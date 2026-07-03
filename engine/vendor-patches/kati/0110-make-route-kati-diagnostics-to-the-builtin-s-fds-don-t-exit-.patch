@@ -1,0 +1,282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 10:57:08 +0000
+Subject: [PATCH] make: route kati diagnostics to the builtin's fds; don't exit
+ the process
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two correctness bugs for the in-process make builtin, both around recipe
+failure / diagnostics:
+
+1. RECIPE FAILURE KILLED THE ENGINE. kati's exec called std::process::exit(2)
+   on a failing recipe — fine for the shadow process, fatal for a builtin
+   (it killed the whole brush/engine process). Now exec emits the
+   `*** [target] Error N` line and returns a BuildFailed(code) error that
+   unwinds to make_main/make_builtin (which return the code) and to the
+   standalone rkati main (which downcasts it to its exit). No re-print.
+
+2. DIAGNOSTICS ESCAPED THE BRUSH PIPE. Recipe stdout was already routed to the
+   builtin's context fd 1; recipe-failure lines, $(warning)/warn!/kati_warn,
+   and $(info) still went to the PROCESS stdout/stderr, so a nested make's
+   messages bypassed the parent's pipe. Added a RECIPE_ERR thread-local sink
+   beside RECIPE_OUT; routed exec's error lines, lib.rs's color_warn_log +
+   warn!/kati_warn macros, and func's $(info) through them. make_builtin sets
+   both fd 1 and fd 2 from its ExecutionContext (save/restore for nesting).
+   (Parse/eval $(error)s already propagated as anyhow and were routed.)
+
+Validated: test_make_rs CASE 9 — a failing recipe in a recursive sub-make exits
+the box cleanly (code 2), routes BOTH `*** [boom] Error 1` (sub-make) and
+`*** [all] Error 2` (parent) up the pipe, and the engine survives (no make
+rows, no process death). Standalone unchanged: kati corpus 364/378 fail=0
+(same recipe-failure output + exit 2); full box suite MAKE-RS PASS.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/exec.rs | 107 +++++++++++++++++++++++++++++++++++--------------
+ src-rs/func.rs |   5 ++-
+ src-rs/lib.rs  |  12 +++---
+ src-rs/main.rs |  14 +++++--
+ 4 files changed, 99 insertions(+), 39 deletions(-)
+
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 2a36203..0386ec4 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -40,18 +40,21 @@ use crate::{
+ };
+ 
+ thread_local! {
+-    // sarun: when set, recipe stdout is written HERE instead of the process
+-    // stdout. An in-process `make` builtin sets this to a writer over its brush
+-    // ExecutionContext's fd 1, so a recursive/nested make's recipe output flows
+-    // up the brush pipe chain rather than escaping to the real terminal.
+-    // Default None → the shadow/standalone path prints to process stdout exactly
+-    // as before. kati runs recipes synchronously on the make's own thread, so a
+-    // thread-local is the correct scope (concurrent makes are on other threads).
++    // sarun: when set, recipe stdout (and $(info)) is written HERE instead of
++    // process stdout; RECIPE_ERR likewise for recipe-failure lines, warnings and
++    // $(warning). An in-process `make` builtin sets these to writers over its
++    // brush ExecutionContext's fd 1/2, so a recursive/nested make's output flows
++    // up the brush pipe chain rather than escaping to the real terminal. Default
++    // None → the shadow/standalone path uses process stdout/stderr exactly as
++    // before. kati runs a make synchronously on one thread, so thread-local is
++    // the correct scope (concurrent makes are on other threads).
+     static RECIPE_OUT: std::cell::RefCell<Option<Box<dyn std::io::Write>>> =
+         const { std::cell::RefCell::new(None) };
++    static RECIPE_ERR: std::cell::RefCell<Option<Box<dyn std::io::Write>>> =
++        const { std::cell::RefCell::new(None) };
+ }
+ 
+-/// sarun: install (or clear) the thread-local recipe-output sink, returning the
++/// sarun: install (or clear) the thread-local recipe-stdout sink, returning the
+ /// previous value so a nested make can save/restore it. Pass None to reset.
+ pub fn set_recipe_out(
+     w: Option<Box<dyn std::io::Write>>,
+@@ -59,9 +62,16 @@ pub fn set_recipe_out(
+     RECIPE_OUT.with(|c| std::mem::replace(&mut *c.borrow_mut(), w))
+ }
+ 
+-/// sarun: emit a recipe's captured stdout — to the thread-local sink if a make
+-/// builtin installed one, else to the process stdout (unchanged default).
+-fn emit_recipe_output(output: &[u8]) {
++/// sarun: install (or clear) the thread-local recipe-stderr/diagnostics sink.
++pub fn set_recipe_err(
++    w: Option<Box<dyn std::io::Write>>,
++) -> Option<Box<dyn std::io::Write>> {
++    RECIPE_ERR.with(|c| std::mem::replace(&mut *c.borrow_mut(), w))
++}
++
++/// sarun: emit to the thread-local stdout sink if a make builtin installed one,
++/// else to process stdout (unchanged default). Used for recipe stdout + $(info).
++pub(crate) fn emit_recipe_output(output: &[u8]) {
+     RECIPE_OUT.with(|c| {
+         let mut slot = c.borrow_mut();
+         if let Some(w) = slot.as_mut() {
+@@ -74,6 +84,39 @@ fn emit_recipe_output(output: &[u8]) {
+     });
+ }
+ 
++/// sarun: emit a diagnostic line (recipe-failure, warning, $(warning)) to the
++/// thread-local stderr sink if set, else process stderr. A trailing newline is
++/// appended (callers pass an unterminated line, matching eprintln!).
++pub fn emit_recipe_err(line: &str) {
++    RECIPE_ERR.with(|c| {
++        let mut slot = c.borrow_mut();
++        if let Some(w) = slot.as_mut() {
++            use std::io::Write;
++            let _ = w.write_all(line.as_bytes());
++            let _ = w.write_all(b"\n");
++            let _ = w.flush();
++        } else {
++            eprintln!("{line}");
++        }
++    });
++}
++
++/// sarun: a recipe failed. Propagated (instead of the old `std::process::exit`)
++/// so the in-process make builtin doesn't kill the whole engine process — it
++/// unwinds to make_main/make_builtin, which return `code`. The user-facing
++/// `*** [target] Error N` line is emitted (via emit_recipe_err) before this is
++/// returned, so callers must NOT re-print it.
++#[derive(Debug, Clone, Copy)]
++pub struct BuildFailed(pub i32);
++
++impl std::fmt::Display for BuildFailed {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "build failed (exit {})", self.0)
++    }
++}
++
++impl std::error::Error for BuildFailed {}
++
+ #[derive(Clone, Copy, PartialEq, Eq)]
+ pub enum ExecStatus {
+     Processing,
+@@ -268,35 +311,39 @@ impl<'a> Executor<'a> {
+                 emit_recipe_output(&output);
+                 if !ok {
+                     if command.ignore_error {
+-                        eprintln!(
++                        emit_recipe_err(&format!(
+                             "[{}] Error {} (ignored)",
+-                            command.output,
+-                            code_for_msg
+-                        )
++                            command.output, code_for_msg
++                        ));
+                     } else {
+                         // sarun: .DELETE_ON_ERROR — remove the target's
+-                        // partially-created output file before bailing,
+-                        // and announce it the way GNU make does (with
+-                        // the same `*** ` prefix and after the Error
+-                        // line). Phony targets are never on-disk so
+-                        // skip them.
+-                        eprintln!(
++                        // partially-created output file before bailing, and
++                        // announce it the way GNU make does (the `*** ` prefix,
++                        // after the Error line). Phony targets are never on-disk
++                        // so skip them. The output path resolves against the
++                        // Evaluator's working_dir (a -C sub-make's outputs live
++                        // there, not at the process cwd).
++                        emit_recipe_err(&format!(
+                             "*** [{}] Error {}",
+-                            command.output,
+-                            code_for_msg
+-                        );
++                            command.output, code_for_msg
++                        ));
+                         if self.ce.ev.delete_on_error && !n.lock().is_phony {
+                             let out_bytes = command.output.as_bytes();
+-                            let path = OsStr::from_bytes(&out_bytes);
+-                            if std::fs::exists(path).unwrap_or(false) {
+-                                eprintln!(
++                            let rel = OsStr::from_bytes(&out_bytes);
++                            let path = self.ce.ev.working_dir.join(rel);
++                            if std::fs::exists(&path).unwrap_or(false) {
++                                emit_recipe_err(&format!(
+                                     "*** Deleting file \"{}\"",
+                                     String::from_utf8_lossy(&out_bytes)
+-                                );
+-                                let _ = std::fs::remove_file(path);
++                                ));
++                                let _ = std::fs::remove_file(&path);
+                             }
+                         }
+-                        std::process::exit(2);
++                        // sarun: was std::process::exit(2) — that would kill the
++                        // engine when running as an in-process builtin. Propagate
++                        // instead; make_main/make_builtin return the code, and
++                        // the standalone rkati main downcasts it to its exit.
++                        return Err(BuildFailed(2).into());
+                     }
+                 }
+             }
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 352ed98..411959c 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -850,7 +850,10 @@ fn info_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) ->
+         s.put_u8(b'"');
+         ev.delayed_output_commands.push(s.freeze());
+     } else {
+-        println!("{}", String::from_utf8_lossy(&a));
++        // sarun: $(info) goes to the logical stdout sink (the make builtin's
++        // context fd 1 when set, else process stdout) — same channel as recipe
++        // stdout — so a nested make's $(info) doesn't escape the brush pipe.
++        crate::exec::emit_recipe_output(format!("{}\n", String::from_utf8_lossy(&a)).as_bytes());
+     }
+     Ok(())
+ }
+diff --git a/src-rs/lib.rs b/src-rs/lib.rs
+index 7e56e22..cb05a55 100644
+--- a/src-rs/lib.rs
++++ b/src-rs/lib.rs
+@@ -68,7 +68,7 @@ macro_rules! log_stat {
+ #[macro_export]
+ macro_rules! warn {
+     ($fmt:expr $(, $($arg:tt)*)?) => {
+-        eprintln!($fmt, $($($arg)*)?)
++        $crate::exec::emit_recipe_err(&format!($fmt, $($($arg)*)?))
+     };
+ }
+ 
+@@ -76,7 +76,7 @@ macro_rules! warn {
+ macro_rules! kati_warn {
+     ($fmt:expr $(, $($arg:tt)*)?) => {
+         if $crate::flags::FLAGS.enable_kati_warnings {
+-            eprintln!($fmt, $($($arg)*)?)
++            $crate::exec::emit_recipe_err(&format!($fmt, $($($arg)*)?))
+         }
+     };
+ }
+@@ -132,7 +132,7 @@ fn color_error_log(loc: Option<&crate::loc::Loc>, msg: String) -> anyhow::Error
+ 
+ fn color_warn_log(loc: Option<&crate::loc::Loc>, msg: String) {
+     let Some(loc) = loc else {
+-        eprintln!("{msg}");
++        crate::exec::emit_recipe_err(&msg);
+         return;
+     };
+ 
+@@ -140,8 +140,10 @@ fn color_warn_log(loc: Option<&crate::loc::Loc>, msg: String) {
+         let mut filtered = trim_prefix_str(&msg, "*warning*: ");
+         filtered = trim_prefix_str(filtered, "warning: ");
+ 
+-        eprintln!("{BOLD}{loc}: {MAGENTA}warning: {RESET}{BOLD}{filtered}{RESET}")
++        crate::exec::emit_recipe_err(&format!(
++            "{BOLD}{loc}: {MAGENTA}warning: {RESET}{BOLD}{filtered}{RESET}"
++        ))
+     } else {
+-        eprintln!("{loc}: {msg}")
++        crate::exec::emit_recipe_err(&format!("{loc}: {msg}"))
+     }
+ }
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index dea3778..a20851e 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -462,10 +462,18 @@ fn main() {
+     let ret = match run(&FLAGS.targets, &FLAGS.cl_vars, orig_args) {
+         Ok(ret) => ret,
+         Err(err) => {
+-            for cause in err.chain() {
+-                eprintln!("{cause}");
++            // sarun: a recipe failure already printed `*** [target] Error N`
++            // (exec.rs now propagates BuildFailed instead of std::process::exit
++            // so an in-process builtin survives); preserve its exit code here
++            // for the standalone rkati without re-printing.
++            if let Some(bf) = err.downcast_ref::<kati::exec::BuildFailed>() {
++                bf.0
++            } else {
++                for cause in err.chain() {
++                    eprintln!("{cause}");
++                }
++                1
+             }
+-            1
+         }
+     };
+     kati::stats::report_all_stats();

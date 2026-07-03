@@ -1,0 +1,459 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 09:44:01 +0000
+Subject: [PATCH] =?UTF-8?q?kati:=20sweep=202=20=E2=80=94=20.SHELLSTATUS=20?=
+ =?UTF-8?q?on=20!=3D,=20optional-include=20remake,=20pattern-rule=20second?=
+ =?UTF-8?q?=20expansion,=20real=20-k?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Second systematic sweep (8 probes: $(eval)+foreach rule generation,
+.SECONDEXPANSION, .DELETE_ON_ERROR, .ONESHELL, -k, %-rule chains with
+.PRECIOUS, != / .SHELLSTATUS, -include remake chains). 4 passed
+immediately; the other 4 were real divergences, all fixed:
+
+- .SHELLSTATUS was set by $(shell) but not by `!=` shell assignment.
+- `-include gen.inc` files with rules were never remade — only
+  REQUIRED includes queued for the remake loop; GNU remakes optional
+  ones too (missing + no rule stays tolerated). pending_remake_includes
+  carries a required flag now.
+- .SECONDEXPANSION worked only for explicit rules: a pattern rule's
+  $$(deps_$$*) prereq (a) failed the implicit-rule viability probe as
+  literal text — deferred when it contains '$' — and (b) expanded
+  without the stem; $*, $(*D), $(*F) are now bound during second
+  expansion, per the manual.
+- -k was accepted-but-ignored: the executor now marks the failed
+  node's transitive dependents not-remade and keeps building the rest,
+  prints GNU's 'Target "X" not remade because of errors.' per failed
+  goal, exits non-zero. Also honored from a makefile-level
+  `MAKEFLAGS += -k` (read from the FINAL variable at exec time).
+
+rkati corpus 395/405 fail=0 xpass=0; box corpus 395/405 fail=0.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/dep.rs                                | 34 +++++++++++++
+ src-rs/eval.rs                               | 19 +++++--
+ src-rs/exec.rs                               | 52 ++++++++++++++++++--
+ src-rs/flags.rs                              | 22 ++++++++-
+ src-rs/main.rs                               |  5 +-
+ testcase/sarun_sweep2_delete_on_error.mk     |  7 +++
+ testcase/sarun_sweep2_eval.mk                | 13 +++++
+ testcase/sarun_sweep2_include_chains.mk      | 10 ++++
+ testcase/sarun_sweep2_intermediate.mk        | 11 +++++
+ testcase/sarun_sweep2_keep_going.mk          | 10 ++++
+ testcase/sarun_sweep2_oneshell.mk            |  7 +++
+ testcase/sarun_sweep2_secondexpansion.mk     | 12 +++++
+ testcase/sarun_sweep2_shell_assign_flavor.mk |  8 +++
+ 13 files changed, 198 insertions(+), 12 deletions(-)
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep2_delete_on_error.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep2_eval.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep2_include_chains.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep2_intermediate.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep2_keep_going.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep2_oneshell.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep2_secondexpansion.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep2_shell_assign_flavor.mk
+
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index ce0dc1d..a6a7f74 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -970,6 +970,11 @@ impl<'a> DepBuilder<'a> {
+                         // as existing for implicit-rule selection, as in GNU
+                         // make's directory search.
+                         || self.vpath_resolve(sym).is_some()
++                        // Under .SECONDEXPANSION a `$$(...)` prerequisite is
++                        // still unexpanded text here; GNU expands BEFORE the
++                        // implicit-rule search, so defer the viability call
++                        // instead of rejecting the rule on a literal '$'.
++                        || (self.secondexpansion && input.as_bytes().contains(&b'$'))
+                         || (allow_chain
+                             && self.has_producing_rule_except(sym, &rule.output_patterns));
+                     if !buildable {
+@@ -1433,6 +1438,35 @@ impl<'a> DepBuilder<'a> {
+                     intern("@F"),
+                     mk_var(Bytes::copy_from_slice(base)),
+                 )?;
++                // $* (the stem) is also bound during second expansion — a
++                // pattern rule's `$$(deps_$$*)` is the canonical use.
++                let stem: Bytes = n
++                    .lock()
++                    .output_pattern
++                    .map(|p| {
++                        Bytes::copy_from_slice(
++                            Pattern::new(p.as_bytes()).stem(&out_bytes),
++                        )
++                    })
++                    .unwrap_or_default();
++                let stem_dir = crate::strutil::dirname(&stem);
++                let stem_base = Bytes::copy_from_slice(
++                    crate::strutil::basename(&stem));
++                let _scoped_star = crate::symtab::ScopedGlobalVar::new(
++                    self.ev.global_vars.clone(),
++                    intern("*"),
++                    mk_var(stem.clone()),
++                )?;
++                let _scoped_star_d = crate::symtab::ScopedGlobalVar::new(
++                    self.ev.global_vars.clone(),
++                    intern("*D"),
++                    mk_var(Bytes::copy_from_slice(&stem_dir)),
++                )?;
++                let _scoped_star_f = crate::symtab::ScopedGlobalVar::new(
++                    self.ev.global_vars.clone(),
++                    intern("*F"),
++                    mk_var(stem_base),
++                )?;
+                 // First pass dropped the source text on the floor and only
+                 // kept space-split tokens. `$(call f,arg)` ends up split
+                 // into `$(call` + `f,arg)`, which is unparseable individually.
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 22629f6..1d41c6a 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -307,7 +307,11 @@ pub struct Evaluator {
+     /// parse time, paired with the source location of the directive.
+     /// The remake-the-makefile loop in main.rs checks for rules
+     /// producing these names and builds + re-parses if any apply.
+-    pub pending_remake_includes: Vec<(Loc, OsString)>,
++    /// (loc, filename, required) — missing `include` files queued for the
++    /// remake-the-makefile loop. `-include` files queue with required=false:
++    /// GNU remakes them too when a rule exists, but a missing one without a
++    /// rule is silently tolerated.
++    pub pending_remake_includes: Vec<(Loc, OsString, bool)>,
+     /// sarun: in the in-process box, exported make variables can't be staged
+     /// into the process environment (`std::env::set_var`) — many makes share one
+     /// engine process, so that global write is a data race (UB) AND leaks one
+@@ -691,9 +695,11 @@ impl Evaluator {
+                 let box_prefix = self.box_export_prefix.clone();
+                 let cwd = std::os::unix::ffi::OsStrExt::as_bytes(
+                     self.working_dir.as_os_str()).to_vec();
+-                let (_exit, output, _fc) =
++                let (exit, output, _fc) =
+                     crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc,
+                                                  &box_prefix, &cwd)?;
++                // GNU sets .SHELLSTATUS after `!=` too, not just $(shell).
++                crate::var::set_shell_status_var(exit);
+                 result = Variable::with_simple_string(
+                     output,
+                     origin,
+@@ -1226,15 +1232,18 @@ impl Evaluator {
+                 }
+             }
+ 
+-            if stmt.should_exist {
++            {
+                 let missing = match files.as_ref() {
+                     Err(_) => true,
+                     Ok(v) => v.is_empty(),
+                 };
+                 if missing {
+                     let loc = self.loc.clone().unwrap_or_default();
+-                    self.pending_remake_includes
+-                        .push((loc, OsString::from_vec(pat.to_vec())));
++                    self.pending_remake_includes.push((
++                        loc,
++                        OsString::from_vec(pat.to_vec()),
++                        stmt.should_exist,
++                    ));
+                     continue;
+                 }
+             }
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index fe3b1e5..6ccf28b 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -649,9 +649,26 @@ impl<'a> Executor<'a> {
+         let mut done_count = 0usize;
+         let total = graph.len();
+ 
++        // -k can also arrive as a makefile-level `MAKEFLAGS += -k`, which
++        // lands in the MAKEFLAGS variable after FLAGS was parsed.
++        let keep_going = FLAGS.is_keep_going
++            || self
++                .ce
++                .ev
++                .lookup_var(crate::symtab::intern("MAKEFLAGS"))
++                .ok()
++                .flatten()
++                .and_then(|v| {
++                    use crate::expr::Evaluable;
++                    v.read().eval_to_buf(self.ce.ev).ok()
++                })
++                .is_some_and(|mf| crate::flags::Flags::makeflags_keep_going(&mf));
++        // Nodes skipped because a (transitive) dependency failed under -k;
++        // goal targets in here get the "not remade" notice at the end.
++        let mut failed_set: HashSet<Symbol> = HashSet::new();
+         loop {
+             // 1. Evaluate ready nodes on the make thread (serial) → done or queued.
+-            while failed.is_none() {
++            while failed.is_none() || keep_going {
+                 let Some(Ready { sym, .. }) = ready.pop() else { break };
+                 let (ts, runreq) = self.prepare_node(&graph, sym)?;
+                 match runreq {
+@@ -706,6 +723,16 @@ impl<'a> Executor<'a> {
+                     continue;
+                 }
+                 if let Some(code) = failed {
++                    if keep_going {
++                        for (name, node) in &roots {
++                            let _ = node;
++                            if failed_set.contains(name) {
++                                emit_recipe_err(&format!(
++                                    "Target \"{}\" not remade because of errors.",
++                                    String::from_utf8_lossy(&name.as_bytes())));
++                            }
++                        }
++                    }
+                     return Err(BuildFailed(code).into());
+                 }
+                 if done_count < total {
+@@ -748,9 +775,26 @@ impl<'a> Executor<'a> {
+                     }
+                 }
+                 failed = Some(2);
+-                // Stop launching new work; drain in-flight runs, then bail.
+-                ready.clear();
+-                run_queue.clear();
++                if keep_going {
++                    // -k: mark the failed node and everything depending on
++                    // it as not-remade; keep building the rest.
++                    let mut stack = vec![run.output];
++                    while let Some(s) = stack.pop() {
++                        if !failed_set.insert(s) {
++                            continue;
++                        }
++                        let p = graph.get_mut(&s).unwrap();
++                        if p.state != PState::Done {
++                            p.state = PState::Done;
++                            done_count += 1;
++                        }
++                        stack.extend(graph[&s].dependents.iter().copied());
++                    }
++                } else {
++                    // Stop launching new work; drain in-flight runs, bail.
++                    ready.clear();
++                    run_queue.clear();
++                }
+             } else {
+                 self.finish_node(&mut graph, run.output, run.result_ts, &mut ready, &mut done_count);
+             }
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index f2af9e7..1faf9b8 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -69,6 +69,9 @@ pub struct Flags {
+     pub generate_empty_ninja: bool,
+     pub is_dry_run: bool,
+     pub is_silent_mode: bool,
++    /// -k / --keep-going: on a recipe failure, keep building targets that
++    /// don't depend on the failed one; exit non-zero at the end.
++    pub is_keep_going: bool,
+     pub is_syntax_check_only: bool,
+     pub regen: bool,
+     pub regen_debug: bool,
+@@ -228,6 +231,19 @@ impl Flags {
+         (flags, vars)
+     }
+ 
++    /// True if a MAKEFLAGS value carries -k / --keep-going (long, short,
++    /// or a bare GNU letter-word like "ks").
++    pub fn makeflags_keep_going(makeflags: &[u8]) -> bool {
++        let (words, _) = Flags::split_makeflags(makeflags);
++        words.iter().any(|w| {
++            w[..] == *b"-k"
++                || w[..] == *b"--keep-going"
++                || (!w.starts_with(b"-") && !w.contains(&b'=')
++                    && w.iter().all(|&b| b.is_ascii_alphabetic())
++                    && w.contains(&b'k'))
++        })
++    }
++
+     pub fn apply_makeflags(&mut self, makeflags: &[u8]) {
+         // GNU carries command-line variable overrides after a `--`
+         // separator, space-escaped. Fold them into cl_vars and keep only
+@@ -250,6 +266,8 @@ impl Flags {
+                 self.no_builtin_variables = true;
+             } else if tok == b"-s" || tok == b"--silent" || tok == b"--quiet" {
+                 self.is_silent_mode = true;
++            } else if tok == b"-k" || tok == b"--keep-going" {
++                self.is_keep_going = true;
+             } else if !tok.starts_with(b"-") && tok.contains(&b'=') {
+                 let var = Bytes::from(tok.to_vec());
+                 if !self.cl_vars.contains(&var) {
+@@ -264,6 +282,7 @@ impl Flags {
+                         b'r' => self.no_builtin_rules = true,
+                         b'R' => self.no_builtin_variables = true,
+                         b's' => self.is_silent_mode = true,
++                        b'k' => self.is_keep_going = true,
+                         _ => {}
+                     }
+                 }
+@@ -294,7 +313,8 @@ impl Flags {
+                 b"-s" => flags.is_silent_mode = true,
+                 b"-r" => flags.no_builtin_rules = true,
+                 b"-R" => flags.no_builtin_variables = true,
+-                b"-w" | b"-k" | b"-n" => {} // accepted, semantically no-op in kati
++                b"-w" | b"-n" => {} // accepted, semantically no-op in kati
++                b"-k" | b"--keep-going" => flags.is_keep_going = true,
+                 // sarun: GNU make's long forms of -w/its inverse. The kernel's
+                 // top Makefile passes --no-print-directory to every sub-make
+                 // (see the __sub-make dance around MAKEFLAGS); without an
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 94d7502..99bea4c 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -243,7 +243,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+     let mut remake_targets: Vec<Symbol> = Vec::new();
+     {
+         let pending = std::mem::take(&mut ev.pending_remake_includes);
+-        for (loc, name) in &pending {
++        for (loc, name, required) in &pending {
+             let sym = intern(name.as_bytes().to_vec());
+             // Literal or PATTERN-rule producible (e.g. the kernel's
+             // `%/auto.conf %/auto.conf.cmd: $(KCONFIG_CONFIG)`).
+@@ -256,7 +256,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+             });
+             if producible {
+                 remake_targets.push(sym);
+-            } else {
++            } else if *required {
+                 // Missing required include with no matching rule. Emit a
+                 // single line matching upstream kati's `error_loc!` shape;
+                 // the corpus normalizer rolls real make's follow-up
+@@ -265,6 +265,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+                 eprintln!("{loc}: {pat_str}: No such file or directory");
+                 std::process::exit(2);
+             }
++            // A missing OPTIONAL include with no rule: GNU tolerates it.
+         }
+     }
+     let remake_active = !remake_targets.is_empty();
+diff --git a/testcase/sarun_sweep2_delete_on_error.mk b/testcase/sarun_sweep2_delete_on_error.mk
+new file mode 100644
+index 0000000..d37681b
+--- /dev/null
++++ b/testcase/sarun_sweep2_delete_on_error.mk
+@@ -0,0 +1,7 @@
++# Sweep 2: .DELETE_ON_ERROR — a failing recipe's target file is removed.
++.DELETE_ON_ERROR:
++all: out.bad
++	@echo should-not-run
++out.bad:
++	@echo partial > $@
++	@false
+diff --git a/testcase/sarun_sweep2_eval.mk b/testcase/sarun_sweep2_eval.mk
+new file mode 100644
+index 0000000..770aa52
+--- /dev/null
++++ b/testcase/sarun_sweep2_eval.mk
+@@ -0,0 +1,13 @@
++# Sweep 2: $(eval) — defining rules/vars from expansion, inside foreach,
++# and eval'd target-specific vars.
++.DEFAULT_GOAL := all
++define RULEGEN
++$(1).gen:
++	@echo made-$(1) > $(1).gen
++gen_targets += $(1).gen
++endef
++$(foreach n,alpha beta,$(eval $(call RULEGEN,$(n))))
++$(eval EVDIRECT := from-eval)
++all: $(gen_targets)
++	@echo direct=[$(EVDIRECT)] targets=[$(gen_targets)]
++	@cat alpha.gen beta.gen
+diff --git a/testcase/sarun_sweep2_include_chains.mk b/testcase/sarun_sweep2_include_chains.mk
+new file mode 100644
+index 0000000..abb6a19
+--- /dev/null
++++ b/testcase/sarun_sweep2_include_chains.mk
+@@ -0,0 +1,10 @@
++# Sweep 2: -include of a GENERATED dependency file that a rule remakes,
++# plus include of multiple files in one directive.
++.DEFAULT_GOAL := all
++-include gen1.inc gen2.inc
++gen1.inc:
++	@echo 'V1 := one' > $@
++gen2.inc:
++	@echo 'V2 := two' > $@
++all:
++	@echo v=[$(V1)$(V2)]
+diff --git a/testcase/sarun_sweep2_intermediate.mk b/testcase/sarun_sweep2_intermediate.mk
+new file mode 100644
+index 0000000..254fdb4
+--- /dev/null
++++ b/testcase/sarun_sweep2_intermediate.mk
+@@ -0,0 +1,11 @@
++# Sweep 2: implicit-rule chains — the intermediate file is built through
++# a two-step %-rule chain (.z <- %.y <- %.x); .PRECIOUS keeps it.
++.PRECIOUS: %.y
++all: thing.z
++	@echo have=[$(wildcard thing.y)]
++%.z: %.y
++	@cp $< $@
++%.y: %.x
++	@echo mid > $@
++thing.x:
++	@touch $@
+diff --git a/testcase/sarun_sweep2_keep_going.mk b/testcase/sarun_sweep2_keep_going.mk
+new file mode 100644
+index 0000000..8d4d390
+--- /dev/null
++++ b/testcase/sarun_sweep2_keep_going.mk
+@@ -0,0 +1,10 @@
++# Sweep 2: make -k via MAKEFLAGS += -k — independent targets keep building
++# after one fails; overall exit is still non-zero.
++MAKEFLAGS += -k
++all: bad good1 good2
++bad:
++	@false
++good1:
++	@echo good1-ran
++good2:
++	@echo good2-ran
+diff --git a/testcase/sarun_sweep2_oneshell.mk b/testcase/sarun_sweep2_oneshell.mk
+new file mode 100644
+index 0000000..1fdf89f
+--- /dev/null
++++ b/testcase/sarun_sweep2_oneshell.mk
+@@ -0,0 +1,7 @@
++# Sweep 2: .ONESHELL — all recipe lines run in ONE shell (state persists).
++.ONESHELL:
++all:
++	@x=hello
++	echo one=[$$x]
++	cd /tmp
++	echo two=[$${PWD}]
+diff --git a/testcase/sarun_sweep2_secondexpansion.mk b/testcase/sarun_sweep2_secondexpansion.mk
+new file mode 100644
+index 0000000..a0f52e8
+--- /dev/null
++++ b/testcase/sarun_sweep2_secondexpansion.mk
+@@ -0,0 +1,12 @@
++# Sweep 2: .SECONDEXPANSION — $$(...) prereqs re-expanded with automatic
++# vars bound per-target.
++.SECONDEXPANSION:
++deps_alpha := a.x
++deps_beta := b.x
++all: alpha.t beta.t
++	@echo done
++%.t: $$(deps_$$*)
++	@echo built=[$@] from=[$<]
++	@touch $@
++a.x b.x:
++	@touch $@
+diff --git a/testcase/sarun_sweep2_shell_assign_flavor.mk b/testcase/sarun_sweep2_shell_assign_flavor.mk
+new file mode 100644
+index 0000000..e45fa36
+--- /dev/null
++++ b/testcase/sarun_sweep2_shell_assign_flavor.mk
+@@ -0,0 +1,8 @@
++# Sweep 2: != shell assignment + $(shell) in := context + exit-status var.
++LINES != printf 'l1\nl2\n'
++NOW := $(shell echo snap)
++STATUS := $(.SHELLSTATUS)
++FAILS != exit 3; echo never
++STATUS2 := $(.SHELLSTATUS)
++all:
++	@echo lines=[$(LINES)] now=[$(NOW)] s1=[$(STATUS)] s2=[$(STATUS2)]

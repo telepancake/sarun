@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 21 Jun 2026 12:24:55 +0000
+Subject: [PATCH] xargs: implement -P (parallel) as a bounded pool reaped
+ per-pid
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`-P/--max-procs` was parsed but silently ignored ("[NOT IMPLEMENTED]") — a
+request for N-way concurrency ran serially with no indication. Now it runs.
+
+Parallel xargs is just `(cmd)& … & wait`: spawn up to N children at once and
+reap each by its OWN pid via `Child::wait`, never `waitpid(-1)`. That is what
+makes it safe to run inside the shared engine process — it cannot disturb the
+engine's or sibling boxes' children (and serial `command.status()` already
+proved the engine has no rival -1 reaper stealing box-spawned children).
+
+`CommandBuilder::execute` is refactored into `build_command` + `map_status` so
+the new `spawn` path constructs and interprets children identically; a
+`ParallelPool` caps concurrency at N (FIFO reap when full, drain at end).
+Serial (`-P1`, the default) keeps the original `execute` path untouched. `-P0`
+means unlimited (usize::MAX); echo (no command) stays in-process.
+
+Verified in a box: 4×`sleep 1` is 4.0s at -P1 vs 1.0s at -P4; all three
+parallel jobs' "start" print before any "end" (real overlap); -P0 unlimited
+concurrent; a failing child yields exit 123; shebang scripts and the logical
+cwd work per child; serial output/order unregressed.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/xargs/mod.rs | 205 +++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 163 insertions(+), 42 deletions(-)
+
+diff --git a/src/xargs/mod.rs b/src/xargs/mod.rs
+index cf4fc4f..fd582b5 100644
+--- a/src/xargs/mod.rs
++++ b/src/xargs/mod.rs
+@@ -12,7 +12,7 @@ use std::{
+     fmt::Display,
+     fs,
+     io::{self, BufRead, BufReader, Read, Write},
+-    process::{Command, Stdio},
++    process::{Child, Command, Stdio},
+ };
+ 
+ /// Injected logical I/O for an in-process embedder.
+@@ -121,6 +121,9 @@ struct Options {
+     replace: Option<String>,
+     verbose: bool,
+     eof_delimiter: Option<String>,
++    /// `-P`/--max-procs normalized to a concurrency cap: 1 = serial (default),
++    /// `usize::MAX` = unlimited (`-P 0`).
++    max_procs: usize,
+ }
+ 
+ #[derive(Debug, PartialEq, Eq)]
+@@ -488,10 +491,14 @@ impl CommandBuilder<'_> {
+         Ok(())
+     }
+ 
+-    fn execute(self, io: &dyn XargsIo) -> Result<CommandResult, CommandExecutionError> {
++    /// Build (but do not run) the child Command for a `Command` action. Shared
++    /// by the serial `execute` and the parallel `spawn` paths so they construct
++    /// the child identically (cwd, args, env, stdin, the `-t` trace, the logical
++    /// stdio dup). Only valid for `ExecAction::Command`.
++    fn build_command(&self, io: &dyn XargsIo) -> Command {
+         let (entry_point, initial_args): (&OsStr, &[OsString]) = match &self.options.action {
+             ExecAction::Command(args) => (&args[0], &args[1..]),
+-            ExecAction::Echo => (OsStr::new("echo"), &[]),
++            ExecAction::Echo => unreachable!("build_command is only for Command actions"),
+         };
+ 
+         let mut command = Command::new(entry_point);
+@@ -550,56 +557,141 @@ impl CommandBuilder<'_> {
+         if let Some(s) = io.child_stderr() {
+             command.stderr(s);
+         }
++        command
++    }
++
++    /// Map a finished child's exit status to a `CommandResult` (success/failure)
++    /// or a hard `CommandExecutionError` (exit 255 = stop, or killed by signal).
++    /// Shared by serial `execute` and parallel reaping so both interpret a
++    /// child's outcome identically.
++    fn map_status(
++        status: std::process::ExitStatus,
++    ) -> Result<CommandResult, CommandExecutionError> {
++        if status.success() {
++            Ok(CommandResult::Success)
++        } else if let Some(err) = status.code() {
++            if err == 255 {
++                Err(CommandExecutionError::UrgentlyFailed)
++            } else {
++                Ok(CommandResult::Failure)
++            }
++        } else {
++            #[cfg(unix)]
++            {
++                use std::os::unix::process::ExitStatusExt;
++                if let Some(signal) = status.signal() {
++                    Err(CommandExecutionError::Killed { signal })
++                } else {
++                    Err(CommandExecutionError::Unknown)
++                }
++            }
++
++            #[cfg(not(unix))]
++            Err(CommandExecutionError::Unknown)
++        }
++    }
+ 
++    /// Run echo (the no-command action) in-process against the logical output.
++    fn run_echo(&self, io: &dyn XargsIo) -> CommandResult {
++        let mut out = io.output().borrow_mut();
++        let _ = writeln!(
++            out,
++            "{}",
++            self.extra_args
++                .iter()
++                .map(|arg| arg.to_string_lossy())
++                .collect::<Vec<_>>()
++                .join(" ")
++        );
++        let _ = out.flush();
++        CommandResult::Success
++    }
++
++    fn execute(self, io: &dyn XargsIo) -> Result<CommandResult, CommandExecutionError> {
+         match &self.options.action {
+-            ExecAction::Command(_) => match command.status() {
+-                Ok(status) => {
+-                    if status.success() {
+-                        Ok(CommandResult::Success)
+-                    } else if let Some(err) = status.code() {
+-                        if err == 255 {
+-                            Err(CommandExecutionError::UrgentlyFailed)
+-                        } else {
+-                            Ok(CommandResult::Failure)
+-                        }
+-                    } else {
+-                        #[cfg(unix)]
+-                        {
+-                            use std::os::unix::process::ExitStatusExt;
+-                            if let Some(signal) = status.signal() {
+-                                Err(CommandExecutionError::Killed { signal })
+-                            } else {
+-                                Err(CommandExecutionError::Unknown)
+-                            }
+-                        }
+-
+-                        #[cfg(not(unix))]
+-                        Err(CommandExecutionError::Unknown)
+-                    }
++            ExecAction::Command(_) => match self.build_command(io).status() {
++                Ok(status) => Self::map_status(status),
++                Err(e) if e.kind() == io::ErrorKind::NotFound => {
++                    Err(CommandExecutionError::NotFound)
+                 }
++                Err(e) => Err(CommandExecutionError::CannotRun(e)),
++            },
++            ExecAction::Echo => Ok(self.run_echo(io)),
++        }
++    }
++
++    /// Parallel (`-P`) dispatch: SPAWN the child and return its handle instead of
++    /// waiting — the caller bounds concurrency and reaps each child by its own
++    /// pid (`Child::wait`), never `waitpid(-1)`, so it is safe in the shared
++    /// engine process (the same model as `cmd & cmd & wait`). Echo has no child:
++    /// it runs in-process now and returns `None`.
++    fn spawn(self, io: &dyn XargsIo) -> Result<Option<Child>, CommandExecutionError> {
++        match &self.options.action {
++            ExecAction::Command(_) => match self.build_command(io).spawn() {
++                Ok(child) => Ok(Some(child)),
+                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                     Err(CommandExecutionError::NotFound)
+                 }
+                 Err(e) => Err(CommandExecutionError::CannotRun(e)),
+             },
+             ExecAction::Echo => {
+-                let mut out = io.output().borrow_mut();
+-                let _ = writeln!(
+-                    out,
+-                    "{}",
+-                    self.extra_args
+-                        .iter()
+-                        .map(|arg| arg.to_string_lossy())
+-                        .collect::<Vec<_>>()
+-                        .join(" ")
+-                );
+-                let _ = out.flush();
+-                Ok(CommandResult::Success)
++                self.run_echo(io);
++                Ok(None)
+             }
+         }
+     }
+ }
+ 
++/// A bounded pool of concurrently running `-P` children. Concurrency is capped
++/// at `max`; when full, the oldest child is reaped before the next is spawned.
++/// Every reap is a specific-pid `Child::wait`, so the pool never disturbs the
++/// engine's other children — parallel xargs is just `(cmd)& … & wait`.
++struct ParallelPool {
++    max: usize,
++    running: Vec<Child>,
++    result: CommandResult,
++}
++
++impl ParallelPool {
++    fn new(max: usize) -> Self {
++        Self { max, running: vec![], result: CommandResult::Success }
++    }
++
++    /// Reap the OLDEST running child (FIFO), folding its outcome into `result`.
++    fn reap_one(&mut self) -> Result<(), CommandExecutionError> {
++        if self.running.is_empty() {
++            return Ok(());
++        }
++        let mut child = self.running.remove(0);
++        let status = child.wait().map_err(CommandExecutionError::CannotRun)?;
++        self.result.combine(CommandBuilder::map_status(status)?);
++        Ok(())
++    }
++
++    /// Spawn `builder`, first reaping down to below the concurrency cap.
++    fn dispatch(
++        &mut self,
++        builder: CommandBuilder,
++        io: &dyn XargsIo,
++    ) -> Result<(), CommandExecutionError> {
++        while self.running.len() >= self.max {
++            self.reap_one()?;
++        }
++        if let Some(child) = builder.spawn(io)? {
++            self.running.push(child);
++        }
++        Ok(())
++    }
++
++    /// Wait for every remaining child and return the combined result.
++    fn drain(mut self) -> Result<CommandResult, CommandExecutionError> {
++        while !self.running.is_empty() {
++            self.reap_one()?;
++        }
++        Ok(self.result)
++    }
++}
++
+ trait ArgumentReader {
+     fn next(&mut self) -> io::Result<Option<Argument>>;
+ }
+@@ -836,6 +928,9 @@ struct InputProcessOptions {
+     max_args: Option<usize>,
+     max_lines: Option<usize>,
+     no_run_if_empty: bool,
++    /// `-P`/--max-procs: max children to run at once. 1 = serial (the default
++    /// and the untouched fast path); `usize::MAX` = unlimited (`-P 0`).
++    max_procs: usize,
+ }
+ 
+ impl InputProcessOptions {
+@@ -844,12 +939,14 @@ impl InputProcessOptions {
+         max_args: Option<usize>,
+         max_lines: Option<usize>,
+         no_run_if_empty: bool,
++        max_procs: usize,
+     ) -> Self {
+         Self {
+             exit_if_pass_char_limit,
+             max_args,
+             max_lines,
+             no_run_if_empty,
++            max_procs,
+         }
+     }
+ }
+@@ -863,6 +960,10 @@ fn process_input(
+     let mut current_builder = CommandBuilder::new(builder_options);
+     let mut have_pending_command = false;
+     let mut result = CommandResult::Success;
++    // -P: run children concurrently through a bounded pool. Serial (max_procs
++    // == 1) keeps the original `execute` path untouched; the pool stays empty.
++    let parallel = options.max_procs > 1;
++    let mut pool = ParallelPool::new(options.max_procs);
+ 
+     while let Some(arg) = args.next()? {
+         if let Err(ExhaustedCommandSpace { arg, out_of_chars }) = current_builder.add_arg(arg) {
+@@ -873,7 +974,11 @@ fn process_input(
+                 return Err(XargsError::ArgumentTooLarge);
+             }
+             if have_pending_command {
+-                result.combine(current_builder.execute(io)?);
++                if parallel {
++                    pool.dispatch(current_builder, io)?;
++                } else {
++                    result.combine(current_builder.execute(io)?);
++                }
+             }
+ 
+             current_builder = CommandBuilder::new(builder_options);
+@@ -886,7 +991,15 @@ fn process_input(
+     }
+ 
+     if !options.no_run_if_empty || have_pending_command {
+-        result.combine(current_builder.execute(io)?);
++        if parallel {
++            pool.dispatch(current_builder, io)?;
++        } else {
++            result.combine(current_builder.execute(io)?);
++        }
++    }
++    if parallel {
++        // Wait for every remaining child (cmd & … & wait).
++        result.combine(pool.drain()?);
+     }
+ 
+     Ok(result)
+@@ -1004,6 +1117,7 @@ fn normalize_options(options: Options, matches: &clap::ArgMatches, io: &dyn Xarg
+         replace,
+         verbose: options.verbose,
+         eof_delimiter,
++        max_procs: options.max_procs,
+     }
+ }
+ 
+@@ -1076,7 +1190,7 @@ fn do_xargs(args: &[&str], io: &dyn XargsIo) -> Result<CommandResult, XargsError
+             Arg::new(options::MAX_PROCS)
+                 .short('P')
+                 .long(options::MAX_PROCS)
+-                .help("Run up to this many commands in parallel [NOT IMPLEMENTED]")
++                .help("Run up to this many commands in parallel")
+                 .value_parser(clap::value_parser!(usize)),
+         )
+         .arg(
+@@ -1213,6 +1327,12 @@ fn do_xargs(args: &[&str], io: &dyn XargsIo) -> Result<CommandResult, XargsError
+                     .map_or_else(|| "{}".to_string(), std::borrow::ToOwned::to_owned)
+             })
+         }),
++        // -P N: 0 means "as many as possible" (unlimited); absent means serial.
++        max_procs: match matches.get_one::<usize>(options::MAX_PROCS).copied() {
++            None | Some(1) => 1,
++            Some(0) => usize::MAX,
++            Some(n) => n,
++        },
+     };
+ 
+     let options = normalize_options(options, &matches, io);
+@@ -1270,6 +1390,7 @@ fn do_xargs(args: &[&str], io: &dyn XargsIo) -> Result<CommandResult, XargsError
+             options.max_args,
+             options.max_lines,
+             options.no_run_if_empty || options.replace.is_some(),
++            options.max_procs,
+         ),
+         io,
+     )?;

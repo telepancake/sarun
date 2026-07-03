@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 22:24:53 +0000
+Subject: [PATCH] katirun: route make exports through the per-recipe subshell,
+ not std::env
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In a box, every recipe and every recursive $(MAKE) runs in-process through a
+brush subshell, and many makes share ONE engine process. The export channel
+was the global process environment: run_kati did std::env::set_var/remove_var
+for each exported variable (and bumped MAKELEVEL the same way). Those writes
+are a data race under -j — concurrent in-process makes mutate the shared env
+while sibling subshells read it to construct their environments — and
+std::env::set_var is itself UB when other threads touch the environment. They
+also semantically leak one make's exports into another.
+
+Replace the global writes with a per-make export prefix carried through the
+subshell:
+
+- run_kati builds a non-echoed shell prefix (`export NAME='val'` / `unset
+  NAME`, MAKELEVEL bumped from the seed env, env-origin vars re-exported as GNU
+  make does, invalid-identifier and shell-managed names skipped) and stores it
+  on the Evaluator (box_export_prefix).
+- exec.rs prepends it to each recipe's subshell; func.rs prepends it to
+  $(shell). Both are no-ops for the standalone rkati binary, which never sets
+  the field and keeps its own one-process-per-make std::env path — so the
+  conformance corpus is byte-identical (still 365/379, parallel 365/365).
+- run_kati no longer reads std::env for the make's variables; it seeds from an
+  explicit env. make_main passes the process env; MakeBuiltin passes the brush
+  subshell's exported env (iter_exported()), which already carries the parent
+  make's exports applied via the recipe prefix. So a recursive sub-make
+  inherits exports with no make ever touching shared process state.
+- MAKEFLAGS stays on std::env: it's make-managed and the jobserver's
+  advertisement channel (gcc -flto=jobserver et al. inherit it). It's skipped
+  in the prefix and seeded live so $(MAKEFLAGS) still carries the jobserver.
+
+busybox `make -j4` stays reliable (byte-identical 1059432-byte binary, 401
+applets). test_make_rs.py case 19 covers both halves: an `export` reaching a
+recursive sub-make as a make variable AND in its recipe's shell env, while a
+non-exported var does not leak.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/eval.rs | 14 +++++++++++++-
+ src-rs/exec.rs | 15 +++++++++++++--
+ src-rs/func.rs | 18 ++++++++++++++++--
+ 3 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index c46ebc1..1f33ff7 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -279,6 +279,16 @@ pub struct Evaluator {
+     /// The remake-the-makefile loop in main.rs checks for rules
+     /// producing these names and builds + re-parses if any apply.
+     pub pending_remake_includes: Vec<(Loc, OsString)>,
++    /// sarun: in the in-process box, exported make variables can't be staged
++    /// into the process environment (`std::env::set_var`) — many makes share one
++    /// engine process, so that global write is a data race (UB) AND leaks one
++    /// make's exports into another. Instead the engine builds a non-echoed shell
++    /// prefix (`export NAME='val'` / `unset NAME`, newline-terminated) here, and
++    /// the executor (recipes) and `$(shell)` prepend it to the command run in the
++    /// brush subshell, so exports reach children through the per-subshell env.
++    /// Empty for the standalone rkati binary, which keeps the `std::env` path
++    /// (one OS process per make, where that's correct).
++    pub box_export_prefix: Bytes,
+     symbols_for_eval: HashSet<Symbol>,
+ 
+     in_rule: bool,
+@@ -331,6 +341,7 @@ impl Evaluator {
+             oneshell: false,
+             delete_on_error: false,
+             pending_remake_includes: Vec::new(),
++            box_export_prefix: Bytes::new(),
+             symbols_for_eval: HashSet::new(),
+ 
+             in_rule: false,
+@@ -634,8 +645,9 @@ impl Evaluator {
+                 let loc = self.loc.clone().unwrap_or_default();
+                 let shell = self.get_shell()?;
+                 let shellflag = self.get_shell_flag();
++                let box_prefix = self.box_export_prefix.clone();
+                 let (_exit, output, _fc) =
+-                    crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc)?;
++                    crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc, &box_prefix)?;
+                 result = Variable::with_simple_string(
+                     output,
+                     origin,
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index efdfa55..39a045f 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -213,6 +213,12 @@ struct RunReq {
+     /// recipe runs at the right cwd on its worker thread (explicit, not via a
+     /// make-thread thread-local the worker wouldn't see).
+     cwd: Bytes,
++    /// sarun: the make's exported-variable prefix (`export NAME='val'` / `unset
++    /// NAME` lines), applied to each command's subshell as a non-echoed prefix so
++    /// the make's `export`s reach recipes (and recursive sub-makes) through the
++    /// per-subshell env rather than a process-global `std::env` write. Empty for
++    /// the standalone rkati path (Evaluator::box_export_prefix is unset there).
++    box_prefix: Bytes,
+     /// The pre-run output timestamp to record as this node's result on success.
+     result_ts: ExecStatus,
+ }
+@@ -257,7 +263,11 @@ fn run_node_commands(
+     let mut out = Vec::new();
+     let mut ignored = Vec::new();
+     let mut failure = None;
+-    let prefix = exports_prefix(&req.exports);
++    // The make's global export prefix (box mode) runs first, then the target's
++    // own exported rule vars, then the command. Both are applied to the subshell
++    // but never echoed.
++    let mut prefix = req.box_prefix.to_vec();
++    prefix.extend_from_slice(&exports_prefix(&req.exports));
+     let cwd = req.cwd;
+     for command in req.commands {
+         if command.echo {
+@@ -421,9 +431,10 @@ impl<'a> Executor<'a> {
+             return Ok((output_ts, None));
+         }
+         let cwd = Bytes::from(self.ce.ev.working_dir.as_os_str().as_bytes().to_vec());
++        let box_prefix = self.ce.ev.box_export_prefix.clone();
+         Ok((
+             output_ts,
+-            Some(RunReq { output, commands, exports, cwd, result_ts: output_ts }),
++            Some(RunReq { output, commands, exports, cwd, box_prefix, result_ts: output_ts }),
+         ))
+     }
+ 
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 411959c..eabab19 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -583,6 +583,7 @@ pub fn shell_func_impl(
+     shellflag: &[u8],
+     cmd: &Bytes,
+     loc: &Loc,
++    box_prefix: &[u8],
+ ) -> Result<(i32, Bytes, Option<FindCommand>)> {
+     log!("ShellFunc: {:?}", cmd);
+ 
+@@ -594,6 +595,17 @@ pub fn shell_func_impl(
+     }
+ 
+     collect_stats_with_slow_report!("func shell time", OsStr::from_bytes(cmd));
++    // box mode: prepend the make's exported-var prefix so $(shell) sees the
++    // make's `export`s (in-process, where we can't stage them into the process
++    // env). Applied to the run subshell, never to the find-emulator parse above.
++    let cmd: Bytes = if box_prefix.is_empty() {
++        cmd.clone()
++    } else {
++        let mut v = box_prefix.to_vec();
++        v.extend_from_slice(cmd);
++        Bytes::from(v)
++    };
++    let cmd = &cmd;
+     let (status, output) = run_command(shell, shellflag, cmd, RedirectStderr::None)?;
+     let output = Bytes::from(format_for_command_substitution(output));
+ 
+@@ -693,8 +705,9 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
+     let loc = ev.loc.clone().unwrap_or_default();
+     let shell = ev.get_shell()?;
+     let shellflag = ev.get_shell_flag();
++    let box_prefix = ev.box_export_prefix.clone();
+ 
+-    let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc)?;
++    let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix)?;
+     out.put_slice(&output);
+     if should_store_command_result(&cmd) {
+         COMMAND_RESULTS.lock().push(CommandResult {
+@@ -735,8 +748,9 @@ fn shell_no_rerun_func(
+     let loc = ev.loc.clone().unwrap_or_default();
+     let shell = ev.get_shell()?;
+     let shellflag = ev.get_shell_flag();
++    let box_prefix = ev.box_export_prefix.clone();
+ 
+-    let (exit_code, output, _) = shell_func_impl(&shell, shellflag, &cmd, &loc)?;
++    let (exit_code, output, _) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix)?;
+     out.put_slice(&output);
+     set_shell_status_var(exit_code);
+     Ok(())

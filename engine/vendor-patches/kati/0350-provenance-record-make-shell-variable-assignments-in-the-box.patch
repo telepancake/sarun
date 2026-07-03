@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 06:15:21 +0000
+Subject: [PATCH] provenance: record make+shell variable assignments in the box
+ DB
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Complex builds pass values make → shell → sub-make and back; tracing a
+wrong value ("aabb") needs the whole assignment chain, searchable in the
+box DB — not stderr traces behind magic flags.
+
+New makevar table (name, loc, value, make_dir; UNIQUE-deduped) fed by:
+- kati: a VarAssignHook in eval_assign records every makefile-level
+  assignment at its ASSIGNMENT site (stmt loc — += points at the append,
+  not the original :=), skipping bootstrap/command-line noise.
+- brush: an AssignObserver in apply_assignment plus a hook in the export
+  builtin record shell scalars and `export NAME=…` inside recipes/
+  pipelines, tagged "recipe of <edge>" / "pipeline #<uid>". The box
+  export-prefix replay is suppressed (SUPPRESS_VAR_RECORD) so per-
+  subshell export noise never lands in the table.
+
+Rows batch through a make_vars frame (256/flush) into the box sqlar;
+review.makevars searches name/value with text globs. test_make_rs.py
+case 24 pins the full chain: make :=/+= with file:line locs, shell
+scalar, export builtin, sub-make override, and prefix suppression.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/eval.rs     | 12 ++++++++++++
+ src-rs/fileutil.rs | 22 ++++++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 6b6f666..05aeb70 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -750,6 +750,18 @@ impl Evaluator {
+             var.write().readonly = true
+         }
+         self.trace_variable_assign(&lhs, &var)?;
++        // sarun: feed the engine's assignment recorder — makefile-level
++        // assignments only (bootstrap/command-line noise is engine plumbing).
++        if !self.is_bootstrap && !self.is_commandline {
++            let g = var.read();
++            // the ASSIGNMENT site (stmt.loc), not the variable's original
++            // definition loc — `+=` must point at the append, not the `:=`.
++            let loc = stmt.loc().to_string();
++            let val = g.string().unwrap_or(std::borrow::Cow::Borrowed(b""));
++            crate::fileutil::report_var_assign(
++                &lhs.as_bytes(), &loc, &val,
++                self.working_dir.as_os_str().as_bytes());
++        }
+         Ok(())
+     }
+ 
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index abb998a..99cfd63 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -388,3 +388,25 @@ pub fn fnmatch(pattern: &CString, string: &[u8], flags: i32) -> bool {
+ pub fn clear_glob_cache() {
+     GLOB_CACHE.lock().clear();
+ }
++
++// sarun: optional hook observing every makefile-level variable assignment
++// (name, "file:line", value, make working dir). The embedding engine records
++// them into the box's capture database so wrong-value hunts are a query, not
++// a rerun with trace flags. Same Arc-clone-then-release pattern as the other
++// hooks (the callback may allocate / send frames).
++pub type VarAssignHook =
++    Arc<dyn Fn(&[u8], &str, &[u8], &[u8]) + Send + Sync + 'static>;
++
++static VAR_ASSIGN_HOOK: parking_lot::Mutex<Option<VarAssignHook>> =
++    parking_lot::Mutex::new(None);
++
++pub fn install_var_assign_hook(f: VarAssignHook) {
++    *VAR_ASSIGN_HOOK.lock() = Some(f);
++}
++
++pub fn report_var_assign(name: &[u8], loc: &str, value: &[u8], make_dir: &[u8]) {
++    let h = VAR_ASSIGN_HOOK.lock().clone();
++    if let Some(h) = h {
++        h(name, loc, value, make_dir);
++    }
++}

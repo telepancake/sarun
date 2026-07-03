@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 21 Jun 2026 04:48:41 +0000
+Subject: [PATCH] brush-core: launch-state hooks for nice/setsid/nohup exec
+ wrappers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 3/3 over pristine brush. Adds the seam the in-process exec-wrapper
+builtins (engine-side: nice/setsid/nohup) need to carry dispositions only a
+real process can hold down to fork→exec:
+
+  * interp.rs: a `LaunchState { niceness, new_session, ignore_sighup }`
+    struct and a `launch_state` field on `ExecutionParameters`, both
+    Default-empty so the normal command path is unaffected.
+  * commands.rs: a second `compose_std_command` pre_exec hook that
+    materializes a non-empty launch state in the child via
+    setpriority/setsid/signal(SIGHUP,SIG_IGN) — async-signal-safe, skipped
+    entirely when the state is empty.
+  * lib.rs: re-export `LaunchState`.
+
+The wrappers themselves live in engine/src/exec_wrappers.rs (not vendored);
+this is only the brush-core extension they ride on.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/commands.rs | 36 ++++++++++++++++++++++++++++++++++++
+ src/interp.rs   | 20 ++++++++++++++++++++
+ src/lib.rs      |  2 +-
+ 3 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/src/commands.rs b/src/commands.rs
+index d1bdf31..9532746 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -292,6 +292,42 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
+         }
+     }
+ 
++    // sarun fix (NOT upstream brush): materialize the launch-state overrides set
++    // by the in-process exec-wrapper builtins (nice/setsid/nohup). These are
++    // dispositions only a real process can carry, so they apply in the forked
++    // child just before execve. The common path leaves `launch_state` empty and
++    // skips the hook entirely.
++    //
++    // SAFETY: the closure runs between fork() and execve(). It captures only
++    // small Copy values (no allocation) and calls setsid(2)/sigaction-class
++    // signal(2)/setpriority(2) — all async-signal-safe per POSIX.
++    #[cfg(target_os = "linux")]
++    {
++        let launch = context.params.launch_state.clone();
++        if launch.new_session || launch.ignore_sighup || launch.niceness.is_some() {
++            use std::os::unix::process::CommandExt;
++            unsafe {
++                cmd.pre_exec(move || {
++                    // New session first (also detaches from the controlling tty).
++                    if launch.new_session {
++                        libc::setsid();
++                    }
++                    // Ignore SIGHUP so the child survives a hangup.
++                    if launch.ignore_sighup {
++                        libc::signal(libc::SIGHUP, libc::SIG_IGN);
++                    }
++                    // Best-effort priority: lowering priority (positive nice) is
++                    // unprivileged; raising it may be denied — match `nice` and
++                    // run the command anyway rather than failing the exec.
++                    if let Some(n) = launch.niceness {
++                        libc::setpriority(libc::PRIO_PROCESS, 0, n);
++                    }
++                    Ok(())
++                });
++            }
++        }
++    }
++
+     Ok(cmd)
+ }
+ 
+diff --git a/src/interp.rs b/src/interp.rs
+index 91fbeef..8334221 100644
+--- a/src/interp.rs
++++ b/src/interp.rs
+@@ -28,6 +28,23 @@ struct PipelineExecutionContext<'a, SE: extensions::ShellExtensions> {
+     process_group_id: Option<i32>,
+ }
+ 
++/// Launch-state overrides that materialize onto a spawned child process at
++/// fork→exec (see `commands::compose_std_command`). These are set by sarun's
++/// in-process exec-wrapper builtins (`nice`/`setsid`/`nohup`): they describe
++/// dispositions that only a real process can carry, so they are applied in the
++/// child between `fork()` and `execve()`. Empty by default — zero effect on the
++/// normal command path. NOT upstream brush.
++#[derive(Clone, Default)]
++pub struct LaunchState {
++    /// Absolute nice value (priority) to apply to the child via `setpriority`
++    /// (`nice`). `None` leaves the inherited priority untouched.
++    pub niceness: Option<i32>,
++    /// Start the child in a new session via `setsid` (`setsid`).
++    pub new_session: bool,
++    /// Set the child's `SIGHUP` disposition to `SIG_IGN` (`nohup`).
++    pub ignore_sighup: bool,
++}
++
+ /// Parameters for execution.
+ #[derive(Clone, Default)]
+ pub struct ExecutionParameters {
+@@ -38,6 +55,9 @@ pub struct ExecutionParameters {
+     /// Whether `errexit` (exit on error) behavior should be
+     /// suppressed in this execution context. Defaults to `false`.
+     pub suppress_errexit: bool,
++    /// sarun (NOT upstream brush): launch-state overrides materialized onto a
++    /// spawned child at fork→exec by the in-process exec-wrapper builtins.
++    pub launch_state: LaunchState,
+ }
+ 
+ impl ExecutionParameters {
+diff --git a/src/lib.rs b/src/lib.rs
+index ee0cdfa..b21b9cc 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -53,7 +53,7 @@ pub mod parser {
+ pub use commands::{CommandArg, ExecutionContext};
+ pub use error::{BuiltinError, Error, ErrorKind};
+ pub use extensions::ShellExtensions;
+-pub use interp::{ExecutionParameters, ProcessGroupPolicy};
++pub use interp::{ExecutionParameters, LaunchState, ProcessGroupPolicy};
+ pub use parser::{SourcePosition, SourcePositionOffset, SourceSpan};
+ pub use results::{ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ExecutionSpawnResult};
+ pub use shell::{

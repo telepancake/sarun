@@ -1,0 +1,213 @@
+# Pinned upstream sources for engine/vendor/ (assembled by scripts/vendor.py).
+# Per crate: pristine source pin + hash; the sarun delta lives in
+# engine/vendor-patches/<crate>/ as a patch series. See vendor-patches/README.md.
+
+[crates.brush-builtins]
+source = "git"
+url = "https://github.com/reubeno/brush"
+commit = "428f47747a890061ae14da2645621751972a5dc9"
+subdir = "brush-builtins"
+
+[crates.brush-core]
+source = "git"
+url = "https://github.com/reubeno/brush"
+commit = "428f47747a890061ae14da2645621751972a5dc9"
+subdir = "brush-core"
+
+[crates.brush-coreutils-builtins]
+source = "git"
+url = "https://github.com/reubeno/brush"
+commit = "428f47747a890061ae14da2645621751972a5dc9"
+subdir = "brush-coreutils-builtins"
+
+[crates.brush-interactive]
+source = "git"
+url = "https://github.com/reubeno/brush"
+commit = "428f47747a890061ae14da2645621751972a5dc9"
+subdir = "brush-interactive"
+
+[crates.brush-parser]
+source = "git"
+url = "https://github.com/reubeno/brush"
+commit = "428f47747a890061ae14da2645621751972a5dc9"
+subdir = "brush-parser"
+
+[crates.findutils]
+source = "git"
+url = "https://github.com/uutils/findutils"
+commit = "c03e1941c8216e636ffb7ab2698585a78211251e"
+
+[crates.kati]
+source = "git"
+url = "https://github.com/google/kati"
+commit = "7eb37cd16ed29b90335983689d3c6caabc17ca70"
+
+[crates.n2]
+source = "git"
+url = "https://github.com/evmar/n2"
+commit = "b1fead52ccda0c497d816696f23f4099c3e8ec1f"
+
+[crates.uu_basename]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "48b987741da8aaf4f2e4e2f555a6af2e78638dbdb086a96685e83f5f77dfd8d1"
+
+[crates.uu_cat]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "2b8c8b09c26aa08c010112715ff724a76fc8a8497c615830ca732e3ebe5c8429"
+
+[crates.uu_chmod]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "badd45e9215a3226bf3d0d43ba85cbd27428ceeec5e03c735ade81b9c16239e2"
+
+[crates.uu_chown]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "1c0ad42ce1ca3755249f4c1a359de89bbfc9128408327a6eb9a53b2972a3d825"
+
+[crates.uu_cp]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "37ee02f3f636a8623ec3ed03c54d615070da244dc0f4651956c01532cce8181b"
+
+[crates.uu_cut]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "5cf7033be7abad2a2374d413038e9eee85c3df2995b55e997ff51c2c007f3785"
+
+[crates.uu_dirname]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "c343f96d17471045a3a18f13519f5f70e899fdee4f33baf8603bd28aa2f80e37"
+
+[crates.uu_expr]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "ed64433d224c496a8e1b49a95a15309e2c5a5dbb9785bc3ee75ebe1705791227"
+
+[crates.uu_head]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "584ec5c7cc8dea56ff27caebab105b78230d071a72da32c46942383afae63ba7"
+
+[crates.uu_id]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "701abc17994af31f0c9b081c9f35d0db317d95b3e0b6de6f44b8065ae473e804"
+
+[crates.uu_install]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "0d36d19c7d29fdf3bac22b4d2c095becc59ecf410cb1a338d2e5a21d121e16b2"
+
+[crates.uu_ln]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "6f18b16fa96dc02278b48660b06697e824332f4ed5e8d98b74eacf18342af0ff"
+
+[crates.uu_mkdir]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "99f996d7f444f1bc97e0c5410f4be5a5bfc5716946535d62b201a828af75e633"
+
+[crates.uu_mktemp]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "3db4a418f8212d898746703cbc394c6731af4be0584dfb015ecd6edbbe9c227c"
+
+[crates.uu_mv]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "21327f17773efe1b736d9129016985d5ad2faf3aebc723d25e7590414b37f64e"
+
+[crates.uu_nl]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "45b97f35bfc870d794a8e344814168ccabe3cd6d99a034f2b1cfbe397b50111b"
+
+[crates.uu_nproc]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "a9dfc45a50d91cc9374269c637bcbf32835e663b819e0547a43ae23e974d0f57"
+
+[crates.uu_readlink]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "1fbc55e39327cd621699547180b81b65be0af812b47d0a8f2e9a4ec1424c4086"
+
+[crates.uu_realpath]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "b5102deb8ac0b61da568d863ec77527f94f569a621f1cfe577020ca7f2a6eb71"
+
+[crates.uu_rm]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "e5985b6455293340223b85ecdcd9d97010a75ed6aac50558c0cd0c1b3138e71c"
+
+[crates.uu_rmdir]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "bb985d50db34c4a8cd0033156f8b066010dd685fc3a3120abae7813f8ab825e4"
+
+[crates.uu_seq]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "47982431a60b163c1982d855c47711cfc687637ab9947f1b09add47f054c6ce4"
+
+[crates.uu_sort]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "046f6f6dade568214554a3441c6ec232c576a4e9a4edae8a993596084f431c77"
+
+[crates.uu_tac]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "dd42244db1f0b0cb96d427c615c0625b37ba9531932daa7e3d16da9b341eb7b6"
+
+[crates.uu_tail]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "f492ecc70829e2deb6cb815b6927dd78ac4c1b0c027819870a5d25de589e31e1"
+
+[crates.uu_tee]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "ca95d8bad3884b3ae9fb059e84d55eac42576ac4c596d1479e6c7a2e6308b61d"
+
+[crates.uu_touch]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "af40dcd9620f96ec09f2439d29d0ed8b5afc496bb25d1b7a4970416bf4c5b72b"
+
+[crates.uu_tr]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "66cb5e5b150d2cee06188caa47eb60b758641344b64ca74563ea7836eb51591d"
+
+[crates.uu_uname]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "e26927e94535497b1ebe69e83a3ab36418524b610e55c205ee338999126f4315"
+
+[crates.uu_uniq]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "cbbe22768fab17ba38bf4ba0a15ab4941e3767eca1def697dfbbcf52876e47ab"
+
+[crates.uu_wc]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "1259afb879ebe4a9c5bc5e969b7806fbeaaea0e3a4c765c602258aaaee5f1b57"
+
+[crates.uu_whoami]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "87bf65bdd9e21258dd484aeb7567f5f833c486ed84ba5aa4fe3b1a93a20e7cee"
+
+[crates.uucore]
+source = "crates.io"
+version = "0.8.0"
+sha256 = "07d779636d827cde4100f0e65ff3fd23b0b1f1195055475c6e6813d425f30c8e"

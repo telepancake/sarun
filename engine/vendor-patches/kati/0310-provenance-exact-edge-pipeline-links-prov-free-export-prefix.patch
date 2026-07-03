@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 2 Jul 2026 12:58:57 +0000
+Subject: [PATCH] =?UTF-8?q?provenance:=20exact=20edge=E2=86=94pipeline=20l?=
+ =?UTF-8?q?inks,=20prov-free=20export=20prefix,=20failure=20surfacing?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root-cause navigation was imprecise-to-useless: the edge↔pipeline
+mapping guessed by execution-time windows, every recipe's ~hundred
+injected `export …` prefix lines were recorded as pipelines (the
+'100000 events'), a failed build's error text was captured but never
+rendered, and nothing showed 'this started that'.
+
+- Exact causality: katirun's edge reporter tags the worker thread with
+  the edge whose recipe is running (re-seeded across the brush recipe
+  thread like the pipeline uid); every pipeline record stamps
+  `edge_out`. review.map_ids joins on it — NO time-window fallback,
+  the tag is the only linkage.
+
+- The make export prefix no longer generates provenance: the recipe
+  runner receives it SEPARATELY (RecipeRunner/run_command gained a
+  prefix parameter), applies it to the same shell via run_string
+  (vars/exports land, nothing recorded), and only the user's recipe
+  goes through the recording path. $(shell …) gets the same
+  treatment. A synthetic failing build drops from 132 recorded
+  pipelines per recipe to the recipe's own 2.
+
+- Failures are surfaced: kati's executor keeps the TAIL ~1KB of each
+  recipe's merged output and ships it on the edge's Done report;
+  mark_build_edge_done stores it in output_excerpt. The edge detail
+  pane renders it (red on failure); the box overview leads with a
+  ── FAILURES ── section (failed edges with their excerpt's last line
+  + failed pipelines) fed by review.box_summary's new failures list.
+
+- 'This started that': the Pipelines detail pane shows the causal
+  neighborhood via review.pipeline_context — the parent pipeline (↑),
+  the pipelines it started (↳, failed ones marked), and the build edge
+  whose recipe it is (⚒).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/exec.rs     | 42 +++++++++++++++++++++++++++--------------
+ src-rs/fileutil.rs | 47 ++++++++++++++++++++++++++++++++++++++++------
+ src-rs/func.rs     | 19 ++++++-------------
+ 3 files changed, 75 insertions(+), 33 deletions(-)
+
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index ab11ce9..33ffbe3 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -303,8 +303,21 @@ fn run_node_commands(
+     let report = !FLAGS.is_dry_run && !req.commands.is_empty();
+     if report {
+         crate::fileutil::report_edge(output.as_bytes().as_ref(),
+-                                     crate::fileutil::EdgePhase::Start, 0);
++                                     crate::fileutil::EdgePhase::Start, 0, b"");
+     }
++    // Keep the TAIL ~1KB of the recipe's merged output for the edge row's
++    // excerpt — on failure the error text is at the end of the stream.
++    let excerpt = std::cell::RefCell::new(Vec::<u8>::new());
++    let mut emit = |b: &[u8]| {
++        {
++            let mut x = excerpt.borrow_mut();
++            x.extend_from_slice(b);
++            let overflow = x.len().saturating_sub(1024);
++            if overflow > 0 { x.drain(..overflow); }
++        }
++        emit(b)
++    };
++    let emit = &mut emit as &mut dyn FnMut(&[u8]);
+     for command in req.commands {
+         if command.echo {
+             // Echo LIVE, before running, so a hung command's line shows at once.
+@@ -314,23 +327,23 @@ fn run_node_commands(
+         if FLAGS.is_dry_run {
+             continue;
+         }
+-        // Run input = the exports prefix + the command (the prefix is applied to
+-        // the subshell but not echoed above).
+-        let run_input: Bytes = if prefix.is_empty() {
+-            command.cmd.clone()
+-        } else {
+-            let mut v = prefix.clone();
+-            v.extend_from_slice(&command.cmd);
+-            Bytes::from(v)
+-        };
+-        // In-process runner streams output straight to `emit` (live, mid-command);
+-        // the fork fallback captures then we emit it per-command.
++        // In-process runner gets the exports prefix SEPARATELY (it applies it
++        // to the recipe's shell without recording it as pipeline provenance);
++        // the fork fallback prepends it to the input as before.
+         let (ok, code) =
+             if let Some(code) = run_with_installed_runner(
+-                shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout, emit)
++                shell, shellflag, &prefix, &command.cmd, &cwd,
++                RedirectStderr::Stdout, emit)
+             {
+                 (code == 0, code)
+             } else {
++                let run_input: Bytes = if prefix.is_empty() {
++                    command.cmd.clone()
++                } else {
++                    let mut v = prefix.clone();
++                    v.extend_from_slice(&command.cmd);
++                    Bytes::from(v)
++                };
+                 match run_command(shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout) {
+                     Ok((status, o)) => { emit(&o); (status.success(), status.code().unwrap_or(1)) }
+                     Err(e) => { emit(format!("{e}\n").as_bytes()); (false, 1) }
+@@ -348,7 +361,8 @@ fn run_node_commands(
+     if report {
+         let code = failure.map(|(_, c)| c).unwrap_or(0);
+         crate::fileutil::report_edge(output.as_bytes().as_ref(),
+-                                     crate::fileutil::EdgePhase::Done, code);
++                                     crate::fileutil::EdgePhase::Done, code,
++                                     &excerpt.borrow());
+     }
+     NodeRun { output, ignored, failure, result_ts: req.result_ts }
+ }
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index a9e2d43..abb998a 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -57,6 +57,7 @@ pub type RecipeRunner = Arc<
+     dyn Fn(
+             &[u8], /* shell */
+             &[u8], /* shellflag */
++            &[u8], /* prov-free prefix (make's export lines — run, not recorded) */
+             &[u8], /* cmd */
+             &[u8], /* recipe cwd (the make's working_dir, as path bytes) */
+             RedirectStderr, /* stderr disposition (merge into output / inherit / discard) */
+@@ -88,6 +89,11 @@ pub fn install_recipe_runner(f: RecipeRunner) {
+ pub fn run_with_installed_runner(
+     shell: &[u8],
+     shellflag: &[u8],
++    // The make's export prefix — the runner applies it to the recipe's shell
++    // WITHOUT recording its lines as pipeline provenance (it's engine
++    // plumbing, not user commands; recording it buried real pipelines under
++    // hundreds of `export …` rows per recipe).
++    prefix: &[u8],
+     cmd: &[u8],
+     cwd: &[u8],
+     redirect_stderr: RedirectStderr,
+@@ -97,7 +103,7 @@ pub fn run_with_installed_runner(
+     // runner may run a recursive in-process make whose recipes re-enter here;
+     // holding this non-reentrant lock across the call would deadlock.
+     let runner = RECIPE_RUNNER.lock().as_ref()?.clone();
+-    match runner(shell, shellflag, cmd, cwd, redirect_stderr, out_cb) {
++    match runner(shell, shellflag, prefix, cmd, cwd, redirect_stderr, out_cb) {
+         RecipeRunnerDecision::Ran { code } => Some(code),
+         RecipeRunnerDecision::Passthrough => None,
+     }
+@@ -119,8 +125,11 @@ pub enum EdgePhase {
+     Done,
+ }
+ 
+-pub type EdgeReporter =
+-    Arc<dyn Fn(&[u8] /* output */, EdgePhase, i32 /* exit code */) + Send + Sync + 'static>;
++pub type EdgeReporter = Arc<
++    dyn Fn(&[u8] /* output */, EdgePhase, i32 /* exit code */,
++           &[u8] /* recipe output excerpt (tail ~1KB; empty on Start) */)
++        + Send + Sync + 'static,
++>;
+ 
+ static EDGE_REPORTER: parking_lot::Mutex<Option<EdgeReporter>> =
+     parking_lot::Mutex::new(None);
+@@ -133,10 +142,10 @@ pub fn install_edge_reporter(f: EdgeReporter) {
+ /// Report a build edge run-state transition through the installed reporter, if
+ /// any. Best-effort: no reporter → no-op. The reporter Arc is cloned and the
+ /// lock released before the call (the reporter may do I/O / re-enter kati).
+-pub fn report_edge(output: &[u8], phase: EdgePhase, code: i32) {
++pub fn report_edge(output: &[u8], phase: EdgePhase, code: i32, excerpt: &[u8]) {
+     let r = EDGE_REPORTER.lock().clone();
+     if let Some(r) = r {
+-        r(output, phase, code);
++        r(output, phase, code, excerpt);
+     }
+ }
+ use parking_lot::Mutex;
+@@ -170,6 +179,22 @@ pub fn run_command(
+     cmd: &Bytes,
+     cwd: &[u8],
+     redirect_stderr: RedirectStderr,
++) -> Result<(ExitStatus, Vec<u8>)> {
++    run_command_prefixed(shell, shellflag, b"", cmd, cwd, redirect_stderr)
++}
++
++/// run_command with a make export PREFIX handed to the in-process runner
++/// SEPARATELY (applied to the subshell, not recorded as pipeline provenance);
++/// the fork fallback prepends it to the input text. $(shell …) in box mode
++/// uses this so its provenance shows the user's command, not the make's
++/// export plumbing.
++pub fn run_command_prefixed(
++    shell: &[u8],
++    shellflag: &[u8],
++    prefix: &[u8],
++    cmd: &Bytes,
++    cwd: &[u8],
++    redirect_stderr: RedirectStderr,
+ ) -> Result<(ExitStatus, Vec<u8>)> {
+     // sarun: route through the in-process runner (embedded brush) before
+     // fork+exec'ing /bin/sh — so $(shell ...), regen, and any other run_command
+@@ -184,11 +209,21 @@ pub fn run_command(
+     if !cwd.is_empty() {
+         let mut output = Vec::new();
+         if let Some(code) = run_with_installed_runner(
+-            shell, shellflag, cmd, cwd, redirect_stderr, &mut |b| output.extend_from_slice(b))
++            shell, shellflag, prefix, cmd, cwd, redirect_stderr,
++            &mut |b| output.extend_from_slice(b))
+         {
+             return Ok((ExitStatus::from_raw((code & 0xff) << 8), output));
+         }
+     }
++    // Fork fallback: the prefix rides the input text (a real sh applies it
++    // the same way; nothing records provenance on this path).
++    let cmd_prefixed: Bytes;
++    let cmd = if prefix.is_empty() { cmd } else {
++        let mut v = prefix.to_vec();
++        v.extend_from_slice(cmd);
++        cmd_prefixed = Bytes::from(v);
++        &cmd_prefixed
++    };
+ 
+     let mut cmd_with_shell;
+     let args = if !shell.starts_with(b"/") || memchr2(b' ', b'$', shell).is_some() {
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 629f5d1..bf82fb9 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -33,7 +33,7 @@ use crate::{
+     eval::{Evaluator, ExportAllowed, FrameType},
+     expr::{Evaluable, Value},
+     file_cache::add_extra_file_dep,
+-    fileutil::{RedirectStderr, run_command},
++    fileutil::{RedirectStderr, run_command_prefixed},
+     find::FindCommand,
+     flags::FLAGS,
+     kati_warn_loc,
+@@ -596,18 +596,11 @@ pub fn shell_func_impl(
+     }
+ 
+     collect_stats_with_slow_report!("func shell time", OsStr::from_bytes(cmd));
+-    // box mode: prepend the make's exported-var prefix so $(shell) sees the
+-    // make's `export`s (in-process, where we can't stage them into the process
+-    // env). Applied to the run subshell, never to the find-emulator parse above.
+-    let cmd: Bytes = if box_prefix.is_empty() {
+-        cmd.clone()
+-    } else {
+-        let mut v = box_prefix.to_vec();
+-        v.extend_from_slice(cmd);
+-        Bytes::from(v)
+-    };
+-    let cmd = &cmd;
+-    let (status, output) = run_command(shell, shellflag, cmd, cwd, RedirectStderr::None)?;
++    // box mode: the make's exported-var prefix rides SEPARATELY so the
++    // in-process runner applies it to the subshell without recording it as
++    // pipeline provenance ($(shell)'s recorded cmd is the user's command).
++    let (status, output) = run_command_prefixed(
++        shell, shellflag, box_prefix, cmd, cwd, RedirectStderr::None)?;
+     let output = Bytes::from(format_for_command_substitution(output));
+ 
+     if let Some(exit_code) = status.code() {

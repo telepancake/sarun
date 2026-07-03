@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 22 Jun 2026 16:38:09 +0000
+Subject: [PATCH] uucore: make localization per-thread so multiple utils render
+ in one process
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+uucore is built for one util per process. Its embedded-Fluent-resource
+caches (UUCORE_FLUENT / CHECKSUM_FLUENT / UTIL_FLUENT) were process-global
+OnceLocks and util_name() a process-global LazyLock from argv[0]. The
+engine runs 13 distinct coreutils as in-process builtins, each on a fresh
+thread that calls init_localization("uu_X"). With process-global caches,
+the FIRST util to run pinned UTIL_FLUENT to its own .ftl; every later util
+on any thread then got that first util's resource, so its bundle lacked its
+own translate! keys and it printed RAW Fluent keys (e.g.
+`tac: tac-error-open-error`, `sort: sort-cannot-read`,
+`expr: expr-error-missing-argument`). util_name() likewise made utils that
+print through it (wc/sort/tr/...) show the host's argv[0] (`sarun:`).
+
+Three changes, all behavior-identical for the stock one-util case:
+
+* locale.rs: the three *_FLUENT caches become thread-local OnceLocks of a
+  leaked &'static FluentResource. parse_fluent_resource() now reads/writes
+  the calling thread's cache, so each util's thread parses and looks up ITS
+  OWN bundle — no cross-thread contamination. The leak gives the 'static
+  lifetime the shared FluentBundle needs and is bounded (<=3 small resources
+  per short-lived util thread, freed-equivalent at thread exit alongside the
+  thread-local LOCALIZER bundle that borrows them).
+
+* lib.rs: util_name() gains an optional per-thread override
+  (set_utility_name / UTIL_NAME_OVERRIDE) consulted before the global
+  LazyLock. Unset => unchanged. Lets an embedder name each util's thread.
+
+* build.rs: embed_static_utility_locales() now also recognizes sibling
+  utility crates named plainly `uu_<util>` (sarun's vendor forks), not only
+  registry checkouts named `uu_<util>-<version>`. Without this a vendored
+  uucore embeds NO per-util .ftl and every util prints raw keys.
+
+Verified: overlaying these patched files on a clean upstream uucore 0.8.0
+checkout (with a uu_test sibling so `test` embeds) passes all 31 locale
+unit tests, incl. test_thread_local_isolation.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TNBGBV51j5AH4j8k8ENi1W
+---
+ build.rs               | 22 +++++++++++----------
+ src/lib/lib.rs         | 30 ++++++++++++++++++++++++++++
+ src/lib/mods/locale.rs | 45 +++++++++++++++++++++++++++++++-----------
+ 3 files changed, 76 insertions(+), 21 deletions(-)
+
+diff --git a/build.rs b/build.rs
+index f3b4df3..099ebbb 100644
+--- a/build.rs
++++ b/build.rs
+@@ -248,16 +248,18 @@ fn embed_static_utility_locales(
+     for entry in entries {
+         let file_name = entry.file_name();
+         if let Some(dir_name) = file_name.to_str() {
+-            // Match uu_<util>-<version>
+-            if let Some((util_part, _)) = dir_name.split_once('-') {
+-                if let Some(util_name) = util_part.strip_prefix("uu_") {
+-                    embed_component_locales(
+-                        embedded_file,
+-                        locales_to_embed,
+-                        util_name,
+-                        |locale| entry.path().join(format!("locales/{locale}.ftl")),
+-                    )?;
+-                }
++            // Match a sibling utility crate directory. On a crates.io build the
++            // siblings are registry checkouts named `uu_<util>-<version>`; in
++            // sarun's vendor tree they are path forks named plainly `uu_<util>`
++            // (no version suffix). sarun patch: accept both — strip the optional
++            // `-<version>` tail, then the `uu_` prefix, so the vendored forks'
++            // `locales/*.ftl` get embedded too (without this, a vendored uucore
++            // embeds no per-util strings and every util prints raw Fluent keys).
++            let util_part = dir_name.split_once('-').map_or(dir_name, |(head, _)| head);
++            if let Some(util_name) = util_part.strip_prefix("uu_") {
++                embed_component_locales(embedded_file, locales_to_embed, util_name, |locale| {
++                    entry.path().join(format!("locales/{locale}.ftl"))
++                })?;
+             }
+         }
+     }
+diff --git a/src/lib/lib.rs b/src/lib/lib.rs
+index 2754868..c28a900 100644
+--- a/src/lib/lib.rs
++++ b/src/lib/lib.rs
+@@ -352,8 +352,38 @@ static UTIL_NAME: LazyLock<String> = LazyLock::new(|| {
+         .into_owned()
+ });
+ 
++thread_local! {
++    // sarun patch: per-thread override for `util_name()`. Stock uucore derives
++    // the utility name once, process-globally, from argv[0] — fine for the
++    // one-util-per-process model. An embedder that runs several utils in one
++    // process (each on its own thread) would otherwise see every util's
++    // diagnostics prefixed with the host's argv[0] (e.g. `sarun: ...` instead
++    // of `wc: ...`) for the utils that print via `util_name()` directly. When
++    // set, this thread-local takes precedence; unset, behavior is unchanged.
++    // The String is leaked once per thread so `util_name()` can keep returning
++    // `&'static str` (it outlives the util's short-lived thread).
++    static UTIL_NAME_OVERRIDE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
++}
++
++/// Set a per-thread override for [`util_name`]. Intended for embedders that run
++/// a utility's logical entry point on a dedicated thread within a long-lived
++/// process whose argv[0] is not the utility's name. Passing an empty string
++/// clears the override for the current thread.
++pub fn set_utility_name(name: &str) {
++    UTIL_NAME_OVERRIDE.with(|c| {
++        if name.is_empty() {
++            c.set(None);
++        } else {
++            c.set(Some(Box::leak(name.to_string().into_boxed_str())));
++        }
++    });
++}
++
+ /// Derive the utility name.
+ pub fn util_name() -> &'static str {
++    if let Some(name) = UTIL_NAME_OVERRIDE.with(std::cell::Cell::get) {
++        return name;
++    }
+     &UTIL_NAME
+ }
+ 
+diff --git a/src/lib/mods/locale.rs b/src/lib/mods/locale.rs
+index f25866b..c38f1f8 100644
+--- a/src/lib/mods/locale.rs
++++ b/src/lib/mods/locale.rs
+@@ -107,11 +107,26 @@ impl Localizer {
+     }
+ }
+ 
+-// Cache localizer. FluentResource cannot be shared between threads while FluentBundle can be shared
+-static UUCORE_FLUENT: OnceLock<FluentResource> = OnceLock::new();
+-static CHECKSUM_FLUENT: OnceLock<FluentResource> = OnceLock::new();
+-static UTIL_FLUENT: OnceLock<FluentResource> = OnceLock::new();
++// Cache localizer. FluentResource cannot be shared between threads while
++// FluentBundle can be shared.
++//
++// sarun patch: these embedded-resource caches are PER-THREAD, not process
++// global. Stock uucore made them process-global `OnceLock<FluentResource>`,
++// which is correct for the one-util-per-process design uutils ships, but
++// breaks an embedder that runs several distinct utils in one process (each on
++// its own thread). The first util to run pinned, say, UTIL_FLUENT to its own
++// `.ftl`; every later util then got that first util's resource back from the
++// cache, so its bundle lacked its own `translate!` keys and it emitted raw
++// Fluent keys (e.g. `tac: tac-error-open-error`). Making the caches
++// thread-local means each util's thread parses and caches ITS OWN resources,
++// with no cross-thread contamination. The cached value is a leaked Box so it
++// satisfies the `'static` lifetime `FluentBundle::add_resource_overriding`
++// needs and outlives the thread-local LOCALIZER bundle that borrows it (both
++// live until the thread exits). At most three small resources leak per thread.
+ thread_local! {
++    static UUCORE_FLUENT: OnceLock<&'static FluentResource> = const { OnceLock::new() };
++    static CHECKSUM_FLUENT: OnceLock<&'static FluentResource> = const { OnceLock::new() };
++    static UTIL_FLUENT: OnceLock<&'static FluentResource> = const { OnceLock::new() };
+     static LOCALIZER: OnceLock<Localizer> = const { OnceLock::new() };
+ }
+ 
+@@ -224,14 +239,21 @@ fn init_localization(
+     Ok(())
+ }
+ 
+-/// Helper function to parse FluentResource from content string
++/// Helper function to parse FluentResource from content string.
++///
++/// sarun patch: `cache` is a thread-local `OnceLock<&'static FluentResource>`
++/// (see the thread_local block above) rather than a process-global
++/// `OnceLock<FluentResource>`, so each thread caches its own resources and
++/// utils run in the same process can't contaminate each other's bundles. The
++/// resource is leaked once per thread to get the `'static` lifetime the shared
++/// `FluentBundle` requires; the cached `&'static` is then cheaply copied out.
+ fn parse_fluent_resource(
+     content: &str,
+-    cache: &'static OnceLock<FluentResource>,
++    cache: &'static std::thread::LocalKey<OnceLock<&'static FluentResource>>,
+ ) -> Result<&'static FluentResource, LocalizationError> {
+-    // global cache breaks unit tests
++    // per-thread cache breaks unit tests (they re-parse in one thread)
+     if cfg!(not(test)) {
+-        if let Some(res) = cache.get() {
++        if let Some(res) = cache.with(|c| c.get().copied()) {
+             return Ok(res);
+         }
+     }
+@@ -254,11 +276,12 @@ fn parse_fluent_resource(
+             }
+         },
+     )?;
+-    // global cache breaks unit tests
++    let leaked: &'static FluentResource = Box::leak(Box::new(resource));
++    // per-thread cache breaks unit tests
+     if cfg!(not(test)) {
+-        Ok(cache.get_or_init(|| resource))
++        Ok(cache.with(|c| *c.get_or_init(|| leaked)))
+     } else {
+-        Ok(Box::leak(Box::new(resource)))
++        Ok(leaked)
+     }
+ }
+ 

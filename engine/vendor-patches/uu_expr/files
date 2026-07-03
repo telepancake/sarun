@@ -1,0 +1,11 @@
+.cargo_vcs_info.json
+Cargo.toml
+Cargo.toml.orig
+LICENSE
+README.package.md
+locales/en-US.ftl
+locales/fr-FR.ftl
+src/expr.rs
+src/locale_aware.rs
+src/main.rs
+src/syntax_tree.rs

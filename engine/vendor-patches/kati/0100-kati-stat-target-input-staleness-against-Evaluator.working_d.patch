@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 10:38:40 +0000
+Subject: [PATCH] kati: stat target/input staleness against
+ Evaluator.working_dir
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The last logical-cwd boundary for the make builtin. get_timestamp() — kati's
+mtime stat for "is this target/input present and out of date" — resolved
+relative to the PROCESS cwd. A sub-make run with -C (working_dir != process
+cwd) therefore stat'd its targets and prerequisites in the WRONG directory and
+reported "No rule to make target 'X'" for inputs that exist in the sub-make's
+dir. Thread the Evaluator's working_dir through get_timestamp (and its callers
+in exec.rs and command.rs's auto-var $? newer-prereq computation), resolving
+relative names against it. base == process cwd is unchanged.
+
+This makes recursive `$(MAKE) -C subdir` builds with real input files work
+end-to-end in-process. Demonstrated by a genuine 2-directory C project: top
+make compiles main.o and links against a static lib built by a recursive
+`$(MAKE) -C lib` (cc -c + ar) — the linked program runs and prints
+square(7)=49, with the sub-make staying in this process (zero make rows).
+
+kati corpus 364/378 fail=0; full box suite MAKE-RS PASS (8 cases).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/command.rs  |  9 ++++++---
+ src-rs/exec.rs     |  2 +-
+ src-rs/fileutil.rs | 13 +++++++++----
+ 3 files changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/src-rs/command.rs b/src-rs/command.rs
+index be3a32e..bcff384 100644
+--- a/src-rs/command.rs
++++ b/src-rs/command.rs
+@@ -152,12 +152,15 @@ impl AutoCommandVar {
+                     }
+                 } else {
+                     let mut ww = WordWriter::new(out);
+-                    let target_age =
+-                        ExecStatus::Timestamp(get_timestamp(&current_dep_node.output.as_bytes())?);
++                    let target_age = ExecStatus::Timestamp(get_timestamp(
++                        &current_dep_node.output.as_bytes(),
++                        &ev.working_dir,
++                    )?);
+                     for ai in current_dep_node.actual_inputs.iter() {
+                         let ai_str = ai.as_bytes();
+                         if seen.insert(*ai)
+-                            && ExecStatus::Timestamp(get_timestamp(&ai_str)?) > target_age
++                            && ExecStatus::Timestamp(get_timestamp(&ai_str, &ev.working_dir)?)
++                                > target_age
+                         {
+                             ww.write(&ai_str)
+                         }
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index a744fba..2a36203 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -143,7 +143,7 @@ impl<'a> Executor<'a> {
+             .enter(FrameType::Exec, output_str.clone(), loc.unwrap_or_default());
+ 
+         self.done.insert(output, ExecStatus::Processing);
+-        let output_timestamp = get_timestamp(&output_str)?;
++        let output_timestamp = get_timestamp(&output_str, &self.ce.ev.working_dir)?;
+         let output_ts = ExecStatus::Timestamp(output_timestamp);
+ 
+         log!(
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 0017c48..1ea713f 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -100,12 +100,17 @@ pub enum RedirectStderr {
+     DevNull,
+ }
+ 
+-pub fn get_timestamp(filename: &[u8]) -> Result<Option<SystemTime>> {
+-    let filename = <OsStr as OsStrExt>::from_bytes(filename);
+-    if !std::fs::exists(filename)? {
++/// sarun: `base` is the Evaluator's logical working dir; a relative target/input
++/// name is stat'd against it instead of the process cwd, so a sub-make run with
++/// -C (working_dir != process cwd) checks staleness of its files in the RIGHT
++/// directory. Absolute names pass through; base == process cwd is unchanged.
++pub fn get_timestamp(filename: &[u8], base: &Path) -> Result<Option<SystemTime>> {
++    let p = Path::new(<OsStr as OsStrExt>::from_bytes(filename));
++    let path = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
++    if !std::fs::exists(&path)? {
+         return Ok(None);
+     }
+-    let metadata = std::fs::metadata(filename)?;
++    let metadata = std::fs::metadata(&path)?;
+     Ok(Some(metadata.modified()?))
+ }
+ 

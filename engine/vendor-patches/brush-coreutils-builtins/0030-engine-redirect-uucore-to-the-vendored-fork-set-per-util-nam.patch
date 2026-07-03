@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 22 Jun 2026 16:38:22 +0000
+Subject: [PATCH] engine: redirect uucore to the vendored fork + set per-util
+ name on init
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* engine/Cargo.toml: add `[patch.crates-io] uucore = { path =
+  "vendor/uucore" }`. This redirects the crates.io uucore 0.8.0 that backs
+  every uu_* builtin and brush-coreutils-builtins to the patched fork. The
+  0.9.0 uucore pulled in only by the vendored findutils is a different
+  version and stays on the registry, unaffected — a [patch] only matches the
+  version it provides (Cargo.lock: 0.8.0 now path-sourced, 0.9.0 untouched).
+
+* brush-coreutils-builtins init_localization (prepare_uutil_runtime): call
+  uucore::set_utility_name(canonical_name) alongside setup_localization, so
+  the per-thread util-name override is set for utils that print via
+  uucore::util_name() (wc now prints `wc:` not `sarun:`). canonical_name is
+  already the alias-mapped util name (uu_wc -> "wc").
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TNBGBV51j5AH4j8k8ENi1W
+---
+ src/lib.rs | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 3a6fd8b..5171f18 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -61,6 +61,14 @@ fn prepare_uutil_runtime(util_crate_name: &str) {
+     uucore::panic::preserve_inherited_sigpipe();
+     uucore::panic::mute_sigpipe_panic();
+     let localization_name = uucore::get_canonical_util_name(util_crate_name);
++    // sarun patch: set the per-thread utility name so utils that print
++    // diagnostics through `uucore::util_name()` (e.g. wc, sort, tr) show their
++    // own name rather than the host process's argv[0] ("sarun"). uucore derives
++    // util_name() process-globally from argv[0] — correct for the
++    // one-util-per-process model but wrong for an embedder running each util on
++    // its own thread. `localization_name` is already the canonical util name
++    // (uu_wc -> "wc", alias map applied), exactly what we want here.
++    uucore::set_utility_name(localization_name);
+     if let Err(err) = uucore::locale::setup_localization(localization_name) {
+         eprintln!("brush: could not initialize localization for '{localization_name}': {err}");
+         std::process::exit(99);

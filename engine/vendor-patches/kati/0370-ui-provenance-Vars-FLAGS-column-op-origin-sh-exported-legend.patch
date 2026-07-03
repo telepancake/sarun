@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 07:28:22 +0000
+Subject: [PATCH] ui/provenance: Vars FLAGS column (op + origin + sh/exported),
+ legends on lists
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Vars list drops the site column (the detail pane owns the full
+site) for a FLAGS column that says what each line IS: the make
+assignment op (:= = += ?= !=) plus the variable's origin when notable
+(env, env!, cmd, ovr, auto — kati now reports op+origin through the
+var hook), or sh / sh x (exported) for script assignments. The flag
+legend is spelled out at the top of the list — and the Changes list's
+glyph column (+ ~ - @ !) gets the same top-of-list legend treatment.
+
+The pty UI test asserts the column + legend and the tests pin the
+recorded flags (+=, sh, sh x) in the DB.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/eval.rs     | 10 +++++++++-
+ src-rs/fileutil.rs |  8 +++++---
+ 2 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index c6ec536..0db5b60 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -758,9 +758,17 @@ impl Evaluator {
+             // definition loc — `+=` must point at the append, not the `:=`.
+             let loc = stmt.loc().to_string();
+             let val = g.string().unwrap_or(std::borrow::Cow::Borrowed(b""));
++            let op = match stmt.op {
++                AssignOp::Eq => "=",
++                AssignOp::ColonEq => ":=",
++                AssignOp::PlusEq => "+=",
++                AssignOp::QuestionEq => "?=",
++                AssignOp::BangEq => "!=",
++            };
+             crate::fileutil::report_var_assign(
+                 &lhs.as_bytes(), &loc, &val,
+-                self.working_dir.as_os_str().as_bytes(), &stmt.orig_rhs);
++                self.working_dir.as_os_str().as_bytes(), &stmt.orig_rhs,
++                op, crate::var::get_origin_str(g.origin()));
+         }
+         Ok(())
+     }
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 395832e..156e857 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -394,9 +394,10 @@ pub fn clear_glob_cache() {
+ // them into the box's capture database so wrong-value hunts are a query, not
+ // a rerun with trace flags. Same Arc-clone-then-release pattern as the other
+ // hooks (the callback may allocate / send frames).
+-/// (name, loc, expanded value, make working dir, UNEXPANDED rhs text)
++/// (name, loc, expanded value, make working dir, UNEXPANDED rhs text,
++///  assignment op ("=" ":=" "+=" "?=" "!="), variable origin (get_origin_str))
+ pub type VarAssignHook =
+-    Arc<dyn Fn(&[u8], &str, &[u8], &[u8], &[u8]) + Send + Sync + 'static>;
++    Arc<dyn Fn(&[u8], &str, &[u8], &[u8], &[u8], &str, &str) + Send + Sync + 'static>;
+ 
+ static VAR_ASSIGN_HOOK: parking_lot::Mutex<Option<VarAssignHook>> =
+     parking_lot::Mutex::new(None);
+@@ -407,9 +408,10 @@ pub fn install_var_assign_hook(f: VarAssignHook) {
+ 
+ pub fn report_var_assign(
+     name: &[u8], loc: &str, value: &[u8], make_dir: &[u8], rhs: &[u8],
++    op: &str, origin: &str,
+ ) {
+     let h = VAR_ASSIGN_HOOK.lock().clone();
+     if let Some(h) = h {
+-        h(name, loc, value, make_dir, rhs);
++        h(name, loc, value, make_dir, rhs, op, origin);
+     }
+ }

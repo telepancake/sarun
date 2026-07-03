@@ -1,0 +1,2 @@
+0010-uu_rm-in-process-rm-builtin-injected-logical-I-O-logical-cwd.patch
+0020-uu_rm-suppress-ENOENT-errors-with-f-during-TOCTOU-races.patch

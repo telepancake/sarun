@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 09:51:52 +0000
+Subject: [PATCH] =?UTF-8?q?kati:=20explain=20WHY=20'No=20rule=20to=20make?=
+ =?UTF-8?q?=20target'=20=E2=80=94=20candidate-rule=20rejection=20notes?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A bare 'No rule to make target blah' in a big build is undiagnosable.
+When dependency analysis finds no rule for a needed target, it now
+records every implicit rule whose output pattern DOES match and the
+first prerequisite that disqualified it, and the error prints them:
+
+  *kati*: note: candidate pattern rule '%.o: %.c' at Makefile:3
+      rejected: needs 'prog.c', which does not exist and has no rule
+  *kati*: note: 'prog.o' comes from the prerequisite list of the rule
+      for 'all' at Makefile:2
+  *** No rule to make target 'prog.o', needed by 'all'.
+
+Capped at 4 candidates; the '*kati*:' prefix keeps corpus GNU-parity
+(normalizers strip it). Both corpora stay fail=0.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/dep.rs  | 57 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ src-rs/exec.rs |  3 +++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index a6a7f74..423108b 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -64,6 +64,11 @@ pub struct DepNode {
+     pub tags_var: Option<Var>,
+     pub output_pattern: Option<Symbol>,
+     pub loc: Option<Loc>,
++    /// Diagnosis for a rule-less node: WHY each candidate implicit rule was
++    /// rejected (its pattern + the first unbuildable prerequisite). Printed
++    /// with the "No rule to make target" error so a big build's failure is
++    /// traceable without -d spelunking.
++    pub no_rule_notes: Vec<String>,
+ }
+ 
+ impl DepNode {
+@@ -75,6 +80,7 @@ impl DepNode {
+             order_onlys: Vec::new(),
+             validations: Vec::new(),
+             has_rule: false,
++            no_rule_notes: Vec::new(),
+             is_default_target: false,
+             is_phony,
+             is_restat,
+@@ -1024,6 +1030,52 @@ impl<'a> DepBuilder<'a> {
+         Some(found)
+     }
+ 
++    /// For a target no rule matched: list each implicit rule whose output
++    /// pattern DOES match and the first prerequisite that disqualified it
++    /// (missing file, nothing to build it with). Empty when no pattern even
++    /// matches the name.
++    fn explain_no_rule(&mut self, output: Symbol) -> Vec<String> {
++        let output_str = output.as_bytes();
++        let mut notes = vec![];
++        for rule in self.implicit_rules.get(&output_str) {
++            for output_pattern in &rule.output_patterns {
++                let pat = Pattern::new(output_pattern.as_bytes());
++                if !pat.matches(&output_str) {
++                    continue;
++                }
++                let mut why = String::new();
++                for input in &rule.inputs {
++                    let buf = pat.append_subst(&output_str, &input.as_bytes());
++                    let sym = intern(buf);
++                    if !self.exists(sym)
++                        && self.vpath_resolve(sym).is_none()
++                        && !self.has_producing_rule_except(sym, &rule.output_patterns)
++                    {
++                        why = format!(
++                            "needs '{sym}', which does not exist and has no rule");
++                        break;
++                    }
++                }
++                if why.is_empty() {
++                    why = "prerequisites unbuildable through this chain".into();
++                }
++                let loc = rule.loc.clone();
++                notes.push(format!(
++                    "candidate pattern rule '{output_pattern}: {}' at {loc} rejected: {why}",
++                    rule.inputs
++                        .iter()
++                        .map(|i| i.to_string())
++                        .collect::<Vec<_>>()
++                        .join(" "),
++                ));
++                if notes.len() >= 4 {
++                    return notes;
++                }
++            }
++        }
++        notes
++    }
++
+     fn pick_rule(&mut self, output: Symbol, n: &Arc<Mutex<DepNode>>) -> Option<PickedRuleInfo> {
+         let rule_merger = self.lookup_rule_merger(output);
+         let mut vars = self.lookup_rule_vars(output);
+@@ -1222,6 +1274,11 @@ impl<'a> DepBuilder<'a> {
+         self.done.insert(output, n.clone());
+ 
+         let Some(mut picked_rule_info) = self.pick_rule(output, &n) else {
++            // No rule found. Record WHY the matching implicit rules were
++            // rejected so the eventual "No rule to make target" error can
++            // explain itself.
++            let notes = self.explain_no_rule(output);
++            n.lock().no_rule_notes = notes;
+             return Ok(n);
+         };
+         if let Some(merger) = &picked_rule_info.merger
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 6ccf28b..55fea54 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -478,6 +478,9 @@ impl<'a> Executor<'a> {
+             (g.has_rule, g.is_phony)
+         };
+         if !has_rule && output_timestamp.is_none() && !is_phony {
++            for note in &n.lock().no_rule_notes {
++                crate::exec::emit_recipe_err(&format!("*kati*: note: {note}"));
++            }
+             if let Some(dep_sym) = graph[&sym].dependents.first() {
+                 // Diagnosis aid: name the RULE whose prerequisite list produced
+                 // this target — a bad expansion (joined words, wrong subst) is

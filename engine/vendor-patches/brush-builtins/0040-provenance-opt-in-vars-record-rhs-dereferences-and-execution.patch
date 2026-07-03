@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 06:51:52 +0000
+Subject: [PATCH] provenance: opt-in --vars; record rhs, dereferences, and
+ execution context
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Variable tracing is now OPT-IN: `sarun run --vars` (exports
+SARUN_TRACE_VARS=1 into the box; both recorders early-return without
+it) — a yocto-scale build pays nothing by default.
+
+Each makevar row additionally records HOW the assignment looked and
+what fed it: the UNEXPANDED rhs text (kati stmt.orig_rhs / brush's
+assignment AST, capped 1KB) and the variable names it dereferences
+(text scan; make function heads excluded, $(call NAME,…)/$(value
+NAME) count their first argument) — plus its execution context: the
+recipe edge's primary output and the enclosing pipeline uid (a
+builtin sub-make parses on the invoking recipe's thread, so its
+assignments anchor to the spawning edge). review.makevars resolves
+those anchors to build_edges/brushprov row ids in the same query and
+grows an any-mode (OR name/value) for single-term searches. The kati
+hook also reports the ASSIGNMENT site (+= points at the append, not
+the original :=).
+
+test_make_rs.py case 24 covers rhs/refs, edge anchoring of shell and
+sub-make assignments, and that an untraced box records zero rows.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src/export.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/export.rs b/src/export.rs
+index ba5d5f8..a31f190 100644
+--- a/src/export.rs
++++ b/src/export.rs
+@@ -121,7 +121,7 @@ impl ExportCommand {
+                 // (apply_assignment doesn't see builtin-arg assignments).
+                 if !self.unexport {
+                     brush_core::interp::observe_assignment(
+-                        name, &value.to_string(), true);
++                        name, &value.to_string(), true, &assignment.to_string());
+                 }
+                 // Update the variable with the provided value and then mark it exported.
+                 context.shell.env_mut().update_or_add(

@@ -1,0 +1,14 @@
+.cargo_vcs_info.json
+BENCHMARKING.md
+Cargo.toml
+Cargo.toml.orig
+LICENSE
+README.package.md
+benches/rm_bench.rs
+benchmark.sh
+locales/en-US.ftl
+locales/fr-FR.ftl
+src/main.rs
+src/platform/mod.rs
+src/platform/unix.rs
+src/rm.rs

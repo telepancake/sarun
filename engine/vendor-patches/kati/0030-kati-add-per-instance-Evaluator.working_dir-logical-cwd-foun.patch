@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 08:40:50 +0000
+Subject: [PATCH] kati: add per-instance Evaluator.working_dir (logical-cwd
+ foundation)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+kati's path-resolving boundaries (makefile read, `include`,
+$(wildcard)/$(abspath)/$(realpath)/$(file), the find emulator root) currently
+resolve relative paths against the *process* cwd — today made to work by
+katirun doing std::env::set_current_dir for -C. That blocks running embedded
+make as an in-process brush builtin: the builtin must resolve against the
+brush shell's logical cwd WITHOUT chdir'ing the process, and concurrent
+in-process instances in different directories must not race on it.
+
+Introduce a per-instance `working_dir` on the Evaluator, seeded from the
+process cwd so standalone rkati and the corpus are byte-identical
+(KATI_COMPAT_PASS=364/378, fail=0). The boundaries will be threaded to resolve
+against this in follow-up commits — carefully, since makefile/include paths
+appear in output ($(MAKEFILE_LIST), $(abspath), parse-error Loc strings), so
+resolution must redirect the fs access while preserving the original name for
+display. The cwd-sensitive caches (file_cache, glob, find) then stay global
+but key by the absolute path resolved at the boundary — correct and shareable
+across instances, minimal churn.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/eval.rs | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index f150c5a..a5d5fef 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -251,6 +251,14 @@ pub struct Evaluator {
+     /// per-instance. Behind Arc<Mutex> so a ScopedGlobalVar can restore its
+     /// saved binding on Drop without needing an &Evaluator.
+     pub global_vars: Arc<Mutex<Vec<Option<Var>>>>,
++    /// sarun: per-instance logical working directory. kati's path-resolving
++    /// boundaries (makefile read, `include`, `$(wildcard)`/`$(abspath)`/
++    /// `$(realpath)`/`$(file)`, the find emulator root) resolve relative paths
++    /// against THIS instead of the process cwd, so an in-process `make` builtin
++    /// can run against the brush shell's logical cwd without `chdir`-ing the
++    /// process — and concurrent instances in different directories don't race
++    /// on it. Seeded from the process cwd so standalone rkati is unchanged.
++    pub working_dir: std::path::PathBuf,
+     pub rules: Vec<Rule>,
+     pub exports: HashMap<Symbol, bool>,
+     /// sarun: set when the makefile names `.EXPORT_ALL_VARIABLES` as a
+@@ -316,6 +324,7 @@ impl Evaluator {
+         let ev = Self {
+             rule_vars: HashMap::new(),
+             global_vars: Arc::new(Mutex::new(Vec::new())),
++            working_dir: std::env::current_dir().unwrap_or_default(),
+             rules: Vec::new(),
+             exports: HashMap::new(),
+             export_all_vars: false,

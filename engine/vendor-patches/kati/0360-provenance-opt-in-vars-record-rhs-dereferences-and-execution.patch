@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 06:51:52 +0000
+Subject: [PATCH] provenance: opt-in --vars; record rhs, dereferences, and
+ execution context
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Variable tracing is now OPT-IN: `sarun run --vars` (exports
+SARUN_TRACE_VARS=1 into the box; both recorders early-return without
+it) — a yocto-scale build pays nothing by default.
+
+Each makevar row additionally records HOW the assignment looked and
+what fed it: the UNEXPANDED rhs text (kati stmt.orig_rhs / brush's
+assignment AST, capped 1KB) and the variable names it dereferences
+(text scan; make function heads excluded, $(call NAME,…)/$(value
+NAME) count their first argument) — plus its execution context: the
+recipe edge's primary output and the enclosing pipeline uid (a
+builtin sub-make parses on the invoking recipe's thread, so its
+assignments anchor to the spawning edge). review.makevars resolves
+those anchors to build_edges/brushprov row ids in the same query and
+grows an any-mode (OR name/value) for single-term searches. The kati
+hook also reports the ASSIGNMENT site (+= points at the append, not
+the original :=).
+
+test_make_rs.py case 24 covers rhs/refs, edge anchoring of shell and
+sub-make assignments, and that an untraced box records zero rows.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/eval.rs     | 2 +-
+ src-rs/fileutil.rs | 9 ++++++---
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 05aeb70..c6ec536 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -760,7 +760,7 @@ impl Evaluator {
+             let val = g.string().unwrap_or(std::borrow::Cow::Borrowed(b""));
+             crate::fileutil::report_var_assign(
+                 &lhs.as_bytes(), &loc, &val,
+-                self.working_dir.as_os_str().as_bytes());
++                self.working_dir.as_os_str().as_bytes(), &stmt.orig_rhs);
+         }
+         Ok(())
+     }
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 99cfd63..395832e 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -394,8 +394,9 @@ pub fn clear_glob_cache() {
+ // them into the box's capture database so wrong-value hunts are a query, not
+ // a rerun with trace flags. Same Arc-clone-then-release pattern as the other
+ // hooks (the callback may allocate / send frames).
++/// (name, loc, expanded value, make working dir, UNEXPANDED rhs text)
+ pub type VarAssignHook =
+-    Arc<dyn Fn(&[u8], &str, &[u8], &[u8]) + Send + Sync + 'static>;
++    Arc<dyn Fn(&[u8], &str, &[u8], &[u8], &[u8]) + Send + Sync + 'static>;
+ 
+ static VAR_ASSIGN_HOOK: parking_lot::Mutex<Option<VarAssignHook>> =
+     parking_lot::Mutex::new(None);
+@@ -404,9 +405,11 @@ pub fn install_var_assign_hook(f: VarAssignHook) {
+     *VAR_ASSIGN_HOOK.lock() = Some(f);
+ }
+ 
+-pub fn report_var_assign(name: &[u8], loc: &str, value: &[u8], make_dir: &[u8]) {
++pub fn report_var_assign(
++    name: &[u8], loc: &str, value: &[u8], make_dir: &[u8], rhs: &[u8],
++) {
+     let h = VAR_ASSIGN_HOOK.lock().clone();
+     if let Some(h) = h {
+-        h(name, loc, value, make_dir);
++        h(name, loc, value, make_dir, rhs);
+     }
+ }

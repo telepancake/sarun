@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 25 Jun 2026 09:33:43 +0000
+Subject: [PATCH] brush: snoop self-shadowed /bin/sh scripts in-process (no
+ fork+reexec)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In a -b box, /bin/sh (and the bash/dash aliases) are bind-shadowed with the
+engine binary, so every nested `sh -c` / `sh script` / `#!/bin/sh` a build
+spawns used to fork+reexec sarun and re-enter brush — the "sh storm" visible
+during ./configure. This adds an in-process snoop: when a box brush shell is
+about to fork an external command that resolves to our OWN binary, interpret
+the script in-process on a clone of the calling shell instead.
+
+Mechanism:
+- brush-core: a thin embedder seam. A new `commands::ExecInterposer<SE>` trait
+  with a cheap sync `wants(&Path)` filter (runs on every external exec, before
+  any clone) and an async `run(sub, resolved, argv, params)`; an optional
+  `Arc<dyn ExecInterposer>` field on Shell, inherited by clones, consulted at
+  SimpleCommand::execute's external-exec point. `run` takes an owned subshell
+  clone (so its future is 'static) and the caller's params (so per-command
+  redirects/fds carry through), mirroring builtin_exec::run_one.
+- sarun (brush.rs): SnoopInterposer implements the trait. Self-detection is
+  box-side and config-free: the FUSE shadow keeps the path's own inode but
+  serves the engine binary's size+content, so we compare a candidate's size +
+  head bytes against /proc/self/exe (the musl-static stripped binary has no
+  build-id). It parses the invocation conservatively (sh/dash only — bash and
+  anything with options we don't model fall through to the fork path, which
+  already builds a correct-mode shell on reentry), sets a unique synthetic
+  $$/BASHPID, and runs the script through run_nested_pipelines — the SAME
+  record-then-run loop the forked shim uses, so nested brush_prov rows are
+  preserved. find/xargs -exec are covered (they dispatch via run_argv).
+
+$$/BASHPID: Shell.synthetic_pid lets a snooped script report a distinct pid
+(expansion.rs + set_snoop_identity), so concurrent in-process scripts get
+unique conftest$$ temp files despite sharing one OS process.
+
+test_brush_nested_sh_rs.py passes, now exercising the snoop path (case3's
+error is tagged "(snooped)"); nested prov rows (case1/2), sh-vs-bash mode
+(case9), and the `sh -c -- CMD` terminator (case10) all preserved.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src/commands.rs      | 68 ++++++++++++++++++++++++++++++++++++++++++++
+ src/expansion.rs     | 10 ++++++-
+ src/shell.rs         | 53 ++++++++++++++++++++++++++++++++++
+ src/shell/builder.rs |  2 ++
+ 4 files changed, 132 insertions(+), 1 deletion(-)
+
+diff --git a/src/commands.rs b/src/commands.rs
+index 8320a39..00f5c4f 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -133,6 +133,33 @@ impl CommandArg {
+     }
+ }
+ 
++/// sarun (NOT upstream brush): an embedder-supplied hook consulted at the
++/// external-exec point of [`SimpleCommand::execute`]. It lets the embedder run a
++/// resolved external command IN-PROCESS instead of forking it — sarun uses this
++/// to interpret a `/bin/sh` script that resolves to its own bind-shadowed binary
++/// (forking it would only re-enter brush) without losing provenance or the
++/// caller's logical fds. Installed via [`Shell::set_exec_interposer`]; inherited
++/// by subshell clones, so nested execs interpose too.
++pub trait ExecInterposer<SE: extensions::ShellExtensions>: Send + Sync {
++    /// Cheap, synchronous filter run on EVERY external exec BEFORE the shell is
++    /// cloned: does this resolved path want in-process handling? Keep it to a
++    /// stat-sized check — anything heavier taxes every forked command.
++    fn wants(&self, resolved: &Path) -> bool;
++
++    /// Run the command in-process on the provided subshell clone (which carries
++    /// the caller's env/cwd/fds plus a clone of this interposer, so commands the
++    /// script itself spawns interpose too). `params` carries the caller's
++    /// per-command redirects. Returns the command's [`ExecutionResult`], or
++    /// `None` to decline after closer inspection (caller then forks normally).
++    fn run<'a>(
++        &'a self,
++        sub: Shell<SE>,
++        resolved: PathBuf,
++        argv: Vec<String>,
++        params: ExecutionParameters,
++    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ExecutionResult>> + Send + 'a>>;
++}
++
+ /// Encapsulates a possibly-owned reference to a `Shell` for command execution.
+ pub enum ShellForCommand<'a, SE: extensions::ShellExtensions> {
+     /// The command is run in the same shell as its parent; the provided
+@@ -474,6 +501,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
+             };
+ 
+             if let Some(path) = path {
++                if let Some(result) = self.try_interpose_exec(&path).await {
++                    return Ok(self.finish_interposed(result));
++                }
+                 self.execute_via_external(&path)
+             } else {
+                 // Bash updates $_ even when the command is not found, so mirror
+@@ -489,10 +519,48 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
+             }
+         } else {
+             let command_name = PathBuf::from(self.command_name.clone());
++            if let Some(result) = self.try_interpose_exec(command_name.as_path()).await {
++                return Ok(self.finish_interposed(result));
++            }
+             self.execute_via_external(command_name.as_path())
+         }
+     }
+ 
++    /// sarun (NOT upstream brush): consult the embedder's exec interposer before
++    /// forking an external command. If the interposer's cheap `wants()` filter
++    /// matches the resolved path and its `run()` handles the command in-process,
++    /// return its `ExecutionResult`; `None` means "not interposed — fork".
++    ///
++    /// `wants()` runs on EVERY external exec, so it must be cheap (a stat-sized
++    /// check); the shell is only cloned when it returns true. This is how sarun
++    /// runs a `/bin/sh` script that resolves to its own bind-shadowed binary
++    /// in-process instead of re-forking+re-execing itself, while preserving the
++    /// caller's logical fds (passed via `params`) and emitting provenance.
++    async fn try_interpose_exec(&self, resolved: &Path) -> Option<ExecutionResult> {
++        let interposer = self.shell.exec_interposer.clone()?;
++        if !interposer.wants(resolved) {
++            return None;
++        }
++        let sub: Shell<SE> = (*self.shell).clone();
++        let argv: Vec<String> = self.args.iter().map(ToString::to_string).collect();
++        let params = self.params.clone();
++        interposer
++            .run(sub, resolved.to_path_buf(), argv, params)
++            .await
++    }
++
++    /// Finish an interposed (in-process) command: mirror `execute_via_external`'s
++    /// `$_` update + optional `post_execute` hook, then wrap the result.
++    fn finish_interposed(self, result: ExecutionResult) -> ExecutionSpawnResult {
++        let mut shell = self.shell;
++        let last_arg = Self::take_last_arg(&self.args);
++        shell.update_last_arg_variable(last_arg);
++        if let Some(post_execute) = self.post_execute {
++            let _ = post_execute(&mut shell);
++        }
++        ExecutionSpawnResult::Completed(result)
++    }
++
+     /// Extracts the owned string representation of the last argument of a
+     /// command, suitable for recording into `$_`.
+     fn take_last_arg(args: &[CommandArg]) -> Option<String> {
+diff --git a/src/expansion.rs b/src/expansion.rs
+index 3176991..1522b21 100644
+--- a/src/expansion.rs
++++ b/src/expansion.rs
+@@ -1888,7 +1888,15 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
+                 Expansion::from(self.shell.options().option_flags())
+             }
+             brush_parser::word::SpecialParameter::ProcessId => {
+-                Expansion::from(std::process::id().to_string())
++                // sarun: a snooped script (run in-process, not forked) reports its
++                // synthetic pid as $$ so it behaves like a distinct process
++                // (e.g. unique conftest$$ temp files); else the real process id.
++                Expansion::from(
++                    self.shell
++                        .synthetic_pid
++                        .unwrap_or_else(std::process::id)
++                        .to_string(),
++                )
+             }
+             brush_parser::word::SpecialParameter::LastBackgroundProcessId => {
+                 if let Some(job) = self.shell.jobs().current_job()
+diff --git a/src/shell.rs b/src/shell.rs
+index 11d02bf..2621e40 100644
+--- a/src/shell.rs
++++ b/src/shell.rs
+@@ -105,6 +105,21 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
+     /// Positional shell arguments (not including shell name).
+     args: Vec<String>,
+ 
++    /// sarun: synthetic process id to report as `$$`/`BASHPID` instead of the
++    /// real `std::process::id()`. `None` = use the real pid. Set on a SNOOPED
++    /// script's subshell (a `#!`/`sh`-invocation run in-process rather than
++    /// forked) so it behaves like a distinct process — e.g. `./configure`'s
++    /// `conftest$$` temp files stay unique across concurrent snooped scripts
++    /// that all share one OS process.
++    pub(crate) synthetic_pid: Option<u32>,
++
++    /// sarun (NOT upstream brush): optional embedder hook consulted before
++    /// forking an external command (see [`crate::commands::ExecInterposer`]).
++    /// `Arc` so subshell clones share it — nested execs interpose too.
++    #[cfg_attr(feature = "serde", serde(skip))]
++    pub(crate) exec_interposer:
++        Option<std::sync::Arc<dyn crate::commands::ExecInterposer<SE>>>,
++
+     /// Shell version
+     version: Option<String>,
+ 
+@@ -162,6 +177,10 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
+             last_pipeline_statuses: self.last_pipeline_statuses.clone(),
+             name: self.name.clone(),
+             args: self.args.clone(),
++            // A subshell inherits its parent's $$ (POSIX). A SNOOPED script is
++            // given a fresh synthetic_pid explicitly after cloning.
++            synthetic_pid: self.synthetic_pid,
++            exec_interposer: self.exec_interposer.clone(),
+             version: self.version.clone(),
+             product_display_str: self.product_display_str.clone(),
+             call_stack: {
+@@ -216,6 +235,8 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
+             options: runtime_options,
+             name: options.shell_name,
+             args: options.shell_args.unwrap_or_default(),
++            synthetic_pid: None,
++            exec_interposer: None,
+             version: options.shell_version,
+             product_display_str: options.shell_product_display_str,
+             working_dir: options.working_dir.map_or_else(std::env::current_dir, Ok)?,
+@@ -260,6 +281,38 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
+ }
+ 
+ impl<SE: extensions::ShellExtensions> Shell<SE> {
++    /// sarun (NOT upstream brush): stamp a SNOOPED script's subshell with the
++    /// identity a freshly-forked interpreter would have had — `$0`, the
++    /// positional parameters, and a unique synthetic `$$`/`BASHPID`. Used by the
++    /// script-snooping path in `commands.rs`, which runs a `#!`/`sh`-invocation
++    /// in-process (in this cloned subshell) rather than forking our own binary.
++    pub fn set_snoop_identity(
++        &mut self,
++        dollar0: String,
++        positional: Vec<String>,
++        synth: u32,
++    ) {
++        self.name = Some(dollar0);
++        self.args = positional;
++        self.synthetic_pid = Some(synth);
++        // BASHPID is a stored global (set once to the real pid at init); update
++        // it so the snooped script's `$BASHPID` matches its synthetic `$$`.
++        let mut bashpid = crate::variables::ShellVariable::new(
++            crate::variables::ShellValue::String(synth.to_string()),
++        );
++        bashpid.treat_as_integer();
++        let _ = self.env.set_global("BASHPID", bashpid);
++    }
++
++    /// sarun (NOT upstream brush): install the embedder's exec interposer (see
++    /// [`crate::commands::ExecInterposer`]). Subshell clones inherit it.
++    pub fn set_exec_interposer(
++        &mut self,
++        interposer: std::sync::Arc<dyn crate::commands::ExecInterposer<SE>>,
++    ) {
++        self.exec_interposer = Some(interposer);
++    }
++
+     /// Increments the interactive line offset in the shell by the indicated number
+     /// of lines.
+     ///
+diff --git a/src/shell/builder.rs b/src/shell/builder.rs
+index 3f99a92..f85308c 100644
+--- a/src/shell/builder.rs
++++ b/src/shell/builder.rs
+@@ -247,6 +247,8 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
+             depth: 0,
+             name: None,
+             args: vec![],
++            synthetic_pid: None,
++            exec_interposer: None,
+             version: None,
+             product_display_str: None,
+             call_stack: callstack::CallStack::new(),

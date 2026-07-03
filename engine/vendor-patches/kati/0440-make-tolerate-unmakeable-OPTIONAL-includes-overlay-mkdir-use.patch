@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 10:24:50 +0000
+Subject: [PATCH] make: tolerate unmakeable OPTIONAL includes; overlay: mkdir
+ uses the merged view
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fixes the '-include blah fails with No rule and nothing works' regression
+the optional-include-remake change introduced, with GNU's ACTUAL
+semantics (measured, not assumed): a -include file whose remake can't
+happen — no producer at all, a producer whose recipe fails, or a
+producer whose own prerequisite is unbuildable — is silently tolerated
+and the build proceeds. Implemented as a separate quiet exec pass for
+optional remake targets (required ones stay strict), with the failed
+names carried across the re-parse (SARUN_KATI_NOREMAKE env on the
+shadow re-exec, a local set on the builtin retry loop) so a permanently
+unmakeable include can't loop to the depth cap. exec_opts' quiet mode
+also suppresses the '*** [target] Error' banner and no-rule notes,
+matching GNU's silence. Three corpus cases pin the shapes; both
+corpora 398/408 fail=0.
+
+overlay: mkdir's existence check used layer() (this box's upper + raw
+host) while lookup serves resolve() (the merged parent-chain view) — a
+path hidden by a parent-box whiteout / opaque dir / OCI
+no_host_fallback returned EEXIST from mkdir yet ENOENT from stat, so
+create_dir_all never reconciled (sibling-session report). mkdir now
+guards on resolve().
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/exec.rs                                | 25 +++++++-
+ src-rs/main.rs                                | 59 +++++++++++++++++--
+ .../sarun_optional_include_failing_recipe.mk  |  6 ++
+ .../sarun_optional_include_no_rule_at_all.mk  |  5 ++
+ .../sarun_optional_include_unpickable_rule.mk |  8 +++
+ 5 files changed, 94 insertions(+), 9 deletions(-)
+ create mode 100644 engine/vendor/kati/testcase/sarun_optional_include_failing_recipe.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_optional_include_no_rule_at_all.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_optional_include_unpickable_rule.mk
+
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 55fea54..a074084 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -146,6 +146,10 @@ struct Executor<'a> {
+     shell: Bytes,
+     shellflag: &'static [u8],
+     num_commands: u64,
++    /// Suppress the "*** [target] Error N" banner (and no-rule notes) —
++    /// used when remaking OPTIONAL includes, whose failures GNU swallows
++    /// silently.
++    quiet_failures: bool,
+ }
+ 
+ // ── Parallel scheduler ───────────────────────────────────────────────────────
+@@ -376,6 +380,7 @@ impl<'a> Executor<'a> {
+             shell,
+             shellflag,
+             num_commands: 0,
++            quiet_failures: false,
+         })
+     }
+ 
+@@ -478,8 +483,10 @@ impl<'a> Executor<'a> {
+             (g.has_rule, g.is_phony)
+         };
+         if !has_rule && output_timestamp.is_none() && !is_phony {
+-            for note in &n.lock().no_rule_notes {
+-                crate::exec::emit_recipe_err(&format!("*kati*: note: {note}"));
++            if !self.quiet_failures {
++                for note in &n.lock().no_rule_notes {
++                    crate::exec::emit_recipe_err(&format!("*kati*: note: {note}"));
++                }
+             }
+             if let Some(dep_sym) = graph[&sym].dependents.first() {
+                 // Diagnosis aid: name the RULE whose prerequisite list produced
+@@ -762,7 +769,9 @@ impl<'a> Executor<'a> {
+                 emit_recipe_err(&format!("[{o}] Error {c} (ignored)"));
+             }
+             if let Some((o, code)) = run.failure {
+-                emit_recipe_err(&format!("*** [{o}] Error {code}"));
++                if !self.quiet_failures {
++                    emit_recipe_err(&format!("*** [{o}] Error {code}"));
++                }
+                 if self.ce.ev.delete_on_error {
+                     let is_phony = graph[&run.output].node.lock().is_phony;
+                     if !is_phony {
+@@ -807,7 +816,17 @@ impl<'a> Executor<'a> {
+ }
+ 
+ pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
++    exec_opts(roots, ev, false)
++}
++
++/// exec with GNU's makefile-remake failure semantics available:
++/// `quiet_failures` suppresses the "*** [target] Error N" banner and the
++/// no-rule notes — callers remaking OPTIONAL includes swallow the Err too.
++pub fn exec_opts(
++    roots: Vec<NamedDepNode>, ev: &mut Evaluator, quiet_failures: bool,
++) -> Result<()> {
+     let mut executor = Executor::new(ev)?;
++    executor.quiet_failures = quiet_failures;
+     // One engine: a dependency-count scheduler with a worker cap. Parallel only
+     // when -j>1 was explicitly requested; bounded by the engine slip pool when
+     // one is advertised (sarun box), else by the local cap alone (standalone,
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 99bea4c..6fa45d8 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -240,7 +240,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+     // with the same args — the second invocation parses with the
+     // freshly-generated content visible. Guard against infinite
+     // re-exec via SARUN_KATI_REMAKE_DEPTH (capped at 5).
+-    let mut remake_targets: Vec<Symbol> = Vec::new();
++    let mut remake_targets: Vec<(Symbol, bool)> = Vec::new();
+     {
+         let pending = std::mem::take(&mut ev.pending_remake_includes);
+         for (loc, name, required) in &pending {
+@@ -254,8 +254,12 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+                             .matches(name.as_bytes())
+                     })
+             });
+-            if producible {
+-                remake_targets.push(sym);
++            let noremake_skip = !*required
++                && std::env::var("SARUN_KATI_NOREMAKE")
++                    .map(|v| v.split(':').any(|f| f.as_bytes() == name.as_bytes()))
++                    .unwrap_or(false);
++            if producible && !noremake_skip {
++                remake_targets.push((sym, *required));
+             } else if *required {
+                 // Missing required include with no matching rule. Emit a
+                 // single line matching upstream kati's `error_loc!` shape;
+@@ -282,7 +286,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+         // this invocation; the user's real targets get built in the
+         // re-exec'd process.
+         let dep_targets = if remake_active {
+-            remake_targets.clone()
++            remake_targets.iter().map(|(s, _)| *s).collect()
+         } else {
+             targets.to_owned()
+         };
+@@ -305,14 +309,57 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+             );
+             std::process::exit(2);
+         }
+-        // Build the remake targets.
++        // Build the remake targets. GNU tolerates a failed remake of an
++        // OPTIONAL (-include) makefile: build required and optional include
++        // targets in separate passes so an optional one that can't be built
++        // never aborts the make — the re-parse proceeds without it.
+         {
+             let _frame = ev.enter(
+                 FrameType::Phase,
+                 Bytes::from_static(b"*remake*"),
+                 Loc::default(),
+             );
+-            kati::exec::exec(nodes, &mut ev)?;
++            let required: std::collections::HashSet<Symbol> = remake_targets
++                .iter().filter(|(_, req)| *req).map(|(s, _)| *s).collect();
++            let (req_nodes, opt_nodes): (Vec<_>, Vec<_>) = nodes
++                .into_iter()
++                .partition(|(s, _)| required.contains(s));
++            if !req_nodes.is_empty() {
++                kati::exec::exec(req_nodes, &mut ev)?;
++            }
++            for node in opt_nodes {
++                // optional include not remakable — GNU carries on, silently
++                let _ = kati::exec::exec_opts(vec![node], &mut ev, true);
++            }
++        }
++        // Optional remake targets that did NOT materialize are carried in
++        // SARUN_KATI_NOREMAKE so the re-exec'd pass skips them instead of
++        // re-queueing forever (GNU proceeds without an unmakeable optional
++        // include).
++        {
++            let mut failed: Vec<String> = std::env::var("SARUN_KATI_NOREMAKE")
++                .map(|v| v.split(':').filter(|f| !f.is_empty())
++                     .map(str::to_string).collect())
++                .unwrap_or_default();
++            for (sym, required) in &remake_targets {
++                if *required {
++                    continue;
++                }
++                let b = sym.as_bytes();
++                let p = std::path::Path::new(OsStr::from_bytes(&b));
++                let abs = if p.is_absolute() { p.to_path_buf() }
++                          else { ev.working_dir.join(p) };
++                let name = String::from_utf8_lossy(&b).into_owned();
++                if !abs.exists() && !failed.contains(&name) {
++                    failed.push(name);
++                }
++            }
++            if !failed.is_empty() {
++                // SAFETY: single-threaded standalone path, pre-exec.
++                unsafe {
++                    std::env::set_var("SARUN_KATI_NOREMAKE", failed.join(":"));
++                }
++            }
+         }
+         // Re-exec ourselves with the same args. GLOB_CACHE et al. reset
+         // naturally because it's a fresh process. Use current_exe() for
+diff --git a/testcase/sarun_optional_include_failing_recipe.mk b/testcase/sarun_optional_include_failing_recipe.mk
+new file mode 100644
+index 0000000..b21131b
+--- /dev/null
++++ b/testcase/sarun_optional_include_failing_recipe.mk
+@@ -0,0 +1,6 @@
++# An optional include whose remake RECIPE fails: GNU proceeds without it.
++all:
++	@echo ran-after-fail
++-include blah2
++blah2:
++	@false
+diff --git a/testcase/sarun_optional_include_no_rule_at_all.mk b/testcase/sarun_optional_include_no_rule_at_all.mk
+new file mode 100644
+index 0000000..be267a2
+--- /dev/null
++++ b/testcase/sarun_optional_include_no_rule_at_all.mk
+@@ -0,0 +1,5 @@
++# `-include blah` with NO producer anywhere must be silently tolerated —
++# a regression once made it fatal ("No rule to make target 'blah'").
++all:
++	@echo ran-no-producer
++-include blah
+diff --git a/testcase/sarun_optional_include_unpickable_rule.mk b/testcase/sarun_optional_include_unpickable_rule.mk
+new file mode 100644
+index 0000000..6fa9108
+--- /dev/null
++++ b/testcase/sarun_optional_include_unpickable_rule.mk
+@@ -0,0 +1,8 @@
++# An optional include whose rule exists but whose PREREQUISITE has no rule:
++# GNU tolerates this too (no error, build proceeds) — the remake attempt
++# simply doesn't happen.
++all:
++	@echo ran-unpickable
++-include gen.dep
++gen.dep: missing-src
++	@cp missing-src $@

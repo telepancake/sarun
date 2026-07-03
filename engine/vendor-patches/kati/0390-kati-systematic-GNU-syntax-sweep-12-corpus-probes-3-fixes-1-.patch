@@ -1,0 +1,636 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 08:40:18 +0000
+Subject: [PATCH] =?UTF-8?q?kati:=20systematic=20GNU-syntax=20sweep=20?=
+ =?UTF-8?q?=E2=80=94=2012=20corpus=20probes,=203=20fixes,=201=20TODO?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The subst-ref bug survived because the corpus was inherited from
+upstream kati, which SHARES such bugs — its own testcases never probe
+them. This adds a systematic sweep, one probe file per syntax family
+with adversarial inputs, each diffed against real GNU make by the
+hard gate: text functions, filename functions, computed names /
+value/origin/flavor, call/foreach/if/or/and, define flavors,
+conditional forms, target- and pattern-specific vars, double-colon +
+static patterns, automatic vars (D/F, ^ vs +, |), the vpath
+directive, special vars, export/unexport/undefine.
+
+8/12 matched GNU immediately. The sweep caught three more real bugs,
+fixed here:
+- $(call) did not set $(0) to the function name.
+- $* was empty in EXPLICIT rules; GNU sets it to the target minus a
+  known suffix (.SUFFIXES, default list from GNU's default.c) —
+  modeled as a %suffix output pattern so the stem logic is shared.
+- the vpath DIRECTIVE was a parse error ('missing separator'); now a
+  real statement (VpathStmt) feeding pattern-scoped entries into the
+  dependency search, with GNU's clear-one/clear-all forms. Upstream's
+  vpath_directive.mk TODO now passes and its marker is dropped.
+
+Remaining known gap, visibly TODO'd (not silently skipped):
+double-colon parts must be independent dep nodes (per-part prereqs +
+declaration-order execution); kati merges them into one node.
+
+rkati corpus 387/397 fail=0 xpass=0; box corpus 387/397 fail=0.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/dep.rs                                | 57 +++++++++++++++++++-
+ src-rs/eval.rs                               | 31 +++++++++++
+ src-rs/func.rs                               | 11 ++++
+ src-rs/parser.rs                             | 12 +++++
+ src-rs/stmt.rs                               | 37 +++++++++++++
+ testcase/a.dep                               |  0
+ testcase/b.dep                               |  0
+ testcase/dir/t.out                           |  0
+ testcase/oo.dep                              |  0
+ testcase/sarun_sweep_automatic_vars.mk       | 10 ++++
+ testcase/sarun_sweep_call_foreach.mk         | 13 +++++
+ testcase/sarun_sweep_computed_names.mk       | 12 +++++
+ testcase/sarun_sweep_conditionals.mk         | 30 +++++++++++
+ testcase/sarun_sweep_define_call.mk          | 27 ++++++++++
+ testcase/sarun_sweep_double_colon_static.mk  | 17 ++++++
+ testcase/sarun_sweep_export_undefine.mk      | 10 ++++
+ testcase/sarun_sweep_filename_functions.mk   | 11 ++++
+ testcase/sarun_sweep_special_vars.mk         |  9 ++++
+ testcase/sarun_sweep_target_specific_vars.mk | 13 +++++
+ testcase/sarun_sweep_text_functions.mk       | 17 ++++++
+ testcase/sarun_sweep_vpath_directive.mk      |  8 +++
+ testcase/srcdir/thing.src                    |  1 +
+ testcase/vpath_directive.mk                  |  2 -
+ 23 files changed, 324 insertions(+), 4 deletions(-)
+ create mode 100644 engine/vendor/kati/testcase/a.dep
+ create mode 100644 engine/vendor/kati/testcase/b.dep
+ create mode 100644 engine/vendor/kati/testcase/dir/t.out
+ create mode 100644 engine/vendor/kati/testcase/oo.dep
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_automatic_vars.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_call_foreach.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_computed_names.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_conditionals.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_define_call.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_double_colon_static.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_export_undefine.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_filename_functions.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_special_vars.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_target_specific_vars.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_text_functions.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_sweep_vpath_directive.mk
+ create mode 100644 engine/vendor/kati/testcase/srcdir/thing.src
+
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index cca953f..ce0dc1d 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -411,6 +411,10 @@ struct DepBuilder<'a> {
+     suffix_rules: SuffixRuleMap,
+ 
+     first_rule: Option<Symbol>,
++    // GNU's known-suffix list (.SUFFIXES; defaults below). Used for the
++    // explicit-rule $* stem: a target ending in a known suffix gets
++    // `target minus suffix` as its stem, exactly like GNU make.
++    known_suffixes: Vec<Bytes>,
+     // sarun: set when `.SECONDEXPANSION:` was seen. Triggers a second
+     // pass of prereq expansion when building targets, where `$$...`
+     // tokens that survived the first parse get re-evaluated against the
+@@ -426,6 +430,8 @@ struct DepBuilder<'a> {
+     // executor's stat see the real file) — the Linux kernel's out-of-tree
+     // builds (`VPATH := $(srctree)`) resolve every source file this way.
+     vpath_dirs: Vec<Bytes>,
++    // `vpath PATTERN DIRS` directive entries (pattern-scoped search).
++    vpath_patterns: Vec<(Bytes, Vec<Bytes>)>,
+     depfile_var_name: Symbol,
+     implicit_outputs_var_name: Symbol,
+     ninja_pool_var_name: Symbol,
+@@ -461,6 +467,7 @@ impl<'a> DepBuilder<'a> {
+             }
+             dirs
+         };
++        let vpath_patterns = ev.vpath_patterns.clone();
+         let mut ret = Self {
+             ev,
+             rules: HashMap::new(),
+@@ -471,6 +478,14 @@ impl<'a> DepBuilder<'a> {
+             suffix_rules: HashMap::new(),
+ 
+             first_rule: None,
++            // GNU make's default suffix list (src/default.c default_suffixes).
++            known_suffixes: [
++                ".out", ".a", ".ln", ".o", ".c", ".cc", ".C", ".cpp", ".p",
++                ".f", ".F", ".m", ".r", ".y", ".l", ".ym", ".yl", ".s",
++                ".S", ".mod", ".sym", ".def", ".h", ".info", ".dvi", ".tex",
++                ".texinfo", ".texi", ".txinfo", ".w", ".ch", ".web", ".sh",
++                ".elc", ".el",
++            ].iter().map(|s| Bytes::from_static(s.as_bytes())).collect(),
+             secondexpansion: false,
+             done: HashMap::new(),
+             phony: HashSet::new(),
+@@ -481,6 +496,7 @@ impl<'a> DepBuilder<'a> {
+             validations_var_name: intern(".KATI_VALIDATIONS"),
+             tags_var_name: intern(".KATI_TAGS"),
+             vpath_dirs,
++            vpath_patterns,
+         };
+         let _tr = ScopedTimeReporter::new("make dep (populate)");
+         ret.populate_rules()?;
+@@ -509,6 +525,14 @@ impl<'a> DepBuilder<'a> {
+         if let Some((targets, _loc)) = self.get_rule_inputs(intern(".SUFFIXES")) {
+             if targets.is_empty() {
+                 self.suffix_rules.clear();
++                self.known_suffixes.clear();
++            } else {
++                for t in &targets {
++                    let b = Bytes::copy_from_slice(&t.as_bytes());
++                    if !self.known_suffixes.contains(&b) {
++                        self.known_suffixes.push(b);
++                    }
++                }
+             }
+             // sarun: `.SUFFIXES: .foo` adds suffixes to make's list. Kati
+             // doesn't actually drive suffix-rule lookup the same way, but
+@@ -681,7 +705,7 @@ impl<'a> DepBuilder<'a> {
+     /// to `dir/name` (matching GNU's behavior for files that don't need to be
+     /// rebuilt — the common case VPATH exists for: out-of-tree source files).
+     fn vpath_resolve(&self, sym: Symbol) -> Option<Symbol> {
+-        if self.vpath_dirs.is_empty() {
++        if self.vpath_dirs.is_empty() && self.vpath_patterns.is_empty() {
+             return None;
+         }
+         let bytes = sym.as_bytes();
+@@ -695,7 +719,15 @@ impl<'a> DepBuilder<'a> {
+         if std::fs::exists(self.ev.working_dir.join(rel)).is_ok_and(|v| v) {
+             return None;
+         }
+-        for dir in &self.vpath_dirs {
++        // Search order: the VPATH variable's directories, then matching
++        // `vpath PATTERN` entries in makefile order.
++        let pattern_dirs: Vec<&Bytes> = self
++            .vpath_patterns
++            .iter()
++            .filter(|(p, _)| Pattern::new(p.clone()).matches(&bytes))
++            .flat_map(|(_, dirs)| dirs.iter())
++            .collect();
++        for dir in self.vpath_dirs.iter().chain(pattern_dirs.into_iter()) {
+             let mut cand = bytes::BytesMut::with_capacity(dir.len() + 1 + bytes.len());
+             cand.extend_from_slice(dir);
+             if !dir.ends_with(b"/") {
+@@ -1207,6 +1239,27 @@ impl<'a> DepBuilder<'a> {
+             .lock()
+             .fill_dep_node(output, &picked_rule_info.pattern_rule, &n);
+ 
++        // GNU sets $* for EXPLICIT rules too: when the target ends in a
++        // known suffix (.SUFFIXES), the stem is the target minus that
++        // suffix. Model it as a %suffix output pattern so AutoCommand::Star
++        // computes the same stem it does for pattern rules.
++        {
++            let mut node = n.lock();
++            if node.output_pattern.is_none() {
++                let ob = output.as_bytes();
++                let base_start = ob.iter().rposition(|&c| c == b'/').map_or(0, |i| i + 1);
++                if let Some(dot) = ob[base_start..].iter().rposition(|&c| c == b'.') {
++                    let sufx = &ob[base_start + dot..];
++                    if self.known_suffixes.iter().any(|k| k == sufx) {
++                        let mut pat = BytesMut::with_capacity(sufx.len() + 1);
++                        pat.put_u8(b'%');
++                        pat.put_slice(sufx);
++                        node.output_pattern = Some(intern(pat.freeze()));
++                    }
++                }
++            }
++        }
++
+         let mut sv = Vec::new();
+         let frame = self.ev.enter(
+             FrameType::Dependency,
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 0db5b60..22629f6 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -261,6 +261,9 @@ static USED_UNDEFINED_VARS: LazyLock<Mutex<HashSet<Symbol>>> =
+ 
+ pub struct Evaluator {
+     pub rule_vars: HashMap<Symbol, Arc<Vars>>,
++    /// sarun: accumulated `vpath PATTERN DIRS` directive entries, in
++    /// makefile order — consumed by dep.rs's directory search.
++    pub vpath_patterns: Vec<(Bytes, Vec<Bytes>)>,
+     /// sarun: per-instance global variable bindings, indexed by Symbol id.
+     /// Moved off the process-global symbol table (symtab `symbol_data`) so each
+     /// Evaluator — i.e. each make invocation — owns its OWN global namespace.
+@@ -358,6 +361,7 @@ impl Evaluator {
+     pub fn new() -> Self {
+         let ev = Self {
+             rule_vars: HashMap::new(),
++            vpath_patterns: Vec::new(),
+             global_vars: Arc::new(Mutex::new(Vec::new())),
+             working_dir: std::env::current_dir().unwrap_or_default(),
+             include_dirs: Vec::new(),
+@@ -1260,6 +1264,33 @@ impl Evaluator {
+         Ok(())
+     }
+ 
++    /// `vpath PATTERN DIRS` appends a pattern-scoped search entry;
++    /// `vpath PATTERN` clears that pattern's entries; bare `vpath` clears
++    /// everything. DIRS split on colons and whitespace, like GNU.
++    pub fn eval_vpath(&mut self, stmt: &crate::stmt::VpathStmt) -> Result<()> {
++        self.loc = Some(stmt.loc());
++        self.in_rule = false;
++        let line = stmt.expr.eval_to_buf(self)?;
++        let mut words = word_scanner(&line);
++        let Some(pat) = words.next() else {
++            self.vpath_patterns.clear();
++            return Ok(());
++        };
++        let pat = line.slice_ref(pat);
++        let mut dirs: Vec<Bytes> = vec![];
++        for w in words {
++            for part in w.split(|&b| b == b':').filter(|p| !p.is_empty()) {
++                dirs.push(line.slice_ref(part));
++            }
++        }
++        if dirs.is_empty() {
++            self.vpath_patterns.retain(|(p, _)| p != &pat);
++        } else {
++            self.vpath_patterns.push((pat, dirs));
++        }
++        Ok(())
++    }
++
+     pub fn eval_undefine(&mut self, stmt: &UndefineStmt) -> Result<()> {
+         self.loc = Some(stmt.loc());
+         self.in_rule = false;
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index bf82fb9..1193fb1 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -776,6 +776,17 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
+         ));
+     }
+     let mut sv = Vec::new();
++    // GNU sets $(0) to the name of the function being expanded.
++    sv.push(ScopedGlobalVar::new(
++        ev.global_vars.clone(),
++        intern(b"0".to_vec()),
++        Variable::with_simple_string(
++            func_name_buf.clone(),
++            VarOrigin::Automatic,
++            None,
++            None,
++        ),
++    )?);
+     let mut i = 1;
+     loop {
+         let tmpvar_name_sym = intern(format!("{i}"));
+diff --git a/src-rs/parser.rs b/src-rs/parser.rs
+index e475e75..8a0e692 100644
+--- a/src-rs/parser.rs
++++ b/src-rs/parser.rs
+@@ -633,6 +633,17 @@ impl Parser {
+         self.create_export(line, false)
+     }
+ 
++    fn parse_vpath(&mut self, line: Bytes) -> Result<()> {
++        let loc = self.loc.clone();
++        let mut mutable_loc = loc.clone();
++        let expr = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
++        self.out_stmts
++            .lock()
++            .push(crate::stmt::VpathStmt::new(loc, expr));
++        self.after_rule = false;
++        Ok(())
++    }
++
+     fn parse_undefine(&mut self, line: Bytes) -> Result<()> {
+         if line.is_empty() {
+             error_loc!(Some(&self.loc), "*** empty variable name.");
+@@ -690,6 +701,7 @@ impl Parser {
+             b"export" => self.parse_export(rest)?,
+             b"unexport" => self.parse_unexport(&rest)?,
+             b"undefine" => self.parse_undefine(rest)?,
++            b"vpath" => self.parse_vpath(rest)?,
+             _ => return Ok(false),
+         }
+         Ok(true)
+diff --git a/src-rs/stmt.rs b/src-rs/stmt.rs
+index e4433e2..4d77d8b 100644
+--- a/src-rs/stmt.rs
++++ b/src-rs/stmt.rs
+@@ -418,3 +418,40 @@ impl UndefineStmt {
+         })
+     }
+ }
++
++// sarun: the `vpath` DIRECTIVE (GNU: `vpath PATTERN DIRS`, `vpath PATTERN`
++// to clear one pattern, bare `vpath` to clear all). Evaluated in makefile
++// order; the accumulated pattern list drives dep.rs's directory search.
++pub struct VpathStmt {
++    loc: Loc,
++    orig: Bytes,
++    pub expr: Arc<Value>,
++}
++
++impl Statement for VpathStmt {
++    fn loc(&self) -> Loc {
++        self.loc.clone()
++    }
++    fn orig(&self) -> Bytes {
++        self.orig.clone()
++    }
++    fn eval(&self, ev: &mut Evaluator) -> Result<()> {
++        ev.eval_vpath(self)
++    }
++}
++
++impl Debug for VpathStmt {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "VpathStmt({:?})", self.expr)
++    }
++}
++
++impl VpathStmt {
++    pub fn new(loc: Loc, expr: Arc<Value>) -> Arc<VpathStmt> {
++        Arc::new(VpathStmt {
++            loc,
++            orig: Bytes::new(),
++            expr,
++        })
++    }
++}
+diff --git a/testcase/a.dep b/testcase/a.dep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/testcase/b.dep b/testcase/b.dep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/testcase/dir/t.out b/testcase/dir/t.out
+new file mode 100644
+index 0000000..e69de29
+diff --git a/testcase/oo.dep b/testcase/oo.dep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/testcase/sarun_sweep_automatic_vars.mk b/testcase/sarun_sweep_automatic_vars.mk
+new file mode 100644
+index 0000000..3b94a36
+--- /dev/null
++++ b/testcase/sarun_sweep_automatic_vars.mk
+@@ -0,0 +1,10 @@
++# Systematic sweep: automatic variables incl. D/F variants, $^ dedup vs $+,
++# $? (newer-only), $| (order-only separation).
++all: dir/t.out
++	@echo top_done
++dir/t.out: a.dep b.dep a.dep | oo.dep
++	@echo at=[$@] lt=[$<] caret=[$^] plus=[$+] pipe=[$|] star=[$*]
++	@echo atD=[$(@D)] atF=[$(@F)] ltD=[$(<D)] ltF=[$(<F)]
++	@mkdir -p dir && touch dir/t.out
++a.dep b.dep oo.dep:
++	@touch $@
+diff --git a/testcase/sarun_sweep_call_foreach.mk b/testcase/sarun_sweep_call_foreach.mk
+new file mode 100644
+index 0000000..2dcc557
+--- /dev/null
++++ b/testcase/sarun_sweep_call_foreach.mk
+@@ -0,0 +1,13 @@
++# Systematic sweep: $(call) arg handling ($(0), missing args, nesting,
++# recursion), $(foreach) shadowing, $(if)/$(or)/$(and) semantics.
++f = [$(0):$(1):$(2)]
++outer = $(call f,$(1),via-outer)
++rev = $(if $(1),$(call rev,$(wordlist 2,99,$(1))) $(firstword $(1)))
++x := shadowed
++test:
++	@echo call=[$(call f,a,b)] missing=[$(call f,onlyone)]
++	@echo nested=[$(call outer,X)]
++	@echo recursion=[$(strip $(call rev,1 2 3 4))]
++	@echo 'foreach=[$(foreach x,p q,{$(x)})] after=[$(x)]'
++	@echo if=[$(if ,then,else)] [$(if nonempty,then,else)] [$(if x,justthen)]
++	@echo or=[$(or ,,third)] and=[$(and a,b,c)] and_empty=[$(and a,,c)]
+diff --git a/testcase/sarun_sweep_computed_names.mk b/testcase/sarun_sweep_computed_names.mk
+new file mode 100644
+index 0000000..e89c754
+--- /dev/null
++++ b/testcase/sarun_sweep_computed_names.mk
+@@ -0,0 +1,12 @@
++# Systematic sweep: computed variable names, nested references, $(value),
++# $(origin), $(flavor).
++xy := INNER
++INNER := deep
++name := xy
++R = rec $(name)
++S := simple
++test:
++	@echo computed=[$($(name))] double=[$($($(name)))]
++	@echo 'value=[$(value R)]'
++	@echo origin_file=[$(origin xy)] origin_undef=[$(origin NOPE)] origin_auto=[$(origin @)]
++	@echo flavor_simple=[$(flavor S)] flavor_rec=[$(flavor R)] flavor_undef=[$(flavor NOPE)]
+diff --git a/testcase/sarun_sweep_conditionals.mk b/testcase/sarun_sweep_conditionals.mk
+new file mode 100644
+index 0000000..18cecd1
+--- /dev/null
++++ b/testcase/sarun_sweep_conditionals.mk
+@@ -0,0 +1,30 @@
++# Systematic sweep: conditional directive forms — parens vs quotes, mixed,
++# ifdef on empty-valued vs undefined, else-if chains, nesting.
++EMPTY :=
++SET := yes
++test:
++	@echo done=[$(RESULT)]
++ifeq ($(SET),yes)
++RESULT += p1
++endif
++ifeq "$(SET)" "yes"
++RESULT += p2
++endif
++ifeq '$(SET)' 'yes'
++RESULT += p3
++endif
++ifneq ($(SET),no)
++RESULT += p4
++endif
++ifdef EMPTY
++RESULT += bad-empty-is-defined
++else
++RESULT += p5
++endif
++ifdef UNDEFINED
++RESULT += bad
++else ifeq ($(SET),yes)
++RESULT += p6
++else
++RESULT += bad2
++endif
+diff --git a/testcase/sarun_sweep_define_call.mk b/testcase/sarun_sweep_define_call.mk
+new file mode 100644
+index 0000000..804c95a
+--- /dev/null
++++ b/testcase/sarun_sweep_define_call.mk
+@@ -0,0 +1,27 @@
++# Systematic sweep: define/endef flavors — recursive template via $(call),
++# simply-expanded define (:=), define +=, and blank-line preservation.
++blank :=
++define n
++
++
++endef
++newline := $(subst $(blank) ,,$(n))
++define tmpl
++line1 $(1)
++line2 $(2)
++endef
++EAGER := before
++define simple :=
++now $(EAGER)
++endef
++EAGER := after
++define appended
++first
++endef
++define appended +=
++second
++endef
++test:
++	@echo call_tmpl=[$(subst $(newline), / ,$(call tmpl,A,B))]
++	@echo simple=[$(simple)]
++	@echo appended=[$(subst $(newline), / ,$(appended))]
+diff --git a/testcase/sarun_sweep_double_colon_static.mk b/testcase/sarun_sweep_double_colon_static.mk
+new file mode 100644
+index 0000000..167f8cc
+--- /dev/null
++++ b/testcase/sarun_sweep_double_colon_static.mk
+@@ -0,0 +1,17 @@
++# TODO: double-colon parts must be INDEPENDENT dep nodes — each ::
++# rule with its own prereqs/commands, run in declaration order. kati merges
++# them into one node, so a part with prerequisites is reordered ahead of
++# the command-bearing parts. Needs per-part DepNodes.
++# Systematic sweep: double-colon rules (both run, in order) and static
++# pattern rules (stem binding).
++all:: 
++	@echo dc-one
++all::
++	@echo dc-two
++all:: statics
++OBJS := x.o y.o
++statics: $(OBJS)
++$(OBJS): %.o: %.src
++	@echo build_$@_from_$<_stem_$*
++x.src y.src:
++	@: 
+diff --git a/testcase/sarun_sweep_export_undefine.mk b/testcase/sarun_sweep_export_undefine.mk
+new file mode 100644
+index 0000000..39e004f
+--- /dev/null
++++ b/testcase/sarun_sweep_export_undefine.mk
+@@ -0,0 +1,10 @@
++# Systematic sweep: export/unexport/undefine directives + $(origin) after.
++EXP := exported-val
++NOEXP := hidden-val
++GONE := present
++export EXP
++unexport NOEXP
++undefine GONE
++test:
++	@echo exp=[$$EXP] noexp=[$$NOEXP]
++	@echo gone_origin=[$(origin GONE)] gone_val=[$(GONE)]
+diff --git a/testcase/sarun_sweep_filename_functions.mk b/testcase/sarun_sweep_filename_functions.mk
+new file mode 100644
+index 0000000..19f7ca3
+--- /dev/null
++++ b/testcase/sarun_sweep_filename_functions.mk
+@@ -0,0 +1,11 @@
++# Systematic sweep: filename functions on tricky paths (no slash, trailing
++# slash, dotfiles, multiple dots, absolute).
++P := a/b/c.x .hidden ../up/f.tar.gz /abs/q noext dir/
++test:
++	@echo dir=[$(dir $(P))]
++	@echo notdir=[$(notdir $(P))]
++	@echo suffix=[$(suffix $(P))]
++	@echo basename=[$(basename $(P))]
++	@echo addsuffix=[$(addsuffix .o,a b)]
++	@echo addprefix=[$(addprefix p/,a b)]
++	@echo join=[$(join a b c,1 2)] [$(join a,1 2 3)]
+diff --git a/testcase/sarun_sweep_special_vars.mk b/testcase/sarun_sweep_special_vars.mk
+new file mode 100644
+index 0000000..5007934
+--- /dev/null
++++ b/testcase/sarun_sweep_special_vars.mk
+@@ -0,0 +1,9 @@
++# Systematic sweep: special/introspection variables a build system leans on.
++FIRST_LIST := $(words $(MAKEFILE_LIST))
++.DEFAULT_GOAL := chosen
++other:
++	@echo wrong-goal
++chosen:
++	@echo goal=[$(.DEFAULT_GOAL)] cmdgoals=[$(MAKECMDGOALS)]
++	@echo makefile_list_nonempty=[$(if $(MAKEFILE_LIST),yes,no)]
++	@echo curdir_abs=[$(if $(filter /%,$(CURDIR)),yes,no)]
+diff --git a/testcase/sarun_sweep_target_specific_vars.mk b/testcase/sarun_sweep_target_specific_vars.mk
+new file mode 100644
+index 0000000..e940a77
+--- /dev/null
++++ b/testcase/sarun_sweep_target_specific_vars.mk
+@@ -0,0 +1,13 @@
++# Systematic sweep: target-specific and pattern-specific variables,
++# inheritance by prerequisites, override interplay.
++GLOBAL := g
++all: T := target-val
++all: P += appended
++P := base
++%.pat: PV := from-pattern
++all: sub one.pat
++	@echo all_T=[$(T)] all_P=[$(P)]
++sub:
++	@echo sub_T=[$(T)] sub_GLOBAL=[$(GLOBAL)]
++one.pat:
++	@echo pat_PV=[$(PV)]
+diff --git a/testcase/sarun_sweep_text_functions.mk b/testcase/sarun_sweep_text_functions.mk
+new file mode 100644
+index 0000000..6da7840
+--- /dev/null
++++ b/testcase/sarun_sweep_text_functions.mk
+@@ -0,0 +1,17 @@
++# Systematic sweep: GNU text functions with adversarial inputs — empty
++# words, non-matching patterns, %-patterns in filter, repeated words.
++V := aa xbb aaxbb bb
++test:
++	@echo subst=[$(subst bb,YY,$(V))]
++	@echo subst_empty_from=[$(subst ,YY,$(V))]
++	@echo patsubst=[$(patsubst %xbb,%Q,$(V))]
++	@echo patsubst_nomatch=[$(patsubst zz%,Q,$(V))]
++	@echo patsubst_plain=[$(patsubst aa,Q,$(V))]
++	@echo strip=[$(strip   aa    bb  )]
++	@echo findstring=[$(findstring xb,$(V))] [$(findstring zz,$(V))]
++	@echo filter=[$(filter %bb aa,$(V))]
++	@echo filterout=[$(filter-out %bb,$(V))]
++	@echo sort=[$(sort bb aa bb aa)]
++	@echo word=[$(word 2,$(V))] words=[$(words $(V))]
++	@echo wordlist=[$(wordlist 2,3,$(V))] wl_over=[$(wordlist 3,99,$(V))]
++	@echo first=[$(firstword $(V))] last=[$(lastword $(V))]
+diff --git a/testcase/sarun_sweep_vpath_directive.mk b/testcase/sarun_sweep_vpath_directive.mk
+new file mode 100644
+index 0000000..67a4e13
+--- /dev/null
++++ b/testcase/sarun_sweep_vpath_directive.mk
+@@ -0,0 +1,8 @@
++# Systematic sweep: the vpath DIRECTIVE (pattern-scoped search) — distinct
++# from the VPATH variable the corpus already covers.
++setup := $(shell mkdir -p srcdir && echo payload > srcdir/thing.src)
++vpath %.src srcdir
++all: gen.out
++gen.out: thing.src
++	@echo from=[$<]
++	@cp $< $@
+diff --git a/testcase/srcdir/thing.src b/testcase/srcdir/thing.src
+new file mode 100644
+index 0000000..c2981a9
+--- /dev/null
++++ b/testcase/srcdir/thing.src
+@@ -0,0 +1 @@
++payload
+diff --git a/testcase/vpath_directive.mk b/testcase/vpath_directive.mk
+index 1f0dd35..e074449 100644
+--- a/testcase/vpath_directive.mk
++++ b/testcase/vpath_directive.mk
+@@ -1,5 +1,3 @@
+-# TODO: Implement vpath.
+-
+ vpath %.c dir
+ 
+ test: bar

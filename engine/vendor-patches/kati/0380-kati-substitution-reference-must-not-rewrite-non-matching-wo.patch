@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 08:24:58 +0000
+Subject: [PATCH] kati: substitution reference must not rewrite non-matching
+ words
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+$(V:xbb=bb) turned 'aa xbb' into 'aabb bb' — append_subst_ref trimmed
+the suffix when present and appended the replacement UNCONDITIONALLY,
+so a word that doesn't end with the suffix got the replacement glued
+on. GNU semantics: $(V:suf=rep) == $(patsubst %suf,%rep,$(V)) — a
+non-matching word passes through unchanged. (An empty suffix still
+matches every word, so $(V:=.o) keeps appending, as GNU does.)
+
+This was the user-reported 'no rule to build blah/aabb/file' bug: the
+list was corrupted by the subst ref before being handed to a sub-make
+as a command-line variable — traced end-to-end with the new Vars
+provenance ('?= cmd' row → spawning edge → $(sort $(VAR:xbb=bb))).
+Corpus case sarun_subst_ref_nonmatching_word.mk pins it (matching,
+non-matching, sorted, and empty-suffix-append forms) against GNU.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/strutil.rs                            |  9 +++++++++
+ testcase/sarun_subst_ref_nonmatching_word.mk | 14 ++++++++++++++
+ 2 files changed, 23 insertions(+)
+ create mode 100644 engine/vendor/kati/testcase/sarun_subst_ref_nonmatching_word.mk
+
+diff --git a/src-rs/strutil.rs b/src-rs/strutil.rs
+index 5043629..1471404 100644
+--- a/src-rs/strutil.rs
++++ b/src-rs/strutil.rs
+@@ -237,6 +237,15 @@ impl Pattern {
+         if self.percent_index.is_some() && subst.contains(&b'%') {
+             return self.append_subst(s, subst);
+         }
++        // GNU substitution-reference semantics ($(V:suf=rep) ==
++        // $(patsubst %suf,%rep,$(V))): only a word that ENDS WITH the
++        // suffix is rewritten; any other word passes through UNCHANGED.
++        // Trimming-then-appending unconditionally rewrote 'aa' under
++        // ':xbb=bb' into 'aabb'. (An empty suffix still matches every
++        // word — $(V:=.o) appends, as GNU does.)
++        if !s.ends_with(&self.pat[..]) {
++            return s.clone();
++        }
+         let s = trim_suffix(s, &self.pat);
+         let mut ret = BytesMut::with_capacity(s.len() + subst.len());
+         ret.put_slice(s);
+diff --git a/testcase/sarun_subst_ref_nonmatching_word.mk b/testcase/sarun_subst_ref_nonmatching_word.mk
+new file mode 100644
+index 0000000..1724cae
+--- /dev/null
++++ b/testcase/sarun_subst_ref_nonmatching_word.mk
+@@ -0,0 +1,14 @@
++# A substitution reference must leave words that do NOT end with the suffix
++# untouched — $(V:suf=rep) == $(patsubst %suf,%rep,$(V)). kati rewrote 'aa'
++# under ':xbb=bb' into 'aabb' (trim-then-append, unconditionally), which
++# corrupted real builds' path lists passed as $(MAKE) cmdline vars.
++V1 := aa xbb
++V2 := aaxbb bb
++V3 := xbb aa
++E :=
++test:
++	@echo S1=[$(V1:xbb=bb)]
++	@echo S2=[$(V2:xbb=bb)]
++	@echo S3=[$(V3:xbb=bb)]
++	@echo SORT=[$(sort $(V1:xbb=bb))]
++	@echo APPEND=[$(V1:$(E)=.o)]

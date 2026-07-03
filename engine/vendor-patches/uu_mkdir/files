@@ -1,0 +1,9 @@
+.cargo_vcs_info.json
+Cargo.toml
+Cargo.toml.orig
+LICENSE
+README.package.md
+locales/en-US.ftl
+locales/fr-FR.ftl
+src/main.rs
+src/mkdir.rs

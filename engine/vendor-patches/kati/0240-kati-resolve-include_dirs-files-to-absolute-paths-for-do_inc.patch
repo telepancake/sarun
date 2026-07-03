@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 1 Jul 2026 12:25:26 +0000
+Subject: [PATCH] kati: resolve include_dirs files to absolute paths for
+ do_include
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+glob() strips its base prefix so the returned filenames stay relative.
+When eval_include found a file via an include_dir, it passed the bare
+relative name to do_include, which resolved it against working_dir —
+wrong when working_dir != include_dir (out-of-tree kernel builds).
+
+Prefix the glob results with the include_dir path so do_include gets an
+absolute path and file_cache::resolve uses it as-is.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015LEeF5AcZaz1izBxgws317
+---
+ src-rs/eval.rs | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 24b8b40..2827ac2 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -1104,7 +1104,24 @@ impl Evaluator {
+                             Ok(v) => !v.is_empty(),
+                         };
+                         if found {
+-                            files = try_files;
++                            // glob() strips the base prefix, returning
++                            // relative paths. Resolve them against the
++                            // include_dir so do_include opens the right file
++                            // (not working_dir).
++                            let idir_bytes = idir.as_os_str().as_bytes();
++                            if let Ok(v) = try_files.as_ref() {
++                                files = std::sync::Arc::new(Ok(v.iter()
++                                    .map(|f| {
++                                        let mut abs = bytes::BytesMut::with_capacity(
++                                            idir_bytes.len() + 1 + f.len(),
++                                        );
++                                        abs.extend_from_slice(idir_bytes);
++                                        abs.extend_from_slice(b"/");
++                                        abs.extend_from_slice(f);
++                                        abs.freeze()
++                                    })
++                                    .collect()));
++                            }
+                             break;
+                         }
+                     }

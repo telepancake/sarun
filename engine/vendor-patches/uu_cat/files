@@ -1,0 +1,13 @@
+Cargo.toml
+Cargo.toml.orig
+LICENSE
+README.package.md
+benches/cat_bench.rs
+locales/en-US.ftl
+locales/fr-FR.ftl
+src/cat.rs
+src/main.rs
+src/platform/mod.rs
+src/platform/unix.rs
+src/platform/windows.rs
+src/splice.rs

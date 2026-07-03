@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 20 Jun 2026 12:41:41 +0000
+Subject: [PATCH] docs: vendored findutils is find + xargs, not find-only
+
+A blind review caught the README row and the vendored Cargo.toml header
+still describing the fork as "find-only" after xargs was added back.
+Update both, the rebase/verify notes (the trim now keeps xargs and
+deletes locate/updatedb/testing; the test overlay covers both modules),
+and document the known limitation: commands that find -exec / xargs SPAWN
+inherit the engine's real fd 1/2, so a spawned child's stdout/stderr does
+not honor the box's logical pipes/redirects yet (pending child-fd wiring).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ Cargo.toml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 3f533e0..8b8cc83 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,4 +1,4 @@
+-# sarun: trimmed to a find-only library fork of uutils/findutils 0.9.1.
++# sarun: trimmed to a find + xargs library fork of uutils/findutils 0.9.1.
+ # The `locate`/`updatedb`/`xargs`/`testing-commandline` binaries, their
+ # benches, and the dev-dependencies are removed — the engine consumes only the
+ # `find` module as a library (engine/vendor/findutils via a path dependency).
+@@ -10,7 +10,7 @@ repository = "https://github.com/uutils/findutils"
+ edition = "2021"
+ license = "MIT"
+ readme = "README.md"
+-description = "Rust implementation of GNU findutils (find-only fork for sarun)"
++description = "Rust implementation of GNU findutils (find + xargs fork for sarun)"
+ authors = ["uutils developers"]
+ 
+ [dependencies]

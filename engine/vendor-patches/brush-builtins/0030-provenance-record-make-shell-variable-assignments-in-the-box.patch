@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 06:15:21 +0000
+Subject: [PATCH] provenance: record make+shell variable assignments in the box
+ DB
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Complex builds pass values make → shell → sub-make and back; tracing a
+wrong value ("aabb") needs the whole assignment chain, searchable in the
+box DB — not stderr traces behind magic flags.
+
+New makevar table (name, loc, value, make_dir; UNIQUE-deduped) fed by:
+- kati: a VarAssignHook in eval_assign records every makefile-level
+  assignment at its ASSIGNMENT site (stmt loc — += points at the append,
+  not the original :=), skipping bootstrap/command-line noise.
+- brush: an AssignObserver in apply_assignment plus a hook in the export
+  builtin record shell scalars and `export NAME=…` inside recipes/
+  pipelines, tagged "recipe of <edge>" / "pipeline #<uid>". The box
+  export-prefix replay is suppressed (SUPPRESS_VAR_RECORD) so per-
+  subshell export noise never lands in the table.
+
+Rows batch through a make_vars frame (256/flush) into the box sqlar;
+review.makevars searches name/value with text globs. test_make_rs.py
+case 24 pins the full chain: make :=/+= with file:line locs, shell
+scalar, export builtin, sub-make override, and prefix suppression.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src/export.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/export.rs b/src/export.rs
+index af7870c..ba5d5f8 100644
+--- a/src/export.rs
++++ b/src/export.rs
+@@ -117,6 +117,12 @@ impl ExportCommand {
+                     }
+                 };
+ 
++                // sarun: report to the engine's variable-provenance observer
++                // (apply_assignment doesn't see builtin-arg assignments).
++                if !self.unexport {
++                    brush_core::interp::observe_assignment(
++                        name, &value.to_string(), true);
++                }
+                 // Update the variable with the provided value and then mark it exported.
+                 context.shell.env_mut().update_or_add(
+                     name,

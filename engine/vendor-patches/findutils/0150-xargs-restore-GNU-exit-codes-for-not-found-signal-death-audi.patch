@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 21 Jun 2026 20:27:18 +0000
+Subject: [PATCH] xargs: restore GNU exit codes for not-found / signal death
+ (audit)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The brush-routing port collapsed every command outcome to a plain `i32`, so
+xargs lost two GNU distinctions a blind review caught: a not-found command
+returned 123 instead of 127, and a signal-killed command returned 123 +
+continue instead of 125 + stop. (The CommandExecutionError → exit-code mapping
+in xargs_main — 124/125/126/127 — was intact; the port just stopped producing
+the variants.)
+
+- The bridge now reports `Outcome::{Code,CouldNotRun}`; the xargs `BridgeChild`
+  maps `CouldNotRun` (run_argv couldn't dispatch the command) to
+  `NotFound` → exit 127. find's `-exec` keeps treating it as a plain failure.
+- The standalone `ProcessChild` again returns `Killed{signal}` on a signal
+  death (→ exit 125) instead of folding it into `128+signo`.
+
+Verified: `xargs nonexistent` → 127, `xargs false` → 123, success → 0; 93
+engine tests pass; xargs/find builtin+function dispatch unaffected.
+
+Known lim: a signal death seen through the in-process bridge still maps to 123,
+because `run_argv` returns only an exit code (128+signo) with no
+WIFSIGNALED bit; the standalone path keeps full fidelity.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/xargs/mod.rs | 37 +++++++++++++++++++------------------
+ 1 file changed, 19 insertions(+), 18 deletions(-)
+
+diff --git a/src/xargs/mod.rs b/src/xargs/mod.rs
+index 9dd1eec..6bd101a 100644
+--- a/src/xargs/mod.rs
++++ b/src/xargs/mod.rs
+@@ -74,8 +74,9 @@ pub trait XargsIo {
+ /// backs this with a real `std::process::Child`; the in-process embedder backs
+ /// it with a brush-dispatched command (see [`XargsIo::submit`]).
+ pub trait ExecChild {
+-    /// Block until the command finishes and return its exit code (`128 + signo`
+-    /// if it was killed by a signal).
++    /// Block until the command finishes. `Ok(code)` is a normal exit; a signal
++    /// death, a not-found command, etc. come back as the matching
++    /// `CommandExecutionError` so xargs reports GNU's 125/126/127 and stops.
+     fn wait(self: Box<Self>) -> Result<i32, CommandExecutionError>;
+ }
+ 
+@@ -85,23 +86,23 @@ struct ProcessChild(Child);
+ impl ExecChild for ProcessChild {
+     fn wait(mut self: Box<Self>) -> Result<i32, CommandExecutionError> {
+         let status = self.0.wait().map_err(CommandExecutionError::CannotRun)?;
+-        Ok(exit_code_of(status))
+-    }
+-}
+-
+-/// A process's exit code, encoding signal death as `128 + signo` (as a shell
+-/// does), so all callers can reason about a single `i32`.
+-fn exit_code_of(status: std::process::ExitStatus) -> i32 {
+-    if let Some(code) = status.code() {
+-        return code;
+-    }
+-    #[cfg(unix)]
+-    {
+-        use std::os::unix::process::ExitStatusExt;
+-        return 128 + status.signal().unwrap_or(0);
++        match status.code() {
++            Some(code) => Ok(code),
++            // No exit code → killed by a signal. Preserve the distinction so
++            // xargs stops with GNU's exit 125 (rather than a generic failure).
++            None => {
++                #[cfg(unix)]
++                {
++                    use std::os::unix::process::ExitStatusExt;
++                    Err(CommandExecutionError::Killed {
++                        signal: status.signal().unwrap_or(0),
++                    })
++                }
++                #[cfg(not(unix))]
++                Err(CommandExecutionError::Unknown)
++            }
++        }
+     }
+-    #[cfg(not(unix))]
+-    -1
+ }
+ 
+ /// The dependencies used when xargs runs as the real standalone executable:

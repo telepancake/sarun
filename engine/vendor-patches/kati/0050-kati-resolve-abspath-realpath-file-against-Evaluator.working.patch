@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 08:56:30 +0000
+Subject: [PATCH] kati: resolve $(abspath)/$(realpath)/$(file) against
+ Evaluator.working_dir
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+More logical-cwd boundaries. These functions resolved relative operands
+against the process cwd:
+- $(abspath): strutil::abs_path now takes the base dir (its sole caller,
+  abspath_func, passes ev.working_dir) instead of calling current_dir().
+- $(realpath): canonicalize a relative operand joined onto ev.working_dir.
+- $(file <name): read relative to ev.working_dir; the recorded
+  command/result keeps the original name.
+
+With working_dir == process cwd these name the same files / produce the same
+absolute paths, so standalone rkati is byte-identical: KATI_COMPAT_PASS=364/378,
+fail=0. Engine builds.
+
+$(wildcard) and the find emulator are the remaining cwd-dependent boundaries;
+they return relative matches so the glob/find walk must run relative to
+working_dir while preserving relative output — handled next.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/func.rs    | 24 ++++++++++++++++++++----
+ src-rs/strutil.rs |  9 ++++++---
+ 2 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 27c04e1..95cbab0 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -459,7 +459,15 @@ fn realpath_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut)
+     let mut ww = WordWriter::new(out);
+     for tok in word_scanner(&text) {
+         let tok = <OsStr as OsStrExt>::from_bytes(tok);
+-        if let Ok(path) = std::fs::canonicalize(tok) {
++        // sarun: resolve relative names against the logical working_dir before
++        // canonicalizing (was implicitly the process cwd). Identical when
++        // working_dir == cwd.
++        let probe = if std::path::Path::new(tok).is_absolute() {
++            std::path::PathBuf::from(tok)
++        } else {
++            ev.working_dir.join(tok)
++        };
++        if let Ok(path) = std::fs::canonicalize(&probe) {
+             ww.write(path.as_os_str().as_bytes());
+         }
+     }
+@@ -470,7 +478,7 @@ fn abspath_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -
+     let text = args[0].eval_to_buf(ev)?;
+     let mut ww = WordWriter::new(out);
+     for tok in word_scanner(&text) {
+-        ww.write(&crate::strutil::abs_path(tok)?);
++        ww.write(&crate::strutil::abs_path(tok, &ev.working_dir)?);
+     }
+     Ok(())
+ }
+@@ -884,7 +892,15 @@ fn file_read_func(
+     out: &mut dyn BufMut,
+     rerun: bool,
+ ) -> Result<()> {
+-    if !std::fs::exists(filename)? {
++    // sarun: read relative to the logical working_dir, not the process cwd.
++    // The recorded command/result keeps the original name. Identical when
++    // working_dir == cwd.
++    let open_path = if std::path::Path::new(filename).is_absolute() {
++        std::path::PathBuf::from(filename)
++    } else {
++        ev.working_dir.join(filename)
++    };
++    if !std::fs::exists(&open_path)? {
+         if should_store_command_result(filename.as_bytes()) {
+             COMMAND_RESULTS.lock().push(CommandResult {
+                 op: CommandOp::ReadMissing,
+@@ -899,7 +915,7 @@ fn file_read_func(
+         return Ok(());
+     }
+ 
+-    let mut buf = std::fs::read(filename)?;
++    let mut buf = std::fs::read(&open_path)?;
+     if buf.ends_with(b"\n") {
+         buf.pop();
+     }
+diff --git a/src-rs/strutil.rs b/src-rs/strutil.rs
+index b915495..5043629 100644
+--- a/src-rs/strutil.rs
++++ b/src-rs/strutil.rs
+@@ -17,7 +17,7 @@ limitations under the License.
+ use anyhow::Result;
+ use bytes::{BufMut, Bytes, BytesMut};
+ use memchr::{memchr, memchr2, memmem, memrchr};
+-use std::{borrow::Cow, env::current_dir, os::unix::ffi::OsStrExt};
++use std::{borrow::Cow, os::unix::ffi::OsStrExt, path::Path};
+ 
+ pub fn is_space(c: char) -> bool {
+     ('\t'..='\r').contains(&c) || c == ' '
+@@ -382,11 +382,14 @@ pub fn normalize_path(mut o: &[u8]) -> Bytes {
+     ret.into()
+ }
+ 
+-pub fn abs_path(s: &[u8]) -> Result<Bytes> {
++/// sarun: `base` is the logical working directory to resolve a relative path
++/// against (the Evaluator's working_dir) — was the process cwd. Absolute paths
++/// ignore it. With base == process cwd the result is unchanged.
++pub fn abs_path(s: &[u8], base: &Path) -> Result<Bytes> {
+     if s.starts_with(b"/") {
+         return Ok(normalize_path(s));
+     }
+-    let mut o = BytesMut::from(current_dir()?.as_os_str().as_bytes());
++    let mut o = BytesMut::from(base.as_os_str().as_bytes());
+     if !s.is_empty() {
+         o.put_u8(b'/');
+         o.put_slice(s);

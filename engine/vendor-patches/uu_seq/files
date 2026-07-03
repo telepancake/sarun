@@ -1,0 +1,14 @@
+.cargo_vcs_info.json
+BENCHMARKING.md
+Cargo.toml
+Cargo.toml.orig
+LICENSE
+README.package.md
+benches/seq_bench.rs
+locales/en-US.ftl
+locales/fr-FR.ftl
+src/error.rs
+src/main.rs
+src/number.rs
+src/numberparse.rs
+src/seq.rs

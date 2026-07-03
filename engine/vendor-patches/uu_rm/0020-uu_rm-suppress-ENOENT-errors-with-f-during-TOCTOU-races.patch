@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 1 Jul 2026 12:02:19 +0000
+Subject: [PATCH] uu_rm: suppress ENOENT errors with -f during TOCTOU races
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a file vanishes between symlink_metadata (exists check) and the
+actual unlink syscall, rm -f should silently succeed — matching GNU rm
+behavior. The -f check only covered the initial stat, not the removal
+paths in safe_remove_file, safe_remove_empty_dir, safe_remove_dir_recursive,
+or the fallback fs::remove_file.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015LEeF5AcZaz1izBxgws317
+---
+ src/platform/unix.rs | 24 ++++++++++++++++++------
+ src/rm.rs            |  7 +++++--
+ 2 files changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/src/platform/unix.rs b/src/platform/unix.rs
+index 4f532ea..c0b7e26 100644
+--- a/src/platform/unix.rs
++++ b/src/platform/unix.rs
+@@ -133,12 +133,17 @@ pub fn safe_remove_file(
+             Some(false)
+         }
+         Err(e) => {
+-            if e.kind() == std::io::ErrorKind::PermissionDenied {
++            if e.kind() == std::io::ErrorKind::NotFound && options.force {
++                // TOCTOU: file vanished between symlink_metadata and unlink.
++                // With -f, treat as success (matches GNU rm behavior).
++                Some(false)
++            } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                 show_error!("cannot remove {}: Permission denied", path.quote());
++                Some(true)
+             } else {
+                 let _ = show_removal_error(e, path);
++                Some(true)
+             }
+-            Some(true)
+         }
+     }
+ }
+@@ -164,10 +169,14 @@ pub fn safe_remove_empty_dir(
+             Some(false)
+         }
+         Err(e) => {
+-            let e =
+-                e.map_err_context(|| translate!("rm-error-cannot-remove", "file" => path.quote()));
+-            show_error!("{e}");
+-            Some(true)
++            if e.kind() == std::io::ErrorKind::NotFound && options.force {
++                Some(false)
++            } else {
++                let e =
++                    e.map_err_context(|| translate!("rm-error-cannot-remove", "file" => path.quote()));
++                show_error!("{e}");
++                Some(true)
++            }
+         }
+     }
+ }
+@@ -278,6 +287,9 @@ pub fn safe_remove_dir_recursive(
+         }
+         Ok(metadata) => metadata.permissions().mode(),
+         Err(e) => {
++            if e.kind() == std::io::ErrorKind::NotFound && options.force {
++                return false;
++            }
+             return show_removal_error(e, path);
+         }
+     };
+diff --git a/src/rm.rs b/src/rm.rs
+index c0c5676..7627c97 100644
+--- a/src/rm.rs
++++ b/src/rm.rs
+@@ -946,16 +946,19 @@ fn remove_file(path: &Path, options: &Options, progress_bar: Option<&ProgressBar
+                 verbose_removed_file(path, options);
+             }
+             Err(e) => {
+-                if e.kind() == io::ErrorKind::PermissionDenied {
++                if e.kind() == io::ErrorKind::NotFound && options.force {
++                    // TOCTOU: file vanished between symlink_metadata and
++                    // remove. With -f, treat as success (GNU rm behavior).
++                } else if e.kind() == io::ErrorKind::PermissionDenied {
+                     // GNU compatibility (rm/fail-eacces.sh)
+                     show_error!(
+                         "{}",
+                         RmError::CannotRemovePermissionDenied(path.as_os_str().to_os_string())
+                     );
++                    return true;
+                 } else {
+                     return show_removal_error(e, path);
+                 }
+-                return true;
+             }
+         }
+     }

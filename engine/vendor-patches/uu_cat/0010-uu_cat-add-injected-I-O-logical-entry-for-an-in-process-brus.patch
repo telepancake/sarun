@@ -1,0 +1,407 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 19 Jun 2026 17:52:08 +0000
+Subject: [PATCH] uu_cat: add injected-I/O logical entry for an in-process
+ brush builtin
+
+Adapt the vendored uu_cat so it can run as an in-process brush builtin
+that reads/writes the shell's logical OpenFile sink and source instead of
+the process's global stdin/stdout. New public entry point:
+
+    pub fn cat(args, out: &mut dyn Write, out_fd: Option<BorrowedFd>,
+               stdin: &mut dyn Read, stdin_fd: Option<BorrowedFd>)
+
+out/stdin are the logical streams; out_fd/stdin_fd are their backing
+descriptors when one exists (None for an in-memory stream). The Linux
+splice(2) fast path is kept and gated on both ends having a real fd; an
+fd-less end takes the copy loop. write_fast flushes out before splicing
+so a buffered, fd-backed sink (e.g. line-buffered stdout) can't have its
+buffered bytes reordered behind the spliced bytes.
+
+To support fd-less inputs, the FdReadable (Read + AsFd) bound and the
+generic InputHandle<R> are replaced by a non-generic InputHandle holding
+&mut dyn Read + Option<RawFd>; splice.rs takes two BorrowedFd instead of
+the handle. The self-overwrite guard (is_unsafe_overwrite) now fires only
+when both fds exist.
+
+uumain is retained as a thin descriptor-based bridge over cat() for the
+standalone binary and the --invoke-bundled subprocess dispatcher, where
+the process's own fd 0/1 are the intended I/O. The engine consumes the
+vendored copy via [patch.crates-io].
+
+Verified: builds on the static musl target (make engine); the patched
+crate compiles warning-free and its splice fast path is exercised under
+strace for in-memory, file, pipe, and buffered-fd sinks.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/cat.rs    | 187 ++++++++++++++++++++++++++++++++++----------------
+ src/splice.rs |  26 ++++---
+ 2 files changed, 142 insertions(+), 71 deletions(-)
+
+diff --git a/src/cat.rs b/src/cat.rs
+index a572e56..fa1c964 100644
+--- a/src/cat.rs
++++ b/src/cat.rs
+@@ -14,7 +14,7 @@ use std::ffi::OsString;
+ use std::fs::{File, metadata};
+ use std::io::{self, BufWriter, ErrorKind, IsTerminal, Read, Write};
+ #[cfg(unix)]
+-use std::os::fd::AsFd;
++use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+ #[cfg(unix)]
+ use std::os::unix::fs::FileTypeExt;
+ use thiserror::Error;
+@@ -167,19 +167,15 @@ struct OutputState {
+     one_blank_kept: bool,
+ }
+ 
+-#[cfg(unix)]
+-trait FdReadable: Read + AsFd {}
+-#[cfg(not(unix))]
+-trait FdReadable: Read {}
+-
+-#[cfg(unix)]
+-impl<T> FdReadable for T where T: Read + AsFd {}
+-#[cfg(not(unix))]
+-impl<T> FdReadable for T where T: Read {}
+-
+-/// Represents an open file handle, stream, or other device
+-struct InputHandle<R: FdReadable> {
+-    reader: R,
++/// Represents an open file handle, stream, or other device.
++///
++/// `reader` is the shell's logical input source; `in_fd` is the raw descriptor
++/// backing it when one exists (a pipe, a regular file). It is `None` for an
++/// in-memory stream with no descriptor, in which case the splice fast path is
++/// skipped and bytes are copied through `reader`.
++struct InputHandle<'a> {
++    reader: &'a mut dyn Read,
++    in_fd: Option<RawFd>,
+     is_interactive: bool,
+ }
+ 
+@@ -216,8 +212,22 @@ mod options {
+     pub static IGNORED_U: &str = "ignored-u";
+ }
+ 
+-#[uucore::main]
+-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++/// Logical entry point for the bundled `cat` builtin.
++///
++/// Unlike upstream's `uumain`, this never touches the process's own stdio: it
++/// drives `cat` against the shell's logical output sink (`out`, with its
++/// backing descriptor `out_fd` when one exists) and logical input source
++/// (`stdin`, with `stdin_fd`). With no backing fd the splice fast path is
++/// skipped and bytes are copied through the trait objects, so it is correct
++/// for both real pipes/files and in-memory streams, and holds no
++/// process-global state.
++pub fn cat(
++    args: impl uucore::Args,
++    out: &mut dyn Write,
++    out_fd: Option<BorrowedFd<'_>>,
++    stdin: &mut dyn Read,
++    stdin_fd: Option<BorrowedFd<'_>>,
++) -> UResult<()> {
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+ 
+     let number_mode = if matches.get_flag(options::NUMBER_NONBLANK) {
+@@ -264,7 +274,28 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+         show_tabs,
+         squeeze_blank,
+     };
+-    cat_files(files, &options)
++    cat_files(files, &options, out, out_fd, stdin, stdin_fd)
++}
++
++/// Descriptor-based entry point for the standalone `cat` binary and the
++/// `--invoke-bundled` subprocess dispatcher.
++///
++/// In those contexts the process's own fd 0/1 *are* the intended input and
++/// output, so this is a thin bridge that hands them to [`cat`]. The in-process
++/// brush builtin must NOT route through here — it calls [`cat`] directly with
++/// the shell's logical sink/source (and their backing fds, when any), so it
++/// never touches process-global stdio.
++#[uucore::main]
++pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++    let stdout = io::stdout();
++    let mut out = stdout.lock();
++    let stdin = io::stdin();
++    let mut input = stdin.lock();
++    // SAFETY: fd 0 and fd 1 are the process's standard streams, open and valid
++    // for the whole duration of this call.
++    let out_fd = Some(unsafe { BorrowedFd::borrow_raw(1) });
++    let in_fd = Some(unsafe { BorrowedFd::borrow_raw(0) });
++    cat(args, &mut out, out_fd, &mut input, in_fd)
+ }
+ 
+ pub fn uu_app() -> Command {
+@@ -354,49 +385,73 @@ pub fn uu_app() -> Command {
+         )
+ }
+ 
+-fn cat_handle<R: FdReadable>(
+-    handle: &mut InputHandle<R>,
++fn cat_handle(
++    handle: &mut InputHandle,
+     options: &OutputOptions,
+     state: &mut OutputState,
++    out: &mut dyn Write,
++    out_fd: Option<BorrowedFd<'_>>,
+ ) -> CatResult<()> {
+     if options.can_write_fast() {
+-        write_fast(handle)
++        write_fast(handle, out, out_fd)
+     } else {
+-        write_lines(handle, options, state)
++        write_lines(handle, options, state, out)
+     }
+ }
+ 
+-fn cat_path(path: &OsString, options: &OutputOptions, state: &mut OutputState) -> CatResult<()> {
++fn cat_path(
++    path: &OsString,
++    options: &OutputOptions,
++    state: &mut OutputState,
++    out: &mut dyn Write,
++    out_fd: Option<BorrowedFd<'_>>,
++    stdin: &mut dyn Read,
++    stdin_fd: Option<BorrowedFd<'_>>,
++) -> CatResult<()> {
+     match get_input_type(path)? {
+         InputType::StdIn => {
+-            let stdin = io::stdin();
+-            if is_unsafe_overwrite(&stdin, &io::stdout()) {
+-                return Err(CatError::OutputIsInput);
++            if let (Some(ifd), Some(ofd)) = (stdin_fd, out_fd) {
++                if is_unsafe_overwrite(&ifd, &ofd) {
++                    return Err(CatError::OutputIsInput);
++                }
+             }
++            let is_interactive = stdin_fd.is_some_and(|fd| fd.is_terminal());
+             let mut handle = InputHandle {
+                 reader: stdin,
+-                is_interactive: io::stdin().is_terminal(),
++                in_fd: stdin_fd.map(|fd| fd.as_raw_fd()),
++                is_interactive,
+             };
+-            cat_handle(&mut handle, options, state)
++            cat_handle(&mut handle, options, state, out, out_fd)
+         }
+         InputType::Directory => Err(CatError::IsDirectory),
+         #[cfg(unix)]
+         InputType::Socket => Err(CatError::NoSuchDeviceOrAddress),
+         _ => {
+-            let file = File::open(path)?;
+-            if is_unsafe_overwrite(&file, &io::stdout()) {
+-                return Err(CatError::OutputIsInput);
++            let mut file = File::open(path)?;
++            if let Some(ofd) = out_fd {
++                if is_unsafe_overwrite(&file, &ofd) {
++                    return Err(CatError::OutputIsInput);
++                }
+             }
++            let in_fd = file.as_raw_fd();
+             let mut handle = InputHandle {
+-                reader: file,
++                reader: &mut file,
++                in_fd: Some(in_fd),
+                 is_interactive: false,
+             };
+-            cat_handle(&mut handle, options, state)
++            cat_handle(&mut handle, options, state, out, out_fd)
+         }
+     }
+ }
+ 
+-fn cat_files<'a, I>(files: I, options: &OutputOptions) -> UResult<()>
++fn cat_files<'a, I>(
++    files: I,
++    options: &OutputOptions,
++    out: &mut dyn Write,
++    out_fd: Option<BorrowedFd<'_>>,
++    stdin: &mut dyn Read,
++    stdin_fd: Option<BorrowedFd<'_>>,
++) -> UResult<()>
+ where
+     I: IntoIterator<Item = &'a OsString>,
+ {
+@@ -409,12 +464,12 @@ where
+     let mut error_messages: Vec<String> = Vec::new();
+ 
+     for path in files {
+-        if let Err(err) = cat_path(path, options, &mut state) {
++        if let Err(err) = cat_path(path, options, &mut state, out, out_fd, stdin, stdin_fd) {
+             error_messages.push(format!("{}: {err}", path.maybe_quote()));
+         }
+     }
+     if state.skipped_carriage_return {
+-        print!("\r");
++        let _ = out.write_all(b"\r");
+     }
+     if error_messages.is_empty() {
+         Ok(())
+@@ -474,21 +529,36 @@ fn get_input_type(path: &OsString) -> CatResult<InputType> {
+     }
+ }
+ 
+-/// Writes handle to stdout with no configuration. This allows a
++/// Writes handle to the output sink with no configuration. This allows a
+ /// simple memory copy.
+-fn write_fast<R: FdReadable>(handle: &mut InputHandle<R>) -> CatResult<()> {
+-    let stdout = io::stdout();
++fn write_fast(
++    handle: &mut InputHandle,
++    out: &mut dyn Write,
++    out_fd: Option<BorrowedFd<'_>>,
++) -> CatResult<()> {
+     #[cfg(any(target_os = "linux", target_os = "android"))]
+     {
+-        // If we're on Linux or Android, try to use the splice() system call
+-        // for faster writing. If it works, we're done.
+-        if !splice::write_fast_using_splice(handle, &stdout)? {
+-            return Ok(());
++        // Try the splice() system call for faster writing, but only when both
++        // ends are real descriptors. A logical sink (or source) with no backing
++        // fd — an in-memory stream — has nothing to splice and falls through to
++        // the copy loop below.
++        if let (Some(in_raw), Some(write_fd)) = (handle.in_fd, out_fd) {
++            // splice() writes straight to `write_fd`, bypassing any userspace
++            // buffering inside `out` (e.g. a line-buffered stdout). Drain that
++            // buffer to the fd first so already-written bytes stay ahead of the
++            // spliced bytes. `write_fd` is `out`'s own descriptor, so this flush
++            // and the splice target the same open file.
++            out.flush().inspect_err(handle_broken_pipe)?;
++            // SAFETY: `in_raw` is the descriptor owned by `handle.reader`, which
++            // outlives this call; we only borrow it for the splice below.
++            let read_fd = unsafe { BorrowedFd::borrow_raw(in_raw) };
++            if !splice::write_fast_using_splice(read_fd, write_fd)? {
++                return Ok(());
++            }
+         }
+     }
+-    // If we're not on Linux or Android, or the splice() call failed,
+-    // fall back on slower writing.
+-    let mut stdout_lock = stdout.lock();
++    // If we're not on Linux or Android, or the splice() call failed, or there
++    // is no backing fd, fall back on slower writing.
+     let mut buf = [0; 1024 * 64];
+     loop {
+         match handle.reader.read(&mut buf) {
+@@ -496,9 +566,7 @@ fn write_fast<R: FdReadable>(handle: &mut InputHandle<R>) -> CatResult<()> {
+                 if n == 0 {
+                     break;
+                 }
+-                stdout_lock
+-                    .write_all(&buf[..n])
+-                    .inspect_err(handle_broken_pipe)?;
++                out.write_all(&buf[..n]).inspect_err(handle_broken_pipe)?;
+             }
+             Err(e) if e.kind() == ErrorKind::Interrupted => {}
+             Err(e) => return Err(e.into()),
+@@ -506,26 +574,25 @@ fn write_fast<R: FdReadable>(handle: &mut InputHandle<R>) -> CatResult<()> {
+     }
+ 
+     // If the splice() call failed and there has been some data written to
+-    // stdout via while loop above AND there will be second splice() call
+-    // that will succeed, data pushed through splice will be output before
+-    // the data buffered in stdout.lock. Therefore additional explicit flush
+-    // is required here.
+-    stdout_lock.flush().inspect_err(handle_broken_pipe)?;
++    // the output via the while loop above AND there will be a second splice()
++    // call that will succeed, data pushed through splice will be output before
++    // the data buffered in `out`. Therefore an additional explicit flush is
++    // required here.
++    out.flush().inspect_err(handle_broken_pipe)?;
+     Ok(())
+ }
+ 
+-/// Outputs file contents to stdout in a line-by-line fashion,
++/// Outputs file contents to the output sink in a line-by-line fashion,
+ /// propagating any errors that might occur.
+-fn write_lines<R: FdReadable>(
+-    handle: &mut InputHandle<R>,
++fn write_lines(
++    handle: &mut InputHandle,
+     options: &OutputOptions,
+     state: &mut OutputState,
++    out: &mut dyn Write,
+ ) -> CatResult<()> {
+     let mut in_buf = [0; 1024 * 31];
+-    let stdout = io::stdout();
+-    let stdout = stdout.lock();
+-    // Add a 32K buffer for stdout - this greatly improves performance.
+-    let mut writer = BufWriter::with_capacity(32 * 1024, stdout);
++    // Add a 32K buffer for the output - this greatly improves performance.
++    let mut writer = BufWriter::with_capacity(32 * 1024, out);
+ 
+     loop {
+         let n = match handle.reader.read(&mut in_buf) {
+diff --git a/src/splice.rs b/src/splice.rs
+index 87cbff8..74cd040 100644
+--- a/src/splice.rs
++++ b/src/splice.rs
+@@ -2,10 +2,10 @@
+ //
+ // For the full copyright and license information, please view the LICENSE
+ // file that was distributed with this source code.
+-use super::{CatResult, FdReadable, InputHandle};
++use super::CatResult;
+ 
+ use rustix::io::{read, write};
+-use std::os::{fd::AsFd, unix::io::AsRawFd};
++use std::os::fd::{AsFd, BorrowedFd};
+ 
+ use uucore::pipes::{MAX_ROOTLESS_PIPE_SIZE, pipe, splice, splice_exact};
+ 
+@@ -16,19 +16,23 @@ const BUF_SIZE: usize = 1024 * 16;
+ /// without copying between kernel and user spaces. This results in a large
+ /// speedup.
+ ///
++/// `read_fd` and `write_fd` are the descriptors backing the input source and
++/// the output sink; the caller only reaches this path when both exist (an
++/// in-memory stream with no descriptor takes the slow copy path instead).
++///
+ /// The `bool` in the result value indicates if we need to fall back to normal
+ /// copying or not. False means we don't have to.
+ #[inline]
+-pub(super) fn write_fast_using_splice<R: FdReadable, S: AsRawFd + AsFd>(
+-    handle: &InputHandle<R>,
+-    write_fd: &S,
++pub(super) fn write_fast_using_splice(
++    read_fd: BorrowedFd<'_>,
++    write_fd: BorrowedFd<'_>,
+ ) -> CatResult<bool> {
+-    if splice(&handle.reader, &write_fd, MAX_ROOTLESS_PIPE_SIZE).is_ok() {
++    if splice(&read_fd, &write_fd, MAX_ROOTLESS_PIPE_SIZE).is_ok() {
+         // fcntl improves throughput
+         // todo: avoid fcntl overhead for small input, but don't fcntl inside of the loop
+-        let _ = rustix::pipe::fcntl_setpipe_size(write_fd, MAX_ROOTLESS_PIPE_SIZE);
++        let _ = rustix::pipe::fcntl_setpipe_size(&write_fd, MAX_ROOTLESS_PIPE_SIZE);
+         loop {
+-            match splice(&handle.reader, &write_fd, MAX_ROOTLESS_PIPE_SIZE) {
++            match splice(&read_fd, &write_fd, MAX_ROOTLESS_PIPE_SIZE) {
+                 Ok(1..) => {}
+                 Ok(0) => return Ok(false),
+                 Err(_) => return Ok(true),
+@@ -37,16 +41,16 @@ pub(super) fn write_fast_using_splice<R: FdReadable, S: AsRawFd + AsFd>(
+     } else if let Ok((pipe_rd, pipe_wr)) = pipe() {
+         // both of in/output are not pipe. needs broker to use splice() with additional costs
+         loop {
+-            match splice(&handle.reader, &pipe_wr, MAX_ROOTLESS_PIPE_SIZE) {
++            match splice(&read_fd, &pipe_wr, MAX_ROOTLESS_PIPE_SIZE) {
+                 Ok(0) => return Ok(false),
+                 Ok(n) => {
+-                    if splice_exact(&pipe_rd, write_fd, n).is_err() {
++                    if splice_exact(&pipe_rd, &write_fd, n).is_err() {
+                         // If the first splice manages to copy to the intermediate
+                         // pipe, but the second splice to stdout fails for some reason
+                         // we can recover by copying the data that we have from the
+                         // intermediate pipe to stdout using normal read/write. Then
+                         // we tell the caller to fall back.
+-                        copy_exact(&pipe_rd, write_fd, n)?;
++                        copy_exact(&pipe_rd, &write_fd, n)?;
+                         return Ok(true);
+                     }
+                 }

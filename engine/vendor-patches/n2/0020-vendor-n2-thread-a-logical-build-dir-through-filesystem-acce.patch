@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 11:12:19 +0000
+Subject: [PATCH] vendor/n2: thread a logical build dir through filesystem
+ access
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+n2 resolves every path against the process cwd, which forces the in-process
+`ninja` builtin to chdir the engine to build a tree elsewhere — unusable when
+recipes (and sibling builds) share the process. Add a thread-local logical
+build dir (graph::set_cwd / get_cwd / resolve_cwd) that every filesystem touch
+resolves relative paths against: stat (graph), build-file and depfile reads
+(scanner::read_file_with_nul), the .n2_db (db::open + its parent-dir create in
+load), response files (task::write_rspfile), and output directories
+(work::create_parent_dirs). Default (None) is the process cwd — unchanged.
+
+Each recipe runs on a fresh worker thread, so Runner::start carries the dir
+across the thread boundary (get_cwd before spawn, set_cwd inside) so the
+recipe's executor, rspfile writes, and depfile reads all see it.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src/db.rs      |  3 +++
+ src/graph.rs   | 34 +++++++++++++++++++++++++++++++++-
+ src/load.rs    |  4 +++-
+ src/scanner.rs |  4 +++-
+ src/task.rs    | 12 ++++++++++--
+ src/work.rs    |  4 +++-
+ 6 files changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/src/db.rs b/src/db.rs
+index 7e06b97..182bb16 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -324,6 +324,9 @@ impl<'a> Reader<'a> {
+ 
+ /// Opens or creates an on-disk database, loading its state into the provided Graph.
+ pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Result<Writer> {
++    // sarun: resolve against the logical build dir so the in-process `ninja`
++    // builtin reads/writes .n2_db under the brush context's dir.
++    let path = &crate::graph::resolve_cwd(path);
+     match std::fs::OpenOptions::new()
+         .read(true)
+         .append(true)
+diff --git a/src/graph.rs b/src/graph.rs
+index a5b23ae..8a7041e 100644
+--- a/src/graph.rs
++++ b/src/graph.rs
+@@ -345,11 +345,43 @@ pub enum MTime {
+     Stamp(SystemTime),
+ }
+ 
++thread_local! {
++    // sarun: a logical build directory. When set, relative paths n2 stats are
++    // resolved against it instead of the PROCESS cwd, so the in-process `ninja`
++    // builtin can build a tree at the brush context's dir (or `-C <dir>`)
++    // without chdir'ing the engine. Default None → process cwd, unchanged.
++    static N2_CWD: std::cell::RefCell<Option<std::path::PathBuf>> =
++        const { std::cell::RefCell::new(None) };
++}
++
++/// sarun: set (or clear) the thread-local logical build dir, returning the
++/// previous value so a nested build can save/restore it.
++pub fn set_cwd(cwd: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
++    N2_CWD.with(|c| std::mem::replace(&mut *c.borrow_mut(), cwd))
++}
++
++/// sarun: the current logical build dir (None ⇒ process cwd). Used to carry the
++/// dir onto a per-recipe worker thread and to derive the recipe's run cwd.
++pub fn get_cwd() -> Option<std::path::PathBuf> {
++    N2_CWD.with(|c| c.borrow().clone())
++}
++
++/// sarun: resolve a path for filesystem access against the logical build dir.
++pub fn resolve_cwd(path: &Path) -> std::path::PathBuf {
++    if path.is_absolute() {
++        return path.to_path_buf();
++    }
++    N2_CWD.with(|c| match &*c.borrow() {
++        Some(base) => base.join(path),
++        None => path.to_path_buf(),
++    })
++}
++
+ /// stat() an on-disk path, producing its MTime.
+ pub fn stat(path: &Path) -> std::io::Result<MTime> {
+     // TODO: On Windows, use FindFirstFileEx()/FindNextFile() to get timestamps per
+     //       directory, for better stat perf.
+-    Ok(match std::fs::metadata(path) {
++    Ok(match std::fs::metadata(resolve_cwd(path)) {
+         Ok(meta) => MTime::Stamp(meta.modified().unwrap()),
+         Err(err) => {
+             if err.kind() == std::io::ErrorKind::NotFound {
+diff --git a/src/load.rs b/src/load.rs
+index 2a178f2..de93112 100644
+--- a/src/load.rs
++++ b/src/load.rs
+@@ -268,7 +268,9 @@ pub fn read(build_filename: &str) -> anyhow::Result<State> {
+         if let Some(builddir) = &loader.builddir {
+             db_path = Path::new(&builddir).join(db_path);
+             if let Some(parent) = db_path.parent() {
+-                std::fs::create_dir_all(parent)?;
++                // sarun: resolve against the logical build dir (db::open also
++                // resolves, but the parent dir must exist before it opens).
++                std::fs::create_dir_all(graph::resolve_cwd(parent))?;
+             }
+         };
+         db::open(&db_path, &mut loader.graph, &mut hashes)
+diff --git a/src/scanner.rs b/src/scanner.rs
+index aeca733..a87fe0c 100644
+--- a/src/scanner.rs
++++ b/src/scanner.rs
+@@ -165,7 +165,9 @@ pub fn read_file_with_nul(path: &Path) -> std::io::Result<Vec<u8>> {
+     // causes us to allocate a buffer the size of the file, then grow it to push
+     // the nul, copying the entire file(!).  So instead create a buffer of the
+     // right size up front.
+-    let mut file = std::fs::File::open(path)?;
++    // sarun: resolve against the logical build dir so the in-process `ninja`
++    // builtin reads build files and depfiles from the brush context's dir.
++    let mut file = std::fs::File::open(crate::graph::resolve_cwd(path))?;
+     let size = file.metadata()?.len() as usize;
+     let mut bytes = Vec::with_capacity(size + 1);
+     unsafe {
+diff --git a/src/task.rs b/src/task.rs
+index bf4e816..9e041de 100644
+--- a/src/task.rs
++++ b/src/task.rs
+@@ -59,10 +59,13 @@ fn read_depfile(path: &Path) -> anyhow::Result<Vec<String>> {
+ }
+ 
+ fn write_rspfile(rspfile: &RspFile) -> anyhow::Result<()> {
+-    if let Some(parent) = rspfile.path.parent() {
++    // sarun: resolve against the logical build dir so the in-process `ninja`
++    // builtin writes response files into the brush context's dir.
++    let path = crate::graph::resolve_cwd(&rspfile.path);
++    if let Some(parent) = path.parent() {
+         std::fs::create_dir_all(parent)?;
+     }
+-    std::fs::write(&rspfile.path, &rspfile.content)?;
++    std::fs::write(&path, &rspfile.content)?;
+     Ok(())
+ }
+ 
+@@ -219,7 +222,12 @@ impl Runner {
+ 
+         let tid = self.tids.claim();
+         let tx = self.tx.clone();
++        // sarun: each task runs on a fresh thread, so the logical build dir
++        // (a thread-local) must be carried over — recipe execution, rspfile
++        // writes, and depfile reads all resolve relative paths against it.
++        let cwd = crate::graph::get_cwd();
+         std::thread::spawn(move || {
++            crate::graph::set_cwd(cwd);
+             let start = Instant::now();
+             let result = run_task(
+                 &cmdline,
+diff --git a/src/work.rs b/src/work.rs
+index 9b618a6..348b063 100644
+--- a/src/work.rs
++++ b/src/work.rs
+@@ -690,7 +690,9 @@ impl<'a> Work<'a> {
+                 if dirs.iter().any(|&p| p == parent) {
+                     continue;
+                 }
+-                std::fs::create_dir_all(parent)?;
++                // sarun: resolve against the logical build dir so output
++                // directories are created under the brush context's dir.
++                std::fs::create_dir_all(crate::graph::resolve_cwd(parent))?;
+                 dirs.push(parent);
+             }
+         }

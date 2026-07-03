@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 1 Jul 2026 17:34:40 +0000
+Subject: [PATCH] kati: fix Linux kernel build hangs/rejections in embedded
+ make
+
+Three fixes surfaced by running a Linux kernel build (defconfig + build)
+through sarun's embedded kati:
+
+- Advertise .FEATURES (undefine, target-specific, order-only,
+  second-expansion, else-if, shortest-stem, oneshell) in the bootstrap
+  makefile. The kernel's top Makefile gates on
+  `$(filter undefine,$(.FEATURES))` and bails out with a GNU Make
+  version error when it's empty, which kati never populated.
+
+- Accept --no-print-directory/--print-directory as no-op long flags in
+  kati's flags.rs parser instead of panicking with "Unknown flag" the
+  first time the kernel's sub-make recurses with it.
+
+- Fold this invocation's long command-line flags into $(MAKEFLAGS)
+  (run_kati's new cmdline_flags parameter, extract_long_flags helper,
+  wired through all three run_kati call sites). GNU make reflects
+  command-line flags into MAKEFLAGS; kati didn't, so the kernel's
+  __sub-make guard `$(filter --no-print-directory,$(MAKEFLAGS))` never
+  matched and the recursive $(MAKE) rule spun forever.
+---
+ src-rs/flags.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index 074d5a7..a85b381 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -199,6 +199,12 @@ impl Flags {
+                 b"-r" => flags.no_builtin_rules = true,
+                 b"-R" => flags.no_builtin_variables = true,
+                 b"-w" | b"-k" | b"-n" => {} // accepted, semantically no-op in kati
++                // sarun: GNU make's long forms of -w/its inverse. The kernel's
++                // top Makefile passes --no-print-directory to every sub-make
++                // (see the __sub-make dance around MAKEFLAGS); without an
++                // accepted arm here kati's catch-all below panics with
++                // "Unknown flag" on the very first recursive invocation.
++                b"--print-directory" | b"--no-print-directory" => {}
+                 b"-d" => flags.enable_debug = true,
+                 b"--kati_stats" => flags.enable_stat_logs = true,
+                 b"--warn" => flags.enable_kati_warnings = true,

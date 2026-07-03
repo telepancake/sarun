@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 23 Jun 2026 15:32:33 +0000
+Subject: [PATCH] =?UTF-8?q?uu=5Ftouch:=20in-process=20touch=20builtin=20?=
+ =?UTF-8?q?=E2=80=94=20injected=20logical=20I/O=20+=20logical=20cwd?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src/touch.rs | 98 ++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 95 insertions(+), 3 deletions(-)
+
+diff --git a/src/touch.rs b/src/touch.rs
+index bcb688e..8f44322 100644
+--- a/src/touch.rs
++++ b/src/touch.rs
+@@ -37,10 +37,41 @@ use uucore::error::{FromIo, UResult, USimpleError};
+ use uucore::libc;
+ use uucore::parser::shortcut_value_parser::ShortcutValueParser;
+ use uucore::translate;
+-use uucore::{format_usage, show};
++use uucore::format_usage;
+ 
+ use crate::error::TouchError;
+ 
++// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
++//
++// FILESYSTEM template, mirroring uu_cp: [`touch_main`] resolves every relative
++// path operand (and a `-r`/`--reference` value) against the shell's LOGICAL cwd
++// (the process is never `chdir`'d) and routes diagnostics to the shell's logical
++// stderr. touch reads no stdin and (on Unix) writes no stdout. Runs on a FRESH
++// worker thread per call (the engine's `run_coreutil_localized`), so these
++// thread-locals are per-instance: `TOUCH_ERR` buffers diagnostics, `TOUCH_EXIT`
++// the deferred exit code. The crate-local `show!` macro below SHADOWS uucore's
++// (which writes fd 2 + the process-global exit code), recording the code into
++// `TOUCH_EXIT`. Standalone [`uumain`] drains the buffer to real stderr.
++thread_local! {
++    static TOUCH_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
++    static TOUCH_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
++}
++
++/// Shadows [`uucore::show!`]: records the error's code into [`TOUCH_EXIT`] and
++/// writes `<util_name>: <err>` to the logical stderr buffer (never fd 2).
++macro_rules! show {
++    ($err:expr) => {{
++        #[allow(unused_imports)]
++        use uucore::error::UError as _;
++        use std::io::Write as _;
++        let e = $err;
++        $crate::TOUCH_EXIT.with(|c| c.set(e.code()));
++        $crate::TOUCH_ERR.with(|b| {
++            let _ = writeln!(b.borrow_mut(), "{}: {e}", uucore::util_name());
++        });
++    }};
++}
++
+ /// Options contains all the possible behaviors and flags for touch.
+ ///
+ /// All options are public so that the options can be programmatically
+@@ -194,8 +225,55 @@ fn shr2(s: &str) -> String {
+     result
+ }
+ 
++/// Logical entry point for the in-process brush `touch` builtin.
++///
++/// Mirrors [`uumain`] but (1) resolves every relative path operand and the
++/// `-r`/`--reference` value against the shell's LOGICAL `cwd` (the process is
++/// never `chdir`'d), and (2) routes diagnostics to `err` (never fd 2). touch
++/// reads no stdin. The deferred error status surfaces as the returned value.
++pub fn touch_main(
++    args: impl uucore::Args,
++    cwd: &Path,
++    _out: &mut dyn std::io::Write,
++    err: &mut dyn std::io::Write,
++) -> UResult<()> {
++    TOUCH_ERR.with(|b| b.borrow_mut().clear());
++    TOUCH_EXIT.with(|c| c.set(0));
++
++    let result = run(args, Some(cwd));
++
++    let produced = TOUCH_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
++    let _ = err.write_all(&produced);
++    let _ = err.flush();
++
++    let deferred = TOUCH_EXIT.with(std::cell::Cell::get);
++    match result {
++        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
++        other => other,
++    }
++}
++
+ #[uucore::main]
+ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++    TOUCH_ERR.with(|b| b.borrow_mut().clear());
++    TOUCH_EXIT.with(|c| c.set(0));
++
++    let result = run(args, None);
++
++    let produced = TOUCH_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
++    let _ = std::io::Write::write_all(&mut std::io::stderr(), &produced);
++
++    let deferred = TOUCH_EXIT.with(std::cell::Cell::get);
++    match result {
++        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
++        other => other,
++    }
++}
++
++/// Shared body of [`touch_main`] and [`uumain`]. With `cwd` `Some`, relative
++/// path operands and `-r` root at the shell's logical cwd; with `None`
++/// (standalone) they resolve against the process cwd, as upstream.
++fn run(args: impl uucore::Args, cwd: Option<&Path>) -> UResult<()> {
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+ 
+     let mut filenames: Vec<&OsString> = matches
+@@ -210,7 +288,16 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+ 
+     let no_deref = matches.get_flag(options::NO_DEREF);
+ 
+-    let reference = matches.get_one::<OsString>(options::sources::REFERENCE);
++    // Resolve a relative `-r`/`--reference` against the logical cwd.
++    let reference_buf: Option<PathBuf> = matches
++        .get_one::<OsString>(options::sources::REFERENCE)
++        .map(PathBuf::from)
++        .map(|p| match cwd {
++            Some(cwd) if p.is_relative() => cwd.join(p),
++            _ => p,
++        });
++    let reference = reference_buf.as_ref().map(|p| p.as_os_str().to_owned());
++    let reference = reference.as_ref();
+     let date = matches
+         .get_one::<String>(options::sources::DATE)
+         .map(ToOwned::to_owned);
+@@ -243,7 +330,12 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+             if filename == "-" {
+                 InputFile::Stdout
+             } else {
+-                InputFile::Path(PathBuf::from(filename))
++                let p = PathBuf::from(filename);
++                let p = match cwd {
++                    Some(cwd) if p.is_relative() => cwd.join(p),
++                    _ => p,
++                };
++                InputFile::Path(p)
+             }
+         })
+         .collect();

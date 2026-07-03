@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 2 Jul 2026 10:16:24 +0000
+Subject: [PATCH] kati: expand shell wildcards in rule target/prerequisite
+ lists
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+GNU make expands globs in target and prerequisite lists when the
+makefile is read. kati never did, so the kernel's
+
+    $(out)/xen-hypercalls.h: … $(srctree)/include/xen/interface/xen*.h
+
+kept the literal 'xen*.h' word as a prerequisite and dep analysis died
+with "No rule to make target '…/include/xen/interface/xen*.h'".
+
+eval_rule now expands any output / input / order-only word containing
+glob metacharacters (*, ?, [) against the make's logical working dir,
+sorted as libc glob returns them (GNU's order); a pattern with no
+matches stays literal, matching GNU. %-pattern lists are untouched
+unless a word actually carries glob syntax.
+
+testcase/wildcard_in_rule.mk pins GNU parity in the corpus.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/eval.rs               | 43 ++++++++++++++++++++++++++++++++++++
+ testcase/wildcard_in_rule.mk | 13 +++++++++++
+ 2 files changed, 56 insertions(+)
+ create mode 100644 engine/vendor/kati/testcase/wildcard_in_rule.mk
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 2827ac2..c4b793f 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -949,6 +949,13 @@ impl Evaluator {
+             }
+         }
+ 
++        // sarun: GNU make expands shell wildcards in target and prerequisite
++        // lists when the makefile is read — e.g. the Linux kernel's
++        //   xen-hypercalls.h: … $(srctree)/include/xen/interface/xen*.h
++        // Expand any word containing glob metacharacters against the logical
++        // working dir; a pattern with no matches stays literal (GNU behavior).
++        self.expand_rule_globs(&mut rule);
++
+         log!("Rule: {:?}", rule);
+         match self.get_allow_rules()? {
+             RulesAllowed::Warning => {
+@@ -972,6 +979,42 @@ impl Evaluator {
+         Ok(())
+     }
+ 
++    /// GNU make wildcard expansion for rule target / prerequisite words (NOT
++    /// %-patterns — those lists are left alone unless a word carries actual
++    /// glob metacharacters). Matches replace the word in place, sorted (libc
++    /// glob's default, same as GNU); a non-matching pattern stays literal.
++    fn expand_rule_globs(&self, rule: &mut crate::rule::Rule) {
++        fn has_meta(b: &[u8]) -> bool {
++            b.iter().any(|c| matches!(c, b'*' | b'?' | b'['))
++        }
++        let expand = |list: &mut Vec<Symbol>| {
++            if !list.iter().any(|s| has_meta(&s.as_bytes())) {
++                return;
++            }
++            let mut out: Vec<Symbol> = Vec::with_capacity(list.len());
++            for s in list.iter() {
++                let b = s.as_bytes();
++                if !has_meta(&b) {
++                    out.push(*s);
++                    continue;
++                }
++                let files = crate::fileutil::glob(b.clone(), &self.working_dir);
++                match files.as_ref() {
++                    Ok(v) if !v.is_empty() => {
++                        for f in v {
++                            out.push(intern(f.clone()));
++                        }
++                    }
++                    _ => out.push(*s),
++                }
++            }
++            *list = out;
++        };
++        expand(&mut rule.outputs);
++        expand(&mut rule.inputs);
++        expand(&mut rule.order_only_inputs);
++    }
++
+     pub fn eval_command(&mut self, stmt: &CommandStmt) -> Result<()> {
+         self.loc = Some(stmt.loc());
+ 
+diff --git a/testcase/wildcard_in_rule.mk b/testcase/wildcard_in_rule.mk
+new file mode 100644
+index 0000000..9ae928a
+--- /dev/null
++++ b/testcase/wildcard_in_rule.mk
+@@ -0,0 +1,13 @@
++# GNU make expands shell wildcards in target and prerequisite lists when
++# the makefile is read (the Linux kernel relies on this, e.g.
++# `xen-hypercalls.h: … $(srctree)/include/xen/interface/xen*.h`).
++# A pattern that matches nothing stays literal.
++
++$(shell mkdir -p hdrs)
++$(shell touch hdrs/xen1.h hdrs/xen2.h hdrs/other.h)
++
++test: out.txt
++
++out.txt: hdrs/xen*.h
++	@echo deps=$^
++	@touch $@

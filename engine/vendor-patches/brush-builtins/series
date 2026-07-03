@@ -1,0 +1,4 @@
+0010-brush-de-workspace-vendored-crate-manifests-for-standalone-p.patch
+0020-vendor-brush-builtins-exec-in-a-subshell-must-terminate-the-.patch
+0030-provenance-record-make-shell-variable-assignments-in-the-box.patch
+0040-provenance-opt-in-vars-record-rhs-dereferences-and-execution.patch

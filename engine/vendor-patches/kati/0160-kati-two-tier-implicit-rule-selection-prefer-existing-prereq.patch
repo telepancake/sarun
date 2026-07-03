@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 19:42:19 +0000
+Subject: [PATCH] kati: two-tier implicit-rule selection (prefer existing
+ prerequisites)
+
+GNU make picks pattern rules in two tiers: it first prefers a rule whose
+prerequisites already exist (a file, or a mentioned/phony target), and only
+falls back to a rule whose prerequisite must itself be built by another
+implicit rule ("intermediate"/chained) when no existing-prereq rule applies.
+
+kati's chained-prerequisite support (added for Kbuild's
+`$(obj)/%: $(src)/%_shipped`) was folded into the single rule-selection
+pass, so it could win over a directly-buildable rule. For busybox's
+`applets/applets.o`, both `%.o: %.S` and `%.o: %.c` match; only `applets.c`
+exists, but a catch-all link rule (`%: %.o`) made the bogus `applets.S` look
+producible, so `%.o: %.S` was picked and the build died with
+"No rule to make target 'applets/applets.S'".
+
+Split selection into the two tiers GNU make uses:
+  pass 1  existing-prereq pattern rules  (original kati path)
+  suffix  old-style suffix rules         (existing-prereq)
+  pass 2  chained/intermediate pattern rules (last resort before .DEFAULT)
+Chain-free corpus cases take the exact same pass-1 path as before; the
+_shipped chain still resolves in pass 2 with the no-rule-twice guard intact.
+
+busybox `make -j8 prepare` now completes (PREPARE_RC=0).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/dep.rs | 105 +++++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 73 insertions(+), 32 deletions(-)
+
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index d152150..2004293 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -838,6 +838,7 @@ impl<'a> DepBuilder<'a> {
+         rule: &Rule,
+         output: Symbol,
+         n: Arc<Mutex<DepNode>>,
++        allow_chain: bool,
+     ) -> Option<Arc<Rule>> {
+         let output_str = output.as_bytes();
+         let mut matched = None;
+@@ -848,18 +849,27 @@ impl<'a> DepBuilder<'a> {
+                 for input in &rule.inputs {
+                     let buf = pat.append_subst(&output_str, &input.as_bytes());
+                     let sym = intern(buf);
+-                    // sarun: accept inputs that don't exist on disk yet
+-                    // but ARE buildable — either via an explicit rule
+-                    // or via some OTHER implicit pattern rule whose output
+-                    // pattern matches. Mirrors GNU make's "chained
+-                    // implicit rule" derivation (a one-step lookahead;
+-                    // we don't recurse further to keep it cheap). Excluding
+-                    // THIS rule's own patterns enforces "no pattern rule twice
+-                    // in a chain" — else a self-feeding rule like
+-                    // `$(obj)/%: $(src)/%_shipped` would recurse forever.
+-                    if !self.exists(sym)
+-                        && !self.has_producing_rule_except(sym, &rule.output_patterns)
+-                    {
++                    // GNU make picks implicit rules in two tiers: it first
++                    // prefers a rule whose prerequisites already EXIST (a file
++                    // on disk, or a mentioned/phony target — `self.exists`),
++                    // and only resorts to a rule whose prerequisite must itself
++                    // be built by ANOTHER implicit rule ("intermediate" /
++                    // chained) when no existing-prereq rule applies. That tier
++                    // ordering matters: e.g. `%.o: %.S` and `%.o: %.c` both
++                    // match `applets.o`; only `applets.c` exists, so the `.c`
++                    // rule must win even though a catch-all link rule (`%: %.o`)
++                    // makes the bogus `applets.S` look "producible".
++                    //
++                    // `allow_chain` selects the tier: false = existing prereqs
++                    // only (pass 1); true = also accept chained prerequisites
++                    // (pass 2, last resort). The chain check excludes THIS
++                    // rule's own patterns so a self-feeding rule like
++                    // `$(obj)/%: $(src)/%_shipped` can't recurse forever
++                    // (foo → foo_shipped → foo_shipped_shipped → …).
++                    let buildable = self.exists(sym)
++                        || (allow_chain
++                            && self.has_producing_rule_except(sym, &rule.output_patterns));
++                    if !buildable {
+                         ok = false;
+                         break;
+                     }
+@@ -947,8 +957,12 @@ impl<'a> DepBuilder<'a> {
+         }
+ 
+         let irules = self.implicit_rules.get(&output.as_bytes());
+-        for rule in irules.into_iter().rev() {
+-            let Some(pattern_rule) = self.can_pick_implicit_rule(&rule, output, n.clone()) else {
++        // Pass 1: pattern rules whose prerequisites already EXIST (GNU make's
++        // preferred tier — no chaining). This is the original kati behavior and
++        // the path every chain-free corpus case takes.
++        for rule in irules.iter().rev() {
++            let Some(pattern_rule) = self.can_pick_implicit_rule(rule, output, n.clone(), false)
++            else {
+                 continue;
+             };
+             if rule_merger.is_some() {
+@@ -968,25 +982,26 @@ impl<'a> DepBuilder<'a> {
+         }
+ 
+         let output_str = output.as_bytes();
+-        let Some(output_suffix) = get_ext(&output_str) else {
+-            return self.try_default_or_merger(rule_merger, output, vars);
+-        };
+-        if !output_suffix.starts_with(b".") {
+-            return self.try_default_or_merger(rule_merger, output, vars);
+-        }
+-        let output_suffix = &output_suffix[1..];
+-
+-        let Some(found) = self.suffix_rules.get(output_suffix) else {
+-            return self.try_default_or_merger(rule_merger, output, vars);
+-        };
+-
+-        for irule in found {
+-            assert!(irule.inputs.len() == 1);
+-            let input = replace_suffix(output, &irule.inputs[0]);
+-            if !self.exists(input) {
+-                continue;
++        // Old-style suffix rules (also existing-prereq only). On no match,
++        // fall through to the chained pattern-rule pass below rather than
++        // jumping straight to .DEFAULT.
++        let suffix_pick = (|| {
++            let output_suffix = get_ext(&output_str)?;
++            if !output_suffix.starts_with(b".") {
++                return None;
+             }
+-
++            let output_suffix = &output_suffix[1..];
++            let found = self.suffix_rules.get(output_suffix)?;
++            for irule in found {
++                assert!(irule.inputs.len() == 1);
++                let input = replace_suffix(output, &irule.inputs[0]);
++                if self.exists(input) {
++                    return Some(irule.clone());
++                }
++            }
++            None
++        })();
++        if let Some(irule) = suffix_pick {
+             if rule_merger.is_some() {
+                 return Some(PickedRuleInfo {
+                     merger: rule_merger,
+@@ -1006,6 +1021,32 @@ impl<'a> DepBuilder<'a> {
+             });
+         }
+ 
++        // Pass 2: chained (intermediate) pattern rules — accept a rule whose
++        // prerequisite is itself buildable by another implicit rule. This is
++        // GNU make's last resort before `.DEFAULT`, and where the Kbuild
++        // `$(obj)/%: $(src)/%_shipped` chain is resolved when the shipped file
++        // doesn't already exist.
++        for rule in irules.iter().rev() {
++            let Some(pattern_rule) = self.can_pick_implicit_rule(rule, output, n.clone(), true)
++            else {
++                continue;
++            };
++            if rule_merger.is_some() {
++                return Some(PickedRuleInfo {
++                    merger: rule_merger,
++                    pattern_rule: Some(pattern_rule),
++                    vars,
++                });
++            }
++            assert!(pattern_rule.output_patterns.len() == 1);
++            let vars = self.merge_implicit_rule_vars(pattern_rule.output_patterns[0], vars);
++            return Some(PickedRuleInfo {
++                merger: None,
++                pattern_rule: Some(pattern_rule),
++                vars,
++            });
++        }
++
+         self.try_default_or_merger(rule_merger, output, vars)
+     }
+ 

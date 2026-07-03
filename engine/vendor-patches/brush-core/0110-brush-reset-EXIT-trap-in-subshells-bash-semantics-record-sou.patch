@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 13:32:33 +0000
+Subject: [PATCH] brush: reset EXIT trap in subshells (bash semantics); record
+ sourced pipelines
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Real-world integration (GNU hello ./configure in a box — the first
+time an actual autoconf run went through the gate rather than only
+the user's builds) caught a regression from the recent subshell EXIT
+trap change: the PARENT's inherited handler fired at every ( … )
+subshell exit. bash resets the EXIT trap on subshell entry; only one
+set INSIDE the subshell fires. configure's cache-dump exit trap
+running inside its build-sanity probe subshell wedged the whole run.
+Conformance probe pins it (parent trap silent in subshells, still
+fires at shell end).
+
+Also: complete-command observer in brush-core — the engine now
+records pipeline provenance for programs it didn't drive itself
+(sourced files, nested run_program), closing the 'configure sourced
+its .lineno copy and ran entirely off-camera' visibility hole. Depth
+1 stays with run_nested_pipelines; deeper programs stamp/done their
+own records with correct parent uids.
+
+Known gap recorded as visible XFAIL: $! is empty after ( cmd ) & —
+background-subshell jobs don't register a pid (autoconf guards its
+uses; bash sets it).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src/interp.rs | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/src/interp.rs b/src/interp.rs
+index db52c6f..5ad1f8f 100644
+--- a/src/interp.rs
++++ b/src/interp.rs
+@@ -230,8 +230,18 @@ impl Execute for ast::Program {
+     ) -> Result<ExecutionResult, error::Error> {
+         let mut result = ExecutionResult::success();
+ 
++        let depth = PROGRAM_DEPTH.with(|d| {
++            let v = d.get() + 1;
++            d.set(v);
++            v
++        });
+         for command in &self.complete_commands {
+             record_source_position(shell, command);
++            let finisher = COMPLETE_COMMAND_OBSERVER
++                .read()
++                .unwrap()
++                .clone()
++                .and_then(|obs| obs(command, depth));
+             // Execute the command and handle any errors without immediately propagating them.
+             // This allows interactive shells to continue executing subsequent commands even after
+             // errors.
+@@ -243,6 +253,9 @@ impl Execute for ast::Program {
+                     result = err.into_result(shell);
+                 }
+             }
++            if let Some(f) = finisher {
++                f(u8::from(result.exit_code) as i32);
++            }
+ 
+             // Update status
+             shell.set_last_exit_status(result.exit_code.into());
+@@ -252,11 +265,35 @@ impl Execute for ast::Program {
+                 break;
+             }
+         }
++        PROGRAM_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+ 
+         Ok(result)
+     }
+ }
+ 
++// sarun: observer for complete-command execution — lets the embedding
++// engine record pipeline provenance for programs IT didn't drive itself
++// (sourced files, `eval`ed programs). Called with the command and the
++// current Program-execution nesting depth (1 = the outermost run_program,
++// which the engine already records); returns an optional finisher invoked
++// with the exit code after the command completes.
++pub type CompleteCommandObserver = std::sync::Arc<
++    dyn Fn(&ast::CompoundList, usize) -> Option<Box<dyn FnOnce(i32) + Send>>
++        + Send
++        + Sync,
++>;
++
++static COMPLETE_COMMAND_OBSERVER: std::sync::RwLock<Option<CompleteCommandObserver>> =
++    std::sync::RwLock::new(None);
++
++pub fn install_complete_command_observer(f: CompleteCommandObserver) {
++    *COMPLETE_COMMAND_OBSERVER.write().unwrap() = Some(f);
++}
++
++thread_local! {
++    static PROGRAM_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
++}
++
+ /// Record the statement's source position on the current call frame so
+ /// $LINENO (and BASH_LINENO) track execution, as bash does. Best-effort:
+ /// nodes without location info leave the previous position in place.
+@@ -722,6 +759,13 @@ impl Execute for ast::CompoundCommand {
+                 // TODO(source-info): Do we need to reset the line number?
+                 let mut subshell = shell.clone();
+ 
++                // sarun: bash RESETS the EXIT trap on subshell entry — the
++                // parent's handler must not fire when the subshell ends
++                // (configure's cache-dump exit trap running inside every
++                // ( … ) sanity probe wedged the whole run). A trap set
++                // INSIDE the subshell still fires via on_exit below.
++                subshell.traps_mut().remove_handlers(crate::traps::TrapSignal::Exit);
++
+                 // Handle errors within the subshell context to prevent fatal errors
+                 // from propagating to the parent shell.
+                 let subshell_result = match list.execute(&mut subshell, params).await {

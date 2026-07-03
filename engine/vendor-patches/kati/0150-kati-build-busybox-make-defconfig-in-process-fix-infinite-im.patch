@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 19:00:23 +0000
+Subject: [PATCH] =?UTF-8?q?kati:=20build=20busybox=20`make=20defconfig`=20?=
+ =?UTF-8?q?in-process=20=E2=80=94=20fix=20infinite=20implicit-rule=20chain?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Driving a real busybox defconfig through an in-process box make surfaced a hard
+kati bug: a self-feeding pattern rule (Kbuild's `$(obj)/%: $(src)/%_shipped`)
+recursed forever — fixdep.c → fixdep.c_shipped → fixdep.c_shipped_shipped → … —
+until the stack overflowed and aborted the engine. Diagnosed by adding a
+recursion guard that named the runaway target instead of crashing.
+
+Root cause + fix (GNU make's "no pattern rule is used more than once in a chain
+of implicit rules"): can_pick_implicit_rule's prerequisite lookahead counted the
+SAME rule as a producer of its own prerequisite, so the chain never terminated.
+has_producing_rule_except now excludes the current rule's own output patterns
+from that lookahead. Because the real shipped file (e.g. fixdep.c_shipped) EXISTS
+on disk, the target still builds from it — the chain just stops, exactly like
+GNU make.
+
+That fix unmasked a second bug: exists() checked the target relative to the
+engine's PROCESS cwd, not the make's working_dir, so the shipped-file existence
+check failed in a box and the now-correct chain was wrongly rejected
+("No rule to make target zconf.tab.c"). exists() now resolves against
+ev.working_dir (same class as the CURDIR fix).
+
+Backstops (turn a crash into a graceful, named error): a per-thread eval
+recursion guard (expr.rs) and dependency recursion guard (dep.rs). Plus 64 MiB
+worker stacks on the box brush tokio runtime and the n2 recipe runtime, so deep
+(but finite) recursion on large Makefiles doesn't overflow.
+
+Result: `make defconfig` builds the kconfig tooling (gcc-compiled) and runs it
+fully in-process, writing a valid .config (1078 lines, 875 applets). Corpus
+stays 364/378 fail=0; parallel-equiv 364/364.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/dep.rs  | 69 +++++++++++++++++++++++++++++++++++++++++++++-----
+ src-rs/expr.rs | 40 +++++++++++++++++++++++++++++
+ 2 files changed, 102 insertions(+), 7 deletions(-)
+
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 020f851..d152150 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -92,6 +92,19 @@ impl DepNode {
+     }
+ }
+ 
++// sarun: per-thread build_plan recursion depth, to catch runaway dependency
++// chains (deep or non-terminating implicit/suffix-rule searches) before they
++// overflow the stack.
++thread_local! {
++    static DEP_RECURSION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
++}
++struct DepRecursionGuard;
++impl Drop for DepRecursionGuard {
++    fn drop(&mut self) {
++        DEP_RECURSION.with(|c| c.set(c.get().saturating_sub(1)));
++    }
++}
++
+ fn replace_suffix(s: Symbol, newsuf: &Symbol) -> Symbol {
+     let s = s.as_bytes();
+     let s = strip_ext(&s);
+@@ -618,9 +631,22 @@ impl<'a> DepBuilder<'a> {
+     }
+ 
+     fn exists(&self, target: Symbol) -> bool {
+-        self.rules.contains_key(&target)
+-            || self.phony.contains(&target)
+-            || std::fs::exists(OsStr::from_bytes(&target.as_bytes())).is_ok_and(|v| v)
++        if self.rules.contains_key(&target) || self.phony.contains(&target) {
++            return true;
++        }
++        // sarun: resolve the on-disk check against the make's logical working_dir
++        // (the box context / -C dir), NOT the engine's process cwd — a relative
++        // target like `scripts/kconfig/zconf.tab.c_shipped` lives under the build
++        // dir. Without this, the shipped-file existence check fails and the
++        // pattern-rule chain that would copy it is wrongly rejected.
++        let bytes = target.as_bytes();
++        let p = std::path::Path::new(OsStr::from_bytes(&bytes));
++        let path = if p.is_absolute() {
++            p.to_path_buf()
++        } else {
++            self.ev.working_dir.join(p)
++        };
++        std::fs::exists(&path).is_ok_and(|v| v)
+     }
+ 
+     fn get_rule_inputs(&self, s: Symbol) -> Option<(Vec<Symbol>, Loc)> {
+@@ -780,13 +806,23 @@ impl<'a> DepBuilder<'a> {
+     /// or implicit) have output matching this symbol? Used by
+     /// can_pick_implicit_rule to allow chained pattern rules like
+     /// `%.o: %.c` + `%.c:` to build a missing `.c` on demand.
+-    fn has_producing_rule(&self, sym: Symbol) -> bool {
++    /// Like a plain producing-rule check but ignores implicit rules whose output
++    /// patterns equal `except`. sarun: GNU make forbids using a pattern rule more
++    /// than once in a chain of implicit rules — so when deciding whether a
++    /// pattern rule's prerequisite is itself makeable, that SAME rule must not
++    /// count as its producer. Without this, a self-feeding pattern like Kbuild's
++    /// `$(obj)/%: $(src)/%_shipped` recurses forever (foo → foo_shipped →
++    /// foo_shipped_shipped → …) until the stack overflows.
++    fn has_producing_rule_except(&self, sym: Symbol, except: &[Symbol]) -> bool {
+         if self.rules.contains_key(&sym) {
+             return true;
+         }
+         let bytes = sym.as_bytes();
+         let irules = self.implicit_rules.get(&bytes);
+         for rule in irules {
++            if !except.is_empty() && rule.output_patterns.as_slice() == except {
++                continue;
++            }
+             for output_pattern in &rule.output_patterns {
+                 let pat = crate::strutil::Pattern::new(output_pattern.as_bytes());
+                 if pat.matches(&bytes) {
+@@ -814,11 +850,16 @@ impl<'a> DepBuilder<'a> {
+                     let sym = intern(buf);
+                     // sarun: accept inputs that don't exist on disk yet
+                     // but ARE buildable — either via an explicit rule
+-                    // or via some implicit pattern rule whose output
++                    // or via some OTHER implicit pattern rule whose output
+                     // pattern matches. Mirrors GNU make's "chained
+                     // implicit rule" derivation (a one-step lookahead;
+-                    // we don't recurse further to keep it cheap).
+-                    if !self.exists(sym) && !self.has_producing_rule(sym) {
++                    // we don't recurse further to keep it cheap). Excluding
++                    // THIS rule's own patterns enforces "no pattern rule twice
++                    // in a chain" — else a self-feeding rule like
++                    // `$(obj)/%: $(src)/%_shipped` would recurse forever.
++                    if !self.exists(sym)
++                        && !self.has_producing_rule_except(sym, &rule.output_patterns)
++                    {
+                         ok = false;
+                         break;
+                     }
+@@ -1006,6 +1047,20 @@ impl<'a> DepBuilder<'a> {
+     ) -> Result<Arc<Mutex<DepNode>>> {
+         log!("BuildPlan: {output} for {needed_by:?}");
+ 
++        // sarun: guard runaway dependency recursion (deep/implicit-rule chains)
++        // before it overflows the stack; report the target chain instead of
++        // aborting the process.
++        DEP_RECURSION.with(|c| c.set(c.get() + 1));
++        let _dg = DepRecursionGuard;
++        let dep_depth = DEP_RECURSION.with(|c| c.get());
++        if dep_depth > 800 {
++            return Err(anyhow::anyhow!(
++                "dependency recursion exceeded 800 building '{output}' (needed by {:?}) \
++                 — likely an implicit/suffix-rule chain that never terminates",
++                needed_by
++            ));
++        }
++
+         if let Some(found) = self.done.get(&output) {
+             return Ok(found.clone());
+         }
+diff --git a/src-rs/expr.rs b/src-rs/expr.rs
+index d1e6dcf..1c90344 100644
+--- a/src-rs/expr.rs
++++ b/src-rs/expr.rs
+@@ -81,8 +81,48 @@ pub enum Value {
+     },
+ }
+ 
++// sarun: guard against runaway expansion recursion (a self-referential variable
++// or macro) BEFORE it overflows the stack. Counts nested Value::eval calls on
++// this thread; on exceeding the limit, bail with a diagnostic naming the
++// construct, instead of aborting the whole process with a stack overflow. The
++// limit is well above any legitimate makefile expansion depth yet below the
++// frame count that exhausts the (64 MiB) recipe-thread stack.
++thread_local! {
++    static EVAL_RECURSION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
++}
++const EVAL_RECURSION_LIMIT: u32 = 6000;
++
++struct EvalDepthGuard;
++impl Drop for EvalDepthGuard {
++    fn drop(&mut self) {
++        EVAL_RECURSION.with(|c| c.set(c.get().saturating_sub(1)));
++    }
++}
++
+ impl Evaluable for Value {
+     fn eval(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
++        let depth = EVAL_RECURSION.with(|c| {
++            let d = c.get() + 1;
++            c.set(d);
++            d
++        });
++        let _g = EvalDepthGuard;
++        if depth > EVAL_RECURSION_LIMIT {
++            let what = match self {
++                Value::Func { fi, .. } => {
++                    format!("$({} …)", String::from_utf8_lossy(fi.name))
++                }
++                Value::SymRef(_, sym) => format!("$({sym})"),
++                Value::VarRef(..) => "a computed variable reference".to_string(),
++                Value::VarSubst { .. } => "a $(var:pat=subst) reference".to_string(),
++                _ => "an expression".to_string(),
++            };
++            return Err(anyhow::anyhow!(
++                "evaluation recursion exceeded {EVAL_RECURSION_LIMIT} expanding \
++                 {what} (at {:?}) — likely a self-referential variable or macro",
++                ev.loc
++            ));
++        }
+         match self {
+             Value::Literal(_, lit) => out.put_slice(lit),
+             Value::List(_, vec) => {

@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 20 Jun 2026 14:15:56 +0000
+Subject: [PATCH] find: wire -exec children's stdio to the box's logical
+ streams
+
+Parity with the xargs fix: the commands `find -exec` spawns inherited the
+engine's real fd 1/2, so `find ... -exec cmd \; | next` / `-exec cmd + >
+file` misrouted the child's output to the terminal instead of the box's
+pipe/redirect. find's OWN output/errors/stdin/cwd were already logical;
+this closes the remaining spawned-child gap.
+
+Add `Dependencies::{child_stdout, child_stderr}` (default `None` = inherit,
+so Standard/Fake deps and the standalone binary are unchanged), set them on
+both exec paths (single `\;` std Command and batched `+` argmax::Command,
+which forwards stdout/stderr to its inner Command), and have the builtin
+dup the shell's logical fd 1/2 OpenFiles via `TryFrom<OpenFile> for Stdio`.
+BrushFindDeps now holds stdout/stderr as OpenFiles (try_fd).
+
+Verified on musl: `find -name X -exec echo {} \; | wc -l` -> 1,
+`-exec echo {} + > file` writes the path, plain find unaffected, find unit
+suite green.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/find/matchers/exec.rs | 19 +++++++++++++++++++
+ src/find/mod.rs           | 10 ++++++++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/src/find/matchers/exec.rs b/src/find/matchers/exec.rs
+index f14e02e..54a8d01 100644
+--- a/src/find/matchers/exec.rs
++++ b/src/find/matchers/exec.rs
+@@ -123,6 +123,16 @@ impl Matcher for SingleExecMatcher {
+                 }
+             }
+         }
++        // Route the child's stdout/stderr to the embedder's logical streams when
++        // provided (the in-process builtin dups the shell's logical fds), so
++        // `find … -exec cmd \; > file` / `| next` honor the box's redirects and
++        // pipes. Default (standalone) inherits the process fds, as upstream does.
++        if let Some(s) = matcher_io.deps.child_stdout() {
++            command.stdout(s);
++        }
++        if let Some(s) = matcher_io.deps.child_stderr() {
++            command.stderr(s);
++        }
+         match command.status() {
+             Ok(status) => status.success(),
+             Err(e) => {
+@@ -174,6 +184,15 @@ impl MultiExecMatcher {
+     }
+ 
+     fn run_command(&self, command: &mut argmax::Command, matcher_io: &mut MatcherIO) {
++        // Same child-stdio routing as the single-exec path: dup the embedder's
++        // logical streams into the batched `-exec … +` child (argmax::Command
++        // forwards stdout/stderr to the inner std Command).
++        if let Some(s) = matcher_io.deps.child_stdout() {
++            command.stdout(s);
++        }
++        if let Some(s) = matcher_io.deps.child_stderr() {
++            command.stderr(s);
++        }
+         match command.status() {
+             Ok(status) => {
+                 if !status.success() {
+diff --git a/src/find/mod.rs b/src/find/mod.rs
+index c72abab..b982f60 100644
+--- a/src/find/mod.rs
++++ b/src/find/mod.rs
+@@ -86,6 +86,16 @@ pub trait Dependencies {
+     /// the answer comes from the real terminal even when stdin is redirected;
+     /// BSD find reads from stdin unconditionally.
+     fn confirm(&self, prompt: &str) -> bool;
++    /// Stdio for a spawned `-exec` child's stdout / stderr. An embedder returns
++    /// `Some(_)` to route the child's output to the shell's logical streams
++    /// (e.g. a dup of a piped/redirected logical fd); the default `None` leaves
++    /// the child inheriting the process fds, matching the standalone binary.
++    fn child_stdout(&self) -> Option<std::process::Stdio> {
++        None
++    }
++    fn child_stderr(&self) -> Option<std::process::Stdio> {
++        None
++    }
+ }
+ 
+ /// Struct that holds the dependencies we use when run as the real executable.

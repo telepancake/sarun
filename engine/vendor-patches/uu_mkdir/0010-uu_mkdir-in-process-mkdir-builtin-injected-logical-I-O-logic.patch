@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 23 Jun 2026 15:32:30 +0000
+Subject: [PATCH] =?UTF-8?q?uu=5Fmkdir:=20in-process=20mkdir=20builtin=20?=
+ =?UTF-8?q?=E2=80=94=20injected=20logical=20I/O=20+=20logical=20cwd?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src/mkdir.rs | 138 ++++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 125 insertions(+), 13 deletions(-)
+
+diff --git a/src/mkdir.rs b/src/mkdir.rs
+index 9d63211..7f75934 100644
+--- a/src/mkdir.rs
++++ b/src/mkdir.rs
+@@ -6,10 +6,9 @@
+ // spell-checker:ignore (ToDO) ugoa cmode RAII
+ 
+ use clap::builder::ValueParser;
+-use clap::parser::ValuesRef;
+ use clap::{Arg, ArgAction, ArgMatches, Command};
+ use std::ffi::OsString;
+-use std::io::{Write, stdout};
++use std::io::Write;
+ use std::path::{Path, PathBuf};
+ #[cfg(all(unix, target_os = "linux"))]
+ use uucore::error::FromIo;
+@@ -19,10 +18,66 @@ use uucore::translate;
+ #[cfg(not(windows))]
+ use uucore::mode;
+ use uucore::{display::Quotable, fs::dir_strip_dot_for_creation};
+-use uucore::{format_usage, show_if_err};
++use uucore::format_usage;
+ 
+ static DEFAULT_PERM: u32 = 0o777;
+ 
++// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
++//
++// FILESYSTEM template, mirroring uu_cp: [`mkdir_main`] resolves every relative
++// operand against the shell's LOGICAL cwd (the process is never `chdir`'d) and
++// routes all output to the shell's logical sinks. `mkdir` runs on a FRESH worker
++// thread per call (the engine's `run_coreutil_localized`), so these thread-
++// locals are per-instance: `MKDIR_OUT` buffers verbose output, `MKDIR_ERR`
++// diagnostics, `MKDIR_EXIT` the deferred exit code. The crate-local `show!` /
++// `show_if_err!` macros below SHADOW uucore's (which write fd 2 + the process-
++// global exit code), and the verbose `writeln!` sites target [`MkdirOut`]. Both
++// the logical entry and standalone [`uumain`] drain the buffers (the latter to
++// real stdio), so standalone behavior is unchanged.
++thread_local! {
++    static MKDIR_OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
++    static MKDIR_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
++    static MKDIR_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
++}
++
++/// `Write` sink for verbose output; buffers into [`MKDIR_OUT`] (drained to the
++/// logical or real stdout by the entry point). Replaces upstream's
++/// `writeln!(stdout(), …)`.
++struct MkdirOut;
++impl Write for MkdirOut {
++    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++        MKDIR_OUT.with(|b| b.borrow_mut().extend_from_slice(buf));
++        Ok(buf.len())
++    }
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
++/// Shadows [`uucore::show!`]: records the error's code into [`MKDIR_EXIT`] and
++/// writes `<util_name>: <err>` to the logical stderr buffer.
++macro_rules! show {
++    ($err:expr) => {{
++        #[allow(unused_imports)]
++        use uucore::error::UError as _;
++        use std::io::Write as _;
++        let e = $err;
++        $crate::MKDIR_EXIT.with(|c| c.set(e.code()));
++        $crate::MKDIR_ERR.with(|b| {
++            let _ = writeln!(b.borrow_mut(), "{}: {e}", uucore::util_name());
++        });
++    }};
++}
++
++/// Shadows [`uucore::show_if_err!`], routing through the crate-local `show!`.
++macro_rules! show_if_err {
++    ($res:expr) => {{
++        if let Err(e) = $res {
++            show!(e);
++        }
++    }};
++}
++
+ mod options {
+     pub const MODE: &str = "mode";
+     pub const PARENTS: &str = "parents";
+@@ -70,16 +125,76 @@ fn get_mode(matches: &ArgMatches) -> Result<u32, String> {
+     }
+ }
+ 
++/// Logical entry point for the in-process brush `mkdir` builtin.
++///
++/// Mirrors [`uumain`] but (1) resolves every relative directory operand against
++/// the shell's LOGICAL `cwd` (the process is never `chdir`'d), and (2) never
++/// touches process fd 1/2 — verbose output drains to `out`, diagnostics to
++/// `err`, the deferred exit code surfaces as the returned status.
++pub fn mkdir_main(
++    args: impl uucore::Args,
++    cwd: &Path,
++    out: &mut dyn Write,
++    err: &mut dyn Write,
++) -> UResult<()> {
++    MKDIR_OUT.with(|b| b.borrow_mut().clear());
++    MKDIR_ERR.with(|b| b.borrow_mut().clear());
++    MKDIR_EXIT.with(|c| c.set(0));
++
++    let result = run(args, Some(cwd));
++
++    let produced_out = MKDIR_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
++    let produced_err = MKDIR_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
++    let _ = out.write_all(&produced_out);
++    let _ = out.flush();
++    let _ = err.write_all(&produced_err);
++    let _ = err.flush();
++
++    let deferred = MKDIR_EXIT.with(std::cell::Cell::get);
++    match result {
++        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
++        other => other,
++    }
++}
++
+ #[uucore::main]
+ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++    MKDIR_OUT.with(|b| b.borrow_mut().clear());
++    MKDIR_ERR.with(|b| b.borrow_mut().clear());
++    MKDIR_EXIT.with(|c| c.set(0));
++
++    let result = run(args, None);
++
++    let produced_out = MKDIR_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
++    let produced_err = MKDIR_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
++    let _ = std::io::stdout().write_all(&produced_out);
++    let _ = std::io::stderr().write_all(&produced_err);
++
++    let deferred = MKDIR_EXIT.with(std::cell::Cell::get);
++    match result {
++        Ok(()) if deferred != 0 => Err(USimpleError::new(deferred, String::new())),
++        other => other,
++    }
++}
++
++/// Shared body of [`mkdir_main`] and [`uumain`]. When `cwd` is `Some`, relative
++/// operands are rooted at the shell's logical cwd; when `None` (standalone) they
++/// resolve against the process cwd, as upstream.
++fn run(args: impl uucore::Args, cwd: Option<&Path>) -> UResult<()> {
+     // Linux-specific options, not implemented
+     // opts.optflag("Z", "context", "set SELinux security context" +
+     // " of each created directory to CTX"),
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+ 
+-    let dirs = matches
++    let dirs: Vec<PathBuf> = matches
+         .get_many::<OsString>(options::DIRS)
+-        .unwrap_or_default();
++        .unwrap_or_default()
++        .map(PathBuf::from)
++        .map(|p| match cwd {
++            Some(cwd) if p.is_relative() => cwd.join(p),
++            _ => p,
++        })
++        .collect();
+     let verbose = matches.get_flag(options::VERBOSE);
+     let recursive = matches.get_flag(options::PARENTS);
+ 
+@@ -96,7 +211,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+                 set_security_context: set_security_context || context.is_some(),
+                 context,
+             };
+-            exec(dirs, &config);
++            exec(&dirs, &config);
+             Ok(())
+         }
+         Err(f) => Err(USimpleError::new(1, f)),
+@@ -159,12 +274,9 @@ pub fn uu_app() -> Command {
+ /**
+  * Create the list of new directories
+  */
+-fn exec(dirs: ValuesRef<OsString>, config: &Config) {
++fn exec(dirs: &[PathBuf], config: &Config) {
+     for dir in dirs {
+-        let path_buf = PathBuf::from(dir);
+-        let path = path_buf.as_path();
+-
+-        show_if_err!(mkdir(path, config));
++        show_if_err!(mkdir(dir.as_path(), config));
+     }
+ }
+ 
+@@ -312,7 +424,7 @@ fn create_single_dir(path: &Path, is_parent: bool, config: &Config) -> UResult<(
+         Ok(()) => {
+             if config.verbose {
+                 writeln!(
+-                    stdout(),
++                    MkdirOut,
+                     "{}",
+                     translate!("mkdir-verbose-created-directory", "util_name" => "mkdir", "path" => path.quote())
+                 )?;
+@@ -362,7 +474,7 @@ fn create_single_dir(path: &Path, is_parent: bool, config: &Config) -> UResult<(
+             // This matches GNU behavior for paths like "test_dir/../test_dir_a"
+             if config.verbose && is_parent && config.recursive && !ends_with_parent_dir {
+                 writeln!(
+-                    stdout(),
++                    MkdirOut,
+                     "{}",
+                     translate!("mkdir-verbose-created-directory", "util_name" => "mkdir", "path" => path.quote())
+                 )?;

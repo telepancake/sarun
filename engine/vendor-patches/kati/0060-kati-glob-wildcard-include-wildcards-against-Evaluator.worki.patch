@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 09:02:21 +0000
+Subject: [PATCH] kati: glob $(wildcard)/include-wildcards against
+ Evaluator.working_dir
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fileutil::glob now takes the logical working dir. A relative pattern is
+resolved against it (absolute) and globbed there instead of the process cwd;
+matches are then stripped of the base prefix so they keep the pattern's
+original relative form — $(wildcard) and wildcard `include` output are
+unchanged when working_dir == process cwd. Absolute patterns pass through. The
+glob cache keys by the resolved pattern, so the same relative pattern in two
+different working dirs gets its own correct entry.
+
+Callers: wildcard_func and eval's include-glob pass their Evaluator's
+working_dir; regen (which has no Evaluator) passes the process cwd, its
+historical behavior.
+
+Corpus byte-identical incl. the $(wildcard) cases: KATI_COMPAT_PASS=364/378,
+fail=0. Engine builds. The find emulator is the last remaining cwd boundary.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/eval.rs     |  2 +-
+ src-rs/fileutil.rs | 42 ++++++++++++++++++++++++++++++++++++------
+ src-rs/func.rs     |  2 +-
+ src-rs/regen.rs    |  4 +++-
+ 4 files changed, 41 insertions(+), 9 deletions(-)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index e4aaf4e..c46ebc1 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -1061,7 +1061,7 @@ impl Evaluator {
+         let pats = stmt.expr.eval_to_buf(self)?;
+         for pat in word_scanner(&pats) {
+             let pat = pats.slice_ref(pat);
+-            let files = crate::fileutil::glob(pat.clone());
++            let files = crate::fileutil::glob(pat.clone(), &self.working_dir);
+ 
+             if stmt.should_exist {
+                 let missing = match files.as_ref() {
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index bdbaa66..52c9b5b 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -19,6 +19,7 @@ use std::os::unix::ffi::OsStrExt;
+ use std::{
+     collections::HashMap,
+     ffi::{CStr, CString, OsStr},
++    path::Path,
+     process::{Command, ExitStatus},
+     slice,
+     sync::{Arc, LazyLock},
+@@ -168,22 +169,51 @@ pub type GlobResults = Arc<Result<Vec<Bytes>, std::io::Error>>;
+ pub static GLOB_CACHE: LazyLock<Mutex<HashMap<Bytes, GlobResults>>> =
+     LazyLock::new(|| Mutex::new(HashMap::new()));
+ 
+-pub fn glob(pat: Bytes) -> GlobResults {
++/// sarun: `base` is the logical working directory (the Evaluator's working_dir).
++/// A relative pattern is globbed against it instead of the process cwd: we glob
++/// the resolved ABSOLUTE pattern, then strip the `base/` prefix so matches keep
++/// the pattern's original relative form — so $(wildcard) output is unchanged
++/// when base == process cwd. Absolute patterns pass through untouched. The
++/// cache keys by the resolved pattern, so the same relative pattern in two
++/// different working dirs gets its own (correct) entry.
++pub fn glob(pat: Bytes, base: &Path) -> GlobResults {
++    let is_abs = pat.starts_with(b"/");
++    let (resolved, strip_len): (Bytes, usize) = if is_abs {
++        (pat.clone(), 0)
++    } else {
++        let base_bytes = base.as_os_str().as_bytes();
++        let mut r = BytesMut::with_capacity(base_bytes.len() + 1 + pat.len());
++        r.put_slice(base_bytes);
++        r.put_u8(b'/');
++        r.put_slice(&pat);
++        (r.freeze(), base_bytes.len() + 1)
++    };
++
+     let mut cache = GLOB_CACHE.lock();
+-    if let Some(entry) = cache.get(&pat) {
++    if let Some(entry) = cache.get(&resolved) {
+         return entry.clone();
+     }
++    let strip = |f: Bytes| -> Bytes {
++        if strip_len > 0 && f.len() >= strip_len {
++            f.slice(strip_len..)
++        } else {
++            f
++        }
++    };
+     let glob = Arc::new(
+-        if pat.contains(&b'?') || pat.contains(&b'*') || pat.contains(&b'[') || pat.contains(&b'\\')
++        if resolved.contains(&b'?')
++            || resolved.contains(&b'*')
++            || resolved.contains(&b'[')
++            || resolved.contains(&b'\\')
+         {
+-            libc_glob(&pat)
+-        } else if let Err(err) = std::fs::metadata(<OsStr as OsStrExt>::from_bytes(&pat)) {
++            libc_glob(&resolved).map(|files| files.into_iter().map(strip).collect())
++        } else if let Err(err) = std::fs::metadata(<OsStr as OsStrExt>::from_bytes(&resolved)) {
+             Err(err)
+         } else {
+             Ok(vec![pat.clone()])
+         },
+     );
+-    cache.insert(pat, glob.clone());
++    cache.insert(resolved, glob.clone());
+     glob
+ }
+ 
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 95cbab0..352ed98 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -369,7 +369,7 @@ fn wildcard_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut)
+     let mut ww = WordWriter::new(out);
+     for tok in word_scanner(&pat) {
+         let tok = pat.slice_ref(tok);
+-        let files = crate::fileutil::glob(tok);
++        let files = crate::fileutil::glob(tok, &ev.working_dir);
+         if let Ok(files) = files.as_ref() {
+             for f in files {
+                 ww.write(f);
+diff --git a/src-rs/regen.rs b/src-rs/regen.rs
+index 8d01cf2..d1dcd00 100644
+--- a/src-rs/regen.rs
++++ b/src-rs/regen.rs
+@@ -268,7 +268,9 @@ impl StampChecker {
+ 
+     fn check_glob_result(gr: &GlobResult, err: &mut String) -> bool {
+         collect_stats!("glob time (regen)");
+-        let files = glob(gr.pat.clone());
++        // sarun: regen runs without an Evaluator (no logical working_dir), so
++        // glob against the process cwd — its historical behavior.
++        let files = glob(gr.pat.clone(), &std::env::current_dir().unwrap_or_default());
+         let needs_regen = if let Ok(files) = files.as_ref() {
+             files != &gr.result
+         } else {

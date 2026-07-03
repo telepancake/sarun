@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 23 Jun 2026 15:32:32 +0000
+Subject: [PATCH] =?UTF-8?q?uu=5Frm:=20in-process=20rm=20builtin=20?=
+ =?UTF-8?q?=E2=80=94=20injected=20logical=20I/O=20+=20logical=20cwd?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src/platform/unix.rs |  11 +--
+ src/rm.rs            | 161 ++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 157 insertions(+), 15 deletions(-)
+
+diff --git a/src/platform/unix.rs b/src/platform/unix.rs
+index d2bcf6e..4f532ea 100644
+--- a/src/platform/unix.rs
++++ b/src/platform/unix.rs
+@@ -10,15 +10,16 @@
+ use indicatif::ProgressBar;
+ use std::ffi::OsStr;
+ use std::fs;
+-use std::io::{IsTerminal, stdin};
+ use std::os::unix::fs::PermissionsExt;
+ use std::path::Path;
+ use uucore::display::Quotable;
+ use uucore::error::FromIo;
+-use uucore::prompt_yes;
+ use uucore::safe_traversal::{DirFd, SymlinkBehavior};
+-use uucore::show_error;
+ use uucore::translate;
++// `prompt_yes!`/`show_error!` here are the crate-local (logical-I/O) macros from
++// `rm.rs`, in scope by textual macro order; do NOT `use uucore::{…}` them or the
++// two definitions become ambiguous (E0659).
++use super::super::rm_stdin_is_terminal;
+ 
+ use super::super::{
+     InteractiveMode, Options, is_dir_empty, is_readable_metadata, prompt_descend, remove_file,
+@@ -45,7 +46,7 @@ fn prompt_file_with_stat(path: &Path, stat: &libc::stat, options: &Options) -> b
+     let is_symlink = ((stat.st_mode as libc::mode_t) & libc::S_IFMT) == libc::S_IFLNK;
+     let writable = mode_writable(stat.st_mode as libc::mode_t);
+     let len = stat.st_size as u64;
+-    let stdin_ok = options.__presume_input_tty.unwrap_or(false) || stdin().is_terminal();
++    let stdin_ok = options.__presume_input_tty.unwrap_or(false) || rm_stdin_is_terminal();
+ 
+     // Match original behaviour:
+     // - Interactive::Always: always prompt; use non-protected wording when writable,
+@@ -84,7 +85,7 @@ fn prompt_dir_with_mode(path: &Path, mode: libc::mode_t, options: &Options) -> b
+ 
+     let readable = mode_readable(mode as libc::mode_t);
+     let writable = mode_writable(mode as libc::mode_t);
+-    let stdin_ok = options.__presume_input_tty.unwrap_or(false) || stdin().is_terminal();
++    let stdin_ok = options.__presume_input_tty.unwrap_or(false) || rm_stdin_is_terminal();
+ 
+     match (stdin_ok, readable, writable, options.interactive) {
+         (false, _, _, InteractiveMode::PromptProtected) => true,
+diff --git a/src/rm.rs b/src/rm.rs
+index 5f2b981..c0c5676 100644
+--- a/src/rm.rs
++++ b/src/rm.rs
+@@ -10,20 +10,100 @@ use clap::{Arg, ArgAction, Command, parser::ValueSource};
+ use indicatif::{ProgressBar, ProgressStyle};
+ use std::ffi::{OsStr, OsString};
+ use std::fs::{self, Metadata};
+-use std::io::{self, IsTerminal, stdin};
++use std::io::{self, BufRead, IsTerminal, Write, stdin};
+ use std::ops::BitOr;
+ #[cfg(unix)]
+ use std::os::unix::ffi::OsStrExt;
+ #[cfg(unix)]
+ use std::os::unix::fs::PermissionsExt;
+ use std::path::MAIN_SEPARATOR;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use thiserror::Error;
+ use uucore::display::Quotable;
+ use uucore::error::{FromIo, UError, UResult};
+ use uucore::parser::shortcut_value_parser::ShortcutValueParser;
+ use uucore::translate;
+-use uucore::{format_usage, os_str_as_bytes, prompt_yes, show_error};
++use uucore::{format_usage, os_str_as_bytes};
++
++// ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
++//
++// FILESYSTEM template, mirroring uu_cp: [`rm_main`] resolves every relative
++// operand against the shell's LOGICAL cwd (the process is never `chdir`'d) and
++// routes ALL stdio to the shell's logical streams — including interactive
++// prompts (`rm -i`), which must read the shell's logical stdin, NEVER the
++// engine's real fd 0 (a stray read there corrupts a control channel/pipe). Runs
++// on a FRESH worker thread per call (the engine's `run_coreutil_localized`), so
++// these thread-locals are per-instance: `RM_OUT` buffers verbose output,
++// `RM_ERR` diagnostics + prompt text, `RM_IN` the logical stdin line source,
++// `RM_LOGICAL` flags that the logical entry installed them. The crate-local
++// `show_error!` / `prompt_yes!` macros below SHADOW uucore's, and the verbose
++// `println!` sites target `RM_OUT`. Standalone [`uumain`] leaves `RM_LOGICAL`
++// false, so prompts/`is_terminal` fall back to the real process streams.
++thread_local! {
++    static RM_OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
++    static RM_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
++    static RM_IN: std::cell::RefCell<Option<Box<dyn BufRead>>> = const { std::cell::RefCell::new(None) };
++    static RM_LOGICAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// True when the standard streams are the shell's logical streams ([`rm_main`]),
++/// false for the standalone binary ([`uumain`]).
++fn rm_logical() -> bool {
++    RM_LOGICAL.with(std::cell::Cell::get)
++}
++
++/// Whether the (logical or real) stdin is a terminal. In-process there is no
++/// controlling tty, so the logical stdin is never a terminal.
++fn rm_stdin_is_terminal() -> bool {
++    if rm_logical() { false } else { stdin().is_terminal() }
++}
++
++/// Shadows [`uucore::show_error!`]: writes `<util_name>: <msg>` to the logical
++/// stderr buffer when in logical mode, else to the real fd 2.
++macro_rules! show_error {
++    ($($args:tt)+) => {{
++        use std::io::Write as _;
++        if $crate::rm_logical() {
++            $crate::RM_ERR.with(|b| {
++                let mut b = b.borrow_mut();
++                let _ = write!(b, "{}: ", uucore::util_name());
++                let _ = writeln!(b, $($args)+);
++            });
++        } else {
++            let mut e = std::io::stderr().lock();
++            let _ = write!(e, "{}: ", uucore::util_name());
++            let _ = writeln!(e, $($args)+);
++        }
++    }};
++}
++
++/// Shadows [`uucore::prompt_yes!`]: in logical mode the prompt text goes to the
++/// logical stderr buffer and the y/N answer is read from the logical stdin
++/// (`RM_IN`) — never the engine's fd 0; EOF / no input is treated as "no",
++/// matching GNU's behavior on a closed stdin. Falls back to the real streams
++/// for the standalone binary.
++macro_rules! prompt_yes {
++    ($($args:tt)+) => {{
++        if $crate::rm_logical() {
++            use std::io::Write as _;
++            $crate::RM_ERR.with(|b| {
++                let mut b = b.borrow_mut();
++                let _ = write!(b, "{}: ", uucore::util_name());
++                let _ = write!(b, $($args)+);
++                let _ = write!(b, " ");
++            });
++            $crate::RM_IN.with(|cell| {
++                let mut s = String::new();
++                match cell.borrow_mut().as_mut() {
++                    Some(r) => matches!(r.read_line(&mut s), Ok(n) if n > 0 && matches!(s.chars().next(), Some('y' | 'Y'))),
++                    None => false,
++                }
++            })
++        } else {
++            uucore::prompt_yes!($($args)+)
++        }
++    }};
++}
+ 
+ mod platform;
+ #[cfg(all(unix, not(target_os = "redox")))]
+@@ -51,10 +131,23 @@ enum RmError {
+ 
+ impl UError for RmError {}
+ 
++/// `println!` to the logical stdout buffer (`RM_OUT`) in logical mode, else the
++/// real stdout. Replaces upstream's `println!` for verbose output.
++macro_rules! rm_println {
++    ($($args:tt)+) => {{
++        use std::io::Write as _;
++        if $crate::rm_logical() {
++            $crate::RM_OUT.with(|b| { let _ = writeln!(b.borrow_mut(), $($args)+); });
++        } else {
++            let _ = writeln!(std::io::stdout(), $($args)+);
++        }
++    }};
++}
++
+ /// Helper function to print verbose message for removed file
+ fn verbose_removed_file(path: &Path, options: &Options) {
+     if options.verbose {
+-        println!(
++        rm_println!(
+             "{}",
+             translate!("rm-verbose-removed", "file" => uucore::fs::normalize_path(path).quote())
+         );
+@@ -64,7 +157,7 @@ fn verbose_removed_file(path: &Path, options: &Options) {
+ /// Helper function to print verbose message for removed directory
+ fn verbose_removed_directory(path: &Path, options: &Options) {
+     if options.verbose {
+-        println!(
++        rm_println!(
+             "{}",
+             translate!("rm-verbose-removed-directory", "file" => uucore::fs::normalize_path(path).quote())
+         );
+@@ -200,15 +293,63 @@ static PRESUME_INPUT_TTY: &str = "-presume-input-tty";
+ 
+ static ARG_FILES: &str = "files";
+ 
++/// Logical entry point for the in-process brush `rm` builtin.
++///
++/// Mirrors [`uumain`] but (1) resolves every relative file operand against the
++/// shell's LOGICAL `cwd` (the process is never `chdir`'d), and (2) routes all
++/// stdio through the shell's logical streams: verbose output to `out`,
++/// diagnostics + prompts to `err`, and `rm -i` answers read from `stdin` — never
++/// the engine's fd 0. The deferred error status surfaces as the returned value.
++pub fn rm_main(
++    args: impl uucore::Args,
++    cwd: &Path,
++    out: &mut dyn Write,
++    err: &mut dyn Write,
++    stdin_src: Box<dyn BufRead>,
++) -> UResult<()> {
++    RM_OUT.with(|b| b.borrow_mut().clear());
++    RM_ERR.with(|b| b.borrow_mut().clear());
++    RM_IN.with(|c| *c.borrow_mut() = Some(stdin_src));
++    RM_LOGICAL.with(|c| c.set(true));
++
++    let result = run(args, Some(cwd));
++
++    RM_LOGICAL.with(|c| c.set(false));
++    RM_IN.with(|c| *c.borrow_mut() = None);
++    let produced_out = RM_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
++    let produced_err = RM_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
++    let _ = out.write_all(&produced_out);
++    let _ = out.flush();
++    let _ = err.write_all(&produced_err);
++    let _ = err.flush();
++    result
++}
++
+ #[uucore::main]
+ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++    run(args, None)
++}
++
++/// Shared body of [`rm_main`] and [`uumain`]. With `cwd` `Some`, relative file
++/// operands root at the shell's logical cwd; with `None` (standalone) they
++/// resolve against the process cwd, as upstream.
++fn run(args: impl uucore::Args, cwd: Option<&Path>) -> UResult<()> {
+     let args: Vec<OsString> = args.collect();
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args.iter())?;
+ 
+-    let files: Vec<_> = matches
++    // Resolve relative operands against the logical cwd; absolute ones untouched.
++    let file_bufs: Vec<PathBuf> = matches
+         .get_many::<OsString>(ARG_FILES)
+-        .map(|v| v.map(OsString::as_os_str).collect())
++        .map(|v| {
++            v.map(PathBuf::from)
++                .map(|p| match cwd {
++                    Some(cwd) if p.is_relative() => cwd.join(p),
++                    _ => p,
++                })
++                .collect()
++        })
+         .unwrap_or_default();
++    let files: Vec<&OsStr> = file_bufs.iter().map(|p| p.as_os_str()).collect();
+ 
+     let force_flag = matches.get_flag(OPT_FORCE);
+ 
+@@ -864,7 +1005,7 @@ fn prompt_file(path: &Path, options: &Options) -> bool {
+ }
+ 
+ fn prompt_file_permission_readonly(path: &Path, options: &Options, metadata: &Metadata) -> bool {
+-    let stdin_ok = options.__presume_input_tty.unwrap_or(false) || stdin().is_terminal();
++    let stdin_ok = options.__presume_input_tty.unwrap_or(false) || rm_stdin_is_terminal();
+     match (stdin_ok, options.interactive) {
+         (false, InteractiveMode::PromptProtected) => true,
+         _ if is_writable_metadata(metadata) => true,
+@@ -897,7 +1038,7 @@ fn path_is_current_or_parent_directory(path: &Path) -> bool {
+ // Most cases are covered by keep eye out for edge cases
+ #[cfg(unix)]
+ fn handle_writable_directory(path: &Path, options: &Options, metadata: &Metadata) -> bool {
+-    let stdin_ok = options.__presume_input_tty.unwrap_or(false) || stdin().is_terminal();
++    let stdin_ok = options.__presume_input_tty.unwrap_or(false) || rm_stdin_is_terminal();
+     match (
+         stdin_ok,
+         is_readable_metadata(metadata),
+@@ -926,7 +1067,7 @@ fn handle_writable_directory(path: &Path, options: &Options, metadata: &Metadata
+     use std::os::windows::prelude::MetadataExt;
+     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+     let not_user_writable = (metadata.file_attributes() & FILE_ATTRIBUTE_READONLY) != 0;
+-    let stdin_ok = options.__presume_input_tty.unwrap_or(false) || stdin().is_terminal();
++    let stdin_ok = options.__presume_input_tty.unwrap_or(false) || rm_stdin_is_terminal();
+     match (stdin_ok, not_user_writable, options.interactive) {
+         (false, _, InteractiveMode::PromptProtected) => true,
+         (_, true, _) => prompt_yes!("remove write-protected directory {}?", path.quote()),

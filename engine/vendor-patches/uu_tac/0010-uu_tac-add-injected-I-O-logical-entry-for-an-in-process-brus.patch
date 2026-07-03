@@ -1,0 +1,444 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 22 Jun 2026 11:54:51 +0000
+Subject: [PATCH] uu_tac: add injected-I/O logical entry for an in-process
+ brush builtin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adapt the vendored uu_tac so it runs as a native in-process brush builtin
+that reads/writes the shell's logical OpenFile sink/source instead of the
+process's global stdin/stdout/stderr — no process-global stdio, no dup2, so it
+is safe as a concurrent pipeline stage. uumain is retained as a thin descriptor
+bridge over the new entry for the standalone binary / --invoke-bundled path.
+Behavior (and any fast path) is kept byte-for-byte; only the I/O seam moved.
+See engine/vendor/uu_tac/src for the diff against the pristine base.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01TNBGBV51j5AH4j8k8ENi1W
+---
+ src/tac.rs | 297 +++++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 183 insertions(+), 114 deletions(-)
+
+diff --git a/src/tac.rs b/src/tac.rs
+index 50e615c..457b01d 100644
+--- a/src/tac.rs
++++ b/src/tac.rs
+@@ -9,16 +9,10 @@ mod error;
+ 
+ use clap::{Arg, ArgAction, Command};
+ use memchr::memmem;
+-use memmap2::Mmap;
+ use std::ffi::{OsStr, OsString};
+-use std::io::{BufWriter, Read, Write, stdin, stdout};
+-use std::{fs::File, io::copy, path::Path};
+-#[cfg(unix)]
+-use uucore::error::UError;
++use std::io::{Read, Write};
+ use uucore::error::UResult;
+-#[cfg(unix)]
+-use uucore::error::set_exit_code;
+-use uucore::{format_usage, show};
++use uucore::format_usage;
+ 
+ use crate::error::TacError;
+ 
+@@ -31,8 +25,31 @@ mod options {
+     pub static FILE: &str = "file";
+ }
+ 
+-#[uucore::main]
+-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++/// Logical entry point for the bundled `tac` builtin.
++///
++/// Unlike upstream's `uumain`, this never touches the process's own stdio. It
++/// drives `tac` against the shell's logical output sink (`out`), the logical
++/// diagnostic sink (`err`), and the logical input source (`stdin`).
++///
++/// `tac` is inherently a buffer-the-whole-input utility (it must read every
++/// byte before it can emit the LAST line first), so there is no streaming /
++/// splice fast path to preserve and no backing descriptor is needed: stdin is
++/// drained through the `stdin` reader into an owned `Vec<u8>`. Files are still
++/// opened by path (so per-file open/read errors stay byte-faithful to GNU) and
++/// read fully into memory. This holds no process-global state and is safe to
++/// run as one stage of a concurrent pipeline.
++///
++/// Per-file open/read failures are written to `err` (each prefixed with the
++/// "tac: " program name, matching upstream's `show!`) and processing continues
++/// with the next file; the call then returns a non-zero `UResult` so the
++/// caller can surface GNU's exit status (1 on any such error). A write error
++/// to `out` aborts immediately, exactly as upstream.
++pub fn tac(
++    args: impl uucore::Args,
++    out: &mut dyn Write,
++    err: &mut dyn Write,
++    stdin: &mut dyn Read,
++) -> UResult<()> {
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+ 
+     let before = matches.get_flag(options::BEFORE);
+@@ -52,7 +69,26 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+         None => vec![OsString::from("-")],
+     };
+ 
+-    tac(&files, before, regex, separator)
++    tac_impl(&files, before, regex, separator, out, err, stdin)
++}
++
++/// Descriptor-based entry point for the standalone `tac` binary and the
++/// `--invoke-bundled` subprocess dispatcher.
++///
++/// In those contexts the process's own fd 0/1/2 *are* the intended input,
++/// output, and diagnostics, so this is a thin bridge that hands them to
++/// [`tac`]. The in-process brush builtin must NOT route through here — it calls
++/// [`tac`] directly with the shell's logical sinks/source, so it never touches
++/// process-global stdio.
++#[uucore::main]
++pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++    let stdout = std::io::stdout();
++    let mut out = stdout.lock();
++    let stderr = std::io::stderr();
++    let mut err = stderr.lock();
++    let stdin = std::io::stdin();
++    let mut input = stdin.lock();
++    tac(args, &mut out, &mut err, &mut input)
+ }
+ 
+ pub fn uu_app() -> Command {
+@@ -104,21 +140,18 @@ pub fn uu_app() -> Command {
+ /// `before` is `false`, then each match of this pattern is interpreted
+ /// as the end of a line.
+ ///
+-/// This function writes each line in `data` to [`std::io::Stdout`] in
+-/// reverse.
++/// This function writes each line in `data` to `out` in reverse.
+ ///
+ /// # Errors
+ ///
+-/// If there is a problem writing to `stdout`, then this function
++/// If there is a problem writing to `out`, then this function
+ /// returns [`std::io::Error`].
+ fn buffer_tac_regex(
+     data: &[u8],
+     pattern: &regex::bytes::Regex,
+     before: bool,
++    out: &mut dyn Write,
+ ) -> std::io::Result<()> {
+-    let out = stdout();
+-    let mut out = BufWriter::new(out.lock());
+-
+     // The index of the line separator for the current line.
+     //
+     // As we scan through the `data` from right to left, we update this
+@@ -138,7 +171,7 @@ fn buffer_tac_regex(
+     let mut following_line_start = data.len();
+ 
+     // Iterate over each byte in the buffer in reverse. When we find a
+-    // line separator, write the line to stdout.
++    // line separator, write the line to the output.
+     //
+     // The `before` flag controls whether the line separator appears at
+     // the end of the line (as in "abc\ndef\n") or at the beginning of
+@@ -173,9 +206,9 @@ fn buffer_tac_regex(
+     Ok(())
+ }
+ 
+-/// Write lines from `data` to stdout in reverse.
++/// Write lines from `data` to `out` in reverse.
+ ///
+-/// This function writes to [`stdout`] each line appearing in `data`,
++/// This function writes to `out` each line appearing in `data`,
+ /// starting with the last line and ending with the first line. The
+ /// `separator` parameter defines what characters to use as a line
+ /// separator.
+@@ -185,10 +218,12 @@ fn buffer_tac_regex(
+ /// If `before` is `true`, then this function assumes that the
+ /// `separator` appears at the beginning of each line, as in
+ /// `"/abc/def"`.
+-fn buffer_tac(data: &[u8], before: bool, separator: &OsStr) -> std::io::Result<()> {
+-    let out = stdout();
+-    let mut out = BufWriter::new(out.lock());
+-
++fn buffer_tac(
++    data: &[u8],
++    before: bool,
++    separator: &OsStr,
++    out: &mut dyn Write,
++) -> std::io::Result<()> {
+     // The number of bytes in the line separator.
+     let slen = separator.len();
+ 
+@@ -203,7 +238,7 @@ fn buffer_tac(data: &[u8], before: bool, separator: &OsStr) -> std::io::Result<(
+     let mut following_line_start = data.len();
+ 
+     // Iterate over each byte in the buffer in reverse. When we find a
+-    // line separator, write the line to stdout.
++    // line separator, write the line to the output.
+     //
+     // The `before` flag controls whether the line separator appears at
+     // the end of the line (as in "abc\ndef\n") or at the beginning of
+@@ -322,7 +357,15 @@ fn translate_regex_flavor(bytes: &[u8]) -> String {
+ }
+ 
+ #[allow(clippy::cognitive_complexity)]
+-fn tac(filenames: &[OsString], before: bool, regex: bool, separator: &OsStr) -> UResult<()> {
++fn tac_impl(
++    filenames: &[OsString],
++    before: bool,
++    regex: bool,
++    separator: &OsStr,
++    out: &mut dyn Write,
++    err: &mut dyn Write,
++    stdin: &mut dyn Read,
++) -> UResult<()> {
+     // Compile the regular expression pattern if it is provided.
+     let maybe_pattern = if regex {
+         match regex::bytes::RegexBuilder::new(&translate_regex_flavor(separator.as_encoded_bytes()))
+@@ -336,67 +379,54 @@ fn tac(filenames: &[OsString], before: bool, regex: bool, separator: &OsStr) ->
+         None
+     };
+ 
++    // Tracks whether any per-file open/read error occurred. Upstream uses
++    // `show!` + `set_exit_code(1)` + `continue`; here we route the diagnostic
++    // to the logical `err` sink and remember that the final status must be
++    // non-zero (GNU exits 1 on any such error, but still processes the rest).
++    let mut had_error = false;
++
+     for filename in filenames {
+-        let mmap;
+         let buf;
+ 
+         let data: &[u8] = if filename == "-" {
+-            #[cfg(unix)]
+-            if uucore::signals::stdin_was_closed() {
+-                let e: Box<dyn UError> = TacError::ReadError(
+-                    OsString::from("-"),
+-                    std::io::Error::from_raw_os_error(libc::EBADF),
+-                )
+-                .into();
+-                show!(e);
+-                set_exit_code(1);
+-                continue;
+-            }
+-            if let Some(mmap1) = try_mmap_stdin() {
+-                mmap = mmap1;
+-                &mmap
+-            } else {
+-                // Copy stdin to a temp file (respects TMPDIR), then mmap it.
+-                // Falls back to Vec buffer if temp file creation fails (e.g., bad TMPDIR).
+-                match buffer_stdin() {
+-                    Ok(StdinData::Mmap(mmap1)) => {
+-                        mmap = mmap1;
+-                        &mmap
+-                    }
+-                    Ok(StdinData::Vec(buf1)) => {
+-                        buf = buf1;
+-                        &buf
+-                    }
+-                    Err(e) => {
+-                        show!(TacError::ReadError(OsString::from("stdin"), e));
+-                        continue;
+-                    }
++            // tac buffers the entire input before emitting anything (last line
++            // first), so there is no streaming/splice path to preserve: drain
++            // the logical stdin reader fully into an owned buffer.
++            let mut contents = Vec::new();
++            match stdin.read_to_end(&mut contents) {
++                Ok(_) => {
++                    buf = contents;
++                    &buf
++                }
++                Err(e) => {
++                    let msg = TacError::ReadError(OsString::from("stdin"), e);
++                    let _ = writeln!(err, "tac: {msg}");
++                    had_error = true;
++                    continue;
+                 }
+             }
+         } else {
+-            let path = Path::new(filename);
+-            let mut file = match File::open(path) {
++            let mut file = match std::fs::File::open(std::path::Path::new(filename)) {
+                 Ok(f) => f,
+                 Err(e) => {
+-                    show!(TacError::OpenError(filename.clone(), e));
++                    let msg = TacError::OpenError(filename.clone(), e);
++                    let _ = writeln!(err, "tac: {msg}");
++                    had_error = true;
+                     continue;
+                 }
+             };
+ 
+-            if let Some(mmap1) = try_mmap_file(&file) {
+-                mmap = mmap1;
+-                &mmap
+-            } else {
+-                let mut contents = Vec::new();
+-                match file.read_to_end(&mut contents) {
+-                    Ok(_) => {
+-                        buf = contents;
+-                        &buf
+-                    }
+-                    Err(e) => {
+-                        show!(TacError::ReadError(filename.clone(), e));
+-                        continue;
+-                    }
++            let mut contents = Vec::new();
++            match file.read_to_end(&mut contents) {
++                Ok(_) => {
++                    buf = contents;
++                    &buf
++                }
++                Err(e) => {
++                    let msg = TacError::ReadError(filename.clone(), e);
++                    let _ = writeln!(err, "tac: {msg}");
++                    had_error = true;
++                    continue;
+                 }
+             }
+         };
+@@ -404,8 +434,8 @@ fn tac(filenames: &[OsString], before: bool, regex: bool, separator: &OsStr) ->
+         // Select the appropriate `tac` algorithm based on whether the
+         // separator is given as a regular expression or a fixed string.
+         let result = match maybe_pattern {
+-            Some(ref pattern) => buffer_tac_regex(data, pattern, before),
+-            None => buffer_tac(data, before, separator),
++            Some(ref pattern) => buffer_tac_regex(data, pattern, before, out),
++            None => buffer_tac(data, before, separator, out),
+         };
+ 
+         // If there is any error in writing the output, terminate immediately.
+@@ -413,49 +443,17 @@ fn tac(filenames: &[OsString], before: bool, regex: bool, separator: &OsStr) ->
+             return Err(TacError::WriteError(e).into());
+         }
+     }
+-    Ok(())
+-}
+-
+-fn try_mmap_stdin() -> Option<Mmap> {
+-    // SAFETY: If the file is truncated while we map it, SIGBUS will be raised
+-    // and our process will be terminated, thus preventing access of invalid memory.
+-    let mmap = unsafe { Mmap::map(&stdin()).ok()? };
+-    // On Windows, mmap on a pipe handle can "succeed" but return 0 bytes
+-    // (the file size of a pipe is reported as 0). When that happens, return
+-    // None so we fall through to buffer_stdin() which reads the pipe properly.
+-    if mmap.is_empty() { None } else { Some(mmap) }
+-}
+ 
+-enum StdinData {
+-    Mmap(Mmap),
+-    Vec(Vec<u8>),
+-}
+-
+-/// Copy stdin to a temp file, then memory-map it.
+-/// Falls back to reading directly into memory if temp file creation fails.
+-fn buffer_stdin() -> std::io::Result<StdinData> {
+-    // Try to create a temp file (respects TMPDIR)
+-    if let Ok(mut tmp) = tempfile::tempfile() {
+-        // Temp file created - copy stdin to it, then read back
+-        copy(&mut stdin(), &mut tmp)?;
+-        // SAFETY: If the file is truncated while we map it, SIGBUS will be raised
+-        // and our process will be terminated, thus preventing access of invalid memory.
+-        let mmap = unsafe { Mmap::map(&tmp)? };
+-        Ok(StdinData::Mmap(mmap))
++    if had_error {
++        // The diagnostics were already emitted to `err`; surface GNU's exit
++        // status (1) without printing anything further. An empty-message
++        // USimpleError sets the code and prints nothing.
++        Err(uucore::error::USimpleError::new(1, String::new()))
+     } else {
+-        // Fall back to reading directly into memory (e.g., bad TMPDIR)
+-        let mut buf = Vec::new();
+-        stdin().read_to_end(&mut buf)?;
+-        Ok(StdinData::Vec(buf))
++        Ok(())
+     }
+ }
+ 
+-fn try_mmap_file(file: &File) -> Option<Mmap> {
+-    // SAFETY: If the file is truncated while we map it, SIGBUS will be raised
+-    // and our process will be terminated, thus preventing access of invalid memory.
+-    unsafe { Mmap::map(file).ok() }
+-}
+-
+ #[cfg(test)]
+ mod tests_hybrid_flavor {
+     use super::translate_regex_flavor;
+@@ -539,4 +537,75 @@ mod tests_hybrid_flavor {
+ 
+         assert_eq!(translate_regex_flavor(br"\^"), r"\^");
+     }
++
++    // ── injected-I/O smoke tests (the in-process brush builtin path) ──
++    // Drive the public `tac(...)` entry with in-memory Vec<u8> out/err and a
++    // `&[u8]` stdin, asserting reversed bytes — no process fd is touched.
++    use super::tac;
++
++    fn run(args: &[&str], input: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
++        let mut out: Vec<u8> = Vec::new();
++        let mut err: Vec<u8> = Vec::new();
++        let mut stdin: &[u8] = input;
++        let argv = args.iter().map(|s| std::ffi::OsString::from(*s));
++        let code = match tac(argv, &mut out, &mut err, &mut stdin) {
++            Ok(()) => 0,
++            Err(e) => e.code(),
++        };
++        (out, err, code)
++    }
++
++    #[test]
++    fn test_inmem_basic_reverse() {
++        let (out, err, code) = run(&["tac"], b"a\nb\nc\n");
++        assert_eq!(out, b"c\nb\na\n");
++        assert!(err.is_empty());
++        assert_eq!(code, 0);
++    }
++
++    #[test]
++    fn test_inmem_no_trailing_newline() {
++        let (out, _err, code) = run(&["tac"], b"a\nb\nc");
++        assert_eq!(out, b"cb\na\n");
++        assert_eq!(code, 0);
++    }
++
++    #[test]
++    fn test_inmem_empty_input() {
++        let (out, err, code) = run(&["tac"], b"");
++        assert!(out.is_empty());
++        assert!(err.is_empty());
++        assert_eq!(code, 0);
++    }
++
++    #[test]
++    fn test_inmem_separator() {
++        let (out, _err, code) = run(&["tac", "-s", ":"], b"a:b:c:");
++        assert_eq!(out, b"c:b:a:");
++        assert_eq!(code, 0);
++    }
++
++    #[test]
++    fn test_inmem_before() {
++        let (out, _err, code) = run(&["tac", "-b", "-s", ":"], b":a:b:c");
++        assert_eq!(out, b":c:b:a");
++        assert_eq!(code, 0);
++    }
++
++    #[test]
++    fn test_inmem_regex_separator() {
++        // Reverse on a run of digits as the separator (matches GNU
++        // `printf 'a1b22c' | tac -r -s '[0-9]+'` => "c2b2a1").
++        let (out, _err, code) = run(&["tac", "-r", "-s", "[0-9]+"], b"a1b22c");
++        assert_eq!(out, b"c2b2a1");
++        assert_eq!(code, 0);
++    }
++
++    #[test]
++    fn test_inmem_binary_input() {
++        // NUL-separated reverse via empty separator (maps to \0).
++        let (out, _err, code) = run(&["tac", "-s", ""], b"a\0b\0c\0");
++        assert_eq!(out, b"c\0b\0a\0");
++        assert_eq!(code, 0);
++    }
+ }

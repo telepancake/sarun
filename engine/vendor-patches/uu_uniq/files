@@ -1,0 +1,10 @@
+.cargo_vcs_info.json
+Cargo.toml
+Cargo.toml.orig
+LICENSE
+README.package.md
+benches/uniq_bench.rs
+locales/en-US.ftl
+locales/fr-FR.ftl
+src/main.rs
+src/uniq.rs

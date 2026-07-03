@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 25 Jun 2026 11:54:35 +0000
+Subject: [PATCH] kati: run \$(shell ...) in the make's logical working dir,
+ not process cwd
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A sub-make reached in-process (make -C sub, or `cd sub && make`) never chdir's
+the process — kati tracks a LOGICAL working_dir and uses it for include/glob/
+stat. But run_command (\$(shell ...), regen) ran in the PROCESS cwd, so a
+sub-make's `$(shell cat rel.txt)` looked in the parent dir and failed
+("no such file"), yielding empty values.
+
+Thread the Evaluator's working_dir into the shell path: shell_func_impl and
+run_command take a `cwd`, used for BOTH the in-process runner (via the recipe
+runner's cwd) AND the fork fallback (cmd.current_dir). \$(shell) now runs where
+the makefile lives. eval.rs `!=` assignment and regen pass their working dir too.
+
+Verified: a sub-make `VAL := $(shell cat val.txt)` now reads sub/val.txt
+(VAL=[FROMSUB]) under both `make -C a` and `cd a && make`; previously empty
+with "cat: val.txt: No such file". make + recursive real_build regressions pass.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/eval.rs     |  5 ++++-
+ src-rs/exec.rs     |  2 +-
+ src-rs/fileutil.rs | 21 +++++++++++++--------
+ src-rs/func.rs     |  9 ++++++---
+ src-rs/regen.rs    |  6 ++++++
+ 5 files changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 1f33ff7..2418792 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -646,8 +646,11 @@ impl Evaluator {
+                 let shell = self.get_shell()?;
+                 let shellflag = self.get_shell_flag();
+                 let box_prefix = self.box_export_prefix.clone();
++                let cwd = std::os::unix::ffi::OsStrExt::as_bytes(
++                    self.working_dir.as_os_str()).to_vec();
+                 let (_exit, output, _fc) =
+-                    crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc, &box_prefix)?;
++                    crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc,
++                                                 &box_prefix, &cwd)?;
+                 result = Variable::with_simple_string(
+                     output,
+                     origin,
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 80f8aa4..32aaeaf 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -292,7 +292,7 @@ fn run_node_commands(
+             {
+                 (code == 0, o, code)
+             } else {
+-                match run_command(shell, shellflag, &run_input, RedirectStderr::Stdout) {
++                match run_command(shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout) {
+                     Ok((status, o)) => (status.success(), o, status.code().unwrap_or(1)),
+                     Err(e) => (false, format!("{e}\n").into_bytes(), 1),
+                 }
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 5c26a0c..223c90e 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -15,7 +15,7 @@ limitations under the License.
+ */
+ 
+ use std::io::Read;
+-use std::os::unix::ffi::{OsStrExt, OsStringExt};
++use std::os::unix::ffi::OsStrExt;
+ use std::os::unix::process::ExitStatusExt;
+ use std::{
+     collections::HashMap,
+@@ -129,6 +129,7 @@ pub fn run_command(
+     shell: &[u8],
+     shellflag: &[u8],
+     cmd: &Bytes,
++    cwd: &[u8],
+     redirect_stderr: RedirectStderr,
+ ) -> Result<(ExitStatus, Vec<u8>)> {
+     // sarun: route through the in-process runner (embedded brush) before
+@@ -137,14 +138,13 @@ pub fn run_command(
+     // (which would re-exec the engine as a separate process). The runner honors
+     // `redirect_stderr` (merge into the captured output / inherit to the box's
+     // stderr / discard) so $(shell) keeps stdout-capture + stderr-to-terminal.
+-    // cwd is the process cwd — matching the fork path, which inherits it too.
+-    // Declines (Passthrough / no runner) fall through to the classic fork below.
+-    {
+-        let cwd = std::env::current_dir()
+-            .map(|p| p.into_os_string().into_vec())
+-            .unwrap_or_default();
++    // `cwd` is the make's LOGICAL working dir (the Evaluator's working_dir): an
++    // in-process sub-make never chdir's the process, so $(shell) must run in this
++    // dir, not the process cwd. Declines (Passthrough / no runner) fall through
++    // to the fork below, which is also pinned to `cwd`.
++    if !cwd.is_empty() {
+         if let Some((code, output)) =
+-            run_with_installed_runner(shell, shellflag, cmd, &cwd, redirect_stderr)
++            run_with_installed_runner(shell, shellflag, cmd, cwd, redirect_stderr)
+         {
+             return Ok((ExitStatus::from_raw((code & 0xff) << 8), output));
+         }
+@@ -178,6 +178,11 @@ pub fn run_command(
+ 
+     let mut cmd = Command::new(args[0]);
+     cmd.args(&args[1..]);
++    // Pin the forked shell to the make's logical working dir (an in-process
++    // sub-make doesn't chdir the process), so $(shell) sees the right cwd.
++    if !cwd.is_empty() {
++        cmd.current_dir(<OsStr as OsStrExt>::from_bytes(cwd));
++    }
+ 
+     let (mut reader, writer) = os_pipe::pipe()?;
+     match redirect_stderr {
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index eabab19..629f5d1 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -584,6 +584,7 @@ pub fn shell_func_impl(
+     cmd: &Bytes,
+     loc: &Loc,
+     box_prefix: &[u8],
++    cwd: &[u8],
+ ) -> Result<(i32, Bytes, Option<FindCommand>)> {
+     log!("ShellFunc: {:?}", cmd);
+ 
+@@ -606,7 +607,7 @@ pub fn shell_func_impl(
+         Bytes::from(v)
+     };
+     let cmd = &cmd;
+-    let (status, output) = run_command(shell, shellflag, cmd, RedirectStderr::None)?;
++    let (status, output) = run_command(shell, shellflag, cmd, cwd, RedirectStderr::None)?;
+     let output = Bytes::from(format_for_command_substitution(output));
+ 
+     if let Some(exit_code) = status.code() {
+@@ -707,7 +708,8 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
+     let shellflag = ev.get_shell_flag();
+     let box_prefix = ev.box_export_prefix.clone();
+ 
+-    let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix)?;
++    let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix,
++                        ev.working_dir.as_os_str().as_bytes())?;
+     out.put_slice(&output);
+     if should_store_command_result(&cmd) {
+         COMMAND_RESULTS.lock().push(CommandResult {
+@@ -750,7 +752,8 @@ fn shell_no_rerun_func(
+     let shellflag = ev.get_shell_flag();
+     let box_prefix = ev.box_export_prefix.clone();
+ 
+-    let (exit_code, output, _) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix)?;
++    let (exit_code, output, _) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix,
++                        ev.working_dir.as_os_str().as_bytes())?;
+     out.put_slice(&output);
+     set_shell_status_var(exit_code);
+     Ok(())
+diff --git a/src-rs/regen.rs b/src-rs/regen.rs
+index d1dcd00..13527bd 100644
+--- a/src-rs/regen.rs
++++ b/src-rs/regen.rs
+@@ -415,10 +415,16 @@ impl StampChecker {
+         }
+ 
+         collect_stats_with_slow_report!("shell time (regen)", &sr.cmd);
++        // regen runs at the top level (makefile staleness check), so the process
++        // cwd is the right working dir for these $(shell) results.
++        let cwd = std::env::current_dir()
++            .map(|p| <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::into_vec(p.into_os_string()))
++            .unwrap_or_default();
+         let (_status, output) = run_command(
+             sr.shell.as_bytes(),
+             sr.shellflag.as_bytes(),
+             &cmd,
++            &cwd,
+             crate::fileutil::RedirectStderr::DevNull,
+         )?;
+         let output = format_for_command_substitution(output);

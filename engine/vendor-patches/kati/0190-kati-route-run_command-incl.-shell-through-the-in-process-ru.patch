@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 25 Jun 2026 10:33:20 +0000
+Subject: [PATCH] kati: route run_command (incl. \$(shell)) through the
+ in-process runner
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A -b box's make ran recipes in-process via the recipe-runner hook, but kati's
+run_command() — used by \$(shell ...), regen, and the recipe fork-fallback —
+still fork+exec'd /bin/sh directly, re-execing the engine as a separate process
+per call. \$(shell cat foo) / \$(shell pkg-config ...) and friends were the
+"bash -c / sh -c as separate processes" seen during a kbuild-style build.
+
+Fix at the single choke point: run_command() now consults the installed
+in-process runner (embedded brush) before forking, so EVERY caller benefits.
+The runner hook gains a RedirectStderr arg so it reproduces run_command's three
+stderr dispositions:
+  - Stdout  (recipes, n2): fd2 merged into the captured output.
+  - None    (\$(shell)):    fd2 stays on the box's real stderr (terminal/sink);
+                            only stdout is captured into the expansion value.
+  - DevNull:               fd2 -> /dev/null.
+On Passthrough / no runner (standalone rkati, or SHELL=non-posix) it falls
+through to the classic fork. cwd is the process cwd, matching the fork path.
+
+brush::run_recipe_in_process_opt gains a RecipeStderr param (Merge/Inherit/Null)
+driving fd2; run_recipe_in_process and the n2 executor keep Merge (their merged
+contract). n2 needed no change — its executor hook (process_posix.rs) already
+replaces posix_spawn wholesale when installed.
+
+Verified: \$(shell cat ver.txt) captured correctly, \$(shell ... >&2; ...)
+captures only stdout (stderr to terminal), no forked sh. Busybox builds
+byte-identical (1059432 bytes / 401 applets); forked shells across the whole
+build drop from ~21 to 1. test_make_rs.py and test_brush_nested_sh_rs.py pass.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/exec.rs     |  4 +++-
+ src-rs/fileutil.rs | 28 ++++++++++++++++++++++++++--
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 39a045f..80f8aa4 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -287,7 +287,9 @@ fn run_node_commands(
+             Bytes::from(v)
+         };
+         let (ok, o, code) =
+-            if let Some((code, o)) = run_with_installed_runner(shell, shellflag, &run_input, &cwd) {
++            if let Some((code, o)) =
++                run_with_installed_runner(shell, shellflag, &run_input, &cwd, RedirectStderr::Stdout)
++            {
+                 (code == 0, o, code)
+             } else {
+                 match run_command(shell, shellflag, &run_input, RedirectStderr::Stdout) {
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index e38677f..5c26a0c 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -15,7 +15,8 @@ limitations under the License.
+ */
+ 
+ use std::io::Read;
+-use std::os::unix::ffi::OsStrExt;
++use std::os::unix::ffi::{OsStrExt, OsStringExt};
++use std::os::unix::process::ExitStatusExt;
+ use std::{
+     collections::HashMap,
+     ffi::{CStr, CString, OsStr},
+@@ -58,6 +59,7 @@ pub type RecipeRunner = Arc<
+             &[u8], /* shellflag */
+             &[u8], /* cmd */
+             &[u8], /* recipe cwd (the make's working_dir, as path bytes) */
++            RedirectStderr, /* stderr disposition (merge into output / inherit / discard) */
+             &mut dyn FnMut(&[u8]),
+         ) -> RecipeRunnerDecision
+         + Send
+@@ -84,13 +86,16 @@ pub fn run_with_installed_runner(
+     shellflag: &[u8],
+     cmd: &[u8],
+     cwd: &[u8],
++    redirect_stderr: RedirectStderr,
+ ) -> Option<(i32, Vec<u8>)> {
+     // sarun: clone the runner Arc and RELEASE the lock before invoking it. The
+     // runner may run a recursive in-process make whose recipes re-enter here;
+     // holding this non-reentrant lock across the call would deadlock.
+     let runner = RECIPE_RUNNER.lock().as_ref()?.clone();
+     let mut out = Vec::new();
+-    match runner(shell, shellflag, cmd, cwd, &mut |b| out.extend_from_slice(b)) {
++    match runner(shell, shellflag, cmd, cwd, redirect_stderr, &mut |b| {
++        out.extend_from_slice(b)
++    }) {
+         RecipeRunnerDecision::Ran { code } => Some((code, out)),
+         RecipeRunnerDecision::Passthrough => None,
+     }
+@@ -126,6 +131,25 @@ pub fn run_command(
+     cmd: &Bytes,
+     redirect_stderr: RedirectStderr,
+ ) -> Result<(ExitStatus, Vec<u8>)> {
++    // sarun: route through the in-process runner (embedded brush) before
++    // fork+exec'ing /bin/sh — so $(shell ...), regen, and any other run_command
++    // caller run in-process exactly like recipes do, instead of forking a shell
++    // (which would re-exec the engine as a separate process). The runner honors
++    // `redirect_stderr` (merge into the captured output / inherit to the box's
++    // stderr / discard) so $(shell) keeps stdout-capture + stderr-to-terminal.
++    // cwd is the process cwd — matching the fork path, which inherits it too.
++    // Declines (Passthrough / no runner) fall through to the classic fork below.
++    {
++        let cwd = std::env::current_dir()
++            .map(|p| p.into_os_string().into_vec())
++            .unwrap_or_default();
++        if let Some((code, output)) =
++            run_with_installed_runner(shell, shellflag, cmd, &cwd, redirect_stderr)
++        {
++            return Ok((ExitStatus::from_raw((code & 0xff) << 8), output));
++        }
++    }
++
+     let mut cmd_with_shell;
+     let args = if !shell.starts_with(b"/") || memchr2(b' ', b'$', shell).is_some() {
+         let cmd_escaped = crate::strutil::escape_shell(cmd);

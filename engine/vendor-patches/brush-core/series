@@ -1,0 +1,11 @@
+0010-brush-de-workspace-vendored-crate-manifests-for-standalone-p.patch
+0020-brush-core-pipeline-stage-fd-hygiene-spawned_pipeline_stage-.patch
+0030-brush-core-launch-state-hooks-for-nice-setsid-nohup-exec-wra.patch
+0040-brush-core-add-Shell-run_argv-run-env-nice-.-through-it-drop.patch
+0050-Fix-audit-bugs-H5-L1-H1-correct-stale-capture-rename-comment.patch
+0060-brush-snoop-self-shadowed-bin-sh-scripts-in-process-no-fork-.patch
+0070-provenance-record-make-shell-variable-assignments-in-the-box.patch
+0080-provenance-opt-in-vars-record-rhs-dereferences-and-execution.patch
+0090-brush-bash-conformance-corpus-38-probes-through-a-real-box-3.patch
+0100-brush-LINENO-tracks-execution-unblocks-autoconf-configure.patch
+0110-brush-reset-EXIT-trap-in-subshells-bash-semantics-record-sou.patch

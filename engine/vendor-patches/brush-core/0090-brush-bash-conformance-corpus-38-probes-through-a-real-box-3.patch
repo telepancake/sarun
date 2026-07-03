@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 11:07:01 +0000
+Subject: [PATCH] brush: bash-conformance corpus (38 probes through a real box)
+ + 3 fixes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+New hard gate: test_brush_conformance_rs.py runs a corpus of shell
+probes — parameter expansion, arrays, IFS/quoting, heredocs,
+[[ ]]/(( ))/case, functions, traps, set -e/-u/pipefail, redirections,
+builtins, brace/glob — through host bash (reference) AND through
+brush in BASH mode inside a real -b box, diffing stdout+stderr+exit.
+Divergence outside the (currently EMPTY) visible XFAIL list fails;
+an xpass fails too, so the list can't rot. Part of make test.
+
+35/38 matched bash immediately; the sweep caught three real bugs,
+fixed:
+- ${v:1:-2}: a NEGATIVE length is an absolute end offset from the
+  END of the value (len-2), not offset-relative — was one char long.
+- EXIT traps never fired at shell termination: brush-core had
+  on_exit() but nothing called it. Wired at every shell-lifetime end
+  (script entry, snooped nested sh/bash, recipe lines, subshells) —
+  with the CALLER's execution params (new on_exit_with_params), so a
+  redirected shell's trap writes to the redirected fds, and $? of an
+  explicit exit is preserved.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src/expansion.rs   | 21 ++++++++++++++-------
+ src/interp.rs      |  8 +++++++-
+ src/shell/traps.rs | 14 ++++++++++++--
+ 3 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/src/expansion.rs b/src/expansion.rs
+index 1522b21..4432ae0 100644
+--- a/src/expansion.rs
++++ b/src/expansion.rs
+@@ -1362,15 +1362,22 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
+                 let expanded_offset = min(expanded_offset, expanded_parameter_len);
+ 
+                 let end_offset = if let Some(length) = length {
+-                    let mut expanded_length = length.eval(self.shell, self.params, false).await?;
++                    let expanded_length = length.eval(self.shell, self.params, false).await?;
+                     if expanded_length < 0 {
+-                        expanded_length += expanded_parameter_len;
++                        // bash: a NEGATIVE length is an absolute end offset
++                        // from the END of the value — ${v:1:-2} ends at
++                        // len-2, not offset+(len-2).
++                        std::cmp::max(
++                            expanded_parameter_len + expanded_length,
++                            expanded_offset,
++                        )
++                    } else {
++                        let expanded_length = min(
++                            expanded_length,
++                            expanded_parameter_len - expanded_offset,
++                        );
++                        expanded_offset + expanded_length
+                     }
+-
+-                    let expanded_length =
+-                        min(expanded_length, expanded_parameter_len - expanded_offset);
+-
+-                    expanded_offset + expanded_length
+                 } else {
+                     expanded_parameter_len
+                 };
+diff --git a/src/interp.rs b/src/interp.rs
+index 08bd338..b2687cd 100644
+--- a/src/interp.rs
++++ b/src/interp.rs
+@@ -720,9 +720,15 @@ impl Execute for ast::CompoundCommand {
+                     }
+                 };
+ 
++                // sarun: bash fires a subshell's own EXIT trap when the
++                // subshell terminates — including via an explicit `exit`.
++                // The trap must not clobber the subshell's exit code.
++                let sub_code = subshell_result.exit_code;
++                let _ = subshell.on_exit_with_params(params).await;
++
+                 // Preserve the subshell's exit code, but don't honor any of its requests to exit
+                 // the shell, break out of loops, etc.
+-                Ok(ExecutionResult::from(subshell_result.exit_code))
++                Ok(ExecutionResult::from(sub_code))
+             }
+             Self::ForClause(f) => f.execute(shell, params).await,
+             Self::CaseClause(c) => c.execute(shell, params).await,
+diff --git a/src/shell/traps.rs b/src/shell/traps.rs
+index 83c4400..27eb2d7 100644
+--- a/src/shell/traps.rs
++++ b/src/shell/traps.rs
+@@ -7,9 +7,19 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+     ///
+     /// This currently includes invoking the `EXIT` trap handler, if any.
+     pub async fn on_exit(&mut self) -> Result<(), error::Error> {
++        let params = self.default_exec_params();
++        self.on_exit_with_params(&params).await
++    }
++
++    /// Like `on_exit`, but the trap handler runs with the CALLER's execution
++    /// parameters — a redirected nested shell's EXIT trap must write to the
++    /// redirected fds, not the shell's base ones.
++    pub async fn on_exit_with_params(
++        &mut self,
++        params: &ExecutionParameters,
++    ) -> Result<(), error::Error> {
+         if self.traps.handles(TrapSignal::Exit) {
+-            self.invoke_trap_handler(TrapSignal::Exit, &self.default_exec_params())
+-                .await?;
++            self.invoke_trap_handler(TrapSignal::Exit, params).await?;
+         }
+ 
+         Ok(())

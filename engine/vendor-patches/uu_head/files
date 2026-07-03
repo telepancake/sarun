@@ -1,0 +1,11 @@
+Cargo.toml
+Cargo.toml.orig
+LICENSE
+README.package.md
+locales/en-US.ftl
+locales/fr-FR.ftl
+src/cli.rs
+src/head.rs
+src/main.rs
+src/parse.rs
+src/take.rs

@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 06:15:21 +0000
+Subject: [PATCH] provenance: record make+shell variable assignments in the box
+ DB
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Complex builds pass values make → shell → sub-make and back; tracing a
+wrong value ("aabb") needs the whole assignment chain, searchable in the
+box DB — not stderr traces behind magic flags.
+
+New makevar table (name, loc, value, make_dir; UNIQUE-deduped) fed by:
+- kati: a VarAssignHook in eval_assign records every makefile-level
+  assignment at its ASSIGNMENT site (stmt loc — += points at the append,
+  not the original :=), skipping bootstrap/command-line noise.
+- brush: an AssignObserver in apply_assignment plus a hook in the export
+  builtin record shell scalars and `export NAME=…` inside recipes/
+  pipelines, tagged "recipe of <edge>" / "pipeline #<uid>". The box
+  export-prefix replay is suppressed (SUPPRESS_VAR_RECORD) so per-
+  subshell export noise never lands in the table.
+
+Rows batch through a make_vars frame (256/flush) into the box sqlar;
+review.makevars searches name/value with text globs. test_make_rs.py
+case 24 pins the full chain: make :=/+= with file:line locs, shell
+scalar, export builtin, sub-make override, and prefix suppression.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src/interp.rs | 30 ++++++++++++++++++++++++++++++
+ src/lib.rs    |  2 +-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/interp.rs b/src/interp.rs
+index af34bc0..091a091 100644
+--- a/src/interp.rs
++++ b/src/interp.rs
+@@ -1540,6 +1540,31 @@ async fn expand_assignment_value(
+ }
+ 
+ #[expect(clippy::too_many_lines)]
++// sarun: optional observer for every shell variable assignment the
++// interpreter applies — (name, value, exported). The embedding engine records
++// them (tagged with its recipe/pipeline context) into the box's capture DB so
++// make↔shell↔sub-make variable flows are traceable from one searchable place.
++pub type AssignObserver = std::sync::Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
++
++static ASSIGN_OBSERVER: std::sync::RwLock<Option<AssignObserver>> =
++    std::sync::RwLock::new(None);
++
++pub fn install_assign_observer(f: AssignObserver) {
++    *ASSIGN_OBSERVER.write().unwrap() = Some(f);
++}
++
++fn assign_observer() -> Option<AssignObserver> {
++    ASSIGN_OBSERVER.read().unwrap().clone()
++}
++
++/// Report one assignment to the installed observer — for builtins that set
++/// variables outside apply_assignment (export/declare).
++pub fn observe_assignment(name: &str, value: &str, exported: bool) {
++    if let Some(obs) = assign_observer() {
++        obs(name, value, exported);
++    }
++}
++
+ async fn apply_assignment(
+     assignment: &ast::Assignment,
+     shell: &mut Shell<impl extensions::ShellExtensions>,
+@@ -1607,6 +1632,11 @@ async fn apply_assignment(
+             .await;
+     }
+ 
++    // sarun: report to the installed assignment observer (engine capture).
++    if let Some(obs) = assign_observer() {
++        obs(variable_name.as_str(), &new_value.to_string(), export);
++    }
++
+     // See if we need to eval an array index.
+     if let Some(idx) = &array_index {
+         let will_be_indexed_array = if let Some((_, existing_value)) =
+diff --git a/src/lib.rs b/src/lib.rs
+index b21b9cc..2d52769 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -17,7 +17,7 @@ pub mod functions;
+ pub mod history;
+ pub mod int_utils;
+ pub mod interfaces;
+-mod interp;
++pub mod interp;
+ mod ioutils;
+ pub mod jobs;
+ mod keywords;

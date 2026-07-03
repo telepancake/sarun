@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 10:16:43 +0000
+Subject: [PATCH] make: in-process remake-the-makefile loop in the builtin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-generating includes (e.g. auto-generated .d dependency files, a staple of
+non-trivial C builds) now work in the make builtin. When a required `include`
+names a file that doesn't exist but has a rule, kati builds it and reports
+remake_active; the shadow path re-execs the engine to re-parse with the file
+visible, which a builtin can't do. Instead make_builtin loops in-process:
+build the include, drop the caches, re-run kati — up to the same depth cap.
+
+Both caches must be dropped between iterations: the makefile cache (so the
+regenerated include is re-parsed) AND the glob cache (eval_include probes
+include existence via glob(), and the first parse cached the include as
+missing — without clearing it the re-parse believes it's still missing and
+loops forever). Added file_cache::clear(); glob already had clear_glob_cache().
+
+Validated in a real box: test_make_rs CASE 7 — GENVAR defined ONLY in the
+generated gen.mk reaches the top makefile's recipe on the reparse
+(out7.txt='remade'), fully in-process (no `make` process row). Full box suite
+MAKE-RS PASS; kati corpus 364/378 fail=0.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/file_cache.rs | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src-rs/file_cache.rs b/src-rs/file_cache.rs
+index 99d5dbb..dbbdfa6 100644
+--- a/src-rs/file_cache.rs
++++ b/src-rs/file_cache.rs
+@@ -78,6 +78,16 @@ pub fn get_makefile(filename: &OsStr, base_dir: &Path) -> Result<Option<Arc<Make
+     CACHE.lock().get_makefile(filename, &open_path)
+ }
+ 
++/// sarun: drop all cached parsed makefiles (and extra-dep names) so the next
++/// parse re-reads from disk. The in-process make builtin calls this between
++/// remake-the-makefile iterations — the in-process analogue of the shadow
++/// path's self-re-exec — so a regenerated `include` becomes visible on reparse.
++pub fn clear() {
++    let mut m = CACHE.lock();
++    m.cache.clear();
++    m.extra_file_deps.clear();
++}
++
+ pub fn add_extra_file_dep(filename: OsString) {
+     CACHE.lock().extra_file_deps.insert(filename);
+ }

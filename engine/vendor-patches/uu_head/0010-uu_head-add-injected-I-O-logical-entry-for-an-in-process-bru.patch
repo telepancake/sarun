@@ -1,0 +1,526 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 22 Jun 2026 11:54:50 +0000
+Subject: [PATCH] uu_head: add injected-I/O logical entry for an in-process
+ brush builtin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adapt the vendored uu_head so it runs as a native in-process brush builtin
+that reads/writes the shell's logical OpenFile sink/source instead of the
+process's global stdin/stdout/stderr — no process-global stdio, no dup2, so it
+is safe as a concurrent pipeline stage. uumain is retained as a thin descriptor
+bridge over the new entry for the standalone binary / --invoke-bundled path.
+Behavior (and any fast path) is kept byte-for-byte; only the I/O seam moved.
+See engine/vendor/uu_head/src for the diff against the pristine base.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01TNBGBV51j5AH4j8k8ENi1W
+---
+ src/head.rs | 288 +++++++++++++++++++++++++++++++++++++++-------------
+ src/take.rs |  16 +--
+ 2 files changed, 225 insertions(+), 79 deletions(-)
+
+diff --git a/src/head.rs b/src/head.rs
+index 1fbb21d..3b8aea6 100644
+--- a/src/head.rs
++++ b/src/head.rs
+@@ -12,10 +12,10 @@ use std::fs::File;
+ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+ use std::num::TryFromIntError;
+ #[cfg(unix)]
+-use std::os::fd::AsFd;
++use std::os::fd::BorrowedFd;
+ use std::path::{Path, PathBuf};
+ use thiserror::Error;
+-use uucore::display::{Quotable, print_verbatim};
++use uucore::display::Quotable;
+ use uucore::error::{FromIo, UError, UResult, USimpleError};
+ use uucore::line_ending::LineEnding;
+ use uucore::show;
+@@ -166,32 +166,54 @@ fn wrap_in_stdout_error(err: io::Error) -> io::Error {
+     )
+ }
+ 
+-fn read_n_bytes(input: impl Read, n: u64) -> io::Result<u64> {
++/// Write a filename verbatim to the logical output sink, preserving any
++/// non-UTF-8 bytes. This is the writer-injected analogue of uucore's
++/// `print_verbatim`, which only ever targets the process's real stdout; the
++/// in-process builtin must write the box's logical sink instead.
++fn write_verbatim(out: &mut dyn Write, name: &OsString) -> io::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::os::unix::ffi::OsStrExt;
++        out.write_all(name.as_bytes())
++    }
++    #[cfg(not(unix))]
++    {
++        match name.to_str() {
++            Some(text) => out.write_all(text.as_bytes()),
++            None => Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "OS string cannot be converted to bytes",
++            )),
++        }
++    }
++}
++
++fn read_n_bytes(input: impl Read, n: u64, out: &mut dyn Write) -> io::Result<u64> {
+     // Read the first `n` bytes from the `input` reader.
+     let mut reader = input.take(n);
+ 
+-    // Write those bytes to `stdout`.
+-    let stdout = io::stdout();
+-    let mut stdout = stdout.lock();
+-
+-    let bytes_written = io::copy(&mut reader, &mut stdout).map_err(wrap_in_stdout_error)?;
++    // Write those bytes to the output sink.
++    let bytes_written = io::copy(&mut reader, out).map_err(wrap_in_stdout_error)?;
+ 
+     // Make sure we finish writing everything to the target before
+     // exiting. Otherwise, when Rust is implicitly flushing, any
+     // error will be silently ignored.
+-    stdout.flush().map_err(wrap_in_stdout_error)?;
++    out.flush().map_err(wrap_in_stdout_error)?;
+ 
+     Ok(bytes_written)
+ }
+ 
+-fn read_n_lines(input: &mut impl io::BufRead, n: u64, separator: u8) -> io::Result<u64> {
++fn read_n_lines(
++    input: &mut impl io::BufRead,
++    n: u64,
++    separator: u8,
++    out: &mut dyn Write,
++) -> io::Result<u64> {
+     // Read the first `n` lines from the `input` reader.
+     let mut reader = take_lines(input, n, separator);
+ 
+-    // Write those bytes to `stdout`.
+-    let stdout = io::stdout();
+-    let stdout = stdout.lock();
+-    let mut writer = BufWriter::with_capacity(BUF_SIZE, stdout);
++    // Write those bytes to the output sink.
++    let mut writer = BufWriter::with_capacity(BUF_SIZE, out);
+ 
+     let bytes_written = io::copy(&mut reader, &mut writer).map_err(wrap_in_stdout_error)?;
+ 
+@@ -207,13 +229,10 @@ fn catch_too_large_numbers_in_backwards_bytes_or_lines(n: u64) -> Option<usize>
+     usize::try_from(n).ok()
+ }
+ 
+-fn read_but_last_n_bytes(mut input: impl Read, n: u64) -> io::Result<u64> {
++fn read_but_last_n_bytes(mut input: impl Read, n: u64, out: &mut dyn Write) -> io::Result<u64> {
+     let mut bytes_written: u64 = 0;
+     if let Some(n) = catch_too_large_numbers_in_backwards_bytes_or_lines(n) {
+-        let stdout = io::stdout();
+-        let mut stdout = stdout.lock();
+-
+-        bytes_written = copy_all_but_n_bytes(&mut input, &mut stdout, n)
++        bytes_written = copy_all_but_n_bytes(&mut input, out, n)
+             .map_err(wrap_in_stdout_error)?
+             .try_into()
+             .unwrap();
+@@ -221,27 +240,30 @@ fn read_but_last_n_bytes(mut input: impl Read, n: u64) -> io::Result<u64> {
+         // Make sure we finish writing everything to the target before
+         // exiting. Otherwise, when Rust is implicitly flushing, any
+         // error will be silently ignored.
+-        stdout.flush().map_err(wrap_in_stdout_error)?;
++        out.flush().map_err(wrap_in_stdout_error)?;
+     }
+     Ok(bytes_written)
+ }
+ 
+-fn read_but_last_n_lines(mut input: impl Read, n: u64, separator: u8) -> io::Result<u64> {
+-    let stdout = io::stdout();
+-    let mut stdout = stdout.lock();
++fn read_but_last_n_lines(
++    mut input: impl Read,
++    n: u64,
++    separator: u8,
++    out: &mut dyn Write,
++) -> io::Result<u64> {
+     if n == 0 {
+-        return io::copy(&mut input, &mut stdout).map_err(wrap_in_stdout_error);
++        return io::copy(&mut input, out).map_err(wrap_in_stdout_error);
+     }
+     let mut bytes_written: u64 = 0;
+     if let Some(n) = catch_too_large_numbers_in_backwards_bytes_or_lines(n) {
+-        bytes_written = copy_all_but_n_lines(input, &mut stdout, n, separator)
++        bytes_written = copy_all_but_n_lines(input, out, n, separator)
+             .map_err(wrap_in_stdout_error)?
+             .try_into()
+             .unwrap();
+         // Make sure we finish writing everything to the target before
+         // exiting. Otherwise, when Rust is implicitly flushing, any
+         // error will be silently ignored.
+-        stdout.flush().map_err(wrap_in_stdout_error)?;
++        out.flush().map_err(wrap_in_stdout_error)?;
+     }
+     Ok(bytes_written)
+ }
+@@ -344,97 +366,140 @@ fn is_seekable(input: &mut File) -> bool {
+         && input.seek(SeekFrom::Start(current_pos.unwrap())).is_ok()
+ }
+ 
+-fn head_backwards_file(input: &mut File, options: &HeadOptions) -> io::Result<u64> {
++fn head_backwards_file(
++    input: &mut File,
++    options: &HeadOptions,
++    out: &mut dyn Write,
++) -> io::Result<u64> {
+     let st = input.metadata()?;
+     let seekable = is_seekable(input);
+     let blksize_limit = uucore::fs::sane_blksize::sane_blksize_from_metadata(&st);
+     if !seekable || st.len() <= blksize_limit || options.presume_input_pipe {
+-        head_backwards_without_seek_file(input, options)
++        head_backwards_without_seek_file(input, options, out)
+     } else {
+-        head_backwards_on_seekable_file(input, options)
++        head_backwards_on_seekable_file(input, options, out)
+     }
+ }
+ 
+-fn head_backwards_without_seek_file(input: &mut File, options: &HeadOptions) -> io::Result<u64> {
++fn head_backwards_without_seek_file(
++    input: &mut File,
++    options: &HeadOptions,
++    out: &mut dyn Write,
++) -> io::Result<u64> {
+     match options.mode {
+-        Mode::AllButLastBytes(n) => read_but_last_n_bytes(input, n),
+-        Mode::AllButLastLines(n) => read_but_last_n_lines(input, n, options.line_ending.into()),
++        Mode::AllButLastBytes(n) => read_but_last_n_bytes(input, n, out),
++        Mode::AllButLastLines(n) => read_but_last_n_lines(input, n, options.line_ending.into(), out),
+         _ => unreachable!(),
+     }
+ }
+ 
+-fn head_backwards_on_seekable_file(input: &mut File, options: &HeadOptions) -> io::Result<u64> {
++fn head_backwards_on_seekable_file(
++    input: &mut File,
++    options: &HeadOptions,
++    out: &mut dyn Write,
++) -> io::Result<u64> {
+     match options.mode {
+         Mode::AllButLastBytes(n) => {
+             let size = input.metadata()?.len();
+             if n >= size {
+                 Ok(0)
+             } else {
+-                read_n_bytes(input, size - n)
++                read_n_bytes(input, size - n, out)
+             }
+         }
+         Mode::AllButLastLines(n) => {
+             let found = find_nth_line_from_end(input, n, options.line_ending.into())?;
+-            read_n_bytes(input, found)
++            read_n_bytes(input, found, out)
+         }
+         _ => unreachable!(),
+     }
+ }
+ 
+-fn head_file(input: &mut File, options: &HeadOptions) -> io::Result<u64> {
++fn head_file(input: &mut File, options: &HeadOptions, out: &mut dyn Write) -> io::Result<u64> {
+     match options.mode {
+-        Mode::FirstBytes(n) => read_n_bytes(input, n),
++        Mode::FirstBytes(n) => read_n_bytes(input, n, out),
+         Mode::FirstLines(n) => read_n_lines(
+             &mut io::BufReader::with_capacity(BUF_SIZE, input),
+             n,
+             options.line_ending.into(),
++            out,
++        ),
++        Mode::AllButLastBytes(_) | Mode::AllButLastLines(_) => head_backwards_file(input, options, out),
++    }
++}
++
++/// Drive `head` over a stdin source that has no seekable backing `File`.
++///
++/// This is the in-memory / no-fd path: bytes are consumed straight from the
++/// logical reader `stdin`, with no `stream_position`/seek games (there is
++/// nothing to seek). Mirrors upstream's `#[cfg(not(unix))]` stdin branch.
++fn head_stdin_no_fd(
++    stdin: &mut dyn Read,
++    options: &HeadOptions,
++    out: &mut dyn Write,
++) -> io::Result<u64> {
++    match options.mode {
++        Mode::FirstBytes(n) => read_n_bytes(stdin, n, out),
++        Mode::AllButLastBytes(n) => read_but_last_n_bytes(stdin, n, out),
++        Mode::FirstLines(n) => read_n_lines(
++            &mut io::BufReader::with_capacity(BUF_SIZE, stdin),
++            n,
++            options.line_ending.into(),
++            out,
+         ),
+-        Mode::AllButLastBytes(_) | Mode::AllButLastLines(_) => head_backwards_file(input, options),
++        Mode::AllButLastLines(n) => read_but_last_n_lines(stdin, n, options.line_ending.into(), out),
+     }
+ }
+ 
+ #[allow(clippy::cognitive_complexity)]
+-fn uu_head(options: &HeadOptions) -> UResult<()> {
++fn uu_head(
++    options: &HeadOptions,
++    out: &mut dyn Write,
++    stdin: &mut dyn Read,
++    stdin_fd: Option<BorrowedFd<'_>>,
++) -> UResult<()> {
+     let mut first = true;
+     for file in &options.files {
+         let res = if file == "-" {
+             if (options.files.len() > 1 && !options.quiet) || options.verbose {
+                 if !first {
+-                    println!();
++                    writeln!(out)?;
+                 }
+-                println!("{}", translate!("head-header-stdin"));
++                writeln!(out, "{}", translate!("head-header-stdin"))?;
+             }
+-            let stdin = io::stdin();
+ 
++            // When the logical stdin has a real backing descriptor we honour
++            // upstream's seek-preserving behavior: dup the fd into an owned
++            // `File`, run `head_file` against it (which can seek for the
++            // all-but-last paths), then leave the shared offset pointing just
++            // past the bytes we consumed so a following reader of the same
++            // stream continues from the right place. With no backing fd (an
++            // in-memory stream) there is nothing to dup or seek, so we copy
++            // straight through the logical reader instead.
+             #[cfg(unix)]
+             {
+-                let stdin_owned_fd = stdin.as_fd().try_clone_to_owned()?;
+-                let mut stdin_file = File::from(stdin_owned_fd);
+-                let current_pos = stdin_file.stream_position();
+-                if let Ok(current_pos) = current_pos {
+-                    // We have a seekable file. Ensure we set the input stream to the
+-                    // last byte read so that any tools that parse the remainder of
+-                    // the stdin stream read from the correct place.
+-
+-                    let bytes_read = head_file(&mut stdin_file, options)?;
+-                    stdin_file.seek(SeekFrom::Start(current_pos + bytes_read))?;
++                if let Some(fd) = stdin_fd {
++                    let stdin_owned_fd = fd.try_clone_to_owned()?;
++                    let mut stdin_file = File::from(stdin_owned_fd);
++                    let current_pos = stdin_file.stream_position();
++                    if let Ok(current_pos) = current_pos {
++                        // We have a seekable file. Ensure we set the input stream to the
++                        // last byte read so that any tools that parse the remainder of
++                        // the stdin stream read from the correct place.
++
++                        let bytes_read = head_file(&mut stdin_file, options, out)?;
++                        stdin_file.seek(SeekFrom::Start(current_pos + bytes_read))?;
++                    } else {
++                        let _bytes_read = head_file(&mut stdin_file, options, out)?;
++                    }
+                 } else {
+-                    let _bytes_read = head_file(&mut stdin_file, options)?;
++                    head_stdin_no_fd(stdin, options, out)?;
+                 }
+             }
+ 
+             #[cfg(not(unix))]
+             {
+-                let mut stdin = stdin.lock();
+-
+-                match options.mode {
+-                    Mode::FirstBytes(n) => read_n_bytes(&mut stdin, n),
+-                    Mode::AllButLastBytes(n) => read_but_last_n_bytes(&mut stdin, n),
+-                    Mode::FirstLines(n) => read_n_lines(&mut stdin, n, options.line_ending.into()),
+-                    Mode::AllButLastLines(n) => {
+-                        read_but_last_n_lines(&mut stdin, n, options.line_ending.into())
+-                    }
+-                }?;
++                head_stdin_no_fd(stdin, options, out)?;
+             }
+ 
+             Ok(())
+@@ -457,13 +522,13 @@ fn uu_head(options: &HeadOptions) -> UResult<()> {
+             };
+             if (options.files.len() > 1 && !options.quiet) || options.verbose {
+                 if !first {
+-                    println!();
++                    writeln!(out)?;
+                 }
+-                print!("==> ");
+-                print_verbatim(file).unwrap();
+-                println!(" <==");
++                write!(out, "==> ")?;
++                write_verbatim(out, file).unwrap();
++                writeln!(out, " <==")?;
+             }
+-            head_file(&mut file_handle, options)?;
++            head_file(&mut file_handle, options, out)?;
+             Ok(())
+         };
+         if let Err(err) = res {
+@@ -483,12 +548,51 @@ fn uu_head(options: &HeadOptions) -> UResult<()> {
+     Ok(())
+ }
+ 
+-#[uucore::main]
+-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++/// Logical entry point for the bundled `head` builtin.
++///
++/// Unlike upstream's `uumain`, this never touches the process's own stdio: it
++/// drives `head` against the shell's logical output sink (`out`) and logical
++/// input source (`stdin`, with its backing descriptor `stdin_fd` when one
++/// exists). `head` has no splice/`copy_file_range` fast path, so `out_fd` is
++/// accepted only for signature parity with `cat` and is unused; `stdin_fd` is
++/// genuinely needed — when present, the stdin path dups it to a seekable
++/// `File` and preserves the shared offset exactly as GNU/uutils do, and when
++/// absent it copies straight through the in-memory reader. Holds no
++/// process-global state, so a pipeline stage can take it concurrently.
++pub fn head(
++    args: impl uucore::Args,
++    out: &mut dyn Write,
++    out_fd: Option<BorrowedFd<'_>>,
++    stdin: &mut dyn Read,
++    stdin_fd: Option<BorrowedFd<'_>>,
++) -> UResult<()> {
++    // `head` has no fd-to-fd fast path; the output descriptor is irrelevant.
++    let _ = out_fd;
+     let args: Vec<_> = arg_iterate(args)?.collect();
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+     let options = HeadOptions::get_from(&matches).map_err(HeadError::MatchOption)?;
+-    uu_head(&options)
++    uu_head(&options, out, stdin, stdin_fd)
++}
++
++/// Descriptor-based entry point for the standalone `head` binary and the
++/// `--invoke-bundled` subprocess dispatcher.
++///
++/// In those contexts the process's own fd 0/1 *are* the intended input and
++/// output, so this is a thin bridge that hands them to [`head`]. The in-process
++/// brush builtin must NOT route through here — it calls [`head`] directly with
++/// the shell's logical sink/source (and their backing fds, when any), so it
++/// never touches process-global stdio.
++#[uucore::main]
++pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++    let stdout = io::stdout();
++    let mut out = stdout.lock();
++    let stdin = io::stdin();
++    let mut input = stdin.lock();
++    // SAFETY: fd 0 and fd 1 are the process's standard streams, open and valid
++    // for the whole duration of this call.
++    let out_fd = Some(unsafe { BorrowedFd::borrow_raw(1) });
++    let in_fd = Some(unsafe { BorrowedFd::borrow_raw(0) });
++    head(args, &mut out, out_fd, &mut input, in_fd)
+ }
+ 
+ #[cfg(test)]
+@@ -610,8 +714,46 @@ mod tests {
+     #[test]
+     fn read_early_exit() {
+         let mut empty = io::BufReader::new(Cursor::new(Vec::new()));
+-        assert!(read_n_bytes(&mut empty, 0).is_ok());
+-        assert!(read_n_lines(&mut empty, 0, b'\n').is_ok());
++        let mut out: Vec<u8> = Vec::new();
++        assert!(read_n_bytes(&mut empty, 0, &mut out).is_ok());
++        assert!(read_n_lines(&mut empty, 0, b'\n', &mut out).is_ok());
++    }
++
++    /// In-memory, no-fd path: drive the public `head` entry with `out` = a
++    /// `Vec<u8>` and `stdin` = a byte slice, both fd-less (out_fd/stdin_fd =
++    /// None). This is the exact shape a pipeline hands when `head` is fed by
++    /// another in-process builtin and its output is captured to memory: no raw
++    /// descriptor exists on either end, so the seek path is skipped and bytes
++    /// flow through the trait objects. Proves the port is correct without any
++    /// process-global stdio.
++    #[test]
++    #[allow(clippy::cognitive_complexity)]
++    fn test_head_in_memory_no_fd() {
++        fn run(argv: &[&str], input: &[u8]) -> Vec<u8> {
++            let mut src: &[u8] = input;
++            let mut out: Vec<u8> = Vec::new();
++            let args = std::iter::once(OsString::from("head"))
++                .chain(argv.iter().map(OsString::from));
++            head(args, &mut out, None, &mut src, None).unwrap();
++            out
++        }
++
++        let input: &[u8] = b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n";
++
++        // Default: first 10 lines.
++        assert_eq!(run(&[], input), b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n");
++        // -n 2
++        assert_eq!(run(&["-n", "2"], input), b"l1\nl2\n");
++        // -c 5
++        assert_eq!(run(&["-c", "5"], input), b"l1\nl2");
++        // -n -2 (all but last 2 lines)
++        assert_eq!(run(&["-n", "-2"], b"a\nb\nc\nd\ne\n"), b"a\nb\nc\n");
++        // -c -3 (all but last 3 bytes)
++        assert_eq!(run(&["-c", "-3"], b"abcdef"), b"abc");
++        // empty input
++        assert_eq!(run(&[], b""), b"");
++        // no trailing newline, -n 2
++        assert_eq!(run(&["-n", "2"], b"a\nb\nc"), b"a\nb\n");
+     }
+ 
+     #[test]
+diff --git a/src/take.rs b/src/take.rs
+index b557036..89b24b0 100644
+--- a/src/take.rs
++++ b/src/take.rs
+@@ -37,7 +37,11 @@ impl TakeAllBuffer {
+         }
+     }
+ 
+-    fn write_bytes_exact(&mut self, writer: &mut impl Write, bytes: usize) -> std::io::Result<()> {
++    fn write_bytes_exact(
++        &mut self,
++        writer: &mut (impl Write + ?Sized),
++        bytes: usize,
++    ) -> std::io::Result<()> {
+         let buffer_to_write = &self.remaining_buffer()[..bytes];
+         writer.write_all(buffer_to_write)?;
+         self.start_index += bytes;
+@@ -45,7 +49,7 @@ impl TakeAllBuffer {
+         Ok(())
+     }
+ 
+-    fn write_all(&mut self, writer: &mut impl Write) -> std::io::Result<usize> {
++    fn write_all(&mut self, writer: &mut (impl Write + ?Sized)) -> std::io::Result<usize> {
+         let remaining_bytes = self.remaining_bytes();
+         self.write_bytes_exact(writer, remaining_bytes)?;
+         Ok(remaining_bytes)
+@@ -53,7 +57,7 @@ impl TakeAllBuffer {
+ 
+     fn write_bytes_limit(
+         &mut self,
+-        writer: &mut impl Write,
++        writer: &mut (impl Write + ?Sized),
+         max_bytes: usize,
+     ) -> std::io::Result<usize> {
+         let bytes_to_write = self.remaining_bytes().min(max_bytes);
+@@ -93,7 +97,7 @@ impl TakeAllBuffer {
+ /// 4 - Go back to (1).
+ pub fn copy_all_but_n_bytes(
+     reader: &mut impl Read,
+-    writer: &mut impl Write,
++    writer: &mut (impl Write + ?Sized),
+     n: usize,
+ ) -> std::io::Result<usize> {
+     let mut buffers: VecDeque<TakeAllBuffer> = VecDeque::new();
+@@ -180,7 +184,7 @@ impl TakeAllLinesBuffer {
+ 
+     fn write_lines(
+         &mut self,
+-        writer: &mut impl Write,
++        writer: &mut (impl Write + ?Sized),
+         max_lines: usize,
+         separator: u8,
+     ) -> std::io::Result<BytesAndLines> {
+@@ -248,7 +252,7 @@ impl TakeAllLinesBuffer {
+ /// Note that lines will regularly straddle multiple [`TakeAllLinesBuffer`] instances. The `partial_line`
+ /// flag on [`TakeAllLinesBuffer`] tracks this, and we use that to ensure that we write out enough
+ /// lines in the case that the input file doesn't end with a `separator` character.
+-pub fn copy_all_but_n_lines<R: Read, W: Write>(
++pub fn copy_all_but_n_lines<R: Read, W: Write + ?Sized>(
+     mut reader: R,
+     writer: &mut W,
+     n: usize,

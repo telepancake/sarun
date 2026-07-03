@@ -1,0 +1,306 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 22 Jun 2026 13:24:53 +0000
+Subject: [PATCH] uu_uniq: add injected-I/O logical entry for an in-process
+ brush builtin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adapt vendored uu_uniq to run as a native in-process brush builtin reading/
+writing the shell's logical OpenFile sink/source instead of process-global
+stdio — no process-global stdio, no dup2, pipeline-safe. Diagnostics are routed
+to the logical stderr (or accumulated and returned), exit codes returned (no
+show!/set_exit_code/process::exit). uumain retained as a thin descriptor bridge.
+Behavior kept byte-for-byte; only the I/O seam moved.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01TNBGBV51j5AH4j8k8ENi1W
+---
+ src/uniq.rs | 239 ++++++++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 206 insertions(+), 33 deletions(-)
+
+diff --git a/src/uniq.rs b/src/uniq.rs
+index e249aab..cc64fa9 100644
+--- a/src/uniq.rs
++++ b/src/uniq.rs
+@@ -9,7 +9,7 @@ use clap::{
+ };
+ use std::ffi::{OsStr, OsString};
+ use std::fs::File;
+-use std::io::{BufRead, BufReader, BufWriter, Write, stdin, stdout};
++use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+ use std::num::IntErrorKind;
+ use uucore::display::Quotable;
+ use uucore::error::{FromIo, UError, UResult, USimpleError};
+@@ -643,21 +643,56 @@ fn map_clap_errors(clap_error: Error) -> Box<dyn UError> {
+     USimpleError::new(1, error_message)
+ }
+ 
+-#[uucore::main]
+-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++/// Logical entry point for the bundled `uniq` builtin.
++///
++/// Unlike upstream's `uumain`, this never touches the process's own stdio: it
++/// filters adjacent-duplicate lines onto the shell's logical output sink
++/// (`out`), routes its own diagnostics to the logical error sink (`err`), and
++/// reads its default (`-`/absent) input from the shell's logical input source
++/// (`stdin`). The dedup engine (`Uniq::write_uniq` and everything it calls) is
++/// byte-for-byte the upstream code — only the *binding* of the reader/writer is
++/// adapted:
++///
++///   * INPUT.  GNU `uniq` takes an optional INPUT operand. When it is given and
++///     is not `-`, we open that path (upstream `open_input_file`). When it is
++///     absent or `-`, upstream locked the process's real `stdin`; here we use
++///     the injected logical `stdin` reader instead. No backing raw descriptor
++///     is needed — `uniq` does buffered `read_until` line reads with no
++///     splice/seek fast path — so the `try_fd(0)` parameter that `cat` carries
++///     is deliberately omitted.
++///
++///   * OUTPUT. GNU `uniq` takes an optional OUTPUT operand. When it is given and
++///     is not `-`, we still honour it by opening (creating) that path on the
++///     real filesystem (upstream `open_output_file`) — a box writes its own
++///     overlay there. When it is absent or `-`, upstream wrote the process's
++///     real `stdout`; here we write the injected logical `out` sink instead.
++///
++/// It holds no process-global state (clap-parse errors are RETURNED, never
++/// `print_error_and_exit`; nothing touches `set_exit_code`), so it is safe to
++/// run as a concurrent pipeline stage. The caller writes the returned
++/// diagnostic to the box's logical stderr and uses the returned exit code.
++pub fn uniq(
++    args: impl uucore::Args,
++    out: &mut dyn Write,
++    err: &mut dyn Write,
++    stdin: &mut dyn Read,
++) -> UResult<()> {
++    // `err` is only consulted on the bridge side (uumain) / by the engine for
++    // the returned diagnostic; uniq itself routes nothing to a second stream,
++    // so the parameter is accepted for signature parity with the other ports.
++    let _ = err;
++
+     let (args, skip_fields_old, skip_chars_old) = handle_obsolete(args);
+ 
++    // Upstream branched here into `print_error_and_exit_with_callback`, which
++    // writes the process's real fd 2 and calls `std::process::exit` — both
++    // forbidden for an in-process builtin (it would kill the engine and leak to
++    // its stderr). Instead every clap error (including the usage/parse error
++    // path) is mapped to a returned `UError`, so the caller decides what to do
++    // with it.
+     let matches = match uu_app().try_get_matches_from(args) {
+         Ok(matches) => matches,
+-        Err(clap_error) => {
+-            if clap_error.exit_code() == 0 {
+-                // Let caller handle help/version
+-                return Err(map_clap_errors(clap_error));
+-            }
+-            // Use ErrorFormatter directly to handle error
+-            let formatter = uucore::clap_localization::ErrorFormatter::new("uniq");
+-            formatter.print_error_and_exit_with_callback(&clap_error, 1, || {});
+-        }
++        Err(clap_error) => return Err(map_clap_errors(clap_error)),
+     };
+ 
+     let files = matches.get_many::<OsString>(ARG_FILES);
+@@ -692,10 +727,49 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+         ));
+     }
+ 
+-    uniq.write_uniq(
+-        open_input_file(in_file_name)?,
+-        open_output_file(out_file_name)?,
+-    )
++    // INPUT binding: a real INPUT-file operand opens that path; the default
++    // (`-`/absent) reads the injected logical `stdin`. Note the reader is a
++    // `Box<dyn BufRead>` exactly as upstream's `open_input_file` returned, so
++    // `write_uniq` (which takes `impl BufRead`) is unchanged.
++    let reader: Box<dyn BufRead> = open_input_reader(in_file_name, stdin)?;
++
++    // OUTPUT binding: a real OUTPUT-file operand opens (creates) that path; the
++    // default (`-`/absent) writes the injected logical `out` sink. Both arms
++    // wrap in the same `BufWriter` upstream used.
++    match out_file_name {
++        Some(path) if path != "-" => {
++            let out_file = File::create(path).map_err_context(
++                || translate!("uniq-error-could-not-open", "path" => path.maybe_quote()),
++            )?;
++            let writer = BufWriter::with_capacity(OUTPUT_BUFFER_CAPACITY, out_file);
++            uniq.write_uniq(reader, writer)
++        }
++        _ => {
++            let writer = BufWriter::with_capacity(OUTPUT_BUFFER_CAPACITY, out);
++            uniq.write_uniq(reader, writer)
++        }
++    }
++}
++
++/// Descriptor-based entry point for the standalone `uniq` binary.
++///
++/// Here the process's own fd 0/1/2 *are* the intended I/O, so this is a thin
++/// bridge that locks them and hands them to [`uniq`]. The in-process brush
++/// builtin must NOT route through here — it calls [`uniq`] directly with the
++/// shell's logical sinks/source, so it never touches process-global stdio.
++#[uucore::main]
++pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++    let stdout = io::stdout();
++    let mut out = stdout.lock();
++    let stderr = io::stderr();
++    let mut err = stderr.lock();
++    let stdin = io::stdin();
++    let mut input = stdin.lock();
++    let result = uniq(args, &mut out, &mut err, &mut input);
++    // GNU `uniq` flushes stdout before exiting; `write_uniq` already flushed its
++    // BufWriter, but the locked Stdout itself is line-buffered, so flush.
++    let _ = out.flush();
++    result
+ }
+ 
+ pub fn uu_app() -> Command {
+@@ -821,8 +895,17 @@ fn get_delimiter(matches: &ArgMatches) -> Delimiters {
+     }
+ }
+ 
+-// None or "-" means stdin.
+-fn open_input_file(in_file_name: Option<&OsStr>) -> UResult<Box<dyn BufRead>> {
++// None or "-" means the injected logical stdin.
++//
++// This is the writer-injected analogue of upstream's `open_input_file`: a real
++// INPUT-file operand still opens that path verbatim (identical error wording),
++// but the default `-`/absent case now wraps the injected logical `stdin` reader
++// instead of locking the process's real fd 0. `'a` ties the returned
++// `Box<dyn BufRead>` to the borrow of `stdin` for the no-file case.
++fn open_input_reader<'a>(
++    in_file_name: Option<&OsStr>,
++    stdin: &'a mut dyn Read,
++) -> UResult<Box<dyn BufRead + 'a>> {
+     Ok(match in_file_name {
+         Some(path) if path != "-" => {
+             let in_file = File::open(path).map_err_context(
+@@ -830,22 +913,112 @@ fn open_input_file(in_file_name: Option<&OsStr>) -> UResult<Box<dyn BufRead>> {
+             )?;
+             Box::new(BufReader::new(in_file))
+         }
+-        _ => Box::new(stdin().lock()),
++        _ => Box::new(BufReader::new(stdin)),
+     })
+ }
+ 
+-// None or "-" means stdout.
+-fn open_output_file(out_file_name: Option<&OsStr>) -> UResult<Box<dyn Write>> {
+-    Ok(match out_file_name {
+-        Some(path) if path != "-" => {
+-            let out_file = File::create(path).map_err_context(
+-                || translate!("uniq-error-could-not-open", "path" => path.maybe_quote()),
+-            )?;
+-            Box::new(BufWriter::with_capacity(OUTPUT_BUFFER_CAPACITY, out_file))
+-        }
+-        _ => Box::new(BufWriter::with_capacity(
+-            OUTPUT_BUFFER_CAPACITY,
+-            stdout().lock(),
+-        )),
+-    })
++#[cfg(test)]
++mod injected_io_tests {
++    use super::*;
++    use std::ffi::OsString;
++
++    /// Drive the injected-I/O `uniq` entry with no process fd 0/1/2 touched:
++    /// output goes to a `Vec<u8>`, diagnostics to another `Vec<u8>`, and stdin
++    /// is a `&[u8]` slice (the in-memory, no-fd path a pipeline hands when uniq
++    /// is fed by another in-process builtin and captured to memory).
++    fn run(argv: &[&str], input: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
++        let mut src: &[u8] = input;
++        let mut out: Vec<u8> = Vec::new();
++        let mut err: Vec<u8> = Vec::new();
++        let args = std::iter::once(OsString::from("uniq")).chain(argv.iter().map(OsString::from));
++        let code = match uniq(args, &mut out, &mut err, &mut src) {
++            Ok(()) => 0,
++            Err(e) => e.code(),
++        };
++        (out, err, code)
++    }
++
++    #[test]
++    fn test_uniq_injected_plain() {
++        // Adjacent dups collapse; non-adjacent dups are kept (byte-for-byte GNU).
++        let (out, err, code) = run(&[], b"a\na\nb\na\n");
++        assert_eq!(out, b"a\nb\na\n", "got {:?}", String::from_utf8_lossy(&out));
++        assert!(err.is_empty());
++        assert_eq!(code, 0);
++    }
++
++    #[test]
++    fn test_uniq_injected_count() {
++        let (out, _err, _c) = run(&["-c"], b"a\na\nb\n");
++        assert_eq!(
++            out,
++            b"      2 a\n      1 b\n".to_vec(),
++            "got {:?}",
++            String::from_utf8_lossy(&out)
++        );
++    }
++
++    #[test]
++    fn test_uniq_injected_only_dup_and_unique() {
++        // -d: only print groups that repeated.
++        assert_eq!(run(&["-d"], b"a\na\nb\n").0, b"a\n".to_vec());
++        // -u: only print groups that did NOT repeat.
++        assert_eq!(run(&["-u"], b"a\na\nb\n").0, b"b\n".to_vec());
++    }
++
++    #[test]
++    fn test_uniq_injected_all_dup() {
++        // -D: print ALL lines of each duplicate group.
++        assert_eq!(run(&["-D"], b"a\na\nb\nc\nc\n").0, b"a\na\nc\nc\n".to_vec());
++    }
++
++    #[test]
++    fn test_uniq_injected_ignore_case() {
++        assert_eq!(run(&["-i"], b"Hello\nhello\nworld\n").0, b"Hello\nworld\n".to_vec());
++    }
++
++    #[test]
++    fn test_uniq_injected_skip_fields_and_chars() {
++        // -f1: skip the first field for comparison.
++        assert_eq!(run(&["-f1"], b"1 a\n2 a\n3 b\n").0, b"1 a\n3 b\n".to_vec());
++        // -s2: skip the first 2 chars for comparison.
++        assert_eq!(run(&["-s2"], b"xxabc\nyyabc\nzzdef\n").0, b"xxabc\nzzdef\n".to_vec());
++        // -w3: only compare the first 3 chars.
++        assert_eq!(run(&["-w3"], b"abcZ\nabcQ\nxyz1\n").0, b"abcZ\nxyz1\n".to_vec());
++    }
++
++    #[test]
++    fn test_uniq_injected_empty_and_no_newline() {
++        assert_eq!(run(&[], b"").0, b"".to_vec());
++        // No trailing newline on input: GNU still emits one on output.
++        assert_eq!(run(&[], b"a\na\nb").0, b"a\nb\n".to_vec());
++    }
++
++    /// OUTPUT-file operand: when present, uniq writes that file, not `out`.
++    #[test]
++    fn test_uniq_injected_output_file_operand() {
++        let dir = std::env::temp_dir();
++        let path = dir.join(format!("uniq_inj_test_{}.txt", std::process::id()));
++        let path_str = path.to_str().unwrap();
++        // INPUT operand "-" (stdin), OUTPUT operand = our temp path.
++        let mut src: &[u8] = b"a\na\nb\n";
++        let mut out: Vec<u8> = Vec::new();
++        let mut err: Vec<u8> = Vec::new();
++        let args = ["uniq", "-", path_str].into_iter().map(OsString::from);
++        uniq(args, &mut out, &mut err, &mut src).unwrap();
++        // The injected `out` sink must stay empty; the file holds the result.
++        assert!(out.is_empty(), "out should be empty, got {out:?}");
++        let written = std::fs::read(&path).unwrap();
++        assert_eq!(written, b"a\nb\n".to_vec());
++        let _ = std::fs::remove_file(&path);
++    }
++
++    /// A clap/usage error is RETURNED (never printed/exited): code 1, sinks clean.
++    #[test]
++    fn test_uniq_injected_error_is_returned() {
++        let (out, _err, code) = run(&["--c-and-D-bogus-conflict", "-c", "-D"], b"a\na\n");
++        // Unknown long option -> clap error -> returned, not exited.
++        assert_eq!(code, 1);
++        assert!(out.is_empty());
++    }
+ }

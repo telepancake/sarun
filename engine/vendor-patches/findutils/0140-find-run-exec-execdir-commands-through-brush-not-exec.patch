@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 21 Jun 2026 17:43:18 +0000
+Subject: [PATCH] find: run -exec/-execdir commands through brush, not exec
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Ports find's -exec actions to dispatch through `Shell::run_argv` (the same
+`builtin_exec` bridge xargs now uses), so `find … -exec cmd …` runs a shell
+builtin, a function, or a script — all snooped — exactly like xargs and
+env/nice. Before, `find -exec <function>` / `-exec <builtin>` were "command not
+found".
+
+Fork side: `Dependencies` gains `exec_via_shell()` + `run(argv, cwd)`. The
+embedder sets `exec_via_shell() == true`, so both matchers route the
+fully-substituted argv through `run` instead of spawning a `std::process::
+Command`:
+  - SingleExecMatcher (`-exec … \;`/`-execdir`): builds the argv, runs it with
+    cwd = the entry's parent for -execdir (`exec_dir_cwd`), else the logical
+    cwd (None — the subshell already has it).
+  - MultiExecMatcher (`-exec … +`): `argmax` exists only for the OS exec
+    arg-limit, which doesn't apply in-process, so the shell path just
+    accumulates matched paths in `pending` and flushes one command per batch
+    (a directory for -execdir at finished_dir, the whole run for -exec at
+    finished). A non-zero exit sets find's exit code, as before.
+The standalone binary (`exec_via_shell() == false`) keeps its Command/argmax
+path untouched.
+
+Builtin side: FindBuiltin becomes an async `builtins::Command`; find runs on a
+worker thread submitting each -exec argv over the bridge, the executor runs it
+on a subshell clone (per-command cwd for -execdir) and replies. -exec is serial
+so the thread blocks per reply. The bridge gained an optional per-command cwd
+for -execdir.
+
+Verified in a box shim: -exec a function ("fn-got:./a.txt"), -exec a builtin
+(`type`), -exec + batch (one call, all paths), -execdir \; and + (each batch in
+its own directory with ./relative paths), external -exec cat, plain -print and
+relative {} display. xargs unregressed; 93 engine tests pass.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/find/matchers/exec.rs | 87 ++++++++++++++++++++++++++++++++++-----
+ src/find/mod.rs           | 17 ++++++++
+ 2 files changed, 94 insertions(+), 10 deletions(-)
+
+diff --git a/src/find/matchers/exec.rs b/src/find/matchers/exec.rs
+index 1c88de8..b6d8308 100644
+--- a/src/find/matchers/exec.rs
++++ b/src/find/matchers/exec.rs
+@@ -7,11 +7,26 @@
+ use std::cell::RefCell;
+ use std::error::Error;
+ use std::ffi::OsString;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::process::Command;
+ 
+ use super::{Matcher, MatcherIO, WalkEntry};
+ 
++/// sarun: the directory a `-execdir`/`-okdir` command runs in (the entry's
++/// parent), or `None` for the shell's own logical cwd — used both by a normal
++/// `-exec` (the subshell already has the cwd) and the awkward `parent == ""`
++/// case. Mirrors the `current_dir` choices in the process-spawning path.
++fn exec_dir_cwd(exec_in_parent_dir: bool, file_info: &WalkEntry) -> Option<PathBuf> {
++    if !exec_in_parent_dir {
++        return None;
++    }
++    match file_info.path().parent() {
++        None => Some(file_info.path().to_path_buf()), // root "/" → run from "/"
++        Some(p) if p == Path::new("") => None,        // "foo" → avoid chdir("")
++        Some(p) => Some(p.to_path_buf()),
++    }
++}
++
+ enum Arg {
+     FileArg(Vec<OsString>),
+     LiteralArg(OsString),
+@@ -104,14 +119,26 @@ impl Matcher for SingleExecMatcher {
+             }
+         }
+ 
+-        let mut command = Command::new(&resolved_executable);
+-
++        // The fully-substituted argv (program + each arg, with {} replaced).
++        let mut argv: Vec<OsString> = vec![resolved_executable.clone()];
+         for arg in &self.args {
+-            match *arg {
+-                Arg::LiteralArg(ref a) => command.arg(a.as_os_str()),
+-                Arg::FileArg(ref parts) => command.arg(parts.join(path_to_file.as_os_str())),
+-            };
++            argv.push(match *arg {
++                Arg::LiteralArg(ref a) => a.clone(),
++                Arg::FileArg(ref parts) => parts.join(path_to_file.as_os_str()),
++            });
+         }
++
++        // sarun: run the command through the embedder's shell (builtin /
++        // function / external, snooped) instead of spawning a process. -execdir
++        // runs in the entry's parent dir; a normal -exec runs in the shell's own
++        // logical cwd (cwd == None — the subshell already has it).
++        if matcher_io.deps.exec_via_shell() {
++            let cwd = exec_dir_cwd(self.exec_in_parent_dir, file_info);
++            return matcher_io.deps.run(&argv, cwd.as_deref()) == 0;
++        }
++
++        let mut command = Command::new(&argv[0]);
++        command.args(&argv[1..]);
+         if self.exec_in_parent_dir {
+             match file_info.path().parent() {
+                 None => {
+@@ -165,8 +192,13 @@ pub struct MultiExecMatcher {
+     executable: String,
+     args: Vec<OsString>,
+     exec_in_parent_dir: bool,
+-    /// Command to build while matching.
++    /// Command to build while matching (the process-spawning / standalone path).
+     command: RefCell<Option<argmax::Command>>,
++    /// sarun: accumulated path arguments for the shell-exec path. In-process
++    /// `run_argv` has no `execve` arg-length limit, so we just collect every
++    /// matched path and flush them in one command per batch (a directory for
++    /// `-execdir`, or the whole run for `-exec`).
++    pending: RefCell<Vec<OsString>>,
+ }
+ 
+ impl MultiExecMatcher {
+@@ -182,9 +214,28 @@ impl MultiExecMatcher {
+             args: transformed_args,
+             exec_in_parent_dir,
+             command: RefCell::new(None),
++            pending: RefCell::new(Vec::new()),
+         })
+     }
+ 
++    /// sarun: flush the accumulated `pending` paths as ONE command through the
++    /// embedder's shell, in `cwd` (the entry's parent for `-execdir`, else the
++    /// logical cwd). A non-zero exit sets find's exit code, matching the
++    /// process-spawning path.
++    fn dispatch_via_shell(&self, cwd: Option<&Path>, matcher_io: &mut MatcherIO) {
++        let pending = std::mem::take(&mut *self.pending.borrow_mut());
++        if pending.is_empty() {
++            return;
++        }
++        let mut argv: Vec<OsString> = Vec::with_capacity(1 + self.args.len() + pending.len());
++        argv.push(OsString::from(&self.executable));
++        argv.extend(self.args.iter().cloned());
++        argv.extend(pending);
++        if matcher_io.deps.run(&argv, cwd) != 0 {
++            matcher_io.set_exit_code(1);
++        }
++    }
++
+     fn new_command(&self) -> argmax::Command {
+         let mut command = argmax::Command::new(&self.executable);
+         command.try_args(&self.args).unwrap();
+@@ -235,6 +286,14 @@ impl Matcher for MultiExecMatcher {
+         } else {
+             file_info.display_path().to_path_buf()
+         };
++
++        // sarun: shell-exec path — just accumulate; flushed per batch in
++        // finished()/finished_dir(). No `execve` arg limit applies in-process.
++        if matcher_io.deps.exec_via_shell() {
++            self.pending.borrow_mut().push(path_to_file.into_os_string());
++            return true;
++        }
++
+         let mut command = self.command.borrow_mut();
+         let command = command.get_or_insert_with(|| self.new_command());
+ 
+@@ -273,8 +332,12 @@ impl Matcher for MultiExecMatcher {
+     }
+ 
+     fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
+-        // Dispatch command for -execdir.
++        // Dispatch command for -execdir (one batch per directory).
+         if self.exec_in_parent_dir {
++            if matcher_io.deps.exec_via_shell() {
++                self.dispatch_via_shell(Some(dir), matcher_io);
++                return;
++            }
+             let mut command = self.command.borrow_mut();
+             if let Some(mut command) = command.take() {
+                 command.current_dir(Path::new(".").join(dir));
+@@ -284,8 +347,12 @@ impl Matcher for MultiExecMatcher {
+     }
+ 
+     fn finished(&self, matcher_io: &mut MatcherIO) {
+-        // Dispatch command for -exec.
++        // Dispatch command for -exec (one batch for the whole run).
+         if !self.exec_in_parent_dir {
++            if matcher_io.deps.exec_via_shell() {
++                self.dispatch_via_shell(None, matcher_io);
++                return;
++            }
+             let mut command = self.command.borrow_mut();
+             if let Some(mut command) = command.take() {
+                 self.run_command(&mut command, matcher_io);
+diff --git a/src/find/mod.rs b/src/find/mod.rs
+index 47811b0..83ba1ca 100644
+--- a/src/find/mod.rs
++++ b/src/find/mod.rs
+@@ -105,6 +105,23 @@ pub trait Dependencies {
+     fn cwd(&self) -> Option<&std::path::Path> {
+         None
+     }
++    /// sarun: when true, `-exec`/`-execdir` runs each built command through the
++    /// embedder's shell (see `run`) instead of spawning a `std::process::Command`
++    /// — so the command may be a shell builtin / function / script, all snooped,
++    /// exactly like the `xargs` builtin. Default `false` keeps the standalone
++    /// binary on its process-spawning path.
++    fn exec_via_shell(&self) -> bool {
++        false
++    }
++    /// sarun: run a fully-built command argv through the embedder's shell,
++    /// returning its exit code (`128 + signo` for a signal death). `cwd` is the
++    /// directory to run it in — `Some(dir)` for `-execdir` (the entry's parent),
++    /// `None` for the shell's own logical cwd. Only called when
++    /// `exec_via_shell()` is `true`; the default never runs.
++    fn run(&self, argv: &[std::ffi::OsString], cwd: Option<&std::path::Path>) -> i32 {
++        let _ = (argv, cwd);
++        127
++    }
+ }
+ 
+ /// Struct that holds the dependencies we use when run as the real executable.

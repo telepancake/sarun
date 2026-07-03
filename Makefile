@@ -39,8 +39,12 @@ deps: ## Install system packages (FUSE, bubblewrap; iproute2 + tshark for net te
 # The only build: a fully-static musl binary via cargo-zigbuild + ziglang (no
 # apt toolchain). The cargo default target is musl (engine/.cargo/config.toml).
 
+.PHONY: vendor
+vendor: ## Assemble engine/vendor/ from pinned upstreams + vendor-patches/ series
+	python3 scripts/vendor.py
+
 .PHONY: engine
-engine: ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
+engine: vendor ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
 	@command -v uv >/dev/null || { echo "engine needs uv (https://docs.astral.sh/uv/)"; exit 1; }
 	uv tool install --with ziglang cargo-zigbuild
 	rustup target add x86_64-unknown-linux-musl

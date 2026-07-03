@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 2 Jul 2026 13:49:21 +0000
+Subject: [PATCH] kati: 'No rule to make target' names the rule whose
+ prerequisite demanded it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A bad expansion (joined words, wrong subst) surfaces as
+"No rule to make target 'blah/aabb/file'" with no way to find WHICH
+makefile line's prerequisite list produced the bogus name in a big
+build. The executor now emits a note ahead of the error:
+
+    *kati*: note: 'X' comes from the prerequisite list of the rule
+    for 'Y' at Makefile:123
+
+The '*kati*:' prefix is what the corpus normalizers strip, so GNU
+parity holds (both normalizers now also eat the stripped line's
+newline — previously a stripped *kati* line left a blank line behind).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/exec.rs  | 15 ++++++++++++++-
+ tests/corpus.rs |  2 +-
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 33ffbe3..fe3b1e5 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -478,7 +478,20 @@ impl<'a> Executor<'a> {
+             (g.has_rule, g.is_phony)
+         };
+         if !has_rule && output_timestamp.is_none() && !is_phony {
+-            if let Some(nb) = graph[&sym].dependents.first().map(|d| d.as_bytes()) {
++            if let Some(dep_sym) = graph[&sym].dependents.first() {
++                // Diagnosis aid: name the RULE whose prerequisite list produced
++                // this target — a bad expansion (joined words, wrong subst) is
++                // otherwise untraceable in a big build. The `*kati*:` prefix is
++                // stripped by the corpus normalizers, so GNU-parity holds.
++                if let Some(pn) = graph.get(dep_sym) {
++                    if let Some(loc) = pn.node.lock().loc.clone() {
++                        crate::exec::emit_recipe_err(&format!(
++                            "*kati*: note: '{output}' comes from the \
++                             prerequisite list of the rule for '{dep_sym}' \
++                             at {loc}"));
++                    }
++                }
++                let nb = dep_sym.as_bytes();
+                 error!(
+                     "*** No rule to make target '{output}', needed by '{}'.",
+                     String::from_utf8_lossy(&nb)
+diff --git a/tests/corpus.rs b/tests/corpus.rs
+index 4f9dcb1..6c19566 100644
+--- a/tests/corpus.rs
++++ b/tests/corpus.rs
+@@ -97,7 +97,7 @@ fn kati_norms() -> Vec<Norm> {
+         // rkati's output. Apply the same strips the make-side does.
+         norm(r"make(?:\[\d+\])?: (Entering|Leaving) directory[^\n]*\n", ""),
+         norm(r"make(?:\[\d+\])?: ", ""),
+-        norm(r"\*kati\*[^\n]*", ""),
++        norm(r"\*kati\*[^\n]*\n?", ""),
+         norm(r"c?kati: ", ""),
+         norm(r"/bin/(ba)?sh: line 1: ", ""),
+         // sarun: dash form `/bin/sh: N: cmd: ...` (recipe shell-error

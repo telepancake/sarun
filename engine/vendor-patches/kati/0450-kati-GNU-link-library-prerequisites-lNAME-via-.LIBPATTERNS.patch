@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 11:07:00 +0000
+Subject: [PATCH] kati: GNU link-library prerequisites (-lNAME via
+ .LIBPATTERNS)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A prerequisite of the form -lNAME is resolved by trying each
+$(.LIBPATTERNS) pattern (default lib%.so lib%.a) against the make's
+working directory, the VPATH/vpath search path, and the default
+system library dirs — first hit rewrites the prereq, exactly like
+GNU's directory search for link libraries. Unimplemented, it surfaced
+as "No rule to make target '-lfoo'" on a real build's .so link step
+(the user-reported failure). Corpus case pins it against GNU
+(vpath'd .so + working-dir .a).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/dep.rs                         | 66 ++++++++++++++++++++++++++-
+ testcase/sarun_link_library_prereq.mk |  8 ++++
+ 2 files changed, 72 insertions(+), 2 deletions(-)
+ create mode 100644 engine/vendor/kati/testcase/sarun_link_library_prereq.mk
+
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 423108b..2adeb14 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -710,6 +710,64 @@ impl<'a> DepBuilder<'a> {
+     /// for in the VPATH directories; the first hit rewrites the prerequisite
+     /// to `dir/name` (matching GNU's behavior for files that don't need to be
+     /// rebuilt — the common case VPATH exists for: out-of-tree source files).
++    /// GNU's link-library prerequisites: a prereq of the form `-lNAME` is
++    /// resolved by trying each pattern in $(.LIBPATTERNS) (default
++    /// `lib%.so lib%.a`) against the working dir, the VPATH/vpath search
++    /// path, and the default system library directories; the first hit
++    /// rewrites the prerequisite.
++    fn libpattern_resolve(&mut self, sym: Symbol) -> Option<Symbol> {
++        let bytes = sym.as_bytes();
++        let name = bytes.strip_prefix(b"-l")?;
++        if name.is_empty() {
++            return None;
++        }
++        let patterns: Vec<Vec<u8>> = {
++            use crate::expr::Evaluable;
++            let v = self
++                .ev
++                .lookup_var(intern(".LIBPATTERNS"))
++                .ok()
++                .flatten()
++                .and_then(|v| v.read().eval_to_buf(self.ev).ok());
++            match &v {
++                Some(buf) if !buf.is_empty() => {
++                    word_scanner(buf).map(<[u8]>::to_vec).collect()
++                }
++                _ => vec![b"lib%.so".to_vec(), b"lib%.a".to_vec()],
++            }
++        };
++        for pat in &patterns {
++            let Some(pct) = pat.iter().position(|&b| b == b'%') else {
++                continue;
++            };
++            let mut cand = Vec::with_capacity(pat.len() + name.len());
++            cand.extend_from_slice(&pat[..pct]);
++            cand.extend_from_slice(name);
++            cand.extend_from_slice(&pat[pct + 1..]);
++            let cand_str = OsStr::from_bytes(&cand);
++            // 1. the make's working directory
++            if self.ev.working_dir.join(cand_str).is_file() {
++                return Some(intern(cand));
++            }
++            // 2. the VPATH / vpath search path
++            let cand_sym = intern(cand.clone());
++            if let Some(found) = self.vpath_resolve(cand_sym) {
++                return Some(found);
++            }
++            // 3. GNU's default library directories
++            for dir in ["/lib", "/usr/lib", "/usr/local/lib"] {
++                let p = std::path::Path::new(dir).join(cand_str);
++                if p.is_file() {
++                    let mut full = dir.as_bytes().to_vec();
++                    full.push(b'/');
++                    full.extend_from_slice(&cand);
++                    return Some(intern(full));
++                }
++            }
++        }
++        None
++    }
++
+     fn vpath_resolve(&self, sym: Symbol) -> Option<Symbol> {
+         if self.vpath_dirs.is_empty() && self.vpath_patterns.is_empty() {
+             return None;
+@@ -1592,12 +1650,16 @@ impl<'a> DepBuilder<'a> {
+         {
+             let mut node = n.lock();
+             for i in node.actual_inputs.iter_mut() {
+-                if let Some(resolved) = self.vpath_resolve(*i) {
++                if let Some(resolved) = self.vpath_resolve(*i)
++                    .or_else(|| self.libpattern_resolve(*i))
++                {
+                     *i = resolved;
+                 }
+             }
+             for i in node.actual_order_only_inputs.iter_mut() {
+-                if let Some(resolved) = self.vpath_resolve(*i) {
++                if let Some(resolved) = self.vpath_resolve(*i)
++                    .or_else(|| self.libpattern_resolve(*i))
++                {
+                     *i = resolved;
+                 }
+             }
+diff --git a/testcase/sarun_link_library_prereq.mk b/testcase/sarun_link_library_prereq.mk
+new file mode 100644
+index 0000000..4e6cf08
+--- /dev/null
++++ b/testcase/sarun_link_library_prereq.mk
+@@ -0,0 +1,8 @@
++# GNU link-library prerequisites: `-lNAME` is resolved through
++# $(.LIBPATTERNS) (default lib%.so lib%.a) against the working dir, the
++# VPATH/vpath search path, and the system lib dirs. Unimplemented, it
++# surfaced as "No rule to make target '-lfoo'" on real builds.
++setup := $(shell mkdir -p libs && touch libs/libfoo.so && touch libbar.a)
++vpath %.so libs
++prog: -lfoo -lbar
++	@echo "link=[$^]"

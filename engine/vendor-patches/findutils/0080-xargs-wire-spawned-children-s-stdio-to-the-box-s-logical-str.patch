@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 20 Jun 2026 14:09:52 +0000
+Subject: [PATCH] xargs: wire spawned children's stdio to the box's logical
+ streams
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The commands xargs spawns inherited the engine's real fd 1/2, so a
+child's stdout/stderr ignored the box's pipes and redirects — `xargs cmd
+| next` and `xargs cmd > file` (the everyday xargs patterns) silently
+misrouted to the terminal. That made in-process xargs only half-correct.
+
+Fix: add `child_stdout`/`child_stderr` to the `XargsIo` seam (default
+`None` = inherit, so the standalone binary is byte-identical), set them on
+the child `Command` before spawn, and have the in-process builtin dup the
+shell's logical stdout/stderr `OpenFile`s into them via the existing
+`TryFrom<OpenFile> for Stdio` (a piped/redirected sink is dup'd, an
+inherited handle stays inherit, an fd-less in-memory stream becomes null).
+The builtin now captures fd 1/2 as `OpenFile`s (try_fd) and uses them both
+as xargs's own output sink and as the child-stdio source.
+
+Verified on the static musl build: `seq 3 | xargs echo | wc -w` -> 3 (was
+0), `printf hello | xargs echo > file` -> file holds "hello" (was empty),
+child `2>` honored; plain xargs and logical cwd unaffected; xargs unit
+suite 10/10.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/xargs/mod.rs | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/xargs/mod.rs b/src/xargs/mod.rs
+index 58d2e33..edf2e71 100644
+--- a/src/xargs/mod.rs
++++ b/src/xargs/mod.rs
+@@ -39,6 +39,16 @@ pub trait XargsIo {
+     fn output(&self) -> &RefCell<dyn Write>;
+     /// Sink for diagnostics (`-t` command traces, warnings, errors).
+     fn error_output(&self) -> &RefCell<dyn Write>;
++    /// Stdio for a spawned child's stdout / stderr. An embedder returns
++    /// `Some(_)` to route the child's output to the shell's logical streams
++    /// (e.g. a dup of a piped/redirected logical fd); the default `None` leaves
++    /// the child inheriting the process fds, matching the standalone binary.
++    fn child_stdout(&self) -> Option<Stdio> {
++        None
++    }
++    fn child_stderr(&self) -> Option<Stdio> {
++        None
++    }
+ }
+ 
+ /// The dependencies used when xargs runs as the real standalone executable:
+@@ -513,6 +523,19 @@ impl CommandBuilder<'_> {
+             let _ = err.flush();
+         }
+ 
++        // Route the spawned child's stdout/stderr to the embedder's logical
++        // streams when provided. The in-process builtin dups the shell's
++        // logical fds here, so `xargs cmd > file` / `xargs cmd | next` honor
++        // the box's redirects and pipes. Default (standalone) leaves the child
++        // inheriting the process fds, exactly as upstream does. Set after the
++        // `-t` trace so the verbose output is unchanged.
++        if let Some(s) = io.child_stdout() {
++            command.stdout(s);
++        }
++        if let Some(s) = io.child_stderr() {
++            command.stderr(s);
++        }
++
+         match &self.options.action {
+             ExecAction::Command(_) => match command.status() {
+                 Ok(status) => {

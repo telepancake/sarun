@@ -1,0 +1,455 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 23 Jun 2026 16:40:13 +0000
+Subject: [PATCH] n2: lib-only de-workspace + in-process brush executor hook
+
+Re-applies sarun's delta over the pristine n2 base:
+  * Cargo.toml: de-workspace to a standalone lib-only crate (drop [[bin]],
+    benches, jemalloc/windows deps; empty default feature; add [lib]).
+  * lib.rs: pub graph/process/signal; drop jemalloc global_allocator and the
+    process_win mod (unix-only fork).
+  * process.rs: a global in-process Executor hook (set_executor/executor).
+  * process_posix.rs: run_command routes to the executor when installed,
+    never posix_spawning /bin/sh.
+  * signal.rs: register_sigint is a no-op when the executor is active.
+  * run.rs: force -j1 under the executor; add run_state() for an already-loaded
+    in-memory State.
+  * load.rs: read_from_content / read_from_content_with_db build a State from
+    in-memory ninja with a memfd (or disk) db, no build.ninja/.n2_db temp.
+  * db.rs: Writer::in_memory() (memfd-backed empty db).
+  * densemap.rs: len()/iter() to walk the build graph for provenance.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ Cargo.toml           | 63 +++++++++++++--------------------------
+ src/db.rs            | 20 +++++++++++++
+ src/densemap.rs      |  9 ++++++
+ src/lib.rs           | 20 +++++--------
+ src/load.rs          | 70 ++++++++++++++++++++++++++++++++++++++++++-
+ src/process.rs       | 26 ++++++++++++++++
+ src/process_posix.rs |  6 ++++
+ src/run.rs           | 71 +++++++++++++++++++++++++++++++++++++++++++-
+ src/signal.rs        |  6 ++++
+ 9 files changed, 234 insertions(+), 57 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index d0ade3c..77f1534 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,18 +1,28 @@
++# sarun: vendored, lib-only patched fork of n2 (github.com/evmar/n2).
++# Pinned upstream commit: b1fead52ccda0c497d816696f23f4099c3e8ec1f
++#
++# Why vendored: sarun embeds n2 IN-PROCESS and replaces n2's per-recipe
++# `/bin/sh -c` posix_spawn with an in-process embedded-brush executor (see
++# the `// sarun:` patch in src/process_posix.rs). All other n2 sources are
++# byte-for-byte upstream so this fork stays auditable / re-syncable.
++#
++# Changes vs upstream, all marked `// sarun:`:
++#   * Cargo.toml: lib-only (dropped [[bin]], benches, jemalloc — `default`
++#     feature is now empty, matching `--no-default-features`); windows-sys
++#     target dep dropped (we only build unix).
++#   * lib.rs: dropped the jemalloc global_allocator block and process_win mod.
++#   * process_posix.rs: run_command routes to a global executor hook when set.
++#   * signal.rs: register_sigint is a no-op when the embedded hook is active.
+ [package]
+ name = "n2"
+ version = "0.1.0"
+-categories = ["development-tools", "development-tools::build-utils"]
+ edition = "2021"
+-exclude = [".github/*", ".vscode/*"]
+-homepage = "https://github.com/evmar/n2"
+-keywords = ["ninja", "build"]
+ license = "Apache-2.0"
+-readme = "README.md"
+-repository = "https://github.com/evmar/n2"
+-# https://github.com/evmar/n2/issues/74
+-# Note: if we bump this, may need to bump .github/workflows/ci.yml version too.
+-rust-version = "1.81.0"
+-description = "a ninja compatible build system"
++description = "a ninja compatible build system (sarun vendored lib-only fork)"
++
++[lib]
++name = "n2"
++path = "src/lib.rs"
+ 
+ [dependencies]
+ anyhow = "1.0"
+@@ -20,37 +30,6 @@ lexopt = "0.3.0"
+ libc = "0.2"
+ rustc-hash = "1.1.0"
+ 
+-[target.'cfg(windows)'.dependencies.windows-sys]
+-version = "0.48"
+-features = [
+-  "Win32_Foundation",
+-  "Win32_Security",
+-  "Win32_System_Console",
+-  "Win32_System_Diagnostics_Debug",
+-  "Win32_System_Pipes",
+-  "Win32_System_Threading",
+-]
+-
+-[target.'cfg(not(any(windows, target_arch = "wasm32")))'.dependencies]
+-jemallocator = { version = "0.5", optional = true }
+-
+-[dev-dependencies]
+-divan = "0.1.16"
+-tempfile = "3.6.0"
+-
+-[profile.release]
+-debug = true
+-lto = true
+-
+-[[bench]]
+-name = "parse"
+-harness = false
+-
+-[[bench]]
+-name = "canon"
+-harness = false
+-
+ [features]
+-default = ["jemalloc"]
+-jemalloc = ["jemallocator"]
++default = []
+ crlf = []
+diff --git a/src/db.rs b/src/db.rs
+index d6481ad..7e06b97 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -92,6 +92,26 @@ impl Writer {
+         Ok(w)
+     }
+ 
++    // sarun: a fresh, EMPTY db backed by an anonymous in-memory file
++    // (memfd_create) instead of an on-disk .n2_db. Used by load::read_from_content
++    // so sarun's embedded `make`→kati→n2 path runs WITHOUT touching the box
++    // filesystem (no .n2_db, no build.ninja temp). The fd auto-frees on close.
++    // The db starts empty (no prior build records), so every target is treated
++    // as out-of-date on this run — correct for a one-shot in-process build that
++    // has no persisted state.
++    pub fn in_memory() -> std::io::Result<Self> {
++        // SAFETY: memfd_create with a valid NUL-terminated name and MFD_CLOEXEC.
++        let fd = unsafe { libc::memfd_create(c"n2-db".as_ptr(), libc::MFD_CLOEXEC) };
++        if fd < 0 {
++            return Err(std::io::Error::last_os_error());
++        }
++        // SAFETY: fd is a fresh owned descriptor returned by memfd_create.
++        let f = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
++        let mut w = Self::from_opened(IdMap::default(), f);
++        w.write_signature()?;
++        Ok(w)
++    }
++
+     fn from_opened(ids: IdMap, w: File) -> Self {
+         Writer { ids, w }
+     }
+diff --git a/src/densemap.rs b/src/densemap.rs
+index 2d9878e..d4c5f50 100644
+--- a/src/densemap.rs
++++ b/src/densemap.rs
+@@ -45,6 +45,15 @@ impl<K: Index, V> DenseMap<K, V> {
+         K::from(self.vec.len())
+     }
+ 
++    // sarun: expose count + a value iterator so the engine can walk every Build
++    // in the loaded graph for the `build_edges` provenance frame.
++    pub fn len(&self) -> usize {
++        self.vec.len()
++    }
++    pub fn iter(&self) -> impl Iterator<Item = &V> {
++        self.vec.iter()
++    }
++
+     pub fn push(&mut self, val: V) -> K {
+         let id = self.next_id();
+         self.vec.push(val);
+diff --git a/src/lib.rs b/src/lib.rs
+index 44411ce..715e93a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,32 +3,26 @@ mod db;
+ mod densemap;
+ mod depfile;
+ mod eval;
+-mod graph;
++pub mod graph; // sarun: pub so the engine can walk the build graph for build_edges
+ mod hash;
+ pub mod load;
+ pub mod parse;
+-mod process;
++pub mod process; // sarun: pub so the engine can install the in-process executor hook
+ #[cfg(unix)]
+ mod process_posix;
+-#[cfg(windows)]
+-mod process_win;
++// sarun: process_win dropped — this fork is unix-only.
+ mod progress;
+ mod progress_dumb;
+ mod progress_fancy;
+ pub mod run;
+ pub mod scanner;
+-mod signal;
++pub mod signal; // sarun: pub so the engine can suppress n2's SIGINT handler
+ mod smallmap;
+ mod task;
+ mod terminal;
+ mod trace;
+ mod work;
+ 
+-#[cfg(feature = "jemalloc")]
+-#[cfg(not(any(miri, windows, target_arch = "wasm32")))]
+-use jemallocator::Jemalloc;
+-
+-#[cfg(feature = "jemalloc")]
+-#[cfg(not(any(miri, windows, target_arch = "wasm32")))]
+-#[global_allocator]
+-static GLOBAL: Jemalloc = Jemalloc;
++// sarun: the upstream jemalloc #[global_allocator] block is dropped — the
++// vendored fork is lib-only with the jemalloc feature removed, so the host
++// binary owns the allocator.
+diff --git a/src/load.rs b/src/load.rs
+index c0892e3..2a178f2 100644
+--- a/src/load.rs
++++ b/src/load.rs
+@@ -285,7 +285,8 @@ pub fn read(build_filename: &str) -> anyhow::Result<State> {
+ }
+ 
+ /// Parse a single file's content.
+-#[cfg(test)]
++// sarun: un-gated from `#[cfg(test)]` so the embedded `make` path can parse the
++// kati-generated ninja straight from memory (no disk read). Behaviour unchanged.
+ pub fn parse(name: &str, mut content: Vec<u8>) -> anyhow::Result<graph::Graph> {
+     content.push(0);
+     let mut loader = Loader::new();
+@@ -297,3 +298,70 @@ pub fn parse(name: &str, mut content: Vec<u8>) -> anyhow::Result<graph::Graph> {
+ 
+     Ok(loader.graph)
+ }
++
++// sarun: build a fully-runnable `State` from in-memory ninja content, with a
++// fresh in-memory (memfd) db and NO `.n2_db` file. The in-memory twin of read():
++// it parses `content` (the kati-generated ninja handed back via memfd), then
++// constructs the same State { graph, db, hashes, default, pools } read() returns
++// — so work::Work runs it exactly as a disk-loaded build. There is no disk
++// build.ninja and no .n2_db; the whole make→ninja→execute handoff stays in
++// memory, the user-mandated no-temp-file contract.
++pub fn read_from_content(name: &str, mut content: Vec<u8>) -> anyhow::Result<State> {
++    content.push(0);
++    let mut loader = Loader::new();
++    trace::scope("loader.read_content", || {
++        let mut parser = parse::Parser::new(&content);
++        loader.parse_with_parser(&mut parser, PathBuf::from(name), &[])
++    })?;
++
++    // Fresh empty in-memory db (memfd). With no prior build records every wanted
++    // target is treated as out of date this run — correct for a one-shot build.
++    let hashes = graph::Hashes::default();
++    let db = db::Writer::in_memory().map_err(|err| anyhow!("n2 in-memory db: {}", err))?;
++
++    Ok(State {
++        graph: loader.graph,
++        db,
++        hashes,
++        default: loader.default,
++        pools: loader.pools,
++    })
++}
++
++// sarun: variant of read_from_content that ALSO opens a persistent disk
++// db at db_path (creating parent dirs as needed). The kati→n2 box pipeline
++// uses this to share build state across sub-makes within a single box
++// session — without it, every `$(MAKE)` invocation starts with an empty
++// hashes map and rebuilds every target, diverging from real make's
++// mtime-based "exists + nothing newer = up to date" semantics.
++pub fn read_from_content_with_db(
++    name: &str,
++    mut content: Vec<u8>,
++    db_path: &std::path::Path,
++) -> anyhow::Result<State> {
++    content.push(0);
++    let mut loader = Loader::new();
++    trace::scope("loader.read_content", || {
++        let mut parser = parse::Parser::new(&content);
++        loader.parse_with_parser(&mut parser, PathBuf::from(name), &[])
++    })?;
++
++    let mut hashes = graph::Hashes::default();
++    if let Some(parent) = db_path.parent() {
++        if !parent.as_os_str().is_empty() {
++            let _ = std::fs::create_dir_all(parent);
++        }
++    }
++    let db = trace::scope("db::open", || {
++        db::open(db_path, &mut loader.graph, &mut hashes)
++    })
++    .map_err(|err| anyhow!("n2 db {}: {}", db_path.display(), err))?;
++
++    Ok(State {
++        graph: loader.graph,
++        db,
++        hashes,
++        default: loader.default,
++        pools: loader.pools,
++    })
++}
+diff --git a/src/process.rs b/src/process.rs
+index ae67bc3..425e1e7 100644
+--- a/src/process.rs
++++ b/src/process.rs
+@@ -19,3 +19,29 @@ pub enum Termination {
+     Interrupted,
+     Failure,
+ }
++
++// ── sarun: in-process executor hook ──────────────────────────────────────────
++// sarun embeds n2 and runs each recipe through its in-process brush shell
++// instead of posix_spawning `/bin/sh -c`. The host installs an executor here
++// BEFORE calling run::run(); when set, run_command (process_posix.rs) routes
++// every cmdline to it and posix_spawn is never reached. The contract is
++// IDENTICAL to upstream run_command: feed merged stdout+stderr bytes to
++// output_cb, return a Termination. The scheduler (task.rs/work.rs) is untouched.
++//
++// The executor is a bare fn pointer (no captured state) so it needs no
++// allocation/locking and is trivially Send+Sync; sarun's executor reaches its
++// shared tokio runtime via its own statics.
++pub type Executor = fn(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> Termination;
++
++static EXECUTOR: std::sync::OnceLock<Executor> = std::sync::OnceLock::new();
++
++/// sarun: install the in-process recipe executor. Call once before run::run().
++/// Idempotent: a second call is ignored (OnceLock).
++pub fn set_executor(exec: Executor) {
++    let _ = EXECUTOR.set(exec);
++}
++
++/// sarun: the installed executor, if any.
++pub fn executor() -> Option<Executor> {
++    EXECUTOR.get().copied()
++}
+diff --git a/src/process_posix.rs b/src/process_posix.rs
+index e650537..20a0ebe 100644
+--- a/src/process_posix.rs
++++ b/src/process_posix.rs
+@@ -151,6 +151,12 @@ fn pipe2() -> anyhow::Result<[libc::c_int; 2]> {
+ }
+ 
+ pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::Result<Termination> {
++    // sarun: if the host installed an in-process executor, route the recipe to
++    // it (embedded brush) and NEVER posix_spawn /bin/sh. The byte/Termination
++    // contract below is reproduced exactly by the executor.
++    if let Some(exec) = crate::process::executor() {
++        return Ok(exec(cmdline, &mut output_cb));
++    }
+     // Spawn the subprocess using posix_spawn with output redirected to the pipe.
+     // We don't use Rust's process spawning because of issue #14 and because
+     // we want to feed both stdout and stderr into the same pipe, which cannot
+diff --git a/src/run.rs b/src/run.rs
+index 7887e3d..a79c9ba 100644
+--- a/src/run.rs
++++ b/src/run.rs
+@@ -227,11 +227,19 @@ options:
+ }
+ 
+ fn run_impl() -> anyhow::Result<i32> {
+-    let args = match parse_args()? {
++    let mut args = match parse_args()? {
+         Ok(args) => args,
+         Err(exit) => return Ok(exit),
+     };
+ 
++    // sarun: when the in-process executor is active, FORCE serial (-j1). Recipes
++    // run through the embedded brush which mutates process-global cwd/fds; the
++    // cross-recipe race under parallelism is deferred, so serial is the
++    // conservative correct default (see process.rs::set_executor).
++    if crate::process::executor().is_some() {
++        args.options.parallelism = 1;
++    }
++
+     match build(args)? {
+         None => {
+             // Don't print any summary, the failing task is enough info.
+@@ -258,3 +266,64 @@ pub fn run() -> anyhow::Result<i32> {
+     trace::close();
+     res
+ }
++
++// sarun: run an ALREADY-LOADED, in-memory State (from load::read_from_content)
++// against an explicit target list, with the in-process executor forced serial
++// (-j1), exactly like run_impl's embedded path. There is no command-line parse,
++// no disk load, no build.ninja rebuild step (the make→kati→ninja graph is not
++// self-regenerating). `targets` empty → build the graph's `default` targets, or
++// every target if there are no defaults — matching `build()`'s own logic.
++pub fn run_state(state: load::State, targets: &[String]) -> anyhow::Result<i32> {
++    let dumb_console = DumbConsoleProgress::new(false);
++    let progress: &dyn Progress = &dumb_console;
++
++    let mut options = work::Options::default();
++    // In-process executor ⇒ serial, same reasoning as run_impl (recipes mutate
++    // process-global cwd/fds through embedded brush).
++    options.parallelism = if crate::process::executor().is_some() {
++        1
++    } else {
++        default_parallelism()?
++    };
++
++    let mut work = work::Work::new(
++        state.graph,
++        state.hashes,
++        state.db,
++        &options,
++        progress,
++        state.pools,
++    );
++
++    if !targets.is_empty() {
++        for name in targets {
++            let Some(target) = work.lookup(name) else {
++                return Err(anyhow::anyhow!("unknown path requested: {:?}", name));
++            };
++            work.want_file(target)?;
++        }
++    } else if !state.default.is_empty() {
++        for target in state.default {
++            work.want_file(target)?;
++        }
++    } else {
++        work.want_every_file(None)?;
++    }
++
++    let res = match trace::scope("work.run", || work.run())? {
++        false => Ok(1),
++        true => {
++            match work.tasks_run {
++                0 => println!("n2: no work to do"),
++                n => println!(
++                    "n2: ran {} task{}, now up to date",
++                    n,
++                    if n == 1 { "" } else { "s" }
++                ),
++            }
++            Ok(0)
++        }
++    };
++    trace::close();
++    res
++}
+diff --git a/src/signal.rs b/src/signal.rs
+index 7b71ed0..e2b2022 100644
+--- a/src/signal.rs
++++ b/src/signal.rs
+@@ -16,6 +16,12 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
+ 
+ #[cfg(unix)]
+ pub fn register_sigint() {
++    // sarun: when n2 is embedded in the engine, the box's own signal setup owns
++    // SIGINT — n2 installing a SA_RESETHAND handler here would race/override it.
++    // Suppress n2's handler whenever the in-process executor is active.
++    if crate::process::executor().is_some() {
++        return;
++    }
+     // Safety: registering a signal handler is libc unsafe code.
+     unsafe {
+         let mut sa: libc::sigaction = std::mem::zeroed();

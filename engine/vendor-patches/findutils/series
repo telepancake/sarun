@@ -1,0 +1,15 @@
+0010-findutils-reduce-vendored-crate-to-a-find-only-library.patch
+0020-find-inject-error-diagnostics-through-the-Dependencies-trait.patch
+0030-findutils-drop-accidentally-committed-Cargo.lock.patch
+0040-find-read-files0-from-from-logical-stdin-not-the-process-fd-.patch
+0050-vendor-restore-pristine-xargs-findutils-0.9.1.patch
+0060-xargs-inject-logical-I-O-for-an-in-process-brush-builtin.patch
+0070-docs-vendored-findutils-is-find-xargs-not-find-only.patch
+0080-xargs-wire-spawned-children-s-stdio-to-the-box-s-logical-str.patch
+0090-find-wire-exec-children-s-stdio-to-the-box-s-logical-streams.patch
+0100-xargs-resolve-children-against-the-logical-cwd-drop-the-unsh.patch
+0110-find-resolve-against-the-logical-cwd-drop-the-unshare-thread.patch
+0120-xargs-implement-P-parallel-as-a-bounded-pool-reaped-per-pid.patch
+0130-xargs-run-built-commands-through-brush-builtins-functions-sc.patch
+0140-find-run-exec-execdir-commands-through-brush-not-exec.patch
+0150-xargs-restore-GNU-exit-codes-for-not-found-signal-death-audi.patch

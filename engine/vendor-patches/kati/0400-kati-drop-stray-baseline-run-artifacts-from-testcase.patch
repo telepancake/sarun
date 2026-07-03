@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 08:40:39 +0000
+Subject: [PATCH] kati: drop stray baseline-run artifacts from testcase/
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+a.dep/b.dep/oo.dep/dir/t.out/srcdir/thing.src were droppings from
+running the sweep baselines with real GNU make inside testcase/ —
+the corpus runner executes every case in its own temp dir; these
+don't belong in the tree.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ testcase/a.dep            | 0
+ testcase/b.dep            | 0
+ testcase/dir/t.out        | 0
+ testcase/oo.dep           | 0
+ testcase/srcdir/thing.src | 1 -
+ 5 files changed, 1 deletion(-)
+ delete mode 100644 engine/vendor/kati/testcase/a.dep
+ delete mode 100644 engine/vendor/kati/testcase/b.dep
+ delete mode 100644 engine/vendor/kati/testcase/dir/t.out
+ delete mode 100644 engine/vendor/kati/testcase/oo.dep
+ delete mode 100644 engine/vendor/kati/testcase/srcdir/thing.src
+
+diff --git a/testcase/a.dep b/testcase/a.dep
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/testcase/b.dep b/testcase/b.dep
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/testcase/dir/t.out b/testcase/dir/t.out
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/testcase/oo.dep b/testcase/oo.dep
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/testcase/srcdir/thing.src b/testcase/srcdir/thing.src
+deleted file mode 100644
+index c2981a9..0000000
+--- a/testcase/srcdir/thing.src
++++ /dev/null
+@@ -1 +0,0 @@
+-payload

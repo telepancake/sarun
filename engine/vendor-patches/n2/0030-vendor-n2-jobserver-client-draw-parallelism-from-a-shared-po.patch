@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 13:33:03 +0000
+Subject: [PATCH] =?UTF-8?q?vendor/n2:=20jobserver=20client=20=E2=80=94=20d?=
+ =?UTF-8?q?raw=20parallelism=20from=20a=20shared=20pool?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+n2 was forced to -j1 whenever the in-process executor was installed (recipes
+run through embedded brush, and parallel recipe execution was deferred). Add a
+minimal GNU-make jobserver CLIENT (src/jobserver.rs): n2 reads the jobserver
+advertised in MAKEFLAGS (--jobserver-auth=R,W / --jobserver-fds=R,W, plus the
+4.4 fifo: form) and draws tokens, so its concurrency is bounded by the same
+shared pool every other consumer in the build tree uses.
+
+The work loop runs the first concurrent recipe on the implicit token (every
+client may run one job free — this keeps the protocol deadlock-free under
+recursion) and claims a pool token for each additional one, releasing it when
+the task finishes. With a jobserver present the forced -j1 is lifted (up to N
+concurrent recipes; the pool does the real bounding); without one, embedded
+builds stay serial as before. Each recipe still runs on its own worker thread
+with its own logical cwd, so concurrent recipes don't share mutable state.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src/jobserver.rs | 108 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib.rs       |   1 +
+ src/run.rs       |  31 ++++++++------
+ src/task.rs      |  11 ++++-
+ src/work.rs      |  34 ++++++++++++++-
+ 5 files changed, 170 insertions(+), 15 deletions(-)
+ create mode 100644 engine/vendor/n2/src/jobserver.rs
+
+diff --git a/src/jobserver.rs b/src/jobserver.rs
+new file mode 100644
+index 0000000..48f73cd
+--- /dev/null
++++ b/src/jobserver.rs
+@@ -0,0 +1,108 @@
++//! A minimal GNU-make jobserver CLIENT.
++//!
++//! sarun: this is a vendored addition. n2 reads the jobserver advertised by its
++//! parent in `MAKEFLAGS` and draws tokens from it, so n2's parallelism is bounded
++//! by the same shared pool every other consumer in the build tree draws from —
++//! the engine, recursive in-process makes, and forked tools like
++//! `gcc -flto=jobserver`. Total jobs running at once across the whole tree stay
++//! within the pool's N, instead of each tool independently fanning out to -jN.
++//!
++//! Protocol (the classic POSIX form, plus the 4.4 fifo form):
++//!   MAKEFLAGS contains `--jobserver-auth=R,W` or `--jobserver-fds=R,W` (a pair
++//!   of inherited pipe fds) or `--jobserver-auth=fifo:PATH`. A client reads one
++//!   byte to claim a slot and writes it back to release. Every client also has
++//!   one implicit token: it may always run a single job without acquiring, which
++//!   is what makes the protocol deadlock-free under recursion.
++//!
++//! Absent any jobserver in the environment, [`Client::from_env`] returns None and
++//! n2 falls back to its own `--parallelism`, unchanged.
++
++/// A connection to an inherited jobserver pipe (or fifo).
++pub struct Client {
++    read_fd: i32,
++    write_fd: i32,
++}
++
++/// Find `name=` in a MAKEFLAGS string and return its value token.
++fn flag_value<'a>(makeflags: &'a str, name: &str) -> Option<&'a str> {
++    makeflags
++        .split_whitespace()
++        .find_map(|tok| tok.strip_prefix(name))
++}
++
++/// Parse `R,W` into a pair of fds.
++fn parse_fd_pair(v: &str) -> Option<(i32, i32)> {
++    let (r, w) = v.split_once(',')?;
++    Some((r.trim().parse().ok()?, w.trim().parse().ok()?))
++}
++
++impl Client {
++    /// Connect to the jobserver named in `MAKEFLAGS`, if any.
++    pub fn from_env() -> Option<Client> {
++        let mf = std::env::var("MAKEFLAGS").ok()?;
++        // Prefer --jobserver-auth (current), fall back to --jobserver-fds (legacy).
++        let val = flag_value(&mf, "--jobserver-auth=")
++            .or_else(|| flag_value(&mf, "--jobserver-fds="))?;
++
++        if let Some(path) = val.strip_prefix("fifo:") {
++            // Open the fifo read-write so neither end ever sees EOF/EPIPE while
++            // the build runs (the standard client trick).
++            let c = std::ffi::CString::new(path).ok()?;
++            let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR) };
++            if fd < 0 {
++                return None;
++            }
++            return Some(Client { read_fd: fd, write_fd: fd });
++        }
++
++        let (read_fd, write_fd) = parse_fd_pair(val)?;
++        // Validate the fds are actually open (a stale MAKEFLAGS from a parent
++        // that already closed them would otherwise wedge us).
++        if unsafe { libc::fcntl(read_fd, libc::F_GETFD) } < 0
++            || unsafe { libc::fcntl(write_fd, libc::F_GETFD) } < 0
++        {
++            return None;
++        }
++        Some(Client { read_fd, write_fd })
++    }
++
++    /// The `-jN` count advertised in MAKEFLAGS, if present — used to size n2's
++    /// runner cap so it can hold up to N concurrent tasks (the pool still does
++    /// the real bounding).
++    pub fn jobs_hint() -> Option<usize> {
++        let mf = std::env::var("MAKEFLAGS").ok()?;
++        for tok in mf.split_whitespace() {
++            if let Some(rest) = tok.strip_prefix("-j") {
++                if let Ok(n) = rest.parse::<usize>() {
++                    return Some(n);
++                }
++            }
++            if let Some(rest) = tok.strip_prefix("--jobs=") {
++                if let Ok(n) = rest.parse::<usize>() {
++                    return Some(n);
++                }
++            }
++        }
++        None
++    }
++
++    /// Claim a token without blocking. None ⇒ the pool is momentarily empty.
++    /// The pipe stays blocking (forked tools require that), so poll first and
++    /// only read when a byte is waiting.
++    pub fn try_acquire(&self) -> Option<u8> {
++        let mut pfd = libc::pollfd { fd: self.read_fd, events: libc::POLLIN, revents: 0 };
++        let r = unsafe { libc::poll(&mut pfd, 1, 0) };
++        if r <= 0 || (pfd.revents & libc::POLLIN) == 0 {
++            return None;
++        }
++        let mut b = [0u8; 1];
++        let n = unsafe { libc::read(self.read_fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
++        if n == 1 { Some(b[0]) } else { None }
++    }
++
++    /// Return a token to the pool.
++    pub fn release(&self, token: u8) {
++        let b = [token];
++        unsafe { libc::write(self.write_fd, b.as_ptr() as *const libc::c_void, 1) };
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 715e93a..c442416 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,6 +5,7 @@ mod depfile;
+ mod eval;
+ pub mod graph; // sarun: pub so the engine can walk the build graph for build_edges
+ mod hash;
++mod jobserver; // sarun: GNU-make jobserver client (bounds parallelism to a shared pool)
+ pub mod load;
+ pub mod parse;
+ pub mod process; // sarun: pub so the engine can install the in-process executor hook
+diff --git a/src/run.rs b/src/run.rs
+index a79c9ba..4290567 100644
+--- a/src/run.rs
++++ b/src/run.rs
+@@ -105,6 +105,22 @@ fn default_parallelism() -> anyhow::Result<usize> {
+     Ok(usize::from(par))
+ }
+ 
++/// sarun: parallelism for an embedded (in-process executor) build. With a shared
++/// jobserver advertised in MAKEFLAGS, allow up to N concurrent recipes — the pool
++/// does the real bounding (and is shared with recursive makes and forked tools).
++/// Without a jobserver, stay serial: embedded brush recipes run concurrently only
++/// under the pool's accounting. A non-embedded build keeps n2's normal default.
++fn embedded_parallelism() -> anyhow::Result<usize> {
++    if crate::process::executor().is_none() {
++        return default_parallelism();
++    }
++    if crate::jobserver::Client::from_env().is_some() {
++        Ok(crate::jobserver::Client::jobs_hint().unwrap_or(default_parallelism()?))
++    } else {
++        Ok(1)
++    }
++}
++
+ /// Run a tool as specified by the `-t` flag`.
+ fn subtool(args: &mut BuildArgs, tool: &str) -> anyhow::Result<Option<i32>> {
+     match tool {
+@@ -232,12 +248,9 @@ fn run_impl() -> anyhow::Result<i32> {
+         Err(exit) => return Ok(exit),
+     };
+ 
+-    // sarun: when the in-process executor is active, FORCE serial (-j1). Recipes
+-    // run through the embedded brush which mutates process-global cwd/fds; the
+-    // cross-recipe race under parallelism is deferred, so serial is the
+-    // conservative correct default (see process.rs::set_executor).
++    // sarun: pick embedded parallelism the same way run_state does.
+     if crate::process::executor().is_some() {
+-        args.options.parallelism = 1;
++        args.options.parallelism = embedded_parallelism()?;
+     }
+ 
+     match build(args)? {
+@@ -278,13 +291,7 @@ pub fn run_state(state: load::State, targets: &[String]) -> anyhow::Result<i32>
+     let progress: &dyn Progress = &dumb_console;
+ 
+     let mut options = work::Options::default();
+-    // In-process executor ⇒ serial, same reasoning as run_impl (recipes mutate
+-    // process-global cwd/fds through embedded brush).
+-    options.parallelism = if crate::process::executor().is_some() {
+-        1
+-    } else {
+-        default_parallelism()?
+-    };
++    options.parallelism = embedded_parallelism()?;
+ 
+     let mut work = work::Work::new(
+         state.graph,
+diff --git a/src/task.rs b/src/task.rs
+index 9e041de..5ddf115 100644
+--- a/src/task.rs
++++ b/src/task.rs
+@@ -26,6 +26,9 @@ pub struct FinishedTask {
+     pub buildid: BuildId,
+     pub span: (Instant, Instant),
+     pub result: TaskResult,
++    /// sarun: the jobserver token this task held (None ⇒ the implicit token),
++    /// returned to the work loop so it can release it to the shared pool.
++    pub token: Option<u8>,
+ }
+ 
+ /// The result of running a build step.
+@@ -213,7 +216,12 @@ impl Runner {
+         self.running > 0
+     }
+ 
+-    pub fn start(&mut self, id: BuildId, build: &Build) {
++    /// Number of tasks currently running.
++    pub fn running(&self) -> usize {
++        self.running
++    }
++
++    pub fn start(&mut self, id: BuildId, build: &Build, token: Option<u8>) {
+         let cmdline = build.cmdline.clone().unwrap();
+         let depfile = build.depfile.clone().map(PathBuf::from);
+         let rspfile = build.rspfile.clone();
+@@ -252,6 +260,7 @@ impl Runner {
+                 buildid: id,
+                 span: (start, finish),
+                 result,
++                token,
+             };
+             // The send will only fail if the receiver disappeared, e.g. due to shutting down.
+             let _ = tx.send(Message::Done(task));
+diff --git a/src/work.rs b/src/work.rs
+index 348b063..ce49b6c 100644
+--- a/src/work.rs
++++ b/src/work.rs
+@@ -706,6 +706,10 @@ impl<'a> Work<'a> {
+         signal::register_sigint();
+         let mut tasks_failed = 0;
+         let mut runner = task::Runner::new(self.options.parallelism);
++        // sarun: the shared jobserver, if our parent advertised one. When present
++        // it — not just `parallelism` — bounds how many recipes run at once, and
++        // the same pool is shared with recursive makes and forked tools.
++        let jobserver = crate::jobserver::Client::from_env();
+         while self.build_states.unfinished() {
+             self.progress.update(&self.build_states.counts);
+ 
+@@ -721,14 +725,36 @@ impl<'a> Work<'a> {
+ 
+             let mut made_progress = false;
+             while runner.can_start_more() {
++                // sarun: jobserver gate. The first concurrent task runs on our
++                // implicit token (every client may run one job for free — this is
++                // what keeps the protocol deadlock-free under recursion); each
++                // additional task must claim a token from the shared pool. If the
++                // pool is momentarily empty we stop starting and wait for a
++                // running task to finish and release one.
++                let token = if runner.running() == 0 {
++                    None
++                } else if let Some(js) = &jobserver {
++                    match js.try_acquire() {
++                        Some(t) => Some(t),
++                        None => break,
++                    }
++                } else {
++                    None
++                };
+                 let id = match self.build_states.pop_queued() {
+                     Some(id) => id,
+-                    None => break,
++                    None => {
++                        // No queued work after all — return the token we claimed.
++                        if let (Some(js), Some(t)) = (&jobserver, token) {
++                            js.release(t);
++                        }
++                        break;
++                    }
+                 };
+                 let build = &self.graph.builds[id];
+                 self.build_states.set(id, build, BuildState::Running);
+                 self.create_parent_dirs(build.outs())?;
+-                runner.start(id, build);
++                runner.start(id, build, token);
+                 self.progress.task_started(id, build);
+                 made_progress = true;
+             }
+@@ -769,6 +795,10 @@ impl<'a> Work<'a> {
+             let task = runner.wait(|id, line| {
+                 self.progress.task_output(id, line);
+             });
++            // sarun: return this task's jobserver token to the shared pool.
++            if let (Some(js), Some(t)) = (&jobserver, task.token) {
++                js.release(t);
++            }
+             let build = &self.graph.builds[task.buildid];
+             if trace::enabled() {
+                 let desc = progress::build_message(build);

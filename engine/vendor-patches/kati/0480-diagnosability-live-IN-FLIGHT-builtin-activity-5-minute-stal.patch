@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 11:58:47 +0000
+Subject: [PATCH] diagnosability: live IN FLIGHT builtin activity + 5-minute
+ stall watchdog
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A stuck box had no 'running builtins' view — processes have a tree,
+but an in-process make/recipe/$(shell) spinning silently was
+invisible. Now:
+
+- kati keeps a per-thread activity registry (RAII guards around each
+  recipe, $(shell CMD), and dependency analysis — nesting restores
+  the enclosing entry).
+- the box ships an activity snapshot to the engine every 30s
+  (box_activity frame → live BoxState, ephemeral); review.box_summary
+  merges it, and the box overview renders an '── IN FLIGHT ──'
+  section: each busy builtin with its live age, red at 5+ minutes.
+- a watchdog (SARUN_STALL_SECS, default 300) also prints
+  '*kati*: STALL? Ns without completing: <what>' to the box's stderr
+  — nothing in the build may run 5+ minutes in silence. Standalone
+  rkati gets the stderr watchdog too.
+
+Both corpora fail=0; make-rs PASS.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/dep.rs      |  1 +
+ src-rs/exec.rs     |  2 ++
+ src-rs/fileutil.rs | 76 ++++++++++++++++++++++++++++++++++++++++++++++
+ src-rs/func.rs     |  3 ++
+ src-rs/main.rs     |  7 +++++
+ 5 files changed, 89 insertions(+)
+
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 0500af5..c8a6e39 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -1775,6 +1775,7 @@ impl<'a> DepBuilder<'a> {
+ }
+ 
+ pub fn make_dep(ev: &mut Evaluator, targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
++    let _act = crate::fileutil::ActivityGuard::new("dependency analysis".into());
+     let mut db = DepBuilder::new(ev)?;
+     let _tr = ScopedTimeReporter::new("make dep (build)");
+     db.build(targets)
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 2cb2cfd..111b674 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -742,6 +742,8 @@ list of the rule for '{output}' at {loc}"));
+                         // Stream each output chunk to the main thread LIVE (it owns
+                         // the RECIPE_OUT sink); then the final result.
+                         let mut emit = |b: &[u8]| { let _ = txc.send(RunMsg::Chunk(b.to_vec())); };
++                        let _act = crate::fileutil::ActivityGuard::new(
++                            format!("recipe of '{}'", req.output));
+                         let r = run_node_commands(&shell, shellflag, req, &mut emit);
+                         let _ = txc.send(RunMsg::Done(r, slip));
+                     })
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 156e857..6e50e7b 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -394,6 +394,82 @@ pub fn clear_glob_cache() {
+ // them into the box's capture database so wrong-value hunts are a query, not
+ // a rerun with trace flags. Same Arc-clone-then-release pattern as the other
+ // hooks (the callback may allocate / send frames).
++// ── stall watchdog ───────────────────────────────────────────────────────────
++// Long-running in-process work registers WHAT it is doing (per thread);
++// a watchdog (installed by the embedding engine / rkati main) reports any
++// entry that has been running past a threshold — a silent 5-minute stall in
++// a recipe / $(shell) / parse is a diagnosability bug, not patience.
++pub static ACTIVITY: LazyLock<
++    parking_lot::Mutex<HashMap<std::thread::ThreadId, Vec<(String, std::time::Instant)>>>,
++> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
++
++/// RAII: registers `desc` as this thread's current activity; drop pops it
++/// (restoring the enclosing activity, e.g. the recipe a $(shell) runs under).
++pub struct ActivityGuard;
++
++impl ActivityGuard {
++    pub fn new(desc: String) -> ActivityGuard {
++        ACTIVITY
++            .lock()
++            .entry(std::thread::current().id())
++            .or_default()
++            .push((desc, std::time::Instant::now()));
++        ActivityGuard
++    }
++}
++
++impl Drop for ActivityGuard {
++    fn drop(&mut self) {
++        let tid = std::thread::current().id();
++        let mut a = ACTIVITY.lock();
++        if let Some(v) = a.get_mut(&tid) {
++            v.pop();
++            if v.is_empty() {
++                a.remove(&tid);
++            }
++        }
++    }
++}
++
++/// Snapshot of every thread's CURRENT activity: (description, age seconds),
++/// innermost entry per thread. For the engine's live "what is this box
++/// doing" feed.
++pub fn activity_snapshot() -> Vec<(String, u64)> {
++    let now = std::time::Instant::now();
++    ACTIVITY
++        .lock()
++        .values()
++        .filter_map(|stack| stack.last())
++        .map(|(d, t)| (d.clone(), now.duration_since(*t).as_secs()))
++        .collect()
++}
++
++/// Start the watchdog (idempotent). Every 30s, any activity older than
++/// `stall_secs` is reported through `report` (once per interval, with its
++/// age) — the report callback decides where it lands (recipe stderr).
++pub fn start_stall_watchdog(stall_secs: u64, report: Arc<dyn Fn(&str) + Send + Sync>) {
++    static ONCE: std::sync::Once = std::sync::Once::new();
++    ONCE.call_once(move || {
++        std::thread::Builder::new()
++            .name("kati-stall-watchdog".into())
++            .spawn(move || loop {
++                std::thread::sleep(std::time::Duration::from_secs(30));
++                let now = std::time::Instant::now();
++                for stack in ACTIVITY.lock().values() {
++                    if let Some((desc, since)) = stack.last() {
++                        let age = now.duration_since(*since).as_secs();
++                        if age >= stall_secs {
++                            report(&format!(
++                                "*kati*: STALL? {age}s without completing: {desc}"
++                            ));
++                        }
++                    }
++                }
++            })
++            .ok();
++    });
++}
++
+ /// (name, loc, expanded value, make working dir, UNEXPANDED rhs text,
+ ///  assignment op ("=" ":=" "+=" "?=" "!="), variable origin (get_origin_str))
+ pub type VarAssignHook =
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 1193fb1..179172d 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -596,6 +596,9 @@ pub fn shell_func_impl(
+     }
+ 
+     collect_stats_with_slow_report!("func shell time", OsStr::from_bytes(cmd));
++    let _act = crate::fileutil::ActivityGuard::new(format!(
++        "$(shell {})",
++        String::from_utf8_lossy(&cmd[..cmd.len().min(120)])));
+     // box mode: the make's exported-var prefix rides SEPARATELY so the
+     // in-process runner applies it to the subshell without recording it as
+     // pipeline provenance ($(shell)'s recorded cmd is the user's command).
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 6fa45d8..d30b6dd 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -115,6 +115,13 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>>
+ }
+ 
+ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<i32> {
++    // Standalone rkati: a builtin silently busy for 5+ minutes gets a
++    // STALL line on stderr naming exactly what it is running.
++    kati::fileutil::start_stall_watchdog(
++        std::env::var("SARUN_STALL_SECS").ok()
++            .and_then(|s| s.parse().ok()).unwrap_or(300),
++        std::sync::Arc::new(|line| eprintln!("{line}")),
++    );
+     let start_time = std::time::SystemTime::now();
+ 
+     if FLAGS.generate_ninja && (FLAGS.regen || FLAGS.dump_kati_stamp) {

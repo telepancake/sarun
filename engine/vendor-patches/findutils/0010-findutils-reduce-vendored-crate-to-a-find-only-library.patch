@@ -1,0 +1,3005 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 19 Jun 2026 18:34:32 +0000
+Subject: [PATCH] findutils: reduce vendored crate to a find-only library
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Drop the locate/updatedb/xargs/testing modules and binaries, their
+benches, and the dev-dependencies — sarun vendors findutils only to run
+`find` in-process. lib.rs now exposes just `pub mod find`; Cargo.toml is
+a lean library manifest (find's runtime deps: argmax, chrono, clap,
+faccess, nix, onig, regex, uucore 0.9, walkdir, itertools, thiserror).
+
+Builds clean as a library (cargo build --lib). No behavioral change to
+find itself; this is purely scope reduction ahead of the in-process
+adaptation.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ Cargo.toml                      |   66 +-
+ src/find/main.rs                |   17 -
+ src/lib.rs                      |    6 +-
+ src/locate/main.rs              |    9 -
+ src/locate/mod.rs               |  751 ----------------
+ src/testing/commandline/main.rs |  138 ---
+ src/updatedb/main.rs            |    9 -
+ src/updatedb/mod.rs             |  378 --------
+ src/xargs/main.rs               |   15 -
+ src/xargs/mod.rs                | 1492 -------------------------------
+ 10 files changed, 8 insertions(+), 2873 deletions(-)
+ delete mode 100644 engine/vendor/findutils/src/find/main.rs
+ delete mode 100644 engine/vendor/findutils/src/locate/main.rs
+ delete mode 100644 engine/vendor/findutils/src/locate/mod.rs
+ delete mode 100644 engine/vendor/findutils/src/testing/commandline/main.rs
+ delete mode 100644 engine/vendor/findutils/src/updatedb/main.rs
+ delete mode 100644 engine/vendor/findutils/src/updatedb/mod.rs
+ delete mode 100644 engine/vendor/findutils/src/xargs/main.rs
+ delete mode 100644 engine/vendor/findutils/src/xargs/mod.rs
+
+diff --git a/Cargo.toml b/Cargo.toml
+index cb172f3..3f533e0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,3 +1,7 @@
++# sarun: trimmed to a find-only library fork of uutils/findutils 0.9.1.
++# The `locate`/`updatedb`/`xargs`/`testing-commandline` binaries, their
++# benches, and the dev-dependencies are removed — the engine consumes only the
++# `find` module as a library (engine/vendor/findutils via a path dependency).
+ [package]
+ name = "findutils"
+ version = "0.9.1"
+@@ -6,7 +10,7 @@ repository = "https://github.com/uutils/findutils"
+ edition = "2021"
+ license = "MIT"
+ readme = "README.md"
+-description = "Rust implementation of GNU findutils"
++description = "Rust implementation of GNU findutils (find-only fork for sarun)"
+ authors = ["uutils developers"]
+ 
+ [dependencies]
+@@ -22,64 +26,6 @@ walkdir = "2.5"
+ itertools = "0.15.0"
+ thiserror = "2.0.12"
+ 
+-[dev-dependencies]
+-criterion = { version = "4.7.0", package = "codspeed-criterion-compat" }
+-assert_cmd = "2"
+-ctor = "1.0"
+-filetime = "0.2"
+-nix = { version = "0.31", features = ["fs"] }
+-rstest = "0.26.1"
+-tempfile = "3"
+-uutests = "0.9.0"
+-
+-[[bench]]
+-name = "find_bench"
+-harness = false
+-
+-[[bench]]
+-name = "xargs_bench"
+-harness = false
+-
+-[[bench]]
+-name = "updatedb_bench"
+-harness = false
+-
+-[[bench]]
+-name = "locate_bench"
+-harness = false
+-
+-[[bin]]
+-name = "find"
+-path = "src/find/main.rs"
+-
+-[[bin]]
+-name = "locate"
+-path = "src/locate/main.rs"
+-
+-[[bin]]
+-name = "updatedb"
+-path = "src/updatedb/main.rs"
+-
+-[[bin]]
+-name = "xargs"
+-path = "src/xargs/main.rs"
+-
+-[[bin]]
+-name = "testing-commandline"
+-path = "src/testing/commandline/main.rs"
+-
+-[profile.release]
+-lto = "thin"
+-codegen-units = 1
+-
+-[profile.release-fast]
+-inherits = "release"
+-panic = "abort"
+-
+-# The profile that 'dist' (cargo-dist) builds release artifacts with.
+-[profile.dist]
+-inherits = "release"
+-
+ [lints.clippy]
+ all = { level = "warn", priority = -1 }
+ cargo = { level = "warn", priority = -1 }
+@@ -119,5 +65,3 @@ format_push_string = "allow"
+ flat_map_option = "allow"
+ from_iter_instead_of_collect = "allow"
+ large_types_passed_by_value = "allow"
+-# Disable for now, we have a few occurrences
+-# panic = "warn"
+diff --git a/src/find/main.rs b/src/find/main.rs
+deleted file mode 100644
+index 1d8787e..0000000
+--- a/src/find/main.rs
++++ /dev/null
+@@ -1,17 +0,0 @@
+-// Copyright 2017 Google Inc.
+-//
+-// Use of this source code is governed by a MIT-style
+-// license that can be found in the LICENSE file or at
+-// https://opensource.org/licenses/MIT.
+-
+-fn main() {
+-    // Ignores the SIGPIPE signal.
+-    // This is to solve the problem that when find is used with a pipe character,
+-    // the downstream software of the standard output stream closes the pipe and triggers a panic.
+-    uucore::panic::mute_sigpipe_panic();
+-
+-    let args = std::env::args().collect::<Vec<String>>();
+-    let strs: Vec<&str> = args.iter().map(std::convert::AsRef::as_ref).collect();
+-    let deps = findutils::find::StandardDependencies::new();
+-    std::process::exit(findutils::find::find_main(&strs, &deps));
+-}
+diff --git a/src/lib.rs b/src/lib.rs
+index 9a09012..45e4c49 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -4,7 +4,7 @@
+ // license that can be found in the LICENSE file or at
+ // https://opensource.org/licenses/MIT.
+ 
++// sarun: reduced to a find-only library. Upstream's `locate`, `updatedb`,
++// `xargs`, and `testing` modules (and their binaries) are dropped — this fork
++// vendors findutils solely to run `find` as an in-process brush builtin.
+ pub mod find;
+-pub mod locate;
+-pub mod updatedb;
+-pub mod xargs;
+diff --git a/src/locate/main.rs b/src/locate/main.rs
+deleted file mode 100644
+index d550d43..0000000
+--- a/src/locate/main.rs
++++ /dev/null
+@@ -1,9 +0,0 @@
+-// Use of this source code is governed by a MIT-style
+-// license that can be found in the LICENSE file or at
+-// https://opensource.org/licenses/MIT.
+-
+-fn main() {
+-    let args = std::env::args().collect::<Vec<String>>();
+-    let strs: Vec<&str> = args.iter().map(std::convert::AsRef::as_ref).collect();
+-    std::process::exit(findutils::locate::locate_main(strs.as_slice()));
+-}
+diff --git a/src/locate/mod.rs b/src/locate/mod.rs
+deleted file mode 100644
+index 9041027..0000000
+--- a/src/locate/mod.rs
++++ /dev/null
+@@ -1,751 +0,0 @@
+-// Use of this source code is governed by a MIT-style
+-// license that can be found in the LICENSE file or at
+-// https://opensource.org/licenses/MIT.
+-
+-use std::{
+-    borrow::Cow,
+-    env,
+-    ffi::{CStr, CString},
+-    fs::{self, File},
+-    io::{self, stderr, BufRead, BufReader, Read, Write},
+-    path::{Path, PathBuf},
+-    str::FromStr,
+-};
+-
+-use chrono::{DateTime, Local, TimeDelta};
+-use clap::{self, crate_version, value_parser, Arg, ArgAction, ArgMatches, Command, Id};
+-use itertools::Itertools;
+-use onig::{Regex, RegexOptions, Syntax};
+-use thiserror::Error;
+-use uucore::error::{ClapErrorWrapper, UClapError, UError, UResult};
+-
+-use crate::{find::matchers::RegexType, updatedb::DbFormat};
+-
+-#[derive(Debug)]
+-pub struct Config {
+-    all: bool,
+-    basename: bool,
+-    mode: Mode,
+-    db: Vec<PathBuf>,
+-    existing: ExistenceMode,
+-    follow_symlinks: bool,
+-    ignore_case: bool,
+-    limit: Option<usize>,
+-    max_age: usize,
+-    null_bytes: bool,
+-    print: bool,
+-}
+-
+-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+-pub enum Mode {
+-    #[default]
+-    Normal,
+-    Count,
+-    Statistics,
+-}
+-
+-#[derive(Debug, Clone, Copy, Default)]
+-pub enum ExistenceMode {
+-    #[default]
+-    Any,
+-    Present,
+-    NotPresent,
+-}
+-
+-#[derive(Error, Debug)]
+-pub enum Error {
+-    #[error("no matches found")]
+-    NoMatches,
+-    #[error("Unknown database type")]
+-    InvalidDbType,
+-    #[error("locate database {0} is corrupt or invalid")]
+-    InvalidDb(String),
+-    #[error("invalid regular expression: {0}")]
+-    InvalidRegex(String),
+-    #[error("{0}")]
+-    IoErr(#[from] io::Error),
+-    #[error("{0}")]
+-    ClapErr(#[from] ClapErrorWrapper),
+-    /// General copy error
+-    #[error("{0}")]
+-    Error(String),
+-}
+-
+-type LocateResult<T> = Result<T, Error>;
+-
+-impl UError for Error {
+-    fn code(&self) -> i32 {
+-        1
+-    }
+-}
+-
+-pub struct Statistics {
+-    matches: usize,
+-    total_length: usize,
+-    whitespace: usize,
+-    newlines: usize,
+-    high_bit: usize,
+-}
+-
+-impl Statistics {
+-    fn new() -> Self {
+-        Self {
+-            matches: 0,
+-            total_length: 0,
+-            whitespace: 0,
+-            newlines: 0,
+-            high_bit: 0,
+-        }
+-    }
+-
+-    fn add_match(&mut self, mat: &CStr) {
+-        let s = mat.to_string_lossy();
+-        self.matches += 1;
+-        self.total_length += s.len();
+-        if s.chars().any(char::is_whitespace) {
+-            self.whitespace += 1;
+-        }
+-        if s.chars().any(|c| c == '\n') {
+-            self.newlines += 1;
+-        }
+-        if !s.is_ascii() {
+-            self.high_bit += 1;
+-        }
+-    }
+-
+-    fn print_header(&self, dbreader: &DbReader) {
+-        println!(
+-            "Database {} is in the {} format.",
+-            dbreader.path.to_string_lossy(),
+-            dbreader.format,
+-        );
+-    }
+-
+-    fn print(&self, dbreader: &DbReader) {
+-        if let Ok(metadata) = fs::metadata(&dbreader.path) {
+-            if let Ok(time) = metadata.modified() {
+-                let time: DateTime<Local> = time.into();
+-                println!("Database was last modified at {}", time);
+-            }
+-            println!("Locate database size: {} bytes", metadata.len());
+-        }
+-        println!("Matching Filenames: {}", self.matches);
+-        println!(
+-            "File names have a cumulative length of {} bytes",
+-            self.total_length
+-        );
+-        println!("Of those file names,\n");
+-        println!("        {} contain whitespace,", self.whitespace);
+-        println!("        {} contain newline characters,", self.newlines);
+-        println!(
+-            "        and {} contain characters with the high bit set.",
+-            self.high_bit
+-        );
+-        println!();
+-    }
+-}
+-
+-#[derive(Debug)]
+-enum Patterns {
+-    String(Vec<String>),
+-    Regex(Vec<Regex>),
+-}
+-
+-impl Patterns {
+-    fn any_match(&self, entry: &str) -> bool {
+-        match self {
+-            Self::String(v) => v.iter().any(|s| entry.contains(s)),
+-            Self::Regex(v) => v.iter().any(|r| r.find(entry).is_some()),
+-        }
+-    }
+-
+-    fn all_match(&self, entry: &str) -> bool {
+-        match self {
+-            Self::String(v) => v.iter().all(|s| entry.contains(s)),
+-            Self::Regex(v) => v.iter().all(|r| r.find(entry).is_some()),
+-        }
+-    }
+-}
+-
+-pub struct ParsedInfo {
+-    patterns: Patterns,
+-    config: Config,
+-}
+-
+-fn make_regex(ty: RegexType, config: &Config, pattern: &str) -> Result<Regex, onig::Error> {
+-    let syntax = match ty {
+-        RegexType::Emacs => Syntax::emacs(),
+-        RegexType::Grep => Syntax::grep(),
+-        RegexType::PosixBasic => Syntax::posix_basic(),
+-        RegexType::PosixExtended => Syntax::posix_extended(),
+-    };
+-
+-    Regex::with_options(
+-        pattern,
+-        if config.ignore_case {
+-            RegexOptions::REGEX_OPTION_IGNORECASE
+-        } else {
+-            RegexOptions::REGEX_OPTION_NONE
+-        },
+-        syntax,
+-    )
+-}
+-
+-impl TryFrom<ArgMatches> for ParsedInfo {
+-    type Error = Error;
+-
+-    fn try_from(value: ArgMatches) -> Result<Self, Self::Error> {
+-        let config = Config {
+-            all: value.get_flag("all"),
+-            basename: value.get_flag("basename"),
+-            db: value
+-                .get_one::<String>("database")
+-                .map(String::as_str)
+-                // `database` has a default value, so this is only reached if clap
+-                // somehow omits it; fall back to an empty (non-openable) path.
+-                .unwrap_or_default()
+-                .split(':')
+-                .map(PathBuf::from)
+-                .collect(),
+-            mode: value
+-                .get_many::<Id>("mode")
+-                .unwrap_or_default()
+-                .next_back()
+-                .map(|s| match s.as_str() {
+-                    "count" => Mode::Count,
+-                    "statistics" => Mode::Statistics,
+-                    // the "mode" group only contains the "count" and "statistics" args
+-                    _ => unreachable!(),
+-                })
+-                .unwrap_or_default(),
+-            existing: value
+-                .get_many::<Id>("exist")
+-                .unwrap_or_default()
+-                .next_back()
+-                .map(|s| match s.as_str() {
+-                    "existing" => ExistenceMode::Present,
+-                    "non-existing" => ExistenceMode::NotPresent,
+-                    // the "exist" group only contains the "existing" and "non-existing" args
+-                    s => unreachable!("{s}"),
+-                })
+-                .unwrap_or_default(),
+-            follow_symlinks: value.get_flag("follow") || !value.get_flag("nofollow"),
+-            ignore_case: value.get_flag("ignore-case"),
+-            limit: value.get_one::<usize>("limit").copied(),
+-            // `max-database-age` has a default value of 8
+-            max_age: value
+-                .get_one::<usize>("max-database-age")
+-                .copied()
+-                .unwrap_or(8),
+-            null_bytes: value.get_flag("null"),
+-            print: value.get_flag("print"),
+-        };
+-        // `patterns` is a required argument, so this is normally non-empty
+-        let patterns: Vec<String> = value
+-            .get_many::<String>("patterns")
+-            .map(|v| v.cloned().collect())
+-            .unwrap_or_default();
+-        let patterns = if let Some(ty) = value.get_flag("regex").then(|| {
+-            value
+-                .get_one::<String>("regextype")
+-                .and_then(|s| RegexType::from_str(s.as_str()).ok())
+-                .unwrap_or(RegexType::Emacs)
+-        }) {
+-            let mut compiled = Vec::with_capacity(patterns.len());
+-            for pattern in patterns {
+-                let regex = make_regex(ty, &config, &pattern)
+-                    .map_err(|e| Error::InvalidRegex(format!("{pattern}: {e}")))?;
+-                compiled.push(regex);
+-            }
+-            Patterns::Regex(compiled)
+-        } else {
+-            Patterns::String(patterns)
+-        };
+-        Ok(Self { patterns, config })
+-    }
+-}
+-
+-fn uu_app() -> Command {
+-    Command::new("locate")
+-        .version(crate_version!())
+-        .args_override_self(true)
+-        .arg(
+-            Arg::new("all")
+-                .short('a')
+-                .long("all")
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new("basename")
+-                .short('b')
+-                .long("basename")
+-                .action(ArgAction::SetTrue)
+-                .group("name"),
+-        )
+-        .arg(
+-            Arg::new("count")
+-                .short('c')
+-                .long("count")
+-                .action(ArgAction::SetTrue)
+-                .group("mode"),
+-        )
+-        .arg(
+-            Arg::new("database")
+-                .short('d')
+-                .long("database")
+-                .env("LOCATE_PATH")
+-                .default_value("/usr/local/var/locatedb")
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("existing")
+-                .short('e')
+-                .long("existing")
+-                .action(ArgAction::SetTrue)
+-                .group("exist"),
+-        )
+-        .arg(
+-            Arg::new("non-existing")
+-                .short('E')
+-                .long("non-existing")
+-                .action(ArgAction::SetTrue)
+-                .group("exist"),
+-        )
+-        .arg(
+-            Arg::new("follow")
+-                .short('L')
+-                .action(ArgAction::SetTrue)
+-                .overrides_with("nofollow"),
+-        )
+-        .arg(
+-            Arg::new("nofollow")
+-                .short('P')
+-                .short_alias('H')
+-                .action(ArgAction::SetTrue)
+-                .overrides_with("follow"),
+-        )
+-        .arg(
+-            Arg::new("ignore-case")
+-                .short('i')
+-                .long("ignore-case")
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new("limit")
+-                .short('l')
+-                .long("limit")
+-                .value_parser(value_parser!(usize))
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("max-database-age")
+-                .long("max-database-age")
+-                .value_parser(value_parser!(usize))
+-                .default_value("8")
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("mmap")
+-                .short('m')
+-                .long("mmap")
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new("null")
+-                .short('0')
+-                .long("null")
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new("print")
+-                .short('p')
+-                .long("print")
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new("wholename")
+-                .short('w')
+-                .long("wholename")
+-                .action(ArgAction::SetFalse)
+-                .group("name"),
+-        )
+-        .arg(
+-            Arg::new("regex")
+-                .short('r')
+-                .long("regex")
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new("regextype")
+-                .long("regextype")
+-                .value_parser([
+-                    "findutils-default",
+-                    "emacs",
+-                    "gnu-awk",
+-                    "grep",
+-                    "posix-awk",
+-                    "awk",
+-                    "posix-basic",
+-                    "posix-egrep",
+-                    "egrep",
+-                    "posix-extended",
+-                ])
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("stdio")
+-                .short('s')
+-                .long("stdio")
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new("statistics")
+-                .short('S')
+-                .long("statistics")
+-                .action(ArgAction::SetTrue)
+-                .group("mode"),
+-        )
+-        .arg(
+-            Arg::new("patterns")
+-                .num_args(1..)
+-                .action(ArgAction::Append)
+-                .value_parser(value_parser!(String))
+-                .required(true),
+-        )
+-}
+-
+-struct DbReader {
+-    reader: BufReader<File>,
+-    prev: Option<CString>,
+-    prefix: isize,
+-    format: DbFormat,
+-    path: PathBuf,
+-}
+-
+-impl Iterator for DbReader {
+-    type Item = LocateResult<CString>;
+-
+-    fn next(&mut self) -> Option<Self::Item> {
+-        // 1 byte for the prefix delta
+-        let mut buf = [0];
+-        self.reader.read_exact(&mut buf).ok()?;
+-        // 0x80 - the prefix delta takes the next two bytes
+-        let size = if buf[0] == 0x80 {
+-            let mut buf = [0; 2];
+-            self.reader.read_exact(&mut buf).ok()?;
+-            i16::from_be_bytes(buf) as isize
+-        } else {
+-            // u8 as isize directly doesn't sign-extend
+-            buf[0] as i8 as isize
+-        };
+-        self.prefix += size;
+-        // read the actual path fragment
+-        let mut buf = Vec::new();
+-        self.reader.read_until(b'\0', &mut buf).ok()?;
+-        let prefix = self.prev.as_ref().map(|s| {
+-            s.to_bytes()
+-                .iter()
+-                .take(self.prefix as usize)
+-                .collect::<Vec<_>>()
+-        });
+-        if (prefix.as_ref().map_or(0, std::vec::Vec::len) as isize) < size {
+-            return Some(Err(Error::InvalidDb(
+-                self.path.to_string_lossy().to_string(),
+-            )));
+-        }
+-        let res = CString::from_vec_with_nul(
+-            prefix
+-                .unwrap_or_default()
+-                .into_iter()
+-                .copied()
+-                .chain(buf)
+-                .collect(),
+-        )
+-        .ok()?;
+-        self.prev = Some(res.clone());
+-        Some(Ok(res))
+-    }
+-}
+-
+-impl DbReader {
+-    fn new(path: impl AsRef<Path>) -> UResult<Self> {
+-        let mut reader = BufReader::new(File::open(path.as_ref())?);
+-        let format = Self::check_db(&mut reader).ok_or(Error::InvalidDbType)?;
+-        Ok(Self {
+-            reader,
+-            prev: None,
+-            prefix: 0,
+-            format,
+-            path: path.as_ref().to_path_buf(),
+-        })
+-    }
+-
+-    fn check_db(reader: &mut BufReader<File>) -> Option<DbFormat> {
+-        let mut buf = [0];
+-        let Ok(_) = reader.read_exact(&mut buf) else {
+-            return None;
+-        };
+-        let mut buf = Vec::new();
+-        let Ok(_) = reader.read_until(b'\0', &mut buf) else {
+-            return None;
+-        };
+-
+-        // drop the trailing nul byte when matching. `read_until` may stop at EOF
+-        // without one (e.g. a too-short file), so strip it only if present rather
+-        // than slicing `buf.len() - 1`, which underflows when `buf` is empty.
+-        match String::from_utf8_lossy(buf.strip_suffix(b"\0").unwrap_or(&buf)).as_ref() {
+-            "LOCATE02" => Some(DbFormat::Locate02),
+-            _ => None,
+-        }
+-    }
+-}
+-
+-/// Decode a raw database entry into a path.
+-///
+-/// On Unix a path is an arbitrary byte string, so the bytes are used verbatim. On other
+-/// platforms paths aren't raw bytes; the database stores UTF-8 text (find emits paths via
+-/// `Path::to_string_lossy`), so it is decoded lossily back into a path.
+-#[cfg(unix)]
+-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+-    use std::os::unix::ffi::OsStrExt;
+-    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+-}
+-
+-#[cfg(not(unix))]
+-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+-}
+-
+-/// Whether `path` currently exists on disk.
+-///
+-/// With `follow_symlinks` (the `-L`/`--follow` default) a symlink is resolved, so a broken
+-/// symlink counts as non-existent. Without it (`-P`/`--nofollow`) the link itself is checked,
+-/// so a broken symlink counts as existing.
+-fn path_exists(path: &Path, follow_symlinks: bool) -> bool {
+-    if follow_symlinks {
+-        fs::metadata(path).is_ok()
+-    } else {
+-        fs::symlink_metadata(path).is_ok()
+-    }
+-}
+-
+-fn match_entry(entry: &CStr, config: &Config, patterns: &Patterns) -> bool {
+-    // glob metacharacters in a stored path aren't handled yet, so such entries are skipped. On
+-    // Windows `\` is the path separator (present in every path), so it must not count here.
+-    #[cfg(windows)]
+-    const GLOB_METACHARS: &str = "*?[]";
+-    #[cfg(not(windows))]
+-    const GLOB_METACHARS: &str = r"*?[]\";
+-
+-    let buf = bytes_to_path(entry.to_bytes());
+-    let name = if config.basename {
+-        let Some(path) = buf.file_name() else {
+-            return false;
+-        };
+-
+-        let Ok(c) = CString::from_vec_with_nul(
+-            path.as_encoded_bytes()
+-                .iter()
+-                .copied()
+-                .chain([b'\0'])
+-                .collect(),
+-        ) else {
+-            // a file name can't contain an interior nul byte, so this only fails on
+-            // genuinely malformed input, which we treat as a non-match
+-            return false;
+-        };
+-
+-        Cow::Owned(c)
+-    } else {
+-        Cow::Borrowed(entry)
+-    };
+-    let entry = name.to_string_lossy();
+-
+-    let has_metachars = entry.chars().any(|c| GLOB_METACHARS.contains(c));
+-    let patterns_match = if config.all {
+-        if has_metachars {
+-            // TODO: parse metacharacters
+-            false
+-        } else {
+-            patterns.all_match(entry.as_ref())
+-        }
+-    } else {
+-        if has_metachars {
+-            // TODO: parse metacharacters
+-            false
+-        } else {
+-            patterns.any_match(entry.as_ref())
+-        }
+-    };
+-
+-    // existence is always checked against the full path, even in `--basename` mode
+-    let existence_matches = match config.existing {
+-        ExistenceMode::Any => true,
+-        ExistenceMode::Present => path_exists(&buf, config.follow_symlinks),
+-        ExistenceMode::NotPresent => !path_exists(&buf, config.follow_symlinks),
+-    };
+-
+-    patterns_match && existence_matches
+-}
+-
+-fn do_locate(args: &[&str]) -> LocateResult<()> {
+-    let matches = uu_app().try_get_matches_from(args);
+-    match matches {
+-        Err(e) => {
+-            let mut app = uu_app();
+-
+-            match e.kind() {
+-                clap::error::ErrorKind::DisplayHelp => {
+-                    app.print_help()?;
+-                }
+-                clap::error::ErrorKind::DisplayVersion => print!("{}", app.render_version()),
+-                _ => return Err(e.with_exit_code(1).into()),
+-            }
+-        }
+-        Ok(matches) => {
+-            let ParsedInfo { patterns, config } = ParsedInfo::try_from(matches)?;
+-            let mut stats = Statistics::new();
+-
+-            // iterate over each given database
+-            let count = config
+-                .db
+-                .iter()
+-                .filter_map(|p| DbReader::new(p.as_path()).ok())
+-                .map(|mut dbreader| {
+-                    // if we can get the mtime of the file, check it against the current time
+-                    if let Ok(metadata) = fs::metadata(&dbreader.path) {
+-                        if let Ok(time) = metadata.modified() {
+-                            let modified: DateTime<Local> = time.into();
+-                            let now = Local::now();
+-                            let delta = now - modified;
+-                            if delta
+-                                > TimeDelta::days(config.max_age as i64)
+-                            {
+-                                eprintln!(
+-                                    "{}: warning: database ‘{}’ is more than {} days old (actual age is {:.1} days)",
+-                                    args[0],
+-                                    dbreader.path.to_string_lossy(),
+-                                    config.max_age,
+-                                    delta.num_seconds() as f64 / (60 * 60 * 24) as f64
+-                                );
+-                            }
+-                        }
+-                    }
+-
+-                    // the first line of the statistics description is printed before matches
+-                    // (given --print)
+-                    if config.mode == Mode::Statistics {
+-                        stats.print_header(&dbreader);
+-                    }
+-
+-                    // find matches
+-                    let count = dbreader
+-                        .by_ref()
+-                        .process_results(|iter|
+-                            iter
+-                                .filter(|s| match_entry(s.as_c_str(), &config, &patterns))
+-                                .take(config.limit.unwrap_or(usize::MAX))
+-                                .inspect(|s| {
+-                                    if config.mode == Mode::Normal || config.print {
+-                                        if config.null_bytes {
+-                                            print!("{}\0", s.to_string_lossy());
+-                                        } else {
+-                                            println!("{}", s.to_string_lossy());
+-                                        }
+-                                    }
+-                                    if config.mode == Mode::Statistics {
+-                                        stats.add_match(s);
+-                                    }
+-                                })
+-                                .count()
+-                        );
+-
+-                    // print the rest of the statistics description
+-                    if config.mode == Mode::Statistics && count.is_ok() {
+-                        stats.print(&dbreader);
+-                    }
+-
+-                    count
+-                })
+-                .try_fold(0, |acc, e| e.map(|e| acc + e))?;
+-
+-            if config.mode == Mode::Count {
+-                println!("{count}");
+-            }
+-
+-            // zero matches isn't an error if --statistics is passed
+-            if count == 0 && config.mode != Mode::Statistics {
+-                return Err(Error::NoMatches);
+-            }
+-        }
+-    }
+-
+-    Ok(())
+-}
+-
+-pub fn locate_main(args: &[&str]) -> i32 {
+-    match do_locate(args) {
+-        Ok(()) => 0,
+-        Err(e) => {
+-            match e {
+-                Error::NoMatches => {}
+-                _ => {
+-                    let _ = writeln!(&mut stderr(), "Error: {e}");
+-                }
+-            }
+-            e.code()
+-        }
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use std::io;
+-    use std::path::Path;
+-
+-    use super::path_exists;
+-
+-    /// Create a symlink at `link` pointing at `target`, cross-platform.
+-    #[cfg(unix)]
+-    fn make_symlink(target: &Path, link: &Path) -> io::Result<()> {
+-        std::os::unix::fs::symlink(target, link)
+-    }
+-
+-    #[cfg(windows)]
+-    fn make_symlink(target: &Path, link: &Path) -> io::Result<()> {
+-        std::os::windows::fs::symlink_file(target, link)
+-    }
+-
+-    #[test]
+-    fn path_exists_regular_file() {
+-        let dir = tempfile::tempdir().unwrap();
+-        let file = dir.path().join("file");
+-        std::fs::write(&file, b"").unwrap();
+-        // a real file exists regardless of whether symlinks are followed
+-        assert!(path_exists(&file, true));
+-        assert!(path_exists(&file, false));
+-    }
+-
+-    #[test]
+-    fn path_exists_missing() {
+-        let dir = tempfile::tempdir().unwrap();
+-        let missing = dir.path().join("missing");
+-        assert!(!path_exists(&missing, true));
+-        assert!(!path_exists(&missing, false));
+-    }
+-
+-    #[test]
+-    fn path_exists_broken_symlink() {
+-        let dir = tempfile::tempdir().unwrap();
+-        let link = dir.path().join("dangling");
+-        // creating a symlink on Windows requires privileges that CI may lack; skip the
+-        // check gracefully when it isn't available rather than failing the test
+-        if make_symlink(&dir.path().join("nonexistent-target"), &link).is_err() {
+-            return;
+-        }
+-        // following the link resolves to the missing target -> non-existent
+-        assert!(!path_exists(&link, true));
+-        // not following the link checks the link itself, which exists
+-        assert!(path_exists(&link, false));
+-    }
+-}
+diff --git a/src/testing/commandline/main.rs b/src/testing/commandline/main.rs
+deleted file mode 100644
+index 428e42f..0000000
+--- a/src/testing/commandline/main.rs
++++ /dev/null
+@@ -1,138 +0,0 @@
+-// Copyright 2017 Google Inc.
+-//
+-// Use of this source code is governed by a MIT-style
+-// license that can be found in the LICENSE file or at
+-// https://opensource.org/licenses/MIT.
+-
+-use std::env;
+-use std::fs::{self, File, OpenOptions};
+-use std::io::{stdin, stdout, Read, Write};
+-use std::path::PathBuf;
+-
+-fn usage() -> ! {
+-    println!("Simple command-line app just used for testing -exec flags!");
+-    std::process::exit(2);
+-}
+-
+-enum ExitWith {
+-    Failure,
+-    UrgentFailure,
+-    #[cfg(unix)]
+-    Signal,
+-}
+-
+-#[derive(Default)]
+-struct Config {
+-    exit_with: Option<ExitWith>,
+-    print_stdin: bool,
+-    no_print_cwd: bool,
+-    sort: bool,
+-    destination_dir: Option<String>,
+-}
+-
+-fn open_file(destination_dir: &str) -> File {
+-    let mut file_number = fs::read_dir(destination_dir)
+-        .expect("failed to read destination")
+-        .count();
+-
+-    loop {
+-        file_number += 1;
+-        let mut file_path: PathBuf = PathBuf::from(destination_dir);
+-        file_path.push(format!("{file_number}.txt"));
+-        if let Ok(f) = OpenOptions::new()
+-            .write(true)
+-            .create_new(true)
+-            .open(file_path)
+-        {
+-            return f;
+-        }
+-    }
+-}
+-
+-fn write_content(mut f: impl Write, config: &Config, args: &[String]) {
+-    if !config.no_print_cwd {
+-        writeln!(f, "cwd={}", env::current_dir().unwrap().to_string_lossy())
+-            .expect("failed to write to file");
+-    }
+-
+-    if config.print_stdin {
+-        let mut s = String::new();
+-        stdin()
+-            .read_to_string(&mut s)
+-            .expect("failed to read from stdin");
+-        writeln!(f, "stdin={}", s.trim()).expect("failed to write to file");
+-    }
+-
+-    writeln!(f, "args=").expect("failed to write to file");
+-
+-    // first two args are going to be the path to this executable and
+-    // the destination_dir we want to write to. Don't write either of those
+-    // as they'll be non-deterministic.
+-    for arg in &args[2..] {
+-        writeln!(f, "{arg}").expect("failed to write to file");
+-    }
+-}
+-
+-fn main() {
+-    let mut args = env::args().collect::<Vec<String>>();
+-    if args.len() < 2 || args[1] == "-h" || args[1] == "--help" {
+-        usage();
+-    }
+-    let mut config = Config {
+-        destination_dir: if args[1] == "-" {
+-            None
+-        } else {
+-            Some(args[1].clone())
+-        },
+-        ..Default::default()
+-    };
+-
+-    for arg in &args[2..] {
+-        if arg.starts_with("--") {
+-            match arg.as_ref() {
+-                "--exit_with_failure" => {
+-                    config.exit_with = Some(ExitWith::Failure);
+-                }
+-                "--exit_with_urgent_failure" => {
+-                    config.exit_with = Some(ExitWith::UrgentFailure);
+-                }
+-                #[cfg(unix)]
+-                "--exit_with_signal" => {
+-                    config.exit_with = Some(ExitWith::Signal);
+-                }
+-                "--no_print_cwd" => {
+-                    config.no_print_cwd = true;
+-                }
+-                "--print_stdin" => {
+-                    config.print_stdin = true;
+-                }
+-                "--sort" => {
+-                    config.sort = true;
+-                }
+-                _ => {
+-                    usage();
+-                }
+-            }
+-        }
+-    }
+-
+-    if config.sort {
+-        args[2..].sort();
+-    }
+-
+-    if let Some(destination_dir) = &config.destination_dir {
+-        write_content(open_file(destination_dir), &config, &args);
+-    } else {
+-        write_content(stdout(), &config, &args);
+-    }
+-
+-    match config.exit_with {
+-        None => std::process::exit(0),
+-        Some(ExitWith::Failure) => std::process::exit(2),
+-        Some(ExitWith::UrgentFailure) => std::process::exit(255),
+-        #[cfg(unix)]
+-        Some(ExitWith::Signal) => unsafe {
+-            uucore::libc::raise(uucore::libc::SIGINT);
+-        },
+-    }
+-}
+diff --git a/src/updatedb/main.rs b/src/updatedb/main.rs
+deleted file mode 100644
+index e96570a..0000000
+--- a/src/updatedb/main.rs
++++ /dev/null
+@@ -1,9 +0,0 @@
+-// Use of this source code is governed by a MIT-style
+-// license that can be found in the LICENSE file or at
+-// https://opensource.org/licenses/MIT.
+-
+-fn main() {
+-    let args = std::env::args().collect::<Vec<String>>();
+-    let strs: Vec<&str> = args.iter().map(std::convert::AsRef::as_ref).collect();
+-    std::process::exit(findutils::updatedb::updatedb_main(strs.as_slice()));
+-}
+diff --git a/src/updatedb/mod.rs b/src/updatedb/mod.rs
+deleted file mode 100644
+index 00dd5f4..0000000
+--- a/src/updatedb/mod.rs
++++ /dev/null
+@@ -1,378 +0,0 @@
+-// Use of this source code is governed by a MIT-style
+-// license that can be found in the LICENSE file or at
+-// https://opensource.org/licenses/MIT.
+-
+-use std::{
+-    cell::RefCell,
+-    fmt::Display,
+-    fs::OpenOptions,
+-    io::{stderr, BufRead, BufReader, BufWriter, Write},
+-    path::PathBuf,
+-    rc::Rc,
+-    str::FromStr,
+-    time::SystemTime,
+-};
+-
+-use clap::{crate_version, value_parser, Arg, ArgAction, ArgMatches, Command};
+-use uucore::error::{strip_errno, UResult, USimpleError};
+-
+-use crate::find::{find_main, Dependencies};
+-
+-// TODO: the `localuser` and `netuser` arguments are accepted but not yet honored; handling them
+-// will likely involve splitting the find logic into two calls.
+-pub struct Config {
+-    find_options: String,
+-    local_paths: Vec<PathBuf>,
+-    net_paths: Vec<String>,
+-    prune_paths: Vec<PathBuf>,
+-    prune_fs: Vec<String>,
+-    output: PathBuf,
+-    db_format: DbFormat,
+-}
+-
+-impl From<ArgMatches> for Config {
+-    fn from(value: ArgMatches) -> Self {
+-        Self {
+-            find_options: value
+-                .get_one::<String>("findoptions")
+-                .cloned()
+-                .unwrap_or_else(String::new),
+-            local_paths: value.get_one::<String>("localpaths").map_or_else(
+-                || vec![PathBuf::from("/")],
+-                |s| {
+-                    s.split_whitespace()
+-                        .filter_map(|s| PathBuf::from_str(s).ok())
+-                        .collect()
+-                },
+-            ),
+-            net_paths: value
+-                .get_one::<String>("netpaths")
+-                .map(|s| {
+-                    s.split_whitespace()
+-                        .map(std::borrow::ToOwned::to_owned)
+-                        .collect()
+-                })
+-                .unwrap_or_default(),
+-            prune_paths: value.get_one::<String>("prunepaths").map_or_else(
+-                || {
+-                    ["/tmp", "/usr/tmp", "/var/tmp", "/afs"]
+-                        .into_iter()
+-                        .map(PathBuf::from)
+-                        .collect()
+-                },
+-                |s| s.split_whitespace().map(PathBuf::from).collect(),
+-            ),
+-            prune_fs: value.get_one::<String>("prunefs").map_or_else(
+-                || {
+-                    ["nfs", "NFS", "proc"]
+-                        .into_iter()
+-                        .map(str::to_string)
+-                        .collect()
+-                },
+-                |s| {
+-                    s.split_whitespace()
+-                        .map(std::borrow::ToOwned::to_owned)
+-                        .collect()
+-                },
+-            ),
+-            db_format: value
+-                .get_one::<DbFormat>("dbformat")
+-                .copied()
+-                .unwrap_or_default(),
+-            output: value
+-                .get_one::<PathBuf>("output")
+-                .cloned()
+-                // FIXME: the default should be platform-dependent
+-                .unwrap_or_else(|| PathBuf::from("/usr/local/var/locatedb")),
+-        }
+-    }
+-}
+-
+-#[derive(Debug, Clone, Copy, Default)]
+-pub enum DbFormat {
+-    #[default]
+-    Locate02,
+-}
+-
+-// used for locate's --statistics
+-impl Display for DbFormat {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        match self {
+-            Self::Locate02 => f.write_str("GNU LOCATE02"),
+-        }
+-    }
+-}
+-
+-fn uu_app() -> Command {
+-    Command::new("updatedb")
+-        .version(crate_version!())
+-        .arg(
+-            Arg::new("findoptions")
+-                .long("findoptions")
+-                .require_equals(true)
+-                .env("FINDOPTIONS")
+-                .action(ArgAction::Append),
+-        )
+-        .arg(
+-            Arg::new("localpaths")
+-                .long("localpaths")
+-                .require_equals(true)
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("netpaths")
+-                .long("netpaths")
+-                .require_equals(true)
+-                .env("NETPATHS")
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("prunepaths")
+-                .long("prunepaths")
+-                .require_equals(true)
+-                .env("PRUNEPATHS")
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("prunefs")
+-                .long("prunefs")
+-                .require_equals(true)
+-                .env("PRUNEFS")
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("output")
+-                .long("output")
+-                .require_equals(true)
+-                .value_parser(value_parser!(PathBuf))
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("localuser")
+-                .long("localuser")
+-                .require_equals(true)
+-                .env("LOCALUSER")
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("netuser")
+-                .long("netuser")
+-                .require_equals(true)
+-                .env("NETUSER")
+-                .action(ArgAction::Set),
+-        )
+-        .arg(
+-            Arg::new("dbformat")
+-                .long("dbformat")
+-                .require_equals(true)
+-                .value_parser(["LOCATE02"])
+-                .action(ArgAction::Set),
+-        )
+-}
+-
+-// The LOCATE02 format elides bytes from the path until the first byte that differs from the
+-// previous entry. It keeps a running total of the prefix length, and uses 1 or 3 bytes to write
+-// the difference from the previous prefix length. Paths are provided in sorted order by find.
+-struct Frcoder<'a> {
+-    reader: BufReader<&'a [u8]>,
+-    prev: Option<Vec<u8>>,
+-    prefix: usize,
+-    ty: DbFormat,
+-}
+-
+-impl<'a> Frcoder<'a> {
+-    fn new(v: &'a [u8], ty: DbFormat) -> Self {
+-        Self {
+-            reader: BufReader::new(v),
+-            prev: None,
+-            prefix: 0,
+-            ty,
+-        }
+-    }
+-
+-    fn generate_header(&self) -> Vec<u8> {
+-        match self.ty {
+-            DbFormat::Locate02 => "\0LOCATE02\0".as_bytes().to_vec(),
+-        }
+-    }
+-}
+-
+-impl Iterator for Frcoder<'_> {
+-    type Item = Vec<u8>;
+-
+-    fn next(&mut self) -> Option<Self::Item> {
+-        let mut path = Vec::new();
+-        // find prints nul bytes after each path
+-        if self.reader.read_until(b'\0', &mut path).ok()? == 0 {
+-            return None;
+-        }
+-
+-        let prefix = path
+-            .iter()
+-            .zip(self.prev.as_deref().unwrap_or_default())
+-            .take_while(|(a, b)| a == b)
+-            .count();
+-
+-        let diff = prefix as i32 - self.prefix as i32;
+-
+-        // if the prefix delta exceeds 0x7f, we use 0x80 to signal that the next two bytes comprise
+-        // the delta
+-        let mut out = Vec::new();
+-        if diff.abs() > 0x7f {
+-            out.push(0x80);
+-            out.extend((diff as i16).to_be_bytes());
+-        } else {
+-            out.push(diff as u8);
+-        }
+-
+-        out.extend(path.iter().skip(prefix));
+-
+-        self.prefix = prefix;
+-        self.prev = Some(path);
+-
+-        Some(out)
+-    }
+-}
+-
+-// capture find's stdout
+-struct CapturedDependencies {
+-    output: Rc<RefCell<dyn Write>>,
+-    now: SystemTime,
+-}
+-
+-impl CapturedDependencies {
+-    fn new(output: Rc<RefCell<dyn Write>>) -> Self {
+-        Self {
+-            output,
+-            now: SystemTime::now(),
+-        }
+-    }
+-}
+-
+-impl Dependencies for CapturedDependencies {
+-    fn get_output(&self) -> &RefCell<dyn Write> {
+-        self.output.as_ref()
+-    }
+-
+-    fn now(&self) -> SystemTime {
+-        self.now
+-    }
+-
+-    fn confirm(&self, _prompt: &str) -> bool {
+-        // updatedb runs non-interactively; there is nothing to confirm.
+-        false
+-    }
+-}
+-
+-fn do_updatedb(args: &[&str]) -> UResult<()> {
+-    let matches = uu_app().try_get_matches_from(args)?;
+-    let config = Config::from(matches);
+-
+-    // offload most of the logic to find. Build the argument list as discrete tokens rather than
+-    // a single string so that paths and options aren't re-split on whitespace and so that an empty
+-    // `prunefs`/`prunepaths` can't produce an invalid expression (e.g. an empty `( )` group).
+-    let mut tokens: Vec<String> = Vec::new();
+-    tokens.extend(
+-        config
+-            .local_paths
+-            .iter()
+-            .filter_map(|p| p.to_str())
+-            .map(String::from),
+-    );
+-    tokens.extend(config.net_paths.iter().cloned());
+-    // FINDOPTIONS is a single string of options, split on whitespace as GNU updatedb does
+-    tokens.extend(config.find_options.split_whitespace().map(String::from));
+-
+-    // Each clause prunes a subtree (by filesystem type or by path); the final clause prints the
+-    // entry. Clauses are OR-ed together so a path that matches no prune clause gets printed.
+-    let mut clauses: Vec<Vec<String>> = Vec::new();
+-    if !config.prune_fs.is_empty() {
+-        let mut clause = vec![String::from("(")];
+-        for (i, fs) in config.prune_fs.iter().enumerate() {
+-            if i > 0 {
+-                clause.push(String::from("-or"));
+-            }
+-            clause.push(String::from("-fstype"));
+-            clause.push(fs.clone());
+-        }
+-        clause.push(String::from(")"));
+-        clause.push(String::from("-prune"));
+-        clauses.push(clause);
+-    }
+-    for path in config.prune_paths.iter().filter_map(|p| p.to_str()) {
+-        clauses.push(vec![
+-            String::from("-regex"),
+-            path.to_string(),
+-            String::from("-prune"),
+-        ]);
+-    }
+-    clauses.push(vec![String::from("-print0")]);
+-
+-    for (i, clause) in clauses.into_iter().enumerate() {
+-        if i > 0 {
+-            tokens.push(String::from("-or"));
+-        }
+-        tokens.extend(clause);
+-    }
+-    tokens.push(String::from("-sorted"));
+-
+-    let mut find_args = vec!["find"];
+-    find_args.extend(tokens.iter().map(String::as_str));
+-
+-    let output = Rc::new(RefCell::new(Vec::new()));
+-    let deps = CapturedDependencies::new(output.clone());
+-    find_main(find_args.as_slice(), &deps);
+-
+-    let output_path = config.output;
+-    let file = OpenOptions::new()
+-        .write(true)
+-        .truncate(true)
+-        .create(true)
+-        .open(&output_path)
+-        .map_err(|e| {
+-            USimpleError::new(
+-                1,
+-                format!(
+-                    "cannot create '{}': {}",
+-                    output_path.display(),
+-                    strip_errno(&e)
+-                ),
+-            )
+-        })?;
+-    let mut writer = BufWriter::new(file);
+-
+-    // strip the trailing "(os error N)" so write failures read like the create error above
+-    let write_err = |e: std::io::Error| {
+-        USimpleError::new(
+-            1,
+-            format!(
+-                "error writing '{}': {}",
+-                output_path.display(),
+-                strip_errno(&e)
+-            ),
+-        )
+-    };
+-
+-    let output = output.borrow();
+-    let frcoder = Frcoder::new(output.as_slice(), config.db_format);
+-    writer
+-        .write_all(&frcoder.generate_header())
+-        .map_err(&write_err)?;
+-    for v in frcoder {
+-        writer.write_all(v.as_slice()).map_err(&write_err)?;
+-    }
+-
+-    writer.flush().map_err(&write_err)?;
+-
+-    Ok(())
+-}
+-
+-pub fn updatedb_main(args: &[&str]) -> i32 {
+-    match do_updatedb(args) {
+-        Ok(()) => 0,
+-        Err(e) => {
+-            let _ = writeln!(&mut stderr(), "Error: {e}");
+-            1
+-        }
+-    }
+-}
+diff --git a/src/xargs/main.rs b/src/xargs/main.rs
+deleted file mode 100644
+index 061ac21..0000000
+--- a/src/xargs/main.rs
++++ /dev/null
+@@ -1,15 +0,0 @@
+-// Copyright 2021 Collabora, Ltd.
+-//
+-// Use of this source code is governed by a MIT-style
+-// license that can be found in the LICENSE file or at
+-// https://opensource.org/licenses/MIT.
+-
+-fn main() {
+-    let args = std::env::args().collect::<Vec<String>>();
+-    std::process::exit(findutils::xargs::xargs_main(
+-        &args
+-            .iter()
+-            .map(std::convert::AsRef::as_ref)
+-            .collect::<Vec<&str>>(),
+-    ))
+-}
+diff --git a/src/xargs/mod.rs b/src/xargs/mod.rs
+deleted file mode 100644
+index 9679a05..0000000
+--- a/src/xargs/mod.rs
++++ /dev/null
+@@ -1,1492 +0,0 @@
+-// Copyright 2021 Collabora, Ltd.
+-//
+-// Use of this source code is governed by a MIT-style
+-// license that can be found in the LICENSE file or at
+-// https://opensource.org/licenses/MIT.
+-
+-use std::{
+-    collections::HashMap,
+-    error::Error,
+-    ffi::{OsStr, OsString},
+-    fmt::Display,
+-    fs,
+-    io::{self, BufRead, BufReader, Read},
+-    process::{Command, Stdio},
+-};
+-
+-use clap::{crate_version, error::ErrorKind, Arg, ArgAction};
+-
+-mod options {
+-    pub const COMMAND: &str = "COMMAND";
+-
+-    pub const ARG_FILE: &str = "arg-file";
+-    pub const DELIMITER: &str = "delimiter";
+-    pub const EOF: &str = "eof";
+-    pub const EOF_E: &str = "eof-E";
+-    pub const EXIT: &str = "exit";
+-    pub const MAX_ARGS: &str = "max-args";
+-    pub const MAX_CHARS: &str = "max-chars";
+-    pub const MAX_LINES: &str = "max-lines";
+-    pub const MAX_LINES_L: &str = "max-lines-l";
+-    pub const MAX_PROCS: &str = "max-procs";
+-    pub const NO_RUN_IF_EMPTY: &str = "no-run-if-empty";
+-    pub const NULL: &str = "null";
+-    pub const REPLACE: &str = "replace";
+-    pub const REPLACE_I: &str = "replace-I";
+-    pub const VERBOSE: &str = "verbose";
+-}
+-
+-struct Options {
+-    arg_file: Option<String>,
+-    delimiter: Option<u8>,
+-    exit_if_pass_char_limit: bool,
+-    max_args: Option<usize>,
+-    max_chars: Option<usize>,
+-    max_lines: Option<usize>,
+-    no_run_if_empty: bool,
+-    null: bool,
+-    replace: Option<String>,
+-    verbose: bool,
+-    eof_delimiter: Option<String>,
+-}
+-
+-#[derive(Debug, PartialEq, Eq)]
+-enum ArgumentKind {
+-    /// An argument provided as part of the initial command line.
+-    Initial,
+-    /// An argument that was terminated by a newline or custom delimiter.
+-    HardTerminated,
+-    /// An argument that was terminated by non-newline whitespace.
+-    SoftTerminated,
+-}
+-
+-#[derive(Debug, PartialEq, Eq)]
+-struct Argument {
+-    arg: OsString,
+-    kind: ArgumentKind,
+-}
+-
+-struct ExhaustedCommandSpace {
+-    arg: Argument,
+-    out_of_chars: bool,
+-}
+-
+-/// A "limiter" to constrain the size of a single command line. Given a cursor
+-/// pointing to the next limiter that should be tried.
+-trait CommandSizeLimiter {
+-    fn try_arg(
+-        &mut self,
+-        arg: Argument,
+-        cursor: LimiterCursor<'_>,
+-    ) -> Result<Argument, ExhaustedCommandSpace>;
+-    fn dyn_clone(&self) -> Box<dyn CommandSizeLimiter>;
+-}
+-
+-/// A pointer to the next limiter. A limiter should *always* call the cursor's
+-/// `try_next` *before* updating its own state, to ensure that all other limiters
+-/// are okay with the argument first.
+-struct LimiterCursor<'collection> {
+-    limiters: &'collection mut [Box<dyn CommandSizeLimiter>],
+-}
+-
+-impl LimiterCursor<'_> {
+-    fn try_next(self, arg: Argument) -> Result<Argument, ExhaustedCommandSpace> {
+-        if self.limiters.is_empty() {
+-            Ok(arg)
+-        } else {
+-            let (current, remaining) = self.limiters.split_at_mut(1);
+-            current[0].try_arg(
+-                arg,
+-                LimiterCursor {
+-                    limiters: remaining,
+-                },
+-            )
+-        }
+-    }
+-}
+-
+-struct LimiterCollection {
+-    limiters: Vec<Box<dyn CommandSizeLimiter>>,
+-}
+-
+-impl LimiterCollection {
+-    fn new() -> Self {
+-        Self { limiters: vec![] }
+-    }
+-
+-    fn add(&mut self, limiter: impl CommandSizeLimiter + 'static) {
+-        self.limiters.push(Box::new(limiter));
+-    }
+-
+-    fn try_arg(&mut self, arg: Argument) -> Result<Argument, ExhaustedCommandSpace> {
+-        let cursor = LimiterCursor {
+-            limiters: &mut self.limiters[..],
+-        };
+-        cursor.try_next(arg)
+-    }
+-}
+-
+-impl Clone for LimiterCollection {
+-    fn clone(&self) -> Self {
+-        Self {
+-            limiters: self
+-                .limiters
+-                .iter()
+-                .map(|limiter| limiter.dyn_clone())
+-                .collect(),
+-        }
+-    }
+-}
+-
+-#[cfg(windows)]
+-fn count_osstr_chars_for_exec(s: &OsStr) -> usize {
+-    use std::os::windows::ffi::OsStrExt;
+-    // Include +1 for either the null terminator or trailing space.
+-    s.encode_wide().count() + 1
+-}
+-
+-#[cfg(unix)]
+-fn count_osstr_chars_for_exec(s: &OsStr) -> usize {
+-    use std::os::unix::ffi::OsStrExt;
+-    // Include +1 for the null terminator.
+-    s.as_bytes().len() + 1
+-}
+-
+-#[cfg(not(any(unix, windows)))]
+-fn count_osstr_chars_for_exec(s: &OsStr) -> usize {
+-    // Include +1 for the null terminator.
+-    s.as_encoded_bytes().len() + 1
+-}
+-
+-#[derive(Clone)]
+-struct MaxCharsCommandSizeLimiter {
+-    current_size: usize,
+-    max_chars: usize,
+-}
+-
+-impl MaxCharsCommandSizeLimiter {
+-    fn new(max_chars: usize) -> Self {
+-        Self {
+-            current_size: 0,
+-            max_chars,
+-        }
+-    }
+-
+-    #[cfg(windows)]
+-    fn new_system(_env: &HashMap<OsString, OsString>) -> MaxCharsCommandSizeLimiter {
+-        // Taken from the CreateProcess docs.
+-        const MAX_CMDLINE: usize = 32767;
+-        MaxCharsCommandSizeLimiter::new(MAX_CMDLINE)
+-    }
+-
+-    #[cfg(unix)]
+-    fn new_system(env: &HashMap<OsString, OsString>) -> Self {
+-        // POSIX requires that we leave 2048 bytes of space so that the child processes
+-        // can have room to set their own environment variables.
+-        const ARG_HEADROOM: usize = 2048;
+-        let arg_max = unsafe { uucore::libc::sysconf(uucore::libc::_SC_ARG_MAX) } as usize;
+-
+-        let env_size: usize = env
+-            .iter()
+-            .map(|(var, value)| count_osstr_chars_for_exec(var) + count_osstr_chars_for_exec(value))
+-            .sum();
+-
+-        Self::new(arg_max - ARG_HEADROOM - env_size)
+-    }
+-
+-    #[cfg(not(any(unix, windows)))]
+-    fn new_system(_env: &HashMap<OsString, OsString>) -> Self {
+-        // No portable way to query the system limit; fall back to the POSIX
+-        // minimum guaranteed value for _POSIX_ARG_MAX.
+-        const POSIX_ARG_MAX: usize = 4096;
+-        Self::new(POSIX_ARG_MAX)
+-    }
+-}
+-
+-impl CommandSizeLimiter for MaxCharsCommandSizeLimiter {
+-    fn try_arg(
+-        &mut self,
+-        arg: Argument,
+-        cursor: LimiterCursor<'_>,
+-    ) -> Result<Argument, ExhaustedCommandSpace> {
+-        let chars = count_osstr_chars_for_exec(&arg.arg);
+-        if self.current_size + chars <= self.max_chars {
+-            let arg = cursor.try_next(arg)?;
+-            self.current_size += chars;
+-            Ok(arg)
+-        } else {
+-            Err(ExhaustedCommandSpace {
+-                arg,
+-                out_of_chars: true,
+-            })
+-        }
+-    }
+-
+-    fn dyn_clone(&self) -> Box<dyn CommandSizeLimiter> {
+-        Box::new(self.clone())
+-    }
+-}
+-
+-#[derive(Clone)]
+-struct MaxArgsCommandSizeLimiter {
+-    current_args: usize,
+-    max_args: usize,
+-}
+-
+-impl MaxArgsCommandSizeLimiter {
+-    fn new(max_args: usize) -> Self {
+-        Self {
+-            current_args: 0,
+-            max_args,
+-        }
+-    }
+-}
+-
+-impl CommandSizeLimiter for MaxArgsCommandSizeLimiter {
+-    fn try_arg(
+-        &mut self,
+-        arg: Argument,
+-        cursor: LimiterCursor<'_>,
+-    ) -> Result<Argument, ExhaustedCommandSpace> {
+-        if self.current_args < self.max_args {
+-            let arg = cursor.try_next(arg)?;
+-            if arg.kind != ArgumentKind::Initial {
+-                self.current_args += 1;
+-            }
+-            Ok(arg)
+-        } else {
+-            Err(ExhaustedCommandSpace {
+-                arg,
+-                out_of_chars: false,
+-            })
+-        }
+-    }
+-
+-    fn dyn_clone(&self) -> Box<dyn CommandSizeLimiter> {
+-        Box::new(self.clone())
+-    }
+-}
+-
+-#[derive(Clone)]
+-struct MaxLinesCommandSizeLimiter {
+-    current_line: usize,
+-    max_lines: usize,
+-}
+-
+-impl MaxLinesCommandSizeLimiter {
+-    fn new(max_lines: usize) -> Self {
+-        Self {
+-            current_line: 1,
+-            max_lines,
+-        }
+-    }
+-}
+-
+-impl CommandSizeLimiter for MaxLinesCommandSizeLimiter {
+-    fn try_arg(
+-        &mut self,
+-        arg: Argument,
+-        cursor: LimiterCursor<'_>,
+-    ) -> Result<Argument, ExhaustedCommandSpace> {
+-        if self.current_line <= self.max_lines {
+-            let arg = cursor.try_next(arg)?;
+-            // The name of this limiter is a bit of a lie: although this limits
+-            // by max "lines", if a custom delimiter is used, xargs uses that
+-            // instead. So, this actually limits based on the max amount of hard
+-            // terminations.
+-            if arg.kind == ArgumentKind::HardTerminated {
+-                self.current_line += 1;
+-            }
+-            Ok(arg)
+-        } else {
+-            Err(ExhaustedCommandSpace {
+-                arg,
+-                out_of_chars: false,
+-            })
+-        }
+-    }
+-
+-    fn dyn_clone(&self) -> Box<dyn CommandSizeLimiter> {
+-        Box::new(self.clone())
+-    }
+-}
+-
+-enum CommandResult {
+-    Success,
+-    Failure,
+-}
+-
+-impl CommandResult {
+-    fn combine(&mut self, other: Self) {
+-        if matches!(*self, Self::Success) {
+-            *self = other;
+-        }
+-    }
+-}
+-
+-#[allow(dead_code)] // `Killed` variant is never constructed on Windows
+-#[derive(Debug)]
+-enum CommandExecutionError {
+-    // exit code 255
+-    UrgentlyFailed,
+-    Killed { signal: i32 },
+-    CannotRun(io::Error),
+-    NotFound,
+-    Unknown,
+-}
+-
+-impl Display for CommandExecutionError {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        match self {
+-            Self::UrgentlyFailed => write!(f, "Command exited with code 255"),
+-            Self::Killed { signal } => {
+-                write!(f, "Command was killed with signal {signal}")
+-            }
+-            Self::CannotRun(err) => write!(f, "Command could not be run: {err}"),
+-            Self::NotFound => write!(f, "Command not found"),
+-            Self::Unknown => write!(f, "Unknown error running command"),
+-        }
+-    }
+-}
+-
+-impl Error for CommandExecutionError {}
+-
+-enum ExecAction {
+-    Command(Vec<OsString>),
+-    Echo,
+-}
+-
+-struct CommandBuilderOptions {
+-    action: ExecAction,
+-    env: HashMap<OsString, OsString>,
+-    limiters: LimiterCollection,
+-    verbose: bool,
+-    close_stdin: bool,
+-    replace: Option<String>,
+-}
+-impl CommandBuilderOptions {
+-    fn new(
+-        action: ExecAction,
+-        env: HashMap<OsString, OsString>,
+-        mut limiters: LimiterCollection,
+-        replace: Option<String>,
+-    ) -> Result<Self, ExhaustedCommandSpace> {
+-        let initial_args = match &action {
+-            ExecAction::Command(args) => args.iter().map(std::convert::AsRef::as_ref).collect(),
+-            ExecAction::Echo => vec![OsStr::new("echo")],
+-        };
+-
+-        for arg in initial_args {
+-            limiters.try_arg(Argument {
+-                arg: arg.to_owned(),
+-                kind: ArgumentKind::Initial,
+-            })?;
+-        }
+-
+-        Ok(Self {
+-            action,
+-            env,
+-            limiters,
+-            verbose: false,
+-            close_stdin: false,
+-            replace,
+-        })
+-    }
+-}
+-
+-struct CommandBuilder<'options> {
+-    options: &'options CommandBuilderOptions,
+-    extra_args: Vec<OsString>,
+-    limiters: LimiterCollection,
+-}
+-
+-impl CommandBuilder<'_> {
+-    fn new(options: &CommandBuilderOptions) -> CommandBuilder<'_> {
+-        CommandBuilder {
+-            options,
+-            extra_args: vec![],
+-            limiters: options.limiters.clone(),
+-        }
+-    }
+-
+-    fn add_arg(&mut self, arg: Argument) -> Result<(), ExhaustedCommandSpace> {
+-        let arg = self.limiters.try_arg(arg)?;
+-        self.extra_args.push(arg.arg);
+-        Ok(())
+-    }
+-
+-    fn execute(self) -> Result<CommandResult, CommandExecutionError> {
+-        let (entry_point, initial_args): (&OsStr, &[OsString]) = match &self.options.action {
+-            ExecAction::Command(args) => (&args[0], &args[1..]),
+-            ExecAction::Echo => (OsStr::new("echo"), &[]),
+-        };
+-
+-        let mut command = Command::new(entry_point);
+-
+-        if let Some(replace_str) = &self.options.replace {
+-            // Replace all occurrences in initial args with the extra arg,
+-            // Thanks to `MaxArgsCommandSizeLimiter`, we only process a single extra arg here.
+-            let replacement = self.extra_args[0].to_string_lossy();
+-            let initial_args: Vec<OsString> = initial_args
+-                .iter()
+-                .map(|arg| {
+-                    let arg_str = arg.to_string_lossy();
+-                    OsString::from(arg_str.replace(replace_str, &replacement))
+-                })
+-                .collect();
+-
+-            command
+-                .args(&initial_args)
+-                .env_clear()
+-                .envs(&self.options.env);
+-        } else {
+-            // don't do any replacement
+-            command
+-                .args(initial_args)
+-                .args(&self.extra_args)
+-                .env_clear()
+-                .envs(&self.options.env);
+-        }
+-
+-        if self.options.close_stdin {
+-            command.stdin(Stdio::null());
+-        }
+-
+-        if self.options.verbose {
+-            eprintln!("{command:?}");
+-        }
+-
+-        match &self.options.action {
+-            ExecAction::Command(_) => match command.status() {
+-                Ok(status) => {
+-                    if status.success() {
+-                        Ok(CommandResult::Success)
+-                    } else if let Some(err) = status.code() {
+-                        if err == 255 {
+-                            Err(CommandExecutionError::UrgentlyFailed)
+-                        } else {
+-                            Ok(CommandResult::Failure)
+-                        }
+-                    } else {
+-                        #[cfg(unix)]
+-                        {
+-                            use std::os::unix::process::ExitStatusExt;
+-                            if let Some(signal) = status.signal() {
+-                                Err(CommandExecutionError::Killed { signal })
+-                            } else {
+-                                Err(CommandExecutionError::Unknown)
+-                            }
+-                        }
+-
+-                        #[cfg(not(unix))]
+-                        Err(CommandExecutionError::Unknown)
+-                    }
+-                }
+-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+-                    Err(CommandExecutionError::NotFound)
+-                }
+-                Err(e) => Err(CommandExecutionError::CannotRun(e)),
+-            },
+-            ExecAction::Echo => {
+-                println!(
+-                    "{}",
+-                    self.extra_args
+-                        .iter()
+-                        .map(|arg| arg.to_string_lossy())
+-                        .collect::<Vec<_>>()
+-                        .join(" ")
+-                );
+-                Ok(CommandResult::Success)
+-            }
+-        }
+-    }
+-}
+-
+-trait ArgumentReader {
+-    fn next(&mut self) -> io::Result<Option<Argument>>;
+-}
+-
+-struct WhitespaceDelimitedArgumentReader<R: Read> {
+-    rd: R,
+-    pending: Vec<u8>,
+-}
+-
+-impl<R> WhitespaceDelimitedArgumentReader<R>
+-where
+-    R: Read,
+-{
+-    fn new(rd: R) -> Self {
+-        Self {
+-            rd,
+-            pending: vec![],
+-        }
+-    }
+-}
+-
+-impl<R> ArgumentReader for WhitespaceDelimitedArgumentReader<R>
+-where
+-    R: Read,
+-{
+-    fn next(&mut self) -> io::Result<Option<Argument>> {
+-        enum Escape {
+-            Slash,
+-            Quote(u8),
+-        }
+-
+-        let mut result = vec![];
+-        let mut terminated_by_newline = false;
+-
+-        let mut pending = vec![];
+-        std::mem::swap(&mut pending, &mut self.pending);
+-
+-        let mut escape: Option<Escape> = None;
+-        let mut i = 0;
+-        loop {
+-            if i == pending.len() {
+-                pending.resize(4096, 0);
+-                // Already hit the end of our buffer, so read in some more data.
+-                let bytes_read = loop {
+-                    match self.rd.read(&mut pending[..]) {
+-                        Ok(bytes_read) => break bytes_read,
+-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+-                        Err(e) => return Err(e),
+-                    }
+-                };
+-
+-                if bytes_read == 0 {
+-                    if let Some(Escape::Quote(q)) = &escape {
+-                        return Err(io::Error::new(
+-                            io::ErrorKind::InvalidInput,
+-                            format!("Unterminated quote: {q}"),
+-                        ));
+-                    }
+-                    if i == 0 {
+-                        return Ok(None);
+-                    }
+-                    pending.clear();
+-                    break;
+-                }
+-
+-                pending.resize(bytes_read, 0);
+-                i = 0;
+-            }
+-
+-            match (&escape, pending[i]) {
+-                (Some(Escape::Quote(quote)), c) if c == *quote => escape = None,
+-                (Some(Escape::Quote(_)), c) => result.push(c),
+-                (Some(Escape::Slash), c) => {
+-                    result.push(c);
+-                    escape = None;
+-                }
+-                (None, c @ (b'"' | b'\'')) => escape = Some(Escape::Quote(c)),
+-                (None, b'\\') => escape = Some(Escape::Slash),
+-                (None, c) if c.is_ascii_whitespace() => {
+-                    if !result.is_empty() {
+-                        terminated_by_newline = c == b'\n';
+-                        break;
+-                    }
+-                }
+-                (None, c) => result.push(c),
+-            }
+-
+-            i += 1;
+-        }
+-
+-        if i < pending.len() {
+-            self.pending = pending.split_off(i + 1);
+-        }
+-
+-        Ok(Some(Argument {
+-            arg: String::from_utf8_lossy(&result[..]).into_owned().into(),
+-            kind: if terminated_by_newline {
+-                ArgumentKind::HardTerminated
+-            } else {
+-                ArgumentKind::SoftTerminated
+-            },
+-        }))
+-    }
+-}
+-
+-struct ByteDelimitedArgumentReader<R: Read> {
+-    rd: BufReader<R>,
+-    delimiter: u8,
+-}
+-
+-impl<R> ByteDelimitedArgumentReader<R>
+-where
+-    R: Read,
+-{
+-    fn new(rd: R, delimiter: u8) -> Self {
+-        Self {
+-            rd: BufReader::new(rd),
+-            delimiter,
+-        }
+-    }
+-}
+-
+-impl<R> ArgumentReader for ByteDelimitedArgumentReader<R>
+-where
+-    R: Read,
+-{
+-    fn next(&mut self) -> io::Result<Option<Argument>> {
+-        Ok(loop {
+-            let mut buf = vec![];
+-            let bytes_read = self.rd.read_until(self.delimiter, &mut buf)?;
+-            if bytes_read > 0 {
+-                let need_to_trim_delimiter = buf[buf.len() - 1] == self.delimiter;
+-                let bytes = if need_to_trim_delimiter {
+-                    if buf.len() == 1 {
+-                        // This was *only* a delimiter, so we didn't actually
+-                        // read anything interesting. Try again.
+-                        continue;
+-                    }
+-
+-                    &buf[..buf.len() - 1]
+-                } else {
+-                    &buf[..]
+-                };
+-                break Some(Argument {
+-                    arg: String::from_utf8_lossy(bytes).into_owned().into(),
+-                    kind: ArgumentKind::HardTerminated,
+-                });
+-            }
+-            break None;
+-        })
+-    }
+-}
+-
+-struct EofArgumentReader {
+-    reader: Box<dyn ArgumentReader>,
+-    eof_delimiter: OsString,
+-    eof_found: bool,
+-}
+-
+-impl EofArgumentReader {
+-    fn new(reader: Box<dyn ArgumentReader>, eof_delimiter: &String) -> Self {
+-        Self {
+-            reader,
+-            eof_delimiter: eof_delimiter.into(),
+-            eof_found: false,
+-        }
+-    }
+-}
+-
+-impl ArgumentReader for EofArgumentReader {
+-    fn next(&mut self) -> io::Result<Option<Argument>> {
+-        Ok(if self.eof_found {
+-            None
+-        } else {
+-            self.reader.next()?.and_then(|arg| {
+-                if arg.arg == self.eof_delimiter {
+-                    self.eof_found = true;
+-                    None
+-                } else {
+-                    Some(arg)
+-                }
+-            })
+-        })
+-    }
+-}
+-
+-#[derive(Debug)]
+-enum XargsError {
+-    ArgumentTooLarge,
+-    CommandExecution(CommandExecutionError),
+-    Io(io::Error),
+-    Untyped(String),
+-}
+-
+-impl Display for XargsError {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        match self {
+-            Self::ArgumentTooLarge => write!(f, "Argument too large"),
+-            Self::CommandExecution(e) => write!(f, "{e}"),
+-            Self::Io(e) => write!(f, "{e}"),
+-            Self::Untyped(s) => write!(f, "{s}"),
+-        }
+-    }
+-}
+-
+-impl Error for XargsError {}
+-
+-impl From<String> for XargsError {
+-    fn from(s: String) -> Self {
+-        Self::Untyped(s)
+-    }
+-}
+-
+-impl From<&'_ str> for XargsError {
+-    fn from(s: &'_ str) -> Self {
+-        s.to_owned().into()
+-    }
+-}
+-
+-impl From<CommandExecutionError> for XargsError {
+-    fn from(e: CommandExecutionError) -> Self {
+-        Self::CommandExecution(e)
+-    }
+-}
+-
+-impl From<io::Error> for XargsError {
+-    fn from(e: io::Error) -> Self {
+-        Self::Io(e)
+-    }
+-}
+-
+-struct InputProcessOptions {
+-    exit_if_pass_char_limit: bool,
+-    max_args: Option<usize>,
+-    max_lines: Option<usize>,
+-    no_run_if_empty: bool,
+-}
+-
+-impl InputProcessOptions {
+-    fn new(
+-        exit_if_pass_char_limit: bool,
+-        max_args: Option<usize>,
+-        max_lines: Option<usize>,
+-        no_run_if_empty: bool,
+-    ) -> Self {
+-        Self {
+-            exit_if_pass_char_limit,
+-            max_args,
+-            max_lines,
+-            no_run_if_empty,
+-        }
+-    }
+-}
+-
+-fn process_input(
+-    builder_options: &CommandBuilderOptions,
+-    mut args: Box<dyn ArgumentReader>,
+-    options: &InputProcessOptions,
+-) -> Result<CommandResult, XargsError> {
+-    let mut current_builder = CommandBuilder::new(builder_options);
+-    let mut have_pending_command = false;
+-    let mut result = CommandResult::Success;
+-
+-    while let Some(arg) = args.next()? {
+-        if let Err(ExhaustedCommandSpace { arg, out_of_chars }) = current_builder.add_arg(arg) {
+-            if out_of_chars
+-                && options.exit_if_pass_char_limit
+-                && (options.max_args.is_some() || options.max_lines.is_some())
+-            {
+-                return Err(XargsError::ArgumentTooLarge);
+-            }
+-            if have_pending_command {
+-                result.combine(current_builder.execute()?);
+-            }
+-
+-            current_builder = CommandBuilder::new(builder_options);
+-            if let Err(ExhaustedCommandSpace { .. }) = current_builder.add_arg(arg) {
+-                return Err(XargsError::ArgumentTooLarge);
+-            }
+-        }
+-
+-        have_pending_command = true;
+-    }
+-
+-    if !options.no_run_if_empty || have_pending_command {
+-        result.combine(current_builder.execute()?);
+-    }
+-
+-    Ok(result)
+-}
+-
+-fn parse_delimiter(s: &str) -> Result<u8, String> {
+-    match s.strip_prefix('\\') {
+-        Some(hex) if hex.starts_with('x') => {
+-            u8::from_str_radix(&hex[1..], 16).map_err(|e| format!("Invalid hex sequence: {e}"))
+-        }
+-        Some(oct) if oct.starts_with('0') => {
+-            u8::from_str_radix(&oct[1..], 8).map_err(|e| format!("Invalid octal sequence: {e}"))
+-        }
+-        Some(special) => match special {
+-            "a" => Ok(b'\x07'),
+-            "b" => Ok(b'\x08'),
+-            "f" => Ok(b'\x0C'),
+-            "n" => Ok(b'\n'),
+-            "r" => Ok(b'\r'),
+-            "t" => Ok(b'\t'),
+-            "v" => Ok(b'\x0B'),
+-            "\\" => Ok(b'\\'),
+-            "0" => Ok(b'\0'),
+-            _ => Err(format!("Invalid escape sequence: \\{special}")),
+-        },
+-        None if s.len() == 1 => Ok(s.as_bytes()[0]),
+-        None => Err("Delimiter must be one byte".to_owned()),
+-    }
+-}
+-
+-fn validate_positive_usize(s: &str) -> Result<usize, String> {
+-    match s.parse::<usize>() {
+-        Ok(v) if v > 0 => Ok(v),
+-        Ok(v) => Err(format!("Value must be > 0, not: {v}")),
+-        Err(e) => Err(e.to_string()),
+-    }
+-}
+-
+-fn normalize_options(options: Options, matches: &clap::ArgMatches) -> Options {
+-    let (max_args, max_lines, replace) =
+-        match (options.max_args, options.max_lines, &options.replace) {
+-            // These 3 options are mutually exclusive.
+-            // But `max_args=1` and `replace` do not actually conflict, so no warning.
+-            (None | Some(1), None, Some(_)) => {
+-                // If `replace`, all matches in initial args should be replaced with extra args read from stdin.
+-                // It is possible to have multiple matches and multiple extra args, and the Cartesian product is desired.
+-                // To be specific, we process extra args one by one, and replace all matches with the same extra arg in each time.
+-                (Some(1), None, options.replace)
+-            }
+-            (Some(_), None, None) | (None, Some(_), None) | (None, None, None) => {
+-                (options.max_args, options.max_lines, None)
+-            }
+-            _ => {
+-                eprintln!(
+-                "WARNING: -L, -n and -I/-i are mutually exclusive, but more than one were given; \
+-                only the last option will be used"
+-            );
+-                let lines_index = matches
+-                    .indices_of(options::MAX_LINES)
+-                    .and_then(|mut v| v.next_back());
+-                let args_index = matches
+-                    .indices_of(options::MAX_ARGS)
+-                    .and_then(|mut v| v.next_back());
+-                let replace_index = [options::REPLACE, options::REPLACE_I]
+-                    .iter()
+-                    .flat_map(|o| matches.indices_of(o).and_then(|mut v| v.next_back()))
+-                    .max();
+-                if lines_index > args_index && lines_index > replace_index {
+-                    (None, options.max_lines, None)
+-                } else if args_index > lines_index && args_index > replace_index {
+-                    (options.max_args, None, None)
+-                } else {
+-                    (Some(1), None, options.replace)
+-                }
+-            }
+-        };
+-
+-    let delimiter = match (options.delimiter, options.null) {
+-        (Some(delimiter), true) => {
+-            if matches.indices_of(options::NULL).unwrap().next_back()
+-                > matches.indices_of(options::DELIMITER).unwrap().next_back()
+-            {
+-                Some(b'\0')
+-            } else {
+-                Some(delimiter)
+-            }
+-        }
+-        (Some(delimiter), false) => Some(delimiter),
+-        (None, true) => Some(b'\0'),
+-        // If `replace` and no delimiter specified, each line of stdin turns into a line of stdout,
+-        // so the input should be split at newlines only.
+-        (None, false) => replace.as_ref().map(|_| b'\n'),
+-    };
+-
+-    let eof_delimiter = if delimiter.is_some() {
+-        None
+-    } else {
+-        options.eof_delimiter
+-    };
+-
+-    Options {
+-        arg_file: options.arg_file,
+-        delimiter,
+-        exit_if_pass_char_limit: options.exit_if_pass_char_limit,
+-        max_args,
+-        max_chars: options.max_chars,
+-        max_lines,
+-        no_run_if_empty: options.no_run_if_empty,
+-        null: options.null,
+-        replace,
+-        verbose: options.verbose,
+-        eof_delimiter,
+-    }
+-}
+-
+-fn do_xargs(args: &[&str]) -> Result<CommandResult, XargsError> {
+-    let matches = clap::Command::new("xargs")
+-        .version(crate_version!())
+-        .about("Run commands using arguments derived from standard input")
+-        .arg(
+-            Arg::new(options::COMMAND)
+-                .help("The command to run")
+-                .trailing_var_arg(true)
+-                .num_args(0..)
+-                .value_parser(clap::value_parser!(OsString)),
+-        )
+-        .arg(
+-            Arg::new(options::ARG_FILE)
+-                .short('a')
+-                .long(options::ARG_FILE)
+-                .help("Read arguments from the given file instead of stdin"),
+-        )
+-        .arg(
+-            Arg::new(options::DELIMITER)
+-                .short('d')
+-                .long(options::DELIMITER)
+-                .help("Use the given delimiter to split the input")
+-                .value_parser(parse_delimiter),
+-        )
+-        .arg(
+-            Arg::new(options::EXIT)
+-                .short('x')
+-                .long(options::EXIT)
+-                .help(
+-                    "Terminate if a constructed command line would exceed the size \
+-                    limit (see -s) rather than reducing the argument count",
+-                )
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new(options::MAX_ARGS)
+-                .short('n')
+-                .long(options::MAX_ARGS)
+-                .help(
+-                    "Set the max number of arguments read from stdin to be passed \
+-                    to each command invocation (mutually exclusive with -L and -I/-i)",
+-                )
+-                .value_parser(validate_positive_usize),
+-        )
+-        .arg(
+-            Arg::new(options::MAX_LINES)
+-                .short('L')
+-                .long(options::MAX_LINES)
+-                .help(
+-                    "Set the max number of lines from stdin to be passed to each \
+-                    command invocation (mutually exclusive with -n and -I/-i)",
+-                )
+-                .value_parser(validate_positive_usize),
+-        )
+-        .arg(
+-            Arg::new(options::MAX_LINES_L)
+-                .short('l')
+-                .num_args(0..=1)
+-                .help(
+-                    "Equivalent to -L, but with a default value of 1 if max-lines \
+-                    is unspecified",
+-                )
+-                .value_name("max-lines")
+-                .value_parser(validate_positive_usize),
+-        )
+-        .arg(
+-            Arg::new(options::MAX_PROCS)
+-                .short('P')
+-                .long(options::MAX_PROCS)
+-                .help("Run up to this many commands in parallel [NOT IMPLEMENTED]")
+-                .value_parser(clap::value_parser!(usize)),
+-        )
+-        .arg(
+-            Arg::new(options::NO_RUN_IF_EMPTY)
+-                .short('r')
+-                .long(options::NO_RUN_IF_EMPTY)
+-                .help("If there are no input arguments, do not run the command at all")
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new(options::NULL)
+-                .short('0')
+-                .long(options::NULL)
+-                .help("Split the input by null terminators rather than whitespace")
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new(options::MAX_CHARS)
+-                .short('s')
+-                .long(options::MAX_CHARS)
+-                .help(
+-                    "Set the max number of characters to be passed to each \
+-                    invocation",
+-                )
+-                .value_parser(validate_positive_usize),
+-        )
+-        .arg(
+-            Arg::new(options::VERBOSE)
+-                .short('t')
+-                .long(options::VERBOSE)
+-                .help("Print each command to stderr before executing it")
+-                .action(ArgAction::SetTrue),
+-        )
+-        .arg(
+-            Arg::new(options::REPLACE)
+-                .long(options::REPLACE)
+-                .short('i')
+-                .num_args(0..=1)
+-                .require_equals(true)
+-                .value_parser(clap::value_parser!(String))
+-                .value_name("R")
+-                .help("If R is specified, the same as -I R; otherwise, the same as -I {}"),
+-        )
+-        .arg(
+-            Arg::new(options::REPLACE_I)
+-                .short('I')
+-                .num_args(1)
+-                .allow_hyphen_values(true)
+-                .value_name("R")
+-                .help(
+-                    "Replace R in initial arguments with names read from standard input; \
+-                    also, the input is split at newlines only
+-                    (mutually exclusive with -L and -n)",
+-                )
+-                .overrides_with(options::REPLACE)
+-                .value_parser(clap::value_parser!(String)),
+-        )
+-        .arg(
+-            Arg::new(options::EOF)
+-                .short('E')
+-                .num_args(1)
+-                .allow_hyphen_values(true)
+-                .value_name("eof-string")
+-                .help(
+-                    "If specified, stop processing the input upon reaching an input \
+-                        item that matches eof-string (ignored if -d or -0 is used)",
+-                )
+-                .value_parser(clap::value_parser!(String)),
+-        )
+-        .arg(
+-            Arg::new(options::EOF_E)
+-                .short('e')
+-                .long(options::EOF)
+-                .num_args(0..=1)
+-                .allow_hyphen_values(true)
+-                .value_name("eof-string")
+-                .help("Alias for -E")
+-                .overrides_with(options::EOF)
+-                .value_parser(clap::value_parser!(String)),
+-        )
+-        .try_get_matches_from(args);
+-
+-    let matches = match matches {
+-        Ok(m) => m,
+-        Err(e) => match e.kind() {
+-            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+-                // The help/version text already has a newline, so use `print!` here, not `println!`
+-                print!("{e}");
+-
+-                return Ok(CommandResult::Success);
+-            }
+-            _ => return Err(XargsError::from(e.to_string())),
+-        },
+-    };
+-
+-    let options = Options {
+-        arg_file: matches
+-            .get_one::<String>(options::ARG_FILE)
+-            .map(std::borrow::ToOwned::to_owned),
+-        delimiter: matches.get_one::<u8>(options::DELIMITER).copied(),
+-        exit_if_pass_char_limit: matches.get_flag(options::EXIT),
+-        max_args: matches.get_one::<usize>(options::MAX_ARGS).copied(),
+-        max_chars: matches.get_one::<usize>(options::MAX_CHARS).copied(),
+-        max_lines: [options::MAX_LINES, options::MAX_LINES_L]
+-            .iter()
+-            .find_map(|&option| {
+-                matches.contains_id(option).then(|| {
+-                    matches
+-                        .get_one::<usize>(option)
+-                        .map_or_else(|| 1, std::borrow::ToOwned::to_owned)
+-                })
+-            }),
+-        no_run_if_empty: matches.get_flag(options::NO_RUN_IF_EMPTY),
+-        null: matches.get_flag(options::NULL),
+-        replace: [options::REPLACE_I, options::REPLACE]
+-            .iter()
+-            .find_map(|&option| {
+-                matches.contains_id(option).then(|| {
+-                    matches
+-                        .get_one::<String>(option)
+-                        .map_or_else(|| "{}".to_string(), std::borrow::ToOwned::to_owned)
+-                })
+-            }),
+-        verbose: matches.get_flag(options::VERBOSE),
+-        eof_delimiter: [options::EOF_E, options::EOF].iter().find_map(|&option| {
+-            matches.contains_id(option).then(|| {
+-                matches
+-                    .get_one::<String>(option)
+-                    .map_or_else(|| "{}".to_string(), std::borrow::ToOwned::to_owned)
+-            })
+-        }),
+-    };
+-
+-    let options = normalize_options(options, &matches);
+-
+-    let action = match matches.get_many::<OsString>(options::COMMAND) {
+-        Some(args) if args.len() > 0 => {
+-            ExecAction::Command(args.map(std::borrow::ToOwned::to_owned).collect())
+-        }
+-        _ => ExecAction::Echo,
+-    };
+-    let env = std::env::vars_os().collect();
+-
+-    let mut limiters = LimiterCollection::new();
+-    if let Some(max_args) = options.max_args {
+-        limiters.add(MaxArgsCommandSizeLimiter::new(max_args));
+-    }
+-    if let Some(max_lines) = options.max_lines {
+-        limiters.add(MaxLinesCommandSizeLimiter::new(max_lines));
+-    }
+-    if let Some(max_chars) = options.max_chars {
+-        limiters.add(MaxCharsCommandSizeLimiter::new(max_chars));
+-    }
+-    limiters.add(MaxCharsCommandSizeLimiter::new_system(&env));
+-
+-    let mut builder_options =
+-        CommandBuilderOptions::new(action, env, limiters, options.replace.clone()).map_err(
+-            |_| "Base command and environment are too large to fit into one command execution",
+-        )?;
+-
+-    builder_options.verbose = options.verbose;
+-    builder_options.close_stdin = options.arg_file.is_none();
+-
+-    let args_file: Box<dyn Read> = if let Some(path) = &options.arg_file {
+-        Box::new(fs::File::open(path).map_err(|e| format!("Failed to open {path}: {e}"))?)
+-    } else {
+-        Box::new(io::stdin())
+-    };
+-
+-    let mut args: Box<dyn ArgumentReader> = if let Some(delimiter) = options.delimiter {
+-        Box::new(ByteDelimitedArgumentReader::new(args_file, delimiter))
+-    } else {
+-        Box::new(WhitespaceDelimitedArgumentReader::new(args_file))
+-    };
+-
+-    if let Some(eof_delimiter) = options.eof_delimiter {
+-        args = Box::new(EofArgumentReader::new(args, &eof_delimiter));
+-    }
+-
+-    let result = process_input(
+-        &builder_options,
+-        args,
+-        &InputProcessOptions::new(
+-            options.exit_if_pass_char_limit,
+-            options.max_args,
+-            options.max_lines,
+-            options.no_run_if_empty || options.replace.is_some(),
+-        ),
+-    )?;
+-    Ok(result)
+-}
+-
+-#[must_use]
+-pub fn xargs_main(args: &[&str]) -> i32 {
+-    match do_xargs(args) {
+-        Ok(CommandResult::Success) => 0,
+-        Ok(CommandResult::Failure) => 123,
+-        Err(e) => {
+-            eprintln!("Error: {e}");
+-            if let XargsError::CommandExecution(cx) = e {
+-                match cx {
+-                    CommandExecutionError::UrgentlyFailed => 124,
+-                    CommandExecutionError::Killed { .. } => 125,
+-                    CommandExecutionError::CannotRun(_) => 126,
+-                    CommandExecutionError::NotFound => 127,
+-                    CommandExecutionError::Unknown => 1,
+-                }
+-            } else {
+-                1
+-            }
+-        }
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    fn make_arg_init(s: &str) -> Argument {
+-        Argument {
+-            arg: s.to_owned().into(),
+-            kind: ArgumentKind::Initial,
+-        }
+-    }
+-
+-    fn make_arg_hard(s: &str) -> Argument {
+-        Argument {
+-            arg: s.to_owned().into(),
+-            kind: ArgumentKind::HardTerminated,
+-        }
+-    }
+-
+-    fn make_arg_soft(s: &str) -> Argument {
+-        Argument {
+-            arg: s.to_owned().into(),
+-            kind: ArgumentKind::SoftTerminated,
+-        }
+-    }
+-
+-    #[derive(Clone)]
+-    struct AlwaysRejectLimiter;
+-
+-    impl CommandSizeLimiter for AlwaysRejectLimiter {
+-        fn try_arg(
+-            &mut self,
+-            arg: Argument,
+-            _cursor: LimiterCursor<'_>,
+-        ) -> Result<Argument, ExhaustedCommandSpace> {
+-            Err(ExhaustedCommandSpace {
+-                arg,
+-                out_of_chars: false,
+-            })
+-        }
+-
+-        fn dyn_clone(&self) -> Box<dyn CommandSizeLimiter> {
+-            Box::new(self.clone())
+-        }
+-    }
+-
+-    fn empty_cursor() -> LimiterCursor<'static> {
+-        LimiterCursor { limiters: &mut [] }
+-    }
+-
+-    enum Chunk {
+-        Data(&'static [u8]),
+-        Error(io::ErrorKind),
+-    }
+-
+-    struct ChunkReader {
+-        chunks: Vec<Chunk>,
+-        current: usize,
+-    }
+-
+-    impl ChunkReader {
+-        fn new(chunks: Vec<Chunk>) -> Self {
+-            Self { chunks, current: 0 }
+-        }
+-    }
+-
+-    impl Read for ChunkReader {
+-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+-            if self.current >= self.chunks.len() {
+-                return Ok(0);
+-            }
+-
+-            match &mut self.chunks[self.current] {
+-                Chunk::Data(data) => {
+-                    let byte_count = std::cmp::min(data.len(), buf.len());
+-                    buf[..byte_count].copy_from_slice(&(*data)[..byte_count]);
+-                    if byte_count == data.len() {
+-                        self.current += 1;
+-                    } else {
+-                        *data = &(*data)[byte_count..];
+-                    }
+-
+-                    Ok(byte_count)
+-                }
+-                Chunk::Error(kind) => {
+-                    self.current += 1;
+-                    Err(io::Error::new(*kind, "Synthesized error"))
+-                }
+-            }
+-        }
+-    }
+-
+-    #[test]
+-    fn test_chars_limiter() {
+-        let mut limiter = MaxCharsCommandSizeLimiter::new(6);
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), empty_cursor())
+-            .is_ok());
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abcd"), empty_cursor())
+-            .is_err());
+-        assert!(limiter.try_arg(make_arg_hard("a"), empty_cursor()).is_ok());
+-    }
+-
+-    #[test]
+-    fn test_chars_limiter_asks_cursor() {
+-        let mut rejects: [Box<dyn CommandSizeLimiter>; 1] = [Box::new(AlwaysRejectLimiter)];
+-        let reject_cursor = LimiterCursor {
+-            limiters: &mut rejects,
+-        };
+-
+-        let mut limiter = MaxCharsCommandSizeLimiter::new(5);
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), reject_cursor)
+-            .is_err());
+-        // Ensure the limiter didn't update before trying the cursor.
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), empty_cursor())
+-            .is_ok());
+-    }
+-
+-    #[test]
+-    fn test_args_limiter() {
+-        let mut limiter = MaxArgsCommandSizeLimiter::new(2);
+-        // Should not count initial arguments.
+-        for _ in 1..3 {
+-            assert!(limiter
+-                .try_arg(make_arg_init("abc"), empty_cursor())
+-                .is_ok());
+-        }
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), empty_cursor())
+-            .is_ok());
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), empty_cursor())
+-            .is_ok());
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), empty_cursor())
+-            .is_err());
+-    }
+-
+-    #[test]
+-    fn test_args_limiter_asks_cursor() {
+-        let mut rejects: [Box<dyn CommandSizeLimiter>; 1] = [Box::new(AlwaysRejectLimiter)];
+-        let reject_cursor = LimiterCursor {
+-            limiters: &mut rejects,
+-        };
+-
+-        let mut limiter = MaxArgsCommandSizeLimiter::new(1);
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), reject_cursor)
+-            .is_err());
+-        // Ensure the limiter didn't update before trying the cursor.
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), empty_cursor())
+-            .is_ok());
+-    }
+-
+-    #[test]
+-    fn test_lines_limiter() {
+-        let mut limiter = MaxLinesCommandSizeLimiter::new(2);
+-        assert!(limiter
+-            .try_arg(make_arg_soft("abc"), empty_cursor())
+-            .is_ok());
+-        assert!(limiter
+-            .try_arg(make_arg_soft("abc"), empty_cursor())
+-            .is_ok());
+-        assert!(limiter
+-            .try_arg(make_arg_soft("abc"), empty_cursor())
+-            .is_ok());
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), empty_cursor())
+-            .is_ok());
+-        assert!(limiter
+-            .try_arg(make_arg_soft("abc"), empty_cursor())
+-            .is_ok());
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), empty_cursor())
+-            .is_ok());
+-        assert!(limiter
+-            .try_arg(make_arg_soft("abc"), empty_cursor())
+-            .is_err());
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), empty_cursor())
+-            .is_err());
+-    }
+-
+-    #[test]
+-    fn test_lines_limiter_asks_cursor() {
+-        let mut rejects: [Box<dyn CommandSizeLimiter>; 1] = [Box::new(AlwaysRejectLimiter)];
+-        let reject_cursor = LimiterCursor {
+-            limiters: &mut rejects,
+-        };
+-
+-        let mut limiter = MaxLinesCommandSizeLimiter::new(1);
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), reject_cursor)
+-            .is_err());
+-        // Ensure the limiter didn't update before trying the cursor.
+-        assert!(limiter
+-            .try_arg(make_arg_hard("abc"), empty_cursor())
+-            .is_ok());
+-    }
+-
+-    #[test]
+-    fn test_whitespace_delimited_reader() {
+-        let mut reader = WhitespaceDelimitedArgumentReader::new(ChunkReader::new(vec![
+-            Chunk::Data(b"abc "),
+-            Chunk::Data(b" def"),
+-            Chunk::Data(b"\nghi\t\tj"),
+-            Chunk::Data(b"kl\n"),
+-            Chunk::Data(b"mn"),
+-            Chunk::Error(io::ErrorKind::Interrupted),
+-            Chunk::Data(b"\\\t\\ o 'ab"),
+-            Chunk::Data(b" \"' \"xy' z\""),
+-        ]));
+-
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_soft("abc"));
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_hard("def"));
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_soft("ghi"));
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_hard("jkl"));
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_soft("mn\t o"));
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_soft("ab \""));
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_soft("xy' z"));
+-        assert_eq!(reader.next().unwrap(), None);
+-    }
+-
+-    #[test]
+-    fn test_eof_argument_reader() {
+-        let filter = String::from("def");
+-
+-        let reader = WhitespaceDelimitedArgumentReader::new(ChunkReader::new(vec![Chunk::Data(
+-            b"abc def ghi",
+-        )]));
+-        let mut wrapper = EofArgumentReader::new(Box::new(reader), &filter);
+-        assert_eq!(wrapper.next().unwrap().unwrap(), make_arg_soft("abc"));
+-        assert_eq!(wrapper.next().unwrap(), None);
+-        assert_eq!(wrapper.next().unwrap(), None);
+-
+-        let reader = WhitespaceDelimitedArgumentReader::new(ChunkReader::new(vec![Chunk::Data(
+-            b"abc define undef undefined ghi",
+-        )]));
+-        let mut wrapper = EofArgumentReader::new(Box::new(reader), &filter);
+-        assert_eq!(wrapper.next().unwrap().unwrap(), make_arg_soft("abc"));
+-        assert_eq!(wrapper.next().unwrap().unwrap(), make_arg_soft("define"));
+-        assert_eq!(wrapper.next().unwrap().unwrap(), make_arg_soft("undef"));
+-        assert_eq!(wrapper.next().unwrap().unwrap(), make_arg_soft("undefined"));
+-        assert_eq!(wrapper.next().unwrap().unwrap(), make_arg_soft("ghi"));
+-        assert_eq!(wrapper.next().unwrap(), None);
+-
+-        let reader = WhitespaceDelimitedArgumentReader::new(ChunkReader::new(vec![
+-            Chunk::Data(b"abc "),
+-            Chunk::Error(io::ErrorKind::Interrupted),
+-            Chunk::Data(b"deF "),
+-            Chunk::Error(io::ErrorKind::BrokenPipe),
+-            Chunk::Data(b"ghi "),
+-            Chunk::Data(b"def "),
+-            Chunk::Error(io::ErrorKind::BrokenPipe),
+-        ]));
+-        let mut wrapper = EofArgumentReader::new(Box::new(reader), &filter);
+-        assert_eq!(wrapper.next().unwrap().unwrap(), make_arg_soft("abc"));
+-        assert_eq!(wrapper.next().unwrap().unwrap(), make_arg_soft("deF"));
+-        assert!(wrapper.next().err().unwrap().kind() == io::ErrorKind::BrokenPipe);
+-        assert_eq!(wrapper.next().unwrap().unwrap(), make_arg_soft("ghi"));
+-        assert_eq!(wrapper.next().unwrap(), None);
+-        assert_eq!(wrapper.next().unwrap(), None);
+-    }
+-
+-    #[test]
+-    fn test_byte_delimited_reader() {
+-        let mut reader = ByteDelimitedArgumentReader::new(
+-            ChunkReader::new(vec![
+-                Chunk::Data(b"ab"),
+-                Chunk::Error(io::ErrorKind::Interrupted),
+-                Chunk::Data(b"c!de!"),
+-                Chunk::Data(b"!ef!!gh"),
+-                Chunk::Data(b"!ij"),
+-            ]),
+-            b'!',
+-        );
+-
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_hard("abc"));
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_hard("de"));
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_hard("ef"));
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_hard("gh"));
+-        assert_eq!(reader.next().unwrap().unwrap(), make_arg_hard("ij"));
+-        assert_eq!(reader.next().unwrap(), None);
+-    }
+-
+-    #[test]
+-    fn test_delimiter_parsing() {
+-        assert_eq!(parse_delimiter("a").unwrap(), b'a');
+-        assert_eq!(parse_delimiter("\\x61").unwrap(), b'a');
+-        assert_eq!(parse_delimiter("\\x00061").unwrap(), b'a');
+-        assert_eq!(parse_delimiter("\\0141").unwrap(), b'a');
+-        assert_eq!(parse_delimiter("\\0000141").unwrap(), b'a');
+-        assert_eq!(parse_delimiter("\\n").unwrap(), b'\n');
+-
+-        assert!(parse_delimiter("\\0").is_err());
+-        assert!(parse_delimiter("\\x").is_err());
+-        assert!(parse_delimiter("\\").is_err());
+-        assert!(parse_delimiter("abc").is_err());
+-    }
+-}

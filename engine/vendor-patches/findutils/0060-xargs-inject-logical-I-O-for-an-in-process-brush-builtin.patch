@@ -1,0 +1,301 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 20 Jun 2026 11:51:47 +0000
+Subject: [PATCH] xargs: inject logical I/O for an in-process brush builtin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+xargs reads its items from stdin and writes diagnostics (`-t` traces, the
+mutually-exclusive warning, errors), help/version text, and the no-command
+`echo` output to stdout/stderr. Run as an in-process brush builtin those are
+the ENGINE's process-global fd 0/1/2 (a control channel, a parent pipe, another
+box's stream) — reading or writing them would steal/corrupt a neighbour's
+bytes, the same data-corruption class the find `-files0-from -` seam fixed.
+
+Carve a minimal `XargsIo` trait over the three logical streams and thread it
+surgically through `do_xargs` -> `normalize_options` / `process_input` ->
+`CommandBuilder::execute`, replacing the six process-global touchpoints:
+`io::stdin()`, the `-t` `eprintln!`, the Echo `println!`, the warning
+`eprintln!`, the help/version `print!`, and the final `Error:` `eprintln!`.
+`StandardXargsIo` reproduces upstream behaviour (real stdin/stdout/stderr) so
+`xargs_main` / `main.rs` stay byte-identical; the new `xargs_main_with_io`
+entry is what the embedder calls. The commands xargs SPAWNS still inherit the
+process fds via `Command`, exactly as `find -exec` does — in a box those are
+the shell's logical fd 1/2. No behavior changes; every option preserved.
+
+Re-expose `pub mod xargs;` in lib.rs (find-and-xargs library now).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/lib.rs       |   7 +--
+ src/xargs/mod.rs | 124 ++++++++++++++++++++++++++++++++++++++++-------
+ 2 files changed, 110 insertions(+), 21 deletions(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 45e4c49..95ca18f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -4,7 +4,8 @@
+ // license that can be found in the LICENSE file or at
+ // https://opensource.org/licenses/MIT.
+ 
+-// sarun: reduced to a find-only library. Upstream's `locate`, `updatedb`,
+-// `xargs`, and `testing` modules (and their binaries) are dropped — this fork
+-// vendors findutils solely to run `find` as an in-process brush builtin.
++// sarun: reduced to a find-and-xargs library. Upstream's `locate`, `updatedb`,
++// and `testing` modules (and their binaries) are dropped — this fork vendors
++// findutils solely to run `find` and `xargs` as in-process brush builtins.
+ pub mod find;
++pub mod xargs;
+diff --git a/src/xargs/mod.rs b/src/xargs/mod.rs
+index 9679a05..58d2e33 100644
+--- a/src/xargs/mod.rs
++++ b/src/xargs/mod.rs
+@@ -5,15 +5,70 @@
+ // https://opensource.org/licenses/MIT.
+ 
+ use std::{
++    cell::RefCell,
+     collections::HashMap,
+     error::Error,
+     ffi::{OsStr, OsString},
+     fmt::Display,
+     fs,
+-    io::{self, BufRead, BufReader, Read},
++    io::{self, BufRead, BufReader, Read, Write},
+     process::{Command, Stdio},
+ };
+ 
++/// Injected logical I/O for an in-process embedder.
++///
++/// Upstream xargs reads its items from the process's real `stdin` and writes
++/// diagnostics (`-t` traces, the mutually-exclusive warning, errors) and the
++/// no-command `echo` output to the process's real `stdout`/`stderr`. Run as an
++/// in-process brush builtin those process-global streams belong to the ENGINE
++/// (fd 0 is a control channel / a parent pipe / another box's stream; fd 1/2
++/// are the engine's), so touching them would steal or corrupt a neighbour's
++/// bytes. `XargsIo` routes xargs's OWN input/output through the shell's LOGICAL
++/// stdin/stdout/stderr instead. The commands xargs SPAWNS still inherit the
++/// process fds via `Command` — exactly as `find -exec` does — which in a box is
++/// the shell's logical fd 1/2.
++///
++/// `StandardXargsIo` reproduces the upstream behaviour (real `stdin`/`stdout`/
++/// `stderr`) for the standalone binary; the embedder supplies its own.
++pub trait XargsIo {
++    /// Bulk source for input items — replaces `io::stdin()`. Returned by value
++    /// because it is moved into the `ArgumentReader`. Only consulted when no
++    /// `-a/--arg-file` is given (a file always wins, same as upstream).
++    fn take_input(&self) -> Box<dyn Read>;
++    /// Sink for normal output (the no-command `echo` action, help/version text).
++    fn output(&self) -> &RefCell<dyn Write>;
++    /// Sink for diagnostics (`-t` command traces, warnings, errors).
++    fn error_output(&self) -> &RefCell<dyn Write>;
++}
++
++/// The dependencies used when xargs runs as the real standalone executable:
++/// the process's real `stdin`, `stdout`, and `stderr`.
++pub struct StandardXargsIo {
++    output: RefCell<io::Stdout>,
++    error_output: RefCell<io::Stderr>,
++}
++
++impl Default for StandardXargsIo {
++    fn default() -> Self {
++        Self {
++            output: RefCell::new(io::stdout()),
++            error_output: RefCell::new(io::stderr()),
++        }
++    }
++}
++
++impl XargsIo for StandardXargsIo {
++    fn take_input(&self) -> Box<dyn Read> {
++        Box::new(io::stdin())
++    }
++    fn output(&self) -> &RefCell<dyn Write> {
++        &self.output
++    }
++    fn error_output(&self) -> &RefCell<dyn Write> {
++        &self.error_output
++    }
++}
++
+ use clap::{crate_version, error::ErrorKind, Arg, ArgAction};
+ 
+ mod options {
+@@ -415,7 +470,7 @@ impl CommandBuilder<'_> {
+         Ok(())
+     }
+ 
+-    fn execute(self) -> Result<CommandResult, CommandExecutionError> {
++    fn execute(self, io: &dyn XargsIo) -> Result<CommandResult, CommandExecutionError> {
+         let (entry_point, initial_args): (&OsStr, &[OsString]) = match &self.options.action {
+             ExecAction::Command(args) => (&args[0], &args[1..]),
+             ExecAction::Echo => (OsStr::new("echo"), &[]),
+@@ -453,7 +508,9 @@ impl CommandBuilder<'_> {
+         }
+ 
+         if self.options.verbose {
+-            eprintln!("{command:?}");
++            let mut err = io.error_output().borrow_mut();
++            let _ = writeln!(err, "{command:?}");
++            let _ = err.flush();
+         }
+ 
+         match &self.options.action {
+@@ -488,7 +545,9 @@ impl CommandBuilder<'_> {
+                 Err(e) => Err(CommandExecutionError::CannotRun(e)),
+             },
+             ExecAction::Echo => {
+-                println!(
++                let mut out = io.output().borrow_mut();
++                let _ = writeln!(
++                    out,
+                     "{}",
+                     self.extra_args
+                         .iter()
+@@ -496,6 +555,7 @@ impl CommandBuilder<'_> {
+                         .collect::<Vec<_>>()
+                         .join(" ")
+                 );
++                let _ = out.flush();
+                 Ok(CommandResult::Success)
+             }
+         }
+@@ -760,6 +820,7 @@ fn process_input(
+     builder_options: &CommandBuilderOptions,
+     mut args: Box<dyn ArgumentReader>,
+     options: &InputProcessOptions,
++    io: &dyn XargsIo,
+ ) -> Result<CommandResult, XargsError> {
+     let mut current_builder = CommandBuilder::new(builder_options);
+     let mut have_pending_command = false;
+@@ -774,7 +835,7 @@ fn process_input(
+                 return Err(XargsError::ArgumentTooLarge);
+             }
+             if have_pending_command {
+-                result.combine(current_builder.execute()?);
++                result.combine(current_builder.execute(io)?);
+             }
+ 
+             current_builder = CommandBuilder::new(builder_options);
+@@ -787,7 +848,7 @@ fn process_input(
+     }
+ 
+     if !options.no_run_if_empty || have_pending_command {
+-        result.combine(current_builder.execute()?);
++        result.combine(current_builder.execute(io)?);
+     }
+ 
+     Ok(result)
+@@ -826,7 +887,7 @@ fn validate_positive_usize(s: &str) -> Result<usize, String> {
+     }
+ }
+ 
+-fn normalize_options(options: Options, matches: &clap::ArgMatches) -> Options {
++fn normalize_options(options: Options, matches: &clap::ArgMatches, io: &dyn XargsIo) -> Options {
+     let (max_args, max_lines, replace) =
+         match (options.max_args, options.max_lines, &options.replace) {
+             // These 3 options are mutually exclusive.
+@@ -841,10 +902,15 @@ fn normalize_options(options: Options, matches: &clap::ArgMatches) -> Options {
+                 (options.max_args, options.max_lines, None)
+             }
+             _ => {
+-                eprintln!(
+-                "WARNING: -L, -n and -I/-i are mutually exclusive, but more than one were given; \
+-                only the last option will be used"
+-            );
++                {
++                    let mut err = io.error_output().borrow_mut();
++                    let _ = writeln!(
++                        err,
++                        "WARNING: -L, -n and -I/-i are mutually exclusive, but more than one \
++                        were given; only the last option will be used"
++                    );
++                    let _ = err.flush();
++                }
+                 let lines_index = matches
+                     .indices_of(options::MAX_LINES)
+                     .and_then(|mut v| v.next_back());
+@@ -903,7 +969,7 @@ fn normalize_options(options: Options, matches: &clap::ArgMatches) -> Options {
+     }
+ }
+ 
+-fn do_xargs(args: &[&str]) -> Result<CommandResult, XargsError> {
++fn do_xargs(args: &[&str], io: &dyn XargsIo) -> Result<CommandResult, XargsError> {
+     let matches = clap::Command::new("xargs")
+         .version(crate_version!())
+         .about("Run commands using arguments derived from standard input")
+@@ -1059,8 +1125,13 @@ fn do_xargs(args: &[&str]) -> Result<CommandResult, XargsError> {
+         Ok(m) => m,
+         Err(e) => match e.kind() {
+             ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+-                // The help/version text already has a newline, so use `print!` here, not `println!`
+-                print!("{e}");
++                // The help/version text already has a newline, so write it as-is
++                // (no extra newline), to the logical stdout.
++                {
++                    let mut out = io.output().borrow_mut();
++                    let _ = write!(out, "{e}");
++                    let _ = out.flush();
++                }
+ 
+                 return Ok(CommandResult::Success);
+             }
+@@ -1106,7 +1177,7 @@ fn do_xargs(args: &[&str]) -> Result<CommandResult, XargsError> {
+         }),
+     };
+ 
+-    let options = normalize_options(options, &matches);
++    let options = normalize_options(options, &matches, io);
+ 
+     let action = match matches.get_many::<OsString>(options::COMMAND) {
+         Some(args) if args.len() > 0 => {
+@@ -1139,7 +1210,8 @@ fn do_xargs(args: &[&str]) -> Result<CommandResult, XargsError> {
+     let args_file: Box<dyn Read> = if let Some(path) = &options.arg_file {
+         Box::new(fs::File::open(path).map_err(|e| format!("Failed to open {path}: {e}"))?)
+     } else {
+-        Box::new(io::stdin())
++        // The shell's LOGICAL stdin, not the host process's real fd 0.
++        io.take_input()
+     };
+ 
+     let mut args: Box<dyn ArgumentReader> = if let Some(delimiter) = options.delimiter {
+@@ -1161,17 +1233,33 @@ fn do_xargs(args: &[&str]) -> Result<CommandResult, XargsError> {
+             options.max_lines,
+             options.no_run_if_empty || options.replace.is_some(),
+         ),
++        io,
+     )?;
+     Ok(result)
+ }
+ 
++/// Standalone entry point: run xargs against the process's real stdio
++/// (`StandardXargsIo`). Kept so `main.rs` stays byte-identical to upstream.
+ #[must_use]
+ pub fn xargs_main(args: &[&str]) -> i32 {
+-    match do_xargs(args) {
++    xargs_main_with_io(args, &StandardXargsIo::default())
++}
++
++/// Entry point with injected logical I/O, for an in-process embedder (the sarun
++/// brush builtin). Identical to `xargs_main` except all of xargs's own input
++/// and diagnostic/echo output go through `io` (the shell's logical
++/// stdin/stdout/stderr) instead of the process's real fd 0/1/2.
++#[must_use]
++pub fn xargs_main_with_io(args: &[&str], io: &dyn XargsIo) -> i32 {
++    match do_xargs(args, io) {
+         Ok(CommandResult::Success) => 0,
+         Ok(CommandResult::Failure) => 123,
+         Err(e) => {
+-            eprintln!("Error: {e}");
++            {
++                let mut err = io.error_output().borrow_mut();
++                let _ = writeln!(err, "Error: {e}");
++                let _ = err.flush();
++            }
+             if let XargsError::CommandExecution(cx) = e {
+                 match cx {
+                     CommandExecutionError::UrgentlyFailed => 124,

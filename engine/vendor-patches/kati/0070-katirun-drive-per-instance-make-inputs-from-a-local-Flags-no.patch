@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 09:15:28 +0000
+Subject: [PATCH] katirun: drive per-instance make inputs from a local Flags,
+ not global FLAGS
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Prerequisite for an in-process `make` builtin. kati's FLAGS is a global
+LazyLock installed once via install_args (an OnceLock); a second make in the
+same process would fail to re-install and would share one config. Split the
+two roles:
+
+- The immutable mode-switches stay in the global FLAGS. install_args is now
+  best-effort (a repeated install in the same process is tolerated, not a
+  fatal "already initialized" error) since the switches are identical.
+- The per-instance INPUTS — makefile, targets, cl_vars (and the makefile
+  default-discovery / missing-file error) — now come from a LOCAL
+  kati::flags::Flags::from_args(kargv) (made pub) instead of reading the
+  global. run_kati takes the makefile as a parameter and no longer reads
+  FLAGS.makefile.
+
+For the existing shadow/main() path (one make per process) the local Flags is
+parsed from the same synthesized argv as the global, so behavior is identical:
+corpus KATI_COMPAT_PASS=364/378, fail=0; engine builds. This unblocks multiple
+make invocations coexisting in one process without colliding on inputs.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/flags.rs | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index 1235ec3..dc56b82 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -138,7 +138,13 @@ fn parse_command_line_option_with_arg(
+ }
+ 
+ impl Flags {
+-    fn from_args(args: Vec<OsString>) -> Flags {
++    /// sarun: pub so an embedder can parse a per-instance Flags from a
++    /// synthesized argv instead of relying solely on the install-once global
++    /// FLAGS — needed when multiple make invocations share one process (the
++    /// in-process `make` builtin). The global FLAGS still supplies the
++    /// immutable mode-switches; per-instance INPUTS (makefile/targets/cl_vars/
++    /// working_dir) come from a local Flags so concurrent makes don't collide.
++    pub fn from_args(args: Vec<OsString>) -> Flags {
+         let mut iter = args.into_iter();
+         let mut flags = Flags::default();
+         flags.subkati_args.push(iter.next().unwrap());

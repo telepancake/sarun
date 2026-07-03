@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 22 Jun 2026 16:45:53 +0000
+Subject: [PATCH] uu_expr: match GNU expr for leading-+ integers and
+ out-of-range substr
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two real divergences from GNU/POSIX expr, fixed in the fork since the util
+now runs in-process unconditionally (no host-binary gate fallback):
+
+1. Leading `+` integer literals. num_bigint's parser accepts `+N`; GNU does
+   not — a `+N` token is a non-integer string. Add `parse_expr_bigint` which
+   rejects a leading `+` (keeping leading `-`) and route `to_bigint` /
+   `eval_as_bigint` through it. Now `expr +1 = 1` is the string compare
+   "+1" != "1" (0, exit 1) and `expr +5 + 1` is a non-integer argument
+   (exit 2); `expr -5 + 1` stays -4.
+
+2. substr with out-of-range POS/LEN. A positive POS/LEN that overflows usize
+   (e.g. `substr abcdef 1 99999999999999999999`) was coerced to 0 via
+   `to_usize().unwrap_or(0)`, emptying the result; GNU clamps to the string.
+   Saturate a positive overflow to usize::MAX (the downstream
+   `.skip(pos).take(len)` already clamps to the string end) while keeping
+   negative/zero/non-numeric → 0 (the null string, exit 1), matching GNU.
+
+Differential vs /usr/bin/expr: 36/36 cases match on stdout AND exit code
+(bug cases, -5 + 1, basics, arithmetic/precedence/parens, length/index/
+match/: regex, substr normal+edges, bignum). Upstream unit suite: 31 passed.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TNBGBV51j5AH4j8k8ENi1W
+---
+ src/syntax_tree.rs | 52 +++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 45 insertions(+), 7 deletions(-)
+
+diff --git a/src/syntax_tree.rs b/src/syntax_tree.rs
+index 22d0bde..55f6685 100644
+--- a/src/syntax_tree.rs
++++ b/src/syntax_tree.rs
+@@ -588,21 +588,38 @@ impl From<MaybeNonUtf8String> for NumOrStr {
+     }
+ }
+ 
++/// Parse a string as an `expr` integer.
++///
++/// GNU/POSIX `expr` integers are an OPTIONAL leading `-` followed by one or
++/// more decimal digits. A leading `+` is NOT accepted (`num_bigint`'s own
++/// `parse` would accept `+N`, so we reject it explicitly here): a `+N` token
++/// is therefore a non-integer string and follows the string path, exactly as
++/// GNU does (e.g. `expr +1 = 1` is the string compare "+1" != "1" → 0/exit 1,
++/// and `expr +5 + 1` is a non-integer argument). A leading `-` stays a valid
++/// integer (`expr -5 + 1` → -4).
++fn parse_expr_bigint(s: &str) -> Option<BigInt> {
++    // Reject a leading `+` (GNU does); `BigInt::parse` would otherwise accept it.
++    if s.as_bytes().first() == Some(&b'+') {
++        return None;
++    }
++    s.parse::<BigInt>().ok()
++}
++
+ impl NumOrStr {
+     pub fn to_bigint(&self) -> Option<BigInt> {
+         match self {
+             Self::Num(num) => Some(num.clone()),
+-            Self::Str(str) => std::str::from_utf8(str).ok()?.parse::<BigInt>().ok(),
++            Self::Str(str) => parse_expr_bigint(std::str::from_utf8(str).ok()?),
+         }
+     }
+ 
+     pub fn eval_as_bigint(self) -> ExprResult<BigInt> {
+         match self {
+             Self::Num(num) => Ok(num),
+-            Self::Str(str) => String::from_utf8(str)
+-                .map_err(|_| ExprError::NonIntegerArgument)?
+-                .parse::<BigInt>()
+-                .map_err(|_| ExprError::NonIntegerArgument),
++            Self::Str(str) => parse_expr_bigint(
++                &String::from_utf8(str).map_err(|_| ExprError::NonIntegerArgument)?,
++            )
++            .ok_or(ExprError::NonIntegerArgument),
+         }
+     }
+ 
+@@ -704,15 +721,36 @@ impl AstNode {
+                     //
+                     // So we coerce errors into 0 to make that the only case we
+                     // have to care about.
++                    //
++                    // For an in-range substring GNU CLAMPS to the string: a
++                    // POS/LEN larger than the string (or larger than `usize`,
++                    // e.g. `substr abcdef 1 99999999999999999999`) yields the
++                    // available tail, not the empty string. The downstream
++                    // `.skip(pos).take(len)` already clamps to the string end,
++                    // so a positive value that overflows `usize` must saturate
++                    // to `usize::MAX` rather than fall back to 0 (which would
++                    // wrongly empty the result). Negative/zero/non-numeric
++                    // still map to 0 → the null string, matching GNU.
++                    let to_clamped_usize = |n: BigInt| -> usize {
++                        // Already filtered to a real integer; <= 0 → 0 (null
++                        // string per GNU), positive-overflow → usize::MAX.
++                        n.to_usize().unwrap_or_else(|| {
++                            if n.sign() == num_bigint::Sign::Plus {
++                                usize::MAX
++                            } else {
++                                0
++                            }
++                        })
++                    };
+                     let pos = pos?
+                         .eval_as_bigint()
+                         .ok()
+-                        .and_then(|n| n.to_usize())
++                        .map(to_clamped_usize)
+                         .unwrap_or(0);
+                     let length = length?
+                         .eval_as_bigint()
+                         .ok()
+-                        .and_then(|n| n.to_usize())
++                        .map(to_clamped_usize)
+                         .unwrap_or(0);
+ 
+                     if let (Some(pos), Some(_)) = (pos.checked_sub(1), length.checked_sub(1)) {

@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 05:37:39 +0000
+Subject: [PATCH] kati: readable variable-assignment trace (loc + value, not
+ debug dumps)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The trace tool for hunting a wrong variable value —
+
+    make --dump_variable_assignment_trace=- \
+         --variable_assignment_trace_filter=NAME …
+
+— emitted each assignment as the Variable struct's Rust debug dump
+(RwLock/Frame/Weak soup with the value as a byte array), unusable for
+the one question it exists to answer: WHERE did the value change and
+WHAT was it. Each assignment record now carries
+
+    "loc": "Makefile:123",
+    "value": "aa bb"
+
+(the value's source form, JSON-escaped by hand — no serde dependency
+in the vendored crate). Works in a -b box: the shadowed make passes
+the long flags through to kati, and every in-process nested make in
+the box shares the installed FLAGS, so the filter traces the variable
+across the whole recursive build. '=-' writes to stderr (a file path
+would be re-truncated by each nested make).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/eval.rs | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index c4b793f..bce4862 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -1336,9 +1336,29 @@ impl Evaluator {
+         writeln!(tf, "    {{")?;
+         writeln!(tf, "      \"name\": \"{name}\",")?;
+         writeln!(tf, "      \"operation\": \"assign\",")?;
+-        write!(tf, "      \"value\": \"{var:?}\"")?;
++        // sarun: emit the assignment LOCATION and the value's SOURCE form as
++        // readable strings (was the Variable's Rust debug dump — unusable for
++        // the "where did this value go wrong" hunt the trace exists for).
++        {
++            let g = var.read();
++            if let Some(loc) = g.loc().as_ref() {
++                writeln!(tf, "      \"loc\": \"{loc}\",")?;
++            }
++            let val = g.string().unwrap_or(std::borrow::Cow::Borrowed(b"?"));
++            let escaped: String = String::from_utf8_lossy(&val)
++                .chars()
++                .flat_map(|c| match c {
++                    '"' => vec!['\\', '"'],
++                    '\\' => vec!['\\', '\\'],
++                    '\n' => vec!['\\', 'n'],
++                    '\t' => vec!['\\', 't'],
++                    c => vec![c],
++                })
++                .collect();
++            writeln!(tf, "      \"value\": \"{escaped}\"")?;
++        }
+         if let Some(definition) = var.read().definition().clone() {
+-            writeln!(tf, ",\n")?;
++            writeln!(tf, ",")?;
+             writeln!(tf, "      \"value_stack\": [")?;
+             definition.print_json_trace(tf, 8)?;
+             writeln!(tf, "      ]")?;

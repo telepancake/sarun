@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 23 Jun 2026 15:32:37 +0000
+Subject: [PATCH] =?UTF-8?q?uu=5Funame:=20in-process=20uname=20builtin=20?=
+ =?UTF-8?q?=E2=80=94=20injected=20logical=20I/O?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/uname.rs | 47 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+diff --git a/src/uname.rs b/src/uname.rs
+index 1439bd6..6972bb7 100644
+--- a/src/uname.rs
++++ b/src/uname.rs
+@@ -6,6 +6,7 @@
+ // spell-checker:ignore (API) nodename osname sysname (options) mnrsv mnrsvo
+ 
+ use std::ffi::{OsStr, OsString};
++use std::io::Write;
+ 
+ use clap::{Arg, ArgAction, Command};
+ use platform_info::{PlatformInfo, PlatformInfoAPI, UNameAPI};
+@@ -119,6 +120,52 @@ pub struct Options {
+     pub os: bool,
+ }
+ 
++/// Logical entry point for the in-process brush builtin.
++///
++/// `uname` reads no stdin; it reads read-only system info (uname(2)) and writes
++/// the assembled line to the injected `out` sink (verbatim, trailing newline) —
++/// never the process's global stdout. `err` is accepted for the engine's uniform
++/// `(args, out, err)` entry shape; uname emits no diagnostics of its own
++/// (failures are returned).
++pub fn uname_main(
++    args: impl uucore::Args,
++    out: &mut dyn Write,
++    _err: &mut dyn Write,
++) -> UResult<()> {
++    let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
++
++    let options = Options {
++        all: matches.get_flag(options::ALL),
++        kernel_name: matches.get_flag(options::KERNEL_NAME),
++        nodename: matches.get_flag(options::NODENAME),
++        kernel_release: matches.get_flag(options::KERNEL_RELEASE),
++        kernel_version: matches.get_flag(options::KERNEL_VERSION),
++        machine: matches.get_flag(options::MACHINE),
++        processor: matches.get_flag(options::PROCESSOR),
++        hardware_platform: matches.get_flag(options::HARDWARE_PLATFORM),
++        os: matches.get_flag(options::OS),
++    };
++    let output = UNameOutput::new(&options)?;
++    write_verbatim(out, output.display().as_os_str())
++        .map_err(|e| USimpleError::new(1, e.to_string()))?;
++    Ok(())
++}
++
++/// Write `text` verbatim with a trailing newline, mirroring upstream's
++/// `println_verbatim` but to the injected sink (Unix preserves the raw bytes).
++fn write_verbatim(out: &mut dyn Write, text: &OsStr) -> std::io::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::os::unix::ffi::OsStrExt;
++        out.write_all(text.as_bytes())?;
++    }
++    #[cfg(not(unix))]
++    {
++        out.write_all(text.to_string_lossy().as_bytes())?;
++    }
++    out.write_all(b"\n")
++}
++
+ #[uucore::main(no_signals)]
+ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;

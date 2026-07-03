@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 21 Jun 2026 04:47:44 +0000
+Subject: [PATCH] brush: de-workspace vendored crate manifests for standalone
+ [patch.crates-io]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 1/3 over pristine brush. Upstream's crate manifests inherit metadata
+from the brush workspace (`categories.workspace = true`, `[lints] workspace
+= true`, …) and refer to siblings by relative path
+(`brush-parser = { path = "../brush-parser" }`). The engine consumes these
+crates as a FLAT set of standalone vendored copies redirected via
+`[patch.crates-io]`, where there is no enclosing workspace and no `../`
+sibling layout, so each manifest must stand on its own:
+
+  * inline the workspace-inherited fields (categories/edition/keywords/
+    license/readme/repository/rust-version, authors) with upstream's own
+    values,
+  * drop the `[lints] workspace = true` table, and
+  * replace inter-crate `path = "../…"` deps with plain version requirements
+    so the [patch.crates-io] redirect resolves them.
+
+Pure packaging plumbing; no behavior change.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ Cargo.toml | 16 +++++++---------
+ 1 file changed, 7 insertions(+), 9 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 1839efe..e7a760d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -2,13 +2,13 @@
+ name = "brush-coreutils-builtins"
+ description = "Optional coreutils builtins for brush-shell (powered by uutils/coreutils)"
+ version = "0.1.0"
+-categories.workspace = true
+-edition.workspace = true
+-keywords.workspace = true
+-license.workspace = true
+-readme.workspace = true
+-repository.workspace = true
+-rust-version.workspace = true
++categories = ["command-line-utilities", "development-tools"]
++edition = "2024"
++keywords = ["cli", "shell", "sh", "bash", "script"]
++license = "MIT"
++readme = "README.md"
++repository = "https://github.com/reubeno/brush"
++rust-version = "1.88.0"
+ 
+ [lib]
+ bench = false
+@@ -187,8 +187,6 @@ default = []
+ 'coreutils.whoami' = ["dep:uu_whoami"]
+ 'coreutils.yes' = ["dep:uu_yes"]
+ 
+-[lints]
+-workspace = true
+ 
+ [dependencies]
+ uucore = { version = "0.8.0", default-features = false }

@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 2 Jul 2026 11:55:03 +0000
+Subject: [PATCH] kati/katirun: order-only probes the make's dir; exports off
+ custom SHELLs; seed MAKELEVEL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three in-box make correctness fixes surfaced by the -j failures and by
+running the conformance corpus through real boxes:
+
+- exec.rs discover(): the order-only-prerequisite existence probe
+  resolved against the PROCESS cwd, not the make's logical working
+  dir. An in-process `make -C sub` keeps the engine's cwd, so a
+  same-named file in the box's start dir made the sub-make's
+  order-only prereq look already-built and it was silently never
+  generated — its consumer then failed ('not generating needed file':
+  immediately under -j, serially whenever no other edge built it).
+  test_make_rs case 23 pins it with a decoy file in the parent dir.
+
+- exec.rs run_node_commands(): the make's export prefix is POSIX shell
+  text; with a custom SHELL (SHELL=echo and friends) it was pasted
+  into the argument handed to the custom program, visibly corrupting
+  the recipe. The prefix now applies only to sh-like shells — the
+  fork path's children inherit exports through the process env, as
+  GNU make's do.
+
+- katirun bootstrap: MAKELEVEL was read from std::env — shared by
+  every in-process make in a box, so a nested $(MAKE) reported level
+  0. The bootstrap now takes the level from the make's OWN seed_env
+  (whose +1 export to children already worked).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/exec.rs | 34 +++++++++++++++++++++++++++++++---
+ 1 file changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 36a85f8..ab11ce9 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -18,6 +18,7 @@ use std::{
+     collections::HashMap,
+     ffi::OsStr,
+     os::unix::ffi::OsStrExt,
++    path::Path,
+     sync::Arc,
+     time::SystemTime,
+ };
+@@ -276,8 +277,22 @@ fn run_node_commands(
+     // The make's global export prefix (box mode) runs first, then the target's
+     // own exported rule vars, then the command. Both are applied to the subshell
+     // but never echoed.
+-    let mut prefix = req.box_prefix.to_vec();
+-    prefix.extend_from_slice(&exports_prefix(&req.exports));
++    //
++    // sarun: ONLY when SHELL is a POSIX sh — the prefix is `export …` shell
++    // text. With a custom SHELL (e.g. the corpus's `SHELL=/usr/bin/printf`),
++    // that text would be pasted into the command handed to the custom program
++    // (visibly corrupting it); GNU make passes exports to such recipes through
++    // the child ENVIRONMENT, which the fork path inherits from the process
++    // anyway.
++    let shell_base = std::path::Path::new(OsStr::from_bytes(shell))
++        .file_name()
++        .and_then(|s| s.to_str())
++        .unwrap_or("");
++    let posix_shell = matches!(shell_base, "sh" | "bash" | "dash" | "ash" | "ksh" | "zsh");
++    let mut prefix = if posix_shell { req.box_prefix.to_vec() } else { Vec::new() };
++    if posix_shell {
++        prefix.extend_from_slice(&exports_prefix(&req.exports));
++    }
+     let cwd = req.cwd;
+     // sarun: report this edge's run-state to the engine so the targets pane can
+     // show only the targets currently building (and their wall time). Only edges
+@@ -374,7 +389,20 @@ impl<'a> Executor<'a> {
+         let mut build_deps: Vec<Symbol> = Vec::new();
+         for (_, d) in order {
+             let dout = d.lock().output;
+-            if std::fs::exists(OsStr::from_bytes(&dout.as_bytes())).unwrap_or(false) {
++            // sarun: resolve the existence probe against the make's logical
++            // working_dir, NOT the process cwd — an in-process sub-make's cwd
++            // differs (`make -C sub` in a box), and a same-named file in the
++            // process cwd made the order-only prerequisite look already-built,
++            // so it was silently never generated (its consumer then failed —
++            // under -j immediately, serially whenever no other edge built it).
++            let dbytes = dout.as_bytes();
++            let dpath = Path::new(OsStr::from_bytes(&dbytes));
++            let dpath = if dpath.is_absolute() {
++                dpath.to_path_buf()
++            } else {
++                self.ce.ev.working_dir.join(dpath)
++            };
++            if std::fs::exists(&dpath).unwrap_or(false) {
+                 continue;
+             }
+             if visiting.contains(&dout) {

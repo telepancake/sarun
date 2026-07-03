@@ -1,19 +1,22 @@
-# Vendored, patched upstreams (`uu_cat`, `findutils`, …)
+# Vendored, patched upstreams (`engine/vendor/` — generated, not tracked)
 
-Each crate is vendored as:
+Each vendored crate is assembled at build time from:
 
-* one **pristine-import commit** — upstream source verbatim at a pinned release
-  (the rebase base), and
-* a **patch series** on top — never squashed.
+* a **pristine pinned upstream** — a crates.io tarball verified by sha256, or a
+  git commit fetched by hash (`engine/vendor.toml`), plus
+* a **patch series** on top — never squashed, one patch per logical change
+  (`engine/vendor-patches/<crate>/{files,series,NNNN-*.patch}`).
 
-To update: replace the pristine base with a newer upstream drop and `git rebase`
-replays the patch series; conflicts surface only where upstream changed the same
-lines. The base must be byte-identical to upstream — do not tidy it.
+`make vendor` (or any `make engine`) runs `scripts/vendor.py`, which downloads
+each upstream into `engine/.vendor-cache/`, copies the crate's file selection
+(`files` — dev-only trees like tests/, benches/, util/ are not selected), and
+applies the series with `git apply` into `engine/vendor/<crate>`. Both
+`engine/vendor/` and the cache are gitignored: the repo carries only pins and
+diffs, never upstream source.
 
-> The brush crates (`brush-core`, `brush-builtins`, …) follow the same
-> pristine-import + rebaseable-patch-series discipline. They are not run as
-> in-process builtins; brush *is* the shell. The update procedure below applies
-> unchanged.
+`files` lists every upstream path the crate consumes, relative to the crate
+root (for git sources with a `subdir`, relative to that subdir). Files the
+patches *create* are not listed — they arrive with the series.
 
 ## What is vendored, and how it is consumed
 
@@ -26,54 +29,18 @@ lines. The base must be byte-identical to upstream — do not tidy it.
 | `findutils` | github.com/uutils/findutils, tag `0.9.1` | `0.9.1` | `findutils = { path = "vendor/findutils" }` in `engine/Cargo.toml`; builtins in `engine/src/find_builtin.rs` and `engine/src/xargs_builtin.rs`, registered in `engine/src/brush.rs` (`box_builtins_opt`) | Reduced to a **find + xargs** library (`lib.rs` = `pub mod find; pub mod xargs;`; the `locate`/`updatedb`/`testing` modules + bins removed). **find:** added `Dependencies::{get_error_output, get_input}` so diagnostics and the `-files0-from -` read go through the shell's logical stderr/stdin. **xargs:** added an `XargsIo` trait (`take_input`/`output`/`error_output`) so item input and xargs's own output/`-t`/warnings/errors go through the logical streams; `xargs_main_with_io` is the embedder entry. Both builtins run their `_main` on a worker thread (the findutils engine is synchronous; the `Shell` isn't `Send`); `find` resolves relative start paths against the shell's logical cwd via a `Dependencies::cwd` hook — NOT `unshare(CLONE_FS)`/`chdir` (see `find_builtin.rs` + PORTING-STORY for why that dead-ends), and `find -exec`/`xargs` commands run through `Shell::run_argv` on subshell clones via the `builtin_exec` sync→async bridge. The commands `find -exec` / `xargs` *spawn* have their stdout/stderr dup'd from the shell's logical streams (`Dependencies::{child_stdout,child_stderr}` / `XargsIo::{child_stdout,child_stderr}`), so `find … -exec cmd \; > file` and `xargs cmd | downstream` honor the box's redirects and pipes; a standalone build inherits the process fds, as upstream does. |
 | brush crates: `brush-core`, `brush-builtins`, `brush-coreutils-builtins`, `brush-parser`, `brush-interactive` | github.com/reubeno/brush, commit `428f477` (PR #1181 — the `OpenFile`-Arc pipeline fd-leak fix), pre-release ahead of crates.io | `428f477` (`brush-core` 0.5.0 / `brush-parser` 0.4.0 / `brush-builtins` 0.2.0 / `brush-coreutils-builtins` 0.1.0 / `brush-interactive` 0.4.0) | `[patch.crates-io]` redirects in `engine/Cargo.toml` point every `brush-*` name at `vendor/brush-*`, so the whole dep graph resolves to one copy | Three patches over the pristine import: **(1) de-workspace** the crate manifests (inline the `*.workspace = true` metadata, drop `[lints]`, turn `path = "../sibling"` deps into plain versions) so each crate stands alone under `[patch.crates-io]`; **(2) pipeline fd hygiene** in `brush-core` — a `compose_std_command` pre_exec `close_stray_fds` hook (closes CLOEXEC-marked stray fds in the child so pipeline children don't leak a stdin-pipe writer and hang) plus a `spawned_pipeline_stage` flag so the dup2'ing `CoreutilWrapper` stays inert on the concurrent spawn path; **(3) launch-state hooks** in `brush-core` — a `LaunchState` on `ExecutionParameters` and a second pre_exec that materializes nice/setsid/SIGHUP-ignore in the child, for the `nice`/`setsid`/`nohup` exec-wrapper builtins (`engine/src/exec_wrappers.rs`). |
 
-Provenance is in each crate's **pristine-import commit message** — find it with:
-
-```bash
-git log --oneline --grep '^vendor: import pristine'
-```
-
-Do **not** hard-code commit hashes: rebasing rewrites them. Re-derive the base
-from that commit message convention.
-
 ## Updating a vendored crate to a newer upstream
 
-Worked example: bumping `findutils` `0.9.1` → `0.10.0`. For `uu_cat`: fetch the
-new crate from crates.io instead of git; skip the find/xargs trim notes. For the
-**brush** crates: clone github.com/reubeno/brush at the new commit, refresh all
-five `vendor/brush-*` directories in one pristine-import commit (`git log --grep
-'^vendor: import pristine brush'` finds the base), then rebase replays the
-de-workspace / fd-hygiene / launch-state patches; re-check `engine/Cargo.toml`'s
-`[patch.crates-io]` versions still match.
-
-```bash
-cd ~/sarun
-
-# 0. Rebase base by message — NOT a remembered hash.
-BASE=$(git log --format=%H --grep '^vendor: import pristine findutils' -1)
-
-# 1. Fetch new upstream.
-cd /tmp && rm -rf fu-new
-git clone --depth 1 --branch 0.10.0 https://github.com/uutils/findutils fu-new
-
-# 2. Rebuild pristine BASE in place (same file selection: src/ Cargo.toml LICENSE README).
-#    dev-only trees (tests/, test_data/, benches/, util/) are NOT vendored.
-cd ~/sarun
-git switch -c vendor-bump "$BASE"
-rm -rf engine/vendor/findutils/{src,Cargo.toml,LICENSE,README.md}
-cp -r /tmp/fu-new/src engine/vendor/findutils/src
-cp /tmp/fu-new/{Cargo.toml,LICENSE,README.md} engine/vendor/findutils/
-git add engine/vendor/findutils
-git commit --amend -m "vendor: import pristine findutils 0.10.0 (find)"
-
-# 3. Replay patch series.
-git rebase --onto vendor-bump "$BASE" <work-branch>
-#    Conflicts only where 0.10.0 touched the same lines our patches did.
-#    The find+xargs trim re-applies by deleting locate/updatedb/testing.
-
-# 4. Verify (see next section). Then:
-git push --force-with-lease       # rewrites SHAs after the base — expected
-git branch -D vendor-bump
-```
+1. Point `engine/vendor.toml` at the new version/commit (for crates.io, put the
+   new tarball's sha256 — `curl -fsSL https://static.crates.io/crates/<c>/<c>-<v>.crate | sha256sum`).
+2. Refresh the selection: diff the old and new upstream trees; add/remove paths
+   in `vendor-patches/<crate>/files` for files upstream added or dropped.
+3. `make vendor`. `git apply` fails loudly on any patch upstream has drifted
+   under; re-spin that patch against the new base (apply the earlier patches,
+   make the change by hand, `git diff --no-prefix`-style regenerate — the patch
+   files are plain `git format-patch` output, so editing the hunks directly is
+   also fine). Do NOT fold patches together while re-spinning.
+4. Verify (next section).
 
 ## Verifying after an update (the regression net)
 
@@ -120,9 +87,9 @@ signed off.
 
 ## Conventions (the tooling above depends on these)
 
-* Pristine-import commit message **must** start with
-  `vendor: import pristine <crate> <version>`.
-* Exactly one pristine-import commit per crate; everything after it is a patch.
-  **Never squash** the base into patches or patches together.
-* The base tree **is** upstream byte-for-byte. File-selection changes go in a
-  *patch* commit, not the base.
+* One patch per logical change, numbered `NNNN-<slug>.patch`, ordered by
+  `series`. **Never squash** patches together while re-spinning.
+* The assembled base (selection, before patches) **is** upstream byte-for-byte.
+  File-selection changes are made in `files`, never by editing fetched source.
+* Patch files are `git format-patch` output (subject + body preserved) so the
+  why of every delta travels with the diff.

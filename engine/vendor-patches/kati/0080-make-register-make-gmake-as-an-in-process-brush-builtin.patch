@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 10:09:13 +0000
+Subject: [PATCH] make: register make/gmake as an in-process brush builtin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Recursive `$(MAKE)` (and configure/cmake-invoked make) now runs IN-PROCESS
+instead of re-exec'ing the engine per sub-make. When brush runs `make`/`gmake`
+it dispatches the new MakeBuiltin, which drives kati against the brush
+ExecutionContext's LOGICAL state — working_dir from context.shell (resolved
+with -C, no process chdir) and recipe output routed to context fd 1 — using
+the per-instance Evaluator from the earlier de-globalization. In a -b box the
+top-level make is dispatched the same way, so a recursive build now runs
+entirely in ONE process: zero `make` rows (box test CASE 6).
+
+Mechanism:
+- kati exec.rs: recipe stdout goes through a thread-local sink (set_recipe_out)
+  — process stdout by default, the builtin's context fd 1 when set.
+- kati fileutil.rs: RecipeRunner is an Arc, cloned out with the lock RELEASED
+  before invocation, so a recursive in-process make whose recipes re-enter
+  run_with_installed_runner doesn't deadlock on the (non-reentrant) lock.
+- brush.rs: BOX_RECIPE_CWD thread-local so recipes run at the make's logical
+  working_dir, not the process cwd; MakeBuiltin (args already include argv[0],
+  like the coreutils) + registration.
+- katirun.rs: make_builtin entry (context-driven, no chdir, no exec); the
+  recipe-runner install is factored out and shared with make_main.
+
+Validated: box test MAKE-RS PASS (CASE 6 recursive make in-process added);
+kati corpus KATI_COMPAT_PASS=364/378 fail=0; engine builds. The shadow/main()
+path is untouched (used outside brush). KNOWN GAP: self-generating includes
+(remake) aren't yet handled by the builtin — in-process remake loop is next.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/exec.rs     | 37 ++++++++++++++++++++++++++++++++++++-
+ src-rs/fileutil.rs | 12 +++++++++---
+ 2 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 359b644..a744fba 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -39,6 +39,41 @@ use crate::{
+     warn,
+ };
+ 
++thread_local! {
++    // sarun: when set, recipe stdout is written HERE instead of the process
++    // stdout. An in-process `make` builtin sets this to a writer over its brush
++    // ExecutionContext's fd 1, so a recursive/nested make's recipe output flows
++    // up the brush pipe chain rather than escaping to the real terminal.
++    // Default None → the shadow/standalone path prints to process stdout exactly
++    // as before. kati runs recipes synchronously on the make's own thread, so a
++    // thread-local is the correct scope (concurrent makes are on other threads).
++    static RECIPE_OUT: std::cell::RefCell<Option<Box<dyn std::io::Write>>> =
++        const { std::cell::RefCell::new(None) };
++}
++
++/// sarun: install (or clear) the thread-local recipe-output sink, returning the
++/// previous value so a nested make can save/restore it. Pass None to reset.
++pub fn set_recipe_out(
++    w: Option<Box<dyn std::io::Write>>,
++) -> Option<Box<dyn std::io::Write>> {
++    RECIPE_OUT.with(|c| std::mem::replace(&mut *c.borrow_mut(), w))
++}
++
++/// sarun: emit a recipe's captured stdout — to the thread-local sink if a make
++/// builtin installed one, else to the process stdout (unchanged default).
++fn emit_recipe_output(output: &[u8]) {
++    RECIPE_OUT.with(|c| {
++        let mut slot = c.borrow_mut();
++        if let Some(w) = slot.as_mut() {
++            use std::io::Write;
++            let _ = w.write_all(output);
++            let _ = w.flush();
++        } else {
++            print!("{}", String::from_utf8_lossy(output));
++        }
++    });
++}
++
+ #[derive(Clone, Copy, PartialEq, Eq)]
+ pub enum ExecStatus {
+     Processing,
+@@ -230,7 +265,7 @@ impl<'a> Executor<'a> {
+                         )?;
+                         (status.success(), out, status.code().unwrap_or(1))
+                     };
+-                print!("{}", String::from_utf8_lossy(&output));
++                emit_recipe_output(&output);
+                 if !ok {
+                     if command.ignore_error {
+                         eprintln!(
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 52c9b5b..0017c48 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -48,7 +48,11 @@ pub enum RecipeRunnerDecision {
+     Passthrough,
+ }
+ 
+-pub type RecipeRunner = Box<
++// sarun: Arc (not Box) so run_with_installed_runner can clone the runner out
++// and RELEASE the lock before invoking it — a recursive in-process make's
++// recipes re-enter run_with_installed_runner, and holding this non-reentrant
++// lock across the call would deadlock.
++pub type RecipeRunner = Arc<
+     dyn Fn(&[u8] /* shell */, &[u8] /* shellflag */, &[u8] /* cmd */, &mut dyn FnMut(&[u8]))
+         -> RecipeRunnerDecision
+         + Send
+@@ -75,8 +79,10 @@ pub fn run_with_installed_runner(
+     shellflag: &[u8],
+     cmd: &[u8],
+ ) -> Option<(i32, Vec<u8>)> {
+-    let guard = RECIPE_RUNNER.lock();
+-    let runner = guard.as_ref()?;
++    // sarun: clone the runner Arc and RELEASE the lock before invoking it. The
++    // runner may run a recursive in-process make whose recipes re-enter here;
++    // holding this non-reentrant lock across the call would deadlock.
++    let runner = RECIPE_RUNNER.lock().as_ref()?.clone();
+     let mut out = Vec::new();
+     match runner(shell, shellflag, cmd, &mut |b| out.extend_from_slice(b)) {
+         RecipeRunnerDecision::Ran { code } => Some((code, out)),

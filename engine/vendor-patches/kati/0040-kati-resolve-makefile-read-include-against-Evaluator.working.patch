@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 08:50:36 +0000
+Subject: [PATCH] kati: resolve makefile read/include against
+ Evaluator.working_dir
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+First logical-cwd boundary. Makefile::from_file now takes (display_name,
+open_path): it reads bytes from open_path but interns display_name for
+Locs/$(MAKEFILE_LIST), so the resolved path never leaks into output. The
+file_cache resolves the include/makefile name against the requesting
+Evaluator's working_dir (absolute names pass through) and keys the cache by
+that resolved absolute path — so two in-process makes in different directories
+that both `include Makefile` get their own correct entries instead of
+colliding, and the cache stays shareable.
+
+Call sites (eval do_include, standalone main parse, engine katirun parse) pass
+their Evaluator's working_dir. With working_dir == process cwd the resolved
+path names the same file and the interned display name is identical, so
+standalone rkati is byte-identical: KATI_COMPAT_PASS=364/378, fail=0. Engine
+builds.
+
+Remaining boundaries ($(wildcard)/$(abspath)/$(realpath)/$(file), find root)
+follow the same shape.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/eval.rs       |  2 +-
+ src-rs/file.rs       | 17 ++++++++++++-----
+ src-rs/file_cache.rs | 43 ++++++++++++++++++++++++++++++++++---------
+ src-rs/main.rs       |  2 +-
+ 4 files changed, 48 insertions(+), 16 deletions(-)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index a5d5fef..e4aaf4e 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -1017,7 +1017,7 @@ impl Evaluator {
+         let filename = OsString::from_vec(fname.to_vec());
+         collect_stats_with_slow_report!("included makefiles", &filename);
+ 
+-        let Some(mk) = file_cache::get_makefile(&filename)? else {
++        let Some(mk) = file_cache::get_makefile(&filename, &self.working_dir)? else {
+             error_loc!(
+                 self.loc.as_ref(),
+                 "{} does not exist",
+diff --git a/src-rs/file.rs b/src-rs/file.rs
+index 7940494..63a0cfc 100644
+--- a/src-rs/file.rs
++++ b/src-rs/file.rs
+@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-use std::{ffi::OsStr, os::unix::ffi::OsStrExt, sync::Arc};
++use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path, sync::Arc};
+ 
+ use anyhow::Result;
+ use bytes::Bytes;
+@@ -32,14 +32,21 @@ pub struct Makefile {
+ }
+ 
+ impl Makefile {
+-    pub fn from_file(filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
+-        if !std::fs::exists(filename)? {
++    /// sarun: `display_name` is recorded for Locs / `$(MAKEFILE_LIST)` verbatim
++    /// (usually the relative name the makefile referenced); `open_path` is where
++    /// the bytes are actually read — the display name resolved against the
++    /// Evaluator's logical `working_dir`. Splitting the two lets an in-process
++    /// make read a makefile relative to a logical cwd without touching the
++    /// process cwd, while keeping path strings in output unchanged. With
++    /// `working_dir == process cwd` the two name the same file.
++    pub fn from_file(display_name: &OsStr, open_path: &Path) -> Result<Option<Arc<Makefile>>> {
++        if !std::fs::exists(open_path)? {
+             return Ok(None);
+         }
+ 
+-        let buf = Bytes::from(std::fs::read(filename)?);
++        let buf = Bytes::from(std::fs::read(open_path)?);
+ 
+-        let filename = intern(filename.as_bytes().to_vec());
++        let filename = intern(display_name.as_bytes().to_vec());
+         let stmts = parse_file(&buf, filename)?;
+ 
+         Ok(Some(Arc::new(Makefile { filename, stmts })))
+diff --git a/src-rs/file_cache.rs b/src-rs/file_cache.rs
+index d2e18b2..99d5dbb 100644
+--- a/src-rs/file_cache.rs
++++ b/src-rs/file_cache.rs
+@@ -17,6 +17,7 @@ limitations under the License.
+ use std::{
+     collections::{HashMap, HashSet},
+     ffi::{OsStr, OsString},
++    path::{Path, PathBuf},
+     sync::{Arc, LazyLock},
+ };
+ 
+@@ -33,24 +34,48 @@ static CACHE: LazyLock<Mutex<MakefileCacheManager>> = LazyLock::new(|| {
+ });
+ 
+ struct MakefileCacheManager {
+-    cache: HashMap<OsString, Option<Arc<Makefile>>>,
++    // sarun: keyed by the RESOLVED absolute path (display name joined onto the
++    // requesting Evaluator's working_dir), not the relative name. Two in-process
++    // makes in different directories that both `include Makefile` therefore get
++    // their own (correct) entries instead of colliding, and the cache stays
++    // safely shareable across instances.
++    cache: HashMap<PathBuf, Option<Arc<Makefile>>>,
+     extra_file_deps: HashSet<OsString>,
+ }
+ 
+ impl MakefileCacheManager {
+-    fn get_makefile(&mut self, filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
+-        if let Some(mk) = self.cache.get(filename) {
++    fn get_makefile(
++        &mut self,
++        display_name: &OsStr,
++        open_path: &Path,
++    ) -> Result<Option<Arc<Makefile>>> {
++        if let Some(mk) = self.cache.get(open_path) {
+             return Ok(mk.clone());
+         }
+-        let filename = filename.to_os_string();
+-        let mk = Makefile::from_file(&filename)?;
+-        self.cache.insert(filename, mk.clone());
++        let mk = Makefile::from_file(display_name, open_path)?;
++        self.cache.insert(open_path.to_path_buf(), mk.clone());
+         Ok(mk)
+     }
+ }
+ 
+-pub fn get_makefile(filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
+-    CACHE.lock().get_makefile(filename)
++/// sarun: resolve a makefile/include name against a logical working directory.
++/// Absolute names pass through; relative names are joined onto `base_dir` (the
++/// Evaluator's working_dir). The result is used ONLY for the fs read and as the
++/// cache key — the original `filename` is what gets interned for
++/// Locs/$(MAKEFILE_LIST), so display strings are unchanged. With base_dir ==
++/// process cwd this names the same file a bare relative open would.
++fn resolve(base_dir: &Path, filename: &OsStr) -> PathBuf {
++    let p = Path::new(filename);
++    if p.is_absolute() {
++        p.to_path_buf()
++    } else {
++        base_dir.join(p)
++    }
++}
++
++pub fn get_makefile(filename: &OsStr, base_dir: &Path) -> Result<Option<Arc<Makefile>>> {
++    let open_path = resolve(base_dir, filename);
++    CACHE.lock().get_makefile(filename, &open_path)
+ }
+ 
+ pub fn add_extra_file_dep(filename: OsString) {
+@@ -61,7 +86,7 @@ pub fn get_all_filenames() -> HashSet<OsString> {
+     let manager = CACHE.lock();
+     let mut ret = HashSet::new();
+     for p in manager.cache.keys() {
+-        ret.insert(p.clone());
++        ret.insert(p.as_os_str().to_os_string());
+     }
+     for f in &manager.extra_file_deps {
+         ret.insert(f.clone());
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index f8fd848..dea3778 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -207,7 +207,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+             Bytes::from(makefile.as_bytes().to_vec()),
+             Loc::default(),
+         );
+-        let Some(mk) = kati::file_cache::get_makefile(&makefile)? else {
++        let Some(mk) = kati::file_cache::get_makefile(&makefile, &ev.working_dir)? else {
+             bail!("makefile not found")
+         };
+         let stmts = mk.stmts.lock();

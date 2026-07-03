@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 06:51:52 +0000
+Subject: [PATCH] provenance: opt-in --vars; record rhs, dereferences, and
+ execution context
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Variable tracing is now OPT-IN: `sarun run --vars` (exports
+SARUN_TRACE_VARS=1 into the box; both recorders early-return without
+it) — a yocto-scale build pays nothing by default.
+
+Each makevar row additionally records HOW the assignment looked and
+what fed it: the UNEXPANDED rhs text (kati stmt.orig_rhs / brush's
+assignment AST, capped 1KB) and the variable names it dereferences
+(text scan; make function heads excluded, $(call NAME,…)/$(value
+NAME) count their first argument) — plus its execution context: the
+recipe edge's primary output and the enclosing pipeline uid (a
+builtin sub-make parses on the invoking recipe's thread, so its
+assignments anchor to the spawning edge). review.makevars resolves
+those anchors to build_edges/brushprov row ids in the same query and
+grows an any-mode (OR name/value) for single-term searches. The kati
+hook also reports the ASSIGNMENT site (+= points at the append, not
+the original :=).
+
+test_make_rs.py case 24 covers rhs/refs, edge anchoring of shell and
+sub-make assignments, and that an untraced box records zero rows.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src/interp.rs | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/src/interp.rs b/src/interp.rs
+index 091a091..08bd338 100644
+--- a/src/interp.rs
++++ b/src/interp.rs
+@@ -1544,7 +1544,8 @@ async fn expand_assignment_value(
+ // interpreter applies — (name, value, exported). The embedding engine records
+ // them (tagged with its recipe/pipeline context) into the box's capture DB so
+ // make↔shell↔sub-make variable flows are traceable from one searchable place.
+-pub type AssignObserver = std::sync::Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
++/// (name, expanded value, exported, UNEXPANDED assignment text)
++pub type AssignObserver = std::sync::Arc<dyn Fn(&str, &str, bool, &str) + Send + Sync>;
+ 
+ static ASSIGN_OBSERVER: std::sync::RwLock<Option<AssignObserver>> =
+     std::sync::RwLock::new(None);
+@@ -1559,9 +1560,9 @@ fn assign_observer() -> Option<AssignObserver> {
+ 
+ /// Report one assignment to the installed observer — for builtins that set
+ /// variables outside apply_assignment (export/declare).
+-pub fn observe_assignment(name: &str, value: &str, exported: bool) {
++pub fn observe_assignment(name: &str, value: &str, exported: bool, rhs: &str) {
+     if let Some(obs) = assign_observer() {
+-        obs(name, value, exported);
++        obs(name, value, exported, rhs);
+     }
+ }
+ 
+@@ -1634,7 +1635,8 @@ async fn apply_assignment(
+ 
+     // sarun: report to the installed assignment observer (engine capture).
+     if let Some(obs) = assign_observer() {
+-        obs(variable_name.as_str(), &new_value.to_string(), export);
++        obs(variable_name.as_str(), &new_value.to_string(), export,
++            &assignment.to_string());
+     }
+ 
+     // See if we need to eval an array index.

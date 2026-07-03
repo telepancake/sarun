@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 1 Jul 2026 17:59:04 +0000
+Subject: [PATCH] vendor/brush-builtins: exec in a subshell must terminate the
+ script
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+exec's subshell-safe fallback (delegating to the `command` builtin, since
+a brush "subshell" isn't its own OS process and a real exec(2) there
+would take down whatever embeds it) ran the target command but then let
+control fall back to the caller — unlike a real exec, which never returns
+on success. Scripts that pair `exec` with trailing "could not exec"
+fallback code (a common idiom; autoconf's shell-reexec bootstrap is one)
+ran that fallback even though the delegated command completed normally,
+corrupting the script's exit status.
+
+Surfaced by running `./configure && make` for an autotools project (less)
+through sarun: configure's `exec $CONFIG_SHELL ... "$as_myself"` bootstrap
+successfully re-ran the whole script under bash (producing correct
+Makefile/defines.h), but then fell through into its own "could not
+re-execute" + `exit 255` path, so `configure` reported failure and the
+`&&`-chained `make` never ran.
+
+Fix: after the delegated command completes, force the same
+"terminate this script now" control flow the `exit` builtin uses
+(ExecutionControlFlow::ExitShell), carrying the delegated command's exit
+code — matching what a real successful exec would have produced.
+---
+ src/exec.rs | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/src/exec.rs b/src/exec.rs
+index d3ade04..1a4b341 100644
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -1,7 +1,9 @@
+ use clap::Parser;
+ use std::{borrow::Cow, os::unix::process::CommandExt};
+ 
+-use brush_core::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, commands};
++use brush_core::{
++    ErrorKind, ExecutionControlFlow, ExecutionExitCode, ExecutionResult, builtins, commands,
++};
+ 
+ /// Exec the provided command.
+ #[derive(Parser)]
+@@ -55,7 +57,25 @@ impl builtins::Command for ExecCommand {
+                 ..Default::default()
+             };
+ 
+-            return cmd_cmd.execute(context).await;
++            // sarun: a real exec(2) never returns to the calling script on
++            // success — code following `exec CMD` only runs if CMD couldn't
++            // be launched at all. Delegating to `command` here (required
++            // because a brush "subshell" isn't its own OS process, so truly
++            // replacing the process image would take down whatever embeds
++            // it) DOES return control to the caller once CMD finishes. Left
++            // alone, that resumes the script exactly where a real exec would
++            // never have resumed it — corrupting scripts that pair `exec`
++            // with trailing "could not exec" fallback/cleanup code, a common
++            // idiom (e.g. autoconf's shell-reexec bootstrap hits its own
++            // "could not re-execute" + `exit 255` path even though the
++            // delegated command ran to completion). Force the same
++            // "terminate this script now" control flow the `exit` builtin
++            // uses, carrying the delegated command's exit code, so the
++            // caller observes what a real successful exec would have
++            // produced: no further statements execute.
++            let mut result = cmd_cmd.execute(context).await?;
++            result.next_control_flow = ExecutionControlFlow::ExitShell;
++            return Ok(result);
+         }
+ 
+         let mut argv0 = Cow::Borrowed(self.name_for_argv0.as_ref().unwrap_or(&self.args[0]));

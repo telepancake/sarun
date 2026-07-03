@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 21 Jun 2026 21:24:26 +0000
+Subject: [PATCH] brush: wire `cat` as a genuine native injected-I/O builtin
+ (no dup2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Box `cat` was never an in-process native builtin. It fell through the
+generic CoreutilWrapper, and with no gate it gate_false'd straight to a
+fork+exec of the host /usr/bin/cat. The vendored uu_cat fork has long
+exposed an injected logical entry — `uu_cat::cat(out, out_fd, stdin,
+stdin_fd)` that writes a caller-supplied sink with no process-global
+stdio — but nothing called it: the engine only ever reached uu_cat via
+its `uumain`, which writes the process's real fd 0/1/2 and therefore
+needs CoreutilWrapper's `with_fd_redirected` (a process-global dup2) to
+aim at a box sink.
+
+This finishes the port:
+
+  * CatBuiltin (brush.rs) — a SimpleCommand that calls `uu_cat::cat`
+    DIRECTLY against the box's logical OpenFiles, passing their backing
+    raw fds so cat's splice(2) fast path still fires. No dup2, so it is
+    concurrency-safe and works as a pipeline stage too (unlike the
+    CoreutilWrapper path, which must shell out a piped coreutil to avoid
+    the dup2 racing sibling spawns). Registered to overwrite cat's
+    generic CoreutilWrapper registration, under bundle_coreutils only.
+  * gate_cat (brush_gates.rs) — accepts the audited formatting flag set
+    (-A -b -e -E -n -s -t -T -u -v and their long forms) plus positional
+    files / `-`; refuses --help/--version and unaudited options so their
+    wording falls back to host GNU cat.
+  * init_localization (brush-coreutils-builtins) — exposes the Fluent
+    setup the bundled-coreutils adapter runs, so cat's translate!()
+    messages (e.g. "Is a directory") render instead of raw keys when the
+    engine calls the logical entry directly.
+  * engine now depends on uu_cat directly (the patch.crates-io already
+    redirected it to the vendored fork).
+
+Proof it takes the injected path, not uumain+dup2:
+  - strace of `cat in > out` in a brush box: zero dup2/dup3, no execve of
+    any cat binary; the output fd (the `> out` OpenFile) is written
+    directly via splice. By contrast `uname > out` (still CoreutilWrapper)
+    shows dup2(fd,1) + the restoring dup2 — the process-global redirect.
+  - test_brush_nested_sh_rs case7 ("NO external /usr/bin/cat process row")
+    failed on baseline (cat was external) and now passes (cat in-process).
+  - functional: multi-file concat, -n numbering, missing-file continues
+    with exit 1 and GNU wording, directory arg renders "Is a directory",
+    stdin pipe, and `cat --version` correctly falling back to host GNU.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/lib.rs | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index a52e6e9..3a6fd8b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -67,6 +67,16 @@ fn prepare_uutil_runtime(util_crate_name: &str) {
+     }
+ }
+ 
++/// Initialize uucore's localization bundle for the util implemented by
++/// `util_crate_name` (e.g. `"uu_cat"`), so an embedder that calls that util's
++/// LOGICAL entry point directly — bypassing the `register!` adapter, as the
++/// engine's native injected-I/O `cat` builtin does — still renders `translate!`
++/// messages instead of raw Fluent keys. Mirrors the setup half the generated
++/// adapter runs (sans the stdin/stdout dance), and is idempotent per thread.
++pub fn init_localization(util_crate_name: &str) {
++    prepare_uutil_runtime(util_crate_name);
++}
++
+ /// Second half of the `uucore::bin!` body: flush stdout after `uumain`
+ /// returns. `bin!` does this before calling `std::process::exit` to work
+ /// around <https://github.com/rust-lang/rust/issues/23818>. We do it here so

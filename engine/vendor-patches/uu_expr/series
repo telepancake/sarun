@@ -1,0 +1,3 @@
+0010-uu_expr-add-injected-I-O-logical-entry-for-an-in-process-bru.patch
+0020-vendor-drop-stray-Cargo.lock-.cargo_vcs_info.json-from-uutil.patch
+0030-uu_expr-match-GNU-expr-for-leading-integers-and-out-of-range.patch

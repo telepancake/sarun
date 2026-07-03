@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 3 Jul 2026 11:41:04 +0000
+Subject: [PATCH] =?UTF-8?q?kati:=20honor=20.NOTPARALLEL=20=E2=80=94=20seri?=
+ =?UTF-8?q?alize=20the=20make=20even=20under=20-j/jobserver?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+.NOTPARALLEL was in the 'no-op for us' list from before the parallel
+scheduler existed — with -j real, ignoring it races recipes GNU would
+have serialized, which is exactly how wrapper makefiles order
+side-effect files that no rule declares as an output ('No rule to
+make target .../library.so' immediately under -j, fine on the host).
+The evaluator carries the flag; the executor forces cap=1 for that
+make (sub-makes still parallelize per their own makefiles, like GNU).
+Corpus case pins the ordering shape under -j8. Both corpora fail=0.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/dep.rs                 | 12 ++++++++----
+ src-rs/eval.rs                |  4 ++++
+ src-rs/exec.rs                |  5 ++++-
+ testcase/sarun_notparallel.mk | 11 ++++++++---
+ 4 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 2adeb14..0500af5 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -566,17 +566,21 @@ impl<'a> DepBuilder<'a> {
+         // it asks make to DELETE the file after build. We don't, so
+         // it's a real semantic divergence (user expects the file
+         // gone; we leave it). Belongs in the warn list.
+-        // sarun: .NOTPARALLEL is a no-op for us because the executor
+-        // runs one recipe at a time anyway — there's nothing parallel to
+-        // serialize. .INTERMEDIATE asks for post-build deletion of the
++        // sarun: .INTERMEDIATE asks for post-build deletion of the
+         // marked targets; we don't delete, but the user-observable
+         // recipe output is identical, and warning would diverge it.
+         let noop_for_us = [
+             ".PRECIOUS",
+             ".SECONDARY",
+-            ".NOTPARALLEL",
+             ".INTERMEDIATE",
+         ];
++        // .NOTPARALLEL: this make runs its recipes SERIALLY even under -j —
++        // real semantics now that the executor has a parallel scheduler.
++        // Wrapper makefiles rely on it to order side-effect files that no
++        // rule declares as its output.
++        if self.get_rule_inputs(intern(".NOTPARALLEL")).is_some() {
++            self.ev.not_parallel = true;
++        }
+         // sarun: .EXPORT_ALL_VARIABLES isn't a rule whose recipe runs —
+         // it's a flag that tells make to export every variable into the
+         // recipe environment. Flip the Evaluator flag if present.
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 1d41c6a..c3b3334 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -264,6 +264,9 @@ pub struct Evaluator {
+     /// sarun: accumulated `vpath PATTERN DIRS` directive entries, in
+     /// makefile order — consumed by dep.rs's directory search.
+     pub vpath_patterns: Vec<(Bytes, Vec<Bytes>)>,
++    /// sarun: `.NOTPARALLEL:` was seen — this make's recipes run serially
++    /// even when -j / a jobserver is in effect.
++    pub not_parallel: bool,
+     /// sarun: per-instance global variable bindings, indexed by Symbol id.
+     /// Moved off the process-global symbol table (symtab `symbol_data`) so each
+     /// Evaluator — i.e. each make invocation — owns its OWN global namespace.
+@@ -366,6 +369,7 @@ impl Evaluator {
+         let ev = Self {
+             rule_vars: HashMap::new(),
+             vpath_patterns: Vec::new(),
++            not_parallel: false,
+             global_vars: Arc::new(Mutex::new(Vec::new())),
+             working_dir: std::env::current_dir().unwrap_or_default(),
+             include_dirs: Vec::new(),
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index d69ce7c..2cb2cfd 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -864,6 +864,7 @@ pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
+ pub fn exec_opts(
+     roots: Vec<NamedDepNode>, ev: &mut Evaluator, quiet_failures: bool,
+ ) -> Result<()> {
++    let not_parallel = ev.not_parallel;
+     let mut executor = Executor::new(ev)?;
+     executor.quiet_failures = quiet_failures;
+     // One engine: a dependency-count scheduler with a worker cap. Parallel only
+@@ -875,7 +876,9 @@ pub fn exec_opts(
+     // Parallel when -j>1 was requested OR a parent advertised a jobserver in
+     // MAKEFLAGS (a sub-make inherits parallelism, like GNU make). Plain standalone
+     // `make` with no jobserver stays serial (cap 1), so the corpus is unaffected.
+-    let parallel = FLAGS.jobs_explicit || client.is_some();
++    let parallel = (FLAGS.jobs_explicit || client.is_some())
++        // .NOTPARALLEL: this make is serial regardless of -j/jobserver.
++        && !not_parallel;
+     let cap = if parallel { FLAGS.num_jobs.max(1) } else { 1 };
+     let client = if cap > 1 { client } else { None };
+     executor.exec_graph(roots.clone(), cap, client)?;
+diff --git a/testcase/sarun_notparallel.mk b/testcase/sarun_notparallel.mk
+index a26a479..36d8428 100644
+--- a/testcase/sarun_notparallel.mk
++++ b/testcase/sarun_notparallel.mk
+@@ -1,4 +1,9 @@
++# .NOTPARALLEL serializes THIS make even under -j — wrapper makefiles rely
++# on it to order side-effect files no rule declares as its output. Was a
++# stale no-op from before the parallel scheduler existed.
+ .NOTPARALLEL:
+-all: a b
+-a: ; @echo a
+-b: ; @echo b
++all: consumer
++primary:
++	@mkdir -p gen && echo lib > gen/side2.so && echo made-primary
++consumer: primary gen/side2.so
++	@echo "consumer=[$(wordlist 2,2,$^)]"

@@ -1,0 +1,514 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 22 Jun 2026 11:54:50 +0000
+Subject: [PATCH] uu_wc: add injected-I/O logical entry for an in-process brush
+ builtin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adapt the vendored uu_wc so it runs as a native in-process brush builtin
+that reads/writes the shell's logical OpenFile sink/source instead of the
+process's global stdin/stdout/stderr — no process-global stdio, no dup2, so it
+is safe as a concurrent pipeline stage. uumain is retained as a thin descriptor
+bridge over the new entry for the standalone binary / --invoke-bundled path.
+Behavior (and any fast path) is kept byte-for-byte; only the I/O seam moved.
+See engine/vendor/uu_wc/src for the diff against the pristine base.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01TNBGBV51j5AH4j8k8ENi1W
+---
+ src/count_fast.rs |   6 +-
+ src/countable.rs  |  68 +++++++++++-
+ src/wc.rs         | 263 ++++++++++++++++++++++++++++++++++++++--------
+ 3 files changed, 292 insertions(+), 45 deletions(-)
+
+diff --git a/src/count_fast.rs b/src/count_fast.rs
+index 637a777..7b469df 100644
+--- a/src/count_fast.rs
++++ b/src/count_fast.rs
+@@ -76,8 +76,12 @@ fn count_bytes_using_splice(fd: &impl AsFd) -> Result<usize, usize> {
+ pub(crate) fn count_bytes_fast<T: WordCountable>(handle: &mut T) -> (usize, Option<io::Error>) {
+     let mut byte_count = 0;
+ 
++    // The fstat/seek/splice fast paths below need a real descriptor. A logical
++    // in-memory source (the injected brush stdin with no backing fd) reports a
++    // negative raw fd; skip straight to the read loop for it. `BorrowedFd`
++    // forbids -1, so we must not even construct one in that case.
+     #[cfg(unix)]
+-    {
++    if handle.as_raw_fd() >= 0 {
+         let fd = handle.as_fd();
+         if let Ok(stat) = rustix::fs::fstat(fd) {
+             // If the file is regular, then the `st_size` should hold
+diff --git a/src/countable.rs b/src/countable.rs
+index 32d5655..6ea2077 100644
+--- a/src/countable.rs
++++ b/src/countable.rs
+@@ -11,7 +11,7 @@ use std::fs::File;
+ use std::io::{BufRead, BufReader, Read, StdinLock};
+ 
+ #[cfg(unix)]
+-use std::os::fd::{AsFd, AsRawFd};
++use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+ 
+ #[cfg(unix)]
+ pub trait WordCountable: AsFd + AsRawFd + Read {
+@@ -75,3 +75,69 @@ impl WordCountable for File {
+         BufReader::new(self)
+     }
+ }
++
++/// The shell's logical standard input, as handed to the in-process `wc`
++/// builtin: an arbitrary [`Read`] sink (`reader`) plus the raw descriptor
++/// backing it (`in_fd`) when one exists.
++///
++/// Upstream `wc` reads the process's real stdin (`io::stdin().lock()`). The
++/// logical entry point [`crate::wc`] never touches process-global stdio; it
++/// drives counting from this handle instead. `in_fd` is `None` for an
++/// in-memory stream with no descriptor — in which case the `-c` `fstat`/splice
++/// fast paths in [`crate::count_fast`] are skipped (they `fstat` an invalid fd,
++/// which fails, and fall through to the plain read loop, so byte counts are
++/// still correct).
++#[cfg(unix)]
++pub struct LogicalStdin<'a> {
++    reader: &'a mut dyn Read,
++    in_fd: Option<RawFd>,
++}
++
++#[cfg(unix)]
++impl<'a> LogicalStdin<'a> {
++    pub fn new(reader: &'a mut dyn Read, in_fd: Option<RawFd>) -> Self {
++        Self { reader, in_fd }
++    }
++}
++
++#[cfg(unix)]
++impl Read for LogicalStdin<'_> {
++    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++        self.reader.read(buf)
++    }
++}
++
++#[cfg(unix)]
++impl AsRawFd for LogicalStdin<'_> {
++    fn as_raw_fd(&self) -> RawFd {
++        // -1 when there is no backing descriptor: `fstat(-1)` fails, so the
++        // byte-count fast path in `count_fast` falls back to the read loop.
++        self.in_fd.unwrap_or(-1)
++    }
++}
++
++#[cfg(unix)]
++impl AsFd for LogicalStdin<'_> {
++    fn as_fd(&self) -> BorrowedFd<'_> {
++        // SAFETY: when `in_fd` is `Some`, it is the descriptor of the OpenFile
++        // that backs `reader`, which outlives this handle. When `None`, we
++        // borrow the invalid fd -1; the only consumer (`rustix::fs::fstat`)
++        // treats it as an error and falls through to the read loop.
++        unsafe { BorrowedFd::borrow_raw(self.in_fd.unwrap_or(-1)) }
++    }
++}
++
++#[cfg(unix)]
++impl WordCountable for LogicalStdin<'_> {
++    type Buffered = BufReader<Self>;
++
++    fn buffered(self) -> Self::Buffered {
++        BufReader::new(self)
++    }
++
++    fn inner_file(&mut self) -> Option<&mut File> {
++        // Not a real `File`, so the seek-based `-c` optimization is skipped;
++        // the read loop in `count_bytes_fast` handles it correctly.
++        None
++    }
++}
+diff --git a/src/wc.rs b/src/wc.rs
+index 90c8075..68700b1 100644
+--- a/src/wc.rs
++++ b/src/wc.rs
+@@ -16,10 +16,12 @@ use std::{
+     env,
+     ffi::{OsStr, OsString},
+     fs::{self, File},
+-    io::{self, Write, stderr},
++    io::{self, Read, Write},
+     iter,
+     path::{Path, PathBuf},
+ };
++#[cfg(unix)]
++use std::os::fd::BorrowedFd;
+ 
+ use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
+ use thiserror::Error;
+@@ -33,7 +35,6 @@ use uucore::{
+     hardware::{HardwareFeature, HasHardwareFeatures as _, SimdPolicy},
+     parser::shortcut_value_parser::ShortcutValueParser,
+     quoting_style::{self, QuotingStyle},
+-    show,
+ };
+ 
+ use crate::{
+@@ -381,14 +382,63 @@ impl UError for WcError {
+     }
+ }
+ 
+-#[uucore::main]
+-pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++/// Logical entry point for the bundled `wc` builtin.
++///
++/// Unlike upstream's `uumain`, this never touches the process's own stdio: the
++/// counts table is written to the shell's logical output sink (`out`), every
++/// per-file diagnostic to the logical error sink (`err`), and stdin counting
++/// reads the shell's logical input source (`stdin`, with its backing descriptor
++/// `stdin_fd` when one exists). With no backing fd the `-c` `fstat`/splice fast
++/// path is skipped and bytes are read through the trait object, so it is correct
++/// for both real pipes/files and in-memory streams and holds no process-global
++/// state.
++///
++/// `out_fd` is accepted for signature parity with the other injected-I/O
++/// builtins; `wc` writes a small formatted table and never needs the raw output
++/// descriptor (no splice-to-stdout fast path), so it is intentionally ignored.
++pub fn wc(
++    args: impl uucore::Args,
++    out: &mut dyn Write,
++    out_fd: Option<BorrowedFd<'_>>,
++    err: &mut dyn Write,
++    stdin: &mut dyn Read,
++    stdin_fd: Option<BorrowedFd<'_>>,
++) -> UResult<()> {
++    let _ = out_fd; // see doc comment: wc has no output-fd fast path.
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+ 
+     let settings = Settings::new(&matches);
+     let inputs = Inputs::new(&matches)?;
+ 
+-    wc(&inputs, &settings)
++    let raw = stdin_fd.map(|fd| {
++        use std::os::fd::AsRawFd;
++        fd.as_raw_fd()
++    });
++    let mut handle = Some(countable::LogicalStdin::new(stdin, raw));
++    wc_impl(&inputs, &settings, out, err, &mut handle)
++}
++
++/// Descriptor-based entry point for the standalone `wc` binary and the
++/// `--invoke-bundled` subprocess dispatcher.
++///
++/// In those contexts the process's own fd 0/1/2 *are* the intended I/O, so this
++/// is a thin bridge that hands them to [`wc`]. The in-process brush builtin must
++/// NOT route through here — it calls [`wc`] directly with the shell's logical
++/// sinks/source (and their backing fds, when any), so it never touches
++/// process-global stdio.
++#[uucore::main]
++pub fn uumain(args: impl uucore::Args) -> UResult<()> {
++    let stdout = io::stdout();
++    let mut out = stdout.lock();
++    let stderr = io::stderr();
++    let mut err = stderr.lock();
++    let stdin = io::stdin();
++    let mut input = stdin.lock();
++    // SAFETY: fd 0/1/2 are the process's standard streams, open and valid for
++    // the whole duration of this call.
++    let out_fd = Some(unsafe { BorrowedFd::borrow_raw(1) });
++    let in_fd = Some(unsafe { BorrowedFd::borrow_raw(0) });
++    wc(args, &mut out, out_fd, &mut err, &mut input, in_fd)
+ }
+ 
+ pub fn uu_app() -> Command {
+@@ -692,9 +742,22 @@ enum CountResult {
+ ///
+ /// Therefore, the reading implementations always return a total and sometimes
+ /// return an error: ([`WordCount`], `Option<io::Error>`).
+-fn word_count_from_input(input: &Input<'_>, settings: &Settings) -> CountResult {
++fn word_count_from_input(
++    input: &Input<'_>,
++    settings: &Settings,
++    stdin: &mut Option<countable::LogicalStdin<'_>>,
++) -> CountResult {
+     let (total, maybe_err) = match input {
+-        Input::Stdin(_) => word_count_from_reader(io::stdin().lock(), settings),
++        Input::Stdin(_) => match stdin.take() {
++            // Count the shell's logical stdin once. Repeated stdin entries
++            // (e.g. `-` listed twice) drain the same stream, matching a real
++            // pipe; the gate keeps such argvs off this path anyway.
++            Some(handle) => word_count_from_reader(handle, settings),
++            None => word_count_from_reader(
++                countable::LogicalStdin::new(&mut io::empty(), None),
++                settings,
++            ),
++        },
+         Input::Path(path) => match File::open(path) {
+             Ok(f) => word_count_from_reader(f, settings),
+             Err(err) => return CountResult::Failure(err),
+@@ -790,7 +853,7 @@ fn files0_iter_file<'a>(path: &Path) -> UResult<impl Iterator<Item = InputIterIt
+ }
+ 
+ fn files0_iter<'a>(
+-    r: impl io::Read + 'static,
++    r: impl Read + 'static,
+     err_path: OsString,
+ ) -> impl Iterator<Item = InputIterItem<'a>> {
+     use std::io::BufRead;
+@@ -901,10 +964,35 @@ pub(crate) fn wc_simd_allowed(policy: &SimdPolicy) -> bool {
+     policy.iter_features().any(is_simd_runtime_feature)
+ }
+ 
+-fn wc(inputs: &Inputs, settings: &Settings) -> UResult<()> {
++fn wc_impl(
++    inputs: &Inputs,
++    settings: &Settings,
++    out: &mut dyn Write,
++    err: &mut dyn Write,
++    stdin: &mut Option<countable::LogicalStdin<'_>>,
++) -> UResult<()> {
+     let mut total_word_count = WordCount::default();
+     let mut num_inputs: usize = 0;
+ 
++    // Highest non-zero exit code seen across all inputs. Diagnostics go to the
++    // injected `err` sink (NOT the process stderr), and the code is returned to
++    // the caller instead of stashed in uucore's process-global `set_exit_code`,
++    // so this builtin is safe to run on a pipeline thread.
++    let mut exit_code: i32 = 0;
++    // Mirror of uucore's `show!`: print "wc: <diagnostic>" to the logical error
++    // sink and remember the error's exit code. `$e` must be a `Box<dyn UError>`
++    // (or convertible), exactly as `show!` expects.
++    macro_rules! show_local {
++        ($e:expr) => {{
++            let e = $e;
++            let code = e.code();
++            if code != 0 {
++                exit_code = exit_code.max(code);
++            }
++            let _ = writeln!(err, "{}: {e}", uucore::util_name());
++        }};
++    }
++
+     let (number_width, are_stats_visible) = match settings.total_when {
+         TotalWhen::Only => (1, false),
+         _ => (compute_number_width(inputs, settings), true),
+@@ -932,22 +1020,22 @@ fn wc(inputs: &Inputs, settings: &Settings) -> UResult<()> {
+         let runtime_disabled = !features.disabled_runtime.is_empty();
+ 
+         if enabled_empty && !runtime_disabled {
+-            let _ = writeln!(stderr(), "{}", translate!("wc-debug-hw-unavailable"));
++            let _ = writeln!(err, "{}", translate!("wc-debug-hw-unavailable"));
+         } else if runtime_disabled {
+             let _ = writeln!(
+-                stderr(),
++                err,
+                 "{}",
+                 translate!("wc-debug-hw-disabled-glibc", "features" => disabled.join(", "))
+             );
+         } else if !enabled_empty && disabled_empty {
+             let _ = writeln!(
+-                stderr(),
++                err,
+                 "{}",
+                 translate!("wc-debug-hw-using", "features" => enabled.join(", "))
+             );
+         } else {
+             let _ = writeln!(
+-                stderr(),
++                err,
+                 "{}",
+                 translate!(
+                     "wc-debug-hw-limited-glibc",
+@@ -963,62 +1051,76 @@ fn wc(inputs: &Inputs, settings: &Settings) -> UResult<()> {
+ 
+         let input = match maybe_input {
+             Ok(input) => input,
+-            Err(err) => {
+-                show!(err);
++            Err(e) => {
++                show_local!(e);
+                 continue;
+             }
+         };
+ 
+         // Store any I/O error from reading to print AFTER stats (matches GNU wc behavior)
+-        let (word_count, deferred_error) = match word_count_from_input(&input, settings) {
+-            CountResult::Success(word_count) => (word_count, None),
+-            CountResult::Interrupted(word_count, err) => (
+-                word_count,
+-                Some(err.map_err_context(|| input.path_display())),
+-            ),
+-            CountResult::Failure(err) => {
+-                show!(err.map_err_context(|| input.path_display()));
+-                continue;
+-            }
+-        };
++        let (word_count, deferred_error) =
++            match word_count_from_input(&input, settings, stdin) {
++                CountResult::Success(word_count) => (word_count, None),
++                CountResult::Interrupted(word_count, e) => (
++                    word_count,
++                    Some(e.map_err_context(|| input.path_display())),
++                ),
++                CountResult::Failure(e) => {
++                    show_local!(e.map_err_context(|| input.path_display()));
++                    continue;
++                }
++            };
+         total_word_count += word_count;
+         if are_stats_visible {
+             let maybe_title = input.to_title();
+             let maybe_title_str = maybe_title.as_deref();
+-            if let Err(err) = print_stats(settings, &word_count, maybe_title_str, number_width) {
++            if let Err(e) = print_stats(out, settings, &word_count, maybe_title_str, number_width) {
+                 let title = maybe_title_str.unwrap_or(OsStr::new("<stdin>"));
+-                show!(err.map_err_context(|| translate!("wc-error-failed-to-print-result", "title" => title.to_string_lossy())));
+-                return Ok(());
++                show_local!(e.map_err_context(|| translate!("wc-error-failed-to-print-result", "title" => title.to_string_lossy())));
++                return finish(exit_code);
+             }
+         }
+         // Print deferred error after stats to match GNU wc output order
+-        if let Some(err) = deferred_error {
+-            let _ = io::stdout().flush();
+-            show!(err);
++        if let Some(e) = deferred_error {
++            let _ = out.flush();
++            show_local!(e);
+         }
+     }
+ 
+     if settings.total_when.is_total_row_visible(num_inputs) {
+         let wc_total_msg = translate!("wc-total");
+         let title = are_stats_visible.then_some(OsStr::new(&wc_total_msg));
+-        if let Err(err) = print_stats(settings, &total_word_count, title, number_width) {
+-            show!(err.map_err_context(|| translate!("wc-error-failed-to-print-total")));
++        if let Err(e) = print_stats(out, settings, &total_word_count, title, number_width) {
++            show_local!(e.map_err_context(|| translate!("wc-error-failed-to-print-total")));
+         }
+     }
+ 
+-    // Although this appears to be returning `Ok`, the exit code may have been set to a non-zero
+-    // value by a call to `record_error!()` above.
+-    Ok(())
++    let _ = out.flush();
++    finish(exit_code)
++}
++
++/// Translate an accumulated non-zero exit code into a `UResult`. The standalone
++/// `uumain` bridge maps the returned error code to the process exit status; the
++/// in-process builtin reads it the same way — neither relies on uucore's
++/// process-global `set_exit_code`, keeping this builtin pipeline-thread safe.
++fn finish(exit_code: i32) -> UResult<()> {
++    if exit_code == 0 {
++        Ok(())
++    } else {
++        // Empty message: every diagnostic was already written to `err`; this
++        // only carries the exit status. The standalone binary's runner prints
++        // nothing extra for an empty message.
++        Err(uucore::error::USimpleError::new(exit_code, String::new()))
++    }
+ }
+ 
+ fn print_stats(
++    out: &mut dyn Write,
+     settings: &Settings,
+     result: &WordCount,
+     title: Option<&OsStr>,
+     number_width: usize,
+ ) -> io::Result<()> {
+-    let mut stdout = io::stdout().lock();
+-
+     let maybe_cols = [
+         (settings.show_lines, result.lines),
+         (settings.show_words, result.words),
+@@ -1029,13 +1131,88 @@ fn print_stats(
+ 
+     let mut space = "";
+     for (_, num) in maybe_cols.iter().filter(|(show, _)| *show) {
+-        write!(stdout, "{space}{num:number_width$}")?;
++        write!(out, "{space}{num:number_width$}")?;
+         space = " ";
+     }
+ 
+     if let Some(title) = title {
+-        write!(stdout, "{space}")?;
+-        stdout.write_all(&uucore::os_str_as_bytes_lossy(title))?;
++        write!(out, "{space}")?;
++        out.write_all(&uucore::os_str_as_bytes_lossy(title))?;
++    }
++    writeln!(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::wc;
++    use std::ffi::OsString;
++
++    /// Drive the logical `wc` entry with in-memory streams and NO backing
++    /// descriptors (out_fd=None, stdin_fd=None), asserting the counts table is
++    /// written to `out` and nothing leaks to the process stdio. This is the
++    /// path the in-process brush builtin uses for a sink/source with no fd.
++    fn run(flags: &[&str], input: &[u8]) -> (String, String, Result<(), i32>) {
++        let mut argv: Vec<OsString> = vec![OsString::from("wc")];
++        argv.extend(flags.iter().map(OsString::from));
++        // No file args -> counts the injected stdin.
++        let mut out: Vec<u8> = Vec::new();
++        let mut err: Vec<u8> = Vec::new();
++        let mut stdin: &[u8] = input;
++        let res = wc(
++            argv.into_iter(),
++            &mut out,
++            None,
++            &mut err,
++            &mut stdin,
++            None,
++        );
++        let code = res.map_err(|e| e.code());
++        (
++            String::from_utf8(out).unwrap(),
++            String::from_utf8(err).unwrap(),
++            code,
++        )
++    }
++
++    #[test]
++    fn lines_only_stdin_no_fd() {
++        // Single counter on stdin -> width 1, no leading padding.
++        let (out, err, code) = run(&["-l"], b"a\nb\nc\n");
++        assert_eq!(out, "3\n");
++        assert_eq!(err, "");
++        assert_eq!(code, Ok(()));
++    }
++
++    #[test]
++    fn bytes_only_stdin_no_fd() {
++        let (out, err, code) = run(&["-c"], b"hello world");
++        assert_eq!(out, "11\n");
++        assert_eq!(err, "");
++        assert_eq!(code, Ok(()));
++    }
++
++    #[test]
++    fn lines_and_bytes_stdin_no_fd() {
++        // Two counters from a non-fd (in-memory) stdin -> MINIMUM_WIDTH (7),
++        // matching GNU's behavior for a piped stdin.
++        let (out, err, code) = run(&["-lc"], b"one\ntwo\n");
++        assert_eq!(out, "      2       8\n");
++        assert_eq!(err, "");
++        assert_eq!(code, Ok(()));
++    }
++
++    #[test]
++    fn empty_stdin_no_fd() {
++        let (out, _err, code) = run(&["-lc"], b"");
++        assert_eq!(out, "      0       0\n");
++        assert_eq!(code, Ok(()));
++    }
++
++    #[test]
++    fn no_trailing_newline_lines() {
++        // GNU counts newlines, so a final line with no '\n' is not counted.
++        let (out, _err, code) = run(&["-l"], b"a\nb");
++        assert_eq!(out, "1\n");
++        assert_eq!(code, Ok(()));
+     }
+-    writeln!(stdout)
+ }

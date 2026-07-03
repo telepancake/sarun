@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 2 Jul 2026 11:04:07 +0000
+Subject: [PATCH] kati: make the corpus a hard gate; pin the recent fixes with
+ testcases
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The corpus runner only PRINTED its pass tally — a regression in any
+kati fix was invisible unless someone compared numbers. Now
+corpus_pass_rate asserts fail==0 (every non-'# TODO' case must match
+GNU make) and xpass==0 (a TODO case that starts passing must be
+un-TODO'd so it's enforced), keeping KATI_COMPAT_MIN as an optional
+stricter floor. Filtered runs (KATI_CORPUS_ONLY) skip the gate.
+
+New testcases pinning the recent kati work:
+
+- sarun_selfgen_include_pattern.mk — remake-the-makefile via a PATTERN
+  rule producer (the kernel's %/auto.conf → syncconfig).
+- sarun_features_var.mk — .FEATURES advertises undefine /
+  target-specific / order-only / second-expansion (the kernel bails
+  out without 'undefine'). The standalone rkati bootstrap didn't
+  advertise .FEATURES at all — brought to parity with the engine's
+  embedded-make bootstrap.
+- sarun_submake_makeflags_env.mk — a makefile-level
+  `MAKEFLAGS += --flag` reaches a child make's ENVIRONMENT (GNU
+  always exports MAKEFLAGS; the kernel's --include-dir rides this).
+  Standalone rkati never exported the final MAKEFLAGS value to recipe
+  children — fixed in main.rs alongside (the engine side was fixed in
+  0fbfe87 and is covered by test_make_rs case 20; the standalone gap
+  was found BY this testcase).
+- vpath_directory_search.mk / wildcard_in_rule.mk (added with their
+  fixes) are now enforced rather than advisory.
+
+Four stale '# TODO' headers removed (err_export_override,
+err_override_export, override_export, wildcard_cache) — they pass
+against GNU make 4.3 today (wildcard_cache thanks to the rule-word
+glob expansion), so they're armed as regressions guards now.
+Tally: 374/384 pass, 10 legitimate TODOs, zero unexplained diffs.
+
+Engine-side behaviors the standalone corpus cannot see (seed_env
+MAKEFLAGS, in-box include-dir, nested-sh errexit) stay covered by
+test_make_rs cases 20-22.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B97aMMA3rHQW7gsyBB2Cpa
+---
+ src-rs/main.rs                            | 27 +++++++++++++++++++++++
+ testcase/err_export_override.mk           |  3 ++-
+ testcase/err_override_export.mk           |  3 ++-
+ testcase/override_export.mk               |  3 ++-
+ testcase/sarun_features_var.mk            | 10 +++++++++
+ testcase/sarun_selfgen_include_pattern.mk | 13 +++++++++++
+ testcase/sarun_submake_makeflags_env.mk   | 13 +++++++++++
+ testcase/wildcard_cache.mk                |  3 ++-
+ tests/corpus.rs                           | 24 ++++++++++++++++++--
+ 9 files changed, 93 insertions(+), 6 deletions(-)
+ create mode 100644 engine/vendor/kati/testcase/sarun_features_var.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_selfgen_include_pattern.mk
+ create mode 100644 engine/vendor/kati/testcase/sarun_submake_makeflags_env.mk
+
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 67688f2..94d7502 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -73,6 +73,16 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>>
+     }
+     bootstrap.put_slice(b"KATI?=ckati\n");
+     bootstrap.put_slice(b"SHELL=/bin/sh\n");
++    // sarun: GNU make 4.x advertises its optional features via .FEATURES;
++    // makefiles gate on it (the Linux kernel bails out without `undefine`).
++    // Same list the engine's embedded-make bootstrap advertises (katirun.rs)
++    // — kati implements (or accepts as syntax) each token. GNU's value starts
++    // with the same tokens in the same order, so $(filter …,$(.FEATURES))
++    // output is corpus-comparable.
++    bootstrap.put_slice(
++        b".FEATURES?=target-specific order-only second-expansion else-if \
++          shortest-stem undefine oneshell\n",
++    );
+ 
+     if !FLAGS.no_builtin_rules {
+         bootstrap.put_slice(b".c.o:\n");
+@@ -363,6 +373,23 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+         }
+     }
+ 
++    // sarun: GNU make ALWAYS passes MAKEFLAGS to children through the
++    // environment, including makefile-level appends (`MAKEFLAGS += --foo`) —
++    // the Linux kernel's `MAKEFLAGS += --include-dir=$(abs_srctree)` only
++    // works in the re-invoked sub-make via env. Export the FINAL evaluated
++    // value; skip when empty so a plain run doesn't grow an empty env var.
++    {
++        if let Some(v) = ev.lookup_var(intern("MAKEFLAGS"))? {
++            let value = v.read().eval_to_buf(&mut ev)?;
++            if !value.is_empty() {
++                // SAFETY: single-threaded at this point in the pipeline.
++                unsafe {
++                    std::env::set_var("MAKEFLAGS", OsStr::from_bytes(&value));
++                }
++            }
++        }
++    }
++
+     for (name, export) in ev.exports.clone() {
+         if export {
+             let value = if let Some(v) = ev.lookup_var(name)? {
+diff --git a/testcase/err_export_override.mk b/testcase/err_export_override.mk
+index b0a4789..6555c2d 100644
+--- a/testcase/err_export_override.mk
++++ b/testcase/err_export_override.mk
+@@ -1,4 +1,5 @@
+-# TODO: Fix - "override export define A" is invalid "override" directive.
++# (was TODO) TODO: Fix - "override export define A" is invalid "override" directive.
++# sarun: passes with rkati vs GNU make 4.3 — un-TODO'd so the corpus gate enforces it.
+ 
+ # GNU make 4 accepts this syntax. Note kati doesn't agree with make 4
+ # either.
+diff --git a/testcase/err_override_export.mk b/testcase/err_override_export.mk
+index 59aaaff..9526e3d 100644
+--- a/testcase/err_override_export.mk
++++ b/testcase/err_override_export.mk
+@@ -1,4 +1,5 @@
+-# TODO: Fix - "override export define A" is invalid "override" directive.
++# (was TODO) TODO: Fix - "override export define A" is invalid "override" directive.
++# sarun: passes with rkati vs GNU make 4.3 — un-TODO'd so the corpus gate enforces it.
+ 
+ # GNU make 4 accepts this syntax. Note kati doesn't agree with make 4
+ # either.
+diff --git a/testcase/override_export.mk b/testcase/override_export.mk
+index d66f6b5..5dc49e0 100644
+--- a/testcase/override_export.mk
++++ b/testcase/override_export.mk
+@@ -1,4 +1,5 @@
+-# TODO: it overrides "export A" and exports(?) "override B"
++# (was TODO) TODO: it overrides "export A" and exports(?) "override B"
++# sarun: passes with rkati vs GNU make 4.3 — un-TODO'd so the corpus gate enforces it.
+ # ninja: can't export variable with space in name (by bash).
+ 
+ override export A:=override_A
+diff --git a/testcase/sarun_features_var.mk b/testcase/sarun_features_var.mk
+new file mode 100644
+index 0000000..a414e46
+--- /dev/null
++++ b/testcase/sarun_features_var.mk
+@@ -0,0 +1,10 @@
++# GNU make advertises optional features via the special .FEATURES variable.
++# Makefiles gate on it — the Linux kernel's top Makefile checks
++# `$(filter undefine,$(.FEATURES))` and refuses to build when it's empty.
++# Pin the tokens kbuild (and common makefiles) rely on.
++
++test:
++	@echo undefine=[$(filter undefine,$(.FEATURES))]
++	@echo tsv=[$(filter target-specific,$(.FEATURES))]
++	@echo oo=[$(filter order-only,$(.FEATURES))]
++	@echo se=[$(filter second-expansion,$(.FEATURES))]
+diff --git a/testcase/sarun_selfgen_include_pattern.mk b/testcase/sarun_selfgen_include_pattern.mk
+new file mode 100644
+index 0000000..9002cfe
+--- /dev/null
++++ b/testcase/sarun_selfgen_include_pattern.mk
+@@ -0,0 +1,13 @@
++# Remake-the-makefile where the required include is produced by a PATTERN
++# rule, not a literal one — the Linux kernel regenerates its required
++# `include include/config/auto.conf` through
++# `%/auto.conf %/auto.conf.cmd: $(KCONFIG_CONFIG)` (syncconfig). The
++# remake loop must accept pattern-rule producers; matching only literal
++# rule outputs fails this with "gen.conf: No such file or directory".
++
++%.conf:
++	echo 'CONF := yes' > $@
++
++include gen.conf
++
++all: ; @echo done CONF=$(CONF)
+diff --git a/testcase/sarun_submake_makeflags_env.mk b/testcase/sarun_submake_makeflags_env.mk
+new file mode 100644
+index 0000000..2d22d81
+--- /dev/null
++++ b/testcase/sarun_submake_makeflags_env.mk
+@@ -0,0 +1,13 @@
++# A makefile-level `MAKEFLAGS += <flag>` must reach a child make through the
++# ENVIRONMENT — GNU make always exports MAKEFLAGS. The Linux kernel depends
++# on this: `MAKEFLAGS += --include-dir=$(abs_srctree)` only takes effect in
++# the re-invoked sub-make, via env. The child here is whatever `make`
++# resolves on PATH (real GNU make on both sides of the corpus diff); what's
++# tested is the PARENT's export.
++
++MAKEFLAGS += --no-print-directory
++
++$(shell printf 'show:\n\t@echo flags=[$$(filter --no-print-directory,$$(MAKEFLAGS))]\n' > child.mk)
++
++test:
++	@$(MAKE) -f child.mk show
+diff --git a/testcase/wildcard_cache.mk b/testcase/wildcard_cache.mk
+index e8eb119..227f200 100644
+--- a/testcase/wildcard_cache.mk
++++ b/testcase/wildcard_cache.mk
+@@ -1,4 +1,5 @@
+-# TODO: Fix this. Maybe $(wildcard) always runs at eval-phase.
++# (was TODO) TODO: Fix this. Maybe $(wildcard) always runs at eval-phase.
++# sarun: passes with rkati vs GNU make 4.3 (rule-word glob expansion made the behaviors agree) — un-TODO'd so the corpus gate enforces it.
+ 
+ # GNU make 4 agrees with ckati.
+ MAKEVER:=$(shell make --version | grep "Make [0-9]" | sed -E 's/.*Make ([0-9]).*/\1/')
+diff --git a/tests/corpus.rs b/tests/corpus.rs
+index 41ccfcb..4f9dcb1 100644
+--- a/tests/corpus.rs
++++ b/tests/corpus.rs
+@@ -485,8 +485,28 @@ fn corpus_pass_rate() {
+         );
+     }
+ 
+-    // The serial pass never fails the suite by default — its purpose is to print
+-    // a number. To enforce a minimum pass rate, set KATI_COMPAT_MIN=N.
++    // sarun: the serial corpus is a HARD gate — every case not marked
++    // `# TODO` must match GNU make byte-for-byte (post-normalization), so a
++    // kati fix pinned by a testcase cannot silently regress. Runs filtered
++    // with KATI_CORPUS_ONLY skip this (a partial run has no meaningful tally).
++    if only.is_none() {
++        assert_eq!(
++            tally.fail, 0,
++            "kati compat regression: {} non-TODO case(s) diverge from GNU make: {:?}",
++            tally.fail, failures
++        );
++        // An unexpected PASS is stale bookkeeping: the case's `# TODO` header
++        // no longer reflects reality, and the behavior it pins could regress
++        // invisibly. Un-TODO the case (or fix the header) to re-arm it.
++        assert_eq!(
++            tally.xfail_unexpected_pass, 0,
++            "stale TODO header(s): {} case(s) now PASS but are still marked \
++             expected-fail — remove their `# TODO` so they're enforced: {:?}",
++            tally.xfail_unexpected_pass, tally.xpass_names
++        );
++    }
++
++    // Optional stricter floor (e.g. CI ratcheting): KATI_COMPAT_MIN=N.
+     if let Ok(min) = std::env::var("KATI_COMPAT_MIN") {
+         let min: usize = min.parse().expect("KATI_COMPAT_MIN must be integer");
+         assert!(

@@ -1,0 +1,16 @@
+BENCHMARKING.md
+Cargo.toml
+Cargo.toml.orig
+LICENSE
+README.package.md
+benches/cp_bench.rs
+locales/en-US.ftl
+locales/fr-FR.ftl
+src/copydir.rs
+src/cp.rs
+src/main.rs
+src/platform/linux.rs
+src/platform/macos.rs
+src/platform/mod.rs
+src/platform/other.rs
+src/platform/other_unix.rs

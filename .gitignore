@@ -13,3 +13,8 @@ __pycache__/
 /Cargo.lock
 /src/
 /target/
+
+# Assembled at build time by `make vendor` (scripts/vendor.py) from
+# engine/vendor.toml pins + engine/vendor-patches/ series. Never commit.
+/engine/vendor/
+/engine/.vendor-cache/

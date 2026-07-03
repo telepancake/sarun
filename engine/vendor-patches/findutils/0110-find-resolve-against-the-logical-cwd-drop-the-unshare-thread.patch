@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 21 Jun 2026 07:30:48 +0000
+Subject: [PATCH] find: resolve against the logical cwd, drop the
+ unshare/thread hack
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Completes the "no unshare; use logical state" rule for the in-process tools.
+find's walkdir traversal resolves against AT_FDCWD, so the old builtin ran on
+a worker thread that unshare(CLONE_FS)+chdir'd to give itself a private kernel
+cwd. That mechanism is gone.
+
+Mechanism (vendored fork): `Dependencies::cwd()` supplies the shell's logical
+working dir. When set, `process_dir` roots a RELATIVE start path at that
+absolute dir — an absolute walk that never reads or mutates the process cwd —
+and remaps each entry's DISPLAY path back to the start-relative form. The
+split is deliberate: `WalkEntry::path()` stays the real absolute path so every
+fs op and cached metadata stay correct (-delete, -empty, -lname, -type, …),
+while a new `display_path()` is used only by the display/match sites
+(-print/-print0, -path/-ipath, -regex, -printf %p/%P/%h, and -exec {}). A
+normal -exec child runs with the logical cwd as its current_dir so the
+relative {} resolves; -execdir keeps "./basename" + the real parent dir.
+Standalone (cwd == None) is unchanged — walks the path as given.
+
+The builtin now runs find_main in-process on the calling thread (no thread, no
+unshare); catch_unwind preserves panic isolation. This removes the find part
+of the previous fail-loud H2 change — there is no longer any process cwd to
+get wrong.
+
+Verified in a box: relative display (`.`/`sub`, no trailing slash), -name,
+-path, -type f/l (cached metadata), relative subdir start, multiple starts,
+-printf %p/%f/%h, -exec {} (\; and +) resolving in the logical cwd, -execdir
+in the real parent, absolute start (no remap), and -delete removing the real
+file. xargs unregressed.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/find/matchers/entry.rs   | 31 ++++++++++++++++++++++++++++-
+ src/find/matchers/exec.rs    | 21 ++++++++++++++++++--
+ src/find/matchers/path.rs    |  2 +-
+ src/find/matchers/printer.rs |  4 ++--
+ src/find/matchers/printf.rs  |  6 +++---
+ src/find/matchers/regex.rs   |  2 +-
+ src/find/mod.rs              | 38 ++++++++++++++++++++++++++++++++++--
+ 7 files changed, 92 insertions(+), 12 deletions(-)
+
+diff --git a/src/find/matchers/entry.rs b/src/find/matchers/entry.rs
+index 649413d..1e4654f 100644
+--- a/src/find/matchers/entry.rs
++++ b/src/find/matchers/entry.rs
+@@ -203,6 +203,14 @@ pub struct WalkEntry {
+     follow: Follow,
+     /// Cached metadata.
+     meta: OnceCell<Result<Metadata, WalkError>>,
++    /// sarun: a DISPLAY path that differs from the real (fs) path. When the
++    /// in-process embedder roots the walk at an absolute logical-cwd path so it
++    /// can avoid mutating the engine's process cwd, `path()` stays the real
++    /// absolute path (every `fs` op and cached `metadata` must use it), while
++    /// `display_path()` is the relative form the user expects in `-print`,
++    /// `-path`/`-regex`, `-printf %p/%h`, and `-exec {}`. `None` for the
++    /// standalone binary (display == path).
++    display: Option<PathBuf>,
+ }
+ 
+ impl WalkEntry {
+@@ -212,6 +220,7 @@ impl WalkEntry {
+             inner: Entry::Explicit(path.into(), depth),
+             follow,
+             meta: OnceCell::new(),
++            display: None,
+         }
+     }
+ 
+@@ -233,6 +242,7 @@ impl WalkEntry {
+                         inner: Entry::WalkDir(entry),
+                         follow,
+                         meta: OnceCell::new(),
++                        display: None,
+                     }
+                 };
+                 Ok(ret)
+@@ -245,6 +255,7 @@ impl WalkEntry {
+                             inner: Entry::Explicit(path.into(), depth),
+                             follow: Follow::Never,
+                             meta: Ok(meta).into(),
++                            display: None,
+                         });
+                     }
+                 }
+@@ -255,7 +266,9 @@ impl WalkEntry {
+         }
+     }
+ 
+-    /// Get the path to this entry.
++    /// Get the REAL path to this entry — the one every filesystem operation and
++    /// the cached `metadata` resolve against. Absolute when the embedder rooted
++    /// the walk at an absolute logical-cwd path.
+     pub fn path(&self) -> &Path {
+         match &self.inner {
+             Entry::Explicit(path, _) => path.as_path(),
+@@ -263,6 +276,22 @@ impl WalkEntry {
+         }
+     }
+ 
++    /// Get the DISPLAY path — the form shown to the user / matched by `-path` /
++    /// substituted for `-exec {}`. Equals `path()` unless the embedder set a
++    /// distinct display path (see the `display` field). sarun addition.
++    pub fn display_path(&self) -> &Path {
++        match &self.display {
++            Some(p) => p.as_path(),
++            None => self.path(),
++        }
++    }
++
++    /// sarun: override the display path (relative form) while `path()` keeps the
++    /// real absolute path used for fs ops. Set by the embedder's walk driver.
++    pub fn set_display(&mut self, display: PathBuf) {
++        self.display = Some(display);
++    }
++
+     /// Get the path to this entry.
+     pub fn into_path(self) -> PathBuf {
+         match self.inner {
+diff --git a/src/find/matchers/exec.rs b/src/find/matchers/exec.rs
+index 54a8d01..1c88de8 100644
+--- a/src/find/matchers/exec.rs
++++ b/src/find/matchers/exec.rs
+@@ -76,7 +76,10 @@ impl Matcher for SingleExecMatcher {
+                 Path::new(".").join(file_info.path())
+             }
+         } else {
+-            file_info.path().to_path_buf()
++            // {} substitutes the DISPLAY (relative) path the user expects; the
++            // child runs in the embedder's logical cwd (set below) so it still
++            // resolves. -execdir keeps the "./basename" + real-parent-cwd form.
++            file_info.display_path().to_path_buf()
+         };
+ 
+         let resolved_executable = match self.executable {
+@@ -122,6 +125,11 @@ impl Matcher for SingleExecMatcher {
+                     command.current_dir(parent);
+                 }
+             }
++        } else if let Some(d) = matcher_io.deps.cwd() {
++            // sarun: a normal -exec child runs in the embedder's logical cwd, so
++            // the relative {} (display path) resolves there without the engine
++            // ever changing its own process cwd.
++            command.current_dir(d);
+         }
+         // Route the child's stdout/stderr to the embedder's logical streams when
+         // provided (the in-process builtin dups the shell's logical fds), so
+@@ -184,6 +192,15 @@ impl MultiExecMatcher {
+     }
+ 
+     fn run_command(&self, command: &mut argmax::Command, matcher_io: &mut MatcherIO) {
++        // sarun: a normal `-exec … +` child runs in the embedder's logical cwd
++        // so the relative {} (display) paths resolve. -execdir already set its
++        // own current_dir (the real parent) before calling us, so only do this
++        // for the non-execdir form.
++        if !self.exec_in_parent_dir {
++            if let Some(d) = matcher_io.deps.cwd() {
++                command.current_dir(d);
++            }
++        }
+         // Same child-stdio routing as the single-exec path: dup the embedder's
+         // logical streams into the batched `-exec … +` child (argmax::Command
+         // forwards stdout/stderr to the inner std Command).
+@@ -216,7 +233,7 @@ impl Matcher for MultiExecMatcher {
+                 Path::new(".").join(file_info.path())
+             }
+         } else {
+-            file_info.path().to_path_buf()
++            file_info.display_path().to_path_buf()
+         };
+         let mut command = self.command.borrow_mut();
+         let command = command.get_or_insert_with(|| self.new_command());
+diff --git a/src/find/matchers/path.rs b/src/find/matchers/path.rs
+index c9db349..b6b4983 100644
+--- a/src/find/matchers/path.rs
++++ b/src/find/matchers/path.rs
+@@ -22,7 +22,7 @@ impl PathMatcher {
+ 
+ impl Matcher for PathMatcher {
+     fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+-        let path = file_info.path().to_string_lossy();
++        let path = file_info.display_path().to_string_lossy();
+         self.pattern.matches(&path)
+     }
+ }
+diff --git a/src/find/matchers/printer.rs b/src/find/matchers/printer.rs
+index 78f47eb..4627958 100644
+--- a/src/find/matchers/printer.rs
++++ b/src/find/matchers/printer.rs
+@@ -47,7 +47,7 @@ impl Printer {
+         match write!(
+             out,
+             "{}{}",
+-            file_info.path().to_string_lossy(),
++            file_info.display_path().to_string_lossy(),
+             self.delimiter
+         ) {
+             Ok(_) => {}
+@@ -56,7 +56,7 @@ impl Printer {
+                     writeln!(
+                         &mut *matcher_io.deps.get_error_output().borrow_mut(),
+                         "Error writing {:?} for {}",
+-                        file_info.path().to_string_lossy(),
++                        file_info.display_path().to_string_lossy(),
+                         e
+                     )
+                     .unwrap();
+diff --git a/src/find/matchers/printf.rs b/src/find/matchers/printf.rs
+index eaa4c24..5d58088 100644
+--- a/src/find/matchers/printf.rs
++++ b/src/find/matchers/printf.rs
+@@ -357,7 +357,7 @@ impl FormatString {
+ 
+ fn get_starting_point(file_info: &WalkEntry) -> &Path {
+     file_info
+-        .path()
++        .display_path()
+         .ancestors()
+         .nth(file_info.depth())
+         // safe to unwrap: the file's depth should never be longer than its path
+@@ -436,7 +436,7 @@ fn format_directive<'entry>(
+         // - "." also returns "."
+         // - ".." returns "." (???)
+         // These are all (thankfully) documented on the find(1) man page.
+-        FormatDirective::Dirname => match file_info.path().parent() {
++        FormatDirective::Dirname => match file_info.display_path().parent() {
+             None => "".into(),
+             Some(p) if p == Path::new("/") => "".into(),
+             Some(p) if p == Path::new("") => ".".into(),
+@@ -485,7 +485,7 @@ fn format_directive<'entry>(
+         FormatDirective::Path {
+             strip_starting_point,
+         } => file_info
+-            .path()
++            .display_path()
+             .strip_prefix(if *strip_starting_point {
+                 get_starting_point(file_info)
+             } else {
+diff --git a/src/find/matchers/regex.rs b/src/find/matchers/regex.rs
+index 4b85e4d..5d20ff6 100644
+--- a/src/find/matchers/regex.rs
++++ b/src/find/matchers/regex.rs
+@@ -108,7 +108,7 @@ impl RegexMatcher {
+ impl Matcher for RegexMatcher {
+     fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+         self.regex
+-            .is_match(file_info.path().to_string_lossy().as_ref())
++            .is_match(file_info.display_path().to_string_lossy().as_ref())
+     }
+ }
+ 
+diff --git a/src/find/mod.rs b/src/find/mod.rs
+index b982f60..47811b0 100644
+--- a/src/find/mod.rs
++++ b/src/find/mod.rs
+@@ -96,6 +96,15 @@ pub trait Dependencies {
+     fn child_stderr(&self) -> Option<std::process::Stdio> {
+         None
+     }
++    /// The embedder's LOGICAL working directory. When `Some(dir)`, find roots a
++    /// relative start path at `dir` (an absolute walk, so it never depends on or
++    /// mutates the process cwd) and presents paths relative to the start, and
++    /// spawns `-exec` children with `dir` as their cwd. `None` (the standalone
++    /// binary) uses the process cwd as usual. sarun addition — replaces the
++    /// per-thread `unshare(CLONE_FS)` cwd hack with pure logical state.
++    fn cwd(&self) -> Option<&std::path::Path> {
++        None
++    }
+ }
+ 
+ /// Struct that holds the dependencies we use when run as the real executable.
+@@ -256,7 +265,17 @@ fn process_dir(
+     matcher: &dyn matchers::Matcher,
+     quit: &mut bool,
+ ) -> i32 {
+-    let mut walkdir = WalkDir::new(dir)
++    // sarun: when the embedder supplies a logical cwd, root a RELATIVE start
++    // path there with an absolute walk (so the traversal never depends on the
++    // process cwd — no `unshare`/`chdir`), and remap each entry's DISPLAY path
++    // back to the start-relative form the user expects. An absolute start path,
++    // or the standalone binary (cwd == None), is walked as-is.
++    let start = std::path::Path::new(dir);
++    let (walk_root, remap): (PathBuf, Option<PathBuf>) = match deps.cwd() {
++        Some(cwd) if start.is_relative() => (cwd.join(start), Some(start.to_path_buf())),
++        _ => (start.to_path_buf(), None),
++    };
++    let mut walkdir = WalkDir::new(&walk_root)
+         .contents_first(config.depth_first)
+         .max_depth(config.max_depth)
+         .min_depth(config.min_depth)
+@@ -281,7 +300,22 @@ fn process_dir(
+                 ret = 1;
+                 writeln!(&mut *deps.get_error_output().borrow_mut(), "Error: {err}").unwrap();
+             }
+-            Ok(entry) => {
++            Ok(mut entry) => {
++                // sarun: present this entry relative to the start path (the real
++                // absolute path stays for fs ops); identity when not remapping.
++                if let Some(remap_root) = &remap {
++                    let rel = entry.path().strip_prefix(&walk_root).unwrap_or(entry.path());
++                    // The root entry strips to "" — display it as the start path
++                    // itself (`.`/`sub`), not `./`/`sub/` (a bare join("") would
++                    // append a trailing separator).
++                    let disp = if rel.as_os_str().is_empty() {
++                        remap_root.clone()
++                    } else {
++                        remap_root.join(rel)
++                    };
++                    entry.set_display(disp);
++                }
++
+                 let mut matcher_io = matchers::MatcherIO::new(deps);
+ 
+                 let new_dir = entry.path().parent().map(std::path::Path::to_path_buf);

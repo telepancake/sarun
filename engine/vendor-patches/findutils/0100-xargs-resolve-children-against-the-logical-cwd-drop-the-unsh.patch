@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 21 Jun 2026 07:06:44 +0000
+Subject: [PATCH] xargs: resolve children against the logical cwd, drop the
+ unshare hack
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Per the architecture rule "no unshare; use logical state": the xargs builtin
+no longer runs on a worker thread that `unshare(CLONE_FS)`+`chdir`s to give
+itself a per-thread kernel cwd. xargs doesn't traverse — it only spawns
+children — so the logical cwd is pure launch state: the vendored fork gains
+`XargsIo::cwd()` and sets it as each spawned child's `current_dir` (exactly
+like the env/nice/... exec-wrappers materialize logical state at spawn). The
+builtin now runs in-process on the calling thread with no cwd manipulation;
+`catch_unwind` preserves the old panic isolation the thread provided.
+
+This removes the cross-thread cwd race and the silent-wrong-dir / fail-loud
+handling the previous commit added for xargs — there is no longer any process
+cwd to get wrong. Verified: `cd /tmp/xt && find . | xargs cat` and
+`echo x | xargs -I{} pwd` both run children in /tmp/xt with the engine's
+process cwd untouched.
+
+(find still uses the per-thread mechanism; its walkdir traversal is
+AT_FDCWD-coupled and must keep printing relative paths, so de-unshare-ing it
+needs the fork's walk rooted at the logical cwd — a separate, larger change.)
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5MwFcipu6iwqtMPPwFhXd
+---
+ src/xargs/mod.rs | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/xargs/mod.rs b/src/xargs/mod.rs
+index edf2e71..cf4fc4f 100644
+--- a/src/xargs/mod.rs
++++ b/src/xargs/mod.rs
+@@ -49,6 +49,14 @@ pub trait XargsIo {
+     fn child_stderr(&self) -> Option<Stdio> {
+         None
+     }
++    /// Working directory for spawned children. An embedder returns `Some(_)` to
++    /// run each child in the shell's LOGICAL cwd (so relative input items and the
++    /// command resolve there) without the in-process engine ever changing its own
++    /// process cwd. The default `None` inherits the process cwd, matching the
++    /// standalone binary.
++    fn cwd(&self) -> Option<&std::path::Path> {
++        None
++    }
+ }
+ 
+ /// The dependencies used when xargs runs as the real standalone executable:
+@@ -488,6 +496,13 @@ impl CommandBuilder<'_> {
+ 
+         let mut command = Command::new(entry_point);
+ 
++        // Run the child in the shell's LOGICAL cwd (in-process embedder), so
++        // relative input items and the command resolve against the box's cwd
++        // without the engine touching its own process cwd. No-op for standalone.
++        if let Some(dir) = io.cwd() {
++            command.current_dir(dir);
++        }
++
+         if let Some(replace_str) = &self.options.replace {
+             // Replace all occurrences in initial args with the extra arg,
+             // Thanks to `MaxArgsCommandSizeLimiter`, we only process a single extra arg here.

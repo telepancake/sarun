@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: telepancake <113372415+telepancake@users.noreply.github.com>
+Date: Wed, 1 Jul 2026 09:31:21 +0300
+Subject: [PATCH] kati: parse --include-dir/-I from MAKEFLAGS and command line
+ (#74)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Linux kernel build adds `MAKEFLAGS += --include-dir=$(abs_srctree)`
+so sub-makes can find scripts/Kbuild.include when their working
+directory differs from the source tree (e.g. O= out-of-tree builds).
+kati's MAKEFLAGS parser only extracted VAR=val assignments and silently
+ignored all flags — so --include-dir was lost and the sub-make's
+`include scripts/Kbuild.include` failed with "No such file or
+directory".
+
+Fix: parse --include-dir=DIR from MAKEFLAGS, accept -I DIR /
+--include-dir=DIR on the command line, thread include_dirs through
+to the Evaluator, and fall back to them in eval_include when the
+file is not found relative to working_dir.
+
+Also parse -r/-R (no-builtin-rules / no-builtin-variables) from
+MAKEFLAGS — the kernel sets MAKEFLAGS += -rR and the previous code
+silently ignored both, leaving suffix rules and default CC/CXX/AR
+active in sub-makes that inherited the flags. Accept -w/-k/-n as
+no-op short flags so they don't error when inherited via MAKEFLAGS.
+
+
+Claude-Session: https://claude.ai/code/session_015LEeF5AcZaz1izBxgws317
+
+Co-authored-by: Claude <noreply@anthropic.com>
+---
+ src-rs/eval.rs  | 41 ++++++++++++++++++++++++++++++++++-------
+ src-rs/flags.rs | 31 ++++++++++++++++++++++++++++++-
+ 2 files changed, 64 insertions(+), 8 deletions(-)
+
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 2418792..24b8b40 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -17,6 +17,7 @@ limitations under the License.
+ use std::borrow::Cow;
+ use std::collections::{BTreeSet, HashMap, HashSet};
+ use std::ffi::{OsStr, OsString};
++use std::os::unix::ffi::OsStrExt;
+ use std::io::BufWriter;
+ use std::os::unix::ffi::OsStringExt;
+ use std::sync::{Arc, LazyLock, Weak};
+@@ -259,6 +260,12 @@ pub struct Evaluator {
+     /// process — and concurrent instances in different directories don't race
+     /// on it. Seeded from the process cwd so standalone rkati is unchanged.
+     pub working_dir: std::path::PathBuf,
++    /// sarun: GNU make's `-I`/`--include-dir` search path. When `include`
++    /// can't find a file relative to working_dir, it tries each of these
++    /// directories in order (matching GNU make's include-search semantics).
++    /// Populated from the command-line `-I` and from `--include-dir=` in
++    /// MAKEFLAGS (the kernel build adds `--include-dir=$(abs_srctree)`).
++    pub include_dirs: Vec<std::path::PathBuf>,
+     pub rules: Vec<Rule>,
+     pub exports: HashMap<Symbol, bool>,
+     /// sarun: set when the makefile names `.EXPORT_ALL_VARIABLES` as a
+@@ -335,6 +342,7 @@ impl Evaluator {
+             rule_vars: HashMap::new(),
+             global_vars: Arc::new(Mutex::new(Vec::new())),
+             working_dir: std::env::current_dir().unwrap_or_default(),
++            include_dirs: Vec::new(),
+             rules: Vec::new(),
+             exports: HashMap::new(),
+             export_all_vars: false,
+@@ -1076,7 +1084,32 @@ impl Evaluator {
+         let pats = stmt.expr.eval_to_buf(self)?;
+         for pat in word_scanner(&pats) {
+             let pat = pats.slice_ref(pat);
+-            let files = crate::fileutil::glob(pat.clone(), &self.working_dir);
++            let mut files = crate::fileutil::glob(pat.clone(), &self.working_dir);
++
++            // sarun: GNU make's -I / --include-dir search. When the file
++            // isn't found relative to the working directory, try each
++            // include_dir in order — the kernel build relies on this
++            // (MAKEFLAGS += --include-dir=$(abs_srctree)) for sub-makes
++            // whose working dir differs from the source tree.
++            if !std::path::Path::new(std::ffi::OsStr::from_bytes(&pat)).is_absolute() {
++                let missing = match files.as_ref() {
++                    Err(_) => true,
++                    Ok(v) => v.is_empty(),
++                };
++                if missing {
++                    for idir in &self.include_dirs {
++                        let try_files = crate::fileutil::glob(pat.clone(), idir);
++                        let found = match try_files.as_ref() {
++                            Err(_) => false,
++                            Ok(v) => !v.is_empty(),
++                        };
++                        if found {
++                            files = try_files;
++                            break;
++                        }
++                    }
++                }
++            }
+ 
+             if stmt.should_exist {
+                 let missing = match files.as_ref() {
+@@ -1084,12 +1117,6 @@ impl Evaluator {
+                     Ok(v) => v.is_empty(),
+                 };
+                 if missing {
+-                    // sarun: defer "missing required include" to the remake
+-                    // loop in main.rs. If a rule for this file is discovered
+-                    // by the end of parse, main will build it and re-parse
+-                    // the makefile (mirroring GNU make's
+-                    // remake-the-makefile-then-re-exec behavior). If no rule
+-                    // exists, main raises the error after the loop settles.
+                     let loc = self.loc.clone().unwrap_or_default();
+                     self.pending_remake_includes
+                         .push((loc, OsString::from_vec(pat.to_vec())));
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index ddf0bb2..074d5a7 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -76,6 +76,7 @@ pub struct Flags {
+     pub use_find_emulator: bool,
+     pub color_warnings: bool,
+     pub no_builtin_rules: bool,
++    pub no_builtin_variables: bool,
+     pub no_ninja_prelude: bool,
+     pub use_ninja_phony_output: bool,
+     pub use_ninja_validations: bool,
+@@ -104,6 +105,7 @@ pub struct Flags {
+     pub ninja_dir: Option<OsString>,
+     pub ninja_suffix: OsString,
+     pub working_dir: Option<OsString>, // -C <dir>
++    pub include_dirs: Vec<OsString>,   // -I / --include-dir
+     pub num_cpus: usize,
+     pub num_jobs: usize,
+     // sarun: true when -j was given explicitly on the command line (vs the
+@@ -158,8 +160,28 @@ impl Flags {
+ 
+         if let Some(makeflags) = env::var_os("MAKEFLAGS") {
+             for tok in crate::strutil::word_scanner(makeflags.as_bytes()) {
+-                if !tok.starts_with(b"-") && tok.contains(&b'=') {
++                if let Some(dir) = tok.strip_prefix(b"--include-dir=") {
++                    flags.include_dirs.push(OsString::from_vec(dir.to_vec()));
++                } else if tok == b"--no-builtin-rules" || tok == b"--no_builtin_rules" {
++                    flags.no_builtin_rules = true;
++                } else if tok == b"--no-builtin-variables" || tok == b"--no_builtin_variables" {
++                    flags.no_builtin_variables = true;
++                } else if tok == b"-s" || tok == b"--silent" || tok == b"--quiet" {
++                    flags.is_silent_mode = true;
++                } else if !tok.starts_with(b"-") && tok.contains(&b'=') {
+                     flags.cl_vars.push(Bytes::from(tok.to_vec()));
++                } else if !tok.starts_with(b"-") && !tok.contains(&b'=') && tok.iter().all(|&b| b.is_ascii_alphabetic()) {
++                    // GNU make encodes short flags as a bare letter-word in
++                    // MAKEFLAGS (e.g. "rRs" for -r -R -s). Parse the
++                    // semantically important ones.
++                    for &ch in tok {
++                        match ch {
++                            b'r' => flags.no_builtin_rules = true,
++                            b'R' => flags.no_builtin_variables = true,
++                            b's' => flags.is_silent_mode = true,
++                            _ => {}
++                        }
++                    }
+                 }
+             }
+         }
+@@ -174,6 +196,9 @@ impl Flags {
+                 b"-c" => flags.is_syntax_check_only = true,
+                 b"-i" => flags.is_dry_run = true,
+                 b"-s" => flags.is_silent_mode = true,
++                b"-r" => flags.no_builtin_rules = true,
++                b"-R" => flags.no_builtin_variables = true,
++                b"-w" | b"-k" | b"-n" => {} // accepted, semantically no-op in kati
+                 b"-d" => flags.enable_debug = true,
+                 b"--kati_stats" => flags.enable_stat_logs = true,
+                 b"--warn" => flags.enable_kati_warnings = true,
+@@ -230,6 +255,10 @@ impl Flags {
+                 _ => {
+                     if let Some(arg) = parse_command_line_option_with_arg("-C", &arg, &mut iter) {
+                         flags.working_dir = Some(arg);
++                    } else if let Some(arg) = parse_command_line_option_with_arg("-I", &arg, &mut iter) {
++                        flags.include_dirs.push(arg);
++                    } else if let Some(arg) = parse_command_line_option_with_arg("--include-dir", &arg, &mut iter) {
++                        flags.include_dirs.push(arg);
+                     } else if let Some(arg) =
+                         parse_command_line_option_with_arg("--dump_include_graph", &arg, &mut iter)
+                     {

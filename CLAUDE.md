@@ -106,11 +106,14 @@ are the quick check for UI/logic/rules changes.
 ## Vendored, patched upstreams
 
 `uu_cat`, `findutils`, `kati`, `n2`, `brush-*` under `engine/vendor/` are
-patched forks (pristine-import commit + a never-squashed patch series, NOT
-submodules) so they run as in-process brush builtins. The model, per-crate
-provenance, and the update/`rebase --onto` procedure are in
-`engine/vendor/README.md`; the how-to-port guide is
-`engine/vendor/PORTING-STORY.md`. Read those before touching a vendored crate.
+patched forks so they run as in-process brush builtins. `engine/vendor/` is
+GENERATED — assembled by `make vendor` (`scripts/vendor.py`) from pinned
+pristine upstreams (`engine/vendor.toml`) plus a never-squashed patch series
+per crate (`engine/vendor-patches/<crate>/`); never edit or commit assembled
+source. The model, per-crate provenance, and the update procedure are in
+`engine/vendor-patches/README.md`; the how-to-port guide is
+`engine/vendor-patches/PORTING-STORY.md`. Read those before touching a
+vendored crate.
 
 ## Branch / workflow
 

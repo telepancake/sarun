@@ -1,0 +1,726 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 08:19:13 +0000
+Subject: [PATCH] kati: move global variable bindings off the symtab onto the
+ Evaluator
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Make variables used to live in the process-global symbol table
+(Symtab::symbol_data), so every kati invocation in a process shared one
+variable namespace. That is wrong for in-process sub-makes (a sub-make must
+start with a fresh namespace, inheriting only exported env) and unsafe once
+multiple kati instances run in one process — the prerequisite for running
+embedded make as a proper in-process brush builtin.
+
+Split the symbol table: the interner (name<->id) stays global (Symbol ids
+must be stable), but the variable *bindings* move to a per-instance store on
+the Evaluator (`global_vars: Arc<Mutex<Vec<Option<Var>>>>`). The accessors
+(get/peek/set/clear_global_var, get_symbol_names) and the variable-precedence
+logic (readonly / override / command-line-beats-file / automatic-overwrite)
+move verbatim onto the Evaluator; the special vars (.SHELLSTATUS / .VARIABLES
+/ .KATI_SYMBOLS) and the automatic vars ($@/$</$^/...) are now seeded per
+instance instead of once into the global symtab. ScopedGlobalVar holds an
+Arc<Mutex> handle to the store so its Drop restore still works without an
+&Evaluator (so $@/$(D)/$(F) under .SECONDEXPANSION and foreach/call temp vars
+survive ?-early-returns). Added Symbol::index()/from_index() so the store can
+be indexed by symbol id.
+
+All call sites (eval/var/command/dep/func/main + the engine's katirun glue)
+now route through `ev`. Behavior is unchanged for a single instance: the
+standalone corpus holds at KATI_COMPAT_PASS=364/378, fail=0. A bonus of
+killing the global is that the Evaluator's variable handling is now
+unit-testable in isolation.
+
+This is step 1 of converting embedded make/ninja into proper in-process
+brush builtins on logical shell state; the FUSE-shadow/main() entrypoint is
+left intact.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XyA6FzC6QGgsrjEYEBJV46
+---
+ src-rs/command.rs |   6 +-
+ src-rs/dep.rs     |   3 +
+ src-rs/eval.rs    | 154 ++++++++++++++++++++++++++++++++++++---
+ src-rs/func.rs    |  14 ++--
+ src-rs/main.rs    |   8 ++-
+ src-rs/symtab.rs  | 179 ++++++++++------------------------------------
+ src-rs/var.rs     |   5 +-
+ 7 files changed, 202 insertions(+), 167 deletions(-)
+
+diff --git a/src-rs/command.rs b/src-rs/command.rs
+index 0477db4..be3a32e 100644
+--- a/src-rs/command.rs
++++ b/src-rs/command.rs
+@@ -251,7 +251,7 @@ impl<'a> CommandEvaluator<'a> {
+                 current_dep_node: self.current_dep_node.clone(),
+             },
+         );
+-        sym.set_global_var(v, false, None)?;
++        self.ev.set_global_var(sym, v, false, None)?;
+         let sym = intern(format!("{c}D"));
+         let v = Variable::new_autocommand(
+             sym,
+@@ -262,7 +262,7 @@ impl<'a> CommandEvaluator<'a> {
+                 current_dep_node: self.current_dep_node.clone(),
+             },
+         );
+-        sym.set_global_var(v, false, None)?;
++        self.ev.set_global_var(sym, v, false, None)?;
+         let sym = intern(format!("{c}F"));
+         let v = Variable::new_autocommand(
+             sym,
+@@ -273,7 +273,7 @@ impl<'a> CommandEvaluator<'a> {
+                 current_dep_node: self.current_dep_node.clone(),
+             },
+         );
+-        sym.set_global_var(v, false, None)?;
++        self.ev.set_global_var(sym, v, false, None)?;
+         Ok(())
+     }
+ 
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 3494f2f..020f851 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -1199,14 +1199,17 @@ impl<'a> DepBuilder<'a> {
+                     )
+                 };
+                 let _scoped_at = crate::symtab::ScopedGlobalVar::new(
++                    self.ev.global_vars.clone(),
+                     intern("@"),
+                     mk_var(out_bytes.clone()),
+                 )?;
+                 let _scoped_at_d = crate::symtab::ScopedGlobalVar::new(
++                    self.ev.global_vars.clone(),
+                     intern("@D"),
+                     mk_var(Bytes::copy_from_slice(&dir)),
+                 )?;
+                 let _scoped_at_f = crate::symtab::ScopedGlobalVar::new(
++                    self.ev.global_vars.clone(),
+                     intern("@F"),
+                     mk_var(Bytes::copy_from_slice(base)),
+                 )?;
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 3ea3999..f150c5a 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -39,7 +39,7 @@ use crate::stmt::{
+ use crate::strutil::{is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
+ use crate::symtab::{ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, SHELL_SYM, Symbol, intern};
+ use crate::var::{Var, VarOrigin, Variable, Vars};
+-use crate::{collect_stats_with_slow_report, error_loc, file_cache, log, warn_loc};
++use crate::{collect_stats_with_slow_report, error, error_loc, file_cache, log, warn_loc};
+ 
+ pub enum RulesAllowed {
+     Allowed,
+@@ -241,6 +241,16 @@ static USED_UNDEFINED_VARS: LazyLock<Mutex<HashSet<Symbol>>> =
+ 
+ pub struct Evaluator {
+     pub rule_vars: HashMap<Symbol, Arc<Vars>>,
++    /// sarun: per-instance global variable bindings, indexed by Symbol id.
++    /// Moved off the process-global symbol table (symtab `symbol_data`) so each
++    /// Evaluator — i.e. each make invocation — owns its OWN global namespace.
++    /// That is both the correct sub-make semantics (a sub-make starts fresh,
++    /// inheriting only exported env) and the prerequisite for running multiple
++    /// kati instances in one process without their variables colliding. The
++    /// interner (name<->id) stays global in symtab; only the bindings are
++    /// per-instance. Behind Arc<Mutex> so a ScopedGlobalVar can restore its
++    /// saved binding on Drop without needing an &Evaluator.
++    pub global_vars: Arc<Mutex<Vec<Option<Var>>>>,
+     pub rules: Vec<Rule>,
+     pub exports: HashMap<Symbol, bool>,
+     /// sarun: set when the makefile names `.EXPORT_ALL_VARIABLES` as a
+@@ -303,8 +313,9 @@ impl Default for Evaluator {
+ 
+ impl Evaluator {
+     pub fn new() -> Self {
+-        Self {
++        let ev = Self {
+             rule_vars: HashMap::new(),
++            global_vars: Arc::new(Mutex::new(Vec::new())),
+             rules: Vec::new(),
+             exports: HashMap::new(),
+             export_all_vars: false,
+@@ -343,7 +354,129 @@ impl Evaluator {
+             profiled_files: Vec::new(),
+ 
+             is_evaluating_command: false,
++        };
++        ev.seed_special_vars();
++        ev
++    }
++
++    /// sarun: seed the builtin special variables that used to be installed
++    /// process-globally by Symtab::new(). Now each Evaluator seeds them into
++    /// its own per-instance global namespace, so behavior is identical for a
++    /// single instance but instances no longer share these bindings.
++    fn seed_special_vars(&self) {
++        let _ = self.set_global_var(intern(".SHELLSTATUS"), Variable::new_shell_status_var(), false, None);
++        let _ = self.set_global_var(
++            intern(".VARIABLES"),
++            Variable::new_variable_names(b".VARIABLES", true),
++            false,
++            None,
++        );
++        let _ = self.set_global_var(
++            intern(".KATI_SYMBOLS"),
++            Variable::new_variable_names(b".KATI_SYMBOLS", false),
++            false,
++            None,
++        );
++    }
++
++    /// sarun: read a global variable binding (peek — no env-use tracking).
++    pub fn peek_global_var(&self, sym: Symbol) -> Option<Var> {
++        let store = self.global_vars.lock();
++        store.get(sym.index())?.clone()
++    }
++
++    /// sarun: read a global variable binding, tracking env-var use (mirrors
++    /// the old Symbol::get_global_var).
++    pub fn get_global_var(&self, sym: Symbol) -> Option<Var> {
++        let v = {
++            let store = self.global_vars.lock();
++            store.get(sym.index())?.clone()?
++        };
++        match v.read().origin() {
++            VarOrigin::Environment | VarOrigin::EnvironmentOverride => {
++                crate::var::USED_ENV_VARS.lock().insert(sym);
++            }
++            _ => {}
++        }
++        Some(v)
++    }
++
++    /// sarun: drop a binding (the `undefine` directive). Was
++    /// Symbol::clear_global_var.
++    pub fn clear_global_var(&self, sym: Symbol) {
++        let mut store = self.global_vars.lock();
++        let idx = sym.index();
++        if idx < store.len() {
++            store[idx] = None;
++        }
++    }
++
++    /// sarun: assign a global variable, honoring make's precedence rules
++    /// (readonly, command-line/override beats file, automatic is overwritable).
++    /// Ported verbatim from the old Symtab::set_global_var.
++    pub fn set_global_var(
++        &self,
++        sym: Symbol,
++        var: Var,
++        is_override: bool,
++        readonly: Option<&mut bool>,
++    ) -> Result<()> {
++        let mut store = self.global_vars.lock();
++        let idx = sym.index();
++        if idx >= store.len() {
++            store.resize(idx + 1, None);
+         }
++        let entry = store.get_mut(idx).unwrap();
++        if let Some(orig) = entry {
++            if orig.read().readonly {
++                if let Some(readonly) = readonly {
++                    *readonly = true;
++                } else {
++                    error!("*** cannot assign to readonly variable: {sym}");
++                }
++                return Ok(());
++            } else if let Some(readonly) = readonly {
++                *readonly = false;
++            }
++            let origin = orig.read().origin();
++            if !is_override
++                && (origin == VarOrigin::Override || origin == VarOrigin::EnvironmentOverride)
++            {
++                return Ok(());
++            }
++            if origin == VarOrigin::CommandLine && var.read().origin() == VarOrigin::File {
++                return Ok(());
++            }
++            // sarun: $(eval) inside $(call) often does `1:=newval` to rebind the
++            // call arg. Real make accepts the override; when the surrounding
++            // ScopedGlobalVar later drops, the original Automatic binding is
++            // restored.
++            if origin == VarOrigin::Automatic {
++                // fall through — overwrite the entry below.
++            }
++        }
++        *entry = Some(var);
++        Ok(())
++    }
++
++    /// sarun: enumerate per-instance global bindings passing `filter`, paired
++    /// with their interned names. Feeds `.VARIABLES`/`.KATI_SYMBOLS` and
++    /// `.EXPORT_ALL_VARIABLES`. Was the free fn symtab::get_symbol_names, which
++    /// walked the global symbol_data; now walks this Evaluator's bindings.
++    pub fn get_symbol_names<T: Fn(Var) -> bool>(&self, filter: T) -> Vec<(Symbol, Bytes)> {
++        let store = self.global_vars.lock();
++        store
++            .iter()
++            .enumerate()
++            .filter_map(|(idx, slot)| {
++                let var = slot.clone()?;
++                if !filter(var) {
++                    return None;
++                }
++                let sym = Symbol::from_index(idx)?;
++                Some((sym, sym.as_bytes()))
++            })
++            .collect()
+     }
+ 
+     pub fn start(&mut self) -> Result<()> {
+@@ -523,7 +656,7 @@ impl Evaluator {
+             let rhs = stmt.rhs.eval_to_buf(self)?;
+             for name in word_scanner(&rhs) {
+                 let name = intern(rhs.slice_ref(name));
+-                let Some(var) = name.get_global_var() else {
++                let Some(var) = self.get_global_var(name) else {
+                     error_loc!(self.loc.as_ref(), "*** unknown variable: {name}");
+                 };
+                 var.write().readonly = true;
+@@ -541,7 +674,7 @@ impl Evaluator {
+         )?;
+         if needs_assign {
+             let mut readonly = false;
+-            lhs.set_global_var(var.clone(), is_override, Some(&mut readonly))?;
++            self.set_global_var(lhs, var.clone(), is_override, Some(&mut readonly))?;
+             if readonly {
+                 error_loc!(
+                     self.loc.as_ref(),
+@@ -887,7 +1020,8 @@ impl Evaluator {
+         if let Some(var_list) = self.lookup_var(*MAKEFILE_LIST)? {
+             var_list.write().append_str(&v, self.current_frame())?;
+         } else {
+-            MAKEFILE_LIST.set_global_var(
++            self.set_global_var(
++                *MAKEFILE_LIST,
+                 Variable::with_simple_string(
+                     v,
+                     VarOrigin::File,
+@@ -973,7 +1107,7 @@ impl Evaluator {
+             // Mirrors set_global_var's command-line-override rule: a plain
+             // `undefine` won't unset a command-line variable, but
+             // `override undefine` will.
+-            if let Some(prev) = sym.peek_global_var()
++            if let Some(prev) = self.peek_global_var(sym)
+                 && !stmt.is_override
+                 && matches!(
+                     prev.read().origin(),
+@@ -982,7 +1116,7 @@ impl Evaluator {
+             {
+                 continue;
+             }
+-            sym.clear_global_var();
++            self.clear_global_var(sym);
+         }
+         Ok(())
+     }
+@@ -1027,7 +1161,7 @@ impl Evaluator {
+     }
+ 
+     pub fn lookup_var_global(&self, name: Symbol) -> Option<Var> {
+-        let v = name.get_global_var();
++        let v = self.get_global_var(name);
+         if v.is_none() {
+             USED_UNDEFINED_VARS.lock().insert(name);
+         }
+@@ -1143,7 +1277,7 @@ impl Evaluator {
+         }
+ 
+         if result.is_none() {
+-            result = name.peek_global_var();
++            result = self.peek_global_var(name);
+         }
+ 
+         result
+@@ -1164,7 +1298,7 @@ impl Evaluator {
+         if let Some(current_scope) = &self.current_scope {
+             current_scope.peek(name)
+         } else {
+-            name.peek_global_var()
++            self.peek_global_var(name)
+         }
+     }
+ 
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 00386ff..27c04e1 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -762,7 +762,7 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
+     loop {
+         let tmpvar_name_sym = intern(format!("{i}"));
+         if let Some(a) = av.get(i - 1) {
+-            sv.push(ScopedGlobalVar::new(tmpvar_name_sym, a.clone())?);
++            sv.push(ScopedGlobalVar::new(ev.global_vars.clone(), tmpvar_name_sym, a.clone())?);
+         } else {
+             // We need to blank further automatic vars
+             let Some(v) = ev.lookup_var(tmpvar_name_sym)? else {
+@@ -773,7 +773,7 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
+             }
+ 
+             let v = Variable::new_simple(VarOrigin::Automatic, None, None);
+-            sv.push(ScopedGlobalVar::new(tmpvar_name_sym, v)?);
++            sv.push(ScopedGlobalVar::new(ev.global_vars.clone(), tmpvar_name_sym, v)?);
+         }
+         i += 1;
+     }
+@@ -804,7 +804,7 @@ fn foreach_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -
+     for tok in word_scanner(&list) {
+         let tok = list.slice_ref(tok);
+         let v = Variable::with_simple_string(tok, VarOrigin::Automatic, None, None);
+-        let _sv = ScopedGlobalVar::new(varname, v)?;
++        let _sv = ScopedGlobalVar::new(ev.global_vars.clone(), varname, v)?;
+         ww.maybe_add_space();
+         args[2].eval(ev, ww.out)?;
+     }
+@@ -1045,7 +1045,7 @@ fn deprecated_var_func(
+             None => {
+                 let v =
+                     Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
+-                sym.set_global_var(v.clone(), false, None)?;
++                ev.set_global_var(sym, v.clone(), false, None)?;
+                 v
+             }
+         };
+@@ -1091,7 +1091,7 @@ fn obsolete_var_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn Buf
+             None => {
+                 let v =
+                     Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
+-                sym.set_global_var(v.clone(), false, None)?;
++                ev.set_global_var(sym, v.clone(), false, None)?;
+                 v
+             }
+         };
+@@ -1226,7 +1226,7 @@ fn foreach_sep_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMu
+     for tok in word_scanner(&list) {
+         let tok = list.slice_ref(tok);
+         let v = Variable::with_simple_string(tok, VarOrigin::Automatic, None, None);
+-        let _sv = ScopedGlobalVar::new(varname, v)?;
++        let _sv = ScopedGlobalVar::new(ev.global_vars.clone(), varname, v)?;
+         ww.maybe_add_separator(&separator);
+         args[3].eval(ev, ww.out)?;
+     }
+@@ -1291,7 +1291,7 @@ fn visibility_prefix_func(
+     } else {
+         // If variable is not defined, create an empty variable.
+         let v = Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
+-        sym.set_global_var(v.clone(), false, None)?;
++        ev.set_global_var(sym, v.clone(), false, None)?;
+         v
+     };
+     if !prefixes.is_empty() {
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index dfabf23..f8fd848 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -128,7 +128,8 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+     // $(MAKEFILE_LIST) (e.g. `echo  Makefile` instead of `echo Makefile`).
+     let mut makefile_list = BytesMut::new();
+     makefile_list.put_slice(FLAGS.makefile.lock().clone().unwrap().as_bytes());
+-    intern("MAKEFILE_LIST").set_global_var(
++    ev.set_global_var(
++        intern("MAKEFILE_LIST"),
+         Variable::with_simple_string(
+             makefile_list.freeze(),
+             VarOrigin::File,
+@@ -141,7 +142,8 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+     for (k, v) in std::env::vars_os() {
+         let v = Bytes::from(v.as_bytes().to_vec());
+         let val = Arc::new(Value::Literal(None, v.clone()));
+-        intern(k.as_bytes().to_vec()).set_global_var(
++        ev.set_global_var(
++            intern(k.as_bytes().to_vec()),
+             Variable::new_recursive(
+                 val,
+                 VarOrigin::Environment,
+@@ -339,7 +341,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+     // visible to recipe environments. Stage them all here, before the
+     // explicit-exports loop (which can still override with unexport).
+     if ev.export_all_vars {
+-        let all = kati::symtab::get_symbol_names(|v| {
++        let all = ev.get_symbol_names(|v| {
+             !matches!(
+                 v.read().origin(),
+                 kati::var::VarOrigin::Default | kati::var::VarOrigin::Automatic
+diff --git a/src-rs/symtab.rs b/src-rs/symtab.rs
+index 7d07a43..8533cb7 100644
+--- a/src-rs/symtab.rs
++++ b/src-rs/symtab.rs
+@@ -18,14 +18,11 @@ use std::{
+     collections::HashMap,
+     fmt::{Debug, Display},
+     num::NonZeroUsize,
+-    sync::LazyLock,
++    sync::{Arc, LazyLock},
+     vec,
+ };
+ 
+-use crate::{
+-    error,
+-    var::{Var, VarOrigin, Variable},
+-};
++use crate::var::Var;
+ use anyhow::Result;
+ use bytes::{BufMut, Bytes, BytesMut};
+ use parking_lot::Mutex;
+@@ -62,74 +59,58 @@ impl Symbol {
+         r.symbols[self.0.get()].clone()
+     }
+ 
+-    pub fn peek_global_var(&self) -> Option<Var> {
+-        let r = SYMTAB.lock();
+-        r.symbol_data.get(self.0.get())?.clone()
+-    }
+-
+-    pub fn get_global_var(&self) -> Option<Var> {
+-        let v = {
+-            let r = SYMTAB.lock();
+-            r.symbol_data.get(self.0.get())?.clone()?
+-        };
+-        match v.read().origin() {
+-            VarOrigin::Environment | VarOrigin::EnvironmentOverride => {
+-                crate::var::USED_ENV_VARS.lock().insert(*self);
+-            }
+-            _ => {}
+-        }
+-        Some(v)
++    /// sarun: the interned id, used to index an Evaluator's per-instance
++    /// global-variable store (see Evaluator::global_vars). The variable
++    /// bindings used to live here in the symtab; they now live per-Evaluator.
++    pub fn index(&self) -> usize {
++        self.0.get()
+     }
+ 
+-    pub fn set_global_var(
+-        &self,
+-        var: Var,
+-        is_override: bool,
+-        readonly: Option<&mut bool>,
+-    ) -> Result<()> {
+-        let mut r = SYMTAB.lock();
+-        r.set_global_var(self, var, is_override, readonly)
+-    }
+-    /// sarun: drop a variable's binding so `$(flavor X)` returns
+-    /// "undefined". Used by the `undefine` directive (GNU make 3.82+).
+-    pub fn clear_global_var(&self) {
+-        let mut r = SYMTAB.lock();
+-        let idx = self.0.get();
+-        if idx < r.symbol_data.len() {
+-            r.symbol_data[idx] = None;
+-        }
++    /// sarun: rebuild a Symbol from an id produced by `index()`. None for id 0
++    /// (the reserved empty symbol).
++    pub fn from_index(idx: usize) -> Option<Symbol> {
++        Some(Symbol(NonZeroUsize::new(idx)?))
+     }
+ }
+ 
++/// sarun: a temporary override of a global variable binding, restored on Drop.
++/// Operates on an Evaluator's per-instance store (an Arc<Mutex<…>> handle to
++/// Evaluator::global_vars) so the Drop restore needs no &Evaluator — which is
++/// what lets it survive `?`-early-returns. Used for $@/$(D)/$(F) under
++/// .SECONDEXPANSION and for foreach/call temp vars.
+ pub struct ScopedGlobalVar {
+-    sym: Symbol,
++    store: Arc<Mutex<Vec<Option<Var>>>>,
++    idx: usize,
+     orig: Option<Var>,
+ }
+ 
+ impl ScopedGlobalVar {
+-    pub fn new(sym: Symbol, var: Var) -> Result<Self> {
+-        let orig = sym.peek_global_var();
+-        let mut symtab = SYMTAB.lock();
+-        let idx = sym.0.get();
+-        if idx >= symtab.symbol_data.len() {
+-            symtab.symbol_data.resize(idx + 1, None);
+-        }
+-        symtab.symbol_data[idx] = Some(var);
+-        Ok(Self { sym, orig })
++    pub fn new(store: Arc<Mutex<Vec<Option<Var>>>>, sym: Symbol, var: Var) -> Result<Self> {
++        let idx = sym.index();
++        let orig = {
++            let mut s = store.lock();
++            if idx >= s.len() {
++                s.resize(idx + 1, None);
++            }
++            let orig = s[idx].clone();
++            s[idx] = Some(var);
++            orig
++        };
++        Ok(Self { store, idx, orig })
+     }
+ }
+ 
+ impl Drop for ScopedGlobalVar {
+     fn drop(&mut self) {
+-        let mut r = SYMTAB.lock();
+-        let idx = self.sym.0.get();
+-        r.symbol_data[idx] = self.orig.clone();
++        let mut s = self.store.lock();
++        if self.idx < s.len() {
++            s[self.idx] = self.orig.clone();
++        }
+     }
+ }
+ 
+ struct Symtab {
+     symbols: Vec<Bytes>,
+-    symbol_data: Vec<Option<Var>>,
+     symtab: HashMap<Bytes, Symbol>,
+ }
+ 
+@@ -137,7 +118,6 @@ impl Symtab {
+     fn new() -> Self {
+         let mut symtab = Self {
+             symbols: vec![Bytes::new()],
+-            symbol_data: vec![],
+             symtab: HashMap::new(),
+         };
+         for i in 1u8..=255 {
+@@ -147,35 +127,10 @@ impl Symtab {
+             symtab.symbols.push(name.clone());
+             symtab.symtab.insert(name, sym);
+         }
+-
+-        let shell_status_sym = symtab.intern(".SHELLSTATUS");
+-        symtab
+-            .set_global_var(
+-                &shell_status_sym,
+-                Variable::new_shell_status_var(),
+-                false,
+-                None,
+-            )
+-            .unwrap();
+-        let variables_sym = symtab.intern(".VARIABLES");
+-        symtab
+-            .set_global_var(
+-                &variables_sym,
+-                Variable::new_variable_names(b".VARIABLES", true),
+-                false,
+-                None,
+-            )
+-            .unwrap();
+-        let symbols_sym = symtab.intern(".KATI_SYMBOLS");
+-        symtab
+-            .set_global_var(
+-                &symbols_sym,
+-                Variable::new_variable_names(b".KATI_SYMBOLS", false),
+-                false,
+-                None,
+-            )
+-            .unwrap();
+-
++        // sarun: the builtin special vars (.SHELLSTATUS/.VARIABLES/.KATI_SYMBOLS)
++        // are no longer seeded here. Variable bindings are per-Evaluator now, so
++        // Evaluator::seed_special_vars installs them; the symtab is purely the
++        // name<->id interner.
+         symtab
+     }
+ 
+@@ -193,49 +148,6 @@ impl Symtab {
+         sym
+     }
+ 
+-    fn set_global_var(
+-        &mut self,
+-        sym: &Symbol,
+-        var: Var,
+-        is_override: bool,
+-        readonly: Option<&mut bool>,
+-    ) -> Result<()> {
+-        let idx = sym.0.get();
+-        if idx >= self.symbol_data.len() {
+-            self.symbol_data.resize(idx + 1, None);
+-        }
+-        let entry = self.symbol_data.get_mut(idx).unwrap();
+-        if let Some(orig) = entry {
+-            if orig.read().readonly {
+-                if let Some(readonly) = readonly {
+-                    *readonly = true;
+-                } else {
+-                    error!("*** cannot assign to readonly variable: {sym}");
+-                }
+-                return Ok(());
+-            } else if let Some(readonly) = readonly {
+-                *readonly = false;
+-            }
+-            let origin = orig.read().origin();
+-            if !is_override
+-                && (origin == VarOrigin::Override || origin == VarOrigin::EnvironmentOverride)
+-            {
+-                return Ok(());
+-            }
+-            if origin == VarOrigin::CommandLine && var.read().origin() == VarOrigin::File {
+-                return Ok(());
+-            }
+-            // sarun: $(eval) inside $(call) often does `1:=newval` to
+-            // rebind the call arg. Real make accepts the override; when
+-            // the surrounding ScopedGlobalVar later drops, the original
+-            // Automatic binding is restored.
+-            if origin == VarOrigin::Automatic {
+-                // fall through — overwrite the entry below.
+-            }
+-        }
+-        *entry = Some(var);
+-        Ok(())
+-    }
+ }
+ 
+ pub fn intern<T: Into<Bytes> + AsRef<[u8]>>(s: T) -> Symbol {
+@@ -257,21 +169,6 @@ pub fn join_symbols(symbols: &[Symbol], sep: &[u8]) -> Bytes {
+     r.freeze()
+ }
+ 
+-pub fn get_symbol_names<T: Fn(Var) -> bool>(filter: T) -> Vec<(Symbol, Bytes)> {
+-    let s = SYMTAB.lock();
+-    s.symbols
+-        .iter()
+-        .enumerate()
+-        .filter_map(|(idx, str)| {
+-            let var = s.symbol_data.get(idx)?.clone()?;
+-            if !filter(var) {
+-                return None;
+-            }
+-            Some((Symbol(NonZeroUsize::new(idx).unwrap()), str.clone()))
+-        })
+-        .collect::<Vec<_>>()
+-}
+-
+ pub fn symbol_count() -> usize {
+     let s = SYMTAB.lock();
+     s.symbols.len()
+diff --git a/src-rs/var.rs b/src-rs/var.rs
+index 7f41a83..8c01c0b 100644
+--- a/src-rs/var.rs
++++ b/src-rs/var.rs
+@@ -33,7 +33,6 @@ use crate::{
+     eval::Frame,
+     loc::Loc,
+     strutil::{WordWriter, has_path_prefix},
+-    symtab::get_symbol_names,
+     warn_loc,
+ };
+ use crate::{
+@@ -453,7 +452,7 @@ impl Evaluable for Variable {
+             }
+             InnerVar::VariableNames { all, .. } => {
+                 let mut ww = WordWriter::new(out);
+-                let symbols = get_symbol_names(|var| {
++                let symbols = ev.get_symbol_names(|var| {
+                     if var.read().obsolete() {
+                         return false;
+                     }
+@@ -461,7 +460,7 @@ impl Evaluable for Variable {
+                 });
+                 for (sym, entry) in symbols {
+                     if !*all
+-                        && let Some(var) = sym.peek_global_var()
++                        && let Some(var) = ev.peek_global_var(sym)
+                         && var.read().is_func()
+                     {
+                         continue;
