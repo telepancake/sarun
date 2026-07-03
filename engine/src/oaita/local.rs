@@ -550,14 +550,24 @@ fn local_config(base_url: &str) -> String {
              api_key = \"sk-local\"\n")
 }
 
-/// Write oaita.toml for the local endpoint. An existing config is left
-/// alone unless --write-config (then backed up to oaita.toml.bak first).
+/// Write oaita.toml for the local endpoint. An existing, USABLE config
+/// (one that actually sets a model) is left alone unless --write-config.
+/// A config with no model is broken — the agent box would hit "no model
+/// set" — so it is replaced (backed up first) even without --write-config,
+/// so F4 always leaves a working config.
 fn ensure_config(base_url: &str, overwrite: bool) -> Result<()> {
     let p = crate::paths::oaita_config_path();
     if p.is_file() && !overwrite {
-        eprintln!("keeping existing {} (use --write-config to point it at \
-                   the local server)", p.display());
-        return Ok(());
+        let has_model = crate::oaita::config::Config::load_from(&p)
+            .model.map(|m| !m.trim().is_empty()).unwrap_or(false);
+        if has_model {
+            eprintln!("keeping existing {} (use --write-config to point it \
+                       at the local server)", p.display());
+            return Ok(());
+        }
+        eprintln!("existing {} sets no model — replacing it with the local \
+                   config (the old one is backed up)", p.display());
+        // fall through to write (with backup)
     }
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {parent:?}"))?;
