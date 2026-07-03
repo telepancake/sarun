@@ -1858,6 +1858,41 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
             }
         }
+        // The local-model picker's catalog: currently-popular GGUF instruct
+        // models resolved from a live HuggingFace query (config-file override
+        // + offline fallback). Each entry is a ready-to-download Q4 URL. The
+        // UI opens this when neither an external API nor a local model is set.
+        "oaita.models" => {
+            let (entries, source) = crate::oaita::models::catalog();
+            json!({
+                "source": source,
+                "models": entries.iter().map(|e| json!({
+                    "name": e.name, "url": e.url, "note": e.note,
+                })).collect::<Vec<_>>(),
+            })
+        }
+        // What the "Api" pane is wired to: external (host oaita.toml has a
+        // model), local (an OAITA-LOCAL svc is declared), or none (offer the
+        // picker). Lets the UI reflect real state instead of guessing.
+        "oaita.status" => {
+            let host_cfg = crate::oaita::config::Config::load();
+            let external = host_cfg.model.as_deref()
+                .map(|m| !m.trim().is_empty()).unwrap_or(false);
+            let local = service_declared("oaita-local");
+            let (kind, model, endpoint) = if external {
+                ("external",
+                 host_cfg.model.clone().unwrap_or_default(),
+                 host_cfg.base_url.clone().unwrap_or_default())
+            } else if local {
+                ("local", "local".to_string(), "svc://oaita-local".to_string())
+            } else {
+                ("none", String::new(), String::new())
+            };
+            json!({
+                "kind": kind, "model": model, "endpoint": endpoint,
+                "serving": svc_has("oaita-local"),
+            })
+        }
         other => {
             return json!({"ok": false, "error": format!("unknown verb '{other}'")});
         }

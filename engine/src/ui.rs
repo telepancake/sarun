@@ -365,6 +365,23 @@ enum Modal {
     /// Enter runs `oaita run --on <box> --task <buf> <session>` on a PTY —
     /// one step, no session to pre-scaffold, no NAME to remember.
     OaitaTask { box_name: String, session: String, buf: String },
+    /// Local-model picker for the Api pane. Opened when neither an external
+    /// API nor a local model is configured (or from the pane's F4 menu). The
+    /// list is the engine's `oaita.models` catalog — a LIVE HuggingFace query
+    /// for currently-popular Q4 GGUF instruct models (config-file override +
+    /// offline fallback); `source` names where it came from. Enter on a model
+    /// runs `oaita local --model-url <url>` on a PTY (a BOXED download — no
+    /// host writes). A trailing "custom URL…" row is the escape hatch. While
+    /// `loading`, the fetch is still in flight (see pump_models).
+    ModelPicker {
+        models: Vec<ModelRow>,
+        source: String,
+        sel: usize,
+        loading: bool,
+    },
+    /// Free-text GGUF URL entry — the model picker's escape hatch. Enter runs
+    /// `oaita local --model-url <buf>` on a PTY.
+    ModelUrl { buf: String },
 }
 
 /// One level of the image-picker menu stack.
@@ -404,6 +421,16 @@ struct LoadJob {
     rx: mpsc::Receiver<Result<String, String>>,
     label: String,
     spin: usize,
+}
+
+/// One pickable local model in the ModelPicker (mirrors the engine's
+/// `oaita.models` entries): a display name, a ready-to-download Q4 GGUF
+/// URL, and a short note (size / source).
+#[derive(Clone)]
+struct ModelRow {
+    name: String,
+    url: String,
+    note: String,
 }
 
 /// One row inside Modal::ActionMenu. `hint` shows the global key that
@@ -456,6 +483,10 @@ enum Action {
     /// Launcher / sessions menu: run an oaita agent session whose sandbox
     /// is parented ON TOP of the selected box (`oaita run --on BOX NAME`).
     OaitaOnSelectedBox,
+    /// Api pane: open the local-model picker (live HuggingFace catalog) to
+    /// choose a model, then download+serve it. The discoverable front door to
+    /// `oaita local` — no magic URL to guess, no host/box confusion.
+    OpenModelPicker,
 }
 
 /// One editable line of the '/' clause editor (mirrors Python ClauseRow): the
@@ -771,6 +802,16 @@ struct App {
     /// Drained by pump_load() each tick; the status line shows a spinner
     /// while it runs so the UI never blocks on a registry.
     load_job: Option<LoadJob>,
+    /// In-flight background fetch of the local-model catalog (a live
+    /// HuggingFace query the engine runs for `oaita.models`). Drained by
+    /// pump_models() into the open Modal::ModelPicker so the UI never blocks
+    /// on the network while listing models.
+    models_job: Option<mpsc::Receiver<Result<(Vec<ModelRow>, String), String>>>,
+    /// One-shot: the Api pane already auto-offered the model picker this
+    /// session (because neither an external API nor a local model was
+    /// configured). Never re-offer — a user who dismisses it is not nagged;
+    /// the F4 menu still opens it on demand.
+    model_picker_offered: bool,
     /// Off-loop structural-diff state for the selected BINARY change.
     structd: StructState,
     /// Hunk cursor within the diff pane (index into the hunk list); used for
@@ -887,6 +928,8 @@ impl App {
             tap_ok: tap_available(),
             net_auto_bumped: false,
             load_job: None,
+            models_job: None,
+            model_picker_offered: false,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -1037,6 +1080,78 @@ impl App {
                 let label = job.label.clone();
                 self.load_job = None;
                 self.status = format!("oci load '{label}': worker died");
+            }
+        }
+    }
+
+    /// Open the local-model picker (Api pane F4, or auto-opened when nothing
+    /// is configured). The catalog fetch (a live HuggingFace query the engine
+    /// runs) can take a few seconds, so open in a `loading` state and pull the
+    /// result in via pump_models() rather than blocking the UI thread.
+    fn open_model_picker(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        let sock = self.sock.clone();
+        std::thread::spawn(move || {
+            let res = rpc(&sock, "oaita.models", json!([])).map(|r| {
+                let source = r.get("source").and_then(Value::as_str)
+                    .unwrap_or("").to_string();
+                let models = r.get("models").and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(|m| Some(ModelRow {
+                        name: m.get("name")?.as_str()?.to_string(),
+                        url: m.get("url")?.as_str()?.to_string(),
+                        note: m.get("note").and_then(Value::as_str)
+                            .unwrap_or("").to_string(),
+                    })).collect())
+                    .unwrap_or_default();
+                (models, source)
+            }).map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        });
+        self.models_job = Some(rx);
+        self.modal = Some(Modal::ModelPicker {
+            models: vec![], source: String::new(), sel: 0, loading: true,
+        });
+        self.status = "local model picker · querying HuggingFace for current \
+                       models…".into();
+    }
+
+    /// Drain the finished model-catalog fetch into the open ModelPicker.
+    fn pump_models(&mut self) {
+        let Some(rx) = self.models_job.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.models_job = None;
+                // Only fill the modal if it's still the (loading) picker — the
+                // user may have closed it while the fetch was in flight.
+                if let Some(Modal::ModelPicker { models, source, loading, .. })
+                    = self.modal.as_mut()
+                {
+                    match res {
+                        Ok((rows, src)) => {
+                            *models = rows;
+                            *source = src;
+                            *loading = false;
+                            self.status = format!(
+                                "local model picker · {} model(s) · {}",
+                                models.len(), source);
+                        }
+                        Err(e) => {
+                            *loading = false;
+                            *source = format!("catalog fetch failed: {e}");
+                            self.status = format!("oaita.models: {e}");
+                        }
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.models_job = None;
+                if let Some(Modal::ModelPicker { loading, source, .. })
+                    = self.modal.as_mut()
+                {
+                    *loading = false;
+                    *source = "catalog worker died".into();
+                }
             }
         }
     }
@@ -2403,8 +2518,24 @@ impl App {
                 .map(|(model, base_url, _)| (model, base_url)));
     }
 
+    /// The FIRST time the Api pane is shown with nothing wired up — no
+    /// external API in oaita.toml AND no local model declared — auto-open the
+    /// model picker so the endpoint answers "how do I get one?" itself,
+    /// instead of leaving the user to guess F4 / magic argv. One-shot: a
+    /// dismissal is respected (see `model_picker_offered`).
+    fn maybe_offer_model_picker(&mut self) {
+        if self.model_picker_offered || self.modal.is_some() { return; }
+        let none = matches!(rpc(&self.sock, "oaita.status", json!([])),
+            Ok(v) if v.get("kind").and_then(Value::as_str) == Some("none"));
+        if none {
+            self.model_picker_offered = true;
+            self.open_model_picker();
+        }
+    }
+
     fn load_api_logs(&mut self) {
         self.refresh_api_endpoint_note();
+        self.maybe_offer_model_picker();
         let Some(sid) = self.cur_sid() else { return };
         match rpc(&self.sock, "api_log", json!([sid])) {
             Ok(v) => {
@@ -5210,6 +5341,9 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         // budget up to two display rows per item.
         Modal::ImagePicker { stack, .. } => stack.last()
             .map(|l| l.items.len() as u16 * 2).unwrap_or(0) + 6,
+        // one row per model + the "custom URL" row + source/help chrome.
+        Modal::ModelPicker { models, .. } =>
+            (models.len() as u16 + 1).clamp(1, 18) + 7,
         _ => 7,
     };
     let hgt = want.min(area.height);
@@ -5484,6 +5618,65 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from("type the task, e.g. `summarize README.md` — Enter \
                             runs it in a captured box layered on this box \
                             (net via the Pty+ chip) · Esc cancel"),
+            ],
+        ),
+        Modal::ModelPicker { models, source, sel, loading } => {
+            let mut body = vec![
+                Line::from(Span::styled(
+                    "pick a local model — downloaded in a box, served on demand \
+                     (no host writes)",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+            ];
+            if *loading {
+                body.push(Line::from(Span::styled(
+                    "  querying HuggingFace for current models…",
+                    Style::default().fg(Color::Yellow))));
+            } else {
+                // Model rows, then the custom-URL escape hatch as the last row.
+                let n = models.len();
+                for (i, m) in models.iter().enumerate() {
+                    let active = i == *sel;
+                    let style = if active {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else { Style::default() };
+                    body.push(Line::from(vec![
+                        Span::styled(format!("  {}", m.name), style),
+                        Span::styled(format!("  {}", m.note),
+                            Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+                let custom_active = *sel == n;
+                let cstyle = if custom_active {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else { Style::default().fg(Color::Gray) };
+                body.push(Line::from(Span::styled(
+                    "  Enter a custom GGUF URL…", cstyle)));
+                if models.is_empty() {
+                    body.push(Line::from(Span::styled(
+                        "  (no catalog models — use the custom URL row)",
+                        Style::default().fg(Color::DarkGray))));
+                }
+            }
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                format!("source: {} · override via {}/oaita-models.toml",
+                    if source.is_empty() { "…" } else { source.as_str() },
+                    crate::paths::config_home().display()),
+                Style::default().fg(Color::DarkGray))));
+            body.push(Line::from(Span::styled(
+                "↑/↓ move · Enter download & serve · Esc cancel",
+                Style::default().fg(Color::Gray))));
+            (" local model picker ", body)
+        }
+        Modal::ModelUrl { buf } => (
+            " custom model URL ",
+            vec![
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from("paste a GGUF URL (e.g. \
+                            https://huggingface.co/…/model-Q4_K_M.gguf) — \
+                            Enter downloads it in a box & serves it · Esc cancel"),
             ],
         ),
     };
@@ -7382,11 +7575,13 @@ fn endpoint_note_lines(resolved: Option<(String, String)>) -> Vec<String> {
         None => vec![
             "(no endpoint configured — nothing to log yet)".to_string(),
             String::new(),
-            "F4 → \"Set up a LOCAL endpoint\" downloads a tiny tool-capable \
-             model + CPU runtime".to_string(),
-            "and serves it on localhost (`sarun oaita local`) — no external \
-             endpoint or key needed.".to_string(),
-            format!("Or configure one by hand: {}",
+            "F4 → \"Pick a local model\" opens a picker of currently-popular \
+             models (a live".to_string(),
+            "HuggingFace query); choosing one downloads it in a box and serves \
+             it on demand —".to_string(),
+            "no external endpoint or key needed. Opens automatically the first \
+             time.".to_string(),
+            format!("Or configure an external API by hand: {}",
                     crate::paths::oaita_config_path().display()),
         ],
     }
@@ -8018,7 +8213,9 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
         }
         Pane::ApiLogs => Some(("API calls".into(), vec![
             mk("Open call detail",   "Enter", Action::OpenSelection),
-            mk("Set up a LOCAL endpoint & serve it (oaita local)", "",
+            mk("Pick a local model (live catalog) & serve it…", "",
+               Action::OpenModelPicker),
+            mk("Set up the default local endpoint (oaita local)", "",
                Action::OaitaLocalPty),
         ])),
         // Procs / Outputs / Pipelines / BuildEdges: no destructive ops
@@ -8095,6 +8292,7 @@ fn run_action(app: &mut App, a: Action) {
         Action::OaitaLocalPty  => {
             app.open_pty(vec![self_exe(), "oaita".into(), "local".into()]);
         }
+        Action::OpenModelPicker => app.open_model_picker(),
         Action::OaitaOnSelectedBox => {
             // Ask for the TASK; the session name is derived from the box.
             // Enter runs it all in one shot — no NAME to type, no session
@@ -8440,6 +8638,74 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::OaitaTask { box_name, session, buf }),
         },
+        Modal::ModelPicker { models, source, mut sel, loading } => {
+            // While the catalog is still loading, only Esc does anything.
+            if loading {
+                match code {
+                    KeyCode::Esc => app.status = "model picker cancelled".into(),
+                    _ => app.modal = Some(Modal::ModelPicker {
+                        models, source, sel, loading }),
+                }
+                return;
+            }
+            // Rows are the models plus one trailing "custom URL…" row.
+            let n_rows = models.len() + 1;
+            match code {
+                KeyCode::Esc => app.status = "model picker cancelled".into(),
+                KeyCode::Up => {
+                    sel = sel.saturating_sub(1);
+                    app.modal = Some(Modal::ModelPicker {
+                        models, source, sel, loading });
+                }
+                KeyCode::Down => {
+                    if sel + 1 < n_rows { sel += 1; }
+                    app.modal = Some(Modal::ModelPicker {
+                        models, source, sel, loading });
+                }
+                KeyCode::Home => app.modal = Some(Modal::ModelPicker {
+                    models, source, sel: 0, loading }),
+                KeyCode::End => {
+                    let last = n_rows.saturating_sub(1);
+                    app.modal = Some(Modal::ModelPicker {
+                        models, source, sel: last, loading });
+                }
+                KeyCode::Enter => {
+                    if sel < models.len() {
+                        // Boxed download of the chosen model, then serve on
+                        // demand — the same flow F4 kicks, with a URL.
+                        let url = models[sel].url.clone();
+                        app.open_pty(vec![self_exe(), "oaita".into(),
+                            "local".into(), "--model-url".into(), url]);
+                    } else {
+                        // The custom-URL escape hatch.
+                        app.modal = Some(Modal::ModelUrl { buf: String::new() });
+                    }
+                }
+                _ => app.modal = Some(Modal::ModelPicker {
+                    models, source, sel, loading }),
+            }
+        }
+        Modal::ModelUrl { mut buf } => match code {
+            KeyCode::Enter => {
+                let url = buf.trim().to_string();
+                if url.is_empty() {
+                    app.status = "model URL cancelled".into();
+                } else {
+                    app.open_pty(vec![self_exe(), "oaita".into(),
+                        "local".into(), "--model-url".into(), url]);
+                }
+            }
+            KeyCode::Esc => app.status = "model URL cancelled".into(),
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::ModelUrl { buf });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::ModelUrl { buf });
+            }
+            _ => app.modal = Some(Modal::ModelUrl { buf }),
+        },
     }
 }
 
@@ -8493,6 +8759,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             app.pump_struct();
             // drain a finished background image pull (oci.load) the same way.
             app.pump_load();
+            app.pump_models();
             if app.structd.pending && app.structd.full_lines.is_none() {
                 app.structd.spin = app.structd.spin.wrapping_add(1);
             }
@@ -9940,6 +10207,8 @@ mod tests {
             tap_ok: true,
             net_auto_bumped: false,
             load_job: None,
+            models_job: None,
+            model_picker_offered: false,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -10239,6 +10508,7 @@ mod tests {
         // pump until the (failing, no engine) job reports
         for _ in 0..500 {
             app.pump_load();
+            app.pump_models();
             if app.load_job.is_none() { break; }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -10246,9 +10516,9 @@ mod tests {
         assert!(app.status.contains("oci load"), "failure surfaced: {}", app.status);
     }
 
-    /// The Api pane must surface `oaita local`: an unconfigured endpoint
-    /// renders the how-to (pointing at the F4 action), and the action menu
-    /// carries the entry that launches it on a PTY.
+    /// The Api pane must surface the local on-ramp: an unconfigured endpoint
+    /// renders the how-to (pointing at the model picker), and the action menu
+    /// carries both the picker entry and the plain `oaita local` launcher.
     #[test]
     fn api_pane_surfaces_oaita_local() {
         let mut app = headless_app();
@@ -10256,21 +10526,52 @@ mod tests {
         app.api_endpoint_note = endpoint_note_lines(None);
         let buf = render_to_string(&app, 110, 30).unwrap();
         assert!(buf.contains("no endpoint configured"), "{buf}");
-        assert!(buf.contains("oaita local"), "empty state must name the \
-                 zero-endpoint on-ramp:\n{buf}");
+        assert!(buf.contains("local model") || buf.contains("Pick a local"),
+                "empty state must name the zero-endpoint on-ramp:\n{buf}");
         // configured endpoint: summary instead of the how-to
         app.api_endpoint_note = endpoint_note_lines(Some(
             ("qwen3".into(), "http://127.0.0.1:18181/v1".into())));
         let buf = render_to_string(&app, 110, 30).unwrap();
         assert!(buf.contains("http://127.0.0.1:18181/v1"), "{buf}");
         assert!(buf.contains("--api"), "{buf}");
-        // action menu carries the launcher entry
+        // action menu carries BOTH on-ramp entries
         let (title, items) = pane_action_menu(&app).expect("Api pane menu");
         assert!(title.contains("API"), "{title}");
         assert!(items.iter().any(|i|
-            matches!(i.action, Action::OaitaLocalPty)
-            && i.label.contains("LOCAL endpoint")),
-            "menu must offer oaita local");
+            matches!(i.action, Action::OpenModelPicker)),
+            "menu must offer the model picker");
+        assert!(items.iter().any(|i|
+            matches!(i.action, Action::OaitaLocalPty)),
+            "menu must offer plain oaita local");
+    }
+
+    /// The model picker: opening it (with no engine to answer oaita.models)
+    /// lands in a loading state; a synthesized catalog renders rows + the
+    /// custom-URL escape hatch, and Enter on the last row switches to URL
+    /// entry rather than launching a download.
+    #[test]
+    fn model_picker_lists_and_offers_custom_url() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = headless_app();
+        // Simulate a delivered catalog directly in the modal (no engine RPC).
+        app.modal = Some(Modal::ModelPicker {
+            models: vec![
+                ModelRow { name: "Qwen3-4B".into(),
+                    url: "https://hf/x-Q4_K_M.gguf".into(),
+                    note: "Q4 · 2 GiB".into() },
+            ],
+            source: "HuggingFace (1 live)".into(),
+            sel: 0,
+            loading: false,
+        });
+        let buf = render_to_string(&app, 110, 30).unwrap();
+        assert!(buf.contains("Qwen3-4B"), "row must show:\n{buf}");
+        assert!(buf.contains("custom GGUF URL"), "escape hatch:\n{buf}");
+        // Down to the custom-URL row (index == models.len()), Enter → ModelUrl.
+        handle_modal_key(&mut app, KeyCode::Down, KeyModifiers::empty());
+        handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(matches!(app.modal, Some(Modal::ModelUrl { .. })),
+                "custom-URL row must open the URL entry, not launch a download");
     }
 
     #[test]

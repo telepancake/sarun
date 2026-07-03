@@ -269,6 +269,18 @@ fn find_gguf(dir: &Path) -> Option<PathBuf> {
         .find(|p| p.extension().is_some_and(|x| x == "gguf"))
 }
 
+/// Remove every `*.gguf` in `dir` EXCEPT `keep` — used on a `--force` model
+/// swap so a stale model file doesn't linger for find_gguf to pick up.
+fn clear_other_gguf(dir: &Path, keep: &str) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
+        if p.extension().is_some_and(|x| x == "gguf")
+            && p.file_name().and_then(|n| n.to_str()) != Some(keep) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 /// Declare (from inside the download box) that THIS box provides the
 /// on-demand `oaita-local` service: the engine stamps the declaration onto
 /// this box's meta, so a later svc://oaita-local call starts the serve
@@ -308,6 +320,10 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
             .ok_or_else(|| anyhow!("cannot derive a filename from {model_url}"))?;
         let model_path = dir.join(&model_name);
         if force || !model_path.is_file() {
+            // Clean swap: a --force download replaces the model, so drop any
+            // OTHER *.gguf first — otherwise find_gguf (which scans by
+            // extension at serve time) could keep serving the stale one.
+            if force { clear_other_gguf(dir, &model_name); }
             rt.block_on(fetch_to(model_url, &model_path, "model"))?;
         } else {
             eprintln!("model already present: {}", model_path.display());

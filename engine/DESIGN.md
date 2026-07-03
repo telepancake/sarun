@@ -245,3 +245,15 @@ model into box `OAITA-LOCAL` (captured, never applied) and declares the
 `OAITA-LOCAL.SVC-OAITA-LOCAL` (llama-server + the svc bridge) on demand. Any
 box — an oci image, any downloaded-server box — can advertise a server the
 same way by declaring `svc_provide`/`svc_argv`.
+
+**Model picker (Api pane).** Which model `oaita local` downloads is a UI
+choice, not a hardcoded recommendation (those go stale). The Api pane offers
+a picker whose catalog is a LIVE HuggingFace query for currently-popular Q4
+GGUF instruct models (`oaita.models` verb → `oaita::models::catalog`),
+overridable by `{config_home}/oaita-models.toml` and backed by a labelled
+offline snapshot. Picking a model runs `oaita local --model-url <url>` on a
+PTY — a BOXED download, so there's no host/box confusion and nothing to
+apply. The picker auto-opens the first time the Api pane is shown with
+neither an external API nor a local model configured (`oaita.status` reports
+`kind == "none"`); it's also on the pane's F4 action menu. A `--force` model
+swap clears any stale `*.gguf` so the serve path picks up the new file.

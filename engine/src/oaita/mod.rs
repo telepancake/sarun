@@ -40,6 +40,7 @@ pub mod hints;
 pub mod ids;
 pub mod inspect;
 pub mod local;
+pub mod models;
 pub mod proxy;
 pub mod structural;
 pub mod tools;
