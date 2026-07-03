@@ -518,6 +518,18 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // namespace.
     let broker_name = format!("sarun-broker:{sid}");
     bwrap.args(["--setenv", "SARUN_BROKER", &broker_name]);
+    // Engine self-reference for IN-BOX re-execs. The box CMD and its
+    // descendants (the oaita driver, brush's `sarun`/`oaita` builtins, a
+    // nested `sarun run`) must be able to re-exec the engine — but the box's
+    // rootfs may NOT contain the engine binary's host path (a closed OCI
+    // rootfs like alpine, an `oaita run --on <image>` parent). `/proc/self/exe`
+    // then fails to resolve. The engine is already ferried in as the inherited
+    // fd `bin_fd` (see above) and exec'd as `/proc/self/fd/N`; that path
+    // resolves through the process's OWN fd table regardless of rootfs. bin_fd
+    // is CLOEXEC-cleared, so it survives every fork+exec down the box's process
+    // tree — the same fd number stays valid everywhere. Publish it so the
+    // re-exec sites use it instead of guessing a path.
+    bwrap.args(["--setenv", "SARUN_EXE", &inner_exe]);
     // D9 follow-on — NESTED shell IS brush (brush boxes, capture on only).
     // We shadow the box's /bin/sh, /bin/bash (and /usr/bin/{sh,bash}) with the
     // ENGINE binary: the shim (brush_sh, gated on SARUN_BRUSH_SH=1) RUNS the
@@ -660,9 +672,28 @@ fn send_frame(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
     }
 }
 
+/// The engine binary to re-exec from INSIDE a box. Prefer `SARUN_EXE` (the
+/// inherited-fd path `/proc/self/fd/N` the runner ferried in and published —
+/// always reachable, even on a closed rootfs whose files don't include the
+/// engine's host path). Fall back to `/proc/self/exe` for the top-level /
+/// host case where no box ferried an fd. This is the single source of truth
+/// for every in-box re-exec site (inner CMD, oaita driver, brush builtins).
+pub fn in_box_self_exe() -> String {
+    std::env::var("SARUN_EXE")
+        .ok().filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/proc/self/exe".to_string())
+}
+
 pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
-             api: bool, cmd: Vec<String>) -> i32 {
+             api: bool, mut cmd: Vec<String>) -> i32 {
     if cmd.is_empty() { return 2; }
+    // The box CMD may name `/proc/self/exe` as argv[0] to mean "re-exec the
+    // engine" (e.g. `oaita run --on <box>` ships `/proc/self/exe oaita run
+    // --inbox …`). Resolve it through the ferried fd so it works when the box
+    // rootfs doesn't contain the engine's host path (closed OCI image).
+    if cmd[0] == "/proc/self/exe" {
+        cmd[0] = in_box_self_exe();
+    }
     // Hold the box-channel fd open (not CLOEXEC) so the engine sees EOF — its
     // teardown signal — only when this process (and CMD) finally exits.
     if conn_fd >= 0 { clear_cloexec(conn_fd); }

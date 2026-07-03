@@ -1123,7 +1123,9 @@ impl brush_core::builtins::SimpleCommand for EngineSelfCommand {
         if name == "oaita" { eargs.push(OsString::from("oaita")); }
         eargs.extend(rest);
 
-        let mut cmd = std::process::Command::new("/proc/self/exe");
+        // Re-exec the engine via the ferried fd (SARUN_EXE) so `sarun`/`oaita`
+        // work inside a closed rootfs where `/proc/self/exe`'s path is absent.
+        let mut cmd = std::process::Command::new(crate::runner::in_box_self_exe());
         cmd.args(&eargs);
         if let Some(s) = Self::stdio_from(&context.try_fd(0)) { cmd.stdin(s); }
         if let Some(s) = Self::stdio_from(&context.try_fd(1)) { cmd.stdout(s); }

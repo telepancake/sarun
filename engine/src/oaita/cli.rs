@@ -263,7 +263,7 @@ fn spawn_in_box(p: &Parsed, original_args: &[String]) -> i32 {
     // /proc/self/exe in-box, else current_exe(). The `--` payload runs in the
     // NEW box, so it is always /proc/self/exe.
     let exe_path = if crate::oaita::exec::in_box() {
-        "/proc/self/exe".to_string()
+        crate::runner::in_box_self_exe()
     } else {
         std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())

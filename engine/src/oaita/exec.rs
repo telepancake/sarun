@@ -140,7 +140,10 @@ fn filter_sarun_noise(stderr: &str) -> String {
 /// On the host: `./sarun` next to a symlinked oaita, else `sarun` on PATH,
 /// else current_exe (when invoked via subcommand we already ARE sarun).
 fn default_sarun() -> String {
-    if in_box() { return "/proc/self/exe".to_string(); }
+    // In-box: re-exec the engine via the ferried fd (SARUN_EXE), which
+    // resolves on ANY rootfs — not `/proc/self/exe`, whose path is absent in a
+    // closed OCI rootfs. See runner::in_box_self_exe.
+    if in_box() { return crate::runner::in_box_self_exe(); }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(stem) = exe.file_name().and_then(|s| s.to_str()) {
             if stem == "sarun" || stem == "sarun-engine" {
