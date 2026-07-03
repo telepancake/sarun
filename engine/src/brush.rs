@@ -1365,6 +1365,9 @@ async fn build_box_shell_full(
 ) -> Result<brush_core::Shell, brush_core::error::Error> {
     install_shell_var_recorder();
     install_pipeline_observer();
+    // Shell work reports into the same activity feed / stall watchdog as
+    // the embedded makes — a pure-shell hang (configure!) must be visible.
+    crate::katirun::start_activity_reporting();
     // bon's builder is typestate-typed; we can't conditionally chain setters.
     // Passing the inner value (unwrapped from Option with a sensible default)
     // reproduces brush-core's own unset default for each field.
@@ -2014,6 +2017,21 @@ fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// First pipeline command text of a complete-command, truncated — the
+/// activity-feed label for shell work (the counterpart of kati's
+/// "recipe of 'x'" entries; a pure-shell hang was invisible before).
+fn activity_desc(complete: &brush_parser::ast::CompoundList) -> String {
+    let mut s = format!("{complete}");
+    s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.len() > 120 {
+        let mut cut = 120;
+        while !s.is_char_boundary(cut) { cut -= 1; }
+        s.truncate(cut);
+        s.push('…');
+    }
+    format!("sh: {s}")
+}
+
 async fn run_nested_pipelines(
     shell: &mut brush_core::Shell,
     prog: brush_parser::ast::Program,
@@ -2029,6 +2047,7 @@ async fn run_nested_pipelines(
         let (recs, frame_uid, uids) = stamp_pipeline_records(&complete, &mut seq, spawn_ts, true);
         all_uids.extend_from_slice(&uids);
         send_nested_pipeline_records(recs);
+        let _act = kati::fileutil::ActivityGuard::new(activity_desc(&complete));
         let one = brush_parser::ast::Program { complete_commands: vec![complete] };
         let prev_uid = set_current_pipeline_uid(frame_uid);
         let r = shell.run_program(one, params).await;
@@ -2647,10 +2666,12 @@ pub(crate) fn install_pipeline_observer() {
                     return None;
                 }
                 send_nested_pipeline_records(recs);
+                let act = kati::fileutil::ActivityGuard::new(activity_desc(complete));
                 let prev_uid = set_current_pipeline_uid(frame_uid);
                 Some(Box::new(move |code: i32| {
                     set_current_pipeline_uid(prev_uid);
                     send_pipeline_done(&uids, code, now_secs());
+                    drop(act);
                 }))
             },
         ));

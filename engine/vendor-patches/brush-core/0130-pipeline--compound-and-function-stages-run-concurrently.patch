@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 03 Jul 2026 15:00:39 +0000
+Subject: [PATCH] pipeline: compound and function stages run concurrently
+
+A compound stage of a multi-stage pipeline executed inline to completion while holding the pipe writer - >64K of output (configure's '(set) 2>&1 | sed' cache dump) deadlocked with the reader stage never spawned. bash forks every stage; spawn owned-subshell compound/function stages as tasks.
+
+---
+diff --git a/src/interp.rs b/src/interp.rs
+index 5ad1f8f..318823e 100644
+--- a/src/interp.rs
++++ b/src/interp.rs
+@@ -696,6 +696,30 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
+         match self {
+             Self::Simple(simple) => simple.execute_in_pipeline(pipeline_context, params).await,
+             Self::Compound(compound, redirects) => {
++                // sarun: a compound stage of a MULTI-stage pipeline (an owned
++                // subshell clone) must run CONCURRENTLY — executing it inline
++                // to completion while holding the pipe writer deadlocks once
++                // its output exceeds the pipe buffer with the reader stage
++                // not yet spawned (configure's `(set) 2>&1 | sed …` cache
++                // dump, >64K). bash forks every stage; we spawn a task.
++                if let commands::ShellForCommand::OwnedShell { target, .. } =
++                    pipeline_context.shell
++                {
++                    let mut sub = *target;
++                    let compound = compound.clone();
++                    let redirects = redirects.clone();
++                    let join_handle = tokio::spawn(async move {
++                        if let Some(redirects) = &redirects {
++                            for redirect in &redirects.0 {
++                                setup_redirect(&mut sub, &mut params, redirect)
++                                    .await?;
++                            }
++                        }
++                        compound.execute(&mut sub, &params).await
++                    });
++                    return Ok(ExecutionSpawnResult::StartedTask(join_handle));
++                }
++
+                 // Set up any additional redirects.
+                 if let Some(redirects) = redirects {
+                     for redirect in &redirects.0 {
+@@ -708,10 +732,23 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
+                     .await?
+                     .into())
+             }
+-            Self::Function(func) => Ok(func
+-                .execute(&mut pipeline_context.shell, &params)
+-                .await?
+-                .into()),
++            Self::Function(func) => {
++                // sarun: same concurrency requirement as Compound above.
++                if let commands::ShellForCommand::OwnedShell { target, .. } =
++                    pipeline_context.shell
++                {
++                    let mut sub = *target;
++                    let func = func.clone();
++                    let join_handle = tokio::spawn(async move {
++                        func.execute(&mut sub, &params).await
++                    });
++                    return Ok(ExecutionSpawnResult::StartedTask(join_handle));
++                }
++                Ok(func
++                    .execute(&mut pipeline_context.shell, &params)
++                    .await?
++                    .into())
++            }
+             Self::ExtendedTest(e, redirects) => {
+                 // Set up any additional redirects.
+                 if let Some(redirects) = redirects {

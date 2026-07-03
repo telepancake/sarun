@@ -917,33 +917,40 @@ fn install_var_recorder() {
     ));
 }
 
+/// Stall visibility: ship the in-flight builtin/shell activity to the
+/// engine every 30s (the UI's IN FLIGHT feed) and put a STALL line on
+/// stderr once something runs 5+ minutes without completing — a silent
+/// hang is a diagnosability bug. Idempotent; shared by the make entries
+/// and every box shell.
+pub(crate) fn start_activity_reporting() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        kati::fileutil::start_stall_watchdog(
+            std::env::var("SARUN_STALL_SECS").ok()
+                .and_then(|s| s.parse().ok()).unwrap_or(300),
+            Arc::new(|line| eprintln!("{line}")),
+        );
+        std::thread::Builder::new().name("box-activity-feed".into()).spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let snap = kati::fileutil::activity_snapshot();
+                if snap.is_empty() {
+                    continue;
+                }
+                let items: Vec<serde_json::Value> = snap
+                    .into_iter()
+                    .map(|(d, age)| serde_json::json!([d, age]))
+                    .collect();
+                let msg = serde_json::json!({"type": "box_activity", "items": items});
+                crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
+            }
+        }).ok();
+    });
+}
+
 fn install_make_recipe_runner() {
     install_var_recorder();
-    // Stall visibility: ship the in-flight builtin activity (recipes,
-    // $(shell), parse phases) to the engine every 30s so the UI can show a
-    // live "what is this box doing" tree, and put a STALL line on stderr
-    // once something runs 5+ minutes without completing — a silent hang is
-    // a diagnosability bug.
-    kati::fileutil::start_stall_watchdog(
-        std::env::var("SARUN_STALL_SECS").ok()
-            .and_then(|s| s.parse().ok()).unwrap_or(300),
-        Arc::new(|line| eprintln!("{line}")),
-    );
-    std::thread::Builder::new().name("box-activity-feed".into()).spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(30));
-            let snap = kati::fileutil::activity_snapshot();
-            if snap.is_empty() {
-                continue;
-            }
-            let items: Vec<serde_json::Value> = snap
-                .into_iter()
-                .map(|(d, age)| serde_json::json!([d, age]))
-                .collect();
-            let msg = serde_json::json!({"type": "box_activity", "items": items});
-            crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
-        }
-    }).ok();
+    start_activity_reporting();
     kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, prefix, cmd, cwd, redirect_stderr, output_cb| {
         use kati::fileutil::RecipeRunnerDecision;
         let shell_base = std::path::Path::new(std::ffi::OsStr::from_bytes(shell))

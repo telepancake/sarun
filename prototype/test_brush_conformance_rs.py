@@ -145,6 +145,13 @@ rm -f trapmark''',
 (false | true); echo "rc=$?"
 false | true; echo "ps=[${PIPESTATUS[0]} ${PIPESTATUS[1]}]"''',
     # ── redirections ───────────────────────────────────────────────────────
+    "pipe_big_builtin_output": '''i=0
+while [ $i -lt 300 ]; do
+  eval "bigvar_$i=payload-$i-0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
+  i=$((i+1))
+done
+n=`(set) 2>&1 | sed -n 's/^\\([a-zA-Z_][a-zA-Z0-9_]*\\)=.*/\\1/p' | wc -l`
+test "$n" -gt 300 && echo "big-pipe-ok"''',
     "redir_order": '''f() { echo out; echo err >&2; }
 f 2>&1 | sort
 f > /dev/null 2>&1; echo "silent=$?"''',
