@@ -265,6 +265,11 @@ enum Pane {
     /// INCLUDING up-to-date targets that never executed.
     BuildEdges,
     Rules,
+    /// Variable provenance: every makefile-level assignment (name, loc,
+    /// value, make dir) plus shell assignments from box shells, recorded in
+    /// the box's makevar table. '/' sets the name/value query; the right
+    /// pane shows the selected variable's full value + assignment history.
+    Vars,
     /// `-n` per-box network capture: left pane = list of flows
     /// (tshark-decoded HTTP requests + TLS handshakes from the box's
     /// pcapng, queried via the `flows.list` engine verb), right pane =
@@ -318,6 +323,9 @@ enum Modal {
     /// generic transport — it runs the given argv; it does NOT presume a box or
     /// any box parameters (that is the caller's choice).
     PtyCmd { buf: String },
+    /// Vars-view query: `name [value]` — two whitespace-separated cmd_match
+    /// text globs (bare word = substring); the second is optional.
+    VarQuery { buf: String },
     /// Context-menu popup for the currently-selected list row. Opened
     /// with `m`. `title` is the row identity (e.g. "Box: foo" or
     /// "Change: src/main.rs"); `items` are (label, hint, action). The
@@ -675,6 +683,10 @@ struct App {
     /// against it so the detail body stops at its last line instead of
     /// scrolling into blank space.
     right_scroll_max: std::cell::Cell<u16>,
+    /// Vars view: query (name glob, value glob), loaded rows, cursor.
+    vars_query: (String, String),
+    vars_rows: Vec<Value>,
+    sel_var: usize,
     /// Backspace go-back stack: one snapshot per view SWITCH (letter chips,
     /// cross-navs, Enter drill-downs), capped at NAV_HISTORY_CAP — oldest
     /// dropped first. Each snapshot carries enough to restore the view as it
@@ -859,7 +871,7 @@ impl App {
             f_pipelines: ViewFilter::default(),
             f_edges: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], pty_in_right: false, menu_nav: false, menu_sel: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], vars_query: (String::new(), String::new()), vars_rows: vec![], sel_var: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
             oci_images: vec![],
             launch_net: 0,
             launch_env: false,
@@ -1286,6 +1298,27 @@ impl App {
     /// reads. Named for the legacy "recent_changes" call but renamed
     /// in spirit — recent_changes Vec is gone, the bundle is the
     /// single source of truth now (no fallback).
+    /// (Re)query the Vars view. Requires a non-empty name or value pattern —
+    /// an unfiltered dump of a big build's assignments is the useless list
+    /// this view exists to avoid.
+    fn load_vars(&mut self) {
+        self.vars_rows.clear();
+        self.sel_var = 0;
+        let Some(sid) = self.cur_sid() else { return };
+        let (n, v) = self.vars_query.clone();
+        if n.is_empty() && v.is_empty() {
+            self.status = "vars: press '/' and type a NAME (or NAME VALUE) query".into();
+            return;
+        }
+        match rpc(&self.sock, "review.makevars", json!([sid, n, v, 800])) {
+            Ok(rows) => {
+                self.vars_rows = rows.as_array().cloned().unwrap_or_default();
+                self.status = format!("vars: {} assignment(s)", self.vars_rows.len());
+            }
+            Err(e) => self.status = format!("review.makevars: {e}"),
+        }
+    }
+
     fn refresh_recent_changes(&mut self) {
         let Some(sid) = self.cur_sid() else { return };
         self.box_summary = serde_json::json!(null);
@@ -2610,6 +2643,12 @@ impl App {
                     self.right_scroll = 0;
                 }
             }
+            Pane::Vars => {
+                if self.sel_var + 1 < self.vars_rows.len() {
+                    self.sel_var += 1;
+                    self.right_scroll = 0;
+                }
+            }
         }
     }
 
@@ -2665,6 +2704,10 @@ impl App {
             Pane::Pty => {}
             Pane::ApiLogs => {
                 self.sel_api_log = self.sel_api_log.saturating_sub(1);
+                self.right_scroll = 0;
+            }
+            Pane::Vars => {
+                self.sel_var = self.sel_var.saturating_sub(1);
                 self.right_scroll = 0;
             }
         }
@@ -2769,6 +2812,13 @@ impl App {
                 self.sel_api_log = (cur + delta).clamp(0, total as isize - 1) as usize;
                 self.right_scroll = 0;
             }
+            Pane::Vars => {
+                let total = self.vars_rows.len();
+                if total == 0 { return; }
+                let cur = self.sel_var as isize;
+                self.sel_var = (cur + delta).clamp(0, total as isize - 1) as usize;
+                self.right_scroll = 0;
+            }
         }
     }
 
@@ -2782,7 +2832,7 @@ impl App {
         matches!(self.focus,
             Pane::Sessions | Pane::Processes | Pane::Outputs
             | Pane::Pipelines | Pane::BuildEdges | Pane::Rules
-            | Pane::Flows | Pane::Packets)
+            | Pane::Flows | Pane::Packets | Pane::Vars)
     }
 
     /// Snap focus back to the LEFT list and reset the right-pane scroll.
@@ -2822,6 +2872,7 @@ impl App {
             Pane::Flows => self.sel_flow,
             Pane::Packets => self.sel_packet,
             Pane::ApiLogs => self.sel_api_log,
+            Pane::Vars => self.sel_var,
             Pane::Help | Pane::Pty => 0,
         }
     }
@@ -2909,6 +2960,11 @@ impl App {
                     self.sel_api_log =
                         snap.cursor.min(self.api_log_rows.len().saturating_sub(1));
                 }
+                Pane::Vars => {
+                    self.load_vars();
+                    self.sel_var =
+                        snap.cursor.min(self.vars_rows.len().saturating_sub(1));
+                }
                 _ => {}
             }
         }
@@ -2943,6 +2999,13 @@ impl App {
             Pane::Pipelines => { self.nav(Pane::Pipelines);  self.load_pipelines_if_needed(); }
             Pane::BuildEdges=> { self.nav(Pane::BuildEdges); self.load_edges_if_needed(); }
             Pane::Help      => { self.focus = Pane::Help; self.out_scroll = 0; }
+            Pane::Vars      => {
+                self.focus = Pane::Vars;
+                self.load_vars();
+                if self.vars_query.0.is_empty() && self.vars_query.1.is_empty() {
+                    self.modal = Some(Modal::VarQuery { buf: String::new() });
+                }
+            }
             other           => { self.focus = other; }
         }
     }
@@ -3003,7 +3066,7 @@ impl App {
             }
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
             | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
-            | Pane::Help | Pane::Pty | Pane::ApiLogs => {}
+            | Pane::Help | Pane::Pty | Pane::ApiLogs | Pane::Vars => {}
         }
     }
 
@@ -3354,6 +3417,15 @@ impl App {
     /// "ids" filter is dropped; a user one keeps its clauses for next time).
     #[cfg_attr(test, allow(dead_code))]
     fn toggle_filter(&mut self) {
+        if self.focus == Pane::Vars {
+            let seed = if self.vars_query.1.is_empty() {
+                self.vars_query.0.clone()
+            } else {
+                format!("{} {}", self.vars_query.0, self.vars_query.1)
+            };
+            self.modal = Some(Modal::VarQuery { buf: seed });
+            return;
+        }
         let Some(v) = self.focus_filter_view() else {
             self.status = "filter: not a filterable pane".into();
             return;
@@ -3532,6 +3604,10 @@ impl App {
             Pane::ApiLogs => {
                 if self.api_log_rows.is_empty() { return; }
                 self.sel_api_log = if end { self.api_log_rows.len() - 1 } else { 0 };
+            }
+            Pane::Vars => {
+                if self.vars_rows.is_empty() { return; }
+                self.sel_var = if end { self.vars_rows.len() - 1 } else { 0 };
             }
             Pane::Hunks => {
                 if end {
@@ -4422,6 +4498,93 @@ fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
 /// this box's behalf. Backed by the box's `api_log` sqlar table — sourced
 /// via the `api_log` control verb (no view machinery; rows are bounded by
 /// LLM call count which is naturally small).
+/// VARS index (left pane): Name | Where (assignment loc / shell context) |
+/// Value (truncated). Rows are the current query's matches in assignment
+/// order; '/' re-queries.
+fn vars_index_lines(app: &App) -> Vec<Line<'static>> {
+    let (qn, qv) = &app.vars_query;
+    let mut out = vec![Line::from(Span::styled(
+        format!("query: name~[{qn}] value~[{qv}]   ('/' to change)"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if app.vars_rows.is_empty() {
+        out.push(Line::from(if qn.is_empty() && qv.is_empty() {
+            "press '/' and type a NAME (or NAME VALUE) query"
+        } else {
+            "(no recorded assignments match — run the build in this box first?)"
+        }));
+        return out;
+    }
+    for (i, r) in app.vars_rows.iter().enumerate() {
+        let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+        let loc = r.get("loc").and_then(Value::as_str).unwrap_or("");
+        let val = r.get("value").and_then(Value::as_str).unwrap_or("");
+        let mk = r.get("make").and_then(Value::as_str).unwrap_or("");
+        let shellish = mk.starts_with("sh");
+        let one: String = val.chars()
+            .map(|c| if c == '\n' { ' ' } else { c }).take(48).collect();
+        let name_s: String = name.chars().take(22).collect();
+        let loc_s: String = loc.chars().take(28).collect();
+        let text = format!("{:<22} {:<28} {}", name_s, loc_s, one);
+        let line = if i == app.sel_var {
+            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else if shellish {
+            Line::from(Span::styled(text, Style::default().fg(Color::Magenta)))
+        } else {
+            Line::from(Span::raw(text))
+        };
+        out.push(line);
+    }
+    out
+}
+
+/// VARS detail (right pane): the selected assignment in full, then every
+/// other recorded assignment of the SAME name (its history) — the value
+/// chain the query surfaced, oldest first.
+fn var_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(row) = app.vars_rows.get(app.sel_var) else {
+        return vec![Line::from(Span::styled(
+            "(no assignment selected)",
+            Style::default().add_modifier(Modifier::DIM)))];
+    };
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let name = row.get("name").and_then(Value::as_str).unwrap_or("");
+    let loc = row.get("loc").and_then(Value::as_str).unwrap_or("");
+    let mk = row.get("make").and_then(Value::as_str).unwrap_or("");
+    let val = row.get("value").and_then(Value::as_str).unwrap_or("");
+    let mut out = vec![
+        Line::from(vec![Span::styled("name   ", dim), Span::styled(name.to_string(), bold)]),
+        Line::from(vec![Span::styled("where  ", dim), Span::raw(loc.to_string())]),
+        Line::from(vec![Span::styled("make   ", dim), Span::raw(mk.to_string())]),
+        Line::from(""),
+        Line::from(Span::styled("value", bold)),
+    ];
+    for l in val.lines() {
+        out.push(Line::from(l.to_string()));
+    }
+    if val.is_empty() {
+        out.push(Line::from(Span::styled("(empty)", dim)));
+    }
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        format!("── every recorded assignment of {name} ──"), dim)));
+    for r in &app.vars_rows {
+        if r.get("name").and_then(Value::as_str) != Some(name) {
+            continue;
+        }
+        let loc = r.get("loc").and_then(Value::as_str).unwrap_or("");
+        let v = r.get("value").and_then(Value::as_str).unwrap_or("");
+        let one: String = v.chars()
+            .map(|c| if c == '\n' { ' ' } else { c }).take(90).collect();
+        out.push(Line::from(vec![
+            Span::styled(format!("{loc:<30} "), Style::default().fg(Color::Cyan)),
+            Span::raw(one),
+        ]));
+    }
+    out
+}
+
 fn api_log_index_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         format!("{:<8} {:<6} {:<5} {:<24} {:<12} {:>7}",
@@ -4852,6 +5015,14 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from("e.g.  discard **/*.log   ·   Enter save · Esc cancel"),
             ],
         ),
+        Modal::VarQuery { buf } => (
+            " variable query ",
+            vec![
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from("NAME [VALUE] — text globs, bare word = substring                             · Enter search · Esc cancel"),
+            ],
+        ),
         Modal::PtyCmd { buf } => {
             // The help must match what the CURRENT command actually does: a
             // `sarun …` line runs the sarun binary on the host and IT builds
@@ -5094,6 +5265,7 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
         Pane::Help      => Some(('?', "help",    FilterView::Changes /* unused */)),
         Pane::Pty       => Some(('P', "PTY",     FilterView::Changes /* unused */)),
         Pane::ApiLogs   => Some(('i', "api",     FilterView::Changes /* unused */)),
+        Pane::Vars      => Some(('v', "vars",    FilterView::Changes /* unused */)),
     }
 }
 
@@ -5116,6 +5288,7 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
     ('e', Pane::Rules,      "Rules",   PaneVis::Always,            "file rules — the ordered apply/discard/passthrough rules"),
     ('P', Pane::Pty,        "PTYs",    PaneVis::Pty,               "open an engine-held PTY — a live interactive shell pane"),
     ('i', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
+    ('v', Pane::Vars,       "Vars",    PaneVis::Data("makevar"),   "variable provenance — make + shell assignments ('/' queries)"),
     ('?', Pane::Help,       "Help",    PaneVis::Always,            "this help"),
 ];
 
@@ -5779,6 +5952,21 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
             }
+            Pane::Vars => {
+                let lines = vars_index_lines(app);
+                let scroll = scroll_for_cursor(app.sel_var + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
+                    .block(block(title("VARS · provenance", lf), lf))
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
+                let dl = var_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
+                    .block(block(title("VARIABLE · value + history", rf), rf))
+                    .scroll((rs, 0))
+                    .wrap(Wrap { trim: false });
+                if !skip_right { f.render_widget(detail, right); }
+            }
             // Changes view (Pane::Changes is list-focused; Pane::Hunks is
             // diff-focused — same two-pane layout, different border). The
             // right half is split vertically: a 3-row cd-info strip with
@@ -6073,7 +6261,16 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         out.push(Line::from(Span::styled(
             format!("── FAILURES ── ('!' in build/pipes/outputs filters to errors)"),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
-        for r in rows.iter().take(budget).rev() {
+        // Hard cap: each failure takes 2 lines (label + excerpt) and a broken
+        // -j build can fail dozens of edges at once — without the cap the
+        // section shoves everything else off the pane.
+        let cap = budget.min(6);
+        if rows.len() > cap {
+            out.push(Line::from(Span::styled(
+                format!("  (+{} more — 'g' then '!' to see all)", rows.len() - cap),
+                Style::default().fg(Color::Red).add_modifier(Modifier::DIM))));
+        }
+        for r in rows.iter().take(cap).rev() {
             let label = r.get("label").and_then(Value::as_str).unwrap_or("");
             let code = r.get("code").and_then(Value::as_i64).unwrap_or(0);
             let kind = r.get("kind").and_then(Value::as_str).unwrap_or("");
@@ -7719,6 +7916,26 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::RuleForm { buf, editing }),
         },
+        Modal::VarQuery { mut buf } => match code {
+            KeyCode::Enter => {
+                let mut it = buf.split_whitespace();
+                app.vars_query = (
+                    it.next().unwrap_or("").to_string(),
+                    it.next().unwrap_or("").to_string(),
+                );
+                app.load_vars();
+            }
+            KeyCode::Esc => {}
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::VarQuery { buf });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::VarQuery { buf });
+            }
+            _ => app.modal = Some(Modal::VarQuery { buf }),
+        },
         Modal::PtyCmd { mut buf } => match code {
             KeyCode::Enter => app.open_pty(shell_split(&buf)),
             KeyCode::Esc => app.status = "pty cancelled".into(),
@@ -8319,7 +8536,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // Letter accelerators: route through the same
                     // dispatch_menubar_key the F9 menu-nav path uses,
                     // so the two paths can't diverge.
-                    KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i')) =>
+                    KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'v')) =>
                         dispatch_menubar_key(&mut app, c),
                     // Esc / Backspace from the packet drill-down pops back
                     // to the flows list, keeping its cursor + detail state.
@@ -9389,7 +9606,7 @@ mod tests {
             f_pipelines: ViewFilter::default(),
             f_edges: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], pty_in_right: false, menu_nav: false, menu_sel: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], vars_query: (String::new(), String::new()), vars_rows: vec![], sel_var: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
             oci_images: vec![],
             launch_net: 0,
             launch_env: false,
