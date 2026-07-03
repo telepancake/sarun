@@ -4771,6 +4771,28 @@ fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
             Span::styled("   (g/p/o/c cross-navigate)", dim),
         ]));
     }
+    // A ?= (or any file assignment) whose variable's ORIGIN is env/cmdline/
+    // override never took effect — the recorded value is the WINNER from
+    // elsewhere, while the rhs below is the losing default. Say so, loudly:
+    // reading "rhs aa, value aabb" without this note sends the reader hunting
+    // in the wrong file.
+    {
+        let letters = makevar_flag_letters(row);
+        if letters.starts_with('q')
+            && letters.chars().any(|c| matches!(c, 'e' | 'E' | 'c' | 'o'))
+        {
+            let whom = match letters.chars().nth(1) {
+                Some('c') => "this make's command line",
+                Some('o') => "an override directive",
+                _ => "the environment",
+            };
+            out.push(Line::from(Span::styled(
+                format!("NOTE: this ?= did NOT assign — the value came from \
+{whom}; the rhs below is the losing default"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    }
     let mut items: Vec<(usize, VarNavAction)> = vec![];
     let hl = |on: bool, text: String, base: Style| {
         if on {

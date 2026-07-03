@@ -49,6 +49,7 @@ def main():
         "ORIG_VAR += bb\n"
         "DERIVED := pre-$(ORIG_VAR)-$(OTHER)\n"
         "OTHER := zz\n"
+        "LOSER ?= default-val\n"
         "all:\n\t@echo done > out.txt\n")
     eng = subprocess.Popen([str(BIN), "serve"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
@@ -63,7 +64,7 @@ def main():
             return 1
         r = subprocess.run(
             [str(BIN), "run", "-b", "--vars", "UIVARS", "-C", str(work),
-             "--", "make"],
+             "--", "make", "LOSER=cmdline-won"],
             capture_output=True, text=True, timeout=120)
         check(r.returncode == 0,
               f"--vars box exits 0 (got {r.returncode}: {r.stderr[-400:]})")
@@ -135,6 +136,13 @@ def main():
         txt = screen()
         check("ORIG_VAR" in txt and "Makefile:1" in txt,
               "a single word matches VALUES by substring ('aa' finds ORIG_VAR)")
+        send("/", 0.5)
+        send("\x7f" * 30, 0.3)
+        send("LOSER"); send("\r", 1.0)
+        txt = screen()
+        check("q" in txt and "did NOT assign" in txt
+              and "cmdline-won" in txt,
+              "a ?= beaten by a command-line value carries the explicit NOTE")
         send("p", 1.2)
         check("Pipes" in screen(), "'p' cross-nav from Vars lands on Pipes")
         send("q", 0.5)
