@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 03 Jul 2026 16:03:12 +0000
+Subject: [PATCH] wait: implement waiting on process IDs
+
+wait <pid> was wholesale unimplemented. Resolve the pid through
+JobManager::resolve_pid (covers real pids and the minted stand-ins for
+in-process background jobs), propagate the waited command's exit
+status, and report bash's 'pid N is not a child of this shell' with
+exit 127 for unknown pids.
+
+---
+diff --git a/src/wait.rs b/src/wait.rs
+index 05b2009..e0c9ae7 100644
+--- a/src/wait.rs
++++ b/src/wait.rs
+@@ -58,9 +58,28 @@ impl builtins::Command for WaitCommand {
+ 
+                         result = ExecutionExitCode::GeneralError.into();
+                     }
++                } else if let Ok(pid) = id.parse::<i64>() {
++                    // It's a process ID; bash returns the waited command's
++                    // exit status, or 127 for a pid it never spawned.
++                    if let Some(job) = context.shell.jobs_mut().resolve_pid(pid) {
++                        result = job.wait().await?;
++                    } else {
++                        writeln!(
++                            context.stderr(),
++                            "{}: pid {} is not a child of this shell",
++                            context.command_name,
++                            pid
++                        )?;
++                        result = ExecutionExitCode::Custom(127).into();
++                    }
+                 } else {
+-                    // It's a process ID.
+-                    return error::unimp("wait with process IDs");
++                    writeln!(
++                        context.stderr(),
++                        "{}: no such job: {}",
++                        context.command_name,
++                        id
++                    )?;
++                    result = ExecutionExitCode::GeneralError.into();
+                 }
+             }
+         } else {

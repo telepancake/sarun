@@ -2,3 +2,4 @@
 0020-vendor-brush-builtins-exec-in-a-subshell-must-terminate-the-.patch
 0030-provenance-record-make-shell-variable-assignments-in-the-box.patch
 0040-provenance-opt-in-vars-record-rhs-dereferences-and-execution.patch
+0050-wait--implement-waiting-on-process-IDs.patch

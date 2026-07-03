@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 03 Jul 2026 16:03:12 +0000
+Subject: [PATCH] jobs: mint stand-in pids for in-process background jobs
+
+A backgrounded subshell/compound runs as an internal tokio task with no
+OS process, so $! expanded empty and the job was unaddressable. Mint a
+stand-in pid (above any real kernel pid — pid_max caps at 2^22) when a
+job lands with no external pid; representative_pid() falls back to it,
+and JobManager::resolve_pid() maps a pid (real or minted) back to its
+job for wait-by-pid.
+
+---
+diff --git a/src/jobs.rs b/src/jobs.rs
+index a549c92..00bd2fd 100644
+--- a/src/jobs.rs
++++ b/src/jobs.rs
+@@ -106,6 +106,14 @@ impl JobManager {
+         let id = self.jobs.len() + 1;
+         job.id = id;
+         job.annotation = JobAnnotation::Current;
++        if job.representative_pid().is_none() {
++            // In-process task (e.g. a backgrounded subshell): mint a
++            // stand-in pid so `$!` is non-empty and `wait $!` resolves.
++            static NEXT: std::sync::atomic::AtomicI32 =
++                std::sync::atomic::AtomicI32::new(0x1000_0000);
++            job.synthetic_pid =
++                Some(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
++        }
+         self.jobs.push(job);
+ 
+         #[allow(clippy::unwrap_used, reason = "we just pushed an element")]
+@@ -162,6 +170,14 @@ impl JobManager {
+         }
+     }
+ 
++    /// Tries to resolve a pid (as reported by `$!` / job listings — a real
++    /// process id or a minted stand-in for an in-process task) to a job.
++    pub fn resolve_pid(&mut self, pid: i64) -> Option<&mut Job> {
++        self.jobs
++            .iter_mut()
++            .find(|j| j.representative_pid().is_some_and(|p| i64::from(p) == pid))
++    }
++
+     /// Waits for all managed jobs to complete.
+     pub async fn wait_all(&mut self) -> Result<Vec<Job>, error::Error> {
+         for job in &mut self.jobs {
+@@ -272,6 +288,11 @@ pub struct Job {
+ 
+     /// The current operational state of the job.
+     pub state: JobState,
++
++    /// A minted stand-in pid for jobs with no external process (background
++    /// subshells and other in-process tasks), so `$!` and `wait <pid>` work.
++    /// Minted above any real kernel pid (pid_max caps at 2^22).
++    synthetic_pid: Option<sys::process::ProcessId>,
+ }
+ 
+ impl Display for Job {
+@@ -303,6 +324,7 @@ impl Job {
+             annotation: JobAnnotation::None,
+             command_line,
+             state,
++            synthetic_pid: None,
+         }
+     }
+ 
+@@ -447,7 +469,7 @@ impl Job {
+                 JobTask::Internal(_) => (),
+             }
+         }
+-        None
++        self.synthetic_pid
+     }
+ 
+     /// Tries to retrieve the process group ID (PGID) of the job.

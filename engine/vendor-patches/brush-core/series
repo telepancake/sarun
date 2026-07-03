@@ -11,3 +11,4 @@
 0110-brush-reset-EXIT-trap-in-subshells-bash-semantics-record-sou.patch
 0120-brush-core-clear-ALL-inherited-traps-on-the-snoop-clone.patch
 0130-pipeline--compound-and-function-stages-run-concurrently.patch
+0140-jobs--mint-stand-in-pids-for-in-process-background-jobs.patch
