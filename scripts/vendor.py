@@ -146,7 +146,11 @@ def cmd_assemble(force=False, only=None):
         entry["_name"] = name
         want = stamp_of(name, entry)
         stamp = os.path.join(VENDOR, name, ".stamp")
-        if not force and os.path.exists(stamp) and open(stamp).read() == want:
+        # A valid stamp only counts if the tree is actually there — a git
+        # operation can remove the files while leaving the untracked stamp.
+        populated = os.path.exists(os.path.join(VENDOR, name, "Cargo.toml"))
+        if not force and populated and os.path.exists(stamp) \
+                and open(stamp).read() == want:
             continue
         assemble(name, entry, upstream_root(entry))
         with open(stamp, "w") as f:
