@@ -2149,6 +2149,36 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 .entry(name.to_string()).or_default().push_back(writer);
             return;
         }
+        // svc.declare: a box declares that IT provides an on-demand service.
+        // Stamped onto the DIALING box's meta (hint_box_id): `svc_provide`
+        // (name), `svc_argv` (JSON `--` payload to run in the serve sub-box),
+        // `svc_net` (optional net mode). Later, when a box dials svc://<name>
+        // and nothing is serving, the engine starts that payload as a
+        // sub-box PARENTED on this box (see ensure_service). Generic: any box
+        // — an oci image, a downloaded model box — can advertise a server
+        // this way. See engine/DESIGN.md "On-demand box services".
+        if msg.get("type").and_then(Value::as_str) == Some("svc.declare") {
+            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            let name = msg.get("name").and_then(Value::as_str).unwrap_or("");
+            let argv = msg.get("argv").cloned().unwrap_or(Value::Null);
+            let net = msg.get("net").and_then(Value::as_str).unwrap_or("");
+            let ok = svc_name_ok(name) && argv.is_array();
+            if ok {
+                if let (Some(bid), Some(ov)) =
+                    (hint_box_id, lock(&state).overlay.clone())
+                {
+                    if let Some(b) = ov.box_of(bid) {
+                        b.set_meta("svc_provide", name);
+                        b.set_meta("svc_argv", &argv.to_string());
+                        b.set_meta("svc_net", net);
+                    }
+                }
+            }
+            let reply = if ok { "{\"ok\":true}\n" }
+                        else { "{\"ok\":false,\"error\":\"svc.declare: bad name/argv\"}\n" };
+            let _ = writer.write_all(reply.as_bytes());
+            return;
+        }
         // svc.dial: the host-side half — THIS connection becomes a raw
         // stream spliced onto a parked svc.serve slot of the named service.
         // Rides the ordinary control socket (like pty_spawn / api.proxy);
@@ -2428,6 +2458,70 @@ static SVC_PARKED: std::sync::LazyLock<
 /// the sequential calls an agent makes.
 pub fn svc_has(name: &str) -> bool {
     SVC_PARKED.lock().unwrap().get(name).is_some_and(|q| !q.is_empty())
+}
+
+/// GENERIC on-demand service start. When a box dials `svc://<name>` and
+/// nothing is serving (a fresh engine after restart, or the serve box was
+/// discarded), find the box that DECLARED the service (meta `svc_provide`
+/// == name, set via `svc.declare`) and start its declared payload
+/// (`svc_argv`) as a sub-box PARENTED on it — so the sub-box reads the
+/// declaring box's files without any apply. Serialized + idempotent:
+/// concurrent callers coalesce onto one start. Returns once a slot parks
+/// (server ready) or errors with an actionable reason. This is the reusable
+/// mechanism behind `oaita local`; any box can advertise a server the same
+/// way. See engine/DESIGN.md "On-demand box services".
+pub async fn ensure_service(name: &str) -> Result<(), String> {
+    if svc_has(name) { return Ok(()); }
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = LOCK.lock().await;
+    if svc_has(name) { return Ok(()); } // another caller won the race
+    // Find the declaring box.
+    let boxes = discover::discover();
+    let Some((&pid, decl)) = boxes.iter()
+        .find(|(_, b)| b.meta.get("svc_provide").map(|s| s == name).unwrap_or(false))
+    else {
+        return Err(format!("no box provides service '{name}' — nothing has \
+            declared it (svc.declare)"));
+    };
+    let argv: Vec<String> = decl.meta.get("svc_argv")
+        .and_then(|s| serde_json::from_str(s).ok())
+        .ok_or_else(|| format!("service '{name}': malformed svc_argv"))?;
+    if argv.is_empty() {
+        return Err(format!("service '{name}': empty svc_argv"));
+    }
+    // Net for the serve sub-box: declared, or default tap with a host
+    // fallback where netns is unavailable (mirrors box networking).
+    let net = match decl.meta.get("svc_net").map(String::as_str) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => if crate::net::tap::tap_available() { "tap" } else { "host" }.to_string(),
+    };
+    // Serve sub-box parented on the declaring box (numeric-id prefix — the
+    // engine resolves it as the parent, same stacking `oci run` uses).
+    let child = format!("SVC-{}", name.to_ascii_uppercase()
+        .chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect::<String>());
+    let serve_box = format!("{pid}.{child}");
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "sarun".into());
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["run", "--net", &net, &serve_box, "--"]);
+    for a in &argv { cmd.arg(a); }
+    cmd.stdin(std::process::Stdio::null())
+       .stdout(std::process::Stdio::null())
+       .stderr(std::process::Stdio::null());
+    // setsid: outlive whatever triggered the start.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| { libc::setsid(); Ok(()) });
+    }
+    cmd.spawn().map_err(|e| format!("start service '{name}': {e}"))?;
+    for _ in 0..240 { // ~120s: cold server / model load
+        if svc_has(name) { return Ok(()); }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err(format!("service '{name}' did not become ready in time \
+        (check box '{serve_box}')"))
 }
 
 /// Pop the first LIVE parked slot for `name` (a dead slot — its box exited

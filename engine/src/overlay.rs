@@ -898,7 +898,7 @@ impl Overlay {
         }
     }
 
-    fn box_of(&self, id: i64) -> Option<Arc<BoxState>> {
+    pub(crate) fn box_of(&self, id: i64) -> Option<Arc<BoxState>> {
         self.inner.boxes.read().unwrap().get(&id).cloned()
     }
 

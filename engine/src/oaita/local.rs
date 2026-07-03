@@ -42,24 +42,23 @@ USAGE:
                    — outside sarun's own dirs, which boxes cannot see)
   --model-url URL  GGUF to fetch (default Qwen3-0.6B-Q8_0 from Hugging Face)
   --runtime-url URL  llama.cpp release zip (default: latest CPU ubuntu-x64)
-  --setup-only     download + write config, don't start the server
+  --setup-only     alias for the default (download only; never serves)
   --write-config   overwrite an existing oaita.toml (backed up to .bak)
   --force          re-download even if files exist
   --no-box         run on the host directly instead of inside sarun boxes
-  --net MODE       network for the DOWNLOAD box: tap (default; engine's
-                   proxied per-box stack, no host netns) or host (for
-                   environments without netns privileges)
+  --net MODE       network for the download box: tap (default) or host
 
-Two boxed phases, no host network in either by default. DOWNLOAD runs
-in box 'OAITA-LOCAL' under tap networking — egress via the engine's
-proxied stack, files captured until an explicit `sarun OAITA-LOCAL
-apply`. SERVE runs in box 'OAITA-SERVE' with its OWN isolated netns;
-the endpoint is bridged through the engine's control socket (oaita.toml
-gets base_url = \"svc://oaita-local#/v1\") so no netns — and no extra
-socket — is ever involved. --net host switches both phases to the
-host netns (plain http://127.0.0.1 endpoint) for environments without
-netns privileges. Requires a running engine; --no-box does everything
-directly on the host instead.";
+`oaita local` (F4) ONLY DOWNLOADS — it starts no server. The model is
+fetched into box 'OAITA-LOCAL' (captured; never applied to the host)
+and oaita.toml is pointed at base_url = \"svc://oaita-local#/v1\". That
+box then DECLARES an on-demand service: the first time any box calls
+the endpoint (and again after every restart), the engine starts the
+server as a sub-box PARENTED on OAITA-LOCAL — reading the captured model
+with no apply, bridged over the engine's control socket, no host netns.
+Nothing is left running to babysit. See engine/DESIGN.md \"On-demand
+box services\" — the same mechanism any box can use to advertise a
+server. Requires a running engine; --no-box downloads + serves on the
+host directly instead.";
 
 pub fn cmd_local(args: &[String]) -> i32 {
     let mut port = DEFAULT_PORT;
@@ -151,14 +150,12 @@ pub fn cmd_local(args: &[String]) -> i32 {
             &net, net_explicit, crate::net::tap::tap_available());
         net = chosen;
         if let Some(n) = note { eprintln!("oaita local: {n}"); }
-        // Endpoint the host's oaita will use. Isolated serve (the default)
-        // is bridged out over the engine's svc socket — HTTP over a host
-        // UDS, no netns anywhere. --net host keeps the plain TCP endpoint.
-        let base_url = if net == "host" {
-            format!("http://127.0.0.1:{port}/v1")
-        } else {
-            format!("svc://{SVC_NAME}#/v1")
-        };
+        // Endpoint is ALWAYS the engine-bridged svc socket — regardless of
+        // the box's own network. The bridge rides the broker/engine sockets
+        // (svc.serve/svc.dial), so it works whether the serve box is tap,
+        // off, or host. Uniform endpoint = the engine can recognize it and
+        // start it ON DEMAND (control::ensure_service) when a box needs it.
+        let base_url = format!("svc://{SVC_NAME}#/v1");
         if let Err(e) = ensure_config(&base_url, write_config) {
             eprintln!("oaita local: {e:#}");
             return 1;
@@ -166,26 +163,26 @@ pub fn cmd_local(args: &[String]) -> i32 {
         let this = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "sarun".into());
-        // Already serving? Idempotent — a second F4 / `oaita local` is a
-        // no-op. Isolated: probe the svc slot; host: probe the TCP port.
-        if endpoint_up(&net, port) {
-            eprintln!("oaita local: already serving at {base_url}");
-            return 0;
-        }
-        // 1. DOWNLOAD (once) into box 'OAITA-LOCAL', captured. We detect a
-        //    prior download by the box's existence, NOT host files — the
-        //    files live in that box's overlay and are NEVER applied to the
-        //    host (the serve box reads them by parenting on OAITA-LOCAL).
+        // F4 / `oaita local` ONLY downloads the model — it starts NOTHING.
+        // Serving is entirely on demand: the first time a box calls the
+        // svc://oaita-local endpoint, the engine starts the serve box
+        // (control::ensure_service), and does so again after any restart. So
+        // there is no server to babysit and nothing to leave running here.
+        //
+        // Download (once) into box 'OAITA-LOCAL', captured. A prior download
+        // is detected by that box existing, NOT by host files — the files
+        // live in the box's overlay and are never applied to the host (the
+        // serve box reads them by parenting on OAITA-LOCAL).
         if force || !download_box_ready() {
             let mut cmd = std::process::Command::new(&this);
-            cmd.args(["run", "--net", &net, "OAITA-LOCAL", "--",
+            cmd.args(["run", "--net", &net, DOWNLOAD_BOX, "--",
                       &this, "oaita", "local", "--inbox", "--setup-only",
                       "--port", &port.to_string(),
                       "--model-url", &model_url,
                       "--dir"]).arg(&dir);
             if let Some(u) = &runtime_url { cmd.args(["--runtime-url", u]); }
             if force { cmd.arg("--force"); }
-            eprintln!("oaita local: downloading into box 'OAITA-LOCAL' \
+            eprintln!("oaita local: downloading into box '{DOWNLOAD_BOX}' \
                        (net={net}); the files stay captured in that box — \
                        no host changes");
             match cmd.status() {
@@ -193,66 +190,14 @@ pub fn cmd_local(args: &[String]) -> i32 {
                 Ok(st) => return st.code().unwrap_or(1),
                 Err(e) => { eprintln!("oaita local: spawn box: {e}"); return 1; }
             }
+        } else {
+            eprintln!("oaita local: model already downloaded (box \
+                       '{DOWNLOAD_BOX}')");
         }
-        if setup_only {
-            eprintln!("oaita local: model ready in box 'OAITA-LOCAL' \
-                       (run `sarun oaita local` to serve it)");
-            return 0;
-        }
-        // 2. SERVE: a box PARENTED on OAITA-LOCAL (dotted name) so it reads
-        //    the captured model+runtime with NO apply, detached so it
-        //    outlives this F4 PTY. Endpoint bridged over the engine (svc)
-        //    when isolated; host loopback under --net host.
-        let serve_box = format!("OAITA-LOCAL.{SERVE_BOX}");
-        let mut cmd = std::process::Command::new(&this);
-        // setsid: own session, so closing the launching PTY doesn't SIGHUP
-        // the server. The box lives as long as this detached runner does.
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| { libc::setsid(); Ok(()) });
-        }
-        cmd.args(["run", "--net", &net, &serve_box, "--",
-                  &this, "oaita", "local", "--inbox",
-                  "--port", &port.to_string(),
-                  "--model-url", &model_url,
-                  "--dir"]).arg(&dir);
-        if net != "host" { cmd.args(["--svc", SVC_NAME]); }
-        cmd.stdin(std::process::Stdio::null())
-           .stdout(std::process::Stdio::null())
-           .stderr(std::process::Stdio::null());
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => { eprintln!("oaita local: spawn serve box: {e}"); return 1; }
-        };
-        eprintln!("oaita local: starting the model server in box \
-                   '{serve_box}' (detached) — loading the model…");
-        if net == "host" {
-            // No svc slot to probe under host net; give it a moment and
-            // trust it (the endpoint is plain http://127.0.0.1).
-            eprintln!("oaita local: server starting at {base_url} \
-                       (net=host). Stop it with `sarun {serve_box} discard`.");
-            let _ = child; // leave it running, detached
-            return 0;
-        }
-        // Poll the svc endpoint until the server has loaded + bridged.
-        for i in 0..240 { // ~120s for a cold CPU model load
-            if svc_up(SVC_NAME) {
-                eprintln!("oaita local: READY — endpoint {base_url}");
-                eprintln!("  boxes reach it automatically (e.g. an agent \
-                           session on a box). Stop it with \
-                           `sarun {serve_box} discard`.");
-                return 0;
-            }
-            if i == 6 {
-                eprintln!("oaita local: (still loading the model — this can \
-                           take a while on CPU)");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        eprintln!("oaita local: server did not become ready in ~120s — \
-                   check box '{serve_box}' (`sarun {serve_box} patch`, or \
-                   the UI). It may still come up; retry shortly.");
-        return 1;
+        eprintln!("oaita local: model ready — boxes reach it on demand at \
+                   {base_url} (the engine starts the server on the first \
+                   call and after restarts; no server left running).");
+        return 0;
     }
     match run(&dir, port, &model_url, runtime_url.as_deref(),
               setup_only, write_config && !inbox, force, inbox,
@@ -269,32 +214,6 @@ const SVC_NAME: &str = "oaita-local";
 /// `sarun <NAME> discard` can address them.
 const DOWNLOAD_BOX: &str = "OAITA-LOCAL";
 const SERVE_BOX: &str = "OAITA-SERVE";
-
-/// Whether the local endpoint is already serving, for the active net mode:
-/// isolated → the engine's svc slot is parked; host → something answers on
-/// the loopback TCP port.
-fn endpoint_up(net: &str, port: u16) -> bool {
-    if net == "host" {
-        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-    } else {
-        svc_up(SVC_NAME)
-    }
-}
-
-/// Ask the engine whether the named svc service is live (has parked slots).
-fn svc_up(name: &str) -> bool {
-    let Ok(mut s) = std::os::unix::net::UnixStream::connect(
-        crate::paths::sock_path()) else { return false };
-    let msg = format!("{{\"type\":\"ui\",\"verb\":\"svc.up\",\"args\":[\"{name}\"]}}\n");
-    if s.write_all(msg.as_bytes()).is_err() { return false; }
-    let mut line = String::new();
-    if std::io::BufRead::read_line(
-        &mut std::io::BufReader::new(&s), &mut line).is_err() { return false; }
-    serde_json::from_str::<serde_json::Value>(&line).ok()
-        .and_then(|v| v.get("r").and_then(|r| r.get("up"))
-            .and_then(serde_json::Value::as_bool))
-        .unwrap_or(false)
-}
 
 /// Whether the OAITA-LOCAL download box exists and carries the model — i.e.
 /// a prior download succeeded. Checked via the engine (the files live in
@@ -332,6 +251,35 @@ fn engine_running() -> bool {
     std::os::unix::net::UnixStream::connect(crate::paths::sock_path()).is_ok()
 }
 
+/// The first `*.gguf` model in `dir` (the serve path locates the model by
+/// scanning, so it needs no --model-url — the download named the file).
+fn find_gguf(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?
+        .filter_map(|e| e.ok()).map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "gguf"))
+}
+
+/// Declare (from inside the download box) that THIS box provides the
+/// on-demand `oaita-local` service: the engine stamps the declaration onto
+/// this box's meta, so a later svc://oaita-local call starts the serve
+/// payload as a sub-box parented here. See control::ensure_service.
+fn declare_service(dir: &Path) {
+    let Ok(broker) = std::env::var("SARUN_BROKER") else { return };
+    if broker.is_empty() { return; }
+    // Payload run in the serve sub-box: serve THIS dir over the svc bridge.
+    let argv = serde_json::json!([
+        "/proc/self/exe", "oaita", "local", "--inbox",
+        "--svc", SVC_NAME, "--dir", dir.to_string_lossy()]);
+    let msg = serde_json::json!({
+        "type": "svc.declare", "name": SVC_NAME, "argv": argv, "net": ""});
+    if let Ok(mut c) = crate::runner::broker_dial(&broker) {
+        let _ = c.write_all(format!("{msg}\n").as_bytes());
+        let mut line = String::new();
+        let _ = std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(&c), &mut line);
+    }
+}
+
 fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
        setup_only: bool, write_config: bool, force: bool, inbox: bool,
        svc: Option<&str>) -> Result<()> {
@@ -345,54 +293,65 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
         .context("tokio runtime")?;
-
-    // 1. model
-    let model_name = url_filename(model_url)
-        .ok_or_else(|| anyhow!("cannot derive a filename from {model_url}"))?;
-    let model_path = dir.join(&model_name);
-    if force || !model_path.is_file() {
-        rt.block_on(fetch_to(model_url, &model_path, "model"))?;
-    } else {
-        eprintln!("model already present: {}", model_path.display());
-    }
-
-    // 2. runtime
     let server = dir.join("llama-server");
-    if force || !server.is_file() {
-        let url = match runtime_url {
-            Some(u) => u.to_string(),
-            None => rt.block_on(latest_runtime_url())?,
-        };
-        // Keep the URL's own extension: extract_runtime routes zip vs tar.gz
-        // by filename.
-        let arch_name = url_filename(&url).unwrap_or_else(|| "runtime.tar.gz".into());
-        let arch_path = dir.join(&arch_name);
-        rt.block_on(fetch_to(&url, &arch_path, "runtime"))?;
-        let n = extract_runtime(&arch_path, dir)?;
-        let _ = std::fs::remove_file(&arch_path);
-        if !server.is_file() {
-            bail!("archive extracted ({n} files) but no llama-server in it — \
-                   pass --runtime-url with a llama.cpp *bin-ubuntu-x64* \
-                   archive, or drop a llama-server binary into {}",
-                  dir.display());
+
+    // DOWNLOAD when setting up, or (host `--no-box`) when the files aren't
+    // there yet. The SERVE path never downloads — it locates the existing
+    // model by scanning, so it needs no URL.
+    let need_download = force || setup_only
+        || find_gguf(dir).is_none() || !server.is_file();
+    if need_download {
+        let model_name = url_filename(model_url)
+            .ok_or_else(|| anyhow!("cannot derive a filename from {model_url}"))?;
+        let model_path = dir.join(&model_name);
+        if force || !model_path.is_file() {
+            rt.block_on(fetch_to(model_url, &model_path, "model"))?;
+        } else {
+            eprintln!("model already present: {}", model_path.display());
         }
-        eprintln!("runtime ready: {} ({n} files)", server.display());
-    } else {
-        eprintln!("runtime already present: {}", server.display());
+        if force || !server.is_file() {
+            let url = match runtime_url {
+                Some(u) => u.to_string(),
+                None => rt.block_on(latest_runtime_url())?,
+            };
+            let arch_name = url_filename(&url)
+                .unwrap_or_else(|| "runtime.tar.gz".into());
+            let arch_path = dir.join(&arch_name);
+            rt.block_on(fetch_to(&url, &arch_path, "runtime"))?;
+            let n = extract_runtime(&arch_path, dir)?;
+            let _ = std::fs::remove_file(&arch_path);
+            if !server.is_file() {
+                bail!("archive extracted ({n} files) but no llama-server in \
+                       it — pass --runtime-url with a llama.cpp \
+                       *bin-ubuntu-x64* archive, or drop a llama-server \
+                       binary into {}", dir.display());
+            }
+            eprintln!("runtime ready: {} ({n} files)", server.display());
+        }
     }
 
-    // 3. config — host-side concern; the box wrapper already wrote it (a
-    //    second write here would only show up as a spurious box change).
+    // Host-side `--no-box` writes its own (plain http) config; boxed flows
+    // get the svc:// config from cmd_local.
     if !inbox {
         ensure_config(&format!("http://127.0.0.1:{port}/v1"), write_config)?;
     }
 
     if setup_only {
-        eprintln!("setup complete — start the server later with `oaita local`");
+        // Advertise the on-demand service so the engine can start it later.
+        declare_service(dir);
+        eprintln!("setup complete — model captured; the engine serves it on \
+                   demand");
         return Ok(());
     }
 
-    // 4. serve (foreground; Ctrl-C stops it)
+    // SERVE: locate the model by scan (no URL needed) and run.
+    let model_path = find_gguf(dir)
+        .ok_or_else(|| anyhow!("no *.gguf model in {} — run `oaita local` \
+            (F4) to download it first", dir.display()))?;
+    if !server.is_file() {
+        bail!("no llama-server in {} — run `oaita local` to fetch the runtime",
+              dir.display());
+    }
     serve(dir, &model_path, port, svc)
 }
 

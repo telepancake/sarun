@@ -211,3 +211,37 @@ triple, but plain `cargo build`/`cargo test` do NOT work — there is no
 engine`. One musl source fix: `msg_controllen` is `socklen_t` on glibc but
 `size_t` on musl, so the `msg.msg_controllen` casts in `control.rs` use `as _`.
 `prototype/test_musl_rs.py` checks the static-linkage guarantee (`file` + `ldd`).
+
+## On-demand box services (svc.serve / svc.dial / svc.declare)
+
+A box can host a server that other boxes reach WITHOUT any shared network:
+the server rides the engine's control socket, not a netns. Three verbs:
+
+- `svc.serve {name}` — an in-box process PARKS a connection as one accept
+  slot of a named service. The engine holds the parked slots (`SVC_PARKED`).
+- `svc.dial {name}` — a caller (the api proxy forwarding a `svc://<name>`
+  upstream) becomes a raw stream that the engine splices onto a parked slot,
+  byte-for-byte. This is the inbound path INTO a box the tap stack lacks.
+- `svc.declare {name, argv, net}` — a box advertises that IT provides an
+  on-demand service. The engine stamps the declaring box's meta:
+  `svc_provide` (name), `svc_argv` (the `--` payload for the serve sub-box),
+  `svc_net` (optional net mode).
+
+**On-demand start (`control::ensure_service`).** When a box dials
+`svc://<name>` and nothing is serving (a fresh engine after restart, or the
+serve box was discarded), the engine finds the box whose meta declares
+`svc_provide == name` and runs its `svc_argv` as a sub-box PARENTED on that
+box (`<declaring-id>.SVC-<NAME>`). Parenting means the sub-box reads the
+declaring box's captured files with NO apply-to-host. The start is
+serialized + idempotent (concurrent callers coalesce), detached (`setsid`,
+so it outlives whatever triggered it), and waits for a slot to park before
+forwarding. So the service is never left running to babysit — it comes up on
+first use and again after every restart.
+
+**`oaita local` is one instance.** `oaita local` (UI: F4) ONLY downloads the
+model into box `OAITA-LOCAL` (captured, never applied) and declares the
+`oaita-local` service on that box; oaita.toml points at
+`svc://oaita-local#/v1`. The first box call starts
+`OAITA-LOCAL.SVC-OAITA-LOCAL` (llama-server + the svc bridge) on demand. Any
+box — an oci image, any downloaded-server box — can advertise a server the
+same way by declaring `svc_provide`/`svc_argv`.

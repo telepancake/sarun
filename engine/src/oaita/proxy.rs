@@ -183,6 +183,24 @@ async fn handle_inner(proxy: Arc<Proxy>, state: crate::control::State,
         return Ok(error_resp(StatusCode::SERVICE_UNAVAILABLE, msg));
     };
 
+    // On-demand: if the upstream is a `svc://<name>` endpoint and nothing is
+    // serving it (fresh engine after a restart, or the serve box was
+    // discarded), start it automatically before forwarding — GENERIC: any
+    // box that declared the service (svc.declare) is started as a sub-box.
+    // This is what makes `oaita local`'s endpoint (and any box-provided
+    // server) "just work" without the user restarting it by hand.
+    if let Some(rest) = up.base_url.strip_prefix("svc://") {
+        let svc_name = rest.split(['#', '/']).next().unwrap_or("");
+        if !svc_name.is_empty() {
+            if let Err(e) = crate::control::ensure_service(svc_name).await {
+                let msg = format!("svc '{svc_name}': {e}");
+                log_call(&proxy, box_id, &method, &path, &model, 502,
+                         &body_bytes, msg.as_bytes(), is_stream);
+                return Ok(error_resp(StatusCode::BAD_GATEWAY, &msg));
+            }
+        }
+    }
+
     let client = match Client::from_resolved(&up.base_url, &up.api_key) {
         Ok(c) => c,
         Err(e) => {
