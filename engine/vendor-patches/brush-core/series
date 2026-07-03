@@ -9,3 +9,4 @@
 0090-brush-bash-conformance-corpus-38-probes-through-a-real-box-3.patch
 0100-brush-LINENO-tracks-execution-unblocks-autoconf-configure.patch
 0110-brush-reset-EXIT-trap-in-subshells-bash-semantics-record-sou.patch
+0120-brush-core-clear-ALL-inherited-traps-on-the-snoop-clone.patch
