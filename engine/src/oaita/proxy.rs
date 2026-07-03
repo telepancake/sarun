@@ -65,14 +65,25 @@ impl Proxy {
     }
     pub async fn reload_config(&self) {
         let cfg = Config::load();
-        let (model_hint, base_url, api_key) = cfg.resolve()
-            .unwrap_or_else(|_| ("".into(), "".into(), "".into()));
-        if base_url.is_empty() {
-            *self.upstream.lock().await = None;
-        } else {
-            *self.upstream.lock().await = Some(UpstreamConfig {
-                base_url, api_key, model_hint,
-            });
+        match cfg.resolve() {
+            // A usable EXTERNAL (or explicit) config wins.
+            Ok((model_hint, base_url, api_key)) if !base_url.is_empty() => {
+                *self.upstream.lock().await = Some(UpstreamConfig {
+                    base_url, api_key, model_hint,
+                });
+            }
+            // No usable config. If sarun has a local model available
+            // (`oaita local` declared the oaita-local service), default to
+            // it — the local case needs NO oaita.toml at all. The engine
+            // knows the endpoint it set up; the box never configures a thing.
+            _ if crate::control::service_declared("oaita-local") => {
+                *self.upstream.lock().await = Some(UpstreamConfig {
+                    base_url: "svc://oaita-local#/v1".into(),
+                    api_key: String::new(),
+                    model_hint: "local".into(),
+                });
+            }
+            _ => *self.upstream.lock().await = None,
         }
     }
     pub fn enable_box(&self, box_id: i64) { self.api_boxes.write().insert(box_id); }

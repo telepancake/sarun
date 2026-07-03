@@ -158,9 +158,17 @@ pub fn cmd_local(args: &[String]) -> i32 {
         // off, or host. Uniform endpoint = the engine can recognize it and
         // start it ON DEMAND (control::ensure_service) when a box needs it.
         let base_url = format!("svc://{SVC_NAME}#/v1");
-        if let Err(e) = ensure_config(&base_url, write_config) {
-            eprintln!("oaita local: {e:#}");
-            return 1;
+        // The local case needs NO oaita.toml: once the download box declares
+        // the service, the engine defaults its upstream to svc://oaita-local
+        // and --api boxes don't require a model. So we DON'T write a config
+        // by default (that was the source of the recurring "no model set" —
+        // a stale/model-less oaita.toml). --write-config still pins it
+        // explicitly for anyone who wants a file.
+        if write_config {
+            if let Err(e) = ensure_config(&base_url, true) {
+                eprintln!("oaita local: {e:#}");
+                return 1;
+            }
         }
         let this = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())

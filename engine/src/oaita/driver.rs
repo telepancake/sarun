@@ -45,7 +45,23 @@ impl Settings {
         -> Result<Self, String>
     {
         let cfg = Config::load();
-        let (model_d, base_d, key_d) = cfg.resolve()?;
+        // Inside an --api box the client reaches the model through the
+        // engine's broker/proxy, which supplies the routing AND the model —
+        // so NO oaita.toml is needed for the sarun-local case. The config is
+        // only required when talking to an EXTERNAL API (host-side). In
+        // broker mode a missing model defaults to a placeholder the engine
+        // overrides; base_url is ignored (the broker wins).
+        let brokered = std::env::var("SARUN_BROKER")
+            .map(|s| !s.is_empty()).unwrap_or(false);
+        let (model_d, base_d, key_d) = match cfg.resolve() {
+            Ok(t) => t,
+            Err(_) if brokered => (
+                cfg.model.filter(|m| !m.trim().is_empty())
+                    .unwrap_or_else(|| "local".into()),
+                cfg.base_url.clone().unwrap_or_default(),
+                cfg.api_key.clone().unwrap_or_default()),
+            Err(e) => return Err(e),
+        };
         Ok(Settings {
             model: model.unwrap_or(model_d),
             base_url: base_url.unwrap_or(base_d),
