@@ -17,7 +17,7 @@ pub mod functions;
 pub mod history;
 pub mod int_utils;
 pub mod interfaces;
-mod interp;
+pub mod interp;
 mod ioutils;
 pub mod jobs;
 mod keywords;

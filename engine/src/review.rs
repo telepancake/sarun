@@ -363,6 +363,16 @@ pub fn box_summary(id: i64, limit: i64) -> Value {
         }
     }
 
+    // Presence marker for the Vars chip (the UI shows data-gated chips only
+    // when their table has rows).
+    let makevar: Vec<Value> = if has_table(&conn, "makevar")
+        && conn.query_row("SELECT 1 FROM makevar LIMIT 1", [], |_| Ok(())).is_ok()
+    {
+        vec![json!(1)]
+    } else {
+        vec![]
+    };
+
     json!({
         "outputs":   outputs,
         "changes":   changes,
@@ -370,7 +380,38 @@ pub fn box_summary(id: i64, limit: i64) -> Value {
         "pipelines": pipelines,
         "edges":     edges,
         "failures":  failures,
+        "makevar":   makevar,
     })
+}
+
+/// Search the box's recorded makefile variable assignments (the makevar
+/// table). `name_pat` / `value_pat` are cmd_match text globs — a bare word
+/// matches as a substring, empty matches everything. Rows come back in
+/// assignment order so a value's history reads top-to-bottom.
+pub fn makevars(id: i64, name_pat: &str, value_pat: &str, limit: i64) -> Value {
+    let Some(conn) = open_ro(id) else { return json!([]) };
+    if !has_table(&conn, "makevar") { return json!([]); }
+    let mut out = vec![];
+    let Ok(mut st) = conn.prepare(
+        "SELECT id, name, loc, value, make_dir FROM makevar ORDER BY id") else {
+        return json!([]);
+    };
+    let Ok(it) = st.query_map([], |r| Ok((
+        r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+        r.get::<_, String>(3)?, r.get::<_, String>(4)?,
+    ))) else { return json!([]) };
+    for (rid, name, loc, value, make_dir) in it.flatten() {
+        if !name_pat.is_empty() && !crate::rules::cmd_match(name_pat, &name) {
+            continue;
+        }
+        if !value_pat.is_empty() && !crate::rules::cmd_match(value_pat, &value) {
+            continue;
+        }
+        out.push(json!({"id": rid, "name": name, "loc": loc,
+                        "value": value, "make": make_dir}));
+        if out.len() as i64 >= limit { break; }
+    }
+    json!(out)
 }
 
 /// Map provenance row ids between the three linked domains — "process"

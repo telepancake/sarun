@@ -388,3 +388,25 @@ pub fn fnmatch(pattern: &CString, string: &[u8], flags: i32) -> bool {
 pub fn clear_glob_cache() {
     GLOB_CACHE.lock().clear();
 }
+
+// sarun: optional hook observing every makefile-level variable assignment
+// (name, "file:line", value, make working dir). The embedding engine records
+// them into the box's capture database so wrong-value hunts are a query, not
+// a rerun with trace flags. Same Arc-clone-then-release pattern as the other
+// hooks (the callback may allocate / send frames).
+pub type VarAssignHook =
+    Arc<dyn Fn(&[u8], &str, &[u8], &[u8]) + Send + Sync + 'static>;
+
+static VAR_ASSIGN_HOOK: parking_lot::Mutex<Option<VarAssignHook>> =
+    parking_lot::Mutex::new(None);
+
+pub fn install_var_assign_hook(f: VarAssignHook) {
+    *VAR_ASSIGN_HOOK.lock() = Some(f);
+}
+
+pub fn report_var_assign(name: &[u8], loc: &str, value: &[u8], make_dir: &[u8]) {
+    let h = VAR_ASSIGN_HOOK.lock().clone();
+    if let Some(h) = h {
+        h(name, loc, value, make_dir);
+    }
+}

@@ -101,6 +101,14 @@ CREATE TABLE IF NOT EXISTS build_edges(id INTEGER PRIMARY KEY AUTOINCREMENT,
 -- views would not see it. `model` is what the request asked for (best-effort
 -- — may be empty if the wire body omits it). `req`/`resp` are full bytes
 -- (for streaming: a SSE-frame-concatenated reconstitution).
+-- Makefile variable assignments, one row per (name, location, value, make
+-- working dir) the box's embedded makes evaluated — the searchable record
+-- behind the UI's Vars view (where did this variable get this value).
+-- UNIQUE collapses the identical re-assignments every sub-make repeats.
+CREATE TABLE IF NOT EXISTS makevar(id INTEGER PRIMARY KEY AUTOINCREMENT,
+ ts REAL, name TEXT, loc TEXT, value TEXT, make_dir TEXT,
+ UNIQUE(name, loc, value, make_dir));
+CREATE INDEX IF NOT EXISTS idx_makevar_name ON makevar(name);
 CREATE TABLE IF NOT EXISTS api_log(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, method TEXT, path TEXT, model TEXT, status INT,
  stream INT DEFAULT 0, req BLOB, resp BLOB);
@@ -1114,6 +1122,22 @@ impl BoxState {
             "INSERT INTO build_edges(ts,outs,ins,cmd) VALUES(?1,?2,?3,?4)",
             params![ts, outs_json, ins_json, cmd]);
         conn.last_insert_rowid()
+    }
+
+    /// Record a batch of makefile variable assignments (make_vars frame).
+    /// INSERT OR IGNORE: the unique key collapses identical repeats across
+    /// sub-makes, keeping the table proportional to distinct assignments.
+    pub fn add_makevars(&self, rows: &[(String, String, String, String)]) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let conn = self.conn.lock().unwrap();
+        for (name, loc, value, make_dir) in rows {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO makevar(ts,name,loc,value,make_dir) \
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![ts, name, loc, value, make_dir]);
+        }
     }
 
     /// Mark a build edge as STARTED running. The edge is identified by either

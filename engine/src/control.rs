@@ -362,6 +362,32 @@ fn build_edges(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
 /// stamp `started_ts` / `ended_ts`+`exit_code` on the matching `build_edges`
 /// row, so the targets pane can show only the targets currently building and
 /// each target's wall time. One-shot control reply.
+/// `make_vars` frame: a batch of makefile variable assignments from a box's
+/// embedded make(s), recorded into the box's makevar table.
+fn make_vars(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
+    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
+    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let Some(id) = derive_parent_box(state, host_pid) else {
+        return json!({"ok": false, "error": "no enclosing box"});
+    };
+    let rows: Vec<(String, String, String, String)> = msg.get("rows")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|r| Some((
+            r.get("name")?.as_str()?.to_string(),
+            r.get("loc")?.as_str().unwrap_or("").to_string(),
+            r.get("value")?.as_str().unwrap_or("").to_string(),
+            r.get("make")?.as_str().unwrap_or("").to_string(),
+        ))).collect())
+        .unwrap_or_default();
+    let ov = lock(state).overlay.clone();
+    if let Some(ov) = ov.as_ref() {
+        if let Some(b) = ov.live_box(id) {
+            b.add_makevars(&rows);
+        }
+    }
+    json!({"ok": true})
+}
+
 fn build_edge_state(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
     if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
@@ -1383,6 +1409,19 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 None => json!({}),
             }
         }
+        // Search the box's recorded makefile variable assignments. args:
+        // [sid, name_pattern, value_pattern, limit]. Patterns are cmd_match
+        // text globs (bare word = substring); empty = match all.
+        "review.makevars" => {
+            let id = arg_sid(args);
+            let name_pat = args.get(1).and_then(Value::as_str).unwrap_or("");
+            let value_pat = args.get(2).and_then(Value::as_str).unwrap_or("");
+            let limit = args.get(3).and_then(Value::as_i64).unwrap_or(500);
+            match id {
+                Some(id) => crate::review::makevars(id, name_pat, value_pat, limit),
+                None => json!([]),
+            }
+        }
         // Map provenance row ids between the process / pipeline / edge
         // domains — the cross-pane generated filter's id translation.
         // args: [sid, from_kind, [ids...], to_kind] → [ids...].
@@ -2164,6 +2203,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // shadowed `ninja` (vendored n2) carrying its OWN pidfd, resolved to
             // the enclosing box by /proc ancestry exactly like brush_prov_nested.
             build_edges(&state, &msg, peer_pidfd.take())
+        } else if msg.get("type").and_then(Value::as_str) == Some("make_vars") {
+            make_vars(&state, &msg, peer_pidfd.take())
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edge_state") {
             // A single edge's run-state transition (started / finished), sent by
             // the in-process make/ninja executor around each recipe — stamps the

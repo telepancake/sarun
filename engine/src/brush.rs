@@ -1363,6 +1363,7 @@ async fn build_box_shell_full(
     interactive: bool,
     bundle_coreutils: bool,
 ) -> Result<brush_core::Shell, brush_core::error::Error> {
+    install_shell_var_recorder();
     // bon's builder is typestate-typed; we can't conditionally chain setters.
     // Passing the inner value (unwrapped from Option with a sensible default)
     // reproduces brush-core's own unset default for each field.
@@ -2591,6 +2592,62 @@ pub fn set_box_recipe_edge(edge: Option<String>) -> Option<String> {
     BOX_RECIPE_EDGE.with(|c| std::mem::replace(&mut *c.borrow_mut(), edge))
 }
 
+/// Install (once) the brush-core assignment observer: every shell variable
+/// assignment a box shell applies is queued as a variable-provenance row,
+/// tagged `sh` plus the recipe's build edge (when inside one) or the current
+/// pipeline uid — the same makevar table the make hook feeds, so
+/// make↔shell↔sub-make value flows are one searchable history.
+thread_local! {
+    /// True while this thread runs engine plumbing (the make export prefix)
+    /// whose assignments must NOT be recorded as variable provenance.
+    static SUPPRESS_VAR_RECORD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn install_shell_var_recorder() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        brush_core::interp::install_assign_observer(std::sync::Arc::new(
+            |name, value, exported| {
+                if SUPPRESS_VAR_RECORD.with(|c| c.get()) {
+                    return;
+                }
+                let uid = current_pipeline_uid();
+                let edge = current_recipe_edge();
+                // Only record assignments inside a recorded execution context
+                // (a pipeline or a recipe) — shell-internal churn outside one
+                // is engine plumbing, not build provenance.
+                if uid == 0 && edge.is_none() {
+                    return;
+                }
+                let loc = match &edge {
+                    Some(e) => format!("recipe of {e}"),
+                    None => format!("pipeline #{uid}"),
+                };
+                // ShellValueLiteral's Display shell-quotes scalars with
+                // spaces; strip a matching outer quote pair for readability.
+                let mut v = value.to_string();
+                if v.len() >= 2
+                    && ((v.starts_with('\'') && v.ends_with('\''))
+                        || (v.starts_with('"') && v.ends_with('"')))
+                {
+                    v = v[1..v.len() - 1].to_string();
+                }
+                if v.len() > 4096 {
+                    v.truncate(4096);
+                    v.push('…');
+                }
+                crate::katirun::push_makevar(serde_json::json!({
+                    "name": name,
+                    "loc": loc,
+                    "value": v,
+                    "make": if exported { "sh export" } else { "sh" },
+                }));
+            },
+        ));
+    });
+}
+
 fn current_recipe_edge() -> Option<String> {
     BOX_RECIPE_EDGE.with(|c| c.borrow().clone())
 }
@@ -2709,7 +2766,10 @@ pub fn run_recipe_in_process_prefixed(
                 let src = brush_core::SourceInfo {
                     source: "<make exports>".into(), start: None };
                 let params = shell.default_exec_params();
-                if shell.run_string(prefix_owned.clone(), &src, &params).await.is_err() {
+                SUPPRESS_VAR_RECORD.with(|c| c.set(true));
+                let r = shell.run_string(prefix_owned.clone(), &src, &params).await;
+                SUPPRESS_VAR_RECORD.with(|c| c.set(false));
+                if r.is_err() {
                     eprintln!("sarun-engine make: export prefix failed to apply");
                 }
             }

@@ -815,6 +815,59 @@ def main():
         check(oo23 == b"made-in-sub\n",
               f"case23: order-only prereq built in the sub-make's OWN dir "
               f"(not skipped for the parent's decoy); out.txt={oo23!r}")
+
+        # ── CASE 24: variable provenance lands in the box makevar table ───────
+        # Every assignment a build makes — make (:=, +=, with file:line loc),
+        # shell scalar inside a recipe, `export NAME=…` via the export builtin,
+        # and a sub-make's own override — must be recorded in the box DB's
+        # makevar table so the Vars pane / review.makevars can trace the chain.
+        # The export-prefix noise (box exports replayed per subshell) must NOT
+        # appear.
+        vt = work / "vars"
+        shutil.rmtree(vt, ignore_errors=True)
+        vt.mkdir(parents=True, exist_ok=True)
+        (vt / "Makefile").write_text(
+            "ORIG_VAR := aa\n"
+            "ORIG_VAR += bb\n"
+            "all:\n"
+            "\t@SHELLVAR=\"from-shell $(ORIG_VAR)\"; "
+            "export EXPVAR=\"exported $$SHELLVAR\"; "
+            "$(MAKE) -f sub.mk\n")
+        (vt / "sub.mk").write_text(
+            "ORIG_VAR := sub-val\n"
+            "all:\n\t@true\n")
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE24", "-C", str(vt), "--", "make"],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 0,
+              f"case24: vars box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
+        sp24 = latest_sqlar(m)
+        con = sqlite3.connect(f"file:{sp24}?mode=ro", uri=True)
+        try:
+            mv = list(con.execute(
+                "SELECT name, loc, value, make_dir FROM makevar ORDER BY id"))
+        finally:
+            con.close()
+        def mv_has(name, loc_sub, value, make_sub):
+            return any(n == name and loc_sub in (l or "") and v == value
+                       and make_sub in (d or "") for n, l, v, d in mv)
+        check(mv_has("ORIG_VAR", "Makefile:1", "aa", "vars"),
+              f"case24: make := assignment recorded with file:line loc ({mv})")
+        check(mv_has("ORIG_VAR", "Makefile:2", "aa bb", "vars"),
+              f"case24: make += records the appended value")
+        check(mv_has("SHELLVAR", "recipe of all", "from-shell aa bb", "sh"),
+              f"case24: shell scalar inside the recipe recorded, expanded")
+        check(mv_has("EXPVAR", "recipe of all", "exported from-shell aa bb",
+                     "sh export"),
+              f"case24: `export NAME=…` (builtin path) recorded as sh export")
+        check(mv_has("ORIG_VAR", "sub.mk:1", "sub-val", "vars"),
+              f"case24: sub-make's own assignment recorded with sub.mk loc")
+        noise = [row for row in mv if row[0] not in
+                 ("ORIG_VAR", "SHELLVAR", "EXPVAR", "MAKEFLAGS", "MAKELEVEL",
+                  "MFLAGS", "MAKE")]
+        check(not any("PATH" == n for n, *_ in mv),
+              f"case24: export-prefix replay is suppressed (no PATH rows; "
+              f"extra rows: {noise[:8]})")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

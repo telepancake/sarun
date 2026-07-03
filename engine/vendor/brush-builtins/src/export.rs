@@ -117,6 +117,12 @@ impl ExportCommand {
                     }
                 };
 
+                // sarun: report to the engine's variable-provenance observer
+                // (apply_assignment doesn't see builtin-arg assignments).
+                if !self.unexport {
+                    brush_core::interp::observe_assignment(
+                        name, &value.to_string(), true);
+                }
                 // Update the variable with the provided value and then mark it exported.
                 context.shell.env_mut().update_or_add(
                     name,

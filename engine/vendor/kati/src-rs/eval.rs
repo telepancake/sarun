@@ -750,6 +750,18 @@ impl Evaluator {
             var.write().readonly = true
         }
         self.trace_variable_assign(&lhs, &var)?;
+        // sarun: feed the engine's assignment recorder — makefile-level
+        // assignments only (bootstrap/command-line noise is engine plumbing).
+        if !self.is_bootstrap && !self.is_commandline {
+            let g = var.read();
+            // the ASSIGNMENT site (stmt.loc), not the variable's original
+            // definition loc — `+=` must point at the append, not the `:=`.
+            let loc = stmt.loc().to_string();
+            let val = g.string().unwrap_or(std::borrow::Cow::Borrowed(b""));
+            crate::fileutil::report_var_assign(
+                &lhs.as_bytes(), &loc, &val,
+                self.working_dir.as_os_str().as_bytes());
+        }
         Ok(())
     }
 

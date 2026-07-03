@@ -678,7 +678,49 @@ fn extract_long_flags(argv: &[String]) -> Vec<OsString> {
 /// exec.rs falls back to fork+exec — makefiles using SHELL=echo etc. still work
 /// as gnu make / standalone rkati do. Process-global + idempotent (last wins);
 /// safe to call from both the shadow entry and the builtin.
+/// Batched makefile-variable-assignment records, shipped as `make_vars`
+/// frames. Values are capped (a 100KB variable is not debugged whole) and
+/// flushed every 256 records plus at each make's end.
+pub(crate) static MAKEVAR_BUF: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+
+/// Queue one variable-provenance row (shared by the make hook here and the
+/// brush shell-assignment observer); flushes every 256 rows.
+pub(crate) fn push_makevar(row: serde_json::Value) {
+    let mut buf = MAKEVAR_BUF.lock();
+    buf.push(row);
+    if buf.len() >= 256 {
+        drop(buf);
+        flush_makevars();
+    }
+}
+
+pub(crate) fn flush_makevars() {
+    let rows: Vec<serde_json::Value> = std::mem::take(&mut *MAKEVAR_BUF.lock());
+    if rows.is_empty() {
+        return;
+    }
+    let msg = serde_json::json!({"type": "make_vars", "rows": rows});
+    crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
+}
+
+fn install_var_recorder() {
+    kati::fileutil::install_var_assign_hook(Arc::new(|name, loc, value, make_dir| {
+        let mut v = String::from_utf8_lossy(value).into_owned();
+        if v.len() > 4096 {
+            v.truncate(4096);
+            v.push('…');
+        }
+        push_makevar(serde_json::json!({
+            "name": String::from_utf8_lossy(name),
+            "loc": loc,
+            "value": v,
+            "make": String::from_utf8_lossy(make_dir),
+        }));
+    }));
+}
+
 fn install_make_recipe_runner() {
+    install_var_recorder();
     kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, prefix, cmd, cwd, redirect_stderr, output_cb| {
         use kati::fileutil::RecipeRunnerDecision;
         let shell_base = std::path::Path::new(std::ffi::OsStr::from_bytes(shell))
@@ -908,6 +950,7 @@ pub fn make_main(argv: &[String]) -> i32 {
             return 1;
         }
     };
+    flush_makevars();
     let code = 0;
 
     if run_result.remake_active && code == 0 {
@@ -1103,6 +1146,7 @@ pub fn make_builtin(
     kati::exec::set_recipe_out(prev_out);
     kati::exec::set_recipe_err(prev_err);
     crate::brush::set_box_recipe_cwd(prev_cwd);
+    flush_makevars();
 
     match result {
         Ok(r) => {
