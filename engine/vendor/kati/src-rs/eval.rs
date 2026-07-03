@@ -307,7 +307,11 @@ pub struct Evaluator {
     /// parse time, paired with the source location of the directive.
     /// The remake-the-makefile loop in main.rs checks for rules
     /// producing these names and builds + re-parses if any apply.
-    pub pending_remake_includes: Vec<(Loc, OsString)>,
+    /// (loc, filename, required) — missing `include` files queued for the
+    /// remake-the-makefile loop. `-include` files queue with required=false:
+    /// GNU remakes them too when a rule exists, but a missing one without a
+    /// rule is silently tolerated.
+    pub pending_remake_includes: Vec<(Loc, OsString, bool)>,
     /// sarun: in the in-process box, exported make variables can't be staged
     /// into the process environment (`std::env::set_var`) — many makes share one
     /// engine process, so that global write is a data race (UB) AND leaks one
@@ -691,9 +695,11 @@ impl Evaluator {
                 let box_prefix = self.box_export_prefix.clone();
                 let cwd = std::os::unix::ffi::OsStrExt::as_bytes(
                     self.working_dir.as_os_str()).to_vec();
-                let (_exit, output, _fc) =
+                let (exit, output, _fc) =
                     crate::func::shell_func_impl(&shell, shellflag, &cmd_buf, &loc,
                                                  &box_prefix, &cwd)?;
+                // GNU sets .SHELLSTATUS after `!=` too, not just $(shell).
+                crate::var::set_shell_status_var(exit);
                 result = Variable::with_simple_string(
                     output,
                     origin,
@@ -1226,15 +1232,18 @@ impl Evaluator {
                 }
             }
 
-            if stmt.should_exist {
+            {
                 let missing = match files.as_ref() {
                     Err(_) => true,
                     Ok(v) => v.is_empty(),
                 };
                 if missing {
                     let loc = self.loc.clone().unwrap_or_default();
-                    self.pending_remake_includes
-                        .push((loc, OsString::from_vec(pat.to_vec())));
+                    self.pending_remake_includes.push((
+                        loc,
+                        OsString::from_vec(pat.to_vec()),
+                        stmt.should_exist,
+                    ));
                     continue;
                 }
             }

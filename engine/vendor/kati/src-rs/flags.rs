@@ -69,6 +69,9 @@ pub struct Flags {
     pub generate_empty_ninja: bool,
     pub is_dry_run: bool,
     pub is_silent_mode: bool,
+    /// -k / --keep-going: on a recipe failure, keep building targets that
+    /// don't depend on the failed one; exit non-zero at the end.
+    pub is_keep_going: bool,
     pub is_syntax_check_only: bool,
     pub regen: bool,
     pub regen_debug: bool,
@@ -228,6 +231,19 @@ impl Flags {
         (flags, vars)
     }
 
+    /// True if a MAKEFLAGS value carries -k / --keep-going (long, short,
+    /// or a bare GNU letter-word like "ks").
+    pub fn makeflags_keep_going(makeflags: &[u8]) -> bool {
+        let (words, _) = Flags::split_makeflags(makeflags);
+        words.iter().any(|w| {
+            w[..] == *b"-k"
+                || w[..] == *b"--keep-going"
+                || (!w.starts_with(b"-") && !w.contains(&b'=')
+                    && w.iter().all(|&b| b.is_ascii_alphabetic())
+                    && w.contains(&b'k'))
+        })
+    }
+
     pub fn apply_makeflags(&mut self, makeflags: &[u8]) {
         // GNU carries command-line variable overrides after a `--`
         // separator, space-escaped. Fold them into cl_vars and keep only
@@ -250,6 +266,8 @@ impl Flags {
                 self.no_builtin_variables = true;
             } else if tok == b"-s" || tok == b"--silent" || tok == b"--quiet" {
                 self.is_silent_mode = true;
+            } else if tok == b"-k" || tok == b"--keep-going" {
+                self.is_keep_going = true;
             } else if !tok.starts_with(b"-") && tok.contains(&b'=') {
                 let var = Bytes::from(tok.to_vec());
                 if !self.cl_vars.contains(&var) {
@@ -264,6 +282,7 @@ impl Flags {
                         b'r' => self.no_builtin_rules = true,
                         b'R' => self.no_builtin_variables = true,
                         b's' => self.is_silent_mode = true,
+                        b'k' => self.is_keep_going = true,
                         _ => {}
                     }
                 }
@@ -294,7 +313,8 @@ impl Flags {
                 b"-s" => flags.is_silent_mode = true,
                 b"-r" => flags.no_builtin_rules = true,
                 b"-R" => flags.no_builtin_variables = true,
-                b"-w" | b"-k" | b"-n" => {} // accepted, semantically no-op in kati
+                b"-w" | b"-n" => {} // accepted, semantically no-op in kati
+                b"-k" | b"--keep-going" => flags.is_keep_going = true,
                 // sarun: GNU make's long forms of -w/its inverse. The kernel's
                 // top Makefile passes --no-print-directory to every sub-make
                 // (see the __sub-make dance around MAKEFLAGS); without an

@@ -649,9 +649,26 @@ impl<'a> Executor<'a> {
         let mut done_count = 0usize;
         let total = graph.len();
 
+        // -k can also arrive as a makefile-level `MAKEFLAGS += -k`, which
+        // lands in the MAKEFLAGS variable after FLAGS was parsed.
+        let keep_going = FLAGS.is_keep_going
+            || self
+                .ce
+                .ev
+                .lookup_var(crate::symtab::intern("MAKEFLAGS"))
+                .ok()
+                .flatten()
+                .and_then(|v| {
+                    use crate::expr::Evaluable;
+                    v.read().eval_to_buf(self.ce.ev).ok()
+                })
+                .is_some_and(|mf| crate::flags::Flags::makeflags_keep_going(&mf));
+        // Nodes skipped because a (transitive) dependency failed under -k;
+        // goal targets in here get the "not remade" notice at the end.
+        let mut failed_set: HashSet<Symbol> = HashSet::new();
         loop {
             // 1. Evaluate ready nodes on the make thread (serial) → done or queued.
-            while failed.is_none() {
+            while failed.is_none() || keep_going {
                 let Some(Ready { sym, .. }) = ready.pop() else { break };
                 let (ts, runreq) = self.prepare_node(&graph, sym)?;
                 match runreq {
@@ -706,6 +723,16 @@ impl<'a> Executor<'a> {
                     continue;
                 }
                 if let Some(code) = failed {
+                    if keep_going {
+                        for (name, node) in &roots {
+                            let _ = node;
+                            if failed_set.contains(name) {
+                                emit_recipe_err(&format!(
+                                    "Target \"{}\" not remade because of errors.",
+                                    String::from_utf8_lossy(&name.as_bytes())));
+                            }
+                        }
+                    }
                     return Err(BuildFailed(code).into());
                 }
                 if done_count < total {
@@ -748,9 +775,26 @@ impl<'a> Executor<'a> {
                     }
                 }
                 failed = Some(2);
-                // Stop launching new work; drain in-flight runs, then bail.
-                ready.clear();
-                run_queue.clear();
+                if keep_going {
+                    // -k: mark the failed node and everything depending on
+                    // it as not-remade; keep building the rest.
+                    let mut stack = vec![run.output];
+                    while let Some(s) = stack.pop() {
+                        if !failed_set.insert(s) {
+                            continue;
+                        }
+                        let p = graph.get_mut(&s).unwrap();
+                        if p.state != PState::Done {
+                            p.state = PState::Done;
+                            done_count += 1;
+                        }
+                        stack.extend(graph[&s].dependents.iter().copied());
+                    }
+                } else {
+                    // Stop launching new work; drain in-flight runs, bail.
+                    ready.clear();
+                    run_queue.clear();
+                }
             } else {
                 self.finish_node(&mut graph, run.output, run.result_ts, &mut ready, &mut done_count);
             }

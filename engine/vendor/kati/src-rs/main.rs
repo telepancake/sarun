@@ -243,7 +243,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
     let mut remake_targets: Vec<Symbol> = Vec::new();
     {
         let pending = std::mem::take(&mut ev.pending_remake_includes);
-        for (loc, name) in &pending {
+        for (loc, name, required) in &pending {
             let sym = intern(name.as_bytes().to_vec());
             // Literal or PATTERN-rule producible (e.g. the kernel's
             // `%/auto.conf %/auto.conf.cmd: $(KCONFIG_CONFIG)`).
@@ -256,7 +256,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
             });
             if producible {
                 remake_targets.push(sym);
-            } else {
+            } else if *required {
                 // Missing required include with no matching rule. Emit a
                 // single line matching upstream kati's `error_loc!` shape;
                 // the corpus normalizer rolls real make's follow-up
@@ -265,6 +265,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
                 eprintln!("{loc}: {pat_str}: No such file or directory");
                 std::process::exit(2);
             }
+            // A missing OPTIONAL include with no rule: GNU tolerates it.
         }
     }
     let remake_active = !remake_targets.is_empty();

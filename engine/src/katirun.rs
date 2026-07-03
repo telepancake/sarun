@@ -424,7 +424,7 @@ fn run_kati(
     let mut remake_targets: Vec<Symbol> = Vec::new();
     {
         let pending = std::mem::take(&mut ev.pending_remake_includes);
-        for (loc, name) in &pending {
+        for (loc, name, required) in &pending {
             let sym = intern(name.as_bytes().to_vec());
             // A rule can produce the missing include either literally or via a
             // PATTERN target — the kernel regenerates include/config/auto.conf
@@ -440,11 +440,12 @@ fn run_kati(
             });
             if producible {
                 remake_targets.push(sym);
-            } else {
+            } else if *required {
                 let pat_str = String::from_utf8_lossy(name.as_bytes());
                 eprintln!("{loc}: {pat_str}: No such file or directory");
                 std::process::exit(2);
             }
+            // A missing OPTIONAL include with no rule: GNU tolerates it.
         }
     }
     let remake_active = !remake_targets.is_empty();

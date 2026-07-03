@@ -970,6 +970,11 @@ impl<'a> DepBuilder<'a> {
                         // as existing for implicit-rule selection, as in GNU
                         // make's directory search.
                         || self.vpath_resolve(sym).is_some()
+                        // Under .SECONDEXPANSION a `$$(...)` prerequisite is
+                        // still unexpanded text here; GNU expands BEFORE the
+                        // implicit-rule search, so defer the viability call
+                        // instead of rejecting the rule on a literal '$'.
+                        || (self.secondexpansion && input.as_bytes().contains(&b'$'))
                         || (allow_chain
                             && self.has_producing_rule_except(sym, &rule.output_patterns));
                     if !buildable {
@@ -1432,6 +1437,35 @@ impl<'a> DepBuilder<'a> {
                     self.ev.global_vars.clone(),
                     intern("@F"),
                     mk_var(Bytes::copy_from_slice(base)),
+                )?;
+                // $* (the stem) is also bound during second expansion — a
+                // pattern rule's `$$(deps_$$*)` is the canonical use.
+                let stem: Bytes = n
+                    .lock()
+                    .output_pattern
+                    .map(|p| {
+                        Bytes::copy_from_slice(
+                            Pattern::new(p.as_bytes()).stem(&out_bytes),
+                        )
+                    })
+                    .unwrap_or_default();
+                let stem_dir = crate::strutil::dirname(&stem);
+                let stem_base = Bytes::copy_from_slice(
+                    crate::strutil::basename(&stem));
+                let _scoped_star = crate::symtab::ScopedGlobalVar::new(
+                    self.ev.global_vars.clone(),
+                    intern("*"),
+                    mk_var(stem.clone()),
+                )?;
+                let _scoped_star_d = crate::symtab::ScopedGlobalVar::new(
+                    self.ev.global_vars.clone(),
+                    intern("*D"),
+                    mk_var(Bytes::copy_from_slice(&stem_dir)),
+                )?;
+                let _scoped_star_f = crate::symtab::ScopedGlobalVar::new(
+                    self.ev.global_vars.clone(),
+                    intern("*F"),
+                    mk_var(stem_base),
                 )?;
                 // First pass dropped the source text on the floor and only
                 // kept space-split tokens. `$(call f,arg)` ends up split
