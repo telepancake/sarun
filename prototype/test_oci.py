@@ -65,11 +65,12 @@ def wait_socket(sock, timeout=40):
 def _sha(b):  return hashlib.sha256(b).hexdigest()
 
 
-def _build_layout(layout, exe, extra=None):
+def _build_layout(layout, exe, extra=None, files=None):
     """Build a synthetic single-layer oci-layout in dir `layout`. rootfs = bin/ +
     bin/sarun (the engine binary), plus an optional `/marker` file (`extra`,
-    bytes) so callers can vary the image content → a distinct manifest digest.
-    Returns the image's manifest digest ('sha256:…')."""
+    bytes) and arbitrary extra `files` ({path: bytes}) so callers can vary
+    the image content → a distinct manifest digest. Returns the image's
+    manifest digest ('sha256:…')."""
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w") as t:
         d = tarfile.TarInfo("bin"); d.type = tarfile.DIRTYPE; d.mode = 0o755
@@ -79,6 +80,13 @@ def _build_layout(layout, exe, extra=None):
         if extra is not None:
             m = tarfile.TarInfo("marker"); m.size = len(extra); m.mode = 0o644
             t.addfile(m, io.BytesIO(extra))
+        for path, content in (files or {}).items():
+            for i in range(1, len(Path(path).parts)):
+                dd = tarfile.TarInfo("/".join(Path(path).parts[:i]))
+                dd.type = tarfile.DIRTYPE; dd.mode = 0o755
+                t.addfile(dd)
+            fi = tarfile.TarInfo(path); fi.size = len(content); fi.mode = 0o644
+            t.addfile(fi, io.BytesIO(content))
     layer_raw = raw.getvalue()
     diff_id = "sha256:" + _sha(layer_raw)
     gz = gzip.compress(layer_raw)
@@ -123,10 +131,10 @@ def _tar_layout(layout, dest_tar):
         t.add(layout / "blobs", arcname="blobs")     # recursive
 
 
-def build_archive(dest_tar, exe_path):
+def build_archive(dest_tar, exe_path, files=None):
     """Write a synthetic single-layer oci-archive (a tar of an oci-layout)."""
     layout = Path(tempfile.mkdtemp(prefix="oci-layout-"))
-    _build_layout(layout, Path(exe_path).read_bytes())
+    _build_layout(layout, Path(exe_path).read_bytes(), files=files)
     _tar_layout(layout, dest_tar)
     shutil.rmtree(layout, ignore_errors=True)
     return dest_tar
@@ -364,6 +372,26 @@ def main():
         check(r.returncode == 0, f"oci run SYN exits 0 (stderr: {r.stderr.strip()[:300]})")
         check("oci load" in both and "usage" in both.lower(),
               "oci run SYN executed the image CMD (/bin/sarun oci --help)")
+
+        # ── tap shadows beat image-baked files ───────────────────────────────
+        # An image that bakes its own /etc/resolv.conf must NOT bypass the
+        # tap box's per-box DNS: the overlay shadows resolv.conf (and the CA
+        # bundle paths) from ANY non-own layer, image layers included —
+        # carbonyl ships `nameserver 1.1.1.1`, which made Chromium dial a
+        # resolver the box netns can't reach.
+        arch2 = build_archive(str(tmp / "img-resolv.tar"), ENGINE,
+                              files={"etc/resolv.conf": b"nameserver 9.9.9.9\n"})
+        r = sarun(e, "oci", "load", f"oci-archive:{arch2}", "RSLV")
+        check(r.returncode == 0,
+              f"oci load RSLV exits 0 (stderr: {r.stderr.strip()[:200]})")
+        r = sarun(e, "oci", "run", "--net", "tap", "RSLV", "--",
+                  "/bin/sarun", "brush-sh", "--", "sh", "-c",
+                  "cat /etc/resolv.conf")
+        check(r.returncode == 0,
+              f"oci run RSLV (tap) exits 0 (stderr: {r.stderr.strip()[:300]})")
+        check("9.9.9.9" not in r.stdout and "nameserver" in r.stdout,
+              "image-baked resolv.conf is shadowed by the per-box DNS "
+              f"(got {r.stdout.strip()[:120]!r})")
 
         # ── build ────────────────────────────────────────────────────────────
         ctx = tmp / "ctx"; ctx.mkdir()

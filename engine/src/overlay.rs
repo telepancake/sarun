@@ -1137,7 +1137,10 @@ impl Overlay {
         // noise in the parent box's overlay. Same shape as the
         // oaita.toml shadow above; the box reads canonical paths and
         // gets engine-controlled content, no on-disk write or bind.
-        if matches!(layer, Layer::Lower) && b.is_tap()
+        // Gated on the box's OWN upper having no entry (not on Layer::Lower):
+        // an OCI image layer baking its own bundle/resolv.conf must not
+        // bypass the shadow — only this box's own write (or delete) wins.
+        if b.entry(rel).is_none() && b.is_tap()
             && Self::matches_api_box_ca_target(rel) {
             let safe = crate::paths::api_box_ca_pem_path();
             if let Ok(md) = std::fs::metadata(&safe) {
@@ -1149,7 +1152,7 @@ impl Overlay {
         // --api resolv.conf: synthetic `nameserver <engine-gateway>\n`
         // so the box's stub resolver dials the engine's per-box DNS.
         // Same shadow pattern, same reasons.
-        if matches!(layer, Layer::Lower) && b.is_tap() && rel == "etc/resolv.conf" {
+        if b.entry(rel).is_none() && b.is_tap() && rel == "etc/resolv.conf" {
             let safe = crate::paths::api_box_resolv_conf_path();
             if let Ok(md) = std::fs::metadata(&safe) {
                 let mut a = self.attr_from_md(ino, &md);
@@ -1461,6 +1464,29 @@ impl Filesystem for Overlay {
         // the host) finds it. `upper` (this box owns the blob) is true ONLY when
         // the resolved owner IS this box; a parent's file or the host file is
         // served read-only until the first write triggers copy-up-from-parent.
+        // Tap shadows (MITM CA bundle, per-box resolv.conf) apply no matter
+        // where the merge would resolve from — host OR an OCI image layer
+        // (a baked-in `nameserver 1.1.1.1` must not bypass the box DNS) —
+        // and even when the path is Absent (an image shipping no
+        // resolv.conf still gets one). Only the box's own entry overrides.
+        let tap_shadow = if b.is_tap() && b.entry(&rel).is_none() {
+            if Self::matches_api_box_ca_target(&rel) {
+                Some(crate::paths::api_box_ca_pem_path())
+            } else if rel == "etc/resolv.conf" {
+                Some(crate::paths::api_box_resolv_conf_path())
+            } else { None }
+        } else { None };
+        if let Some(safe) = tap_shadow {
+            match File::open(safe) {
+                Ok(f) => {
+                    let n = self.reg_fh(FhInner {
+                        box_id: bid, rel, file: Some(f), upper: false, dirty: false,
+                        last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: false, _backing: None });
+                    return reply.opened(FileHandle(n), FopenFlags::empty());
+                }
+                Err(_) => return reply.error(Errno::EACCES),
+            }
+        }
         let (file, upper) = match self.resolve(bid, &rel) {
             Layer::UpperFile { owner, rowid, .. } => {
                 let bp = blob_path(owner, rowid);
@@ -1482,10 +1508,6 @@ impl Filesystem for Overlay {
                 // the rel is the host oaita.toml path.
                 let host = if b.is_api() && Self::matches_host_oaita_config(&rel) {
                     crate::paths::api_box_oaita_toml_path()
-                } else if b.is_tap() && Self::matches_api_box_ca_target(&rel) {
-                    crate::paths::api_box_ca_pem_path()
-                } else if b.is_tap() && rel == "etc/resolv.conf" {
-                    crate::paths::api_box_resolv_conf_path()
                 } else if b.is_brush() && self.shadow_matches(&rel) {
                     self.shadow_target_path().unwrap_or_else(|| self.host(&rel))
                 } else { self.host(&rel) };
