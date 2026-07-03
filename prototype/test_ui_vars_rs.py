@@ -101,8 +101,10 @@ def main():
         txt = screen()
         check("DERIVED" in txt and "uivars_work/Makefile:3" in txt,
               "detail shows the FULL site (dir-joined Makefile:3)")
-        check("flags: :=" in txt and "NAME" in txt and "FLAGS" in txt,
-              "list has a FLAGS column with its legend at the top")
+        check("Flags: s - simple" in txt and "x - exported" in txt,
+              "the flag legend at the top is complete (wraps, not truncated)")
+        check(any(re.search(r"[│║┌]\s*s\s+DERIVED", l) for l in vt.display),
+              "flags are a narrow left column (Mikrotik style): 's DERIVED …'")
         check("pre-$(ORIG_VAR)-$(OTHER)" in txt,
               "detail shows the assignment as written (unexpanded rhs)")
         check("→ ORIG_VAR" in txt and "→ OTHER" in txt,

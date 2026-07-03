@@ -4238,17 +4238,15 @@ fn cd_info_lines(app: &App) -> Vec<Line<'static>> {
     }).collect()
 }
 
-fn changes_lines(app: &App) -> Vec<Line<'static>> {
-    let mut out = vec![
-        Line::from(Span::styled(
-            "flags: + created  ~ modified  - deleted  @ xattr  ! stale-vs-host",
-            Style::default().add_modifier(Modifier::DIM),
-        )),
-        Line::from(Span::styled(
-            format!("{:<1} {:>10}  {}", "", "SIZE", "PATH"),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    ];
+fn changes_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let mut out = legend_lines(
+        "Flags: + - created, ~ - modified, - - deleted, @ - xattr, \
+! - stale vs host",
+        width);
+    out.push(Line::from(Span::styled(
+        format!("{:<1} {:>10}  {}", "", "SIZE", "PATH"),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
     let vis = app.visible_changes();
     if vis.is_empty() {
         let empty_msg = if app.changes_total == 0 {
@@ -4644,29 +4642,25 @@ fn tail_trunc(s: &str, max: usize) -> String {
     format!("…{}", s.chars().skip(skip).collect::<String>())
 }
 
-fn vars_index_lines(app: &App) -> Vec<Line<'static>> {
+fn vars_index_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let (qn, qv) = &app.vars_query;
     let q = if app.vars_any {
         format!("query: name-or-value~[{qn}]   ('/' to change)")
     } else {
         format!("query: name~[{qn}] value~[{qv}]   ('/' to change)")
     };
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut out = vec![
-        Line::from(Span::styled(
-            q, Style::default().add_modifier(Modifier::BOLD),
-        )),
-        // The FLAGS legend — every flag the column can show, spelled out.
-        Line::from(Span::styled(
-            "flags: := simple  = recursive  += append  ?= if-unset  != shell-assign  \
-env/cmd/ovr/auto origin  sh script (x exported)",
-            dim,
-        )),
-        Line::from(Span::styled(
-            format!("{:<26} {:<9} {}", "NAME", "FLAGS", "VALUE"),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    ];
+    let mut out = vec![Line::from(Span::styled(
+        q, Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    out.extend(legend_lines(
+        "Flags: s - simple :=, r - recursive =, a - append +=, q - if-unset ?=, \
+! - shell-assign !=, e - environment, E - env override, c - command line, \
+o - override, u - automatic, S - script assignment, x - exported",
+        width));
+    out.push(Line::from(Span::styled(
+        format!("{:<4} {:<26} {}", "", "NAME", "VALUE"),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
     if app.vars_rows.is_empty() {
         out.push(Line::from(if qn.is_empty() && qv.is_empty() {
             "press '/' and type a query — a word matches variable names AND values"
@@ -4678,12 +4672,12 @@ env/cmd/ovr/auto origin  sh script (x exported)",
     for (i, r) in app.vars_rows.iter().enumerate() {
         let name = r.get("name").and_then(Value::as_str).unwrap_or("");
         let val = r.get("value").and_then(Value::as_str).unwrap_or("");
-        let flags = r.get("flags").and_then(Value::as_str).unwrap_or("");
-        let shellish = flags.starts_with("sh");
+        let flags = makevar_flag_letters(r);
+        let shellish = flags.starts_with('S');
         let one: String = val.chars()
-            .map(|c| if c == '\n' { ' ' } else { c }).take(80).collect();
+            .map(|c| if c == '\n' { ' ' } else { c }).take(96).collect();
         let name_s: String = name.chars().take(26).collect();
-        let text = format!("{:<26} {:<9} {}", name_s, flags, one);
+        let text = format!("{:<4} {:<26} {}", flags, name_s, one);
         let line = if i == app.sel_var {
             Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
         } else if shellish {
@@ -4692,6 +4686,35 @@ env/cmd/ovr/auto origin  sh script (x exported)",
             Line::from(Span::raw(text))
         };
         out.push(line);
+    }
+    out
+}
+
+/// Mikrotik-style single-letter flags for a makevar row, derived from the
+/// recorded flags string (op + notable origin, or sh / sh x).
+fn makevar_flag_letters(r: &Value) -> String {
+    let f = r.get("flags").and_then(Value::as_str).unwrap_or("");
+    let mut toks = f.split_whitespace();
+    let mut out = String::new();
+    match toks.next().unwrap_or("") {
+        ":=" => out.push('s'),
+        "=" => out.push('r'),
+        "+=" => out.push('a'),
+        "?=" => out.push('q'),
+        "!=" => out.push('!'),
+        "sh" => out.push('S'),
+        _ => {}
+    }
+    for t in toks {
+        match t {
+            "env" => out.push('e'),
+            "env!" => out.push('E'),
+            "cmd" => out.push('c'),
+            "ovr" => out.push('o'),
+            "auto" => out.push('u'),
+            "x" | "export" => out.push('x'),
+            _ => {}
+        }
     }
     out
 }
@@ -5459,6 +5482,26 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
 /// header at index 0 and rows from index 1, it's `sel_row + 1`). `rect_h`
 /// is the full pane rect height (block borders included; we subtract 2).
 /// Anchors the cursor ~1/3 down so motion in either direction has room.
+/// Word-wrap a legend string to the pane's inner width as DIM lines —
+/// list Paragraphs don't wrap, so an unwrapped legend would truncate.
+fn legend_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let w = (width as usize).saturating_sub(2).max(20);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut out = vec![];
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > w {
+            out.push(Line::from(Span::styled(std::mem::take(&mut cur), dim)));
+        }
+        if !cur.is_empty() { cur.push(' '); }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        out.push(Line::from(Span::styled(cur, dim)));
+    }
+    out
+}
+
 fn scroll_for_cursor(cursor_line: usize, n_lines: usize, rect_h: u16) -> u16 {
     let visible = (rect_h as usize).saturating_sub(2);
     if visible == 0 || n_lines <= visible { return 0; }
@@ -6092,8 +6135,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 if !skip_right { f.render_widget(out, right); }
             }
             Pane::Pipelines => {
-                let lines = pipelines_lines(app);
-                let scroll = scroll_for_cursor(app.sel_pipeline + 1, lines.len(), left.height);
+                let lines = pipelines_lines(app, left.width);
+                let hdr = lines.len().saturating_sub(app.pipelines.len());
+                let scroll = scroll_for_cursor(app.sel_pipeline + hdr + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
                     .block(block(title("PIPELINES · brush", lf), lf))
                     .scroll((scroll, 0));
@@ -6107,8 +6151,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 if !skip_right { f.render_widget(detail, right); }
             }
             Pane::BuildEdges => {
-                let lines = build_edges_lines(app);
-                let scroll = scroll_for_cursor(app.sel_edge + 1, lines.len(), left.height);
+                let lines = build_edges_lines(app, left.width);
+                let hdr = lines.len().saturating_sub(app.build_edges.len());
+                let scroll = scroll_for_cursor(app.sel_edge + hdr + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
                     .block(block(title("BUILD EDGES · ninja/make", lf), lf))
                     .scroll((scroll, 0));
@@ -6185,9 +6230,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 if !skip_right { f.render_widget(detail, right); }
             }
             Pane::Vars => {
-                let lines = vars_index_lines(app);
-                // +3 header rows: query line, flags legend, column header.
-                let scroll = scroll_for_cursor(app.sel_var + 3, lines.len(), left.height);
+                let lines = vars_index_lines(app, left.width);
+                let hdr = lines.len().saturating_sub(app.vars_rows.len());
+                let scroll = scroll_for_cursor(app.sel_var + hdr, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
                     .block(block(title("VARS · provenance", lf), lf))
                     .scroll((scroll, 0));
@@ -6206,9 +6251,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             // the selected change's full path + kind/size/mode + stale
             // banner, and the diff body below it.
             _ => {
-                let lines = changes_lines(app);
-                // +2 header rows: the flags legend + the column header.
-                let scroll = scroll_for_cursor(app.sel_change + 2, lines.len(), left.height);
+                let lines = changes_lines(app, left.width);
+                let hdr = lines.len().saturating_sub(app.visible_changes().len());
+                let scroll = scroll_for_cursor(app.sel_change + hdr, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
                     .block(block(
                         title("changes", app.focus == Pane::Changes),
@@ -6649,14 +6694,17 @@ fn fmt_dur(secs: f64) -> String {
     format!("{m}m{s:02}s")
 }
 
-fn pipelines_lines(app: &App) -> Vec<Line<'static>> {
+fn pipelines_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     if app.pipelines.is_empty() {
         return vec![Line::from(Span::styled(
             "no pipelines yet — run something through brush (-b) to populate",
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
         ];
     }
-    let mut out = vec![];
+    let mut out = legend_lines(
+        "Flags: T - top-level, N - nested (spawned inside another pipeline); \
+red time - non-zero exit, yellow 'run' - still running",
+        width);
     for (i, row) in app.pipelines.iter().enumerate() {
         let id = row.get("id").and_then(Value::as_i64).unwrap_or(0);
         let nested = row.get("nested").and_then(Value::as_bool) == Some(true);
@@ -6858,14 +6906,17 @@ fn pipeline_detail_lines(app: &App) -> Vec<Line<'static>> {
 /// One line per build_edges row: a marker (P for phony, R for real recipe),
 /// the first output target, → and the cmd (truncated). The detail pane
 /// shows all outs/ins and the full cmd.
-fn build_edges_lines(app: &App) -> Vec<Line<'static>> {
+fn build_edges_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     if app.build_edges.is_empty() {
         return vec![Line::from(Span::styled(
             "no build edges yet — run `ninja` or `make` inside a -b box",
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
         ];
     }
-    let mut out = vec![];
+    let mut out = legend_lines(
+        "Flags: R - recipe ran, P - phony/no recipe, • - building now; \
+red time - failed recipe",
+        width);
     for (i, row) in app.build_edges.iter().enumerate() {
         let outs = row.get("outs").and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
