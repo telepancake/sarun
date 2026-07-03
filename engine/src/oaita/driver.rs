@@ -84,7 +84,7 @@ impl Settings {
 pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
     let segs = parse_stitch(spec)?;
     let target = segs.last().unwrap().clone();
-    fs::create_dir_all(session_dir(&target))
+    crate::oaita::turns::ensure_session_dir(&session_dir(&target))
         .map_err(|e| format!("create session dir: {e}"))?;
 
     // Ensure every turn has a slug; turn-ids stay unique across the stitched
@@ -913,7 +913,7 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
         let existing: HashSet<String> = HashSet::new();
         new_turn_id(&existing)
     };
-    let _ = fs::create_dir_all(session_dir(&inner));
+    let _ = crate::oaita::turns::ensure_session_dir(&session_dir(&inner));
     // Seed: a user turn from the outer session.
     let seed_content = if data.is_empty() { request.clone() }
                        else { format!("{request}\n\n{data}") };

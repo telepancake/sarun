@@ -190,13 +190,28 @@ pub fn assign_slugs(turns: Vec<Turn>, existing: &mut std::collections::HashSet<S
 }
 
 /// Append a NEW turn file with the given content; returns the path written.
+/// `create_dir_all` that tolerates a raw EEXIST. Inside a box's FUSE
+/// overlay, mkdir of a directory that already exists host-side can report
+/// EEXIST while the follow-up stat std uses to excuse it doesn't reconcile —
+/// so the session dir (which lives under the shared state home) trips it.
+/// Same tolerance `oaita local`'s dir setup already applies.
+pub fn ensure_session_dir(p: &Path) -> io::Result<()> {
+    match fs::create_dir_all(p) {
+        Ok(()) => Ok(()),
+        // EEXIST (17): the path is there — good enough for a directory we
+        // were about to create anyway.
+        Err(e) if e.raw_os_error() == Some(17) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn append_turn(name: &str, kind: &str, content: &str,
                    slug: Option<String>, sender: Option<String>,
                    flags: &str, number: Option<u32>) -> io::Result<PathBuf>
 {
     validate_session_name(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let folder = session_dir(name);
-    fs::create_dir_all(&folder)?;
+    ensure_session_dir(&folder)?;
     let turns = load_turns(name);
     let mut existing: std::collections::HashSet<String> = turns.iter()
         .filter_map(|t| t.slug.clone()).collect();
@@ -217,7 +232,7 @@ pub fn load_stitched(spec: &str) -> Result<Vec<Turn>, String> {
     let mut slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for seg in &segs {
         // Ensure folder exists for later writes; loading the empty list is fine.
-        let _ = fs::create_dir_all(session_dir(seg));
+        let _ = ensure_session_dir(&session_dir(seg));
         let ts = load_turns(seg);
         let ts = assign_slugs(ts, &mut slugs)
             .map_err(|e| format!("assign slugs in {seg}: {e}"))?;
