@@ -490,9 +490,10 @@ enum Action {
     /// Selected sessions row is a loaded image: prompt a PTY running
     /// `<exe> oci run <name>` (a container shell on that image).
     RunSelectedImage,
-    /// Launcher: carbonyl (Chromium in the terminal) in a NEW tap box —
-    /// the URL prompt is the PtyCmd modal pre-filled with the full
-    /// `oci run` command, URL left to finish.
+    /// Launcher: carbonyl (Chromium in the terminal) in the persistent
+    /// BROWSER box — the URL prompt is the PtyCmd modal pre-filled with the
+    /// full `oci run --name BROWSER` command, URL left to finish. Reruns
+    /// reuse the box (profile persists); refused when it's already live.
     BrowserCarbonyl,
     /// Api pane: run `oaita local` on a PTY — download a tiny tool-capable
     /// model + CPU runtime and serve a local OpenAI-compatible endpoint.
@@ -1007,6 +1008,16 @@ impl App {
             .and_then(|s| s.get("status"))
             .and_then(Value::as_str)
             == Some("running")
+    }
+
+    /// The current `How` (net + env chips) with the given placement — the one
+    /// accessor every launch path uses so the chips are honored identically.
+    fn how(&self, placement: Placement) -> How {
+        How {
+            net: effective_net(self).to_string(),
+            env: self.launch_env,
+            placement,
+        }
     }
 
     fn cur_change_path(&self) -> Option<String> {
@@ -7902,7 +7913,11 @@ fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
 /// requiring `sarun` on $PATH (the engine's PTY does no shell lookup — it
 /// execvp's argv[0] directly). The user can edit the line before launching;
 /// this is a default, not an enforced choice.
-fn pty_default_cmd() -> String {
+/// The user's configured default launch command, if any: the first usable
+/// line of `{config}/slopbox[.NS]/pty_command`. `None` when unconfigured — the
+/// Custom entry then prefills the unified box-shell template (build_launch)
+/// instead, so the how-flags are honored without a fragile string splice.
+fn pty_command_configured() -> Option<String> {
     let app_dir = match std::env::var("SLOPBOX_NS") {
         Ok(ns) if !ns.is_empty() => format!("slopbox.{ns}"),
         _ => "slopbox".into(),
@@ -7912,42 +7927,16 @@ fn pty_default_cmd() -> String {
         _ => PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
             .join(".config"),
     };
-    if let Ok(s) = std::fs::read_to_string(base.join(app_dir).join("pty_command")) {
-        if let Some(l) = s.lines().map(str::trim)
-            .find(|l| !l.is_empty() && !l.starts_with('#')) {
-            return l.to_string();
-        }
-    }
-    // `sarun run -b --` drops the user into a brush shell inside a fresh
-    // box; they can add a NAME or a trailing command before pressing Enter.
-    // open_pty expands the bare `sarun` to this binary's absolute path at
-    // spawn time (the engine PTY does no PATH lookup), so the prompt stays
-    // readable instead of showing the full install path.
-    "sarun run -b -- ".to_string()
+    let s = std::fs::read_to_string(base.join(app_dir).join("pty_command")).ok()?;
+    s.lines().map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
 }
 
 /// The carbonyl image, pinned by multi-arch manifest-list digest (the
 /// upstream 0.0.3 release; tags are mutable, digests are the pin).
 const CARBONYL_IMAGE: &str = "docker.io/fathyb/carbonyl@sha256:\
 77b3686f46a16375004985b522cef8f66e27fabc4a7d80209609bbb20fdfb362";
-
-/// The launcher's carbonyl command for the PtyCmd prompt, URL left for the
-/// user to finish. A supplied CMD replaces the image's entrypoint+cmd
-/// wholesale (runner.rs's no-cmd path is the only one that reads them), so
-/// the entrypoint's own flags are repeated here. `--user-data-dir` is what
-/// makes Chromium honor the SPKI allowlist; the allowlist is how the
-/// browser trusts the MITM root (net/ca.rs::root_spki_sha256_b64).
-fn carbonyl_cmd(flags: &[String], spki: Option<&str>) -> String {
-    let mut s = format!(
-        "sarun oci run {} {CARBONYL_IMAGE} -- /carbonyl/carbonyl \
-         --no-sandbox --disable-dev-shm-usage --user-data-dir=/carbonyl/data",
-        flags.join(" "));
-    if let Some(k) = spki {
-        s.push_str(&format!(" --ignore-certificate-errors-spki-list={k}"));
-    }
-    s.push_str(" https://");
-    s
-}
 
 /// Absolute path to this very binary (the engine's PTY does no PATH lookup —
 /// it execvp's argv[0] as given, so prompts and menu entries always use the
@@ -7975,7 +7964,7 @@ fn open_pty_menu(app: &mut App) {
             hint: "", action: Action::NewFromImage,
         },
         ActionItem {
-            label: "Browser — carbonyl in a NEW box (tap; flows captured)".into(),
+            label: "Browser — carbonyl (container; flows captured)".into(),
             hint: "", action: Action::BrowserCarbonyl,
         },
         ActionItem {
@@ -8068,18 +8057,163 @@ fn oaita_session_for_box(box_name: &str) -> String {
     format!("{}agent", if slug.is_empty() { "box" } else { &slug })
 }
 
-/// argv for "oaita agent session on a box": one command that seeds the
-/// task and drives it in a sandbox parented on `box_name`. Pure so the
-/// modal flow is unit-testable end to end. The task is a single argv
-/// element (no shell splitting), so spaces/quotes in it are safe.
-fn oaita_task_argv(box_name: &str, session: &str, task: &str, net: &str)
-    -> Vec<String>
-{
-    vec![self_exe(), "oaita".into(), "run".into(),
-         "--on".into(), box_name.into(),
-         "--net".into(), net.into(),
-         "--task".into(), task.into(),
-         session.into()]
+// ── The universal launch model ───────────────────────────────────────────
+// Everything the launcher can start — a shell, a command, a container image,
+// the browser, an agent — is a `LaunchTarget` (pure data) turned into an argv
+// by ONE function, `build_launch`, honoring ONE set of `How` choices (net /
+// env / placement). There is no per-target spawn path: a preset is a row, not
+// a code branch. This replaces the previous grab-bag (carbonyl_cmd,
+// oaita_task_argv, per-Action inline argvs) where each destination built its
+// own command and honored the how-flags inconsistently.
+
+/// Where a launched box sits in the box stack — a universal `How` axis applied
+/// to every target identically. This one knob is what used to be three
+/// separate features: a persistent browser (Reuse), an agent parented on a box
+/// (On), and a fresh container (New).
+#[derive(Clone, PartialEq, Debug)]
+enum Placement {
+    /// A fresh box (or fresh container on an image); at-rest on exit like any
+    /// other, nothing reused.
+    New,
+    /// Rerun the box named `.0` in place — its upper (a browser profile, a
+    /// build tree) persists across launches (control.rs load_mirror).
+    Reuse(String),
+    /// A sub-box parented on the existing box `.0`: reads that box's captured
+    /// files copy-on-write, writes to its own upper — the parent untouched,
+    /// the child reviewable/discardable. Natural for `run` and the agent
+    /// (`oaita --on`); an image target can't express it, so it degrades to
+    /// New (a fresh container on the image).
+    On(String),
+}
+
+/// One consistent set of execution choices, applied to EVERY target the same
+/// way (launcher chips n/e/p). `net` is already resolved through
+/// effective_net (tap→host fallback).
+#[derive(Clone, Debug)]
+struct How {
+    net: String,
+    env: bool,
+    placement: Placement,
+}
+
+/// What to run. Pure data — no variant carries spawn logic; build_launch()
+/// turns it into an argv. Presets (Shell, Browser, …) are rows, not paths.
+#[derive(Clone, Debug)]
+enum LaunchTarget {
+    /// Interactive brush shell in a box over the host filesystem.
+    Shell,
+    /// A specific command line in a box over the host filesystem.
+    Command(Vec<String>),
+    /// A container from an OCI image reference (runs its entrypoint/cmd).
+    Image(String),
+    /// carbonyl — an image target with a fixed reference + argv + the MITM
+    /// SPKI so Chromium trusts the tap proxy. URL left for the user to finish.
+    Browser { spki: Option<String> },
+    /// An oaita agent session seeded with `task`.
+    Ai { task: String },
+    /// The host login shell — the ONE target not in a box, so no How applies.
+    HostShell,
+}
+
+/// A short, valid ([A-Za-z0-9-], lowercase) slug for a derived box/session
+/// name — used when a placement needs a child name the user didn't give.
+fn slugify(s: &str, fallback: &str) -> String {
+    let slug: String = s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>();
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() { fallback.to_string() } else { slug }
+}
+
+/// `sarun run [-b] --net N [-e] [PLACEMENT] -- CMD`. Placement: New → auto
+/// session; Reuse(n) → bare NAME (reruns if it exists); On(p) → dotted
+/// `p.<child>` (sub-box parented on p).
+fn run_argv(how: &How, brush: bool, cmd: &[String]) -> Vec<String> {
+    let mut a = vec!["sarun".to_string(), "run".into()];
+    if brush { a.push("-b".into()); }
+    a.push("--net".into());
+    a.push(how.net.clone());
+    if how.env { a.push("-e".into()); }
+    match &how.placement {
+        Placement::New => {}
+        Placement::Reuse(n) => a.push(n.clone()),
+        Placement::On(p) => {
+            let child = cmd.first().map(|c| slugify(c, "run")).unwrap_or_else(|| "sh".into());
+            a.push(format!("{p}.{child}"));
+        }
+    }
+    a.push("--".into());
+    a.extend(cmd.iter().cloned());
+    a
+}
+
+/// `sarun oci run [--name NAME] --net N <ref> [-- CMD]`. Placement: New →
+/// fresh container; Reuse(n) → `--name n` (reruns → upper persists); On(_) →
+/// an image can't be parented elsewhere, so it degrades to New.
+fn oci_run_argv(how: &How, reference: &str, cmd: &[String]) -> Vec<String> {
+    let mut a = vec!["sarun".to_string(), "oci".into(), "run".into()];
+    a.push("--net".into());
+    a.push(how.net.clone());
+    if let Placement::Reuse(n) = &how.placement {
+        a.push("--name".into());
+        a.push(n.clone());
+    }
+    a.push(reference.into());
+    if !cmd.is_empty() {
+        a.push("--".into());
+        a.extend(cmd.iter().cloned());
+    }
+    a
+}
+
+/// `sarun oaita run [--on BOX] --net N --task TASK SESSION`. The agent's
+/// natural placement is On(box) (= oaita's `--on`); Reuse(n) names the
+/// session so it continues; New uses a default session name.
+fn ai_argv(how: &How, task: &str) -> Vec<String> {
+    let mut a = vec!["sarun".to_string(), "oaita".into(), "run".into()];
+    let session = match &how.placement {
+        Placement::On(p) => {
+            a.push("--on".into());
+            a.push(p.clone());
+            oaita_session_for_box(p)
+        }
+        Placement::Reuse(n) => slugify(n, "agent"),
+        Placement::New => "agent".into(),
+    };
+    a.push("--net".into());
+    a.push(how.net.clone());
+    a.push("--task".into());
+    a.push(task.into());
+    a.push(session);
+    a
+}
+
+/// The ONE builder: (target, how) → argv. Every launcher entry funnels here,
+/// so net/env/placement are honored identically for all of them. `open_pty`
+/// rewrites the leading `sarun` to the real binary path at spawn.
+fn build_launch(target: &LaunchTarget, how: &How) -> Vec<String> {
+    match target {
+        // The only un-boxed target: How cannot apply (no box, no net).
+        LaunchTarget::HostShell =>
+            vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())],
+        LaunchTarget::Shell => run_argv(how, true, &[]),
+        LaunchTarget::Command(cmd) => run_argv(how, true, cmd),
+        LaunchTarget::Image(reference) => oci_run_argv(how, reference, &[]),
+        LaunchTarget::Browser { spki } => {
+            let mut cmd = vec![
+                "/carbonyl/carbonyl".to_string(),
+                "--no-sandbox".into(),
+                "--disable-dev-shm-usage".into(),
+                "--user-data-dir=/carbonyl/data".into(),
+            ];
+            if let Some(k) = spki {
+                cmd.push(format!("--ignore-certificate-errors-spki-list={k}"));
+            }
+            cmd.push("https://".into());
+            oci_run_argv(how, CARBONYL_IMAGE, &cmd)
+        }
+        LaunchTarget::Ai { task } => ai_argv(how, task),
+    }
 }
 
 /// The network mode a launch should ACTUALLY use: the selected chip, but
@@ -8092,13 +8226,6 @@ fn effective_net(app: &App) -> &'static str {
     if sel == "tap" && !tap_available() { "host" } else { sel }
 }
 
-/// The `run` / `oci run` flags the launcher's current toggles translate to.
-/// `env` is only meaningful for `sarun run` (oci run has no -e).
-fn launch_flags(app: &App, env: bool) -> Vec<String> {
-    let mut f = vec!["--net".to_string(), effective_net(app).to_string()];
-    if env && app.launch_env { f.push("-e".into()); }
-    f
-}
 
 /// One curated catalog group: display name, unqualified image name (resolved
 /// through registries.conf at display/pull time), and the tags offered.
@@ -8240,6 +8367,20 @@ fn build_image_picker(
 
 /// Split a typed command line into argv, honoring single and double quotes
 /// (enough for the PTY prompt). Unquoted whitespace separates words.
+/// Join an argv into an editable command line, single-quoting any arg that
+/// needs it — the inverse of shell_split, used to prefill the PtyCmd editor
+/// from build_launch so the user always sees (and can edit) the exact command.
+fn shell_join(argv: &[String]) -> String {
+    argv.iter().map(|a| {
+        if a.is_empty()
+            || a.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"') {
+            format!("'{}'", a.replace('\'', r"'\''"))
+        } else {
+            a.clone()
+        }
+    }).collect::<Vec<_>>().join(" ")
+}
+
 fn shell_split(s: &str) -> Vec<String> {
     let mut out = vec![];
     let mut cur = String::new();
@@ -8821,50 +8962,51 @@ fn run_action(app: &mut App, a: Action) {
         Action::MoveRuleUp     => app.move_rule(-1),
         Action::MoveRuleDown   => app.move_rule(1),
         Action::PtyNew         => open_pty_menu(app),
+        // Every launch below funnels through build_launch(target, how) — one
+        // builder, the same net/env/placement for all. Targets that are ready
+        // to run spawn directly; targets that need the user to finish
+        // something (a command, a URL) prefill the SAME editable command line
+        // (shell_join of the built argv) so what runs is always visible.
         Action::PtyNewBoxShell => {
-            let mut argv = vec![self_exe(), "run".into(), "-b".into()];
-            argv.extend(launch_flags(app, true));
-            argv.push("--".into());
-            app.open_pty(argv);
+            app.open_pty(build_launch(&LaunchTarget::Shell, &app.how(Placement::New)));
         }
         Action::PtyNewHostShell => {
-            let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-            app.open_pty(vec![sh]);
+            app.open_pty(build_launch(&LaunchTarget::HostShell, &app.how(Placement::New)));
         }
         Action::PtyNewCustom   => {
-            // The saved/default prompt, with the launcher's current toggles
-            // spliced into the `run` flags so they carry over into editing.
-            let buf = pty_default_cmd().replacen(
-                " run -b ",
-                &format!(" run -b {} ", launch_flags(app, true).join(" ")),
-                1);
+            // The user's configured default command if set; else a box shell
+            // with the command left blank — the how-flags already in the built
+            // argv, so editing starts from the real command that would run.
+            // Trailing space: the cursor lands after `-- ` ready to type.
+            let buf = pty_command_configured().unwrap_or_else(|| {
+                let argv = build_launch(&LaunchTarget::Command(vec![]),
+                                        &app.how(Placement::New));
+                shell_join(&argv) + " "
+            });
             app.modal = Some(Modal::PtyCmd { buf });
         }
         Action::NewFromImage   => app.open_image_picker(),
         Action::RunSelectedImage => {
-            // Straight in: a container on the selected image box (its real
-            // rootfs and default CMD — not a brush box, nothing to type).
             let name = app.sessions.get(app.sel_session)
                 .and_then(|r| r.get("path").and_then(Value::as_str))
                 .and_then(|p| app.oci_images.iter()
                     .find(|(n, _)| p.ends_with(n.as_str()))
                     .map(|(n, _)| n.clone()));
             match name {
-                Some(name) => {
-                    let mut argv = vec![self_exe(), "oci".into(), "run".into()];
-                    argv.extend(launch_flags(app, false));
-                    argv.push(name);
-                    app.open_pty(argv);
-                }
+                Some(name) => app.open_pty(
+                    build_launch(&LaunchTarget::Image(name), &app.how(Placement::New))),
                 None => app.status =
                     "selected box is not a loaded image".into(),
             }
         }
         Action::BrowserCarbonyl => {
+            // Just another image target — no browser-specific box lifecycle.
+            // Prefilled editable (the URL is left dangling for the user); add
+            // `--name X` in the command for a persistent browser, exactly as
+            // for any container.
             let spki = crate::net::ca::root_spki_sha256_b64().ok();
-            app.modal = Some(Modal::PtyCmd {
-                buf: carbonyl_cmd(&launch_flags(app, false), spki.as_deref()),
-            });
+            let argv = build_launch(&LaunchTarget::Browser { spki }, &app.how(Placement::New));
+            app.modal = Some(Modal::PtyCmd { buf: shell_join(&argv) });
         }
         Action::OaitaLocalPty  => {
             app.open_pty(vec![self_exe(), "oaita".into(), "local".into()]);
@@ -8872,10 +9014,8 @@ fn run_action(app: &mut App, a: Action) {
         Action::OpenModelPicker => app.open_model_picker(),
         Action::OpenApiConfig  => app.open_api_config(),
         Action::OaitaOnSelectedBox => {
-            // Ask for the TASK; the session name is derived from the box.
-            // Enter runs it all in one shot — no NAME to type, no session
-            // to pre-scaffold (the old prefill handed the user an
-            // incomplete `oaita run --on BOX ` that failed on Enter).
+            // Ask for the TASK; placement is On(this box). Enter builds the
+            // agent launch through the same build_launch as everything else.
             let name = app.sessions.get(app.sel_session)
                 .and_then(|r| r.get("name").and_then(Value::as_str));
             match name {
@@ -9155,13 +9295,10 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     }
                     Some((_, PickNext::Pull(rf))) => app.start_image_load(rf),
                     Some((_, PickNext::RunLocal(name))) => {
-                        // Straight into a container PTY on the loaded image
-                        // (its default CMD) — no command line to understand.
-                        let mut argv =
-                            vec![self_exe(), "oci".into(), "run".into()];
-                        argv.extend(launch_flags(app, false));
-                        argv.push(name);
-                        app.open_pty(argv);
+                        // A loaded image is just an Image target — same
+                        // builder as every other launch.
+                        app.open_pty(build_launch(
+                            &LaunchTarget::Image(name), &app.how(Placement::New)));
                     }
                     Some((_, PickNext::EnterRef(prefix))) => {
                         app.modal = Some(Modal::ImageRef { buf: prefix });
@@ -9201,8 +9338,8 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     app.status = "type a task for the agent (Esc to cancel)".into();
                     app.modal = Some(Modal::OaitaTask { box_name, session, buf });
                 } else {
-                    let net = effective_net(app);
-                    app.open_pty(oaita_task_argv(&box_name, &session, &task, net));
+                    let how = app.how(Placement::On(box_name.clone()));
+                    app.open_pty(build_launch(&LaunchTarget::Ai { task }, &how));
                 }
             }
             KeyCode::Esc => app.status = "agent session cancelled".into(),
@@ -9958,31 +10095,109 @@ mod tests {
         assert!(shell_split("   ").is_empty());
     }
 
+    // A How with the given net + placement (env off unless set) for tests.
+    fn how(net: &str, placement: Placement) -> How {
+        How { net: net.to_string(), env: false, placement }
+    }
+
     #[test]
-    fn carbonyl_cmd_pins_digest_and_survives_cmd_override() {
-        // (1) digest-pinned image, not a mutable tag; (2) the entrypoint
-        // flags repeated, because an explicit `oci run ... -- CMD` REPLACES
-        // entrypoint+cmd (runner.rs reads them only on the no-cmd path);
-        // (3) --user-data-dir present, without which Chromium ignores the
-        // SPKI allowlist; (4) a URL stub last, for the user to finish.
-        let flags = vec!["--net".to_string(), "tap".to_string()];
-        let c = carbonyl_cmd(&flags, Some("AbC="));
-        assert!(c.starts_with(
+    fn build_launch_browser_is_a_plain_image_target() {
+        // The browser has NO special path: it is an Image with a fixed
+        // digest-pinned ref, the entrypoint flags repeated (an explicit
+        // `oci run ... -- CMD` REPLACES entrypoint+cmd), --user-data-dir
+        // (without which Chromium ignores the SPKI allowlist), the MITM SPKI,
+        // and a URL stub last. net is honored like any launch.
+        let argv = build_launch(
+            &LaunchTarget::Browser { spki: Some("AbC=".into()) },
+            &how("tap", Placement::New));
+        let j = argv.join(" ");
+        assert!(j.starts_with(
             "sarun oci run --net tap docker.io/fathyb/carbonyl@sha256:"),
-            "digest-pinned oci run, got {c:?}");
-        assert!(c.contains(" -- /carbonyl/carbonyl "),
-            "explicit CMD must name the binary path, got {c:?}");
+            "digest-pinned oci run, got {j:?}");
+        assert!(argv.contains(&"--".to_string())
+            && argv.contains(&"/carbonyl/carbonyl".to_string()),
+            "explicit CMD names the binary, got {j:?}");
         for flag in ["--no-sandbox", "--disable-dev-shm-usage",
                      "--user-data-dir=/carbonyl/data",
                      "--ignore-certificate-errors-spki-list=AbC="] {
-            assert!(c.contains(flag), "missing {flag} in {c:?}");
+            assert!(argv.iter().any(|a| a == flag), "missing {flag} in {j:?}");
         }
-        assert!(c.ends_with(" https://"), "URL stub last, got {c:?}");
-        // No SPKI (CA unreadable): still a working command, the user just
-        // gets the interstitial instead of silent trust.
-        let c = carbonyl_cmd(&flags, None);
-        assert!(!c.contains("spki"), "no empty spki flag: {c:?}");
-        assert!(c.ends_with(" https://"));
+        assert_eq!(argv.last().map(String::as_str), Some("https://"),
+            "URL stub last, got {j:?}");
+        // No SPKI: still valid, no empty flag.
+        let argv = build_launch(
+            &LaunchTarget::Browser { spki: None }, &how("tap", Placement::New));
+        assert!(!argv.iter().any(|a| a.contains("spki")), "no empty spki flag");
+        assert_eq!(argv.last().map(String::as_str), Some("https://"));
+    }
+
+    #[test]
+    fn build_launch_honors_net_and_env_for_every_target() {
+        // net is spliced identically; env (-e) only where a box run accepts
+        // it (`sarun run`), never on oci run / host shell.
+        let h = How { net: "host".into(), env: true, placement: Placement::New };
+        assert_eq!(build_launch(&LaunchTarget::Shell, &h),
+            vec!["sarun", "run", "-b", "--net", "host", "-e", "--"]);
+        assert_eq!(build_launch(&LaunchTarget::Command(vec!["make".into()]), &h),
+            vec!["sarun", "run", "-b", "--net", "host", "-e", "--", "make"]);
+        // oci run: net honored, -e never added (it has no such flag).
+        assert_eq!(build_launch(&LaunchTarget::Image("alpine:3.20".into()), &h),
+            vec!["sarun", "oci", "run", "--net", "host", "alpine:3.20"]);
+        // host shell: the one un-boxed target — no flags at all.
+        let hs = build_launch(&LaunchTarget::HostShell, &h);
+        assert_eq!(hs.len(), 1, "host shell is bare, got {hs:?}");
+    }
+
+    #[test]
+    fn build_launch_placement_is_uniform() {
+        // New: no name. Reuse(n): the box is named so a rerun persists its
+        // upper. On(p): a sub-box parented on p. Same axis, every target.
+        let n = |p| how("tap", p);
+        // run: Reuse -> bare NAME positional; On -> dotted parent.child.
+        assert_eq!(build_launch(&LaunchTarget::Shell, &n(Placement::New)),
+            vec!["sarun", "run", "-b", "--net", "tap", "--"]);
+        assert_eq!(build_launch(&LaunchTarget::Shell, &n(Placement::Reuse("WORK".into()))),
+            vec!["sarun", "run", "-b", "--net", "tap", "WORK", "--"]);
+        assert_eq!(
+            build_launch(&LaunchTarget::Command(vec!["make".into()]),
+                         &n(Placement::On("BUILD".into()))),
+            vec!["sarun", "run", "-b", "--net", "tap", "BUILD.make", "--", "make"]);
+        // oci run: Reuse -> --name; On degrades to New (an image can't be
+        // parented elsewhere).
+        assert_eq!(
+            build_launch(&LaunchTarget::Image("alpine".into()),
+                         &n(Placement::Reuse("A".into()))),
+            vec!["sarun", "oci", "run", "--net", "tap", "--name", "A", "alpine"]);
+        assert_eq!(
+            build_launch(&LaunchTarget::Image("alpine".into()),
+                         &n(Placement::On("X".into()))),
+            vec!["sarun", "oci", "run", "--net", "tap", "alpine"]);
+    }
+
+    #[test]
+    fn build_launch_ai_on_box_is_the_agent_natural_placement() {
+        // The agent's On(box) is oaita's own --on; the session is derived
+        // from the box so re-running continues the same conversation.
+        let argv = build_launch(&LaunchTarget::Ai { task: "fix the bug".into() },
+            &how("host", Placement::On("WORK".into())));
+        assert_eq!(argv, vec!["sarun", "oaita", "run", "--on", "WORK",
+            "--net", "host", "--task", "fix the bug", "workagent"]);
+    }
+
+    #[test]
+    fn shell_join_roundtrips_through_shell_split() {
+        // The editor prefill (shell_join) and its Enter parse (shell_split)
+        // are inverses for the commands build_launch emits, incl. an arg with
+        // spaces.
+        for argv in [
+            build_launch(&LaunchTarget::Browser { spki: Some("A=".into()) },
+                         &how("tap", Placement::New)),
+            vec!["sarun".into(), "run".into(), "-b".into(), "--".into(),
+                 "echo".into(), "a b".into()],
+        ] {
+            assert_eq!(shell_split(&shell_join(&argv)), argv,
+                "join/split roundtrip failed for {argv:?}");
+        }
     }
 
     #[test]
@@ -10025,19 +10240,13 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", &tmp);
             std::env::set_var("SLOPBOX_NS", "PTYCFG");
         }
-        assert_eq!(pty_default_cmd(), "sarun run -b -- make",
+        assert_eq!(pty_command_configured().as_deref(), Some("sarun run -b -- make"),
                    "configured login command must be used verbatim");
-        // … and with no config it falls back to a READABLE `sarun run -b --`
-        // (no full install path leaking into the dialog); open_pty expands
-        // the bare `sarun` to this binary's absolute path at spawn time
-        // because the engine's PTY execvp's argv[0] with no PATH lookup.
+        // … and with no config there is None, so the Custom entry falls back
+        // to the unified build_launch box-shell template (asserted separately).
         std::fs::remove_file(cfgdir.join("pty_command")).unwrap();
-        let d = pty_default_cmd();
-        assert!(d.contains("run -b --"),
-                "fallback should drop into a fresh brush-mode box, got {d:?}");
-        let head = d.split_whitespace().next().unwrap_or("");
-        assert_eq!(head, "sarun",
-                   "fallback head must be the readable placeholder");
+        assert_eq!(pty_command_configured(), None,
+                   "no config → None → unified template prefill");
         unsafe {
             match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
                              None => std::env::remove_var("XDG_CONFIG_HOME") }
@@ -10992,9 +11201,13 @@ mod tests {
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("network: HOST"), "chip must show new mode:\n{buf}");
         assert!(buf.contains("record env: ON"), "chip must show env on:\n{buf}");
-        assert_eq!(launch_flags(&app, true),
-                   vec!["--net", "host", "-e"]);
-        assert_eq!(launch_flags(&app, false), vec!["--net", "host"]);
+        // The chips reach the argv through the ONE builder: a box run gets
+        // --net + -e; an oci run gets --net (no -e).
+        assert_eq!(build_launch(&LaunchTarget::Shell, &app.how(Placement::New)),
+                   vec!["sarun", "run", "-b", "--net", "host", "-e", "--"]);
+        assert_eq!(build_launch(&LaunchTarget::Image("x".into()),
+                                &app.how(Placement::New)),
+                   vec!["sarun", "oci", "run", "--net", "host", "x"]);
         // Custom command prefill carries the toggles into the editable line.
         let sel_custom = match &app.modal {
             Some(Modal::Launcher { items, .. }) =>
@@ -11058,7 +11271,8 @@ mod tests {
         }
         // The argv the modal WOULD run (open_pty needs a live engine, so
         // assert the pure builder that feeds it — a complete command).
-        let argv = oaita_task_argv("WORK", "workagent", "fix the bug", "host");
+        let argv = build_launch(&LaunchTarget::Ai { task: "fix the bug".into() },
+                                &how("host", Placement::On("WORK".into())));
         assert_eq!(&argv[1..], &["oaita", "run", "--on", "WORK",
                                  "--net", "host", "--task", "fix the bug",
                                  "workagent"]);
@@ -11080,13 +11294,14 @@ mod tests {
         let mut app = headless_app();
         // host chip (index 1)
         app.launch_net = 1;
-        let argv = oaita_task_argv("C1", "c1agent", "what os is this?",
-                                   effective_net(&app));
+        let argv = build_launch(&LaunchTarget::Ai { task: "what os is this?".into() },
+                                &app.how(Placement::On("C1".into())));
         let i = argv.iter().position(|a| a == "--net").expect("--net present");
         assert_eq!(argv[i + 1], "host", "host selection must reach the box");
         // off chip (index 2)
         app.launch_net = 2;
-        let argv = oaita_task_argv("C1", "c1agent", "x", effective_net(&app));
+        let argv = build_launch(&LaunchTarget::Ai { task: "x".into() },
+                                &app.how(Placement::On("C1".into())));
         let i = argv.iter().position(|a| a == "--net").unwrap();
         assert_eq!(argv[i + 1], "off", "off selection must reach the box");
     }
