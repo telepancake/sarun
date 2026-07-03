@@ -48,3 +48,4 @@
 0480-diagnosability-live-IN-FLIGHT-builtin-activity-5-minute-stal.patch
 0490-Nothing-to-be-done-through-the-logical-stdout--GNU-wording.patch
 0500-dep--double-colon-rules-as-independent-per-part-nodes.patch
+0510-parser--load-directive--expr--recipe-function-args-keep-shel.patch

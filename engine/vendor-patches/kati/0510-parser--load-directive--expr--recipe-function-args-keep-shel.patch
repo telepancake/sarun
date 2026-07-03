@@ -1,0 +1,310 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 03 Jul 2026 16:33:27 +0000
+Subject: [PATCH] parser: load directive; expr: recipe function args keep shell escapes
+
+Two conformance TODOs retired:
+
+load / -load directive (was 'missing separator'): parsed like include
+into a LoadStmt, evaluated by never dlopening — 'load' of a missing
+file reproduces GNU's two-line failure verbatim, an existing file gets
+the generic '*** X: failed to load.', and '-load' tolerates silently
+(GNU instead treats the file as a remakeable makefile; we lean
+tolerant since a plugin can never work in-box).
+
+\# inside function args in a RECIPE (echo \#define via $(foreach ...))
+was unescaped to # at parse time, so the shell saw a comment and the
+rest of the line vanished. New ParseExprOpt::FuncCommand — selected
+when function args are parsed inside a Command expression — parses
+function syntax but keeps \\ and \# untouched for the shell, while
+still collapsing backslash-newline argument continuations (measured
+GNU behavior; multiline_arg.mk holds).
+
+Corpus 403/410 fail=0 xfail=7 xpass=0.
+
+---
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index c3b3334..0959f62 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -1185,6 +1185,37 @@ impl Evaluator {
+         Ok(())
+     }
+ 
++    // sarun: `load` / `-load` (GNU make C plugins). We never dlopen — a box
++    // must not pull host .so's into the engine — so `load` of a missing
++    // file reproduces GNU's two-line failure verbatim and `load` of an
++    // existing file fails with the generic second line. `-load` tolerates
++    // everything silently; GNU instead treats the file like a remakeable
++    // makefile (a missing -load .so with no rule still errors there) —
++    // we lean tolerant, since a plugin can never work in-box anyway.
++    pub fn eval_load(&mut self, stmt: &crate::stmt::LoadStmt) -> Result<()> {
++        self.loc = Some(stmt.loc());
++        self.in_rule = false;
++
++        let files = stmt.expr.eval_to_buf(self)?;
++        for tok in word_scanner(&files) {
++            // `load foo.so(init_symbol)` — the file part is before '('.
++            let name = tok.split(|&b| b == b'(').next().unwrap_or(tok);
++            if !stmt.should_exist {
++                continue;
++            }
++            let f = String::from_utf8_lossy(name);
++            let exists = self.working_dir.join(&*f).exists();
++            if !exists {
++                warn_loc!(
++                    self.loc.as_ref(),
++                    "{f}: cannot open shared object file: No such file or directory"
++                );
++            }
++            error_loc!(self.loc.as_ref(), "*** {f}: failed to load.");
++        }
++        Ok(())
++    }
++
+     pub fn eval_include(&mut self, stmt: &IncludeStmt) -> Result<()> {
+         self.loc = Some(stmt.loc());
+         self.in_rule = false;
+diff --git a/src-rs/expr.rs b/src-rs/expr.rs
+index 1c90344..0f2ec6b 100644
+--- a/src-rs/expr.rs
++++ b/src-rs/expr.rs
+@@ -60,6 +60,10 @@ pub enum ParseExprOpt {
+     Define,
+     Command,
+     Func,
++    // Function arguments INSIDE a recipe line: function syntax is parsed
++    // (like Func) but nothing is unescaped and `#` is not a comment
++    // (like Command) — GNU strips comments/escapes only outside recipes.
++    FuncCommand,
+ }
+ 
+ #[derive(Debug, PartialEq)]
+@@ -302,7 +306,10 @@ fn close_paren(c: u8) -> Option<u8> {
+ }
+ 
+ fn should_handle_comments(opt: ParseExprOpt) -> bool {
+-    !matches!(opt, ParseExprOpt::Define | ParseExprOpt::Command)
++    !matches!(
++        opt,
++        ParseExprOpt::Define | ParseExprOpt::Command | ParseExprOpt::FuncCommand
++    )
+ }
+ 
+ fn skip_spaces(loc: &mut Loc, s: &[u8], terms: &[u8]) -> usize {
+@@ -332,6 +339,7 @@ fn parse_func(
+     s: Bytes,
+     mut i: usize,
+     mut terms: Vec<u8>,
++    in_command: bool,
+ ) -> Result<(usize, Vec<Arc<Value>>)> {
+     let start_loc = loc.clone();
+     terms.truncate(2);
+@@ -372,7 +380,11 @@ fn parse_func(
+             loc,
+             s.slice(i..),
+             Some(&terms),
+-            ParseExprOpt::Func,
++            if in_command {
++                ParseExprOpt::FuncCommand
++            } else {
++                ParseExprOpt::Func
++            },
+             trim_right_space,
+         )?;
+         // TODO: concatLine???
+@@ -409,7 +421,12 @@ fn parse_func(
+     Ok((i, args))
+ }
+ 
+-fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<Value>)> {
++fn parse_dollar(
++    loc: &mut Loc,
++    s: Bytes,
++    end_paren: bool,
++    in_command: bool,
++) -> Result<(usize, Arc<Value>)> {
+     assert!(s.len() >= 2);
+     assert!(s.starts_with(b"$"));
+     assert!(!s.starts_with(b"$$"));
+@@ -453,7 +470,7 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
+             // ${func ...}
+             if let Value::Literal(_, lit) = &*vname {
+                 if let Some(fi) = get_func_info(lit) {
+-                    let (idx, args) = parse_func(loc, fi, s, i + 1, terms)?;
++                    let (idx, args) = parse_func(loc, fi, s, i + 1, terms, in_command)?;
+                     return Ok((
+                         idx,
+                         Arc::new(Value::Func {
+@@ -630,14 +647,21 @@ pub fn parse_expr_impl_ext(
+                 return Ok((i + 1, Arc::new(Value::List(Some(item_loc), list))));
+             }
+ 
+-            let (n, v) = parse_dollar(loc, s.slice(i..), end_paren)?;
++            let (n, v) = parse_dollar(
++                loc,
++                s.slice(i..),
++                end_paren,
++                matches!(opt, ParseExprOpt::Command | ParseExprOpt::FuncCommand),
++            )?;
+             list.push(v);
+             i += n;
+             b = i;
+             continue;
+         }
+ 
+-        if (c == b'(' || c == b'{') && opt == ParseExprOpt::Func {
++        if (c == b'(' || c == b'{')
++            && matches!(opt, ParseExprOpt::Func | ParseExprOpt::FuncCommand)
++        {
+             let cp = close_paren(c);
+             if terms
+                 .map(|v| v[terms_ignored..].first() == cp.as_ref())
+@@ -661,9 +685,12 @@ pub fn parse_expr_impl_ext(
+             }
+         }
+ 
++        // FuncCommand (function args inside a recipe): backslash-newline is
++        // still function-argument continuation (GNU collapses it to a
++        // space), but `\\` and `\#` pass through to the shell unescaped.
+         if c == b'\\' && i + 1 < s.len() && opt != ParseExprOpt::Command {
+             let n = remaining[1];
+-            if n == b'\\' {
++            if n == b'\\' && opt != ParseExprOpt::FuncCommand {
+                 i += 2;
+                 continue;
+             }
+@@ -786,7 +813,7 @@ mod tests {
+     #[test]
+     fn test_parse_dollar() {
+         assert_eq!(
+-            parse_dollar(&mut Loc::default(), Bytes::from_static(b"${foo}bar"), false).unwrap(),
++            parse_dollar(&mut Loc::default(), Bytes::from_static(b"${foo}bar"), false, false).unwrap(),
+             (6, Arc::new(Value::SymRef(Loc::default(), intern("foo"))))
+         );
+         assert_eq!(
+@@ -794,6 +821,7 @@ mod tests {
+                 &mut Loc::default(),
+                 Bytes::from_static(b"$(info ***   - Re-execute)"),
+                 false,
++                false,
+             )
+             .unwrap(),
+             (
+@@ -813,6 +841,7 @@ mod tests {
+                 &mut Loc::default(),
+                 Bytes::from_static(b"$(info ***   - Re-execute envsetup (\". envsetup.sh\"))"),
+                 false,
++                false,
+             )
+             .unwrap(),
+             (
+diff --git a/src-rs/parser.rs b/src-rs/parser.rs
+index 8a0e692..512289d 100644
+--- a/src-rs/parser.rs
++++ b/src-rs/parser.rs
+@@ -27,7 +27,7 @@ use crate::{
+     loc::Loc,
+     stmt::{
+         AssignDirective, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt,
+-        IncludeStmt, RuleSep, RuleStmt, Stmt, UndefineStmt,
++        IncludeStmt, LoadStmt, RuleSep, RuleStmt, Stmt, UndefineStmt,
+     },
+     strutil::{
+         find_end_of_line, find_outside_paren, trim_left_space, trim_right_space, trim_space,
+@@ -329,6 +329,19 @@ impl Parser {
+         Ok(())
+     }
+ 
++    // sarun: `load foo.so` / `-load foo.so` — parsed like include (the
++    // file list may contain expansions), evaluated by Evaluator::eval_load.
++    fn parse_load(&mut self, line: Bytes, directive: &[u8]) -> Result<()> {
++        let loc = self.loc.clone();
++        let mut mutable_loc = loc.clone();
++        let expr = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
++        self.out_stmts
++            .lock()
++            .push(LoadStmt::new(loc, expr, directive.starts_with(b"l")));
++        self.after_rule = false;
++        Ok(())
++    }
++
+     fn parse_define(&mut self, line: Bytes) -> Result<()> {
+         if line.is_empty() {
+             error_loc!(Some(&self.loc), "*** empty variable name.");
+@@ -692,6 +705,7 @@ impl Parser {
+         ))));
+         match directive {
+             b"include" | b"-include" | b"sinclude" => self.parse_include(rest, directive)?,
++            b"load" | b"-load" => self.parse_load(rest, directive)?,
+             b"define" => self.parse_define(rest)?,
+             b"ifdef" | b"ifndef" => self.parse_ifdef(rest, directive)?,
+             b"ifeq" | b"ifneq" => self.parse_ifeq(rest, directive)?,
+diff --git a/src-rs/stmt.rs b/src-rs/stmt.rs
+index 4d77d8b..d4f70f4 100644
+--- a/src-rs/stmt.rs
++++ b/src-rs/stmt.rs
+@@ -334,6 +334,47 @@ impl IncludeStmt {
+     }
+ }
+ 
++/// sarun: the GNU `load` / `-load` directive. We never actually dlopen a
++/// plugin — a box has no business loading host .so's into the engine — but
++/// the directive must parse and fail with GNU's wording (or be silently
++/// tolerated in its `-load` form) instead of "missing separator".
++pub struct LoadStmt {
++    loc: Loc,
++    orig: Bytes,
++
++    pub expr: Arc<Value>,
++    pub should_exist: bool,
++}
++
++impl Statement for LoadStmt {
++    fn loc(&self) -> Loc {
++        self.loc.clone()
++    }
++    fn orig(&self) -> Bytes {
++        self.orig.clone()
++    }
++    fn eval(&self, ev: &mut Evaluator) -> Result<()> {
++        ev.eval_load(self)
++    }
++}
++
++impl Debug for LoadStmt {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "LoadStmt({:?}, loc={})", self.expr, self.loc)
++    }
++}
++
++impl LoadStmt {
++    pub fn new(loc: Loc, expr: Arc<Value>, should_exist: bool) -> Arc<LoadStmt> {
++        Arc::new(LoadStmt {
++            loc,
++            orig: Bytes::new(),
++            expr,
++            should_exist,
++        })
++    }
++}
++
+ pub struct ExportStmt {
+     loc: Loc,
+     orig: Bytes,
+diff --git a/testcase/sarun_hash_in_recipe.mk b/testcase/sarun_hash_in_recipe.mk
+index 73e9ef6..727b55b 100644
+--- a/testcase/sarun_hash_in_recipe.mk
++++ b/testcase/sarun_hash_in_recipe.mk
+@@ -1,3 +1,2 @@
+-# TODO(rust)
+ all:
+ 	@$(foreach v,foo,echo \#define $(v);)
+diff --git a/testcase/sarun_load_directive.mk b/testcase/sarun_load_directive.mk
+index 75b9cff..241586c 100644
+--- a/testcase/sarun_load_directive.mk
++++ b/testcase/sarun_load_directive.mk
+@@ -1,3 +1,2 @@
+-# TODO(rust)
+ load definitely_missing.so
+ all: ; @:
