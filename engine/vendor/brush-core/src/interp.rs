@@ -1544,7 +1544,8 @@ async fn expand_assignment_value(
 // interpreter applies — (name, value, exported). The embedding engine records
 // them (tagged with its recipe/pipeline context) into the box's capture DB so
 // make↔shell↔sub-make variable flows are traceable from one searchable place.
-pub type AssignObserver = std::sync::Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
+/// (name, expanded value, exported, UNEXPANDED assignment text)
+pub type AssignObserver = std::sync::Arc<dyn Fn(&str, &str, bool, &str) + Send + Sync>;
 
 static ASSIGN_OBSERVER: std::sync::RwLock<Option<AssignObserver>> =
     std::sync::RwLock::new(None);
@@ -1559,9 +1560,9 @@ fn assign_observer() -> Option<AssignObserver> {
 
 /// Report one assignment to the installed observer — for builtins that set
 /// variables outside apply_assignment (export/declare).
-pub fn observe_assignment(name: &str, value: &str, exported: bool) {
+pub fn observe_assignment(name: &str, value: &str, exported: bool, rhs: &str) {
     if let Some(obs) = assign_observer() {
-        obs(name, value, exported);
+        obs(name, value, exported, rhs);
     }
 }
 
@@ -1634,7 +1635,8 @@ async fn apply_assignment(
 
     // sarun: report to the installed assignment observer (engine capture).
     if let Some(obs) = assign_observer() {
-        obs(variable_name.as_str(), &new_value.to_string(), export);
+        obs(variable_name.as_str(), &new_value.to_string(), export,
+            &assignment.to_string());
     }
 
     // See if we need to eval an array index.

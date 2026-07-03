@@ -760,7 +760,7 @@ impl Evaluator {
             let val = g.string().unwrap_or(std::borrow::Cow::Borrowed(b""));
             crate::fileutil::report_var_assign(
                 &lhs.as_bytes(), &loc, &val,
-                self.working_dir.as_os_str().as_bytes());
+                self.working_dir.as_os_str().as_bytes(), &stmt.orig_rhs);
         }
         Ok(())
     }

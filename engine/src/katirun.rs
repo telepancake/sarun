@@ -703,20 +703,132 @@ pub(crate) fn flush_makevars() {
     crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
 
-fn install_var_recorder() {
-    kati::fileutil::install_var_assign_hook(Arc::new(|name, loc, value, make_dir| {
-        let mut v = String::from_utf8_lossy(value).into_owned();
-        if v.len() > 4096 {
-            v.truncate(4096);
-            v.push('…');
+/// Variable tracing is OPT-IN: `sarun run --vars` exports SARUN_TRACE_VARS=1
+/// into the box (bwrap propagates it to every box process, including the
+/// shadowed makes/shells). Off by default so a yocto-scale build pays nothing
+/// for a feature it didn't ask for.
+pub(crate) fn vartrace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("SARUN_TRACE_VARS").is_some_and(|v| v == "1")
+    })
+}
+
+/// Make functions whose `$(name …)` head is NOT a variable dereference. The
+/// first argument of `call`/`value` IS one, so those record it.
+const MAKE_FUNCS: &[&str] = &[
+    "subst", "patsubst", "strip", "findstring", "filter", "filter-out",
+    "sort", "word", "wordlist", "words", "firstword", "lastword", "dir",
+    "notdir", "suffix", "basename", "addsuffix", "addprefix", "join",
+    "wildcard", "realpath", "abspath", "if", "or", "and", "intcmp",
+    "foreach", "file", "eval", "origin", "flavor", "shell", "guile",
+    "error", "warning", "info", "let",
+];
+
+/// Best-effort text scan of an UNEXPANDED rhs for the variables it
+/// dereferences: `$(NAME)` / `${NAME}` (make), `$NAME` / `${NAME}` (shell).
+/// Make function heads don't count (`$(call NAME,…)` / `$(value NAME)` count
+/// their first argument instead); `$$` is a literal; automatic vars ($@ $< …)
+/// have no name characters and fall out naturally. Function ARGUMENTS keep
+/// being scanned, so `$(patsubst %.c,%.o,$(SRCS))` yields SRCS. Returns the
+/// unique names in first-appearance order, space-joined — frugal, greppable.
+pub(crate) fn extract_var_refs(rhs: &str) -> String {
+    fn name_at(b: &[u8], i: usize) -> usize {
+        let mut j = i;
+        while j < b.len()
+            && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'_' | b'.' | b'-'))
+        {
+            j += 1;
         }
-        push_makevar(serde_json::json!({
-            "name": String::from_utf8_lossy(name),
-            "loc": loc,
-            "value": v,
-            "make": String::from_utf8_lossy(make_dir),
-        }));
-    }));
+        j
+    }
+    let b = rhs.as_bytes();
+    let mut refs: Vec<String> = vec![];
+    let mut push = |s: &str| {
+        if s.bytes().any(|c| c.is_ascii_alphabetic() || c == b'_')
+            && !refs.iter().any(|r| r == s)
+        {
+            refs.push(s.to_string());
+        }
+    };
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        match b[i + 1] {
+            b'$' => i += 2, // literal $
+            b'(' | b'{' => {
+                let start = i + 2;
+                let end = name_at(b, start);
+                let head = &rhs[start..end];
+                if head == "call" || head == "value" {
+                    // skip whitespace, the first argument is the deref
+                    let mut k = end;
+                    while k < b.len() && (b[k] == b' ' || b[k] == b'\t') {
+                        k += 1;
+                    }
+                    let e2 = name_at(b, k);
+                    push(&rhs[k..e2]);
+                } else if !MAKE_FUNCS.contains(&head) {
+                    push(head);
+                }
+                i = end.max(start); // keep scanning inside the parens
+            }
+            _ => {
+                let end = name_at(b, i + 1);
+                push(&rhs[i + 1..end]);
+                i = end.max(i + 2);
+            }
+        }
+    }
+    let mut out = refs.join(" ");
+    if out.len() > 1024 {
+        out.truncate(1024);
+    }
+    out
+}
+
+/// Cap a recorded text field: a 100KB variable is not debugged whole.
+pub(crate) fn cap_text(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut m = max;
+        while m > 0 && !s.is_char_boundary(m) {
+            m -= 1;
+        }
+        s.truncate(m);
+        s.push('…');
+    }
+    s
+}
+
+fn install_var_recorder() {
+    kati::fileutil::install_var_assign_hook(Arc::new(
+        |name, loc, value, make_dir, rhs| {
+            if !vartrace_enabled() {
+                return;
+            }
+            let v = cap_text(String::from_utf8_lossy(value).into_owned(), 4096);
+            let rhs_s = cap_text(String::from_utf8_lossy(rhs).into_owned(), 1024);
+            let refs = extract_var_refs(&rhs_s);
+            // A builtin sub-make parses on the invoking recipe's thread, so
+            // the recipe-edge / pipeline context links its assignments to the
+            // spawning edge; a top-level (shadow-process) make has neither.
+            let edge = crate::brush::current_recipe_edge();
+            let uid = crate::brush::current_pipeline_uid();
+            push_makevar(serde_json::json!({
+                "name": String::from_utf8_lossy(name),
+                "loc": loc,
+                "value": v,
+                "make": String::from_utf8_lossy(make_dir),
+                "rhs": rhs_s,
+                "refs": refs,
+                "edge": edge,
+                "uid": uid,
+            }));
+        },
+    ));
 }
 
 fn install_make_recipe_runner() {

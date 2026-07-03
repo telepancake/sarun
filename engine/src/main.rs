@@ -90,7 +90,7 @@ fn top_level_help() -> &'static str {
      run FLAGS:\n  \
        -n / -N / --net off|tap|host   per-box networking (default: tap, a proxied per-box netns)\n  \
        -t passthrough   -d direct (no overlay)   -e record-env   -b brush-shell   -p pty\n  \
-       -C DIR   --no-parent   --readonly-parent   --api (oaita proxy)\n"
+       -C DIR   --no-parent   --readonly-parent   --api (oaita proxy)   --vars (variable provenance)\n"
 }
 
 fn serve() -> i32 {
@@ -581,13 +581,25 @@ fn main() {
                     //        in-box `oaita gen` routes through the engine
                     //        with no api key in the box and no extra UDS.
                     "--api" => api = true,
+                    // --vars  OPT-IN variable provenance: record every make
+                    //         and shell variable assignment (name, site,
+                    //         value, unexpanded rhs + its dereferences) into
+                    //         the box's makevar table for the UI's Vars view.
+                    //         An env toggle because the recorders run in the
+                    //         box's shadowed makes/shells, which inherit the
+                    //         box environment through bwrap.
+                    // Single-threaded here (argv parsing, pre-spawn) — safe.
+                    "--vars" => unsafe {
+                        std::env::set_var("SARUN_TRACE_VARS", "1");
+                    },
                     _ => if name.is_none() { name = Some(a.clone()); },
                 }
             }
             if cmd.is_empty() && !api {
                 eprintln!("usage: sarun run [FLAGS] [NAME] -- CMD...   (needs a running engine/UI)\n\
                     \x20 flags: -n/-N/--net off|tap|host  -t passthrough  -d direct  -e record-env\n\
-                    \x20        -b brush-shell  -p pty  -C DIR  --no-parent  --readonly-parent  --api");
+                    \x20        -b brush-shell  -p pty  -C DIR  --no-parent  --readonly-parent  --api\n\
+                    \x20        --vars record variable assignments (Vars view)");
                 std::process::exit(2);
             }
             std::process::exit(runner::run(name, passthrough, direct, env,

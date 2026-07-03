@@ -105,8 +105,15 @@ CREATE TABLE IF NOT EXISTS build_edges(id INTEGER PRIMARY KEY AUTOINCREMENT,
 -- working dir) the box's embedded makes evaluated — the searchable record
 -- behind the UI's Vars view (where did this variable get this value).
 -- UNIQUE collapses the identical re-assignments every sub-make repeats.
+-- edge_out / uid anchor the assignment to its execution context (the recipe
+-- build edge's primary output / the enclosing pipeline's brushprov uid) so
+-- the Vars view can cross-navigate to Build / Pipes.
+-- rhs is the UNEXPANDED assignment text and refs the space-joined variable
+-- names it dereferences — how the assignment looked and what fed it, so the
+-- Vars view can walk the chain. Both capped at capture time (frugal).
 CREATE TABLE IF NOT EXISTS makevar(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, name TEXT, loc TEXT, value TEXT, make_dir TEXT,
+ edge_out TEXT, uid INT, rhs TEXT, refs TEXT,
  UNIQUE(name, loc, value, make_dir));
 CREATE INDEX IF NOT EXISTS idx_makevar_name ON makevar(name);
 CREATE TABLE IF NOT EXISTS api_log(id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1127,16 +1134,18 @@ impl BoxState {
     /// Record a batch of makefile variable assignments (make_vars frame).
     /// INSERT OR IGNORE: the unique key collapses identical repeats across
     /// sub-makes, keeping the table proportional to distinct assignments.
-    pub fn add_makevars(&self, rows: &[(String, String, String, String)]) {
+    pub fn add_makevars(&self, rows: &[crate::control::MakeVarRow]) {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let conn = self.conn.lock().unwrap();
-        for (name, loc, value, make_dir) in rows {
+        for r in rows {
             let _ = conn.execute(
-                "INSERT OR IGNORE INTO makevar(ts,name,loc,value,make_dir) \
-                 VALUES(?1,?2,?3,?4,?5)",
-                params![ts, name, loc, value, make_dir]);
+                "INSERT OR IGNORE INTO makevar\
+                 (ts,name,loc,value,make_dir,edge_out,uid,rhs,refs) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![ts, r.name, r.loc, r.value, r.make_dir, r.edge_out,
+                        r.uid, r.rhs, r.refs]);
         }
     }
 

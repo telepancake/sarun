@@ -1947,7 +1947,7 @@ fn next_pipeline_uid() -> u64 {
 }
 
 /// The pipeline uid currently executing on THIS thread (0 = none/root).
-fn current_pipeline_uid() -> u64 {
+pub(crate) fn current_pipeline_uid() -> u64 {
     CURRENT_PIPELINE_UID.with(std::cell::Cell::get)
 }
 
@@ -2608,8 +2608,10 @@ pub(crate) fn install_shell_var_recorder() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         brush_core::interp::install_assign_observer(std::sync::Arc::new(
-            |name, value, exported| {
-                if SUPPRESS_VAR_RECORD.with(|c| c.get()) {
+            |name, value, exported, rhs| {
+                if !crate::katirun::vartrace_enabled()
+                    || SUPPRESS_VAR_RECORD.with(|c| c.get())
+                {
                     return;
                 }
                 let uid = current_pipeline_uid();
@@ -2633,22 +2635,25 @@ pub(crate) fn install_shell_var_recorder() {
                 {
                     v = v[1..v.len() - 1].to_string();
                 }
-                if v.len() > 4096 {
-                    v.truncate(4096);
-                    v.push('…');
-                }
+                let v = crate::katirun::cap_text(v, 4096);
+                let rhs_s = crate::katirun::cap_text(rhs.to_string(), 1024);
+                let refs = crate::katirun::extract_var_refs(&rhs_s);
                 crate::katirun::push_makevar(serde_json::json!({
                     "name": name,
                     "loc": loc,
                     "value": v,
                     "make": if exported { "sh export" } else { "sh" },
+                    "rhs": rhs_s,
+                    "refs": refs,
+                    "edge": edge,
+                    "uid": uid,
                 }));
             },
         ));
     });
 }
 
-fn current_recipe_edge() -> Option<String> {
+pub(crate) fn current_recipe_edge() -> Option<String> {
     BOX_RECIPE_EDGE.with(|c| c.borrow().clone())
 }
 

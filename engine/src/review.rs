@@ -388,27 +388,46 @@ pub fn box_summary(id: i64, limit: i64) -> Value {
 /// table). `name_pat` / `value_pat` are cmd_match text globs — a bare word
 /// matches as a substring, empty matches everything. Rows come back in
 /// assignment order so a value's history reads top-to-bottom.
-pub fn makevars(id: i64, name_pat: &str, value_pat: &str, limit: i64) -> Value {
+pub fn makevars(
+    id: i64, name_pat: &str, value_pat: &str, limit: i64, any: bool,
+) -> Value {
     let Some(conn) = open_ro(id) else { return json!([]) };
     if !has_table(&conn, "makevar") { return json!([]); }
     let mut out = vec![];
+    // edge_id / pipeline_id resolve the capture-time anchors (recipe edge's
+    // primary output / pipeline uid) to the row ids the cross-pane "ids"
+    // filters key on, so the UI can navigate without another round-trip.
     let Ok(mut st) = conn.prepare(
-        "SELECT id, name, loc, value, make_dir FROM makevar ORDER BY id") else {
+        "SELECT m.id, m.name, m.loc, m.value, m.make_dir, m.rhs, m.refs,
+                m.edge_out, m.uid,
+                (SELECT e.id FROM build_edges e
+                  WHERE json_extract(e.outs,'$[0]') = m.edge_out LIMIT 1),
+                (SELECT p.id FROM brushprov p WHERE p.uid = m.uid LIMIT 1)
+         FROM makevar m ORDER BY m.id") else {
         return json!([]);
     };
     let Ok(it) = st.query_map([], |r| Ok((
         r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
         r.get::<_, String>(3)?, r.get::<_, String>(4)?,
+        r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?,
+        r.get::<_, Option<String>>(7)?, r.get::<_, Option<i64>>(8)?,
+        r.get::<_, Option<i64>>(9)?, r.get::<_, Option<i64>>(10)?,
     ))) else { return json!([]) };
-    for (rid, name, loc, value, make_dir) in it.flatten() {
-        if !name_pat.is_empty() && !crate::rules::cmd_match(name_pat, &name) {
-            continue;
-        }
-        if !value_pat.is_empty() && !crate::rules::cmd_match(value_pat, &value) {
-            continue;
-        }
+    for (rid, name, loc, value, make_dir, rhs, refs, edge_out, uid,
+         edge_id, pipeline_id) in it.flatten()
+    {
+        let name_ok = name_pat.is_empty()
+            || crate::rules::cmd_match(name_pat, &name);
+        let value_ok = value_pat.is_empty()
+            || crate::rules::cmd_match(value_pat, &value);
+        if any { if !(name_ok || value_ok) { continue; } }
+        else if !(name_ok && value_ok) { continue; }
         out.push(json!({"id": rid, "name": name, "loc": loc,
-                        "value": value, "make": make_dir}));
+                        "value": value, "make": make_dir,
+                        "rhs": rhs.unwrap_or_default(),
+                        "refs": refs.unwrap_or_default(),
+                        "edge_out": edge_out, "uid": uid,
+                        "edge_id": edge_id, "pipeline_id": pipeline_id}));
         if out.len() as i64 >= limit { break; }
     }
     json!(out)

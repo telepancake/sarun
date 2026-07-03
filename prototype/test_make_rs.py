@@ -817,18 +817,22 @@ def main():
               f"(not skipped for the parent's decoy); out.txt={oo23!r}")
 
         # ── CASE 24: variable provenance lands in the box makevar table ───────
-        # Every assignment a build makes — make (:=, +=, with file:line loc),
-        # shell scalar inside a recipe, `export NAME=…` via the export builtin,
-        # and a sub-make's own override — must be recorded in the box DB's
-        # makevar table so the Vars pane / review.makevars can trace the chain.
-        # The export-prefix noise (box exports replayed per subshell) must NOT
-        # appear.
+        # OPT-IN via `run --vars`. Every assignment a traced build makes —
+        # make (:=, +=, with file:line loc), shell scalar inside a recipe,
+        # `export NAME=…` via the export builtin, and a sub-make's own
+        # override — must be recorded in the box DB's makevar table with the
+        # UNEXPANDED rhs, the variable names it dereferences, and its
+        # execution context (recipe edge / pipeline uid), so the Vars pane
+        # can search, walk the chain, and cross-navigate. Export-prefix noise
+        # (box exports replayed per subshell) must NOT appear; a box run
+        # WITHOUT --vars must record nothing.
         vt = work / "vars"
         shutil.rmtree(vt, ignore_errors=True)
         vt.mkdir(parents=True, exist_ok=True)
         (vt / "Makefile").write_text(
             "ORIG_VAR := aa\n"
             "ORIG_VAR += bb\n"
+            "DERIVED := pre-$(ORIG_VAR)\n"
             "all:\n"
             "\t@SHELLVAR=\"from-shell $(ORIG_VAR)\"; "
             "export EXPVAR=\"exported $$SHELLVAR\"; "
@@ -837,7 +841,8 @@ def main():
             "ORIG_VAR := sub-val\n"
             "all:\n\t@true\n")
         r = subprocess.run(
-            [str(BIN), "run", "-b", "MAKE24", "-C", str(vt), "--", "make"],
+            [str(BIN), "run", "-b", "--vars", "MAKE24", "-C", str(vt),
+             "--", "make"],
             capture_output=True, text=True, timeout=180)
         check(r.returncode == 0,
               f"case24: vars box exits 0 (got {r.returncode}: {r.stderr[-600:]})")
@@ -845,29 +850,58 @@ def main():
         con = sqlite3.connect(f"file:{sp24}?mode=ro", uri=True)
         try:
             mv = list(con.execute(
-                "SELECT name, loc, value, make_dir FROM makevar ORDER BY id"))
+                "SELECT name, loc, value, make_dir, rhs, refs, edge_out, uid "
+                "FROM makevar ORDER BY id"))
         finally:
             con.close()
-        def mv_has(name, loc_sub, value, make_sub):
-            return any(n == name and loc_sub in (l or "") and v == value
-                       and make_sub in (d or "") for n, l, v, d in mv)
-        check(mv_has("ORIG_VAR", "Makefile:1", "aa", "vars"),
+        def mv_row(name, loc_sub, value, make_sub):
+            for row in mv:
+                if (row[0] == name and loc_sub in (row[1] or "")
+                        and row[2] == value and make_sub in (row[3] or "")):
+                    return row
+            return None
+        check(mv_row("ORIG_VAR", "Makefile:1", "aa", "vars") is not None,
               f"case24: make := assignment recorded with file:line loc ({mv})")
-        check(mv_has("ORIG_VAR", "Makefile:2", "aa bb", "vars"),
+        check(mv_row("ORIG_VAR", "Makefile:2", "aa bb", "vars") is not None,
               f"case24: make += records the appended value")
-        check(mv_has("SHELLVAR", "recipe of all", "from-shell aa bb", "sh"),
+        drow = mv_row("DERIVED", "Makefile:3", "pre-aa bb", "vars")
+        check(drow is not None and drow[4] == "pre-$(ORIG_VAR)"
+              and drow[5] == "ORIG_VAR",
+              f"case24: DERIVED keeps the unexpanded rhs + its dereference "
+              f"(rhs={drow[4] if drow else None!r} "
+              f"refs={drow[5] if drow else None!r})")
+        srow = mv_row("SHELLVAR", "recipe of all", "from-shell aa bb", "sh")
+        check(srow is not None,
               f"case24: shell scalar inside the recipe recorded, expanded")
-        check(mv_has("EXPVAR", "recipe of all", "exported from-shell aa bb",
-                     "sh export"),
+        check(srow is not None and srow[6] == "all",
+              f"case24: shell assignment anchored to its recipe edge "
+              f"(edge_out={srow[6] if srow else None!r})")
+        check(mv_row("EXPVAR", "recipe of all", "exported from-shell aa bb",
+                     "sh export") is not None,
               f"case24: `export NAME=…` (builtin path) recorded as sh export")
-        check(mv_has("ORIG_VAR", "sub.mk:1", "sub-val", "vars"),
+        subrow = mv_row("ORIG_VAR", "sub.mk:1", "sub-val", "vars")
+        check(subrow is not None,
               f"case24: sub-make's own assignment recorded with sub.mk loc")
-        noise = [row for row in mv if row[0] not in
-                 ("ORIG_VAR", "SHELLVAR", "EXPVAR", "MAKEFLAGS", "MAKELEVEL",
-                  "MFLAGS", "MAKE")]
-        check(not any("PATH" == n for n, *_ in mv),
-              f"case24: export-prefix replay is suppressed (no PATH rows; "
-              f"extra rows: {noise[:8]})")
+        check(subrow is not None and subrow[6] == "all",
+              f"case24: sub-make parse anchored to the spawning recipe edge "
+              f"(edge_out={subrow[6] if subrow else None!r})")
+        check(not any("PATH" == row[0] for row in mv),
+              f"case24: export-prefix replay is suppressed (no PATH rows)")
+        # Same build WITHOUT --vars: silence.
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE24B", "-C", str(vt), "--", "make"],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 0,
+              f"case24: untraced box exits 0 (got {r.returncode})")
+        sp24b = latest_sqlar(m)
+        con = sqlite3.connect(f"file:{sp24b}?mode=ro", uri=True)
+        try:
+            n_off = con.execute("SELECT count(*) FROM makevar").fetchone()[0]
+        finally:
+            con.close()
+        check(n_off == 0,
+              f"case24: variable tracing is OFF by default ({n_off} rows "
+              f"recorded without --vars)")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
