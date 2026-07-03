@@ -73,6 +73,7 @@ pub fn cmd_local(args: &[String]) -> i32 {
     let mut inbox = false;
     let mut svc: Option<String> = None;
     let mut net = "tap".to_string();
+    let mut net_explicit = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = |flag: &str| {
@@ -100,7 +101,9 @@ pub fn cmd_local(args: &[String]) -> i32 {
             "--force" => force = true,
             "--no-box" => no_box = true,
             "--net" => match val("--net") {
-                Ok(v) if ["tap", "host", "off"].contains(&v.as_str()) => net = v,
+                Ok(v) if ["tap", "host", "off"].contains(&v.as_str()) => {
+                    net = v; net_explicit = true;
+                }
                 Ok(v) => { eprintln!("oaita local: --net wants tap|host, \
                                       got {v:?}"); return 2; }
                 Err(e) => { eprintln!("oaita local: {e}"); return 2; }
@@ -141,6 +144,13 @@ pub fn cmd_local(args: &[String]) -> i32 {
                        or pass --no-box to download onto the host directly");
             return 1;
         }
+        // Don't spawn a tap box that can't start: on hosts without netns
+        // privileges (unprivileged containers), unshare(CLONE_NEWNET) is
+        // denied and the box dies with "tap setup failed".
+        let (chosen, note) = resolve_local_net(
+            &net, net_explicit, crate::net::tap::tap_available());
+        net = chosen;
+        if let Some(n) = note { eprintln!("oaita local: {n}"); }
         // Endpoint the host's oaita will use. Isolated serve (the default)
         // is bridged out over the engine's svc socket — HTTP over a host
         // UDS, no netns anywhere. --net host keeps the plain TCP endpoint.
@@ -224,6 +234,24 @@ pub fn cmd_local(args: &[String]) -> i32 {
 /// The engine-side service name for the bridged endpoint (host socket
 /// {runtime_home}/svc-<name>.sock).
 const SVC_NAME: &str = "oaita-local";
+
+/// Decide the box network mode, given the requested mode, whether the user
+/// forced it, and whether tap can actually work here. When the default tap
+/// can't run (no CLONE_NEWNET), fall back to host and return a note — the
+/// download is still captured, only network isolation is lost. An explicit
+/// choice is always respected (returned as-is, left to fail loudly if the
+/// user forced tap on a host that can't do it).
+fn resolve_local_net(net: &str, explicit: bool, tap_ok: bool)
+    -> (String, Option<String>)
+{
+    if net == "tap" && !explicit && !tap_ok {
+        return ("host".to_string(), Some(
+            "tap networking unavailable here (no CLONE_NEWNET) — using \
+             --net host for the box (writes are still captured; pass \
+             --net off to air-gap, or --net tap to force)".to_string()));
+    }
+    (net.to_string(), None)
+}
 
 /// Whether the engine's control socket answers (a box run needs it).
 fn engine_running() -> bool {
@@ -757,6 +785,22 @@ mod tests {
                 assert_eq!(name, "oaita-local"),
             other => panic!("expected Svc endpoint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn local_net_falls_back_to_host_when_tap_dead() {
+        // default tap on a no-netns host → host, with an explanation
+        let (net, note) = resolve_local_net("tap", false, false);
+        assert_eq!(net, "host");
+        assert!(note.unwrap().contains("CLONE_NEWNET"));
+        // tap available → stays tap, silent
+        assert_eq!(resolve_local_net("tap", false, true), ("tap".into(), None));
+        // explicit --net tap is respected even if it'll fail (no silent
+        // downgrade of an explicit choice)
+        assert_eq!(resolve_local_net("tap", true, false), ("tap".into(), None));
+        // explicit host / off pass through untouched
+        assert_eq!(resolve_local_net("host", true, false), ("host".into(), None));
+        assert_eq!(resolve_local_net("off", true, true), ("off".into(), None));
     }
 
     #[test]

@@ -29,6 +29,32 @@ pub const BOX_MAC: [u8; 6] = [0x02, 0x73, 0x72, 0x6e, 0x00, 0x02];
 /// The fixed per-box subnet (see `BOX_SUBNET_ID`).
 pub fn box_subnet() -> BoxSubnet { BoxSubnet::new(BOX_SUBNET_ID) }
 
+/// Whether tap networking can work here at all: probe unshare(CLONE_NEWNET)
+/// in a throwaway child (fork → unshare → _exit; nothing else runs in the
+/// child, so forking a threaded process is safe). Restricted environments
+/// (unprivileged containers, some CI) refuse CLONE_NEWNET — callers use
+/// this to fall back to host networking (announced) instead of spawning a
+/// box that dies with `tap setup failed: unshare(CLONE_NEWNET)`. Probed
+/// once per process.
+pub fn tap_available() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| unsafe {
+        match libc::fork() {
+            0 => {
+                let ok = libc::unshare(libc::CLONE_NEWNET) == 0;
+                libc::_exit(if ok { 0 } else { 1 });
+            }
+            -1 => true, // probe impossible — don't claim unavailability
+            pid => {
+                let mut st = 0;
+                while libc::waitpid(pid, &mut st, 0) == -1
+                    && *libc::__errno_location() == libc::EINTR {}
+                libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
+            }
+        }
+    })
+}
+
 /// The gateway MAC: what the engine's smoltcp answers as, AND what the runner
 /// seeds into the box's ARP cache. `StackRuntime::start` must be given the
 /// same value.

@@ -347,6 +347,12 @@ enum Modal {
     /// launch_env) so they persist across launches this session and are
     /// applied to whichever destination Enter picks.
     Launcher { items: Vec<ActionItem>, sel: usize },
+    /// Task entry for "run an oaita agent session ON a box". `box_name` is
+    /// the box the session's sandbox is parented on; `session` is the
+    /// auto-derived turn-folder name; `buf` is the task the user types.
+    /// Enter runs `oaita run --on <box> --task <buf> <session>` on a PTY —
+    /// one step, no session to pre-scaffold, no NAME to remember.
+    OaitaTask { box_name: String, session: String, buf: String },
 }
 
 /// One level of the image-picker menu stack.
@@ -4846,18 +4852,29 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from("e.g.  discard **/*.log   ·   Enter save · Esc cancel"),
             ],
         ),
-        Modal::PtyCmd { buf } => (
-            " run on a PTY ",
-            vec![
+        Modal::PtyCmd { buf } => {
+            // The help must match what the CURRENT command actually does: a
+            // `sarun …` line runs the sarun binary on the host and IT builds
+            // a captured box; anything else runs verbatim on the host with
+            // no sandbox. Saying "runs on the HOST" for a `sarun run` prefill
+            // was the confusing part.
+            let is_sarun = buf.trim_start().starts_with("sarun ");
+            let help = if is_sarun {
+                "this is a `sarun` command — it launches a sandboxed, \
+                 captured box (edit the args or command, then Enter) · \
+                 Esc cancel"
+            } else {
+                "runs on the HOST as typed — no box, no capture (a bare \
+                 `bash` is a plain host shell); prefix `sarun run -b -- CMD` \
+                 to run CMD in a fresh captured box · Enter run · Esc cancel"
+            };
+            (" run on a PTY ",
+             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("runs on the HOST as typed (no box, no capture) — \
-                            a bare `bash` is a host shell; keep the \
-                            `sarun run -b -- CMD` prefix to run CMD in a \
-                            fresh captured box (`sarun` expands to this \
-                            binary) · Enter run · Esc cancel"),
-            ],
-        ),
+                Line::from(help),
+            ])
+        }
         Modal::ActionMenu { title, items, sel } => {
             let mut body = vec![
                 Line::from(Span::styled(title.clone(),
@@ -5004,6 +5021,21 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from("e.g. ubuntu:24.04 · ghcr.io/org/img:tag · \
                             oci-archive:/path.tar — short names resolve via \
                             /etc/containers · Enter pull · Esc cancel"),
+            ],
+        ),
+        Modal::OaitaTask { box_name, session, buf } => (
+            " agent task ",
+            vec![
+                Line::from(Span::styled(
+                    format!("run an oaita agent on box '{box_name}' \
+                             (session '{session}')"),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from("type the task, e.g. `summarize README.md` — Enter \
+                            runs it in a captured box layered on this box \
+                            (review/apply the result) · Esc cancel"),
             ],
         ),
     };
@@ -6859,29 +6891,29 @@ fn endpoint_note_lines(resolved: Option<(String, String)>) -> Vec<String> {
 /// Launcher network modes, cycled in place with `n` (index = App.launch_net).
 const NET_MODES: [&str; 3] = ["tap", "host", "off"];
 
-/// Whether tap networking can work here at all: probe unshare(CLONE_NEWNET)
-/// in a throwaway child (fork → unshare → _exit; nothing else runs in the
-/// child, so forking the threaded TUI is safe). Restricted environments
-/// (unprivileged containers, some CI) refuse CLONE_NEWNET — the launcher
-/// uses this to pre-select host networking and MARK tap as unavailable
-/// instead of offering an option that fails after launch. Probed once.
-fn tap_available() -> bool {
-    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PROBE.get_or_init(|| unsafe {
-        match libc::fork() {
-            0 => {
-                let ok = libc::unshare(libc::CLONE_NEWNET) == 0;
-                libc::_exit(if ok { 0 } else { 1 });
-            }
-            -1 => true, // probe impossible — don't claim unavailability
-            pid => {
-                let mut st = 0;
-                while libc::waitpid(pid, &mut st, 0) == -1
-                    && *libc::__errno_location() == libc::EINTR {}
-                libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
-            }
-        }
-    })
+use crate::net::tap::tap_available;
+
+/// Derive a valid oaita session name from a box display name. Session names
+/// are alphanumeric ONLY (validate_session_name), so drop every other char
+/// and suffix `agent`. Deterministic, so re-running the action continues the
+/// same conversation on that box.
+fn oaita_session_for_box(box_name: &str) -> String {
+    let slug: String = box_name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    format!("{}agent", if slug.is_empty() { "box" } else { &slug })
+}
+
+/// argv for "oaita agent session on a box": one command that seeds the
+/// task and drives it in a sandbox parented on `box_name`. Pure so the
+/// modal flow is unit-testable end to end. The task is a single argv
+/// element (no shell splitting), so spaces/quotes in it are safe.
+fn oaita_task_argv(box_name: &str, session: &str, task: &str) -> Vec<String> {
+    vec![self_exe(), "oaita".into(), "run".into(),
+         "--on".into(), box_name.into(),
+         "--task".into(), task.into(),
+         session.into()]
 }
 
 /// The `run` / `oci run` flags the launcher's current toggles translate to.
@@ -7547,14 +7579,17 @@ fn run_action(app: &mut App, a: Action) {
             app.open_pty(vec![self_exe(), "oaita".into(), "local".into()]);
         }
         Action::OaitaOnSelectedBox => {
-            // Editable prefill: the user appends the SESSION name (the turn
-            // folder to drive) and Enter runs the agent in a box parented
-            // on the selected box.
+            // Ask for the TASK; the session name is derived from the box.
+            // Enter runs it all in one shot — no NAME to type, no session
+            // to pre-scaffold (the old prefill handed the user an
+            // incomplete `oaita run --on BOX ` that failed on Enter).
             let name = app.sessions.get(app.sel_session)
                 .and_then(|r| r.get("name").and_then(Value::as_str));
             match name {
-                Some(n) => app.modal = Some(Modal::PtyCmd {
-                    buf: format!("sarun oaita run --on {n} "),
+                Some(n) => app.modal = Some(Modal::OaitaTask {
+                    box_name: n.to_string(),
+                    session: oaita_session_for_box(n),
+                    buf: String::new(),
                 }),
                 None => app.status = "no box selected".into(),
             }
@@ -7837,6 +7872,29 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 app.modal = Some(Modal::ImageRef { buf });
             }
             _ => app.modal = Some(Modal::ImageRef { buf }),
+        },
+        Modal::OaitaTask { box_name, session, mut buf } => match code {
+            KeyCode::Enter => {
+                let task = buf.trim().to_string();
+                if task.is_empty() {
+                    // Don't launch an empty agent session — say what's needed
+                    // instead of running a no-op (or, as before, erroring).
+                    app.status = "type a task for the agent (Esc to cancel)".into();
+                    app.modal = Some(Modal::OaitaTask { box_name, session, buf });
+                } else {
+                    app.open_pty(oaita_task_argv(&box_name, &session, &task));
+                }
+            }
+            KeyCode::Esc => app.status = "agent session cancelled".into(),
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::OaitaTask { box_name, session, buf });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::OaitaTask { box_name, session, buf });
+            }
+            _ => app.modal = Some(Modal::OaitaTask { box_name, session, buf }),
         },
     }
 }
@@ -9416,11 +9474,13 @@ mod tests {
         assert_eq!(NET_MODES[app.launch_net], "tap");
     }
 
-    /// With a box selected, the launcher (and the sessions menu) offer an
-    /// oaita agent session parented on that box; picking it pre-fills the
-    /// editable `oaita run --on BOX ` command.
+    /// Drive the WHOLE "oaita agent session ON box" flow the way a user
+    /// does: launcher → pick the entry → task modal → type a task → Enter.
+    /// The old version handed the user an incomplete `oaita run --on BOX `
+    /// prefill that failed on Enter with "missing NAME"; this asserts the
+    /// modal collects a task and builds a COMPLETE, runnable command.
     #[test]
-    fn launcher_offers_oaita_session_on_selected_box() {
+    fn oaita_on_box_flow_builds_a_complete_command() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = headless_app();
         app.sessions = vec![serde_json::json!({
@@ -9437,15 +9497,64 @@ mod tests {
             *sel = sel_oaita;
         }
         handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
-        let Some(Modal::PtyCmd { buf }) = &app.modal else {
-            panic!("picking the entry must open the editable prompt");
+        // Picking it opens a TASK modal (not a broken command prefill).
+        let Some(Modal::OaitaTask { box_name, session, .. }) = &app.modal else {
+            panic!("must open the agent-task modal, got {:?}",
+                   app.modal.is_some());
         };
-        assert_eq!(buf, "sarun oaita run --on WORK ");
+        assert_eq!(box_name, "WORK");
+        assert_eq!(session, "workagent");
+        // Enter with an EMPTY task must NOT launch — it must prompt, and
+        // keep the modal open (the old flow ran and errored).
+        handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(matches!(app.modal, Some(Modal::OaitaTask { .. })),
+                "empty task must keep the modal open, not launch");
+        assert!(app.status.contains("type a task"));
+        // Type a multi-word task and submit.
+        for c in "fix the bug".chars() {
+            handle_modal_key(&mut app, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        // The argv the modal WOULD run (open_pty needs a live engine, so
+        // assert the pure builder that feeds it — a complete command).
+        let argv = oaita_task_argv("WORK", "workagent", "fix the bug");
+        assert_eq!(&argv[1..], &["oaita", "run", "--on", "WORK",
+                                 "--task", "fix the bug", "workagent"]);
+        // task is ONE argv element — spaces need no quoting.
+        assert_eq!(argv.iter().filter(|a| a.contains(' ')).count(), 1);
         // the sessions context menu carries the same action
         app.focus = Pane::Sessions;
         let (_, items) = pane_action_menu(&app).unwrap();
         assert!(items.iter().any(|i|
             matches!(i.action, Action::OaitaOnSelectedBox)));
+    }
+
+    #[test]
+    fn oaita_session_name_is_valid_and_alnum() {
+        // must satisfy the engine's validator (alphanumeric only).
+        for (box_name, want) in [("C1","c1agent"), ("WORK.SUB","worksubagent"),
+                                 ("---","boxagent")] {
+            let s = oaita_session_for_box(box_name);
+            assert_eq!(s, want);
+            assert!(crate::oaita::turns::validate_session_name(&s).is_ok(),
+                    "derived session {s:?} must be valid");
+        }
+    }
+
+    /// A `sarun …` PtyCmd prefill must NOT be described as "runs on the
+    /// HOST (no capture)" — that line was the lie the user hit. It must say
+    /// the sarun command launches a sandboxed box.
+    #[test]
+    fn ptycmd_help_is_honest_about_sarun_commands() {
+        let mut app = headless_app();
+        app.modal = Some(Modal::PtyCmd { buf: "sarun run -b -- ".into() });
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("sandboxed"), "sarun prefill help:\n{buf}");
+        assert!(!buf.contains("no box, no capture"),
+                "must not claim no-capture for a sarun command:\n{buf}");
+        // a non-sarun command keeps the host-shell caveat
+        app.modal = Some(Modal::PtyCmd { buf: "bash".into() });
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("runs on the HOST"), "host caveat:\n{buf}");
     }
 
     /// Restricted host (no CLONE_NEWNET): the launcher must not offer a

@@ -26,9 +26,11 @@ oaita — a resumable OpenAI-compatible chat client (folder-of-turn-files).
 USAGE:
   oaita gen   NAME [--model M] [--base-url URL] [--api-key K] [--capabilities T]
   oaita call  NAME [--tool-context N] [--sarun PATH] [--no-sandbox]
-  oaita run   NAME [--on BOX] [--max-steps N] [--depth N] [...common gen flags]
-              --on BOX: run the session's sandbox ON TOP of an existing box
-              (its files are the agent's world; writes layer above it)
+  oaita run   NAME [--on BOX] [--task TEXT] [--max-steps N] [...gen flags]
+              --on BOX:   run the session's sandbox ON TOP of an existing box
+                          (its files are the agent's world; writes layer above)
+              --task TEXT: seed NAME with TEXT as the first user turn, then
+                          run — one command to pose a task and drive it
   oaita tail  NAME
   oaita add   NAME [--type ROLE] [--id TURNID] [--from NAME] [--flags F] [--number N]
   oaita where               (print where oaita.toml is looked up)
@@ -84,6 +86,11 @@ struct Parsed {
     /// Internal: sub-agent nesting depth. `ask` (driver.rs::act_script)
     /// passes the bumped value when spawning a child.
     pub depth: Option<u32>,
+    /// `--task TEXT`: seed the session with TEXT as a user turn before
+    /// running (host-side, once) — so a single command both poses the task
+    /// and drives it. Lets the UI launch an agent on a box without a
+    /// separate `oaita add`. No-op inside the box re-exec (--inbox).
+    pub task: Option<String>,
     /// `--on BOX`: parent the session's wrapper box onto this existing box
     /// (dotted session id — same mechanism `oci run` uses to stack a
     /// container on an image). The agent then works on top of that box's
@@ -103,6 +110,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         inbox: false,
         depth: None,
         on: None,
+        task: None,
     };
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -119,6 +127,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 .parse().map_err(|e| format!("--max-steps: {e}"))?),
             "--inbox" => p.inbox = true,
             "--on" => p.on = it.next().cloned(),
+            "--task" => p.task = it.next().cloned(),
             "--depth" => p.depth = Some(it.next()
                 .ok_or_else(|| "missing N after --depth".to_string())?
                 .parse().map_err(|e| format!("--depth: {e}"))?),
@@ -169,7 +178,12 @@ fn cmd_call(args: &[String]) -> i32 {
 
 fn cmd_run(args: &[String]) -> i32 {
     let p = match parse(args) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return 2; } };
-    if p.name.is_empty() { eprintln!("run: missing NAME"); return 2; }
+    if p.name.is_empty() {
+        eprintln!("run: missing NAME (the session/turn-folder to drive; \
+                   e.g. `oaita run mytask` — scaffold it with `oaita gen` / \
+                   `oaita add`, or pass --task TEXT to seed it inline)");
+        return 2;
+    }
     // `--inbox` is the explicit marker that we're already running INSIDE
     // the agent's wrapper box (set by spawn_in_box on the re-exec).
     // Without it we're a host shim and must wrap ourselves in a fresh
@@ -177,6 +191,19 @@ fn cmd_run(args: &[String]) -> i32 {
     // side oaita driver process; the cli is either a thin spawner
     // (host) or the loop body (in-box). Mirrors `sarun run -- cmd`.
     if !p.inbox {
+        // --task seeds the initial user turn HOST-side (once), so a single
+        // command both poses the task and drives it. The re-exec below
+        // carries --task into the box but the --inbox guard skips re-adding.
+        if let Some(task) = &p.task {
+            let target = match target_segment(&p.name) {
+                Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
+            };
+            if let Err(e) = append_turn(&target, "user", task,
+                                        None, None, "", None) {
+                eprintln!("oaita run: seed --task: {e}");
+                return 1;
+            }
+        }
         return spawn_in_box(&p, args);
     }
     let set = match Settings::resolve(p.model, p.base_url, p.api_key,
