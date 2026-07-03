@@ -105,6 +105,17 @@ def main():
               "detail shows the assignment as written (unexpanded rhs)")
         check("→ ORIG_VAR" in txt and "→ OTHER" in txt,
               "detail lists both dereferenced variables")
+        # the value body is painted (background) so its exact extent —
+        # trailing whitespace included — is visible
+        val_bg = ""
+        for row in range(40):
+            line = "".join(vt.buffer[row][c].data for c in range(160))
+            if "pre-aa bb-" in line:
+                col = line.index("pre-aa bb-")
+                val_bg = vt.buffer[row][col].bg
+                break
+        check(val_bg not in ("", "default"),
+              f"value text is painted with a background (bg={val_bg!r})")
         send("\r", 0.8)          # focus detail items (first = ORIG_VAR)
         send("j", 0.5)           # second item = OTHER
         send("\r", 1.0)          # follow it

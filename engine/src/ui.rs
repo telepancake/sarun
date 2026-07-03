@@ -4734,11 +4734,17 @@ fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
         }
     };
     let focused = app.right_focused;
+    // Section headers as stand-out chips; rhs/value bodies get a painted
+    // background so the value's exact extent — trailing whitespace included —
+    // is visible.
+    let header = Style::default().fg(Color::Black).bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let body_bg = Style::default().bg(Color::Rgb(40, 40, 60));
     if !rhs.is_empty() {
         out.push(Line::from(""));
-        out.push(Line::from(Span::styled("assignment (as written)", bold)));
+        out.push(Line::from(Span::styled(" assignment (as written) ", header)));
         for l in rhs.lines() {
-            out.push(Line::from(l.to_string()));
+            out.push(Line::from(Span::styled(l.to_string(), body_bg)));
         }
         let ref_names: Vec<&str> =
             refs.split_whitespace().filter(|r| *r != name).collect();
@@ -4756,16 +4762,18 @@ fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
         }
     }
     out.push(Line::from(""));
-    out.push(Line::from(Span::styled("value", bold)));
+    out.push(Line::from(Span::styled(" value ", header)));
     for l in val.lines() {
-        out.push(Line::from(l.to_string()));
+        out.push(Line::from(Span::styled(l.to_string(), body_bg)));
     }
     if val.is_empty() {
         out.push(Line::from(Span::styled("(empty)", dim)));
     }
     out.push(Line::from(""));
-    out.push(Line::from(Span::styled(
-        format!("── every recorded assignment of {name} (Enter jumps) ──"), dim)));
+    out.push(Line::from(vec![
+        Span::styled(format!(" every recorded assignment of {name} "), header),
+        Span::styled("  (Enter jumps)", dim),
+    ]));
     for (ri, r) in app.vars_rows.iter().enumerate() {
         if r.get("name").and_then(Value::as_str) != Some(name) {
             continue;
