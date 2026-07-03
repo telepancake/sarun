@@ -1336,9 +1336,29 @@ impl Evaluator {
         writeln!(tf, "    {{")?;
         writeln!(tf, "      \"name\": \"{name}\",")?;
         writeln!(tf, "      \"operation\": \"assign\",")?;
-        write!(tf, "      \"value\": \"{var:?}\"")?;
+        // sarun: emit the assignment LOCATION and the value's SOURCE form as
+        // readable strings (was the Variable's Rust debug dump — unusable for
+        // the "where did this value go wrong" hunt the trace exists for).
+        {
+            let g = var.read();
+            if let Some(loc) = g.loc().as_ref() {
+                writeln!(tf, "      \"loc\": \"{loc}\",")?;
+            }
+            let val = g.string().unwrap_or(std::borrow::Cow::Borrowed(b"?"));
+            let escaped: String = String::from_utf8_lossy(&val)
+                .chars()
+                .flat_map(|c| match c {
+                    '"' => vec!['\\', '"'],
+                    '\\' => vec!['\\', '\\'],
+                    '\n' => vec!['\\', 'n'],
+                    '\t' => vec!['\\', 't'],
+                    c => vec![c],
+                })
+                .collect();
+            writeln!(tf, "      \"value\": \"{escaped}\"")?;
+        }
         if let Some(definition) = var.read().definition().clone() {
-            writeln!(tf, ",\n")?;
+            writeln!(tf, ",")?;
             writeln!(tf, "      \"value_stack\": [")?;
             definition.print_json_trace(tf, 8)?;
             writeln!(tf, "      ]")?;
