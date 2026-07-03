@@ -217,6 +217,11 @@ fn read_bootstrap_makefile(
 /// visible (GNU make's remake-the-makefile loop).
 struct RunKatiResult {
     remake_active: bool,
+    /// OPTIONAL (-include) remake targets that did NOT materialize this
+    /// pass — the re-run passes them back as `noremake` so they aren't
+    /// attempted again (GNU proceeds without an unmakeable optional
+    /// include instead of looping).
+    failed_optional: Vec<Vec<u8>>,
 }
 
 fn run_kati(
@@ -241,6 +246,9 @@ fn run_kati(
     // doesn't do this automatically — without it that filter never matches and
     // a self-recursing `$(MAKE)` rule spins forever.
     cmdline_flags: &[OsString],
+    // Optional includes known unmakeable from a previous remake pass —
+    // don't queue them again.
+    noremake: &std::collections::HashSet<Vec<u8>>,
 ) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
     // sarun: the Evaluator seeds working_dir from the process cwd; override it
@@ -421,7 +429,7 @@ fn run_kati(
     // make_main will then re-exec the engine so the second parse sees
     // the freshly-generated content. If no rule applies, raise the
     // canonical error and exit.
-    let mut remake_targets: Vec<Symbol> = Vec::new();
+    let mut remake_targets: Vec<(Symbol, bool)> = Vec::new();
     {
         let pending = std::mem::take(&mut ev.pending_remake_includes);
         for (loc, name, required) in &pending {
@@ -438,14 +446,17 @@ fn run_kati(
                         .matches(&name.as_bytes())
                     })
             });
-            if producible {
-                remake_targets.push(sym);
+            if producible
+                && (*required || !noremake.contains(name.as_bytes()))
+            {
+                remake_targets.push((sym, *required));
             } else if *required {
                 let pat_str = String::from_utf8_lossy(name.as_bytes());
                 eprintln!("{loc}: {pat_str}: No such file or directory");
                 std::process::exit(2);
             }
-            // A missing OPTIONAL include with no rule: GNU tolerates it.
+            // A missing OPTIONAL include with no rule (or one already known
+            // unmakeable): GNU tolerates it.
         }
     }
     let remake_active = !remake_targets.is_empty();
@@ -457,7 +468,7 @@ fn run_kati(
         // invocation; the user's real targets get built in the
         // re-exec'd process.
         let dep_targets = if remake_active {
-            remake_targets.clone()
+            remake_targets.iter().map(|(s, _)| *s).collect()
         } else {
             targets.to_owned()
         };
@@ -601,10 +612,47 @@ fn run_kati(
             bytes::Bytes::from_static(b"*execute*"),
             Loc::default(),
         );
-        kati::exec::exec(nodes, &mut ev)?;
+        if remake_active {
+            // GNU tolerates a failed remake of an OPTIONAL (-include)
+            // makefile: build required and optional include targets in
+            // separate passes so an optional one that can't be built (no
+            // pickable rule, failing recipe) never aborts the make — the
+            // re-parse simply proceeds without it.
+            let required: std::collections::HashSet<Symbol> = remake_targets
+                .iter().filter(|(_, req)| *req).map(|(s, _)| *s).collect();
+            let (req_nodes, opt_nodes): (Vec<_>, Vec<_>) = nodes
+                .into_iter()
+                .partition(|(s, _)| required.contains(s));
+            if !req_nodes.is_empty() {
+                kati::exec::exec(req_nodes, &mut ev)?;
+            }
+            for node in opt_nodes {
+                // optional include not remakable — GNU carries on, silently
+                let _ = kati::exec::exec_opts(vec![node], &mut ev, true);
+            }
+        } else {
+            kati::exec::exec(nodes, &mut ev)?;
+        }
         ev.finish()?;
     }
-    Ok(RunKatiResult { remake_active })
+    // Optional remake targets that did not materialize are reported back so
+    // the re-run skips them (otherwise a permanently-unmakeable -include
+    // would re-queue every pass until the depth cap).
+    let failed_optional: Vec<Vec<u8>> = remake_targets
+        .iter()
+        .filter(|(sym, required)| {
+            if *required {
+                return false;
+            }
+            let b = sym.as_bytes();
+            let p = std::path::Path::new(std::ffi::OsStr::from_bytes(&b));
+            let abs = if p.is_absolute() { p.to_path_buf() }
+                      else { working_dir.join(p) };
+            !abs.exists()
+        })
+        .map(|(sym, _)| sym.as_bytes().to_vec())
+        .collect();
+    Ok(RunKatiResult { remake_active, failed_optional })
 }
 
 /// Walk the kati dep graph reachable from `roots` and ship one
@@ -1086,7 +1134,17 @@ pub fn make_main(argv: &[String]) -> i32 {
     let seed_env: Vec<(std::ffi::OsString, std::ffi::OsString)> =
         std::env::vars_os().collect();
     let cmdline_flags = extract_long_flags(argv);
-    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags) {
+    // Optional includes a previous remake pass could not build (colon-joined,
+    // via the re-exec env) — skip re-queueing them this pass.
+    let noremake: std::collections::HashSet<Vec<u8>> =
+        std::env::var_os("SARUN_KATI_NOREMAKE")
+            .map(|v| std::os::unix::ffi::OsStrExt::as_bytes(v.as_os_str())
+                .split(|&b| b == b':')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_vec())
+                .collect())
+            .unwrap_or_default();
+    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, &noremake) {
         Ok(r) => r,
         Err(e) => {
             // Recipe failure already printed its `*** [target] Error N`; just
@@ -1124,6 +1182,19 @@ pub fn make_main(argv: &[String]) -> i32 {
         std::os::unix::process::CommandExt::arg0(&mut cmd, &argv0);
         cmd.args(argv_os.iter().skip(1));
         cmd.env("SARUN_KATI_REMAKE_DEPTH", (depth + 1).to_string());
+        // Carry forward optional includes that failed to remake, unioned
+        // with the ones we inherited, so the next pass skips them.
+        if !run_result.failed_optional.is_empty() || !noremake.is_empty() {
+            let mut all: Vec<Vec<u8>> = noremake.iter().cloned().collect();
+            for f in &run_result.failed_optional {
+                if !all.contains(f) {
+                    all.push(f.clone());
+                }
+            }
+            let joined = all.join(&b':');
+            cmd.env("SARUN_KATI_NOREMAKE",
+                    std::ffi::OsStr::from_bytes(&joined));
+        }
         let err = std::os::unix::process::CommandExt::exec(&mut cmd);
         eprintln!("*** kati: failed to re-exec for remake: {err}");
         return 2;
@@ -1279,10 +1350,16 @@ pub fn make_builtin(
     // Instead we drop the makefile cache (so the regenerated include is re-read)
     // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
     let cmdline_flags = extract_long_flags(argv);
-    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags);
+    let mut noremake: std::collections::HashSet<Vec<u8>> = Default::default();
+    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, &noremake);
     let mut remake_depth = 0u32;
     while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
         remake_depth += 1;
+        if let Ok(r) = &result {
+            // Optional includes that failed to remake are skipped on the
+            // re-run instead of re-queued forever.
+            noremake.extend(r.failed_optional.iter().cloned());
+        }
         // Drop BOTH caches: the makefile cache (so the regenerated include is
         // re-parsed) AND the glob cache (eval_include probes existence via
         // glob(); the first parse cached the missing include as absent, which
@@ -1290,7 +1367,7 @@ pub fn make_builtin(
         // forever).
         kati::file_cache::clear();
         kati::fileutil::clear_glob_cache();
-        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags);
+        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, &noremake);
     }
 
     kati::exec::set_recipe_out(prev_out);

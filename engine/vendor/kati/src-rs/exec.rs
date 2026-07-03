@@ -146,6 +146,10 @@ struct Executor<'a> {
     shell: Bytes,
     shellflag: &'static [u8],
     num_commands: u64,
+    /// Suppress the "*** [target] Error N" banner (and no-rule notes) —
+    /// used when remaking OPTIONAL includes, whose failures GNU swallows
+    /// silently.
+    quiet_failures: bool,
 }
 
 // ── Parallel scheduler ───────────────────────────────────────────────────────
@@ -376,6 +380,7 @@ impl<'a> Executor<'a> {
             shell,
             shellflag,
             num_commands: 0,
+            quiet_failures: false,
         })
     }
 
@@ -478,8 +483,10 @@ impl<'a> Executor<'a> {
             (g.has_rule, g.is_phony)
         };
         if !has_rule && output_timestamp.is_none() && !is_phony {
-            for note in &n.lock().no_rule_notes {
-                crate::exec::emit_recipe_err(&format!("*kati*: note: {note}"));
+            if !self.quiet_failures {
+                for note in &n.lock().no_rule_notes {
+                    crate::exec::emit_recipe_err(&format!("*kati*: note: {note}"));
+                }
             }
             if let Some(dep_sym) = graph[&sym].dependents.first() {
                 // Diagnosis aid: name the RULE whose prerequisite list produced
@@ -762,7 +769,9 @@ impl<'a> Executor<'a> {
                 emit_recipe_err(&format!("[{o}] Error {c} (ignored)"));
             }
             if let Some((o, code)) = run.failure {
-                emit_recipe_err(&format!("*** [{o}] Error {code}"));
+                if !self.quiet_failures {
+                    emit_recipe_err(&format!("*** [{o}] Error {code}"));
+                }
                 if self.ce.ev.delete_on_error {
                     let is_phony = graph[&run.output].node.lock().is_phony;
                     if !is_phony {
@@ -807,7 +816,17 @@ impl<'a> Executor<'a> {
 }
 
 pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
+    exec_opts(roots, ev, false)
+}
+
+/// exec with GNU's makefile-remake failure semantics available:
+/// `quiet_failures` suppresses the "*** [target] Error N" banner and the
+/// no-rule notes — callers remaking OPTIONAL includes swallow the Err too.
+pub fn exec_opts(
+    roots: Vec<NamedDepNode>, ev: &mut Evaluator, quiet_failures: bool,
+) -> Result<()> {
     let mut executor = Executor::new(ev)?;
+    executor.quiet_failures = quiet_failures;
     // One engine: a dependency-count scheduler with a worker cap. Parallel only
     // when -j>1 was explicitly requested; bounded by the engine slip pool when
     // one is advertised (sarun box), else by the local cap alone (standalone,

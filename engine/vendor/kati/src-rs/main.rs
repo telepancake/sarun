@@ -240,7 +240,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
     // with the same args — the second invocation parses with the
     // freshly-generated content visible. Guard against infinite
     // re-exec via SARUN_KATI_REMAKE_DEPTH (capped at 5).
-    let mut remake_targets: Vec<Symbol> = Vec::new();
+    let mut remake_targets: Vec<(Symbol, bool)> = Vec::new();
     {
         let pending = std::mem::take(&mut ev.pending_remake_includes);
         for (loc, name, required) in &pending {
@@ -254,8 +254,12 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
                             .matches(name.as_bytes())
                     })
             });
-            if producible {
-                remake_targets.push(sym);
+            let noremake_skip = !*required
+                && std::env::var("SARUN_KATI_NOREMAKE")
+                    .map(|v| v.split(':').any(|f| f.as_bytes() == name.as_bytes()))
+                    .unwrap_or(false);
+            if producible && !noremake_skip {
+                remake_targets.push((sym, *required));
             } else if *required {
                 // Missing required include with no matching rule. Emit a
                 // single line matching upstream kati's `error_loc!` shape;
@@ -282,7 +286,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
         // this invocation; the user's real targets get built in the
         // re-exec'd process.
         let dep_targets = if remake_active {
-            remake_targets.clone()
+            remake_targets.iter().map(|(s, _)| *s).collect()
         } else {
             targets.to_owned()
         };
@@ -305,14 +309,57 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
             );
             std::process::exit(2);
         }
-        // Build the remake targets.
+        // Build the remake targets. GNU tolerates a failed remake of an
+        // OPTIONAL (-include) makefile: build required and optional include
+        // targets in separate passes so an optional one that can't be built
+        // never aborts the make — the re-parse proceeds without it.
         {
             let _frame = ev.enter(
                 FrameType::Phase,
                 Bytes::from_static(b"*remake*"),
                 Loc::default(),
             );
-            kati::exec::exec(nodes, &mut ev)?;
+            let required: std::collections::HashSet<Symbol> = remake_targets
+                .iter().filter(|(_, req)| *req).map(|(s, _)| *s).collect();
+            let (req_nodes, opt_nodes): (Vec<_>, Vec<_>) = nodes
+                .into_iter()
+                .partition(|(s, _)| required.contains(s));
+            if !req_nodes.is_empty() {
+                kati::exec::exec(req_nodes, &mut ev)?;
+            }
+            for node in opt_nodes {
+                // optional include not remakable — GNU carries on, silently
+                let _ = kati::exec::exec_opts(vec![node], &mut ev, true);
+            }
+        }
+        // Optional remake targets that did NOT materialize are carried in
+        // SARUN_KATI_NOREMAKE so the re-exec'd pass skips them instead of
+        // re-queueing forever (GNU proceeds without an unmakeable optional
+        // include).
+        {
+            let mut failed: Vec<String> = std::env::var("SARUN_KATI_NOREMAKE")
+                .map(|v| v.split(':').filter(|f| !f.is_empty())
+                     .map(str::to_string).collect())
+                .unwrap_or_default();
+            for (sym, required) in &remake_targets {
+                if *required {
+                    continue;
+                }
+                let b = sym.as_bytes();
+                let p = std::path::Path::new(OsStr::from_bytes(&b));
+                let abs = if p.is_absolute() { p.to_path_buf() }
+                          else { ev.working_dir.join(p) };
+                let name = String::from_utf8_lossy(&b).into_owned();
+                if !abs.exists() && !failed.contains(&name) {
+                    failed.push(name);
+                }
+            }
+            if !failed.is_empty() {
+                // SAFETY: single-threaded standalone path, pre-exec.
+                unsafe {
+                    std::env::set_var("SARUN_KATI_NOREMAKE", failed.join(":"));
+                }
+            }
         }
         // Re-exec ourselves with the same args. GLOB_CACHE et al. reset
         // naturally because it's a fresh process. Use current_exe() for

@@ -1925,7 +1925,12 @@ impl Filesystem for Overlay {
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
-        if !matches!(self.layer(&b, &rel), Layer::Absent) {
+        // Existence must use the MERGED view (resolve), the same one lookup
+        // serves — layer() consults only this box's upper + the raw host, so
+        // a path hidden by a parent-box whiteout / opaque dir / OCI
+        // no_host_fallback showed EEXIST here while lookup said ENOENT, and
+        // create_dir_all's mkdir→stat never reconciled.
+        if !matches!(self.resolve(bid, &rel), Layer::Absent) {
             return reply.error(Errno::EEXIST);
         }
         b.set_dir(&rel, mode, b.writer_for(req.pid()));
