@@ -154,12 +154,23 @@ impl Client {
 
     /// Stream Server-Sent-Events from `path`. The callback gets each `data:`
     /// payload (without the prefix); a sentinel "[DONE]" causes us to stop.
-    pub async fn post_stream<F>(&self, path: &str, mut body: Value, mut on_event: F)
+    pub async fn post_stream<F>(&self, path: &str, body: Value, on_event: F)
         -> Result<(), String>
     where F: FnMut(&str)
     {
-        // Caller sets stream=true on the body, but enforce it here too in case
-        // they forgot — streaming is the whole point of this method.
+        let resp = self.open_stream(path, body).await?;
+        pump_stream(resp, on_event).await
+    }
+
+    /// Send a streaming POST and check the status, returning the response
+    /// ready to pump frames from — or an Err carrying the reason. Splitting
+    /// this out from the frame loop lets a caller (the engine proxy) surface
+    /// an unreachable / refused / non-2xx upstream as a clean error BEFORE
+    /// committing to a 200 stream, instead of the opaque mid-stream "error
+    /// reading a body from connection" the box otherwise sees.
+    pub async fn open_stream(&self, path: &str, mut body: Value)
+        -> Result<Response<Incoming>, String>
+    {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("stream".into(), json!(true));
         }
@@ -175,26 +186,7 @@ impl Client {
             let preview = String::from_utf8_lossy(&body[..body.len().min(2048)]);
             return Err(format!("upstream {status}: {preview}"));
         }
-        let mut buf = Vec::<u8>::new();
-        while let Some(frame) = resp.body_mut().frame().await {
-            let frame = frame.map_err(|e| format!("stream frame: {e}"))?;
-            let Some(data) = frame.data_ref() else { continue; };
-            buf.extend_from_slice(data);
-            // Split on \n\n — SSE event delimiter.
-            loop {
-                let Some(pos) = find_double_newline(&buf) else { break; };
-                let event_bytes = buf.drain(..pos + 2).collect::<Vec<u8>>();
-                let event = String::from_utf8_lossy(&event_bytes);
-                for line in event.lines() {
-                    if let Some(rest) = line.strip_prefix("data:") {
-                        let payload = rest.trim_start();
-                        if payload == "[DONE]" { return Ok(()); }
-                        on_event(payload);
-                    }
-                }
-            }
-        }
-        Ok(())
+        Ok(resp)
     }
 
     async fn send(&self, path: &str, body: Value)
@@ -363,6 +355,51 @@ fn default_tls_connector() -> tokio_rustls::TlsConnector {
         .with_root_certificates(root_store)
         .with_no_client_auth();
     tokio_rustls::TlsConnector::from(Arc::new(config))
+}
+
+/// Join an error and its `source()` chain into one line. hyper's outer
+/// message is famously vague ("error reading a body from connection"); the
+/// real cause ("connection reset by peer", "unexpected EOF during chunk…")
+/// lives one or two `source()` links down. Surfacing it turns an
+/// undebuggable report into an actionable one.
+fn err_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(inner) = src {
+        let msg = inner.to_string();
+        if !s.ends_with(&msg) { s.push_str(": "); s.push_str(&msg); }
+        src = inner.source();
+    }
+    s
+}
+
+/// Pump SSE frames from an already-opened streaming response, invoking
+/// `on_event` with each `data:` payload until `[DONE]` or end of body.
+pub async fn pump_stream<F>(mut resp: Response<Incoming>, mut on_event: F)
+    -> Result<(), String>
+where F: FnMut(&str)
+{
+    let mut buf = Vec::<u8>::new();
+    while let Some(frame) = resp.body_mut().frame().await {
+        let frame = frame.map_err(|e| format!("stream frame: {}",
+            err_chain(&e)))?;
+        let Some(data) = frame.data_ref() else { continue; };
+        buf.extend_from_slice(data);
+        // Split on \n\n — SSE event delimiter.
+        loop {
+            let Some(pos) = find_double_newline(&buf) else { break; };
+            let event_bytes = buf.drain(..pos + 2).collect::<Vec<u8>>();
+            let event = String::from_utf8_lossy(&event_bytes);
+            for line in event.lines() {
+                if let Some(rest) = line.strip_prefix("data:") {
+                    let payload = rest.trim_start();
+                    if payload == "[DONE]" { return Ok(()); }
+                    on_event(payload);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One-shot helper for callers that just want to dial and stream.

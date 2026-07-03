@@ -236,16 +236,30 @@ async fn proxy_stream(proxy: Arc<Proxy>, box_id: i64, client: Client,
                       method: String, path: String, model: String,
                       body: Bytes) -> Response<Body>
 {
+    let req_json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    // Preflight: open the upstream stream and check its status BEFORE we
+    // commit a 200 to the box. A dead/unreachable/refused upstream (e.g. the
+    // svc:// model server isn't running) or a non-2xx now comes back as a
+    // clean 502 the box surfaces as "upstream: <reason>", instead of an
+    // opaque mid-stream "error reading a body from connection".
+    let resp = match client.open_stream(&path, req_json).await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("upstream: {e}");
+            log_call(&proxy, box_id, &method, &path, &model,
+                     502, &body, msg.as_bytes(), true);
+            return error_resp(StatusCode::BAD_GATEWAY, &msg);
+        }
+    };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, String>>();
     let proxy_clone = proxy.clone();
-    let req_json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let body_log = body.clone();
     let method_log = method.clone();
     let path_log = path.clone();
     let model_log = model.clone();
     tokio::spawn(async move {
         let mut collected = Vec::<u8>::new();
-        let res = client.post_stream(&path, req_json, |payload| {
+        let res = crate::oaita::client::pump_stream(resp, |payload| {
             let frame = format!("data: {payload}\n\n");
             collected.extend_from_slice(frame.as_bytes());
             let _ = tx.send(Ok(Bytes::from(frame)));
