@@ -5387,14 +5387,14 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             vec![
                 Line::from(Span::styled(
                     format!("run an oaita agent on box '{box_name}' \
-                             (session '{session}')"),
+                             (session '{session}', net {})", effective_net(app)),
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
                 Line::from(""),
                 Line::from(format!("{buf}_")),
                 Line::from(""),
                 Line::from("type the task, e.g. `summarize README.md` — Enter \
                             runs it in a captured box layered on this box \
-                            (review/apply the result) · Esc cancel"),
+                            (net via the Pty+ chip) · Esc cancel"),
             ],
         ),
     };
@@ -7294,17 +7294,30 @@ fn oaita_session_for_box(box_name: &str) -> String {
 /// task and drives it in a sandbox parented on `box_name`. Pure so the
 /// modal flow is unit-testable end to end. The task is a single argv
 /// element (no shell splitting), so spaces/quotes in it are safe.
-fn oaita_task_argv(box_name: &str, session: &str, task: &str) -> Vec<String> {
+fn oaita_task_argv(box_name: &str, session: &str, task: &str, net: &str)
+    -> Vec<String>
+{
     vec![self_exe(), "oaita".into(), "run".into(),
          "--on".into(), box_name.into(),
+         "--net".into(), net.into(),
          "--task".into(), task.into(),
          session.into()]
+}
+
+/// The network mode a launch should ACTUALLY use: the selected chip, but
+/// tap downgraded to host when tap can't work here (no CLONE_NEWNET). The
+/// launcher's chip auto-bump only fires when the launcher is opened; this
+/// resolves it for every spawn path (incl. the Sessions menu) so a box is
+/// never spawned with a tap that will fail. An explicit host/off is kept.
+fn effective_net(app: &App) -> &'static str {
+    let sel = NET_MODES[app.launch_net];
+    if sel == "tap" && !tap_available() { "host" } else { sel }
 }
 
 /// The `run` / `oci run` flags the launcher's current toggles translate to.
 /// `env` is only meaningful for `sarun run` (oci run has no -e).
 fn launch_flags(app: &App, env: bool) -> Vec<String> {
-    let mut f = vec!["--net".to_string(), NET_MODES[app.launch_net].to_string()];
+    let mut f = vec!["--net".to_string(), effective_net(app).to_string()];
     if env && app.launch_env { f.push("-e".into()); }
     f
 }
@@ -8293,7 +8306,8 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     app.status = "type a task for the agent (Esc to cancel)".into();
                     app.modal = Some(Modal::OaitaTask { box_name, session, buf });
                 } else {
-                    app.open_pty(oaita_task_argv(&box_name, &session, &task));
+                    let net = effective_net(app);
+                    app.open_pty(oaita_task_argv(&box_name, &session, &task, net));
                 }
             }
             KeyCode::Esc => app.status = "agent session cancelled".into(),
@@ -9927,9 +9941,10 @@ mod tests {
         }
         // The argv the modal WOULD run (open_pty needs a live engine, so
         // assert the pure builder that feeds it — a complete command).
-        let argv = oaita_task_argv("WORK", "workagent", "fix the bug");
+        let argv = oaita_task_argv("WORK", "workagent", "fix the bug", "host");
         assert_eq!(&argv[1..], &["oaita", "run", "--on", "WORK",
-                                 "--task", "fix the bug", "workagent"]);
+                                 "--net", "host", "--task", "fix the bug",
+                                 "workagent"]);
         // task is ONE argv element — spaces need no quoting.
         assert_eq!(argv.iter().filter(|a| a.contains(' ')).count(), 1);
         // the sessions context menu carries the same action
@@ -9937,6 +9952,26 @@ mod tests {
         let (_, items) = pane_action_menu(&app).unwrap();
         assert!(items.iter().any(|i|
             matches!(i.action, Action::OaitaOnSelectedBox)));
+    }
+
+    /// THE bug the user hit: picking "host" (or "off") in the Pty+ chip
+    /// must reach the oaita box's argv. Before, oaita run spawned its box
+    /// with no --net at all, so every choice collapsed to the default tap
+    /// and a no-netns host got "tap setup failed" even after selecting host.
+    #[test]
+    fn oaita_box_argv_carries_the_selected_network() {
+        let mut app = headless_app();
+        // host chip (index 1)
+        app.launch_net = 1;
+        let argv = oaita_task_argv("C1", "c1agent", "what os is this?",
+                                   effective_net(&app));
+        let i = argv.iter().position(|a| a == "--net").expect("--net present");
+        assert_eq!(argv[i + 1], "host", "host selection must reach the box");
+        // off chip (index 2)
+        app.launch_net = 2;
+        let argv = oaita_task_argv("C1", "c1agent", "x", effective_net(&app));
+        let i = argv.iter().position(|a| a == "--net").unwrap();
+        assert_eq!(argv[i + 1], "off", "off selection must reach the box");
     }
 
     #[test]

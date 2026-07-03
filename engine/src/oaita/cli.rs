@@ -26,11 +26,12 @@ oaita — a resumable OpenAI-compatible chat client (folder-of-turn-files).
 USAGE:
   oaita gen   NAME [--model M] [--base-url URL] [--api-key K] [--capabilities T]
   oaita call  NAME [--tool-context N] [--sarun PATH] [--no-sandbox]
-  oaita run   NAME [--on BOX] [--task TEXT] [--max-steps N] [...gen flags]
+  oaita run   NAME [--on BOX] [--task TEXT] [--net MODE] [--max-steps N] [...]
               --on BOX:   run the session's sandbox ON TOP of an existing box
                           (its files are the agent's world; writes layer above)
               --task TEXT: seed NAME with TEXT as the first user turn, then
                           run — one command to pose a task and drive it
+              --net MODE: off|tap|host network for the agent's box (default tap)
   oaita tail  NAME
   oaita add   NAME [--type ROLE] [--id TURNID] [--from NAME] [--flags F] [--number N]
   oaita where               (print where oaita.toml is looked up)
@@ -86,6 +87,11 @@ struct Parsed {
     /// Internal: sub-agent nesting depth. `ask` (driver.rs::act_script)
     /// passes the bumped value when spawning a child.
     pub depth: Option<u32>,
+    /// `--net MODE` (off|tap|host): network for the agent's wrapper box.
+    /// Forwarded to the outer `sarun run` — WITHOUT it the box always used
+    /// the default tap, so a host/off choice from the UI was silently
+    /// dropped and a no-netns host got "tap setup failed".
+    pub net: Option<String>,
     /// `--task TEXT`: seed the session with TEXT as a user turn before
     /// running (host-side, once) — so a single command both poses the task
     /// and drives it. Lets the UI launch an agent on a box without a
@@ -111,6 +117,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         depth: None,
         on: None,
         task: None,
+        net: None,
     };
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -128,6 +135,11 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             "--inbox" => p.inbox = true,
             "--on" => p.on = it.next().cloned(),
             "--task" => p.task = it.next().cloned(),
+            "--net" => match it.next().map(String::as_str) {
+                Some(m @ ("off" | "tap" | "host")) => p.net = Some(m.to_string()),
+                Some(m) => return Err(format!("--net wants off|tap|host, got {m:?}")),
+                None => return Err("missing MODE after --net".to_string()),
+            },
             "--depth" => p.depth = Some(it.next()
                 .ok_or_else(|| "missing N after --depth".to_string())?
                 .parse().map_err(|e| format!("--depth: {e}"))?),
@@ -258,7 +270,12 @@ fn spawn_in_box(p: &Parsed, original_args: &[String]) -> i32 {
             .unwrap_or_else(|_| "sarun".to_string())
     };
     let mut cmd = std::process::Command::new(&exe_path);
-    cmd.arg("run").arg("--api").arg(&target_box).arg("--");
+    cmd.arg("run");
+    // Forward the network mode to the OUTER `sarun run` that builds the box
+    // (the inner oaita, under --inbox, spawns nothing). Absent → sarun's own
+    // default (tap).
+    if let Some(net) = &p.net { cmd.arg("--net").arg(net); }
+    cmd.arg("--api").arg(&target_box).arg("--");
     cmd.arg("/proc/self/exe").arg("oaita").arg("run").arg("--inbox");
     for a in original_args { cmd.arg(a); }
     match cmd.status() {
