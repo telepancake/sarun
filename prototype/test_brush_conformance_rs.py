@@ -120,6 +120,15 @@ f p q r''',
     # ── traps / exit ───────────────────────────────────────────────────────
     "trap_exit": '''trap 'echo trapped' EXIT
 echo body''',
+    "trap_exit_subshell_reset": '''trap 'echo parent-trap' EXIT
+( echo in-sub )
+( exit 5 ); echo "rc=$?"
+echo body-done''',
+    "bg_subshell_pid": '''( sleep 0.1 ) &
+p=$!
+test -n "$p" && echo "bg-pid-set"
+wait $p
+echo "waited=$?"''',
     "trap_exit_rc": '''(trap 'echo t' EXIT; exit 7); echo "rc=$?"''',
     # ── set -e / -u / pipefail ─────────────────────────────────────────────
     "errexit_basic": '''(set -e; false; echo not-reached); echo "rc=$?"
@@ -167,6 +176,9 @@ echo "out=[$v]"
 # Known divergences: name -> reason. VISIBLE debt, not silent skips —
 # an xpass (fixed entry still listed) fails the suite so this can't rot.
 XFAIL = {
+    # $! is empty after backgrounding a SUBSHELL — `( cmd ) &` doesn't
+    # register a job pid. autoconf guards its uses, but bash sets it.
+    "bg_subshell_pid": "$! empty after ( cmd ) & — background subshell job",
 }
 
 

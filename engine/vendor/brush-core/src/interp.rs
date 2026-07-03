@@ -230,8 +230,18 @@ impl Execute for ast::Program {
     ) -> Result<ExecutionResult, error::Error> {
         let mut result = ExecutionResult::success();
 
+        let depth = PROGRAM_DEPTH.with(|d| {
+            let v = d.get() + 1;
+            d.set(v);
+            v
+        });
         for command in &self.complete_commands {
             record_source_position(shell, command);
+            let finisher = COMPLETE_COMMAND_OBSERVER
+                .read()
+                .unwrap()
+                .clone()
+                .and_then(|obs| obs(command, depth));
             // Execute the command and handle any errors without immediately propagating them.
             // This allows interactive shells to continue executing subsequent commands even after
             // errors.
@@ -243,6 +253,9 @@ impl Execute for ast::Program {
                     result = err.into_result(shell);
                 }
             }
+            if let Some(f) = finisher {
+                f(u8::from(result.exit_code) as i32);
+            }
 
             // Update status
             shell.set_last_exit_status(result.exit_code.into());
@@ -252,9 +265,33 @@ impl Execute for ast::Program {
                 break;
             }
         }
+        PROGRAM_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
 
         Ok(result)
     }
+}
+
+// sarun: observer for complete-command execution — lets the embedding
+// engine record pipeline provenance for programs IT didn't drive itself
+// (sourced files, `eval`ed programs). Called with the command and the
+// current Program-execution nesting depth (1 = the outermost run_program,
+// which the engine already records); returns an optional finisher invoked
+// with the exit code after the command completes.
+pub type CompleteCommandObserver = std::sync::Arc<
+    dyn Fn(&ast::CompoundList, usize) -> Option<Box<dyn FnOnce(i32) + Send>>
+        + Send
+        + Sync,
+>;
+
+static COMPLETE_COMMAND_OBSERVER: std::sync::RwLock<Option<CompleteCommandObserver>> =
+    std::sync::RwLock::new(None);
+
+pub fn install_complete_command_observer(f: CompleteCommandObserver) {
+    *COMPLETE_COMMAND_OBSERVER.write().unwrap() = Some(f);
+}
+
+thread_local! {
+    static PROGRAM_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Record the statement's source position on the current call frame so
@@ -721,6 +758,13 @@ impl Execute for ast::CompoundCommand {
                 // Clone off a new subshell, and run the body of the subshell there.
                 // TODO(source-info): Do we need to reset the line number?
                 let mut subshell = shell.clone();
+
+                // sarun: bash RESETS the EXIT trap on subshell entry — the
+                // parent's handler must not fire when the subshell ends
+                // (configure's cache-dump exit trap running inside every
+                // ( … ) sanity probe wedged the whole run). A trap set
+                // INSIDE the subshell still fires via on_exit below.
+                subshell.traps_mut().remove_handlers(crate::traps::TrapSignal::Exit);
 
                 // Handle errors within the subshell context to prevent fatal errors
                 // from propagating to the parent shell.

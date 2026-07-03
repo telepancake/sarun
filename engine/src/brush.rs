@@ -1364,6 +1364,7 @@ async fn build_box_shell_full(
     bundle_coreutils: bool,
 ) -> Result<brush_core::Shell, brush_core::error::Error> {
     install_shell_var_recorder();
+    install_pipeline_observer();
     // bon's builder is typestate-typed; we can't conditionally chain setters.
     // Passing the inner value (unwrapped from Option with a sensible default)
     // reproduces brush-core's own unset default for each field.
@@ -2617,6 +2618,37 @@ thread_local! {
     /// whose assignments must NOT be recorded as variable provenance.
     static SUPPRESS_VAR_RECORD: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+/// Record pipeline provenance for complete-commands the engine did NOT
+/// drive itself: sourced files (`. file`) and other nested run_program
+/// invocations. Depth 1 is the outermost program — run_nested_pipelines
+/// already records those; deeper programs were previously INVISIBLE in
+/// Pipes (a configure sourcing its .lineno copy ran entirely off-camera).
+pub(crate) fn install_pipeline_observer() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        brush_core::interp::install_complete_command_observer(std::sync::Arc::new(
+            |complete, depth| {
+                if depth <= 1 {
+                    return None;
+                }
+                let spawn_ts = now_secs();
+                let mut seq = 0i64;
+                let (recs, frame_uid, uids) =
+                    stamp_pipeline_records(complete, &mut seq, spawn_ts, true);
+                if uids.is_empty() {
+                    return None;
+                }
+                send_nested_pipeline_records(recs);
+                let prev_uid = set_current_pipeline_uid(frame_uid);
+                Some(Box::new(move |code: i32| {
+                    set_current_pipeline_uid(prev_uid);
+                    send_pipeline_done(&uids, code, now_secs());
+                }))
+            },
+        ));
+    });
 }
 
 pub(crate) fn install_shell_var_recorder() {
