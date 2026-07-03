@@ -162,6 +162,10 @@ echo to-three >&3
 exec 3>&-
 cat fd3.txt; rm -f fd3.txt''',
     # ── builtins ───────────────────────────────────────────────────────────
+    "tail_pipe_sink": '''printf 'a\nb\nc\n' | tail -1
+seq 1 10 | tail -2 | tr '\n' ' '; echo
+seq 1 5 | tee /dev/null | tail -1
+printf 'p\nq\n' | head -1''',
     "tail_legacy_n": '''printf 'a\nb\nc\nd\n' > tl.txt
 tail -2 tl.txt
 rm -f tl.txt''',

@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 03 Jul 2026 17:51:45 +0000
+Subject: [PATCH] dep: single-suffix rules (.in: == %: %.in)
+
+GNU make 10.7: a rule whose target is a single known suffix builds ANY
+target T from T<suffix>. gzip generates gunzip/zcat/zdiff/... from
+their .in sources this way; kati parsed '.in:' as an ordinary target
+and gzip died with "No rule to make target 'gunzip'". Candidates are
+collected at populate time and validated at pick time against the
+fully-populated .SUFFIXES list (which weeds out .PHONY-shaped special
+targets); the prerequisite is target+suffix (no extension replacement).
+
+Corpus 406/411 fail=0 xfail=5 xpass=0; box corpus PASS; gzip 1.13 now
+builds end-to-end in a box.
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 1d22f94..a5c9e91 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -133,7 +133,17 @@ fn apply_output_pattern(r: &Rule, output: Symbol, inputs: &[Symbol]) -> Vec<Symb
+     }
+     if r.is_suffix_rule {
+         for input in inputs {
+-            ret.push(replace_suffix(output, input));
++            if r.is_single_suffix {
++                let ob = output.as_bytes();
++                let ib = input.as_bytes();
++                let mut b = BytesMut::with_capacity(ob.len() + ib.len() + 1);
++                b.put_slice(&ob);
++                b.put_u8(b'.');
++                b.put_slice(&ib);
++                ret.push(intern(b.freeze()));
++            } else {
++                ret.push(replace_suffix(output, input));
++            }
+         }
+         return ret;
+     }
+@@ -211,15 +221,17 @@ fn is_suffix_rule(output: &Symbol) -> bool {
+     }
+     let mut output = output.as_bytes();
+     output.advance(1);
++    if output.is_empty() {
++        return false;
++    }
+     let dot_index = memchr(b'.', &output);
+-    // If there is only a single dot or the third dot, this is not a
+-    // suffix rule.
++    // A third dot disqualifies. A single leading dot (`.in:`) is a
++    // SINGLE-suffix rule candidate — whether it really is one is decided
++    // at pick time against the .SUFFIXES list (`.PHONY` never matches).
+     if let Some(dot_index) = dot_index {
+         if memchr(b'.', &output[dot_index + 1..]).is_some() {
+             return false;
+         }
+-    } else {
+-        return false;
+     }
+     true
+ }
+@@ -419,6 +431,10 @@ struct DepBuilder<'a> {
+ 
+     implicit_rules: RuleTrie,
+     suffix_rules: SuffixRuleMap,
++    // sarun: single-suffix rules (`.in:` == `%: %.in`), GNU make 10.7.
++    // Applied at pick time to ANY target T when T<suffix> exists and the
++    // suffix is in the (by then fully populated) .SUFFIXES list.
++    single_suffix_rules: Vec<Arc<Rule>>,
+ 
+     first_rule: Option<Symbol>,
+     // GNU's known-suffix list (.SUFFIXES; defaults below). Used for the
+@@ -486,6 +502,7 @@ impl<'a> DepBuilder<'a> {
+ 
+             implicit_rules: RuleTrie::new(),
+             suffix_rules: HashMap::new(),
++            single_suffix_rules: Vec::new(),
+ 
+             first_rule: None,
+             // GNU make's default suffix list (src/default.c default_suffixes).
+@@ -535,6 +552,7 @@ impl<'a> DepBuilder<'a> {
+         if let Some((targets, _loc)) = self.get_rule_inputs(intern(".SUFFIXES")) {
+             if targets.is_empty() {
+                 self.suffix_rules.clear();
++                self.single_suffix_rules.clear();
+                 self.known_suffixes.clear();
+             } else {
+                 for t in &targets {
+@@ -896,7 +914,18 @@ impl<'a> DepBuilder<'a> {
+ 
+         let mut output = output.as_bytes();
+         output.advance(1);
+-        let dot_index = memchr(b'.', &output).unwrap();
++        let Some(dot_index) = memchr(b'.', &output) else {
++            // Single-suffix rule (`.in:` == `%: %.in`). Store the candidate;
++            // pick time checks the suffix against the final .SUFFIXES list,
++            // which filters out same-shaped special targets (.PHONY, ...).
++            let mut r = rule.clone();
++            r.inputs.clear();
++            r.inputs.push(intern(output));
++            r.is_suffix_rule = true;
++            r.is_single_suffix = true;
++            self.single_suffix_rules.push(Arc::new(r));
++            return Ok(true);
++        };
+ 
+         let input_suffix = output.slice(..dot_index);
+         let output_suffix = output.slice(dot_index + 1..);
+@@ -1226,7 +1255,31 @@ impl<'a> DepBuilder<'a> {
+                 }
+             }
+             None
+-        })();
++        })()
++        .or_else(|| {
++            // Single-suffix rules (`.in:` == `%: %.in`): applicable to ANY
++            // target when target+suffix exists and the suffix made it into
++            // the final .SUFFIXES list (which weeds out .PHONY-shaped
++            // specials that parse identically).
++            for irule in &self.single_suffix_rules {
++                let suf = irule.inputs[0].as_bytes();
++                let known = self.known_suffixes.iter().any(|k| {
++                    k.strip_prefix(b".".as_slice()).unwrap_or(k) == suf
++                });
++                if !known {
++                    continue;
++                }
++                let mut b = BytesMut::with_capacity(output_str.len() + suf.len() + 1);
++                b.put_slice(&output_str);
++                b.put_u8(b'.');
++                b.put_slice(&suf);
++                let input = intern(b.freeze());
++                if self.exists(input) {
++                    return Some(irule.clone());
++                }
++            }
++            None
++        });
+         if let Some(irule) = suffix_pick {
+             if rule_merger.is_some() {
+                 return Some(PickedRuleInfo {
+diff --git a/src-rs/rule.rs b/src-rs/rule.rs
+index f6a3c03..dc79616 100644
+--- a/src-rs/rule.rs
++++ b/src-rs/rule.rs
+@@ -37,6 +37,10 @@ pub struct Rule {
+     pub validations: Vec<Symbol>,
+     pub is_double_colon: bool,
+     pub is_suffix_rule: bool,
++    // sarun: a SINGLE-suffix rule (`.in:` == `%: %.in`): the prerequisite is
++    // the whole target plus the suffix, not the target with its extension
++    // replaced.
++    pub is_single_suffix: bool,
+     pub cmds: Vec<Arc<Value>>,
+     pub loc: Loc,
+     pub cmd_loc: Option<Loc>,
+@@ -52,6 +56,7 @@ impl Rule {
+             validations: Vec::new(),
+             is_double_colon,
+             is_suffix_rule: false,
++            is_single_suffix: false,
+             cmds: Vec::new(),
+             loc,
+             cmd_loc: None,
+diff --git a/testcase/sarun_single_suffix_rule.mk b/testcase/sarun_single_suffix_rule.mk
+new file mode 100644
+index 0000000..ad119c8
+--- /dev/null
++++ b/testcase/sarun_single_suffix_rule.mk
+@@ -0,0 +1,14 @@
++# Single-suffix rules (GNU make 10.7): `.in:` with `.SUFFIXES: .in` builds
++# ANY target T from T.in — gzip's Makefile generates its gunzip/zcat/...
++# scripts this way. A special target like .PHONY parses identically but
++# must never act as a suffix rule.
++test1:
++	printf 'payload\n' > gunzip.in
++
++test2: gunzip
++	cat gunzip
++
++.SUFFIXES: .in
++.in:
++	echo build_$@_from_$<
++	cp $< $@

@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 03 Jul 2026 17:51:45 +0000
+Subject: [PATCH] tail: logical stdin is always a pipe — never resolve the process fd 0
+
+In-process builtin tail resolved InputKind::Stdin by canonicalizing
+/dev/fd/0 — the ENGINE's real stdin, not the pipeline's logical pipe —
+so 'seq 1 5 | tail -2' printed nothing, exited 0, and EPIPE'd the
+writer. A TAIL_LOGICAL_STDIN thread-local (set by the builtin entry,
+same pattern as TAIL_OUT) forces the pipe path so the injected reader
+is consumed. File operands are unaffected.
+
+---
+diff --git a/src/tail.rs b/src/tail.rs
+index ecafd05..1683a54 100644
+--- a/src/tail.rs
++++ b/src/tail.rs
+@@ -58,6 +58,10 @@ thread_local! {
+     static TAIL_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+     /// Deferred non-fatal exit code, set by the local `show!`/`show_error!`.
+     static TAIL_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
++    /// True while running as a builtin with an injected logical stdin. Stdin
++    /// input must then ALWAYS be treated as a pipe: resolving the PROCESS
++    /// /dev/fd/0 would read the engine's real stdin, not the pipeline.
++    static TAIL_LOGICAL_STDIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+ }
+ 
+ /// A `Write` that targets the call's injected logical stdout (via [`TAIL_OUT`])
+@@ -180,10 +184,12 @@ pub fn tail(
+     let out_ptr: *mut (dyn Write + 'static) =
+         unsafe { std::mem::transmute::<*mut dyn Write, *mut (dyn Write + 'static)>(out) };
+     TAIL_OUT.with(|c| c.set(Some(out_ptr)));
++    TAIL_LOGICAL_STDIN.with(|c| c.set(true));
+ 
+     let result = run(args, stdin);
+ 
+     TAIL_OUT.with(|c| c.set(None));
++    TAIL_LOGICAL_STDIN.with(|c| c.set(false));
+     let produced = TAIL_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+     let _ = err.write_all(&produced);
+     let _ = err.flush();
+@@ -445,7 +451,10 @@ fn tail_stdin(
+         return Ok(());
+     }
+ 
+-    if let Some(path) = input.resolve() {
++    // Builtin call with injected logical stdin: the process /dev/fd/0 is NOT
++    // this pipeline's stdin — never resolve it; read the injected pipe.
++    let logical = TAIL_LOGICAL_STDIN.with(std::cell::Cell::get);
++    if let Some(path) = input.resolve().filter(|_| !logical) {
+         // fifo
+         let mut stdin_offset = 0;
+         if cfg!(unix) {
