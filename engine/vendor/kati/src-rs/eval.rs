@@ -264,6 +264,9 @@ pub struct Evaluator {
     /// sarun: accumulated `vpath PATTERN DIRS` directive entries, in
     /// makefile order — consumed by dep.rs's directory search.
     pub vpath_patterns: Vec<(Bytes, Vec<Bytes>)>,
+    /// sarun: `.NOTPARALLEL:` was seen — this make's recipes run serially
+    /// even when -j / a jobserver is in effect.
+    pub not_parallel: bool,
     /// sarun: per-instance global variable bindings, indexed by Symbol id.
     /// Moved off the process-global symbol table (symtab `symbol_data`) so each
     /// Evaluator — i.e. each make invocation — owns its OWN global namespace.
@@ -366,6 +369,7 @@ impl Evaluator {
         let ev = Self {
             rule_vars: HashMap::new(),
             vpath_patterns: Vec::new(),
+            not_parallel: false,
             global_vars: Arc::new(Mutex::new(Vec::new())),
             working_dir: std::env::current_dir().unwrap_or_default(),
             include_dirs: Vec::new(),

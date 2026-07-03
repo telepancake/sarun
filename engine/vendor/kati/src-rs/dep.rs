@@ -566,17 +566,21 @@ impl<'a> DepBuilder<'a> {
         // it asks make to DELETE the file after build. We don't, so
         // it's a real semantic divergence (user expects the file
         // gone; we leave it). Belongs in the warn list.
-        // sarun: .NOTPARALLEL is a no-op for us because the executor
-        // runs one recipe at a time anyway — there's nothing parallel to
-        // serialize. .INTERMEDIATE asks for post-build deletion of the
+        // sarun: .INTERMEDIATE asks for post-build deletion of the
         // marked targets; we don't delete, but the user-observable
         // recipe output is identical, and warning would diverge it.
         let noop_for_us = [
             ".PRECIOUS",
             ".SECONDARY",
-            ".NOTPARALLEL",
             ".INTERMEDIATE",
         ];
+        // .NOTPARALLEL: this make runs its recipes SERIALLY even under -j —
+        // real semantics now that the executor has a parallel scheduler.
+        // Wrapper makefiles rely on it to order side-effect files that no
+        // rule declares as its output.
+        if self.get_rule_inputs(intern(".NOTPARALLEL")).is_some() {
+            self.ev.not_parallel = true;
+        }
         // sarun: .EXPORT_ALL_VARIABLES isn't a rule whose recipe runs —
         // it's a flag that tells make to export every variable into the
         // recipe environment. Flip the Evaluator flag if present.

@@ -864,6 +864,7 @@ pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
 pub fn exec_opts(
     roots: Vec<NamedDepNode>, ev: &mut Evaluator, quiet_failures: bool,
 ) -> Result<()> {
+    let not_parallel = ev.not_parallel;
     let mut executor = Executor::new(ev)?;
     executor.quiet_failures = quiet_failures;
     // One engine: a dependency-count scheduler with a worker cap. Parallel only
@@ -875,7 +876,9 @@ pub fn exec_opts(
     // Parallel when -j>1 was requested OR a parent advertised a jobserver in
     // MAKEFLAGS (a sub-make inherits parallelism, like GNU make). Plain standalone
     // `make` with no jobserver stays serial (cap 1), so the corpus is unaffected.
-    let parallel = FLAGS.jobs_explicit || client.is_some();
+    let parallel = (FLAGS.jobs_explicit || client.is_some())
+        // .NOTPARALLEL: this make is serial regardless of -j/jobserver.
+        && !not_parallel;
     let cap = if parallel { FLAGS.num_jobs.max(1) } else { 1 };
     let client = if cap > 1 { client } else { None };
     executor.exec_graph(roots.clone(), cap, client)?;
