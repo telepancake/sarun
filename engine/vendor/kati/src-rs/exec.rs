@@ -467,6 +467,7 @@ impl<'a> Executor<'a> {
         &mut self,
         graph: &HashMap<Symbol, PNode>,
         sym: Symbol,
+        missing: &mut std::collections::HashSet<Symbol>,
     ) -> Result<(ExecStatus, Option<RunReq>)> {
         let n = graph[&sym].node.clone();
         let output = sym;
@@ -483,35 +484,51 @@ impl<'a> Executor<'a> {
             (g.has_rule, g.is_phony)
         };
         if !has_rule && output_timestamp.is_none() && !is_phony {
-            if !self.quiet_failures {
-                for note in &n.lock().no_rule_notes {
-                    crate::exec::emit_recipe_err(&format!("*kati*: note: {note}"));
-                }
-            }
-            if let Some(dep_sym) = graph[&sym].dependents.first() {
-                // Diagnosis aid: name the RULE whose prerequisite list produced
-                // this target — a bad expansion (joined words, wrong subst) is
-                // otherwise untraceable in a big build. The `*kati*:` prefix is
-                // stripped by the corpus normalizers, so GNU-parity holds.
-                if let Some(pn) = graph.get(dep_sym) {
-                    if let Some(loc) = pn.node.lock().loc.clone() {
-                        crate::exec::emit_recipe_err(&format!(
-                            "*kati*: note: '{output}' comes from the \
-                             prerequisite list of the rule for '{dep_sym}' \
-                             at {loc}"));
-                    }
-                }
-                let nb = dep_sym.as_bytes();
-                error!(
-                    "*** No rule to make target '{output}', needed by '{}'.",
-                    String::from_utf8_lossy(&nb)
-                );
-            } else {
-                error!("*** No rule to make target '{output}'");
-            }
+            // GNU considers prerequisites LAZILY: a rule-less missing file
+            // only errors when a CONSUMER is reached and it's still absent —
+            // an earlier recipe may create it as a side effect (files built
+            // by another rule without being its declared output). Defer: the
+            // node completes normally; the consumer's prepare re-stats it.
+            missing.insert(sym);
         }
         let mut latest = ExecStatus::Processing;
         for d in &graph[&sym].deps {
+            if missing.contains(d) {
+                // The dep had no rule and didn't exist when IT was prepared.
+                // Re-stat now — everything scheduled before this consumer has
+                // run, matching GNU's in-order consideration.
+                let dts = get_timestamp(&d.as_bytes(), &self.ce.ev.working_dir)?;
+                if let Some(ts) = dts {
+                    missing.remove(d);
+                    let r = ExecStatus::Timestamp(Some(ts));
+                    if latest < r {
+                        latest = r;
+                    }
+                    continue;
+                }
+                if !self.quiet_failures {
+                    if let Some(dp) = graph.get(d) {
+                        for note in &dp.node.lock().no_rule_notes {
+                            crate::exec::emit_recipe_err(&format!(
+                                "*kati*: note: {note}"));
+                        }
+                    }
+                    // Diagnosis aid: name the RULE whose prerequisite list
+                    // produced this target — a bad expansion (joined words,
+                    // wrong subst) is otherwise untraceable in a big build.
+                    // The `*kati*:` prefix is stripped by the corpus
+                    // normalizers, so GNU-parity holds.
+                    if let Some(loc) = n.lock().loc.clone() {
+                        crate::exec::emit_recipe_err(&format!(
+                            "*kati*: note: '{d}' comes from the prerequisite \
+list of the rule for '{output}' at {loc}"));
+                    }
+                }
+                error!(
+                    "*** No rule to make target '{d}', needed by '{}'.",
+                    String::from_utf8_lossy(&output_str)
+                );
+            }
             if let Some(r) = graph.get(d).and_then(|p| p.result) {
                 if latest < r {
                     latest = r;
@@ -661,6 +678,10 @@ impl<'a> Executor<'a> {
 
         // -k can also arrive as a makefile-level `MAKEFLAGS += -k`, which
         // lands in the MAKEFLAGS variable after FLAGS was parsed.
+        // Rule-less nodes that didn't exist at their own prepare — resolved
+        // (or errored) lazily at each consumer, GNU-style.
+        let mut missing: std::collections::HashSet<Symbol> =
+            std::collections::HashSet::new();
         let keep_going = FLAGS.is_keep_going
             || self
                 .ce
@@ -680,7 +701,7 @@ impl<'a> Executor<'a> {
             // 1. Evaluate ready nodes on the make thread (serial) → done or queued.
             while failed.is_none() || keep_going {
                 let Some(Ready { sym, .. }) = ready.pop() else { break };
-                let (ts, runreq) = self.prepare_node(&graph, sym)?;
+                let (ts, runreq) = self.prepare_node(&graph, sym, &mut missing)?;
                 match runreq {
                     None => self.finish_node(&mut graph, sym, ts, &mut ready, &mut done_count),
                     Some(req) => {
@@ -731,6 +752,24 @@ impl<'a> Executor<'a> {
             if running == 0 {
                 if !ready.is_empty() || !run_queue.is_empty() {
                     continue;
+                }
+                // A goal target that is STILL rule-less and absent errors
+                // even without a consumer (GNU: "No rule to make target").
+                if failed.is_none() {
+                    for (name, node) in &roots {
+                        if missing.contains(name)
+                            && get_timestamp(&name.as_bytes(),
+                                             &self.ce.ev.working_dir)?.is_none()
+                        {
+                            if !self.quiet_failures {
+                                for note in &node.lock().no_rule_notes {
+                                    crate::exec::emit_recipe_err(&format!(
+                                        "*kati*: note: {note}"));
+                                }
+                            }
+                            error!("*** No rule to make target '{name}'");
+                        }
+                    }
                 }
                 if let Some(code) = failed {
                     if keep_going {
