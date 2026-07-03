@@ -29,21 +29,23 @@ pub const BOX_MAC: [u8; 6] = [0x02, 0x73, 0x72, 0x6e, 0x00, 0x02];
 /// The fixed per-box subnet (see `BOX_SUBNET_ID`).
 pub fn box_subnet() -> BoxSubnet { BoxSubnet::new(BOX_SUBNET_ID) }
 
-/// Whether tap networking can work here at all: probe unshare(CLONE_NEWNET)
-/// in a throwaway child (fork → unshare → _exit; nothing else runs in the
-/// child, so forking a threaded process is safe). Restricted environments
-/// (unprivileged containers, some CI) refuse CLONE_NEWNET — callers use
-/// this to fall back to host networking (announced) instead of spawning a
-/// box that dies with `tap setup failed: unshare(CLONE_NEWNET)`. Probed
-/// once per process.
+/// Whether tap networking can actually work here — the SAME two gates the real
+/// setup must pass: (1) getting a configurable network namespace (a bare
+/// `unshare(CLONE_NEWNET)`, else via our own user namespace for the rootless
+/// case — see `unshare_netns`), and (2) opening `/dev/net/tun` (TUNSETIFF), the
+/// device-permission gate that a userns can't override when the node is
+/// root-only. Probed in a throwaway forked child so a failure just means
+/// "announce host fallback" instead of spawning a box that dies.
+///
+/// The child runs ONLY async-signal-safe code (raw syscalls, no heap): the
+/// parent (the UI) may be multithreaded, and malloc after fork can deadlock.
+/// That's why this re-implements the `unshare_netns` sequence with bare
+/// syscalls rather than calling it. Probed once per process.
 pub fn tap_available() -> bool {
     static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *PROBE.get_or_init(|| unsafe {
         match libc::fork() {
-            0 => {
-                let ok = libc::unshare(libc::CLONE_NEWNET) == 0;
-                libc::_exit(if ok { 0 } else { 1 });
-            }
+            0 => libc::_exit(if probe_tap_child() { 0 } else { 1 }),
             -1 => true, // probe impossible — don't claim unavailability
             pid => {
                 let mut st = 0;
@@ -55,6 +57,62 @@ pub fn tap_available() -> bool {
     })
 }
 
+/// The probe body, run in the forked child. Async-signal-safe: no allocation.
+/// Mirrors `unshare_netns` + `open_tap`. Returns true iff both gates pass.
+unsafe fn probe_tap_child() -> bool {
+    if libc::unshare(libc::CLONE_NEWNET) != 0 {
+        if *libc::__errno_location() != libc::EPERM { return false; }
+        // Rootless: gain the cap via a user namespace, then retry the netns.
+        if libc::unshare(libc::CLONE_NEWUSER) != 0 { return false; }
+        let _ = write_raw(b"/proc/self/setgroups\0", b"deny"); // best-effort
+        if !write_id_map(b"/proc/self/uid_map\0", libc::getuid()) { return false; }
+        if !write_id_map(b"/proc/self/gid_map\0", libc::getgid()) { return false; }
+        if libc::unshare(libc::CLONE_NEWNET) != 0 { return false; }
+    }
+    // Device-permission gate: can we actually open + configure a TAP?
+    let fd = libc::open(b"/dev/net/tun\0".as_ptr().cast(),
+                        libc::O_RDWR | libc::O_CLOEXEC);
+    if fd < 0 { return false; }
+    #[repr(C)]
+    struct Ifreq { name: [u8; 16], flags: i16, _pad: [u8; 22] }
+    let mut req: Ifreq = std::mem::zeroed();
+    req.name[..4].copy_from_slice(b"tap0");
+    req.flags = (0x0002 | 0x1000) as i16; // IFF_TAP | IFF_NO_PI
+    const TUNSETIFF: libc::c_ulong = 0x400454ca;
+    let ok = libc::ioctl(fd, TUNSETIFF as _, &mut req) == 0;
+    libc::close(fd);
+    ok
+}
+
+/// Write the identity id-map `"<id> <id> 1"` to `path` with raw syscalls (no
+/// heap). `path` is NUL-terminated. Returns whether the write succeeded.
+unsafe fn write_id_map(path: &[u8], id: libc::uid_t) -> bool {
+    // Compose "<id> <id> 1\n" into a stack buffer.
+    let mut buf = [0u8; 32];
+    let mut n = 0;
+    let mut push_uint = |buf: &mut [u8], n: &mut usize, mut v: u32| {
+        let mut digits = [0u8; 10];
+        let mut d = 0;
+        if v == 0 { digits[0] = b'0'; d = 1; }
+        while v > 0 { digits[d] = b'0' + (v % 10) as u8; v /= 10; d += 1; }
+        while d > 0 { d -= 1; buf[*n] = digits[d]; *n += 1; }
+    };
+    push_uint(&mut buf, &mut n, id as u32);
+    buf[n] = b' '; n += 1;
+    push_uint(&mut buf, &mut n, id as u32);
+    for &b in b" 1\n" { buf[n] = b; n += 1; }
+    write_raw(path, &buf[..n])
+}
+
+/// Open `path` (NUL-terminated) and write `data` in full. Raw syscalls only.
+unsafe fn write_raw(path: &[u8], data: &[u8]) -> bool {
+    let fd = libc::open(path.as_ptr().cast(), libc::O_WRONLY);
+    if fd < 0 { return false; }
+    let r = libc::write(fd, data.as_ptr().cast(), data.len());
+    libc::close(fd);
+    r == data.len() as isize
+}
+
 /// The gateway MAC: what the engine's smoltcp answers as, AND what the runner
 /// seeds into the box's ARP cache. `StackRuntime::start` must be given the
 /// same value.
@@ -63,13 +121,11 @@ pub fn gateway_mac() -> [u8; 6] { derive_gw_mac(BOX_SUBNET_ID) }
 /// RUNNER-side: move THIS process into a fresh network namespace and equip it
 /// with loopback + a TAP at the fixed box address, returning the TAP fd to hand
 /// to the engine (which polls it). The caller then execs bwrap WITHOUT
-/// --unshare-net so the box inherits this netns. Requires CAP_NET_ADMIN /
-/// CAP_SYS_ADMIN in the caller's user namespace — the runner already clears that
-/// bar (its bwrap child `setns`'d a netns before this change).
+/// --unshare-net so the box inherits this netns. Needs no root: `unshare_netns`
+/// self-acquires CAP_NET_ADMIN via an unprivileged user namespace when the
+/// process doesn't already have it (the rootless top-level case).
 pub fn create_netns_tap() -> Result<OwnedFd> {
-    if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
-        bail!("unshare(CLONE_NEWNET): {}", std::io::Error::last_os_error());
-    }
+    unshare_netns()?;
     let subnet = box_subnet();
     let tap_name = "tap0";
     // The IP on the TAP is the BOX's address (.0.2); the gateway (.0.1) lives on
@@ -88,6 +144,51 @@ pub fn create_netns_tap() -> Result<OwnedFd> {
         eprintln!("sarun-engine: net: ARP seed for gateway failed: {e}");
     }
     Ok(tap)
+}
+
+/// Move THIS process into a fresh, configurable network namespace.
+///
+/// A bare `unshare(CLONE_NEWNET)` needs CAP_NET_ADMIN — satisfied when we run
+/// as root, OR when we're already inside a user namespace that granted it (a
+/// NESTED box, running under its parent's bwrap userns). In the ordinary
+/// ROOTLESS top-level case it is refused (EPERM): an unprivileged user in the
+/// initial userns has no such capability.
+///
+/// The fix costs nothing and needs no root: the creator of a user namespace
+/// holds EVERY capability INSIDE it, whatever the uid mapping. So on EPERM we
+/// first `unshare(CLONE_NEWUSER)` — with an IDENTITY map (your uid/gid → the
+/// same values), so the box keeps running as YOU, matching host/off boxes
+/// (bwrap maps identity too). That grants CAP_NET_ADMIN in the new userns and
+/// the netns unshare then succeeds. We open + `TUNSETIFF` the TAP in THIS
+/// process (no exec in between), so those caps are still held — an identity
+/// map would drop them across an execve, but we never exec here. bwrap, run
+/// later, makes its own nested userns for the box and inherits this netns
+/// (it is run WITHOUT --unshare-net).
+fn unshare_netns() -> Result<()> {
+    if unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0 {
+        return Ok(());
+    }
+    let bare = std::io::Error::last_os_error();
+    if bare.raw_os_error() != Some(libc::EPERM) {
+        bail!("unshare(CLONE_NEWNET): {bare}");
+    }
+    // Rootless: acquire the capability via our own user namespace, then retry.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+        bail!("unshare(CLONE_NEWUSER) (for rootless tap): {}",
+              std::io::Error::last_os_error());
+    }
+    // setgroups must be denied before an unprivileged gid_map write.
+    let _ = std::fs::write("/proc/self/setgroups", "deny");
+    std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))
+        .map_err(|e| anyhow::anyhow!("write uid_map (rootless tap): {e}"))?;
+    std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))
+        .map_err(|e| anyhow::anyhow!("write gid_map (rootless tap): {e}"))?;
+    if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+        bail!("unshare(CLONE_NEWNET) after userns: {}",
+              std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn open_tap(name: &str) -> Result<OwnedFd> {

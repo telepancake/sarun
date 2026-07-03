@@ -315,10 +315,11 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                 Ok(fd) => Some(fd),
                 Err(e) => {
                     eprintln!("sarun-engine: tap setup failed: {e}");
-                    eprintln!("hint: tap needs netns privileges \
-                               (CLONE_NEWNET); on hosts without them pass \
-                               `--net host` (-N) to share the host network \
-                               or `--net off` for none");
+                    eprintln!("hint: tap now self-acquires netns privileges via \
+                               an unprivileged user namespace, so this is most \
+                               likely /dev/net/tun being root-only — `ls -l \
+                               /dev/net/tun` should be crw-rw-rw- (0666); \
+                               otherwise pass `--net host` (-N) or `--net off`");
                     return 1;
                 }
             }
