@@ -1935,6 +1935,39 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 "serving": svc_has("oaita-local"),
             })
         }
+        // Connection test for the external-API config editor: does a minimal
+        // 1-token chat completion against the given endpoint and reports
+        // reachability / auth / model validity as a single line. Runs on the
+        // engine (which has the network), so the UI stays a thin client.
+        "oaita.probe" => {
+            let spec = args.first().cloned().unwrap_or(Value::Null);
+            let base_url = spec.get("base_url").and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("https://api.openai.com/v1").to_string();
+            let model = spec.get("model").and_then(Value::as_str)
+                .unwrap_or("").to_string();
+            let api_key = spec.get("api_key").and_then(Value::as_str)
+                .unwrap_or("").to_string();
+            if model.trim().is_empty() {
+                return json!({"ok": false, "error": "set a model name first"});
+            }
+            let probe = crate::oaita::client::block_on(async {
+                let client = crate::oaita::client::Client::from_resolved(
+                    &base_url, &api_key)?;
+                let body = json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1, "stream": false,
+                });
+                client.post("/chat/completions", body).await
+            });
+            match probe {
+                Ok(_) => json!({"ok": true, "detail":
+                    format!("connected · {model} @ {base_url}")}),
+                Err(e) => return json!({"ok": false,
+                    "error": format!("{base_url}: {e}")}),
+            }
+        }
         other => {
             return json!({"ok": false, "error": format!("unknown verb '{other}'")});
         }

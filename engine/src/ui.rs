@@ -382,6 +382,19 @@ enum Modal {
     /// Free-text GGUF URL entry — the model picker's escape hatch. Enter runs
     /// `oaita local --model-url <buf>` on a PTY.
     ModelUrl { buf: String },
+    /// External-API config editor: the three oaita.toml fields as editable
+    /// lines (`field` = cursored line 0..3), a `result` line for the last
+    /// connection test, and `testing` while a probe is in flight. Tab/↑/↓
+    /// move between fields, Ctrl-T tests, Ctrl-S / Enter saves to oaita.toml,
+    /// Esc cancels. The in-UI answer to "where do I set the server?".
+    ApiConfig {
+        base_url: String,
+        model: String,
+        api_key: String,
+        field: usize,
+        result: String,
+        testing: bool,
+    },
 }
 
 /// One level of the image-picker menu stack.
@@ -487,6 +500,10 @@ enum Action {
     /// choose a model, then download+serve it. The discoverable front door to
     /// `oaita local` — no magic URL to guess, no host/box confusion.
     OpenModelPicker,
+    /// Api pane: open the external-API config editor (base_url / model /
+    /// api_key) with a live "test connection" — the in-UI alternative to
+    /// hand-editing oaita.toml.
+    OpenApiConfig,
 }
 
 /// One editable line of the '/' clause editor (mirrors Python ClauseRow): the
@@ -812,6 +829,10 @@ struct App {
     /// configured). Never re-offer — a user who dismisses it is not nagged;
     /// the F4 menu still opens it on demand.
     model_picker_offered: bool,
+    /// In-flight background connection test for the ApiConfig editor (the
+    /// engine's `oaita.probe`). Drained by pump_probe() into the modal's
+    /// `result` line so the test never blocks the UI thread.
+    probe_job: Option<mpsc::Receiver<Result<String, String>>>,
     /// Off-loop structural-diff state for the selected BINARY change.
     structd: StructState,
     /// Hunk cursor within the diff pane (index into the hunk list); used for
@@ -930,6 +951,7 @@ impl App {
             load_job: None,
             models_job: None,
             model_picker_offered: false,
+            probe_job: None,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -1153,6 +1175,102 @@ impl App {
                     *source = "catalog worker died".into();
                 }
             }
+        }
+    }
+
+    /// Open the external-API config editor, prefilled from the current
+    /// oaita.toml. The in-UI answer to "where do I set base_url / model /
+    /// api_key?" — with a Ctrl-T connection test and Ctrl-S save.
+    fn open_api_config(&mut self) {
+        let cfg = crate::oaita::config::Config::load();
+        self.modal = Some(Modal::ApiConfig {
+            base_url: cfg.base_url.unwrap_or_default(),
+            model: cfg.model.unwrap_or_default(),
+            api_key: cfg.api_key.unwrap_or_default(),
+            field: 0,
+            result: String::new(),
+            testing: false,
+        });
+        self.status = format!("edit external API · writes {}",
+            crate::paths::oaita_config_path().display());
+    }
+
+    /// Kick a background connection test (engine `oaita.probe`) for the
+    /// ApiConfig editor's current values. Result lands via pump_probe().
+    fn start_api_probe(&mut self, base_url: String, model: String,
+                       api_key: String) {
+        let (tx, rx) = mpsc::channel();
+        let sock = self.sock.clone();
+        std::thread::spawn(move || {
+            let res = rpc(&sock, "oaita.probe",
+                json!([{ "base_url": base_url, "model": model,
+                         "api_key": api_key }]));
+            let out = match res {
+                Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) =>
+                    Ok(v.get("detail").and_then(Value::as_str)
+                        .unwrap_or("connected").to_string()),
+                Ok(v) => Err(v.get("error").and_then(Value::as_str)
+                    .unwrap_or("probe failed").to_string()),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(out);
+        });
+        self.probe_job = Some(rx);
+    }
+
+    /// Drain a finished connection test into the open ApiConfig editor.
+    fn pump_probe(&mut self) {
+        let Some(rx) = self.probe_job.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.probe_job = None;
+                if let Some(Modal::ApiConfig { result, testing, .. })
+                    = self.modal.as_mut()
+                {
+                    *testing = false;
+                    *result = match res {
+                        Ok(d) => format!("✓ {d}"),
+                        Err(e) => format!("✗ {e}"),
+                    };
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.probe_job = None;
+                if let Some(Modal::ApiConfig { result, testing, .. })
+                    = self.modal.as_mut()
+                {
+                    *testing = false;
+                    *result = "✗ probe worker died".into();
+                }
+            }
+        }
+    }
+
+    /// Persist the ApiConfig editor to oaita.toml (model required). Returns a
+    /// status string; refreshes the engine's --api box shadow so a running
+    /// box picks up the new upstream without a restart.
+    fn save_api_config(&mut self, base_url: &str, model: &str, api_key: &str)
+        -> String {
+        if model.trim().is_empty() {
+            return "model is required — fill it before saving".into();
+        }
+        let mut toml = format!("model = {:?}\n", model.trim());
+        if !base_url.trim().is_empty() {
+            toml.push_str(&format!("base_url = {:?}\n", base_url.trim()));
+        }
+        if !api_key.trim().is_empty() {
+            toml.push_str(&format!("api_key = {:?}\n", api_key.trim()));
+        }
+        let path = crate::paths::oaita_config_path();
+        if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+        match std::fs::write(&path, toml) {
+            Ok(()) => {
+                crate::control::write_api_box_oaita_toml();
+                self.refresh_api_endpoint_note();
+                format!("saved external API → {}", path.display())
+            }
+            Err(e) => format!("write {}: {e}", path.display()),
         }
     }
 
@@ -5344,6 +5462,8 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         // one row per model + the "custom URL" row + source/help chrome.
         Modal::ModelPicker { models, .. } =>
             (models.len() as u16 + 1).clamp(1, 18) + 7,
+        // 3 fields + header + result + help + borders.
+        Modal::ApiConfig { .. } => 11,
         _ => 7,
     };
     let hgt = want.min(area.height);
@@ -5679,6 +5799,57 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                             Enter downloads it in a box & serves it · Esc cancel"),
             ],
         ),
+        Modal::ApiConfig { base_url, model, api_key, field, result, testing } => {
+            // Three editable fields; the cursored one shows a trailing "_".
+            let masked: String = if api_key.is_empty() { String::new() }
+                else { "•".repeat(api_key.chars().count().min(24)) };
+            let rows = [
+                ("model    ", model.as_str(), model.clone()),
+                ("base_url ", base_url.as_str(),
+                    if base_url.is_empty() {
+                        "https://api.openai.com/v1 (default)".to_string()
+                    } else { base_url.clone() }),
+                ("api_key  ", api_key.as_str(), masked),
+            ];
+            let mut body = vec![
+                Line::from(Span::styled(
+                    "external OpenAI-compatible endpoint — written to oaita.toml",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+            ];
+            for (i, (label, _raw, shown)) in rows.iter().enumerate() {
+                let active = i == *field;
+                let val = if active { format!("{shown}_") } else { shown.clone() };
+                let lstyle = if active {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else { Style::default().fg(Color::Gray) };
+                body.push(Line::from(vec![
+                    Span::styled(format!(" {label}"), lstyle),
+                    Span::raw("  "),
+                    Span::raw(val),
+                ]));
+            }
+            body.push(Line::from(""));
+            let rline = if *testing {
+                Span::styled("  testing connection…",
+                    Style::default().fg(Color::Yellow))
+            } else if result.is_empty() {
+                Span::styled("  (Ctrl-T tests the connection)",
+                    Style::default().fg(Color::DarkGray))
+            } else if result.starts_with('✓') {
+                Span::styled(format!("  {result}"),
+                    Style::default().fg(Color::Green))
+            } else {
+                Span::styled(format!("  {result}"),
+                    Style::default().fg(Color::Red))
+            };
+            body.push(Line::from(rline));
+            body.push(Line::from(Span::styled(
+                "Tab/↑/↓ field · type to edit · Ctrl-T test · Ctrl-S/Enter save \
+                 · Esc cancel",
+                Style::default().fg(Color::Gray))));
+            (" configure external API ", body)
+        }
     };
     let p = Paragraph::new(Text::from(body))
         .block(
@@ -7606,14 +7777,17 @@ fn endpoint_note_lines(resolved: Option<(String, String)>) -> Vec<String> {
         None => vec![
             "(no endpoint configured — nothing to log yet)".to_string(),
             String::new(),
-            "F4 → \"Pick a local model\" opens a picker of currently-popular \
-             models (a live".to_string(),
-            "HuggingFace query); choosing one downloads it in a box and serves \
-             it on demand —".to_string(),
-            "no external endpoint or key needed. Opens automatically the first \
-             time.".to_string(),
-            format!("Or configure an external API by hand: {}",
-                    crate::paths::oaita_config_path().display()),
+            "F4 → \"Configure an external API\" edits base_url / model / key \
+             (with a".to_string(),
+            "connection test) and writes oaita.toml — the in-UI way to point \
+             at any".to_string(),
+            "OpenAI-compatible server.".to_string(),
+            String::new(),
+            "F4 → \"Pick a local model\" instead downloads a model in a box and \
+             serves".to_string(),
+            "it on demand — no external endpoint or key needed. Opens \
+             automatically the".to_string(),
+            "first time.".to_string(),
         ],
     }
 }
@@ -8244,6 +8418,8 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
         }
         Pane::ApiLogs => Some(("API calls".into(), vec![
             mk("Open call detail",   "Enter", Action::OpenSelection),
+            mk("Configure an external API (base_url / model / key)…", "",
+               Action::OpenApiConfig),
             mk("Pick a local model (live catalog) & serve it…", "",
                Action::OpenModelPicker),
             mk("Set up the default local endpoint (oaita local)", "",
@@ -8324,6 +8500,7 @@ fn run_action(app: &mut App, a: Action) {
             app.open_pty(vec![self_exe(), "oaita".into(), "local".into()]);
         }
         Action::OpenModelPicker => app.open_model_picker(),
+        Action::OpenApiConfig  => app.open_api_config(),
         Action::OaitaOnSelectedBox => {
             // Ask for the TASK; the session name is derived from the box.
             // Enter runs it all in one shot — no NAME to type, no session
@@ -8737,6 +8914,62 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::ModelUrl { buf }),
         },
+        Modal::ApiConfig { mut base_url, mut model, mut api_key,
+                           mut field, mut result, mut testing } => {
+            let ctrl = mods.contains(KeyModifiers::CONTROL);
+            // Field order matches the render: 0 model · 1 base_url · 2 api_key.
+            let reopen = |app: &mut App, base_url, model, api_key, field,
+                          result, testing| {
+                app.modal = Some(Modal::ApiConfig {
+                    base_url, model, api_key, field, result, testing });
+            };
+            match code {
+                KeyCode::Esc => app.status = "api config cancelled".into(),
+                KeyCode::Tab | KeyCode::Down => {
+                    field = (field + 1) % 3;
+                    reopen(app, base_url, model, api_key, field, result, testing);
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    field = (field + 2) % 3;
+                    reopen(app, base_url, model, api_key, field, result, testing);
+                }
+                // Ctrl-T: fire the connection test with the current values.
+                KeyCode::Char('t') if ctrl => {
+                    testing = true;
+                    result = String::new();
+                    app.start_api_probe(base_url.clone(), model.clone(),
+                                        api_key.clone());
+                    reopen(app, base_url, model, api_key, field, result, testing);
+                }
+                // Ctrl-S or Enter: persist to oaita.toml.
+                KeyCode::Char('s') if ctrl => {
+                    app.status = app.save_api_config(&base_url, &model, &api_key);
+                    if app.status.starts_with("model is required") {
+                        reopen(app, base_url, model, api_key, field,
+                               result, testing);
+                    }
+                }
+                KeyCode::Enter => {
+                    app.status = app.save_api_config(&base_url, &model, &api_key);
+                    if app.status.starts_with("model is required") {
+                        reopen(app, base_url, model, api_key, field,
+                               result, testing);
+                    }
+                }
+                KeyCode::Backspace => {
+                    match field { 0 => &mut model, 1 => &mut base_url,
+                                  _ => &mut api_key }.pop();
+                    reopen(app, base_url, model, api_key, field, result, testing);
+                }
+                KeyCode::Char(c) => {
+                    match field { 0 => &mut model, 1 => &mut base_url,
+                                  _ => &mut api_key }.push(c);
+                    reopen(app, base_url, model, api_key, field, result, testing);
+                }
+                _ => reopen(app, base_url, model, api_key, field,
+                            result, testing),
+            }
+        }
     }
 }
 
@@ -8791,6 +9024,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             // drain a finished background image pull (oci.load) the same way.
             app.pump_load();
             app.pump_models();
+            app.pump_probe();
             if app.structd.pending && app.structd.full_lines.is_none() {
                 app.structd.spin = app.structd.spin.wrapping_add(1);
             }
@@ -10240,6 +10474,7 @@ mod tests {
             load_job: None,
             models_job: None,
             model_picker_offered: false,
+            probe_job: None,
             structd: StructState::default(),
             sel_hunk: 0,
             struct_rx: None,
@@ -10540,6 +10775,7 @@ mod tests {
         for _ in 0..500 {
             app.pump_load();
             app.pump_models();
+            app.pump_probe();
             if app.load_job.is_none() { break; }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -10603,6 +10839,51 @@ mod tests {
         handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
         assert!(matches!(app.modal, Some(Modal::ModelUrl { .. })),
                 "custom-URL row must open the URL entry, not launch a download");
+    }
+
+    /// The external-API editor: three editable fields (model / base_url /
+    /// api_key), Tab cycles them, typing edits the cursored one, and the key
+    /// is masked in the render. The Api-pane menu carries the entry.
+    #[test]
+    fn api_config_editor_edits_and_masks_key() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = headless_app();
+        // menu offers the editor
+        app.focus = Pane::ApiLogs;
+        let (_, items) = pane_action_menu(&app).expect("Api pane menu");
+        assert!(items.iter().any(|i| matches!(i.action, Action::OpenApiConfig)),
+                "menu must offer the external-API editor");
+        // open it: field 0 is `model`
+        app.modal = Some(Modal::ApiConfig {
+            base_url: String::new(), model: String::new(),
+            api_key: String::new(), field: 0, result: String::new(),
+            testing: false });
+        let none = KeyModifiers::empty();
+        for c in "gpt-4o".chars() {
+            handle_modal_key(&mut app, KeyCode::Char(c), none);
+        }
+        // Tab → base_url, type it
+        handle_modal_key(&mut app, KeyCode::Tab, none);
+        for c in "http://h:1/v1".chars() {
+            handle_modal_key(&mut app, KeyCode::Char(c), none);
+        }
+        // Tab → api_key, type a secret
+        handle_modal_key(&mut app, KeyCode::Tab, none);
+        for c in "sk-secret".chars() {
+            handle_modal_key(&mut app, KeyCode::Char(c), none);
+        }
+        match &app.modal {
+            Some(Modal::ApiConfig { model, base_url, api_key, .. }) => {
+                assert_eq!(model, "gpt-4o");
+                assert_eq!(base_url, "http://h:1/v1");
+                assert_eq!(api_key, "sk-secret");
+            }
+            _ => panic!("editor must stay open across edits"),
+        }
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("gpt-4o") && buf.contains("http://h:1/v1"), "{buf}");
+        assert!(!buf.contains("sk-secret"), "api_key must be masked:\n{buf}");
+        assert!(buf.contains("•"), "masked key must render dots:\n{buf}");
     }
 
     #[test]
