@@ -46,6 +46,7 @@ mod rules;
 mod runner;
 mod slippool;
 mod sud;
+mod sudwire;
 mod ui;
 mod views;
 

@@ -86,18 +86,38 @@ not drop in.
 - **Toolchain**: `sud64` is a freestanding gcc build (`make -C tv sud64
   SUD_ADDINS=...`) — outside the engine's cargo-zigbuild musl world. The tv
   import ships without its third-party single-file printf dep; it is now
-  vendored at `tv/libc-fs/deps/printf/` (mpaland/printf, MIT).
+  vendored at `tv/libc-fs/deps/printf/` (mpaland/printf, MIT). The C
+  launcher (`sudtrace`) is absorbed into the Rust runner; translating the
+  wrapper itself to `no_std` Rust is deliberately deferred — its interface
+  (argv flag block in, upper dir + trace stream out) is language-neutral,
+  and a rewrite buys toolchain unification at high regression risk.
 
-## Runner/engine protocol (step 1, subject to change)
+## Runner/engine protocol (step 1 + launcher absorption, subject to change)
 
 - `run --sud` registers with `want_sud: true`, `want_capture: false`,
   `net_mode: "host"`. The engine creates `live/<id>/sud-up` and acks with
   `sud_upper`.
-- The runner execs `$SARUN_SUDTRACE` (or `sudtrace` from PATH):
-  `sudtrace -o live/<id>/sud.trace --passthrough /proc /dev /sys /tmp
-  <state-dir> --overlay /=<sud_upper>+/ -- CMD…` (rule order matters:
-  first-prefix-match wins, carve-outs before the wide rule).
+- The runner IS the sud launcher (tv's `sudtrace` binary is no longer in
+  the loop; only the freestanding `sud64` wrapper remains a foreign
+  artifact, located via `$SARUN_SUD64` or PATH). The runner:
+  - opens `live/<id>/sud.trace` on fd 1023 and the 4 KiB MAP_SHARED
+    wire-state page (memfd, stream-id counter) on fd 1022 — the wrapper
+    contract from tv/sud/sudtrace.c; every traced child inherits both;
+  - writes the TRACE version atom and, from its waitpid loop, the
+    launcher-side EV_EXIT events, via the Rust wire encoder
+    (`engine/src/sudwire.rs` — the seed of the step-2 trace crate; its
+    events decode with tv's own `tools/wiredump` interleaved with
+    wrapper-emitted streams);
+  - probes the target like sudtrace did (PATH resolve, shebang → run the
+    interpreter with the kernel's shebang argv shape, ELF class — a
+    32-bit target fails loud until sud32 is wired);
+  - execs `sud64 --trace-outfile T --remap-rule passthrough:… --remap-rule
+    overlay:/=<sud_upper>+/ CMD…` — the argv flag block from
+    tv/sud/runtime_config.h (rule order matters: first-prefix-match wins,
+    carve-outs before the wide rule).
 - On exit the runner sends `{"type":"sud_ingest","sid":…}` on a fresh
   engine conn; the engine sweeps the upper into the live `BoxState`, then
   the runner drops the box channel (normal EOF teardown).
-- The trace file is written but not yet consumed (step 2).
+- The trace file is written but not yet consumed (step 2). Owning fd 1023
+  in the runner is what lets step 2 switch from a post-exit file read to
+  live streaming.

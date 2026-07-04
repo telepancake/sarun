@@ -661,10 +661,90 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
 }
 
-/// `run --sud` (WIP, see engine/DESIGN-sud.md): run CMD under tv's sudtrace
-/// instead of bwrap+FUSE. Registers with `want_sud`, gets the engine-owned
-/// upper directory back in the ack, launches
-///   sudtrace -o <trace> --passthrough … --overlay /=<upper>+/ -- CMD
+// ── sud launcher (absorbed from tv/sud/sudtrace.c) ──────────────────────────
+// The runner IS the sud launcher now: it owns the trace fd (1023) and the
+// shared wire-state page (1022), writes the TRACE version atom + launcher
+// EV_EXIT events (crate::sudwire), and execs the sud64 wrapper directly
+// with the argv flag block from tv/sud/runtime_config.h. tv's own sudtrace
+// binary is no longer in the loop. See engine/DESIGN-sud.md (WIP).
+
+/// The two high fds the sud wrapper contract reserves (tv/sud/sudtrace.c):
+/// 1023 = trace output, 1022 = MAP_SHARED wire-state page (stream-id
+/// counter). Every traced child inherits both.
+const SUD_OUTPUT_FD: i32 = 1023;
+const SUD_STATE_FD: i32 = 1022;
+
+/// Resolve `cmd0` through PATH like sudtrace's build_wrapper_argv (only
+/// used for probing the target — the wrapper gets the user's argv).
+fn sud_resolve_target(cmd0: &str) -> String {
+    if cmd0.contains('/') { return cmd0.to_string(); }
+    let pathenv = std::env::var("PATH")
+        .unwrap_or_else(|_| "/usr/bin:/bin".into());
+    for seg in pathenv.split(':').filter(|s| !s.is_empty()) {
+        let cand = format!("{seg}/{cmd0}");
+        if unsafe {
+            libc::access(std::ffi::CString::new(cand.as_bytes())
+                .unwrap().as_ptr(), libc::X_OK) == 0
+        } {
+            return cand;
+        }
+    }
+    cmd0.to_string()
+}
+
+/// Probe `path` head bytes: Some((interp, Some(arg))) for a shebang
+/// script, None for anything else. Mirrors sudtrace's parse (first
+/// whitespace-separated token = interpreter, rest = one argument).
+fn sud_shebang(path: &str) -> Option<(String, Option<String>)> {
+    let head = {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut buf = [0u8; 512];
+        let n = f.read(&mut buf).ok()?;
+        buf[..n].to_vec()
+    };
+    if head.len() < 3 || &head[..2] != b"#!" { return None; }
+    let line_end = head.iter().position(|b| *b == b'\n')
+        .unwrap_or(head.len());
+    let line = String::from_utf8_lossy(&head[2..line_end]).into_owned();
+    let line = line.trim_matches(|c| c == ' ' || c == '\t' || c == '\r');
+    let mut it = line.splitn(2, [' ', '\t']);
+    let interp = it.next()?.to_string();
+    if interp.is_empty() { return None; }
+    let arg = it.next()
+        .map(|a| a.trim_matches(|c| c == ' ' || c == '\t' || c == '\r'))
+        .filter(|a| !a.is_empty())
+        .map(String::from);
+    Some((interp, arg))
+}
+
+/// ELF class of `path`: 1 = 32-bit, 2 = 64-bit, 0 = not readable/ELF.
+fn sud_elf_class(path: &str) -> u8 {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return 0 };
+    let mut e = [0u8; 5];
+    if f.read_exact(&mut e).is_err() { return 0; }
+    if &e[..4] != b"\x7fELF" { return 0; }
+    e[4]
+}
+
+/// /proc/<pid>/status field parse with sudtrace's fallbacks
+/// (tgid → pid, ppid → 0) — reaped pids read back absent.
+fn sud_proc_field(pid: i32, field: &str, fallback: i32) -> i32 {
+    let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        else { return fallback };
+    s.lines()
+        .find_map(|l| l.strip_prefix(field))
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(fallback)
+}
+
+/// `run --sud` (WIP, see engine/DESIGN-sud.md): run CMD under the sud64
+/// wrapper instead of bwrap+FUSE. Registers with `want_sud`, gets the
+/// engine-owned upper directory back in the ack, sets up the sud launcher
+/// contract itself (fds 1022/1023, version atom, EXIT events), execs
+///   sud64 --trace-outfile T --remap-rule … -- resolved CMD
 /// and, after the child exits, asks the engine (fresh conn, `sud_ingest`)
 /// to sweep the upper into the box's sqlar. The register conn stays open
 /// for the duration — its EOF after the sweep is the normal box teardown.
@@ -679,9 +759,9 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                    supported yet (see engine/DESIGN-sud.md).");
         return 2;
     }
-    let sudtrace = std::env::var("SARUN_SUDTRACE")
+    let sud64 = std::env::var("SARUN_SUD64")
         .ok().filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "sudtrace".to_string());
+        .unwrap_or_else(|| "sud64".to_string());
     let sock = paths::sock_path();
     let conn = match UnixStream::connect(&sock) {
         Ok(c) => c,
@@ -733,32 +813,147 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         .parent().map(|p| p.join("sud.trace"))
         .unwrap_or_else(|| "sud.trace".into());
     eprintln!("sarun-engine: box {sid}  (sud upper: {upper})");
-    // Rule order matters (first-prefix-match wins): carve the pseudo
-    // filesystems and sarun's own state tree out BEFORE the wide `/` rule.
-    // /tmp passthrough is a step-1 stopgap — see DESIGN-sud.md gaps.
-    let state_dir = crate::paths::state_home();
-    let mut sc = Command::new(&sudtrace);
-    sc.arg("-o").arg(&trace);
-    for p in ["/proc", "/dev", "/sys", "/tmp"] {
-        sc.args(["--passthrough", p]);
+    // Probe the target the way sudtrace did: PATH-resolve, shebang, ELF
+    // class (we ship only the 64-bit wrapper — fail LOUD on a 32-bit
+    // target, no silent downgrade).
+    let resolved = sud_resolve_target(&cmd[0]);
+    let shebang = sud_shebang(&resolved);
+    let probe = shebang.as_ref().map(|(i, _)| i.as_str())
+        .unwrap_or(resolved.as_str());
+    if sud_elf_class(probe) == 1 {
+        eprintln!("sarun-engine run --sud: {probe} is a 32-bit ELF; only \
+                   the sud64 wrapper is wired up (sud32 support pending).");
+        return 2;
     }
-    sc.arg("--passthrough").arg(&state_dir);
-    sc.arg("--overlay").arg(format!("/={upper}+/"));
-    sc.arg("--");
-    sc.args(&cmd);
-    if let Some(d) = &chdir { sc.current_dir(d); }
-    let status = sc.status();
-    let code = match status {
-        Ok(s) => s.code().unwrap_or(1),
+    // Launcher contract, absorbed from tv/sud/sudtrace.c: the trace file
+    // on fd 1023 and the 4 KiB MAP_SHARED wire-state page (stream-id
+    // counter) on fd 1022, both inherited by every traced child. We take
+    // launcher stream id (first fetch-and-add) and write the TRACE
+    // version atom before any event.
+    let trace_abs = trace.to_string_lossy().into_owned();
+    let out = match std::fs::File::create(&trace) {
+        Ok(f) => f,
         Err(e) => {
-            eprintln!("sarun-engine: exec {sudtrace}: {e}\n\
-                       hint: build it with `make -C tv sudtrace sud64 \
-                       SUD_ADDINS=\"sud/trace sud/path_remap sud/cmd-rewrite \
-                       sud/fake-exec sud/inramfs\"` and put it on PATH or \
-                       point SARUN_SUDTRACE at it.");
-            127
+            eprintln!("sarun-engine: create {}: {e}", trace.display());
+            return 1;
         }
     };
+    use std::os::fd::IntoRawFd;
+    let stream_id: u32;
+    let state_page: *mut u32;
+    unsafe {
+        let ofd = out.into_raw_fd();
+        if libc::dup2(ofd, SUD_OUTPUT_FD) < 0 {
+            eprintln!("sarun-engine: dup2 trace fd: {}",
+                      std::io::Error::last_os_error());
+            return 1;
+        }
+        libc::close(ofd); // dup2'd fd is not CLOEXEC — children inherit
+        let mfd = libc::syscall(libc::SYS_memfd_create,
+                                c"sud_wire_state".as_ptr(), 0u32) as i32;
+        if mfd < 0 || libc::ftruncate(mfd, 4096) < 0
+            || libc::dup2(mfd, SUD_STATE_FD) < 0 {
+            eprintln!("sarun-engine: wire state page: {}",
+                      std::io::Error::last_os_error());
+            return 1;
+        }
+        if mfd != SUD_STATE_FD { libc::close(mfd); }
+        let p = libc::mmap(std::ptr::null_mut(), 4096,
+                           libc::PROT_READ | libc::PROT_WRITE,
+                           libc::MAP_SHARED, SUD_STATE_FD, 0);
+        if p == libc::MAP_FAILED {
+            eprintln!("sarun-engine: mmap wire state: {}",
+                      std::io::Error::last_os_error());
+            return 1;
+        }
+        state_page = p.cast();
+        // struct sud_shared { volatile uint32_t next_stream_id; } — the
+        // page is zero-filled; post-increment value is our stream id
+        // (launcher = 1, children take 2, 3, … the same way).
+        stream_id = (*std::sync::atomic::AtomicU32::from_ptr(state_page))
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let va = crate::sudwire::version_atom();
+        let _ = write_all_fd(SUD_OUTPUT_FD, &va);
+    }
+    // Wrapper argv: flag block (runtime_config.h shapes), then the target.
+    // Rule order matters (first-prefix-match wins): carve the pseudo
+    // filesystems and sarun's own state tree out BEFORE the wide `/`
+    // overlay. /tmp passthrough is a step-1 stopgap — see DESIGN-sud.md.
+    let state_dir = crate::paths::state_home();
+    let mut sc = Command::new(&sud64);
+    sc.arg("--trace-outfile").arg(&trace_abs);
+    for p in ["/proc", "/dev", "/sys", "/tmp"] {
+        sc.args(["--remap-rule", &format!("passthrough:{p}")]);
+    }
+    sc.arg("--remap-rule")
+        .arg(format!("passthrough:{}", state_dir.display()));
+    sc.arg("--remap-rule").arg(format!("overlay:/={upper}+/"));
+    match &shebang {
+        Some((interp, arg)) => {
+            // Script: wrapper runs the interpreter with the kernel's
+            // shebang argv shape (interp [arg] script args…).
+            sc.arg(interp);
+            if let Some(a) = arg { sc.arg(a); }
+            sc.arg(&resolved);
+            sc.args(&cmd[1..]);
+        }
+        None => { sc.args(&cmd); }
+    }
+    if let Some(d) = &chdir { sc.current_dir(d); }
+    let child = match sc.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sarun-engine: exec {sud64}: {e}\n\
+                       hint: build it with `make -C tv sud64 \
+                       SUD_ADDINS=\"sud/trace sud/path_remap sud/cmd-rewrite \
+                       sud/fake-exec sud/inramfs\"` and put it on PATH or \
+                       point SARUN_SUD64 at it.");
+            return 127;
+        }
+    };
+    // Launcher wait loop (sudtrace's): reap every descendant that lands
+    // on us, emit an EV_EXIT per real termination of a thread-group
+    // leader, stop when the wrapper child itself is done.
+    let child_pid = child.id() as i32;
+    let mut ev = crate::sudwire::EvState::default();
+    let mut code = 1;
+    loop {
+        let mut wstatus: i32 = 0;
+        let wpid = unsafe { libc::waitpid(-1, &mut wstatus, libc::__WALL) };
+        if wpid < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) { continue; }
+            break; // ECHILD: nothing left to reap
+        }
+        if wpid == 0 { continue; }
+        if !libc::WIFEXITED(wstatus) && !libc::WIFSIGNALED(wstatus) {
+            continue; // stopped/continued — keep waiting
+        }
+        let tgid = sud_proc_field(wpid, "Tgid:", wpid);
+        if wpid == tgid || wpid == child_pid {
+            let ppid = sud_proc_field(wpid, "PPid:", 0);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64).unwrap_or(0);
+            let buf = ev.build_exit(stream_id, ts, wpid as i64,
+                                    tgid as i64, ppid as i64, wstatus);
+            let _ = write_all_fd(SUD_OUTPUT_FD, &buf);
+        }
+        if wpid == child_pid {
+            code = if libc::WIFEXITED(wstatus) {
+                libc::WEXITSTATUS(wstatus)
+            } else {
+                128 + libc::WTERMSIG(wstatus)
+            };
+            break;
+        }
+    }
+    unsafe {
+        libc::munmap(state_page.cast(), 4096);
+        libc::close(SUD_OUTPUT_FD);
+        libc::close(SUD_STATE_FD);
+    }
+    drop(child); // already reaped by our waitpid; Child::drop doesn't wait
     // Sweep the upper into the box's sqlar on a FRESH conn (the register
     // conn is the box channel; a verb on it would desync teardown).
     match UnixStream::connect(&sock) {
