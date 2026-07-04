@@ -1055,16 +1055,43 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
 #endif
 
     /* ---- execve / execveat ------------------------------------- */
+    /* A target UNDER THE INRAMFS MOUNT must NOT be overlay-rewritten: the
+     * binary lives in the inode store, not on the kernel FS or in any
+     * overlay upper.  Leave the path arg untouched so the SIGSYS handler's
+     * build_exec_argv (elf.c) takes the inramfs exec path — read the ELF
+     * via the inramfs ops, prepend sud{32,64}, and let the child wrapper
+     * re-adopt the binary from a memfd.  Without this guard, an
+     * `overlay:/` rule (always present in the sarun runner) composes
+     * /tmp/prog into a nonexistent upper path and execve ENOENTs — while
+     * a RELATIVE exec of the same binary worked, because relative paths
+     * fall through remap unrewritten. Mirrors handle_chdir's inramfs
+     * classification. */
+#if defined(SYS_execve) || defined(SYS_execveat)
+    {
+        int is_exec = 0, path_idx = 0, dirfd = AT_FDCWD;
 #ifdef SYS_execve
-    if (nr == SYS_execve) {
-        int rc = remap_path_arg(ctx, 0, 0);
-        return handle_overlay_result(ctx, rc);
-    }
+        if (nr == SYS_execve) { is_exec = 1; path_idx = 0; }
 #endif
 #ifdef SYS_execveat
-    if (nr == SYS_execveat) {
-        int rc = remap_path_arg_at(ctx, 0, 1, 0);
-        return handle_overlay_result(ctx, rc);
+        if (nr == SYS_execveat) {
+            is_exec = 1; path_idx = 1; dirfd = (int)ctx->args[0];
+        }
+#endif
+        if (is_exec) {
+#ifdef SUD_ADDIN_INRAMFS
+            const char *epath = (const char *)ctx->args[path_idx];
+            if (epath && sud_pr_inramfs_mount_path()) {
+                char eabs[PATH_MAX];
+                int arc = sud_pr_absolutise(dirfd, epath, eabs, sizeof(eabs));
+                if (arc == 0 && sud_pr_inramfs_path_under_mount(eabs))
+                    return 0;   /* inramfs exec: leave for build_exec_argv */
+            }
+#endif
+            int rc = (path_idx == 0)
+                   ? remap_path_arg(ctx, 0, 0)
+                   : remap_path_arg_at(ctx, 0, 1, 0);
+            return handle_overlay_result(ctx, rc);
+        }
     }
 #endif
 

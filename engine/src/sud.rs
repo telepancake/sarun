@@ -325,6 +325,54 @@ pub fn ingest_upper(b: &BoxState, upper: &Path, runpid: u32,
     (n, errs)
 }
 
+/// Read every extended attribute off the upper file at `p` (via
+/// l*xattr, so symlinks aren't followed) and mirror it into the box's
+/// sqlar. The box set these through the wrapper's intercepted setxattr,
+/// which lands them as real xattrs on the upper file. `trusted.overlay.*`
+/// is skipped defensively (a real-overlayfs internal namespace; sud uses
+/// char-dev whiteouts, not xattrs, so it should never appear — but a host
+/// file copied up could carry one).
+fn capture_xattrs(b: &BoxState, p: &Path, rel: &str, errs: &mut Vec<String>) {
+    let cpath = match std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) {
+        Ok(c) => c, Err(_) => return,
+    };
+    let sz = unsafe {
+        libc::llistxattr(cpath.as_ptr(), std::ptr::null_mut(), 0)
+    };
+    if sz <= 0 { return; } // 0 = none, <0 = unsupported/gone: nothing to do
+    let mut names = vec![0u8; sz as usize];
+    let got = unsafe {
+        libc::llistxattr(cpath.as_ptr(), names.as_mut_ptr().cast(),
+                         names.len())
+    };
+    if got <= 0 { return; }
+    names.truncate(got as usize);
+    for key in names.split(|c| *c == 0).filter(|k| !k.is_empty()) {
+        let Ok(kstr) = std::str::from_utf8(key) else { continue };
+        if kstr.starts_with("trusted.overlay.") { continue; }
+        let ckey = match std::ffi::CString::new(key) {
+            Ok(c) => c, Err(_) => continue,
+        };
+        let vsz = unsafe {
+            libc::lgetxattr(cpath.as_ptr(), ckey.as_ptr(),
+                            std::ptr::null_mut(), 0)
+        };
+        if vsz < 0 { continue; }
+        let mut val = vec![0u8; vsz as usize];
+        let vgot = unsafe {
+            libc::lgetxattr(cpath.as_ptr(), ckey.as_ptr(),
+                            val.as_mut_ptr().cast(), val.len())
+        };
+        if vgot < 0 {
+            errs.push(format!("{rel}: getxattr {kstr}: {}",
+                              std::io::Error::last_os_error()));
+            continue;
+        }
+        val.truncate(vgot as usize);
+        b.set_xattr(rel, kstr, &val);
+    }
+}
+
 fn walk(b: &BoxState, dir: &Path, rel: &str, fallback: i64,
         writers: &HashMap<String, i64>,
         n: &mut usize, errs: &mut Vec<String>) {
@@ -350,6 +398,7 @@ fn walk(b: &BoxState, dir: &Path, rel: &str, fallback: i64,
         let writer = writers.get(&crel).copied().unwrap_or(fallback);
         if ftype.is_dir() {
             b.set_dir(&crel, mode, writer);
+            capture_xattrs(b, &p, &crel, errs);
             *n += 1;
             walk(b, &p, &crel, fallback, writers, n, errs);
         } else if ftype.is_symlink() {
@@ -373,6 +422,7 @@ fn walk(b: &BoxState, dir: &Path, rel: &str, fallback: i64,
                         .saturating_mul(1_000_000_000)
                         .saturating_add(md.mtime_nsec());
                     b.finalize_file(&crel, sz as i64, mtime_ns, writer);
+                    capture_xattrs(b, &p, &crel, errs);
                     *n += 1;
                 }
                 Err(e) => errs.push(format!("{crel}: blob copy: {e}")),

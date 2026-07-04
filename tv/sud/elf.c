@@ -276,6 +276,19 @@ int resolve_path(const char *cmd, char *out, int out_sz)
         if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
         memcpy(out, cmd, clen);
         out[clen] = '\0';
+#ifdef SUD_ADDIN_INRAMFS
+        /* An absolute path UNDER THE INRAMFS MOUNT is served by the inode
+         * store, not the kernel or any overlay upper — do NOT run the
+         * overlay resolver on it (that would rewrite e.g. /tmp/prog into a
+         * nonexistent overlay upper path when an `overlay:/` rule is also
+         * configured, ir_access would fail, build_exec_argv would bail, and
+         * the kernel would get an uninstrumented execve of an inramfs path
+         * it cannot see → ENOENT).  The inramfs exec path (ir_access here +
+         * the loader's memfd re-adoption) handles it directly.  This mirrors
+         * the relative-path inramfs arm below. */
+        if (ir_path_is_inramfs(out))
+            return (ir_access(out, X_OK) == 0);
+#endif
 #ifdef SUD_ADDIN_PATH_REMAP
         /* Apply --remap / --overlay rules before checking accessibility:
          * the wrapper has to load the *real* binary off disk (the kernel

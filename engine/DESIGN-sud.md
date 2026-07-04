@@ -92,6 +92,34 @@ not drop in.
 3. Only then: the store. Alternate `BoxState` backend on depot/strpool
    mechanics, sqlar kept as an export for the Python tooling.
 
+## Equivalence testing (prototype/test_sud_equiv_rs.py)
+
+sud is a REPLACEMENT mechanism, so the load-bearing test is not a bespoke
+sud test but running the SAME workload through both backends and asserting
+the captured sqlar agrees. `test_sud_equiv_rs.py` (also `make test-sud`)
+runs one workload under FUSE and under sud and checks field-for-field
+equivalence on: file permission bits, a user.* xattr, char-dev tombstones
+(== whiteouts hiding a host/lower file), content + nested-subdir capture,
+and a program executed from the HOST filesystem. It then checks two
+sud-only exec capabilities with no FUSE analogue: executing an ELF binary
+that lives in the box's inramfs /tmp, and a nested (same-in-same) box
+executing a binary in its PARENT box's captured layer. Temp dirs live under
+/var/tmp on purpose — the box's /tmp is an inramfs mount, so engine state
+(which holds the overlay upper) must not sit under /tmp.
+
+Two bugs this test surfaced and that are now fixed:
+- The sud sweep did not capture xattrs. `sud::capture_xattrs` now reads
+  each upper file's l*xattr set into the sqlar (skipping trusted.overlay.*).
+- Executing a binary in inramfs /tmp failed whenever an `overlay:/` rule
+  was also configured (i.e. always, in the sarun runner): the execve
+  pre-syscall dispatcher overlay-rewrote the inramfs path to a nonexistent
+  upper path before build_exec_argv saw it. Fixed in tv: the execve/
+  execveat dispatch (path_remap/addin.c) now classifies the target against
+  the inramfs mount and leaves inramfs paths un-rewritten for the loader's
+  memfd exec path, and resolve_path's absolute arm (elf.c) skips the
+  overlay resolver for inramfs paths. A RELATIVE exec of the same binary
+  already worked; only the absolute path was broken.
+
 ## Composition: same-in-same nesting (implemented), mixed (sketch)
 
 Same-in-same nesting preserves the full model on both sides, and both
