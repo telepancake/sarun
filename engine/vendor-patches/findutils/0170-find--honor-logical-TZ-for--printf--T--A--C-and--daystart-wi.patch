@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 21:09:47 +0000
+Subject: [PATCH] find: honor logical TZ for -printf %T/%A/%C and -daystart without mutating process TZ
+
+---
+diff --git a/Cargo.toml b/Cargo.toml
+index 8b8cc83..77a85e1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,6 +16,9 @@ authors = ["uutils developers"]
+ [dependencies]
+ argmax = "0.4.0"
+ chrono = "0.4.45"
++# sarun: resolve the box shell's LOGICAL `TZ` to per-timestamp UTC offsets for
++# `-printf %T/%A/%C` and `-daystart`, without mutating the engine process TZ.
++jiff = "0.2"
+ clap = { version = "4.6", features = ["env"] }
+ faccess = "0.2.4"
+ nix = { version = "0.31", features = ["fs", "user"] }
+diff --git a/src/find/matchers/mod.rs b/src/find/matchers/mod.rs
+index 30c0a81..c9a7e78 100644
+--- a/src/find/matchers/mod.rs
++++ b/src/find/matchers/mod.rs
+@@ -196,6 +196,48 @@ impl MatcherIO<'_> {
+     pub fn confirm(&self, prompt: &str) -> bool {
+         self.deps.confirm(prompt)
+     }
++
++    /// sarun: the embedder's LOGICAL `TZ` name (`Dependencies::tz`), or `None` to
++    /// fall back to the process local zone (chrono `Local`).
++    #[must_use]
++    pub fn tz(&self) -> Option<String> {
++        self.deps.tz()
++    }
++}
++
++/// sarun: resolve a LOGICAL `TZ` name to the UTC offset in effect AT `time`,
++/// as a `chrono::FixedOffset` — the seam that lets `-printf %T/%A/%C` and
++/// `-daystart` honor the box shell's `export TZ=…` without the engine process
++/// mutating its own `TZ` (racy across concurrent in-process pipelines).
++///
++/// Honored forms (via `jiff`): an IANA name (`Asia/Tokyo`, `UTC`, optional
++/// leading `:`) resolved against the system zoneinfo, a POSIX TZ string
++/// (`JST-9`, `EST5EDT`), and empty `TZ` (POSIX: UTC). Anything that resolves to
++/// none of these yields `None`, and the caller falls back to chrono `Local`
++/// (the process zone) — i.e. today's behavior. DST is handled per-`time`: the
++/// offset is looked up at that instant, so a file whose time falls in a
++/// different DST period than "now" gets its own correct offset.
++#[must_use]
++pub(crate) fn logical_offset(tz_name: &str, time: SystemTime) -> Option<chrono::FixedOffset> {
++    let spec = tz_name.strip_prefix(':').unwrap_or(tz_name);
++    let tz = if spec.is_empty() {
++        jiff::tz::TimeZone::UTC
++    } else if let Ok(z) = jiff::tz::TimeZone::get(spec) {
++        z
++    } else if let Ok(z) = jiff::tz::TimeZone::posix(spec) {
++        z
++    } else {
++        return None;
++    };
++    let ts = match time.duration_since(SystemTime::UNIX_EPOCH) {
++        Ok(d) => jiff::Timestamp::new(d.as_secs() as i64, d.subsec_nanos() as i32).ok()?,
++        Err(e) => {
++            // pre-epoch time
++            let d = e.duration();
++            jiff::Timestamp::new(-(d.as_secs() as i64), -(d.subsec_nanos() as i32)).ok()?
++        }
++    };
++    chrono::FixedOffset::east_opt(tz.to_offset(ts).seconds())
+ }
+ 
+ /// A basic interface that can be used to determine whether a directory entry
+diff --git a/src/find/matchers/printf.rs b/src/find/matchers/printf.rs
+index 5d58088..fe57443 100644
+--- a/src/find/matchers/printf.rs
++++ b/src/find/matchers/printf.rs
+@@ -10,9 +10,9 @@ use std::path::Path;
+ use std::time::SystemTime;
+ use std::{borrow::Cow, io::Write};
+ 
+-use chrono::{format::StrftimeItems, DateTime, Local};
++use chrono::{format::StrftimeItems, DateTime, FixedOffset, Local, Utc};
+ 
+-use super::{FileType, Matcher, MatcherIO, WalkEntry, WalkError};
++use super::{logical_offset, FileType, Matcher, MatcherIO, WalkEntry, WalkError};
+ 
+ #[cfg(unix)]
+ use std::os::unix::prelude::MetadataExt;
+@@ -37,7 +37,14 @@ enum TimeFormat {
+ }
+ 
+ impl TimeFormat {
+-    fn apply(&self, time: SystemTime) -> Result<Cow<'static, str>, Box<dyn Error>> {
++    /// `tz` is the box shell's LOGICAL `TZ` name (sarun): when `Some(name)` that
++    /// resolves to a zone, the wall-clock is rendered in it; otherwise (and for
++    /// the standalone binary) the process local zone (`Local`) is used, exactly
++    /// as upstream. Rendering routes through `format_in_zone`, which formats in a
++    /// per-instant `FixedOffset` for the logical case and in `Local` otherwise —
++    /// byte-identical for all wall-clock specifiers.
++    fn apply(&self, time: SystemTime, tz: Option<&str>) -> Result<Cow<'static, str>, Box<dyn Error>> {
++        let offset = tz.and_then(|name| logical_offset(name, time));
+         let formatted = match self {
+             Self::SinceEpoch => {
+                 let duration = time.duration_since(SystemTime::UNIX_EPOCH)?;
+@@ -45,17 +52,12 @@ impl TimeFormat {
+             }
+             Self::Ctime => {
+                 const CTIME_FORMAT: &str = "%a %b %d %H:%M:%S.%f0 %Y";
+-
+-                DateTime::<Local>::from(time)
+-                    .format(CTIME_FORMAT)
+-                    .to_string()
++                format_in_zone(time, offset, CTIME_FORMAT)
+             }
+             Self::Strftime(format) => {
+                 // Handle a special case
+                 let custom_format = format.replace("%+", "%Y-%m-%d+%H:%M:%S%.f0");
+-                DateTime::<Local>::from(time)
+-                    .format(&custom_format)
+-                    .to_string()
++                format_in_zone(time, offset, &custom_format)
+             }
+         };
+ 
+@@ -63,6 +65,20 @@ impl TimeFormat {
+     }
+ }
+ 
++/// Format `time` with strftime `format`, in `offset` when `Some` (the box's
++/// LOGICAL zone) or the process local zone otherwise. The `Some` branch converts
++/// via UTC then `with_timezone(&offset)`; the wall-clock components are identical
++/// to what a `chrono::Local` in that zone would produce.
++fn format_in_zone(time: SystemTime, offset: Option<FixedOffset>, format: &str) -> String {
++    match offset {
++        Some(off) => DateTime::<Utc>::from(time)
++            .with_timezone(&off)
++            .format(format)
++            .to_string(),
++        None => DateTime::<Local>::from(time).format(format).to_string(),
++    }
++}
++
+ #[derive(Debug, PartialEq, Eq)]
+ enum PermissionsFormat {
+     Octal,
+@@ -380,6 +396,7 @@ fn format_non_link_file_type(file_type: FileType) -> char {
+ fn format_directive<'entry>(
+     file_info: &'entry WalkEntry,
+     directive: &FormatDirective,
++    tz: Option<&str>,
+ ) -> Result<Cow<'entry, str>, Box<dyn Error>> {
+     let meta = || file_info.metadata();
+ 
+@@ -390,7 +407,7 @@ fn format_directive<'entry>(
+     // still done at all).
+ 
+     let res: Cow<'entry, str> = match directive {
+-        FormatDirective::AccessTime(tf) => tf.apply(meta()?.accessed()?)?,
++        FormatDirective::AccessTime(tf) => tf.apply(meta()?.accessed()?, tz)?,
+ 
+         FormatDirective::Basename => file_info.file_name().to_string_lossy(),
+ 
+@@ -411,7 +428,7 @@ fn format_directive<'entry>(
+         }
+ 
+         #[cfg(not(unix))]
+-        FormatDirective::ChangeTime(tf) => tf.apply(meta()?.modified()?)?,
++        FormatDirective::ChangeTime(tf) => tf.apply(meta()?.modified()?, tz)?,
+         #[cfg(unix)]
+         FormatDirective::ChangeTime(tf) => {
+             use std::time::Duration;
+@@ -420,7 +437,7 @@ fn format_directive<'entry>(
+             let ctime = SystemTime::UNIX_EPOCH
+                 + Duration::from_secs(meta.ctime() as u64)
+                 + Duration::from_nanos(meta.ctime_nsec() as u64);
+-            tf.apply(ctime)?
++            tf.apply(ctime, tz)?
+         }
+ 
+         FormatDirective::Depth => file_info.depth().to_string().into(),
+@@ -480,7 +497,7 @@ fn format_directive<'entry>(
+         #[cfg(unix)]
+         FormatDirective::Inode => meta()?.ino().to_string().into(),
+ 
+-        FormatDirective::ModificationTime(tf) => tf.apply(meta()?.modified()?)?,
++        FormatDirective::ModificationTime(tf) => tf.apply(meta()?.modified()?, tz)?,
+ 
+         FormatDirective::Path {
+             strip_starting_point,
+@@ -589,7 +606,13 @@ impl Printf {
+         })
+     }
+ 
+-    fn print(&self, file_info: &WalkEntry, mut out: impl Write, err_out: &mut dyn Write) {
++    fn print(
++        &self,
++        file_info: &WalkEntry,
++        mut out: impl Write,
++        err_out: &mut dyn Write,
++        tz: Option<&str>,
++    ) {
+         for component in &self.format.components {
+             match component {
+                 FormatComponent::Literal(literal) => write!(out, "{literal}").unwrap(),
+@@ -598,7 +621,7 @@ impl Printf {
+                     directive,
+                     width,
+                     justify,
+-                } => match format_directive(file_info, directive) {
++                } => match format_directive(file_info, directive, tz) {
+                     Ok(content) => {
+                         if let Some(width) = width {
+                             match justify {
+@@ -631,11 +654,15 @@ impl Printf {
+ 
+ impl Matcher for Printf {
+     fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
++        // sarun: the box shell's LOGICAL TZ (None ⇒ process local zone).
++        let tz = matcher_io.tz();
++        let tz = tz.as_deref();
+         if let Some(file) = &self.output_file {
+             self.print(
+                 file_info,
+                 file,
+                 &mut *matcher_io.deps.get_error_output().borrow_mut(),
++                tz,
+             );
+         } else {
+             // Borrow the two distinct sinks (output, error) from deps separately.
+@@ -644,6 +671,7 @@ impl Matcher for Printf {
+                 file_info,
+                 &mut *matcher_io.deps.get_output().borrow_mut(),
+                 &mut *err.borrow_mut(),
++                tz,
+             );
+         }
+ 
+diff --git a/src/find/matchers/time.rs b/src/find/matchers/time.rs
+index 3dbd2ce..c1472a8 100644
+--- a/src/find/matchers/time.rs
++++ b/src/find/matchers/time.rs
+@@ -13,19 +13,33 @@ use chrono::{DateTime, Local, Timelike};
+ #[cfg(unix)]
+ use std::os::unix::fs::MetadataExt;
+ 
+-use super::{ComparableValue, Follow, Matcher, MatcherIO, WalkEntry};
++use super::{logical_offset, ComparableValue, Follow, Matcher, MatcherIO, WalkEntry};
+ 
+ const SECONDS_PER_DAY: i64 = 60 * 60 * 24;
+ 
+ fn get_time(matcher_io: &mut MatcherIO, today_start: bool) -> SystemTime {
+     if today_start {
+-        // the time at 00:00:00 of today
+-        let duration_since_unix_epoch = matcher_io.now().duration_since(UNIX_EPOCH).unwrap();
++        // the time at 00:00:00 of today, in the box's LOGICAL zone (sarun): the
++        // shell's `export TZ=…` decides which midnight `-daystart` counts from,
++        // just as it would for a real find child. `logical_offset` returns the
++        // per-instant offset; `None` (unset/unresolved, and the standalone
++        // binary) falls back to the process local zone (chrono `Local`).
++        let now = matcher_io.now();
++        let duration_since_unix_epoch = now.duration_since(UNIX_EPOCH).unwrap();
+         let seconds_since_unix_epoch = duration_since_unix_epoch.as_secs();
+         let utc_time = DateTime::from_timestamp(seconds_since_unix_epoch as i64, 0).unwrap();
+-        let local_time = utc_time.with_timezone(&Local);
+-        let seconds_since_last_midnight = local_time.num_seconds_from_midnight();
+-        let local_midnight_seconds = local_time.timestamp() - seconds_since_last_midnight as i64;
++        let (seconds_since_last_midnight, ts) =
++            match matcher_io.tz().as_deref().and_then(|n| logical_offset(n, now)) {
++                Some(off) => {
++                    let local_time = utc_time.with_timezone(&off);
++                    (local_time.num_seconds_from_midnight(), local_time.timestamp())
++                }
++                None => {
++                    let local_time = utc_time.with_timezone(&Local);
++                    (local_time.num_seconds_from_midnight(), local_time.timestamp())
++                }
++            };
++        let local_midnight_seconds = ts - seconds_since_last_midnight as i64;
+ 
+         UNIX_EPOCH + Duration::from_secs(local_midnight_seconds as u64)
+     } else {
+diff --git a/src/find/mod.rs b/src/find/mod.rs
+index 83ba1ca..f0d63a6 100644
+--- a/src/find/mod.rs
++++ b/src/find/mod.rs
+@@ -122,6 +122,15 @@ pub trait Dependencies {
+         let _ = (argv, cwd);
+         127
+     }
++    /// sarun: the embedder's LOGICAL `TZ` (the box shell's `export TZ=…`), used
++    /// to render `-printf %T/%A/%C` and compute `-daystart` local midnight in the
++    /// box's zone rather than the engine PROCESS's zone. `None` (the standalone
++    /// binary, and the default) means "use the process local zone" — today's
++    /// behavior, driven by the process `TZ` via chrono `Local`. See
++    /// `matchers::logical_offset` for the honored forms.
++    fn tz(&self) -> Option<String> {
++        None
++    }
+ }
+ 
+ /// Struct that holds the dependencies we use when run as the real executable.

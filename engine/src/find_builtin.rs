@@ -34,6 +34,10 @@ struct BrushFindDeps {
     stdin: RefCell<Box<dyn BufRead>>,
     now: SystemTime,
     cwd: std::path::PathBuf,
+    /// The box shell's LOGICAL `TZ` (its `export TZ=…`), or `None` when unset.
+    /// Steers `-printf %T/%A/%C` and `-daystart` to the box's zone without the
+    /// engine process mutating its own `TZ`. See `Dependencies::tz`.
+    tz: Option<String>,
     submitter: builtin_exec::ExecSubmitter,
 }
 
@@ -73,6 +77,11 @@ impl Dependencies for BrushFindDeps {
         Some(&self.cwd)
     }
 
+    fn tz(&self) -> Option<String> {
+        // Logical TZ: the box shell's `export TZ=…`, snapshotted at spawn.
+        self.tz.clone()
+    }
+
     fn exec_via_shell(&self) -> bool {
         true
     }
@@ -108,6 +117,15 @@ impl brush_core::builtins::Command for FindBuiltin {
         let input = context.stdin();
         let cwd = context.shell.working_dir().to_path_buf();
 
+        // Snapshot the box shell's LOGICAL exported `TZ` (only exported vars
+        // reach a child), so `-printf %T` / `-daystart` render in the box's zone.
+        let tz = context
+            .shell
+            .env()
+            .iter_exported()
+            .find(|(k, _)| k.as_str() == "TZ")
+            .map(|(_, v)| v.value().to_cow_str(context.shell).to_string());
+
         // Execution bridge: find (thread) submits -exec argvs; executor runs each
         // through run_argv on a subshell clone.
         let (submitter, rx) = builtin_exec::channel();
@@ -121,6 +139,7 @@ impl brush_core::builtins::Command for FindBuiltin {
                     stdin: RefCell::new(Box::new(BufReader::new(input))),
                     now: SystemTime::now(),
                     cwd,
+                    tz,
                     submitter,
                 };
                 let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();

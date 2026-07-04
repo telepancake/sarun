@@ -2005,6 +2005,7 @@ dependencies = [
  "clap",
  "faccess",
  "itertools 0.15.0",
+ "jiff",
  "nix 0.31.3",
  "onig",
  "regex",

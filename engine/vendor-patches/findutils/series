@@ -14,3 +14,4 @@
 0140-find-run-exec-execdir-commands-through-brush-not-exec.patch
 0150-xargs-restore-GNU-exit-codes-for-not-found-signal-death-audi.patch
 0160-xargs-find--exec-children-inherit-the-logical-shell-env.patch
+0170-find--honor-logical-TZ-for--printf--T--A--C-and--daystart-wi.patch
