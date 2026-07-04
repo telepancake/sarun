@@ -306,6 +306,7 @@ impl brush_core::builtins::SimpleCommand for WcBuiltin {
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
+        let cwd = context.shell.working_dir().to_path_buf();
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
@@ -321,7 +322,7 @@ impl brush_core::builtins::SimpleCommand for WcBuiltin {
             // SAFETY: fd is owned by an OpenFile that outlives this call.
             let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
             let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-            let r = match uu_wc::wc(argv.into_iter(), &mut out, out_fd, &mut err, &mut inp, in_fd) {
+            let r = match uu_wc::wc(argv.into_iter(), &cwd, &mut out, out_fd, &mut err, &mut inp, in_fd) {
                 Ok(()) => 0,
                 Err(e) => e.code(),
             };

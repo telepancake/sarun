@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 16:41:35 +0000
+Subject: [PATCH] wc: entry takes logical cwd; join relative file and files0-from operands
+
+---
+diff --git a/src/wc.rs b/src/wc.rs
+index 68700b1..1ce6897 100644
+--- a/src/wc.rs
++++ b/src/wc.rs
+@@ -134,6 +134,34 @@ mod options {
+ static ARG_FILES: &str = "files";
+ static STDIN_REPR: &str = "-";
+ 
++thread_local! {
++    /// The call's logical cwd. A relative FILE operand — and a `--files0-from=F`
++    /// value, and every relative path read FROM F — is rooted here for OPEN
++    /// (the process is never `chdir`'d). Empty => the standalone binary, which
++    /// resolves operands against the process cwd. Set by [`wc`], cleared after.
++    static WC_CWD: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
++}
++
++/// Root a relative operand at the call's logical cwd ([`WC_CWD`]) for OPEN only.
++/// Absolute operands are returned unchanged; an empty cwd (standalone binary)
++/// leaves the operand as given. The stdin sentinel (`-`) never reaches here.
++/// Display/error text keeps the operand as the user wrote it — this join is
++/// applied strictly at the `File::open`/`metadata` sites, not to the stored
++/// `Input::Path`.
++fn logical_join(path: &Path) -> PathBuf {
++    if path.is_absolute() {
++        return path.to_path_buf();
++    }
++    WC_CWD.with(|c| {
++        let base = c.borrow();
++        if base.as_os_str().is_empty() {
++            path.to_path_buf()
++        } else {
++            base.join(path)
++        }
++    })
++}
++
+ /// Supported inputs.
+ #[derive(Debug)]
+ enum Inputs<'a> {
+@@ -282,7 +310,7 @@ impl<'a> Input<'a> {
+     /// will ultimately be printed.
+     fn try_as_files0(&self) -> UResult<Option<Vec<Input<'static>>>> {
+         match self {
+-            Self::Path(path) => match fs::metadata(path) {
++            Self::Path(path) => match fs::metadata(logical_join(path)) {
+                 Ok(meta) if meta.is_file() && meta.len() <= (10 << 20) => Ok(Some(
+                     files0_iter_file(path)?.collect::<Result<Vec<_>, _>>()?,
+                 )),
+@@ -396,8 +424,14 @@ impl UError for WcError {
+ /// `out_fd` is accepted for signature parity with the other injected-I/O
+ /// builtins; `wc` writes a small formatted table and never needs the raw output
+ /// descriptor (no splice-to-stdout fast path), so it is intentionally ignored.
++///
++/// `cwd` is the shell's logical working directory: relative FILE operands (and a
++/// `--files0-from=F` value, and every relative path read from F) are rooted
++/// there for OPEN via [`logical_join`], never by `chdir`; the counts table and
++/// diagnostics still show each operand as the user wrote it.
+ pub fn wc(
+     args: impl uucore::Args,
++    cwd: &Path,
+     out: &mut dyn Write,
+     out_fd: Option<BorrowedFd<'_>>,
+     err: &mut dyn Write,
+@@ -405,17 +439,22 @@ pub fn wc(
+     stdin_fd: Option<BorrowedFd<'_>>,
+ ) -> UResult<()> {
+     let _ = out_fd; // see doc comment: wc has no output-fd fast path.
+-    let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
++    WC_CWD.with(|c| *c.borrow_mut() = cwd.to_path_buf());
++    let r = (|| {
++        let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+ 
+-    let settings = Settings::new(&matches);
+-    let inputs = Inputs::new(&matches)?;
++        let settings = Settings::new(&matches);
++        let inputs = Inputs::new(&matches)?;
+ 
+-    let raw = stdin_fd.map(|fd| {
+-        use std::os::fd::AsRawFd;
+-        fd.as_raw_fd()
+-    });
+-    let mut handle = Some(countable::LogicalStdin::new(stdin, raw));
+-    wc_impl(&inputs, &settings, out, err, &mut handle)
++        let raw = stdin_fd.map(|fd| {
++            use std::os::fd::AsRawFd;
++            fd.as_raw_fd()
++        });
++        let mut handle = Some(countable::LogicalStdin::new(stdin, raw));
++        wc_impl(&inputs, &settings, out, err, &mut handle)
++    })();
++    WC_CWD.with(|c| c.borrow_mut().clear());
++    r
+ }
+ 
+ /// Descriptor-based entry point for the standalone `wc` binary and the
+@@ -438,7 +477,8 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     // the whole duration of this call.
+     let out_fd = Some(unsafe { BorrowedFd::borrow_raw(1) });
+     let in_fd = Some(unsafe { BorrowedFd::borrow_raw(0) });
+-    wc(args, &mut out, out_fd, &mut err, &mut input, in_fd)
++    // Standalone binary: empty cwd => operands resolve against the process cwd.
++    wc(args, Path::new(""), &mut out, out_fd, &mut err, &mut input, in_fd)
+ }
+ 
+ pub fn uu_app() -> Command {
+@@ -758,7 +798,7 @@ fn word_count_from_input(
+                 settings,
+             ),
+         },
+-        Input::Path(path) => match File::open(path) {
++        Input::Path(path) => match File::open(logical_join(path)) {
+             Ok(f) => word_count_from_reader(f, settings),
+             Err(err) => return CountResult::Failure(err),
+         },
+@@ -802,7 +842,7 @@ fn compute_number_width(inputs: &Inputs, settings: &Settings) -> usize {
+                 match input {
+                     Input::Stdin(_) => minimum_width = MINIMUM_WIDTH,
+                     Input::Path(path) => {
+-                        if let Ok(meta) = fs::metadata(path) {
++                        if let Ok(meta) = fs::metadata(logical_join(path)) {
+                             if meta.is_file() {
+                                 total += meta.len();
+                             } else {
+@@ -837,7 +877,9 @@ fn files0_iter_stdin<'a>() -> impl Iterator<Item = InputIterItem<'a>> {
+ }
+ 
+ fn files0_iter_file<'a>(path: &Path) -> UResult<impl Iterator<Item = InputIterItem<'a>>> {
+-    match File::open(path) {
++    // OPEN the `--files0-from=F` file at the logical cwd; the error/display path
++    // (`path.into()` below) keeps F as the user wrote it.
++    match File::open(logical_join(path)) {
+         Ok(f) => Ok(files0_iter(f, path.into())),
+         Err(e) => Err(e.map_err_context(|| {
+             translate!("wc-error-cannot-open-for-reading",
+@@ -1160,6 +1202,7 @@ mod tests {
+         let mut stdin: &[u8] = input;
+         let res = wc(
+             argv.into_iter(),
++            std::path::Path::new(""),
+             &mut out,
+             None,
+             &mut err,
