@@ -355,6 +355,7 @@ impl brush_core::builtins::SimpleCommand for NlBuiltin {
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
+        let cwd = context.shell.working_dir().to_path_buf();
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
@@ -364,7 +365,7 @@ impl brush_core::builtins::SimpleCommand for NlBuiltin {
             let mut out = out;
             let mut err = err;
             let mut inp = inp;
-            let r = match uu_nl::nl(argv.into_iter(), &mut out, &mut err, &mut inp) {
+            let r = match uu_nl::nl(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
                 Ok(()) => 0,
                 Err(e) => {
                     let msg = e.to_string();

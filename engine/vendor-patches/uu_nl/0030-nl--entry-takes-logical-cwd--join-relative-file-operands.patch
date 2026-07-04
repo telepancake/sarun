@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 16:37:07 +0000
+Subject: [PATCH] nl: entry takes logical cwd; join relative file operands
+
+---
+diff --git a/src/nl.rs b/src/nl.rs
+index 0d0ed95..73f2e80 100644
+--- a/src/nl.rs
++++ b/src/nl.rs
+@@ -227,6 +227,7 @@ pub mod options {
+ /// run as a concurrent pipeline stage.
+ pub fn nl(
+     args: impl uucore::Args,
++    cwd: &Path,
+     out: &mut dyn Write,
+     err: &mut dyn Write,
+     stdin: &mut dyn Read,
+@@ -275,9 +276,17 @@ pub fn nl(
+             let mut buffer = BufReader::new(&mut *stdin);
+             nl_buffer(&mut buffer, &mut writer, &mut stats, &settings)?;
+         } else {
++            // The operand as given is used for every displayed name/diagnostic;
++            // a relative operand is rooted at the shell's logical cwd only for
++            // the actual filesystem access (the process is never `chdir`'d).
+             let path = Path::new(file);
++            let open_path = if path.is_relative() {
++                cwd.join(path)
++            } else {
++                path.to_path_buf()
++            };
+ 
+-            if path.is_dir() {
++            if open_path.is_dir() {
+                 writeln!(
+                     err,
+                     "{}: {}",
+@@ -287,7 +296,8 @@ pub fn nl(
+                 .map_err_context(|| translate!("nl-error-could-not-write"))?;
+                 had_dir_error = true;
+             } else {
+-                let reader = File::open(path).map_err_context(|| file.maybe_quote().to_string())?;
++                let reader =
++                    File::open(&open_path).map_err_context(|| file.maybe_quote().to_string())?;
+                 let mut buffer = BufReader::new(reader);
+                 nl_buffer(&mut buffer, &mut writer, &mut stats, &settings)?;
+             }
+@@ -319,7 +329,11 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     let mut err = stderr.lock();
+     let stdin = io::stdin();
+     let mut input = stdin.lock();
+-    let result = nl(args, &mut out, &mut err, &mut input);
++    // The standalone binary owns the process cwd; relative operands resolve
++    // against it, so pass the kernel cwd (`.`) — join is then a no-op-ish
++    // reroot that preserves upstream behavior.
++    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
++    let result = nl(args, &cwd, &mut out, &mut err, &mut input);
+     // GNU `nl` flushes stdout before exiting; the logical entry already flushed
+     // its BufWriter, but the locked Stdout itself is line-buffered, so flush.
+     let _ = out.flush();
+@@ -577,7 +591,7 @@ mod test {
+         // argv[0] = "nl", no flags -> default: body numbering = NonEmpty,
+         // width 6, right-justified, tab separator, start 1, increment 1.
+         let args = ["nl"].iter().map(|s| OsString::from(*s));
+-        nl(args, &mut out, &mut err, &mut reader).unwrap();
++        nl(args, Path::new("."), &mut out, &mut err, &mut reader).unwrap();
+ 
+         // Blank line is NOT numbered under the NonEmpty default; it gets the
+         // 7-space (width+1) prefix.
+@@ -599,7 +613,7 @@ mod test {
+         let mut err: Vec<u8> = Vec::new();
+ 
+         let args = ["nl", "-b", "a"].iter().map(|s| OsString::from(*s));
+-        nl(args, &mut out, &mut err, &mut reader).unwrap();
++        nl(args, Path::new("."), &mut out, &mut err, &mut reader).unwrap();
+ 
+         assert_eq!(
+             out,
