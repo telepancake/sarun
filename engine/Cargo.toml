@@ -9,6 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+# The depot node model + canonical layer codec (gimir workspace; pure Rust,
+# std-only). `crate::depot` is the engine's seam module; the model crate is
+# aliased `depot_model` to keep the two distinguishable at use sites.
+depot_model = { path = "../gimir/depot", package = "depot" }
 base64 = "0.22.1"
 bytes = "1.10"
 brush-core = "0.5"

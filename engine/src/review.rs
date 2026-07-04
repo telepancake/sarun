@@ -1757,6 +1757,7 @@ mod tests {
     /// read/write must not behave differently based on whether a process runs.)
     #[test]
     fn promote_into_live_parent_refreshes_the_ram_mirror() {
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir()
             .join(format!("sarun-promote-{}-{:?}", std::process::id(),
                           std::time::SystemTime::now()));

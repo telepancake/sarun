@@ -1475,6 +1475,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5729f5117e208430e437df2f4843f5e5952997175992d1414f94c57d61e270b4"
 
 [[package]]
+name = "depot"
+version = "0.0.0"
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5319,6 +5323,7 @@ dependencies = [
  "bzip2-rs",
  "clap",
  "crossterm",
+ "depot",
  "dhcproto",
  "domain",
  "findutils",

@@ -544,3 +544,322 @@ impl BoxDepot for BoxState {
         (white, present)
     }
 }
+
+// ── canonical layer export / import ─────────────────────────────────────
+//
+// A box's captured layer ⇄ the depot node model (gimir depot crate), so a
+// box can move through the canonical wire form (transfer, stream, chains).
+//
+// Mapping, pinned by the round-trip criterion (DEPOT-DESIGN.md §3 — the
+// serialized form contains exactly what cannot be derived):
+//   sqlar name "a/b/c"            → nested nodes by byte segment
+//   whiteout row (mode==S_IFCHR)  → tombstone node
+//   dir row                       → live node, `opaque` from its column,
+//                                   attrs mode/mtime
+//   symlink row                   → blob = target bytes, attrs mode/mtime
+//   fifo/device row               → no blob, attrs mode/mtime (+rdev)
+//   file row                      → blob = pool-blob (or inline) bytes,
+//                                   attrs mode/mtime
+//   ownership / rdev / xattr      → attrs uid/gid/rdev, "x:<key>"
+//   the box-root opaque marker (name="") → opaque on the layer root
+// sz is derived (blob length) and not exported. writer/last_writer are
+// bookkeeping and not exported. A node carries attrs IFF a row exists —
+// implicit path components round-trip as attr-less interior nodes.
+
+fn a(v: impl ToString) -> Vec<u8> {
+    v.to_string().into_bytes()
+}
+
+fn parse_a<T: std::str::FromStr>(attrs: &depot_model::Attrs, key: &[u8]) -> Option<T> {
+    attrs.get(key).and_then(|v| std::str::from_utf8(v).ok())
+        .and_then(|s| s.parse().ok())
+}
+
+/// Insert `node` (already shaped) at slash-separated `name` in the tree.
+fn tree_insert(root: &mut depot_model::Node, name: &str, node: depot_model::Node) {
+    let mut cur = root;
+    let mut it = name.split('/').peekable();
+    while let Some(seg) = it.next() {
+        if it.peek().is_none() {
+            // Merge: an implicit interior node may already exist (children
+            // inserted first under ORDER BY name they cannot — parents sort
+            // first — but "" segments aside, be safe and keep children).
+            let entry = cur.children.entry(seg.as_bytes().to_vec())
+                .or_insert_with(depot_model::Node::keep);
+            let kids = std::mem::take(&mut entry.children);
+            *entry = node;
+            for (k, v) in kids {
+                entry.children.entry(k).or_insert(v);
+            }
+            return;
+        }
+        cur = cur.children.entry(seg.as_bytes().to_vec())
+            .or_insert_with(depot_model::Node::keep);
+    }
+}
+
+/// Export a box's captured layer as a canonical depot layer. `conn` is an
+/// open connection to the box's sqlar; `box_id` names its blob pool.
+pub fn export_layer(conn: &Connection, box_id: i64)
+    -> Result<depot_model::Layer, String>
+{
+    use depot_model::{BlobOp, Node};
+    let mut side: std::collections::HashMap<String, depot_model::Attrs> =
+        std::collections::HashMap::new();
+    let mut load_side = |sql: &str, key: &[u8]| -> Result<(), String> {
+        let mut st = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = st.query_map([], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| e.to_string())?;
+        for (name, v) in rows.flatten() {
+            side.entry(name).or_default().insert(key.to_vec(), a(v));
+        }
+        Ok(())
+    };
+    load_side("SELECT name,uid FROM ownership", b"uid")?;
+    load_side("SELECT name,gid FROM ownership", b"gid")?;
+    load_side("SELECT name,dev FROM rdev", b"rdev")?;
+    {
+        let mut st = conn.prepare("SELECT name,key,value FROM xattr")
+            .map_err(|e| e.to_string())?;
+        let rows = st.query_map([], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?,
+            r.get::<_, Vec<u8>>(2)?))).map_err(|e| e.to_string())?;
+        for (name, k, v) in rows.flatten() {
+            let mut key = b"x:".to_vec();
+            key.extend_from_slice(k.as_bytes());
+            side.entry(name).or_default().insert(key, v);
+        }
+    }
+
+    let mut root = Node::keep();
+    let mut root_attrs: Option<depot_model::Attrs> = None;
+    let mut st = conn.prepare(
+        "SELECT rowid,name,mode,mtime,data,opaque FROM sqlar ORDER BY name")
+        .map_err(|e| e.to_string())?;
+    let rows = st.query_map([], |r| Ok((
+        r.get::<_, i64>(0)?, r.get::<_, String>(1)?,
+        r.get::<_, i64>(2)? as u32, r.get::<_, i64>(3)?,
+        r.get::<_, Option<Vec<u8>>>(4)?, r.get::<_, i64>(5)?,
+    ))).map_err(|e| e.to_string())?;
+    for row in rows.flatten() {
+        let (rowid, name, mode, mtime, data, opaque) = row;
+        if name.is_empty() {
+            // The box-root marker (today only its opaque bit matters).
+            root.opaque = opaque != 0;
+            root_attrs = Some(depot_model::Attrs::new());
+            continue;
+        }
+        if mode == S_IFCHR {
+            tree_insert(&mut root, &name, Node::tombstone());
+            continue;
+        }
+        let mut attrs = side.remove(&name).unwrap_or_default();
+        attrs.insert(b"mode".to_vec(), a(mode));
+        attrs.insert(b"mtime".to_vec(), a(mtime));
+        let ft = mode & 0o170000;
+        let blob = if ft == 0o040000 {
+            BlobOp::Keep // directory: no bytes
+        } else if ft == 0o120000 {
+            BlobOp::Set(data.unwrap_or_default()) // symlink target
+        } else if ft == 0o010000 || ft == 0o060000 || ft == 0o020000 {
+            BlobOp::Keep // fifo / device: no bytes
+        } else {
+            // Regular file: inline data (reverted content) or pool blob.
+            match data {
+                Some(d) => BlobOp::Set(d),
+                None => BlobOp::Set(
+                    std::fs::read(blob_path(box_id, rowid)).unwrap_or_default()),
+            }
+        };
+        let node = Node {
+            presence: depot_model::Presence::Live,
+            blob,
+            opaque: ft == 0o040000 && opaque != 0,
+            attrs: Some(attrs),
+            children: Default::default(),
+        };
+        tree_insert(&mut root, &name, node);
+    }
+    if let Some(ra) = root_attrs {
+        root.attrs = Some(ra);
+    }
+    Ok(depot_model::Layer { root })
+}
+
+fn import_node(conn: &Connection, box_id: i64, name: &str,
+               node: &depot_model::Node) -> Result<(), String> {
+    use depot_model::{BlobOp, Presence};
+    if node.presence == Presence::Tombstone {
+        archive_upsert(conn, name, S_IFCHR, 0, 0, None, 0)?;
+        return Ok(());
+    }
+    if let Some(attrs) = &node.attrs {
+        let mode: u32 = parse_a(attrs, b"mode")
+            .ok_or_else(|| format!("{name}: node without mode attr"))?;
+        let mtime: i64 = parse_a(attrs, b"mtime").unwrap_or(0);
+        let ft = mode & 0o170000;
+        let rowid = match (&node.blob, ft) {
+            (_, 0o040000) => {
+                archive_upsert(conn, name, mode, mtime, 0, None,
+                               node.opaque as i64)?
+            }
+            (BlobOp::Set(t), 0o120000) => {
+                // Symlink: target inline, sz == len (the "not deflated" mark).
+                archive_upsert(conn, name, mode, mtime, t.len() as i64,
+                               Some(t), 0)?
+            }
+            (BlobOp::Set(bytes), _) => {
+                // Regular file: bytes ALWAYS to the pool blob (D4).
+                let rid = archive_upsert(conn, name, mode, mtime,
+                                         bytes.len() as i64, None, 0)?;
+                let bp = blob_path(box_id, rid);
+                if let Some(p) = bp.parent() {
+                    std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&bp, bytes).map_err(|e| e.to_string())?;
+                rid
+            }
+            (BlobOp::Keep, _) => {
+                // fifo / device node: row only.
+                archive_upsert(conn, name, mode, mtime, 0, None, 0)?
+            }
+            (BlobOp::Remove, _) => {
+                return Err(format!("{name}: Remove blob in a full layer"));
+            }
+        };
+        let _ = rowid;
+        if let (Some(uid), Some(gid)) =
+            (parse_a::<i64>(attrs, b"uid"), parse_a::<i64>(attrs, b"gid")) {
+            let _ = conn.execute(
+                "INSERT INTO ownership(name,uid,gid) VALUES(?1,?2,?3)
+                 ON CONFLICT(name) DO UPDATE SET uid=excluded.uid, gid=excluded.gid",
+                params![name, uid, gid]);
+        }
+        if let Some(dev) = parse_a::<i64>(attrs, b"rdev") {
+            let _ = conn.execute(
+                "INSERT INTO rdev(name,dev) VALUES(?1,?2)
+                 ON CONFLICT(name) DO UPDATE SET dev=excluded.dev",
+                params![name, dev]);
+        }
+        for (k, v) in attrs {
+            if let Some(xk) = k.strip_prefix(b"x:".as_slice()) {
+                let xk = String::from_utf8_lossy(xk).into_owned();
+                let _ = conn.execute(
+                    "INSERT INTO xattr(name,key,value) VALUES(?1,?2,?3)
+                     ON CONFLICT(name,key) DO UPDATE SET value=excluded.value",
+                    params![name, xk, v]);
+            }
+        }
+    }
+    for (seg, child) in &node.children {
+        let child_name = if name.is_empty() {
+            String::from_utf8_lossy(seg).into_owned()
+        } else {
+            format!("{name}/{}", String::from_utf8_lossy(seg))
+        };
+        import_node(conn, box_id, &child_name, child)?;
+    }
+    Ok(())
+}
+
+/// Import a canonical depot layer into a box's sqlar + blob pool. The
+/// inverse of `export_layer`; existing rows with the same names are
+/// replaced. The caller refreshes any live mirror afterwards
+/// (`load_mirror`/`reload_entry`).
+pub fn import_layer(conn: &Connection, box_id: i64,
+                    layer: &depot_model::Layer) -> Result<(), String> {
+    if layer.root.opaque {
+        let _ = conn.execute(
+            "INSERT INTO sqlar(name,mode,mtime,sz,data,opaque) \
+             VALUES('',?1,0,0,NULL,1)
+             ON CONFLICT(name) DO UPDATE SET opaque=1",
+            params![0o040755u32]);
+    }
+    import_node(conn, box_id, "", &layer.root)
+}
+
+#[cfg(test)]
+pub(crate) static TEST_STATE_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use depot_model::codec;
+
+    /// Round-trip: a box layer with every node kind exports to a canonical
+    /// layer, survives encode/decode, imports into a fresh box, and
+    /// re-exports byte-identically. This is the transfer-fidelity check
+    /// for the sqlar variant (canonical encoding = the wire form).
+    #[test]
+    fn export_import_roundtrip_canonical() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir()
+            .join(format!("sarun-depotrt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: serialized by TEST_STATE_HOME_LOCK with the other
+        // state-home-dependent test.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let src_id = 9101;
+        let src = BoxState::create(src_id).unwrap();
+        // Regular file with pool blob.
+        let rid = src.ensure_file_row("dir/file.txt", 0o100644, 0);
+        let bp = blob_path(src_id, rid);
+        std::fs::create_dir_all(bp.parent().unwrap()).unwrap();
+        std::fs::write(&bp, b"contents").unwrap();
+        src.finalize_file("dir/file.txt", 8, 1234, 0);
+        // Executable + xattr + owner.
+        let rid2 = src.ensure_file_row("bin/tool", 0o100755, 0);
+        let bp2 = blob_path(src_id, rid2);
+        std::fs::create_dir_all(bp2.parent().unwrap()).unwrap();
+        std::fs::write(&bp2, b"#!/bin/sh\n").unwrap();
+        src.finalize_file("bin/tool", 10, 99, 0);
+        src.set_xattr("bin/tool", "user.tag", b"v1");
+        src.set_owner("bin/tool", 1000, 1000);
+        // Dir (opaque), symlink, whiteout, fifo.
+        src.set_dir("dir", 0o040755, 0);
+        src.set_opaque("masked", 0);
+        src.set_symlink("link", std::path::Path::new("dir/file.txt"), 0);
+        src.set_whiteout("gone", 0);
+        src.set_special("pipe", 0o010644, 0, 0);
+
+        let layer = {
+            let conn = src.conn.lock().unwrap();
+            export_layer(&conn, src_id).unwrap()
+        };
+
+        // Through the canonical wire form.
+        let bytes = codec::encode(&layer);
+        let layer2 = codec::decode(&bytes).unwrap();
+        assert_eq!(layer2, layer, "canonical round-trip changed the layer");
+
+        // Import into a fresh box; re-export must be byte-identical.
+        let dst_id = 9102;
+        let dst = BoxState::create(dst_id).unwrap();
+        {
+            let conn = dst.conn.lock().unwrap();
+            import_layer(&conn, dst_id, &layer2).unwrap();
+        }
+        let back = {
+            let conn = dst.conn.lock().unwrap();
+            export_layer(&conn, dst_id).unwrap()
+        };
+        assert_eq!(
+            codec::encode(&back), bytes,
+            "transfer through import lost fidelity"
+        );
+
+        // And the imported box serves the bytes from its OWN pool.
+        let n = {
+            let conn = dst.conn.lock().unwrap();
+            archive_node(&conn, "dir/file.txt").unwrap()
+        };
+        assert_eq!(std::fs::read(blob_path(dst_id, n.rowid)).unwrap(),
+                   b"contents");
+        assert_eq!(n.mtime, 1234);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
