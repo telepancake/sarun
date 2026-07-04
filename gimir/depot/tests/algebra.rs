@@ -8,8 +8,11 @@
 //!
 //! plus the derived-rotation equivalences.
 
+mod common;
+
 use std::collections::BTreeMap;
 
+use common::{random_layer, Rng};
 use depot::{
     apply, compose, diff, resolve, rotate, squash, Attrs, BlobOp, Layer, Node, Presence, View,
 };
@@ -345,56 +348,6 @@ fn rotation_of_rotation_is_identity_on_views() {
 }
 
 // -------------------------------------------------- randomized law check
-
-/// Tiny deterministic xorshift — no external deps, fixed seeds.
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
-
-const NAMES: &[&[u8]] = &[b"a", b"b", b"c", b"d"];
-
-fn random_node(rng: &mut Rng, depth: u32) -> Node {
-    if rng.below(8) == 0 {
-        return Node::tombstone();
-    }
-    let blob = match rng.below(4) {
-        0 => BlobOp::Keep,
-        1 => BlobOp::Remove,
-        _ => BlobOp::Set(vec![b'v', rng.below(3) as u8 + b'0']),
-    };
-    let attrs = match rng.below(3) {
-        0 => None,
-        1 => Some(Attrs::new()),
-        _ => Some(Attrs::from([(b"m".to_vec(), vec![rng.below(3) as u8 + b'0'])])),
-    };
-    let opaque = rng.below(5) == 0;
-    let mut children = BTreeMap::new();
-    if depth > 0 {
-        for name in NAMES {
-            if rng.below(2) == 0 {
-                children.insert(name.to_vec(), random_node(rng, depth - 1));
-            }
-        }
-    }
-    Node { presence: Presence::Live, blob, opaque, attrs, children }
-}
-
-fn random_layer(rng: &mut Rng) -> Layer {
-    let mut root = random_node(rng, 3);
-    root.presence = Presence::Live; // layer roots are live
-    Layer { root }
-}
 
 #[test]
 fn randomized_squash_and_compose_laws() {
