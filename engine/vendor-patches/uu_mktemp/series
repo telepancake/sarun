@@ -1,1 +1,2 @@
 0010-uu_mktemp-in-process-mktemp-builtin-injected-logical-I-O-log.patch
+0020-mktemp--entry-takes-logical-env--TMPDIR-and-POSIXLY-CORRECT.patch

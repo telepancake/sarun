@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 17:44:23 +0000
+Subject: [PATCH] mktemp: entry takes logical env; TMPDIR and POSIXLY_CORRECT from the shell
+
+---
+diff --git a/src/mktemp.rs b/src/mktemp.rs
+index 70faa13..4e6210c 100644
+--- a/src/mktemp.rs
++++ b/src/mktemp.rs
+@@ -114,7 +114,11 @@ pub struct Options {
+ }
+ 
+ impl Options {
+-    fn from(matches: &ArgMatches) -> Self {
++    /// `env` is the shell's LOGICAL exported environment (or the process env for
++    /// the standalone bridge); `TMPDIR` is read from it, never the process env.
++    /// `cwd` is the shell's logical cwd, used to root a RELATIVE `$TMPDIR` value
++    /// (the process is never `chdir`'d); `None` in the standalone bridge.
++    fn from(matches: &ArgMatches, env: &[(OsString, OsString)], cwd: Option<&Path>) -> Self {
+         let tmpdir = matches
+             .get_one::<Option<PathBuf>>(OPT_TMPDIR)
+             .or_else(|| matches.get_one::<Option<PathBuf>>(OPT_P))
+@@ -124,26 +128,27 @@ impl Options {
+                 Some(d) => d.clone(),
+                 // Otherwise use $TMPDIR if set, else use the system's default
+                 // temporary directory.
+-                None => get_tmpdir_env_or_default(),
++                None => get_tmpdir_env_or_default(env, cwd),
+             });
+         let (tmpdir, template) = match matches.get_one::<OsString>(ARG_TEMPLATE) {
+             // If no template argument is given, `--tmpdir` is implied.
+             None => {
+-                let tmpdir = Some(tmpdir.unwrap_or_else(get_tmpdir_env_or_default));
++                let tmpdir = Some(tmpdir.unwrap_or_else(|| get_tmpdir_env_or_default(env, cwd)));
+                 let template = DEFAULT_TEMPLATE;
+                 (tmpdir, OsString::from(template))
+             }
+             Some(template) => {
+-                let tmpdir = if let Some(tmpdir) = env::var_os(TMPDIR_ENV_VAR)
++                let tmpdir = if let Some(tmpdir) = env_get(env, TMPDIR_ENV_VAR)
+                     && matches.get_flag(OPT_T)
+                 {
+-                    Some(PathBuf::from(tmpdir))
++                    // -t uses $TMPDIR; a relative value is rooted at the logical cwd.
++                    Some(join_logical(Path::new(tmpdir), cwd))
+                 } else if tmpdir.is_some() {
+                     tmpdir
+                 } else if matches.get_flag(OPT_T) || matches.contains_id(OPT_TMPDIR) {
+                     // If --tmpdir is given without an argument, or -t is given
+                     // export in TMPDIR
+-                    Some(env::temp_dir())
++                    Some(get_tmpdir_env_or_default(env, cwd))
+                 } else {
+                     None
+                 };
+@@ -378,10 +383,11 @@ impl ValueParserFactory for OptionalPathBufParser {
+ pub fn mktemp_main(
+     args: impl uucore::Args,
+     cwd: &Path,
++    env: &[(OsString, OsString)],
+     out: &mut dyn std::io::Write,
+     err: &mut dyn std::io::Write,
+ ) -> UResult<()> {
+-    let result = run(args, Some(cwd), out);
++    let result = run(args, Some(cwd), env, out);
+     let _ = out.flush();
+     let _ = err.flush();
+     result
+@@ -390,14 +396,22 @@ pub fn mktemp_main(
+ #[uucore::main]
+ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     let mut out = std::io::stdout();
+-    run(args, None, &mut out)
++    // Standalone binary: the process env is the intended source of TMPDIR /
++    // POSIXLY_CORRECT, exactly as upstream.
++    let env: Vec<(OsString, OsString)> = env::vars_os().collect();
++    run(args, None, &env, &mut out)
+ }
+ 
+ /// Shared body of [`mktemp_main`] and [`uumain`]. When `cwd` is `Some`, a
+ /// relative target directory is rooted at the shell's logical cwd for creation
+ /// (the printed name stays template-relative); when `None` (standalone) creation
+ /// is against the process cwd, as upstream. The created name is written to `out`.
+-fn run(args: impl uucore::Args, cwd: Option<&Path>, out: &mut dyn std::io::Write) -> UResult<()> {
++fn run(
++    args: impl uucore::Args,
++    cwd: Option<&Path>,
++    env: &[(OsString, OsString)],
++    out: &mut dyn std::io::Write,
++) -> UResult<()> {
+     let args: Vec<_> = args.collect();
+     let matches = match uu_app().try_get_matches_from(&args) {
+         Ok(m) => m,
+@@ -423,9 +437,9 @@ fn run(args: impl uucore::Args, cwd: Option<&Path>, out: &mut dyn std::io::Write
+ 
+     // Parse command-line options into a format suitable for the
+     // application logic.
+-    let options = Options::from(&matches);
++    let options = Options::from(&matches, env, cwd);
+ 
+-    if env::var_os("POSIXLY_CORRECT").is_some() {
++    if env_get(env, "POSIXLY_CORRECT").is_some() {
+         // If POSIXLY_CORRECT was set, template MUST be the last argument.
+         if matches.contains_id(ARG_TEMPLATE) {
+             // Template argument was provided, check if was the last one.
+@@ -669,11 +683,32 @@ fn exec(
+     Ok(path)
+ }
+ 
+-/// Reads from `TMPDIR_ENV_VAR` but defaults to /tmp if value is set to empty string.
+-fn get_tmpdir_env_or_default() -> PathBuf {
+-    match env::var_os(TMPDIR_ENV_VAR) {
+-        Some(val) if val.is_empty() => PathBuf::from(FALLBACK_TMPDIR),
+-        _ => env::temp_dir(),
++/// Look a key up in a logical-env snapshot (`export`ed vars from the brush shell).
++fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsStr> {
++    env.iter()
++        .find(|(k, _)| k.as_os_str() == OsStr::new(key))
++        .map(|(_, v)| v.as_os_str())
++}
++
++/// Root a directory path against the shell's logical `cwd` when it is relative
++/// (the process is never `chdir`'d there). `cwd` is `None` on the standalone
++/// bridge, where a relative value is left as-is (resolved against the process
++/// cwd at creation, exactly as upstream).
++fn join_logical(path: &Path, cwd: Option<&Path>) -> PathBuf {
++    match cwd {
++        Some(c) if path.is_relative() => c.join(path),
++        _ => path.to_owned(),
++    }
++}
++
++/// The temp-directory default from the LOGICAL env: `$TMPDIR` if set and
++/// non-empty (a relative value rooted at the logical `cwd`), else `/tmp`. This
++/// replaces the pair `env::var_os(TMPDIR)` / `env::temp_dir()`, both of which
++/// read the engine process's own env.
++fn get_tmpdir_env_or_default(env: &[(OsString, OsString)], cwd: Option<&Path>) -> PathBuf {
++    match env_get(env, TMPDIR_ENV_VAR) {
++        Some(val) if !val.is_empty() => join_logical(Path::new(val), cwd),
++        _ => PathBuf::from(FALLBACK_TMPDIR),
+     }
+ }
+ 

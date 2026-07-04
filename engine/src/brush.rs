@@ -823,7 +823,64 @@ fs_builtin_stdin!(LnBuiltin, "ln", uu_ln::ln_main, "uu_ln");
 
 fs_builtin!(ReadlinkBuiltin, "readlink", uu_readlink::readlink, "uu_readlink");
 fs_builtin!(RealpathBuiltin, "realpath", uu_realpath::realpath, "uu_realpath");
-fs_builtin!(MktempBuiltin, "mktemp", uu_mktemp::mktemp_main, "uu_mktemp");
+
+/// `mktemp` — FILESYSTEM template like [`fs_builtin!`], but its entry also takes
+/// the shell's LOGICAL exported env: `$TMPDIR` (and `POSIXLY_CORRECT`) come from
+/// the vars the brush shell `export`ed, not the engine process's env. A relative
+/// `$TMPDIR` is rooted at the logical cwd. Hand-written (not the shared macro)
+/// because only this fs entry takes an `env` argument in this round.
+struct MktempBuiltin;
+
+impl brush_core::builtins::SimpleCommand for MktempBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O mktemp builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        let cwd = context.shell.working_dir().to_path_buf();
+
+        // Shell's LOGICAL exported env: mktemp reads TMPDIR / POSIXLY_CORRECT
+        // from here, not the engine process env.
+        let envv: Vec<(std::ffi::OsString, std::ffi::OsString)> = context.shell.env()
+            .iter_exported()
+            .map(|(k, v)| (k.clone().into(),
+                           v.value().to_cow_str(context.shell).to_string().into()))
+            .collect();
+
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+
+        let code = run_coreutil_localized("uu_mktemp", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let r = match uu_mktemp::mktemp_main(argv.into_iter(), &cwd, &envv, &mut out, &mut err) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
 
 fs_builtin!(ChmodBuiltin, "chmod", uu_chmod::chmod_main, "uu_chmod");
 fs_builtin!(ChownBuiltin, "chown", uu_chown::chown_main, "uu_chown");
