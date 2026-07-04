@@ -1,2 +1,3 @@
 0010-uu_tail-in-process-tail-builtin-injected-logical-I-O.patch
 0020-tail--logical-stdin-is-always-a-pipe---never-resolve-the-pro.patch
+0030-tail--entry-takes-logical-cwd--join-relative-file-operands.patch

@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 16:41:31 +0000
+Subject: [PATCH] tail: entry takes logical cwd; join relative file operands
+
+---
+diff --git a/src/paths.rs b/src/paths.rs
+index 39771c9..b50c545 100644
+--- a/src/paths.rs
++++ b/src/paths.rs
+@@ -54,12 +54,20 @@ impl Input {
+     pub fn from<T: AsRef<OsStr>>(string: T) -> Self {
+         let string = string.as_ref();
+ 
+-        let kind = string.into();
++        let kind: InputKind = string.into();
+         let display_name = match kind {
+             InputKind::File(_) => string.to_string_lossy().to_string(),
+             InputKind::Stdin => translate!("tail-stdin-header"),
+         };
+ 
++        // Root a relative FILE operand at the shell's logical cwd for OPEN; the
++        // `display_name` above keeps the operand as the user wrote it. The stdin
++        // sentinel (`-`) is never joined.
++        let kind = match kind {
++            InputKind::File(path) => InputKind::File(crate::logical_join(&path)),
++            InputKind::Stdin => InputKind::Stdin,
++        };
++
+         Self { kind, display_name }
+     }
+ 
+diff --git a/src/tail.rs b/src/tail.rs
+index 1683a54..b42300f 100644
+--- a/src/tail.rs
++++ b/src/tail.rs
+@@ -38,9 +38,11 @@ use uucore::translate;
+ 
+ // ── Injected-I/O plumbing for the in-process brush builtin ───────────────────
+ //
+-// `tail` is the STREAM template (like `cat`/`head`): it has NO logical-cwd seam
+-// (every operand is opened by literal path), only logical stdio. But unlike
+-// `cat`/`head`, tail's data and diagnostic writes are scattered across
++// `tail` carries logical stdio PLUS a logical-cwd seam ([`TAIL_CWD`] +
++// [`logical_join`]): a relative FILE operand is rooted at the shell's cwd for
++// OPEN (including the `-f`/`-F` follow/re-open datapath), the process never
++// `chdir`'d, while the operand's display form stays in `Input::display_name`.
++// Unlike `cat`/`head`, tail's data and diagnostic writes are scattered across
+ // `tail.rs`/`paths.rs`/`follow/` and reach process `stdout()`/`stderr()` deep
+ // inside helpers that are awkward to thread an `out`/`err` argument through. So
+ // the [`tail`] entry installs the injected sinks into thread-locals for the
+@@ -62,6 +64,30 @@ thread_local! {
+     /// input must then ALWAYS be treated as a pipe: resolving the PROCESS
+     /// /dev/fd/0 would read the engine's real stdin, not the pipeline.
+     static TAIL_LOGICAL_STDIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++    /// The call's logical cwd. A relative FILE operand is rooted here for OPEN
++    /// (the process is never `chdir`'d); empty => the standalone binary, which
++    /// resolves operands against the process cwd. Set by [`tail`], cleared after.
++    static TAIL_CWD: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
++}
++
++/// Root a relative FILE operand at the call's logical cwd ([`TAIL_CWD`]) for
++/// OPEN — the follow/re-open datapath uses this joined path too. Absolute
++/// operands are returned unchanged; an empty cwd (standalone binary) leaves the
++/// operand as given. The stdin sentinel (`-`) never reaches here. The operand's
++/// display form is kept separately in `Input::display_name`, so diagnostics and
++/// headers still show the operand as the user wrote it.
++pub(crate) fn logical_join(path: &Path) -> PathBuf {
++    if path.is_absolute() {
++        return path.to_path_buf();
++    }
++    TAIL_CWD.with(|c| {
++        let base = c.borrow();
++        if base.as_os_str().is_empty() {
++            path.to_path_buf()
++        } else {
++            base.join(path)
++        }
++    })
+ }
+ 
+ /// A `Write` that targets the call's injected logical stdout (via [`TAIL_OUT`])
+@@ -162,13 +188,16 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+ ///
+ /// Drives `tail` against the shell's logical output sink (via [`LogicalStdout`]
+ /// + [`TAIL_OUT`]), the logical input source (`stdin`), and a logical stderr
+-/// buffer drained to `err`. `out_fd`/`stdin_fd` are accepted for signature
+-/// parity with the other STREAM-template builtins; tail has no splice fast path,
+-/// and reads stdin through the injected reader. Returns a non-zero status when a
++/// buffer drained to `err`. `cwd` is the shell's logical working directory:
++/// relative FILE operands (including `-f`/`-F` follow targets) are rooted there
++/// for OPEN via [`logical_join`], never by `chdir`. `out_fd`/`stdin_fd` are
++/// accepted for signature parity with the other STREAM-template builtins; tail
++/// has no splice fast path, and reads stdin through the injected reader. Returns a non-zero status when a
+ /// diagnostic set [`TAIL_EXIT`] (matching GNU/uutils tail's exit 1 on a per-file
+ /// error). Holds no process-global state once the thread-locals are cleared.
+ pub fn tail(
+     args: impl uucore::Args,
++    cwd: &Path,
+     out: &mut dyn Write,
+     out_fd: Option<std::os::fd::BorrowedFd<'_>>,
+     err: &mut dyn Write,
+@@ -178,6 +207,7 @@ pub fn tail(
+     let _ = (out_fd, stdin_fd);
+     TAIL_ERR.with(|b| b.borrow_mut().clear());
+     TAIL_EXIT.with(|c| c.set(0));
++    TAIL_CWD.with(|c| *c.borrow_mut() = cwd.to_path_buf());
+     // Erase `out`'s lifetime into the thread-local. SAFETY: the pointer is
+     // cleared (set to None) below, before `tail` returns and thus before `out`
+     // is dropped, so no read of TAIL_OUT can outlive the borrow.
+@@ -190,6 +220,7 @@ pub fn tail(
+ 
+     TAIL_OUT.with(|c| c.set(None));
+     TAIL_LOGICAL_STDIN.with(|c| c.set(false));
++    TAIL_CWD.with(|c| c.borrow_mut().clear());
+     let produced = TAIL_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+     let _ = err.write_all(&produced);
+     let _ = err.flush();
