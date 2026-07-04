@@ -67,6 +67,7 @@ pub mod policy;
 pub mod prompt;
 pub mod bridge;
 pub mod dispatch;
+pub mod webcap;
 
 use std::sync::Arc;
 

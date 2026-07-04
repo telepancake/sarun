@@ -16,18 +16,22 @@
 // `tls.keylog_file` decodes the whole pcapng.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use http_body_util::{BodyExt, Empty, combinators::BoxBody};
+use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::BoxBody};
 use hyper::body::Bytes;
+use hyper::body::Frame;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use tokio::net::TcpStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::bridge::SmoltcpStream;
 use super::ca::Ca;
+use super::webcap::{self, ReqCap, WebCapSink};
 
 /// Hyper body type the proxy emits — boxed dyn so HTTP and HTTPS paths
 /// share the same Response signature regardless of the upstream body.
@@ -57,10 +61,15 @@ fn err_response(status: hyper::StatusCode, msg: &str) -> Response<ProxyBody> {
 
 /// Common request handler. `scheme` is "http" or "https"; for "https" the
 /// upstream is opened via tokio-rustls. `port` is the default port (80/443)
-/// or whatever the box dialed.
+/// or whatever the box dialed. `sink` (DESIGN-web.md W2) is the per-box web
+/// capture sink: `None` runs the original pure pass-through with zero added
+/// cost; `Some` takes the capturing path — buffer the request body (bounded),
+/// then tee the response body into a `webcap` row while streaming it to the
+/// box unchanged.
 async fn proxy_request(scheme: &'static str, default_port: u16,
                        req: Request<Incoming>,
-                       rustls_client_config: Option<Arc<rustls::ClientConfig>>)
+                       rustls_client_config: Option<Arc<rustls::ClientConfig>>,
+                       sink: Option<Arc<WebCapSink>>)
                        -> Result<Response<ProxyBody>>
 {
     // Recover the target authority from the Host header (HTTP) or the
@@ -77,10 +86,45 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
         None => (host.clone(), default_port),
     };
 
+    // Split off the request parts BEFORE the forward consumes the body, so we
+    // can record method/url/headers (and, when capturing, the body). The
+    // outgoing body is boxed to a uniform type so both the streamed
+    // (capture-off) and buffered (capture-on) shapes drive the same sender.
+    let (parts, in_body) = req.into_parts();
+    let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let url = format!("{scheme}://{host}{pq}");
+    let (out_body, reqcap): (ProxyBody, Option<ReqCap>) = if sink.is_some() {
+        let mut rc = ReqCap {
+            method: parts.method.to_string(),
+            url: url.clone(),
+            host: host.clone(),
+            headers: webcap::format_headers(&parts.headers),
+            body: Vec::new(),
+        };
+        if webcap::length_within_cap(&parts.headers) {
+            // Small body (browse/crawl requests are tiny or absent); collect
+            // it, cap-guarded, and forward a buffered copy.
+            let collected = in_body.collect().await
+                .map(|c| c.to_bytes()).unwrap_or_default();
+            let bytes = if collected.len() > webcap::WEBCAP_BODY_MAX {
+                collected.slice(0..webcap::WEBCAP_BODY_MAX)
+            } else { collected };
+            rc.body = bytes.to_vec();
+            (Full::new(bytes).map_err(|n| match n {}).boxed(), Some(rc))
+        } else {
+            // Oversized declared upload: stream through untouched, record the
+            // request header-only.
+            (in_body.map_err(|e| Box::new(e) as _).boxed(), Some(rc))
+        }
+    } else {
+        (in_body.map_err(|e| Box::new(e) as _).boxed(), None)
+    };
+    let out_req = Request::from_parts(parts, out_body);
+
     let tcp = TcpStream::connect((host_only.as_str(), port)).await
         .with_context(|| format!("dial {host_only}:{port}"))?;
 
-    if scheme == "https" {
+    let resp: Response<ProxyBody> = if scheme == "https" {
         let cfg = rustls_client_config.ok_or_else(|| anyhow!("no client config"))?;
         let connector = tokio_rustls::TlsConnector::from(cfg);
         let dnsname = rustls::pki_types::ServerName::try_from(host_only.clone())
@@ -97,8 +141,8 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
                 eprintln!("sarun-engine: net: mitm upstream https conn: {e}");
             }
         });
-        let resp = sender.send_request(req).await?;
-        Ok(resp.map(|b| b.map_err(|e| Box::new(e) as _).boxed()))
+        let resp = sender.send_request(out_req).await?;
+        resp.map(|b| b.map_err(|e| Box::new(e) as _).boxed())
     } else {
         let io = TokioIo::new(tcp);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
@@ -107,20 +151,84 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
                 eprintln!("sarun-engine: net: mitm upstream http conn: {e}");
             }
         });
-        let resp = sender.send_request(req).await?;
-        Ok(resp.map(|b| b.map_err(|e| Box::new(e) as _).boxed()))
+        let resp = sender.send_request(out_req).await?;
+        resp.map(|b| b.map_err(|e| Box::new(e) as _).boxed())
+    };
+
+    // Capturing path: tee the response body into a webcap row while it streams
+    // to the box. Non-capturing path returns the response untouched.
+    match (sink, reqcap) {
+        (Some(sink), Some(req)) => Ok(tee_response(sink, req, resp)),
+        _ => Ok(resp),
     }
 }
 
+/// Wrap the upstream response so each body frame is forwarded to the box
+/// immediately AND copied into a capped accumulator; when the stream ends the
+/// completed exchange is recorded as one `webcap` row (DESIGN-web.md W2). The
+/// forward is byte-for-byte — the box sees exactly what upstream sent — so
+/// this never changes what the box receives, only records a copy.
+fn tee_response(sink: Arc<WebCapSink>, req: ReqCap,
+                resp: Response<ProxyBody>) -> Response<ProxyBody> {
+    let (parts, mut body) = resp.into_parts();
+    let status = parts.status.as_u16() as i32;
+    let resp_headers = webcap::format_headers(&parts.headers);
+    let mime = webcap::mime_of(&parts.headers);
+    // A declared over-cap length means don't bother accumulating (we'd only
+    // truncate); stream through and record header-only.
+    let mut capturing = webcap::length_within_cap(&parts.headers);
+    let over_cap_declared = !capturing;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+        Result<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>>();
+    tokio::spawn(async move {
+        let mut acc: Vec<u8> = Vec::new();
+        let mut truncated = over_cap_declared;
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        if capturing {
+                            let room = webcap::WEBCAP_BODY_MAX.saturating_sub(acc.len());
+                            if data.len() > room {
+                                acc.extend_from_slice(&data[..room]);
+                                truncated = true;
+                                capturing = false;
+                            } else {
+                                acc.extend_from_slice(data);
+                            }
+                        } else {
+                            truncated = true;
+                        }
+                    }
+                    if tx.send(Ok(frame)).is_err() { break; }
+                }
+                Some(Err(e)) => { let _ = tx.send(Err(e)); break; }
+                None => break,
+            }
+        }
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        sink.record(ts, &req, status, &mime, &resp_headers, &acc, truncated);
+    });
+    let stream = UnboundedReceiverStream::new(rx);
+    // Disambiguate: both BodyExt and StreamExt provide `boxed` in scope.
+    let new_body = BodyExt::boxed(StreamBody::new(stream));
+    Response::from_parts(parts, new_body)
+}
+
 pub async fn serve_http(box_side: SmoltcpStream, _host_hint: &str,
-                        port: u16) -> Result<()> {
+                        port: u16, sink: Option<Arc<WebCapSink>>) -> Result<()> {
     let io = TokioIo::new(box_side);
-    let svc = hyper::service::service_fn(move |req: Request<Incoming>| async move {
-        match proxy_request("http", port, req, None).await {
-            Ok(r) => Ok::<_, std::convert::Infallible>(r),
-            Err(e) => {
-                eprintln!("sarun-net: http proxy: {e}");
-                Ok(err_response(hyper::StatusCode::BAD_GATEWAY, &e.to_string()))
+    let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
+        let sink = sink.clone();
+        async move {
+            match proxy_request("http", port, req, None, sink).await {
+                Ok(r) => Ok::<_, std::convert::Infallible>(r),
+                Err(e) => {
+                    eprintln!("sarun-net: http proxy: {e}");
+                    Ok(err_response(hyper::StatusCode::BAD_GATEWAY, &e.to_string()))
+                }
             }
         }
     });
@@ -136,7 +244,8 @@ pub async fn serve_http(box_side: SmoltcpStream, _host_hint: &str,
 
 pub async fn serve_https(box_side: SmoltcpStream, host: &str,
                          ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
-                         upstream: Arc<rustls::ClientConfig>) -> Result<()> {
+                         upstream: Arc<rustls::ClientConfig>,
+                         sink: Option<Arc<WebCapSink>>) -> Result<()> {
     let leaf = ca.leaf_for(host).context("mint leaf")?;
     let cert_chain: Vec<rustls::pki_types::CertificateDer> = vec![
         rustls::pki_types::CertificateDer::from(leaf.cert_der.clone()),
@@ -156,8 +265,9 @@ pub async fn serve_https(box_side: SmoltcpStream, host: &str,
     let upstream_cfg = upstream.clone();
     let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
         let cfg = upstream_cfg.clone();
+        let sink = sink.clone();
         async move {
-            match proxy_request("https", 443, req, Some(cfg)).await {
+            match proxy_request("https", 443, req, Some(cfg), sink).await {
                 Ok(r) => Ok::<_, std::convert::Infallible>(r),
                 Err(e) => {
                     eprintln!("sarun-net: https proxy: {e}");

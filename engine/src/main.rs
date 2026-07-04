@@ -589,6 +589,16 @@ fn main() {
                     //        the box's sqlar. Host netns, no capture mux,
                     //        incompatible with -t/-d/-p/-b/--api.
                     "--sud" => sud = true,
+                    // --webcap  OPT-IN web capture (DESIGN-web.md W2): tee
+                    //           every HTTP(S) request/response this tap box
+                    //           makes into its `webcap` table. An env toggle
+                    //           (like --vars) so it reaches the register
+                    //           message without threading a new bool through
+                    //           runner::run's signature. tap-only (gated in
+                    //           the register message).
+                    "--webcap" => unsafe {
+                        std::env::set_var("SARUN_WEBCAP", "1");
+                    },
                     // --vars  OPT-IN variable provenance: record every make
                     //         and shell variable assignment (name, site,
                     //         value, unexpanded rhs + its dereferences) into

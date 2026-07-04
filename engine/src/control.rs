@@ -164,6 +164,17 @@ pub fn broadcast_api_log(box_id: i64) {
     }
 }
 
+/// Broadcast that box `box_id` has new webcap rows so the UI's Captures pane
+/// refreshes. Best-effort, mirroring `broadcast_api_log` (DESIGN-web.md W1).
+pub fn broadcast_webcap(box_id: i64) {
+    if let Some(state) = STATE_HANDLE.read().clone() {
+        broadcast(&state, &json!({
+            "type": "webcap_added",
+            "sid": box_id.to_string(),
+        }));
+    }
+}
+
 static STATE_HANDLE: parking_lot::RwLock<Option<State>> = parking_lot::RwLock::new(None);
 pub fn install_state_handle(s: State) {
     *STATE_HANDLE.write() = Some(s.clone());
@@ -1420,12 +1431,22 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
     // trust roots don't vary by box).
     let keylog = crate::net::mitm::KeyLogFile::new(&flows.keylog_path).ok();
     let upstream_tls = crate::net::mitm::build_upstream_client_config();
+    // Web capture sink (DESIGN-web.md W2): built only when this box opted in
+    // via --webcap. It resolves live_box(id) at record time off the overlay,
+    // exactly like the oaita proxy's api_log sink — None means the MITM proxy
+    // runs its pure pass-through.
+    let want_webcap = msg.get("want_webcap").and_then(Value::as_bool).unwrap_or(false);
+    let webcap_sink = if want_webcap {
+        lock(state).overlay.clone()
+            .map(|ov| crate::net::webcap::WebCapSink::new(ov, id))
+    } else { None };
     if let (Some(rt), Some(keylog)) = (lock(state).net_rt.clone(), keylog) {
         crate::net::dispatch::Dispatcher::start(
             stack.clone(), stack.dns.clone(),
             format!("box{id}"),
             net.ca.clone(), keylog, upstream_tls,
             net.prompts.clone(),
+            webcap_sink,
             rt);
     }
 
@@ -1533,6 +1554,16 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         },
         "api_log_detail" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::api_log_detail(id, rid),
+            _ => Value::Null,
+        },
+        // Web capture (DESIGN-web.md W4): summary rows + full detail, mirroring
+        // api_log. Feeds the UI's Captures pane and the oaita web tools.
+        "webcap" => match arg_sid(args) {
+            Some(id) => discover::webcap(id),
+            None => json!([]),
+        },
+        "webcap_detail" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+            (Some(id), Some(rid)) => discover::webcap_detail(id, rid),
             _ => Value::Null,
         },
         "brushprov" => match arg_sid(args) {

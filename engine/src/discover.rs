@@ -267,6 +267,75 @@ pub fn api_log_detail(box_id: i64, row_id: i64) -> Value {
     row.unwrap_or(Value::Null)
 }
 
+/// Web capture rows for a box (DESIGN-web.md W1/W4): one row per HTTP(S)
+/// request/response the tap MITM proxy teed. Summary-sized here (body lengths
+/// only); `webcap_detail` fetches full headers + bodies on demand. Newest
+/// first (DESC) — the browser/crawler produce these in time order and the
+/// most recent captures are what the Captures pane wants at the top. A sqlar
+/// written before the webcap table existed simply yields no rows.
+pub fn webcap(box_id: i64) -> Value {
+    let db = sqlar_path(box_id);
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return json!([]);
+    };
+    let mut rows = vec![];
+    if let Ok(mut st) = conn.prepare(
+        "SELECT id,ts,method,url,host,status,mime,truncated,\
+         length(req_body),length(resp_body) FROM webcap ORDER BY id DESC") {
+        let it = st.query_map([], |r| Ok(json!({
+            "id": r.get::<_, i64>(0)?,
+            "ts": r.get::<_, f64>(1)?,
+            "method": r.get::<_, String>(2)?,
+            "url": r.get::<_, String>(3)?,
+            "host": r.get::<_, String>(4)?,
+            "status": r.get::<_, i64>(5)?,
+            "mime": r.get::<_, String>(6)?,
+            "truncated": r.get::<_, i64>(7)?,
+            "req_len": r.get::<_, i64>(8)?,
+            "resp_len": r.get::<_, i64>(9)?,
+        })));
+        if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }
+    }
+    Value::Array(rows)
+}
+
+/// Full headers + bodies for one webcap row. The response body is returned
+/// BOTH raw-lossy (for binary inspection) and, when it decodes to text,
+/// identity-decoded via the recorded Content-Encoding (DESIGN-web.md W2).
+pub fn webcap_detail(box_id: i64, row_id: i64) -> Value {
+    let db = sqlar_path(box_id);
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return Value::Null;
+    };
+    let row = conn.query_row(
+        "SELECT id,ts,method,url,host,status,mime,req_headers,resp_headers,\
+         req_body,resp_body,truncated FROM webcap WHERE id=?1",
+        [row_id],
+        |r| {
+            let resp_headers: String = r.get(8)?;
+            let req_body: Vec<u8> = r.get(9)?;
+            let resp_body: Vec<u8> = r.get(10)?;
+            let decoded = crate::net::webcap::decode_body(&resp_headers, &resp_body);
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
+                "method": r.get::<_, String>(2)?,
+                "url": r.get::<_, String>(3)?,
+                "host": r.get::<_, String>(4)?,
+                "status": r.get::<_, i64>(5)?,
+                "mime": r.get::<_, String>(6)?,
+                "req_headers": r.get::<_, String>(7)?,
+                "resp_headers": resp_headers,
+                "req_body": String::from_utf8_lossy(&req_body),
+                "resp_body": String::from_utf8_lossy(&decoded),
+                "truncated": r.get::<_, i64>(11)?,
+            }))
+        }
+    );
+    row.unwrap_or(Value::Null)
+}
+
 pub fn outputs(box_id: i64) -> Value {
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(

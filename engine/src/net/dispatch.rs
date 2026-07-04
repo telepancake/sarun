@@ -17,6 +17,7 @@ use super::dns::DnsServer;
 use super::mitm::KeyLogFile;
 use super::prompt::{PromptQueue, Verdict};
 use super::stack::{AcceptedConn, StackRuntime};
+use super::webcap::WebCapSink;
 
 pub struct Dispatcher {
     pub stack: Arc<StackRuntime>,
@@ -26,16 +27,21 @@ pub struct Dispatcher {
     pub keylog: Arc<KeyLogFile>,
     pub upstream_tls: Arc<rustls::ClientConfig>,
     pub prompts: Arc<PromptQueue>,
+    /// Per-box web capture sink (DESIGN-web.md W2). `None` when this box
+    /// didn't opt into capture — the proxy then runs its pure pass-through.
+    pub webcap: Option<Arc<WebCapSink>>,
 }
 
 impl Dispatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
                  box_name: String, ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
                  upstream_tls: Arc<rustls::ClientConfig>,
                  prompts: Arc<PromptQueue>,
+                 webcap: Option<Arc<WebCapSink>>,
                  rt: tokio::runtime::Handle) {
         let Some(rx) = stack.take_accept_rx() else { return; };
-        let me = Self { stack, dns, box_name, ca, keylog, upstream_tls, prompts };
+        let me = Self { stack, dns, box_name, ca, keylog, upstream_tls, prompts, webcap };
         std::thread::Builder::new()
             .name("sarun-net-dispatch".into())
             .spawn(move || {
@@ -47,18 +53,21 @@ impl Dispatcher {
                     let keylog = me.keylog.clone();
                     let up = me.upstream_tls.clone();
                     let prompts = me.prompts.clone();
+                    let webcap = me.webcap.clone();
                     rt.spawn(handle_conn(stack, dns, box_name, ca, keylog,
-                                          up, prompts, acc));
+                                          up, prompts, webcap, acc));
                 }
             }).expect("spawn dispatcher");
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
                      box_name: String,
                      ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
                      upstream_tls: Arc<rustls::ClientConfig>,
                      prompts: Arc<PromptQueue>,
+                     webcap: Option<Arc<WebCapSink>>,
                      acc: AcceptedConn) {
     let host = dns.host_for_ip(acc.dst_ip)
         .unwrap_or_else(|| ipv4(acc.dst_ip));
@@ -107,9 +116,9 @@ async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
 
     let stream_io = SmoltcpStream::new(stack, acc.handle);
     let r = if port == 443 {
-        super::mitm::serve_https(stream_io, &host, ca, keylog, upstream_tls).await
+        super::mitm::serve_https(stream_io, &host, ca, keylog, upstream_tls, webcap).await
     } else if port == 80 {
-        super::mitm::serve_http(stream_io, &host, port).await
+        super::mitm::serve_http(stream_io, &host, port, webcap).await
     } else {
         super::l4::forward(stream_io, &host, port).await
     };

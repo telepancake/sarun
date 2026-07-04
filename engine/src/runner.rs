@@ -302,6 +302,14 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                          "want_env": env,
                          "want_brush": brush,
                          "want_api": api,
+                         // Web capture (DESIGN-web.md W2): opt-in via --webcap
+                         // (SARUN_WEBCAP env, set by the run/oci-run parsers,
+                         // mirroring --vars). Only meaningful on a tap box —
+                         // the MITM proxy that feeds the capture exists only
+                         // there — so gate on net_mode to avoid a dead flag.
+                         "want_webcap": std::env::var("SARUN_WEBCAP")
+                             .map(|v| !v.is_empty()).unwrap_or(false)
+                             && net_mode == crate::net::NetMode::Tap,
                          "net_mode": net_mode.as_str(),
                          "want_no_parent": no_parent,
                          "want_readonly_parent": readonly_parent,

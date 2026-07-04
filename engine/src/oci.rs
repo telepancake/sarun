@@ -785,9 +785,14 @@ fn cli_run(args: &[String]) -> i32 {
                     return 2;
                 }
             },
+            // --webcap  opt into web capture (DESIGN-web.md W2). Same env
+            //           toggle the `sarun run` parser sets; read at the
+            //           register message in runner::run. The browser and the
+            //           crawler pass this.
+            "--webcap" => unsafe { std::env::set_var("SARUN_WEBCAP", "1"); },
             "-h" | "--help" => {
                 println!("usage: sarun oci run [--name NAME] [--net off|tap|host] \
-                          <ref> [-- CMD...]");
+                          [--webcap] <ref> [-- CMD...]");
                 return 0;
             }
             other if reference.is_none() => reference = Some(other.to_string()),

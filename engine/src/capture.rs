@@ -122,6 +122,24 @@ CREATE INDEX IF NOT EXISTS idx_makevar_name ON makevar(name);
 CREATE TABLE IF NOT EXISTS api_log(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, method TEXT, path TEXT, model TEXT, status INT,
  stream INT DEFAULT 0, req BLOB, resp BLOB);
+-- web capture (DESIGN-web.md W1): one row per HTTP(S) request/response the tap
+-- MITM proxy teed on this box's behalf, addressed by URL. This is the CONTENT
+-- record (full request/response bodies) that the pcapng/keylog flows are
+-- the PACKET record of — two views of the same traffic. Opt-in per box (the
+-- browser and the crawler enable it; ordinary boxes don't accumulate one).
+-- resp_body holds the RAW upstream bytes (byte-identical, Content-Encoding
+-- kept verbatim in resp_headers) so replay is exact and no decode is paid at
+-- capture time; readers decode to identity on demand via the recorded
+-- Content-Encoding (webcap::decode_body). Bodies over WEBCAP_BODY_MAX are
+-- recorded header-only with a truncation marker. host is indexed for
+-- all-captures-of-a-site; url for replay lookup. Newest-first per url =
+-- gimir PageView chain (DESIGN-web.md W0).
+CREATE TABLE IF NOT EXISTS webcap(id INTEGER PRIMARY KEY AUTOINCREMENT,
+ ts REAL, method TEXT, url TEXT, host TEXT, status INT, mime TEXT,
+ req_headers TEXT, resp_headers TEXT, req_body BLOB, resp_body BLOB,
+ truncated INT DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_webcap_host ON webcap(host);
+CREATE INDEX IF NOT EXISTS idx_webcap_url ON webcap(url);
 ";
 
 #[derive(Clone)]
@@ -890,6 +908,27 @@ impl BoxState {
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![ts, method, path, model, status,
                     if stream { 1 } else { 0 }, req, resp]);
+        conn.last_insert_rowid()
+    }
+
+    /// Record one web capture into this box's `webcap` table (DESIGN-web.md
+    /// W1). `ts` is wall-clock UNIX seconds. Bodies are identity-encoded
+    /// (already decompressed by the caller); `truncated` marks a body that
+    /// exceeded the capture cap and was stored header-only. Best-effort: a
+    /// stale connection drops the row silently, exactly like `add_api_log`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_web_capture(&self, ts: f64, method: &str, url: &str, host: &str,
+                           status: i32, mime: &str, req_headers: &str,
+                           resp_headers: &str, req_body: &[u8],
+                           resp_body: &[u8], truncated: bool) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO webcap(ts,method,url,host,status,mime,\
+             req_headers,resp_headers,req_body,resp_body,truncated) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![ts, method, url, host, status, mime,
+                    req_headers, resp_headers, req_body, resp_body,
+                    if truncated { 1 } else { 0 }]);
         conn.last_insert_rowid()
     }
 
