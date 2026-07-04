@@ -127,16 +127,17 @@ fn roundtrip_sha_exact_and_chain_compresses() {
         r.full_raw
     );
     assert!(
-        r.delta_ref_chain * 4 < r.full_standalone,
+        r.view_ref_chain * 4 < r.full_standalone,
         "stored chain ({}) not <4x smaller than full standalone ({})",
-        r.delta_ref_chain,
+        r.view_ref_chain,
         r.full_standalone
     );
-    // The stored chain should be in the same league as the solid bound.
+    // The stored (view-anchored) chain should be in the same league as
+    // the solid bound.
     assert!(
-        r.delta_ref_chain < r.solid_full * 3,
+        r.view_ref_chain < r.solid_full * 3,
         "stored chain ({}) way off the solid bound ({})",
-        r.delta_ref_chain,
+        r.view_ref_chain,
         r.solid_full
     );
 

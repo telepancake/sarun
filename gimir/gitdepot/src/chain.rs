@@ -79,7 +79,29 @@ fn solid_total(records: &[Vec<u8>], level: i32) -> Result<u64> {
     Ok(compress(&concat, None, level)?.len() as u64)
 }
 
-/// Write the store (the DELTA refPrefix chain is the rest form) and
+/// The stored (view-anchored) chain: frame 0 = the newest full record
+/// standalone; frame i = delta record i compressed with the previous
+/// commit's FULL record — the canonical bytes of its view — as
+/// refPrefix. The decoder recomputes that anchor from the reconstructed
+/// view via `diff(None, view)`; both sides go through the one canonical
+/// encoding, whose bit-exactness is load-bearing.
+fn view_chain_bytes(
+    delta_records: &[Vec<u8>],
+    full_records: &[Vec<u8>],
+    level: i32,
+) -> Result<Vec<u8>> {
+    let mut chain = Vec::new();
+    for (i, rec) in delta_records.iter().enumerate() {
+        let prefix = if i == 0 { None } else { Some(full_records[i - 1].as_slice()) };
+        let frame = compress(rec, prefix, level)?;
+        chain.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+        chain.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        chain.extend_from_slice(&frame);
+    }
+    Ok(chain)
+}
+
+/// Write the store (the view-anchored chain is the rest form) and
 /// produce the encoding comparison over both record families.
 pub fn write_store(
     store: &Path,
@@ -95,10 +117,10 @@ pub fn write_store(
         return Err(Error::Chain(format!("store {} already populated", store.display())));
     }
 
-    let delta_chain = chain_bytes(delta_records, level)?;
+    let view_chain = view_chain_bytes(delta_records, full_records, level)?;
 
     let mut f = std::fs::File::create(&chain_path)?;
-    f.write_all(&delta_chain)?;
+    f.write_all(&view_chain)?;
     f.sync_all()?;
     let mut f = std::fs::File::create(&meta_path)?;
     serde_json::to_writer_pretty(&mut f, meta).map_err(|e| Error::Meta(e.to_string()))?;
@@ -112,19 +134,23 @@ pub fn write_store(
         full_ref_chain: chain_bytes(full_records, level)?.len() as u64,
         delta_raw: delta_records.iter().map(|r| r.len() as u64).sum(),
         delta_standalone: standalone_total(delta_records, level)?,
-        delta_ref_chain: delta_chain.len() as u64,
+        delta_ref_chain: chain_bytes(delta_records, level)?.len() as u64,
+        view_ref_chain: view_chain.len() as u64,
         solid_full: solid_total(full_records, level)?,
     })
 }
 
-/// Read the store back: meta + canonical records, newest-first.
-pub fn read_store(store: &Path) -> Result<(Meta, Vec<Vec<u8>>)> {
+/// Read the store back: meta + the reconstructed VIEWS, newest-first.
+/// Each frame's refPrefix anchor is recomputed from the previous view's
+/// canonical full record.
+pub fn read_store(store: &Path) -> Result<(Meta, Vec<depot::View>)> {
     let mut json = String::new();
     std::fs::File::open(store.join("meta.json"))?.read_to_string(&mut json)?;
     let meta: Meta = serde_json::from_str(&json).map_err(|e| Error::Meta(e.to_string()))?;
 
     let buf = std::fs::read(store.join("chain"))?;
-    let mut records: Vec<Vec<u8>> = Vec::new();
+    let mut views: Vec<depot::View> = Vec::new();
+    let mut prev_full: Option<Vec<u8>> = None;
     let mut pos = 0usize;
     while pos < buf.len() {
         if buf.len() - pos < 8 {
@@ -136,16 +162,22 @@ pub fn read_store(store: &Path) -> Result<(Meta, Vec<Vec<u8>>)> {
         if buf.len() - pos < zlen {
             return Err(Error::Chain("truncated frame body".into()));
         }
-        let prefix = records.last().map(|r: &Vec<u8>| r.as_slice());
-        records.push(decompress(&buf[pos..pos + zlen], prefix, raw_len)?);
+        let record = decompress(&buf[pos..pos + zlen], prev_full.as_deref(), raw_len)?;
         pos += zlen;
+
+        let layer = depot::codec::decode(&record)?;
+        let view = depot::apply(views.last(), &layer).ok_or_else(|| {
+            Error::Chain(format!("frame {} resolves to nothing", views.len()))
+        })?;
+        prev_full = Some(depot::codec::encode(&depot::diff(None, Some(&view))));
+        views.push(view);
     }
-    if records.len() != meta.commits.len() {
+    if views.len() != meta.commits.len() {
         return Err(Error::Chain(format!(
             "{} frames but {} commits in meta",
-            records.len(),
+            views.len(),
             meta.commits.len()
         )));
     }
-    Ok((meta, records))
+    Ok((meta, views))
 }

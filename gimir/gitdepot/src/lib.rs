@@ -312,8 +312,12 @@ pub struct SizeReport {
     pub full_ref_chain: u64,
     pub delta_raw: u64,
     pub delta_standalone: u64,
-    /// The stored form.
+    /// Delta records refPrefix-anchored on the previous DELTA record.
     pub delta_ref_chain: u64,
+    /// The stored form: delta records refPrefix-anchored on the previous
+    /// commit's full VIEW bytes (recomputed by the decoder from the
+    /// reconstructed view — bit-exact canonical encoding is load-bearing).
+    pub view_ref_chain: u64,
     /// One zstd stream over the concatenated full records — the global
     /// redundancy bound (not seekable, comparison only).
     pub solid_full: u64,
@@ -383,7 +387,11 @@ pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
         let full = tree_layer(&entries, &blobs)?;
         let view = depot::apply(None, &full)
             .ok_or_else(|| Error::Unsupported(format!("commit {sha} has an empty tree")))?;
-        full_records.push(codec::encode(&full));
+        // The full record is derived from the VIEW via diff(None, view) —
+        // the same function the decoder uses to recompute refPrefix
+        // anchors from reconstructed views. Bit-exactness of that anchor
+        // is load-bearing: both sides go through one code path.
+        full_records.push(codec::encode(&depot::diff(None, Some(&view))));
         match &prev_view {
             None => delta_records.push(full_records[0].clone()),
             Some(newer) => {
@@ -448,21 +456,11 @@ fn walk_files<'a>(
 /// shas by ref name; fails if any regenerated commit id differs from the
 /// one recorded at import (the fidelity check).
 pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
-    let (meta, records) = chain::read_store(store)?;
+    // read_store walks the chain newest→oldest, reconstructing each
+    // commit's view (and each frame's view-anchored refPrefix) as it goes.
+    let (meta, views) = chain::read_store(store)?;
     std::fs::create_dir_all(repo)?;
     git(repo, &["init", "-q"])?;
-
-    // Rebuild every view by walking the chain newest→oldest: record 0 is
-    // the newest full layer; each older record is the diff layer that
-    // turns the next-newer view into this one.
-    let mut views: Vec<depot::View> = Vec::with_capacity(records.len());
-    for (i, rec) in records.iter().enumerate() {
-        let layer = codec::decode(rec)?;
-        let base = if i == 0 { None } else { Some(&views[i - 1]) };
-        let view = depot::apply(base, &layer)
-            .ok_or_else(|| Error::Meta(format!("chain frame {i} resolves to nothing")))?;
-        views.push(view);
-    }
 
     // Build the fast-import stream. Commits oldest-first; every commit is
     // a full manifest (deleteall + M for each file) from its resolved

@@ -134,6 +134,18 @@ Generalization: the serialized form contains exactly what cannot be
 derived. Source-recorded checksums (a wiki revision's sha1 from the dump)
 are data and round-trip; anything recomputable is omitted.
 
+**Bit-exactness is load-bearing, not hygiene.** The view-anchored chain
+form (delta records refPrefix-anchored on the previous *view's* canonical
+full bytes, recomputed by the decoder from the view it just
+reconstructed) only works because the encoding is deterministic and the
+decoder rejects non-canonical input — encoder and decoder derive the
+anchor through the same single function (`diff(None, view)` → encode).
+Any nondeterminism, or an unversioned format change, makes every chain
+written under the old bytes **unrecoverable**. Consequence: the golden
+byte-level test is a compatibility contract; changing the canonical
+encoding is a migration event for all view-anchored stores, never a
+refactor.
+
 **Stated cost** (a decision, not a surprise): dropping embedded hashes
 trades away O(1) per-object integrity verification and cheap random access
 into deep history. A git repo stored this way cannot verify one object in

@@ -32,7 +32,8 @@ fn main() -> ExitCode {
                 println!(
                     "{} commits, zstd level {}\n\
                      \x20 full records:  raw {:>12}  standalone {:>12}  refPrefix chain {:>12}\n\
-                     \x20 delta records: raw {:>12}  standalone {:>12}  refPrefix chain {:>12}  (stored)\n\
+                     \x20 delta records: raw {:>12}  standalone {:>12}  refPrefix chain {:>12}\n\
+                     \x20 view-anchored chain (delta records, prev full view as prefix): {:>12}  (stored)\n\
                      \x20 solid stream over full records: {:>12}  (bound)",
                     r.commits,
                     r.zstd_level,
@@ -42,6 +43,7 @@ fn main() -> ExitCode {
                     r.delta_raw,
                     r.delta_standalone,
                     r.delta_ref_chain,
+                    r.view_ref_chain,
                     r.solid_full,
                 );
             })
