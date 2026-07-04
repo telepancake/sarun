@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 21:06:40 +0000
+Subject: [PATCH] logical-env seam: route runtime env reads through the shell's exported env
+
+---
+diff --git a/src/lib/features/backup_control.rs b/src/lib/features/backup_control.rs
+index f56d131..405cc24 100644
+--- a/src/lib/features/backup_control.rs
++++ b/src/lib/features/backup_control.rs
+@@ -87,7 +87,6 @@ use crate::{
+ };
+ use clap::ArgMatches;
+ use std::{
+-    env,
+     error::Error,
+     ffi::{OsStr, OsString},
+     fmt::{Debug, Display},
+@@ -253,7 +252,8 @@ pub fn determine_backup_suffix(matches: &ArgMatches) -> String {
+     let suffix = if let Some(suffix) = supplied_suffix {
+         String::from(suffix)
+     } else {
+-        env::var("SIMPLE_BACKUP_SUFFIX").unwrap_or_else(|_| DEFAULT_BACKUP_SUFFIX.to_owned())
++        crate::logical_env::get_string("SIMPLE_BACKUP_SUFFIX")
++            .unwrap_or_else(|| DEFAULT_BACKUP_SUFFIX.to_owned())
+     };
+     if suffix.contains('/') {
+         DEFAULT_BACKUP_SUFFIX.to_owned()
+@@ -349,7 +349,7 @@ pub fn determine_backup_mode(matches: &ArgMatches) -> UResult<BackupMode> {
+         if let Some(method) = matches.get_one::<String>(arguments::OPT_BACKUP) {
+             // Second argument is for the error string that is returned.
+             match_method(method, "backup type")
+-        } else if let Ok(method) = env::var("VERSION_CONTROL") {
++        } else if let Some(method) = crate::logical_env::get_string("VERSION_CONTROL") {
+             // Second argument is for the error string that is returned.
+             match_method(&method, "$VERSION_CONTROL")
+         } else {
+@@ -360,7 +360,7 @@ pub fn determine_backup_mode(matches: &ArgMatches) -> UResult<BackupMode> {
+         // the short form of this option, -b does not accept any argument.
+         // if VERSION_CONTROL is not set then using -b is equivalent to
+         // using --backup=existing.
+-        if let Ok(method) = env::var("VERSION_CONTROL") {
++        if let Some(method) = crate::logical_env::get_string("VERSION_CONTROL") {
+             match_method(&method, "$VERSION_CONTROL")
+         } else {
+             Ok(BackupMode::Existing)
+@@ -368,7 +368,7 @@ pub fn determine_backup_mode(matches: &ArgMatches) -> UResult<BackupMode> {
+     } else if matches.contains_id(arguments::OPT_SUFFIX) {
+         // Suffix option is enough to determine mode even if --backup is not set.
+         // If VERSION_CONTROL is not set, the default backup type is 'existing'.
+-        if let Ok(method) = env::var("VERSION_CONTROL") {
++        if let Some(method) = crate::logical_env::get_string("VERSION_CONTROL") {
+             match_method(&method, "$VERSION_CONTROL")
+         } else {
+             Ok(BackupMode::Existing)
+@@ -492,6 +492,7 @@ mod tests {
+     use super::*;
+     // Required to instantiate mutex in shared context
+     use clap::Command;
++    use std::env;
+     use std::sync::Mutex;
+ 
+     // The mutex is required here as by default all tests are run as separate
+diff --git a/src/lib/features/i18n/charmap.rs b/src/lib/features/i18n/charmap.rs
+index 2ec9922..022827a 100644
+--- a/src/lib/features/i18n/charmap.rs
++++ b/src/lib/features/i18n/charmap.rs
+@@ -32,7 +32,7 @@ fn get_encoding() -> &'static MbEncoding {
+     ENCODING.get_or_init(|| {
+         let val = ["LC_ALL", "LC_CTYPE", "LANG"]
+             .iter()
+-            .find_map(|&k| std::env::var(k).ok().filter(|v| !v.is_empty()));
++            .find_map(|&k| crate::logical_env::get_string(k).filter(|v| !v.is_empty()));
+         let s = match val.as_deref() {
+             Some(s) if s != "C" && s != "POSIX" => s,
+             _ => return MbEncoding::Utf8,
+diff --git a/src/lib/features/i18n/mod.rs b/src/lib/features/i18n/mod.rs
+index 282baf2..0a8dee0 100644
+--- a/src/lib/features/i18n/mod.rs
++++ b/src/lib/features/i18n/mod.rs
+@@ -38,7 +38,7 @@ const DEFAULT_LOCALE: Locale = locale!("und");
+ pub fn get_locale_from_env(locale_name: &str) -> (Locale, UEncoding) {
+     let locale_var = ["LC_ALL", locale_name, "LANG"]
+         .iter()
+-        .find_map(|&key| std::env::var(key).ok());
++        .find_map(|&key| crate::logical_env::get_string(key));
+ 
+     if let Some(locale_var_str) = locale_var {
+         let mut split = locale_var_str.split(&['.', '@']);
+diff --git a/src/lib/lib.rs b/src/lib/lib.rs
+index c28a900..2dad53e 100644
+--- a/src/lib/lib.rs
++++ b/src/lib/lib.rs
+@@ -29,6 +29,7 @@ pub use crate::mods::error;
+ pub use crate::mods::io;
+ pub use crate::mods::line_ending;
+ pub use crate::mods::locale;
++pub use crate::mods::logical_env;
+ pub use crate::mods::os;
+ pub use crate::mods::panic;
+ pub use crate::mods::posix;
+@@ -269,13 +270,15 @@ pub fn localized_help_template(util_name: &str) -> clap::builder::StyledStr {
+     use std::io::IsTerminal;
+ 
+     // Determine if colors should be enabled - same logic as configure_localized_command
+-    let colors_enabled = if std::env::var("NO_COLOR").is_ok() {
++    let colors_enabled = if crate::logical_env::get("NO_COLOR").is_some() {
+         false
+-    } else if std::env::var("CLICOLOR_FORCE").is_ok() || std::env::var("FORCE_COLOR").is_ok() {
++    } else if crate::logical_env::get("CLICOLOR_FORCE").is_some()
++        || crate::logical_env::get("FORCE_COLOR").is_some()
++    {
+         true
+     } else {
+         IsTerminal::is_terminal(&std::io::stdout())
+-            && std::env::var("TERM").unwrap_or_default() != "dumb"
++            && crate::logical_env::get_string("TERM").unwrap_or_default() != "dumb"
+     };
+ 
+     localized_help_template_with_colors(util_name, colors_enabled)
+diff --git a/src/lib/mods/clap_localization.rs b/src/lib/mods/clap_localization.rs
+index fc4f838..011de2e 100644
+--- a/src/lib/mods/clap_localization.rs
++++ b/src/lib/mods/clap_localization.rs
+@@ -43,9 +43,11 @@ impl Color {
+ 
+ /// Determine color choice based on environment variables
+ fn get_color_choice() -> clap::ColorChoice {
+-    if std::env::var("NO_COLOR").is_ok() {
++    if crate::logical_env::get("NO_COLOR").is_some() {
+         clap::ColorChoice::Never
+-    } else if std::env::var("CLICOLOR_FORCE").is_ok() || std::env::var("FORCE_COLOR").is_ok() {
++    } else if crate::logical_env::get("CLICOLOR_FORCE").is_some()
++        || crate::logical_env::get("FORCE_COLOR").is_some()
++    {
+         clap::ColorChoice::Always
+     } else {
+         clap::ColorChoice::Auto
+@@ -58,7 +60,8 @@ fn should_use_color_for_stream<S: std::io::IsTerminal>(stream: &S) -> bool {
+         clap::ColorChoice::Always => true,
+         clap::ColorChoice::Never => false,
+         clap::ColorChoice::Auto => {
+-            stream.is_terminal() && std::env::var("TERM").unwrap_or_default() != "dumb"
++            stream.is_terminal()
++                && crate::logical_env::get_string("TERM").unwrap_or_default() != "dumb"
+         }
+     }
+ }
+diff --git a/src/lib/mods/locale.rs b/src/lib/mods/locale.rs
+index c38f1f8..2177711 100644
+--- a/src/lib/mods/locale.rs
++++ b/src/lib/mods/locale.rs
+@@ -438,8 +438,8 @@ pub fn get_message_with_args(id: &str, ftl_args: FluentArgs) -> String {
+ 
+ /// Function to detect system locale from environment variables
+ fn detect_system_locale() -> Result<LanguageIdentifier, LocalizationError> {
+-    let locale_str = std::env::var("LANG")
+-        .unwrap_or_else(|_| DEFAULT_LOCALE.to_string())
++    let locale_str = crate::logical_env::get_string("LANG")
++        .unwrap_or_else(|| DEFAULT_LOCALE.to_string())
+         .split('.')
+         .next()
+         .unwrap_or(DEFAULT_LOCALE)
+diff --git a/src/lib/mods/logical_env.rs b/src/lib/mods/logical_env.rs
+new file mode 100644
+index 0000000..7872f70
+--- /dev/null
++++ b/src/lib/mods/logical_env.rs
+@@ -0,0 +1,67 @@
++// This file is part of the uutils coreutils package.
++//
++// For the full copyright and license information, please view the LICENSE
++// file that was distributed with this source code.
++
++//! A thread-local *logical environment* seam for the in-process builtins.
++//!
++//! When several uutils utilities run as in-process brush builtins inside one
++//! long-lived engine process, the shell's exported variables (set with
++//! `export`, `unset`, or a `VAR=v cmd` prefix) live only in the shell's own
++//! logical environment — they are NOT installed into the engine process's real
++//! `environ`. So uucore's *runtime* env reads (`LANG`/`LC_*` for localization,
++//! `VERSION_CONTROL`/`SIMPLE_BACKUP_SUFFIX` for backups, `_POSIX2_VERSION`,
++//! `NO_COLOR`/`TERM`, …) must consult that logical environment, not
++//! `std::env::var_os`.
++//!
++//! The engine installs a snapshot of the shell's exported vars into this
++//! thread-local at the top of each builtin's worker thread (before
++//! localization and the util body run), then clears it. A standalone uutils
++//! binary never installs an override, so [`get`] falls straight through to
++//! `std::env::var_os` and behavior is byte-for-byte unchanged.
++
++use std::ffi::{OsStr, OsString};
++
++thread_local! {
++    // `None` => no override installed on this thread: fall back to the real
++    // process environment (standalone binaries, and any engine thread that
++    // hasn't been seeded). `Some(vec)` => the shell's logical exported env.
++    static OVERRIDE: std::cell::RefCell<Option<Vec<(OsString, OsString)>>> =
++        const { std::cell::RefCell::new(None) };
++}
++
++/// Install the logical environment for the current thread. Replaces any
++/// previously-installed override. Call once at the top of a builtin's worker
++/// thread, before localization setup and the util body.
++pub fn set_logical_env(env: Vec<(OsString, OsString)>) {
++    OVERRIDE.with(|slot| *slot.borrow_mut() = Some(env));
++}
++
++/// Remove any logical-environment override on the current thread, restoring
++/// the fall-through-to-`std::env` behavior.
++pub fn clear() {
++    OVERRIDE.with(|slot| *slot.borrow_mut() = None);
++}
++
++/// Look up `key` in the logical environment for the current thread.
++///
++/// If an override is installed, the lookup is served entirely from it (a key
++/// absent from the snapshot reads as unset — the shell did not export it, so a
++/// forked child would not see it either). If no override is installed, falls
++/// back to `std::env::var_os`.
++pub fn get<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
++    let key = key.as_ref();
++    OVERRIDE.with(|slot| match &*slot.borrow() {
++        Some(env) => env
++            .iter()
++            .find(|(k, _)| k.as_os_str() == key)
++            .map(|(_, v)| v.clone()),
++        None => std::env::var_os(key),
++    })
++}
++
++/// Convenience: like [`get`] but yields a `String`, mirroring the common
++/// `std::env::var(k).ok()` shape (non-UTF-8 values read as absent).
++pub fn get_string<K: AsRef<OsStr>>(key: K) -> Option<String> {
++    get(key).and_then(|v| v.into_string().ok())
++}
+diff --git a/src/lib/mods/posix.rs b/src/lib/mods/posix.rs
+index 47bdd76..68625f6 100644
+--- a/src/lib/mods/posix.rs
++++ b/src/lib/mods/posix.rs
+@@ -18,7 +18,6 @@
+ //! `touch` (TBD)
+ //! `uniq`
+ //!
+-use std::env;
+ 
+ /// '199209' for POSIX 1003.2-1992, which would define Obsolete mode
+ pub const OBSOLETE: usize = 199_209;
+@@ -31,14 +30,14 @@ pub const MODERN: usize = 200_809;
+ 
+ /// Returns the value of the `_POSIX2_VERSION` environment variable if it is defined
+ pub fn posix_version() -> Option<usize> {
+-    env::var("_POSIX2_VERSION")
+-        .ok()
++    crate::logical_env::get_string("_POSIX2_VERSION")
+         .and_then(|v| v.parse::<usize>().ok())
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use crate::posix::*;
++    use std::env;
+ 
+     #[test]
+     fn test_posix_version() {
+diff --git a/src/lib/mods.rs b/src/lib/mods.rs
+index e33bf03..5a70c66 100644
+--- a/src/lib/mods.rs
++++ b/src/lib/mods.rs
+@@ -11,6 +11,7 @@ pub mod error;
+ pub mod io;
+ pub mod line_ending;
+ pub mod locale;
++pub mod logical_env;
+ pub mod os;
+ pub mod panic;
+ pub mod posix;
