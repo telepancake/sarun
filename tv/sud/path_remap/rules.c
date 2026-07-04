@@ -172,6 +172,16 @@ const struct sud_rule *sud_rules_find_filtered(const struct sud_rule *rules,
         const struct sud_rule *r = &rules[i];
         if (!r->merged || r->merged_len == 0) continue;
         if (kind_mask && !(kind_mask & (1u << (unsigned)r->kind))) continue;
+        /* A bare "/" visible prefix means "the whole tree": every absolute
+         * path matches, and the tail is the path itself (keeping its
+         * leading '/') so composed targets stay well-formed — the generic
+         * boundary check below would otherwise reject everything but "/"
+         * (path[1] is never a boundary). Listed carve-outs still win by
+         * rule order, so put --passthrough rules before a "/" overlay. */
+        if (r->merged_len == 1 && r->merged[0] == '/') {
+            if (tail_out) *tail_out = path;
+            return r;
+        }
         if (rules_strncmp(path, r->merged, r->merged_len) != 0) continue;
         if (!is_path_boundary(path[r->merged_len])) continue;
         if (tail_out) *tail_out = path + r->merged_len;
