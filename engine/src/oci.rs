@@ -538,12 +538,7 @@ fn build_layer_tar(box_id: i64) -> Result<Vec<u8>> {
         &sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open {}", sqlar.display()))?;
     let mut tb = tar::Builder::new(Vec::new());
-    let mut st = conn.prepare(
-        "SELECT rowid,name,mode,data,opaque FROM sqlar ORDER BY name")?;
-    let rows: Vec<(i64, String, u32, Option<Vec<u8>>, i64)> = st.query_map([], |r| Ok((
-        r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u32,
-        r.get::<_, Option<Vec<u8>>>(3)?, r.get::<_, i64>(4)?,
-    )))?.filter_map(|r| r.ok()).collect();
+    let rows = crate::depot::archive_all_nodes(&conn)?;
     for (rowid, name, mode, data, opaque) in rows {
         let kind = mode & 0o170000;
         let perm = mode & 0o7777;
@@ -593,7 +588,7 @@ fn build_layer_tar(box_id: i64) -> Result<Vec<u8>> {
                 tb.append_data(&mut h, &name, std::io::empty())?;
             }
             _ => {   // regular file — bytes live in the blob pool
-                let bytes = std::fs::read(crate::capture::blob_path(box_id, rowid))
+                let bytes = std::fs::read(crate::depot::blob_path(box_id, rowid))
                     .unwrap_or_default();
                 let mut h = tar::Header::new_gnu();
                 h.set_entry_type(tar::EntryType::Regular);
@@ -659,15 +654,8 @@ fn box_write_lcp(box_id: i64) -> String {
     let sqlar = paths::state_home().join(format!("{box_id}.sqlar"));
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         &sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return String::new() };
-    let Ok(mut st) = conn.prepare("SELECT name,mode FROM sqlar") else {
-        return String::new();
-    };
-    let Ok(rows) = st.query_map([], |r| Ok((
-        r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))) else {
-        return String::new();
-    };
     let mut names = Vec::new();
-    for (name, mode) in rows.flatten() {
+    for (name, mode) in crate::depot::archive_names_modes(&conn) {
         if name.is_empty() { continue; }
         let kind = mode & 0o170000;
         if kind == 0o040000 { continue; }                                   // dir
@@ -2185,7 +2173,7 @@ fn copy_file(b: &BoxState, src: &Path, target_rel: &str,
     }
     let mode = mode_override.unwrap_or_else(|| meta.permissions().mode() & 0o7777);
     let rowid = b.ensure_file_row(target_rel, 0o100000 | mode, 0);
-    let bp = crate::capture::blob_path(b.id, rowid);
+    let bp = crate::depot::blob_path(b.id, rowid);
     if let Some(p) = bp.parent() { std::fs::create_dir_all(p)?; }
     let sz = std::fs::copy(src, &bp)
         .with_context(|| format!("copy {} → blob", src.display()))?;
@@ -2271,7 +2259,7 @@ fn put_file_bytes(b: &BoxState, target_rel: &str, bytes: &[u8], mode: u32,
     }
     let m = mode & 0o7777;
     let rowid = b.ensure_file_row(target_rel, 0o100000 | m, 0);
-    let bp = crate::capture::blob_path(b.id, rowid);
+    let bp = crate::depot::blob_path(b.id, rowid);
     if let Some(p) = bp.parent() { std::fs::create_dir_all(p)?; }
     std::fs::write(&bp, bytes)
         .with_context(|| format!("write blob for {target_rel}"))?;
@@ -3042,7 +3030,7 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
             tar::EntryType::Regular | tar::EntryType::Continuous => {
                 let full_mode = 0o100000 | mode;
                 let rowid = b.ensure_file_row(rel, full_mode, writer);
-                let bp = crate::capture::blob_path(b.id, rowid);
+                let bp = crate::depot::blob_path(b.id, rowid);
                 if let Some(p) = bp.parent() {
                     std::fs::create_dir_all(p)?;
                 }
@@ -3079,9 +3067,9 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
                         .trim_end_matches('/')
                         .to_string();
                     if let Some((src_rowid, src_mode)) = lookup_file(b, &src_rel) {
-                        let src_blob = crate::capture::blob_path(b.id, src_rowid);
+                        let src_blob = crate::depot::blob_path(b.id, src_rowid);
                         let new_rowid = b.ensure_file_row(rel, src_mode, writer);
-                        let new_blob = crate::capture::blob_path(b.id, new_rowid);
+                        let new_blob = crate::depot::blob_path(b.id, new_rowid);
                         if let Some(p) = new_blob.parent() {
                             let _ = std::fs::create_dir_all(p);
                         }

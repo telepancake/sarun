@@ -22,8 +22,146 @@
 use std::path::PathBuf;
 
 use rusqlite::params;
+use rusqlite::Connection;
 
-use crate::capture::{blob_path, now_ns, BoxState, Entry, S_IFCHR};
+use crate::capture::{now_ns, BoxState, Entry, S_IFCHR};
+use crate::paths;
+
+/// The loose content file for a regular-file node, named by its sqlar
+/// rowid: live/blob/<box_id>/<rowid%1024:03x>/<rowid>. The blob layout
+/// is depot-owned; nothing outside this module derives these paths.
+pub fn blob_path(box_id: i64, rowid: i64) -> PathBuf {
+    paths::live_home()
+        .join("blob")
+        .join(box_id.to_string())
+        .join(format!("{:03x}", rowid % 1024))
+        .join(rowid.to_string())
+}
+
+// ── the at-rest archive surface ─────────────────────────────────────────
+//
+// review/apply/OCI operate on at-rest .sqlar files through bare rusqlite
+// Connections (open_ro/open_rw), which also serve the bookkeeping tables.
+// The LAYER-DATA statements live here — this module is the only place
+// that knows the sqlar layer schema — and callers pass their Connection.
+
+/// One at-rest layer node, as stored: `data` inline bytes (symlink target
+/// / reverted content), else the bytes live at `blob_path(id, rowid)`.
+pub struct ArchiveNode {
+    pub rowid: i64,
+    pub mode: u32,
+    pub mtime: i64,
+    pub sz: i64,
+    pub data: Option<Vec<u8>>,
+    pub opaque: bool,
+}
+
+pub fn archive_node(conn: &Connection, rel: &str) -> Option<ArchiveNode> {
+    conn.query_row(
+        "SELECT rowid,mode,mtime,sz,data,opaque FROM sqlar WHERE name=?1", [rel],
+        |r| Ok(ArchiveNode {
+            rowid: r.get(0)?,
+            mode: r.get::<_, i64>(1)? as u32,
+            mtime: r.get(2)?,
+            sz: r.get(3)?,
+            data: r.get(4)?,
+            opaque: r.get::<_, i64>(5)? != 0,
+        })).ok()
+}
+
+pub fn archive_exists(conn: &Connection, rel: &str) -> bool {
+    conn.query_row("SELECT 1 FROM sqlar WHERE name=?1", [rel], |_| Ok(()))
+        .is_ok()
+}
+
+pub fn archive_mode(conn: &Connection, rel: &str) -> Option<u32> {
+    conn.query_row("SELECT mode FROM sqlar WHERE name=?1", [rel],
+                   |r| r.get::<_, i64>(0).map(|m| m as u32)).ok()
+}
+
+pub fn archive_mtime(conn: &Connection, rel: &str) -> Option<i64> {
+    conn.query_row("SELECT mtime FROM sqlar WHERE name=?1", [rel],
+                   |r| r.get(0)).ok()
+}
+
+/// All nodes (name, mode, sz), name-ordered — the session-changes listing.
+pub fn archive_nodes_by_name(conn: &Connection) -> Vec<(String, u32, i64)> {
+    let Ok(mut st) = conn.prepare(
+        "SELECT name,mode,sz FROM sqlar ORDER BY name") else { return vec![] };
+    let Ok(it) = st.query_map([], |r| Ok((
+        r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32,
+        r.get::<_, i64>(2)?))) else { return vec![] };
+    it.flatten().collect()
+}
+
+/// All nodes with content + opaque, name-ordered — the layer-export walk
+/// (OCI build_layer_tar).
+#[allow(clippy::type_complexity)]
+pub fn archive_all_nodes(conn: &Connection)
+    -> rusqlite::Result<Vec<(i64, String, u32, Option<Vec<u8>>, i64)>>
+{
+    let mut st = conn.prepare(
+        "SELECT rowid,name,mode,data,opaque FROM sqlar ORDER BY name")?;
+    let rows = st.query_map([], |r| Ok((
+        r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u32,
+        r.get::<_, Option<Vec<u8>>>(3)?, r.get::<_, i64>(4)?,
+    )))?.filter_map(|r| r.ok()).collect();
+    Ok(rows)
+}
+
+/// (name, mode) of every node — the cheap shape scan.
+pub fn archive_names_modes(conn: &Connection) -> Vec<(String, u32)> {
+    let Ok(mut st) = conn.prepare("SELECT name,mode FROM sqlar") else {
+        return vec![];
+    };
+    let Ok(rows) = st.query_map([], |r| Ok((
+        r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))) else {
+        return vec![];
+    };
+    rows.flatten().collect()
+}
+
+/// Most-recently-touched nodes: (name, mode, sz, mtime), mtime-descending.
+pub fn archive_recent(conn: &Connection, limit: i64)
+    -> Vec<(String, u32, i64, i64)>
+{
+    let Ok(mut st) = conn.prepare(
+        "SELECT name, mode, sz, mtime FROM sqlar ORDER BY mtime DESC LIMIT ?1")
+    else { return vec![] };
+    let Ok(it) = st.query_map([limit], |r| Ok((
+        r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32,
+        r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))) else { return vec![] };
+    it.flatten().collect()
+}
+
+/// Remove a node row (the caller handles its blob file).
+pub fn archive_delete(conn: &Connection, rel: &str) {
+    let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [rel]);
+}
+
+/// Write content INLINE into an existing node row (discard-hunk revert),
+/// returning its rowid so the caller can drop the stale pool blob.
+pub fn archive_write_inline(conn: &Connection, rel: &str, data: &[u8])
+    -> rusqlite::Result<Option<i64>>
+{
+    conn.execute("UPDATE sqlar SET sz=?1, data=?2 WHERE name=?3",
+                 params![data.len() as i64, data, rel])?;
+    Ok(archive_node(conn, rel).map(|n| n.rowid))
+}
+
+/// INSERT OR REPLACE a full node row (apply-promote / copy-down target),
+/// returning the new rowid.
+pub fn archive_upsert(conn: &Connection, rel: &str, mode: u32, mtime: i64,
+                      sz: i64, data: Option<&[u8]>, opaque: i64)
+    -> Result<i64, String>
+{
+    conn.execute(
+        "INSERT OR REPLACE INTO sqlar(name,mode,mtime,sz,data,opaque) \
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![rel, mode as i64, mtime, sz, data, opaque])
+        .map_err(|x| x.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
 
 pub trait BoxDepot {
     // ── nodes ────────────────────────────────────────────────────────────

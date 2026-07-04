@@ -53,7 +53,7 @@ use fuser::TimeOrNow;
 
 use crate::capture::BoxState;
 use crate::capture::Entry;
-use crate::capture::blob_path;
+use crate::depot::blob_path;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -753,7 +753,7 @@ impl Overlay {
         self.hydrate_chain(Some(bid));
         match self.resolve(bid, rel) {
             Layer::UpperFile { owner, rowid, .. } => {
-                std::fs::read(crate::capture::blob_path(owner, rowid))
+                std::fs::read(crate::depot::blob_path(owner, rowid))
             }
             Layer::Lower => std::fs::read(self.host(rel)),
             Layer::UpperSymlink { target } =>

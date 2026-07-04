@@ -398,14 +398,6 @@ impl BoxState {
     }
 }
 
-pub fn blob_path(box_id: i64, rowid: i64) -> PathBuf {
-    paths::live_home()
-        .join("blob")
-        .join(box_id.to_string())
-        .join(format!("{:03x}", rowid % 1024))
-        .join(rowid.to_string())
-}
-
 pub(crate) fn now_ns() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use crate::capture::BoxState;
-use crate::capture::blob_path;
+use crate::depot::blob_path;
 use crate::sudwire;
 
 // ── live trace streaming (step 2) ───────────────────────────────────────────

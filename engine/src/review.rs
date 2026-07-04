@@ -24,7 +24,7 @@ use serde_json::json;
 use similar::DiffTag;
 use similar::TextDiff;
 
-use crate::capture::blob_path;
+use crate::depot::blob_path;
 use crate::paths;
 
 fn sqlar_path(id: i64) -> PathBuf {
@@ -42,19 +42,11 @@ const S_IFLNK: u32 = 0o120000;
 pub fn session_changes(id: i64) -> Value {
     let Some(conn) = open_ro(id) else { return json!([]) };
     let mut out = vec![];
-    if let Ok(mut st) = conn.prepare("SELECT name,mode,sz FROM sqlar ORDER BY name") {
-        let it = st.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32,
-                r.get::<_, i64>(2)?))
-        });
-        if let Ok(it) = it {
-            for (name, mode, sz) in it.flatten() {
-                let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
-                           else if mode & S_IFMT == S_IFLNK { "symlink" }
-                           else { "changed" };
-                out.push(json!({"path": name, "kind": kind, "size": sz}));
-            }
-        }
+    for (name, mode, sz) in crate::depot::archive_nodes_by_name(&conn) {
+        let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
+                   else if mode & S_IFMT == S_IFLNK { "symlink" }
+                   else { "changed" };
+        out.push(json!({"path": name, "kind": kind, "size": sz}));
     }
     Value::Array(out)
 }
@@ -63,10 +55,8 @@ pub fn session_changes(id: i64) -> Value {
 /// pool blob for a file. None if the row is missing or a tombstone.
 fn current_bytes(id: i64, rel: &str) -> Option<Vec<u8>> {
     let conn = open_ro(id)?;
-    let (rowid, mode, _sz, data): (i64, u32, i64, Option<Vec<u8>>) = conn
-        .query_row("SELECT rowid,mode,sz,data FROM sqlar WHERE name=?1", [rel],
-                   |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?, r.get(3)?)))
-        .ok()?;
+    let n = crate::depot::archive_node(&conn, rel)?;
+    let (rowid, mode, data) = (n.rowid, n.mode, n.data);
     if mode & S_IFMT == S_IFCHR {
         return None; // tombstone
     }
@@ -90,8 +80,7 @@ fn b64(b: &[u8]) -> String {
 
 pub fn current_mode(id: i64, rel: &str) -> Option<u32> {
     let conn = open_ro(id)?;
-    conn.query_row("SELECT mode FROM sqlar WHERE name=?1", [rel],
-                   |r| r.get::<_, i64>(0)).ok().map(|m| m as u32)
+    crate::depot::archive_mode(&conn, rel)
 }
 
 pub fn hunks(id: i64, rel: &str) -> Value {
@@ -156,8 +145,7 @@ pub fn hunks(id: i64, rel: &str) -> Value {
 /// st_mtime_ns stored for `rel` in the box's sqlar, or None.
 pub fn current_mtime(id: i64, rel: &str) -> Option<i64> {
     let conn = open_ro(id)?;
-    conn.query_row("SELECT mtime FROM sqlar WHERE name=?1", [rel],
-                   |r| r.get::<_, i64>(0)).ok()
+    crate::depot::archive_mtime(&conn, rel)
 }
 
 /// Mirror of Python ChangeReview.decorate: per-row lazy decoration for ONE
@@ -178,23 +166,11 @@ pub fn decorate_many(id: i64, rels: &[&str]) -> Value {
 pub fn recent_changes(id: i64, limit: i64) -> Value {
     let Some(conn) = open_ro(id) else { return json!([]) };
     let mut out = vec![];
-    if let Ok(mut st) = conn.prepare(
-        "SELECT name, mode, sz FROM sqlar ORDER BY mtime DESC LIMIT ?1") {
-        let it = st.query_map([limit], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)? as u32,
-                r.get::<_, i64>(2)?,
-            ))
-        });
-        if let Ok(it) = it {
-            for (name, mode, sz) in it.flatten() {
-                let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
-                           else if mode & S_IFMT == S_IFLNK { "symlink" }
-                           else { "changed" };
-                out.push(json!({"path": name, "kind": kind, "size": sz}));
-            }
-        }
+    for (name, mode, sz, _mtime) in crate::depot::archive_recent(&conn, limit) {
+        let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
+                   else if mode & S_IFMT == S_IFLNK { "symlink" }
+                   else { "changed" };
+        out.push(json!({"path": name, "kind": kind, "size": sz}));
     }
     Value::Array(out)
 }
@@ -213,13 +189,9 @@ pub fn box_summary(id: i64, limit: i64) -> Value {
     // Files: newest-first by mtime. Same kind classification as
     // recent_changes (sqlar S_IFCHR row = whiteout = deleted).
     let mut file_rows: Vec<(i64, Value)> = vec![];
-    if let Ok(mut st) = conn.prepare(
-        "SELECT name, mode, sz, mtime FROM sqlar ORDER BY mtime DESC LIMIT ?1") {
-        if let Ok(it) = st.query_map([limit], |r| Ok((
-            r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32,
-            r.get::<_, i64>(2)?, r.get::<_, i64>(3)?,
-        ))) {
-            for (name, mode, sz, mtime) in it.flatten() {
+    {
+        {
+            for (name, mode, sz, mtime) in crate::depot::archive_recent(&conn, limit) {
                 let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
                            else if mode & S_IFMT == S_IFLNK { "symlink" }
                            else { "changed" };
@@ -647,12 +619,11 @@ impl NestCtx {
 }
 
 fn row_of(conn: &Connection, rel: &str) -> Option<(i64, u32, Option<Vec<u8>>)> {
-    conn.query_row("SELECT rowid,mode,data FROM sqlar WHERE name=?1", [rel],
-                   |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?))).ok()
+    crate::depot::archive_node(conn, rel).map(|n| (n.rowid, n.mode, n.data))
 }
 
 fn consume(conn: &Connection, id: i64, rel: &str, rowid: i64) {
-    let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [rel]);
+    crate::depot::archive_delete(conn, rel);
     let _ = std::fs::remove_file(blob_path(id, rowid));
 }
 
@@ -817,8 +788,7 @@ fn materialize(conn: &Connection, id: i64, rel: &str) -> Result<(), String> {
 /// to write/delete through a symlink at the leaf.
 fn materialize_at(root: BorrowedFd, conn: &Connection, id: i64, rel: &str) -> Result<(), String> {
     let (rowid, mode, data) = row_of(conn, rel).ok_or("not in archive")?;
-    let mtime_ns: i64 = conn.query_row("SELECT mtime FROM sqlar WHERE name=?1", [rel],
-                                       |r| r.get(0)).unwrap_or(0);
+    let mtime_ns: i64 = crate::depot::archive_mtime(conn, rel).unwrap_or(0);
 
     if mode & S_IFMT == S_IFCHR {
         // char-device row == deletion tombstone (the Python convention). Resolve
@@ -1101,10 +1071,8 @@ fn settle(id: i64, rel: &str) {
 fn write_current(id: i64, rel: &str, data: &[u8]) -> Option<Value> {
     let rel = rel.trim_start_matches('/');
     let conn = open_rw(id)?;
-    let rowid = match conn.execute(
-        "UPDATE sqlar SET sz=?1, data=?2 WHERE name=?3",
-        params![data.len() as i64, data, rel]) {
-        Ok(_) => row_of(&conn, rel).map(|(r, _, _)| r),
+    let rowid = match crate::depot::archive_write_inline(&conn, rel, data) {
+        Ok(r) => r,
         Err(e) => return Some(json!({"ok": false, "error": e.to_string()})),
     };
     if let Some(r) = rowid {
@@ -1228,10 +1196,9 @@ struct SrcEntry {
 /// rdev + xattrs). None if the source has no such row.
 fn read_src_entry(src: i64, rel: &str) -> Option<SrcEntry> {
     let pc = open_ro(src)?;
-    let (rowid, mode, mtime, sz, data, opaque): (i64, i64, i64, i64, Option<Vec<u8>>, i64) = pc
-        .query_row("SELECT rowid,mode,mtime,sz,data,opaque FROM sqlar WHERE name=?1",
-                   [rel], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
-                                  r.get(4)?, r.get(5)?))).ok()?;
+    let n = crate::depot::archive_node(&pc, rel)?;
+    let (rowid, mode, mtime, sz, data, opaque) =
+        (n.rowid, n.mode as i64, n.mtime, n.sz, n.data, n.opaque as i64);
     let owner: Option<(i64, i64)> = pc.query_row(
         "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
         |r| Ok((r.get(0)?, r.get(1)?))).ok();
@@ -1257,8 +1224,7 @@ fn read_src_entry(src: i64, rel: &str) -> Option<SrcEntry> {
 /// a process is running in the box.
 fn own_kind(id: i64, rel: &str) -> Option<&'static str> {
     let conn = open_ro(id)?;
-    let mode: u32 = conn.query_row("SELECT mode FROM sqlar WHERE name=?1", [rel],
-                                   |r| r.get::<_, i64>(0)).ok().map(|m| m as u32)?;
+    let mode: u32 = crate::depot::archive_mode(&conn, rel)?;
     Some(if mode & S_IFMT == S_IFCHR { "whiteout" } else { "present" })
 }
 
@@ -1330,11 +1296,8 @@ fn promote_record(e: &SrcEntry, src: i64, dst: i64,
         if let Some((old_rowid, _, _)) = row_of(&cc, rel) {
             let _ = std::fs::remove_file(blob_path(dst, old_rowid));
         }
-        cc.execute("INSERT OR REPLACE INTO sqlar(name,mode,mtime,sz,data,opaque) \
-                    VALUES(?1,?2,?3,?4,?5,?6)",
-                   params![rel, e.mode as i64, e.mtime, e.sz, e.data, e.opaque])
-            .map_err(|x| x.to_string())?;
-        let new_rowid = cc.last_insert_rowid();
+        let new_rowid = crate::depot::archive_upsert(
+            &cc, rel, e.mode, e.mtime, e.sz, e.data.as_deref(), e.opaque)?;
         if kind == 0o100000 {
             let s = blob_path(src, e.rowid);
             if s.exists() {
@@ -1410,8 +1373,9 @@ pub fn copy_down_entry(parent: i64, child: i64, rel: &str,
     let rel = rel.trim_start_matches('/');
     // Child already speaks for this path (its own sqlar row exists) — its view
     // is self-contained, nothing to copy down. Read the sqlar, not a live mirror.
-    let has = open_ro(child).and_then(|c| c.query_row(
-        "SELECT 1 FROM sqlar WHERE name=?1", [rel], |_| Ok(())).ok()).is_some();
+    let has = open_ro(child)
+        .map(|c| crate::depot::archive_exists(&c, rel))
+        .unwrap_or(false);
     if has {
         return Ok(());
     }
@@ -1808,7 +1772,7 @@ mod tests {
 
         // Child captures a regular-file change: foo.txt = "hi".
         let rid = child.ensure_file_row("foo.txt", 0o100644, 0);
-        let cblob = crate::capture::blob_path(child_id, rid);
+        let cblob = crate::depot::blob_path(child_id, rid);
         std::fs::create_dir_all(cblob.parent().unwrap()).unwrap();
         std::fs::write(&cblob, b"hi").unwrap();
         child.finalize_file("foo.txt", 2, 0, 0);
@@ -1828,7 +1792,7 @@ mod tests {
         // ...AND the live mirror was refreshed with the right rowid + bytes.
         match parent.entry("foo.txt") {
             Some(Entry::File { rowid, .. }) => {
-                let pblob = crate::capture::blob_path(parent_id, rowid);
+                let pblob = crate::depot::blob_path(parent_id, rowid);
                 assert_eq!(std::fs::read(&pblob).unwrap(), b"hi", "promoted blob copied");
             }
             Some(_) => panic!("live parent mirror has wrong entry kind after promote"),
