@@ -231,13 +231,15 @@ network response, and bundle it as WACZ. sarun already has the browser
 (carbonyl/Chromium, which speaks CDP) and now the capture (W1/W2). What's
 missing is the driver and the exporter:
 
-- **Crawl driver.** A headless carbonyl box (W3 headless variant) driven over
-  CDP: navigate to each seed, run a scroll/settle behavior, harvest in-page
-  links, enqueue same-scope links to a depth/page cap. Every response the page
-  triggers flows through the tap MITM → `webcap` (no separate capture path —
-  the crawler drives, the proxy records). This is a reimplementation of
-  browsertrix's *orchestration*, not its capture stack, because our capture
-  stack is the MITM proxy we already own.
+- **Crawl driver.** A headless Chromium box driven over CDP: navigate to each
+  seed, run a scroll/settle behavior, harvest in-page links, enqueue same-scope
+  links to a depth/page cap. Every response the page triggers flows through the
+  tap MITM → `webcap` (no separate capture path — the crawler drives, the proxy
+  records). This is a reimplementation of browsertrix's *orchestration*, not
+  its capture stack, because our capture stack is the MITM proxy we already own.
+  NB: the CDP target is a **headless `chrome-headless-shell` sidecar**, not
+  carbonyl — carbonyl (the pinned v0.0.3, an old-mode headless Chromium fork)
+  does not reliably expose a remote-debugging endpoint; see W8.
 - **WACZ export.** `webcap` → WACZ 1.1.1: a WARC of the request/response
   records (identity payloads, `WARC-Payload-Digest`), a CDXJ index, `pages.jsonl`
   for the seeds, and `datapackage.json`, zipped. This is the on-demand,
@@ -339,3 +341,61 @@ To keep this consistent with the storage work happening in parallel
 So a web archive is not a new storage concept — it is the depot's web-shaped
 data kind (`DEPOT-BRIEF.md:52`), captured hot as sqlar rows and (when kept)
 sealed cold as delta chains, viewed through `serve`/replay, exported as WACZ.
+
+## W8 · DevTools as terminal panes
+
+Because carbonyl is Chromium and the proxy sees all traffic, a large slice of
+browser DevTools maps onto the TUI. The panes split by data source, and the
+split is what makes them tractable:
+
+**Out-of-band panes (the proxy — no CDP, no browser cooperation, any box,
+replayable).** These render `webcap` / the pcapng+keylog and need nothing from
+the browser:
+
+- **Network** — SHIPPED (`Pane::Network`, key `w`): the request list + a
+  drill-in to headers and body, straight off `webcap`. This is the Network
+  panel, and because it's proxy-sourced it works for a headless crawl or a bare
+  `curl`, and archivally — you can open the Network panel of a page captured
+  last week.
+- **Security** (cert chain / TLS version / mixed content) and **Cookies**
+  (`Set-Cookie` seen on the wire) are the same freebie — the engine terminates
+  the TLS and sees every header, so it already holds this data. Not yet built.
+
+**In-band panes (CDP — the live browser's internal state).** DOM, Console, the
+debugger, live storage internals, and Performance are about state the proxy
+can't see; they need CDP. The data is overwhelmingly trees/tables/text and
+renders in the existing pane substrate (the DOM reuses the process-forest tree
+renderer; the Console is a text stream + a `Runtime.evaluate` input line; the
+debugger is a source pane + call-stack + scope tree, i.e. what gdb-TUI/delve
+already are). What does NOT translate is the *visual* layer — the Elements
+hover overlay, the box-model diagram, screenshots, and the Performance flame
+chart's shape; the underlying data survives as tables/icicles but the gestalt
+is lost.
+
+**CDP transport decision (probed, decisive):** the CDP panes drive a dedicated
+headless **`chrome-headless-shell` sidecar**, NOT carbonyl. The pinned carbonyl
+(v0.0.3, an unmaintained old-mode headless Chromium fork) exposes no documented
+flag surface and no reliable `--remote-debugging-port`; the one serious
+carbonyl-automation project drives it by *screen-scraping the terminal via a
+PTY*, which is the tell that nobody gets CDP out of it. So the sidecar model:
+per box, launch `chrome-headless-shell --remote-debugging-port=0` (loopback
+only; parse the `ws://…` URL off stderr — never hardcode 9222), dial it from
+the engine over one WebSocket, `Target.setAutoAttach{flatten:true}`, enable
+domains up front (events buffer nothing pre-`enable`), and fan events into
+panes. Domains: Runtime+Log (Console), DOM+CSS+Overlay (Elements), Debugger,
+Network (redundant with the proxy but adds initiator/timing), Page. Response
+bodies are ephemeral — grab them on `loadingFinished`. On the old M111-era
+protocol, codegen bindings from the sidecar's own `/json/protocol`, not the
+current published spec.
+
+The higher-leverage form of the in-band panes is **as oaita tools**, not just a
+human UI: "get the DOM of this captured page", "run this JS and return the
+result", "list the console errors" — DevTools-as-inspection-API, which fits the
+archival/agent goals (W5) better than a human-only pane. Same CDP driver
+backs both.
+
+Build order by value-per-effort: Network (shipped) → Cookies/Security (proxy
+freebies, cheap) → the CDP sidecar + Console REPL (cheapest CDP win) → DOM tree
+→ Debugger (expensive, high fidelity) → Performance tables (skip the flame
+chart). The visual overlays are the only part a terminal genuinely can't
+follow.
