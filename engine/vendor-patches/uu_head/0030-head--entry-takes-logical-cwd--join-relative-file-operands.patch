@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 16:35:59 +0000
+Subject: [PATCH] head: entry takes logical cwd; join relative file operands
+
+---
+diff --git a/src/head.rs b/src/head.rs
+index 561cc2a..658c7c7 100644
+--- a/src/head.rs
++++ b/src/head.rs
+@@ -453,6 +453,7 @@ fn head_stdin_no_fd(
+ #[allow(clippy::cognitive_complexity)]
+ fn uu_head(
+     options: &HeadOptions,
++    cwd: &Path,
+     out: &mut dyn Write,
+     stdin: &mut dyn Read,
+     stdin_fd: Option<BorrowedFd<'_>>,
+@@ -510,13 +511,22 @@ fn uu_head(
+ 
+             Ok(())
+         } else {
+-            if Path::new(file).is_dir() {
++            // Resolve the operand against the shell's LOGICAL cwd for the actual
++            // filesystem access (brush never `chdir`s the process). An absolute
++            // operand is left as-is; the verbatim `file` is still used for the
++            // `==>` header and diagnostics, matching GNU `head`.
++            let resolved: OsString = if Path::new(file).is_absolute() {
++                file.clone()
++            } else {
++                cwd.join(file).into_os_string()
++            };
++            if Path::new(&resolved).is_dir() {
+                 error_messages.push(translate!(
+                     "head-error-reading-file", "name" => file.quote(), "err" => "Is a directory"
+                 ));
+                 continue;
+             }
+-            let mut file_handle = match File::open(file) {
++            let mut file_handle = match File::open(&resolved) {
+                 Ok(f) => f,
+                 Err(err) => {
+                     error_messages.push(
+@@ -569,8 +579,15 @@ fn uu_head(
+ /// `File` and preserves the shared offset exactly as GNU/uutils do, and when
+ /// absent it copies straight through the in-memory reader. Holds no
+ /// process-global state, so a pipeline stage can take it concurrently.
++///
++/// It also takes the shell's LOGICAL `cwd`: brush never `chdir`s the process,
++/// so every RELATIVE `FILE` operand is resolved against `cwd` for the actual
++/// filesystem access (`-` stays stdin, absolute operands are untouched). The
++/// operand is still displayed verbatim in headers/diagnostics, matching GNU
++/// `head`.
+ pub fn head(
+     args: impl uucore::Args,
++    cwd: &Path,
+     out: &mut dyn Write,
+     out_fd: Option<BorrowedFd<'_>>,
+     stdin: &mut dyn Read,
+@@ -581,7 +598,7 @@ pub fn head(
+     let args: Vec<_> = arg_iterate(args)?.collect();
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+     let options = HeadOptions::get_from(&matches).map_err(HeadError::MatchOption)?;
+-    uu_head(&options, out, stdin, stdin_fd)
++    uu_head(&options, cwd, out, stdin, stdin_fd)
+ }
+ 
+ /// Descriptor-based entry point for the standalone `head` binary and the
+@@ -602,7 +619,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     // for the whole duration of this call.
+     let out_fd = Some(unsafe { BorrowedFd::borrow_raw(1) });
+     let in_fd = Some(unsafe { BorrowedFd::borrow_raw(0) });
+-    head(args, &mut out, out_fd, &mut input, in_fd)
++    // The standalone binary IS chdir'd to the process cwd, so a "." base joins
++    // relative operands against it exactly as upstream's kernel-cwd resolution.
++    head(args, Path::new("."), &mut out, out_fd, &mut input, in_fd)
+ }
+ 
+ #[cfg(test)]
+@@ -744,7 +763,7 @@ mod tests {
+             let mut out: Vec<u8> = Vec::new();
+             let args = std::iter::once(OsString::from("head"))
+                 .chain(argv.iter().map(OsString::from));
+-            head(args, &mut out, None, &mut src, None).unwrap();
++            head(args, Path::new("."), &mut out, None, &mut src, None).unwrap();
+             out
+         }
+ 
