@@ -157,6 +157,25 @@ fn apply_event(b: &BoxState, st: &Stream,
     }
 }
 
+// ── layer registry ──────────────────────────────────────────────────────────
+// Each sud box's register-time layer list (upper first, then lowers,
+// host implied at the bottom). A nested launch under a RUNNING ancestor
+// flattens against this — the live upper dir + everything it saw below.
+
+static LAYERS: OnceLock<Mutex<HashMap<i64, Vec<String>>>> = OnceLock::new();
+
+fn layer_map() -> &'static Mutex<HashMap<i64, Vec<String>>> {
+    LAYERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn set_layers(box_id: i64, layers: Vec<String>) {
+    layer_map().lock().unwrap().insert(box_id, layers);
+}
+
+pub fn layers(box_id: i64) -> Option<Vec<String>> {
+    layer_map().lock().unwrap().get(&box_id).cloned()
+}
+
 // ── nesting: same-in-same (sud under sud) ───────────────────────────────────
 // Wrapper-in-wrapper is impossible (both wrappers link at one fixed text
 // address, and the outer wrapper's execve interception would wrap the

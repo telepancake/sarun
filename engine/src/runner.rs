@@ -851,30 +851,28 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     let wrapper = if sud_elf_class(probe) == 1 { &sud32 } else { &sud64 };
     // Launcher contract, absorbed from tv/sud/sudtrace.c: the trace pipe's
     // write end on fd 1023 and the 4 KiB MAP_SHARED wire-state page
-    // (stream-id counter) on fd 1022, both inherited by every traced
-    // child. We take the launcher stream id (first fetch-and-add) and
-    // write the TRACE version atom before any event.
+    // (stream-id counter) on fd 1022, inherited by every traced child.
+    // CRITICAL for in-box nesting: the fds are installed in the CHILD
+    // (pre_exec, between fork and exec), never in this process — a nested
+    // runner is itself traced by the OUTER wrapper, whose trace addin
+    // writes outer events to fd 1023 in our process; replumbing our own
+    // 1022/1023 would splice outer-stream events (with colliding stream
+    // ids from the outer counter page) into the inner trace. The launcher
+    // writes its own version atom + EXIT events through trace_w directly.
     let stream_id: u32;
     let state_page: *mut u32;
+    let mfd: i32;
     unsafe {
-        if libc::dup2(trace_w, SUD_OUTPUT_FD) < 0 {
-            eprintln!("sarun-engine: dup2 trace fd: {}",
-                      std::io::Error::last_os_error());
-            return 1;
-        }
-        libc::close(trace_w); // dup2'd fd is not CLOEXEC — children inherit
-        let mfd = libc::syscall(libc::SYS_memfd_create,
-                                c"sud_wire_state".as_ptr(), 0u32) as i32;
-        if mfd < 0 || libc::ftruncate(mfd, 4096) < 0
-            || libc::dup2(mfd, SUD_STATE_FD) < 0 {
+        mfd = libc::syscall(libc::SYS_memfd_create,
+                            c"sud_wire_state".as_ptr(), 0u32) as i32;
+        if mfd < 0 || libc::ftruncate(mfd, 4096) < 0 {
             eprintln!("sarun-engine: wire state page: {}",
                       std::io::Error::last_os_error());
             return 1;
         }
-        if mfd != SUD_STATE_FD { libc::close(mfd); }
         let p = libc::mmap(std::ptr::null_mut(), 4096,
                            libc::PROT_READ | libc::PROT_WRITE,
-                           libc::MAP_SHARED, SUD_STATE_FD, 0);
+                           libc::MAP_SHARED, mfd, 0);
         if p == libc::MAP_FAILED {
             eprintln!("sarun-engine: mmap wire state: {}",
                       std::io::Error::last_os_error());
@@ -887,7 +885,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         stream_id = (*std::sync::atomic::AtomicU32::from_ptr(state_page))
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let va = crate::sudwire::version_atom();
-        let _ = write_all_fd(SUD_OUTPUT_FD, &va);
+        let _ = write_all_fd(trace_w, &va);
     }
     // Wrapper argv: flag block (runtime_config.h shapes), then the target.
     // Rule order matters (first-prefix-match wins): carve the pseudo
@@ -932,6 +930,18 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         None => { sc.args(&cmd); }
     }
     if let Some(d) = &chdir { sc.current_dir(d); }
+    // Install the wrapper-contract fds in the child only (see above).
+    // dup2 targets are not CLOEXEC, so they survive the exec.
+    unsafe {
+        use std::os::unix::process::CommandExt as _;
+        sc.pre_exec(move || {
+            if libc::dup2(trace_w, SUD_OUTPUT_FD) < 0
+                || libc::dup2(mfd, SUD_STATE_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let child = match sc.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -969,7 +979,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                 .map(|d| d.as_nanos() as i64).unwrap_or(0);
             let buf = ev.build_exit(stream_id, ts, wpid as i64,
                                     tgid as i64, ppid as i64, wstatus);
-            let _ = write_all_fd(SUD_OUTPUT_FD, &buf);
+            let _ = write_all_fd(trace_w, &buf);
         }
         if wpid == child_pid {
             code = if libc::WIFEXITED(wstatus) {
@@ -982,8 +992,8 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     }
     unsafe {
         libc::munmap(state_page.cast(), 4096);
-        libc::close(SUD_OUTPUT_FD);
-        libc::close(SUD_STATE_FD);
+        libc::close(trace_w);
+        libc::close(mfd);
     }
     drop(child); // already reaped by our waitpid; Child::drop doesn't wait
     // Sweep the upper into the box's sqlar on a FRESH conn (the register

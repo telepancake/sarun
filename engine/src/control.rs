@@ -1048,6 +1048,26 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
         b.set_readonly_parent(true);
         b.set_meta("readonly_parent", "1");
     }
+    // sud in-box nesting: a `run --sud` issued from INSIDE a running sud
+    // box arrives with no relname (sud boxes set no SARUN_BROKER) and no
+    // dotted name — derive the enclosing box from the runner's /proc
+    // ancestry, exactly like relname registration does. Only a sud
+    // enclosure nests (same-in-same); a runner inside a FUSE box never
+    // reaches here (the runner rejects --sud under SARUN_BROKER).
+    let mut parent = parent;
+    if want_sud && parent.is_none() && !want_no_parent {
+        if let Some(enc) = derive_parent_box(state, host_pid) {
+            if boxes.get(&enc).is_some_and(
+                |bx| bx.meta.get("sud").map(String::as_str) == Some("1")) {
+                parent = Some(enc);
+            } else {
+                if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                return json!({"ok": false, "error": format!(
+                    "sud nesting is same-in-same: enclosing box {enc} is \
+                     not a sud box (see engine/DESIGN-sud.md)")});
+            }
+        }
+    }
     if let Some(p) = parent {
         b.set_parent(Some(p));
         b.set_meta("parent_box_id", &p.to_string());
@@ -1062,8 +1082,23 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     // sud-up directory.
     let mut sud_lowers: Vec<String> = Vec::new();
     if want_sud {
-        let mut export_ids: Vec<i64> = Vec::new();
-        if rerun { export_ids.push(id); }
+        // A rerun's own prior state is the nearest lower.
+        if rerun {
+            let dest = backing.join(format!("sud-lower-{id}"));
+            match crate::sud::export_box(id, &dest) {
+                Ok(_) => sud_lowers.push(dest.to_string_lossy().into_owned()),
+                Err(e) => {
+                    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                    return json!({"ok": false,
+                        "error": format!("sud lower export: {e}")});
+                }
+            }
+        }
+        // Ancestor chain. An AT-REST ancestor's truth is its sqlar —
+        // export and keep walking. A RUNNING ancestor's truth is its
+        // LIVE upper directory stacked on its own register-time layer
+        // list (which already covers everything above it) — take those
+        // and stop.
         let mut cur = parent;
         let mut seen = std::collections::HashSet::new();
         while let Some(aid) = cur {
@@ -1076,15 +1111,21 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
                      not a sud box (see engine/DESIGN-sud.md)")});
             }
             if lock(state).box_pids.contains_key(&aid) {
-                if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
-                return json!({"ok": false, "error": format!(
-                    "parent sud box {aid} is running; its captured state \
-                     is only authoritative at rest")});
+                match crate::sud::layers(aid) {
+                    Some(mut ls) => {
+                        sud_lowers.append(&mut ls);
+                        break;
+                    }
+                    None => {
+                        if let Some(fd) = peer_pidfd {
+                            unsafe { libc::close(fd); }
+                        }
+                        return json!({"ok": false, "error": format!(
+                            "running sud box {aid} has no recorded layer \
+                             list (engine restarted under it?)")});
+                    }
+                }
             }
-            export_ids.push(aid);
-            cur = bx.parent;
-        }
-        for aid in export_ids {
             let dest = backing.join(format!("sud-lower-{aid}"));
             match crate::sud::export_box(aid, &dest) {
                 Ok(_) => sud_lowers.push(dest.to_string_lossy().into_owned()),
@@ -1094,6 +1135,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
                         "error": format!("sud lower export: {e}")});
                 }
             }
+            cur = bx.parent;
         }
         // A fresh run starts from an empty upper (a rerun's prior state
         // just became the nearest lower; stale upper contents would
@@ -1104,6 +1146,11 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
             if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
             return json!({"ok": false, "error": format!("sud upper: {e}")});
         }
+        // Record this box's full layer list (upper-first) so a nested
+        // launch while WE are running can flatten against it.
+        let mut layers = vec![up.to_string_lossy().into_owned()];
+        layers.extend(sud_lowers.iter().cloned());
+        crate::sud::set_layers(id, layers);
     }
     // Host visibility: a box whose chain is closed — its own --no-parent, or any
     // ancestor marked no_host_fallback (e.g. an OCI image's rootfs base) — sees

@@ -95,10 +95,34 @@ upper. The sqlar is authoritative — the stale sud-up dir is never used
 as a lower, so apply/discard done between runs are honored. Upstream
 patch: the overlay resolve walk now honors whiteouts found in MIDDLE
 lowers (the dir-listing merge already did); rules.h caps one rule at 9
-layers, so chains deeper than 7 ancestors fail loud. Launching the
-nested run from INSIDE the parent box (rather than from the host) still
-needs the ancestry-derivation leg. Gaps: opaque-dir semantics don't
-exist in the sud overlay; parent boxes must be at rest.
+layers, so chains deeper than 7 ancestors fail loud.
+
+**In-box nesting (implemented)**: a `run --sud` issued from INSIDE a
+running sud box derives its enclosing box from the runner's /proc
+ancestry (same identity path relname registration uses). A RUNNING
+ancestor's truth is its LIVE upper directory stacked on its register-
+time layer list (recorded in `sud::set_layers`); an at-rest ancestor is
+exported from its sqlar as before. Two mechanics make this safe:
+- The outer wrapper's execve interception passes a sud-wrapper target
+  through UNWRAPPED (elf.c): execve replaces the process image, so the
+  inner wrapper simply takes over with its own composed flag block —
+  no wrapper-in-wrapper, no address collision.
+- The nested runner never replumbs fds 1022/1023 in its own process
+  (it is itself traced by the outer wrapper, whose trace addin writes
+  outer events — with stream ids from the OUTER counter page — to fd
+  1023 there); the inner contract fds are installed in the child
+  between fork and exec, and the launcher writes its version atom +
+  EXIT events through the pipe fd directly.
+
+**Mixed 32/64 (verified)**: one box can cross classes both ways — a
+64-bit shell spawning a 32-bit static binary (wrapped by sud32 via the
+wrapper's dir-sibling convention) and a 32-bit binary exec'ing /bin/sh:
+both capture into the same upper with correct attribution. This is the
+environment inramfs testing needs — on 32-bit the store cannot fit in
+the address space and the transfer paths must be exercised.
+
+Gaps: opaque-dir semantics don't exist in the sud overlay; host-
+launched (dotted-name) nesting still requires at-rest ancestors.
 
 **32-bit (implemented)**: the runner probes the target's ELF class and
 picks sud32/sud64 (`$SARUN_SUD32`, or sud64's dir sibling — the same

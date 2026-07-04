@@ -480,6 +480,24 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
         if (!resolve_path(args[0], resolved, sizeof(resolved)))
             return args;
 
+        /* Exec of a sud wrapper itself (a nested launcher composed its
+         * own flag block): pass through UNWRAPPED.  execve replaces this
+         * process image, so there is no address-space collision — while
+         * wrapping would make the fresh wrapper try to load the inner
+         * wrapper ELF at its own link address.  Match the exact sibling
+         * paths first, then the naming convention as a fallback for a
+         * wrapper invoked from a different build directory. */
+        {
+            const char *base = resolved;
+            for (const char *p = resolved; *p; p++)
+                if (*p == '/') base = p + 1;
+            if (!strcmp(resolved, g_self_exe)
+                || (g_self_exe32[0] && !strcmp(resolved, g_self_exe32))
+                || (g_self_exe64[0] && !strcmp(resolved, g_self_exe64))
+                || !strcmp(base, "sud32") || !strcmp(base, "sud64"))
+                return args;
+        }
+
         char *dup = sud_arena_strdup(a, resolved);
         if (!dup) return NULL;  /* arena exhausted → caller returns -ENOMEM */
         args[0] = dup;
