@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 17:44:15 +0000
+Subject: [PATCH] sort: entry takes logical env; TMPDIR temp-dir default and LC_ALL quirk from the shell
+
+---
+diff --git a/src/sort.rs b/src/sort.rs
+index c88705d..f62d9ad 100644
+--- a/src/sort.rs
++++ b/src/sort.rs
+@@ -100,6 +100,35 @@ thread_local! {
+     /// the `open`/`create`. The process is never `chdir`'d. Displayed operand
+     /// names in diagnostics keep the ORIGINAL (un-joined) spelling.
+     static SORT_CWD: RefCell<PathBuf> = const { RefCell::new(PathBuf::new()) };
++    /// The shell's LOGICAL exported environment, set by [`sort`]. Every knob that
++    /// upstream reads from the process env (`TMPDIR` for the external-sort temp
++    /// directory, `LC_ALL` on non-unix) is looked up here instead, so the builtin
++    /// sees the vars the brush shell `export`ed rather than the engine process's
++    /// env.
++    static SORT_ENV: RefCell<Vec<(OsString, OsString)>> = const { RefCell::new(Vec::new()) };
++}
++
++/// Look a key up in a logical-env snapshot (`export`ed vars from the brush shell).
++fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsStr> {
++    env.iter()
++        .find(|(k, _)| k.as_os_str() == OsStr::new(key))
++        .map(|(_, v)| v.as_os_str())
++}
++
++/// The external-sort temp-directory default, computed from the LOGICAL env:
++/// `$TMPDIR` if set and non-empty (a relative value joined against the shell's
++/// logical cwd — the process is never `chdir`'d), else `/tmp`. This replaces
++/// `env::temp_dir()`, which reads the process's own `TMPDIR`.
++fn logical_temp_dir() -> PathBuf {
++    let tmpdir = SORT_ENV.with(|e| {
++        env_get(&e.borrow(), "TMPDIR")
++            .filter(|v| !v.is_empty())
++            .map(OsStr::to_owned)
++    });
++    match tmpdir {
++        Some(v) => resolve_logical(Path::new(&v)),
++        None => PathBuf::from("/tmp"),
++    }
+ }
+ 
+ /// Resolve a path for actual filesystem access against the shell's logical cwd.
+@@ -150,6 +179,7 @@ impl Write for LogicalStdout {
+ pub fn sort(
+     args: impl uucore::Args,
+     cwd: &Path,
++    env: &[(OsString, OsString)],
+     out: &mut dyn Write,
+     err: &mut dyn Write,
+     stdin: &mut dyn Read,
+@@ -157,6 +187,9 @@ pub fn sort(
+     // Root every relative path (operands, -o, -T, --files0-from) at the shell's
+     // logical cwd; the process is never chdir'd to it.
+     SORT_CWD.with(|c| *c.borrow_mut() = cwd.to_owned());
++    // Read env knobs (TMPDIR, LC_ALL) from the shell's LOGICAL exported env,
++    // not the engine process's env.
++    SORT_ENV.with(|e| *e.borrow_mut() = env.to_vec());
+ 
+     // Drain the injected stdin once; share it with every `open("-")`.
+     let mut buf = Vec::new();
+@@ -173,6 +206,7 @@ pub fn sort(
+         SORT_STDOUT.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+     SORT_STDIN.with(|cell| *cell.borrow_mut() = None);
+     SORT_CWD.with(|cell| cell.borrow_mut().clear());
++    SORT_ENV.with(|cell| cell.borrow_mut().clear());
+     if let Err(e) = out.write_all(&produced) {
+         return Err(USimpleError::new(2, format!("sort: write error: {e}")));
+     }
+@@ -1902,7 +1936,8 @@ fn default_merge_batch_size() -> usize {
+ 
+ #[cfg(not(unix))]
+ fn locale_failed_to_set() -> bool {
+-    env::var_os("LC_ALL").as_deref() == Some(OsStr::new("missing"))
++    // Read LC_ALL from the shell's LOGICAL exported env, not the process env.
++    SORT_ENV.with(|e| env_get(&e.borrow(), "LC_ALL") == Some(OsStr::new("missing")))
+ }
+ 
+ #[cfg(unix)]
+@@ -2157,9 +2192,11 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     let stdin = std::io::stdin();
+     let mut input = stdin.lock();
+     // Standalone binary: the process's real cwd is the intended base for
+-    // relative operands, exactly as upstream.
++    // relative operands, and the process env is the intended source of TMPDIR
++    // etc., exactly as upstream.
+     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+-    sort(args, &cwd, &mut out, &mut err, &mut input)
++    let env: Vec<(OsString, OsString)> = env::vars_os().collect();
++    sort(args, &cwd, &env, &mut out, &mut err, &mut input)
+ }
+ 
+ #[allow(clippy::cognitive_complexity)]
+@@ -2324,14 +2361,18 @@ fn sort_inner(args: impl uucore::Args, err: &mut dyn Write) -> UResult<()> {
+             {
+                 PathBuf::from("/tmp")
+             }
++            // Default temp dir from the shell's LOGICAL $TMPDIR (relative joined
++            // against the logical cwd) else /tmp — NOT env::temp_dir(), which
++            // reads the engine process's own TMPDIR.
+             #[cfg(not(target_os = "wasi"))]
+             {
+-                env::temp_dir()
++                logical_temp_dir()
+             }
+         },
+         // An explicit -T/--temporary-directory is resolved against the shell's
+         // logical cwd (a relative DIR would otherwise land under the engine's
+-        // process cwd). The env::temp_dir() default above is already absolute.
++        // process cwd). The logical_temp_dir() default above already handles
++        // its own relative-join.
+         |dir| resolve_logical(Path::new(dir)),
+     ));
+ 

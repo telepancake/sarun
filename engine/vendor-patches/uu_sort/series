@@ -1,3 +1,4 @@
 0010-uu_sort-add-injected-I-O-logical-entry-for-an-in-process-bru.patch
 0020-vendor-drop-stray-Cargo.lock-.cargo_vcs_info.json-from-uutil.patch
 0030-sort--entry-takes-logical-cwd--join-relative-paths--operands.patch
+0040-sort--entry-takes-logical-env--TMPDIR-temp-dir-default-and-L.patch

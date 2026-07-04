@@ -581,6 +581,14 @@ impl brush_core::builtins::SimpleCommand for SortBuiltin {
         // not the engine process cwd.
         let cwd = context.shell.working_dir().to_path_buf();
 
+        // Shell's LOGICAL exported env: sort reads TMPDIR (external-sort temp
+        // dir) from here, not the engine process env.
+        let envv: Vec<(std::ffi::OsString, std::ffi::OsString)> = context.shell.env()
+            .iter_exported()
+            .map(|(k, v)| (k.clone().into(),
+                           v.value().to_cow_str(context.shell).to_string().into()))
+            .collect();
+
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
@@ -590,7 +598,7 @@ impl brush_core::builtins::SimpleCommand for SortBuiltin {
             let mut out = out;
             let mut err = err;
             let mut inp = inp;
-            let r = match uu_sort::sort(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
+            let r = match uu_sort::sort(argv.into_iter(), &cwd, &envv, &mut out, &mut err, &mut inp) {
                 Ok(()) => 0,
                 Err(e) => {
                     let msg = e.to_string();
