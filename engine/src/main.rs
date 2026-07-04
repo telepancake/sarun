@@ -599,6 +599,13 @@ fn main() {
                     "--webcap" => unsafe {
                         std::env::set_var("SARUN_WEBCAP", "1");
                     },
+                    // --webfilter  OPT-IN proxy-side filtering (DESIGN-web.md
+                    //              W7): adblock + response rewrite from
+                    //              {config_home}/webfilter, in the engine,
+                    //              outside the browser. tap-only.
+                    "--webfilter" => unsafe {
+                        std::env::set_var("SARUN_WEBFILTER", "1");
+                    },
                     // --vars  OPT-IN variable provenance: record every make
                     //         and shell variable assignment (name, site,
                     //         value, unexpanded rhs + its dereferences) into

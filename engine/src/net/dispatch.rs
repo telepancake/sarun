@@ -17,7 +17,7 @@ use super::dns::DnsServer;
 use super::mitm::KeyLogFile;
 use super::prompt::{PromptQueue, Verdict};
 use super::stack::{AcceptedConn, StackRuntime};
-use super::webcap::WebCapSink;
+use super::ProxyHooks;
 
 pub struct Dispatcher {
     pub stack: Arc<StackRuntime>,
@@ -27,9 +27,10 @@ pub struct Dispatcher {
     pub keylog: Arc<KeyLogFile>,
     pub upstream_tls: Arc<rustls::ClientConfig>,
     pub prompts: Arc<PromptQueue>,
-    /// Per-box web capture sink (DESIGN-web.md W2). `None` when this box
-    /// didn't opt into capture — the proxy then runs its pure pass-through.
-    pub webcap: Option<Arc<WebCapSink>>,
+    /// Per-box proxy hooks (DESIGN-web.md W2/W7): capture + filter. `None`
+    /// when this box opted into neither — the proxy then runs its pure
+    /// pass-through.
+    pub hooks: Option<Arc<ProxyHooks>>,
 }
 
 impl Dispatcher {
@@ -38,10 +39,10 @@ impl Dispatcher {
                  box_name: String, ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
                  upstream_tls: Arc<rustls::ClientConfig>,
                  prompts: Arc<PromptQueue>,
-                 webcap: Option<Arc<WebCapSink>>,
+                 hooks: Option<Arc<ProxyHooks>>,
                  rt: tokio::runtime::Handle) {
         let Some(rx) = stack.take_accept_rx() else { return; };
-        let me = Self { stack, dns, box_name, ca, keylog, upstream_tls, prompts, webcap };
+        let me = Self { stack, dns, box_name, ca, keylog, upstream_tls, prompts, hooks };
         std::thread::Builder::new()
             .name("sarun-net-dispatch".into())
             .spawn(move || {
@@ -53,9 +54,9 @@ impl Dispatcher {
                     let keylog = me.keylog.clone();
                     let up = me.upstream_tls.clone();
                     let prompts = me.prompts.clone();
-                    let webcap = me.webcap.clone();
+                    let hooks = me.hooks.clone();
                     rt.spawn(handle_conn(stack, dns, box_name, ca, keylog,
-                                          up, prompts, webcap, acc));
+                                          up, prompts, hooks, acc));
                 }
             }).expect("spawn dispatcher");
     }
@@ -67,7 +68,7 @@ async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
                      ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
                      upstream_tls: Arc<rustls::ClientConfig>,
                      prompts: Arc<PromptQueue>,
-                     webcap: Option<Arc<WebCapSink>>,
+                     hooks: Option<Arc<ProxyHooks>>,
                      acc: AcceptedConn) {
     let host = dns.host_for_ip(acc.dst_ip)
         .unwrap_or_else(|| ipv4(acc.dst_ip));
@@ -116,9 +117,9 @@ async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
 
     let stream_io = SmoltcpStream::new(stack, acc.handle);
     let r = if port == 443 {
-        super::mitm::serve_https(stream_io, &host, ca, keylog, upstream_tls, webcap).await
+        super::mitm::serve_https(stream_io, &host, ca, keylog, upstream_tls, hooks).await
     } else if port == 80 {
-        super::mitm::serve_http(stream_io, &host, port, webcap).await
+        super::mitm::serve_http(stream_io, &host, port, hooks).await
     } else {
         super::l4::forward(stream_io, &host, port).await
     };

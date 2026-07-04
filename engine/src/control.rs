@@ -1431,14 +1431,21 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
     // trust roots don't vary by box).
     let keylog = crate::net::mitm::KeyLogFile::new(&flows.keylog_path).ok();
     let upstream_tls = crate::net::mitm::build_upstream_client_config();
-    // Web capture sink (DESIGN-web.md W2): built only when this box opted in
-    // via --webcap. It resolves live_box(id) at record time off the overlay,
-    // exactly like the oaita proxy's api_log sink — None means the MITM proxy
-    // runs its pure pass-through.
+    // Proxy hooks (DESIGN-web.md W2/W7): capture + filter, per-box opt-in.
+    // The capture sink resolves live_box(id) at record time off the overlay,
+    // exactly like the oaita proxy's api_log sink; the filter loads the
+    // webfilter ruleset. All-None → the MITM proxy runs its pure pass-through.
     let want_webcap = msg.get("want_webcap").and_then(Value::as_bool).unwrap_or(false);
-    let webcap_sink = if want_webcap {
+    let want_webfilter = msg.get("want_webfilter").and_then(Value::as_bool).unwrap_or(false);
+    let capture = if want_webcap {
         lock(state).overlay.clone()
             .map(|ov| crate::net::webcap::WebCapSink::new(ov, id))
+    } else { None };
+    let filter = if want_webfilter {
+        Some(std::sync::Arc::new(crate::net::filter::Filter::load()))
+    } else { None };
+    let hooks = if capture.is_some() || filter.is_some() {
+        Some(std::sync::Arc::new(crate::net::ProxyHooks { capture, filter }))
     } else { None };
     if let (Some(rt), Some(keylog)) = (lock(state).net_rt.clone(), keylog) {
         crate::net::dispatch::Dispatcher::start(
@@ -1446,7 +1453,7 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
             format!("box{id}"),
             net.ca.clone(), keylog, upstream_tls,
             net.prompts.clone(),
-            webcap_sink,
+            hooks,
             rt);
     }
 

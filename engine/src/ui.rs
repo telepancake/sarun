@@ -1031,6 +1031,7 @@ impl App {
             env: self.launch_env,
             placement,
             webcap: false,
+            webfilter: false,
         }
     }
 
@@ -8110,6 +8111,10 @@ struct How {
     /// like net/env — the browser and crawler set it; other targets default
     /// off. tap-only (the engine gates it), so it's inert without `--net tap`.
     webcap: bool,
+    /// Web filtering (DESIGN-web.md W7): pass `--webfilter` so the engine
+    /// applies adblock + response rewrites outside the box. tap-only. The
+    /// browser sets it alongside webcap; other targets default off.
+    webfilter: bool,
 }
 
 /// What to run. Pure data — no variant carries spawn logic; build_launch()
@@ -8154,6 +8159,7 @@ fn run_argv(how: &How, brush: bool, cmd: &[String]) -> Vec<String> {
     a.push(how.net.clone());
     if how.env { a.push("-e".into()); }
     if how.webcap { a.push("--webcap".into()); }
+    if how.webfilter { a.push("--webfilter".into()); }
     match &how.placement {
         Placement::New => {}
         Placement::Reuse(n) => a.push(n.clone()),
@@ -8179,6 +8185,7 @@ fn oci_run_argv(how: &How, reference: &str, cmd: &[String]) -> Vec<String> {
         a.push(n.clone());
     }
     if how.webcap { a.push("--webcap".into()); }
+    if how.webfilter { a.push("--webfilter".into()); }
     a.push(reference.into());
     if !cmd.is_empty() {
         a.push("--".into());
@@ -9245,6 +9252,7 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     env: app.launch_env,
                     placement: Placement::Reuse("BROWSER".into()),
                     webcap: true,
+                    webfilter: true,
                 };
                 let argv = build_launch(
                     &LaunchTarget::Browser { url: buf, spki: Some(spki) }, &how);
@@ -10179,7 +10187,8 @@ mod tests {
 
     // A How with the given net + placement (env off unless set) for tests.
     fn how(net: &str, placement: Placement) -> How {
-        How { net: net.to_string(), env: false, placement, webcap: false }
+        How { net: net.to_string(), env: false, placement, webcap: false,
+              webfilter: false }
     }
 
     #[test]
@@ -10193,15 +10202,16 @@ mod tests {
         let how = How {
             net: "tap".into(), env: false,
             placement: Placement::Reuse("BROWSER".into()), webcap: true,
+            webfilter: true,
         };
         let argv = build_launch(
             &LaunchTarget::Browser { url: "https://example.com".into(),
                                      spki: Some("AbC=".into()) }, &how);
         let j = argv.join(" ");
         assert!(j.starts_with(
-            "sarun oci run --net tap --name BROWSER --webcap \
+            "sarun oci run --net tap --name BROWSER --webcap --webfilter \
              docker.io/fathyb/carbonyl@sha256:"),
-            "persistent + captured oci run, got {j:?}");
+            "persistent + captured + filtered oci run, got {j:?}");
         assert!(argv.contains(&"--".to_string())
             && argv.contains(&"/carbonyl/carbonyl".to_string()),
             "explicit CMD names the binary, got {j:?}");
@@ -10224,7 +10234,7 @@ mod tests {
         // net is spliced identically; env (-e) only where a box run accepts
         // it (`sarun run`), never on oci run / host shell.
         let h = How { net: "host".into(), env: true, placement: Placement::New,
-                      webcap: false };
+                      webcap: false, webfilter: false };
         assert_eq!(build_launch(&LaunchTarget::Shell, &h),
             vec!["sarun", "run", "-b", "--net", "host", "-e", "--"]);
         assert_eq!(build_launch(&LaunchTarget::Command(vec!["make".into()]), &h),

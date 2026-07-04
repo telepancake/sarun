@@ -790,9 +790,11 @@ fn cli_run(args: &[String]) -> i32 {
             //           register message in runner::run. The browser and the
             //           crawler pass this.
             "--webcap" => unsafe { std::env::set_var("SARUN_WEBCAP", "1"); },
+            // --webfilter  proxy-side adblock + rewrite (DESIGN-web.md W7).
+            "--webfilter" => unsafe { std::env::set_var("SARUN_WEBFILTER", "1"); },
             "-h" | "--help" => {
                 println!("usage: sarun oci run [--name NAME] [--net off|tap|host] \
-                          [--webcap] <ref> [-- CMD...]");
+                          [--webcap] [--webfilter] <ref> [-- CMD...]");
                 return 0;
             }
             other if reference.is_none() => reference = Some(other.to_string()),

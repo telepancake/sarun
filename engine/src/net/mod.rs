@@ -68,6 +68,27 @@ pub mod prompt;
 pub mod bridge;
 pub mod dispatch;
 pub mod webcap;
+pub mod filter;
+
+/// The per-box hooks the MITM proxy applies to each flow (DESIGN-web.md
+/// W2/W7). Bundled so one optional handle threads through the dispatcher and
+/// `proxy_request`: `None` (or all-None fields) is the pure pass-through every
+/// non-opted box gets. Future proxy hooks slot in here without re-touching the
+/// signatures.
+pub struct ProxyHooks {
+    /// Web capture sink — teed request/response rows (`--webcap`).
+    pub capture: Option<std::sync::Arc<webcap::WebCapSink>>,
+    /// Ad/tracker block + response rewrite (`--webfilter`).
+    pub filter: Option<std::sync::Arc<filter::Filter>>,
+}
+
+impl ProxyHooks {
+    /// True when neither hook is active — the proxy can take its original
+    /// zero-cost path.
+    pub fn is_inert(&self) -> bool {
+        self.capture.is_none() && self.filter.is_none()
+    }
+}
 
 use std::sync::Arc;
 

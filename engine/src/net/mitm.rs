@@ -31,7 +31,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::bridge::SmoltcpStream;
 use super::ca::Ca;
-use super::webcap::{self, ReqCap, WebCapSink};
+use super::filter::Decision;
+use super::webcap::{self, ReqCap};
+use super::ProxyHooks;
 
 /// Hyper body type the proxy emits — boxed dyn so HTTP and HTTPS paths
 /// share the same Response signature regardless of the upstream body.
@@ -61,17 +63,19 @@ fn err_response(status: hyper::StatusCode, msg: &str) -> Response<ProxyBody> {
 
 /// Common request handler. `scheme` is "http" or "https"; for "https" the
 /// upstream is opened via tokio-rustls. `port` is the default port (80/443)
-/// or whatever the box dialed. `sink` (DESIGN-web.md W2) is the per-box web
-/// capture sink: `None` runs the original pure pass-through with zero added
-/// cost; `Some` takes the capturing path — buffer the request body (bounded),
-/// then tee the response body into a `webcap` row while streaming it to the
-/// box unchanged.
+/// or whatever the box dialed. `hooks` (DESIGN-web.md W2/W7) are the per-box
+/// proxy hooks: `None` runs the original pure pass-through with zero added
+/// cost; otherwise the filter can block the request (synthetic 204) or rewrite
+/// response headers, and the capture sink tees the exchange into a `webcap`
+/// row while streaming the body to the box unchanged.
 async fn proxy_request(scheme: &'static str, default_port: u16,
                        req: Request<Incoming>,
                        rustls_client_config: Option<Arc<rustls::ClientConfig>>,
-                       sink: Option<Arc<WebCapSink>>)
+                       hooks: Option<Arc<ProxyHooks>>)
                        -> Result<Response<ProxyBody>>
 {
+    let sink = hooks.as_ref().and_then(|h| h.capture.clone());
+    let filter = hooks.as_ref().and_then(|h| h.filter.clone());
     // Recover the target authority from the Host header (HTTP) or the
     // request URI's authority (HTTP/2-style absolute URI).
     let host = req.headers().get(hyper::header::HOST)
@@ -93,6 +97,31 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
     let (parts, in_body) = req.into_parts();
     let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let url = format!("{scheme}://{host}{pq}");
+
+    // ── W7 request-block (adblock) ────────────────────────────────────────
+    // Decide BEFORE dialing upstream. A blocked request never leaves the
+    // engine; the box gets a synthetic 204. Still recorded (status 204,
+    // blocked marker) so the archive shows what was filtered.
+    if let Some(f) = &filter {
+        if f.decide(&url, &host) == Decision::Block {
+            if let Some(sink) = &sink {
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                let rc = ReqCap {
+                    method: parts.method.to_string(), url: url.clone(),
+                    host: host.clone(),
+                    headers: webcap::format_headers(&parts.headers),
+                    body: Vec::new(),
+                };
+                sink.record(ts, &rc, 204, "", "x-sarun-filter: blocked\n", &[], false);
+            }
+            return Ok(Response::builder()
+                .status(hyper::StatusCode::NO_CONTENT)
+                .header("x-sarun-filter", "blocked")
+                .body(empty_body()).unwrap());
+        }
+    }
+
     let (out_body, reqcap): (ProxyBody, Option<ReqCap>) = if sink.is_some() {
         let mut rc = ReqCap {
             method: parts.method.to_string(),
@@ -154,6 +183,15 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
         let resp = sender.send_request(out_req).await?;
         resp.map(|b| b.map_err(|e| Box::new(e) as _).boxed())
     };
+    let mut resp = resp;
+
+    // ── W7 response header rewrite ────────────────────────────────────────
+    // Strip configured headers (CSP/X-Frame-Options for rendering, tracking
+    // headers) before the box OR the capture sink sees them, so both the live
+    // view and the archive reflect the filtered response.
+    if let Some(f) = &filter {
+        f.rewrite_response_headers(resp.headers_mut());
+    }
 
     // Capturing path: tee the response body into a webcap row while it streams
     // to the box. Non-capturing path returns the response untouched.
@@ -168,7 +206,7 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
 /// completed exchange is recorded as one `webcap` row (DESIGN-web.md W2). The
 /// forward is byte-for-byte — the box sees exactly what upstream sent — so
 /// this never changes what the box receives, only records a copy.
-fn tee_response(sink: Arc<WebCapSink>, req: ReqCap,
+fn tee_response(sink: Arc<webcap::WebCapSink>, req: ReqCap,
                 resp: Response<ProxyBody>) -> Response<ProxyBody> {
     let (parts, mut body) = resp.into_parts();
     let status = parts.status.as_u16() as i32;
@@ -218,12 +256,12 @@ fn tee_response(sink: Arc<WebCapSink>, req: ReqCap,
 }
 
 pub async fn serve_http(box_side: SmoltcpStream, _host_hint: &str,
-                        port: u16, sink: Option<Arc<WebCapSink>>) -> Result<()> {
+                        port: u16, hooks: Option<Arc<ProxyHooks>>) -> Result<()> {
     let io = TokioIo::new(box_side);
     let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
-        let sink = sink.clone();
+        let hooks = hooks.clone();
         async move {
-            match proxy_request("http", port, req, None, sink).await {
+            match proxy_request("http", port, req, None, hooks).await {
                 Ok(r) => Ok::<_, std::convert::Infallible>(r),
                 Err(e) => {
                     eprintln!("sarun-net: http proxy: {e}");
@@ -245,7 +283,7 @@ pub async fn serve_http(box_side: SmoltcpStream, _host_hint: &str,
 pub async fn serve_https(box_side: SmoltcpStream, host: &str,
                          ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
                          upstream: Arc<rustls::ClientConfig>,
-                         sink: Option<Arc<WebCapSink>>) -> Result<()> {
+                         hooks: Option<Arc<ProxyHooks>>) -> Result<()> {
     let leaf = ca.leaf_for(host).context("mint leaf")?;
     let cert_chain: Vec<rustls::pki_types::CertificateDer> = vec![
         rustls::pki_types::CertificateDer::from(leaf.cert_der.clone()),
@@ -265,9 +303,9 @@ pub async fn serve_https(box_side: SmoltcpStream, host: &str,
     let upstream_cfg = upstream.clone();
     let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
         let cfg = upstream_cfg.clone();
-        let sink = sink.clone();
+        let hooks = hooks.clone();
         async move {
-            match proxy_request("https", 443, req, Some(cfg), sink).await {
+            match proxy_request("https", 443, req, Some(cfg), hooks).await {
                 Ok(r) => Ok::<_, std::convert::Infallible>(r),
                 Err(e) => {
                     eprintln!("sarun-net: https proxy: {e}");

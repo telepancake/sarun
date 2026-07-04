@@ -253,6 +253,56 @@ missing is the driver and the exporter:
   apply-time/GC concern (like `DESIGN.md` D4's "long-KEPT boxes are
   uncompressed at rest"), not a capture-time one — capture stays simple rows.
 
+## W7 · Proxy-side filtering — adblock + rewriting, entirely outside the browser
+
+Filtering belongs on the same seam as capture, for the same reason: the engine
+MITM proxy sees every request and response in the clear, so ad/tracker
+blocking and content rewriting can happen there — in the engine, outside the
+browser — and apply to **any** box, not just carbonyl. A `curl` in a build
+box, a headless crawl, the interactive browser: all get the same filtering,
+because it lives at `proxy_request`, not in a browser extension.
+
+This is strictly better than in-browser adblock: it needs no extension (which
+carbonyl can't easily run anyway), it can't be defeated by the page, it works
+for non-browser HTTP clients, and — because it runs before the capture tee —
+the web archive records what was *actually served to the box* (blocked
+requests noted, injected content present), so replay reproduces the filtered
+view.
+
+Two filter kinds, both on the `proxy_request` path:
+
+1. **Request block (adblock).** Before dialing upstream, match the request URL
+   and host against the filter ruleset. On a block match, short-circuit with a
+   synthetic response (204 No Content, or an empty 200) — upstream is never
+   contacted. This is ad/tracker/malware-domain blocking. A blocked request is
+   still recorded in `webcap` (status 204, a `blocked` marker) so the archive
+   shows what was filtered.
+2. **Response rewriting.** After fetching, before handing the response to the
+   box: rewrite headers (strip `Content-Security-Policy` / `X-Frame-Options` so
+   archived pages render in the viewer, drop tracking headers) and — for
+   `text/html` — inject cosmetic CSS (`##selector`-style element hiding) into
+   the body. Header rewriting ships in the first cut; body/cosmetic rewriting
+   is the follow-on (it re-encodes through the same streaming tee).
+
+The ruleset is a plain file, `{config_home}/webfilter`, one rule per line:
+
+```
+block  <glob>          block requests whose URL matches <glob> (synthetic 204)
+block-host <glob>      block by host authority (tracker/ad domains)
+strip-header <name>    remove <name> from every response (e.g. CSP)
+```
+
+`<glob>` is a case-insensitive match with `*` wildcards. This native format is
+deliberately tiny; an EasyList importer (`||domain^`, `##selector`) that
+compiles the standard lists into these rules is a follow-on — the engine
+mechanism is list-format-agnostic.
+
+Filtering is opt-in per box via `--webfilter` (SARUN_WEBFILTER env, mirroring
+`--webcap`); the browser turns it on alongside capture. It composes with the
+existing per-flow `policy::decide` (`net/dispatch.rs`) — policy is coarse
+allow/deny by host/port/scheme; the filter is fine URL/header rewriting. They
+stack: policy gates the connection, the filter shapes the request/response.
+
 ## Ordering & what lands when
 
 - **W1 + W2** (the store + the tee) is the spine — everything else needs it.
@@ -263,6 +313,9 @@ missing is the driver and the exporter:
 - **W3** (browser de-kludge) turns capture on for the browser and fixes the
   three kludges; depends only on W1/W2.
 - **W5** (oaita tools) and **W4 rung 2** (replay) are parallel consumers.
+- **W7** (filtering) rides the same `proxy_request` seam as W2; request-block
+  and header-strip land with the browser (which turns filtering on), body
+  rewriting follows.
 - **W6** (crawl + WACZ) is the capstone; depends on W3 (headless browser) and
   W1 (the store to export).
 

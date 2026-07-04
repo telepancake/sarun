@@ -310,6 +310,11 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                          "want_webcap": std::env::var("SARUN_WEBCAP")
                              .map(|v| !v.is_empty()).unwrap_or(false)
                              && net_mode == crate::net::NetMode::Tap,
+                         // Web filtering (DESIGN-web.md W7): adblock + response
+                         // rewrite. Same env-toggle shape as --webcap; tap-only.
+                         "want_webfilter": std::env::var("SARUN_WEBFILTER")
+                             .map(|v| !v.is_empty()).unwrap_or(false)
+                             && net_mode == crate::net::NetMode::Tap,
                          "net_mode": net_mode.as_str(),
                          "want_no_parent": no_parent,
                          "want_readonly_parent": readonly_parent,
