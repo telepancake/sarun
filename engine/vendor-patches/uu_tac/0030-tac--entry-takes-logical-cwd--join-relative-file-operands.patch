@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 16:37:42 +0000
+Subject: [PATCH] tac: entry takes logical cwd; join relative file operands
+
+---
+diff --git a/src/tac.rs b/src/tac.rs
+index 457b01d..9b65fa9 100644
+--- a/src/tac.rs
++++ b/src/tac.rs
+@@ -46,6 +46,7 @@ mod options {
+ /// to `out` aborts immediately, exactly as upstream.
+ pub fn tac(
+     args: impl uucore::Args,
++    cwd: &std::path::Path,
+     out: &mut dyn Write,
+     err: &mut dyn Write,
+     stdin: &mut dyn Read,
+@@ -69,7 +70,7 @@ pub fn tac(
+         None => vec![OsString::from("-")],
+     };
+ 
+-    tac_impl(&files, before, regex, separator, out, err, stdin)
++    tac_impl(&files, cwd, before, regex, separator, out, err, stdin)
+ }
+ 
+ /// Descriptor-based entry point for the standalone `tac` binary and the
+@@ -88,7 +89,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     let mut err = stderr.lock();
+     let stdin = std::io::stdin();
+     let mut input = stdin.lock();
+-    tac(args, &mut out, &mut err, &mut input)
++    // The standalone binary owns the process cwd; pass it so relative operands
++    // resolve against it exactly as upstream did.
++    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
++    tac(args, &cwd, &mut out, &mut err, &mut input)
+ }
+ 
+ pub fn uu_app() -> Command {
+@@ -359,6 +363,7 @@ fn translate_regex_flavor(bytes: &[u8]) -> String {
+ #[allow(clippy::cognitive_complexity)]
+ fn tac_impl(
+     filenames: &[OsString],
++    cwd: &std::path::Path,
+     before: bool,
+     regex: bool,
+     separator: &OsStr,
+@@ -406,7 +411,14 @@ fn tac_impl(
+                 }
+             }
+         } else {
+-            let mut file = match std::fs::File::open(std::path::Path::new(filename)) {
++            // Root a relative operand at the shell's logical cwd for the actual
++            // open (the process is never `chdir`'d); the diagnostic still shows
++            // the operand exactly as given (`filename`).
++            let open_path = {
++                let p = std::path::Path::new(filename);
++                if p.is_relative() { cwd.join(p) } else { p.to_path_buf() }
++            };
++            let mut file = match std::fs::File::open(&open_path) {
+                 Ok(f) => f,
+                 Err(e) => {
+                     let msg = TacError::OpenError(filename.clone(), e);
