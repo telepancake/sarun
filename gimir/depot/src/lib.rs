@@ -26,13 +26,18 @@
 //! apply(base, diff(base, target)) == target
 //! ```
 //!
-//! and rotation — promote child B over parent A — is *derived*:
+//! and rotation — promote child B over parent A — is *derived and purely
+//! syntactic* (no views, no backdrop, no host I/O):
 //!
 //! ```text
-//! B' = squash([A, B]);  A' = diff(view(B'), view(A))
-//! resolve([B'])     == resolve([A, B])
-//! resolve([B', A']) == resolve([A])
+//! B' = compose(A, B);  A' = inverse over B's recorded footprint
+//! resolve_over(bd, anc ++ [B'])     == resolve_over(bd, anc ++ [A, B])   for all bd
+//! resolve_over(bd, anc ++ [B', A']) == resolve_over(bd, anc ++ [A])      for all bd
 //! ```
+//!
+//! Stacks containing backdrop-anchored nodes (holes) MUST be resolved
+//! compose-then-apply ([`resolve_over`]); fold-apply ([`resolve`]) is
+//! only valid for pure lower-anchored stacks.
 //!
 //! Names are opaque bytes, deliberately not called "paths": a layer can
 //! hold a filesystem image, a tabular dataset, a git snapshot, a wiki.
@@ -79,17 +84,42 @@ pub enum Presence {
     Tombstone,
 }
 
+/// What a node's own facets (blob / attrs / opaque) resolve against.
+///
+/// A layer is a partially occluded view of a BACKDROP — the live host
+/// filesystem, or the empty filesystem for no-host stacks. The backdrop
+/// is never content in a layer; it is what access resolves against.
+/// Parent links between layers are an ENCODING detail: a child is stored
+/// as a difference from its parent, but its meaning is always the single
+/// composed occlusion over the backdrop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// Facets resolve against the recorded occlusion below (the normal
+    /// delta encoding).
+    Lower,
+    /// Facets resolve against the BACKDROP: whatever recorded occlusion
+    /// sits below is erased for this node's facets. A pure such node
+    /// (no blob/attrs/children set) is a **hole** — "this key is not
+    /// occluded" — the artifact layer re-encoding (rotation) leaves
+    /// where the new parent-encoding contains changes that were never
+    /// part of this layer's occlusion. A hole documents *lack of change*;
+    /// a tombstone documents deletion. Holes are absolute: they always
+    /// mean "backdrop", never "skip N layers".
+    Backdrop,
+}
+
 /// One node of a delta tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node {
     pub presence: Presence,
     pub blob: BlobOp,
-    /// Masks lower-layer *children* only (AUFS opaque-dir). The node's own
-    /// blob/attrs still inherit unless overridden — opaque is a third
-    /// axis, not a kind of tombstone.
+    /// Masks lower *children* — recorded AND backdrop (AUFS opaque-dir).
+    /// The node's own blob/attrs still inherit unless overridden —
+    /// opaque is its own axis, not a kind of tombstone.
     pub opaque: bool,
-    /// `None` = inherit lower attrs; `Some(map)` = replace them wholesale.
+    /// `None` = inherit attrs (from the anchor); `Some(map)` = replace.
     pub attrs: Option<Attrs>,
+    pub anchor: Anchor,
     pub children: BTreeMap<Name, Node>,
 }
 
@@ -101,6 +131,7 @@ impl Node {
             blob: BlobOp::Keep,
             opaque: false,
             attrs: None,
+            anchor: Anchor::Lower,
             children: BTreeMap::new(),
         }
     }
@@ -109,13 +140,21 @@ impl Node {
         Node { presence: Presence::Tombstone, ..Node::keep() }
     }
 
+    /// A hole: this key is not occluded — the backdrop shows through,
+    /// erasing any recorded occlusion below under composition.
+    pub fn hole() -> Self {
+        Node { anchor: Anchor::Backdrop, ..Node::keep() }
+    }
+
     /// True if this node is exactly the identity delta (and so can be
-    /// pruned from a parent's children without changing meaning).
+    /// pruned from a parent's children without changing meaning). A
+    /// backdrop-anchored node is NEVER identity: it erases under compose.
     pub fn is_identity(&self) -> bool {
         self.presence == Presence::Live
             && self.blob == BlobOp::Keep
             && !self.opaque
             && self.attrs.is_none()
+            && self.anchor == Anchor::Lower
             && self.children.is_empty()
     }
 }
@@ -190,14 +229,27 @@ pub fn apply(base: Option<&View>, layer: &Layer) -> Option<View> {
     apply_node(base, &layer.root)
 }
 
-/// Resolve a stack of layers, listed lower-first, into its effective view.
-/// `None` means the stack presents nothing at all (e.g. empty stack).
+/// Resolve a stack of layers, listed lower-first, into its effective view
+/// over NOTHING (the empty backdrop), by folding `apply`. ONLY valid for
+/// stacks with no backdrop-anchored nodes: `apply` cannot distinguish
+/// "recorded lower" from "backdrop", so a hole applied mid-fold would
+/// wrongly inherit the accumulated view. Stacks that may contain anchors
+/// must use [`resolve_over`] (compose-then-apply).
 pub fn resolve(stack: &[&Layer]) -> Option<View> {
     let mut view = None;
     for layer in stack {
         view = apply(view.as_ref(), layer);
     }
     view
+}
+
+/// Resolve a stack over an explicit backdrop, compose-then-apply: fold the
+/// deltas with `compose` (where backdrop-anchored facets erase recorded
+/// occlusion below), then apply the net occlusion to the backdrop once.
+/// This is the semantically correct resolution for any stack; sarun's
+/// per-name chain walk is this, per name.
+pub fn resolve_over(backdrop: Option<&View>, stack: &[&Layer]) -> Option<View> {
+    apply(backdrop, &squash(stack))
 }
 
 // -------------------------------------------------------------- compose
@@ -207,6 +259,10 @@ pub fn resolve(stack: &[&Layer]) -> Option<View> {
 /// DEPOT-DESIGN.md §6, in one place:
 ///
 /// - `b` tombstone wins outright.
+/// - `b` backdrop-anchored: `a`'s facets are erased (the backdrop shows
+///   through them); `a`'s children still compose per name — anchoring is
+///   facet-local, subtree erasure is expressed by explicit per-name holes
+///   (rotation enumerates them; all footprints are recorded data).
 /// - `b` live over `a` tombstone is a *recreate*: nothing below `a` may
 ///   show through, so the result is opaque, `Keep` hardens to `Remove`,
 ///   and inherit-attrs hardens to replace-with-what-`b`-sees (empty).
@@ -214,6 +270,14 @@ pub fn resolve(stack: &[&Layer]) -> Option<View> {
 fn compose_node(a: &Node, b: &Node) -> Node {
     if b.presence == Presence::Tombstone {
         return Node::tombstone();
+    }
+    if b.anchor == Anchor::Backdrop {
+        // b re-bases this name on the backdrop: NOTHING recorded below
+        // survives — not facets, not children, not a tombstone. b's own
+        // facets and explicitly-listed children are the entire recorded
+        // occlusion here. (This wholesale scope is what keeps squash
+        // confluent with later holes: erasure never half-survives.)
+        return b.clone();
     }
     if a.presence == Presence::Tombstone {
         // Recreate over a whiteout: harden every inherit in `b` so the
@@ -278,7 +342,7 @@ fn compose_node(a: &Node, b: &Node) -> Node {
         }
         (a.opaque, kids)
     };
-    Node { presence: Presence::Live, blob, opaque, attrs, children }
+    Node { presence: Presence::Live, blob, opaque, attrs, anchor: a.anchor, children }
 }
 
 /// Would this delta node materialize a view when applied over an absent
@@ -310,6 +374,7 @@ fn harden(n: &Node) -> Node {
         },
         opaque: true,
         attrs: Some(n.attrs.clone().unwrap_or_default()),
+        anchor: Anchor::Lower,
         children: n
             .children
             .iter()
@@ -371,7 +436,8 @@ fn diff_node(base: Option<&View>, target: &View) -> Node {
     }
     // Canonical views contain no empty nodes (apply prunes them), so a
     // live target always sets something and the delta materializes it.
-    Node { presence: Presence::Live, blob, opaque: false, attrs, children }
+    Node { presence: Presence::Live, blob, opaque: false, attrs,
+           anchor: Anchor::Lower, children }
 }
 
 /// Delta from one optional view to another. `target = None` yields a
@@ -387,6 +453,7 @@ pub fn diff(base: Option<&View>, target: Option<&View>) -> Layer {
                 blob: BlobOp::Remove,
                 opaque: true,
                 attrs: Some(Attrs::new()),
+                anchor: Anchor::Lower,
                 children: BTreeMap::new(),
             },
         },
@@ -400,10 +467,87 @@ pub fn diff(base: Option<&View>, target: Option<&View>) -> Layer {
 /// where `b'` is the new parent (effective content of the old stack) and
 /// `a'` the new child (restores the old parent's view when stacked on
 /// `b'`).
-pub fn rotate(a: &Layer, b: &Layer) -> (Layer, Layer) {
-    let b_new = squash(&[a, b]);
-    let view_b = resolve(&[&b_new]);
-    let view_a = resolve(&[a]);
-    let a_new = diff(view_b.as_ref(), view_a.as_ref());
-    (b_new, a_new)
+/// Rotation, derived and purely syntactic (DEPOT-DESIGN.md §6): given
+/// parent `a` and child `b` (child stacked over parent), promote the
+/// child. Returns `(b', a')` where `b'` carries the old stack's total
+/// occlusion and `a'` restores `a`'s occlusion when stacked on `b'`.
+///
+/// Rotation rewrites ENCODINGS; no layer's occlusion changes — which is
+/// why it needs no view, no backdrop, and no host I/O. `ancestors` are
+/// `a`'s own encoding ancestors (recorded data), consulted only to
+/// replicate older changes at names `b` touched: where the old chain
+/// recorded something, `a'` replicates it (backdrop-anchored, erasing
+/// `b'`'s contribution); where it recorded nothing, `a'` writes a hole —
+/// the backdrop shows through, LIVE at access time. Grandparent changes
+/// replicate; holes never mean "skip N layers".
+///
+/// Law (checked over multiple backdrops in the tests):
+///   resolve_over(bd, ancestors ++ [b'])      == resolve_over(bd, ancestors ++ [a, b])
+///   resolve_over(bd, ancestors ++ [b', a'])  == resolve_over(bd, ancestors ++ [a])
+pub fn rotate(ancestors: &[&Layer], a: &Layer, b: &Layer) -> (Layer, Layer) {
+    let b_new = compose(a, b);
+    // The old child stack's net recorded occlusion (encoding vs backdrop).
+    let mut chain: Vec<&Layer> = ancestors.to_vec();
+    chain.push(a);
+    let net = squash(&chain);
+    let a_root = inverse_node(Some(&net.root), &b.root);
+    (b_new, Layer { root: a_root })
+}
+
+/// Does this delta node record anything at all (itself or below)?
+fn records(n: &Node) -> bool {
+    !n.is_identity()
+}
+
+/// Did the node record anything at its own scope (facets, presence,
+/// opaque, anchoring)?
+fn facets_recorded(n: &Node) -> bool {
+    n.presence == Presence::Tombstone
+        || !matches!(n.blob, BlobOp::Keep)
+        || n.attrs.is_some()
+        || n.opaque
+        || n.anchor == Anchor::Backdrop
+}
+
+/// Replicate a net-occlusion subtree as a backdrop-anchored (re-based)
+/// restoration: the top node erases everything recorded below it; its
+/// facets and children ARE the occlusion, verbatim from net. Keep/None
+/// facets still mean "backdrop", which is exactly what they meant at the
+/// chain root, and the backdrop stays LIVE — nothing is snapshotted.
+fn replicate(net: &Node) -> Node {
+    if net.presence == Presence::Tombstone {
+        return Node::tombstone();
+    }
+    Node { anchor: Anchor::Backdrop, ..net.clone() }
+}
+
+/// The anti-`b` node: restores the old chain's net occlusion (`net`) at
+/// every scope `b` recorded.
+fn inverse_node(net: Option<&Node>, b: &Node) -> Node {
+    if facets_recorded(b) {
+        // b recorded at this scope: re-base it on the old chain's net
+        // occlusion — or on nothing (a pure hole) if the chain had none.
+        return match net {
+            Some(n) => replicate(n),
+            None => Node::hole(),
+        };
+    }
+    if net.is_some_and(|n| n.presence == Presence::Tombstone) {
+        // b recorded only deeper, but the old chain deleted this whole
+        // subtree; restore the deletion (it subsumes the names below).
+        return Node::tombstone();
+    }
+    // Carrier: recurse into the children b recorded.
+    let mut out = Node::keep();
+    for (name, bc) in &b.children {
+        if !records(bc) {
+            continue;
+        }
+        let net_child = net.and_then(|n| n.children.get(name));
+        let inv = inverse_node(net_child, bc);
+        if !inv.is_identity() {
+            out.children.insert(name.clone(), inv);
+        }
+    }
+    out
 }

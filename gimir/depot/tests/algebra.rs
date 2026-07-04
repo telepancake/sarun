@@ -14,8 +14,52 @@ use std::collections::BTreeMap;
 
 use common::{random_layer, Rng};
 use depot::{
-    apply, compose, diff, resolve, rotate, squash, Attrs, BlobOp, Layer, Node, Presence, View,
+    apply, compose, diff, resolve, resolve_over, rotate, squash, Anchor, Attrs, BlobOp, Layer,
+    Node, Presence, View,
 };
+
+/// A couple of distinct backdrops for the "for all backdrops" laws: the
+/// empty filesystem and two host-ish trees that disagree everywhere.
+fn backdrops() -> Vec<Option<View>> {
+    let host1 = layer(with_children(
+        set(b"hostroot"),
+        vec![
+            (b"keep", set(b"host-K")),
+            (b"overwritten", set(b"host-OLD")),
+            (b"hostonly", set(b"H")),
+            (b"dir", with_children(live(), vec![(b"hx", set(b"HX"))])),
+        ],
+    ));
+    let host2 = layer(with_children(
+        live(),
+        vec![(b"overwritten", set(b"host2")), (b"other", set(b"O"))],
+    ));
+    vec![None, apply(None, &host1), apply(None, &host2)]
+}
+
+fn assert_rotation_laws(ancestors: &[&Layer], a: &Layer, b: &Layer, ctx: &str) {
+    let (b_new, a_new) = rotate(ancestors, a, b);
+    let mut anc_b: Vec<&Layer> = ancestors.to_vec();
+    anc_b.push(&b_new);
+    let mut anc_ab: Vec<&Layer> = ancestors.to_vec();
+    anc_ab.extend([a, b]);
+    let mut anc_ba: Vec<&Layer> = anc_b.clone();
+    anc_ba.push(&a_new);
+    let mut anc_a: Vec<&Layer> = ancestors.to_vec();
+    anc_a.push(a);
+    for (i, bd) in backdrops().iter().enumerate() {
+        assert_eq!(
+            resolve_over(bd.as_ref(), &anc_b),
+            resolve_over(bd.as_ref(), &anc_ab),
+            "{ctx}: parent view broken over backdrop {i}"
+        );
+        assert_eq!(
+            resolve_over(bd.as_ref(), &anc_ba),
+            resolve_over(bd.as_ref(), &anc_a),
+            "{ctx}: child view broken over backdrop {i}"
+        );
+    }
+}
 
 // ------------------------------------------------------------- builders
 
@@ -298,11 +342,7 @@ fn rotation_preserves_both_views() {
         ],
     ));
 
-    let (b_new, a_new) = rotate(&a, &b);
-    // resolve(B') == resolve(A + B)
-    assert_eq!(resolve(&[&b_new]), resolve(&[&a, &b]));
-    // resolve(B' + A') == resolve(A)
-    assert_eq!(resolve(&[&b_new, &a_new]), resolve(&[&a]));
+    assert_rotation_laws(&[], &a, &b, "basic");
 }
 
 #[test]
@@ -318,16 +358,18 @@ fn rotation_opaque_inversion_relists_children() {
     op.opaque = true;
     let b = layer(with_children(live(), vec![(b"d", op)]));
 
-    let (b_new, a_new) = rotate(&a, &b);
-    assert_eq!(resolve(&[&b_new]), resolve(&[&a, &b]));
-    assert_eq!(resolve(&[&b_new, &a_new]), resolve(&[&a]));
+    assert_rotation_laws(&[], &a, &b, "opaque-inversion");
+    let (_b_new, a_new) = rotate(&[], &a, &b);
 
-    // And the inverse really is explicit re-listing, not opaque.
+    // The inverse re-bases `d` on the backdrop (erasing B's opaque AND
+    // B's z wholesale) and re-lists A's own children explicitly. The
+    // backdrop's children under d reappear live — nothing snapshotted.
     let d = &a_new.root.children[&n(b"d")];
-    assert!(!d.opaque, "diff never generates opaque");
-    assert_eq!(d.children[&n(b"z")].presence, Presence::Tombstone);
+    assert_eq!(d.anchor, Anchor::Backdrop, "re-based, not layered over B");
+    assert!(!d.opaque, "A never opaqued d");
     assert_eq!(d.children[&n(b"x")].blob, BlobOp::Set(n(b"X")));
     assert_eq!(d.children[&n(b"y")].blob, BlobOp::Set(n(b"Y")));
+    assert!(!d.children.contains_key(&n(b"z")), "B's addition erased by the re-base");
 }
 
 #[test]
@@ -340,11 +382,15 @@ fn rotation_of_rotation_is_identity_on_views() {
         live(),
         vec![(b"f", Node::tombstone()), (b"h", set(b"H"))],
     ));
-    let (b1, a1) = rotate(&a, &b);
-    let (a2, b2) = rotate(&b1, &a1);
-    // Rotating back: parent view again == old A+... check both.
-    assert_eq!(resolve(&[&a2]), resolve(&[&a]));
-    assert_eq!(resolve(&[&a2, &b2]), resolve(&[&a, &b]));
+    let (b1, a1) = rotate(&[], &a, &b);
+    let (a2, b2) = rotate(&[], &b1, &a1);
+    // Rotating back: both views restored, over every backdrop.
+    for bd in backdrops() {
+        assert_eq!(resolve_over(bd.as_ref(), &[&a2]),
+                   resolve_over(bd.as_ref(), &[&a]));
+        assert_eq!(resolve_over(bd.as_ref(), &[&a2, &b2]),
+                   resolve_over(bd.as_ref(), &[&a, &b]));
+    }
 }
 
 // -------------------------------------------------- randomized law check
@@ -384,9 +430,107 @@ fn randomized_diff_and_rotation_laws() {
             let d = diff(va.as_ref(), Some(target));
             assert_eq!(apply(va.as_ref(), &d).as_ref(), Some(target), "diff law, seed {seed}");
         }
-        // rotation equivalences.
-        let (b_new, a_new) = rotate(&a, &b);
-        assert_eq!(resolve(&[&b_new]), resolve(&[&a, &b]), "rotation parent view, seed {seed}");
-        assert_eq!(resolve(&[&b_new, &a_new]), resolve(&[&a]), "rotation child view, seed {seed}");
+        // rotation equivalences (Lower-only layers here; the anchored
+        // randomized test covers holes).
+        assert_rotation_laws(&[], &a, &b, &format!("plain seed {seed}"));
+    }
+}
+
+// ----------------------------------------------------- holes / backdrop
+
+/// A hole is "this key is not occluded": the backdrop shows through LIVE
+/// — the same encoding resolves differently over different backdrops.
+#[test]
+fn hole_reveals_live_backdrop() {
+    let lower = layer(with_children(live(), vec![(b"overwritten", set(b"MINE"))]));
+    let upper = layer(with_children(live(), vec![(b"overwritten", Node::hole())]));
+    let bds = backdrops();
+    // Over the empty backdrop: nothing there.
+    assert_eq!(resolve_over(bds[0].as_ref(), &[&lower, &upper]), None);
+    // Over host1 and host2: each backdrop's own bytes, unfrozen.
+    let v1 = resolve_over(bds[1].as_ref(), &[&lower, &upper]).unwrap();
+    assert_eq!(v1.children[&n(b"overwritten")].blob.as_deref(), Some(&b"host-OLD"[..]));
+    let v2 = resolve_over(bds[2].as_ref(), &[&lower, &upper]).unwrap();
+    assert_eq!(v2.children[&n(b"overwritten")].blob.as_deref(), Some(&b"host2"[..]));
+}
+
+/// A hole cancels recorded deletion too: the tombstone was occlusion, and
+/// the hole says "not occluded".
+#[test]
+fn hole_cancels_tombstone() {
+    let lower = layer(with_children(live(), vec![(b"overwritten", Node::tombstone())]));
+    let upper = layer(with_children(live(), vec![(b"overwritten", Node::hole())]));
+    let bds = backdrops();
+    let v = resolve_over(bds[1].as_ref(), &[&lower, &upper]).unwrap();
+    assert_eq!(v.children[&n(b"overwritten")].blob.as_deref(), Some(&b"host-OLD"[..]));
+    assert_eq!(resolve_over(bds[0].as_ref(), &[&lower, &upper]), None);
+}
+
+/// Rotation where B changed something A never touched: the inverse is a
+/// hole, and A's rotated view tracks the LIVE backdrop.
+#[test]
+fn rotation_holes_where_a_never_changed() {
+    let a = layer(with_children(live(), vec![(b"keep", set(b"A-KEEP"))]));
+    let b = layer(with_children(live(), vec![(b"overwritten", set(b"B-NEW"))]));
+    assert_rotation_laws(&[], &a, &b, "hole-side");
+    let (_b_new, a_new) = rotate(&[], &a, &b);
+    let inv = &a_new.root.children[&n(b"overwritten")];
+    assert_eq!(inv.anchor, Anchor::Backdrop);
+    assert_eq!(inv.blob, BlobOp::Keep, "a hole, not frozen content");
+}
+
+/// Rotation where a GRANDPARENT recorded a change at the name B touched:
+/// the older change is recorded data and gets replicated into the
+/// inverse — holes never mean "skip N layers".
+#[test]
+fn rotation_replicates_grandparent_changes() {
+    let g = layer(with_children(live(), vec![(b"overwritten", set(b"G-OLD"))]));
+    let a = layer(with_children(live(), vec![(b"unrelated", set(b"A"))]));
+    let b = layer(with_children(live(), vec![(b"overwritten", set(b"B-NEW"))]));
+    assert_rotation_laws(&[&g], &a, &b, "grandparent-replication");
+    let (_b_new, a_new) = rotate(&[&g], &a, &b);
+    let inv = &a_new.root.children[&n(b"overwritten")];
+    assert_eq!(inv.blob, BlobOp::Set(n(b"G-OLD")), "replicated, not holed");
+    assert_eq!(inv.anchor, Anchor::Backdrop, "replica erases B's entry");
+}
+
+/// Randomized rotation laws over anchored layers (holes included), with
+/// and without ancestors, across every backdrop.
+#[test]
+fn randomized_rotation_laws_with_holes() {
+    for seed in 1..150u64 {
+        let mut rng = Rng(seed ^ 0xda7a);
+        let g = common::random_layer_anchored(&mut rng);
+        let a = common::random_layer_anchored(&mut rng);
+        let b = common::random_layer_anchored(&mut rng);
+        assert_rotation_laws(&[], &a, &b, &format!("seed {seed} no-anc"));
+        assert_rotation_laws(&[&g], &a, &b, &format!("seed {seed} anc"));
+    }
+}
+
+/// Compose-then-apply consistency for anchored stacks: composing any
+/// adjacent pair first never changes the resolved view.
+#[test]
+fn randomized_compose_consistency_with_holes() {
+    for seed in 1..150u64 {
+        let mut rng = Rng(seed ^ 0xc0);
+        let layers: Vec<Layer> =
+            (0..3).map(|_| common::random_layer_anchored(&mut rng)).collect();
+        let all: Vec<&Layer> = layers.iter().collect();
+        let ab = compose(all[0], all[1]);
+        let bc = compose(all[1], all[2]);
+        for bd in backdrops() {
+            let direct = resolve_over(bd.as_ref(), &all);
+            assert_eq!(
+                resolve_over(bd.as_ref(), &[&ab, all[2]]),
+                direct,
+                "left-compose broke view, seed {seed}"
+            );
+            assert_eq!(
+                resolve_over(bd.as_ref(), &[all[0], &bc]),
+                direct,
+                "right-compose broke view, seed {seed}"
+            );
+        }
     }
 }

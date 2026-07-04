@@ -46,7 +46,33 @@ pub fn random_node(rng: &mut Rng, depth: u32) -> Node {
             }
         }
     }
-    Node { presence: Presence::Live, blob, opaque, attrs, children }
+    Node { presence: Presence::Live, blob, opaque, attrs,
+           anchor: depot::Anchor::Lower, children }
+}
+
+/// Like `random_node` but may emit backdrop-anchored nodes (holes and
+/// facet-restorations) — for the compose-then-apply and rotation laws.
+/// Fold-based `resolve` is NOT valid for these layers.
+pub fn random_node_anchored(rng: &mut Rng, depth: u32) -> Node {
+    let mut node = random_node(rng, 0);
+    if node.presence == Presence::Live && rng.below(5) == 0 {
+        node.anchor = depot::Anchor::Backdrop;
+    }
+    if depth > 0 && node.presence == Presence::Live {
+        for name in NAMES {
+            if rng.below(2) == 0 {
+                node.children
+                    .insert(name.to_vec(), random_node_anchored(rng, depth - 1));
+            }
+        }
+    }
+    node
+}
+
+pub fn random_layer_anchored(rng: &mut Rng) -> Layer {
+    let mut root = random_node_anchored(rng, 3);
+    root.presence = Presence::Live;
+    Layer { root }
 }
 
 pub fn random_layer(rng: &mut Rng) -> Layer {

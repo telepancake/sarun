@@ -48,9 +48,37 @@ Node = name            opaque bytes; ordering/semantics defined by the variant's
   name is deleted", so a stack can mask a name present in a lower layer.
   This is sarun's overlay whiteout promoted into the data model.
 - **Opaque** is a third axis on branch nodes, not a kind of tombstone: it
-  masks lower-layer *children* while the node itself stays live. sarun
-  already stores it as separate state (`capture.rs` `opaque` column); the
-  layer-algebra corner cases (§6) force it into the model explicitly.
+  masks lower *children* — recorded and backdrop alike — while the node
+  itself stays live. sarun already stores it as separate state
+  (`capture.rs` `opaque` column); the layer-algebra corner cases (§6)
+  force it into the model explicitly.
+- **The backdrop, and holes.** A layer is a partially occluded view of a
+  BACKDROP — the live host filesystem, or the empty filesystem for
+  no-host stacks. The backdrop is never content in a layer; it is the
+  substrate access resolves against, at access time (never snapshotted).
+  Parent links between layers are an ENCODING detail: a child is stored
+  as a difference from its parent, but the meaning of a layer is always
+  its single composed occlusion over the backdrop. Nodes therefore carry
+  an **anchor**: `Lower` (facets are a delta over the recorded occlusion
+  below — the normal encoding) or `Backdrop` (this name is RE-BASED on
+  the backdrop: nothing recorded below survives — not facets, children,
+  or tombstones; the node's facets and explicitly-listed children are
+  the entire recorded occlusion there). A pure backdrop-anchored node is
+  a **hole**: "this key is not occluded." A tombstone documents
+  deletion; a hole documents *lack of change* — the artifact layer
+  re-encoding (rotation) leaves where the new parent-encoding contains
+  changes that were never part of this layer's occlusion. Holes are
+  absolute — always "backdrop", never "skip N layers"; an ancestor's
+  change at a rotated name is recorded data and gets REPLICATED instead.
+  Wholesale re-basing (not facet-local anchoring) is load-bearing: it is
+  what keeps squash confluent — a facet-local hole meeting a squashed
+  opaque would need records the squash already dropped.
+- **Compose-then-apply.** Backdrop-anchored nodes make fold-application
+  of a stack invalid (`apply` cannot distinguish "recorded lower" from
+  "backdrop"): a stack that may contain them is resolved by composing
+  all deltas first, then applying the net occlusion to the backdrop once
+  (`resolve_over`). sarun's per-name top-down chain walk is exactly this
+  discipline, per name.
 - `attrs` carry domain metadata that is *data* (mode/mtime for fs layers, a
   wiki revision's sha1-as-recorded-by-the-source). Derived values do not
   appear here (§5).
@@ -179,27 +207,37 @@ the *set* above is fixed by the four workloads, the weights are not.
 
 ## 6. Layer algebra: diff, squash, rotation
 
-`diff` and `squash` are trait-level operations. **Rotation is derived, not
-primitive**: given boxes A (parent) and A.B (child), promoting the child —
+`diff` and `squash` are trait-level operations. **Rotation is derived,
+purely syntactic, and needs no view, no backdrop, and no host I/O**:
+given boxes A (parent) and A.B (child), promoting the child —
 
 ```
-B' = squash(A, B)                 # new parent: old A.B's effective content
-A' = diff(resolve(B'), resolve(A))  # new child: whiteouts for B's additions,
-                                    # resurrected content for B's overwrites/deletes
+B' = compose(A, B)          # new parent: carries the old stack's occlusion
+A' = inverse over B's recorded footprint:
+       where the old chain (A + its encoding ancestors) recorded
+       something → replicate its net occlusion, re-based (backdrop-
+       anchored, erasing B''s contribution);
+       where it recorded nothing → a hole (backdrop shows through, LIVE)
 ```
 
-Correctness is mechanically checkable, and these equivalences ARE the
-acceptance tests, generic over every variant:
+Rotation rewrites encodings; no layer's occlusion changes — the same
+reason dissolving a parent today does not change the view through its
+children. Ancestor changes at rotated names REPLICATE (recorded data is
+copyable exactly); only the backdrop must stay live, and holes preserve
+exactly that. Correctness is mechanically checkable over ARBITRARY
+backdrops, and these equivalences ARE the acceptance tests, generic over
+every variant (checked over multiple distinct backdrops — that is the
+liveness property no snapshot could pass):
 
 ```
-resolve(B' + A') == resolve(A)        # child's effective view preserved
-resolve(B')      == resolve(A + B)    # parent's effective view preserved
+resolve_over(bd, anc ++ [B'])     == resolve_over(bd, anc ++ [A, B])   for all bd
+resolve_over(bd, anc ++ [B', A']) == resolve_over(bd, anc ++ [A])      for all bd
 ```
 
-Because sharing is internal (§1), `diff`/`squash` produce layers whose
-unchanged subtrees and resurrected blobs alias existing internal objects —
-rotation is O(changed metadata), never O(bytes). No copy rule needs to be
-imposed; the definition already implies it.
+Because sharing is internal (§1), `compose` and the inverse produce
+layers whose unchanged subtrees and replicated blobs alias existing
+internal objects — rotation is O(changed metadata), never O(bytes). No
+copy rule needs to be imposed; the definition already implies it.
 
 The value of rotation: it restores the **newest-first invariant** —
 "current state cheap, history in the tail" — across all workloads. Overlay
@@ -214,9 +252,13 @@ stack). Git history imports as layers newest-first for the same reason.
 The "tricky whiteout juggling" lives entirely in these; write them as
 fixtures first:
 
-- **Opaque inversion**: an inverse layer may need to *un*-opaque a
-  directory, which has no whiteout form — the inverse must re-list the
-  masked lower children explicitly.
+- **Opaque inversion**: an inverse layer un-opaques by RE-BASING the
+  directory on the backdrop (the backdrop children reappear live) and
+  re-listing the old chain's own children explicitly.
+- **Hole × tombstone**: a hole cancels recorded deletion (the tombstone
+  was occlusion; the hole says "not occluded").
+- **Hole under opaque**: the parent wildcard dominates — a hole beneath
+  a still-opaque parent reveals nothing.
 - Tombstone of a name that is itself a tombstone below.
 - Metadata-only (attrs) changes, including on interior nodes with blobs.
 - A tombstone in the squash base (masks nothing → vanishes vs. must be

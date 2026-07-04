@@ -6,7 +6,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{random_layer, Rng};
+use common::{random_layer, random_layer_anchored, Rng};
 use depot::codec::{decode, encode, DecodeError};
 use depot::{Attrs, BlobOp, Layer, Node, Presence};
 
@@ -24,6 +24,7 @@ fn golden_encoding() {
         blob: BlobOp::Set(b"hi".to_vec()),
         opaque: true,
         attrs: None,
+        anchor: depot::Anchor::Lower,
         children: BTreeMap::from([(b"t".to_vec(), Node::tombstone())]),
     };
     let root = Node {
@@ -31,6 +32,7 @@ fn golden_encoding() {
         blob: BlobOp::Keep,
         opaque: false,
         attrs: Some(Attrs::from([(b"m".to_vec(), b"1".to_vec())])),
+        anchor: depot::Anchor::Lower,
         children: BTreeMap::from([(b"f".to_vec(), child)]),
     };
     let layer = Layer { root };
@@ -68,7 +70,11 @@ fn roundtrip_empty_layer() {
 fn roundtrip_randomized_and_deterministic() {
     for seed in 1..500u64 {
         let mut rng = Rng(seed);
-        let layer = random_layer(&mut rng);
+        let layer = if seed % 2 == 0 {
+            random_layer_anchored(&mut rng) // holes / backdrop anchors
+        } else {
+            random_layer(&mut rng)
+        };
         let bytes = encode(&layer);
         let back = decode(&bytes).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(back, layer, "round-trip mismatch, seed {seed}");
@@ -99,6 +105,28 @@ fn tombstone_encodes_one_byte_regardless_of_payload() {
         },
     };
     assert_eq!(encode(&dirty), encode(&clean));
+}
+
+/// A hole is one flag byte + zero children — and bit 5 is pinned.
+#[test]
+fn golden_hole() {
+    let layer = Layer {
+        root: Node {
+            children: BTreeMap::from([(b"h".to_vec(), Node::hole())]),
+            ..Node::keep()
+        },
+    };
+    assert_eq!(
+        encode(&layer),
+        vec![
+            0,           // root flags
+            1,           // children count
+            1, b'h',     // child name
+            0b0010_0000, // backdrop anchor (hole)
+            0,           // its children count
+        ]
+    );
+    assert_eq!(decode(&encode(&layer)).unwrap(), layer);
 }
 
 // -------------------------------------------------------------- rejection

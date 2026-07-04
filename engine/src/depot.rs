@@ -677,6 +677,7 @@ pub fn export_layer(conn: &Connection, box_id: i64)
             blob,
             opaque: ft == 0o040000 && opaque != 0,
             attrs: Some(attrs),
+            anchor: depot_model::Anchor::Lower,
             children: Default::default(),
         };
         tree_insert(&mut root, &name, node);

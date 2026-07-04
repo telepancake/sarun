@@ -19,6 +19,8 @@
 //!                bits 1-2  blob op: 00 keep, 01 set, 10 remove
 //!                bit 3  opaque
 //!                bit 4  attrs present (replace) — else inherit
+//!                bit 5  backdrop anchor (facets resolve against the
+//!                       backdrop; a pure such node is a hole)
 //! [blob]         if op = set: varint len, bytes
 //! [attrs]        if present: varint count, then (varint len key,
 //!                varint len value) per entry, keys strictly ascending
@@ -43,8 +45,13 @@ const BLOB_SET: u8 = 0b01 << BLOB_SHIFT;
 const BLOB_REMOVE: u8 = 0b10 << BLOB_SHIFT;
 const FLAG_OPAQUE: u8 = 1 << 3;
 const FLAG_ATTRS: u8 = 1 << 4;
+/// Backdrop anchor (a pure such node is a hole). FORMAT MIGRATION NOTE:
+/// bit 5 was added with the anchor axis; encodings written before it
+/// decode unchanged (the bit reads as Lower), and no view-anchored
+/// stores existed at the flag's introduction.
+const FLAG_BACKDROP: u8 = 1 << 5;
 const KNOWN_FLAGS: u8 =
-    FLAG_TOMBSTONE | BLOB_MASK | FLAG_OPAQUE | FLAG_ATTRS;
+    FLAG_TOMBSTONE | BLOB_MASK | FLAG_OPAQUE | FLAG_ATTRS | FLAG_BACKDROP;
 
 /// Decode failure. The input is untrusted bytes (a transfer source, a
 /// cold frame); every malformation is a structured error, never a panic.
@@ -120,6 +127,9 @@ fn encode_node(out: &mut Vec<u8>, node: &Node) {
     }
     if node.attrs.is_some() {
         flags |= FLAG_ATTRS;
+    }
+    if node.anchor == crate::Anchor::Backdrop {
+        flags |= FLAG_BACKDROP;
     }
     out.push(flags);
     if let BlobOp::Set(bytes) = &node.blob {
@@ -238,6 +248,11 @@ impl<'a> Reader<'a> {
             blob,
             opaque: flags & FLAG_OPAQUE != 0,
             attrs,
+            anchor: if flags & FLAG_BACKDROP != 0 {
+                crate::Anchor::Backdrop
+            } else {
+                crate::Anchor::Lower
+            },
             children,
         })
     }
