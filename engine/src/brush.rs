@@ -117,6 +117,27 @@ fn run_coreutil_localized(
     }
 }
 
+/// Snapshot the shell's LOGICAL environment — its exported variables — as
+/// `(name, value)` `OsString` pairs, the shape the coreutil builtins take for
+/// their `POSIXLY_CORRECT`-class knob reads. Only exported vars are included
+/// (a child process/`printenv` would see exactly these), so a builtin sees the
+/// same environment a forked coreutil would, NOT the engine process's own env.
+fn exported_env_snapshot<SE: brush_core::extensions::ShellExtensions>(
+    context: &brush_core::commands::ExecutionContext<'_, SE>,
+) -> Vec<(OsString, OsString)> {
+    context
+        .shell
+        .env()
+        .iter_exported()
+        .map(|(k, v)| {
+            (
+                k.clone().into(),
+                v.value().to_cow_str(context.shell).to_string().into(),
+            )
+        })
+        .collect()
+}
+
 /// `cat` — STREAM template: injected logical stdin/stdout, `splice(2)` fast path intact.
 /// See [`run_coreutil_localized`] for thread-per-call localization isolation.
 struct CatBuiltin;
@@ -639,6 +660,9 @@ impl brush_core::builtins::SimpleCommand for CpBuiltin {
         // Shell's LOGICAL cwd, captured before the worker closure:
         // cp's relative operands resolve against this, not the process cwd.
         let cwd = context.shell.working_dir().to_path_buf();
+        // Shell's LOGICAL exported env: cp reads POSIXLY_CORRECT from this,
+        // not the engine process's environment.
+        let envv = exported_env_snapshot(&context);
 
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
@@ -647,7 +671,7 @@ impl brush_core::builtins::SimpleCommand for CpBuiltin {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
-            let r = match uu_cp::cp(argv.into_iter(), &cwd, &mut out, &mut err) {
+            let r = match uu_cp::cp(argv.into_iter(), &cwd, &envv, &mut out, &mut err) {
                 Ok(()) => 0,
                 Err(e) => {
                     let msg = e.to_string();

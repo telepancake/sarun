@@ -1,1 +1,2 @@
 0010-uu_cp-in-process-cp-builtin-injected-logical-I-O-logical-cwd.patch
+0020-cp--entry-takes-logical-env--POSIXLY-CORRECT-from-the-shell.patch

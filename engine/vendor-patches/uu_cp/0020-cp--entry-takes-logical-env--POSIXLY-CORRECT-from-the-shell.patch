@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 17:47:11 +0000
+Subject: [PATCH] cp: entry takes logical env; POSIXLY_CORRECT from the shell
+
+---
+diff --git a/src/cp.rs b/src/cp.rs
+index 6e1208d..e06505c 100644
+--- a/src/cp.rs
++++ b/src/cp.rs
+@@ -66,6 +66,25 @@ thread_local! {
+     static CP_ERR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+     /// Deferred non-fatal exit code, set by the local `show!`/`show_error!`.
+     static CP_EXIT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
++
++    /// Whether POSIXLY_CORRECT is set in the call's LOGICAL environment — the
++    /// shell's exported vars, NOT the engine process's environment. Read deep in
++    /// [`copy_file`] (the dangling-symlink guard), where no env slice is in
++    /// scope, so it is captured from the `env` slice at each entry ([`cp`] and
++    /// the standalone [`uumain`]) and cleared after. `false` is the default
++    /// before an entry seeds it.
++    static CP_POSIX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// Look up `key` in the call's LOGICAL environment (the shell's exported vars),
++/// never the engine process's environment. `Some("")` for a set-but-empty value
++/// vs `None` when unset — the same distinction as `env::var_os`. The standalone
++/// binary passes a snapshot of the process environment, so behavior there is
++/// unchanged.
++fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a std::ffi::OsStr> {
++    env.iter()
++        .find(|(k, _)| k == key)
++        .map(|(_, v)| v.as_os_str())
+ }
+ 
+ /// Write `format!`-style output (with a trailing newline) into the logical
+@@ -907,6 +926,7 @@ pub fn uu_app() -> Command {
+ pub fn cp(
+     args: impl uucore::Args,
+     cwd: &Path,
++    env: &[(OsString, OsString)],
+     out: &mut dyn io::Write,
+     err: &mut dyn io::Write,
+ ) -> UResult<()> {
+@@ -914,6 +934,9 @@ pub fn cp(
+     CP_OUT.with(|b| b.borrow_mut().clear());
+     CP_ERR.with(|b| b.borrow_mut().clear());
+     CP_EXIT.with(|c| c.set(0));
++    // POSIXLY_CORRECT from the shell's LOGICAL env, captured for the deep
++    // dangling-symlink guard in `copy_file`; never the process environment.
++    CP_POSIX.with(|c| c.set(env_get(env, "POSIXLY_CORRECT").is_some()));
+ 
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+ 
+@@ -998,6 +1021,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+ 
+     let (sources, target) = parse_path_args(paths, &options)?;
+ 
++    // Standalone binary: POSIXLY_CORRECT resolves against the process env,
++    // captured for the deep dangling-symlink guard in `copy_file`.
++    CP_POSIX.with(|c| c.set(std::env::var_os("POSIXLY_CORRECT").is_some()));
++
+     if let Err(error) = copy(&sources, &target, &options) {
+         if let CpError::NotAllFilesCopied = error {
+             // Error::NotAllFilesCopied is non-fatal, but the error
+@@ -2623,7 +2650,7 @@ fn copy_file(
+                 OverwriteMode::Clobber(ClobberMode::RemoveDestination)
+             )
+             && !is_symlink_loop(dest)
+-            && std::env::var_os("POSIXLY_CORRECT").is_none()
++            && !CP_POSIX.with(std::cell::Cell::get)
+         {
+             return Err(CpError::Error(
+                 translate!("cp-error-not-writing-dangling-symlink", "dest" => dest.quote()),
