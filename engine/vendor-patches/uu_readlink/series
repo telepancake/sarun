@@ -1,1 +1,2 @@
 0010-uu_readlink-in-process-readlink-builtin-injected-logical-I-O.patch
+0020-readlink--entry-takes-logical-env--POSIXLY-CORRECT-from-the.patch
