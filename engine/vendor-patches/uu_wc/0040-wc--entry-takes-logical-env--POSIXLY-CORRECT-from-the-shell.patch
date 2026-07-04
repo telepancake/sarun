@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 17:47:11 +0000
+Subject: [PATCH] wc: entry takes logical env; POSIXLY_CORRECT from the shell
+
+---
+diff --git a/src/wc.rs b/src/wc.rs
+index 1ce6897..5d16139 100644
+--- a/src/wc.rs
++++ b/src/wc.rs
+@@ -140,6 +140,24 @@ thread_local! {
+     /// (the process is never `chdir`'d). Empty => the standalone binary, which
+     /// resolves operands against the process cwd. Set by [`wc`], cleared after.
+     static WC_CWD: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
++
++    /// Whether POSIXLY_CORRECT is set in the call's LOGICAL environment — the
++    /// shell's exported vars, NOT the engine process's environment. Read deep in
++    /// [`word_count_from_reader_specialized`] (where no env slice is in scope),
++    /// so it is captured from the `env` slice at [`wc`]'s entry and cleared after.
++    /// `false` => the standalone binary's default before it seeds the process env.
++    static WC_POSIX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// Look up `key` in the call's LOGICAL environment (the shell's exported vars),
++/// never the engine process's environment. `Some("")` for a set-but-empty value
++/// vs `None` when unset — the same distinction as `env::var_os`. The standalone
++/// binary passes a snapshot of the process environment, so behavior there is
++/// unchanged.
++fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsStr> {
++    env.iter()
++        .find(|(k, _)| k == key)
++        .map(|(_, v)| v.as_os_str())
+ }
+ 
+ /// Root a relative operand at the call's logical cwd ([`WC_CWD`]) for OPEN only.
+@@ -429,9 +447,15 @@ impl UError for WcError {
+ /// `--files0-from=F` value, and every relative path read from F) are rooted
+ /// there for OPEN via [`logical_join`], never by `chdir`; the counts table and
+ /// diagnostics still show each operand as the user wrote it.
++///
++/// `env` is the call's LOGICAL environment (the shell's exported vars): the
++/// POSIXLY_CORRECT knob that governs `-L` width accounting is read from it via
++/// [`env_get`], captured into [`WC_POSIX`] for the deep counting loop, NOT from
++/// the engine process's environment.
+ pub fn wc(
+     args: impl uucore::Args,
+     cwd: &Path,
++    env: &[(OsString, OsString)],
+     out: &mut dyn Write,
+     out_fd: Option<BorrowedFd<'_>>,
+     err: &mut dyn Write,
+@@ -440,6 +464,7 @@ pub fn wc(
+ ) -> UResult<()> {
+     let _ = out_fd; // see doc comment: wc has no output-fd fast path.
+     WC_CWD.with(|c| *c.borrow_mut() = cwd.to_path_buf());
++    WC_POSIX.with(|c| c.set(env_get(env, "POSIXLY_CORRECT").is_some()));
+     let r = (|| {
+         let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+ 
+@@ -454,6 +479,7 @@ pub fn wc(
+         wc_impl(&inputs, &settings, out, err, &mut handle)
+     })();
+     WC_CWD.with(|c| c.borrow_mut().clear());
++    WC_POSIX.with(|c| c.set(false));
+     r
+ }
+ 
+@@ -477,8 +503,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     // the whole duration of this call.
+     let out_fd = Some(unsafe { BorrowedFd::borrow_raw(1) });
+     let in_fd = Some(unsafe { BorrowedFd::borrow_raw(0) });
+-    // Standalone binary: empty cwd => operands resolve against the process cwd.
+-    wc(args, Path::new(""), &mut out, out_fd, &mut err, &mut input, in_fd)
++    // Standalone binary: empty cwd => operands resolve against the process cwd;
++    // POSIXLY_CORRECT resolves against the process environment.
++    let env: Vec<(OsString, OsString)> = env::vars_os().collect();
++    wc(args, Path::new(""), &env, &mut out, out_fd, &mut err, &mut input, in_fd)
+ }
+ 
+ pub fn uu_app() -> Command {
+@@ -745,7 +773,9 @@ fn word_count_from_reader_specialized<
+     let mut reader = BufReadDecoder::new(reader.buffered());
+     let mut in_word = false;
+     let mut current_len = 0;
+-    let posixly_correct = env::var_os("POSIXLY_CORRECT").is_some();
++    // POSIXLY_CORRECT from the shell's LOGICAL env (captured into WC_POSIX at
++    // the [`wc`] entry), never the engine process's environment.
++    let posixly_correct = WC_POSIX.with(std::cell::Cell::get);
+     while let Some(chunk) = reader.next_strict() {
+         match chunk {
+             Ok(text) => {
+@@ -1203,6 +1233,7 @@ mod tests {
+         let res = wc(
+             argv.into_iter(),
+             std::path::Path::new(""),
++            &[],
+             &mut out,
+             None,
+             &mut err,
