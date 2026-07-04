@@ -54,6 +54,17 @@ fn build_fixture(repo: &Path) -> Vec<String> {
         .map(|i| format!("line {i:04}: {}{}{}{}\n", rand_hex(), rand_hex(), rand_hex(), rand_hex()))
         .collect();
 
+    // A stable bulk: most of a real tree does NOT change per commit
+    // (imagine linux.git) — this is what makes delta records small.
+    for f in 0..48 {
+        let dir = repo.join(format!("stable/d{}", f % 4));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: String = (0..200)
+            .map(|i| format!("s{f:02}-{i:03}: {}{}\n", rand_hex(), rand_hex()))
+            .collect();
+        std::fs::write(dir.join(format!("f{f}.txt")), body).unwrap();
+    }
+
     for i in 0..12 {
         let mut doc = base.clone();
         // Small edit per revision: replace one line, append one.
@@ -106,22 +117,27 @@ fn roundtrip_sha_exact_and_chain_compresses() {
     let r = &outcome.report;
     assert_eq!(r.commits, 13);
 
-    // §8 anti-sabotage assertions: the chain must actually render the
-    // design. Near-identical successive trees ⇒ refPrefix frames cost
-    // ~the delta; standalone frames cost ~the full tree each.
+    // §8 anti-sabotage assertions: the rest form must actually render
+    // the design. Near-identical successive trees ⇒ delta records cost
+    // ~the edit; full records cost ~the whole tree each.
     assert!(
-        r.ref_prefix_chain * 4 < r.standalone,
-        "refPrefix chain ({}) not <4x smaller than standalone ({})",
-        r.ref_prefix_chain,
-        r.standalone
+        r.delta_raw * 4 < r.full_raw,
+        "delta records ({}) not <4x smaller than full records ({}) — diff isn't deltaing",
+        r.delta_raw,
+        r.full_raw
     );
-    assert!(r.standalone < r.raw, "zstd made things bigger?");
-    // The chain should be in the same league as the solid bound.
     assert!(
-        r.ref_prefix_chain < r.solid * 3,
-        "chain ({}) way off the solid bound ({})",
-        r.ref_prefix_chain,
-        r.solid
+        r.delta_ref_chain * 4 < r.full_standalone,
+        "stored chain ({}) not <4x smaller than full standalone ({})",
+        r.delta_ref_chain,
+        r.full_standalone
+    );
+    // The stored chain should be in the same league as the solid bound.
+    assert!(
+        r.delta_ref_chain < r.solid_full * 3,
+        "stored chain ({}) way off the solid bound ({})",
+        r.delta_ref_chain,
+        r.solid_full
     );
 
     // Export and verify: every ref regenerates to the SAME commit id.

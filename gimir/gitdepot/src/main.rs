@@ -30,8 +30,19 @@ fn main() -> ExitCode {
             gitdepot::import(&PathBuf::from(repo), &PathBuf::from(store), level).map(|o| {
                 let r = &o.report;
                 println!(
-                    "{} commits, zstd level {}\n  raw records      {:>12}\n  standalone zstd  {:>12}\n  refPrefix chain  {:>12}  (stored)\n  solid stream     {:>12}  (bound)",
-                    r.commits, r.zstd_level, r.raw, r.standalone, r.ref_prefix_chain, r.solid
+                    "{} commits, zstd level {}\n\
+                     \x20 full records:  raw {:>12}  standalone {:>12}  refPrefix chain {:>12}\n\
+                     \x20 delta records: raw {:>12}  standalone {:>12}  refPrefix chain {:>12}  (stored)\n\
+                     \x20 solid stream over full records: {:>12}  (bound)",
+                    r.commits,
+                    r.zstd_level,
+                    r.full_raw,
+                    r.full_standalone,
+                    r.full_ref_chain,
+                    r.delta_raw,
+                    r.delta_standalone,
+                    r.delta_ref_chain,
+                    r.solid_full,
                 );
             })
         }

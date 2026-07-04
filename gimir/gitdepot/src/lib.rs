@@ -1,14 +1,18 @@
 //! gitdepot — a git repository to/from depot straightedge.
 //!
 //! The second workload for the depot model (DEPOT-DESIGN.md §7 "git"):
-//! a repo's history becomes a chain of **full-content canonical layers,
-//! newest first** — each commit's tree is one layer (never a delta layer:
-//! cross-version redundancy is the *compression's* job, per the tiered-VBF
-//! design), refPrefix-chained in zstd exactly the way a VBF chain anchors
-//! each frame on the next-newer record. Refs and commit metadata (author,
-//! committer, message, parent edges) are **meta** — bookkeeping outside
-//! the layers, per the round-trip fence: they round-trip, but they are
-//! not tree data.
+//! a repo's history becomes a chain of canonical layers, **newest
+//! first**: record 0 is the newest commit's full tree layer; every older
+//! record is a **diff layer** — `diff(view[i-1], view[i])`, the delta
+//! that rebuilds the older view from the next-newer one (full-content
+//! records per commit make zero sense at scale — imagine linux.git).
+//! Frames are refPrefix-chained in zstd the way a VBF chain anchors each
+//! frame on the next-newer record; the import prints the comparison
+//! against the other encodings (full/delta × standalone/refPrefix, plus
+//! the solid bound). Refs and commit metadata (author, committer,
+//! message, parent edges) are **meta** — bookkeeping outside the layers,
+//! per the round-trip fence: they round-trip, but they are not tree
+//! data.
 //!
 //! Per the implicit-id rule, no git object id is stored in any layer:
 //! blob/tree hashes are dropped on import and recomputed by git on
@@ -31,7 +35,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use depot::codec;
-use depot::{Attrs, BlobOp, Layer, Node, Presence};
+use depot::{Attrs, BlobOp, Layer, Node};
 
 pub mod chain;
 
@@ -286,20 +290,33 @@ fn parse_commit(raw: &[u8]) -> Result<CommitMeta> {
     })
 }
 
-/// Size comparison across encodings of the same records (bytes).
+/// Size comparison across encodings of the same history (bytes).
+///
+/// Two record families over the same commits, newest-first:
+/// - **full**: every record is the commit's complete tree layer. Zero
+///   sense as a rest form (imagine linux.git) — measured purely as the
+///   baseline the delta encodings must beat.
+/// - **delta**: record 0 is the newest full layer; record i>0 is
+///   `diff(view[i-1], view[i])` — the layer that rebuilds the older view
+///   from the next-newer one, walking the chain backward VBF-style.
+///
+/// Each family measured standalone-zstd-per-record and as a refPrefix
+/// chain (frame i anchored on record i-1). The delta refPrefix chain is
+/// what the store keeps.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SizeReport {
-    /// Sum of raw canonical records.
-    pub raw: u64,
-    /// Each record zstd'd standalone.
-    pub standalone: u64,
-    /// The stored VBF-style refPrefix chain.
-    pub ref_prefix_chain: u64,
-    /// All records concatenated into one zstd stream (a solid bound —
-    /// not seekable, listed for comparison only).
-    pub solid: u64,
     pub commits: usize,
     pub zstd_level: i32,
+    pub full_raw: u64,
+    pub full_standalone: u64,
+    pub full_ref_chain: u64,
+    pub delta_raw: u64,
+    pub delta_standalone: u64,
+    /// The stored form.
+    pub delta_ref_chain: u64,
+    /// One zstd stream over the concatenated full records — the global
+    /// redundancy bound (not seekable, comparison only).
+    pub solid_full: u64,
 }
 
 pub struct ImportOutcome {
@@ -340,8 +357,15 @@ pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
         .map(str::to_string)
         .collect();
 
+    // Walk newest → oldest, keeping only the PREVIOUS (newer) resolved
+    // view in memory: record 0 is the newest full layer, record i>0 is
+    // diff(view[i-1], view[i]) — the delta that rebuilds the older view
+    // from the next-newer one. Full records are also encoded, measured
+    // for the comparison, and dropped.
     let mut commits = Vec::with_capacity(shas.len());
-    let mut records: Vec<Vec<u8>> = Vec::with_capacity(shas.len());
+    let mut delta_records: Vec<Vec<u8>> = Vec::with_capacity(shas.len());
+    let mut full_records: Vec<Vec<u8>> = Vec::with_capacity(shas.len());
+    let mut prev_view: Option<depot::View> = None;
     for sha in &shas {
         let raw = git(repo, &["cat-file", "commit", sha])?;
         let mut cm = parse_commit(&raw)?;
@@ -356,11 +380,21 @@ pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
                 .filter(|e| e.mode != "160000")
                 .map(|e| e.oid.clone()),
         )?;
-        records.push(codec::encode(&tree_layer(&entries, &blobs)?));
+        let full = tree_layer(&entries, &blobs)?;
+        let view = depot::apply(None, &full)
+            .ok_or_else(|| Error::Unsupported(format!("commit {sha} has an empty tree")))?;
+        full_records.push(codec::encode(&full));
+        match &prev_view {
+            None => delta_records.push(full_records[0].clone()),
+            Some(newer) => {
+                delta_records.push(codec::encode(&depot::diff(Some(newer), Some(&view))));
+            }
+        }
+        prev_view = Some(view);
     }
 
     let meta = Meta { refs, commits };
-    let report = chain::write_store(store, &meta, &records, level)?;
+    let report = chain::write_store(store, &meta, &delta_records, &full_records, level)?;
     Ok(ImportOutcome { meta, report })
 }
 
@@ -382,15 +416,14 @@ fn quote_path(p: &[u8]) -> String {
 }
 
 fn walk_files<'a>(
-    node: &'a Node,
+    view: &'a depot::View,
     prefix: &mut Vec<u8>,
     out: &mut Vec<(Vec<u8>, String, &'a [u8])>,
 ) -> Result<()> {
-    if let BlobOp::Set(content) = &node.blob {
-        let mode = node
+    if let Some(content) = &view.blob {
+        let mode = view
             .attrs
-            .as_ref()
-            .and_then(|a| a.get(&b"mode"[..]))
+            .get(&b"mode"[..])
             .ok_or_else(|| Error::Meta("file node without mode attr".into()))?;
         out.push((
             prefix.clone(),
@@ -398,10 +431,7 @@ fn walk_files<'a>(
             content,
         ));
     }
-    for (name, child) in &node.children {
-        if child.presence == Presence::Tombstone {
-            return Err(Error::Meta("tombstone in a full-content layer".into()));
-        }
+    for (name, child) in &view.children {
         let len = prefix.len();
         if !prefix.is_empty() {
             prefix.push(b'/');
@@ -422,23 +452,30 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
     std::fs::create_dir_all(repo)?;
     git(repo, &["init", "-q"])?;
 
+    // Rebuild every view by walking the chain newest→oldest: record 0 is
+    // the newest full layer; each older record is the diff layer that
+    // turns the next-newer view into this one.
+    let mut views: Vec<depot::View> = Vec::with_capacity(records.len());
+    for (i, rec) in records.iter().enumerate() {
+        let layer = codec::decode(rec)?;
+        let base = if i == 0 { None } else { Some(&views[i - 1]) };
+        let view = depot::apply(base, &layer)
+            .ok_or_else(|| Error::Meta(format!("chain frame {i} resolves to nothing")))?;
+        views.push(view);
+    }
+
     // Build the fast-import stream. Commits oldest-first; every commit is
-    // a full manifest (deleteall + M for each file) — matching the
-    // full-content layer model. Blobs are deduped through marks.
+    // a full manifest (deleteall + M for each file) from its resolved
+    // view. Blobs are deduped through marks.
     let mut stream: Vec<u8> = Vec::new();
     let mut blob_marks: std::collections::HashMap<&[u8], usize> = Default::default();
     let mut next_mark = 1usize;
     let mut commit_marks: std::collections::HashMap<&str, usize> = Default::default();
 
-    let layers: Vec<Layer> = records
-        .iter()
-        .map(|r| codec::decode(r).map_err(Error::from))
-        .collect::<Result<_>>()?;
-
     for idx in (0..meta.commits.len()).rev() {
         let cm = &meta.commits[idx];
         let mut files = Vec::new();
-        walk_files(&layers[idx].root, &mut Vec::new(), &mut files)?;
+        walk_files(&views[idx], &mut Vec::new(), &mut files)?;
 
         for (_, mode, content) in &files {
             if mode == "160000" {

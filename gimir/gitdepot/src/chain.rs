@@ -49,12 +49,43 @@ fn decompress(src: &[u8], prefix: Option<&[u8]>, raw_len: usize) -> Result<Vec<u
     Ok(out)
 }
 
-/// Write the store and produce the encoding comparison. `records` are
-/// canonical layer encodings, newest-first.
+/// Encode records (newest-first) as a refPrefix chain: frame 0
+/// standalone, frame i anchored on record i-1.
+fn chain_bytes(records: &[Vec<u8>], level: i32) -> Result<Vec<u8>> {
+    let mut chain = Vec::new();
+    for (i, rec) in records.iter().enumerate() {
+        let prefix = if i == 0 { None } else { Some(records[i - 1].as_slice()) };
+        let frame = compress(rec, prefix, level)?;
+        chain.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+        chain.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        chain.extend_from_slice(&frame);
+    }
+    Ok(chain)
+}
+
+fn standalone_total(records: &[Vec<u8>], level: i32) -> Result<u64> {
+    let mut total = 0u64;
+    for rec in records {
+        total += compress(rec, None, level)?.len() as u64;
+    }
+    Ok(total)
+}
+
+fn solid_total(records: &[Vec<u8>], level: i32) -> Result<u64> {
+    let mut concat = Vec::new();
+    for rec in records {
+        concat.extend_from_slice(rec);
+    }
+    Ok(compress(&concat, None, level)?.len() as u64)
+}
+
+/// Write the store (the DELTA refPrefix chain is the rest form) and
+/// produce the encoding comparison over both record families.
 pub fn write_store(
     store: &Path,
     meta: &Meta,
-    records: &[Vec<u8>],
+    delta_records: &[Vec<u8>],
+    full_records: &[Vec<u8>],
     level: i32,
 ) -> Result<SizeReport> {
     std::fs::create_dir_all(store)?;
@@ -64,38 +95,25 @@ pub fn write_store(
         return Err(Error::Chain(format!("store {} already populated", store.display())));
     }
 
-    let mut chain = Vec::new();
-    let mut standalone_total = 0u64;
-    for (i, rec) in records.iter().enumerate() {
-        let prefix = if i == 0 { None } else { Some(records[i - 1].as_slice()) };
-        let frame = compress(rec, prefix, level)?;
-        chain.extend_from_slice(&(rec.len() as u32).to_le_bytes());
-        chain.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-        chain.extend_from_slice(&frame);
-        standalone_total += compress(rec, None, level)?.len() as u64;
-    }
-
-    // Solid bound: one stream over the concatenation.
-    let mut concat = Vec::new();
-    for rec in records {
-        concat.extend_from_slice(rec);
-    }
-    let solid = compress(&concat, None, level)?.len() as u64;
+    let delta_chain = chain_bytes(delta_records, level)?;
 
     let mut f = std::fs::File::create(&chain_path)?;
-    f.write_all(&chain)?;
+    f.write_all(&delta_chain)?;
     f.sync_all()?;
     let mut f = std::fs::File::create(&meta_path)?;
     serde_json::to_writer_pretty(&mut f, meta).map_err(|e| Error::Meta(e.to_string()))?;
     f.sync_all()?;
 
     Ok(SizeReport {
-        raw: records.iter().map(|r| r.len() as u64).sum(),
-        standalone: standalone_total,
-        ref_prefix_chain: chain.len() as u64,
-        solid,
-        commits: records.len(),
+        commits: delta_records.len(),
         zstd_level: level,
+        full_raw: full_records.iter().map(|r| r.len() as u64).sum(),
+        full_standalone: standalone_total(full_records, level)?,
+        full_ref_chain: chain_bytes(full_records, level)?.len() as u64,
+        delta_raw: delta_records.iter().map(|r| r.len() as u64).sum(),
+        delta_standalone: standalone_total(delta_records, level)?,
+        delta_ref_chain: delta_chain.len() as u64,
+        solid_full: solid_total(full_records, level)?,
     })
 }
 
