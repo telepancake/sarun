@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 16:47:26 +0000
+Subject: [PATCH] sort: entry takes logical cwd; join relative paths (operands, -o, -T, --files0-from)
+
+---
+diff --git a/src/buffer_hint.rs b/src/buffer_hint.rs
+index d5baf9e..ad95cd3 100644
+--- a/src/buffer_hint.rs
++++ b/src/buffer_hint.rs
+@@ -29,7 +29,10 @@ fn file_size_hint(files: &[OsString]) -> Option<usize> {
+             continue;
+         }
+ 
+-        let Ok(metadata) = std::fs::metadata(file) else {
++        // Stat at the cwd-resolved path so the size heuristic sees the real
++        // file (the process is never chdir'd to the shell's logical cwd).
++        let Ok(metadata) = std::fs::metadata(crate::resolve_logical(std::path::Path::new(file)))
++        else {
+             continue;
+         };
+ 
+diff --git a/src/merge.rs b/src/merge.rs
+index df03a3d..bf2b600 100644
+--- a/src/merge.rs
++++ b/src/merge.rs
+@@ -42,9 +42,14 @@ fn replace_output_file_in_input_files(
+     tmp_dir: &mut TmpDirWrapper,
+ ) -> UResult<()> {
+     let mut copy: Option<PathBuf> = None;
+-    if let Some(Ok(output_path)) = output.map(|path| Path::new(path).canonicalize()) {
++    // Resolve both sides against the shell's logical cwd before canonicalizing,
++    // so the "output file is also an input" overlap is detected in the box's cwd
++    // (the process is never chdir'd there). `-` (stdin) never resolves.
++    if let Some(Ok(output_path)) =
++        output.map(|path| crate::resolve_logical(Path::new(path)).canonicalize())
++    {
+         for file in files {
+-            if let Ok(file_path) = Path::new(file).canonicalize() {
++            if let Ok(file_path) = crate::resolve_logical(Path::new(file)).canonicalize() {
+                 if file_path == output_path {
+                     if let Some(copy) = &copy {
+                         *file = copy.clone().into_os_string();
+diff --git a/src/sort.rs b/src/sort.rs
+index de6e63c..c88705d 100644
+--- a/src/sort.rs
++++ b/src/sort.rs
+@@ -94,6 +94,24 @@ thread_local! {
+     /// Buffer that the no-`-o` `Output` writer appends to; flushed to the
+     /// injected `out` at the end of [`sort`].
+     static SORT_STDOUT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
++    /// The shell's LOGICAL working directory, set by [`sort`]. Every RELATIVE
++    /// path accessed on the filesystem (input operands, `-o`, `-T`,
++    /// `--files0-from` and each path read from it) is joined against this before
++    /// the `open`/`create`. The process is never `chdir`'d. Displayed operand
++    /// names in diagnostics keep the ORIGINAL (un-joined) spelling.
++    static SORT_CWD: RefCell<PathBuf> = const { RefCell::new(PathBuf::new()) };
++}
++
++/// Resolve a path for actual filesystem access against the shell's logical cwd.
++/// A relative path is rooted at `SORT_CWD` (which brush never `chdir`s to); an
++/// absolute path is returned unchanged. Only the fs access uses this — error
++/// messages and displayed names keep the operand as the user gave it.
++fn resolve_logical(path: &Path) -> PathBuf {
++    if path.is_relative() {
++        SORT_CWD.with(|cwd| cwd.borrow().join(path))
++    } else {
++        path.to_owned()
++    }
+ }
+ 
+ /// A `Write` sink that appends to the thread-local `SORT_STDOUT` buffer. Used as
+@@ -131,10 +149,15 @@ impl Write for LogicalStdout {
+ /// stderr, are routed to the injected `err` here.
+ pub fn sort(
+     args: impl uucore::Args,
++    cwd: &Path,
+     out: &mut dyn Write,
+     err: &mut dyn Write,
+     stdin: &mut dyn Read,
+ ) -> UResult<()> {
++    // Root every relative path (operands, -o, -T, --files0-from) at the shell's
++    // logical cwd; the process is never chdir'd to it.
++    SORT_CWD.with(|c| *c.borrow_mut() = cwd.to_owned());
++
+     // Drain the injected stdin once; share it with every `open("-")`.
+     let mut buf = Vec::new();
+     stdin
+@@ -149,6 +172,7 @@ pub fn sort(
+     let produced =
+         SORT_STDOUT.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+     SORT_STDIN.with(|cell| *cell.borrow_mut() = None);
++    SORT_CWD.with(|cell| cell.borrow_mut().clear());
+     if let Err(e) = out.write_all(&produced) {
+         return Err(USimpleError::new(2, format!("sort: write error: {e}")));
+     }
+@@ -346,7 +370,9 @@ impl Output {
+             let file = OpenOptions::new()
+                 .write(true)
+                 .create(true)
+-                .open(path)
++                // Create/open at the cwd-resolved path; the displayed name and
++                // any error keep the operand exactly as the user gave it.
++                .open(resolve_logical(path))
+                 .map_err(|e| SortError::OpenFailed {
+                     path: path.to_owned(),
+                     error: e,
+@@ -2130,7 +2156,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     let mut err = stderr.lock();
+     let stdin = std::io::stdin();
+     let mut input = stdin.lock();
+-    sort(args, &mut out, &mut err, &mut input)
++    // Standalone binary: the process's real cwd is the intended base for
++    // relative operands, exactly as upstream.
++    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
++    sort(args, &cwd, &mut out, &mut err, &mut input)
+ }
+ 
+ #[allow(clippy::cognitive_complexity)]
+@@ -2300,7 +2329,10 @@ fn sort_inner(args: impl uucore::Args, err: &mut dyn Write) -> UResult<()> {
+                 env::temp_dir()
+             }
+         },
+-        PathBuf::from,
++        // An explicit -T/--temporary-directory is resolved against the shell's
++        // logical cwd (a relative DIR would otherwise land under the engine's
++        // process cwd). The env::temp_dir() default above is already absolute.
++        |dir| resolve_logical(Path::new(dir)),
+     ));
+ 
+     settings.compress_prog = matches
+@@ -3295,7 +3327,8 @@ fn open(path: impl AsRef<OsStr>) -> UResult<Box<dyn Read + Send>> {
+     }
+ 
+     let path = Path::new(path);
+-    match File::open(path) {
++    // Open at the cwd-resolved path; the error keeps the operand as given.
++    match File::open(resolve_logical(path)) {
+         Ok(f) => Ok(Box::new(f) as Box<dyn Read + Send>),
+         Err(error) => Err(SortError::ReadFailed {
+             path: path.to_owned(),
+@@ -3314,7 +3347,8 @@ fn open_with_open_failed_error(path: impl AsRef<OsStr>) -> UResult<Box<dyn Read
+     }
+ 
+     let path = Path::new(path);
+-    match File::open(path) {
++    // Open at the cwd-resolved path; the error keeps the operand as given.
++    match File::open(resolve_logical(path)) {
+         Ok(f) => Ok(Box::new(f) as Box<dyn Read + Send>),
+         Err(error) => Err(SortError::OpenFailed {
+             path: path.to_owned(),
