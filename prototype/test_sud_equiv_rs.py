@@ -68,6 +68,9 @@ CRATE = _HERE.parent / "engine"
 BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
 TV = _HERE.parent / "tv"
 SUD64 = TV / "sud64"
+SUD32 = TV / "sud32"
+SUD_ADDINS = ("sud/trace sud/path_remap sud/cmd-rewrite "
+              "sud/fake-exec sud/inramfs")
 # The box's /tmp is inramfs; keep engine state (the overlay upper) off /tmp.
 TMPBASE = "/var/tmp"
 
@@ -132,13 +135,21 @@ def ensure_binaries():
             return False
     if not SUD64.exists():
         try:
-            subprocess.run(
-                ["make", "sud64",
-                 "SUD_ADDINS=sud/trace sud/path_remap sud/cmd-rewrite "
-                 "sud/fake-exec sud/inramfs"],
-                cwd=TV, check=True, timeout=600)
+            subprocess.run(["make", "sud64", f"SUD_ADDINS={SUD_ADDINS}"],
+                           cwd=TV, check=True, timeout=600)
         except Exception:
             return False
+    # sud32 is best-effort: it needs the -m32 toolchain (gcc-multilib).
+    # Without it the 32-bit leg of the suite skips — but if the toolchain IS
+    # there, the runner's dir-sibling convention (tv/sud32 next to tv/sud64)
+    # must hold, else a 32-bit box's wrapper exec fails and captures nothing.
+    if not SUD32.exists():
+        try:
+            subprocess.run(["make", "sud32", f"SUD_ADDINS={SUD_ADDINS}"],
+                           cwd=TV, check=True, timeout=600,
+                           stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
     return BIN.exists() and SUD64.exists()
 
 
@@ -388,6 +399,12 @@ def main():
 
     # ── PART A2: 32-bit output capture (both backends). ──
     tool32 = build_sudtool(bits=32)
+    if tool32 is not None and not SUD32.exists():
+        # A 32-bit box needs the sud32 wrapper (dir sibling of sud64);
+        # running without it would exec-fail and capture nothing.
+        print("  (sud32 wrapper did not build — skipping 32-bit output capture)")
+        shutil.rmtree(Path(tool32).parent, ignore_errors=True)
+        tool32 = None
     if tool32 is None:
         print("  (no 32-bit toolchain — skipping 32-bit output capture)")
     else:
