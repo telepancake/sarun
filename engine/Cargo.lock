@@ -5406,6 +5406,7 @@ dependencies = [
  "uu_uniq",
  "uu_wc",
  "uu_whoami",
+ "uucore 0.8.0",
  "zip",
 ]
 

@@ -22,6 +22,12 @@ brush-builtins = "0.2"
 # brush-builtins uses so the derived `Parser` impl satisfies brush-core's bound.
 clap = { version = "4.6.0", features = ["derive"] }
 brush-coreutils-builtins = { version = "0.1", features = ["coreutils.all"] }
+# Direct dep on the shared uutils runtime so the engine can install the shell's
+# LOGICAL environment for each builtin worker thread
+# (`uucore::logical_env::set_logical_env`) before localization + the util body
+# run. Redirected to the vendored fork (vendor/uucore) by `[patch.crates-io]`
+# below — the same single copy every uu_* builtin + brush-coreutils-builtins use.
+uucore = "0.8"
 # Direct dep on uutils' `uu_cat` so the engine can call its injected logical
 # entry point (`uu_cat::cat`) for the native in-process `cat` builtin. The
 # `[patch.crates-io]` below redirects this to our vendored fork (vendor/uu_cat),
