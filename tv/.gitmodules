@@ -1,0 +1,9 @@
+[submodule "deps/zstd"]
+	path = deps/zstd
+	url = https://github.com/facebook/zstd
+[submodule "deps/printf"]
+	path = libc-fs/deps/printf
+	url = https://github.com/mpaland/printf
+[submodule "deps/duckdb"]
+	path = deps/duckdb
+	url = https://github.com/duckdb/duckdb
