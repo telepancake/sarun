@@ -272,19 +272,25 @@ this design, whatever its tests say.
    crate with an in-memory reference variant: encode/decode round-trip,
    diff/squash, the rotation equivalences, the §6 corner fixtures. This is
    the data model made concrete; everything else consumes it.
-2. **Stream variant** (nearly free once 1 exists) → transfer works; the
+2. **git straightedge** (`gitdepot`): a real git repo to/from a chain of
+   full-content layers newest-first, refs+commit metadata as meta,
+   refPrefix-chained frames, SHA-exact export via fast-import — a second
+   workload to develop the model against, and the encoding-comparison
+   bench (standalone vs refPrefix chain vs solid bound).
+3. **Stream variant** (nearly free once 1 exists) → transfer works; the
    sabotage-resistant size assertions get their harness.
-3. **sqlar adapter** over `capture.rs` + blob pool; `overlay.rs`/`sud.rs`/
+4. **sqlar adapter** over `capture.rs` + blob pool; `overlay.rs`/`sud.rs`/
    `review.rs` stop touching `Connection`/`blob_path()` directly. Proves
    the trait against the only workload with a live consumer.
-4. **Un-sabotage `wikimak/wikipedia`** (independent; one file) — verified
+5. **Un-sabotage `wikimak/wikipedia`** (independent; one file) — verified
    by measured on-disk size on a real multi-revision page, not the
    byte-payload unit tests.
-5. **VBF variant**: canonical layers into `wikimak/depot` chains; wikipedia
+6. **VBF variant**: canonical layers into `wikimak/depot` chains; wikipedia
    and web-archive workloads land here.
-6. **hot variant** (loose layout with internal sharing), then **rotation in
+7. **hot variant** (loose layout with internal sharing), then **rotation in
    anger** (container layer reordering; overlay newest-first maintenance).
-7. **git import/export** through the stream form.
+8. **full git import/export** through the stream form (the straightedge tool
+   generalized: signed commits, annotated tags, incremental update).
 
 ## 10. Open questions (size before committing; do not guess)
 

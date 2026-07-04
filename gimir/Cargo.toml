@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "depot",
+    "gitdepot",
     "strpool",
     "wikimak/depot",
     "wikimak/mediawiki",

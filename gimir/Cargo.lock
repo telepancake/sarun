@@ -712,6 +712,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitdepot"
+version = "0.0.0"
+dependencies = [
+ "depot",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
 name = "gloo-timers"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
