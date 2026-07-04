@@ -287,6 +287,13 @@ enum Pane {
     /// network pcap/MITM views would not see it. Backed by the box's
     /// `api_log` sqlar table (`api_log` / `api_log_detail` control verbs).
     ApiLogs,
+    /// Network/Web pane (DESIGN-web.md W4): the box's web-capture archive —
+    /// one row per HTTP(S) request/response the tap MITM proxy teed (a
+    /// browser box, a --webcap crawl, any captured HTTP client), newest
+    /// first, with drill-in to headers + body. This is the content record the
+    /// Flows/Packets panes are the packet record of. Backed by the box's
+    /// `webcap` sqlar table (`webcap` / `webcap_detail` control verbs).
+    Network,
     /// Drill-down INTO a flow's TCP stream: left pane = every packet in
     /// that connection (frame · time · src→dst · proto · len · info),
     /// right pane = the same tshark -V dissection but per-packet. Pushed
@@ -726,6 +733,13 @@ struct App {
     /// load_api_logs_if_needed; refreshed on `api_log_added` notifications.
     api_log_rows: Vec<Value>,
     api_log_loaded_sid: Option<String>,
+    /// Network/Web pane (DESIGN-web.md W4). One row per webcap capture for the
+    /// focused box (id, ts, method, url, host, status, mime, truncated,
+    /// req_len, resp_len), newest-first. Populated lazily by
+    /// load_webcap_if_needed; refreshed on `webcap_added` notifications.
+    sel_webcap: usize,
+    webcap_rows: Vec<Value>,
+    webcap_loaded_sid: Option<String>,
     /// Endpoint summary / getting-started lines for the Api pane's empty
     /// state (endpoint_note_lines). Computed when the pane loads — not per
     /// frame — because it reads oaita.toml from disk.
@@ -959,6 +973,9 @@ impl App {
             sel_api_log: 0,
             api_log_rows: vec![],
             api_log_loaded_sid: None,
+            sel_webcap: 0,
+            webcap_rows: vec![],
+            webcap_loaded_sid: None,
             api_endpoint_note: vec![],
             sel_rule: 0,
             hunk_scroll: 0,
@@ -2718,6 +2735,35 @@ impl App {
         self.load_api_logs();
     }
 
+    /// Network/Web pane loader (DESIGN-web.md W4): pull the focused box's
+    /// webcap rows (newest first). Mirrors load_api_logs; no api-endpoint
+    /// bookkeeping. Clamps the selection so a shrunken list (box changed)
+    /// never leaves the cursor past the end.
+    fn load_webcap(&mut self) {
+        let Some(sid) = self.cur_sid() else { return };
+        match rpc(&self.sock, "webcap", json!([sid])) {
+            Ok(v) => {
+                self.webcap_rows = v.as_array().cloned().unwrap_or_default();
+                self.webcap_loaded_sid = Some(sid);
+                if self.sel_webcap >= self.webcap_rows.len() {
+                    self.sel_webcap = self.webcap_rows.len().saturating_sub(1);
+                }
+            }
+            Err(e) if e.contains("unknown verb") => {
+                self.status = "engine doesn't speak webcap — old engine?".into();
+            }
+            Err(e) => { self.status = format!("webcap: {e}"); }
+        }
+    }
+
+    fn load_webcap_if_needed(&mut self) {
+        let cur = self.cur_sid();
+        if cur.is_some() && self.webcap_loaded_sid == cur && !self.webcap_rows.is_empty() {
+            return;
+        }
+        self.load_webcap();
+    }
+
     /// Lazy counterpart of load_outputs — same idea as
     /// load_processes_if_needed: only re-open when the box changed.
     fn load_outputs_if_needed(&mut self) {
@@ -2951,6 +2997,12 @@ impl App {
                     self.right_scroll = 0;
                 }
             }
+            Pane::Network => {
+                if self.sel_webcap + 1 < self.webcap_rows.len() {
+                    self.sel_webcap += 1;
+                    self.right_scroll = 0;
+                }
+            }
             Pane::Vars => {
                 if self.sel_var + 1 < self.vars_rows.len() {
                     self.sel_var += 1;
@@ -3017,6 +3069,10 @@ impl App {
             Pane::Pty => {}
             Pane::ApiLogs => {
                 self.sel_api_log = self.sel_api_log.saturating_sub(1);
+                self.right_scroll = 0;
+            }
+            Pane::Network => {
+                self.sel_webcap = self.sel_webcap.saturating_sub(1);
                 self.right_scroll = 0;
             }
             Pane::Vars => {
@@ -3126,6 +3182,13 @@ impl App {
                 self.sel_api_log = (cur + delta).clamp(0, total as isize - 1) as usize;
                 self.right_scroll = 0;
             }
+            Pane::Network => {
+                let total = self.webcap_rows.len();
+                if total == 0 { return; }
+                let cur = self.sel_webcap as isize;
+                self.sel_webcap = (cur + delta).clamp(0, total as isize - 1) as usize;
+                self.right_scroll = 0;
+            }
             Pane::Vars => {
                 let total = self.vars_rows.len();
                 if total == 0 { return; }
@@ -3187,6 +3250,7 @@ impl App {
             Pane::Flows => self.sel_flow,
             Pane::Packets => self.sel_packet,
             Pane::ApiLogs => self.sel_api_log,
+            Pane::Network => self.sel_webcap,
             Pane::Vars => self.sel_var,
             Pane::Help | Pane::Pty => 0,
         }
@@ -3235,6 +3299,7 @@ impl App {
             Pane::Pipelines => self.load_pipelines_if_needed(),
             Pane::BuildEdges => self.load_edges_if_needed(),
             Pane::ApiLogs => self.load_api_logs_if_needed(),
+            Pane::Network => self.load_webcap_if_needed(),
             Pane::Flows => self.load_flows(),
             _ => {}
         }
@@ -3277,6 +3342,10 @@ impl App {
                     self.sel_api_log =
                         snap.cursor.min(self.api_log_rows.len().saturating_sub(1));
                 }
+                Pane::Network => {
+                    self.sel_webcap =
+                        snap.cursor.min(self.webcap_rows.len().saturating_sub(1));
+                }
                 Pane::Vars => {
                     self.vars_query = snap.vars_query.clone();
                     self.vars_any = snap.vars_any;
@@ -3314,6 +3383,7 @@ impl App {
             Pane::Processes => { self.nav(Pane::Processes); self.load_processes_if_needed(); }
             Pane::Outputs   => { self.nav(Pane::Outputs);   self.load_outputs_if_needed(); }
             Pane::ApiLogs   => { self.nav(Pane::ApiLogs);   self.load_api_logs_if_needed(); }
+            Pane::Network   => { self.nav(Pane::Network);   self.load_webcap_if_needed(); }
             Pane::Flows     => { self.focus = Pane::Flows;      self.load_flows(); }
             Pane::Pipelines => { self.nav(Pane::Pipelines);  self.load_pipelines_if_needed(); }
             Pane::BuildEdges=> { self.nav(Pane::BuildEdges); self.load_edges_if_needed(); }
@@ -3399,7 +3469,7 @@ impl App {
             }
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
             | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
-            | Pane::Help | Pane::Pty | Pane::ApiLogs => {}
+            | Pane::Help | Pane::Pty | Pane::ApiLogs | Pane::Network => {}
         }
     }
 
@@ -3915,6 +3985,17 @@ impl App {
                     self.refresh_build_edges_preserving_cursor();
                 }
             }
+            // Live refresh of the Network pane as captures land (DESIGN-web.md
+            // W4): a browser or crawl adds rows while you watch. webcap_added
+            // carries `sid`. Rows are newest-first; load_webcap clamps the
+            // selection so a grown list never strands the cursor.
+            Some("webcap_added") => {
+                let sid = ev.get("sid").and_then(Value::as_str);
+                if sid.is_some() && sid == self.cur_sid().as_deref()
+                    && self.focus == Pane::Network {
+                    self.load_webcap();
+                }
+            }
             // Consolidation events from the Python prototype's engine (the
             // Rust engine has no consolidation phase, so these are only
             // ever seen by a Rust UI attached to a Python engine).
@@ -4163,6 +4244,10 @@ impl App {
             Pane::ApiLogs => {
                 if self.api_log_rows.is_empty() { return; }
                 self.sel_api_log = if end { self.api_log_rows.len() - 1 } else { 0 };
+            }
+            Pane::Network => {
+                if self.webcap_rows.is_empty() { return; }
+                self.sel_webcap = if end { self.webcap_rows.len() - 1 } else { 0 };
             }
             Pane::Vars => {
                 if self.vars_rows.is_empty() { return; }
@@ -5433,6 +5518,97 @@ fn api_log_detail_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+/// Network/Web pane list (DESIGN-web.md W4): one styled line per webcap row —
+/// time · method · status · mime · size · url. Selected row reverses; 4xx/5xx
+/// red, 3xx yellow, 2xx default; a `‡` marks a body truncated at the capture
+/// cap. Rows arrive newest-first from the `webcap` verb.
+fn webcap_index_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled(
+        format!("{:<8} {:<6} {:<4} {:<16} {:>7} {}",
+                "Time", "Method", "Stat", "Type", "Bytes", "URL"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if app.webcap_rows.is_empty() {
+        out.push(Line::from("(no web captures — launch this box with --webcap \
+                             on --net tap, or use the browser, then browse)"));
+        return out;
+    }
+    for (i, r) in app.webcap_rows.iter().enumerate() {
+        let ts = r.get("ts").and_then(Value::as_f64).unwrap_or(0.0) as i64;
+        let method = r.get("method").and_then(Value::as_str).unwrap_or("?");
+        let url = r.get("url").and_then(Value::as_str).unwrap_or("");
+        let mime = r.get("mime").and_then(Value::as_str).unwrap_or("");
+        let status = r.get("status").and_then(Value::as_i64).unwrap_or(0);
+        let resp_len = r.get("resp_len").and_then(Value::as_i64).unwrap_or(0);
+        let truncated = r.get("truncated").and_then(Value::as_i64).unwrap_or(0) != 0;
+        let time_label = {
+            let secs = ts.rem_euclid(86400);
+            let h = secs / 3600; let m = (secs % 3600) / 60; let s = secs % 60;
+            format!("{h:02}:{m:02}:{s:02}")
+        };
+        let mime_short: String = mime.chars().take(16).collect();
+        let mark = if truncated { "‡" } else { "" };
+        let text = format!("{time_label:<8} {method:<6} {status:<4} \
+                            {mime_short:<16} {resp_len:>7} {mark}{url}");
+        let line = if i == app.sel_webcap {
+            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else {
+            let color = if status >= 400 { Color::Red }
+                        else if status >= 200 && status < 300 { Color::Reset }
+                        else { Color::Yellow };
+            Line::from(Span::styled(text, Style::default().fg(color)))
+        };
+        out.push(line);
+    }
+    out
+}
+
+/// Network/Web pane detail: full request + response headers and (text) bodies
+/// for the focused capture, fetched on demand via `webcap_detail` (the
+/// response body arrives identity-decoded). Falls back to the index row's
+/// metadata when the detail RPC is unreachable.
+fn webcap_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(row) = app.webcap_rows.get(app.sel_webcap) else {
+        return vec![Line::from("(no capture selected)")];
+    };
+    let id = row.get("id").and_then(Value::as_i64).unwrap_or(-1);
+    let Some(sid) = app.cur_sid() else {
+        return vec![Line::from("(no box focused)")];
+    };
+    let detail = rpc(&app.sock, "webcap_detail", json!([sid, id])).ok();
+    let method = row.get("method").and_then(Value::as_str).unwrap_or("?");
+    let url = row.get("url").and_then(Value::as_str).unwrap_or("");
+    let status = row.get("status").and_then(Value::as_i64).unwrap_or(0);
+    let mime = row.get("mime").and_then(Value::as_str).unwrap_or("");
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::from(format!("{method} {url}")));
+    out.push(Line::from(format!("status={status} · type={mime}")));
+    out.push(Line::from(""));
+    if let Some(d) = detail {
+        let section = |out: &mut Vec<Line<'static>>, title: &str, color: Color,
+                       body: &str| {
+            if body.is_empty() { return; }
+            out.push(Line::from(Span::styled(title.to_string(),
+                Style::default().add_modifier(Modifier::BOLD).fg(color))));
+            for l in body.lines() { out.push(Line::from(l.to_string())); }
+            out.push(Line::from(""));
+        };
+        section(&mut out, "REQUEST HEADERS", Color::Yellow,
+                d.get("req_headers").and_then(Value::as_str).unwrap_or(""));
+        section(&mut out, "REQUEST BODY", Color::Yellow,
+                d.get("req_body").and_then(Value::as_str).unwrap_or(""));
+        section(&mut out, "RESPONSE HEADERS", Color::Green,
+                d.get("resp_headers").and_then(Value::as_str).unwrap_or(""));
+        let truncated = d.get("truncated").and_then(Value::as_i64).unwrap_or(0) != 0;
+        let resp_body = d.get("resp_body").and_then(Value::as_str).unwrap_or("");
+        section(&mut out, if truncated { "RESPONSE BODY (truncated at cap)" }
+                          else { "RESPONSE BODY" }, Color::Green, resp_body);
+    } else {
+        out.push(Line::from("(could not load detail — engine offline?)"));
+    }
+    out
+}
+
 fn outputs_index_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         format!("{:<8} {:<6} {:<20} {:>10}", "Time", "Stream", "Process", "Bytes"),
@@ -6176,6 +6352,7 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
         Pane::Help      => Some(('?', "help",    FilterView::Changes /* unused */)),
         Pane::Pty       => Some(('P', "PTY",     FilterView::Changes /* unused */)),
         Pane::ApiLogs   => Some(('i', "api",     FilterView::Changes /* unused */)),
+        Pane::Network   => Some(('w', "web",     FilterView::Changes /* unused */)),
         Pane::Vars      => Some(('v', "vars",    FilterView::Changes /* unused */)),
     }
 }
@@ -6199,6 +6376,7 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
     ('e', Pane::Rules,      "Rules",   PaneVis::Always,            "file rules — the ordered apply/discard/passthrough rules"),
     ('P', Pane::Pty,        "PTYs",    PaneVis::Pty,               "open an engine-held PTY — a live interactive shell pane"),
     ('i', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
+    ('w', Pane::Network,    "Web",     PaneVis::Always,            "web captures — tap MITM HTTP(S) content archive (headers + body)"),
     ('v', Pane::Vars,       "Vars",    PaneVis::Data("makevar"),   "variable provenance — make + shell assignments ('/' queries)"),
     ('?', Pane::Help,       "Help",    PaneVis::Always,            "this help"),
 ];
@@ -6866,6 +7044,21 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let rs = clamp_rscroll(&dl);
                 let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("CALL · request + response", rf), rf))
+                    .scroll((rs, 0))
+                    .wrap(Wrap { trim: false });
+                if !skip_right { f.render_widget(detail, right); }
+            }
+            Pane::Network => {
+                let lines = webcap_index_lines(app);
+                let scroll = scroll_for_cursor(app.sel_webcap + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
+                    .block(block(title("WEB · capture archive", lf), lf))
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
+                let dl = webcap_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
+                    .block(block(title("CAPTURE · headers + body", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
@@ -11223,6 +11416,9 @@ mod tests {
             sel_api_log: 0,
             api_log_rows: vec![],
             api_log_loaded_sid: None,
+            sel_webcap: 0,
+            webcap_rows: vec![],
+            webcap_loaded_sid: None,
             api_endpoint_note: vec![],
             sel_rule: 0,
             hunk_scroll: 0,
@@ -11559,6 +11755,38 @@ mod tests {
         }
         assert!(app.load_job.is_none(), "job must complete");
         assert!(app.status.contains("oci load"), "failure surfaced: {}", app.status);
+    }
+
+    /// The Network/Web pane (DESIGN-web.md W4) renders the box's webcap rows:
+    /// a header, one line per capture (method · status · type · size · url),
+    /// and the empty-state hint when there are none. The index lines render
+    /// from in-memory `webcap_rows` (no engine needed); the detail lines fetch
+    /// over RPC and aren't exercised here.
+    #[test]
+    fn network_pane_renders_captures() {
+        let mut app = headless_app();
+        app.focus = Pane::Network;
+        // Empty state names the on-ramp.
+        let buf = render_to_string(&app, 110, 30).unwrap();
+        assert!(buf.contains("WEB") && buf.contains("no web captures"),
+                "empty Network pane must show the --webcap on-ramp:\n{buf}");
+        // With rows: header + a capture line with method/status/url.
+        app.webcap_rows = vec![
+            json!({"id": 2, "ts": 0.0, "method": "GET", "url": "https://example.com/app.js",
+                   "host": "example.com", "status": 200, "mime": "application/javascript",
+                   "truncated": 0, "req_len": 0, "resp_len": 4096}),
+            json!({"id": 1, "ts": 0.0, "method": "GET", "url": "https://ad.doubleclick.net/x",
+                   "host": "ad.doubleclick.net", "status": 204, "mime": "",
+                   "truncated": 0, "req_len": 0, "resp_len": 0}),
+        ];
+        let buf = render_to_string(&app, 110, 30).unwrap();
+        assert!(buf.contains("Method") && buf.contains("Type") && buf.contains("Bytes"),
+                "header row rendered:\n{buf}");
+        assert!(buf.contains("GET") && buf.contains("200")
+                && buf.contains("application/java"),
+                "the 200 capture row rendered (method/status/type):\n{buf}");
+        assert!(buf.contains("204"),
+                "the blocked (204) capture is shown too:\n{buf}");
     }
 
     /// The Api pane must surface the local on-ramp: an unconfigured endpoint
