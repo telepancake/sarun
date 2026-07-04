@@ -176,10 +176,19 @@ struct sud_ir_inode {
             uint32_t target_len;
         } lnk;
     } u;
-};
+} __attribute__((aligned(8)));
 
 /* Sanity: keep struct stable.  Compilers must NOT add padding that
- * changes layout across builds — all fields are aligned. */
+ * changes layout across builds — all fields are aligned.
+ *
+ * The aligned(8) above is LOAD-BEARING for mixed 32/64-bit stores: the
+ * struct ends with a 12-byte union after an 8-aligned body, so without
+ * it i386 (where uint64_t aligns to 4) sizes the inode at 76 bytes
+ * while x86_64 sizes it at 80 — divergent inode-table strides, and a
+ * 32-bit process reads garbage inodes from a 64-bit-initialised region
+ * (and vice versa).  The asserts pin the shared-region ABI for both. */
+_Static_assert(sizeof(struct sud_ir_inode) == 80,
+               "sud_ir_inode must be 80 bytes on every arch");
 
 /* ---- Directory entry block ------------------------------------ */
 
@@ -268,6 +277,10 @@ struct sud_ir_super {
     uint32_t small_alloc_hint;
     uint64_t small_shm_size       __attribute__((aligned(8)));
 };
+
+/* Same mixed-arch ABI pin as sud_ir_inode's (see above). */
+_Static_assert(sizeof(struct sud_ir_super) == 88,
+               "sud_ir_super must be 88 bytes on every arch");
 
 /* ---- super.c: region access and locking ----------------------- */
 

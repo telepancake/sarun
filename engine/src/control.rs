@@ -576,9 +576,23 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                             let writers = stream.as_ref()
                                 .map(|s| s.writers.lock().unwrap().clone())
                                 .unwrap_or_default();
-                            let (n, errs) = crate::sud::ingest_upper(
+                            let (n, mut errs) = crate::sud::ingest_upper(
                                 &b, &upper, runpid as u32, &writers);
-                            json!({"ok": true, "ingested": n,
+                            // /tmp lives in the inramfs shared-memory
+                            // store, not in the upper dir — parse the
+                            // region and drop its backing shms.
+                            let mut total = n;
+                            if let Some(key) = b.get_meta("sud_ir_key")
+                                .filter(|k| !k.is_empty()) {
+                                let fallback = if runpid > 0 {
+                                    b.writer_for(runpid as u32)
+                                } else { 0 };
+                                let (in_, mut ie) = crate::sud::ingest_inramfs(
+                                    &b, &key, fallback, &writers);
+                                total += in_;
+                                errs.append(&mut ie);
+                            }
+                            json!({"ok": true, "ingested": total,
                                    "errors": errs})
                         }
                         None => json!({"ok": false,
@@ -1151,6 +1165,12 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
         let mut layers = vec![up.to_string_lossy().into_owned()];
         layers.extend(sud_lowers.iter().cloned());
         crate::sud::set_layers(id, layers);
+        // /tmp is an inramfs mount (shared-memory store keyed per run;
+        // the engine parses the region at sweep and drops the shms).
+        // pid+id keying keeps concurrent engines and reruns collision-
+        // free; the previous run's shms were unlinked at its sweep.
+        let ir_key = format!("sarun{}b{id}", std::process::id());
+        b.set_meta("sud_ir_key", &ir_key);
     }
     // Host visibility: a box whose chain is closed — its own --no-parent, or any
     // ancestor marked no_host_fallback (e.g. an OCI image's rootfs base) — sees
@@ -1252,6 +1272,11 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     if want_sud {
         reply["sud_upper"] = json!(backing.join("sud-up").to_string_lossy());
         reply["sud_lowers"] = json!(sud_lowers);
+        reply["sud_ir_key"] = json!(
+            lock(state).overlay.clone()
+                .and_then(|o| o.live_box(id))
+                .and_then(|bx| bx.get_meta("sud_ir_key"))
+                .unwrap_or_default());
     }
     reply
 }

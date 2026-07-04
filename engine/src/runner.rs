@@ -893,7 +893,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // overlay. /tmp passthrough is a step-1 stopgap — see DESIGN-sud.md.
     let state_dir = crate::paths::state_home();
     let mut sc = Command::new(wrapper);
-    for p in ["/proc", "/dev", "/sys", "/tmp"] {
+    for p in ["/proc", "/dev", "/sys"] {
         sc.args(["--remap-rule", &format!("passthrough:{p}")]);
     }
     sc.arg("--remap-rule")
@@ -904,6 +904,18 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // box's upper (sud × FUSE composition, DESIGN-sud.md).
     sc.arg("--remap-rule")
         .arg(format!("passthrough:{}", crate::paths::mnt_point().display()));
+    // /tmp: an inramfs mount — served from the shared-memory store the
+    // engine keyed for this box; captured at sweep. Replaces the old
+    // /tmp passthrough stopgap (whose writes were never captured). Listed
+    // AFTER every narrower carve-out above: if the engine's state/mnt
+    // dirs live under /tmp (test rigs do this), first-prefix-match must
+    // still route them to the host, not into the store.
+    let ir_key = ack.get("sud_ir_key").and_then(Value::as_str)
+        .unwrap_or("").to_string();
+    if !ir_key.is_empty() {
+        sc.args(["--remap-rule", "inramfs:/tmp"]);
+        sc.args(["--inramfs-key", &ir_key]);
+    }
     // rules.h caps an overlay rule at 9 layers (upper + 8): chain depth
     // beyond that would be SILENTLY dropped by the wrapper parser — fail
     // loud instead.

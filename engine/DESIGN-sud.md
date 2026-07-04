@@ -65,10 +65,30 @@ not drop in.
    runner row), STDOUT/STDERR events land in the box's outputs table, and
    the raw bytes tee to `live/<id>/sud.trace` at rest. `sud_ingest` waits
    for pipe EOF (the runner closes fd 1023 before requesting the sweep)
-   so the attribution map is complete. Still pending from the old step 2:
-   the **inramfs upper** (writes currently land in the plain directory
-   upper), and live file rows (writes appear at sweep time, not as they
-   happen).
+   so the attribution map is complete.
+2.5. **(done — inramfs /tmp)** `/tmp` is a per-box inramfs mount rather
+   than a passthrough stopgap: the engine mints a per-run key
+   (`sarun<pid>b<id>`), the wrapper serves `/tmp` from the shared-memory
+   store (`--remap-rule inramfs:/tmp --inramfs-key …`), and at sweep the
+   engine parses the store's `/dev/shm/sud-inramfs.<key>.{meta,smalldata,
+   f.*}` region FROM OUTSIDE (`engine/src/sudir.rs`, offset-addressed —
+   no fixed-address mapping needed) into the sqlar under `tmp/…`, then
+   unlinks the shms. Mixed 32/64 is the hard case and works: a 64-bit
+   process maps the region; a 32-bit process can't fit the 8 GiB data
+   space in its address space, so it pread/pwrites the smalldata shm and
+   promotes large files to per-file shms — all captured. Two upstream
+   fixes were required for cross-class store sharing:
+     - `internal.h`: `struct sud_ir_inode` is 76 B on i386 vs 80 B on
+       x86_64 (a trailing 12-B union after an 8-aligned body), so a
+       64-init region gave a 32-bit attacher a wrong inode stride. Pinned
+       both structs with `aligned(8)` + `_Static_assert` on size.
+     - `super.c` / `libc.h`: a 32-bit `open()` of the 8 GiB smalldata shm
+       needs `O_LARGEFILE` (else EOVERFLOW → attach aborts → `/tmp`
+       silently reverts to host), and the creating truncate needs the
+       i386 split-arg `ftruncate64`.
+   Still pending: live file rows (writes appear at sweep, not as they
+   happen); OPEN attribution under /tmp currently often lands on the
+   runner row.
 3. Only then: the store. Alternate `BoxState` backend on depot/strpool
    mechanics, sqlar kept as an export for the Python tooling.
 

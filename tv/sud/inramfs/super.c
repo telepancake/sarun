@@ -949,25 +949,41 @@ static size_t min_meta_size(void)
 /* Open or create a /dev/shm backing file at `path` and ftruncate it
  * to `size`.  Returns an open fd or a negative -errno; sets
  * *created to 1 if we won the create race. */
+/* ftruncate `fd` to a full 64-bit `size`.  On i386 a plain SYS_ftruncate
+ * takes a 32-bit length, so an 8 GiB small-file shm would silently
+ * truncate to (size & 0xffffffff) — 0 for exactly 8 GiB — leaving a
+ * short file that later SIGBUSes a 64-bit mapper past EOF.  Use
+ * __NR_ftruncate64(fd, len_lo, len_hi) there instead. */
+static long ftruncate_full(int fd, uint64_t size)
+{
+#if defined(__i386__)
+    return raw_syscall6(SYS_ftruncate64, fd,
+                        (long)(uint32_t)size,
+                        (long)(uint32_t)(size >> 32), 0, 0, 0);
+#else
+    return raw_syscall6(SYS_ftruncate, fd, (long)size, 0, 0, 0, 0);
+#endif
+}
+
 static int open_or_create_shm_at(const char *path, uint64_t size, int *created)
 {
     *created = 0;
+    /* O_LARGEFILE is mandatory on i386 to open (or create) the multi-GiB
+     * small-file shm; a no-op on x86_64.  Without it a sud32 process
+     * cannot attach a store a sud64 process created — open() returns
+     * -EOVERFLOW and /tmp silently stops being an inramfs mount. */
     int fd = (int)raw_syscall6(SYS_openat, AT_FDCWD, (long)path,
-                               O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
-                               0600, 0, 0);
+                               O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC
+                               | O_LARGEFILE, 0600, 0, 0);
     if (fd >= 0) {
         *created = 1;
-#ifdef SYS_ftruncate
-        long r = raw_syscall6(SYS_ftruncate, fd, (long)size, 0, 0, 0, 0);
-#else
-        long r = raw_syscall6(SYS_ftruncate64, fd, (long)size, 0, 0, 0, 0);
-#endif
+        long r = ftruncate_full(fd, size);
         if (r < 0) { raw_close(fd); return (int)r; }
         return fd;
     }
     /* Lost the EXCL race; just open. */
     return (int)raw_syscall6(SYS_openat, AT_FDCWD, (long)path,
-                             O_RDWR | O_CLOEXEC, 0, 0, 0);
+                             O_RDWR | O_CLOEXEC | O_LARGEFILE, 0, 0, 0);
 }
 
 /* mmap MAP_SHARED at exactly `want`.  Tries MAP_FIXED_NOREPLACE first

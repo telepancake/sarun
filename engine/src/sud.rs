@@ -111,7 +111,9 @@ fn open_writes(flags: i64) -> bool {
 /// Paths the runner carves out of the overlay (rule order in run_sud) —
 /// writes there never reach the upper, so don't attribute them.
 fn is_passthrough(abs: &str) -> bool {
-    for p in ["/proc/", "/dev/", "/sys/", "/tmp/"] {
+    // /tmp is NOT here: it's the box's inramfs mount, captured at sweep,
+    // so OPEN events under it feed attribution like any overlay path.
+    for p in ["/proc/", "/dev/", "/sys/"] {
         if abs.starts_with(p) { return true; }
     }
     abs.starts_with(&*crate::paths::state_home().to_string_lossy())
@@ -174,6 +176,65 @@ pub fn set_layers(box_id: i64, layers: Vec<String>) {
 
 pub fn layers(box_id: i64) -> Option<Vec<String>> {
     layer_map().lock().unwrap().get(&box_id).cloned()
+}
+
+// ── inramfs ingest ──────────────────────────────────────────────────────────
+
+/// Mirror the box's inramfs /tmp store into the sqlar under `tmp/…`,
+/// then drop the backing shm objects. Same row semantics as the upper
+/// sweep; attribution comes from the same rel→writer map (OPEN events
+/// under /tmp carry the visible path).
+pub fn ingest_inramfs(b: &BoxState, key: &str, fallback: i64,
+                      writers: &HashMap<String, i64>)
+                      -> (usize, Vec<String>) {
+    let shm_dir = std::path::Path::new("/dev/shm");
+    let mut n = 0usize;
+    let mut errs = vec![];
+    let entries = match crate::sudir::read_store(shm_dir, key) {
+        Ok(e) => e,
+        Err(e) => { return (0, vec![format!("inramfs: {e}")]); }
+    };
+    if !entries.is_empty() {
+        b.set_dir("tmp", 0o041777, fallback);
+        n += 1;
+    }
+    for ent in &entries {
+        let rel = format!("tmp/{}", ent.rel);
+        let writer = writers.get(&rel).copied().unwrap_or(fallback);
+        match &ent.kind {
+            crate::sudir::IrKind::Dir { mode } => {
+                b.set_dir(&rel, mode | 0o040000, writer);
+                n += 1;
+            }
+            crate::sudir::IrKind::Symlink { target } => {
+                b.set_symlink(&rel, target, writer);
+                n += 1;
+            }
+            crate::sudir::IrKind::File { mode, data } => {
+                let rowid = b.ensure_file_row(&rel, 0o100000 | mode, writer);
+                let bp = blob_path(b.id, rowid);
+                if let Some(parent) = bp.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::write(&bp, data) {
+                    Ok(()) => {
+                        b.finalize_file(&rel, data.len() as i64,
+                                        now_wall_ns(), writer);
+                        n += 1;
+                    }
+                    Err(e) => errs.push(format!("{rel}: blob: {e}")),
+                }
+            }
+        }
+    }
+    crate::sudir::unlink_store(shm_dir, key);
+    (n, errs)
+}
+
+fn now_wall_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64).unwrap_or(0)
 }
 
 // ── nesting: same-in-same (sud under sud) ───────────────────────────────────

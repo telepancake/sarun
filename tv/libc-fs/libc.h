@@ -660,6 +660,16 @@ extern int g_errno_value;
 #define O_NOFOLLOW      0400000
 #define O_CLOEXEC       02000000
 #define O_TMPFILE       020200000
+/* O_LARGEFILE: on 32-bit the kernel refuses open()/openat() of a file
+ * whose size exceeds 2 GiB unless this flag is set (EOVERFLOW). It is a
+ * no-op on x86_64 (the kernel treats every open as large). Required so a
+ * sud32 process can attach the multi-GiB inramfs small-file shm that a
+ * sud64 process created. */
+#if defined(__i386__)
+#define O_LARGEFILE     0100000
+#else
+#define O_LARGEFILE     0
+#endif
 
 #define AT_FDCWD            (-100)
 #define AT_SYMLINK_NOFOLLOW  0x100
