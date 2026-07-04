@@ -420,7 +420,7 @@ static const char *fd_map_lookup(int fd)
 static long read_cwd(char *out, size_t out_sz)
 {
     long n = raw_syscall6(SYS_readlinkat, AT_FDCWD,
-                          (long)"/proc/self/cwd",
+                          (long)"/proc/thread-self/cwd",
                           (long)out, out_sz - 1, 0, 0);
     if (n < 0) return n;
     out[n] = '\0';

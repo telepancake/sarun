@@ -346,7 +346,7 @@ int resolve_path(const char *cmd, char *out, int out_sz)
          * against the host directory and ENOENTs. */
         char abs[PATH_MAX];
         long n = raw_syscall6(SYS_readlinkat, AT_FDCWD,
-                              (long)"/proc/self/cwd",
+                              (long)"/proc/thread-self/cwd",
                               (long)abs, sizeof(abs) - 1, 0, 0);
         if (n > 0) {
             size_t cl = (size_t)n;

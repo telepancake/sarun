@@ -73,11 +73,16 @@ const char *sud_pr_cwd_get(void)
     return g_logical_cwd[0] ? g_logical_cwd : 0;
 }
 
+/* thread-self (not self): the SIGSYS handler runs on the CALLING
+ * thread, and a traced program may give threads their own cwd via
+ * unshare(CLONE_FS)+chdir (the engine's in-process coreutils builtins
+ * do).  /proc/self/cwd is the thread-group leader's and would resolve
+ * such a thread's relative paths against the wrong directory. */
 long sud_pr_read_kernel_cwd(char *out, size_t out_sz)
 {
     if (out_sz == 0) return -EINVAL;
     long n = raw_syscall6(SYS_readlinkat, AT_FDCWD,
-                          (long)"/proc/self/cwd",
+                          (long)"/proc/thread-self/cwd",
                           (long)out, (long)out_sz - 1, 0, 0);
     if (n < 0) return n;
     out[n] = '\0';

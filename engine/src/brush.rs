@@ -104,11 +104,27 @@ fn child_exit_code(status: std::process::ExitStatus) -> i32 {
 /// (1 on spawn/join failure).
 fn run_coreutil_localized(
     util: &'static str,
+    cwd: std::path::PathBuf,
     body: impl FnOnce() -> i32 + Send + 'static,
 ) -> i32 {
     match std::thread::Builder::new()
         .name(format!("sarun-{util}"))
         .spawn(move || {
+            // Give THIS THREAD its own kernel cwd (unshare(CLONE_FS)), set to
+            // the shell's LOGICAL cwd. The stream-template utils (cat, head,
+            // sort, ...) pass argv verbatim to uumain, so a relative FILE
+            // operand resolves against the thread's kernel cwd — which is the
+            // engine process's launch dir, not the box's `cd`, unless we pin
+            // it here. The fs-op forks cwd-join their operands already; the
+            // thread cwd makes their internal relative accesses right too.
+            unsafe {
+                if libc::unshare(libc::CLONE_FS) == 0 {
+                    if let Ok(c) = std::ffi::CString::new(
+                        std::os::unix::ffi::OsStrExt::as_bytes(cwd.as_os_str())) {
+                        let _ = libc::chdir(c.as_ptr());
+                    }
+                }
+            }
             brush_coreutils_builtins::init_localization(util);
             body()
         }) {
@@ -143,7 +159,7 @@ impl brush_core::builtins::SimpleCommand for CatBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_cat", move || {
+        let code = run_coreutil_localized("uu_cat", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             use std::os::fd::{AsRawFd, BorrowedFd};
             let mut out = out;
@@ -191,7 +207,7 @@ impl brush_core::builtins::SimpleCommand for HeadBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_head", move || {
+        let code = run_coreutil_localized("uu_head", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             use std::os::fd::{AsRawFd, BorrowedFd};
             let mut out = out;
@@ -239,7 +255,7 @@ impl brush_core::builtins::SimpleCommand for TailBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_tail", move || {
+        let code = run_coreutil_localized("uu_tail", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             use std::os::fd::{AsRawFd, BorrowedFd};
             let mut out = out;
@@ -291,7 +307,7 @@ impl brush_core::builtins::SimpleCommand for WcBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_wc", move || {
+        let code = run_coreutil_localized("uu_wc", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             use std::os::fd::{AsRawFd, BorrowedFd};
             let mut out = out;
@@ -339,7 +355,7 @@ impl brush_core::builtins::SimpleCommand for NlBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_nl", move || {
+        let code = run_coreutil_localized("uu_nl", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -385,7 +401,7 @@ impl brush_core::builtins::SimpleCommand for TacBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_tac", move || {
+        let code = run_coreutil_localized("uu_tac", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -431,7 +447,7 @@ impl brush_core::builtins::SimpleCommand for TrBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_tr", move || {
+        let code = run_coreutil_localized("uu_tr", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -477,7 +493,7 @@ impl brush_core::builtins::SimpleCommand for CutBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_cut", move || {
+        let code = run_coreutil_localized("uu_cut", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -523,7 +539,7 @@ impl brush_core::builtins::SimpleCommand for UniqBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_uniq", move || {
+        let code = run_coreutil_localized("uu_uniq", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -569,7 +585,7 @@ impl brush_core::builtins::SimpleCommand for SortBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_sort", move || {
+        let code = run_coreutil_localized("uu_sort", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -619,7 +635,7 @@ impl brush_core::builtins::SimpleCommand for CpBuiltin {
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-        let code = run_coreutil_localized("uu_cp", move || {
+        let code = run_coreutil_localized("uu_cp", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -666,7 +682,7 @@ macro_rules! fs_builtin {
                 let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-                let code = run_coreutil_localized($thread, move || {
+                let code = run_coreutil_localized($thread, cwd.clone(), move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
@@ -717,7 +733,7 @@ impl brush_core::builtins::SimpleCommand for TouchBuiltin {
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-        let code = run_coreutil_localized("uu_touch", move || {
+        let code = run_coreutil_localized("uu_touch", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             use std::os::fd::AsRawFd;
             let out = out;
@@ -769,7 +785,7 @@ macro_rules! fs_builtin_stdin {
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
                 let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-                let code = run_coreutil_localized($thread, move || {
+                let code = run_coreutil_localized($thread, cwd.clone(), move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
@@ -832,7 +848,7 @@ impl brush_core::builtins::SimpleCommand for TeeBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_tee", move || {
+        let code = run_coreutil_localized("uu_tee", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -877,7 +893,7 @@ impl brush_core::builtins::SimpleCommand for BasenameBuiltin {
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-        let code = run_coreutil_localized("uu_basename", move || {
+        let code = run_coreutil_localized("uu_basename", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -921,7 +937,7 @@ impl brush_core::builtins::SimpleCommand for DirnameBuiltin {
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-        let code = run_coreutil_localized("uu_dirname", move || {
+        let code = run_coreutil_localized("uu_dirname", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -965,7 +981,7 @@ impl brush_core::builtins::SimpleCommand for SeqBuiltin {
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-        let code = run_coreutil_localized("uu_seq", move || {
+        let code = run_coreutil_localized("uu_seq", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -1009,7 +1025,7 @@ impl brush_core::builtins::SimpleCommand for ExprBuiltin {
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-        let code = run_coreutil_localized("uu_expr", move || {
+        let code = run_coreutil_localized("uu_expr", context.shell.working_dir().to_path_buf(), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
@@ -1054,8 +1070,9 @@ macro_rules! info_builtin {
 
                 let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let cwd = context.shell.working_dir().to_path_buf();
 
-                let code = run_coreutil_localized($thread, move || {
+                let code = run_coreutil_localized($thread, cwd, move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
