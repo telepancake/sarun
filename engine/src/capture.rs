@@ -225,6 +225,14 @@ pub struct BoxState {
     // pipeline's process, so stamping that file's last_writer process row with the
     // pipeline id needs no timing/clock comparison at all.
     brush_links: Mutex<Vec<(i64, Vec<String>)>>,
+    // RO attachments (DEPOT-DESIGN.md §8): ordered box ids whose layers
+    // this box references READ-ONLY, conceptually between this box and
+    // its parent in the lookup chain. Any mutation of a key an
+    // attachment matches is EROFS — which is what guarantees the
+    // captured layer is independent of the attachments (copy-up is the
+    // only path lower content takes into the upper, and it is exactly
+    // the rejected operation). Persisted in meta for rerun.
+    ro_attachments: Mutex<Vec<i64>>,
     // The brushprov row id of the currently-executing pipeline (0 = none).
     // Set by record_brush_prov, cleared by brush_prov_done. Used by
     // add_output to stamp each output row with its pipeline.
@@ -459,6 +467,7 @@ impl BoxState {
             cur_brush_pipeline: std::sync::atomic::AtomicI64::new(0),
             is_api: std::sync::atomic::AtomicBool::new(false),
             is_tap: std::sync::atomic::AtomicBool::new(false),
+            ro_attachments: Mutex::new(vec![]),
         })
     }
 
@@ -490,6 +499,14 @@ impl BoxState {
         {
             if let Ok(p) = s.parse::<i64>() {
                 if p > 0 { self.set_parent(Some(p)); }
+            }
+        }
+        if let Ok(s) = conn.query_row(
+            "SELECT value FROM meta WHERE key='ro_attachments'", [],
+            |r| r.get::<_, String>(0))
+        {
+            if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&s) {
+                *self.ro_attachments.lock().unwrap() = ids;
             }
         }
         let mut kinds = self.kinds.write().unwrap();
@@ -795,6 +812,18 @@ impl BoxState {
     }
 
 
+
+    pub fn ro_attachments(&self) -> Vec<i64> {
+        self.ro_attachments.lock().unwrap().clone()
+    }
+
+    /// Replace the RO attachment list (ordered, topmost first) and
+    /// persist it in meta so a rerun reopens with the same view.
+    pub fn set_ro_attachments(&self, ids: Vec<i64>) {
+        let json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into());
+        self.set_meta("ro_attachments", &json);
+        *self.ro_attachments.lock().unwrap() = ids;
+    }
 
     pub fn set_cur_brush_pipeline(&self, id: i64) {
         self.cur_brush_pipeline.store(id, std::sync::atomic::Ordering::Relaxed);

@@ -687,6 +687,7 @@ impl Overlay {
     pub fn add_box(&self, b: Arc<BoxState>) {
         b.set_event_sink(self.inner.events.clone());
         let parent = b.parent();
+        let bid_of_added = b.id;
         self.inner.boxes.write().unwrap().insert(b.id, b);
         // Hydrate any at-rest parent chain into the overlay's live box map so
         // resolve()/scan_dir() can WALK INTO the ancestors during the child's
@@ -696,36 +697,43 @@ impl Overlay {
         // fall through to host (or Absent under no_host_fallback), missing
         // every layer below. Idempotent — already-loaded ancestors are kept.
         self.hydrate_chain(parent);
+        for ro in self.box_of(bid_of_added).map(|b| b.ro_attachments())
+            .unwrap_or_default()
+        {
+            self.hydrate_chain(Some(ro));
+        }
     }
 
     /// Open + load-mirror each at-rest box up the parent chain rooted at
     /// `start`, adding to `self.boxes` (under the same lock discipline as
     /// add_box). Stops on missing sqlar, on a cycle, or after 64 hops.
     fn hydrate_chain(&self, start: Option<i64>) {
-        let mut cur = start;
+        let mut work: Vec<i64> = start.into_iter().collect();
         let mut seen = std::collections::HashSet::new();
-        for _ in 0..64 {
-            let Some(id) = cur else { return };
-            if !seen.insert(id) { return; }
-            if self.inner.boxes.read().unwrap().contains_key(&id) {
-                // already live — but its parent chain may still need work.
-                cur = self.inner.boxes.read().unwrap().get(&id)
-                    .and_then(|b| b.parent());
+        let mut hops = 0;
+        while let Some(id) = work.pop() {
+            hops += 1;
+            if hops > 64 || !seen.insert(id) { continue; }
+            if let Some(b) = self.inner.boxes.read().unwrap().get(&id) {
+                // already live — but its parents/attachments may need work.
+                work.extend(b.parent());
+                work.extend(b.ro_attachments());
                 continue;
             }
             // Open the at-rest sqlar; `BoxState::create` is a CREATE-IF-NOT-
             // EXISTS open + schema upsert (additive), so on an existing
             // sqlar it just rebinds. load_mirror() then populates `kinds`
-            // and restores the parent-stack mode flags from meta.
+            // and restores the parent-stack mode flags + RO attachments
+            // from meta (an attachment is itself a chain root to hydrate).
             match BoxState::create(id) {
                 Ok(pb) => {
                     pb.load_mirror();
-                    let next = pb.parent();
+                    work.extend(pb.parent());
+                    work.extend(pb.ro_attachments());
                     self.inner.boxes.write().unwrap()
                         .insert(pb.id, Arc::new(pb));
-                    cur = next;
                 }
-                Err(_) => return,
+                Err(_) => continue,
             }
         }
     }
@@ -946,6 +954,49 @@ impl Overlay {
         }
     }
 
+    /// The full lookup chain for `bid`: each box followed by its RO
+    /// attachments (DEPOT-DESIGN.md §8 — read-only layers conceptually
+    /// between a box and its parent), then the parent, recursively.
+    /// Capped like the old parent walk.
+    fn chain_of(&self, bid: i64) -> Vec<i64> {
+        let mut out = Vec::new();
+        let mut cur = Some(bid);
+        while let Some(id) = cur {
+            if out.len() >= 64 { break; }
+            out.push(id);
+            let Some(b) = self.box_of(id) else { break };
+            for ro in b.ro_attachments() {
+                if out.len() >= 64 { break; }
+                out.push(ro);
+            }
+            cur = b.parent();
+        }
+        out
+    }
+
+    /// Does any RO attachment in `bid`'s chain match `rel`? Matched keys
+    /// are immutable for the running box (EROFS at the mutating call,
+    /// checked BEFORE any capture side effect) — the invariant that
+    /// keeps the captured layer independent of what was attached.
+    pub(crate) fn ro_denied(&self, bid: i64, rel: &str) -> bool {
+        let mut cur = Some(bid);
+        let mut seen = 0;
+        while let Some(id) = cur {
+            seen += 1;
+            if seen > 64 { break; }
+            let Some(b) = self.box_of(id) else { break };
+            for ro in b.ro_attachments() {
+                if let Some(rb) = self.box_of(ro) {
+                    if rb.entry(rel).is_some() {
+                        return true;
+                    }
+                }
+            }
+            cur = b.parent();
+        }
+        false
+    }
+
     /// The MERGED resolution for `rel` as seen by box `bid`: the box's own entry
     /// if any, else its parent box's overlay (recursively), the root box
     /// bottoming out at the host. A whiteout at any level hides everything
@@ -977,18 +1028,15 @@ impl Overlay {
                 }
             }
         }
-        let mut cur = Some(bid);
-        let mut seen = 0;
         // D-parent: any box in the lookup chain having `no_host_fallback` set
         // closes the bottom of the stack — when the parent walk runs out, the
         // path is Absent rather than served from the real host /. Set on the
         // bottom of an OCI image stack so `ls /etc` inside the box sees only
-        // the image's /etc, never the host's.
+        // the image's /etc, never the host's. The chain is each box, its RO
+        // attachments, then its parent (chain_of).
         let mut no_host = false;
-        while let Some(id) = cur {
-            seen += 1;
-            if seen > 64 { break; }
-            let Some(b) = self.box_of(id) else { break };
+        for id in self.chain_of(bid) {
+            let Some(b) = self.box_of(id) else { continue };
             if b.no_host_fallback() { no_host = true; }
             match b.entry(rel) {
                 Some(Entry::Whiteout) => return Layer::Absent,
@@ -1010,7 +1058,7 @@ impl Overlay {
                     if has_opaque_ancestor(&b, rel) {
                         return Layer::Absent;
                     }
-                    cur = b.parent();  // not in this box → try its parent
+                    // not in this box → next link in the chain
                 }
             }
         }
@@ -1045,15 +1093,10 @@ impl Overlay {
     /// only ever offered for a path that is empty in EVERY box of the chain, so
     /// it can never hide a real directory's contents.
     fn chain_dir_has_children(&self, bid: i64, rel: &str) -> bool {
-        let mut cur = Some(bid);
-        let mut seen = 0;
-        while let Some(id) = cur {
-            seen += 1;
-            if seen > 64 { break; }
-            let Some(b) = self.box_of(id) else { break };
+        for id in self.chain_of(bid) {
+            let Some(b) = self.box_of(id) else { continue };
             let (_white, present) = b.children_of(rel);
             if !present.is_empty() { return true; }
-            cur = b.parent();
         }
         false
     }
@@ -1248,15 +1291,8 @@ impl Overlay {
     fn scan_dir(&self, b: &BoxState, rel: &str, plus: bool)
                 -> Vec<(String, FileType, u64, Option<FileAttr>)> {
         let mut names: BTreeMap<String, ()> = BTreeMap::new();
-        // chain of box ids, root-first.
-        let mut chain = vec![b.id];
-        let mut cur = b.parent();
-        let mut guard = 0;
-        while let Some(p) = cur {
-            guard += 1; if guard > 64 { break; }
-            chain.push(p);
-            cur = self.box_of(p).and_then(|bx| bx.parent());
-        }
+        // chain of box ids, root-first (incl. RO attachments).
+        let mut chain = self.chain_of(b.id);
         chain.reverse();
         // D-parent: skip host seeding when any box in the chain disables it
         // (matches resolve()'s no_host_fallback semantics — the box stack is
@@ -1412,6 +1448,13 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        // RO attachment (§8): reject write-intent opens up front — fail
+        // fast like a kernel ro-mount, before any capture side effect.
+        if flags.0 & (libc::O_WRONLY | libc::O_RDWR) != 0
+            && self.ro_denied(bid, &rel)
+        {
+            return reply.error(Errno::EROFS);
+        }
         if rel == JOBSERVER {
             // A handle on the slip pool. read() acquires, write() releases. Record
             // whether this handle is O_NONBLOCK so read() knows to defer (block)
@@ -1566,6 +1609,9 @@ impl Filesystem for Overlay {
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
+        if self.ro_denied(bid, &rel) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         if b.direct() || self.is_passthrough(&rel, bid, req.pid()) {
             // passthrough (file rule, or -d whole-box direct): create the file on
             // the REAL host, uncaptured.
@@ -1795,6 +1841,9 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if self.ro_denied(bid, &rel) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         // HOST-DIRECT (passthrough file rule, or -d direct): metadata ops hit the
         // REAL host file, never copy-up/capture — mirroring the host-direct
         // read/write path. This is the fix for the O_TRUNC bug: the kernel
@@ -1948,6 +1997,9 @@ impl Filesystem for Overlay {
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
+        if self.ro_denied(bid, &rel) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         // Existence must use the MERGED view (resolve), the same one lookup
         // serves — layer() consults only this box's upper + the raw host, so
         // a path hidden by a parent-box whiteout / opaque dir / OCI
@@ -1977,6 +2029,9 @@ impl Filesystem for Overlay {
         };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
+        if self.ro_denied(bid, &rel) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         b.set_symlink(&rel, target, b.writer_for(req.pid()));
         let ino = self.ino_for(&(bid, rel.clone()));
         self.push_event(bid, rel, "symlink");
@@ -1995,6 +2050,9 @@ impl Filesystem for Overlay {
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
+        if self.ro_denied(bid, &rel) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         match mode & libc::S_IFMT {
             libc::S_IFREG => {
                 // mknod of a regular file = create an empty file.
@@ -2031,6 +2089,9 @@ impl Filesystem for Overlay {
         let Some(name) = newname.to_str() else { return reply.error(Errno::EINVAL) };
         let nrel = if nprel.is_empty() { name.to_string() }
                    else { format!("{nprel}/{name}") };
+        if self.ro_denied(sbid, &nrel) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         // materialise source bytes into the new name's blob.
         if self.copy_up(&b, &srel, req.pid()).is_err() {
             return reply.error(Errno::EIO);
@@ -2083,6 +2144,9 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if self.ro_denied(bid, &rel) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         if let Some(k) = name.to_str() { b.set_xattr(&rel, k, value); }
         reply.ok();
     }
@@ -2126,6 +2190,9 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
+        if self.ro_denied(bid, &rel) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         match name.to_str() {
             Some(k) if b.remove_xattr(&rel, k) => reply.ok(),
             _ => reply.error(Errno::ENODATA),
@@ -2141,6 +2208,9 @@ impl Filesystem for Overlay {
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
+        if self.ro_denied(bid, &rel) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         let writer = b.writer_for(req.pid());
         let lower_exists = self.host(&rel).symlink_metadata().is_ok();
         match b.entry(&rel) {
@@ -2168,6 +2238,9 @@ impl Filesystem for Overlay {
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
         let rel = if prel.is_empty() { name.to_string() }
                   else { format!("{prel}/{name}") };
+        if self.ro_denied(bid, &rel) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         if !self.scan_dir(&b, &rel, false).is_empty() {
             return reply.error(Errno::ENOTEMPTY);
         }
@@ -2246,6 +2319,9 @@ impl Filesystem for Overlay {
                                       else { format!("{p}/{n}") };
         let rel_o = join(&po, no);
         let rel_n = join(&pn, nn);
+        if self.ro_denied(bo, &rel_o) || self.ro_denied(bo, &rel_n) {
+            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        }
         let writer = b.writer_for(req.pid());
         let lower_o = self.host(&rel_o).symlink_metadata().is_ok();
         match self.layer(&b, &rel_o) {

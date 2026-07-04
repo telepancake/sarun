@@ -303,7 +303,58 @@ Notes per variant:
   boundary). Encoding tombstones into native git trees is explicitly
   abandoned.
 
-## 8. Dedup needs its own observability (anti-sabotage clause)
+## 8. Read-only composition (RO attachments)
+
+A running box may reference additional layers READ-ONLY, conceptually
+stacked between its parent chain and its own upper:
+
+```
+backdrop < parent chain < RO attachments (ordered) < box upper
+```
+
+These are not a special kind of layer — they are exactly the same
+objects (full layer semantics, tombstones and holes included), merely
+*referenced differently* by the running box: any mutation of a key the
+attachment matches is an ERROR (EROFS), rejected at open-for-write time
+(a deliberate exception to first-write laziness — fail fast like a
+kernel ro-mount).
+
+The rejection is what makes attachment free: copy-up is the only path
+by which lower content enters a box's layer, and it is exactly the
+rejected operation — so `footprint(upper) ∩ keys(RO) = ∅` holds
+structurally and the captured layer is provably independent of which
+attachments were present. Attach/detach is pure bookkeeping (an ordered
+list, in sqlite/meta); no re-encoding, no holes, no copying. This is
+the zero-cost complement to rotation: rotation restacks layers that
+interact; RO attachment is the guaranteed-non-interacting case.
+
+Rules pinned:
+- **New keys under RO-provided directories are allowed** (overlayfs-like
+  dir merge): build outputs land beside RO sources, captured in the
+  upper. The error set is mutation of MATCHED keys: write/truncate,
+  setattr/xattr, unlink/rename-over (both need a whiteout against the
+  attachment), rename-of. A layer wanting its subtree sealed against
+  additions says so itself (opaque / a sealed attribute), not via the
+  global rule.
+- An attachment needs only the READOUT half of the trait (entry,
+  children, blob read) — so anything with random-access readout can
+  attach: an at-rest box, an imported canonical layer, an OCI layer, a
+  git ref (served lazily from a gitdepot chain — the tip is frame 0 —
+  or straight from a git repo via ls-tree/cat-file, no checkout), a
+  VBF-extracted snapshot (behind materialization or a decode cache).
+  The stream variant cannot attach directly (no random access).
+- Relation to existing flags: `readonly_parent` is the apply-time
+  cousin (child may not promote INTO parent); RO attachment is the
+  write-time dual (child may not diverge FROM the attachment). Both are
+  per-attachment attitudes, both bookkeeping.
+- The invariant test: the same box run with and without an attachment
+  produces a byte-identical captured layer (plus EROFS on matched-key
+  writes, success beside them).
+
+Use: composing SDKs, source trees, datasets, wiki snapshots into a
+workspace at runtime without unpacking or copying.
+
+## 9. Dedup needs its own observability (anti-sabotage clause)
 
 Because sharing and compression are internal and invisible, a green
 functional suite proves nothing about them — exactly how the wikipedia
@@ -320,7 +371,7 @@ properties**, not just round-trips:
 A depot whose on-disk size matches its uncompressed input has not rendered
 this design, whatever its tests say.
 
-## 9. Build order
+## 10. Build order
 
 1. **Node model + canonical encoding + layer algebra**, as a standalone
    crate with an in-memory reference variant: encode/decode round-trip,
@@ -346,7 +397,7 @@ this design, whatever its tests say.
 8. **full git import/export** through the stream form (the straightedge tool
    generalized: signed commits, annotated tags, incremental update).
 
-## 10. Open questions (size before committing; do not guess)
+## 11. Open questions (size before committing; do not guess)
 
 - Operation frequency weights for the fs-layer workload — measure against
   the live overlay before pinning signatures (§5).

@@ -1653,6 +1653,50 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             Some(id) => dissolve(state, id),
             None => json!({"ok": false, "error": "no slopbox"}),
         },
+        // RO attachments (DEPOT-DESIGN.md §8): reference another box's
+        // layer read-only, between this box and its parent in the lookup
+        // chain. args: [sid, ro_box_id, ...] — the full ordered list
+        // replaces the current one (empty list = detach all). The RO box
+        // is hydrated from its at-rest sqlar if not already live.
+        "ro_attach" => {
+            let ov = lock(state).overlay.clone();
+            let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
+                return json!({"ok": false, "error": "no overlay / bad sid"});
+            };
+            let Some(b) = ov.box_of(sid) else {
+                return json!({"ok": false, "error": "no such box"});
+            };
+            let mut ids = Vec::new();
+            for v in args.iter().skip(1) {
+                let Some(ro) = v.as_i64() else {
+                    return json!({"ok": false, "error": "bad ro id"});
+                };
+                if ro == sid {
+                    return json!({"ok": false, "error": "cannot attach self"});
+                }
+                if ov.box_of(ro).is_none() {
+                    // Hydrate the at-rest box: open its sqlar, load the
+                    // mirror, register it (never run — reference only).
+                    let db = crate::paths::state_home()
+                        .join(format!("{ro}.sqlar"));
+                    if !db.exists() {
+                        return json!({"ok": false,
+                                      "error": format!("no box {ro}")});
+                    }
+                    match crate::capture::BoxState::create(ro) {
+                        Ok(rb) => {
+                            rb.load_mirror();
+                            ov.add_box(std::sync::Arc::new(rb));
+                        }
+                        Err(e) => return json!({"ok": false,
+                                                "error": e.to_string()}),
+                    }
+                }
+                ids.push(ro);
+            }
+            b.set_ro_attachments(ids);
+            json!({"ok": true})
+        }
         "reload_rules" => {
             if let Some(ov) = lock(state).overlay.clone() {
                 ov.reload_rules();
