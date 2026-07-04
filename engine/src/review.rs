@@ -6,6 +6,7 @@
 // apply/discard (host-mutating, need live-connection ownership routing) and
 // the structural-diff job path are deferred to a later milestone.
 
+use crate::depot::BoxDepot;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};

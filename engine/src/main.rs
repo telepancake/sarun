@@ -24,6 +24,7 @@ mod find_builtin;
 mod xargs_builtin;
 mod containers_conf;
 mod control;
+mod depot;
 mod discover;
 // Dockerfile/Containerfile parser for `sarun oci build` / `oci run`. Lands
 // ahead of its consumer (the build driver), so allow the not-yet-used items.

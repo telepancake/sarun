@@ -10,6 +10,7 @@
 // Implemented: lookup/getattr/readdir(plus)/readlink/open/create/read/write/
 // truncate/mkdir/unlink/rmdir/symlink/rename.
 
+use crate::depot::BoxDepot;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsStr;

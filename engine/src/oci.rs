@@ -24,6 +24,7 @@
 // Out of scope (v1): keyless cosign (Fulcio/Rekor) verification; the
 // zstd:chunked TOC fast path (plain-zstd decode is already correct).
 
+use crate::depot::BoxDepot;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;

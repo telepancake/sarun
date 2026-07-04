@@ -6,6 +6,7 @@
 // every row is attributed to the runner's process row until the wire trace
 // stream is ingested (step 2).
 
+use crate::depot::BoxDepot;
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
