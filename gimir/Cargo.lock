@@ -456,6 +456,15 @@ name = "depot"
 version = "0.0.0"
 
 [[package]]
+name = "depot-stream"
+version = "0.0.0"
+dependencies = [
+ "depot",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

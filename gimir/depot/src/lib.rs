@@ -41,6 +41,7 @@
 use std::collections::BTreeMap;
 
 pub mod codec;
+pub mod variant;
 
 /// A node key: opaque bytes. Ordering is byte-lexicographic in this
 /// reference implementation (canonical-encoding walks depend on ONE

@@ -1,5 +1,5 @@
-//! Shared test helpers: a tiny deterministic xorshift and a random
-//! delta-tree generator, used by both the algebra-law and codec tests.
+// Shared test helpers: a tiny deterministic xorshift and a random
+// delta-tree generator, used by both the algebra-law and codec tests.
 
 use std::collections::BTreeMap;
 
