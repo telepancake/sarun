@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 16:37:50 +0000
+Subject: [PATCH] cut: entry takes logical cwd; join relative file operands
+
+---
+diff --git a/src/cut.rs b/src/cut.rs
+index ad595ef..5fea1dc 100644
+--- a/src/cut.rs
++++ b/src/cut.rs
+@@ -455,6 +455,7 @@ fn cut_fields<R: Read, W: Write>(
+ /// byte-for-byte the upstream `cut_files` body.
+ fn cut_files<'a, I>(
+     filenames: I,
++    cwd: &Path,
+     mode: &Mode,
+     out: &mut dyn Write,
+     stdin: &mut dyn Read,
+@@ -492,8 +493,16 @@ where
+             stdin_read = true;
+         } else {
+             let path = Path::new(filename);
++            // Root a relative operand at the shell's logical cwd for the actual
++            // filesystem access (the process is never `chdir`'d); every displayed
++            // name/diagnostic keeps the operand exactly as given (`filename`).
++            let open_path = if path.is_relative() {
++                cwd.join(path)
++            } else {
++                path.to_path_buf()
++            };
+ 
+-            if path.is_dir() {
++            if open_path.is_dir() {
+                 error_messages.push(format!(
+                     "{}: {}",
+                     filename.maybe_quote(),
+@@ -502,7 +511,7 @@ where
+                 continue;
+             }
+ 
+-            let res = File::open(path)
++            let res = File::open(&open_path)
+                 .map_err_context(|| filename.maybe_quote().to_string())
+                 .and_then(|file| match &mode {
+                     Mode::Bytes(ranges, opts) | Mode::Characters(ranges, opts) => {
+@@ -620,6 +629,7 @@ mod options {
+ /// returned (the caller writes them to logical stderr) instead of being printed.
+ pub fn cut(
+     args: impl uucore::Args,
++    cwd: &Path,
+     out: &mut dyn Write,
+     _err: &mut dyn Write,
+     stdin: &mut dyn Read,
+@@ -733,7 +743,7 @@ pub fn cut(
+     #[allow(clippy::unwrap_used, reason = "clap provides '-' by default")]
+     let files = matches.get_many::<OsString>(options::FILE).unwrap();
+ 
+-    cut_files(files, &mode, out, stdin)
++    cut_files(files, cwd, &mode, out, stdin)
+ }
+ 
+ /// Descriptor-based entry point for the standalone `cut` binary.
+@@ -750,13 +760,16 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     let mut err = stderr.lock();
+     let stdin = io::stdin();
+     let mut input = stdin.lock();
++    // The standalone binary owns the process cwd; pass it so relative operands
++    // resolve against it exactly as upstream did.
++    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+     // NOTE: the returned `UError` is printed by the `#[uucore::main]` macro
+     // itself (with the "cut: " prefix), so this bridge must NOT print it again —
+     // the in-process brush builtin, which does NOT go through this macro, is the
+     // one that writes the returned message to its LOGICAL stderr. `err` is the
+     // standalone process's fd 2, handed to `cut` for signature parity (cut never
+     // writes diagnostics mid-run, so it is currently unused inside `cut`).
+-    let result = cut(args, &mut out, &mut err, &mut input);
++    let result = cut(args, &cwd, &mut out, &mut err, &mut input);
+     // The logical entry already flushed its BufWriter; the locked Stdout itself
+     // is line-buffered, so flush before exit to mirror GNU `cut`.
+     let _ = out.flush();
+@@ -881,7 +894,7 @@ mod tests {
+ 
+         // argv[0] = "cut", select field 2 with ':' delimiter; no file -> stdin.
+         let args = ["cut", "-d:", "-f2"].iter().map(|s| OsString::from(*s));
+-        cut(args, &mut out, &mut err, &mut reader).unwrap();
++        cut(args, Path::new("."), &mut out, &mut err, &mut reader).unwrap();
+ 
+         assert_eq!(
+             out,
+@@ -904,7 +917,7 @@ mod tests {
+         let args = ["cut", "-b", "2-4", "--complement"]
+             .iter()
+             .map(|s| OsString::from(*s));
+-        cut(args, &mut out, &mut err, &mut reader).unwrap();
++        cut(args, Path::new("."), &mut out, &mut err, &mut reader).unwrap();
+ 
+         assert_eq!(out, b"aef\n".to_vec());
+         assert!(err.is_empty());
+@@ -921,7 +934,7 @@ mod tests {
+         let args = ["cut", "-d:", "-f1", "-s"]
+             .iter()
+             .map(|s| OsString::from(*s));
+-        cut(args, &mut out, &mut err, &mut reader).unwrap();
++        cut(args, Path::new("."), &mut out, &mut err, &mut reader).unwrap();
+ 
+         assert_eq!(out, b"x\n".to_vec());
+         assert!(err.is_empty());
