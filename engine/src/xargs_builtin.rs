@@ -20,6 +20,8 @@
 //! concurrency. Nothing touches process-global stdio or cwd.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 
 use brush_core::openfiles::OpenFile;
@@ -35,6 +37,11 @@ struct BrushXargsIo {
     input: RefCell<Option<Box<dyn Read>>>,
     output: RefCell<OpenFile>,
     error_output: RefCell<OpenFile>,
+    /// The shell's LOGICAL exported env, snapshotted before the worker thread
+    /// starts. xargs hands this to every dispatched child (matching `export
+    /// FOO=bar | xargs cmd`) and uses it to size command batches with headroom
+    /// for the child's real env at execve time.
+    env: HashMap<OsString, OsString>,
     submitter: builtin_exec::ExecSubmitter,
 }
 
@@ -68,6 +75,10 @@ impl XargsIo for BrushXargsIo {
         &self.error_output
     }
 
+    fn env(&self) -> Option<HashMap<OsString, OsString>> {
+        Some(self.env.clone())
+    }
+
     fn submit(&self, argv: &[std::ffi::OsString]) -> Option<Box<dyn ExecChild>> {
         // Run through brush (builtin/function/external) in the shell's logical
         // cwd (xargs has no per-command dir like -execdir; pass None).
@@ -99,6 +110,21 @@ impl brush_core::builtins::Command for XargsBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let input = context.stdin();
 
+        // Snapshot the shell's LOGICAL exported env for the child commands (the
+        // worker thread hands it to each dispatched argv, and sizes batches by
+        // it). iter_exported is the same idiom `env`/`printenv` use.
+        let env: HashMap<OsString, OsString> = context
+            .shell
+            .env()
+            .iter_exported()
+            .map(|(k, v)| {
+                (
+                    k.clone().into(),
+                    v.value().to_cow_str(context.shell).to_string().into(),
+                )
+            })
+            .collect();
+
         // Execution bridge: findutils (thread) submits argvs; executor runs each
         // through run_argv on a subshell clone.
         let (submitter, rx) = builtin_exec::channel();
@@ -110,6 +136,7 @@ impl brush_core::builtins::Command for XargsBuiltin {
                     input: RefCell::new(Some(Box::new(input))),
                     output: RefCell::new(out),
                     error_output: RefCell::new(err),
+                    env,
                     submitter,
                 };
                 let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();

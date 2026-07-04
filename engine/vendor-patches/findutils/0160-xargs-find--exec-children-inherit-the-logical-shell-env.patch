@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 17:48:32 +0000
+Subject: [PATCH] xargs/find: exec children inherit the logical shell env
+
+---
+diff --git a/src/xargs/mod.rs b/src/xargs/mod.rs
+index 6bd101a..3431d16 100644
+--- a/src/xargs/mod.rs
++++ b/src/xargs/mod.rs
+@@ -57,6 +57,15 @@ pub trait XargsIo {
+     fn cwd(&self) -> Option<&std::path::Path> {
+         None
+     }
++    /// The environment a spawned/dispatched child must receive. An in-process
++    /// embedder returns `Some(_)` with the shell's LOGICAL exported env, so
++    /// `export FOO=bar | xargs cmd` reaches the child (and, just as importantly,
++    /// the system arg-size limiter reserves headroom for the child's REAL env at
++    /// execve time). The default `None` uses the engine/process env
++    /// (`std::env::vars_os`), matching the standalone binary.
++    fn env(&self) -> Option<HashMap<OsString, OsString>> {
++        None
++    }
+     /// Execute one fully-built command argv, returning a handle to await its exit
+     /// code — OR `None` to fall back to spawning a real `std::process::Command`.
+     /// The in-process embedder returns `Some(_)` to run the command through the
+@@ -1362,7 +1371,10 @@ fn do_xargs(args: &[&str], io: &dyn XargsIo) -> Result<CommandResult, XargsError
+         }
+         _ => ExecAction::Echo,
+     };
+-    let env = std::env::vars_os().collect();
++    // Embedder supplies the shell's LOGICAL exported env; standalone falls back
++    // to the process env. This env is handed to dispatched/spawned children AND
++    // used to size command batches (headroom for the child's env at execve).
++    let env = io.env().unwrap_or_else(|| std::env::vars_os().collect());
+ 
+     let mut limiters = LimiterCollection::new();
+     if let Some(max_args) = options.max_args {
