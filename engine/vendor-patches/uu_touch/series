@@ -1,3 +1,4 @@
 0010-uu_touch-in-process-touch-builtin-injected-logical-I-O-logic.patch
 0020-uu_ln-uu_rmdir-uu_touch-fix-logical-cwd-edge-cases-from-blin.patch
 0030-touch--entry-takes-logical-env--knobs-from-the-shell.patch
+0040-touch--honor-logical-TZ-for--d--t-date-parsing-without-mutat.patch

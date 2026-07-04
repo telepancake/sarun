@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 21:09:43 +0000
+Subject: [PATCH] touch: honor logical TZ for -d/-t date parsing without mutating process TZ
+
+---
+diff --git a/src/touch.rs b/src/touch.rs
+index 1703964..9d544d3 100644
+--- a/src/touch.rs
++++ b/src/touch.rs
+@@ -174,9 +174,41 @@ fn timestamp_to_filetime(ts: Timestamp) -> FileTime {
+     FileTime::from_system_time(SystemTime::from(ts))
+ }
+ 
+-fn filetime_to_zoned(ft: &FileTime) -> Option<Zoned> {
++fn filetime_to_zoned(ft: &FileTime, tz: &TimeZone) -> Option<Zoned> {
+     let ts = Timestamp::new(ft.unix_seconds(), ft.nanoseconds() as i32).ok()?;
+-    Some(Zoned::new(ts, TimeZone::system()))
++    Some(Zoned::new(ts, tz.clone()))
++}
++
++/// Resolve the LOGICAL timezone for date parsing.
++///
++/// A box shell's `export TZ=…` must steer `touch -d`/`-t` the way it steers a
++/// real `touch` child — but the process (the engine) is shared across concurrent
++/// pipelines, so we must NOT mutate the process TZ (`set_var`/`tzset`). Instead
++/// we read `TZ` from the shell's LOGICAL env snapshot (`env`) and resolve it to a
++/// `jiff::tz::TimeZone` locally, leaving the process global untouched.
++///
++/// Honored forms: an IANA name (`Asia/Tokyo`, `UTC`, resolved against the
++/// system zoneinfo, optional leading `:`), a POSIX TZ string (`JST-9`,
++/// `EST5EDT`), and empty `TZ` (POSIX: UTC). When `TZ` is unset, or set to a
++/// value that resolves to neither, we fall back to `TimeZone::system()` — the
++/// process's own local zone, i.e. today's behavior. The standalone binary passes
++/// an env snapshot of the real process env, so it is unaffected.
++fn logical_timezone(env: &[(OsString, OsString)]) -> TimeZone {
++    let Some(tz) = env_get(env, "TZ") else {
++        return TimeZone::system();
++    };
++    let spec = tz.to_string_lossy();
++    let spec = spec.strip_prefix(':').unwrap_or(&spec);
++    if spec.is_empty() {
++        return TimeZone::UTC;
++    }
++    if let Ok(z) = TimeZone::get(spec) {
++        return z;
++    }
++    if let Ok(z) = TimeZone::posix(spec) {
++        return z;
++    }
++    TimeZone::system()
+ }
+ 
+ /// Whether all characters in the string are digits.
+@@ -302,6 +334,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+ fn run(args: impl uucore::Args, cwd: Option<&Path>, env: &[(OsString, OsString)]) -> UResult<()> {
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+ 
++    // Resolve the shell's LOGICAL timezone once; steers `-d`/`-t` parsing below
++    // without touching the process TZ global.
++    let tz = logical_timezone(env);
++
+     let mut filenames: Vec<&OsString> = matches
+         .get_many::<OsString>(ARG_FILES)
+         .ok_or_else(|| {
+@@ -346,7 +382,7 @@ fn run(args: impl uucore::Args, cwd: Option<&Path>, env: &[(OsString, OsString)]
+     let source = if let Some(reference) = reference {
+         Source::Reference(PathBuf::from(reference))
+     } else if let Some(ts) = timestamp {
+-        Source::Timestamp(parse_timestamp(&ts)?)
++        Source::Timestamp(parse_timestamp(&ts, &tz)?)
+     } else {
+         Source::Now
+     };
+@@ -376,7 +412,7 @@ fn run(args: impl uucore::Args, cwd: Option<&Path>, env: &[(OsString, OsString)]
+         strict: false,
+     };
+ 
+-    touch(&files, &opts)?;
++    touch(&files, &opts, &tz)?;
+ 
+     Ok(())
+ }
+@@ -496,7 +532,7 @@ pub fn uu_app() -> Command {
+ /// - The file doesn't already exist
+ /// - `-c`/`--no-create` was passed (`opts.no_create`)
+ /// - Either `-h`/`--no-dereference` was passed (`opts.no_deref`) or the file couldn't be created
+-pub fn touch(files: &[InputFile], opts: &Options) -> Result<(), TouchError> {
++pub fn touch(files: &[InputFile], opts: &Options, tz: &TimeZone) -> Result<(), TouchError> {
+     let (atime, mtime) = match &opts.source {
+         Source::Reference(reference) => {
+             let (atime, mtime) = stat(reference, !opts.no_deref)
+@@ -526,12 +562,14 @@ pub fn touch(files: &[InputFile], opts: &Options) -> Result<(), TouchError> {
+     let (atime, mtime) = if let Some(date) = &opts.date {
+         (
+             parse_date(
+-                filetime_to_zoned(&atime).ok_or_else(|| TouchError::InvalidFiletime(atime))?,
++                filetime_to_zoned(&atime, tz).ok_or_else(|| TouchError::InvalidFiletime(atime))?,
+                 date,
++                tz,
+             )?,
+             parse_date(
+-                filetime_to_zoned(&mtime).ok_or_else(|| TouchError::InvalidFiletime(mtime))?,
++                filetime_to_zoned(&mtime, tz).ok_or_else(|| TouchError::InvalidFiletime(mtime))?,
+                 date,
++                tz,
+             )?,
+         )
+     } else {
+@@ -773,7 +811,7 @@ fn stat(path: &Path, follow: bool) -> std::io::Result<(FileTime, FileTime)> {
+     ))
+ }
+ 
+-fn parse_date(ref_zoned: Zoned, s: &str) -> Result<FileTime, TouchError> {
++fn parse_date(ref_zoned: Zoned, s: &str, tz: &TimeZone) -> Result<FileTime, TouchError> {
+     // This isn't actually compatible with GNU touch, but there doesn't seem to
+     // be any simple specification for what format this parameter allows and I'm
+     // not about to implement GNU parse_datetime.
+@@ -817,8 +855,7 @@ fn parse_date(ref_zoned: Zoned, s: &str) -> Result<FileTime, TouchError> {
+     if let Ok(filetime) = strtime::parse(format::ISO_8601, s)
+         .and_then(|tm| tm.to_date())
+         .and_then(|date| {
+-            TimeZone::system()
+-                .to_ambiguous_zoned(date.to_datetime(Time::midnight()))
++            tz.to_ambiguous_zoned(date.to_datetime(Time::midnight()))
+                 .unambiguous()
+         })
+         .map(|zdt| timestamp_to_filetime(zdt.timestamp()))
+@@ -867,10 +904,10 @@ fn prepend_century(s: &str) -> UResult<String> {
+ /// Note that  If the year is specified with only two digits,
+ /// then cc is 20 for years in the range 0 … 68, and 19 for years in 69 … 99.
+ /// in order to be compatible with GNU `touch`.
+-fn parse_timestamp(s: &str) -> UResult<FileTime> {
++fn parse_timestamp(s: &str, tz: &TimeZone) -> UResult<FileTime> {
+     use format::{YYYYMMDDHHMM, YYYYMMDDHHMM_DOT_SS};
+ 
+-    let current_year = || Timestamp::now().to_zoned(TimeZone::system()).year();
++    let current_year = || Timestamp::now().to_zoned(tz.clone()).year();
+ 
+     let (format, ts) = match s.chars().count() {
+         15 => (YYYYMMDDHHMM_DOT_SS, s.to_owned()),
+@@ -908,7 +945,7 @@ fn parse_timestamp(s: &str) -> UResult<FileTime> {
+     // Due to daylight saving time switch, local time can jump from 1:59 AM to
+     // 3:00 AM, in which case any time between 2:00 AM and 2:59 AM is not valid.
+     // Jiff's `to_ambiguous_zoned(...).unambiguous()` handles this case.
+-    let local = TimeZone::system()
++    let local = tz
+         .to_ambiguous_zoned(dt)
+         .unambiguous()
+         .map_err(|_| {
+@@ -1084,6 +1121,7 @@ mod tests {
+                 change_times: ChangeTimes::Both,
+                 strict: false,
+             },
++            &TimeZone::system(),
+         ) {
+             Err(TouchError::InvalidFiletime(filetime)) => assert_eq!(filetime, invalid_filetime),
+             Err(e) => panic!("Expected TouchError::InvalidFiletime, got {e}"),
