@@ -554,6 +554,20 @@ impl brush_core::builtins::SimpleCommand for UniqBuiltin {
         // against this, not the engine process cwd.
         let cwd = context.shell.working_dir().to_path_buf();
 
+        // Shell's LOGICAL environment: uniq's locale knobs (LC_ALL/LC_CTYPE/LANG)
+        // come from the vars the box shell has `export`ed, not the engine's env.
+        let envv: Vec<(OsString, OsString)> = context
+            .shell
+            .env()
+            .iter_exported()
+            .map(|(k, v)| {
+                (
+                    k.clone().into(),
+                    v.value().to_cow_str(context.shell).to_string().into(),
+                )
+            })
+            .collect();
+
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
@@ -563,7 +577,7 @@ impl brush_core::builtins::SimpleCommand for UniqBuiltin {
             let mut out = out;
             let mut err = err;
             let mut inp = inp;
-            let r = match uu_uniq::uniq(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
+            let r = match uu_uniq::uniq(argv.into_iter(), &cwd, &envv, &mut out, &mut err, &mut inp) {
                 Ok(()) => 0,
                 Err(e) => {
                     let msg = e.to_string();

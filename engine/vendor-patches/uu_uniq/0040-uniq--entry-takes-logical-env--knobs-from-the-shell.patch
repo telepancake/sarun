@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 17:53:06 +0000
+Subject: [PATCH] uniq: entry takes logical env; knobs from the shell
+
+---
+diff --git a/src/uniq.rs b/src/uniq.rs
+index 8ffde9f..6a6d7c0 100644
+--- a/src/uniq.rs
++++ b/src/uniq.rs
+@@ -56,6 +56,20 @@ struct Uniq {
+     slice_stop: Option<usize>,
+     ignore_case: bool,
+     zero_terminated: bool,
++    /// Whether the effective locale is C/POSIX, computed once from the shell's
++    /// LOGICAL environment (not the engine process's env) when the `Uniq` is
++    /// built. Governs byte- vs character-counting for `-w`/`--check-chars`.
++    is_c_locale: bool,
++}
++
++/// Look up `key` in the shell's LOGICAL environment snapshot (the vars the
++/// brush shell has `export`ed), returning its value if present. Replaces the
++/// process-env reads (`std::env::var_os`) so a knob set with `export` in the
++/// box shell — not one inherited by the engine process — takes effect.
++fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsStr> {
++    env.iter()
++        .find(|(k, _)| k == OsStr::new(key))
++        .map(|(_, v)| v.as_os_str())
+ }
+ 
+ #[derive(Default)]
+@@ -72,6 +86,21 @@ macro_rules! write_line_terminator {
+     };
+ }
+ 
++/// Whether the effective locale (from the shell's LOGICAL env) is C/POSIX.
++/// The first non-empty of `LC_ALL`, `LC_CTYPE`, `LANG` decides; absent/empty
++/// throughout means C (GNU's default), so behavior with the vars unset is
++/// identical to the previous process-env read.
++fn is_c_locale(env: &[(OsString, OsString)]) -> bool {
++    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
++        if let Some(v) = env_get(env, key) {
++            if !v.is_empty() {
++                return v == "C" || v == "POSIX";
++            }
++        }
++    }
++    true
++}
++
+ impl Uniq {
+     pub fn write_uniq(&self, mut reader: impl BufRead, mut writer: impl Write) -> UResult<()> {
+         let mut first_line_printed = false;
+@@ -187,17 +216,6 @@ impl Uniq {
+         }
+     }
+ 
+-    fn is_c_locale() -> bool {
+-        for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+-            if let Some(v) = std::env::var_os(key) {
+-                if !v.is_empty() {
+-                    return v == "C" || v == "POSIX";
+-                }
+-            }
+-        }
+-        true
+-    }
+-
+     fn key_end_index(&self, line: &[u8], key_start: usize) -> usize {
+         let remainder = &line[key_start..];
+         match self.slice_stop {
+@@ -206,7 +224,7 @@ impl Uniq {
+                 if remainder.is_empty() {
+                     return key_start;
+                 }
+-                if Self::is_c_locale() {
++                if self.is_c_locale {
+                     // for C or POSIX we count bytes
+                     key_start + remainder.len().min(limit)
+                 } else if let Ok(valid) = std::str::from_utf8(remainder) {
+@@ -675,6 +693,7 @@ fn map_clap_errors(clap_error: Error) -> Box<dyn UError> {
+ pub fn uniq(
+     args: impl uucore::Args,
+     cwd: &Path,
++    env: &[(OsString, OsString)],
+     out: &mut dyn Write,
+     err: &mut dyn Write,
+     stdin: &mut dyn Read,
+@@ -720,6 +739,7 @@ pub fn uniq(
+         slice_stop: opt_parsed(options::CHECK_CHARS, &matches)?,
+         ignore_case: matches.get_flag(options::IGNORE_CASE),
+         zero_terminated: matches.get_flag(options::ZERO_TERMINATED),
++        is_c_locale: is_c_locale(env),
+     };
+ 
+     if uniq.show_counts && uniq.all_repeated {
+@@ -772,7 +792,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     // Standalone binary: the process's real cwd is the intended base for
+     // relative operands, exactly as upstream.
+     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+-    let result = uniq(args, &cwd, &mut out, &mut err, &mut input);
++    // Standalone binary: the intended knobs come from the process environment,
++    // exactly as upstream read them directly.
++    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
++    let result = uniq(args, &cwd, &env, &mut out, &mut err, &mut input);
+     // GNU `uniq` flushes stdout before exiting; `write_uniq` already flushed its
+     // BufWriter, but the locked Stdout itself is line-buffered, so flush.
+     let _ = out.flush();
+@@ -952,7 +975,7 @@ mod injected_io_tests {
+         let mut out: Vec<u8> = Vec::new();
+         let mut err: Vec<u8> = Vec::new();
+         let args = std::iter::once(OsString::from("uniq")).chain(argv.iter().map(OsString::from));
+-        let code = match uniq(args, Path::new("."), &mut out, &mut err, &mut src) {
++        let code = match uniq(args, Path::new("."), &[], &mut out, &mut err, &mut src) {
+             Ok(()) => 0,
+             Err(e) => e.code(),
+         };
+@@ -1026,7 +1049,7 @@ mod injected_io_tests {
+         let mut out: Vec<u8> = Vec::new();
+         let mut err: Vec<u8> = Vec::new();
+         let args = ["uniq", "-", path_str].into_iter().map(OsString::from);
+-        uniq(args, Path::new("."), &mut out, &mut err, &mut src).unwrap();
++        uniq(args, Path::new("."), &[], &mut out, &mut err, &mut src).unwrap();
+         // The injected `out` sink must stay empty; the file holds the result.
+         assert!(out.is_empty(), "out should be empty, got {out:?}");
+         let written = std::fs::read(&path).unwrap();
