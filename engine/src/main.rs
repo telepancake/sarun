@@ -45,6 +45,7 @@ mod review;
 mod rules;
 mod runner;
 mod slippool;
+mod sud;
 mod ui;
 mod views;
 
@@ -513,6 +514,7 @@ fn main() {
             let mut no_parent = false;
             let mut readonly_parent = false;
             let mut api = false;
+            let mut sud = false;
             let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
             // Box networking defaults to Tap (proxied): the box gets a per-box
@@ -577,6 +579,13 @@ fn main() {
                     //        in-box `oaita gen` routes through the engine
                     //        with no api key in the box and no extra UDS.
                     "--api" => api = true,
+                    // --sud  EXPERIMENTAL (engine/DESIGN-sud.md, WIP): run
+                    //        CMD under tv's sudtrace (Syscall User Dispatch
+                    //        + userland overlay) instead of bwrap+FUSE; a
+                    //        post-exit sweep captures the upper dir into
+                    //        the box's sqlar. Host netns, no capture mux,
+                    //        incompatible with -t/-d/-p/-b/--api.
+                    "--sud" => sud = true,
                     // --vars  OPT-IN variable provenance: record every make
                     //         and shell variable assignment (name, site,
                     //         value, unexpanded rhs + its dereferences) into
@@ -597,6 +606,15 @@ fn main() {
                     \x20        -b brush-shell  -p pty  -C DIR  --no-parent  --readonly-parent  --api\n\
                     \x20        --vars record variable assignments (Vars view)");
                 std::process::exit(2);
+            }
+            if sud {
+                if passthrough || direct || pty || brush || api {
+                    eprintln!("sarun: --sud is incompatible with \
+                               -t/-d/-p/-b/--api (step-1 scope, see \
+                               engine/DESIGN-sud.md)");
+                    std::process::exit(2);
+                }
+                std::process::exit(runner::run_sud(name, env, chdir, cmd));
             }
             std::process::exit(runner::run(name, passthrough, direct, env,
                 pty, brush, api, no_parent, readonly_parent, chdir,

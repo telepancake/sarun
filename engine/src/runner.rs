@@ -661,6 +661,138 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
 }
 
+/// `run --sud` (WIP, see engine/DESIGN-sud.md): run CMD under tv's sudtrace
+/// instead of bwrap+FUSE. Registers with `want_sud`, gets the engine-owned
+/// upper directory back in the ack, launches
+///   sudtrace -o <trace> --passthrough … --overlay /=<upper>+/ -- CMD
+/// and, after the child exits, asks the engine (fresh conn, `sud_ingest`)
+/// to sweep the upper into the box's sqlar. The register conn stays open
+/// for the duration — its EOF after the sweep is the normal box teardown.
+pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
+               cmd: Vec<String>) -> i32 {
+    if cmd.is_empty() {
+        eprintln!("sarun-engine run --sud: needs a command");
+        return 2;
+    }
+    if std::env::var("SARUN_BROKER").is_ok_and(|s| !s.is_empty()) {
+        eprintln!("sarun-engine run --sud: nested sud boxes are not \
+                   supported yet (see engine/DESIGN-sud.md).");
+        return 2;
+    }
+    let sudtrace = std::env::var("SARUN_SUDTRACE")
+        .ok().filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "sudtrace".to_string());
+    let sock = paths::sock_path();
+    let conn = match UnixStream::connect(&sock) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("sarun-engine: no engine running (control socket {}).",
+                      sock.display());
+            return 3;
+        }
+    };
+    let reg = json!({"type": "register",
+                     "cmd": cmd, "prov": provenance(&cmd, env),
+                     "want_capture": false,
+                     "want_direct": false,
+                     "want_env": env,
+                     "want_sud": true,
+                     "net_mode": "host",
+                     "session_id": name.clone().unwrap_or_default(),
+                     "want_rerun": name.is_some()});
+    let pidfd = pidfd_open(std::process::id() as i32);
+    if !send_register(&conn, format!("{reg}\n").as_bytes(), pidfd, None) {
+        eprintln!("sarun-engine: register write failed");
+        return 1;
+    }
+    if pidfd >= 0 { unsafe { libc::close(pidfd); } }
+    let mut line = String::new();
+    if BufReader::new(&conn).read_line(&mut line).is_err() {
+        eprintln!("sarun-engine: register read failed");
+        return 1;
+    }
+    let ack: Value = match serde_json::from_str(&line) {
+        Ok(v) => v, Err(_) => { eprintln!("sarun-engine: bad ack"); return 1; }
+    };
+    if ack.get("ok").and_then(Value::as_bool) != Some(true) {
+        eprintln!("sarun-engine: {}",
+                  ack.get("error").and_then(Value::as_str)
+                      .unwrap_or("register failed"));
+        return 1;
+    }
+    let sid = ack.get("session_id").and_then(Value::as_str)
+        .unwrap_or("?").to_string();
+    let upper = ack.get("sud_upper").and_then(Value::as_str)
+        .unwrap_or("").to_string();
+    if upper.is_empty() {
+        eprintln!("sarun-engine: engine did not allocate a sud upper \
+                   (engine older than this runner?)");
+        return 1;
+    }
+    let trace = std::path::Path::new(&upper)
+        .parent().map(|p| p.join("sud.trace"))
+        .unwrap_or_else(|| "sud.trace".into());
+    eprintln!("sarun-engine: box {sid}  (sud upper: {upper})");
+    // Rule order matters (first-prefix-match wins): carve the pseudo
+    // filesystems and sarun's own state tree out BEFORE the wide `/` rule.
+    // /tmp passthrough is a step-1 stopgap — see DESIGN-sud.md gaps.
+    let state_dir = crate::paths::state_home();
+    let mut sc = Command::new(&sudtrace);
+    sc.arg("-o").arg(&trace);
+    for p in ["/proc", "/dev", "/sys", "/tmp"] {
+        sc.args(["--passthrough", p]);
+    }
+    sc.arg("--passthrough").arg(&state_dir);
+    sc.arg("--overlay").arg(format!("/={upper}+/"));
+    sc.arg("--");
+    sc.args(&cmd);
+    if let Some(d) = &chdir { sc.current_dir(d); }
+    let status = sc.status();
+    let code = match status {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("sarun-engine: exec {sudtrace}: {e}\n\
+                       hint: build it with `make -C tv sudtrace sud64 \
+                       SUD_ADDINS=\"sud/trace sud/path_remap sud/cmd-rewrite \
+                       sud/fake-exec sud/inramfs\"` and put it on PATH or \
+                       point SARUN_SUDTRACE at it.");
+            127
+        }
+    };
+    // Sweep the upper into the box's sqlar on a FRESH conn (the register
+    // conn is the box channel; a verb on it would desync teardown).
+    match UnixStream::connect(&sock) {
+        Ok(c) => {
+            let req = json!({"type": "sud_ingest", "sid": sid});
+            if conn_write_all(&c, format!("{req}\n").as_bytes()) {
+                let mut resp = String::new();
+                let _ = BufReader::new(&c).read_line(&mut resp);
+                match serde_json::from_str::<Value>(&resp) {
+                    Ok(v) if v.get("ok").and_then(Value::as_bool)
+                        == Some(true) => {
+                        let n = v.get("ingested").and_then(Value::as_i64)
+                            .unwrap_or(0);
+                        eprintln!("sarun-engine: sud sweep: {n} entries \
+                                   captured into box {sid}");
+                        if let Some(errs) = v.get("errors")
+                            .and_then(Value::as_array)
+                            .filter(|a| !a.is_empty()) {
+                            for e in errs {
+                                eprintln!("sarun-engine: sud sweep: {e}");
+                            }
+                        }
+                    }
+                    _ => eprintln!("sarun-engine: sud sweep failed: {}",
+                                   resp.trim()),
+                }
+            }
+        }
+        Err(e) => eprintln!("sarun-engine: sud sweep: dial engine: {e}"),
+    }
+    drop(conn); // box channel EOF → teardown
+    code
+}
+
 /// Send one frame (optionally with our pidfd as SCM_RIGHTS) over the box channel.
 fn send_frame(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
     let Some(fd) = pidfd else {

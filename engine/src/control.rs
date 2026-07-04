@@ -553,6 +553,35 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             }
         }
         "ui" => dispatch_ui(state, msg),
+        // --sud step-1 sweep (WIP, engine/DESIGN-sud.md): the runner calls
+        // this after its sudtrace child exits; we mirror the box's upper
+        // directory (live/<id>/sud-up) into the live BoxState so review /
+        // apply / discard / UI see a sud box like any other.
+        "sud_ingest" => {
+            let boxes = discover::discover();
+            match msg.get("sid").and_then(Value::as_str)
+                .and_then(|s| resolve(&boxes, s)) {
+                Some(id) => {
+                    let live = lock(state).overlay.clone()
+                        .and_then(|o| o.live_box(id));
+                    match live {
+                        Some(b) => {
+                            let upper = crate::paths::live_home()
+                                .join(id.to_string()).join("sud-up");
+                            let runpid = lock(state).box_runpids
+                                .get(&id).copied().unwrap_or(0);
+                            let (n, errs) = crate::sud::ingest_upper(
+                                &b, &upper, runpid as u32);
+                            json!({"ok": true, "ingested": n,
+                                   "errors": errs})
+                        }
+                        None => json!({"ok": false,
+                                       "error": "box is not live"}),
+                    }
+                }
+                None => json!({"ok": false, "error": "no slopbox"}),
+            }
+        }
         "patch" => {
             let boxes = discover::discover();
             match msg.get("sid").and_then(Value::as_str)
@@ -980,6 +1009,19 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     // on this flag (see overlay.rs).
     b.set_is_tap(msg.get("net_mode").and_then(Value::as_str) == Some("tap"));
     b.set_meta("name", &name);
+    // --sud (WIP, see engine/DESIGN-sud.md): the box runs under tv's
+    // sudtrace with a directory upper instead of on the FUSE mount. Create
+    // the upper here so the ack can hand its path to the runner; the
+    // post-exit `sud_ingest` verb sweeps it into this BoxState.
+    let want_sud = msg.get("want_sud").and_then(Value::as_bool).unwrap_or(false);
+    if want_sud {
+        let up = backing.join("sud-up");
+        if let Err(e) = std::fs::create_dir_all(&up) {
+            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            return json!({"ok": false, "error": format!("sud upper: {e}")});
+        }
+        b.set_meta("sud", "1");
+    }
     // D-parent: `want_no_parent` strips any kernel-derived parent AND closes
     // the lower chain so reads never fall through to the real host. It's the
     // "OCI rootfs" / "Dockerfile FROM scratch" semantic. A child can
@@ -1084,6 +1126,9 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     });
     if let Some(o) = oci {
         reply["oci"] = o;
+    }
+    if want_sud {
+        reply["sud_upper"] = json!(backing.join("sud-up").to_string_lossy());
     }
     reply
 }
