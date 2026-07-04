@@ -141,6 +141,67 @@ Bugs this test surfaced and that are now fixed:
   overlay resolver for inramfs paths. A RELATIVE exec of the same binary
   already worked; only the absolute path was broken.
 
+## brush + in-process builtins under sud (`run --sud -b`, implemented)
+
+The D9 in-process advantage — brush-core as the box shell, coreutils/
+find/xargs as builtins, kati (`make`) and n2 (`ninja`) embedded, no
+sh-storm — carries over to sud boxes, and compounds: under FUSE a
+builtin's file I/O still crossed the kernel into the engine's fuser
+threads; under sud it is a SIGSYS trap handled in the SAME address
+space by the userland overlay. The pieces:
+
+- **Top level**: the traced target IS the engine binary, execed under
+  the wrapper as `sarun brush-sh -- sh -c <script>` (the explicit shim
+  subcommand; `script_from_argv` reconstructs the box command). The
+  engine is a static musl non-PIE ELF linked at the default low base —
+  no collision with the wrapper's text (sud32 at 0x20000000, sud64 at
+  0x40000000), and SUD (unlike LD_PRELOAD) traces static binaries and
+  brush's multi-threaded tokio runtime (clone3/CLONE_VM re-arming in
+  tv handler.c).
+- **Nested shells/builds**: the FUSE overlay's lazy /bin/sh + make +
+  ninja shadowing becomes `remap:` rules. Subtlety: the wrapper's exec
+  rewrite substitutes the RESOLVED target path as the child's argv[0]
+  (handler.c build_exec_argv), which would lose the invocation name
+  the engine's dispatch gates key on (is_brush_sh/is_make/is_ninja +
+  SARUN_BRUSH_SH=1). So the remap destination is a per-box symlink
+  NAMED AFTER THE TOOL (`live/<id>/shadow-bin/sh → sarun` etc.); the
+  basename survives the rewrite and the engine-state passthrough rule
+  keeps the link host-served. Rules are emitted for {/bin,/usr/bin}/
+  {sh,bash,dash,make,gmake,ninja} (the FUSE Shadows defaults; the
+  shadow_*.glob config files are not consulted — remap rules can't
+  express globs).
+- **32-bit boxes**: nothing special — brush is the 64-bit engine
+  reached through the wrapper's cross-class dir-sibling convention;
+  a sud32-traced tool exec'ing the shadowed `sh` transitions to sud64
+  like any other 64-bit child. There is no (and need be no) 32-bit
+  build of brush/the builtins.
+- **fake-exec** remains orthogonal: it elides trivial helper execs
+  (echo/true/printf) at the SUD layer for ANY sud box, brush or not.
+
+Rejected: compiling brush/builtins INTO the wrapper (it is a tiny
+freestanding fixed-address C binary — no allocator, no std), and
+cmd-rewrite `compiler-wrap` rules (its one-shot per-chain suppression
+would drop the shim for deep make→sh→make chains, and it also loses
+argv[0]).
+
+Verified by the `-b` leg of test_sud_equiv_rs.py: builtin redirect
+write, nested `/bin/sh -c` through the shim, in-process `cat`, and an
+in-process `make` recipe write — all captured, host untouched,
+field-for-field equivalent FUSE vs sud.
+
+Gaps:
+- **Semantic provenance**: no box channel exists in the traced brush
+  process, so FRAME_PROV/brushprov rows are not emitted (send_nested_
+  prov no-ops without SARUN_BROKER); per-pipeline provenance under sud
+  should eventually ride the trace stream as a synthetic event kind.
+  Process attribution still comes from the trace stream as usual.
+- Upstream bug found by this work (fixed in tv): path_remap's addin
+  parsed rules into a 16-entry array (SUD_OVERLAY_MAX_RULES) while the
+  runtime config carries 64 — the shadow rules pushed the runner past
+  16 and the trailing wide `overlay:/` rule was SILENTLY dropped,
+  letting every write land on the real host. The cap now equals
+  SUD_RULES_MAX_RULES.
+
 ## Composition: same-in-same nesting (implemented), mixed (sketch)
 
 Same-in-same nesting preserves the full model on both sides, and both

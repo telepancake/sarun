@@ -758,7 +758,8 @@ fn sud_proc_field(pid: i32, field: &str, fallback: i32) -> i32 {
 /// to sweep the upper into the box's sqlar. The register conn stays open
 /// for the duration — its EOF after the sweep is the normal box teardown.
 pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
-               net_mode: crate::net::NetMode, cmd: Vec<String>) -> i32 {
+               net_mode: crate::net::NetMode, brush: bool,
+               cmd: Vec<String>) -> i32 {
     if cmd.is_empty() {
         eprintln!("sarun-engine run --sud: needs a command");
         return 2;
@@ -878,6 +879,29 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         return 1;
     }
     eprintln!("sarun-engine: box {sid}  (sud upper: {upper})");
+    // -b brush: the box's shell IS the embedded brush, exactly like a FUSE
+    // -b box — but here brush is the TRACED TARGET: the engine binary runs
+    // under the wrapper via the explicit `brush-sh` subcommand, so brush,
+    // the coreutils builtins, find/xargs, and the embedded make (kati) /
+    // ninja (n2) all execute IN ONE traced process. The in-process
+    // advantage survives the backend swap — and compounds: a builtin's
+    // file I/O is a SIGSYS trap into the same address space (userland
+    // overlay), not a kernel round-trip into the engine's fuser threads.
+    // The FUSE shadow binds become `remap:` rules below. Gap (documented
+    // in DESIGN-sud.md): no box channel in the traced process, so brush's
+    // semantic-provenance frames are skipped (send_nested_prov no-ops
+    // without SARUN_BROKER); provenance comes from the trace stream.
+    let self_exe: Option<String> = std::env::current_exe().ok()
+        .and_then(|p| p.to_str().map(String::from));
+    let cmd = if brush {
+        let Some(exe) = self_exe.clone() else {
+            eprintln!("sarun-engine run --sud: -b needs current_exe()");
+            return 1;
+        };
+        let script = crate::brush::script_from_argv(&cmd);
+        vec![exe, "brush-sh".into(), "--".into(),
+             "sh".into(), "-c".into(), script]
+    } else { cmd };
     // Probe the target the way sudtrace did: PATH-resolve, shebang, ELF
     // class → pick sud32 or sud64 for the initial exec (the wrapper
     // handles cross-class children itself via its dir-sibling paths).
@@ -986,6 +1010,43 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                              &format!("remap:/etc/resolv.conf={}",
                                       rc_path.display())]);
                 }
+            }
+        }
+    }
+    // -b shadow rules: the sud analogue of the FUSE overlay's lazy
+    // /bin/sh + make + ninja shadowing (overlay.rs::Shadows defaults). A
+    // nested tool's execve of a shadowed path is remapped to the engine
+    // binary; argv[0] keeps the shadowed name and SARUN_BRUSH_SH=1 gates
+    // dispatch (is_brush_sh_invocation / is_make_invocation /
+    // is_ninja_invocation), so recipes run through embedded brush and
+    // make/ninja run in-process (kati/n2) — no real-shell storm. The
+    // remap matcher is component-boundary-safe (/bin/sh ≠ /bin/shred)
+    // and execve paths go through the same resolver as opens.
+    // The remap DESTINATION is a per-box symlink NAMED AFTER THE TOOL
+    // (live/<id>/shadow-bin/sh → engine), not the engine path itself:
+    // the wrapper's exec rewrite substitutes the resolved target path
+    // as the child's argv[0] (handler.c build_exec_argv), so remapping
+    // straight to the engine binary would lose the invocation name the
+    // dispatch gates key on. The symlink keeps the basename; the
+    // engine-state passthrough rule keeps the link itself host-served.
+    if brush {
+        let exe = self_exe.as_deref().unwrap_or_default();
+        sc.env("SARUN_BRUSH_SH", "1");
+        let shadow_dir = std::path::Path::new(&upper)
+            .parent().map(|p| p.join("shadow-bin"))
+            .unwrap_or_else(|| std::path::PathBuf::from("shadow-bin"));
+        let _ = std::fs::create_dir_all(&shadow_dir);
+        for name in ["sh", "bash", "dash", "make", "gmake", "ninja"] {
+            let link = shadow_dir.join(name);
+            let _ = std::fs::remove_file(&link);
+            if let Err(e) = std::os::unix::fs::symlink(exe, &link) {
+                eprintln!("sarun-engine run --sud: -b shadow link \
+                           {}: {e}", link.display());
+                return 1;
+            }
+            for dir in ["/bin", "/usr/bin"] {
+                sc.args(["--remap-rule",
+                         &format!("remap:{dir}/{name}={}", link.display())]);
             }
         }
     }

@@ -82,7 +82,11 @@ static inline long sud_ov_lstat(const char *path,
  *  Configuration storage.  Rules are owned by the addin for the
  *  lifetime of the process; never freed.
  * ---------------------------------------------------------------- */
-#define SUD_OVERLAY_MAX_RULES   16
+/* Must hold every rule the runtime config can carry: parsing into a
+ * SMALLER array silently drops the tail of the rule list — and the
+ * sarun runner puts the wide `overlay:/` capture rule LAST, so a
+ * dropped tail means writes silently land on the real host. */
+#define SUD_OVERLAY_MAX_RULES   SUD_RULES_MAX_RULES
 #define SUD_OVERLAY_MAX_LOWERS  16
 
 /* Path-rewriting rule kinds we care about (the rest are owned by

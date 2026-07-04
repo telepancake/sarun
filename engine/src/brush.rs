@@ -1415,7 +1415,7 @@ fn redirect_stdio_to_sinks() -> bool {
 
 /// Build the brush script from the box argv. `sh/bash/dash -c SCRIPT` extracts
 /// SCRIPT directly; anything else is reconstructed into a quoted command string.
-fn script_from_argv(cmd: &[String]) -> String {
+pub(crate) fn script_from_argv(cmd: &[String]) -> String {
     let base = std::path::Path::new(&cmd[0])
         .file_name().and_then(|s| s.to_str()).unwrap_or(&cmd[0]);
     if matches!(base, "sh" | "bash" | "dash" | "brush") {

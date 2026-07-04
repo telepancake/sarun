@@ -610,14 +610,14 @@ fn main() {
                 std::process::exit(2);
             }
             if sud {
-                if passthrough || direct || pty || brush || api {
+                if passthrough || direct || pty || api {
                     eprintln!("sarun: --sud is incompatible with \
-                               -t/-d/-p/-b/--api (step-1 scope, see \
+                               -t/-d/-p/--api (step-1 scope, see \
                                engine/DESIGN-sud.md)");
                     std::process::exit(2);
                 }
                 std::process::exit(
-                    runner::run_sud(name, env, chdir, net_mode, cmd));
+                    runner::run_sud(name, env, chdir, net_mode, brush, cmd));
             }
             std::process::exit(runner::run(name, passthrough, direct, env,
                 pty, brush, api, no_parent, readonly_parent, chdir,

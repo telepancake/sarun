@@ -331,6 +331,41 @@ def output_capture_32(tool32):
         host_bin.unlink(missing_ok=True)
 
 
+def brush_workload(mode):
+    """Run the same `-b` (embedded brush) workload under both backends: an
+    in-process builtin write (echo redirect), a NESTED `/bin/sh -c` (the
+    shadow shim — FUSE overlay shadow vs sud remap-to-shadow-symlink), an
+    in-process `cat`, and an in-process `make` (embedded kati/n2) whose
+    recipe writes a file. Returns observations for equivalence checks."""
+    proj = Path(tempfile.mkdtemp(prefix=f"sudeq-bproj-", dir=TMPBASE))
+    (proj / "Makefile").write_text("all:\n\techo BUILTMARK > built.txt\n")
+    eng = Engine(mode)
+    try:
+        script = ("echo TOPMARK > /root/sudeq_brush.txt && "
+                  "/bin/sh -c 'echo NESTEDMARK >> /root/sudeq_brush.txt' && "
+                  "cat /root/sudeq_brush.txt && "
+                  f"cd {proj} && make")
+        r = eng.run("BRUSHBOX", script, extra_argv=["--net", "off", "-b"])
+        if r.returncode != 0:
+            raise RuntimeError(f"{mode}: -b box rc={r.returncode}: "
+                               f"{r.stderr[-400:]}")
+        sp = eng.latest_sqlar()
+        m = eng.m
+        return {
+            "content": m.sqlar_content(sp, "root/sudeq_brush.txt"),
+            "stdout_top": "TOPMARK" in r.stdout,
+            "stdout_nested": "NESTEDMARK" in r.stdout,
+            "make_out": m.sqlar_content(
+                sp, str(proj).lstrip("/") + "/built.txt"),
+            "host_untouched": not Path("/root/sudeq_brush.txt").exists()
+                and not (proj / "built.txt").exists(),
+        }
+    finally:
+        Path("/root/sudeq_brush.txt").unlink(missing_ok=True)
+        shutil.rmtree(proj, ignore_errors=True)
+        eng.close()
+
+
 def net_capture(mode):
     """Run a tap box; return (dns_via_engine, flows_pcap). A tap box's DNS
     is answered by the engine's synthetic resolver (fake-IP range 240/8 or
@@ -444,6 +479,29 @@ def main():
                       "equiv: network capture identical across FUSE and sud")
         except Exception as e:
             print(f"  (network capture unavailable: {e})")
+
+    # ── PART A4: -b embedded-brush boxes (both backends). ──
+    try:
+        fb = brush_workload("fuse")
+        sb = brush_workload("sud")
+        for label, obs in (("fuse", fb), ("sud", sb)):
+            check(obs["content"] == b"TOPMARK\nNESTEDMARK\n",
+                  f"{label}: -b brush builtin write + nested /bin/sh shim "
+                  f"captured (got {obs['content']!r})")
+            check(obs["stdout_top"] and obs["stdout_nested"],
+                  f"{label}: -b brush stdout visible to the runner")
+            check(obs["make_out"] == b"BUILTMARK\n",
+                  f"{label}: -b in-process make (kati/n2) recipe write "
+                  f"captured (got {obs['make_out']!r})")
+            check(obs["host_untouched"],
+                  f"{label}: -b brush writes stayed in the box")
+        for field in ("content", "stdout_top", "stdout_nested",
+                      "make_out", "host_untouched"):
+            check(fb[field] == sb[field],
+                  f"equiv: -b '{field}' identical across FUSE and sud "
+                  f"(fuse={fb[field]!r} sud={sb[field]!r})")
+    except Exception as e:
+        print(f"  (-b brush workload unavailable: {e})")
 
     # ── PART B: sud-only exec capabilities. ──
     try:
