@@ -97,6 +97,34 @@ static int open_is_write(long flags)
     return (acc != O_RDONLY) || (flags & (O_CREAT | O_TRUNC));
 }
 
+/* Build the merged-absolute (virtual) path of `(dirfd, path)`.
+ * Duplicates a small piece of resolve_at logic, but keeping it
+ * self-contained avoids exposing the abs-builder in overlay.h.
+ * Returns 0 on success, -1 when the pair can't be absolutised
+ * (non-AT_FDCWD relative dirfd — not a path we track). */
+static int merged_abs_of(int dirfd, const char *path,
+                         char *buf, size_t sz)
+{
+    if (path[0] == '/') {
+        size_t n = strlen(path);
+        if (n + 1 > sz) return -1;
+        memcpy(buf, path, n + 1);
+        return 0;
+    }
+    if (dirfd != AT_FDCWD) return -1;
+    long n = raw_syscall6(SYS_readlinkat, AT_FDCWD,
+                          (long)"/proc/self/cwd",
+                          (long)buf, (long)(sz - 1), 0, 0);
+    if (n < 0) return -1;
+    buf[n] = '\0';
+    size_t cl = (size_t)n;
+    size_t pl = strlen(path);
+    if (cl + 1 + pl + 1 > sz) return -1;
+    buf[cl] = '/';
+    memcpy(buf + cl + 1, path, pl + 1);
+    return 0;
+}
+
 /* If the caller is trying to delete `(dirfd, path)`, perform the
  * delete ourselves (so we know its outcome), then create a whiteout
  * marker in upper if the same name was visible from a lower layer.
@@ -116,31 +144,10 @@ static int handle_delete(struct sud_syscall_ctx *ctx, int dirfd_idx,
     if (!path) return 0;
 
     /* Build the merged-absolute path BEFORE resolution so we can
-     * decide whether a whiteout is needed.  This duplicates a small
-     * piece of resolve_at logic, but keeping it self-contained avoids
-     * exposing the abs-builder in overlay.h. */
+     * decide whether a whiteout is needed. */
     char merged_abs[PATH_MAX];
-    if (path[0] == '/') {
-        size_t n = strlen(path);
-        if (n + 1 > sizeof(merged_abs)) return 0;
-        memcpy(merged_abs, path, n + 1);
-    } else if (dirfd == AT_FDCWD) {
-        long n = raw_syscall6(SYS_readlinkat, AT_FDCWD,
-                              (long)"/proc/self/cwd",
-                              (long)merged_abs, sizeof(merged_abs) - 1,
-                              0, 0);
-        if (n < 0) return 0;
-        merged_abs[n] = '\0';
-        size_t cl = (size_t)n;
-        size_t pl = strlen(path);
-        if (cl + 1 + pl + 1 > sizeof(merged_abs)) return 0;
-        merged_abs[cl] = '/';
-        memcpy(merged_abs + cl + 1, path, pl + 1);
-    } else {
-        /* Non-AT_FDCWD relative dirfd: not on a path we track.  Let
-         * it pass through unchanged. */
+    if (merged_abs_of(dirfd, path, merged_abs, sizeof(merged_abs)) != 0)
         return 0;
-    }
 
     /* Resolve to the upper path (write-side resolution). */
     int rc = sud_overlay_resolve(merged_abs, 1,
@@ -163,6 +170,140 @@ static int handle_delete(struct sud_syscall_ctx *ctx, int dirfd_idx,
         return short_circuit(ctx, 0);
     }
     return short_circuit(ctx, del_ret);
+}
+
+/* Overlay-aware rename, done inline (handle_delete-style).  Three
+ * things the generic two-arg rewrite got fatally wrong:
+ *   1. Both names were resolved into the SAME ctx->scratch buffer, so
+ *      the kernel saw rename(dst, dst) — and every caller's fallback
+ *      logic then ran against nonsense results (GNU mv ended up
+ *      mkdir-ing the destination as a directory via our own
+ *      ensure_parent for "dst/src" paths).
+ *   2. A source that lives only in a LOWER layer must never reach the
+ *      kernel rename: lower and upper are usually the same device, so
+ *      the rename would MOVE THE REAL HOST FILE.  Surface -EXDEV and
+ *      let the caller's standard cross-device fallback copy through
+ *      the overlay and unlink (whiteout) the source.
+ *   3. A successful upper→upper rename must whiteout the old name when
+ *      a lower layer also carries it, or the name resurfaces.
+ * `flags` are renameat2 flags (0 for rename/renameat). */
+static int handle_rename(struct sud_syscall_ctx *ctx,
+                         int olddirfd_idx, int oldpath_idx,
+                         int newdirfd_idx, int newpath_idx,
+                         long flags)
+{
+    int olddirfd = (olddirfd_idx >= 0) ? (int)ctx->args[olddirfd_idx]
+                                       : AT_FDCWD;
+    int newdirfd = (newdirfd_idx >= 0) ? (int)ctx->args[newdirfd_idx]
+                                       : AT_FDCWD;
+    const char *oldpath = (const char *)ctx->args[oldpath_idx];
+    const char *newpath = (const char *)ctx->args[newpath_idx];
+    if (!oldpath || !newpath || !ctx->scratch
+        || ctx->scratch_size < 2 * PATH_MAX)
+        return 0;
+
+    /* Disjoint scratch halves: src-read into [0], dst-write into [1]. */
+    char *sbuf = ctx->scratch;
+    char *dbuf = ctx->scratch + ctx->scratch_size / 2;
+    size_t half = ctx->scratch_size / 2;
+
+    int src_rc = sud_overlay_resolve_at(olddirfd, oldpath, 0, sbuf, half);
+    int dst_rc = sud_overlay_resolve_at(newdirfd, newpath, 1, dbuf, half);
+
+    if (src_rc == SUD_OVERLAY_PASSTHROUGH
+        && dst_rc == SUD_OVERLAY_PASSTHROUGH)
+        return 0;                      /* fully outside the overlay */
+    if (src_rc == SUD_OVERLAY_WHITEOUT)
+        return short_circuit(ctx, -ENOENT);
+    if (dst_rc == SUD_OVERLAY_READONLY)
+        return short_circuit(ctx, -EROFS);
+    if (src_rc != SUD_OVERLAY_RESOLVED || dst_rc != SUD_OVERLAY_RESOLVED)
+        /* One side inside the overlay, the other outside (a carve-out
+         * or a foreign prefix): never let the kernel move bytes across
+         * the capture boundary in one call. */
+        return short_circuit(ctx, -EXDEV);
+
+    /* Is the source physically in the upper?  Compare its read-side
+     * resolution with its write-side (upper) composition. */
+    char merged_src[PATH_MAX];
+    char upper_src[PATH_MAX];
+    if (merged_abs_of(olddirfd, oldpath, merged_src,
+                      sizeof(merged_src)) != 0)
+        return short_circuit(ctx, -EXDEV);
+    if (sud_overlay_resolve(merged_src, 1, upper_src, sizeof(upper_src))
+            != SUD_OVERLAY_RESOLVED
+        || strcmp(sbuf, upper_src) != 0)
+        /* Source lives in a lower layer (or host): a kernel rename
+         * would move the REAL lower file into the upper.  -EXDEV makes
+         * the caller fall back to copy(read-through-overlay) + unlink
+         * (whiteout machinery). */
+        return short_circuit(ctx, -EXDEV);
+
+#ifdef __NR_renameat2
+    long ret = raw_syscall6(__NR_renameat2, AT_FDCWD, (long)upper_src,
+                            AT_FDCWD, (long)dbuf, flags, 0);
+#else
+    long ret = flags ? -EINVAL
+                     : raw_syscall6(__NR_renameat, AT_FDCWD,
+                                    (long)upper_src, AT_FDCWD,
+                                    (long)dbuf, 0, 0);
+#endif
+    if (ret == 0)
+        /* The old NAME is gone from the upper; if a lower still shows
+         * it, shadow it.  create_whiteout is a no-op when no lower
+         * carries the name. */
+        (void)sud_overlay_create_whiteout(merged_src);
+    return short_circuit(ctx, ret);
+}
+
+/* Overlay-aware link: same two-buffer discipline as handle_rename
+ * (the old shared-scratch rewrite produced link(dst,dst)), and the
+ * same lower-source guard — hardlinking a LOWER file into the upper
+ * would alias the REAL host inode, so later writes through the new
+ * name would mutate the host.  -EXDEV sends the caller to its
+ * standard copy fallback.  No whiteout: link leaves the source. */
+static int handle_link(struct sud_syscall_ctx *ctx,
+                       int olddirfd_idx, int oldpath_idx,
+                       int newdirfd_idx, int newpath_idx)
+{
+    int olddirfd = (olddirfd_idx >= 0) ? (int)ctx->args[olddirfd_idx]
+                                       : AT_FDCWD;
+    int newdirfd = (newdirfd_idx >= 0) ? (int)ctx->args[newdirfd_idx]
+                                       : AT_FDCWD;
+    const char *oldpath = (const char *)ctx->args[oldpath_idx];
+    const char *newpath = (const char *)ctx->args[newpath_idx];
+    if (!oldpath || !newpath || !ctx->scratch
+        || ctx->scratch_size < 2 * PATH_MAX)
+        return 0;
+    char *sbuf = ctx->scratch;
+    char *dbuf = ctx->scratch + ctx->scratch_size / 2;
+    size_t half = ctx->scratch_size / 2;
+
+    int src_rc = sud_overlay_resolve_at(olddirfd, oldpath, 0, sbuf, half);
+    int dst_rc = sud_overlay_resolve_at(newdirfd, newpath, 1, dbuf, half);
+    if (src_rc == SUD_OVERLAY_PASSTHROUGH
+        && dst_rc == SUD_OVERLAY_PASSTHROUGH)
+        return 0;
+    if (src_rc == SUD_OVERLAY_WHITEOUT)
+        return short_circuit(ctx, -ENOENT);
+    if (dst_rc == SUD_OVERLAY_READONLY)
+        return short_circuit(ctx, -EROFS);
+    if (src_rc != SUD_OVERLAY_RESOLVED || dst_rc != SUD_OVERLAY_RESOLVED)
+        return short_circuit(ctx, -EXDEV);
+
+    char merged_src[PATH_MAX];
+    char upper_src[PATH_MAX];
+    if (merged_abs_of(olddirfd, oldpath, merged_src,
+                      sizeof(merged_src)) != 0)
+        return short_circuit(ctx, -EXDEV);
+    if (sud_overlay_resolve(merged_src, 1, upper_src, sizeof(upper_src))
+            != SUD_OVERLAY_RESOLVED
+        || strcmp(sbuf, upper_src) != 0)
+        return short_circuit(ctx, -EXDEV);
+
+    long ret = raw_syscall6(__NR_linkat, AT_FDCWD, (long)upper_src,
+                            AT_FDCWD, (long)dbuf, 0, 0);
+    return short_circuit(ctx, ret);
 }
 
 static void path_remap_init(void)
@@ -914,44 +1055,24 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
     }
 #endif
 #ifdef __NR_link
-    if (nr == __NR_link) {
-        int rc1 = remap_path_arg(ctx, 0, 0);
-        if (handle_overlay_result(ctx, rc1)) return 1;
-        int rc2 = remap_path_arg(ctx, 1, 1);
-        return handle_overlay_result(ctx, rc2);
-    }
+    if (nr == __NR_link)
+        return handle_link(ctx, -1, 0, -1, 1);
 #endif
 #ifdef __NR_linkat
-    if (nr == __NR_linkat) {
-        int rc1 = remap_path_arg_at(ctx, 0, 1, 0);
-        if (handle_overlay_result(ctx, rc1)) return 1;
-        int rc2 = remap_path_arg_at(ctx, 2, 3, 1);
-        return handle_overlay_result(ctx, rc2);
-    }
+    if (nr == __NR_linkat)
+        return handle_link(ctx, 0, 1, 2, 3);
 #endif
 #ifdef __NR_rename
-    if (nr == __NR_rename) {
-        int rc1 = remap_path_arg(ctx, 0, 1);
-        if (handle_overlay_result(ctx, rc1)) return 1;
-        int rc2 = remap_path_arg(ctx, 1, 1);
-        return handle_overlay_result(ctx, rc2);
-    }
+    if (nr == __NR_rename)
+        return handle_rename(ctx, -1, 0, -1, 1, 0);
 #endif
 #ifdef __NR_renameat
-    if (nr == __NR_renameat) {
-        int rc1 = remap_path_arg_at(ctx, 0, 1, 1);
-        if (handle_overlay_result(ctx, rc1)) return 1;
-        int rc2 = remap_path_arg_at(ctx, 2, 3, 1);
-        return handle_overlay_result(ctx, rc2);
-    }
+    if (nr == __NR_renameat)
+        return handle_rename(ctx, 0, 1, 2, 3, 0);
 #endif
 #ifdef __NR_renameat2
-    if (nr == __NR_renameat2) {
-        int rc1 = remap_path_arg_at(ctx, 0, 1, 1);
-        if (handle_overlay_result(ctx, rc1)) return 1;
-        int rc2 = remap_path_arg_at(ctx, 2, 3, 1);
-        return handle_overlay_result(ctx, rc2);
-    }
+    if (nr == __NR_renameat2)
+        return handle_rename(ctx, 0, 1, 2, 3, ctx->args[4]);
 #endif
 #ifdef __NR_truncate
     if (nr == __NR_truncate) {

@@ -744,6 +744,41 @@ int sud_overlay_open_dir(const char *path, int flags, int mode)
         return (int)fd;
     }
 
+    /* Only synthesize when the merged view actually HAS this
+     * directory.  Walk upper → lowers in priority order (whiteouts
+     * hide everything below, same as the resolve walk).  Without this
+     * check a directory-open of a NONEXISTENT name returned a valid
+     * (empty) synth dir fd — callers that probe "is dst a dir?" with
+     * open(O_DIRECTORY) (GNU mv does) then concluded yes and composed
+     * dst/src paths, materializing phantom directories in the upper. */
+    {
+        struct sud_overlay_stat st;
+        const char *upper     = rule_upper(r);
+        size_t      upper_len = rule_upper_len(r);
+        int found_dir = 0, found_other = 0;
+        char probe[PATH_MAX];
+        if (upper
+            && compose_layer(probe, sizeof(probe),
+                             upper, upper_len, tail) >= 0
+            && stat_one(probe, &st) == 0) {
+            if (is_whiteout_st(&st)) return -ENOENT;
+            if ((st.st_mode & S_IFMT) == S_IFDIR) found_dir = 1;
+            else found_other = 1;
+        }
+        int lc = rule_lower_count(r);
+        for (int i = 0; !found_dir && !found_other && i < lc; i++) {
+            if (compose_layer(probe, sizeof(probe), rule_lower(r, i),
+                              rule_lower_len(r, i), tail) < 0)
+                continue;
+            if (stat_one(probe, &st) != 0) continue;
+            if (is_whiteout_st(&st)) return -ENOENT;
+            if ((st.st_mode & S_IFMT) == S_IFDIR) found_dir = 1;
+            else found_other = 1;
+        }
+        if (found_other) return SUD_OVERLAY_NO_DIR; /* kernel → ENOTDIR */
+        if (!found_dir)  return -ENOENT;
+    }
+
     /* Build synth dir: /tmp/.sud-overlay/<pid>/<seq>/.  Atomic
      * increment makes the seq counter race-safe across SIGSYS
      * handlers running concurrently on different threads. */
