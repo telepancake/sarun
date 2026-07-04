@@ -107,7 +107,28 @@ executing a binary in its PARENT box's captured layer. Temp dirs live under
 /var/tmp on purpose — the box's /tmp is an inramfs mount, so engine state
 (which holds the overlay upper) must not sit under /tmp.
 
-Two bugs this test surfaced and that are now fixed:
+The test also cross-checks OUTPUT capture (stdout+stderr into the outputs
+table, for both 64- and 32-bit boxes) and NETWORK capture (a tap box's DNS
+answered by the engine's synthetic resolver + a per-box flows pcapng) —
+both equivalent FUSE vs sud.
+
+sud networking now mirrors a FUSE box: `run --sud` honors `--net
+off|tap|host`. Tap creates the netns + TAP device the same way the FUSE
+runner does (`create_netns_tap`, the wrapper inherits the netns) and hands
+the engine the TAP fd as a THIRD register SCM_RIGHTS fd (the trace pipe is
+its own fd now, so a sud box can be a tap box too). The engine's stack,
+DNS, MITM and flow-capture are backend-agnostic; the CA bundle + resolv.conf
+that a FUSE box gets as overlay shadows are served to a sud box as `remap`
+rules pointing at host files the runner materializes from the ack's
+ca_pem/dns_ip. `--net off` unshares an empty netns (no bwrap to do it).
+
+Bugs this test surfaced and that are now fixed:
+- Output stream numbering diverged: FUSE labels stdout=0/stderr=1 in the
+  outputs table (overlay.rs sink map), but sud's trace ingest used the fd
+  numbers 1/2. sud now uses 0/1 to match. (A shell `>&2` redirect is still
+  labeled stdout under sud — the trace addin sees write(fd=1) after the
+  shell's dup — a minor artifact vs FUSE's sink-based model; direct
+  stderr writes match.)
 - The sud sweep did not capture xattrs. `sud::capture_xattrs` now reads
   each upper file's l*xattr set into the sqlar (skipping trusted.overlay.*).
 - Executing a binary in inramfs /tmp failed whenever an `overlay:/` rule

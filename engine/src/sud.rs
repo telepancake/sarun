@@ -153,8 +153,10 @@ fn apply_event(b: &BoxState, st: &Stream,
             let w = b.writer_for(ev.tgid as u32);
             st.writers.lock().unwrap().insert(rel, w);
         }
-        sudwire::EV_STDOUT => b.add_output(1, ev.tgid as u32, &ev.blob),
-        sudwire::EV_STDERR => b.add_output(2, ev.tgid as u32, &ev.blob),
+        // Match the FUSE sink numbering in overlay.rs: stdout = 0, stderr
+        // = 1 (NOT the fd numbers) so the outputs table is backend-identical.
+        sudwire::EV_STDOUT => b.add_output(0, ev.tgid as u32, &ev.blob),
+        sudwire::EV_STDERR => b.add_output(1, ev.tgid as u32, &ev.blob),
         _ => {}
     }
 }

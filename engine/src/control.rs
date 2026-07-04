@@ -478,7 +478,7 @@ pub fn broadcast(state: &State, ev: &Value) {
 /// TAP fd as a second fd). Return (pidfd, tap_fd): keep both, close any extras.
 /// MSG_PEEK leaves the data bytes queued for the BufReader, and the real
 /// (no-ancillary) read later discards the duplicate fd delivery.
-fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>) {
+fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>, Option<i32>) {
     // Wait (bounded) for the first bytes to arrive before peeking: the runner's
     // sendmsg may still be in flight when we accept, and a non-blocking peek
     // that races ahead of it would miss the pidfd — dropping a nested box's
@@ -487,7 +487,7 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>) {
     let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
     let pr = unsafe { libc::poll(&mut pfd, 1, 30_000) };
     if pr <= 0 {
-        return (None, None);
+        return (None, None, None);
     }
     let mut fdbuf = [0i32; 8];
     let mut io = [0u8; 1];
@@ -502,12 +502,15 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>) {
     msg.msg_controllen = cmsg.len() as _;
     let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_PEEK) };
     if n < 0 {
-        return (None, None);
+        return (None, None, None);
     }
-    // Keep the FIRST fd (pidfd) and the SECOND (tap fd, tap boxes only); close
-    // any beyond.
+    // Keep up to THREE fds in order: [pidfd, then optionally a TAP fd, then
+    // optionally a sud trace-pipe fd]. The runner sends them in that fixed
+    // order; `register` assigns roles from want_sud + net_mode (a sud+tap
+    // box sends all three; a fuse+tap box sends two; a plain box sends one).
     let mut first: Option<i32> = None;
     let mut second: Option<i32> = None;
+    let mut third: Option<i32> = None;
     unsafe {
         let mut c = libc::CMSG_FIRSTHDR(&msg);
         while !c.is_null() {
@@ -523,6 +526,8 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>) {
                         first = Some(fdbuf[i]);
                     } else if second.is_none() {
                         second = Some(fdbuf[i]);
+                    } else if third.is_none() {
+                        third = Some(fdbuf[i]);
                     } else {
                         libc::close(fdbuf[i]);
                     }
@@ -531,14 +536,14 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>) {
             c = libc::CMSG_NXTHDR(&msg, c);
         }
     }
-    (first, second)
+    (first, second, third)
 }
 
 fn dispatch(state: &State, msg: &Value) -> Value {
     let t = msg.get("type").and_then(Value::as_str).unwrap_or("");
     match t {
         "subscribe" => json!({"ok": true, "_subscribe": true}),
-        "register" => register(state, msg, None, None),
+        "register" => register(state, msg, None, None, None),
         "select" => {
             let sid = msg.get("sid").and_then(Value::as_str).map(String::from);
             let boxes = discover::discover();
@@ -912,10 +917,31 @@ fn valid_name(s: &str) -> bool {
 /// return when the caller's loop tears down). Capture mode stays downgraded in
 /// the ack (no echo/sinks yet — runner behaves as -t passthrough).
 fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
-            tap_fd_raw: Option<i32>) -> Value {
-    // Own the runner's TAP fd (tap mode) so EVERY early-return path below closes
-    // it automatically; it's moved into prepare_net only on the success path.
-    let tap_fd: Option<std::os::fd::OwnedFd> = tap_fd_raw.map(|fd| unsafe {
+            fd2_raw: Option<i32>, fd3_raw: Option<i32>) -> Value {
+    // Assign the post-pidfd SCM_RIGHTS fds to roles from the message. The
+    // runner sends them in a fixed order: [tap (if net_mode==tap)] then
+    // [sud trace pipe (if want_sud)]. So:
+    //   fuse+tap : fd2=tap
+    //   sud+tap  : fd2=tap,   fd3=trace
+    //   sud+!tap : fd2=trace
+    // Own each as an OwnedFd so every early-return path closes it; the tap
+    // fd moves into prepare_net and the trace fd into stream_events only on
+    // the success path.
+    let want_sud_fd = msg.get("want_sud").and_then(Value::as_bool).unwrap_or(false);
+    let is_tap_fd = msg.get("net_mode").and_then(Value::as_str) == Some("tap");
+    let (tap_raw, trace_raw) = match (want_sud_fd, is_tap_fd) {
+        (true, true) => (fd2_raw, fd3_raw),
+        (true, false) => (None, fd2_raw),
+        (false, _) => (fd2_raw, None),
+    };
+    // Close any fd that didn't get a role (shouldn't happen in normal flow).
+    if want_sud_fd && !is_tap_fd {
+        if let Some(fd) = fd3_raw { unsafe { libc::close(fd); } }
+    }
+    let tap_fd: Option<std::os::fd::OwnedFd> = tap_raw.map(|fd| unsafe {
+        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+    });
+    let sud_trace_owned: Option<std::os::fd::OwnedFd> = trace_raw.map(|fd| unsafe {
         <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
     });
     let ov = lock(state).overlay.clone();
@@ -1032,13 +1058,12 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     // --sud (WIP, see engine/DESIGN-sud.md): the box runs under the sud64
     // wrapper with a directory upper instead of on the FUSE mount. Create
     // the upper here so the ack can hand its path to the runner; the
-    // post-exit `sud_ingest` verb sweeps it into this BoxState. The
-    // register's SECOND SCM_RIGHTS fd (tap's slot — a sud box is net-host)
-    // is the read end of the fd-1023 trace pipe: stolen from the tap
-    // Option here, streamed by sud::stream_events after add_box below.
+    // post-exit `sud_ingest` verb sweeps it into this BoxState. The trace
+    // pipe (fd-1023 read end) came in as its own SCM_RIGHTS fd
+    // (sud_trace_owned), separate from the tap fd — so a sud box can be a
+    // TAP box too (tap fd → prepare_net, trace fd → stream_events).
     let want_sud = msg.get("want_sud").and_then(Value::as_bool).unwrap_or(false);
-    let mut sud_trace_fd: Option<std::os::fd::OwnedFd> = None;
-    let mut tap_fd = tap_fd;
+    let mut sud_trace_fd: Option<std::os::fd::OwnedFd> = sud_trace_owned;
     if want_sud {
         let up = backing.join("sud-up");
         if let Err(e) = std::fs::create_dir_all(&up) {
@@ -1046,7 +1071,6 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
             return json!({"ok": false, "error": format!("sud upper: {e}")});
         }
         b.set_meta("sud", "1");
-        sud_trace_fd = tap_fd.take();
     }
     // D-parent: `want_no_parent` strips any kernel-derived parent AND closes
     // the lower chain so reads never fall through to the real host. It's the
@@ -2366,10 +2390,15 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
     // The register handshake carries the runner's pidfd as the connection's
     // first SCM_RIGHTS fd; keep it for host-pid derivation + kill. It belongs
     // to the FIRST message only (a register); close it if that never comes.
-    let (mut peer_pidfd, peer_tapfd_raw) = recv_first_fd(&conn);
-    // The TAP fd (tap boxes) rides the register message's SCM_RIGHTS. Own it so
-    // every non-register path drops → closes it; the register call takes it.
+    let (mut peer_pidfd, peer_tapfd_raw, peer_thirdfd_raw) = recv_first_fd(&conn);
+    // The TAP fd (tap boxes) and the sud trace-pipe fd (sud boxes) ride the
+    // register message's SCM_RIGHTS after the pidfd. Own both so every
+    // non-register path drops → closes them; the register call takes them and
+    // sorts roles by want_sud + net_mode.
     let mut peer_tapfd: Option<std::os::fd::OwnedFd> = peer_tapfd_raw.map(|fd| unsafe {
+        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+    });
+    let mut peer_thirdfd: Option<std::os::fd::OwnedFd> = peer_thirdfd_raw.map(|fd| unsafe {
         <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
     });
     let mut reader = BufReader::new(match conn.try_clone() {
@@ -2599,6 +2628,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         let mut reply = if msg.get("type").and_then(Value::as_str) == Some("register") {
             register(&state, &msg, peer_pidfd.take(),
                      peer_tapfd.take().map(|f|
+                         <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(f)),
+                     peer_thirdfd.take().map(|f|
                          <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(f)))
         } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_nested") {
             // D9 nested-shell provenance: a one-shot control message from the

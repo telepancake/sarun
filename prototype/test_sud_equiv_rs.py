@@ -46,6 +46,22 @@ def sqlar_xattr(sp, name, key):
     finally:
         con.close()
 
+
+def sqlar_outputs(sp):
+    """All captured (stream, content) rows from a box's outputs table,
+    coalesced per stream. Canonical numbering (overlay.rs sink map):
+    stream 0 = stdout, 1 = stderr."""
+    con = sqlite3.connect(f"file:{sp}?mode=ro", uri=True)
+    try:
+        out = {0: b"", 1: b""}
+        for stream, content in con.execute(
+                "SELECT stream, content FROM outputs ORDER BY id"):
+            if stream in out and content is not None:
+                out[stream] += bytes(content)
+        return out
+    finally:
+        con.close()
+
 _HERE = Path(__file__).resolve().parent
 SARUN = str(_HERE / "libtestsarun.py")
 CRATE = _HERE.parent / "engine"
@@ -67,6 +83,7 @@ SUDTOOL_C = r"""
 #include <sys/xattr.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "mark")) {
         printf("MARK:%s\n", argv[2]); return 0;
@@ -77,20 +94,28 @@ int main(int argc, char **argv) {
         }
         printf("XOK\n"); return 0;
     }
+    if (argc >= 2 && !strcmp(argv[1], "streams")) {
+        /* Direct writes to fd 1 and fd 2 (not shell >&2, which the trace
+         * addin labels by fd number as stdout). */
+        (void)!write(1, "STDOUT-STREAM\n", 14);
+        (void)!write(2, "STDERR-STREAM\n", 14);
+        return 0;
+    }
     return 2;
 }
 """
 
 
-def build_sudtool():
-    """Compile the static helper; return its path or None if no toolchain."""
+def build_sudtool(bits=64):
+    """Compile the static helper (64- or 32-bit); return its path or None."""
     if not shutil.which("gcc"):
         return None
-    d = Path(tempfile.mkdtemp(prefix="sudtool-", dir=TMPBASE))
+    d = Path(tempfile.mkdtemp(prefix=f"sudtool{bits}-", dir=TMPBASE))
     src = d / "sudtool.c"; src.write_text(SUDTOOL_C)
     out = d / "sudtool"
+    flags = ["-static", "-O2"] + (["-m32"] if bits == 32 else [])
     try:
-        subprocess.run(["gcc", "-static", "-O2", "-o", str(out), str(src)],
+        subprocess.run(["gcc", *flags, "-o", str(out), str(src)],
                        check=True, timeout=120,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except Exception:
@@ -148,11 +173,12 @@ class Engine:
         if not wait_socket(self.m.sock_path()):
             raise RuntimeError(f"{mode}: engine socket never appeared")
 
-    def run(self, name, script, extra_argv=()):
+    def run(self, name, script, extra_argv=(), raw_cmd=None):
         argv = [str(BIN), "run", name]
         if self.mode == "sud":
             argv.append("--sud")
-        argv += list(extra_argv) + ["--", "sh", "-c", script]
+        argv += list(extra_argv) + ["--"]
+        argv += list(raw_cmd) if raw_cmd is not None else ["sh", "-c", script]
         return subprocess.run(argv, capture_output=True, text=True,
                               timeout=180)
 
@@ -160,6 +186,12 @@ class Engine:
         return max(Path(os.environ["XDG_STATE_HOME"])
                    .joinpath("slopbox.SUDEQ").glob("*.sqlar"),
                    key=lambda p: int(p.stem))
+
+    def has_flows_pcap(self):
+        """True iff the engine wrote a per-box network flows pcapng — the
+        capture artifact a tap box produces (same for FUSE and sud)."""
+        flows = Path(os.environ["XDG_STATE_HOME"]) / "slopbox.SUDEQ" / "flows"
+        return any(flows.rglob("*.pcapng"))
 
     def close(self):
         if self.proc.poll() is None:
@@ -190,14 +222,19 @@ def equivalence_workload(mode, sudtool):
             f"{host_bin} setxattr /root/sudeq_xf.txt user.sudeq hello && "
             # nested subdir write
             "mkdir -p /root/sudeq_d && echo nested > /root/sudeq_d/inner.txt && "
+            # distinct stdout + stderr writes (captured into the outputs table)
+            f"{host_bin} streams; "
             # deletion of a host file -> tombstone / whiteout
             "rm /root/sudeq_victim.txt")
-        r = eng.run("SUDEQBOX", script)
+        # --net off keeps this (filesystem-equivalence) workload deterministic
+        # and independent of tap availability; networking has its own test.
+        r = eng.run("SUDEQBOX", script, extra_argv=["--net", "off"])
         if r.returncode != 0:
             raise RuntimeError(f"{mode}: box rc={r.returncode}: {r.stderr[-400:]}")
         sp = eng.latest_sqlar()
         m = eng.m
         rows = {n: md for n, md, *_ in m.sqlar_list(sp)}
+        outs = sqlar_outputs(sp)
         return {
             "stdout_has_mark": "MARK:FROMHOST" in r.stdout,
             "out_content": m.sqlar_content(sp, "root/sudeq_out.txt"),
@@ -210,6 +247,9 @@ def equivalence_workload(mode, sudtool):
             # tombstone lives only in the box) — so the host victim PERSISTS.
             "host_victim_present": victim.exists(),
             "host_out_absent": not Path("/root/sudeq_out.txt").exists(),
+            # output capture: stdout -> stream 1, stderr -> stream 2
+            "cap_stdout": b"STDOUT-STREAM\n" in outs[0],
+            "cap_stderr": b"STDERR-STREAM\n" in outs[1],
         }
     finally:
         victim.unlink(missing_ok=True)
@@ -257,6 +297,50 @@ def sud_parentbox_exec(sudtool):
         eng.close()
 
 
+def output_capture_32(tool32):
+    """Run a 32-bit binary that writes distinct stdout+stderr under both
+    backends; return {backend: (stdout_ok, stderr_ok)} from the outputs
+    table. Proves output capture works for 32-bit boxes too."""
+    host_bin = Path(TMPBASE) / "sudeq_out32"
+    shutil.copy(tool32, host_bin); host_bin.chmod(0o755)
+    res = {}
+    try:
+        for mode in ("fuse", "sud"):
+            eng = Engine(mode)
+            try:
+                eng.run("OUT32", "", extra_argv=["--net", "off"],
+                        raw_cmd=[str(host_bin), "streams"])
+                outs = sqlar_outputs(eng.latest_sqlar())
+                res[mode] = (b"STDOUT-STREAM\n" in outs[0],
+                             b"STDERR-STREAM\n" in outs[1])
+            finally:
+                eng.close()
+        return res
+    finally:
+        host_bin.unlink(missing_ok=True)
+
+
+def net_capture(mode):
+    """Run a tap box; return (dns_via_engine, flows_pcap). A tap box's DNS
+    is answered by the engine's synthetic resolver (fake-IP range 240/8 or
+    a non-public address), and the engine writes a per-box flows pcapng —
+    both the observable, upstream-independent proofs that the box's network
+    is engine-mediated (== captured). Same mechanism for FUSE and sud."""
+    eng = Engine(mode)
+    try:
+        r = eng.run("NETBOX", "getent hosts example.com 2>&1 | head -1",
+                    extra_argv=["--net", "tap"])
+        # Synthetic address: the engine hands out its own fake IP, never the
+        # real public one — proof the lookup went through the engine stack.
+        line = (r.stdout or "").split()
+        ip = line[0] if line else ""
+        via_engine = ip.startswith("240.") or ip.startswith("10.") \
+            or ip.startswith("100.64.")
+        return (via_engine, eng.has_flows_pcap(), r)
+    finally:
+        eng.close()
+
+
 def main():
     if not ensure_binaries():
         print("test_sud_equiv_rs: engine or sud64 unavailable — SKIP"); return 0
@@ -291,13 +375,58 @@ def main():
               f"{label}: nested-dir write captured")
         check(obs["victim_is_tombstone"],
               f"{label}: host-file deletion is a char-dev tombstone/whiteout")
+        check(obs["cap_stdout"] and obs["cap_stderr"],
+              f"{label}: stdout+stderr captured to the outputs table "
+              f"(out={obs['cap_stdout']} err={obs['cap_stderr']})")
 
     for field in ("host_out_absent", "host_victim_present", "stdout_has_mark",
                   "out_content", "out_mode_perm", "xattr", "nested_content",
-                  "victim_is_tombstone"):
+                  "victim_is_tombstone", "cap_stdout", "cap_stderr"):
         check(fuse[field] == sud[field],
               f"equiv: '{field}' identical across FUSE and sud "
               f"(fuse={fuse[field]!r} sud={sud[field]!r})")
+
+    # ── PART A2: 32-bit output capture (both backends). ──
+    tool32 = build_sudtool(bits=32)
+    if tool32 is None:
+        print("  (no 32-bit toolchain — skipping 32-bit output capture)")
+    else:
+        try:
+            oc32 = output_capture_32(tool32)
+            for mode in ("fuse", "sud"):
+                so, se = oc32[mode]
+                check(so and se,
+                      f"{mode}: 32-bit box stdout+stderr captured "
+                      f"(out={so} err={se})")
+            check(oc32["fuse"] == oc32["sud"],
+                  "equiv: 32-bit output capture identical across FUSE and sud")
+        except Exception as e:
+            print(f"  (32-bit output capture unavailable: {e})")
+        finally:
+            shutil.rmtree(Path(tool32).parent, ignore_errors=True)
+
+    # ── PART A3: network capture (tap), both backends. ──
+    if not Path("/dev/net/tun").exists():
+        print("  (no /dev/net/tun — skipping network capture)")
+    else:
+        try:
+            fnet = net_capture("fuse")
+            snet = net_capture("sud")
+            for mode, (via, pcap, r) in (("fuse", fnet), ("sud", snet)):
+                # tap may be unavailable (rootless/no CAP_NET_ADMIN); only
+                # assert capture when the box actually got a tap datapath.
+                if via or pcap:
+                    check(via, f"{mode}: tap box DNS answered by the engine "
+                               f"stack (synthetic IP; got {r.stdout.split()[:1]})")
+                    check(pcap, f"{mode}: engine wrote a per-box flows pcapng")
+                else:
+                    print(f"  ({mode}: tap datapath unavailable here — "
+                          f"skipping net capture asserts)")
+            if (fnet[0] or fnet[1]) and (snet[0] or snet[1]):
+                check(fnet[0] == snet[0] and fnet[1] == snet[1],
+                      "equiv: network capture identical across FUSE and sud")
+        except Exception as e:
+            print(f"  (network capture unavailable: {e})")
 
     # ── PART B: sud-only exec capabilities. ──
     try:

@@ -616,7 +616,8 @@ fn main() {
                                engine/DESIGN-sud.md)");
                     std::process::exit(2);
                 }
-                std::process::exit(runner::run_sud(name, env, chdir, cmd));
+                std::process::exit(
+                    runner::run_sud(name, env, chdir, net_mode, cmd));
             }
             std::process::exit(runner::run(name, passthrough, direct, env,
                 pty, brush, api, no_parent, readonly_parent, chdir,

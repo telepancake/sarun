@@ -164,7 +164,12 @@ pub fn create_netns_tap() -> Result<OwnedFd> {
 /// map would drop them across an execve, but we never exec here. bwrap, run
 /// later, makes its own nested userns for the box and inherits this netns
 /// (it is run WITHOUT --unshare-net).
-fn unshare_netns() -> Result<()> {
+/// Move THIS process into a fresh (empty) network namespace, acquiring the
+/// capability via a user namespace when unprivileged. Used by `--net off`
+/// sud boxes to get a namespace where every dial fails closed (the sud
+/// wrapper has no bwrap `--unshare-net` to do it). Public so the runner can
+/// call it directly.
+pub fn unshare_netns() -> Result<()> {
     if unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0 {
         return Ok(());
     }

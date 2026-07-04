@@ -94,11 +94,20 @@ pub fn runner_broker_handoff_pub(fd: i32) { runner_broker_handoff(fd) }
 /// runners, where our own getpid() is a parent-namespace pid the engine can't
 /// use. Returns false on write error.
 fn send_register(conn: &UnixStream, line: &[u8], pidfd: i32, tap_fd: Option<i32>) -> bool {
-    // The engine peeks these in order: fd[0] = pidfd (host-pid identity),
-    // fd[1] = TAP fd for a `tap` box (the netns/device the runner just made).
-    let mut fds: Vec<i32> = Vec::with_capacity(2);
+    send_register_fds(conn, line, pidfd, tap_fd, None)
+}
+
+/// Like send_register but with an ORDERED extra-fd tail after the pidfd:
+/// fd[0] = pidfd, then the TAP fd (tap boxes), then the sud trace-pipe fd
+/// (sud boxes). The engine (recv_first_fd + register) assigns roles from the
+/// same want_sud/net_mode it reads out of `line`, so the order must match:
+/// [pidfd, tap?, trace?].
+fn send_register_fds(conn: &UnixStream, line: &[u8], pidfd: i32,
+                     tap_fd: Option<i32>, trace_fd: Option<i32>) -> bool {
+    let mut fds: Vec<i32> = Vec::with_capacity(3);
     if pidfd >= 0 { fds.push(pidfd); }
     if let Some(t) = tap_fd { fds.push(t); }
+    if let Some(t) = trace_fd { fds.push(t); }
     if fds.is_empty() {
         return conn_write_all(conn, line);
     }
@@ -107,7 +116,7 @@ fn send_register(conn: &UnixStream, line: &[u8], pidfd: i32, tap_fd: Option<i32>
         iov_base: line.as_ptr() as *mut libc::c_void,
         iov_len: line.len(),
     };
-    let mut cmsg = [0u8; 64]; // CMSG_SPACE(2 * sizeof(i32)) rounded up
+    let mut cmsg = [0u8; 64]; // CMSG_SPACE(3 * sizeof(i32)) rounded up
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -749,7 +758,7 @@ fn sud_proc_field(pid: i32, field: &str, fallback: i32) -> i32 {
 /// to sweep the upper into the box's sqlar. The register conn stays open
 /// for the duration — its EOF after the sweep is the normal box teardown.
 pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
-               cmd: Vec<String>) -> i32 {
+               net_mode: crate::net::NetMode, cmd: Vec<String>) -> i32 {
     if cmd.is_empty() {
         eprintln!("sarun-engine run --sud: needs a command");
         return 2;
@@ -780,11 +789,9 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
             return 3;
         }
     };
-    // Trace pipe: the wrapper contract's fd 1023 becomes the WRITE end of
-    // a pipe whose READ end rides to the engine as register's second
-    // SCM_RIGHTS fd (the slot tap boxes use for the TAP fd — a sud box is
-    // net-host, so it's free). The engine streams events live and tees
-    // the raw bytes to live/<id>/sud.trace.
+    // Trace pipe: the wrapper contract's fd 1023 becomes the WRITE end of a
+    // pipe whose READ end rides to the engine as an SCM_RIGHTS fd; the engine
+    // streams events live and tees the raw bytes to live/<id>/sud.trace.
     let mut pfd = [0i32; 2];
     if unsafe { libc::pipe(pfd.as_mut_ptr()) } < 0 {
         eprintln!("sarun-engine: trace pipe: {}",
@@ -792,22 +799,52 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         return 1;
     }
     let (trace_r, trace_w) = (pfd[0], pfd[1]);
+    // Networking: same as a FUSE box. Tap mode → WE create the netns + TAP
+    // device (unshare(CLONE_NEWNET) moves THIS process into the fresh netns;
+    // the wrapper, spawned later, inherits it) and hand the engine the TAP
+    // fd; the engine wires it to its in-process TCP/IP stack (DHCP, DNS,
+    // HTTPS MITM). Off → an empty netns (every dial fails closed). Host →
+    // share the launcher's netns. Fail LOUD on tap setup error.
+    let tap_fd: Option<std::os::fd::OwnedFd> =
+        if net_mode == crate::net::NetMode::Tap {
+            match crate::net::tap::create_netns_tap() {
+                Ok(fd) => Some(fd),
+                Err(e) => {
+                    eprintln!("sarun-engine run --sud: tap setup failed: {e}");
+                    eprintln!("hint: `ls -l /dev/net/tun` should be 0666; \
+                               otherwise pass `--net host` or `--net off`");
+                    unsafe { libc::close(trace_r); libc::close(trace_w); }
+                    return 1;
+                }
+            }
+        } else { None };
+    if net_mode == crate::net::NetMode::Off {
+        // Empty netns so every dial fails closed — the wrapper (spawned
+        // later in this process's netns) inherits it. No bwrap to do it.
+        if let Err(e) = crate::net::tap::unshare_netns() {
+            eprintln!("sarun-engine run --sud: --net off netns: {e}");
+            unsafe { libc::close(trace_r); libc::close(trace_w); }
+            return 1;
+        }
+    }
     let reg = json!({"type": "register",
                      "cmd": cmd, "prov": provenance(&cmd, env),
                      "want_capture": false,
                      "want_direct": false,
                      "want_env": env,
                      "want_sud": true,
-                     "net_mode": "host",
+                     "net_mode": net_mode.as_str(),
                      "session_id": name.clone().unwrap_or_default(),
                      "want_rerun": name.is_some()});
     let pidfd = pidfd_open(std::process::id() as i32);
-    if !send_register(&conn, format!("{reg}\n").as_bytes(), pidfd,
-                      Some(trace_r)) {
+    let tap_raw = tap_fd.as_ref().map(|f| f.as_raw_fd());
+    if !send_register_fds(&conn, format!("{reg}\n").as_bytes(), pidfd,
+                          tap_raw, Some(trace_r)) {
         eprintln!("sarun-engine: register write failed");
         return 1;
     }
     if pidfd >= 0 { unsafe { libc::close(pidfd); } }
+    drop(tap_fd); // engine dup'd it; device stays alive on its fd + our netns
     unsafe { libc::close(trace_r); } // engine holds its dup now
     let mut line = String::new();
     if BufReader::new(&conn).read_line(&mut line).is_err() {
@@ -915,6 +952,42 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     if !ir_key.is_empty() {
         sc.args(["--remap-rule", "inramfs:/tmp"]);
         sc.args(["--inramfs-key", &ir_key]);
+    }
+    // Tap networking: the box reaches the net through the engine's MITM
+    // proxy, so it must trust the engine's CA and resolve via the gateway.
+    // A FUSE box gets these as overlay SHADOWS; a sud box gets them as
+    // `remap` rules pointing the CA-bundle + resolv.conf paths at host
+    // files the runner materializes (ca_pem / dns_ip come back in the ack).
+    // Listed BEFORE the wide overlay:/ rule (first-prefix-match wins).
+    let ca_pem = ack.get("ca_pem").and_then(Value::as_str).unwrap_or("");
+    let dns_ip = ack.get("dns_ip").and_then(Value::as_str).unwrap_or("");
+    let backing = ack.get("shm_dir").and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
+    if net_mode == crate::net::NetMode::Tap && !ca_pem.is_empty() {
+        if let Some(bk) = &backing {
+            let ca_path = bk.join("sud-ca.pem");
+            if std::fs::write(&ca_path, ca_pem).is_ok() {
+                for tgt in CA_BUNDLE_TARGETS {
+                    sc.args(["--remap-rule",
+                             &format!("remap:{tgt}={}", ca_path.display())]);
+                }
+                let canonical = "/etc/ssl/certs/ca-certificates.crt";
+                for k in ["SSL_CERT_FILE", "CURL_CA_BUNDLE",
+                          "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE",
+                          "GIT_SSL_CAINFO"] {
+                    sc.env(k, canonical);
+                }
+            }
+            if !dns_ip.is_empty() {
+                let rc_path = bk.join("sud-resolv.conf");
+                if std::fs::write(&rc_path,
+                                  format!("nameserver {dns_ip}\n")).is_ok() {
+                    sc.args(["--remap-rule",
+                             &format!("remap:/etc/resolv.conf={}",
+                                      rc_path.display())]);
+                }
+            }
+        }
     }
     // rules.h caps an overlay rule at 9 layers (upper + 8): chain depth
     // beyond that would be SILENTLY dropped by the wrapper parser — fail
