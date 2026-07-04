@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 17:47:11 +0000
+Subject: [PATCH] id: entry takes logical env; POSIXLY_CORRECT from the shell
+
+---
+diff --git a/src/id.rs b/src/id.rs
+index b0e344d..00fd7c2 100644
+--- a/src/id.rs
++++ b/src/id.rs
+@@ -34,7 +34,7 @@
+ #![allow(dead_code)]
+ 
+ use clap::{Arg, ArgAction, Command};
+-use std::ffi::CStr;
++use std::ffi::{CStr, OsString};
+ use std::io::{self, Write};
+ use uucore::display::Quotable;
+ use uucore::entries::{self, Group, Locate, Passwd};
+@@ -179,6 +179,7 @@ struct State {
+ /// deferred exit code (e.g. an unknown user) as the returned status.
+ pub fn id_main(
+     args: impl uucore::Args,
++    env: &[(OsString, OsString)],
+     out: &mut dyn Write,
+     err: &mut dyn Write,
+ ) -> UResult<()> {
+@@ -186,7 +187,7 @@ pub fn id_main(
+     ID_ERR.with(|b| b.borrow_mut().clear());
+     ID_EXIT.with(|c| c.set(0));
+ 
+-    let result = run(args);
++    let result = run(args, env);
+ 
+     let produced_out = ID_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+     let produced_err = ID_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+@@ -208,7 +209,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     ID_ERR.with(|b| b.borrow_mut().clear());
+     ID_EXIT.with(|c| c.set(0));
+ 
+-    let result = run(args);
++    // Standalone binary: resolve POSIXLY_CORRECT against the process environment.
++    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
++    let result = run(args, &env);
+ 
+     let produced_out = ID_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+     let produced_err = ID_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+@@ -223,7 +226,18 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+ }
+ 
+ #[allow(clippy::cognitive_complexity)]
+-fn run(args: impl uucore::Args) -> UResult<()> {
++/// Look up `key` in the call's LOGICAL environment (the shell's exported vars),
++/// never the engine process's environment. `Some("")` for a set-but-empty value
++/// vs `None` when unset — the same distinction as `env::var_os`. The standalone
++/// binary passes a snapshot of the process environment, so behavior there is
++/// unchanged.
++fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a std::ffi::OsStr> {
++    env.iter()
++        .find(|(k, _)| k == key)
++        .map(|(_, v)| v.as_os_str())
++}
++
++fn run(args: impl uucore::Args, env: &[(OsString, OsString)]) -> UResult<()> {
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+     let mut lock = IdOut;
+ 
+@@ -448,7 +462,7 @@ fn run(args: impl uucore::Args) -> UResult<()> {
+         }
+ 
+         if default_format {
+-            id_print(&state, &groups)?;
++            id_print(&state, &groups, env)?;
+         }
+         write!(lock, "{line_ending}")?;
+ 
+@@ -724,7 +738,13 @@ fn auditid() -> io::Result<()> {
+     Ok(())
+ }
+ 
+-fn id_print(state: &State, groups: &[u32]) -> io::Result<()> {
++// `env` supplies the call's logical POSIXLY_CORRECT for the SELinux/SMACK
++// context suffix below; it is only consulted under those feature gates.
++#[cfg_attr(
++    not(any(feature = "selinux", feature = "smack")),
++    allow(unused_variables)
++)]
++fn id_print(state: &State, groups: &[u32], env: &[(OsString, OsString)]) -> io::Result<()> {
+     let uid = state.ids.as_ref().unwrap().uid;
+     let gid = state.ids.as_ref().unwrap().gid;
+     let euid = state.ids.as_ref().unwrap().euid;
+@@ -808,7 +828,7 @@ fn id_print(state: &State, groups: &[u32]) -> io::Result<()> {
+     #[cfg(feature = "selinux")]
+     if state.selinux_supported
+         && !state.user_specified
+-        && std::env::var_os("POSIXLY_CORRECT").is_none()
++        && env_get(env, "POSIXLY_CORRECT").is_none()
+     {
+         // print SElinux context (does not depend on "-Z")
+         if let Ok(context) = selinux::SecurityContext::current(false) {
+@@ -820,7 +840,7 @@ fn id_print(state: &State, groups: &[u32]) -> io::Result<()> {
+     #[cfg(feature = "smack")]
+     if state.smack_supported
+         && !state.user_specified
+-        && std::env::var_os("POSIXLY_CORRECT").is_none()
++        && env_get(env, "POSIXLY_CORRECT").is_none()
+     {
+         // print SMACK label (does not depend on "-Z")
+         if let Ok(label) = uucore::smack::get_smack_label_for_self() {

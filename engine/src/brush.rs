@@ -1187,7 +1187,55 @@ macro_rules! info_builtin {
 
 info_builtin!(UnameBuiltin, "uname", uu_uname::uname_main, "uu_uname");
 info_builtin!(NprocBuiltin, "nproc", uu_nproc::nproc_main, "uu_nproc");
-info_builtin!(IdBuiltin, "id", uu_id::id_main, "uu_id");
+/// `id` — INFO template, but hand-written (lifted out of [`info_builtin!`])
+/// because its entry additionally takes the shell's LOGICAL exported env: the
+/// SELinux/SMACK context suffix is suppressed under POSIXLY_CORRECT, which must
+/// come from the shell, not the engine process. Extending `info_builtin!` would
+/// force the same signature onto uname/nproc/whoami, so only `id` diverges.
+/// Body otherwise mirrors the macro expansion.
+struct IdBuiltin;
+
+impl brush_core::builtins::SimpleCommand for IdBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O id builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        let envv = exported_env_snapshot(&context);
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+
+        let code = run_coreutil_localized("uu_id", move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let r = match uu_id::id_main(argv.into_iter(), &envv, &mut out, &mut err) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
 info_builtin!(WhoamiBuiltin, "whoami", uu_whoami::whoami_main, "uu_whoami");
 
 /// `sarun` / `oaita` in-box builtins: re-exec the engine at /proc/self/exe so
