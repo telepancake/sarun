@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 17:53:06 +0000
+Subject: [PATCH] touch: entry takes logical env; knobs from the shell
+
+---
+diff --git a/src/touch.rs b/src/touch.rs
+index e3b24b5..1703964 100644
+--- a/src/touch.rs
++++ b/src/touch.rs
+@@ -196,19 +196,32 @@ fn get_year(s: &str) -> u8 {
+     10 * y1 + y2
+ }
+ 
++/// Look up `key` in the shell's LOGICAL environment snapshot (the vars the
++/// brush shell has `export`ed), returning its value if present. Replaces the
++/// process-env read (`std::env::var`) so `_POSIX2_VERSION` set with `export` in
++/// the box shell — not one inherited by the engine process — governs the
++/// obsolete first-operand-as-timestamp parsing. Behavior when it is absent is
++/// identical.
++fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsStr> {
++    env.iter()
++        .find(|(k, _)| k == OsStr::new(key))
++        .map(|(_, v)| v.as_os_str())
++}
++
+ /// Whether the first filename should be interpreted as a timestamp.
+ fn is_first_filename_timestamp(
+     reference: Option<&OsString>,
+     date: Option<&str>,
+     timestamp: Option<&str>,
+     files: &[&OsString],
++    env: &[(OsString, OsString)],
+ ) -> bool {
+     timestamp.is_none()
+         && reference.is_none()
+         && date.is_none()
+         && files.len() >= 2
+         // env check is last as the slowest op
+-        && matches!(std::env::var("_POSIX2_VERSION").as_deref(), Ok("199209"))
++        && env_get(env, "_POSIX2_VERSION") == Some(OsStr::new("199209"))
+         && files[0].to_str().is_some_and(is_timestamp)
+ }
+ 
+@@ -233,11 +246,15 @@ fn shr2(s: &str) -> String {
+ ///
+ /// Mirrors [`uumain`] but (1) resolves every relative path operand and the
+ /// `-r`/`--reference` value against the shell's LOGICAL `cwd` (the process is
+-/// never `chdir`'d), and (2) routes diagnostics to `err` (never fd 2). touch
+-/// reads no stdin. The deferred error status surfaces as the returned value.
++/// never `chdir`'d), and (2) routes diagnostics to `err` (never fd 2). The
++/// obsolete `_POSIX2_VERSION` knob that enables first-operand-as-timestamp
++/// parsing is read from `env` — the shell's LOGICAL environment — not the
++/// engine process's env. touch reads no stdin. The deferred error status
++/// surfaces as the returned value.
+ pub fn touch_main(
+     args: impl uucore::Args,
+     cwd: &Path,
++    env: &[(OsString, OsString)],
+     out_fd: Option<i32>,
+     err: &mut dyn std::io::Write,
+ ) -> UResult<()> {
+@@ -245,7 +262,7 @@ pub fn touch_main(
+     TOUCH_EXIT.with(|c| c.set(0));
+     TOUCH_OUT_FD.with(|c| c.set(out_fd.unwrap_or(-1)));
+ 
+-    let result = run(args, Some(cwd));
++    let result = run(args, Some(cwd), env);
+ 
+     TOUCH_OUT_FD.with(|c| c.set(-1));
+     let produced = TOUCH_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+@@ -264,7 +281,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     TOUCH_ERR.with(|b| b.borrow_mut().clear());
+     TOUCH_EXIT.with(|c| c.set(0));
+ 
+-    let result = run(args, None);
++    // Standalone binary: the intended `_POSIX2_VERSION` knob comes from the
++    // process environment, exactly as upstream read it directly.
++    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
++    let result = run(args, None, &env);
+ 
+     let produced = TOUCH_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+     let _ = std::io::Write::write_all(&mut std::io::stderr(), &produced);
+@@ -279,7 +299,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+ /// Shared body of [`touch_main`] and [`uumain`]. With `cwd` `Some`, relative
+ /// path operands and `-r` root at the shell's logical cwd; with `None`
+ /// (standalone) they resolve against the process cwd, as upstream.
+-fn run(args: impl uucore::Args, cwd: Option<&Path>) -> UResult<()> {
++fn run(args: impl uucore::Args, cwd: Option<&Path>, env: &[(OsString, OsString)]) -> UResult<()> {
+     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+ 
+     let mut filenames: Vec<&OsString> = matches
+@@ -312,7 +332,8 @@ fn run(args: impl uucore::Args, cwd: Option<&Path>) -> UResult<()> {
+         .get_one::<String>(options::sources::TIMESTAMP)
+         .map(ToOwned::to_owned);
+ 
+-    if is_first_filename_timestamp(reference, date.as_deref(), timestamp.as_deref(), &filenames) {
++    if is_first_filename_timestamp(reference, date.as_deref(), timestamp.as_deref(), &filenames, env)
++    {
+         let first_file = filenames[0].to_str().unwrap();
+         timestamp = if first_file.len() == 10 {
+             Some(shr2(first_file))

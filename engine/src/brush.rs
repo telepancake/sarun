@@ -765,6 +765,21 @@ impl brush_core::builtins::SimpleCommand for TouchBuiltin {
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
         let cwd = context.shell.working_dir().to_path_buf();
+
+        // Shell's LOGICAL environment: touch's obsolete `_POSIX2_VERSION` knob
+        // comes from the vars the box shell has `export`ed, not the engine's env.
+        let envv: Vec<(OsString, OsString)> = context
+            .shell
+            .env()
+            .iter_exported()
+            .map(|(k, v)| {
+                (
+                    k.clone().into(),
+                    v.value().to_cow_str(context.shell).to_string().into(),
+                )
+            })
+            .collect();
+
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
@@ -776,7 +791,7 @@ impl brush_core::builtins::SimpleCommand for TouchBuiltin {
             // Raw fd for the logical stdout, for the `-` operand only;
             // borrowed for the call's duration (the OpenFile outlives it).
             let out_fd = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            let r = match uu_touch::touch_main(argv.into_iter(), &cwd, out_fd, &mut err) {
+            let r = match uu_touch::touch_main(argv.into_iter(), &cwd, &envv, out_fd, &mut err) {
                 Ok(()) => 0,
                 Err(e) => {
                     let msg = e.to_string();
