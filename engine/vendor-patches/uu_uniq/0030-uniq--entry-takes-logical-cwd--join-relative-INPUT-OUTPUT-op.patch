@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 16:47:33 +0000
+Subject: [PATCH] uniq: entry takes logical cwd; join relative INPUT/OUTPUT operands
+
+---
+diff --git a/src/uniq.rs b/src/uniq.rs
+index cc64fa9..8ffde9f 100644
+--- a/src/uniq.rs
++++ b/src/uniq.rs
+@@ -11,6 +11,7 @@ use std::ffi::{OsStr, OsString};
+ use std::fs::File;
+ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+ use std::num::IntErrorKind;
++use std::path::{Path, PathBuf};
+ use uucore::display::Quotable;
+ use uucore::error::{FromIo, UError, UResult, USimpleError};
+ use uucore::format_usage;
+@@ -673,6 +674,7 @@ fn map_clap_errors(clap_error: Error) -> Box<dyn UError> {
+ /// diagnostic to the box's logical stderr and uses the returned exit code.
+ pub fn uniq(
+     args: impl uucore::Args,
++    cwd: &Path,
+     out: &mut dyn Write,
+     err: &mut dyn Write,
+     stdin: &mut dyn Read,
+@@ -731,14 +733,16 @@ pub fn uniq(
+     // (`-`/absent) reads the injected logical `stdin`. Note the reader is a
+     // `Box<dyn BufRead>` exactly as upstream's `open_input_file` returned, so
+     // `write_uniq` (which takes `impl BufRead`) is unchanged.
+-    let reader: Box<dyn BufRead> = open_input_reader(in_file_name, stdin)?;
++    let reader: Box<dyn BufRead> = open_input_reader(in_file_name, cwd, stdin)?;
+ 
+     // OUTPUT binding: a real OUTPUT-file operand opens (creates) that path; the
+     // default (`-`/absent) writes the injected logical `out` sink. Both arms
+-    // wrap in the same `BufWriter` upstream used.
++    // wrap in the same `BufWriter` upstream used. A relative OUTPUT is created
++    // under the shell's logical cwd (the process is never chdir'd there); the
++    // displayed name in any error keeps the operand exactly as given.
+     match out_file_name {
+         Some(path) if path != "-" => {
+-            let out_file = File::create(path).map_err_context(
++            let out_file = File::create(resolve_logical(Path::new(path), cwd)).map_err_context(
+                 || translate!("uniq-error-could-not-open", "path" => path.maybe_quote()),
+             )?;
+             let writer = BufWriter::with_capacity(OUTPUT_BUFFER_CAPACITY, out_file);
+@@ -765,7 +769,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     let mut err = stderr.lock();
+     let stdin = io::stdin();
+     let mut input = stdin.lock();
+-    let result = uniq(args, &mut out, &mut err, &mut input);
++    // Standalone binary: the process's real cwd is the intended base for
++    // relative operands, exactly as upstream.
++    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
++    let result = uniq(args, &cwd, &mut out, &mut err, &mut input);
+     // GNU `uniq` flushes stdout before exiting; `write_uniq` already flushed its
+     // BufWriter, but the locked Stdout itself is line-buffered, so flush.
+     let _ = out.flush();
+@@ -902,13 +909,27 @@ fn get_delimiter(matches: &ArgMatches) -> Delimiters {
+ // but the default `-`/absent case now wraps the injected logical `stdin` reader
+ // instead of locking the process's real fd 0. `'a` ties the returned
+ // `Box<dyn BufRead>` to the borrow of `stdin` for the no-file case.
++/// Resolve a path for actual filesystem access against the shell's logical cwd.
++/// A relative path is rooted at `cwd` (which brush never `chdir`s the process
++/// to); an absolute path is returned unchanged. Only the fs access uses this —
++/// diagnostics and displayed names keep the operand as the user gave it.
++fn resolve_logical(path: &Path, cwd: &Path) -> PathBuf {
++    if path.is_relative() {
++        cwd.join(path)
++    } else {
++        path.to_owned()
++    }
++}
++
+ fn open_input_reader<'a>(
+     in_file_name: Option<&OsStr>,
++    cwd: &Path,
+     stdin: &'a mut dyn Read,
+ ) -> UResult<Box<dyn BufRead + 'a>> {
+     Ok(match in_file_name {
+         Some(path) if path != "-" => {
+-            let in_file = File::open(path).map_err_context(
++            // Open at the cwd-resolved path; the error keeps the operand as given.
++            let in_file = File::open(resolve_logical(Path::new(path), cwd)).map_err_context(
+                 || translate!("uniq-error-could-not-open", "path" => path.maybe_quote()),
+             )?;
+             Box::new(BufReader::new(in_file))
+@@ -931,7 +952,7 @@ mod injected_io_tests {
+         let mut out: Vec<u8> = Vec::new();
+         let mut err: Vec<u8> = Vec::new();
+         let args = std::iter::once(OsString::from("uniq")).chain(argv.iter().map(OsString::from));
+-        let code = match uniq(args, &mut out, &mut err, &mut src) {
++        let code = match uniq(args, Path::new("."), &mut out, &mut err, &mut src) {
+             Ok(()) => 0,
+             Err(e) => e.code(),
+         };
+@@ -1005,7 +1026,7 @@ mod injected_io_tests {
+         let mut out: Vec<u8> = Vec::new();
+         let mut err: Vec<u8> = Vec::new();
+         let args = ["uniq", "-", path_str].into_iter().map(OsString::from);
+-        uniq(args, &mut out, &mut err, &mut src).unwrap();
++        uniq(args, Path::new("."), &mut out, &mut err, &mut src).unwrap();
+         // The injected `out` sink must stay empty; the file holds the result.
+         assert!(out.is_empty(), "out should be empty, got {out:?}");
+         let written = std::fs::read(&path).unwrap();
