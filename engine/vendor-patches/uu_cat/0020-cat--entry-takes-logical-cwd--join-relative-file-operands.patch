@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 04 Jul 2026 16:35:52 +0000
+Subject: [PATCH] cat: entry takes logical cwd; join relative file operands
+
+---
+diff --git a/src/cat.rs b/src/cat.rs
+index fa1c964..3eb585c 100644
+--- a/src/cat.rs
++++ b/src/cat.rs
+@@ -13,6 +13,7 @@ use memchr::memchr2;
+ use std::ffi::OsString;
+ use std::fs::{File, metadata};
+ use std::io::{self, BufWriter, ErrorKind, IsTerminal, Read, Write};
++use std::path::Path;
+ #[cfg(unix)]
+ use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+ #[cfg(unix)]
+@@ -221,8 +222,14 @@ mod options {
+ /// skipped and bytes are copied through the trait objects, so it is correct
+ /// for both real pipes/files and in-memory streams, and holds no
+ /// process-global state.
++///
++/// It also takes the shell's LOGICAL `cwd`: brush never `chdir`s the process,
++/// so every RELATIVE `FILE` operand is resolved against `cwd` for the actual
++/// filesystem access (`-` stays stdin, absolute operands are untouched). The
++/// operand is still displayed verbatim in diagnostics, matching GNU `cat`.
+ pub fn cat(
+     args: impl uucore::Args,
++    cwd: &Path,
+     out: &mut dyn Write,
+     out_fd: Option<BorrowedFd<'_>>,
+     stdin: &mut dyn Read,
+@@ -274,7 +281,7 @@ pub fn cat(
+         show_tabs,
+         squeeze_blank,
+     };
+-    cat_files(files, &options, out, out_fd, stdin, stdin_fd)
++    cat_files(files, cwd, &options, out, out_fd, stdin, stdin_fd)
+ }
+ 
+ /// Descriptor-based entry point for the standalone `cat` binary and the
+@@ -295,7 +302,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     // for the whole duration of this call.
+     let out_fd = Some(unsafe { BorrowedFd::borrow_raw(1) });
+     let in_fd = Some(unsafe { BorrowedFd::borrow_raw(0) });
+-    cat(args, &mut out, out_fd, &mut input, in_fd)
++    // The standalone binary IS chdir'd to the process cwd, so a "." base joins
++    // relative operands against it exactly as upstream's kernel-cwd resolution.
++    cat(args, Path::new("."), &mut out, out_fd, &mut input, in_fd)
+ }
+ 
+ pub fn uu_app() -> Command {
+@@ -401,6 +410,7 @@ fn cat_handle(
+ 
+ fn cat_path(
+     path: &OsString,
++    cwd: &Path,
+     options: &OutputOptions,
+     state: &mut OutputState,
+     out: &mut dyn Write,
+@@ -408,7 +418,15 @@ fn cat_path(
+     stdin: &mut dyn Read,
+     stdin_fd: Option<BorrowedFd<'_>>,
+ ) -> CatResult<()> {
+-    match get_input_type(path)? {
++    // Resolve the operand against the shell's LOGICAL cwd for the actual
++    // filesystem access. `-` is stdin (never joined); an absolute operand is
++    // left as-is. `path` itself stays the verbatim operand used in diagnostics.
++    let resolved: OsString = if path == "-" || Path::new(path).is_absolute() {
++        path.clone()
++    } else {
++        cwd.join(path).into_os_string()
++    };
++    match get_input_type(&resolved)? {
+         InputType::StdIn => {
+             if let (Some(ifd), Some(ofd)) = (stdin_fd, out_fd) {
+                 if is_unsafe_overwrite(&ifd, &ofd) {
+@@ -427,7 +445,7 @@ fn cat_path(
+         #[cfg(unix)]
+         InputType::Socket => Err(CatError::NoSuchDeviceOrAddress),
+         _ => {
+-            let mut file = File::open(path)?;
++            let mut file = File::open(&resolved)?;
+             if let Some(ofd) = out_fd {
+                 if is_unsafe_overwrite(&file, &ofd) {
+                     return Err(CatError::OutputIsInput);
+@@ -446,6 +464,7 @@ fn cat_path(
+ 
+ fn cat_files<'a, I>(
+     files: I,
++    cwd: &Path,
+     options: &OutputOptions,
+     out: &mut dyn Write,
+     out_fd: Option<BorrowedFd<'_>>,
+@@ -464,7 +483,7 @@ where
+     let mut error_messages: Vec<String> = Vec::new();
+ 
+     for path in files {
+-        if let Err(err) = cat_path(path, options, &mut state, out, out_fd, stdin, stdin_fd) {
++        if let Err(err) = cat_path(path, cwd, options, &mut state, out, out_fd, stdin, stdin_fd) {
+             error_messages.push(format!("{}: {err}", path.maybe_quote()));
+         }
+     }

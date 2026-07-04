@@ -159,7 +159,8 @@ impl brush_core::builtins::SimpleCommand for CatBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_cat", context.shell.working_dir().to_path_buf(), move || {
+        let cwd = context.shell.working_dir().to_path_buf();
+        let code = run_coreutil_localized("uu_cat", cwd.clone(), move || {
             use std::io::Write;
             use std::os::fd::{AsRawFd, BorrowedFd};
             let mut out = out;
@@ -170,7 +171,7 @@ impl brush_core::builtins::SimpleCommand for CatBuiltin {
             // SAFETY: fd is owned by an OpenFile that outlives this call.
             let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
             let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-            let r = match uu_cat::cat(argv.into_iter(), &mut out, out_fd, &mut inp, in_fd) {
+            let r = match uu_cat::cat(argv.into_iter(), &cwd, &mut out, out_fd, &mut inp, in_fd) {
                 Ok(()) => 0,
                 Err(e) => { let _ = writeln!(err, "{name}: {e}"); 1 }
             };
