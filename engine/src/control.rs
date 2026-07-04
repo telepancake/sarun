@@ -570,8 +570,14 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                                 .join(id.to_string()).join("sud-up");
                             let runpid = lock(state).box_runpids
                                 .get(&id).copied().unwrap_or(0);
+                            // Waits for the trace pipe to drain, so the
+                            // rel→writer attribution map is complete.
+                            let stream = crate::sud::take_stream(id);
+                            let writers = stream.as_ref()
+                                .map(|s| s.writers.lock().unwrap().clone())
+                                .unwrap_or_default();
                             let (n, errs) = crate::sud::ingest_upper(
-                                &b, &upper, runpid as u32);
+                                &b, &upper, runpid as u32, &writers);
                             json!({"ok": true, "ingested": n,
                                    "errors": errs})
                         }
@@ -1009,11 +1015,16 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     // on this flag (see overlay.rs).
     b.set_is_tap(msg.get("net_mode").and_then(Value::as_str) == Some("tap"));
     b.set_meta("name", &name);
-    // --sud (WIP, see engine/DESIGN-sud.md): the box runs under tv's
-    // sudtrace with a directory upper instead of on the FUSE mount. Create
+    // --sud (WIP, see engine/DESIGN-sud.md): the box runs under the sud64
+    // wrapper with a directory upper instead of on the FUSE mount. Create
     // the upper here so the ack can hand its path to the runner; the
-    // post-exit `sud_ingest` verb sweeps it into this BoxState.
+    // post-exit `sud_ingest` verb sweeps it into this BoxState. The
+    // register's SECOND SCM_RIGHTS fd (tap's slot — a sud box is net-host)
+    // is the read end of the fd-1023 trace pipe: stolen from the tap
+    // Option here, streamed by sud::stream_events after add_box below.
     let want_sud = msg.get("want_sud").and_then(Value::as_bool).unwrap_or(false);
+    let mut sud_trace_fd: Option<std::os::fd::OwnedFd> = None;
+    let mut tap_fd = tap_fd;
     if want_sud {
         let up = backing.join("sud-up");
         if let Err(e) = std::fs::create_dir_all(&up) {
@@ -1021,6 +1032,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
             return json!({"ok": false, "error": format!("sud upper: {e}")});
         }
         b.set_meta("sud", "1");
+        sud_trace_fd = tap_fd.take();
     }
     // D-parent: `want_no_parent` strips any kernel-derived parent AND closes
     // the lower chain so reads never fall through to the real host. It's the
@@ -1077,6 +1089,16 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
         write_api_box_oaita_toml();
     }
     ov.add_box(std::sync::Arc::new(b));
+    // sud: start consuming the live trace stream now that the BoxState is
+    // registered (events snapshot process rows / build the write-
+    // attribution map / record outputs; raw bytes tee to sud.trace).
+    if let Some(fd) = sud_trace_fd.take() {
+        if let Some(bx) = ov.live_box(id) {
+            use std::os::fd::IntoRawFd;
+            crate::sud::stream_events(id, fd.into_raw_fd(), bx,
+                                      backing.join("sud.trace"));
+        }
+    }
     // Announce the new box on the subscribe stream so attached UIs
     // rebuild their session list WITHOUT a manual refresh. on_event
     // already handles session_added/removed/renamed identically — it

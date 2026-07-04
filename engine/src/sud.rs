@@ -6,25 +6,174 @@
 // every row is attributed to the runner's process row until the wire trace
 // stream is ingested (step 2).
 
+use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use crate::capture::BoxState;
 use crate::capture::blob_path;
+use crate::sudwire;
+
+// ── live trace streaming (step 2) ───────────────────────────────────────────
+// The runner ships the read end of the fd-1023 pipe with register; the
+// engine consumes the TRACE stream as the box runs: EXEC events snapshot
+// each process row from /proc WHILE THE PROCESS IS ALIVE (writer_for),
+// OPEN-for-write events build the rel→writer map the post-exit sweep uses
+// for per-file attribution, STDOUT/STDERR events land in the box's
+// outputs table, and every byte is teed to live/<id>/sud.trace at rest.
+
+/// Per-box streaming state, registered while a sud box runs.
+pub struct Stream {
+    /// rel path → process row id of the last writer seen opening it.
+    pub writers: Mutex<HashMap<String, i64>>,
+    /// Pipe hit EOF and every buffered event was applied.
+    done: (Mutex<bool>, Condvar),
+}
+
+static STREAMS: OnceLock<Mutex<HashMap<i64, Arc<Stream>>>> = OnceLock::new();
+
+fn streams() -> &'static Mutex<HashMap<i64, Arc<Stream>>> {
+    STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take the box's stream state (if the runner streamed a trace), waiting
+/// up to 5 s for the pipe to drain — the runner closes its fd 1023 before
+/// asking for the sweep, so EOF beats the sud_ingest verb in the normal
+/// flow; the timeout only guards a wedged reader.
+pub fn take_stream(box_id: i64) -> Option<Arc<Stream>> {
+    let s = streams().lock().unwrap().remove(&box_id)?;
+    let (lock, cv) = &s.done;
+    let mut g = lock.lock().unwrap();
+    let deadline = std::time::Duration::from_secs(5);
+    while !*g {
+        let (ng, timeout) = cv.wait_timeout(g, deadline).unwrap();
+        g = ng;
+        if timeout.timed_out() { break; }
+    }
+    drop(g);
+    Some(s)
+}
+
+/// Spawn the reader thread for one sud box: tee `fd` (pipe read end,
+/// owned here) into `trace_path` and apply events to `b` as they arrive.
+pub fn stream_events(box_id: i64, fd: i32, b: Arc<BoxState>,
+                     trace_path: std::path::PathBuf) {
+    let st = Arc::new(Stream {
+        writers: Mutex::new(HashMap::new()),
+        done: (Mutex::new(false), Condvar::new()),
+    });
+    streams().lock().unwrap().insert(box_id, st.clone());
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let mut tee = std::fs::File::create(&trace_path).ok();
+        let mut dec = sudwire::Decoder::default();
+        // per-tgid logical cwd (from EV_CWD) for resolving relative
+        // OPEN paths; dirfd-relative opens stay unresolved (fallback
+        // attribution applies).
+        let mut cwds: HashMap<i32, String> = HashMap::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = unsafe {
+                libc::read(fd, buf.as_mut_ptr().cast(), buf.len())
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINTR) { continue; }
+                break;
+            }
+            if n == 0 { break; }
+            if let Some(t) = tee.as_mut() {
+                let _ = t.write_all(&buf[..n as usize]);
+            }
+            for ev in dec.feed(&buf[..n as usize]) {
+                apply_event(&b, &st, &mut cwds, &ev);
+            }
+        }
+        unsafe { libc::close(fd); }
+        let (lock, cv) = &st.done;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    });
+}
+
+/// Write-intent test on OPEN flags: any access mode beyond O_RDONLY, or
+/// creation/truncation.
+fn open_writes(flags: i64) -> bool {
+    let f = flags as i32;
+    (f & libc::O_ACCMODE) != libc::O_RDONLY
+        || f & (libc::O_CREAT | libc::O_TRUNC) != 0
+}
+
+/// Paths the runner carves out of the overlay (rule order in run_sud) —
+/// writes there never reach the upper, so don't attribute them.
+fn is_passthrough(abs: &str) -> bool {
+    for p in ["/proc/", "/dev/", "/sys/", "/tmp/"] {
+        if abs.starts_with(p) { return true; }
+    }
+    abs.starts_with(&*crate::paths::state_home().to_string_lossy())
+        || abs.starts_with(&*crate::paths::mnt_point().to_string_lossy())
+}
+
+fn apply_event(b: &BoxState, st: &Stream,
+               cwds: &mut HashMap<i32, String>, ev: &sudwire::Event) {
+    match ev.ty {
+        sudwire::EV_EXEC => {
+            // Snapshot the process row while /proc/<tgid> is alive —
+            // this is what post-exit sweeps structurally can't do.
+            if ev.tgid > 0 { b.writer_for(ev.tgid as u32); }
+        }
+        sudwire::EV_CWD => {
+            if let Ok(p) = String::from_utf8(ev.blob.clone()) {
+                cwds.insert(ev.tgid, p);
+            }
+        }
+        sudwire::EV_OPEN => {
+            // extras = {flags, fd, ino, dev_major, dev_minor, err, inh}
+            let [flags, _, _, _, _, err, inh] = ev.extras[..] else {
+                return;
+            };
+            if err != 0 || inh != 0 || !open_writes(flags) { return; }
+            let Ok(path) = std::str::from_utf8(&ev.blob) else { return };
+            let abs = if path.starts_with('/') {
+                path.to_string()
+            } else if let Some(cwd) = cwds.get(&ev.tgid) {
+                format!("{}/{}", cwd.trim_end_matches('/'), path)
+            } else {
+                return; // relative with unknown cwd — fallback applies
+            };
+            if is_passthrough(&abs) { return; }
+            let rel = abs.trim_start_matches('/').to_string();
+            if rel.is_empty() { return; }
+            let w = b.writer_for(ev.tgid as u32);
+            st.writers.lock().unwrap().insert(rel, w);
+        }
+        sudwire::EV_STDOUT => b.add_output(1, ev.tgid as u32, &ev.blob),
+        sudwire::EV_STDERR => b.add_output(2, ev.tgid as u32, &ev.blob),
+        _ => {}
+    }
+}
 
 /// Walk `upper` (the sud overlay's upper directory) and mirror it into the
 /// box's sqlar. Char-0:0 device nodes are the sud/overlayfs whiteout marker
-/// and become whiteout rows. Returns (rows written, errors).
-pub fn ingest_upper(b: &BoxState, upper: &Path, runpid: u32)
+/// and become whiteout rows. `writers` (from the trace stream) attributes
+/// each path to the process that opened it for writing; anything unmatched
+/// falls back to the runner's process row. Returns (rows written, errors).
+pub fn ingest_upper(b: &BoxState, upper: &Path, runpid: u32,
+                    writers: &HashMap<String, i64>)
                     -> (usize, Vec<String>) {
-    let writer = if runpid > 0 { b.writer_for(runpid) } else { 0 };
+    let fallback = if runpid > 0 { b.writer_for(runpid) } else { 0 };
     let mut n = 0usize;
     let mut errs = Vec::new();
-    walk(b, upper, "", writer, &mut n, &mut errs);
+    walk(b, upper, "", fallback, writers, &mut n, &mut errs);
     (n, errs)
 }
 
-fn walk(b: &BoxState, dir: &Path, rel: &str, writer: i64,
+fn walk(b: &BoxState, dir: &Path, rel: &str, fallback: i64,
+        writers: &HashMap<String, i64>,
         n: &mut usize, errs: &mut Vec<String>) {
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -45,10 +194,11 @@ fn walk(b: &BoxState, dir: &Path, rel: &str, writer: i64,
         };
         let mode = md.mode();
         let ftype = md.file_type();
+        let writer = writers.get(&crel).copied().unwrap_or(fallback);
         if ftype.is_dir() {
             b.set_dir(&crel, mode, writer);
             *n += 1;
-            walk(b, &p, &crel, writer, n, errs);
+            walk(b, &p, &crel, fallback, writers, n, errs);
         } else if ftype.is_symlink() {
             match std::fs::read_link(&p) {
                 Ok(t) => { b.set_symlink(&crel, &t, writer); *n += 1; }

@@ -44,7 +44,7 @@ not drop in.
 
 ## Staging
 
-1. **(this commit)** `sarun run --sud`: launch the command under `sudtrace`
+1. **(done)** `sarun run --sud`: launch the command under the sud wrapper
    with a plain *directory* upper (`{state}/live/<id>/sud-up`) overlaid on
    `/`, then a post-exit sweep (`sud_ingest` verb → `engine/src/sud.rs`)
    ingests the upper dir into the box's existing sqlar `BoxState` —
@@ -53,12 +53,59 @@ not drop in.
    works unchanged. No bwrap, no FUSE mount participation for the box's own
    I/O; the box registers on the overlay like any other so the control plane
    and UI see it.
-2. Switch the upper from a directory to **inramfs** and ingest from the
-   shared region; ingest the wire trace stream for per-write process
-   attribution (today the sweep attributes everything to the runner's
-   process row) and live-ness (step 1 only sees writes after exit).
+1.5. **(done)** Absorb the launcher (tv's `sudtrace`) into the Rust runner;
+   `engine/src/sudwire.rs` encodes the launcher side of the TRACE stream.
+2. **(done — trace streaming)** The runner's fd 1023 is a pipe whose read
+   end rides to the engine with register (second SCM_RIGHTS fd, the slot
+   tap boxes use). `sud::stream_events` consumes the TRACE stream live:
+   EXEC events snapshot each process row from /proc *while the process is
+   alive* (`writer_for`), OPEN-for-write events build the rel→writer map
+   the sweep uses for per-file attribution (relative paths resolved
+   against per-tgid EV_CWD state; dirfd-relative opens fall back to the
+   runner row), STDOUT/STDERR events land in the box's outputs table, and
+   the raw bytes tee to `live/<id>/sud.trace` at rest. `sud_ingest` waits
+   for pipe EOF (the runner closes fd 1023 before requesting the sweep)
+   so the attribution map is complete. Still pending from the old step 2:
+   the **inramfs upper** (writes currently land in the plain directory
+   upper), and live file rows (writes appear at sweep time, not as they
+   happen).
 3. Only then: the store. Alternate `BoxState` backend on depot/strpool
    mechanics, sqlar kept as an export for the Python tooling.
+
+## Composition: sud × FUSE boxes (design sketch, nothing implemented)
+
+Four quadrants; the working rule of thumb is *flatten sud into rules,
+bridge FUSE through its mount path*:
+
+- **FUSE box nested in a sud box**: works structurally today — the inner
+  runner dials the engine as a host runner (a sud box sets no
+  SARUN_BROKER), bwrap binds `<mnt>/<id>` as usual. The sud overlay must
+  NOT swallow writes that go through the FUSE mount (they belong to the
+  inner box's capture), so the engine's mountpoint is a passthrough
+  carve-out in the sud rule stack. Gap: parentage — the inner box
+  registers as top-level because parent derivation currently only runs
+  for in-box (`relname`) registrations; deriving the enclosing sud box
+  from the /proc ancestry (box_runpids already has the sud runner's pid)
+  would nest it properly.
+- **sud box nested in a FUSE box**: rejected today. The wrong way is to
+  run sud64 inside the bwrap mount (upper paths under the engine state
+  dir resolve through the parent's FUSE lower — the child's captured
+  writes would themselves become parent-box captured writes). The right
+  way is rule composition against the parent's *host-side* mount:
+  `overlay:/=<child-up>+<mnt>/<parent-id>` — reads traverse the parent's
+  merged view (whiteouts and all), writes land in the child's own upper.
+- **sud in sud**: never wrapper-in-wrapper — both wrappers link at the
+  same fixed text address, and the outer wrapper's execve interception
+  would try to wrap the inner wrapper. Flatten instead: the engine knows
+  the parent chain, so a nested sud box is ONE wrapper invocation with a
+  composed rule stack, `overlay:/=<child-up>+<parent-up>+/` (the overlay
+  rule syntax already takes multiple lowers, and the upper-side whiteout
+  markers are honored during lower walks).
+- **FUSE box whose PARENT is a sud box**: the FUSE resolve() walks parent
+  BoxStates, but a live sud box's writes sit in its upper dir, not in its
+  BoxState until sweep — the child would see a stale parent. Needs either
+  live row ingest (streaming writes into the BoxState as they happen) or
+  a resolve() fallback that consults the parent's sud upper directory.
 
 ## Known gaps / practical issues expected (step 1)
 

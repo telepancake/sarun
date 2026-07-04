@@ -744,7 +744,7 @@ fn sud_proc_field(pid: i32, field: &str, fallback: i32) -> i32 {
 /// wrapper instead of bwrap+FUSE. Registers with `want_sud`, gets the
 /// engine-owned upper directory back in the ack, sets up the sud launcher
 /// contract itself (fds 1022/1023, version atom, EXIT events), execs
-///   sud64 --trace-outfile T --remap-rule … -- resolved CMD
+///   sud64 --remap-rule … resolved CMD
 /// and, after the child exits, asks the engine (fresh conn, `sud_ingest`)
 /// to sweep the upper into the box's sqlar. The register conn stays open
 /// for the duration — its EOF after the sweep is the normal box teardown.
@@ -771,6 +771,18 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
             return 3;
         }
     };
+    // Trace pipe: the wrapper contract's fd 1023 becomes the WRITE end of
+    // a pipe whose READ end rides to the engine as register's second
+    // SCM_RIGHTS fd (the slot tap boxes use for the TAP fd — a sud box is
+    // net-host, so it's free). The engine streams events live and tees
+    // the raw bytes to live/<id>/sud.trace.
+    let mut pfd = [0i32; 2];
+    if unsafe { libc::pipe(pfd.as_mut_ptr()) } < 0 {
+        eprintln!("sarun-engine: trace pipe: {}",
+                  std::io::Error::last_os_error());
+        return 1;
+    }
+    let (trace_r, trace_w) = (pfd[0], pfd[1]);
     let reg = json!({"type": "register",
                      "cmd": cmd, "prov": provenance(&cmd, env),
                      "want_capture": false,
@@ -781,11 +793,13 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                      "session_id": name.clone().unwrap_or_default(),
                      "want_rerun": name.is_some()});
     let pidfd = pidfd_open(std::process::id() as i32);
-    if !send_register(&conn, format!("{reg}\n").as_bytes(), pidfd, None) {
+    if !send_register(&conn, format!("{reg}\n").as_bytes(), pidfd,
+                      Some(trace_r)) {
         eprintln!("sarun-engine: register write failed");
         return 1;
     }
     if pidfd >= 0 { unsafe { libc::close(pidfd); } }
+    unsafe { libc::close(trace_r); } // engine holds its dup now
     let mut line = String::new();
     if BufReader::new(&conn).read_line(&mut line).is_err() {
         eprintln!("sarun-engine: register read failed");
@@ -809,9 +823,6 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                    (engine older than this runner?)");
         return 1;
     }
-    let trace = std::path::Path::new(&upper)
-        .parent().map(|p| p.join("sud.trace"))
-        .unwrap_or_else(|| "sud.trace".into());
     eprintln!("sarun-engine: box {sid}  (sud upper: {upper})");
     // Probe the target the way sudtrace did: PATH-resolve, shebang, ELF
     // class (we ship only the 64-bit wrapper — fail LOUD on a 32-bit
@@ -825,30 +836,20 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                    the sud64 wrapper is wired up (sud32 support pending).");
         return 2;
     }
-    // Launcher contract, absorbed from tv/sud/sudtrace.c: the trace file
-    // on fd 1023 and the 4 KiB MAP_SHARED wire-state page (stream-id
-    // counter) on fd 1022, both inherited by every traced child. We take
-    // launcher stream id (first fetch-and-add) and write the TRACE
-    // version atom before any event.
-    let trace_abs = trace.to_string_lossy().into_owned();
-    let out = match std::fs::File::create(&trace) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("sarun-engine: create {}: {e}", trace.display());
-            return 1;
-        }
-    };
-    use std::os::fd::IntoRawFd;
+    // Launcher contract, absorbed from tv/sud/sudtrace.c: the trace pipe's
+    // write end on fd 1023 and the 4 KiB MAP_SHARED wire-state page
+    // (stream-id counter) on fd 1022, both inherited by every traced
+    // child. We take the launcher stream id (first fetch-and-add) and
+    // write the TRACE version atom before any event.
     let stream_id: u32;
     let state_page: *mut u32;
     unsafe {
-        let ofd = out.into_raw_fd();
-        if libc::dup2(ofd, SUD_OUTPUT_FD) < 0 {
+        if libc::dup2(trace_w, SUD_OUTPUT_FD) < 0 {
             eprintln!("sarun-engine: dup2 trace fd: {}",
                       std::io::Error::last_os_error());
             return 1;
         }
-        libc::close(ofd); // dup2'd fd is not CLOEXEC — children inherit
+        libc::close(trace_w); // dup2'd fd is not CLOEXEC — children inherit
         let mfd = libc::syscall(libc::SYS_memfd_create,
                                 c"sud_wire_state".as_ptr(), 0u32) as i32;
         if mfd < 0 || libc::ftruncate(mfd, 4096) < 0
@@ -881,12 +882,17 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // overlay. /tmp passthrough is a step-1 stopgap — see DESIGN-sud.md.
     let state_dir = crate::paths::state_home();
     let mut sc = Command::new(&sud64);
-    sc.arg("--trace-outfile").arg(&trace_abs);
     for p in ["/proc", "/dev", "/sys", "/tmp"] {
         sc.args(["--remap-rule", &format!("passthrough:{p}")]);
     }
     sc.arg("--remap-rule")
         .arg(format!("passthrough:{}", state_dir.display()));
+    // The engine's FUSE mountpoint too: a nested NON-sud box launched
+    // from inside this box binds <mnt>/<id> and writes through it —
+    // those writes belong to the nested box's own capture, not to this
+    // box's upper (sud × FUSE composition, DESIGN-sud.md).
+    sc.arg("--remap-rule")
+        .arg(format!("passthrough:{}", crate::paths::mnt_point().display()));
     sc.arg("--remap-rule").arg(format!("overlay:/={upper}+/"));
     match &shebang {
         Some((interp, arg)) => {

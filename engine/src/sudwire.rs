@@ -136,6 +136,170 @@ impl EvState {
     }
 }
 
+// ── decoder ─────────────────────────────────────────────────────────────────
+
+/// One decoded TRACE event, with the per-stream deltas already applied.
+/// Blob/extras are interpreted per type (trace.h).
+#[derive(Debug)]
+pub struct Event {
+    pub ty: i64,
+    pub ts_ns: i64,
+    pub pid: i32,
+    pub tgid: i32,
+    pub ppid: i32,
+    pub extras: Vec<i64>,
+    pub blob: Vec<u8>,
+}
+
+/// OPEN extras layout: {flags, fd, ino, dev_major, dev_minor, err, inh}.
+pub const EV_EXEC: i64 = 0;
+pub const EV_ARGV: i64 = 1;
+pub const EV_ENV: i64 = 2;
+pub const EV_CWD: i64 = 6;
+pub const EV_OPEN: i64 = 5;
+pub const EV_STDOUT: i64 = 7;
+pub const EV_STDERR: i64 = 8;
+
+/// Incremental TRACE-stream decoder: feed() raw bytes as they arrive,
+/// collect complete events. Keeps one delta state per observed stream id
+/// (trace.h contract). A malformed stream poisons the decoder — every
+/// later feed returns nothing (the transport below it is a pipe from a
+/// cooperative tracer; there is no resync point in the format).
+#[derive(Default)]
+pub struct Decoder {
+    buf: Vec<u8>,
+    states: std::collections::HashMap<u32, EvState>,
+    versioned: bool,
+    poisoned: bool,
+}
+
+/// Total encoded length of the atom at buf[0..], or None if incomplete.
+/// Err(()) on a malformed prefix (lensz=7 would exceed u64 — wire.h
+/// treats it as format error).
+fn atom_len(buf: &[u8]) -> Result<Option<(usize, usize, usize)>, ()> {
+    // returns (payload_start, payload_len, total)
+    let Some(&b) = buf.first() else { return Ok(None) };
+    if b < 0xC0 {
+        return Ok(Some((0, 1, 1)));
+    }
+    if b < 0xF8 {
+        let len = (b - 0xC0) as usize;
+        if buf.len() < 1 + len { return Ok(None); }
+        return Ok(Some((1, len, 1 + len)));
+    }
+    let lensz = (b - 0xF8) as usize;
+    if lensz == 7 { return Err(()); }
+    if buf.len() < 1 + lensz { return Ok(None); }
+    let mut len = 0usize;
+    for i in 0..lensz {
+        len |= (buf[1 + i] as usize) << (8 * i);
+    }
+    if buf.len() < 1 + lensz + len { return Ok(None); }
+    Ok(Some((1 + lensz, len, 1 + lensz + len)))
+}
+
+fn take_atom<'a>(src: &mut &'a [u8]) -> Option<&'a [u8]> {
+    match atom_len(src) {
+        Ok(Some((start, len, total))) => {
+            let out = &src[start..start + len];
+            *src = &src[total..];
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn take_u64(src: &mut &[u8]) -> Option<u64> {
+    let a = take_atom(src)?;
+    if a.len() > 8 { return None; }
+    let mut v = 0u64;
+    for (i, b) in a.iter().enumerate() {
+        v |= (*b as u64) << (8 * i);
+    }
+    Some(v)
+}
+
+fn take_i64(src: &mut &[u8]) -> Option<i64> {
+    let u = take_u64(src)?;
+    Some(((u >> 1) as i64) ^ -((u & 1) as i64))
+}
+
+impl Decoder {
+    /// Consume `bytes`, return every event that completed.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
+        if self.poisoned { return vec![]; }
+        self.buf.extend_from_slice(bytes);
+        let mut out = vec![];
+        let mut off = 0usize;
+        loop {
+            match atom_len(&self.buf[off..]) {
+                Ok(Some((start, len, total))) => {
+                    let payload =
+                        &self.buf[off + start..off + start + len];
+                    if !self.versioned {
+                        // first atom = wire_put_u64(TRACE_VERSION); its
+                        // payload IS the LE version bytes
+                        let mut v = 0u64;
+                        for (i, b) in payload.iter().enumerate().take(8) {
+                            v |= (*b as u64) << (8 * i);
+                        }
+                        if v != TRACE_VERSION {
+                            self.poisoned = true;
+                            return out;
+                        }
+                        self.versioned = true;
+                    } else if let Some(ev) =
+                        Self::decode_event(&mut self.states, payload) {
+                        out.push(ev);
+                    } else {
+                        self.poisoned = true;
+                        self.buf.clear();
+                        return out;
+                    }
+                    off += total;
+                }
+                Ok(None) => break,
+                Err(()) => {
+                    self.poisoned = true;
+                    self.buf.clear();
+                    return out;
+                }
+            }
+        }
+        self.buf.drain(..off);
+        out
+    }
+
+    fn decode_event(states: &mut std::collections::HashMap<u32, EvState>,
+                    payload: &[u8]) -> Option<Event> {
+        let mut p = payload;
+        let mut hdr = take_atom(&mut p)?;
+        let blob = take_atom(&mut p)?.to_vec();
+        let sid = take_u64(&mut hdr)? as u32;
+        let st = states.entry(sid).or_default();
+        st.ty += take_i64(&mut hdr)?;
+        st.ts_ns += take_i64(&mut hdr)?;
+        st.pid += take_i64(&mut hdr)?;
+        st.tgid += take_i64(&mut hdr)?;
+        st.ppid += take_i64(&mut hdr)?;
+        st.nspid += take_i64(&mut hdr)?;
+        st.nstgid += take_i64(&mut hdr)?;
+        let mut extras = vec![];
+        while !hdr.is_empty() {
+            extras.push(take_i64(&mut hdr)?);
+        }
+        Some(Event {
+            ty: st.ty,
+            ts_ns: st.ts_ns,
+            pid: st.pid as i32,
+            tgid: st.tgid as i32,
+            ppid: st.ppid as i32,
+            extras,
+            blob,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +376,40 @@ mod tests {
         assert_eq!(v, [0x02]);
         // version atom: TRACE_VERSION=3 is the self-byte 0x03
         assert_eq!(version_atom(), [0x03]);
+    }
+
+    #[test]
+    fn decoder_streams_incrementally() {
+        let mut enc = EvState::default();
+        let mut stream = version_atom();
+        stream.extend(enc.build_event(3, EV_EXEC, 100, 10, 10, 5, 10, 10,
+                                      &[], b"/bin/sh"));
+        stream.extend(enc.build_event(3, EV_OPEN, 200, 10, 10, 5, 10, 10,
+                                      &[0o101, 3, 99, 1, 2, 0, 0],
+                                      b"out.txt"));
+        stream.extend(enc.build_exit(3, 300, 10, 10, 5, 0));
+        // interleave a second stream to prove per-stream delta state
+        let mut enc2 = EvState::default();
+        stream.extend(enc2.build_event(4, EV_STDOUT, 150, 11, 11, 10,
+                                       11, 11, &[], b"hi\n"));
+        let mut dec = Decoder::default();
+        let mut evs = vec![];
+        for b in &stream {
+            evs.extend(dec.feed(std::slice::from_ref(b))); // 1 byte at a time
+        }
+        assert_eq!(evs.len(), 4);
+        assert_eq!(evs[0].ty, EV_EXEC);
+        assert_eq!(evs[0].blob, b"/bin/sh");
+        assert_eq!(evs[0].tgid, 10);
+        assert_eq!(evs[1].ty, EV_OPEN);
+        assert_eq!(evs[1].extras, [0o101, 3, 99, 1, 2, 0, 0]);
+        assert_eq!(evs[1].blob, b"out.txt");
+        assert_eq!(evs[1].ts_ns, 200);
+        assert_eq!(evs[2].ty, EV_EXIT);
+        assert_eq!(evs[2].extras[0], EV_EXIT_EXITED);
+        assert_eq!(evs[3].ty, EV_STDOUT);
+        assert_eq!(evs[3].tgid, 11);
+        assert_eq!(evs[3].blob, b"hi\n");
     }
 
     #[test]
