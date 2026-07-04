@@ -1058,6 +1058,17 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                    overlay rule ({} layers > 9)", 2 + lowers.len());
         return 2;
     }
+    // '+' is the overlay rule's layer separator and the rule syntax has
+    // no escaping: a '+' anywhere in a layer path would silently split
+    // into garbage layers and box writes would land on the REAL host
+    // under the truncated prefix. Fail loud instead.
+    if upper.contains('+') || lowers.iter().any(|l| l.contains('+')) {
+        eprintln!("sarun-engine run --sud: state path contains '+' \
+                   (the overlay rule separator): {upper}\n\
+                   move the engine state dir (XDG_STATE_HOME) to a \
+                   path without '+'");
+        return 2;
+    }
     let mut layers = upper.clone();
     for l in &lowers {
         layers.push('+');
