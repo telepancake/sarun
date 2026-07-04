@@ -309,6 +309,13 @@ int sud_pr_resolve_at_inramfs(int dirfd, const char *path,
 {
     if (!g_inramfs_mount_len) return -1;
     int rc = sud_pr_absolutise(dirfd, path, out, out_sz);
+    /* -EXDEV is absolutise's "unknown dirfd" SENTINEL, not an error:
+     * such a path cannot be classified as inramfs, so it is simply
+     * not ours (-1 → caller falls through to overlay/kernel).
+     * Propagating it raw made the ticket dispatchers short-circuit
+     * application syscalls with a bogus EXDEV (GNU rm's
+     * unlinkat(dirfd, name) against an opened directory). */
+    if (rc == -EXDEV) return -1;
     if (rc < 0) return rc;
     if (!sud_pr_inramfs_path_under_mount(out)) return -1;
     return 0;

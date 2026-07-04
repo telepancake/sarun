@@ -17,6 +17,7 @@
 
 #include "sud/path_remap/overlay.h"
 #include "sud/path_remap/rules.h"
+#include "sud/path_remap/path.h"
 #include "sud/raw.h"
 #include "sud/runtime_config.h"
 
@@ -829,6 +830,12 @@ int sud_overlay_open_dir(const char *path, int flags, int mode)
                            flags | O_DIRECTORY, mode, 0, 0);
     if (fd < 0) return (int)fd;
     fd_map_remember((int)fd, path);
+    /* Register in the SHARED dirfd table too: (dirfd, rel) syscalls
+     * absolutise through sud_pr_dirfd_lookup, and a synth-dir fd that
+     * is only in overlay's private map absolutises as "unknown dirfd"
+     * — deletes/renames relative to an opened directory then bypass
+     * the overlay (GNU rm opens the parent and unlinkat(dirfd, name)). */
+    sud_pr_dirfd_register((int)fd, path);
     return (int)fd;
 }
 

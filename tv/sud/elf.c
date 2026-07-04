@@ -339,6 +339,25 @@ int resolve_path(const char *cmd, char *out, int out_sz)
 #endif
 
     if (cmd[0] == '.' || strchr(cmd, '/')) {
+        /* Absolutise against the kernel cwd and re-enter the absolute
+         * arm so overlay/remap rules apply.  Without this, a relative
+         * exec of a binary that exists only in the overlay UPPER
+         * (`./example` just built by the box) reaches the kernel
+         * against the host directory and ENOENTs. */
+        char abs[PATH_MAX];
+        long n = raw_syscall6(SYS_readlinkat, AT_FDCWD,
+                              (long)"/proc/self/cwd",
+                              (long)abs, sizeof(abs) - 1, 0, 0);
+        if (n > 0) {
+            size_t cl = (size_t)n;
+            size_t pl = strlen(cmd);
+            if (cl + 1 + pl + 1 <= sizeof(abs)) {
+                abs[cl] = '/';
+                memcpy(abs + cl + 1, cmd, pl + 1);
+                if (resolve_path(abs, out, out_sz))
+                    return 1;
+            }
+        }
         size_t clen = strlen(cmd);
         if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
         memcpy(out, cmd, clen);

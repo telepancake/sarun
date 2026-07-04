@@ -48,8 +48,13 @@ static int remap_path_arg(struct sud_syscall_ctx *ctx, int idx,
     const char *path = (const char *)ctx->args[idx];
     if (!path || !ctx->scratch || ctx->scratch_size == 0)
         return SUD_OVERLAY_PASSTHROUGH;
-    int rc = sud_overlay_resolve(path, for_write,
-                                 ctx->scratch, ctx->scratch_size);
+    /* Route through the cwd-aware resolver: the plain (non-at) path
+     * syscalls take RELATIVE paths too (ld ends its link with
+     * chmod("h", 0755)), and sud_overlay_resolve would pass those
+     * through to the kernel against the HOST cwd — reads then miss
+     * the overlay and writes hit the real host tree. */
+    int rc = sud_overlay_resolve_at(AT_FDCWD, path, for_write,
+                                    ctx->scratch, ctx->scratch_size);
     if (rc == SUD_OVERLAY_RESOLVED)
         ctx->args[idx] = (long)ctx->scratch;
     return rc;
@@ -105,24 +110,11 @@ static int open_is_write(long flags)
 static int merged_abs_of(int dirfd, const char *path,
                          char *buf, size_t sz)
 {
-    if (path[0] == '/') {
-        size_t n = strlen(path);
-        if (n + 1 > sz) return -1;
-        memcpy(buf, path, n + 1);
-        return 0;
-    }
-    if (dirfd != AT_FDCWD) return -1;
-    long n = raw_syscall6(SYS_readlinkat, AT_FDCWD,
-                          (long)"/proc/self/cwd",
-                          (long)buf, (long)(sz - 1), 0, 0);
-    if (n < 0) return -1;
-    buf[n] = '\0';
-    size_t cl = (size_t)n;
-    size_t pl = strlen(path);
-    if (cl + 1 + pl + 1 > sz) return -1;
-    buf[cl] = '/';
-    memcpy(buf + cl + 1, path, pl + 1);
-    return 0;
+    /* sud_pr_absolutise handles all three shapes: absolute paths,
+     * AT_FDCWD (via the logical-cwd shadow, falling back to
+     * /proc/self/cwd), and real dirfds via the shared dirfd table
+     * (which overlay's synth-dir opens register into). */
+    return sud_pr_absolutise(dirfd, path, buf, sz) == 0 ? 0 : -1;
 }
 
 /* If the caller is trying to delete `(dirfd, path)`, perform the
@@ -741,14 +733,43 @@ static int handle_chdir(struct sud_syscall_ctx *ctx)
     }
 
     /* Step 2: the destination is on the host FS.  Drop any stale
-     * shadow (the kernel CWD is about to become authoritative again),
-     * then fall through with the path arg overlay-resolved when an
-     * overlay rule applies. */
+     * shadow (the kernel CWD is about to become authoritative again). */
     sud_pr_cwd_set(0);
 
     if (sud_overlay_rule_count() == 0) return 0;
-    int rc = remap_path_arg(ctx, 0, 0);
-    return handle_overlay_result(ctx, rc);
+
+    /* Prefer the VIRTUAL path whenever the kernel itself can resolve
+     * it (the wide overlay's lower is the host, an identity mapping):
+     * the kernel cwd then doubles as the virtual cwd and every
+     * relative-path absolutisation (/proc/self/cwd) stays virtual.
+     * Blindly overlay-resolving here rewrote chdir to the UPPER
+     * SKELETON as soon as the box had written ANY file under the
+     * directory — children then inherited an upper cwd where the
+     * unmodified source tree doesn't exist (cc1's relative
+     * "test/example.c" → ENOENT). */
+    char vabs[PATH_MAX];
+    if (sud_pr_absolutise(AT_FDCWD, path, vabs, sizeof(vabs)) == 0) {
+        long pf = raw_syscall6(SYS_openat, AT_FDCWD, (long)vabs,
+                               O_RDONLY | O_DIRECTORY, 0, 0, 0);
+        if (pf >= 0) {
+            raw_close((int)pf);
+            return 0;   /* kernel chdir on the virtual path */
+        }
+        /* Not kernel-resolvable: the dir may exist only in a layer
+         * (mkdir'd inside the box → upper only).  chdir to the layer
+         * path inline and SHADOW the virtual cwd so getcwd and
+         * relative resolution keep presenting the virtual path. */
+        char lay[PATH_MAX];
+        int rc = sud_overlay_resolve(vabs, 0, lay, sizeof(lay));
+        if (rc == SUD_OVERLAY_WHITEOUT)
+            return short_circuit(ctx, -ENOENT);
+        if (rc == SUD_OVERLAY_RESOLVED) {
+            long r = raw_syscall6(SYS_chdir, (long)lay, 0, 0, 0, 0, 0);
+            if (r == 0) sud_pr_cwd_set(vabs);
+            return short_circuit(ctx, r);
+        }
+    }
+    return 0;
 }
 
 static int handle_getcwd(struct sud_syscall_ctx *ctx)
