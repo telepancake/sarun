@@ -55,6 +55,21 @@ Node = name            opaque bytes; ordering/semantics defined by the variant's
   wiki revision's sha1-as-recorded-by-the-source). Derived values do not
   appear here (§5).
 
+Two semantics pinned by the reference implementation (each was forced by a
+randomized-law counterexample, not chosen aesthetically):
+
+- **Canonical form: an empty node does not exist.** A resolved node with
+  no blob, no attrs, and no children is pruned; existence *is* content.
+  The alternative ("a named node exists because a layer named it") makes
+  compose unsound — a node materialized by one layer and emptied by a
+  later one would need an inexpressible "materialize but inherit" marker
+  to squash correctly. Variants that need empty directories to exist carry
+  attrs on them (an fs layer's mode already does).
+- **Inherit-absence.** A delta node that only inherits (blob `Keep`, attrs
+  inherit, no materializing children) applied over an absent name yields
+  absence, not an empty node. Corollary: the identity delta is prunable,
+  and `diff` output is minimal.
+
 ## 3. The depot / bookkeeping boundary
 
 The depot stores layers. Everything *about* layers and their owners —
