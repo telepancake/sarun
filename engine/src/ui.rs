@@ -327,6 +327,13 @@ enum Modal {
     /// generic transport — it runs the given argv; it does NOT presume a box or
     /// any box parameters (that is the caller's choice).
     PtyCmd { buf: String },
+    /// Browser URL entry (DESIGN-web.md W3). A real URL field, not a shell
+    /// line: `buf` is the destination the user types; Enter assembles the
+    /// carbonyl launch (persistent BROWSER box, web capture on) with `spki`
+    /// pinned so Chromium trusts the tap MITM proxy. `spki` is captured at
+    /// open time (the action refuses to open this modal if the CA is missing),
+    /// so it's a plain String, never a silent None.
+    BrowserUrl { buf: String, spki: String },
     /// Vars-view query: `name [value]` — two whitespace-separated cmd_match
     /// text globs (bare word = substring); the second is optional.
     VarQuery { buf: String },
@@ -496,9 +503,11 @@ enum Action {
     /// `<exe> oci run <name>` (a container shell on that image).
     RunSelectedImage,
     /// Launcher: carbonyl (Chromium in the terminal) in the persistent
-    /// BROWSER box — the URL prompt is the PtyCmd modal pre-filled with the
-    /// full `oci run --name BROWSER` command, URL left to finish. Reruns
-    /// reuse the box (profile persists); refused when it's already live.
+    /// BROWSER box (DESIGN-web.md W3). Opens a real URL field (Modal::
+    /// BrowserUrl); Enter assembles the launch via build_launch as
+    /// Reuse("BROWSER") + webcap, so the Chromium profile persists across
+    /// launches and every page is captured to the box's web archive. Refused
+    /// (visible status) if the MITM CA is unavailable.
     BrowserCarbonyl,
     /// Api pane: run `oaita local` on a PTY — download a tiny tool-capable
     /// model + CPU runtime and serve a local OpenAI-compatible endpoint.
@@ -1021,6 +1030,7 @@ impl App {
             net: effective_net(self).to_string(),
             env: self.launch_env,
             placement,
+            webcap: false,
         }
     }
 
@@ -5805,6 +5815,17 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from(help),
             ])
         }
+        Modal::BrowserUrl { buf, .. } => {
+            (" open in browser ",
+             vec![
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from("carbonyl (Chromium in the terminal) in the \
+                            persistent BROWSER box — the profile persists and \
+                            every page is captured to the box's web archive"),
+                Line::from("Enter open · Esc cancel"),
+            ])
+        }
         Modal::ActionMenu { title, items, sel } => {
             let mut body = vec![
                 Line::from(Span::styled(title.clone(),
@@ -8084,6 +8105,11 @@ struct How {
     net: String,
     env: bool,
     placement: Placement,
+    /// Web capture (DESIGN-web.md W2/W3): pass `--webcap` so this box's tap
+    /// HTTP(S) traffic is teed into its `webcap` store. A universal How axis
+    /// like net/env — the browser and crawler set it; other targets default
+    /// off. tap-only (the engine gates it), so it's inert without `--net tap`.
+    webcap: bool,
 }
 
 /// What to run. Pure data — no variant carries spawn logic; build_launch()
@@ -8096,9 +8122,12 @@ enum LaunchTarget {
     Command(Vec<String>),
     /// A container from an OCI image reference (runs its entrypoint/cmd).
     Image(String),
-    /// carbonyl — an image target with a fixed reference + argv + the MITM
-    /// SPKI so Chromium trusts the tap proxy. URL left for the user to finish.
-    Browser { spki: Option<String> },
+    /// carbonyl (DESIGN-web.md W3) — the browser: a fixed-image target with
+    /// the container argv and the MITM SPKI so Chromium trusts the tap proxy.
+    /// `url` is the validated destination (assembled here, not spliced into a
+    /// shell line). Launched Reuse("BROWSER") + webcap so the profile persists
+    /// and browsing archives; see build_launch.
+    Browser { url: String, spki: Option<String> },
     /// An oaita agent session seeded with `task`.
     Ai { task: String },
     /// The host login shell — the ONE target not in a box, so no How applies.
@@ -8124,6 +8153,7 @@ fn run_argv(how: &How, brush: bool, cmd: &[String]) -> Vec<String> {
     a.push("--net".into());
     a.push(how.net.clone());
     if how.env { a.push("-e".into()); }
+    if how.webcap { a.push("--webcap".into()); }
     match &how.placement {
         Placement::New => {}
         Placement::Reuse(n) => a.push(n.clone()),
@@ -8148,6 +8178,7 @@ fn oci_run_argv(how: &How, reference: &str, cmd: &[String]) -> Vec<String> {
         a.push("--name".into());
         a.push(n.clone());
     }
+    if how.webcap { a.push("--webcap".into()); }
     a.push(reference.into());
     if !cmd.is_empty() {
         a.push("--".into());
@@ -8189,7 +8220,7 @@ fn build_launch(target: &LaunchTarget, how: &How) -> Vec<String> {
         LaunchTarget::Shell => run_argv(how, true, &[]),
         LaunchTarget::Command(cmd) => run_argv(how, true, cmd),
         LaunchTarget::Image(reference) => oci_run_argv(how, reference, &[]),
-        LaunchTarget::Browser { spki } => {
+        LaunchTarget::Browser { url, spki } => {
             let mut cmd = vec![
                 "/carbonyl/carbonyl".to_string(),
                 "--no-sandbox".into(),
@@ -8199,7 +8230,10 @@ fn build_launch(target: &LaunchTarget, how: &How) -> Vec<String> {
             if let Some(k) = spki {
                 cmd.push(format!("--ignore-certificate-errors-spki-list={k}"));
             }
-            cmd.push("https://".into());
+            // The validated URL is the last positional; a blank one lets
+            // carbonyl open its own start page rather than a dud "https://".
+            let dest = if url.trim().is_empty() { "about:blank" } else { url.trim() };
+            cmd.push(dest.to_string());
             oci_run_argv(how, CARBONYL_IMAGE, &cmd)
         }
         LaunchTarget::Ai { task } => ai_argv(how, task),
@@ -9004,13 +9038,18 @@ fn run_action(app: &mut App, a: Action) {
             }
         }
         Action::BrowserCarbonyl => {
-            // Just another image target — no browser-specific box lifecycle.
-            // Prefilled editable (the URL is left dangling for the user); add
-            // `--name X` in the command for a persistent browser, exactly as
-            // for any container.
-            let spki = crate::net::ca::root_spki_sha256_b64().ok();
-            let argv = build_launch(&LaunchTarget::Browser { spki }, &app.how(Placement::New));
-            app.modal = Some(Modal::PtyCmd { buf: shell_join(&argv) });
+            // Open a real URL field (DESIGN-web.md W3). The MITM SPKI is
+            // required — Chromium ignores the overlay CA bundle and pin-trusts
+            // this key instead, so without it TLS interception fails silently
+            // in the browser. Refuse to launch (visible error) rather than
+            // hand out a browser that can't load HTTPS.
+            match crate::net::ca::root_spki_sha256_b64() {
+                Ok(spki) => app.modal = Some(Modal::BrowserUrl {
+                    buf: "https://".into(), spki,
+                }),
+                Err(e) => app.status =
+                    format!("browser: MITM CA unavailable ({e}); cannot launch"),
+            }
         }
         Action::OaitaLocalPty  => {
             app.open_pty(vec![self_exe(), "oaita".into(), "local".into()]);
@@ -9194,6 +9233,33 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 app.modal = Some(Modal::PtyCmd { buf });
             }
             _ => app.modal = Some(Modal::PtyCmd { buf }),
+        },
+        Modal::BrowserUrl { mut buf, spki } => match code {
+            KeyCode::Enter => {
+                // Assemble the browser launch from the validated URL: the
+                // persistent BROWSER box (profile persists across launches)
+                // with web capture on (browsing archives). One universal
+                // build_launch, not a hand-edited shell line.
+                let how = How {
+                    net: effective_net(app).to_string(),
+                    env: app.launch_env,
+                    placement: Placement::Reuse("BROWSER".into()),
+                    webcap: true,
+                };
+                let argv = build_launch(
+                    &LaunchTarget::Browser { url: buf, spki: Some(spki) }, &how);
+                app.open_pty(argv);
+            }
+            KeyCode::Esc => app.status = "browser cancelled".into(),
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::BrowserUrl { buf, spki });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::BrowserUrl { buf, spki });
+            }
+            _ => app.modal = Some(Modal::BrowserUrl { buf, spki }),
         },
         Modal::ActionMenu { title, items, mut sel } => match code {
             KeyCode::Esc => app.status = "menu cancelled".into(),
@@ -10113,23 +10179,29 @@ mod tests {
 
     // A How with the given net + placement (env off unless set) for tests.
     fn how(net: &str, placement: Placement) -> How {
-        How { net: net.to_string(), env: false, placement }
+        How { net: net.to_string(), env: false, placement, webcap: false }
     }
 
     #[test]
-    fn build_launch_browser_is_a_plain_image_target() {
-        // The browser has NO special path: it is an Image with a fixed
-        // digest-pinned ref, the entrypoint flags repeated (an explicit
-        // `oci run ... -- CMD` REPLACES entrypoint+cmd), --user-data-dir
-        // (without which Chromium ignores the SPKI allowlist), the MITM SPKI,
-        // and a URL stub last. net is honored like any launch.
+    fn build_launch_browser_persists_and_captures() {
+        // The browser (DESIGN-web.md W3) is a digest-pinned carbonyl image with
+        // the entrypoint flags repeated (an explicit `oci run ... -- CMD`
+        // REPLACES entrypoint+cmd), --user-data-dir (without which Chromium
+        // ignores the SPKI allowlist), the MITM SPKI, and the VALIDATED URL
+        // last. Its How is Reuse("BROWSER") + webcap, so the launch carries
+        // both --name BROWSER (profile persistence) and --webcap (archiving).
+        let how = How {
+            net: "tap".into(), env: false,
+            placement: Placement::Reuse("BROWSER".into()), webcap: true,
+        };
         let argv = build_launch(
-            &LaunchTarget::Browser { spki: Some("AbC=".into()) },
-            &how("tap", Placement::New));
+            &LaunchTarget::Browser { url: "https://example.com".into(),
+                                     spki: Some("AbC=".into()) }, &how);
         let j = argv.join(" ");
         assert!(j.starts_with(
-            "sarun oci run --net tap docker.io/fathyb/carbonyl@sha256:"),
-            "digest-pinned oci run, got {j:?}");
+            "sarun oci run --net tap --name BROWSER --webcap \
+             docker.io/fathyb/carbonyl@sha256:"),
+            "persistent + captured oci run, got {j:?}");
         assert!(argv.contains(&"--".to_string())
             && argv.contains(&"/carbonyl/carbonyl".to_string()),
             "explicit CMD names the binary, got {j:?}");
@@ -10138,20 +10210,21 @@ mod tests {
                      "--ignore-certificate-errors-spki-list=AbC="] {
             assert!(argv.iter().any(|a| a == flag), "missing {flag} in {j:?}");
         }
-        assert_eq!(argv.last().map(String::as_str), Some("https://"),
-            "URL stub last, got {j:?}");
-        // No SPKI: still valid, no empty flag.
+        assert_eq!(argv.last().map(String::as_str), Some("https://example.com"),
+            "validated URL last, got {j:?}");
+        // Blank URL falls back to about:blank, never a dud "https://".
         let argv = build_launch(
-            &LaunchTarget::Browser { spki: None }, &how("tap", Placement::New));
+            &LaunchTarget::Browser { url: "  ".into(), spki: None }, &how);
         assert!(!argv.iter().any(|a| a.contains("spki")), "no empty spki flag");
-        assert_eq!(argv.last().map(String::as_str), Some("https://"));
+        assert_eq!(argv.last().map(String::as_str), Some("about:blank"));
     }
 
     #[test]
     fn build_launch_honors_net_and_env_for_every_target() {
         // net is spliced identically; env (-e) only where a box run accepts
         // it (`sarun run`), never on oci run / host shell.
-        let h = How { net: "host".into(), env: true, placement: Placement::New };
+        let h = How { net: "host".into(), env: true, placement: Placement::New,
+                      webcap: false };
         assert_eq!(build_launch(&LaunchTarget::Shell, &h),
             vec!["sarun", "run", "-b", "--net", "host", "-e", "--"]);
         assert_eq!(build_launch(&LaunchTarget::Command(vec!["make".into()]), &h),
@@ -10206,7 +10279,8 @@ mod tests {
         // are inverses for the commands build_launch emits, incl. an arg with
         // spaces.
         for argv in [
-            build_launch(&LaunchTarget::Browser { spki: Some("A=".into()) },
+            build_launch(&LaunchTarget::Browser { url: "https://x.test".into(),
+                                                  spki: Some("A=".into()) },
                          &how("tap", Placement::New)),
             vec!["sarun".into(), "run".into(), "-b".into(), "--".into(),
                  "echo".into(), "a b".into()],
