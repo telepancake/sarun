@@ -157,6 +157,79 @@ fn apply_event(b: &BoxState, st: &Stream,
     }
 }
 
+// ── nesting: same-in-same (sud under sud) ───────────────────────────────────
+// Wrapper-in-wrapper is impossible (both wrappers link at one fixed text
+// address, and the outer wrapper's execve interception would wrap the
+// inner wrapper binary), so a nested sud box is FLATTENED: one wrapper
+// invocation whose overlay rule stacks the child's upper over each
+// ancestor's captured state over the host. Ancestor state is authoritative
+// in the sqlar (apply/discard mutate it after the sweep), so the lower is
+// MATERIALIZED from the BoxState — the stale sud-up directory is never
+// used as a lower.
+
+/// Materialize box `aid`'s at-rest captured state into `dest` as a sud
+/// overlay lower: files hardlink (fall back to copy) from the blob pool,
+/// whiteout rows become char-0:0 markers, dirs/symlinks/specials their
+/// on-disk selves. Returns the entry count.
+pub fn export_box(aid: i64, dest: &Path) -> Result<usize, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let b = BoxState::create(aid).map_err(|e| format!("sqlar {aid}: {e}"))?;
+    b.load_mirror();
+    let _ = std::fs::remove_dir_all(dest); // stale from a prior nest run
+    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    let kinds = b.kinds.read().unwrap();
+    let mut rels: Vec<&String> = kinds.keys().collect();
+    rels.sort(); // parents sort before children
+    let mut n = 0usize;
+    for rel in rels {
+        let p = dest.join(rel);
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let cpath = || std::ffi::CString::new(
+            p.as_os_str().as_encoded_bytes()).unwrap();
+        match &kinds[rel] {
+            crate::capture::Entry::Dir { mode, .. } => {
+                let _ = std::fs::create_dir_all(&p);
+                let _ = std::fs::set_permissions(&p,
+                    std::fs::Permissions::from_mode(mode & 0o7777));
+            }
+            crate::capture::Entry::File { rowid, mode } => {
+                let src = blob_path(aid, *rowid);
+                let _ = std::fs::remove_file(&p);
+                if std::fs::hard_link(&src, &p).is_err() {
+                    std::fs::copy(&src, &p)
+                        .map_err(|e| format!("{rel}: {e}"))?;
+                }
+                let _ = std::fs::set_permissions(&p,
+                    std::fs::Permissions::from_mode(mode & 0o7777));
+            }
+            crate::capture::Entry::Symlink { target } => {
+                let _ = std::fs::remove_file(&p);
+                std::os::unix::fs::symlink(target, &p)
+                    .map_err(|e| format!("{rel}: symlink: {e}"))?;
+            }
+            crate::capture::Entry::Whiteout => {
+                let _ = std::fs::remove_file(&p);
+                if unsafe { libc::mknod(cpath().as_ptr(),
+                                        libc::S_IFCHR, 0) } != 0 {
+                    return Err(format!("{rel}: whiteout mknod: {}",
+                        std::io::Error::last_os_error()));
+                }
+            }
+            crate::capture::Entry::Special { mode, rdev } => {
+                // Best-effort (fifos work unprivileged; devices may not).
+                let _ = std::fs::remove_file(&p);
+                let _ = unsafe {
+                    libc::mknod(cpath().as_ptr(), *mode, *rdev as libc::dev_t)
+                };
+            }
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Walk `upper` (the sud overlay's upper directory) and mirror it into the
 /// box's sqlar. Char-0:0 device nodes are the sud/overlayfs whiteout marker
 /// and become whiteout rows. `writers` (from the trace stream) attributes

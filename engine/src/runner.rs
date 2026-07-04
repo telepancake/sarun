@@ -762,6 +762,15 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     let sud64 = std::env::var("SARUN_SUD64")
         .ok().filter(|s| !s.is_empty())
         .unwrap_or_else(|| "sud64".to_string());
+    // The 32-bit twin: $SARUN_SUD32, else sud64's sibling (the wrapper
+    // itself derives its cross-class sibling the same way — dir(self) +
+    // "/sud32" — so keeping them adjacent is already the contract).
+    let sud32 = std::env::var("SARUN_SUD32")
+        .ok().filter(|s| !s.is_empty())
+        .unwrap_or_else(|| match sud64.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/sud32"),
+            None => "sud32".to_string(),
+        });
     let sock = paths::sock_path();
     let conn = match UnixStream::connect(&sock) {
         Ok(c) => c,
@@ -818,6 +827,14 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         .unwrap_or("?").to_string();
     let upper = ack.get("sud_upper").and_then(Value::as_str)
         .unwrap_or("").to_string();
+    // Nested (same-in-same) sud box: the engine materialized each
+    // ancestor's captured state and hands the lower list back; the
+    // overlay stacks upper → lowers → host in that priority order.
+    let lowers: Vec<String> = ack.get("sud_lowers")
+        .and_then(Value::as_array)
+        .map(|a| a.iter()
+             .filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
     if upper.is_empty() {
         eprintln!("sarun-engine: engine did not allocate a sud upper \
                    (engine older than this runner?)");
@@ -825,17 +842,13 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     }
     eprintln!("sarun-engine: box {sid}  (sud upper: {upper})");
     // Probe the target the way sudtrace did: PATH-resolve, shebang, ELF
-    // class (we ship only the 64-bit wrapper — fail LOUD on a 32-bit
-    // target, no silent downgrade).
+    // class → pick sud32 or sud64 for the initial exec (the wrapper
+    // handles cross-class children itself via its dir-sibling paths).
     let resolved = sud_resolve_target(&cmd[0]);
     let shebang = sud_shebang(&resolved);
     let probe = shebang.as_ref().map(|(i, _)| i.as_str())
         .unwrap_or(resolved.as_str());
-    if sud_elf_class(probe) == 1 {
-        eprintln!("sarun-engine run --sud: {probe} is a 32-bit ELF; only \
-                   the sud64 wrapper is wired up (sud32 support pending).");
-        return 2;
-    }
+    let wrapper = if sud_elf_class(probe) == 1 { &sud32 } else { &sud64 };
     // Launcher contract, absorbed from tv/sud/sudtrace.c: the trace pipe's
     // write end on fd 1023 and the 4 KiB MAP_SHARED wire-state page
     // (stream-id counter) on fd 1022, both inherited by every traced
@@ -881,7 +894,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // filesystems and sarun's own state tree out BEFORE the wide `/`
     // overlay. /tmp passthrough is a step-1 stopgap — see DESIGN-sud.md.
     let state_dir = crate::paths::state_home();
-    let mut sc = Command::new(&sud64);
+    let mut sc = Command::new(wrapper);
     for p in ["/proc", "/dev", "/sys", "/tmp"] {
         sc.args(["--remap-rule", &format!("passthrough:{p}")]);
     }
@@ -893,7 +906,20 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // box's upper (sud × FUSE composition, DESIGN-sud.md).
     sc.arg("--remap-rule")
         .arg(format!("passthrough:{}", crate::paths::mnt_point().display()));
-    sc.arg("--remap-rule").arg(format!("overlay:/={upper}+/"));
+    // rules.h caps an overlay rule at 9 layers (upper + 8): chain depth
+    // beyond that would be SILENTLY dropped by the wrapper parser — fail
+    // loud instead.
+    if 2 + lowers.len() > 9 {
+        eprintln!("sarun-engine run --sud: box chain too deep for one \
+                   overlay rule ({} layers > 9)", 2 + lowers.len());
+        return 2;
+    }
+    let mut layers = upper.clone();
+    for l in &lowers {
+        layers.push('+');
+        layers.push_str(l);
+    }
+    sc.arg("--remap-rule").arg(format!("overlay:/={layers}+/"));
     match &shebang {
         Some((interp, arg)) => {
             // Script: wrapper runs the interpreter with the kernel's
@@ -909,11 +935,11 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     let child = match sc.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("sarun-engine: exec {sud64}: {e}\n\
-                       hint: build it with `make -C tv sud64 \
+            eprintln!("sarun-engine: exec {wrapper}: {e}\n\
+                       hint: build it with `make -C tv sud64 sud32 \
                        SUD_ADDINS=\"sud/trace sud/path_remap sud/cmd-rewrite \
-                       sud/fake-exec sud/inramfs\"` and put it on PATH or \
-                       point SARUN_SUD64 at it.");
+                       sud/fake-exec sud/inramfs\"` and put them on PATH or \
+                       point SARUN_SUD64/SARUN_SUD32 at them.");
             return 127;
         }
     };

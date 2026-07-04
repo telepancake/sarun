@@ -326,15 +326,22 @@ int sud_overlay_resolve(const char *path, int for_write,
     /* Read path. */
     if (upper_state == 1) return SUD_OVERLAY_WHITEOUT;
     if (upper_state == 2) return copy_resolved(out, out_sz, upath);
-    /* Walk lowers. */
+    /* Walk lowers.  A whiteout in a MIDDLE lower hides the entry from
+     * every layer below it (multi-lower stacks built from nested-box
+     * exports carry whiteouts in lowers, not just in the upper) — the
+     * dir-listing merge already treats lower whiteouts this way; the
+     * resolve walk must agree or a deleted-in-parent path re-resolves
+     * to the grandparent/host copy. */
     int lc = rule_lower_count(r);
     for (int i = 0; i < lc; i++) {
         char buf[PATH_MAX];
         if (compose_layer(buf, sizeof(buf),
                           rule_lower(r, i), rule_lower_len(r, i), tail) < 0)
             continue;
-        if (stat_one(buf, &st) == 0)
+        if (stat_one(buf, &st) == 0) {
+            if (is_whiteout_st(&st)) break;
             return copy_resolved(out, out_sz, buf);
+        }
     }
     /* Not found in any layer.  Return the upper path so the syscall
      * itself produces -ENOENT against a meaningful location.  If no

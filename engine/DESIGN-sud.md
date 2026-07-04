@@ -72,10 +72,42 @@ not drop in.
 3. Only then: the store. Alternate `BoxState` backend on depot/strpool
    mechanics, sqlar kept as an export for the Python tooling.
 
-## Composition: sud × FUSE boxes (design sketch, nothing implemented)
+## Composition: same-in-same nesting (implemented), mixed (sketch)
 
-Four quadrants; the working rule of thumb is *flatten sud into rules,
-bridge FUSE through its mount path*:
+Same-in-same nesting preserves the full model on both sides, and both
+sides use the SAME shape: **flattening**. FUSE-in-FUSE was never
+mount-in-mount — it is one multi-box mount whose resolve() walks the
+parent chain; sud-in-sud is likewise never wrapper-in-wrapper (both
+wrappers link at one fixed text address, and the outer wrapper's execve
+interception would wrap the inner wrapper binary) — it is ONE wrapper
+invocation whose overlay rule stacks the layers.
+
+**sud-in-sud (implemented)**: `sarun run --sud PARENT.CHILD -- cmd`
+(launched from the host, dotted-name parent resolution — the existing
+register path). Register validates the chain is all-sud and AT REST,
+materializes each ancestor's captured state from its sqlar
+(`sud::export_box` — the inverse of the sweep: blob-pool hardlinks,
+char-0:0 whiteouts, dirs/symlinks/specials) into `live/<id>/sud-lower-
+<aid>`, and acks the lower list; the runner emits
+`overlay:/=<up>+<lower…>+/`. A rerun exports its OWN prior state as the
+nearest lower (the FUSE analog is load_mirror) and starts from a clean
+upper. The sqlar is authoritative — the stale sud-up dir is never used
+as a lower, so apply/discard done between runs are honored. Upstream
+patch: the overlay resolve walk now honors whiteouts found in MIDDLE
+lowers (the dir-listing merge already did); rules.h caps one rule at 9
+layers, so chains deeper than 7 ancestors fail loud. Launching the
+nested run from INSIDE the parent box (rather than from the host) still
+needs the ancestry-derivation leg. Gaps: opaque-dir semantics don't
+exist in the sud overlay; parent boxes must be at rest.
+
+**32-bit (implemented)**: the runner probes the target's ELF class and
+picks sud32/sud64 (`$SARUN_SUD32`, or sud64's dir sibling — the same
+convention the wrapper itself uses for cross-class children). Verified:
+a static i386 binary traced by sud32 captures into the upper with
+attribution and output rows. This unblocks the inramfs upper (the
+in-RAM store must be mappable from both wrapper classes).
+
+Mixed quadrants (sketch only):
 
 - **FUSE box nested in a sud box**: works structurally today — the inner
   runner dials the engine as a host runner (a sud box sets no

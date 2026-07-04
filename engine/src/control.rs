@@ -1052,6 +1052,59 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
         b.set_parent(Some(p));
         b.set_meta("parent_box_id", &p.to_string());
     }
+    // sud nesting is same-in-same and FLATTENED (DESIGN-sud.md): one
+    // wrapper invocation whose overlay stacks child upper → materialized
+    // ancestor states → host. Wrapper-in-wrapper can't work (fixed text
+    // address), so the chain must be all-sud and at rest; a RERUN's own
+    // prior state is exported as the nearest lower so earlier writes show
+    // through (the FUSE analog is load_mirror). Lowers are materialized
+    // from the sqlar — the authoritative state — never from the stale
+    // sud-up directory.
+    let mut sud_lowers: Vec<String> = Vec::new();
+    if want_sud {
+        let mut export_ids: Vec<i64> = Vec::new();
+        if rerun { export_ids.push(id); }
+        let mut cur = parent;
+        let mut seen = std::collections::HashSet::new();
+        while let Some(aid) = cur {
+            if !seen.insert(aid) { break; }
+            let Some(bx) = boxes.get(&aid) else { break };
+            if bx.meta.get("sud").map(String::as_str) != Some("1") {
+                if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                return json!({"ok": false, "error": format!(
+                    "sud nesting is same-in-same: ancestor box {aid} is \
+                     not a sud box (see engine/DESIGN-sud.md)")});
+            }
+            if lock(state).box_pids.contains_key(&aid) {
+                if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                return json!({"ok": false, "error": format!(
+                    "parent sud box {aid} is running; its captured state \
+                     is only authoritative at rest")});
+            }
+            export_ids.push(aid);
+            cur = bx.parent;
+        }
+        for aid in export_ids {
+            let dest = backing.join(format!("sud-lower-{aid}"));
+            match crate::sud::export_box(aid, &dest) {
+                Ok(_) => sud_lowers.push(dest.to_string_lossy().into_owned()),
+                Err(e) => {
+                    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                    return json!({"ok": false,
+                        "error": format!("sud lower export: {e}")});
+                }
+            }
+        }
+        // A fresh run starts from an empty upper (a rerun's prior state
+        // just became the nearest lower; stale upper contents would
+        // re-ingest as phantom writes).
+        let up = backing.join("sud-up");
+        let _ = std::fs::remove_dir_all(&up);
+        if let Err(e) = std::fs::create_dir_all(&up) {
+            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            return json!({"ok": false, "error": format!("sud upper: {e}")});
+        }
+    }
     // Host visibility: a box whose chain is closed — its own --no-parent, or any
     // ancestor marked no_host_fallback (e.g. an OCI image's rootfs base) — sees
     // no host filesystem underneath. Surfaced to the runner so it can pick the
@@ -1151,6 +1204,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     }
     if want_sud {
         reply["sud_upper"] = json!(backing.join("sud-up").to_string_lossy());
+        reply["sud_lowers"] = json!(sud_lowers);
     }
     reply
 }
