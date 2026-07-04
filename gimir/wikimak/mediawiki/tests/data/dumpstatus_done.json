@@ -1,0 +1,20 @@
+{
+  "jobs": {
+    "metahistorybz2dump": {
+      "status": "done",
+      "updated": "2024-04-02 03:00:00",
+      "files": {
+        "testwiki-20240401-pages-meta-history1.xml-p1p99.bz2": {
+          "size": 97,
+          "url": "/testwiki/20240401/testwiki-20240401-pages-meta-history1.xml-p1p99.bz2",
+          "sha1": "ignored-by-tests"
+        },
+        "testwiki-20240401-pages-meta-history2.xml-p100p199.bz2": {
+          "size": 97,
+          "url": "/testwiki/20240401/testwiki-20240401-pages-meta-history2.xml-p100p199.bz2",
+          "sha1": "ignored-by-tests"
+        }
+      }
+    }
+  }
+}

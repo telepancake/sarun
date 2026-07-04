@@ -1,0 +1,37 @@
+[package]
+name = "wikimak-wikipedia"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+wikimak-depot.workspace = true
+wikimak-mediawiki.workspace = true
+strpool.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# Live test (`livewiki.rs`, `#[ignore]`) needs a `reqwest::blocking::Client`
+# to hand to `wikimak_mediawiki::discover` / `fetch`. Not used by any
+# always-run test.
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+
+[lints.clippy]
+# Tester's `tests/sha1.rs` doc-comment uses a multi-line, visually-aligned
+# list item that clippy reads as overindented. Can't edit tests/.
+doc_overindented_list_items = "allow"
+# Tester's `tests/livewiki.rs` uses `while let Some(_) = stream.next()`
+# against an `&mut PageStream<_>` — the for-loop rewrite clippy wants
+# doesn't compile against the borrowed iterator. Can't edit tests/.
+while_let_on_iterator = "allow"
+# Tester's `tests/codec.rs` builds a needle with `std::iter::repeat(b)
+# .take(n)`. Clippy 1.94+ wants `repeat_n` but it's MSRV-sensitive.
+manual_repeat_n = "allow"

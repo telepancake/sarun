@@ -1,0 +1,22 @@
+[package]
+name = "strpool"
+version = "0.1.0"
+edition = "2021"
+description = "Sharded, append-only byte-string pool with single-file shards and background zstd compaction."
+license = "Apache-2.0"
+
+[dependencies]
+# zstd: the on-disk compaction format. Frames are walked by the safe
+# `find_frame_compressed_size` header parser and decoded with prepared dicts.
+zstd = "0.13"
+# rayon: parallel substring scan across shards. The spec requires
+# `scan_substring` to return a `ParallelIterator`.
+rayon = "1"
+# memchr: SIMD-backed `memmem` for the substring scan.
+memchr = "2"
+# thiserror: derive macros for the public `StrpoolError` enum.
+thiserror = "1"
+
+[dev-dependencies]
+# tempfile is intentionally NOT used; tests build their own scratch dirs under
+# the system temp dir to keep the crate dependency footprint at exactly four.

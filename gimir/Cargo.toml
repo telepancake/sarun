@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "strpool",
+    "wikimak/depot",
+    "wikimak/mediawiki",
+    "wikimak/wikipedia",
+]
+exclude = [
+    ".claude/worktrees",
+    "third_party",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+strpool = { path = "strpool" }
+wikimak-depot = { path = "wikimak/depot" }
+wikimak-mediawiki = { path = "wikimak/mediawiki" }
+zstd = "0.13"
+memchr = "2"
+thiserror = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# bzip2 0.6 flipped the default backend to a pure-Rust port. Opt back into
+# the libbz2 C backend for per-block parallel decode.
+bzip2 = { version = "0.6", default-features = false, features = ["bzip2-sys"] }
+quick-xml = "0.40"
+sha1 = "0.10"
+sha2 = "0.10"
+regex = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rusqlite: meta.db storage (title intervals, page→chain map, parts watermarks).
+# `bundled` ships our own SQLite (3.47+) so we don't depend on system libsqlite3.
+# FTS5 is bundled by default in `bundled`.
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }

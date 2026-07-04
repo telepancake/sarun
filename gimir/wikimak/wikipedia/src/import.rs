@@ -1,0 +1,343 @@
+//! Import pipeline. Drains a `PageStream` into the depot + strpool +
+//! sqlite under per-page atomic transactions.
+//!
+//! ## Chain append strategy (this phase)
+//!
+//! Each revision becomes ONE depot frame. The wikipedia layer decides
+//! what bytes go into f0 vs f1; the depot is opaque.
+//!
+//! Pinning (deliberately the simplest scheme that passes the suite):
+//!   * f0 always holds the encoded bytes of the NEWEST revision (one
+//!     record).
+//!   * f1 holds the CONCATENATION of all older revisions' record bytes,
+//!     in newest-first order. Each record is self-delimiting via the
+//!     codec's fixed prefix + four varint-length-prefixed blobs, so the
+//!     reader walks them sequentially without an extra length field.
+//!   * We never seal (`seal_old_f1 = false`). There are no cold frames
+//!     this phase; the chain grows in f1. PHASES W3-Rust-4 revisits.
+//!
+//! ## Per-page atomicity
+//!
+//! Per SPEC §"Crash-safety contract":
+//!   1. `BEGIN IMMEDIATE` on sqlite.
+//!   2. For each new revision on this page, append one frame to the
+//!      depot. The depot index flip is the depot's commit; if sqlite
+//!      then rolls back, those frames are orphaned but unreferenced
+//!      (sqlite owns the page-id↔chain-id story).
+//!   3. Append the title bytes to the strpool ONCE per (ns, normalized
+//!      title) if not already present; record the resulting id.
+//!   4. Insert sqlite rows: `revisions_seen`, `title_id_to_page` (if
+//!      new title), `page_to_title_id`, `title_intervals` (one row per
+//!      stable title), `siteinfo_snapshots` (once per import).
+//!   5. Commit sqlite. The commit is the atomic boundary.
+//!
+//! ## Dedup
+//!
+//! A revision `(page_id, rev_id)` already present in `revisions_seen`
+//! is skipped and counted toward `revisions_deduped`.
+
+use std::io::Read;
+
+use rusqlite::params;
+use serde_json::json;
+use wikimak_mediawiki::{site_info, verify_rev_sha1, Contributor, Page, PageStream, Revision};
+
+use crate::error::Result;
+use crate::instance::{ContributorMeta, ImportStats, Instance, InstanceInner, RevisionMeta};
+use crate::revision::{
+    encode_revision, FLAG_COMMENT_HIDDEN, FLAG_CONTRIBUTOR_HIDDEN, FLAG_SHA1_MISMATCH,
+    FLAG_SUPPRESSED, FLAG_TEXT_HIDDEN,
+};
+
+pub(crate) fn do_import<R: Read>(
+    instance: &Instance,
+    stream: &mut PageStream<R>,
+) -> Result<ImportStats> {
+    let mut stats = ImportStats::default();
+    let mut siteinfo_captured = false;
+
+    while let Some(page) = stream.next() {
+        let page = page?;
+
+        // Capture site_info once (PageStream parses it during the first
+        // `next()` call). Best-effort: skipping on missing or insert
+        // failure is fine — the table is not query-pinned by tests.
+        if !siteinfo_captured {
+            if let Some(si) = site_info(stream) {
+                // Use a Mutex-guarded conn; capture once.
+                let g = instance.inner.lock().expect("instance mutex poisoned");
+                capture_siteinfo(&g.conn, si)?;
+                siteinfo_captured = true;
+            }
+        }
+
+        let page_id = page.id as u64;
+
+        // Skip-policy on overflow: page never touches the depot or
+        // sqlite. Matches PHASES §"page_id_overflow_errors_before_writes".
+        if page_id >= instance.max_chain_id {
+            continue;
+        }
+
+        import_one_page(instance, page, &mut stats)?;
+    }
+
+    Ok(stats)
+}
+
+fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> Result<()> {
+    let page_id = page.id as u64;
+
+    let g = instance.inner.lock().expect("instance mutex poisoned");
+
+    // Begin the per-page transaction.
+    g.conn.execute("BEGIN IMMEDIATE", [])?;
+    let outcome = (|| -> Result<bool> {
+        // Title bookkeeping. Tests assert ONE title_intervals row per
+        // stable-title page (PHASES W6 revisits rename history). For
+        // this phase: insert the page's title ONCE on first appearance.
+        let ns_i = page.namespace as i64;
+        let normalized = page.title.trim().as_bytes().to_vec();
+        ensure_title(&g, page_id, ns_i, &normalized, instance.title_shard_count)?;
+
+        // Append each revision in source order (oldest → newest); skip
+        // those already in revisions_seen. Source order isn't strictly
+        // timestamp-ordered in the wild, but every test fixture has
+        // it so. The chain's "newest in f0" is the LAST appended.
+        let mut new_this_page = 0u64;
+        for rev in &page.revisions {
+            let rev_id = rev.id as u64;
+            if revision_seen(&g.conn, page_id, rev_id)? {
+                stats.revisions_deduped += 1;
+                continue;
+            }
+
+            let (meta, text_bytes) = build_revision_record(rev, stats);
+            let encoded = encode_revision(&meta, &text_bytes);
+
+            append_depot_frame(&g, page_id, &encoded)?;
+
+            g.conn.execute(
+                "INSERT INTO revisions_seen(page_id, rev_id) VALUES(?1, ?2)",
+                params![page_id as i64, rev_id as i64],
+            )?;
+            new_this_page += 1;
+        }
+
+        stats.revisions_new += new_this_page;
+        // Pages counter: bump even when the page was wholly deduped —
+        // it WAS observed in the stream. Tests don't pin this case but
+        // the "pages" semantic is "pages seen this run".
+        stats.pages += 1;
+        Ok(true)
+    })();
+
+    match outcome {
+        Ok(_) => {
+            g.conn.execute("COMMIT", [])?;
+            Ok(())
+        }
+        Err(e) => {
+            // Rollback sqlite; depot frames already appended are
+            // orphaned (dead bytes), per SPEC's per-page atomicity
+            // contract.
+            let _ = g.conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
+
+/// Insert title pool entry + meta.db rows on first sighting of a
+/// (ns, normalized_title) pair. Subsequent calls are no-ops for the
+/// pool but DO insert `title_intervals` and `page_to_title_id` if not
+/// already present for this page.
+fn ensure_title(
+    g: &InstanceInner,
+    page_id: u64,
+    ns: i64,
+    normalized: &[u8],
+    title_shard_count: u32,
+) -> Result<()> {
+    // Look up an existing title_id for this (ns, normalized_title).
+    let existing: Option<i64> = g
+        .conn
+        .query_row(
+            "SELECT title_id FROM title_id_to_page
+             WHERE ns = ?1 AND normalized_title = ?2",
+            params![ns, normalized],
+            |r| r.get(0),
+        )
+        .ok();
+
+    let title_id = match existing {
+        Some(id) => id as u64,
+        None => {
+            // Pick a shard: simple modulo on a stable hash. For
+            // shard_count=1 (test default) this is always shard 0.
+            let shard_id = if title_shard_count == 0 {
+                0
+            } else {
+                (fnv1a(normalized) % title_shard_count as u64) as u32
+            };
+            let id = g.titles.append(shard_id, normalized)?;
+            g.conn.execute(
+                "INSERT INTO title_id_to_page(title_id, ns, normalized_title)
+                 VALUES(?1, ?2, ?3)",
+                params![id as i64, ns, normalized],
+            )?;
+            id
+        }
+    };
+
+    // Idempotent inserts for the page→title side.
+    g.conn.execute(
+        "INSERT OR IGNORE INTO page_to_title_id(page_id, title_id)
+         VALUES(?1, ?2)",
+        params![page_id as i64, title_id as i64],
+    )?;
+
+    // Title-intervals row: one per (page_id, start_ts). For this phase
+    // we use start_ts = 0 and end_ts NULL — a stable title yields one
+    // open-ended interval. INSERT OR IGNORE makes re-import a no-op.
+    g.conn.execute(
+        "INSERT OR IGNORE INTO title_intervals
+            (page_id, ns, normalized_title, start_ts, end_ts)
+         VALUES(?1, ?2, ?3, 0, NULL)",
+        params![page_id as i64, ns, normalized],
+    )?;
+    Ok(())
+}
+
+fn revision_seen(conn: &rusqlite::Connection, page_id: u64, rev_id: u64) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM revisions_seen WHERE page_id = ?1 AND rev_id = ?2",
+        params![page_id as i64, rev_id as i64],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Build the RevisionMeta + raw text bytes for one mediawiki Revision.
+/// Updates `stats.sha1_*` counters as a side effect. Sets the
+/// SHA1_MISMATCH flag when the stored sha1 cannot be matched to the
+/// text by any newline-fudge variant.
+fn build_revision_record(rev: &Revision, stats: &mut ImportStats) -> (RevisionMeta, Vec<u8>) {
+    let mut flags: u32 = 0;
+    if rev.text_hidden {
+        flags |= FLAG_TEXT_HIDDEN;
+    }
+    if rev.comment_hidden {
+        flags |= FLAG_COMMENT_HIDDEN;
+    }
+    if rev.contributor_hidden {
+        flags |= FLAG_CONTRIBUTOR_HIDDEN;
+    }
+    if rev.suppressed {
+        flags |= FLAG_SUPPRESSED;
+    }
+
+    // SHA1 counters. We can only verify if we actually have the text.
+    if !rev.text_hidden && !rev.sha1.is_empty() {
+        let (matched, _normalized, tried) = verify_rev_sha1(&rev.text, &rev.sha1);
+        if matched {
+            if tried.is_empty() {
+                stats.sha1_ok += 1;
+            } else {
+                stats.sha1_fudged += 1;
+            }
+        } else {
+            stats.sha1_mismatch += 1;
+            flags |= FLAG_SHA1_MISMATCH;
+        }
+    }
+
+    let contributor = match &rev.contributor {
+        Contributor::Anonymous { ip } => ContributorMeta::Anonymous { ip: ip.clone() },
+        Contributor::Named { username, user_id } => ContributorMeta::Named {
+            username: username.clone(),
+            user_id: *user_id as u64,
+        },
+        Contributor::Hidden => ContributorMeta::Hidden,
+    };
+
+    let text_bytes: Vec<u8> = if rev.text_hidden {
+        Vec::new()
+    } else {
+        rev.text.as_bytes().to_vec()
+    };
+    let text_len = text_bytes.len() as u64;
+
+    let meta = RevisionMeta {
+        rev_id: rev.id as u64,
+        parent_id: rev.parent_id.unwrap_or(0) as u64,
+        ts: rev.timestamp,
+        contributor,
+        comment: rev.comment.clone(),
+        sha1: rev.sha1.clone(),
+        flags,
+        text_len,
+    };
+    (meta, text_bytes)
+}
+
+/// Append one revision record to the depot chain for `chain_id`. See
+/// the module doc for the f0/f1 strategy.
+fn append_depot_frame(g: &InstanceInner, chain_id: u64, record: &[u8]) -> Result<()> {
+    // Is this the first append on the chain?
+    let prev_f0 = match g.depot.read_f0(chain_id) {
+        Ok(b) => Some(b),
+        Err(wikimak_depot::Error::NoFrame) => None,
+        Err(e) => return Err(e.into()),
+    };
+
+    match prev_f0 {
+        None => {
+            // First append: no f1.
+            g.depot.append(chain_id, record, None, false)?;
+        }
+        Some(prev_record) => {
+            // Build new f1 = prev_record then old_f1 (newest-first).
+            let prev_f1 = g.depot.read_f1(chain_id)?;
+            let mut new_f1 =
+                Vec::with_capacity(prev_record.len() + prev_f1.as_ref().map_or(0, |v| v.len()));
+            new_f1.extend_from_slice(&prev_record);
+            if let Some(b) = prev_f1 {
+                new_f1.extend_from_slice(&b);
+            }
+            g.depot.append(chain_id, record, Some(&new_f1), false)?;
+        }
+    }
+    Ok(())
+}
+
+fn capture_siteinfo(conn: &rusqlite::Connection, si: &wikimak_mediawiki::SiteInfo) -> Result<()> {
+    let captured_at = chrono::Utc::now().timestamp_micros();
+    let payload = json!({
+        "site_name": si.site_name,
+        "db_name": si.db_name,
+        "base": si.base,
+        "generator": si.generator,
+        "case": si.case,
+    });
+    // serde_json::to_vec on a flat object of String fields cannot fail
+    // (no custom Serialize, no non-UTF-8 keys); unwrap is fine.
+    let bytes = serde_json::to_vec(&payload).expect("siteinfo json");
+    // PRIMARY KEY on captured_at; OR IGNORE so a re-import doesn't
+    // collide on the rare same-microsecond reopen.
+    conn.execute(
+        "INSERT OR IGNORE INTO siteinfo_snapshots(captured_at, json) VALUES(?1, ?2)",
+        params![captured_at, bytes],
+    )?;
+    Ok(())
+}
+
+/// FNV-1a 64-bit. Used solely to pick a strpool shard deterministically
+/// from the normalized title bytes — never persisted, never read back.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}

@@ -1,0 +1,14 @@
+{
+  "jobs": {
+    "metahistorybz2dump": {
+      "status": "in-progress",
+      "updated": "2024-05-02 03:00:00",
+      "files": {
+        "testwiki-20240501-pages-meta-history1.xml-p1p99.bz2": {
+          "size": 97,
+          "url": "/testwiki/20240501/testwiki-20240501-pages-meta-history1.xml-p1p99.bz2"
+        }
+      }
+    }
+  }
+}

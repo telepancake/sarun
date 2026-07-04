@@ -1,0 +1,30 @@
+[package]
+name = "wikimak-mediawiki"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+bzip2.workspace = true
+quick-xml.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+regex.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+httpmock = "0.7"
+
+[lints.clippy]
+# The tester wrote `while let Some(item) = stream.next()` in livewiki.rs
+# and parser.rs; the for-loop rewrite clippy suggests isn't compatible
+# with consuming an &mut iterator the way those tests do. We can't edit
+# tests, so allow the pattern at the package level.
+while_let_on_iterator = "allow"
