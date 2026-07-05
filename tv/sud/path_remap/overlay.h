@@ -70,6 +70,15 @@ void sud_overlay_init(void);
  * is effectively a no-op). */
 int sud_overlay_rule_count(void);
 
+/* fd-based METADATA mutations (fchmod/fchown/fsetxattr/futimens):
+ * if `fd` currently backs onto a LOWER-layer file, copy it up and
+ * write the upper path into `out`, returning 1 — the caller applies
+ * the path-based equivalent to the upper copy instead of letting the
+ * fd op mutate the real lower.  Returns 0 when the fd is already
+ * upper, non-overlay, anonymous, or unresolvable (leave the op
+ * alone). */
+int sud_overlay_fd_upper_redirect(int fd, char *out, size_t out_sz);
+
 /* Resolve `path` (absolute) against the configured overlay rules.
  *
  *   for_write is one of the SUD_OVERLAY_FOR_* values below.

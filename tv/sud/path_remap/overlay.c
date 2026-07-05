@@ -403,6 +403,86 @@ static void copy_up_from_lowers(const struct sud_rule *r, const char *tail,
     (void)rc;
 }
 
+/* ----------------------------------------------------------------
+ *  fd → upper redirect for fd-based METADATA mutations.
+ *
+ *  An fd opened for READ resolves to the lower/host file; fchmod/
+ *  fchown/fsetxattr/futimens on that fd would mutate the REAL lower.
+ *  (Content ops can't hit this: a writable fd implies an open-for-
+ *  write, which copy-up already routed to the upper.)  Reverse-map
+ *  the fd's real path through the rule table: under an upper →
+ *  nothing to do; under a lower → rebuild the VIRTUAL path, resolve
+ *  it FOR_MODIFY (copy-up), and hand back the upper path so the
+ *  caller applies the path-based equivalent there instead.
+ * ---------------------------------------------------------------- */
+
+/* Does `path` sit under (`prefix`,`plen`) on a component boundary?
+ * Returns the tail ("/..." or "") or NULL.  A one-char "/" prefix is
+ * the identity mapping and matches every absolute path. */
+static const char *prefix_tail(const char *path,
+                               const char *prefix, size_t plen)
+{
+    if (!prefix || plen == 0) return 0;
+    if (plen == 1 && prefix[0] == '/')
+        return path[0] == '/' ? path : 0;
+    if (strncmp(path, prefix, plen) != 0) return 0;
+    if (path[plen] != '\0' && path[plen] != '/') return 0;
+    return path + plen;
+}
+
+int sud_overlay_fd_upper_redirect(int fd, char *out, size_t out_sz)
+{
+    if (!g_rule_count || fd < 0) return 0;
+    char link[64];
+    int ln = snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    if (ln <= 0) return 0;
+    char real[PATH_MAX];
+    long n = raw_readlink(link, real, sizeof(real) - 1);
+    if (n <= 0) return 0;
+    real[n] = '\0';
+    if (real[0] != '/') return 0;          /* pipe:, memfd:, socket: */
+    /* " (deleted)" suffix: the backing entry is gone — nothing to
+     * copy up, and the fd op on the orphan inode is box-local. */
+    if ((size_t)n > 10 && strncmp(real + n - 10, " (deleted)", 10) == 0)
+        return 0;
+
+    for (int i = 0; i < g_rule_count; i++) {
+        const struct sud_rule *r = &g_rules[i];
+        if (r->kind != SUD_RULE_KIND_OVERLAY) continue;
+        /* Already in this rule's upper: the fd op is box-local. */
+        if (rule_upper(r)
+            && prefix_tail(real, rule_upper(r), rule_upper_len(r)))
+            return 0;
+        int lc = rule_lower_count(r);
+        for (int j = 0; j < lc; j++) {
+            const char *tail = prefix_tail(real, rule_lower(r, j),
+                                           rule_lower_len(r, j));
+            if (!tail) continue;
+            /* Virtual path = rule's visible prefix + tail.  The
+             * identity lower ("/") makes virtual == real. */
+            char virt[PATH_MAX];
+            size_t ml = r->merged_len;
+            size_t tl = strlen(tail);
+            const char *vp;
+            if (ml == 1 && r->merged[0] == '/') {
+                vp = real;
+            } else {
+                if (ml + tl + 1 > sizeof(virt)) return 0;
+                memcpy(virt, r->merged, ml);
+                memcpy(virt + ml, tail, tl + 1);
+                vp = virt;
+            }
+            /* Whiteout/carve-out oddities resolve like any modify. */
+            if (sud_overlay_resolve(vp, SUD_OVERLAY_FOR_MODIFY,
+                                    out, out_sz) == SUD_OVERLAY_RESOLVED
+                && strcmp(out, real) != 0)
+                return 1;
+            return 0;
+        }
+    }
+    return 0;
+}
+
 /* Copy NUL-terminated `src` into `out` of size `out_sz`, returning
  * SUD_OVERLAY_RESOLVED on success or SUD_OVERLAY_PASSTHROUGH if the
  * destination is too small.  Bounds-checks before writing so we never

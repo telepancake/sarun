@@ -1171,8 +1171,87 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
         return handle_overlay_result(ctx, rc);
     }
 #endif
+
+    /* ---- fd-based METADATA mutations --------------------------------
+     * An fd opened READ-ONLY resolves to the lower/host file; letting
+     * fchmod/fchown/fsetxattr/futimens run raw would mutate the REAL
+     * lower.  Redirect: copy the entry up and apply the path-based
+     * equivalent to the upper copy.  Writable fds are already upper
+     * (open-for-write copy-up), so redirect returns 0 and the op runs
+     * untouched — same for anonymous fds (memfd/pipe/socket), inramfs
+     * fds (handled by the inramfs addin after us), and non-overlay
+     * paths. */
+#ifdef __NR_fchmod
+    if (nr == __NR_fchmod) {
+        char up[PATH_MAX];
+        if (sud_overlay_fd_upper_redirect((int)ctx->args[0],
+                                          up, sizeof(up))) {
+            long r = raw_syscall6(SYS_fchmodat, AT_FDCWD, (long)up,
+                                  ctx->args[1], 0, 0, 0);
+            return short_circuit(ctx, r);
+        }
+        return 0;
+    }
+#endif
+#if defined(__NR_fchown) || defined(__NR_fchown32)
+    if (0
+#ifdef __NR_fchown
+        || nr == __NR_fchown
+#endif
+#ifdef __NR_fchown32
+        || nr == __NR_fchown32
+#endif
+    ) {
+        char up[PATH_MAX];
+        if (sud_overlay_fd_upper_redirect((int)ctx->args[0],
+                                          up, sizeof(up))) {
+            long r = raw_syscall6(SYS_fchownat, AT_FDCWD, (long)up,
+                                  ctx->args[1], ctx->args[2], 0, 0);
+            return short_circuit(ctx, r);
+        }
+        return 0;
+    }
+#endif
+#ifdef __NR_fsetxattr
+    if (nr == __NR_fsetxattr) {
+        char up[PATH_MAX];
+        if (sud_overlay_fd_upper_redirect((int)ctx->args[0],
+                                          up, sizeof(up))) {
+            long r = raw_syscall6(__NR_setxattr, (long)up, ctx->args[1],
+                                  ctx->args[2], ctx->args[3],
+                                  ctx->args[4], 0);
+            return short_circuit(ctx, r);
+        }
+        return 0;
+    }
+#endif
+#ifdef __NR_fremovexattr
+    if (nr == __NR_fremovexattr) {
+        char up[PATH_MAX];
+        if (sud_overlay_fd_upper_redirect((int)ctx->args[0],
+                                          up, sizeof(up))) {
+            long r = raw_syscall6(__NR_removexattr, (long)up,
+                                  ctx->args[1], 0, 0, 0, 0);
+            return short_circuit(ctx, r);
+        }
+        return 0;
+    }
+#endif
+
 #ifdef __NR_utimensat
     if (nr == __NR_utimensat) {
+        /* futimens form: NULL path operates on the fd itself — same
+         * lower-mutation hazard as fchmod; redirect to the upper. */
+        if ((const char *)ctx->args[1] == 0) {
+            char up[PATH_MAX];
+            if (sud_overlay_fd_upper_redirect((int)ctx->args[0],
+                                              up, sizeof(up))) {
+                long r = raw_syscall6(__NR_utimensat, AT_FDCWD, (long)up,
+                                      ctx->args[2], 0, 0, 0);
+                return short_circuit(ctx, r);
+            }
+            return 0;
+        }
         int rc = remap_path_arg_at(ctx, 0, 1, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
