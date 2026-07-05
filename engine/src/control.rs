@@ -608,6 +608,16 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                                 total += in_;
                                 errs.append(&mut ie);
                             }
+                            // Fold the raw TRACE stream into the box's
+                            // durable record: the sqlar copy is now
+                            // authoritative (survives export/reap), so
+                            // the `sudtrace` verb + UI Trace pane read it
+                            // there rather than from the live file.
+                            let trace_path = crate::paths::live_home()
+                                .join(id.to_string()).join("sud.trace");
+                            if let Ok(bytes) = std::fs::read(&trace_path) {
+                                b.set_sudtrace(&bytes);
+                            }
                             // A CLEAN sweep makes the upper dir pure
                             // residue: the sqlar is authoritative from
                             // here (reruns delete-and-recreate it,
@@ -616,10 +626,13 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                             // footprint until reap. Keep it ONLY when
                             // the sweep reported errors — then it is
                             // the sole copy of whatever failed to
-                            // ingest. sud.trace stays until reap: a
-                            // small, wiredump-decodable debug record.
+                            // ingest. On a clean sweep sud.trace is
+                            // likewise redundant (folded into the sqlar
+                            // just above), so drop it too; keep it on an
+                            // errored sweep as a debug record.
                             if errs.is_empty() {
                                 let _ = std::fs::remove_dir_all(&upper);
+                                let _ = std::fs::remove_file(&trace_path);
                             }
                             json!({"ok": true, "ingested": total,
                                    "errors": errs})
@@ -639,6 +652,34 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                     let data = crate::review::patch_text(id);
                     json!({"ok": true, "patch":
                         base64::engine::general_purpose::STANDARD.encode(&data)})
+                }
+                None => json!({"ok": false, "error": "no slopbox"}),
+            }
+        }
+        // The box's durable sud TRACE stream, decoded server-side into JSON
+        // event rows (engine/DESIGN-sud.md step 2). Reads the sqlar blob via
+        // get_sudtrace — works for an at-rest box, no live requirement. A box
+        // with no trace (every FUSE box) answers with a clean error.
+        "sudtrace" => {
+            let boxes = discover::discover();
+            match msg.get("sid").and_then(Value::as_str)
+                .and_then(|s| resolve(&boxes, s)) {
+                Some(id) => {
+                    // Prefer the LIVE BoxState's connection when the box is
+                    // running (no rival on-disk handle racing serve);
+                    // otherwise open the at-rest sqlar read/write-lite.
+                    let live = lock(state).overlay.clone()
+                        .and_then(|o| o.live_box(id));
+                    let blob = match live {
+                        Some(b) => b.get_sudtrace(),
+                        None => crate::capture::BoxState::create(id)
+                            .ok().and_then(|b| b.get_sudtrace()),
+                    };
+                    match blob {
+                        Some(bytes) => crate::sud::decode_trace(&bytes),
+                        None => json!({"ok": false,
+                                       "error": "box has no sud trace"}),
+                    }
                 }
                 None => json!({"ok": false, "error": "no slopbox"}),
             }

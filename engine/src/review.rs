@@ -346,6 +346,18 @@ pub fn box_summary(id: i64, limit: i64) -> Value {
         vec![]
     };
 
+    // Presence marker for the Trace chip: a non-empty sudtrace blob (only sud
+    // boxes populate it). Same shape as `makevar` — the UI shows the chip only
+    // when this array is non-empty.
+    let sudtrace: Vec<Value> = if has_table(&conn, "sudtrace")
+        && conn.query_row("SELECT 1 FROM sudtrace WHERE length(content)>0 LIMIT 1",
+                          [], |_| Ok(())).is_ok()
+    {
+        vec![json!(1)]
+    } else {
+        vec![]
+    };
+
     json!({
         "outputs":   outputs,
         "changes":   changes,
@@ -354,6 +366,7 @@ pub fn box_summary(id: i64, limit: i64) -> Value {
         "edges":     edges,
         "failures":  failures,
         "makevar":   makevar,
+        "sudtrace":  sudtrace,
     })
 }
 

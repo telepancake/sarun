@@ -120,6 +120,24 @@ fn rename_rpc(sock: &str, sid: &str, name: &str) -> Result<Value, String> {
     Ok(rep)
 }
 
+/// The engine's `sudtrace` is a top-level control type (like `patch`, not a
+/// "ui" verb): {"type":"sudtrace","sid":..} → {"ok":true,"events":[..],
+/// "truncated":bool}. Returns the whole reply so the caller reads `events` +
+/// `truncated`. Errors (no box, no trace) come back as {"ok":false,"error"}.
+fn sudtrace_rpc(sock: &str, sid: &str) -> Result<Value, String> {
+    let mut s = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
+    let msg = json!({"type": "sudtrace", "sid": sid});
+    s.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    BufReader::new(&s).read_line(&mut line).map_err(|e| e.to_string())?;
+    let rep: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    if rep.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(rep.get("error").and_then(Value::as_str)
+            .unwrap_or("sudtrace failed").to_string());
+    }
+    Ok(rep)
+}
+
 /// Open a subscribe connection and spawn a reader thread that forwards each
 /// event line (parsed JSON) to `tx`. The engine turns a {"type":"subscribe"}
 /// connection into a one-way feed (session_added/removed/renamed, pong). The
@@ -294,6 +312,13 @@ enum Pane {
     /// Flows/Packets panes are the packet record of. Backed by the box's
     /// `webcap` sqlar table (`webcap` / `webcap_detail` control verbs).
     Network,
+    /// sud TRACE stream (engine/DESIGN-sud.md step 2): the box's durable
+    /// wire-trace record — one row per traced event (time · KIND · pid ·
+    /// summary) read from the box's `sudtrace` sqlar blob and decoded by the
+    /// `sudtrace` control verb. Left pane lists events; the right pane shows
+    /// the selected event's full fields + text. Only sud boxes populate the
+    /// blob, so the chip is gated on its presence (PaneVis::Data("sudtrace")).
+    Trace,
     /// Drill-down INTO a flow's TCP stream: left pane = every packet in
     /// that connection (frame · time · src→dst · proto · len · info),
     /// right pane = the same tshark -V dissection but per-packet. Pushed
@@ -782,6 +807,13 @@ struct App {
     sel_webcap: usize,
     webcap_rows: Vec<Value>,
     webcap_loaded_sid: Option<String>,
+    /// Trace pane (engine/DESIGN-sud.md step 2). One decoded row per sud TRACE
+    /// event for the focused box ({ts_ns, kind, pid, tgid, ppid, extras, text}),
+    /// in stream order. Populated lazily by load_trace_if_needed via the
+    /// `sudtrace` verb; re-fetched when the focused box changes.
+    sel_trace: usize,
+    trace_rows: Vec<Value>,
+    trace_loaded_sid: Option<String>,
     /// Endpoint summary / getting-started lines for the Api pane's empty
     /// state (endpoint_note_lines). Computed when the pane loads — not per
     /// frame — because it reads oaita.toml from disk.
@@ -1065,6 +1097,9 @@ impl App {
             sel_webcap: 0,
             webcap_rows: vec![],
             webcap_loaded_sid: None,
+            sel_trace: 0,
+            trace_rows: vec![],
+            trace_loaded_sid: None,
             api_endpoint_note: vec![],
             sel_rule: 0,
             hunk_scroll: 0,
@@ -2932,6 +2967,46 @@ impl App {
         self.load_webcap();
     }
 
+    /// Trace pane loader (engine/DESIGN-sud.md step 2): pull the focused box's
+    /// decoded sud TRACE events (stream order). Mirrors load_webcap. A box with
+    /// no trace (every FUSE box) answers with a clean error — surfaced in the
+    /// status line, leaving the rows empty (the pane shows its empty state).
+    fn load_trace(&mut self) {
+        let Some(sid) = self.cur_sid() else { return };
+        match sudtrace_rpc(&self.sock, &sid) {
+            Ok(rep) => {
+                self.trace_rows = rep.get("events")
+                    .and_then(Value::as_array).cloned().unwrap_or_default();
+                self.trace_loaded_sid = Some(sid);
+                if self.sel_trace >= self.trace_rows.len() {
+                    self.sel_trace = self.trace_rows.len().saturating_sub(1);
+                }
+                if rep.get("truncated").and_then(Value::as_bool) == Some(true) {
+                    self.status = "trace truncated (showing first 20k events)".into();
+                }
+            }
+            Err(e) if e.contains("unknown") => {
+                self.status = "engine doesn't speak sudtrace — old engine?".into();
+                self.trace_rows = vec![];
+                self.trace_loaded_sid = Some(sid);
+            }
+            Err(_) => {
+                // No trace for this box (FUSE / no sud run): empty, not an error.
+                self.trace_rows = vec![];
+                self.trace_loaded_sid = Some(sid);
+                self.sel_trace = 0;
+            }
+        }
+    }
+
+    fn load_trace_if_needed(&mut self) {
+        let cur = self.cur_sid();
+        if cur.is_some() && self.trace_loaded_sid == cur {
+            return;
+        }
+        self.load_trace();
+    }
+
     /// Lazy counterpart of load_outputs — same idea as
     /// load_processes_if_needed: only re-open when the box changed.
     fn load_outputs_if_needed(&mut self) {
@@ -3174,6 +3249,12 @@ impl App {
                     self.right_scroll = 0;
                 }
             }
+            Pane::Trace => {
+                if self.sel_trace + 1 < self.trace_rows.len() {
+                    self.sel_trace += 1;
+                    self.right_scroll = 0;
+                }
+            }
             Pane::Vars => {
                 if self.sel_var + 1 < self.vars_rows.len() {
                     self.sel_var += 1;
@@ -3247,6 +3328,10 @@ impl App {
             }
             Pane::Network => {
                 self.sel_webcap = self.sel_webcap.saturating_sub(1);
+                self.right_scroll = 0;
+            }
+            Pane::Trace => {
+                self.sel_trace = self.sel_trace.saturating_sub(1);
                 self.right_scroll = 0;
             }
             Pane::Vars => {
@@ -3364,6 +3449,13 @@ impl App {
                 self.sel_webcap = (cur + delta).clamp(0, total as isize - 1) as usize;
                 self.right_scroll = 0;
             }
+            Pane::Trace => {
+                let total = self.trace_rows.len();
+                if total == 0 { return; }
+                let cur = self.sel_trace as isize;
+                self.sel_trace = (cur + delta).clamp(0, total as isize - 1) as usize;
+                self.right_scroll = 0;
+            }
             Pane::Vars => {
                 let total = self.vars_rows.len();
                 if total == 0 { return; }
@@ -3426,6 +3518,7 @@ impl App {
             Pane::Packets => self.sel_packet,
             Pane::ApiLogs => self.sel_api_log,
             Pane::Network => self.sel_webcap,
+            Pane::Trace => self.sel_trace,
             Pane::Vars => self.sel_var,
             Pane::Help | Pane::Pty => 0,
             Pane::Inspect => self.ins_stack.last().map(|f| f.sel).unwrap_or(0),
@@ -3477,6 +3570,7 @@ impl App {
             Pane::BuildEdges => self.load_edges_if_needed(),
             Pane::ApiLogs => self.load_api_logs_if_needed(),
             Pane::Network => self.load_webcap_if_needed(),
+            Pane::Trace => self.load_trace_if_needed(),
             Pane::Flows => self.load_flows(),
             _ => {}
         }
@@ -3523,6 +3617,10 @@ impl App {
                     self.sel_webcap =
                         snap.cursor.min(self.webcap_rows.len().saturating_sub(1));
                 }
+                Pane::Trace => {
+                    self.sel_trace =
+                        snap.cursor.min(self.trace_rows.len().saturating_sub(1));
+                }
                 Pane::Vars => {
                     self.vars_query = snap.vars_query.clone();
                     self.vars_any = snap.vars_any;
@@ -3561,6 +3659,7 @@ impl App {
             Pane::Outputs   => { self.nav(Pane::Outputs);   self.load_outputs_if_needed(); }
             Pane::ApiLogs   => { self.nav(Pane::ApiLogs);   self.load_api_logs_if_needed(); }
             Pane::Network   => { self.nav(Pane::Network);   self.load_webcap_if_needed(); }
+            Pane::Trace     => { self.focus = Pane::Trace;   self.load_trace_if_needed(); }
             Pane::Flows     => { self.focus = Pane::Flows;      self.load_flows(); }
             Pane::Pipelines => { self.nav(Pane::Pipelines);  self.load_pipelines_if_needed(); }
             Pane::BuildEdges=> { self.nav(Pane::BuildEdges); self.load_edges_if_needed(); }
@@ -3679,7 +3778,7 @@ impl App {
             }
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
             | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
-            | Pane::Help | Pane::Pty | Pane::ApiLogs => {}
+            | Pane::Help | Pane::Pty | Pane::ApiLogs | Pane::Trace => {}
         }
     }
 
@@ -4564,6 +4663,10 @@ impl App {
             Pane::Network => {
                 if self.webcap_rows.is_empty() { return; }
                 self.sel_webcap = if end { self.webcap_rows.len() - 1 } else { 0 };
+            }
+            Pane::Trace => {
+                if self.trace_rows.is_empty() { return; }
+                self.sel_trace = if end { self.trace_rows.len() - 1 } else { 0 };
             }
             Pane::Vars => {
                 if self.vars_rows.is_empty() { return; }
@@ -5967,6 +6070,92 @@ fn webcap_detail_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+/// Trace pane left list (engine/DESIGN-sud.md step 2): one row per decoded sud
+/// TRACE event — `HH:MM:SS.mmm  KIND  pid  summary`. The summary is the first
+/// line of `text` for EXEC/ARGV/ENV/OPEN/CWD, a byte count for STDOUT/STDERR,
+/// and the exit status for EXIT (extras = {status, code, core, wstatus}).
+fn trace_index_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled(
+        format!("{:<12} {:<7} {:>7}  {}", "Time", "Kind", "Pid", "Summary"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if app.trace_rows.is_empty() {
+        out.push(Line::from("(no sud trace — this box was not run under --sud, \
+                             or its trace was reaped)"));
+        return out;
+    }
+    for (i, r) in app.trace_rows.iter().enumerate() {
+        let ts = r.get("ts_ns").and_then(Value::as_i64).unwrap_or(0);
+        let kind = r.get("kind").and_then(Value::as_str).unwrap_or("?");
+        let pid = r.get("pid").and_then(Value::as_i64).unwrap_or(0);
+        let text = r.get("text").and_then(Value::as_str).unwrap_or("");
+        let time_label = trace_time_label(ts);
+        let summary = match kind {
+            "STDOUT" | "STDERR" => format!("{} bytes", text.len()),
+            "EXIT" => {
+                let ex = r.get("extras").and_then(Value::as_array);
+                let code = ex.and_then(|a| a.get(1)).and_then(Value::as_i64).unwrap_or(0);
+                let status = ex.and_then(|a| a.first()).and_then(Value::as_i64).unwrap_or(0);
+                if status == 1 { format!("signal {code}") }
+                else { format!("exit {code}") }
+            }
+            _ => text.lines().next().unwrap_or("").to_string(),
+        };
+        let text_line = format!("{time_label:<12} {kind:<7} {pid:>7}  {summary}");
+        let line = if i == app.sel_trace {
+            Line::from(Span::styled(text_line,
+                Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else {
+            let color = match kind {
+                "EXEC" => Color::Green,
+                "STDERR" => Color::Red,
+                "EXIT" => Color::Yellow,
+                _ => Color::Reset,
+            };
+            Line::from(Span::styled(text_line, Style::default().fg(color)))
+        };
+        out.push(line);
+    }
+    out
+}
+
+/// `HH:MM:SS.mmm` from a nanosecond wall-clock timestamp (trace ts_ns).
+fn trace_time_label(ts_ns: i64) -> String {
+    let secs = ts_ns.div_euclid(1_000_000_000);
+    let ms = ts_ns.div_euclid(1_000_000).rem_euclid(1000);
+    let day = secs.rem_euclid(86400);
+    let (h, m, s) = (day / 3600, (day % 3600) / 60, day % 60);
+    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+/// Trace pane right detail: every field of the selected event plus its full
+/// (wrapped) text. Purely from the in-memory `trace_rows` — no extra RPC.
+fn trace_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(row) = app.trace_rows.get(app.sel_trace) else {
+        return vec![Line::from("(no event selected)")];
+    };
+    let ts = row.get("ts_ns").and_then(Value::as_i64).unwrap_or(0);
+    let kind = row.get("kind").and_then(Value::as_str).unwrap_or("?");
+    let pid = row.get("pid").and_then(Value::as_i64).unwrap_or(0);
+    let tgid = row.get("tgid").and_then(Value::as_i64).unwrap_or(0);
+    let ppid = row.get("ppid").and_then(Value::as_i64).unwrap_or(0);
+    let text = row.get("text").and_then(Value::as_str).unwrap_or("");
+    let extras: Vec<i64> = row.get("extras").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::from(Span::styled(format!("{kind}  @ {}", trace_time_label(ts)),
+        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))));
+    out.push(Line::from(format!("pid={pid}  tgid={tgid}  ppid={ppid}  ts_ns={ts}")));
+    out.push(Line::from(format!("extras={extras:?}")));
+    out.push(Line::from(""));
+    if !text.is_empty() {
+        out.push(Line::from(Span::styled("TEXT",
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Green))));
+        for l in text.lines() { out.push(Line::from(l.to_string())); }
+    }
+    out
+}
+
 fn outputs_index_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         format!("{:<8} {:<6} {:<20} {:>10}", "Time", "Stream", "Process", "Bytes"),
@@ -6738,6 +6927,7 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
         Pane::Pty       => Some(('P', "PTY",     FilterView::Changes /* unused */)),
         Pane::ApiLogs   => Some(('i', "api",     FilterView::Changes /* unused */)),
         Pane::Network   => Some(('w', "web",     FilterView::Changes /* unused */)),
+        Pane::Trace     => Some(('t', "trace",   FilterView::Changes /* unused */)),
         Pane::Vars      => Some(('v', "vars",    FilterView::Changes /* unused */)),
         Pane::Inspect   => Some(('s', "inspect", FilterView::Changes /* unused */)),
     }
@@ -6763,6 +6953,7 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
     ('P', Pane::Pty,        "PTYs",    PaneVis::Pty,               "open an engine-held PTY — a live interactive shell pane"),
     ('i', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
     ('w', Pane::Network,    "Web",     PaneVis::Always,            "web captures — tap MITM HTTP(S) content archive (headers + body)"),
+    ('t', Pane::Trace,      "Trace",   PaneVis::Data("sudtrace"),  "sud Trace — a sud box's decoded wire-trace event stream"),
     ('v', Pane::Vars,       "Vars",    PaneVis::Data("makevar"),   "variable provenance — make + shell assignments ('/' queries)"),
     ('s', Pane::Inspect,    "Inspect", PaneVis::Always,            "object inspector — drill into every sarun object (':' takes oaita-inspect locators)"),
     ('?', Pane::Help,       "Help",    PaneVis::Always,            "this help"),
@@ -9211,6 +9402,21 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let rs = clamp_rscroll(&dl);
                 let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("CAPTURE · headers + body", rf), rf))
+                    .scroll((rs, 0))
+                    .wrap(Wrap { trim: false });
+                if !skip_right { f.render_widget(detail, right); }
+            }
+            Pane::Trace => {
+                let lines = trace_index_lines(app);
+                let scroll = scroll_for_cursor(app.sel_trace + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
+                    .block(block(title("TRACE · sud wire events", lf), lf))
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
+                let dl = trace_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
+                    .block(block(title("EVENT · full detail", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }

@@ -45,6 +45,50 @@ fn streams() -> &'static Mutex<HashMap<i64, Arc<Stream>>> {
 /// up to 5 s for the pipe to drain — the runner closes its fd 1023 before
 /// asking for the sweep, so EOF beats the sud_ingest verb in the normal
 /// flow; the timeout only guards a wedged reader.
+/// Decode a raw sud TRACE stream (the `sudtrace` blob) into JSON event rows
+/// for the `sudtrace` control verb / the UI's Trace pane. Each row is
+/// `{ts_ns, kind, pid, tgid, ppid, extras, text}` where `kind` names the
+/// event type (numeric string for anything unknown) and `text` is the blob
+/// rendered lossy-UTF8 — argv/env/cwd/open paths and stdout/stderr bytes —
+/// truncated at 4 KiB with a "… (N bytes)" suffix so one huge write can't
+/// bloat the reply. Capped at the first `CAP` events with a `truncated`
+/// flag so a giant trace can't wedge the UI.
+pub fn decode_trace(bytes: &[u8]) -> serde_json::Value {
+    use serde_json::json;
+    const CAP: usize = 20_000;
+    const TEXT_MAX: usize = 4096;
+    let mut dec = sudwire::Decoder::default();
+    let events = dec.feed(bytes);
+    let truncated = events.len() > CAP;
+    let render_text = |blob: &[u8]| -> String {
+        if blob.len() > TEXT_MAX {
+            let head = String::from_utf8_lossy(&blob[..TEXT_MAX]);
+            format!("{head}… ({} bytes)", blob.len())
+        } else {
+            String::from_utf8_lossy(blob).into_owned()
+        }
+    };
+    let rows: Vec<serde_json::Value> = events.iter().take(CAP).map(|e| {
+        let kind = match e.ty {
+            sudwire::EV_EXEC => "EXEC".to_string(),
+            sudwire::EV_ARGV => "ARGV".to_string(),
+            sudwire::EV_ENV => "ENV".to_string(),
+            sudwire::EV_OPEN => "OPEN".to_string(),
+            sudwire::EV_CWD => "CWD".to_string(),
+            sudwire::EV_STDOUT => "STDOUT".to_string(),
+            sudwire::EV_STDERR => "STDERR".to_string(),
+            sudwire::EV_EXIT => "EXIT".to_string(),
+            other => other.to_string(),
+        };
+        json!({
+            "ts_ns": e.ts_ns, "kind": kind,
+            "pid": e.pid, "tgid": e.tgid, "ppid": e.ppid,
+            "extras": e.extras, "text": render_text(&e.blob),
+        })
+    }).collect();
+    json!({"ok": true, "events": rows, "truncated": truncated})
+}
+
 pub fn take_stream(box_id: i64) -> Option<Arc<Stream>> {
     let s = streams().lock().unwrap().remove(&box_id)?;
     let (lock, cv) = &s.done;

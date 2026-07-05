@@ -140,6 +140,14 @@ CREATE TABLE IF NOT EXISTS webcap(id INTEGER PRIMARY KEY AUTOINCREMENT,
  truncated INT DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_webcap_host ON webcap(host);
 CREATE INDEX IF NOT EXISTS idx_webcap_url ON webcap(url);
+-- sud TRACE stream (engine/DESIGN-sud.md step 2): the raw wire-format event
+-- stream a sud box's tracer emitted (EXEC/ARGV/ENV/OPEN/CWD/STDOUT/STDERR/EXIT),
+-- teed live to live/<id>/sud.trace and folded into the box's durable record by
+-- the post-exit sweep. Single-row (one blob per box): set_sudtrace deletes then
+-- inserts so a rerun overwrites. Decoded on demand by the `sudtrace` control
+-- verb (crate::sudwire::Decoder). Absent for FUSE boxes — only sud boxes ever
+-- populate it, which is what gates the UI's Trace chip.
+CREATE TABLE IF NOT EXISTS sudtrace(content BLOB);
 ";
 
 #[derive(Clone)]
@@ -1067,6 +1075,26 @@ impl BoxState {
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![key, value],
         );
+    }
+
+    /// Store the box's raw sud TRACE stream (the bytes teed to
+    /// live/<id>/sud.trace) as the single-row `sudtrace` blob. DELETE + INSERT
+    /// so a rerun of the box overwrites the prior run's trace rather than
+    /// accumulating rows. Empty input still writes an (empty) row — callers
+    /// only invoke this when a trace file existed.
+    pub fn set_sudtrace(&self, content: &[u8]) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("DELETE FROM sudtrace", []);
+        let _ = conn.execute("INSERT INTO sudtrace(content) VALUES(?1)",
+                             params![content]);
+    }
+
+    /// The box's stored sud TRACE stream, or None if this box never captured
+    /// one (every FUSE box, and a sud box swept before this table existed).
+    pub fn get_sudtrace(&self) -> Option<Vec<u8>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT content FROM sudtrace LIMIT 1", [],
+                       |r| r.get::<_, Option<Vec<u8>>>(0)).ok().flatten()
     }
 
     /// Read one `meta` row by key. None if absent.

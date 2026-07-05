@@ -253,7 +253,32 @@ def equivalence_workload(mode, sudtool):
         m = eng.m
         rows = {n: md for n, md, *_ in m.sqlar_list(sp)}
         outs = sqlar_outputs(sp)
+        # sud TRACE stream is now durable (engine/DESIGN-sud.md step 2): the
+        # sweep folds live/<id>/sud.trace into the box's sqlar `sudtrace` row
+        # and, on a clean sweep, removes the redundant file. Verify the blob
+        # is present + the `sudtrace` control verb decodes ≥1 EXEC event + the
+        # live file is gone. (FUSE boxes never populate it — trace stays None.)
+        trace = None
+        if mode == "sud":
+            bid = sp.stem
+            con = sqlite3.connect(f"file:{sp}?mode=ro", uri=True)
+            try:
+                trow = con.execute(
+                    "SELECT length(content) FROM sudtrace").fetchone()
+                sqlar_len = trow[0] if trow and trow[0] is not None else 0
+            finally:
+                con.close()
+            rep = m.sync_request(m.sock_path(), type="sudtrace", sid=bid) or {}
+            events = rep.get("events", []) if rep.get("ok") else []
+            live_trace = sp.parent / "live" / bid / "sud.trace"
+            trace = {
+                "sqlar_len": sqlar_len,
+                "verb_ok": bool(rep.get("ok")),
+                "exec_events": sum(1 for e in events if e.get("kind") == "EXEC"),
+                "file_gone": not live_trace.exists(),
+            }
         return {
+            "trace": trace,
             "stdout_has_mark": "MARK:FROMHOST" in r.stdout,
             "out_content": m.sqlar_content(sp, "root/sudeq_out.txt"),
             "out_mode_perm": stat_mod.S_IMODE(rows.get("root/sudeq_out.txt", 0)),
@@ -449,6 +474,16 @@ def main():
         check(fuse[field] == sud[field],
               f"equiv: '{field}' identical across FUSE and sud "
               f"(fuse={fuse[field]!r} sud={sud[field]!r})")
+
+    # ── PART A-trace: the sud box's TRACE stream is durable + queryable. ──
+    tr = sud["trace"]
+    check(tr is not None and tr["sqlar_len"] > 0,
+          f"sud: box sqlar has a non-empty sudtrace row (len={tr and tr['sqlar_len']})")
+    check(tr is not None and tr["verb_ok"] and tr["exec_events"] >= 1,
+          f"sud: sudtrace verb returns ok with ≥1 EXEC event "
+          f"(ok={tr and tr['verb_ok']} execs={tr and tr['exec_events']})")
+    check(tr is not None and tr["file_gone"],
+          "sud: live/<id>/sud.trace removed after the clean sweep")
 
     # ── PART A2: 32-bit output capture (both backends). ──
     tool32 = build_sudtool(bits=32)
