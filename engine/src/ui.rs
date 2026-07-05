@@ -7632,6 +7632,68 @@ fn ins_wild(pat: &str, name: &str) -> bool {
     pi == p.len()
 }
 
+/// Best-effort file-format sniff from magic bytes — enough to tell the
+/// user WHAT the binary is before the hexdump. Purely local (host files
+/// have no engine-side struct_quick; box changes do and use it).
+fn ins_magic(bytes: &[u8]) -> Option<&'static str> {
+    let m = bytes;
+    Some(match m {
+        _ if m.starts_with(b"\x7fELF") => {
+            match m.get(16).copied().unwrap_or(0) {
+                2 => "ELF executable",
+                3 => "ELF shared object",
+                1 => "ELF relocatable object",
+                4 => "ELF core dump",
+                _ => "ELF binary",
+            }
+        }
+        _ if m.starts_with(b"MZ") => "PE/DOS executable",
+        _ if m.starts_with(b"\x89PNG") => "PNG image",
+        _ if m.starts_with(b"\xff\xd8\xff") => "JPEG image",
+        _ if m.starts_with(b"GIF8") => "GIF image",
+        _ if m.starts_with(b"\x1f\x8b") => "gzip data",
+        _ if m.starts_with(b"\x28\xb5\x2f\xfd") => "zstd data",
+        _ if m.starts_with(b"BZh") => "bzip2 data",
+        _ if m.starts_with(b"\xfd7zXZ") => "xz data",
+        _ if m.starts_with(b"PK\x03\x04") || m.starts_with(b"PK\x05\x06") =>
+            "zip archive",
+        _ if m.starts_with(b"!<arch>\n") => "ar archive",
+        _ if m.starts_with(b"SQLite format 3\0") => "SQLite database",
+        _ if m.len() > 262 && &m[257..262] == b"ustar" => "tar archive",
+        _ => return None,
+    })
+}
+
+/// One 16-byte hexdump row at an arbitrary byte offset (offset, hex, ASCII)
+/// — the paged sibling of `hexdump_into`, which always starts at 0.
+fn ins_hex_row(bytes: &[u8], row: usize) -> String {
+    let off = row * 16;
+    let chunk = &bytes[off..(off + 16).min(bytes.len())];
+    let hex = chunk.iter().map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>().join(" ");
+    let ascii: String = chunk.iter()
+        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+        .collect();
+    format!("{off:08x}  {hex:<48}  {ascii}")
+}
+
+/// Greedy word-wrap for hint bodies rendered inside a cascade column
+/// (Paragraph::scroll and Wrap don't compose — we pre-wrap instead).
+fn ins_wrap(s: &str, w: usize) -> Vec<String> {
+    let w = w.max(16);
+    let mut out = vec![];
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > w {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() { cur.push(' '); }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() { out.push(cur); }
+    out
+}
+
 /// One narrowing step on a box-table view. A node carries a STACK of these;
 /// all except `Size` translate to engine-side filter clauses (AND-ed), so
 /// counts stay exact however deep the drill goes. `Size` filters client-side
@@ -8260,10 +8322,37 @@ impl App {
                             (mandatory pattern)".to_string());
             }
             Some(InsNode::File { path, lo, hi, .. }) => {
+                // The value preview: a bounded head-read of the file — the
+                // same first bytes `read` would return — plus the drill
+                // hotspots. Text shows its first lines; binary shows its
+                // magic-sniffed format and the first hexdump rows.
+                let head = std::fs::File::open(path).ok().and_then(|mut f| {
+                    use std::io::Read;
+                    let mut buf = vec![0u8; 2048];
+                    let n = f.read(&mut buf).ok()?;
+                    buf.truncate(n);
+                    Some(buf)
+                }).unwrap_or_default();
                 let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                let binary = head.contains(&0);
+                let kind = if binary {
+                    ins_magic(&head).unwrap_or("binary")
+                } else { "text" };
                 lines.push(format!("file {path}"));
                 lines.push(String::new());
-                lines.push(format!("{size} bytes"));
+                lines.push(format!("{size} bytes \u{b7} {kind}"));
+                lines.push(String::new());
+                if binary {
+                    for r in 0..4.min(head.len().div_ceil(16)) {
+                        lines.push(ins_hex_row(&head, r));
+                    }
+                } else {
+                    for l in String::from_utf8_lossy(&head).lines().take(8) {
+                        lines.push(ins_clip(l, 160));
+                    }
+                }
+                if size as usize > head.len() { lines.push("\u{2026}".into()); }
+                lines.push(String::new());
                 if *lo > 1 || *hi != INS_END {
                     lines.push(format!("this bucket spans lines {lo}..{}",
                         if *hi == INS_END { 0 } else { *hi }));
@@ -8474,7 +8563,29 @@ impl App {
                                 .and_then(Value::as_str)
                                 .unwrap_or("not in change set").to_string());
                         } else if !is_text {
-                            header.push("binary (no text diff)".into());
+                            // Binary change: the engine's structural pass
+                            // (the same struct_quick the Changes pane's
+                            // diff viewer runs) names the format and its
+                            // top-level structure; the heavy struct_finish
+                            // dump stays in the Changes pane ('c').
+                            header.push("binary (no text diff) — quick \
+                                         structural pass:".into());
+                            header.push(String::new());
+                            if let Ok(q) = rpc(&self.sock, "struct_quick",
+                                               json!([sid.to_string(), file])) {
+                                for (_, txt) in pairs_of(q.get("lines")) {
+                                    entries.push(ins_row(txt));
+                                }
+                                if let Some(job) = q.get("job")
+                                    .and_then(Value::as_i64)
+                                {
+                                    let _ = rpc(&self.sock, "struct_cancel",
+                                                json!([job]));
+                                    entries.push(ins_row(
+                                        "\u{2026} full structural diff in the \
+                                         Changes pane ('c')"));
+                                }
+                            }
                         } else {
                             header.push(format!("staged diff of {file}"));
                             header.push(String::new());
@@ -8597,8 +8708,36 @@ impl App {
             InsNode::File { path, query, lo, hi } => {
                 match std::fs::read(path) {
                     Ok(bytes) if bytes.contains(&0) => {
-                        title = path.clone();
-                        header.push(format!("binary ({} bytes)", bytes.len()));
+                        // Binary: name the format from its magic, then a
+                        // PAGED hexdump — lo/hi span 16-byte rows here, so
+                        // the same bucket/sibling mechanics walk the bytes.
+                        let size = bytes.len();
+                        let kind = ins_magic(&bytes).unwrap_or("binary");
+                        let rows = size.div_ceil(16).max(1);
+                        let (lo, hi) = ((*lo).max(1).min(rows), (*hi).min(rows));
+                        title = if lo == 1 && hi >= rows {
+                            format!("{path} ({kind}, {size} bytes)")
+                        } else {
+                            format!("{path} bytes {:#x}..{:#x} of {size}",
+                                    (lo - 1) * 16, (hi * 16).min(size))
+                        };
+                        header.push(format!("{kind} \u{b7} {size} bytes \u{b7} \
+                                             hexdump (offset \u{b7} hex \u{b7} \
+                                             ASCII)"));
+                        header.push(String::new());
+                        if let Some(spans) = ins_spans(lo, hi, INS_FILE_PAGE) {
+                            for (a, b) in spans {
+                                entries.push(ins_link(
+                                    format!("bytes {:#08x}..{:#08x}",
+                                            (a - 1) * 16, (b * 16).min(size)),
+                                    InsNode::File { path: path.clone(),
+                                        query: query.clone(), lo: a, hi: b }));
+                            }
+                        } else {
+                            for r in lo - 1..hi {
+                                entries.push(ins_row(ins_hex_row(&bytes, r)));
+                            }
+                        }
                     }
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes);
@@ -9254,6 +9393,27 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
                 Style::default().add_modifier(Modifier::DIM))));
         }
         for (i, e) in fr.entries.iter().enumerate() {
+            // The inline input edits IN PLACE: while a prompt is open, the
+            // active frame's selected row becomes the edit line — the text
+            // you type appears exactly where the row you activated sits.
+            if active && i == fr.sel {
+                if let Some((prompt, buf)) = &app.ins_input {
+                    lines.push(Line::from(vec![
+                        Span::styled("\u{2315} ", Style::default()
+                            .fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{buf}_"), Style::default()
+                            .fg(Color::Black).bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)),
+                        Span::styled("  Enter go \u{b7} Esc cancel",
+                            Style::default().add_modifier(Modifier::DIM)),
+                    ]));
+                    lines.push(Line::from(Span::styled(
+                        format!("   {prompt}"),
+                        Style::default().fg(Color::Yellow)
+                            .add_modifier(Modifier::DIM))));
+                    continue;
+                }
+            }
             let marker = if e.arg.is_some() { "\u{2315} " }
                          else if e.child.is_some() { "\u{25b8} " }
                          else { "  " };
@@ -9273,6 +9433,22 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
         if fr.entries.is_empty() && fr.header.is_empty() {
             lines.push(Line::from(Span::styled("(empty)",
                 Style::default().add_modifier(Modifier::DIM))));
+        }
+        // First-time hints belong to the FRAME, so they render on its
+        // column (see INS_HINTS) — pre-wrapped to the column width.
+        if active {
+            let dim = Style::default().add_modifier(Modifier::DIM);
+            for id in &fr.hints {
+                if let Some(h) = ins_hint(id) {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(h.marker, dim)));
+                    for l in ins_wrap(h.body,
+                        cols[ci].width.saturating_sub(2) as usize)
+                    {
+                        lines.push(Line::from(Span::styled(l, dim)));
+                    }
+                }
+            }
         }
         let cursor_line = fr.header.len() + fr.sel + 1;
         let scroll = scroll_for_cursor(cursor_line, lines.len(), cols[ci].height);
@@ -9315,34 +9491,8 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
             card_lines.push(Line::from(l.clone()));
         }
     }
-    // First-time hints for this frame kind (see INS_HINTS): once per drill
-    // chain, at the card's tail, dim.
-    for id in &frame.hints {
-        if let Some(h) = ins_hint(id) {
-            if !card_lines.is_empty() { card_lines.push(Line::from("")); }
-            let dim = Style::default().add_modifier(Modifier::DIM);
-            card_lines.push(Line::from(Span::styled(h.marker, dim)));
-            card_lines.push(Line::from(Span::styled(h.body, dim)));
-        }
-    }
-    // The inline input (mandatory argument / ':' locator) renders INSIDE
-    // the card — a prompt line and the live buffer with a cursor, no popup.
-    if let Some((prompt, buf)) = &app.ins_input {
-        if !card_lines.is_empty() { card_lines.push(Line::from("")); }
-        card_lines.push(Line::from(Span::styled(
-            format!("\u{2315} {prompt}"),
-            Style::default().fg(Color::Yellow))));
-        card_lines.push(Line::from(vec![
-            Span::styled("  \u{203a} ", Style::default().fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{buf}_"),
-                Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled("   (Enter go \u{b7} Esc cancel)",
-                Style::default().add_modifier(Modifier::DIM)),
-        ]));
-    }
     let hint = if app.ins_input.is_some() {
-        "card \u{b7} typing goes to the input below"
+        "card \u{b7} typing goes to the \u{2315} row above"
     } else if frame.hotspots.is_empty() {
         "card \u{b7} Enter drill \u{b7} \u{2190}/\u{2192} siblings \u{b7} \
          Backspace up \u{b7} ':' locator"
@@ -13300,6 +13450,25 @@ mod tests {
 
         let buf = render_to_string(&app, 120, 40).unwrap();
         assert!(buf.contains("inspect"), "inspector title missing:\n{buf}");
+
+        // Binary files don't dead-end: the magic sniff names the format
+        // and the listing is a paged hexdump (lo/hi walk 16-byte rows).
+        let elf = dir.join("probe.bin");
+        let mut blob = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x03\0".to_vec();
+        blob.resize(200_000, 0u8);
+        std::fs::write(&elf, &blob).unwrap();
+        app.ins_goto(elf.to_str().unwrap());
+        let f = app.ins_stack.last().unwrap();
+        assert!(f.title.contains("ELF"), "magic sniff in title: {}", f.title);
+        assert!(f.entries.iter().any(|e| e.text.starts_with("bytes 0x")),
+                "200k of binary must bucket into byte ranges");
+        app.ins_extreme(false);
+        app.ins_enter();
+        assert!(app.ins_stack.last().unwrap().entries.iter()
+                    .any(|e| e.text.contains("7f 45 4c 46")),
+                "leaf pages are hexdump rows");
+        app.ins_pop();
+        app.ins_pop();
 
         // First-time hints treat the DRILL CHAIN as the session: the first
         // dir frame teaches, a nested dir frame stays clean, and popping
