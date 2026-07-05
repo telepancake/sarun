@@ -1,7 +1,7 @@
 //! Import pipeline. Drains a `PageStream` into the depot + strpool +
 //! sqlite under per-page atomic transactions.
 //!
-//! ## Chain append strategy
+//! ## Chain prepend strategy
 //!
 //! Each revision becomes ONE record; the depot stores zstd frames the
 //! wikipedia layer encodes (the depot is byte-opaque):
@@ -27,7 +27,7 @@
 //!
 //! Per SPEC §"Crash-safety contract":
 //!   1. `BEGIN IMMEDIATE` on sqlite.
-//!   2. For each new revision on this page, append one frame to the
+//!   2. For each new revision on this page, prepend one frame to the
 //!      depot. The depot index flip is the depot's commit; if sqlite
 //!      then rolls back, those frames are orphaned but unreferenced
 //!      (sqlite owns the page-id↔chain-id story).
@@ -142,10 +142,10 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
         let normalized = page.title.trim().as_bytes().to_vec();
         ensure_title(&g, page_id, ns_i, &normalized, instance.title_shard_count)?;
 
-        // Append each revision in source order (oldest → newest); skip
+        // Prepend each revision in source order (oldest → newest); skip
         // those already in revisions_seen. Source order isn't strictly
         // timestamp-ordered in the wild, but every test fixture has
-        // it so. The chain's "newest in f0" is the LAST appended.
+        // it so. The chain's "newest in f0" is the LAST prepended.
         let mut new_this_page = 0u64;
         for rev in &page.revisions {
             let rev_id = rev.id as u64;
@@ -181,7 +181,7 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
             Ok(())
         }
         Err(e) => {
-            // Rollback sqlite; depot frames already appended are
+            // Rollback sqlite; depot frames already prepended are
             // orphaned (dead bytes), per SPEC's per-page atomicity
             // contract.
             let _ = g.conn.execute("ROLLBACK", []);
@@ -323,7 +323,7 @@ fn build_revision_record(rev: &Revision, stats: &mut ImportStats) -> (RevisionMe
     (meta, text_bytes)
 }
 
-/// Append one revision record to the depot chain for `chain_id`. See
+/// Prepend one revision record to the depot chain for `chain_id`. See
 /// the module doc for the f0/f1/seal strategy.
 fn prepend_depot_frame(
     g: &InstanceInner,
