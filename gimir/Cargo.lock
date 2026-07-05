@@ -2494,6 +2494,7 @@ version = "0.0.0"
 dependencies = [
  "chrono",
  "hex",
+ "httpmock",
  "reqwest",
  "rusqlite",
  "serde",

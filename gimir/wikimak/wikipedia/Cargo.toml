@@ -20,13 +20,15 @@ serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 hex.workspace = true
+# `sync` (discover → fetch → import) drives wikimak_mediawiki's HTTP
+# surface, so the blocking client is a real dependency now, not just the
+# livewiki test's.
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 
 [dev-dependencies]
 tempfile = "3"
-# Live test (`livewiki.rs`, `#[ignore]`) needs a `reqwest::blocking::Client`
-# to hand to `wikimak_mediawiki::discover` / `fetch`. Not used by any
-# always-run test.
-reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+# `tests/sync.rs` stands in for dumps.wikimedia.org.
+httpmock = "0.7"
 
 [lints.clippy]
 # Tester's `tests/sha1.rs` doc-comment uses a multi-line, visually-aligned

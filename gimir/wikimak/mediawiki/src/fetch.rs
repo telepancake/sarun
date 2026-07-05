@@ -86,7 +86,7 @@ impl<R: Read> Read for VerifyingReader<R> {
 }
 
 /// Fetch a Part: GET the URL, return a streaming reader.
-pub fn fetch(client: &Client, part: &Part) -> Result<VerifyingReader<Box<dyn Read>>> {
+pub fn fetch(client: &Client, part: &Part) -> Result<VerifyingReader<Box<dyn Read + Send>>> {
     let resp = client.get(&part.url).send()?;
     let status = resp.status();
     if !status.is_success() {
@@ -101,7 +101,7 @@ pub fn fetch(client: &Client, part: &Part) -> Result<VerifyingReader<Box<dyn Rea
         (None, None) => (None, String::new()),
     };
     Ok(VerifyingReader {
-        inner: Box::new(resp) as Box<dyn Read>,
+        inner: Box::new(resp) as Box<dyn Read + Send>,
         hasher,
         expected,
         filename: part.filename.clone(),

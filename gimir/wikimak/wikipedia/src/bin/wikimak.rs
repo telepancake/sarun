@@ -1,5 +1,7 @@
 //! `wikimak` — the wikipedia-mirror driver CLI (MIRRORS.md phase 1).
 //!
+//!   wikimak discover <dbname>                  list newest complete run
+//!   wikimak fetch <dbname> <root>               discover + fetch + import
 //!   wikimak import <dump.xml[.bz2]> <root>     import/refresh a dump
 //!   wikimak head <root> <page_id>              newest revision meta
 //!   wikimak text <root> <page_id>              newest revision text
@@ -54,6 +56,39 @@ fn cmd_import(dump: &str, root: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .user_agent("wikimak/0 (sarun mirror; contact: local)")
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+fn cmd_discover(dbname: &str) -> Result<(), String> {
+    let client = http_client()?;
+    let run = wikimak_mediawiki::discover(&client, dbname).map_err(|e| e.to_string())?;
+    println!("run {} ({:?}), {} parts", run.date, run.source, run.parts.len());
+    for p in &run.parts {
+        println!("  {}\t{} bytes\t{}", p.filename, p.size_bytes,
+                 p.sha256.as_deref().or(p.sha1.as_deref()).unwrap_or("-"));
+    }
+    Ok(())
+}
+
+fn cmd_fetch(dbname: &str, root: &str) -> Result<(), String> {
+    let inst = open_instance(PathBuf::from(root))?;
+    let client = http_client()?;
+    let (run, stats) = wikimak_wikipedia::sync(
+        &inst, &client, &wikimak_mediawiki::Config::default(), dbname,
+        |name, fetched| eprintln!("{} {}", if fetched { "fetch" } else { "skip " }, name),
+    ).map_err(|e| e.to_string())?;
+    println!(
+        "run {}  parts {}/{} fetched ({} skipped)  pages {}  revisions new {}  deduped {}",
+        run.date, stats.parts_fetched, stats.parts_total, stats.parts_skipped,
+        stats.import.pages, stats.import.revisions_new, stats.import.revisions_deduped
+    );
+    Ok(())
+}
+
 fn cmd_head(root: &str, page: u64) -> Result<(), String> {
     let inst = open_instance(PathBuf::from(root))?;
     match inst.page_head(page).map_err(|e| e.to_string())? {
@@ -91,6 +126,8 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let strs: Vec<&str> = args.iter().map(String::as_str).collect();
     let r = match strs.as_slice() {
+        ["discover", dbname] => cmd_discover(dbname),
+        ["fetch", dbname, root] => cmd_fetch(dbname, root),
         ["import", dump, root] => cmd_import(dump, root),
         ["head", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_head(root, p)),
@@ -98,7 +135,9 @@ fn main() -> ExitCode {
             .and_then(|p| cmd_text(root, p)),
         ["history", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_history(root, p)),
-        _ => Err("usage: wikimak import <dump.xml[.bz2]> <root>\n\
+        _ => Err("usage: wikimak discover <dbname>\n\
+                  \x20      wikimak fetch <dbname> <root>\n\
+                  \x20      wikimak import <dump.xml[.bz2]> <root>\n\
                   \x20      wikimak head|text|history <root> <page_id>".into()),
     };
     match r {

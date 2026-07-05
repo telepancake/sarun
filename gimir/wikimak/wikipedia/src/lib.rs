@@ -15,11 +15,13 @@ pub mod import;
 pub mod instance;
 pub mod revision;
 pub mod schema;
+pub mod sync;
 
 pub use error::{Error, Result};
 pub use instance::{
     ContributorMeta, HistoryEntry, HistoryIter, ImportStats, Instance, InstanceConfig, RevisionMeta,
 };
+pub use sync::{sync, SyncStats};
 pub use revision::{
     FLAG_COMMENT_HIDDEN, FLAG_CONTRIBUTOR_HIDDEN, FLAG_SHA1_MISMATCH, FLAG_SUPPRESSED,
     FLAG_TEXT_HIDDEN, KIND_ANONYMOUS, KIND_HIDDEN, KIND_NAMED, REVISION_SCHEMA_VERSION,

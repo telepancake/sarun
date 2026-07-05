@@ -44,6 +44,16 @@ pub fn new_page_stream<R: Read>(r: R) -> PageStream<R> {
     }
 }
 
+impl<R: Read> PageStream<R> {
+    /// Consume the stream, returning the underlying reader. The parser
+    /// stops at `</mediawiki>`; callers that need end-of-stream effects
+    /// on the source (e.g. `VerifyingReader`'s on-EOF checksum) drain
+    /// the returned reader.
+    pub fn into_inner(self) -> R {
+        self.reader.into_inner().into_inner()
+    }
+}
+
 /// Return the parsed `<siteinfo>` header, or `None` if it has not yet
 /// been observed.
 pub fn site_info<R: Read>(stream: &PageStream<R>) -> Option<&SiteInfo> {

@@ -239,6 +239,31 @@ impl Instance {
         })
     }
 
+    /// Has this dump part already been fully imported? Keyed by the
+    /// part's filename (`parts_seen` table).
+    pub fn part_seen(&self, filename: &str) -> Result<bool> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        let n: u64 = g.conn.query_row(
+            "SELECT COUNT(*) FROM parts_seen WHERE part_filename = ?1",
+            [filename],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Record a fully-imported dump part. Call only after the part's
+    /// pages are durably flushed — the watermark is the skip signal for
+    /// the next sync, so writing it early would drop data on a crash.
+    pub fn mark_part_seen(&self, filename: &str, sha256: Option<&str>) -> Result<()> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        g.conn.execute(
+            "INSERT OR REPLACE INTO parts_seen(part_filename, sha256, completed_at)
+             VALUES(?1, ?2, strftime('%s','now'))",
+            rusqlite::params![filename, sha256],
+        )?;
+        Ok(())
+    }
+
     /// Flush depot + strpool + sqlite to durable storage.
     pub fn flush(&self) -> Result<()> {
         let g = self.inner.lock().expect("instance mutex poisoned");
