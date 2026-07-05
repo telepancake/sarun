@@ -164,6 +164,72 @@ fn roundtrip_sha_exact_and_chain_compresses() {
 }
 
 #[test]
+fn incremental_update_appends_and_exports_sha_exact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("src-repo");
+    let store = tmp.path().join("store");
+    let out = tmp.path().join("out-repo");
+
+    build_fixture(&repo);
+    gitdepot::import(&repo, &store, 3).unwrap();
+    let chain_before = std::fs::read(store.join("chain")).unwrap();
+
+    // Two new commits on main, on top of everything.
+    for i in 12..14 {
+        std::fs::write(repo.join("doc.txt"), format!("rewritten in revision {i}\n")).unwrap();
+        std::fs::write(repo.join(format!("new-{i}.txt")), format!("added {i}\n")).unwrap();
+        sh_git(&repo, &["add", "-A"]);
+        sh_git(&repo, &["commit", "-q", "-m", &format!("revision {i}")]);
+    }
+    let refs_now: Vec<String> = sh_git(&repo, &["for-each-ref", "--format=%(objectname) %(refname)"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+
+    let o = gitdepot::update(&repo, &store, 3).unwrap();
+    assert_eq!((o.new_commits, o.total_commits), (2, 15));
+
+    // Incrementality is structural: the old chain minus its former
+    // frame 0 must survive verbatim as the new chain's tail.
+    let chain_after = std::fs::read(store.join("chain")).unwrap();
+    let zlen0 = u32::from_le_bytes(chain_before[4..8].try_into().unwrap()) as usize;
+    let old_tail = &chain_before[8 + zlen0..];
+    assert!(
+        chain_after.ends_with(old_tail),
+        "old frames were rewritten — update is not incremental"
+    );
+
+    // Round-trip: export regenerates every ref SHA-exactly.
+    let refs_after = gitdepot::export(&store, &out).unwrap();
+    let mut after: Vec<String> = refs_after.iter().map(|r| format!("{} {}", r.sha, r.name)).collect();
+    after.sort();
+    let mut before = refs_now;
+    before.sort();
+    assert_eq!(after, before, "post-update round-trip changed commit ids");
+    let head_doc = Command::new("git")
+        .arg("-C")
+        .arg(&out)
+        .args(["show", "main:doc.txt"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&head_doc.stdout).contains("rewritten in revision 13"));
+
+    // No new commits: update is a refs-only no-op.
+    let o2 = gitdepot::update(&repo, &store, 3).unwrap();
+    assert_eq!(o2.new_commits, 0);
+    assert_eq!(std::fs::read(store.join("chain")).unwrap(), chain_after);
+
+    // Rewritten history (amend) is refused, store untouched.
+    sh_git(&repo, &["commit", "-q", "--amend", "-m", "amended"]);
+    match gitdepot::update(&repo, &store, 3) {
+        Err(gitdepot::Error::Unsupported(_)) => {}
+        Err(e) => panic!("expected Unsupported, got: {e}"),
+        Ok(_) => panic!("non-fast-forward update unexpectedly succeeded"),
+    }
+    assert_eq!(std::fs::read(store.join("chain")).unwrap(), chain_after);
+}
+
+#[test]
 fn import_refuses_unsupported_shapes() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");

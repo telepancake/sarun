@@ -1,4 +1,5 @@
 //! CLI: `gitdepot import <git-repo> <store-dir> [--level N]`
+//!      `gitdepot update <git-repo> <store-dir> [--level N]`
 //!      `gitdepot export <store-dir> <new-repo-dir>`
 
 use std::path::PathBuf;
@@ -6,7 +7,7 @@ use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: gitdepot import <git-repo> <store-dir> [--level N]\n       gitdepot export <store-dir> <new-repo-dir>"
+        "usage: gitdepot import <git-repo> <store-dir> [--level N]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot export <store-dir> <new-repo-dir>"
     );
     ExitCode::from(2)
 }
@@ -46,6 +47,22 @@ fn main() -> ExitCode {
                     r.view_ref_chain,
                     r.solid_full,
                 );
+            })
+        }
+        ("update", [repo, store, rest @ ..]) => {
+            let level = match rest {
+                [] => 3,
+                [flag, n] if flag == "--level" => match n.parse() {
+                    Ok(v) => v,
+                    Err(_) => return usage(),
+                },
+                _ => return usage(),
+            };
+            gitdepot::update(&PathBuf::from(repo), &PathBuf::from(store), level).map(|o| {
+                println!("{} new commits ({} total)", o.new_commits, o.total_commits);
+                for r in &o.refs {
+                    println!("{} {}", r.sha, r.name);
+                }
             })
         }
         ("export", [store, repo]) => {

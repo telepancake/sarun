@@ -140,6 +140,80 @@ pub fn write_store(
     })
 }
 
+/// Read `meta.json` alone (no chain walk).
+pub fn read_meta(store: &Path) -> Result<Meta> {
+    let mut json = String::new();
+    std::fs::File::open(store.join("meta.json"))?.read_to_string(&mut json)?;
+    serde_json::from_str(&json).map_err(|e| Error::Meta(e.to_string()))
+}
+
+/// Rewrite `meta.json` (tmp + rename) leaving the chain untouched.
+pub fn write_meta(store: &Path, meta: &Meta) -> Result<()> {
+    let tmp = store.join("meta.json.tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    serde_json::to_writer_pretty(&mut f, meta).map_err(|e| Error::Meta(e.to_string()))?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, store.join("meta.json"))?;
+    Ok(())
+}
+
+/// The newest record (frame 0 — standalone by construction) without
+/// walking the rest of the chain.
+pub fn read_head_record(store: &Path) -> Result<Vec<u8>> {
+    let buf = std::fs::read(store.join("chain"))?;
+    let (raw_len, zlen) = frame_header(&buf, 0)?;
+    decompress(&buf[8..8 + zlen], None, raw_len)
+}
+
+fn frame_header(buf: &[u8], pos: usize) -> Result<(usize, usize)> {
+    if buf.len() - pos < 8 {
+        return Err(Error::Chain("truncated frame header".into()));
+    }
+    let raw_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    let zlen = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+    if buf.len() - pos - 8 < zlen {
+        return Err(Error::Chain("truncated frame body".into()));
+    }
+    Ok((raw_len, zlen))
+}
+
+/// Prepend `k` new commits to the front of the chain (the incremental
+/// append — MIRRORS.md phase 3). `delta_records` is `k+1` records
+/// newest-first: the new commits' deltas plus, last, the BRIDGE delta
+/// that rebuilds the former head view from the oldest new view.
+/// `full_records` is the `k` new commits' full records; new frame `i`
+/// is anchored on `full_records[i-1]`, frame 0 standalone — so the
+/// former frame 0 (the old head's standalone full record) is REPLACED
+/// by the bridge frame, and every remaining old frame keeps its anchor
+/// (the old full records are unchanged) and is copied verbatim.
+pub fn prepend_store(
+    store: &Path,
+    meta: &Meta,
+    delta_records: &[Vec<u8>],
+    full_records: &[Vec<u8>],
+    level: i32,
+) -> Result<()> {
+    if delta_records.len() != full_records.len() + 1 {
+        return Err(Error::Chain("prepend: need k+1 delta records for k commits".into()));
+    }
+    let old = std::fs::read(store.join("chain"))?;
+    let (_, zlen) = frame_header(&old, 0)?;
+    let tail = &old[8 + zlen..];
+
+    let mut chain = view_chain_bytes(delta_records, full_records, level)?;
+    chain.extend_from_slice(tail);
+
+    // tmp + rename on both files; chain first, then meta — a crash
+    // between the two leaves a chain longer than meta.commits, which
+    // read_store rejects loudly rather than serving a half-update.
+    let chain_tmp = store.join("chain.tmp");
+    let mut f = std::fs::File::create(&chain_tmp)?;
+    f.write_all(&chain)?;
+    f.sync_all()?;
+    std::fs::rename(&chain_tmp, store.join("chain"))?;
+    write_meta(store, meta)
+}
+
 /// Read the store back: meta + the reconstructed VIEWS, newest-first.
 /// Each frame's refPrefix anchor is recomputed from the previous view's
 /// canonical full record.

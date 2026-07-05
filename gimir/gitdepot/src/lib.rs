@@ -328,9 +328,8 @@ pub struct ImportOutcome {
     pub report: SizeReport,
 }
 
-/// Import a git repo into `store` (created; must not exist).
-pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
-    // Refs (bookkeeping).
+/// Refs (bookkeeping). Only commit refs are in scope.
+fn collect_refs(repo: &Path) -> Result<Vec<RefMeta>> {
     let mut refs = Vec::new();
     for line in git_str(
         repo,
@@ -354,12 +353,40 @@ pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
     if refs.is_empty() {
         return Err(Error::Git("repository has no refs".into()));
     }
+    Ok(refs)
+}
 
-    // Commits, newest-first.
-    let shas: Vec<String> = git_str(repo, &["rev-list", "--topo-order", "--all"])?
+/// All commits, newest-first (topo order).
+fn rev_list(repo: &Path) -> Result<Vec<String>> {
+    Ok(git_str(repo, &["rev-list", "--topo-order", "--all"])?
         .lines()
         .map(str::to_string)
-        .collect();
+        .collect())
+}
+
+/// One commit's meta + resolved view.
+fn commit_view(repo: &Path, sha: &str) -> Result<(CommitMeta, depot::View)> {
+    let raw = git(repo, &["cat-file", "commit", sha])?;
+    let mut cm = parse_commit(&raw)?;
+    cm.sha = sha.to_string();
+    let entries = ls_tree(repo, sha)?;
+    let blobs = fetch_blobs(
+        repo,
+        entries
+            .iter()
+            .filter(|e| e.mode != "160000")
+            .map(|e| e.oid.clone()),
+    )?;
+    let full = tree_layer(&entries, &blobs)?;
+    let view = depot::apply(None, &full)
+        .ok_or_else(|| Error::Unsupported(format!("commit {sha} has an empty tree")))?;
+    Ok((cm, view))
+}
+
+/// Import a git repo into `store` (created; must not exist).
+pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
+    let refs = collect_refs(repo)?;
+    let shas = rev_list(repo)?;
 
     // Walk newest → oldest, keeping only the PREVIOUS (newer) resolved
     // view in memory: record 0 is the newest full layer, record i>0 is
@@ -371,22 +398,8 @@ pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
     let mut full_records: Vec<Vec<u8>> = Vec::with_capacity(shas.len());
     let mut prev_view: Option<depot::View> = None;
     for sha in &shas {
-        let raw = git(repo, &["cat-file", "commit", sha])?;
-        let mut cm = parse_commit(&raw)?;
-        cm.sha = sha.clone();
+        let (cm, view) = commit_view(repo, sha)?;
         commits.push(cm);
-
-        let entries = ls_tree(repo, sha)?;
-        let blobs = fetch_blobs(
-            repo,
-            entries
-                .iter()
-                .filter(|e| e.mode != "160000")
-                .map(|e| e.oid.clone()),
-        )?;
-        let full = tree_layer(&entries, &blobs)?;
-        let view = depot::apply(None, &full)
-            .ok_or_else(|| Error::Unsupported(format!("commit {sha} has an empty tree")))?;
         // The full record is derived from the VIEW via diff(None, view) —
         // the same function the decoder uses to recompute refPrefix
         // anchors from reconstructed views. Bit-exactness of that anchor
@@ -404,6 +417,87 @@ pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
     let meta = Meta { refs, commits };
     let report = chain::write_store(store, &meta, &delta_records, &full_records, level)?;
     Ok(ImportOutcome { meta, report })
+}
+
+// ---------------------------------------------------------------- update
+
+#[derive(Debug, Clone)]
+pub struct UpdateOutcome {
+    pub new_commits: usize,
+    pub total_commits: usize,
+    pub refs: Vec<RefMeta>,
+}
+
+/// Incrementally append the repo's NEW commits to an existing store
+/// (MIRRORS.md phase 3). Cost is proportional to the new history: the
+/// former head's standalone frame 0 is replaced by a bridge delta frame
+/// anchored on the oldest new commit's full record; every older frame's
+/// anchor is unchanged and its bytes are copied verbatim.
+///
+/// Requires fast-forward shape: the store's recorded commit list must be
+/// an exact suffix of the repo's current `rev-list --topo-order --all`.
+/// Anything else (rewritten history, or new commits that topo-interleave
+/// into old ones) is refused — re-import for those.
+pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
+    let old_meta = chain::read_meta(store)?;
+    let refs = collect_refs(repo)?;
+    let shas = rev_list(repo)?;
+
+    let old_shas: Vec<&str> = old_meta.commits.iter().map(|c| c.sha.as_str()).collect();
+    if shas.len() < old_shas.len()
+        || shas[shas.len() - old_shas.len()..]
+            .iter()
+            .map(String::as_str)
+            .ne(old_shas.iter().copied())
+    {
+        return Err(Error::Unsupported(
+            "store history is not a suffix of the repo's (non-fast-forward or \
+             topo-interleaved new commits) — re-import"
+            .into(),
+        ));
+    }
+    let k = shas.len() - old_shas.len();
+    let total = shas.len();
+    if k == 0 {
+        // Content unchanged; refs may still have moved between known
+        // commits (branch created/renamed onto an old sha).
+        let meta = Meta { refs: refs.clone(), commits: old_meta.commits };
+        chain::write_meta(store, &meta)?;
+        return Ok(UpdateOutcome { new_commits: 0, total_commits: total, refs });
+    }
+
+    // The former head view, from frame 0 alone.
+    let head_rec = chain::read_head_record(store)?;
+    let old_head_layer = codec::decode(&head_rec)?;
+    let old_head_view = depot::apply(None, &old_head_layer)
+        .ok_or_else(|| Error::Chain("stored head resolves to nothing".into()))?;
+
+    // Walk the k new commits newest → oldest, exactly like import.
+    let mut commits = Vec::with_capacity(k);
+    let mut delta_records: Vec<Vec<u8>> = Vec::with_capacity(k + 1);
+    let mut full_records: Vec<Vec<u8>> = Vec::with_capacity(k);
+    let mut prev_view: Option<depot::View> = None;
+    for sha in &shas[..k] {
+        let (cm, view) = commit_view(repo, sha)?;
+        commits.push(cm);
+        full_records.push(codec::encode(&depot::diff(None, Some(&view))));
+        match &prev_view {
+            None => delta_records.push(full_records[0].clone()),
+            Some(newer) => {
+                delta_records.push(codec::encode(&depot::diff(Some(newer), Some(&view))));
+            }
+        }
+        prev_view = Some(view);
+    }
+    // The bridge: rebuild the former head from the oldest new view.
+    let oldest_new = prev_view.expect("k > 0");
+    delta_records.push(codec::encode(&depot::diff(Some(&oldest_new), Some(&old_head_view))));
+
+    let mut all_commits = commits;
+    all_commits.extend(old_meta.commits);
+    let meta = Meta { refs: refs.clone(), commits: all_commits };
+    chain::prepend_store(store, &meta, &delta_records, &full_records, level)?;
+    Ok(UpdateOutcome { new_commits: k, total_commits: total, refs })
 }
 
 // ---------------------------------------------------------------- export
