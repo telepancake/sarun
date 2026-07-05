@@ -8,7 +8,7 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 |---|---|---|---|
 | **wikipedia** | ~99%-identical revision chains per page | `wikimak/*` (depot chains, un-sabotaged 2026-07, 12× measured) | `wikimak` CLI: import/head/text/history + discover/fetch sync with `parts_seen` watermarks |
 | **IETF drafts** | revision chains per draft name (`draft-x-00..-NN`) — the tiered-VBF doc's other named workload | multi-chain `depot-vbf::VbfDepot` (canonical layers) + sqlite bookkeeping | `ietf-mirror` crate + `ietfmak` CLI: update (idempotent, incremental, 404-watermarked) / list / head / text / history |
-| **git repos** | DAG of tree snapshots, newest-first | `gitdepot` (view-anchored chains; SHA-exact export) | import/export/`update` (incremental fast-forward append) + `mirror` (bare-clone fetch loop, re-import on rewrite) |
+| **git repos** | DAG of tree snapshots, newest-first | `gitdepot` (view-anchored chains; SHA-exact export) | import/export/`update` (incremental fast-forward prepend) + `mirror` (bare-clone fetch loop, re-import on rewrite) |
 
 ## Common architecture (per DEPOT-DESIGN)
 
@@ -21,7 +21,7 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 - **Serve**: reads through the depot APIs; workspace access via RO
   attachments (§8), materialized through the depot-cache (§7) — a wiki
   snapshot or a git ref attaches to a box with no checkout.
-- **Update**: incremental by design — chains append. Scheduled by the
+- **Update**: incremental by design — chains prepend (newest-first; the new head is frame 0). Scheduled by the
   engine (`engine/src/mirrors.rs` + `sarun mirror` CLI + the Mirrors
   pane): jobs in `{state_home}/mirrors.db`, a minute tick starts due
   ones, states running/paused/pending/scheduled/completed/error/stopped,

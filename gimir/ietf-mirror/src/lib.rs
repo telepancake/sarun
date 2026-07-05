@@ -15,7 +15,7 @@
 //! Durability handshake per draft, same shape as wikimak's sync:
 //! import all unseen revisions → depot flush → watermark the revisions.
 //! A crash before the watermark re-fetches those revisions into a
-//! duplicate append — the watermark write is tiny, so the window is,
+//! duplicate prepend — the watermark write is tiny, so the window is,
 //! too; `update` is idempotent across completed drafts either way.
 
 pub mod readout;
@@ -197,7 +197,7 @@ impl Mirror {
                     self.alloc_chain(name)?
                 }
             };
-            // Oldest→newest so each append is the chain's new newest.
+            // Oldest→newest so each prepend is the chain's new newest.
             let mut done: Vec<(&str, bool)> = Vec::new();
             for (rev, date) in fresh {
                 let label = format!("{name}-{rev}");

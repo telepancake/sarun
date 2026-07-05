@@ -10,10 +10,10 @@ Each chain has, at any given moment:
 
 - **One f0 frame** — the current head revision, standalone zstd-encoded
   with the chain's pretrained dict. Always present once the chain has
-  been appended to.
+  been prepended to.
 - **One f1 frame** — the accumulator: zero or more records (newest-first),
   zstd-encoded with refPrefix anchored against f0's record. Always
-  present after at least two appends; on the first append, the chain has
+  present after at least two prepends; on the first prepend, the chain has
   f0 but no f1.
 - **Zero or more cold frames** — sealed accumulators, linked. Each cold
   frame's refPrefix anchor is the LAST record (oldest, by chain order)
@@ -76,7 +76,7 @@ Files are named `file-NNNN` where NNNN is a 4-digit zero-padded
 globally-unique-within-tier id.
 
 Each f0/f1 file has an in-memory `bytes_deprecated` counter. Bumped
-whenever a frame in that file is orphaned by an append (see Operations
+whenever a frame in that file is orphaned by a prepend (see Operations
 below). The counter is not persisted; on `open` it is rebuilt by walking
 the file's frames and checking each one's chain_id against the index.
 
@@ -109,10 +109,10 @@ impl Depot {
     ///   5. Flips the index entry.
     ///   6. Bumps bytes_deprecated on the files that held old f0/f1.
     ///
-    /// `new_f1_bytes` must be `None` on the very first append (no f1
+    /// `new_f1_bytes` must be `None` on the very first prepend (no f1
     /// exists yet) and `Some` otherwise. The depot does NOT compute
     /// `new_f0`/`new_f1` — the caller encoded them.
-    pub fn append(
+    pub fn prepend(
         &self,
         chain_id: u64,
         new_f0_bytes: &[u8],
@@ -150,15 +150,15 @@ on-disk pointer format is internal; callers walk via `read_f0`,
 
 ## Operations
 
-### Append (no seal)
+### Prepend (no seal)
 
 Caller has just encoded `new_f0` (R standalone-dict) and `new_f1`
 (records refPrefix-against-R). Caller invokes
-`append(chain_id, new_f0, Some(new_f1), seal_old_f1=false)`.
+`prepend(chain_id, new_f0, Some(new_f1), seal_old_f1=false)`.
 
 The depot:
 1. Reads index entry → old_f0_ref (or (0,0)).
-2. If old_f0_ref == (0,0): first ever append.
+2. If old_f0_ref == (0,0): first ever prepend.
    - Caller MUST pass `new_f1_bytes = None`. If they pass Some, error.
    - Write new f0 to current f0 file with `next_pointer = (0, 0)`. Flip
      index. Done.
@@ -175,11 +175,11 @@ The depot:
    - Bump `bytes_deprecated` on old_f0's file by old_f0's full frame
      size (header + zstd). Same for old_f1.
 
-### Append with seal
+### Prepend with seal
 
 Same call, but `seal_old_f1 = true`. The depot:
 1. Reads old_f0_ref from index. If (0,0), error (can't seal on first
-   append).
+   prepend).
 2. Reads old_f0's next_pointer → old_f1_ref. If (0,0), error (can't seal
    with no f1).
 3. Reads old f1's full frame bytes: `[chain_id_le | next_pointer_le |
@@ -283,15 +283,15 @@ implementer wants faster open; not required.)
 
 ## Crash-safety contract
 
-- Same as strpool's: a `flush()` makes all preceding appends durable. A
-  crash without flush may lose recent appends. There is NO recovery
+- Same as strpool's: a `flush()` makes all preceding prepends durable. A
+  crash without flush may lose recent prepends. There is NO recovery
   code, NO journal, NO magic, NO checksums.
-- Append ordering: write the new cold frame (if sealing) → fsync cold;
+- Prepend ordering: write the new cold frame (if sealing) → fsync cold;
   write the new f1 → fsync f1; write the new f0 → fsync f0; flip index
   → fsync index. The index flip is the atomic commit point.
 - A crash before the flip: the index still points at old state, all old
   frames are intact and reachable, the orphan bytes in the new locations
-  are dead and will be naturally deprecated on the next append touching
+  are dead and will be naturally deprecated on the next prepend touching
   those files.
 - A crash mid-eviction: the source frame is still in V (not yet
   unlinked), pointers still point at it. The duplicate in L is dead and
@@ -319,7 +319,7 @@ implementer wants faster open; not required.)
 - Chain walks via next_pointer chasing in f0 (there is no chain of f0s;
   f0 is one frame).
 - Generic frame-anywhere relocation. The depot supports two location
-  changes only: append (which always writes to the current write target)
+  changes only: prepend (which always writes to the current write target)
   and eviction (which migrates frames from a victim file to the current
   write target in the same tier).
 - Cross-tier GC. f0 is evicted only from f0; f1 only from f1; cold is

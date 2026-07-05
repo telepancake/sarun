@@ -473,7 +473,7 @@ pub struct UpdateOutcome {
     pub refs: Vec<RefMeta>,
 }
 
-/// Incrementally append the repo's NEW commits to an existing store
+/// Incrementally prepend the repo's NEW commits to an existing store
 /// (MIRRORS.md phase 3). Cost is proportional to the new history: the
 /// former head's standalone frame 0 is replaced by a bridge delta frame
 /// anchored on the oldest new commit's full record; every older frame's

@@ -6,7 +6,7 @@
 //!
 //! Scope of this crate: storage primitive. It does NOT know about Wikipedia,
 //! mediawiki, or revisions. It stores opaque byte blobs ("frames") in chains
-//! identified by `u64` chain ids, across three tiers, with append + GC.
+//! identified by `u64` chain ids, across three tiers, with prepend + GC.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -27,7 +27,7 @@ pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The chain has no f0 frame yet (was never appended to).
+    /// The chain has no f0 frame yet (was never prepended to).
     #[error("chain has no frame")]
     NoFrame,
 
@@ -35,15 +35,15 @@ pub enum Error {
     #[error("chain id out of range")]
     ChainIdOutOfRange,
 
-    /// First append must pass `new_f1_bytes = None`.
-    #[error("first append must not supply f1 bytes")]
-    FirstAppendHasF1,
+    /// First prepend must pass `new_f1_bytes = None`.
+    #[error("first prepend must not supply f1 bytes")]
+    FirstPrependHasF1,
 
-    /// Subsequent append must pass `new_f1_bytes = Some(_)`.
-    #[error("non-first append requires f1 bytes")]
+    /// Subsequent prepend must pass `new_f1_bytes = Some(_)`.
+    #[error("non-first prepend requires f1 bytes")]
     MissingF1,
 
-    /// Cannot seal on the first append (no f1 to seal).
+    /// Cannot seal on the first prepend (no f1 to seal).
     #[error("cannot seal: chain has no f1")]
     CannotSealNoF1,
 
@@ -115,8 +115,8 @@ impl Depot {
         })
     }
 
-    /// Replace the chain's f0 and f1 with new bytes. See SPEC §"Append".
-    pub fn append(
+    /// Replace the chain's f0 and f1 with new bytes. See SPEC §"Prepend".
+    pub fn prepend(
         &self,
         chain_id: u64,
         new_f0_bytes: &[u8],
@@ -124,7 +124,7 @@ impl Depot {
         seal_old_f1: bool,
     ) -> Result<()> {
         let mut g = self.inner.lock().expect("depot mutex poisoned");
-        g.append(chain_id, new_f0_bytes, new_f1_bytes, seal_old_f1)
+        g.prepend(chain_id, new_f0_bytes, new_f1_bytes, seal_old_f1)
     }
 
     /// Read the current f0 frame's opaque zstd bytes (header stripped).

@@ -129,7 +129,7 @@ impl VbfDepot {
     pub fn open(root: PathBuf, max_chain_id: u64, seal_threshold: u64) -> Result<Self, Error> {
         // File rolls scale with the seal threshold so eviction (which
         // only ever targets non-current files) can actually reclaim the
-        // orphaned f0/f1 frames each append leaves behind; a giant
+        // orphaned f0/f1 frames each prepend leaves behind; a giant
         // threshold would pin every orphan inside the one write target.
         let depot = Depot::open(DepotConfig {
             root,
@@ -197,7 +197,7 @@ impl VbfDepot {
             Err(e) => return Err(e.into()),
         };
         match prev_f0 {
-            None => self.depot.append(chain_id, &new_f0, None, false)?,
+            None => self.depot.prepend(chain_id, &new_f0, None, false)?,
             Some(prev_frame) => {
                 let prev_record = decompress(&prev_frame, None)?;
                 let old_f1_raw = match self.depot.read_f1(chain_id)? {
@@ -214,7 +214,7 @@ impl VbfDepot {
                     raw.extend_from_slice(&old_f1_raw);
                     compress(&raw, Some(&record))?
                 };
-                self.depot.append(chain_id, &new_f0, Some(&new_f1), seal)?;
+                self.depot.prepend(chain_id, &new_f0, Some(&new_f1), seal)?;
             }
         }
         Ok(())

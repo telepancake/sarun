@@ -73,7 +73,7 @@ fn suspect_open_repairs_bookkeeping_ahead_of_depot() {
         ).unwrap();
     }
     // Re-open (suspect) and import a dump where page 1 HAS rev 999:
-    // a fresh <revision> appended inside page 1 (whose closing tag is
+    // a fresh <revision> prepended inside page 1 (whose closing tag is
     // the first </page> in the fixture).
     let inst = make_instance(&tmp, 1024);
     let xml = String::from_utf8(fixture("export_three_pages.xml")).unwrap();

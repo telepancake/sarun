@@ -46,7 +46,7 @@ copy   = never (import_layer path deleted from attach verbs)
    entry/children/blob for attachments route through the trait —
    which also closes the `blob_path()` leak for attachments. Attach
    verbs stop calling `import_layer`; pinning stays (rev recorded at
-   attach time, store append-only ⇒ a pinned rev never changes).
+   attach time, stores only prepend ⇒ a pinned rev never changes).
 4. **Wire `depot-cache`**: attachment blob reads that need a real fd
    (mmap/exec/pread paths) materialize into the cache pool; repeated
    reads hit the pool. Eviction = space management, never data loss.
@@ -70,13 +70,13 @@ end state inverts the current layering:
 - **The depot is the only store.** VBF/cold chains become a real depot
   variant behind the gimir/depot traits (§7 already names them as
   one). Where the depot interface lacks what chains need — named
-  multi-chain addressing, append-to-chain, history enumeration,
+  multi-chain addressing, prepend-to-chain, history enumeration,
   sealing, per-chain dicts — the features are ADDED TO THE DEPOT,
   not built beside it. wikimak/depot, depot-vbf, and gitdepot's
   chain.rs converge into (or behind) that variant; the app crates
   stop owning bytes-at-rest entirely.
 - **The engine exposes the depot as API.** UDS verbs for the full
-  surface: open a depot root, append a layer to a named chain, read
+  surface: open a depot root, prepend a layer to a named chain, read
   head/rev/history, readout, attach-by-reference. High-performance
   codecs (zstd, bz2, XML dump scanning) are engine-side services —
   e.g. a dump-scan verb that streams parsed revisions — because raw

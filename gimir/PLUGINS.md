@@ -33,7 +33,7 @@ CORRECTED (2026-07-05, see ATTACH-CONVERGENCE.md "North star"): the
 Per-mirror ingest verbs (`wikimak ingest --stdin`) were still the
 crow's-nest layering: three app crates owning three formats built on
 depot internals. The engine exposes the depot API itself (chains,
-append, head/history, readout, attach) as verbs; missing capabilities
+prepend, head/history, readout, attach) as verbs; missing capabilities
 get added to the depot, not built beside it; mirror crates stop
 owning bytes-at-rest. The scripting story is unchanged in spirit and
 simpler in practice: business logic (keys, revision identity,
@@ -55,8 +55,8 @@ mirror's format.
    into the two halves it already almost has. The store half (Rust,
    stable, rarely rebuilt): an ingest verb per driver — `wikimak
    ingest --stdin` reading a framed stream of revision records
-   (ndjson header line + payload bytes), appending under the
-   EXISTING flock/dirty-flag/repair protocol, echoing appended revids;
+   (ndjson header line + payload bytes), prepending under the
+   EXISTING flock/dirty-flag/repair protocol, echoing ingested revids;
    likewise `gitdepot`/`ietfmak`. No format code is duplicated — the
    same crate code is reached over a pipe. The acquisition half
    (script, hot-swappable): decides what's new upstream and feeds the
@@ -107,7 +107,7 @@ Track A regardless.
 ## Chips
 
 - [x] `cmd` job kind (engine)
-- [ ] `wikimak ingest --stdin`: framed record stream → chain append
+- [ ] `wikimak ingest --stdin`: framed record stream → chain prepend
       under the existing durability protocol; crash mid-stream test
       (kill the ingest, reopen repairs)
 - [ ] `sarunmirror/` package: framing + porcelain wrappers +

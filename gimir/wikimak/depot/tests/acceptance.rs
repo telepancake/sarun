@@ -68,28 +68,28 @@ fn open_creates_layout() {
     // No f0/file-* or f1/file-* yet.
     assert!(
         list_files(&root.join("f0")).is_empty(),
-        "no f0 data files until first append"
+        "no f0 data files until first prepend"
     );
     assert!(
         list_files(&root.join("f1")).is_empty(),
-        "no f1 data files until first append"
+        "no f1 data files until first prepend"
     );
 
     drop(depot);
 }
 
 // ---------------------------------------------------------------------------
-// first_append_no_f1
+// first_prepend_no_f1
 // ---------------------------------------------------------------------------
 
 #[test]
-fn first_append_no_f1() {
+fn first_prepend_no_f1() {
     let dir = TempDir::new().unwrap();
     let depot = Depot::open(cfg(dir.path().to_path_buf())).unwrap();
 
     depot
-        .append(42, b"f0-bytes-A", None, false)
-        .expect("first append with None f1 must succeed");
+        .prepend(42, b"f0-bytes-A", None, false)
+        .expect("first prepend with None f1 must succeed");
 
     assert_eq!(depot.read_f0(42).unwrap(), b"f0-bytes-A".to_vec());
     assert!(depot.read_f1(42).unwrap().is_none(), "no f1 yet");
@@ -98,44 +98,44 @@ fn first_append_no_f1() {
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
-    assert!(cold.is_empty(), "no cold frames after first append");
+    assert!(cold.is_empty(), "no cold frames after first prepend");
 }
 
 // ---------------------------------------------------------------------------
-// first_append_with_some_f1_is_error
+// first_prepend_with_some_f1_is_error
 // ---------------------------------------------------------------------------
 
 #[test]
-fn first_append_with_some_f1_is_error() {
+fn first_prepend_with_some_f1_is_error() {
     let dir = TempDir::new().unwrap();
     let depot = Depot::open(cfg(dir.path().to_path_buf())).unwrap();
 
-    let r = depot.append(42, b"f0", Some(b"f1"), false);
+    let r = depot.prepend(42, b"f0", Some(b"f1"), false);
     assert!(
         r.is_err(),
-        "passing Some(f1) on the very first append must error"
+        "passing Some(f1) on the very first prepend must error"
     );
 }
 
 // ---------------------------------------------------------------------------
-// second_append_writes_f1
+// second_prepend_writes_f1
 // ---------------------------------------------------------------------------
 
 #[test]
-fn second_append_writes_f1() {
+fn second_prepend_writes_f1() {
     let dir = TempDir::new().unwrap();
     let depot = Depot::open(cfg(dir.path().to_path_buf())).unwrap();
 
-    depot.append(42, b"A-f0", None, false).unwrap();
+    depot.prepend(42, b"A-f0", None, false).unwrap();
     depot
-        .append(42, b"B-f0", Some(b"f1-records"), false)
+        .prepend(42, b"B-f0", Some(b"f1-records"), false)
         .unwrap();
 
     assert_eq!(depot.read_f0(42).unwrap(), b"B-f0".to_vec());
     assert_eq!(
         depot.read_f1(42).unwrap(),
         Some(b"f1-records".to_vec()),
-        "f1 must be the bytes from the second append"
+        "f1 must be the bytes from the second prepend"
     );
     let cold: Vec<Vec<u8>> = depot
         .cold_iter(42)
@@ -154,13 +154,13 @@ fn seal_moves_f1_bytes_to_cold_verbatim() {
     let dir = TempDir::new().unwrap();
     let depot = Depot::open(cfg(dir.path().to_path_buf())).unwrap();
 
-    depot.append(42, b"A-f0", None, false).unwrap();
+    depot.prepend(42, b"A-f0", None, false).unwrap();
     depot
-        .append(42, b"B-f0", Some(b"f1-after-B"), false)
+        .prepend(42, b"B-f0", Some(b"f1-after-B"), false)
         .unwrap();
     // Seal: previous f1 ("f1-after-B") must move to cold byte-identical.
     depot
-        .append(42, b"C-f0", Some(b"f1-after-C"), true)
+        .prepend(42, b"C-f0", Some(b"f1-after-C"), true)
         .unwrap();
 
     assert_eq!(depot.read_f0(42).unwrap(), b"C-f0".to_vec());
@@ -188,17 +188,17 @@ fn multiple_seals_build_cold_chain_newest_first() {
     let dir = TempDir::new().unwrap();
     let depot = Depot::open(cfg(dir.path().to_path_buf())).unwrap();
 
-    // First append (no f1).
-    depot.append(7, b"f0-0", None, false).unwrap();
-    // Second append: sets f1_0 (no seal possible yet, no prior f1).
-    depot.append(7, b"f0-1", Some(b"f1-0"), false).unwrap();
+    // First prepend (no f1).
+    depot.prepend(7, b"f0-0", None, false).unwrap();
+    // Second prepend: sets f1_0 (no seal possible yet, no prior f1).
+    depot.prepend(7, b"f0-1", Some(b"f1-0"), false).unwrap();
 
     // Four seals. Each seal moves the previous f1 into cold (newest-first).
     let sealed_in_order = [b"f1-0".to_vec(), b"f1-1".to_vec(), b"f1-2".to_vec(), b"f1-3".to_vec()];
-    depot.append(7, b"f0-2", Some(b"f1-1"), true).unwrap();
-    depot.append(7, b"f0-3", Some(b"f1-2"), true).unwrap();
-    depot.append(7, b"f0-4", Some(b"f1-3"), true).unwrap();
-    depot.append(7, b"f0-5", Some(b"f1-4"), true).unwrap();
+    depot.prepend(7, b"f0-2", Some(b"f1-1"), true).unwrap();
+    depot.prepend(7, b"f0-3", Some(b"f1-2"), true).unwrap();
+    depot.prepend(7, b"f0-4", Some(b"f1-3"), true).unwrap();
+    depot.prepend(7, b"f0-5", Some(b"f1-4"), true).unwrap();
 
     let cold: Vec<Vec<u8>> = depot
         .cold_iter(7)
@@ -229,14 +229,14 @@ fn multiple_chains_independent() {
     let dir = TempDir::new().unwrap();
     let depot = Depot::open(cfg(dir.path().to_path_buf())).unwrap();
 
-    // 100 chains, three appends each: A (first), B (no seal), C (seal).
+    // 100 chains, three prepends each: A (first), B (no seal), C (seal).
     let chain_ids: Vec<u64> = (0..100).collect();
     for &cid in &chain_ids {
         depot
-            .append(cid, format!("chain-{cid}-f0-A").as_bytes(), None, false)
+            .prepend(cid, format!("chain-{cid}-f0-A").as_bytes(), None, false)
             .unwrap();
         depot
-            .append(
+            .prepend(
                 cid,
                 format!("chain-{cid}-f0-B").as_bytes(),
                 Some(format!("chain-{cid}-f1-B").as_bytes()),
@@ -244,7 +244,7 @@ fn multiple_chains_independent() {
             )
             .unwrap();
         depot
-            .append(
+            .prepend(
                 cid,
                 format!("chain-{cid}-f0-C").as_bytes(),
                 Some(format!("chain-{cid}-f1-C").as_bytes()),
@@ -277,16 +277,16 @@ fn flush_durability() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
 
-    // Append + seal across a handful of chains; flush; drop.
+    // Prepend + seal across a handful of chains; flush; drop.
     let chain_ids: [u64; 5] = [1, 17, 42, 100, 500];
     {
         let depot = Depot::open(cfg(root.clone())).unwrap();
         for &cid in &chain_ids {
             depot
-                .append(cid, format!("f0-A-{cid}").as_bytes(), None, false)
+                .prepend(cid, format!("f0-A-{cid}").as_bytes(), None, false)
                 .unwrap();
             depot
-                .append(
+                .prepend(
                     cid,
                     format!("f0-B-{cid}").as_bytes(),
                     Some(format!("f1-B-{cid}").as_bytes()),
@@ -294,7 +294,7 @@ fn flush_durability() {
                 )
                 .unwrap();
             depot
-                .append(
+                .prepend(
                     cid,
                     format!("f0-C-{cid}").as_bytes(),
                     Some(format!("f1-C-{cid}").as_bytes()),
@@ -332,7 +332,7 @@ fn flush_durability() {
 // "Crash" simulation: drop the depot via `std::mem::forget`, which skips
 // Drop entirely. Any flush-on-Drop the implementer wires up does not run.
 // The contract under test is the weakest possible: no panic, no corrupt
-// bytes. We do NOT assert that the recent append is present or missing.
+// bytes. We do NOT assert that the recent prepend is present or missing.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -344,15 +344,15 @@ fn no_flush_may_lose() {
     // verify post-crash.
     {
         let depot = Depot::open(cfg(root.clone())).unwrap();
-        depot.append(10, b"baseline-f0", None, false).unwrap();
+        depot.prepend(10, b"baseline-f0", None, false).unwrap();
         depot.flush().unwrap();
     }
 
-    // Now append more without flushing, then "crash" by forgetting the
+    // Now prepend more without flushing, then "crash" by forgetting the
     // depot — Drop never runs, so no fsync-on-drop fires.
     let depot = Depot::open(cfg(root.clone())).unwrap();
     depot
-        .append(20, b"unflushed-f0", None, false)
+        .prepend(20, b"unflushed-f0", None, false)
         .unwrap();
     std::mem::forget(depot);
 
@@ -362,13 +362,13 @@ fn no_flush_may_lose() {
     // The flushed baseline must still be there byte-identical.
     assert_eq!(depot.read_f0(10).unwrap(), b"baseline-f0".to_vec());
 
-    // The unflushed append may or may not be visible — SPEC permits both.
+    // The unflushed prepend may or may not be visible — SPEC permits both.
     // If it IS visible, it must be byte-identical (no corruption).
     match depot.read_f0(20) {
         Ok(bytes) => assert_eq!(
             bytes,
             b"unflushed-f0".to_vec(),
-            "if the unflushed append survived, it must be byte-identical"
+            "if the unflushed prepend survived, it must be byte-identical"
         ),
         Err(_) => { /* lost — allowed by SPEC */ }
     }
@@ -392,7 +392,7 @@ fn index_entry_is_8_bytes() {
     })
     .unwrap();
 
-    depot.append(42, b"f0-bytes", None, false).unwrap();
+    depot.prepend(42, b"f0-bytes", None, false).unwrap();
     depot.flush().unwrap();
 
     let index = std::fs::read(root.join("index")).unwrap();
@@ -406,7 +406,7 @@ fn index_entry_is_8_bytes() {
     let entry = &index[entry_start..entry_start + INDEX_ENTRY_LEN];
     assert!(
         entry.iter().any(|&b| b != 0),
-        "chain 42's index entry must be nonzero after one append"
+        "chain 42's index entry must be nonzero after one prepend"
     );
 
     // All other entries must remain zero.
@@ -428,7 +428,7 @@ fn index_entry_is_8_bytes() {
 // eviction_reclaims_dead_f0_space
 //
 // Strategy: use a small file_size_threshold (64 KiB) and a payload size
-// large enough that a few appends per chain blow through it. Append many
+// large enough that a few prepends per chain blow through it. Prepend many
 // revisions to one chain (each deprecates its prior f0 in its f0 file).
 // Eventually the original f0 file's dead ratio crosses 0.5; calling
 // flush() should let an opportunistic trigger fire. After flush(), the
@@ -453,22 +453,22 @@ fn eviction_reclaims_dead_f0_space() {
 
     let depot = Depot::open(cfg).unwrap();
 
-    // First append (no f1).
+    // First prepend (no f1).
     let p0 = payload("initial-f0-", 4 * 1024);
-    depot.append(3, &p0, None, false).unwrap();
+    depot.prepend(3, &p0, None, false).unwrap();
 
-    // Drive many more appends. Each ~4 KiB f0 + ~4 KiB f1. After a few we
+    // Drive many more prepends. Each ~4 KiB f0 + ~4 KiB f1. After a few we
     // cross the 64 KiB file_size_threshold and roll into a new file. After
     // many more, the original file is entirely dead and must be evicted.
-    let n_appends: usize = 200;
-    for i in 0..n_appends {
+    let n_prepends: usize = 200;
+    for i in 0..n_prepends {
         let f0 = payload(&format!("f0-rev-{i:04}-"), 4 * 1024);
         let f1 = payload(&format!("f1-rev-{i:04}-"), 1024);
-        depot.append(3, &f0, Some(&f1), false).unwrap();
+        depot.prepend(3, &f0, Some(&f1), false).unwrap();
     }
 
-    let last_f0 = payload(&format!("f0-rev-{:04}-", n_appends - 1), 4 * 1024);
-    let last_f1 = payload(&format!("f1-rev-{:04}-", n_appends - 1), 1024);
+    let last_f0 = payload(&format!("f0-rev-{:04}-", n_prepends - 1), 4 * 1024);
+    let last_f1 = payload(&format!("f1-rev-{:04}-", n_prepends - 1), 1024);
 
     // Trigger opportunistic eviction via flush.
     depot.flush().unwrap();
@@ -511,15 +511,15 @@ fn eviction_reclaims_dead_f1_space() {
     let depot = Depot::open(cfg).unwrap();
 
     let initial_f0 = payload("initial-f0-", 1024);
-    depot.append(5, &initial_f0, None, false).unwrap();
+    depot.prepend(5, &initial_f0, None, false).unwrap();
 
-    // Drive many appends without seal; each replaces (deprecates) the
+    // Drive many prepends without seal; each replaces (deprecates) the
     // previous f1 in its f1 file.
     let n: usize = 200;
     for i in 0..n {
         let f0 = payload(&format!("f0-{i:04}-"), 1024);
         let f1 = payload(&format!("f1-{i:04}-"), 4 * 1024);
-        depot.append(5, &f0, Some(&f1), false).unwrap();
+        depot.prepend(5, &f0, Some(&f1), false).unwrap();
     }
     let last_f0 = payload(&format!("f0-{:04}-", n - 1), 1024);
     let last_f1 = payload(&format!("f1-{:04}-", n - 1), 4 * 1024);
@@ -563,10 +563,10 @@ fn cold_file_never_evicted() {
 
     let depot = Depot::open(cfg).unwrap();
 
-    // First append (no f1).
-    depot.append(2, b"f0-0", None, false).unwrap();
+    // First prepend (no f1).
+    depot.prepend(2, b"f0-0", None, false).unwrap();
 
-    // Drive many appends with seals so cold accumulates frames, and so
+    // Drive many prepends with seals so cold accumulates frames, and so
     // f0/f1 turnover triggers evictions.
     let mut sealed_f1s: Vec<Vec<u8>> = Vec::new();
     let n: usize = 100;
@@ -574,7 +574,7 @@ fn cold_file_never_evicted() {
     for i in 0..n {
         let f1_bytes = payload(&format!("seal-{i:04}-"), 1024);
         depot
-            .append(2, &f0_filler, Some(&f1_bytes), i > 0) // seal from append 1 onward
+            .prepend(2, &f0_filler, Some(&f1_bytes), i > 0) // seal from prepend 1 onward
             .unwrap();
         if i > 0 {
             // The PREVIOUS f1 is what gets sealed into cold. Track it.
@@ -589,7 +589,7 @@ fn cold_file_never_evicted() {
     for i in 0..200 {
         let f0 = payload(&format!("post-f0-{i:04}-"), 4 * 1024);
         let f1 = payload(&format!("post-f1-{i:04}-"), 1024);
-        depot.append(2, &f0, Some(&f1), false).unwrap();
+        depot.prepend(2, &f0, Some(&f1), false).unwrap();
     }
     depot.flush().unwrap();
 
@@ -654,10 +654,10 @@ fn delete_all_unlinks_everything() {
     let depot = Depot::open(mk_cfg()).unwrap();
     for cid in 0u64..20 {
         depot
-            .append(cid, format!("f0-{cid}").as_bytes(), None, false)
+            .prepend(cid, format!("f0-{cid}").as_bytes(), None, false)
             .unwrap();
         depot
-            .append(
+            .prepend(
                 cid,
                 format!("f0b-{cid}").as_bytes(),
                 Some(format!("f1-{cid}").as_bytes()),
@@ -665,7 +665,7 @@ fn delete_all_unlinks_everything() {
             )
             .unwrap();
         depot
-            .append(
+            .prepend(
                 cid,
                 format!("f0c-{cid}").as_bytes(),
                 Some(format!("f1b-{cid}").as_bytes()),
@@ -733,12 +733,12 @@ fn mid_eviction_crash_safe() {
     // Build a depot where eviction WILL run on next flush.
     let depot = Depot::open(mk_cfg()).unwrap();
     let initial = payload("init-", 1024);
-    depot.append(4, &initial, None, false).unwrap();
+    depot.prepend(4, &initial, None, false).unwrap();
     let n: usize = 100;
     for i in 0..n {
         let f0 = payload(&format!("f0-{i:04}-"), 4 * 1024);
         let f1 = payload(&format!("f1-{i:04}-"), 1024);
-        depot.append(4, &f0, Some(&f1), false).unwrap();
+        depot.prepend(4, &f0, Some(&f1), false).unwrap();
     }
     depot.flush().unwrap();
     let last_f0 = payload(&format!("f0-{:04}-", n - 1), 4 * 1024);
@@ -751,7 +751,7 @@ fn mid_eviction_crash_safe() {
     for i in n..(n + 100) {
         let f0 = payload(&format!("f0-{i:04}-"), 4 * 1024);
         let f1 = payload(&format!("f1-{i:04}-"), 1024);
-        depot.append(4, &f0, Some(&f1), false).unwrap();
+        depot.prepend(4, &f0, Some(&f1), false).unwrap();
     }
     let crash_f0 = payload(&format!("f0-{:04}-", n + 99), 4 * 1024);
     let crash_f1 = payload(&format!("f1-{:04}-", n + 99), 1024);
@@ -761,13 +761,13 @@ fn mid_eviction_crash_safe() {
     let snapshot_dir = TempDir::new().unwrap();
     copy_tree(&root, snapshot_dir.path());
 
-    // Continue with another wave of appends and then "crash" — std::mem::forget
+    // Continue with another wave of prepends and then "crash" — std::mem::forget
     // skips Drop, mirroring an abort partway through the eviction the next
     // flush would run.
     for i in (n + 100)..(n + 200) {
         let f0 = payload(&format!("f0-{i:04}-"), 4 * 1024);
         let f1 = payload(&format!("f1-{i:04}-"), 1024);
-        depot.append(4, &f0, Some(&f1), false).unwrap();
+        depot.prepend(4, &f0, Some(&f1), false).unwrap();
     }
     std::mem::forget(depot);
 
@@ -811,7 +811,7 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
 // Pin the on-disk frame header at 20 bytes:
 // `[u64 chain_id LE | u64 next_pointer LE | u32 zstd_len LE]`, followed
 // by exactly `zstd_len` opaque payload bytes that match what we passed
-// to `append`.
+// to `prepend`.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -822,7 +822,7 @@ fn frame_header_layout() {
 
     let chain_id: u64 = 7;
     let f0_bytes: &[u8] = b"opaque-zstd-blob-for-f0";
-    depot.append(chain_id, f0_bytes, None, false).unwrap();
+    depot.prepend(chain_id, f0_bytes, None, false).unwrap();
     depot.flush().unwrap();
 
     // There should be exactly one f0 data file (file-0000).
@@ -830,7 +830,7 @@ fn frame_header_layout() {
     assert_eq!(
         f0_files.len(),
         1,
-        "expected exactly one f0 data file after one append, got {f0_files:?}"
+        "expected exactly one f0 data file after one prepend, got {f0_files:?}"
     );
     let bytes = std::fs::read(&f0_files[0]).unwrap();
     assert!(
@@ -880,11 +880,11 @@ fn cold_pointer_chain_walks_correctly() {
     let depot = Depot::open(cfg(root.clone())).unwrap();
 
     let chain_id: u64 = 11;
-    // First append (no f1).
-    depot.append(chain_id, b"f0-init", None, false).unwrap();
-    // Second append: introduce f1 (no seal possible yet).
+    // First prepend (no f1).
+    depot.prepend(chain_id, b"f0-init", None, false).unwrap();
+    // Second prepend: introduce f1 (no seal possible yet).
     depot
-        .append(chain_id, b"f0-1", Some(b"f1-0"), false)
+        .prepend(chain_id, b"f0-1", Some(b"f1-0"), false)
         .unwrap();
 
     // Now do K seals. Each seal moves the previous f1 into cold.
@@ -893,7 +893,7 @@ fn cold_pointer_chain_walks_correctly() {
         let new_f0 = format!("f0-{}", i + 1);
         let new_f1 = format!("f1-{i}");
         depot
-            .append(chain_id, new_f0.as_bytes(), Some(new_f1.as_bytes()), true)
+            .prepend(chain_id, new_f0.as_bytes(), Some(new_f1.as_bytes()), true)
             .unwrap();
     }
     depot.flush().unwrap();

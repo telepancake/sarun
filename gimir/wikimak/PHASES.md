@@ -18,7 +18,7 @@ nothing else.
 **TESTS that must pass** (write them first, TDD-style):
 
 The tests talk to the depot through the public API only: `open`,
-`append(chain_id, new_f0, new_f1, seal_old_f1)`, `read_f0`, `read_f1`,
+`prepend(chain_id, new_f0, new_f1, seal_old_f1)`, `read_f0`, `read_f1`,
 `cold_iter`, `flush`, `delete_all`. They are byte-payload tests: the
 depot is opaque to zstd, so tests feed it arbitrary byte slices labeled
 "f0", "f1", "cold". No real zstd encoding is required by these tests.
@@ -27,15 +27,15 @@ depot is opaque to zstd, so tests feed it arbitrary byte slices labeled
   `max_chain_id * 8` bytes of zeros; `f0/`, `f1/`, and `cold/` dirs
   exist; `cold/cold` is an empty file; no `f0/file-*` or `f1/file-*`
   files yet.
-- `first_append_no_f1`: `append(42, b"f0-bytes-A", None, false)`;
+- `first_append_no_f1`: `prepend(42, b"f0-bytes-A", None, false)`;
   `read_f0(42)` returns `b"f0-bytes-A"`; `read_f1(42)` returns
   `Ok(None)`; `cold_iter(42)` is empty.
-- `first_append_with_some_f1_is_error`: `append(42, b"f0", Some(b"f1"),
+- `first_append_with_some_f1_is_error`: `prepend(42, b"f0", Some(b"f1"),
   false)` on an empty chain returns an error.
-- `second_append_writes_f1`: append A then append B with `new_f1 =
+- `second_append_writes_f1`: prepend A then prepend B with `new_f1 =
   Some(b"f1-records")`, no seal; `read_f0(42) == b"B-f0"`,
   `read_f1(42) == Some(b"f1-records")`, `cold_iter(42)` empty.
-- `seal_moves_f1_bytes_to_cold_verbatim`: append A, B (gives chain an
+- `seal_moves_f1_bytes_to_cold_verbatim`: prepend A, B (gives chain an
   f1), then C with `seal_old_f1 = true` and `new_f1 = Some(b"new-f1")`;
   the previous f1's bytes appear in `cold_iter` byte-identical, as the
   first (newest) cold frame; `read_f1` returns the new f1.
@@ -43,22 +43,22 @@ depot is opaque to zstd, so tests feed it arbitrary byte slices labeled
   `cold_iter` yields the four old-f1 byte payloads in newest-first
   order, each byte-identical to what was passed at seal time.
 - `multiple_chains_independent`: drive 100 distinct chain_ids through a
-  few appends each (mix of seals and non-seals); every chain's
+  few prepends each (mix of seals and non-seals); every chain's
   `read_f0`/`read_f1`/`cold_iter` returns only its own bytes.
-- `flush_durability`: append + seal across several chains; `flush()`;
+- `flush_durability`: prepend + seal across several chains; `flush()`;
   drop the depot; reopen; assert `read_f0`/`read_f1`/`cold_iter` return
   the same bytes for every chain.
-- `no_flush_may_lose`: append without `flush()`; drop the depot via a
+- `no_flush_may_lose`: prepend without `flush()`; drop the depot via a
   path that does not fsync (simulating crash); reopen. The depot must
   not panic and must not return corrupt bytes. It may or may not show
-  the recent append — the test asserts no-panic and either-or, nothing
+  the recent prepend — the test asserts no-panic and either-or, nothing
   stronger.
-- `index_entry_is_8_bytes`: dump the raw index bytes after one append
+- `index_entry_is_8_bytes`: dump the raw index bytes after one prepend
   to chain 42; assert the file size is exactly `max_chain_id * 8`;
   assert bytes `[42*8 .. 42*8+8]` are nonzero and the rest are zero.
 - `eviction_reclaims_dead_f0_space`: configure a small
   `file_size_threshold` (e.g. 64 KiB) and `eviction_dead_ratio = 0.5`.
-  Append many revisions to one chain (each append deprecates the prior
+  Prepend many revisions to one chain (each prepend deprecates the prior
   f0 in its f0 file). Drive enough turnover that an f0 file's dead
   ratio crosses 0.5. Either via an opportunistic flush trigger or via
   an implementer-exposed `maybe_evict` hook (test detects which is
@@ -70,7 +70,7 @@ depot is opaque to zstd, so tests feed it arbitrary byte slices labeled
   crosses the dead ratio. Force eviction. Victim f1 file gone; chains
   still readable; the f0 frames' next_pointers now point at the new f1
   locations.
-- `cold_file_never_evicted`: drive many appends and force several
+- `cold_file_never_evicted`: drive many prepends and force several
   evictions in f0 and f1; the `cold/cold` file is still the same inode
   and still contains every cold frame ever written, byte-identical.
 - `delete_all_unlinks_everything`: after a busy session, call
@@ -83,11 +83,11 @@ depot is opaque to zstd, so tests feed it arbitrary byte slices labeled
   reopen: every chain is still readable byte-identical; the depot can
   run eviction again to completion. No data loss; duplicate copies in
   the destination file are dead and get deprecated naturally.
-- `frame_header_layout`: handcraft a chain's append by calling the
+- `frame_header_layout`: handcraft a chain's prepend by calling the
   public API, then read the f0 file's raw bytes; assert the first 8
   bytes are `chain_id` LE, the next 8 bytes are the `next_pointer` LE,
   the next 4 bytes are `zstd_len` LE, and the following `zstd_len`
-  bytes match the payload passed to `append`. This pins the on-disk
+  bytes match the payload passed to `prepend`. This pins the on-disk
   frame header at 20 bytes per SPEC §"Frame format".
 - `cold_pointer_chain_walks_correctly`: after K seals, assert that the
   cold-frame pointers form a chain of length K: newest cold's
@@ -102,13 +102,13 @@ depot is opaque to zstd, so tests feed it arbitrary byte slices labeled
 - Index entry is 8 bytes: `[u32 file_id LE | u32 offset LE]`.
 - One chain has exactly one f0 and zero-or-one f1, plus zero-or-more
   cold frames. Never more than one f0 or f1 per chain.
-- Cold is ONE file per depot, append-only, never evicted, `unlink`'d
+- Cold is ONE file per depot, prepend-only, never evicted, `unlink`'d
   whole on `delete_all`.
 - Eviction migrates frames from a victim f0/f1 file to the current
   write target in the same tier. Only two pointer patches: the index
   (for f0 victims) or the f0 frame's next_pointer (for f1 victims).
 - Crash recovery = trust the OS. The index flip is the atomic commit
-  point of every append.
+  point of every prepend.
 - The depot does NOT call zstd. It stores and returns opaque bytes.
 
 **Dispatch shape**: one tester agent writes the tests; one implementer
@@ -430,7 +430,7 @@ not required.
 - One frame per revision in the depot. The depot is opaque to the
   record codec.
 - `chain_id = page_id as u64`. No silent remapping.
-- Per-page atomicity: depot append + strpool append (if new title) +
+- Per-page atomicity: depot prepend + strpool prepend (if new title) +
   sqlite rows commit together. `BEGIN IMMEDIATE` per page.
 - `Instance::flush` calls `depot.flush()`, sqlite checkpoint/commit,
   and `pool.flush(shard_id)` for all touched shards.

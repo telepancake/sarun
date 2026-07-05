@@ -157,7 +157,7 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
             let (meta, text_bytes) = build_revision_record(rev, stats);
             let encoded = encode_revision(&meta, &text_bytes);
 
-            append_depot_frame(&g, page_id, &encoded,
+            prepend_depot_frame(&g, page_id, &encoded,
                                instance.f1_seal_threshold_bytes)?;
 
             g.conn.execute(
@@ -325,13 +325,13 @@ fn build_revision_record(rev: &Revision, stats: &mut ImportStats) -> (RevisionMe
 
 /// Append one revision record to the depot chain for `chain_id`. See
 /// the module doc for the f0/f1/seal strategy.
-fn append_depot_frame(
+fn prepend_depot_frame(
     g: &InstanceInner,
     chain_id: u64,
     record: &[u8],
     seal_threshold: u64,
 ) -> Result<()> {
-    // Is this the first append on the chain?
+    // Is this the first prepend on the chain?
     let prev_f0 = match g.depot.read_f0(chain_id) {
         Ok(b) => Some(b),
         Err(wikimak_depot::Error::NoFrame) => None,
@@ -341,8 +341,8 @@ fn append_depot_frame(
     let new_f0 = crate::frames::compress(record, None)?;
     match prev_f0 {
         None => {
-            // First append: no f1.
-            g.depot.append(chain_id, &new_f0, None, false)?;
+            // First prepend: no f1.
+            g.depot.prepend(chain_id, &new_f0, None, false)?;
         }
         Some(prev_f0_frame) => {
             // Recover the raw records: old f0 standalone; old f1 (if
@@ -371,7 +371,7 @@ fn append_depot_frame(
                 raw.extend_from_slice(&old_f1_raw);
                 crate::frames::compress(&raw, Some(record))?
             };
-            g.depot.append(chain_id, &new_f0, Some(&new_f1), seal)?;
+            g.depot.prepend(chain_id, &new_f0, Some(&new_f1), seal)?;
         }
     }
     Ok(())

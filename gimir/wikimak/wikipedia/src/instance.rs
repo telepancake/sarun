@@ -162,7 +162,7 @@ impl Instance {
         // held for the Instance's lifetime and auto-released by the
         // kernel on any exit (even a crash). External READERS of
         // meta.db stay possible — only a second writing instance is
-        // locked out (it would interleave depot appends unsynchronized).
+        // locked out (it would interleave depot prepends unsynchronized).
         let lock = acquire_root_lock(&cfg.root)?;
 
         // meta.db.

@@ -36,7 +36,7 @@ fn base_text(rng: &mut Rng) -> Vec<String> {
 }
 
 /// Build a MediaWiki export: ONE page, `n` revisions, each a small edit
-/// of the previous (one line replaced, one appended) — the ~99%-identical
+/// of the previous (one line replaced, one prepended) — the ~99%-identical
 /// succession the tiered design exists for.
 fn export_xml(n: usize) -> (String, Vec<String>) {
     let mut rng = Rng(0x5eed);
@@ -46,7 +46,7 @@ fn export_xml(n: usize) -> (String, Vec<String>) {
     for r in 0..n {
         let at = (rng.next() as usize) % lines.len();
         lines[at] = format!("line {at:04}: EDITED r{r} {:016x}", rng.next());
-        lines.push(format!("appended by r{r}"));
+        lines.push(format!("prepended by r{r}"));
         let text = lines.join("\n");
         revs.push_str(&format!(
             r#"    <revision>

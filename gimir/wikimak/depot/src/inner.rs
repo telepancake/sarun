@@ -16,7 +16,7 @@ const HEADER_LEN: usize = 20;
 /// `[u32 file_id LE | u32 offset LE]`.
 const INDEX_ENTRY_LEN: usize = 8;
 /// `file_id == 0` ⇔ the cold file. f0/f1 file ids start at 1 so that a
-/// real first-append index entry of `(file_id=1, offset=0)` is nonzero
+/// real first-prepend index entry of `(file_id=1, offset=0)` is nonzero
 /// and distinguishable from the `(0,0)` "empty chain" sentinel.
 const COLD_FILE_ID: u32 = 0;
 
@@ -184,7 +184,7 @@ impl DepotInner {
         })
     }
 
-    pub fn append(
+    pub fn prepend(
         &mut self,
         chain_id: u64,
         new_f0_bytes: &[u8],
@@ -208,7 +208,7 @@ impl DepotInner {
 
         if virgin {
             if new_f1_bytes.is_some() {
-                return Err(Error::FirstAppendHasF1);
+                return Err(Error::FirstPrependHasF1);
             }
             if seal_old_f1 {
                 return Err(Error::CannotSealNoF1);
