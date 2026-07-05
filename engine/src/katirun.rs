@@ -993,12 +993,6 @@ fn install_make_recipe_runner() {
         // thread around the run (save/restore so nested makes nest cleanly).
         let cwd_path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(cwd));
         let prev = crate::brush::set_box_recipe_cwd(Some(cwd_path));
-        // bundle_coreutils=false: see brush::box_builtins_opt. uutils
-        // localization caches each util's FluentResource in a process-
-        // global OnceLock; the first util to run owns it, every later
-        // util's translate!() returns the raw key (e.g. cp's
-        // `cp-error-cannot-stat`). For make recipes we accept the
-        // fork+exec overhead in exchange for bash-compatible stderr.
         // Map kati's stderr disposition to brush's fd-2 handling: recipes
         // (RedirectStderr::Stdout) merge stderr into the captured output; a
         // $(shell ...) (RedirectStderr::None) keeps stderr on the box's real
@@ -1008,7 +1002,7 @@ fn install_make_recipe_runner() {
             kati::fileutil::RedirectStderr::None => crate::brush::RecipeStderr::Inherit,
             kati::fileutil::RedirectStderr::DevNull => crate::brush::RecipeStderr::Null,
         };
-        let code = crate::brush::run_recipe_in_process_prefixed(&p, &s, output_cb, false, stderr_mode);
+        let code = crate::brush::run_recipe_in_process_prefixed(&p, &s, output_cb, stderr_mode);
         crate::brush::set_box_recipe_cwd(prev);
         RecipeRunnerDecision::Ran { code }
     }));

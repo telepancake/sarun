@@ -24,7 +24,7 @@
 // (coreutils installed first, BashMode set overwrites overlaps). Each coreutil runs
 // on a fresh thread via run_coreutil_localized — no process-fd dup2, pipeline-safe.
 // All three shells (top-level box, nested sh, nested bash) get their builtins from
-// box_builtins_opt(), which is the single policy point.
+// box_builtins(), which is the single policy point.
 //
 // brush↔PROCESS LINKAGE (D9, DONE — see capture.rs):
 //   brush emits one FRAME_PROV per pipeline IN EXECUTION ORDER, immediately before
@@ -60,7 +60,7 @@
 // PARSER MODE BY INVOCATION NAME (B): reached as `bash` → BASH mode (bashisms:
 // `[[ ]]`, `<(…)`, arrays, `${x//a/b}`, …); `sh`/`dash` → sh_mode(true), faithful
 // POSIX. The top-level box brush stays sh_mode(true). Mode is the ONLY difference
-// between the three; builtins come from box_builtins_opt().
+// between the three; builtins come from box_builtins().
 //
 // Brush-core coverage (VERIFIED): POSIX builtins (cd, export, set, [, test,
 // printf, echo, shift, …), variable assignment+expansion, arithmetic,
@@ -75,7 +75,7 @@ use serde_json::json;
 use serde_json::Value;
 
 // ── shared shell builder ─────────────────────────────────────────────────────
-// All three brush shells install the SAME builtin policy via box_builtins_opt().
+// All three brush shells install the SAME builtin policy via box_builtins().
 // Only the parser mode differs (see module header).
 
 use std::ffi::OsString;
@@ -356,369 +356,132 @@ impl brush_core::builtins::SimpleCommand for WcBuiltin {
     }
 }
 
-/// `nl` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
-struct NlBuiltin;
+// ── coreutil builtin templates ───────────────────────────────────────────────
+// Each box coreutil builtin below is ONE macro invocation: the struct name, the
+// util text (for `get_content`), the vendored entry path, and the thread label
+// passed to `run_coreutil_localized` (which runs the util on a fresh thread so it
+// gets its own thread-local uucore Fluent bundle and never `chdir`s the process).
+// The macros differ only by the entry's argument SHAPE — whether it also takes
+// the shell's logical cwd, its exported-env snapshot, and/or logical stdin:
+//
+//   info_builtin!        (args, out, err)                 — uname/whoami/basename/…
+//   info_env_builtin!    (args, env, out, err)            — id/nproc
+//   fs_builtin!          (args, cwd, out, err)            — mkdir/rmdir/chmod/…
+//   fs_env_builtin!      (args, cwd, env, out, err)       — cp/readlink/mktemp
+//   fs_builtin_stdin!    (args, cwd, out, err, stdin)     — rm/mv/ln (-i prompt)
+//   stream_builtin!      (args, cwd, out, err, in)        — nl/tac/cut/tee
+//   stream_env_builtin!  (args, cwd, env, out, err, in)   — uniq/sort
+//
+// cat/head/tail/wc stay hand-written above: their entries take a raw `BorrowedFd`
+// for the splice(2) fast path, a shape shared by no other util. touch and tr are
+// the only members of their shapes and stay hand-written below.
+//
+// Every macro renders a failed entry's error as `NAME: <msg>` on the logical
+// stderr and returns the util's own `e.code()`; a fresh thread per call keeps the
+// process cwd and localization untouched.
 
-impl brush_core::builtins::SimpleCommand for NlBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O nl builtin\n"))
-    }
+/// INFO shape: `(args, out, err)` — no cwd, no env, no stdin.
+macro_rules! info_builtin {
+    ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
+        struct $builtin;
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
+        impl brush_core::builtins::SimpleCommand for $builtin {
+            fn get_content(
+                name: &str,
+                _content_type: brush_core::builtins::ContentType,
+                _options: &brush_core::builtins::ContentOptions,
+            ) -> Result<String, brush_core::error::Error> {
+                Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
+            }
 
-        let cwd = context.shell.working_dir().to_path_buf();
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
+            fn execute<SE: brush_core::extensions::ShellExtensions,
+                       I: Iterator<Item = S>, S: AsRef<str>>(
+                context: brush_core::commands::ExecutionContext<'_, SE>,
+                args: I,
+            ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+                let name = context.command_name.clone();
+                let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+                if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        let code = run_coreutil_localized("uu_nl", exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let r = match uu_nl::nl(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
+                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+
+                let code = run_coreutil_localized($thread, exported_env_snapshot(&context), move || {
+                    use std::io::Write;
+                    let mut out = out;
+                    let mut err = err;
+                    let r = match $entry(argv.into_iter(), &mut out, &mut err) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                            e.code()
+                        }
+                    };
+                    let _ = out.flush();
+                    let _ = err.flush();
+                    r
+                });
+                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+            }
+        }
+    };
 }
 
-/// `tac` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
-struct TacBuiltin;
+/// INFO+ENV shape: `(args, env, out, err)`. `id` suppresses its SELinux context
+/// suffix under `POSIXLY_CORRECT`; `nproc` scales by `OMP_NUM_THREADS`/
+/// `OMP_THREAD_LIMIT` — both read from the shell's exported env, not the engine's.
+macro_rules! info_env_builtin {
+    ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
+        struct $builtin;
 
-impl brush_core::builtins::SimpleCommand for TacBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O tac builtin\n"))
-    }
+        impl brush_core::builtins::SimpleCommand for $builtin {
+            fn get_content(
+                name: &str,
+                _content_type: brush_core::builtins::ContentType,
+                _options: &brush_core::builtins::ContentOptions,
+            ) -> Result<String, brush_core::error::Error> {
+                Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
+            }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
+            fn execute<SE: brush_core::extensions::ShellExtensions,
+                       I: Iterator<Item = S>, S: AsRef<str>>(
+                context: brush_core::commands::ExecutionContext<'_, SE>,
+                args: I,
+            ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+                let name = context.command_name.clone();
+                let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+                if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-        let cwd = context.shell.working_dir().to_path_buf();
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
+                let envv = exported_env_snapshot(&context);
+                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-        let code = run_coreutil_localized("uu_tac", exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let r = match uu_tac::tac(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
+                let code = run_coreutil_localized($thread, envv.clone(), move || {
+                    use std::io::Write;
+                    let mut out = out;
+                    let mut err = err;
+                    let r = match $entry(argv.into_iter(), &envv, &mut out, &mut err) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                            e.code()
+                        }
+                    };
+                    let _ = out.flush();
+                    let _ = err.flush();
+                    r
+                });
+                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+            }
+        }
+    };
 }
 
-/// `tr` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
-struct TrBuiltin;
-
-impl brush_core::builtins::SimpleCommand for TrBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O tr builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-
-        let code = run_coreutil_localized("uu_tr", exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let r = match uu_tr::tr(argv.into_iter(), &mut out, &mut err, &mut inp) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `cut` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
-struct CutBuiltin;
-
-impl brush_core::builtins::SimpleCommand for CutBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O cut builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        let cwd = context.shell.working_dir().to_path_buf();
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-
-        let code = run_coreutil_localized("uu_cut", exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let r = match uu_cut::cut(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `uniq` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
-struct UniqBuiltin;
-
-impl brush_core::builtins::SimpleCommand for UniqBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O uniq builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        // Shell's LOGICAL cwd: uniq's relative INPUT/OUTPUT operands resolve
-        // against this, not the engine process cwd.
-        let cwd = context.shell.working_dir().to_path_buf();
-
-        // Shell's LOGICAL environment: uniq's locale knobs (LC_ALL/LC_CTYPE/LANG)
-        // come from the vars the box shell has `export`ed, not the engine's env.
-        let envv: Vec<(OsString, OsString)> = context
-            .shell
-            .env()
-            .iter_exported()
-            .map(|(k, v)| {
-                (
-                    k.clone().into(),
-                    v.value().to_cow_str(context.shell).to_string().into(),
-                )
-            })
-            .collect();
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-
-        let code = run_coreutil_localized("uu_uniq", envv.clone(), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let r = match uu_uniq::uniq(argv.into_iter(), &cwd, &envv, &mut out, &mut err, &mut inp) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `sort` — STREAM template like [`HeadBuiltin`]. See [`run_coreutil_localized`].
-struct SortBuiltin;
-
-impl brush_core::builtins::SimpleCommand for SortBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O sort builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        // Shell's LOGICAL cwd: sort's relative operands (input FILEs, `-o`,
-        // `-T`, `--files0-from` + each path read from it) resolve against this,
-        // not the engine process cwd.
-        let cwd = context.shell.working_dir().to_path_buf();
-
-        // Shell's LOGICAL exported env: sort reads TMPDIR (external-sort temp
-        // dir) from here, not the engine process env.
-        let envv: Vec<(std::ffi::OsString, std::ffi::OsString)> = context.shell.env()
-            .iter_exported()
-            .map(|(k, v)| (k.clone().into(),
-                           v.value().to_cow_str(context.shell).to_string().into()))
-            .collect();
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-
-        let code = run_coreutil_localized("uu_sort", envv.clone(), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let r = match uu_sort::sort(argv.into_iter(), &cwd, &envv, &mut out, &mut err, &mut inp) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `cp` — FILESYSTEM template: relative operands resolved against the shell's logical cwd
-/// (captured before the worker runs; process is never `chdir`'d). See [`run_coreutil_localized`].
-struct CpBuiltin;
-
-impl brush_core::builtins::SimpleCommand for CpBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O cp builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        // Shell's LOGICAL cwd, captured before the worker closure:
-        // cp's relative operands resolve against this, not the process cwd.
-        let cwd = context.shell.working_dir().to_path_buf();
-        // Shell's LOGICAL exported env: cp reads POSIXLY_CORRECT from this,
-        // not the engine process's environment.
-        let envv = exported_env_snapshot(&context);
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-
-        let code = run_coreutil_localized("uu_cp", envv.clone(), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let r = match uu_cp::cp(argv.into_iter(), &cwd, &envv, &mut out, &mut err) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// FILESYSTEM-template builtin (like [`CpBuiltin`]): `(args, cwd, out, err)`, no stdin.
+/// FILESYSTEM shape: `(args, cwd, out, err)` — relative operands resolve against
+/// the shell's logical cwd (captured before the worker runs; the process is never
+/// `chdir`'d). No stdin.
 macro_rules! fs_builtin {
     ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
         struct $builtin;
@@ -767,74 +530,59 @@ macro_rules! fs_builtin {
     };
 }
 
-fs_builtin!(MkdirBuiltin, "mkdir", uu_mkdir::mkdir_main, "uu_mkdir");
-fs_builtin!(RmdirBuiltin, "rmdir", uu_rmdir::rmdir_main, "uu_rmdir");
+/// FILESYSTEM+ENV shape: `(args, cwd, env, out, err)`. `cp`/`readlink` read
+/// `POSIXLY_CORRECT`, `mktemp` reads `$TMPDIR` (a relative one rooted at the
+/// logical cwd) — all from the shell's exported env, not the engine's.
+macro_rules! fs_env_builtin {
+    ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
+        struct $builtin;
 
-/// `touch` — FILESYSTEM template. Distinct from [`fs_builtin!`]: `-` passes the logical
-/// fd 1 as a raw fd, so `touch -` updates the logical stdout's referent.
-struct TouchBuiltin;
+        impl brush_core::builtins::SimpleCommand for $builtin {
+            fn get_content(
+                name: &str,
+                _content_type: brush_core::builtins::ContentType,
+                _options: &brush_core::builtins::ContentOptions,
+            ) -> Result<String, brush_core::error::Error> {
+                Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
+            }
 
-impl brush_core::builtins::SimpleCommand for TouchBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O touch builtin\n"))
-    }
+            fn execute<SE: brush_core::extensions::ShellExtensions,
+                       I: Iterator<Item = S>, S: AsRef<str>>(
+                context: brush_core::commands::ExecutionContext<'_, SE>,
+                args: I,
+            ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+                let name = context.command_name.clone();
+                let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+                if argv.is_empty() { argv.push(OsString::from(&name)); }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
+                let cwd = context.shell.working_dir().to_path_buf();
+                let envv = exported_env_snapshot(&context);
+                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-        let cwd = context.shell.working_dir().to_path_buf();
-
-        // Shell's LOGICAL environment: touch's obsolete `_POSIX2_VERSION` knob
-        // comes from the vars the box shell has `export`ed, not the engine's env.
-        let envv: Vec<(OsString, OsString)> = context
-            .shell
-            .env()
-            .iter_exported()
-            .map(|(k, v)| {
-                (
-                    k.clone().into(),
-                    v.value().to_cow_str(context.shell).to_string().into(),
-                )
-            })
-            .collect();
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-
-        let code = run_coreutil_localized("uu_touch", envv.clone(), move || {
-            use std::io::Write;
-            use std::os::fd::AsRawFd;
-            let out = out;
-            let mut err = err;
-            // Raw fd for the logical stdout, for the `-` operand only;
-            // borrowed for the call's duration (the OpenFile outlives it).
-            let out_fd = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            let r = match uu_touch::touch_main(argv.into_iter(), &cwd, &envv, out_fd, &mut err) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
+                let code = run_coreutil_localized($thread, envv.clone(), move || {
+                    use std::io::Write;
+                    let mut out = out;
+                    let mut err = err;
+                    let r = match $entry(argv.into_iter(), &cwd, &envv, &mut out, &mut err) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                            e.code()
+                        }
+                    };
+                    let _ = out.flush();
+                    let _ = err.flush();
+                    r
+                });
+                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+            }
+        }
+    };
 }
 
-/// Like [`fs_builtin`] but entry is `(args, cwd, out, err, stdin)`: `rm -i`/`mv -i`
+/// FILESYSTEM+STDIN shape: `(args, cwd, out, err, stdin)` — `rm -i`/`mv -i`/`ln -i`
 /// read the y/N prompt from logical stdin, never the engine's fd 0.
 macro_rules! fs_builtin_stdin {
     ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
@@ -887,350 +635,9 @@ macro_rules! fs_builtin_stdin {
     };
 }
 
-fs_builtin_stdin!(RmBuiltin, "rm", uu_rm::rm_main, "uu_rm");
-fs_builtin_stdin!(MvBuiltin, "mv", uu_mv::mv_main, "uu_mv");
-fs_builtin_stdin!(LnBuiltin, "ln", uu_ln::ln_main, "uu_ln");
-
-/// `readlink` — FILESYSTEM template, but hand-written (lifted out of
-/// [`fs_builtin!`]) because its entry additionally takes the shell's LOGICAL
-/// exported env: `readlink -f`'s verbose default follows POSIXLY_CORRECT, which
-/// must come from the shell, not the engine process. Extending `fs_builtin!`
-/// itself would force the same signature onto every other fs util, so only this
-/// one diverges. Body otherwise mirrors the macro expansion.
-struct ReadlinkBuiltin;
-
-impl brush_core::builtins::SimpleCommand for ReadlinkBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O readlink builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        let cwd = context.shell.working_dir().to_path_buf();
-        let envv = exported_env_snapshot(&context);
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-
-        let code = run_coreutil_localized("uu_readlink", envv.clone(), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let r = match uu_readlink::readlink(argv.into_iter(), &cwd, &envv, &mut out, &mut err) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-fs_builtin!(RealpathBuiltin, "realpath", uu_realpath::realpath, "uu_realpath");
-
-/// `mktemp` — FILESYSTEM template like [`fs_builtin!`], but its entry also takes
-/// the shell's LOGICAL exported env: `$TMPDIR` (and `POSIXLY_CORRECT`) come from
-/// the vars the brush shell `export`ed, not the engine process's env. A relative
-/// `$TMPDIR` is rooted at the logical cwd. Hand-written (not the shared macro)
-/// because only this fs entry takes an `env` argument in this round.
-struct MktempBuiltin;
-
-impl brush_core::builtins::SimpleCommand for MktempBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O mktemp builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        let cwd = context.shell.working_dir().to_path_buf();
-
-        // Shell's LOGICAL exported env: mktemp reads TMPDIR / POSIXLY_CORRECT
-        // from here, not the engine process env.
-        let envv: Vec<(std::ffi::OsString, std::ffi::OsString)> = context.shell.env()
-            .iter_exported()
-            .map(|(k, v)| (k.clone().into(),
-                           v.value().to_cow_str(context.shell).to_string().into()))
-            .collect();
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-
-        let code = run_coreutil_localized("uu_mktemp", envv.clone(), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let r = match uu_mktemp::mktemp_main(argv.into_iter(), &cwd, &envv, &mut out, &mut err) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-fs_builtin!(ChmodBuiltin, "chmod", uu_chmod::chmod_main, "uu_chmod");
-fs_builtin!(ChownBuiltin, "chown", uu_chown::chown_main, "uu_chown");
-fs_builtin!(InstallBuiltin, "install", uu_install::install_main, "uu_install");
-
-/// `tee` — STREAM + CWD: reads logical stdin, writes logical stdout AND file operands
-/// (relative ones resolved against the logical cwd). See [`run_coreutil_localized`].
-struct TeeBuiltin;
-
-impl brush_core::builtins::SimpleCommand for TeeBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O tee builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        let cwd = context.shell.working_dir().to_path_buf();
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
-
-        let code = run_coreutil_localized("uu_tee", exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let r = match uu_tee::tee_main(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `basename` — `(args, out, err)`, no stdin, no cwd. See [`run_coreutil_localized`].
-struct BasenameBuiltin;
-
-impl brush_core::builtins::SimpleCommand for BasenameBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O basename builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-
-        let code = run_coreutil_localized("uu_basename", exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let r = match uu_basename::basename(argv.into_iter(), &mut out, &mut err) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `dirname` — `(args, out, err)`, no stdin, no cwd. See [`run_coreutil_localized`].
-struct DirnameBuiltin;
-
-impl brush_core::builtins::SimpleCommand for DirnameBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O dirname builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-
-        let code = run_coreutil_localized("uu_dirname", exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let r = match uu_dirname::dirname(argv.into_iter(), &mut out, &mut err) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `seq` — `(args, out, err)`, no stdin, no cwd. See [`run_coreutil_localized`].
-struct SeqBuiltin;
-
-impl brush_core::builtins::SimpleCommand for SeqBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O seq builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-
-        let code = run_coreutil_localized("uu_seq", exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let r = match uu_seq::seq(argv.into_iter(), &mut out, &mut err) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// `expr` — `(args, out, err)`, no stdin, no cwd. See [`run_coreutil_localized`].
-struct ExprBuiltin;
-
-impl brush_core::builtins::SimpleCommand for ExprBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O expr builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-
-        let code = run_coreutil_localized("uu_expr", exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let r = match uu_expr::expr(argv.into_iter(), &mut out, &mut err) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
-
-/// Info-util builtin (`uname`/`nproc`/`id`/`whoami`): `(args, out, err)`, no stdin, no cwd.
-macro_rules! info_builtin {
+/// STREAM shape: `(args, cwd, out, err, in)` — reads logical stdin, writes logical
+/// stdout/stderr; relative file operands resolve against the shell's logical cwd.
+macro_rules! stream_builtin {
     ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
         struct $builtin;
 
@@ -1252,14 +659,17 @@ macro_rules! info_builtin {
                 let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
                 if argv.is_empty() { argv.push(OsString::from(&name)); }
 
+                let cwd = context.shell.working_dir().to_path_buf();
                 let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
                 let code = run_coreutil_localized($thread, exported_env_snapshot(&context), move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
-                    let r = match $entry(argv.into_iter(), &mut out, &mut err) {
+                    let mut inp = inp;
+                    let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
                         Ok(()) => 0,
                         Err(e) => {
                             let msg = e.to_string();
@@ -1277,22 +687,80 @@ macro_rules! info_builtin {
     };
 }
 
-info_builtin!(UnameBuiltin, "uname", uu_uname::uname_main, "uu_uname");
-/// `id` — INFO template, but hand-written (lifted out of [`info_builtin!`])
-/// because its entry additionally takes the shell's LOGICAL exported env: the
-/// SELinux/SMACK context suffix is suppressed under POSIXLY_CORRECT, which must
-/// come from the shell, not the engine process. Extending `info_builtin!` would
-/// force the same signature onto uname/nproc/whoami, so only `id` diverges.
-/// Body otherwise mirrors the macro expansion.
-struct IdBuiltin;
+/// STREAM+ENV shape: `(args, cwd, env, out, err, in)`. `sort` reads `$TMPDIR` (its
+/// external-sort spill dir) and both read the locale knobs (`LC_ALL`/`LC_CTYPE`/
+/// `LANG`) from the shell's exported env, not the engine's.
+macro_rules! stream_env_builtin {
+    ($builtin:ident, $util:literal, $entry:path, $thread:literal) => {
+        struct $builtin;
 
-impl brush_core::builtins::SimpleCommand for IdBuiltin {
+        impl brush_core::builtins::SimpleCommand for $builtin {
+            fn get_content(
+                name: &str,
+                _content_type: brush_core::builtins::ContentType,
+                _options: &brush_core::builtins::ContentOptions,
+            ) -> Result<String, brush_core::error::Error> {
+                Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
+            }
+
+            fn execute<SE: brush_core::extensions::ShellExtensions,
+                       I: Iterator<Item = S>, S: AsRef<str>>(
+                context: brush_core::commands::ExecutionContext<'_, SE>,
+                args: I,
+            ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+                let name = context.command_name.clone();
+                let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+                if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+                let cwd = context.shell.working_dir().to_path_buf();
+                let envv = exported_env_snapshot(&context);
+                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
+
+                let code = run_coreutil_localized($thread, envv.clone(), move || {
+                    use std::io::Write;
+                    let mut out = out;
+                    let mut err = err;
+                    let mut inp = inp;
+                    let r = match $entry(argv.into_iter(), &cwd, &envv, &mut out, &mut err, &mut inp) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                            e.code()
+                        }
+                    };
+                    let _ = out.flush();
+                    let _ = err.flush();
+                    r
+                });
+                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+            }
+        }
+    };
+}
+
+// STREAM builtins.
+stream_builtin!(NlBuiltin, "nl", uu_nl::nl, "uu_nl");
+stream_builtin!(TacBuiltin, "tac", uu_tac::tac, "uu_tac");
+stream_builtin!(CutBuiltin, "cut", uu_cut::cut, "uu_cut");
+stream_builtin!(TeeBuiltin, "tee", uu_tee::tee_main, "uu_tee");
+stream_env_builtin!(UniqBuiltin, "uniq", uu_uniq::uniq, "uu_uniq");
+stream_env_builtin!(SortBuiltin, "sort", uu_sort::sort, "uu_sort");
+
+/// `tr` — STREAM shape but its entry is `(args, out, err, in)` with NO cwd (tr has
+/// no file operands), the sole member of that shape; hand-written rather than a
+/// single-use macro. See [`run_coreutil_localized`].
+struct TrBuiltin;
+
+impl brush_core::builtins::SimpleCommand for TrBuiltin {
     fn get_content(
         name: &str,
         _content_type: brush_core::builtins::ContentType,
         _options: &brush_core::builtins::ContentOptions,
     ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O id builtin\n"))
+        Ok(format!("{name}: native injected-I/O tr builtin\n"))
     }
 
     fn execute<SE: brush_core::extensions::ShellExtensions,
@@ -1304,15 +772,83 @@ impl brush_core::builtins::SimpleCommand for IdBuiltin {
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
         if argv.is_empty() { argv.push(OsString::from(&name)); }
 
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
+
+        let code = run_coreutil_localized("uu_tr", exported_env_snapshot(&context), move || {
+            use std::io::Write;
+            let mut out = out;
+            let mut err = err;
+            let mut inp = inp;
+            let r = match uu_tr::tr(argv.into_iter(), &mut out, &mut err, &mut inp) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
+                    e.code()
+                }
+            };
+            let _ = out.flush();
+            let _ = err.flush();
+            r
+        });
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    }
+}
+
+// FILESYSTEM builtins.
+fs_builtin!(MkdirBuiltin, "mkdir", uu_mkdir::mkdir_main, "uu_mkdir");
+fs_builtin!(RmdirBuiltin, "rmdir", uu_rmdir::rmdir_main, "uu_rmdir");
+fs_builtin!(RealpathBuiltin, "realpath", uu_realpath::realpath, "uu_realpath");
+fs_builtin!(ChmodBuiltin, "chmod", uu_chmod::chmod_main, "uu_chmod");
+fs_builtin!(ChownBuiltin, "chown", uu_chown::chown_main, "uu_chown");
+fs_builtin!(InstallBuiltin, "install", uu_install::install_main, "uu_install");
+fs_env_builtin!(CpBuiltin, "cp", uu_cp::cp, "uu_cp");
+fs_env_builtin!(ReadlinkBuiltin, "readlink", uu_readlink::readlink, "uu_readlink");
+fs_env_builtin!(MktempBuiltin, "mktemp", uu_mktemp::mktemp_main, "uu_mktemp");
+fs_builtin_stdin!(RmBuiltin, "rm", uu_rm::rm_main, "uu_rm");
+fs_builtin_stdin!(MvBuiltin, "mv", uu_mv::mv_main, "uu_mv");
+fs_builtin_stdin!(LnBuiltin, "ln", uu_ln::ln_main, "uu_ln");
+
+/// `touch` — FILESYSTEM shape but hand-written: the `-` operand passes the logical
+/// fd 1 as a raw fd so `touch -` updates the logical stdout's referent, and its
+/// entry also takes the shell's exported env for the obsolete `_POSIX2_VERSION`
+/// knob. The sole member of that shape. See [`run_coreutil_localized`].
+struct TouchBuiltin;
+
+impl brush_core::builtins::SimpleCommand for TouchBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: native injected-I/O touch builtin\n"))
+    }
+
+    fn execute<SE: brush_core::extensions::ShellExtensions,
+               I: Iterator<Item = S>, S: AsRef<str>>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let name = context.command_name.clone();
+        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
+        if argv.is_empty() { argv.push(OsString::from(&name)); }
+
+        let cwd = context.shell.working_dir().to_path_buf();
         let envv = exported_env_snapshot(&context);
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-        let code = run_coreutil_localized("uu_id", envv.clone(), move || {
+        let code = run_coreutil_localized("uu_touch", envv.clone(), move || {
             use std::io::Write;
-            let mut out = out;
+            use std::os::fd::AsRawFd;
+            let out = out;
             let mut err = err;
-            let r = match uu_id::id_main(argv.into_iter(), &envv, &mut out, &mut err) {
+            // Raw fd for the logical stdout, for the `-` operand only;
+            // borrowed for the call's duration (the OpenFile outlives it).
+            let out_fd = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+            let r = match uu_touch::touch_main(argv.into_iter(), &cwd, &envv, out_fd, &mut err) {
                 Ok(()) => 0,
                 Err(e) => {
                     let msg = e.to_string();
@@ -1320,75 +856,22 @@ impl brush_core::builtins::SimpleCommand for IdBuiltin {
                     e.code()
                 }
             };
-            let _ = out.flush();
             let _ = err.flush();
             r
         });
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
+
+// INFO builtins.
+info_builtin!(BasenameBuiltin, "basename", uu_basename::basename, "uu_basename");
+info_builtin!(DirnameBuiltin, "dirname", uu_dirname::dirname, "uu_dirname");
+info_builtin!(SeqBuiltin, "seq", uu_seq::seq, "uu_seq");
+info_builtin!(ExprBuiltin, "expr", uu_expr::expr, "uu_expr");
+info_builtin!(UnameBuiltin, "uname", uu_uname::uname_main, "uu_uname");
 info_builtin!(WhoamiBuiltin, "whoami", uu_whoami::whoami_main, "uu_whoami");
-
-/// `nproc` — an info builtin like the [`info_builtin!`] group, but hand-written
-/// because its entry additionally takes the shell's LOGICAL environment snapshot:
-/// the OpenMP knobs (`OMP_THREAD_LIMIT`/`OMP_NUM_THREADS`) that scale the reported
-/// count come from the vars the box shell has `export`ed, not the engine's env.
-struct NprocBuiltin;
-
-impl brush_core::builtins::SimpleCommand for NprocBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: native injected-I/O nproc builtin\n"))
-    }
-
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
-        context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let name = context.command_name.clone();
-        let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
-
-        // Shell's LOGICAL environment: the OpenMP knobs come from the vars the
-        // box shell has `export`ed, not the engine's env.
-        let envv: Vec<(OsString, OsString)> = context
-            .shell
-            .env()
-            .iter_exported()
-            .map(|(k, v)| {
-                (
-                    k.clone().into(),
-                    v.value().to_cow_str(context.shell).to_string().into(),
-                )
-            })
-            .collect();
-
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-
-        let code = run_coreutil_localized("uu_nproc", envv.clone(), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let r = match uu_nproc::nproc_main(argv.into_iter(), &envv, &mut out, &mut err) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
-    }
-}
+info_env_builtin!(IdBuiltin, "id", uu_id::id_main, "uu_id");
+info_env_builtin!(NprocBuiltin, "nproc", uu_nproc::nproc_main, "uu_nproc");
 
 /// `sarun` / `oaita` in-box builtins: re-exec the engine at /proc/self/exe so
 /// `sarun …`/`oaita …` work with nothing on PATH inside the box. `oaita` maps
@@ -1448,13 +931,6 @@ impl brush_core::builtins::SimpleCommand for EngineSelfCommand {
     }
 }
 
-/// All box brush builtins. `bundle_coreutils` gates the stream/filter
-/// coreutils (`cat`/`head`/`sort`/etc.); when false (make-recipe path) those
-/// fall through to fork+exec.
-/// The gate avoids uucore's process-global `OnceLock` localization poisoning (first util
-/// wins the slot; others emit raw keys like `cp-error-cannot-stat`). Filesystem-op builtins
-/// (`cp`/`rm`/`mv`/…) are always registered — each runs on its own fresh thread, getting its
-/// own Fluent bundle via the thread-local localization fix in vendored uucore.
 /// `make`/`gmake` — embedded GNU make (in-process kati). Dispatched whenever
 /// brush itself runs make (a recipe's recursive `$(MAKE)`, or `make` invoked by
 /// a configure/cmake shell step), so it stays in THIS process at the brush
@@ -1550,35 +1026,39 @@ impl brush_core::builtins::SimpleCommand for NinjaBuiltin {
     }
 }
 
-fn box_builtins_opt<SE: brush_core::extensions::ShellExtensions>(
-    bundle_coreutils: bool,
+/// All box brush builtins — the single builtin-policy point for every box brush
+/// shell (top-level box, nested `sh -c`, make/n2 recipes). The stream/filter
+/// coreutils are registered UNCONDITIONALLY: each runs on its own fresh thread
+/// (`run_coreutil_localized`) with a thread-local uucore Fluent bundle, so N
+/// utils in one process — even concurrent under `make -j` — never poison each
+/// other's localization. (Vendored uucore made `LOCALIZER` and its resource
+/// caches thread-local; the old process-global `OnceLock` that once forced a
+/// fork+exec gate for make recipes is gone.)
+fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
 ) -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
     use brush_core::builtins::{builtin, simple_builtin};
     let mut m: std::collections::HashMap<String, brush_core::builtins::Registration<SE>>
         = std::collections::HashMap::new();
-    if bundle_coreutils {
-        // Gated: false for make recipes (process-global OnceLock localization — shared cache slot).
-        m.insert("cat".to_string(), simple_builtin::<CatBuiltin, SE>());
-        m.insert("head".to_string(), simple_builtin::<HeadBuiltin, SE>());
-        m.insert("tail".to_string(), simple_builtin::<TailBuiltin, SE>());
-        m.insert("wc".to_string(), simple_builtin::<WcBuiltin, SE>());
-        m.insert("nl".to_string(), simple_builtin::<NlBuiltin, SE>());
-        m.insert("tac".to_string(), simple_builtin::<TacBuiltin, SE>());
-        m.insert("basename".to_string(), simple_builtin::<BasenameBuiltin, SE>());
-        m.insert("dirname".to_string(), simple_builtin::<DirnameBuiltin, SE>());
-        m.insert("seq".to_string(), simple_builtin::<SeqBuiltin, SE>());
-        m.insert("expr".to_string(), simple_builtin::<ExprBuiltin, SE>());
-        m.insert("tr".to_string(), simple_builtin::<TrBuiltin, SE>());
-        m.insert("cut".to_string(), simple_builtin::<CutBuiltin, SE>());
-        m.insert("uniq".to_string(), simple_builtin::<UniqBuiltin, SE>());
-        m.insert("sort".to_string(), simple_builtin::<SortBuiltin, SE>());
-        m.insert("uname".to_string(), simple_builtin::<UnameBuiltin, SE>());
-        m.insert("nproc".to_string(), simple_builtin::<NprocBuiltin, SE>());
-        m.insert("id".to_string(), simple_builtin::<IdBuiltin, SE>());
-        m.insert("whoami".to_string(), simple_builtin::<WhoamiBuiltin, SE>());
-    }
-    // Filesystem-op builtins: always registered; each runs on a fresh thread
-    // (thread-local Fluent cache, no cross-util poisoning) and honors logical cwd.
+    // Stream/filter + info coreutils (see the macro block above for their shapes).
+    m.insert("cat".to_string(), simple_builtin::<CatBuiltin, SE>());
+    m.insert("head".to_string(), simple_builtin::<HeadBuiltin, SE>());
+    m.insert("tail".to_string(), simple_builtin::<TailBuiltin, SE>());
+    m.insert("wc".to_string(), simple_builtin::<WcBuiltin, SE>());
+    m.insert("nl".to_string(), simple_builtin::<NlBuiltin, SE>());
+    m.insert("tac".to_string(), simple_builtin::<TacBuiltin, SE>());
+    m.insert("basename".to_string(), simple_builtin::<BasenameBuiltin, SE>());
+    m.insert("dirname".to_string(), simple_builtin::<DirnameBuiltin, SE>());
+    m.insert("seq".to_string(), simple_builtin::<SeqBuiltin, SE>());
+    m.insert("expr".to_string(), simple_builtin::<ExprBuiltin, SE>());
+    m.insert("tr".to_string(), simple_builtin::<TrBuiltin, SE>());
+    m.insert("cut".to_string(), simple_builtin::<CutBuiltin, SE>());
+    m.insert("uniq".to_string(), simple_builtin::<UniqBuiltin, SE>());
+    m.insert("sort".to_string(), simple_builtin::<SortBuiltin, SE>());
+    m.insert("uname".to_string(), simple_builtin::<UnameBuiltin, SE>());
+    m.insert("nproc".to_string(), simple_builtin::<NprocBuiltin, SE>());
+    m.insert("id".to_string(), simple_builtin::<IdBuiltin, SE>());
+    m.insert("whoami".to_string(), simple_builtin::<WhoamiBuiltin, SE>());
+    // Filesystem-op builtins: each runs on a fresh thread and honors logical cwd.
     m.insert("cp".to_string(), simple_builtin::<CpBuiltin, SE>());
     m.insert("mkdir".to_string(), simple_builtin::<MkdirBuiltin, SE>());
     m.insert("rmdir".to_string(), simple_builtin::<RmdirBuiltin, SE>());
@@ -1660,7 +1140,7 @@ async fn build_box_shell_opt(
     cwd: Option<std::path::PathBuf>,
     interactive: bool,
 ) -> Result<brush_core::Shell, brush_core::error::Error> {
-    build_box_shell_full(sh_mode, shell_name, positional, cwd, interactive, true).await
+    build_box_shell_full(sh_mode, shell_name, positional, cwd, interactive).await
 }
 
 async fn build_box_shell_full(
@@ -1669,7 +1149,6 @@ async fn build_box_shell_full(
     positional: Option<Vec<String>>,
     cwd: Option<std::path::PathBuf>,
     interactive: bool,
-    bundle_coreutils: bool,
 ) -> Result<brush_core::Shell, brush_core::error::Error> {
     install_shell_var_recorder();
     install_pipeline_observer();
@@ -1685,7 +1164,7 @@ async fn build_box_shell_full(
     let mut shell = brush_core::Shell::builder()
         .sh_mode(sh_mode)
         .interactive(interactive)
-        .builtins(box_builtins_opt(bundle_coreutils))
+        .builtins(box_builtins())
         .shell_name(shell_name.unwrap_or_default())
         .shell_args(positional.unwrap_or_default())
         .working_dir(cwd)
@@ -3054,20 +2533,19 @@ pub enum RecipeStderr {
 }
 
 pub fn run_recipe_in_process(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> i32 {
-    run_recipe_in_process_opt(cmdline, output_cb, true, RecipeStderr::Merge)
+    run_recipe_in_process_opt(cmdline, output_cb, RecipeStderr::Merge)
 }
 
-/// Like [`run_recipe_in_process`] but gates bundled stream/filter coreutils.
-/// `bundle_coreutils=false` (kati/make path) avoids uucore's process-global
-/// OnceLock localization poisoning (see `box_builtins_opt`).
-/// `bundle_coreutils=true` (n2/ninja path) keeps them in-process.
+/// Like [`run_recipe_in_process`] but selects how the recipe's fd 2 is handled.
+/// The full box coreutil set runs in-process for every recipe (make and n2
+/// alike): `box_builtins` registers them unconditionally — see its note on the
+/// thread-local localization that makes this safe.
 pub fn run_recipe_in_process_opt(
     cmdline: &str,
     output_cb: &mut dyn FnMut(&[u8]),
-    bundle_coreutils: bool,
     stderr: RecipeStderr,
 ) -> i32 {
-    run_recipe_in_process_prefixed("", cmdline, output_cb, bundle_coreutils, stderr)
+    run_recipe_in_process_prefixed("", cmdline, output_cb, stderr)
 }
 
 /// Like run_recipe_in_process_opt, with a make export PREFIX that runs in the
@@ -3078,7 +2556,6 @@ pub fn run_recipe_in_process_prefixed(
     prefix: &str,
     cmdline: &str,
     output_cb: &mut dyn FnMut(&[u8]),
-    bundle_coreutils: bool,
     stderr: RecipeStderr,
 ) -> i32 {
     let prefix_owned = prefix.to_string();
@@ -3117,7 +2594,7 @@ pub fn run_recipe_in_process_prefixed(
             set_current_pipeline_uid(parent_uid);
             set_box_recipe_edge(recipe_edge);
             let mut shell = match build_box_shell_full(
-                true, None, None, Some(cwd), false, bundle_coreutils,
+                true, None, None, Some(cwd), false,
             ).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -3253,5 +2730,100 @@ pub fn n2_executor(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> n2::proce
         n2::process::Termination::Success
     } else {
         n2::process::Termination::Failure
+    }
+}
+
+// ── builtin-boundary unit tests ──────────────────────────────────────────────
+// These exercise the coreutil builtins directly through the box brush shell —
+// no box, no bwrap, no FUSE, no keystrokes. They pin the two seams the macro
+// block above exists to preserve: relative operands resolve against the shell's
+// LOGICAL cwd (the process is never `chdir`'d), and an EXPORTED shell var reaches
+// the vendored entry (via `exported_env_snapshot`), for one representative of
+// each argument shape (stream, stream+env, fs+env, info+env).
+#[cfg(test)]
+mod builtin_boundary_tests {
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// A fresh empty scratch dir under the system tempdir (never the process cwd).
+    fn scratch_dir() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "sarun_brush_boundary_{}_{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Build a box shell with logical cwd = `cwd`, run `script` with fd 1 wired to
+    /// a capture file, and return everything the shell wrote to stdout.
+    async fn run_capture(script: &str, cwd: &Path) -> String {
+        let mut shell = super::build_box_shell(true, None, None, Some(cwd.to_path_buf()))
+            .await
+            .expect("build box shell");
+        let out_path = cwd.join(".capture_stdout");
+        let file = std::fs::File::create(&out_path).expect("create capture file");
+        shell
+            .open_files_mut()
+            .set_fd(1, brush_core::openfiles::OpenFile::from(file));
+        let src = brush_core::SourceInfo { source: "<boundary-test>".into(), start: None };
+        let params = shell.default_exec_params();
+        shell
+            .run_string(script.to_string(), &src, &params)
+            .await
+            .expect("run script");
+        drop(shell); // close the capture fd before reading it back
+        std::fs::read_to_string(&out_path).expect("read capture file")
+    }
+
+    /// STREAM shape (`cat`): a relative operand resolves against the shell's
+    /// logical cwd, not the engine process's cwd.
+    #[tokio::test]
+    async fn stream_relative_operand_uses_logical_cwd() {
+        let dir = scratch_dir();
+        std::fs::File::create(dir.join("rel.txt"))
+            .unwrap()
+            .write_all(b"logical-cwd-hit\n")
+            .unwrap();
+        assert_ne!(std::env::current_dir().unwrap(), dir);
+        let out = run_capture("cat rel.txt", &dir).await;
+        assert_eq!(out, "logical-cwd-hit\n");
+    }
+
+    /// STREAM+ENV shape (`sort`): reads piped logical stdin and sorts it; also
+    /// confirms the stream+env entry is wired (LC_ALL from the exported env).
+    #[tokio::test]
+    async fn stream_env_sort_orders_stdin() {
+        let dir = scratch_dir();
+        let out = run_capture("export LC_ALL=C; printf 'b\\na\\nc\\n' | sort", &dir).await;
+        assert_eq!(out, "a\nb\nc\n");
+    }
+
+    /// FS+ENV shape (`cp`): relative source AND dest resolve against the logical
+    /// cwd (the copy lands in `dir`, proving no process chdir).
+    #[tokio::test]
+    async fn fs_env_cp_relative_uses_logical_cwd() {
+        let dir = scratch_dir();
+        std::fs::File::create(dir.join("src.txt"))
+            .unwrap()
+            .write_all(b"payload\n")
+            .unwrap();
+        run_capture("cp src.txt dst.txt", &dir).await;
+        let dst = std::fs::read_to_string(dir.join("dst.txt")).expect("dst.txt in logical cwd");
+        assert_eq!(dst, "payload\n");
+    }
+
+    /// INFO+ENV shape (`nproc`): an EXPORTED var reaches the vendored entry —
+    /// `OMP_NUM_THREADS=1` clamps the reported count to 1.
+    #[tokio::test]
+    async fn info_env_nproc_reads_exported_var() {
+        let dir = scratch_dir();
+        let out = run_capture("export OMP_NUM_THREADS=1; nproc", &dir).await;
+        assert_eq!(out.trim(), "1");
     }
 }
