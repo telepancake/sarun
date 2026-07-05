@@ -17,7 +17,16 @@ formats with full parity against the Rust side — the parity tests
 already enforce it for sqlar.
 
 So the cheapest route to "logic in Python, engine stable" is not an
-embedded interpreter — it is finishing that seam:
+embedded interpreter — it is finishing that seam. And NOT by porting
+the store formats to Python: two codebases owning one on-disk format
+would make the durability guarantees only as strong as the weaker
+writer. The single-owner rule:
+
+> Anything that defines bytes-at-rest or crash-safety — chain format,
+> dirty flag, flock, checkpoint, repair — is Rust, in ONE place,
+> reached through a narrow verb. What gets scripted is corpus logic:
+> what to fetch next, which series, how to parse upstream, cooldown
+> policy. That's the code that churns; it never touches a depot page.
 
 ## Track A (recommended, near-term): Python drivers out-of-process
 
@@ -28,24 +37,34 @@ embedded interpreter — it is finishing that seam:
    machine (running/error tail/stopped auto-resume/pause/force-run)
    and shows in the Mirrors pane and `sarun mirror ls`. Adding new
    mirror logic no longer requires touching the engine.
-2. **`sarunmirror` Python module** — the host bindings. A pure-python
-   package (stdlib-only, `uv run --with` for anything extra, matching
-   the repo's no-venv rule) exposing:
-   - the depot chain format: open root, read head/window, append a
-     canonical or delta layer, checkpoint (port of the `depot` crate's
-     file format; parity tests Rust-writes/Python-reads and reverse,
-     same style as libtestsarun's sqlar tests);
-   - the durability protocol: per-root flock, dirty flag
-     (`meta.import_dirty`) around write sessions, watermark tables —
-     so a Python driver crashing keeps the same self-repair guarantees
-     the Rust drivers have;
-   - an engine client: the UDS verbs (`mirror_jobs`, attach verbs) so
-     a script can attach its own snapshot to a box or report progress.
-3. **Wikipedia gap-fill in Python first** — new wiki logic (other
-   dump series, recentchanges polling, langlinks…) lands as
-   `sarunmirror`-based scripts scheduled via `cmd` jobs; whatever
-   proves out and needs the speed graduates into `wikimak` later, or
-   never.
+2. **Store porcelain on the existing drivers** — split each driver
+   into the two halves it already almost has. The store half (Rust,
+   stable, rarely rebuilt): an ingest verb per driver — `wikimak
+   ingest --stdin` reading a framed stream of revision records
+   (ndjson header line + payload bytes), appending under the
+   EXISTING flock/dirty-flag/repair protocol, echoing appended revids;
+   likewise `gitdepot`/`ietfmak`. No format code is duplicated — the
+   same crate code is reached over a pipe. The acquisition half
+   (script, hot-swappable): decides what's new upstream and feeds the
+   pipe.
+3. **`sarunmirror` Python module** — the host bindings, which is NOT
+   a format library. Pure-python (stdlib-only; `uv run --with` for
+   extras, per the no-venv rule):
+   - record framing + subprocess wrappers for the porcelain verbs;
+   - bookkeeping-sqlite helpers (watermarks, cooldowns) — scripts may
+     own bookkeeping because §3 already requires it to be disposable
+     and re-derivable from the chain; a script can't corrupt what the
+     depot cares about;
+   - an engine UDS client (`mirror_jobs`, attach verbs) so a script
+     can attach its snapshot to a box or report progress.
+   `libtestsarun`-style Python format code remains what it is today: a
+   TEST oracle for parity, never a production writer.
+4. **Wikipedia gap-fill in Python first** — recentchanges polling is
+   then ~100 lines: query the API for revids past the watermark,
+   fetch content, stream records into `wikimak ingest`, bump the
+   watermark; scheduled as a `cmd` job. Other dump series, langlinks,
+   another wiki — same shape. Whatever proves out and needs the speed
+   graduates into Rust later, or never.
 
 Why out-of-process is the right default for *mirroring*: the work is
 I/O-bound (interpreter speed is irrelevant), a crashed driver is
@@ -73,12 +92,15 @@ Track A regardless.
 
 ## Chips
 
-- [x] `cmd` job kind (engine, this commit)
-- [ ] `sarunmirror/` package skeleton: flock + dirty flag + bookkeeping
-      helpers + engine UDS client (no depot format yet), with a demo
-      driver scheduled as a `cmd` job in a test
-- [ ] depot chain read in Python + parity test vs `depot` crate
-- [ ] depot chain append in Python + crash-repair parity test
+- [x] `cmd` job kind (engine)
+- [ ] `wikimak ingest --stdin`: framed record stream → chain append
+      under the existing durability protocol; crash mid-stream test
+      (kill the ingest, reopen repairs)
+- [ ] `sarunmirror/` package: framing + porcelain wrappers +
+      bookkeeping helpers + engine UDS client, with a demo driver
+      scheduled as a `cmd` job in a test
+- [ ] first real script driver: wikipedia recentchanges polling
+- [ ] ingest verbs for `gitdepot` / `ietfmak`
 - [ ] (spike, optional) rustpython-vm behind a feature flag: run a
       hook script from config at flow-policy time; measure binary-size
       and compile-time cost before committing to it
