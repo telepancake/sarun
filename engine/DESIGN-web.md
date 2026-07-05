@@ -357,6 +357,16 @@ the browser:
   panel, and because it's proxy-sourced it works for a headless crawl or a bare
   `curl`, and archivally — you can open the Network panel of a page captured
   last week.
+- **Image viewer** — SHIPPED (Enter on an image capture in the Network pane):
+  a standalone popover that decodes the captured body (PNG/JPEG/GIF/WebP) and
+  draws it as real pixels via **sixel** when the terminal supports it (probed
+  once from the DA1 reply at startup; `SARUN_SIXEL=1` overrides). Pixels are
+  blitted to the tty *after* ratatui draws — they can't live in the cell buffer
+  — over the popover interior; on a non-sixel terminal it degrades to a
+  metadata note. `engine/src/sixel.rs` is the pure encoder + detection;
+  `open_image_view` in `ui.rs` is the decode/fit/blit. This is the "view page
+  images / image files in the terminal" rung, deliberately a popover, not
+  inline character content.
 - **Security** (cert chain / TLS version / mixed content) and **Cookies**
   (`Set-Cookie` seen on the wire) are the same freebie — the engine terminates
   the TLS and sees every header, so it already holds this data. Not yet built.

@@ -5397,6 +5397,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ietf-mirror",
+ "image",
  "kati",
  "libc",
  "lzma-rs",

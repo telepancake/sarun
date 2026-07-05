@@ -349,6 +349,33 @@ pub fn webcap_detail(box_id: i64, row_id: i64) -> Value {
     row.unwrap_or(Value::Null)
 }
 
+/// The RAW, identity-decoded response body bytes for one webcap row, base64
+/// so JSON can carry binary (images) losslessly — the lossy-UTF8 `resp_body`
+/// in `webcap_detail` corrupts non-text. Feeds the standalone image viewer
+/// (DESIGN-web.md W8). Returns `{ "mime": ..., "b64": ... }`, or Null.
+pub fn webcap_body(box_id: i64, row_id: i64) -> Value {
+    use base64::Engine;
+    let db = sqlar_path(box_id);
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return Value::Null;
+    };
+    conn.query_row(
+        "SELECT mime,resp_headers,resp_body FROM webcap WHERE id=?1",
+        [row_id],
+        |r| {
+            let mime: String = r.get(0)?;
+            let resp_headers: String = r.get(1)?;
+            let resp_body: Vec<u8> = r.get(2)?;
+            let decoded = crate::net::webcap::decode_body(&resp_headers, &resp_body);
+            Ok(json!({
+                "mime": mime,
+                "b64": base64::engine::general_purpose::STANDARD.encode(&decoded),
+            }))
+        }
+    ).unwrap_or(Value::Null)
+}
+
 pub fn outputs(box_id: i64) -> Value {
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(

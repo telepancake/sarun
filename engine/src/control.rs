@@ -1586,6 +1586,12 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             (Some(id), Some(rid)) => discover::webcap_detail(id, rid),
             _ => Value::Null,
         },
+        // Raw (base64) response body of one capture — for the image viewer,
+        // which needs lossless binary the lossy-UTF8 detail can't carry.
+        "webcap_body" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+            (Some(id), Some(rid)) => discover::webcap_body(id, rid),
+            _ => Value::Null,
+        },
         "brushprov" => match arg_sid(args) {
             Some(id) => discover::brushprov(id),
             None => json!([]),

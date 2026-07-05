@@ -367,6 +367,15 @@ enum Modal {
     /// open time (the action refuses to open this modal if the CA is missing),
     /// so it's a plain String, never a silent None.
     BrowserUrl { buf: String, spki: String },
+    /// Standalone image viewer popover (DESIGN-web.md W8). `title` is the
+    /// caption (source · dimensions · format); `note` is a fallback message
+    /// shown in the box body when there's no image to blit (no sixel support,
+    /// or decode failed). `sixel` is the pre-encoded DECSIXEL bytes (empty ⇒
+    /// show `note` only), blitted to the tty AFTER ratatui draws — over the
+    /// box interior at `cells` (x, y, w, h) — because pixels can't live in the
+    /// cell buffer. Esc/q/Enter dismiss it.
+    ImageView { title: String, note: String, sixel: Vec<u8>,
+                cells: (u16, u16, u16, u16) },
     /// Vars-view query: `name [value]` — two whitespace-separated cmd_match
     /// text globs (bare word = substring); the second is optional.
     VarQuery { buf: String },
@@ -861,6 +870,15 @@ struct App {
     /// follows keyboard focus AND the child's wish; see the want_mouse block
     /// in the main loop).
     mouse_release: bool,
+    /// Whether the OUTER terminal advertised sixel graphics in its DA1 reply
+    /// (probed once at startup). Gates the standalone image viewer: on a
+    /// non-sixel terminal the viewer shows metadata instead of pixels. An env
+    /// override (SARUN_SIXEL=1/0) wins over the probe.
+    sixel_ok: bool,
+    /// Pixels per terminal cell (width, height), from TIOCGWINSZ at startup —
+    /// used to size a sixel image to a cell rect. Falls back to (10, 20) when
+    /// the terminal doesn't report pixel dimensions.
+    cell_px: (u16, u16),
     /// F9 menu navigation: when true, the menubar cursor is active
     /// and arrow keys move between top-level menu chips. Enter
     /// activates the chip under the cursor (same as pressing its
@@ -1062,6 +1080,7 @@ impl App {
             f_edges: ViewFilter::default(),
             should_quit: false,
             ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], vars_query: (String::new(), String::new()), vars_any: false, vars_rows: vec![], sel_var: 0, sel_var_item: 0, pty_in_right: false, mouse_release: false, menu_nav: false, menu_sel: 0,
+            sixel_ok: false, cell_px: (10, 20),
             oci_images: vec![],
             launch_net: 0,
             launch_env: false,
@@ -3627,9 +3646,40 @@ impl App {
                 self.var_item_act();
             }
             Pane::Inspect => self.ins_enter(),
+            // Enter on an image capture opens the standalone image viewer
+            // (DESIGN-web.md W8); on any other row it's a no-op (the detail is
+            // already shown in the right pane).
+            Pane::Network => {
+                let (id, mime) = match self.webcap_rows.get(self.sel_webcap) {
+                    Some(row) => (
+                        row.get("id").and_then(Value::as_i64).unwrap_or(-1),
+                        row.get("mime").and_then(Value::as_str).unwrap_or("").to_string(),
+                    ),
+                    None => return,
+                };
+                if !mime.starts_with("image/") {
+                    self.status =
+                        format!("not an image ({mime}) — Enter views image captures");
+                    return;
+                }
+                let Some(sid) = self.cur_sid() else { return };
+                match rpc(&self.sock, "webcap_body", json!([sid, id])) {
+                    Ok(v) => {
+                        let b64 = v.get("b64").and_then(Value::as_str)
+                            .unwrap_or("").to_string();
+                        use base64::Engine;
+                        match base64::engine::general_purpose::STANDARD.decode(&b64) {
+                            Ok(bytes) =>
+                                open_image_view(self, &format!("webcap #{id} {mime}"), &bytes),
+                            Err(e) => self.status = format!("image: bad body ({e})"),
+                        }
+                    }
+                    Err(e) => self.status = format!("webcap_body: {e}"),
+                }
+            }
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
             | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
-            | Pane::Help | Pane::Pty | Pane::ApiLogs | Pane::Network => {}
+            | Pane::Help | Pane::Pty | Pane::ApiLogs => {}
         }
     }
 
@@ -5785,6 +5835,47 @@ fn api_log_detail_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+/// Open the standalone image viewer (DESIGN-web.md W8) on raw image `bytes`.
+/// Decodes (PNG/JPEG/GIF/WebP), sizes a centered popover, and — when the
+/// terminal does sixel — fits + encodes the image to a DECSIXEL blob the main
+/// loop blits over the box interior. On a non-sixel terminal (or a decode
+/// failure) the popover shows a message instead of pixels. `source` is the
+/// caption prefix (e.g. "webcap #4 image/png").
+fn open_image_view(app: &mut App, source: &str, bytes: &[u8]) {
+    let img = match image::load_from_memory(bytes) {
+        Ok(i) => i,
+        Err(e) => { app.status = format!("image: can't decode {source} ({e})"); return; }
+    };
+    let (iw, ih) = (img.width(), img.height());
+    let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 30));
+    // Popover box: ~90% of the screen, centered, floored so it's usable.
+    let bw = (tc * 9 / 10).clamp(20, tc);
+    let bh = (tr * 9 / 10).clamp(6, tr);
+    let bx = (tc.saturating_sub(bw)) / 2;
+    let by = (tr.saturating_sub(bh)) / 2;
+    let title = format!("{source} · {iw}×{ih}");
+    // Interior = inside the border (−2 cols/rows); the caption rides the border.
+    let icols = bw.saturating_sub(2);
+    let irows = bh.saturating_sub(2);
+    let (sixel, note) = if app.sixel_ok && icols > 0 && irows > 0 {
+        let (pw, ph) = crate::sixel::fit_pixels(iw, ih, icols, irows,
+                                                app.cell_px.0, app.cell_px.1);
+        let resized = image::imageops::resize(
+            &img.to_rgb8(), pw.max(1), ph.max(1),
+            image::imageops::FilterType::Triangle);
+        (crate::sixel::encode_rgb(resized.as_raw(), pw as usize, ph as usize),
+         String::new())
+    } else {
+        (Vec::new(),
+         "this terminal reported no sixel support — set SARUN_SIXEL=1 to \
+          force, or open sarun in a sixel terminal (foot, wezterm, xterm \
+          -ti vt340, mlterm).".to_string())
+    };
+    app.modal = Some(Modal::ImageView {
+        title, note, sixel, cells: (bx, by, bw, bh),
+    });
+}
+
 /// Network/Web pane list (DESIGN-web.md W4): one styled line per webcap row —
 /// time · method · status · mime · size · url. Selected row reverses; 4xx/5xx
 /// red, 3xx yellow, 2xx default; a `‡` marks a body truncated at the capture
@@ -6132,6 +6223,30 @@ fn help_lines() -> Vec<Line<'static>> {
 
 /// Render the active modal centered over the body. Returns the area consumed.
 fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
+    // The image viewer owns its OWN rect (`cells`) so the border lines up with
+    // the sixel blitted over the interior after this draw. The interior is
+    // left blank for the pixels (or shows `note` when there's nothing to blit).
+    if let Modal::ImageView { title, note, cells, sixel } = modal {
+        let (x, y, cw, ch) = *cells;
+        let rect = Rect { x, y, width: cw.min(area.width), height: ch.min(area.height) };
+        f.render_widget(ratatui::widgets::Clear, rect);
+        let body: Vec<Line> = if !note.is_empty() {
+            vec![Line::from(""), Line::from(note.clone())]
+        } else if sixel.is_empty() {
+            vec![Line::from("(no image)")]
+        } else {
+            Vec::new() // interior stays blank for the sixel overlay
+        };
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .title(format!(" image · {title} "))
+            .title_bottom(" Esc/q close ");
+        f.render_widget(
+            Paragraph::new(Text::from(body)).block(block)
+                .wrap(Wrap { trim: false }),
+            rect);
+        return;
+    }
     let w = (area.width * 7 / 10).clamp(20, area.width);
     let want = match modal {
         Modal::Search { rows, .. } => (rows.len() as u16) + 6,
@@ -6543,6 +6658,9 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Style::default().fg(Color::Gray))));
             (" configure external API ", body)
         }
+        // Rendered by the early-return at the top of draw_modal (it owns its
+        // own rect); this arm only satisfies exhaustiveness.
+        Modal::ImageView { .. } => (" image ", vec![]),
     };
     let p = Paragraph::new(Text::from(body))
         .block(
@@ -11101,6 +11219,58 @@ fn key_to_pty_bytes(code: crossterm::event::KeyCode,
     })
 }
 
+// ── terminal capability probe (sixel + cell pixel size) ─────────────────────
+
+/// Probe the outer terminal, once, at startup (raw mode, before the crossterm
+/// loop): send Primary Device Attributes (`\x1b[c`) and read the reply
+/// directly off fd 0 with a short timeout, and read the cell pixel size via
+/// TIOCGWINSZ. Returns (sixel_supported, (px_w, px_h)). Best-effort — a
+/// terminal that never answers just yields (false, fallback), and the env
+/// override (SARUN_SIXEL) can force the sixel half either way.
+fn probe_terminal() -> (bool, (u16, u16)) {
+    let px = cell_pixel_size().unwrap_or((10, 20));
+    // Ask for DA1. Write straight to fd 1 so it isn't caught in a buffer.
+    let query = b"\x1b[c";
+    let wrote = unsafe {
+        libc::write(1, query.as_ptr() as *const libc::c_void, query.len())
+    };
+    if wrote < 0 { return (false, px); }
+    // Collect the reply (`\x1b[?…c`) for up to ~250ms total, or until we see
+    // the terminating 'c'. poll fd 0 between reads so a silent terminal can't
+    // hang startup.
+    let mut buf = Vec::with_capacity(64);
+    let deadline_ms = 250i32;
+    let mut spent = 0i32;
+    let mut chunk = [0u8; 64];
+    while spent < deadline_ms {
+        let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        let step = 40i32;
+        let r = unsafe { libc::poll(&mut pfd, 1, step) };
+        spent += step;
+        if r <= 0 { continue; }
+        let n = unsafe {
+            libc::read(0, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
+        };
+        if n <= 0 { break; }
+        buf.extend_from_slice(&chunk[..n as usize]);
+        if buf.contains(&b'c') { break; }
+    }
+    let reply = String::from_utf8_lossy(&buf);
+    (crate::sixel::da1_reports_sixel(&reply), px)
+}
+
+/// Cell pixel size from TIOCGWINSZ (ws_xpixel/ws_col, ws_ypixel/ws_row), or
+/// None when the terminal doesn't report pixel dimensions (many don't).
+fn cell_pixel_size() -> Option<(u16, u16)> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
+    if r != 0 || ws.ws_col == 0 || ws.ws_row == 0
+        || ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
+        return None;
+    }
+    Some((ws.ws_xpixel / ws.ws_col, ws.ws_ypixel / ws.ws_row))
+}
+
 // ── headless one-frame render (tests / --once) ──────────────────────────────
 
 /// Render the current app state to a TestBackend and return the buffer as text.
@@ -11361,6 +11531,13 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 Some((_, ConfirmKey::Yes, _)) => app.run_confirm(action),
                 Some((_, ConfirmKey::No, _)) => app.status = "cancelled".into(),
                 None => app.modal = Some(Modal::Confirm { prompt, action }),
+            }
+        }
+        Modal::ImageView { title, note, sixel, cells } => {
+            // Any of Esc / q / Enter dismisses; other keys keep it open.
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
+                _ => app.modal = Some(Modal::ImageView { title, note, sixel, cells }),
             }
         }
         Modal::Search { view, kinds, mut rows, mut sel, mut field } => {
@@ -11810,6 +11987,18 @@ fn run_interactive(sock: &str) -> Result<(), String> {
     let _ = rpc(sock, "prompts.ui_active", json!([true]));
 
     terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+    // Probe the OUTER terminal for sixel support + cell pixel size BEFORE the
+    // crossterm event loop starts (it would otherwise swallow the DA1 reply).
+    // Must run in raw mode so the reply isn't line-buffered. An env override
+    // wins for terminals whose DA1 lies or which we can't probe (e.g. a
+    // multiplexer that filters DA1).
+    let (probe_sixel, probe_px) = probe_terminal();
+    app.sixel_ok = match std::env::var("SARUN_SIXEL").ok().as_deref() {
+        Some("1") | Some("true") | Some("yes") => true,
+        Some("0") | Some("false") | Some("no") => false,
+        _ => probe_sixel,
+    };
+    app.cell_px = probe_px;
     let mut out = std::io::stdout();
     execute!(out, terminal::EnterAlternateScreen).map_err(|e| e.to_string())?;
     let backend = CrosstermBackend::new(out);
@@ -11854,6 +12043,23 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             // (see on_event), so the UI reacts to actual change instead
             // of polling.
             term.draw(|f| draw(f, &app)).map_err(|e| e.to_string())?;
+            // Blit a sixel image over the viewer popover interior (DESIGN-web.md
+            // W8). Pixels can't live in ratatui's cell buffer, so we position
+            // the cursor at the box interior and write the DECSIXEL bytes
+            // straight to the backend after the frame is drawn. Re-done each
+            // frame because the draw above repaints the interior with blanks.
+            if let Some(Modal::ImageView { sixel, cells, .. }) = &app.modal {
+                if !sixel.is_empty() {
+                    use std::io::Write;
+                    let (bx, by, _, _) = *cells;
+                    let b = term.backend_mut();
+                    // CSI row;col H is 1-based; interior top-left is one cell
+                    // inside the border.
+                    let _ = write!(b, "\x1b[{};{}H", by + 2, bx + 2);
+                    let _ = b.write_all(sixel);
+                    let _ = b.flush();
+                }
+            }
             if app.should_quit {
                 break;
             }
@@ -14008,6 +14214,50 @@ mod tests {
         }
         assert!(app.load_job.is_none(), "job must complete");
         assert!(app.status.contains("oci load"), "failure surfaced: {}", app.status);
+    }
+
+    /// The standalone image viewer (DESIGN-web.md W8): on a sixel terminal it
+    /// carries the encoded DECSIXEL and captions the dimensions; on a non-sixel
+    /// terminal it degrades to a metadata note. Exercised end-to-end from a
+    /// real in-memory PNG (decode → fit → encode), which is the part that
+    /// doesn't need an actual sixel display to verify.
+    #[test]
+    fn image_viewer_sixel_and_fallback() {
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([255, 0, 0]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let bytes = png.into_inner();
+
+        let mut app = headless_app();
+        app.sixel_ok = true;
+        app.cell_px = (10, 20);
+        open_image_view(&mut app, "webcap #1 image/png", &bytes);
+        match &app.modal {
+            Some(Modal::ImageView { sixel, title, note, .. }) => {
+                assert!(sixel.starts_with(b"\x1bPq") && sixel.ends_with(b"\x1b\\"),
+                        "carries encoded sixel");
+                assert!(title.contains("4×4"), "dimensions captioned: {title}");
+                assert!(note.is_empty());
+            }
+            _ => panic!("expected an ImageView modal"),
+        }
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("image · webcap #1"), "popover caption drawn:\n{buf}");
+
+        // Non-sixel terminal: metadata note, no pixels.
+        app.sixel_ok = false;
+        app.modal = None;
+        open_image_view(&mut app, "webcap #1 image/png", &bytes);
+        match &app.modal {
+            Some(Modal::ImageView { sixel, note, .. }) => {
+                assert!(sixel.is_empty(), "no pixels without sixel support");
+                assert!(note.contains("no sixel support"), "explains the fallback");
+            }
+            _ => panic!("expected an ImageView modal (fallback)"),
+        }
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("no sixel support"), "fallback note drawn:\n{buf}");
     }
 
     /// F6 in the PTY pane toggles the mouse between the app and the terminal's

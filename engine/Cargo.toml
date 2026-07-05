@@ -119,6 +119,11 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "
 tokio-stream = "0.1"
 futures-util = "0.3"
 regex = "1"
+# Decode image files / captured page images (PNG/JPEG/GIF/WebP) for the sixel
+# viewer. Already in the tree transitively (tattoy-termwiz), so this direct dep
+# adds no new compilation — just makes `image::` reachable. default-features
+# off + the web codecs keeps it lean.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 rustls-pemfile = "2"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
