@@ -28,33 +28,33 @@ blobs  = materialized on demand through depot-cache (mmap/exec safe)
 copy   = never (import_layer path deleted from attach verbs)
 ```
 
-## Chips
+## Chips (1–6 DONE 2026-07-05; proof tests in test_attach_convergence_rs.py)
 
-1. **Readout trait in `gimir/depot`** (`variant.rs`): the §8 readout
+1. ✅ **Readout trait in `gimir/depot`** (`variant.rs`): the §8 readout
    half — `entry(components) / children(components) / blob(components)`
    over opaque byte names; blob returns bytes-or-backing-file so loose
    file stores stay zero-copy. Engine's `BoxDepot` readout half becomes
    an impl of it (sqlar variant); a generic `View`-backed impl covers
    any resolved snapshot.
-2. **Store adapters**: `Readout` impls for wikimak (page head — O(1)
+2. ✅ **Store adapters**: `Readout` impls for wikimak (page head — O(1)
    already), ietf (`head_layer`), gitdepot (tip via `read_head_record`,
    decoded once, cached; full-history frames later). Live beside the
    store crates; unit tests per adapter.
-3. **Reference attachments in the engine**: `ro_attachments` grows
+3. ✅ **Reference attachments in the engine**: `ro_attachments` grows
    external entries (kept alongside box-id entries); hydrate builds a
    Readout-backed attachment instead of opening a sqlar box; overlay
    entry/children/blob for attachments route through the trait —
    which also closes the `blob_path()` leak for attachments. Attach
    verbs stop calling `import_layer`; pinning stays (rev recorded at
    attach time, stores only prepend ⇒ a pinned rev never changes).
-4. **Wire `depot-cache`**: attachment blob reads that need a real fd
+4. ✅ **Wire `depot-cache`**: attachment blob reads that need a real fd
    (mmap/exec/pread paths) materialize into the cache pool; repeated
    reads hit the pool. Eviction = space management, never data loss.
-5. **Proof tests**: §8 byte-identical invariant (same box run with and
+5. ✅ **Proof tests**: §8 byte-identical invariant (same box run with and
    without attachment → identical captured layer — the missing half of
    test_ro_attach); laziness (attach a store with N pages, assert no
    O(N) I/O or sqlar box creation); EROFS suite unchanged.
-6. **Delete the copy path** from the attach verbs (attach_ro_layer’s
+6. ✅ **Delete the copy path** from the attach verbs (attach_ro_layer’s
    import remains only for genuine imports, if anything still wants
    one).
 

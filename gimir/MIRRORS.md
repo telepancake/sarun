@@ -46,25 +46,27 @@ each corpus's shape wants, served through sarun. Three mirrors first:
    rewritten/topo-interleaved history → re-import). Fetch-and-update
    DONE (`mirror <url> <root>`: bare mirror clone under `<root>/repo.git`,
    store under `<root>/store`, non-fast-forward remote → wholesale
-   re-import — the mirror follows the remote). RO-attach DONE: the
-   engine's `git_attach` verb (control.rs) resolves store+ref to a view,
-   imports it as a fresh at-rest box (`layer_from_git_view`: git octal
-   modes → engine dialect; gitlinks become pin files), names it
-   `git:<ref>@<sha8>`, and appends it to the box's RO attachments — a
-   git ref in a workspace with NO checkout. `test_git_attach_rs.py`
-   proves read-through, EROFS, and DAG visibility. Remaining: serve via
-   depot-cache materialization instead of sqlar import (an
-   optimization, not a semantic change).
+   re-import — the mirror follows the remote). RO-attach DONE and
+   CONVERGED (ATTACH-CONVERGENCE.md, 2026-07-05): `git_attach` is pure
+   bookkeeping — ref→sha from store metadata only, one pinned Ext row
+   `{kind,store,ref,rev,prefix,name}` named `git:<label>/<ref>@<sha8>`;
+   the overlay serves it through the depot Readout trait (getattr from
+   entry metadata, blobs via depot-cache fds — mmap/exec work), no
+   sqlar import, no copy. `test_git_attach_rs.py` proves read-through,
+   EROFS, DAG visibility; `test_attach_convergence_rs.py` proves the
+   §8 byte-identical invariant and laziness (200-file store: attach is
+   O(bookkeeping), one read = one cache blob).
 4. **Serve/browse**: all three attach verbs live — `git_attach`,
    `wiki_attach` (a page's head text), `ietf_attach` (a draft's full
    revision series) — one CLI surface: `sarun NAME attach git|wiki|ietf
-   SRC REF [AT]`. Each snapshots the mirror object into a fresh RO box
-   named for it (`git:main@sha8`, `wiki:1@r100`,
-   `ietf:draft-x@01`), visible and navigable in the sessions DAG. The
+   SRC REF [AT]`. Each appends one pinned read-only reference (named
+   `git:main@sha8`, `wiki:enwiki/Title@r100`, `ietf:draft-x@01`),
+   served lazily through the readout trait and shown on the owning
+   session row (`attachments` in the session dict). The
    mirror crates' read paths are feature-gated (`fetch` off in-engine):
    the engine never dials out; fetching stays in wikimak/ietfmak/
    gitdepot. `test_mirror_attach_rs.py` proves all three through the
-   real CLI. Later: browse panes per mirror, depot-cache serving.
+   real CLI. Later: browse panes per mirror; read-at-rev adapters (wiki/ietf pin identity today, git pins content).
 
 ## Non-goals for now
 
