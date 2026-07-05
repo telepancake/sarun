@@ -456,6 +456,16 @@ name = "depot"
 version = "0.0.0"
 
 [[package]]
+name = "depot-cache"
+version = "0.0.0"
+dependencies = [
+ "depot",
+ "hex",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "depot-stream"
 version = "0.0.0"
 dependencies = [
