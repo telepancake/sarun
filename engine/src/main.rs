@@ -45,6 +45,7 @@ mod pty;
 mod review;
 mod rules;
 mod runner;
+mod sixel;
 mod slippool;
 mod sud;
 mod sudir;
