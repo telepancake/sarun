@@ -72,3 +72,15 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 
 Provider extradata (issues/PRs), CDP capture, full provider matrix —
 SCOPING.md keeps the record; mirrors of bulk corpora come first.
+
+## Rejected (do not resurface)
+
+- **Mirroring Wikimedia Enterprise HTML dumps** as a rendered-page
+  source (2026-07-05): loses exact edits (no revision chain — the
+  corpus IS the edit sequence) and provenance (a third-party render of
+  an unknowable input set: which page/template/module revs produced it
+  cannot be stated, so it is neither reproducible nor attributable).
+  Rendering derives from the mirrored wikitext chains in-house; the
+  expansion records its full pin set (page rev + every transcluded
+  template/module rev at the chosen τ) and the result is depot-cache
+  material keyed by that pin set — never authoritative data.
