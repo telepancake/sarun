@@ -1903,6 +1903,60 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Err(e) => json!({"ok": false, "error": e}),
             }
         }
+        // Mirror-update jobs (mirrors.rs): the schedule surface.
+        "mirror_jobs" => match crate::mirrors::jobs_list() {
+            Ok(jobs) => serde_json::to_value(jobs).unwrap_or(Value::Null),
+            Err(e) => return json!({"ok": false, "error": e}),
+        },
+        // args: [kind, src, dest, interval_secs]
+        "mirror_add" => {
+            let (Some(kind), Some(src), Some(dest)) = (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+                args.get(2).and_then(Value::as_str),
+            ) else {
+                return json!({"ok": false, "error": "need kind, src, dest"});
+            };
+            let interval = args.get(3).and_then(Value::as_i64).unwrap_or(24 * 3600);
+            match crate::mirrors::job_add(kind, src, dest, interval) {
+                Ok(id) => json!({"ok": true, "id": id}),
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+        // args: [id] — force-run one job now (paused included).
+        "mirror_run" => match args.first().and_then(Value::as_i64) {
+            Some(id) => match crate::mirrors::job_run(id) {
+                Ok(()) => json!({"ok": true}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+            None => return json!({"ok": false, "error": "need job id"}),
+        },
+        // Start every due/stopped unpaused job.
+        "mirror_run_pending" => match crate::mirrors::run_pending() {
+            Ok(ids) => json!({"ok": true, "started": ids}),
+            Err(e) => json!({"ok": false, "error": e}),
+        },
+        // args: [id, paused(bool)]
+        "mirror_pause" => {
+            let (Some(id), Some(p)) = (
+                args.first().and_then(Value::as_i64),
+                args.get(1).and_then(Value::as_bool),
+            ) else {
+                return json!({"ok": false, "error": "need id + bool"});
+            };
+            match crate::mirrors::job_set_paused(id, p) {
+                Ok(()) => json!({"ok": true}),
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+        // args: [id]
+        "mirror_rm" => match args.first().and_then(Value::as_i64) {
+            Some(id) => match crate::mirrors::job_remove(id) {
+                Ok(()) => json!({"ok": true}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+            None => return json!({"ok": false, "error": "need job id"}),
+        },
         // Rotation (DEPOT-DESIGN.md §6): promote child box over its
         // parent. args: [child_sid]. Encodings are rewritten — no
         // layer's occlusion changes: the child box ends up holding the
@@ -3461,6 +3515,97 @@ fn svc_splice(a: UnixStream, b: UnixStream) {
         let _ = std::io::copy(&mut br, &mut aw);
         let _ = aw.shutdown(std::net::Shutdown::Write);
     });
+}
+
+/// `sarun mirror …` — the mirror-jobs CLI (schedule surface of
+/// mirrors.rs; the TUI's Mirrors pane shows the same rows).
+pub fn cli_mirror(argv: &[String]) -> i32 {
+    let sock = crate::paths::sock_path();
+    let one = |verb: &str, args: Value| -> Result<Value, String> {
+        let mut c = UnixStream::connect(&sock).map_err(|_| "no engine running".to_string())?;
+        let msg = json!({"type": "ui", "verb": verb, "args": args});
+        c.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        BufReader::new(&c).read_line(&mut line).map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+        // Wrapped ok/r on success; bare early-return errors.
+        Ok(v.get("r").cloned().unwrap_or(v))
+    };
+    let fail = |e: String| -> i32 { eprintln!("sarun-engine: {e}"); 1 };
+    let strs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match strs.as_slice() {
+        ["ls"] | [] => match one("mirror_jobs", json!([])) {
+            Ok(Value::Array(jobs)) => {
+                for j in jobs {
+                    let g = |k: &str| j.get(k).cloned().unwrap_or(Value::Null);
+                    let due = g("next_due").as_i64()
+                        .map(|d| {
+                            let dt = d - std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|x| x.as_secs() as i64).unwrap_or(0);
+                            if dt <= 0 { "now".to_string() }
+                            else { format!("in {}m", dt / 60) }
+                        })
+                        .unwrap_or_else(|| "-".into());
+                    println!("{:>3}  {:<9} {:<5} {:<28} → {:<24} every {}m  due {}{}",
+                        g("id").as_i64().unwrap_or(0),
+                        g("state").as_str().unwrap_or("?"),
+                        g("kind").as_str().unwrap_or("?"),
+                        g("src").as_str().unwrap_or(""),
+                        g("dest").as_str().unwrap_or(""),
+                        g("interval_secs").as_i64().unwrap_or(0) / 60,
+                        due,
+                        match g("last_detail").as_str() {
+                            Some(d) if !d.is_empty()
+                                && g("state").as_str() == Some("error") =>
+                                format!("  [{}]", d.lines().last().unwrap_or("")),
+                            _ => String::new(),
+                        });
+                }
+                0
+            }
+            Ok(v) => fail(v.get("error").and_then(Value::as_str).unwrap_or("bad reply").into()),
+            Err(e) => fail(e),
+        },
+        ["add", kind, src, dest, rest @ ..] => {
+            let interval: i64 = rest.first().and_then(|s| s.parse().ok()).unwrap_or(24 * 3600);
+            match one("mirror_add", json!([kind, src, dest, interval])) {
+                Ok(v) if v.get("ok") == Some(&Value::Bool(true)) => {
+                    println!("job {} added", v.get("id").and_then(Value::as_i64).unwrap_or(-1));
+                    0
+                }
+                Ok(v) => fail(v.get("error").and_then(Value::as_str).unwrap_or("add failed").into()),
+                Err(e) => fail(e),
+            }
+        }
+        ["run"] => match one("mirror_run_pending", json!([])) {
+            Ok(v) if v.get("ok") == Some(&Value::Bool(true)) => {
+                let n = v.get("started").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+                println!("{n} pending job(s) started");
+                0
+            }
+            Ok(v) => fail(v.get("error").and_then(Value::as_str).unwrap_or("run failed").into()),
+            Err(e) => fail(e),
+        },
+        ["run", id] | ["pause", id] | ["resume", id] | ["rm", id] => {
+            let Ok(idn) = id.parse::<i64>() else { return fail("job id must be a number".into()) };
+            let (verb, args) = match strs[0] {
+                "run" => ("mirror_run", json!([idn])),
+                "pause" => ("mirror_pause", json!([idn, true])),
+                "resume" => ("mirror_pause", json!([idn, false])),
+                _ => ("mirror_rm", json!([idn])),
+            };
+            match one(verb, args) {
+                Ok(v) if v.get("ok") == Some(&Value::Bool(true)) => { println!("ok"); 0 }
+                Ok(v) => fail(v.get("error").and_then(Value::as_str).unwrap_or("failed").into()),
+                Err(e) => fail(e),
+            }
+        }
+        _ => {
+            eprintln!("usage: sarun mirror ls\n       sarun mirror add git|wiki|ietf SRC DEST [INTERVAL_SECS]\n       sarun mirror run [ID]        (no ID = run all pending)\n       sarun mirror pause|resume|rm ID");
+            2
+        }
+    }
 }
 
 pub fn cli_box_op(argv: &[String]) -> i32 {

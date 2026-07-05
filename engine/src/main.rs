@@ -40,6 +40,7 @@ mod frames;
 mod hostfs;
 mod jobserver;
 mod katirun;
+mod mirrors;
 mod n2run;
 mod net;
 mod oaita;
@@ -95,6 +96,7 @@ fn top_level_help() -> &'static str {
        sarun run [FLAGS] [NAME] -- CMD    run CMD in a sandbox box (needs a running engine/UI)\n  \
        sarun <NAME> [apply|discard|rename NEW|patch]   operate on a box from the CLI\n  \
        sarun <NAME> attach git|wiki|ietf SRC REF [AT]  attach a mirror snapshot read-only\n  \
+       sarun mirror <ls|add|run|pause|resume|rm> ...   scheduled mirror updates\n  \
        sarun oci <load|run|build|save|dockerfile|author> ...   OCI images (`sarun oci -h`)\n  \
        sarun oaita <gen|run|call|tail|add|where> NAME          LLM chat/agent runner (`oaita -h`)\n  \
        sarun --once --sock PATH           render one UI frame and exit (headless)\n\
@@ -313,6 +315,9 @@ fn serve() -> i32 {
             }
         });
     }
+    // Mirror-update scheduler: a minute tick starting whatever jobs are
+    // due (mirrors.db). No jobs → pure no-op loop.
+    mirrors::scheduler_thread();
     let rc = match control::serve(state, listener) {
         Ok(()) => 0,
         Err(e) => {
@@ -648,6 +653,10 @@ fn main() {
             std::process::exit(runner::run(name, passthrough, direct, env,
                 pty, brush, api, no_parent, readonly_parent, chdir,
                 net_mode, cmd));
+        }
+        Some("mirror") => {
+            // sarun mirror ls|add|run|pause|resume|rm — mirror-update jobs.
+            std::process::exit(control::cli_mirror(&argv[1..]));
         }
         Some("oci") => {
             // sarun oci load <ref> [NAME]  → populate a chain of at-rest sarun

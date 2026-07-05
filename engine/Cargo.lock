@@ -2993,6 +2993,7 @@ version = "0.0.0"
 dependencies = [
  "depot",
  "depot-vbf",
+ "libc",
  "rusqlite",
  "thiserror 1.0.69",
 ]
@@ -8450,6 +8451,7 @@ version = "0.0.0"
 dependencies = [
  "chrono",
  "hex",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
