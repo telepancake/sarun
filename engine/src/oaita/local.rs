@@ -50,7 +50,7 @@ USAGE:
   --no-box         run on the host directly instead of inside sarun boxes
   --net MODE       network for the download box: tap (default) or host
 
-`oaita local` (F4) ONLY DOWNLOADS — it starts no server. The model is
+`oaita local` (the Api pane's 'm' menu) ONLY DOWNLOADS — it starts no server. The model is
 fetched into box 'OAITA-LOCAL' (captured; never applied to the host)
 and oaita.toml is pointed at base_url = \"svc://oaita-local#/v1\". That
 box then DECLARES an on-demand service: the first time any box calls
@@ -173,7 +173,7 @@ pub fn cmd_local(args: &[String]) -> i32 {
         let this = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "sarun".into());
-        // F4 / `oaita local` ONLY downloads the model — it starts NOTHING.
+        // The 'm' menu / `oaita local` ONLY downloads the model — it starts NOTHING.
         // Serving is entirely on demand: the first time a box calls the
         // svc://oaita-local endpoint, the engine starts the serve box
         // (control::ensure_service), and does so again after any restart. So
@@ -366,7 +366,7 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
     // SERVE: locate the model by scan (no URL needed) and run.
     let model_path = find_gguf(dir)
         .ok_or_else(|| anyhow!("no *.gguf model in {} — run `oaita local` \
-            (F4) to download it first", dir.display()))?;
+            ('m' menu) to download it first", dir.display()))?;
     if !server.is_file() {
         bail!("no llama-server in {} — run `oaita local` to fetch the runtime",
               dir.display());
@@ -571,7 +571,7 @@ fn local_config(base_url: &str) -> String {
 /// (one that actually sets a model) is left alone unless --write-config.
 /// A config with no model is broken — the agent box would hit "no model
 /// set" — so it is replaced (backed up first) even without --write-config,
-/// so F4 always leaves a working config.
+/// so the picker always leaves a working config.
 fn ensure_config(base_url: &str, overwrite: bool) -> Result<()> {
     let p = crate::paths::oaita_config_path();
     if p.is_file() && !overwrite {

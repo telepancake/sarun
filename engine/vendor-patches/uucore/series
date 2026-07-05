@@ -2,3 +2,4 @@
 0020-uucore-build-rerun-locale-embedding-when-a-sibling-uu_-crate.patch
 0030-uu_chown-in-process-chown-builtin-injected-logical-I-O-logic.patch
 0040-logical-env-seam--route-runtime-env-reads-through-the-shell.patch
+0050-silence-rustc-lint-warnings--unused-qualifications---dead-co.patch

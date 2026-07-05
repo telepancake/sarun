@@ -229,15 +229,9 @@ pub trait BoxDepot {
     /// Refresh the in-RAM mirror entry for ONE path from the store, after
     /// an offline write through a separate connection.
     fn reload_entry(&self, rel: &str);
-    /// The loose file holding a regular-file node's bytes, named by the
-    /// rowid `ensure_file_row` returned.
-    fn blob_file(&self, rowid: i64) -> PathBuf;
 }
 
 impl BoxDepot for BoxState {
-    fn blob_file(&self, rowid: i64) -> PathBuf {
-        blob_path(self.id, rowid)
-    }
 
     /// Upsert the file row for `rel` (data stays NULL — D4) and return its
     /// rowid, which names the pool blob. First writer sticks; last_writer moves.

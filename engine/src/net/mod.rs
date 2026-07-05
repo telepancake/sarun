@@ -82,13 +82,6 @@ pub struct ProxyHooks {
     pub filter: Option<std::sync::Arc<filter::Filter>>,
 }
 
-impl ProxyHooks {
-    /// True when neither hook is active — the proxy can take its original
-    /// zero-cost path.
-    pub fn is_inert(&self) -> bool {
-        self.capture.is_none() && self.filter.is_none()
-    }
-}
 
 use std::sync::Arc;
 

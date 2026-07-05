@@ -72,7 +72,11 @@ impl Filter {
         Self { rules }
     }
 
+    /// Test-only: whether any rules parsed (the prod paths gate on
+    /// `ProxyHooks.filter` being present at all).
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool { self.rules.is_empty() }
+
 
     /// Request-time verdict for a URL + host. Block wins on the first match.
     pub fn decide(&self, url: &str, host: &str) -> Decision {

@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 05 Jul 2026 06:02:11 +0000
+Subject: [PATCH] silence rustc lint warnings (unused qualifications / dead code)
+
+---
+diff --git a/src/process_posix.rs b/src/process_posix.rs
+index 20a0ebe..7d817e8 100644
+--- a/src/process_posix.rs
++++ b/src/process_posix.rs
+@@ -48,14 +48,6 @@ impl PosixSpawnAttr {
+         &mut self.0
+     }
+ 
+-    fn setflags(&mut self, flags: libc::c_short) -> anyhow::Result<()> {
+-        unsafe {
+-            check_posix_spawn(
+-                "posix_spawnattr_setflags",
+-                libc::posix_spawnattr_setflags(self.as_ptr(), flags),
+-            )
+-        }
+-    }
+ }
+ 
+ impl Drop for PosixSpawnAttr {
+diff --git a/src/signal.rs b/src/signal.rs
+index e2b2022..0bf30fa 100644
+--- a/src/signal.rs
++++ b/src/signal.rs
+@@ -25,7 +25,7 @@ pub fn register_sigint() {
+     // Safety: registering a signal handler is libc unsafe code.
+     unsafe {
+         let mut sa: libc::sigaction = std::mem::zeroed();
+-        sa.sa_sigaction = sigint_handler as libc::sighandler_t;
++        sa.sa_sigaction = sigint_handler as *const () as libc::sighandler_t;
+         sa.sa_flags = libc::SA_RESETHAND;
+         #[cfg(not(miri))]
+         libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());

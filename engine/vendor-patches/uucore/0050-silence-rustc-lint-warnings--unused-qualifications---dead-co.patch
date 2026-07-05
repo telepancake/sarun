@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 05 Jul 2026 06:02:11 +0000
+Subject: [PATCH] silence rustc lint warnings (unused qualifications / dead code)
+
+---
+diff --git a/src/lib/lib.rs b/src/lib/lib.rs
+index 2dad53e..3be0156 100644
+--- a/src/lib/lib.rs
++++ b/src/lib/lib.rs
+@@ -270,15 +270,15 @@ pub fn localized_help_template(util_name: &str) -> clap::builder::StyledStr {
+     use std::io::IsTerminal;
+ 
+     // Determine if colors should be enabled - same logic as configure_localized_command
+-    let colors_enabled = if crate::logical_env::get("NO_COLOR").is_some() {
++    let colors_enabled = if logical_env::get("NO_COLOR").is_some() {
+         false
+-    } else if crate::logical_env::get("CLICOLOR_FORCE").is_some()
+-        || crate::logical_env::get("FORCE_COLOR").is_some()
++    } else if logical_env::get("CLICOLOR_FORCE").is_some()
++        || logical_env::get("FORCE_COLOR").is_some()
+     {
+         true
+     } else {
+         IsTerminal::is_terminal(&std::io::stdout())
+-            && crate::logical_env::get_string("TERM").unwrap_or_default() != "dumb"
++            && logical_env::get_string("TERM").unwrap_or_default() != "dumb"
+     };
+ 
+     localized_help_template_with_colors(util_name, colors_enabled)

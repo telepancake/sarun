@@ -59,7 +59,7 @@ pub fn tap_available() -> bool {
 
 /// The probe body, run in the forked child. Async-signal-safe: no allocation.
 /// Mirrors `unshare_netns` + `open_tap`. Returns true iff both gates pass.
-unsafe fn probe_tap_child() -> bool {
+unsafe fn probe_tap_child() -> bool { unsafe {
     if libc::unshare(libc::CLONE_NEWNET) != 0 {
         if *libc::__errno_location() != libc::EPERM { return false; }
         // Rootless: gain the cap via a user namespace, then retry the netns.
@@ -82,7 +82,7 @@ unsafe fn probe_tap_child() -> bool {
     let ok = libc::ioctl(fd, TUNSETIFF as _, &mut req) == 0;
     libc::close(fd);
     ok
-}
+}}
 
 /// Write the identity id-map `"<id> <id> 1"` to `path` with raw syscalls (no
 /// heap). `path` is NUL-terminated. Returns whether the write succeeded.
@@ -90,7 +90,7 @@ unsafe fn write_id_map(path: &[u8], id: libc::uid_t) -> bool {
     // Compose "<id> <id> 1\n" into a stack buffer.
     let mut buf = [0u8; 32];
     let mut n = 0;
-    let mut push_uint = |buf: &mut [u8], n: &mut usize, mut v: u32| {
+    let push_uint = |buf: &mut [u8], n: &mut usize, mut v: u32| {
         let mut digits = [0u8; 10];
         let mut d = 0;
         if v == 0 { digits[0] = b'0'; d = 1; }
@@ -101,17 +101,17 @@ unsafe fn write_id_map(path: &[u8], id: libc::uid_t) -> bool {
     buf[n] = b' '; n += 1;
     push_uint(&mut buf, &mut n, id as u32);
     for &b in b" 1\n" { buf[n] = b; n += 1; }
-    write_raw(path, &buf[..n])
+    unsafe { write_raw(path, &buf[..n]) }
 }
 
 /// Open `path` (NUL-terminated) and write `data` in full. Raw syscalls only.
-unsafe fn write_raw(path: &[u8], data: &[u8]) -> bool {
+unsafe fn write_raw(path: &[u8], data: &[u8]) -> bool { unsafe {
     let fd = libc::open(path.as_ptr().cast(), libc::O_WRONLY);
     if fd < 0 { return false; }
     let r = libc::write(fd, data.as_ptr().cast(), data.len());
     libc::close(fd);
     r == data.len() as isize
-}
+}}
 
 /// The gateway MAC: what the engine's smoltcp answers as, AND what the runner
 /// seeds into the box's ARP cache. `StackRuntime::start` must be given the

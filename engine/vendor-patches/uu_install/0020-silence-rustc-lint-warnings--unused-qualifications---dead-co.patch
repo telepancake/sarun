@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 05 Jul 2026 06:02:11 +0000
+Subject: [PATCH] silence rustc lint warnings (unused qualifications / dead code)
+
+---
+diff --git a/src/install.rs b/src/install.rs
+index 993b0ce..816b686 100644
+--- a/src/install.rs
++++ b/src/install.rs
+@@ -165,7 +165,7 @@ enum InstallError {
+     DirNeedsArg,
+ 
+     #[error("{}", translate!("install-error-create-dir-failed", "path" => .0.quote()))]
+-    CreateDirFailed(PathBuf, #[source] std::io::Error),
++    CreateDirFailed(PathBuf, #[source] io::Error),
+ 
+     #[error("{}", translate!("install-error-chmod-failed", "path" => .0.quote()))]
+     ChmodFailed(PathBuf),
+@@ -180,7 +180,7 @@ enum InstallError {
+     TargetDirIsntDir(PathBuf),
+ 
+     #[error("{}", translate!("install-error-backup-failed", "from" => .0.quote(), "to" => .1.quote()))]
+-    BackupFailed(PathBuf, PathBuf, #[source] std::io::Error),
++    BackupFailed(PathBuf, PathBuf, #[source] io::Error),
+ 
+     #[error("{}", translate!("install-error-install-failed", "from" => .0.quote(), "to" => .1.quote(), "error" => .2.clone()))]
+     InstallFailed(PathBuf, PathBuf, String),
+@@ -189,7 +189,7 @@ enum InstallError {
+     StripProgramFailed(String),
+ 
+     #[error("{}", translate!("install-error-metadata-failed"))]
+-    MetadataFailed(#[source] std::io::Error),
++    MetadataFailed(#[source] io::Error),
+ 
+     #[error("{}", translate!("install-error-invalid-user", "user" => .0.quote()))]
+     InvalidUser(String),
+@@ -276,8 +276,8 @@ static ARG_FILES: &str = "files";
+ pub fn install_main(
+     args: impl uucore::Args,
+     cwd: &Path,
+-    out: &mut dyn io::Write,
+-    err: &mut dyn io::Write,
++    out: &mut dyn Write,
++    err: &mut dyn Write,
+ ) -> UResult<()> {
+     INSTALL_OUT.with(|b| b.borrow_mut().clear());
+     INSTALL_ERR.with(|b| b.borrow_mut().clear());
+@@ -309,8 +309,8 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+ 
+     let produced_out = INSTALL_OUT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+     let produced_err = INSTALL_ERR.with(|b| std::mem::take(&mut *b.borrow_mut()));
+-    let _ = io::Write::write_all(&mut io::stdout(), &produced_out);
+-    let _ = io::Write::write_all(&mut io::stderr(), &produced_err);
++    let _ = Write::write_all(&mut io::stdout(), &produced_out);
++    let _ = Write::write_all(&mut io::stderr(), &produced_err);
+ 
+     let deferred = INSTALL_EXIT.with(std::cell::Cell::get);
+     match result {
+@@ -858,7 +858,7 @@ fn standard(mut paths: Vec<OsString>, b: &Behavior) -> UResult<()> {
+                             }
+                         }
+                         Err(e) => {
+-                            if e.kind() == std::io::ErrorKind::AlreadyExists
++                            if e.kind() == io::ErrorKind::AlreadyExists
+                                 && to_create.exists()
+                                 && !to_create.is_dir()
+                             {
+@@ -924,7 +924,7 @@ fn standard(mut paths: Vec<OsString>, b: &Behavior) -> UResult<()> {
+                 let backup_path = perform_backup(&target, b)?;
+ 
+                 if let Err(e) = parent_fd.unlink_at(filename.as_os_str(), false)
+-                    && e.kind() != std::io::ErrorKind::NotFound
++                    && e.kind() != io::ErrorKind::NotFound
+                 {
+                     show_error!(
+                         "{}",
+@@ -1124,7 +1124,7 @@ fn copy_file(from: &Path, to: &Path) -> UResult<()> {
+ 
+     // Remove existing file (create_new below provides TOCTOU protection)
+     if let Err(e) = fs::remove_file(to)
+-        && e.kind() != std::io::ErrorKind::NotFound
++        && e.kind() != io::ErrorKind::NotFound
+     {
+         show_error!(
+             "{}",

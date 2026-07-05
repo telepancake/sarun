@@ -139,8 +139,10 @@ impl EvState {
 // ── decoder ─────────────────────────────────────────────────────────────────
 
 /// One decoded TRACE event, with the per-stream deltas already applied.
-/// Blob/extras are interpreted per type (trace.h).
+/// Blob/extras are interpreted per type (trace.h). Fields mirror the wire
+/// format in full even where the engine has no consumer yet.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Event {
     pub ty: i64,
     pub ts_ns: i64,
@@ -153,8 +155,8 @@ pub struct Event {
 
 /// OPEN extras layout: {flags, fd, ino, dev_major, dev_minor, err, inh}.
 pub const EV_EXEC: i64 = 0;
-pub const EV_ARGV: i64 = 1;
-pub const EV_ENV: i64 = 2;
+#[allow(dead_code)] pub const EV_ARGV: i64 = 1; // wire ids kept complete
+#[allow(dead_code)] pub const EV_ENV: i64 = 2;
 pub const EV_CWD: i64 = 6;
 pub const EV_OPEN: i64 = 5;
 pub const EV_STDOUT: i64 = 7;

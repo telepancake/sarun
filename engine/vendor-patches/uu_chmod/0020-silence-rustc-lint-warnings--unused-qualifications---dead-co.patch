@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 05 Jul 2026 06:02:11 +0000
+Subject: [PATCH] silence rustc lint warnings (unused qualifications / dead code)
+
+---
+diff --git a/src/chmod.rs b/src/chmod.rs
+index 6d9ec44..51bce4f 100644
+--- a/src/chmod.rs
++++ b/src/chmod.rs
+@@ -616,7 +616,7 @@ impl Chmoder {
+                 }
+                 Err(err) => {
+                     // Handle permission denied errors with proper file path context
+-                    if err.kind() == std::io::ErrorKind::PermissionDenied {
++                    if err.kind() == io::ErrorKind::PermissionDenied {
+                         r = r.and(Err(ChmodError::PermissionDenied(file_path.into()).into()));
+                     } else {
+                         r = r.and(Err(err.into()));
+@@ -643,7 +643,7 @@ impl Chmoder {
+             let Ok(meta) = dir_meta else {
+                 // Handle permission denied with proper file path context
+                 let e = dir_meta.unwrap_err();
+-                let error = if e.kind() == std::io::ErrorKind::PermissionDenied {
++                let error = if e.kind() == io::ErrorKind::PermissionDenied {
+                     ChmodError::PermissionDenied(entry_path).into()
+                 } else {
+                     e.into()
+@@ -669,7 +669,7 @@ impl Chmoder {
+                             r = self.safe_traverse_dir(&child_dir_fd, &entry_path).and(r);
+                         }
+                         Err(err) => {
+-                            let error = if err.kind() == std::io::ErrorKind::PermissionDenied {
++                            let error = if err.kind() == io::ErrorKind::PermissionDenied {
+                                 ChmodError::PermissionDenied(entry_path).into()
+                             } else {
+                                 err.into()
+@@ -771,7 +771,7 @@ impl Chmoder {
+                         );
+                     }
+                     Ok(()) // Skip dangling symlinks
+-                } else if err.kind() == std::io::ErrorKind::PermissionDenied {
++                } else if err.kind() == io::ErrorKind::PermissionDenied {
+                     Err(ChmodError::PermissionDenied(file.into()).into())
+                 } else {
+                     Err(ChmodError::CannotStat(file.into()).into())

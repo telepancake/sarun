@@ -1448,14 +1448,9 @@ impl brush_core::builtins::SimpleCommand for EngineSelfCommand {
     }
 }
 
-/// All box brush builtins with `bundle_coreutils=true`.
-fn box_builtins<SE: brush_core::extensions::ShellExtensions>()
-    -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
-    box_builtins_opt(true)
-}
-
-/// Same as [`box_builtins`] but gates stream/filter coreutils (`cat`/`head`/`sort`/etc.)
-/// behind `bundle_coreutils`. When false (make-recipe path) those fall through to fork+exec.
+/// All box brush builtins. `bundle_coreutils` gates the stream/filter
+/// coreutils (`cat`/`head`/`sort`/etc.); when false (make-recipe path) those
+/// fall through to fork+exec.
 /// The gate avoids uucore's process-global `OnceLock` localization poisoning (first util
 /// wins the slot; others emit raw keys like `cp-error-cannot-stat`). Filesystem-op builtins
 /// (`cp`/`rm`/`mv`/…) are always registered — each runs on its own fresh thread, getting its
@@ -2946,11 +2941,11 @@ pub fn set_box_recipe_edge(edge: Option<String>) -> Option<String> {
     BOX_RECIPE_EDGE.with(|c| std::mem::replace(&mut *c.borrow_mut(), edge))
 }
 
-/// Install (once) the brush-core assignment observer: every shell variable
-/// assignment a box shell applies is queued as a variable-provenance row,
-/// tagged `sh` plus the recipe's build edge (when inside one) or the current
-/// pipeline uid — the same makevar table the make hook feeds, so
-/// make↔shell↔sub-make value flows are one searchable history.
+// Install (once) the brush-core assignment observer: every shell variable
+// assignment a box shell applies is queued as a variable-provenance row,
+// tagged `sh` plus the recipe's build edge (when inside one) or the current
+// pipeline uid — the same makevar table the make hook feeds, so
+// make↔shell↔sub-make value flows are one searchable history.
 thread_local! {
     /// True while this thread runs engine plumbing (the make export prefix)
     /// whose assignments must NOT be recorded as variable provenance.

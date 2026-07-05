@@ -323,6 +323,14 @@ enum Pane {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Screen { Main, Terminal, Browser, Inspect }
 
+/// Wrapping cycle: the element `dir` steps away from index `i` in `items`.
+/// The one helper behind every F2-F5 rotation (screens, panes, PTYs).
+fn cycle_pick<T: Copy>(items: &[T], i: usize, dir: isize) -> Option<T> {
+    if items.is_empty() { return None; }
+    let n = items.len() as isize;
+    Some(items[((i as isize + dir).rem_euclid(n)) as usize])
+}
+
 /// A transient modal overlaid on the main view. Mirrors the Python Textual
 /// modals: Confirm (y/n destructive), SearchModal (substring filter of the
 /// active pane), RuleFormModal (add/edit a filerules line).
@@ -398,7 +406,7 @@ enum Modal {
     /// one step, no session to pre-scaffold, no NAME to remember.
     OaitaTask { box_name: String, session: String, buf: String },
     /// Local-model picker for the Api pane. Opened when neither an external
-    /// API nor a local model is configured (or from the pane's F4 menu). The
+    /// API nor a local model is configured (or from the pane's 'm' menu). The
     /// list is the engine's `oaita.models` catalog — a LIVE HuggingFace query
     /// for currently-popular Q4 GGUF instruct models (config-file override +
     /// offline fallback); `source` names where it came from. Enter on a model
@@ -479,7 +487,7 @@ struct ModelRow {
 }
 
 /// One row inside Modal::ActionMenu. `hint` shows the global key that
-/// would do the same thing (e.g. "F5" / "a") so the popup teaches the
+/// would do the same thing (e.g. "a") so the popup teaches the
 /// keymap as the user uses it.
 #[derive(Clone)]
 struct ActionItem {
@@ -894,7 +902,7 @@ struct App {
     /// One-shot: the Api pane already auto-offered the model picker this
     /// session (because neither an external API nor a local model was
     /// configured). Never re-offer — a user who dismisses it is not nagged;
-    /// the F4 menu still opens it on demand.
+    /// the 'm' menu still opens it on demand.
     model_picker_offered: bool,
     /// In-flight background connection test for the ApiConfig editor (the
     /// engine's `oaita.probe`). Drained by pump_probe() into the modal's
@@ -983,8 +991,20 @@ const OUTPUT_WINDOW_CAP: usize = 8000;
 
 
 impl App {
+    /// Connected constructor: field defaults + the initial engine loads.
     fn new(sock: String) -> Self {
-        let mut a = App {
+        let mut a = App::bare(sock);
+        a.refresh_sessions();
+        a.load_changes();
+        a.load_rules();
+        a
+    }
+
+    /// Every field's default, no engine traffic. The ONE place App's
+    /// initial state lives — the interactive path adds its loads in
+    /// `new`, the headless tests use this directly.
+    fn bare(sock: String) -> Self {
+        App {
             sock,
             sessions: vec![],
             changes: vec![],
@@ -1063,11 +1083,7 @@ impl App {
             ins_stack: vec![],
             ins_input: None,
             ins_pending: None,
-        };
-        a.refresh_sessions();
-        a.load_changes();
-        a.load_rules();
-        a
+        }
     }
 
     /// box_id (the engine's session_id, a stringified i64) of the selected box.
@@ -1292,7 +1308,7 @@ impl App {
         }
     }
 
-    /// Open the local-model picker (Api pane F4, or auto-opened when nothing
+    /// Open the local-model picker (Api pane 'm' menu, or auto-opened when nothing
     /// is configured). The catalog fetch (a live HuggingFace query the engine
     /// runs) can take a few seconds, so open in a `loading` state and pull the
     /// result in via pump_models() rather than blocking the UI thread.
@@ -2825,7 +2841,7 @@ impl App {
     /// The FIRST time the Api pane is shown with nothing wired up — no
     /// external API in oaita.toml AND no local model declared — auto-open the
     /// model picker so the endpoint answers "how do I get one?" itself,
-    /// instead of leaving the user to guess F4 / magic argv. One-shot: a
+    /// instead of leaving the user to guess the 'm' menu / magic argv. One-shot: a
     /// dismissal is respected (see `model_picker_offered`).
     fn maybe_offer_model_picker(&mut self) {
         if self.model_picker_offered || self.modal.is_some() { return; }
@@ -3693,10 +3709,10 @@ impl App {
     fn cycle_screen(&mut self, dir: isize) {
         let avail = self.screens_available();
         let cur = self.current_screen();
-        let i = avail.iter().position(|s| *s == cur).unwrap_or(0) as isize;
-        let n = avail.len() as isize;
-        let next = avail[((i + dir).rem_euclid(n)) as usize];
-        self.switch_screen(next);
+        let i = avail.iter().position(|s| *s == cur).unwrap_or(0);
+        if let Some(next) = cycle_pick(&avail, i, dir) {
+            self.switch_screen(next);
+        }
     }
 
     /// Land on a screen: Main restores the last data pane; Terminal /
@@ -3746,16 +3762,15 @@ impl App {
                 // chip (that one jumps screens, not windows).
                 let chips: Vec<char> = menubar_chips(self).into_iter()
                     .map(|(c, _)| c).filter(|c| *c != 'P').collect();
-                if chips.is_empty() { return; }
                 let cur = view_of_pane(self.focus).map(|(k, _, _)| k);
                 let i = cur.and_then(|k| chips.iter().position(|c| *c == k))
-                    .unwrap_or(0) as isize;
-                let n = chips.len() as isize;
-                let next = chips[((i + dir).rem_euclid(n)) as usize];
-                if let Some((_, pane, _, _, _)) =
-                    PANE_KEYS.iter().find(|e| e.0 == next)
-                {
-                    self.go_to_pane(*pane);
+                    .unwrap_or(0);
+                if let Some(next) = cycle_pick(&chips, i, dir) {
+                    if let Some((_, pane, _, _, _)) =
+                        PANE_KEYS.iter().find(|e| e.0 == next)
+                    {
+                        self.go_to_pane(*pane);
+                    }
                 }
             }
             Screen::Terminal => self.pty_cycle_kind(dir, false),
@@ -3771,12 +3786,11 @@ impl App {
         let idxs: Vec<usize> = self.ptys.iter().enumerate()
             .filter(|(_, p)| p.browser == browser)
             .map(|(i, _)| i).collect();
-        if idxs.is_empty() { return; }
-        let pos = idxs.iter().position(|&i| i == self.sel_pty).unwrap_or(0) as isize;
-        let n = idxs.len() as isize;
-        self.sel_pty = idxs[((pos + dir).rem_euclid(n)) as usize];
+        let pos = idxs.iter().position(|&i| i == self.sel_pty).unwrap_or(0);
+        let Some(next) = cycle_pick(&idxs, pos, dir) else { return };
+        self.sel_pty = next;
         self.status = format!("window {}/{} of the {} screen",
-            ((pos + dir).rem_euclid(n)) + 1, n,
+            idxs.iter().position(|&i| i == next).unwrap_or(0) + 1, idxs.len(),
             if browser { "browser" } else { "terminal" });
     }
     /// Kill the current PTY (drop the connection — engine SIGHUPs the
@@ -7152,12 +7166,7 @@ fn ins_json_preview(v: &Value, cap: usize) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };
-    let s = s.replace('\n', "\u{21b5}");
-    if s.chars().count() > cap {
-        format!("{}\u{2026}", s.chars().take(cap).collect::<String>())
-    } else {
-        s
-    }
+    ins_clip(&s.replace('\n', "\u{21b5}"), cap)
 }
 
 /// Truncate a name for a bucket's orientation label.
@@ -13133,91 +13142,12 @@ mod tests {
         assert!(!eval_clauses(&no, std::slice::from_ref(&ids_clause)));
     }
 
-    /// An App with no socket and all state empty — built by struct literal so
-    /// it never RPCs (unlike `App::new`, which calls refresh/load on construct).
-    /// For the pure-render and pure-dispatch keybinding tests that must run with
-    /// no live engine.
+    /// An App with no socket and all state empty — App::bare, which never
+    /// RPCs (unlike `App::new`, which calls refresh/load on construct). For
+    /// the pure-render and pure-dispatch keybinding tests that must run
+    /// with no live engine.
     fn headless_app() -> App {
-        App {
-            nav_from: None,
-            sock: String::new(),
-            sessions: vec![],
-            changes: vec![],
-            changes_view: None, changes_view_sid: None,
-            changes_total: 0,
-            changes_window_start: 0,
-            hunks: Value::Null,
-            processes: vec![],
-            processes_view: None, processes_view_sid: None,
-            processes_total: 0,
-            processes_window_start: 0,
-            outputs: vec![],
-            outputs_view: None, outputs_view_sid: None,
-            outputs_total: 0,
-            outputs_window_start: 0,
-            rules: vec![], pipelines: vec![], pipelines_flat: vec![],
-            pipelines_view: None, pipelines_view_sid: None, pipelines_total: 0, pipelines_window_start: 0,
-            pipe_tree: true, pipe_running_only: false, proc_running_only: true,
-            build_edges: vec![], build_edges_flat: vec![],
-            edges_view: None, edges_view_sid: None, edges_total: 0, edges_window_start: 0,
-            edges_running_only: true,
-            sel_session: 0,
-            sel_change: 0,
-            marks: std::collections::HashSet::new(),
-            mark_scope: None,
-            mark_anchor: None,
-            sel_proc: 0, sel_pipeline: 0, sel_edge: 0,
-            sel_output: 0,
-            sel_api_log: 0,
-            api_log_rows: vec![],
-            api_log_loaded_sid: None,
-            sel_webcap: 0,
-            webcap_rows: vec![],
-            webcap_loaded_sid: None,
-            api_endpoint_note: vec![],
-            sel_rule: 0,
-            hunk_scroll: 0,
-            out_scroll: 0,
-            focus: Pane::Help,
-            status: String::new(),
-            renaming: None,
-            modal: None,
-            f_changes: ViewFilter::default(),
-            f_procs: ViewFilter::default(),
-            f_outputs: ViewFilter::default(),
-            f_pipelines: ViewFilter::default(),
-            f_edges: ViewFilter::default(),
-            should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], vars_query: (String::new(), String::new()), vars_any: false, vars_rows: vec![], sel_var: 0, sel_var_item: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
-            oci_images: vec![],
-            launch_net: 0,
-            launch_env: false,
-            tap_ok: true,
-            net_auto_bumped: false,
-            load_job: None,
-            models_job: None,
-            model_picker_offered: false,
-            probe_job: None,
-            structd: StructState::default(),
-            sel_hunk: 0,
-            struct_rx: None,
-            cd_info: None,
-            output_segs: vec![],
-            changes_decor: vec![],
-            box_summary: serde_json::json!(null),
-            flows: vec![], sel_flow: 0,
-            flow_detail: String::new(), flow_detail_frame: 0,
-            packets: vec![], sel_packet: 0,
-            packet_detail: String::new(), packet_detail_frame: 0,
-            packets_stream: -1,
-            pending_prompt: None,
-            last_main_pane: Pane::Sessions,
-            last_term_pty: 0,
-            last_browser_pty: 0,
-            ins_stack: vec![],
-            ins_input: None,
-            ins_pending: None,
-        }
+        App::bare(String::new())
     }
 
     /// The Pty+ entry point must be a discoverable chooser, not a raw

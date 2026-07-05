@@ -2,3 +2,4 @@
 0020-vendor-n2-thread-a-logical-build-dir-through-filesystem-acce.patch
 0030-vendor-n2-jobserver-client-draw-parallelism-from-a-shared-po.patch
 0040-jobserver-route-all-real-builds-at-the-engine-global-FUSE-po.patch
+0050-silence-rustc-lint-warnings--unused-qualifications---dead-co.patch

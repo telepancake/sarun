@@ -29,7 +29,7 @@
 // error and a non-zero exit. We NEVER silently exec the real `make`.
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
