@@ -95,7 +95,42 @@ pub(crate) fn do_import<R: Read>(
 fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> Result<()> {
     let page_id = page.id as u64;
 
-    let g = instance.inner.lock().expect("instance mutex poisoned");
+    let mut g = instance.inner.lock().expect("instance mutex poisoned");
+
+    // Dirty fence (once per session, durable BEFORE any import write):
+    // between here and the next flush, revisions_seen commits may be
+    // durable while their depot frames are not — a power loss in that
+    // window is what the flag records, and what suspect-mode repairs.
+    if !g.dirty_stamped {
+        g.conn.execute(
+            "INSERT OR REPLACE INTO instance_flags(key, value) VALUES('dirty', 1)",
+            [],
+        )?;
+        g.conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+        g.dirty_stamped = true;
+    }
+    // Suspect-mode repair: the previous session died dirty, so this
+    // page's revisions_seen rows may reference frames that never became
+    // durable. Re-derive the rows from the CHAIN (the depot is the data
+    // fence; bookkeeping must never be ahead of it) once per page.
+    if instance.suspect && !g.repaired.contains(&page_id) {
+        let actual: Vec<i64> = crate::instance::collect_records(&g.depot, page_id)?
+            .iter()
+            .map(|rec| decode_rev_id(rec))
+            .collect::<Result<_>>()?;
+        g.conn.execute(
+            "DELETE FROM revisions_seen WHERE page_id = ?1",
+            params![page_id as i64],
+        )?;
+        for rev_id in actual {
+            g.conn.execute(
+                "INSERT OR IGNORE INTO revisions_seen(page_id, rev_id) VALUES(?1, ?2)",
+                params![page_id as i64, rev_id],
+            )?;
+        }
+        g.repaired.insert(page_id);
+    }
+    let g = &*g;
 
     // Begin the per-page transaction.
     g.conn.execute("BEGIN IMMEDIATE", [])?;
@@ -340,6 +375,12 @@ fn append_depot_frame(
         }
     }
     Ok(())
+}
+
+/// The rev id of one encoded revision record (suspect-mode repair).
+fn decode_rev_id(rec: &[u8]) -> Result<i64> {
+    let (meta, _text) = crate::revision::decode_revision(rec)?;
+    Ok(meta.rev_id as i64)
 }
 
 fn capture_siteinfo(conn: &rusqlite::Connection, si: &wikimak_mediawiki::SiteInfo) -> Result<()> {

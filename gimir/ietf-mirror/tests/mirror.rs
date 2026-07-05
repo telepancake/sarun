@@ -40,6 +40,17 @@ fn mock_text<'a>(server: &'a MockServer, docname: &str, body: &str) -> httpmock:
 }
 
 #[test]
+fn second_process_is_locked_out() {
+    let tmp = TempDir::new().unwrap();
+    let _first = mirror(&tmp);
+    match Mirror::open(MirrorConfig::new(tmp.path().join("m"))) {
+        Err(ietf_mirror::Error::MirrorLocked(_)) => {}
+        Err(e) => panic!("expected MirrorLocked, got {e}"),
+        Ok(_) => panic!("second open of a live root must fail"),
+    }
+}
+
+#[test]
 fn update_mirrors_then_increments() {
     let server = MockServer::start();
     let mut idx = server.mock(|when, then| {

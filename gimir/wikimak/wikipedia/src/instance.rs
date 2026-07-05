@@ -109,6 +109,11 @@ pub struct Instance {
     pub(crate) max_chain_id: u64,
     pub(crate) f1_seal_threshold_bytes: u64,
     pub(crate) title_shard_count: u32,
+    /// True when the previous session ended dirty (crash between an
+    /// import write and a flush): `revisions_seen` may then be AHEAD of
+    /// the depot (rows durable, frames lost). Imports repair each
+    /// touched page's rows from the chain before trusting them.
+    pub(crate) suspect: bool,
     #[allow(dead_code)]
     // dbname retained for future logging / sharding decisions; unread today.
     pub(crate) dbname: String,
@@ -121,6 +126,13 @@ pub(crate) struct InstanceInner {
     pub(crate) depot: Depot,
     pub(crate) titles: Pool,
     pub(crate) conn: Connection,
+    /// Pages whose `revisions_seen` rows were re-derived from the chain
+    /// this session (suspect-mode repair) — each repaired once.
+    pub(crate) repaired: std::collections::HashSet<u64>,
+    /// Whether this session has already stamped the dirty flag.
+    pub(crate) dirty_stamped: bool,
+    /// The root's flock, held for the instance's lifetime.
+    pub(crate) _lock: std::fs::File,
 }
 
 impl Instance {
@@ -146,6 +158,13 @@ impl Instance {
             None,
         )?;
 
+        // One-process-per-root guard: an exclusive flock on <root>/.lock,
+        // held for the Instance's lifetime and auto-released by the
+        // kernel on any exit (even a crash). External READERS of
+        // meta.db stay possible — only a second writing instance is
+        // locked out (it would interleave depot appends unsynchronized).
+        let lock = acquire_root_lock(&cfg.root)?;
+
         // meta.db.
         let conn = Connection::open(cfg.root.join("meta.db"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -153,13 +172,25 @@ impl Instance {
         for stmt in META_DDL {
             conn.execute(stmt, [])?;
         }
+        let suspect: bool = conn
+            .query_row(
+                "SELECT value FROM instance_flags WHERE key = 'dirty'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+            .unwrap_or(false);
 
         Ok(Self {
             inner: Mutex::new(InstanceInner {
                 depot,
                 titles,
                 conn,
+                repaired: Default::default(),
+                dirty_stamped: false,
+                _lock: lock,
             }),
+            suspect,
             max_chain_id: cfg.max_chain_id,
             f1_seal_threshold_bytes: if cfg.f1_seal_threshold_bytes == 0 {
                 256 * 1024
@@ -313,7 +344,9 @@ impl Instance {
 
     /// Flush depot + strpool + sqlite to durable storage.
     pub fn flush(&self) -> Result<()> {
-        let g = self.inner.lock().expect("instance mutex poisoned");
+        let mut g = self.inner.lock().expect("instance mutex poisoned");
+        g.dirty_stamped = false; // next import re-stamps
+        let g = &*g;
         g.depot.flush()?;
         for sid in 0..self.title_shard_count {
             g.titles.flush(sid)?;
@@ -324,8 +357,33 @@ impl Instance {
         g.conn
             .pragma_update(None, "wal_checkpoint", "TRUNCATE")
             .map_err(Error::Sqlite)?;
+        // Everything the session wrote is now durable IN ORDER (depot
+        // first, then bookkeeping): clear the dirty flag. A crash after
+        // this point is a clean shutdown for the repair logic.
+        g.conn.execute(
+            "INSERT OR REPLACE INTO instance_flags(key, value) VALUES('dirty', 0)",
+            [],
+        )?;
+        g.conn
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .map_err(Error::Sqlite)?;
         Ok(())
     }
+}
+
+/// Take the exclusive per-root flock, or fail with `InstanceLocked`.
+fn acquire_root_lock(root: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join(".lock"))?;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(crate::error::Error::InstanceLocked(root.to_path_buf()));
+    }
+    Ok(f)
 }
 
 /// Collect every revision record on `chain_id`, newest-first. Walks the

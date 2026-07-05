@@ -33,4 +33,9 @@ pub enum Error {
 
     #[error("corrupt: {0}")]
     Corrupt(&'static str),
+
+    /// Another process holds this instance root (meta.db exclusive
+    /// lock). One process at a time per root — by lock, not convention.
+    #[error("instance {0} is locked by another process")]
+    InstanceLocked(std::path::PathBuf),
 }

@@ -45,6 +45,15 @@ pub const META_DDL: &[&str] = &[
         rev_id INTEGER NOT NULL,
         PRIMARY KEY(page_id, rev_id)
     ) WITHOUT ROWID",
+    // Crash bookkeeping: 'dirty' = 1 between the first import write and
+    // the next successful flush. On open, dirty means the last session
+    // may have committed revisions_seen rows whose depot frames were
+    // never flushed (power loss) — imports then verify a page's rows
+    // against the CHAIN before trusting them (lazy per-page repair).
+    "CREATE TABLE IF NOT EXISTS instance_flags (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+    )",
     // Reverse-lookup index for title pool dedup: by (ns, normalized_title).
     "CREATE INDEX IF NOT EXISTS idx_title_id_to_page_title
         ON title_id_to_page (ns, normalized_title)",

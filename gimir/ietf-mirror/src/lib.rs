@@ -53,6 +53,9 @@ pub enum Error {
     InventoryFull(u64),
     #[error("corrupt layer on chain {chain_id}: {what}")]
     CorruptLayer { chain_id: u64, what: &'static str },
+    /// Another process holds this mirror root (meta.db exclusive lock).
+    #[error("mirror {0} is locked by another process")]
+    MirrorLocked(PathBuf),
 }
 
 /// Configuration for the HTTP side. Production uses `Default`; tests
@@ -122,6 +125,8 @@ const DDL: &[&str] = &[
 pub struct Mirror {
     conn: Connection,
     store: VbfDepot,
+    /// The root's flock, held for the mirror's lifetime.
+    _lock: std::fs::File,
     #[cfg_attr(not(feature = "fetch"), allow(dead_code))]
     max_chain_id: u64,
 }
@@ -132,13 +137,28 @@ impl Mirror {
     pub fn open(cfg: MirrorConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.root)?;
         let store = VbfDepot::open(cfg.root.join("depot"), cfg.max_chain_id, cfg.seal_threshold)?;
+        // One-process-per-root guard: exclusive flock on <root>/.lock,
+        // held for the Mirror's lifetime, kernel-released on any exit.
+        // External readers of meta.db stay possible.
+        let lock = {
+            use std::os::fd::AsRawFd;
+            let f = std::fs::OpenOptions::new()
+                .create(true).truncate(false).write(true)
+                .open(cfg.root.join(".lock"))?;
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                return Err(Error::MirrorLocked(cfg.root.clone()));
+            }
+            f
+        };
+
         let conn = Connection::open(cfg.root.join("meta.db"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         for stmt in DDL {
             conn.execute(stmt, [])?;
         }
-        Ok(Mirror { conn, store, max_chain_id: cfg.max_chain_id })
+        Ok(Mirror { conn, store, max_chain_id: cfg.max_chain_id, _lock: lock })
     }
 
     /// Discover + fetch + import every unseen revision of every draft in
