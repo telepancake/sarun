@@ -791,6 +791,45 @@ static void assert_path_arg_rewritten(long nr, int path_arg_idx,
     fixture_teardown();
 }
 
+/* chdir is NOT an arg-rewrite interception: the handler EXECUTES the
+ * chdir itself (the virtual path when the kernel can resolve it, else
+ * the layer path + the logical-cwd shadow) and short-circuits, so
+ * getcwd and relative-path resolution keep presenting the virtual
+ * tree.  Assert the executed contract: a lower-only directory lands
+ * the process in the LAYER dir with the call short-circuited as
+ * success, and the original path arg is left alone. */
+static void test_chdir_executes_inline(void)
+{
+    g_curtest = "intercept/__NR_chdir";
+    fixture_setup();
+    install_overlay();
+
+    char save[PATH_MAX];
+    long sn = raw_syscall6(__NR_getcwd, (long)save, sizeof(save), 0, 0, 0, 0);
+    TASSERT(sn > 0, "getcwd for restore");
+
+    char lodir[PATH_MAX];
+    snprintf(lodir, sizeof(lodir), "%s/d", g_lower);
+    t_mkdir(lodir, 0755);
+    char merged_dir[PATH_MAX];
+    snprintf(merged_dir, sizeof(merged_dir), "%s/d", g_merged);
+
+    struct sud_syscall_ctx ctx = make_ctx();
+    ctx.nr = __NR_chdir;
+    ctx.args[0] = (long)merged_dir;
+    int handled = sud_addins_pre_syscall(&ctx);
+    TASSERT(handled == 1, "chdir short-circuited by the handler");
+    TASSERT(ctx.ret == 0, "chdir on a lower-only dir succeeds");
+
+    char now[PATH_MAX];
+    long nn = raw_syscall6(__NR_getcwd, (long)now, sizeof(now), 0, 0, 0, 0);
+    TASSERT(nn > 0 && strcmp(now, lodir) == 0,
+            "process cwd landed in the layer dir");
+
+    raw_syscall6(__NR_chdir, (long)save, 0, 0, 0, 0, 0);
+    fixture_teardown();
+}
+
 static void test_pathremap_intercepts_all_required_syscalls(void)
 {
     /* If any of these asserts fails with the path NOT rewritten, the
@@ -799,8 +838,7 @@ static void test_pathremap_intercepts_all_required_syscalls(void)
      * build, or the if-chain has a structural bug (early return,
      * misordered #ifdef, wrong macro name, ...). */
 #ifdef __NR_chdir
-    assert_path_arg_rewritten(__NR_chdir, 0, -1,
-                              "intercept/__NR_chdir");
+    test_chdir_executes_inline();
 #endif
 #ifdef __NR_open
     assert_path_arg_rewritten(__NR_open, 0, -1,
