@@ -12,6 +12,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// coarse — callers either retry the whole pipeline or surface the message.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[cfg(feature = "fetch")]
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("http status {status} for {url}")]

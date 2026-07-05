@@ -24,7 +24,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 strpool = { path = "strpool" }
 wikimak-depot = { path = "wikimak/depot" }
-wikimak-mediawiki = { path = "wikimak/mediawiki" }
+wikimak-mediawiki = { path = "wikimak/mediawiki", default-features = false }
 zstd = "0.13"
 memchr = "2"
 thiserror = "1"

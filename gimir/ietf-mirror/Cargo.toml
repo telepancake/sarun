@@ -10,7 +10,13 @@ depot = { path = "../depot" }
 depot-vbf = { path = "../depot-vbf" }
 rusqlite.workspace = true
 thiserror.workspace = true
-reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+# Optional behind `fetch` (default ON): the update/index HTTP surface.
+# Read-only embedders (the sarun engine's ietf_attach) build without it.
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"], optional = true }
+
+[features]
+default = ["fetch"]
+fetch = ["dep:reqwest"]
 
 [dev-dependencies]
 httpmock = "0.7"
@@ -19,3 +25,4 @@ tempfile = "3"
 [[bin]]
 name = "ietfmak"
 path = "src/bin/ietfmak.rs"
+required-features = ["fetch"]

@@ -10,14 +10,18 @@
 //! revisions: [Revision...] }` records and walks away.
 
 pub mod bz2;
+#[cfg(feature = "fetch")]
 pub mod discover;
+#[cfg(feature = "fetch")]
 pub mod fetch;
 pub mod parser;
 pub mod sha1;
 pub mod types;
 
 pub use bz2::{new_bz2_reader, Bz2Options, Bz2Reader};
+#[cfg(feature = "fetch")]
 pub use discover::{discover, discover_with, Config, DUMPS_BASE_URL};
+#[cfg(feature = "fetch")]
 pub use fetch::{fetch, VerifyingReader};
 pub use parser::{new_page_stream, site_info, PageStream};
 pub use sha1::verify_rev_sha1;

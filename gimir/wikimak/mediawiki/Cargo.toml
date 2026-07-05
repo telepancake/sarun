@@ -8,7 +8,9 @@ publish = false
 [dependencies]
 thiserror.workspace = true
 chrono.workspace = true
-reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+# Optional behind `fetch` (default ON): the discover/fetch HTTP surface.
+# Read-only embedders (the sarun engine) build without it.
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"], optional = true }
 bzip2.workspace = true
 quick-xml.workspace = true
 sha1.workspace = true
@@ -17,6 +19,10 @@ regex.workspace = true
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[features]
+default = ["fetch"]
+fetch = ["dep:reqwest"]
 
 [dev-dependencies]
 tempfile = "3"

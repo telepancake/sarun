@@ -19,11 +19,15 @@
 //! too; `update` is idempotent across completed drafts either way.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "fetch")]
 use std::io::Read;
 use std::path::PathBuf;
 
-use depot::{BlobOp, Layer, Node};
+use depot::{BlobOp, Layer};
+#[cfg(feature = "fetch")]
+use depot::Node;
 use depot_vbf::VbfDepot;
+#[cfg(feature = "fetch")]
 use reqwest::blocking::Client;
 use rusqlite::Connection;
 use thiserror::Error;
@@ -38,6 +42,7 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
     #[error("vbf: {0}")]
     Vbf(#[from] depot_vbf::Error),
+    #[cfg(feature = "fetch")]
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
     #[error("http status {status} for {url}")]
@@ -117,6 +122,7 @@ const DDL: &[&str] = &[
 pub struct Mirror {
     conn: Connection,
     store: VbfDepot,
+    #[cfg_attr(not(feature = "fetch"), allow(dead_code))]
     max_chain_id: u64,
 }
 
@@ -139,6 +145,7 @@ impl Mirror {
     /// the index. Idempotent and resumable: completed drafts are skipped
     /// by their revision watermarks. `progress` gets `(draft-rev,
     /// fetched)` per revision considered.
+    #[cfg(feature = "fetch")]
     pub fn update(
         &mut self,
         client: &Client,
@@ -237,6 +244,7 @@ impl Mirror {
         })
     }
 
+    #[cfg(feature = "fetch")]
     fn alloc_chain(&self, name: &str) -> Result<u64> {
         let next: i64 = self
             .conn
@@ -249,6 +257,7 @@ impl Mirror {
         Ok(next as u64)
     }
 
+    #[cfg(feature = "fetch")]
     fn rev_seen(&self, name: &str, rev: &str) -> Result<bool> {
         let n: u64 = self.conn.query_row(
             "SELECT COUNT(*) FROM revisions_seen WHERE name = ?1 AND rev = ?2",
@@ -265,6 +274,7 @@ pub type DraftIndex = BTreeMap<String, Vec<(String, Option<String>)>>;
 /// Fetch and parse `/id/all_id.txt`: the authoritative docname index.
 /// Lines are `draft-...-NN<TAB>date<TAB>status...`; `#` lines and names
 /// without a `-NN` suffix are skipped.
+#[cfg(feature = "fetch")]
 pub fn fetch_index(client: &Client, cfg: &FetchConfig) -> Result<DraftIndex> {
     let url = format!("{}/id/all_id.txt", cfg.base_url);
     let body = http_get(client, &url)?.ok_or(Error::HttpStatus { status: 404, url })?;
@@ -288,6 +298,7 @@ pub fn fetch_index(client: &Client, cfg: &FetchConfig) -> Result<DraftIndex> {
 
 /// `draft-x-y-NN` → `("draft-x-y", "NN")`; `None` if there is no
 /// two-digit revision suffix.
+#[cfg(feature = "fetch")]
 fn split_rev(docname: &str) -> Option<(&str, &str)> {
     let (base, rev) = docname.rsplit_once('-')?;
     if rev.len() == 2 && rev.bytes().all(|b| b.is_ascii_digit()) && !base.is_empty() {
@@ -299,10 +310,12 @@ fn split_rev(docname: &str) -> Option<(&str, &str)> {
 
 /// Insert keeping the revision list ascending and deduped (the index
 /// occasionally repeats a docname).
+#[cfg(feature = "fetch")]
 trait PushAscending {
     fn push_ascending(&mut self, rev: String, date: Option<String>);
 }
 
+#[cfg(feature = "fetch")]
 impl PushAscending for Vec<(String, Option<String>)> {
     fn push_ascending(&mut self, rev: String, date: Option<String>) {
         match self.binary_search_by(|(r, _)| r.as_str().cmp(rev.as_str())) {
@@ -314,6 +327,7 @@ impl PushAscending for Vec<(String, Option<String>)> {
 
 /// The canonical layer for one revision: root → child `text` with the
 /// body as blob and `rev`/`date` attrs. Full snapshot — see module doc.
+#[cfg(feature = "fetch")]
 fn revision_layer(rev: &str, date: Option<&str>, text: &[u8]) -> Layer {
     let mut attrs = BTreeMap::new();
     attrs.insert(b"rev".to_vec(), rev.as_bytes().to_vec());
@@ -361,6 +375,7 @@ fn decode_revision_layer(layer: &Layer, chain_id: u64) -> Result<RevisionEntry> 
 }
 
 /// GET returning `Ok(None)` on 404, the body on 2xx, an error otherwise.
+#[cfg(feature = "fetch")]
 fn http_get(client: &Client, url: &str) -> Result<Option<Vec<u8>>> {
     let resp = client.get(url).send()?;
     let status = resp.status();

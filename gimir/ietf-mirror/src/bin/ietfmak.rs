@@ -26,8 +26,13 @@ fn client() -> Result<reqwest::blocking::Client, String> {
 
 fn cmd_update(root: &str) -> Result<(), String> {
     let mut m = open(root)?;
+    // Test/override seam: point the fetch at a stand-in host.
+    let cfg = match std::env::var("IETFMAK_BASE_URL") {
+        Ok(u) if !u.is_empty() => FetchConfig { base_url: u },
+        _ => FetchConfig::default(),
+    };
     let s = m
-        .update(&client()?, &FetchConfig::default(), |label, fetched| {
+        .update(&client()?, &cfg, |label, fetched| {
             if fetched {
                 eprintln!("fetch {label}");
             }

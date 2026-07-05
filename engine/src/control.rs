@@ -1721,23 +1721,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
             };
-            if ov.box_of(sid).is_none() {
-                // Hydrate the at-rest target box.
-                if !crate::paths::state_home()
-                    .join(format!("{sid}.sqlar")).exists()
-                {
-                    return json!({"ok": false, "error": "no such box"});
-                }
-                match crate::capture::BoxState::create(sid) {
-                    Ok(tb) => {
-                        tb.load_mirror();
-                        ov.add_box(std::sync::Arc::new(tb));
-                    }
-                    Err(e) => return json!({"ok": false,
-                                            "error": e.to_string()}),
-                }
-            }
-            let Some(b) = ov.box_of(sid) else {
+            let Some(b) = hydrate_box(&ov, sid) else {
                 return json!({"ok": false, "error": "no such box"});
             };
             let (Some(store), Some(refname)) = (
@@ -1771,35 +1755,93 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Ok(l) => l,
                 Err(e) => return json!({"ok": false, "error": e}),
             };
-            // A fresh at-rest box holds the imported layer. Same id rule
-            // as run: one past everything at rest or live.
-            let rest_max = std::fs::read_dir(crate::paths::state_home())
-                .map(|rd| rd.flatten()
-                    .filter_map(|e| e.path().file_stem()?
-                        .to_str()?.parse::<i64>().ok())
-                    .max().unwrap_or(0))
-                .unwrap_or(0);
-            let live_max = ov.box_ids().into_iter().max().unwrap_or(0);
-            let gid = rest_max.max(live_max) + 1;
-            let gb = match crate::capture::BoxState::create(gid) {
-                Ok(gb) => gb,
-                Err(e) => return json!({"ok": false,
-                                        "error": format!("sqlar: {e}")}),
-            };
-            {
-                let conn = gb.conn.lock().unwrap();
-                if let Err(e) = crate::depot::import_layer(&conn, gid, &layer) {
-                    return json!({"ok": false, "error": e});
-                }
-            }
             let short: String = r.sha.chars().take(8).collect();
-            gb.set_meta("name", &format!("git:{refname}@{short}"));
-            gb.load_mirror();
-            ov.add_box(std::sync::Arc::new(gb));
-            let mut ids = b.ro_attachments();
-            ids.push(gid);
-            b.set_ro_attachments(ids);
-            json!({"ok": true, "box": gid, "sha": r.sha})
+            match attach_ro_layer(&ov, &b, &layer,
+                                  &format!("git:{refname}@{short}")) {
+                Ok(gid) => json!({"ok": true, "box": gid, "sha": r.sha}),
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+        // Attach a wikipedia mirror page (wikimak instance root) as an
+        // RO layer: args [sid, root, page_id, prefix?]. The box holds
+        // the page's HEAD text as page-<id>.txt under prefix.
+        "wiki_attach" => {
+            let ov = lock(state).overlay.clone();
+            let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
+                return json!({"ok": false, "error": "no overlay / bad sid"});
+            };
+            let Some(b) = hydrate_box(&ov, sid) else {
+                return json!({"ok": false, "error": "no such box"});
+            };
+            let (Some(root), Some(page)) = (
+                args.get(1).and_then(Value::as_str),
+                args.get(2).and_then(Value::as_u64),
+            ) else {
+                return json!({"ok": false, "error": "need root + page id"});
+            };
+            let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
+            let inst = match open_wiki_instance(root) {
+                Ok(i) => i,
+                Err(e) => return json!({"ok": false, "error": e}),
+            };
+            let (head, text) = match (inst.page_head(page),
+                                      inst.page_head_text(page)) {
+                (Ok(Some(h)), Ok(Some(t))) => (h, t),
+                (Ok(None), _) | (_, Ok(None)) =>
+                    return json!({"ok": false,
+                                  "error": format!("no page {page}")}),
+                (Err(e), _) | (_, Err(e)) =>
+                    return json!({"ok": false, "error": e.to_string()}),
+            };
+            let layer = files_layer(prefix,
+                                    &[(format!("page-{page}.txt"), text)]);
+            match attach_ro_layer(&ov, &b, &layer,
+                                  &format!("wiki:{page}@r{}", head.rev_id)) {
+                Ok(gid) => json!({"ok": true, "box": gid,
+                                  "rev": head.rev_id}),
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+        // Attach an IETF draft series (ietf-mirror root) as an RO layer:
+        // args [sid, root, draft, prefix?]. The box holds every mirrored
+        // revision as <draft>-<rev>.txt under prefix — a whole series is
+        // small and the history is the point of a drafts mirror.
+        "ietf_attach" => {
+            let ov = lock(state).overlay.clone();
+            let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
+                return json!({"ok": false, "error": "no overlay / bad sid"});
+            };
+            let Some(b) = hydrate_box(&ov, sid) else {
+                return json!({"ok": false, "error": "no such box"});
+            };
+            let (Some(root), Some(draft)) = (
+                args.get(1).and_then(Value::as_str),
+                args.get(2).and_then(Value::as_str),
+            ) else {
+                return json!({"ok": false, "error": "need root + draft"});
+            };
+            let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
+            let m = match ietf_mirror::Mirror::open(
+                ietf_mirror::MirrorConfig::new(root.into())) {
+                Ok(m) => m,
+                Err(e) => return json!({"ok": false, "error": e.to_string()}),
+            };
+            let hist = match m.history(draft) {
+                Ok(h) if !h.is_empty() => h,
+                Ok(_) => return json!({"ok": false,
+                                       "error": format!("no draft {draft}")}),
+                Err(e) => return json!({"ok": false, "error": e.to_string()}),
+            };
+            let head_rev = hist[0].rev.clone();
+            let files: Vec<(String, Vec<u8>)> = hist.into_iter()
+                .map(|e| (format!("{draft}-{}.txt", e.rev), e.text))
+                .collect();
+            let layer = files_layer(prefix, &files);
+            match attach_ro_layer(&ov, &b, &layer,
+                                  &format!("ietf:{draft}@{head_rev}")) {
+                Ok(gid) => json!({"ok": true, "box": gid, "rev": head_rev}),
+                Err(e) => json!({"ok": false, "error": e}),
+            }
         }
         // Rotation (DEPOT-DESIGN.md §6): promote child box over its
         // parent. args: [child_sid]. Encodings are rewritten — no
@@ -3115,6 +3157,100 @@ pub fn is_box_name(s: &str) -> bool {
 /// engine-side). `NAME` alone selects; `patch` prints the unified diff; `apply`
 /// / `discard` act on the whole box; `rename NEW` renames. Mirrors the Python
 /// `slopbox NAME patch|apply|discard|rename`.
+// ── mirror attach plumbing (MIRRORS.md phase 4) ─────────────────────────────
+
+/// A live handle for `sid`, hydrating the at-rest box (open sqlar, load
+/// mirror, register) if it is not already live. The shared preamble of
+/// the attach/rotate verbs.
+fn hydrate_box(ov: &crate::overlay::Overlay, sid: i64)
+    -> Option<std::sync::Arc<crate::capture::BoxState>>
+{
+    if ov.box_of(sid).is_none() {
+        if !crate::paths::state_home().join(format!("{sid}.sqlar")).exists() {
+            return None;
+        }
+        let tb = crate::capture::BoxState::create(sid).ok()?;
+        tb.load_mirror();
+        ov.add_box(std::sync::Arc::new(tb));
+    }
+    ov.box_of(sid)
+}
+
+/// Import `layer` as a FRESH at-rest box named `name` (no parent — a
+/// mirror snapshot is its own bottom) and append it to `b`'s RO
+/// attachments. Returns the new box id. The §8 serve path shared by the
+/// git/wiki/ietf attach verbs.
+fn attach_ro_layer(ov: &crate::overlay::Overlay,
+                   b: &std::sync::Arc<crate::capture::BoxState>,
+                   layer: &depot_model::Layer, name: &str)
+    -> Result<i64, String>
+{
+    // Same id rule as run: one past everything at rest or live.
+    let rest_max = std::fs::read_dir(crate::paths::state_home())
+        .map(|rd| rd.flatten()
+            .filter_map(|e| e.path().file_stem()?.to_str()?.parse::<i64>().ok())
+            .max().unwrap_or(0))
+        .unwrap_or(0);
+    let live_max = ov.box_ids().into_iter().max().unwrap_or(0);
+    let gid = rest_max.max(live_max) + 1;
+    let gb = crate::capture::BoxState::create(gid)
+        .map_err(|e| format!("sqlar: {e}"))?;
+    {
+        let conn = gb.conn.lock().unwrap();
+        crate::depot::import_layer(&conn, gid, layer)?;
+    }
+    gb.set_meta("name", name);
+    gb.load_mirror();
+    ov.add_box(std::sync::Arc::new(gb));
+    let mut ids = b.ro_attachments();
+    ids.push(gid);
+    b.set_ro_attachments(ids);
+    Ok(gid)
+}
+
+/// A layer of plain read-only text files under slash-separated `prefix`
+/// (`""` = box root) — the wiki/ietf attach shape.
+fn files_layer(prefix: &str, files: &[(String, Vec<u8>)]) -> depot_model::Layer {
+    let view = depot_model::View {
+        blob: None,
+        attrs: Default::default(),
+        children: files.iter().map(|(name, bytes)| {
+            (name.as_bytes().to_vec(), depot_model::View {
+                blob: Some(bytes.clone()),
+                attrs: depot_model::Attrs::from([
+                    (b"mode".to_vec(), b"100644".to_vec()),
+                ]),
+                children: Default::default(),
+            })
+        }).collect(),
+    };
+    // Reuse the git-view converter: same octal-mode dialect in, engine
+    // dialect out. Flat text files cannot fail it.
+    crate::depot::layer_from_git_view(&view, prefix)
+        .expect("flat files layer")
+}
+
+/// Open a wikimak instance READ-ONLY-ish (the read paths never write
+/// chains) with the same sizing defaults as the wikimak driver CLI.
+fn open_wiki_instance(root: &str)
+    -> Result<wikimak_wikipedia::Instance, String>
+{
+    wikimak_wikipedia::Instance::open(wikimak_wikipedia::InstanceConfig {
+        root: std::path::PathBuf::from(root),
+        dbname: "wiki".into(),
+        max_chain_id: 4_000_000,
+        depot: wikimak_depot::DepotConfig {
+            root: Default::default(), // forced to <root>/depot/
+            max_chain_id: 4_000_000,
+            file_size_threshold: 1 << 30,
+            eviction_dead_ratio: 0.5,
+        },
+        title_shard_count: 4,
+        title_seal_threshold_bytes: 8 << 20,
+        f1_seal_threshold_bytes: 0,
+    }).map_err(|e| e.to_string())
+}
+
 // ── svc: engine-spliced host↔box service streams ────────────────────────────
 // State is engine-global (one namespace of service names). Parked slots are
 // plain blocking UnixStreams; the splice is two copy threads per paired
@@ -3310,6 +3446,70 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                     0
                 }
                 other => report(other),
+            }
+        }
+        // sarun NAME attach git <store> <ref> [PREFIX]
+        //                  attach wiki <root> <page-id> [PREFIX]
+        //                  attach ietf <root> <draft> [PREFIX]
+        // Mirror→box serve path (MIRRORS.md phase 4): snapshot the mirror
+        // object into a fresh RO box and attach it to NAME.
+        Some("attach") => {
+            let (Some(kind), Some(src), Some(key)) =
+                (argv.get(2), argv.get(3), argv.get(4)) else {
+                eprintln!("usage: sarun NAME attach git|wiki|ietf <src> <ref|page|draft> [PREFIX]");
+                return 2;
+            };
+            let verb = match kind.as_str() {
+                "git" => "git_attach",
+                "wiki" => "wiki_attach",
+                "ietf" => "ietf_attach",
+                other => {
+                    eprintln!("sarun-engine: unknown attach kind {other:?} (git|wiki|ietf)");
+                    return 2;
+                }
+            };
+            // The engine resolves the source path from ITS cwd — send it
+            // absolute.
+            let src = std::fs::canonicalize(src)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| src.clone());
+            let sid = match one(json!({"type": "ui", "verb": "resolve_box",
+                                       "args": [name]})) {
+                // resolve_box replies with the id as a STRING (or null).
+                Ok(v) => match v.get("r").and_then(Value::as_str)
+                    .and_then(|s| s.parse::<i64>().ok()) {
+                    Some(id) => id,
+                    None => { eprintln!("sarun-engine: no box {name}"); return 1; }
+                },
+                Err(e) => { eprintln!("sarun-engine: {e}"); return 1; }
+            };
+            let key_v: Value = if verb == "wiki_attach" {
+                match key.parse::<u64>() {
+                    Ok(n) => json!(n),
+                    Err(_) => { eprintln!("sarun-engine: wiki page id must be a number"); return 2; }
+                }
+            } else {
+                json!(key)
+            };
+            let mut vargs = vec![json!(sid), json!(src), key_v];
+            if let Some(p) = argv.get(5) {
+                vargs.push(json!(p));
+            }
+            match one(json!({"type": "ui", "verb": verb, "args": vargs})) {
+                Ok(v) => {
+                    let r = v.get("r").cloned().unwrap_or(Value::Null);
+                    if r.get("ok").and_then(Value::as_bool) == Some(true) {
+                        println!("attached box {} to {name}",
+                            r.get("box").and_then(Value::as_i64).unwrap_or(-1));
+                        0
+                    } else {
+                        eprintln!("sarun-engine: {}",
+                            r.get("error").and_then(Value::as_str)
+                             .unwrap_or("attach failed"));
+                        1
+                    }
+                }
+                Err(e) => { eprintln!("sarun-engine: {e}"); 1 }
             }
         }
         Some("rename") => {

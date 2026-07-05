@@ -88,6 +88,7 @@ fn top_level_help() -> &'static str {
        sarun serve                        run the engine headless (no UI)\n  \
        sarun run [FLAGS] [NAME] -- CMD    run CMD in a sandbox box (needs a running engine/UI)\n  \
        sarun <NAME> [apply|discard|rename NEW|patch]   operate on a box from the CLI\n  \
+       sarun <NAME> attach git|wiki|ietf SRC REF [AT]  attach a mirror snapshot read-only\n  \
        sarun oci <load|run|build|save|dockerfile|author> ...   OCI images (`sarun oci -h`)\n  \
        sarun oaita <gen|run|call|tail|add|where> NAME          LLM chat/agent runner (`oaita -h`)\n  \
        sarun --once --sock PATH           render one UI frame and exit (headless)\n\

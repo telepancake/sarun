@@ -17,6 +17,12 @@ depot_model = { path = "../gimir/depot", package = "depot" }
 # gitdepot store + ref to a view and imports it as an at-rest RO box.
 # Only the chain reader is used in-engine (no `git` binary needed).
 gitdepot = { path = "../gimir/gitdepot" }
+# Mirror READ paths for wiki_attach / ietf_attach (no default `fetch`
+# feature — the engine never dials out; fetching stays in the wikimak /
+# ietfmak drivers).
+ietf_mirror = { path = "../gimir/ietf-mirror", package = "ietf-mirror", default-features = false }
+wikimak_wikipedia = { path = "../gimir/wikimak/wikipedia", package = "wikimak-wikipedia", default-features = false }
+wikimak_depot = { path = "../gimir/wikimak/depot", package = "wikimak-depot" }
 base64 = "0.22.1"
 bytes = "1.10"
 brush-core = "0.5"

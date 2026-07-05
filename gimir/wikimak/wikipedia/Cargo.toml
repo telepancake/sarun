@@ -11,7 +11,7 @@ publish = false
 # record. `experimental` exposes ZSTD_CCtx_refPrefix.
 zstd = { workspace = true, features = ["experimental"] }
 wikimak-depot.workspace = true
-wikimak-mediawiki.workspace = true
+wikimak-mediawiki = { workspace = true, default-features = false }
 strpool.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
@@ -21,9 +21,13 @@ serde_json.workspace = true
 sha1.workspace = true
 hex.workspace = true
 # `sync` (discover → fetch → import) drives wikimak_mediawiki's HTTP
-# surface, so the blocking client is a real dependency now, not just the
-# livewiki test's.
-reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+# surface. Optional behind `fetch` (default ON) so read-only embedders
+# (the sarun engine's wiki_attach) don't carry an HTTP stack.
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"], optional = true }
+
+[features]
+default = ["fetch"]
+fetch = ["dep:reqwest", "wikimak-mediawiki/fetch"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -45,3 +49,4 @@ manual_repeat_n = "allow"
 [[bin]]
 name = "wikimak"
 path = "src/bin/wikimak.rs"
+required-features = ["fetch"]

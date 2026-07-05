@@ -48,10 +48,16 @@ each corpus's shape wants, served through sarun. Three mirrors first:
    proves read-through, EROFS, and DAG visibility. Remaining: serve via
    depot-cache materialization instead of sqlar import (an
    optimization, not a semantic change).
-4. **Serve/browse**: `git_attach` (above) is the first serve path — a
-   mirror snapshot in a running box's view. Wikipedia browsing plan
-   (docs/wikipedia-browsing-plan.md) + list-widget DAG navigation
-   already landed; wiki/draft attach verbs and a pane per mirror later.
+4. **Serve/browse**: all three attach verbs live — `git_attach`,
+   `wiki_attach` (a page's head text), `ietf_attach` (a draft's full
+   revision series) — one CLI surface: `sarun NAME attach git|wiki|ietf
+   SRC REF [AT]`. Each snapshots the mirror object into a fresh RO box
+   named for it (`git:main@sha8`, `wiki:1@r100`,
+   `ietf:draft-x@01`), visible and navigable in the sessions DAG. The
+   mirror crates' read paths are feature-gated (`fetch` off in-engine):
+   the engine never dials out; fetching stays in wikimak/ietfmak/
+   gitdepot. `test_mirror_attach_rs.py` proves all three through the
+   real CLI. Later: browse panes per mirror, depot-cache serving.
 
 ## Non-goals for now
 
