@@ -28,6 +28,20 @@ writer. The single-owner rule:
 > what to fetch next, which series, how to parse upstream, cooldown
 > policy. That's the code that churns; it never touches a depot page.
 
+CORRECTED (2026-07-05, see ATTACH-CONVERGENCE.md "North star"): the
+"one place" is THE DEPOT — not each mirror crate's private store.
+Per-mirror ingest verbs (`wikimak ingest --stdin`) were still the
+crow's-nest layering: three app crates owning three formats built on
+depot internals. The engine exposes the depot API itself (chains,
+append, head/history, readout, attach) as verbs; missing capabilities
+get added to the depot, not built beside it; mirror crates stop
+owning bytes-at-rest. The scripting story is unchanged in spirit and
+simpler in practice: business logic (keys, revision identity,
+encode/decode policy, display) in Python against a stable algebra-
+shaped API — out-of-process first, embedded rustpython as a later
+optimization, since the binding surface no longer depends on any
+mirror's format.
+
 ## Track A (recommended, near-term): Python drivers out-of-process
 
 1. **Generic job kind `cmd`** — DONE alongside this doc. A job whose

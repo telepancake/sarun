@@ -61,3 +61,38 @@ copy   = never (import_layer path deleted from attach verbs)
 Consistency note: no sub-box/apply-on-complete dance is needed —
 attach reads an already-consistent pinned rev; store-side flock +
 dirty-flag repair own write-time consistency (MIRRORS.md).
+
+## North star (2026-07-05, supersedes PLUGINS.md Track A's framing)
+
+The readout/attach chips above are substrate, not the end state. The
+end state inverts the current layering:
+
+- **The depot is the only store.** VBF/cold chains become a real depot
+  variant behind the gimir/depot traits (§7 already names them as
+  one). Where the depot interface lacks what chains need — named
+  multi-chain addressing, append-to-chain, history enumeration,
+  sealing, per-chain dicts — the features are ADDED TO THE DEPOT,
+  not built beside it. wikimak/depot, depot-vbf, and gitdepot's
+  chain.rs converge into (or behind) that variant; the app crates
+  stop owning bytes-at-rest entirely.
+- **The engine exposes the depot as API.** UDS verbs for the full
+  surface: open a depot root, append a layer to a named chain, read
+  head/rev/history, readout, attach-by-reference. High-performance
+  codecs (zstd, bz2, XML dump scanning) are engine-side services —
+  e.g. a dump-scan verb that streams parsed revisions — because raw
+  throughput is the engine's job.
+- **Mirror logic is business logic in a script.** Which dumps, which
+  pages, key naming, revision identity, encode/decode policy, display
+  — a Python module speaking those verbs (out-of-process over the
+  UDS today; embedded rustpython later becomes an optimization, not
+  an architecture change, precisely because the binding surface is
+  the depot algebra and stays stable). wikimak/wikipedia,
+  ietf-mirror, gitdepot's fetch half are progressively rewritten as
+  such scripts; what remains Rust in them is only what earns it on
+  throughput, exposed as engine services.
+
+Revised order: chips 1–6 above (readout + reference attach — needed
+under any layering), then: (7) chain features promoted into the depot
+trait surface + VBF variant behind it, (8) depot verbs on the UDS,
+(9) first script-driven mirror (ietf is smallest) proving the loop,
+(10) wikipedia logic migrated, dump-scan as an engine service.
