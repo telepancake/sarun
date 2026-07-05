@@ -305,6 +305,16 @@ enum Pane {
     Pty,
 }
 
+/// Top-level SCREENS the F2/F3 keys cycle through. A screen is a whole-body
+/// surface: every two-pane data view together is ONE screen (Main), the
+/// full-screen terminal (a non-browser PTY) is another, the browser (a
+/// carbonyl PTY) a third. F4/F5 cycle the individual WINDOWS inside the
+/// current screen — the data panes on Main, the PTYs of the matching kind
+/// on Terminal/Browser. Terminal/Browser only enter the rotation while a
+/// PTY of that kind is open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Screen { Main, Terminal, Browser }
+
 /// A transient modal overlaid on the main view. Mirrors the Python Textual
 /// modals: Confirm (y/n destructive), SearchModal (substring filter of the
 /// active pane), RuleFormModal (add/edit a filerules line).
@@ -819,7 +829,7 @@ struct App {
     /// separate state — F11 from there shrinks the PTY into the
     /// previous view's right column instead of toggling.
     /// All currently-open engine-held PTYs. Pane::Pty renders the
-    /// full-screen view of `ptys[sel_pty]`; F2/F3 cycle between them,
+    /// full-screen view of `ptys[sel_pty]`; F4/F5 cycle between them,
     /// F7 creates a new one, F8 kills the current one. EOF'd PTYs
     /// are dropped when the user moves off of them, so re-opening
     /// the pane lands on a running shell, not a corpse.
@@ -938,6 +948,14 @@ struct App {
     /// replaced with a YELLOW banner asking the user for a verdict;
     /// y/n/a/d send the answer via `prompts.answer`.
     pending_prompt: Option<Value>,
+    /// The data pane the Main screen returns to when F2/F3 cycles back to
+    /// it — the last non-full-screen pane the user was on.
+    last_main_pane: Pane,
+    /// Remembered `sel_pty` per PTY-hosting screen, so cycling back to the
+    /// Terminal (resp. Browser) screen lands on the PTY the user last used
+    /// there rather than whichever one happens to be selected.
+    last_term_pty: usize,
+    last_browser_pty: usize,
 }
 
 /// Cap on the transcript window: chars rendered in one frame, centred on
@@ -1021,6 +1039,9 @@ impl App {
             packet_detail: String::new(), packet_detail_frame: 0,
             packets_stream: -1,
             pending_prompt: None,
+            last_main_pane: Pane::Sessions,
+            last_term_pty: 0,
+            last_browser_pty: 0,
         };
         a.refresh_sessions();
         a.load_changes();
@@ -3611,16 +3632,119 @@ impl App {
         self.ptys.get_mut(self.sel_pty)
     }
 
-    /// Cycle to the next / previous PTY (wrapping).
-    #[cfg_attr(test, allow(dead_code))]
-    fn pty_next(&mut self) {
-        if self.ptys.is_empty() { return; }
-        self.sel_pty = (self.sel_pty + 1) % self.ptys.len();
+    // ── screens (F2/F3) and windows-within-a-screen (F4/F5) ─────────────────
+
+    /// Which SCREEN the app is currently showing (see `enum Screen`).
+    fn current_screen(&self) -> Screen {
+        match self.focus {
+            Pane::Pty => {
+                if self.cur_pty().map(|p| p.browser).unwrap_or(false) {
+                    Screen::Browser
+                } else {
+                    Screen::Terminal
+                }
+            }
+            _ => Screen::Main,
+        }
     }
+
+    /// The screens currently in the F2/F3 rotation: Main always; Terminal /
+    /// Browser only while a PTY of that kind is open.
+    fn screens_available(&self) -> Vec<Screen> {
+        let mut v = vec![Screen::Main];
+        if self.ptys.iter().any(|p| !p.browser) { v.push(Screen::Terminal); }
+        if self.ptys.iter().any(|p| p.browser) { v.push(Screen::Browser); }
+        v
+    }
+
+    /// F2 (dir=+1) / F3 (dir=-1): cycle to the next / previous screen,
+    /// wrapping, skipping screens with nothing to show.
     #[cfg_attr(test, allow(dead_code))]
-    fn pty_prev(&mut self) {
-        if self.ptys.is_empty() { return; }
-        self.sel_pty = (self.sel_pty + self.ptys.len() - 1) % self.ptys.len();
+    fn cycle_screen(&mut self, dir: isize) {
+        let avail = self.screens_available();
+        if avail.len() < 2 {
+            self.status =
+                "one screen open — F7 opens a terminal, browser via 'm' on a box".into();
+            return;
+        }
+        let cur = self.current_screen();
+        let i = avail.iter().position(|s| *s == cur).unwrap_or(0) as isize;
+        let n = avail.len() as isize;
+        let next = avail[((i + dir).rem_euclid(n)) as usize];
+        self.switch_screen(next);
+    }
+
+    /// Land on a screen: Main restores the last data pane; Terminal /
+    /// Browser focus the last-used PTY of that kind (falling back to the
+    /// first one).
+    fn switch_screen(&mut self, s: Screen) {
+        match s {
+            Screen::Main => {
+                self.focus = self.last_main_pane;
+                self.snap_left();
+                self.status = "screen: main".into();
+            }
+            Screen::Terminal | Screen::Browser => {
+                let want = s == Screen::Browser;
+                let remembered = if want { self.last_browser_pty } else { self.last_term_pty };
+                let pick = if self.ptys.get(remembered)
+                    .map(|p| p.browser == want).unwrap_or(false)
+                {
+                    Some(remembered)
+                } else {
+                    self.ptys.iter().position(|p| p.browser == want)
+                };
+                if let Some(i) = pick {
+                    self.sel_pty = i;
+                    self.focus = Pane::Pty;
+                    self.status = format!(
+                        "screen: {} · F4/F5 cycle its windows · F2/F3 screens",
+                        if want { "browser" } else { "terminal" });
+                }
+            }
+        }
+    }
+
+    /// F4 (dir=+1) / F5 (dir=-1): cycle the individual WINDOWS inside the
+    /// current screen — the data panes on Main (the same set as the menubar
+    /// chips), the matching-kind PTYs on Terminal / Browser.
+    #[cfg_attr(test, allow(dead_code))]
+    fn cycle_window(&mut self, dir: isize) {
+        match self.current_screen() {
+            Screen::Main => {
+                // The window set is the visible menubar chips minus the PTY
+                // chip (that one jumps screens, not windows).
+                let chips: Vec<char> = menubar_chips(self).into_iter()
+                    .map(|(c, _)| c).filter(|c| *c != 'P').collect();
+                if chips.is_empty() { return; }
+                let cur = view_of_pane(self.focus).map(|(k, _, _)| k);
+                let i = cur.and_then(|k| chips.iter().position(|c| *c == k))
+                    .unwrap_or(0) as isize;
+                let n = chips.len() as isize;
+                let next = chips[((i + dir).rem_euclid(n)) as usize];
+                if let Some((_, pane, _, _, _)) =
+                    PANE_KEYS.iter().find(|e| e.0 == next)
+                {
+                    self.go_to_pane(*pane);
+                }
+            }
+            Screen::Terminal => self.pty_cycle_kind(dir, false),
+            Screen::Browser => self.pty_cycle_kind(dir, true),
+        }
+    }
+
+    /// Cycle `sel_pty` among the PTYs of one kind (browser or not), wrapping.
+    fn pty_cycle_kind(&mut self, dir: isize, browser: bool) {
+        let idxs: Vec<usize> = self.ptys.iter().enumerate()
+            .filter(|(_, p)| p.browser == browser)
+            .map(|(i, _)| i).collect();
+        if idxs.is_empty() { return; }
+        let pos = idxs.iter().position(|&i| i == self.sel_pty).unwrap_or(0) as isize;
+        let n = idxs.len() as isize;
+        self.sel_pty = idxs[((pos + dir).rem_euclid(n)) as usize];
+        self.status = format!("window {}/{} of the {} screen",
+            ((pos + dir).rem_euclid(n)) + 1, n,
+            if browser { "browser" } else { "terminal" });
     }
     /// Kill the current PTY (drop the connection — engine SIGHUPs the
     /// child). Selector slides to the next PTY; focus snaps back to
@@ -3672,7 +3796,7 @@ impl App {
                 self.sel_pty = self.ptys.len() - 1;
                 self.focus = Pane::Pty;
                 self.status = format!(
-                    "PTY {}/{} · F2/F3 cycle · F8 kill · F12 detach",
+                    "PTY {}/{} · F4/F5 cycle · F2/F3 screens · F8 kill · F12 detach",
                     self.sel_pty + 1, self.ptys.len());
             }
             Err(e) => self.status = format!("pty: {e}"),
@@ -6744,7 +6868,7 @@ fn cmdline_spans(app: &App) -> Vec<Span<'static>> {
         }
     }
     vec![prompt,
-         Span::styled("(idle — '/' filter · F4 / m row actions · F-keys below)",
+         Span::styled("(idle — '/' filter · 'm' row actions · F2-F5 screens/windows)",
              Style::default().add_modifier(Modifier::DIM))]
 }
 
@@ -6783,42 +6907,39 @@ fn fkey_labels(app: &App) -> [&'static str; 11] {
     let sessions = app.focus == Pane::Sessions;
     let changes  = app.focus == Pane::Changes;
     let any_pty  = !app.ptys.is_empty();
-    // Whether THIS pane has a context-menu popup ('m' / F4 opens
-    // pane_action_menu) — so the F4 label reads "Actions" when it's
-    // available and dims to "·" when it isn't.
-    let has_menu = matches!(app.focus,
-        Pane::Sessions | Pane::Changes | Pane::Hunks
-        | Pane::Rules | Pane::Pty | Pane::ApiLogs);
-    let mut f: [&'static str; 11] = [
+    [
         "Help",     // F1   — always
-        if pty_pane { "PtyNext" } else { "Pty+" },  // F2
-        if pty_pane { "PtyPrev" } else { "Tab" },   // F3
-        if has_menu { "Actions" } else { "·" }, // F4 — context popup
-        if hunks || changes { "Apply" } else { "·" },  // F5
+        // F2/F3 cycle SCREENS (main two-pane view / terminal / browser),
+        // F4/F5 cycle the WINDOWS within the current screen: the data
+        // panes on Main, the PTYs of the screen's kind on Terminal /
+        // Browser.
+        "Scrn+",    // F2
+        "Scrn-",    // F3
+        if pty_pane { "PtyNext" } else { "Win+" }, // F4
+        if pty_pane { "PtyPrev" } else { "Win-" }, // F5
         if sessions { "Rename" } else { "·" }, // F6
         if pty_pane { "PtyNew" }
         else if sessions { "Image+" }
         else if rules { "NewRule" }
-        else { "·" }, // F7
+        else { "Pty+" }, // F7 — the launcher everywhere else
         if pty_pane { "PtyKill" }
         else if hunks || changes { "Discard" }
         else if rules { "DelRule" }
         else if sessions { "Delete" }   // box: dissolve (keep children)
         else { "·" }, // F8
-        "Menu",     // F9 (menubar nav)
+        // F9: menubar nav on data panes; the row-actions popup on the
+        // full-screen PTY (where 'm' would go to the shell).
+        if pty_pane { "Actions" } else { "Menu" },
         "Quit",     // F10  — always
         // F11: split/un-split. The label flips with `pty_in_right`
         // so the user can read what F11 will DO next. With no PTY there
-        // is nothing to split — dim it (F2 is THE create-a-PTY key;
+        // is nothing to split — dim it (F7 is THE create-a-PTY key;
         // don't show the same button twice).
         if pty_pane { "Embed" }
         else if !any_pty { "·" }
         else if app.pty_in_right { "Solo" }
         else { "Split" },
-    ];
-    // PTY full-screen has no menubar-nav meaning for F9.
-    if pty_pane { f[8] = "·"; }
-    f
+    ]
 }
 
 /// Render a clause list as a one-line expression (kind:pattern, joined by
@@ -6894,7 +7015,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 Span::styled(tag, Style::default().fg(Color::Yellow)
                                                    .add_modifier(Modifier::BOLD)),
                 Span::raw("   "),
-                Span::styled("F2/F3 cycle · F7 new · F8 kill · F12 detach",
+                Span::styled("F4/F5 cycle · F2/F3 screens · F7 new · F8 kill · F12 detach",
                     Style::default().add_modifier(Modifier::DIM)),
             ]));
             f.render_widget(title_bar, split[0]);
@@ -6964,7 +7085,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         Style::default().fg(if rf { Color::Yellow } else { Color::DarkGray })
                             .add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
-                    Span::styled("F11 full-screen · F8 kill · F2/F3 cycle",
+                    Span::styled("F11 full-screen · F8 kill · F4/F5 cycle",
                         Style::default().add_modifier(Modifier::DIM)),
                 ]));
                 f.render_widget(title_bar, split[0]);
@@ -8318,13 +8439,13 @@ fn endpoint_note_lines(resolved: Option<(String, String)>) -> Vec<String> {
         None => vec![
             "(no endpoint configured — nothing to log yet)".to_string(),
             String::new(),
-            "F4 → \"Configure an external API\" edits base_url / model / key \
+            "'m' → \"Configure an external API\" edits base_url / model / key \
              (with a".to_string(),
             "connection test) and writes oaita.toml — the in-UI way to point \
              at any".to_string(),
             "OpenAI-compatible server.".to_string(),
             String::new(),
-            "F4 → \"Pick a local model\" instead downloads a model in a box and \
+            "'m' → \"Pick a local model\" instead downloads a model in a box and \
              serves".to_string(),
             "it on demand — no external endpoint or key needed. Opens \
              automatically the".to_string(),
@@ -8765,6 +8886,11 @@ struct PtyPane {
     rows: u16,
     cols: u16,
     eof: bool,
+    /// True when this PTY hosts the carbonyl browser — it then lives on the
+    /// Browser SCREEN of the F2/F3 rotation, not the Terminal one. Detected
+    /// from the argv at open time (build_launch's Browser target always puts
+    /// the carbonyl binary in the container command).
+    browser: bool,
 }
 
 enum PtyMsg {
@@ -8857,7 +8983,10 @@ impl PtyPane {
             std::sync::Arc::new(PtyTermConfig),
             "sarun", env!("CARGO_PKG_VERSION"),
             response_writer);
-        Ok(PtyPane { terminal: term, writer, rx, rows, cols, eof: false })
+        // Browser detection: the carbonyl launch always carries the in-
+        // container binary path in its argv (see LaunchTarget::Browser).
+        let browser = argv.iter().any(|a| a == "/carbonyl/carbonyl");
+        Ok(PtyPane { terminal: term, writer, rx, rows, cols, eof: false, browser })
     }
 
     /// Drain any pending PTY output into the wezterm-term emulator.
@@ -9209,18 +9338,18 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                 .unwrap_or("").to_string();
             Some((title("Change", &path), vec![
                 mk("Open diff",          "Enter",  Action::OpenSelection),
-                mk("Apply this file",    "a/F5",   Action::ApplyFile),
+                mk("Apply this file",    "a",      Action::ApplyFile),
                 mk("Discard this file",  "x/F8",   Action::DiscardFile),
             ]))
         }
         Pane::Hunks => Some(("Hunk (selected)".into(), vec![
-            mk("Apply this hunk",    "a/F5",   Action::ApplyHunk),
+            mk("Apply this hunk",    "a",      Action::ApplyHunk),
             mk("Discard this hunk",  "x/F8",   Action::DiscardHunk),
         ])),
         Pane::Rules => {
             let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
             Some((title("Rule", &cur), vec![
-                mk("Edit rule",   "F4",   Action::EditRule),
+                mk("Edit rule",   "Enter", Action::EditRule),
                 mk("New rule",    "n/F7", Action::NewRule),
                 mk("Delete rule", "d/F8", Action::DeleteRule),
                 mk("Move up",     "Ctrl-↑", Action::MoveRuleUp),
@@ -9361,7 +9490,7 @@ fn run_action(app: &mut App, a: Action) {
         Action::PtyKill        => app.pty_kill(),
         Action::PtyEmbedToggle => {
             if app.ptys.is_empty() {
-                app.status = "no PTY to split — F2 opens one".into();
+                app.status = "no PTY to split — F7 opens one".into();
             } else {
                 app.pty_in_right = !app.pty_in_right;
                 app.right_focused = app.pty_in_right;
@@ -9950,6 +10079,20 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
+                // Track each screen's "last window" so the F2/F3 screen
+                // cycle can return to it: the last data pane for Main, the
+                // last-selected PTY of each kind for Terminal / Browser.
+                match app.focus {
+                    Pane::Pty => {
+                        if app.cur_pty().map(|p| p.browser).unwrap_or(false) {
+                            app.last_browser_pty = app.sel_pty;
+                        } else {
+                            app.last_term_pty = app.sel_pty;
+                        }
+                    }
+                    Pane::Help => {}
+                    other => app.last_main_pane = other,
+                }
                 // modal captures keys (Confirm / Search / RuleForm).
                 if app.modal.is_some() {
                     handle_modal_key(&mut app, k.code, k.modifiers);
@@ -10054,13 +10197,16 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // into a corpse — that's how the user got stuck last time).
                     let dead = app.cur_pty().map(|p| p.eof).unwrap_or(true);
                     // F-key bindings local to the PTY pane (the F-keybar
-                    // shows the same set in its bottom strip — F1/F2/F3/F7/F8
-                    // for help / next-pty / prev-pty / new-pty / kill-pty,
-                    // F12 for detach. Norton-style: stable mapping, the
-                    // labels in the bar tell you what each does here).
-                    if matches!(k.code, KeyCode::F(2)) { app.pty_next(); continue; }
-                    if matches!(k.code, KeyCode::F(3)) { app.pty_prev(); continue; }
-                    if matches!(k.code, KeyCode::F(4)) {
+                    // shows the same set in its bottom strip — F1 help,
+                    // F2/F3 screen cycle, F4/F5 next/prev PTY of this
+                    // screen's kind, F7 new, F8 kill, F9 actions, F12
+                    // detach. Norton-style: stable mapping, the labels in
+                    // the bar tell you what each does here).
+                    if matches!(k.code, KeyCode::F(2)) { app.cycle_screen(1); continue; }
+                    if matches!(k.code, KeyCode::F(3)) { app.cycle_screen(-1); continue; }
+                    if matches!(k.code, KeyCode::F(4)) { app.cycle_window(1); continue; }
+                    if matches!(k.code, KeyCode::F(5)) { app.cycle_window(-1); continue; }
+                    if matches!(k.code, KeyCode::F(9)) {
                         // Context-menu popup inside the PTY pane (PTY-
                         // specific actions: new, kill, embed). Same
                         // entrypoint as 'm' in any other pane.
@@ -10157,26 +10303,28 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 use crossterm::event::KeyModifiers as KM;
                 let ctrl = k.modifiers.contains(KM::CONTROL);
                 // F-key bar bindings, global outside the PTY pane.
-                // (PTY pane handles its own F2/F3/F7/F8/F12 before
+                // (PTY pane handles its own F2..F5/F7/F8/F9/F12 before
                 // we get here.) Mapping mirrors fkey_labels() above:
-                //   F1  Help · F2 new PTY · F3 Tab (next pane within
-                //   view) · F4 edit (rules / rename box) · F5 apply
-                //   · F6 rename (boxes) · F7 new rule (when on Rules)
+                //   F1  Help · F2/F3 cycle SCREENS (main two-pane view /
+                //   terminal / browser) · F4/F5 cycle the WINDOWS within
+                //   the current screen (the data panes here on Main)
+                //   · F6 rename (boxes) · F7 new rule (Rules) / new image
+                //   box (Boxes) / new PTY elsewhere
                 //   · F8 discard (Changes/Hunks) / del rule (Rules)
-                //   · F9 menu (TBD)             · F10 quit
+                //   · F9 menu-nav               · F10 quit
                 if let KeyCode::F(n) = k.code {
                     match n {
                         1 => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
-                        2 => { open_pty_menu(&mut app); }
-                        3 => { app.next_pane(); }
+                        2 => { app.cycle_screen(1); }
+                        3 => { app.cycle_screen(-1); }
                         11 => {
                             // Embed the active PTY into the focused view's
                             // RIGHT column (or un-embed). With no PTY there
-                            // is nothing to split — point at F2 instead of
+                            // is nothing to split — point at F7 instead of
                             // duplicating it (the fkeybar dims F11 too).
                             if app.ptys.is_empty() {
                                 app.status =
-                                    "no PTY to split — F2 opens one".into();
+                                    "no PTY to split — F7 opens one".into();
                             } else {
                                 app.pty_in_right = !app.pty_in_right;
                                 // Right-focus follows the embedded PTY so
@@ -10185,25 +10333,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                                 app.right_scroll = 0;
                             }
                         }
-                        4 => {
-                            // F4 = "Actions" — open the per-row context
-                            // popup (same as the 'm' shortcut, but now
-                            // visible in the always-on F-keybar). The
-                            // popup itself lists Edit / Rename / etc.
-                            // with their underlying global keys, so the
-                            // muscle memory transfer is straightforward.
-                            if let Some((title, items)) = pane_action_menu(&app) {
-                                app.modal = Some(Modal::ActionMenu {
-                                    title, items, sel: 0,
-                                });
-                            } else {
-                                app.status = "no actions for this row yet".into();
-                            }
-                        }
-                        5 => {
-                            if app.focus == Pane::Hunks { app.apply_hunk(); }
-                            else if app.focus == Pane::Changes { app.apply(); }
-                        }
+                        4 => { app.cycle_window(1); }
+                        5 => { app.cycle_window(-1); }
                         6 => {
                             if app.focus == Pane::Sessions {
                                 app.renaming = Some(String::new());
@@ -10216,6 +10347,10 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             } else if app.focus == Pane::Sessions {
                                 // "Image+" — new box from a container image.
                                 app.open_image_picker();
+                            } else {
+                                // Everywhere else: the Pty+ launcher (the
+                                // old F2 binding — F2 now cycles screens).
+                                open_pty_menu(&mut app);
                             }
                         }
                         8 => {
@@ -11614,6 +11749,9 @@ mod tests {
             packet_detail: String::new(), packet_detail_frame: 0,
             packets_stream: -1,
             pending_prompt: None,
+            last_main_pane: Pane::Sessions,
+            last_term_pty: 0,
+            last_browser_pty: 0,
         }
     }
 
