@@ -112,28 +112,32 @@ fn undelimit(buf: &[u8], out: &mut Vec<Vec<u8>>) -> Result<(), Error> {
     Ok(())
 }
 
-pub struct VbfStore {
+/// A MULTI-chain VBF layer depot: many independent newest-first layer
+/// sequences (one per `chain_id`) sharing one tiered-VBF store. The
+/// mirror crates use this — one chain per page/draft/ref — with their
+/// inventory (name → chain_id) in their own sqlite, per the
+/// bookkeeping fence (DEPOT-DESIGN.md §3).
+pub struct VbfDepot {
     depot: Depot,
-    chain_id: u64,
     /// Decompressed-accumulator seal threshold (bytes).
     seal_threshold: u64,
 }
 
-impl VbfStore {
-    /// Open (or create) the chain store under `root`, storing the layer
-    /// sequence on `chain_id`.
-    pub fn open(root: PathBuf, chain_id: u64, seal_threshold: u64) -> Result<Self, Error> {
+impl VbfDepot {
+    /// Open (or create) the store under `root` with chain ids in
+    /// `0..max_chain_id`.
+    pub fn open(root: PathBuf, max_chain_id: u64, seal_threshold: u64) -> Result<Self, Error> {
         // File rolls scale with the seal threshold so eviction (which
         // only ever targets non-current files) can actually reclaim the
         // orphaned f0/f1 frames each append leaves behind; a giant
         // threshold would pin every orphan inside the one write target.
         let depot = Depot::open(DepotConfig {
             root,
-            max_chain_id: chain_id + 1,
+            max_chain_id,
             file_size_threshold: (seal_threshold * 4).max(1 << 20),
             eviction_dead_ratio: 0.5,
         })?;
-        Ok(VbfStore { depot, chain_id, seal_threshold })
+        Ok(VbfDepot { depot, seal_threshold })
     }
 
     pub fn flush(&self) -> Result<(), Error> {
@@ -147,21 +151,22 @@ impl VbfStore {
         Ok(())
     }
 
-    /// Every layer, newest-first (owned; the chain is walked eagerly).
-    pub fn layers_newest_first(&self) -> Result<Vec<Layer>, Error> {
+    /// Every layer on `chain_id`, newest-first (owned; the chain is
+    /// walked eagerly).
+    pub fn layers_newest_first(&self, chain_id: u64) -> Result<Vec<Layer>, Error> {
         let mut records: Vec<Vec<u8>> = Vec::new();
-        match self.depot.read_f0(self.chain_id) {
+        match self.depot.read_f0(chain_id) {
             Ok(frame) => records.push(decompress(&frame, None)?),
             Err(wikimak_depot::Error::NoFrame) => return Ok(vec![]),
             Err(e) => return Err(e.into()),
         }
-        if let Some(f1) = self.depot.read_f1(self.chain_id)? {
+        if let Some(f1) = self.depot.read_f1(chain_id)? {
             let anchor = records[0].clone();
             let mut raw_records = Vec::new();
             undelimit(&decompress(&f1, Some(&anchor))?, &mut raw_records)?;
             records.extend(raw_records);
         }
-        for cold in self.depot.cold_iter(self.chain_id)? {
+        for cold in self.depot.cold_iter(chain_id)? {
             let frame = cold?;
             let anchor = records.last().expect("cold after f1").clone();
             let mut raw_records = Vec::new();
@@ -170,25 +175,32 @@ impl VbfStore {
         }
         records.iter().map(|r| Ok(codec::decode(r)?)).collect()
     }
-}
 
-impl LayerSink for VbfStore {
-    type Err = Error;
+    /// The newest layer on `chain_id` alone (one small standalone
+    /// decode — the VBF hot path), or `None` for an empty chain.
+    pub fn head_layer(&self, chain_id: u64) -> Result<Option<Layer>, Error> {
+        match self.depot.read_f0(chain_id) {
+            Ok(frame) => Ok(Some(codec::decode(&decompress(&frame, None)?)?)),
+            Err(wikimak_depot::Error::NoFrame) => Ok(None),
+            Err(wikimak_depot::Error::ChainIdOutOfRange) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 
-    /// The layer becomes the chain's NEW NEWEST version.
-    fn put_layer(&mut self, layer: &Layer) -> Result<(), Error> {
+    /// The layer becomes chain `chain_id`'s NEW NEWEST version.
+    pub fn put_layer(&mut self, chain_id: u64, layer: &Layer) -> Result<(), Error> {
         let record = codec::encode(layer);
         let new_f0 = compress(&record, None)?;
-        let prev_f0 = match self.depot.read_f0(self.chain_id) {
+        let prev_f0 = match self.depot.read_f0(chain_id) {
             Ok(b) => Some(b),
             Err(wikimak_depot::Error::NoFrame) => None,
             Err(e) => return Err(e.into()),
         };
         match prev_f0 {
-            None => self.depot.append(self.chain_id, &new_f0, None, false)?,
+            None => self.depot.append(chain_id, &new_f0, None, false)?,
             Some(prev_frame) => {
                 let prev_record = decompress(&prev_frame, None)?;
-                let old_f1_raw = match self.depot.read_f1(self.chain_id)? {
+                let old_f1_raw = match self.depot.read_f1(chain_id)? {
                     Some(f) => decompress(&f, Some(&prev_record))?,
                     None => Vec::new(),
                 };
@@ -202,10 +214,47 @@ impl LayerSink for VbfStore {
                     raw.extend_from_slice(&old_f1_raw);
                     compress(&raw, Some(&record))?
                 };
-                self.depot.append(self.chain_id, &new_f0, Some(&new_f1), seal)?;
+                self.depot.append(chain_id, &new_f0, Some(&new_f1), seal)?;
             }
         }
         Ok(())
+    }
+}
+
+/// Single-chain convenience wrapper over [`VbfDepot`] — the original
+/// `VbfStore` surface, kept for the transfer/`LayerSink` tests and
+/// single-sequence callers.
+pub struct VbfStore {
+    inner: VbfDepot,
+    chain_id: u64,
+}
+
+impl VbfStore {
+    /// Open (or create) the chain store under `root`, storing the layer
+    /// sequence on `chain_id`.
+    pub fn open(root: PathBuf, chain_id: u64, seal_threshold: u64) -> Result<Self, Error> {
+        Ok(VbfStore {
+            inner: VbfDepot::open(root, chain_id + 1, seal_threshold)?,
+            chain_id,
+        })
+    }
+
+    pub fn flush(&self) -> Result<(), Error> {
+        self.inner.flush()
+    }
+
+    /// Every layer, newest-first (owned; the chain is walked eagerly).
+    pub fn layers_newest_first(&self) -> Result<Vec<Layer>, Error> {
+        self.inner.layers_newest_first(self.chain_id)
+    }
+}
+
+impl LayerSink for VbfStore {
+    type Err = Error;
+
+    /// The layer becomes the chain's NEW NEWEST version.
+    fn put_layer(&mut self, layer: &Layer) -> Result<(), Error> {
+        self.inner.put_layer(self.chain_id, layer)
     }
 }
 

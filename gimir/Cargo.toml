@@ -6,6 +6,7 @@ members = [
     "depot-cache",
     "depot-vbf",
     "gitdepot",
+    "ietf-mirror",
     "strpool",
     "wikimak/depot",
     "wikimak/mediawiki",

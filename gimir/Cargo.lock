@@ -1107,6 +1107,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ietf-mirror"
+version = "0.0.0"
+dependencies = [
+ "depot",
+ "depot-vbf",
+ "httpmock",
+ "reqwest",
+ "rusqlite",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

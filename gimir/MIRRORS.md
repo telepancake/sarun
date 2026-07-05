@@ -6,8 +6,8 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 
 | mirror | shape | store | state |
 |---|---|---|---|
-| **wikipedia** | ~99%-identical revision chains per page | `wikimak/*` (depot chains, un-sabotaged 2026-07, 12× measured) | pipeline built: discover → fetch → bz2 → parse → import; NO driver CLI yet |
-| **IETF drafts** | revision chains per draft name (`draft-x-00..-NN`) — the tiered-VBF doc's other named workload | `depot-vbf` chains (canonical layers) + sqlite bookkeeping | not started |
+| **wikipedia** | ~99%-identical revision chains per page | `wikimak/*` (depot chains, un-sabotaged 2026-07, 12× measured) | `wikimak` CLI: import/head/text/history + discover/fetch sync with `parts_seen` watermarks |
+| **IETF drafts** | revision chains per draft name (`draft-x-00..-NN`) — the tiered-VBF doc's other named workload | multi-chain `depot-vbf::VbfDepot` (canonical layers) + sqlite bookkeeping | `ietf-mirror` crate + `ietfmak` CLI: update (idempotent, incremental, 404-watermarked) / list / head / text / history |
 | **git repos** | DAG of tree snapshots, newest-first | `gitdepot` (view-anchored chains; SHA-exact export) | import/export works; no incremental update, no fetch loop |
 
 ## Common architecture (per DEPOT-DESIGN)
@@ -26,13 +26,13 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 
 ## Phases
 
-1. **wikipedia driver** (`wikimak` CLI): `import <dump(.bz2|.xml)> <root>`,
-   `head/history/text <root> <title>` — makes the existing pipeline
-   usable end to end on real dumps. Then `discover`/`fetch` wiring for
-   dumps.wikimedia.org.
-2. **IETF drafts** (`ietf-mirror` crate): datatracker/rsync listing →
-   per-draft chains of canonical layers in depot-vbf; sqlite for series
-   state; `update` idempotent + resumable.
+1. **wikipedia driver** (`wikimak` CLI): DONE — import + head/history/
+   text, and `discover`/`fetch` (`sync`) against dumps.wikimedia.org
+   with per-part watermarks and streamed checksum verification.
+2. **IETF drafts** (`ietf-mirror` crate): DONE — `all_id.txt` index →
+   per-draft chains of full-snapshot canonical layers in a multi-chain
+   `VbfDepot`; sqlite for series state; `update` idempotent + resumable
+   (revision watermarks; listed-but-404 revisions watermarked missing).
 3. **git mirror loop**: gitdepot incremental import (append new commits
    to the chain instead of full re-import; needs the caller-anchored
    frame mode), fetch-and-update verb, then RO-attach a ref via the
