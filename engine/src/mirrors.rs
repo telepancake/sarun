@@ -134,8 +134,8 @@ pub fn jobs_list() -> Result<Vec<Job>, String> {
 }
 
 pub fn job_add(kind: &str, src: &str, dest: &str, interval_secs: i64) -> Result<i64, String> {
-    if !matches!(kind, "git" | "wiki" | "ietf") {
-        return Err(format!("unknown mirror kind {kind:?} (git|wiki|ietf)"));
+    if !matches!(kind, "git" | "wiki" | "ietf" | "cmd") {
+        return Err(format!("unknown mirror kind {kind:?} (git|wiki|ietf|cmd)"));
     }
     let conn = db()?;
     conn.execute(
@@ -189,6 +189,11 @@ fn spawn_run(job: Job) {
     let argv: Vec<String> = match job.kind.as_str() {
         "git" => vec!["gitdepot".into(), "mirror".into(), job.src.clone(), job.dest.clone()],
         "wiki" => vec!["wikimak".into(), "fetch".into(), job.src.clone(), job.dest.clone()],
+        // The plugin seam (gimir/PLUGINS.md): src IS the command line,
+        // dest arrives as $1 (and $SARUN_MIRROR_DEST) — any script gets
+        // the full job state machine without touching the engine.
+        "cmd" => vec!["/bin/sh".into(), "-c".into(), job.src.clone(),
+                      "mirror-job".into(), job.dest.clone()],
         _ => vec!["ietfmak".into(), "update".into(), job.dest.clone()],
     };
     let id = job.id;
@@ -208,6 +213,7 @@ fn spawn_run(job: Job) {
     std::thread::spawn(move || {
         let child = std::process::Command::new(&argv[0])
             .args(&argv[1..])
+            .env("SARUN_MIRROR_DEST", &job.dest)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())

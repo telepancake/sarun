@@ -3602,7 +3602,7 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
             }
         }
         _ => {
-            eprintln!("usage: sarun mirror ls\n       sarun mirror add git|wiki|ietf SRC DEST [INTERVAL_SECS]\n       sarun mirror run [ID]        (no ID = run all pending)\n       sarun mirror pause|resume|rm ID");
+            eprintln!("usage: sarun mirror ls\n       sarun mirror add git|wiki|ietf|cmd SRC DEST [INTERVAL_SECS]  (cmd: SRC is a shell command, DEST = $1)\n       sarun mirror run [ID]        (no ID = run all pending)\n       sarun mirror pause|resume|rm ID");
             2
         }
     }
