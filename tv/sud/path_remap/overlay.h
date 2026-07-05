@@ -72,6 +72,7 @@ int sud_overlay_rule_count(void);
 
 /* Resolve `path` (absolute) against the configured overlay rules.
  *
+ *   for_write is one of the SUD_OVERLAY_FOR_* values below.
  *   for_write != 0  — caller intends to create / modify the named
  *                     entry, so resolution returns the upper-layer
  *                     path and ensures parent directories exist in
@@ -84,6 +85,16 @@ int sud_overlay_rule_count(void);
  * (NUL-terminated, no overflow).  On SUD_OVERLAY_PASSTHROUGH /
  * _WHITEOUT / _READONLY, `out` is left untouched.
  */
+/* for_write values.  FOR_WRITE creates/replaces/deletes the name (the
+ * lower bytes are dead weight — no copy-up).  FOR_MODIFY changes the
+ * existing entry's content or metadata (open-for-write, chmod/chown/
+ * utimensat, truncate, xattr set): a lower-only entry is COPIED UP
+ * first so the operation acts on the box's copy and O_EXCL/no-O_CREAT
+ * opens see the merged view's existence truthfully. */
+#define SUD_OVERLAY_FOR_READ    0
+#define SUD_OVERLAY_FOR_WRITE   1
+#define SUD_OVERLAY_FOR_MODIFY  2
+
 int sud_overlay_resolve(const char *path, int for_write,
                         char *out, size_t out_sz);
 

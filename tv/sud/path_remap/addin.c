@@ -867,7 +867,8 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
                                           (int)flags, (int)ctx->args[2]);
             if (fd != SUD_OVERLAY_NO_DIR) return short_circuit(ctx, fd);
         }
-        int rc = remap_path_arg(ctx, 0, open_is_write(flags));
+        int rc = remap_path_arg(ctx, 0,
+            open_is_write(flags) ? SUD_OVERLAY_FOR_MODIFY : 0);
         return handle_overlay_result(ctx, rc);
     }
 #endif
@@ -880,7 +881,8 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
                                              (int)flags, (int)ctx->args[3]);
             if (fd != SUD_OVERLAY_NO_DIR) return short_circuit(ctx, fd);
         }
-        int rc = remap_path_arg_at(ctx, 0, 1, open_is_write(flags));
+        int rc = remap_path_arg_at(ctx, 0, 1,
+            open_is_write(flags) ? SUD_OVERLAY_FOR_MODIFY : 0);
         return handle_overlay_result(ctx, rc);
     }
 #endif
@@ -1013,25 +1015,25 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
 #endif
 #ifdef __NR_setxattr
     if (nr == __NR_setxattr) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_lsetxattr
     if (nr == __NR_lsetxattr) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_removexattr
     if (nr == __NR_removexattr) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_lremovexattr
     if (nr == __NR_lremovexattr) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
@@ -1097,13 +1099,13 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
 #endif
 #ifdef __NR_truncate
     if (nr == __NR_truncate) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_truncate64
     if (nr == __NR_truncate64) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
@@ -1111,67 +1113,67 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
     /* ---- chmod / chown / utimes (act on metadata; treated as write) */
 #ifdef __NR_chmod
     if (nr == __NR_chmod) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_fchmodat
     if (nr == __NR_fchmodat) {
-        int rc = remap_path_arg_at(ctx, 0, 1, 1);
+        int rc = remap_path_arg_at(ctx, 0, 1, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_chown
     if (nr == __NR_chown) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_chown32
     if (nr == __NR_chown32) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_lchown
     if (nr == __NR_lchown) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_lchown32
     if (nr == __NR_lchown32) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_fchownat
     if (nr == __NR_fchownat) {
-        int rc = remap_path_arg_at(ctx, 0, 1, 1);
+        int rc = remap_path_arg_at(ctx, 0, 1, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_utime
     if (nr == __NR_utime) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_utimes
     if (nr == __NR_utimes) {
-        int rc = remap_path_arg(ctx, 0, 1);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_futimesat
     if (nr == __NR_futimesat) {
-        int rc = remap_path_arg_at(ctx, 0, 1, 1);
+        int rc = remap_path_arg_at(ctx, 0, 1, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_utimensat
     if (nr == __NR_utimensat) {
-        int rc = remap_path_arg_at(ctx, 0, 1, 1);
+        int rc = remap_path_arg_at(ctx, 0, 1, SUD_OVERLAY_FOR_MODIFY);
         return handle_overlay_result(ctx, rc);
     }
 #endif

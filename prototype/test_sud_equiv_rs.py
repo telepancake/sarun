@@ -221,6 +221,10 @@ def equivalence_workload(mode, sudtool):
     shutil.copy(sudtool, host_bin); host_bin.chmod(0o755)
     victim = Path("/root/sudeq_victim.txt")
     victim.write_bytes(b"v\n")
+    # Host files the box MODIFIES (append / chmod): copy-up territory —
+    # the captured box copy carries the change, the host copy must not.
+    modf = Path("/root/sudeq_mod.txt")
+    modf.write_bytes(b"orig\n"); modf.chmod(0o644)
     eng = Engine(mode)
     try:
         script = (
@@ -235,6 +239,9 @@ def equivalence_workload(mode, sudtool):
             "mkdir -p /root/sudeq_d && echo nested > /root/sudeq_d/inner.txt && "
             # distinct stdout + stderr writes (captured into the outputs table)
             f"{host_bin} streams; "
+            # in-place modification of a HOST file (append) + chmod of it:
+            # copy-up semantics — box copy changes, host copy must not
+            "echo add >> /root/sudeq_mod.txt && chmod 0741 /root/sudeq_mod.txt && "
             # deletion of a host file -> tombstone / whiteout
             "rm /root/sudeq_victim.txt")
         # --net off keeps this (filesystem-equivalence) workload deterministic
@@ -254,6 +261,10 @@ def equivalence_workload(mode, sudtool):
             "nested_content": m.sqlar_content(sp, "root/sudeq_d/inner.txt"),
             "victim_is_tombstone": stat_mod.S_ISCHR(
                 rows.get("root/sudeq_victim.txt", 0)),
+            "mod_content": m.sqlar_content(sp, "root/sudeq_mod.txt"),
+            "mod_perm": stat_mod.S_IMODE(rows.get("root/sudeq_mod.txt", 0)),
+            "host_mod_untouched": modf.read_bytes() == b"orig\n"
+                and stat_mod.S_IMODE(modf.stat().st_mode) == 0o644,
             # An overlay deletion must leave the HOST file untouched (the
             # tombstone lives only in the box) — so the host victim PERSISTS.
             "host_victim_present": victim.exists(),
@@ -264,6 +275,7 @@ def equivalence_workload(mode, sudtool):
         }
     finally:
         victim.unlink(missing_ok=True)
+        modf.unlink(missing_ok=True)
         Path("/root/sudeq_out.txt").unlink(missing_ok=True)
         host_bin.unlink(missing_ok=True)
         eng.close()
@@ -421,13 +433,19 @@ def main():
               f"{label}: nested-dir write captured")
         check(obs["victim_is_tombstone"],
               f"{label}: host-file deletion is a char-dev tombstone/whiteout")
+        check(obs["mod_content"] == b"orig\nadd\n" and obs["mod_perm"] == 0o741,
+              f"{label}: in-place host-file modify copied up "
+              f"(content={obs['mod_content']!r} mode={obs['mod_perm']:o})")
+        check(obs["host_mod_untouched"],
+              f"{label}: host copy of the modified file untouched")
         check(obs["cap_stdout"] and obs["cap_stderr"],
               f"{label}: stdout+stderr captured to the outputs table "
               f"(out={obs['cap_stdout']} err={obs['cap_stderr']})")
 
     for field in ("host_out_absent", "host_victim_present", "stdout_has_mark",
                   "out_content", "out_mode_perm", "xattr", "nested_content",
-                  "victim_is_tombstone", "cap_stdout", "cap_stderr"):
+                  "victim_is_tombstone", "mod_content", "mod_perm",
+                  "host_mod_untouched", "cap_stdout", "cap_stderr"):
         check(fuse[field] == sud[field],
               f"equiv: '{field}' identical across FUSE and sud "
               f"(fuse={fuse[field]!r} sud={sud[field]!r})")

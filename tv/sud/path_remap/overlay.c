@@ -269,6 +269,140 @@ static int ensure_parent_in_upper(const char *upper, size_t upper_len,
     return 0;
 }
 
+/* ----------------------------------------------------------------
+ *  Copy-up: materialize a lower-only entry at its upper path so a
+ *  MODIFY operation (open-for-write, chmod/chown/utimensat, truncate,
+ *  xattr set) acts on the box's copy, never the real lower file.
+ * ---------------------------------------------------------------- */
+
+/* Copy file bytes in..out via sendfile, falling back to a read/write
+ * loop for filesystems that refuse sendfile.  Returns 0 / -errno. */
+static long copy_fd_contents(int out_fd, int in_fd)
+{
+    for (;;) {
+#ifdef SYS_sendfile64
+        long n = raw_syscall6(SYS_sendfile64, out_fd, in_fd, 0,
+                              1 << 30, 0, 0);
+#else
+        long n = raw_syscall6(SYS_sendfile, out_fd, in_fd, 0,
+                              1 << 30, 0, 0);
+#endif
+        if (n == 0) return 0;
+        if (n > 0) continue;
+        if (n != -EINVAL && n != -ENOSYS) return n;
+        /* sendfile refused: byte loop. */
+        char buf[8192];
+        for (;;) {
+            long r = raw_read(in_fd, buf, sizeof(buf));
+            if (r == 0) return 0;
+            if (r < 0) return r;
+            char *p = buf;
+            while (r > 0) {
+                long w = raw_write(out_fd, p, (size_t)r);
+                if (w <= 0) return w < 0 ? w : -5 /* EIO */;
+                p += w; r -= w;
+            }
+        }
+    }
+}
+
+/* Copy the first visible lower entry for `tail` up to `upath`.
+ * Regular files copy content+mode via a temp name and land with
+ * renameat2(RENAME_NOREPLACE), so a concurrent copy-up (or a
+ * concurrent O_CREAT writer) can never observe a HALF-COPIED upper
+ * file — the loser just discards its temp.  Symlinks and dirs are
+ * recreated; specials are skipped (the following syscall then fails
+ * against the absent upper path, same as before copy-up existed).
+ * Best-effort by design: on any failure the caller's syscall runs
+ * against the absent upper path and reports its own error. */
+static void copy_up_from_lowers(const struct sud_rule *r, const char *tail,
+                                const char *upath)
+{
+    struct sud_overlay_stat st;
+    char lpath[PATH_MAX];
+    int found = 0;
+    int lc = rule_lower_count(r);
+    for (int i = 0; i < lc; i++) {
+        if (compose_layer(lpath, sizeof(lpath),
+                          rule_lower(r, i), rule_lower_len(r, i), tail) < 0)
+            continue;
+        if (stat_one(lpath, &st) == 0) {
+            if (is_whiteout_st(&st)) return;   /* logically absent */
+            found = 1;
+            break;
+        }
+    }
+    if (!found) return;
+
+    unsigned ftype = st.st_mode & S_IFMT;
+    unsigned perms = st.st_mode & 07777;
+
+    if (ftype == S_IFDIR) {
+        raw_mkdirat(AT_FDCWD, upath, (int)perms);
+        return;
+    }
+    if (ftype == S_IFLNK) {
+        char tgt[PATH_MAX];
+        long n = raw_readlink(lpath, tgt, sizeof(tgt) - 1);
+        if (n <= 0) return;
+        tgt[n] = '\0';
+        raw_symlinkat(tgt, AT_FDCWD, upath);
+        return;
+    }
+    if (ftype != S_IFREG) return;
+
+    long in_fd = raw_syscall6(SYS_openat, AT_FDCWD, (long)lpath,
+#ifdef O_LARGEFILE
+                              O_RDONLY | O_LARGEFILE,
+#else
+                              O_RDONLY,
+#endif
+                              0, 0, 0);
+    if (in_fd < 0) return;
+
+    /* Temp sibling keyed by tid; PATH_MAX headroom checked. */
+    char tmp[PATH_MAX];
+    size_t ul = strlen(upath);
+    long tid = raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+    if (ul + 24 >= sizeof(tmp)) { raw_close((int)in_fd); return; }
+    memcpy(tmp, upath, ul);
+    tmp[ul] = '\0';
+    {
+        char suf[24];
+        int sn = snprintf(suf, sizeof(suf), ".sudcp.%ld", tid);
+        if (sn <= 0) { raw_close((int)in_fd); return; }
+        memcpy(tmp + ul, suf, (size_t)sn + 1);
+    }
+    long out_fd = raw_syscall6(SYS_openat, AT_FDCWD, (long)tmp,
+#ifdef O_LARGEFILE
+                               O_WRONLY | O_CREAT | O_EXCL | O_LARGEFILE,
+#else
+                               O_WRONLY | O_CREAT | O_EXCL,
+#endif
+                               (long)perms, 0, 0);
+    if (out_fd < 0) { raw_close((int)in_fd); return; }
+
+    long rc = copy_fd_contents((int)out_fd, (int)in_fd);
+    raw_close((int)in_fd);
+    raw_close((int)out_fd);
+    if (rc < 0) {
+        raw_unlinkat(AT_FDCWD, tmp, 0);
+        return;
+    }
+#ifdef __NR_renameat2
+    rc = raw_syscall6(__NR_renameat2, AT_FDCWD, (long)tmp,
+                      AT_FDCWD, (long)upath, 1 /* RENAME_NOREPLACE */, 0);
+    if (rc == -EEXIST) rc = 0;      /* someone else materialized it */
+#else
+    rc = raw_syscall6(__NR_renameat, AT_FDCWD, (long)tmp,
+                      AT_FDCWD, (long)upath, 0, 0);
+#endif
+    /* Success leaves no temp (renamed away); the EEXIST arm and any
+     * failure leave one — unlink is a harmless ENOENT otherwise. */
+    raw_unlinkat(AT_FDCWD, tmp, 0);
+    (void)rc;
+}
+
 /* Copy NUL-terminated `src` into `out` of size `out_sz`, returning
  * SUD_OVERLAY_RESOLVED on success or SUD_OVERLAY_PASSTHROUGH if the
  * destination is too small.  Bounds-checks before writing so we never
@@ -325,6 +459,16 @@ int sud_overlay_resolve(const char *path, int for_write,
     if (for_write) {
         if (!upper) return SUD_OVERLAY_READONLY;
         ensure_parent_in_upper(upper, upper_len, tail);
+        /* MODIFY (content or metadata) of an entry that exists only in
+         * a lower: COPY IT UP first, or the modification sees a
+         * nonexistent upper file — open(O_WRONLY) of a host file
+         * ENOENTed, O_APPEND started empty, chmod/chown/utimensat of a
+         * host file failed, and O_CREAT|O_EXCL wrongly succeeded on a
+         * name the merged view already had.  Plain FOR_WRITE (create /
+         * replace / delete) skips the copy: the old bytes are dead
+         * weight there (rm of a big lower file must not copy it). */
+        if (for_write == SUD_OVERLAY_FOR_MODIFY && upper_state == 0)
+            copy_up_from_lowers(r, tail, upath);
         return copy_resolved(out, out_sz, upath);
     }
 
