@@ -279,30 +279,24 @@ One trait, several layouts, each tuned to a shape:
 
 Notes per variant:
 
-- **hot**: an unpacked git repo is already a deduped node store; the delta
-  is interior-node blobs + tombstones + opaque. Internal hashing for
-  equal-subtree merging is fine — but hashes live only in the private
-  lookup index, are derivable, hence droppable: a depot must be able to
-  rebuild its dedup index from scratch with nothing observable changing.
-  Subtree-level (not just blob-level) sharing is what makes `diff` prune
-  whole unchanged subtrees by internal identity instead of walking them.
+- **hot** — WITHDRAWN as a variant (2026-07-05): "actually hot" is not a
+  kind of storage, it is a **persistent materialization CACHE in front of
+  ALL depots**. Mount-serving consumers (mmap/exec, the D5 kernel
+  read-passthrough's backing fd, pread) need real loose files; those
+  files are DERIVED — reconstructible from whichever depot holds the
+  layer — so they form a cache with zero durability obligations: crash =
+  cold cache, eviction = space management, never data loss. One
+  content-keyed pool fronts every variant (dedup global by construction);
+  entries are immutable and never opened writable; write = copy-up into
+  the box's AUTHORITATIVE store (the existing D3 path), never cache
+  mutation. Hash-naming inside the cache is maximally internal: entries
+  AND the lookup index are rebuildable by re-walking depots. This is how
+  a VBF-stored wiki snapshot or a lazy git ref serves a workspace mount:
+  materialize on demand into the cache, pay the decode once. Distinct
+  and deliberately left open: whether AUTHORITATIVE stores ever share
+  bytes internally (that, not the cache, is what would make rotation
+  O(metadata)) — a variant-internal choice, per §1.
 
-  **Content must be REAL LOOSE FILES** — non-negotiable, because the
-  mount-serving tier has consumers only a real file satisfies: mmap/exec,
-  the D5 kernel read-passthrough (a backing fd), plain pread. Packed
-  variants (VBF, stream) are rest/history/wire tiers and never serve a
-  mount; their content mmaps by materializing THROUGH the hot tier.
-  Sharing is file identity: a pool of immutable loose files with
-  content-derived NAMES (the brief's "hashing works as a filename
-  scheme" — internal only, rebuildable), layers hardlinking in;
-  refcount = st_nlink, reap = last unlink. Duplicate-on-write: shared
-  files are never opened writable — FICLONE where the fs has reflink,
-  else hardlink + explicit copy on first write (which IS today's D3
-  lazy copy-up, retargeted at the pool). The live upper keeps writing
-  PRIVATE per-rowid files exactly as today — no hashing on the hot
-  write path; sharing happens at rest boundaries (box finish, ingest,
-  RO-attach, rotation), which is what finally makes rotation
-  O(metadata): replicated blobs become pool links, not byte copies.
 - **sqlar adapter**: the seam half-exists (`BoxState`'s methods are a
   de-facto interface) but blob I/O leaks (`overlay.rs` reads `blob_path()`
   directly) and `sud.rs`/`review.rs` run raw SQL on the shared connection.
@@ -392,8 +386,9 @@ this design, whatever its tests say.
 
 *Status 2026-07-05: steps 1–6 done; step 7's rotation half done (holes
 in the sqlar variant, overlay walk, `rotate` verb, liveness-tested);
-remaining: the hot variant with internal sharing (the one clause of §1
-still unimplemented anywhere), gitdepot moving onto depot-vbf (needs a
+remaining: the materialization cache (§7 "hot", reframed 2026-07-05 —
+a derived, rebuildable loose-file cache in front of all depots; the §1
+internal-sharing clause stays open for authoritative stores), gitdepot moving onto depot-vbf (needs a
 caller-anchored frame mode to keep the measured view-anchored hybrid),
 step 8, and the git-ref RO-attachment resolver (§8).*
 
