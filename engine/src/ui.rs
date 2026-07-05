@@ -8997,41 +8997,69 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
         .split(body);
     let (top, bottom) = (split[0], split[1]);
 
-    let crumb: Vec<&str> = app.ins_stack.iter()
-        .map(|fr| fr.title.as_str()).collect();
-    // Keep the tail of a deep chain — the leaf matters most.
-    let crumb = if crumb.len() > 4 {
-        format!("\u{2026} \u{25b8} {}", crumb[crumb.len() - 4..].join(" \u{25b8} "))
-    } else {
-        crumb.join(" \u{25b8} ")
-    };
-    let mut lines: Vec<Line> = vec![];
-    for h in &frame.header {
-        lines.push(Line::from(Span::styled(h.clone(),
-            Style::default().add_modifier(Modifier::DIM))));
-    }
-    for (i, e) in frame.entries.iter().enumerate() {
-        let marker = if e.arg.is_some() { "\u{2315} " }
-                     else if e.child.is_some() { "\u{25b8} " }
-                     else { "  " };
-        let style = if i == frame.sel {
-            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    // Miller-columns cascade: the whole drill stack renders side by side —
+    // ancestors (static data, already built) in narrower columns on the
+    // left, the ACTIVE frame widest on the right. Deep chains shift out
+    // the left margin; the leftmost visible column says how many frames
+    // scrolled off. Each ancestor keeps its own cursor highlighted (the
+    // row you descended through), so the whole path reads at a glance.
+    let min_col = 30u16;
+    let max_cols = ((top.width / min_col).max(1) as usize)
+        .min(app.ins_stack.len());
+    let frames = &app.ins_stack[app.ins_stack.len() - max_cols..];
+    let hidden = app.ins_stack.len() - max_cols;
+    // The active column gets a double share of the width.
+    let shares: u32 = max_cols as u32 + 1;
+    let constraints: Vec<Constraint> = (0..max_cols).map(|i| {
+        let sh = if i + 1 == max_cols { 2 } else { 1 };
+        Constraint::Ratio(sh, shares)
+    }).collect();
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(top);
+    for (ci, fr) in frames.iter().enumerate() {
+        let active = ci + 1 == max_cols;
+        let mut lines: Vec<Line> = vec![];
+        for h in &fr.header {
+            lines.push(Line::from(Span::styled(h.clone(),
+                Style::default().add_modifier(Modifier::DIM))));
+        }
+        for (i, e) in fr.entries.iter().enumerate() {
+            let marker = if e.arg.is_some() { "\u{2315} " }
+                         else if e.child.is_some() { "\u{25b8} " }
+                         else { "  " };
+            let style = if i == fr.sel && active {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else if i == fr.sel {
+                // The ancestor's cursor — the rung of the descent path.
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else if active {
+                Style::default()
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{marker}{}", e.text), style)));
+        }
+        if fr.entries.is_empty() && fr.header.is_empty() {
+            lines.push(Line::from(Span::styled("(empty)",
+                Style::default().add_modifier(Modifier::DIM))));
+        }
+        let cursor_line = fr.header.len() + fr.sel + 1;
+        let scroll = scroll_for_cursor(cursor_line, lines.len(), cols[ci].height);
+        let t = if ci == 0 && hidden > 0 {
+            format!("\u{2026}{hidden} \u{25b8} {}", fr.title)
+        } else if active {
+            format!("inspect \u{b7} {}", fr.title)
         } else {
-            Style::default()
+            fr.title.clone()
         };
-        lines.push(Line::from(Span::styled(
-            format!("{marker}{}", e.text), style)));
+        let p = Paragraph::new(Text::from(lines))
+            .block(block(title(&t, active), active))
+            .scroll((scroll, 0));
+        f.render_widget(p, cols[ci]);
     }
-    if frame.entries.is_empty() && frame.header.is_empty() {
-        lines.push(Line::from(Span::styled("(empty)",
-            Style::default().add_modifier(Modifier::DIM))));
-    }
-    let cursor_line = frame.header.len() + frame.sel + 1;
-    let scroll = scroll_for_cursor(cursor_line, lines.len(), top.height);
-    let p = Paragraph::new(Text::from(lines))
-        .block(block(title(&format!("inspect \u{b7} {crumb}"), true), true))
-        .scroll((scroll, 0));
-    f.render_widget(p, top);
 
     // The card: [n] hotspot markers highlighted so they read as buttons.
     let mut card_lines: Vec<Line> = vec![];
