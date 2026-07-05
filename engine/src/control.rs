@@ -608,6 +608,19 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                                 total += in_;
                                 errs.append(&mut ie);
                             }
+                            // A CLEAN sweep makes the upper dir pure
+                            // residue: the sqlar is authoritative from
+                            // here (reruns delete-and-recreate it,
+                            // nested launches export from the sqlar),
+                            // so keeping it doubles the box's disk
+                            // footprint until reap. Keep it ONLY when
+                            // the sweep reported errors — then it is
+                            // the sole copy of whatever failed to
+                            // ingest. sud.trace stays until reap: a
+                            // small, wiredump-decodable debug record.
+                            if errs.is_empty() {
+                                let _ = std::fs::remove_dir_all(&upper);
+                            }
                             json!({"ok": true, "ingested": total,
                                    "errors": errs})
                         }
