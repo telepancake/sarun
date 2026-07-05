@@ -546,3 +546,101 @@ fn walk(b: &BoxState, dir: &Path, rel: &str, fallback: i64,
         }
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sudwire::{self, EvState};
+
+    /// decode_trace renders an encoder-built stream into typed JSON rows:
+    /// EXEC/OPEN/STDOUT/EXIT names, per-event text, extras verbatim.
+    #[test]
+    fn decode_trace_names_kinds_and_text() {
+        let mut enc = EvState::default();
+        let mut stream = sudwire::version_atom();
+        stream.extend(enc.build_event(1, sudwire::EV_EXEC, 100, 9, 9, 1,
+                                      9, 9, &[], b"/bin/sh"));
+        stream.extend(enc.build_event(1, sudwire::EV_OPEN, 200, 9, 9, 1,
+                                      9, 9, &[0o101, 3, 5, 1, 2, 0, 0],
+                                      b"out.txt"));
+        stream.extend(enc.build_event(1, sudwire::EV_STDOUT, 300, 9, 9, 1,
+                                      9, 9, &[], b"hi\n"));
+        stream.extend(enc.build_exit(1, 400, 9, 9, 1, 0));
+
+        let v = decode_trace(&stream);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["truncated"], false);
+        let rows = v["events"].as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["kind"], "EXEC");
+        assert_eq!(rows[0]["text"], "/bin/sh");
+        assert_eq!(rows[1]["kind"], "OPEN");
+        assert_eq!(rows[1]["text"], "out.txt");
+        assert_eq!(rows[1]["extras"][0], 0o101);
+        assert_eq!(rows[2]["kind"], "STDOUT");
+        assert_eq!(rows[2]["text"], "hi\n");
+        assert_eq!(rows[3]["kind"], "EXIT");
+    }
+
+    /// A blob past TEXT_MAX (4 KiB) is truncated with a "… (N bytes)" suffix
+    /// so one huge write can't bloat the reply.
+    #[test]
+    fn decode_trace_truncates_long_text() {
+        let mut enc = EvState::default();
+        let mut stream = sudwire::version_atom();
+        let big = vec![b'a'; 5000];
+        stream.extend(enc.build_event(1, sudwire::EV_STDOUT, 1, 9, 9, 1,
+                                      9, 9, &[], &big));
+        let v = decode_trace(&stream);
+        let text = v["events"][0]["text"].as_str().unwrap();
+        assert!(text.ends_with("… (5000 bytes)"), "got: {}", &text[..40]);
+        assert!(text.starts_with(&"a".repeat(4096)));
+    }
+
+    /// More than CAP events flips `truncated` and clamps the row count.
+    #[test]
+    fn decode_trace_caps_event_count() {
+        let mut enc = EvState::default();
+        let mut stream = sudwire::version_atom();
+        for _ in 0..20_001 {
+            stream.extend(enc.build_event(1, sudwire::EV_EXEC, 1, 9, 9, 1,
+                                          9, 9, &[], b""));
+        }
+        let v = decode_trace(&stream);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["events"].as_array().unwrap().len(), 20_000);
+    }
+
+    /// A clean sweep of a sud box's upper dir mirrors its files into the sqlar
+    /// and reports the row count; the now-redundant upper residue is removed.
+    /// (Runs against a temp XDG_STATE_HOME — no boxes, no wrapper.)
+    #[test]
+    fn sweep_ingests_upper_and_clears_residue() {
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "sarun-sweep-{}-{:?}", std::process::id(),
+            std::time::SystemTime::now()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: state_home() is XDG_STATE_HOME-derived; the lock serializes
+        // this against every other test that repoints it.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let id = 7701;
+        let b = BoxState::create(id).unwrap();
+        // Plant an upper dir with a dir + a file, the shapes ingest_upper walks.
+        let upper = crate::paths::live_home().join(id.to_string())
+            .join("sud-up");
+        std::fs::create_dir_all(upper.join("d")).unwrap();
+        std::fs::write(upper.join("d").join("f.txt"), b"hi").unwrap();
+
+        // runpid 0 → fallback writer 0, so no /proc read is attempted.
+        let r = sweep(&b, id, 0);
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+        assert_eq!(r.ingested, 2); // the dir + the file
+        assert!(b.entry("d/f.txt").is_some());
+        // Clean sweep → the upper residue is gone.
+        assert!(!upper.exists(), "clean sweep should remove the upper dir");
+    }
+}
