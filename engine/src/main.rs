@@ -104,6 +104,7 @@ fn top_level_help() -> &'static str {
      run FLAGS:\n  \
        -n / -N / --net off|tap|host   per-box networking (default: tap, a proxied per-box netns)\n  \
        -t passthrough   -d direct (no overlay)   -e record-env   -b brush-shell   -p pty\n  \
+       --fuse bwrap+FUSE backend (default: sud; -t/-d/-p/--api imply --fuse)\n  \
        -C DIR   --no-parent   --readonly-parent   --api (oaita proxy)   --vars (variable provenance)\n"
 }
 
@@ -531,6 +532,7 @@ fn main() {
             let mut readonly_parent = false;
             let mut api = false;
             let mut sud = false;
+            let mut fuse = false;
             let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
             // Box networking defaults to Tap (proxied): the box gets a per-box
@@ -595,13 +597,14 @@ fn main() {
                     //        in-box `oaita gen` routes through the engine
                     //        with no api key in the box and no extra UDS.
                     "--api" => api = true,
-                    // --sud  EXPERIMENTAL (engine/DESIGN-sud.md, WIP): run
-                    //        CMD under tv's sudtrace (Syscall User Dispatch
-                    //        + userland overlay) instead of bwrap+FUSE; a
-                    //        post-exit sweep captures the upper dir into
-                    //        the box's sqlar. Host netns, no capture mux,
-                    //        incompatible with -t/-d/-p/-b/--api.
+                    // Backend selection (engine/DESIGN-sud.md): sud is
+                    //        the DEFAULT for captured runs; --sud forces
+                    //        it (erroring on modes sud cannot do), --fuse
+                    //        forces the bwrap+FUSE path. With neither
+                    //        flag, modes sud cannot do yet route to FUSE
+                    //        automatically.
                     "--sud" => sud = true,
+                    "--fuse" => fuse = true,
                     // --webcap  OPT-IN web capture (DESIGN-web.md W2): tee
                     //           every HTTP(S) request/response this tap box
                     //           makes into its `webcap` table. An env toggle
@@ -640,13 +643,24 @@ fn main() {
                     \x20        --vars record variable assignments (Vars view)");
                 std::process::exit(2);
             }
-            if sud {
-                if passthrough || direct || pty || api {
-                    eprintln!("sarun: --sud is incompatible with \
-                               -t/-d/-p/--api (step-1 scope, see \
-                               engine/DESIGN-sud.md)");
-                    std::process::exit(2);
-                }
+            if sud && fuse {
+                eprintln!("sarun: --sud and --fuse are mutually exclusive");
+                std::process::exit(2);
+            }
+            // Modes not yet ported to sud, and nested runs inside a FUSE
+            // box (sud-in-FUSE composition is undesigned; SARUN_BROKER
+            // is the in-box marker), route to the FUSE path.
+            let in_fuse_box = std::env::var("SARUN_BROKER")
+                .is_ok_and(|s| !s.is_empty());
+            let fuse_only = passthrough || direct || pty || api
+                || in_fuse_box;
+            if sud && fuse_only {
+                eprintln!("sarun: --sud is incompatible with \
+                           -t/-d/-p/--api and with nesting inside a FUSE \
+                           box (see engine/DESIGN-sud.md)");
+                std::process::exit(2);
+            }
+            if !fuse && !fuse_only {
                 std::process::exit(
                     runner::run_sud(name, env, chdir, net_mode, brush, cmd));
             }

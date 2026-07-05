@@ -186,8 +186,8 @@ class Engine:
 
     def run(self, name, script, extra_argv=(), raw_cmd=None):
         argv = [str(BIN), "run", name]
-        if self.mode == "sud":
-            argv.append("--sud")
+        # sud is the default backend; both legs stay explicit.
+        argv.append("--sud" if self.mode == "sud" else "--fuse")
         argv += list(extra_argv) + ["--"]
         argv += list(raw_cmd) if raw_cmd is not None else ["sh", "-c", script]
         return subprocess.run(argv, capture_output=True, text=True,
