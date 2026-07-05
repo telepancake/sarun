@@ -213,7 +213,7 @@ fn spawn_run(job: Job) {
             .stderr(std::process::Stdio::piped())
             .spawn();
         let (exit, detail) = match child {
-            Ok(mut c) => {
+            Ok(c) => {
                 running_map(|m| { m.insert(id, c.id()); });
                 let out = c.wait_with_output();
                 match out {

@@ -287,6 +287,11 @@ enum Pane {
     /// INCLUDING up-to-date targets that never executed.
     BuildEdges,
     Rules,
+    /// Mirror-update jobs (engine/src/mirrors.rs): one row per scheduled
+    /// `gitdepot mirror` / `wikimak fetch` / `ietfmak update` job with its
+    /// derived state + next due time. 'r' force-runs the selected job,
+    /// 'R' starts everything pending, Space pauses/resumes.
+    Mirrors,
     /// Variable provenance: every makefile-level assignment (name, loc,
     /// value, make dir) plus shell assignments from box shells, recorded in
     /// the box's makevar table. '/' sets the name/value query; the right
@@ -553,6 +558,10 @@ enum Action {
     DeleteRule,
     MoveRuleUp,
     MoveRuleDown,
+    /// Mirrors pane: the r / R / space key actions, menu-discoverable.
+    MirrorRun,
+    MirrorRunPending,
+    MirrorTogglePause,
     PtyNew,
     PtyKill,
     PtyEmbedToggle,
@@ -819,6 +828,14 @@ struct App {
     /// frame — because it reads oaita.toml from disk.
     api_endpoint_note: Vec<String>,
     sel_rule: usize,
+    /// Mirrors pane (engine/src/mirrors.rs): one Job per mirror-update
+    /// schedule row, read straight from the shared mirrors.db (like the
+    /// Rules pane reads the filerules file — no engine verb round-trip).
+    /// Job state is TIME-derived (pending flips as intervals elapse), so
+    /// the main loop re-reads it on a throttle while the pane is focused.
+    sel_mirror: usize,
+    mirror_jobs: Vec<crate::mirrors::Job>,
+    mirrors_loaded_at: Option<std::time::Instant>,
     hunk_scroll: u16,
     out_scroll: u16,
     focus: Pane,
@@ -1102,6 +1119,9 @@ impl App {
             trace_loaded_sid: None,
             api_endpoint_note: vec![],
             sel_rule: 0,
+            sel_mirror: 0,
+            mirror_jobs: vec![],
+            mirrors_loaded_at: None,
             hunk_scroll: 0,
             out_scroll: 0,
             focus: Pane::Sessions,
@@ -3166,6 +3186,56 @@ impl App {
         }
     }
 
+    /// Re-read the mirror job list. Direct crate::mirrors call (the store is
+    /// the shared {state_home}/mirrors.db, same host-side access the Rules
+    /// pane has to its filerules file). Clamps the cursor so a shrunken list
+    /// never leaves it past the end.
+    fn load_mirrors(&mut self) {
+        match crate::mirrors::jobs_list() {
+            Ok(jobs) => {
+                self.mirror_jobs = jobs;
+                if self.sel_mirror >= self.mirror_jobs.len() {
+                    self.sel_mirror = self.mirror_jobs.len().saturating_sub(1);
+                }
+            }
+            Err(e) => self.status = format!("mirrors: {e}"),
+        }
+        self.mirrors_loaded_at = Some(std::time::Instant::now());
+    }
+
+    /// 'r' on Mirrors: force-run the selected job (works on paused too).
+    fn mirror_run_selected(&mut self) {
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else { return };
+        let id = job.id;
+        self.status = match crate::mirrors::job_run(id) {
+            Ok(()) => format!("mirror #{id}: run started"),
+            Err(e) => format!("mirror #{id}: {e}"),
+        };
+        self.load_mirrors();
+    }
+
+    /// 'R' on Mirrors: start every due, unpaused, not-running job.
+    fn mirror_run_pending(&mut self) {
+        self.status = match crate::mirrors::run_pending() {
+            Ok(ids) if ids.is_empty() => "mirrors: nothing pending".into(),
+            Ok(ids) => format!("mirrors: started {} job(s)", ids.len()),
+            Err(e) => format!("mirrors: {e}"),
+        };
+        self.load_mirrors();
+    }
+
+    /// Space on Mirrors: pause ⇄ resume the selected job.
+    fn mirror_toggle_pause(&mut self) {
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else { return };
+        let (id, want) = (job.id, !job.paused);
+        self.status = match crate::mirrors::job_set_paused(id, want) {
+            Ok(()) => format!("mirror #{id}: {}",
+                              if want { "paused" } else { "resumed" }),
+            Err(e) => format!("mirror #{id}: {e}"),
+        };
+        self.load_mirrors();
+    }
+
     // ── navigation ── (driven by the interactive loop; not by headless tests)
 
     #[cfg_attr(test, allow(dead_code))]
@@ -3215,6 +3285,12 @@ impl App {
             Pane::Rules => {
                 if self.sel_rule + 1 < self.rules.len() {
                     self.sel_rule += 1;
+                    self.right_scroll = 0;
+                }
+            }
+            Pane::Mirrors => {
+                if self.sel_mirror + 1 < self.mirror_jobs.len() {
+                    self.sel_mirror += 1;
                     self.right_scroll = 0;
                 }
             }
@@ -3301,6 +3377,10 @@ impl App {
             Pane::Outputs => { self.move_output_cursor(-1); self.right_scroll = 0; }
             Pane::Rules => {
                 self.sel_rule = self.sel_rule.saturating_sub(1);
+                self.right_scroll = 0;
+            }
+            Pane::Mirrors => {
+                self.sel_mirror = self.sel_mirror.saturating_sub(1);
                 self.right_scroll = 0;
             }
             Pane::Pipelines => { self.move_pipeline_cursor(-1); self.right_scroll = 0; }
@@ -3399,6 +3479,13 @@ impl App {
                 self.sel_rule = (cur + delta).clamp(0, total as isize - 1) as usize;
                 self.right_scroll = 0;
             }
+            Pane::Mirrors => {
+                let total = self.mirror_jobs.len();
+                if total == 0 { return; }
+                let cur = self.sel_mirror as isize;
+                self.sel_mirror = (cur + delta).clamp(0, total as isize - 1) as usize;
+                self.right_scroll = 0;
+            }
             Pane::Pipelines => { self.page_pipeline_cursor(delta); self.right_scroll = 0; }
             Pane::BuildEdges => { self.page_edge_cursor(delta); self.right_scroll = 0; }
             Pane::Flows => {
@@ -3477,7 +3564,7 @@ impl App {
         matches!(self.focus,
             Pane::Sessions | Pane::Processes | Pane::Outputs
             | Pane::Pipelines | Pane::BuildEdges | Pane::Rules
-            | Pane::Flows | Pane::Packets | Pane::Vars)
+            | Pane::Mirrors | Pane::Flows | Pane::Packets | Pane::Vars)
     }
 
     /// Snap focus back to the LEFT list and reset the right-pane scroll.
@@ -3514,6 +3601,7 @@ impl App {
             Pane::Pipelines => self.pipelines_window_start + self.sel_pipeline,
             Pane::BuildEdges => self.edges_window_start + self.sel_edge,
             Pane::Rules => self.sel_rule,
+            Pane::Mirrors => self.sel_mirror,
             Pane::Flows => self.sel_flow,
             Pane::Packets => self.sel_packet,
             Pane::ApiLogs => self.sel_api_log,
@@ -3597,6 +3685,11 @@ impl App {
                     self.sel_rule =
                         snap.cursor.min(self.rules.len().saturating_sub(1));
                 }
+                Pane::Mirrors => {
+                    self.load_mirrors();
+                    self.sel_mirror =
+                        snap.cursor.min(self.mirror_jobs.len().saturating_sub(1));
+                }
                 Pane::Flows => {
                     if !self.flows.is_empty() {
                         self.sel_flow = snap.cursor.min(self.flows.len() - 1);
@@ -3672,6 +3765,7 @@ impl App {
                 }
             }
             Pane::Inspect   => { self.focus = Pane::Inspect; self.ins_init(); }
+            Pane::Mirrors   => { self.focus = Pane::Mirrors; self.load_mirrors(); }
             other           => { self.focus = other; }
         }
     }
@@ -3777,7 +3871,7 @@ impl App {
                 }
             }
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
-            | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
+            | Pane::Mirrors | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
             | Pane::Help | Pane::Pty | Pane::ApiLogs | Pane::Trace => {}
         }
     }
@@ -4637,6 +4731,10 @@ impl App {
             Pane::Rules => {
                 if self.rules.is_empty() { return; }
                 self.sel_rule = if end { self.rules.len() - 1 } else { 0 };
+            }
+            Pane::Mirrors => {
+                if self.mirror_jobs.is_empty() { return; }
+                self.sel_mirror = if end { self.mirror_jobs.len() - 1 } else { 0 };
             }
             Pane::Flows => {
                 if self.flows.is_empty() { return; }
@@ -6309,6 +6407,107 @@ fn rules_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+/// Color for a mirror job's derived state (mirrors.rs doc list).
+fn mirror_state_color(state: &str) -> Color {
+    match state {
+        "running" => Color::Cyan,
+        "paused" => Color::DarkGray,
+        "pending" | "stopped" => Color::Yellow,
+        "error" => Color::Red,
+        "completed" => Color::Green,
+        _ => Color::Reset, // scheduled
+    }
+}
+
+/// "in 5m" / "due" for a next_due unix timestamp (already-elapsed shows
+/// as the state column's "pending"; the due cell just says "due").
+fn mirror_due_label(next_due: Option<i64>) -> String {
+    let Some(due) = next_due else { return "—".into() };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0);
+    let dt = due - now;
+    if dt <= 0 { "due".into() }
+    else if dt < 3600 { format!("in {}m", (dt + 59) / 60) }
+    else { format!("in {}h{:02}m", dt / 3600, (dt % 3600) / 60) }
+}
+
+/// MIRRORS pane: one row per mirror-update job.
+fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled(
+        "scheduled mirror updates — r run selected · R run pending · space pause/resume",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if app.mirror_jobs.is_empty() {
+        out.push(Line::from("(no mirror jobs — `sarun mirror add …`)"));
+        return out;
+    }
+    for (i, j) in app.mirror_jobs.iter().enumerate() {
+        let text = format!(
+            "{:>3} {:<9} {:<4} {} → {} every {}m {}",
+            j.id, j.state, j.kind, j.src, j.dest,
+            j.interval_secs / 60, mirror_due_label(j.next_due));
+        let line = if i == app.sel_mirror {
+            Line::from(Span::styled(text,
+                Style::default().fg(Color::Black).bg(Color::Cyan)))
+        } else {
+            Line::from(Span::styled(text,
+                Style::default().fg(mirror_state_color(&j.state))))
+        };
+        out.push(line);
+    }
+    out
+}
+
+/// Right pane of the MIRRORS view: every field of the selected job plus
+/// its last_detail lines (an error's stderr tail).
+fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(j) = app.mirror_jobs.get(app.sel_mirror) else {
+        return vec![
+            Line::from(Span::styled("r run · R run pending · space pause/resume",
+                Style::default().add_modifier(Modifier::DIM))),
+            Line::from(""),
+            Line::from("Mirror jobs keep local gitdepot / wikimak / ietfmak"),
+            Line::from("stores fresh on a per-job interval. The engine"),
+            Line::from("schedules; the driver binaries fetch."),
+        ];
+    };
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let cyan = Style::default().fg(Color::Cyan);
+    let ts = |t: Option<i64>| t.map(|s| {
+        let secs = s.rem_euclid(86400);
+        format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    }).unwrap_or_else(|| "—".into());
+    let mut out = vec![Line::from(vec![
+        Span::styled(j.state.clone(),
+            Style::default().fg(mirror_state_color(&j.state))
+                .add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  job #{}", j.id), dim),
+    ])];
+    let field = |k: &str, v: String| Line::from(vec![
+        Span::styled(format!("{k:>9} "), cyan), Span::raw(v)]);
+    out.push(field("kind", j.kind.clone()));
+    out.push(field("src", j.src.clone()));
+    out.push(field("dest", j.dest.clone()));
+    out.push(field("interval", format!("{}s ({}m)",
+        j.interval_secs, j.interval_secs / 60)));
+    out.push(field("paused", j.paused.to_string()));
+    out.push(field("next due", format!("{} ({})",
+        ts(j.next_due), mirror_due_label(j.next_due))));
+    out.push(field("last run", format!("{} → {} exit {}",
+        ts(j.last_start), ts(j.last_end),
+        j.last_exit.map(|e| e.to_string()).unwrap_or_else(|| "—".into()))));
+    if !j.last_detail.is_empty() {
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled("LAST DETAIL",
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))));
+        for l in j.last_detail.lines() {
+            out.push(Line::from(l.to_string()));
+        }
+    }
+    out
+}
+
 /// HELP pane: a static cheatsheet of the keybindings and the run→inspect→
 /// apply/discard loop.
 fn help_lines() -> Vec<Line<'static>> {
@@ -6921,6 +7120,7 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
         Pane::Pipelines => Some(('l', "pipes",   FilterView::Pipelines)),
         Pane::BuildEdges => Some(('g', "build",  FilterView::BuildEdges)),
         Pane::Rules     => Some(('e', "rules",   FilterView::Changes /* unused */)),
+        Pane::Mirrors   => Some(('M', "mirrors", FilterView::Changes /* unused */)),
         Pane::Flows | Pane::Packets
                         => Some(('f', "flows",   FilterView::Changes /* unused */)),
         Pane::Help      => Some(('?', "help",    FilterView::Changes /* unused */)),
@@ -6950,6 +7150,7 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
     ('g', Pane::BuildEdges, "Build",   PaneVis::Data("edges"),     "build Graph — parsed ninja/make build edges from a -b box"),
     ('f', Pane::Flows,      "Flows",   PaneVis::Always,            "network flows — tshark-decoded HTTP/TLS from a -n box's pcap"),
     ('e', Pane::Rules,      "Rules",   PaneVis::Always,            "file rules — the ordered apply/discard/passthrough rules"),
+    ('M', Pane::Mirrors,    "Mirrors", PaneVis::Always,            "scheduled mirror updates — r run selected, R run pending, space pause/resume"),
     ('P', Pane::Pty,        "PTYs",    PaneVis::Pty,               "open an engine-held PTY — a live interactive shell pane"),
     ('i', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
     ('w', Pane::Network,    "Web",     PaneVis::Always,            "web captures — tap MITM HTTP(S) content archive (headers + body)"),
@@ -7039,6 +7240,7 @@ enum PaneAction {
     ApplyHunk, DiscardHunk, ApplyFile, DiscardFile, ApplyAll, DiscardAll,
     ConfirmKill, ConfirmDissolve,
     NewRule, DeleteRule, StartRename,
+    MirrorRun, MirrorRunPending, MirrorTogglePause,
     ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
     ToggleEdgeRunning,
     ToggleMark, RangeMark,
@@ -7068,6 +7270,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('a'), PaneGate::On(Pane::Hunks), PaneAction::ApplyHunk,       None),
     (Key::Char('x'), PaneGate::On(Pane::Hunks), PaneAction::DiscardHunk,     None),
     (Key::Char('d'), PaneGate::On(Pane::Hunks), PaneAction::DiscardHunk,     None),
+    (Key::Char(' '), PaneGate::On(Pane::Mirrors), PaneAction::MirrorTogglePause, Some("pause/resume mirror job (on Mirrors)")),
     (Key::Char(' '), PaneGate::Any,             PaneAction::ToggleMark,      Some("select/unselect row (Boxes/Changes) for batch a/x/D")),
     (Key::Char('['), PaneGate::Any,             PaneAction::RangeMark,       Some("select range: anchor (Space) → cursor")),
     (Key::Char(']'), PaneGate::Any,             PaneAction::RangeMark,       None),
@@ -7081,6 +7284,8 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('f'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleRunningOnly, Some("toggle running-only (on Pipes)")),
     (Key::Char('f'), PaneGate::On(Pane::Processes), PaneAction::ToggleProcRunning, Some("toggle running-only (on Procs)")),
     (Key::Char('f'), PaneGate::On(Pane::BuildEdges), PaneAction::ToggleEdgeRunning, Some("toggle running-only (on Targets)")),
+    (Key::Char('r'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRun,     Some("force-run selected mirror job (on Mirrors)")),
+    (Key::Char('R'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRunPending, Some("run all pending mirror jobs (on Mirrors)")),
     (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
     (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
     (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
@@ -7132,6 +7337,9 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::NewRule => app.modal = Some(Modal::RuleForm {
             buf: String::new(), editing: None }),
         PaneAction::DeleteRule => app.delete_rule(),
+        PaneAction::MirrorRun => app.mirror_run_selected(),
+        PaneAction::MirrorRunPending => app.mirror_run_pending(),
+        PaneAction::MirrorTogglePause => app.mirror_toggle_pause(),
         PaneAction::StartRename => app.renaming = Some(String::new()),
         PaneAction::ToggleFilter => app.toggle_filter(),
         PaneAction::Refresh => {
@@ -9381,6 +9589,21 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
             }
+            Pane::Mirrors => {
+                let lines = mirrors_lines(app);
+                let scroll = scroll_for_cursor(app.sel_mirror + 1, lines.len(), left.height);
+                let p = Paragraph::new(Text::from(lines))
+                    .block(block(title("MIRRORS · update jobs", lf), lf))
+                    .scroll((scroll, 0));
+                f.render_widget(p, left);
+                let dl = mirror_detail_lines(app);
+                let rs = clamp_rscroll(&dl);
+                let detail = Paragraph::new(Text::from(dl))
+                    .block(block(title("JOB · DETAIL", rf), rf))
+                    .scroll((rs, 0))
+                    .wrap(Wrap { trim: false });
+                if !skip_right { f.render_widget(detail, right); }
+            }
             Pane::Flows => {
                 let lines = flows_lines(app);
                 let scroll = scroll_for_cursor(app.sel_flow + 1, lines.len(), left.height);
@@ -11594,6 +11817,18 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                 mk("Move down",   "Ctrl-↓", Action::MoveRuleDown),
             ]))
         }
+        Pane::Mirrors => {
+            let j = app.mirror_jobs.get(app.sel_mirror);
+            let target = j.map(|j| format!("#{} {} → {}", j.id, j.src, j.dest))
+                .unwrap_or_default();
+            let paused = j.map(|j| j.paused).unwrap_or(false);
+            Some((title("Mirror job", &target), vec![
+                mk("Force-run this job",  "r", Action::MirrorRun),
+                mk("Run all pending jobs", "R", Action::MirrorRunPending),
+                mk(if paused { "Resume this job" } else { "Pause this job" },
+                   "space", Action::MirrorTogglePause),
+            ]))
+        }
         Pane::Pty => {
             let total = app.ptys.len();
             let sel = app.sel_pty + 1;
@@ -11654,6 +11889,9 @@ fn run_action(app: &mut App, a: Action) {
         Action::DeleteRule     => app.delete_rule(),
         Action::MoveRuleUp     => app.move_rule(-1),
         Action::MoveRuleDown   => app.move_rule(1),
+        Action::MirrorRun         => app.mirror_run_selected(),
+        Action::MirrorRunPending  => app.mirror_run_pending(),
+        Action::MirrorTogglePause => app.mirror_toggle_pause(),
         Action::PtyNew         => open_pty_menu(app),
         // Every launch below funnels through build_launch(target, how) — one
         // builder, the same net/env/placement for all. Targets that are ready
@@ -12281,6 +12519,16 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             if app.structd.pending && app.structd.full_lines.is_none() {
                 app.structd.spin = app.structd.spin.wrapping_add(1);
             }
+            // Mirrors is the one pane that polls: a job's state is derived
+            // from wall time (pending flips as intervals elapse) and runs
+            // are started by the engine's scheduler, so there is no push
+            // event to react to. Throttled to ~2s while focused.
+            if app.focus == Pane::Mirrors
+                && app.mirrors_loaded_at
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
+            {
+                app.load_mirrors();
+            }
             // No periodic refresh — the engine pushes overlay /
             // process_added / session_* events on the subscribe stream
             // (see on_event), so the UI reacts to actual change instead
@@ -12736,7 +12984,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             app.should_quit = true;
                         }
                         KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'
-                                           |'?'|'P'|'i'|'w'|'v'|'s')) =>
+                                           |'?'|'P'|'i'|'w'|'v'|'s'|'M')) =>
                             dispatch_menubar_key(&mut app, c),
                         _ => {}
                     }
@@ -12798,7 +13046,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // Letter accelerators: route through the same
                     // dispatch_menubar_key the F9 menu-nav path uses,
                     // so the two paths can't diverge.
-                    KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'w'|'v'|'s')) =>
+                    KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'w'|'v'|'s'|'M')) =>
                         dispatch_menubar_key(&mut app, c),
                     // Esc / Backspace from the packet drill-down pops back
                     // to the flows list, keeping its cursor + detail state.
@@ -15500,5 +15748,40 @@ mod tests {
         let tree = build_pipeline_tree(rows);
         assert_eq!(tree.len(), 2);
         assert!(tree.iter().all(|r| r.get("depth").and_then(Value::as_i64) == Some(0)));
+    }
+
+    /// The Mirrors pane end to end (headless): a job added to the store shows
+    /// up as a "pending" row when the pane gains focus, and the space action
+    /// (pause/resume) flips it to "paused" in both the store and the render.
+    #[test]
+    fn mirrors_pane_lists_jobs_and_space_toggles_pause() {
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir()
+            .join(format!("sarun-mirrorsui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: serialized by TEST_STATE_HOME_LOCK with the other
+        // state-home-dependent tests.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let id = crate::mirrors::job_add(
+            "git", "https://example.com/x.git", "/depot/x", 3600).unwrap();
+        let mut app = headless_app();
+        app.go_to_pane(Pane::Mirrors);
+        assert!(matches!(app.focus, Pane::Mirrors));
+        let job = app.mirror_jobs.iter().find(|j| j.id == id)
+            .expect("job must load on focus");
+        assert_eq!(job.state, "pending", "never-ran job is due now");
+        let buf = render_to_string(&app, 120, 30).unwrap();
+        assert!(buf.contains("pending"), "job row not rendered:\n{buf}");
+        assert!(buf.contains("/depot/x"), "job row not rendered:\n{buf}");
+
+        run_pane_action(&mut app, PaneAction::MirrorTogglePause);
+        let job = app.mirror_jobs.iter().find(|j| j.id == id).unwrap();
+        assert!(job.paused);
+        assert_eq!(job.state, "paused");
+        let buf = render_to_string(&app, 120, 30).unwrap();
+        assert!(buf.contains("paused"), "pause must show:\n{buf}");
     }
 }
