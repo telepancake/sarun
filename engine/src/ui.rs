@@ -5237,15 +5237,28 @@ fn sessions_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let marked = app.is_marked(&g("session_id"));
         let mark = if marked { MARK_GLYPH } else { " " };
         let text = format!("{mark}{flag:<1} {name_col:<name_w$} {pid_str:<pid_w$} {cmdc:<cmd_w$} {age:>age_w$}");
-        let line = if i == app.sel_session {
-            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+        let base = if i == app.sel_session {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
         } else if marked {
-            Line::from(Span::styled(text,
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)))
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
         } else {
-            Line::from(Span::styled(text, Style::default().fg(color)))
+            Style::default().fg(color)
         };
-        out.push(line);
+        // External RO references (session_dict "attachments") ride the
+        // owning row — they are not boxes, so they get no row of their
+        // own; a dim trailing tag per attachment names the pinned rev.
+        let atts: String = s.get("attachments").and_then(Value::as_array)
+            .map(|a| a.iter()
+                .filter_map(|x| x.get("name").and_then(Value::as_str))
+                .map(|n| format!(" ⟨{n}⟩"))
+                .collect())
+            .unwrap_or_default();
+        let mut spans = vec![Span::styled(text, base)];
+        if !atts.is_empty() {
+            spans.push(Span::styled(atts,
+                base.add_modifier(Modifier::DIM)));
+        }
+        out.push(Line::from(spans));
     }
     out
 }

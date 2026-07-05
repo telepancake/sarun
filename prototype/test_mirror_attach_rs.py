@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Mirror→box serve path, all three kinds, through the REAL CLI
-(`sarun NAME attach git|wiki|ietf …` — MIRRORS.md phase 4): build a git
-mirror store, a wikimak wikipedia instance, and an ietf-mirror root
+"""Mirror serve path, all three kinds, through the REAL CLI
+(`sarun NAME attach git|wiki|ietf …` — ATTACH-CONVERGENCE.md): build a
+git mirror store, a wikimak wikipedia instance, and an ietf-mirror root
 (update against a local stand-in HTTP server), attach one object of
-each to a box, and prove the §8 semantics inside the box.
+each to a box as an EXTERNAL RO reference (no import, no new box), and
+prove the §8 semantics inside the box.
 
 Real-effect assertions (never shape-only):
+  • each attach is bookkeeping-only: box count never changes
   • each attached object's bytes are readable in the box (captured copy)
   • a write to an attached key is EROFS with NO captured row
-  • all three attachments appear in the session's parents (UI DAG)
+  • all three attachments appear in the session dict's "attachments",
+    named for their objects (git:…/main@sha8, wiki:…@rN, ietf:…@rev)
 
 Needs FUSE + bwrap + git; builds gitdepot/wikimak/ietfmak via cargo if
 absent. Run:
@@ -179,15 +182,27 @@ def main():
         sp = newest_sqlar()
         sid = int(sp.stem)
 
-        # All three attach kinds, through the REAL CLI surface.
-        for cli in (["attach", "git", str(store), "main", "gitsdk"],
-                    ["attach", "wiki", str(wroot), "1", "wiki"],
-                    ["attach", "ietf", str(iroot), "draft-test-mesh", "ietf"]):
+        # All three attach kinds, through the REAL CLI surface. Each is
+        # bookkeeping-only: the reply names the pinned object and NO box
+        # appears.
+        before = {p.name for p in Path(os.environ["XDG_STATE_HOME"])
+                  .joinpath("slopbox.MAT").glob("*.sqlar")}
+        for cli, want in ((["attach", "git", str(store), "main", "gitsdk"],
+                           "attached git:gitstore/main@"),
+                          (["attach", "wiki", str(wroot), "1", "wiki"],
+                           "attached wiki:wiki/Old Title@r"),
+                          (["attach", "ietf", str(iroot), "draft-test-mesh",
+                            "ietf"],
+                           "attached ietf:draft-test-mesh@01")):
             r = subprocess.run([str(BIN), "WORK", *cli],
                                capture_output=True, text=True, timeout=60)
-            check(r.returncode == 0 and "attached box" in r.stdout,
-                  f"CLI {' '.join(cli[:2])} succeeds "
+            check(r.returncode == 0 and want in r.stdout,
+                  f"CLI {' '.join(cli[:2])} succeeds, prints name+rev "
                   f"(rc={r.returncode}: {(r.stderr or r.stdout)[:200]})")
+        after = {p.name for p in Path(os.environ["XDG_STATE_HOME"])
+                 .joinpath("slopbox.MAT").glob("*.sqlar")}
+        check(after == before,
+              "box count unchanged by all three attaches (no import)")
 
         # Read every attached object through the box; capture proves it.
         script = ("cat /gitsdk/tool.txt '/wiki/Old Title.txt' "
@@ -213,18 +228,25 @@ def main():
             check(key.strip("'").lstrip("/") not in rows(sp),
                   f"rejected write to {key} left NO captured row")
 
-        # UI DAG: three attachments in parents, named for their objects.
+        # UI visibility: three rows in the session dict's "attachments",
+        # named for their objects; parents stay box-only (empty here).
         rep = m.sync_request(sock, type="ui", verb="session_dicts", args=[])
         sessions = (rep or {}).get("r", [])
         mine = next((s for s in sessions if s.get("box_id") == sid), {})
-        parents = mine.get("parents") or []
-        check(len(parents) == 3,
-              f"three attachments in session parents (got {parents!r})")
-        names = {s.get("name") for s in sessions}
+        atts = mine.get("attachments") or []
+        check(len(atts) == 3,
+              f"three rows in session attachments (got {atts!r})")
+        names = [a.get("name") for a in atts]
+        kinds = [a.get("kind") for a in atts]
         for want in ("git:gitstore/main@", "wiki:wiki/Old Title@r",
                      "ietf:draft-test-mesh@01"):
             check(any(n and n.startswith(want) for n in names),
-                  f"attachment box named {want}… (names {sorted(filter(None, names))!r})")
+                  f"attachment named {want}… (names {names!r})")
+        check(kinds == ["git", "wiki", "ietf"]
+              and all(a.get("rev") for a in atts),
+              f"attachment rows carry kind + pinned rev (got {atts!r})")
+        check(mine.get("parents") == [],
+              f"no phantom parents for attachments (got {mine.get('parents')!r})")
     finally:
         if eng:
             eng.terminate()

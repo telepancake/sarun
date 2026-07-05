@@ -158,8 +158,14 @@ fn open_readout(ext: &ExtRef) -> Result<Arc<dyn Readout>, String> {
             let inst = open_wiki_instance(&ext.store)?;
             let page: u64 = ext.refname.parse().map_err(|_|
                 format!("wiki ref {:?} is not a page id", ext.refname))?;
-            let title = ext.name.split(':').nth(1)
-                .and_then(|s| s.rsplit_once('@').map(|(t, _)| t.to_string()));
+            // name is "wiki:<wiki>/<title>@r<rev>" (control.rs
+            // wiki_attach): strip the kind, drop the pin at the LAST
+            // '@' (titles may contain '@'), drop the wiki label at the
+            // FIRST '/' (titles may contain '/').
+            let title = ext.name.strip_prefix("wiki:")
+                .and_then(|s| s.rsplit_once('@'))
+                .and_then(|(t, _)| t.split_once('/'))
+                .map(|(_, t)| t.to_string());
             Ok(Arc::new(wikimak_wikipedia::readout::PageHeadReadout::new(
                 inst, page, title.as_deref())))
         }

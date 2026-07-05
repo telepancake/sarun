@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""git_attach (MIRRORS.md phase 4) against the RUST engine: a git ref
-from a gitdepot mirror store attaches to a box as a READ-ONLY layer —
-no checkout, no working tree. The verb resolves the ref's view from the
-store, imports it as a fresh at-rest box, and appends it to the box's
-RO attachments; from there DEPOT-DESIGN.md §8 semantics apply.
+"""git_attach (ATTACH-CONVERGENCE.md) against the RUST engine: a git
+ref from a gitdepot mirror store attaches to a box as an EXTERNAL RO
+reference — bookkeeping only, no import, no new at-rest box. The verb
+resolves ref→sha from the store's meta.json, pins it as an Ext row,
+and the overlay serves the tree straight from the store on first read;
+from there DEPOT-DESIGN.md §8 semantics apply.
 
 Real-effect assertions (never shape-only):
-  • the imported box's sqlar holds the repo's files (modes converted)
+  • attach reply carries name+sha, NO box id; box count is unchanged
+  • the served tree shows the NEWEST commit's bytes + exec bits (modes
+    converted) through the mount — no checkout, no working tree
   • read-through: `cat` of an attached repo file captures its bytes
   • EROFS: writing an attached repo key fails, leaving no captured row
-  • the attachment shows in the session's parents (UI DAG visibility)
+  • the attachment shows in the session dict's "attachments" (UI
+    visibility), named git:<label>/<ref>@<sha8>
 
 Needs FUSE + bwrap + git + a built gitdepot (cargo builds it if absent).
 Run:
@@ -77,6 +81,11 @@ def newest_sqlar():
                .glob("*.sqlar"), key=lambda p: int(p.stem))
 
 
+def sqlar_set():
+    return {p.name for p in Path(os.environ["XDG_STATE_HOME"])
+            .joinpath("slopbox.GAT").glob("*.sqlar")}
+
+
 def rows(sp):
     with sqlite3.connect(f"file:{sp}?mode=ro", uri=True) as c:
         return {name: (rowid, mode, data) for rowid, name, mode, data in
@@ -142,24 +151,34 @@ def main():
         check(r.returncode == 0, f"setup run exits 0 (rc={r.returncode}: {r.stderr[:200]})")
         sp = newest_sqlar()
         sid = int(sp.stem)
+        before = sqlar_set()
         rep = m.sync_request(sock, type="ui", verb="git_attach",
                              args=[sid, str(store), "main", "gitsdk"])
         rr = (rep or {}).get("r", {})
         check(rr.get("ok") is True, f"git_attach verb succeeds (got {rep!r})")
-        gid = rr.get("box")
+        check("box" not in rr, f"reply carries NO box id (got {rr!r})")
+        aname = rr.get("name") or ""
+        sha = rr.get("sha") or ""
+        check(aname.startswith("git:") and "/main@" in aname,
+              f"reply names the attachment repo/ref (got {aname!r})")
+        check(len(sha) == 40 and aname.endswith(sha[:8]),
+              f"reply pins the full sha, name carries sha8 (got {sha!r})")
+        check(sqlar_set() == before,
+              "box count unchanged — reference, not import")
 
-        # The imported box holds the repo's files, right modes, no checkout.
-        gsp = m.sqlar_path(str(gid))
-        check(row_bytes(m, gsp, "gitsdk/README") == b"readme v2\n",
-              "imported box serves the NEWEST commit's bytes")
-        grows = rows(gsp)
-        check("gitsdk/sdk/run.sh" in grows
-              and (grows["gitsdk/sdk/run.sh"][1] & 0o111) != 0,
+        # The served tree is the NEWEST commit, modes converted, through
+        # the mount (there is no imported box to inspect).
+        r = subprocess.run(
+            [str(BIN), "run", "WORK", "--", "sh", "-c",
+             "cat /gitsdk/README > /readme.txt; "
+             "test -x /gitsdk/sdk/run.sh && echo exec > /xbit.txt"],
+            capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0,
+              f"served-tree probe exits 0 (rc={r.returncode}: {r.stderr[:200]})")
+        check(row_bytes(m, sp, "readme.txt") == b"readme v2\n",
+              "attachment serves the NEWEST commit's bytes")
+        check(row_bytes(m, sp, "xbit.txt") == b"exec\n",
               "executable bit survived the git mode conversion")
-        with sqlite3.connect(f"file:{gsp}?mode=ro", uri=True) as c:
-            name = dict(c.execute("SELECT key,value FROM meta")).get("name")
-        check(name and name.startswith("git:") and "/main@" in name,
-              f"imported box named repo/ref (got {name!r})")
 
         # Read-through into the working box's captured layer.
         r = subprocess.run(
@@ -180,12 +199,19 @@ def main():
         check("gitsdk/README" not in rows(sp),
               "rejected write left NO captured row")
 
-        # UI DAG visibility: the attachment is one of WORK's parents.
+        # UI visibility: the attachment rides the session dict's
+        # "attachments" (it is NOT a box, so never a parent).
         rep = m.sync_request(sock, type="ui", verb="session_dicts", args=[])
         sessions = (rep or {}).get("r", [])
         mine = next((s for s in sessions if s.get("box_id") == sid), {})
-        check(gid in (mine.get("parents") or []),
-              f"attachment listed in session parents (got {mine.get('parents')!r})")
+        atts = mine.get("attachments") or []
+        check([a.get("name") for a in atts] == [aname],
+              f"attachment listed in session attachments (got {atts!r})")
+        check(atts and atts[0].get("kind") == "git"
+              and atts[0].get("rev") == sha,
+              f"attachment row pins kind+rev (got {atts!r})")
+        check(mine.get("parents") == [],
+              f"no phantom parent for the attachment (got {mine.get('parents')!r})")
     finally:
         if eng:
             eng.terminate()

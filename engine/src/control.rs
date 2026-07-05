@@ -1520,8 +1520,29 @@ macro_rules! ui_verbs {
             // active-set behavior).
             let runpids: std::collections::HashMap<i64, i32> =
                 lock(state).box_runpids.clone();
+            let ov = lock(state).overlay.clone();
             Value::Array(boxes.values().map(|b| {
                 let mut sd = discover::session_dict(&boxes, b);
+                // Ext attachments carry an open error only on the LIVE
+                // overlay object (discover reads meta alone) — merge it
+                // in by name, without triggering any build/open.
+                if let Some(ov) = ov.as_ref() {
+                    let errs = ov.ext_errors(b.box_id);
+                    if !errs.is_empty() {
+                        if let Some(atts) = sd.get_mut("attachments")
+                            .and_then(Value::as_array_mut)
+                        {
+                            for a in atts {
+                                if let Some(e) = a.get("name")
+                                    .and_then(Value::as_str)
+                                    .and_then(|n| errs.get(n))
+                                {
+                                    a["error"] = json!(e);
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(&pid) = runpids.get(&b.box_id) {
                     if let Some(obj) = sd.as_object_mut() {
                         obj.insert("live".into(), Value::Bool(true));
@@ -1751,13 +1772,14 @@ macro_rules! ui_verbs {
             ov.invalidate_ext(sid);
             json!({"ok": true})
         }
-        // Attach a git ref from a gitdepot mirror store (MIRRORS.md
-        // phase 4): resolve the ref's tree VIEW from the store, import
-        // it as a fresh at-rest box (its own layer; no checkout, no
-        // parent), and append that box to sid's RO attachments. args:
+        // Attach a git ref from a gitdepot mirror store
+        // (ATTACH-CONVERGENCE.md): bookkeeping only — resolve ref→sha
+        // from meta.json (no chain walk, no import, no new box) and
+        // append an Ext row to sid's RO attachments; the overlay serves
+        // the tree straight from the store on first read. args:
         // [sid, store_path, refname, prefix?] — prefix nests the tree
         // (e.g. "src" serves the repo under /src).
-        "git_attach", "SID STORE REF [PREFIX]", "attach a git ref from a mirror store as an RO layer" => {
+        "git_attach", "SID STORE REF [PREFIX]", "attach a git ref from a mirror store as a read-only external reference" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -1772,8 +1794,10 @@ macro_rules! ui_verbs {
                 return json!({"ok": false, "error": "need store path + ref"});
             };
             let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
-            let (meta, views) =
-                match gitdepot::chain::read_store(std::path::Path::new(store)) {
+            // meta.json alone carries refs + the commit list — enough to
+            // resolve and membership-check without decoding the chain.
+            let meta =
+                match gitdepot::chain::read_meta(std::path::Path::new(store)) {
                     Ok(v) => v,
                     Err(e) => return json!({"ok": false,
                                             "error": format!("store: {e}")}),
@@ -1801,15 +1825,9 @@ macro_rules! ui_verbs {
                     }
                 }
             };
-            let Some(idx) = meta.commits.iter().position(|c| c.sha == sha)
-            else {
+            if !meta.commits.iter().any(|c| c.sha == sha) {
                 return json!({"ok": false, "error": "ref target not in chain"});
-            };
-            let layer = match crate::depot::layer_from_git_view(&views[idx],
-                                                                prefix) {
-                Ok(l) => l,
-                Err(e) => return json!({"ok": false, "error": e}),
-            };
+            }
             // WHICH git: the store's label (`mirror` stamps it from the
             // URL). Unlabeled direct imports fall back to the store's
             // path: the directory itself, unless it's the mirror
@@ -1828,16 +1846,24 @@ macro_rules! ui_verbs {
                 meta.label.clone()
             };
             let short: String = sha.chars().take(8).collect();
-            match attach_ro_layer(&ov, &b, &layer,
-                                  &format!("git:{label}/{refname}@{short}")) {
-                Ok(gid) => json!({"ok": true, "box": gid, "sha": sha}),
-                Err(e) => json!({"ok": false, "error": e}),
-            }
+            let name = format!("git:{label}/{refname}@{short}");
+            let mut rows = b.ro_attachment_list();
+            rows.push(crate::capture::RoAttachment::Ext(
+                crate::capture::ExtRef {
+                    kind: "git".into(), store: store.to_string(),
+                    refname: refname.to_string(), rev: sha.clone(),
+                    prefix: prefix.to_string(), name: name.clone(),
+                }));
+            b.set_ro_attachments(rows);
+            ov.invalidate_ext(sid);
+            json!({"ok": true, "name": name, "sha": sha})
         }
         // Attach a wikipedia mirror page (wikimak instance root) as an
-        // RO layer: args [sid, root, page_id, prefix?]. The box holds
-        // the page's HEAD text as page-<id>.txt under prefix.
-        "wiki_attach", "SID ROOT PAGE [PREFIX]", "attach a wikipedia mirror page as an RO layer" => {
+        // external RO reference: args [sid, root, page_id, prefix?].
+        // Bookkeeping only — title/id resolution + head rev pin here;
+        // the page text is decoded by the overlay's readout on first
+        // read and serves as <title>.txt under prefix.
+        "wiki_attach", "SID ROOT PAGE [PREFIX]", "attach a wikipedia mirror page as a read-only external reference" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -1892,35 +1918,40 @@ macro_rules! ui_verbs {
                         .find(|(i, _)| *i == page).map(|(_, t)| t))
                     .unwrap_or_else(|| format!("page-{page}")),
             };
-            let (head, text) = match (inst.page_head(page),
-                                      inst.page_head_text(page)) {
-                (Ok(Some(h)), Ok(Some(t))) => (h, t),
-                (Ok(None), _) | (_, Ok(None)) =>
-                    return json!({"ok": false,
-                                  "error": format!("no page {page}")}),
-                (Err(e), _) | (_, Err(e)) =>
-                    return json!({"ok": false, "error": e.to_string()}),
+            // page_head only — the rev pin; text stays in the store
+            // until the overlay's readout decodes it at first read.
+            let head = match inst.page_head(page) {
+                Ok(Some(h)) => h,
+                Ok(None) => return json!({"ok": false,
+                                          "error": format!("no page {page}")}),
+                Err(e) => return json!({"ok": false, "error": e.to_string()}),
             };
             // WHICH wiki: the instance root's directory name.
             let wiki = std::path::Path::new(root).file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "wiki".into());
-            let fname: String = title.chars()
-                .map(|c| if c == '/' || c == '\0' { '_' } else { c })
-                .collect();
-            let layer = files_layer(prefix, &[(format!("{fname}.txt"), text)]);
-            match attach_ro_layer(&ov, &b, &layer,
-                    &format!("wiki:{wiki}/{title}@r{}", head.rev_id)) {
-                Ok(gid) => json!({"ok": true, "box": gid, "page": page,
-                                  "title": title, "rev": head.rev_id}),
-                Err(e) => json!({"ok": false, "error": e}),
-            }
+            // attach.rs recovers the title from this exact shape
+            // (strip "wiki:", drop the wiki label at the first '/',
+            // rsplit the '@rN' pin) — keep the three in lockstep.
+            let name = format!("wiki:{wiki}/{title}@r{}", head.rev_id);
+            let mut rows = b.ro_attachment_list();
+            rows.push(crate::capture::RoAttachment::Ext(
+                crate::capture::ExtRef {
+                    kind: "wiki".into(), store: root.to_string(),
+                    refname: page.to_string(),
+                    rev: head.rev_id.to_string(),
+                    prefix: prefix.to_string(), name: name.clone(),
+                }));
+            b.set_ro_attachments(rows);
+            ov.invalidate_ext(sid);
+            json!({"ok": true, "name": name, "page": page,
+                   "title": title, "rev": head.rev_id})
         }
-        // Attach an IETF draft series (ietf-mirror root) as an RO layer:
-        // args [sid, root, draft, prefix?]. The box holds every mirrored
-        // revision as <draft>-<rev>.txt under prefix — a whole series is
-        // small and the history is the point of a drafts mirror.
-        "ietf_attach", "SID ROOT DRAFT [PREFIX]", "attach an IETF draft series as an RO layer" => {
+        // Attach an IETF draft series (ietf-mirror root) as an external
+        // RO reference: args [sid, root, draft, prefix?]. Bookkeeping
+        // only — head-rev pin here; the readout serves every mirrored
+        // revision as <draft>-<rev>.txt under prefix at first read.
+        "ietf_attach", "SID ROOT DRAFT [PREFIX]", "attach an IETF draft series as a read-only external reference" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -1940,22 +1971,25 @@ macro_rules! ui_verbs {
                 Ok(m) => m,
                 Err(e) => return json!({"ok": false, "error": e.to_string()}),
             };
-            let hist = match m.history(draft) {
-                Ok(h) if !h.is_empty() => h,
-                Ok(_) => return json!({"ok": false,
-                                       "error": format!("no draft {draft}")}),
+            // head() decodes ONE layer for the rev pin — never the full
+            // history() walk; that happens readout-side at first read.
+            let head_rev = match m.head(draft) {
+                Ok(Some(h)) => h.rev,
+                Ok(None) => return json!({"ok": false,
+                                          "error": format!("no draft {draft}")}),
                 Err(e) => return json!({"ok": false, "error": e.to_string()}),
             };
-            let head_rev = hist[0].rev.clone();
-            let files: Vec<(String, Vec<u8>)> = hist.into_iter()
-                .map(|e| (format!("{draft}-{}.txt", e.rev), e.text))
-                .collect();
-            let layer = files_layer(prefix, &files);
-            match attach_ro_layer(&ov, &b, &layer,
-                                  &format!("ietf:{draft}@{head_rev}")) {
-                Ok(gid) => json!({"ok": true, "box": gid, "rev": head_rev}),
-                Err(e) => json!({"ok": false, "error": e}),
-            }
+            let name = format!("ietf:{draft}@{head_rev}");
+            let mut rows = b.ro_attachment_list();
+            rows.push(crate::capture::RoAttachment::Ext(
+                crate::capture::ExtRef {
+                    kind: "ietf".into(), store: root.to_string(),
+                    refname: draft.to_string(), rev: head_rev.clone(),
+                    prefix: prefix.to_string(), name: name.clone(),
+                }));
+            b.set_ro_attachments(rows);
+            ov.invalidate_ext(sid);
+            json!({"ok": true, "name": name, "rev": head_rev})
         }
         // Mirror-update jobs (mirrors.rs): the schedule surface.
         "mirror_jobs", "", "list scheduled mirror-update jobs" => { match crate::mirrors::jobs_list() {
@@ -3411,60 +3445,6 @@ fn hydrate_box(ov: &crate::overlay::Overlay, sid: i64)
     ov.box_of(sid)
 }
 
-/// Import `layer` as a FRESH at-rest box named `name` (no parent — a
-/// mirror snapshot is its own bottom) and append it to `b`'s RO
-/// attachments. Returns the new box id. The §8 serve path shared by the
-/// git/wiki/ietf attach verbs.
-fn attach_ro_layer(ov: &crate::overlay::Overlay,
-                   b: &std::sync::Arc<crate::capture::BoxState>,
-                   layer: &depot_model::Layer, name: &str)
-    -> Result<i64, String>
-{
-    // Same id rule as run: one past everything at rest or live.
-    let rest_max = std::fs::read_dir(crate::paths::state_home())
-        .map(|rd| rd.flatten()
-            .filter_map(|e| e.path().file_stem()?.to_str()?.parse::<i64>().ok())
-            .max().unwrap_or(0))
-        .unwrap_or(0);
-    let live_max = ov.box_ids().into_iter().max().unwrap_or(0);
-    let gid = rest_max.max(live_max) + 1;
-    let gb = crate::capture::BoxState::create(gid)
-        .map_err(|e| format!("sqlar: {e}"))?;
-    {
-        let conn = gb.conn.lock().unwrap();
-        crate::depot::import_layer(&conn, gid, layer)?;
-    }
-    gb.set_meta("name", name);
-    gb.load_mirror();
-    ov.add_box(std::sync::Arc::new(gb));
-    let mut ids = b.ro_attachment_list();
-    ids.push(crate::capture::RoAttachment::Box(gid));
-    b.set_ro_attachments(ids);
-    Ok(gid)
-}
-
-/// A layer of plain read-only text files under slash-separated `prefix`
-/// (`""` = box root) — the wiki/ietf attach shape.
-fn files_layer(prefix: &str, files: &[(String, Vec<u8>)]) -> depot_model::Layer {
-    let view = depot_model::View {
-        blob: None,
-        attrs: Default::default(),
-        children: files.iter().map(|(name, bytes)| {
-            (name.as_bytes().to_vec(), depot_model::View {
-                blob: Some(bytes.clone()),
-                attrs: depot_model::Attrs::from([
-                    (b"mode".to_vec(), b"100644".to_vec()),
-                ]),
-                children: Default::default(),
-            })
-        }).collect(),
-    };
-    // Reuse the git-view converter: same octal-mode dialect in, engine
-    // dialect out. Flat text files cannot fail it.
-    crate::depot::layer_from_git_view(&view, prefix)
-        .expect("flat files layer")
-}
-
 /// Open a wikimak instance READ-ONLY-ish (the read paths never write
 /// chains) with the same sizing defaults as the wikimak driver CLI.
 fn open_wiki_instance(root: &str)
@@ -3825,8 +3805,9 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
         // sarun NAME attach git <store> <ref> [PREFIX]
         //                  attach wiki <root> <page-id> [PREFIX]
         //                  attach ietf <root> <draft> [PREFIX]
-        // Mirror→box serve path (MIRRORS.md phase 4): snapshot the mirror
-        // object into a fresh RO box and attach it to NAME.
+        // Mirror serve path (ATTACH-CONVERGENCE.md): pin the mirror
+        // object as an external RO reference on NAME — no import, the
+        // overlay serves it from the store on first read.
         Some("attach") => {
             let (Some(kind), Some(src), Some(key)) =
                 (argv.get(2), argv.get(3), argv.get(4)) else {
@@ -3869,8 +3850,11 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                     // verb-side early-return errors arrive bare.
                     let r = v.get("r").cloned().unwrap_or(v);
                     if r.get("ok").and_then(Value::as_bool) == Some(true) {
-                        println!("attached box {} to {name}",
-                            r.get("box").and_then(Value::as_i64).unwrap_or(-1));
+                        // The attachment's display name carries the
+                        // pinned rev ("…@<rev>") — the whole identity.
+                        println!("attached {} to {name}",
+                            r.get("name").and_then(Value::as_str)
+                             .unwrap_or("?"));
                         0
                     } else {
                         eprintln!("sarun-engine: {}",

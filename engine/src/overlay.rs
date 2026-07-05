@@ -830,6 +830,19 @@ impl Overlay {
         }).as_ref()
     }
 
+    /// Open errors of `owner`'s LIVE ext attachments, keyed by name.
+    /// Reads only what is already built/opened — never triggers a
+    /// build or a store open (the session list must stay lazy).
+    pub(crate) fn ext_errors(&self, owner: i64)
+        -> HashMap<String, String>
+    {
+        self.inner.ext.read().unwrap().get(&owner)
+            .map(|v| v.iter()
+                .filter_map(|a| a.error().map(|e| (a.ext.name.clone(), e)))
+                .collect())
+            .unwrap_or_default()
+    }
+
     /// Drop `owner`'s cached ExtAttachments — call after rewriting its
     /// attachment list so the next walk rebuilds from bookkeeping.
     pub(crate) fn invalidate_ext(&self, owner: i64) {

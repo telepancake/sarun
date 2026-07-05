@@ -138,9 +138,25 @@ pub fn session_dict(boxes: &BTreeMap<i64, Box_>, b: &Box_) -> Value {
     // the sessions pane flattens by), then RO attachments. The UI's
     // sideways navigation cycles these.
     let mut parents: Vec<i64> = b.parent.into_iter().collect();
+    // ro_attachments is heterogeneous (capture::RoAttachment): ints are
+    // box ids (DAG edges → parents), objects are external references
+    // (→ "attachments"). Open-error state lives on the LIVE overlay
+    // ExtAttachment; this reads on-disk meta only, so the session_dicts
+    // verb (control.rs) enriches these rows with "error".
+    let mut attachments: Vec<Value> = vec![];
     if let Some(j) = b.meta.get("ro_attachments") {
-        if let Ok(ids) = serde_json::from_str::<Vec<i64>>(j) {
-            parents.extend(ids);
+        if let Ok(rows) = serde_json::from_str::<Vec<Value>>(j) {
+            for r in rows {
+                if let Some(id) = r.as_i64() {
+                    parents.push(id);
+                } else if r.is_object() {
+                    attachments.push(json!({
+                        "name": r.get("name").cloned().unwrap_or_default(),
+                        "kind": r.get("kind").cloned().unwrap_or_default(),
+                        "rev": r.get("rev").cloned().unwrap_or_default(),
+                    }));
+                }
+            }
         }
     }
     json!({
@@ -161,6 +177,9 @@ pub fn session_dict(boxes: &BTreeMap<i64, Box_>, b: &Box_) -> Value {
         // tree the sessions pane flattens by), then RO attachments. The
         // UI's sideways navigation cycles these.
         "parents": parents,
+        // External RO references (Ext rows): identity for the UI —
+        // NOT DAG edges, they have no box id.
+        "attachments": attachments,
         "started": b.started,
         "pid": 0,
         "status": "finished",
