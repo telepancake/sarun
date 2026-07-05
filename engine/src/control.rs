@@ -1710,6 +1710,97 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             b.set_ro_attachments(ids);
             json!({"ok": true})
         }
+        // Attach a git ref from a gitdepot mirror store (MIRRORS.md
+        // phase 4): resolve the ref's tree VIEW from the store, import
+        // it as a fresh at-rest box (its own layer; no checkout, no
+        // parent), and append that box to sid's RO attachments. args:
+        // [sid, store_path, refname, prefix?] — prefix nests the tree
+        // (e.g. "src" serves the repo under /src).
+        "git_attach" => {
+            let ov = lock(state).overlay.clone();
+            let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
+                return json!({"ok": false, "error": "no overlay / bad sid"});
+            };
+            if ov.box_of(sid).is_none() {
+                // Hydrate the at-rest target box.
+                if !crate::paths::state_home()
+                    .join(format!("{sid}.sqlar")).exists()
+                {
+                    return json!({"ok": false, "error": "no such box"});
+                }
+                match crate::capture::BoxState::create(sid) {
+                    Ok(tb) => {
+                        tb.load_mirror();
+                        ov.add_box(std::sync::Arc::new(tb));
+                    }
+                    Err(e) => return json!({"ok": false,
+                                            "error": e.to_string()}),
+                }
+            }
+            let Some(b) = ov.box_of(sid) else {
+                return json!({"ok": false, "error": "no such box"});
+            };
+            let (Some(store), Some(refname)) = (
+                args.get(1).and_then(Value::as_str),
+                args.get(2).and_then(Value::as_str),
+            ) else {
+                return json!({"ok": false, "error": "need store path + ref"});
+            };
+            let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
+            let (meta, views) =
+                match gitdepot::chain::read_store(std::path::Path::new(store)) {
+                    Ok(v) => v,
+                    Err(e) => return json!({"ok": false,
+                                            "error": format!("store: {e}")}),
+                };
+            // "main" matches "refs/heads/main"; full names match exactly.
+            let Some(r) = meta.refs.iter().find(|r| {
+                r.name == refname
+                    || r.name.strip_prefix("refs/heads/") == Some(refname)
+                    || r.name.strip_prefix("refs/tags/") == Some(refname)
+            }) else {
+                return json!({"ok": false,
+                              "error": format!("no ref {refname} in store")});
+            };
+            let Some(idx) = meta.commits.iter().position(|c| c.sha == r.sha)
+            else {
+                return json!({"ok": false, "error": "ref target not in chain"});
+            };
+            let layer = match crate::depot::layer_from_git_view(&views[idx],
+                                                                prefix) {
+                Ok(l) => l,
+                Err(e) => return json!({"ok": false, "error": e}),
+            };
+            // A fresh at-rest box holds the imported layer. Same id rule
+            // as run: one past everything at rest or live.
+            let rest_max = std::fs::read_dir(crate::paths::state_home())
+                .map(|rd| rd.flatten()
+                    .filter_map(|e| e.path().file_stem()?
+                        .to_str()?.parse::<i64>().ok())
+                    .max().unwrap_or(0))
+                .unwrap_or(0);
+            let live_max = ov.box_ids().into_iter().max().unwrap_or(0);
+            let gid = rest_max.max(live_max) + 1;
+            let gb = match crate::capture::BoxState::create(gid) {
+                Ok(gb) => gb,
+                Err(e) => return json!({"ok": false,
+                                        "error": format!("sqlar: {e}")}),
+            };
+            {
+                let conn = gb.conn.lock().unwrap();
+                if let Err(e) = crate::depot::import_layer(&conn, gid, &layer) {
+                    return json!({"ok": false, "error": e});
+                }
+            }
+            let short: String = r.sha.chars().take(8).collect();
+            gb.set_meta("name", &format!("git:{refname}@{short}"));
+            gb.load_mirror();
+            ov.add_box(std::sync::Arc::new(gb));
+            let mut ids = b.ro_attachments();
+            ids.push(gid);
+            b.set_ro_attachments(ids);
+            json!({"ok": true, "box": gid, "sha": r.sha})
+        }
         // Rotation (DEPOT-DESIGN.md §6): promote child box over its
         // parent. args: [child_sid]. Encodings are rewritten — no
         // layer's occlusion changes: the child box ends up holding the

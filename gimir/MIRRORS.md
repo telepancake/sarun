@@ -39,11 +39,19 @@ each corpus's shape wants, served through sarun. Three mirrors first:
    rewritten/topo-interleaved history → re-import). Fetch-and-update
    DONE (`mirror <url> <root>`: bare mirror clone under `<root>/repo.git`,
    store under `<root>/store`, non-fast-forward remote → wholesale
-   re-import — the mirror follows the remote). Remaining: RO-attach a
-   ref via the cache.
-4. **Serve/browse**: wikipedia browsing plan (docs/wikipedia-browsing-
-   plan.md) + list-widget DAG navigation already landed; a pane per
-   mirror later.
+   re-import — the mirror follows the remote). RO-attach DONE: the
+   engine's `git_attach` verb (control.rs) resolves store+ref to a view,
+   imports it as a fresh at-rest box (`layer_from_git_view`: git octal
+   modes → engine dialect; gitlinks become pin files), names it
+   `git:<ref>@<sha8>`, and appends it to the box's RO attachments — a
+   git ref in a workspace with NO checkout. `test_git_attach_rs.py`
+   proves read-through, EROFS, and DAG visibility. Remaining: serve via
+   depot-cache materialization instead of sqlar import (an
+   optimization, not a semantic change).
+4. **Serve/browse**: `git_attach` (above) is the first serve path — a
+   mirror snapshot in a running box's view. Wikipedia browsing plan
+   (docs/wikipedia-browsing-plan.md) + list-widget DAG navigation
+   already landed; wiki/draft attach verbs and a pane per mirror later.
 
 ## Non-goals for now
 
