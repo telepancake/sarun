@@ -1495,13 +1495,23 @@ pub fn write_api_box_net_shadows(net: &crate::net::Net)
     Ok(())
 }
 
-fn dispatch_ui(state: &State, msg: &Value) -> Value {
-    let verb = msg.get("verb").and_then(Value::as_str).unwrap_or("");
-    let empty = vec![];
-    let args = msg.get("args").and_then(Value::as_array).unwrap_or(&empty);
-    let boxes = discover::discover();
-    let r: Value = match verb {
-        "session_dicts" => {
+/// One row of the UI-verb surface. VERB_DOCS and the dispatch match both
+/// expand from the single `ui_verbs!` token list, so the docs cannot drift
+/// from the arms (same principle as the UI's PANE_KEYS-derived help).
+pub struct VerbDoc {
+    pub name: &'static str,
+    pub args: &'static str,
+    pub help: &'static str,
+}
+
+/// ONE edit site per verb: `"name", "ARGS", "help" => { body }`. Args
+/// notation: UPPER = required, [X] = optional, X... = variadic. The context
+/// idents (state/verb/args/boxes) ride in the list so the emitted fn's
+/// binders share the bodies' hygiene context (a plain `fn` in the emitter
+/// could not see `state` used by body tokens born in THIS macro).
+macro_rules! ui_verbs {
+    ($emit:ident) => { $emit! { (state, verb, args, boxes)
+        "session_dicts", "", "list every box with status metadata (live overridden for running boxes)" => {
             // discover::session_dict reads on-disk metadata only, so every box
             // looks "finished" to it. Override `live` / `status` / `pid` for
             // boxes whose runner is still registered with this engine — that's
@@ -1526,81 +1536,96 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 sd
             }).collect())
         }
-        "display_path" => match arg_sid(args) {
+        "display_path", "SID", "human display path for a box" => { match arg_sid(args) {
             Some(id) => Value::String(discover::display_path(&boxes, id)),
             None => Value::Null,
-        },
-        "resolve_box" => match args.first().and_then(Value::as_str)
+        }
+        }
+        "resolve_box", "NAME_OR_ID", "resolve a box name/id to its numeric id" => { match args.first().and_then(Value::as_str)
             .and_then(|s| resolve(&boxes, s)) {
             Some(id) => Value::String(id.to_string()),
             None => Value::Null,
-        },
-        "select" => {
+        }
+        }
+        "select", "SID", "set the engine-side selected box" => {
             if let Some(id) = arg_sid(args) {
                 lock(state).selected = Some(id.to_string());
             }
             json!({"ok": true})
         }
-        "processes" => match arg_sid(args) {
+        "processes", "SID", "captured process rows for a box" => { match arg_sid(args) {
             Some(id) => discover::processes(id),
             None => json!([]),
-        },
-        "outputs" => match arg_sid(args) {
+        }
+        }
+        "outputs", "SID", "decoded stdout/stderr transcript rows" => { match arg_sid(args) {
             Some(id) => discover::outputs(id),
             None => json!([]),
-        },
-        "api_log" => match arg_sid(args) {
+        }
+        }
+        "api_log", "SID", "--api oaita proxy request log" => { match arg_sid(args) {
             Some(id) => discover::api_log(id),
             None => json!([]),
-        },
-        "api_log_detail" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        }
+        }
+        "api_log_detail", "SID ROW", "full request/response detail of one api_log row" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::api_log_detail(id, rid),
             _ => Value::Null,
-        },
+        }
+        }
         // Web capture (DESIGN-web.md W4): summary rows + full detail, mirroring
         // api_log. Feeds the UI's Captures pane and the oaita web tools.
-        "webcap" => match arg_sid(args) {
+        "webcap", "SID", "web-capture summary rows (tap MITM archive)" => { match arg_sid(args) {
             Some(id) => discover::webcap(id),
             None => json!([]),
-        },
-        "webcap_detail" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        }
+        }
+        "webcap_detail", "SID ROW", "full detail of one web capture" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::webcap_detail(id, rid),
             _ => Value::Null,
-        },
+        }
+        }
         // Raw (base64) response body of one capture — for the image viewer,
         // which needs lossless binary the lossy-UTF8 detail can't carry.
-        "webcap_body" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "webcap_body", "SID ROW", "raw base64 response body of one capture" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::webcap_body(id, rid),
             _ => Value::Null,
-        },
-        "brushprov" => match arg_sid(args) {
+        }
+        }
+        "brushprov", "SID", "brush semantic-provenance rows (pipelines)" => { match arg_sid(args) {
             Some(id) => discover::brushprov(id),
             None => json!([]),
-        },
+        }
+        }
         // Phase 1 embedded-ninja: the parsed build-graph edges (outs/ins/cmd),
         // including up-to-date targets that never executed.
-        "build_edges" => match arg_sid(args) {
+        "build_edges", "SID", "parsed ninja/make build-graph edges" => { match arg_sid(args) {
             Some(id) => discover::build_edges(id),
             None => json!([]),
-        },
+        }
+        }
         // D9 brush↔process linkage joins (both directions).
-        "proc_pipeline" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "proc_pipeline", "SID ROW", "the pipeline a process belongs to" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::proc_pipeline(id, rid),
             _ => Value::Null,
-        },
-        "output_pipeline" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        }
+        }
+        "output_pipeline", "SID OUTPUT", "the pipeline an output row belongs to" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(oid)) => discover::output_pipeline(id, oid),
             _ => Value::Null,
-        },
-        "pipeline_procs" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        }
+        }
+        "pipeline_procs", "SID PIPELINE", "processes belonging to a pipeline" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(pid)) => discover::pipeline_procs(id, pid),
             _ => json!([]),
-        },
-        "output_detail" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        }
+        }
+        "output_detail", "SID OUTPUT", "one output row in full" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(oid)) => discover::output_detail(id, oid),
             _ => Value::Null,
-        },
-        "processes_live" => {
+        }
+        }
+        "processes_live", "SID", "process snapshot when the box is live, else null" => {
             // For a box whose runner is still registered the engine returns
             // the captured process set as the "live" snapshot; the UI uses
             // null vs non-null to choose live-style vs finished-style
@@ -1615,31 +1640,38 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 _ => Value::Null,
             }
         }
-        "proc_info" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "proc_info", "SID ROW", "one process row in full" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::proc_info(id, rid),
             _ => Value::Null,
-        },
-        "proc_prov" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        }
+        }
+        "proc_prov", "SID ROW", "brush provenance for one process" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::proc_prov(id, rid),
             _ => Value::Null,
-        },
-        "proc_roots" => match arg_sid(args) {
+        }
+        }
+        "proc_roots", "SID", "root processes of the captured tree" => { match arg_sid(args) {
             Some(id) => discover::proc_roots(id), None => json!([]),
-        },
-        "process_env" => match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        }
+        }
+        "process_env", "SID ROW", "recorded environment of one process" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::process_env(id, rid),
             _ => json!({}),
-        },
-        "writer_id" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+        }
+        }
+        "writer_id", "SID REL", "process that last wrote a path" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => discover::writer_id(id, rel), _ => Value::Null,
-        },
-        "first_writer_id" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+        }
+        }
+        "first_writer_id", "SID REL", "process that first wrote a path" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => discover::first_writer_id(id, rel), _ => Value::Null,
-        },
-        "first_writer_prov" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+        }
+        }
+        "first_writer_prov", "SID REL", "provenance of the first writer of a path" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => discover::first_writer_prov(id, rel), _ => Value::Null,
-        },
-        "kill" => match arg_sid(args) {
+        }
+        }
+        "kill", "SID", "SIGTERM the box's runner" => { match arg_sid(args) {
             Some(id) => {
                 let fd = lock(state).box_pids.get(&id).copied();
                 match fd {
@@ -1648,17 +1680,19 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 }
             }
             None => json!({"ok": false, "error": "no slopbox"}),
-        },
-        "dissolve" => match arg_sid(args) {
+        }
+        }
+        "dissolve", "SID", "finalize a box by file-rules and free it" => { match arg_sid(args) {
             Some(id) => dissolve(state, id),
             None => json!({"ok": false, "error": "no slopbox"}),
-        },
+        }
+        }
         // RO attachments (DEPOT-DESIGN.md §8): reference another box's
         // layer read-only, between this box and its parent in the lookup
         // chain. args: [sid, ro_box_id, ...] — the full ordered list
         // replaces the current one (empty list = detach all). The RO box
         // is hydrated from its at-rest sqlar if not already live.
-        "ro_attach" => {
+        "ro_attach", "SID [RO_ID...]", "replace the box's read-only attachment list" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -1703,7 +1737,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // parent), and append that box to sid's RO attachments. args:
         // [sid, store_path, refname, prefix?] — prefix nests the tree
         // (e.g. "src" serves the repo under /src).
-        "git_attach" => {
+        "git_attach", "SID STORE REF [PREFIX]", "attach a git ref from a mirror store as an RO layer" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -1783,7 +1817,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // Attach a wikipedia mirror page (wikimak instance root) as an
         // RO layer: args [sid, root, page_id, prefix?]. The box holds
         // the page's HEAD text as page-<id>.txt under prefix.
-        "wiki_attach" => {
+        "wiki_attach", "SID ROOT PAGE [PREFIX]", "attach a wikipedia mirror page as an RO layer" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -1866,7 +1900,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // args [sid, root, draft, prefix?]. The box holds every mirrored
         // revision as <draft>-<rev>.txt under prefix — a whole series is
         // small and the history is the point of a drafts mirror.
-        "ietf_attach" => {
+        "ietf_attach", "SID ROOT DRAFT [PREFIX]", "attach an IETF draft series as an RO layer" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -1904,12 +1938,13 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             }
         }
         // Mirror-update jobs (mirrors.rs): the schedule surface.
-        "mirror_jobs" => match crate::mirrors::jobs_list() {
+        "mirror_jobs", "", "list scheduled mirror-update jobs" => { match crate::mirrors::jobs_list() {
             Ok(jobs) => serde_json::to_value(jobs).unwrap_or(Value::Null),
             Err(e) => return json!({"ok": false, "error": e}),
-        },
+        }
+        }
         // args: [kind, src, dest, interval_secs]
-        "mirror_add" => {
+        "mirror_add", "KIND SRC DEST [INTERVAL_SECS]", "add a scheduled mirror-update job" => {
             let (Some(kind), Some(src), Some(dest)) = (
                 args.first().and_then(Value::as_str),
                 args.get(1).and_then(Value::as_str),
@@ -1924,20 +1959,22 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             }
         }
         // args: [id] — force-run one job now (paused included).
-        "mirror_run" => match args.first().and_then(Value::as_i64) {
+        "mirror_run", "ID", "force-run one mirror job now" => { match args.first().and_then(Value::as_i64) {
             Some(id) => match crate::mirrors::job_run(id) {
                 Ok(()) => json!({"ok": true}),
                 Err(e) => json!({"ok": false, "error": e}),
             },
             None => return json!({"ok": false, "error": "need job id"}),
-        },
+        }
+        }
         // Start every due/stopped unpaused job.
-        "mirror_run_pending" => match crate::mirrors::run_pending() {
+        "mirror_run_pending", "", "start every due unpaused mirror job" => { match crate::mirrors::run_pending() {
             Ok(ids) => json!({"ok": true, "started": ids}),
             Err(e) => json!({"ok": false, "error": e}),
-        },
+        }
+        }
         // args: [id, paused(bool)]
-        "mirror_pause" => {
+        "mirror_pause", "ID PAUSED", "pause or resume a mirror job" => {
             let (Some(id), Some(p)) = (
                 args.first().and_then(Value::as_i64),
                 args.get(1).and_then(Value::as_bool),
@@ -1950,13 +1987,14 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             }
         }
         // args: [id]
-        "mirror_rm" => match args.first().and_then(Value::as_i64) {
+        "mirror_rm", "ID", "remove a mirror job" => { match args.first().and_then(Value::as_i64) {
             Some(id) => match crate::mirrors::job_remove(id) {
                 Ok(()) => json!({"ok": true}),
                 Err(e) => json!({"ok": false, "error": e}),
             },
             None => return json!({"ok": false, "error": "need job id"}),
-        },
+        }
+        }
         // Rotation (DEPOT-DESIGN.md §6): promote child box over its
         // parent. args: [child_sid]. Encodings are rewritten — no
         // layer's occlusion changes: the child box ends up holding the
@@ -1964,7 +2002,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // the old parent box holds the inverse (replicas + holes) and
         // becomes the child. Purely syntactic — no view, no host I/O;
         // ancestors are consulted only as recorded data.
-        "rotate" => {
+        "rotate", "SID", "promote a child box over its parent (both at rest)" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(child_id)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -2066,14 +2104,15 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             parent.load_mirror();
             json!({"ok": true, "parent": child_id, "child": parent_id})
         }
-        "reload_rules" => {
+        "reload_rules", "", "reload the file-rules from disk" => {
             if let Some(ov) = lock(state).overlay.clone() {
                 ov.reload_rules();
             }
             json!(null)
         }
-        "rescan" => json!(null),   // discovery is always fresh; nothing to do
-        "delete" => match arg_sid(args) {
+        // discovery is always fresh; nothing to do
+        "rescan", "", "no-op; discovery is always fresh" => { json!(null) }
+        "delete", "SID", "discard a box's writes and free it, keeping children" => { match arg_sid(args) {
             // Free the box, KEEPING any boxes stacked on it: children have this
             // box's view copied down into them and are re-parented onto the
             // grandparent, so their merged view is unchanged. Unlike dissolve,
@@ -2082,25 +2121,30 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             // one when children exist, and never destroys a box not named.
             Some(id) => free_box(state, id, false),
             None => json!({"ok": false}),
-        },
-        "open_files" => json!([]),
-        "review_state" => json!({
+        }
+        }
+        "open_files", "", "compat stub; always []" => { json!([])
+        }
+        "review_state", "", "consolidation status + the selected box" => { json!({
             "consolidating": [], "consolidated": [],
             "selected": lock(state).selected,
-        }),
-        "review_live" => json!(false),
-        "review.session_changes" => match arg_sid(args) {
+        })
+        }
+        "review_live", "", "compat stub; always false" => { json!(false)
+        }
+        "review.session_changes", "SID", "changed files of a box" => { match arg_sid(args) {
             Some(id) => crate::review::session_changes(id),
             None => json!([]),
-        },
-        "review.hunks" => {
+        }
+        }
+        "review.hunks", "SID REL", "unified-diff hunks for one changed file" => {
             match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
                 (Some(id), Some(rel)) => crate::review::hunks(id, rel),
                 _ => json!({"is_text": false, "hunks": [],
                             "diff": {"kind": "error", "error": "bad args"}}),
             }
         }
-        "review.apply" => match arg_sid(args) {
+        "review.apply", "SID [PATHS]", "apply a box's changes to the host" => { match arg_sid(args) {
             // Audit H3: refuse a still-running box — its captured blobs may be
             // mid-write, so applying could stamp a torn blob onto the host.
             Some(id) if box_is_running(state, id) => json!({"applied": [],
@@ -2112,8 +2156,9 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                     args.get(1).unwrap_or(&Value::Null), &ctx);
                 drop_if_empty(state, id); r }
             None => json!({"applied": [], "errors": []}),
-        },
-        "review.discard" => match arg_sid(args) {
+        }
+        }
+        "review.discard", "SID [PATHS]", "discard a box's changes" => { match arg_sid(args) {
             // Audit H3: same running-box guard as apply (discard reads the same
             // blobs to copy them DOWN into children before dropping the row).
             Some(id) if box_is_running(state, id) => json!({"discarded": [],
@@ -2125,27 +2170,31 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                     args.get(1).unwrap_or(&Value::Null), &ctx);
                 drop_if_empty(state, id); r }
             None => json!({"discarded": [], "errors": []}),
-        },
-        "review.patch_text" => match arg_sid(args) {
+        }
+        }
+        "review.patch_text", "SID", "whole-box patch as base64" => { match arg_sid(args) {
             Some(id) => {
                 let data = crate::review::patch_text(id);
                 json!({"__b": base64::engine::general_purpose::STANDARD.encode(&data)})
             }
             None => json!({"__b": ""}),
-        },
-        "review.change_mode" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+        }
+        }
+        "review.change_mode", "SID REL", "current mode of one changed path" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => match crate::review::current_mode(id, rel) {
                 Some(m) => json!(m), None => Value::Null,
             },
             _ => Value::Null,
-        },
-        "review.decorate" => match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+        }
+        }
+        "review.decorate", "SID REL", "kind/stale/is_text label for one change" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => crate::review::decorate(id, rel),
             _ => json!({"is_text": false, "stale": false, "kind": "changed"}),
-        },
+        }
+        }
         // Newest-first slice of the box's change set, for the boxes view's
         // "recently changed" panel on a live box. limit defaults to 200.
-        "review.recent_changes" => {
+        "review.recent_changes", "SID [LIMIT]", "newest-first slice of the change set" => {
             let id = arg_sid(args);
             let limit = args.get(1).and_then(Value::as_i64).unwrap_or(200);
             match id {
@@ -2157,7 +2206,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // outputs / changes / processes / pipelines / build-edges in one
         // round-trip, capped at `limit` per kind (default 20). Changes
         // includes xattr modifications inline as kind="xattr" rows.
-        "review.box_summary" => {
+        "review.box_summary", "SID [LIMIT]", "outputs/changes/procs/pipelines/edges bundle" => {
             let id = arg_sid(args);
             let limit = args.get(1).and_then(Value::as_i64).unwrap_or(20);
             match id {
@@ -2184,7 +2233,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         }
         // The causal neighborhood of one pipeline: parent, children, owning
         // edge. args: [sid, brushprov_row_id].
-        "review.pipeline_context" => {
+        "review.pipeline_context", "SID PROV_ID", "causal neighborhood of one pipeline" => {
             let id = arg_sid(args);
             let prov_id = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
             match id {
@@ -2195,7 +2244,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // Search the box's recorded makefile variable assignments. args:
         // [sid, name_pattern, value_pattern, limit]. Patterns are cmd_match
         // text globs (bare word = substring); empty = match all.
-        "review.makevars" => {
+        "review.makevars", "SID [NAME_PAT] [VALUE_PAT] [LIMIT] [ANY]", "search recorded makefile variable assignments" => {
             let id = arg_sid(args);
             let name_pat = args.get(1).and_then(Value::as_str).unwrap_or("");
             let value_pat = args.get(2).and_then(Value::as_str).unwrap_or("");
@@ -2212,7 +2261,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // Map provenance row ids between the process / pipeline / edge
         // domains — the cross-pane generated filter's id translation.
         // args: [sid, from_kind, [ids...], to_kind] → [ids...].
-        "review.map_ids" => {
+        "review.map_ids", "SID FROM [IDS...] TO", "translate provenance row ids across domains" => {
             let id = arg_sid(args);
             let from = args.get(1).and_then(Value::as_str).unwrap_or("");
             let ids: Vec<i64> = args.get(2).and_then(Value::as_array)
@@ -2228,7 +2277,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // (kind / stale / is_text per row) — the UI uses this to label the
         // changes list with +/~/- glyphs and the `!` stale marker without a
         // round-trip per row.
-        "review.decorate_many" => {
+        "review.decorate_many", "SID [RELS...]", "bulk decorate a window of changes" => {
             let id = arg_sid(args);
             let rels: Vec<&str> = args.get(1).and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).collect())
@@ -2238,28 +2287,30 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 None => Value::Array(vec![]),
             }
         }
-        "review.apply_hunk" => match (arg_sid(args), args.get(1).and_then(Value::as_str),
+        "review.apply_hunk", "SID REL HUNK_IX", "apply one hunk to the host" => { match (arg_sid(args), args.get(1).and_then(Value::as_str),
                                       args.get(2).and_then(Value::as_i64)) {
             (Some(id), Some(rel), Some(ix)) => {
                 let r = crate::review::apply_hunk(id, rel, ix);
                 drop_if_empty(state, id); r
             }
             _ => json!({"ok": false, "error": "bad args"}),
-        },
-        "review.discard_hunk" => match (arg_sid(args), args.get(1).and_then(Value::as_str),
+        }
+        }
+        "review.discard_hunk", "SID REL HUNK_IX", "discard one hunk (revert it in the box)" => { match (arg_sid(args), args.get(1).and_then(Value::as_str),
                                         args.get(2).and_then(Value::as_i64)) {
             (Some(id), Some(rel), Some(ix)) => {
                 let r = crate::review::discard_hunk(id, rel, ix);
                 drop_if_empty(state, id); r
             }
             _ => json!({"ok": false, "error": "bad args"}),
-        },
+        }
+        }
         // ── server-side windowed views over per-box data ────────────────────
         // The UI lists are millions of rows in the limit; shipping the whole
         // set client-side made keystrokes multi-second. These verbs let the
         // client open a materialized view (filtered + sorted) and read it as
         // small windows — see views.rs.
-        "view.open" => {
+        "view.open", "KIND SID [FILTER] [RUNNING_ONLY]", "open a server-side windowed view" => {
             let kind = args.first().and_then(Value::as_str).unwrap_or("");
             // Accept either an int or a string-of-int for the sid (the Python
             // and Rust UIs both send strings, matching the existing verbs;
@@ -2276,26 +2327,26 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             let Shared { views, next_view_id, .. } = &mut *s;
             crate::views::open(views, next_view_id, kind, sid, &filter, running_only && live)
         }
-        "view.window" => {
+        "view.window", "VIEW START SIZE", "read one window of an open view" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let start = args.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
             let size = args.get(2).and_then(Value::as_u64).unwrap_or(0) as usize;
             let s = lock(state);
             crate::views::window(&s.views, vid, start, size)
         }
-        "view.filter" => {
+        "view.filter", "VIEW FILTER", "re-filter an open view" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let filter = args.get(1).cloned().unwrap_or(Value::Null);
             let mut s = lock(state);
             crate::views::set_filter(&mut s.views, vid, &filter)
         }
-        "view.find" => {
+        "view.find", "VIEW ROW_ID", "locate a row id inside a view" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let target_id = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
             let s = lock(state);
             crate::views::find(&s.views, vid, target_id)
         }
-        "view.close" => {
+        "view.close", "VIEW", "close a view" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let mut s = lock(state);
             crate::views::close(&mut s.views, vid)
@@ -2304,12 +2355,13 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // phase, no separate caches — these UI lifecycle pokes are vacuous, but
         // must not return "unknown verb".
         "consolidate_start" | "review.invalidate_consolidation"
-        | "review.invalidate_struct" => json!(null),
-        "ping" => {
+        | "review.invalidate_struct", "", "compat no-op lifecycle poke" => { json!(null)
+        }
+        "ping", "", "liveness check; broadcasts a pong event" => {
             broadcast(state, &json!({"type": "pong"}));
             json!("pong")
         }
-        "box_new" => {
+        "box_new", "[PARENT_SID]", "create an empty box and expose its mount" => {
             // m3a: create a box and expose <mnt>/<id> — the overlay-core path
             // (the full runner register handshake is m3b).
             let ov = lock(state).overlay.clone();
@@ -2344,7 +2396,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                                         "error": format!("box_new: {e}")}),
             }
         }
-        "struct_quick" => {
+        "struct_quick", "SID REL", "quick structural diff of a binary change" => {
             match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
                 (Some(id), Some(rel)) => crate::review::struct_quick(id, rel),
                 _ => json!({"lines": [["err", "bad args"]], "job": Value::Null}),
@@ -2354,7 +2406,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // flows.list  [SID]              → {ok, flows: [row, ...]}
         // flows.detail [SID, FRAME]      → {ok, text: "..."}
         // SID may be omitted to mean the currently-selected box.
-        "flows.list" => {
+        "flows.list", "[SID]", "tshark-decoded HTTP/TLS flow rows for a box" => {
             match arg_sid(args).or_else(|| selected_sid(state)) {
                 Some(id) => match flows_dir_for(id) {
                     Some(dir) => match crate::net::flows::tshark_list(&dir) {
@@ -2368,7 +2420,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 None => json!({"ok": false, "error": "no box selected"}),
             }
         }
-        "flows.detail" => {
+        "flows.detail", "[SID] FRAME", "full tshark decode of one frame" => {
             let frame = args.get(1).and_then(Value::as_u64).unwrap_or(0);
             match arg_sid(args).or_else(|| selected_sid(state)) {
                 Some(id) if frame > 0 => match flows_dir_for(id) {
@@ -2389,7 +2441,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         //   The TUI calls ui_active(true) on startup and ui_active(false)
         //   on shutdown; while inactive, dispatcher Ask short-circuits to
         //   deny so no connection wedges on an absent UI.
-        "prompts.peek" => {
+        "prompts.peek", "", "next pending network-permission prompt" => {
             match lock(state).net.clone() {
                 Some(net) => match net.prompts.peek() {
                     Some(ask) => json!({"ok": true, "ask": {
@@ -2402,7 +2454,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 None => json!({"ok": true, "ask": Value::Null}),
             }
         }
-        "prompts.answer" => {
+        "prompts.answer", "ID VERDICT", "answer a prompt (yes_once|no_once|allow_save|deny_save)" => {
             let id = args.first().and_then(Value::as_u64).unwrap_or(0);
             let v = args.get(1).and_then(Value::as_str).unwrap_or("");
             let Some(verdict) = crate::net::prompt::Verdict::parse(v) else {
@@ -2423,7 +2475,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 None => json!({"ok": false, "error": "no net registry"}),
             }
         }
-        "prompts.ui_active" => {
+        "prompts.ui_active", "BOOL", "mark the TUI prompt consumer active/inactive" => {
             let on = args.first().and_then(Value::as_bool).unwrap_or(false);
             if let Some(net) = lock(state).net.clone() {
                 net.prompts.mark_ui_active(on);
@@ -2433,7 +2485,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // flows.packets [SID, STREAM] → every frame in `tcp.stream == STREAM`
         // (i.e. the connection the user just drilled into from the flows
         // list pane). Powers the packet-list view inside Pane::Packets.
-        "flows.packets" => {
+        "flows.packets", "[SID] STREAM", "every frame of one TCP stream" => {
             let stream = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
             match arg_sid(args).or_else(|| selected_sid(state)) {
                 Some(id) if stream >= 0 => match flows_dir_for(id) {
@@ -2448,17 +2500,18 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 _ => json!({"ok": false, "error": "bad args"}),
             }
         }
-        "struct_finish" => match args.first().and_then(Value::as_i64) {
+        "struct_finish", "JOB", "collect a finished structural-diff job" => { match args.first().and_then(Value::as_i64) {
             Some(job) => crate::review::struct_finish(job),
             None => json!({"lines": [["err", "bad job"]]}),
-        },
-        "struct_cancel" => {
+        }
+        }
+        "struct_cancel", "JOB", "cancel a structural-diff job" => {
             if let Some(job) = args.first().and_then(Value::as_i64) {
                 crate::review::struct_cancel(job);
             }
             return json!({"ok": true, "r": Value::Null});
         }
-        "box_drop" => {
+        "box_drop", "SID", "unregister a box from the overlay (no reap)" => {
             let ov = lock(state).overlay.clone();
             if let (Some(ov), Some(id)) = (ov, arg_sid(args)) {
                 ov.remove_box(id);
@@ -2470,7 +2523,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         //    use the same overlay API nested boxes use. No FUSE mount needed,
         //    no subprocess. args: [name_or_id, path_rel_to_root, (write only)
         //    base64-bytes]. path must NOT start with '/'.
-        "box_file_read" => {
+        "box_file_read", "BOX PATH", "read a file from a box's merged view (base64)" => {
             let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
@@ -2490,7 +2543,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Err(e) => return json!({"ok": false, "error": e.to_string()}),
             }
         }
-        "box_file_write" => {
+        "box_file_write", "BOX PATH B64", "write a file into a box's layer" => {
             let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
@@ -2514,7 +2567,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Err(e) => return json!({"ok": false, "error": e.to_string()}),
             }
         }
-        "box_dir_list" => {
+        "box_dir_list", "BOX PATH", "list a directory in a box's merged view" => {
             let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
@@ -2533,7 +2586,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Err(e) => return json!({"ok": false, "error": e.to_string()}),
             }
         }
-        "box_path_kind" => {
+        "box_path_kind", "BOX PATH", "file/dir/missing kind of a box path" => {
             let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
@@ -2552,7 +2605,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // pull doesn't go through the box's netns/FUSE. Box EXECUTION stays in
         // the caller (runner::run) for foreground stdio. The pull blocks this
         // connection's own handler thread, not the main loop.
-        "oci.load" => {
+        "oci.load", "REFERENCE [NAME]", "pull + unpack an OCI image into at-rest boxes" => {
             let Some(reference) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "oci.load: missing reference"});
             };
@@ -2569,7 +2622,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // Loaded images, for the UI's base-image picker: the TOP box of each
         // installed layer chain (the one carrying the image config), with the
         // reference it was pulled as. Cheap metadata scan, no registry I/O.
-        "oci.images" => {
+        "oci.images", "", "loaded OCI images (top box of each chain)" => {
             let boxes = crate::discover::discover();
             Value::Array(boxes.iter()
                 .filter(|(_, b)| b.meta.contains_key("oci_config"))
@@ -2587,11 +2640,11 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         }
         // Is a named svc.serve service live (≥1 parked accept slot)? Used by
         // `oaita local` to poll readiness / idempotency without racing.
-        "svc.up" => {
+        "svc.up", "NAME", "whether a svc.serve service is live" => {
             let name = args.first().and_then(Value::as_str).unwrap_or("");
             json!({"up": svc_has(name)})
         }
-        "oci.resolve" => {
+        "oci.resolve", "REFERENCE", "resolve an image reference to its local top box" => {
             let Some(reference) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "oci.resolve: missing reference"});
             };
@@ -2603,7 +2656,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // In-box `oci build`: the CLI ships its context + Dockerfile here so the
         // build runs host-side (its layer boxes land in engine state, not the
         // box's FUSE). Returns the worker's output + exit code + top box id.
-        "oci.build" => {
+        "oci.build", "SPEC", "run an in-box-shipped Dockerfile build host-side" => {
             let Some(spec) = args.first() else {
                 return json!({"ok": false, "error": "oci.build: missing spec"});
             };
@@ -2616,7 +2669,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // models resolved from a live HuggingFace query (config-file override
         // + offline fallback). Each entry is a ready-to-download Q4 URL. The
         // UI opens this when neither an external API nor a local model is set.
-        "oaita.models" => {
+        "oaita.models", "", "GGUF local-model catalog for the picker" => {
             let (entries, source) = crate::oaita::models::catalog();
             json!({
                 "source": source,
@@ -2628,7 +2681,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // What the "Api" pane is wired to: external (host oaita.toml has a
         // model), local (an OAITA-LOCAL svc is declared), or none (offer the
         // picker). Lets the UI reflect real state instead of guessing.
-        "oaita.status" => {
+        "oaita.status", "", "what the Api pane is wired to (external/local/none)" => {
             let host_cfg = crate::oaita::config::Config::load();
             let external = host_cfg.model.as_deref()
                 .map(|m| !m.trim().is_empty()).unwrap_or(false);
@@ -2651,7 +2704,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
         // 1-token chat completion against the given endpoint and reports
         // reachability / auth / model validity as a single line. Runs on the
         // engine (which has the network), so the UI stays a thin client.
-        "oaita.probe" => {
+        "oaita.probe", "SPEC", "1-token connection test of an external API config" => {
             let spec = args.first().cloned().unwrap_or(Value::Null);
             let base_url = spec.get("base_url").and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
@@ -2680,11 +2733,59 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                     "error": format!("{base_url}: {e}")}),
             }
         }
-        other => {
-            return json!({"ok": false, "error": format!("unknown verb '{other}'")});
+        // The self-listing verb: the docs table as JSON, optionally filtered by
+        // a substring over name/help. `sarun verbs` and the F1 help render this
+        // same table (the CLI over the socket, the UI in-process).
+        "verbs", "[FILTER]", "list every UI verb with its args and help" => {
+            let filt = args.first().and_then(Value::as_str).unwrap_or("");
+            Value::Array(VERB_DOCS.iter()
+                .filter(|d| filt.is_empty() || d.name.contains(filt)
+                        || d.help.contains(filt))
+                .map(|d| json!({"verb": d.name, "args": d.args, "help": d.help}))
+                .collect())
+        }
+    } };
+}
+
+macro_rules! emit_verb_docs {
+    ( ($state:ident, $verb:ident, $args:ident, $boxes:ident)
+      $($($name:literal)|+, $a:literal, $h:literal => $body:block)* ) => {
+        pub static VERB_DOCS: &[VerbDoc] = &[
+            $($(VerbDoc { name: $name, args: $a, help: $h },)+)*
+        ];
+    };
+}
+
+macro_rules! emit_verb_dispatch {
+    ( ($state:ident, $verb:ident, $args:ident, $boxes:ident)
+      $($($name:literal)|+, $a:literal, $h:literal => $body:block)* ) => {
+        /// The `{"type":"ui"}` verb dispatch. An arm's `return` sends its
+        /// value raw (errors); falling out wraps as {"ok":true,"r":...}.
+        pub(crate) fn dispatch_ui_verb($state: &State, $verb: &str,
+                                       $args: &[Value],
+                                       $boxes: &std::collections::BTreeMap<i64, discover::Box_>)
+                                       -> Value {
+            let r: Value = match $verb {
+                $( $($name)|+ => $body )*
+                other => {
+                    return json!({"ok": false, "error":
+                        format!("unknown verb '{other}'; see 'verbs'")});
+                }
+            };
+            json!({"ok": true, "r": r})
         }
     };
-    json!({"ok": true, "r": r})
+}
+
+ui_verbs!(emit_verb_docs);
+ui_verbs!(emit_verb_dispatch);
+
+fn dispatch_ui(state: &State, msg: &Value) -> Value {
+    let verb = msg.get("verb").and_then(Value::as_str).unwrap_or("");
+    let empty = vec![];
+    let args = msg.get("args").and_then(Value::as_array).unwrap_or(&empty);
+    let boxes = discover::discover();
+    dispatch_ui_verb(state, verb, args, &boxes)
 }
 
 /// One recvmsg on the box channel: read up to `buf` bytes and capture the first
@@ -3608,6 +3709,54 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
     }
 }
 
+/// `sarun verbs [FILTER]` — print the engine's UI-verb surface from the
+/// engine's own VERB_DOCS (via the "verbs" verb, so what prints is what the
+/// RUNNING engine dispatches, not this binary's table). Works from inside a
+/// box too: the FD broker (SARUN_BROKER, same channel cli_box_op uses)
+/// splices the connection to the engine's control socket.
+pub fn cli_verbs(argv: &[String]) -> i32 {
+    let filter = argv.first().cloned().unwrap_or_default();
+    let sock = crate::paths::sock_path();
+    let broker_name = std::env::var("SARUN_BROKER").ok()
+        .filter(|s| !s.is_empty());
+    let dial = || -> std::io::Result<UnixStream> {
+        match broker_name.as_ref() {
+            Some(n) => crate::runner::broker_dial(n),
+            None => UnixStream::connect(&sock),
+        }
+    };
+    let mut c = match dial() {
+        Ok(c) => c,
+        Err(_) => { eprintln!("sarun-engine: no engine running"); return 1; }
+    };
+    let msg = json!({"type": "ui", "verb": "verbs", "args": [filter]});
+    if let Err(e) = c.write_all(format!("{msg}\n").as_bytes()) {
+        eprintln!("sarun-engine: {e}"); return 1;
+    }
+    let mut line = String::new();
+    if BufReader::new(&c).read_line(&mut line).is_err() {
+        eprintln!("sarun-engine: read failed"); return 1;
+    }
+    let v: Value = match serde_json::from_str(&line) {
+        Ok(v) => v, Err(e) => { eprintln!("sarun-engine: {e}"); return 1; }
+    };
+    let Some(rows) = v.get("r").and_then(Value::as_array) else {
+        eprintln!("sarun-engine: {}",
+            v.get("error").and_then(Value::as_str).unwrap_or("bad reply"));
+        return 1;
+    };
+    let g = |r: &Value, k: &str| r.get(k).and_then(Value::as_str)
+        .unwrap_or("").to_string();
+    let namew = rows.iter().map(|r| g(r, "verb").len()).max().unwrap_or(0);
+    let argw = rows.iter().map(|r| g(r, "args").len()).max().unwrap_or(0);
+    for r in rows {
+        println!("{:<namew$}  {:<argw$}  {}",
+                 g(r, "verb"), g(r, "args"), g(r, "help"));
+    }
+    if rows.is_empty() { eprintln!("no verbs match '{filter}'"); }
+    0
+}
+
 pub fn cli_box_op(argv: &[String]) -> i32 {
     let name = argv[0].as_str();
     let op = argv.get(1).map(String::as_str);
@@ -3893,5 +4042,59 @@ fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>,
         std::ptr::copy_nonoverlapping((&fd as *const i32).cast(),
                                        libc::CMSG_DATA(cm), 4);
         libc::sendmsg(conn_fd, &msg, 0);
+    }
+}
+
+#[cfg(test)]
+mod verb_tests {
+    use super::*;
+
+    // The match arms and VERB_DOCS expand from the same ui_verbs! token
+    // list, so name-coverage parity is guaranteed by construction; calling
+    // every documented verb with empty args is NOT safe in a unit test
+    // (mirror_run_pending starts jobs, oaita.models does network I/O), so
+    // we spot-check side-effect-free verbs instead.
+    #[test]
+    fn verb_docs_nonempty_and_unique() {
+        assert!(VERB_DOCS.len() >= 80, "table lost entries: {}", VERB_DOCS.len());
+        let mut names: Vec<&str> = VERB_DOCS.iter().map(|d| d.name).collect();
+        names.sort_unstable();
+        let n = names.len();
+        names.dedup();
+        assert_eq!(n, names.len(), "duplicate verb names in VERB_DOCS");
+        for d in VERB_DOCS {
+            assert!(!d.help.is_empty(), "verb {} has no help", d.name);
+        }
+    }
+
+    #[test]
+    fn unknown_verb_error_points_at_verbs() {
+        let state: State = Default::default();
+        let boxes = std::collections::BTreeMap::new();
+        let r = dispatch_ui_verb(&state, "no_such_verb", &[], &boxes);
+        let err = r.get("error").and_then(Value::as_str).unwrap();
+        assert!(err.contains("unknown verb") && err.contains("see 'verbs'"),
+                "got: {err}");
+    }
+
+    #[test]
+    fn documented_verbs_spot_check_dispatch() {
+        let state: State = Default::default();
+        let boxes = std::collections::BTreeMap::new();
+        // Three safe representatives: the self-list, a pure stub, and an
+        // args-validating mutator that errors before any side effect.
+        for v in ["verbs", "rescan", "mirror_pause"] {
+            let r = dispatch_ui_verb(&state, v, &[], &boxes);
+            let err = r.get("error").and_then(Value::as_str).unwrap_or("");
+            assert!(!err.contains("unknown verb"), "{v} fell through: {err}");
+        }
+        // And the self-list actually lists itself + honors the filter arg.
+        let r = dispatch_ui_verb(&state, "verbs", &[json!("mirror")], &boxes);
+        let rows = r["r"].as_array().unwrap();
+        assert!(rows.iter().all(|x| x["verb"].as_str().unwrap().contains("mirror")
+                                 || x["help"].as_str().unwrap().contains("mirror")));
+        assert!(rows.len() >= 5);
+        let all = dispatch_ui_verb(&state, "verbs", &[], &boxes);
+        assert_eq!(all["r"].as_array().unwrap().len(), VERB_DOCS.len());
     }
 }

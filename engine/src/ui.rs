@@ -6539,15 +6539,23 @@ fn help_lines() -> Vec<Line<'static>> {
         t("  j/k or ↓/↑  move       Enter  open the selection in the next pane"),
         t("  PageUp/PageDown  page   ctrl+↑/↓  reorder a rule (on Rules)"),
     ]);
-    // The per-pane action keys are GENERATED from PANE_ACTION_KEYS — the same
-    // table `dispatch_pane_key` runs. Every binding with a help string surfaces
+    // The action keys are GENERATED from PANE_ACTION_KEYS — the same table
+    // `dispatch_pane_key` runs. Every binding with a help string surfaces
     // here exactly once; keys can never drift from their documentation. (The
     // None-help entries — the j/k/Tab/Enter nav block — are described in prose
-    // just above, since they read as a group, not one line each.)
-    v.push(h("Actions (per-pane keys)"));
-    for (key, _, _, help) in PANE_ACTION_KEYS {
-        if let Some(desc) = help {
-            v.push(t(&format!("  {}  {desc}", key.label())));
+    // just above, since they read as a group, not one line each.) Grouped by
+    // gate: global keys work everywhere, pane-gated ones only in their pane.
+    v.push(h("Keys"));
+    v.push(d("  global:"));
+    for (key, gate, _, help) in PANE_ACTION_KEYS {
+        if let (PaneGate::Any, Some(desc)) = (gate, help) {
+            v.push(t(&format!("    {}  {desc}", key.label())));
+        }
+    }
+    v.push(d("  pane-gated:"));
+    for (key, gate, _, help) in PANE_ACTION_KEYS {
+        if let (PaneGate::On(_), Some(desc)) = (gate, help) {
+            v.push(t(&format!("    {}  {desc}", key.label())));
         }
     }
     v.extend(vec![
@@ -6606,6 +6614,18 @@ fn help_lines() -> Vec<Line<'static>> {
         t("  evaluated TOP → BOTTOM and the FIRST match wins; saving any edit"),
         t("  rewrites the filerules file and reloads it in the engine."),
     ]);
+    // The engine's control-socket verb surface — the SAME table the dispatch
+    // match is generated from (control::VERB_DOCS), read in-process: no
+    // socket call, no second text. `sarun verbs [FILTER]` prints it too.
+    v.push(t(""));
+    v.push(h("Verbs (control-socket surface · `sarun verbs [FILTER]`)"));
+    let w = crate::control::VERB_DOCS.iter()
+        .map(|d2| d2.name.len() + 1 + d2.args.len()).max().unwrap_or(0);
+    for vd in crate::control::VERB_DOCS {
+        let sig = if vd.args.is_empty() { vd.name.to_string() }
+                  else { format!("{} {}", vd.name, vd.args) };
+        v.push(t(&format!("  {sig:<w$}  {}", vd.help)));
+    }
     v
 }
 
@@ -13152,6 +13172,24 @@ pub fn ui_main(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// F1/'?' help is headless-renderable text: it must carry the "Verbs"
+    /// section derived in-process from control::VERB_DOCS, with at least
+    /// one real verb line.
+    #[test]
+    fn help_has_verbs_section() {
+        let text: Vec<String> = super::help_lines().iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref())
+                 .collect::<String>())
+            .collect();
+        assert!(text.iter().any(|l| l.starts_with("Verbs")),
+                "no Verbs header in help");
+        assert!(text.iter().any(|l| l.contains("mirror_add")
+                                 && l.contains("add a scheduled")),
+                "no verb line in help");
+        assert!(text.iter().any(|l| l.starts_with("Keys")), "no Keys header");
+        assert!(text.iter().any(|l| l.starts_with("Panes")), "no Panes header");
+    }
 
     /// DAG sideways navigation: the sessions list flattens by MAIN
     /// parent, and Left/Right cycles the alternatives of the last

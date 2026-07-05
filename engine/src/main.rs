@@ -97,6 +97,7 @@ fn top_level_help() -> &'static str {
        sarun <NAME> [apply|discard|rename NEW|patch]   operate on a box from the CLI\n  \
        sarun <NAME> attach git|wiki|ietf SRC REF [AT]  attach a mirror snapshot read-only\n  \
        sarun mirror <ls|add|run|pause|resume|rm> ...   scheduled mirror updates\n  \
+       sarun verbs [FILTER]               list the engine's UI verbs (args + help)\n  \
        sarun oci <load|run|build|save|dockerfile|author> ...   OCI images (`sarun oci -h`)\n  \
        sarun oaita <gen|run|call|tail|add|where> NAME          LLM chat/agent runner (`oaita -h`)\n  \
        sarun --once --sock PATH           render one UI frame and exit (headless)\n\
@@ -653,6 +654,12 @@ fn main() {
             std::process::exit(runner::run(name, passthrough, direct, env,
                 pty, brush, api, no_parent, readonly_parent, chdir,
                 net_mode, cmd));
+        }
+        Some("verbs") => {
+            // sarun verbs [FILTER] — the engine's UI-verb surface, from the
+            // running engine's own table (control::VERB_DOCS via the "verbs"
+            // verb). Works in-box too (SARUN_BROKER channel).
+            std::process::exit(control::cli_verbs(&argv[1..]));
         }
         Some("mirror") => {
             // sarun mirror ls|add|run|pause|resume|rm — mirror-update jobs.
