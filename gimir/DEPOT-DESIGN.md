@@ -286,6 +286,23 @@ Notes per variant:
   rebuild its dedup index from scratch with nothing observable changing.
   Subtree-level (not just blob-level) sharing is what makes `diff` prune
   whole unchanged subtrees by internal identity instead of walking them.
+
+  **Content must be REAL LOOSE FILES** — non-negotiable, because the
+  mount-serving tier has consumers only a real file satisfies: mmap/exec,
+  the D5 kernel read-passthrough (a backing fd), plain pread. Packed
+  variants (VBF, stream) are rest/history/wire tiers and never serve a
+  mount; their content mmaps by materializing THROUGH the hot tier.
+  Sharing is file identity: a pool of immutable loose files with
+  content-derived NAMES (the brief's "hashing works as a filename
+  scheme" — internal only, rebuildable), layers hardlinking in;
+  refcount = st_nlink, reap = last unlink. Duplicate-on-write: shared
+  files are never opened writable — FICLONE where the fs has reflink,
+  else hardlink + explicit copy on first write (which IS today's D3
+  lazy copy-up, retargeted at the pool). The live upper keeps writing
+  PRIVATE per-rowid files exactly as today — no hashing on the hot
+  write path; sharing happens at rest boundaries (box finish, ingest,
+  RO-attach, rotation), which is what finally makes rotation
+  O(metadata): replicated blobs become pool links, not byte copies.
 - **sqlar adapter**: the seam half-exists (`BoxState`'s methods are a
   de-facto interface) but blob I/O leaks (`overlay.rs` reads `blob_path()`
   directly) and `sud.rs`/`review.rs` run raw SQL on the shared connection.
