@@ -133,6 +133,46 @@ static int t_exists(const char *p)
     return raw_access(p, 0 /* F_OK */) == 0;
 }
 
+static int t_symlink(const char *target, const char *linkpath)
+{
+    return (int)raw_symlinkat(target, AT_FDCWD, linkpath);
+}
+
+/* lstat st_mode of `p`, or 0 if it doesn't exist.  Reads the raw kernel
+ * stat buffer at the arch-specific st_mode offset (x86_64: 24, i386
+ * stat64: 16) — the test links no libc struct stat. */
+static unsigned t_lmode(const char *p)
+{
+    unsigned long long buf[24];
+    for (int i = 0; i < 24; i++) buf[i] = 0;
+#ifdef SYS_newfstatat
+    long rc = raw_syscall6(SYS_newfstatat, AT_FDCWD, (long)p, (long)buf,
+                           AT_SYMLINK_NOFOLLOW, 0, 0);
+#else
+    long rc = raw_syscall6(SYS_fstatat64, AT_FDCWD, (long)p, (long)buf,
+                           AT_SYMLINK_NOFOLLOW, 0, 0);
+#endif
+    if (rc < 0) return 0;
+#if defined(__x86_64__)
+    return *(unsigned int *)((char *)buf + 24);
+#else
+    return *(unsigned int *)((char *)buf + 16);
+#endif
+}
+
+/* Read up to n-1 bytes of `p` into `out` (NUL-terminated).  Returns
+ * byte count, or -1 on open/read failure. */
+static int t_read_file(const char *p, char *out, size_t n)
+{
+    int fd = raw_open(p, O_RDONLY);
+    if (fd < 0) return -1;
+    long r = raw_read(fd, out, n - 1);
+    raw_close(fd);
+    if (r < 0) return -1;
+    out[r] = '\0';
+    return (int)r;
+}
+
 /* Recursively delete a directory tree.  Used to reset between tests. */
 static void t_rm_rf(const char *path)
 {
@@ -665,6 +705,186 @@ static void test_passthrough_rule(void)
     fixture_teardown();
 }
 
+/* FOR_MODIFY copies a lower-only regular file up (content + mode); plain
+ * FOR_WRITE does not (the old bytes would be dead weight — rm of a big
+ * lower file must not copy it). */
+static void test_copyup_modify_vs_write(void)
+{
+    g_curtest = "copyup_modify_vs_write";
+    fixture_setup();
+    install_overlay();
+
+    char p[PATH_MAX], m[PATH_MAX], up[PATH_MAX], out[PATH_MAX], body[64];
+
+    /* A lower-only file with a distinctive mode. */
+    snprintf(p, sizeof(p), "%s/mod", g_lower1);
+    t_write_file(p, "LOWERBYTES");
+    raw_syscall6(__NR_fchmodat, AT_FDCWD, (long)p, 0640, 0, 0, 0);
+
+    snprintf(m,  sizeof(m),  "%s/mod", g_merged);
+    snprintf(up, sizeof(up), "%s/mod", g_upper);
+
+    int rc = sud_overlay_resolve(m, SUD_OVERLAY_FOR_MODIFY, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_RESOLVED, "modify resolves to upper");
+    TASSERT_STREQ(out, up, "modify resolved path is upper");
+    TASSERT(t_exists(up), "FOR_MODIFY copied the lower file up");
+    int n = t_read_file(up, body, sizeof(body));
+    TASSERT_EQ(n, 10, "copied-up content length");
+    TASSERT_STREQ(body, "LOWERBYTES", "copied-up content matches lower");
+    TASSERT_EQ(t_lmode(up) & 07777, 0640, "copied-up mode matches lower");
+
+    /* A different lower-only file resolved FOR_WRITE must NOT copy up. */
+    snprintf(p, sizeof(p), "%s/wr", g_lower1);
+    t_write_file(p, "L");
+    snprintf(m,  sizeof(m),  "%s/wr", g_merged);
+    snprintf(up, sizeof(up), "%s/wr", g_upper);
+    rc = sud_overlay_resolve(m, SUD_OVERLAY_FOR_WRITE, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_RESOLVED, "write resolves to upper");
+    TASSERT_STREQ(out, up, "write resolved path is upper");
+    TASSERT(!t_exists(up), "FOR_WRITE does not copy the lower up");
+
+    fixture_teardown();
+}
+
+/* FOR_MODIFY of a whiteouted name must not resurrect the lower: no
+ * copy-up runs, and the upper stays the whiteout marker. */
+static void test_modify_whiteout_no_resurrect(void)
+{
+    g_curtest = "modify_whiteout_no_resurrect";
+    fixture_setup();
+    install_overlay();
+
+    char p[PATH_MAX], m[PATH_MAX], up[PATH_MAX], out[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/gone", g_lower1);  t_write_file(p, "SECRET");
+    snprintf(up, sizeof(up), "%s/gone", g_upper);
+    TASSERT_EQ(t_mknod_chr(up), 0, "install whiteout in upper");
+
+    snprintf(m, sizeof(m), "%s/gone", g_merged);
+    int rc = sud_overlay_resolve(m, SUD_OVERLAY_FOR_MODIFY, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_RESOLVED, "modify of whiteout resolves to upper");
+    /* The upper entry is still the char-dev whiteout, not a copied-up
+     * regular file. */
+    TASSERT_EQ(t_lmode(up) & S_IFMT, S_IFCHR,
+               "upper stays a whiteout (lower not resurrected)");
+
+    fixture_teardown();
+}
+
+/* open_dir: nonexistent name → -ENOENT; a file → NO_DIR (kernel yields
+ * ENOTDIR); a dir present only in a lower → a synth fd whose listing
+ * merges the lower's entries. */
+static void test_open_dir_semantics(void)
+{
+    g_curtest = "open_dir_semantics";
+    fixture_setup();
+    install_overlay();
+
+    char p[PATH_MAX], m[PATH_MAX];
+
+    /* Nonexistent name. */
+    snprintf(m, sizeof(m), "%s/nope", g_merged);
+    int rc = sud_overlay_open_dir(m, O_RDONLY | O_DIRECTORY, 0);
+    TASSERT_EQ(rc, -ENOENT, "open_dir of nonexistent name is -ENOENT");
+
+    /* A regular file. */
+    snprintf(p, sizeof(p), "%s/afile", g_lower1);  t_write_file(p, "x");
+    snprintf(m, sizeof(m), "%s/afile", g_merged);
+    rc = sud_overlay_open_dir(m, O_RDONLY | O_DIRECTORY, 0);
+    TASSERT_EQ(rc, SUD_OVERLAY_NO_DIR, "open_dir of a file is NO_DIR");
+
+    /* A directory present only in a lower, with two entries. */
+    snprintf(p, sizeof(p), "%s/adir", g_lower1);        t_mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/adir/one", g_lower1);    t_write_file(p, "1");
+    snprintf(p, sizeof(p), "%s/adir/two", g_lower1);    t_write_file(p, "2");
+    snprintf(m, sizeof(m), "%s/adir", g_merged);
+    int fd = sud_overlay_open_dir(m, O_RDONLY | O_DIRECTORY, 0);
+    TASSERT(fd >= 0, "open_dir of lower-only dir yields a synth fd");
+    if (fd >= 0) {
+        char names[256];
+        int n = collect_sorted_dirents(fd, names, sizeof(names));
+        TASSERT_EQ(n, 2, "lower-only dir has 2 merged entries");
+        TASSERT_STREQ(names, "one|two", "lower-only dir merged listing");
+        raw_close(fd);
+    }
+
+    fixture_teardown();
+}
+
+/* Copy-up of a symlink recreates the link itself, not its target. */
+static void test_copyup_symlink(void)
+{
+    g_curtest = "copyup_symlink";
+    fixture_setup();
+    install_overlay();
+
+    char p[PATH_MAX], m[PATH_MAX], up[PATH_MAX], out[PATH_MAX], tgt[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/link", g_lower1);
+    TASSERT_EQ(t_symlink("/some/target", p), 0, "create lower symlink");
+
+    snprintf(m,  sizeof(m),  "%s/link", g_merged);
+    snprintf(up, sizeof(up), "%s/link", g_upper);
+    int rc = sud_overlay_resolve(m, SUD_OVERLAY_FOR_MODIFY, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_RESOLVED, "symlink modify resolves to upper");
+    TASSERT_EQ(t_lmode(up) & S_IFMT, S_IFLNK, "copied-up entry is a symlink");
+    long tn = raw_readlink(up, tgt, sizeof(tgt) - 1);
+    TASSERT(tn > 0, "readlink of copied-up symlink");
+    if (tn > 0) {
+        tgt[tn] = '\0';
+        TASSERT_STREQ(tgt, "/some/target", "symlink target preserved");
+    }
+
+    fixture_teardown();
+}
+
+/* fd_upper_redirect: an fd on the upper → 0 (box-local); an fd on a
+ * lower file → 1, with the file copied up to the upper with the same
+ * content; an anonymous fd (pipe) → 0. */
+static void test_fd_upper_redirect(void)
+{
+    g_curtest = "fd_upper_redirect";
+    fixture_setup();
+    install_overlay();
+
+    char p[PATH_MAX], up[PATH_MAX], out[PATH_MAX], body[64];
+
+    /* fd already on the upper. */
+    snprintf(up, sizeof(up), "%s/onupper", g_upper);
+    t_write_file(up, "U");
+    int ufd = raw_open(up, O_RDONLY);
+    TASSERT(ufd >= 0, "open upper file");
+    TASSERT_EQ(sud_overlay_fd_upper_redirect(ufd, out, sizeof(out)), 0,
+               "fd on upper needs no redirect");
+    raw_close(ufd);
+
+    /* fd on a lower file: redirect copies it up and hands back upper. */
+    snprintf(p, sizeof(p), "%s/onlower", g_lower1);
+    t_write_file(p, "LOWDATA");
+    int lfd = raw_open(p, O_RDONLY);
+    TASSERT(lfd >= 0, "open lower file");
+    int r = sud_overlay_fd_upper_redirect(lfd, out, sizeof(out));
+    raw_close(lfd);
+    TASSERT_EQ(r, 1, "fd on lower file redirects");
+    snprintf(up, sizeof(up), "%s/onlower", g_upper);
+    TASSERT_STREQ(out, up, "redirect yields the upper path");
+    TASSERT(t_exists(up), "lower file copied up by redirect");
+    int n = t_read_file(up, body, sizeof(body));
+    TASSERT_EQ(n, 7, "copied-up content length");
+    TASSERT_STREQ(body, "LOWDATA", "copied-up content matches lower");
+
+    /* Anonymous fd (pipe): /proc/self/fd link is "pipe:[…]", not a path. */
+    int pfds[2];
+    long pr = raw_syscall6(__NR_pipe2, (long)pfds, 0, 0, 0, 0, 0);
+    TASSERT_EQ(pr, 0, "pipe2 for anonymous fd");
+    if (pr == 0) {
+        TASSERT_EQ(sud_overlay_fd_upper_redirect(pfds[0], out, sizeof(out)),
+                   0, "anonymous fd needs no redirect");
+        raw_close(pfds[0]);
+        raw_close(pfds[1]);
+    }
+
+    fixture_teardown();
+}
+
 /* ---- Driver -------------------------------------------------------- */
 
 /* Exposed by sud/path_remap/tests/test_fakeroot.c — linked into the
@@ -688,6 +908,11 @@ int main(int argc, char **argv)
     test_resolve_at_with_dirfd();
     test_multi_rule_parsing();
     test_passthrough_rule();
+    test_copyup_modify_vs_write();
+    test_modify_whiteout_no_resurrect();
+    test_open_dir_semantics();
+    test_copyup_symlink();
+    test_fd_upper_redirect();
 
     int fr_fail = run_fakeroot_tests();
 
