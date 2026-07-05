@@ -7031,15 +7031,16 @@ fn clauses_expr(clauses: &[Clause]) -> String {
 // jump to the previous/next SIBLING at the same level (the parent's adjacent
 // row), ':' takes an `oaita inspect` locator, 'R' rebuilds.
 //
-// Large datasets are never dumped: any listing wider than a page is split
-// into RANGE BUCKETS (each labeled with its span and, where cheap, the
-// first/last member for orientation), and buckets recurse until a leaf page
-// fits. Drilling a bucket is a level like any other, so Left/Right walks
-// bucket siblings. Some rows take a MANDATORY text argument (e.g. a glob
-// filter) — Enter prompts for it before descending. Box drill-downs go
-// through the same engine RPCs the data panes use (session_dicts,
-// view.open/window, review.hunks, flows.list, webcap, api_log); leaf pages
-// fetch only their slice.
+// Large datasets are never dumped AND never reduced to blind index ranges:
+// a listing wider than a page becomes a SUMMARY level of informative facets
+// — path-prefix groups, file types, size ranges, exe/command groups, field-
+// value groups — each with its member count, plus a mandatory-text refine
+// row (glob / pattern / substring) and a sequential-browse escape hatch.
+// Facets recurse (a prefix group that is still wide re-facets one component
+// deeper) until a leaf page fits, and Left/Right walks the siblings at any
+// level. Box drill-downs go through the same engine RPCs the data panes use
+// (session_dicts, view.open/window, review.hunks, flows.list, webcap,
+// api_log); leaf pages fetch only their slice.
 
 /// Rows per leaf page (and max buckets per level) for inspector listings.
 const INS_PAGE: usize = 40;
@@ -7047,10 +7048,14 @@ const INS_PAGE: usize = 40;
 const INS_FILE_PAGE: usize = crate::oaita::inspect::LINES_PER_PAGE;
 /// "To the end" sentinel for a node span's `hi` bound.
 const INS_END: usize = usize::MAX;
+/// Cap on rows fetched to derive facets / boundary labels for one summary
+/// level. Counts computed from a truncated sample are marked "≈".
+const INS_SAMPLE: usize = 4000;
 
 /// Bucket a 1-based span: when `hi-lo+1` exceeds `page`, split it into at
 /// most `page` equal subranges (sized a power of `page`, so each drill
 /// shrinks the span by ~a page factor until a leaf fits). None = leaf.
+/// This is the SEQUENTIAL fallback — the facet summaries are preferred.
 fn ins_spans(lo: usize, hi: usize, page: usize) -> Option<Vec<(usize, usize)>> {
     let n = hi.checked_sub(lo)? + 1;
     if n <= page { return None; }
@@ -7090,10 +7095,126 @@ fn ins_wild(pat: &str, name: &str) -> bool {
     pi == p.len()
 }
 
+/// One narrowing step on a box-table view. A node carries a STACK of these;
+/// all except `Size` translate to engine-side filter clauses (AND-ed), so
+/// counts stay exact however deep the drill goes. `Size` filters client-side
+/// and is only offered when the whole (already-narrowed) listing fits the
+/// sample.
+#[derive(Clone)]
+enum InsFacet {
+    /// User-typed pattern for the view's text field (the ⌕ refine row).
+    Text(String),
+    /// Everything under a path prefix (changes / build-edge targets).
+    Prefix(String),
+    /// Entries directly AT the prefix, no deeper (the "(files here)" group).
+    Here(String),
+    /// File extension group (changes): "rs" → `**/*.rs`.
+    Ext(String),
+    /// Exe-basename / command-leading-token group (procs / pipelines).
+    Group(String),
+    /// Size range in bytes, upper bound exclusive (None = unbounded).
+    Size(u64, Option<u64>),
+}
+
+impl InsFacet {
+    /// The engine filter clause for this facet, as (kind, pattern) for the
+    /// given view — or None for the client-side Size facet.
+    fn clause(&self, view: &str) -> Option<(&'static str, String)> {
+        let text_kind = match view {
+            "changes" => "path",
+            "pipelines" => "cmd",
+            "build_edges" => "target",
+            _ => "exe",
+        };
+        let path_kind = if view == "build_edges" { "target" } else { "path" };
+        match self {
+            InsFacet::Text(p) => Some((text_kind, p.clone())),
+            InsFacet::Prefix(p) => Some((path_kind, format!("/{p}/**"))),
+            InsFacet::Here(p) => Some((path_kind, format!("/{p}/*"))),
+            InsFacet::Ext(e) => Some((path_kind, format!("**/*.{e}"))),
+            InsFacet::Group(g) => Some(match view {
+                "pipelines" => ("cmd", format!("{g}*")),
+                _ => ("exe", g.clone()), // bare name → **/name (path glob)
+            }),
+            InsFacet::Size(_, _) => None,
+        }
+    }
+
+    /// Human tag for titles/headers.
+    fn label(&self) -> String {
+        match self {
+            InsFacet::Text(p) => format!("~{p}"),
+            InsFacet::Prefix(p) => format!("{p}/"),
+            InsFacet::Here(p) => format!("{p}/ (here)"),
+            InsFacet::Ext(e) => format!("*.{e}"),
+            InsFacet::Group(g) => g.clone(),
+            InsFacet::Size(a, b) => ins_size_label(*a, *b),
+        }
+    }
+}
+
+/// The size-range boundaries the changes summary offers, smallest first.
+const INS_SIZE_STEPS: &[(u64, Option<u64>)] = &[
+    (0, Some(1 << 10)),
+    (1 << 10, Some(64 << 10)),
+    (64 << 10, Some(1 << 20)),
+    (1 << 20, Some(16 << 20)),
+    (16 << 20, None),
+];
+
+fn ins_size_label(a: u64, b: Option<u64>) -> String {
+    let human = |v: u64| -> String {
+        if v >= 1 << 20 { format!("{}M", v >> 20) }
+        else if v >= 1 << 10 { format!("{}K", v >> 10) }
+        else { format!("{v}B") }
+    };
+    match b {
+        Some(b) => format!("{}..{}", human(a), human(b)),
+        None => format!("\u{2265}{}", human(a)),
+    }
+}
+
+/// Which engine list the in-memory row nodes wrap (flows / web captures /
+/// api log — fetched whole, faceted client-side). One kind enum instead of
+/// three near-identical node variants.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InsRowsKind { Flows, Webcap, ApiLog }
+
+impl InsRowsKind {
+    fn label(self) -> &'static str {
+        match self {
+            InsRowsKind::Flows => "network flows",
+            InsRowsKind::Webcap => "web captures",
+            InsRowsKind::ApiLog => "api log",
+        }
+    }
+    /// Fetch the full row list (these captures are small; the engine has no
+    /// windowed view for them).
+    fn fetch(self, sock: &str, sid: i64) -> Option<Vec<Value>> {
+        match self {
+            InsRowsKind::Flows => rpc(sock, "flows.list", json!([sid.to_string()]))
+                .ok()
+                .and_then(|v| v.get("flows").and_then(Value::as_array).cloned()),
+            InsRowsKind::Webcap => rpc(sock, "webcap", json!([sid.to_string()]))
+                .ok().and_then(|v| v.as_array().cloned()),
+            InsRowsKind::ApiLog => rpc(sock, "api_log", json!([sid.to_string()]))
+                .ok().and_then(|v| v.as_array().cloned()),
+        }
+    }
+    /// Candidate group-by fields for the summary level, most useful first.
+    fn group_keys(self) -> &'static [&'static str] {
+        match self {
+            InsRowsKind::Flows => &["host", "proto", "src"],
+            InsRowsKind::Webcap => &["host", "mime", "status", "method"],
+            InsRowsKind::ApiLog => &["model", "status", "method", "path"],
+        }
+    }
+}
+
 /// A node in the inspector's object graph — what a frame is built FROM
 /// (kept on the frame so 'R' can rebuild it and siblings can re-derive it).
-/// `lo`/`hi` are 1-based inclusive spans into the node's listing (INS_END =
-/// to the end); `pattern` is the optional wildcard filter.
+/// `lo`/`hi` are 1-based inclusive spans into the node's FINAL (narrowed)
+/// listing (INS_END = to the end).
 #[derive(Clone)]
 enum InsNode {
     /// Top level: every sarun surface, one row each.
@@ -7102,20 +7223,23 @@ enum InsNode {
     Boxes { lo: usize, hi: usize },
     /// One box: its per-box tables, one row each.
     Box { sid: i64, path: String },
-    /// An engine list view of a box table (view.open/window/close).
+    /// An engine list view of a box table (view.open/window/close),
+    /// narrowed by the facet stack. `seq` forces sequential index buckets
+    /// (the summary's escape hatch).
     BoxView { sid: i64, view: &'static str, label: &'static str,
-              pattern: Option<String>, lo: usize, hi: usize },
+              facets: Vec<InsFacet>, seq: bool, lo: usize, hi: usize },
     /// One changed file's staged diff (review.hunks).
     BoxFile { sid: i64, file: String },
-    /// The box's network flows / web captures / api-proxy log.
-    Flows { sid: i64, lo: usize, hi: usize },
-    Webcap { sid: i64, lo: usize, hi: usize },
-    ApiLog { sid: i64, lo: usize, hi: usize },
+    /// An in-memory row list (flows / webcap / api log), narrowed by an
+    /// optional field=value group and a substring/wildcard query.
+    Rows { sid: i64, kind: InsRowsKind, group: Option<(String, String)>,
+           query: Option<String>, seq: bool, lo: usize, hi: usize },
     /// The ordered file rules.
     Rules,
-    /// Host filesystem directory / file lines / tree-sitter symbols.
+    /// Host filesystem directory (glob-filterable) / file lines
+    /// (substring-filterable, original numbering) / tree-sitter symbols.
     Dir { path: String, pattern: Option<String>, lo: usize, hi: usize },
-    File { path: String, lo: usize, hi: usize },
+    File { path: String, query: Option<String>, lo: usize, hi: usize },
     Symbols { path: String, lo: usize, hi: usize },
     Symbol { path: String, name: String, occ: usize },
     /// An arbitrary JSON value (engine rows drill into their fields).
@@ -7123,23 +7247,30 @@ enum InsNode {
 }
 
 impl InsNode {
-    /// Substitute the prompted text argument into the node (the filter
-    /// prompts). Nodes that take no argument pass through unchanged.
+    /// Substitute the prompted text argument into the node (the ⌕ refine
+    /// rows). Nodes that take no argument pass through unchanged.
     fn with_arg(self, s: &str) -> InsNode {
         match self {
             InsNode::Dir { path, lo, hi, .. } =>
                 InsNode::Dir { path, pattern: Some(s.to_string()), lo, hi },
-            InsNode::BoxView { sid, view, label, lo, hi, .. } =>
-                InsNode::BoxView { sid, view, label,
-                                   pattern: Some(s.to_string()), lo, hi },
+            InsNode::File { path, lo, hi, .. } =>
+                InsNode::File { path, query: Some(s.to_string()), lo, hi },
+            InsNode::BoxView { sid, view, label, mut facets, seq, .. } => {
+                facets.push(InsFacet::Text(s.to_string()));
+                InsNode::BoxView { sid, view, label, facets, seq,
+                                   lo: 1, hi: INS_END }
+            }
+            InsNode::Rows { sid, kind, group, seq, .. } =>
+                InsNode::Rows { sid, kind, group, query: Some(s.to_string()),
+                                seq, lo: 1, hi: INS_END },
             other => other,
         }
     }
 }
 
 /// One row of a frame. `child` is what Enter drills into; `arg` (when set)
-/// names a MANDATORY text argument — Enter prompts for it first (e.g. the
-/// glob of a filter row).
+/// names a MANDATORY text argument — Enter opens the inline input for it
+/// (e.g. the glob of a refine row).
 struct InsEntry {
     text: String,
     child: Option<InsNode>,
@@ -7188,6 +7319,26 @@ fn ins_clip(s: &str, cap: usize) -> String {
     }
 }
 
+/// Tally `key(item)` over a listing and return the groups by descending
+/// count — the shared engine behind every facet summary.
+fn ins_tally<T, K: Fn(&T) -> Option<String>>(items: &[T], key: K)
+    -> Vec<(String, usize)>
+{
+    let mut counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for it in items {
+        if let Some(k) = key(it) {
+            *counts.entry(k).or_insert(0) += 1;
+        }
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v
+}
+
+/// "≈" marker when facet counts were derived from a truncated sample.
+fn ins_approx(sampled: bool) -> &'static str { if sampled { "\u{2248}" } else { "" } }
+
 impl App {
     /// Ensure the stack has its Root frame (first entry into the screen).
     fn ins_init(&mut self) {
@@ -7213,8 +7364,7 @@ impl App {
     }
 
     /// Enter: drill into the selected row's child node. Rows with a
-    /// mandatory argument prompt for it first (the node descends once the
-    /// prompt is answered).
+    /// mandatory argument open the inline input first.
     fn ins_enter(&mut self) {
         let Some(f) = self.ins_stack.last() else { return };
         let Some(e) = f.entries.get(f.sel) else { return };
@@ -7295,7 +7445,7 @@ impl App {
 
     /// Left/Right: previous/next SIBLING — move the PARENT frame's cursor
     /// to its adjacent drillable row and rebuild this level from it. This
-    /// is how you walk bucket 3 → bucket 4, box → next box, file → next
+    /// is how you walk facet 3 → facet 4, box → next box, file → next
     /// file without popping and re-drilling.
     fn ins_sibling(&mut self, dir: isize) {
         if self.ins_stack.len() < 2 {
@@ -7313,7 +7463,7 @@ impl App {
                     return;
                 }
                 let e = &parent.entries[i as usize];
-                // Arg-taking rows (filters) are prompts, not siblings.
+                // Arg-taking rows (refine prompts) are not siblings.
                 if e.arg.is_some() { continue; }
                 if let Some(n) = &e.child { break (i as usize, n.clone()); }
             }
@@ -7374,30 +7524,28 @@ impl App {
             self.ins_follow(node, None);
             return;
         }
+        let file_at = |lo: usize, hi: usize| InsNode::File {
+            path: loc.path.clone(), query: None, lo, hi };
         let node = match &loc.window {
             Window::Symbols => InsNode::Symbols {
                 path: loc.path.clone(), lo: 1, hi: INS_END },
             Window::Symbol(name, occ) => InsNode::Symbol {
                 path: loc.path.clone(), name: name.clone(), occ: *occ },
-            Window::Range(a, b) => InsNode::File {
-                path: loc.path.clone(), lo: (*a).max(1), hi: (*b).max(*a) },
-            Window::Around(n) => InsNode::File {
-                path: loc.path.clone(),
-                lo: n.saturating_sub(INS_FILE_PAGE / 2).max(1),
-                hi: n + INS_FILE_PAGE / 2 },
+            Window::Range(a, b) => file_at((*a).max(1), (*b).max(*a)),
+            Window::Around(n) => file_at(
+                n.saturating_sub(INS_FILE_PAGE / 2).max(1),
+                n + INS_FILE_PAGE / 2),
             Window::PageKey(_) => {
                 self.status = "inspect: next/previous here are \u{2190}/\u{2192} \
                                sibling navigation".into();
                 return;
             }
             Window::Default => {
-                let md = std::fs::metadata(&loc.path);
-                match md {
+                match std::fs::metadata(&loc.path) {
                     Ok(m) if m.is_dir() => InsNode::Dir {
                         path: loc.path.clone(), pattern: None,
                         lo: 1, hi: INS_END },
-                    Ok(_) => InsNode::File {
-                        path: loc.path.clone(), lo: 1, hi: INS_END },
+                    Ok(_) => file_at(1, INS_END),
                     Err(e) => {
                         self.status = format!("inspect: {}: {e}", loc.path);
                         return;
@@ -7436,29 +7584,30 @@ impl App {
             Some(InsNode::Box { sid, path }) => {
                 lines.push(format!("box {path}"));
                 lines.push(String::new());
-                lines.push(format!("{}", e.text));
+                lines.push(e.text.clone());
                 lines.push(String::new());
                 let sid = *sid;
+                let bv = |view: &'static str, label: &'static str| InsNode::BoxView {
+                    sid, view, label, facets: vec![], seq: false,
+                    lo: 1, hi: INS_END };
+                let rows = |kind| InsNode::Rows {
+                    sid, kind, group: None, query: None, seq: false,
+                    lo: 1, hi: INS_END };
                 let mut spot = |label: &str, node: InsNode| -> String {
                     spots.push((node, None));
                     format!("[{}] {label}", spots.len())
                 };
                 lines.push(format!("{} \u{b7} {} \u{b7} {}",
-                    spot("changes", InsNode::BoxView { sid, view: "changes",
-                        label: "changes", pattern: None, lo: 1, hi: INS_END }),
-                    spot("processes", InsNode::BoxView { sid, view: "procs",
-                        label: "processes", pattern: None, lo: 1, hi: INS_END }),
-                    spot("outputs", InsNode::BoxView { sid, view: "outputs",
-                        label: "outputs", pattern: None, lo: 1, hi: INS_END })));
+                    spot("changes", bv("changes", "changes")),
+                    spot("processes", bv("procs", "processes")),
+                    spot("outputs", bv("outputs", "outputs"))));
                 lines.push(format!("{} \u{b7} {} \u{b7} {}",
-                    spot("pipelines", InsNode::BoxView { sid, view: "pipelines",
-                        label: "pipelines", pattern: None, lo: 1, hi: INS_END }),
-                    spot("build edges", InsNode::BoxView { sid, view: "build_edges",
-                        label: "build edges", pattern: None, lo: 1, hi: INS_END }),
-                    spot("network flows", InsNode::Flows { sid, lo: 1, hi: INS_END })));
+                    spot("pipelines", bv("pipelines", "pipelines")),
+                    spot("build edges", bv("build_edges", "build edges")),
+                    spot("network flows", rows(InsRowsKind::Flows))));
                 lines.push(format!("{} \u{b7} {}",
-                    spot("web captures", InsNode::Webcap { sid, lo: 1, hi: INS_END }),
-                    spot("api log", InsNode::ApiLog { sid, lo: 1, hi: INS_END })));
+                    spot("web captures", rows(InsRowsKind::Webcap)),
+                    spot("api log", rows(InsRowsKind::ApiLog))));
                 lines.push(String::new());
                 lines.push("Enter opens the box's table index; digits jump \
                             straight to a table.".into());
@@ -7493,10 +7642,10 @@ impl App {
                 spots.push((InsNode::Dir { path: path.clone(), pattern: None,
                                            lo: 1, hi: INS_END },
                             Some("glob pattern (e.g. *.rs)")));
-                lines.push(format!("[1] open \u{b7} [2] filter by glob\u{2026} \
-                                    (mandatory pattern)"));
+                lines.push("[1] open \u{b7} [2] filter by glob\u{2026} \
+                            (mandatory pattern)".to_string());
             }
-            Some(InsNode::File { path, lo, hi }) => {
+            Some(InsNode::File { path, lo, hi, .. }) => {
                 let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                 lines.push(format!("file {path}"));
                 lines.push(String::new());
@@ -7507,7 +7656,11 @@ impl App {
                 }
                 lines.push(String::new());
                 spots.push((e.child.clone().unwrap(), None));
-                let mut hot = format!("[1] view lines");
+                spots.push((InsNode::File { path: path.clone(), query: None,
+                                            lo: 1, hi: INS_END },
+                            Some("substring / wildcard the lines must contain")));
+                let mut hot =
+                    "[1] view lines \u{b7} [2] grep lines\u{2026}".to_string();
                 let known_ext = std::path::Path::new(path).extension()
                     .and_then(|x| x.to_str())
                     .map(|x| matches!(x, "rs" | "py" | "sh" | "bash"))
@@ -7515,23 +7668,26 @@ impl App {
                 if known_ext {
                     spots.push((InsNode::Symbols { path: path.clone(),
                                                    lo: 1, hi: INS_END }, None));
-                    hot.push_str(" \u{b7} [2] symbols (tree-sitter)");
+                    hot.push_str(" \u{b7} [3] symbols (tree-sitter)");
                 }
                 lines.push(hot);
             }
-            Some(InsNode::BoxView { sid, view, label, pattern, .. }) => {
+            Some(InsNode::BoxView { sid, view, label, facets, .. }) => {
                 lines.push(format!("{label} of this box"));
                 lines.push(String::new());
-                if let Some(p) = pattern {
-                    lines.push(format!("filter {p:?}"));
+                if !facets.is_empty() {
+                    lines.push(format!("narrowed to: {}",
+                        facets.iter().map(InsFacet::label)
+                            .collect::<Vec<_>>().join(" \u{b7} ")));
                     lines.push(String::new());
                 }
                 spots.push((e.child.clone().unwrap(), None));
                 spots.push((InsNode::BoxView { sid: *sid, view, label,
-                                               pattern: None, lo: 1, hi: INS_END },
-                            Some("wildcard pattern")));
-                lines.push(format!("[1] open \u{b7} [2] filter by pattern\u{2026} \
-                                    (mandatory)"));
+                                facets: facets.clone(), seq: false,
+                                lo: 1, hi: INS_END },
+                            Some("pattern (glob; filters this table)")));
+                lines.push("[1] open \u{b7} [2] narrow by pattern\u{2026} \
+                            (mandatory)".to_string());
             }
             Some(InsNode::Json { v, .. }) => {
                 let pretty = serde_json::to_string_pretty(v)
@@ -7540,7 +7696,7 @@ impl App {
                     lines.push(l.to_string());
                 }
                 if pretty.lines().count() > INS_PAGE {
-                    lines.push(format!("\u{2026} Enter drills into the fields"));
+                    lines.push("\u{2026} Enter drills into the fields".to_string());
                 }
             }
             Some(InsNode::Symbol { path, name, .. }) => {
@@ -7568,10 +7724,11 @@ impl App {
     }
 
     /// Build the frame for a node — the one renderer for the whole object
-    /// graph. Every listing goes through the same shape: compute the total,
-    /// bucket the span when it exceeds a page (`ins_spans`), else emit the
-    /// leaf rows for exactly this slice. RPC / fs errors become the frame's
-    /// header (the drill-down stays navigable; Backspace goes up).
+    /// graph. Listings share one shape: compute the (narrowed) total; if it
+    /// exceeds a page emit a SUMMARY of informative facets (never blind
+    /// index ranges) plus a refine row and a sequential escape hatch; else
+    /// emit the leaf rows for exactly this slice. RPC / fs errors become
+    /// the frame's header (the drill-down stays navigable).
     fn ins_frame(&self, node: InsNode) -> InsFrame {
         let mut header: Vec<String> = vec![];
         let mut entries: Vec<InsEntry> = vec![];
@@ -7589,23 +7746,22 @@ impl App {
                                       InsNode::Boxes { lo: 1, hi: INS_END }));
                 entries.push(ins_link("file rules — the ordered apply/discard/passthrough list",
                                       InsNode::Rules));
+                let dir_at = |p: String| InsNode::Dir {
+                    path: p, pattern: None, lo: 1, hi: INS_END };
                 let cwd = std::env::current_dir()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| "/".into());
-                entries.push(ins_link(format!("cwd — {cwd}"),
-                    InsNode::Dir { path: cwd, pattern: None, lo: 1, hi: INS_END }));
+                entries.push(ins_link(format!("cwd — {cwd}"), dir_at(cwd.clone())));
                 let conf = crate::paths::config_home().to_string_lossy().into_owned();
-                entries.push(ins_link(format!("config — {conf}"),
-                    InsNode::Dir { path: conf, pattern: None, lo: 1, hi: INS_END }));
+                entries.push(ins_link(format!("config — {conf}"), dir_at(conf)));
                 let state = crate::paths::state_home().to_string_lossy().into_owned();
-                entries.push(ins_link(format!("state — {state} (oaita sessions live here)"),
-                    InsNode::Dir { path: state, pattern: None, lo: 1, hi: INS_END }));
+                entries.push(ins_link(
+                    format!("state — {state} (oaita sessions live here)"),
+                    dir_at(state)));
                 let data = crate::paths::data_home().to_string_lossy().into_owned();
                 entries.push(ins_link(format!("data — {data} (box stores)"),
-                    InsNode::Dir { path: data, pattern: None, lo: 1, hi: INS_END }));
-                entries.push(ins_link("filesystem — /",
-                    InsNode::Dir { path: "/".into(), pattern: None,
-                                   lo: 1, hi: INS_END }));
+                                      dir_at(data)));
+                entries.push(ins_link("filesystem — /", dir_at("/".into())));
             }
             InsNode::Boxes { lo, hi } => {
                 match rpc(&self.sock, "session_dicts", json!([])) {
@@ -7619,15 +7775,13 @@ impl App {
                         header.push(String::new());
                         if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
                             for (a, b) in spans {
-                                let first = rows.get(a - 1)
-                                    .and_then(|r| r.get("path"))
-                                    .and_then(Value::as_str).unwrap_or("?");
-                                let last = rows.get(b - 1)
+                                let name = |i: usize| rows.get(i - 1)
                                     .and_then(|r| r.get("path"))
                                     .and_then(Value::as_str).unwrap_or("?");
                                 entries.push(ins_link(
                                     format!("boxes {a}..{b} \u{b7} {} \u{21e2} {}",
-                                            ins_clip(first, 18), ins_clip(last, 18)),
+                                            ins_clip(name(a), 18),
+                                            ins_clip(name(b), 18)),
                                     InsNode::Boxes { lo: a, hi: b }));
                             }
                         } else {
@@ -7667,7 +7821,11 @@ impl App {
                 }
                 let sid = *sid;
                 let bv = |view: &'static str, label: &'static str| InsNode::BoxView {
-                    sid, view, label, pattern: None, lo: 1, hi: INS_END };
+                    sid, view, label, facets: vec![], seq: false,
+                    lo: 1, hi: INS_END };
+                let rows = |kind| InsNode::Rows {
+                    sid, kind, group: None, query: None, seq: false,
+                    lo: 1, hi: INS_END };
                 entries.push(ins_link("changes — files the box wrote",
                                       bv("changes", "changes")));
                 entries.push(ins_link("processes — the captured process tree",
@@ -7679,102 +7837,14 @@ impl App {
                 entries.push(ins_link("build edges — parsed ninja/make graph",
                                       bv("build_edges", "build edges")));
                 entries.push(ins_link("network flows — tshark-decoded pcap",
-                    InsNode::Flows { sid, lo: 1, hi: INS_END }));
+                                      rows(InsRowsKind::Flows)));
                 entries.push(ins_link("web captures — tap MITM HTTP(S) archive",
-                    InsNode::Webcap { sid, lo: 1, hi: INS_END }));
+                                      rows(InsRowsKind::Webcap)));
                 entries.push(ins_link("api log — the --api oaita proxy log",
-                    InsNode::ApiLog { sid, lo: 1, hi: INS_END }));
+                                      rows(InsRowsKind::ApiLog)));
             }
-            InsNode::BoxView { sid, view, label, pattern, lo, hi } => {
-                let filter = match pattern {
-                    Some(p) => {
-                        let kind = match *view {
-                            "changes" => "path",
-                            "pipelines" => "cmd",
-                            "build_edges" => "target",
-                            _ => "exe",
-                        };
-                        json!([{ "kind": kind, "pattern": p, "join": "and",
-                                 "negate": false, "enabled": true }])
-                    }
-                    None => Value::Null,
-                };
-                let args = if *view == "procs" {
-                    json!([view, sid, filter, false])
-                } else {
-                    json!([view, sid, filter])
-                };
-                match rpc(&self.sock, "view.open", args) {
-                    Ok(opened) => {
-                        let vid = opened.get("view_id")
-                            .and_then(Value::as_u64).unwrap_or(0);
-                        let n = opened.get("total")
-                            .and_then(Value::as_u64).unwrap_or(0) as usize;
-                        let (lo, hi) = ((*lo).max(1), (*hi).min(n));
-                        let ptag = match pattern {
-                            Some(p) => format!(" \u{b7} filter {p:?}"),
-                            None => String::new(),
-                        };
-                        title = if lo == 1 && hi >= n {
-                            format!("{label}{ptag}")
-                        } else {
-                            format!("{label} {lo}..{hi}{ptag}")
-                        };
-                        header.push(format!("{label}: {n} row(s){ptag}"));
-                        header.push(String::new());
-                        if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
-                            let _ = rpc(&self.sock, "view.close", json!([vid]));
-                            for (a, b) in spans {
-                                entries.push(ins_link(
-                                    format!("rows {a}..{b} of {n}"),
-                                    InsNode::BoxView { sid: *sid, view, label,
-                                        pattern: pattern.clone(),
-                                        lo: a, hi: b }));
-                            }
-                        } else {
-                            let take = hi.saturating_sub(lo - 1);
-                            let rows = if take == 0 { vec![] } else {
-                                rpc(&self.sock, "view.window",
-                                    json!([vid, lo - 1, take]))
-                                    .ok()
-                                    .and_then(|v| v.get("rows")
-                                        .and_then(|r| r.as_array().cloned()))
-                                    .unwrap_or_default()
-                            };
-                            let _ = rpc(&self.sock, "view.close", json!([vid]));
-                            for r in rows {
-                                if *view == "changes" {
-                                    let path = r.get("path").and_then(Value::as_str)
-                                        .unwrap_or("").to_string();
-                                    let kind = r.get("kind").and_then(Value::as_str)
-                                        .unwrap_or("?");
-                                    let size = r.get("size").and_then(Value::as_i64)
-                                        .unwrap_or(0);
-                                    // Directory-connector rows are structure,
-                                    // not leaves — shown, but with no diff.
-                                    let child = if kind == "dir" { None } else {
-                                        Some(InsNode::BoxFile {
-                                            sid: *sid, file: path.clone() })
-                                    };
-                                    entries.push(InsEntry {
-                                        text: format!("{kind:>7}  {size:>8}  {path}"),
-                                        child, arg: None,
-                                    });
-                                } else {
-                                    entries.push(ins_link(
-                                        ins_json_preview(&r, 200),
-                                        InsNode::Json {
-                                            label: format!("{label} row"),
-                                            v: r.clone(), lo: 1, hi: INS_END }));
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        title = (*label).to_string();
-                        header.push(format!("view.open {view}: {e}"));
-                    }
-                }
+            InsNode::BoxView { .. } => {
+                title = self.ins_box_view_frame(&node, &mut header, &mut entries);
             }
             InsNode::BoxFile { sid, file } => {
                 title = file.clone();
@@ -7818,27 +7888,8 @@ impl App {
                     Err(e) => header.push(format!("review.hunks: {e}")),
                 }
             }
-            InsNode::Flows { sid, lo, hi } => {
-                let rows = rpc(&self.sock, "flows.list", json!([sid.to_string()]))
-                    .ok()
-                    .and_then(|v| v.get("flows").and_then(Value::as_array).cloned());
-                title = Self::ins_rows_frame(rows, "flows", "flow", *lo, *hi,
-                    &mut header, &mut entries,
-                    |a, b| InsNode::Flows { sid: *sid, lo: a, hi: b });
-            }
-            InsNode::Webcap { sid, lo, hi } => {
-                let rows = rpc(&self.sock, "webcap", json!([sid.to_string()]))
-                    .ok().and_then(|v| v.as_array().cloned());
-                title = Self::ins_rows_frame(rows, "web captures", "web capture",
-                    *lo, *hi, &mut header, &mut entries,
-                    |a, b| InsNode::Webcap { sid: *sid, lo: a, hi: b });
-            }
-            InsNode::ApiLog { sid, lo, hi } => {
-                let rows = rpc(&self.sock, "api_log", json!([sid.to_string()]))
-                    .ok().and_then(|v| v.as_array().cloned());
-                title = Self::ins_rows_frame(rows, "api log", "api request",
-                    *lo, *hi, &mut header, &mut entries,
-                    |a, b| InsNode::ApiLog { sid: *sid, lo: a, hi: b });
+            InsNode::Rows { .. } => {
+                title = self.ins_rows_frame(&node, &mut header, &mut entries);
             }
             InsNode::Rules => {
                 title = "file rules".into();
@@ -7879,23 +7930,24 @@ impl App {
                         };
                         header.push(format!("dir {path}: {n} entrie(s){ptag}"));
                         header.push(String::new());
-                        if pattern.is_none() && lo == 1 {
-                            entries.push(ins_ask(
-                                "\u{2315} filter entries by glob\u{2026} \
-                                 (e.g. *.rs — mandatory pattern)",
-                                InsNode::Dir { path: path.clone(), pattern: None,
-                                               lo: 1, hi: INS_END },
-                                "glob pattern (e.g. *.rs)"));
-                        }
+                        // Every level (bucket or not) can refine by glob —
+                        // the typed selection on top of the prepared ranges.
+                        entries.push(ins_ask(
+                            "\u{2315} filter entries by glob\u{2026} \
+                             (e.g. *.rs — mandatory pattern)",
+                            InsNode::Dir { path: path.clone(), pattern: None,
+                                           lo: 1, hi: INS_END },
+                            "glob pattern (e.g. *.rs)"));
                         if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
+                            // Alphabetic ranges labeled by their boundary
+                            // names — a phone-book index, not blind numbers.
                             for (a, b) in spans {
-                                let first = items.get(a - 1)
-                                    .map(|(n, _)| n.as_str()).unwrap_or("?");
-                                let last = items.get(b - 1)
+                                let name = |i: usize| items.get(i - 1)
                                     .map(|(n, _)| n.as_str()).unwrap_or("?");
                                 entries.push(ins_link(
                                     format!("entries {a}..{b} \u{b7} {} \u{21e2} {}",
-                                            ins_clip(first, 16), ins_clip(last, 16)),
+                                            ins_clip(name(a), 16),
+                                            ins_clip(name(b), 16)),
                                     InsNode::Dir { path: path.clone(),
                                                    pattern: pattern.clone(),
                                                    lo: a, hi: b }));
@@ -7915,7 +7967,7 @@ impl App {
                                         pattern: None, lo: 1, hi: INS_END })
                                 } else {
                                     ("file", InsNode::File { path: full,
-                                        lo: 1, hi: INS_END })
+                                        query: None, lo: 1, hi: INS_END })
                                 };
                                 entries.push(ins_link(
                                     format!("{kind:>5}  {name}"), child));
@@ -7928,7 +7980,7 @@ impl App {
                     }
                 }
             }
-            InsNode::File { path, lo, hi } => {
+            InsNode::File { path, query, lo, hi } => {
                 match std::fs::read(path) {
                     Ok(bytes) if bytes.contains(&0) => {
                         title = path.clone();
@@ -7936,15 +7988,26 @@ impl App {
                     }
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes);
-                        let lines: Vec<&str> = text.lines().collect();
+                        // Keep original line numbers through the grep filter.
+                        let lines: Vec<(usize, &str)> = text.lines().enumerate()
+                            .map(|(i, l)| (i + 1, l))
+                            .filter(|(_, l)| match query {
+                                Some(q) => ins_wild(q, l),
+                                None => true,
+                            })
+                            .collect();
                         let n = lines.len();
                         let (lo, hi) = ((*lo).max(1).min(n.max(1)), (*hi).min(n));
-                        title = if lo == 1 && hi >= n {
-                            format!("{path} ({n} lines)")
-                        } else {
-                            format!("{path} lines {lo}..{hi} of {n}")
+                        let qtag = match query {
+                            Some(q) => format!(" \u{b7} grep {q:?}"),
+                            None => String::new(),
                         };
-                        if lo == 1 && hi >= n
+                        title = if lo == 1 && hi >= n {
+                            format!("{path} ({n} lines){qtag}")
+                        } else {
+                            format!("{path} lines {lo}..{hi} of {n}{qtag}")
+                        };
+                        if query.is_none() && lo == 1 && hi >= n
                             && crate::oaita::structural::parse_symbols(
                                 path, &bytes).is_some()
                         {
@@ -7954,17 +8017,28 @@ impl App {
                                 InsNode::Symbols { path: path.clone(),
                                                    lo: 1, hi: INS_END }));
                         }
+                        entries.push(ins_ask(
+                            "\u{2315} grep lines\u{2026} (substring or *glob*, \
+                             keeps line numbers)",
+                            InsNode::File { path: path.clone(), query: None,
+                                            lo: 1, hi: INS_END },
+                            "substring / wildcard the lines must contain"));
                         if let Some(spans) = ins_spans(lo, hi, INS_FILE_PAGE) {
                             for (a, b) in spans {
+                                // Label with the REAL line numbers at the
+                                // bucket edges (they differ under a grep).
+                                let (la, lb) = (lines[a - 1].0, lines[b - 1].0);
                                 entries.push(ins_link(
-                                    format!("lines {a}..{b}"),
+                                    format!("lines {la}..{lb}"),
                                     InsNode::File { path: path.clone(),
+                                                    query: query.clone(),
                                                     lo: a, hi: b }));
                             }
                         } else {
-                            for (i, l) in lines[lo - 1..hi].iter().enumerate() {
-                                entries.push(ins_row(
-                                    format!("{:>6}  {l}", lo + i)));
+                            for (num, l) in lines.iter().take(hi)
+                                .skip(lo.saturating_sub(1))
+                            {
+                                entries.push(ins_row(format!("{num:>6}  {l}")));
                             }
                         }
                     }
@@ -8002,15 +8076,13 @@ impl App {
                                 }
                                 if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
                                     for (a, b) in spans {
-                                        let first = symbols.get(a - 1)
-                                            .map(|s| s.name.as_str()).unwrap_or("?");
-                                        let last = symbols.get(b - 1)
+                                        let name = |i: usize| symbols.get(i - 1)
                                             .map(|s| s.name.as_str()).unwrap_or("?");
                                         entries.push(ins_link(
                                             format!("symbols {a}..{b} \u{b7} \
                                                      {} \u{21e2} {}",
-                                                    ins_clip(first, 16),
-                                                    ins_clip(last, 16)),
+                                                    ins_clip(name(a), 16),
+                                                    ins_clip(name(b), 16)),
                                             InsNode::Symbols { path: path.clone(),
                                                                lo: a, hi: b }));
                                     }
@@ -8115,7 +8187,10 @@ impl App {
                         if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
                             for (a, b) in spans {
                                 entries.push(ins_link(
-                                    format!("[{}..{}] of {n}", a - 1, b - 1),
+                                    format!("[{}..{}] \u{b7} {} \u{21e2} {}",
+                                            a - 1, b - 1,
+                                            ins_json_preview(&arr[a - 1], 14),
+                                            ins_json_preview(&arr[b - 1], 14)),
                                     InsNode::Json { label: label.clone(),
                                         v: v.clone(), lo: a, hi: b }));
                             }
@@ -8146,39 +8221,344 @@ impl App {
                    card: vec![], hotspots: vec![] }
     }
 
-    /// Shared frame builder for the in-memory row lists (flows / webcap /
-    /// api log): count, bucket-or-list, one row per element with a JSON
-    /// drill-down. Returns the frame title.
-    fn ins_rows_frame(rows: Option<Vec<Value>>, what: &str, row_label: &str,
-                      lo: usize, hi: usize,
-                      header: &mut Vec<String>, entries: &mut Vec<InsEntry>,
-                      sub: impl Fn(usize, usize) -> InsNode) -> String {
-        let Some(rows) = rows else {
+    /// A box-table view frame. Wide listings become a FACET SUMMARY —
+    /// path-prefix groups, file types, size ranges (changes/build edges),
+    /// exe / leading-command groups (procs/pipelines) — every count from
+    /// the engine-filtered listing (a "≈" marks sample-derived counts),
+    /// plus the ⌕ refine row and a sequential escape hatch. Facets stack:
+    /// drilling a group re-runs the view with one more filter clause.
+    fn ins_box_view_frame(&self, node: &InsNode,
+                          header: &mut Vec<String>,
+                          entries: &mut Vec<InsEntry>) -> String {
+        let InsNode::BoxView { sid, view, label, facets, seq, lo, hi } = node
+            else { unreachable!() };
+        let clauses: Vec<Value> = facets.iter()
+            .filter_map(|f| f.clause(view))
+            .map(|(kind, pattern)| json!({
+                "kind": kind, "pattern": pattern, "join": "and",
+                "negate": false, "enabled": true }))
+            .collect();
+        let filter = if clauses.is_empty() { Value::Null }
+                     else { Value::Array(clauses) };
+        let args = if *view == "procs" {
+            json!([view, sid, filter, false])
+        } else {
+            json!([view, sid, filter])
+        };
+        let opened = match rpc(&self.sock, "view.open", args) {
+            Ok(v) => v,
+            Err(e) => {
+                header.push(format!("view.open {view}: {e}"));
+                return (*label).to_string();
+            }
+        };
+        let vid = opened.get("view_id").and_then(Value::as_u64).unwrap_or(0);
+        let n = opened.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let ftag = if facets.is_empty() { String::new() } else {
+            format!(" \u{b7} {}", facets.iter().map(InsFacet::label)
+                .collect::<Vec<_>>().join(" \u{b7} "))
+        };
+        // Client-side Size facets need the rows; so do leaves and facet
+        // derivation. One bounded window covers all three.
+        let sample = rpc(&self.sock, "view.window",
+                         json!([vid, 0, n.min(INS_SAMPLE)]))
+            .ok()
+            .and_then(|v| v.get("rows").and_then(|r| r.as_array().cloned()))
+            .unwrap_or_default();
+        let _ = rpc(&self.sock, "view.close", json!([vid]));
+        let sampled = n > sample.len();
+
+        let size_of = |r: &Value| r.get("size").and_then(Value::as_i64)
+            .unwrap_or(0) as u64;
+        let size_sel: Vec<(u64, Option<u64>)> = facets.iter()
+            .filter_map(|f| match f {
+                InsFacet::Size(a, b) => Some((*a, *b)), _ => None })
+            .collect();
+        let in_size = |r: &Value| size_sel.iter().all(|(a, b)| {
+            let s = size_of(r);
+            s >= *a && b.map(|b| s < b).unwrap_or(true)
+        });
+
+        if !size_sel.is_empty() || *seq || n <= INS_PAGE {
+            // Row-listing mode. Size facets filter the sample client-side
+            // (they are only ever offered when the whole narrowed listing
+            // fits the sample, so this is exact).
+            let rows: Vec<&Value> = sample.iter().filter(|r| in_size(r)).collect();
+            let m = rows.len();
+            let (lo, hi) = ((*lo).max(1), (*hi).min(m));
+            header.push(format!("{label}: {m} row(s){ftag}"));
+            if sampled {
+                header.push(format!("(first {} of {n} — narrow to see the rest)",
+                                    sample.len()));
+            }
+            header.push(String::new());
+            if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
+                for (a, b) in spans {
+                    let sub = |a, b| InsNode::BoxView {
+                        sid: *sid, view, label, facets: facets.clone(),
+                        seq: true, lo: a, hi: b };
+                    // Boundary previews so even the sequential ranges say
+                    // what's inside them.
+                    let pv = |i: usize| ins_preview_of(rows[i - 1], view, 14);
+                    entries.push(ins_link(
+                        format!("rows {a}..{b} \u{b7} {} \u{21e2} {}",
+                                pv(a), pv(b)), sub(a, b)));
+                }
+            } else {
+                for r in rows.iter().take(hi).skip(lo.saturating_sub(1)) {
+                    entries.push(ins_view_row(r, *sid, view, label));
+                }
+            }
+            return if lo == 1 && hi >= m { format!("{label}{ftag}") }
+                   else { format!("{label} {lo}..{hi}{ftag}") };
+        }
+
+        // SUMMARY mode: facet groups instead of blind ranges.
+        header.push(format!("{label}: {n} row(s){ftag} — pick a group, \
+                             refine by pattern, or browse sequentially"));
+        header.push(String::new());
+        let again = |extra: InsFacet| {
+            let mut fs = facets.clone();
+            fs.push(extra);
+            InsNode::BoxView { sid: *sid, view, label, facets: fs,
+                               seq: false, lo: 1, hi: INS_END }
+        };
+        entries.push(ins_ask(
+            format!("\u{2315} narrow by pattern\u{2026} (glob on the row's {}, \
+                     mandatory)",
+                    match *view { "changes" => "path", "procs" => "exe",
+                                  "pipelines" => "command",
+                                  "build_edges" => "target", _ => "text" }),
+            InsNode::BoxView { sid: *sid, view, label, facets: facets.clone(),
+                               seq: false, lo: 1, hi: INS_END },
+            "pattern (glob; filters this table)"));
+        let ap = ins_approx(sampled);
+        match *view {
+            "changes" | "build_edges" => {
+                let cur_prefix: String = facets.iter().rev().find_map(|f|
+                    match f { InsFacet::Prefix(p) => Some(p.clone()), _ => None })
+                    .unwrap_or_default();
+                let rel_of = |r: &Value| -> Option<String> {
+                    let p = ins_path_of(r, view)?;
+                    let p = p.trim_start_matches('/');
+                    if cur_prefix.is_empty() { return Some(p.to_string()); }
+                    p.strip_prefix(cur_prefix.as_str())
+                        .map(|s| s.trim_start_matches('/').to_string())
+                };
+                // Next path component under the current prefix ("" = here).
+                let comps = ins_tally(&sample, |r| {
+                    let rel = rel_of(r)?;
+                    Some(match rel.split_once('/') {
+                        Some((c, _)) => c.to_string(),
+                        None => String::new(),
+                    })
+                });
+                for (comp, count) in comps.iter().take(INS_PAGE / 2) {
+                    if comp.is_empty() {
+                        entries.push(ins_link(
+                            format!("(files here) — {ap}{count}"),
+                            again(InsFacet::Here(cur_prefix.clone()))));
+                    } else {
+                        let deeper = if cur_prefix.is_empty() { comp.clone() }
+                                     else { format!("{cur_prefix}/{comp}") };
+                        entries.push(ins_link(
+                            format!("{comp}/ — {ap}{count}"),
+                            again(InsFacet::Prefix(deeper))));
+                    }
+                }
+                if *view == "changes" {
+                    let exts = ins_tally(&sample, |r| {
+                        let p = ins_path_of(r, view)?;
+                        let base = p.rsplit('/').next()?;
+                        let e = base.rsplit_once('.')?.1;
+                        (!e.is_empty() && e.len() <= 8
+                            && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                            .then(|| e.to_string())
+                    });
+                    for (ext, count) in exts.iter().take(8) {
+                        entries.push(ins_link(
+                            format!("*.{ext} — {ap}{count}"),
+                            again(InsFacet::Ext(ext.clone()))));
+                    }
+                    if !sampled {
+                        // Exact only: size filtering is client-side.
+                        for (a, b) in INS_SIZE_STEPS {
+                            let count = sample.iter().filter(|r| {
+                                let s = size_of(r);
+                                s >= *a && b.map(|b| s < b).unwrap_or(true)
+                            }).count();
+                            if count > 0 {
+                                entries.push(ins_link(
+                                    format!("size {} — {count}",
+                                            ins_size_label(*a, *b)),
+                                    again(InsFacet::Size(*a, *b))));
+                            }
+                        }
+                    }
+                }
+            }
+            "procs" => {
+                let groups = ins_tally(&sample, |r| {
+                    r.get("exe").and_then(Value::as_str)
+                        .map(|e| e.rsplit('/').next().unwrap_or(e).to_string())
+                });
+                for (g, count) in groups.iter().take(INS_PAGE) {
+                    entries.push(ins_link(format!("{g} — {ap}{count}"),
+                                          again(InsFacet::Group(g.clone()))));
+                }
+            }
+            "pipelines" => {
+                let groups = ins_tally(&sample, |r| {
+                    r.get("cmd").and_then(Value::as_str)
+                        .and_then(|c| c.split_whitespace().next())
+                        .map(str::to_string)
+                });
+                for (g, count) in groups.iter().take(INS_PAGE) {
+                    entries.push(ins_link(format!("{g} \u{2026} — {ap}{count}"),
+                                          again(InsFacet::Group(g.clone()))));
+                }
+            }
+            _ => {}
+        }
+        // The transcript-like views (and any facet-less residue) can always
+        // be walked in order.
+        entries.push(ins_link(
+            format!("browse all {n} sequentially\u{2026}"),
+            InsNode::BoxView { sid: *sid, view, label, facets: facets.clone(),
+                               seq: true, lo: 1, hi: INS_END }));
+        format!("{label}{ftag}")
+    }
+
+    /// An in-memory row-list frame (flows / webcap / api log). Same summary
+    /// shape as the box views, faceted client-side: field=value groups from
+    /// the list's natural keys, a ⌕ query row (substring across the whole
+    /// row), and a sequential escape hatch.
+    fn ins_rows_frame(&self, node: &InsNode,
+                      header: &mut Vec<String>,
+                      entries: &mut Vec<InsEntry>) -> String {
+        let InsNode::Rows { sid, kind, group, query, seq, lo, hi } = node
+            else { unreachable!() };
+        let what = kind.label();
+        let Some(all) = kind.fetch(&self.sock, *sid) else {
             header.push(format!("{what}: unavailable (engine verb missing \
                                  or no capture for this box)"));
             return what.to_string();
         };
+        let rows: Vec<&Value> = all.iter()
+            .filter(|r| match group {
+                Some((k, want)) => r.get(k.as_str())
+                    .map(|v| ins_json_preview(v, 200) == *want)
+                    .unwrap_or(false),
+                None => true,
+            })
+            .filter(|r| match query {
+                Some(q) => ins_wild(q, &ins_json_preview(r, 4096)),
+                None => true,
+            })
+            .collect();
         let n = rows.len();
-        let (lo, hi) = (lo.max(1), hi.min(n));
-        header.push(format!("{n} {row_label}(s)"));
+        let mut tags = vec![];
+        if let Some((k, v)) = group { tags.push(format!("{k}={v}")); }
+        if let Some(q) = query { tags.push(format!("~{q}")); }
+        let ftag = if tags.is_empty() { String::new() }
+                   else { format!(" \u{b7} {}", tags.join(" \u{b7} ")) };
+        header.push(format!("{n} row(s){ftag}"));
         header.push(String::new());
+
+        if !*seq && n > INS_PAGE && group.is_none() {
+            // SUMMARY: group by the list's most useful key with >1 value.
+            entries.push(ins_ask(
+                "\u{2315} filter rows\u{2026} (substring or *glob* across the \
+                 whole row, mandatory)",
+                node.clone(), "substring / wildcard the rows must contain"));
+            let mut grouped = false;
+            for key in kind.group_keys() {
+                let groups = ins_tally(&rows, |r| {
+                    r.get(*key).map(|v| ins_json_preview(v, 60))
+                });
+                if groups.len() < 2 { continue; }
+                for (val, count) in groups.iter().take(INS_PAGE) {
+                    entries.push(ins_link(
+                        format!("{key} = {val} — {count}"),
+                        InsNode::Rows { sid: *sid, kind: *kind,
+                            group: Some((key.to_string(), val.clone())),
+                            query: query.clone(), seq: false,
+                            lo: 1, hi: INS_END }));
+                }
+                grouped = true;
+                break;
+            }
+            entries.push(ins_link(
+                format!("browse all {n} sequentially\u{2026}"),
+                InsNode::Rows { sid: *sid, kind: *kind, group: group.clone(),
+                    query: query.clone(), seq: true, lo: 1, hi: INS_END }));
+            if grouped {
+                return format!("{what}{ftag}");
+            }
+            // No key had >1 value — fall through to the sequential listing.
+            entries.truncate(1);
+        }
+
+        let (lo, hi) = ((*lo).max(1), (*hi).min(n));
         if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
             for (a, b) in spans {
-                entries.push(ins_link(format!("rows {a}..{b} of {n}"),
-                                      sub(a, b)));
+                entries.push(ins_link(
+                    format!("rows {a}..{b} \u{b7} {} \u{21e2} {}",
+                            ins_json_preview(rows[a - 1], 14),
+                            ins_json_preview(rows[b - 1], 14)),
+                    InsNode::Rows { sid: *sid, kind: *kind, group: group.clone(),
+                        query: query.clone(), seq: true, lo: a, hi: b }));
             }
         } else {
             for r in rows.iter().take(hi).skip(lo.saturating_sub(1)) {
                 entries.push(ins_link(ins_json_preview(r, 200),
-                    InsNode::Json { label: row_label.to_string(),
-                                    v: r.clone(), lo: 1, hi: INS_END }));
+                    InsNode::Json { label: what.to_string(),
+                                    v: (*r).clone(), lo: 1, hi: INS_END }));
             }
         }
-        if lo == 1 && hi >= n {
-            what.to_string()
-        } else {
-            format!("{what} {lo}..{hi}")
-        }
+        if lo == 1 && hi >= n { format!("{what}{ftag}") }
+        else { format!("{what} {lo}..{hi}{ftag}") }
+    }
+}
+
+/// The path-ish field of a box-view row ("path" for changes, the first out
+/// for build edges).
+fn ins_path_of(r: &Value, view: &str) -> Option<String> {
+    if view == "build_edges" {
+        r.get("outs").and_then(Value::as_array)
+            .and_then(|a| a.first()).and_then(Value::as_str)
+            .map(str::to_string)
+    } else {
+        r.get("path").and_then(Value::as_str).map(str::to_string)
+    }
+}
+
+/// Short content preview for a sequential-range boundary label.
+fn ins_preview_of(r: &Value, view: &str, cap: usize) -> String {
+    match ins_path_of(r, view) {
+        Some(p) => ins_clip(p.rsplit('/').next().unwrap_or(&p), cap),
+        None => ins_json_preview(r, cap),
+    }
+}
+
+/// One leaf row of a box-table view: changes get their per-file diff as the
+/// child, everything else drills into the row's fields.
+fn ins_view_row(r: &Value, sid: i64, view: &'static str,
+                label: &'static str) -> InsEntry {
+    if view == "changes" {
+        let path = r.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let kind = r.get("kind").and_then(Value::as_str).unwrap_or("?");
+        let size = r.get("size").and_then(Value::as_i64).unwrap_or(0);
+        // Directory-connector rows are structure, not leaves — no diff.
+        let child = if kind == "dir" { None } else {
+            Some(InsNode::BoxFile { sid, file: path.clone() })
+        };
+        InsEntry { text: format!("{kind:>7}  {size:>8}  {path}"),
+                   child, arg: None }
+    } else {
+        ins_link(ins_json_preview(r, 200),
+            InsNode::Json { label: format!("{label} row"),
+                            v: r.clone(), lo: 1, hi: INS_END })
     }
 }
 
@@ -8186,7 +8566,8 @@ impl App {
 /// on top (breadcrumb title, dim header, selectable rows; "\u{25b8}" marks
 /// rows with a drill target, "\u{2315}" argument prompts), the CARD of the
 /// selected row on the bottom (formatted description whose [n] markers are
-/// live hotspots — press the digit).
+/// live hotspots — press the digit), with the inline input rendered inside
+/// the card when a prompt or the ':' locator is active.
 fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect) {
     let Some(frame) = app.ins_stack.last() else {
         f.render_widget(Paragraph::new(Span::styled(
@@ -12049,6 +12430,24 @@ mod tests {
                     && names.iter().any(|t| t.contains("c.rs"))
                     && !names.iter().any(|t| t.contains("b.py")),
                 "filtered listing: {names:?}");
+
+        // File grep: the mandatory-input row filters lines but keeps the
+        // ORIGINAL line numbers.
+        app.ins_goto(file.to_str().unwrap());
+        let f = app.ins_stack.last().unwrap();
+        let grep = f.entries.iter().position(|e| e.arg.is_some())
+            .expect("file frames offer the grep row");
+        app.ins_stack.last_mut().unwrap().sel = grep;
+        app.ins_enter();
+        app.ins_input.as_mut().unwrap().1.push_str("alpha");
+        app.ins_input_done();
+        let f = app.ins_stack.last().unwrap();
+        assert!(f.title.contains("alpha"), "title: {}", f.title);
+        assert!(f.entries.iter().any(|e| e.text.contains("     1  def alpha")),
+                "grep keeps original numbering: {:?}",
+                f.entries.iter().map(|e| &e.text).collect::<Vec<_>>());
+        app.ins_pop();
+        app.ins_pop();
 
         // Cards: a file row's card carries numbered hotspots.
         app.ins_extreme(false);
