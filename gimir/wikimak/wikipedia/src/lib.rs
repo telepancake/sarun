@@ -10,6 +10,7 @@
 //! crash-safety contract.
 
 pub mod error;
+pub(crate) mod frames;
 pub mod import;
 pub mod instance;
 pub mod revision;

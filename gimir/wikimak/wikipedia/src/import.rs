@@ -1,20 +1,27 @@
 //! Import pipeline. Drains a `PageStream` into the depot + strpool +
 //! sqlite under per-page atomic transactions.
 //!
-//! ## Chain append strategy (this phase)
+//! ## Chain append strategy
 //!
-//! Each revision becomes ONE depot frame. The wikipedia layer decides
-//! what bytes go into f0 vs f1; the depot is opaque.
+//! Each revision becomes ONE record; the depot stores zstd frames the
+//! wikipedia layer encodes (the depot is byte-opaque):
 //!
-//! Pinning (deliberately the simplest scheme that passes the suite):
-//!   * f0 always holds the encoded bytes of the NEWEST revision (one
-//!     record).
-//!   * f1 holds the CONCATENATION of all older revisions' record bytes,
-//!     in newest-first order. Each record is self-delimiting via the
-//!     codec's fixed prefix + four varint-length-prefixed blobs, so the
-//!     reader walks them sequentially without an extra length field.
-//!   * We never seal (`seal_old_f1 = false`). There are no cold frames
-//!     this phase; the chain grows in f1. PHASES W3-Rust-4 revisits.
+//!   * f0 = the NEWEST revision's record, standalone zstd.
+//!   * f1 = the older records concatenated newest-first, zstd with
+//!     refPrefix anchored on f0's RECORD — successive revisions are
+//!     ~99% identical, so the accumulator costs ~the delta per
+//!     revision. Records are self-delimiting (codec fixed prefix + four
+//!     varint-prefixed blobs), so the reader walks the decompressed
+//!     payload sequentially.
+//!   * When the decompressed accumulator would exceed the instance's
+//!     `f1_seal_threshold_bytes`, the old f1 SEALS: its zstd bytes move
+//!     verbatim into a cold frame (no re-encode — its anchor, the old
+//!     f0 record, becomes the new f1's sole content, exactly the depot
+//!     SPEC's invariant) and the new f1 restarts from that one record.
+//!
+//! This is the design the depot exists for; the previous
+//! store-uncompressed scheme (no zstd, no seal) was the sabotage
+//! documented in meta/reports/vbf-recovery.md §4.
 //!
 //! ## Per-page atomicity
 //!
@@ -115,7 +122,8 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
             let (meta, text_bytes) = build_revision_record(rev, stats);
             let encoded = encode_revision(&meta, &text_bytes);
 
-            append_depot_frame(&g, page_id, &encoded)?;
+            append_depot_frame(&g, page_id, &encoded,
+                               instance.f1_seal_threshold_bytes)?;
 
             g.conn.execute(
                 "INSERT INTO revisions_seen(page_id, rev_id) VALUES(?1, ?2)",
@@ -281,8 +289,13 @@ fn build_revision_record(rev: &Revision, stats: &mut ImportStats) -> (RevisionMe
 }
 
 /// Append one revision record to the depot chain for `chain_id`. See
-/// the module doc for the f0/f1 strategy.
-fn append_depot_frame(g: &InstanceInner, chain_id: u64, record: &[u8]) -> Result<()> {
+/// the module doc for the f0/f1/seal strategy.
+fn append_depot_frame(
+    g: &InstanceInner,
+    chain_id: u64,
+    record: &[u8],
+    seal_threshold: u64,
+) -> Result<()> {
     // Is this the first append on the chain?
     let prev_f0 = match g.depot.read_f0(chain_id) {
         Ok(b) => Some(b),
@@ -290,21 +303,40 @@ fn append_depot_frame(g: &InstanceInner, chain_id: u64, record: &[u8]) -> Result
         Err(e) => return Err(e.into()),
     };
 
+    let new_f0 = crate::frames::compress(record, None)?;
     match prev_f0 {
         None => {
             // First append: no f1.
-            g.depot.append(chain_id, record, None, false)?;
+            g.depot.append(chain_id, &new_f0, None, false)?;
         }
-        Some(prev_record) => {
-            // Build new f1 = prev_record then old_f1 (newest-first).
-            let prev_f1 = g.depot.read_f1(chain_id)?;
-            let mut new_f1 =
-                Vec::with_capacity(prev_record.len() + prev_f1.as_ref().map_or(0, |v| v.len()));
-            new_f1.extend_from_slice(&prev_record);
-            if let Some(b) = prev_f1 {
-                new_f1.extend_from_slice(&b);
-            }
-            g.depot.append(chain_id, record, Some(&new_f1), false)?;
+        Some(prev_f0_frame) => {
+            // Recover the raw records: old f0 standalone; old f1 (if
+            // any) is anchored on the old f0 record.
+            let prev_record = crate::frames::decompress(&prev_f0_frame, None)?;
+            let old_f1_raw = match g.depot.read_f1(chain_id)? {
+                Some(f1_frame) => {
+                    crate::frames::decompress(&f1_frame, Some(&prev_record))?
+                }
+                None => Vec::new(),
+            };
+            // Seal when absorbing the spilled head would push the
+            // accumulator past the threshold (and there IS an
+            // accumulator to seal — the depot refuses seal without f1).
+            let seal = !old_f1_raw.is_empty()
+                && (old_f1_raw.len() + prev_record.len()) as u64 > seal_threshold;
+            let new_f1 = if seal {
+                // Old f1's zstd bytes move verbatim to cold (its anchor,
+                // prev_record, becomes new f1's sole content). Fresh
+                // accumulator = just the spilled head.
+                crate::frames::compress(&prev_record, Some(record))?
+            } else {
+                let mut raw =
+                    Vec::with_capacity(prev_record.len() + old_f1_raw.len());
+                raw.extend_from_slice(&prev_record);
+                raw.extend_from_slice(&old_f1_raw);
+                crate::frames::compress(&raw, Some(record))?
+            };
+            g.depot.append(chain_id, &new_f0, Some(&new_f1), seal)?;
         }
     }
     Ok(())

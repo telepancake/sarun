@@ -38,6 +38,14 @@ pub struct InstanceConfig {
     pub title_shard_count: u32,
     /// Strpool seal threshold for the titles pool.
     pub title_seal_threshold_bytes: u64,
+    /// f1 accumulator seal threshold, in DECOMPRESSED bytes: when
+    /// absorbing the spilled head would push the accumulator past this,
+    /// the old f1's zstd bytes move verbatim into a cold frame and a
+    /// fresh accumulator starts. 0 = use the default (256 KiB). Sizing
+    /// against the real corpus is an open tuning question (tiered-VBF
+    /// doc §9); the default renders the design without pretending to be
+    /// measured.
+    pub f1_seal_threshold_bytes: u64,
 }
 
 /// Per-revision metadata decoded from a depot frame.
@@ -95,6 +103,7 @@ impl Iterator for HistoryIter {
 pub struct Instance {
     pub(crate) inner: Mutex<InstanceInner>,
     pub(crate) max_chain_id: u64,
+    pub(crate) f1_seal_threshold_bytes: u64,
     pub(crate) title_shard_count: u32,
     #[allow(dead_code)]
     // dbname retained for future logging / sharding decisions; unread today.
@@ -148,6 +157,11 @@ impl Instance {
                 conn,
             }),
             max_chain_id: cfg.max_chain_id,
+            f1_seal_threshold_bytes: if cfg.f1_seal_threshold_bytes == 0 {
+                256 * 1024
+            } else {
+                cfg.f1_seal_threshold_bytes
+            },
             title_shard_count: cfg.title_shard_count,
             dbname: cfg.dbname,
         })
@@ -166,7 +180,8 @@ impl Instance {
         }
         let g = self.inner.lock().expect("instance mutex poisoned");
         match g.depot.read_f0(page_id) {
-            Ok(bytes) => {
+            Ok(frame) => {
+                let bytes = crate::frames::decompress(&frame, None)?;
                 let (meta, _text) = decode_revision(&bytes)?;
                 Ok(Some(meta))
             }
@@ -184,7 +199,8 @@ impl Instance {
         }
         let g = self.inner.lock().expect("instance mutex poisoned");
         match g.depot.read_f0(page_id) {
-            Ok(bytes) => {
+            Ok(frame) => {
+                let bytes = crate::frames::decompress(&frame, None)?;
                 let (_meta, text) = decode_revision(&bytes)?;
                 Ok(Some(text))
             }
@@ -241,26 +257,31 @@ impl Instance {
 }
 
 /// Collect every revision record on `chain_id`, newest-first. Walks the
-/// chain we built in `import`:
-///   - f0 = newest record (1 record's bytes)
-///   - f1 = concatenation of older records, newer first, each starting
-///     with the codec's fixed-prefix u32/u32/u64/...; walk by decoding
-///     header + payload sizes.
-///   - cold = (empty this phase; no sealing yet).
+/// chain the way it was encoded (depot SPEC "The shape of a chain"):
+///   - f0 = newest record, standalone zstd;
+///   - f1 = older records concatenated newest-first, refPrefix-anchored
+///     on f0's record;
+///   - each cold frame is a sealed former accumulator, anchored on the
+///     OLDEST record of the next-newer frame — which is exactly the
+///     last record decoded so far in this newest-first walk.
 pub(crate) fn collect_records(depot: &Depot, chain_id: u64) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     match depot.read_f0(chain_id) {
-        Ok(b) => out.push(b),
+        Ok(frame) => out.push(crate::frames::decompress(&frame, None)?),
         Err(wikimak_depot::Error::NoFrame) => return Ok(out),
         Err(wikimak_depot::Error::ChainIdOutOfRange) => return Ok(out),
         Err(e) => return Err(e.into()),
     }
     if let Some(f1) = depot.read_f1(chain_id)? {
-        split_concatenated_records(&f1, &mut out)?;
+        let anchor = out[0].clone();
+        let raw = crate::frames::decompress(&f1, Some(&anchor))?;
+        split_concatenated_records(&raw, &mut out)?;
     }
     for cold in depot.cold_iter(chain_id)? {
-        let bytes = cold?;
-        split_concatenated_records(&bytes, &mut out)?;
+        let frame = cold?;
+        let anchor = out.last().expect("cold after f1").clone();
+        let raw = crate::frames::decompress(&frame, Some(&anchor))?;
+        split_concatenated_records(&raw, &mut out)?;
     }
     Ok(out)
 }

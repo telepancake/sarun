@@ -6,6 +6,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# The compression discipline IS the architecture (tiered-VBF doc §8):
+# f0 standalone zstd; f1/cold refPrefix-anchored on the next-newer
+# record. `experimental` exposes ZSTD_CCtx_refPrefix.
+zstd = { workspace = true, features = ["experimental"] }
 wikimak-depot.workspace = true
 wikimak-mediawiki.workspace = true
 strpool.workspace = true

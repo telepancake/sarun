@@ -2483,6 +2483,7 @@ dependencies = [
  "thiserror 1.0.69",
  "wikimak-depot",
  "wikimak-mediawiki",
+ "zstd",
 ]
 
 [[package]]

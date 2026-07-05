@@ -29,7 +29,7 @@ wikipedia}`):
 | `wikimak/depot` | the tiered revision-chain store (f0/f1/cold, flat index, index-flip commit) — **one depot variant** | **works**, zstd-opaque, 17-test acceptance suite green |
 | `strpool` | string → dense integer id interning (sharded, positional ids) | builds; needs the C toolchain to test |
 | `wikimak/mediawiki` | MediaWiki dump pipeline: discover → fetch → multistream bz2 → XML parse → sha1 | real + tested; needs C (`bzip2-sys`, bundled `rusqlite`) |
-| `wikimak/wikipedia` | the glue that should encode revisions into the depot | **SABOTAGED** — no `zstd` dep, f1 a literal concat, sealing dead-coded → ~uncompressed, a 10–20× miss (`meta/reports/vbf-recovery.md` §4). The one thing to fix. |
+| `wikimak/wikipedia` | the glue encoding revisions into the depot | **FIXED** (2026-07): f0 standalone zstd, f1 refPrefix-anchored on the head record, sealing at a threshold → cold frames form. Verified by MEASURED on-disk size (`tests/compression.rs`): a 120-revision ~5 MB page stores at 12× compression, in the design's 10–20× target. The sabotage record stays in `meta/reports/vbf-recovery.md` §4. |
 
 Docs: `DEPOT-BRIEF.md` (the north star), `SCOPING.md` (the mesh analysis),
 `docs/` (owner design), `notes/` (design reasoning), each crate's `SPEC.md`,
@@ -52,9 +52,10 @@ cargo test                      # full: needs a C toolchain (zstd, bzip2, sqlite
    interface, data model first. `wikimak/depot` is a *variant* to inform it, not
    the abstraction.
 2. Make `wikimak/depot` (and `strpool`) build+test in this tree — done for depot.
-3. **Un-sabotage `wikimak/wikipedia`**: encode into the depot with per-chain dict
-   + refPrefix + sealing. Verify against a real multi-revision page, **not** the
-   byte-payload units — the sabotage passed those.
+3. ~~Un-sabotage `wikimak/wikipedia`~~ DONE — refPrefix + sealing, verified by
+   measured on-disk size against a real multi-revision page
+   (`wikimak/wikipedia/tests/compression.rs`). Per-chain dict training remains
+   an open tuning question (size against the real corpus first).
 4. Map the other three data kinds (fs layers, git repos, sqlar) onto depot
    variants; wire the box overlay to address its store through the trait.
 5. Mesh: provider capture inside sarun tap boxes (flows-visible), serve/UI as a

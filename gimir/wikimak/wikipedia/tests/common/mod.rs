@@ -23,7 +23,8 @@ pub fn cfg(root: PathBuf, max_chain_id: u64) -> InstanceConfig {
             eviction_dead_ratio: 0.5,
         },
         title_shard_count: 1,
-        title_seal_threshold_bytes: 1 << 20,
+        f1_seal_threshold_bytes: 0,
+            title_seal_threshold_bytes: 1 << 20,
     }
 }
 
