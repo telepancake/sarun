@@ -7287,6 +7287,70 @@ fn ins_ask(text: impl Into<String>, child: InsNode, arg: &'static str) -> InsEnt
     InsEntry { text: text.into(), child: Some(child), arg: Some(arg) }
 }
 
+/// First-time hints, the oaita mechanism transplanted to the UI: the DRILL
+/// CHAIN is the session, a frame is a turn. A hint shows the first time its
+/// frame kind appears anywhere in the current stack; deeper frames of the
+/// same kind stay clean. Popping the carrying frame is the UI's backtrack —
+/// the hint refires on the next drill, exactly the "context is fresh,
+/// re-teach" path. Dedup is structural (each frame records the hint ids it
+/// displays) rather than oaita's marker-in-text scan, because frames are
+/// data, not text; the `marker` field is kept for uniformity with the tool
+/// side so LLM screen-scrapes read like tool output.
+const INS_HINTS: &[crate::oaita::hints::Hint] = &[
+    crate::oaita::hints::Hint {
+        id: "ins-dir",
+        marker: "--- hint: ins-dir ---",
+        body: "Each row is `<kind>  <name>`; Enter opens a child. The \u{2315} \
+               row narrows by glob; ':' takes a locator (path \u{b7} path \
+               lines A..B \u{b7} path symbols).",
+    },
+    crate::oaita::hints::Hint {
+        id: "ins-file",
+        marker: "--- hint: ins-file ---",
+        body: "Lines keep their 1-based file numbering (also under a grep). \
+               Line-span rows are levels: Enter opens one, \u{2190}/\u{2192} \
+               walk adjacent spans.",
+    },
+    crate::oaita::hints::Hint {
+        id: "ins-symbols",
+        marker: "--- hint: ins-symbols ---",
+        body: "Tree-sitter definitions. Enter focuses one; the same address \
+               works in the ':' locator as `path symbol <name>[N]` (N \
+               disambiguates same-name collisions).",
+    },
+    crate::oaita::hints::Hint {
+        id: "ins-summary",
+        marker: "--- hint: ins-summary ---",
+        body: "A summary, not the rows: each group row is a filter that \
+               STACKS with the narrowing above it; the count is its members \
+               (\u{2248} = estimated from a sample). \u{2315} adds a typed \
+               pattern; 'browse sequentially' walks the raw order.",
+    },
+    crate::oaita::hints::Hint {
+        id: "ins-box-changes",
+        marker: "--- hint: ins-box-changes ---",
+        body: "Staged writes — nothing has touched the host. Enter shows a \
+               file's diff; apply/discard live in the Changes pane ('c'). \
+               The ':' locator jumps with `box:<box>/<file>`.",
+    },
+    crate::oaita::hints::Hint {
+        id: "ins-rows",
+        marker: "--- hint: ins-rows ---",
+        body: "Captured rows. Enter opens a row's full record field by \
+               field; group rows above are field=value filters.",
+    },
+    crate::oaita::hints::Hint {
+        id: "ins-json",
+        marker: "--- hint: ins-json ---",
+        body: "One row per field. Enter drills into a value; a leaf value \
+               shows in full in the card below.",
+    },
+];
+
+fn ins_hint(id: &str) -> Option<&'static crate::oaita::hints::Hint> {
+    INS_HINTS.iter().find(|h| h.id == id)
+}
+
 /// One level of the drill-down: the node it was built from, its crumb
 /// `title`, non-selectable `header` lines, selectable `entries`, cursor,
 /// and the CARD of the selected entry (formatted lines + the hotspot
@@ -7299,6 +7363,10 @@ struct InsFrame {
     sel: usize,
     card: Vec<String>,
     hotspots: Vec<(InsNode, Option<&'static str>)>,
+    /// Hint ids this frame DISPLAYS (first occurrence in the chain). A
+    /// suppressed hint is not recorded, so popping the carrying frame
+    /// re-arms it — the drill chain is the hint "session".
+    hints: Vec<&'static str>,
 }
 
 /// One-line preview of a JSON value for a list row.
@@ -8217,8 +8285,38 @@ impl App {
                 }
             }
         }
+        // First-occurrence hints: what this frame kind teaches, minus
+        // whatever an ancestor frame in the chain already displays.
+        let want: Vec<&'static str> = match &node {
+            InsNode::Dir { .. } => vec!["ins-dir"],
+            InsNode::File { .. } => vec!["ins-file"],
+            InsNode::Symbols { .. } => vec!["ins-symbols"],
+            InsNode::Json { .. } => vec!["ins-json"],
+            InsNode::BoxView { view, .. } => {
+                // An ask-row marks the facet-summary shape; a leaf changes
+                // listing teaches the staged-writes contract instead.
+                if entries.iter().any(|e| e.arg.is_some()) {
+                    vec!["ins-summary"]
+                } else if *view == "changes" {
+                    vec!["ins-box-changes"]
+                } else {
+                    vec![]
+                }
+            }
+            InsNode::Rows { .. } => {
+                if entries.iter().any(|e| e.arg.is_some()) {
+                    vec!["ins-summary"]
+                } else {
+                    vec!["ins-rows"]
+                }
+            }
+            _ => vec![],
+        };
+        let hints: Vec<&'static str> = want.into_iter()
+            .filter(|id| !self.ins_stack.iter().any(|f| f.hints.contains(id)))
+            .collect();
         InsFrame { title, node, header, entries, sel: 0,
-                   card: vec![], hotspots: vec![] }
+                   card: vec![], hotspots: vec![], hints }
     }
 
     /// A box-table view frame. Wide listings become a FACET SUMMARY —
@@ -8641,6 +8739,16 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
             card_lines.push(Line::from(spans));
         } else {
             card_lines.push(Line::from(l.clone()));
+        }
+    }
+    // First-time hints for this frame kind (see INS_HINTS): once per drill
+    // chain, at the card's tail, dim.
+    for id in &frame.hints {
+        if let Some(h) = ins_hint(id) {
+            if !card_lines.is_empty() { card_lines.push(Line::from("")); }
+            let dim = Style::default().add_modifier(Modifier::DIM);
+            card_lines.push(Line::from(Span::styled(h.marker, dim)));
+            card_lines.push(Line::from(Span::styled(h.body, dim)));
         }
     }
     // The inline input (mandatory argument / ':' locator) renders INSIDE
@@ -12457,6 +12565,29 @@ mod tests {
 
         let buf = render_to_string(&app, 120, 40).unwrap();
         assert!(buf.contains("inspect"), "inspector title missing:\n{buf}");
+
+        // First-time hints treat the DRILL CHAIN as the session: the first
+        // dir frame teaches, a nested dir frame stays clean, and popping
+        // the carrying frame re-arms the hint (the UI's backtrack).
+        while app.ins_stack.len() > 1 { app.ins_pop(); }
+        app.ins_goto(dir.to_str().unwrap());
+        assert!(app.ins_stack.last().unwrap().hints.contains(&"ins-dir"),
+                "first dir frame carries the hint");
+        let sub = dir.join("nest");
+        std::fs::create_dir_all(&sub).unwrap();
+        app.ins_reload();
+        let f = app.ins_stack.last().unwrap();
+        let child = f.entries.iter().position(|e| e.text.contains("nest"))
+            .expect("listing shows the subdir");
+        app.ins_stack.last_mut().unwrap().sel = child;
+        app.ins_enter();
+        assert!(app.ins_stack.last().unwrap().hints.is_empty(),
+                "a nested dir frame must not repeat the hint");
+        app.ins_pop();
+        app.ins_pop();
+        app.ins_goto(sub.to_str().unwrap());
+        assert!(app.ins_stack.last().unwrap().hints.contains(&"ins-dir"),
+                "after popping the carrier, the hint refires");
         std::fs::remove_dir_all(&dir).ok();
     }
 
