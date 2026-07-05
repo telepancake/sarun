@@ -303,6 +303,14 @@ enum Pane {
     /// The engine-held PTY pane (D7/D9): a live tui-term view of an interactive
     /// command the ENGINE runs on a PTY, driven over the FRAME_PTY_* mux.
     Pty,
+    /// The Smalltalk-style object inspector (its own SCREEN in the F2/F3
+    /// rotation): a drill-down browser over every sarun object — boxes and
+    /// their change sets / processes / outputs / pipelines / build edges /
+    /// flows / web captures / api logs, the file rules, and the host
+    /// filesystem (with tree-sitter symbol drill-down). Navigation uses the
+    /// same locator logic as `oaita inspect` (`path lines A..B`, `path
+    /// symbols`, `box:<id>[/file]`, …) — ':' opens a locator prompt.
+    Inspect,
 }
 
 /// Top-level SCREENS the F2/F3 keys cycle through. A screen is a whole-body
@@ -311,9 +319,9 @@ enum Pane {
 /// carbonyl PTY) a third. F4/F5 cycle the individual WINDOWS inside the
 /// current screen — the data panes on Main, the PTYs of the matching kind
 /// on Terminal/Browser. Terminal/Browser only enter the rotation while a
-/// PTY of that kind is open.
+/// PTY of that kind is open; the object Inspector is always there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Screen { Main, Terminal, Browser }
+enum Screen { Main, Terminal, Browser, Inspect }
 
 /// A transient modal overlaid on the main view. Mirrors the Python Textual
 /// modals: Confirm (y/n destructive), SearchModal (substring filter of the
@@ -354,6 +362,10 @@ enum Modal {
     /// Vars-view query: `name [value]` — two whitespace-separated cmd_match
     /// text globs (bare word = substring); the second is optional.
     VarQuery { buf: String },
+    /// Inspector locator prompt (':' on the Inspect screen): a free-text
+    /// locator in the `oaita inspect` grammar — `path`, `path lines A..B`,
+    /// `path symbols`, `path symbol NAME[N]`, `box:<box>[/<file>]`.
+    InsGoto { buf: String },
     /// Context-menu popup for the currently-selected list row. Opened
     /// with `m`. `title` is the row identity (e.g. "Box: foo" or
     /// "Change: src/main.rs"); `items` are (label, hint, action). The
@@ -956,6 +968,10 @@ struct App {
     /// there rather than whichever one happens to be selected.
     last_term_pty: usize,
     last_browser_pty: usize,
+    /// The object inspector's drill-down stack — one frame per Enter, top
+    /// is what's on screen. Backspace pops. Never empty once initialized
+    /// (the bottom frame is the Root listing).
+    ins_stack: Vec<InsFrame>,
 }
 
 /// Cap on the transcript window: chars rendered in one frame, centred on
@@ -1042,6 +1058,7 @@ impl App {
             last_main_pane: Pane::Sessions,
             last_term_pty: 0,
             last_browser_pty: 0,
+            ins_stack: vec![],
         };
         a.refresh_sessions();
         a.load_changes();
@@ -3098,6 +3115,7 @@ impl App {
             }
             Pane::Help => self.out_scroll = self.out_scroll.saturating_add(1),
             Pane::Pty => {}
+            Pane::Inspect => self.ins_move(1),
             Pane::ApiLogs => {
                 if self.sel_api_log + 1 < self.api_log_rows.len() {
                     self.sel_api_log += 1;
@@ -3176,6 +3194,7 @@ impl App {
             }
             Pane::Help => self.out_scroll = self.out_scroll.saturating_sub(1),
             Pane::Pty => {}
+            Pane::Inspect => self.ins_move(-1),
             Pane::ApiLogs => {
                 self.sel_api_log = self.sel_api_log.saturating_sub(1);
                 self.right_scroll = 0;
@@ -3284,6 +3303,7 @@ impl App {
                 else { self.out_scroll = self.out_scroll.saturating_sub(n16); }
             }
             Pane::Pty => {}
+            Pane::Inspect => self.ins_move(delta),
             Pane::ApiLogs => {
                 let total = self.api_log_rows.len();
                 if total == 0 { return; }
@@ -3362,14 +3382,16 @@ impl App {
             Pane::Network => self.sel_webcap,
             Pane::Vars => self.sel_var,
             Pane::Help | Pane::Pty => 0,
+            Pane::Inspect => self.ins_stack.last().map(|f| f.sel).unwrap_or(0),
         }
     }
 
     /// Record the CURRENT view on the go-back stack (called just before a
     /// view switch). Oldest entries drop once the stack exceeds its cap.
     fn push_history(&mut self) {
-        if matches!(self.focus, Pane::Help | Pane::Pty) {
+        if matches!(self.focus, Pane::Help | Pane::Pty | Pane::Inspect) {
             return; // full-screen panes aren't list views worth returning to
+            // (the inspector keeps its own drill-down stack)
         }
         let snap = NavSnapshot {
             pane: self.focus,
@@ -3504,6 +3526,7 @@ impl App {
                     self.modal = Some(Modal::VarQuery { buf: String::new() });
                 }
             }
+            Pane::Inspect   => { self.focus = Pane::Inspect; self.ins_init(); }
             other           => { self.focus = other; }
         }
     }
@@ -3576,6 +3599,7 @@ impl App {
                 }
                 self.var_item_act();
             }
+            Pane::Inspect => self.ins_enter(),
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
             | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
             | Pane::Help | Pane::Pty | Pane::ApiLogs | Pane::Network => {}
@@ -3644,6 +3668,7 @@ impl App {
                     Screen::Terminal
                 }
             }
+            Pane::Inspect => Screen::Inspect,
             _ => Screen::Main,
         }
     }
@@ -3654,6 +3679,7 @@ impl App {
         let mut v = vec![Screen::Main];
         if self.ptys.iter().any(|p| !p.browser) { v.push(Screen::Terminal); }
         if self.ptys.iter().any(|p| p.browser) { v.push(Screen::Browser); }
+        v.push(Screen::Inspect);
         v
     }
 
@@ -3662,11 +3688,6 @@ impl App {
     #[cfg_attr(test, allow(dead_code))]
     fn cycle_screen(&mut self, dir: isize) {
         let avail = self.screens_available();
-        if avail.len() < 2 {
-            self.status =
-                "one screen open — F7 opens a terminal, browser via 'm' on a box".into();
-            return;
-        }
         let cur = self.current_screen();
         let i = avail.iter().position(|s| *s == cur).unwrap_or(0) as isize;
         let n = avail.len() as isize;
@@ -3702,6 +3723,11 @@ impl App {
                         if want { "browser" } else { "terminal" });
                 }
             }
+            Screen::Inspect => {
+                self.focus = Pane::Inspect;
+                self.ins_init();
+                self.status = "screen: inspector · Enter drill · Backspace up                                · ':' locator".into();
+            }
         }
     }
 
@@ -3730,6 +3756,9 @@ impl App {
             }
             Screen::Terminal => self.pty_cycle_kind(dir, false),
             Screen::Browser => self.pty_cycle_kind(dir, true),
+            Screen::Inspect => {
+                self.status = "the inspector is one window — Enter drills,                                Backspace goes up".into();
+            }
         }
     }
 
@@ -4478,6 +4507,7 @@ impl App {
                 if !end { self.out_scroll = 0; }
             }
             Pane::Pty => {}
+            Pane::Inspect => self.ins_extreme(end),
         }
     }
 
@@ -6181,6 +6211,14 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from("one word matches NAME or VALUE (substring); two words = NAME VALUE; globs ok · Enter · Esc"),
             ],
         ),
+        Modal::InsGoto { buf } => (
+            " inspect locator ",
+            vec![
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from("the oaita-inspect grammar: path · path lines A..B                             · path symbols · path symbol NAME[N] ·                             box:<box>[/<file>] — Enter jump · Esc cancel"),
+            ],
+        ),
         Modal::PtyCmd { buf } => {
             // The help must match what the CURRENT command actually does: a
             // `sarun …` line runs the sarun binary on the host and IT builds
@@ -6566,6 +6604,7 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
         Pane::ApiLogs   => Some(('i', "api",     FilterView::Changes /* unused */)),
         Pane::Network   => Some(('w', "web",     FilterView::Changes /* unused */)),
         Pane::Vars      => Some(('v', "vars",    FilterView::Changes /* unused */)),
+        Pane::Inspect   => Some(('s', "inspect", FilterView::Changes /* unused */)),
     }
 }
 
@@ -6590,6 +6629,7 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
     ('i', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
     ('w', Pane::Network,    "Web",     PaneVis::Always,            "web captures — tap MITM HTTP(S) content archive (headers + body)"),
     ('v', Pane::Vars,       "Vars",    PaneVis::Data("makevar"),   "variable provenance — make + shell assignments ('/' queries)"),
+    ('s', Pane::Inspect,    "Inspect", PaneVis::Always,            "object inspector — drill into every sarun object (':' takes oaita-inspect locators)"),
     ('?', Pane::Help,       "Help",    PaneVis::Always,            "this help"),
 ];
 
@@ -6961,6 +7001,699 @@ fn clauses_expr(clauses: &[Clause]) -> String {
     s
 }
 
+
+// ── the object inspector (Pane::Inspect) ────────────────────────────────────
+//
+// A Smalltalk-style inspector: every sarun object is a NODE; a node renders
+// to one frame (a list of rows, some of which link to child nodes); Enter
+// drills into the selected row's child, Backspace pops back up. The address
+// model is `oaita inspect`'s locator grammar (crate::oaita::inspect) — the
+// ':' prompt accepts the same `path lines A..B` / `path symbols` /
+// `box:<id>[/file]` forms the agent tool takes, and box drill-downs go
+// through the SAME engine RPCs (session_dicts, view.open/window,
+// review.hunks, flows.list, webcap, api_log) the data panes use — two
+// renderers of one engine, never parallel implementations.
+
+/// Row cap for engine-view listings in the inspector (a frame is a page,
+/// not a full dump; the header says when rows were cut).
+const INS_ROWS_CAP: usize = 500;
+
+/// A node in the inspector's object graph — what a frame is built FROM
+/// (kept on the frame so 'R' can rebuild it in place).
+#[derive(Clone)]
+enum InsNode {
+    /// Top level: every sarun surface, one row each.
+    Root,
+    /// The box/session list (session_dicts).
+    Boxes,
+    /// One box: its per-box tables, one row each.
+    Box { sid: i64, path: String },
+    /// An engine list view of a box table (view.open/window/close).
+    /// `view` is the engine view name; `label` the human name.
+    BoxView { sid: i64, view: &'static str, label: &'static str },
+    /// One changed file's staged diff (review.hunks).
+    BoxFile { sid: i64, file: String },
+    /// The box's network flows / web captures / api-proxy log.
+    Flows { sid: i64 },
+    Webcap { sid: i64 },
+    ApiLog { sid: i64 },
+    /// The ordered file rules.
+    Rules,
+    /// Host filesystem directory / file (a page of lines starting at
+    /// 1-based `start`) / tree-sitter symbol listing / one symbol's source.
+    Dir { path: String },
+    File { path: String, start: usize },
+    Symbols { path: String },
+    Symbol { path: String, name: String, occ: usize },
+    /// An arbitrary JSON value (engine rows drill into their fields).
+    Json { label: String, v: Value },
+}
+
+/// One row of a frame. `child` is what Enter drills into; `replace`
+/// marks paging rows (next/previous page) that swap the current frame
+/// instead of growing the stack.
+struct InsEntry {
+    text: String,
+    child: Option<InsNode>,
+    replace: bool,
+}
+
+fn ins_row(text: impl Into<String>) -> InsEntry {
+    InsEntry { text: text.into(), child: None, replace: false }
+}
+fn ins_link(text: impl Into<String>, child: InsNode) -> InsEntry {
+    InsEntry { text: text.into(), child: Some(child), replace: false }
+}
+fn ins_page(text: impl Into<String>, child: InsNode) -> InsEntry {
+    InsEntry { text: text.into(), child: Some(child), replace: true }
+}
+
+/// One level of the drill-down: the node it was built from, its crumb
+/// `title`, non-selectable `header` lines, selectable `entries`, cursor.
+struct InsFrame {
+    title: String,
+    node: InsNode,
+    header: Vec<String>,
+    entries: Vec<InsEntry>,
+    sel: usize,
+}
+
+/// One-line preview of a JSON value for a list row.
+fn ins_json_preview(v: &Value, cap: usize) -> String {
+    let s = match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let s = s.replace('\n', "\u{21b5}");
+    if s.chars().count() > cap {
+        format!("{}\u{2026}", s.chars().take(cap).collect::<String>())
+    } else {
+        s
+    }
+}
+
+impl App {
+    /// Ensure the stack has its Root frame (first entry into the screen).
+    fn ins_init(&mut self) {
+        if self.ins_stack.is_empty() {
+            let f = self.ins_frame(InsNode::Root);
+            self.ins_stack.push(f);
+        }
+    }
+
+    fn ins_move(&mut self, d: isize) {
+        let Some(f) = self.ins_stack.last_mut() else { return };
+        if f.entries.is_empty() { return; }
+        let last = f.entries.len() as isize - 1;
+        f.sel = (f.sel as isize + d).clamp(0, last) as usize;
+    }
+
+    fn ins_extreme(&mut self, end: bool) {
+        let Some(f) = self.ins_stack.last_mut() else { return };
+        f.sel = if end { f.entries.len().saturating_sub(1) } else { 0 };
+    }
+
+    /// Enter: drill into the selected row's child node (paging rows swap
+    /// the current frame instead of pushing).
+    fn ins_enter(&mut self) {
+        let Some(f) = self.ins_stack.last() else { return };
+        let Some(e) = f.entries.get(f.sel) else { return };
+        let Some(node) = e.child.clone() else {
+            self.status = "no drill-down for this row".into();
+            return;
+        };
+        let replace = e.replace;
+        let frame = self.ins_frame(node);
+        if replace {
+            *self.ins_stack.last_mut().unwrap() = frame;
+        } else {
+            self.ins_stack.push(frame);
+        }
+    }
+
+    /// Backspace/Esc: pop one level; at the Root, hand back to the Main
+    /// screen (mirrors how Esc leaves the packet drill-down).
+    fn ins_pop(&mut self) {
+        if self.ins_stack.len() > 1 {
+            self.ins_stack.pop();
+        } else {
+            self.switch_screen(Screen::Main);
+        }
+    }
+
+    /// 'R': rebuild the top frame from its node (fresh RPCs / fs reads).
+    fn ins_reload(&mut self) {
+        let Some(f) = self.ins_stack.last() else { return };
+        let node = f.node.clone();
+        let sel = f.sel;
+        let mut frame = self.ins_frame(node);
+        frame.sel = sel.min(frame.entries.len().saturating_sub(1));
+        *self.ins_stack.last_mut().unwrap() = frame;
+        self.status = "inspector: reloaded".into();
+    }
+
+    /// The ':' prompt — parse an `oaita inspect` locator and jump there.
+    fn ins_goto(&mut self, input: &str) {
+        use crate::oaita::inspect::{parse_locator, Window};
+        let input = input.trim();
+        if input.is_empty() { return; }
+        let loc = parse_locator(input);
+        // box:<id>[/<file>] — resolve <id> against the live session list by
+        // display path, name, or numeric session id.
+        if let Some(rest) = loc.path.strip_prefix("box:") {
+            let (box_ref, file) = match rest.split_once('/') {
+                Some((b, f)) => (b, Some(f)),
+                None => (rest, None),
+            };
+            self.refresh_sessions();
+            let hit = self.sessions.iter().find(|r| {
+                let p = r.get("path").and_then(Value::as_str).unwrap_or("");
+                let n = r.get("name").and_then(Value::as_str).unwrap_or("");
+                let id = r.get("session_id").and_then(Value::as_str).unwrap_or("");
+                p == box_ref || n == box_ref || id == box_ref
+            });
+            let Some(row) = hit else {
+                self.status = format!("inspect: no box matches {box_ref:?} \
+                                       (path, name, or id)");
+                return;
+            };
+            let sid: i64 = row.get("session_id").and_then(Value::as_str)
+                .and_then(|s| s.parse().ok()).unwrap_or(-1);
+            let path = row.get("path").and_then(Value::as_str)
+                .unwrap_or(box_ref).to_string();
+            let node = match file {
+                Some(f) => InsNode::BoxFile { sid, file: f.to_string() },
+                None => InsNode::Box { sid, path },
+            };
+            let frame = self.ins_frame(node);
+            self.ins_stack.push(frame);
+            return;
+        }
+        let node = match &loc.window {
+            Window::Symbols => InsNode::Symbols { path: loc.path.clone() },
+            Window::Symbol(name, occ) => InsNode::Symbol {
+                path: loc.path.clone(), name: name.clone(), occ: *occ },
+            Window::Range(a, _) | Window::Around(a) => InsNode::File {
+                path: loc.path.clone(), start: (*a).max(1) },
+            Window::PageKey(_) => {
+                self.status = "inspect: next/previous are the paging rows \
+                               here — Enter on them instead".into();
+                return;
+            }
+            Window::Default => {
+                let md = std::fs::metadata(&loc.path);
+                match md {
+                    Ok(m) if m.is_dir() => InsNode::Dir { path: loc.path.clone() },
+                    Ok(_) => InsNode::File { path: loc.path.clone(), start: 1 },
+                    Err(e) => {
+                        self.status = format!("inspect: {}: {e}", loc.path);
+                        return;
+                    }
+                }
+            }
+        };
+        let frame = self.ins_frame(node);
+        self.ins_stack.push(frame);
+    }
+
+    /// Build the frame for a node — the one renderer for the whole object
+    /// graph. RPC / fs errors become the frame's header (the drill-down
+    /// stays navigable; Backspace goes up).
+    fn ins_frame(&self, node: InsNode) -> InsFrame {
+        let mut header: Vec<String> = vec![];
+        let mut entries: Vec<InsEntry> = vec![];
+        let title: String;
+        match &node {
+            InsNode::Root => {
+                title = "sarun".into();
+                header.push("every sarun object, drillable — Enter descends \
+                             · Backspace up · ':' takes an oaita-inspect \
+                             locator (path lines A..B · path symbols · \
+                             box:<box>[/file])".into());
+                header.push(String::new());
+                entries.push(ins_link("boxes — every box/session, live and settled",
+                                      InsNode::Boxes));
+                entries.push(ins_link("file rules — the ordered apply/discard/passthrough list",
+                                      InsNode::Rules));
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "/".into());
+                entries.push(ins_link(format!("cwd — {cwd}"),
+                                      InsNode::Dir { path: cwd.clone() }));
+                let conf = crate::paths::config_home().to_string_lossy().into_owned();
+                entries.push(ins_link(format!("config — {conf}"),
+                                      InsNode::Dir { path: conf }));
+                let state = crate::paths::state_home().to_string_lossy().into_owned();
+                entries.push(ins_link(format!("state — {state} (oaita sessions live here)"),
+                                      InsNode::Dir { path: state }));
+                let data = crate::paths::data_home().to_string_lossy().into_owned();
+                entries.push(ins_link(format!("data — {data} (box stores)"),
+                                      InsNode::Dir { path: data }));
+                entries.push(ins_link("filesystem — /",
+                                      InsNode::Dir { path: "/".into() }));
+            }
+            InsNode::Boxes => {
+                title = "boxes".into();
+                match rpc(&self.sock, "session_dicts", json!([])) {
+                    Ok(v) => {
+                        let rows = v.as_array().cloned().unwrap_or_default();
+                        header.push(format!("{} box(es)", rows.len()));
+                        header.push(String::new());
+                        for r in rows {
+                            let path = r.get("path").and_then(Value::as_str)
+                                .unwrap_or("?").to_string();
+                            let status = r.get("status").and_then(Value::as_str)
+                                .unwrap_or("?");
+                            let cmd = r.get("cmd").and_then(Value::as_str)
+                                .unwrap_or("");
+                            let sid: i64 = r.get("session_id")
+                                .and_then(Value::as_str)
+                                .and_then(|s| s.parse().ok()).unwrap_or(-1);
+                            entries.push(ins_link(
+                                format!("{path}  ·  {status}  ·  {cmd}"),
+                                InsNode::Box { sid, path }));
+                        }
+                    }
+                    Err(e) => header.push(format!("session_dicts: {e}")),
+                }
+            }
+            InsNode::Box { sid, path } => {
+                title = format!("box {path}");
+                if let Ok(v) = rpc(&self.sock, "session_dicts", json!([])) {
+                    if let Some(row) = v.as_array().into_iter().flatten()
+                        .find(|r| r.get("session_id").and_then(Value::as_str)
+                            .and_then(|s| s.parse::<i64>().ok()) == Some(*sid))
+                    {
+                        entries.push(ins_link("session record — the raw dict",
+                            InsNode::Json { label: format!("box {path}"),
+                                            v: row.clone() }));
+                    }
+                }
+                let sid = *sid;
+                entries.push(ins_link("changes — files the box wrote",
+                    InsNode::BoxView { sid, view: "changes", label: "changes" }));
+                entries.push(ins_link("processes — the captured process tree",
+                    InsNode::BoxView { sid, view: "procs", label: "processes" }));
+                entries.push(ins_link("outputs — decoded stdout/stderr writes",
+                    InsNode::BoxView { sid, view: "outputs", label: "outputs" }));
+                entries.push(ins_link("pipelines — recorded shell pipelines",
+                    InsNode::BoxView { sid, view: "pipelines", label: "pipelines" }));
+                entries.push(ins_link("build edges — parsed ninja/make graph",
+                    InsNode::BoxView { sid, view: "build_edges", label: "build edges" }));
+                entries.push(ins_link("network flows — tshark-decoded pcap",
+                    InsNode::Flows { sid }));
+                entries.push(ins_link("web captures — tap MITM HTTP(S) archive",
+                    InsNode::Webcap { sid }));
+                entries.push(ins_link("api log — the --api oaita proxy log",
+                    InsNode::ApiLog { sid }));
+            }
+            InsNode::BoxView { sid, view, label } => {
+                title = (*label).to_string();
+                let args = if *view == "procs" {
+                    json!([view, sid, Value::Null, false])
+                } else {
+                    json!([view, sid, Value::Null])
+                };
+                match rpc(&self.sock, "view.open", args) {
+                    Ok(opened) => {
+                        let vid = opened.get("view_id")
+                            .and_then(Value::as_u64).unwrap_or(0);
+                        let total = opened.get("total")
+                            .and_then(Value::as_u64).unwrap_or(0) as usize;
+                        let take = total.min(INS_ROWS_CAP);
+                        let rows = if take == 0 { vec![] } else {
+                            rpc(&self.sock, "view.window", json!([vid, 0, take]))
+                                .ok()
+                                .and_then(|v| v.get("rows")
+                                    .and_then(|r| r.as_array().cloned()))
+                                .unwrap_or_default()
+                        };
+                        let _ = rpc(&self.sock, "view.close", json!([vid]));
+                        header.push(if total > take {
+                            format!("{label}: showing first {take} of {total} \
+                                     row(s) — the {} pane pages the rest",
+                                    label)
+                        } else {
+                            format!("{label}: {total} row(s)")
+                        });
+                        header.push(String::new());
+                        for r in rows {
+                            if *view == "changes" {
+                                let path = r.get("path").and_then(Value::as_str)
+                                    .unwrap_or("").to_string();
+                                let kind = r.get("kind").and_then(Value::as_str)
+                                    .unwrap_or("?");
+                                let size = r.get("size").and_then(Value::as_i64)
+                                    .unwrap_or(0);
+                                // Directory-connector rows are structure, not
+                                // leaves — shown, but with no diff to open.
+                                let child = if kind == "dir" { None } else {
+                                    Some(InsNode::BoxFile {
+                                        sid: *sid, file: path.clone() })
+                                };
+                                entries.push(InsEntry {
+                                    text: format!("{kind:>7}  {size:>8}  {path}"),
+                                    child, replace: false,
+                                });
+                            } else {
+                                entries.push(ins_link(
+                                    ins_json_preview(&r, 200),
+                                    InsNode::Json {
+                                        label: format!("{label} row"),
+                                        v: r.clone() }));
+                            }
+                        }
+                    }
+                    Err(e) => header.push(format!("view.open {view}: {e}")),
+                }
+            }
+            InsNode::BoxFile { sid, file } => {
+                title = file.clone();
+                match rpc(&self.sock, "review.hunks",
+                          json!([sid.to_string(), file])) {
+                    Ok(r) => {
+                        let is_text = r.get("is_text")
+                            .and_then(Value::as_bool).unwrap_or(false);
+                        let diff_kind = r.get("diff").and_then(|d| d.get("kind"))
+                            .and_then(Value::as_str).unwrap_or("");
+                        if diff_kind == "error" {
+                            header.push(r.get("diff").and_then(|d| d.get("error"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("not in change set").to_string());
+                        } else if !is_text {
+                            header.push("binary (no text diff)".into());
+                        } else {
+                            header.push(format!("staged diff of {file}"));
+                            header.push(String::new());
+                            let empty = vec![];
+                            let hunks = r.get("hunks")
+                                .and_then(Value::as_array).unwrap_or(&empty);
+                            for hk in hunks {
+                                let lines = hk.get("lines")
+                                    .and_then(Value::as_array).unwrap_or(&empty);
+                                for line in lines {
+                                    let Some(pair) = line.as_array() else { continue };
+                                    let tag = pair.first().and_then(Value::as_str)
+                                        .unwrap_or(" ");
+                                    let txt = pair.get(1).and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    entries.push(ins_row(if tag == "hdr" {
+                                        txt.to_string()
+                                    } else {
+                                        format!("{tag}{txt}")
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => header.push(format!("review.hunks: {e}")),
+                }
+            }
+            InsNode::Flows { sid } => {
+                title = "flows".into();
+                match rpc(&self.sock, "flows.list", json!([sid.to_string()])) {
+                    Ok(v) => {
+                        let rows = v.get("flows").and_then(Value::as_array)
+                            .cloned().unwrap_or_default();
+                        header.push(format!("{} flow(s)", rows.len()));
+                        header.push(String::new());
+                        for r in rows {
+                            entries.push(ins_link(ins_json_preview(&r, 200),
+                                InsNode::Json { label: "flow".into(),
+                                                v: r.clone() }));
+                        }
+                    }
+                    Err(e) => header.push(format!("flows.list: {e}")),
+                }
+            }
+            InsNode::Webcap { sid } => {
+                title = "web captures".into();
+                match rpc(&self.sock, "webcap", json!([sid.to_string()])) {
+                    Ok(v) => {
+                        let rows = v.as_array().cloned().unwrap_or_default();
+                        header.push(format!("{} capture(s)", rows.len()));
+                        header.push(String::new());
+                        for r in rows {
+                            entries.push(ins_link(ins_json_preview(&r, 200),
+                                InsNode::Json { label: "web capture".into(),
+                                                v: r.clone() }));
+                        }
+                    }
+                    Err(e) => header.push(format!("webcap: {e}")),
+                }
+            }
+            InsNode::ApiLog { sid } => {
+                title = "api log".into();
+                match rpc(&self.sock, "api_log", json!([sid.to_string()])) {
+                    Ok(v) => {
+                        let rows = v.as_array().cloned().unwrap_or_default();
+                        header.push(format!("{} request(s)", rows.len()));
+                        header.push(String::new());
+                        for r in rows {
+                            entries.push(ins_link(ins_json_preview(&r, 200),
+                                InsNode::Json { label: "api request".into(),
+                                                v: r.clone() }));
+                        }
+                    }
+                    Err(e) => header.push(format!("api_log: {e}")),
+                }
+            }
+            InsNode::Rules => {
+                title = "file rules".into();
+                header.push(format!("{} rule(s), first match wins",
+                                    self.rules.len()));
+                header.push(String::new());
+                for r in &self.rules {
+                    entries.push(ins_row(r.clone()));
+                }
+            }
+            InsNode::Dir { path } => {
+                title = path.clone();
+                match std::fs::read_dir(path) {
+                    Ok(rd) => {
+                        let mut items: Vec<(String, bool)> = rd
+                            .filter_map(|e| e.ok())
+                            .map(|e| {
+                                let is_dir = e.file_type()
+                                    .map(|t| t.is_dir()).unwrap_or(false);
+                                (e.file_name().to_string_lossy().into_owned(),
+                                 is_dir)
+                            })
+                            .collect();
+                        items.sort();
+                        header.push(format!("dir {path}: {} entrie(s)",
+                                            items.len()));
+                        header.push(String::new());
+                        let join = |name: &str| if path.ends_with('/') {
+                            format!("{path}{name}")
+                        } else {
+                            format!("{path}/{name}")
+                        };
+                        for (name, is_dir) in items {
+                            let full = join(&name);
+                            let (kind, child) = if is_dir {
+                                ("dir", InsNode::Dir { path: full })
+                            } else {
+                                ("file", InsNode::File { path: full, start: 1 })
+                            };
+                            entries.push(ins_link(format!("{kind:>5}  {name}"),
+                                                  child));
+                        }
+                    }
+                    Err(e) => header.push(format!("read_dir {path}: {e}")),
+                }
+            }
+            InsNode::File { path, start } => {
+                use crate::oaita::inspect::LINES_PER_PAGE;
+                match std::fs::read(path) {
+                    Ok(bytes) if bytes.contains(&0) => {
+                        title = path.clone();
+                        header.push(format!("binary ({} bytes)", bytes.len()));
+                    }
+                    Ok(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        let lines: Vec<&str> = text.lines().collect();
+                        let n = lines.len();
+                        let a = (*start).max(1).min(n.max(1));
+                        let b = (a + LINES_PER_PAGE - 1).min(n);
+                        title = format!("{path} lines {a}..{b} of {n}");
+                        if crate::oaita::structural::parse_symbols(
+                            path, &bytes).is_some()
+                        {
+                            entries.push(ins_link(
+                                "\u{2261} symbols — named definitions \
+                                 (tree-sitter)",
+                                InsNode::Symbols { path: path.clone() }));
+                        }
+                        if a > 1 {
+                            let prev = a.saturating_sub(LINES_PER_PAGE).max(1);
+                            entries.push(ins_page(
+                                format!("\u{2026} previous page (lines {prev}..)"),
+                                InsNode::File { path: path.clone(), start: prev }));
+                        }
+                        for (i, l) in lines[a - 1..b].iter().enumerate() {
+                            entries.push(ins_row(format!("{:>6}  {l}", a + i)));
+                        }
+                        if b < n {
+                            entries.push(ins_page(
+                                format!("\u{2026} next page (lines {}..)", b + 1),
+                                InsNode::File { path: path.clone(), start: b + 1 }));
+                        }
+                    }
+                    Err(e) => {
+                        title = path.clone();
+                        header.push(format!("read {path}: {e}"));
+                    }
+                }
+            }
+            InsNode::Symbols { path } => {
+                title = format!("{path} symbols");
+                match std::fs::read(path) {
+                    Ok(bytes) => {
+                        match crate::oaita::structural::parse_symbols(path, &bytes) {
+                            Some(symbols) => {
+                                header.push(format!("{} named definition(s)",
+                                                    symbols.len()));
+                                header.push(String::new());
+                                // Same occurrence-tally the oaita listing does,
+                                // so the drill target names the Nth collision.
+                                let mut seen = std::collections::HashMap::
+                                    <String, usize>::new();
+                                for sym in &symbols {
+                                    let occ = seen.entry(sym.name.clone())
+                                        .or_insert(0);
+                                    *occ += 1;
+                                    let indent = "  ".repeat(sym.depth);
+                                    entries.push(ins_link(
+                                        format!("{indent}{:>6}  {}   (lines {}..{})",
+                                                sym.kind, sym.name,
+                                                sym.start_line, sym.end_line),
+                                        InsNode::Symbol {
+                                            path: path.clone(),
+                                            name: sym.name.clone(),
+                                            occ: *occ }));
+                                }
+                            }
+                            None => header.push(
+                                "no tree-sitter grammar for this extension \
+                                 (currently: .rs, .py, .sh, .bash)".into()),
+                        }
+                    }
+                    Err(e) => header.push(format!("read {path}: {e}")),
+                }
+            }
+            InsNode::Symbol { path, name, occ } => {
+                title = format!("{name} in {path}");
+                match std::fs::read(path) {
+                    Ok(bytes) => {
+                        let syms = crate::oaita::structural::parse_symbols(
+                            path, &bytes);
+                        match syms.as_deref().and_then(|ss|
+                            crate::oaita::structural::find_symbol(ss, name, *occ))
+                        {
+                            Some(sym) => {
+                                header.push(format!(
+                                    "{} {} (lines {}..{})",
+                                    sym.kind, sym.name,
+                                    sym.start_line, sym.end_line));
+                                header.push(String::new());
+                                let src = String::from_utf8_lossy(
+                                    &bytes[sym.start_byte..sym.end_byte])
+                                    .into_owned();
+                                for (i, l) in src.lines().enumerate() {
+                                    entries.push(ins_row(format!(
+                                        "{:>6}  {l}", sym.start_line + i)));
+                                }
+                            }
+                            None => header.push(format!(
+                                "no symbol named {name:?} (occurrence {occ})")),
+                        }
+                    }
+                    Err(e) => header.push(format!("read {path}: {e}")),
+                }
+            }
+            InsNode::Json { label, v } => {
+                title = label.clone();
+                match v {
+                    Value::Object(map) => {
+                        let w = map.keys().map(|k| k.chars().count())
+                            .max().unwrap_or(0);
+                        for (k, val) in map {
+                            entries.push(ins_link(
+                                format!("{k:>w$}  {}",
+                                        ins_json_preview(val, 160)),
+                                InsNode::Json { label: k.clone(),
+                                                v: val.clone() }));
+                        }
+                    }
+                    Value::Array(arr) => {
+                        for (i, val) in arr.iter().enumerate() {
+                            entries.push(ins_link(
+                                format!("[{i}]  {}", ins_json_preview(val, 160)),
+                                InsNode::Json { label: format!("{label}[{i}]"),
+                                                v: val.clone() }));
+                        }
+                    }
+                    Value::String(txt) => {
+                        for l in txt.lines() {
+                            entries.push(ins_row(l.to_string()));
+                        }
+                    }
+                    other => entries.push(ins_row(other.to_string())),
+                }
+            }
+        }
+        InsFrame { title, node, header, entries, sel: 0 }
+    }
+}
+
+/// Render the inspector screen: breadcrumb title, dim header lines, the
+/// entry list with the selected row reversed. Rows with a drill target get
+/// a "\u{25b8}" marker so what Enter will do is visible per row.
+fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect) {
+    let Some(frame) = app.ins_stack.last() else {
+        f.render_widget(Paragraph::new(Span::styled(
+            "inspector: empty (press 's' again)",
+            Style::default().add_modifier(Modifier::DIM))), body);
+        return;
+    };
+    let crumb: Vec<&str> = app.ins_stack.iter()
+        .map(|fr| fr.title.as_str()).collect();
+    // Keep the tail of a deep chain — the leaf matters most.
+    let crumb = if crumb.len() > 4 {
+        format!("\u{2026} \u{25b8} {}", crumb[crumb.len() - 4..].join(" \u{25b8} "))
+    } else {
+        crumb.join(" \u{25b8} ")
+    };
+    let mut lines: Vec<Line> = vec![];
+    for h in &frame.header {
+        lines.push(Line::from(Span::styled(h.clone(),
+            Style::default().add_modifier(Modifier::DIM))));
+    }
+    for (i, e) in frame.entries.iter().enumerate() {
+        let marker = if e.child.is_some() { "\u{25b8} " } else { "  " };
+        let style = if i == frame.sel {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{}", e.text), style)));
+    }
+    if frame.entries.is_empty() && frame.header.is_empty() {
+        lines.push(Line::from(Span::styled("(empty)",
+            Style::default().add_modifier(Modifier::DIM))));
+    }
+    let cursor_line = frame.header.len() + frame.sel + 1;
+    let scroll = scroll_for_cursor(cursor_line, lines.len(), body.height);
+    let p = Paragraph::new(Text::from(lines))
+        .block(block(title(&format!(
+            "inspect \u{b7} {crumb} \u{b7} Enter drill \u{b7} Backspace up \
+             \u{b7} ':' locator"), true), true))
+        .scroll((scroll, 0));
+    f.render_widget(p, body);
+}
+
 fn draw(f: &mut ratatui::Frame, app: &App) {
     // Norton-Commander-style chrome (top to bottom):
     //   menubar    : pane names with their letter accelerators (b/c/p/...)
@@ -7037,6 +7770,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             .scroll((app.out_scroll, 0))
             .wrap(Wrap { trim: false });
         f.render_widget(help, body);
+    } else if app.focus == Pane::Inspect {
+        // The object inspector takes the whole body (its own screen).
+        draw_inspector(f, app, body);
     } else {
         // Single-list-per-view layout (mirrors the prototype's _set_view /
         // LEFT/RIGHT scheme): the left half is the FOCUSED view's primary
@@ -9638,6 +10374,19 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::VarQuery { buf }),
         },
+        Modal::InsGoto { mut buf } => match code {
+            KeyCode::Enter => app.ins_goto(&buf.clone()),
+            KeyCode::Esc => app.status = "inspect cancelled".into(),
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::InsGoto { buf });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::InsGoto { buf });
+            }
+            _ => app.modal = Some(Modal::InsGoto { buf }),
+        },
         Modal::PtyCmd { mut buf } => match code {
             KeyCode::Enter => app.open_pty(shell_split(&buf)),
             KeyCode::Esc => app.status = "pty cancelled".into(),
@@ -10390,6 +11139,35 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     }
                     continue;
                 }
+                // Inspector screen: its own keymap — list motion, Enter
+                // drill, Backspace/Esc up, ':' locator prompt, 'R' reload.
+                // The F-keys (screens/windows) were handled above; the
+                // letter chips still switch panes; 'q' still quits.
+                if app.focus == Pane::Inspect {
+                    match k.code {
+                        KeyCode::Down | KeyCode::Char('j') => app.ins_move(1),
+                        KeyCode::Up | KeyCode::Char('k') => app.ins_move(-1),
+                        KeyCode::PageDown => app.ins_move(PAGE_SIZE as isize),
+                        KeyCode::PageUp => app.ins_move(-(PAGE_SIZE as isize)),
+                        KeyCode::Home => app.ins_extreme(false),
+                        KeyCode::End => app.ins_extreme(true),
+                        KeyCode::Enter => app.ins_enter(),
+                        KeyCode::Backspace | KeyCode::Esc => app.ins_pop(),
+                        KeyCode::Char(':') => {
+                            app.modal = Some(Modal::InsGoto { buf: String::new() });
+                        }
+                        KeyCode::Char('R') => app.ins_reload(),
+                        KeyCode::Char('q') => {
+                            shutdown_rpc(&app.sock);
+                            app.should_quit = true;
+                        }
+                        KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'
+                                           |'?'|'P'|'i'|'w'|'v'|'s')) =>
+                            dispatch_menubar_key(&mut app, c),
+                        _ => {}
+                    }
+                    continue;
+                }
                 // Banner-prompt keys take priority over EVERYTHING (so y/n/a/d
                 // don't accidentally trigger pane bindings like 'n' = new
                 // rule / 'a' = apply / 'd' = detach). The banner only steals
@@ -10446,7 +11224,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // Letter accelerators: route through the same
                     // dispatch_menubar_key the F9 menu-nav path uses,
                     // so the two paths can't diverge.
-                    KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'v')) =>
+                    KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'w'|'v'|'s')) =>
                         dispatch_menubar_key(&mut app, c),
                     // Esc / Backspace from the packet drill-down pops back
                     // to the flows list, keeping its cursor + detail state.
@@ -10558,6 +11336,77 @@ mod tests {
     /// vertical traversal — all parents (main + RO attachments) when the
     /// cursor arrived by Up, all explicit children when it arrived by
     /// Down. Pure App-state test: no engine needed.
+
+    /// The inspector: Root frame lists every top-level sarun surface; a
+    /// ':' locator drills into a real file with line paging and symbol
+    /// drill-down; Backspace pops; the whole thing renders. RPC-free —
+    /// only the fs-backed nodes are exercised (box nodes need an engine).
+    #[test]
+    fn inspector_drills_files_and_renders() {
+        let mut app = headless_app();
+        app.focus = Pane::Inspect;
+        app.ins_init();
+        let root = app.ins_stack.last().unwrap();
+        let texts: Vec<&str> = root.entries.iter()
+            .map(|e| e.text.as_str()).collect();
+        assert!(texts.iter().any(|t| t.starts_with("boxes")),
+                "root must list boxes: {texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("file rules")),
+                "root must list rules: {texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("config")),
+                "root must list config: {texts:?}");
+
+        // A real file, long enough to page (LINES_PER_PAGE = 200).
+        let dir = std::env::temp_dir().join(format!("sarun-ins-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.py");
+        let mut body = String::from("def alpha():\n    return 1\n");
+        for i in 0..300 { body.push_str(&format!("x{i} = {i}\n")); }
+        std::fs::write(&file, &body).unwrap();
+
+        // ':' locator → the file, page 1; the page row swaps the frame.
+        app.ins_goto(file.to_str().unwrap());
+        {
+            let f = app.ins_stack.last().unwrap();
+            assert!(f.title.contains("lines 1..200"), "title: {}", f.title);
+            assert!(f.entries.iter().any(|e| e.text.contains("def alpha")),
+                    "page 1 must show the source");
+            let next = f.entries.iter().position(|e| e.text.contains("next page"))
+                .expect("a 302-line file must offer a next page");
+            assert!(f.entries[next].replace, "paging must replace, not push");
+        }
+        let depth = app.ins_stack.len();
+        // Enter on the next-page row: same depth, new window.
+        let next = app.ins_stack.last().unwrap().entries.iter()
+            .position(|e| e.text.contains("next page")).unwrap();
+        app.ins_stack.last_mut().unwrap().sel = next;
+        app.ins_enter();
+        assert_eq!(app.ins_stack.len(), depth, "paging must not deepen the stack");
+        assert!(app.ins_stack.last().unwrap().title.contains("lines 201.."),
+                "title after paging: {}", app.ins_stack.last().unwrap().title);
+
+        // Symbol drill-down: locator "…probe.py symbols" → focus alpha.
+        app.ins_goto(&format!("{} symbols", file.display()));
+        {
+            let f = app.ins_stack.last().unwrap();
+            let i = f.entries.iter().position(|e| e.text.contains("alpha"))
+                .expect("symbols frame must list alpha");
+            app.ins_stack.last_mut().unwrap().sel = i;
+        }
+        app.ins_enter();
+        assert!(app.ins_stack.last().unwrap().entries.iter()
+                    .any(|e| e.text.contains("return 1")),
+                "symbol frame must show alpha's source");
+
+        // Backspace pops; the whole screen renders with the breadcrumb.
+        let before = app.ins_stack.len();
+        app.ins_pop();
+        assert_eq!(app.ins_stack.len(), before - 1);
+        let buf = render_to_string(&app, 120, 40).unwrap();
+        assert!(buf.contains("inspect"), "inspector title missing:\n{buf}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn sessions_sideways_cycles_dag_edges() {
         let mut app = headless_app();
@@ -11752,6 +12601,7 @@ mod tests {
             last_main_pane: Pane::Sessions,
             last_term_pty: 0,
             last_browser_pty: 0,
+            ins_stack: vec![],
         }
     }
 
