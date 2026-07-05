@@ -2,9 +2,9 @@
  * sud/elf.c — Unified ELF inspection, path resolution, and exec argv
  *             building using only raw syscalls.
  *
- * These are the signal-safe (raw_*) implementations from sudtrace.c
- * with the _raw suffix removed.  The old libc-based duplicates are
- * deleted — these work in both the SIGSYS handler and parent process.
+ * Every routine here is signal-safe (raw_* syscalls only), so the same
+ * implementation serves both the SIGSYS handler and the parent process
+ * — there is deliberately no libc-based variant.
  */
 
 #include "libc-fs/libc.h"

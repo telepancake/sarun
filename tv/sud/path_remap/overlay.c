@@ -290,7 +290,9 @@ static long copy_fd_contents(int out_fd, int in_fd)
         if (n == 0) return 0;
         if (n > 0) continue;
         if (n != -EINVAL && n != -ENOSYS) return n;
-        /* sendfile refused: byte loop. */
+        /* sendfile is not universal: some filesystems reject a given
+         * source/target pair with EINVAL.  Fall back to a plain
+         * read/write copy loop, which every filesystem supports. */
         char buf[8192];
         for (;;) {
             long r = raw_read(in_fd, buf, sizeof(buf));
@@ -299,7 +301,7 @@ static long copy_fd_contents(int out_fd, int in_fd)
             char *p = buf;
             while (r > 0) {
                 long w = raw_write(out_fd, p, (size_t)r);
-                if (w <= 0) return w < 0 ? w : -5 /* EIO */;
+                if (w <= 0) return w < 0 ? w : -EIO;
                 p += w; r -= w;
             }
         }
@@ -389,18 +391,20 @@ static void copy_up_from_lowers(const struct sud_rule *r, const char *tail,
         raw_unlinkat(AT_FDCWD, tmp, 0);
         return;
     }
+    /* Land the temp atomically.  RENAME_NOREPLACE lets a racing copy-up
+     * (or a concurrent O_CREAT writer) that already materialized the
+     * upper win — our temp then just loses and is cleaned up below.
+     * Either way the box never observes a half-copied upper file. */
 #ifdef __NR_renameat2
-    rc = raw_syscall6(__NR_renameat2, AT_FDCWD, (long)tmp,
-                      AT_FDCWD, (long)upath, 1 /* RENAME_NOREPLACE */, 0);
-    if (rc == -EEXIST) rc = 0;      /* someone else materialized it */
+    raw_syscall6(__NR_renameat2, AT_FDCWD, (long)tmp,
+                 AT_FDCWD, (long)upath, RENAME_NOREPLACE, 0);
 #else
-    rc = raw_syscall6(__NR_renameat, AT_FDCWD, (long)tmp,
-                      AT_FDCWD, (long)upath, 0, 0);
+    raw_syscall6(__NR_renameat, AT_FDCWD, (long)tmp,
+                 AT_FDCWD, (long)upath, 0, 0);
 #endif
-    /* Success leaves no temp (renamed away); the EEXIST arm and any
-     * failure leave one — unlink is a harmless ENOENT otherwise. */
+    /* A successful rename left no temp; a lost race or any failure
+     * leaves one, so unlink it (a harmless ENOENT otherwise). */
     raw_unlinkat(AT_FDCWD, tmp, 0);
-    (void)rc;
 }
 
 /* ----------------------------------------------------------------
@@ -415,20 +419,6 @@ static void copy_up_from_lowers(const struct sud_rule *r, const char *tail,
  *  it FOR_MODIFY (copy-up), and hand back the upper path so the
  *  caller applies the path-based equivalent there instead.
  * ---------------------------------------------------------------- */
-
-/* Does `path` sit under (`prefix`,`plen`) on a component boundary?
- * Returns the tail ("/..." or "") or NULL.  A one-char "/" prefix is
- * the identity mapping and matches every absolute path. */
-static const char *prefix_tail(const char *path,
-                               const char *prefix, size_t plen)
-{
-    if (!prefix || plen == 0) return 0;
-    if (plen == 1 && prefix[0] == '/')
-        return path[0] == '/' ? path : 0;
-    if (strncmp(path, prefix, plen) != 0) return 0;
-    if (path[plen] != '\0' && path[plen] != '/') return 0;
-    return path + plen;
-}
 
 int sud_overlay_fd_upper_redirect(int fd, char *out, size_t out_sz)
 {
@@ -451,12 +441,12 @@ int sud_overlay_fd_upper_redirect(int fd, char *out, size_t out_sz)
         if (r->kind != SUD_RULE_KIND_OVERLAY) continue;
         /* Already in this rule's upper: the fd op is box-local. */
         if (rule_upper(r)
-            && prefix_tail(real, rule_upper(r), rule_upper_len(r)))
+            && sud_rules_prefix_tail(real, rule_upper(r), rule_upper_len(r)))
             return 0;
         int lc = rule_lower_count(r);
         for (int j = 0; j < lc; j++) {
-            const char *tail = prefix_tail(real, rule_lower(r, j),
-                                           rule_lower_len(r, j));
+            const char *tail = sud_rules_prefix_tail(real, rule_lower(r, j),
+                                                     rule_lower_len(r, j));
             if (!tail) continue;
             /* Virtual path = rule's visible prefix + tail.  The
              * identity lower ("/") makes virtual == real. */
@@ -969,13 +959,13 @@ int sud_overlay_open_dir(const char *path, int flags, int mode)
         return (int)fd;
     }
 
-    /* Only synthesize when the merged view actually HAS this
-     * directory.  Walk upper → lowers in priority order (whiteouts
-     * hide everything below, same as the resolve walk).  Without this
-     * check a directory-open of a NONEXISTENT name returned a valid
-     * (empty) synth dir fd — callers that probe "is dst a dir?" with
-     * open(O_DIRECTORY) (GNU mv does) then concluded yes and composed
-     * dst/src paths, materializing phantom directories in the upper. */
+    /* Only synthesize when the merged view actually HAS this directory.
+     * Walk upper → lowers in priority order (whiteouts hide everything
+     * below, same as the resolve walk).  A synth fd for a NONEXISTENT
+     * name would look like a valid empty directory, so a caller probing
+     * "is dst a dir?" with open(O_DIRECTORY) (GNU mv does) would conclude
+     * yes, compose dst/src paths, and materialize phantom directories in
+     * the upper. */
     {
         struct sud_overlay_stat st;
         const char *upper     = rule_upper(r);

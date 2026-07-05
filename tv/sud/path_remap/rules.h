@@ -102,6 +102,16 @@ const struct sud_rule *sud_rules_find_filtered(const struct sud_rule *rules,
                                                unsigned kind_mask,
                                                const char **tail_out);
 
+/* Does `path` lie under the (`prefix`, `prefix_len`) base on a path-
+ * component boundary?  Returns the tail (a pointer into `path`: "" or
+ * "/...") on a match, or NULL.  A bare "/" prefix is the identity
+ * mapping and matches every absolute path, returning `path` itself
+ * (leading '/' kept) so composed targets stay well-formed.  This is the
+ * one boundary-prefix test shared by the rule lookup and the overlay
+ * layer's fd reverse-mapping. */
+const char *sud_rules_prefix_tail(const char *path,
+                                  const char *prefix, size_t prefix_len);
+
 /* Append a NUL-terminated `tail` to a (`prefix`, `prefix_len`) base
  * into out[0..out_sz).  Returns 1 on success, 0 on overflow.  Does
  * not insert a separator; caller passes a tail starting with '/' or

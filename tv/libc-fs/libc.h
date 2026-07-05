@@ -543,6 +543,7 @@ typedef struct ucontext_t {
  * ================================================================ */
 #define EPERM           1
 #define ENOENT          2
+#define EIO             5
 #define EINTR           4
 #define EBADF           9
 #define ENOMEM         12
@@ -675,6 +676,9 @@ extern int g_errno_value;
 #define AT_SYMLINK_NOFOLLOW  0x100
 #define AT_REMOVEDIR         0x200
 #define AT_EMPTY_PATH        0x1000
+
+/* renameat2 flags */
+#define RENAME_NOREPLACE     1
 
 /* ================================================================
  * File mode bits — st_mode
