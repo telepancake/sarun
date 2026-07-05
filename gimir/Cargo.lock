@@ -465,6 +465,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "depot-vbf"
+version = "0.0.0"
+dependencies = [
+ "depot",
+ "depot-stream",
+ "tempfile",
+ "wikimak-depot",
+ "zstd",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
