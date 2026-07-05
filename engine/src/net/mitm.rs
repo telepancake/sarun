@@ -45,20 +45,21 @@ fn empty_body() -> ProxyBody {
         .boxed()
 }
 
+/// A proxy error the BOX can see: the reason rides the response body (text),
+/// not just the status — so `curl -v` / browser devtools show why a dial,
+/// TLS handshake, or body read failed, instead of a bare 502. Mirrors the
+/// oaita proxy's `error_resp`. Building a response from a Full body is
+/// infallible, so there's no Result to unwrap and no silent fallback arm.
 fn err_response(status: hyper::StatusCode, msg: &str) -> Response<ProxyBody> {
-    Response::builder().status(status)
-        .body(Empty::<Bytes>::new()
-              .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
-              .boxed())
-        .unwrap_or_else(|_| {
-            // Building an empty-body response is infallible in practice; this
-            // arm only exists to satisfy the Result. `msg` is purely advisory
-            // and intentionally unused on this fallback path.
-            let _ = msg;
-            let mut r = Response::new(empty_body());
-            *r.status_mut() = status;
-            r
-        })
+    let body = Full::new(Bytes::from(msg.to_string().into_bytes()))
+        .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+        .boxed();
+    let mut r = Response::new(body);
+    *r.status_mut() = status;
+    r.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"));
+    r
 }
 
 /// Common request handler. `scheme` is "http" or "https"; for "https" the
@@ -132,9 +133,16 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
         };
         if webcap::length_within_cap(&parts.headers) {
             // Small body (browse/crawl requests are tiny or absent); collect
-            // it, cap-guarded, and forward a buffered copy.
-            let collected = in_body.collect().await
-                .map(|c| c.to_bytes()).unwrap_or_default();
+            // it, cap-guarded, and forward a buffered copy. If the body can't
+            // be read (client hangup / framing error), forwarding an empty
+            // body would send a silently-corrupt request upstream — fail loud
+            // with a 502 instead.
+            let collected = match in_body.collect().await {
+                Ok(c) => c.to_bytes(),
+                Err(e) => return Ok(err_response(
+                    hyper::StatusCode::BAD_GATEWAY,
+                    &format!("read request body for {url}: {e}"))),
+            };
             let bytes = if collected.len() > webcap::WEBCAP_BODY_MAX {
                 collected.slice(0..webcap::WEBCAP_BODY_MAX)
             } else { collected };

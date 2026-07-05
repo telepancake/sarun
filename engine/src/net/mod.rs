@@ -7,10 +7,13 @@
 // which is the design choice for QUIC (it falls back to TCP/443).
 //
 // Public surface:
-//   `Net::start_box(box_id, gateway_mac, allow_real_egress)` — returns a
-//   `NetHandle` whose `.netns_fd` is what `runner::run` setns'es bwrap into
-//   (so bwrap inherits an already-equipped netns). Dropping the handle tears
-//   the TAP and netns down.
+//   `Net` (this module) holds only the per-engine SHARED state: the MITM root
+//   CA and the one banner-prompt queue. The per-box stack is NOT started here
+//   — the RUNNER creates the netns + TAP and hands the engine the TAP fd
+//   (SCM_RIGHTS on the register conn); `control::prepare_net` then stands up a
+//   `stack::StackRuntime` + a `dispatch::Dispatcher` around that fd. There is
+//   no `Net`-level per-box handle: each box's stack is owned by its own poll
+//   thread and torn down when that thread's TAP fd closes.
 //
 // Per-box layout (Class E /16 per box, 12 bits of box id):
 //   box subnet : (240 | (box_id >> 8)).(box_id & 0xff).0.0/16
@@ -19,21 +22,24 @@
 //   synth pool : .1.0 .. .255.254  (DNS A answers for arbitrary domains)
 //
 // Modules:
-//   subnet  — Class E /16 math + per-box id alloc
-//   ca      — generate-once root CA persisted under XDG_DATA
-//   tap     — fork+unshare(NEWNET), create TAP + assign addr/link-up, ship
-//             tapfd + netnsfd back over socketpair
-//   stack   — smoltcp Interface poll loop on the tapfd
-//   dhcp    — DHCPv4 server, one lease per box (always .0.2)
-//   dns     — UDP :53 server: A → synth-pool IP, store reverse mapping
-//   tcp     — smoltcp listen wildcard → spawn per-conn task with dst tuple
-//   udp     — UDP demux (only :53 terminated; rest dropped)
-//   mitm    — rustls accept with rcgen-on-demand leaf certs by SNI; hyper
-//             http1+2; reqwest as upstream client
-//   l4      — non-TLS-non-HTTP TCP: copy bytes upstream both ways
-//   flows   — pcapng (one IDB for the TAP) + SSLKEYLOGFILE sidecar
-//   policy  — bridge to rules.rs (host/port/scheme/sni fields)
-//   prompt  — banner-style approval queue for unknown hosts
+//   subnet   — Class E /16 math + per-box id alloc
+//   ca       — generate-once root CA persisted under XDG_DATA
+//   tap      — fork+unshare(NEWNET), create TAP + assign addr/link-up, ship
+//              tapfd + netnsfd back over socketpair
+//   stack    — smoltcp Interface poll loop on the tapfd (TCP + UDP demux:
+//              only :53 is terminated, other UDP dropped — the QUIC choice)
+//   bridge   — smoltcp socket ⇄ tokio AsyncRead/Write adapter (SmoltcpStream)
+//   dispatch — per-box conn router: policy-gate then HTTP/HTTPS MITM / L4
+//   dhcp     — DHCPv4 server, one lease per box (always .0.2)
+//   dns      — UDP :53 server: A → synth-pool IP, store reverse mapping
+//   mitm     — rustls accept with rcgen-on-demand leaf certs by SNI; hyper
+//              http1; tokio-rustls + hyper as the upstream client
+//   l4       — non-TLS-non-HTTP TCP: copy bytes upstream both ways
+//   flows    — pcapng (one IDB for the TAP) + SSLKEYLOGFILE sidecar
+//   policy   — bridge to rules.rs (host/port/scheme/sni fields)
+//   prompt   — banner-style approval queue for unknown hosts
+//   webcap   — tee decoded HTTP request/response into the box's webcap store
+//   filter   — proxy-side adblock + response rewrite (DESIGN-web.md W7)
 
 pub mod ca;
 pub mod subnet;
