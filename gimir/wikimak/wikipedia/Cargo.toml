@@ -39,3 +39,7 @@ while_let_on_iterator = "allow"
 # Tester's `tests/codec.rs` builds a needle with `std::iter::repeat(b)
 # .take(n)`. Clippy 1.94+ wants `repeat_n` but it's MSRV-sensitive.
 manual_repeat_n = "allow"
+
+[[bin]]
+name = "wikimak"
+path = "src/bin/wikimak.rs"
