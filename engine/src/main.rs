@@ -40,6 +40,7 @@ mod frames;
 mod hostfs;
 mod jobserver;
 mod katirun;
+mod attach;
 mod mirrors;
 mod n2run;
 mod net;

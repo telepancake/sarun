@@ -141,6 +141,12 @@ struct Inner {
     next_ino: AtomicU64,
     fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
     next_fh: AtomicU64,
+    // Live ExtAttachment objects per owning box (RoAttachment::Ext rows,
+    // in list order). Constructed lazily and WITHOUT I/O (attach.rs
+    // opens the store on first entry/blob use), so hydration cost stays
+    // O(bookkeeping) no matter the store size. Invalidated when a box's
+    // attachment list is rewritten.
+    ext: RwLock<HashMap<i64, Arc<Vec<Arc<crate::attach::ExtAttachment>>>>>,
     // Open handles to the synthetic JOBSERVER file: fh -> is-O_NONBLOCK. Kept
     // apart from `fhs` (no blob/file behind them) so read/write dispatch to the
     // slip pool instead of a backing file.
@@ -418,6 +424,7 @@ impl Overlay {
             next_ino: AtomicU64::new(2),
             fhs: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
+            ext: RwLock::new(HashMap::new()),
             jobserver_fhs: RwLock::new(HashMap::new()),
             rules: RwLock::new(crate::rules::Rules::load()),
             echo: RwLock::new(HashMap::new()),
@@ -755,6 +762,35 @@ impl Overlay {
                 Err(_) => continue,
             }
         }
+    }
+
+    /// The live ExtAttachment list for `owner`'s RoAttachment::Ext rows,
+    /// constructed on first ask (no store I/O — see attach.rs). Shared
+    /// Arc so repeated chain walks reuse the same memos/opens.
+    pub(crate) fn ext_attachments(&self, owner: i64)
+        -> Arc<Vec<Arc<crate::attach::ExtAttachment>>>
+    {
+        if let Some(v) = self.inner.ext.read().unwrap().get(&owner) {
+            return v.clone();
+        }
+        let built: Vec<Arc<crate::attach::ExtAttachment>> =
+            self.box_of(owner).map(|b| b.ro_attachment_list()).unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| match r {
+                    crate::capture::RoAttachment::Ext(e) =>
+                        Some(Arc::new(crate::attach::ExtAttachment::new(e))),
+                    crate::capture::RoAttachment::Box(_) => None,
+                })
+                .collect();
+        let built = Arc::new(built);
+        self.inner.ext.write().unwrap().insert(owner, built.clone());
+        built
+    }
+
+    /// Drop `owner`'s cached ExtAttachments — call after rewriting its
+    /// attachment list so the next walk rebuilds from bookkeeping.
+    pub(crate) fn invalidate_ext(&self, owner: i64) {
+        self.inner.ext.write().unwrap().remove(&owner);
     }
 
     pub fn remove_box(&self, id: i64) {
