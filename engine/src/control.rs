@@ -1785,16 +1785,30 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                     Err(e) => return json!({"ok": false,
                                             "error": format!("store: {e}")}),
                 };
-            // "main" matches "refs/heads/main"; full names match exactly.
-            let Some(r) = meta.refs.iter().find(|r| {
+            // REF may be a ref name ("main" matches "refs/heads/main")
+            // or a unique commit-sha prefix — ANY commit in the chain is
+            // attachable, not just the tips.
+            let sha = match meta.refs.iter().find(|r| {
                 r.name == refname
                     || r.name.strip_prefix("refs/heads/") == Some(refname)
                     || r.name.strip_prefix("refs/tags/") == Some(refname)
-            }) else {
-                return json!({"ok": false,
-                              "error": format!("no ref {refname} in store")});
+            }) {
+                Some(r) => r.sha.clone(),
+                None => {
+                    let hits: Vec<&str> = meta.commits.iter()
+                        .map(|c| c.sha.as_str())
+                        .filter(|s| s.starts_with(refname))
+                        .collect();
+                    match hits.as_slice() {
+                        [one] => one.to_string(),
+                        [] => return json!({"ok": false, "error":
+                            format!("no ref or commit {refname} in store")}),
+                        _ => return json!({"ok": false, "error":
+                            format!("commit prefix {refname} is ambiguous")}),
+                    }
+                }
             };
-            let Some(idx) = meta.commits.iter().position(|c| c.sha == r.sha)
+            let Some(idx) = meta.commits.iter().position(|c| c.sha == sha)
             else {
                 return json!({"ok": false, "error": "ref target not in chain"});
             };
@@ -1803,10 +1817,27 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 Ok(l) => l,
                 Err(e) => return json!({"ok": false, "error": e}),
             };
-            let short: String = r.sha.chars().take(8).collect();
+            // WHICH git: the store's label (`mirror` stamps it from the
+            // URL). Unlabeled direct imports fall back to the store's
+            // path: the directory itself, unless it's the mirror
+            // layout's generic `store`, then its parent.
+            let label = if meta.label.is_empty() {
+                let p = std::path::Path::new(store);
+                let name = p.file_name().map(|n| n.to_string_lossy());
+                match name.as_deref() {
+                    Some("store") | None => p.parent()
+                        .and_then(|q| q.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "repo".into()),
+                    Some(n) => n.to_string(),
+                }
+            } else {
+                meta.label.clone()
+            };
+            let short: String = sha.chars().take(8).collect();
             match attach_ro_layer(&ov, &b, &layer,
-                                  &format!("git:{refname}@{short}")) {
-                Ok(gid) => json!({"ok": true, "box": gid, "sha": r.sha}),
+                                  &format!("git:{label}/{refname}@{short}")) {
+                Ok(gid) => json!({"ok": true, "box": gid, "sha": sha}),
                 Err(e) => json!({"ok": false, "error": e}),
             }
         }
@@ -1821,16 +1852,52 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             let Some(b) = hydrate_box(&ov, sid) else {
                 return json!({"ok": false, "error": "no such box"});
             };
-            let (Some(root), Some(page)) = (
-                args.get(1).and_then(Value::as_str),
-                args.get(2).and_then(Value::as_u64),
-            ) else {
-                return json!({"ok": false, "error": "need root + page id"});
+            let Some(root) = args.get(1).and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "need root + page"});
             };
             let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
             let inst = match open_wiki_instance(root) {
                 Ok(i) => i,
                 Err(e) => return json!({"ok": false, "error": e}),
+            };
+            // PAGE is a numeric id or a title (exact, else unique
+            // case-insensitive substring) — titles are the UI, ids are
+            // the plumbing.
+            let (page, title) = match args.get(2) {
+                Some(Value::Number(n)) if n.as_u64().is_some() => {
+                    (n.as_u64().unwrap(), None)
+                }
+                Some(Value::String(s)) => match s.parse::<u64>() {
+                    Ok(n) => (n, None),
+                    Err(_) => match inst.page_by_title(s) {
+                        Ok((Some(id), hits)) => {
+                            let t = hits.into_iter()
+                                .find(|(i, _)| *i == id).map(|(_, t)| t);
+                            (id, t)
+                        }
+                        Ok((None, hits)) if hits.is_empty() =>
+                            return json!({"ok": false,
+                                "error": format!("no page titled {s:?}")}),
+                        Ok((None, hits)) => {
+                            let cands: Vec<String> = hits.into_iter()
+                                .map(|(i, t)| format!("{t} ({i})")).collect();
+                            return json!({"ok": false, "error": format!(
+                                "title {s:?} is ambiguous: {}",
+                                cands.join(", "))});
+                        }
+                        Err(e) => return json!({"ok": false,
+                                                "error": e.to_string()}),
+                    },
+                },
+                _ => return json!({"ok": false, "error": "need root + page"}),
+            };
+            let title = match title {
+                Some(t) => t,
+                // Attached by id: recover the title for the name.
+                None => inst.pages(None, usize::MAX).ok()
+                    .and_then(|ps| ps.into_iter()
+                        .find(|(i, _)| *i == page).map(|(_, t)| t))
+                    .unwrap_or_else(|| format!("page-{page}")),
             };
             let (head, text) = match (inst.page_head(page),
                                       inst.page_head_text(page)) {
@@ -1841,12 +1908,18 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                 (Err(e), _) | (_, Err(e)) =>
                     return json!({"ok": false, "error": e.to_string()}),
             };
-            let layer = files_layer(prefix,
-                                    &[(format!("page-{page}.txt"), text)]);
+            // WHICH wiki: the instance root's directory name.
+            let wiki = std::path::Path::new(root).file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "wiki".into());
+            let fname: String = title.chars()
+                .map(|c| if c == '/' || c == '\0' { '_' } else { c })
+                .collect();
+            let layer = files_layer(prefix, &[(format!("{fname}.txt"), text)]);
             match attach_ro_layer(&ov, &b, &layer,
-                                  &format!("wiki:{page}@r{}", head.rev_id)) {
-                Ok(gid) => json!({"ok": true, "box": gid,
-                                  "rev": head.rev_id}),
+                    &format!("wiki:{wiki}/{title}@r{}", head.rev_id)) {
+                Ok(gid) => json!({"ok": true, "box": gid, "page": page,
+                                  "title": title, "rev": head.rev_id}),
                 Err(e) => json!({"ok": false, "error": e}),
             }
         }
@@ -3531,21 +3604,17 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                 },
                 Err(e) => { eprintln!("sarun-engine: {e}"); return 1; }
             };
-            let key_v: Value = if verb == "wiki_attach" {
-                match key.parse::<u64>() {
-                    Ok(n) => json!(n),
-                    Err(_) => { eprintln!("sarun-engine: wiki page id must be a number"); return 2; }
-                }
-            } else {
-                json!(key)
-            };
+            // wiki pages go by title or id; the verb resolves either.
+            let key_v: Value = json!(key);
             let mut vargs = vec![json!(sid), json!(src), key_v];
             if let Some(p) = argv.get(5) {
                 vargs.push(json!(p));
             }
             match one(json!({"type": "ui", "verb": verb, "args": vargs})) {
                 Ok(v) => {
-                    let r = v.get("r").cloned().unwrap_or(Value::Null);
+                    // Success replies arrive wrapped ({"ok":true,"r":…});
+                    // verb-side early-return errors arrive bare.
+                    let r = v.get("r").cloned().unwrap_or(v);
                     if r.get("ok").and_then(Value::as_bool) == Some(true) {
                         println!("attached box {} to {name}",
                             r.get("box").and_then(Value::as_i64).unwrap_or(-1));

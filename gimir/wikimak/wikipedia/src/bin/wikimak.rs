@@ -89,6 +89,14 @@ fn cmd_fetch(dbname: &str, root: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_pages(root: &str, filter: Option<&str>) -> Result<(), String> {
+    let inst = open_instance(PathBuf::from(root))?;
+    for (id, title) in inst.pages(filter, 200).map_err(|e| e.to_string())? {
+        println!("{id:>8}  {title}");
+    }
+    Ok(())
+}
+
 fn cmd_head(root: &str, page: u64) -> Result<(), String> {
     let inst = open_instance(PathBuf::from(root))?;
     match inst.page_head(page).map_err(|e| e.to_string())? {
@@ -129,6 +137,8 @@ fn main() -> ExitCode {
         ["discover", dbname] => cmd_discover(dbname),
         ["fetch", dbname, root] => cmd_fetch(dbname, root),
         ["import", dump, root] => cmd_import(dump, root),
+        ["pages", root] => cmd_pages(root, None),
+        ["pages", root, filter] => cmd_pages(root, Some(filter)),
         ["head", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_head(root, p)),
         ["text", root, page] => page.parse().map_err(|e| format!("{e}"))
@@ -136,6 +146,7 @@ fn main() -> ExitCode {
         ["history", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_history(root, p)),
         _ => Err("usage: wikimak discover <dbname>\n\
+                  \x20      wikimak pages <root> [filter]\n\
                   \x20      wikimak fetch <dbname> <root>\n\
                   \x20      wikimak import <dump.xml[.bz2]> <root>\n\
                   \x20      wikimak head|text|history <root> <page_id>".into()),

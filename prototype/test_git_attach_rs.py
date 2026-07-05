@@ -158,8 +158,8 @@ def main():
               "executable bit survived the git mode conversion")
         with sqlite3.connect(f"file:{gsp}?mode=ro", uri=True) as c:
             name = dict(c.execute("SELECT key,value FROM meta")).get("name")
-        check(name and name.startswith("git:main@"),
-              f"imported box named for the ref (got {name!r})")
+        check(name and name.startswith("git:") and "/main@" in name,
+              f"imported box named repo/ref (got {name!r})")
 
         # Read-through into the working box's captured layer.
         r = subprocess.run(

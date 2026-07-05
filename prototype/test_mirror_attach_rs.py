@@ -190,7 +190,7 @@ def main():
                   f"(rc={r.returncode}: {(r.stderr or r.stdout)[:200]})")
 
         # Read every attached object through the box; capture proves it.
-        script = ("cat /gitsdk/tool.txt /wiki/page-1.txt "
+        script = ("cat /gitsdk/tool.txt '/wiki/Old Title.txt' "
                   "/ietf/draft-test-mesh-01.txt > /gathered.txt")
         r = subprocess.run([str(BIN), "run", "WORK", "--", "sh", "-c", script],
                            capture_output=True, text=True, timeout=60)
@@ -203,14 +203,14 @@ def main():
               "wiki page text read through (non-trivial bytes)")
 
         # EROFS on each kind's key; no capture side effect.
-        for key in ("/gitsdk/tool.txt", "/wiki/page-1.txt",
+        for key in ("/gitsdk/tool.txt", "'/wiki/Old Title.txt'",
                     "/ietf/draft-test-mesh-00.txt"):
             r = subprocess.run(
                 [str(BIN), "run", "WORK", "--", "sh", "-c",
                  f"echo overwrite > {key}"],
                 capture_output=True, text=True, timeout=60)
             check(r.returncode != 0, f"write to {key} fails")
-            check(key.lstrip("/") not in rows(sp),
+            check(key.strip("'").lstrip("/") not in rows(sp),
                   f"rejected write to {key} left NO captured row")
 
         # UI DAG: three attachments in parents, named for their objects.
@@ -221,7 +221,8 @@ def main():
         check(len(parents) == 3,
               f"three attachments in session parents (got {parents!r})")
         names = {s.get("name") for s in sessions}
-        for want in ("git:main@", "wiki:1@r", "ietf:draft-test-mesh@01"):
+        for want in ("git:gitstore/main@", "wiki:wiki/Old Title@r",
+                     "ietf:draft-test-mesh@01"):
             check(any(n and n.startswith(want) for n in names),
                   f"attachment box named {want}… (names {sorted(filter(None, names))!r})")
     finally:

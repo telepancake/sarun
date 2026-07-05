@@ -69,6 +69,10 @@ pub enum ContributorMeta {
     Hidden,
 }
 
+/// [`Instance::page_by_title`]'s answer: the resolved page id (if exact
+/// or unique) and the candidate `(page_id, title)` matches.
+pub type TitleResolution = (Option<u64>, Vec<(u64, String)>);
+
 /// Counters returned from [`Instance::import`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportStats {
@@ -237,6 +241,49 @@ impl Instance {
         Ok(HistoryIter {
             inner: Box::new(iter),
         })
+    }
+
+    /// List `(page_id, title)` pairs, title-ordered, optionally filtered
+    /// by a case-insensitive substring. The answer to "which pages do I
+    /// have?" — ids alone are not a UI.
+    pub fn pages(&self, filter: Option<&str>, limit: usize)
+        -> Result<Vec<(u64, String)>>
+    {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        let mut st = g.conn.prepare(
+            "SELECT page_id, normalized_title FROM title_intervals
+             ORDER BY normalized_title")?;
+        let rows = st.query_map([], |r| Ok((
+            r.get::<_, i64>(0)? as u64, r.get::<_, Vec<u8>>(1)?)))?;
+        let needle = filter.map(str::to_lowercase);
+        let mut out = Vec::new();
+        for row in rows.flatten() {
+            let title = String::from_utf8_lossy(&row.1).into_owned();
+            if let Some(n) = &needle {
+                if !title.to_lowercase().contains(n) {
+                    continue;
+                }
+            }
+            out.push((row.0, title));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve a page by exact title, else by unique case-insensitive
+    /// substring. `Err(TitleAmbiguous)`-free by design: ambiguity comes
+    /// back as `Ok(None)` plus the candidates for the caller to show.
+    pub fn page_by_title(&self, title: &str) -> Result<TitleResolution> {
+        let all = self.pages(Some(title), 16)?;
+        if let Some(hit) = all.iter().find(|(_, t)| t == title) {
+            return Ok((Some(hit.0), all));
+        }
+        match all.as_slice() {
+            [(id, _)] => Ok((Some(*id), all)),
+            _ => Ok((None, all)),
+        }
     }
 
     /// Has this dump part already been fully imported? Keyed by the

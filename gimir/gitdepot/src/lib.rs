@@ -59,13 +59,40 @@ pub struct CommitMeta {
     pub author_hex: String,
     pub committer_hex: String,
     pub message_hex: String,
+    /// Header keys beyond tree/parent/author/committer (gpgsig,
+    /// mergetag, encoding …). Non-empty means fast-import cannot
+    /// regenerate this commit SHA-exact — export refuses it; the raw
+    /// object below preserves the data for a future exact exporter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<String>,
+    /// The complete raw commit object, hex — kept ONLY when
+    /// extra_headers is non-empty (it is redundant otherwise).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub raw_hex: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Meta {
+    /// Human name of the mirrored repository ("WHICH git?") — shown in
+    /// listings and in attachment box names. `mirror` derives it from
+    /// the URL; empty on stores imported before it existed.
+    #[serde(default)]
+    pub label: String,
+    /// Where this mirror fetches from (empty for direct imports).
+    #[serde(default)]
+    pub url: String,
     pub refs: Vec<RefMeta>,
     /// Newest-first; index i corresponds to chain frame i.
     pub commits: Vec<CommitMeta>,
+}
+
+impl CommitMeta {
+    /// First line of the commit message, lossily decoded.
+    pub fn subject(&self) -> String {
+        let msg = hex::decode(&self.message_hex).unwrap_or_default();
+        let line = msg.split(|&b| b == b'\n').next().unwrap_or(&[]);
+        String::from_utf8_lossy(line).into_owned()
+    }
 }
 
 // ----------------------------------------------------------------- error
@@ -260,22 +287,29 @@ fn parse_commit(raw: &[u8]) -> Result<CommitMeta> {
         .ok_or_else(|| Error::Git("commit: no header/body split".into()))?;
     let (headers, message) = (&raw[..body_at], &raw[body_at + 2..]);
     let mut parents = Vec::new();
+    let mut extra_headers = Vec::new();
     let (mut author, mut committer) = (None, None);
     for line in headers.split(|&b| b == b'\n') {
         let sp = line.iter().position(|&b| b == b' ').unwrap_or(line.len());
         let (key, val) = (&line[..sp], &line[sp.min(line.len() - 1) + 1..]);
+        if line.first() == Some(&b' ') {
+            // Continuation line of a multi-line header (gpgsig PGP
+            // block, mergetag body) — the whole raw object is already
+            // preserved below; nothing to parse here.
+            continue;
+        }
         match key {
             b"tree" => {}
             b"parent" => parents.push(String::from_utf8_lossy(val).into_owned()),
             b"author" => author = Some(val.to_vec()),
             b"committer" => committer = Some(val.to_vec()),
             other => {
-                // gpgsig etc. would break SHA-exact re-import; refuse
-                // loudly rather than round-trip approximately.
-                return Err(Error::Unsupported(format!(
-                    "commit header '{}' (signed commits are out of straightedge scope)",
-                    String::from_utf8_lossy(other)
-                )));
+                // gpgsig / mergetag / encoding … — data we cannot
+                // regenerate through fast-import. Record the fact; the
+                // RAW object is preserved so nothing is lost, and
+                // export refuses these commits explicitly instead of
+                // silently minting different SHAs.
+                extra_headers.push(String::from_utf8_lossy(other).into_owned());
             }
         }
     }
@@ -287,6 +321,12 @@ fn parse_commit(raw: &[u8]) -> Result<CommitMeta> {
             committer.ok_or_else(|| Error::Git("commit: no committer".into()))?,
         ),
         message_hex: hex::encode(message),
+        raw_hex: if extra_headers.is_empty() {
+            String::new()
+        } else {
+            hex::encode(raw)
+        },
+        extra_headers,
     })
 }
 
@@ -328,12 +368,15 @@ pub struct ImportOutcome {
     pub report: SizeReport,
 }
 
-/// Refs (bookkeeping). Only commit refs are in scope.
+/// Refs (bookkeeping): branches + tags only. `refs/pull/*` and friends
+/// are excluded — on public forges that forest is unbounded and
+/// adversarial (spam PRs merging foreign megahistories).
 fn collect_refs(repo: &Path) -> Result<Vec<RefMeta>> {
     let mut refs = Vec::new();
     for line in git_str(
         repo,
-        &["for-each-ref", "--format=%(objectname) %(objecttype) %(refname)"],
+        &["for-each-ref", "--format=%(objectname) %(objecttype) %(refname)",
+          "refs/heads", "refs/tags"],
     )?
     .lines()
     {
@@ -356,9 +399,10 @@ fn collect_refs(repo: &Path) -> Result<Vec<RefMeta>> {
     Ok(refs)
 }
 
-/// All commits, newest-first (topo order).
+/// All commits reachable from branches + tags, newest-first (topo
+/// order). Same scope rule as `collect_refs`.
 fn rev_list(repo: &Path) -> Result<Vec<String>> {
-    Ok(git_str(repo, &["rev-list", "--topo-order", "--all"])?
+    Ok(git_str(repo, &["rev-list", "--topo-order", "--branches", "--tags"])?
         .lines()
         .map(str::to_string)
         .collect())
@@ -414,7 +458,7 @@ pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
         prev_view = Some(view);
     }
 
-    let meta = Meta { refs, commits };
+    let meta = Meta { label: String::new(), url: String::new(), refs, commits };
     let report = chain::write_store(store, &meta, &delta_records, &full_records, level)?;
     Ok(ImportOutcome { meta, report })
 }
@@ -461,7 +505,8 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
     if k == 0 {
         // Content unchanged; refs may still have moved between known
         // commits (branch created/renamed onto an old sha).
-        let meta = Meta { refs: refs.clone(), commits: old_meta.commits };
+        let meta = Meta { label: old_meta.label, url: old_meta.url,
+                          refs: refs.clone(), commits: old_meta.commits };
         chain::write_meta(store, &meta)?;
         return Ok(UpdateOutcome { new_commits: 0, total_commits: total, refs });
     }
@@ -495,7 +540,8 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
 
     let mut all_commits = commits;
     all_commits.extend(old_meta.commits);
-    let meta = Meta { refs: refs.clone(), commits: all_commits };
+    let meta = Meta { label: old_meta.label, url: old_meta.url,
+                      refs: refs.clone(), commits: all_commits };
     chain::prepend_store(store, &meta, &delta_records, &full_records, level)?;
     Ok(UpdateOutcome { new_commits: k, total_commits: total, refs })
 }
@@ -518,6 +564,17 @@ pub struct MirrorOutcome {
 ///
 /// Fetching is host-side for now (MIRRORS.md: the move into a tap box
 /// is mechanical later).
+/// "WHICH git?" — the repo's human name, from its URL's last path
+/// segment (`.git` stripped): `https://host/o/hello-world.git` →
+/// `hello-world`.
+pub fn label_from_url(url: &str) -> String {
+    let tail = url.trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(url);
+    tail.strip_suffix(".git").unwrap_or(tail).to_string()
+}
+
 pub fn mirror(url: &str, root: &Path) -> Result<MirrorOutcome> {
     std::fs::create_dir_all(root)?;
     let repo = root.join("repo.git");
@@ -536,34 +593,81 @@ pub fn mirror(url: &str, root: &Path) -> Result<MirrorOutcome> {
             )));
         }
     }
-    if !store.join("meta.json").exists() {
+    let out = if !store.join("meta.json").exists() {
         let o = import(&repo, &store, 3)?;
         let n = o.meta.commits.len();
-        return Ok(MirrorOutcome {
+        MirrorOutcome {
             update: UpdateOutcome { new_commits: n, total_commits: n, refs: o.meta.refs },
             reimported: false,
+        }
+    } else {
+        match update(&repo, &store, 3) {
+            Ok(u) => MirrorOutcome { update: u, reimported: false },
+            Err(Error::Unsupported(_)) => {
+                // Remote rewrote history out from under the store: replace
+                // the store wholesale with the fresh state.
+                let fresh = root.join("store.new");
+                if fresh.exists() {
+                    std::fs::remove_dir_all(&fresh)?;
+                }
+                let o = import(&repo, &fresh, 3)?;
+                std::fs::remove_dir_all(&store)?;
+                std::fs::rename(&fresh, &store)?;
+                let n = o.meta.commits.len();
+                MirrorOutcome {
+                    update: UpdateOutcome { new_commits: n, total_commits: n, refs: o.meta.refs },
+                    reimported: true,
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    // Stamp identity ("WHICH git?") — listings and attachment names key
+    // off it.
+    let mut meta = chain::read_meta(&store)?;
+    if meta.label.is_empty() || meta.url != url {
+        meta.label = label_from_url(url);
+        meta.url = url.to_string();
+        chain::write_meta(&store, &meta)?;
+    }
+    Ok(out)
+}
+
+/// One row of `list_mirrors`.
+#[derive(Debug, Clone)]
+pub struct MirrorEntry {
+    /// Directory under the mirrors root (`<root>/<dir>/store`).
+    pub dir: String,
+    pub label: String,
+    pub url: String,
+    pub commits: usize,
+    pub refs: Vec<RefMeta>,
+}
+
+/// Scan a mirrors root for `<root>/*/store/meta.json` — the answer to
+/// "which repos do I have?".
+pub fn list_mirrors(root: &Path) -> Result<Vec<MirrorEntry>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(root)?.flatten() {
+        let store = e.path().join("store");
+        if !store.join("meta.json").exists() {
+            continue;
+        }
+        let meta = chain::read_meta(&store)?;
+        out.push(MirrorEntry {
+            dir: e.file_name().to_string_lossy().into_owned(),
+            label: if meta.label.is_empty() {
+                e.file_name().to_string_lossy().into_owned()
+            } else {
+                meta.label.clone()
+            },
+            url: meta.url,
+            commits: meta.commits.len(),
+            refs: meta.refs,
         });
     }
-    match update(&repo, &store, 3) {
-        Ok(u) => Ok(MirrorOutcome { update: u, reimported: false }),
-        Err(Error::Unsupported(_)) => {
-            // Remote rewrote history out from under the store: replace
-            // the store wholesale with the fresh state.
-            let fresh = root.join("store.new");
-            if fresh.exists() {
-                std::fs::remove_dir_all(&fresh)?;
-            }
-            let o = import(&repo, &fresh, 3)?;
-            std::fs::remove_dir_all(&store)?;
-            std::fs::rename(&fresh, &store)?;
-            let n = o.meta.commits.len();
-            Ok(MirrorOutcome {
-                update: UpdateOutcome { new_commits: n, total_commits: n, refs: o.meta.refs },
-                reimported: true,
-            })
-        }
-        Err(e) => Err(e),
-    }
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- export
@@ -632,6 +736,13 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
 
     for idx in (0..meta.commits.len()).rev() {
         let cm = &meta.commits[idx];
+        if !cm.extra_headers.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "commit {} carries {:?} — SHA-exact export of signed/extended \
+                 commits is not implemented (raw object is preserved in meta)",
+                cm.sha, cm.extra_headers
+            )));
+        }
         let mut files = Vec::new();
         walk_files(&views[idx], &mut Vec::new(), &mut files)?;
 

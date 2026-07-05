@@ -1,6 +1,8 @@
 //! CLI: `gitdepot import <git-repo> <store-dir> [--level N]`
 //!      `gitdepot update <git-repo> <store-dir> [--level N]`
 //!      `gitdepot mirror <url> <root-dir>`
+//!      `gitdepot list <mirrors-root>`
+//!      `gitdepot log <store-dir>`
 //!      `gitdepot export <store-dir> <new-repo-dir>`
 
 use std::path::PathBuf;
@@ -8,7 +10,7 @@ use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: gitdepot import <git-repo> <store-dir> [--level N]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir>\n       gitdepot export <store-dir> <new-repo-dir>"
+        "usage: gitdepot import <git-repo> <store-dir> [--level N]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir>\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>"
     );
     ExitCode::from(2)
 }
@@ -63,6 +65,45 @@ fn main() -> ExitCode {
                 println!("{} new commits ({} total)", o.new_commits, o.total_commits);
                 for r in &o.refs {
                     println!("{} {}", r.sha, r.name);
+                }
+            })
+        }
+        ("list", [root]) => {
+            gitdepot::list_mirrors(&PathBuf::from(root)).map(|entries| {
+                for e in &entries {
+                    // Branches + tags are the navigable surface; the
+                    // refs/pull/* forest is noise here.
+                    let mut heads: Vec<&str> = e.refs.iter()
+                        .filter_map(|r| r.name.strip_prefix("refs/heads/"))
+                        .collect();
+                    let tags = e.refs.iter()
+                        .filter(|r| r.name.starts_with("refs/tags/")).count();
+                    let other = e.refs.len() - heads.len() - tags;
+                    if heads.len() > 6 {
+                        heads.truncate(6);
+                        heads.push("…");
+                    }
+                    println!("{:<16} {:>5} commits  [{}]{}{}  {}",
+                             e.label, e.commits, heads.join(", "),
+                             if tags > 0 { format!("  +{tags} tags") }
+                             else { String::new() },
+                             if other > 0 { format!("  +{other} other refs") }
+                             else { String::new() },
+                             e.url);
+                }
+            })
+        }
+        ("log", [store]) => {
+            gitdepot::chain::read_meta(&PathBuf::from(store)).map(|meta| {
+                for (i, c) in meta.commits.iter().enumerate() {
+                    let at: Vec<&str> = meta.refs.iter()
+                        .filter(|r| r.sha == c.sha)
+                        .map(|r| r.name.strip_prefix("refs/heads/")
+                                  .unwrap_or(&r.name))
+                        .collect();
+                    println!("{i:>4}  {}  {}{}", &c.sha[..8], c.subject(),
+                             if at.is_empty() { String::new() }
+                             else { format!("  [{}]", at.join(", ")) });
                 }
             })
         }
