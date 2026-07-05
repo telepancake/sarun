@@ -1689,21 +1689,40 @@ macro_rules! ui_verbs {
         }
         // RO attachments (DEPOT-DESIGN.md §8): reference another box's
         // layer read-only, between this box and its parent in the lookup
-        // chain. args: [sid, ro_box_id, ...] — the full ordered list
-        // replaces the current one (empty list = detach all). The RO box
-        // is hydrated from its at-rest sqlar if not already live.
-        "ro_attach", "SID [RO_ID...]", "replace the box's read-only attachment list" => {
+        // chain. args: [sid, row, ...] — each row an integer box id, or
+        // an object {kind,store,ref,rev,prefix?,name} referencing a
+        // mirror store directly (served through the readout, no import —
+        // the generic attachment row the kind-specific verbs converge
+        // on). The full ordered list replaces the current one (empty
+        // list = detach all). A box row is hydrated from its at-rest
+        // sqlar if not already live; an ext row opens lazily at first
+        // use.
+        "ro_attach", "SID [RO_ID|{kind,store,ref,rev,prefix,name}...]", "replace the box's read-only attachment list (ints = box ids, objects = external refs)" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
             };
-            let Some(b) = ov.box_of(sid) else {
+            // Hydrate an at-rest owner (same as the kind-specific attach
+            // verbs): the list persists in meta, so attaching between
+            // runs must work.
+            let Some(b) = hydrate_box(&ov, sid) else {
                 return json!({"ok": false, "error": "no such box"});
             };
             let mut ids = Vec::new();
             for v in args.iter().skip(1) {
                 let Some(ro) = v.as_i64() else {
-                    return json!({"ok": false, "error": "bad ro id"});
+                    // Object row: an external reference. Parse strictly —
+                    // a malformed row must fail the verb, not skip.
+                    match serde_json::from_value::<crate::capture::ExtRef>(
+                        v.clone())
+                    {
+                        Ok(e) => {
+                            ids.push(crate::capture::RoAttachment::Ext(e));
+                            continue;
+                        }
+                        Err(e) => return json!({"ok": false,
+                            "error": format!("bad attachment row: {e}")}),
+                    }
                 };
                 if ro == sid {
                     return json!({"ok": false, "error": "cannot attach self"});
@@ -1729,6 +1748,7 @@ macro_rules! ui_verbs {
                 ids.push(crate::capture::RoAttachment::Box(ro));
             }
             b.set_ro_attachments(ids);
+            ov.invalidate_ext(sid);
             json!({"ok": true})
         }
         // Attach a git ref from a gitdepot mirror store (MIRRORS.md
