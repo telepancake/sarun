@@ -147,6 +147,11 @@ struct Inner {
     // O(bookkeeping) no matter the store size. Invalidated when a box's
     // attachment list is rewritten.
     ext: RwLock<HashMap<i64, Arc<Vec<Arc<crate::attach::ExtAttachment>>>>>,
+    // The §7 materialization cache: real pool files for attachment blobs
+    // a readout hands back as Bytes (open/mmap/exec need an fd). Root is
+    // state_home()/cache — is_engine_path already hides the whole
+    // state_home subtree from boxes. None = open failed (served EIO).
+    cache: std::sync::OnceLock<Option<depot_cache::Cache>>,
     // Open handles to the synthetic JOBSERVER file: fh -> is-O_NONBLOCK. Kept
     // apart from `fhs` (no blob/file behind them) so read/write dispatch to the
     // slip pool instead of a backing file.
@@ -371,7 +376,21 @@ enum Layer {
     UpperDir { mode: u32, mtime_ns: i64 },
     UpperSymlink { target: PathBuf },
     UpperSpecial { mode: u32, rdev: u64 },
+    /// A regular file served by an external RO attachment. size/mode are
+    /// carried from the readout's entry so getattr NEVER decodes blob
+    /// bytes; only open()/box_read_file call att.blob(rel).
+    ExtFile { att: Arc<crate::attach::ExtAttachment>, rel: String,
+              size: u64, mode: u32 },
     Lower,
+}
+
+/// One hop of a box's lookup chain: a box's own overlay, or an external
+/// RO attachment served through a mirror-store readout. Scoped to the
+/// overlay — chain_of is the single funnel; BoxState is NOT trait-
+/// objected (its ~40 box_of consumers stay concrete).
+enum ChainLink {
+    Box(Arc<BoxState>),
+    Ext(Arc<crate::attach::ExtAttachment>),
 }
 
 /// Top-level directory names the overlay always presents as an empty, virtual
@@ -425,6 +444,7 @@ impl Overlay {
             fhs: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             ext: RwLock::new(HashMap::new()),
+            cache: std::sync::OnceLock::new(),
             jobserver_fhs: RwLock::new(HashMap::new()),
             rules: RwLock::new(crate::rules::Rules::load()),
             echo: RwLock::new(HashMap::new()),
@@ -435,6 +455,13 @@ impl Overlay {
             events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             shadows: RwLock::new(Shadows::load()),
         }) };
+        // Reclaim unreferenced cache pool files once per engine start —
+        // cheap (one readdir sweep), and NEVER on the FUSE path: eviction
+        // under a live open() race would yank a pool file an mmap still
+        // needs; at startup nothing holds cache fds yet.
+        if let Some(c) = ov.cache() {
+            let _ = c.evict_unreferenced();
+        }
         // Test observability: if SARUN_STATS_FILE is set, a thread writes
         // "passthrough=<0|1> daemon_reads=<n>" to it (survives the SIGTERM
         // _exit teardown, which skips destroy()). No-op when unset.
@@ -787,6 +814,22 @@ impl Overlay {
         built
     }
 
+    /// The materialization cache, opened once per engine. None (with a
+    /// one-time log line) when the root can't be created; blob-backed
+    /// attachment opens then fail with EIO rather than bricking the box.
+    fn cache(&self) -> Option<&depot_cache::Cache> {
+        self.inner.cache.get_or_init(|| {
+            let root = crate::paths::state_home().join("cache");
+            match depot_cache::Cache::open(root) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("sarun-engine: depot cache unavailable: {e}");
+                    None
+                }
+            }
+        }).as_ref()
+    }
+
     /// Drop `owner`'s cached ExtAttachments — call after rewriting its
     /// attachment list so the next walk rebuilds from bookkeeping.
     pub(crate) fn invalidate_ext(&self, owner: i64) {
@@ -819,6 +862,14 @@ impl Overlay {
                 std::fs::read(crate::depot::blob_path(owner, rowid))
             }
             Layer::Lower => std::fs::read(self.host(rel)),
+            Layer::ExtFile { att, rel, .. } => match att.blob(&rel) {
+                Some(depot_model::variant::Blob::Bytes(b)) => Ok(b),
+                Some(depot_model::variant::Blob::File(p)) => std::fs::read(p),
+                // Resolved entry but no blob: the store went away between
+                // getattr and read (§8 failure mode) — EIO, never a panic.
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other, "attachment blob unavailable")),
+            },
             Layer::UpperSymlink { target } =>
                 Ok(target.to_string_lossy().into_owned().into_bytes()),
             Layer::UpperDir { .. } => Err(std::io::Error::new(
@@ -837,7 +888,8 @@ impl Overlay {
         use std::os::unix::fs::PermissionsExt;
         self.hydrate_chain(Some(bid));
         match self.resolve(bid, rel) {
-            Layer::UpperFile { mode, .. } => Some((mode & 0o7777) as u32),
+            Layer::UpperFile { mode, .. } | Layer::ExtFile { mode, .. } =>
+                Some(mode & 0o7777),
             Layer::Lower => std::fs::symlink_metadata(self.host(rel)).ok()
                 .map(|m| m.permissions().mode() & 0o7777),
             _ => None,
@@ -899,7 +951,7 @@ impl Overlay {
     pub fn box_path_kind(&self, bid: i64, rel: &str) -> char {
         self.hydrate_chain(Some(bid));
         match self.resolve(bid, rel) {
-            Layer::UpperFile { .. } => 'f',
+            Layer::UpperFile { .. } | Layer::ExtFile { .. } => 'f',
             Layer::UpperDir { .. } => 'd',
             Layer::UpperSymlink { .. } => 'l',
             Layer::UpperSpecial { .. } => 's',
@@ -1010,22 +1062,55 @@ impl Overlay {
         }
     }
 
+    /// `b`'s RO attachments as chain links, in LIST order — Box and Ext
+    /// rows interleaved exactly as ro_attachments records them (the
+    /// per-kind accessors each preserve relative order; the running Ext
+    /// index rejoins them). Box rows not currently registered are
+    /// skipped, matching the old id-walk's box_of miss behavior.
+    fn attachment_links(&self, b: &BoxState, out: &mut Vec<ChainLink>) {
+        let exts = self.ext_attachments(b.id);
+        if exts.is_empty() {
+            // Common case: no Ext rows — skip the (cloning) full-list
+            // accessor on the per-op resolve path.
+            for ro in b.ro_attachment_box_ids() {
+                if let Some(rb) = self.box_of(ro) {
+                    out.push(ChainLink::Box(rb));
+                }
+            }
+            return;
+        }
+        let mut ei = 0;
+        for row in b.ro_attachment_list() {
+            match row {
+                crate::capture::RoAttachment::Box(ro) => {
+                    if let Some(rb) = self.box_of(ro) {
+                        out.push(ChainLink::Box(rb));
+                    }
+                }
+                crate::capture::RoAttachment::Ext(_) => {
+                    if let Some(a) = exts.get(ei) {
+                        out.push(ChainLink::Ext(a.clone()));
+                    }
+                    ei += 1;
+                }
+            }
+        }
+    }
+
     /// The full lookup chain for `bid`: each box followed by its RO
     /// attachments (DEPOT-DESIGN.md §8 — read-only layers conceptually
     /// between a box and its parent), then the parent, recursively.
     /// Capped like the old parent walk.
-    fn chain_of(&self, bid: i64) -> Vec<i64> {
+    fn chain_of(&self, bid: i64) -> Vec<ChainLink> {
         let mut out = Vec::new();
         let mut cur = Some(bid);
         while let Some(id) = cur {
             if out.len() >= 64 { break; }
-            out.push(id);
             let Some(b) = self.box_of(id) else { break };
-            for ro in b.ro_attachment_box_ids() {
-                if out.len() >= 64 { break; }
-                out.push(ro);
-            }
             cur = b.parent();
+            out.push(ChainLink::Box(b.clone()));
+            self.attachment_links(&b, &mut out);
+            out.truncate(64);
         }
         out
     }
@@ -1041,12 +1126,14 @@ impl Overlay {
             seen += 1;
             if seen > 64 { break; }
             let Some(b) = self.box_of(id) else { break };
-            for ro in b.ro_attachment_box_ids() {
-                if let Some(rb) = self.box_of(ro) {
-                    if rb.entry(rel).is_some() {
-                        return true;
-                    }
-                }
+            let mut links = Vec::new();
+            self.attachment_links(&b, &mut links);
+            for l in links {
+                let hit = match l {
+                    ChainLink::Box(rb) => rb.entry(rel).is_some(),
+                    ChainLink::Ext(att) => att.entry(rel).is_some(),
+                };
+                if hit { return true; }
             }
             cur = b.parent();
         }
@@ -1091,8 +1178,26 @@ impl Overlay {
         // the image's /etc, never the host's. The chain is each box, its RO
         // attachments, then its parent (chain_of).
         let mut no_host = false;
-        for id in self.chain_of(bid) {
-            let Some(b) = self.box_of(id) else { continue };
+        for link in self.chain_of(bid) {
+            let b = match link {
+                ChainLink::Box(b) => b,
+                // Attachments are resolved VIEWS: no whiteouts, holes or
+                // opacity — a miss just falls through to the next link.
+                ChainLink::Ext(att) => {
+                    match att.entry(rel) {
+                        Some(e) if e.dir =>
+                            return Layer::UpperDir { mode: e.mode,
+                                                     mtime_ns: 0 },
+                        Some(e) =>
+                            return Layer::ExtFile {
+                                att, rel: rel.to_string(),
+                                size: e.size, mode: e.mode },
+                        None => {}
+                    }
+                    continue;
+                }
+            };
+            let id = b.id;
             if b.no_host_fallback() { no_host = true; }
             match b.entry(rel) {
                 Some(Entry::Whiteout) => return Layer::Absent,
@@ -1158,10 +1263,16 @@ impl Overlay {
     /// only ever offered for a path that is empty in EVERY box of the chain, so
     /// it can never hide a real directory's contents.
     fn chain_dir_has_children(&self, bid: i64, rel: &str) -> bool {
-        for id in self.chain_of(bid) {
-            let Some(b) = self.box_of(id) else { continue };
-            let (_white, present, _holes) = b.children_of(rel);
-            if !present.is_empty() { return true; }
+        for link in self.chain_of(bid) {
+            match link {
+                ChainLink::Box(b) => {
+                    let (_white, present, _holes) = b.children_of(rel);
+                    if !present.is_empty() { return true; }
+                }
+                ChainLink::Ext(att) => {
+                    if !att.children(rel).is_empty() { return true; }
+                }
+            }
         }
         false
     }
@@ -1297,6 +1408,15 @@ impl Overlay {
                 a.kind = FileType::RegularFile;
                 Some(a)
             }
+            // Carried size/mode only — getattr must NEVER call blob()
+            // (an `ls -lR` over a big attachment must not decode it).
+            Layer::ExtFile { size, mode, .. } => {
+                let mut a = self.synth_file_attr(ino);
+                a.size = size;
+                a.blocks = size.div_ceil(512);
+                a.perm = (mode & 0o7777) as u16;
+                Some(a)
+            }
             Layer::UpperDir { mode, mtime_ns } =>
                 Some(self.synth_dir_attr(ino, mode, mtime_ns)),
             Layer::UpperSymlink { target } =>
@@ -1327,6 +1447,10 @@ impl Overlay {
                     .unwrap_or(0o100644);
                 (Some(self.host(rel)), m)
             }
+            // Unreachable: every mutation path EROFS'd at ro_denied
+            // before copy_up could see an attachment-resolved key.
+            Layer::ExtFile { .. } =>
+                return Err(std::io::Error::from_raw_os_error(libc::EROFS)),
             _ => (None, 0o100644),
         };
         let rowid = b.ensure_file_row(rel, mode, writer);
@@ -1356,14 +1480,14 @@ impl Overlay {
     fn scan_dir(&self, b: &BoxState, rel: &str, plus: bool)
                 -> Vec<(String, FileType, u64, Option<FileAttr>)> {
         let mut names: BTreeMap<String, ()> = BTreeMap::new();
-        // chain of box ids, root-first (incl. RO attachments).
+        // chain of links, root-first (incl. RO attachments).
         let mut chain = self.chain_of(b.id);
         chain.reverse();
         // D-parent: skip host seeding when any box in the chain disables it
         // (matches resolve()'s no_host_fallback semantics — the box stack is
         // closed at the bottom, no /etc-from-host bleed-through).
-        let no_host = chain.iter().filter_map(|id| self.box_of(*id))
-                           .any(|bx| bx.no_host_fallback());
+        let no_host = chain.iter().any(|l| matches!(l,
+            ChainLink::Box(bx) if bx.no_host_fallback()));
         if !no_host {
             if let Ok(rd) = std::fs::read_dir(self.host(rel)) {
                 for ent in rd.flatten() {
@@ -1373,8 +1497,17 @@ impl Overlay {
                 }
             }
         }
-        for id in chain {
-            if let Some(bx) = self.box_of(id) {
+        for link in chain {
+            let bx = match link {
+                ChainLink::Box(bx) => bx,
+                // Attachment entries are plain present names — no
+                // whiteouts/holes/opacity; kinds come from attr_of below.
+                ChainLink::Ext(att) => {
+                    for n in att.children(rel) { names.insert(n, ()); }
+                    continue;
+                }
+            };
+            {
                 // D-opaque: clear lower contributions if THIS box marks `rel`
                 // opaque, OR if ANY ANCESTOR of `rel` is opaque here. The
                 // OCI/AUFS spec says `.wh..wh..opq` hides every lower entry
@@ -1655,6 +1788,27 @@ impl Filesystem for Overlay {
                     Err(_) => return reply.error(Errno::EACCES),
                 }
             },
+            Layer::ExtFile { att, rel: erel, .. } => {
+                // Write intent already EROFS'd above (ro_denied matches
+                // every attachment-resolved key); this is read-only.
+                let opened = match att.blob(&erel) {
+                    // Store loose file: serve it directly, no copy.
+                    Some(depot_model::variant::Blob::File(p)) =>
+                        File::open(&p).ok(),
+                    // Decoded bytes: land them in the §7 cache pool so
+                    // the Fh has a real fd (read_at/mmap/exec unchanged);
+                    // repeat opens dedupe onto the same pool path.
+                    Some(depot_model::variant::Blob::Bytes(bytes)) =>
+                        self.cache()
+                            .and_then(|c| c.file_for(&bytes).ok())
+                            .and_then(|p| File::open(p).ok()),
+                    None => None,
+                };
+                match opened {
+                    Some(f) => (Some(f), false),
+                    None => return reply.error(Errno::EIO),
+                }
+            }
             _ => return reply.error(Errno::ENOENT),
         };
         // D5 (rule-gated): a READ-ONLY open of a HOST-DIRECT path (the existing
@@ -2017,6 +2171,7 @@ impl Filesystem for Overlay {
                 }
                 Layer::Absent => {}
                 Layer::UpperSpecial { .. } => {}
+                Layer::ExtFile { .. } => {}  // layer() never yields it
             }
         }
         // chown: a regular file does a REAL chown on its backing blob and
@@ -2439,6 +2594,8 @@ impl Filesystem for Overlay {
                 b.rename_row(&rel_o, &rel_n);
                 if lower_o { b.set_whiteout(&rel_o, writer); }
             }
+            // layer() never yields it; ro_denied EROFS'd above anyway.
+            Layer::ExtFile { .. } => return reply.error(Errno::EROFS),
         }
         self.remap_inode_subtree(bo, &rel_o, &rel_n);
         self.push_event(bo, rel_o, "rename_src");
@@ -2549,5 +2706,63 @@ impl Filesystem for Overlay {
             }
         }
         reply.ok();
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use crate::capture::{BoxState, ExtRef, RoAttachment};
+
+    fn ext_ref(prefix: &str) -> ExtRef {
+        ExtRef { kind: "git".into(), store: "/nonexistent".into(),
+                 refname: "main".into(), rev: "abc".into(),
+                 prefix: prefix.into(), name: "t".into() }
+    }
+
+    // chain_of must honor the FULL interleaved ro_attachments order —
+    // Box and Ext rows at their list positions, never grouped by kind
+    // (resolve precedence is the list order the attach verbs recorded).
+    // The Ext link's synthesized prefix chain must then show through
+    // resolve/ro_denied/chain_dir_has_children WITHOUT the store (here
+    // nonexistent) ever opening.
+    #[test]
+    fn chain_interleaves_box_and_ext_rows_in_list_order() {
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "sarun-chain-{}-{:?}", std::process::id(),
+            std::time::SystemTime::now()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: same discipline as review.rs's promote test — the lock
+        // serializes every state_home-reading test in this binary.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let ov = Overlay::new(tmp.clone());
+        let (owner, a, c) = (9101i64, 9102i64, 9103i64);
+        for id in [a, c] {
+            ov.add_box(Arc::new(BoxState::create(id).unwrap()));
+        }
+        let ob = BoxState::create(owner).unwrap();
+        ob.set_ro_attachments(vec![
+            RoAttachment::Box(a),
+            RoAttachment::Ext(ext_ref("deep/sdk")),
+            RoAttachment::Box(c),
+        ]);
+        ov.add_box(Arc::new(ob));
+
+        let tags: Vec<String> = ov.chain_of(owner).iter().map(|l| match l {
+            ChainLink::Box(b) => format!("box:{}", b.id),
+            ChainLink::Ext(att) => format!("ext:{}", att.ext.prefix),
+        }).collect();
+        assert_eq!(tags, ["box:9101", "box:9102", "ext:deep/sdk",
+                          "box:9103"]);
+
+        assert!(matches!(ov.resolve(owner, "deep"), Layer::UpperDir { .. }));
+        assert!(ov.ro_denied(owner, "deep"));
+        assert!(ov.chain_dir_has_children(owner, ""));
+        assert_eq!(ov.box_path_kind(owner, "deep"), 'd');
+        // Off-prefix rels miss the attachment and stay writable.
+        assert!(!ov.ro_denied(owner, "elsewhere"));
     }
 }

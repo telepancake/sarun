@@ -13,6 +13,9 @@ anyhow = "1.0"
 # std-only). `crate::depot` is the engine's seam module; the model crate is
 # aliased `depot_model` to keep the two distinguishable at use sites.
 depot_model = { path = "../gimir/depot", package = "depot" }
+# The materialization cache (DEPOT-DESIGN.md §7): real loose files for
+# mount-serving an external attachment whose readout hands back Bytes.
+depot-cache = { path = "../gimir/depot-cache" }
 # The git-mirror store reader (gimir workspace): `git_attach` resolves a
 # gitdepot store + ref to a view and imports it as an at-rest RO box.
 # Only the chain reader is used in-engine (no `git` binary needed).

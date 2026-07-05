@@ -1498,6 +1498,15 @@ name = "depot"
 version = "0.0.0"
 
 [[package]]
+name = "depot-cache"
+version = "0.0.0"
+dependencies = [
+ "depot",
+ "hex",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "depot-vbf"
 version = "0.0.0"
 dependencies = [
@@ -5385,6 +5394,7 @@ dependencies = [
  "clap",
  "crossterm",
  "depot",
+ "depot-cache",
  "dhcproto",
  "domain",
  "findutils",
