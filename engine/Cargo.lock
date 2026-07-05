@@ -8450,6 +8450,7 @@ name = "wikimak-wikipedia"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "depot",
  "hex",
  "libc",
  "rusqlite",

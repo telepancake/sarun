@@ -10,6 +10,9 @@ publish = false
 # f0 standalone zstd; f1/cold refPrefix-anchored on the next-newer
 # record. `experimental` exposes ZSTD_CCtx_refPrefix.
 zstd = { workspace = true, features = ["experimental"] }
+# The RO-attachment readout half (gimir/depot `Readout`) — chip 2 of
+# ATTACH-CONVERGENCE.md.
+depot = { path = "../../depot" }
 wikimak-depot.workspace = true
 wikimak-mediawiki = { workspace = true, default-features = false }
 strpool.workspace = true

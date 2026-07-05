@@ -13,6 +13,7 @@ pub mod error;
 pub(crate) mod frames;
 pub mod import;
 pub mod instance;
+pub mod readout;
 pub mod revision;
 pub mod schema;
 #[cfg(feature = "fetch")]

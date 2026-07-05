@@ -18,6 +18,8 @@
 //! duplicate append — the watermark write is tiny, so the window is,
 //! too; `update` is idempotent across completed drafts either way.
 
+pub mod readout;
+
 use std::collections::BTreeMap;
 #[cfg(feature = "fetch")]
 use std::io::Read;

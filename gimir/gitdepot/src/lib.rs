@@ -38,6 +38,7 @@ use depot::codec;
 use depot::{Attrs, BlobOp, Layer, Node};
 
 pub mod chain;
+pub mod readout;
 
 // ------------------------------------------------------------------ meta
 

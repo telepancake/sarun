@@ -1692,7 +1692,7 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
                                                 "error": e.to_string()}),
                     }
                 }
-                ids.push(ro);
+                ids.push(crate::capture::RoAttachment::Box(ro));
             }
             b.set_ro_attachments(ids);
             json!({"ok": true})
@@ -3316,8 +3316,8 @@ fn attach_ro_layer(ov: &crate::overlay::Overlay,
     gb.set_meta("name", name);
     gb.load_mirror();
     ov.add_box(std::sync::Arc::new(gb));
-    let mut ids = b.ro_attachments();
-    ids.push(gid);
+    let mut ids = b.ro_attachment_list();
+    ids.push(crate::capture::RoAttachment::Box(gid));
     b.set_ro_attachments(ids);
     Ok(gid)
 }

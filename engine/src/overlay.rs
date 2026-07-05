@@ -716,7 +716,7 @@ impl Overlay {
         // fall through to host (or Absent under no_host_fallback), missing
         // every layer below. Idempotent — already-loaded ancestors are kept.
         self.hydrate_chain(parent);
-        for ro in self.box_of(bid_of_added).map(|b| b.ro_attachments())
+        for ro in self.box_of(bid_of_added).map(|b| b.ro_attachment_box_ids())
             .unwrap_or_default()
         {
             self.hydrate_chain(Some(ro));
@@ -736,7 +736,7 @@ impl Overlay {
             if let Some(b) = self.inner.boxes.read().unwrap().get(&id) {
                 // already live — but its parents/attachments may need work.
                 work.extend(b.parent());
-                work.extend(b.ro_attachments());
+                work.extend(b.ro_attachment_box_ids());
                 continue;
             }
             // Open the at-rest sqlar; `BoxState::create` is a CREATE-IF-NOT-
@@ -748,7 +748,7 @@ impl Overlay {
                 Ok(pb) => {
                     pb.load_mirror();
                     work.extend(pb.parent());
-                    work.extend(pb.ro_attachments());
+                    work.extend(pb.ro_attachment_box_ids());
                     self.inner.boxes.write().unwrap()
                         .insert(pb.id, Arc::new(pb));
                 }
@@ -985,7 +985,7 @@ impl Overlay {
             if out.len() >= 64 { break; }
             out.push(id);
             let Some(b) = self.box_of(id) else { break };
-            for ro in b.ro_attachments() {
+            for ro in b.ro_attachment_box_ids() {
                 if out.len() >= 64 { break; }
                 out.push(ro);
             }
@@ -1005,7 +1005,7 @@ impl Overlay {
             seen += 1;
             if seen > 64 { break; }
             let Some(b) = self.box_of(id) else { break };
-            for ro in b.ro_attachments() {
+            for ro in b.ro_attachment_box_ids() {
                 if let Some(rb) = self.box_of(ro) {
                     if rb.entry(rel).is_some() {
                         return true;

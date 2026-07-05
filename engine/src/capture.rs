@@ -17,6 +17,35 @@ use std::sync::RwLock;
 use rusqlite::Connection;
 use rusqlite::params;
 
+/// One row of a box's RO-attachment list (§8). Serialized untagged so
+/// the meta JSON stays backward/forward compatible: a bare number is a
+/// Box row (the historical Vec<i64> format — old metas parse unchanged
+/// and int-only lists serialize byte-identically), an object is an
+/// external reference into a mirror store, served through the readout
+/// trait instead of an imported copy (gimir/ATTACH-CONVERGENCE.md).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum RoAttachment {
+    Box(i64),
+    Ext(ExtRef),
+}
+
+/// A pinned external attachment: which store, and which immutable rev.
+/// `rev` pins content, never position — git = full commit sha (frame
+/// indices shift when update() prepends), wiki = head rev_id, ietf =
+/// head draft rev. `name` is the display identity the UI shows.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExtRef {
+    pub kind: String,
+    pub store: String,
+    #[serde(rename = "ref")]
+    pub refname: String,
+    pub rev: String,
+    #[serde(default)]
+    pub prefix: String,
+    pub name: String,
+}
+
 use crate::paths;
 
 pub const S_IFCHR: u32 = 0o020000; // tombstone mode, matches the Python engine
@@ -245,14 +274,14 @@ pub struct BoxState {
     // pipeline's process, so stamping that file's last_writer process row with the
     // pipeline id needs no timing/clock comparison at all.
     brush_links: Mutex<Vec<(i64, Vec<String>)>>,
-    // RO attachments (DEPOT-DESIGN.md §8): ordered box ids whose layers
+    // RO attachments (DEPOT-DESIGN.md §8): the ordered list of layers
     // this box references READ-ONLY, conceptually between this box and
     // its parent in the lookup chain. Any mutation of a key an
     // attachment matches is EROFS — which is what guarantees the
     // captured layer is independent of the attachments (copy-up is the
     // only path lower content takes into the upper, and it is exactly
     // the rejected operation). Persisted in meta for rerun.
-    ro_attachments: Mutex<Vec<i64>>,
+    ro_attachments: Mutex<Vec<RoAttachment>>,
     // The brushprov row id of the currently-executing pipeline (0 = none).
     // Set by record_brush_prov, cleared by brush_prov_done. Used by
     // add_output to stamp each output row with its pipeline.
@@ -525,8 +554,8 @@ impl BoxState {
             "SELECT value FROM meta WHERE key='ro_attachments'", [],
             |r| r.get::<_, String>(0))
         {
-            if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&s) {
-                *self.ro_attachments.lock().unwrap() = ids;
+            if let Ok(rows) = serde_json::from_str::<Vec<RoAttachment>>(&s) {
+                *self.ro_attachments.lock().unwrap() = rows;
             }
         }
         let mut kinds = self.kinds.write().unwrap();
@@ -837,16 +866,26 @@ impl BoxState {
 
 
 
-    pub fn ro_attachments(&self) -> Vec<i64> {
+    /// Only the box-id rows — what the hydrate walk and the id-based
+    /// chain hops consume. External rows are invisible here.
+    pub fn ro_attachment_box_ids(&self) -> Vec<i64> {
+        self.ro_attachments.lock().unwrap().iter()
+            .filter_map(|r| match r { RoAttachment::Box(id) => Some(*id),
+                                      RoAttachment::Ext(_) => None })
+            .collect()
+    }
+
+    /// The full ordered list, box and external rows alike.
+    pub fn ro_attachment_list(&self) -> Vec<RoAttachment> {
         self.ro_attachments.lock().unwrap().clone()
     }
 
     /// Replace the RO attachment list (ordered, topmost first) and
     /// persist it in meta so a rerun reopens with the same view.
-    pub fn set_ro_attachments(&self, ids: Vec<i64>) {
-        let json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into());
+    pub fn set_ro_attachments(&self, rows: Vec<RoAttachment>) {
+        let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
         self.set_meta("ro_attachments", &json);
-        *self.ro_attachments.lock().unwrap() = ids;
+        *self.ro_attachments.lock().unwrap() = rows;
     }
 
     pub fn set_cur_brush_pipeline(&self, id: i64) {
@@ -1150,4 +1189,40 @@ impl BoxState {
 
 
 
+}
+
+#[cfg(test)]
+mod ro_attachment_tests {
+    use super::*;
+
+    // The untagged serde is the compat contract: historical Vec<i64>
+    // metas parse, and int-only lists serialize byte-identically so a
+    // box that never gains an external attachment never changes format.
+    #[test]
+    fn old_format_round_trips_byte_identical() {
+        let rows: Vec<RoAttachment> = serde_json::from_str("[3,7]").unwrap();
+        assert!(matches!(rows[..], [RoAttachment::Box(3), RoAttachment::Box(7)]));
+        assert_eq!(serde_json::to_string(&rows).unwrap(), "[3,7]");
+    }
+
+    #[test]
+    fn mixed_list_round_trips() {
+        let j = r#"[7,{"kind":"git","store":"/m/s","ref":"main","rev":"abc","prefix":"sdk","name":"git:x/main@abc"}]"#;
+        let rows: Vec<RoAttachment> = serde_json::from_str(j).unwrap();
+        let RoAttachment::Ext(e) = &rows[1] else { panic!("ext row") };
+        assert_eq!((e.kind.as_str(), e.refname.as_str(), e.rev.as_str()),
+                   ("git", "main", "abc"));
+        let back: Vec<RoAttachment> =
+            serde_json::from_str(&serde_json::to_string(&rows).unwrap()).unwrap();
+        assert!(matches!(back[0], RoAttachment::Box(7)));
+        assert!(matches!(&back[1], RoAttachment::Ext(e2) if e2.prefix == "sdk"));
+    }
+
+    // Missing prefix (older ext rows or hand-written) defaults empty.
+    #[test]
+    fn ext_prefix_defaults_empty() {
+        let j = r#"[{"kind":"wiki","store":"/w","ref":"12","rev":"99","name":"wiki:12@99"}]"#;
+        let rows: Vec<RoAttachment> = serde_json::from_str(j).unwrap();
+        assert!(matches!(&rows[0], RoAttachment::Ext(e) if e.prefix.is_empty()));
+    }
 }
