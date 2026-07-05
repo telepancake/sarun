@@ -134,6 +134,15 @@ pub fn display_path(boxes: &BTreeMap<i64, Box_>, box_id: i64) -> String {
 }
 
 pub fn session_dict(boxes: &BTreeMap<i64, Box_>, b: &Box_) -> Value {
+    // The DAG edges (DEPOT-DESIGN.md §8): the MAIN parent first (the tree
+    // the sessions pane flattens by), then RO attachments. The UI's
+    // sideways navigation cycles these.
+    let mut parents: Vec<i64> = b.parent.into_iter().collect();
+    if let Some(j) = b.meta.get("ro_attachments") {
+        if let Ok(ids) = serde_json::from_str::<Vec<i64>>(j) {
+            parents.extend(ids);
+        }
+    }
     json!({
         "session_id": b.box_id.to_string(),
         "cmd": b.cmd,
@@ -148,6 +157,10 @@ pub fn session_dict(boxes: &BTreeMap<i64, Box_>, b: &Box_) -> Value {
         "run_pid": 0,
         "run_pidfd": -1,
         "parent_box_id": b.parent,
+        // The DAG edges (DEPOT-DESIGN.md §8): the MAIN parent first (the
+        // tree the sessions pane flattens by), then RO attachments. The
+        // UI's sideways navigation cycles these.
+        "parents": parents,
         "started": b.started,
         "pid": 0,
         "status": "finished",

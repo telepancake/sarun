@@ -712,6 +712,13 @@ struct App {
     /// so all edges show). Toggled with `f`.
     edges_running_only: bool,
     sel_session: usize,
+    /// DAG sideways navigation (sessions pane): the node the cursor LAST
+    /// moved away from vertically, and whether it moved UP. Arriving by
+    /// Up means the current row is one of that node's PARENTS — Left/
+    /// Right cycles them (main parent + RO attachments). Arriving by
+    /// Down means the current row is one of its children — Left/Right
+    /// cycles the siblings (every node listing it among `parents`).
+    nav_from: Option<(String, bool)>,
     sel_change: usize,
     /// Multi-select marks for batch apply/discard/delete on the Boxes and
     /// Changes lists. Keys are stable row identities (a box's session_id, or a
@@ -964,6 +971,7 @@ impl App {
             edges_view: None, edges_view_sid: None, edges_total: 0, edges_window_start: 0,
             edges_running_only: true,
             sel_session: 0,
+            nav_from: None,
             sel_change: 0,
             marks: std::collections::HashSet::new(),
             mark_scope: None,
@@ -1058,6 +1066,82 @@ impl App {
             .and_then(|c| c.get("path"))
             .and_then(Value::as_str)
             .map(String::from)
+    }
+
+    fn session_id_at(&self, i: usize) -> Option<String> {
+        self.sessions.get(i)
+            .and_then(|s| s.get("session_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn session_index_of(&self, id: &str) -> Option<usize> {
+        self.sessions.iter().position(|s| {
+            s.get("session_id").and_then(Value::as_str) == Some(id)
+        })
+    }
+
+    /// The DAG parents of a session row, as session-id strings (main
+    /// parent first, then RO attachments — the `parents` array).
+    fn session_parents(&self, id: &str) -> Vec<String> {
+        self.session_index_of(id)
+            .and_then(|i| self.sessions[i].get("parents"))
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_i64)
+                      .map(|n| n.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every session listing `id` among its parents (main OR attachment),
+    /// in list order — the explicit DAG children.
+    fn session_children(&self, id: &str) -> Vec<String> {
+        let target: Option<i64> = id.parse().ok();
+        self.sessions.iter().filter(|s| {
+            s.get("parents").and_then(Value::as_array).is_some_and(|a| {
+                a.iter().filter_map(Value::as_i64).any(|p| Some(p) == target)
+            })
+        }).filter_map(|s| s.get("session_id").and_then(Value::as_str))
+          .map(str::to_string).collect()
+    }
+
+    /// DAG sideways navigation: boxes (and build targets, and git) form a
+    /// DAG, not a tree — the list keeps ONE parent as "main" for the tree
+    /// rendering, and Left/Right cycles the alternatives of the last
+    /// vertical traversal: arrived by Up → all PARENTS of the node we
+    /// left; arrived by Down → all its explicit children (the siblings
+    /// of the current row along that edge).
+    fn sideways(&mut self, step: isize) {
+        if self.focus != Pane::Sessions {
+            return;
+        }
+        let Some((from_id, arrived_up)) = self.nav_from.clone() else {
+            self.status = "sideways: move up/down first".into();
+            return;
+        };
+        let ring = if arrived_up {
+            self.session_parents(&from_id)
+        } else {
+            self.session_children(&from_id)
+        };
+        if ring.is_empty() {
+            return;
+        }
+        let cur_id = self.session_id_at(self.sel_session);
+        let pos = cur_id.as_deref()
+            .and_then(|c| ring.iter().position(|r| r == c));
+        let next = match pos {
+            Some(p) => (p as isize + step).rem_euclid(ring.len() as isize) as usize,
+            None => 0,
+        };
+        if let Some(i) = self.session_index_of(&ring[next]) {
+            if i != self.sel_session {
+                self.sel_session = i;
+                self.on_box_cursor_moved();
+            }
+            let kind = if arrived_up { "parent" } else { "child" };
+            self.status = format!("{kind} {}/{} of {}",
+                                  next + 1, ring.len(), from_id);
+        }
     }
 
     fn refresh_sessions(&mut self) {
@@ -2945,6 +3029,8 @@ impl App {
         match self.focus {
             Pane::Sessions => {
                 if self.sel_session + 1 < self.sessions.len() {
+                    self.nav_from = self.session_id_at(self.sel_session)
+                        .map(|id| (id, false));
                     self.sel_session += 1;
                     self.on_box_cursor_moved();
                 }
@@ -3026,6 +3112,8 @@ impl App {
         match self.focus {
             Pane::Sessions => {
                 if self.sel_session > 0 {
+                    self.nav_from = self.session_id_at(self.sel_session)
+                        .map(|id| (id, true));
                     self.sel_session -= 1;
                     self.on_box_cursor_moved();
                 }
@@ -10201,6 +10289,13 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     KeyCode::Down if ctrl && app.focus == Pane::Rules => app.move_rule(1),
                     KeyCode::Down => app.move_down(),
                     KeyCode::Up => app.move_up(),
+                    // DAG sideways (sessions pane): cycle the alternatives
+                    // of the last vertical traversal — all parents (main +
+                    // RO attachments) or all explicit children.
+                    KeyCode::Left if app.focus == Pane::Sessions
+                        && !app.right_focused => app.sideways(-1),
+                    KeyCode::Right if app.focus == Pane::Sessions
+                        && !app.right_focused => app.sideways(1),
                     KeyCode::PageDown => app.page_down(),
                     KeyCode::PageUp => app.page_up(),
                     KeyCode::Home => app.move_home(),
@@ -10322,6 +10417,68 @@ pub fn ui_main(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// DAG sideways navigation: the sessions list flattens by MAIN
+    /// parent, and Left/Right cycles the alternatives of the last
+    /// vertical traversal — all parents (main + RO attachments) when the
+    /// cursor arrived by Up, all explicit children when it arrived by
+    /// Down. Pure App-state test: no engine needed.
+    #[test]
+    fn sessions_sideways_cycles_dag_edges() {
+        let mut app = headless_app();
+        app.focus = Pane::Sessions;
+        // DAG: box 3 has main parent 1 and RO attachment 2; boxes 4 and 5
+        // are children of 1 (4 by main parent, 5 by attachment).
+        let row = |id: i64, path: &str, parents: Vec<i64>| {
+            serde_json::json!({
+                "session_id": id.to_string(), "box_id": id, "path": path,
+                "parents": parents, "name": format!("b{id}"),
+            })
+        };
+        app.sessions = vec![
+            row(1, "1", vec![]),
+            row(4, "1.4", vec![1]),
+            row(5, "1.5", vec![1]),
+            row(2, "2", vec![]),
+            row(3, "2.3", vec![1, 2]),
+        ];
+        // Stand on box 3 (index 4), move Up: we arrive on row index 3
+        // (box 2). nav_from = (3, arrived-by-up) → sideways cycles box
+        // 3's PARENTS {1, 2}.
+        app.sel_session = 4;
+        app.move_up();
+        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("2"));
+        app.sideways(1);
+        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("1"),
+                   "cycles to the other parent");
+        app.sideways(1);
+        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("2"),
+                   "wraps around the parent ring");
+        app.sideways(-1);
+        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("1"));
+
+        // Stand on box 1 (index 0), move Down: arrive on 1.4. nav_from =
+        // (1, arrived-by-down) → sideways cycles box 1's explicit
+        // children {4, 5, 3} — 3 is a child via its RO attachment edge.
+        app.sel_session = 0;
+        app.move_down();
+        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("4"));
+        app.sideways(1);
+        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("5"));
+        app.sideways(1);
+        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("3"),
+                   "attachment edge counts as an explicit child");
+        app.sideways(1);
+        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("4"),
+                   "wraps around the sibling ring");
+
+        // No prior vertical traversal → sideways is a no-op with a hint.
+        app.nav_from = None;
+        let before = app.sel_session;
+        app.sideways(1);
+        assert_eq!(app.sel_session, before);
+    }
+
     use super::*;
     use std::process::Child;
     use std::process::Command;
@@ -11385,6 +11542,7 @@ mod tests {
     /// no live engine.
     fn headless_app() -> App {
         App {
+            nav_from: None,
             sock: String::new(),
             sessions: vec![],
             changes: vec![],
