@@ -854,6 +854,13 @@ struct App {
     /// view's right column instead of the normal detail body. Stays
     /// false on PTY full-screen mode (Pane::Pty manages itself).
     pty_in_right: bool,
+    /// User override: force the outer terminal's mouse capture OFF even while
+    /// a focused PTY child (carbonyl, vim) wants mouse reporting, so the
+    /// terminal's native click-drag SELECTION + copy works. Toggled with F6 in
+    /// the PTY pane. Default false — mouse capture is otherwise "smart" (it
+    /// follows keyboard focus AND the child's wish; see the want_mouse block
+    /// in the main loop).
+    mouse_release: bool,
     /// F9 menu navigation: when true, the menubar cursor is active
     /// and arrow keys move between top-level menu chips. Enter
     /// activates the chip under the cursor (same as pressing its
@@ -1054,7 +1061,7 @@ impl App {
             f_pipelines: ViewFilter::default(),
             f_edges: ViewFilter::default(),
             should_quit: false,
-            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], vars_query: (String::new(), String::new()), vars_any: false, vars_rows: vec![], sel_var: 0, sel_var_item: 0, pty_in_right: false, menu_nav: false, menu_sel: 0,
+            ptys: vec![], sel_pty: 0, pty_esc_at: None, right_focused: false, right_scroll: 0, right_scroll_max: std::cell::Cell::new(0), out_follow_scroll: std::cell::Cell::new(0), err_only: false, nav_history: vec![], vars_query: (String::new(), String::new()), vars_any: false, vars_rows: vec![], sel_var: 0, sel_var_item: 0, pty_in_right: false, mouse_release: false, menu_nav: false, menu_sel: 0,
             oci_images: vec![],
             launch_net: 0,
             launch_env: false,
@@ -6967,7 +6974,10 @@ fn fkey_labels(app: &App) -> [&'static str; 11] {
         "Scrn-",    // F3
         if pty_pane { "PtyNext" } else { "Win+" }, // F4
         if pty_pane { "PtyPrev" } else { "Win-" }, // F5
-        if sessions { "Rename" } else { "·" }, // F6
+        // F6: in the PTY pane, toggle the mouse between the app (carbonyl/vim)
+        // and the terminal's native drag-select/copy — label flips with state.
+        if pty_pane { if app.mouse_release { "Grab" } else { "Select" } }
+        else if sessions { "Rename" } else { "·" }, // F6
         if pty_pane { "PtyNew" }
         else if sessions { "Image+" }
         else if rules { "NewRule" }
@@ -11358,15 +11368,22 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             if app.should_quit {
                 break;
             }
-            // Mouse capture tracks the CHILD's wish, not the pane's mere
-            // presence: only while the visible PTY's child has mouse
-            // reporting on (carbonyl, vim-with-mouse) do we steal the
-            // outer terminal's mouse; otherwise native click-drag
-            // selection keeps working (see the frameless-body comment in
-            // draw()).
+            // Mouse capture is SMART: we steal the outer terminal's mouse only
+            // when ALL of (a) a PTY pane has keyboard focus, (b) that PTY is
+            // visible, and (c) its child actually asked for mouse reporting
+            // (carbonyl, vim-with-mouse). Otherwise native click-drag SELECTION
+            // + copy keeps working — including when an embedded carbonyl is
+            // still running but the user has Tab'd back to a list pane (mouse
+            // follows focus, exactly like the keyboard does). The F6 override
+            // (mouse_release) forces capture off even on a focused grabbing
+            // child, so you can select/copy from carbonyl itself.
             let want_mouse = {
                 let (tc, tr) = terminal::size().unwrap_or((80, 24));
-                pty_grid_rect(&app, tc, tr).is_some()
+                let pty_focused = app.focus == Pane::Pty
+                    || (app.pty_in_right && app.right_focused && !app.ptys.is_empty());
+                !app.mouse_release
+                    && pty_focused
+                    && pty_grid_rect(&app, tc, tr).is_some()
                     && app.cur_pty().is_some_and(|p| p.mouse_grabbed())
             };
             if want_mouse != mouse_captured {
@@ -11548,6 +11565,21 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         continue;
                     }
                     if matches!(k.code, KeyCode::F(8)) { app.pty_kill(); continue; }
+                    if matches!(k.code, KeyCode::F(6)) {
+                        // Toggle the mouse between the child (carbonyl/vim get
+                        // clicks + scroll) and the outer terminal (native
+                        // drag-select + copy). The want_mouse block above
+                        // reconciles the actual capture state next iteration.
+                        app.mouse_release = !app.mouse_release;
+                        app.status = if app.mouse_release {
+                            "mouse released to the terminal — drag to select/copy \
+                             · F6 to hand it back to the app".into()
+                        } else {
+                            "mouse grabbed by the app — clicks/scroll go to the \
+                             page · F6 to release for selection".into()
+                        };
+                        continue;
+                    }
                     if matches!(k.code, KeyCode::F(11)) {
                         // F11 from full-screen PTY: shrink the PTY into
                         // the Sessions view's right column (default
@@ -13446,6 +13478,23 @@ mod tests {
         }
         assert!(app.load_job.is_none(), "job must complete");
         assert!(app.status.contains("oci load"), "failure surfaced: {}", app.status);
+    }
+
+    /// F6 in the PTY pane toggles the mouse between the app and the terminal's
+    /// native selection; its F-keybar label flips with the state so the user
+    /// can read what pressing it will do.
+    #[test]
+    fn f6_mouse_toggle_label_flips() {
+        let mut app = headless_app();
+        app.focus = Pane::Pty;
+        assert_eq!(fkey_labels(&app)[5], "Select",
+                   "grabbed → F6 offers to release for selection");
+        app.mouse_release = true;
+        assert_eq!(fkey_labels(&app)[5], "Grab",
+                   "released → F6 offers to hand the mouse back to the app");
+        // Outside the PTY pane F6 keeps its list-pane meaning (Rename on Boxes).
+        app.focus = Pane::Sessions;
+        assert_eq!(fkey_labels(&app)[5], "Rename");
     }
 
     /// The Network/Web pane (DESIGN-web.md W4) renders the box's webcap rows:
