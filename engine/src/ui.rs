@@ -7846,8 +7846,12 @@ impl App {
             }
         };
         self.ins_stack[pi].sel = next;
+        // Replace the top frame, building it with the old top popped off so the
+        // hint dedup checks only true ancestors (see ins_reload) — a sibling
+        // that's the first of its kind in the chain must keep its hint.
+        self.ins_stack.pop();
         let frame = self.ins_frame(node);
-        *self.ins_stack.last_mut().unwrap() = frame;
+        self.ins_stack.push(frame);
         self.ins_refresh_card();
         let parent = &self.ins_stack[pi];
         self.status = format!("sibling {}/{}", next + 1, parent.entries.len());
@@ -7858,9 +7862,14 @@ impl App {
         let Some(f) = self.ins_stack.last() else { return };
         let node = f.node.clone();
         let sel = f.sel;
+        // Build with the frame we're replacing OFF the stack: ins_frame's
+        // first-occurrence hint dedup (which skips a hint an ancestor already
+        // shows) would otherwise count the old top against its own rebuild and
+        // strip the hint — leaving a nested child to wrongly re-teach it.
+        self.ins_stack.pop();
         let mut frame = self.ins_frame(node);
         frame.sel = sel.min(frame.entries.len().saturating_sub(1));
-        *self.ins_stack.last_mut().unwrap() = frame;
+        self.ins_stack.push(frame);
         self.ins_refresh_card();
         self.status = "inspector: reloaded".into();
     }
