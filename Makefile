@@ -43,6 +43,9 @@ deps: ## Install system packages (FUSE, bubblewrap; iproute2 + tshark for net te
 vendor: ## Assemble engine/vendor/ from pinned upstreams + vendor-patches/ series
 	python3 scripts/vendor.py
 
+# The addin set the sarun runner requires of the sud wrappers.
+SUD_ADDINS := sud/trace sud/path_remap sud/cmd-rewrite sud/fake-exec sud/inramfs
+
 .PHONY: engine
 engine: vendor ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
 	@command -v uv >/dev/null || { echo "engine needs uv (https://docs.astral.sh/uv/)"; exit 1; }
@@ -51,6 +54,14 @@ engine: vendor ## Build the engine (fully-static musl binary; cargo-zigbuild + z
 	cd engine && PATH="$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
 	  cargo zigbuild --release --target x86_64-unknown-linux-musl
 	@ln -sfn engine/target/x86_64-unknown-linux-musl/release/sarun sarun
+	@# sud is the DEFAULT run backend: the wrappers must sit next to the
+	@# engine binary (runner::sud_wrapper_paths resolves the sibling).
+	@# sud64 is required; sud32 needs the -m32 toolchain and is best-effort
+	@# (32-bit targets fail loud at run time without it).
+	$(MAKE) -C tv sud64 SUD_ADDINS="$(SUD_ADDINS)"
+	-$(MAKE) -C tv sud32 SUD_ADDINS="$(SUD_ADDINS)" 2>/dev/null
+	@cp tv/sud64 engine/target/x86_64-unknown-linux-musl/release/sud64
+	@-cp tv/sud32 engine/target/x86_64-unknown-linux-musl/release/sud32 2>/dev/null
 	@echo "→ ./sarun → engine/target/x86_64-unknown-linux-musl/release/sarun"
 
 # ---- Tests ----------------------------------------------------------------

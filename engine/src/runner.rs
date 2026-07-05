@@ -915,11 +915,18 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
 }
 
 /// Resolve the sud64/sud32 wrapper binary paths. `$SARUN_SUD64` / `$SARUN_SUD32`
-/// override; otherwise `sud64` on PATH and its dir-sibling `sud32` (the
-/// cross-class contract the wrapper itself uses to find its twin).
+/// override; otherwise a `sud64` SIBLING OF THE ENGINE BINARY (`make engine`
+/// installs the wrappers next to it — what makes sud viable as the default
+/// backend), else `sud64` on PATH. sud32 is always the dir-sibling of
+/// whatever sud64 resolved to (the cross-class contract the wrapper itself
+/// uses to find its twin).
 fn sud_wrapper_paths() -> (String, String) {
     let sud64 = std::env::var("SARUN_SUD64")
         .ok().filter(|s| !s.is_empty())
+        .or_else(|| {
+            let sib = std::env::current_exe().ok()?.with_file_name("sud64");
+            sib.is_file().then(|| sib.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| "sud64".to_string());
     let sud32 = std::env::var("SARUN_SUD32")
         .ok().filter(|s| !s.is_empty())
