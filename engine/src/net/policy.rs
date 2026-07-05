@@ -4,10 +4,12 @@
 // box / exe / cwd / arg. The matcher engine in rules.rs is reused
 // verbatim — only the field resolver differs by context.
 //
-// At connection time the dispatcher calls `decide` with the per-conn
-// subject; on Deny we close, on Allow we proceed, on Inspect we proceed
-// AND make sure MITM is on (for TLS that means we terminate; for HTTP
-// it's the same path so the bit is informational).
+// At connection time the dispatcher calls `decide`, which returns a
+// `rules::Action`: `Discard` closes the connection, `Apply`/`Passthrough`
+// proceed, and `Ask` banner-prompts the user (deny-if-no-TUI), optionally
+// persisting the answer as a new rule. HTTPS on the proceed paths is always
+// MITM-terminated (that's how the leaf cert + capture work); there is no
+// separate "inspect" verdict.
 
 use crate::rules::Action;
 

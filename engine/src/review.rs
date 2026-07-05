@@ -1321,17 +1321,23 @@ fn promote_record(e: &SrcEntry, src: i64, dst: i64,
                 std::fs::copy(&s, &dstb).map_err(|x| x.to_string())?;
             }
         }
+        // Propagate these like the row + blob above: a dropped ownership /
+        // rdev / xattr write would promote the file with the wrong uid/gid,
+        // a missing device number, or lost xattrs while apply reported
+        // success — a silent partial-corruption. Fail the apply instead.
         if let Some((u, g)) = e.owner {
-            let _ = cc.execute("INSERT OR REPLACE INTO ownership(name,uid,gid) \
-                                VALUES(?1,?2,?3)", params![rel, u, g]);
+            cc.execute("INSERT OR REPLACE INTO ownership(name,uid,gid) \
+                        VALUES(?1,?2,?3)", params![rel, u, g])
+              .map_err(|x| x.to_string())?;
         }
         if let Some(dev) = e.rdev {
-            let _ = cc.execute("INSERT OR REPLACE INTO rdev(name,dev) VALUES(?1,?2)",
-                               params![rel, dev]);
+            cc.execute("INSERT OR REPLACE INTO rdev(name,dev) VALUES(?1,?2)",
+                       params![rel, dev]).map_err(|x| x.to_string())?;
         }
         for (k, v) in &e.xattrs {
-            let _ = cc.execute("INSERT OR REPLACE INTO xattr(name,key,value) \
-                                VALUES(?1,?2,?3)", params![rel, k, v]);
+            cc.execute("INSERT OR REPLACE INTO xattr(name,key,value) \
+                        VALUES(?1,?2,?3)", params![rel, k, v])
+              .map_err(|x| x.to_string())?;
         }
         Ok(())
         // cc is dropped here, releasing the write lock BEFORE the mirror refresh.

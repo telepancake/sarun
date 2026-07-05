@@ -3,9 +3,10 @@ use base64::Engine as _;
 // SAME protocol as the Python ChannelServer: {"type":"ui","verb":...} verb
 // calls, {"type":"subscribe"} converting the connection into a one-way event
 // feed, explicit errors for unknown types/verbs. The first datagram on a
-// connection may carry an SCM_RIGHTS pidfd (the register handshake); m2 does
-// not run boxes yet, so register is refused politely, but any received fds
-// are drained and closed so the protocol shape is honored.
+// connection may carry SCM_RIGHTS fds — the register handshake sends the
+// runner's pidfd (and, for a `-n` box, its TAP fd). `register` (below) fully
+// runs the box: it builds the overlay + capture state, equips the netns, and
+// turns the SAME connection into the box channel.
 
 use std::io::BufRead;
 use std::io::BufReader;

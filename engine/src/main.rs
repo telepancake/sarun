@@ -1,12 +1,18 @@
-// sarun-engine — milestone 1: a multithreaded read-only passthrough FUSE
-// filesystem over a lower root. The point of this milestone is NOT features —
-// it exists to measure the serving-loop scaling that the Python engine's
-// single GIL thread cannot deliver (see bench/FINDINGS.md "parallel builds").
+// sarun-engine — the standalone Rust engine + UI (see engine/DESIGN.md). One
+// static musl binary that is the whole product: a multithreaded FUSE overlay
+// with copy-on-write capture, the control socket + subscribe feed, per-box
+// `-n` networking (TAP + userland TCP/IP + MITM proxy), OCI, the oaita agent
+// runner, engine-held PTYs, and its own ratatui UI.
 //
-//   sarun-engine <mountpoint> [--lower /] [--threads N]
-//
-// Serves lookup/getattr/readdir(plus)/readlink/open/read, nothing else; every
-// answer comes straight from the lower tree (no overlay, no capture yet).
+// The subcommands are dispatched below in `main` — the big ones:
+//   (no args)                 start the engine (if needed) + interactive UI
+//   run [FLAGS] [NAME] -- CMD  run CMD in a captured box (see runner.rs)
+//   oci  load|run|build|…      OCI images + containers (see oci.rs)
+//   oaita gen|run|call|…       the agent runner (see oaita/)
+//   serve                      headless engine (the FUSE + control loop)
+// The bare `<mountpoint>` FUSE-passthrough mode below is the original m1
+// benchmark harness, kept for the serving-loop scaling measurement it exists
+// for (bench/FINDINGS.md "parallel builds"), not the product entry point.
 
 use std::path::PathBuf;
 use std::time::Duration;

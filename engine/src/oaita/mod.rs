@@ -21,11 +21,16 @@
 //   turns    — filename grammar, parse/load/write
 //   ids      — turn-id generation (5 lc letters)
 //   client   — minimal OpenAI HTTP/1.1 client; TCP+TLS or UDS transports
-//   gen      — `gen` (one model generation, streamed → turn file)
-//   call     — `call` (eval one tool call) and `run` (drive to settle)
-//   tools    — tool registry (act/shell/inspect/read), schema rendering
+//   cli      — argv parsing + the `gen`/`run`/`call`/… subcommand dispatch
+//   driver   — the generation + tool-call loop (`gen`, `call`, run-to-settle)
+//   tools    — tool registry (ask/shell/inspect/read/write/…), schema render
 //   exec     — executors: SarunExecutor (sarun box -- sh -c), LocalExecutor
 //   inspect  — inspect/read helpers
+//   budget   — per-box turn budget grant + chain debit
+//   hints    — first-occurrence teaching hints appended to tool results
+//   local    — `oaita local`: download a GGUF + serve a local endpoint
+//   models   — the model-picker catalog (live HF query + offline snapshot)
+//   structural — structured-output helpers
 //   proxy      — engine-side HTTP server: takes an `api.proxy` conn handed
 //                in via the FD broker, injects upstream auth, forwards to
 //                the configured LLM API, logs to sqlar

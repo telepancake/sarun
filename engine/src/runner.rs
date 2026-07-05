@@ -1,4 +1,6 @@
-// The box runner, ported to Rust (the ECHO/capture mux is a follow-on).
+// The box runner, ported to Rust. Capture is wired: `want_capture` (computed
+// from the box-mode flags) is threaded through register so the engine builds
+// the overlay + capture sinks for the box.
 // Supports NESTED launch: a `run` invoked inside a running box reaches the
 // engine by dialing the FD broker (SARUN_BROKER abstract UDS, served by the
 // parent inner), which hands back a fresh engine conn via SCM_RIGHTS; it
@@ -9,8 +11,9 @@
 //   run [NAME] -- CMD   host side: register the box with the engine, then bwrap
 //                       CMD onto the box's overlay root, exec'ing `inner`.
 //   inner --conn-fd N -- CMD   in-box pid-1-ish shim: holds the box channel fd
-//                       (its EOF on exit is the engine's teardown signal) and
-//                       execs CMD. Capture/echo will hang off this seam later.
+//                       (its EOF on exit is the engine's teardown signal),
+//                       serves the in-box FD broker, and execs CMD; output
+//                       capture rides the box channel when --capture is set.
 // This makes a box fully Rust end to end — no Python in the runtime path.
 
 use std::io::BufRead;

@@ -1351,8 +1351,15 @@ fn cli_build_worker(args: &[String]) -> i32 {
     };
     match run_dockerfile(context, &text, tag, net_mode, build_args) {
         Ok(top) => {
+            // --result-file is the ONLY channel handing the built image id
+            // back to the caller; a dropped write would report a successful
+            // build with no result. Surface it and fail.
             if let Some(rf) = result_file {
-                let _ = std::fs::write(&rf, serde_json::json!({"top_id": top}).to_string());
+                if let Err(e) = std::fs::write(
+                    &rf, serde_json::json!({"top_id": top}).to_string()) {
+                    eprintln!("sarun oci build: write --result-file {rf}: {e}");
+                    return 1;
+                }
             }
             0
         }

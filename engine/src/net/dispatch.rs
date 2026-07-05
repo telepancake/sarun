@@ -5,9 +5,10 @@
 //   • port 443 or TLS-sniffed             → mitm::serve_https
 //   • anything else                       → l4::forward
 // Before opening any upstream, we gate via `policy::decide` against the
-// rules file. On Deny we close the box-side stream immediately; on Allow
-// we proceed; on Inspect (HTTPS only) we ensure MITM is on (it is by
-// default for 443).
+// rules file (returns a `rules::Action`): `Discard` closes the box-side
+// stream immediately; `Apply`/`Passthrough` proceed; `Ask` banner-prompts
+// the user and may persist the answer as a rule. 443 is always MITM-
+// terminated on the proceed paths.
 
 use std::sync::Arc;
 
@@ -100,7 +101,7 @@ async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
                                 port, scheme.clone()).await;
             if v.is_persistent() {
                 let act = if v == Verdict::AllowSave { "apply" } else { "discard" };
-                if let Err(e) = append_rule_line(
+                if let Err(e) = prepend_rule_line(
                     &format!("{act} host:{host}\n"))
                 {
                     eprintln!("sarun-net: persist {act} host:{host}: {e}");
@@ -142,7 +143,7 @@ fn ipv4(o: [u8; 4]) -> String {
 /// gets asked again on the next dial. Writing through a tempfile +
 /// rename keeps the swap atomic so a concurrent reader can't see a
 /// half-written file.
-fn append_rule_line(line: &str) -> std::io::Result<()> {
+fn prepend_rule_line(line: &str) -> std::io::Result<()> {
     use std::io::Write;
     let dir = crate::paths::config_home();
     std::fs::create_dir_all(&dir)?;

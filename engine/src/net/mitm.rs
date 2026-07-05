@@ -7,10 +7,12 @@
 // upstream's response. Headers are forwarded verbatim except `Host:`
 // which is rewritten to the upstream authority.
 //
-// For HTTPS the upstream is opened via tokio-rustls + a webpki roots
-// trust store (we trust the real internet just like a browser would).
-// The leaf cert we mint to talk to the box is generated on demand from
-// the engine CA and cached by SNI.
+// For HTTPS the upstream is opened via tokio-rustls trusting the OS CA
+// bundle, which `build_upstream_client_config` reads off disk itself
+// (/etc/ssl/certs/… — no rustls-native-certs/webpki-roots dep) — we trust
+// the real internet just like a browser would. The leaf cert we mint to
+// talk to the box is generated on demand from the engine CA and cached by
+// SNI.
 //
 // Both paths share one `KeyLogFile` per box, so a single tshark
 // `tls.keylog_file` decodes the whole pcapng.
