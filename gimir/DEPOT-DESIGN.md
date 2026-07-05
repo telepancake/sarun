@@ -373,6 +373,13 @@ this design, whatever its tests say.
 
 ## 10. Build order
 
+*Status 2026-07-05: steps 1–6 done; step 7's rotation half done (holes
+in the sqlar variant, overlay walk, `rotate` verb, liveness-tested);
+remaining: the hot variant with internal sharing (the one clause of §1
+still unimplemented anywhere), gitdepot moving onto depot-vbf (needs a
+caller-anchored frame mode to keep the measured view-anchored hybrid),
+step 8, and the git-ref RO-attachment resolver (§8).*
+
 1. **Node model + canonical encoding + layer algebra**, as a standalone
    crate with an in-memory reference variant: encode/decode round-trip,
    diff/squash, the rotation equivalences, the §6 corner fixtures. This is
