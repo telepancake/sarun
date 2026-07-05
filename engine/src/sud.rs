@@ -41,10 +41,6 @@ fn streams() -> &'static Mutex<HashMap<i64, Arc<Stream>>> {
     STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Take the box's stream state (if the runner streamed a trace), waiting
-/// up to 5 s for the pipe to drain — the runner closes its fd 1023 before
-/// asking for the sweep, so EOF beats the sud_ingest verb in the normal
-/// flow; the timeout only guards a wedged reader.
 /// Decode a raw sud TRACE stream (the `sudtrace` blob) into JSON event rows
 /// for the `sudtrace` control verb / the UI's Trace pane. Each row is
 /// `{ts_ns, kind, pid, tgid, ppid, extras, text}` where `kind` names the
@@ -89,6 +85,10 @@ pub fn decode_trace(bytes: &[u8]) -> serde_json::Value {
     json!({"ok": true, "events": rows, "truncated": truncated})
 }
 
+/// Take the box's stream state (if the runner streamed a trace), waiting
+/// up to 5 s for the pipe to drain — the runner closes its fd 1023 before
+/// asking for the sweep, so EOF beats the sud_ingest verb in the normal
+/// flow; the timeout only guards a wedged reader.
 pub fn take_stream(box_id: i64) -> Option<Arc<Stream>> {
     let s = streams().lock().unwrap().remove(&box_id)?;
     let (lock, cv) = &s.done;
@@ -101,6 +101,68 @@ pub fn take_stream(box_id: i64) -> Option<Arc<Stream>> {
     }
     drop(g);
     Some(s)
+}
+
+/// What a post-exit sweep folded into the box's sqlar: rows written and the
+/// per-path errors that didn't ingest (empty = a clean sweep).
+pub struct SweepReport {
+    pub ingested: usize,
+    pub errors: Vec<String>,
+}
+
+/// Sweep a finished sud box's captured state into its sqlar BoxState — the
+/// whole body behind the `sud_ingest` verb. Owns three sources: the overlay
+/// upper dir (`live/<id>/sud-up`), the inramfs /tmp store (keyed by the
+/// `sud_ir_key` meta), and the durable TRACE stream (`live/<id>/sud.trace`,
+/// folded into the sqlar so the `sudtrace` verb reads it there). `runpid` is
+/// the runner's host pid, the fallback writer for anything the trace stream
+/// didn't attribute. On a CLEAN sweep the upper dir + live trace file are
+/// pure residue (the sqlar is authoritative from here — reruns recreate it,
+/// nested launches export from it), so they're removed; on an errored sweep
+/// they're kept as the sole copy of whatever failed to ingest.
+pub fn sweep(b: &BoxState, id: i64, runpid: u32) -> SweepReport {
+    let live = crate::paths::live_home().join(id.to_string());
+    let upper = live.join("sud-up");
+    // take_stream waits for the trace pipe to drain, so the rel→writer
+    // attribution map is complete before the upper is swept.
+    let writers = take_stream(id)
+        .map(|s| s.writers.lock().unwrap().clone())
+        .unwrap_or_default();
+    let (mut ingested, mut errors) = ingest_upper(b, &upper, runpid, &writers);
+    // /tmp lives in the inramfs shared-memory store, not the upper dir —
+    // ingest it under the same rel→writer attribution and drop its shms.
+    if let Some(key) = b.get_meta("sud_ir_key").filter(|k| !k.is_empty()) {
+        let fallback = if runpid > 0 { b.writer_for(runpid) } else { 0 };
+        let (n, mut errs) = ingest_inramfs(b, &key, fallback, &writers);
+        ingested += n;
+        errors.append(&mut errs);
+    }
+    let trace_path = live.join("sud.trace");
+    if let Ok(bytes) = std::fs::read(&trace_path) {
+        b.set_sudtrace(&bytes);
+    }
+    if errors.is_empty() {
+        let _ = std::fs::remove_dir_all(&upper);
+        let _ = std::fs::remove_file(&trace_path);
+    }
+    SweepReport { ingested, errors }
+}
+
+/// Decode a box's durable TRACE blob to JSON event rows for the `sudtrace`
+/// verb / the UI Trace pane. Prefers the live BoxState's own connection when
+/// the box is running (no rival on-disk handle racing serve); else opens the
+/// at-rest sqlar. A box with no trace (every FUSE box) answers a clean error.
+pub fn trace_events_json(live: Option<Arc<BoxState>>, id: i64)
+                         -> serde_json::Value {
+    let blob = match live {
+        Some(b) => b.get_sudtrace(),
+        None => BoxState::create(id).ok().and_then(|b| b.get_sudtrace()),
+    };
+    match blob {
+        Some(bytes) => decode_trace(&bytes),
+        None => serde_json::json!({"ok": false,
+                                   "error": "box has no sud trace"}),
+    }
 }
 
 /// Spawn the reader thread for one sud box: tee `fd` (pipe read end,

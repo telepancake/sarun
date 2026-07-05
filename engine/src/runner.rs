@@ -22,6 +22,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::Value;
@@ -773,6 +774,16 @@ fn sud_proc_field(pid: i32, field: &str, fallback: i32) -> i32 {
 /// and, after the child exits, asks the engine (fresh conn, `sud_ingest`)
 /// to sweep the upper into the box's sqlar. The register conn stays open
 /// for the duration — its EOF after the sweep is the normal box teardown.
+/// `run --sud` (see engine/DESIGN-sud.md): run CMD under the sud64 wrapper
+/// instead of bwrap+FUSE. Registers with `want_sud`, gets the engine-owned
+/// upper directory back in the ack, sets up the sud launcher contract itself
+/// (fds 1022/1023, version atom, EXIT events), execs
+///   sud64 --remap-rule … resolved CMD
+/// and, after the child exits, asks the engine (fresh conn, `sud_ingest`) to
+/// sweep the upper into the box's sqlar. The register conn stays open for the
+/// duration — its EOF after the sweep is the normal box teardown.
+///
+/// The body is orchestration only; each labelled step is a named helper below.
 pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                net_mode: crate::net::NetMode, brush: bool,
                cmd: Vec<String>) -> i32 {
@@ -785,18 +796,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                    supported yet (see engine/DESIGN-sud.md).");
         return 2;
     }
-    let sud64 = std::env::var("SARUN_SUD64")
-        .ok().filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "sud64".to_string());
-    // The 32-bit twin: $SARUN_SUD32, else sud64's sibling (the wrapper
-    // itself derives its cross-class sibling the same way — dir(self) +
-    // "/sud32" — so keeping them adjacent is already the contract).
-    let sud32 = std::env::var("SARUN_SUD32")
-        .ok().filter(|s| !s.is_empty())
-        .unwrap_or_else(|| match sud64.rsplit_once('/') {
-            Some((dir, _)) => format!("{dir}/sud32"),
-            None => "sud32".to_string(),
-        });
+    let (sud64, sud32) = sud_wrapper_paths();
     let sock = paths::sock_path();
     let conn = match UnixStream::connect(&sock) {
         Ok(c) => c,
@@ -806,9 +806,15 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
             return 3;
         }
     };
-    // Trace pipe: the wrapper contract's fd 1023 becomes the WRITE end of a
-    // pipe whose READ end rides to the engine as an SCM_RIGHTS fd; the engine
-    // streams events live and tees the raw bytes to live/<id>/sud.trace.
+    // Networking BEFORE the trace pipe, so a tap/off setup failure returns
+    // without a half-open pipe to clean up.
+    let tap_fd = match sud_netns_setup(net_mode) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("sarun-engine run --sud: {e}"); return 1; }
+    };
+    // Trace pipe: the wrapper contract's fd 1023 is the WRITE end; the READ
+    // end rides to the engine as an SCM_RIGHTS fd (it streams events live and
+    // tees the raw bytes to live/<id>/sud.trace).
     let mut pfd = [0i32; 2];
     if unsafe { libc::pipe(pfd.as_mut_ptr()) } < 0 {
         eprintln!("sarun-engine: trace pipe: {}",
@@ -816,36 +822,144 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         return 1;
     }
     let (trace_r, trace_w) = (pfd[0], pfd[1]);
-    // Networking: same as a FUSE box. Tap mode → WE create the netns + TAP
-    // device (unshare(CLONE_NEWNET) moves THIS process into the fresh netns;
-    // the wrapper, spawned later, inherits it) and hand the engine the TAP
-    // fd; the engine wires it to its in-process TCP/IP stack (DHCP, DNS,
-    // HTTPS MITM). Off → an empty netns (every dial fails closed). Host →
-    // share the launcher's netns. Fail LOUD on tap setup error.
-    let tap_fd: Option<std::os::fd::OwnedFd> =
-        if net_mode == crate::net::NetMode::Tap {
-            match crate::net::tap::create_netns_tap() {
-                Ok(fd) => Some(fd),
-                Err(e) => {
-                    eprintln!("sarun-engine run --sud: tap setup failed: {e}");
-                    eprintln!("hint: `ls -l /dev/net/tun` should be 0666; \
-                               otherwise pass `--net host` or `--net off`");
-                    unsafe { libc::close(trace_r); libc::close(trace_w); }
-                    return 1;
-                }
-            }
-        } else { None };
-    if net_mode == crate::net::NetMode::Off {
-        // Empty netns so every dial fails closed — the wrapper (spawned
-        // later in this process's netns) inherits it. No bwrap to do it.
-        if let Err(e) = crate::net::tap::unshare_netns() {
-            eprintln!("sarun-engine run --sud: --net off netns: {e}");
-            unsafe { libc::close(trace_r); libc::close(trace_w); }
+    // Register (consumes tap_fd + trace_r as SCM_RIGHTS fds) and validate ack.
+    let ack = match sud_register(&conn, &cmd, env, &name, net_mode,
+                                 tap_fd, trace_r) {
+        Ok(a) => a,
+        Err(code) => { unsafe { libc::close(trace_w); } return code; }
+    };
+    let sid = ack.get("session_id").and_then(Value::as_str)
+        .unwrap_or("?").to_string();
+    let upper = ack.get("sud_upper").and_then(Value::as_str)
+        .unwrap_or("").to_string();
+    // Nested (same-in-same) sud box: the engine materialized each ancestor's
+    // captured state and hands the lower list back; the overlay stacks
+    // upper → lowers → host in that priority order.
+    let lowers: Vec<String> = ack.get("sud_lowers")
+        .and_then(Value::as_array)
+        .map(|a| a.iter()
+             .filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if upper.is_empty() {
+        eprintln!("sarun-engine: engine did not allocate a sud upper \
+                   (engine older than this runner?)");
+        unsafe { libc::close(trace_w); }
+        return 1;
+    }
+    eprintln!("sarun-engine: box {sid}  (sud upper: {upper})");
+    // -b brush: the box's shell IS the embedded brush, run as the TRACED
+    // target — the engine binary under the wrapper via `brush-sh`, so brush +
+    // coreutils/find/xargs + make(kati)/ninja(n2) all execute in one traced
+    // process. (Gap in DESIGN-sud.md: no box channel in the traced process, so
+    // semantic-provenance frames are skipped; provenance comes from the trace.)
+    let self_exe: Option<String> = std::env::current_exe().ok()
+        .and_then(|p| p.to_str().map(String::from));
+    let cmd = if brush {
+        let Some(exe) = self_exe.as_deref() else {
+            eprintln!("sarun-engine run --sud: -b needs current_exe()");
+            unsafe { libc::close(trace_w); }
+            return 1;
+        };
+        sud_brush_cmd(exe, &cmd)
+    } else { cmd };
+    // Probe the target the way sudtrace did: PATH-resolve, shebang, ELF class
+    // → pick sud32 or sud64 for the initial exec (the wrapper handles
+    // cross-class children itself via its dir-sibling paths).
+    let resolved = sud_resolve_target(&cmd[0]);
+    let shebang = sud_shebang(&resolved);
+    let probe = shebang.as_ref().map(|(i, _)| i.as_str())
+        .unwrap_or(resolved.as_str());
+    let wrapper = if sud_elf_class(probe) == 1 { &sud32 } else { &sud64 };
+    // Wrapper argv: the remap-rule flag block, then the target. Rule order is
+    // first-prefix-match-wins, so the narrow carve-outs precede the wide `/`
+    // overlay (each helper appends in that priority order).
+    let mut sc = Command::new(wrapper);
+    let ir_key = ack.get("sud_ir_key").and_then(Value::as_str).unwrap_or("");
+    sud_base_rules(&mut sc, ir_key);
+    let backing = ack.get("shm_dir").and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
+    let ca_pem = ack.get("ca_pem").and_then(Value::as_str).unwrap_or("");
+    let dns_ip = ack.get("dns_ip").and_then(Value::as_str).unwrap_or("");
+    sud_net_rules(&mut sc, net_mode, ca_pem, dns_ip, backing.as_deref());
+    if brush {
+        let exe = self_exe.as_deref().unwrap_or_default();
+        if let Err(e) = sud_shadow_rules(&mut sc, &upper, exe) {
+            eprintln!("sarun-engine run --sud: {e}");
+            unsafe { libc::close(trace_w); }
             return 1;
         }
     }
+    if let Err(code) = sud_overlay_rule(&mut sc, &upper, &lowers) {
+        unsafe { libc::close(trace_w); }
+        return code;
+    }
+    match &shebang {
+        Some((interp, arg)) => {
+            // Script: run the interpreter with the kernel's shebang argv shape
+            // (interp [arg] script args…).
+            sc.arg(interp);
+            if let Some(a) = arg { sc.arg(a); }
+            sc.arg(&resolved);
+            sc.args(&cmd[1..]);
+        }
+        None => { sc.args(&cmd); }
+    }
+    if let Some(d) = &chdir { sc.current_dir(d); }
+    // Launch under the wrapper contract and wait for the traced tree.
+    let code = sud_launcher_exec(sc, wrapper, trace_w);
+    // Sweep the upper into the box's sqlar on a FRESH conn (the register conn
+    // is the box channel; a verb on it would desync teardown).
+    sud_request_sweep(&sock, &sid);
+    drop(conn); // box channel EOF → teardown
+    code
+}
+
+/// Resolve the sud64/sud32 wrapper binary paths. `$SARUN_SUD64` / `$SARUN_SUD32`
+/// override; otherwise `sud64` on PATH and its dir-sibling `sud32` (the
+/// cross-class contract the wrapper itself uses to find its twin).
+fn sud_wrapper_paths() -> (String, String) {
+    let sud64 = std::env::var("SARUN_SUD64")
+        .ok().filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "sud64".to_string());
+    let sud32 = std::env::var("SARUN_SUD32")
+        .ok().filter(|s| !s.is_empty())
+        .unwrap_or_else(|| match sud64.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/sud32"),
+            None => "sud32".to_string(),
+        });
+    (sud64, sud32)
+}
+
+/// Set up the box's network namespace, exactly as a FUSE box does. Tap →
+/// create the netns + TAP device (unshare(CLONE_NEWNET) moves THIS process
+/// into the fresh netns; the wrapper, spawned later, inherits it) and return
+/// the TAP fd to hand the engine. Off → an empty netns where every dial fails
+/// closed. Host → share the launcher's netns. Fails loud on tap/off error.
+fn sud_netns_setup(net_mode: crate::net::NetMode)
+                   -> Result<Option<std::os::fd::OwnedFd>, String> {
+    match net_mode {
+        crate::net::NetMode::Tap =>
+            crate::net::tap::create_netns_tap().map(Some).map_err(|e|
+                format!("tap setup failed: {e}\n\
+                         hint: `ls -l /dev/net/tun` should be 0666; \
+                         otherwise pass `--net host` or `--net off`")),
+        crate::net::NetMode::Off =>
+            crate::net::tap::unshare_netns().map(|_| None)
+                .map_err(|e| format!("--net off netns: {e}")),
+        crate::net::NetMode::Host => Ok(None),
+    }
+}
+
+/// Send the sud register line with the ordered SCM_RIGHTS fd tail
+/// [pidfd, tap?, trace_r], drop our copies of the fds the engine dup'd
+/// (`tap_fd` + `trace_r` are consumed here), read the ack, and return it once
+/// validated. `Err(code)` carries the process exit code on any failure.
+fn sud_register(conn: &UnixStream, cmd: &[String], env: bool,
+                name: &Option<String>, net_mode: crate::net::NetMode,
+                tap_fd: Option<std::os::fd::OwnedFd>, trace_r: i32)
+                -> Result<Value, i32> {
     let reg = json!({"type": "register",
-                     "cmd": cmd, "prov": provenance(&cmd, env),
+                     "cmd": cmd, "prov": provenance(cmd, env),
                      "want_capture": false,
                      "want_direct": false,
                      "want_env": env,
@@ -855,87 +969,163 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                      "want_rerun": name.is_some()});
     let pidfd = pidfd_open(std::process::id() as i32);
     let tap_raw = tap_fd.as_ref().map(|f| f.as_raw_fd());
-    if !send_register_fds(&conn, format!("{reg}\n").as_bytes(), pidfd,
+    if !send_register_fds(conn, format!("{reg}\n").as_bytes(), pidfd,
                           tap_raw, Some(trace_r)) {
         eprintln!("sarun-engine: register write failed");
-        return 1;
+        return Err(1);
     }
     if pidfd >= 0 { unsafe { libc::close(pidfd); } }
     drop(tap_fd); // engine dup'd it; device stays alive on its fd + our netns
     unsafe { libc::close(trace_r); } // engine holds its dup now
     let mut line = String::new();
-    if BufReader::new(&conn).read_line(&mut line).is_err() {
+    if BufReader::new(conn).read_line(&mut line).is_err() {
         eprintln!("sarun-engine: register read failed");
-        return 1;
+        return Err(1);
     }
     let ack: Value = match serde_json::from_str(&line) {
-        Ok(v) => v, Err(_) => { eprintln!("sarun-engine: bad ack"); return 1; }
+        Ok(v) => v,
+        Err(_) => { eprintln!("sarun-engine: bad ack"); return Err(1); }
     };
     if ack.get("ok").and_then(Value::as_bool) != Some(true) {
         eprintln!("sarun-engine: {}",
                   ack.get("error").and_then(Value::as_str)
                       .unwrap_or("register failed"));
-        return 1;
+        return Err(1);
     }
-    let sid = ack.get("session_id").and_then(Value::as_str)
-        .unwrap_or("?").to_string();
-    let upper = ack.get("sud_upper").and_then(Value::as_str)
-        .unwrap_or("").to_string();
-    // Nested (same-in-same) sud box: the engine materialized each
-    // ancestor's captured state and hands the lower list back; the
-    // overlay stacks upper → lowers → host in that priority order.
-    let lowers: Vec<String> = ack.get("sud_lowers")
-        .and_then(Value::as_array)
-        .map(|a| a.iter()
-             .filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    if upper.is_empty() {
-        eprintln!("sarun-engine: engine did not allocate a sud upper \
-                   (engine older than this runner?)");
-        return 1;
+    Ok(ack)
+}
+
+/// Rewrite CMD so the box's shell IS the embedded brush: `exe` (the engine's
+/// own path) runs under the wrapper via the explicit `brush-sh` subcommand.
+fn sud_brush_cmd(exe: &str, cmd: &[String]) -> Vec<String> {
+    let script = crate::brush::script_from_argv(cmd);
+    vec![exe.to_string(), "brush-sh".into(), "--".into(),
+         "sh".into(), "-c".into(), script]
+}
+
+/// The base remap-rule carve-outs, in first-prefix-match priority order: the
+/// pseudo filesystems and sarun's own state + FUSE mount trees stay
+/// host-served (a nested NON-sud box binds <mnt>/<id> and its writes belong to
+/// that box's own capture, not this box's upper), then /tmp is served from the
+/// inramfs shared-memory store (`ir_key`, empty = no inramfs) — listed AFTER
+/// the narrower carve-outs so an engine state/mnt dir living under /tmp (test
+/// rigs do this) still routes to the host.
+fn sud_base_rules(sc: &mut Command, ir_key: &str) {
+    for p in ["/proc", "/dev", "/sys"] {
+        sc.args(["--remap-rule", &format!("passthrough:{p}")]);
     }
-    eprintln!("sarun-engine: box {sid}  (sud upper: {upper})");
-    // -b brush: the box's shell IS the embedded brush, exactly like a FUSE
-    // -b box — but here brush is the TRACED TARGET: the engine binary runs
-    // under the wrapper via the explicit `brush-sh` subcommand, so brush,
-    // the coreutils builtins, find/xargs, and the embedded make (kati) /
-    // ninja (n2) all execute IN ONE traced process. The in-process
-    // advantage survives the backend swap — and compounds: a builtin's
-    // file I/O is a SIGSYS trap into the same address space (userland
-    // overlay), not a kernel round-trip into the engine's fuser threads.
-    // The FUSE shadow binds become `remap:` rules below. Gap (documented
-    // in DESIGN-sud.md): no box channel in the traced process, so brush's
-    // semantic-provenance frames are skipped (send_nested_prov no-ops
-    // without SARUN_BROKER); provenance comes from the trace stream.
-    let self_exe: Option<String> = std::env::current_exe().ok()
-        .and_then(|p| p.to_str().map(String::from));
-    let cmd = if brush {
-        let Some(exe) = self_exe.clone() else {
-            eprintln!("sarun-engine run --sud: -b needs current_exe()");
-            return 1;
-        };
-        let script = crate::brush::script_from_argv(&cmd);
-        vec![exe, "brush-sh".into(), "--".into(),
-             "sh".into(), "-c".into(), script]
-    } else { cmd };
-    // Probe the target the way sudtrace did: PATH-resolve, shebang, ELF
-    // class → pick sud32 or sud64 for the initial exec (the wrapper
-    // handles cross-class children itself via its dir-sibling paths).
-    let resolved = sud_resolve_target(&cmd[0]);
-    let shebang = sud_shebang(&resolved);
-    let probe = shebang.as_ref().map(|(i, _)| i.as_str())
-        .unwrap_or(resolved.as_str());
-    let wrapper = if sud_elf_class(probe) == 1 { &sud32 } else { &sud64 };
-    // Launcher contract, absorbed from tv/sud/sudtrace.c: the trace pipe's
-    // write end on fd 1023 and the 4 KiB MAP_SHARED wire-state page
-    // (stream-id counter) on fd 1022, inherited by every traced child.
-    // CRITICAL for in-box nesting: the fds are installed in the CHILD
-    // (pre_exec, between fork and exec), never in this process — a nested
-    // runner is itself traced by the OUTER wrapper, whose trace addin
-    // writes outer events to fd 1023 in our process; replumbing our own
-    // 1022/1023 would splice outer-stream events (with colliding stream
-    // ids from the outer counter page) into the inner trace. The launcher
-    // writes its own version atom + EXIT events through trace_w directly.
+    sc.arg("--remap-rule")
+        .arg(format!("passthrough:{}", crate::paths::state_home().display()));
+    sc.arg("--remap-rule")
+        .arg(format!("passthrough:{}", crate::paths::mnt_point().display()));
+    if !ir_key.is_empty() {
+        sc.args(["--remap-rule", "inramfs:/tmp"]);
+        sc.args(["--inramfs-key", ir_key]);
+    }
+}
+
+/// Tap networking: the box reaches the net through the engine's MITM proxy, so
+/// it must trust the engine's CA and resolve via the gateway. A FUSE box gets
+/// these as overlay shadows; a sud box gets them as `remap` rules pointing the
+/// CA-bundle + resolv.conf paths at host files materialized under `backing`
+/// (ack `shm_dir`). No-op unless tap mode with a CA. Listed BEFORE the wide
+/// overlay:/ rule (first-prefix-match wins).
+fn sud_net_rules(sc: &mut Command, net_mode: crate::net::NetMode,
+                 ca_pem: &str, dns_ip: &str, backing: Option<&Path>) {
+    if net_mode != crate::net::NetMode::Tap || ca_pem.is_empty() { return; }
+    let Some(bk) = backing else { return; };
+    let ca_path = bk.join("sud-ca.pem");
+    if std::fs::write(&ca_path, ca_pem).is_ok() {
+        for tgt in CA_BUNDLE_TARGETS {
+            sc.args(["--remap-rule",
+                     &format!("remap:{tgt}={}", ca_path.display())]);
+        }
+        let canonical = "/etc/ssl/certs/ca-certificates.crt";
+        for k in ["SSL_CERT_FILE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+                  "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO"] {
+            sc.env(k, canonical);
+        }
+    }
+    if !dns_ip.is_empty() {
+        let rc_path = bk.join("sud-resolv.conf");
+        if std::fs::write(&rc_path, format!("nameserver {dns_ip}\n")).is_ok() {
+            sc.args(["--remap-rule",
+                     &format!("remap:/etc/resolv.conf={}", rc_path.display())]);
+        }
+    }
+}
+
+/// -b shadow rules: the sud analogue of the FUSE overlay's lazy /bin/sh + make
+/// + ninja shadowing. A nested tool's execve of a shadowed path is remapped to
+/// a per-box symlink NAMED AFTER THE TOOL (live/<id>/shadow-bin/<tool> →
+/// engine); argv[0] keeps the shadowed name and SARUN_BRUSH_SH=1 gates dispatch
+/// (is_brush_sh_invocation / is_make_invocation / is_ninja_invocation), so
+/// recipes run through embedded brush and make/ninja in-process (kati/n2). The
+/// symlink — not a direct remap to the engine path — preserves the invocation
+/// basename the wrapper's exec rewrite substitutes as argv[0]; the
+/// engine-state passthrough rule keeps the link itself host-served.
+fn sud_shadow_rules(sc: &mut Command, upper: &str, exe: &str)
+                    -> Result<(), String> {
+    sc.env("SARUN_BRUSH_SH", "1");
+    let shadow_dir = Path::new(upper)
+        .parent().map(|p| p.join("shadow-bin"))
+        .unwrap_or_else(|| std::path::PathBuf::from("shadow-bin"));
+    let _ = std::fs::create_dir_all(&shadow_dir);
+    for name in ["sh", "bash", "dash", "make", "gmake", "ninja"] {
+        let link = shadow_dir.join(name);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(exe, &link)
+            .map_err(|e| format!("-b shadow link {}: {e}", link.display()))?;
+        for dir in ["/bin", "/usr/bin"] {
+            sc.args(["--remap-rule",
+                     &format!("remap:{dir}/{name}={}", link.display())]);
+        }
+    }
+    Ok(())
+}
+
+/// The wide `overlay:/` rule, stacking upper → lowers → host. Fails loud (the
+/// rule syntax swallows both faults silently) when the chain exceeds rules.h's
+/// 9-layer cap or any layer path contains the '+' layer separator (which would
+/// split into garbage layers and land box writes on the real host under a
+/// truncated prefix). `Err(code)` carries the process exit code.
+fn sud_overlay_rule(sc: &mut Command, upper: &str, lowers: &[String])
+                    -> Result<(), i32> {
+    if 2 + lowers.len() > 9 {
+        eprintln!("sarun-engine run --sud: box chain too deep for one \
+                   overlay rule ({} layers > 9)", 2 + lowers.len());
+        return Err(2);
+    }
+    if upper.contains('+') || lowers.iter().any(|l| l.contains('+')) {
+        eprintln!("sarun-engine run --sud: state path contains '+' \
+                   (the overlay rule separator): {upper}\n\
+                   move the engine state dir (XDG_STATE_HOME) to a \
+                   path without '+'");
+        return Err(2);
+    }
+    let mut layers = upper.to_string();
+    for l in lowers {
+        layers.push('+');
+        layers.push_str(l);
+    }
+    sc.arg("--remap-rule").arg(format!("overlay:/={layers}+/"));
+    Ok(())
+}
+
+/// The wire-state page + launcher wait loop, absorbed from tv/sud/sudtrace.c.
+/// Installs the wrapper-contract fds in the CHILD only (fd 1023 = the trace
+/// pipe write end `trace_w`, fd 1022 = the 4 KiB MAP_SHARED stream-id page),
+/// writes the TRACE version atom and one launcher EV_EXIT per real
+/// thread-group-leader termination straight to `trace_w`, and returns the
+/// wrapper child's exit code. Consumes `trace_w` (closed before return, so the
+/// engine's reader sees EOF ahead of the sweep RPC).
+///
+/// CRITICAL for in-box nesting: the 1022/1023 fds are installed via pre_exec
+/// (between fork and exec), never in THIS process — a nested runner is itself
+/// traced by the OUTER wrapper, whose addin writes outer events to fd 1023 in
+/// our process; replumbing our own would splice outer-stream events (with
+/// colliding stream ids from the outer counter page) into the inner trace.
+fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32) -> i32 {
     let stream_id: u32;
     let state_page: *mut u32;
     let mfd: i32;
@@ -945,6 +1135,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         if mfd < 0 || libc::ftruncate(mfd, 4096) < 0 {
             eprintln!("sarun-engine: wire state page: {}",
                       std::io::Error::last_os_error());
+            libc::close(trace_w);
             return 1;
         }
         let p = libc::mmap(std::ptr::null_mut(), 4096,
@@ -953,160 +1144,21 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         if p == libc::MAP_FAILED {
             eprintln!("sarun-engine: mmap wire state: {}",
                       std::io::Error::last_os_error());
+            libc::close(mfd);
+            libc::close(trace_w);
             return 1;
         }
         state_page = p.cast();
-        // struct sud_shared { volatile uint32_t next_stream_id; } — the
-        // page is zero-filled; post-increment value is our stream id
-        // (launcher = 1, children take 2, 3, … the same way).
+        // struct sud_shared { volatile uint32_t next_stream_id; } — the page is
+        // zero-filled; the post-increment value is our stream id (launcher = 1,
+        // children take 2, 3, … off the same counter).
         stream_id = (*std::sync::atomic::AtomicU32::from_ptr(state_page))
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let va = crate::sudwire::version_atom();
         let _ = write_all_fd(trace_w, &va);
     }
-    // Wrapper argv: flag block (runtime_config.h shapes), then the target.
-    // Rule order matters (first-prefix-match wins): carve the pseudo
-    // filesystems and sarun's own state tree out BEFORE the wide `/`
-    // overlay. /tmp passthrough is a step-1 stopgap — see DESIGN-sud.md.
-    let state_dir = crate::paths::state_home();
-    let mut sc = Command::new(wrapper);
-    for p in ["/proc", "/dev", "/sys"] {
-        sc.args(["--remap-rule", &format!("passthrough:{p}")]);
-    }
-    sc.arg("--remap-rule")
-        .arg(format!("passthrough:{}", state_dir.display()));
-    // The engine's FUSE mountpoint too: a nested NON-sud box launched
-    // from inside this box binds <mnt>/<id> and writes through it —
-    // those writes belong to the nested box's own capture, not to this
-    // box's upper (sud × FUSE composition, DESIGN-sud.md).
-    sc.arg("--remap-rule")
-        .arg(format!("passthrough:{}", crate::paths::mnt_point().display()));
-    // /tmp: an inramfs mount — served from the shared-memory store the
-    // engine keyed for this box; captured at sweep. Replaces the old
-    // /tmp passthrough stopgap (whose writes were never captured). Listed
-    // AFTER every narrower carve-out above: if the engine's state/mnt
-    // dirs live under /tmp (test rigs do this), first-prefix-match must
-    // still route them to the host, not into the store.
-    let ir_key = ack.get("sud_ir_key").and_then(Value::as_str)
-        .unwrap_or("").to_string();
-    if !ir_key.is_empty() {
-        sc.args(["--remap-rule", "inramfs:/tmp"]);
-        sc.args(["--inramfs-key", &ir_key]);
-    }
-    // Tap networking: the box reaches the net through the engine's MITM
-    // proxy, so it must trust the engine's CA and resolve via the gateway.
-    // A FUSE box gets these as overlay SHADOWS; a sud box gets them as
-    // `remap` rules pointing the CA-bundle + resolv.conf paths at host
-    // files the runner materializes (ca_pem / dns_ip come back in the ack).
-    // Listed BEFORE the wide overlay:/ rule (first-prefix-match wins).
-    let ca_pem = ack.get("ca_pem").and_then(Value::as_str).unwrap_or("");
-    let dns_ip = ack.get("dns_ip").and_then(Value::as_str).unwrap_or("");
-    let backing = ack.get("shm_dir").and_then(Value::as_str)
-        .map(std::path::PathBuf::from);
-    if net_mode == crate::net::NetMode::Tap && !ca_pem.is_empty() {
-        if let Some(bk) = &backing {
-            let ca_path = bk.join("sud-ca.pem");
-            if std::fs::write(&ca_path, ca_pem).is_ok() {
-                for tgt in CA_BUNDLE_TARGETS {
-                    sc.args(["--remap-rule",
-                             &format!("remap:{tgt}={}", ca_path.display())]);
-                }
-                let canonical = "/etc/ssl/certs/ca-certificates.crt";
-                for k in ["SSL_CERT_FILE", "CURL_CA_BUNDLE",
-                          "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE",
-                          "GIT_SSL_CAINFO"] {
-                    sc.env(k, canonical);
-                }
-            }
-            if !dns_ip.is_empty() {
-                let rc_path = bk.join("sud-resolv.conf");
-                if std::fs::write(&rc_path,
-                                  format!("nameserver {dns_ip}\n")).is_ok() {
-                    sc.args(["--remap-rule",
-                             &format!("remap:/etc/resolv.conf={}",
-                                      rc_path.display())]);
-                }
-            }
-        }
-    }
-    // -b shadow rules: the sud analogue of the FUSE overlay's lazy
-    // /bin/sh + make + ninja shadowing (overlay.rs::Shadows defaults). A
-    // nested tool's execve of a shadowed path is remapped to the engine
-    // binary; argv[0] keeps the shadowed name and SARUN_BRUSH_SH=1 gates
-    // dispatch (is_brush_sh_invocation / is_make_invocation /
-    // is_ninja_invocation), so recipes run through embedded brush and
-    // make/ninja run in-process (kati/n2) — no real-shell storm. The
-    // remap matcher is component-boundary-safe (/bin/sh ≠ /bin/shred)
-    // and execve paths go through the same resolver as opens.
-    // The remap DESTINATION is a per-box symlink NAMED AFTER THE TOOL
-    // (live/<id>/shadow-bin/sh → engine), not the engine path itself:
-    // the wrapper's exec rewrite substitutes the resolved target path
-    // as the child's argv[0] (handler.c build_exec_argv), so remapping
-    // straight to the engine binary would lose the invocation name the
-    // dispatch gates key on. The symlink keeps the basename; the
-    // engine-state passthrough rule keeps the link itself host-served.
-    if brush {
-        let exe = self_exe.as_deref().unwrap_or_default();
-        sc.env("SARUN_BRUSH_SH", "1");
-        let shadow_dir = std::path::Path::new(&upper)
-            .parent().map(|p| p.join("shadow-bin"))
-            .unwrap_or_else(|| std::path::PathBuf::from("shadow-bin"));
-        let _ = std::fs::create_dir_all(&shadow_dir);
-        for name in ["sh", "bash", "dash", "make", "gmake", "ninja"] {
-            let link = shadow_dir.join(name);
-            let _ = std::fs::remove_file(&link);
-            if let Err(e) = std::os::unix::fs::symlink(exe, &link) {
-                eprintln!("sarun-engine run --sud: -b shadow link \
-                           {}: {e}", link.display());
-                return 1;
-            }
-            for dir in ["/bin", "/usr/bin"] {
-                sc.args(["--remap-rule",
-                         &format!("remap:{dir}/{name}={}", link.display())]);
-            }
-        }
-    }
-    // rules.h caps an overlay rule at 9 layers (upper + 8): chain depth
-    // beyond that would be SILENTLY dropped by the wrapper parser — fail
-    // loud instead.
-    if 2 + lowers.len() > 9 {
-        eprintln!("sarun-engine run --sud: box chain too deep for one \
-                   overlay rule ({} layers > 9)", 2 + lowers.len());
-        return 2;
-    }
-    // '+' is the overlay rule's layer separator and the rule syntax has
-    // no escaping: a '+' anywhere in a layer path would silently split
-    // into garbage layers and box writes would land on the REAL host
-    // under the truncated prefix. Fail loud instead.
-    if upper.contains('+') || lowers.iter().any(|l| l.contains('+')) {
-        eprintln!("sarun-engine run --sud: state path contains '+' \
-                   (the overlay rule separator): {upper}\n\
-                   move the engine state dir (XDG_STATE_HOME) to a \
-                   path without '+'");
-        return 2;
-    }
-    let mut layers = upper.clone();
-    for l in &lowers {
-        layers.push('+');
-        layers.push_str(l);
-    }
-    sc.arg("--remap-rule").arg(format!("overlay:/={layers}+/"));
-    match &shebang {
-        Some((interp, arg)) => {
-            // Script: wrapper runs the interpreter with the kernel's
-            // shebang argv shape (interp [arg] script args…).
-            sc.arg(interp);
-            if let Some(a) = arg { sc.arg(a); }
-            sc.arg(&resolved);
-            sc.args(&cmd[1..]);
-        }
-        None => { sc.args(&cmd); }
-    }
-    if let Some(d) = &chdir { sc.current_dir(d); }
-    // Install the wrapper-contract fds in the child only (see above).
-    // dup2 targets are not CLOEXEC, so they survive the exec.
+    // dup2 targets are not CLOEXEC, so they survive the exec into the wrapper.
     unsafe {
-        use std::os::unix::process::CommandExt as _;
         sc.pre_exec(move || {
             if libc::dup2(trace_w, SUD_OUTPUT_FD) < 0
                 || libc::dup2(mfd, SUD_STATE_FD) < 0 {
@@ -1123,12 +1175,17 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
                        SUD_ADDINS=\"sud/trace sud/path_remap sud/cmd-rewrite \
                        sud/fake-exec sud/inramfs\"` and put them on PATH or \
                        point SARUN_SUD64/SARUN_SUD32 at them.");
+            unsafe {
+                libc::munmap(state_page.cast(), 4096);
+                libc::close(mfd);
+                libc::close(trace_w);
+            }
             return 127;
         }
     };
-    // Launcher wait loop (sudtrace's): reap every descendant that lands
-    // on us, emit an EV_EXIT per real termination of a thread-group
-    // leader, stop when the wrapper child itself is done.
+    // Launcher wait loop (sudtrace's): reap every descendant that lands on us,
+    // emit an EV_EXIT per real termination of a thread-group leader, stop when
+    // the wrapper child itself is done.
     let child_pid = child.id() as i32;
     let mut ev = crate::sudwire::EvState::default();
     let mut code = 1;
@@ -1169,38 +1226,36 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         libc::close(mfd);
     }
     drop(child); // already reaped by our waitpid; Child::drop doesn't wait
-    // Sweep the upper into the box's sqlar on a FRESH conn (the register
-    // conn is the box channel; a verb on it would desync teardown).
-    match UnixStream::connect(&sock) {
-        Ok(c) => {
-            let req = json!({"type": "sud_ingest", "sid": sid});
-            if conn_write_all(&c, format!("{req}\n").as_bytes()) {
-                let mut resp = String::new();
-                let _ = BufReader::new(&c).read_line(&mut resp);
-                match serde_json::from_str::<Value>(&resp) {
-                    Ok(v) if v.get("ok").and_then(Value::as_bool)
-                        == Some(true) => {
-                        let n = v.get("ingested").and_then(Value::as_i64)
-                            .unwrap_or(0);
-                        eprintln!("sarun-engine: sud sweep: {n} entries \
-                                   captured into box {sid}");
-                        if let Some(errs) = v.get("errors")
-                            .and_then(Value::as_array)
-                            .filter(|a| !a.is_empty()) {
-                            for e in errs {
-                                eprintln!("sarun-engine: sud sweep: {e}");
-                            }
-                        }
-                    }
-                    _ => eprintln!("sarun-engine: sud sweep failed: {}",
-                                   resp.trim()),
+    code
+}
+
+/// Ask the engine (fresh conn to `sock`) to sweep the finished box's upper
+/// into its sqlar. Reporting is best-effort — the command already ran, so a
+/// sweep RPC failure is printed but never changes the box's exit code.
+fn sud_request_sweep(sock: &Path, sid: &str) {
+    let c = match UnixStream::connect(sock) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("sarun-engine: sud sweep: dial engine: {e}");
+                    return; }
+    };
+    let req = json!({"type": "sud_ingest", "sid": sid});
+    if !conn_write_all(&c, format!("{req}\n").as_bytes()) { return; }
+    let mut resp = String::new();
+    let _ = BufReader::new(&c).read_line(&mut resp);
+    match serde_json::from_str::<Value>(&resp) {
+        Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+            let n = v.get("ingested").and_then(Value::as_i64).unwrap_or(0);
+            eprintln!("sarun-engine: sud sweep: {n} entries \
+                       captured into box {sid}");
+            if let Some(errs) = v.get("errors").and_then(Value::as_array)
+                .filter(|a| !a.is_empty()) {
+                for e in errs {
+                    eprintln!("sarun-engine: sud sweep: {e}");
                 }
             }
         }
-        Err(e) => eprintln!("sarun-engine: sud sweep: dial engine: {e}"),
+        _ => eprintln!("sarun-engine: sud sweep failed: {}", resp.trim()),
     }
-    drop(conn); // box channel EOF → teardown
-    code
 }
 
 /// Send one frame (optionally with our pidfd as SCM_RIGHTS) over the box channel.

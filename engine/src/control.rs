@@ -570,10 +570,10 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             }
         }
         "ui" => dispatch_ui(state, msg),
-        // --sud step-1 sweep (WIP, engine/DESIGN-sud.md): the runner calls
-        // this after its sudtrace child exits; we mirror the box's upper
-        // directory (live/<id>/sud-up) into the live BoxState so review /
-        // apply / discard / UI see a sud box like any other.
+        // --sud sweep (engine/DESIGN-sud.md): the runner calls this after
+        // its wrapper child exits. We resolve the box, then hand the live
+        // BoxState to sud::sweep, which owns the upper/inramfs/trace ingest
+        // and residue cleanup; here we only shape the report into a reply.
         "sud_ingest" => {
             let boxes = discover::discover();
             match msg.get("sid").and_then(Value::as_str)
@@ -583,60 +583,11 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                         .and_then(|o| o.live_box(id));
                     match live {
                         Some(b) => {
-                            let upper = crate::paths::live_home()
-                                .join(id.to_string()).join("sud-up");
                             let runpid = lock(state).box_runpids
-                                .get(&id).copied().unwrap_or(0);
-                            // Waits for the trace pipe to drain, so the
-                            // rel→writer attribution map is complete.
-                            let stream = crate::sud::take_stream(id);
-                            let writers = stream.as_ref()
-                                .map(|s| s.writers.lock().unwrap().clone())
-                                .unwrap_or_default();
-                            let (n, mut errs) = crate::sud::ingest_upper(
-                                &b, &upper, runpid as u32, &writers);
-                            // /tmp lives in the inramfs shared-memory
-                            // store, not in the upper dir — parse the
-                            // region and drop its backing shms.
-                            let mut total = n;
-                            if let Some(key) = b.get_meta("sud_ir_key")
-                                .filter(|k| !k.is_empty()) {
-                                let fallback = if runpid > 0 {
-                                    b.writer_for(runpid as u32)
-                                } else { 0 };
-                                let (in_, mut ie) = crate::sud::ingest_inramfs(
-                                    &b, &key, fallback, &writers);
-                                total += in_;
-                                errs.append(&mut ie);
-                            }
-                            // Fold the raw TRACE stream into the box's
-                            // durable record: the sqlar copy is now
-                            // authoritative (survives export/reap), so
-                            // the `sudtrace` verb + UI Trace pane read it
-                            // there rather than from the live file.
-                            let trace_path = crate::paths::live_home()
-                                .join(id.to_string()).join("sud.trace");
-                            if let Ok(bytes) = std::fs::read(&trace_path) {
-                                b.set_sudtrace(&bytes);
-                            }
-                            // A CLEAN sweep makes the upper dir pure
-                            // residue: the sqlar is authoritative from
-                            // here (reruns delete-and-recreate it,
-                            // nested launches export from the sqlar),
-                            // so keeping it doubles the box's disk
-                            // footprint until reap. Keep it ONLY when
-                            // the sweep reported errors — then it is
-                            // the sole copy of whatever failed to
-                            // ingest. On a clean sweep sud.trace is
-                            // likewise redundant (folded into the sqlar
-                            // just above), so drop it too; keep it on an
-                            // errored sweep as a debug record.
-                            if errs.is_empty() {
-                                let _ = std::fs::remove_dir_all(&upper);
-                                let _ = std::fs::remove_file(&trace_path);
-                            }
-                            json!({"ok": true, "ingested": total,
-                                   "errors": errs})
+                                .get(&id).copied().unwrap_or(0) as u32;
+                            let r = crate::sud::sweep(&b, id, runpid);
+                            json!({"ok": true, "ingested": r.ingested,
+                                   "errors": r.errors})
                         }
                         None => json!({"ok": false,
                                        "error": "box is not live"}),
@@ -666,21 +617,9 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             match msg.get("sid").and_then(Value::as_str)
                 .and_then(|s| resolve(&boxes, s)) {
                 Some(id) => {
-                    // Prefer the LIVE BoxState's connection when the box is
-                    // running (no rival on-disk handle racing serve);
-                    // otherwise open the at-rest sqlar read/write-lite.
                     let live = lock(state).overlay.clone()
                         .and_then(|o| o.live_box(id));
-                    let blob = match live {
-                        Some(b) => b.get_sudtrace(),
-                        None => crate::capture::BoxState::create(id)
-                            .ok().and_then(|b| b.get_sudtrace()),
-                    };
-                    match blob {
-                        Some(bytes) => crate::sud::decode_trace(&bytes),
-                        None => json!({"ok": false,
-                                       "error": "box has no sud trace"}),
-                    }
+                    crate::sud::trace_events_json(live, id)
                 }
                 None => json!({"ok": false, "error": "no slopbox"}),
             }
