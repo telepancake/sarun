@@ -26,7 +26,6 @@
 //! not a cache mutation. Refcounting is `st_nlink`: a blob referenced by
 //! no tree has nlink 1 and is reclaimable.
 
-use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -164,9 +163,10 @@ impl Cache {
                     // No: hardlinks share the inode, and pool files are
                     // 0444. An executable needs its own inode.
                     if let Some(m) = mode {
-                        if m & 0o111 != 0 {
-                            let meta = std::fs::symlink_metadata(&p)?;
-                            if meta.permissions().mode() & 0o111 == 0 {
+                        if m & 0o111 != 0
+                            && std::fs::symlink_metadata(&p)?
+                                .permissions().mode() & 0o111 == 0 {
+                            {
                                 // re-copy privately with the exec bit
                                 std::fs::remove_file(&p)?;
                                 std::fs::copy(&pool, &p)?;
@@ -213,10 +213,10 @@ impl Cache {
             for f in std::fs::read_dir(shard.path())?.flatten() {
                 let md = match f.metadata() { Ok(m) => m, Err(_) => continue };
                 use std::os::unix::fs::MetadataExt;
-                if md.is_file() && md.nlink() == 1 {
-                    if std::fs::remove_file(f.path()).is_ok() {
-                        removed += 1;
-                    }
+                if md.is_file() && md.nlink() == 1
+                    && std::fs::remove_file(f.path()).is_ok()
+                {
+                    removed += 1;
                 }
             }
         }

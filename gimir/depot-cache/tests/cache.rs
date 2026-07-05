@@ -2,11 +2,6 @@
 //! materialization with pool sharing, idempotence over partial state,
 //! rebuild-from-nothing (everything is derived), and eviction.
 
-mod common {
-    include!("../../depot/tests/common/mod.rs");
-}
-
-use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 
@@ -114,6 +109,5 @@ fn refuses_delta_artifacts() {
     assert!(c.materialize(&Layer { root }).is_err());
     let mut root = Node::keep();
     root.children.insert(b"h".to_vec(), Node::hole());
-    assert!(c.materialize(&Layer { root: root.clone() }).is_err());
-    let _ = BTreeMap::<u8, u8>::new();
+    assert!(c.materialize(&Layer { root }).is_err());
 }
