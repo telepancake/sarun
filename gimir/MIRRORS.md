@@ -8,7 +8,7 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 |---|---|---|---|
 | **wikipedia** | ~99%-identical revision chains per page | `wikimak/*` (depot chains, un-sabotaged 2026-07, 12× measured) | `wikimak` CLI: import/head/text/history + discover/fetch sync with `parts_seen` watermarks |
 | **IETF drafts** | revision chains per draft name (`draft-x-00..-NN`) — the tiered-VBF doc's other named workload | multi-chain `depot-vbf::VbfDepot` (canonical layers) + sqlite bookkeeping | `ietf-mirror` crate + `ietfmak` CLI: update (idempotent, incremental, 404-watermarked) / list / head / text / history |
-| **git repos** | DAG of tree snapshots, newest-first | `gitdepot` (view-anchored chains; SHA-exact export) | import/export/`update` (incremental fast-forward append); no fetch loop yet |
+| **git repos** | DAG of tree snapshots, newest-first | `gitdepot` (view-anchored chains; SHA-exact export) | import/export/`update` (incremental fast-forward append) + `mirror` (bare-clone fetch loop, re-import on rewrite) |
 
 ## Common architecture (per DEPOT-DESIGN)
 
@@ -36,9 +36,11 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 3. **git mirror loop**: gitdepot incremental import DONE (`update`:
    new frames prepended, former head's standalone frame replaced by a
    bridge delta, all older frames verbatim; fast-forward-only, refuses
-   rewritten/topo-interleaved history → re-import). Remaining:
-   fetch-and-update loop over remotes, then RO-attach a ref via the
-   cache.
+   rewritten/topo-interleaved history → re-import). Fetch-and-update
+   DONE (`mirror <url> <root>`: bare mirror clone under `<root>/repo.git`,
+   store under `<root>/store`, non-fast-forward remote → wholesale
+   re-import — the mirror follows the remote). Remaining: RO-attach a
+   ref via the cache.
 4. **Serve/browse**: wikipedia browsing plan (docs/wikipedia-browsing-
    plan.md) + list-widget DAG navigation already landed; a pane per
    mirror later.

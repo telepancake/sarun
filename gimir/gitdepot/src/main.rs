@@ -1,5 +1,6 @@
 //! CLI: `gitdepot import <git-repo> <store-dir> [--level N]`
 //!      `gitdepot update <git-repo> <store-dir> [--level N]`
+//!      `gitdepot mirror <url> <root-dir>`
 //!      `gitdepot export <store-dir> <new-repo-dir>`
 
 use std::path::PathBuf;
@@ -7,7 +8,7 @@ use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: gitdepot import <git-repo> <store-dir> [--level N]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot export <store-dir> <new-repo-dir>"
+        "usage: gitdepot import <git-repo> <store-dir> [--level N]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir>\n       gitdepot export <store-dir> <new-repo-dir>"
     );
     ExitCode::from(2)
 }
@@ -61,6 +62,19 @@ fn main() -> ExitCode {
             gitdepot::update(&PathBuf::from(repo), &PathBuf::from(store), level).map(|o| {
                 println!("{} new commits ({} total)", o.new_commits, o.total_commits);
                 for r in &o.refs {
+                    println!("{} {}", r.sha, r.name);
+                }
+            })
+        }
+        ("mirror", [url, root]) => {
+            gitdepot::mirror(url, &PathBuf::from(root)).map(|o| {
+                println!(
+                    "{} new commits ({} total){}",
+                    o.update.new_commits,
+                    o.update.total_commits,
+                    if o.reimported { "  [re-imported: remote rewrote history]" } else { "" }
+                );
+                for r in &o.update.refs {
                     println!("{} {}", r.sha, r.name);
                 }
             })

@@ -230,6 +230,43 @@ fn incremental_update_appends_and_exports_sha_exact() {
 }
 
 #[test]
+fn mirror_loop_clones_updates_and_survives_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    let root = tmp.path().join("mirror");
+
+    build_fixture(&origin);
+    // A path stands in for the remote URL (same git transport surface).
+    let o = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert_eq!(o.update.total_commits, 13);
+    assert!(!o.reimported);
+    assert!(root.join("repo.git/HEAD").exists(), "bare mirror clone missing");
+
+    // New commit on origin → incremental update through the fetch.
+    std::fs::write(origin.join("more.txt"), "more\n").unwrap();
+    sh_git(&origin, &["add", "-A"]);
+    sh_git(&origin, &["commit", "-q", "-m", "more"]);
+    let chain_before = std::fs::read(root.join("store/chain")).unwrap();
+    let o2 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert_eq!((o2.update.new_commits, o2.reimported), (1, false));
+    let zlen0 = u32::from_le_bytes(chain_before[4..8].try_into().unwrap()) as usize;
+    assert!(
+        std::fs::read(root.join("store/chain")).unwrap().ends_with(&chain_before[8 + zlen0..]),
+        "mirror update rewrote old frames"
+    );
+
+    // Origin rewrites history → mirror falls back to full re-import
+    // and still exports SHA-exact against the NEW truth.
+    sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended"]);
+    let o3 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert!(o3.reimported, "rewritten remote should force re-import");
+    let out = tmp.path().join("out");
+    let refs = gitdepot::export(&root.join("store"), &out).unwrap();
+    let tip = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
+    assert!(refs.iter().any(|r| r.name == "refs/heads/main" && r.sha == tip));
+}
+
+#[test]
 fn import_refuses_unsupported_shapes() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");

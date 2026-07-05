@@ -500,6 +500,72 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
     Ok(UpdateOutcome { new_commits: k, total_commits: total, refs })
 }
 
+// ---------------------------------------------------------------- mirror
+
+#[derive(Debug, Clone)]
+pub struct MirrorOutcome {
+    pub update: UpdateOutcome,
+    /// True when a non-fast-forward remote forced a full re-import.
+    pub reimported: bool,
+}
+
+/// The fetch-and-update loop for one remote: keep `<root>/repo.git` (a
+/// bare mirror clone) in sync with `url`, and `<root>/store` in sync
+/// with the clone. First call clones + imports; later calls fetch +
+/// incrementally `update`. A rewritten remote (non-fast-forward) falls
+/// back to a full re-import of the fresh state — the mirror follows the
+/// remote, it does not argue with it.
+///
+/// Fetching is host-side for now (MIRRORS.md: the move into a tap box
+/// is mechanical later).
+pub fn mirror(url: &str, root: &Path) -> Result<MirrorOutcome> {
+    std::fs::create_dir_all(root)?;
+    let repo = root.join("repo.git");
+    let store = root.join("store");
+    if repo.join("HEAD").exists() {
+        git(&repo, &["remote", "update", "--prune"])?;
+    } else {
+        let out = Command::new("git")
+            .args(["clone", "--quiet", "--mirror", url])
+            .arg(&repo)
+            .output()?;
+        if !out.status.success() {
+            return Err(Error::Git(format!(
+                "clone --mirror {url}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+    }
+    if !store.join("meta.json").exists() {
+        let o = import(&repo, &store, 3)?;
+        let n = o.meta.commits.len();
+        return Ok(MirrorOutcome {
+            update: UpdateOutcome { new_commits: n, total_commits: n, refs: o.meta.refs },
+            reimported: false,
+        });
+    }
+    match update(&repo, &store, 3) {
+        Ok(u) => Ok(MirrorOutcome { update: u, reimported: false }),
+        Err(Error::Unsupported(_)) => {
+            // Remote rewrote history out from under the store: replace
+            // the store wholesale with the fresh state.
+            let fresh = root.join("store.new");
+            if fresh.exists() {
+                std::fs::remove_dir_all(&fresh)?;
+            }
+            let o = import(&repo, &fresh, 3)?;
+            std::fs::remove_dir_all(&store)?;
+            std::fs::rename(&fresh, &store)?;
+            let n = o.meta.commits.len();
+            Ok(MirrorOutcome {
+                update: UpdateOutcome { new_commits: n, total_commits: n, refs: o.meta.refs },
+                reimported: true,
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // ---------------------------------------------------------------- export
 
 fn quote_path(p: &[u8]) -> String {
