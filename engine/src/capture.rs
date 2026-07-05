@@ -145,10 +145,22 @@ CREATE INDEX IF NOT EXISTS idx_webcap_url ON webcap(url);
 #[derive(Clone)]
 pub enum Entry {
     File { rowid: i64, mode: u32 },
-    Dir { mode: u32, mtime_ns: i64, opaque: bool },
+    /// `rebased`: backdrop-anchored (DEPOT-DESIGN.md §2) — this dir's
+    /// recorded LOWER contributions (parent boxes) are erased, while the
+    /// backdrop (host) still shows through. Distinct from `opaque`,
+    /// which masks recorded lower AND backdrop children. Produced by
+    /// rotation; stored as bit 1 of the `opaque` column.
+    Dir { mode: u32, mtime_ns: i64, opaque: bool, rebased: bool },
     Symlink { target: PathBuf },
     Special { mode: u32, rdev: u64 },  // fifo / char / block device
     Whiteout,
+    /// A hole (DEPOT-DESIGN.md §2): "this key is not occluded" — skip
+    /// every recorded lower layer and resolve from the BACKDROP (host,
+    /// or nothing under no_host_fallback), LIVE at access time. The
+    /// artifact rotation leaves where the new parent-encoding contains
+    /// changes that were never this layer's. Stored as a whiteout row
+    /// (mode == S_IFCHR) with the backdrop-anchor bit set.
+    Hole,
 }
 
 pub struct BoxState {
@@ -789,18 +801,22 @@ impl BoxState {
     pub(crate) fn entry_from_row(conn: &Connection, name: &str, mode: u32, sz: i64,
                       data: Option<Vec<u8>>) -> Entry {
         let ft = mode & 0o170000;
+        // The `opaque` column is a bitfield: bit 0 = opaque-dir, bit 1 =
+        // backdrop-anchored (§2 anchor axis). Python readers treat any
+        // non-zero value as opaque-ish; additive.
+        let flags: i64 = conn.query_row(
+            "SELECT opaque FROM sqlar WHERE name=?1", [name],
+            |r| r.get(0)).unwrap_or(0);
         if mode == S_IFCHR {
-            Entry::Whiteout
+            if flags & 2 != 0 { Entry::Hole } else { Entry::Whiteout }
         } else if ft == 0o120000 {
             let bytes = data.unwrap_or_default();
             let t = String::from_utf8_lossy(&bytes).into_owned();
             let _ = sz;
             Entry::Symlink { target: PathBuf::from(t) }
         } else if ft == 0o040000 {
-            let opaque: i64 = conn.query_row(
-                "SELECT opaque FROM sqlar WHERE name=?1", [name],
-                |r| r.get(0)).unwrap_or(0);
-            Entry::Dir { mode, mtime_ns: 0, opaque: opaque != 0 }
+            Entry::Dir { mode, mtime_ns: 0, opaque: flags & 1 != 0,
+                         rebased: flags & 2 != 0 }
         } else if ft == 0o010000 || ft == 0o060000 {
             Entry::Special { mode, rdev: 0 }
         } else {

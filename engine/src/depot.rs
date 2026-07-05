@@ -163,6 +163,31 @@ pub fn archive_upsert(conn: &Connection, rel: &str, mode: u32, mtime: i64,
     Ok(conn.last_insert_rowid())
 }
 
+/// Wipe a box's LAYER data — every sqlar row, its pool blobs, and the
+/// node side tables (ownership/rdev/xattr). Bookkeeping tables (process,
+/// outputs, meta, …) are untouched. Used by rotation before re-importing
+/// the rewritten encoding.
+pub fn archive_clear(conn: &Connection, box_id: i64) -> Result<(), String> {
+    let mut st = conn.prepare("SELECT rowid,mode,data FROM sqlar")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(i64, u32, bool)> = st.query_map([], |r| Ok((
+        r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32,
+        r.get::<_, Option<Vec<u8>>>(2)?.is_some())))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok()).collect();
+    drop(st);
+    for (rowid, mode, has_inline) in rows {
+        if mode & 0o170000 == 0o100000 && !has_inline {
+            let _ = std::fs::remove_file(blob_path(box_id, rowid));
+        }
+    }
+    for t in ["sqlar", "ownership", "rdev", "xattr"] {
+        conn.execute(&format!("DELETE FROM {t}"), [])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 pub trait BoxDepot {
     // ── nodes ────────────────────────────────────────────────────────────
     /// Upsert the file row for `rel` and return its rowid — the key that
@@ -198,8 +223,9 @@ pub trait BoxDepot {
     fn drop_row(&self, rel: &str);
     // ── readout ─────────────────────────────────────────────────────────
     fn entry(&self, rel: &str) -> Option<Entry>;
-    /// Direct overlay children of dir `rel`: (whiteout names, present names).
-    fn children_of(&self, rel: &str) -> (Vec<String>, Vec<String>);
+    /// Direct overlay children of dir `rel`:
+    /// (whiteout names, present names, hole names).
+    fn children_of(&self, rel: &str) -> (Vec<String>, Vec<String>, Vec<String>);
     /// Refresh the in-RAM mirror entry for ONE path from the store, after
     /// an offline write through a separate connection.
     fn reload_entry(&self, rel: &str);
@@ -358,10 +384,13 @@ impl BoxDepot for BoxState {
         // opaque dir must not silently clear it. Default is false on first
         // creation (use set_opaque() to flip).
         let mut kinds = self.kinds.write().unwrap();
-        let was_opaque = matches!(kinds.get(rel),
-            Some(Entry::Dir { opaque: true, .. }));
+        let (was_opaque, was_rebased) = match kinds.get(rel) {
+            Some(Entry::Dir { opaque, rebased, .. }) => (*opaque, *rebased),
+            _ => (false, false),
+        };
         kinds.insert(rel.to_string(),
-            Entry::Dir { mode: m, mtime_ns: now_ns(), opaque: was_opaque });
+            Entry::Dir { mode: m, mtime_ns: now_ns(), opaque: was_opaque,
+                         rebased: was_rebased });
     }
 
     /// Mark `rel` as an OPAQUE directory (OCI/AUFS `.wh..wh..opq` semantics):
@@ -384,13 +413,14 @@ impl BoxDepot for BoxState {
         }
         let mut kinds = self.kinds.write().unwrap();
         match kinds.get(rel).cloned() {
-            Some(Entry::Dir { mode, mtime_ns, .. }) => {
+            Some(Entry::Dir { mode, mtime_ns, rebased, .. }) => {
                 kinds.insert(rel.to_string(),
-                    Entry::Dir { mode, mtime_ns, opaque: true });
+                    Entry::Dir { mode, mtime_ns, opaque: true, rebased });
             }
             _ => {
                 kinds.insert(rel.to_string(), Entry::Dir {
-                    mode: 0o040755, mtime_ns: now_ns(), opaque: true });
+                    mode: 0o040755, mtime_ns: now_ns(), opaque: true,
+                    rebased: false });
             }
         }
     }
@@ -524,10 +554,11 @@ impl BoxDepot for BoxState {
     }
 
     /// Direct overlay children of dir `rel`: (whiteout names, present names).
-    fn children_of(&self, rel: &str) -> (Vec<String>, Vec<String>) {
+    fn children_of(&self, rel: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
         let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };
         let mut white = vec![];
         let mut present = vec![];
+        let mut holes = vec![];
         for (p, e) in self.kinds.read().unwrap().iter() {
             if !p.starts_with(&prefix) || p.len() == prefix.len() {
                 continue;
@@ -538,10 +569,11 @@ impl BoxDepot for BoxState {
             }
             match e {
                 Entry::Whiteout => white.push(tail.to_string()),
+                Entry::Hole => holes.push(tail.to_string()),
                 _ => present.push(tail.to_string()),
             }
         }
-        (white, present)
+        (white, present, holes)
     }
 }
 
@@ -651,7 +683,11 @@ pub fn export_layer(conn: &Connection, box_id: i64)
             continue;
         }
         if mode == S_IFCHR {
-            tree_insert(&mut root, &name, Node::tombstone());
+            // opaque bit 1 = backdrop anchor: an anchored whiteout row IS
+            // a hole ("not occluded"), not a deletion.
+            let node = if opaque & 2 != 0 { Node::hole() }
+                       else { Node::tombstone() };
+            tree_insert(&mut root, &name, node);
             continue;
         }
         let mut attrs = side.remove(&name).unwrap_or_default();
@@ -675,9 +711,10 @@ pub fn export_layer(conn: &Connection, box_id: i64)
         let node = Node {
             presence: depot_model::Presence::Live,
             blob,
-            opaque: ft == 0o040000 && opaque != 0,
+            opaque: ft == 0o040000 && opaque & 1 != 0,
             attrs: Some(attrs),
-            anchor: depot_model::Anchor::Lower,
+            anchor: if opaque & 2 != 0 { depot_model::Anchor::Backdrop }
+                    else { depot_model::Anchor::Lower },
             children: Default::default(),
         };
         tree_insert(&mut root, &name, node);
@@ -695,6 +732,16 @@ fn import_node(conn: &Connection, box_id: i64, name: &str,
         archive_upsert(conn, name, S_IFCHR, 0, 0, None, 0)?;
         return Ok(());
     }
+    let anchor_bit: i64 = if node.anchor == depot_model::Anchor::Backdrop { 2 }
+                          else { 0 };
+    if node.attrs.is_none() && anchor_bit != 0
+        && matches!(node.blob, BlobOp::Keep)
+    {
+        // A backdrop-anchored node without recorded facets is a HOLE.
+        archive_upsert(conn, name, S_IFCHR, 0, 0, None, anchor_bit)?;
+        // (A hole may still carry children in the model; the sqlar
+        // variant's rows are per-name, so children import normally.)
+    }
     if let Some(attrs) = &node.attrs {
         let mode: u32 = parse_a(attrs, b"mode")
             .ok_or_else(|| format!("{name}: node without mode attr"))?;
@@ -703,17 +750,17 @@ fn import_node(conn: &Connection, box_id: i64, name: &str,
         let rowid = match (&node.blob, ft) {
             (_, 0o040000) => {
                 archive_upsert(conn, name, mode, mtime, 0, None,
-                               node.opaque as i64)?
+                               node.opaque as i64 | anchor_bit)?
             }
             (BlobOp::Set(t), 0o120000) => {
                 // Symlink: target inline, sz == len (the "not deflated" mark).
                 archive_upsert(conn, name, mode, mtime, t.len() as i64,
-                               Some(t), 0)?
+                               Some(t), anchor_bit)?
             }
             (BlobOp::Set(bytes), _) => {
                 // Regular file: bytes ALWAYS to the pool blob (D4).
                 let rid = archive_upsert(conn, name, mode, mtime,
-                                         bytes.len() as i64, None, 0)?;
+                                         bytes.len() as i64, None, anchor_bit)?;
                 let bp = blob_path(box_id, rid);
                 if let Some(p) = bp.parent() {
                     std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
@@ -723,7 +770,7 @@ fn import_node(conn: &Connection, box_id: i64, name: &str,
             }
             (BlobOp::Keep, _) => {
                 // fifo / device node: row only.
-                archive_upsert(conn, name, mode, mtime, 0, None, 0)?
+                archive_upsert(conn, name, mode, mtime, 0, None, anchor_bit)?
             }
             (BlobOp::Remove, _) => {
                 return Err(format!("{name}: Remove blob in a full layer"));

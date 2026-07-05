@@ -1697,6 +1697,115 @@ fn dispatch_ui(state: &State, msg: &Value) -> Value {
             b.set_ro_attachments(ids);
             json!({"ok": true})
         }
+        // Rotation (DEPOT-DESIGN.md §6): promote child box over its
+        // parent. args: [child_sid]. Encodings are rewritten — no
+        // layer's occlusion changes: the child box ends up holding the
+        // old stack's total occlusion (compose) and BECOMES the parent;
+        // the old parent box holds the inverse (replicas + holes) and
+        // becomes the child. Purely syntactic — no view, no host I/O;
+        // ancestors are consulted only as recorded data.
+        "rotate" => {
+            let ov = lock(state).overlay.clone();
+            let (Some(ov), Some(child_id)) = (ov, arg_sid(args)) else {
+                return json!({"ok": false, "error": "no overlay / bad sid"});
+            };
+            let runpids = lock(state).box_runpids.clone();
+            // Hydrate the at-rest pair (add_box pulls the parent chain in).
+            if ov.box_of(child_id).is_none() {
+                if !crate::paths::state_home()
+                    .join(format!("{child_id}.sqlar")).exists()
+                {
+                    return json!({"ok": false, "error": "no such box"});
+                }
+                match crate::capture::BoxState::create(child_id) {
+                    Ok(cb) => {
+                        cb.load_mirror();
+                        ov.add_box(std::sync::Arc::new(cb));
+                    }
+                    Err(e) => return json!({"ok": false, "error": e.to_string()}),
+                }
+            }
+            let Some(child) = ov.box_of(child_id) else {
+                return json!({"ok": false, "error": "no such box"});
+            };
+            let Some(parent_id) = child.parent() else {
+                return json!({"ok": false, "error": "box has no parent"});
+            };
+            let Some(parent) = ov.box_of(parent_id) else {
+                return json!({"ok": false, "error": "parent not hydrated"});
+            };
+            if runpids.contains_key(&child_id) || runpids.contains_key(&parent_id) {
+                return json!({"ok": false,
+                              "error": "rotate needs both boxes at rest"});
+            }
+            // Export the recorded chain: the parent's OWN ancestors
+            // (lower-first), then a = parent's layer, b = child's layer.
+            let mut anc_layers: Vec<depot_model::Layer> = Vec::new();
+            {
+                let mut cur = parent.parent();
+                let mut hops = 0;
+                while let Some(id) = cur {
+                    hops += 1;
+                    if hops > 64 { break; }
+                    let Some(bx) = ov.box_of(id) else { break };
+                    let conn = bx.conn.lock().unwrap();
+                    match crate::depot::export_layer(&conn, id) {
+                        Ok(l) => anc_layers.push(l),
+                        Err(e) => return json!({"ok": false, "error": e}),
+                    }
+                    drop(conn);
+                    cur = bx.parent();
+                }
+                anc_layers.reverse(); // walked upward; rotate wants lower-first
+            }
+            let a = {
+                let conn = parent.conn.lock().unwrap();
+                match crate::depot::export_layer(&conn, parent_id) {
+                    Ok(l) => l,
+                    Err(e) => return json!({"ok": false, "error": e}),
+                }
+            };
+            let b = {
+                let conn = child.conn.lock().unwrap();
+                match crate::depot::export_layer(&conn, child_id) {
+                    Ok(l) => l,
+                    Err(e) => return json!({"ok": false, "error": e}),
+                }
+            };
+            let anc_refs: Vec<&depot_model::Layer> = anc_layers.iter().collect();
+            let (b_new, a_new) = depot_model::rotate(&anc_refs, &a, &b);
+            // Write back: the CHILD box carries B' and becomes the
+            // parent; the old parent carries A' and becomes its child.
+            {
+                let conn = child.conn.lock().unwrap();
+                if let Err(e) = crate::depot::archive_clear(&conn, child_id)
+                    .and_then(|_| crate::depot::import_layer(&conn, child_id, &b_new))
+                {
+                    return json!({"ok": false, "error": e});
+                }
+            }
+            {
+                let conn = parent.conn.lock().unwrap();
+                if let Err(e) = crate::depot::archive_clear(&conn, parent_id)
+                    .and_then(|_| crate::depot::import_layer(&conn, parent_id, &a_new))
+                {
+                    return json!({"ok": false,
+                                  "error": format!("parent import: {e}                                                     (child already rewritten)")});
+                }
+            }
+            // Flip the encoding parenthood (bookkeeping): child takes the
+            // old parent's parent; the old parent hangs off the child.
+            let grand = parent.parent();
+            child.set_parent(grand);
+            child.set_meta("parent_box_id",
+                           &grand.map(|g| g.to_string()).unwrap_or_default());
+            parent.set_parent(Some(child_id));
+            parent.set_meta("parent_box_id", &child_id.to_string());
+            // Refresh the in-RAM mirrors.
+            child.load_mirror();
+            parent.load_mirror();
+            json!({"ok": true, "parent": child_id, "child": parent_id})
+        }
         "reload_rules" => {
             if let Some(ov) = lock(state).overlay.clone() {
                 ov.reload_rules();

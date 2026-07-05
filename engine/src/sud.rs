@@ -292,6 +292,9 @@ pub fn export_box(aid: i64, dest: &Path) -> Result<usize, String> {
                 std::os::unix::fs::symlink(target, &p)
                     .map_err(|e| format!("{rel}: symlink: {e}"))?;
             }
+            // A hole materializes nothing into the sud lower tree: the
+            // backdrop shows through at runtime, not at materialization.
+            crate::capture::Entry::Hole => {}
             crate::capture::Entry::Whiteout => {
                 let _ = std::fs::remove_file(&p);
                 if unsafe { libc::mknod(cpath().as_ptr(),

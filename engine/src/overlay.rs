@@ -89,6 +89,25 @@ type Key = (i64, String);
 /// then the box root ""). The box root itself IS a valid opaque target — a
 /// layer can carry a `.wh..wh..opq` directly at its top to opacify EVERYTHING
 /// from below. Root rel ("") has no ancestors → false.
+/// Any ancestor dir of `rel` (or the box root) marked REBASED in this
+/// box (backdrop-anchored, DEPOT-DESIGN.md §2): everything recorded
+/// BELOW this box is erased for that subtree, while the backdrop (host)
+/// shows through — so the chain walk must stop here and fall to host.
+fn has_rebased_ancestor(b: &BoxState, rel: &str) -> bool {
+    if rel.is_empty() { return false; }
+    let mut p = Path::new(rel).parent();
+    while let Some(ancestor) = p {
+        let s = ancestor.to_string_lossy();
+        let s = s.as_ref();
+        if matches!(b.entry(s), Some(Entry::Dir { rebased: true, .. })) {
+            return true;
+        }
+        if s.is_empty() { break; }
+        p = ancestor.parent();
+    }
+    false
+}
+
 fn has_opaque_ancestor(b: &BoxState, rel: &str) -> bool {
     if rel.is_empty() { return false; }
     let mut p = Path::new(rel).parent();
@@ -944,7 +963,8 @@ impl Overlay {
             Some(Entry::Dir { mode, mtime_ns, .. }) => Layer::UpperDir { mode, mtime_ns },
             Some(Entry::Symlink { target }) => Layer::UpperSymlink { target },
             Some(Entry::Special { mode, rdev }) => Layer::UpperSpecial { mode, rdev },
-            None => {
+            // A hole in the box's own upper: the backdrop (host) shows.
+            Some(Entry::Hole) | None => {
                 if self.host(rel).symlink_metadata().is_ok() {
                     Layer::Lower
                 } else {
@@ -1048,6 +1068,10 @@ impl Overlay {
                     return Layer::UpperSymlink { target },
                 Some(Entry::Special { mode, rdev }) =>
                     return Layer::UpperSpecial { mode, rdev },
+                // A hole: "this key is not occluded" — every recorded
+                // layer below is skipped; the backdrop (host, or nothing
+                // under no_host) shows through LIVE.
+                Some(Entry::Hole) => break,
                 None => {
                     // D-opaque (OCI): an upper box can mark a directory as
                     // opaque (`.wh..wh..opq` convention) — when we don't have
@@ -1057,6 +1081,11 @@ impl Overlay {
                     // below for that dir's subtree). Return Absent immediately.
                     if has_opaque_ancestor(&b, rel) {
                         return Layer::Absent;
+                    }
+                    // A REBASED ancestor erases everything recorded
+                    // below this box for the subtree; the backdrop shows.
+                    if has_rebased_ancestor(&b, rel) {
+                        break;
                     }
                     // not in this box → next link in the chain
                 }
@@ -1095,7 +1124,7 @@ impl Overlay {
     fn chain_dir_has_children(&self, bid: i64, rel: &str) -> bool {
         for id in self.chain_of(bid) {
             let Some(b) = self.box_of(id) else { continue };
-            let (_white, present) = b.children_of(rel);
+            let (_white, present, _holes) = b.children_of(rel);
             if !present.is_empty() { return true; }
         }
         false
@@ -1321,8 +1350,38 @@ impl Overlay {
                 if bx.is_opaque(rel) || has_opaque_ancestor(&bx, rel) {
                     names.clear();
                 }
-                let (white, present) = bx.children_of(rel);
+                // REBASED here (this dir, or an ancestor): everything the
+                // chain recorded so far is erased for this subtree; the
+                // backdrop (host) still shows through — re-seed it.
+                if matches!(bx.entry(rel),
+                            Some(Entry::Dir { rebased: true, .. }))
+                    || has_rebased_ancestor(&bx, rel)
+                {
+                    names.clear();
+                    if !no_host {
+                        if let Ok(rd) = std::fs::read_dir(self.host(rel)) {
+                            for ent in rd.flatten() {
+                                if let Some(n) = ent.file_name().to_str() {
+                                    names.insert(n.to_string(), ());
+                                }
+                            }
+                        }
+                    }
+                }
+                let (white, present, holes) = bx.children_of(rel);
                 for w in &white { names.remove(w); }
+                for h in &holes {
+                    // A hole un-occludes the name: recorded contributions
+                    // vanish; the LIVE backdrop decides.
+                    names.remove(h);
+                    if !no_host {
+                        let hp = if rel.is_empty() { h.clone() }
+                                 else { format!("{rel}/{h}") };
+                        if self.host(&hp).symlink_metadata().is_ok() {
+                            names.insert(h.clone(), ());
+                        }
+                    }
+                }
                 for p in present { names.insert(p, ()); }
             }
         }
