@@ -49,10 +49,14 @@
 //!   plus an intra-ingest map, never persisted.
 //!
 //! Import/update discovery is O(changes), not O(tree × history): ONE
-//! `git log --raw` stream (first-parent deltas, full DAG, topo
-//! oldest-first) + ONE persistent `cat-file --batch` for raw commits
-//! and changed blobs; per-commit views are built frontier-style
-//! (clone first parent's view + apply_mut of the delta, refcounted by
+//! `git rev-list --parents` pass fixes the CHAIN LANDING ORDER (an
+//! own linearization, `walk_order` — git's `--topo-order`/`--date-order`
+//! both interleave diverged lines and blow the reverse-delta chain up
+//! by orders of magnitude on merge-heavy history), then ONE
+//! `git diff-tree --stdin` stream serves the first-parent deltas in
+//! that order + ONE persistent `cat-file --batch` the raw commits and
+//! changed blobs; per-commit views are built frontier-style (clone
+//! first parent's view + apply_mut of the delta, refcounted by
 //! remaining children). The CHAIN ENCODING is untouched: the same
 //! records, reverse deltas, batching and anchoring land through
 //! `store::Ingest` exactly as before.
@@ -632,11 +636,13 @@ fn collect_tag_objects(repo: &Path, refs: &[RefMeta]) -> Result<Vec<TagObj>> {
 // ------------------------------------------------------------- discovery
 //
 // Import/update walk the history O(changes), not O(tree × history):
-// ONE `git log --raw` stream yields every reachable commit with its
-// changed paths (vs the FIRST parent — the frontier's base), and ONE
-// persistent `git cat-file --batch` serves the raw commit objects and
-// the changed blobs on demand. No per-commit subprocess, no re-piping
-// of unchanged blobs.
+// ONE `git rev-list --parents` pass computes the chain landing order
+// (`walk_order` — the TREES size model), ONE `git diff-tree --stdin`
+// stream fed that order yields every commit's changed paths (vs the
+// FIRST parent — the frontier's base), and ONE persistent
+// `git cat-file --batch` serves the raw commit objects and the
+// changed blobs on demand. No per-commit subprocess, no re-piping of
+// unchanged blobs.
 
 /// One persistent `git cat-file --batch` child for a whole run. Strict
 /// request-one/read-one interleaving: a single pending request never
@@ -705,54 +711,58 @@ struct RawChange {
     path: Vec<u8>,
 }
 
-/// The one streaming walk: `git log --format=%x01%H --raw -z
-/// --no-renames --no-abbrev --diff-merges=first-parent --topo-order
-/// --reverse` over branches+tags (minus `negations` for updates).
-/// Stream grammar, NUL-tokenized (verified against git 2.43):
-///   `\x01<sha>\0` then, iff the commit changes anything vs its first
-///   parent (empty tree for roots), `\n:<meta>\0<path>\0` per change —
-///   only the FIRST meta token of a commit carries the `\n`. Tokens are
-///   dispatched by position, never by path content, so arbitrary path
-///   bytes are safe.
+/// The one streaming change source: `git diff-tree --stdin -r -z
+/// --root --no-renames --no-abbrev --diff-merges=first-parent`, fed the
+/// caller-computed chain landing order (`Dag::order`) by a writer
+/// thread (requests can outrun the pipe buffer while replies fill the
+/// other pipe — same deadlock shape as `fetch_blobs`). Stream grammar,
+/// NUL-tokenized (verified against git 2.43): `<sha>\0` then, iff the
+/// commit changes anything vs its first parent (empty tree for roots —
+/// `--root`; `--always` echoes even no-change commits, which the walk
+/// must still land), `:<meta>\0<path>\0` per change. Tokens are dispatched by
+/// their leading byte (`:` = meta, else sha) and by position (a path
+/// always follows a meta), never by path content, so arbitrary path
+/// bytes are safe.
 struct LogStream {
     child: std::process::Child,
     out: std::io::BufReader<std::process::ChildStdout>,
+    writer: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     /// The next commit's sha, read while scanning the previous one.
     pending: Option<String>,
     eof: bool,
 }
 
 impl LogStream {
-    fn spawn(repo: &Path, negations: &[String]) -> Result<LogStream> {
-        let mut cmd = Command::new("git");
-        cmd.arg("-C")
+    fn spawn(repo: &Path, order: &[String]) -> Result<LogStream> {
+        let mut child = Command::new("git")
+            .arg("-C")
             .arg(repo)
             .args([
-                "log",
-                "--format=%x01%H",
-                "--raw",
+                "diff-tree",
+                "--stdin",
+                "-r",
                 "-z",
+                "--root",
+                "--always",
                 "--no-renames",
                 "--no-abbrev",
                 "--diff-merges=first-parent",
-                "--topo-order",
-                "--reverse",
-                "--branches",
-                "--tags",
-            ]);
-        if !negations.is_empty() {
-            // A negation tip can have been pruned from the buffer's
-            // object db; --ignore-missing keeps the walk going (known
-            // commits that re-stream are skipped by the caller).
-            cmd.arg("--ignore-missing").arg("--not").args(negations);
-        }
-        let mut child = cmd
-            .stdin(Stdio::null())
+            ])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let mut reqs = Vec::with_capacity(order.iter().map(|s| s.len() + 1).sum());
+        for sha in order {
+            reqs.extend_from_slice(sha.as_bytes());
+            reqs.push(b'\n');
+        }
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            stdin.write_all(&reqs) // drop closes stdin
+        });
         let out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
-        Ok(LogStream { child, out, pending: None, eof: false })
+        Ok(LogStream { child, out, writer: Some(writer), pending: None, eof: false })
     }
 
     /// The next NUL-terminated token, delimiter stripped; None = EOF.
@@ -769,8 +779,9 @@ impl LogStream {
         Ok(Some(buf))
     }
 
-    /// The next commit and its first-parent changes, stream order
-    /// (parents before children); None = clean EOF.
+    /// The next commit and its first-parent changes, request order
+    /// (the caller's order lists parents before children); None =
+    /// clean EOF.
     fn next_commit(&mut self) -> Result<Option<(String, Vec<RawChange>)>> {
         let sha = match self.pending.take() {
             Some(s) => s,
@@ -790,25 +801,24 @@ impl LogStream {
                 self.eof = true;
                 break;
             };
-            if tok.first() == Some(&1) {
+            if tok.first() != Some(&b':') {
                 self.pending = Some(Self::sha_of(&tok)?);
                 break;
             }
-            // Meta token: optional leading \n (first change of a
-            // commit), then ":<old_mode> <new_mode> <old_oid> <new_oid> <status>".
-            let meta = tok.strip_prefix(b"\n").unwrap_or(&tok);
-            let meta = std::str::from_utf8(meta)
-                .ok()
-                .and_then(|s| s.strip_prefix(':'))
-                .ok_or_else(|| Error::Git(format!("log --raw: bad meta token {:?}",
-                                                  String::from_utf8_lossy(&tok))))?;
+            // Meta token: ":<old_mode> <new_mode> <old_oid> <new_oid> <status>".
+            let meta = std::str::from_utf8(&tok[1..]).map_err(|_| {
+                Error::Git(format!(
+                    "diff-tree: bad meta token {:?}",
+                    String::from_utf8_lossy(&tok)
+                ))
+            })?;
             let f: Vec<&str> = meta.split(' ').collect();
             let [_, new_mode, _, new_oid, status] = f.as_slice() else {
-                return Err(Error::Git(format!("log --raw: bad meta {meta:?}")));
+                return Err(Error::Git(format!("diff-tree: bad meta {meta:?}")));
             };
             let path = self
                 .token()?
-                .ok_or_else(|| Error::Git("log --raw: meta without path".into()))?;
+                .ok_or_else(|| Error::Git("diff-tree: meta without path".into()))?;
             changes.push(RawChange {
                 status: status.bytes().next().unwrap_or(0),
                 new_mode: new_mode.to_string(),
@@ -820,20 +830,25 @@ impl LogStream {
     }
 
     fn sha_of(tok: &[u8]) -> Result<String> {
-        std::str::from_utf8(&tok[1..])
+        std::str::from_utf8(tok)
             .map(str::to_string)
-            .map_err(|_| Error::Git("log: non-utf8 sha".into()))
+            .map_err(|_| Error::Git("diff-tree: non-utf8 sha".into()))
     }
 
     fn finish(&mut self) -> Result<()> {
         use std::io::Read as _;
+        if let Some(w) = self.writer.take() {
+            w.join()
+                .map_err(|_| Error::Git("diff-tree writer panicked".into()))?
+                .map_err(Error::Io)?;
+        }
         let status = self.child.wait()?;
         if !status.success() {
             let mut err = String::new();
             if let Some(e) = self.child.stderr.as_mut() {
                 let _ = e.read_to_string(&mut err);
             }
-            return Err(Error::Git(format!("log --raw: {}", err.trim())));
+            return Err(Error::Git(format!("diff-tree --stdin: {}", err.trim())));
         }
         Ok(())
     }
@@ -843,6 +858,9 @@ impl Drop for LogStream {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
     }
 }
 
@@ -904,16 +922,29 @@ fn delta_layer(changes: &[RawChange], cat: &mut CatFile) -> Result<Layer> {
     Ok(Layer { root })
 }
 
-/// One cheap `rev-list --parents` pass over the same scope as the log
-/// stream: per-sha child count (the frontier refcount — parents outside
-/// the streamed set included: those are the update path's boundary
-/// parents) and the streamed set itself.
-fn dag_children(
-    repo: &Path,
-    negations: &[String],
-) -> Result<(HashMap<String, u32>, std::collections::HashSet<String>)> {
+/// The walked scope, from ONE `rev-list --parents` pass (same scope
+/// as the change stream; minus `negations` for updates).
+struct Dag {
+    /// Per-sha child count within the scope (the frontier refcount —
+    /// parents outside the streamed set included: those are the update
+    /// path's boundary parents).
+    counts: HashMap<String, u32>,
+    /// The streamed set itself.
+    streamed: std::collections::HashSet<String>,
+    /// CHAIN LANDING ORDER (parents always before children): the order
+    /// `ingest_stream` feeds to `git diff-tree --stdin` and therefore
+    /// the order trees land in the TREES chain. Because each chain
+    /// record is the reverse delta between chain-NEIGHBORING trees,
+    /// this order decides record size — see `walk_order`.
+    order: Vec<String>,
+}
+
+fn dag_scope(repo: &Path, negations: &[String]) -> Result<Dag> {
     let mut args: Vec<&str> = vec!["rev-list", "--parents", "--branches", "--tags"];
     if !negations.is_empty() {
+        // A negation tip can have been pruned from the buffer's
+        // object db; --ignore-missing keeps the walk going (known
+        // commits that re-stream are skipped by the caller).
         args.push("--ignore-missing");
         args.push("--not");
         args.extend(negations.iter().map(String::as_str));
@@ -921,15 +952,139 @@ fn dag_children(
     let out = git_str(repo, &args)?;
     let mut counts: HashMap<String, u32> = HashMap::new();
     let mut streamed = std::collections::HashSet::new();
+    // (sha, parents) in rev-list output order — children before
+    // parents, so the first zero-child sha of each history comes
+    // first. Dropped after `walk_order`.
+    let mut commits: Vec<(String, Vec<String>)> = Vec::new();
     for line in out.lines() {
         let mut it = line.split(' ');
-        let sha = it.next().unwrap_or_default();
-        streamed.insert(sha.to_string());
-        for p in it {
-            *counts.entry(p.to_string()).or_insert(0) += 1;
+        let sha = it.next().unwrap_or_default().to_string();
+        streamed.insert(sha.clone());
+        let parents: Vec<String> = it.map(str::to_string).collect();
+        for p in &parents {
+            *counts.entry(p.clone()).or_insert(0) += 1;
+        }
+        commits.push((sha, parents));
+    }
+    let order = walk_order(&commits, &streamed);
+    Ok(Dag { counts, streamed, order })
+}
+
+/// The chain landing order — the size model of the TREES chain.
+///
+/// TREES records are reverse deltas between chain-NEIGHBORING trees,
+/// so this order decides record size: every adjacency between trees
+/// from diverged lines of history is paid as a record carrying their
+/// full file-level divergence. git's own linearizations interleave
+/// lines freely and measured catastrophic on merge-heavy history
+/// (git.git, 85k commits: `--topo-order` and `--date-order` both put
+/// ~1/3 of commits next to a diverged line at ~1.5MB a record — 94% of
+/// all staged bytes, 15GB+ of staging, ENOSPC before finishing).
+///
+/// The order that restores "record ∝ what the commit touched" is a
+/// SEGMENT-AT-ITS-FORK linearization, produced by one Kahn walk over
+/// the scope with a LIFO ready stack:
+///
+/// * a commit becomes ready when all its in-scope parents are emitted;
+/// * when a commit is emitted, its now-ready children are pushed
+///   sorted by first-parent lineage length (`fpheight`) DESCENDING, so
+///   the stack pops SHORT side lines first and the longest line — the
+///   mainline continuation — LAST;
+/// * the LIFO discipline then keeps every first-parent segment
+///   contiguous and places it immediately after its fork: a topic that
+///   forked at X lands right after X (its whole divergence from the
+///   chain neighbor is the topic itself plus one mainline step), the
+///   mainline resumes behind it, and the topic's eventual merge — made
+///   ready by its mainline first parent much later — lands
+///   first-parent-adjacent, costing exactly its own first-parent
+///   change;
+/// * unrelated ROOT histories (git.git's gitk/git-gui subtree sources,
+///   `todo`) stay whole: their commits gate on nothing outside their
+///   own component, so each component drains as ONE contiguous block
+///   (shortest component first), costing two whole-tree adjacencies
+///   total instead of one per subtree merge or timestamp interleave.
+///
+/// Parents always precede children (it is a Kahn order), which is the
+/// ingest's only correctness requirement; everything else is purely a
+/// size optimization. Measured on git.git (85k commits): git-ordered
+/// walks headed past 50GB of raw staging (ENOSPC on a 15GB disk,
+/// never finished); this order stages 11.4GB raw against an 8.0GB
+/// irreducible floor (the sum of every commit's own first-parent
+/// old-side blob bytes) and completes in minutes. The residue is real
+/// divergence at genuinely era-crossing merges (git.git's cross-maint
+/// security waves), not walk noise.
+fn walk_order(
+    commits: &[(String, Vec<String>)],
+    streamed: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let n = commits.len();
+    let idx: HashMap<&str, u32> =
+        commits.iter().enumerate().map(|(i, (s, _))| (s.as_str(), i as u32)).collect();
+    // In-scope parent count (readiness gate) and first-parent children.
+    let mut pending: Vec<u32> = vec![0; n];
+    let mut fp_child_of: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (i, (_, parents)) in commits.iter().enumerate() {
+        let mut first = true;
+        for p in parents {
+            if let Some(&pi) = idx.get(p.as_str()) {
+                pending[i] += 1;
+                children[pi as usize].push(i as u32);
+                if first {
+                    fp_child_of[pi as usize].push(i as u32);
+                }
+            }
+            first = false;
         }
     }
-    Ok((counts, streamed))
+    // fpheight = longest first-parent-only chain hanging off a commit,
+    // by DP over one plain Kahn pass (reverse topological order).
+    let mut topo: Vec<u32> = Vec::with_capacity(n);
+    {
+        let mut deg = pending.clone();
+        let mut queue: std::collections::VecDeque<u32> = (0..n as u32)
+            .filter(|&i| deg[i as usize] == 0)
+            .collect();
+        while let Some(i) = queue.pop_front() {
+            topo.push(i);
+            for &c in &children[i as usize] {
+                deg[c as usize] -= 1;
+                if deg[c as usize] == 0 {
+                    queue.push_back(c);
+                }
+            }
+        }
+    }
+    let mut fpheight: Vec<u32> = vec![1; n];
+    for &i in topo.iter().rev() {
+        for &c in &fp_child_of[i as usize] {
+            fpheight[i as usize] = fpheight[i as usize].max(1 + fpheight[c as usize]);
+        }
+    }
+    // The ready stack. Roots seed it, longest lineage pushed first so
+    // the shortest root component drains first and the primary history
+    // comes out last (deterministic: ties break on scope index).
+    let mut order = Vec::with_capacity(n);
+    let mut stack: Vec<u32> = (0..n as u32).filter(|&i| pending[i as usize] == 0).collect();
+    stack.sort_by_key(|&i| (std::cmp::Reverse(fpheight[i as usize]), i));
+    let mut ready: Vec<u32> = Vec::new();
+    while let Some(i) = stack.pop() {
+        order.push(commits[i as usize].0.clone());
+        ready.clear();
+        for &c in &children[i as usize] {
+            pending[c as usize] -= 1;
+            if pending[c as usize] == 0 {
+                ready.push(c);
+            }
+        }
+        // Push longest lineage FIRST so the stack pops short side
+        // lines before the mainline continuation (LIFO).
+        ready.sort_by_key(|&c| (std::cmp::Reverse(fpheight[c as usize]), c));
+        stack.extend(ready.iter().copied());
+    }
+    debug_assert_eq!(order.len(), streamed.len());
+    let _ = streamed;
+    order
 }
 
 /// The frontier: view-per-commit-with-unprocessed-children, refcounted
@@ -1090,16 +1245,16 @@ fn same_tree_parent(
 fn ingest_stream(
     repo: &Path,
     ingest: &mut store::Ingest,
-    negations: &[String],
-    counts: &HashMap<String, u32>,
+    dag: &Dag,
     seeds: Vec<(String, depot::View)>,
     known: &std::collections::HashSet<String>,
     tree_oids: &mut HashMap<String, String>,
     mut rep: Option<&mut ReportAccum>,
     on_commit: &mut dyn FnMut(&CommitMeta) -> Result<()>,
 ) -> Result<(usize, usize)> {
+    let counts = &dag.counts;
     let mut cat = CatFile::new(repo)?;
-    let mut stream = LogStream::spawn(repo, negations)?;
+    let mut stream = LogStream::spawn(repo, &dag.order)?;
     let mut frontier = Frontier { views: HashMap::new(), max: 0 };
     for (sha, view) in seeds {
         let rc = counts.get(&sha).copied().unwrap_or(0);
@@ -1157,7 +1312,7 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
     -> Result<ImportOutcome>
 {
     let refs = collect_refs(repo)?;
-    let (counts, _) = dag_children(repo, &[])?;
+    let dag = dag_scope(repo, &[])?;
 
     let mut st = store::Store::create(store)?;
     let mut ingest = store::Ingest::new(&mut st, level)?;
@@ -1170,8 +1325,7 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
     let (new_commits, max_frontier) = ingest_stream(
         repo,
         &mut ingest,
-        &[],
-        &counts,
+        &dag,
         Vec::new(),
         &Default::default(),
         &mut HashMap::new(),
@@ -1306,7 +1460,8 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
         .collect();
     negations.sort();
     negations.dedup();
-    let (counts, streamed) = dag_children(repo, &negations)?;
+    let dag = dag_scope(repo, &negations)?;
+    let (counts, streamed) = (&dag.counts, &dag.streamed);
 
     // Boundary/known views: a new commit's parent can be an OLD commit
     // whose view is in no frontier — reconstruct those from the store
@@ -1315,7 +1470,7 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
     // chain must not have unaccounted staged records).
     let mut known = std::collections::HashSet::new();
     let mut need: Vec<(String, u64)> = Vec::new(); // (sha, tree_idx)
-    for sha in &streamed {
+    for sha in streamed {
         // Already stored but streaming again (rewind, recreated branch,
         // pruned negation object): skip its records, seed its view if
         // any streamed child needs it.
@@ -1339,7 +1494,7 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
 
     let mut ingest = store::Ingest::new(&mut st, level)?;
     let (k, _max_frontier) = ingest_stream(
-        repo, &mut ingest, &negations, &counts, seeds, &known, &mut HashMap::new(), None,
+        repo, &mut ingest, &dag, seeds, &known, &mut HashMap::new(), None,
         &mut |_| Ok(()), // only the count is used
     )?;
     ingest_tags(repo, &mut ingest, &refs)?;
@@ -1509,7 +1664,7 @@ fn write_object(repo: &Path, typ: &str, bytes: &[u8], expect: &str) -> Result<()
 //     resolves on any transport (no promisor/lazy-fetch tricks);
 //   * fetch's connectivity check walks the new tips' full closures
 //     down to the boundary — tips' trees/blobs must exist;
-//   * `git log --raw` emits correct changed-path deltas for commits
+//   * `git diff-tree --stdin` emits correct changed-path deltas for commits
 //     whose first parent is a boundary tip only if the parent's tree
 //     objects exist (git diffs against the parent tree, shallow or
 //     not).
@@ -2246,7 +2401,8 @@ fn bootstrap(
         }
         let buffer_peak_kb = dir_kb(&repo);
         let negations = prev_tips.clone();
-        let (counts, streamed) = dag_children(&repo, &negations)?;
+        let dag = dag_scope(&repo, &negations)?;
+        let (counts, streamed) = (&dag.counts, &dag.streamed);
         // Boundary/known seeding, mid-bootstrap flavor: views come
         // from the staged chain, not the store.
         let mut known = std::collections::HashSet::new();
@@ -2258,7 +2414,7 @@ fn bootstrap(
             need.entry(t).or_default().push(sha.to_string());
             Ok(())
         };
-        for sha in &streamed {
+        for sha in streamed {
             if known_all.contains(sha) {
                 known.insert(sha.clone());
                 if counts.get(sha).copied().unwrap_or(0) > 0 {
@@ -2275,7 +2431,7 @@ fn bootstrap(
         // The sink keeps ONLY the sha (known_all needs it for later
         // rungs); the rest of the CommitMeta is dropped per commit.
         let (rung_new, frontier_peak) = ingest_stream(
-            &repo, &mut ingest, &negations, &counts, seeds, &known, &mut tree_oids, None,
+            &repo, &mut ingest, &dag, seeds, &known, &mut tree_oids, None,
             &mut |cm| {
                 known_all.insert(cm.sha.clone());
                 Ok(())

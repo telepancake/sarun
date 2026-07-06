@@ -477,8 +477,9 @@ fn tree_tags_dedup_import_export_and_mirror() {
     // dedups against main's tree, lonetree adds exactly one record.
     assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 14,
                "tree-tag dedup broke: treetag must reuse main's TREES record");
-    let tip_tree = st.commit_record_at(st.count(gitdepot::store::COMMITS).unwrap() - 1)
-        .unwrap().tree_idx;
+    let main_sha = sh_git(&repo, &["rev-parse", "main"]).trim().to_string();
+    let main_idx = st.sha_to_idx(&main_sha).unwrap().expect("main in store");
+    let tip_tree = st.commit_record_at(main_idx).unwrap().tree_idx;
     drop(st);
 
     // resolve_ref: the pin is the TAG sha; treetag's tree is the tip's.
@@ -728,7 +729,9 @@ fn tree_dedup_reuses_parent_not_distant_ancestors() {
     assert_eq!(n_commits, 14);
     assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 13,
                "identical-to-parent tree minted a fresh TREES record");
-    let tip = st.commit_record_at(n_commits - 1).unwrap();
+    let tip_sha = sh_git(&repo, &["rev-parse", "main"]).trim().to_string();
+    let tip_idx = st.sha_to_idx(&tip_sha).unwrap().expect("tip in store");
+    let tip = st.commit_record_at(tip_idx).unwrap();
     let parent = st.commit_record_at(tip.parent_idxs[0]).unwrap();
     assert_eq!(tip.tree_idx, parent.tree_idx);
     drop(st);
@@ -739,7 +742,8 @@ fn tree_dedup_reuses_parent_not_distant_ancestors() {
     let st = gitdepot::store::Store::open(&store).unwrap();
     assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 13);
     let tip = st.commit_record_at(14).unwrap();
-    assert_eq!(tip.tree_idx, 12);
+    let parent = st.commit_record_at(tip.parent_idxs[0]).unwrap();
+    assert_eq!(tip.tree_idx, parent.tree_idx);
     drop(st);
 
     // Revert to a distant ancestor's exact tree: same view, NEW record
@@ -797,10 +801,12 @@ fn resolve_ref_point_lookups() {
     let commit = |sha: &str, idx: usize| gitdepot::Resolved::Commit {
         sha: sha.to_string(), idx,
     };
+    let main_idx = n - 1
+        - meta.commits.iter().position(|c| c.sha == main_sha).expect("main in meta");
     assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap(),
-               commit(&main_sha, n - 1));
+               commit(&main_sha, main_idx));
     assert_eq!(gitdepot::resolve_ref(&store, "refs/heads/main").unwrap().unwrap(),
-               commit(&main_sha, n - 1));
+               commit(&main_sha, main_idx));
     let (v1_sha, v1_idx) = match gitdepot::resolve_ref(&store, "v1").unwrap().unwrap() {
         gitdepot::Resolved::Commit { sha, idx } => (sha, idx),
         other => panic!("lightweight tag must resolve to a commit, got {other:?}"),

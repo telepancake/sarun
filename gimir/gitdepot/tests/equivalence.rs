@@ -212,9 +212,21 @@ fn assert_store_matches_git(repo: &Path, store: &Path, shas: &[String]) {
     let recs = st.commit_records().unwrap();
     assert_eq!(recs.len(), shas.len(), "commit count");
     let idx_of: BTreeMap<&str, u64> = recs.iter().map(|r| (r.sha.as_str(), r.idx)).collect();
-    for (i, sha) in shas.iter().enumerate() {
-        let r = &recs[i];
-        assert_eq!(&r.sha, sha, "stable index {i} holds the wrong commit");
+    // The importer picks its own chain landing order (walk_order); the
+    // contract is set-equality with the repo plus parents-before-
+    // children stable indices, not any git-native ordering.
+    {
+        let mut want: Vec<&str> = shas.iter().map(String::as_str).collect();
+        let mut got: Vec<&str> = recs.iter().map(|r| r.sha.as_str()).collect();
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, want, "stored commit set differs from the repo");
+    }
+    for r in &recs {
+        let sha = &r.sha;
+        for &pi in &r.parent_idxs {
+            assert!(pi < r.idx, "{sha}: parent index {pi} not below own {}", r.idx);
+        }
         // Metadata straight from the raw object.
         let raw = sh_git(repo, &["cat-file", "commit", sha]);
         let hdr = |k: &str| -> String {

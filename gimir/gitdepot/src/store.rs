@@ -1739,7 +1739,20 @@ impl<'a> Ingest<'a> {
         // short-circuits every subtree `view` and `prev` still share.
         match &self.head_view {
             Some(prev) => {
-                let delta = depot::codec::encode(&depot::diff(Some(view), Some(prev)));
+                let d = depot::diff(Some(view), Some(prev));
+                let delta = depot::codec::encode(&d);
+                if std::env::var_os("GITDEPOT_TRACE_RECORDS").is_some() {
+                    fn walk(n: &depot::Node, nodes: &mut u64, sets: &mut u64, setb: &mut u64, tomb: &mut u64) {
+                        *nodes += 1;
+                        if n.presence == depot::Presence::Tombstone { *tomb += 1; }
+                        if let depot::BlobOp::Set(b) = &n.blob { *sets += 1; *setb += b.len() as u64; }
+                        for c in n.children.values() { walk(c, nodes, sets, setb, tomb); }
+                    }
+                    let (mut nodes, mut sets, mut setb, mut tomb) = (0, 0, 0, 0);
+                    walk(&d.root, &mut nodes, &mut sets, &mut setb, &mut tomb);
+                    eprintln!("TRACE rec={} len={} nodes={} sets={} setbytes={} tombs={}",
+                              self.n_trees, delta.len(), nodes, sets, setb, tomb);
+                }
                 self.tree_entries.push(delta)?;
             }
             None => {
