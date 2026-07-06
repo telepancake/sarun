@@ -592,3 +592,46 @@ fn upstream_rewrite_retires_old_store_and_logs() {
     assert!(rw.note.contains(retired.to_str().unwrap()),
             "note {:?} does not name the retired store", rw.note);
 }
+
+/// A rewrite that orphans nothing (the old tip stays reachable via
+/// another branch) must NOT retain a retired store copy — retirement
+/// is for unique history only, else every side-ref rewrite on a busy
+/// repo banks a full redundant store (unbounded disk). The reflog
+/// still records the rewrite either way.
+#[test]
+fn redundant_rewrite_drops_the_retired_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    let root = tmp.path().join("mirror");
+    build_fixture(&origin);
+    gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+
+    // Keep the old tip reachable, then rewrite main (amend) — the old
+    // commits ALL survive in the new store via "keep".
+    sh_git(&origin, &["branch", "keep", "main"]);
+    sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended tip"]);
+    let o = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert!(o.reimported);
+    let retired: Vec<_> = std::fs::read_dir(&root).unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("store.retired"))
+        .collect();
+    assert!(retired.is_empty(),
+            "redundant rewrite banked a retired copy: {retired:?}");
+    // The rewrite is still on the record.
+    let log = gitdepot::chain::reflog(&root.join("store")).unwrap();
+    assert!(log.iter().any(|r| r.note.contains("no unique history")),
+            "rewrite not reflogged: {log:?}");
+
+    // Control: a rewrite that DOES orphan commits retains the copy.
+    sh_git(&origin, &["branch", "-D", "keep"]);
+    sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended again"]);
+    let o2 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert!(o2.reimported);
+    let retired: Vec<_> = std::fs::read_dir(&root).unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("store.retired"))
+        .collect();
+    assert_eq!(retired.len(), 1,
+               "orphaning rewrite must retain exactly the unique copy");
+}

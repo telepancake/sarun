@@ -96,6 +96,17 @@ under any layering), then: (7) chain features promoted into the depot
 trait surface + VBF variant behind it — acceptance test already in
 the tree: gitdepot roundtrip.rs update_io_is_bounded_not_o_history
 (#[ignore]d, documents the flat chain's O(history)-per-prepend
-sabotage; must pass un-ignored when the store tiers) —, (8) depot verbs on the UDS,
+sabotage; must pass un-ignored when the store tiers). For git this
+variant must be MULTI-CHAIN (2026-07-06, user finding): one linear
+chain over rev-list --branches --tags means ANY side-ref rewrite on a
+busy repo is a global non-FF → full re-import (linux: daily). Target:
+a SPINE chain (default branch first-parent — prepend-only in
+practice), SIDE chains per divergent lineage anchored at fork-point
+records, tags as pure ref rows; a side rewrite adds records to one
+chain, a spine rewrite starts a new spine chain in the SAME store —
+no event ever copies a store. Interim (landed): retirement is
+conditional on unique history — a rewrite that orphans no commits
+drops the redundant copy (reflogged), one that does keeps exactly
+that copy —, (8) depot verbs on the UDS,
 (9) first script-driven mirror (ietf is smallest) proving the loop,
 (10) wikipedia logic migrated, dump-scan as an engine service.

@@ -705,7 +705,23 @@ pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome
                 };
                 std::fs::rename(&store, &retired)?;
                 std::fs::rename(&fresh, &store)?;
-                chain::log_rewrite(&store, &old_refs, &retired)?;
+                // Retain the retired copy ONLY if it holds unique
+                // history — commits the new store lost. A busy repo
+                // rewrites side refs constantly; retiring a full store
+                // copy per event is unbounded disk for redundant data.
+                // (The real fix is the multi-chain store — chip 7 —
+                // where a rewrite adds records instead of a store.)
+                let new_shas: std::collections::HashSet<String> =
+                    chain::commit_shas(&store)?.into_iter().collect();
+                let unique = chain::commit_shas(&retired)?
+                    .into_iter().any(|s| !new_shas.contains(&s));
+                if unique {
+                    chain::log_rewrite(&store, &old_refs, &retired)?;
+                } else {
+                    std::fs::remove_dir_all(&retired)?;
+                    chain::log_rewrite(&store, &old_refs, std::path::Path::new(
+                        "(dropped: rewrite left no unique history)"))?;
+                }
                 let n = o.meta.commits.len();
                 MirrorOutcome {
                     update: UpdateOutcome { new_commits: n, total_commits: n, refs: o.meta.refs },
