@@ -38,17 +38,39 @@ fn base_text(rng: &mut Rng) -> Vec<String> {
 /// Build a MediaWiki export: ONE page, `n` revisions, each a small edit
 /// of the previous (one line replaced, one prepended) — the ~99%-identical
 /// succession the tiered design exists for.
+fn wrap_doc(revs: &str) -> String {
+    format!(
+        r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
+  <siteinfo>
+    <sitename>T</sitename><dbname>t</dbname><base>x</base>
+    <generator>g</generator><case>first-letter</case>
+    <namespaces><namespace key="0" case="first-letter"/></namespaces>
+  </siteinfo>
+  <page>
+    <title>Big</title><ns>0</ns><id>7</id>
+{revs}  </page>
+</mediawiki>"#
+    )
+}
+
 fn export_xml(n: usize) -> (String, Vec<String>) {
+    let (pieces, texts) = export_rev_pieces(n);
+    (wrap_doc(&pieces.concat()), texts)
+}
+
+/// Per-revision XML pieces, so tests can assemble incremental
+/// documents (import in several batches; dedup skips known revs).
+fn export_rev_pieces(n: usize) -> (Vec<String>, Vec<String>) {
     let mut rng = Rng(0x5eed);
     let mut lines = base_text(&mut rng);
-    let mut revs = String::new();
+    let mut pieces = Vec::new();
     let mut texts = Vec::new();
     for r in 0..n {
         let at = (rng.next() as usize) % lines.len();
         lines[at] = format!("line {at:04}: EDITED r{r} {:016x}", rng.next());
         lines.push(format!("prepended by r{r}"));
         let text = lines.join("\n");
-        revs.push_str(&format!(
+        pieces.push(format!(
             r#"    <revision>
       <id>{id}</id>{parent}
       <timestamp>2024-01-01T{h:02}:{m:02}:{s:02}Z</timestamp>
@@ -66,19 +88,7 @@ fn export_xml(n: usize) -> (String, Vec<String>) {
         ));
         texts.push(text);
     }
-    let xml = format!(
-        r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
-  <siteinfo>
-    <sitename>T</sitename><dbname>t</dbname><base>x</base>
-    <generator>g</generator><case>first-letter</case>
-    <namespaces><namespace key="0" case="first-letter"/></namespaces>
-  </siteinfo>
-  <page>
-    <title>Big</title><ns>0</ns><id>7</id>
-{revs}  </page>
-</mediawiki>"#
-    );
-    (xml, texts)
+    (pieces, texts)
 }
 
 fn dir_size(p: &Path) -> u64 {
@@ -119,9 +129,19 @@ fn multi_revision_page_compresses_and_seals() {
     })
     .unwrap();
 
-    let mut stream = new_page_stream(Cursor::new(xml.into_bytes()));
-    let stats = inst.import(&mut stream).unwrap();
-    assert_eq!(stats.revisions_new as usize, N);
+    // Six incremental imports of 20 revisions each: sealing is a
+    // between-prepends decision, so cold frames form across imports —
+    // a single batch import would (correctly) produce none.
+    let (pieces, _) = export_rev_pieces(N);
+    let mut total_new = 0u64;
+    for chunk in pieces.chunks(20) {
+        let upto: String = pieces[..pieces.len().min(
+            pieces.iter().position(|p| std::ptr::eq(p, chunk.last().unwrap()))
+                .unwrap() + 1)].concat();
+        let mut stream = new_page_stream(Cursor::new(wrap_doc(&upto).into_bytes()));
+        total_new += inst.import(&mut stream).unwrap().revisions_new;
+    }
+    assert_eq!(total_new as usize, N);
     inst.flush().unwrap(); // also runs depot eviction
 
     // ── fidelity: every revision reads back exactly, newest-first ──────

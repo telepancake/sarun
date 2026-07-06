@@ -98,8 +98,21 @@ fn batch_import_equals_sequential_imports() {
     assert_eq!(ha.len(), N);
     assert_eq!(ha, hb, "batch and sequential stores decode differently");
 
-    // Sealing fired in the batch store too (cold frames formed).
+    // One batch = ONE prepend: sealing is decided BETWEEN prepends,
+    // so a single batch import must NOT have split itself into cold
+    // frames, however small the threshold.
     let cold = tmp_a.path().join("depot/cold/cold");
+    assert_eq!(cold.metadata().map(|m| m.len()).unwrap_or(0), 0,
+               "single-batch import sealed mid-batch — batches must never split");
+
+    // The NEXT prepend sees the oversized old accumulator and seals it
+    // whole: import one more revision.
+    let mut stream = new_page_stream(Cursor::new(export_xml(N + 1, N + 1).into_bytes()));
+    let stats = a.import(&mut stream).unwrap();
+    assert_eq!(stats.revisions_new, 1);
+    a.flush().unwrap();
     assert!(cold.metadata().map(|m| m.len()).unwrap_or(0) > 0,
-            "batch import never sealed despite a tiny threshold");
+            "oversized old accumulator not sealed at the next prepend");
+    let ha2 = history(&a);
+    assert_eq!(ha2.len(), N + 1, "post-seal read-back lost records");
 }

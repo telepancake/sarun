@@ -197,15 +197,19 @@ impl Mirror {
                     self.alloc_chain(name)?
                 }
             };
-            // Oldest→newest so each prepend is the chain's new newest.
+            // Oldest→newest; the whole draft lands as ONE batch
+            // prepend (the normative multi-record form — one f0 swap,
+            // one f1 re-encode), not a per-revision cycle. Fetch
+            // errors abort before any store write: idempotent refetch.
             let mut done: Vec<(&str, bool)> = Vec::new();
+            let mut batch: Vec<Layer> = Vec::new();
             for (rev, date) in fresh {
                 let label = format!("{name}-{rev}");
                 progress(&label, true);
                 let url = format!("{}/archive/id/{label}.txt", cfg.base_url);
                 match http_get(client, &url)? {
                     Some(text) => {
-                        self.store.put_layer(chain_id, &revision_layer(rev, date.as_deref(), &text))?;
+                        batch.push(revision_layer(rev, date.as_deref(), &text));
                         stats.revisions_fetched += 1;
                         done.push((rev, false));
                     }
@@ -217,6 +221,7 @@ impl Mirror {
                     }
                 }
             }
+            self.store.put_layers(chain_id, &batch)?;
             // Durability fence: bytes first, watermarks after.
             self.store.flush()?;
             let tx = self.conn.transaction()?;

@@ -120,3 +120,52 @@ fn near_identical_layers_compress_and_seal() {
     assert!(disk * 4 < raw,
             "vbf on disk ({disk}) not <1/4 of raw ({raw}) — discipline not rendered");
 }
+
+/// The normative batch form: put_layers(oldest→newest) must land ONE
+/// prepend and read back record-for-record identical to sequential
+/// put_layer calls — never split by the seal threshold (sealing is a
+/// between-prepends decision against the OLD accumulator).
+#[test]
+fn put_layers_batch_equals_sequential() {
+    fn layer(n: u32, body: &[u8]) -> depot::Layer {
+        let mut children = std::collections::BTreeMap::new();
+        children.insert(format!("f{n}").into_bytes(), depot::Node {
+            blob: depot::BlobOp::Set(body.to_vec()),
+            children: Default::default(),
+            presence: depot::Presence::Live,
+            opaque: false,
+            attrs: None,
+            anchor: depot::Anchor::Lower,
+        });
+        depot::Layer { root: depot::Node {
+            blob: depot::BlobOp::Keep,
+            children,
+            presence: depot::Presence::Live,
+            opaque: false,
+            attrs: None,
+            anchor: depot::Anchor::Lower,
+        }}
+    }
+    // Bodies big enough that the batch total far exceeds the seal
+    // threshold — the batch must still be one prepend.
+    let layers: Vec<depot::Layer> =
+        (0..24).map(|i| layer(i, &vec![b'a' + (i % 26) as u8; 4096])).collect();
+
+    let t1 = tempfile::tempdir().unwrap();
+    let mut seq = depot_vbf::VbfDepot::open(t1.path().into(), 8, 16 * 1024).unwrap();
+    for l in &layers { seq.put_layer(3, l).unwrap(); }
+    let t2 = tempfile::tempdir().unwrap();
+    let mut bat = depot_vbf::VbfDepot::open(t2.path().into(), 8, 16 * 1024).unwrap();
+    let before = bat.prepend_count();
+    bat.put_layers(3, &layers).unwrap();
+    // Seed (empty-chain constraint) + the batch = at most 2.
+    assert!(bat.prepend_count() - before <= 2,
+            "batch split into {} prepends", bat.prepend_count() - before);
+
+    let a = seq.layers_newest_first(3).unwrap();
+    let b = bat.layers_newest_first(3).unwrap();
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        assert_eq!(depot::codec::encode(x), depot::codec::encode(y));
+    }
+}

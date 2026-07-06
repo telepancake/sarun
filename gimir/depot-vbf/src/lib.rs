@@ -187,37 +187,86 @@ impl VbfDepot {
         }
     }
 
+    /// Total prepends performed by the underlying depot (test/
+    /// instrumentation surface — the batch invariant is observable).
+    pub fn prepend_count(&self) -> u64 {
+        self.depot.prepend_count()
+    }
+
     /// The layer becomes chain `chain_id`'s NEW NEWEST version.
     pub fn put_layer(&mut self, chain_id: u64, layer: &Layer) -> Result<(), Error> {
-        let record = codec::encode(layer);
-        let new_f0 = compress(&record, None)?;
+        self.put_layers(chain_id, std::slice::from_ref(layer))
+    }
+
+    /// Prepend `layers` (oldest → newest) as ONE prepend: one f0 swap,
+    /// one f1 re-encode, one seal check — the normative multi-record
+    /// form (wikimak/depot SPEC §Prepend). Never splits the batch;
+    /// sealing is decided against the OLD accumulator (compose_f1).
+    pub fn put_layers(&mut self, chain_id: u64, layers: &[Layer]) -> Result<(), Error> {
+        let Some((newest, older_new)) = layers.split_last() else {
+            return Ok(());
+        };
+        let record = codec::encode(newest);
         let prev_f0 = match self.depot.read_f0(chain_id) {
             Ok(b) => Some(b),
             Err(wikimak_depot::Error::NoFrame) => None,
             Err(e) => return Err(e.into()),
         };
-        match prev_f0 {
-            None => self.depot.prepend(chain_id, &new_f0, None, false)?,
-            Some(prev_frame) => {
-                let prev_record = decompress(&prev_frame, None)?;
+        // Accumulator entries newest-first: the older NEW records, then
+        // the demoted old head (verbatim — full-snapshot records).
+        let mut entries_owned: Vec<Vec<u8>> = older_new.iter().rev()
+            .map(codec::encode).collect();
+        let (prev_record, old_f1_raw) = match &prev_f0 {
+            Some(frame) => {
+                let prev_record = decompress(frame, None)?;
                 let old_f1_raw = match self.depot.read_f1(chain_id)? {
                     Some(f) => decompress(&f, Some(&prev_record))?,
                     None => Vec::new(),
                 };
-                let spill = delimit(std::slice::from_ref(&prev_record));
-                let seal = !old_f1_raw.is_empty()
-                    && (old_f1_raw.len() + spill.len()) as u64 > self.seal_threshold;
-                let new_f1 = if seal {
-                    compress(&spill, Some(&record))?
-                } else {
-                    let mut raw = spill;
-                    raw.extend_from_slice(&old_f1_raw);
-                    compress(&raw, Some(&record))?
-                };
-                self.depot.prepend(chain_id, &new_f0, Some(&new_f1), seal)?;
+                entries_owned.push(prev_record.clone());
+                (Some(prev_record), old_f1_raw)
             }
-        }
+            None => {
+                // Empty chain: the depot forbids f1 on the first
+                // prepend — seed with the OLDEST record, then absorb
+                // the rest as one batch.
+                if let Some(oldest) = entries_owned.pop() {
+                    self.depot.prepend(chain_id, &compress(&oldest, None)?,
+                                       None, false)?;
+                    entries_owned.insert(0, oldest);
+                    // Re-run now that the chain has a head. The seed
+                    // record is entries_owned's oldest again: rebuild
+                    // the batch minus the seed, plus the seed as head
+                    // demotee — simplest is recursion with the already
+                    // seeded chain.
+                    entries_owned.clear();
+                    return self.put_layers_seeded(chain_id, layers);
+                }
+                // Single layer onto empty chain.
+                return Ok(self.depot.prepend(chain_id, &compress(&record, None)?,
+                                             None, false)?);
+            }
+        };
+        let _ = prev_record;
+        let delimited: Vec<Vec<u8>> = entries_owned.iter()
+            .map(|r| delimit(std::slice::from_ref(r))).collect();
+        let refs: Vec<&[u8]> = delimited.iter().map(|e| e.as_slice()).collect();
+        let (new_f1_raw, seal) = wikimak_depot::compose_f1(
+            &refs,
+            if old_f1_raw.is_empty() { None } else { Some(&old_f1_raw) },
+            self.seal_threshold,
+        );
+        let new_f0 = compress(&record, None)?;
+        let new_f1 = compress(&new_f1_raw, Some(&record))?;
+        self.depot.prepend(chain_id, &new_f0, Some(&new_f1), seal)?;
         Ok(())
+    }
+
+    /// `put_layers` continuation once the chain has its seeded head.
+    fn put_layers_seeded(&mut self, chain_id: u64, layers: &[Layer]) -> Result<(), Error> {
+        let rest = &layers[1..];
+        if rest.is_empty() { return Ok(()); }
+        self.put_layers(chain_id, rest)
     }
 }
 

@@ -342,10 +342,14 @@ pub(crate) fn prepend_depot_frames(
     records_newest_first: &[Vec<u8>],
     seal_threshold: u64,
 ) -> Result<()> {
-    // A batch bigger than the seal threshold lands chunk by chunk
-    // (oldest first) so accumulators and cold frames stay bounded.
+    // NEVER chunk at the seal threshold: one batch = one prepend =
+    // one f1 re-encode regardless of size; splitting only churns dead
+    // head frames. Sealing is decided BETWEEN prepends against the OLD
+    // accumulator (compose_f1). Chunking survives solely as a RAM
+    // bound for pathological batches.
+    const INGEST_RAM_BOUND: u64 = 256 << 20;
     let sizes: Vec<usize> = records_newest_first.iter().map(|r| r.len()).collect();
-    let chunks = wikimak_depot::chunk_newest_first(&sizes, seal_threshold);
+    let chunks = wikimak_depot::chunk_newest_first(&sizes, INGEST_RAM_BOUND.max(seal_threshold));
     if chunks.len() > 1 {
         for range in chunks {
             prepend_depot_frames(g, chain_id, &records_newest_first[range], seal_threshold)?;

@@ -80,6 +80,10 @@ const SEAL_THRESHOLD: u64 = 256 * 1024;
 // trees chain's f0 frames are whole-head-sized, deadening fast. The
 // moderate-repo bench measured 32MiB here as ~2.7x the useful store.
 const FILE_SIZE_THRESHOLD: u64 = 4 << 20;
+/// Mid-ingest flush trigger — a MEMORY bound only, deliberately far
+/// above the seal threshold (frame sizing is compose_f1's job, between
+/// prepends; see prepend_batch).
+const INGEST_RAM_BOUND: u64 = 256 << 20;
 const EVICTION_DEAD_RATIO: f32 = 0.5;
 
 const SCHEMA: &str = "
@@ -1065,10 +1069,14 @@ impl<'a> Ingest<'a> {
         self.head_full = Some(full_record.to_vec());
         self.tree_cache.insert(h.clone(), idx);
         self.new_tree_hashes.push((h, idx));
-        // Staged bytes past the seal threshold land NOW (a sub-batch of
-        // the whole ingest) so accumulators and cold frames stay
-        // bounded during big imports; a small update stays one prepend.
-        if self.tree_entry_bytes as u64 > SEAL_THRESHOLD {
+        // NEVER sub-batch on the seal threshold: within one prepend
+        // there is exactly one f1 re-encode regardless of size, so
+        // splitting a batch buys nothing and churns dead head frames
+        // (an import chunked at 256KiB wrote ~90 superseded f0s).
+        // Sealing is decided BETWEEN prepends (compose_f1: an old
+        // accumulator past the threshold seals whole). The only reason
+        // to flush mid-ingest is RAM on truly huge imports.
+        if self.tree_entry_bytes as u64 > INGEST_RAM_BOUND {
             self.flush_tree_batch()?;
         }
         Ok(idx)
@@ -1142,7 +1150,7 @@ impl<'a> Ingest<'a> {
         let enc = rec.encode();
         self.commit_rec_bytes += enc.len();
         self.commit_recs.push(enc);
-        if self.commit_rec_bytes as u64 > SEAL_THRESHOLD {
+        if self.commit_rec_bytes as u64 > INGEST_RAM_BOUND {
             self.flush_commit_batch()?;
         }
         self.sha_cache.insert(cm.sha.clone(), idx);
@@ -1163,8 +1171,8 @@ impl<'a> Ingest<'a> {
     }
 
     /// One batch prepend per touched chain (trees, commits) for what
-    /// remains staged; oversized ingests already flushed sub-batches at
-    /// the seal threshold.
+    /// is staged — the whole ingest, unless the RAM bound forced an
+    /// intermediate flush.
     fn flush_chains(&mut self) -> Result<()> {
         self.flush_tree_batch()?;
         self.flush_commit_batch()
