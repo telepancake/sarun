@@ -1615,7 +1615,17 @@ pub fn brush_sh(argv: &[String]) -> i32 {
 
     // Run through brush-core; errors are visible. Per-pipeline provenance is
     // emitted BEFORE each pipeline runs (matching run_brush's contract).
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    //
+    // MULTI-thread runtime, same as run_brush: a recipe/script mixes
+    // concurrent constructs (process substitutions, background jobs, in-
+    // process builtins) whose blocking IO parks a current-thread runtime's
+    // only worker — a procsub-heavy script wedged reliably as a NESTED
+    // shell while the identical script passed at top level, and that
+    // difference was exactly this runtime. Worker stacks stay big for the
+    // same reason as run_brush (kati recursion on huge Makefiles).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(64 * 1024 * 1024)
+        .enable_all().build();
     let rt = match rt {
         Ok(rt) => rt,
         Err(e) => { eprintln!("sarun-engine brush-sh: runtime: {e}"); return 127; }
