@@ -1,6 +1,6 @@
 //! CLI: `gitdepot import <git-repo> <store-dir> [--level N] [--report]`
 //!      `gitdepot update <git-repo> <store-dir> [--level N]`
-//!      `gitdepot mirror <url> <root-dir> [--frugal]`
+//!      `gitdepot mirror <url> <root-dir> [--frugal] [--whole]`
 //!      `gitdepot list <mirrors-root>`
 //!      `gitdepot log <store-dir>`
 //!      `gitdepot export <store-dir> <new-repo-dir>`
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 fn usage() -> i32 {
     eprintln!(
-        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>"
+        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal] [--whole]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>"
     );
     2
 }
@@ -119,10 +119,14 @@ pub fn cli_main(args: &[String]) -> i32 {
             })
         }
         ("mirror", [url, root, rest @ ..])
-            if rest.is_empty() || rest == ["--frugal"] =>
+            if rest.iter().all(|f| f == "--frugal" || f == "--whole") =>
         {
-            crate::mirror_opts(url, &PathBuf::from(root),
-                                  !rest.is_empty()).map(|o| {
+            let opts = crate::MirrorOpts {
+                frugal: rest.iter().any(|f| f == "--frugal"),
+                whole: rest.iter().any(|f| f == "--whole"),
+                ..Default::default()
+            };
+            crate::mirror_opts(url, &PathBuf::from(root), opts).map(|o| {
                 println!(
                     "{} new commits ({} total)",
                     o.update.new_commits,

@@ -63,6 +63,17 @@
 //! refs — no non-fast-forward path, no re-import, no store retirement.
 //! git itself is driven by shelling out — sarun custom — so this tool
 //! needs a `git` binary and runs host-side.
+//!
+//! Mirroring keeps NO persistent clone: `<root>/repo.git` is a
+//! KB-scale SHALLOW STUB (tip commit objects + tag chains + refs +
+//! `shallow` boundary — see THE STUB CONTRACT at the stub section
+//! below) rebuilt from the store after every run; tip snapshots are
+//! materialized into it before each fetch and vanish with the re-pin.
+//! First contact bootstraps through a LADDER of fetch rungs (tag waves
+//! in natural-version order, then a converge fetch) whose records all
+//! stage through ONE ingest — exactly one prepend per touched chain,
+//! however many rungs the transport took (`mirror --whole` opts back
+//! into a single-shot clone).
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
@@ -1053,8 +1064,13 @@ fn same_tree_parent(
 /// (`Ingest::add_commit` — same records, same reverse deltas, same
 /// batching/anchoring as before). `seeds` are boundary views (update
 /// path: parents/known commits whose views live only in the store),
-/// pre-inserted with their refcounts. Returns the new CommitMetas
-/// oldest-first plus the max frontier size (instrumentation).
+/// pre-inserted with their refcounts. `tree_oids` is the sha → root
+/// tree oid memo for `same_tree_parent` — callers that stream in
+/// several passes over one ingest (the laddered bootstrap) share it so
+/// a rung-boundary parent never needs a cat-file the buffer may no
+/// longer answer. Returns the new CommitMetas oldest-first plus the
+/// max frontier size (instrumentation).
+#[allow(clippy::too_many_arguments)]
 fn ingest_stream(
     repo: &Path,
     ingest: &mut store::Ingest,
@@ -1062,6 +1078,7 @@ fn ingest_stream(
     counts: &HashMap<String, u32>,
     seeds: Vec<(String, depot::View)>,
     known: &std::collections::HashSet<String>,
+    tree_oids: &mut HashMap<String, String>,
     mut rep: Option<&mut ReportAccum>,
 ) -> Result<(Vec<CommitMeta>, usize)> {
     let mut cat = CatFile::new(repo)?;
@@ -1071,7 +1088,6 @@ fn ingest_stream(
         let rc = counts.get(&sha).copied().unwrap_or(0);
         frontier.insert(sha, view, rc);
     }
-    let mut tree_oids: HashMap<String, String> = HashMap::new();
     let mut commits = Vec::new();
     while let Some((sha, changes)) = stream.next_commit()? {
         if known.contains(&sha) {
@@ -1095,7 +1111,7 @@ fn ingest_stream(
         depot::apply_mut(&mut view, &delta_layer(&changes, &mut cat)?);
         let view = view
             .ok_or_else(|| Error::Unsupported(format!("commit {sha} has an empty tree")))?;
-        let same = same_tree_parent(&cm, &tree_oid, &mut tree_oids, &mut cat)?;
+        let same = same_tree_parent(&cm, &tree_oid, tree_oids, &mut cat)?;
         tree_oids.insert(sha.clone(), tree_oid.clone());
         // The full record (`encode(diff(None, view))`, O(tree)) is only
         // needed when this tree mints a new TREES record — or always,
@@ -1143,6 +1159,7 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
         &counts,
         Vec::new(),
         &Default::default(),
+        &mut HashMap::new(),
         rep.as_mut(),
     )?;
     ingest_tags(repo, &mut ingest, &refs)?;
@@ -1307,8 +1324,9 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
     let seeds = seed_views(&st, need)?;
 
     let mut ingest = store::Ingest::new(&mut st, level)?;
-    let (commits, _max_frontier) =
-        ingest_stream(repo, &mut ingest, &negations, &counts, seeds, &known, None)?;
+    let (commits, _max_frontier) = ingest_stream(
+        repo, &mut ingest, &negations, &counts, seeds, &known, &mut HashMap::new(), None,
+    )?;
     let k = commits.len();
     ingest_tags(repo, &mut ingest, &refs)?;
     ingest.finish(&refs)?;
@@ -1349,22 +1367,448 @@ fn seed_views(
     Ok(out)
 }
 
+// ------------------------------------------------- git object identity
+//
+// The stub is REGENERATED from the store (the one-copy story), so the
+// store must be able to recompute git object ids host-side: assembled
+// tip commits and materialized snapshot trees are asserted against the
+// shas recorded at import. Never stored (the implicit-id rule).
+
+fn git_obj_oid(typ: &str, body: &[u8]) -> String {
+    use sha1::Digest as _;
+    let mut h = sha1::Sha1::new();
+    h.update(format!("{typ} {}\0", body.len()).as_bytes());
+    h.update(body);
+    hex::encode(h.finalize())
+}
+
+/// The git tree oid of a canonical view, bottom-up over assembled tree
+/// objects. Entry order is git's: byte order with directory names
+/// compared as `name/`; directory mode is `40000` (tree objects carry
+/// no leading zero).
+fn view_tree_oid(view: &depot::View) -> Result<String> {
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (sortkey, raw entry)
+    for (name, child) in &view.children {
+        let (mode, oid, is_dir) = match &child.blob {
+            Some(content) => {
+                let mode = child
+                    .attrs
+                    .get(&b"mode"[..])
+                    .map(|m| String::from_utf8_lossy(m).into_owned())
+                    .ok_or_else(|| Error::Meta("file node without mode attr".into()))?;
+                let oid = if mode == "160000" {
+                    // gitlink: the stored blob IS the pinned commit id.
+                    String::from_utf8_lossy(content).into_owned()
+                } else {
+                    git_obj_oid("blob", content)
+                };
+                (mode, oid, false)
+            }
+            None => ("40000".to_string(), view_tree_oid(child)?, true),
+        };
+        let mut raw = mode.trim_start_matches('0').to_string().into_bytes();
+        raw.push(b' ');
+        raw.extend_from_slice(name);
+        raw.push(0);
+        raw.extend_from_slice(
+            &hex::decode(&oid).map_err(|_| Error::Meta(format!("bad oid {oid}")))?,
+        );
+        let mut key = name.clone();
+        if is_dir {
+            key.push(b'/');
+        }
+        entries.push((key, raw));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut body = Vec::new();
+    for (_, raw) in entries {
+        body.extend_from_slice(&raw);
+    }
+    Ok(git_obj_oid("tree", &body))
+}
+
+/// Reassemble the raw commit object bytes for a stored record.
+/// extra_headers commits carry the complete raw object instead — the
+/// assembled form cannot reproduce them.
+fn assemble_commit_raw(
+    rec: &store::CommitRecord,
+    parent_shas: &[String],
+    tree_oid: &str,
+) -> Vec<u8> {
+    if !rec.raw.is_empty() {
+        return rec.raw.clone();
+    }
+    let mut out = format!("tree {tree_oid}\n").into_bytes();
+    for p in parent_shas {
+        out.extend_from_slice(format!("parent {p}\n").as_bytes());
+    }
+    out.extend_from_slice(b"author ");
+    out.extend_from_slice(&rec.author);
+    out.extend_from_slice(b"\ncommitter ");
+    out.extend_from_slice(&rec.committer);
+    out.extend_from_slice(b"\n\n");
+    out.extend_from_slice(&rec.message);
+    out
+}
+
+/// Write one loose object, asserting the produced id equals the one
+/// recorded at import (the stub-side fidelity check).
+fn write_object(repo: &Path, typ: &str, bytes: &[u8], expect: &str) -> Result<()> {
+    let got = git_stdin(
+        repo,
+        &["hash-object", "-t", typ, "-w", "--stdin", "--literally"],
+        bytes,
+    )?;
+    if got != expect {
+        return Err(Error::Meta(format!(
+            "fidelity check failed: {typ} regenerated as {got}, imported as {expect}"
+        )));
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------ stub
+//
+// THE STUB CONTRACT (stage-0 validated on file://, local-path and
+// https/github transports; git 2.43):
+//
+// `<root>/repo.git` at rest is a KB-scale SHALLOW STUB, not a clone:
+//   * objects: each ref tip's commit object + the annotated-tag object
+//     chains the refs point through — nothing else (no trees, no
+//     blobs, no history);
+//   * refs: the upstream branches+tags verbatim;
+//   * `shallow`: the set of peeled tip commit shas — git treats the
+//     tips as shallow boundaries, so every local walk (negotiation
+//     haves, rev-list, log) stops there instead of dying on missing
+//     parents;
+//   * config: remote.origin fetching `+refs/heads/*:refs/heads/*` and
+//     `+refs/tags/*:refs/tags/*` (NOT `+refs/*:refs/*` like the old
+//     full clone: on public forges refs/pull/* is unbounded, and the
+//     import never read beyond heads+tags anyway).
+//
+// BEFORE every fetch the tips' FULL snapshots (trees AND blobs) are
+// materialized into the stub from the store (`materialize_snapshots`).
+// This is load-bearing three ways, all verified in stage 0:
+//   * the server, seeing our shallow lines, assumes we have EXACTLY
+//     the tip snapshots and nothing behind them — thin-pack delta
+//     bases are then drawn from objects we really have, so index-pack
+//     resolves on any transport (no promisor/lazy-fetch tricks);
+//   * fetch's connectivity check walks the new tips' full closures
+//     down to the boundary — tips' trees/blobs must exist;
+//   * `git log --raw` emits correct changed-path deltas for commits
+//     whose first parent is a boundary tip only if the parent's tree
+//     objects exist (git diffs against the parent tree, shallow or
+//     not).
+// Anything attached BEHIND a tip (e.g. a merge of a branch rooted at
+// an old non-tip commit) is simply RESENT by the server — the shallow
+// grafts cut the haves closure at the tips, so the server cannot
+// assume we kept deeper history. Correctness is unaffected (known
+// commits re-streaming are skipped, their views seeded from the
+// store); the cost is refetched bytes proportional to how far behind
+// the tips new history attaches.
+//
+// After a successful update the stub is REBUILT FRESH from the store
+// (`build_stub_at` + rename) — no prune/repack dance, the fetched pack
+// and the materialized snapshots simply vanish with the old directory.
+
+/// Directory size in KiB (buffer-peak instrumentation).
+fn dir_kb(dir: &Path) -> u64 {
+    fn walk(d: &Path, acc: &mut u64) {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, acc);
+                } else if let Ok(m) = e.metadata() {
+                    *acc += m.len();
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    walk(dir, &mut n);
+    n / 1024
+}
+
+fn init_stub_dir(dir: &Path, url: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    git(dir, &["init", "-q", "--bare"])?;
+    git(dir, &["config", "remote.origin.url", url])?;
+    git(dir, &["config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"])?;
+    git(dir, &["config", "--add", "remote.origin.fetch", "+refs/tags/*:refs/tags/*"])?;
+    Ok(())
+}
+
+/// Write refs + the shallow boundary for an already-object-complete
+/// stub directory. `refs` are the current refs (annotated tags point
+/// at their tag object).
+fn write_stub_refs(dir: &Path, refs: &[RefMeta]) -> Result<()> {
+    let mut lines = String::new();
+    let mut tips: Vec<&str> = Vec::new();
+    for r in refs {
+        let obj = if r.tag_sha.is_empty() { &r.sha } else { &r.tag_sha };
+        lines.push_str(&format!("update {} {}\n", r.name, obj));
+        if !r.sha.is_empty() {
+            tips.push(&r.sha);
+        }
+    }
+    git_stdin(dir, &["update-ref", "--stdin"], lines.as_bytes())?;
+    tips.sort_unstable();
+    tips.dedup();
+    std::fs::write(dir.join("shallow"), tips.join("\n") + "\n")?;
+    Ok(())
+}
+
+/// Build a fresh stub at `dir` from the store: tip commit objects are
+/// REGENERATED (raw bytes assembled from the record — extra_headers
+/// commits use their preserved raw object — with the tree oid
+/// recomputed from the stored view) and sha-asserted; tag chains are
+/// written from their stored raw bytes, inner-first.
+fn build_stub_at(dir: &Path, st: &store::Store, url: &str) -> Result<()> {
+    init_stub_dir(dir, url)?;
+    let refs = st.refs_meta()?;
+    // Distinct peeled tip commits + their records.
+    let mut recs: BTreeMap<String, store::CommitRecord> = BTreeMap::new();
+    for r in &refs {
+        if !r.sha.is_empty() && !recs.contains_key(&r.sha) {
+            let idx = st.sha_to_idx(&r.sha)?.ok_or_else(|| {
+                Error::Meta(format!("ref {} target {} not in store", r.name, r.sha))
+            })?;
+            recs.insert(r.sha.clone(), st.commit_record_at(idx)?);
+        }
+    }
+    // One tree walk for the views of every tip needing an assembled
+    // commit (raw-carrying records skip it).
+    let need: Vec<(String, u64)> = recs
+        .values()
+        .filter(|c| c.raw.is_empty())
+        .map(|c| (c.sha.clone(), c.tree_idx))
+        .collect();
+    let views: HashMap<String, depot::View> = seed_views(st, need)?.into_iter().collect();
+    for (sha, rec) in &recs {
+        let parents = rec
+            .parent_idxs
+            .iter()
+            .map(|p| {
+                st.idx_to_sha(*p)?
+                    .ok_or_else(|| Error::Meta(format!("parent index {p} not in chain")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tree_oid = match views.get(sha) {
+            Some(v) => view_tree_oid(v)?,
+            None => String::new(), // raw-carrying record: oid unused
+        };
+        write_object(dir, "commit", &assemble_commit_raw(rec, &parents, &tree_oid), sha)?;
+    }
+    // Tag chains, inner-first (raw bytes are the stored fidelity
+    // payload; `object` lines name objects written above or earlier in
+    // the chain — or, for tree tags, a tree that need not exist for
+    // hash-object/update-ref).
+    let mut written = std::collections::BTreeSet::new();
+    for r in &refs {
+        if r.tag_sha.is_empty() {
+            continue;
+        }
+        let mut chain = Vec::new();
+        let mut idx = st.tag_sha_to_idx(&r.tag_sha)?.ok_or_else(|| {
+            Error::Meta(format!("tag object {} for ref {} not in store", r.tag_sha, r.name))
+        })?;
+        loop {
+            let rec = st.tag_record_at(idx)?;
+            let (obj, typ) = parse_tag_target(&rec.sha, &rec.raw)?;
+            chain.push(rec);
+            if typ != "tag" {
+                break;
+            }
+            idx = st
+                .tag_sha_to_idx(&obj)?
+                .ok_or_else(|| Error::Chain(format!("inner tag {obj} not in chain")))?;
+        }
+        for rec in chain.iter().rev() {
+            if written.insert(rec.sha.clone()) {
+                write_object(dir, "tag", &rec.raw, &rec.sha)?;
+            }
+        }
+    }
+    write_stub_refs(dir, &refs)?;
+    // Loose refs and objects cost a filesystem block EACH — a repo
+    // with hundreds of tags would idle at MBs of block overhead. Two
+    // files instead: pack-refs, and pack-objects over the EXPLICIT
+    // loose-object list (repack would walk tip trees, which a stub
+    // deliberately lacks).
+    git(dir, &["pack-refs", "--all"])?;
+    let mut oids = String::new();
+    for d in std::fs::read_dir(dir.join("objects"))?.flatten() {
+        let fan = d.file_name().to_string_lossy().into_owned();
+        if fan.len() != 2 || !d.path().is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(d.path())?.flatten() {
+            oids.push_str(&format!("{fan}{}\n", f.file_name().to_string_lossy()));
+        }
+    }
+    if !oids.is_empty() {
+        // Relative to the repo: `git -C` chdirs, so an absolute base
+        // is wrong exactly when the caller's root path is relative.
+        git_stdin(dir, &["pack-objects", "-q", "objects/pack/pack"], oids.as_bytes())?;
+        git(dir, &["prune-packed", "-q"])?;
+    }
+    Ok(())
+}
+
+/// Materialize full snapshots (trees AND blobs) for `views` into
+/// `repo` through ONE `git fast-import` run — the stub contract's
+/// pre-fetch step. Blobs dedup through marks; each view lands as a
+/// throwaway commit on a scratch ref (deleted after) whose tree is,
+/// by construction, the tip's real tree.
+/// Returns the pack files the run created (so a bootstrap can carry
+/// snapshot packs across re-pins instead of rebuilding them).
+fn materialize_snapshots<'a>(
+    repo: &Path,
+    views: impl IntoIterator<Item = &'a depot::View>,
+) -> Result<Vec<String>> {
+    let pack_dir = repo.join("objects/pack");
+    let before: std::collections::BTreeSet<String> = list_dir(&pack_dir);
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        // unpackLimit=1: ALWAYS emit a pack — snapshot objects must be
+        // a carriable pack file, never loose (re-pins carry packs by
+        // name; fast-import explodes small packs to loose by default).
+        .args(["-c", "fastimport.unpackLimit=1", "fast-import", "--quiet", "--done", "--force"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Stream straight into the child: the union of snapshots can be
+    // checkout-sized and must not be assembled in RAM.
+    let mut stdin = std::io::BufWriter::new(child.stdin.take().expect("piped stdin"));
+    let mut blob_marks: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut next_mark = 1usize;
+    let mut wrote_any = false;
+    for view in views {
+        wrote_any = true;
+        let mut files = Vec::new();
+        walk_files(view, &mut Vec::new(), &mut files)?;
+        for (_, mode, content) in &files {
+            if mode == "160000" || blob_marks.contains_key(*content) {
+                continue;
+            }
+            blob_marks.insert(content.to_vec(), next_mark);
+            stdin.write_all(
+                format!("blob\nmark :{next_mark}\ndata {}\n", content.len()).as_bytes(),
+            )?;
+            stdin.write_all(content)?;
+            stdin.write_all(b"\n")?;
+            next_mark += 1;
+        }
+        stdin.write_all(
+            b"commit refs/gitdepot/seed\ncommitter gitdepot <gitdepot@localhost> 0 +0000\ndata 0\ndeleteall\n",
+        )?;
+        for (path, mode, content) in &files {
+            if mode == "160000" {
+                let sha = String::from_utf8_lossy(content);
+                stdin.write_all(format!("M 160000 {sha} {}\n", quote_path(path)).as_bytes())?;
+            } else {
+                let m = blob_marks[*content];
+                stdin.write_all(format!("M {mode} :{m} {}\n", quote_path(path)).as_bytes())?;
+            }
+        }
+        stdin.write_all(b"\n")?;
+    }
+    stdin.write_all(b"done\n")?;
+    drop(stdin);
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(Error::Git(format!(
+            "fast-import (snapshots): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    if wrote_any {
+        git(repo, &["update-ref", "-d", "refs/gitdepot/seed"])?;
+    }
+    Ok(list_dir(&pack_dir).difference(&before).cloned().collect())
+}
+
+fn list_dir(dir: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Pre-fetch step of the update path: snapshots of ref trees — tip
+/// commit trees AND tag@tree tagged trees (rev-list over the buffer
+/// refs must be able to PARSE every peel target) — views
+/// reconstructed from the store in one walk. `only` restricts to the
+/// named refs (the moved-refs heuristic: new history almost always
+/// attaches at a moved ref's old tip; the caller falls back to
+/// everything + one retry when the fetch proves the heuristic wrong).
+fn materialize_tip_snapshots(
+    repo: &Path,
+    st: &store::Store,
+    only: Option<&std::collections::BTreeSet<String>>,
+) -> Result<()> {
+    let mut need: Vec<(String, u64)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, _cidx, tidx, _tag) in st.ref_rows()? {
+        if only.is_some_and(|f| !f.contains(&name)) {
+            continue;
+        }
+        if seen.insert(tidx) {
+            need.push((name, tidx));
+        }
+    }
+    let views = seed_views(st, need)?;
+    materialize_snapshots(repo, views.iter().map(|(_, v)| v))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- mirror
+
+/// Buffer instrumentation for one bootstrap rung.
+#[derive(Debug, Clone)]
+pub struct RungStat {
+    /// Refs fetched by this rung (0 = the final converge rung).
+    pub refs: usize,
+    pub new_commits: usize,
+    /// repo.git size right after the rung's fetch — the moment the
+    /// buffer peaks (pack + snapshots + stub, before the re-pin).
+    pub buffer_peak_kb: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct MirrorOutcome {
     pub update: UpdateOutcome,
+    /// Bootstrap rungs (empty for update ticks and --whole imports).
+    pub rungs: Vec<RungStat>,
+    /// repo.git size right after the update tick's fetch (0 for
+    /// bootstrap/no-op runs) — the transient peak the stub contract
+    /// trades the persistent clone for.
+    pub buffer_peak_kb: u64,
 }
 
-/// The fetch-and-update loop for one remote: keep `<root>/repo.git` (a
-/// bare mirror clone) in sync with `url`, and `<root>/store` in sync
-/// with the clone. First call clones + imports; later calls fetch +
-/// incrementally `update`. A rewritten remote is just an update: new
-/// records + repointed refs — the mirror follows the remote AND keeps
-/// every commit it ever held resolvable.
-///
-/// Fetching is host-side for now (MIRRORS.md: the move into a tap box
-/// is mechanical later).
+#[derive(Debug, Clone)]
+pub struct MirrorOpts {
+    /// Drop repo.git entirely after the run (even the stub); the next
+    /// run rebuilds it from the store.
+    pub frugal: bool,
+    /// First contact: single-shot `clone --mirror` + import instead of
+    /// the laddered bootstrap.
+    pub whole: bool,
+    /// Tags per bootstrap rung.
+    pub tag_wave: usize,
+}
+
+impl Default for MirrorOpts {
+    fn default() -> Self {
+        MirrorOpts { frugal: false, whole: false, tag_wave: 16 }
+    }
+}
+
 /// "WHICH git?" — the repo's human name, from its URL's last path
 /// segment (`.git` stripped): `https://host/o/hello-world.git` →
 /// `hello-world`.
@@ -1377,13 +1821,19 @@ pub fn label_from_url(url: &str) -> String {
 }
 
 pub fn mirror(url: &str, root: &Path) -> Result<MirrorOutcome> {
-    mirror_opts(url, root, false)
+    mirror_opts(url, root, MirrorOpts::default())
 }
 
-/// `frugal`: drop the fetch buffer after a successful update, leaving
-/// the store as the single on-disk copy. The next run re-seeds the
-/// buffer from the store (one export) before fetching.
-pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome> {
+/// The fetch-and-update loop for one remote: keep `<root>/store` (the
+/// ONLY authoritative copy) in sync with `url`, using `<root>/repo.git`
+/// — the KB-scale shallow stub (contract above) — as the transient
+/// fetch buffer. First contact bootstraps the store through the
+/// laddered fetch (or one `clone --mirror` with `whole`); later calls
+/// materialize tip snapshots, fetch the delta, run the incremental
+/// `update`, and re-pin the stub. A rewritten remote is just an
+/// update: new records + repointed refs — the mirror follows the
+/// remote AND keeps every commit it ever held resolvable.
+pub fn mirror_opts(url: &str, root: &Path, opts: MirrorOpts) -> Result<MirrorOutcome> {
     std::fs::create_dir_all(root)?;
     // One-run-per-root guard: exclusive flock on <root>/.lock, held for
     // the whole run, kernel-released on ANY exit (crash included) — two
@@ -1401,67 +1851,476 @@ pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome
     };
     let repo = root.join("repo.git");
     let store = root.join("store");
-    if repo.join("HEAD").exists() {
-        git(&repo, &["remote", "update", "--prune"])?;
-    } else if store::store_exists(&store) {
-        // The store is the ONLY authoritative copy; repo.git is a
-        // transient fetch buffer, reconstructible because export is
-        // SHA-exact. Re-seed it from the store (bare, wired like
-        // clone --mirror) and fetch just the delta — a deleted (or
-        // frugally dropped) buffer costs one export, never a re-clone.
-        std::fs::create_dir_all(&repo)?;
-        git(&repo, &["init", "-q", "--bare"])?;
-        export(&store, &repo)?;
-        git(&repo, &["config", "remote.origin.url", url])?;
-        git(&repo, &["config", "remote.origin.fetch", "+refs/*:refs/*"])?;
-        git(&repo, &["config", "remote.origin.mirror", "true"])?;
-        git(&repo, &["remote", "update", "--prune"])?;
-    } else {
-        // Clone into scratch + rename: git creates HEAD long before a
-        // clone completes, so a killed clone left at repo.git would pass
-        // the HEAD check above forever. The rename makes repo.git's
-        // existence imply a COMPLETE clone; a stale scratch is garbage
-        // from a crashed run, never data.
-        let scratch = root.join("repo.git.new");
-        if scratch.exists() {
-            std::fs::remove_dir_all(&scratch)?;
+    // A crashed bootstrap/import leaves an EMPTY store (nothing lands
+    // before the final one-prepend-per-chain flush): wipe and restart
+    // from zero — the staging log was scratch, there is no partial
+    // store to resume.
+    if store::store_exists(&store) && store::commit_count(&store)? == 0 {
+        std::fs::remove_dir_all(&store)?;
+        if repo.exists() {
+            std::fs::remove_dir_all(&repo)?;
         }
-        let out = Command::new("git")
-            .args(["clone", "--quiet", "--mirror", url])
-            .arg(&scratch)
-            .output()?;
-        if !out.status.success() {
-            return Err(Error::Git(format!(
-                "clone --mirror {url}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        std::fs::rename(&scratch, &repo)?;
+    }
+    let scratch = root.join("repo.git.new");
+    if scratch.exists() {
+        std::fs::remove_dir_all(&scratch)?;
     }
     let out = if !store::store_exists(&store) {
-        let o = import(&repo, &store, 3)?;
-        let n = o.meta.commits.len();
-        MirrorOutcome {
-            update: UpdateOutcome {
-                new_commits: n,
-                total_commits: n,
-                refs: o.meta.refs,
-                depot_prepends: 0,
-            },
+        if opts.whole {
+            // Single-shot first contact: clone into scratch + rename —
+            // git creates HEAD long before a clone completes, so the
+            // rename makes repo.git's existence imply a COMPLETE clone.
+            if repo.exists() {
+                std::fs::remove_dir_all(&repo)?;
+            }
+            let c = Command::new("git")
+                .args(["clone", "--quiet", "--mirror", url])
+                .arg(&scratch)
+                .output()?;
+            if !c.status.success() {
+                return Err(Error::Git(format!(
+                    "clone --mirror {url}: {}",
+                    String::from_utf8_lossy(&c.stderr).trim()
+                )));
+            }
+            std::fs::rename(&scratch, &repo)?;
+            let o = import(&repo, &store, 3)?;
+            let n = o.meta.commits.len();
+            MirrorOutcome {
+                update: UpdateOutcome {
+                    new_commits: n,
+                    total_commits: n,
+                    refs: o.meta.refs,
+                    depot_prepends: 0,
+                },
+                rungs: Vec::new(),
+                buffer_peak_kb: 0,
+            }
+        } else {
+            let (update, rungs) = bootstrap(url, root, &store, 3, opts.tag_wave.max(1))?;
+            MirrorOutcome { update, rungs, buffer_peak_kb: 0 }
         }
     } else {
-        MirrorOutcome { update: update(&repo, &store, 3)? }
+        // No-op short-circuit: if the advertised refs equal the
+        // store's, there is nothing to fetch and nothing to re-pin —
+        // the tick costs one ls-remote.
+        let advertised = ls_remote(url)?;
+        {
+            let st = store::Store::open(&store)?;
+            if refs_in_sync(&advertised, &st.refs_meta()?) {
+                let refs = st.refs_meta()?;
+                let total = st.count(store::COMMITS)? as usize;
+                drop(st);
+                stamp_identity(&store, url)?;
+                if opts.frugal && repo.exists() {
+                    std::fs::remove_dir_all(&repo)?;
+                }
+                return Ok(MirrorOutcome {
+                    update: UpdateOutcome {
+                        new_commits: 0,
+                        total_commits: total,
+                        refs,
+                        depot_prepends: 0,
+                    },
+                    rungs: Vec::new(),
+                    buffer_peak_kb: 0,
+                });
+            }
+        }
+        // The stub is DERIVED: a missing/incomplete one (deleted by
+        // `mirror rm`, dropped by --frugal, or a crashed rebuild) is
+        // rebuilt from the store. The old export-based full reseed is
+        // gone — a stub costs O(tips), never O(history).
+        if !repo.join("HEAD").exists() {
+            if repo.exists() {
+                std::fs::remove_dir_all(&repo)?;
+            }
+            let st = store::Store::open(&store)?;
+            build_stub_at(&scratch, &st, url)?;
+            drop(st);
+            std::fs::rename(&scratch, &repo)?;
+        } else {
+            // The remote can move between mirrors of the same root.
+            git(&repo, &["config", "remote.origin.url", url])?;
+        }
+        {
+            let st = store::Store::open(&store)?;
+            // EVERY tip's snapshot, not just moved refs': the server
+            // excludes each shallow have's snapshot from the pack
+            // regardless of movement, so any unmaterialized tip is a
+            // potential hole the walk trips over later (proven by the
+            // rewrite tests: an amend resends the parent whose tree
+            // shares subtrees with an unmoved tag's snapshot).
+            materialize_tip_snapshots(&repo, &st, None)?;
+        }
+        git(&repo, &["fetch", "--quiet", "--prune", "origin"])?;
+        let buffer_peak_kb = dir_kb(&repo);
+        MirrorOutcome { update: update(&repo, &store, 3)?, rungs: Vec::new(), buffer_peak_kb }
     };
-    // Stamp identity ("WHICH git?") — listings and attachment names key
-    // off it.
-    let (label, old_url) = store::identity(&store)?;
-    if label.is_empty() || old_url != url {
-        store::set_identity(&store, &label_from_url(url), url)?;
+    stamp_identity(&store, url)?;
+    // Re-pin: replace the buffer with a fresh stub built from the
+    // store — packs and materialized snapshots vanish with the old
+    // directory.
+    {
+        let st = store::Store::open(&store)?;
+        build_stub_at(&scratch, &st, url)?;
     }
-    if frugal {
+    if repo.exists() {
+        std::fs::remove_dir_all(&repo)?;
+    }
+    std::fs::rename(&scratch, &repo)?;
+    if opts.frugal {
         std::fs::remove_dir_all(&repo)?;
     }
     Ok(out)
+}
+
+/// Stamp identity ("WHICH git?") — listings and attachment names key
+/// off it.
+fn stamp_identity(store: &Path, url: &str) -> Result<()> {
+    let (label, old_url) = store::identity(store)?;
+    if label.is_empty() || old_url != url {
+        store::set_identity(store, &label_from_url(url), url)?;
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------- bootstrap
+
+/// One `git ls-remote` advertisement entry.
+struct LsRef {
+    obj: String,
+    /// The `^{}` peel (annotated tags); the object itself otherwise.
+    peeled: String,
+}
+
+/// `git ls-remote` refs: name → (object, peeled).
+fn ls_remote(url: &str) -> Result<BTreeMap<String, LsRef>> {
+    let out = Command::new("git").args(["ls-remote", "--", url]).output()?;
+    if !out.status.success() {
+        return Err(Error::Git(format!(
+            "ls-remote {url}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let mut map: BTreeMap<String, LsRef> = BTreeMap::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((sha, name)) = line.split_once('\t') else { continue };
+        match name.strip_suffix("^{}") {
+            Some(base) => {
+                if let Some(r) = map.get_mut(base) {
+                    r.peeled = sha.to_string();
+                }
+            }
+            None => {
+                map.insert(
+                    name.to_string(),
+                    LsRef { obj: sha.to_string(), peeled: sha.to_string() },
+                );
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Advertised heads+tags == the store's current refs (the no-op-tick
+/// test). Other namespaces (refs/pull/*, HEAD) are outside the mirror
+/// scope on both sides.
+fn refs_in_sync(advertised: &BTreeMap<String, LsRef>, stored: &[RefMeta]) -> bool {
+    let scoped: BTreeMap<&str, &str> = advertised
+        .iter()
+        .filter(|(n, _)| n.starts_with("refs/heads/") || n.starts_with("refs/tags/"))
+        .map(|(n, r)| (n.as_str(), r.obj.as_str()))
+        .collect();
+    if scoped.len() != stored.len() {
+        return false;
+    }
+    stored.iter().all(|r| {
+        let obj = if r.tag_sha.is_empty() { &r.sha } else { &r.tag_sha };
+        scoped.get(r.name.as_str()) == Some(&obj.as_str())
+    })
+}
+
+/// Natural-version sort key: alternating (text, number) segments so
+/// `v0.9 < v0.10 < v1.0`. Chronological ordering was rejected: peeled
+/// committer dates are unknowable before fetching the tag objects, and
+/// fetching them cheaply (a `--filter=tree:0` wave) poisons the object
+/// store for later rungs (present-but-filtered wants make fetch skip
+/// the closure). Ordering only affects BUFFERING, never correctness —
+/// every rung's haves are all previously imported tips.
+fn natural_key(name: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let mut text = String::new();
+    let mut chars = name.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            let mut n = 0u64;
+            while let Some(&d) = chars.peek() {
+                let Some(v) = d.to_digit(10) else { break };
+                n = n.saturating_mul(10).saturating_add(v as u64);
+                chars.next();
+            }
+            out.push((std::mem::take(&mut text), n));
+        } else {
+            text.push(c);
+            chars.next();
+        }
+    }
+    if !text.is_empty() {
+        out.push((text, 0));
+    }
+    out
+}
+
+/// First contact, laddered: fetch the history in rungs (waves of tags
+/// in natural-version order, then a converge fetch of everything) so
+/// the fetch buffer peaks at one rung, not the whole clone — while the
+/// STORE ingest stays ONE turn: every rung's records stage through the
+/// same `Ingest` (spilling to disk past the RAM bound) and land as ONE
+/// prepend per touched chain at the end, exactly like a single-shot
+/// import. Rung boundaries are invisible to the walk: boundary views
+/// come from the staged reverse deltas (`Ingest::staged_views`), and
+/// the sha→tree-oid memo spans rungs. Crash mid-ladder = restart from
+/// zero (the staging log is scratch; nothing lands before finish).
+///
+/// Peak disk = one rung's pack + materialized tip snapshots + the
+/// staging log (≈ the final raw accumulator — the product itself) +
+/// the stub.
+fn bootstrap(
+    url: &str,
+    root: &Path,
+    store_path: &Path,
+    level: i32,
+    tag_wave: usize,
+) -> Result<(UpdateOutcome, Vec<RungStat>)> {
+    let repo = root.join("repo.git");
+    if repo.exists() {
+        std::fs::remove_dir_all(&repo)?;
+    }
+    init_stub_dir(&repo, url)?;
+    let advertised = ls_remote(url)?;
+    // (tag name, peeled commit) in natural-version order.
+    let mut pending: std::collections::VecDeque<(String, String)> = {
+        let mut v: Vec<(String, String)> = advertised
+            .iter()
+            .filter_map(|(n, r)| {
+                n.strip_prefix("refs/tags/")
+                    .map(|t| (t.to_string(), r.peeled.clone()))
+            })
+            .collect();
+        v.sort_by_key(|(t, _)| natural_key(t));
+        v.into()
+    };
+    if pending.is_empty() {
+        eprintln!("gitdepot: no tags upstream — bootstrap falls back to one full fetch rung");
+    }
+
+    let mut st = store::Store::create(store_path)?;
+    let mut ingest = store::Ingest::new(&mut st, level)?;
+    let mut tree_oids: HashMap<String, String> = HashMap::new();
+    let mut known_all: std::collections::HashSet<String> = Default::default();
+    let mut prev_tips: Vec<String> = Vec::new();
+    // Tips that appeared since the last snapshot materialization.
+    let mut fresh_tips: Vec<String> = Vec::new();
+    // Snapshot pack files carried across re-pins.
+    let mut snap_packs: Vec<String> = Vec::new();
+    let mut total_new = 0usize;
+    let mut rungs = Vec::new();
+
+    let mut rung_no = 0usize;
+    let mut done = false;
+    while !done {
+        // Rung selection. READY tags — peeled commits already imported
+        // by earlier rungs — cost only their tag objects, so they ship
+        // in bulk; this is what keeps a multi-namespace tag forest
+        // (crate tags peeling into mid-history) from triggering the
+        // shallow-cut resend (stage-0: the server cuts the haves
+        // closure at our shallow tips, so a want attaching BEHIND a
+        // tip refetches everything between). Otherwise the next
+        // natural-order wave is a real rung. The converge fetch runs
+        // once pending is drained.
+        let ready: Vec<String> = pending
+            .iter()
+            .filter(|(_, peel)| known_all.contains(peel))
+            .map(|(t, _)| t.clone())
+            .collect();
+        let specs: Option<Vec<String>> = if !ready.is_empty() {
+            let take: Vec<String> = ready.into_iter().take(400).collect();
+            pending.retain(|(t, _)| !take.contains(t));
+            Some(take.iter().map(|t| format!("+refs/tags/{t}:refs/tags/{t}")).collect())
+        } else if !pending.is_empty() {
+            let take: Vec<(String, String)> =
+                pending.drain(..tag_wave.min(pending.len())).collect();
+            Some(
+                take.iter()
+                    .map(|(t, _)| format!("+refs/tags/{t}:refs/tags/{t}"))
+                    .collect(),
+            )
+        } else {
+            done = true;
+            None
+        };
+        rung_no += 1;
+        // Pre-fetch: the stub contract's snapshot materialization,
+        // views from the staged (not-yet-landed) chain. EVERY current
+        // tip must be covered before any fetch (the server excludes
+        // each shallow have's snapshot unconditionally), but snapshot
+        // PACKS survive the re-pins, so each rung only builds the
+        // tips that appeared since the last one.
+        if !fresh_tips.is_empty() {
+            let mut targets: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+            for sha in &fresh_tips {
+                let t = ingest.tree_idx_of_staged(sha).ok_or_else(|| {
+                    Error::Chain(format!("tip {sha} not staged (bootstrap invariant)"))
+                })?;
+                targets.entry(t).or_default().push(0);
+            }
+            let views = ingest.staged_views(&targets)?;
+            snap_packs.extend(materialize_snapshots(&repo, views.iter().map(|(_, v)| v))?);
+            fresh_tips.clear();
+        }
+        let rung_refs = specs.as_ref().map_or(0, |s| s.len());
+        match &specs {
+            Some(specs) => {
+                let mut args: Vec<&str> = vec!["fetch", "--quiet", "origin"];
+                args.extend(specs.iter().map(String::as_str));
+                git(&repo, &args)?;
+            }
+            None => {
+                git(&repo, &["fetch", "--quiet", "--prune", "origin"])?;
+            }
+        }
+        let buffer_peak_kb = dir_kb(&repo);
+        let negations = prev_tips.clone();
+        let (counts, streamed) = dag_children(&repo, &negations)?;
+        // Boundary/known seeding, mid-bootstrap flavor: views come
+        // from the staged chain, not the store.
+        let mut known = std::collections::HashSet::new();
+        let mut need: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        let mut want = |sha: &str, ingest: &store::Ingest| -> Result<()> {
+            let t = ingest.tree_idx_of_staged(sha).ok_or_else(|| {
+                Error::Meta(format!("parent {sha} not in the staged import (shallow history?)"))
+            })?;
+            need.entry(t).or_default().push(sha.to_string());
+            Ok(())
+        };
+        for sha in &streamed {
+            if known_all.contains(sha) {
+                known.insert(sha.clone());
+                if counts.get(sha).copied().unwrap_or(0) > 0 {
+                    want(sha, &ingest)?;
+                }
+            }
+        }
+        for sha in counts.keys() {
+            if !streamed.contains(sha) {
+                want(sha, &ingest)?;
+            }
+        }
+        let seeds = ingest.staged_views(&need)?;
+        let (commits, _) = ingest_stream(
+            &repo, &mut ingest, &negations, &counts, seeds, &known, &mut tree_oids, None,
+        )?;
+        known_all.extend(commits.iter().map(|c| c.sha.clone()));
+        total_new += commits.len();
+        eprintln!(
+            "gitdepot: bootstrap rung {rung_no}: {rung_refs} refs, {} new commits, buffer {buffer_peak_kb}K",
+            commits.len()
+        );
+        let refs_now = collect_refs(&repo)?;
+        let old_tips: std::collections::BTreeSet<&String> = prev_tips.iter().collect();
+        let mut tips: Vec<String> = refs_now
+            .iter()
+            .filter(|r| !r.sha.is_empty())
+            .map(|r| r.sha.clone())
+            .collect();
+        tips.sort_unstable();
+        tips.dedup();
+        fresh_tips = tips.iter().filter(|t| !old_tips.contains(t)).cloned().collect();
+        prev_tips = tips;
+        rungs.push(RungStat { refs: rung_refs, new_commits: commits.len(), buffer_peak_kb });
+        if !done {
+            repin_buffer(&repo, url, &refs_now, &snap_packs)?;
+        }
+    }
+
+    let refs = collect_refs(&repo)?;
+    ingest_tags(&repo, &mut ingest, &refs)?;
+    ingest.finish(&refs)?;
+    let total = st.count(store::COMMITS)? as usize;
+    let prepends = st.depot_prepends();
+    Ok((
+        UpdateOutcome {
+            new_commits: total_new,
+            total_commits: total,
+            refs,
+            depot_prepends: prepends,
+        },
+        rungs,
+    ))
+}
+
+/// Mid-ladder re-pin: shrink the buffer back to stub shape (tip
+/// commits + tag chains + refs + shallow) from ITS OWN objects — the
+/// store has nothing landed yet. Rebuild-fresh + rename; the rung's
+/// pack vanishes with the old directory.
+fn repin_buffer(repo: &Path, url: &str, refs: &[RefMeta], keep_packs: &[String]) -> Result<()> {
+    let tags = collect_tag_objects(repo, refs)?;
+    let tips: std::collections::BTreeSet<String> = refs
+        .iter()
+        .filter(|r| !r.sha.is_empty())
+        .map(|r| r.sha.clone())
+        .collect();
+    let commit_raws = fetch_blobs(repo, tips.iter().cloned())?;
+    // A tag@tree's peeled tree closure must SURVIVE the re-pin: the
+    // final ingest_tags reads it, and a later fetch will never resend
+    // it (the tag object being present satisfies the want). Rare and
+    // one-tree-sized.
+    let mut tree_objs: Vec<(String, String)> = Vec::new(); // (oid, type)
+    for r in refs {
+        if r.tree_sha.is_empty() {
+            continue;
+        }
+        for line in git_str(repo, &["rev-list", "--objects", &r.tree_sha])?.lines() {
+            let oid = line.split(' ').next().unwrap_or_default().to_string();
+            if oid.is_empty() {
+                continue;
+            }
+            let typ = git_str(repo, &["cat-file", "-t", &oid])?.trim().to_string();
+            tree_objs.push((oid, typ));
+        }
+    }
+    let scratch = repo.with_extension("git.repin");
+    if scratch.exists() {
+        std::fs::remove_dir_all(&scratch)?;
+    }
+    init_stub_dir(&scratch, url)?;
+    for (sha, raw) in &commit_raws {
+        write_object(&scratch, "commit", raw, sha)?;
+    }
+    for t in &tags {
+        write_object(&scratch, "tag", &t.raw, &t.sha)?;
+    }
+    if !tree_objs.is_empty() {
+        let raws = fetch_blobs(repo, tree_objs.iter().map(|(o, _)| o.clone()))?;
+        for (oid, typ) in &tree_objs {
+            write_object(&scratch, typ, &raws[oid], oid)?;
+        }
+    }
+    write_stub_refs(&scratch, refs)?;
+    // Snapshot packs ride along: the next rung's fetch still needs
+    // every tip snapshot present (rebuilding them each rung would be
+    // O(rungs × union-of-snapshots) fast-import work).
+    std::fs::create_dir_all(scratch.join("objects/pack"))?;
+    for name in keep_packs {
+        let from = repo.join("objects/pack").join(name);
+        if from.exists() {
+            std::fs::copy(&from, scratch.join("objects/pack").join(name))?;
+        }
+    }
+    std::fs::remove_dir_all(repo)?;
+    std::fs::rename(&scratch, repo)?;
+    Ok(())
 }
 
 /// One row of `list_mirrors`.

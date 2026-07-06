@@ -138,3 +138,84 @@ Remaining per-commit O(tree) CPU: the frontier's deep View clone and
 `encode(diff(None, view))` for each NEW tree (the chain's full-record
 anchor). Accepted for v1 — restructuring View for sharing is a
 separate change.
+
+## 2026-07-06 — stub buffer + laddered bootstrap (ripgrep)
+
+The persistent full fetch buffer is gone. `<root>/repo.git` at rest is
+a KB-scale SHALLOW STUB — tip commit objects + tag chains + refs +
+`shallow` boundary, packed (contract: lib.rs "THE STUB CONTRACT",
+stage-0 validated on file://, local-path and https/github):
+
+* Before every fetch, every tip's FULL snapshot (trees+blobs) is
+  materialized from the store via one fast-import. Load-bearing: the
+  server excludes exactly the shallow tips' closures, thin-pack bases
+  and the connectivity walk both resolve locally on any transport (no
+  promisor/lazy-fetch). Tips-only-shallow WITHOUT snapshots fails the
+  connectivity check ("missing blob … did not send all necessary
+  objects"); a commit-graph-complete stub without shallow makes
+  negotiation exact but strands thin bases (index-pack "unresolved
+  deltas") — both measured and rejected in stage 0.
+* Anything attaching BEHIND a tip is resent by the server (shallow
+  grafts cut the haves closure at the tips). Correctness unaffected
+  (known commits skip, views seed from the store); cost = refetched
+  bytes. Endemic shape on tag forests: fetching an old tag with only
+  newer tips as haves resends ~everything between — the bootstrap
+  ladder neutralizes it with READY RUNGS (tags whose peeled commit is
+  already imported fetch as tag objects only).
+* After every run the stub is rebuilt fresh from the store (tip commit
+  bytes REGENERATED — tree oid recomputed host-side from the view via
+  sha1, extra-header commits use their preserved raw — and asserted
+  against the recorded shas; the honest one-copy story). `mirror rm` /
+  `--frugal` may drop even the stub; the next tick rebuilds it.
+
+First contact defaults to the LADDERED bootstrap (`--whole` opts back
+to clone+import): waves of tags in natural-version order (chronological
+ordering rejected: dates are unknowable before fetching tag objects,
+and a `--filter=tree:0` metadata wave poisons later rungs — a
+present-but-filtered want makes fetch skip its closure), ready rungs
+swept in bulk between waves, one converge fetch at the end. The ladder
+is TRANSPORT ONLY: all rungs stage through ONE Ingest (records spill to
+`<store>/staging/` past GITDEPOT_SPILL_BOUND, default 256MiB; the bound
+selects the staging medium, never the prepend count) and land as ONE
+prepend per touched chain — asserted: bootstrap depot_prepends == 5
+(TREES seed + TREES + COMMITS + TAGS + REFLOG) for any rung count, and
+a spilled 40-commit update == the in-RAM update object-identically at 4
+prepends (tests/spill.rs). Crash mid-bootstrap: staging is scratch; an
+empty store is wiped and the bootstrap restarts from zero.
+
+Fixture: fresh `git clone --mirror` of ripgrep (2259 commits, 249 tags,
+9.7MB), local path remote. L3.
+
+| op | old (persistent clone) | new (stub) |
+|---|---|---|
+| first contact | 8.3s clone+import (`--whole`) | 18.4s laddered (10 rungs) |
+| buffer at rest | 9.7MB forever | **404K** |
+| store | 2.2MB | 2.2MB |
+| no-op tick | ~0.1s | 1.1s (ls-remote short-circuit) |
+| 1-commit update | 0.36s | 8.1s |
+| peak rung buffer | — | 11.3MB (see below) |
+
+Peak/update-cost attribution: BOTH are the union-of-tip-snapshots term.
+ripgrep is tag-dense relative to its size — 249 tags whose snapshots
+union to ~7.5MB of fast-import pack (no inter-blob deltas), which every
+fetch must have present, so the bootstrap peak (~11.3MB) exceeds the
+9.7MB clone and each update tick pays ~7s of materialization. On the
+intended shape (history ≫ tag count × tree: long-lived repos with real
+churn) the ratio inverts — the stub test fixture (30×64KB replaced
+file, 3 tags) bounds every rung and every update peak under ⅓ of the
+clone, asserted in tests/stub.rs. Lever if tag-dense repos matter:
+carry snapshot packs across ticks in the at-rest stub (trades the
+KB-at-rest property for O(1) tick cost), or delta-compress the
+snapshot packs.
+
+Bootstrap peak disk = one rung's pack + snapshot packs + staging log
+(≈ the final raw accumulator — the product itself) + the stub.
+
+Equivalence: laddered bootstrap == single-shot import on the
+merge-heavy DAG — per-sha commit records, parent edges, per-commit
+canonical view bytes, refs, tag objects (indices may permute: each
+order is a valid topo order; both stores pass the git-reference index
+contract) — tests/equivalence.rs. Stub lifecycle, delta-only update
+fetch, missing-stub rebuild (sha-asserted), ladder peak bound —
+tests/stub.rs. All existing tests green (19+4+3, 0 ignored; equivalence
+grew to 3), +3 stub +1 spill.

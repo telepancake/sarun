@@ -391,8 +391,12 @@ fn mirror_loop_clones_updates_and_follows_rewrites() {
     std::fs::write(origin.join("last.txt"), "y\n").unwrap();
     sh_git(&origin, &["add", "-A"]);
     sh_git(&origin, &["commit", "-q", "-m", "last"]);
-    let o5 = gitdepot::mirror_opts(origin.to_str().unwrap(), &root, true)
-        .unwrap();
+    let o5 = gitdepot::mirror_opts(
+        origin.to_str().unwrap(),
+        &root,
+        gitdepot::MirrorOpts { frugal: true, ..Default::default() },
+    )
+    .unwrap();
     assert_eq!(o5.update.new_commits, 1);
     assert!(!root.join("repo.git").exists(), "frugal left the buffer");
     let tip2 = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();

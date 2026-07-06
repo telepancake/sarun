@@ -346,3 +346,87 @@ fn incremental_update_equals_full_import_across_merges() {
     drop((sa, sb));
     assert_store_matches_git(&repo, &b, &shas);
 }
+
+/// Laddered bootstrap ≡ single-shot import at OBJECT level on the
+/// merge-heavy DAG: the ladder is transport only — every rung stages
+/// through one ingest, so the store must hold the same per-sha commit
+/// objects, the same per-commit tree views (canonical bytes), the
+/// same refs, and land with exactly one prepend per touched chain
+/// (+ the empty TREES seed), independent of rung count. Stable
+/// indices may PERMUTE between the two stores (each is a valid
+/// topological order; git's tiebreak differs with ref scope), so the
+/// comparison is per-sha with parent edges mapped through shas —
+/// index-identity is asserted only against each store's own git
+/// reference by `assert_store_matches_git`'s per-store contract.
+#[test]
+fn laddered_bootstrap_equals_single_shot_import() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let (shas, _) = build_merge_fixture(&repo);
+
+    let a = tmp.path().join("store-a");
+    gitdepot::import(&repo, &a, 3).unwrap();
+
+    let root = tmp.path().join("mirror");
+    let o = gitdepot::mirror_opts(
+        repo.to_str().unwrap(),
+        &root,
+        gitdepot::MirrorOpts { tag_wave: 1, ..Default::default() },
+    )
+    .unwrap();
+    assert!(o.rungs.len() >= 2, "fixture tags must produce a real ladder");
+    assert_eq!(o.update.new_commits, shas.len());
+    // THE batch invariant: 1 prepend per touched chain (TREES seed +
+    // TREES batch + COMMITS + TAGS + REFLOG) — for ANY rung count.
+    assert_eq!(o.update.depot_prepends, 5,
+               "bootstrap must land as one prepend per touched chain");
+    let b = root.join("store");
+
+    let sa = gitdepot::store::Store::open(&a).unwrap();
+    let sb = gitdepot::store::Store::open(&b).unwrap();
+    let ra = sa.commit_records().unwrap();
+    let rb = sb.commit_records().unwrap();
+    assert_eq!(ra.len(), rb.len(), "commit counts diverge");
+    let by_sha_b: BTreeMap<&str, &gitdepot::store::CommitRecord> =
+        rb.iter().map(|r| (r.sha.as_str(), r)).collect();
+    let sha_of_a: Vec<&str> = ra.iter().map(|r| r.sha.as_str()).collect();
+    let sha_of_b: Vec<&str> = rb.iter().map(|r| r.sha.as_str()).collect();
+    for x in &ra {
+        let y = by_sha_b[x.sha.as_str()];
+        assert_eq!(x.author, y.author, "{} author", x.sha);
+        assert_eq!(x.committer, y.committer, "{} committer", x.sha);
+        assert_eq!(x.message, y.message, "{} message", x.sha);
+        assert_eq!(x.extra_headers, y.extra_headers, "{} headers", x.sha);
+        assert_eq!(x.raw, y.raw, "{} raw", x.sha);
+        let pa: Vec<&str> = x.parent_idxs.iter().map(|p| sha_of_a[*p as usize]).collect();
+        let pb: Vec<&str> = y.parent_idxs.iter().map(|p| sha_of_b[*p as usize]).collect();
+        assert_eq!(pa, pb, "{} parent edges", x.sha);
+        assert_eq!(
+            canon(&sa.tree_view(x.tree_idx).unwrap()),
+            canon(&sb.tree_view(y.tree_idx).unwrap()),
+            "{} tree view", x.sha
+        );
+    }
+    let refs = |st: &gitdepot::store::Store| -> Vec<String> {
+        let mut v: Vec<String> = st.refs_meta().unwrap().iter()
+            .map(|r| format!("{} {} {} {}", r.name, r.sha, r.tag_sha, r.tree_sha))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(refs(&sa), refs(&sb), "refs diverge");
+    let tags = |st: &gitdepot::store::Store| -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<(String, Vec<u8>)> = st.tag_records().unwrap().into_iter()
+            .map(|t| (t.sha, t.raw)).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(tags(&sa), tags(&sb), "tag objects diverge");
+    drop((sa, sb));
+    // And against git's own answers, index contract included.
+    let shas_b: Vec<String> = {
+        let sb = gitdepot::store::Store::open(&b).unwrap();
+        sb.commit_records().unwrap().iter().map(|r| r.sha.clone()).collect()
+    };
+    assert_store_matches_git(&repo, &b, &shas_b);
+}
