@@ -93,6 +93,9 @@ end state inverts the current layering:
 
 Revised order: chips 1–6 above (readout + reference attach — needed
 under any layering), then: (7) chain features promoted into the depot
-trait surface + VBF variant behind it, (8) depot verbs on the UDS,
+trait surface + VBF variant behind it — acceptance test already in
+the tree: gitdepot roundtrip.rs update_io_is_bounded_not_o_history
+(#[ignore]d, documents the flat chain's O(history)-per-prepend
+sabotage; must pass un-ignored when the store tiers) —, (8) depot verbs on the UDS,
 (9) first script-driven mirror (ietf is smallest) proving the loop,
 (10) wikipedia logic migrated, dump-scan as an engine service.

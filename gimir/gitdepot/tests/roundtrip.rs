@@ -310,3 +310,51 @@ fn import_refuses_unsupported_shapes() {
         Ok(_) => panic!("import of annotated-tag repo unexpectedly succeeded"),
     }
 }
+
+/// §9 anti-sabotage, COST axis (the one the assertions above miss):
+/// the tiered-chain design promises prepend with BOUNDED re-encode —
+/// frame 0 + the accumulator only; sealed history physically untouched.
+/// The flat single-file chain rewrites the ENTIRE store per update
+/// (prepend_store: read whole chain, write whole chain), so a one-
+/// commit update on an N-commit store costs O(N) I/O — a daily mirror
+/// of a big repo rewrites gigabytes to prepend kilobytes.
+///
+/// This is the acceptance test for the depot-variant convergence
+/// (ATTACH-CONVERGENCE.md chip 7: gitdepot's chain moves behind the
+/// tiered store). Un-ignore when the store tiers; it must then pass.
+#[test]
+#[ignore = "SABOTAGE (known): flat chain rewrites O(history) bytes per \
+            prepend; bounded-prepend arrives with the tiered depot \
+            variant (ATTACH-CONVERGENCE.md chip 7)"]
+fn update_io_is_bounded_not_o_history() {
+    fn written_bytes() -> u64 {
+        let io = std::fs::read_to_string("/proc/self/io").unwrap();
+        io.lines().find_map(|l| l.strip_prefix("write_bytes: "))
+            .unwrap().trim().parse().unwrap()
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let store = tmp.path().join("store");
+    build_fixture(&repo);
+    // Fatten history so O(N) vs O(1) is unmistakable.
+    for i in 0..120 {
+        std::fs::write(repo.join("doc.txt"), format!("pad rev {i}\n")).unwrap();
+        sh_git(&repo, &["add", "-A"]);
+        sh_git(&repo, &["commit", "-q", "-m", &format!("pad {i}")]);
+    }
+    gitdepot::import(&repo, &store, 3).unwrap();
+    let chain_len = std::fs::metadata(store.join("chain")).unwrap().len();
+
+    std::fs::write(repo.join("doc.txt"), "one more line\n").unwrap();
+    sh_git(&repo, &["add", "-A"]);
+    sh_git(&repo, &["commit", "-q", "-m", "tip"]);
+
+    let before = written_bytes();
+    gitdepot::update(&repo, &store, 3).unwrap();
+    let cost = written_bytes() - before;
+    // Bounded: the new frames + bridge + meta — nowhere near a store
+    // rewrite. Half the old chain is a generous ceiling.
+    assert!(cost < chain_len / 2,
+            "one-commit update wrote {cost} bytes against a {chain_len}-byte \
+             store — prepend is O(history), the tiering is sabotaged");
+}
