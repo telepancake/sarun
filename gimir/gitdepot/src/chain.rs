@@ -109,7 +109,8 @@ pub fn write_store(
     delta_records: &[Vec<u8>],
     full_records: &[Vec<u8>],
     level: i32,
-) -> Result<SizeReport> {
+    report: bool,
+) -> Result<Option<SizeReport>> {
     std::fs::create_dir_all(store)?;
     let meta_path = store.join("meta.json");
     let chain_path = store.join("chain");
@@ -126,7 +127,10 @@ pub fn write_store(
     serde_json::to_writer_pretty(&mut f, meta).map_err(|e| Error::Meta(e.to_string()))?;
     f.sync_all()?;
 
-    Ok(SizeReport {
+    if !report {
+        return Ok(None);
+    }
+    Ok(Some(SizeReport {
         commits: delta_records.len(),
         zstd_level: level,
         full_raw: full_records.iter().map(|r| r.len() as u64).sum(),
@@ -137,7 +141,7 @@ pub fn write_store(
         delta_ref_chain: chain_bytes(delta_records, level)?.len() as u64,
         view_ref_chain: view_chain.len() as u64,
         solid_full: solid_total(full_records, level)?,
-    })
+    }))
 }
 
 /// Read `meta.json` alone (no chain walk).

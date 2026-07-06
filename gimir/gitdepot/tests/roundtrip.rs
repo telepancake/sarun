@@ -113,8 +113,8 @@ fn roundtrip_sha_exact_and_chain_compresses() {
 
     let refs_before = build_fixture(&repo);
 
-    let outcome = gitdepot::import(&repo, &store, 3).unwrap();
-    let r = &outcome.report;
+    let outcome = gitdepot::import_opts(&repo, &store, 3, true).unwrap();
+    let r = outcome.report.as_ref().expect("report requested");
     assert_eq!(r.commits, 13);
 
     // §8 anti-sabotage assertions: the rest form must actually render

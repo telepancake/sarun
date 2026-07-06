@@ -1,4 +1,4 @@
-//! CLI: `gitdepot import <git-repo> <store-dir> [--level N]`
+//! CLI: `gitdepot import <git-repo> <store-dir> [--level N] [--report]`
 //!      `gitdepot update <git-repo> <store-dir> [--level N]`
 //!      `gitdepot mirror <url> <root-dir> [--frugal]`
 //!      `gitdepot list <mirrors-root>`
@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: gitdepot import <git-repo> <store-dir> [--level N]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>"
+        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>"
     );
     ExitCode::from(2)
 }
@@ -23,16 +23,25 @@ fn main() -> ExitCode {
     };
     let result = match (cmd, rest) {
         ("import", [repo, store, rest @ ..]) => {
-            let level = match rest {
-                [] => 3,
+            let (level, report) = match rest {
+                [] => (3, false),
+                [f] if f == "--report" => (3, true),
                 [flag, n] if flag == "--level" => match n.parse() {
-                    Ok(v) => v,
+                    Ok(v) => (v, false),
+                    Err(_) => return usage(),
+                },
+                [flag, n, f] if flag == "--level" && f == "--report" => match n.parse() {
+                    Ok(v) => (v, true),
                     Err(_) => return usage(),
                 },
                 _ => return usage(),
             };
-            gitdepot::import(&PathBuf::from(repo), &PathBuf::from(store), level).map(|o| {
-                let r = &o.report;
+            gitdepot::import_opts(&PathBuf::from(repo), &PathBuf::from(store),
+                                  level, report).map(|o| {
+                let Some(r) = &o.report else {
+                    println!("{} commits imported", o.meta.commits.len());
+                    return;
+                };
                 println!(
                     "{} commits, zstd level {}\n\
                      \x20 full records:  raw {:>12}  standalone {:>12}  refPrefix chain {:>12}\n\

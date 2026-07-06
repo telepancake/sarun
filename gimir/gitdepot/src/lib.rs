@@ -366,7 +366,11 @@ pub struct SizeReport {
 
 pub struct ImportOutcome {
     pub meta: Meta,
-    pub report: SizeReport,
+    /// Present only when the encoding comparison was requested
+    /// (import_opts(report=true) / CLI `import --report`) — computing
+    /// it recompresses the whole history five extra ways, so the
+    /// mirror loop must never pay for it.
+    pub report: Option<SizeReport>,
 }
 
 /// Refs (bookkeeping): branches + tags only. `refs/pull/*` and friends
@@ -430,6 +434,15 @@ fn commit_view(repo: &Path, sha: &str) -> Result<(CommitMeta, depot::View)> {
 
 /// Import a git repo into `store` (created; must not exist).
 pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
+    import_opts(repo, store, level, false)
+}
+
+/// `report`: also measure the alternative encodings (full/delta ×
+/// standalone/refPrefix + solid bound) — the straightedge's comparison
+/// harness, NOT part of storing.
+pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
+    -> Result<ImportOutcome>
+{
     let refs = collect_refs(repo)?;
     let shas = rev_list(repo)?;
 
@@ -460,7 +473,8 @@ pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
     }
 
     let meta = Meta { label: String::new(), url: String::new(), refs, commits };
-    let report = chain::write_store(store, &meta, &delta_records, &full_records, level)?;
+    let report = chain::write_store(store, &meta, &delta_records, &full_records,
+                                    level, report)?;
     Ok(ImportOutcome { meta, report })
 }
 
