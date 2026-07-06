@@ -112,7 +112,14 @@ no retirement, no salvage check (all three interim mechanisms get
 DELETED by this chip). Commit records carry parent indices (lineage
 lives in the data, not in storage topology) and the sha as the
 export-fidelity payload; a sha→idx sqlite index exists only as a
-derived, rebuildable import-dedup aid. refPrefix anchoring locality
-within the trees chain is an optimization detail, not structure —, (8) depot verbs on the UDS,
+derived, rebuildable import-dedup aid. The trees chain stores REVERSE
+DELTAS (head = full layer; older = diff rebuilding older-from-newer,
+v1's proven record family), and tree fetch is the cached-walk: make a
+cached tree state out of f0, keep applying reverse deltas from the
+chain, at each frame boundary re-encode the current state to use as
+the refPrefix for the next older frame, until the target index is
+reached. Prepend demotes the former head to a bridge delta in the
+accumulator (bounded: f0 + f1 re-encode only, cold untouched). Tree
+dedup keys on the full view's canonical bytes, not delta bytes —, (8) depot verbs on the UDS,
 (9) first script-driven mirror (ietf is smallest) proving the loop,
 (10) wikipedia logic migrated, dump-scan as an engine service.
