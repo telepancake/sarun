@@ -166,6 +166,40 @@ def main():
                   f"{backend}: compound pipeline stage completes "
                   f"(no starvation wedge; out={r.stdout[-200:]!r})")
 
+        # ── shadow_make.glob is honored by BOTH backends ─────────────────
+        # A make at a NONSTANDARD path, matched only by a user glob line:
+        # it must be the embedded kati (edges recorded, no real `make`
+        # process) under sud exactly as under FUSE. This was the second
+        # way edges silently vanished: sud hardcoded /bin,/usr/bin and
+        # ignored the config, so a globbed make ran REAL — processes
+        # recorded, zero edges, zero recipe pipelines.
+        mytools = Path("/root/bprov_mytools/bin")
+        mytools.mkdir(parents=True, exist_ok=True)
+        shutil.copy2("/usr/bin/make", mytools / "make")
+        globf = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.BPROV" \
+            / "shadow_make.glob"
+        globf.parent.mkdir(parents=True, exist_ok=True)
+        globf.write_text("/bin/make\n/usr/bin/make\n"
+                         "/root/bprov_mytools/**/make\n")
+        try:
+            for backend in backends:
+                for f in ("a.mid", "b.mid", "out"):
+                    (work / f).unlink(missing_ok=True)
+                r = run_box(backend, f"BP-GLOB-{backend}", work,
+                            ["sh", "-c",
+                             "PATH=/root/bprov_mytools/bin:$PATH make -j4"])
+                check(r.returncode == 0,
+                      f"{backend}: globbed-path make exits 0 "
+                      f"(got {r.returncode}: {r.stderr[-400:]})")
+                sp = latest_sqlar()
+                edges = table_count(sp, "build_edges")
+                check(edges is not None and edges >= 4,
+                      f"{backend}: shadow_make.glob-matched make records "
+                      f"build_edges (got {edges})")
+        finally:
+            globf.unlink(missing_ok=True)
+            shutil.rmtree(mytools.parent, ignore_errors=True)
+
         # ── the exact user-reported flag combo on sud ────────────────────
         if "sud" in backends:
             for f in ("a.mid", "b.mid", "out"):

@@ -1109,15 +1109,65 @@ fn sud_shadow_rules(sc: &mut Command, upper: &str, exe: &str)
         .parent().map(|p| p.join("shadow-bin"))
         .unwrap_or_else(|| std::path::PathBuf::from("shadow-bin"));
     let _ = std::fs::create_dir_all(&shadow_dir);
-    for name in ["sh", "bash", "dash", "make", "gmake", "ninja"] {
-        let link = shadow_dir.join(name);
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(exe, &link)
-            .map_err(|e| format!("-b shadow link {}: {e}", link.display()))?;
-        for dir in ["/bin", "/usr/bin"] {
-            sc.args(["--remap-rule",
-                     &format!("remap:{dir}/{name}={}", link.display())]);
+    // The SAME shadow configuration FUSE honors ({config_home}/
+    // shadow_{sh,make,ninja}.glob, or the historical defaults): a make
+    // matched by shadow_make.glob was shadowed under FUSE but ran REAL
+    // under the old hardcoded sud set — the box then recorded processes
+    // but no recipe pipelines and no build edges. A literal (glob-free)
+    // pattern is remapped verbatim, present on the host or not (parity
+    // with the old behavior: `make` in a box works even when the host
+    // has no /usr/bin/make); a glob pattern is expanded against the
+    // host filesystem at launch. Only basenames the engine dispatches
+    // (sh/bash/dash → brush, make/gmake → kati, ninja → n2) get rules —
+    // remapping anything else to the engine binary would exec it as a
+    // confused CLI. The wrapper's rule table is bounded, so shadow
+    // rules are capped and truncation is LOUD.
+    const SHADOW_RULE_CAP: usize = 40;
+    let (sh, mk, nj) = crate::overlay::shadow_glob_strings();
+    let mut targets: Vec<String> = vec![];
+    for pat in sh.iter().chain(mk.iter()).chain(nj.iter()) {
+        if !pat.starts_with('/') {
+            continue; // the FUSE loader already warned about these
         }
+        if pat.contains(['*', '?', '[']) {
+            if let Ok(hits) = glob::glob(pat) {
+                for h in hits.flatten() {
+                    if h.is_file() {
+                        targets.push(h.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        } else {
+            targets.push(pat.clone());
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    let mut n = 0usize;
+    for t in &targets {
+        let Some(base) = Path::new(t).file_name().and_then(|s| s.to_str())
+        else { continue };
+        if !matches!(base, "sh" | "bash" | "dash" | "make" | "gmake"
+                           | "ninja") {
+            eprintln!("sarun-engine run --sud: shadow glob hit {t:?} \
+                       skipped (basename {base:?} is not a dispatched \
+                       shell/make/ninja name)");
+            continue;
+        }
+        if n == SHADOW_RULE_CAP {
+            eprintln!("sarun-engine run --sud: shadow rules capped at \
+                       {SHADOW_RULE_CAP}; remaining glob hits NOT \
+                       shadowed — narrow the shadow_*.glob patterns");
+            break;
+        }
+        let link = shadow_dir.join(base);
+        if !link.exists() {
+            std::os::unix::fs::symlink(exe, &link)
+                .map_err(|e| format!("-b shadow link {}: {e}",
+                                     link.display()))?;
+        }
+        sc.args(["--remap-rule", &format!("remap:{t}={}", link.display())]);
+        n += 1;
     }
     Ok(())
 }

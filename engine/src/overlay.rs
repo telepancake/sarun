@@ -320,35 +320,53 @@ struct Shadows {
 
 impl Shadows {
     fn load() -> Self {
+        let (sh, make, ninja) = shadow_glob_strings();
         Self {
-            sh: load_glob_lines(
-                &crate::paths::shadow_sh_glob_path(),
-                &["/bin/sh", "/usr/bin/sh",
-                  "/bin/bash", "/usr/bin/bash",
-                  "/bin/dash", "/usr/bin/dash"]),
-            make: load_glob_lines(
-                &crate::paths::shadow_make_glob_path(),
-                &["/bin/make", "/usr/bin/make",
-                  "/bin/gmake", "/usr/bin/gmake"]),
-            ninja: load_glob_lines(
-                &crate::paths::shadow_ninja_glob_path(),
-                &["/bin/ninja", "/usr/bin/ninja"]),
+            sh: compile_globs(&sh),
+            make: compile_globs(&make),
+            ninja: compile_globs(&ninja),
             self_exe: std::env::current_exe().ok(),
         }
     }
 }
 
-fn load_glob_lines(file: &std::path::Path, defaults: &[&str])
-    -> Vec<glob::Pattern>
+/// The raw shadow glob pattern strings (sh, make, ninja) from the SAME
+/// config files + defaults the FUSE shadows compile. Shared with the sud
+/// runner, which expands them into concrete wrapper remap rules — the two
+/// backends must honor the same shadow configuration (a make matched by
+/// shadow_make.glob was shadowed under FUSE but ran REAL under sud,
+/// recording processes but no pipelines and no build edges).
+pub fn shadow_glob_strings() -> (Vec<String>, Vec<String>, Vec<String>) {
+    (
+        load_glob_strings(
+            &crate::paths::shadow_sh_glob_path(),
+            &["/bin/sh", "/usr/bin/sh",
+              "/bin/bash", "/usr/bin/bash",
+              "/bin/dash", "/usr/bin/dash"]),
+        load_glob_strings(
+            &crate::paths::shadow_make_glob_path(),
+            &["/bin/make", "/usr/bin/make",
+              "/bin/gmake", "/usr/bin/gmake"]),
+        load_glob_strings(
+            &crate::paths::shadow_ninja_glob_path(),
+            &["/bin/ninja", "/usr/bin/ninja"]),
+    )
+}
+
+fn load_glob_strings(file: &std::path::Path, defaults: &[&str])
+    -> Vec<String>
 {
-    let raw: Vec<String> = match std::fs::read_to_string(file) {
+    match std::fs::read_to_string(file) {
         Ok(s) => s.lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .map(String::from)
             .collect(),
         Err(_) => defaults.iter().map(|s| (*s).to_string()).collect(),
-    };
+    }
+}
+
+fn compile_globs(raw: &[String]) -> Vec<glob::Pattern> {
     raw.iter().filter_map(|p| {
         // Patterns SHOULD be absolute (the FUSE matcher prepends '/'
         // to the box-relative path). Relative patterns would silently
