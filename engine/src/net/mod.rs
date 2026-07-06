@@ -86,6 +86,20 @@ pub struct ProxyHooks {
     pub capture: Option<std::sync::Arc<webcap::WebCapSink>>,
     /// Ad/tracker block + response rewrite (`--webfilter`).
     pub filter: Option<std::sync::Arc<filter::Filter>>,
+    /// Replay mode (`--replay <box>`, DESIGN-web.md W4.2): serve every request
+    /// from a source box's `webcap` store instead of dialing upstream. When
+    /// Some, the proxy answers from the archive (404 on a miss — sealed, never
+    /// a live fetch); capture/filter don't apply on a replay box.
+    pub replay: Option<ReplaySource>,
+}
+
+/// What a replay box replays: the box whose captures answer requests, and an
+/// optional `asof` (serve the newest capture at-or-before this wall-clock
+/// second — a wayback selector).
+#[derive(Clone, Copy)]
+pub struct ReplaySource {
+    pub source_box: i64,
+    pub asof: Option<f64>,
 }
 
 

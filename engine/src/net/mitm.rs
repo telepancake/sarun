@@ -64,6 +64,41 @@ fn err_response(status: hyper::StatusCode, msg: &str) -> Response<ProxyBody> {
     r
 }
 
+/// Build the box-side response from a replayed capture (DESIGN-web.md W4.2).
+/// The stored body is the RAW bytes the box first received and the stored
+/// headers are verbatim, so serving them reproduces the original response
+/// exactly — including Content-Encoding, which the box decodes as it would
+/// live. We drop only the framing headers (Content-Length / Transfer-Encoding
+/// / Connection): hyper sets a correct Content-Length for the Full body, and a
+/// stored chunked/keep-alive header would desync the box-side connection.
+fn replay_response(hit: crate::discover::ReplayHit) -> Response<ProxyBody> {
+    let body = Full::new(Bytes::from(hit.resp_body))
+        .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+        .boxed();
+    let mut headers = hyper::HeaderMap::new();
+    for line in hit.resp_headers.lines() {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        if matches!(k.to_ascii_lowercase().as_str(),
+                    "content-length" | "transfer-encoding" | "connection"
+                    | "keep-alive" | "proxy-connection") {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v)) {
+            headers.append(name, val);
+        }
+    }
+    headers.insert("x-sarun-replay",
+                   hyper::header::HeaderValue::from_static("1"));
+    let mut r = Response::new(body);
+    *r.status_mut() = hyper::StatusCode::from_u16(hit.status.clamp(100, 599) as u16)
+        .unwrap_or(hyper::StatusCode::OK);
+    *r.headers_mut() = headers;
+    r
+}
+
 /// Common request handler. `scheme` is "http" or "https"; for "https" the
 /// upstream is opened via tokio-rustls. `port` is the default port (80/443)
 /// or whatever the box dialed. `hooks` (DESIGN-web.md W2/W7) are the per-box
@@ -79,6 +114,7 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
 {
     let sink = hooks.as_ref().and_then(|h| h.capture.clone());
     let filter = hooks.as_ref().and_then(|h| h.filter.clone());
+    let replay = hooks.as_ref().and_then(|h| h.replay);
     // Recover the target authority from the Host header (HTTP) or the
     // request URI's authority (HTTP/2-style absolute URI).
     let host = req.headers().get(hyper::header::HOST)
@@ -123,6 +159,23 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
                 .header("x-sarun-filter", "blocked")
                 .body(empty_body()).unwrap());
         }
+    }
+
+    // ── W4.2 replay ───────────────────────────────────────────────────────
+    // A replay box serves every request from a source box's webcap store
+    // instead of dialing upstream — the archive IS the internet for this box.
+    // Because sarun owns DNS + the MITM, the browser dials the real URL as
+    // normal and we answer from the store; no URL rewriting. A miss returns
+    // 404 (sealed: replay never silently falls back to a live fetch).
+    if let Some(rp) = replay {
+        let method = parts.method.to_string();
+        return Ok(match crate::discover::webcap_replay(
+            rp.source_box, &url, &method, rp.asof)
+        {
+            Some(hit) => replay_response(hit),
+            None => err_response(hyper::StatusCode::NOT_FOUND,
+                                 &format!("not in archive: {url}")),
+        });
     }
 
     let (out_body, reqcap): (ProxyBody, Option<ReqCap>) = if sink.is_some() {

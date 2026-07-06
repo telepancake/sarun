@@ -792,9 +792,17 @@ fn cli_run(args: &[String]) -> i32 {
             "--webcap" => unsafe { std::env::set_var("SARUN_WEBCAP", "1"); },
             // --webfilter  proxy-side adblock + rewrite (DESIGN-web.md W7).
             "--webfilter" => unsafe { std::env::set_var("SARUN_WEBFILTER", "1"); },
+            // --replay <box>  serve requests from <box>'s webcap instead of
+            //                 upstream (DESIGN-web.md W4.2). The value is the
+            //                 source box id; read at register via SARUN_REPLAY.
+            "--replay" => match it.next() {
+                Some(v) if v.parse::<i64>().is_ok() =>
+                    unsafe { std::env::set_var("SARUN_REPLAY", v); },
+                _ => { eprintln!("sarun oci run: --replay needs a box id"); return 2; }
+            },
             "-h" | "--help" => {
                 println!("usage: sarun oci run [--name NAME] [--net off|tap|host] \
-                          [--webcap] [--webfilter] <ref> [-- CMD...]");
+                          [--webcap] [--webfilter] [--replay BOX] <ref> [-- CMD...]");
                 return 0;
             }
             other if reference.is_none() => reference = Some(other.to_string()),

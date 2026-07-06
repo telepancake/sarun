@@ -1438,8 +1438,15 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
     let filter = if want_webfilter {
         Some(std::sync::Arc::new(crate::net::filter::Filter::load()))
     } else { None };
-    let hooks = if capture.is_some() || filter.is_some() {
-        Some(std::sync::Arc::new(crate::net::ProxyHooks { capture, filter }))
+    // Replay (DESIGN-web.md W4.2): `replay_from` names the source box whose
+    // captures answer this box's requests, with an optional `replay_asof`.
+    let replay = msg.get("replay_from").and_then(Value::as_i64)
+        .map(|source_box| crate::net::ReplaySource {
+            source_box,
+            asof: msg.get("replay_asof").and_then(Value::as_f64),
+        });
+    let hooks = if capture.is_some() || filter.is_some() || replay.is_some() {
+        Some(std::sync::Arc::new(crate::net::ProxyHooks { capture, filter, replay }))
     } else { None };
     if let (Some(rt), Some(keylog)) = (lock(state).net_rt.clone(), keylog) {
         crate::net::dispatch::Dispatcher::start(

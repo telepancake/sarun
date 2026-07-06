@@ -1196,6 +1196,7 @@ impl App {
             placement,
             webcap: false,
             webfilter: false,
+            replay: None,
         }
     }
 
@@ -3839,35 +3840,41 @@ impl App {
                 self.var_item_act();
             }
             Pane::Inspect => self.ins_enter(),
-            // Enter on an image capture opens the standalone image viewer
-            // (DESIGN-web.md W8); on any other row it's a no-op (the detail is
-            // already shown in the right pane).
+            // Enter on a capture opens it in the RIGHT viewer for its type
+            // (DESIGN-web.md W4.2/W8): an image → the sixel popover; an HTML
+            // page → carbonyl replaying THIS box's archive at that URL; other
+            // types already show decoded in the right pane.
             Pane::Network => {
-                let (id, mime) = match self.webcap_rows.get(self.sel_webcap) {
+                let (id, mime, url) = match self.webcap_rows.get(self.sel_webcap) {
                     Some(row) => (
                         row.get("id").and_then(Value::as_i64).unwrap_or(-1),
                         row.get("mime").and_then(Value::as_str).unwrap_or("").to_string(),
+                        row.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
                     ),
                     None => return,
                 };
-                if !mime.starts_with("image/") {
-                    self.status =
-                        format!("not an image ({mime}) — Enter views image captures");
-                    return;
-                }
                 let Some(sid) = self.cur_sid() else { return };
-                match rpc(&self.sock, "webcap_body", json!([sid, id])) {
-                    Ok(v) => {
-                        let b64 = v.get("b64").and_then(Value::as_str)
-                            .unwrap_or("").to_string();
-                        use base64::Engine;
-                        match base64::engine::general_purpose::STANDARD.decode(&b64) {
-                            Ok(bytes) =>
-                                open_image_view(self, &format!("webcap #{id} {mime}"), &bytes),
-                            Err(e) => self.status = format!("image: bad body ({e})"),
+                if mime.starts_with("image/") {
+                    match rpc(&self.sock, "webcap_body", json!([sid, id])) {
+                        Ok(v) => {
+                            let b64 = v.get("b64").and_then(Value::as_str)
+                                .unwrap_or("").to_string();
+                            use base64::Engine;
+                            match base64::engine::general_purpose::STANDARD.decode(&b64) {
+                                Ok(bytes) => open_image_view(
+                                    self, &format!("webcap #{id} {mime}"), &bytes),
+                                Err(e) => self.status = format!("image: bad body ({e})"),
+                            }
                         }
+                        Err(e) => self.status = format!("webcap_body: {e}"),
                     }
-                    Err(e) => self.status = format!("webcap_body: {e}"),
+                } else if mime.starts_with("text/html")
+                    || mime == "application/xhtml+xml" {
+                    open_replay_in_carbonyl(self, &sid, &url);
+                } else {
+                    self.status = format!(
+                        "{mime}: Enter opens image (sixel) and HTML (carbonyl \
+                         replay) captures; others show in the detail pane");
                 }
             }
             Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
@@ -6055,6 +6062,34 @@ fn api_log_detail_lines(app: &App) -> Vec<Line<'static>> {
 /// loop blits over the box interior. On a non-sixel terminal (or a decode
 /// failure) the popover shows a message instead of pixels. `source` is the
 /// caption prefix (e.g. "webcap #4 image/png").
+/// Launch carbonyl in REPLAY mode (DESIGN-web.md W4.2): a persistent browser
+/// box whose every request is answered from `source_sid`'s webcap archive
+/// instead of the live internet, opened at `url`. Because sarun owns DNS + the
+/// MITM, the browser dials the real URL and the engine serves the stored
+/// response — no URL rewriting. Replay needs tap (the MITM) and the SPKI so
+/// Chromium trusts the leaf; refuse visibly if the CA is missing.
+fn open_replay_in_carbonyl(app: &mut App, source_sid: &str, url: &str) {
+    let spki = match crate::net::ca::root_spki_sha256_b64() {
+        Ok(s) => s,
+        Err(e) => { app.status = format!("replay: MITM CA unavailable ({e})"); return; }
+    };
+    // Per-source replay browser (so two sources don't share one profile), on
+    // tap (replay is served by the MITM), capture/filter off — we're serving
+    // the archive, not recording or rewriting it.
+    let how = How {
+        net: "tap".into(),
+        env: app.launch_env,
+        placement: Placement::Reuse(format!("REPLAY{source_sid}")),
+        webcap: false,
+        webfilter: false,
+        replay: Some(source_sid.to_string()),
+    };
+    let argv = build_launch(
+        &LaunchTarget::Browser { url: url.to_string(), spki: Some(spki) }, &how);
+    app.open_pty(argv);
+    app.status = format!("replaying box {source_sid} in carbonyl — {url}");
+}
+
 fn open_image_view(app: &mut App, source: &str, bytes: &[u8]) {
     let img = match image::load_from_memory(bytes) {
         Ok(i) => i,
@@ -11109,6 +11144,10 @@ struct How {
     /// applies adblock + response rewrites outside the box. tap-only. The
     /// browser sets it alongside webcap; other targets default off.
     webfilter: bool,
+    /// Replay (DESIGN-web.md W4.2): `Some(box_id)` passes `--replay <box_id>`
+    /// so the box serves requests from that box's webcap archive instead of
+    /// upstream. tap-only. Set only by the replay-in-carbonyl launch.
+    replay: Option<String>,
 }
 
 /// What to run. Pure data — no variant carries spawn logic; build_launch()
@@ -11154,6 +11193,7 @@ fn run_argv(how: &How, brush: bool, cmd: &[String]) -> Vec<String> {
     if how.env { a.push("-e".into()); }
     if how.webcap { a.push("--webcap".into()); }
     if how.webfilter { a.push("--webfilter".into()); }
+    if let Some(src) = &how.replay { a.push("--replay".into()); a.push(src.clone()); }
     match &how.placement {
         Placement::New => {}
         Placement::Reuse(n) => a.push(n.clone()),
@@ -11180,6 +11220,7 @@ fn oci_run_argv(how: &How, reference: &str, cmd: &[String]) -> Vec<String> {
     }
     if how.webcap { a.push("--webcap".into()); }
     if how.webfilter { a.push("--webfilter".into()); }
+    if let Some(src) = &how.replay { a.push("--replay".into()); a.push(src.clone()); }
     a.push(reference.into());
     if !cmd.is_empty() {
         a.push("--".into());
@@ -12329,6 +12370,7 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     placement: Placement::Reuse("BROWSER".into()),
                     webcap: true,
                     webfilter: true,
+                    replay: None,
                 };
                 let argv = build_launch(
                     &LaunchTarget::Browser { url: buf, spki: Some(spki) }, &how);
@@ -13623,7 +13665,7 @@ mod tests {
     // A How with the given net + placement (env off unless set) for tests.
     fn how(net: &str, placement: Placement) -> How {
         How { net: net.to_string(), env: false, placement, webcap: false,
-              webfilter: false }
+              webfilter: false, replay: None }
     }
 
     #[test]
@@ -13634,10 +13676,27 @@ mod tests {
         // ignores the SPKI allowlist), the MITM SPKI, and the VALIDATED URL
         // last. Its How is Reuse("BROWSER") + webcap, so the launch carries
         // both --name BROWSER (profile persistence) and --webcap (archiving).
+        // Replay launch (DESIGN-web.md W4.2): a per-source REPLAY box carrying
+        // --replay <src> so carbonyl serves that box's archive, not the live
+        // net (no --webcap/--webfilter — we're replaying, not recording).
+        let rhow = How {
+            net: "tap".into(), env: false,
+            placement: Placement::Reuse("REPLAY7".into()),
+            webcap: false, webfilter: false, replay: Some("7".into()),
+        };
+        let rargv = build_launch(
+            &LaunchTarget::Browser { url: "https://x.test/".into(),
+                                     spki: Some("A=".into()) }, &rhow).join(" ");
+        assert!(rargv.contains("--name REPLAY7") && rargv.contains("--replay 7"),
+                "replay launch names the box + source: {rargv}");
+        assert!(!rargv.contains("--webcap") && !rargv.contains("--webfilter"),
+                "replay doesn't re-capture or filter: {rargv}");
+        assert!(rargv.ends_with("https://x.test/"), "replay opens the URL: {rargv}");
+
         let how = How {
             net: "tap".into(), env: false,
             placement: Placement::Reuse("BROWSER".into()), webcap: true,
-            webfilter: true,
+            webfilter: true, replay: None,
         };
         let argv = build_launch(
             &LaunchTarget::Browser { url: "https://example.com".into(),
@@ -13669,7 +13728,7 @@ mod tests {
         // net is spliced identically; env (-e) only where a box run accepts
         // it (`sarun run`), never on oci run / host shell.
         let h = How { net: "host".into(), env: true, placement: Placement::New,
-                      webcap: false, webfilter: false };
+                      webcap: false, webfilter: false, replay: None };
         assert_eq!(build_launch(&LaunchTarget::Shell, &h),
             vec!["sarun", "run", "-b", "--net", "host", "-e", "--"]);
         assert_eq!(build_launch(&LaunchTarget::Command(vec!["make".into()]), &h),

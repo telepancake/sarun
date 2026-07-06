@@ -319,6 +319,14 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                          "want_webfilter": std::env::var("SARUN_WEBFILTER")
                              .map(|v| !v.is_empty()).unwrap_or(false)
                              && net_mode == crate::net::NetMode::Tap,
+                         // Replay (DESIGN-web.md W4.2): --replay <box> sets
+                         // SARUN_REPLAY to the source box id; the box serves
+                         // requests from that box's webcap instead of upstream.
+                         // tap-only (needs the MITM). null when unset/off.
+                         "replay_from": (net_mode == crate::net::NetMode::Tap)
+                             .then(|| std::env::var("SARUN_REPLAY").ok()
+                                   .and_then(|v| v.parse::<i64>().ok()))
+                             .flatten(),
                          "net_mode": net_mode.as_str(),
                          "want_no_parent": no_parent,
                          "want_readonly_parent": readonly_parent,

@@ -395,6 +395,82 @@ pub fn webcap_body(box_id: i64, row_id: i64) -> Value {
     ).unwrap_or(Value::Null)
 }
 
+/// One replayed response: the RAW stored bytes + verbatim headers of the
+/// capture that answers a request. Byte-identical to what the box first
+/// received (Content-Encoding kept), so a replay browser decodes it exactly.
+pub struct ReplayHit {
+    pub status: i32,
+    pub resp_headers: String,
+    pub resp_body: Vec<u8>,
+}
+
+/// Replay lookup (DESIGN-web.md W4.2): the newest capture in box `box_id`
+/// whose URL matches `url` (and method, when the row recorded one), at or
+/// before `asof` when given. This is what the replay proxy serves instead of
+/// dialing upstream — exact-URL match, newest-first. Returns None when the
+/// archive has no such capture (the caller answers 404, keeping replay
+/// sealed: a miss is never a live fetch).
+pub fn webcap_replay(box_id: i64, url: &str, method: &str,
+                     asof: Option<f64>) -> Option<ReplayHit> {
+    let db = sqlar_path(box_id);
+    let conn = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    webcap_replay_conn(&conn, url, method, asof)
+}
+
+/// The replay query on an open connection (split out for testing). method is
+/// advisory: a capture recorded with an empty method still matches. asof:
+/// newest with ts <= asof (negative sentinel = no bound).
+fn webcap_replay_conn(conn: &rusqlite::Connection, url: &str, method: &str,
+                      asof: Option<f64>) -> Option<ReplayHit> {
+    let sql = "SELECT status,resp_headers,resp_body FROM webcap \
+               WHERE url=?1 AND (method=?2 OR method='') \
+               AND (?3 < 0 OR ts <= ?3) ORDER BY ts DESC LIMIT 1";
+    conn.query_row(sql, rusqlite::params![url, method, asof.unwrap_or(-1.0)],
+        |r| Ok(ReplayHit {
+            status: r.get::<_, i64>(0)? as i32,
+            resp_headers: r.get(1)?,
+            resp_body: r.get(2)?,
+        })).ok()
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    fn seed() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE webcap(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL,
+             method TEXT, url TEXT, host TEXT, status INT, mime TEXT,
+             req_headers TEXT, resp_headers TEXT, req_body BLOB, resp_body BLOB,
+             truncated INT DEFAULT 0);").unwrap();
+        let ins = "INSERT INTO webcap(ts,method,url,host,status,mime,\
+                   req_headers,resp_headers,req_body,resp_body,truncated) \
+                   VALUES(?1,'GET',?2,'x',?3,'text/html','','ct: html\n','',?4,0)";
+        c.execute(ins, rusqlite::params![1.0, "https://x/", 200, b"OLD".to_vec()]).unwrap();
+        c.execute(ins, rusqlite::params![9.0, "https://x/", 200, b"NEW".to_vec()]).unwrap();
+        c.execute(ins, rusqlite::params![5.0, "https://x/a.js", 404, b"".to_vec()]).unwrap();
+        c
+    }
+
+    #[test]
+    fn replay_returns_newest_and_respects_asof() {
+        let c = seed();
+        // Newest capture for the URL wins.
+        let h = webcap_replay_conn(&c, "https://x/", "GET", None).unwrap();
+        assert_eq!(h.resp_body, b"NEW");
+        assert_eq!(h.status, 200);
+        // asof before the newest → the older capture.
+        let h = webcap_replay_conn(&c, "https://x/", "GET", Some(3.0)).unwrap();
+        assert_eq!(h.resp_body, b"OLD");
+        // A different captured resource (a 404 the box actually got).
+        assert_eq!(webcap_replay_conn(&c, "https://x/a.js", "GET", None).unwrap().status, 404);
+        // A URL never captured → None (the proxy answers 404, sealed).
+        assert!(webcap_replay_conn(&c, "https://x/missing", "GET", None).is_none());
+    }
+}
+
 pub fn outputs(box_id: i64) -> Value {
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(
