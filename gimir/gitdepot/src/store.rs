@@ -63,10 +63,12 @@
 //! walks head→k applying deltas (O(distance from tip)); the tip itself is
 //! one standalone frame.
 //!
-//! COMMITS/REFLOG/TAGS chain records are BATCHES: one record per ingest
-//! (an update's new commits, an import, one ref transaction), never
-//! split by the seal threshold — sealing stays a between-prepends
-//! decision on the accumulator. Batch record layout:
+//! COMMITS/REFLOG/TAGS chain records are BATCHES: one record per
+//! landed chunk (an update's new commits, one ref transaction; a
+//! bootstrap-scale ingest early-lands a batch record per
+//! `BATCH_LAND_BOUND` staged bytes), never split by the seal
+//! threshold — sealing stays a between-prepends decision on the
+//! accumulator. Batch record layout:
 //!   `u64 LE base_idx | u32 LE count | count × (u32 LE len | object)`,
 //! objects OLDEST-FIRST within the batch, object stable index =
 //! base_idx + offset. Batch records stand alone, so their demotion is
@@ -128,12 +130,23 @@ const SEAL_THRESHOLD: u64 = 256 * 1024;
 // moderate-repo bench measured 32MiB here as ~2.7x the useful store.
 const FILE_SIZE_THRESHOLD: u64 = 4 << 20;
 /// Staging-medium switch — a MEMORY bound only. Records staged past
-/// this many bytes spill to a per-chain scratch file; the bound NEVER
-/// splits prepends (every ingest of any size lands as ONE prepend per
-/// touched chain — the batch invariant; splitting is the sabotage the
-/// moderate-repo bench measured as ~90 dead head frames). Overridable
-/// via GITDEPOT_SPILL_BOUND (bytes) so tests can force the spill path.
+/// this many bytes spill to a per-chain scratch file (compressed, see
+/// `Staged`); the bound selects where staged bytes WAIT, never how
+/// they land. Overridable via GITDEPOT_SPILL_BOUND (bytes) so tests
+/// can force the spill path.
 const SPILL_RAM_BOUND: u64 = 256 << 20;
+/// COMMITS/TAGS early-landing bound: once an ingest has staged this
+/// many raw record bytes for one of these chains, the staged records
+/// land NOW as one batch record (`finish()` lands the remainder), so
+/// a bootstrap-scale ingest never accumulates its whole history in
+/// staging. Overridable via GITDEPOT_TEST_BATCH_BOUND (bytes).
+const BATCH_LAND_BOUND: u64 = 64 << 20;
+/// Spill scratch: raw records accumulate in a pending buffer and
+/// compress to the scratch file in ~4MiB standalone zstd blocks at
+/// level 3 (records never split across blocks; an oversized record
+/// gets its own block).
+const SPILL_BLOCK: usize = 4 << 20;
+const SPILL_BLOCK_LEVEL: i32 = 3;
 const EVICTION_DEAD_RATIO: f32 = 0.5;
 
 const SCHEMA: &str = "
@@ -160,6 +173,19 @@ fn db_path(store: &Path) -> PathBuf {
 /// "Is there a store here?"
 pub fn store_exists(store: &Path) -> bool {
     db_path(store).exists()
+}
+
+/// Was this store left mid-flight by an interrupted large ingest (the
+/// `dirty_ingest` flag)? A bare kv read — usable where `Store::open`
+/// (which hard-errors on the flag) would be circular, e.g. the
+/// mirror's crashed-bootstrap wipe.
+pub fn ingest_interrupted(store: &Path) -> Result<bool> {
+    let conn = Connection::open_with_flags(
+        db_path(store),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(sql_err)?;
+    Ok(kv_get(&conn, "dirty_ingest")?.is_some())
 }
 
 /// The one supported on-disk format. Anything else on open = loud
@@ -592,6 +618,14 @@ impl Store {
                 "store {} has schema {schema:?}, this build writes {SCHEMA_VERSION} — \
                  store written by older code; delete and re-import (mirrors are \
                  rebuildable)",
+                store.display()
+            )));
+        }
+        if kv_get(&conn, "dirty_ingest")?.is_some() {
+            return Err(Error::Chain(format!(
+                "store {} was interrupted mid-ingest: chains hold early-landed \
+                 chunks ahead of the bookkeeping — the store must be rebuilt; \
+                 delete it and re-run the mirror (mirrors are rebuildable)",
                 store.display()
             )));
         }
@@ -1287,31 +1321,61 @@ pub(crate) fn apply_ref_changes(
 
 // --------------------------------------------------------------- ingest
 
-/// Oldest-first record staging for one chain: RAM up to `bound` bytes,
-/// then EVERYTHING (existing and subsequent records) moves to one
-/// sequential scratch file. The medium selects where bytes wait, never
-/// how they land — finish() drains the whole stage into ONE batch
-/// prepend regardless of size (a bootstrap of a million commits and a
-/// one-commit update are the same shape). The scratch file is pure
-/// scratch: a crash mid-ingest leaves the store untouched (chains
-/// flush before bookkeeping commits, and nothing flushes until
-/// finish); the rerun restages from zero.
+/// One compressed spill block: `comp_len` zstd bytes at file offset
+/// `off`, decompressing to `raw_len`.
+struct SpillBlock {
+    off: u64,
+    comp_len: u32,
+    raw_len: u32,
+}
+
+/// Spilled staging state: raw records accumulate in `pending` and
+/// compress to the scratch file in ~`SPILL_BLOCK`-sized standalone
+/// zstd blocks (level `SPILL_BLOCK_LEVEL`, no refPrefix). A record is
+/// never split across blocks — the pending buffer flushes only AFTER
+/// a whole record joins it, so a record larger than the block size
+/// simply gets its own block.
+struct Spill {
+    f: std::fs::File,
+    file_len: u64,
+    blocks: Vec<SpillBlock>,
+    /// Per-record (block_no, offset_in_block, len); block_no ==
+    /// blocks.len() = the record is still in the pending raw buffer.
+    recs: Vec<(u32, u32, u32)>,
+    pending: Vec<u8>,
+    /// Last decompressed block (sequential access dominates: the
+    /// staged walk and drain read records in near-order).
+    cache: std::cell::RefCell<Option<(u32, Vec<u8>)>>,
+}
+
+/// Oldest-first record staging for one chain: RAM up to `bound` RAW
+/// bytes, then EVERYTHING (existing and subsequent records) moves to
+/// one scratch file of compressed blocks (`Spill`). The medium selects
+/// where bytes wait, never how they land. Staging no longer holds a
+/// whole bootstrap: the `Ingest` early-lands chunks mid-ingest (TREES
+/// at the frame bound, COMMITS/TAGS at `BATCH_LAND_BOUND`), each
+/// early flush draining the stage — `drain_all` therefore only ever
+/// materializes one bounded chunk in RAM. The scratch file is pure
+/// scratch: a crash mid-ingest leaves nothing to clean but the file
+/// (deleted on Drop) — store-side crash state is the `dirty_ingest`
+/// flag, owned by `Ingest`.
 pub(crate) struct Staged {
     ram: Vec<Vec<u8>>,
+    /// RAW staged bytes (RAM or spilled) since the last drain.
     bytes: u64,
     bound: u64,
-    /// (append handle, per-record (offset, len)) once spilled.
-    spill: Option<(std::fs::File, Vec<(u64, u32)>)>,
+    block: usize,
+    spill: Option<Spill>,
     path: PathBuf,
 }
 
 impl Staged {
-    fn new(path: PathBuf, bound: u64) -> Staged {
-        Staged { ram: Vec::new(), bytes: 0, bound, spill: None, path }
+    fn new(path: PathBuf, bound: u64, block: usize) -> Staged {
+        Staged { ram: Vec::new(), bytes: 0, bound, block, spill: None, path }
     }
 
     fn len(&self) -> usize {
-        self.ram.len() + self.spill.as_ref().map_or(0, |(_, o)| o.len())
+        self.ram.len() + self.spill.as_ref().map_or(0, |sp| sp.recs.len())
     }
 
     fn is_empty(&self) -> bool {
@@ -1336,7 +1400,14 @@ impl Staged {
                 .read(true)
                 .write(true)
                 .open(&self.path)?;
-            self.spill = Some((f, Vec::new()));
+            self.spill = Some(Spill {
+                f,
+                file_len: 0,
+                blocks: Vec::new(),
+                recs: Vec::new(),
+                pending: Vec::new(),
+                cache: std::cell::RefCell::new(None),
+            });
             let moved = std::mem::take(&mut self.ram);
             for r in moved {
                 self.append(&r)?;
@@ -1346,44 +1417,77 @@ impl Staged {
     }
 
     fn append(&mut self, rec: &[u8]) -> Result<()> {
-        use std::io::Write as _;
-        let (f, offs) = self.spill.as_mut().expect("spill open");
-        let off = offs.last().map_or(0, |(o, l)| o + *l as u64);
-        f.write_all(rec)?;
-        offs.push((off, rec.len() as u32));
+        let block = self.block;
+        let sp = self.spill.as_mut().expect("spill open");
+        sp.recs.push((sp.blocks.len() as u32, sp.pending.len() as u32, rec.len() as u32));
+        sp.pending.extend_from_slice(rec);
+        if sp.pending.len() >= block {
+            Self::seal_block(sp)?;
+        }
         Ok(())
+    }
+
+    /// Compress the pending raw buffer to the scratch file as one block.
+    fn seal_block(sp: &mut Spill) -> Result<()> {
+        if sp.pending.is_empty() {
+            return Ok(());
+        }
+        use std::io::Write as _;
+        let comp = zstd::bulk::compress(&sp.pending, SPILL_BLOCK_LEVEL)?;
+        sp.f.write_all(&comp)?;
+        sp.blocks.push(SpillBlock {
+            off: sp.file_len,
+            comp_len: comp.len() as u32,
+            raw_len: sp.pending.len() as u32,
+        });
+        sp.file_len += comp.len() as u64;
+        sp.pending.clear();
+        Ok(())
+    }
+
+    fn read_block(sp: &Spill, b: u32) -> Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt as _;
+        let blk = &sp.blocks[b as usize];
+        let mut comp = vec![0u8; blk.comp_len as usize];
+        sp.f.read_exact_at(&mut comp, blk.off)?;
+        Ok(zstd::bulk::decompress(&comp, blk.raw_len as usize)?)
     }
 
     /// Record `i` in push order.
     fn get(&self, i: usize) -> Result<Vec<u8>> {
         match &self.spill {
             None => Ok(self.ram[i].clone()),
-            Some((f, offs)) => {
-                use std::os::unix::fs::FileExt as _;
-                let (off, len) = offs[i];
-                let mut buf = vec![0u8; len as usize];
-                f.read_exact_at(&mut buf, off)?;
-                Ok(buf)
+            Some(sp) => {
+                let (b, off, len) = sp.recs[i];
+                let (off, len) = (off as usize, len as usize);
+                if b as usize == sp.blocks.len() {
+                    return Ok(sp.pending[off..off + len].to_vec());
+                }
+                let mut cache = sp.cache.borrow_mut();
+                if cache.as_ref().map_or(true, |(cb, _)| *cb != b) {
+                    *cache = Some((b, Self::read_block(sp, b)?));
+                }
+                let raw = &cache.as_ref().expect("just cached").1;
+                Ok(raw[off..off + len].to_vec())
             }
         }
     }
 
     /// All records in push order; the stage is left empty and its
-    /// scratch file deleted. RAM peaks at the full staged size here —
-    /// unavoidable: compose_f1 builds the whole raw accumulator in RAM
-    /// anyway, so the spill only bounds RAM during the WALK.
+    /// scratch file deleted. RAM peaks at the drained chunk's raw size
+    /// — bounded, because the `Ingest` early-lands before staging
+    /// grows past its per-chain bound (compose_f1 builds the same raw
+    /// accumulator in RAM anyway).
     fn drain_all(&mut self) -> Result<Vec<Vec<u8>>> {
-        let out = match self.spill.take() {
+        let out = match &self.spill {
             None => std::mem::take(&mut self.ram),
-            Some((f, offs)) => {
-                use std::os::unix::fs::FileExt as _;
-                let mut out = Vec::with_capacity(offs.len());
-                for (off, len) in offs {
-                    let mut buf = vec![0u8; len as usize];
-                    f.read_exact_at(&mut buf, off)?;
-                    out.push(buf);
+            Some(_) => {
+                let n = self.len();
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    out.push(self.get(i)?);
                 }
-                drop(f);
+                self.spill = None;
                 let _ = std::fs::remove_file(&self.path);
                 out
             }
@@ -1403,27 +1507,52 @@ impl Drop for Staged {
 
 /// Staged multi-record write of new commits (import, update, migration):
 /// accumulates tree deltas + commit records oldest-first (in RAM or
-/// spilled to `<store>/staging/`, see `Staged`), then lands each chain
-/// with ONE batch prepend (SPEC §"Prepend multiple records") and one
-/// sqlite transaction. Correct for one commit or many — a
-/// single-commit update is the N=1 batch, a laddered bootstrap is the
-/// N=all batch; the prepend count per touched chain is 1 either way
-/// (plus the empty-chain seed).
+/// spilled to `<store>/staging/`, see `Staged`) and lands them as batch
+/// prepends (SPEC §"Prepend multiple records"), each sized by BYTES:
+/// when TREES staging reaches `max(SEAL_THRESHOLD,
+/// last_boundary_len)` — or COMMITS/TAGS staging reaches
+/// `BATCH_LAND_BOUND` — the staged chunk lands NOW, mid-ingest, as an
+/// ordinary prepend (per the SPEC: a batch whose entries alone dwarf
+/// the seal threshold must not land as one frame). `finish()` lands
+/// the remainder plus the reflog and the single bookkeeping
+/// transaction. A small update never early-lands and stays exactly
+/// the old one-prepend-per-chain, fully atomic shape; an ingest that
+/// DID early-land is guarded by the `dirty_ingest` kv flag (set
+/// before the first early prepend, cleared with the bookkeeping) —
+/// a crash in between leaves chains ahead of counts and the store
+/// hard-errors on open.
 pub(crate) struct Ingest<'a> {
     st: &'a mut Store,
     level: i32,
     // TREES staging. `entries` are reverse deltas in ADD order: the
-    // first entry rebuilds the pre-batch head (the bridge), each later
+    // first entry rebuilds the chain head as of the last flush (the
+    // bridge — after an early flush the next staged delta rebuilds the
+    // just-landed head, so the invariant self-maintains), each later
     // one rebuilds the previously-added tree.
     head_view: Option<depot::View>,
     seed_full: Option<Vec<u8>>,
     tree_entries: Staged,
-    /// Stable index of the first STAGED tree (= n_trees at open).
+    /// Stable index one past the last LANDED tree (= n_trees at open;
+    /// advances as chunks early-land). Staged trees are
+    /// `tree_base..n_trees`.
     tree_base: u64,
     n_trees: u64,
     /// Intra-ingest dedup only (git tree oid → tree_idx), discarded
     /// with the Ingest.
     tree_cache: HashMap<String, u64>,
+    /// Raw length of the last landed TREES boundary head — the full
+    /// snapshot a future cold frame anchors on. Tree chunks flush at
+    /// max(frame_bound, this): frames at least anchor-sized keep the
+    /// anchor recompression cost amortized to ~2x data.
+    last_boundary_len: u64,
+    /// TREES early-flush floor (SEAL_THRESHOLD; test-overridable via
+    /// GITDEPOT_TEST_FRAME_BOUND).
+    frame_bound: u64,
+    /// COMMITS/TAGS early-land bound (BATCH_LAND_BOUND;
+    /// test-overridable via GITDEPOT_TEST_BATCH_BOUND).
+    batch_bound: u64,
+    /// dirty_ingest has been written for this ingest.
+    dirty: bool,
     // COMMITS staging (encoded objects, oldest-first).
     commit_recs: Staged,
     n_commits: u64,
@@ -1449,28 +1578,63 @@ impl<'a> Ingest<'a> {
         } else {
             None
         };
-        let bound = std::env::var("GITDEPOT_SPILL_BOUND")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(SPILL_RAM_BOUND);
+        let env_u64 = |key: &str, default: u64| -> u64 {
+            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
+        let bound = env_u64("GITDEPOT_SPILL_BOUND", SPILL_RAM_BOUND);
+        let frame_bound = env_u64("GITDEPOT_TEST_FRAME_BOUND", SEAL_THRESHOLD);
+        let batch_bound = env_u64("GITDEPOT_TEST_BATCH_BOUND", BATCH_LAND_BOUND);
+        // The opening boundary: the stored head IS a landed full
+        // snapshot, so its canonical encode length seeds the flush
+        // floor (0 on a fresh chain).
+        let last_boundary_len = head_view
+            .as_ref()
+            .map_or(0, |v| depot::codec::encode(&depot::diff(None, Some(v))).len() as u64);
         let staging = st.root().join("staging");
         Ok(Ingest {
             st,
             level,
             head_view,
             seed_full: None,
-            tree_entries: Staged::new(staging.join("trees"), bound),
+            tree_entries: Staged::new(staging.join("trees"), bound, SPILL_BLOCK),
             tree_base: n_trees,
             n_trees,
             tree_cache: HashMap::new(),
-            commit_recs: Staged::new(staging.join("commits"), bound),
+            last_boundary_len,
+            frame_bound,
+            batch_bound,
+            dirty: false,
+            commit_recs: Staged::new(staging.join("commits"), bound, SPILL_BLOCK),
             n_commits,
             sha_cache: HashMap::new(),
             tree_of_commit: HashMap::new(),
-            tag_recs: Staged::new(staging.join("tags"), bound),
+            tag_recs: Staged::new(staging.join("tags"), bound, SPILL_BLOCK),
             n_tags,
             tag_cache: HashMap::new(),
         })
+    }
+
+    /// RAW staged bytes across the three stages (RAM + spill) —
+    /// instrumentation for the bootstrap rung report.
+    pub(crate) fn staged_bytes(&self) -> u64 {
+        self.tree_entries.bytes + self.commit_recs.bytes + self.tag_recs.bytes
+    }
+
+    /// Write the `dirty_ingest` flag in its own transaction —
+    /// immediately BEFORE the first early-landing prepend, so a crash
+    /// after any chain moved ahead of the kv counts is detectable.
+    /// Ingests that never early-land never set it (the common small
+    /// update stays atomic exactly as before). Cleared inside the
+    /// bookkeeping transaction.
+    fn mark_dirty(&mut self) -> Result<()> {
+        if self.dirty {
+            return Ok(());
+        }
+        let tx = self.st.conn.unchecked_transaction().map_err(sql_err)?;
+        kv_set(&tx, "dirty_ingest", "1")?;
+        tx.commit().map_err(sql_err)?;
+        self.dirty = true;
+        Ok(())
     }
 
     fn parent_idx(&self, sha: &str) -> Result<u64> {
@@ -1526,22 +1690,31 @@ impl<'a> Ingest<'a> {
         self.n_trees += 1;
         self.head_view = Some(view.clone());
         self.tree_cache.insert(tree_oid.to_string(), idx);
-        // NEVER sub-batch, on any threshold: within one prepend there
-        // is exactly one f1 re-encode regardless of size, so splitting
-        // a batch buys nothing and churns dead head frames (an import
-        // chunked at 256KiB wrote ~90 superseded f0s). Sealing is
-        // decided BETWEEN prepends (compose_f1: an old accumulator
-        // past the threshold seals whole). RAM on huge ingests is the
-        // Staged spill's job, never a flush trigger.
+        // Early landing: once the staged chunk's bytes reach
+        // max(frame_bound, last landed boundary length), land it NOW
+        // as an ordinary prepend (SPEC, compose_f1 doc: "A batch whose
+        // entries alone dwarf the seal threshold must not land as one
+        // frame" — every accumulator/cold frame stays ~threshold-
+        // sized). The boundary floor keeps frames at least
+        // anchor-sized so the full-snapshot anchor recompression
+        // amortizes. An early-landed chunk is byte-for-byte an
+        // ordinary prepend, so the read path is unchanged.
+        if self.tree_entries.bytes >= self.frame_bound.max(self.last_boundary_len) {
+            self.mark_dirty()?;
+            self.flush_tree_batch()?;
+        }
         Ok(idx)
     }
 
-    /// Reconstruct the view of STAGED tree `tree_idx` by walking the
-    /// staged reverse deltas backward from the staged head — the
-    /// mid-ingest analogue of `Store::walk_tree_views` (a laddered
-    /// bootstrap needs boundary views before anything has landed).
-    /// One backward pass serves many targets: `targets` maps stable
-    /// tree idx → keys wanting that view.
+    /// Reconstruct the view of tree `tree_idx` mid-ingest: staged
+    /// trees by walking the staged reverse deltas backward from the
+    /// staged head — the mid-ingest analogue of
+    /// `Store::walk_tree_views` (a laddered bootstrap needs boundary
+    /// views before the ingest commits) — and trees that already
+    /// EARLY-LANDED (below `tree_base`; kv counts still lag until
+    /// `commit_bookkeeping`) by walking the chain with the ingest's
+    /// live count. One backward pass per side serves many targets:
+    /// `targets` maps stable tree idx → keys wanting that view.
     pub(crate) fn staged_views<K: Clone>(
         &self,
         targets: &std::collections::BTreeMap<u64, Vec<K>>,
@@ -1550,47 +1723,68 @@ impl<'a> Ingest<'a> {
         if targets.is_empty() {
             return Ok(out);
         }
-        let lowest = *targets.keys().next().expect("non-empty");
-        // Entry j rebuilds tree (base + j - 1) from (base + j) — except
-        // on a seeded (fresh) chain, where the seed consumed no entry
-        // and entry j rebuilds tree j from j+1. `first_rebuilt` is the
-        // stable idx entry 0 rebuilds.
+        // Staged entry 0 (the bridge) rebuilds the LANDED chain head,
+        // tree_base - 1 — the staged walk bottoms out there; anything
+        // lower comes from the chain.
         let first_rebuilt = if self.tree_base == 0 { 0 } else { self.tree_base - 1 };
-        if lowest < first_rebuilt {
-            return Err(Error::Chain(format!(
-                "staged view {lowest} is below the staged range (read the store)"
-            )));
+        let mut stored: std::collections::BTreeMap<u64, &Vec<K>> = Default::default();
+        let mut staged: std::collections::BTreeMap<u64, &Vec<K>> = Default::default();
+        for (i, ks) in targets {
+            if *i < first_rebuilt {
+                stored.insert(*i, ks);
+            } else {
+                staged.insert(*i, ks);
+            }
         }
-        let mut cur = self
-            .head_view
-            .clone()
-            .ok_or_else(|| Error::Chain("staged view walk on an empty ingest".into()))?;
-        let mut idx = self.n_trees - 1;
-        let mut j = self.tree_entries.len();
-        loop {
-            if let Some(keys) = targets.get(&idx) {
-                for k in keys {
-                    out.push((k.clone(), cur.clone()));
+        if !staged.is_empty() {
+            let lowest = *staged.keys().next().expect("non-empty");
+            let mut cur = self
+                .head_view
+                .clone()
+                .ok_or_else(|| Error::Chain("staged view walk on an empty ingest".into()))?;
+            let mut idx = self.n_trees - 1;
+            let mut j = self.tree_entries.len();
+            loop {
+                if let Some(keys) = staged.get(&idx) {
+                    for k in *keys {
+                        out.push((k.clone(), cur.clone()));
+                    }
                 }
+                if idx == lowest {
+                    break;
+                }
+                if j == 0 {
+                    return Err(Error::Chain(format!(
+                        "staged walk exhausted at tree {idx} before reaching {lowest}"
+                    )));
+                }
+                j -= 1;
+                let rec = self.tree_entries.get(j)?;
+                let layer = depot::codec::decode(&rec)?;
+                let mut v = Some(cur);
+                depot::apply_mut(&mut v, &layer);
+                cur = v.ok_or_else(|| {
+                    Error::Chain(format!("staged tree {} resolves to nothing", idx - 1))
+                })?;
+                idx -= 1;
             }
-            if idx == lowest {
-                return Ok(out);
-            }
-            if j == 0 {
-                return Err(Error::Chain(format!(
-                    "staged walk exhausted at tree {idx} before reaching {lowest}"
-                )));
-            }
-            j -= 1;
-            let rec = self.tree_entries.get(j)?;
-            let layer = depot::codec::decode(&rec)?;
-            let mut v = Some(cur);
-            depot::apply_mut(&mut v, &layer);
-            cur = v.ok_or_else(|| {
-                Error::Chain(format!("staged tree {} resolves to nothing", idx - 1))
-            })?;
-            idx -= 1;
         }
+        if !stored.is_empty() {
+            // Chain head = tree tree_base - 1 at walk position 0
+            // (early-landed chunks are ordinary prepends).
+            let base = self.tree_base;
+            let lowest = *stored.keys().next().expect("non-empty");
+            let until = (base - 1 - lowest) as usize;
+            self.st.walk_tree_views(Some(until), &mut |pos, _, v| {
+                let idx = base - 1 - pos as u64;
+                if let Some(keys) = stored.get(&idx) {
+                    for k in *keys {
+                        out.push((k.clone(), v.clone()));
+                    }
+                }
+            })?;
+        }
+        Ok(out)
     }
 
     /// The staged view of a commit already added to THIS ingest.
@@ -1598,12 +1792,17 @@ impl<'a> Ingest<'a> {
         self.sha_cache.get(sha).and_then(|c| self.tree_of_commit.get(c)).copied()
     }
 
+    /// Land everything TREES-staged as one batch prepend — the single
+    /// code path shared by mid-ingest early flushes and `finish()`
+    /// (the final flush's bridge rebuilds the last early-landed head).
     fn flush_tree_batch(&mut self) -> Result<()> {
         if let Some(seed_rec) = self.seed_full.take() {
             self.st
                 .prepend_batch(TREES, &seed_rec, &[], Demote::Verbatim, self.level)?;
+            self.last_boundary_len = seed_rec.len() as u64;
         }
         if self.tree_entries.is_empty() {
+            self.tree_base = self.n_trees;
             return Ok(());
         }
         // The batch-head full record, minted here (once per prepend)
@@ -1619,6 +1818,10 @@ impl<'a> Ingest<'a> {
         older.reverse();
         self.st
             .prepend_batch(TREES, &head_full, &older, Demote::Replace(bridge), self.level)?;
+        // The landed head is the next boundary anchor; the next staged
+        // delta rebuilds it (the next bridge).
+        self.last_boundary_len = head_full.len() as u64;
+        self.tree_base = self.n_trees;
         Ok(())
     }
 
@@ -1668,6 +1871,14 @@ impl<'a> Ingest<'a> {
         self.commit_recs.push(rec.encode())?;
         self.sha_cache.insert(cm.sha.clone(), idx);
         self.tree_of_commit.insert(idx, tree_idx);
+        // Early landing: staged COMMITS past the bound land now as one
+        // batch record; `flush_commit_batch`'s running base keeps the
+        // stable indices contiguous across multiple batches per
+        // ingest, and readers already walk batch records.
+        if self.commit_recs.bytes >= self.batch_bound {
+            self.mark_dirty()?;
+            self.flush_commit_batch()?;
+        }
         Ok(idx)
     }
 
@@ -1713,6 +1924,11 @@ impl<'a> Ingest<'a> {
         };
         self.tag_recs.push(rec.encode())?;
         self.tag_cache.insert(sha.to_string(), idx);
+        // Early landing, same shape as COMMITS.
+        if self.tag_recs.bytes >= self.batch_bound {
+            self.mark_dirty()?;
+            self.flush_tag_batch()?;
+        }
         Ok(idx)
     }
 
@@ -1740,7 +1956,8 @@ impl<'a> Ingest<'a> {
     }
 
     /// One batch prepend per touched chain (trees, commits, tags) for
-    /// EVERYTHING staged — the whole ingest, however it was buffered.
+    /// everything still staged — the whole ingest when nothing
+    /// early-landed, the sub-threshold remainder otherwise.
     fn flush_chains(&mut self) -> Result<()> {
         self.flush_tree_batch()?;
         self.flush_commit_batch()?;
@@ -1755,6 +1972,10 @@ impl<'a> Ingest<'a> {
             kv_set(tx, "n_commits", &n_commits.to_string())?;
             kv_set(tx, "n_reflog", &n_reflog.to_string())?;
             kv_set(tx, "n_tags", &n_tags.to_string())?;
+            // Counts now cover every early-landed chunk: the ingest is
+            // whole again.
+            tx.execute("DELETE FROM kv WHERE key = 'dirty_ingest'", [])
+                .map_err(sql_err)?;
             apply_ref_changes(tx, changes)?;
             Ok(())
         })
@@ -1995,4 +2216,79 @@ pub fn read_meta(store: &Path) -> Result<Meta> {
         });
     }
     Ok(Meta { label, url, refs, commits })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// dirty_ingest set (a crash between an early-landing prepend and
+    /// the bookkeeping) ⇒ Store::open hard-errors: the store must be
+    /// rebuilt, no repair path.
+    #[test]
+    fn dirty_ingest_blocks_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("store");
+        {
+            let s = Store::create(&root).unwrap();
+            let tx = s.conn.unchecked_transaction().unwrap();
+            kv_set(&tx, "dirty_ingest", "1").unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(ingest_interrupted(&root).unwrap());
+        let err = match Store::open(&root) {
+            Ok(_) => panic!("open succeeded on a dirty store"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("interrupted mid-ingest") && err.contains("rebuilt"),
+            "unexpected open error: {err}"
+        );
+    }
+
+    /// Compressed-spill roundtrip across block boundaries: records
+    /// never split across blocks; a record larger than the block size
+    /// gets its own block; random-order `get` and `drain_all` both
+    /// return the exact pushed bytes; the scratch file is deleted.
+    #[test]
+    fn staged_spill_block_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("staging").join("t");
+        // bound 0 ⇒ every push spills; tiny 64-byte blocks.
+        let mut st = Staged::new(path.clone(), 0, 64);
+        let mut recs: Vec<Vec<u8>> = Vec::new();
+        for i in 0..40usize {
+            // Lengths straddling the block size, including one record
+            // several blocks large (200 > 64: its own block).
+            let len = match i % 5 {
+                0 => 1,
+                1 => 63,
+                2 => 64,
+                3 => 65,
+                _ => 200,
+            };
+            let rec: Vec<u8> = (0..len).map(|j| (i * 31 + j) as u8).collect();
+            recs.push(rec.clone());
+            st.push(rec).unwrap();
+        }
+        assert_eq!(st.len(), recs.len());
+        assert_eq!(st.bytes, recs.iter().map(|r| r.len() as u64).sum::<u64>());
+        let sp = st.spill.as_ref().expect("spilled");
+        assert!(sp.blocks.len() >= 2, "fixture must cross block boundaries");
+        for blk in &sp.blocks {
+            // A record is never split: every block decompresses to
+            // whole records (checked implicitly below), and only the
+            // oversized record exceeds the block size.
+            assert!(blk.raw_len as usize >= 1);
+        }
+        // Random-order reads (defeat the last-block cache).
+        for &i in &[39usize, 0, 20, 5, 38, 1, 19, 2] {
+            assert_eq!(st.get(i).unwrap(), recs[i], "record {i}");
+        }
+        let drained = st.drain_all().unwrap();
+        assert_eq!(drained, recs);
+        assert!(!path.exists(), "scratch file must be deleted on drain");
+        assert_eq!(st.bytes, 0);
+        assert!(st.is_empty());
+    }
 }

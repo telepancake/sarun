@@ -1528,6 +1528,20 @@ fn dir_kb(dir: &Path) -> u64 {
     n / 1024
 }
 
+/// Free KiB on `path`'s filesystem (0 on any failure) — the
+/// disk-headroom side of the rung instrumentation.
+fn disk_avail_kb(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return 0;
+    };
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return 0;
+    }
+    (s.f_bavail as u64).saturating_mul(s.f_frsize as u64) / 1024
+}
+
 fn init_stub_dir(dir: &Path, url: &str) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     git(dir, &["init", "-q", "--bare"])?;
@@ -1776,6 +1790,16 @@ pub struct RungStat {
     /// repo.git size right after the rung's fetch — the moment the
     /// buffer peaks (pack + snapshots + stub, before the re-pin).
     pub buffer_peak_kb: u64,
+    /// Raw bytes still staged in the ingest (RAM + spill, all three
+    /// stages) at the end of the rung — bounded by the early-landing
+    /// thresholds, not by history size.
+    pub staged_kb: u64,
+    /// Store directory size at the end of the rung (chunks land
+    /// mid-ingest, so this grows rung by rung).
+    pub store_kb: u64,
+    /// Free space on the store's filesystem (statvfs; 0 if the call
+    /// fails).
+    pub disk_avail_kb: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1849,11 +1873,16 @@ pub fn mirror_opts(url: &str, root: &Path, opts: MirrorOpts) -> Result<MirrorOut
     };
     let repo = root.join("repo.git");
     let store = root.join("store");
-    // A crashed bootstrap/import leaves an EMPTY store (nothing lands
-    // before the final one-prepend-per-chain flush): wipe and restart
-    // from zero — the staging log was scratch, there is no partial
-    // store to resume.
-    if store::store_exists(&store) && store::commit_count(&store)? == 0 {
+    // A crashed bootstrap/import leaves either an EMPTY store (it
+    // died before anything landed) or a DIRTY one (the dirty_ingest
+    // flag: early-landed chunks ahead of the bookkeeping — Store::open
+    // refuses it): wipe and restart from zero — the staging log was
+    // scratch, there is no partial store to resume. The dirty check
+    // runs first: commit_count opens the store, which hard-errors on
+    // the flag.
+    if store::store_exists(&store)
+        && (store::ingest_interrupted(&store)? || store::commit_count(&store)? == 0)
+    {
         std::fs::remove_dir_all(&store)?;
         if repo.exists() {
             std::fs::remove_dir_all(&repo)?;
@@ -2073,17 +2102,22 @@ fn natural_key(name: &str) -> Vec<(String, u64)> {
 /// First contact, laddered: fetch the history in rungs (waves of tags
 /// in natural-version order, then a converge fetch of everything) so
 /// the fetch buffer peaks at one rung, not the whole clone — while the
-/// STORE ingest stays ONE turn: every rung's records stage through the
-/// same `Ingest` (spilling to disk past the RAM bound) and land as ONE
-/// prepend per touched chain at the end, exactly like a single-shot
-/// import. Rung boundaries are invisible to the walk: boundary views
-/// come from the staged reverse deltas (`Ingest::staged_views`), and
-/// the sha→tree-oid memo spans rungs. Crash mid-ladder = restart from
-/// zero (the staging log is scratch; nothing lands before finish).
+/// STORE ingest stays one logical turn: every rung's records stage
+/// through the same `Ingest` (spilling to a compressed scratch log
+/// past the RAM bound) and land as byte-bounded chunk prepends as
+/// staging fills (TREES at the frame bound, COMMITS/TAGS at the batch
+/// bound), the remainder at `finish()`. Rung boundaries are invisible
+/// to the walk: boundary views come from the staged reverse deltas or
+/// — once a chunk early-lands — the chain itself
+/// (`Ingest::staged_views`), and the sha→tree-oid memo spans rungs.
+/// Crash mid-ladder = restart from zero: the staging log is scratch,
+/// and any early-landed chunks are fenced by the `dirty_ingest` flag
+/// (the mirror wipes the store and rebuilds; see `mirror_opts`).
 ///
 /// Peak disk = one rung's pack + materialized tip snapshots + the
-/// staging log (≈ the final raw accumulator — the product itself) +
-/// the stub.
+/// bounded compressed staging log + the store growing to its final
+/// size as chunks land + the stub — never an uncompressed copy of
+/// the whole history.
 fn bootstrap(
     url: &str,
     root: &Path,
@@ -2221,8 +2255,13 @@ fn bootstrap(
         )?;
         known_all.extend(commits.iter().map(|c| c.sha.clone()));
         total_new += commits.len();
+        let staged_kb = ingest.staged_bytes() / 1024;
+        let store_kb = dir_kb(store_path);
+        let avail_kb = disk_avail_kb(store_path);
         eprintln!(
-            "gitdepot: bootstrap rung {rung_no}: {rung_refs} refs, {} new commits, buffer {buffer_peak_kb}K",
+            "gitdepot: bootstrap rung {rung_no}: {rung_refs} refs, {} new commits, \
+             buffer {buffer_peak_kb}K, staged {staged_kb}K, store {store_kb}K, \
+             disk-avail {avail_kb}K",
             commits.len()
         );
         let refs_now = collect_refs(&repo)?;
@@ -2236,7 +2275,14 @@ fn bootstrap(
         tips.dedup();
         fresh_tips = tips.iter().filter(|t| !old_tips.contains(t)).cloned().collect();
         prev_tips = tips;
-        rungs.push(RungStat { refs: rung_refs, new_commits: commits.len(), buffer_peak_kb });
+        rungs.push(RungStat {
+            refs: rung_refs,
+            new_commits: commits.len(),
+            buffer_peak_kb,
+            staged_kb,
+            store_kb,
+            disk_avail_kb: avail_kb,
+        });
         if !done {
             repin_buffer(&repo, url, &refs_now, &snap_packs)?;
         }
