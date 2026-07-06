@@ -65,6 +65,14 @@ one-time setup, both done the supported way — no verification is disabled:
 
 ## Known v1 limits
 
+- **Text-run collisions on dense pages**: forcing every font to 16px makes
+  text wider than containers laid out for smaller sizes (e.g. HN's 10px
+  metadata rows), so overflowing inline runs can overlap and overwrite each
+  other's cells, clipping word tails. This is the main quality gap vs
+  carbonyl (which scales the whole layout instead of just fonts); the fix
+  direction is quantizing author font sizes to cell multiples rather than
+  a single global size.
+
 - Main frame only: text inside cross-origin iframes shows as pixels, not
   crisp text (the snapshot walk takes `documents[0]`).
 - Box geometry (margins, images, flex gaps) is continuous px snapped to
