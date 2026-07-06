@@ -201,6 +201,11 @@ bzip2-rs = "0.1"
 # blob's bytes hash to the digest its descriptor claims). Already in the tree
 # transitively via oci-client; named directly so the verification is explicit.
 sha2 = "0.10"
+# cellulose (the in-engine textmode browser, DESIGN-cellulose.md) counts
+# terminal cells per character (wcwidth semantics) when placing DOMSnapshot
+# text on the grid. Pure-Rust, static-musl safe; already transitive in the
+# tree, promoted to a direct dep.
+unicode-width = "0.2"
 # `oaita local` unpacks the llama.cpp CPU-runtime release archives (zip).
 # deflate-only via the flate2 backend already in the tree — no new C deps,
 # static-musl unaffected.

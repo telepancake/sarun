@@ -5496,6 +5496,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tui-term",
+ "unicode-width 0.2.2",
  "uu_basename",
  "uu_cat",
  "uu_chmod",
