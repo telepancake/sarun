@@ -936,6 +936,47 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // send_nested_prov dials it directly for brush pipeline records, build
     // edges, and done/state stamps (the l and g screens' data).
     sc.env("SARUN_SUD_PROV", &sock);
+    // Teardown wiring: the wrapper tree gets its OWN process group, and two
+    // watchers forward a stop to it (the traced tree is ordinary host
+    // processes — nothing else stops it):
+    //   * SIGTERM/SIGINT on this runner (the engine's `kill` verb, engine
+    //     shutdown, ^C at the terminal) → SIGTERM to the group; the wait
+    //     loop then finishes normally, sweep included. A SECOND signal
+    //     escalates to SIGKILL.
+    //   * the box channel `conn` reaching EOF (the engine died or tore the
+    //     box down) → same forwarding, from a watchdog thread.
+    // Without this, quitting the engine left a wedged build running with
+    // nothing attached to it.
+    unsafe {
+        libc::signal(libc::SIGTERM,
+                     sud_on_term as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT,
+                     sud_on_term as *const () as libc::sighandler_t);
+    }
+    {
+        use std::os::fd::AsRawFd;
+        let raw = conn.as_raw_fd();
+        std::thread::spawn(move || {
+            let mut b = [0u8; 256];
+            loop {
+                let n = unsafe {
+                    libc::read(raw, b.as_mut_ptr().cast(), b.len())
+                };
+                if n > 0 { continue; }              // stray frame: ignore
+                if n < 0 && std::io::Error::last_os_error().raw_os_error()
+                    == Some(libc::EINTR) { continue; }
+                break;                              // EOF / error
+            }
+            let p = SUD_WRAPPER_PID.load(std::sync::atomic::Ordering::SeqCst);
+            if p > 0 {
+                eprintln!("sarun-engine: engine gone — stopping the box's \
+                           process group");
+                unsafe { libc::kill(-p, libc::SIGTERM); }
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                unsafe { libc::kill(-p, libc::SIGKILL); }
+            }
+        });
+    }
     // Launch under the wrapper contract and wait for the traced tree.
     let code = sud_launcher_exec(sc, wrapper, trace_w);
     // Sweep the upper into the box's sqlar on a FRESH conn (the register conn
@@ -1213,6 +1254,33 @@ fn sud_overlay_rule(sc: &mut Command, upper: &str, lowers: &[String])
 /// traced by the OUTER wrapper, whose addin writes outer events to fd 1023 in
 /// our process; replumbing our own would splice outer-stream events (with
 /// colliding stream ids from the outer counter page) into the inner trace.
+/// The wrapper child's pid (== its process-group id; the launcher setpgids
+/// it), for the SIGTERM forwarder + the engine-EOF watchdog. 0 = not
+/// launched yet.
+static SUD_WRAPPER_PID: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+/// Signal escalation: first SIGTERM/SIGINT forwards SIGTERM to the group,
+/// the second forwards SIGKILL (a wedged tree may ignore SIGTERM).
+static SUD_TERM_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn sud_on_term(_sig: i32) {
+    use std::sync::atomic::Ordering;
+    let p = SUD_WRAPPER_PID.load(Ordering::SeqCst);
+    if p > 0 {
+        let sig = if SUD_TERM_SEEN.swap(true, Ordering::SeqCst) {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        unsafe { libc::kill(-p, sig); }
+        // Do NOT exit: the wait loop reaps the dying tree and the normal
+        // teardown (sweep, box-channel close) still runs.
+    } else {
+        unsafe { libc::_exit(143); }
+    }
+}
+
 fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32) -> i32 {
     let stream_id: u32;
     let state_page: *mut u32;
@@ -1248,6 +1316,13 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32) -> i32 {
     // dup2 targets are not CLOEXEC, so they survive the exec into the wrapper.
     unsafe {
         sc.pre_exec(move || {
+            // Own process group: the runner's signal forwarder and the
+            // engine-EOF watchdog stop the WHOLE traced tree with one
+            // kill(-pgid), and a terminal ^C no longer reaches the tree
+            // directly (the runner forwards it instead).
+            if libc::setpgid(0, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             if libc::dup2(trace_w, SUD_OUTPUT_FD) < 0
                 || libc::dup2(mfd, SUD_STATE_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
@@ -1275,6 +1350,7 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32) -> i32 {
     // emit an EV_EXIT per real termination of a thread-group leader, stop when
     // the wrapper child itself is done.
     let child_pid = child.id() as i32;
+    SUD_WRAPPER_PID.store(child_pid, std::sync::atomic::Ordering::SeqCst);
     let mut ev = crate::sudwire::EvState::default();
     let mut code = 1;
     loop {

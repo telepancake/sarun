@@ -96,7 +96,7 @@ fn top_level_help() -> &'static str {
        sarun attach [--sock PATH]         interactive UI against a running engine\n  \
        sarun serve                        run the engine headless (no UI)\n  \
        sarun run [FLAGS] [NAME] -- CMD    run CMD in a sandbox box (needs a running engine/UI)\n  \
-       sarun <NAME> [apply|discard|rename NEW|patch]   operate on a box from the CLI\n  \
+       sarun <NAME> [apply|discard|rename NEW|patch|stuck]  operate on a box from the CLI\n  \
        sarun <NAME> attach git|wiki|ietf SRC REF [AT]  attach a mirror object as a read-only reference\n  \
        sarun mirror <ls|add|run|pause|resume|rm> ...   scheduled mirror updates\n  \
        sarun gitdepot|wikimak|ietfmak ...              embedded mirror-driver CLIs\n  \

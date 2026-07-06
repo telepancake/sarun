@@ -681,6 +681,17 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             }
         }
         "shutdown" => {
+            // Stop every LIVE box first: quitting the engine (F10 / `q`)
+            // must not leave runs going — a sud box's traced tree is
+            // ordinary host processes and kept building after the engine
+            // died. Same signal the `kill` verb sends; the runner forwards
+            // it to the wrapper's process group and tears down normally
+            // (sweep included, while the engine is still here to serve it).
+            let fds: Vec<i32> =
+                lock(state).box_pids.values().copied().collect();
+            for fd in fds {
+                pidfd_signal(fd, libc::SIGTERM);
+            }
             // Stop the engine. SIGTERM self → the existing signal handler
             // tears down the overlay + control socket; everything that
             // follows in this dispatch is racing the exit, so reply ok now
@@ -1678,6 +1689,68 @@ macro_rules! ui_verbs {
         }
         "first_writer_prov", "SID REL", "provenance of the first writer of a path" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => discover::first_writer_prov(id, rel), _ => Value::Null,
+        }
+        }
+        "stuck", "SID", "live processes of a running box with wchan/syscall (wedge diagnosis)" => { match arg_sid(args) {
+            // A wedged box is invisible from the outside — this answers
+            // WHERE it is stuck without strace: every live process whose
+            // ancestry reaches the box's runner, with its comm, state,
+            // kernel wait channel and current syscall number. Read
+            // straight from /proc at call time; no box cooperation needed.
+            Some(id) => {
+                let rp = lock(state).box_runpids.get(&id).copied();
+                match rp {
+                    None => json!({"ok": false, "error": "box not running"}),
+                    Some(rp) => {
+                        let mut procs = vec![];
+                        if let Ok(rd) = std::fs::read_dir("/proc") {
+                            for ent in rd.flatten() {
+                                let Some(pid) = ent.file_name().to_str()
+                                    .and_then(|s| s.parse::<i32>().ok())
+                                else { continue };
+                                // Ancestry walk (same shape derive_parent_box
+                                // uses): include the runner itself.
+                                let mut cur = pid;
+                                let mut hit = false;
+                                for _ in 0..64 {
+                                    if cur == rp { hit = true; break; }
+                                    let pp = ppid_of(cur);
+                                    if pp <= 1 { break; }
+                                    cur = pp;
+                                }
+                                if !hit { continue; }
+                                let rd1 = |f: &str| std::fs::read_to_string(
+                                    format!("/proc/{pid}/{f}"))
+                                    .unwrap_or_default().trim().to_string();
+                                let comm = rd1("comm");
+                                let wchan = rd1("wchan");
+                                // /proc/pid/syscall: first token = nr (-1 =
+                                // not in a syscall, "running" while on-CPU).
+                                let sysc = rd1("syscall")
+                                    .split_whitespace().next()
+                                    .unwrap_or("").to_string();
+                                // stat: "pid (comm) STATE …" — the state
+                                // char follows the LAST ')' (comm may
+                                // itself contain parens).
+                                let state = std::fs::read_to_string(
+                                    format!("/proc/{pid}/stat"))
+                                    .ok()
+                                    .and_then(|s| s.rfind(')')
+                                        .and_then(|i| s[i + 1..].trim()
+                                            .chars().next())
+                                        .map(|c| c.to_string()))
+                                    .unwrap_or_default();
+                                procs.push(json!({
+                                    "pid": pid, "comm": comm, "state": state,
+                                    "wchan": wchan, "syscall": sysc,
+                                }));
+                            }
+                        }
+                        json!({"ok": true, "runner": rp, "procs": procs})
+                    }
+                }
+            }
+            None => json!({"ok": false, "error": "no slopbox"}),
         }
         }
         "kill", "SID", "SIGTERM the box's runner" => { match arg_sid(args) {
@@ -3764,6 +3837,61 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
     };
     match op {
         None => report(one(json!({"type": "select", "sid": name}))),
+        // sarun NAME stuck — wedge diagnosis: every live process of the
+        // box with its kernel wait channel + current syscall, so a silent
+        // hang answers "where?" without strace.
+        Some("stuck") => {
+            // arg_sid takes a numeric SID; resolve the NAME first.
+            let sid = match one(json!({"type": "ui", "verb": "resolve_box",
+                                       "args": [name]})) {
+                Ok(v) => match v.get("r").and_then(Value::as_str)
+                    .map(String::from) {
+                    Some(s) => s,
+                    None => { eprintln!("sarun-engine: no slopbox '{name}'");
+                              return 1; }
+                },
+                Err(e) => { eprintln!("sarun-engine: {e}"); return 1; }
+            };
+            match one(json!({"type": "ui", "verb": "stuck",
+                             "args": [sid]})) {
+                Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true)
+                    && v.get("r").and_then(|r| r.get("ok"))
+                        .and_then(Value::as_bool) == Some(true) => {
+                    let r = v.get("r").cloned().unwrap_or(Value::Null);
+                    let empty = vec![];
+                    let procs = r.get("procs").and_then(Value::as_array)
+                        .unwrap_or(&empty);
+                    println!("{:>8} {:>2} {:>18} {:>8}  {}",
+                             "PID", "ST", "WCHAN", "SYSCALL", "COMM");
+                    for p in procs {
+                        let g = |k: &str| p.get(k).and_then(Value::as_str)
+                            .unwrap_or("").to_string();
+                        let pid = p.get("pid").and_then(Value::as_i64)
+                            .unwrap_or(0);
+                        println!("{:>8} {:>2} {:>18} {:>8}  {}",
+                                 pid, g("state"), g("wchan"),
+                                 g("syscall"), g("comm"));
+                    }
+                    if procs.is_empty() {
+                        println!("(no live processes — the box's tree has \
+                                  exited; the runner may be stuck in \
+                                  teardown)");
+                    }
+                    0
+                }
+                Ok(v) => {
+                    // The verb reply nests under "r" for ui verbs; surface
+                    // either error shape.
+                    let e = v.get("r").and_then(|r| r.get("error"))
+                        .and_then(Value::as_str)
+                        .or_else(|| v.get("error").and_then(Value::as_str))
+                        .unwrap_or("failed");
+                    eprintln!("sarun-engine: {e}");
+                    1
+                }
+                Err(e) => { eprintln!("sarun-engine: {e}"); 1 }
+            }
+        }
         Some("apply") | Some("discard") => {
             let t = op.unwrap();
             match one(json!({"type": t, "sid": name})) {
