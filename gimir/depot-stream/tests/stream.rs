@@ -97,7 +97,7 @@ fn near_identical_layers_cost_the_delta() {
 
     let make_layer = |blob: &[u8], rev: u64| -> Layer {
         let file = Node {
-            blob: BlobOp::Set(blob.to_vec()),
+            blob: BlobOp::Set((blob.to_vec()).into()),
             attrs: Some(Attrs::from([(b"rev".to_vec(), rev.to_le_bytes().to_vec())])),
             ..Node::keep()
         };

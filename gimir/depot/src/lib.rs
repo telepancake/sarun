@@ -44,6 +44,7 @@
 //! Interior nodes may carry blobs (superset of git's tree model).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub mod codec;
 pub mod variant;
@@ -57,12 +58,26 @@ pub type Name = Vec<u8>;
 /// implicit-id rule, DEPOT-DESIGN.md §4).
 pub type Attrs = BTreeMap<Name, Vec<u8>>;
 
+/// Blob bytes, refcounted: a blob is written once and then shared —
+/// between a delta and every view it was applied into, and between all
+/// the views that inherit it. `Arc<[u8]>` derefs to `&[u8]`, so reads
+/// are unchanged; writers wrap fresh bytes via `From<Vec<u8>>`.
+pub type Bytes = Arc<[u8]>;
+
 /// A resolved tree — pure value, no delta semantics.
+///
+/// Persistent (path-copying) representation: children and blob bytes
+/// are `Arc`-shared, so `clone()` is O(root fanout), forking a view is
+/// effectively free, and two views that diverged by k edits share every
+/// untouched subtree. All mutation goes through copy-on-write
+/// (`Arc::make_mut` along the touched path — see `apply_child_mut`),
+/// which is what makes pointer equality a sound subtree-identity test
+/// in [`diff`]. Equality is still structural (`PartialEq` on content).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct View {
-    pub blob: Option<Vec<u8>>,
+    pub blob: Option<Bytes>,
     pub attrs: Attrs,
-    pub children: BTreeMap<Name, View>,
+    pub children: BTreeMap<Name, Arc<View>>,
 }
 
 /// What a delta node does to the blob of the node below it.
@@ -70,7 +85,7 @@ pub struct View {
 pub enum BlobOp {
     /// Inherit the lower node's blob (absent if there is no lower node).
     Keep,
-    Set(Vec<u8>),
+    Set(Bytes),
     /// The lower node's blob is removed; children are unaffected. This is
     /// the "interior node loses its blob but keeps children" corner.
     Remove,
@@ -189,25 +204,26 @@ fn apply_node(base: Option<&View>, node: &Node) -> Option<View> {
         Some(map) => map.clone(),
         None => base.map(|b| b.attrs.clone()).unwrap_or_default(),
     };
-    let lower_children: Option<&BTreeMap<Name, View>> = if node.opaque {
+    let lower_children: Option<&BTreeMap<Name, Arc<View>>> = if node.opaque {
         None // opaque: lower children masked, as if there were none
     } else {
         base.map(|b| &b.children)
     };
     let mut children = BTreeMap::new();
-    // Lower children not touched by the delta pass through.
+    // Lower children not touched by the delta pass through (shared, not
+    // copied — the Arc clone is the sharing).
     if let Some(lower) = lower_children {
         for (name, child) in lower {
             if !node.children.contains_key(name) {
-                children.insert(name.clone(), child.clone());
+                children.insert(name.clone(), Arc::clone(child));
             }
         }
     }
     // Delta children apply over their lower counterpart (masked if opaque).
     for (name, child_node) in &node.children {
         let lower_child = lower_children.and_then(|l| l.get(name));
-        if let Some(v) = apply_node(lower_child, child_node) {
-            children.insert(name.clone(), v);
+        if let Some(v) = apply_node(lower_child.map(|a| a.as_ref()), child_node) {
+            children.insert(name.clone(), Arc::new(v));
         }
     }
     // Canonical-form rule: an empty node — no blob, no attrs, no
@@ -238,6 +254,37 @@ fn apply_node_mut(slot: &mut Option<View>, node: &Node) {
         return;
     }
     let mut v = slot.take().unwrap_or_default();
+    mutate_view(&mut v, node);
+    // Same canonical-form rule as apply_node: empty nodes don't exist.
+    *slot = if v.blob.is_none() && v.attrs.is_empty() && v.children.is_empty() {
+        None
+    } else {
+        Some(v)
+    };
+}
+
+/// Path-copying recursion of [`apply_node_mut`] below the root: only the
+/// nodes on delta-touched paths are copied (`Arc::make_mut` — a no-op
+/// move when the view is unshared, a one-node shallow clone when it is);
+/// every untouched subtree stays shared with whatever views also hold it.
+fn apply_child_mut(slot: &mut Option<Arc<View>>, node: &Node) {
+    if node.presence == Presence::Tombstone {
+        *slot = None;
+        return;
+    }
+    let mut arc = slot.take().unwrap_or_default();
+    mutate_view(Arc::make_mut(&mut arc), node);
+    // Same canonical-form rule as apply_node: empty nodes don't exist.
+    *slot = if arc.blob.is_none() && arc.attrs.is_empty() && arc.children.is_empty() {
+        None
+    } else {
+        Some(arc)
+    };
+}
+
+/// The per-node mutation shared by `apply_node_mut` (root) and
+/// `apply_child_mut` (interior): must mirror `apply_node` facet-for-facet.
+fn mutate_view(v: &mut View, node: &Node) {
     match &node.blob {
         BlobOp::Keep => {}
         BlobOp::Set(bytes) => v.blob = Some(bytes.clone()),
@@ -251,17 +298,11 @@ fn apply_node_mut(slot: &mut Option<View>, node: &Node) {
     }
     for (name, child_node) in &node.children {
         let mut child = v.children.remove(name);
-        apply_node_mut(&mut child, child_node);
+        apply_child_mut(&mut child, child_node);
         if let Some(c) = child {
             v.children.insert(name.clone(), c);
         }
     }
-    // Same canonical-form rule as apply_node: empty nodes don't exist.
-    *slot = if v.blob.is_none() && v.attrs.is_empty() && v.children.is_empty() {
-        None
-    } else {
-        Some(v)
-    };
 }
 
 /// Overlay a layer on a view in place — `apply`, O(delta).
@@ -449,7 +490,8 @@ pub fn squash(stack: &[&Layer]) -> Layer {
 /// note in DEPOT-DESIGN.md §6: opaque inversion is handled by re-listing).
 fn diff_node(base: Option<&View>, target: &View) -> Node {
     let blob = match (base.and_then(|b| b.blob.as_ref()), &target.blob) {
-        (Some(old), Some(new)) if old == new => BlobOp::Keep,
+        // (ptr_eq first: same COW-shared bytes are equal without a scan.)
+        (Some(old), Some(new)) if Arc::ptr_eq(old, new) || old == new => BlobOp::Keep,
         (_, Some(new)) => BlobOp::Set(new.clone()),
         (Some(_), None) => BlobOp::Remove,
         (None, None) => BlobOp::Keep,
@@ -469,7 +511,15 @@ fn diff_node(base: Option<&View>, target: &View) -> Node {
     }
     for (name, tchild) in &target.children {
         let bchild = base.and_then(|b| b.children.get(name));
-        let d = diff_node(bchild, tchild);
+        // Fast path — sound because all View mutation is copy-on-write
+        // (`Arc::make_mut` path-copying): two slots holding the SAME Arc
+        // can only hold identical subtrees, whose diff is the identity
+        // delta, which this loop prunes anyway. Pure short-circuit; the
+        // emitted Layer (and its canonical encoding) is byte-identical.
+        if bchild.is_some_and(|b| Arc::ptr_eq(b, tchild)) {
+            continue;
+        }
+        let d = diff_node(bchild.map(|a| a.as_ref()), tchild);
         if !d.is_identity() {
             children.insert(name.clone(), d);
         }

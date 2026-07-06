@@ -219,3 +219,52 @@ contract) — tests/equivalence.rs. Stub lifecycle, delta-only update
 fetch, missing-stub rebuild (sha-asserted), ladder peak bound —
 tests/stub.rs. All existing tests green (19+4+3, 0 ignored; equivalence
 grew to 3), +3 stub +1 spill.
+
+## 2026-07-06 — persistent Views: Arc-shared subtrees + blobs (the last O(tree × history) term)
+
+`depot::View` is now a persistent structure: `children: BTreeMap<Name,
+Arc<View>>`, blob bytes `Arc<[u8]>` shared between records and every
+view that inherits them (`pub type Bytes`). All mutation is
+copy-on-write (`apply_mut` = `Arc::make_mut` path-copying along the
+touched path only), which makes `Arc::ptr_eq` a sound subtree-identity
+test — `diff` short-circuits shared subtrees at every recursion level,
+so the per-commit chain record costs O(paths touched since divergence),
+not O(tree). Frontier forks are Arc clones (O(root fanout)); N live
+views cost one tree + the divergence deltas, not N trees. On top, the
+full record `encode(diff(None, view))` is no longer minted per new
+tree: it's computed once per fresh-store seed and once per prepend
+batch at flush (from the staged head view) — byte-identical output,
+`tests/equivalence.rs` still pins records against the git-built
+reference, and a new depot property test pins `diff` shared ==
+`diff` deep-unshared (same Layer, same canonical bytes, 299 seeds).
+
+Driver now prints `VmHWM` on import (stderr); bench driver reports
+child `ru_maxrss`.
+
+ripgrep (fresh `clone --mirror`, 2259 commits, tags kept, L3):
+
+| | before | after |
+|---|---|---|
+| full import | 4.69s | **1.34s** (3.5×) |
+| peak RSS | 568MiB | 515MiB (fixed costs: zstd window + staged bound) |
+
+WIDE synthetic (fast-import; 20k files ≈ 4MB tree, 2000 commits × 5
+random single-file edits — the O(tree)-per-commit pain shape):
+
+| fixture | | before | after |
+|---|---|---|---|
+| wide, linear (frontier 1)      | import | 45.9s (43.6 c/s) | **1.62s (1235 c/s**, 28×) |
+|                                | peak RSS | 87.7MiB | 56.7MiB |
+| wide, merge-heavy (100 chains cross-merging, frontier 100 — the linux-import OOM shape) | import | 72.4s | **2.76s** (26×) |
+|                                | peak RSS | **2137MiB** | **180MiB** (11.9×) |
+
+Per-commit cost after is flat in tree size (the 20k-file tree imports
+at the same ~1.2–1.6k c/s as the 222-file ripgrep tree); before, it
+scaled with the tree (0.26 c/s × 800 files in the first table above,
+43 c/s × 20k here). Peak RSS after ≈ tip content + frontier deltas +
+fixed compressor/staging buffers; before it was frontier × full tree
+(the live linux import died at 13.9GB RSS on exactly this term).
+
+Store bytes: meta.sqlite and f1 byte-identical before/after on
+ripgrep; the only f0 delta is the REFLOG observation timestamp (two
+runs of the SAME binary differ identically).

@@ -344,7 +344,7 @@ fn tree_layer(entries: &[TreeEntry], blobs: &BTreeMap<String, Vec<u8>>) -> Resul
             }
             node = node.children.entry(seg.to_vec()).or_insert_with(Node::keep);
             if segs.peek().is_none() {
-                node.blob = BlobOp::Set(content.clone());
+                node.blob = BlobOp::Set(content.clone().into());
                 node.attrs = Some(Attrs::from([(b"mode".to_vec(), e.mode.clone().into_bytes())]));
             }
         }
@@ -887,7 +887,7 @@ fn delta_layer(changes: &[RawChange], cat: &mut CatFile) -> Result<Layer> {
                         cat.get(&ch.new_oid)?
                     };
                     node.presence = depot::Presence::Live;
-                    node.blob = BlobOp::Set(content);
+                    node.blob = BlobOp::Set(content.into());
                     node.attrs = Some(Attrs::from([(
                         b"mode".to_vec(),
                         ch.new_mode.clone().into_bytes(),
@@ -928,8 +928,10 @@ fn dag_children(
 }
 
 /// The frontier: view-per-commit-with-unprocessed-children, refcounted
-/// by remaining children. Views are deep values (clone cost is O(tree)
-/// — accepted for v1; the last child MOVES the view instead).
+/// by remaining children. Views are persistent (Arc-shared subtrees;
+/// clone is O(root fanout)), so a fork costs almost nothing and N live
+/// views that diverged by k commits cost one tree + O(k·delta), not N
+/// trees — the term that OOM'd wide-frontier imports.
 struct Frontier {
     views: HashMap<String, (depot::View, u32)>,
     max: usize,
@@ -1010,8 +1012,7 @@ fn tag_tree_idx(
     let full = tree_layer(&entries, &blobs)?;
     let view = depot::apply(None, &full)
         .ok_or_else(|| Error::Unsupported(format!("tagged tree {tree_oid} is empty")))?;
-    let full_rec = codec::encode(&depot::diff(None, Some(&view)));
-    ingest.tree_idx_for(tree_oid, None, &view, Some(&full_rec))
+    ingest.tree_idx_for(tree_oid, None, &view)
 }
 
 /// Stage the repo's NEW annotated-tag objects; must run AFTER the
@@ -1114,15 +1115,12 @@ fn ingest_stream(
         let same = same_tree_parent(&cm, &tree_oid, tree_oids, &mut cat)?;
         tree_oids.insert(sha.clone(), tree_oid.clone());
         // The full record (`encode(diff(None, view))`, O(tree)) is only
-        // needed when this tree mints a new TREES record — or always,
-        // when the report accumulator measures every commit.
-        let need_full =
-            rep.is_some() || (same.is_none() && ingest.known_tree_idx(&tree_oid).is_none());
-        let full = need_full.then(|| codec::encode(&depot::diff(None, Some(&view))));
+        // for the report accumulator's comparison harness; the store
+        // path mints fulls once per prepend batch (store::tree_idx_for).
         if let Some(r) = rep.as_deref_mut() {
-            r.push(&view, full.clone().expect("report forces full"));
+            r.push(&view, codec::encode(&depot::diff(None, Some(&view))));
         }
-        ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view, full.as_deref())?;
+        ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view)?;
         let rc = counts.get(&sha).copied().unwrap_or(0);
         frontier.insert(sha, view, rc);
         commits.push(cm);

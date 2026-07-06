@@ -210,7 +210,7 @@ impl<'a> Reader<'a> {
         }
         let blob = match flags & BLOB_MASK {
             BLOB_KEEP => BlobOp::Keep,
-            BLOB_SET => BlobOp::Set(self.bytes()?.to_vec()),
+            BLOB_SET => BlobOp::Set(self.bytes()?.into()),
             BLOB_REMOVE => BlobOp::Remove,
             _ => return Err(DecodeError::BadFlags(flags)),
         };

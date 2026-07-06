@@ -372,7 +372,7 @@ fn revision_layer(rev: &str, date: Option<&str>, text: &[u8]) -> Layer {
     root.children.insert(
         b"text".to_vec(),
         Node {
-            blob: BlobOp::Set(text.to_vec()),
+            blob: BlobOp::Set(text.to_vec().into()),
             attrs: Some(attrs),
             ..Node::keep()
         },
@@ -401,7 +401,7 @@ fn decode_revision_layer(layer: &Layer, chain_id: u64) -> Result<RevisionEntry> 
         date: attrs
             .get(b"date".as_slice())
             .map(|d| String::from_utf8_lossy(d).into_owned()),
-        text: text.clone(),
+        text: text.to_vec(),
     })
 }
 

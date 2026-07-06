@@ -108,6 +108,6 @@ impl Readout for TipReadout {
     }
 
     fn blob(&self, at: &[&[u8]]) -> Option<Blob> {
-        view_at(self.view()?, at)?.blob.clone().map(Blob::Bytes)
+        view_at(self.view()?, at)?.blob.as_deref().map(|b| Blob::Bytes(b.to_vec()))
     }
 }

@@ -691,15 +691,15 @@ pub fn export_layer(conn: &Connection, box_id: i64)
         let blob = if ft == 0o040000 {
             BlobOp::Keep // directory: no bytes
         } else if ft == 0o120000 {
-            BlobOp::Set(data.unwrap_or_default()) // symlink target
+            BlobOp::Set(data.unwrap_or_default().into()) // symlink target
         } else if ft == 0o010000 || ft == 0o060000 || ft == 0o020000 {
             BlobOp::Keep // fifo / device: no bytes
         } else {
             // Regular file: inline data (reverted content) or pool blob.
             match data {
-                Some(d) => BlobOp::Set(d),
+                Some(d) => BlobOp::Set(d.into()),
                 None => BlobOp::Set(
-                    std::fs::read(blob_path(box_id, rowid)).unwrap_or_default()),
+                    std::fs::read(blob_path(box_id, rowid)).unwrap_or_default().into()),
             }
         };
         let node = Node {

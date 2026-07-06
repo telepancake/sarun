@@ -232,6 +232,25 @@ fn driver_argv(name: &str, self_exe: Option<std::path::PathBuf>) -> Vec<String> 
     }
 }
 
+    fn exit_detail(o: &std::process::Output) -> (i64, String) {
+        let tail = String::from_utf8_lossy(&o.stderr);
+        let tail = &tail[tail.len().saturating_sub(2048)..];
+        // code() is None when the driver died on a SIGNAL (observed
+        // live: OOM kill → SIGKILL); stderr is usually empty then,
+        // so the signal itself must be the detail or the pane shows
+        // a blank error.
+        match o.status.code() {
+            Some(c) => (c as i64, tail.to_string()),
+            None => {
+                use std::os::unix::process::ExitStatusExt;
+                let sig = o.status.signal().unwrap_or(0);
+                let hint = if sig == libc::SIGKILL { " (OOM?)" } else { "" };
+                (-1, format!("killed by signal {sig}{hint}{}{tail}",
+                             if tail.is_empty() { "" } else { "; stderr: " }))
+            }
+        }
+    }
+
 fn spawn_run(job: Job) {
     let driver = |name: &str| driver_argv(name, std::env::current_exe().ok());
     let argv: Vec<String> = match job.kind.as_str() {
@@ -293,11 +312,7 @@ fn spawn_run(job: Job) {
                 running_map(|m| { m.insert(id, c.id()); });
                 let out = c.wait_with_output();
                 match out {
-                    Ok(o) => {
-                        let tail = String::from_utf8_lossy(&o.stderr);
-                        let tail = &tail[tail.len().saturating_sub(2048)..];
-                        (o.status.code().unwrap_or(-1) as i64, tail.to_string())
-                    }
+                    Ok(o) => exit_detail(&o),
                     Err(e) => (-1, e.to_string()),
                 }
             }
@@ -350,6 +365,24 @@ mod tests {
                     vec!["fetch".into(), "enwiki".into(), "/depot/w".into()]].concat();
         assert_eq!(argv, ["/x/sarun", "wikimak", "fetch", "enwiki", "/depot/w"]
                    .map(String::from).to_vec());
+    }
+
+    /// A signal death must name the signal in the detail — the live
+    /// failure was an OOM-killed driver recording exit=-1 with a BLANK
+    /// detail in the pane.
+    #[test]
+    fn exit_detail_names_the_killing_signal() {
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -9 $$"]).output().unwrap();
+        let (exit, detail) = exit_detail(&out);
+        assert_eq!(exit, -1);
+        assert!(detail.contains("killed by signal 9 (OOM?)"), "{detail}");
+
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", "echo oops >&2; exit 3"]).output().unwrap();
+        let (exit, detail) = exit_detail(&out);
+        assert_eq!(exit, 3);
+        assert_eq!(detail, "oops\n");
     }
 
     fn sh_git(repo: &std::path::Path, args: &[&str]) {

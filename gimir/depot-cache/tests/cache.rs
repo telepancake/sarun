@@ -10,7 +10,7 @@ use depot_cache::Cache;
 
 fn file(content: &[u8], mode: &str) -> Node {
     Node {
-        blob: BlobOp::Set(content.to_vec()),
+        blob: BlobOp::Set(content.to_vec().into()),
         attrs: Some(Attrs::from([(b"mode".to_vec(), mode.as_bytes().to_vec())])),
         ..Node::keep()
     }

@@ -116,7 +116,7 @@ pub trait Readout: Send + Sync {
 pub fn view_at<'a>(root: &'a View, at: &[&[u8]]) -> Option<&'a View> {
     let mut v = root;
     for name in at {
-        v = v.children.get(*name)?;
+        v = v.children.get(*name)?.as_ref();
     }
     Some(v)
 }
@@ -138,7 +138,7 @@ pub fn nest_view(view: View, prefix: &[&[u8]]) -> View {
     let mut v = view;
     for name in prefix.iter().rev() {
         let mut children = std::collections::BTreeMap::new();
-        children.insert(name.to_vec(), v);
+        children.insert(name.to_vec(), std::sync::Arc::new(v));
         v = View { blob: None, attrs: Attrs::new(), children };
     }
     v
@@ -179,7 +179,7 @@ impl Readout for ViewReadout {
     }
 
     fn blob(&self, at: &[&[u8]]) -> Option<Blob> {
-        view_at(&self.view, at)?.blob.clone().map(Blob::Bytes)
+        view_at(&self.view, at)?.blob.as_deref().map(|b| Blob::Bytes(b.to_vec()))
     }
 }
 
@@ -187,8 +187,12 @@ impl Readout for ViewReadout {
 mod readout_tests {
     use super::*;
 
-    fn leaf(bytes: &[u8]) -> View {
-        View { blob: Some(bytes.to_vec()), attrs: Attrs::new(), children: Default::default() }
+    fn leaf(bytes: &[u8]) -> std::sync::Arc<View> {
+        std::sync::Arc::new(View {
+            blob: Some(bytes.into()),
+            attrs: Attrs::new(),
+            children: Default::default(),
+        })
     }
 
     /// root ─ src ─ {a.txt, b.txt}   (src carries an interior blob + attr)
@@ -200,12 +204,12 @@ mod readout_tests {
         src_children.insert(b"b.txt".to_vec(), leaf(b"bee"));
         src_children.insert(b"a.txt".to_vec(), leaf(b"aye"));
         let src = View {
-            blob: Some(b"interior".to_vec()),
+            blob: Some(b"interior"[..].into()),
             attrs: src_attrs,
             children: src_children,
         };
         let mut root_children = std::collections::BTreeMap::new();
-        root_children.insert(b"src".to_vec(), src);
+        root_children.insert(b"src".to_vec(), std::sync::Arc::new(src));
         root_children.insert(b"zzz".to_vec(), leaf(b"z"));
         View { blob: None, attrs: Attrs::new(), children: root_children }
     }

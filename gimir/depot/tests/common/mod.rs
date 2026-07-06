@@ -30,7 +30,7 @@ pub fn random_node(rng: &mut Rng, depth: u32) -> Node {
     let blob = match rng.below(4) {
         0 => BlobOp::Keep,
         1 => BlobOp::Remove,
-        _ => BlobOp::Set(vec![b'v', rng.below(3) as u8 + b'0']),
+        _ => BlobOp::Set(vec![b'v', rng.below(3) as u8 + b'0'].into()),
     };
     let attrs = match rng.below(3) {
         0 => None,

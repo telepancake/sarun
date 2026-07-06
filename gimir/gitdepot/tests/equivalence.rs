@@ -190,7 +190,7 @@ fn reference_view(repo: &Path, commitish: &str) -> depot::View {
         while let Some(seg) = segs.next() {
             node = node.children.entry(seg.to_vec()).or_insert_with(depot::Node::keep);
             if segs.peek().is_none() {
-                node.blob = depot::BlobOp::Set(content.clone());
+                node.blob = depot::BlobOp::Set(content.clone().into());
                 node.attrs = Some(depot::Attrs::from([(
                     b"mode".to_vec(),
                     mode.clone().into_bytes(),

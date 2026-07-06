@@ -1416,7 +1416,6 @@ pub(crate) struct Ingest<'a> {
     // first entry rebuilds the pre-batch head (the bridge), each later
     // one rebuilds the previously-added tree.
     head_view: Option<depot::View>,
-    head_full: Option<Vec<u8>>,
     seed_full: Option<Vec<u8>>,
     tree_entries: Staged,
     /// Stable index of the first STAGED tree (= n_trees at open).
@@ -1459,7 +1458,6 @@ impl<'a> Ingest<'a> {
             st,
             level,
             head_view,
-            head_full: None,
             seed_full: None,
             tree_entries: Staged::new(staging.join("trees"), bound),
             tree_base: n_trees,
@@ -1494,7 +1492,6 @@ impl<'a> Ingest<'a> {
         tree_oid: &str,
         same_tree_parent: Option<&str>,
         view: &depot::View,
-        full_record: Option<&[u8]>,
     ) -> Result<u64> {
         if let Some(i) = self.tree_cache.get(tree_oid) {
             return Ok(*i);
@@ -1508,25 +1505,26 @@ impl<'a> Ingest<'a> {
             self.tree_cache.insert(tree_oid.to_string(), t);
             return Ok(t);
         }
-        // A NEW tree needs its full record (the staged chain head / the
-        // seed) — callers may skip computing it for dedup'd trees.
-        let full_record = full_record.ok_or_else(|| {
-            Error::Chain(format!("tree {tree_oid} is new but no full record was supplied"))
-        })?;
         // New distinct tree: stage its record. The delta pushed rebuilds
         // the CURRENT staged head from this (next-newer) view; the very
-        // first tree of a fresh store seeds the chain instead.
+        // first tree of a fresh store seeds the chain instead. The full
+        // record (`encode(diff(None, view))`, O(tree)) is minted ONCE
+        // per fresh store here and once per prepend batch at flush —
+        // never per commit; per-commit cost is this delta, whose diff
+        // short-circuits every subtree `view` and `prev` still share.
         match &self.head_view {
             Some(prev) => {
                 let delta = depot::codec::encode(&depot::diff(Some(view), Some(prev)));
                 self.tree_entries.push(delta)?;
             }
-            None => self.seed_full = Some(full_record.to_vec()),
+            None => {
+                self.seed_full =
+                    Some(depot::codec::encode(&depot::diff(None, Some(view))));
+            }
         }
         let idx = self.n_trees;
         self.n_trees += 1;
         self.head_view = Some(view.clone());
-        self.head_full = Some(full_record.to_vec());
         self.tree_cache.insert(tree_oid.to_string(), idx);
         // NEVER sub-batch, on any threshold: within one prepend there
         // is exactly one f1 re-encode regardless of size, so splitting
@@ -1608,10 +1606,13 @@ impl<'a> Ingest<'a> {
         if self.tree_entries.is_empty() {
             return Ok(());
         }
-        let head_full = self
-            .head_full
-            .clone()
-            .expect("staged tree entries imply a staged head");
+        // The batch-head full record, minted here (once per prepend)
+        // from the staged head view — byte-equal to what the old
+        // per-commit path carried forward (diff/encode are canonical).
+        let head_full = depot::codec::encode(&depot::diff(
+            None,
+            Some(self.head_view.as_ref().expect("staged tree entries imply a staged head")),
+        ));
         let entries = self.tree_entries.drain_all()?;
         let (bridge, rest) = entries.split_first().expect("non-empty entries");
         let mut older: Vec<Vec<u8>> = rest.to_vec();
@@ -1636,17 +1637,15 @@ impl<'a> Ingest<'a> {
     /// Stage one commit (must arrive oldest-first: parents before
     /// children). `tree_oid` = the commit's `tree` header value;
     /// `same_tree_parent` = a parent sha with the same tree oid, if
-    /// any; `full_record` = `codec::encode(diff(None, view))`, required
-    /// only when the tree is new (None is fine for dedup'd trees).
+    /// any.
     pub(crate) fn add_commit(
         &mut self,
         cm: &CommitMeta,
         tree_oid: &str,
         same_tree_parent: Option<&str>,
         view: &depot::View,
-        full_record: Option<&[u8]>,
     ) -> Result<u64> {
-        let tree_idx = self.tree_idx_for(tree_oid, same_tree_parent, view, full_record)?;
+        let tree_idx = self.tree_idx_for(tree_oid, same_tree_parent, view)?;
         let parent_idxs = cm
             .parents
             .iter()

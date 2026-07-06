@@ -68,7 +68,7 @@ fn near_identical_layers_compress_and_seal() {
     let make = |blob: &[u8], rev: u64| Layer {
         root: Node {
             children: BTreeMap::from([(b"big".to_vec(), Node {
-                blob: BlobOp::Set(blob.to_vec()),
+                blob: BlobOp::Set(blob.to_vec().into()),
                 attrs: Some(Attrs::from([(b"rev".to_vec(),
                                           rev.to_le_bytes().to_vec())])),
                 ..Node::keep()
@@ -130,7 +130,7 @@ fn put_layers_batch_equals_sequential() {
     fn layer(n: u32, body: &[u8]) -> depot::Layer {
         let mut children = std::collections::BTreeMap::new();
         children.insert(format!("f{n}").into_bytes(), depot::Node {
-            blob: depot::BlobOp::Set(body.to_vec()),
+            blob: depot::BlobOp::Set(body.to_vec().into()),
             children: Default::default(),
             presence: depot::Presence::Live,
             opaque: false,

@@ -39,6 +39,13 @@ pub fn cli_main(args: &[String]) -> i32 {
             };
             crate::import_opts(&PathBuf::from(repo), &PathBuf::from(store),
                                   level, report).map(|o| {
+                // Peak RSS on stderr: imports are memory-bound (the
+                // frontier of live views), so the bench gate tracks it.
+                if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+                    if let Some(l) = s.lines().find(|l| l.starts_with("VmHWM")) {
+                        eprintln!("{}", l.split_whitespace().collect::<Vec<_>>().join(" "));
+                    }
+                }
                 let Some(r) = &o.report else {
                     println!("{} commits imported (max frontier {})",
                              o.meta.commits.len(), o.max_frontier);

@@ -21,7 +21,7 @@ fn golden_encoding() {
     // child "t".
     let child = Node {
         presence: Presence::Live,
-        blob: BlobOp::Set(b"hi".to_vec()),
+        blob: BlobOp::Set(b"hi"[..].into()),
         opaque: true,
         attrs: None,
         anchor: depot::Anchor::Lower,
@@ -89,7 +89,7 @@ fn tombstone_encodes_one_byte_regardless_of_payload() {
     // The model says a tombstone's other fields are meaningless; the
     // canonical form must not leak them.
     let mut t = Node::tombstone();
-    t.blob = BlobOp::Set(b"garbage".to_vec());
+    t.blob = BlobOp::Set(b"garbage"[..].into());
     t.opaque = true;
     t.attrs = Some(Attrs::from([(b"x".to_vec(), b"y".to_vec())]));
     let clean = Layer {

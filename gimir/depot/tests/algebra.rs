@@ -72,7 +72,7 @@ fn live() -> Node {
 }
 
 fn set(bytes: &[u8]) -> Node {
-    Node { blob: BlobOp::Set(bytes.to_vec()), ..Node::keep() }
+    Node { blob: BlobOp::Set(bytes.into()), ..Node::keep() }
 }
 
 fn with_children(mut node: Node, kids: Vec<(&[u8], Node)>) -> Node {
@@ -86,8 +86,8 @@ fn layer(root: Node) -> Layer {
     Layer { root }
 }
 
-fn view_blob(bytes: &[u8]) -> View {
-    View { blob: Some(bytes.to_vec()), ..View::default() }
+fn view_blob(bytes: &[u8]) -> std::sync::Arc<View> {
+    std::sync::Arc::new(View { blob: Some(bytes.into()), ..View::default() })
 }
 
 // ------------------------------------------------------------ the laws
@@ -190,7 +190,7 @@ fn corner_metadata_only_change() {
     attrs.insert(n(b"mode"), n(b"0644"));
     let lower = layer(with_children(
         live(),
-        vec![(b"f", Node { blob: BlobOp::Set(n(b"data")), attrs: Some(attrs), ..Node::keep() })],
+        vec![(b"f", Node { blob: BlobOp::Set(n(b"data").into()), attrs: Some(attrs), ..Node::keep() })],
     ));
     let mut attrs2 = Attrs::new();
     attrs2.insert(n(b"mode"), n(b"0755"));
@@ -296,7 +296,7 @@ fn diff_roundtrip_basics() {
         ]),
     };
     let target = View {
-        blob: Some(n(b"rootnow")),
+        blob: Some(n(b"rootnow").into()),
         attrs: Attrs::from([(n(b"k"), n(b"v"))]),
         children: BTreeMap::from([
             (n(b"same"), view_blob(b"s")),
@@ -313,7 +313,7 @@ fn diff_roundtrip_basics() {
     let d = diff(Some(&base), Some(&target));
     assert!(!d.root.children.contains_key(&n(b"same")));
     assert_eq!(d.root.children[&n(b"removed")].presence, Presence::Tombstone);
-    assert_eq!(d.root.children[&n(b"changed")].blob, BlobOp::Set(n(b"new")));
+    assert_eq!(d.root.children[&n(b"changed")].blob, BlobOp::Set(n(b"new").into()));
 }
 
 // ------------------------------------------------------------- rotation
@@ -367,8 +367,8 @@ fn rotation_opaque_inversion_relists_children() {
     let d = &a_new.root.children[&n(b"d")];
     assert_eq!(d.anchor, Anchor::Backdrop, "re-based, not layered over B");
     assert!(!d.opaque, "A never opaqued d");
-    assert_eq!(d.children[&n(b"x")].blob, BlobOp::Set(n(b"X")));
-    assert_eq!(d.children[&n(b"y")].blob, BlobOp::Set(n(b"Y")));
+    assert_eq!(d.children[&n(b"x")].blob, BlobOp::Set(n(b"X").into()));
+    assert_eq!(d.children[&n(b"y")].blob, BlobOp::Set(n(b"Y").into()));
     assert!(!d.children.contains_key(&n(b"z")), "B's addition erased by the re-base");
 }
 
@@ -511,7 +511,7 @@ fn rotation_replicates_grandparent_changes() {
     assert_rotation_laws(&[&g], &a, &b, "grandparent-replication");
     let (_b_new, a_new) = rotate(&[&g], &a, &b);
     let inv = &a_new.root.children[&n(b"overwritten")];
-    assert_eq!(inv.blob, BlobOp::Set(n(b"G-OLD")), "replicated, not holed");
+    assert_eq!(inv.blob, BlobOp::Set(n(b"G-OLD").into()), "replicated, not holed");
     assert_eq!(inv.anchor, Anchor::Backdrop, "replica erases B's entry");
 }
 
@@ -553,5 +553,60 @@ fn randomized_compose_consistency_with_holes() {
                 "right-compose broke view, seed {seed}"
             );
         }
+    }
+}
+
+// ------------------------------------------------- sharing transparency
+
+/// Rebuild a view with NO Arc sharing anywhere (fresh allocation per
+/// node and per blob) — the "as if deep-copied" reference shape.
+fn unshare(v: &View) -> View {
+    View {
+        blob: v.blob.as_deref().map(|b| b.to_vec().into()),
+        attrs: v.attrs.clone(),
+        children: v
+            .children
+            .iter()
+            .map(|(k, c)| (k.clone(), std::sync::Arc::new(unshare(c))))
+            .collect(),
+    }
+}
+
+/// Arc sharing is representation, never meaning: over random stacks
+/// built with the sharing-heavy path (`apply_mut` forking a common
+/// ancestor), `diff` of the shared views — where the `Arc::ptr_eq`
+/// fast path fires constantly — must produce the SAME Layer (and the
+/// same canonical bytes) as `diff` of fully unshared deep copies.
+#[test]
+fn randomized_diff_ignores_sharing() {
+    for seed in 1..300u64 {
+        let mut rng = Rng(seed ^ 0x5a5a);
+        let mut base: Option<View> = None;
+        for _ in 0..3 {
+            depot::apply_mut(&mut base, &random_layer(&mut rng));
+        }
+        // Fork the frontier twice (cheap Arc clones), advance each side.
+        let mut a = base.clone();
+        let mut b = base.clone();
+        depot::apply_mut(&mut a, &random_layer(&mut rng));
+        for _ in 0..2 {
+            depot::apply_mut(&mut b, &random_layer(&mut rng));
+        }
+        let ua = a.as_ref().map(unshare);
+        let ub = b.as_ref().map(unshare);
+        let shared = diff(a.as_ref(), b.as_ref());
+        let unshared = diff(ua.as_ref(), ub.as_ref());
+        assert_eq!(shared, unshared, "sharing changed diff, seed {seed}");
+        assert_eq!(
+            depot::codec::encode(&shared),
+            depot::codec::encode(&unshared),
+            "sharing changed canonical bytes, seed {seed}"
+        );
+        // And the full-record anchor (diff from nothing) likewise.
+        assert_eq!(
+            depot::codec::encode(&diff(None, b.as_ref())),
+            depot::codec::encode(&diff(None, ub.as_ref())),
+            "full record differs, seed {seed}"
+        );
     }
 }
