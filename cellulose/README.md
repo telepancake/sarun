@@ -10,9 +10,16 @@ no patches, nothing to rebase when Chrome ships its next major.
 ./cellulose.py --dump-text URL   # one plain-text frame (used by the tests)
 ```
 
-Interactive keys: `Ctrl-Q` quit, `Ctrl-L` URL, `Ctrl-R` reload, arrows/PgUp/
-PgDn scroll, mouse clicks click, everything else (typing, Tab, Enter) is
-forwarded to the page.
+Interactive keys: `Ctrl-Q` quit, `Ctrl-L` URL, `Ctrl-R` reload,
+`Alt-Left`/`Alt-Right` (or `Ctrl-B`/`Ctrl-F`) history back/forward, `Ctrl-P`
+full-resolution pixel peek on sixel-capable terminals (any key returns),
+arrows/PgUp/PgDn scroll, mouse clicks click, everything else (typing, Tab,
+Enter) is forwarded to the page.
+
+Rendering is push-based: `Page.startScreencast` delivers a frame only when
+the compositor produced one, and the terminal repaint diffs rows against the
+previous frame — an idle page costs nothing, scrolling repaints only what
+moved.
 
 ## How it works
 

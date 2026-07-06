@@ -19,8 +19,10 @@ Usage:
     ./cellulose.py --size 100x40 URL       # override terminal size
 
 Interactive keys: Ctrl-Q quit, Ctrl-L edit URL, Ctrl-R reload,
-arrows/PgUp/PgDn scroll, mouse click to click, everything else is
-forwarded to the page (Tab focuses links, Enter follows, typing types).
+Alt-Left/Alt-Right (or Ctrl-B/Ctrl-F) history back/forward,
+Ctrl-P full-res pixel peek (sixel terminals), arrows/PgUp/PgDn scroll,
+mouse click to click, everything else is forwarded to the page
+(Tab focuses links, Enter follows, typing types).
 
 Deps: websocket-client, fonttools, pillow. Chromium/Chrome/headless_shell
 is found via $CELLULOSE_BROWSER or common locations.
@@ -309,17 +311,51 @@ class Browser:
             time.sleep(0.05)
         return False
 
-    def screenshot(self):
-        from PIL import Image
+    def screenshot(self, full=False):
+        import base64
 
         data = self.cdp.call(
             "Page.captureScreenshot", {"format": "png"}, session=self.session
         )["data"]
-        import base64
+        return self.decode_frame(base64.b64decode(data), full)
 
-        img = Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB")
+    def decode_frame(self, png_bytes, full=False):
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+        if full:
+            return img
         # two vertical color samples per cell for half-block rendering
         return img.resize((self.cols, self.rows * 2), Image.BOX)
+
+    def start_screencast(self):
+        """Push-based frames: Chromium sends Page.screencastFrame only when
+        the compositor produced a new frame — no blind polling."""
+        self.cdp.call(
+            "Page.startScreencast",
+            {"format": "png", "everyNthFrame": 1},
+            session=self.session,
+        )
+
+    def ack_frame(self, frame_session):
+        try:
+            self.cdp.call(
+                "Page.screencastFrameAck",
+                {"sessionId": frame_session},
+                session=self.session,
+            )
+        except RuntimeError:
+            pass  # frame from a navigation that already ended
+
+    def history_go(self, delta):
+        hist = self.cdp.call("Page.getNavigationHistory", session=self.session)
+        i = hist["currentIndex"] + delta
+        if 0 <= i < len(hist["entries"]):
+            self.cdp.call(
+                "Page.navigateToHistoryEntry",
+                {"entryId": hist["entries"][i]["id"]},
+                session=self.session,
+            )
 
     def snapshot_text(self):
         """-> list of (row, col, char, (r,g,b)) from the DOM snapshot."""
@@ -449,9 +485,10 @@ def parse_css_color(s):
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
-def compose_frame(browser):
+def compose_frame(browser, img=None):
     """-> grid[rows][cols] of (char, fg, bg) cells."""
-    img = browser.screenshot()
+    if img is None:
+        img = browser.screenshot()
     px = img.load()
     rows, cols = browser.rows, browser.cols
     grid = [
@@ -491,6 +528,7 @@ def render_text(grid, out):
 
 
 def interactive(browser):
+    import base64
     import termios
     import tty
 
@@ -499,24 +537,31 @@ def interactive(browser):
     out = sys.stdout
     out.write("\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h")
     dirty = True
+    frame = None  # latest screencast png bytes
+    prev_lines = None  # last rendered rows, for diff redraws
     url_edit = None  # None = browsing; str = editing URL
     buf = b""
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    browser.start_screencast()
     try:
         tty.setraw(fd)
         while True:
             if dirty:
-                draw_screen(browser, out, url_edit)
+                prev_lines = draw_screen(browser, out, url_edit, frame, prev_lines)
                 dirty = False
-            ready, _, _ = select.select([fd], [], [], 0.6)
+            # block on tty input OR wake shortly to pick up screencast frames
+            ready, _, _ = select.select([fd], [], [], 0.1)
             for ev in browser.cdp.drain_events():
-                if ev.get("method") in (
-                    "Page.loadEventFired",
-                    "Page.frameNavigated",
-                ):
+                meth = ev.get("method")
+                if meth == "Page.screencastFrame":
+                    p = ev["params"]
+                    browser.ack_frame(p["sessionId"])
+                    frame = base64.b64decode(p["data"])
+                    dirty = True
+                elif meth in ("Page.loadEventFired", "Page.frameNavigated"):
+                    browser.start_screencast()  # navigation stops the cast
                     dirty = True
             if not ready:
-                dirty = True  # periodic refresh picks up page changes
                 continue
             buf += os.read(fd, 4096)
             dirty = True
@@ -533,6 +578,13 @@ def interactive(browser):
                     url_edit = ""
                 elif tok == b"\x12":  # Ctrl-R
                     browser.cdp.call("Page.reload", session=browser.session)
+                elif tok == b"\x10":  # Ctrl-P: sixel pixel peek
+                    sixel_peek(browser, out, fd)
+                    prev_lines = None  # force full repaint
+                elif tok in (b"\x1b[1;3D", b"\x1b\x1b[D", b"\x02"):  # Alt-Left/^B
+                    browser.history_go(-1)
+                elif tok in (b"\x1b[1;3C", b"\x1b\x1b[C", b"\x06"):  # Alt-Right/^F
+                    browser.history_go(1)
                 elif tok == b"\x1b[A":
                     browser.scroll(-3)
                 elif tok == b"\x1b[B":
@@ -602,20 +654,98 @@ def handle_url_edit(browser, buf, data):
     return buf
 
 
-def draw_screen(browser, out, url_edit):
-    grid = compose_frame(browser)
-    buf = io.StringIO()
-    render_ansi(grid, buf)
+def row_ansi(row):
+    parts = []
+    last_fg = last_bg = None
+    for ch, fg, bg in row:
+        if fg != last_fg:
+            parts.append("\x1b[38;2;%d;%d;%dm" % fg)
+            last_fg = fg
+        if bg != last_bg:
+            parts.append("\x1b[48;2;%d;%d;%dm" % bg)
+            last_bg = bg
+        parts.append(ch)
+    parts.append("\x1b[0m")
+    return "".join(parts)
+
+
+def draw_screen(browser, out, url_edit, frame=None, prev_lines=None):
+    """Render; when prev_lines is given, repaint only rows that changed.
+    Returns this frame's rows for the next diff."""
+    img = browser.decode_frame(frame) if frame else None
+    grid = compose_frame(browser, img)
     url, title = browser.url_and_title()
     if url_edit is not None:
         status = f" url: {url_edit}_"
     else:
-        status = f" {title}  {url}  [^L url ^R reload ^Q quit]"
+        status = (f" {title}  {url}  [^L url ^R reload alt-←→ history"
+                  f" ^P pixels ^Q quit]")
     status = "".join(c if c >= " " else " " for c in status)  # page-controlled
     status = status[: browser.cols].ljust(browser.cols)
-    out.write("\x1b[H" + buf.getvalue().replace("\n", "\r\n"))
-    out.write("\x1b[7m" + status + "\x1b[0m")
+    lines = [row_ansi(r) for r in grid]
+    lines.append("\x1b[7m" + status + "\x1b[0m")
+    for i, line in enumerate(lines):
+        if prev_lines is not None and i < len(prev_lines) and prev_lines[i] == line:
+            continue
+        out.write(f"\x1b[{i + 1};1H" + line)
     out.flush()
+    return lines
+
+
+def sixel_encode(img):
+    """PIL RGB image -> DECSIXEL escape string (256-color adaptive palette)."""
+    from PIL import Image
+
+    q = img.convert("RGB").quantize(colors=256, dither=Image.Dither.NONE)
+    pal = q.getpalette()[: 256 * 3]
+    w, h = q.size
+    px = q.load()
+    out = ['\x1bPq"1;1;%d;%d' % (w, h)]
+    for i in range(256):
+        r, g, b = pal[3 * i : 3 * i + 3] or [0, 0, 0]
+        out.append("#%d;2;%d;%d;%d" % (i, r * 100 // 255, g * 100 // 255,
+                                       b * 100 // 255))
+    for band in range(0, h, 6):
+        rows = min(6, h - band)
+        per_color = {}
+        for y in range(rows):
+            bit = 1 << y
+            for x in range(w):
+                c = px[x, band + y]
+                arr = per_color.get(c)
+                if arr is None:
+                    arr = per_color[c] = bytearray(w)
+                arr[x] |= bit
+        first = True
+        for c, bits in per_color.items():
+            if not first:
+                out.append("$")  # carriage return within the band
+            first = False
+            out.append("#%d" % c)
+            run_ch, run_n = None, 0
+            for x in range(w):
+                ch = chr(63 + bits[x])
+                if ch == run_ch:
+                    run_n += 1
+                else:
+                    if run_ch is not None:
+                        out.append(run_ch if run_n == 1 else "!%d%s" % (run_n, run_ch))
+                    run_ch, run_n = ch, 1
+            out.append(run_ch if run_n == 1 else "!%d%s" % (run_n, run_ch))
+        out.append("-")  # next band
+    out.append("\x1b\\")
+    return "".join(out)
+
+
+def sixel_peek(browser, out, fd):
+    """Ctrl-P: blit the real full-resolution viewport as a sixel image and
+    hold it until the next keypress. Pixels for terminals that have them."""
+    img = browser.screenshot(full=True)
+    out.write("\x1b[H\x1b[2J" + sixel_encode(img))
+    out.flush()
+    select.select([fd], [], [])  # any key returns to the cell view
+    os.read(fd, 4096)
+    out.write("\x1b[2J")
 
 
 def main():
