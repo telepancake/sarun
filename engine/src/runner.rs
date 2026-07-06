@@ -1078,8 +1078,11 @@ fn sud_register(conn: &UnixStream, cmd: &[String], env: bool,
 /// own path) runs under the wrapper via the explicit `brush-sh` subcommand.
 fn sud_brush_cmd(exe: &str, cmd: &[String]) -> Vec<String> {
     let script = crate::brush::script_from_argv(cmd);
+    // Parse mode follows the user's shell: `bash -c …` must be BASH-mode
+    // brush (brush_sh dispatches mode on this argv0 basename).
+    let shell = crate::brush::shell_name_from_argv(cmd);
     vec![exe.to_string(), "brush-sh".into(), "--".into(),
-         "sh".into(), "-c".into(), script]
+         shell.into(), "-c".into(), script]
 }
 
 /// The base remap-rule carve-outs, in first-prefix-match priority order: the

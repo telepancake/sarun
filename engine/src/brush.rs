@@ -1197,6 +1197,18 @@ fn redirect_stdio_to_sinks() -> bool {
 
 /// Build the brush script from the box argv. `sh/bash/dash -c SCRIPT` extracts
 /// SCRIPT directly; anything else is reconstructed into a quoted command string.
+/// The shell IDENTITY of a box command: "bash" when the user's argv[0]
+/// basename is bash (BASH-mode parse: `[[ ]]`, `<(…)`, arrays), else
+/// "sh" (faithful POSIX). The top-level brush must parse in the mode
+/// the user actually invoked — `sarun run -b -- bash -c 'cat <(x)'`
+/// used to die with a POSIX parse error because the `bash -c` wrapper
+/// was unwrapped by script_from_argv and the bash-ness dropped.
+pub(crate) fn shell_name_from_argv(cmd: &[String]) -> &'static str {
+    let base = std::path::Path::new(&cmd[0])
+        .file_name().and_then(|s| s.to_str()).unwrap_or(&cmd[0]);
+    if base == "bash" { "bash" } else { "sh" }
+}
+
 pub(crate) fn script_from_argv(cmd: &[String]) -> String {
     let base = std::path::Path::new(&cmd[0])
         .file_name().and_then(|s| s.to_str()).unwrap_or(&cmd[0]);
@@ -1413,6 +1425,7 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
     // 2. Run through embedded brush (async; tokio multi-thread runtime).
     //    Parse errors and execution errors surface visibly.
     let script = script_from_argv(&cmd);
+    let sh_mode = shell_name_from_argv(&cmd) != "bash";
     // 64 MiB worker stacks: the box's top command may be a `make` whose kati
     // parse/eval recurses deeply on big Makefiles (busybox/kernel), overflowing
     // the default 2 MiB tokio worker stack.
@@ -1420,7 +1433,7 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
         .thread_stack_size(64 * 1024 * 1024)
         .enable_all().build();
     let code = match rt {
-        Ok(rt) => rt.block_on(run_brush(conn_fd, script)),
+        Ok(rt) => rt.block_on(run_brush(conn_fd, script, sh_mode)),
         Err(e) => { eprintln!("sarun-engine inner: -b runtime: {e}"); 127 }
     };
 
@@ -2246,10 +2259,11 @@ async fn run_brush_interactive(shell_name: String,
 /// Build the brush shell, parse, emit FRAME_PROV per pipeline (in execution
 /// order), then execute. No /bin/sh fallback: parse errors → exit 2; exec
 /// errors → visible message + non-zero.
-async fn run_brush(conn_fd: i32, script: String) -> i32 {
-    // sh_mode=true: POSIX (top-level body stands in for /bin/sh). Without
-    // the builtin table brush-core ships empty, so even POSIX builtins fail.
-    let shell_res = build_box_shell(true, None, None, None).await;
+async fn run_brush(conn_fd: i32, script: String, sh_mode: bool) -> i32 {
+    // Mode follows the user's argv[0] (shell_name_from_argv): bash → BASH
+    // mode, anything else → POSIX. Without the builtin table brush-core
+    // ships empty, so even POSIX builtins fail.
+    let shell_res = build_box_shell(sh_mode, None, None, None).await;
     let mut shell = match shell_res {
         Ok(s) => s,
         Err(e) => { eprintln!("sarun-engine inner: -b brush init failed: {e}"); return 127; }
