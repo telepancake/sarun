@@ -325,8 +325,8 @@ class Browser:
         img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
         if full:
             return img
-        # two vertical color samples per cell for half-block rendering
-        return img.resize((self.cols, self.rows * 2), Image.BOX)
+        # 2x2 color samples per cell for quadrant-block rendering
+        return img.resize((self.cols * 2, self.rows * 2), Image.BOX)
 
     def start_screencast(self):
         """Push-based frames: Chromium sends Page.screencastFrame only when
@@ -485,6 +485,38 @@ def parse_css_color(s):
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
+# quadrant blocks indexed by pixel bitmask: bit 1 = upper-left, 2 = upper-
+# right, 4 = lower-left, 8 = lower-right lit (drawn in the foreground color)
+QUADS = " ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█"
+PIXEL_CHARS = frozenset(QUADS) - {" "}
+
+
+def _dist2(a, b):
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
+
+
+def _quad_cell(pix):
+    """4 RGB samples (UL, UR, LL, LR) -> (char, fg, bg): pick the 2-color
+    partition seeded by the most distant pair, render lit quads as fg."""
+    seed_a, seed_b, worst = pix[0], pix[0], -1
+    for i in range(4):
+        for j in range(i + 1, 4):
+            d = _dist2(pix[i], pix[j])
+            if d > worst:
+                worst, seed_a, seed_b = d, pix[i], pix[j]
+    if worst == 0:
+        return " ", pix[0], pix[0]
+    bits, on, off = 0, [], []
+    for k, p in enumerate(pix):
+        if _dist2(p, seed_a) <= _dist2(p, seed_b):
+            bits |= 1 << k
+            on.append(p)
+        else:
+            off.append(p)
+    avg = lambda ps: tuple(sum(c[i] for c in ps) // len(ps) for i in range(3))
+    return QUADS[bits], avg(on), avg(off)
+
+
 def compose_frame(browser, img=None):
     """-> grid[rows][cols] of (char, fg, bg) cells."""
     if img is None:
@@ -492,12 +524,20 @@ def compose_frame(browser, img=None):
     px = img.load()
     rows, cols = browser.rows, browser.cols
     grid = [
-        [("▄", px[c, r * 2 + 1], px[c, r * 2]) for c in range(cols)]
+        [
+            _quad_cell(
+                (px[2 * c, 2 * r], px[2 * c + 1, 2 * r],
+                 px[2 * c, 2 * r + 1], px[2 * c + 1, 2 * r + 1])
+            )
+            for c in range(cols)
+        ]
         for r in range(rows)
     ]
     for row, col, ch, color in browser.snapshot_text():
         if 0 <= row < rows and 0 <= col < cols:
-            bg = px[col, row * 2]
+            p = (px[2 * col, 2 * row], px[2 * col + 1, 2 * row],
+                 px[2 * col, 2 * row + 1], px[2 * col + 1, 2 * row + 1])
+            bg = tuple(sum(c[i] for c in p) // 4 for i in range(3))
             grid[row][col] = (ch, color, bg)
             if char_cells(ch) == 2 and col + 1 < cols:
                 grid[row][col + 1] = ("", color, bg)  # continuation cell
@@ -522,7 +562,8 @@ def render_ansi(grid, out):
 def render_text(grid, out):
     for row in grid:
         line = "".join(
-            ch if ch and ch != "▄" else (" " if ch else "") for ch, _, _ in row
+            ch if ch and ch not in PIXEL_CHARS else (" " if ch else "")
+            for ch, _, _ in row
         )
         out.write(line.rstrip() + "\n")
 
