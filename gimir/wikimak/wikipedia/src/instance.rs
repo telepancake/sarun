@@ -317,6 +317,174 @@ impl Instance {
         }
     }
 
+    // --- asof-τ read API (browsing plan §2, the wayback contract) ---
+    //
+    // Title normalization here MUST match import's (`ensure_title` in
+    // import.rs): the importer stores `page.title.trim()` verbatim as the
+    // `normalized_title` BLOB — namespace prefix kept, underscores NOT
+    // folded to spaces, no per-namespace case rule applied. So the τ
+    // lookups below normalize an incoming title with `.trim()` only.
+    // Fuller normalization (underscores→spaces, first-letter case from
+    // siteinfo) is a documented gap: it belongs at import time (import
+    // plan §7 amendment) and cannot be added at read time without
+    // re-keying the stored titles.
+
+    /// Resolve a title to its page id AS OF `ts_micros` (unix micros).
+    ///
+    /// `None` τ → current behavior ([`Instance::page_by_title`], exact
+    /// then unique-substring). `Some(τ)` → `title_intervals` window
+    /// lookup on the normalized (trimmed) title:
+    /// `start_ts <= τ AND (end_ts IS NULL OR end_ts > τ)`. When NO
+    /// interval rows exist for the title at all (an old import that
+    /// predates interval bookkeeping), fall back to the current
+    /// title→page mapping. A title that HAS interval rows but none
+    /// covering τ resolves to `None` — it did not exist at τ.
+    pub fn page_id_by_title_at(&self, title: &str, ts_micros: Option<i64>) -> Result<Option<u64>> {
+        let ts = match ts_micros {
+            None => return Ok(self.page_by_title(title)?.0),
+            Some(ts) => ts,
+        };
+        let key = title.trim().as_bytes().to_vec();
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        let hit: Option<i64> = g
+            .conn
+            .query_row(
+                "SELECT page_id FROM title_intervals
+                 WHERE normalized_title = ?1
+                   AND start_ts <= ?2
+                   AND (end_ts IS NULL OR end_ts > ?2)
+                 ORDER BY start_ts DESC LIMIT 1",
+                rusqlite::params![key, ts],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(id) = hit {
+            return Ok(Some(id as u64));
+        }
+        // Distinguish "title has interval rows, none cover τ" (→ None,
+        // did not exist at τ) from "no interval rows at all" (→ fall back
+        // to the current mapping, for pre-interval imports).
+        let any_interval: i64 = g.conn.query_row(
+            "SELECT COUNT(*) FROM title_intervals WHERE normalized_title = ?1",
+            rusqlite::params![key],
+            |r| r.get(0),
+        )?;
+        if any_interval > 0 {
+            return Ok(None);
+        }
+        let current: Option<i64> = g
+            .conn
+            .query_row(
+                "SELECT p.page_id FROM page_to_title_id p
+                 JOIN title_id_to_page t ON t.title_id = p.title_id
+                 WHERE t.normalized_title = ?1
+                 LIMIT 1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(current.map(|id| id as u64))
+    }
+
+    /// Newest revision of `page_id` with timestamp ≤ `ts_micros`.
+    ///
+    /// `None` τ → head. `Some(τ)` → walk the chain newest-first
+    /// ([`Instance::page_history`]) and return the first revision whose
+    /// timestamp is ≤ τ; `Ok(None)` when every revision is newer than τ
+    /// (the page did not yet exist at τ).
+    pub fn revision_at(&self, page_id: u64, ts_micros: Option<i64>) -> Result<Option<RevisionMeta>> {
+        let ts = match ts_micros {
+            None => return self.page_head(page_id),
+            Some(ts) => ts,
+        };
+        for entry in self.page_history(page_id)? {
+            let entry = entry?;
+            if entry.meta.ts.timestamp_micros() <= ts {
+                return Ok(Some(entry.meta));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Text bytes of the revision selected by [`Instance::revision_at`].
+    ///
+    /// Same newest-first walk; decodes only the chosen revision's text.
+    /// `None` τ → head text; `Ok(None)` when no revision is ≤ τ.
+    pub fn page_text_at(&self, page_id: u64, ts_micros: Option<i64>) -> Result<Option<Vec<u8>>> {
+        let ts = match ts_micros {
+            None => return self.page_head_text(page_id),
+            Some(ts) => ts,
+        };
+        for entry in self.page_history(page_id)? {
+            let entry = entry?;
+            if entry.meta.ts.timestamp_micros() <= ts {
+                return Ok(Some((entry.fetch_text)()?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Existence of `title` at τ — the red-link / `#ifexist` fast path.
+    ///
+    /// Title tables only, NO frame decode: resolves through the same
+    /// `title_intervals` window as [`Instance::page_id_by_title_at`].
+    /// NOTE: because import records a single open interval `[0, ∞)` per
+    /// title (start_ts = 0, end_ts = NULL — no rename tracking yet), for
+    /// any τ ≥ 0 this reports whether the title EVER existed, not whether
+    /// its first revision predates τ (that would need a frame decode).
+    pub fn exists_at(&self, title: &str, ts_micros: Option<i64>) -> Result<bool> {
+        Ok(self.page_id_by_title_at(title, ts_micros)?.is_some())
+    }
+
+    /// Raw siteinfo snapshot JSON selected for τ (plan §2 siteinfo rule):
+    /// the snapshot with `max(captured_at) ≤ τ`; for τ before our first
+    /// snapshot, the OLDEST we hold. `None` τ → the newest snapshot.
+    /// `Ok(None)` only when no snapshots exist.
+    pub fn site_config_at(&self, ts_micros: Option<i64>) -> Result<Option<serde_json::Value>> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        let bytes: Option<Vec<u8>> = match ts_micros {
+            None => g
+                .conn
+                .query_row(
+                    "SELECT json FROM siteinfo_snapshots
+                     ORDER BY captured_at DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok(),
+            Some(ts) => {
+                let at = g
+                    .conn
+                    .query_row(
+                        "SELECT json FROM siteinfo_snapshots
+                         WHERE captured_at <= ?1
+                         ORDER BY captured_at DESC LIMIT 1",
+                        rusqlite::params![ts],
+                        |r| r.get::<_, Vec<u8>>(0),
+                    )
+                    .ok();
+                match at {
+                    Some(b) => Some(b),
+                    None => g
+                        .conn
+                        .query_row(
+                            "SELECT json FROM siteinfo_snapshots
+                             ORDER BY captured_at ASC LIMIT 1",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .ok(),
+                }
+            }
+        };
+        match bytes {
+            Some(b) => Ok(Some(
+                serde_json::from_slice(&b).map_err(|_| Error::Corrupt("siteinfo snapshot json"))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// Has this dump part already been fully imported? Keyed by the
     /// part's filename (`parts_seen` table).
     pub fn part_seen(&self, filename: &str) -> Result<bool> {

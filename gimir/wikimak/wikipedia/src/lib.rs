@@ -9,6 +9,7 @@
 //! See `SPEC.md` for the on-disk layout, per-revision codec, and
 //! crash-safety contract.
 
+pub mod asof;
 #[cfg(feature = "fetch")]
 mod cli;
 #[cfg(feature = "fetch")]

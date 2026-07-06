@@ -409,12 +409,31 @@ fn decode_rev_id(rec: &[u8]) -> Result<i64> {
 
 fn capture_siteinfo(conn: &rusqlite::Connection, si: &wikimak_mediawiki::SiteInfo) -> Result<()> {
     let captured_at = chrono::Utc::now().timestamp_micros();
+    // Namespaces are ADDITIVE keys (browsing plan §2 / §7 siteinfo): the
+    // asof read API tolerates snapshots written before this field
+    // existed. The mediawiki `SiteInfo` (wikimak/mediawiki/src/types.rs)
+    // carries only id/name/case per namespace — no per-namespace aliases
+    // in the dump's <siteinfo>, so `aliases` is emitted empty for now
+    // (localized aliases would come from a magicwords/aliases source).
+    let namespaces: Vec<_> = si
+        .namespaces
+        .values()
+        .map(|n| {
+            json!({
+                "id": n.id,
+                "canonical": n.name,
+                "case": n.case,
+                "aliases": Vec::<String>::new(),
+            })
+        })
+        .collect();
     let payload = json!({
         "site_name": si.site_name,
         "db_name": si.db_name,
         "base": si.base,
         "generator": si.generator,
         "case": si.case,
+        "namespaces": namespaces,
     });
     // serde_json::to_vec on a flat object of String fields cannot fail
     // (no custom Serialize, no non-UTF-8 keys); unwrap is fine.
