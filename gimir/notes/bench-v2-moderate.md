@@ -85,3 +85,19 @@ repos all have them; peel to commit + preserve tag object in meta for
 SHA-exact export. (2) git archive is depth-independent (~30ms) —
 content addressing; our 6-7× constant at depth is acceptable, the
 asymptotics are not worse than one frame decode + k applies.
+
+## 2026-07-06 — window/LDM fix (user finding: "solid archive must beat the pack")
+
+compress() had level-default window (~2MB @ L3), no LDM — the
+accumulator's cross-record redundancy sits MB apart in the raw stream
+and was structurally invisible to the encoder. Window now sized to the
+frame (cap wlog 27 = decode default limit) + LDM. ripgrep, same data:
+
+| | f1 | store total | vs pack 3.40MB |
+|---|---|---|---|
+| L3, old window     | 7.63MB | 8.70MB | 2.6× |
+| L3, window+LDM     | 1.52MB | 2.58MB | 0.76× |
+| L19, window+LDM    | 1.26MB | 2.19MB | 0.64× |
+
+Deep-2000 access on the wide-window store: 274ms (vs 203ms before —
+LDM decode cost, negligible). Import time unchanged (~85s L3).
