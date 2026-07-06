@@ -20,6 +20,28 @@ use crate::{Frame, PageStore, RenderMisses, RenderOptions, SiteConfig, Title};
 
 const MAX_DEPTH: usize = 40;
 const TEMPLATE_NS: i32 = 10;
+/// Deepest brace/bracket/arg nesting `parse_nodes` will build a node for.
+/// Beyond this, the excess `{{`/`[[`/`{{{` is emitted as literal text, so a
+/// single body's node tree can never exceed this depth. This is the load
+/// bearing guard: the `Node` enum is recursive, so its DERIVED `Clone`
+/// (head_nodes/detect clone whole subtrees) and `Drop` recurse once per
+/// nesting level — a deep tree overflows the native stack the moment it is
+/// cloned or dropped, before expansion even runs. Capping the tree depth
+/// bounds all three (parse is iterative and never recurses). Absurdly
+/// generous next to MediaWiki's total expansion-depth limit
+/// ($wgMaxPPExpandDepth = 40): no content MediaWiki renders nests this deep.
+const MAX_PARSE_DEPTH: usize = 128;
+/// Deepest live node-walk recursion before expansion bails with an inline
+/// error box. Distinct from [`MAX_PARSE_DEPTH`]: expansion recursion
+/// ACCUMULATES across transcluded bodies (each body is separately parsed
+/// and expanded on the same call stack), so per-body parse capping alone
+/// does not bound the total. Guards native stack use on a long transclusion
+/// chain of individually-nested bodies.
+const MAX_EXPAND_DEPTH: usize = 256;
+/// MediaWiki caps the {{padleft:}}/{{padright:}} result at 500 chars
+/// (CoreParserFunctions::pad: `min( (int)$length, 500 )`). Enforcing it
+/// both matches MediaWiki output and bounds the allocation.
+const PAD_MAX_WIDTH: usize = 500;
 
 /// Behavior switches (`__NOTOC__` &c) found on the page. Stripped from
 /// the text; surfaced here so the parser/serve layers can act on them.
@@ -60,6 +82,9 @@ struct Ctx<'a> {
     /// Prefixed titles currently on the transclusion stack (loop detect).
     stack: Vec<String>,
     depth: usize,
+    /// Live node-walk recursion depth (nested braces/brackets/args),
+    /// distinct from `depth` (transclusion depth). Guards native stack use.
+    node_depth: usize,
 }
 
 pub fn expand(
@@ -67,6 +92,27 @@ pub fn expand(
     title: &Title,
     text: &str,
     opts: &RenderOptions<'_>,
+) -> Expanded {
+    let root = Frame {
+        args: Default::default(),
+        parent: None,
+        title: title.prefixed(store.site()),
+    };
+    expand_with_frame(store, title, text, opts, &root)
+}
+
+/// Expand `text` in the context of an explicit `frame` — the entry point
+/// Scribunto's `frame:preprocess` / `frame:expandTemplate` use so that
+/// `{{{param}}}` references resolve against the invoking template's args
+/// (the frozen [`expand`] seeds an empty root frame, which cannot see
+/// them). Behaviorally identical to [`expand`] except for which frame the
+/// top-level body is expanded against.
+pub fn expand_with_frame(
+    store: &dyn PageStore,
+    title: &Title,
+    text: &str,
+    opts: &RenderOptions<'_>,
+    frame: &Frame,
 ) -> Expanded {
     let site = store.site();
     let mut ctx = Ctx {
@@ -80,15 +126,11 @@ pub fn expand(
         display_title: None,
         stack: Vec::new(),
         depth: 0,
+        node_depth: 0,
     };
     let mut switches = BehaviorSwitches::default();
     let stripped = strip_switches(text, &mut switches);
-    let root = Frame {
-        args: Default::default(),
-        parent: None,
-        title: title.prefixed(site),
-    };
-    let out = expand_body(&mut ctx, &stripped, &root, false);
+    let out = expand_body(&mut ctx, &stripped, frame, false);
     Expanded {
         text: out,
         misses: ctx.misses,
@@ -175,7 +217,14 @@ fn parse_nodes(text: &str) -> Vec<Node> {
         match b {
             b'{' => {
                 let n = run_len(bytes, i, b'{');
-                stack.push(OpenB::new(OpenKind::Curly(n)));
+                if stack.len() < MAX_PARSE_DEPTH {
+                    stack.push(OpenB::new(OpenKind::Curly(n)));
+                } else {
+                    // At the cap: keep the braces as literal text rather than
+                    // deepening the tree. A matching `}}` run finds no open
+                    // Curly and stays literal too, so the pair is symmetric.
+                    top_text(&mut stack, &"{".repeat(n));
+                }
                 i += n;
             }
             b'}' => {
@@ -204,7 +253,11 @@ fn parse_nodes(text: &str) -> Vec<Node> {
                 }
             }
             b'[' if i + 1 < len && bytes[i + 1] == b'[' => {
-                stack.push(OpenB::new(OpenKind::Bracket));
+                if stack.len() < MAX_PARSE_DEPTH {
+                    stack.push(OpenB::new(OpenKind::Bracket));
+                } else {
+                    top_text(&mut stack, "[[");
+                }
                 i += 2;
             }
             b']' if i + 1 < len && bytes[i + 1] == b']' => {
@@ -327,6 +380,14 @@ fn expand_body(ctx: &mut Ctx, text: &str, frame: &Frame, transcluding: bool) -> 
 }
 
 fn expand_nodes(ctx: &mut Ctx, nodes: &[Node], frame: &Frame) -> String {
+    // Every recursive descent into nested braces/brackets/args flows through
+    // here (expand_template/expand_arg/expand_link all re-enter expand_nodes),
+    // so bounding this one function's live depth bounds all native recursion.
+    // Without it, deeply nested `{{`/`[[`/`{{{` overflows the stack → SIGABRT.
+    if ctx.node_depth >= MAX_EXPAND_DEPTH {
+        return html::error_box("Expansion depth limit exceeded");
+    }
+    ctx.node_depth += 1;
     let mut out = String::new();
     for n in nodes {
         match n {
@@ -336,6 +397,7 @@ fn expand_nodes(ctx: &mut Ctx, nodes: &[Node], frame: &Frame) -> String {
             Node::Link(parts) => out.push_str(&expand_link(ctx, parts, frame)),
         }
     }
+    ctx.node_depth -= 1;
     out
 }
 
@@ -801,7 +863,8 @@ fn pf_pad(ctx: &mut Ctx, arg0: &[Node], rest: &[Part], frame: &Frame, left: bool
     let width = rest
         .first()
         .and_then(|p| part_trim(ctx, p, frame).parse::<usize>().ok())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(PAD_MAX_WIDTH);
     let padchar = rest
         .get(1)
         .map(|p| part_trim(ctx, p, frame))
@@ -1637,6 +1700,23 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
     find_ci_from(hay, needle, 0).is_some()
 }
 
+/// Does `needle` match `hay` at exactly byte offset `i` (ASCII-CI)? Unlike
+/// `find_ci_from(hay, needle, i) == Some(i)`, this checks ONLY position `i`
+/// instead of scanning forward to the end — the difference between O(needle)
+/// and O(hay) per call. Callers that walk every position (protect_tags,
+/// remove_tags) must use this, else the whole scan is O(hay²).
+fn matches_ci_at(hay: &[u8], needle: &[u8], i: usize) -> bool {
+    if i + needle.len() > hay.len() {
+        return false;
+    }
+    for j in 0..needle.len() {
+        if !hay[i + j].eq_ignore_ascii_case(&needle[j]) {
+            return false;
+        }
+    }
+    true
+}
+
 fn remove_region(text: &str, open: &str, close: &str) -> String {
     let mut out = String::new();
     let mut i = 0;
@@ -1661,7 +1741,7 @@ fn remove_tags(text: &str, tags: &[&str]) -> String {
         // If a tag starts exactly here, drop it.
         let here = tags
             .iter()
-            .find(|t| find_ci_from(text, t, i) == Some(i));
+            .find(|t| matches_ci_at(text.as_bytes(), t.as_bytes(), i));
         if let Some(t) = here {
             i += t.len();
             continue;
@@ -1759,7 +1839,7 @@ fn protect_tags(text: &str) -> (String, Vec<String>) {
     'scan: while i < text.len() {
         for tag in tags {
             let open = format!("<{tag}");
-            if find_ci_from(text, &open, i) == Some(i) {
+            if matches_ci_at(text.as_bytes(), open.as_bytes(), i) {
                 let after = &text[i + open.len()..];
                 let ok = after
                     .as_bytes()

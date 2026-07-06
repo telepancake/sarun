@@ -100,6 +100,7 @@ pub fn standard_site() -> SiteConfig {
         rtl: false,
         namespaces,
         interwiki: BTreeMap::new(),
+        ..Default::default()
     }
 }
 

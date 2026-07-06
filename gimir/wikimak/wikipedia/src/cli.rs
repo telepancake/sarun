@@ -122,6 +122,16 @@ fn cmd_text(root: &str, page: u64) -> Result<(), String> {
     }
 }
 
+#[cfg(feature = "serve")]
+fn cmd_serve(root: &str, addr: &str) -> Result<(), String> {
+    let inst = open_instance(PathBuf::from(root))?;
+    let cfg = crate::serve::ServeConfig {
+        addr: addr.to_string(),
+        media_cache: PathBuf::from(root).join("media"),
+    };
+    crate::serve::serve(inst, cfg)
+}
+
 fn cmd_history(root: &str, page: u64) -> Result<(), String> {
     let inst = open_instance(PathBuf::from(root))?;
     for entry in inst.page_history(page).map_err(|e| e.to_string())? {
@@ -143,6 +153,10 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["import", dump, root] => cmd_import(dump, root),
         ["pages", root] => cmd_pages(root, None),
         ["pages", root, filter] => cmd_pages(root, Some(filter)),
+        #[cfg(feature = "serve")]
+        ["serve", root] => cmd_serve(root, "127.0.0.1:8642"),
+        #[cfg(feature = "serve")]
+        ["serve", root, addr] => cmd_serve(root, addr),
         ["head", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_head(root, p)),
         ["text", root, page] => page.parse().map_err(|e| format!("{e}"))
@@ -153,6 +167,7 @@ pub fn cli_main(args: &[String]) -> i32 {
                   \x20      wikimak pages <root> [filter]\n\
                   \x20      wikimak fetch <dbname> <root>\n\
                   \x20      wikimak import <dump.xml[.bz2]> <root>\n\
+                  \x20      wikimak serve <root> [addr]        (default 127.0.0.1:8642)\n\
                   \x20      wikimak head|text|history <root> <page_id>".into()),
     };
     match r {

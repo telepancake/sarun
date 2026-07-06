@@ -437,3 +437,101 @@ fn site_config_at_snapshot_selection() {
     assert!(empty.site_config_at(None).unwrap().is_none());
     assert!(empty.site_config_at(Some(123)).unwrap().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION (out-of-order / cross-import revisions): the chain is ordered
+// by import-prepend order, NOT by timestamp. A later import supplying a gap
+// revision lands at the chain head, so "first record with ts ≤ τ" (and f0
+// as "head") returns a non-newest revision. revision_at/page_text_at/
+// page_head must select argmax(ts | ts ≤ τ) instead.
+//
+// Import #1: rev10@2020, rev30@2022. Import #2 (later): the gap rev20@2021.
+// Chain becomes [rev20, rev30, rev10] (rev20 prepended at head).
+// ---------------------------------------------------------------------------
+const OOO_SITEINFO: &str = r#"<siteinfo>
+    <sitename>Test Wiki</sitename><dbname>testwiki</dbname><base>http://x/</base>
+    <generator>g</generator><case>first-letter</case>
+    <namespaces><namespace key="0" case="first-letter"/></namespaces>
+  </siteinfo>"#;
+
+fn ooo_rev(id: u64, parent: Option<u64>, year: u32, text: &str) -> String {
+    let parentid = parent.map(|p| format!("<parentid>{p}</parentid>")).unwrap_or_default();
+    format!(
+        r#"<revision><id>{id}</id>{parentid}<timestamp>{year}-01-01T00:00:00Z</timestamp>
+        <contributor><username>U</username><id>1</id></contributor>
+        <comment>c</comment><model>wikitext</model><format>text/x-wiki</format>
+        <text bytes="5" sha1="x" xml:space="preserve">{text}</text><sha1>x</sha1></revision>"#
+    )
+}
+
+fn ooo_doc(revs: &str) -> String {
+    format!(
+        r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
+  {OOO_SITEINFO}
+  <page><title>Gap</title><ns>0</ns><id>300</id>{revs}</page>
+</mediawiki>"#
+    )
+}
+
+fn ooo_instance(tmp: &TempDir) -> Instance {
+    let inst = make_instance(tmp, 4096);
+    // Import #1: rev10 (2020) and rev30 (2022) — a gap at 2021.
+    let d1 = ooo_doc(&format!("{}{}", ooo_rev(10, None, 2020, "y2020"), ooo_rev(30, Some(10), 2022, "y2022")));
+    let mut s1 = new_page_stream(Cursor::new(d1.into_bytes()));
+    inst.import(&mut s1).expect("import #1");
+    // Import #2 (later): the gap-filling rev20 (2021). Prepended at the head.
+    let d2 = ooo_doc(&ooo_rev(20, Some(10), 2021, "y2021"));
+    let mut s2 = new_page_stream(Cursor::new(d2.into_bytes()));
+    inst.import(&mut s2).expect("import #2");
+    inst.flush().expect("flush");
+    inst
+}
+
+#[test]
+fn revision_at_out_of_order_import_selects_newest_by_time() {
+    let tmp = TempDir::new().unwrap();
+    let inst = ooo_instance(&tmp);
+
+    // The chain head is the LAST-imported record (rev20), proving order is
+    // import-prepend, not timestamp.
+    let hist = history_micros(&inst, 300);
+    assert_eq!(hist[0].0, 20, "chain head is the last-imported gap revision");
+    let t2020 = hist.iter().find(|h| h.0 == 10).unwrap().1;
+    let t2021 = hist.iter().find(|h| h.0 == 20).unwrap().1;
+    let t2022 = hist.iter().find(|h| h.0 == 30).unwrap().1;
+
+    // Head / None τ must be the newest BY TIME (rev30), not the chain head.
+    assert_eq!(rev_id_at(&inst, 300, None), Some(30), "None τ → newest by time");
+    assert_eq!(inst.page_head(300).unwrap().unwrap().rev_id, 30, "page_head → newest by time");
+
+    // τ well past the last edit → rev30 (was rev20 with first-in-chain).
+    assert_eq!(rev_id_at(&inst, 300, Some(t2022 + 1_000_000)), Some(30));
+    // τ exactly at each revision instant.
+    assert_eq!(rev_id_at(&inst, 300, Some(t2022)), Some(30));
+    assert_eq!(rev_id_at(&inst, 300, Some(t2021)), Some(20));
+    assert_eq!(rev_id_at(&inst, 300, Some(t2020)), Some(10));
+    // Between 2021 and 2022 → rev20 (rev30 is newer than τ).
+    assert_eq!(rev_id_at(&inst, 300, Some(t2022 - 1)), Some(20));
+    // Before the first revision → nothing existed yet.
+    assert_eq!(rev_id_at(&inst, 300, Some(t2020 - 1)), None);
+}
+
+#[test]
+fn page_text_at_out_of_order_import_selects_newest_by_time() {
+    let tmp = TempDir::new().unwrap();
+    let inst = ooo_instance(&tmp);
+
+    let hist = history_micros(&inst, 300);
+    let t2021 = hist.iter().find(|h| h.0 == 20).unwrap().1;
+    let t2022 = hist.iter().find(|h| h.0 == 30).unwrap().1;
+
+    let text = |ts| inst.page_text_at(300, ts).expect("page_text_at");
+    // None τ and past-head τ → the 2022 text, not the last-imported 2021 one.
+    assert_eq!(text(None).as_deref(), Some(&b"y2022"[..]));
+    assert_eq!(text(Some(t2022 + 1_000_000)).as_deref(), Some(&b"y2022"[..]));
+    // Head text accessor agrees.
+    assert_eq!(inst.page_head_text(300).unwrap().as_deref(), Some(&b"y2022"[..]));
+    // A τ between the gap edit and the newest edit → the gap text.
+    assert_eq!(text(Some(t2021)).as_deref(), Some(&b"y2021"[..]));
+    assert_eq!(text(Some(t2022 - 1)).as_deref(), Some(&b"y2021"[..]));
+}

@@ -26,7 +26,7 @@ gitdepot = { path = "../gimir/gitdepot" }
 # dials out: mirrors.rs re-execs this same binary, so all fetching happens
 # in a child process.
 ietf_mirror = { path = "../gimir/ietf-mirror", package = "ietf-mirror", default-features = false, features = ["fetch"] }
-wikimak_wikipedia = { path = "../gimir/wikimak/wikipedia", package = "wikimak-wikipedia", default-features = false, features = ["fetch"] }
+wikimak_wikipedia = { path = "../gimir/wikimak/wikipedia", package = "wikimak-wikipedia", default-features = false, features = ["fetch", "serve"] }
 wikimak_depot = { path = "../gimir/wikimak/depot", package = "wikimak-depot" }
 base64 = "0.22.1"
 bytes = "1.10"

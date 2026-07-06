@@ -65,6 +65,14 @@ pub struct SiteConfig {
     /// the HTML gets dir="rtl" on the content root and the parser keeps
     /// bidi-neutral punctuation inside directional runs.
     pub rtl: bool,
+    /// Canonical server URL, scheme + host, no trailing slash — e.g.
+    /// "https://en.wikipedia.org". Drives `mw.site.server` and the
+    /// absolute half of `mw.uri.fullUrl`. Empty when siteinfo carries no
+    /// base URL (the serve layer's links stay relative regardless).
+    pub server: String,
+    /// Wiki script path, e.g. "/w" — drives `mw.site.scriptPath` and the
+    /// path half of `mw.uri.localUrl`/`fullUrl`. Empty by default.
+    pub script_path: String,
     pub namespaces: BTreeMap<i32, NamespaceInfo>,
     pub interwiki: BTreeMap<String, InterwikiEntry>,
 }
@@ -77,6 +85,14 @@ pub trait PageStore {
     /// Existence at τ (red/blue links, #ifexist) — MUST be cheaper than
     /// `page_text` (titles-table point lookup, no frame decode).
     fn page_exists(&self, title: &Title) -> bool;
+    /// Numeric page id at τ (drives `mw.title.id`). Default `None` keeps
+    /// the trait cheap for stores that don't expose ids; the serve-layer
+    /// [`AsOfView`](../wikimak_wikipedia/asof/struct.AsOfView.html) fills
+    /// it from the titles table.
+    fn page_id(&self, title: &Title) -> Option<u64> {
+        let _ = title;
+        None
+    }
     fn site(&self) -> &SiteConfig;
     /// τ in unix micros — drives {{CURRENTYEAR}} etc. (plan §3.2: τ!).
     fn timestamp_micros(&self) -> i64;

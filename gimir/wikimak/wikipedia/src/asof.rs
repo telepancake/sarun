@@ -136,6 +136,12 @@ fn build_site_config(snapshot: Option<&serde_json::Value>) -> wikimak_wikitext::
     cfg.db_name = s("db_name");
     cfg.lang = lang_from_db_name(&cfg.db_name);
     cfg.rtl = RTL_LANGS.contains(&cfg.lang.as_str());
+    // mw.site.server: scheme + host of the siteinfo <base> URL (the URL of
+    // the wiki's main page), no path — e.g. "https://en.wikipedia.org".
+    // Empty when no base is recorded.
+    cfg.server = server_from_base(&s("base"));
+    // Standard MediaWiki script path; siteinfo does not carry it.
+    cfg.script_path = "/w".to_string();
     let mut namespaces: BTreeMap<i32, wikimak_wikitext::NamespaceInfo> = BTreeMap::new();
     if let Some(arr) = v.get("namespaces").and_then(|x| x.as_array()) {
         for ns in arr {
@@ -176,6 +182,24 @@ fn build_site_config(snapshot: Option<&serde_json::Value>) -> wikimak_wikitext::
     cfg
 }
 
+/// Extract `scheme://host` from a siteinfo `<base>` URL, dropping the
+/// path (`http://x/Main_Page` → `http://x`). A base without `://` yields
+/// an empty server (links stay relative). No allocation-heavy URL crate:
+/// the base is a plain absolute URL in every dump.
+#[cfg(feature = "serve")]
+fn server_from_base(base: &str) -> String {
+    let base = base.trim();
+    let Some(scheme_end) = base.find("://") else {
+        return String::new();
+    };
+    let after = scheme_end + 3;
+    let host_end = base[after..]
+        .find('/')
+        .map(|i| after + i)
+        .unwrap_or(base.len());
+    base[..host_end].to_string()
+}
+
 /// `arwiki` → `ar`, `enwiki` → `en`; a db_name not ending in `wiki` is
 /// used verbatim. Language code is not in the dump's siteinfo, so it is
 /// inferred from the database name.
@@ -202,6 +226,11 @@ impl wikimak_wikitext::PageStore for AsOfView<'_> {
     fn page_exists(&self, title: &wikimak_wikitext::Title) -> bool {
         let key = title.prefixed(&self.site);
         self.inst.exists_at(&key, self.ts).unwrap_or(false)
+    }
+
+    fn page_id(&self, title: &wikimak_wikitext::Title) -> Option<u64> {
+        let key = title.prefixed(&self.site);
+        self.inst.page_id_by_title_at(&key, self.ts).ok().flatten()
     }
 
     fn site(&self) -> &wikimak_wikitext::SiteConfig {

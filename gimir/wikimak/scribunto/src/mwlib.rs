@@ -215,45 +215,6 @@ fn lua_frame_to_rust(tbl: &Table) -> Frame {
     Frame { args, parent: None, title }
 }
 
-/// Substitute `{{{name}}}` / `{{{name|default}}}` from the frame args
-/// before running the (frame-less) preprocessor. This is the pragmatic
-/// bridge for `frame:preprocess` — the frozen `preprocess::expand`
-/// signature takes no frame, so its own {{{param}}} resolution can't see
-/// these args; we resolve them here first. Nested/edge param forms are
-/// out of scope (see crate gaps).
-fn substitute_params(text: &str, args: &BTreeMap<String, String>) -> String {
-    let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 3 <= bytes.len() && &text[i..i + 3] == "{{{" {
-            if let Some(end) = text[i + 3..].find("}}}") {
-                let inner = &text[i + 3..i + 3 + end];
-                let (name, default) = match inner.find('|') {
-                    Some(p) => (&inner[..p], Some(&inner[p + 1..])),
-                    None => (inner, None),
-                };
-                let name = name.trim();
-                if let Some(v) = args.get(name) {
-                    out.push_str(v);
-                } else if let Some(d) = default {
-                    out.push_str(d);
-                } else {
-                    out.push_str("{{{");
-                    out.push_str(name);
-                    out.push_str("}}}");
-                }
-                i += 3 + end + 3;
-                continue;
-            }
-        }
-        let ch = text[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
 fn uri_encode(s: &str, kind: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -309,10 +270,8 @@ fn uri_decode(s: &str, kind: &str) -> String {
 fn build_site_table(lua: &Lua, site: &SiteConfig) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     t.raw_set("siteName", site.site_name.clone())?;
-    // SiteConfig carries no server/scriptPath; best-effort placeholders
-    // until the contract grows them (see crate lib_rs_requests).
-    t.raw_set("server", "")?;
-    t.raw_set("scriptPath", "/w")?;
+    t.raw_set("server", site.server.clone())?;
+    t.raw_set("scriptPath", site.script_path.clone())?;
     t.raw_set("currentVersion", "gimir")?;
 
     let ns = lua.create_table()?;
@@ -352,7 +311,7 @@ fn title_table(lua: &Lua, title: &Title, site: &SiteConfig, store: &dyn PageStor
     let t = lua.create_table()?;
     let prefixed = title.prefixed(site);
     t.raw_set("namespace", title.ns)?;
-    t.raw_set("id", 0)?;
+    t.raw_set("id", store.page_id(title).unwrap_or(0))?;
     t.raw_set("text", title.text.clone())?;
     t.raw_set("prefixedText", prefixed.clone())?;
     t.raw_set("fullText", prefixed)?;
@@ -513,15 +472,16 @@ where
         "preprocess",
         scope.create_function(move |_, (this, text): (Table, mlua::String)| {
             let rf = lua_frame_to_rust(&this);
-            let substituted = substitute_params(&text.to_str()?, &rf.args);
             let title = parse_title(&rf.title, ctx.site, 0);
-            Ok(preprocess::expand(ctx.store, &title, &substituted, &ctx.opts()).text)
+            // expand_with_frame resolves {{{param}}} against the invoking
+            // frame's args directly — the frozen `expand`'s empty root
+            // frame cannot see them (crate lib_rs_requests / preprocess).
+            Ok(preprocess::expand_with_frame(ctx.store, &title, &text.to_str()?, &ctx.opts(), &rf).text)
         })?,
     )?;
     methods.set(
         "expandTemplate",
         scope.create_function(move |_, (this, spec): (Table, Table)| {
-            let _ = this;
             let title: String = spec.get("title")?;
             let mut wt = format!("{{{{{title}");
             if let Ok(args) = spec.get::<Table>("args") {
@@ -536,8 +496,12 @@ where
                 }
             }
             wt.push_str("}}");
+            // Expand the constructed call in the invoking frame's context
+            // (expand_with_frame), so parent params referenced inside the
+            // transcluded template resolve — same bridge as :preprocess.
+            let rf = lua_frame_to_rust(&this);
             let cur = parse_title(&ctx.current_title, ctx.site, 0);
-            Ok(preprocess::expand(ctx.store, &cur, &wt, &ctx.opts()).text)
+            Ok(preprocess::expand_with_frame(ctx.store, &cur, &wt, &ctx.opts(), &rf).text)
         })?,
     )?;
     methods.set(

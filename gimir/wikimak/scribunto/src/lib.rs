@@ -18,8 +18,10 @@
 //! — returns `Err(String)`, which the renderer shows as an inline
 //! script-error box. Nothing panics; nothing is silently dropped.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use mlua::{Error as LuaError, HookTriggers, Lua, Table, Value, VmState};
 use wikimak_wikitext::{Frame, ModuleInvoker, PageStore};
@@ -35,12 +37,26 @@ use mwlib::Ctx;
 /// 50 MB, matching Scribunto's default Lua memory limit (plan §3.3).
 const DEFAULT_MEMORY_LIMIT: usize = 50 * 1024 * 1024;
 /// ~7 s of PUC Lua at a few hundred M instr/s: the CPU-time analogue is an
-/// instruction budget (mlua has no wall-clock hook). Deliberately coarse.
+/// instruction budget. Deliberately coarse.
 const DEFAULT_INSTRUCTION_BUDGET: u32 = 400_000_000;
+/// Wall-clock backstop for the invoked function. Independent of the
+/// instruction budget: even if instruction counting under-approximates the
+/// real cost, no invoke runs past this. Set well above the instruction
+/// budget's expected runtime so it never pre-empts normal execution.
+const DEFAULT_TIME_LIMIT: Duration = Duration::from_secs(15);
+/// Instructions between hook firings (wall-clock + budget checks). Small
+/// enough for ~ms wall-clock resolution, large enough that metering a
+/// normal invoke stays cheap.
+const HOOK_INTERVAL: u32 = 1_000_000;
+/// Message raised when either guard trips. Contains "time limit exceeded"
+/// so [`script_error_line`] surfaces it as the real cause.
+const LIMIT_MESSAGE: &str =
+    "Lua time limit exceeded: the invoked function ran too long or exceeded its instruction budget";
 
 pub struct LuaInvoker {
     memory_limit: usize,
     instruction_budget: u32,
+    time_limit: Duration,
     logs: RefCell<Vec<String>>,
     source_cache: RefCell<HashMap<String, Option<String>>>,
 }
@@ -56,9 +72,17 @@ impl LuaInvoker {
         LuaInvoker {
             memory_limit,
             instruction_budget,
+            time_limit: DEFAULT_TIME_LIMIT,
             logs: RefCell::new(Vec::new()),
             source_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Override the wall-clock backstop (tests use a small limit so the
+    /// time guard fires in milliseconds).
+    pub fn with_time_limit(mut self, time_limit: Duration) -> Self {
+        self.time_limit = time_limit;
+        self
     }
 
     /// Debug console output (`mw.log` / `mw.logObject`) collected across
@@ -94,6 +118,7 @@ impl LuaInvoker {
 
         let memory_limit = self.memory_limit;
         let budget = self.instruction_budget;
+        let deadline = Instant::now() + self.time_limit;
 
         lua.scope(|scope| {
             let main_frame = mwlib::install(&lua, scope, &ctx, frame)?;
@@ -113,15 +138,41 @@ impl LuaInvoker {
                 }
             };
 
-            // Meter the module function only.
+            // Meter the module function only. The hook fires periodically
+            // and enforces BOTH the instruction budget (a running total, so
+            // work hidden inside pcall still counts) and the wall-clock
+            // deadline.
+            //
+            // The error a hook raises is an ordinary catchable Lua error: a
+            // module can wrap risky work in `pcall` and swallow it, then loop
+            // again — the exact bypass that makes a plain periodic error no
+            // backstop at all. So once EITHER guard trips, the hook re-arms
+            // itself to fire every single instruction with a killer that
+            // ALWAYS errors. From then on, the moment control returns to any
+            // frame outside a pcall (which a runaway loop must reach, since a
+            // pcall that catches the error then returns to its caller), the
+            // error re-raises and escapes to this Rust caller within a couple
+            // of instructions. pcall can no longer make forward progress.
             let _ = lua.set_memory_limit(memory_limit);
+            let interval = budget.min(HOOK_INTERVAL).max(1);
+            let used = Rc::new(Cell::new(0u64));
             lua.set_hook(
-                HookTriggers::new().every_nth_instruction(budget),
-                |_lua, _debug| {
-                    Err::<VmState, LuaError>(LuaError::RuntimeError(
-                        "Lua time limit exceeded: the invoked function exceeded its instruction budget"
-                            .to_string(),
-                    ))
+                HookTriggers::new().every_nth_instruction(interval),
+                move |lua, _debug| {
+                    let total = used.get().saturating_add(interval as u64);
+                    used.set(total);
+                    if total >= budget as u64 || Instant::now() >= deadline {
+                        lua.set_hook(
+                            HookTriggers::new().every_nth_instruction(1),
+                            |_lua, _debug| {
+                                Err::<VmState, LuaError>(LuaError::RuntimeError(
+                                    LIMIT_MESSAGE.to_string(),
+                                ))
+                            },
+                        );
+                        return Err(LuaError::RuntimeError(LIMIT_MESSAGE.to_string()));
+                    }
+                    Ok(VmState::Continue)
                 },
             );
 

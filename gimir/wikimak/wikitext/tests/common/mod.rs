@@ -64,6 +64,7 @@ pub fn site() -> SiteConfig {
         rtl: false,
         namespaces,
         interwiki,
+        ..Default::default()
     }
 }
 

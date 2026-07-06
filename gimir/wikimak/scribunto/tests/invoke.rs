@@ -39,6 +39,7 @@ impl TestStore {
                 rtl: false,
                 namespaces,
                 interwiki: BTreeMap::new(),
+                ..Default::default()
             },
             tau_micros: 1_109_680_496 * 1_000_000,
         }
@@ -557,5 +558,79 @@ fn dangerous_globals_removed() {
     assert_eq!(
         invoke(&store, "Sb", "main", &f).unwrap(),
         "nil|nil|nil|nil|nil|function"
+    );
+}
+
+// -------------------------------------------------------- limit bypass guards
+
+// A module that wraps a runaway loop in pcall and loops again must NOT be
+// able to swallow the instruction-budget error indefinitely. Before the
+// re-arm fix this never returned (the periodic budget error was caught by
+// the inner pcall every time); now the guard becomes uncatchable once
+// tripped and the error escapes to the Rust caller.
+#[test]
+fn pcall_cannot_swallow_instruction_budget() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "Evil",
+        "return { main = function()
+            while true do pcall(function() while true do end end) end
+        end }",
+    );
+    // Small budget so the guard trips in milliseconds.
+    let inv = LuaInvoker::with_limits(50 * 1024 * 1024, 5_000_000);
+    let f = frame_with(&[]);
+    let err = inv.invoke("Evil", "main", &f, &store).unwrap_err();
+    assert!(
+        err.to_lowercase().contains("time limit") || err.contains("instruction"),
+        "got: {err}"
+    );
+}
+
+// Nested pcall walls (the loop lives inside two layers of pcall) also can't
+// hold the render thread: control eventually returns to the outermost,
+// unprotected frame where the re-armed every-instruction killer escapes.
+#[test]
+fn nested_pcall_cannot_swallow_budget() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "Evil2",
+        "return { main = function()
+            while true do
+                pcall(function()
+                    while true do pcall(function() while true do end end) end
+                end)
+            end
+        end }",
+    );
+    let inv = LuaInvoker::with_limits(50 * 1024 * 1024, 5_000_000);
+    let f = frame_with(&[]);
+    let err = inv.invoke("Evil2", "main", &f, &store).unwrap_err();
+    assert!(
+        err.to_lowercase().contains("time limit") || err.contains("instruction"),
+        "got: {err}"
+    );
+}
+
+// The wall-clock deadline is an independent backstop: with a huge
+// instruction budget but a tiny time limit, a plain infinite loop is still
+// bounded by wall time rather than instruction count.
+#[test]
+fn wall_clock_backstop_fires() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "Slow",
+        "return { main = function() while true do end end }",
+    );
+    let inv = LuaInvoker::with_limits(50 * 1024 * 1024, u32::MAX)
+        .with_time_limit(std::time::Duration::from_millis(200));
+    let start = std::time::Instant::now();
+    let f = frame_with(&[]);
+    let err = inv.invoke("Slow", "main", &f, &store).unwrap_err();
+    assert!(err.to_lowercase().contains("time limit"), "got: {err}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "wall-clock guard should fire quickly, took {:?}",
+        start.elapsed()
     );
 }

@@ -208,41 +208,24 @@ impl Instance {
         do_import(self, stream)
     }
 
-    /// Read the current head revision metadata for `page_id`.
+    /// Read the current head revision metadata for `page_id` — the
+    /// newest revision by timestamp.
+    ///
+    /// NOT the depot chain's f0 frame: f0 is the most-recently-*imported*
+    /// record, which is only the newest-by-time when revisions were
+    /// appended in chronological order. Out-of-order / cross-import
+    /// prepends (a later import supplying a gap revision) make f0 an older
+    /// revision, so the "current head" is computed as `argmax(ts)` over
+    /// the whole chain (via [`Instance::revision_at`] with `None` τ).
     pub fn page_head(&self, page_id: u64) -> Result<Option<RevisionMeta>> {
-        if page_id >= self.max_chain_id {
-            return Ok(None);
-        }
-        let g = self.inner.lock().expect("instance mutex poisoned");
-        match g.depot.read_f0(page_id) {
-            Ok(frame) => {
-                let bytes = crate::frames::decompress(&frame, None)?;
-                let (meta, _text) = decode_revision(&bytes)?;
-                Ok(Some(meta))
-            }
-            Err(wikimak_depot::Error::NoFrame) => Ok(None),
-            Err(wikimak_depot::Error::ChainIdOutOfRange) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        self.revision_at(page_id, None)
     }
 
     /// Read the current head revision's text bytes (UTF-8) for
-    /// `page_id`. `Ok(None)` if no such page.
+    /// `page_id` — the newest revision by timestamp (see [`page_head`]).
+    /// `Ok(None)` if no such page.
     pub fn page_head_text(&self, page_id: u64) -> Result<Option<Vec<u8>>> {
-        if page_id >= self.max_chain_id {
-            return Ok(None);
-        }
-        let g = self.inner.lock().expect("instance mutex poisoned");
-        match g.depot.read_f0(page_id) {
-            Ok(frame) => {
-                let bytes = crate::frames::decompress(&frame, None)?;
-                let (_meta, text) = decode_revision(&bytes)?;
-                Ok(Some(text))
-            }
-            Err(wikimak_depot::Error::NoFrame) => Ok(None),
-            Err(wikimak_depot::Error::ChainIdOutOfRange) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        self.page_text_at(page_id, None)
     }
 
     /// Iterate all revisions of `page_id`, newest-first.
@@ -388,40 +371,54 @@ impl Instance {
 
     /// Newest revision of `page_id` with timestamp ≤ `ts_micros`.
     ///
-    /// `None` τ → head. `Some(τ)` → walk the chain newest-first
-    /// ([`Instance::page_history`]) and return the first revision whose
-    /// timestamp is ≤ τ; `Ok(None)` when every revision is newer than τ
-    /// (the page did not yet exist at τ).
+    /// `None` τ → the newest revision overall. `Some(τ)` → the newest
+    /// revision whose timestamp is ≤ τ; `Ok(None)` when every revision is
+    /// newer than τ (the page did not yet exist at τ).
+    ///
+    /// The chain is walked in full and the answer chosen by `argmax` over
+    /// `(timestamp, rev_id)` — NOT the first record in chain order. Chain
+    /// order is import-prepend order, not timestamp order: an out-of-order
+    /// or cross-import gap revision (a later import supplying an earlier
+    /// revision) lands at the chain head, so "first with ts ≤ τ" would
+    /// return a non-newest revision. `argmax` is correct regardless of the
+    /// order revisions were imported in.
     pub fn revision_at(&self, page_id: u64, ts_micros: Option<i64>) -> Result<Option<RevisionMeta>> {
-        let ts = match ts_micros {
-            None => return self.page_head(page_id),
-            Some(ts) => ts,
-        };
+        let mut best: Option<RevisionMeta> = None;
         for entry in self.page_history(page_id)? {
-            let entry = entry?;
-            if entry.meta.ts.timestamp_micros() <= ts {
-                return Ok(Some(entry.meta));
+            let meta = entry?.meta;
+            if let Some(ts) = ts_micros {
+                if meta.ts.timestamp_micros() > ts {
+                    continue;
+                }
+            }
+            if best.as_ref().map_or(true, |b| rev_key(&meta) > rev_key(b)) {
+                best = Some(meta);
             }
         }
-        Ok(None)
+        Ok(best)
     }
 
     /// Text bytes of the revision selected by [`Instance::revision_at`].
     ///
-    /// Same newest-first walk; decodes only the chosen revision's text.
-    /// `None` τ → head text; `Ok(None)` when no revision is ≤ τ.
+    /// Same `argmax` selection; decodes only the chosen revision's text.
+    /// `None` τ → newest-revision text; `Ok(None)` when no revision is ≤ τ.
     pub fn page_text_at(&self, page_id: u64, ts_micros: Option<i64>) -> Result<Option<Vec<u8>>> {
-        let ts = match ts_micros {
-            None => return self.page_head_text(page_id),
-            Some(ts) => ts,
-        };
+        let mut best: Option<HistoryEntry> = None;
         for entry in self.page_history(page_id)? {
             let entry = entry?;
-            if entry.meta.ts.timestamp_micros() <= ts {
-                return Ok(Some((entry.fetch_text)()?));
+            if let Some(ts) = ts_micros {
+                if entry.meta.ts.timestamp_micros() > ts {
+                    continue;
+                }
+            }
+            if best.as_ref().map_or(true, |b| rev_key(&entry.meta) > rev_key(&b.meta)) {
+                best = Some(entry);
             }
         }
-        Ok(None)
+        match best {
+            Some(entry) => Ok(Some((entry.fetch_text)()?)),
+            None => Ok(None),
+        }
     }
 
     /// Existence of `title` at τ — the red-link / `#ifexist` fast path.
@@ -572,6 +569,13 @@ fn acquire_root_lock(root: &std::path::Path) -> Result<std::fs::File> {
 ///   - each cold frame is a sealed former accumulator, anchored on the
 ///     OLDEST record of the next-newer frame — which is exactly the
 ///     last record decoded so far in this newest-first walk.
+/// Total order used to pick the newest revision: latest timestamp wins,
+/// ties broken by higher rev_id. See [`Instance::revision_at`] for why
+/// chain position cannot be used instead.
+fn rev_key(m: &RevisionMeta) -> (i64, u64) {
+    (m.ts.timestamp_micros(), m.rev_id)
+}
+
 pub(crate) fn collect_records(depot: &Depot, chain_id: u64) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     match depot.read_f0(chain_id) {
