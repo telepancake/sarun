@@ -98,6 +98,16 @@ fn build_fixture(repo: &Path) -> Vec<String> {
     sh_git(repo, &["commit", "-q", "-m", "side commit"]);
     sh_git(repo, &["checkout", "-q", "main"]);
 
+    // Tags: simple annotated, unsigned multi-line with odd bytes,
+    // nested (tag→tag→commit), and a lightweight one alongside.
+    sh_git(repo, &["config", "tag.gpgsign", "false"]);
+    sh_git(repo, &["tag", "-a", "-m", "release one", "v1.0", "main~4"]);
+    sh_git(repo, &["tag", "-a", "-m",
+                   "multi-line message\n\nwith odd bytes: \x01\x02\téüλ\nand a trailing line",
+                   "v2.0", "main~1"]);
+    sh_git(repo, &["tag", "-a", "-m", "outer of nested", "nested", "refs/tags/v1.0"]);
+    sh_git(repo, &["tag", "lw", "main~2"]);
+
     sh_git(repo, &["for-each-ref", "--format=%(objectname) %(refname)"])
         .lines()
         .map(str::to_string)
@@ -105,6 +115,17 @@ fn build_fixture(repo: &Path) -> Vec<String> {
 }
 
 /// Recursive on-disk size of the store (depot files + sqlite).
+/// `for-each-ref`-shaped lines from export results: the ref's direct
+/// object (the tag object for annotated tags) + name.
+fn ref_lines(refs: &[gitdepot::RefMeta]) -> Vec<String> {
+    refs.iter()
+        .map(|r| {
+            let point = if r.tag_sha.is_empty() { &r.sha } else { &r.tag_sha };
+            format!("{point} {}", r.name)
+        })
+        .collect()
+}
+
 fn store_size(store: &Path) -> u64 {
     fn walk(p: &Path, total: &mut u64) {
         for e in std::fs::read_dir(p).unwrap().flatten() {
@@ -158,16 +179,30 @@ fn roundtrip_sha_exact_and_chain_compresses() {
         r.solid_full
     );
 
-    // Export and verify: every ref regenerates to the SAME commit id.
+    // Export and verify: every ref regenerates to the SAME object id —
+    // tag objects included.
     let refs_after = gitdepot::export(&store, &out).unwrap();
-    let mut after: Vec<String> = refs_after
-        .iter()
-        .map(|r| format!("{} {}", r.sha, r.name))
-        .collect();
+    let mut after = ref_lines(&refs_after);
     after.sort();
     let mut before = refs_before;
     before.sort();
-    assert_eq!(after, before, "round-trip changed commit ids");
+    assert_eq!(after, before, "round-trip changed ref object ids");
+
+    // The exported repo agrees byte-for-byte with the origin's
+    // for-each-ref, and both tag sha and peel round-trip.
+    let ffr = |repo: &Path| sh_git(repo, &["for-each-ref",
+        "--format=%(objectname) %(objecttype) %(refname)"]);
+    assert_eq!(ffr(&out), ffr(&repo), "exported for-each-ref differs");
+    for spec in ["refs/tags/v1.0", "refs/tags/v1.0^{}", "refs/tags/v2.0",
+                 "refs/tags/v2.0^{}", "refs/tags/nested", "refs/tags/nested^{}",
+                 "refs/tags/lw"] {
+        assert_eq!(sh_git(&out, &["rev-parse", spec]),
+                   sh_git(&repo, &["rev-parse", spec]),
+                   "{spec} did not round-trip");
+    }
+    // Nested chain really is tag→tag→commit in the export.
+    let raw = sh_git(&out, &["cat-file", "tag", "refs/tags/nested"]);
+    assert!(raw.contains("\ntype tag\n"), "nested tag lost its inner tag: {raw}");
 
     // And the exported repo is a valid, checkout-able repo.
     let head_doc = Command::new("git")
@@ -214,7 +249,7 @@ fn incremental_update_appends_and_exports_sha_exact() {
 
     // Round-trip: export regenerates every ref SHA-exactly.
     let refs_after = gitdepot::export(&store, &out).unwrap();
-    let mut after: Vec<String> = refs_after.iter().map(|r| format!("{} {}", r.sha, r.name)).collect();
+    let mut after = ref_lines(&refs_after);
     after.sort();
     let mut before = refs_now;
     before.sort();
@@ -365,8 +400,12 @@ fn mirror_loop_clones_updates_and_follows_rewrites() {
         .any(|r| r.name == "refs/heads/main" && r.sha == tip2));
 }
 
+/// The narrowed unsupported case: a tag whose peel ends at a TREE (the
+/// famous linux v2.6.11-tree shape) is refused with an error naming the
+/// ref, and the mirror loop aborts cleanly on it. Annotated tags at
+/// commits are in scope now — no blanket refusal.
 #[test]
-fn import_refuses_unsupported_shapes() {
+fn import_refuses_tag_at_tree_by_name() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -376,12 +415,91 @@ fn import_refuses_unsupported_shapes() {
     std::fs::write(repo.join("f"), "x").unwrap();
     sh_git(&repo, &["add", "-A"]);
     sh_git(&repo, &["commit", "-q", "-m", "c"]);
-    sh_git(&repo, &["tag", "-a", "-m", "annotated", "v1"]);
+    sh_git(&repo, &["tag", "-a", "-m", "tree tag", "treetag", "main^{tree}"]);
     match gitdepot::import(&repo, &tmp.path().join("store"), 3) {
-        Err(gitdepot::Error::Unsupported(_)) => {}
+        Err(gitdepot::Error::Unsupported(m)) => {
+            assert!(m.contains("refs/tags/treetag") && m.contains("tree"),
+                    "error must name the ref and the peeled type: {m}");
+        }
         Err(e) => panic!("expected Unsupported, got: {e}"),
-        Ok(_) => panic!("import of annotated-tag repo unexpectedly succeeded"),
+        Ok(_) => panic!("import of a tree-tag repo unexpectedly succeeded"),
     }
+    // The mirror loop surfaces the same refusal, cleanly.
+    match gitdepot::mirror(repo.to_str().unwrap(), &tmp.path().join("mirror")) {
+        Err(gitdepot::Error::Unsupported(m)) => assert!(m.contains("refs/tags/treetag")),
+        other => panic!("mirror should abort Unsupported, got {other:?}"),
+    }
+}
+
+/// Mirror loop end-to-end with annotated tags: create resolves peeled;
+/// upstream MOVES a tag → one reflog row (peeled movement, note "tag")
+/// + repointed ref + a new tag object; upstream DELETES a tag → ref
+/// row gone, reflog deletion row present, tag object still in chain.
+#[test]
+fn mirror_follows_tag_moves_and_deletions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    let root = tmp.path().join("mirror");
+    build_fixture(&origin);
+    gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    let store = root.join("store");
+
+    // resolve_ref by tag name returns the PEELED commit.
+    let peel = |name: &str| sh_git(&origin, &["rev-parse", &format!("{name}^{{}}")])
+        .trim().to_string();
+    let (v1_sha, _) = gitdepot::resolve_ref(&store, "v1.0").unwrap().unwrap();
+    assert_eq!(v1_sha, peel("refs/tags/v1.0"));
+    assert_eq!(gitdepot::resolve_ref(&store, "nested").unwrap().unwrap().0,
+               peel("refs/tags/nested"));
+    let n_tags_0 = {
+        let st = gitdepot::store::Store::open(&store).unwrap();
+        st.tag_records().unwrap().len()
+    };
+    // nested's inner object IS v1.0's tag object — dedup'd by sha.
+    assert_eq!(n_tags_0, 3, "expected v1.0 + v2.0 + nested outer");
+
+    // Upstream moves v2.0 to the tip.
+    sh_git(&origin, &["tag", "-f", "-a", "-m", "moved", "v2.0", "main"]);
+    gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    let new_peel = peel("refs/tags/v2.0");
+    assert_eq!(gitdepot::resolve_ref(&store, "v2.0").unwrap().unwrap().0, new_peel);
+    let log = gitdepot::store::reflog(&store).unwrap();
+    let mv = log.iter().rev()
+        .find(|e| e.refname == "refs/tags/v2.0" && e.new_commit_idx.is_some()
+              && e.old_commit_idx.is_some())
+        .expect("no move row for refs/tags/v2.0");
+    assert_eq!(mv.new_sha.as_deref(), Some(new_peel.as_str()));
+    assert_eq!(mv.note, "tag");
+    let st = gitdepot::store::Store::open(&store).unwrap();
+    assert_eq!(st.tag_records().unwrap().len(), n_tags_0 + 1,
+               "moved tag must mint one new tag object");
+    drop(st);
+
+    // Upstream deletes v1.0 (nested still holds the inner object).
+    let v1_tag = sh_git(&origin, &["rev-parse", "refs/tags/v1.0"]).trim().to_string();
+    sh_git(&origin, &["tag", "-d", "v1.0"]);
+    gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert!(gitdepot::resolve_ref(&store, "v1.0").unwrap().is_none());
+    let conn = rusqlite::Connection::open(store.join("meta.sqlite")).unwrap();
+    let live: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM refs WHERE name = 'refs/tags/v1.0'", [], |r| r.get(0)).unwrap();
+    assert_eq!(live, 0, "deleted tag must leave the refs table");
+    let log = gitdepot::store::reflog(&store).unwrap();
+    assert!(log.iter().rev().any(|e| e.refname == "refs/tags/v1.0"
+                                 && e.new_commit_idx.is_none()),
+            "no deletion row for refs/tags/v1.0");
+    let st = gitdepot::store::Store::open(&store).unwrap();
+    assert!(st.tag_records().unwrap().iter().any(|t| t.sha == v1_tag),
+            "deleted tag's object must stay in the chain");
+    drop(st);
+
+    // Export still carries the surviving tags SHA-exact (and the mirror
+    // reseed path rides export, so this covers buffer reseeding too).
+    let out = tmp.path().join("out");
+    let refs = gitdepot::export(&store, &out).unwrap();
+    assert!(refs.iter().any(|r| r.name == "refs/tags/v2.0" && !r.tag_sha.is_empty()));
+    assert_eq!(sh_git(&out, &["rev-parse", "refs/tags/nested"]),
+               sh_git(&origin, &["rev-parse", "refs/tags/nested"]));
 }
 
 /// §9 anti-sabotage, COST axis: the tiered-chain store promises prepend

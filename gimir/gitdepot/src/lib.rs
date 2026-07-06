@@ -26,14 +26,20 @@
 //! STABLE INDICES; full layout/discipline in `store.rs`):
 //!
 //! * `<dir>/depot/` — one tiered wikimak-depot instance (f0/f1/cold,
-//!   bounded prepend) holding three chains: TREES (reverse-delta tree
+//!   bounded prepend) holding four chains: TREES (reverse-delta tree
 //!   layers, tip full at f0), COMMITS (one object per commit — sha,
 //!   PARENT INDICES, tree index, author/committer/message — batched
 //!   one chain record per ingest), REFLOG (every observed ref movement,
-//!   deletions included, batched likewise).
-//! * `<dir>/meta.sqlite` (WAL) — kv (schema=3, label/url, the
+//!   deletions included, batched likewise), TAGS (one object per
+//!   annotated tag — sha, PEELED commit index, complete raw tag bytes
+//!   as the export-fidelity payload; nested tag→tag chains stored
+//!   inner-first). Tags peeling to a tree/blob are refused with a named
+//!   Unsupported — the only remaining unsupported ref shape.
+//! * `<dir>/meta.sqlite` (WAL) — kv (schema=4, label/url, the
 //!   authoritative per-chain record counts), refs (CURRENT refs only:
-//!   name → commit_idx + tree_idx) — NOTHING else: sha → idx is an
+//!   name → PEELED commit_idx + tree_idx, nullable tag_idx for
+//!   annotated tags — resolving/attaching by tag name yields the peeled
+//!   commit) — NOTHING else: sha → idx is an
 //!   in-RAM map derived by one commits-chain walk per open handle
 //!   (store.rs cost model), and tree dedup is parent-oid comparison
 //!   plus an intra-ingest map, never persisted.
@@ -65,8 +71,13 @@ pub use store::{commit_at, commit_count, label, resolve_ref};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RefMeta {
     pub name: String,
-    /// Commit id the ref points at (hex).
+    /// Commit id the ref points at (hex) — the PEELED commit for an
+    /// annotated tag.
     pub sha: String,
+    /// The annotated-tag object id when the ref is one; empty for
+    /// branches and lightweight tags.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag_sha: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -215,9 +226,10 @@ fn ls_tree(repo: &Path, commit: &str) -> Result<Vec<TreeEntry>> {
     Ok(entries)
 }
 
-/// Fetch every oid's content through ONE `git cat-file --batch` process.
-/// The oid→bytes map is the import's internal dedup (equal blobs read
-/// once) — the oids never reach a layer.
+/// Fetch every oid's raw content (any object type) through ONE
+/// `git cat-file --batch` process. The oid→bytes map is the import's
+/// internal dedup (equal blobs read once) — blob oids never reach a
+/// layer; tag oids ride the same batch pipe.
 fn fetch_blobs(
     repo: &Path,
     oids: impl IntoIterator<Item = String>,
@@ -413,30 +425,163 @@ pub struct ImportOutcome {
 /// adversarial (spam PRs merging foreign megahistories).
 fn collect_refs(repo: &Path) -> Result<Vec<RefMeta>> {
     let mut refs = Vec::new();
+    // %(*objectname)/%(*objecttype) = the FULLY-peeled target (empty for
+    // non-tag refs); refname last — it can't contain spaces.
     for line in git_str(
         repo,
-        &["for-each-ref", "--format=%(objectname) %(objecttype) %(refname)",
+        &["for-each-ref",
+          "--format=%(objectname) %(objecttype) %(*objectname) %(*objecttype) %(refname)",
           "refs/heads", "refs/tags"],
     )?
     .lines()
     {
-        let mut it = line.splitn(3, ' ');
-        let (sha, typ, name) = (
+        let mut it = line.splitn(5, ' ');
+        let (sha, typ, peeled, peeled_typ, name) = (
+            it.next().unwrap_or_default(),
+            it.next().unwrap_or_default(),
             it.next().unwrap_or_default(),
             it.next().unwrap_or_default(),
             it.next().unwrap_or_default(),
         );
-        if typ != "commit" {
-            return Err(Error::Unsupported(format!(
-                "ref {name} points at a {typ} (annotated tags are out of scope)"
-            )));
+        match typ {
+            "commit" => refs.push(RefMeta {
+                name: name.to_string(),
+                sha: sha.to_string(),
+                tag_sha: String::new(),
+            }),
+            "tag" => {
+                // %(*…) peels one level here (a nested tag shows
+                // peeled type "tag") — finish the peel ourselves.
+                let (peeled, peeled_typ) = if peeled_typ == "tag" {
+                    let full = git_str(repo, &["rev-parse", &format!("{name}^{{}}")])?
+                        .trim()
+                        .to_string();
+                    let typ = git_str(repo, &["cat-file", "-t", &full])?.trim().to_string();
+                    (full, typ)
+                } else {
+                    (peeled.to_string(), peeled_typ.to_string())
+                };
+                if peeled_typ != "commit" {
+                    return Err(Error::Unsupported(format!(
+                        "ref {name} is a tag that peels to a {peeled_typ} \
+                         (only commit-target tags are supported)"
+                    )));
+                }
+                refs.push(RefMeta {
+                    name: name.to_string(),
+                    sha: peeled,
+                    tag_sha: sha.to_string(),
+                });
+            }
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "ref {name} points at a {other}"
+                )));
+            }
         }
-        refs.push(RefMeta { name: name.to_string(), sha: sha.to_string() });
     }
     if refs.is_empty() {
         return Err(Error::Git("repository has no refs".into()));
     }
     Ok(refs)
+}
+
+/// `object`/`type` headers of a raw tag object.
+fn parse_tag_target(sha: &str, raw: &[u8]) -> Result<(String, String)> {
+    let (mut obj, mut typ) = (None, None);
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            break; // header/message split
+        }
+        if let Some(v) = line.strip_prefix(b"object ".as_slice()) {
+            obj = Some(String::from_utf8_lossy(v).into_owned());
+        } else if let Some(v) = line.strip_prefix(b"type ".as_slice()) {
+            typ = Some(String::from_utf8_lossy(v).into_owned());
+        }
+    }
+    match (obj, typ) {
+        (Some(o), Some(t)) => Ok((o, t)),
+        _ => Err(Error::Git(format!("tag {sha}: no object/type header"))),
+    }
+}
+
+struct TagObj {
+    sha: String,
+    /// The FULLY-peeled commit of the tag's chain.
+    target_commit: String,
+    raw: Vec<u8>,
+}
+
+/// Every tag object reachable from the annotated-tag refs, nested
+/// chains expanded, deduped, and ordered inner-first (an inner tag
+/// always precedes the outer one whose raw names it — the chain
+/// ingest/export order). Raw bytes come through one `cat-file --batch`
+/// per nesting level (fetch_blobs).
+fn collect_tag_objects(repo: &Path, refs: &[RefMeta]) -> Result<Vec<TagObj>> {
+    let mut outers: Vec<String> = refs
+        .iter()
+        .filter(|r| !r.tag_sha.is_empty())
+        .map(|r| r.tag_sha.clone())
+        .collect();
+    outers.sort();
+    outers.dedup();
+    // sha → (raw, target sha, target type), grown per nesting level.
+    let mut objs: BTreeMap<String, (Vec<u8>, String, String)> = BTreeMap::new();
+    let mut pending = outers.clone();
+    while !pending.is_empty() {
+        let mut next = Vec::new();
+        for (sha, raw) in fetch_blobs(repo, pending)? {
+            let (t_sha, t_typ) = parse_tag_target(&sha, &raw)?;
+            if t_typ == "tag" && !objs.contains_key(&t_sha) {
+                next.push(t_sha.clone());
+            }
+            objs.insert(sha, (raw, t_sha, t_typ));
+        }
+        pending = next;
+    }
+    let mut out = Vec::new();
+    let mut emitted = std::collections::BTreeSet::new();
+    for outer in &outers {
+        let mut chain = vec![outer.clone()];
+        loop {
+            let cur = chain.last().unwrap().clone();
+            let (_, t_sha, t_typ) = &objs[&cur];
+            match t_typ.as_str() {
+                "tag" => chain.push(t_sha.clone()),
+                "commit" => break,
+                // collect_refs already refused the ref by name; this
+                // backstops direct callers.
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "tag {cur} targets a {other} ({t_sha})"
+                    )))
+                }
+            }
+        }
+        let target_commit = objs[chain.last().unwrap()].1.clone();
+        for sha in chain.into_iter().rev() {
+            if emitted.insert(sha.clone()) {
+                out.push(TagObj {
+                    raw: objs[&sha].0.clone(),
+                    target_commit: target_commit.clone(),
+                    sha,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Stage the repo's NEW annotated-tag objects; must run AFTER the
+/// commit loop so every peeled target index resolves.
+fn ingest_tags(repo: &Path, ingest: &mut store::Ingest, refs: &[RefMeta]) -> Result<()> {
+    for t in collect_tag_objects(repo, refs)? {
+        if ingest.knows_tag(&t.sha)? {
+            continue;
+        }
+        ingest.add_tag(&t.sha, &t.target_commit, &t.raw)?;
+    }
+    Ok(())
 }
 
 /// All commits reachable from branches + tags, OLDEST-first (reversed
@@ -537,6 +682,7 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
         ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view, &full)?;
         commits.push(cm);
     }
+    ingest_tags(repo, &mut ingest, &refs)?;
     ingest.finish(&refs)?;
     commits.reverse(); // Meta stays newest-first.
 
@@ -669,6 +815,7 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
         ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view, &full)?;
         k += 1;
     }
+    ingest_tags(repo, &mut ingest, &refs)?;
     ingest.finish(&refs)?;
     Ok(UpdateOutcome {
         new_commits: k,
@@ -973,6 +1120,9 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
     let sha_to_idx: std::collections::HashMap<&str, u64> =
         recs.iter().map(|r| (r.sha.as_str(), r.idx)).collect();
     for r in &refs {
+        if !r.tag_sha.is_empty() {
+            continue; // annotated tag: written after fast-import, below
+        }
         let mark = sha_to_idx
             .get(r.sha.as_str())
             .and_then(|i| commit_marks.get(i))
@@ -997,18 +1147,55 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    // Drop the scratch ref; verify SHA fidelity per real ref.
+    // Drop the scratch ref; then rebuild the tag objects.
     let _ = git(repo, &["update-ref", "-d", "refs/gitdepot/import"]);
-    let mut result = Vec::new();
-    for r in &refs {
-        let got = git_str(repo, &["rev-parse", &r.name])?.trim().to_string();
-        if got != r.sha {
-            return Err(Error::Meta(format!(
-                "fidelity check failed: {} regenerated as {got}, imported as {}",
-                r.name, r.sha
+    // Stored raw tag bytes are valid as-is: the `object <sha>` line
+    // names a commit (or inner tag) fast-import regenerated SHA-exact.
+    // Oldest-first = inner-before-outer for nested chains. --literally
+    // skips git's format lint (historical tags predate it); fidelity is
+    // OUR check — the produced id must equal the imported one.
+    for t in &st.tag_records()? {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["hash-object", "-t", "tag", "-w", "--stdin", "--literally"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().expect("piped stdin").write_all(&t.raw)?;
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            return Err(Error::Git(format!(
+                "hash-object tag {}: {}",
+                t.sha,
+                String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
-        result.push(RefMeta { name: r.name.clone(), sha: got });
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if got != t.sha {
+            return Err(Error::Meta(format!(
+                "fidelity check failed: tag object regenerated as {got}, imported as {}",
+                t.sha
+            )));
+        }
+    }
+    // Verify SHA fidelity per real ref (annotated tag refs point at
+    // their tag object; the rest at their commit).
+    let mut result = Vec::new();
+    for r in &refs {
+        if !r.tag_sha.is_empty() {
+            git(repo, &["update-ref", &r.name, &r.tag_sha])?;
+        }
+        let expected = if r.tag_sha.is_empty() { &r.sha } else { &r.tag_sha };
+        let got = git_str(repo, &["rev-parse", &r.name])?.trim().to_string();
+        if got != *expected {
+            return Err(Error::Meta(format!(
+                "fidelity check failed: {} regenerated as {got}, imported as {expected}",
+                r.name
+            )));
+        }
+        result.push(r.clone());
     }
     Ok(result)
 }
