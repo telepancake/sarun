@@ -96,17 +96,23 @@ under any layering), then: (7) chain features promoted into the depot
 trait surface + VBF variant behind it — acceptance test already in
 the tree: gitdepot roundtrip.rs update_io_is_bounded_not_o_history
 (#[ignore]d, documents the flat chain's O(history)-per-prepend
-sabotage; must pass un-ignored when the store tiers). For git this
-variant must be MULTI-CHAIN (2026-07-06, user finding): one linear
-chain over rev-list --branches --tags means ANY side-ref rewrite on a
-busy repo is a global non-FF → full re-import (linux: daily). Target:
-a SPINE chain (default branch first-parent — prepend-only in
-practice), SIDE chains per divergent lineage anchored at fork-point
-records, tags as pure ref rows; a side rewrite adds records to one
-chain, a spine rewrite starts a new spine chain in the SAME store —
-no event ever copies a store. Interim (landed): retirement is
-conditional on unique history — a rewrite that orphans no commits
-drops the redundant copy (reflogged), one that does keeps exactly
-that copy —, (8) depot verbs on the UDS,
+sabotage; must pass un-ignored when the store tiers). For git the
+design of record is THREE CHAINS + STABLE INDICES (2026-07-06, user
+design; supersedes the earlier spine/side-chain sketch): one tiered
+store (wikimak-depot chains — bounded prepend for free) holding a
+trees chain, a commits chain, and a reflog chain. Records get stable
+indices counted from the OLDEST end — prepend-invariant by
+construction (record k = frame N-1-k from the head; meta keeps N).
+Refs table = CURRENT refs only, (name → commit_idx, tree_idx) — no
+shas in refs, no deleted_at: every ref movement (incl. deletion)
+first prepends the old row to the reflog chain, then updates the
+current table. A rewrite is new records + repointed refs; old
+records keep their indices forever — no non-FF path, no re-import,
+no retirement, no salvage check (all three interim mechanisms get
+DELETED by this chip). Commit records carry parent indices (lineage
+lives in the data, not in storage topology) and the sha as the
+export-fidelity payload; a sha→idx sqlite index exists only as a
+derived, rebuildable import-dedup aid. refPrefix anchoring locality
+within the trees chain is an optimization detail, not structure —, (8) depot verbs on the UDS,
 (9) first script-driven mirror (ietf is smallest) proving the loop,
 (10) wikipedia logic migrated, dump-scan as an engine service.
