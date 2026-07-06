@@ -32,3 +32,28 @@ Diagnosis:
       compression, bounds walk to K steps, +1 full record per K.
   They compose: checkpoints + delta-anchoring between them is the
   likely end state (K trades size vs worst-case access).
+
+## 2026-07-06 — in-place walk (apply_mut)
+
+Fix landed: `depot::apply_mut` (in-place O(delta) apply, property-tested
+equal to `apply`) + `Store::walk_tree_views` keeps ONE working view
+mutated per record instead of a fresh full `apply` + Vec of every
+intermediate view. Anchoring discipline and on-disk format unchanged
+(the full-view re-encode remains once per cold frame; byte-fidelity
+pinned by `tree_walk_matches_apply_reference_byte_exact`).
+
+Fixture regenerated per the recipe above (seed 7, 500 commits / 800
+files / 23.4MB tree; pack 12.8MiB; store 28M — the 4MiB depot file
+threshold is already in). Same store, same deep sha (main~400):
+
+| op | before | after |
+|---|---|---|
+| resolve_ref | 8.3ms | 9.8ms |
+| tip decode + root ls | 67ms | 80ms |
+| tip full 800-file walk | 0.46ms | 0.49ms |
+| tree 400 deep | 16.3s | **0.45s** ✓ |
+
+(16.3s not 32s pre-fix here: this store was written with the 4MiB file
+threshold, so its cold tier differs from the original 2026-07-06 run;
+same pathology, same O(depth × tree) shape.) Deep access is now ~1ms/step
++ one full-view re-encode per cold frame — well under the 2s target.

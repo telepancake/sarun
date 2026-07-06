@@ -679,3 +679,50 @@ fn successive_rewrites_never_copy_the_store() {
                    "rewritten-away tip no longer resolvable");
     }
 }
+
+#[test]
+fn tree_walk_matches_apply_reference_byte_exact() {
+    // Read fidelity: the in-place walk (apply_mut, one working view)
+    // must reconstruct, byte-for-byte in canonical encoding, exactly
+    // what depot::apply-based reference reconstruction yields from the
+    // same stored records — the write path is untouched, so this pins
+    // byte-compatibility with pre-existing v2 stores.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let store = tmp.path().join("store");
+    build_fixture(&repo);
+    gitdepot::import(&repo, &store, 3).unwrap();
+
+    let st = gitdepot::store::Store::open(&store).unwrap();
+    let mut recs: Vec<Vec<u8>> = Vec::new();
+    let mut walked: Vec<depot::View> = Vec::new();
+    st.walk_tree_views(None, &mut |_, rec, view| {
+        recs.push(rec.to_vec());
+        walked.push(view.clone());
+    })
+    .unwrap();
+    assert_eq!(recs.len() as u64, st.count(gitdepot::store::TREES).unwrap());
+
+    let mut reference: Option<depot::View> = None;
+    for (i, rec) in recs.iter().enumerate() {
+        let layer = depot::codec::decode(rec).unwrap();
+        reference = depot::apply(reference.as_ref(), &layer);
+        let want = reference.as_ref().expect("reference view resolves");
+        assert_eq!(
+            depot::codec::encode(&depot::diff(None, Some(&walked[i]))),
+            depot::codec::encode(&depot::diff(None, Some(want))),
+            "walked view at newest-first position {i} diverges from apply reference"
+        );
+    }
+
+    // Point reads (the deep-access path) agree with the full walk.
+    let n = recs.len();
+    for idx in [0usize, n / 2, n - 1] {
+        let v = st.tree_view(idx as u64).unwrap();
+        assert_eq!(
+            depot::codec::encode(&depot::diff(None, Some(&v))),
+            depot::codec::encode(&depot::diff(None, Some(&walked[n - 1 - idx]))),
+            "tree_view({idx}) diverges from the full walk"
+        );
+    }
+}

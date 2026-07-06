@@ -570,64 +570,83 @@ impl Store {
         Ok(out)
     }
 
-    /// Walk the TREES chain newest-first, reconstructing views. Stops
-    /// after newest-first position `until_pos` when given. Cold anchors
-    /// are the canonical full-view bytes at the frame boundary,
-    /// recomputed from the walked view.
-    pub fn tree_views(&self, until_pos: Option<usize>) -> Result<Vec<depot::View>> {
+    /// Walk the TREES chain newest-first, reconstructing views into ONE
+    /// working view mutated in place per record (O(delta) per step —
+    /// only the frame-boundary anchor re-encode is O(tree), once per
+    /// cold frame). `visit(pos, record, view)` per position; stops after
+    /// newest-first position `until_pos` when given. Cold anchors are
+    /// the canonical full-view bytes at the frame boundary, recomputed
+    /// from the walked view. Public for the read-fidelity tests.
+    #[doc(hidden)]
+    pub fn walk_tree_views(
+        &self,
+        until_pos: Option<usize>,
+        visit: &mut dyn FnMut(usize, &[u8], &depot::View),
+    ) -> Result<()> {
         let Some(head) = self.read_head(TREES)? else {
-            return Ok(Vec::new());
+            return Ok(());
         };
-        let head_layer = depot::codec::decode(&head)?;
-        let head_view = depot::apply(None, &head_layer)
-            .ok_or_else(|| Error::Chain("tree head resolves to nothing".into()))?;
-        let mut views = vec![head_view];
-        let stop = |views: &Vec<depot::View>| until_pos.is_some_and(|p| views.len() > p);
-        if stop(&views) {
-            return Ok(views);
+        let mut cur: Option<depot::View> = None;
+        let mut pos: usize = 0;
+        let mut step = |cur: &mut Option<depot::View>, pos: &mut usize, rec: &[u8]| -> Result<bool> {
+            let layer = depot::codec::decode(rec)?;
+            depot::apply_mut(cur, &layer);
+            let view = cur.as_ref().ok_or_else(|| {
+                Error::Chain(format!("tree frame {pos} resolves to nothing"))
+            })?;
+            visit(*pos, rec, view);
+            *pos += 1;
+            Ok(until_pos.is_some_and(|p| *pos > p))
+        };
+        if step(&mut cur, &mut pos, &head)? {
+            return Ok(());
         }
-        let apply_raw = |views: &mut Vec<depot::View>, raw: &[u8]| -> Result<bool> {
-            for rec in split_records(raw)? {
-                let layer = depot::codec::decode(&rec)?;
-                let view = depot::apply(views.last(), &layer).ok_or_else(|| {
-                    Error::Chain(format!("tree frame {} resolves to nothing", views.len()))
-                })?;
-                views.push(view);
-                if until_pos.is_some_and(|p| views.len() > p) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        };
         if let Some(f1) = self.depot.read_f1(TREES).map_err(|e| Error::Chain(e.to_string()))? {
             let raw = decompress(&f1, Some(&head))?;
-            if apply_raw(&mut views, &raw)? {
-                return Ok(views);
+            for rec in split_records(&raw)? {
+                if step(&mut cur, &mut pos, &rec)? {
+                    return Ok(());
+                }
             }
         }
         for cold in self.depot.cold_iter(TREES).map_err(|e| Error::Chain(e.to_string()))? {
             let frame = cold.map_err(|e| Error::Chain(e.to_string()))?;
-            let anchor = depot::codec::encode(&depot::diff(None, Some(views.last().unwrap())));
+            let anchor =
+                depot::codec::encode(&depot::diff(None, cur.as_ref()));
             let raw = decompress(&frame, Some(&anchor))?;
-            if apply_raw(&mut views, &raw)? {
-                return Ok(views);
+            for rec in split_records(&raw)? {
+                if step(&mut cur, &mut pos, &rec)? {
+                    return Ok(());
+                }
             }
         }
+        Ok(())
+    }
+
+    /// All walked views newest-first (down to `until_pos` inclusive when
+    /// given) — O(count × tree) RAM by construction; only for callers
+    /// that genuinely need every view (export, migration fixtures).
+    pub fn tree_views(&self, until_pos: Option<usize>) -> Result<Vec<depot::View>> {
+        let mut views = Vec::new();
+        self.walk_tree_views(until_pos, &mut |_, _, v| views.push(v.clone()))?;
         Ok(views)
     }
 
-    /// The view of tree `tree_idx` (stable index).
+    /// The view of tree `tree_idx` (stable index) — walks head→idx, one
+    /// working view, returns only the target.
     pub fn tree_view(&self, tree_idx: u64) -> Result<depot::View> {
         let n = self.count(TREES)?;
         if tree_idx >= n {
             return Err(Error::Chain(format!("no tree at index {tree_idx}")));
         }
-        let pos = (n - 1 - tree_idx) as usize;
-        let mut views = self.tree_views(Some(pos))?;
-        views
-            .pop()
-            .filter(|_| true)
-            .ok_or_else(|| Error::Chain(format!("tree walk fell short of index {tree_idx}")))
+        let target = (n - 1 - tree_idx) as usize;
+        let mut out = None;
+        self.walk_tree_views(Some(target), &mut |pos, _, v| {
+            if pos == target {
+                out = Some(v.clone());
+            }
+        })?;
+        out.ok_or_else(|| Error::Chain(format!("tree walk fell short of index {tree_idx}")))
     }
 
     /// Flush the depot durable, then run `stage` inside one sqlite

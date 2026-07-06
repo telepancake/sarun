@@ -229,6 +229,46 @@ pub fn apply(base: Option<&View>, layer: &Layer) -> Option<View> {
     apply_node(base, &layer.root)
 }
 
+/// In-place [`apply`]: only the names the delta records are touched, so
+/// the cost is O(delta), not O(view). Must agree with `apply` bit-for-bit
+/// (property-tested); `apply` stays the semantic reference.
+fn apply_node_mut(slot: &mut Option<View>, node: &Node) {
+    if node.presence == Presence::Tombstone {
+        *slot = None;
+        return;
+    }
+    let mut v = slot.take().unwrap_or_default();
+    match &node.blob {
+        BlobOp::Keep => {}
+        BlobOp::Set(bytes) => v.blob = Some(bytes.clone()),
+        BlobOp::Remove => v.blob = None,
+    }
+    if let Some(map) = &node.attrs {
+        v.attrs = map.clone();
+    }
+    if node.opaque {
+        v.children.clear();
+    }
+    for (name, child_node) in &node.children {
+        let mut child = v.children.remove(name);
+        apply_node_mut(&mut child, child_node);
+        if let Some(c) = child {
+            v.children.insert(name.clone(), c);
+        }
+    }
+    // Same canonical-form rule as apply_node: empty nodes don't exist.
+    *slot = if v.blob.is_none() && v.attrs.is_empty() && v.children.is_empty() {
+        None
+    } else {
+        Some(v)
+    };
+}
+
+/// Overlay a layer on a view in place — `apply`, O(delta).
+pub fn apply_mut(base: &mut Option<View>, layer: &Layer) {
+    apply_node_mut(base, &layer.root);
+}
+
 /// Resolve a stack of layers, listed lower-first, into its effective view
 /// over NOTHING (the empty backdrop), by folding `apply`. ONLY valid for
 /// stacks with no backdrop-anchored nodes: `apply` cannot distinguish

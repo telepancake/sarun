@@ -436,6 +436,27 @@ fn randomized_diff_and_rotation_laws() {
     }
 }
 
+#[test]
+fn randomized_apply_mut_matches_apply() {
+    // apply is the reference; apply_mut must agree on every intermediate
+    // view of a folded stack (random_layer covers set/remove/tombstone/
+    // opaque/attrs/interior-blob nodes).
+    for seed in 1..300u64 {
+        let mut rng = Rng(seed);
+        let mut view: Option<View> = if rng.below(4) == 0 {
+            None
+        } else {
+            resolve(&[&random_layer(&mut rng)])
+        };
+        for step in 0..4 {
+            let layer = random_layer(&mut rng);
+            let reference = apply(view.as_ref(), &layer);
+            depot::apply_mut(&mut view, &layer);
+            assert_eq!(view, reference, "apply_mut diverges, seed {seed} step {step}");
+        }
+    }
+}
+
 // ----------------------------------------------------- holes / backdrop
 
 /// A hole is "this key is not occluded": the backdrop shows through LIVE
