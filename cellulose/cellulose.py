@@ -26,6 +26,7 @@ Deps: websocket-client, fonttools, pillow. Chromium/Chrome/headless_shell
 is found via $CELLULOSE_BROWSER or common locations.
 """
 
+import codecs
 import io
 import json
 import os
@@ -38,7 +39,7 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.request
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cellfont import char_cells, font_data_url
@@ -137,11 +138,7 @@ class CDP:
             try:
                 msg = json.loads(self.ws.recv())
             except Exception:
-                self.closed = True
-                with self.lock:
-                    for ev, slot in self.pending.values():
-                        slot.append({"error": {"message": "connection closed"}})
-                        ev.set()
+                self._fail_all()
                 return
             if "id" in msg:
                 with self.lock:
@@ -157,19 +154,33 @@ class CDP:
         ev = threading.Event()
         slot = []
         with self.lock:
+            if self.closed:
+                raise RuntimeError(f"{method}: connection closed")
             mid = self.next_id
             self.next_id += 1
             self.pending[mid] = (ev, slot)
         req = {"id": mid, "method": method, "params": params or {}}
         if session:
             req["sessionId"] = session
-        self.ws.send(json.dumps(req))
+        try:
+            self.ws.send(json.dumps(req))
+        except Exception:
+            self._fail_all()
+            raise RuntimeError(f"{method}: connection closed")
         if not ev.wait(timeout):
             raise TimeoutError(f"CDP call timed out: {method}")
         msg = slot[0]
         if "error" in msg:
             raise RuntimeError(f"{method}: {msg['error'].get('message')}")
         return msg.get("result", {})
+
+    def _fail_all(self):
+        with self.lock:
+            self.closed = True
+            pending, self.pending = self.pending, {}
+        for ev, slot in pending.values():
+            slot.append({"error": {"message": "connection closed"}})
+            ev.set()
 
     def drain_events(self):
         with self.lock:
@@ -209,24 +220,35 @@ class Browser:
         self.proc = subprocess.Popen(
             args, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL
         )
-        ws_url = self._wait_for_ws()
-        self.cdp = CDP(ws_url)
-        self.session = self._attach_first_page()
-        self._setup()
+        try:
+            ws_url = self._wait_for_ws()
+            self.cdp = CDP(ws_url)
+            self.session = self._attach_first_page()
+            self._setup()
+        except BaseException:
+            self.proc.kill()
+            shutil.rmtree(self.profile, ignore_errors=True)
+            raise
 
     def _wait_for_ws(self):
+        fd = self.proc.stderr.fileno()
         deadline = time.time() + 30
-        for line in self.proc.stderr:
-            m = re.search(rb"DevTools listening on (ws://\S+)", line)
+        buf = b""
+        while time.time() < deadline:
+            if not select.select([fd], [], [], 0.5)[0]:
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            buf += chunk
+            m = re.search(rb"DevTools listening on (ws://\S+)", buf)
             if m:
-                # stop consuming stderr so chromium never blocks on a full pipe
+                # keep draining stderr so chromium never blocks on a full pipe
                 threading.Thread(
                     target=lambda: [None for _ in self.proc.stderr], daemon=True
                 ).start()
                 return m.group(1).decode()
-            if time.time() > deadline:
-                break
-        sys.exit("cellulose: browser did not expose a DevTools socket")
+        raise RuntimeError("cellulose: browser did not expose a DevTools socket")
 
     def _attach_first_page(self):
         for _ in range(100):
@@ -238,7 +260,7 @@ class Browser:
                     {"targetId": pages[0]["targetId"], "flatten": True},
                 )["sessionId"]
             time.sleep(0.05)
-        sys.exit("cellulose: no page target appeared")
+        raise RuntimeError("cellulose: no page target appeared")
 
     def _setup(self):
         s = self.session
@@ -266,9 +288,10 @@ class Browser:
         )
 
     def navigate(self, url):
-        if "://" not in url:
+        if not re.match(r"[a-z][a-z0-9+.-]*:", url):  # data:, about:, file://…
             url = "https://" + url
-        self.cdp.call("Page.navigate", {"url": url}, session=self.session)
+        res = self.cdp.call("Page.navigate", {"url": url}, session=self.session)
+        return res.get("errorText")
 
     def wait_load(self, timeout=15):
         deadline = time.time() + timeout
@@ -336,12 +359,24 @@ class Browser:
             col = int(round((x - sx) / CELL_W))
             if row < 0 or row >= self.rows:
                 continue
-            for ch in strings[ti][start : start + length]:
-                if col >= self.cols:
+            # start/length are UTF-16 code units (CDP InlineTextBox semantics)
+            seg = (
+                strings[ti]
+                .encode("utf-16-le", "surrogatepass")[2 * start : 2 * (start + length)]
+                .decode("utf-16-le", "surrogatepass")
+            )
+            for ch in seg:
+                cells = char_cells(ch)
+                if col + cells > self.cols:
                     break
-                if ch not in ("\n", "\r", "\t"):
-                    out.append((row, col, ch, color))
-                col += char_cells(ch)
+                # controls/escapes must never reach the terminal; formatting
+                # chars, lone surrogates, and combining marks would occupy a
+                # layout cell (the cell font gives everything an advance) but
+                # print zero-or-other width, shifting the row
+                if unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Mn", "Me"):
+                    ch = " "
+                out.append((row, col, ch, color))
+                col += cells
         return out
 
     def scroll(self, dy_cells):
@@ -458,6 +493,8 @@ def interactive(browser):
     out.write("\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h")
     dirty = True
     url_edit = None  # None = browsing; str = editing URL
+    buf = b""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
     try:
         tty.setraw(fd)
         while True:
@@ -474,41 +511,74 @@ def interactive(browser):
             if not ready:
                 dirty = True  # periodic refresh picks up page changes
                 continue
-            data = os.read(fd, 64)
+            buf += os.read(fd, 4096)
             dirty = True
-            if url_edit is not None:
-                url_edit = handle_url_edit(browser, url_edit, data)
-                continue
-            if data == b"\x11":  # Ctrl-Q
-                return
-            if data == b"\x0c":  # Ctrl-L
-                url_edit = ""
-            elif data == b"\x12":  # Ctrl-R
-                browser.cdp.call("Page.reload", session=browser.session)
-            elif data == b"\x1b[A":
-                browser.scroll(-3)
-            elif data == b"\x1b[B":
-                browser.scroll(3)
-            elif data == b"\x1b[5~":
-                browser.scroll(-(browser.rows - 2))
-            elif data == b"\x1b[6~":
-                browser.scroll(browser.rows - 2)
-            elif data.startswith(b"\x1b[<"):
-                m = re.match(rb"\x1b\[<(\d+);(\d+);(\d+)([mM])", data)
-                if m and m.group(4) == b"M" and int(m.group(1)) == 0:
-                    browser.click(int(m.group(2)) - 1, int(m.group(3)) - 1)
-            elif data == b"\r":
-                browser.key("Enter", "Enter", 13, "\r")
-            elif data == b"\t":
-                browser.key("Tab", "Tab", 9)
-            elif data == b"\x7f":
-                browser.key("Backspace", "Backspace", 8)
-            elif not data.startswith(b"\x1b"):
-                browser.type_text(data.decode("utf-8", "replace"))
+            while buf:
+                tok, buf = next_token(buf)
+                if tok is None:
+                    break  # incomplete sequence, wait for more bytes
+                if url_edit is not None:
+                    url_edit = handle_url_edit(browser, url_edit, tok)
+                    continue
+                if tok == b"\x11":  # Ctrl-Q
+                    return
+                if tok == b"\x0c":  # Ctrl-L
+                    url_edit = ""
+                elif tok == b"\x12":  # Ctrl-R
+                    browser.cdp.call("Page.reload", session=browser.session)
+                elif tok == b"\x1b[A":
+                    browser.scroll(-3)
+                elif tok == b"\x1b[B":
+                    browser.scroll(3)
+                elif tok == b"\x1b[5~":
+                    browser.scroll(-(browser.rows - 2))
+                elif tok == b"\x1b[6~":
+                    browser.scroll(browser.rows - 2)
+                elif tok.startswith(b"\x1b[<"):
+                    m = re.match(rb"\x1b\[<(\d+);(\d+);(\d+)([mM])", tok)
+                    if m and m.group(4) == b"M" and int(m.group(1)) == 0:
+                        browser.click(int(m.group(2)) - 1, int(m.group(3)) - 1)
+                elif tok == b"\r":
+                    browser.key("Enter", "Enter", 13, "\r")
+                elif tok == b"\t":
+                    browser.key("Tab", "Tab", 9)
+                elif tok == b"\x7f":
+                    browser.key("Backspace", "Backspace", 8)
+                elif not tok.startswith(b"\x1b"):
+                    text = decoder.decode(tok)
+                    if text:
+                        browser.type_text(text)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         out.write("\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?1049l")
         out.flush()
+
+
+def next_token(buf):
+    """Split one input token off the front of the tty byte buffer.
+
+    Tokens: a single control byte, one complete escape sequence, or a run
+    of printable bytes (possibly a partial UTF-8 char — the incremental
+    decoder downstream handles splits). Returns (None, buf) when the buffer
+    holds only an incomplete escape sequence.
+    """
+    if buf[0:1] == b"\x1b":
+        if buf == b"\x1b":
+            return buf, b""  # a lone ESC press
+        if buf[1:2] == b"[":
+            m = re.match(rb"\x1b\[[0-9;<]*[@-~]", buf)
+            if m:
+                return m.group(0), buf[m.end():]
+            if len(buf) < 32:
+                return None, buf  # CSI sequence still arriving
+            return buf[:1], buf[1:]  # garbage; drop the ESC
+        return buf[:2], buf[2:]  # alt-modified key
+    if buf[0] < 0x20 or buf[0] == 0x7F:
+        return buf[:1], buf[1:]
+    n = 1
+    while n < len(buf) and buf[n] != 0x1B and not (buf[n] < 0x20 or buf[n] == 0x7F):
+        n += 1
+    return buf[:n], buf[n:]
 
 
 def handle_url_edit(browser, buf, data):
@@ -534,6 +604,7 @@ def draw_screen(browser, out, url_edit):
         status = f" url: {url_edit}_"
     else:
         status = f" {title}  {url}  [^L url ^R reload ^Q quit]"
+    status = "".join(c if c >= " " else " " for c in status)  # page-controlled
     status = status[: browser.cols].ljust(browser.cols)
     out.write("\x1b[H" + buf.getvalue().replace("\n", "\r\n"))
     out.write("\x1b[7m" + status + "\x1b[0m")
@@ -569,19 +640,28 @@ def main():
 
     browser = Browser(cols, rows)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    status = 0
     try:
-        browser.navigate(url)
+        err = browser.navigate(url)
         browser.wait_load()
         time.sleep(0.3)  # let injected style settle and fonts apply
+        if err:
+            print(f"cellulose: navigation failed: {err}", file=sys.stderr)
+            status = 2
         if mode == "interactive":
             if not sys.stdin.isatty():
                 sys.exit("cellulose: interactive mode needs a tty; try --dump")
             interactive(browser)
         else:
             grid = compose_frame(browser)
-            (render_ansi if mode == "dump" else render_text)(grid, sys.stdout)
+            try:
+                (render_ansi if mode == "dump" else render_text)(grid, sys.stdout)
+            except BrokenPipeError:
+                # reader (e.g. `| head`) went away; not an error
+                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
     finally:
         browser.close()
+    sys.exit(status)
 
 
 if __name__ == "__main__":
