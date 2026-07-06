@@ -41,6 +41,7 @@ mod hostfs;
 mod jobserver;
 mod katirun;
 mod attach;
+mod browser;
 mod mirrors;
 mod n2run;
 mod net;
