@@ -51,9 +51,16 @@ pub enum Error {
     #[error("index size mismatch")]
     IndexSizeMismatch,
 
-    /// A frame's zstd payload is too large for the on-disk `u32` length.
+    /// A frame would push a data file past the 48-bit pointer offset
+    /// space (256TB per file).
     #[error("frame too large")]
     FrameTooLarge,
+
+    /// The depot on disk was written by a different on-disk format
+    /// version (the `format` file at the depot root is missing or
+    /// mismatched). No migrations: delete and re-import.
+    #[error("{0}")]
+    Format(String),
 
     /// Catch-all for invariant violations the depot detects on disk.
     #[error("corrupt: {0}")]
@@ -62,7 +69,7 @@ pub enum Error {
 
 /// Configuration for opening a depot.
 pub struct DepotConfig {
-    /// Root directory holding `index`, `f0/`, `f1/`, `cold/cold`.
+    /// Root directory holding `format`, `index`, `f0/`, `f1/`, `cold/cold`.
     pub root: PathBuf,
     /// Maximum chain id; the index is sized at `max_chain_id * 8` bytes.
     pub max_chain_id: u64,

@@ -19,12 +19,17 @@ use common::{cfg, list_files, payload};
 // ---------------------------------------------------------------------------
 
 /// Frame header size pinned by SPEC §"Frame format":
-/// `[u64 chain_id LE | u64 next_pointer LE | u32 zstd_len LE]`.
-const FRAME_HEADER_LEN: usize = 20;
+/// `[u64 chain_id LE | u64 next_pointer LE | u64 zstd_len LE]`.
+const FRAME_HEADER_LEN: usize = 24;
 
-/// Index entry size pinned by SPEC §"Index":
-/// `[u32 file_id LE | u32 offset LE]`.
+/// Index entry size pinned by SPEC §"Index": one u64 LE packing
+/// `file_id` (low 16 bits) and `offset` (high 48 bits).
 const INDEX_ENTRY_LEN: usize = 8;
+
+/// Split a pointer word into (file_id, offset).
+fn unpack_ptr(ptr: u64) -> (u32, u64) {
+    ((ptr & 0xFFFF) as u32, ptr >> 16)
+}
 
 // ---------------------------------------------------------------------------
 // open_creates_layout
@@ -808,8 +813,8 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
 // ---------------------------------------------------------------------------
 // frame_header_layout
 //
-// Pin the on-disk frame header at 20 bytes:
-// `[u64 chain_id LE | u64 next_pointer LE | u32 zstd_len LE]`, followed
+// Pin the on-disk frame header at 24 bytes:
+// `[u64 chain_id LE | u64 next_pointer LE | u64 zstd_len LE]`, followed
 // by exactly `zstd_len` opaque payload bytes that match what we passed
 // to `prepend`.
 // ---------------------------------------------------------------------------
@@ -840,7 +845,7 @@ fn frame_header_layout() {
 
     // [0..8]   chain_id LE
     // [8..16]  next_pointer LE   (== 0 for f0 on a chain with no f1)
-    // [16..20] zstd_len LE
+    // [16..24] zstd_len LE
     let on_disk_chain_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
     assert_eq!(on_disk_chain_id, chain_id, "chain_id LE at bytes [0..8]");
 
@@ -850,17 +855,17 @@ fn frame_header_layout() {
         "next_pointer LE at bytes [8..16] must be (0,0) since this chain has no f1"
     );
 
-    let on_disk_zstd_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let on_disk_zstd_len = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
     assert_eq!(
         on_disk_zstd_len as usize,
         f0_bytes.len(),
-        "zstd_len LE at bytes [16..20] must equal the payload length we passed"
+        "zstd_len LE at bytes [16..24] must equal the payload length we passed"
     );
 
     let payload_on_disk = &bytes[FRAME_HEADER_LEN..FRAME_HEADER_LEN + f0_bytes.len()];
     assert_eq!(
         payload_on_disk, f0_bytes,
-        "payload bytes immediately after the 20-byte header must equal what we passed"
+        "payload bytes immediately after the 24-byte header must equal what we passed"
     );
 }
 
@@ -902,9 +907,8 @@ fn cold_pointer_chain_walks_correctly() {
     // read f1 header -> get cold_head pointer. Then walk cold.
     let index = std::fs::read(root.join("index")).unwrap();
     let entry_off = chain_id as usize * INDEX_ENTRY_LEN;
-    let f0_file_id = u32::from_le_bytes(index[entry_off..entry_off + 4].try_into().unwrap());
-    let f0_offset =
-        u32::from_le_bytes(index[entry_off + 4..entry_off + 8].try_into().unwrap());
+    let (f0_file_id, f0_offset) =
+        unpack_ptr(u64::from_le_bytes(index[entry_off..entry_off + 8].try_into().unwrap()));
     assert_ne!(
         (f0_file_id, f0_offset),
         (0, 0),
@@ -921,8 +925,7 @@ fn cold_pointer_chain_walks_correctly() {
             .try_into()
             .unwrap(),
     );
-    let f1_file_id = (f0_next_ptr & 0xFFFF_FFFF) as u32;
-    let f1_offset = (f0_next_ptr >> 32) as u32;
+    let (f1_file_id, f1_offset) = unpack_ptr(f0_next_ptr);
 
     let f1_path = root
         .join("f1")
@@ -946,8 +949,7 @@ fn cold_pointer_chain_walks_correctly() {
             current, 0,
             "cold chain ended too early at step {step}, expected length {k}"
         );
-        let file_id = (current & 0xFFFF_FFFF) as u32;
-        let offset = (current >> 32) as u32;
+        let (file_id, offset) = unpack_ptr(current);
         assert_eq!(
             file_id, 0,
             "cold pointer file_id must be 0 (one cold file); got {file_id}"
@@ -1117,4 +1119,58 @@ fn eviction_repoints_live_f1_in_victim() {
     let depot = Depot::open(mk()).unwrap();
     assert_eq!(depot.read_f0(7).unwrap(), b_f0);
     assert_eq!(depot.read_f1(7).unwrap(), Some(b_f1));
+}
+
+// ---------------------------------------------------------------------------
+// format file — the loud version fence
+// ---------------------------------------------------------------------------
+
+/// Create writes `<root>/format` with the current version; reopening
+/// the same depot validates it and succeeds.
+#[test]
+fn create_writes_format_file_and_reopen_roundtrips() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let depot = Depot::open(cfg(root.clone())).unwrap();
+    depot.prepend(3, b"f0", None, false).unwrap();
+    depot.flush().unwrap();
+    drop(depot);
+
+    let format = std::fs::read_to_string(root.join("format")).expect("format file on create");
+    assert_eq!(format.trim(), "2", "format file must carry the current version");
+
+    let depot = Depot::open(cfg(root.clone())).expect("reopen with matching format");
+    assert_eq!(depot.read_f0(3).unwrap(), b"f0");
+}
+
+/// An existing depot (index present) whose `format` file is missing —
+/// e.g. one written by pre-fence code — must hard-error on open, with
+/// the rebuild message. Same for a mismatched version string.
+#[test]
+fn open_without_or_with_wrong_format_file_errors() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    {
+        let depot = Depot::open(cfg(root.clone())).unwrap();
+        depot.prepend(1, b"f0", None, false).unwrap();
+        depot.flush().unwrap();
+    }
+
+    std::fs::remove_file(root.join("format")).unwrap();
+    let err = match Depot::open(cfg(root.clone())) {
+        Ok(_) => panic!("missing format must error"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("delete and re-import"),
+        "error must carry the rebuild message, got: {msg}"
+    );
+
+    std::fs::write(root.join("format"), "1\n").unwrap();
+    let err = match Depot::open(cfg(root.clone())) {
+        Ok(_) => panic!("old format must error"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("format \"1\""), "got: {err}");
 }

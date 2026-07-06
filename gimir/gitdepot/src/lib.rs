@@ -38,7 +38,7 @@
 //!   chains stored inner-first). Tags peeling to a blob are refused
 //!   with a named Unsupported — the only remaining unsupported ref
 //!   shape (no known real-world need; revisit on evidence).
-//! * `<dir>/meta.sqlite` (WAL) — kv (schema=5, label/url, the
+//! * `<dir>/meta.sqlite` (WAL) — kv (schema=6, label/url, the
 //!   authoritative per-chain record counts), refs (CURRENT refs only:
 //!   name → PEELED nullable commit_idx + tree_idx, nullable tag_idx for
 //!   annotated tags — resolving/attaching by tag name yields the peeled
@@ -440,7 +440,12 @@ pub struct SizeReport {
 }
 
 pub struct ImportOutcome {
-    pub meta: Meta,
+    /// The refs observed at import (the walk's per-commit metadata is
+    /// NOT carried: hoarding a CommitMeta per commit cost ~17KB/commit
+    /// of RSS at linux scale — read it back from the store when needed).
+    pub refs: Vec<RefMeta>,
+    /// Commits imported.
+    pub new_commits: usize,
     /// Present only when the encoding comparison was requested
     /// (import_opts(report=true) / CLI `import --report`) — computing
     /// it recompresses the whole history five extra ways, so the
@@ -1069,8 +1074,18 @@ fn same_tree_parent(
 /// tree oid memo for `same_tree_parent` — callers that stream in
 /// several passes over one ingest (the laddered bootstrap) share it so
 /// a rung-boundary parent never needs a cat-file the buffer may no
-/// longer answer. Returns the new CommitMetas oldest-first plus the
-/// max frontier size (instrumentation).
+/// longer answer. Per new commit, `on_commit` is called (right after
+/// `add_commit`) with that commit's CommitMeta — the walk itself
+/// hoards NOTHING per commit (the old Vec<CommitMeta> return measured
+/// ~17KB/commit of linear RSS growth, ~9.6GB extrapolated at linux
+/// scale); callers keep only what they actually use. Returns the new
+/// commit count plus the max frontier size (instrumentation).
+///
+/// Permanent per-commit walk state that DOES remain, with expected
+/// linux-scale footprint (~1.3M commits; ~100-150B/commit each is
+/// acceptable): `tree_oids` (sha → root tree oid hex, ~130B/commit),
+/// the caller's known/known_all sha sets (~90B/commit), and Ingest's
+/// sha_cache (~90B/commit) + tree_of_commit (~50B/commit) maps.
 #[allow(clippy::too_many_arguments)]
 fn ingest_stream(
     repo: &Path,
@@ -1081,7 +1096,8 @@ fn ingest_stream(
     known: &std::collections::HashSet<String>,
     tree_oids: &mut HashMap<String, String>,
     mut rep: Option<&mut ReportAccum>,
-) -> Result<(Vec<CommitMeta>, usize)> {
+    on_commit: &mut dyn FnMut(&CommitMeta) -> Result<()>,
+) -> Result<(usize, usize)> {
     let mut cat = CatFile::new(repo)?;
     let mut stream = LogStream::spawn(repo, negations)?;
     let mut frontier = Frontier { views: HashMap::new(), max: 0 };
@@ -1089,7 +1105,7 @@ fn ingest_stream(
         let rc = counts.get(&sha).copied().unwrap_or(0);
         frontier.insert(sha, view, rc);
     }
-    let mut commits = Vec::new();
+    let mut new_count = 0usize;
     while let Some((sha, changes)) = stream.next_commit()? {
         if known.contains(&sha) {
             continue; // already in the store; its view was seeded
@@ -1121,11 +1137,12 @@ fn ingest_stream(
             r.push(&view, codec::encode(&depot::diff(None, Some(&view))));
         }
         ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view)?;
+        on_commit(&cm)?;
+        new_count += 1;
         let rc = counts.get(&sha).copied().unwrap_or(0);
         frontier.insert(sha, view, rc);
-        commits.push(cm);
     }
-    Ok((commits, frontier.max))
+    Ok((new_count, frontier.max))
 }
 
 /// Import a git repo into `store` (created; must not exist).
@@ -1150,7 +1167,7 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
     // recompute refPrefix anchors from reconstructed views;
     // bit-exactness of that anchor is load-bearing.
     let mut rep = report.then(ReportAccum::default);
-    let (mut commits, max_frontier) = ingest_stream(
+    let (new_commits, max_frontier) = ingest_stream(
         repo,
         &mut ingest,
         &[],
@@ -1159,17 +1176,16 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
         &Default::default(),
         &mut HashMap::new(),
         rep.as_mut(),
+        &mut |_| Ok(()), // per-commit metadata is never hoarded
     )?;
     ingest_tags(repo, &mut ingest, &refs)?;
     ingest.finish(&refs)?;
-    commits.reverse(); // Meta stays newest-first.
 
     let report = match rep {
         Some(r) => Some(r.finish(level)?),
         None => None,
     };
-    let meta = Meta { label: String::new(), url: String::new(), refs, commits };
-    Ok(ImportOutcome { meta, report, max_frontier })
+    Ok(ImportOutcome { refs, new_commits, report, max_frontier })
 }
 
 /// Report-only accumulator: rebuilds the v1 comparison record families
@@ -1322,10 +1338,10 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
     let seeds = seed_views(&st, need)?;
 
     let mut ingest = store::Ingest::new(&mut st, level)?;
-    let (commits, _max_frontier) = ingest_stream(
+    let (k, _max_frontier) = ingest_stream(
         repo, &mut ingest, &negations, &counts, seeds, &known, &mut HashMap::new(), None,
+        &mut |_| Ok(()), // only the count is used
     )?;
-    let k = commits.len();
     ingest_tags(repo, &mut ingest, &refs)?;
     ingest.finish(&refs)?;
     Ok(UpdateOutcome {
@@ -1797,6 +1813,10 @@ pub struct RungStat {
     /// Refs fetched by this rung (0 = the final converge rung).
     pub refs: usize,
     pub new_commits: usize,
+    /// Peak count of live frontier views during the rung's walk (each
+    /// is a full in-RAM tree — the walk's dominant memory driver now
+    /// that per-commit metadata is no longer hoarded).
+    pub frontier_peak: usize,
     /// repo.git size right after the rung's fetch — the moment the
     /// buffer peaks (pack + snapshots + stub, before the re-pin).
     pub buffer_peak_kb: u64,
@@ -1917,12 +1937,12 @@ pub fn mirror_opts(url: &str, root: &Path, opts: MirrorOpts) -> Result<MirrorOut
             }
             std::fs::rename(&scratch, &repo)?;
             let o = import(&repo, &store, 3)?;
-            let n = o.meta.commits.len();
+            let n = o.new_commits;
             MirrorOutcome {
                 update: UpdateOutcome {
                     new_commits: n,
                     total_commits: n,
-                    refs: o.meta.refs,
+                    refs: o.refs,
                     depot_prepends: 0,
                 },
                 rungs: Vec::new(),
@@ -2252,19 +2272,23 @@ fn bootstrap(
             }
         }
         let seeds = ingest.staged_views(&need)?;
-        let (commits, _) = ingest_stream(
+        // The sink keeps ONLY the sha (known_all needs it for later
+        // rungs); the rest of the CommitMeta is dropped per commit.
+        let (rung_new, frontier_peak) = ingest_stream(
             &repo, &mut ingest, &negations, &counts, seeds, &known, &mut tree_oids, None,
+            &mut |cm| {
+                known_all.insert(cm.sha.clone());
+                Ok(())
+            },
         )?;
-        known_all.extend(commits.iter().map(|c| c.sha.clone()));
-        total_new += commits.len();
+        total_new += rung_new;
         let staged_kb = ingest.staged_bytes() / 1024;
         let store_kb = dir_kb(store_path);
         let avail_kb = disk_avail_kb(store_path);
         eprintln!(
-            "gitdepot: bootstrap rung {rung_no}: {rung_refs} refs, {} new commits, \
-             buffer {buffer_peak_kb}K, staged {staged_kb}K, store {store_kb}K, \
-             disk-avail {avail_kb}K",
-            commits.len()
+            "gitdepot: bootstrap rung {rung_no}: {rung_refs} refs, {rung_new} new \
+             commits, frontier-peak {frontier_peak}, buffer {buffer_peak_kb}K, \
+             staged {staged_kb}K, store {store_kb}K, disk-avail {avail_kb}K"
         );
         let refs_now = collect_refs(&repo)?;
         let old_tips: std::collections::BTreeSet<&String> = prev_tips.iter().collect();
@@ -2279,7 +2303,8 @@ fn bootstrap(
         prev_tips = tips;
         rungs.push(RungStat {
             refs: rung_refs,
-            new_commits: commits.len(),
+            new_commits: rung_new,
+            frontier_peak,
             buffer_peak_kb,
             staged_kb,
             store_kb,

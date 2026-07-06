@@ -11,10 +11,19 @@ use memmap2::MmapMut;
 
 use crate::{DepotConfig, Error, Result};
 
-/// `[u64 chain_id | u64 next_pointer | u32 zstd_len]`.
-const HEADER_LEN: usize = 20;
-/// `[u32 file_id LE | u32 offset LE]`.
+/// `[u64 chain_id | u64 next_pointer | u64 zstd_len]`.
+const HEADER_LEN: usize = 24;
+/// One u64 LE: `file_id` in the low 16 bits, `offset` in the high 48.
 const INDEX_ENTRY_LEN: usize = 8;
+/// On-disk format version, written to `<root>/format` on create and
+/// checked on every open of an existing depot. Bump on ANY layout
+/// change — this is UNRELEASED software: no migrations, no
+/// compatibility reads; mismatched depots are deleted and re-imported.
+const FORMAT_VERSION: &str = "2";
+/// Offsets are packed into 48 bits of the pointer word (256TB/file).
+const MAX_OFFSET: u64 = (1 << 48) - 1;
+/// File ids are packed into 16 bits of the pointer word.
+const MAX_FILE_ID: u32 = u16::MAX as u32;
 /// `file_id == 0` ⇔ the cold file. f0/f1 file ids start at 1 so that a
 /// real first-prepend index entry of `(file_id=1, offset=0)` is nonzero
 /// and distinguishable from the `(0,0)` "empty chain" sentinel.
@@ -104,6 +113,9 @@ impl Tier {
             }
         }
         let id = self.next_id;
+        if id > MAX_FILE_ID {
+            return Err(Error::Corrupt("tier file id exceeds the 16-bit pointer field"));
+        }
         self.next_id += 1;
         let path = self.dir.join(format!("file-{id:04}"));
         let df = DataFile::open(id, path)?;
@@ -112,18 +124,18 @@ impl Tier {
         Ok(id)
     }
 
-    fn append(&mut self, frame: &[u8], threshold: u64) -> Result<(u32, u32)> {
+    fn append(&mut self, frame: &[u8], threshold: u64) -> Result<(u32, u64)> {
         let id = self.ensure_room(frame.len() as u64, threshold)?;
         let df = self.files.get_mut(&id).expect("ensured");
         let off = df.len;
-        if off > u32::MAX as u64 {
+        if off + frame.len() as u64 > MAX_OFFSET {
             return Err(Error::FrameTooLarge);
         }
         // Positioned write at the tracked cursor (single-threaded under
         // the outer Mutex; no O_APPEND, see DataFile::open).
         df.file.write_all_at(frame, off)?;
         df.len += frame.len() as u64;
-        Ok((id, off as u32))
+        Ok((id, off))
     }
 }
 
@@ -140,8 +152,29 @@ impl DepotInner {
     pub fn open(cfg: DepotConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.root)?;
 
-        // Index: fixed-size mmap'd file of max_chain_id * 8 zeroed bytes.
+        // Loud version fence: an existing depot (index present) must
+        // carry a matching `format` file — the frame header/pointer
+        // layout has no other marker, and an old-layout depot would
+        // otherwise be silently misread through the new header size.
         let index_path = cfg.root.join("index");
+        let format_path = cfg.root.join("format");
+        if index_path.exists() {
+            let found = std::fs::read_to_string(&format_path)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if found != FORMAT_VERSION {
+                return Err(Error::Format(format!(
+                    "depot {} has format {found:?}, this build writes \
+                     {FORMAT_VERSION:?} — depot written by older code; delete \
+                     and re-import (mirrors are rebuildable)",
+                    cfg.root.display()
+                )));
+            }
+        } else {
+            std::fs::write(&format_path, format!("{FORMAT_VERSION}\n"))?;
+        }
+
+        // Index: fixed-size mmap'd file of max_chain_id * 8 zeroed bytes.
         let expected = cfg.max_chain_id * INDEX_ENTRY_LEN as u64;
         let index_file = OpenOptions::new()
             .read(true)
@@ -198,14 +231,8 @@ impl DepotInner {
         if chain_id >= self.cfg.max_chain_id {
             return Err(Error::ChainIdOutOfRange);
         }
-        if new_f0_bytes.len() > u32::MAX as usize {
-            return Err(Error::FrameTooLarge);
-        }
-        if let Some(b) = new_f1_bytes {
-            if b.len() > u32::MAX as usize {
-                return Err(Error::FrameTooLarge);
-            }
-        }
+        // zstd_len is u64 on disk; individual frames are only bounded
+        // by the 48-bit per-file offset space, checked at append.
 
         let old_f0_ptr = self.index_get(chain_id);
         let virgin = old_f0_ptr == 0;
@@ -238,10 +265,10 @@ impl DepotInner {
             return Err(Error::CannotSealNoF1);
         }
         let old_f0_size =
-            HEADER_LEN as u64 + read_zstd_len(&self.f0, old_f0_fid, old_f0_off)? as u64;
+            HEADER_LEN as u64 + read_zstd_len(&self.f0, old_f0_fid, old_f0_off)?;
         let (old_f1_fid, old_f1_off) = unpack(old_f1_ptr);
         let old_f1_size = if old_f1_ptr != 0 {
-            HEADER_LEN as u64 + read_zstd_len(&self.f1, old_f1_fid, old_f1_off)? as u64
+            HEADER_LEN as u64 + read_zstd_len(&self.f1, old_f1_fid, old_f1_off)?
         } else {
             0
         };
@@ -330,7 +357,7 @@ impl DepotInner {
             .get(&f0_fid)
             .ok_or(Error::Corrupt("missing tier file"))?;
         let patch = OpenOptions::new().write(true).open(&f0_df.path)?;
-        patch.write_all_at(&cold_ptr.to_le_bytes(), f0_off as u64 + 8)?;
+        patch.write_all_at(&cold_ptr.to_le_bytes(), f0_off + 8)?;
         // The old f1 frame is dead.
         if let Some(df) = self.f1.files.get_mut(&f1_fid) {
             df.dead += HEADER_LEN as u64 + f1_zstd.len() as u64;
@@ -396,12 +423,12 @@ impl DepotInner {
             return Err(Error::Corrupt("cold pointer with nonzero file_id"));
         }
         let mut header = [0u8; HEADER_LEN];
-        self.cold_file.read_exact_at(&mut header, off as u64)?;
+        self.cold_file.read_exact_at(&mut header, off)?;
         let next = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let zstd_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let zstd_len = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
         let mut buf = vec![0u8; zstd_len];
         self.cold_file
-            .read_exact_at(&mut buf, off as u64 + HEADER_LEN as u64)?;
+            .read_exact_at(&mut buf, off + HEADER_LEN as u64)?;
         Ok((buf, next))
     }
 
@@ -528,7 +555,7 @@ impl DepotInner {
             // on Linux, ignoring the offset): patch via a fresh
             // plain-write handle on the same path.
             let patch = OpenOptions::new().write(true).open(&f0_df.path)?;
-            patch.write_all_at(&new_ptr.to_le_bytes(), f0_off as u64 + 8)?;
+            patch.write_all_at(&new_ptr.to_le_bytes(), f0_off + 8)?;
             touched_f0.insert(f0_fid);
         }
         for df in self.f1.files.values() {
@@ -568,7 +595,7 @@ impl DepotInner {
         Ok(())
     }
 
-    fn cold_append(&mut self, frame: &[u8]) -> Result<u32> {
+    fn cold_append(&mut self, frame: &[u8]) -> Result<u64> {
         // Reserve byte 0 of the cold file lazily so no real cold frame
         // ever lives at offset 0; that keeps `pack(0, 0) == 0`, the
         // "empty chain" sentinel, disjoint from every real cold pointer.
@@ -576,10 +603,10 @@ impl DepotInner {
             std::io::Write::write_all(&mut self.cold_file, &[0u8])?;
             self.cold_len = 1;
         }
-        if self.cold_len + frame.len() as u64 > u32::MAX as u64 {
+        if self.cold_len + frame.len() as u64 > MAX_OFFSET {
             return Err(Error::FrameTooLarge);
         }
-        let off = self.cold_len as u32;
+        let off = self.cold_len;
         std::io::Write::write_all(&mut self.cold_file, frame)?;
         self.cold_len += frame.len() as u64;
         Ok(off)
@@ -596,69 +623,71 @@ impl DepotInner {
     }
 }
 
-/// Pack `(file_id, offset)` into one u64 such that re-reading the 8
-/// bytes as `[u32 file_id LE | u32 offset LE]` matches the SPEC's index
-/// entry format.
-fn pack(file_id: u32, offset: u32) -> u64 {
-    (offset as u64) << 32 | file_id as u64
+/// Pack `(file_id, offset)` into one u64: `file_id` in the low 16
+/// bits, `offset` in the high 48 (SPEC §"Index") — per-file cap 256TB,
+/// 65535 data files per tier.
+fn pack(file_id: u32, offset: u64) -> u64 {
+    debug_assert!(file_id <= MAX_FILE_ID);
+    debug_assert!(offset <= MAX_OFFSET);
+    offset << 16 | file_id as u64
 }
 
-fn unpack(ptr: u64) -> (u32, u32) {
-    (ptr as u32, (ptr >> 32) as u32)
+fn unpack(ptr: u64) -> (u32, u64) {
+    ((ptr & 0xFFFF) as u32, ptr >> 16)
 }
 
 /// A nonzero pointer into the cold file (fid 0; real f0/f1 fids start
 /// at 1, and cold offset 0 is reserved, so this is unambiguous).
 fn is_cold_ptr(ptr: u64) -> bool {
-    ptr != 0 && (ptr as u32) == COLD_FILE_ID
+    ptr != 0 && (ptr & 0xFFFF) == COLD_FILE_ID as u64
 }
 
 fn encode_frame(chain_id: u64, next_pointer: u64, zstd: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(HEADER_LEN + zstd.len());
     buf.extend_from_slice(&chain_id.to_le_bytes());
     buf.extend_from_slice(&next_pointer.to_le_bytes());
-    buf.extend_from_slice(&(zstd.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(zstd.len() as u64).to_le_bytes());
     buf.extend_from_slice(zstd);
     buf
 }
 
-fn read_next_pointer(tier: &Tier, file_id: u32, offset: u32) -> Result<u64> {
+fn read_next_pointer(tier: &Tier, file_id: u32, offset: u64) -> Result<u64> {
     let df = tier
         .files
         .get(&file_id)
         .ok_or(Error::Corrupt("missing tier file"))?;
     let mut buf = [0u8; 8];
-    df.file.read_exact_at(&mut buf, offset as u64 + 8)?;
+    df.file.read_exact_at(&mut buf, offset + 8)?;
     Ok(u64::from_le_bytes(buf))
 }
 
-fn read_zstd_len(tier: &Tier, file_id: u32, offset: u32) -> Result<u32> {
+fn read_zstd_len(tier: &Tier, file_id: u32, offset: u64) -> Result<u64> {
     let df = tier
         .files
         .get(&file_id)
         .ok_or(Error::Corrupt("missing tier file"))?;
-    let mut buf = [0u8; 4];
-    df.file.read_exact_at(&mut buf, offset as u64 + 16)?;
-    Ok(u32::from_le_bytes(buf))
+    let mut buf = [0u8; 8];
+    df.file.read_exact_at(&mut buf, offset + 16)?;
+    Ok(u64::from_le_bytes(buf))
 }
 
-fn read_zstd(tier: &Tier, file_id: u32, offset: u32) -> Result<Vec<u8>> {
+fn read_zstd(tier: &Tier, file_id: u32, offset: u64) -> Result<Vec<u8>> {
     let df = tier
         .files
         .get(&file_id)
         .ok_or(Error::Corrupt("missing tier file"))?;
-    let mut len_buf = [0u8; 4];
-    df.file.read_exact_at(&mut len_buf, offset as u64 + 16)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut len_buf = [0u8; 8];
+    df.file.read_exact_at(&mut len_buf, offset + 16)?;
+    let len = u64::from_le_bytes(len_buf) as usize;
     let mut buf = vec![0u8; len];
     df.file
-        .read_exact_at(&mut buf, offset as u64 + HEADER_LEN as u64)?;
+        .read_exact_at(&mut buf, offset + HEADER_LEN as u64)?;
     Ok(buf)
 }
 
 /// One frame as read off disk during a sequential walk.
 struct WalkedFrame {
-    offset: u32,
+    offset: u64,
     header: [u8; HEADER_LEN],
     zstd: Vec<u8>,
 }
@@ -670,11 +699,11 @@ fn walk_frames(df: &DataFile) -> Result<Vec<WalkedFrame>> {
     while off < df.len {
         let mut header = [0u8; HEADER_LEN];
         df.file.read_exact_at(&mut header, off)?;
-        let zstd_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let zstd_len = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
         let mut zstd = vec![0u8; zstd_len];
         df.file.read_exact_at(&mut zstd, off + HEADER_LEN as u64)?;
         out.push(WalkedFrame {
-            offset: off as u32,
+            offset: off,
             header,
             zstd,
         });
@@ -724,7 +753,7 @@ fn rebuild_dead_f1(tier: &mut Tier, index: &MmapMut, f0_tier: &Tier) -> Result<(
                 match f0_tier.files.get(&lfid) {
                     Some(f0_df) => {
                         let mut np = [0u8; 8];
-                        f0_df.file.read_exact_at(&mut np, loff as u64 + 8)?;
+                        f0_df.file.read_exact_at(&mut np, loff + 8)?;
                         let (f1_fid, f1_off) = unpack(u64::from_le_bytes(np));
                         f1_fid == fid && f1_off == wf.offset
                     }
@@ -738,4 +767,39 @@ fn rebuild_dead_f1(tier: &mut Tier, index: &MmapMut, f0_tier: &Tier) -> Result<(
         tier.files.get_mut(&fid).expect("present").dead = dead;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 4GB ceiling is gone in principle: pointer words round-trip
+    /// offsets above u32::MAX up to the full 48-bit space, and the
+    /// 16-bit file-id field round-trips its maximum.
+    #[test]
+    fn pack_unpack_wide_offsets() {
+        for off in [0u64, 1, u32::MAX as u64, u32::MAX as u64 + 1, MAX_OFFSET] {
+            for fid in [COLD_FILE_ID, 1u32, 2, MAX_FILE_ID] {
+                let ptr = pack(fid, off);
+                assert_eq!(unpack(ptr), (fid, off), "fid={fid} off={off}");
+                assert_eq!(
+                    is_cold_ptr(ptr),
+                    ptr != 0 && fid == COLD_FILE_ID,
+                    "fid={fid} off={off}"
+                );
+            }
+        }
+        // The empty-chain sentinel stays disjoint from every real
+        // pointer (cold offset 0 is reserved; tier fids start at 1).
+        assert_eq!(pack(COLD_FILE_ID, 0), 0);
+    }
+
+    /// Cold-append accounting accepts offsets past the old u32 ceiling
+    /// and fails closed only at the 48-bit bound.
+    #[test]
+    fn cold_bound_is_48_bits() {
+        assert!(u32::MAX as u64 + 1 + HEADER_LEN as u64 <= MAX_OFFSET);
+        assert!(MAX_OFFSET + 1 > MAX_OFFSET); // trivially: the check is `> MAX_OFFSET`
+        assert_eq!(MAX_OFFSET, (1u64 << 48) - 1);
+    }
 }

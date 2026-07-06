@@ -48,7 +48,7 @@ pub fn cli_main(args: &[String]) -> i32 {
                 }
                 let Some(r) = &o.report else {
                     println!("{} commits imported (max frontier {})",
-                             o.meta.commits.len(), o.max_frontier);
+                             o.new_commits, o.max_frontier);
                     return;
                 };
                 println!(

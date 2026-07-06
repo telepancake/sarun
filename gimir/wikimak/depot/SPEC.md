@@ -30,16 +30,28 @@ upper bound; cold grows as long as the chain is active.
 Under `<root>/`:
 
 ```
+format                   one-line on-disk format version (currently "2")
 index                    fixed-size mmap'd array; entry per chain_id
 f0/file-NNNN             append-only data files; one is the current write target
 f1/file-NNNN             same
 cold/cold                ONE file per depot instance, append-only
 ```
 
+### Format file
+
+`<root>/format` holds a single version string, written on create.
+Current version: `2`. `open` of an existing depot (index present) with
+a missing or mismatched `format` file is a hard error — the frame
+header and pointer layout carry no other marker, so an old-layout depot
+would otherwise be silently misread. There are no migrations and no
+compatibility reads: delete the depot and re-import (mirrors are
+rebuildable).
+
 ### Index
 
-Fixed-size file. Each entry is 8 bytes: `[u32 file_id LE, u32 offset LE]`,
-pointing at the chain's f0 frame. `(0, 0)` = chain has no frames yet.
+Fixed-size file. Each entry is one u64 LE packing `file_id` in the low
+16 bits and `offset` in the high 48 (per-file cap 256TB, 65535 files
+per tier), pointing at the chain's f0 frame. `(0, 0)` = chain has no frames yet.
 File size = `8 * max_chain_id`. mmap'd r/w. Writing an index entry is one
 aligned 8-byte pwrite, atomic on real filesystems.
 
@@ -51,7 +63,8 @@ A frame on disk:
 [u64 chain_id LE | u64 next_pointer LE | zstd frame bytes]
 ```
 
-`next_pointer` is `[u32 file_id LE | u32 offset LE]` packed as one u64.
+`next_pointer` packs `file_id` (low 16 bits) and `offset` (high 48
+bits) as one u64, like an index entry.
 For f0 it points at f1; for f1 it points at the newest cold frame (or
 `(0,0)` if no seals have happened); for cold[k] it points at cold[k-1]
 (or `(0,0)` if k == 1). The zstd bytes are opaque to the depot.
@@ -120,7 +133,7 @@ impl Depot {
         seal_old_f1: bool,
     ) -> Result<()>;
 
-    /// Read the current f0 frame bytes (zstd + 16-byte header stripped).
+    /// Read the current f0 frame bytes (zstd; the 24-byte header stripped).
     /// Returns Err if the chain has no f0 yet.
     pub fn read_f0(&self, chain_id: u64) -> Result<Vec<u8>>;
 
@@ -315,21 +328,14 @@ implementer wants faster open; not required.)
 
 `read_f0(chain_id)`:
 1. Look up index[chain_id]. If (0,0): Err NoFrame.
-2. pread the frame's header (16 bytes) at the f0 location. Get the
-   zstd-bytes length from the next frame's offset or from a stored
-   length. WAIT — we don't store frame length in the header. Implementer:
-   either store it (extend the header to `[chain_id | next_pointer |
-   u32 zstd_len]` = 20 bytes), or use `zstd::find_frame_compressed_size`
-   on a streaming read. Pick one and pin it.
-
-   **Resolution (pinned by SPEC):** extend frame header to 20 bytes:
-   `[u64 chain_id | u64 next_pointer | u32 zstd_len]`. Saves repeated
-   zstd-header probing on every read. Cost: 4 bytes per frame.
+2. pread the frame's header (24 bytes:
+   `[u64 chain_id | u64 next_pointer | u64 zstd_len]` — the length is
+   stored so reads never probe zstd headers).
 3. pread `zstd_len` bytes for the zstd payload. Return.
 
 `read_f1(chain_id)`:
 1. Look up index → f0_loc. If (0,0): Err NoFrame.
-2. pread f0's header (16 bytes). Get its next_pointer = f1_loc.
+2. pread f0's header (24 bytes). Get its next_pointer = f1_loc.
 3. If f1_loc == (0,0): return Ok(None).
 4. pread f1's header, then its zstd bytes. Return Ok(Some(zstd_bytes)).
 
@@ -361,10 +367,11 @@ implementer wants faster open; not required.)
 
 - `chain_id < max_chain_id`. Opening with a different `max_chain_id`
   than the index file's recorded size is an error.
-- One frame's zstd bytes < `u32::MAX` (zstd_len is u32). Wikipedia
-  revisions max out around 2 MiB; not a concern.
-- Per-file size < `u32::MAX` (offset is u32). With ~1 GiB file-size
-  threshold this is well within bounds.
+- One frame's zstd bytes are bounded only by the 48-bit per-file
+  offset space (zstd_len is u64 on disk).
+- Per-file size < 2^48 (offset is 48 bits); at most 65535 data files
+  per tier (file_id is 16 bits). With ~1 GiB file-size threshold this
+  is well within bounds.
 - One depot instance = one wiki. The cold file holds only this
   instance's cold frames. The caller runs one depot per wiki.
 

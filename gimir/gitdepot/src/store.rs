@@ -3,7 +3,7 @@
 //!
 //! `<store>/depot/`      — ONE wikimak-depot instance holding four chains:
 //!                         TREES=0, COMMITS=1, REFLOG=2, TAGS=3.
-//! `<store>/meta.sqlite` — bookkeeping (WAL): `kv` (schema=5, label, url,
+//! `<store>/meta.sqlite` — bookkeeping (WAL): `kv` (schema=6, label, url,
 //!                         n_trees/n_commits/n_reflog/n_tags counts — the
 //!                         AUTHORITATIVE index base), `refs` (CURRENT refs
 //!                         only: name → nullable commit_idx, tree_idx,
@@ -45,7 +45,7 @@
 //! **Frames** (caller-side discipline over the byte-opaque depot, per
 //! wikimak/depot/SPEC.md):
 //!   * f0 = the chain's newest record, standalone zstd.
-//!   * f1 = older records, each u32-length-prefixed, concatenated
+//!   * f1 = older records, each u64-length-prefixed, concatenated
 //!     newest-first, zstd refPrefix-anchored on the f0 RECORD.
 //!   * seal: when absorbing a prepend's entries would push the raw
 //!     accumulator past `SEAL_THRESHOLD`, the old f1's zstd bytes move
@@ -109,7 +109,7 @@
 //! refPrefix anchors), so the trees chain is cross-checked through the
 //! head commit's tree_idx bound and verified in depth by any walk.
 //!
-//! There is exactly ONE on-disk format: kv schema=5. A store written by
+//! There is exactly ONE on-disk format: kv schema=6. A store written by
 //! older code errors loudly on open — delete and re-import; mirrors are
 //! rebuildable.
 
@@ -185,7 +185,7 @@ pub fn store_exists(store: &Path) -> bool {
 
 /// The one supported on-disk format. Anything else on open = loud
 /// error (unreleased software: no migrations, mirrors are rebuildable).
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 
 fn configure(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(sql_err)
@@ -487,7 +487,7 @@ pub(crate) fn decompress(frame: &[u8], prefix: Option<&[u8]>) -> Result<Vec<u8>>
     Ok(out)
 }
 
-/// Stream the u32-length-prefixed records of a multi-record frame
+/// Stream the u64-length-prefixed records of a multi-record frame
 /// (f1 or cold) in stored (newest-first) order, decoding incrementally
 /// (`wikimak_depot::FrameDecoder`): one record in RAM at a time, never
 /// the whole raw frame — a linux-scale sealed frame decompresses to
@@ -515,13 +515,13 @@ fn stream_frame_records(
         Ok(got)
     };
     loop {
-        let mut hdr = [0u8; 4];
+        let mut hdr = [0u8; 8];
         match read_full(&mut dec, &mut hdr)? {
             0 => return Ok(()),
-            4 => {}
+            8 => {}
             _ => return Err(Error::Chain("truncated record".into())),
         }
-        let len = u32::from_le_bytes(hdr) as usize;
+        let len = u64::from_le_bytes(hdr) as usize;
         let mut rec = vec![0u8; len];
         if read_full(&mut dec, &mut rec)? != len {
             return Err(Error::Chain("truncated record".into()));
@@ -765,11 +765,13 @@ impl Store {
             Demote::Verbatim => Some(&prev_record),
             Demote::Dropped => None,
         };
-        // compose_f1 semantics over frame entries (u32 prefix + record).
+        // compose_f1 semantics over frame entries (u64 prefix + record
+        // — the prefix is 8 bytes so a single linux-scale batch record
+        // past 4GB frames losslessly).
         let entries_len: u64 = older
             .as_ref()
-            .map_or(0, |s| s.bytes + 4 * s.len() as u64)
-            + demoted.map_or(0, |d| d.len() as u64 + 4);
+            .map_or(0, |s| s.bytes + 8 * s.len() as u64)
+            + demoted.map_or(0, |d| d.len() as u64 + 8);
         let old_f1 = self.depot.read_f1(chain).map_err(|e| Error::Chain(e.to_string()))?;
         let old_raw_len = match &old_f1 {
             Some(z) => zstd::zstd_safe::get_frame_content_size(z)
@@ -782,7 +784,7 @@ impl Store {
         let mut enc = wikimak_depot::FrameEncoder::new(total_raw, Some(head_record), level)
             .map_err(Error::Chain)?;
         let put = |enc: &mut wikimak_depot::FrameEncoder<'_>, rec: &[u8]| -> Result<()> {
-            enc.write(&(rec.len() as u32).to_le_bytes()).map_err(Error::Chain)?;
+            enc.write(&(rec.len() as u64).to_le_bytes()).map_err(Error::Chain)?;
             enc.write(rec).map_err(Error::Chain)
         };
         if let Some(staged) = older.as_deref_mut() {
@@ -1641,7 +1643,10 @@ pub(crate) struct Ingest<'a> {
     // COMMITS staging (encoded objects, oldest-first).
     commit_recs: Staged,
     n_commits: u64,
+    /// sha → staged idx, one entry per staged commit for the life of
+    /// the ingest — ~90B/commit, acceptable at linux scale (~1.3M).
     sha_cache: HashMap<String, u64>,
+    /// staged commit idx → tree idx, same lifetime — ~50B/commit.
     tree_of_commit: HashMap<u64, u64>,
     // TAGS staging (encoded objects, oldest-first).
     tag_recs: Staged,
