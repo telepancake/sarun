@@ -52,3 +52,4 @@
 0520-eval------after-a-literal-colon-must-itself-be-literal-to-ma.patch
 0530-dep--per-part-double-colon-nodes-bind----from-their-own-stat.patch
 0540-dep--single-suffix-rules---in----------in.patch
+0550-kati--suffix-rules-consult-VPATH-for-the-implied-prerequisit.patch

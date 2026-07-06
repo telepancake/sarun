@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Mon, 06 Jul 2026 09:00:10 +0000
+Subject: [PATCH] kati: suffix rules consult VPATH for the implied prerequisite
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index a5c9e91..8469590 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -1250,7 +1250,12 @@ impl<'a> DepBuilder<'a> {
+             for irule in found {
+                 assert!(irule.inputs.len() == 1);
+                 let input = replace_suffix(output, &irule.inputs[0]);
+-                if self.exists(input) {
++                // sarun: a prerequisite findable through VPATH counts as
++                // existing, exactly as in can_pick_implicit_rule — automake
++                // out-of-tree builds drive `.c.o` suffix rules whose implied
++                // source lives in $(srcdir) via VPATH; without this the .o
++                // silently got no commands and the link failed on it.
++                if self.exists(input) || self.vpath_resolve(input).is_some() {
+                     return Some(irule.clone());
+                 }
+             }
+@@ -1274,7 +1279,7 @@ impl<'a> DepBuilder<'a> {
+                 b.put_u8(b'.');
+                 b.put_slice(&suf);
+                 let input = intern(b.freeze());
+-                if self.exists(input) {
++                if self.exists(input) || self.vpath_resolve(input).is_some() {
+                     return Some(irule.clone());
+                 }
+             }
