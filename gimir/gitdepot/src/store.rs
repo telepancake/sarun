@@ -3,14 +3,17 @@
 //!
 //! `<store>/depot/`      — ONE wikimak-depot instance holding four chains:
 //!                         TREES=0, COMMITS=1, REFLOG=2, TAGS=3.
-//! `<store>/meta.sqlite` — bookkeeping (WAL): `kv` (schema=4, label, url,
+//! `<store>/meta.sqlite` — bookkeeping (WAL): `kv` (schema=5, label, url,
 //!                         n_trees/n_commits/n_reflog/n_tags counts — the
 //!                         AUTHORITATIVE index base), `refs` (CURRENT refs
-//!                         only: name → commit_idx, tree_idx, plus a
-//!                         nullable tag_idx: NULL = branch/lightweight
-//!                         tag; set = the ref is an annotated tag and
-//!                         commit_idx/tree_idx are its PEELED commit —
-//!                         name resolution and attach stay peeled).
+//!                         only: name → nullable commit_idx, tree_idx,
+//!                         plus a nullable tag_idx: tag_idx NULL =
+//!                         branch/lightweight tag; set = the ref is an
+//!                         annotated tag and commit_idx/tree_idx are its
+//!                         PEELED commit — name resolution and attach
+//!                         stay peeled. commit_idx NULL = the tag peels
+//!                         to a TREE (tag_idx set, tree_idx = the tagged
+//!                         tree; there is no commit to resolve to).
 //!                         NOTHING
 //!                         else: every id-keyed lookup derives from the
 //!                         chains on demand. sha → idx is an in-RAM map
@@ -72,17 +75,22 @@
 //! skip a batch on its header alone when the wanted index is out of
 //! its [base, base+count) range. kv counts are OBJECT counts.
 //!
-//! TAGS chain objects are annotated-tag objects: `{sha,
-//! target_commit_idx, raw}` — target_commit_idx is the FULLY-PEELED
-//! commit's stable index (for a nested tag→tag→commit chain EVERY tag
-//! object in the chain is stored, inner tags at lower indices so export
-//! can write deepest-first, each with the final commit's index; the
-//! intermediate target sha lives inside `raw` anyway). `raw` is the
-//! COMPLETE raw tag object (header + message + signature verbatim) —
-//! the export-fidelity payload, same rationale as commit records. Tags
-//! whose peel ends at a tree/blob are refused at import (a named
-//! Unsupported) — narrower than the pre-v4 blanket annotated-tag
-//! refusal.
+//! TAGS chain objects are annotated-tag objects: `{sha, target, raw}` —
+//! `target` is the FULLY-PEELED end of the tag chain as a stable index,
+//! either a COMMITS index or (for a tag at a tree, the linux
+//! v2.6.11-tree shape) a TREES index (for a nested chain EVERY tag
+//! object is stored, inner tags at lower indices so export can write
+//! deepest-first, each with the final target's index; the intermediate
+//! target sha lives inside `raw` anyway). A tagged tree that equals
+//! some commit's root tree reuses that commit's TREES record; a
+//! genuinely standalone tagged tree is imported as an ordinary TREES
+//! record and its reverse delta anchors like any other record (chain
+//! position = wherever the ingest lands it). `raw` is the COMPLETE raw
+//! tag object (header + message + signature verbatim) — the
+//! export-fidelity payload, same rationale as commit records. Tags
+//! whose peel ends at a BLOB are refused at import (a named
+//! Unsupported) — the only remaining unsupported ref shape (no known
+//! real-world need; revisit on evidence).
 //!
 //! **Durability/integrity**: depot writes are flushed durable BEFORE the
 //! sqlite transaction commits, so kv counts are never ahead of the
@@ -94,7 +102,7 @@
 //! refPrefix anchors), so the trees chain is cross-checked through the
 //! head commit's tree_idx bound and verified in depth by any walk.
 //!
-//! There is exactly ONE on-disk format: kv schema=4. A store written by
+//! There is exactly ONE on-disk format: kv schema=5. A store written by
 //! older code errors loudly on open — delete and re-import; mirrors are
 //! rebuildable.
 
@@ -132,7 +140,7 @@ CREATE TABLE IF NOT EXISTS kv(
 );
 CREATE TABLE IF NOT EXISTS refs(
     name       TEXT PRIMARY KEY,
-    commit_idx INTEGER NOT NULL,
+    commit_idx INTEGER,
     tree_idx   INTEGER NOT NULL,
     tag_idx    INTEGER
 );
@@ -153,7 +161,7 @@ pub fn store_exists(store: &Path) -> bool {
 
 /// The one supported on-disk format. Anything else on open = loud
 /// error (unreleased software: no migrations, mirrors are rebuildable).
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
 
 fn configure(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(sql_err)
@@ -297,15 +305,31 @@ impl CommitRecord {
     }
 }
 
+/// The fully-peeled end of a tag chain, as a stable index into the
+/// chain that holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagTarget {
+    Commit(u64),
+    Tree(u64),
+}
+
+/// A tag's resolved peel as handed to `Ingest::add_tag`.
+pub(crate) enum TagPeel<'a> {
+    /// Fully-peeled commit sha (staged or stored).
+    Commit(&'a str),
+    /// Fully-peeled tree, already resolved to its TREES index.
+    Tree(u64),
+}
+
 /// One TAGS-chain object (batched into chain records): an annotated
 /// tag. `raw` is the complete raw tag object (export writes it back
-/// verbatim and asserts the sha); `target_commit_idx` is the fully
-/// peeled commit's stable index.
+/// verbatim and asserts the sha); `target` is the fully peeled
+/// commit's — or, for a tree tag, tree's — stable index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagRecord {
     pub idx: u64,
     pub sha: String,
-    pub target_commit_idx: u64,
+    pub target: TagTarget,
     pub raw: Vec<u8>,
 }
 
@@ -323,7 +347,13 @@ impl TagRecord {
         let mut out = Vec::new();
         out.extend_from_slice(&self.idx.to_le_bytes());
         put_bytes(&mut out, self.sha.as_bytes());
-        out.extend_from_slice(&self.target_commit_idx.to_le_bytes());
+        // Target kind flag byte: 0 = COMMITS index, 1 = TREES index.
+        let (kind, tidx) = match self.target {
+            TagTarget::Commit(i) => (0u8, i),
+            TagTarget::Tree(i) => (1u8, i),
+        };
+        out.push(kind);
+        out.extend_from_slice(&tidx.to_le_bytes());
         put_bytes(&mut out, &self.raw);
         out
     }
@@ -333,24 +363,29 @@ impl TagRecord {
         let idx = c.u64()?;
         let sha = String::from_utf8(c.bytes()?.to_vec())
             .map_err(|_| Error::Chain("tag record: non-utf8 sha".into()))?;
-        let target_commit_idx = c.u64()?;
+        let target = match c.u8()? {
+            0 => TagTarget::Commit(c.u64()?),
+            1 => TagTarget::Tree(c.u64()?),
+            k => return Err(Error::Chain(format!("tag record: unknown target kind {k}"))),
+        };
         let raw = c.bytes()?.to_vec();
         c.done()?;
-        Ok(TagRecord { idx, sha, target_commit_idx, raw })
+        Ok(TagRecord { idx, sha, target, raw })
     }
 }
 
 /// One REFLOG-chain object (batched into chain records): an observed
 /// ref movement. `old` absent =
 /// creation; `new` absent = deletion. Values are `(commit_idx,
-/// tree_idx)` pairs. Prepended BEFORE the refs table row changes.
+/// tree_idx)` pairs; commit_idx absent = a tag-at-tree value (note
+/// "tag@tree"). Prepended BEFORE the refs table row changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflogRecord {
     pub idx: u64,
     pub at: i64,
     pub refname: String,
-    pub old: Option<(u64, u64)>,
-    pub new: Option<(u64, u64)>,
+    pub old: Option<(Option<u64>, u64)>,
+    pub new: Option<(Option<u64>, u64)>,
     pub note: String,
 }
 
@@ -360,14 +395,19 @@ impl ReflogRecord {
         out.extend_from_slice(&self.idx.to_le_bytes());
         out.extend_from_slice(&(self.at as u64).to_le_bytes());
         put_bytes(&mut out, self.refname.as_bytes());
-        let flags = self.old.is_some() as u8 | ((self.new.is_some() as u8) << 1);
+        // Flag bits: 0 = old present, 1 = new present, 2 = old carries
+        // a commit_idx, 3 = new carries one (unset with bit 0/1 set =
+        // a tag-at-tree side: tree_idx only).
+        let flags = self.old.is_some() as u8
+            | ((self.new.is_some() as u8) << 1)
+            | ((self.old.is_some_and(|(c, _)| c.is_some()) as u8) << 2)
+            | ((self.new.is_some_and(|(c, _)| c.is_some()) as u8) << 3);
         out.push(flags);
-        if let Some((c, t)) = self.old {
-            out.extend_from_slice(&c.to_le_bytes());
-            out.extend_from_slice(&t.to_le_bytes());
-        }
-        if let Some((c, t)) = self.new {
-            out.extend_from_slice(&c.to_le_bytes());
+        for side in [self.old, self.new].into_iter().flatten() {
+            let (c, t) = side;
+            if let Some(c) = c {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
             out.extend_from_slice(&t.to_le_bytes());
         }
         put_bytes(&mut out, self.note.as_bytes());
@@ -381,8 +421,15 @@ impl ReflogRecord {
         let refname = String::from_utf8(c.bytes()?.to_vec())
             .map_err(|_| Error::Chain("reflog record: non-utf8 ref".into()))?;
         let flags = c.u8()?;
-        let old = if flags & 1 != 0 { Some((c.u64()?, c.u64()?)) } else { None };
-        let new = if flags & 2 != 0 { Some((c.u64()?, c.u64()?)) } else { None };
+        let mut side = |present: u8, has_commit: u8| -> Result<Option<(Option<u64>, u64)>> {
+            if flags & present == 0 {
+                return Ok(None);
+            }
+            let commit = if flags & has_commit != 0 { Some(c.u64()?) } else { None };
+            Ok(Some((commit, c.u64()?)))
+        };
+        let old = side(1, 4)?;
+        let new = side(2, 8)?;
         let note = String::from_utf8(c.bytes()?.to_vec())
             .map_err(|_| Error::Chain("reflog record: non-utf8 note".into()))?;
         c.done()?;
@@ -929,8 +976,9 @@ impl Store {
     }
 
     /// CURRENT refs: name → (commit_idx, tree_idx, tag_idx), name-ordered.
-    /// commit_idx/tree_idx are PEELED for annotated tags (tag_idx set).
-    pub fn ref_rows(&self) -> Result<Vec<(String, u64, u64, Option<u64>)>> {
+    /// commit_idx/tree_idx are PEELED for annotated tags (tag_idx set);
+    /// commit_idx is NULL for a tag peeling to a tree.
+    pub fn ref_rows(&self) -> Result<Vec<(String, Option<u64>, u64, Option<u64>)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT name, commit_idx, tree_idx, tag_idx FROM refs ORDER BY name")
@@ -939,7 +987,7 @@ impl Store {
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
                     r.get::<_, i64>(2)? as u64,
                     r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
                 ))
@@ -950,18 +998,54 @@ impl Store {
         Ok(rows)
     }
 
+    /// The fully-peeled TREE oid of a tree-target tag at stable index
+    /// `idx` — read from the stored raw tag bytes (nested chains
+    /// followed through the tag map; tree oids are never stored as
+    /// layer data, per the implicit-id rule).
+    pub fn peeled_tree_oid(&self, idx: u64) -> Result<String> {
+        let mut rec = self.tag_record_at(idx)?;
+        loop {
+            let (obj, typ) = crate::parse_tag_target(&rec.sha, &rec.raw)?;
+            match typ.as_str() {
+                "tree" => return Ok(obj),
+                "tag" => {
+                    let inner = self.tag_sha_to_idx(&obj)?.ok_or_else(|| {
+                        Error::Chain(format!("inner tag {obj} not in chain"))
+                    })?;
+                    rec = self.tag_record_at(inner)?;
+                }
+                other => {
+                    return Err(Error::Chain(format!(
+                        "tag {} records a tree target but raw peels to a {other}",
+                        rec.sha
+                    )))
+                }
+            }
+        }
+    }
+
     /// CURRENT refs with their shas (the `for-each-ref`-shaped view).
     pub fn refs_meta(&self) -> Result<Vec<RefMeta>> {
         let mut out = Vec::new();
         for (name, cidx, _t, tag) in self.ref_rows()? {
-            let sha = self
-                .idx_to_sha(cidx)?
-                .ok_or_else(|| Error::Meta("ref target not in chain".into()))?;
             let tag_sha = match tag {
                 Some(ti) => self.tag_record_at(ti)?.sha,
                 None => String::new(),
             };
-            out.push(RefMeta { name, sha, tag_sha });
+            let (sha, tree_sha) = match cidx {
+                Some(c) => (
+                    self.idx_to_sha(c)?
+                        .ok_or_else(|| Error::Meta("ref target not in chain".into()))?,
+                    String::new(),
+                ),
+                None => {
+                    let ti = tag.ok_or_else(|| {
+                        Error::Meta(format!("ref {name} has neither commit nor tag"))
+                    })?;
+                    (String::new(), self.peeled_tree_oid(ti)?)
+                }
+            };
+            out.push(RefMeta { name, sha, tag_sha, tree_sha });
         }
         Ok(out)
     }
@@ -1071,8 +1155,9 @@ pub(crate) fn kv_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
 // ------------------------------------------------------ staged ref diff
 
 /// A ref's value: (commit_idx, tree_idx, tag_idx) — commit/tree PEELED,
-/// tag_idx set only for annotated tags.
-pub(crate) type RefVal = (u64, u64, Option<u64>);
+/// tag_idx set only for annotated tags; commit_idx None = a tag
+/// peeling to a tree.
+pub(crate) type RefVal = (Option<u64>, u64, Option<u64>);
 
 /// One staged ref movement: reflog record content + the refs-table
 /// change to apply in the same operation. The reflog row carries only
@@ -1088,13 +1173,16 @@ pub(crate) struct RefChange {
 /// (already resolved to indices). Every movement — appearance, move,
 /// disappearance — becomes one change; deletion = `new` absent.
 pub(crate) fn diff_refs(
-    current: &[(String, u64, u64, Option<u64>)],
-    observed: &[(String, u64, u64, Option<u64>)],
+    current: &[(String, Option<u64>, u64, Option<u64>)],
+    observed: &[(String, Option<u64>, u64, Option<u64>)],
 ) -> Vec<RefChange> {
     let mut cur: HashMap<&str, RefVal> =
         current.iter().map(|(n, c, t, g)| (n.as_str(), (*c, *t, *g))).collect();
     let note_for = |old: Option<RefVal>, new: Option<RefVal>| -> &'static str {
-        if old.is_some_and(|v| v.2.is_some()) || new.is_some_and(|v| v.2.is_some()) {
+        let tree_tag = |v: Option<RefVal>| v.is_some_and(|v| v.0.is_none());
+        if tree_tag(old) || tree_tag(new) {
+            "tag@tree"
+        } else if old.is_some_and(|v| v.2.is_some()) || new.is_some_and(|v| v.2.is_some()) {
             "tag"
         } else {
             ""
@@ -1180,7 +1268,8 @@ pub(crate) fn apply_ref_changes(
                        commit_idx = excluded.commit_idx,
                        tree_idx = excluded.tree_idx,
                        tag_idx = excluded.tag_idx",
-                    rusqlite::params![ch.name, c as i64, t as i64, g.map(|v| v as i64)],
+                    rusqlite::params![ch.name, c.map(|v| v as i64), t as i64,
+                                      g.map(|v| v as i64)],
                 )
                 .map_err(sql_err)?;
             }
@@ -1281,7 +1370,7 @@ impl<'a> Ingest<'a> {
     // tree oid equals `tree_oid` (caller-checked from the fetch
     // buffer): reuse its tree_idx — no persistent oid index (module
     // doc).
-    fn tree_idx_for(
+    pub(crate) fn tree_idx_for(
         &mut self,
         tree_oid: &str,
         same_tree_parent: Option<&str>,
@@ -1414,17 +1503,40 @@ impl<'a> Ingest<'a> {
         Ok(self.tag_cache.contains_key(sha) || self.st.tag_sha_to_idx(sha)?.is_some())
     }
 
+    /// tree_idx already known to this ingest for a git tree oid
+    /// (every staged commit's root tree lands here).
+    pub(crate) fn known_tree_idx(&self, tree_oid: &str) -> Option<u64> {
+        self.tree_cache.get(tree_oid).copied()
+    }
+
+    /// The tree_idx of a commit already staged or stored, memoized
+    /// under `tree_oid` for later tag lookups.
+    pub(crate) fn tree_idx_of_commit(&mut self, sha: &str, tree_oid: &str) -> Result<u64> {
+        let cidx = self.parent_idx(sha)?;
+        let t = match self.tree_of_commit.get(&cidx) {
+            Some(t) => *t,
+            None => self.st.commit_record_at_n(cidx, self.n_commits)?.tree_idx,
+        };
+        self.tree_cache.insert(tree_oid.to_string(), t);
+        Ok(t)
+    }
+
     /// Stage one annotated-tag object. Nested chains must arrive
-    /// inner-first; `target_sha` is the FULLY-peeled commit, which must
-    /// already be staged or stored (tags ingest after commits).
-    pub(crate) fn add_tag(&mut self, sha: &str, target_sha: &str, raw: &[u8]) -> Result<u64> {
-        let target_commit_idx = self.parent_idx(target_sha)?;
+    /// inner-first; the target must already be staged or stored (tags
+    /// ingest after commits/trees). `TagPeel::Commit` carries the
+    /// FULLY-peeled commit sha; `TagPeel::Tree` the resolved TREES
+    /// index (dedup/import decided by the caller — lib.rs owns git).
+    pub(crate) fn add_tag(&mut self, sha: &str, peel: TagPeel<'_>, raw: &[u8]) -> Result<u64> {
+        let target = match peel {
+            TagPeel::Commit(target_sha) => TagTarget::Commit(self.parent_idx(target_sha)?),
+            TagPeel::Tree(tidx) => TagTarget::Tree(tidx),
+        };
         let idx = self.n_tags;
         self.n_tags += 1;
         let rec = TagRecord {
             idx,
             sha: sha.to_string(),
-            target_commit_idx,
+            target,
             raw: raw.to_vec(),
         };
         self.tag_recs.push(rec.encode());
@@ -1480,10 +1592,9 @@ impl<'a> Ingest<'a> {
     /// ref movement, then the bookkeeping transaction.
     pub(crate) fn finish(mut self, observed_refs: &[RefMeta]) -> Result<()> {
         self.flush_chains()?;
-        let observed: Vec<(String, u64, u64, Option<u64>)> = observed_refs
+        let observed: Vec<(String, Option<u64>, u64, Option<u64>)> = observed_refs
             .iter()
             .map(|r| {
-                let (c, t) = self.ref_row(&r.sha)?;
                 let tag = if r.tag_sha.is_empty() {
                     None
                 } else {
@@ -1497,7 +1608,22 @@ impl<'a> Ingest<'a> {
                         })?,
                     })
                 };
-                Ok((r.name.clone(), c, t, tag))
+                if !r.tree_sha.is_empty() {
+                    // Tag at a tree: no commit; the tree_idx is in the
+                    // tag record (chains are flushed by now).
+                    let ti = tag.ok_or_else(|| {
+                        Error::Meta(format!("tree-target ref {} without a tag", r.name))
+                    })?;
+                    let TagTarget::Tree(t) = self.st.tag_record_at(ti)?.target else {
+                        return Err(Error::Meta(format!(
+                            "ref {} peels to a tree but tag {} records a commit",
+                            r.name, r.tag_sha
+                        )));
+                    };
+                    return Ok((r.name.clone(), None, t, tag));
+                }
+                let (c, t) = self.ref_row(&r.sha)?;
+                Ok((r.name.clone(), Some(c), t, tag))
             })
             .collect::<Result<Vec<_>>>()?;
         let changes = diff_refs(&self.st.ref_rows()?, &observed);
@@ -1539,31 +1665,69 @@ pub fn commit_at(store: &Path, idx: usize) -> Result<CommitMeta> {
     s.commit_meta(&rec)
 }
 
+/// A `resolve_ref` hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    /// A commit — a ref's peeled target or a sha-prefix match.
+    Commit { sha: String, idx: usize },
+    /// An annotated tag peeling to a TREE: no commit exists; the pin
+    /// is the TAG object's sha (content-addressed, same semantics as a
+    /// commit pin) and tree_idx names the tagged tree's TREES record.
+    TreeTag { tag_sha: String, tree_idx: usize },
+}
+
+impl Resolved {
+    /// The content-addressed rev to pin: the commit sha, or the tag
+    /// object's sha for a tree tag.
+    pub fn sha(&self) -> &str {
+        match self {
+            Resolved::Commit { sha, .. } => sha,
+            Resolved::TreeTag { tag_sha, .. } => tag_sha,
+        }
+    }
+
+    /// `(sha, stable commit index)` when the target is a commit.
+    pub fn commit(&self) -> Option<(&str, usize)> {
+        match self {
+            Resolved::Commit { sha, idx } => Some((sha, *idx)),
+            Resolved::TreeTag { .. } => None,
+        }
+    }
+}
+
 /// Resolve REF — a ref name (`main` matches `refs/heads/main`, tags
 /// likewise, or the full refname) or a unique commit-sha prefix (ANY
-/// commit in the store is addressable, not just the tips) — to
-/// `(sha, stable commit index)`. `Ok(None)` = nothing matched; an
-/// ambiguous sha prefix is an error. Point lookups only.
-pub fn resolve_ref(store: &Path, refname: &str) -> Result<Option<(String, usize)>> {
+/// commit in the store is addressable, not just the tips) — to a
+/// [`Resolved`]: the peeled commit, or the tag+tree for a tag at a
+/// tree. `Ok(None)` = nothing matched; an ambiguous sha prefix is an
+/// error. Point lookups only.
+pub fn resolve_ref(store: &Path, refname: &str) -> Result<Option<Resolved>> {
     let s = Store::open(store)?;
     // Name order = the for-each-ref order (refs/heads before refs/tags).
-    let hit: Option<i64> = s
+    let hit: Option<(Option<i64>, i64, Option<i64>)> = s
         .conn
         .query_row(
-            "SELECT commit_idx FROM refs
+            "SELECT commit_idx, tree_idx, tag_idx FROM refs
              WHERE name = ?1 OR name = 'refs/heads/' || ?1
                 OR name = 'refs/tags/' || ?1
              ORDER BY name LIMIT 1",
             [refname],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(sql_err)?;
-    if let Some(idx) = hit {
-        let sha = s
-            .idx_to_sha(idx as u64)?
-            .ok_or_else(|| Error::Meta("ref target not in chain".into()))?;
-        return Ok(Some((sha, idx as usize)));
+    if let Some((cidx, tidx, tag)) = hit {
+        if let Some(idx) = cidx {
+            let sha = s
+                .idx_to_sha(idx as u64)?
+                .ok_or_else(|| Error::Meta("ref target not in chain".into()))?;
+            return Ok(Some(Resolved::Commit { sha, idx: idx as usize }));
+        }
+        let ti = tag.ok_or_else(|| Error::Meta("ref has neither commit nor tag".into()))?;
+        return Ok(Some(Resolved::TreeTag {
+            tag_sha: s.tag_record_at(ti as u64)?.sha,
+            tree_idx: tidx as usize,
+        }));
     }
     // sha / sha-prefix resolution: the walk-built map (one commits
     // walk per handle). Two hits suffice to prove ambiguity.
@@ -1578,7 +1742,7 @@ pub fn resolve_ref(store: &Path, refname: &str) -> Result<Option<(String, usize)
         }
     }
     match hits.as_slice() {
-        [(sha, idx)] => Ok(Some(((*sha).clone(), *idx as usize))),
+        [(sha, idx)] => Ok(Some(Resolved::Commit { sha: (*sha).clone(), idx: *idx as usize })),
         [] => Ok(None),
         _ => Err(Error::Meta(format!("commit prefix {refname} is ambiguous"))),
     }
@@ -1608,17 +1772,17 @@ pub fn reflog(store: &Path) -> Result<Vec<ReflogEntry>> {
     recs.reverse();
     let mut out = Vec::with_capacity(recs.len());
     for r in recs {
-        let sha_of = |o: Option<(u64, u64)>| -> Result<Option<String>> {
+        let sha_of = |o: Option<(Option<u64>, u64)>| -> Result<Option<String>> {
             match o {
-                Some((c, _)) => s.idx_to_sha(c),
-                None => Ok(None),
+                Some((Some(c), _)) => s.idx_to_sha(c),
+                _ => Ok(None),
             }
         };
         out.push(ReflogEntry {
             at: r.at,
             refname: r.refname,
-            old_commit_idx: r.old.map(|(c, _)| c),
-            new_commit_idx: r.new.map(|(c, _)| c),
+            old_commit_idx: r.old.and_then(|(c, _)| c),
+            new_commit_idx: r.new.and_then(|(c, _)| c),
             old_sha: sha_of(r.old)?,
             new_sha: sha_of(r.new)?,
             note: r.note,

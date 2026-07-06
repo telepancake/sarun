@@ -363,7 +363,7 @@ fn mirror_loop_clones_updates_and_follows_rewrites() {
     // repointed refs; the store keeps the old tip resolvable and the
     // export serves the NEW truth SHA-exact.
     let store = root.join("store");
-    let old_main = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0;
+    let old_main = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().sha().to_string();
     sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended"]);
     let o3 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
     assert_eq!(o3.update.new_commits, 1, "rewrite should add exactly the amended commit");
@@ -371,7 +371,7 @@ fn mirror_loop_clones_updates_and_follows_rewrites() {
     let refs = gitdepot::export(&store, &out).unwrap();
     let tip = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
     assert!(refs.iter().any(|r| r.name == "refs/heads/main" && r.sha == tip));
-    assert_eq!(gitdepot::resolve_ref(&store, &old_main).unwrap().unwrap().0,
+    assert_eq!(gitdepot::resolve_ref(&store, &old_main).unwrap().unwrap().sha(),
                old_main, "rewrite destroyed local history");
 
     // The fetch buffer is DERIVED state: delete repo.git, add a commit
@@ -400,12 +400,12 @@ fn mirror_loop_clones_updates_and_follows_rewrites() {
         .any(|r| r.name == "refs/heads/main" && r.sha == tip2));
 }
 
-/// The narrowed unsupported case: a tag whose peel ends at a TREE (the
-/// famous linux v2.6.11-tree shape) is refused with an error naming the
-/// ref, and the mirror loop aborts cleanly on it. Annotated tags at
-/// commits are in scope now — no blanket refusal.
+/// The narrowed unsupported case: a tag whose peel ends at a BLOB is
+/// refused with an error naming the ref, and the mirror loop aborts
+/// cleanly on it. Tags at commits AND trees are in scope now — blob
+/// tags are the only refusal (no known real-world need).
 #[test]
-fn import_refuses_tag_at_tree_by_name() {
+fn import_refuses_tag_at_blob_by_name() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -415,20 +415,116 @@ fn import_refuses_tag_at_tree_by_name() {
     std::fs::write(repo.join("f"), "x").unwrap();
     sh_git(&repo, &["add", "-A"]);
     sh_git(&repo, &["commit", "-q", "-m", "c"]);
-    sh_git(&repo, &["tag", "-a", "-m", "tree tag", "treetag", "main^{tree}"]);
+    sh_git(&repo, &["tag", "-a", "-m", "blob tag", "blobtag", "main:f"]);
     match gitdepot::import(&repo, &tmp.path().join("store"), 3) {
         Err(gitdepot::Error::Unsupported(m)) => {
-            assert!(m.contains("refs/tags/treetag") && m.contains("tree"),
+            assert!(m.contains("refs/tags/blobtag") && m.contains("blob"),
                     "error must name the ref and the peeled type: {m}");
         }
         Err(e) => panic!("expected Unsupported, got: {e}"),
-        Ok(_) => panic!("import of a tree-tag repo unexpectedly succeeded"),
+        Ok(_) => panic!("import of a blob-tag repo unexpectedly succeeded"),
     }
     // The mirror loop surfaces the same refusal, cleanly.
     match gitdepot::mirror(repo.to_str().unwrap(), &tmp.path().join("mirror")) {
-        Err(gitdepot::Error::Unsupported(m)) => assert!(m.contains("refs/tags/treetag")),
+        Err(gitdepot::Error::Unsupported(m)) => assert!(m.contains("refs/tags/blobtag")),
         other => panic!("mirror should abort Unsupported, got {other:?}"),
     }
+}
+
+/// Tags peeling to a TREE (the linux v2.6.11-tree shape): a tag at an
+/// existing commit's tree DEDUPS (no new TREES record), a tag at a
+/// standalone mktree'd tree imports one new TREES record; both export
+/// SHA-exact (standalone trees materialized via mktree), the mirror
+/// loop runs to completion, resolve_ref yields the tag-sha pin, and
+/// the readout serves the tagged tree by that pin.
+#[test]
+fn tree_tags_dedup_import_export_and_mirror() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let store = tmp.path().join("store");
+    let out = tmp.path().join("out");
+    build_fixture(&repo);
+
+    // (a) The linux shape: a tag at the tip commit's tree.
+    sh_git(&repo, &["tag", "-a", "-m", "tree of main", "treetag", "main^{tree}"]);
+    // (b) A standalone tree equal to no commit's tree.
+    let git_stdin = |args: &[&str], input: &[u8]| -> String {
+        let out = Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn().and_then(|mut c| {
+                use std::io::Write as _;
+                c.stdin.take().unwrap().write_all(input)?;
+                c.wait_with_output()
+            }).unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let blob = git_stdin(&["hash-object", "-w", "--stdin"], b"standalone bytes\n");
+    let tree = git_stdin(&["mktree"],
+                         format!("100644 blob {blob}\tlone.txt\n").as_bytes());
+    sh_git(&repo, &["tag", "-a", "-m", "standalone tree", "lonetree", &tree]);
+
+    gitdepot::import(&repo, &store, 3).unwrap();
+    let st = gitdepot::store::Store::open(&store).unwrap();
+    // build_fixture makes 13 commits with 13 distinct trees; treetag
+    // dedups against main's tree, lonetree adds exactly one record.
+    assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 14,
+               "tree-tag dedup broke: treetag must reuse main's TREES record");
+    let tip_tree = st.commit_record_at(st.count(gitdepot::store::COMMITS).unwrap() - 1)
+        .unwrap().tree_idx;
+    drop(st);
+
+    // resolve_ref: the pin is the TAG sha; treetag's tree is the tip's.
+    let treetag_sha = sh_git(&repo, &["rev-parse", "refs/tags/treetag"]).trim().to_string();
+    let lonetree_sha = sh_git(&repo, &["rev-parse", "refs/tags/lonetree"]).trim().to_string();
+    assert_eq!(gitdepot::resolve_ref(&store, "treetag").unwrap().unwrap(),
+               gitdepot::Resolved::TreeTag {
+                   tag_sha: treetag_sha.clone(), tree_idx: tip_tree as usize });
+    match gitdepot::resolve_ref(&store, "lonetree").unwrap().unwrap() {
+        gitdepot::Resolved::TreeTag { tag_sha, .. } => assert_eq!(tag_sha, lonetree_sha),
+        other => panic!("lonetree must resolve TreeTag, got {other:?}"),
+    }
+
+    // Attach path: the tag-sha pin serves the tagged tree's bytes.
+    use depot::variant::Readout as _;
+    let ro = gitdepot::readout::TipReadout::for_commit(&store, &lonetree_sha, "")
+        .unwrap().expect("tag pin must hit");
+    assert_eq!(ro.blob(&[b"lone.txt"]),
+               Some(depot::variant::Blob::Bytes(b"standalone bytes\n".to_vec())));
+
+    // Export: byte-equal for-each-ref, both tags AND their peels.
+    gitdepot::export(&store, &out).unwrap();
+    let ffr = |repo: &Path| sh_git(repo, &["for-each-ref",
+        "--format=%(objectname) %(objecttype) %(refname)"]);
+    assert_eq!(ffr(&out), ffr(&repo), "exported for-each-ref differs");
+    for spec in ["refs/tags/treetag", "refs/tags/treetag^{tree}",
+                 "refs/tags/lonetree", "refs/tags/lonetree^{tree}"] {
+        assert_eq!(sh_git(&out, &["rev-parse", spec]),
+                   sh_git(&repo, &["rev-parse", spec]),
+                   "{spec} did not round-trip");
+    }
+
+    // Mirror loop with tree tags runs to completion, reflog notes the
+    // tag-at-tree movement with no commit fields.
+    let root = tmp.path().join("mirror");
+    gitdepot::mirror(repo.to_str().unwrap(), &root).unwrap();
+    let mstore = root.join("store");
+    assert!(matches!(gitdepot::resolve_ref(&mstore, "lonetree").unwrap().unwrap(),
+                     gitdepot::Resolved::TreeTag { .. }));
+    let log = gitdepot::store::reflog(&mstore).unwrap();
+    let row = log.iter().rev()
+        .find(|e| e.refname == "refs/tags/lonetree")
+        .expect("no reflog row for the tree tag");
+    assert_eq!(row.note, "tag@tree");
+    assert!(row.new_commit_idx.is_none() && row.new_sha.is_none(),
+            "tree-tag reflog row must carry no commit");
+    // A second mirror pass is a no-op (tree-tag rows diff stable).
+    let o = gitdepot::mirror(repo.to_str().unwrap(), &root).unwrap();
+    assert_eq!(o.update.new_commits, 0);
+    assert_eq!(o.update.depot_prepends, 0, "no-op mirror wrote records");
 }
 
 /// Mirror loop end-to-end with annotated tags: create resolves peeled;
@@ -447,9 +543,9 @@ fn mirror_follows_tag_moves_and_deletions() {
     // resolve_ref by tag name returns the PEELED commit.
     let peel = |name: &str| sh_git(&origin, &["rev-parse", &format!("{name}^{{}}")])
         .trim().to_string();
-    let (v1_sha, _) = gitdepot::resolve_ref(&store, "v1.0").unwrap().unwrap();
+    let v1_sha = gitdepot::resolve_ref(&store, "v1.0").unwrap().unwrap().sha().to_string();
     assert_eq!(v1_sha, peel("refs/tags/v1.0"));
-    assert_eq!(gitdepot::resolve_ref(&store, "nested").unwrap().unwrap().0,
+    assert_eq!(gitdepot::resolve_ref(&store, "nested").unwrap().unwrap().sha(),
                peel("refs/tags/nested"));
     let n_tags_0 = {
         let st = gitdepot::store::Store::open(&store).unwrap();
@@ -462,7 +558,7 @@ fn mirror_follows_tag_moves_and_deletions() {
     sh_git(&origin, &["tag", "-f", "-a", "-m", "moved", "v2.0", "main"]);
     gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
     let new_peel = peel("refs/tags/v2.0");
-    assert_eq!(gitdepot::resolve_ref(&store, "v2.0").unwrap().unwrap().0, new_peel);
+    assert_eq!(gitdepot::resolve_ref(&store, "v2.0").unwrap().unwrap().sha(), new_peel);
     let log = gitdepot::store::reflog(&store).unwrap();
     let mv = log.iter().rev()
         .find(|e| e.refname == "refs/tags/v2.0" && e.new_commit_idx.is_some()
@@ -694,11 +790,17 @@ fn resolve_ref_point_lookups() {
 
     let main_sha = meta.refs.iter()
         .find(|r| r.name == "refs/heads/main").unwrap().sha.clone();
+    let commit = |sha: &str, idx: usize| gitdepot::Resolved::Commit {
+        sha: sha.to_string(), idx,
+    };
     assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap(),
-               (main_sha.clone(), n - 1));
+               commit(&main_sha, n - 1));
     assert_eq!(gitdepot::resolve_ref(&store, "refs/heads/main").unwrap().unwrap(),
-               (main_sha.clone(), n - 1));
-    let (v1_sha, v1_idx) = gitdepot::resolve_ref(&store, "v1").unwrap().unwrap();
+               commit(&main_sha, n - 1));
+    let (v1_sha, v1_idx) = match gitdepot::resolve_ref(&store, "v1").unwrap().unwrap() {
+        gitdepot::Resolved::Commit { sha, idx } => (sha, idx),
+        other => panic!("lightweight tag must resolve to a commit, got {other:?}"),
+    };
     assert_eq!(v1_sha, meta.commits[n - 1 - v1_idx].sha, "tag idx mismatched sha");
     assert_ne!(v1_idx, n - 1, "main~1 is not the newest record");
 
@@ -709,10 +811,10 @@ fn resolve_ref_point_lookups() {
         plen += 1;
     }
     assert_eq!(gitdepot::resolve_ref(&store, &target[..plen]).unwrap().unwrap(),
-               (target.clone(), n - 6));
+               commit(target, n - 6));
     // Both prefix parities resolve (a longer unique prefix stays unique).
     assert_eq!(gitdepot::resolve_ref(&store, &target[..plen + 1]).unwrap().unwrap(),
-               (target.clone(), n - 6));
+               commit(target, n - 6));
     // Stable index round-trips through commit_at.
     assert_eq!(gitdepot::commit_at(&store, n - 6).unwrap().sha, *target);
 
@@ -769,7 +871,8 @@ fn update_metadata_is_o_new_not_o_history() {
     assert_eq!(after[133].0, 133, "new commit must land at index N");
     // And the stable index reads back through the point accessors.
     assert_eq!(gitdepot::commit_at(&store, 133).unwrap().sha, after[133].1);
-    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().1, 133);
+    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap()
+                   .commit().unwrap().1, 133);
 }
 
 /// Upstream deletes a branch: the ref row is GONE from the refs table,
@@ -784,7 +887,7 @@ fn upstream_branch_deletion_drops_ref_and_keeps_history() {
     build_fixture(&origin);
     gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
     let store = root.join("store");
-    let side_sha = gitdepot::resolve_ref(&store, "side").unwrap().unwrap().0;
+    let side_sha = gitdepot::resolve_ref(&store, "side").unwrap().unwrap().sha().to_string();
     let n = gitdepot::commit_count(&store).unwrap();
 
     sh_git(&origin, &["branch", "-D", "side"]);
@@ -794,7 +897,7 @@ fn upstream_branch_deletion_drops_ref_and_keeps_history() {
     // The name no longer resolves; the commit (and the count) survive.
     assert!(gitdepot::resolve_ref(&store, "side").unwrap().is_none());
     assert_eq!(gitdepot::commit_count(&store).unwrap(), n);
-    assert_eq!(gitdepot::resolve_ref(&store, &side_sha).unwrap().unwrap().0,
+    assert_eq!(gitdepot::resolve_ref(&store, &side_sha).unwrap().unwrap().sha(),
                side_sha);
     assert!(!gitdepot::store::refs(&store).unwrap().iter()
         .any(|r| r.name == "refs/heads/side"));
@@ -832,20 +935,20 @@ fn upstream_rewrite_keeps_history_in_place() {
     build_fixture(&origin);
     gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
     let store = root.join("store");
-    let old_main = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0;
+    let old_main = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().sha().to_string();
     let old_count = gitdepot::commit_count(&store).unwrap();
 
     sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended"]);
     gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
 
     // Old commits still resolvable by sha…
-    assert_eq!(gitdepot::resolve_ref(&store, &old_main).unwrap().unwrap().0,
+    assert_eq!(gitdepot::resolve_ref(&store, &old_main).unwrap().unwrap().sha(),
                old_main);
     assert_eq!(gitdepot::commit_count(&store).unwrap(), old_count + 1);
     // …and still exportable: the export stream carries the whole store,
     // rewritten-away commits included.
     let new_main = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
-    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0,
+    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().sha(),
                new_main);
     let out = tmp.path().join("out");
     gitdepot::export(&store, &out).unwrap();
@@ -874,11 +977,11 @@ fn successive_rewrites_never_copy_the_store() {
     build_fixture(&origin);
     gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
     let store = root.join("store");
-    let tip0 = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0;
+    let tip0 = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().sha().to_string();
 
     sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended once"]);
     gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
-    let tip1 = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0;
+    let tip1 = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().sha().to_string();
 
     sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended twice"]);
     gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
@@ -891,7 +994,7 @@ fn successive_rewrites_never_copy_the_store() {
         .collect();
     assert!(extra.is_empty(), "rewrites left store copies: {extra:?}");
     for old in [&tip0, &tip1] {
-        assert_eq!(gitdepot::resolve_ref(&store, old).unwrap().unwrap().0, **old,
+        assert_eq!(gitdepot::resolve_ref(&store, old).unwrap().unwrap().sha(), old.as_str(),
                    "rewritten-away tip no longer resolvable");
     }
 }
@@ -1004,5 +1107,5 @@ fn mirror_discards_a_stale_partial_clone_scratch() {
     assert!(!root.join("repo.git/junk").exists(), "partial clone leaked into the buffer");
     let store = root.join("store");
     let tip = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
-    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0, tip);
+    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().sha(), tip);
 }

@@ -132,6 +132,10 @@ def main():
         (repo / "README").write_text("readme v2\n")
         sh_git(repo, "add", "-A")
         sh_git(repo, "commit", "-q", "-m", "v2")
+        # A tag at a TREE (the linux v2.6.11-tree shape) — attachable
+        # by name, pinned by the tag's own sha.
+        sh_git(repo, "config", "tag.gpgsign", "false")
+        sh_git(repo, "tag", "-a", "-m", "tree tag", "treetag", "main^{tree}")
         store = tmp / "store"
         r = subprocess.run([str(GITDEPOT), "import", str(repo), str(store)],
                            capture_output=True, text=True)
@@ -199,14 +203,33 @@ def main():
         check("gitsdk/README" not in rows(sp),
               "rejected write left NO captured row")
 
-        # UI visibility: the attachment rides the session dict's
-        # "attachments" (it is NOT a box, so never a parent).
+        # Attach by TREE-TAG name: no commit exists; the pin is the TAG
+        # object's sha and the overlay serves the tagged tree.
+        rep = m.sync_request(sock, type="ui", verb="git_attach",
+                             args=[sid, str(store), "treetag", "gittree"])
+        tr = (rep or {}).get("r", {})
+        check(tr.get("ok") is True, f"tree-tag git_attach succeeds (got {rep!r})")
+        tag_sha = sh_git(repo, "rev-parse", "refs/tags/treetag").strip()
+        check(tr.get("sha") == tag_sha,
+              f"tree-tag pin is the TAG object's sha (got {tr.get('sha')!r})")
+        tname = tr.get("name") or ""
+        r = subprocess.run(
+            [str(BIN), "run", "WORK", "--",
+             "sh", "-c", "cat /gittree/README > /treereadme.txt"],
+            capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0,
+              f"read of tree-tag attachment succeeds (rc={r.returncode}: {r.stderr[:200]})")
+        check(row_bytes(m, sp, "treereadme.txt") == b"readme v2\n",
+              "tree-tag attachment serves the tagged tree's bytes")
+
+        # UI visibility: the attachments ride the session dict's
+        # "attachments" (they are NOT boxes, so never parents).
         rep = m.sync_request(sock, type="ui", verb="session_dicts", args=[])
         sessions = (rep or {}).get("r", [])
         mine = next((s for s in sessions if s.get("box_id") == sid), {})
         atts = mine.get("attachments") or []
-        check([a.get("name") for a in atts] == [aname],
-              f"attachment listed in session attachments (got {atts!r})")
+        check([a.get("name") for a in atts] == [aname, tname],
+              f"attachments listed in session attachments (got {atts!r})")
         check(atts and atts[0].get("kind") == "git"
               and atts[0].get("rev") == sha,
               f"attachment row pins kind+rev (got {atts!r})")

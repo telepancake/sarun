@@ -41,22 +41,46 @@ impl TipReadout {
         }
     }
 
-    /// Readout of ONE commit, selected by exact sha. Walks the trees
-    /// chain down to the commit's tree NOW; serving is O(1) afterwards.
-    /// `Ok(None)` when the sha is not in the store.
+    /// Readout of ONE commit, selected by exact sha — or, when the sha
+    /// is an annotated TAG's (the tree-tag pin written by git_attach),
+    /// the tag's peeled tree. Walks the trees chain down to that tree
+    /// NOW; serving is O(1) afterwards. `Ok(None)` when the sha is
+    /// neither a commit nor a tag in the store.
     pub fn for_commit(store: &Path, sha: &str, prefix: &str) -> Result<Option<Self>> {
         let st = store::Store::open(store)?;
-        let Some(cidx) = st.sha_to_idx(sha)? else {
-            return Ok(None);
+        let tree_idx = match st.sha_to_idx(sha)? {
+            Some(cidx) => st.commit_record_at(cidx)?.tree_idx,
+            None => match st.tag_sha_to_idx(sha)? {
+                Some(ti) => match st.tag_record_at(ti)?.target {
+                    store::TagTarget::Tree(t) => t,
+                    store::TagTarget::Commit(c) => st.commit_record_at(c)?.tree_idx,
+                },
+                None => return Ok(None),
+            },
         };
-        let rec = st.commit_record_at(cidx)?;
-        let tree = st.tree_view(rec.tree_idx)?;
+        Ok(Some(Self::for_tree_open(&st, store, tree_idx, prefix)?))
+    }
+
+    /// Readout of one TREES record by stable index — the tree-tag
+    /// serving path, trivial next to `for_commit`.
+    pub fn for_tree(store: &Path, tree_idx: u64, prefix: &str) -> Result<Self> {
+        let st = store::Store::open(store)?;
+        Self::for_tree_open(&st, store, tree_idx, prefix)
+    }
+
+    fn for_tree_open(
+        st: &store::Store,
+        store: &Path,
+        tree_idx: u64,
+        prefix: &str,
+    ) -> Result<Self> {
+        let tree = st.tree_view(tree_idx)?;
         let prefix = split_prefix(prefix);
         let nested =
             nest_view(tree, &prefix.iter().map(|c| c.as_slice()).collect::<Vec<_>>());
         let view = OnceLock::new();
         view.set(Some(nested)).expect("fresh OnceLock");
-        Ok(Some(TipReadout { store: store.to_path_buf(), prefix, view }))
+        Ok(TipReadout { store: store.to_path_buf(), prefix, view })
     }
 
     fn view(&self) -> Option<&View> {

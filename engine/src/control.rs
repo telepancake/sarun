@@ -1861,8 +1861,11 @@ macro_rules! ui_verbs {
             // attachable, not just the tips. Point lookups in the
             // store's meta.sqlite (gitdepot::resolve_ref owns the
             // semantics) — no commit-list materialization on attach.
+            // A tag-at-tree ref attaches the tagged tree; its pin is
+            // the TAG object's sha (content-addressed like a commit
+            // pin — the readout dispatches on it).
             let sha = match gitdepot::resolve_ref(store_path, refname) {
-                Ok(Some((sha, _pos))) => sha,
+                Ok(Some(r)) => r.sha().to_string(),
                 Ok(None) => return json!({"ok": false, "error":
                     format!("no ref or commit {refname} in store")}),
                 Err(gitdepot::Error::Meta(msg)) =>

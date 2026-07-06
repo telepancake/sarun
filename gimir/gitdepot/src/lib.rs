@@ -31,15 +31,19 @@
 //!   PARENT INDICES, tree index, author/committer/message — batched
 //!   one chain record per ingest), REFLOG (every observed ref movement,
 //!   deletions included, batched likewise), TAGS (one object per
-//!   annotated tag — sha, PEELED commit index, complete raw tag bytes
-//!   as the export-fidelity payload; nested tag→tag chains stored
-//!   inner-first). Tags peeling to a tree/blob are refused with a named
-//!   Unsupported — the only remaining unsupported ref shape.
-//! * `<dir>/meta.sqlite` (WAL) — kv (schema=4, label/url, the
+//!   annotated tag — sha, PEELED target index (commit, or TREE for a
+//!   tag at a tree: deduped to a commit's tree when the oids match —
+//!   the linux v2.6.11-tree shape — else imported standalone), complete
+//!   raw tag bytes as the export-fidelity payload; nested tag→tag
+//!   chains stored inner-first). Tags peeling to a blob are refused
+//!   with a named Unsupported — the only remaining unsupported ref
+//!   shape (no known real-world need; revisit on evidence).
+//! * `<dir>/meta.sqlite` (WAL) — kv (schema=5, label/url, the
 //!   authoritative per-chain record counts), refs (CURRENT refs only:
-//!   name → PEELED commit_idx + tree_idx, nullable tag_idx for
+//!   name → PEELED nullable commit_idx + tree_idx, nullable tag_idx for
 //!   annotated tags — resolving/attaching by tag name yields the peeled
-//!   commit) — NOTHING else: sha → idx is an
+//!   commit; a tree tag has commit_idx NULL and attaches the tagged
+//!   tree, pinned by the tag's own sha) — NOTHING else: sha → idx is an
 //!   in-RAM map derived by one commits-chain walk per open handle
 //!   (store.rs cost model), and tree dedup is parent-oid comparison
 //!   plus an intra-ingest map, never persisted.
@@ -64,7 +68,7 @@ pub use cli::cli_main;
 pub mod readout;
 pub mod store;
 
-pub use store::{commit_at, commit_count, label, resolve_ref};
+pub use store::{commit_at, commit_count, label, resolve_ref, Resolved};
 
 // ------------------------------------------------------------------ meta
 
@@ -78,6 +82,10 @@ pub struct RefMeta {
     /// branches and lightweight tags.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tag_sha: String,
+    /// The peeled TREE oid when the tag peels to a tree (`sha` is then
+    /// empty — there is no commit); empty for everything else.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tree_sha: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -448,6 +456,7 @@ fn collect_refs(repo: &Path) -> Result<Vec<RefMeta>> {
                 name: name.to_string(),
                 sha: sha.to_string(),
                 tag_sha: String::new(),
+                tree_sha: String::new(),
             }),
             "tag" => {
                 // %(*…) peels one level here (a nested tag shows
@@ -461,17 +470,27 @@ fn collect_refs(repo: &Path) -> Result<Vec<RefMeta>> {
                 } else {
                     (peeled.to_string(), peeled_typ.to_string())
                 };
-                if peeled_typ != "commit" {
-                    return Err(Error::Unsupported(format!(
-                        "ref {name} is a tag that peels to a {peeled_typ} \
-                         (only commit-target tags are supported)"
-                    )));
+                match peeled_typ.as_str() {
+                    "commit" => refs.push(RefMeta {
+                        name: name.to_string(),
+                        sha: peeled,
+                        tag_sha: sha.to_string(),
+                        tree_sha: String::new(),
+                    }),
+                    // Tag at a tree (linux v2.6.11-tree): no commit.
+                    "tree" => refs.push(RefMeta {
+                        name: name.to_string(),
+                        sha: String::new(),
+                        tag_sha: sha.to_string(),
+                        tree_sha: peeled,
+                    }),
+                    _ => {
+                        return Err(Error::Unsupported(format!(
+                            "ref {name} is a tag that peels to a {peeled_typ} \
+                             (only commit- and tree-target tags are supported)"
+                        )));
+                    }
                 }
-                refs.push(RefMeta {
-                    name: name.to_string(),
-                    sha: peeled,
-                    tag_sha: sha.to_string(),
-                });
             }
             other => {
                 return Err(Error::Unsupported(format!(
@@ -487,7 +506,7 @@ fn collect_refs(repo: &Path) -> Result<Vec<RefMeta>> {
 }
 
 /// `object`/`type` headers of a raw tag object.
-fn parse_tag_target(sha: &str, raw: &[u8]) -> Result<(String, String)> {
+pub(crate) fn parse_tag_target(sha: &str, raw: &[u8]) -> Result<(String, String)> {
     let (mut obj, mut typ) = (None, None);
     for line in raw.split(|&b| b == b'\n') {
         if line.is_empty() {
@@ -505,10 +524,16 @@ fn parse_tag_target(sha: &str, raw: &[u8]) -> Result<(String, String)> {
     }
 }
 
+/// The fully-peeled end of a tag chain, by oid.
+enum TagPeelOid {
+    Commit(String),
+    Tree(String),
+}
+
 struct TagObj {
     sha: String,
-    /// The FULLY-peeled commit of the tag's chain.
-    target_commit: String,
+    /// The FULLY-peeled end of the tag's chain.
+    target: TagPeelOid,
     raw: Vec<u8>,
 }
 
@@ -543,12 +568,13 @@ fn collect_tag_objects(repo: &Path, refs: &[RefMeta]) -> Result<Vec<TagObj>> {
     let mut emitted = std::collections::BTreeSet::new();
     for outer in &outers {
         let mut chain = vec![outer.clone()];
-        loop {
+        let target = loop {
             let cur = chain.last().unwrap().clone();
             let (_, t_sha, t_typ) = &objs[&cur];
             match t_typ.as_str() {
                 "tag" => chain.push(t_sha.clone()),
-                "commit" => break,
+                "commit" => break TagPeelOid::Commit(t_sha.clone()),
+                "tree" => break TagPeelOid::Tree(t_sha.clone()),
                 // collect_refs already refused the ref by name; this
                 // backstops direct callers.
                 other => {
@@ -557,13 +583,16 @@ fn collect_tag_objects(repo: &Path, refs: &[RefMeta]) -> Result<Vec<TagObj>> {
                     )))
                 }
             }
-        }
-        let target_commit = objs[chain.last().unwrap()].1.clone();
+        };
+        let peeled = |t: &TagPeelOid| match t {
+            TagPeelOid::Commit(s) => TagPeelOid::Commit(s.clone()),
+            TagPeelOid::Tree(s) => TagPeelOid::Tree(s.clone()),
+        };
         for sha in chain.into_iter().rev() {
             if emitted.insert(sha.clone()) {
                 out.push(TagObj {
                     raw: objs[&sha].0.clone(),
-                    target_commit: target_commit.clone(),
+                    target: peeled(&target),
                     sha,
                 });
             }
@@ -572,14 +601,73 @@ fn collect_tag_objects(repo: &Path, refs: &[RefMeta]) -> Result<Vec<TagObj>> {
     Ok(out)
 }
 
+/// One buffer pass over the walked scope mapping each commit's root
+/// tree oid to a commit sha owning it — the tagged-tree dedup check
+/// when the intra-ingest tree cache misses (update path: the tree's
+/// commit was ingested in an earlier run).
+fn commit_tree_map(repo: &Path) -> Result<BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    for line in git_str(repo, &["log", "--format=%H %T", "--branches", "--tags"])?.lines() {
+        if let Some((sha, tree)) = line.split_once(' ') {
+            map.insert(tree.to_string(), sha.to_string());
+        }
+    }
+    Ok(map)
+}
+
+/// Resolve a tagged tree's oid to a TREES index: dedup against a
+/// commit's tree (intra-ingest cache first, then one `git log %H %T`
+/// buffer pass — the linux v2.6.11-tree shape, no new record), else
+/// import the tree standalone via the same view path as commit trees
+/// (its reverse delta anchors like any other record).
+fn tag_tree_idx(
+    repo: &Path,
+    ingest: &mut store::Ingest,
+    tree_oid: &str,
+    tree_of_commits: &mut Option<BTreeMap<String, String>>,
+) -> Result<u64> {
+    if let Some(i) = ingest.known_tree_idx(tree_oid) {
+        return Ok(i);
+    }
+    if tree_of_commits.is_none() {
+        *tree_of_commits = Some(commit_tree_map(repo)?);
+    }
+    if let Some(csha) = tree_of_commits.as_ref().unwrap().get(tree_oid) {
+        return ingest.tree_idx_of_commit(&csha.clone(), tree_oid);
+    }
+    let entries = ls_tree(repo, tree_oid)?;
+    let blobs = fetch_blobs(
+        repo,
+        entries
+            .iter()
+            .filter(|e| e.mode != "160000")
+            .map(|e| e.oid.clone()),
+    )?;
+    let full = tree_layer(&entries, &blobs)?;
+    let view = depot::apply(None, &full)
+        .ok_or_else(|| Error::Unsupported(format!("tagged tree {tree_oid} is empty")))?;
+    let full_rec = codec::encode(&depot::diff(None, Some(&view)));
+    ingest.tree_idx_for(tree_oid, None, &view, &full_rec)
+}
+
 /// Stage the repo's NEW annotated-tag objects; must run AFTER the
 /// commit loop so every peeled target index resolves.
 fn ingest_tags(repo: &Path, ingest: &mut store::Ingest, refs: &[RefMeta]) -> Result<()> {
+    let mut tree_of_commits = None;
     for t in collect_tag_objects(repo, refs)? {
         if ingest.knows_tag(&t.sha)? {
             continue;
         }
-        ingest.add_tag(&t.sha, &t.target_commit, &t.raw)?;
+        let peel = match &t.target {
+            TagPeelOid::Commit(sha) => store::TagPeel::Commit(sha),
+            TagPeelOid::Tree(oid) => store::TagPeel::Tree(tag_tree_idx(
+                repo,
+                ingest,
+                oid,
+                &mut tree_of_commits,
+            )?),
+        };
+        ingest.add_tag(&t.sha, peel, &t.raw)?;
     }
     Ok(())
 }
@@ -1023,6 +1111,68 @@ fn walk_files<'a>(
     Ok(())
 }
 
+fn object_exists(repo: &Path, oid: &str) -> Result<bool> {
+    Ok(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", oid])
+        .stderr(Stdio::null())
+        .status()?
+        .success())
+}
+
+/// Feed `input` to a git command and return trimmed stdout.
+fn git_stdin(repo: &Path, args: &[&str], input: &[u8]) -> Result<String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().expect("piped stdin").write_all(input)?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(Error::Git(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Write `view` into the repo's object database bottom-up
+/// (`hash-object -w` per blob, `mktree -z` per directory) and return
+/// the root tree oid — the standalone-tagged-tree export path.
+fn materialize_tree(repo: &Path, view: &depot::View) -> Result<String> {
+    let mut lines: Vec<u8> = Vec::new();
+    for (name, child) in &view.children {
+        let (mode, typ, oid) = match &child.blob {
+            Some(content) => {
+                let mode = child
+                    .attrs
+                    .get(&b"mode"[..])
+                    .map(|m| String::from_utf8_lossy(m).into_owned())
+                    .ok_or_else(|| Error::Meta("file node without mode attr".into()))?;
+                if mode == "160000" {
+                    // gitlink: the stored blob IS the pinned commit id.
+                    (mode, "commit", String::from_utf8_lossy(content).into_owned())
+                } else {
+                    let oid = git_stdin(repo, &["hash-object", "-w", "--stdin"], content)?;
+                    (mode, "blob", oid)
+                }
+            }
+            None => ("040000".into(), "tree", materialize_tree(repo, child)?),
+        };
+        lines.extend_from_slice(format!("{mode} {typ} {oid}\t").as_bytes());
+        lines.extend_from_slice(name);
+        lines.push(0);
+    }
+    git_stdin(repo, &["mktree", "-z"], &lines)
+}
+
 /// Export a store into a fresh git repository at `repo` (must not be an
 /// existing repo; `git init` is run there). Returns the regenerated tip
 /// shas by ref name; fails if any regenerated commit id differs from the
@@ -1155,6 +1305,23 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
     // skips git's format lint (historical tags predate it); fidelity is
     // OUR check — the produced id must equal the imported one.
     for t in &st.tag_records()? {
+        if let store::TagTarget::Tree(tidx) = t.target {
+            // A tag at a tree references the tree by oid. A tree that
+            // equals some commit's tree already exists post
+            // fast-import; a STANDALONE tagged tree must be
+            // materialized from its TREES record first (mktree
+            // bottom-up), and must regenerate its imported oid.
+            let (obj, typ) = parse_tag_target(&t.sha, &t.raw)?;
+            if typ == "tree" && !object_exists(repo, &obj)? {
+                let got = materialize_tree(repo, &st.tree_view(tidx)?)?;
+                if got != obj {
+                    return Err(Error::Meta(format!(
+                        "fidelity check failed: tagged tree regenerated as {got}, \
+                         imported as {obj}"
+                    )));
+                }
+            }
+        }
         let mut child = Command::new("git")
             .arg("-C")
             .arg(repo)

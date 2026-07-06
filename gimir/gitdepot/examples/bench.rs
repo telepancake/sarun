@@ -10,9 +10,11 @@ fn main() {
     let deep = args.next();
 
     let t = Instant::now();
-    let (sha, _idx) = gitdepot::resolve_ref(&store, "main").unwrap()
+    let sha = gitdepot::resolve_ref(&store, "main").unwrap()
         .or_else(|| gitdepot::resolve_ref(&store, "master").unwrap())
-        .expect("main/master");
+        .expect("main/master")
+        .sha()
+        .to_string();
     println!("resolve_ref            {:>10.3?}  ({})", t.elapsed(), &sha[..8]);
 
     let t = Instant::now();
