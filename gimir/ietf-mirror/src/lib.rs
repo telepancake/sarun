@@ -19,6 +19,10 @@
 //! too; `update` is idempotent across completed drafts either way.
 
 pub mod readout;
+#[cfg(feature = "fetch")]
+mod cli;
+#[cfg(feature = "fetch")]
+pub use cli::cli_main;
 
 use std::collections::BTreeMap;
 #[cfg(feature = "fetch")]

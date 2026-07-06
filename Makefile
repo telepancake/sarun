@@ -72,6 +72,11 @@ engine: vendor ## Build the engine (fully-static musl binary; cargo-zigbuild + z
 	  echo "WARNING: sud32 not built (32-bit toolchain missing?) —" \
 	       "32-bit binaries in sud boxes will fail to exec, loudly."; \
 	fi
+	@# The mirror drivers are compiled INTO sarun (multi-call dispatch on
+	@# argv[0] / subcommand — mirrors.rs self-execs); the symlinks are a
+	@# convenience for invoking a driver by name from the build dir.
+	@for d in gitdepot wikimak ietfmak; do \
+	  ln -sf sarun engine/target/x86_64-unknown-linux-musl/release/$$d; done
 	@echo "→ ./sarun → engine/target/x86_64-unknown-linux-musl/release/sarun"
 
 # ---- Tests ----------------------------------------------------------------

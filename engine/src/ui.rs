@@ -558,10 +558,11 @@ enum Action {
     DeleteRule,
     MoveRuleUp,
     MoveRuleDown,
-    /// Mirrors pane: the r / R / space key actions, menu-discoverable.
+    /// Mirrors pane: the r / R / space / D key actions, menu-discoverable.
     MirrorRun,
     MirrorRunPending,
     MirrorTogglePause,
+    MirrorRemove,
     PtyNew,
     PtyKill,
     PtyEmbedToggle,
@@ -668,6 +669,8 @@ enum ClauseField {
 enum ConfirmAction {
     Kill,
     Dissolve,
+    /// Mirrors pane: delete the selected mirror job (by id).
+    MirrorRemove(i64),
 }
 
 /// State of the off-loop structural diff for the selected BINARY change. Mirrors
@@ -3237,6 +3240,31 @@ impl App {
         self.load_mirrors();
     }
 
+    /// 'D' on Mirrors: y/n-confirmed delete of the selected job.
+    #[cfg_attr(test, allow(dead_code))]
+    fn confirm_mirror_remove(&mut self) {
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
+            self.status = "no mirror job selected".into();
+            return;
+        };
+        self.modal = Some(Modal::Confirm {
+            prompt: format!("Delete mirror job #{} ({} {} → {})?",
+                            job.id, job.kind, job.src, job.dest),
+            action: ConfirmAction::MirrorRemove(job.id),
+        });
+    }
+
+    /// The confirmed mirror-job delete. A running job refuses (the store's
+    /// "job is running" error) — surfaced on the status line, never fatal.
+    #[cfg_attr(test, allow(dead_code))]
+    fn mirror_remove(&mut self, id: i64) {
+        self.status = match crate::mirrors::job_remove(id) {
+            Ok(()) => format!("mirror #{id}: deleted"),
+            Err(e) => format!("mirror #{id}: {e}"),
+        };
+        self.load_mirrors();
+    }
+
     // ── navigation ── (driven by the interactive loop; not by headless tests)
 
     #[cfg_attr(test, allow(dead_code))]
@@ -4406,6 +4434,7 @@ impl App {
         match action {
             ConfirmAction::Kill => self.kill(),
             ConfirmAction::Dissolve => self.dissolve(),
+            ConfirmAction::MirrorRemove(id) => self.mirror_remove(id),
         }
     }
 
@@ -6703,7 +6732,9 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             rect);
         return;
     }
-    let w = (area.width * 7 / 10).clamp(20, area.width);
+    // max-then-min, NOT clamp: clamp(20, width) panics when the terminal
+    // reports width < 20 (seen as an app-exit on a 0-width pty).
+    let w = (area.width * 7 / 10).max(20).min(area.width);
     let want = match modal {
         Modal::Search { rows, .. } => (rows.len() as u16) + 6,
         Modal::ActionMenu { items, .. } => (items.len() as u16) + 5,
@@ -7218,7 +7249,7 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
     ('g', Pane::BuildEdges, "Build",   PaneVis::Data("edges"),     "build Graph — parsed ninja/make build edges from a -b box"),
     ('f', Pane::Flows,      "Flows",   PaneVis::Always,            "network flows — tshark-decoded HTTP/TLS from a -n box's pcap"),
     ('e', Pane::Rules,      "Rules",   PaneVis::Always,            "file rules — the ordered apply/discard/passthrough rules"),
-    ('M', Pane::Mirrors,    "Mirrors", PaneVis::Always,            "scheduled mirror updates — r run selected, R run pending, space pause/resume"),
+    ('M', Pane::Mirrors,    "Mirrors", PaneVis::Always,            "scheduled mirror updates — r run selected, R run pending, space pause/resume, D delete"),
     ('P', Pane::Pty,        "PTYs",    PaneVis::Pty,               "open an engine-held PTY — a live interactive shell pane"),
     ('i', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
     ('w', Pane::Network,    "Web",     PaneVis::Always,            "web captures — tap MITM HTTP(S) content archive (headers + body)"),
@@ -7306,7 +7337,7 @@ enum PaneAction {
     Quit, Detach,
     MoveDown, MoveUp, NextPane, Open,
     ApplyHunk, DiscardHunk, ApplyFile, DiscardFile, ApplyAll, DiscardAll,
-    ConfirmKill, ConfirmDissolve,
+    ConfirmKill, ConfirmDissolve, ConfirmMirrorRemove,
     NewRule, DeleteRule, StartRename,
     MirrorRun, MirrorRunPending, MirrorTogglePause,
     ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
@@ -7347,6 +7378,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('A'), PaneGate::Any,             PaneAction::ApplyAll,        Some("apply ALL the box's changes")),
     (Key::Char('X'), PaneGate::Any,             PaneAction::DiscardAll,      Some("discard ALL the box's changes")),
     (Key::Char('K'), PaneGate::Any,             PaneAction::ConfirmKill,     Some("kill box (SIGTERM, y/n)")),
+    (Key::Char('D'), PaneGate::On(Pane::Mirrors), PaneAction::ConfirmMirrorRemove, Some("delete mirror job (on Mirrors, y/n)")),
     (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("delete box: changes promoted down into children, never to host (y/n)")),
     (Key::Char('t'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleTree,  Some("toggle tree / flat chronological (on Pipes)")),
     (Key::Char('f'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleRunningOnly, Some("toggle running-only (on Pipes)")),
@@ -7391,17 +7423,27 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::DiscardFile => app.discard(),
         PaneAction::ApplyAll => app.apply_all(),
         PaneAction::DiscardAll => app.discard_all(),
-        PaneAction::ConfirmKill => app.modal = Some(Modal::Confirm {
-            prompt: format!("Kill (SIGTERM) {}?", app.box_op_scope_label()),
-            action: ConfirmAction::Kill,
-        }),
-        PaneAction::ConfirmDissolve => app.modal = Some(Modal::Confirm {
-            prompt: format!("Delete {}? Its changes are promoted down into \
-                             child boxes (never to the host); children are \
-                             kept and re-parented.",
-                            app.box_op_scope_label()),
-            action: ConfirmAction::Dissolve,
-        }),
+        // Both destructive box ops NO-OP when there is no box to act on
+        // (no session rows / nothing selected) — a modal over a subjectless
+        // pane was the old 'D anywhere' trap.
+        PaneAction::ConfirmKill => match app.cur_sid() {
+            None => app.status = "no box selected".into(),
+            Some(_) => app.modal = Some(Modal::Confirm {
+                prompt: format!("Kill (SIGTERM) {}?", app.box_op_scope_label()),
+                action: ConfirmAction::Kill,
+            }),
+        },
+        PaneAction::ConfirmDissolve => match app.cur_sid() {
+            None => app.status = "no box selected".into(),
+            Some(_) => app.modal = Some(Modal::Confirm {
+                prompt: format!("Delete {}? Its changes are promoted down into \
+                                 child boxes (never to the host); children are \
+                                 kept and re-parented.",
+                                app.box_op_scope_label()),
+                action: ConfirmAction::Dissolve,
+            }),
+        },
+        PaneAction::ConfirmMirrorRemove => app.confirm_mirror_remove(),
         PaneAction::NewRule => app.modal = Some(Modal::RuleForm {
             buf: String::new(), editing: None }),
         PaneAction::DeleteRule => app.delete_rule(),
@@ -12051,6 +12093,7 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                 mk("Run all pending jobs", "R", Action::MirrorRunPending),
                 mk(if paused { "Resume this job" } else { "Pause this job" },
                    "space", Action::MirrorTogglePause),
+                mk("Delete this job",     "D", Action::MirrorRemove),
             ]))
         }
         Pane::Pty => {
@@ -12116,6 +12159,7 @@ fn run_action(app: &mut App, a: Action) {
         Action::MirrorRun         => app.mirror_run_selected(),
         Action::MirrorRunPending  => app.mirror_run_pending(),
         Action::MirrorTogglePause => app.mirror_toggle_pause(),
+        Action::MirrorRemove      => app.confirm_mirror_remove(),
         Action::PtyNew         => open_pty_menu(app),
         // Every launch below funnels through build_launch(target, how) — one
         // builder, the same net/env/placement for all. Targets that are ready
@@ -15321,6 +15365,9 @@ mod tests {
         ] {
             let mut app = headless_app();
             app.focus = Pane::Sessions;
+            // The box-op confirms need a subject now: no session rows →
+            // status-line no-op instead of a modal (tested separately).
+            app.sessions = vec![json!({"session_id": "1", "path": "a"})];
             assert!(dispatch_pane_key(&mut app, KeyCode::Char(key)),
                     "'{key}' must be handled by the pane-key table");
             match app.modal {
@@ -16062,5 +16109,77 @@ mod tests {
         assert_eq!(job.state, "paused");
         let buf = render_to_string(&app, 120, 30).unwrap();
         assert!(buf.contains("paused"), "pause must show:\n{buf}");
+    }
+
+    /// 'D' on the Mirrors pane deletes the SELECTED JOB behind a y/n
+    /// confirm — it must never fall through to the box-dissolve entry
+    /// (the old behavior), and it must never exit the app.
+    #[test]
+    fn mirrors_pane_d_deletes_the_selected_job_with_confirm() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir()
+            .join(format!("sarun-mirrorsrm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: serialized by TEST_STATE_HOME_LOCK with the other
+        // state-home-dependent tests.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let id = crate::mirrors::job_add(
+            "git", "file:///src.git", "/depot/g", 3600).unwrap();
+        let mut app = headless_app();
+        app.go_to_pane(Pane::Mirrors);
+        assert!(dispatch_pane_key(&mut app, KeyCode::Char('D')),
+                "'D' must be handled by the pane-key table");
+        assert!(!app.should_quit, "'D' on Mirrors must not quit");
+        match &app.modal {
+            Some(Modal::Confirm { action: ConfirmAction::MirrorRemove(j), prompt }) => {
+                assert_eq!(*j, id);
+                assert!(prompt.contains("file:///src.git"), "{prompt}");
+            }
+            other => panic!("'D' on Mirrors must open the mirror-rm confirm, got {:?}",
+                            other.is_some()),
+        }
+        // The confirm renders (no draw panic), then 'y' deletes + reloads.
+        let buf = render_to_string(&app, 120, 30).unwrap();
+        assert!(buf.contains("Delete mirror job"), "confirm not rendered:\n{buf}");
+        handle_modal_key(&mut app, KeyCode::Char('y'), KeyModifiers::empty());
+        assert!(app.modal.is_none());
+        assert!(!app.should_quit);
+        assert!(app.status.contains("deleted"), "{}", app.status);
+        assert!(app.mirror_jobs.iter().all(|j| j.id != id), "pane must reload");
+        assert!(crate::mirrors::jobs_list().unwrap().iter().all(|j| j.id != id),
+                "job must be gone from the store");
+    }
+
+    /// The destructive box ops (D dissolve / K kill) NO-OP with a status
+    /// message when there is no box subject — no modal, no panic, no exit.
+    #[test]
+    fn box_op_confirms_noop_without_a_subject() {
+        use crossterm::event::KeyCode;
+        let mut app = headless_app();
+        app.focus = Pane::Changes; // any pane; sessions list is empty
+        assert!(dispatch_pane_key(&mut app, KeyCode::Char('D')));
+        assert!(app.modal.is_none(), "no subject → no confirm modal");
+        assert!(!app.should_quit);
+        assert_eq!(app.status, "no box selected");
+        app.status.clear();
+        assert!(dispatch_pane_key(&mut app, KeyCode::Char('K')));
+        assert!(app.modal.is_none());
+        assert_eq!(app.status, "no box selected");
+    }
+
+    /// A Confirm modal must render on ANY terminal width — the old
+    /// clamp(20, width) panicked (and killed the UI) below 20 columns.
+    #[test]
+    fn confirm_modal_renders_on_a_tiny_terminal() {
+        let mut app = headless_app();
+        app.modal = Some(Modal::Confirm {
+            prompt: "Delete?".into(), action: ConfirmAction::Dissolve });
+        for (w, h) in [(1u16, 1u16), (10, 5), (19, 24), (80, 24)] {
+            render_to_string(&app, w, h).unwrap();
+        }
     }
 }

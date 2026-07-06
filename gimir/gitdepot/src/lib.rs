@@ -53,6 +53,8 @@ use std::process::{Command, Stdio};
 use depot::codec;
 use depot::{Attrs, BlobOp, Layer, Node};
 
+mod cli;
+pub use cli::cli_main;
 pub mod readout;
 pub mod store;
 

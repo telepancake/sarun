@@ -1,11 +1,13 @@
 //! Mirror-update jobs: the engine-side schedule for `gitdepot mirror` /
 //! `wikimak fetch` / `ietfmak update` runs (MIRRORS.md "Update").
 //!
-//! The engine SCHEDULES; the driver binaries FETCH. The engine binary
-//! deliberately has no HTTP stack (the mirror crates' `fetch` feature is
-//! off in-engine), so a job run spawns the driver from PATH as a host
-//! process, records its outcome, and never touches the network itself.
-//! Moving those spawns into tap boxes later is mechanical.
+//! The engine SCHEDULES; the drivers FETCH. The drivers are compiled into
+//! the sarun binary itself (multi-call dispatch in main.rs), so a job run
+//! spawns the engine's OWN binary with the driver name as the subcommand.
+//! The child is a separate host process: the engine-never-dials-out
+//! property is a PROCESS property — the HTTP stack only ever runs in the
+//! spawned child, never in the engine's address space. Moving those
+//! spawns into tap boxes later is mechanical.
 //!
 //! Bookkeeping lives in `{state_home}/mirrors.db` (jobs are engine
 //! inventory, not box layer data). Liveness (which jobs are running
@@ -185,16 +187,31 @@ pub fn run_pending() -> Result<Vec<i64>, String> {
     Ok(started)
 }
 
+/// argv prefix that runs embedded driver `name`: the engine's own binary
+/// (`self_exe`) with the driver name as the first argument — main.rs
+/// multi-call dispatch routes it to the compiled-in CLI, so no separate
+/// driver binary is deployed. Bare-name PATH lookup is only the fallback
+/// for the degenerate case where current_exe() itself fails.
+fn driver_argv(name: &str, self_exe: Option<std::path::PathBuf>) -> Vec<String> {
+    match self_exe {
+        Some(exe) => vec![exe.to_string_lossy().into_owned(), name.to_string()],
+        None => vec![name.to_string()],
+    }
+}
+
 fn spawn_run(job: Job) {
+    let driver = |name: &str| driver_argv(name, std::env::current_exe().ok());
     let argv: Vec<String> = match job.kind.as_str() {
-        "git" => vec!["gitdepot".into(), "mirror".into(), job.src.clone(), job.dest.clone()],
-        "wiki" => vec!["wikimak".into(), "fetch".into(), job.src.clone(), job.dest.clone()],
+        "git" => [driver("gitdepot"),
+                  vec!["mirror".into(), job.src.clone(), job.dest.clone()]].concat(),
+        "wiki" => [driver("wikimak"),
+                   vec!["fetch".into(), job.src.clone(), job.dest.clone()]].concat(),
         // The plugin seam (gimir/PLUGINS.md): src IS the command line,
         // dest arrives as $1 (and $SARUN_MIRROR_DEST) — any script gets
         // the full job state machine without touching the engine.
         "cmd" => vec!["/bin/sh".into(), "-c".into(), job.src.clone(),
                       "mirror-job".into(), job.dest.clone()],
-        _ => vec!["ietfmak".into(), "update".into(), job.dest.clone()],
+        _ => [driver("ietfmak"), vec!["update".into(), job.dest.clone()]].concat(),
     };
     let id = job.id;
     // Reserve the running slot BEFORE anything else — the scheduler
@@ -231,7 +248,11 @@ fn spawn_run(job: Job) {
                     Err(e) => (-1, e.to_string()),
                 }
             }
-            Err(e) => (-1, format!("spawn {}: {e}", argv[0])),
+            // Name the resolution that failed: an absolute argv[0] is the
+            // self-exec path; a bare name means the PATH fallback.
+            Err(e) => (-1, format!(
+                "spawn {} ({}): {e}", argv[0],
+                if argv[0].starts_with('/') { "self-exec" } else { "via PATH" })),
         };
         running_map(|m| { m.remove(&id); });
         if let Ok(conn) = db() {
@@ -250,4 +271,31 @@ pub fn scheduler_thread() {
         let _ = run_pending();
         std::thread::sleep(std::time::Duration::from_secs(60));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The deployment contract: drivers are compiled into the engine
+    /// binary, so a driver run is a self-exec of current_exe with the
+    /// driver name as the subcommand. Bare-name PATH lookup only when
+    /// current_exe is unavailable.
+    #[test]
+    fn driver_argv_self_execs_the_engine_binary() {
+        let exe = std::path::PathBuf::from("/opt/sarun/bin/sarun");
+        assert_eq!(driver_argv("gitdepot", Some(exe)),
+                   vec!["/opt/sarun/bin/sarun".to_string(), "gitdepot".to_string()]);
+        assert_eq!(driver_argv("ietfmak", None), vec!["ietfmak".to_string()]);
+    }
+
+    /// The argv prefix must compose with a subcommand tail exactly the way
+    /// spawn_run builds it: [exe, driver, verb, args...].
+    #[test]
+    fn driver_argv_composes_with_the_subcommand_tail() {
+        let argv = [driver_argv("wikimak", Some("/x/sarun".into())),
+                    vec!["fetch".into(), "enwiki".into(), "/depot/w".into()]].concat();
+        assert_eq!(argv, ["/x/sarun", "wikimak", "fetch", "enwiki", "/depot/w"]
+                   .map(String::from).to_vec());
+    }
 }

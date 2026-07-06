@@ -9,6 +9,10 @@
 //! See `SPEC.md` for the on-disk layout, per-revision codec, and
 //! crash-safety contract.
 
+#[cfg(feature = "fetch")]
+mod cli;
+#[cfg(feature = "fetch")]
+pub use cli::cli_main;
 pub mod error;
 pub(crate) mod frames;
 pub mod import;

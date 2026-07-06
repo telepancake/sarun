@@ -20,11 +20,13 @@ depot-cache = { path = "../gimir/depot-cache" }
 # gitdepot store + ref to a view and imports it as an at-rest RO box.
 # Only the chain reader is used in-engine (no `git` binary needed).
 gitdepot = { path = "../gimir/gitdepot" }
-# Mirror READ paths for wiki_attach / ietf_attach (no default `fetch`
-# feature — the engine never dials out; fetching stays in the wikimak /
-# ietfmak drivers).
-ietf_mirror = { path = "../gimir/ietf-mirror", package = "ietf-mirror", default-features = false }
-wikimak_wikipedia = { path = "../gimir/wikimak/wikipedia", package = "wikimak-wikipedia", default-features = false }
+# Mirror read paths for wiki_attach / ietf_attach PLUS the driver CLIs
+# (`fetch`): sarun is a multi-call binary — `sarun wikimak|ietfmak|gitdepot`
+# (or an argv[0] symlink) runs the driver. The engine PROCESS still never
+# dials out: mirrors.rs re-execs this same binary, so all fetching happens
+# in a child process.
+ietf_mirror = { path = "../gimir/ietf-mirror", package = "ietf-mirror", default-features = false, features = ["fetch"] }
+wikimak_wikipedia = { path = "../gimir/wikimak/wikipedia", package = "wikimak-wikipedia", default-features = false, features = ["fetch"] }
 wikimak_depot = { path = "../gimir/wikimak/depot", package = "wikimak-depot" }
 base64 = "0.22.1"
 bytes = "1.10"

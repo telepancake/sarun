@@ -25,8 +25,11 @@ each corpus's shape wants, served through sarun. Three mirrors first:
   engine (`engine/src/mirrors.rs` + `sarun mirror` CLI + the Mirrors
   pane): jobs in `{state_home}/mirrors.db`, a minute tick starts due
   ones, states running/paused/pending/scheduled/completed/error/stopped,
-  force-run and run-pending on demand. The engine spawns the driver
-  binaries (it has no HTTP stack itself); interrupted runs surface as
+  force-run and run-pending on demand. The drivers are compiled into the
+  sarun binary (multi-call dispatch: `sarun gitdepot|wikimak|ietfmak …`
+  or an argv[0] symlink); a run spawns the engine's own binary in driver
+  mode, so the engine PROCESS still never dials out — fetch happens in
+  the child. Interrupted runs surface as
   `stopped` and auto-resume — safe because the stores self-repair
   (dirty-flag chain repair in wikimak, watermark fences in ietf-mirror,
   per-root flocks in both).

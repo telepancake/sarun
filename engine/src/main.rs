@@ -99,6 +99,7 @@ fn top_level_help() -> &'static str {
        sarun <NAME> [apply|discard|rename NEW|patch]   operate on a box from the CLI\n  \
        sarun <NAME> attach git|wiki|ietf SRC REF [AT]  attach a mirror object as a read-only reference\n  \
        sarun mirror <ls|add|run|pause|resume|rm> ...   scheduled mirror updates\n  \
+       sarun gitdepot|wikimak|ietfmak ...              embedded mirror-driver CLIs\n  \
        sarun verbs [FILTER]               list the engine's UI verbs (args + help)\n  \
        sarun oci <load|run|build|save|dockerfile|author> ...   OCI images (`sarun oci -h`)\n  \
        sarun oaita <gen|run|call|tail|add|where> NAME          LLM chat/agent runner (`oaita -h`)\n  \
@@ -416,6 +417,29 @@ fn tail_log(path: &std::path::Path, n_lines: usize) {
     }
 }
 
+/// Multi-call dispatch for the embedded mirror drivers: run the driver CLI
+/// when argv[0]'s basename IS a driver name (symlink launch) or when the
+/// first argument names one (`sarun gitdepot …`). Returns the exit code to
+/// use, or None when this isn't a driver invocation.
+fn driver_invocation() -> Option<i32> {
+    fn run(name: &str, args: &[String]) -> Option<i32> {
+        match name {
+            "gitdepot" => Some(gitdepot::cli_main(args)),
+            "wikimak" => Some(wikimak_wikipedia::cli_main(args)),
+            "ietfmak" => Some(ietf_mirror::cli_main(args)),
+            _ => None,
+        }
+    }
+    let argv: Vec<String> = std::env::args().collect();
+    let arg0 = argv.first().map(String::as_str).unwrap_or("");
+    let base = std::path::Path::new(arg0)
+        .file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if let Some(code) = run(base, &argv[1..]) {
+        return Some(code);
+    }
+    argv.get(1).and_then(|sub| run(sub, &argv[2..]))
+}
+
 fn main() {
     // Symlinked-as-`oaita` dispatch — same trick brush_sh / ninja / make use
     // below: when this engine binary is invoked under the name `oaita` (a
@@ -426,6 +450,13 @@ fn main() {
     if oaita::is_oaita_invocation() {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         std::process::exit(oaita::cli::main(&argv));
+    }
+    // Mirror drivers — same multi-call trick: `gitdepot` / `wikimak` /
+    // `ietfmak` are compiled into this binary (mirrors.rs re-execs it with
+    // the driver name, so the ENGINE process never dials out — fetch runs
+    // in the child). An argv[0] symlink named after a driver works too.
+    if let Some(code) = driver_invocation() {
+        std::process::exit(code);
     }
     // D9 follow-on — brush-sh shim. When a -b box shadows /bin/sh (etc.) with
     // this engine binary, a nested `sh -c RECIPE` execs us under the original
