@@ -101,3 +101,40 @@ frame (cap wlog 27 = decode default limit) + LDM. ripgrep, same data:
 
 Deep-2000 access on the wide-window store: 274ms (vs 203ms before —
 LDM decode cost, negligible). Import time unchanged (~85s L3).
+
+## 2026-07-06 — O(changes) streaming importer (ripgrep, tags kept)
+
+Discovery reworked from O(tree × history) to O(changes): the old loop
+spawned `cat-file commit` + `ls-tree -r` + a fresh `cat-file --batch`
+per commit, re-piping EVERY blob of the WHOLE tree for EVERY commit.
+Now: ONE `git log --format=%x01%H --raw -z --no-renames --no-abbrev
+--diff-merges=first-parent --topo-order --reverse --branches --tags`
+stream for the whole walk + ONE persistent `cat-file --batch`
+(request-one/read-one) for raw commit objects and changed blobs; views
+built frontier-style (clone first parent's view + apply_mut of the
+first-parent delta, refcounted by remaining children from one
+`rev-list --parents` pre-pass). Chain encoding untouched — old/new
+stores verified OBJECT-IDENTICAL on ripgrep (commit/tag records, ref
+rows, byte-identical TREES records; `tests/equivalence.rs` pins the
+same against a git-built reference on a merge-heavy DAG).
+
+Fixture: fresh `git clone --mirror` of ripgrep — 2259 commits,
+annotated tags KEPT this time (260 tag objects imported; the earlier
+run had to strip them). Same machine, L3, store 2.2MB either way.
+
+| | old (per-commit) | new (streaming) |
+|---|---|---|
+| full import | 57.9s | **4.9s** (11.8×) |
+| bytes read by driver (rchar, /proc/self/io) | 5.03GB | 124MB (40×) |
+| syscalls r/w | 859k / 1724k | 30k / 50k |
+| max frontier (live views) | — | 4 |
+| incremental update (3 commits) | — | 1.4s |
+
+Live smoke (sarun binary): `sarun gitdepot mirror <ripgrep clone>` =
+12.9s clone+import end-to-end; second mirror after moving master +
+re-adding a tag = 3 new commits in 2.2s.
+
+Remaining per-commit O(tree) CPU: the frontier's deep View clone and
+`encode(diff(None, view))` for each NEW tree (the chain's full-record
+anchor). Accepted for v1 — restructuring View for sharing is a
+separate change.

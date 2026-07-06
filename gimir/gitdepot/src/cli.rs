@@ -40,7 +40,8 @@ pub fn cli_main(args: &[String]) -> i32 {
             crate::import_opts(&PathBuf::from(repo), &PathBuf::from(store),
                                   level, report).map(|o| {
                 let Some(r) = &o.report else {
-                    println!("{} commits imported", o.meta.commits.len());
+                    println!("{} commits imported (max frontier {})",
+                             o.meta.commits.len(), o.max_frontier);
                     return;
                 };
                 println!(

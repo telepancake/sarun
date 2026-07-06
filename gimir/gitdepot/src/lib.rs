@@ -48,6 +48,15 @@
 //!   (store.rs cost model), and tree dedup is parent-oid comparison
 //!   plus an intra-ingest map, never persisted.
 //!
+//! Import/update discovery is O(changes), not O(tree × history): ONE
+//! `git log --raw` stream (first-parent deltas, full DAG, topo
+//! oldest-first) + ONE persistent `cat-file --batch` for raw commits
+//! and changed blobs; per-commit views are built frontier-style
+//! (clone first parent's view + apply_mut of the delta, refcounted by
+//! remaining children). The CHAIN ENCODING is untouched: the same
+//! records, reverse deltas, batching and anchoring land through
+//! `store::Ingest` exactly as before.
+//!
 //! Records carry STABLE indices counted from the oldest end (record k =
 //! newest-first frame N-1-k; prepends only grow N), so lineage lives in
 //! the data and an upstream rewrite is just new records + repointed
@@ -55,7 +64,7 @@
 //! git itself is driven by shelling out — sarun custom — so this tool
 //! needs a `git` binary and runs host-side.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -426,6 +435,9 @@ pub struct ImportOutcome {
     /// it recompresses the whole history five extra ways, so the
     /// mirror loop must never pay for it.
     pub report: Option<SizeReport>,
+    /// Peak count of live frontier views during the walk (DAG-width
+    /// instrumentation; each view is a full in-RAM tree).
+    pub max_frontier: usize,
 }
 
 /// Refs (bookkeeping): branches + tags only. `refs/pull/*` and friends
@@ -601,6 +613,347 @@ fn collect_tag_objects(repo: &Path, refs: &[RefMeta]) -> Result<Vec<TagObj>> {
     Ok(out)
 }
 
+// ------------------------------------------------------------- discovery
+//
+// Import/update walk the history O(changes), not O(tree × history):
+// ONE `git log --raw` stream yields every reachable commit with its
+// changed paths (vs the FIRST parent — the frontier's base), and ONE
+// persistent `git cat-file --batch` serves the raw commit objects and
+// the changed blobs on demand. No per-commit subprocess, no re-piping
+// of unchanged blobs.
+
+/// One persistent `git cat-file --batch` child for a whole run. Strict
+/// request-one/read-one interleaving: a single pending request never
+/// outgrows the pipe buffer, so no writer thread is needed (contrast
+/// fetch_blobs, which streams thousands of requests ahead).
+struct CatFile {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    out: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl CatFile {
+    fn new(repo: &Path) -> Result<CatFile> {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+        Ok(CatFile { child, stdin, out })
+    }
+
+    /// The raw bytes of one object (any type).
+    fn get(&mut self, oid: &str) -> Result<Vec<u8>> {
+        use std::io::{BufRead as _, Read as _};
+        writeln!(self.stdin, "{oid}")?;
+        self.stdin.flush()?;
+        let mut header = String::new();
+        self.out.read_line(&mut header)?;
+        let mut it = header.trim_end().split(' ');
+        let (h_oid, typ_or_miss, size) = (
+            it.next().unwrap_or_default(),
+            it.next().unwrap_or_default(),
+            it.next().unwrap_or_default(),
+        );
+        if typ_or_miss == "missing" || h_oid != oid {
+            return Err(Error::Git(format!("cat-file: {oid}: {}", header.trim_end())));
+        }
+        let size: usize = size
+            .parse()
+            .map_err(|_| Error::Git(format!("cat-file: bad size for {oid}")))?;
+        let mut buf = vec![0u8; size + 1]; // body + trailing \n
+        self.out.read_exact(&mut buf)?;
+        buf.pop();
+        Ok(buf)
+    }
+}
+
+impl Drop for CatFile {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One `--raw -z` changed-path line: the new side + status is all the
+/// frontier needs (D carries no new oid).
+struct RawChange {
+    status: u8,
+    new_mode: String,
+    new_oid: String,
+    path: Vec<u8>,
+}
+
+/// The one streaming walk: `git log --format=%x01%H --raw -z
+/// --no-renames --no-abbrev --diff-merges=first-parent --topo-order
+/// --reverse` over branches+tags (minus `negations` for updates).
+/// Stream grammar, NUL-tokenized (verified against git 2.43):
+///   `\x01<sha>\0` then, iff the commit changes anything vs its first
+///   parent (empty tree for roots), `\n:<meta>\0<path>\0` per change —
+///   only the FIRST meta token of a commit carries the `\n`. Tokens are
+///   dispatched by position, never by path content, so arbitrary path
+///   bytes are safe.
+struct LogStream {
+    child: std::process::Child,
+    out: std::io::BufReader<std::process::ChildStdout>,
+    /// The next commit's sha, read while scanning the previous one.
+    pending: Option<String>,
+    eof: bool,
+}
+
+impl LogStream {
+    fn spawn(repo: &Path, negations: &[String]) -> Result<LogStream> {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(repo)
+            .args([
+                "log",
+                "--format=%x01%H",
+                "--raw",
+                "-z",
+                "--no-renames",
+                "--no-abbrev",
+                "--diff-merges=first-parent",
+                "--topo-order",
+                "--reverse",
+                "--branches",
+                "--tags",
+            ]);
+        if !negations.is_empty() {
+            // A negation tip can have been pruned from the buffer's
+            // object db; --ignore-missing keeps the walk going (known
+            // commits that re-stream are skipped by the caller).
+            cmd.arg("--ignore-missing").arg("--not").args(negations);
+        }
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+        Ok(LogStream { child, out, pending: None, eof: false })
+    }
+
+    /// The next NUL-terminated token, delimiter stripped; None = EOF.
+    fn token(&mut self) -> Result<Option<Vec<u8>>> {
+        use std::io::BufRead as _;
+        let mut buf = Vec::new();
+        let n = self.out.read_until(0, &mut buf)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if buf.last() == Some(&0) {
+            buf.pop();
+        }
+        Ok(Some(buf))
+    }
+
+    /// The next commit and its first-parent changes, stream order
+    /// (parents before children); None = clean EOF.
+    fn next_commit(&mut self) -> Result<Option<(String, Vec<RawChange>)>> {
+        let sha = match self.pending.take() {
+            Some(s) => s,
+            None if self.eof => return Ok(None),
+            None => match self.token()? {
+                None => {
+                    self.finish()?;
+                    return Ok(None);
+                }
+                Some(t) => Self::sha_of(&t)?,
+            },
+        };
+        let mut changes = Vec::new();
+        loop {
+            let Some(tok) = self.token()? else {
+                self.finish()?;
+                self.eof = true;
+                break;
+            };
+            if tok.first() == Some(&1) {
+                self.pending = Some(Self::sha_of(&tok)?);
+                break;
+            }
+            // Meta token: optional leading \n (first change of a
+            // commit), then ":<old_mode> <new_mode> <old_oid> <new_oid> <status>".
+            let meta = tok.strip_prefix(b"\n").unwrap_or(&tok);
+            let meta = std::str::from_utf8(meta)
+                .ok()
+                .and_then(|s| s.strip_prefix(':'))
+                .ok_or_else(|| Error::Git(format!("log --raw: bad meta token {:?}",
+                                                  String::from_utf8_lossy(&tok))))?;
+            let f: Vec<&str> = meta.split(' ').collect();
+            let [_, new_mode, _, new_oid, status] = f.as_slice() else {
+                return Err(Error::Git(format!("log --raw: bad meta {meta:?}")));
+            };
+            let path = self
+                .token()?
+                .ok_or_else(|| Error::Git("log --raw: meta without path".into()))?;
+            changes.push(RawChange {
+                status: status.bytes().next().unwrap_or(0),
+                new_mode: new_mode.to_string(),
+                new_oid: new_oid.to_string(),
+                path,
+            });
+        }
+        Ok(Some((sha, changes)))
+    }
+
+    fn sha_of(tok: &[u8]) -> Result<String> {
+        std::str::from_utf8(&tok[1..])
+            .map(str::to_string)
+            .map_err(|_| Error::Git("log: non-utf8 sha".into()))
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        use std::io::Read as _;
+        let status = self.child.wait()?;
+        if !status.success() {
+            let mut err = String::new();
+            if let Some(e) = self.child.stderr.as_mut() {
+                let _ = e.read_to_string(&mut err);
+            }
+            return Err(Error::Git(format!("log --raw: {}", err.trim())));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LogStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Build the delta layer for one commit from its changed paths, blobs
+/// fetched on demand (each at most once per appearance — a per-layer
+/// oid memo would only help pathological diffs). Corner shapes:
+/// file→dir = D of the file + A's beneath it (the tombstone must
+/// revive as a live node that removes the blob and the file's attrs);
+/// dir→file = D's of the children + A of the path (a leaf set on a
+/// node that also carries child tombstones — composes as-is).
+fn delta_layer(changes: &[RawChange], cat: &mut CatFile) -> Result<Layer> {
+    let mut root = Node::keep();
+    for ch in changes {
+        let mut node = &mut root;
+        let mut segs = ch.path.split(|&b| b == b'/').peekable();
+        while let Some(seg) = segs.next() {
+            if seg.is_empty() {
+                return Err(Error::Unsupported("empty path segment".into()));
+            }
+            node = node.children.entry(seg.to_vec()).or_insert_with(Node::keep);
+            let leaf = segs.peek().is_none();
+            if !leaf && node.presence == depot::Presence::Tombstone {
+                // file→dir: the deleted file's name becomes a directory.
+                // Live + blob Remove + attrs replaced-with-empty (a
+                // canonical directory carries no attrs; the file's mode
+                // must not leak through inheritance).
+                node.presence = depot::Presence::Live;
+                node.blob = BlobOp::Remove;
+                node.attrs = Some(Attrs::new());
+            }
+            if leaf {
+                if ch.status == b'D' {
+                    // Children staged under this name (file→dir, A seen
+                    // first) must survive the delete of the old blob.
+                    if node.children.is_empty() {
+                        *node = Node::tombstone();
+                    } else {
+                        node.presence = depot::Presence::Live;
+                        node.blob = BlobOp::Remove;
+                        node.attrs = Some(Attrs::new());
+                    }
+                } else {
+                    let content = if ch.new_mode == "160000" {
+                        // gitlink: the pinned commit id IS the source data.
+                        ch.new_oid.clone().into_bytes()
+                    } else {
+                        cat.get(&ch.new_oid)?
+                    };
+                    node.presence = depot::Presence::Live;
+                    node.blob = BlobOp::Set(content);
+                    node.attrs = Some(Attrs::from([(
+                        b"mode".to_vec(),
+                        ch.new_mode.clone().into_bytes(),
+                    )]));
+                }
+            }
+        }
+    }
+    Ok(Layer { root })
+}
+
+/// One cheap `rev-list --parents` pass over the same scope as the log
+/// stream: per-sha child count (the frontier refcount — parents outside
+/// the streamed set included: those are the update path's boundary
+/// parents) and the streamed set itself.
+fn dag_children(
+    repo: &Path,
+    negations: &[String],
+) -> Result<(HashMap<String, u32>, std::collections::HashSet<String>)> {
+    let mut args: Vec<&str> = vec!["rev-list", "--parents", "--branches", "--tags"];
+    if !negations.is_empty() {
+        args.push("--ignore-missing");
+        args.push("--not");
+        args.extend(negations.iter().map(String::as_str));
+    }
+    let out = git_str(repo, &args)?;
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    let mut streamed = std::collections::HashSet::new();
+    for line in out.lines() {
+        let mut it = line.split(' ');
+        let sha = it.next().unwrap_or_default();
+        streamed.insert(sha.to_string());
+        for p in it {
+            *counts.entry(p.to_string()).or_insert(0) += 1;
+        }
+    }
+    Ok((counts, streamed))
+}
+
+/// The frontier: view-per-commit-with-unprocessed-children, refcounted
+/// by remaining children. Views are deep values (clone cost is O(tree)
+/// — accepted for v1; the last child MOVES the view instead).
+struct Frontier {
+    views: HashMap<String, (depot::View, u32)>,
+    max: usize,
+}
+
+impl Frontier {
+    /// Take the base view for a first parent: the last remaining child
+    /// moves it out, earlier ones clone.
+    fn take(&mut self, sha: &str) -> Result<depot::View> {
+        match self.views.get_mut(sha) {
+            Some((_, rc)) if *rc == 1 => Ok(self.views.remove(sha).expect("present").0),
+            Some((v, rc)) => {
+                *rc -= 1;
+                Ok(v.clone())
+            }
+            None => Err(Error::Git(format!(
+                "parent {sha} not in frontier (shallow clone, or a parent \
+                 outside the walked scope that is not in the store)"
+            ))),
+        }
+    }
+
+    /// Release one non-first-parent reference.
+    fn release(&mut self, sha: &str) -> Result<()> {
+        self.take(sha).map(|_| ())
+    }
+
+    fn insert(&mut self, sha: String, view: depot::View, rc: u32) {
+        if rc > 0 {
+            self.views.insert(sha, (view, rc));
+            self.max = self.max.max(self.views.len());
+        }
+    }
+}
+
 /// One buffer pass over the walked scope mapping each commit's root
 /// tree oid to a commit sha owning it — the tagged-tree dedup check
 /// when the intra-ingest tree cache misses (update path: the tree's
@@ -647,7 +1000,7 @@ fn tag_tree_idx(
     let view = depot::apply(None, &full)
         .ok_or_else(|| Error::Unsupported(format!("tagged tree {tree_oid} is empty")))?;
     let full_rec = codec::encode(&depot::diff(None, Some(&view)));
-    ingest.tree_idx_for(tree_oid, None, &view, &full_rec)
+    ingest.tree_idx_for(tree_oid, None, &view, Some(&full_rec))
 }
 
 /// Stage the repo's NEW annotated-tag objects; must run AFTER the
@@ -672,68 +1025,93 @@ fn ingest_tags(repo: &Path, ingest: &mut store::Ingest, refs: &[RefMeta]) -> Res
     Ok(())
 }
 
-/// All commits reachable from branches + tags, OLDEST-first (reversed
-/// topo order: parents always precede children — the stable-index
-/// assignment order). Same scope rule as `collect_refs`.
-fn rev_list_oldest_first(repo: &Path) -> Result<Vec<String>> {
-    let mut shas: Vec<String> =
-        git_str(repo, &["rev-list", "--topo-order", "--branches", "--tags"])?
-            .lines()
-            .map(str::to_string)
-            .collect();
-    shas.reverse();
-    Ok(shas)
-}
-
-/// Memoized commit-sha → root-tree-oid over the fetch buffer, for the
-/// parent-tree dedup check (store::Ingest — no persistent oid index).
-/// Parents outside the walked set (update path) cost one rev-parse;
-/// the buffer always has them (ancestors of a fetched tip).
-#[derive(Default)]
-struct TreeOidMemo(BTreeMap<String, String>);
-
-impl TreeOidMemo {
-    fn insert(&mut self, sha: &str, tree_oid: &str) {
-        self.0.insert(sha.to_string(), tree_oid.to_string());
-    }
-
-    /// A parent of `cm` whose tree oid equals `tree_oid`, if any.
-    fn same_tree_parent(
-        &mut self,
-        repo: &Path,
-        cm: &CommitMeta,
-        tree_oid: &str,
-    ) -> Result<Option<String>> {
-        for p in &cm.parents {
-            if !self.0.contains_key(p) {
-                let oid = git_str(repo, &["rev-parse", &format!("{p}^{{tree}}")])?;
-                self.0.insert(p.clone(), oid.trim().to_string());
-            }
-            if self.0[p] == tree_oid {
-                return Ok(Some(p.clone()));
-            }
+/// A parent of `cm` whose tree oid equals `tree_oid`, if any — the
+/// TREES dedup check. `memo` holds every streamed commit's tree oid;
+/// a miss (boundary parent) costs one small cat-file fetch.
+fn same_tree_parent(
+    cm: &CommitMeta,
+    tree_oid: &str,
+    memo: &mut HashMap<String, String>,
+    cat: &mut CatFile,
+) -> Result<Option<String>> {
+    for p in &cm.parents {
+        if !memo.contains_key(p) {
+            let raw = cat.get(p)?;
+            let (_, t) = parse_commit(&raw)?;
+            memo.insert(p.clone(), t);
         }
-        Ok(None)
+        if memo[p] == tree_oid {
+            return Ok(Some(p.clone()));
+        }
     }
+    Ok(None)
 }
 
-/// One commit's meta + resolved view.
-fn commit_view(repo: &Path, sha: &str) -> Result<(CommitMeta, String, depot::View)> {
-    let raw = git(repo, &["cat-file", "commit", sha])?;
-    let (mut cm, tree_oid) = parse_commit(&raw)?;
-    cm.sha = sha.to_string();
-    let entries = ls_tree(repo, sha)?;
-    let blobs = fetch_blobs(
-        repo,
-        entries
-            .iter()
-            .filter(|e| e.mode != "160000")
-            .map(|e| e.oid.clone()),
-    )?;
-    let full = tree_layer(&entries, &blobs)?;
-    let view = depot::apply(None, &full)
-        .ok_or_else(|| Error::Unsupported(format!("commit {sha} has an empty tree")))?;
-    Ok((cm, tree_oid, view))
+/// Drive the streaming walk into `ingest`: every not-yet-known commit
+/// gets its view built as (first parent's frontier view) + apply_mut of
+/// the first-parent raw delta, then lands via the UNCHANGED chain path
+/// (`Ingest::add_commit` — same records, same reverse deltas, same
+/// batching/anchoring as before). `seeds` are boundary views (update
+/// path: parents/known commits whose views live only in the store),
+/// pre-inserted with their refcounts. Returns the new CommitMetas
+/// oldest-first plus the max frontier size (instrumentation).
+fn ingest_stream(
+    repo: &Path,
+    ingest: &mut store::Ingest,
+    negations: &[String],
+    counts: &HashMap<String, u32>,
+    seeds: Vec<(String, depot::View)>,
+    known: &std::collections::HashSet<String>,
+    mut rep: Option<&mut ReportAccum>,
+) -> Result<(Vec<CommitMeta>, usize)> {
+    let mut cat = CatFile::new(repo)?;
+    let mut stream = LogStream::spawn(repo, negations)?;
+    let mut frontier = Frontier { views: HashMap::new(), max: 0 };
+    for (sha, view) in seeds {
+        let rc = counts.get(&sha).copied().unwrap_or(0);
+        frontier.insert(sha, view, rc);
+    }
+    let mut tree_oids: HashMap<String, String> = HashMap::new();
+    let mut commits = Vec::new();
+    while let Some((sha, changes)) = stream.next_commit()? {
+        if known.contains(&sha) {
+            continue; // already in the store; its view was seeded
+        }
+        let raw = cat.get(&sha)?;
+        let (mut cm, tree_oid) = parse_commit(&raw)?;
+        cm.sha = sha.clone();
+        // Base = FIRST parent's view (the raw delta is vs the first
+        // parent); other parents only release their frontier refs.
+        let mut view = match cm.parents.split_first() {
+            None => None,
+            Some((p1, rest)) => {
+                let base = frontier.take(p1)?;
+                for p in rest {
+                    frontier.release(p)?;
+                }
+                Some(base)
+            }
+        };
+        depot::apply_mut(&mut view, &delta_layer(&changes, &mut cat)?);
+        let view = view
+            .ok_or_else(|| Error::Unsupported(format!("commit {sha} has an empty tree")))?;
+        let same = same_tree_parent(&cm, &tree_oid, &mut tree_oids, &mut cat)?;
+        tree_oids.insert(sha.clone(), tree_oid.clone());
+        // The full record (`encode(diff(None, view))`, O(tree)) is only
+        // needed when this tree mints a new TREES record — or always,
+        // when the report accumulator measures every commit.
+        let need_full =
+            rep.is_some() || (same.is_none() && ingest.known_tree_idx(&tree_oid).is_none());
+        let full = need_full.then(|| codec::encode(&depot::diff(None, Some(&view))));
+        if let Some(r) = rep.as_deref_mut() {
+            r.push(&view, full.clone().expect("report forces full"));
+        }
+        ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view, full.as_deref())?;
+        let rc = counts.get(&sha).copied().unwrap_or(0);
+        frontier.insert(sha, view, rc);
+        commits.push(cm);
+    }
+    Ok((commits, frontier.max))
 }
 
 /// Import a git repo into `store` (created; must not exist).
@@ -748,28 +1126,25 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
     -> Result<ImportOutcome>
 {
     let refs = collect_refs(repo)?;
-    let shas = rev_list_oldest_first(repo)?;
+    let (counts, _) = dag_children(repo, &[])?;
 
     let mut st = store::Store::create(store)?;
     let mut ingest = store::Ingest::new(&mut st, level)?;
     // Walk oldest → newest, one resolved view at a time. The full
-    // record is derived from the VIEW via diff(None, view) — the same
-    // function the decoder uses to recompute refPrefix anchors from
-    // reconstructed views; bit-exactness of that anchor is load-bearing.
-    let mut commits = Vec::with_capacity(shas.len());
+    // record for a new tree is derived from the VIEW via
+    // diff(None, view) — the same function the decoder uses to
+    // recompute refPrefix anchors from reconstructed views;
+    // bit-exactness of that anchor is load-bearing.
     let mut rep = report.then(ReportAccum::default);
-    let mut tree_oids = TreeOidMemo::default();
-    for sha in &shas {
-        let (cm, tree_oid, view) = commit_view(repo, sha)?;
-        let same = tree_oids.same_tree_parent(repo, &cm, &tree_oid)?;
-        tree_oids.insert(sha, &tree_oid);
-        let full = codec::encode(&depot::diff(None, Some(&view)));
-        if let Some(r) = rep.as_mut() {
-            r.push(&view, full.clone());
-        }
-        ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view, &full)?;
-        commits.push(cm);
-    }
+    let (mut commits, max_frontier) = ingest_stream(
+        repo,
+        &mut ingest,
+        &[],
+        &counts,
+        Vec::new(),
+        &Default::default(),
+        rep.as_mut(),
+    )?;
     ingest_tags(repo, &mut ingest, &refs)?;
     ingest.finish(&refs)?;
     commits.reverse(); // Meta stays newest-first.
@@ -779,7 +1154,7 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
         None => None,
     };
     let meta = Meta { label: String::new(), url: String::new(), refs, commits };
-    Ok(ImportOutcome { meta, report })
+    Ok(ImportOutcome { meta, report, max_frontier })
 }
 
 /// Report-only accumulator: rebuilds the v1 comparison record families
@@ -885,24 +1260,56 @@ pub struct UpdateOutcome {
 /// forever.
 pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
     let refs = collect_refs(repo)?;
-    let shas = rev_list_oldest_first(repo)?;
-
     let mut st = store::Store::open(store)?;
     let base_prepends = st.depot_prepends();
-    let mut ingest = store::Ingest::new(&mut st, level)?;
-    let mut k = 0usize;
-    let mut tree_oids = TreeOidMemo::default();
-    for sha in &shas {
-        if ingest.knows_sha(sha)? {
+
+    // The stream is RESTRICTED to new history: negate the store's
+    // current commit tips (the refs table's previous state). Anything
+    // that still streams but is already stored (a rewind, a tip whose
+    // negation object was pruned) is skipped, its view seeded below.
+    let mut negations: Vec<String> = st
+        .refs_meta()?
+        .iter()
+        .filter(|r| !r.sha.is_empty())
+        .map(|r| r.sha.clone())
+        .collect();
+    negations.sort();
+    negations.dedup();
+    let (counts, streamed) = dag_children(repo, &negations)?;
+
+    // Boundary/known views: a new commit's parent can be an OLD commit
+    // whose view is in no frontier — reconstruct those from the store
+    // (ONE tree walk down to the deepest needed position), BEFORE the
+    // ingest starts (tree_view positions are kv-count-relative and the
+    // chain must not have unaccounted staged records).
+    let mut known = std::collections::HashSet::new();
+    let mut need: Vec<(String, u64)> = Vec::new(); // (sha, tree_idx)
+    for sha in &streamed {
+        // Already stored but streaming again (rewind, recreated branch,
+        // pruned negation object): skip its records, seed its view if
+        // any streamed child needs it.
+        if let Some(idx) = st.sha_to_idx(sha)? {
+            known.insert(sha.clone());
+            if counts.get(sha).copied().unwrap_or(0) > 0 {
+                need.push((sha.clone(), st.commit_record_at(idx)?.tree_idx));
+            }
+        }
+    }
+    for sha in counts.keys() {
+        if streamed.contains(sha) {
             continue;
         }
-        let (cm, tree_oid, view) = commit_view(repo, sha)?;
-        let same = tree_oids.same_tree_parent(repo, &cm, &tree_oid)?;
-        tree_oids.insert(sha, &tree_oid);
-        let full = codec::encode(&depot::diff(None, Some(&view)));
-        ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view, &full)?;
-        k += 1;
+        let idx = st.sha_to_idx(sha)?.ok_or_else(|| {
+            Error::Meta(format!("parent {sha} not in store (shallow history?)"))
+        })?;
+        need.push((sha.clone(), st.commit_record_at(idx)?.tree_idx));
     }
+    let seeds = seed_views(&st, need)?;
+
+    let mut ingest = store::Ingest::new(&mut st, level)?;
+    let (commits, _max_frontier) =
+        ingest_stream(repo, &mut ingest, &negations, &counts, seeds, &known, None)?;
+    let k = commits.len();
     ingest_tags(repo, &mut ingest, &refs)?;
     ingest.finish(&refs)?;
     Ok(UpdateOutcome {
@@ -911,6 +1318,35 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
         refs,
         depot_prepends: st.depot_prepends() - base_prepends,
     })
+}
+
+/// Reconstruct the views for `(sha, tree_idx)` pairs in ONE tree-chain
+/// walk (head → deepest needed position).
+fn seed_views(
+    st: &store::Store,
+    need: Vec<(String, u64)>,
+) -> Result<Vec<(String, depot::View)>> {
+    if need.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = st.count(store::TREES)?;
+    let mut by_pos: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (sha, tidx) in need {
+        if tidx >= n {
+            return Err(Error::Chain(format!("no tree at index {tidx}")));
+        }
+        by_pos.entry((n - 1 - tidx) as usize).or_default().push(sha);
+    }
+    let deepest = *by_pos.last_key_value().expect("non-empty").0;
+    let mut out = Vec::new();
+    st.walk_tree_views(Some(deepest), &mut |pos, _, view| {
+        if let Some(shas) = by_pos.get(&pos) {
+            for sha in shas {
+                out.push((sha.clone(), view.clone()));
+            }
+        }
+    })?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- mirror

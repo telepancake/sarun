@@ -1352,10 +1352,6 @@ impl<'a> Ingest<'a> {
         })
     }
 
-    pub(crate) fn knows_sha(&self, sha: &str) -> Result<bool> {
-        Ok(self.sha_cache.contains_key(sha) || self.st.sha_to_idx(sha)?.is_some())
-    }
-
     fn parent_idx(&self, sha: &str) -> Result<u64> {
         if let Some(i) = self.sha_cache.get(sha) {
             return Ok(*i);
@@ -1375,7 +1371,7 @@ impl<'a> Ingest<'a> {
         tree_oid: &str,
         same_tree_parent: Option<&str>,
         view: &depot::View,
-        full_record: &[u8],
+        full_record: Option<&[u8]>,
     ) -> Result<u64> {
         if let Some(i) = self.tree_cache.get(tree_oid) {
             return Ok(*i);
@@ -1389,6 +1385,11 @@ impl<'a> Ingest<'a> {
             self.tree_cache.insert(tree_oid.to_string(), t);
             return Ok(t);
         }
+        // A NEW tree needs its full record (the staged chain head / the
+        // seed) — callers may skip computing it for dedup'd trees.
+        let full_record = full_record.ok_or_else(|| {
+            Error::Chain(format!("tree {tree_oid} is new but no full record was supplied"))
+        })?;
         // New distinct tree: stage its record. The delta pushed rebuilds
         // the CURRENT staged head from this (next-newer) view; the very
         // first tree of a fresh store seeds the chain instead.
@@ -1459,14 +1460,15 @@ impl<'a> Ingest<'a> {
     /// Stage one commit (must arrive oldest-first: parents before
     /// children). `tree_oid` = the commit's `tree` header value;
     /// `same_tree_parent` = a parent sha with the same tree oid, if
-    /// any; `full_record` = `codec::encode(diff(None, view))`.
+    /// any; `full_record` = `codec::encode(diff(None, view))`, required
+    /// only when the tree is new (None is fine for dedup'd trees).
     pub(crate) fn add_commit(
         &mut self,
         cm: &CommitMeta,
         tree_oid: &str,
         same_tree_parent: Option<&str>,
         view: &depot::View,
-        full_record: &[u8],
+        full_record: Option<&[u8]>,
     ) -> Result<u64> {
         let tree_idx = self.tree_idx_for(tree_oid, same_tree_parent, view, full_record)?;
         let parent_idxs = cm
