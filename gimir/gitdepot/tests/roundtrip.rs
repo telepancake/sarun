@@ -768,7 +768,8 @@ fn successive_rewrites_never_copy_the_store() {
     let extra: Vec<_> = std::fs::read_dir(&root).unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "store" && n != "repo.git")
+        // .lock is the per-root run guard, not a store copy.
+        .filter(|n| n != "store" && n != "repo.git" && n != ".lock")
         .collect();
     assert!(extra.is_empty(), "rewrites left store copies: {extra:?}");
     for old in [&tip0, &tip1] {
@@ -822,4 +823,68 @@ fn tree_walk_matches_apply_reference_byte_exact() {
             "tree_view({idx}) diverges from the full walk"
         );
     }
+}
+
+/// Two schedulers on one root: the second run must refuse up front with
+/// the named lock error — never race git against the same buffer (the
+/// observed failure: clone --mirror and remote update --prune in
+/// parallel → "BUG: refs/files-backend.c: initial ref transaction …").
+#[test]
+fn mirror_refuses_while_another_run_holds_the_root() {
+    use std::os::fd::AsRawFd;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("mirror");
+    std::fs::create_dir_all(&root).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .create(true).write(true)
+        .open(root.join(".lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+
+    // The lock check precedes any git; the URL never gets dialed.
+    let err = gitdepot::mirror("file:///nonexistent", &root).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("another mirror run holds"), "wrong error: {msg}");
+    assert!(msg.contains(root.to_str().unwrap()), "error must name the root: {msg}");
+
+    // Lock released → the same root works again (with a real origin).
+    drop(f);
+    let origin = tmp.path().join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    sh_git(&origin, &["init", "-q", "-b", "main"]);
+    std::fs::write(origin.join("a.txt"), "a\n").unwrap();
+    sh_git(&origin, &["add", "-A"]);
+    sh_git(&origin, &["commit", "-q", "-m", "a"]);
+    let o = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert_eq!(o.update.total_commits, 1);
+}
+
+/// A crashed clone must never poison the root: the clone lands in
+/// repo.git.new and only a COMPLETE clone is renamed to repo.git, so a
+/// planted partial scratch is discarded and repo.git's existence keeps
+/// implying completeness.
+#[test]
+fn mirror_discards_a_stale_partial_clone_scratch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    sh_git(&origin, &["init", "-q", "-b", "main"]);
+    std::fs::write(origin.join("a.txt"), "a\n").unwrap();
+    sh_git(&origin, &["add", "-A"]);
+    sh_git(&origin, &["commit", "-q", "-m", "a"]);
+
+    // A killed `git clone --mirror` leaves HEAD but no refs/objects.
+    let root = tmp.path().join("mirror");
+    let scratch = root.join("repo.git.new");
+    std::fs::create_dir_all(scratch.join("objects")).unwrap();
+    std::fs::write(scratch.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(scratch.join("junk"), "partial\n").unwrap();
+
+    let o = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert_eq!(o.update.total_commits, 1);
+    assert!(!scratch.exists(), "stale scratch must be gone");
+    assert!(root.join("repo.git/HEAD").exists());
+    assert!(!root.join("repo.git/junk").exists(), "partial clone leaked into the buffer");
+    let store = root.join("store");
+    let tip = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
+    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0, tip);
 }

@@ -2087,9 +2087,9 @@ macro_rules! ui_verbs {
             }
         }
         // args: [id]
-        "mirror_rm", "ID", "remove a mirror job" => { match args.first().and_then(Value::as_i64) {
+        "mirror_rm", "ID", "remove a mirror job (git: drops the repo.git fetch buffer, keeps <dest>/store)" => { match args.first().and_then(Value::as_i64) {
             Some(id) => match crate::mirrors::job_remove(id) {
-                Ok(()) => json!({"ok": true}),
+                Ok(note) => json!({"ok": true, "note": note}),
                 Err(e) => json!({"ok": false, "error": e}),
             },
             None => return json!({"ok": false, "error": "need job id"}),
@@ -3743,7 +3743,14 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
                 _ => ("mirror_rm", json!([idn])),
             };
             match one(verb, args) {
-                Ok(v) if v.get("ok") == Some(&Value::Bool(true)) => { println!("ok"); 0 }
+                Ok(v) if v.get("ok") == Some(&Value::Bool(true)) => {
+                    // mirror_rm reports buffer-vs-store semantics in `note`.
+                    match v.get("note").and_then(Value::as_str) {
+                        Some(n) if !n.is_empty() => println!("ok — {n}"),
+                        _ => println!("ok"),
+                    }
+                    0
+                }
                 Ok(v) => fail(v.get("error").and_then(Value::as_str).unwrap_or("failed").into()),
                 Err(e) => fail(e),
             }

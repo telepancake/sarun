@@ -11,6 +11,7 @@ zstd = { workspace = true, features = ["experimental"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+libc = { workspace = true }
 rusqlite = { workspace = true }
 wikimak-depot = { workspace = true }
 

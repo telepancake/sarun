@@ -65,7 +65,9 @@ fn running_map<R>(f: impl FnOnce(&mut HashMap<i64, u32>) -> R) -> R {
     f(g.get_or_insert_with(HashMap::new))
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+// Deserialize: the UI pane reads jobs back through the `mirror_jobs`
+// control verb (JSON over the socket), not this module.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Job {
     pub id: i64,
     pub kind: String,
@@ -147,12 +149,43 @@ pub fn job_add(kind: &str, src: &str, dest: &str, interval_secs: i64) -> Result<
     Ok(conn.last_insert_rowid())
 }
 
-pub fn job_remove(id: i64) -> Result<(), String> {
+/// Remove a job. Returns a human note describing what happened to the
+/// job's on-disk state. For git jobs the `<dest>/repo.git` fetch buffer
+/// (plus any `repo.git.new` scratch) is dropped: it is DERIVED — the
+/// mirror loop reconstructs it from the store via SHA-exact export — and
+/// with no schedule left it is ownerless cache. `<dest>/store` is the
+/// authoritative corpus (live box attachments may reference it) and is
+/// NEVER touched here; deleting it stays an explicit manual act.
+/// Cleanup runs only after the row delete succeeds, and a cleanup error
+/// is reported in the note without resurrecting the job.
+pub fn job_remove(id: i64) -> Result<String, String> {
     if running_map(|m| m.contains_key(&id)) {
         return Err("job is running".into());
     }
-    let n = db()?.execute("DELETE FROM jobs WHERE id = ?1", [id]).map_err(|e| e.to_string())?;
-    if n == 0 { Err("no such job".into()) } else { Ok(()) }
+    let conn = db()?;
+    let row: Option<(String, String)> = conn
+        .query_row("SELECT kind, dest FROM jobs WHERE id = ?1", [id],
+                   |r| Ok((r.get(0)?, r.get(1)?)))
+        .ok();
+    let n = conn.execute("DELETE FROM jobs WHERE id = ?1", [id]).map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("no such job".into());
+    }
+    let Some((kind, dest)) = row else { return Ok(String::new()) };
+    if kind != "git" {
+        // wiki/ietf/cmd keep no separate fetch buffer.
+        return Ok(String::new());
+    }
+    let mut note = format!("fetch buffer dropped; store kept at {dest}/store");
+    for name in ["repo.git", "repo.git.new"] {
+        let p = std::path::Path::new(&dest).join(name);
+        if p.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&p) {
+                note = format!("{note} (cleanup of {} failed: {e})", p.display());
+            }
+        }
+    }
+    Ok(note)
 }
 
 pub fn job_set_paused(id: i64, paused: bool) -> Result<(), String> {
@@ -228,13 +261,33 @@ fn spawn_run(job: Job) {
         );
     }
     std::thread::spawn(move || {
-        let child = std::process::Command::new(&argv[0])
-            .args(&argv[1..])
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..])
             .env("SARUN_MIRROR_DEST", &job.dest)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
+            .stderr(std::process::Stdio::piped());
+        // A driver that outlives a dead engine is the parallel-git
+        // collision waiting for the restart. The driver holds the
+        // per-root flock, so even a leaked git grandchild can't collide
+        // with the next run — pdeathsig closes the orphan-DRIVER window,
+        // the flock closes the rest.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // pdeathsig arms against the parent AT CALL TIME: if the
+                // engine died between fork and prctl, the signal never
+                // comes — detect the reparent and die now.
+                if libc::getppid() == 1 {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn();
         let (exit, detail) = match child {
             Ok(c) => {
                 running_map(|m| { m.insert(id, c.id()); });
@@ -297,5 +350,62 @@ mod tests {
                     vec!["fetch".into(), "enwiki".into(), "/depot/w".into()]].concat();
         assert_eq!(argv, ["/x/sarun", "wikimak", "fetch", "enwiki", "/depot/w"]
                    .map(String::from).to_vec());
+    }
+
+    fn sh_git(repo: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C").arg(repo).args(args)
+            .env("GIT_AUTHOR_NAME", "T").env("GIT_AUTHOR_EMAIL", "t@x")
+            .env("GIT_COMMITTER_NAME", "T").env("GIT_COMMITTER_EMAIL", "t@x")
+            .output().expect("run git");
+        assert!(out.status.success(), "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// `rm` on a git job drops the derived fetch buffer (repo.git +
+    /// any scratch) but NEVER the authoritative store — which must stay
+    /// readable afterwards. Non-git kinds are row-only.
+    #[test]
+    fn job_remove_drops_git_fetch_buffer_keeps_store() {
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir()
+            .join(format!("sarun-mirrorrm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: serialized by TEST_STATE_HOME_LOCK with the other
+        // state-home-dependent tests.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        sh_git(&origin, &["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("a.txt"), "a\n").unwrap();
+        sh_git(&origin, &["add", "-A"]);
+        sh_git(&origin, &["commit", "-q", "-m", "a"]);
+
+        // A completed run's on-disk state, produced by the real driver
+        // library (spawning through spawn_run would self-exec the test
+        // harness binary).
+        let dest = tmp.join("dest");
+        gitdepot::mirror(origin.to_str().unwrap(), &dest).unwrap();
+        assert!(dest.join("repo.git/HEAD").exists());
+        std::fs::create_dir_all(dest.join("repo.git.new")).unwrap();
+
+        let id = job_add("git", origin.to_str().unwrap(),
+                         dest.to_str().unwrap(), 3600).unwrap();
+        let note = job_remove(id).unwrap();
+        assert!(note.contains("fetch buffer dropped"), "{note}");
+        assert!(note.contains("store kept"), "{note}");
+        assert!(!dest.join("repo.git").exists(), "buffer must be dropped");
+        assert!(!dest.join("repo.git.new").exists(), "scratch must be dropped");
+        let store = dest.join("store");
+        assert!(gitdepot::store::store_exists(&store), "store must survive rm");
+        assert!(gitdepot::resolve_ref(&store, "main").unwrap().is_some(),
+                "store must stay readable after rm");
+
+        let cid = job_add("cmd", "true", dest.to_str().unwrap(), 3600).unwrap();
+        assert_eq!(job_remove(cid).unwrap(), "", "cmd rm is row-only");
+        assert!(gitdepot::store::store_exists(&store));
     }
 }

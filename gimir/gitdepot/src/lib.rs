@@ -126,6 +126,8 @@ pub enum Error {
     Chain(String),
     Unsupported(String),
     Meta(String),
+    /// Another process holds the per-root mirror lock.
+    Locked(std::path::PathBuf),
 }
 
 impl std::fmt::Display for Error {
@@ -137,6 +139,7 @@ impl std::fmt::Display for Error {
             Error::Chain(s) => write!(f, "chain: {s}"),
             Error::Unsupported(s) => write!(f, "unsupported: {s}"),
             Error::Meta(s) => write!(f, "meta: {s}"),
+            Error::Locked(p) => write!(f, "another mirror run holds {}", p.display()),
         }
     }
 }
@@ -711,6 +714,20 @@ pub fn mirror(url: &str, root: &Path) -> Result<MirrorOutcome> {
 /// buffer from the store (one export) before fetching.
 pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome> {
     std::fs::create_dir_all(root)?;
+    // One-run-per-root guard: exclusive flock on <root>/.lock, held for
+    // the whole run, kernel-released on ANY exit (crash included) — two
+    // schedulers can never drive git against the same buffer/store.
+    let _lock = {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .create(true).truncate(false).write(true)
+            .open(root.join(".lock"))?;
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(Error::Locked(root.to_path_buf()));
+        }
+        f
+    };
     let repo = root.join("repo.git");
     let store = root.join("store");
     if repo.join("HEAD").exists() {
@@ -729,9 +746,18 @@ pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome
         git(&repo, &["config", "remote.origin.mirror", "true"])?;
         git(&repo, &["remote", "update", "--prune"])?;
     } else {
+        // Clone into scratch + rename: git creates HEAD long before a
+        // clone completes, so a killed clone left at repo.git would pass
+        // the HEAD check above forever. The rename makes repo.git's
+        // existence imply a COMPLETE clone; a stale scratch is garbage
+        // from a crashed run, never data.
+        let scratch = root.join("repo.git.new");
+        if scratch.exists() {
+            std::fs::remove_dir_all(&scratch)?;
+        }
         let out = Command::new("git")
             .args(["clone", "--quiet", "--mirror", url])
-            .arg(&repo)
+            .arg(&scratch)
             .output()?;
         if !out.status.success() {
             return Err(Error::Git(format!(
@@ -739,6 +765,7 @@ pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
+        std::fs::rename(&scratch, &repo)?;
     }
     let out = if !store::store_exists(&store) {
         let o = import(&repo, &store, 3)?;

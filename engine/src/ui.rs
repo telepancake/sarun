@@ -3196,12 +3196,29 @@ impl App {
         }
     }
 
-    /// Re-read the mirror job list. Direct crate::mirrors call (the store is
-    /// the shared {state_home}/mirrors.db, same host-side access the Rules
-    /// pane has to its filerules file). Clamps the cursor so a shrunken list
-    /// never leaves it past the end.
+    /// Issue one mirror_* action verb. The mirror arms wrap their own
+    /// {"ok":..,"error":..} INSIDE the rpc envelope, so both layers must
+    /// be checked before an action counts as done.
+    fn mirror_verb(&self, verb: &str, args: Value) -> Result<Value, String> {
+        let v = rpc(&self.sock, verb, args)?;
+        if v.get("ok").and_then(Value::as_bool) == Some(false) {
+            return Err(v.get("error").and_then(Value::as_str)
+                .unwrap_or("failed").to_string());
+        }
+        Ok(v)
+    }
+
+    /// Re-read the mirror job list via the `mirror_jobs` control verb —
+    /// never crate::mirrors directly: job liveness (the RUNNING map) exists
+    /// only in the ENGINE process, so a detached `sarun attach` UI reading
+    /// mirrors.db itself would show every live job as "stopped". The
+    /// combined process takes the same socket path (one code path). Clamps
+    /// the cursor so a shrunken list never leaves it past the end.
     fn load_mirrors(&mut self) {
-        match crate::mirrors::jobs_list() {
+        match rpc(&self.sock, "mirror_jobs", json!([]))
+            .and_then(|v| serde_json::from_value::<Vec<crate::mirrors::Job>>(v)
+                .map_err(|e| e.to_string()))
+        {
             Ok(jobs) => {
                 self.mirror_jobs = jobs;
                 if self.sel_mirror >= self.mirror_jobs.len() {
@@ -3214,11 +3231,13 @@ impl App {
     }
 
     /// 'r' on Mirrors: force-run the selected job (works on paused too).
+    /// Verb, not crate call: the run must be the ENGINE's child, or it
+    /// dies with the attach UI and the engine never sees it.
     fn mirror_run_selected(&mut self) {
         let Some(job) = self.mirror_jobs.get(self.sel_mirror) else { return };
         let id = job.id;
-        self.status = match crate::mirrors::job_run(id) {
-            Ok(()) => format!("mirror #{id}: run started"),
+        self.status = match self.mirror_verb("mirror_run", json!([id])) {
+            Ok(_) => format!("mirror #{id}: run started"),
             Err(e) => format!("mirror #{id}: {e}"),
         };
         self.load_mirrors();
@@ -3226,9 +3245,13 @@ impl App {
 
     /// 'R' on Mirrors: start every due, unpaused, not-running job.
     fn mirror_run_pending(&mut self) {
-        self.status = match crate::mirrors::run_pending() {
-            Ok(ids) if ids.is_empty() => "mirrors: nothing pending".into(),
-            Ok(ids) => format!("mirrors: started {} job(s)", ids.len()),
+        self.status = match self.mirror_verb("mirror_run_pending", json!([])) {
+            Ok(v) => {
+                let n = v.get("started").and_then(Value::as_array)
+                    .map(Vec::len).unwrap_or(0);
+                if n == 0 { "mirrors: nothing pending".into() }
+                else { format!("mirrors: started {n} job(s)") }
+            }
             Err(e) => format!("mirrors: {e}"),
         };
         self.load_mirrors();
@@ -3238,8 +3261,8 @@ impl App {
     fn mirror_toggle_pause(&mut self) {
         let Some(job) = self.mirror_jobs.get(self.sel_mirror) else { return };
         let (id, want) = (job.id, !job.paused);
-        self.status = match crate::mirrors::job_set_paused(id, want) {
-            Ok(()) => format!("mirror #{id}: {}",
+        self.status = match self.mirror_verb("mirror_pause", json!([id, want])) {
+            Ok(_) => format!("mirror #{id}: {}",
                               if want { "paused" } else { "resumed" }),
             Err(e) => format!("mirror #{id}: {e}"),
         };
@@ -3253,19 +3276,30 @@ impl App {
             self.status = "no mirror job selected".into();
             return;
         };
+        // git jobs: the derived fetch buffer goes with the job; the
+        // authoritative store never does — say so before the y.
+        let tail = if job.kind == "git" {
+            format!(" fetch buffer dropped; store kept at {}/store.", job.dest)
+        } else {
+            String::new()
+        };
         self.modal = Some(Modal::Confirm {
-            prompt: format!("Delete mirror job #{} ({} {} → {})?",
+            prompt: format!("Delete mirror job #{} ({} {} → {})?{tail}",
                             job.id, job.kind, job.src, job.dest),
             action: ConfirmAction::MirrorRemove(job.id),
         });
     }
 
-    /// The confirmed mirror-job delete. A running job refuses (the store's
-    /// "job is running" error) — surfaced on the status line, never fatal.
+    /// The confirmed mirror-job delete, via `mirror_rm` (the engine owns
+    /// the RUNNING check and the buffer cleanup). A running job refuses —
+    /// surfaced on the status line, never fatal.
     #[cfg_attr(test, allow(dead_code))]
     fn mirror_remove(&mut self, id: i64) {
-        self.status = match crate::mirrors::job_remove(id) {
-            Ok(()) => format!("mirror #{id}: deleted"),
+        self.status = match self.mirror_verb("mirror_rm", json!([id])) {
+            Ok(v) => match v.get("note").and_then(Value::as_str) {
+                Some(n) if !n.is_empty() => format!("mirror #{id}: deleted — {n}"),
+                _ => format!("mirror #{id}: deleted"),
+            },
             Err(e) => format!("mirror #{id}: {e}"),
         };
         self.load_mirrors();
@@ -16140,6 +16174,61 @@ mod tests {
         assert!(tree.iter().all(|r| r.get("depth").and_then(Value::as_i64) == Some(0)));
     }
 
+    /// Minimal control-socket stand-in serving just the mirror_* verbs the
+    /// pane speaks, with control.rs's exact reply envelopes. The pane must
+    /// go through the socket (an attach UI has no in-process RUNNING map),
+    /// so its headless tests drive the verb path against this listener —
+    /// fixture SETUP still calls crate::mirrors directly, like other pane
+    /// tests inject their data.
+    fn mirror_verb_server(tag: &str) -> String {
+        let sock = std::env::temp_dir()
+            .join(format!("sarun-mvs-{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let mut line = String::new();
+                if BufReader::new(&conn).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                let verb = msg.get("verb").and_then(Value::as_str).unwrap_or("");
+                let args = msg.get("args").and_then(Value::as_array)
+                    .cloned().unwrap_or_default();
+                let id = args.first().and_then(Value::as_i64).unwrap_or(-1);
+                let r = match verb {
+                    "mirror_jobs" => match crate::mirrors::jobs_list() {
+                        Ok(j) => serde_json::to_value(j).unwrap(),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
+                    "mirror_run" => match crate::mirrors::job_run(id) {
+                        Ok(()) => json!({"ok": true}),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
+                    "mirror_run_pending" => match crate::mirrors::run_pending() {
+                        Ok(ids) => json!({"ok": true, "started": ids}),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
+                    "mirror_pause" => {
+                        let p = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+                        match crate::mirrors::job_set_paused(id, p) {
+                            Ok(()) => json!({"ok": true}),
+                            Err(e) => json!({"ok": false, "error": e}),
+                        }
+                    }
+                    "mirror_rm" => match crate::mirrors::job_remove(id) {
+                        Ok(note) => json!({"ok": true, "note": note}),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
+                    other => json!({"ok": false, "error": format!("unknown verb '{other}'")}),
+                };
+                let mut w = &conn;
+                let _ = w.write_all(format!("{}\n", json!({"ok": true, "r": r})).as_bytes());
+            }
+        });
+        sock.to_string_lossy().into_owned()
+    }
+
     /// The Mirrors pane end to end (headless): a job added to the store shows
     /// up as a "pending" row when the pane gains focus, and the space action
     /// (pause/resume) flips it to "paused" in both the store and the render.
@@ -16157,7 +16246,7 @@ mod tests {
 
         let id = crate::mirrors::job_add(
             "git", "https://example.com/x.git", "/depot/x", 3600).unwrap();
-        let mut app = headless_app();
+        let mut app = App::bare(mirror_verb_server("pause"));
         app.go_to_pane(Pane::Mirrors);
         assert!(matches!(app.focus, Pane::Mirrors));
         let job = app.mirror_jobs.iter().find(|j| j.id == id)
@@ -16193,7 +16282,7 @@ mod tests {
 
         let id = crate::mirrors::job_add(
             "git", "file:///src.git", "/depot/g", 3600).unwrap();
-        let mut app = headless_app();
+        let mut app = App::bare(mirror_verb_server("rm"));
         app.go_to_pane(Pane::Mirrors);
         assert!(dispatch_pane_key(&mut app, KeyCode::Char('D')),
                 "'D' must be handled by the pane-key table");
