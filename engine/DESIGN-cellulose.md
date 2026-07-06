@@ -135,21 +135,42 @@ rustls).
 
 ## C5 · Increments (each one commits + builds green)
 
-- **A** — `browser/cdp.rs`: transport trait + websocket framing + sync client,
-  with unit tests for framing and id/event correlation (no Chromium needed).
-  **← this commit.**
-- **B** — `browser/font.rs` + `render.rs`: checked-in font, DOMSnapshot text
-  extraction, quadrant compositing; a host-side integration test that spawns
-  Chromium directly (no box) and asserts a known fixture renders to the
-  expected cells (mirrors `cellulose/test_cellulose.py`).
-- **C** — `browser/session.rs` + the box bridge (C1 option 3): launch headless
-  Chromium in the tap box, reach its CDP, render a real page end to end from
-  the CLI (a `sarun browser --dump URL` verb, parallel to the prototype's
-  `--dump`).
-- **D** — the `Screen::Browser` pane: draw the grid, route input, screencast
-  refresh, retire the `CARBONYL_IMAGE` launch arm.
-- **E** — retire the vendored carbonyl image and its `build_launch` special
-  case; the crawl driver (W-archival) reuses `BrowserSession`.
+- **A — DONE** `browser/cdp.rs`: the sync CDP client behind a transport trait.
+  Bootstrapped on a hand-rolled websocket client; once the pipe framing was
+  pinned down (D) the websocket was deleted. Unit-tested for framing and
+  id/event correlation.
+- **B — DONE** `browser/font.rs` + `render.rs` + `cellfont.ttf`: checked-in
+  font, DOMSnapshot text extraction (UTF-16 slicing, sanitization, wide
+  cells), quadrant compositing. Fully unit-tested (image-crate-free `compose`).
+- **C — DONE** `browser/session.rs`: the page→grid pipeline (attach, inject
+  font, navigate, snapshot+screenshot, compose). An e2e test renders
+  positioned text and asserts exact-cell parity with the Python prototype.
+- **D — DONE** `browser/launch.rs`: the transport question settled on
+  `--remote-debugging-pipe` (NUL-JSON over fds 3/4 — sarun's native
+  fd-passing idiom, no port, no netns dial). `spawn_host_chromium()` +
+  `grid_to_ansi()` + the **`sarun browser [--dump|--dump-text] [--size WxH]
+  URL`** CLI verb. Verified against live and offline pages in a real
+  bwrap/FUSE environment. This is the complete engine-native renderer.
 
-Stage-1 (drop-in carbonyl→cellulose PTY swap) is intentionally not done: it
-would build a throwaway argv path that increment D deletes.
+Remaining (each independently landable):
+
+- **E1 — box transport.** A new `inner_browser` mode (sibling to `inner_pty`
+  / `inner_capture` in `runner.rs`) that dup2's a ferried CDP fd to 3/4 and
+  execs headless Chromium with `--remote-debugging-pipe` inside a **tap** box,
+  so its HTTP(S) flows through the MITM and webcap capture/replay (W1/W2/W4.2)
+  work. The engine holds the pipe's other end and builds a `BrowserSession`
+  over it. Threads a socketpair through the register/spawn path the same way
+  `conn_fd` and the ferried engine binary already cross the bwrap boundary.
+  Verifiable headlessly (via webcap rows).
+- **E2 — the `Screen::Browser` pane.** Draw the `Grid` via
+  `buffer[(x,y)].set_symbol().set_style(Color::Rgb…)` (as `render_pty_into`
+  does), route key/mouse to `session.key()/click()/scroll()`,
+  `Page.startScreencast`-driven refresh, sixel pixel-peek via `sixel.rs`.
+  Needs an attached interactive terminal to verify — not doable in a headless
+  harness.
+- **E3 — retire carbonyl.** Delete the `CARBONYL_IMAGE` `build_launch` arm and
+  the vendored image; point the launcher at the pane. The crawl driver
+  (W-archival) reuses `BrowserSession`.
+
+Stage-1 (drop-in carbonyl→cellulose PTY swap) is intentionally skipped: it
+would build a throwaway argv path E2 deletes.
