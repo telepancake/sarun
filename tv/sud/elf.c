@@ -339,12 +339,20 @@ int resolve_path(const char *cmd, char *out, int out_sz)
 #endif
 
     if (cmd[0] == '.' || strchr(cmd, '/')) {
-        /* Absolutise against the kernel cwd and re-enter the absolute
-         * arm so overlay/remap rules apply.  Without this, a relative
-         * exec of a binary that exists only in the overlay UPPER
-         * (`./example` just built by the box) reaches the kernel
-         * against the host directory and ENOENTs. */
+        /* Absolutise and re-enter the absolute arm so overlay/remap
+         * rules apply.  Without this, a relative exec of a binary that
+         * exists only in the overlay UPPER (`./example` just built by
+         * the box) reaches the kernel against the host directory and
+         * ENOENTs.  The LOGICAL cwd shadow must win over the kernel
+         * cwd: after a chdir into an upper-only directory the kernel
+         * cwd is the upper skeleton, and "../configure" absolutised
+         * against it never finds the host file (out-of-tree builds). */
         char abs[PATH_MAX];
+#ifdef SUD_ADDIN_PATH_REMAP
+        if (sud_pr_absolutise(AT_FDCWD, cmd, abs, sizeof(abs)) == 0
+            && resolve_path(abs, out, out_sz))
+            return 1;
+#endif
         long n = raw_syscall6(SYS_readlinkat, AT_FDCWD,
                               (long)"/proc/thread-self/cwd",
                               (long)abs, sizeof(abs) - 1, 0, 0);

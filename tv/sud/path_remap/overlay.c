@@ -659,7 +659,16 @@ static long read_cwd(char *out, size_t out_sz)
     return 0;
 }
 
-/* Build the absolute "merged" path that `(dirfd, path)` refers to. */
+/* Build the absolute "merged" path that `(dirfd, path)` refers to.
+ * Delegates to sud_pr_absolutise so the LOGICAL cwd shadow wins over
+ * /proc/thread-self/cwd — after a chdir into an upper-only (box-
+ * created) directory the kernel cwd points into the upper skeleton,
+ * and absolutising against it made every "../foo" resolve under the
+ * upper (out-of-tree `../configure`: ENOENT).  All results are
+ * lexically normalized ("nd/../x" → "x") so layer composition never
+ * makes the kernel walk a directory that exists only in another
+ * layer.  The overlay's own fd_map (synth dirfds) stays as the
+ * fallback for dirfds the shared table doesn't know. */
 static int resolve_at_to_abs(int dirfd, const char *path,
                              char *out, size_t out_sz)
 {
@@ -668,10 +677,13 @@ static int resolve_at_to_abs(int dirfd, const char *path,
         size_t n = strlen(path);
         if (n + 1 > out_sz) return -1;
         memcpy(out, path, n + 1);
+        sud_pr_lexnorm(out);
         return 0;
     }
     /* Relative.  Locate the base directory. */
     if (dirfd == AT_FDCWD) {
+        if (sud_pr_absolutise(AT_FDCWD, path, out, out_sz) == 0)
+            return 0;
         char cwd[PATH_MAX];
         if (read_cwd(cwd, sizeof(cwd)) != 0) return -1;
         size_t cwd_len = strlen(cwd);
@@ -681,6 +693,7 @@ static int resolve_at_to_abs(int dirfd, const char *path,
         memcpy(out, cwd, cwd_len);
         out[cwd_len] = '/';
         memcpy(out + cwd_len + 1, path, plen + 1);
+        sud_pr_lexnorm(out);
         return 0;
     }
     const char *merged = fd_map_lookup(dirfd);
@@ -691,6 +704,7 @@ static int resolve_at_to_abs(int dirfd, const char *path,
     memcpy(out, merged, mlen);
     out[mlen] = '/';
     memcpy(out + mlen + 1, path, plen + 1);
+    sud_pr_lexnorm(out);
     return 0;
 }
 

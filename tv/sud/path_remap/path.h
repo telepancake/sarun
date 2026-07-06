@@ -89,6 +89,12 @@ void sud_pr_dirfd_reset_for_testing(void);
  * Returns 0 on success, -errno on failure (-EFAULT if path is NULL,
  * -ENAMETOOLONG if the result doesn't fit, -EXDEV for unknown dirfd).
  */
+/* Lexically collapse "//", "/./" and "name/.." segments in place
+ * (absolute paths only; logical/bash-style dotdot; ".." at the root
+ * stays root).  Every absolutised VIRTUAL path must be normalized
+ * before layer composition — see path.c for the failure mode. */
+void sud_pr_lexnorm(char *p);
+
 int sud_pr_absolutise(int dirfd, const char *path,
                       char *out, size_t out_sz);
 

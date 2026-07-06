@@ -177,6 +177,43 @@ void sud_pr_dirfd_reset_for_testing(void)
  * (dirfd, path) → absolute path
  * ================================================================ */
 
+/* Lexically collapse "//", "/./" and "name/.." segments of an absolute
+ * path, in place.  The virtual (merged) path must be clean BEFORE it is
+ * composed onto a layer: "cwd/nd/../configure" composed onto the host
+ * layer makes the KERNEL resolve "nd" on the host — but "nd" may exist
+ * only in the upper (a box-created build dir), so every "../foo" from
+ * inside it ENOENTs (out-of-tree `../configure` was unrunnable).
+ * Logical (bash-style) dotdot is the right semantics here: the cwd
+ * shadow itself is logical, and prefix-rule matching is lexical.  ".."
+ * at the root stays at the root. */
+void sud_pr_lexnorm(char *p)
+{
+    if (p[0] != '/') return;
+    char *w = p;          /* write cursor: always points AFTER a '/' run */
+    const char *r = p;
+    while (*r) {
+        while (*r == '/') r++;             /* skip the slash run */
+        if (!*r) break;
+        const char *seg = r;
+        while (*r && *r != '/') r++;
+        size_t sl = (size_t)(r - seg);
+        if (sl == 1 && seg[0] == '.') continue;
+        if (sl == 2 && seg[0] == '.' && seg[1] == '.') {
+            /* pop the previous segment (stay at root if none) */
+            while (w > p + 1 && w[-1] == '/') w--;
+            while (w > p + 1 && w[-1] != '/') w--;
+            continue;
+        }
+        if (w == p || w[-1] != '/') *w++ = '/';
+        memmove(w, seg, sl);
+        w += sl;
+    }
+    if (w == p) *w++ = '/';
+    /* Drop a trailing '/' left by a pop, except the root itself. */
+    if (w > p + 1 && w[-1] == '/') w--;
+    *w = '\0';
+}
+
 int sud_pr_absolutise(int dirfd, const char *path,
                       char *out, size_t out_sz)
 {
@@ -185,6 +222,7 @@ int sud_pr_absolutise(int dirfd, const char *path,
         size_t n = strlen(path);
         if (n + 1 > out_sz) return -ENAMETOOLONG;
         memcpy(out, path, n + 1);
+        sud_pr_lexnorm(out);
         return 0;
     }
     if (dirfd != AT_FDCWD) {
@@ -201,6 +239,7 @@ int sud_pr_absolutise(int dirfd, const char *path,
         memcpy(out, base, bl);
         out[bl] = '/';
         memcpy(out + bl + 1, path, pl + 1);
+        sud_pr_lexnorm(out);
         return 0;
     }
     /* AT_FDCWD: prepend the logical CWD if active, else /proc/self/cwd.
@@ -224,6 +263,7 @@ int sud_pr_absolutise(int dirfd, const char *path,
     memcpy(out, cwd, cl);
     out[cl] = '/';
     memcpy(out + cl + 1, path, pl + 1);
+    sud_pr_lexnorm(out);
     return 0;
 }
 
