@@ -577,10 +577,30 @@ pub fn label_from_url(url: &str) -> String {
 }
 
 pub fn mirror(url: &str, root: &Path) -> Result<MirrorOutcome> {
+    mirror_opts(url, root, false)
+}
+
+/// `frugal`: drop the fetch buffer after a successful update, leaving
+/// the store as the single on-disk copy. The next run re-seeds the
+/// buffer from the store (one export) before fetching.
+pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome> {
     std::fs::create_dir_all(root)?;
     let repo = root.join("repo.git");
     let store = root.join("store");
     if repo.join("HEAD").exists() {
+        git(&repo, &["remote", "update", "--prune"])?;
+    } else if store.join("meta.json").exists() {
+        // The store is the ONLY authoritative copy; repo.git is a
+        // transient fetch buffer, reconstructible because export is
+        // SHA-exact. Re-seed it from the store (bare, wired like
+        // clone --mirror) and fetch just the delta — a deleted (or
+        // frugally dropped) buffer costs one export, never a re-clone.
+        std::fs::create_dir_all(&repo)?;
+        git(&repo, &["init", "-q", "--bare"])?;
+        export(&store, &repo)?;
+        git(&repo, &["config", "remote.origin.url", url])?;
+        git(&repo, &["config", "remote.origin.fetch", "+refs/*:refs/*"])?;
+        git(&repo, &["config", "remote.origin.mirror", "true"])?;
         git(&repo, &["remote", "update", "--prune"])?;
     } else {
         let out = Command::new("git")
@@ -630,6 +650,9 @@ pub fn mirror(url: &str, root: &Path) -> Result<MirrorOutcome> {
         meta.label = label_from_url(url);
         meta.url = url.to_string();
         chain::write_meta(&store, &meta)?;
+    }
+    if frugal {
+        std::fs::remove_dir_all(&repo)?;
     }
     Ok(out)
 }
@@ -725,6 +748,8 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
     // commit's view (and each frame's view-anchored refPrefix) as it goes.
     let (meta, views) = chain::read_store(store)?;
     std::fs::create_dir_all(repo)?;
+    // Reinit is a no-op on an existing repo and preserves bareness —
+    // mirror() pre-inits --bare to seed its fetch buffer through here.
     git(repo, &["init", "-q"])?;
 
     // Build the fast-import stream. Commits oldest-first; every commit is

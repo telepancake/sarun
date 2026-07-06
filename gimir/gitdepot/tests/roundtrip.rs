@@ -264,6 +264,32 @@ fn mirror_loop_clones_updates_and_survives_rewrite() {
     let refs = gitdepot::export(&root.join("store"), &out).unwrap();
     let tip = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
     assert!(refs.iter().any(|r| r.name == "refs/heads/main" && r.sha == tip));
+
+    // The fetch buffer is DERIVED state: delete repo.git, add a commit
+    // upstream — the next mirror re-seeds the buffer from the store
+    // (SHA-exact export) and fetches only the delta, no re-clone/
+    // re-import.
+    std::fs::remove_dir_all(root.join("repo.git")).unwrap();
+    std::fs::write(origin.join("even-more.txt"), "x\n").unwrap();
+    sh_git(&origin, &["add", "-A"]);
+    sh_git(&origin, &["commit", "-q", "-m", "even more"]);
+    let o4 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert_eq!((o4.update.new_commits, o4.reimported), (1, false),
+               "reseeded buffer should yield an incremental update");
+    assert!(root.join("repo.git/HEAD").exists(), "buffer not rebuilt");
+
+    // Frugal mode: successful update leaves the store as the single
+    // on-disk copy.
+    std::fs::write(origin.join("last.txt"), "y\n").unwrap();
+    sh_git(&origin, &["add", "-A"]);
+    sh_git(&origin, &["commit", "-q", "-m", "last"]);
+    let o5 = gitdepot::mirror_opts(origin.to_str().unwrap(), &root, true)
+        .unwrap();
+    assert_eq!((o5.update.new_commits, o5.reimported), (1, false));
+    assert!(!root.join("repo.git").exists(), "frugal left the buffer");
+    let tip2 = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
+    assert!(o5.update.refs.iter()
+        .any(|r| r.name == "refs/heads/main" && r.sha == tip2));
 }
 
 #[test]

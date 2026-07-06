@@ -1,6 +1,6 @@
 //! CLI: `gitdepot import <git-repo> <store-dir> [--level N]`
 //!      `gitdepot update <git-repo> <store-dir> [--level N]`
-//!      `gitdepot mirror <url> <root-dir>`
+//!      `gitdepot mirror <url> <root-dir> [--frugal]`
 //!      `gitdepot list <mirrors-root>`
 //!      `gitdepot log <store-dir>`
 //!      `gitdepot export <store-dir> <new-repo-dir>`
@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: gitdepot import <git-repo> <store-dir> [--level N]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir>\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>"
+        "usage: gitdepot import <git-repo> <store-dir> [--level N]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>"
     );
     ExitCode::from(2)
 }
@@ -107,8 +107,11 @@ fn main() -> ExitCode {
                 }
             })
         }
-        ("mirror", [url, root]) => {
-            gitdepot::mirror(url, &PathBuf::from(root)).map(|o| {
+        ("mirror", [url, root, rest @ ..])
+            if rest.is_empty() || rest == ["--frugal"] =>
+        {
+            gitdepot::mirror_opts(url, &PathBuf::from(root),
+                                  !rest.is_empty()).map(|o| {
                 println!(
                     "{} new commits ({} total){}",
                     o.update.new_commits,
