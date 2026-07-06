@@ -29,10 +29,17 @@ libc.workspace = true
 # surface. Optional behind `fetch` (default ON) so read-only embedders
 # (the sarun engine's wiki_attach) don't carry an HTTP stack.
 reqwest = { workspace = true, features = ["rustls-tls-native-roots"], optional = true }
+# Rendering + localhost serving (browsing plan B1-B5), behind `serve` so
+# read-only embedders can stay renderer-free.
+wikimak-wikitext = { workspace = true, optional = true }
+wikimak-scribunto = { workspace = true, optional = true }
+wikimak-media = { workspace = true, optional = true }
+tiny_http = { workspace = true, optional = true }
 
 [features]
-default = ["fetch"]
+default = ["fetch", "serve"]
 fetch = ["dep:reqwest", "wikimak-mediawiki/fetch"]
+serve = ["dep:wikimak-wikitext", "dep:wikimak-scribunto", "dep:wikimak-media", "dep:tiny_http"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -19,6 +19,8 @@ pub mod import;
 pub mod instance;
 pub mod readout;
 pub mod revision;
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod schema;
 #[cfg(feature = "fetch")]
 pub mod sync;

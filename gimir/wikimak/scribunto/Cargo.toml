@@ -1,0 +1,13 @@
+[package]
+name = "wikimak-scribunto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wikimak-wikitext = { workspace = true }
+# Plan §3.3 engine choice (a): vendored PUC Lua 5.1 — exact pattern and
+# number semantics (Scribunto is Lua 5.1-only; mw.ustring is BUILT on
+# Lua patterns, the single biggest fidelity risk of any reimplementation).
+mlua = { workspace = true }
+thiserror = { workspace = true }

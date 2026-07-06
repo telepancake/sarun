@@ -9,8 +9,11 @@ members = [
     "ietf-mirror",
     "strpool",
     "wikimak/depot",
+    "wikimak/media",
     "wikimak/mediawiki",
+    "wikimak/scribunto",
     "wikimak/wikipedia",
+    "wikimak/wikitext",
 ]
 exclude = [
     ".claude/worktrees",
@@ -25,6 +28,14 @@ license = "Apache-2.0"
 strpool = { path = "strpool" }
 wikimak-depot = { path = "wikimak/depot" }
 wikimak-mediawiki = { path = "wikimak/mediawiki", default-features = false }
+wikimak-wikitext = { path = "wikimak/wikitext" }
+wikimak-scribunto = { path = "wikimak/scribunto" }
+wikimak-media = { path = "wikimak/media" }
+# Scribunto engine: vendored PUC Lua 5.1 (browsing plan §3.3 choice (a)).
+mlua = { version = "0.10", features = ["lua51", "vendored"] }
+md-5 = "0.10"
+# Localhost serve for `wikimak serve` (browsing plan §5) — small, sync.
+tiny_http = "0.12"
 zstd = "0.13"
 memchr = "2"
 thiserror = "1"

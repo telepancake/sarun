@@ -1,0 +1,17 @@
+[package]
+name = "wikimak-media"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Network fetch stays OFF by default (repo discipline: the engine never
+# dials out; fetching lives in driver commands).
+fetch = ["dep:reqwest"]
+
+[dependencies]
+wikimak-wikitext = { workspace = true }
+md-5 = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true, optional = true }
