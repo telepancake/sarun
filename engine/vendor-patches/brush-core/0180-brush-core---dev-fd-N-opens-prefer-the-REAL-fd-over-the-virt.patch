@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Mon, 06 Jul 2026 15:58:57 +0000
+Subject: [PATCH] brush-core: /dev/fd/N opens prefer the REAL fd over the virtual table
+
+---
+diff --git a/src/shell/fs.rs b/src/shell/fs.rs
+index 700875c..e759d62 100644
+--- a/src/shell/fs.rs
++++ b/src/shell/fs.rs
+@@ -195,16 +195,27 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+ 
+         let path_to_open = self.absolute_path(path.as_ref());
+ 
+-        // See if this is a reference to a file descriptor, in which case the actual
+-        // /dev/fd* file path for this process may not match with what's in the execution
+-        // parameters.
++        // See if this is a reference to a file descriptor. sarun: the REAL
++        // fd table wins — process substitutions pin their pipe at a real
++        // fd and advertise that number, so a plain open of /dev/fd/N is
++        // exact. Consulting the virtual open-files table FIRST returned a
++        // STALE entry when an earlier substitution/redirect had used the
++        // same slot number: a second `sort <(…)` in one script read the
++        // leftover object (a localized-stdio socket) instead of its pipe
++        // and wedged forever waiting for data that never comes. The
++        // virtual table remains the FALLBACK for purely virtual fds
++        // (`exec 5< file` shapes with no real counterpart).
+         if let Some(parent) = path_to_open.parent()
+             && parent == Path::new("/dev/fd")
+             && let Some(filename) = path_to_open.file_name()
+             && let Ok(fd_num) = filename.to_string_lossy().to_string().parse::<ShellFd>()
+-            && let Some(open_file) = params.try_fd(self, fd_num)
+         {
+-            return Ok(open_file);
++            if let Ok(f) = options.open(&path_to_open) {
++                return Ok(f.into());
++            }
++            if let Some(open_file) = params.try_fd(self, fd_num) {
++                return Ok(open_file);
++            }
+         }
+ 
+         Ok(options.open(path_to_open)?.into())

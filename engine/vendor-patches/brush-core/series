@@ -15,3 +15,4 @@
 0150-brush-core--compound-pipeline-stages-run-on-real-threads.patch
 0160-brush-core--background-jobs--coproc--substitutions-on-real-t.patch
 0170-brush-core---dev-fd-N-from-process-substitution-is-a-REAL-fd.patch
+0180-brush-core---dev-fd-N-opens-prefer-the-REAL-fd-over-the-virt.patch
