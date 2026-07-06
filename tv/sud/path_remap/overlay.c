@@ -648,6 +648,29 @@ static const char *fd_map_lookup(int fd)
     return 0;
 }
 
+int sud_overlay_fd_is_synth(int fd)
+{
+    return fd_map_lookup(fd) != 0;
+}
+
+void sud_overlay_fd_forget(int fd)
+{
+    if (!g_fd_map_init || fd < 0) return;
+    for (int i = 0; i < SUD_OVERLAY_FD_MAP_SIZE; i++) {
+        if (g_fd_map[i].fd == fd) {
+            g_fd_map[i].fd = -1;
+            g_fd_map[i].merged_path[0] = '\0';
+            return;
+        }
+    }
+}
+
+void sud_overlay_fd_dup(int oldfd, int newfd)
+{
+    const char *p = fd_map_lookup(oldfd);
+    if (p) fd_map_remember(newfd, p);
+}
+
 /* Read /proc/self/cwd.  Returns 0 on success or -errno. */
 static long read_cwd(char *out, size_t out_sz)
 {

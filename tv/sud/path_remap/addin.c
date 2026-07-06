@@ -694,6 +694,45 @@ static void fakeroot_post_syscall(const struct sud_syscall_ctx *ctx)
 #endif
 }
 
+/* getdents post hook: a synthetic merged directory is materialized as
+ * SYMLINKS to the source layers, so the kernel reports d_type=DT_LNK
+ * for every entry — and d_type consumers then misclassify the whole
+ * tree: find/fts refuses to descend (busybox's `find . -type d`
+ * returned only "."), ls -F marks everything `@`, walkers skip files.
+ * Launder DT_LNK to DT_UNKNOWN for entries read from a synth fd:
+ * POSIX-correct consumers fall back to fstatat(dirfd, name), which
+ * absolutises through the registered merged path and stats the REAL
+ * entry.  The symlink representation itself stays (it is the
+ * unremapped-syscall fallback); only the advertised type is dropped. */
+static void synth_dirent_post(const struct sud_syscall_ctx *ctx)
+{
+    long nr = ctx->nr;
+    int is64;
+#ifdef SYS_getdents64
+    if (nr == SYS_getdents64) { is64 = 1; } else
+#endif
+#ifdef SYS_getdents
+    if (nr == SYS_getdents)   { is64 = 0; } else
+#endif
+        return;
+    if (ctx->ret <= 0) return;
+    if (!sud_overlay_fd_is_synth((int)ctx->args[0])) return;
+    unsigned char *buf = (unsigned char *)ctx->args[1];
+    long total = ctx->ret;
+    long off = 0;
+    while (off + 19 <= total) {
+        unsigned short reclen;
+        memcpy(&reclen, buf + off + 16, sizeof(reclen));
+        if (reclen < 19 || off + reclen > total) break;
+        /* linux_dirent64: d_type at offset 18; old linux_dirent:
+         * d_type is the LAST byte of the record. */
+        unsigned char *ty = is64 ? buf + off + 18
+                                 : buf + off + reclen - 1;
+        if (*ty == DT_LNK) *ty = DT_UNKNOWN;
+        off += reclen;
+    }
+}
+
 /* ---- chdir / getcwd / fchdir interception -----------------------
  *
  * The kernel only knows about real filesystem paths.  When the
@@ -1315,11 +1354,64 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
     return 0;
 }
 
+/* dirfd lifecycle: registered dir fds (synth-dir opens land in BOTH
+ * the shared dirfd table and overlay's synth map) must follow dup and
+ * die on close.  fts (find/du/tar) dups the directory fd before
+ * fchdir; without propagation the dup is "unknown", the fchdir drops
+ * the logical cwd shadow, and every relative lstat then lands on the
+ * synth SYMLINKS — find refused to descend a single level.  Close
+ * must forget, or a recycled fd number inherits a stale merged path
+ * and mis-routes relative syscalls of an unrelated fd. */
+static void fd_lifecycle_post(const struct sud_syscall_ctx *ctx)
+{
+    long nr = ctx->nr;
+    if (ctx->ret < 0) return;
+#ifdef SYS_close
+    if (nr == SYS_close) {
+        sud_pr_dirfd_forget((int)ctx->orig_args[0]);
+        sud_overlay_fd_forget((int)ctx->orig_args[0]);
+        return;
+    }
+#endif
+    int oldfd = -1, newfd = -1;
+#ifdef SYS_dup
+    if (nr == SYS_dup) { oldfd = (int)ctx->orig_args[0]; newfd = (int)ctx->ret; }
+#endif
+#ifdef SYS_dup2
+    if (nr == SYS_dup2) { oldfd = (int)ctx->orig_args[0]; newfd = (int)ctx->ret; }
+#endif
+#ifdef SYS_dup3
+    if (nr == SYS_dup3) { oldfd = (int)ctx->orig_args[0]; newfd = (int)ctx->ret; }
+#endif
+#ifdef SYS_fcntl
+    if (nr == SYS_fcntl
+        && ((int)ctx->orig_args[1] == F_DUPFD
+            || (int)ctx->orig_args[1] == F_DUPFD_CLOEXEC)) {
+        oldfd = (int)ctx->orig_args[0];
+        newfd = (int)ctx->ret;
+    }
+#endif
+    if (oldfd < 0 || newfd < 0) return;
+    /* dup2/dup3 implicitly closed newfd: clear any stale entry first. */
+    sud_pr_dirfd_forget(newfd);
+    sud_overlay_fd_forget(newfd);
+    const char *base = sud_pr_dirfd_lookup(oldfd);
+    if (base) sud_pr_dirfd_register(newfd, base);
+    sud_overlay_fd_dup(oldfd, newfd);
+}
+
+static void path_remap_post_syscall(const struct sud_syscall_ctx *ctx)
+{
+    synth_dirent_post(ctx);
+    fd_lifecycle_post(ctx);
+    fakeroot_post_syscall(ctx);
+}
+
 const struct sud_addin sud_path_remap_addin = {
     "path_remap",
     path_remap_init,
     0,
     0,
     path_remap_pre_syscall,
-    fakeroot_post_syscall,
+    path_remap_post_syscall,
 };

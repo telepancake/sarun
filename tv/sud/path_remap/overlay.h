@@ -151,6 +151,18 @@ int sud_overlay_create_whiteout(const char *path);
 #define SUD_OVERLAY_NO_DIR ((int)0x80000000)
 int sud_overlay_open_dir(const char *path, int flags, int mode);
 
+/* True when `fd` is a SYNTHETIC merged-directory fd minted by
+ * sud_overlay_open_dir — its entries are symlinks to the source
+ * layers, so getdents d_type must be laundered (see the post hook). */
+int sud_overlay_fd_is_synth(int fd);
+
+/* fd lifecycle bookkeeping for the synth map: close forgets, dup
+ * copies the registration to the new fd (fts and friends dup a dir
+ * fd before fchdir — the dup must stay resolvable or relative stats
+ * land on the synth symlinks). */
+void sud_overlay_fd_forget(int fd);
+void sud_overlay_fd_dup(int oldfd, int newfd);
+
 /* Same as sud_overlay_open_dir but accepts a (dirfd, path) pair using
  * the same dirfd semantics as sud_overlay_resolve_at(). */
 int sud_overlay_open_dir_at(int dirfd, const char *path, int flags, int mode);
