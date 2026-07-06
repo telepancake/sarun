@@ -90,7 +90,7 @@ fn for_commit_walks_to_history() {
     let tmp = tempfile::TempDir::new().unwrap();
     build_store(tmp.path());
     let store = tmp.path().join("store");
-    let (meta, _) = gitdepot::chain::read_store(&store).unwrap();
+    let meta = gitdepot::store::read_meta(&store).unwrap();
     // meta.commits is newest-first: [v2, v1].
     let v1_sha = &meta.commits[1].sha;
 

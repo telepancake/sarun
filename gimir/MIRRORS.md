@@ -8,7 +8,7 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 |---|---|---|---|
 | **wikipedia** | ~99%-identical revision chains per page | `wikimak/*` (depot chains, un-sabotaged 2026-07, 12× measured) | `wikimak` CLI: import/head/text/history + discover/fetch sync with `parts_seen` watermarks |
 | **IETF drafts** | revision chains per draft name (`draft-x-00..-NN`) — the tiered-VBF doc's other named workload | multi-chain `depot-vbf::VbfDepot` (canonical layers) + sqlite bookkeeping | `ietf-mirror` crate + `ietfmak` CLI: update (idempotent, incremental, 404-watermarked) / list / head / text / history |
-| **git repos** | DAG of tree snapshots, newest-first | `gitdepot` (view-anchored chains; SHA-exact export; TIERING SABOTAGED — flat single-file chain, O(history) I/O per prepend; un-sabotage = the tiered depot variant, see roundtrip.rs update_io_is_bounded_not_o_history) | import/export/`update` (incremental fast-forward prepend) + `mirror` (bare-clone fetch loop, re-import on rewrite) |
+| **git repos** | DAG of tree snapshots, newest-first | `gitdepot` store v2 (tiered three-chain wikimak-depot store — TREES/COMMITS/REFLOG with stable indices; bounded prepend, proven by roundtrip.rs update_io_is_bounded_not_o_history; SHA-exact export; no re-import path — a rewrite is new records + repointed refs) | import/export/`update` (incremental prepend, rewrites included) + `mirror` (bare-clone fetch loop) |
 
 ## Common architecture (per DEPOT-DESIGN)
 
@@ -41,12 +41,13 @@ each corpus's shape wants, served through sarun. Three mirrors first:
    `VbfDepot`; sqlite for series state; `update` idempotent + resumable
    (revision watermarks; listed-but-404 revisions watermarked missing).
 3. **git mirror loop**: gitdepot incremental import DONE (`update`:
-   new frames prepended, former head's standalone frame replaced by a
-   bridge delta, all older frames verbatim; fast-forward-only, refuses
-   rewritten/topo-interleaved history → re-import). Fetch-and-update
-   DONE (`mirror <url> <root>`: bare mirror clone under `<root>/repo.git`,
-   store under `<root>/store`, non-fast-forward remote → wholesale
-   re-import — the mirror follows the remote). RO-attach DONE and
+   new tree/commit/reflog records batch-prepended to the tiered chains,
+   former tree head demoted to a bridge delta in the accumulator, cold
+   history untouched; NO fast-forward requirement — a rewrite or a ref
+   deletion is reflog records + refs-table repoints, old commits stay
+   resolvable forever). Fetch-and-update DONE (`mirror <url> <root>`:
+   bare mirror clone under `<root>/repo.git`, store under
+   `<root>/store`; no re-import path). RO-attach DONE and
    CONVERGED (ATTACH-CONVERGENCE.md, 2026-07-05): `git_attach` is pure
    bookkeeping — ref→sha from store metadata only, one pinned Ext row
    `{kind,store,ref,rev,prefix,name}` named `git:<label>/<ref>@<sha8>`;

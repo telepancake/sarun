@@ -104,6 +104,23 @@ fn build_fixture(repo: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Recursive on-disk size of the store (depot files + sqlite).
+fn store_size(store: &Path) -> u64 {
+    fn walk(p: &Path, total: &mut u64) {
+        for e in std::fs::read_dir(p).unwrap().flatten() {
+            let md = e.metadata().unwrap();
+            if md.is_dir() {
+                walk(&e.path(), total);
+            } else {
+                *total += md.len();
+            }
+        }
+    }
+    let mut total = 0;
+    walk(store, &mut total);
+    total
+}
+
 #[test]
 fn roundtrip_sha_exact_and_chain_compresses() {
     let tmp = tempfile::tempdir().unwrap();
@@ -172,7 +189,6 @@ fn incremental_update_appends_and_exports_sha_exact() {
 
     build_fixture(&repo);
     gitdepot::import(&repo, &store, 3).unwrap();
-    let chain_before = std::fs::read(store.join("chain")).unwrap();
 
     // Two new commits on main, on top of everything.
     for i in 12..14 {
@@ -188,15 +204,12 @@ fn incremental_update_appends_and_exports_sha_exact() {
 
     let o = gitdepot::update(&repo, &store, 3).unwrap();
     assert_eq!((o.new_commits, o.total_commits), (2, 15));
-
-    // Incrementality is structural: the old chain minus its former
-    // frame 0 must survive verbatim as the new chain's tail.
-    let chain_after = std::fs::read(store.join("chain")).unwrap();
-    let zlen0 = u32::from_le_bytes(chain_before[4..8].try_into().unwrap()) as usize;
-    let old_tail = &chain_before[8 + zlen0..];
+    // Batch invariant: N new commits land as ONE prepend per touched
+    // chain (trees, commits, reflog) — never one cycle per record.
     assert!(
-        chain_after.ends_with(old_tail),
-        "old frames were rewritten — update is not incremental"
+        o.depot_prepends <= 3,
+        "2-commit update made {} depot prepends (expected ≤3, one per chain)",
+        o.depot_prepends
     );
 
     // Round-trip: export regenerates every ref SHA-exactly.
@@ -214,23 +227,69 @@ fn incremental_update_appends_and_exports_sha_exact() {
         .unwrap();
     assert!(String::from_utf8_lossy(&head_doc.stdout).contains("rewritten in revision 13"));
 
-    // No new commits: update is a refs-only no-op.
+    // No new commits: update is a no-op (no new records anywhere).
     let o2 = gitdepot::update(&repo, &store, 3).unwrap();
     assert_eq!(o2.new_commits, 0);
-    assert_eq!(std::fs::read(store.join("chain")).unwrap(), chain_after);
+    assert_eq!(o2.total_commits, 15);
+    assert_eq!(o2.depot_prepends, 0, "no-op update wrote chain records");
+}
 
-    // Rewritten history (amend) is refused, store untouched.
-    sh_git(&repo, &["commit", "-q", "--amend", "-m", "amended"]);
-    match gitdepot::update(&repo, &store, 3) {
-        Err(gitdepot::Error::Unsupported(_)) => {}
-        Err(e) => panic!("expected Unsupported, got: {e}"),
-        Ok(_) => panic!("non-fast-forward update unexpectedly succeeded"),
+/// Batch prepend ≡ sequential prepends: the same three commits landed
+/// as one 3-commit update and as three 1-commit updates must produce
+/// byte-identical tree/commit records with identical stable indices.
+#[test]
+fn batch_update_equals_sequential_updates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    build_fixture(&repo);
+    let tips: Vec<String> = (0..3)
+        .map(|i| {
+            std::fs::write(repo.join("doc.txt"), format!("batch rev {i}\n")).unwrap();
+            std::fs::write(repo.join(format!("b{i}.txt")), format!("b{i}\n")).unwrap();
+            sh_git(&repo, &["add", "-A"]);
+            sh_git(&repo, &["commit", "-q", "-m", &format!("batch {i}")]);
+            sh_git(&repo, &["rev-parse", "HEAD"]).trim().to_string()
+        })
+        .collect();
+
+    // Store A: import at the pre-batch tip, then ONE update with all 3
+    // commits. Store B: same import, then three 1-commit updates.
+    let orig = sh_git(&repo, &["rev-parse", "main~3"]).trim().to_string();
+    sh_git(&repo, &["checkout", "-q", "--detach"]); // free `main` for -f
+    let a = tmp.path().join("store-a");
+    let b = tmp.path().join("store-b");
+    sh_git(&repo, &["branch", "-f", "main", &orig]);
+    gitdepot::import(&repo, &a, 3).unwrap();
+    sh_git(&repo, &["branch", "-f", "main", &tips[2]]);
+    let oa = gitdepot::update(&repo, &a, 3).unwrap();
+    assert_eq!(oa.new_commits, 3);
+    assert!(oa.depot_prepends <= 3, "batch update made {} prepends", oa.depot_prepends);
+
+    sh_git(&repo, &["branch", "-f", "main", &orig]);
+    gitdepot::import(&repo, &b, 3).unwrap();
+    for tip in &tips {
+        sh_git(&repo, &["branch", "-f", "main", tip]);
+        let o = gitdepot::update(&repo, &b, 3).unwrap();
+        assert_eq!(o.new_commits, 1);
     }
-    assert_eq!(std::fs::read(store.join("chain")).unwrap(), chain_after);
+
+    let sa = gitdepot::store::Store::open(&a).unwrap();
+    let sb = gitdepot::store::Store::open(&b).unwrap();
+    let ra = sa.commit_records().unwrap();
+    let rb = sb.commit_records().unwrap();
+    assert_eq!(ra, rb, "commit records diverge between batch and sequential");
+    let va = sa.tree_views(None).unwrap();
+    let vb = sb.tree_views(None).unwrap();
+    assert_eq!(va.len(), vb.len(), "tree counts diverge");
+    for (i, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
+        let ex = depot::codec::encode(&depot::diff(None, Some(x)));
+        let ey = depot::codec::encode(&depot::diff(None, Some(y)));
+        assert_eq!(ex, ey, "tree at newest-first position {i} diverges");
+    }
 }
 
 #[test]
-fn mirror_loop_clones_updates_and_survives_rewrite() {
+fn mirror_loop_clones_updates_and_follows_rewrites() {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin");
     let root = tmp.path().join("mirror");
@@ -239,42 +298,39 @@ fn mirror_loop_clones_updates_and_survives_rewrite() {
     // A path stands in for the remote URL (same git transport surface).
     let o = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
     assert_eq!(o.update.total_commits, 13);
-    assert!(!o.reimported);
     assert!(root.join("repo.git/HEAD").exists(), "bare mirror clone missing");
 
     // New commit on origin → incremental update through the fetch.
     std::fs::write(origin.join("more.txt"), "more\n").unwrap();
     sh_git(&origin, &["add", "-A"]);
     sh_git(&origin, &["commit", "-q", "-m", "more"]);
-    let chain_before = std::fs::read(root.join("store/chain")).unwrap();
     let o2 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
-    assert_eq!((o2.update.new_commits, o2.reimported), (1, false));
-    let zlen0 = u32::from_le_bytes(chain_before[4..8].try_into().unwrap()) as usize;
-    assert!(
-        std::fs::read(root.join("store/chain")).unwrap().ends_with(&chain_before[8 + zlen0..]),
-        "mirror update rewrote old frames"
-    );
+    assert_eq!(o2.update.new_commits, 1);
 
-    // Origin rewrites history → mirror falls back to full re-import
-    // and still exports SHA-exact against the NEW truth.
+    // Origin rewrites history → still just an update: new records +
+    // repointed refs; the store keeps the old tip resolvable and the
+    // export serves the NEW truth SHA-exact.
+    let store = root.join("store");
+    let old_main = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0;
     sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended"]);
     let o3 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
-    assert!(o3.reimported, "rewritten remote should force re-import");
+    assert_eq!(o3.update.new_commits, 1, "rewrite should add exactly the amended commit");
     let out = tmp.path().join("out");
-    let refs = gitdepot::export(&root.join("store"), &out).unwrap();
+    let refs = gitdepot::export(&store, &out).unwrap();
     let tip = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
     assert!(refs.iter().any(|r| r.name == "refs/heads/main" && r.sha == tip));
+    assert_eq!(gitdepot::resolve_ref(&store, &old_main).unwrap().unwrap().0,
+               old_main, "rewrite destroyed local history");
 
     // The fetch buffer is DERIVED state: delete repo.git, add a commit
     // upstream — the next mirror re-seeds the buffer from the store
-    // (SHA-exact export) and fetches only the delta, no re-clone/
-    // re-import.
+    // (SHA-exact export) and fetches only the delta, no re-clone.
     std::fs::remove_dir_all(root.join("repo.git")).unwrap();
     std::fs::write(origin.join("even-more.txt"), "x\n").unwrap();
     sh_git(&origin, &["add", "-A"]);
     sh_git(&origin, &["commit", "-q", "-m", "even more"]);
     let o4 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
-    assert_eq!((o4.update.new_commits, o4.reimported), (1, false),
+    assert_eq!(o4.update.new_commits, 1,
                "reseeded buffer should yield an incremental update");
     assert!(root.join("repo.git/HEAD").exists(), "buffer not rebuilt");
 
@@ -285,7 +341,7 @@ fn mirror_loop_clones_updates_and_survives_rewrite() {
     sh_git(&origin, &["commit", "-q", "-m", "last"]);
     let o5 = gitdepot::mirror_opts(origin.to_str().unwrap(), &root, true)
         .unwrap();
-    assert_eq!((o5.update.new_commits, o5.reimported), (1, false));
+    assert_eq!(o5.update.new_commits, 1);
     assert!(!root.join("repo.git").exists(), "frugal left the buffer");
     let tip2 = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
     assert!(o5.update.refs.iter()
@@ -311,24 +367,16 @@ fn import_refuses_unsupported_shapes() {
     }
 }
 
-/// §9 anti-sabotage, COST axis (the one the assertions above miss):
-/// the tiered-chain design promises prepend with BOUNDED re-encode —
-/// frame 0 + the accumulator only; sealed history physically untouched.
-/// The flat single-file chain rewrites the ENTIRE store per update
-/// (prepend_store: read whole chain, write whole chain), so a one-
-/// commit update on an N-commit store costs O(N) I/O — a daily mirror
-/// of a big repo rewrites gigabytes to prepend kilobytes.
-///
-/// This is the acceptance test for the depot-variant convergence
-/// (ATTACH-CONVERGENCE.md chip 7: gitdepot's chain moves behind the
-/// tiered store). Un-ignore when the store tiers; it must then pass.
+/// §9 anti-sabotage, COST axis: the tiered-chain store promises prepend
+/// with BOUNDED re-encode — f0 + the accumulator only; sealed history
+/// physically untouched. A one-commit update on a fat store must write
+/// nowhere near the store's size (the v1 flat chain rewrote ALL of it).
 #[test]
-#[ignore = "SABOTAGE (known): flat chain rewrites O(history) bytes per \
-            prepend; bounded-prepend arrives with the tiered depot \
-            variant (ATTACH-CONVERGENCE.md chip 7)"]
 fn update_io_is_bounded_not_o_history() {
+    // Per-THREAD accounting: the harness runs tests concurrently in one
+    // process, and update() does its store I/O on this thread.
     fn written_bytes() -> u64 {
-        let io = std::fs::read_to_string("/proc/self/io").unwrap();
+        let io = std::fs::read_to_string("/proc/thread-self/io").unwrap();
         io.lines().find_map(|l| l.strip_prefix("write_bytes: "))
             .unwrap().trim().parse().unwrap()
     }
@@ -343,70 +391,81 @@ fn update_io_is_bounded_not_o_history() {
         sh_git(&repo, &["commit", "-q", "-m", &format!("pad {i}")]);
     }
     gitdepot::import(&repo, &store, 3).unwrap();
-    let chain_len = std::fs::metadata(store.join("chain")).unwrap().len();
+    let store_len = store_size(&store);
 
-    std::fs::write(repo.join("doc.txt"), "one more line\n").unwrap();
-    sh_git(&repo, &["add", "-A"]);
-    sh_git(&repo, &["commit", "-q", "-m", "tip"]);
+    let one_commit_update_cost = |i: u32| -> u64 {
+        std::fs::write(repo.join("doc.txt"), format!("tip line {i}\n")).unwrap();
+        sh_git(&repo, &["add", "-A"]);
+        sh_git(&repo, &["commit", "-q", "-m", &format!("tip {i}")]);
+        let before = written_bytes();
+        gitdepot::update(&repo, &store, 3).unwrap();
+        written_bytes() - before
+    };
 
-    let before = written_bytes();
+    // Cost of one prepend = new f0 (one full tree frame) + the
+    // accumulator re-encode + sqlite — O(tree + accumulator), NOT
+    // O(history). Sanity ceiling first (v1's flat chain rewrote the
+    // whole store and then some).
+    let cost1 = one_commit_update_cost(0);
+    assert!(cost1 < store_len,
+            "one-commit update wrote {cost1} bytes against a {store_len}-byte \
+             store — prepend rewrote the store");
+
+    // The teeth: DOUBLE the history, prepend once more — the cost must
+    // not follow (sealed cold history is physically untouched).
+    for i in 120..240 {
+        std::fs::write(repo.join("doc.txt"), format!("pad rev {i}\n")).unwrap();
+        sh_git(&repo, &["add", "-A"]);
+        sh_git(&repo, &["commit", "-q", "-m", &format!("pad {i}")]);
+    }
     gitdepot::update(&repo, &store, 3).unwrap();
-    let cost = written_bytes() - before;
-    // Bounded: the new frames + bridge + meta — nowhere near a store
-    // rewrite. Half the old chain is a generous ceiling.
-    assert!(cost < chain_len / 2,
-            "one-commit update wrote {cost} bytes against a {chain_len}-byte \
-             store — prepend is O(history), the tiering is sabotaged");
+    let cost2 = one_commit_update_cost(1);
+    eprintln!("bounded-update: store={store_len}B cost1={cost1}B cost2={cost2}B");
+    assert!(cost2 < cost1 + cost1 / 2,
+            "one-commit update cost grew with history ({cost1} -> {cost2} \
+             bytes after doubling the commit count) — prepend is O(history)");
 }
 
-/// A pre-sqlite store (meta.json) still opens read-only, and the first
-/// write converts it: sqlite appears, the json disappears, and the
-/// round-trip stays SHA-exact across the conversion.
+/// A v1 store (flat chain + legacy bookkeeping) migrates to v2 on open:
+/// depot + schema=2 sqlite appear, the chain file disappears, and the
+/// round-trip stays SHA-exact across the migration.
 #[test]
-fn legacy_json_store_reads_and_converts_on_first_write() {
+fn v1_store_migrates_on_open() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     let store = tmp.path().join("store");
+    let v1 = tmp.path().join("store-v1");
     build_fixture(&repo);
     gitdepot::import(&repo, &store, 3).unwrap();
+    gitdepot::store::legacy::write_v1_from_v2_for_tests(&store, &v1, 3).unwrap();
+    assert!(v1.join("chain").exists() && v1.join("meta.json").exists());
 
-    // Regress the store to the legacy format: Meta still serializes to
-    // the exact meta.json shape (hex fields), so the fixture is minted
-    // from the live store.
-    let meta = gitdepot::chain::read_meta(&store).unwrap();
-    let json = serde_json::to_string_pretty(&meta).unwrap();
-    std::fs::write(store.join("meta.json"), json).unwrap();
-    for f in ["meta.sqlite", "meta.sqlite-wal", "meta.sqlite-shm"] {
-        let p = store.join(f);
-        if p.exists() {
-            std::fs::remove_file(p).unwrap();
-        }
-    }
+    // Any open migrates: a read path suffices.
+    assert_eq!(gitdepot::commit_count(&v1).unwrap(), 13);
+    assert!(v1.join("meta.sqlite").exists(), "migration did not mint sqlite");
+    assert!(v1.join("depot").is_dir(), "migration did not build the depot");
+    assert!(!v1.join("chain").exists(), "v1 chain left behind");
+    assert!(!v1.join("meta.json").exists(), "legacy json left behind");
 
-    // Legacy reads: full load, point accessors, resolution.
-    let back = gitdepot::chain::read_meta(&store).unwrap();
-    assert_eq!(back.commits.len(), meta.commits.len());
-    assert_eq!(gitdepot::commit_count(&store).unwrap(), 13);
-    let (sha, pos) = gitdepot::resolve_ref(&store, "main").unwrap().unwrap();
-    assert_eq!(pos, 0, "main is the newest commit");
+    // Resolution + stable indices work post-migration.
+    let meta = gitdepot::store::read_meta(&v1).unwrap();
+    let (sha, idx) = gitdepot::resolve_ref(&v1, "main").unwrap().unwrap();
     assert_eq!(sha, meta.commits[0].sha);
+    assert_eq!(idx, 12, "main is the newest commit (stable index N-1)");
 
-    // First write (a one-commit update) converts.
-    std::fs::write(repo.join("doc.txt"), "post-legacy\n").unwrap();
+    // Writes keep working (a one-commit update) and export is SHA-exact.
+    std::fs::write(repo.join("doc.txt"), "post-migration\n").unwrap();
     sh_git(&repo, &["add", "-A"]);
-    sh_git(&repo, &["commit", "-q", "-m", "post-legacy"]);
-    let o = gitdepot::update(&repo, &store, 3).unwrap();
+    sh_git(&repo, &["commit", "-q", "-m", "post-migration"]);
+    let o = gitdepot::update(&repo, &v1, 3).unwrap();
     assert_eq!((o.new_commits, o.total_commits), (1, 14));
-    assert!(store.join("meta.sqlite").exists(), "conversion did not mint sqlite");
-    assert!(!store.join("meta.json").exists(), "legacy json left behind");
-
     let out = tmp.path().join("out");
-    let refs = gitdepot::export(&store, &out).unwrap();
-    assert!(!refs.is_empty(), "post-conversion export lost refs");
+    let refs = gitdepot::export(&v1, &out).unwrap();
+    assert!(!refs.is_empty(), "post-migration export lost refs");
 }
 
 /// resolve_ref point-lookup semantics: bare name, full refname, tag,
-/// unique sha prefix (with frame index), ambiguity, and misses.
+/// unique sha prefix (with STABLE index), ambiguity, and misses.
 #[test]
 fn resolve_ref_point_lookups() {
     let tmp = tempfile::tempdir().unwrap();
@@ -415,28 +474,29 @@ fn resolve_ref_point_lookups() {
     build_fixture(&repo);
     sh_git(&repo, &["tag", "v1", "main~1"]); // lightweight: commit type
     gitdepot::import(&repo, &store, 3).unwrap();
-    let meta = gitdepot::chain::read_meta(&store).unwrap();
+    let meta = gitdepot::store::read_meta(&store).unwrap();
+    let n = meta.commits.len(); // 13; meta.commits is newest-first
 
     let main_sha = meta.refs.iter()
         .find(|r| r.name == "refs/heads/main").unwrap().sha.clone();
     assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap(),
-               (main_sha.clone(), 0));
+               (main_sha.clone(), n - 1));
     assert_eq!(gitdepot::resolve_ref(&store, "refs/heads/main").unwrap().unwrap(),
-               (main_sha.clone(), 0));
-    let (v1_sha, v1_pos) = gitdepot::resolve_ref(&store, "v1").unwrap().unwrap();
-    assert_eq!(v1_sha, meta.commits[v1_pos].sha, "tag pos mismatched sha");
-    assert_ne!(v1_pos, 0, "main~1 is not the newest frame");
+               (main_sha.clone(), n - 1));
+    let (v1_sha, v1_idx) = gitdepot::resolve_ref(&store, "v1").unwrap().unwrap();
+    assert_eq!(v1_sha, meta.commits[n - 1 - v1_idx].sha, "tag idx mismatched sha");
+    assert_ne!(v1_idx, n - 1, "main~1 is not the newest record");
 
-    // A NON-tip commit by unique sha prefix, with its frame index.
-    let target = &meta.commits[5].sha;
+    // A NON-tip commit by unique sha prefix, with its stable index.
+    let target = &meta.commits[5].sha; // newest-first pos 5 = stable idx n-6
     let mut plen = 4;
     while meta.commits.iter().filter(|c| c.sha.starts_with(&target[..plen])).count() > 1 {
         plen += 1;
     }
     assert_eq!(gitdepot::resolve_ref(&store, &target[..plen]).unwrap().unwrap(),
-               (target.clone(), 5));
-    // Frame index round-trips through commit_at.
-    assert_eq!(gitdepot::commit_at(&store, 5).unwrap().sha, *target);
+               (target.clone(), n - 6));
+    // Stable index round-trips through commit_at.
+    assert_eq!(gitdepot::commit_at(&store, n - 6).unwrap().sha, *target);
 
     // Empty prefix matches every commit: ambiguous, exact message.
     match gitdepot::resolve_ref(&store, "") {
@@ -450,9 +510,9 @@ fn resolve_ref_point_lookups() {
 }
 
 /// §9 anti-sabotage, METADATA cost axis: a one-commit update must do
-/// O(new) sqlite work. The proof is structural: every pre-existing
-/// commits row keeps its exact (pos, sha) key — nothing is renumbered
-/// or rewritten — and the new commit lands at MIN(pos)-1.
+/// O(new) bookkeeping. The proof is structural: every pre-existing
+/// sha_idx row keeps its exact (sha, index) pair — stable indices are
+/// never renumbered — and the new commit lands at index N.
 #[test]
 fn update_metadata_is_o_new_not_o_history() {
     let tmp = tempfile::tempdir().unwrap();
@@ -469,7 +529,7 @@ fn update_metadata_is_o_new_not_o_history() {
     let rows = |store: &Path| -> Vec<(i64, String)> {
         let conn = rusqlite::Connection::open(store.join("meta.sqlite")).unwrap();
         let mut stmt = conn
-            .prepare("SELECT pos, sha FROM commits ORDER BY pos ASC")
+            .prepare("SELECT commit_idx, sha FROM sha_idx ORDER BY commit_idx ASC")
             .unwrap();
         let v = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -480,7 +540,7 @@ fn update_metadata_is_o_new_not_o_history() {
     };
     let before = rows(&store);
     assert_eq!(before.len(), 133);
-    assert_eq!(before[0].0, 0, "import numbers from 0");
+    assert_eq!(before[0].0, 0, "import numbers from 0 (oldest)");
 
     std::fs::write(repo.join("doc.txt"), "one more line\n").unwrap();
     sh_git(&repo, &["add", "-A"]);
@@ -489,19 +549,20 @@ fn update_metadata_is_o_new_not_o_history() {
 
     let after = rows(&store);
     assert_eq!(after.len(), 134);
-    assert_eq!(after[1..], before[..],
+    assert_eq!(after[..133], before[..],
                "pre-existing rows were renumbered — update is O(history)");
-    assert_eq!(after[0].0, -1, "new commit must land at MIN(pos)-1");
-    // And the shifted keys still read back as frame indices.
-    assert_eq!(gitdepot::commit_at(&store, 0).unwrap().sha, after[0].1);
-    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().1, 0);
+    assert_eq!(after[133].0, 133, "new commit must land at index N");
+    // And the stable index reads back through the point accessors.
+    assert_eq!(gitdepot::commit_at(&store, 133).unwrap().sha, after[133].1);
+    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().1, 133);
 }
 
-/// Upstream deletes a branch: the mirror marks the ref (deleted_at),
-/// logs the prune, stops resolving the name — but the commits the ref
-/// pinned STAY in the store. Local history is never destroyed.
+/// Upstream deletes a branch: the ref row is GONE from the refs table,
+/// a reflog record observes the deletion (new_* absent), and the
+/// commits the ref pinned stay resolvable. Local history is never
+/// destroyed.
 #[test]
-fn upstream_branch_deletion_marks_ref_and_keeps_history() {
+fn upstream_branch_deletion_drops_ref_and_keeps_history() {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin");
     let root = tmp.path().join("mirror");
@@ -513,7 +574,6 @@ fn upstream_branch_deletion_marks_ref_and_keeps_history() {
 
     sh_git(&origin, &["branch", "-D", "side"]);
     let o = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
-    assert!(!o.reimported, "a ref deletion must not force a re-import");
     assert_eq!(o.update.new_commits, 0);
 
     // The name no longer resolves; the commit (and the count) survive.
@@ -521,20 +581,20 @@ fn upstream_branch_deletion_marks_ref_and_keeps_history() {
     assert_eq!(gitdepot::commit_count(&store).unwrap(), n);
     assert_eq!(gitdepot::resolve_ref(&store, &side_sha).unwrap().unwrap().0,
                side_sha);
-    // Live listings exclude it; the row is marked, not dropped.
-    assert!(!gitdepot::chain::refs(&store).unwrap().iter()
+    assert!(!gitdepot::store::refs(&store).unwrap().iter()
         .any(|r| r.name == "refs/heads/side"));
+    // The row is deleted outright — CURRENT refs only, no deleted_at.
     let conn = rusqlite::Connection::open(store.join("meta.sqlite")).unwrap();
-    let deleted_at: Option<i64> = conn
-        .query_row("SELECT deleted_at FROM refs WHERE name = 'refs/heads/side'",
+    let live: i64 = conn
+        .query_row("SELECT COUNT(*) FROM refs WHERE name = 'refs/heads/side'",
                    [], |r| r.get(0))
         .unwrap();
-    assert!(deleted_at.is_some(), "pruned ref must be marked, not dropped");
-    // The reflog observed the deletion.
-    let log = gitdepot::chain::reflog(&store).unwrap();
+    assert_eq!(live, 0, "deleted ref must leave the refs table");
+    // The reflog chain observed the deletion.
+    let log = gitdepot::store::reflog(&store).unwrap();
     let prune = log.iter().rev()
-        .find(|e| e.refname == "refs/heads/side" && e.new_sha.is_none())
-        .expect("no prune row in reflog");
+        .find(|e| e.refname == "refs/heads/side" && e.new_commit_idx.is_none())
+        .expect("no deletion row in reflog");
     assert_eq!(prune.old_sha.as_deref(), Some(side_sha.as_str()));
     assert_eq!(prune.note, "pruned upstream");
     // The store still updates incrementally afterwards.
@@ -542,15 +602,15 @@ fn upstream_branch_deletion_marks_ref_and_keeps_history() {
     sh_git(&origin, &["add", "-A"]);
     sh_git(&origin, &["commit", "-q", "-m", "after prune"]);
     let o2 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
-    assert_eq!((o2.update.new_commits, o2.reimported), (1, false));
+    assert_eq!(o2.update.new_commits, 1);
     assert_eq!(gitdepot::commit_count(&store).unwrap(), n + 1);
 }
 
-/// Upstream force-push: the old store is RETIRED (renamed, intact and
-/// still readable), never deleted; the new store serves the new history
-/// and its reflog records the rewrite naming the retired path.
+/// Upstream force-push: history survives IN PLACE. Old commits stay
+/// resolvable by sha and exportable; the reflog records the move; no
+/// second store, ever.
 #[test]
-fn upstream_rewrite_retires_old_store_and_logs() {
+fn upstream_rewrite_keeps_history_in_place() {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin");
     let root = tmp.path().join("mirror");
@@ -561,77 +621,61 @@ fn upstream_rewrite_retires_old_store_and_logs() {
     let old_count = gitdepot::commit_count(&store).unwrap();
 
     sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended"]);
-    let o = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
-    assert!(o.reimported);
+    gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
 
-    let retired: Vec<_> = std::fs::read_dir(&root).unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("store.retired."))
-        .collect();
-    assert_eq!(retired.len(), 1, "old store not retired");
-    let retired = retired[0].path();
-    // The retired store is intact: bookkeeping AND chain read back.
-    let (old_meta, old_views) = gitdepot::chain::read_store(&retired).unwrap();
-    assert_eq!(old_meta.commits.len(), old_count);
-    assert_eq!(old_views.len(), old_count);
-    assert_eq!(gitdepot::resolve_ref(&retired, "main").unwrap().unwrap().0,
+    // Old commits still resolvable by sha…
+    assert_eq!(gitdepot::resolve_ref(&store, &old_main).unwrap().unwrap().0,
                old_main);
-
-    // The new store serves the new history…
+    assert_eq!(gitdepot::commit_count(&store).unwrap(), old_count + 1);
+    // …and still exportable: the export stream carries the whole store,
+    // rewritten-away commits included.
     let new_main = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
-    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap(),
-               (new_main.clone(), 0));
-    // …and its reflog records the rewrite, naming the retired path.
-    let log = gitdepot::chain::reflog(&store).unwrap();
+    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0,
+               new_main);
+    let out = tmp.path().join("out");
+    gitdepot::export(&store, &out).unwrap();
+    let have_old = Command::new("git")
+        .arg("-C").arg(&out)
+        .args(["cat-file", "-e", &old_main])
+        .status().unwrap();
+    assert!(have_old.success(), "old tip missing from export");
+    // The reflog records the move old→new.
+    let log = gitdepot::store::reflog(&store).unwrap();
     let rw = log.iter().rev()
         .find(|e| e.refname == "refs/heads/main"
               && e.old_sha.as_deref() == Some(old_main.as_str()))
         .expect("no rewrite row in reflog");
     assert_eq!(rw.new_sha.as_deref(), Some(new_main.as_str()));
-    assert!(rw.note.starts_with("rewrite"), "note {:?}", rw.note);
-    assert!(rw.note.contains(retired.to_str().unwrap()),
-            "note {:?} does not name the retired store", rw.note);
 }
 
-/// A rewrite that orphans nothing (the old tip stays reachable via
-/// another branch) must NOT retain a retired store copy — retirement
-/// is for unique history only, else every side-ref rewrite on a busy
-/// repo banks a full redundant store (unbounded disk). The reflog
-/// still records the rewrite either way.
+/// Two successive rewrites: NO store copies, no store.retired.* ever,
+/// and both old tips remain resolvable — a rewrite is records + a
+/// repoint, not a new store.
 #[test]
-fn redundant_rewrite_drops_the_retired_copy() {
+fn successive_rewrites_never_copy_the_store() {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin");
     let root = tmp.path().join("mirror");
     build_fixture(&origin);
     gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    let store = root.join("store");
+    let tip0 = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0;
 
-    // Keep the old tip reachable, then rewrite main (amend) — the old
-    // commits ALL survive in the new store via "keep".
-    sh_git(&origin, &["branch", "keep", "main"]);
-    sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended tip"]);
-    let o = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
-    assert!(o.reimported);
-    let retired: Vec<_> = std::fs::read_dir(&root).unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("store.retired"))
-        .collect();
-    assert!(retired.is_empty(),
-            "redundant rewrite banked a retired copy: {retired:?}");
-    // The rewrite is still on the record.
-    let log = gitdepot::chain::reflog(&root.join("store")).unwrap();
-    assert!(log.iter().any(|r| r.note.contains("no unique history")),
-            "rewrite not reflogged: {log:?}");
+    sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended once"]);
+    gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    let tip1 = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0;
 
-    // Control: a rewrite that DOES orphan commits retains the copy.
-    sh_git(&origin, &["branch", "-D", "keep"]);
-    sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended again"]);
-    let o2 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
-    assert!(o2.reimported);
-    let retired: Vec<_> = std::fs::read_dir(&root).unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("store.retired"))
+    sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended twice"]);
+    gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+
+    let extra: Vec<_> = std::fs::read_dir(&root).unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "store" && n != "repo.git")
         .collect();
-    assert_eq!(retired.len(), 1,
-               "orphaning rewrite must retain exactly the unique copy");
+    assert!(extra.is_empty(), "rewrites left store copies: {extra:?}");
+    for old in [&tip0, &tip1] {
+        assert_eq!(gitdepot::resolve_ref(&store, old).unwrap().unwrap().0, **old,
+                   "rewritten-away tip no longer resolvable");
+    }
 }

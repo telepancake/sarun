@@ -103,7 +103,7 @@ fn main() -> ExitCode {
             })
         }
         ("log", [store]) => {
-            gitdepot::chain::read_meta(&PathBuf::from(store)).map(|meta| {
+            gitdepot::store::read_meta(&PathBuf::from(store)).map(|meta| {
                 for (i, c) in meta.commits.iter().enumerate() {
                     let at: Vec<&str> = meta.refs.iter()
                         .filter(|r| r.sha == c.sha)
@@ -122,10 +122,9 @@ fn main() -> ExitCode {
             gitdepot::mirror_opts(url, &PathBuf::from(root),
                                   !rest.is_empty()).map(|o| {
                 println!(
-                    "{} new commits ({} total){}",
+                    "{} new commits ({} total)",
                     o.update.new_commits,
                     o.update.total_commits,
-                    if o.reimported { "  [re-imported: remote rewrote history]" } else { "" }
                 );
                 for r in &o.update.refs {
                     println!("{} {}", r.sha, r.name);

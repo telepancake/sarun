@@ -27,10 +27,11 @@
 //!
 //! Per SPEC §"Crash-safety contract":
 //!   1. `BEGIN IMMEDIATE` on sqlite.
-//!   2. For each new revision on this page, prepend one frame to the
-//!      depot. The depot index flip is the depot's commit; if sqlite
-//!      then rolls back, those frames are orphaned but unreferenced
-//!      (sqlite owns the page-id↔chain-id story).
+//!   2. All of the page's new revisions land on the chain as ONE batch
+//!      prepend (SPEC §"Prepend multiple records"). The depot index
+//!      flip is the depot's commit; if sqlite then rolls back, those
+//!      frames are orphaned but unreferenced (sqlite owns the
+//!      page-id↔chain-id story).
 //!   3. Append the title bytes to the strpool ONCE per (ns, normalized
 //!      title) if not already present; record the resulting id.
 //!   4. Insert sqlite rows: `revisions_seen`, `title_id_to_page` (if
@@ -142,11 +143,15 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
         let normalized = page.title.trim().as_bytes().to_vec();
         ensure_title(&g, page_id, ns_i, &normalized, instance.title_shard_count)?;
 
-        // Prepend each revision in source order (oldest → newest); skip
-        // those already in revisions_seen. Source order isn't strictly
-        // timestamp-ordered in the wild, but every test fixture has
-        // it so. The chain's "newest in f0" is the LAST prepended.
+        // Collect the page's NEW revisions in source order (oldest →
+        // newest); skip those already in revisions_seen. Source order
+        // isn't strictly timestamp-ordered in the wild, but every test
+        // fixture has it so. All N records then land as ONE batch
+        // prepend (depot SPEC §"Prepend multiple records") — one f0
+        // swap, one f1 re-encode, one seal check per page, not per
+        // revision.
         let mut new_this_page = 0u64;
+        let mut new_records: Vec<Vec<u8>> = Vec::new();
         for rev in &page.revisions {
             let rev_id = rev.id as u64;
             if revision_seen(&g.conn, page_id, rev_id)? {
@@ -155,16 +160,18 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
             }
 
             let (meta, text_bytes) = build_revision_record(rev, stats);
-            let encoded = encode_revision(&meta, &text_bytes);
-
-            prepend_depot_frame(&g, page_id, &encoded,
-                               instance.f1_seal_threshold_bytes)?;
+            new_records.push(encode_revision(&meta, &text_bytes));
 
             g.conn.execute(
                 "INSERT INTO revisions_seen(page_id, rev_id) VALUES(?1, ?2)",
                 params![page_id as i64, rev_id as i64],
             )?;
             new_this_page += 1;
+        }
+        if !new_records.is_empty() {
+            new_records.reverse(); // the chain wants newest-first
+            prepend_depot_frames(&g, page_id, &new_records,
+                                 instance.f1_seal_threshold_bytes)?;
         }
 
         stats.revisions_new += new_this_page;
@@ -323,14 +330,28 @@ fn build_revision_record(rev: &Revision, stats: &mut ImportStats) -> (RevisionMe
     (meta, text_bytes)
 }
 
-/// Prepend one revision record to the depot chain for `chain_id`. See
-/// the module doc for the f0/f1/seal strategy.
-fn prepend_depot_frame(
+/// Prepend one or more revision records (NEWEST-first) to the depot
+/// chain for `chain_id` as ONE prepend — the normative multi-record
+/// composition (depot SPEC §"Prepend multiple records", exposed as
+/// `wikimak_depot::compose_f1`). Revision records stand alone, so the
+/// old head demotes into the accumulator verbatim. See the module doc
+/// for the f0/f1/seal strategy.
+pub(crate) fn prepend_depot_frames(
     g: &InstanceInner,
     chain_id: u64,
-    record: &[u8],
+    records_newest_first: &[Vec<u8>],
     seal_threshold: u64,
 ) -> Result<()> {
+    // A batch bigger than the seal threshold lands chunk by chunk
+    // (oldest first) so accumulators and cold frames stay bounded.
+    let sizes: Vec<usize> = records_newest_first.iter().map(|r| r.len()).collect();
+    let chunks = wikimak_depot::chunk_newest_first(&sizes, seal_threshold);
+    if chunks.len() > 1 {
+        for range in chunks {
+            prepend_depot_frames(g, chain_id, &records_newest_first[range], seal_threshold)?;
+        }
+        return Ok(());
+    }
     // Is this the first prepend on the chain?
     let prev_f0 = match g.depot.read_f0(chain_id) {
         Ok(b) => Some(b),
@@ -338,42 +359,41 @@ fn prepend_depot_frame(
         Err(e) => return Err(e.into()),
     };
 
-    let new_f0 = crate::frames::compress(record, None)?;
-    match prev_f0 {
+    let (head, older, prev_record) = match prev_f0 {
+        Some(frame) => (
+            &records_newest_first[0],
+            &records_newest_first[1..],
+            crate::frames::decompress(&frame, None)?,
+        ),
         None => {
-            // First prepend: no f1.
-            g.depot.prepend(chain_id, &new_f0, None, false)?;
+            // Empty chain: seed with the OLDEST record (the depot
+            // forbids f1 on a chain's first prepend), then absorb the
+            // rest as one batch.
+            let (seed, rest) = records_newest_first.split_last().expect("non-empty batch");
+            g.depot
+                .prepend(chain_id, &crate::frames::compress(seed, None)?, None, false)?;
+            if rest.is_empty() {
+                return Ok(());
+            }
+            (&rest[0], &rest[1..], seed.clone())
         }
-        Some(prev_f0_frame) => {
-            // Recover the raw records: old f0 standalone; old f1 (if
-            // any) is anchored on the old f0 record.
-            let prev_record = crate::frames::decompress(&prev_f0_frame, None)?;
-            let old_f1_raw = match g.depot.read_f1(chain_id)? {
-                Some(f1_frame) => {
-                    crate::frames::decompress(&f1_frame, Some(&prev_record))?
-                }
-                None => Vec::new(),
-            };
-            // Seal when absorbing the spilled head would push the
-            // accumulator past the threshold (and there IS an
-            // accumulator to seal — the depot refuses seal without f1).
-            let seal = !old_f1_raw.is_empty()
-                && (old_f1_raw.len() + prev_record.len()) as u64 > seal_threshold;
-            let new_f1 = if seal {
-                // Old f1's zstd bytes move verbatim to cold (its anchor,
-                // prev_record, becomes new f1's sole content). Fresh
-                // accumulator = just the spilled head.
-                crate::frames::compress(&prev_record, Some(record))?
-            } else {
-                let mut raw =
-                    Vec::with_capacity(prev_record.len() + old_f1_raw.len());
-                raw.extend_from_slice(&prev_record);
-                raw.extend_from_slice(&old_f1_raw);
-                crate::frames::compress(&raw, Some(record))?
-            };
-            g.depot.prepend(chain_id, &new_f0, Some(&new_f1), seal)?;
-        }
-    }
+    };
+    let old_f1_raw = match g.depot.read_f1(chain_id)? {
+        Some(f1_frame) => crate::frames::decompress(&f1_frame, Some(&prev_record))?,
+        None => Vec::new(),
+    };
+    // Accumulator entries newest-first: the older new records, then the
+    // demoted old head (verbatim — its zstd f0 frame is orphaned).
+    let mut entries: Vec<&[u8]> = older.iter().map(|r| r.as_slice()).collect();
+    entries.push(&prev_record);
+    let (new_f1_raw, seal) = wikimak_depot::compose_f1(
+        &entries,
+        if old_f1_raw.is_empty() { None } else { Some(&old_f1_raw) },
+        seal_threshold,
+    );
+    let new_f0 = crate::frames::compress(head, None)?;
+    let new_f1 = crate::frames::compress(&new_f1_raw, Some(head))?;
+    g.depot.prepend(chain_id, &new_f0, Some(&new_f1), seal)?;
     Ok(())
 }
 

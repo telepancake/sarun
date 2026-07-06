@@ -1,22 +1,22 @@
 //! RO-attachment readout over a gitdepot store
 //! (ATTACH-CONVERGENCE.md chip 2).
 //!
-//! The tip is frame 0 — a standalone full record — so [`TipReadout`]
-//! decodes exactly one frame, on first access, and serves plain
-//! [`ViewReadout`] semantics over it (nested under the attach verb's
-//! `prefix`, so e.g. "src" serves the repo under /src). Non-tip commits
-//! have no random access: every frame is refPrefix-anchored on the
-//! next-newer view, so [`TipReadout::for_commit`] pays the FULL chain
-//! walk (`chain::read_store`) up front — O(history), the §4 stated
-//! cost — and only then serves O(1).
+//! The tip is the TREES chain's f0 — a standalone full record — so
+//! [`TipReadout`] decodes exactly one frame, on first access, and serves
+//! plain [`ViewReadout`] semantics over it (nested under the attach
+//! verb's `prefix`, so e.g. "src" serves the repo under /src).
+//! [`TipReadout::for_commit`] resolves sha → commit index → tree index
+//! through the bookkeeping, then walks the TREES chain from the head
+//! down to that tree applying reverse deltas — O(distance from tip),
+//! paid up front; serving is O(1) afterwards.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use depot::variant::{nest_view, view_at, view_entry, Blob, Readout, ReadoutEntry};
-use depot::{codec, Name, View};
+use depot::{Name, View};
 
-use crate::{chain, Result};
+use crate::{store, Result};
 
 pub struct TipReadout {
     store: PathBuf,
@@ -41,20 +41,19 @@ impl TipReadout {
         }
     }
 
-    /// Readout of ONE non-tip commit, selected by exact sha. Decodes
-    /// the whole chain down to it NOW (view-anchored frames admit no
-    /// random access into history); serving is O(1) afterwards.
-    /// `Ok(None)` when the sha is not in the chain.
+    /// Readout of ONE commit, selected by exact sha. Walks the trees
+    /// chain down to the commit's tree NOW; serving is O(1) afterwards.
+    /// `Ok(None)` when the sha is not in the store.
     pub fn for_commit(store: &Path, sha: &str, prefix: &str) -> Result<Option<Self>> {
-        let (meta, views) = chain::read_store(store)?;
-        let Some(idx) = meta.commits.iter().position(|c| c.sha == sha) else {
+        let st = store::Store::open(store)?;
+        let Some(cidx) = st.sha_to_idx(sha)? else {
             return Ok(None);
         };
+        let rec = st.commit_record_at(cidx)?;
+        let tree = st.tree_view(rec.tree_idx)?;
         let prefix = split_prefix(prefix);
-        let nested = nest_view(
-            views.into_iter().nth(idx).expect("read_store aligns views with commits"),
-            &prefix.iter().map(|c| c.as_slice()).collect::<Vec<_>>(),
-        );
+        let nested =
+            nest_view(tree, &prefix.iter().map(|c| c.as_slice()).collect::<Vec<_>>());
         let view = OnceLock::new();
         view.set(Some(nested)).expect("fresh OnceLock");
         Ok(Some(TipReadout { store: store.to_path_buf(), prefix, view }))
@@ -63,9 +62,8 @@ impl TipReadout {
     fn view(&self) -> Option<&View> {
         self.view
             .get_or_init(|| {
-                let record = chain::read_head_record(&self.store).ok()?;
-                let layer = codec::decode(&record).ok()?;
-                let tip = depot::apply(None, &layer)?;
+                let st = store::Store::open(&self.store).ok()?;
+                let tip = st.tree_views(Some(0)).ok()?.pop()?;
                 let prefix: Vec<&[u8]> = self.prefix.iter().map(|c| c.as_slice()).collect();
                 Some(nest_view(tip, &prefix))
             })

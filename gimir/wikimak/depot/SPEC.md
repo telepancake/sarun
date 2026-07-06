@@ -197,6 +197,26 @@ Same call, but `seal_old_f1 = true`. The depot:
 8. Bump `bytes_deprecated` on old f0's file (by old_f0_size) and old f1's
    file (by old_f1_size).
 
+### Prepend multiple records (normative composition)
+
+Prepending N ≥ 1 records to a chain is ONE `prepend` call — one f0
+swap, one f1 re-encode, one seal check — never N single-record cycles.
+The library exposes the composition as `compose_f1` (raw, caller-side
+framing and compression as ever):
+
+- new f0 raw = the newest record;
+- accumulator entries, newest-first = the N−1 older new records, then
+  the DEMOTED old head record (verbatim where records stand alone, a
+  caller-computed replacement — e.g. a delta re-based on the new head —
+  where they don't);
+- `new_f1_raw` = entries ++ old f1 raw, unless absorbing the entries
+  would push the EXISTING accumulator past the seal threshold, in which
+  case `seal_old_f1 = true` (old f1's zstd bytes move to cold verbatim)
+  and the fresh accumulator holds the entries alone.
+
+The caller then compresses new f0 standalone and new f1 anchored on the
+new f0 record per its own discipline, and calls `prepend` once.
+
 ### Eviction of an f0 or f1 file
 
 Triggered when any file in the tier has `bytes_deprecated / file_size >

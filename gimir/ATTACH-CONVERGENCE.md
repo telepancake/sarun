@@ -95,10 +95,14 @@ Revised order: chips 1–6 above (readout + reference attach — needed
 under any layering), then: (7) chain features promoted into the depot
 trait surface + VBF variant behind it — acceptance test already in
 the tree: gitdepot roundtrip.rs update_io_is_bounded_not_o_history
-(#[ignore]d, documents the flat chain's O(history)-per-prepend
-sabotage; must pass un-ignored when the store tiers). For git the
+(un-ignored and PASSING since the git portion landed). For git the
 design of record is THREE CHAINS + STABLE INDICES (2026-07-06, user
-design; supersedes the earlier spine/side-chain sketch): one tiered
+design; supersedes the earlier spine/side-chain sketch;
+✅ git portion IMPLEMENTED 2026-07-06 — gitdepot store v2 in
+`gitdepot/src/store.rs` over wikimak-depot; batch prepends via the
+depot's normative `compose_f1`/`chunk_newest_first` composition, also
+adopted by wikipedia's import; v1 stores migrate on open; the non-FF /
+retire / salvage mechanisms are deleted): one tiered
 store (wikimak-depot chains — bounded prepend for free) holding a
 trees chain, a commits chain, and a reflog chain. Records get stable
 indices counted from the OLDEST end — prepend-invariant by

@@ -1,18 +1,17 @@
 //! gitdepot — a git repository to/from depot straightedge.
 //!
 //! The second workload for the depot model (DEPOT-DESIGN.md §7 "git"):
-//! a repo's history becomes a chain of canonical layers, **newest
-//! first**: record 0 is the newest commit's full tree layer; every older
-//! record is a **diff layer** — `diff(view[i-1], view[i])`, the delta
-//! that rebuilds the older view from the next-newer one (full-content
-//! records per commit make zero sense at scale — imagine linux.git).
-//! Frames are refPrefix-chained in zstd the way a VBF chain anchors each
-//! frame on the next-newer record; the import prints the comparison
+//! a repo's history becomes a chain of canonical tree layers walked
+//! **newest first**: the head record is the newest tree's full layer;
+//! every older record is a **reverse delta** — the layer that rebuilds
+//! the older view from the next-newer one (full-content records per
+//! commit make zero sense at scale — imagine linux.git). Frames are
+//! refPrefix-chained in zstd the way a VBF chain anchors each frame on
+//! the next-newer record; `import --report` prints the comparison
 //! against the other encodings (full/delta × standalone/refPrefix, plus
 //! the solid bound). Refs and commit metadata (author, committer,
-//! message, parent edges) are **meta** — bookkeeping outside the layers,
-//! per the round-trip fence: they round-trip, but they are not tree
-//! data.
+//! message, parent edges) round-trip through their own chains/tables,
+//! not through tree layers.
 //!
 //! Per the implicit-id rule, no git object id is stored in any layer:
 //! blob/tree hashes are dropped on import and recomputed by git on
@@ -23,20 +22,26 @@
 //! data — a pointer into a repo we do not hold — and is stored as the
 //! node's blob.
 //!
-//! On-disk store: `<dir>/meta.sqlite` (WAL; refs + reflog + commit
-//! bookkeeping, point-readable — see `chain.rs`) + `<dir>/chain`
-//! (frames newest-first,
-//! each `[u32 raw_len | u32 zstd_len | zstd bytes]`, frame 0 standalone,
-//! frame i compressed with record i-1 as zstd refPrefix). git itself is
-//! driven by shelling out — sarun custom — so this tool needs a `git`
-//! binary and runs host-side.
+//! On-disk store v2 (ATTACH-CONVERGENCE.md chip 7 — THREE CHAINS +
+//! STABLE INDICES; full layout/discipline in `store.rs`):
 //!
-//! Bookkeeping split (DEPOT-DESIGN.md §3): refs and derived indexes are
-//! the permanently-sqlite part. The commits table — and the reflog —
-//! are corpus data, date-ordered and prepend-shaped; when this store
-//! moves behind the tiered depot variant (ATTACH-CONVERGENCE.md chip 7)
-//! they belong in a depot chain, and their sqlite tables here are the
-//! interim scaled representation.
+//! * `<dir>/depot/` — one tiered wikimak-depot instance (f0/f1/cold,
+//!   bounded prepend) holding three chains: TREES (reverse-delta tree
+//!   layers, tip full at f0), COMMITS (one record per commit: sha,
+//!   PARENT INDICES, tree index, author/committer/message), REFLOG
+//!   (every observed ref movement, deletions included).
+//! * `<dir>/meta.sqlite` (WAL) — kv (schema=2, label/url, the
+//!   authoritative per-chain record counts), refs (CURRENT refs only:
+//!   name → commit_idx + tree_idx), and the DERIVED, rebuildable dedup
+//!   indexes sha_idx (sha → commit_idx) and tree_hash (sha256 of
+//!   canonical view bytes → tree_idx).
+//!
+//! Records carry STABLE indices counted from the oldest end (record k =
+//! newest-first frame N-1-k; prepends only grow N), so lineage lives in
+//! the data and an upstream rewrite is just new records + repointed
+//! refs — no non-fast-forward path, no re-import, no store retirement.
+//! git itself is driven by shelling out — sarun custom — so this tool
+//! needs a `git` binary and runs host-side.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -46,10 +51,10 @@ use std::process::{Command, Stdio};
 use depot::codec;
 use depot::{Attrs, BlobOp, Layer, Node};
 
-pub mod chain;
 pub mod readout;
+pub mod store;
 
-pub use chain::{commit_at, commit_count, label, resolve_ref};
+pub use store::{commit_at, commit_count, label, resolve_ref};
 
 // ------------------------------------------------------------------ meta
 
@@ -424,13 +429,17 @@ fn collect_refs(repo: &Path) -> Result<Vec<RefMeta>> {
     Ok(refs)
 }
 
-/// All commits reachable from branches + tags, newest-first (topo
-/// order). Same scope rule as `collect_refs`.
-fn rev_list(repo: &Path) -> Result<Vec<String>> {
-    Ok(git_str(repo, &["rev-list", "--topo-order", "--branches", "--tags"])?
-        .lines()
-        .map(str::to_string)
-        .collect())
+/// All commits reachable from branches + tags, OLDEST-first (reversed
+/// topo order: parents always precede children — the stable-index
+/// assignment order). Same scope rule as `collect_refs`.
+fn rev_list_oldest_first(repo: &Path) -> Result<Vec<String>> {
+    let mut shas: Vec<String> =
+        git_str(repo, &["rev-list", "--topo-order", "--branches", "--tags"])?
+            .lines()
+            .map(str::to_string)
+            .collect();
+    shas.reverse();
+    Ok(shas)
 }
 
 /// One commit's meta + resolved view.
@@ -464,38 +473,114 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
     -> Result<ImportOutcome>
 {
     let refs = collect_refs(repo)?;
-    let shas = rev_list(repo)?;
+    let shas = rev_list_oldest_first(repo)?;
 
-    // Walk newest → oldest, keeping only the PREVIOUS (newer) resolved
-    // view in memory: record 0 is the newest full layer, record i>0 is
-    // diff(view[i-1], view[i]) — the delta that rebuilds the older view
-    // from the next-newer one. Full records are also encoded, measured
-    // for the comparison, and dropped.
+    let mut st = store::Store::create(store)?;
+    let mut ingest = store::Ingest::new(&mut st, level)?;
+    // Walk oldest → newest, one resolved view at a time. The full
+    // record is derived from the VIEW via diff(None, view) — the same
+    // function the decoder uses to recompute refPrefix anchors from
+    // reconstructed views; bit-exactness of that anchor is load-bearing.
     let mut commits = Vec::with_capacity(shas.len());
-    let mut delta_records: Vec<Vec<u8>> = Vec::with_capacity(shas.len());
-    let mut full_records: Vec<Vec<u8>> = Vec::with_capacity(shas.len());
-    let mut prev_view: Option<depot::View> = None;
+    let mut rep = report.then(ReportAccum::default);
     for sha in &shas {
         let (cm, view) = commit_view(repo, sha)?;
-        commits.push(cm);
-        // The full record is derived from the VIEW via diff(None, view) —
-        // the same function the decoder uses to recompute refPrefix
-        // anchors from reconstructed views. Bit-exactness of that anchor
-        // is load-bearing: both sides go through one code path.
-        full_records.push(codec::encode(&depot::diff(None, Some(&view))));
-        match &prev_view {
-            None => delta_records.push(full_records[0].clone()),
-            Some(newer) => {
-                delta_records.push(codec::encode(&depot::diff(Some(newer), Some(&view))));
-            }
+        let full = codec::encode(&depot::diff(None, Some(&view)));
+        if let Some(r) = rep.as_mut() {
+            r.push(&view, full.clone());
         }
-        prev_view = Some(view);
+        ingest.add_commit(&cm, &view, &full)?;
+        commits.push(cm);
+    }
+    ingest.finish(&refs)?;
+    commits.reverse(); // Meta stays newest-first.
+
+    let report = match rep {
+        Some(r) => Some(r.finish(level)?),
+        None => None,
+    };
+    let meta = Meta { label: String::new(), url: String::new(), refs, commits };
+    Ok(ImportOutcome { meta, report })
+}
+
+/// Report-only accumulator: rebuilds the v1 comparison record families
+/// (newest-first full + delta records) from an oldest-first walk.
+#[derive(Default)]
+struct ReportAccum {
+    fulls: Vec<Vec<u8>>,
+    deltas: Vec<Vec<u8>>, // record for view i, pushed when view i+1 arrives
+    prev: Option<depot::View>,
+}
+
+impl ReportAccum {
+    fn push(&mut self, view: &depot::View, full: Vec<u8>) {
+        if let Some(prev) = &self.prev {
+            self.deltas
+                .push(codec::encode(&depot::diff(Some(view), Some(prev))));
+        }
+        self.fulls.push(full);
+        self.prev = Some(view.clone());
     }
 
-    let meta = Meta { label: String::new(), url: String::new(), refs, commits };
-    let report = chain::write_store(store, &meta, &delta_records, &full_records,
-                                    level, report)?;
-    Ok(ImportOutcome { meta, report })
+    fn finish(mut self, level: i32) -> Result<SizeReport> {
+        self.fulls.reverse();
+        let full_records = self.fulls;
+        let mut delta_records = Vec::with_capacity(full_records.len());
+        delta_records.push(full_records[0].clone());
+        delta_records.extend(self.deltas.into_iter().rev());
+        Ok(SizeReport {
+            commits: delta_records.len(),
+            zstd_level: level,
+            full_raw: full_records.iter().map(|r| r.len() as u64).sum(),
+            full_standalone: standalone_total(&full_records, level)?,
+            full_ref_chain: chain_bytes(&full_records, level)?,
+            delta_raw: delta_records.iter().map(|r| r.len() as u64).sum(),
+            delta_standalone: standalone_total(&delta_records, level)?,
+            delta_ref_chain: chain_bytes(&delta_records, level)?,
+            view_ref_chain: view_chain_total(&delta_records, &full_records, level)?,
+            solid_full: solid_total(&full_records, level)?,
+        })
+    }
+}
+
+fn standalone_total(records: &[Vec<u8>], level: i32) -> Result<u64> {
+    let mut total = 0u64;
+    for rec in records {
+        total += store::compress(rec, None, level)?.len() as u64;
+    }
+    Ok(total)
+}
+
+fn chain_bytes(records: &[Vec<u8>], level: i32) -> Result<u64> {
+    let mut total = 0u64;
+    for (i, rec) in records.iter().enumerate() {
+        let prefix = if i == 0 { None } else { Some(records[i - 1].as_slice()) };
+        total += 8 + store::compress(rec, prefix, level)?.len() as u64;
+    }
+    Ok(total)
+}
+
+/// The v1 stored form (delta records anchored on the previous commit's
+/// full VIEW bytes) — kept as a comparison line.
+fn view_chain_total(
+    delta_records: &[Vec<u8>],
+    full_records: &[Vec<u8>],
+    level: i32,
+) -> Result<u64> {
+    let mut total = 0u64;
+    for (i, rec) in delta_records.iter().enumerate() {
+        let prefix = if i == 0 { None } else { Some(full_records[i - 1].as_slice()) };
+        total += 8 + store::compress(rec, prefix, level)?.len() as u64;
+    }
+    Ok(total)
+}
+
+fn solid_total(records: &[Vec<u8>], level: i32) -> Result<u64> {
+    let mut concat = Vec::new();
+    for rec in records {
+        concat.extend_from_slice(rec);
+    }
+    Ok(store::compress(&concat, None, level)?.len() as u64)
 }
 
 // ---------------------------------------------------------------- update
@@ -505,102 +590,44 @@ pub struct UpdateOutcome {
     pub new_commits: usize,
     pub total_commits: usize,
     pub refs: Vec<RefMeta>,
+    /// `Depot::prepend` calls made by this update — instrumentation for
+    /// the batch invariant (N new commits land as ONE prepend per
+    /// touched chain). 0 on the import path.
+    pub depot_prepends: u64,
 }
 
 /// Incrementally prepend the repo's NEW commits to an existing store
-/// (MIRRORS.md phase 3). Cost is proportional to the new history: the
-/// former head's standalone frame 0 is replaced by a bridge delta frame
-/// anchored on the oldest new commit's full record; every older frame's
-/// anchor is unchanged and its bytes are copied verbatim.
-///
-/// Requires fast-forward shape: the store's recorded commit list must be
-/// an exact suffix of the repo's current `rev-list --topo-order --all`.
-/// Anything else (rewritten history, or new commits that topo-interleave
-/// into old ones) is refused — re-import for those.
+/// (MIRRORS.md phase 3). Cost is proportional to the new history plus
+/// the accumulator tier — never the cold tier (the depot's bounded
+/// prepend). There is no non-fast-forward case: any commit not yet in
+/// `sha_idx` is simply new records with fresh stable indices, and every
+/// observed ref movement (rewrites and deletions included) is one
+/// reflog record + a refs-table repoint. Old records keep their indices
+/// forever.
 pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
-    let old_shas = chain::commit_shas(store)?;
     let refs = collect_refs(repo)?;
-    let shas = rev_list(repo)?;
+    let shas = rev_list_oldest_first(repo)?;
 
-    // New commits must be a clean PREFIX of the repo's walk; every
-    // remaining repo sha must be known to the store IN STORE ORDER (an
-    // upstream ref deletion may drop known commits from the walk — the
-    // store keeps them; see the reflog). Anything else is a rewrite.
-    let old_set: std::collections::HashSet<&str> =
-        old_shas.iter().map(String::as_str).collect();
-    let k = shas.iter().take_while(|s| !old_set.contains(s.as_str())).count();
-    {
-        let mut old_it = old_shas.iter();
-        for s in &shas[k..] {
-            if !old_set.contains(s.as_str()) || !old_it.any(|o| o == s) {
-                return Err(Error::Unsupported(
-                    "store history is not a suffix of the repo's (non-fast-forward \
-                     or topo-interleaved new commits) — re-import"
-                    .into(),
-                ));
-            }
+    let mut st = store::Store::open(store)?;
+    let base_prepends = st.depot_prepends();
+    let mut ingest = store::Ingest::new(&mut st, level)?;
+    let mut k = 0usize;
+    for sha in &shas {
+        if ingest.knows_sha(sha)? {
+            continue;
         }
-    }
-    // Ref-level fast-forward guard: for every upstream ref the store
-    // already tracks, the OLD target must still be in the repo's walk —
-    // a ref whose old tip vanished was rewritten (amend/force-push),
-    // not fast-forwarded, even when the commit walk above still
-    // subsequence-matches (the rewrite drops the old tip and adds a new
-    // one, which is indistinguishable from prune+append at the commit
-    // level). A ref absent upstream is a deletion, handled by marking.
-    {
-        let repo_set: std::collections::HashSet<&str> =
-            shas.iter().map(String::as_str).collect();
-        let known = chain::refs(store)?;
-        for r in &refs {
-            if let Some(old) = known.iter().find(|o| o.name == r.name) {
-                if old.sha != r.sha && !repo_set.contains(old.sha.as_str()) {
-                    return Err(Error::Unsupported(format!(
-                        "{} was rewritten upstream (old target {} no longer \
-                         reachable) — re-import",
-                        r.name, old.sha
-                    )));
-                }
-            }
-        }
-    }
-    let total = old_shas.len() + k;
-    if k == 0 {
-        // Content unchanged; refs may still have moved between known
-        // commits (branch created/renamed onto an old sha).
-        chain::write_refs(store, &refs)?;
-        return Ok(UpdateOutcome { new_commits: 0, total_commits: total, refs });
-    }
-
-    // The former head view, from frame 0 alone.
-    let head_rec = chain::read_head_record(store)?;
-    let old_head_layer = codec::decode(&head_rec)?;
-    let old_head_view = depot::apply(None, &old_head_layer)
-        .ok_or_else(|| Error::Chain("stored head resolves to nothing".into()))?;
-
-    // Walk the k new commits newest → oldest, exactly like import.
-    let mut commits = Vec::with_capacity(k);
-    let mut delta_records: Vec<Vec<u8>> = Vec::with_capacity(k + 1);
-    let mut full_records: Vec<Vec<u8>> = Vec::with_capacity(k);
-    let mut prev_view: Option<depot::View> = None;
-    for sha in &shas[..k] {
         let (cm, view) = commit_view(repo, sha)?;
-        commits.push(cm);
-        full_records.push(codec::encode(&depot::diff(None, Some(&view))));
-        match &prev_view {
-            None => delta_records.push(full_records[0].clone()),
-            Some(newer) => {
-                delta_records.push(codec::encode(&depot::diff(Some(newer), Some(&view))));
-            }
-        }
-        prev_view = Some(view);
+        let full = codec::encode(&depot::diff(None, Some(&view)));
+        ingest.add_commit(&cm, &view, &full)?;
+        k += 1;
     }
-    // The bridge: rebuild the former head from the oldest new view.
-    let oldest_new = prev_view.expect("k > 0");
-    delta_records.push(codec::encode(&depot::diff(Some(&oldest_new), Some(&old_head_view))));
-
-    chain::prepend_store(store, &commits, &refs, &delta_records, &full_records, level)?;
-    Ok(UpdateOutcome { new_commits: k, total_commits: total, refs })
+    ingest.finish(&refs)?;
+    Ok(UpdateOutcome {
+        new_commits: k,
+        total_commits: st.count(store::COMMITS)? as usize,
+        refs,
+        depot_prepends: st.depot_prepends() - base_prepends,
+    })
 }
 
 // ---------------------------------------------------------------- mirror
@@ -608,16 +635,14 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
 #[derive(Debug, Clone)]
 pub struct MirrorOutcome {
     pub update: UpdateOutcome,
-    /// True when a non-fast-forward remote forced a full re-import.
-    pub reimported: bool,
 }
 
 /// The fetch-and-update loop for one remote: keep `<root>/repo.git` (a
 /// bare mirror clone) in sync with `url`, and `<root>/store` in sync
 /// with the clone. First call clones + imports; later calls fetch +
-/// incrementally `update`. A rewritten remote (non-fast-forward) falls
-/// back to a full re-import of the fresh state — the mirror follows the
-/// remote, it does not argue with it.
+/// incrementally `update`. A rewritten remote is just an update: new
+/// records + repointed refs — the mirror follows the remote AND keeps
+/// every commit it ever held resolvable.
 ///
 /// Fetching is host-side for now (MIRRORS.md: the move into a tap box
 /// is mechanical later).
@@ -645,7 +670,7 @@ pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome
     let store = root.join("store");
     if repo.join("HEAD").exists() {
         git(&repo, &["remote", "update", "--prune"])?;
-    } else if chain::store_exists(&store) {
+    } else if store::store_exists(&store) {
         // The store is the ONLY authoritative copy; repo.git is a
         // transient fetch buffer, reconstructible because export is
         // SHA-exact. Re-seed it from the store (bare, wired like
@@ -670,72 +695,25 @@ pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome
             )));
         }
     }
-    let out = if !chain::store_exists(&store) {
+    let out = if !store::store_exists(&store) {
         let o = import(&repo, &store, 3)?;
         let n = o.meta.commits.len();
         MirrorOutcome {
-            update: UpdateOutcome { new_commits: n, total_commits: n, refs: o.meta.refs },
-            reimported: false,
+            update: UpdateOutcome {
+                new_commits: n,
+                total_commits: n,
+                refs: o.meta.refs,
+                depot_prepends: 0,
+            },
         }
     } else {
-        match update(&repo, &store, 3) {
-            Ok(u) => MirrorOutcome { update: u, reimported: false },
-            Err(Error::Unsupported(_)) => {
-                // Remote rewrote history out from under the store: import
-                // the fresh state, RETIRE the old store (rename, intact —
-                // an upstream force-push must never destroy local
-                // history), and log what the rewrite did to each ref.
-                let old_refs = chain::refs(&store)?;
-                let fresh = root.join("store.new");
-                if fresh.exists() {
-                    // Scratch from an interrupted re-import, not a store.
-                    std::fs::remove_dir_all(&fresh)?;
-                }
-                let o = import(&repo, &fresh, 3)?;
-                let mut ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let retired = loop {
-                    let p = root.join(format!("store.retired.{ts}"));
-                    if !p.exists() {
-                        break p;
-                    }
-                    ts += 1;
-                };
-                std::fs::rename(&store, &retired)?;
-                std::fs::rename(&fresh, &store)?;
-                // Retain the retired copy ONLY if it holds unique
-                // history — commits the new store lost. A busy repo
-                // rewrites side refs constantly; retiring a full store
-                // copy per event is unbounded disk for redundant data.
-                // (The real fix is the multi-chain store — chip 7 —
-                // where a rewrite adds records instead of a store.)
-                let new_shas: std::collections::HashSet<String> =
-                    chain::commit_shas(&store)?.into_iter().collect();
-                let unique = chain::commit_shas(&retired)?
-                    .into_iter().any(|s| !new_shas.contains(&s));
-                if unique {
-                    chain::log_rewrite(&store, &old_refs, &retired)?;
-                } else {
-                    std::fs::remove_dir_all(&retired)?;
-                    chain::log_rewrite(&store, &old_refs, std::path::Path::new(
-                        "(dropped: rewrite left no unique history)"))?;
-                }
-                let n = o.meta.commits.len();
-                MirrorOutcome {
-                    update: UpdateOutcome { new_commits: n, total_commits: n, refs: o.meta.refs },
-                    reimported: true,
-                }
-            }
-            Err(e) => return Err(e),
-        }
+        MirrorOutcome { update: update(&repo, &store, 3)? }
     };
     // Stamp identity ("WHICH git?") — listings and attachment names key
     // off it.
-    let (label, old_url) = chain::identity(&store)?;
+    let (label, old_url) = store::identity(&store)?;
     if label.is_empty() || old_url != url {
-        chain::set_identity(&store, &label_from_url(url), url)?;
+        store::set_identity(&store, &label_from_url(url), url)?;
     }
     if frugal {
         std::fs::remove_dir_all(&repo)?;
@@ -761,10 +739,10 @@ pub fn list_mirrors(root: &Path) -> Result<Vec<MirrorEntry>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(root)?.flatten() {
         let store = e.path().join("store");
-        if !chain::store_exists(&store) {
+        if !store::store_exists(&store) {
             continue;
         }
-        let (label, url) = chain::identity(&store)?;
+        let (label, url) = store::identity(&store)?;
         out.push(MirrorEntry {
             dir: e.file_name().to_string_lossy().into_owned(),
             label: if label.is_empty() {
@@ -773,8 +751,8 @@ pub fn list_mirrors(root: &Path) -> Result<Vec<MirrorEntry>> {
                 label
             },
             url,
-            commits: chain::commit_count(&store)?,
-            refs: chain::refs(&store)?,
+            commits: store::commit_count(&store)?,
+            refs: store::refs(&store)?,
         });
     }
     out.sort_by(|a, b| a.label.cmp(&b.label));
@@ -831,9 +809,24 @@ fn walk_files<'a>(
 /// shas by ref name; fails if any regenerated commit id differs from the
 /// one recorded at import (the fidelity check).
 pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
-    // read_store walks the chain newest→oldest, reconstructing each
-    // commit's view (and each frame's view-anchored refPrefix) as it goes.
-    let (meta, views) = chain::read_store(store)?;
+    // Everything walks: all commit records plus every tree view,
+    // reconstructed newest→oldest (the stated O(history) export cost).
+    let st = store::Store::open(store)?;
+    let recs = st.commit_records()?; // oldest-first (position = index)
+    let views_nf = st.tree_views(None)?; // newest-first
+    let n_trees = st.count(store::TREES)? as usize;
+    if views_nf.len() != n_trees {
+        return Err(Error::Chain(format!(
+            "{} tree frames but n_trees = {n_trees}",
+            views_nf.len()
+        )));
+    }
+    let view_of = |tree_idx: u64| -> Result<&depot::View> {
+        views_nf
+            .get(n_trees - 1 - tree_idx as usize)
+            .ok_or_else(|| Error::Chain(format!("no tree at index {tree_idx}")))
+    };
+    let refs = st.refs_meta()?;
     std::fs::create_dir_all(repo)?;
     // Reinit is a no-op on an existing repo and preserves bareness —
     // mirror() pre-inits --bare to seed its fetch buffer through here.
@@ -843,12 +836,12 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
     // a full manifest (deleteall + M for each file) from its resolved
     // view. Blobs are deduped through marks.
     let mut stream: Vec<u8> = Vec::new();
-    let mut blob_marks: std::collections::HashMap<&[u8], usize> = Default::default();
+    let mut blob_marks: std::collections::HashMap<Vec<u8>, usize> = Default::default();
     let mut next_mark = 1usize;
-    let mut commit_marks: std::collections::HashMap<&str, usize> = Default::default();
+    // Commit marks by STABLE INDEX (parents are indices in the data).
+    let mut commit_marks: std::collections::HashMap<u64, usize> = Default::default();
 
-    for idx in (0..meta.commits.len()).rev() {
-        let cm = &meta.commits[idx];
+    for cm in &recs {
         if !cm.extra_headers.is_empty() {
             return Err(Error::Unsupported(format!(
                 "commit {} carries {:?} — SHA-exact export of signed/extended \
@@ -857,14 +850,14 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
             )));
         }
         let mut files = Vec::new();
-        walk_files(&views[idx], &mut Vec::new(), &mut files)?;
+        walk_files(view_of(cm.tree_idx)?, &mut Vec::new(), &mut files)?;
 
         for (_, mode, content) in &files {
             if mode == "160000" {
                 continue; // gitlink: no blob object
             }
             if !blob_marks.contains_key(*content) {
-                blob_marks.insert(content, next_mark);
+                blob_marks.insert(content.to_vec(), next_mark);
                 stream.extend_from_slice(format!("blob\nmark :{next_mark}\ndata {}\n", content.len()).as_bytes());
                 stream.extend_from_slice(content);
                 stream.push(b'\n');
@@ -874,19 +867,18 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
 
         let mark = next_mark;
         next_mark += 1;
-        commit_marks.insert(&cm.sha, mark);
+        commit_marks.insert(cm.idx, mark);
         stream.extend_from_slice(format!("commit refs/gitdepot/import\nmark :{mark}\n").as_bytes());
         stream.extend_from_slice(b"author ");
-        stream.extend_from_slice(&hex::decode(&cm.author_hex).map_err(|e| Error::Meta(e.to_string()))?);
+        stream.extend_from_slice(&cm.author);
         stream.extend_from_slice(b"\ncommitter ");
-        stream.extend_from_slice(&hex::decode(&cm.committer_hex).map_err(|e| Error::Meta(e.to_string()))?);
-        let msg = hex::decode(&cm.message_hex).map_err(|e| Error::Meta(e.to_string()))?;
-        stream.extend_from_slice(format!("\ndata {}\n", msg.len()).as_bytes());
-        stream.extend_from_slice(&msg);
+        stream.extend_from_slice(&cm.committer);
+        stream.extend_from_slice(format!("\ndata {}\n", cm.message.len()).as_bytes());
+        stream.extend_from_slice(&cm.message);
         stream.push(b'\n');
-        for (i, parent) in cm.parents.iter().enumerate() {
+        for (i, parent) in cm.parent_idxs.iter().enumerate() {
             let pmark = commit_marks
-                .get(parent.as_str())
+                .get(parent)
                 .ok_or_else(|| Error::Meta(format!("parent {parent} not in store")))?;
             let verb = if i == 0 { "from" } else { "merge" };
             stream.extend_from_slice(format!("{verb} :{pmark}\n").as_bytes());
@@ -906,9 +898,12 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
         stream.push(b'\n');
     }
 
-    for r in &meta.refs {
-        let mark = commit_marks
+    let sha_to_idx: std::collections::HashMap<&str, u64> =
+        recs.iter().map(|r| (r.sha.as_str(), r.idx)).collect();
+    for r in &refs {
+        let mark = sha_to_idx
             .get(r.sha.as_str())
+            .and_then(|i| commit_marks.get(i))
             .ok_or_else(|| Error::Meta(format!("ref {} target {} not in store", r.name, r.sha)))?;
         stream.extend_from_slice(format!("reset {}\nfrom :{mark}\n\n", r.name).as_bytes());
     }
@@ -933,7 +928,7 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
     // Drop the scratch ref; verify SHA fidelity per real ref.
     let _ = git(repo, &["update-ref", "-d", "refs/gitdepot/import"]);
     let mut result = Vec::new();
-    for r in &meta.refs {
+    for r in &refs {
         let got = git_str(repo, &["rev-parse", &r.name])?.trim().to_string();
         if got != r.sha {
             return Err(Error::Meta(format!(
