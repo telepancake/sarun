@@ -75,7 +75,11 @@ const MAX_CHAIN_ID: u64 = 3;
 
 /// Raw (decompressed) f1 accumulator seal point, per chain.
 const SEAL_THRESHOLD: u64 = 256 * 1024;
-const FILE_SIZE_THRESHOLD: u64 = 32 << 20;
+// Small on purpose: eviction cannot touch the CURRENT write-target
+// file, so this threshold IS the dead-byte ceiling per tier — and the
+// trees chain's f0 frames are whole-head-sized, deadening fast. The
+// moderate-repo bench measured 32MiB here as ~2.7x the useful store.
+const FILE_SIZE_THRESHOLD: u64 = 4 << 20;
 const EVICTION_DEAD_RATIO: f32 = 0.5;
 
 const SCHEMA: &str = "
