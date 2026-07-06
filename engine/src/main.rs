@@ -60,6 +60,7 @@ mod sudir;
 mod sudwire;
 mod ui;
 mod views;
+mod wacz;
 
 // m2 `serve` mode: the control socket at the instance's namespaced path,
 // speaking the Python ChannelServer's protocol (single-instance guard, ui
@@ -101,6 +102,7 @@ fn top_level_help() -> &'static str {
        sarun verbs [FILTER]               list the engine's UI verbs (args + help)\n  \
        sarun oci <load|run|build|save|dockerfile|author> ...   OCI images (`sarun oci -h`)\n  \
        sarun oaita <gen|run|call|tail|add|where> NAME          LLM chat/agent runner (`oaita -h`)\n  \
+       sarun web <export-wacz|import-wacz> ...                 WACZ web-archive interop\n  \
        sarun --once --sock PATH           render one UI frame and exit (headless)\n\
      \n\
      run FLAGS:\n  \
@@ -670,6 +672,11 @@ fn main() {
             // sarun oci load <ref> [NAME]  → populate a chain of at-rest sarun
             // boxes from an OCI image. See engine/src/oci.rs.
             std::process::exit(oci::cli_oci(&argv[1..]));
+        }
+        Some("web") => {
+            // sarun web export-wacz <box> <out> | import-wacz <in> [NAME] —
+            // WACZ interop for the web archive (see engine/src/wacz.rs).
+            std::process::exit(wacz::cli(&argv[1..]));
         }
         Some("inner") => {
             // inner --conn-fd N -- CMD...

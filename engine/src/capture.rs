@@ -57,7 +57,7 @@ pub const S_IFCHR: u32 = 0o020000; // tombstone mode, matches the Python engine
 /// (type=overlay for file ops; type=process_added for op="process_added").
 pub type EventQ = Arc<Mutex<VecDeque<(i64, String, &'static str)>>>;
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT,
  sz INT, data BLOB, opaque INT DEFAULT 0, writer INT, last_writer INT);
 -- review.rs's recent_changes/box_summary (the live \"recently changed\" panel

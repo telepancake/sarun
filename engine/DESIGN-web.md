@@ -223,13 +223,41 @@ Engine-side egress modeled on `oaita/proxy.rs` keeps credentials and network
 off the box boundary and gives the same auditable, budgeted, logged path the
 LLM calls already have — the store *is* the audit log.
 
-## W6 · Archival — crawl driver + WACZ export (the browsertrix reimplementation)
+## W4.2 · Replay — SHIPPED
 
-browsertrix = drive a real browser over a seed list, run page behaviors
-(autoscroll, expand, click-throughs) so lazy content loads, capture every
-network response, and bundle it as WACZ. sarun already has the browser
-(carbonyl/Chromium, which speaks CDP) and now the capture (W1/W2). What's
-missing is the driver and the exporter:
+The local snapshot viewer: a replay box serves every request from a source
+box's `webcap` archive instead of dialing upstream. Because sarun owns DNS +
+the MITM, the browser dials the real URL and the engine answers from the
+store — **no URL rewriting**, the part that is the bulk of pywb/wabac and their
+main source of bugs. A miss is a 404, never a live fetch (sealed by
+construction). `discover::webcap_replay` (newest / method / asof) →
+`net/mitm.rs::replay_response`; `--replay <box>` → `ProxyHooks.replay`. The
+Network pane's Enter is type-routed: image → the sixel popover, `text/html` →
+carbonyl replaying that box at the captured URL.
+
+Rolling our own replay (rather than embedding pywb/wabac) is the right call
+*because* sarun owns the network: the hard problem those tools solve — replay
+without controlling DNS/sockets, hence rewriting every URL — doesn't exist
+here. We conform to WARC/WACZ for the *format* (W6) but the *replay engine* is
+50 lines, not a framework.
+
+## W6 · Archival — WACZ export/import (SHIPPED) + crawl driver (roadmap)
+
+WACZ is the interchange boundary. **Export/import are shipped** (`sarun web
+export-wacz <box> <out>` / `import-wacz <in> [NAME]`, `engine/src/wacz.rs`):
+export writes spec WACZ 1.1.1 — a ZIP of `archive/data.warc` (WARC 1.1 response
+records, payload/block sha256 digests), `indexes/index.cdx` (SURT-sorted
+CDXJ), `pages/pages.jsonl` (HTML seeds), `datapackage.json` +
+`datapackage-digest.json` — so captures open in ReplayWeb.page / pywb. Import
+parses the WARC responses back into a fresh box's `webcap`, which is then
+replayable through W4.2. No new deps (zip + sha2 already in the tree; dates and
+UUIDs are computed, not crated).
+
+The remaining **crawl driver** is browsertrix's *orchestration* — drive a real
+browser over a seed list, run page behaviors (autoscroll, expand) so lazy
+content loads, harvest links, enqueue to a depth/page cap — with capture as the
+side effect the tap MITM already provides (W1/W2). sarun has the browser and
+the capture; what's missing is the driver:
 
 - **Crawl driver.** A headless Chromium box driven over CDP: navigate to each
   seed, run a scroll/settle behavior, harvest in-page links, enqueue same-scope
