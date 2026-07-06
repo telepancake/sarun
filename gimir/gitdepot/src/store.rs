@@ -49,7 +49,14 @@
 //!     newest-first, zstd refPrefix-anchored on the f0 RECORD.
 //!   * seal: when absorbing a prepend's entries would push the raw
 //!     accumulator past `SEAL_THRESHOLD`, the old f1's zstd bytes move
-//!     verbatim to a cold frame and the accumulator restarts.
+//!     verbatim to a cold frame and the accumulator restarts; and when
+//!     the JUST-WRITTEN f1's raw size itself exceeds the threshold (a
+//!     batch that dwarfs it), it is sealed to cold immediately in the
+//!     same operation (`Depot::seal_f1`) — frames are write-once, and
+//!     the next incremental prepend never recompresses a huge
+//!     accumulator. An ingest lands EXACTLY ONE prepend per touched
+//!     chain; RAM and disk stay bounded by STREAMING the frame codec
+//!     (encode and decode), never by mid-ingest chunking.
 //!
 //! TREES chain records are REVERSE DELTAS: only the head (f0) record is
 //! the full layer `codec::encode(diff(None, head_view))`; record k < head
@@ -64,11 +71,9 @@
 //! one standalone frame.
 //!
 //! COMMITS/REFLOG/TAGS chain records are BATCHES: one record per
-//! landed chunk (an update's new commits, one ref transaction; a
-//! bootstrap-scale ingest early-lands a batch record per
-//! `BATCH_LAND_BOUND` staged bytes), never split by the seal
-//! threshold — sealing stays a between-prepends decision on the
-//! accumulator. Batch record layout:
+//! ingest (an update's new commits, one ref transaction), never split
+//! by the seal threshold — sealing stays a per-prepend decision on
+//! the accumulator. Batch record layout:
 //!   `u64 LE base_idx | u32 LE count | count × (u32 LE len | object)`,
 //! objects OLDEST-FIRST within the batch, object stable index =
 //! base_idx + offset. Batch records stand alone, so their demotion is
@@ -123,7 +128,16 @@ pub const TAGS: u64 = 3;
 const MAX_CHAIN_ID: u64 = 4;
 
 /// Raw (decompressed) f1 accumulator seal point, per chain.
+/// Test-overridable via GITDEPOT_TEST_SEAL (bytes) so tests can
+/// exercise the immediate-seal path without multi-MB fixtures.
 const SEAL_THRESHOLD: u64 = 256 * 1024;
+
+fn seal_threshold() -> u64 {
+    std::env::var("GITDEPOT_TEST_SEAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SEAL_THRESHOLD)
+}
 // Small on purpose: eviction cannot touch the CURRENT write-target
 // file, so this threshold IS the dead-byte ceiling per tier — and the
 // trees chain's f0 frames are whole-head-sized, deadening fast. The
@@ -135,12 +149,6 @@ const FILE_SIZE_THRESHOLD: u64 = 4 << 20;
 /// they land. Overridable via GITDEPOT_SPILL_BOUND (bytes) so tests
 /// can force the spill path.
 const SPILL_RAM_BOUND: u64 = 256 << 20;
-/// COMMITS/TAGS early-landing bound: once an ingest has staged this
-/// many raw record bytes for one of these chains, the staged records
-/// land NOW as one batch record (`finish()` lands the remainder), so
-/// a bootstrap-scale ingest never accumulates its whole history in
-/// staging. Overridable via GITDEPOT_TEST_BATCH_BOUND (bytes).
-const BATCH_LAND_BOUND: u64 = 64 << 20;
 /// Spill scratch: raw records accumulate in a pending buffer and
 /// compress to the scratch file in ~4MiB standalone zstd blocks at
 /// level 3 (records never split across blocks; an oversized record
@@ -173,19 +181,6 @@ fn db_path(store: &Path) -> PathBuf {
 /// "Is there a store here?"
 pub fn store_exists(store: &Path) -> bool {
     db_path(store).exists()
-}
-
-/// Was this store left mid-flight by an interrupted large ingest (the
-/// `dirty_ingest` flag)? A bare kv read — usable where `Store::open`
-/// (which hard-errors on the flag) would be circular, e.g. the
-/// mirror's crashed-bootstrap wipe.
-pub fn ingest_interrupted(store: &Path) -> Result<bool> {
-    let conn = Connection::open_with_flags(
-        db_path(store),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(sql_err)?;
-    Ok(kv_get(&conn, "dirty_ingest")?.is_some())
 }
 
 /// The one supported on-disk format. Anything else on open = loud
@@ -492,21 +487,49 @@ pub(crate) fn decompress(frame: &[u8], prefix: Option<&[u8]>) -> Result<Vec<u8>>
     Ok(out)
 }
 
-/// Split a decompressed accumulator into its u32-length-prefixed
-/// records, in stored (newest-first) order.
-fn split_records(buf: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let mut out = Vec::new();
-    let mut c = Cur::new(buf);
-    while c.i < buf.len() {
-        out.push(c.bytes()?.to_vec());
+/// Stream the u32-length-prefixed records of a multi-record frame
+/// (f1 or cold) in stored (newest-first) order, decoding incrementally
+/// (`wikimak_depot::FrameDecoder`): one record in RAM at a time, never
+/// the whole raw frame — a linux-scale sealed frame decompresses to
+/// tens of GB. `visit` returns true to stop early.
+fn stream_frame_records(
+    frame: &[u8],
+    prefix: &[u8],
+    visit: &mut dyn FnMut(Vec<u8>) -> Result<bool>,
+) -> Result<()> {
+    use std::io::Read as _;
+    let mut dec =
+        wikimak_depot::FrameDecoder::new(frame, Some(prefix)).map_err(Error::Chain)?;
+    // read_full: fill `buf` or hit clean EOF at a record boundary.
+    let read_full = |dec: &mut wikimak_depot::FrameDecoder<'_>,
+                         buf: &mut [u8]|
+     -> Result<usize> {
+        let mut got = 0;
+        while got < buf.len() {
+            let n = dec.read(&mut buf[got..])?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        Ok(got)
+    };
+    loop {
+        let mut hdr = [0u8; 4];
+        match read_full(&mut dec, &mut hdr)? {
+            0 => return Ok(()),
+            4 => {}
+            _ => return Err(Error::Chain("truncated record".into())),
+        }
+        let len = u32::from_le_bytes(hdr) as usize;
+        let mut rec = vec![0u8; len];
+        if read_full(&mut dec, &mut rec)? != len {
+            return Err(Error::Chain("truncated record".into()));
+        }
+        if visit(rec)? {
+            return Ok(());
+        }
     }
-    Ok(out)
-}
-
-fn frame_entry(rec: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rec.len() + 4);
-    put_bytes(&mut out, rec);
-    out
 }
 
 // ---------------------------------------------------------- batch records
@@ -546,12 +569,15 @@ fn decode_batch(rec: &[u8]) -> Result<(u64, Vec<Vec<u8>>)> {
 }
 
 /// How the former head record joins the accumulator on prepend.
-pub(crate) enum Demote<'a> {
-    /// Record stands alone (COMMITS, REFLOG): moves in verbatim.
+pub(crate) enum Demote {
+    /// Record stands alone (COMMITS, REFLOG, TAGS): moves in verbatim
+    /// as the OLDEST entry of the new f1 content.
     Verbatim,
-    /// Record is superseded by a caller-computed replacement (TREES:
-    /// the bridge delta rebuilding the old head view from the new one).
-    Replace(&'a [u8]),
+    /// Record is superseded by a caller-computed replacement already
+    /// present as the oldest streamed entry (TREES: the bridge delta
+    /// rebuilding the old head view from the new one is staged entry
+    /// 0) — nothing extra joins the accumulator.
+    Dropped,
 }
 
 // ---------------------------------------------------------------- store
@@ -618,14 +644,6 @@ impl Store {
                 "store {} has schema {schema:?}, this build writes {SCHEMA_VERSION} — \
                  store written by older code; delete and re-import (mirrors are \
                  rebuildable)",
-                store.display()
-            )));
-        }
-        if kv_get(&conn, "dirty_ingest")?.is_some() {
-            return Err(Error::Chain(format!(
-                "store {} was interrupted mid-ingest: chains hold early-landed \
-                 chunks ahead of the bookkeeping — the store must be rebuilt; \
-                 delete it and re-run the mirror (mirrors are rebuildable)",
                 store.display()
             )));
         }
@@ -706,62 +724,105 @@ impl Store {
         }
     }
 
-    /// Prepend a batch of records to `chain`: `head_record` becomes the
-    /// new f0; `older_entries` (newest-first, already in RECORD form —
-    /// for TREES these are reverse deltas) plus the demoted former head
-    /// join the accumulator. ONE depot prepend for the whole batch (two
-    /// on a previously-empty chain, which must be seeded — the depot
-    /// forbids f1 on a chain's first prepend).
+    /// Prepend a batch of records to `chain` as EXACTLY ONE depot
+    /// prepend: `head_record` becomes the new f0; the new f1 is
+    /// STREAM-composed — never materialized raw in RAM — from
+    /// `older` (staged records, drained newest-first; for TREES these
+    /// are reverse deltas whose oldest entry is the bridge), then the
+    /// demoted former head (`Demote::Verbatim`), then the old f1's
+    /// raw bytes (stream-decoded) unless sealing. The seal decision is
+    /// `compose_f1`'s, against the OLD f1; additionally, if the NEW
+    /// f1's raw size exceeds the seal threshold it is retired to cold
+    /// immediately (`Depot::seal_f1`) so no later prepend ever
+    /// recompresses it. The refPrefix anchor is `head_record`, the
+    /// window log is pinned by the upfront-known total raw length —
+    /// the streamed frame is byte-identical to what the bulk
+    /// `compress_frame` would produce.
+    ///
+    /// A previously-empty chain must be seeded first (pass empty
+    /// `older`): the depot forbids f1 on a chain's first prepend.
     pub(crate) fn prepend_batch(
         &self,
         chain: u64,
         head_record: &[u8],
-        older_entries: &[Vec<u8>],
-        demote: Demote<'_>,
+        mut older: Option<&mut Staged>,
+        demote: Demote,
         level: i32,
     ) -> Result<()> {
-        let (prev_record, older) = match self.read_head(chain)? {
-            Some(p) => (p, older_entries),
-            None => {
-                if older_entries.is_empty() {
-                    self.depot
-                        .prepend(chain, &compress(head_record, None, level)?, None, false)
-                        .map_err(|e| Error::Chain(e.to_string()))?;
-                    return Ok(());
-                }
-                // Seed the empty chain with the OLDEST record. Only
-                // meaningful for standalone-record chains: a TREES seed
-                // would need a full record, and its entries are deltas.
-                if matches!(demote, Demote::Replace(_)) {
-                    return Err(Error::Chain(
-                        "batch prepend on an empty delta chain (seed it first)".into(),
-                    ));
-                }
-                let (oldest, rest) = older_entries.split_last().expect("non-empty");
+        let older_empty = older.as_ref().map_or(true, |s| s.is_empty());
+        let Some(prev_record) = self.read_head(chain)? else {
+            if older_empty {
                 self.depot
-                    .prepend(chain, &compress(oldest, None, level)?, None, false)
+                    .prepend(chain, &compress(head_record, None, level)?, None, false)
                     .map_err(|e| Error::Chain(e.to_string()))?;
-                (oldest.clone(), rest)
+                return Ok(());
             }
+            return Err(Error::Chain(
+                "batch prepend on an empty chain (seed it first)".into(),
+            ));
         };
-        let demoted = match demote {
-            Demote::Verbatim => prev_record.clone(),
-            Demote::Replace(b) => b.to_vec(),
+        let demoted: Option<&[u8]> = match demote {
+            Demote::Verbatim => Some(&prev_record),
+            Demote::Dropped => None,
         };
-        let old_f1_raw = match self.depot.read_f1(chain).map_err(|e| Error::Chain(e.to_string()))? {
-            Some(z) => Some(decompress(&z, Some(&prev_record))?),
-            None => None,
+        // compose_f1 semantics over frame entries (u32 prefix + record).
+        let entries_len: u64 = older
+            .as_ref()
+            .map_or(0, |s| s.bytes + 4 * s.len() as u64)
+            + demoted.map_or(0, |d| d.len() as u64 + 4);
+        let old_f1 = self.depot.read_f1(chain).map_err(|e| Error::Chain(e.to_string()))?;
+        let old_raw_len = match &old_f1 {
+            Some(z) => zstd::zstd_safe::get_frame_content_size(z)
+                .map_err(|_| Error::Chain("zstd frame content size".into()))?
+                .ok_or_else(|| Error::Chain("zstd frame without content size".into()))?,
+            None => 0,
         };
-        let mut entries: Vec<Vec<u8>> = older.iter().map(|r| frame_entry(r)).collect();
-        entries.push(frame_entry(&demoted));
-        let refs: Vec<&[u8]> = entries.iter().map(|e| e.as_slice()).collect();
-        let (new_f1_raw, seal) =
-            wikimak_depot::compose_f1(&refs, old_f1_raw.as_deref(), SEAL_THRESHOLD);
+        let seal_old = old_f1.is_some() && old_raw_len + entries_len > seal_threshold();
+        let total_raw = entries_len + if seal_old { 0 } else { old_raw_len };
+        let mut enc = wikimak_depot::FrameEncoder::new(total_raw, Some(head_record), level)
+            .map_err(Error::Chain)?;
+        let put = |enc: &mut wikimak_depot::FrameEncoder<'_>, rec: &[u8]| -> Result<()> {
+            enc.write(&(rec.len() as u32).to_le_bytes()).map_err(Error::Chain)?;
+            enc.write(rec).map_err(Error::Chain)
+        };
+        if let Some(staged) = older.as_deref_mut() {
+            staged.drain_rev(&mut |rec| put(&mut enc, rec))?;
+        }
+        if let Some(d) = demoted {
+            put(&mut enc, d)?;
+        }
+        if !seal_old {
+            if let Some(z) = &old_f1 {
+                use std::io::Read as _;
+                let mut dec = wikimak_depot::FrameDecoder::new(z, Some(&prev_record))
+                    .map_err(Error::Chain)?;
+                let mut buf = vec![0u8; 128 << 10];
+                loop {
+                    let n = dec.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    enc.write(&buf[..n]).map_err(Error::Chain)?;
+                }
+            }
+        }
+        let new_f1 = enc.finish().map_err(Error::Chain)?;
         let new_f0 = compress(head_record, None, level)?;
-        let new_f1 = compress(&new_f1_raw, Some(head_record), level)?;
         self.depot
-            .prepend(chain, &new_f0, Some(&new_f1), seal)
-            .map_err(|e| Error::Chain(e.to_string()))
+            .prepend(chain, &new_f0, Some(&new_f1), seal_old)
+            .map_err(|e| Error::Chain(e.to_string()))?;
+        // Immediate retirement: a just-written accumulator that already
+        // dwarfs the threshold moves verbatim to cold NOW — a later
+        // incremental prepend must never recompress it. The frame was
+        // anchored on `head_record`, which is exactly the record the
+        // walk decodes (or, for TREES, canonically re-encodes) right
+        // before this frame — the invariant is unchanged.
+        if total_raw > seal_threshold() {
+            self.depot
+                .seal_f1(chain)
+                .map_err(|e| Error::Chain(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Walk the records of a standalone-record chain (COMMITS, REFLOG —
@@ -780,23 +841,34 @@ impl Store {
             return Ok(());
         }
         let mut anchor = head;
+        // Per frame: stream records one at a time (never the whole raw
+        // frame); the frame's last (oldest) record becomes the next
+        // frame's anchor.
+        let one_frame = |frame: &[u8],
+                             anchor: &mut Vec<u8>,
+                             visit: &mut dyn FnMut(&[u8]) -> Result<bool>|
+         -> Result<bool> {
+            let mut stopped = false;
+            let mut last: Option<Vec<u8>> = None;
+            stream_frame_records(frame, anchor, &mut |rec| {
+                stopped = visit(&rec)?;
+                last = Some(rec);
+                Ok(stopped)
+            })?;
+            if let Some(l) = last {
+                *anchor = l;
+            }
+            Ok(stopped)
+        };
         if let Some(f1) = self.depot.read_f1(chain).map_err(|e| Error::Chain(e.to_string()))? {
-            let raw = decompress(&f1, Some(&anchor))?;
-            for rec in split_records(&raw)? {
-                if visit(&rec)? {
-                    return Ok(());
-                }
-                anchor = rec;
+            if one_frame(&f1, &mut anchor, visit)? {
+                return Ok(());
             }
         }
         for cold in self.depot.cold_iter(chain).map_err(|e| Error::Chain(e.to_string()))? {
             let frame = cold.map_err(|e| Error::Chain(e.to_string()))?;
-            let raw = decompress(&frame, Some(&anchor))?;
-            for rec in split_records(&raw)? {
-                if visit(&rec)? {
-                    return Ok(());
-                }
-                anchor = rec;
+            if one_frame(&frame, &mut anchor, visit)? {
+                return Ok(());
             }
         }
         Ok(())
@@ -862,22 +934,27 @@ impl Store {
             return Ok(());
         }
         if let Some(f1) = self.depot.read_f1(TREES).map_err(|e| Error::Chain(e.to_string()))? {
-            let raw = decompress(&f1, Some(&head))?;
-            for rec in split_records(&raw)? {
-                if step(&mut cur, &mut pos, &rec)? {
-                    return Ok(());
-                }
+            let mut stopped = false;
+            stream_frame_records(&f1, &head, &mut |rec| {
+                stopped = step(&mut cur, &mut pos, &rec)?;
+                Ok(stopped)
+            })?;
+            if stopped {
+                return Ok(());
             }
         }
         for cold in self.depot.cold_iter(TREES).map_err(|e| Error::Chain(e.to_string()))? {
             let frame = cold.map_err(|e| Error::Chain(e.to_string()))?;
-            let anchor =
-                depot::codec::encode(&depot::diff(None, cur.as_ref()));
-            let raw = decompress(&frame, Some(&anchor))?;
-            for rec in split_records(&raw)? {
-                if step(&mut cur, &mut pos, &rec)? {
-                    return Ok(());
-                }
+            // The cold anchor: canonical full-view bytes at the frame
+            // boundary, recomputed from the walked view.
+            let anchor = depot::codec::encode(&depot::diff(None, cur.as_ref()));
+            let mut stopped = false;
+            stream_frame_records(&frame, &anchor, &mut |rec| {
+                stopped = step(&mut cur, &mut pos, &rec)?;
+                Ok(stopped)
+            })?;
+            if stopped {
+                return Ok(());
             }
         }
         Ok(())
@@ -922,13 +999,11 @@ impl Store {
         tx.commit().map_err(sql_err)
     }
 
-    /// Depot flush + eviction pass. Early-landing ingests call this
-    /// after each landed chunk: every chunk supersedes the previous
-    /// f0/f1 frames (a bootstrap's f0 is a full snapshot, ~tens of MB),
-    /// and eviction otherwise only runs at the ingest-final `with_txn`
-    /// — by which time a linux-scale bootstrap has parked hundreds of
-    /// fully-dead snapshot frames on disk (measured: 5.3G dead f0 for
-    /// 21k commits).
+    /// Depot flush + eviction pass (`Depot::flush` runs eviction).
+    /// Reachable wherever a depot flush already is — `with_txn` covers
+    /// the ingest path, so nothing calls this today; kept for callers
+    /// that flush outside a transaction.
+    #[allow(dead_code)]
     pub(crate) fn evict_pass(&mut self) -> Result<()> {
         self.depot.flush().map_err(|e| Error::Chain(e.to_string()))
     }
@@ -1296,7 +1371,7 @@ pub(crate) fn stage_ref_changes(
         })
         .collect();
     let batch = encode_batch(base, &objs);
-    store.prepend_batch(REFLOG, &batch, &[], Demote::Verbatim, level)?;
+    store.prepend_batch(REFLOG, &batch, None, Demote::Verbatim, level)?;
     Ok(changes.len() as u64)
 }
 
@@ -1362,14 +1437,12 @@ struct Spill {
 /// Oldest-first record staging for one chain: RAM up to `bound` RAW
 /// bytes, then EVERYTHING (existing and subsequent records) moves to
 /// one scratch file of compressed blocks (`Spill`). The medium selects
-/// where bytes wait, never how they land. Staging no longer holds a
-/// whole bootstrap: the `Ingest` early-lands chunks mid-ingest (TREES
-/// at the frame bound, COMMITS/TAGS at `BATCH_LAND_BOUND`), each
-/// early flush draining the stage — `drain_all` therefore only ever
-/// materializes one bounded chunk in RAM. The scratch file is pure
-/// scratch: a crash mid-ingest leaves nothing to clean but the file
-/// (deleted on Drop) — store-side crash state is the `dirty_ingest`
-/// flag, owned by `Ingest`.
+/// where bytes wait, never how they land: at `finish()` the stage
+/// drains STREAMING — `drain_rev`/`for_each` decompress one block at
+/// a time and yield record-at-a-time, so a bootstrap-scale batch is
+/// never materialized raw in RAM. The scratch file is pure scratch: a
+/// crash mid-ingest leaves nothing to clean but the file (deleted on
+/// Drop).
 pub(crate) struct Staged {
     ram: Vec<Vec<u8>>,
     /// RAW staged bytes (RAM or spilled) since the last drain.
@@ -1484,26 +1557,47 @@ impl Staged {
         }
     }
 
-    /// All records in push order; the stage is left empty and its
-    /// scratch file deleted. RAM peaks at the drained chunk's raw size
-    /// — bounded, because the `Ingest` early-lands before staging
-    /// grows past its per-chain bound (compose_f1 builds the same raw
-    /// accumulator in RAM anyway).
-    fn drain_all(&mut self) -> Result<Vec<Vec<u8>>> {
-        let out = match &self.spill {
-            None => std::mem::take(&mut self.ram),
-            Some(_) => {
-                let n = self.len();
-                let mut out = Vec::with_capacity(n);
-                for i in 0..n {
-                    out.push(self.get(i)?);
-                }
-                self.spill = None;
-                let _ = std::fs::remove_file(&self.path);
-                out
-            }
-        };
+    /// Visit every record oldest-first (push order) WITHOUT draining —
+    /// streaming: at most one decompressed spill block in RAM at a
+    /// time (`get`'s last-block cache makes the sequential pass one
+    /// decode per block).
+    fn for_each(&self, visit: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        for i in 0..self.len() {
+            visit(&self.get(i)?)?;
+        }
+        Ok(())
+    }
+
+    /// Visit every record NEWEST-first (reverse push order), then
+    /// leave the stage empty with its scratch file deleted. Streaming
+    /// like `for_each`: blocks decode last-to-first, one at a time.
+    fn drain_rev(&mut self, visit: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        for i in (0..self.len()).rev() {
+            visit(&self.get(i)?)?;
+        }
+        self.clear();
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.ram.clear();
+        if self.spill.take().is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
         self.bytes = 0;
+    }
+
+    /// All records in push order; the stage is left empty and its
+    /// scratch file deleted. Test-only: the landing paths stream via
+    /// `for_each`/`drain_rev` instead of materializing the batch.
+    #[cfg(test)]
+    fn drain_all(&mut self) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::with_capacity(self.len());
+        self.for_each(&mut |rec| {
+            out.push(rec.to_vec());
+            Ok(())
+        })?;
+        self.clear();
         Ok(out)
     }
 }
@@ -1518,52 +1612,32 @@ impl Drop for Staged {
 
 /// Staged multi-record write of new commits (import, update, migration):
 /// accumulates tree deltas + commit records oldest-first (in RAM or
-/// spilled to `<store>/staging/`, see `Staged`) and lands them as batch
-/// prepends (SPEC §"Prepend multiple records"), each sized by BYTES:
-/// when TREES staging reaches `max(SEAL_THRESHOLD,
-/// last_boundary_len)` — or COMMITS/TAGS staging reaches
-/// `BATCH_LAND_BOUND` — the staged chunk lands NOW, mid-ingest, as an
-/// ordinary prepend (per the SPEC: a batch whose entries alone dwarf
-/// the seal threshold must not land as one frame). `finish()` lands
-/// the remainder plus the reflog and the single bookkeeping
-/// transaction. A small update never early-lands and stays exactly
-/// the old one-prepend-per-chain, fully atomic shape; an ingest that
-/// DID early-land is guarded by the `dirty_ingest` kv flag (set
-/// before the first early prepend, cleared with the bookkeeping) —
-/// a crash in between leaves chains ahead of counts and the store
-/// hard-errors on open.
+/// spilled to `<store>/staging/`, see `Staged`) and lands EXACTLY ONE
+/// prepend per touched chain at `finish()` (SPEC §"Prepend multiple
+/// records"): f0 = the head full record, ONE f1 stream-composed from
+/// every other staged record — and if that f1's raw size exceeds the
+/// seal threshold it is sealed to cold immediately in the same
+/// operation. No mid-ingest landing: RAM and disk stay bounded by the
+/// compressed spill plus the streaming frame codec, and the whole
+/// ingest stays atomic (nothing lands before `finish()`; a crash
+/// leaves only scratch).
 pub(crate) struct Ingest<'a> {
     st: &'a mut Store,
     level: i32,
     // TREES staging. `entries` are reverse deltas in ADD order: the
-    // first entry rebuilds the chain head as of the last flush (the
-    // bridge — after an early flush the next staged delta rebuilds the
-    // just-landed head, so the invariant self-maintains), each later
-    // one rebuilds the previously-added tree.
+    // first entry rebuilds the stored chain head (the bridge), each
+    // later one rebuilds the previously-added tree.
     head_view: Option<depot::View>,
     seed_full: Option<Vec<u8>>,
     tree_entries: Staged,
     /// Stable index one past the last LANDED tree (= n_trees at open;
-    /// advances as chunks early-land). Staged trees are
+    /// nothing lands before `finish()`). Staged trees are
     /// `tree_base..n_trees`.
     tree_base: u64,
     n_trees: u64,
     /// Intra-ingest dedup only (git tree oid → tree_idx), discarded
     /// with the Ingest.
     tree_cache: HashMap<String, u64>,
-    /// Raw length of the last landed TREES boundary head — the full
-    /// snapshot a future cold frame anchors on. Tree chunks flush at
-    /// max(frame_bound, this): frames at least anchor-sized keep the
-    /// anchor recompression cost amortized to ~2x data.
-    last_boundary_len: u64,
-    /// TREES early-flush floor (SEAL_THRESHOLD; test-overridable via
-    /// GITDEPOT_TEST_FRAME_BOUND).
-    frame_bound: u64,
-    /// COMMITS/TAGS early-land bound (BATCH_LAND_BOUND;
-    /// test-overridable via GITDEPOT_TEST_BATCH_BOUND).
-    batch_bound: u64,
-    /// dirty_ingest has been written for this ingest.
-    dirty: bool,
     // COMMITS staging (encoded objects, oldest-first).
     commit_recs: Staged,
     n_commits: u64,
@@ -1589,18 +1663,10 @@ impl<'a> Ingest<'a> {
         } else {
             None
         };
-        let env_u64 = |key: &str, default: u64| -> u64 {
-            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-        };
-        let bound = env_u64("GITDEPOT_SPILL_BOUND", SPILL_RAM_BOUND);
-        let frame_bound = env_u64("GITDEPOT_TEST_FRAME_BOUND", SEAL_THRESHOLD);
-        let batch_bound = env_u64("GITDEPOT_TEST_BATCH_BOUND", BATCH_LAND_BOUND);
-        // The opening boundary: the stored head IS a landed full
-        // snapshot, so its canonical encode length seeds the flush
-        // floor (0 on a fresh chain).
-        let last_boundary_len = head_view
-            .as_ref()
-            .map_or(0, |v| depot::codec::encode(&depot::diff(None, Some(v))).len() as u64);
+        let bound = std::env::var("GITDEPOT_SPILL_BOUND")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SPILL_RAM_BOUND);
         let staging = st.root().join("staging");
         Ok(Ingest {
             st,
@@ -1611,10 +1677,6 @@ impl<'a> Ingest<'a> {
             tree_base: n_trees,
             n_trees,
             tree_cache: HashMap::new(),
-            last_boundary_len,
-            frame_bound,
-            batch_bound,
-            dirty: false,
             commit_recs: Staged::new(staging.join("commits"), bound, SPILL_BLOCK),
             n_commits,
             sha_cache: HashMap::new(),
@@ -1629,23 +1691,6 @@ impl<'a> Ingest<'a> {
     /// instrumentation for the bootstrap rung report.
     pub(crate) fn staged_bytes(&self) -> u64 {
         self.tree_entries.bytes + self.commit_recs.bytes + self.tag_recs.bytes
-    }
-
-    /// Write the `dirty_ingest` flag in its own transaction —
-    /// immediately BEFORE the first early-landing prepend, so a crash
-    /// after any chain moved ahead of the kv counts is detectable.
-    /// Ingests that never early-land never set it (the common small
-    /// update stays atomic exactly as before). Cleared inside the
-    /// bookkeeping transaction.
-    fn mark_dirty(&mut self) -> Result<()> {
-        if self.dirty {
-            return Ok(());
-        }
-        let tx = self.st.conn.unchecked_transaction().map_err(sql_err)?;
-        kv_set(&tx, "dirty_ingest", "1")?;
-        tx.commit().map_err(sql_err)?;
-        self.dirty = true;
-        Ok(())
     }
 
     fn parent_idx(&self, sha: &str) -> Result<u64> {
@@ -1701,20 +1746,6 @@ impl<'a> Ingest<'a> {
         self.n_trees += 1;
         self.head_view = Some(view.clone());
         self.tree_cache.insert(tree_oid.to_string(), idx);
-        // Early landing: once the staged chunk's bytes reach
-        // max(frame_bound, last landed boundary length), land it NOW
-        // as an ordinary prepend (SPEC, compose_f1 doc: "A batch whose
-        // entries alone dwarf the seal threshold must not land as one
-        // frame" — every accumulator/cold frame stays ~threshold-
-        // sized). The boundary floor keeps frames at least
-        // anchor-sized so the full-snapshot anchor recompression
-        // amortizes. An early-landed chunk is byte-for-byte an
-        // ordinary prepend, so the read path is unchanged.
-        if self.tree_entries.bytes >= self.frame_bound.max(self.last_boundary_len) {
-            self.mark_dirty()?;
-            self.flush_tree_batch()?;
-            self.st.evict_pass()?;
-        }
         Ok(idx)
     }
 
@@ -1722,10 +1753,9 @@ impl<'a> Ingest<'a> {
     /// trees by walking the staged reverse deltas backward from the
     /// staged head — the mid-ingest analogue of
     /// `Store::walk_tree_views` (a laddered bootstrap needs boundary
-    /// views before the ingest commits) — and trees that already
-    /// EARLY-LANDED (below `tree_base`; kv counts still lag until
-    /// `commit_bookkeeping`) by walking the chain with the ingest's
-    /// live count. One backward pass per side serves many targets:
+    /// views before the ingest commits) — and trees already STORED
+    /// (below `tree_base`) by walking the chain. One backward pass
+    /// per side serves many targets:
     /// `targets` maps stable tree idx → keys wanting that view.
     pub(crate) fn staged_views<K: Clone>(
         &self,
@@ -1782,8 +1812,7 @@ impl<'a> Ingest<'a> {
             }
         }
         if !stored.is_empty() {
-            // Chain head = tree tree_base - 1 at walk position 0
-            // (early-landed chunks are ordinary prepends).
+            // Chain head = tree tree_base - 1 at walk position 0.
             let base = self.tree_base;
             let lowest = *stored.keys().next().expect("non-empty");
             let until = (base - 1 - lowest) as usize;
@@ -1804,14 +1833,14 @@ impl<'a> Ingest<'a> {
         self.sha_cache.get(sha).and_then(|c| self.tree_of_commit.get(c)).copied()
     }
 
-    /// Land everything TREES-staged as one batch prepend — the single
-    /// code path shared by mid-ingest early flushes and `finish()`
-    /// (the final flush's bridge rebuilds the last early-landed head).
+    /// Land everything TREES-staged as ONE batch prepend: f0 = the
+    /// staged head's full record; the f1 streams the staged reverse
+    /// deltas newest-first — the oldest of which is the bridge that
+    /// replaces the demoted former head (`Demote::Dropped`).
     fn flush_tree_batch(&mut self) -> Result<()> {
         if let Some(seed_rec) = self.seed_full.take() {
             self.st
-                .prepend_batch(TREES, &seed_rec, &[], Demote::Verbatim, self.level)?;
-            self.last_boundary_len = seed_rec.len() as u64;
+                .prepend_batch(TREES, &seed_rec, None, Demote::Verbatim, self.level)?;
         }
         if self.tree_entries.is_empty() {
             self.tree_base = self.n_trees;
@@ -1824,26 +1853,35 @@ impl<'a> Ingest<'a> {
             None,
             Some(self.head_view.as_ref().expect("staged tree entries imply a staged head")),
         ));
-        let entries = self.tree_entries.drain_all()?;
-        let (bridge, rest) = entries.split_first().expect("non-empty entries");
-        let mut older: Vec<Vec<u8>> = rest.to_vec();
-        older.reverse();
-        self.st
-            .prepend_batch(TREES, &head_full, &older, Demote::Replace(bridge), self.level)?;
-        // The landed head is the next boundary anchor; the next staged
-        // delta rebuilds it (the next bridge).
-        self.last_boundary_len = head_full.len() as u64;
+        self.st.prepend_batch(
+            TREES,
+            &head_full,
+            Some(&mut self.tree_entries),
+            Demote::Dropped,
+            self.level,
+        )?;
         self.tree_base = self.n_trees;
         Ok(())
     }
 
     fn flush_commit_batch(&mut self) -> Result<()> {
         if !self.commit_recs.is_empty() {
-            let recs = self.commit_recs.drain_all()?;
-            let base = self.n_commits - recs.len() as u64;
-            let batch = encode_batch(base, &recs);
+            let count = self.commit_recs.len();
+            let base = self.n_commits - count as u64;
+            // ONE batch record for the whole ingest, assembled by
+            // streaming the stage forward (never a Vec-of-Vecs copy).
+            let mut batch = Vec::with_capacity(
+                12 + self.commit_recs.bytes as usize + 4 * count,
+            );
+            batch.extend_from_slice(&base.to_le_bytes());
+            batch.extend_from_slice(&(count as u32).to_le_bytes());
+            self.commit_recs.for_each(&mut |rec| {
+                put_bytes(&mut batch, rec);
+                Ok(())
+            })?;
+            self.commit_recs.clear();
             self.st
-                .prepend_batch(COMMITS, &batch, &[], Demote::Verbatim, self.level)?;
+                .prepend_batch(COMMITS, &batch, None, Demote::Verbatim, self.level)?;
             self.st.sha_map.take();
         }
         Ok(())
@@ -1883,15 +1921,6 @@ impl<'a> Ingest<'a> {
         self.commit_recs.push(rec.encode())?;
         self.sha_cache.insert(cm.sha.clone(), idx);
         self.tree_of_commit.insert(idx, tree_idx);
-        // Early landing: staged COMMITS past the bound land now as one
-        // batch record; `flush_commit_batch`'s running base keeps the
-        // stable indices contiguous across multiple batches per
-        // ingest, and readers already walk batch records.
-        if self.commit_recs.bytes >= self.batch_bound {
-            self.mark_dirty()?;
-            self.flush_commit_batch()?;
-            self.st.evict_pass()?;
-        }
         Ok(idx)
     }
 
@@ -1937,22 +1966,24 @@ impl<'a> Ingest<'a> {
         };
         self.tag_recs.push(rec.encode())?;
         self.tag_cache.insert(sha.to_string(), idx);
-        // Early landing, same shape as COMMITS.
-        if self.tag_recs.bytes >= self.batch_bound {
-            self.mark_dirty()?;
-            self.flush_tag_batch()?;
-            self.st.evict_pass()?;
-        }
         Ok(idx)
     }
 
     fn flush_tag_batch(&mut self) -> Result<()> {
         if !self.tag_recs.is_empty() {
-            let recs = self.tag_recs.drain_all()?;
-            let base = self.n_tags - recs.len() as u64;
-            let batch = encode_batch(base, &recs);
+            let count = self.tag_recs.len();
+            let base = self.n_tags - count as u64;
+            let mut batch =
+                Vec::with_capacity(12 + self.tag_recs.bytes as usize + 4 * count);
+            batch.extend_from_slice(&base.to_le_bytes());
+            batch.extend_from_slice(&(count as u32).to_le_bytes());
+            self.tag_recs.for_each(&mut |rec| {
+                put_bytes(&mut batch, rec);
+                Ok(())
+            })?;
+            self.tag_recs.clear();
             self.st
-                .prepend_batch(TAGS, &batch, &[], Demote::Verbatim, self.level)?;
+                .prepend_batch(TAGS, &batch, None, Demote::Verbatim, self.level)?;
             self.st.tag_map.take();
         }
         Ok(())
@@ -1970,8 +2001,7 @@ impl<'a> Ingest<'a> {
     }
 
     /// One batch prepend per touched chain (trees, commits, tags) for
-    /// everything still staged — the whole ingest when nothing
-    /// early-landed, the sub-threshold remainder otherwise.
+    /// everything staged — the whole ingest.
     fn flush_chains(&mut self) -> Result<()> {
         self.flush_tree_batch()?;
         self.flush_commit_batch()?;
@@ -1986,10 +2016,6 @@ impl<'a> Ingest<'a> {
             kv_set(tx, "n_commits", &n_commits.to_string())?;
             kv_set(tx, "n_reflog", &n_reflog.to_string())?;
             kv_set(tx, "n_tags", &n_tags.to_string())?;
-            // Counts now cover every early-landed chunk: the ingest is
-            // whole again.
-            tx.execute("DELETE FROM kv WHERE key = 'dirty_ingest'", [])
-                .map_err(sql_err)?;
             apply_ref_changes(tx, changes)?;
             Ok(())
         })
@@ -2235,30 +2261,6 @@ pub fn read_meta(store: &Path) -> Result<Meta> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// dirty_ingest set (a crash between an early-landing prepend and
-    /// the bookkeeping) ⇒ Store::open hard-errors: the store must be
-    /// rebuilt, no repair path.
-    #[test]
-    fn dirty_ingest_blocks_open() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("store");
-        {
-            let s = Store::create(&root).unwrap();
-            let tx = s.conn.unchecked_transaction().unwrap();
-            kv_set(&tx, "dirty_ingest", "1").unwrap();
-            tx.commit().unwrap();
-        }
-        assert!(ingest_interrupted(&root).unwrap());
-        let err = match Store::open(&root) {
-            Ok(_) => panic!("open succeeded on a dirty store"),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            err.contains("interrupted mid-ingest") && err.contains("rebuilt"),
-            "unexpected open error: {err}"
-        );
-    }
 
     /// Compressed-spill roundtrip across block boundaries: records
     /// never split across blocks; a record larger than the block size

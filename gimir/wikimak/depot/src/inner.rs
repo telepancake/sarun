@@ -226,7 +226,14 @@ impl DepotInner {
         let new_f1_bytes = new_f1_bytes.ok_or(Error::MissingF1)?;
         let (old_f0_fid, old_f0_off) = unpack(old_f0_ptr);
         let old_f0_ptr_field = read_next_pointer(&self.f0, old_f0_fid, old_f0_off)?;
-        let old_f1_ptr = old_f0_ptr_field;
+        // `seal_f1` leaves f0 pointing DIRECTLY at the cold head (fid
+        // 0): the chain has no f1, and the new f1 inherits that cold
+        // head as its next pointer.
+        let (old_f1_ptr, direct_cold) = if is_cold_ptr(old_f0_ptr_field) {
+            (0, old_f0_ptr_field)
+        } else {
+            (old_f0_ptr_field, 0)
+        };
         if seal_old_f1 && old_f1_ptr == 0 {
             return Err(Error::CannotSealNoF1);
         }
@@ -255,8 +262,9 @@ impl DepotInner {
             // No seal: inherit old f1's cold-head pointer.
             read_next_pointer(&self.f1, old_f1_fid, old_f1_off)?
         } else {
-            // Old chain had no f1 yet; new f1 starts a fresh cold chain.
-            0
+            // Old chain had no f1: inherit the direct cold head left
+            // by `seal_f1` (0 if the chain never sealed).
+            direct_cold
         };
 
         let new_f1_frame = encode_frame(chain_id, new_f1_next_ptr, new_f1_bytes);
@@ -285,6 +293,51 @@ impl DepotInner {
         Ok(())
     }
 
+    /// Move the chain's CURRENT f1 verbatim to cold and leave the
+    /// chain with f0 only (see `Depot::seal_f1`). Same machinery as
+    /// `prepend`'s seal: the cold frame reuses the f1's zstd bytes and
+    /// inherits its cold-head pointer; the commit point is the f0
+    /// next_pointer flip (in place, like eviction's f1 repoint) —
+    /// a crash before the flip leaves the chain intact and only an
+    /// unreferenced cold frame behind. Durability, as everywhere in
+    /// the depot, is the caller's `flush()`.
+    pub fn seal_f1(&mut self, chain_id: u64) -> Result<()> {
+        if chain_id >= self.cfg.max_chain_id {
+            return Err(Error::ChainIdOutOfRange);
+        }
+        let f0_ptr = self.index_get(chain_id);
+        if f0_ptr == 0 {
+            return Err(Error::NoFrame);
+        }
+        let (f0_fid, f0_off) = unpack(f0_ptr);
+        let f1_ptr = read_next_pointer(&self.f0, f0_fid, f0_off)?;
+        if f1_ptr == 0 || is_cold_ptr(f1_ptr) {
+            return Err(Error::CannotSealNoF1);
+        }
+        let (f1_fid, f1_off) = unpack(f1_ptr);
+        let f1_next = read_next_pointer(&self.f1, f1_fid, f1_off)?;
+        let f1_zstd = read_zstd(&self.f1, f1_fid, f1_off)?;
+        let cold_frame = encode_frame(chain_id, f1_next, &f1_zstd);
+        let cold_off = self.cold_append(&cold_frame)?;
+        let cold_ptr = pack(COLD_FILE_ID, cold_off);
+        // Commit: repoint the live f0 at the cold frame in place. The
+        // tier handle is O_APPEND (pwrite on it would APPEND on Linux,
+        // ignoring the offset), so the patch goes through a fresh
+        // plain-write handle on the same path.
+        let f0_df = self
+            .f0
+            .files
+            .get(&f0_fid)
+            .ok_or(Error::Corrupt("missing tier file"))?;
+        let patch = OpenOptions::new().write(true).open(&f0_df.path)?;
+        patch.write_all_at(&cold_ptr.to_le_bytes(), f0_off as u64 + 8)?;
+        // The old f1 frame is dead.
+        if let Some(df) = self.f1.files.get_mut(&f1_fid) {
+            df.dead += HEADER_LEN as u64 + f1_zstd.len() as u64;
+        }
+        Ok(())
+    }
+
     pub fn read_f0(&mut self, chain_id: u64) -> Result<Vec<u8>> {
         if chain_id >= self.cfg.max_chain_id {
             return Err(Error::ChainIdOutOfRange);
@@ -307,7 +360,8 @@ impl DepotInner {
         }
         let (fid, off) = unpack(ptr);
         let f1_ptr = read_next_pointer(&self.f0, fid, off)?;
-        if f1_ptr == 0 {
+        if f1_ptr == 0 || is_cold_ptr(f1_ptr) {
+            // No f1 (a cold pointer here = `seal_f1` retired it).
             return Ok(None);
         }
         let (f1_fid, f1_off) = unpack(f1_ptr);
@@ -326,6 +380,10 @@ impl DepotInner {
         let f1_ptr = read_next_pointer(&self.f0, fid, off)?;
         if f1_ptr == 0 {
             return Ok(0);
+        }
+        if is_cold_ptr(f1_ptr) {
+            // `seal_f1` retired the f1: f0 points at the cold head.
+            return Ok(f1_ptr);
         }
         let (f1_fid, f1_off) = unpack(f1_ptr);
         read_next_pointer(&self.f1, f1_fid, f1_off)
@@ -466,9 +524,11 @@ impl DepotInner {
             let (new_fid, new_off) = self.f1.append(&frame, self.cfg.file_size_threshold)?;
             let new_ptr = pack(new_fid, new_off);
             let f0_df = self.f0.files.get(&f0_fid).expect("f0 file present");
-            f0_df
-                .file
-                .write_all_at(&new_ptr.to_le_bytes(), f0_off as u64 + 8)?;
+            // The tier handle is O_APPEND (pwrite on it would APPEND
+            // on Linux, ignoring the offset): patch via a fresh
+            // plain-write handle on the same path.
+            let patch = OpenOptions::new().write(true).open(&f0_df.path)?;
+            patch.write_all_at(&new_ptr.to_le_bytes(), f0_off as u64 + 8)?;
             touched_f0.insert(f0_fid);
         }
         for df in self.f1.files.values() {
@@ -545,6 +605,12 @@ fn pack(file_id: u32, offset: u32) -> u64 {
 
 fn unpack(ptr: u64) -> (u32, u32) {
     (ptr as u32, (ptr >> 32) as u32)
+}
+
+/// A nonzero pointer into the cold file (fid 0; real f0/f1 fids start
+/// at 1, and cold offset 0 is reserved, so this is unambiguous).
+fn is_cold_ptr(ptr: u64) -> bool {
+    ptr != 0 && (ptr as u32) == COLD_FILE_ID
 }
 
 fn encode_frame(chain_id: u64, next_pointer: u64, zstd: &[u8]) -> Vec<u8> {

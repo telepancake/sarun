@@ -201,6 +201,31 @@ Same call, but `seal_old_f1 = true`. The depot:
 8. Bump `bytes_deprecated` on old f0's file (by old_f0_size) and old f1's
    file (by old_f1_size).
 
+### Immediate seal (`seal_f1`)
+
+`prepend`'s `seal_old_f1` seals the PREVIOUS accumulator. When the
+accumulator just written already dwarfs the seal threshold (a batch
+prepend whose entries alone exceed it), the caller may retire it right
+away with `seal_f1(chain_id)` so no later prepend ever recompresses it:
+
+1. Reads the index → f0_ref; error `NoFrame` if (0,0).
+2. Reads f0's next_pointer → f1_ref. If (0,0) or already a cold
+   pointer, error `CannotSealNoF1`.
+3. Writes the f1's zstd bytes verbatim as a new cold frame inheriting
+   the f1's cold-head next_pointer (same machinery as a prepend seal).
+4. Patches the LIVE f0's next_pointer in place to point DIRECTLY at
+   the new cold frame (the commit point; a crash before it leaves the
+   chain intact plus one unreferenced cold frame). Bumps the old f1
+   frame's `bytes_deprecated`.
+
+This introduces one extra pointer state: an f0 `next_pointer` with
+`file_id == 0` (and nonzero offset — unambiguous, f1 file ids start
+at 1) means "no f1; this is the cold head". `read_f1` reports no f1,
+`cold_iter` starts there, and the next `prepend` inherits it as the
+new f1's cold head. The walk is unchanged: f0 → (no f1) → cold…,
+with the sealed frame still refPrefix-anchored on the f0 record it
+was written with.
+
 ### Prepend multiple records (normative composition)
 
 Prepending N ≥ 1 records to a chain is ONE `prepend` call — one f0

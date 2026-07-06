@@ -238,6 +238,21 @@ impl Depot {
         })
     }
 
+    /// Seal the chain's CURRENT f1 to cold immediately: the f1's zstd
+    /// bytes move verbatim to a new cold frame (inheriting the f1's
+    /// cold-head pointer) and the chain is left with f0 and no f1 —
+    /// the walk continues f0 → cold identically. This is the
+    /// "just-written accumulator already dwarfs the seal threshold"
+    /// escape hatch: `prepend`'s `seal_old_f1` seals the PREVIOUS f1;
+    /// this seals the one written by the LAST prepend so a later
+    /// incremental prepend never recompresses it. Sealing a chain
+    /// with no f1 is an error ([`Error::CannotSealNoF1`]); an empty
+    /// chain errors [`Error::NoFrame`].
+    pub fn seal_f1(&self, chain_id: u64) -> Result<()> {
+        let mut g = self.inner.lock().expect("depot mutex poisoned");
+        g.seal_f1(chain_id)
+    }
+
     /// Flush all pending writes to durable storage. Also opportunistically
     /// runs eviction on any ROLLED f0/f1 file whose dead ratio exceeds the
     /// threshold; the current write target keeps its slack (that slack is
@@ -313,4 +328,185 @@ pub fn decompress_frame(
     let mut out = Vec::with_capacity(raw_len);
     dctx.decompress(&mut out, frame).map_err(err)?;
     Ok(out)
+}
+
+/// The window log [`compress_frame`] picks for a frame of
+/// `total_raw_len` bytes — exposed so the streaming encoder (which
+/// cannot see the whole input) reproduces the bulk choice exactly.
+pub fn frame_window_log(total_raw_len: u64) -> u32 {
+    (64 - total_raw_len.max(1 << 20).leading_zeros()).min(27)
+}
+
+/// Streaming form of [`compress_frame`]: IDENTICAL parameters (window
+/// log from the caller-declared total raw length, long-distance
+/// matching, refPrefix) fed through `ZSTD_compressStream2`, producing
+/// byte-identical output to the bulk call for the same
+/// `(input, prefix, level, total)`. The caller MUST know the total
+/// raw size upfront (`total_raw_len`) — it pins both the window log
+/// and the frame header's content size (pledged; writing a different
+/// number of bytes errors at `finish`). The prefix must outlive the
+/// encoder, exactly like zstd's refPrefix contract.
+pub struct FrameEncoder<'p> {
+    cctx: zstd::zstd_safe::CCtx<'p>,
+    out: Vec<u8>,
+    scratch: Vec<u8>,
+    written: u64,
+    total: u64,
+    /// The frame was closed (`ZSTD_e_end` issued). Byte parity with
+    /// the bulk call requires the end directive to travel WITH the
+    /// final input bytes (a trailing empty `e_end` emits a different
+    /// last block) — `write` closes the frame the moment `written`
+    /// reaches the declared total.
+    ended: bool,
+}
+
+impl<'p> FrameEncoder<'p> {
+    pub fn new(
+        total_raw_len: u64,
+        prefix: Option<&'p [u8]>,
+        level: i32,
+    ) -> std::result::Result<Self, String> {
+        let err = |c| zstd::zstd_safe::get_error_name(c).to_string();
+        let mut cctx = zstd::zstd_safe::CCtx::create();
+        cctx.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(level))
+            .map_err(err)?;
+        cctx.set_parameter(zstd::zstd_safe::CParameter::WindowLog(frame_window_log(
+            total_raw_len,
+        )))
+        .map_err(err)?;
+        cctx.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(true))
+            .map_err(err)?;
+        cctx.set_pledged_src_size(Some(total_raw_len)).map_err(err)?;
+        if let Some(p) = prefix {
+            cctx.ref_prefix(p).map_err(err)?;
+        }
+        Ok(Self {
+            cctx,
+            out: Vec::new(),
+            scratch: vec![0u8; zstd::zstd_safe::CCtx::out_size()],
+            written: 0,
+            total: total_raw_len,
+            ended: false,
+        })
+    }
+
+    fn pump(&mut self, src: &[u8], end: bool) -> std::result::Result<(), String> {
+        let err = |c| zstd::zstd_safe::get_error_name(c).to_string();
+        let mut input = zstd::zstd_safe::InBuffer::around(src);
+        let dir = if end {
+            zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_end
+        } else {
+            zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_continue
+        };
+        loop {
+            let mut ob = zstd::zstd_safe::OutBuffer::around(&mut self.scratch[..]);
+            let remaining = self.cctx.compress_stream2(&mut ob, &mut input, dir).map_err(err)?;
+            let n = ob.pos();
+            self.out.extend_from_slice(&self.scratch[..n]);
+            if end {
+                if remaining == 0 {
+                    return Ok(());
+                }
+            } else if input.pos() == src.len() && n < self.scratch.len() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Feed the next chunk of raw frame bytes. The chunk that reaches
+    /// the declared total closes the frame.
+    pub fn write(&mut self, chunk: &[u8]) -> std::result::Result<(), String> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        self.written += chunk.len() as u64;
+        if self.written > self.total {
+            return Err("frame encoder: more bytes than declared".into());
+        }
+        let last = self.written == self.total;
+        if last {
+            self.ended = true;
+        }
+        self.pump(chunk, last)
+    }
+
+    /// Verify the declared total was written, close the frame (only
+    /// the empty frame is still open here), and return the complete
+    /// compressed bytes.
+    pub fn finish(mut self) -> std::result::Result<Vec<u8>, String> {
+        if self.written != self.total {
+            return Err(format!(
+                "frame encoder: wrote {} of declared {} bytes",
+                self.written, self.total
+            ));
+        }
+        if !self.ended {
+            self.pump(&[], true)?;
+        }
+        Ok(self.out)
+    }
+}
+
+/// Streaming decode counterpart of [`decompress_frame`]: reads the
+/// compressed frame bytes (with the optional refPrefix set before the
+/// first read) and yields the raw bytes incrementally via
+/// [`std::io::Read`] — never materializing the whole decompressed
+/// frame. Decodes frames produced by either the bulk or the streaming
+/// encoder.
+pub struct FrameDecoder<'a> {
+    dctx: zstd::zstd_safe::DCtx<'a>,
+    frame: &'a [u8],
+    pos: usize,
+    done: bool,
+}
+
+impl<'a> FrameDecoder<'a> {
+    pub fn new(
+        frame: &'a [u8],
+        prefix: Option<&'a [u8]>,
+    ) -> std::result::Result<Self, String> {
+        let err = |c| zstd::zstd_safe::get_error_name(c).to_string();
+        let mut dctx = zstd::zstd_safe::DCtx::create();
+        if let Some(p) = prefix {
+            dctx.ref_prefix(p).map_err(err)?;
+        }
+        Ok(Self { dctx, frame, pos: 0, done: false })
+    }
+}
+
+impl std::io::Read for FrameDecoder<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        let mut input = zstd::zstd_safe::InBuffer::around(&self.frame[self.pos..]);
+        let mut output = zstd::zstd_safe::OutBuffer::around(&mut buf[..]);
+        loop {
+            let hint = self
+                .dctx
+                .decompress_stream(&mut output, &mut input)
+                .map_err(|c| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        zstd::zstd_safe::get_error_name(c),
+                    )
+                })?;
+            if hint == 0 {
+                self.done = true;
+                break;
+            }
+            if output.pos() == output.capacity() || output.pos() > 0 && input.pos() == input.src.len()
+            {
+                break;
+            }
+            if input.pos() == input.src.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated zstd frame",
+                ));
+            }
+        }
+        self.pos += input.pos();
+        Ok(output.pos())
+    }
 }
