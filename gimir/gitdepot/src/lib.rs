@@ -212,13 +212,21 @@ fn fetch_blobs(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    {
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        for oid in &uniq {
+    // Write requests from a thread: the request stream can exceed the
+    // pipe buffer (large trees) while git's replies fill the other
+    // pipe — writing and reading from one thread deadlocks both sides
+    // (observed: import wedged in anon_pipe_write on a real history).
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let reqs: Vec<String> = uniq.iter().cloned().collect();
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        for oid in &reqs {
             writeln!(stdin, "{oid}")?;
         }
-    } // drop closes stdin
+        Ok(()) // drop closes stdin
+    });
     let out = child.wait_with_output()?;
+    writer.join().map_err(|_| Error::Git("cat-file writer panicked".into()))?
+        .map_err(Error::Io)?;
     if !out.status.success() {
         return Err(Error::Git("cat-file --batch failed".into()));
     }
