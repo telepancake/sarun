@@ -33,9 +33,13 @@ struct DataFile {
 
 impl DataFile {
     fn open(id: u32, path: PathBuf) -> Result<Self> {
+        // NOT O_APPEND: eviction patches f1 next_pointers in place with
+        // pwrite, and Linux pwrite on an O_APPEND fd ignores the offset
+        // and appends. Appends go through write_all_at at the tracked
+        // cursor instead.
         let file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .create(true)
             .truncate(false)
             .open(&path)?;
@@ -115,9 +119,9 @@ impl Tier {
         if off > u32::MAX as u64 {
             return Err(Error::FrameTooLarge);
         }
-        // O_APPEND guarantees the kernel writes at end-of-file. Track our
-        // cursor for ensure_room/eviction bookkeeping.
-        std::io::Write::write_all(&mut df.file, frame)?;
+        // Positioned write at the tracked cursor (single-threaded under
+        // the outer Mutex; no O_APPEND, see DataFile::open).
+        df.file.write_all_at(frame, off)?;
         df.len += frame.len() as u64;
         Ok((id, off as u32))
     }
@@ -355,11 +359,29 @@ impl DepotInner {
         Ok(())
     }
 
+    /// Opportunistic eviction (runs on every `flush`): rolled files
+    /// only. The current write target is exempt here — mid-session its
+    /// slack is what buys bounded per-prepend I/O — and is reclaimed by
+    /// `collect` when the session is done.
     pub fn maybe_evict(&mut self) -> Result<()> {
+        self.evict_pass(false)
+    }
+
+    /// Session-end compaction: same dead-ratio policy, but the current
+    /// write file is a candidate too (rolled first, per SPEC "Eviction"
+    /// step 5 — live frames cannot migrate into the file being
+    /// unlinked). Without this, a churning chain parks every deprecated
+    /// head below file_size_threshold forever: holes at rest serve
+    /// nothing.
+    pub fn collect(&mut self) -> Result<()> {
+        self.evict_pass(true)
+    }
+
+    fn evict_pass(&mut self, include_current: bool) -> Result<()> {
         loop {
             let mut victim: Option<(bool, u32)> = None;
             for df in self.f0.files.values() {
-                if Some(df.id) == self.f0.current {
+                if !include_current && Some(df.id) == self.f0.current {
                     continue;
                 }
                 if df.len > 0 && (df.dead as f32 / df.len as f32) > self.cfg.eviction_dead_ratio {
@@ -369,7 +391,7 @@ impl DepotInner {
             }
             if victim.is_none() {
                 for df in self.f1.files.values() {
-                    if Some(df.id) == self.f1.current {
+                    if !include_current && Some(df.id) == self.f1.current {
                         continue;
                     }
                     if df.len > 0 && (df.dead as f32 / df.len as f32) > self.cfg.eviction_dead_ratio
@@ -383,8 +405,14 @@ impl DepotInner {
                 return Ok(());
             };
             if is_f0 {
+                if self.f0.current == Some(vid) {
+                    self.f0.current = None;
+                }
                 self.evict_f0(vid)?;
             } else {
+                if self.f1.current == Some(vid) {
+                    self.f1.current = None;
+                }
                 self.evict_f1(vid)?;
             }
         }

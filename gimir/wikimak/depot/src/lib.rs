@@ -239,11 +239,23 @@ impl Depot {
     }
 
     /// Flush all pending writes to durable storage. Also opportunistically
-    /// runs eviction on any f0/f1 file whose dead ratio exceeds the threshold.
+    /// runs eviction on any ROLLED f0/f1 file whose dead ratio exceeds the
+    /// threshold; the current write target keeps its slack (that slack is
+    /// what bounds per-prepend I/O mid-session — see `collect`).
     pub fn flush(&self) -> Result<()> {
         let mut g = self.inner.lock().expect("depot mutex poisoned");
         g.flush()?;
         g.maybe_evict()?;
+        g.flush()
+    }
+
+    /// Session-end compaction: eviction with the current write file
+    /// included (rolled first). Call when a batch of updates is done —
+    /// dead frames parked in the under-threshold current file are pure
+    /// waste at rest. Leaves every tier file at or under the dead ratio.
+    pub fn collect(&self) -> Result<()> {
+        let mut g = self.inner.lock().expect("depot mutex poisoned");
+        g.collect()?;
         g.flush()
     }
 

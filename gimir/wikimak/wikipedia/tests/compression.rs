@@ -142,7 +142,8 @@ fn multi_revision_page_compresses_and_seals() {
         total_new += inst.import(&mut stream).unwrap().revisions_new;
     }
     assert_eq!(total_new as usize, N);
-    inst.flush().unwrap(); // also runs depot eviction
+    inst.flush().unwrap(); // durability; evicts rolled files only
+    inst.collect().unwrap(); // session end: reclaim current-file slack
 
     // ── fidelity: every revision reads back exactly, newest-first ──────
     assert_eq!(inst.page_head_text(7).unwrap().unwrap(),
@@ -163,16 +164,19 @@ fn multi_revision_page_compresses_and_seals() {
     assert!(cold_size > 0, "no cold frames — sealing never fired");
 
     // ── THE measurement: on-disk depot ≪ raw input ─────────────────────
-    // Live bytes are ~one full head + a bounded accumulator + per-rev
-    // deltas; eviction (dead ratio 0.5) bounds orphan slack at ~2x live.
-    // The sabotaged scheme stored ~raw_total plus a QUADRATIC f1 — it
-    // could not come near this bound.
+    // After collect, disk ≈ live: one standalone head (the fixture text
+    // is pseudo-random, so ~entropy-floor ~20 KiB), the bounded f1
+    // accumulator, the refPrefix cold chain (~100-240 B per absorbed
+    // revision), and the fixed 8 KiB index. Measured 138x. The
+    // sabotaged scheme stored ~raw_total plus a QUADRATIC f1; the
+    // pre-collect depot parked every superseded head as slack (~30x) —
+    // neither can reach this bound.
     let disk = dir_size(&tmp.path().join("depot"));
     eprintln!("raw {raw_total} B, depot on disk {disk} B, cold {cold_size} B \
                ({}x compression)", raw_total / disk.max(1));
     assert!(
-        disk * 8 < raw_total,
-        "depot on disk ({disk}) not <1/8 of raw input ({raw_total}) — \
+        disk * 64 < raw_total,
+        "depot on disk ({disk}) not <1/64 of raw input ({raw_total}) — \
          the compression discipline is not rendered"
     );
 }

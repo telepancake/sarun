@@ -47,6 +47,9 @@ fn cmd_import(dump: &str, root: &str) -> Result<(), String> {
     let mut stream = new_page_stream(reader);
     let stats = inst.import(&mut stream).map_err(|e| e.to_string())?;
     inst.flush().map_err(|e| e.to_string())?;
+    // Import session over: reclaim the churn slack (dead superseded
+    // heads) parked in the depot's current write files.
+    inst.collect().map_err(|e| e.to_string())?;
     println!(
         "pages {}  revisions new {}  deduped {}  sha1 ok/fudged/mismatch {}/{}/{}",
         stats.pages, stats.revisions_new, stats.revisions_deduped,

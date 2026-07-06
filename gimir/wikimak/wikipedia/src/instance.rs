@@ -342,6 +342,16 @@ impl Instance {
         Ok(())
     }
 
+    /// Session-end compaction: reclaim update-churn slack parked in the
+    /// depot's current write files (see `Depot::collect`). Cheap when
+    /// there is nothing to reclaim; call once after a batch of imports,
+    /// not per part.
+    pub fn collect(&self) -> Result<()> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        g.depot.collect()?;
+        Ok(())
+    }
+
     /// Flush depot + strpool + sqlite to durable storage.
     pub fn flush(&self) -> Result<()> {
         let mut g = self.inner.lock().expect("instance mutex poisoned");

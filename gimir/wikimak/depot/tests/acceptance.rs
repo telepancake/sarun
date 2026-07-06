@@ -976,3 +976,145 @@ fn cold_pointer_chain_walks_correctly() {
     );
     assert_eq!(walked.len(), k, "walked {k} cold frames");
 }
+
+// ---------------------------------------------------------------------------
+// collect_reclaims_current_file_slack
+// ---------------------------------------------------------------------------
+
+/// SPEC §"Eviction": triggered when ANY file in the tier crosses the
+/// dead ratio — the current write target included (step 5 rolls it
+/// first). Update churn on a chain deprecates its prior f0/f1 in place,
+/// so with a large file_size_threshold ALL the slack sits in the current
+/// file; a depot that never reclaims it pins every dead head on disk
+/// forever. `flush` stays the cheap mid-session durability barrier;
+/// `collect` is the session-end pass that includes the current file.
+#[test]
+fn collect_reclaims_current_file_slack() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let depot = Depot::open(DepotConfig {
+        root: root.clone(),
+        max_chain_id: 16,
+        file_size_threshold: 1 << 30, // nothing ever rolls on its own
+        eviction_dead_ratio: 0.5,
+    })
+    .unwrap();
+
+    let tier_bytes = |tier: &str| -> u64 {
+        list_files(&root.join(tier))
+            .iter()
+            .map(|p| p.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum()
+    };
+
+    depot.prepend(3, &payload("seed-", 4 * 1024), None, false).unwrap();
+    let n = 50usize;
+    let mut last_f0 = Vec::new();
+    let mut last_f1 = Vec::new();
+    for i in 0..n {
+        last_f0 = payload(&format!("f0-rev-{i:04}-"), 4 * 1024);
+        last_f1 = payload(&format!("f1-rev-{i:04}-"), 1024);
+        depot.prepend(3, &last_f0, Some(&last_f1), false).unwrap();
+    }
+
+    // Pre-collect: every deprecated frame still on disk in the single
+    // current file per tier — and a plain flush must NOT touch it (the
+    // slack is what bounds per-prepend I/O mid-session).
+    assert!(
+        tier_bytes("f0") > (n as u64) * 4 * 1024,
+        "churn must have accumulated dead f0 frames in the current file"
+    );
+    depot.flush().unwrap();
+    assert!(
+        tier_bytes("f0") > (n as u64) * 4 * 1024,
+        "flush must leave the current file's slack alone"
+    );
+
+    depot.collect().unwrap();
+
+    // Post-collect: the fat current files were rolled, evicted, unlinked;
+    // each tier holds roughly one live frame.
+    let f0_after = tier_bytes("f0");
+    let f1_after = tier_bytes("f1");
+    assert!(
+        f0_after < 3 * (4 * 1024 + FRAME_HEADER_LEN as u64),
+        "f0 tier must shrink to ~one live frame, got {f0_after} B"
+    );
+    assert!(
+        f1_after < 3 * (1024 + FRAME_HEADER_LEN as u64),
+        "f1 tier must shrink to ~one live frame, got {f1_after} B"
+    );
+
+    // The live data survived eviction, in-process and across reopen.
+    assert_eq!(depot.read_f0(3).unwrap(), last_f0);
+    assert_eq!(depot.read_f1(3).unwrap(), Some(last_f1.clone()));
+    drop(depot);
+    let depot = Depot::open(DepotConfig {
+        root: root.clone(),
+        max_chain_id: 16,
+        file_size_threshold: 1 << 30,
+        eviction_dead_ratio: 0.5,
+    })
+    .unwrap();
+    assert_eq!(depot.read_f0(3).unwrap(), last_f0);
+    assert_eq!(depot.read_f1(3).unwrap(), Some(last_f1));
+}
+
+// ---------------------------------------------------------------------------
+// eviction_repoints_live_f1_in_victim
+// ---------------------------------------------------------------------------
+
+/// A LIVE f1 frame stranded in a rolled file must survive that file's
+/// eviction: the frame migrates and the owning f0 frame's next_pointer
+/// is patched IN PLACE (SPEC §"Eviction", T == f1 patch). Regression:
+/// tier fds were opened O_APPEND, and Linux pwrite on an O_APPEND fd
+/// ignores its offset — the patch APPENDED garbage to the f0 file and
+/// left the pointer aimed at the unlinked victim.
+#[test]
+fn eviction_repoints_live_f1_in_victim() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let mk = || DepotConfig {
+        root: root.clone(),
+        max_chain_id: 16,
+        file_size_threshold: 32 * 1024,
+        eviction_dead_ratio: 0.5,
+    };
+    let depot = Depot::open(mk()).unwrap();
+
+    // Chain 7's live f1 lands early, in the first f1 file.
+    depot.prepend(7, &payload("b-seed-", 2048), None, false).unwrap();
+    let b_f0 = payload("b-head-", 2048);
+    let b_f1 = payload("b-hist-", 2048);
+    depot.prepend(7, &b_f0, Some(&b_f1), false).unwrap();
+
+    // Chain 3 churns until the early files roll and go majority-dead —
+    // majority, not fully: chain 7's f1 in there is still live.
+    depot.prepend(3, &payload("a-seed-", 4 * 1024), None, false).unwrap();
+    for i in 0..60 {
+        let f0 = payload(&format!("a-f0-{i:03}-"), 4 * 1024);
+        let f1 = payload(&format!("a-f1-{i:03}-"), 2 * 1024);
+        depot.prepend(3, &f0, Some(&f1), false).unwrap();
+    }
+    depot.flush().unwrap(); // opportunistic eviction of rolled files
+
+    // The victim actually went away (otherwise this proves nothing).
+    let f1_names: Vec<String> = list_files(&root.join("f1"))
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !f1_names.iter().any(|n| n == "file-0001"),
+        "first f1 file must have been evicted; got {f1_names:?}"
+    );
+
+    // Chain 7 reads back whole through the patched pointer…
+    assert_eq!(depot.read_f0(7).unwrap(), b_f0);
+    assert_eq!(depot.read_f1(7).unwrap(), Some(b_f1.clone()));
+
+    // …and across a reopen: the patch must be ON DISK, not fd state.
+    drop(depot);
+    let depot = Depot::open(mk()).unwrap();
+    assert_eq!(depot.read_f0(7).unwrap(), b_f0);
+    assert_eq!(depot.read_f1(7).unwrap(), Some(b_f1));
+}

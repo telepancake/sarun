@@ -84,5 +84,11 @@ pub fn sync(
         inst.mark_part_seen(&part.filename, part.sha256.as_deref())?;
         stats.parts_fetched += 1;
     }
+    // Sync session over: reclaim the churn slack (dead superseded heads)
+    // parked in the depot's current write files. Once per sync, not per
+    // part — mid-session the slack is what keeps prepends cheap.
+    if stats.parts_fetched > 0 {
+        inst.collect()?;
+    }
     Ok((run, stats))
 }

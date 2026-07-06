@@ -6,7 +6,7 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 
 | mirror | shape | store | state |
 |---|---|---|---|
-| **wikipedia** | ~99%-identical revision chains per page | `wikimak/*` (depot chains, un-sabotaged 2026-07, 12× measured) | `wikimak` CLI: import/head/text/history + discover/fetch sync with `parts_seen` watermarks |
+| **wikipedia** | ~99%-identical revision chains per page | `wikimak/*` (depot chains, un-sabotaged 2026-07, 138× measured after session-end `collect`) | `wikimak` CLI: import/head/text/history + discover/fetch sync with `parts_seen` watermarks |
 | **IETF drafts** | revision chains per draft name (`draft-x-00..-NN`) — the tiered-VBF doc's other named workload | multi-chain `depot-vbf::VbfDepot` (canonical layers) + sqlite bookkeeping | `ietf-mirror` crate + `ietfmak` CLI: update (idempotent, incremental, 404-watermarked) / list / head / text / history |
 | **git repos** | DAG of tree snapshots, newest-first | `gitdepot` store (tiered four-chain wikimak-depot store — TREES/COMMITS/REFLOG/TAGS with stable indices; annotated tags stored as raw tag objects, nested chains included, tags at trees supported (deduped to a commit's tree or imported as a standalone TREES record; blob-target tags are the only refusal), refs resolve peeled; bounded prepend, proven by roundtrip.rs update_io_is_bounded_not_o_history; SHA-exact export, tag objects verbatim; no re-import path — a rewrite is new records + repointed refs) | import/export/`update` (incremental prepend, rewrites included) + `mirror` (bare-clone fetch loop) |
 

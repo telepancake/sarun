@@ -133,6 +133,10 @@ impl Depot {
 
     pub fn flush(&self) -> Result<()>;
 
+    /// Session-end compaction: run eviction with the current write file
+    /// included (rolled first). See "Eviction".
+    pub fn collect(&self) -> Result<()>;
+
     /// Unlink the depot's cold file, all f0/f1 files, and zero the index.
     /// Used when the caller wants to delete the wiki instance.
     pub fn delete_all(self) -> Result<()>;
@@ -220,9 +224,19 @@ new f0 record per its own discipline, and calls `prepend` once.
 ### Eviction of an f0 or f1 file
 
 Triggered when any file in the tier has `bytes_deprecated / file_size >
-eviction_dead_ratio`. The depot may run this opportunistically during
-`flush` or on a dedicated `maybe_evict` call (left to implementer; tests
-don't pin which). The eviction algorithm:
+eviction_dead_ratio`. Two passes exist and tests pin the split:
+
+- **Opportunistic** (runs on every `flush`): rolled files only. The
+  current write target is exempt — mid-session, its slack is what keeps
+  a prepend O(new frames) instead of O(live set).
+- **`collect`** (session-end): the current write file is a candidate
+  too; it is rolled first (a new current is allocated) so its live
+  frames have somewhere to migrate. Update churn deprecates each prior
+  f0/f1 in place, so on a depot whose current file never crosses
+  `file_size_threshold` ALL the slack parks there; without `collect`
+  it would sit on disk forever. Holes buy nothing at rest.
+
+The eviction algorithm:
 
 Let `V` = the victim file (in tier T ∈ {f0, f1}).
 Let `L` = the current write target in tier T.
