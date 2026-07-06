@@ -584,6 +584,27 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
             const char *self_exe = self_exe_for_class(elf_class);
             if (!self_exe)
                 return args;
+            /* Cross-class handoff sanity: the sibling wrapper must be
+             * there and executable. sud32 is a best-effort build (needs
+             * a 32-bit toolchain), so a 32-bit target on a box whose
+             * engine build skipped it used to fail with a bare
+             * "command not found" — say WHAT is missing instead. The
+             * exec still proceeds (and fails ENOENT) so the caller
+             * sees the same errno; only the diagnosis is new. */
+            if (ir_access(self_exe, X_OK) != 0) {
+                static const char m1[] = "sud: cannot trace ";
+                static const char m2[] =
+                    "-bit target: wrapper missing/unusable: ";
+                static const char m3[] =
+                    " (sud32 is built best-effort by `make engine`; "
+                    "it needs a 32-bit toolchain)\n";
+                const char *cls = (elf_class == ELFCLASS32) ? "32" : "64";
+                raw_write(2, m1, sizeof(m1) - 1);
+                raw_write(2, cls, 2);
+                raw_write(2, m2, sizeof(m2) - 1);
+                raw_write(2, self_exe, strlen(self_exe));
+                raw_write(2, m3, sizeof(m3) - 1);
+            }
             char **na = ensure_args(a, args, nargs, 1, &max_args);
             if (!na) return NULL;
             args = na;

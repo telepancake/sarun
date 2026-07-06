@@ -57,11 +57,21 @@ engine: vendor ## Build the engine (fully-static musl binary; cargo-zigbuild + z
 	@# sud is the DEFAULT run backend: the wrappers must sit next to the
 	@# engine binary (runner::sud_wrapper_paths resolves the sibling).
 	@# sud64 is required; sud32 needs the -m32 toolchain and is best-effort
-	@# (32-bit targets fail loud at run time without it).
+	@# (32-bit targets fail loud at run time without it). The two wrappers
+	@# hand off to each other on cross-class execs, so they MUST come from
+	@# the same build: on a sud32 build failure the release copy is
+	@# REMOVED (a stale sud32 next to a fresh sud64 is a version-skewed
+	@# handoff — silent wedges), and the failure is announced instead of
+	@# swallowed.
 	$(MAKE) -C tv sud64 SUD_ADDINS="$(SUD_ADDINS)"
-	-$(MAKE) -C tv sud32 SUD_ADDINS="$(SUD_ADDINS)" 2>/dev/null
 	@cp tv/sud64 engine/target/x86_64-unknown-linux-musl/release/sud64
-	@-cp tv/sud32 engine/target/x86_64-unknown-linux-musl/release/sud32 2>/dev/null
+	@if $(MAKE) -C tv sud32 SUD_ADDINS="$(SUD_ADDINS)" >/dev/null 2>&1; then \
+	  cp tv/sud32 engine/target/x86_64-unknown-linux-musl/release/sud32; \
+	else \
+	  rm -f engine/target/x86_64-unknown-linux-musl/release/sud32 tv/sud32; \
+	  echo "WARNING: sud32 not built (32-bit toolchain missing?) —" \
+	       "32-bit binaries in sud boxes will fail to exec, loudly."; \
+	fi
 	@echo "→ ./sarun → engine/target/x86_64-unknown-linux-musl/release/sarun"
 
 # ---- Tests ----------------------------------------------------------------
