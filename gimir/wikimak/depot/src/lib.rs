@@ -253,3 +253,52 @@ impl Depot {
         g.delete_all()
     }
 }
+
+/// The NORMATIVE frame codec for chain users (gitdepot, wikipedia,
+/// depot-vbf all frame through here). The load-bearing part is the
+/// WINDOW: an accumulator/cold frame is a solid stream whose
+/// redundancy (the same logical record across revisions) sits far
+/// apart — a level-default window (~2MB at level 3) makes those
+/// matches unreachable at ANY search level (measured 5x size on a
+/// real corpus). Window-log therefore covers the frame, capped at 27
+/// (the decoder's default limit — readers need no configuration),
+/// with long-distance matching on.
+pub fn compress_frame(
+    src: &[u8],
+    prefix: Option<&[u8]>,
+    level: i32,
+) -> std::result::Result<Vec<u8>, String> {
+    let err = |c| zstd::zstd_safe::get_error_name(c).to_string();
+    let mut cctx = zstd::zstd_safe::CCtx::create();
+    cctx.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(level)).map_err(err)?;
+    let wlog = (64 - (src.len().max(1 << 20) as u64).leading_zeros()).min(27);
+    cctx.set_parameter(zstd::zstd_safe::CParameter::WindowLog(wlog)).map_err(err)?;
+    cctx.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(true))
+        .map_err(err)?;
+    if let Some(p) = prefix {
+        cctx.ref_prefix(p).map_err(err)?;
+    }
+    let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(src.len()));
+    cctx.compress2(&mut out, src).map_err(err)?;
+    Ok(out)
+}
+
+/// Decode counterpart of [`compress_frame`] (the wlog-27 cap is what
+/// keeps a default DCtx sufficient).
+pub fn decompress_frame(
+    frame: &[u8],
+    prefix: Option<&[u8]>,
+) -> std::result::Result<Vec<u8>, String> {
+    let err = |c| zstd::zstd_safe::get_error_name(c).to_string();
+    let raw_len = zstd::zstd_safe::get_frame_content_size(frame)
+        .map_err(|_| "zstd frame content size".to_string())?
+        .ok_or_else(|| "zstd frame without content size".to_string())?
+        as usize;
+    let mut dctx = zstd::zstd_safe::DCtx::create();
+    if let Some(p) = prefix {
+        dctx.ref_prefix(p).map_err(err)?;
+    }
+    let mut out = Vec::with_capacity(raw_len);
+    dctx.decompress(&mut out, frame).map_err(err)?;
+    Ok(out)
+}

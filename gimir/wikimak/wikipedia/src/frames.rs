@@ -24,27 +24,12 @@ fn zerr(_e: zstd::zstd_safe::ErrorCode) -> Error {
 
 /// Compress `raw`, optionally refPrefix-anchored on `prefix`.
 pub(crate) fn compress(raw: &[u8], prefix: Option<&[u8]>) -> Result<Vec<u8>> {
-    let mut cctx = zstd::zstd_safe::CCtx::create();
-    cctx.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(LEVEL))
-        .map_err(zerr)?;
-    if let Some(p) = prefix {
-        cctx.ref_prefix(p).map_err(zerr)?;
-    }
-    let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(raw.len()));
-    cctx.compress2(&mut out, raw).map_err(zerr)?;
-    Ok(out)
+    wikimak_depot::compress_frame(raw, prefix, LEVEL)
+        .map_err(|_| Error::Codec("zstd compress"))
 }
 
 /// Decompress a frame produced by [`compress`] with the same `prefix`.
 pub(crate) fn decompress(frame: &[u8], prefix: Option<&[u8]>) -> Result<Vec<u8>> {
-    let raw_len = zstd::zstd_safe::get_frame_content_size(frame)
-        .map_err(|_| Error::Codec("zstd frame content size"))?
-        .ok_or(Error::Codec("zstd frame without content size"))? as usize;
-    let mut dctx = zstd::zstd_safe::DCtx::create();
-    if let Some(p) = prefix {
-        dctx.ref_prefix(p).map_err(zerr)?;
-    }
-    let mut out = Vec::with_capacity(raw_len);
-    dctx.decompress(&mut out, frame).map_err(zerr)?;
-    Ok(out)
+    wikimak_depot::decompress_frame(frame, prefix)
+        .map_err(|_| Error::Codec("zstd decompress"))
 }

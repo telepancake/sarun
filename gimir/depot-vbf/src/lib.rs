@@ -62,28 +62,11 @@ fn zerr(code: zstd::zstd_safe::ErrorCode) -> Error {
 }
 
 fn compress(raw: &[u8], prefix: Option<&[u8]>) -> Result<Vec<u8>, Error> {
-    let mut cctx = zstd::zstd_safe::CCtx::create();
-    cctx.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(3))
-        .map_err(zerr)?;
-    if let Some(p) = prefix {
-        cctx.ref_prefix(p).map_err(zerr)?;
-    }
-    let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(raw.len()));
-    cctx.compress2(&mut out, raw).map_err(zerr)?;
-    Ok(out)
+    wikimak_depot::compress_frame(raw, prefix, 3).map_err(Error::Zstd)
 }
 
 fn decompress(frame: &[u8], prefix: Option<&[u8]>) -> Result<Vec<u8>, Error> {
-    let raw_len = zstd::zstd_safe::get_frame_content_size(frame)
-        .map_err(|_| Error::Zstd("frame content size".into()))?
-        .ok_or_else(|| Error::Zstd("frame without content size".into()))? as usize;
-    let mut dctx = zstd::zstd_safe::DCtx::create();
-    if let Some(p) = prefix {
-        dctx.ref_prefix(p).map_err(zerr)?;
-    }
-    let mut out = Vec::with_capacity(raw_len);
-    dctx.decompress(&mut out, frame).map_err(zerr)?;
-    Ok(out)
+    wikimak_depot::decompress_frame(frame, prefix).map_err(Error::Zstd)
 }
 
 fn delimit(records: &[Vec<u8>]) -> Vec<u8> {

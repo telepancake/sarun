@@ -315,25 +315,9 @@ fn zstd_err(code: zstd::zstd_safe::ErrorCode) -> Error {
 }
 
 pub(crate) fn compress(src: &[u8], prefix: Option<&[u8]>, level: i32) -> Result<Vec<u8>> {
-    let mut cctx = zstd::zstd_safe::CCtx::create();
-    cctx.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(level))
-        .map_err(zstd_err)?;
-    // The accumulator/cold frames hold MANY records; cross-record
-    // redundancy (the same file's blob edited across revisions) sits
-    // far apart in the raw stream — beyond the level-default window
-    // (~2MB at level 3), those matches are silently lost. Window must
-    // cover the frame; LDM finds the distant repeats cheaply.
-    let wlog = (64 - (src.len().max(1 << 20) as u64).leading_zeros()).min(27);
-    cctx.set_parameter(zstd::zstd_safe::CParameter::WindowLog(wlog))
-        .map_err(zstd_err)?;
-    cctx.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(true))
-        .map_err(zstd_err)?;
-    if let Some(p) = prefix {
-        cctx.ref_prefix(p).map_err(zstd_err)?;
-    }
-    let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(src.len()));
-    cctx.compress2(&mut out, src).map_err(zstd_err)?;
-    Ok(out)
+    // Window/LDM discipline lives in the depot's normative frame
+    // codec — shared by every chain user.
+    wikimak_depot::compress_frame(src, prefix, level).map_err(Error::Chain)
 }
 
 pub(crate) fn decompress(frame: &[u8], prefix: Option<&[u8]>) -> Result<Vec<u8>> {
