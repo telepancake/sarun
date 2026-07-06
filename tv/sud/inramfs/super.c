@@ -222,6 +222,12 @@ void sud_ir_inode_free(uint32_t index)
             ino->u.reg.tag = SUD_IR_REG_SMALL;
             ino->u.reg.u.small.start_block = 0;
             ino->u.reg.u.small.nblocks     = 0;
+        } else if (ino->type == SUD_IR_T_FIFO) {
+            /* Drop the backing real fifo; open fds keep working (the
+             * kernel reclaims the pipe on last close). */
+            char p[PATH_MAX];
+            sud_ir_fifo_path(index, ino->generation, p, sizeof(p));
+            raw_syscall6(SYS_unlinkat, AT_FDCWD, (long)p, 0, 0, 0, 0);
         } else if (ino->type == SUD_IR_T_DIR && ino->u.dir.dirblock_head_offset) {
             uint32_t off = ino->u.dir.dirblock_head_offset;
             while (off) {
@@ -549,6 +555,14 @@ void sud_ir_large_path(uint32_t idx, uint32_t gen,
                        char *out, size_t out_sz)
 {
     snprintf(out, out_sz, "/dev/shm/sud-inramfs.%s.f.%u.%u",
+             g_shm_key, idx, gen);
+}
+
+/* Backing REAL fifo for a SUD_IR_T_FIFO inode ("p" = pipe). */
+void sud_ir_fifo_path(uint32_t idx, uint32_t gen,
+                      char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "/dev/shm/sud-inramfs.%s.p.%u.%u",
              g_shm_key, idx, gen);
 }
 

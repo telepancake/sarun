@@ -277,6 +277,17 @@ long sud_inramfs_op_open_inode(uint32_t inode_idx, int flags)
         if ((flags & O_ACCMODE) != O_RDONLY) return -EISDIR;
     }
 
+    /* FIFO: hand back a REAL fd on the backing kernel fifo — full pipe
+     * semantics (a blocking open blocks HERE, exactly as the caller's
+     * open would have). Deliberately NOT registered in the fd table:
+     * read/write/poll/close on the fd go straight to the kernel. */
+    if (ino->type == SUD_IR_T_FIFO) {
+        char p[PATH_MAX];
+        sud_ir_fifo_path(inode_idx, ino->generation, p, sizeof(p));
+        return raw_syscall6(SYS_openat, AT_FDCWD, (long)p,
+                            flags & ~(O_CREAT | O_EXCL), 0, 0, 0);
+    }
+
     /* O_TRUNC on regular files. */
     if ((flags & O_TRUNC) && ino->type == SUD_IR_T_REG
         && (flags & O_ACCMODE) != O_RDONLY) {

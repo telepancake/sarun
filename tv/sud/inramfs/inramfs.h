@@ -159,6 +159,13 @@ long sud_inramfs_resolve_inode(const char *abs_path, int follow,
  * inramfs's public API free of any string path arguments — see
  * PLAN.md "Net result". */
 long sud_inramfs_op_open_inode(uint32_t inode_idx, int flags);
+
+/* mknod(S_IFIFO) under the mount: FIFO inode + backing real kernel
+ * fifo (see SUD_IR_T_FIFO). Only fifos; other node types are the
+ * caller's problem. */
+long sud_inramfs_op_mkfifo_at_inode(uint32_t parent_idx,
+                                    const char *name, size_t name_len,
+                                    int mode);
 long sud_inramfs_op_create_open_inode(uint32_t parent_idx,
                                       const char *name, size_t name_len,
                                       int flags, int mode);

@@ -53,6 +53,7 @@ static uint8_t d_type_from_ino(const struct sud_ir_inode *ino)
         case SUD_IR_T_REG: return DT_REG;
         case SUD_IR_T_DIR: return DT_DIR;
         case SUD_IR_T_LNK: return DT_LNK;
+        case SUD_IR_T_FIFO: return DT_FIFO;
     }
     return DT_UNKNOWN;
 }
@@ -65,6 +66,7 @@ static uint32_t full_mode(const struct sud_ir_inode *ino)
         case SUD_IR_T_REG: base = S_IFREG; break;
         case SUD_IR_T_DIR: base = S_IFDIR; break;
         case SUD_IR_T_LNK: base = S_IFLNK; break;
+        case SUD_IR_T_FIFO: base = S_IFIFO; break;
     }
     return base | (ino->mode & 07777);
 }
@@ -1104,6 +1106,7 @@ static long create_at_inode(uint32_t pidx, const char *base, size_t blen,
     }
     uint8_t dt = (type == SUD_IR_T_DIR) ? DT_DIR
                 : (type == SUD_IR_T_LNK) ? DT_LNK
+                : (type == SUD_IR_T_FIFO) ? DT_FIFO
                 : DT_REG;
     int rc = sud_ir_dir_link(pidx, base, blen, new_idx, dt);
     if (rc) {
@@ -1113,6 +1116,38 @@ static long create_at_inode(uint32_t pidx, const char *base, size_t blen,
     }
     if (out_idx) *out_idx = new_idx;
     sud_ir_unlock(&sb->lock);
+    return 0;
+}
+
+static long unlink_at_inode_internal(uint32_t parent_idx,
+                                     const char *name, size_t name_len,
+                                     int want_dir);
+
+/* mkfifo: allocate a FIFO inode AND materialize its backing REAL
+ * kernel fifo under /dev/shm, so opens get true fifo semantics
+ * (blocking open, pipe buffering) across every traced process that
+ * shares the region. Fail-closed: if the backing mknod fails, the
+ * namespace entry is rolled back. */
+long sud_inramfs_op_mkfifo_at_inode(uint32_t parent_idx,
+                                    const char *name, size_t name_len,
+                                    int mode)
+{
+    uint32_t idx = 0;
+    long rc = create_at_inode(parent_idx, name, name_len,
+                              SUD_IR_T_FIFO, (uint32_t)mode, 0, &idx);
+    if (rc) return rc;
+    struct sud_ir_inode *ino = sud_ir_inode_get(idx);
+    if (!ino) return -EIO;
+    char p[PATH_MAX];
+    sud_ir_fifo_path(idx, ino->generation, p, sizeof(p));
+    /* A stale object from a recycled (idx,gen) pair: clear it first. */
+    raw_syscall6(SYS_unlinkat, AT_FDCWD, (long)p, 0, 0, 0, 0);
+    long mk = raw_syscall6(SYS_mknodat, AT_FDCWD, (long)p,
+                           S_IFIFO | 0600, 0, 0, 0);
+    if (mk < 0) {
+        (void)unlink_at_inode_internal(parent_idx, name, name_len, 0);
+        return mk;
+    }
     return 0;
 }
 

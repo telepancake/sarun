@@ -92,6 +92,14 @@ enum {
     SUD_IR_T_REG  = 1,
     SUD_IR_T_DIR  = 2,
     SUD_IR_T_LNK  = 3,
+    /* Named pipe. The inode carries NO data — a REAL kernel fifo is
+     * materialized at /dev/shm/sud-inramfs.<key>.p.<idx>.<gen> at mknod
+     * time, and open() of the inode raw-opens that fifo (full kernel
+     * fifo semantics: blocking opens, pipe buffering, poll). GNU make
+     * 4.4's jobserver is a named fifo in /tmp — without this, every
+     * `make -j` under a sud box died or wedged on
+     * "cannot open jobserver /tmp/GMfifoNNN". */
+    SUD_IR_T_FIFO = 4,
 };
 
 /* ---- Inode ----------------------------------------------------- */
@@ -395,6 +403,8 @@ int  sud_ir_large_open(uint32_t file_idx, uint32_t file_gen);
  * fd (separate from the cache maintained by sud_ir_large_open). */
 void sud_ir_large_path(uint32_t idx, uint32_t gen,
                        char *out, size_t out_sz);
+void sud_ir_fifo_path(uint32_t idx, uint32_t gen,
+                      char *out, size_t out_sz);
 
 /* ftruncate the per-file shm to `size`.  Returns 0 / -errno. */
 int  sud_ir_large_ftruncate(uint32_t file_idx, uint32_t file_gen,

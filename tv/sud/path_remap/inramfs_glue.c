@@ -249,6 +249,37 @@ static long h_access_a2(struct sud_syscall_ctx *c,
 /* ---- mkdir / rmdir / unlink ----
  * These take parent + basename, so the dispatch row sets
  * want_parent=1.  Mount-root special-cases match Linux semantics. */
+/* mknod under the mount. S_IFIFO (or an explicit S_IFREG / bare-mode
+ * regular) only — sockets/devices have no inramfs representation and
+ * get -EPERM, same as most real filesystems for unprivileged mknod. */
+static long h_mknod_common(const struct sud_pr_inramfs_ticket *t,
+                           int mode)
+{
+    if (t->is_mount_root || t->leaf_idx) return -EEXIST;
+    int fmt = mode & S_IFMT;
+    if (fmt == S_IFIFO)
+        return sud_inramfs_op_mkfifo_at_inode(t->parent_idx,
+                                              t->basename,
+                                              t->basename_len, mode);
+    if (fmt == 0 || fmt == S_IFREG) {
+        long fd = sud_inramfs_op_create_open_inode(t->parent_idx,
+                                                   t->basename,
+                                                   t->basename_len,
+                                                   O_CREAT | O_EXCL | O_WRONLY,
+                                                   mode & 07777);
+        if (fd < 0) return fd;
+        sud_inramfs_op_close((int)fd);
+        return 0;
+    }
+    return -EPERM;
+}
+static long h_mknod_a1(struct sud_syscall_ctx *c,
+                       const struct sud_pr_inramfs_ticket *t)
+{ return h_mknod_common(t, (int)c->args[1]); }
+static long h_mknod_a2(struct sud_syscall_ctx *c,
+                       const struct sud_pr_inramfs_ticket *t)
+{ return h_mknod_common(t, (int)c->args[2]); }
+
 static long h_mkdir_a1(struct sud_syscall_ctx *c,
                        const struct sud_pr_inramfs_ticket *t)
 {
@@ -457,6 +488,12 @@ static const struct ir_path_row ir_path_dispatch[] = {
     /* directory ops — want_parent=1. */
 #ifdef SYS_mkdir
     ROW(SYS_mkdir,    -1, 0, 0, 1, h_mkdir_a1),
+#endif
+#ifdef SYS_mknod
+    ROW(SYS_mknod,    -1, 0, 0, 1, h_mknod_a1),
+#endif
+#ifdef SYS_mknodat
+    ROW(SYS_mknodat,   0, 1, 0, 1, h_mknod_a2),
 #endif
 #ifdef SYS_mkdirat
     ROW(SYS_mkdirat,   0, 1, 0, 1, h_mkdir_a2),
