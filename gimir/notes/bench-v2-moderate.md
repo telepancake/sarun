@@ -57,3 +57,31 @@ threshold is already in). Same store, same deep sha (main~400):
 threshold, so its cold tier differs from the original 2026-07-06 run;
 same pathology, same O(depth × tree) shape.) Deep access is now ~1ms/step
 + one full-view re-encode per cold frame — well under the 2s target.
+
+## 2026-07-06 — real repo (ripgrep, 2252 commits, 222 files / 3.1MB tree)
+
+Branches-only (annotated tags BLOCK the mirror — must-fix, see below);
+baseline pack `repack -adf` = 3.40MB.
+
+| op | gitdepot v2 | git |
+|---|---|---|
+| full import | 84.6s (~38ms/commit; ls-tree+cat-file per commit) | clone 1.3s |
+| store | 8.7MB = f1 7.6 + f0 0.6 + sqlite 0.5, cold 0, zero dead | 3.40MB (2.6×) |
+| no-op tick | 0.10s | ~0.1s |
+| 1-commit update | 0.36s | ~instant |
+| tip decode+ls | 13ms | archive 19ms (parity) |
+| 400-deep | 228ms | 31ms |
+| 2000-deep | 203ms (FLAT — one f1 frame) | 32ms |
+
+Attribution: size gap = whole-blob-per-touched-file records vs git's
+intra-blob xdelta (lever if needed: byte-delta encoding inside
+records). Import cost = per-commit subprocess round-trips (lever:
+fast-export streaming importer). Deep access flat-in-depth while
+history fits one accumulator frame; checkpoints only matter once many
+cold frames exist.
+
+FINDINGS: (1) annotated tags abort mirror ("out of scope") — real
+repos all have them; peel to commit + preserve tag object in meta for
+SHA-exact export. (2) git archive is depth-independent (~30ms) —
+content addressing; our 6-7× constant at depth is acceptable, the
+asymptotics are not worse than one frame decode + k applies.
