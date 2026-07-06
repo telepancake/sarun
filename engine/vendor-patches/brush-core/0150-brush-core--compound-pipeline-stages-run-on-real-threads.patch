@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Mon, 06 Jul 2026 09:34:03 +0000
+Subject: [PATCH] brush-core: compound pipeline stages run on real threads
+
+---
+diff --git a/src/interp.rs b/src/interp.rs
+index 318823e..2256c0a 100644
+--- a/src/interp.rs
++++ b/src/interp.rs
+@@ -701,21 +701,35 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
+                 // to completion while holding the pipe writer deadlocks once
+                 // its output exceeds the pipe buffer with the reader stage
+                 // not yet spawned (configure's `(set) 2>&1 | sed …` cache
+-                // dump, >64K). bash forks every stage; we spawn a task.
++                // dump, >64K). bash forks every stage; we give each stage a
++                // REAL THREAD (spawn_blocking), not a plain tokio task: the
++                // shell runs on a current-thread runtime, and pipeline
++                // stages do BLOCKING pipe reads/writes — two compound
++                // stages as tasks on one worker starve each other the
++                // moment the reader outruns the writer (an empty-pipe
++                // blocking read parks the only worker and the writer task
++                // never runs again: `{ find …; } | while read …` wedged
++                // forever under sud, where the slower traced syscalls made
++                // the reader win the race every time).
+                 if let commands::ShellForCommand::OwnedShell { target, .. } =
+                     pipeline_context.shell
+                 {
+                     let mut sub = *target;
+                     let compound = compound.clone();
+                     let redirects = redirects.clone();
+-                    let join_handle = tokio::spawn(async move {
+-                        if let Some(redirects) = &redirects {
+-                            for redirect in &redirects.0 {
+-                                setup_redirect(&mut sub, &mut params, redirect)
+-                                    .await?;
++                    let join_handle = tokio::task::spawn_blocking(move || {
++                        let rt = tokio::runtime::Builder::new_current_thread()
++                            .enable_all()
++                            .build()?;
++                        rt.block_on(async move {
++                            if let Some(redirects) = &redirects {
++                                for redirect in &redirects.0 {
++                                    setup_redirect(&mut sub, &mut params, redirect)
++                                        .await?;
++                                }
+                             }
+-                        }
+-                        compound.execute(&mut sub, &params).await
++                            compound.execute(&mut sub, &params).await
++                        })
+                     });
+                     return Ok(ExecutionSpawnResult::StartedTask(join_handle));
+                 }
+@@ -733,14 +747,20 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
+                     .into())
+             }
+             Self::Function(func) => {
+-                // sarun: same concurrency requirement as Compound above.
++                // sarun: same concurrency requirement (and same blocking-
++                // starvation hazard) as Compound above — real thread.
+                 if let commands::ShellForCommand::OwnedShell { target, .. } =
+                     pipeline_context.shell
+                 {
+                     let mut sub = *target;
+                     let func = func.clone();
+-                    let join_handle = tokio::spawn(async move {
+-                        func.execute(&mut sub, &params).await
++                    let join_handle = tokio::task::spawn_blocking(move || {
++                        let rt = tokio::runtime::Builder::new_current_thread()
++                            .enable_all()
++                            .build()?;
++                        rt.block_on(async move {
++                            func.execute(&mut sub, &params).await
++                        })
+                     });
+                     return Ok(ExecutionSpawnResult::StartedTask(join_handle));
+                 }
