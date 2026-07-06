@@ -368,6 +368,9 @@ fn cycle_pick<T: Copy>(items: &[T], i: usize, dir: isize) -> Option<T> {
 enum Modal {
     /// A y/n confirmation. `action` names the destructive op to run on 'y'.
     Confirm { prompt: String, action: ConfirmAction },
+    /// A read-only text report (e.g. the `stuck` wedge diagnosis). Esc/q
+    /// closes; content is preformatted lines.
+    Report { title: String, lines: Vec<String> },
     /// Clause filter editor of the focused list view (the '/' SearchModal — a
     /// reusable ClauseList). `view` is the list it filters; `kinds` the user
     /// Match vocabulary it offers; `rows` the editable clause rows (enabled ·
@@ -552,6 +555,9 @@ enum Action {
     /// open a Confirm modal so they're never a one-keystroke accident.
     DissolveBox,
     KillBox,
+    /// Wedge diagnosis: run the `stuck` verb on the selected box and show
+    /// each live process's state/wchan/syscall in a Report modal.
+    StuckBox,
     StartRename,
     EditRule,
     NewRule,
@@ -4418,6 +4424,51 @@ impl App {
     }
 
 
+    /// Wedge diagnosis (`stuck` verb): every live process of the selected
+    /// box with its state / kernel wchan / current syscall, in a Report
+    /// modal. The answer to "the box hangs — WHERE?" without leaving the UI.
+    #[cfg_attr(test, allow(dead_code))]
+    fn stuck_box(&mut self) {
+        let Some(sid) = self.cur_sid() else {
+            self.status = "no box selected".into();
+            return;
+        };
+        match rpc(&self.sock, "stuck", json!([sid.clone()])) {
+            Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) => {
+                let empty = vec![];
+                let procs = r.get("procs").and_then(Value::as_array)
+                    .unwrap_or(&empty);
+                let mut lines = vec![format!(
+                    "{:>8} {:>2} {:>18} {:>8}  {}",
+                    "PID", "ST", "WCHAN", "SYSCALL", "COMM")];
+                for p in procs {
+                    let g = |k: &str| p.get(k).and_then(Value::as_str)
+                        .unwrap_or("").to_string();
+                    lines.push(format!(
+                        "{:>8} {:>2} {:>18} {:>8}  {}",
+                        p.get("pid").and_then(Value::as_i64).unwrap_or(0),
+                        g("state"), g("wchan"), g("syscall"), g("comm")));
+                }
+                if procs.is_empty() {
+                    lines.push("(no live processes — the tree exited; \
+                                the runner may be stuck in teardown)".into());
+                }
+                lines.push(String::new());
+                lines.push("R + wchan '-' = userspace spin · S = sleeping \
+                            in the named wait channel".into());
+                self.modal = Some(Modal::Report {
+                    title: format!(" stuck · box {sid} "),
+                    lines,
+                });
+            }
+            Ok(r) => {
+                self.status = r.get("error").and_then(Value::as_str)
+                    .unwrap_or("stuck: failed").to_string();
+            }
+            Err(e) => { self.status = format!("stuck: {e}"); }
+        }
+    }
+
     #[cfg_attr(test, allow(dead_code))]
     fn dissolve(&mut self) {
         let (ok, err, why) = self.box_op_over_selection("dissolve");
@@ -6748,6 +6799,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             (models.len() as u16 + 1).clamp(1, 18) + 7,
         // 3 fields + header + result + help + borders.
         Modal::ApiConfig { .. } => 11,
+        Modal::Report { lines, .. } => (lines.len() as u16) + 4,
         _ => 7,
     };
     let hgt = want.min(area.height);
@@ -6757,6 +6809,10 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     // clear behind the modal
     f.render_widget(ratatui::widgets::Clear, rect);
     let (title_s, body): (&str, Vec<Line>) = match modal {
+        Modal::Report { title, lines } => (
+            title.as_str(),
+            lines.iter().map(|l| Line::from(l.clone())).collect(),
+        ),
         Modal::Confirm { prompt, .. } => (
             " confirm ",
             vec![Line::from(prompt.clone()), Line::from(""), Line::from("y = yes · n / Esc = cancel")],
@@ -12047,6 +12103,7 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                    Action::DissolveBox),
                 mk("Discard ALL changes", "x",    Action::DiscardBox),
                 mk("Kill (SIGTERM)",    "K",      Action::KillBox),
+                mk("Diagnose stuck (wchan/syscall)", "", Action::StuckBox),
                 mk("Rename box",        "r/F6",   Action::StartRename),
                 mk("New box from image…", "F7",   Action::NewFromImage),
                 mk("oaita agent session on this box…", "",
@@ -12141,6 +12198,7 @@ fn run_action(app: &mut App, a: Action) {
                             app.box_op_scope_label()),
             action: ConfirmAction::Dissolve,
         }),
+        Action::StuckBox       => app.stuck_box(),
         Action::KillBox        => app.modal = Some(Modal::Confirm {
             prompt: format!("Kill (SIGTERM) {}?", app.box_op_scope_label()),
             action: ConfirmAction::Kill,
@@ -12287,6 +12345,12 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             match code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
                 _ => app.modal = Some(Modal::ImageView { title, note, sixel, cells }),
+            }
+        }
+        Modal::Report { title, lines } => {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
+                _ => app.modal = Some(Modal::Report { title, lines }),
             }
         }
         Modal::Search { view, kinds, mut rows, mut sel, mut field } => {
