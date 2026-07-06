@@ -13,7 +13,7 @@ is unchanged. This proves all three with REAL effects (not shape):
     PARENT (now top-level) then reaches the host.
   • discard COPY-DOWN: a parent path a child inherited (never touched) →
     discarding it in the parent copies it DOWN so the child still resolves it;
-    the host is untouched. Also proven via finalize_by_rules (dissolve path).
+    the host is untouched. Also proven via the dissolve copy-down path.
   • top-level apply still WRITES the host (no regression).
 
 Boxes are built at-rest (sqlar only) via the Python module helpers, exactly as
@@ -215,12 +215,9 @@ def main():
                 if m.sqlar_path(s).exists():
                     m.sync_request(sock, type="ui", verb="delete", args=[s])
 
-        # ── 2b: discard copy-down ALSO via finalize_by_rules (dissolve) ──────
-        # A discard RULE keeps the inherited file off the host on dissolve; the
-        # ONLY way the child keeps seeing it is the finalize discard pass copying
-        # it down. (test_engine_rs covers this for a copy-down-then-free path;
-        # here we additionally assert the finalize DISCARD set itself copies
-        # down — the gap the audit named: finalize split-but-did-not-copy-down.)
+        # ── 2b: dissolve copies the inherited file DOWN into the child ───────
+        # Dissolve never writes the host (rules or not); the ONLY way the child
+        # keeps seeing the inherited file is dissolve\'s copy-down pass.
         rules_f = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.NEST" / "filerules"
         rules_f.parent.mkdir(parents=True, exist_ok=True)
         rules_f.write_text("discard **/*.inh\n")
@@ -234,8 +231,7 @@ def main():
             dr = (m.sync_request(sock, type="ui", verb="dissolve", args=[fpid])
                   or {}).get("r") or {}
             check(dr.get("ok") is True,
-                  "finalize-copydown: dissolve (finalize_by_rules) of a box with a "
-                  "child succeeds")
+                  "finalize-copydown: dissolve of a box with a child succeeds")
             check(not host_finh.exists(),
                   "finalize-copydown: discard-ruled inherited file NOT applied to host")
             check(m.sqlar_content(m.sqlar_path(fcid), "root/fin_shared.inh")

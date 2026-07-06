@@ -548,7 +548,7 @@ enum Action {
     ApplyBox,
     DiscardBox,
     /// Box removal from the context menu, mirroring the K / D keys: dissolve
-    /// (finalize by rules, keep children, remove) and kill (SIGTERM). Both
+    /// (changes promoted down into children, remove) and kill (SIGTERM). Both
     /// open a Confirm modal so they're never a one-keystroke accident.
     DissolveBox,
     KillBox,
@@ -7347,7 +7347,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('A'), PaneGate::Any,             PaneAction::ApplyAll,        Some("apply ALL the box's changes")),
     (Key::Char('X'), PaneGate::Any,             PaneAction::DiscardAll,      Some("discard ALL the box's changes")),
     (Key::Char('K'), PaneGate::Any,             PaneAction::ConfirmKill,     Some("kill box (SIGTERM, y/n)")),
-    (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("delete box: finalize changes by file-rules, keep child boxes (y/n)")),
+    (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("delete box: changes promoted down into children, never to host (y/n)")),
     (Key::Char('t'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleTree,  Some("toggle tree / flat chronological (on Pipes)")),
     (Key::Char('f'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleRunningOnly, Some("toggle running-only (on Pipes)")),
     (Key::Char('f'), PaneGate::On(Pane::Processes), PaneAction::ToggleProcRunning, Some("toggle running-only (on Procs)")),
@@ -7396,9 +7396,9 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
             action: ConfirmAction::Kill,
         }),
         PaneAction::ConfirmDissolve => app.modal = Some(Modal::Confirm {
-            prompt: format!("Delete {}? Changes are finalized by your \
-                             file-rules (apply-matched → host, the rest \
-                             discarded); any nested child boxes are kept.",
+            prompt: format!("Delete {}? Its changes are promoted down into \
+                             child boxes (never to the host); children are \
+                             kept and re-parented.",
                             app.box_op_scope_label()),
             action: ConfirmAction::Dissolve,
         }),
@@ -12001,7 +12001,7 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
             let mut items = vec![
                 mk("Open changes view", "Enter",  Action::OpenSelection),
                 mk("Apply ALL changes to host", "a", Action::ApplyBox),
-                mk("Delete box (finalize by rules, keep child boxes)", "D",
+                mk("Delete box (changes promoted down, keep child boxes)", "D",
                    Action::DissolveBox),
                 mk("Discard ALL changes", "x",    Action::DiscardBox),
                 mk("Kill (SIGTERM)",    "K",      Action::KillBox),
@@ -12092,9 +12092,9 @@ fn run_action(app: &mut App, a: Action) {
         Action::ApplyBox       => app.apply(),
         Action::DiscardBox     => app.discard(),
         Action::DissolveBox    => app.modal = Some(Modal::Confirm {
-            prompt: format!("Delete {}? Changes are finalized by your \
-                             file-rules (apply-matched → host, the rest \
-                             discarded); any nested child boxes are kept.",
+            prompt: format!("Delete {}? Its changes are promoted down into \
+                             child boxes (never to the host); children are \
+                             kept and re-parented.",
                             app.box_op_scope_label()),
             action: ConfirmAction::Dissolve,
         }),
@@ -13127,14 +13127,14 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             else if app.focus == Pane::Changes { app.discard(); }
                             else if app.focus == Pane::Rules { app.delete_rule(); }
                             else if app.focus == Pane::Sessions {
-                                // Box "Delete" = dissolve (finalize by rules,
-                                // keep children); guarded by a Confirm modal.
+                                // Box "Delete" = dissolve (changes promoted
+                                // down, keep children); Confirm-guarded.
                                 app.modal = Some(Modal::Confirm {
-                                    prompt: format!("Delete {}? Changes are \
-                                        finalized by your file-rules \
-                                        (apply-matched → host, the rest \
-                                        discarded); any nested child boxes \
-                                        are kept.", app.box_op_scope_label()),
+                                    prompt: format!("Delete {}? Its changes \
+                                        are promoted down into child boxes \
+                                        (never to the host); children are \
+                                        kept and re-parented.",
+                                        app.box_op_scope_label()),
                                     action: ConfirmAction::Dissolve,
                                 });
                             }

@@ -918,8 +918,15 @@ pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
     let mut errors = vec![];
     for rel in paths_arg(id, paths) {
         let rel = rel.trim_start_matches('/').to_string();
+        // Sibling preservation FIRST (fail-closed): the promote below mutates
+        // the parent/host every sibling reads through — each sibling that
+        // inherits `rel` snapshots its current view as its own row before the
+        // bytes underneath it change. Direct children of the applied box need
+        // nothing: they read the same content through the promoted row.
         let result = if ro_parent {
             Err("parent is read-only (--readonly-parent); apply refused".into())
+        } else if let Err(e) = preserve_sibling_views(id, &rel, ctx) {
+            Err(e)
         } else { match parent {
             Some(p) => {
                 // Nested box: promote into the parent's overlay, not the host.
@@ -1147,50 +1154,6 @@ pub fn discard_hunk(id: i64, rel: &str, index: i64) -> Value {
     json!({"ok": true})
 }
 
-/// finalize_by_rules: split the box's changes by the file rules — apply the
-/// apply-matched paths to the host, discard everything else (the rest copies
-/// nowhere for a top-level box). Used by dissolve. Returns {applied, discarded,
-/// errors}; non-empty errors mean the caller must NOT free the box.
-pub fn finalize_by_rules(id: i64, ctx: &NestCtx) -> Value {
-    let rules = crate::rules::Rules::load();
-    // Box display name (only resolved when a rule actually needs it).
-    let box_name = if rules.needs_box() {
-        crate::discover::display_path(&crate::discover::discover(), id)
-    } else { String::new() };
-    let mut apply_paths = vec![];
-    let mut discard_paths = vec![];
-    for e in session_changes(id).as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-        let rel = e.get("path").and_then(Value::as_str).unwrap_or("").to_string();
-        // The change's FIRST-WRITER provenance (exe/cwd/argv) + box, so a
-        // process-/box-scoped rule decides exactly as the Python FileRules.
-        let mut subject = crate::rules::Subject {
-            box_name: box_name.clone(), ..Default::default() };
-        if rules.needs_proc() {
-            let prov = crate::discover::first_writer_prov(id, &rel);
-            subject.exe = prov.get("exe").and_then(Value::as_str).unwrap_or("").to_string();
-            subject.cwd = prov.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
-            subject.argv = prov.get("argv").and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-        }
-        match rules.decide(&rel, &subject) {
-            Some(crate::rules::Action::Apply) => apply_paths.push(Value::from(rel)),
-            _ => discard_paths.push(Value::from(rel)),  // discard / passthrough / none
-        }
-    }
-    let ar = apply(id, &Value::Array(apply_paths), ctx);
-    // The discard pass now copies each path DOWN into immediate children that
-    // inherit it (discard() does this) before dropping the row — so a finalized
-    // box with children preserves each child's merged view, matching Python.
-    let dr = discard(id, &Value::Array(discard_paths), ctx);
-    let mut errs = ar.get("errors").and_then(Value::as_array).cloned()
-        .unwrap_or_default();
-    errs.extend(dr.get("errors").and_then(Value::as_array).cloned().unwrap_or_default());
-    json!({"applied": ar.get("applied").cloned().unwrap_or(json!([])),
-           "discarded": dr.get("discarded").cloned().unwrap_or(json!([])),
-           "errors": Value::Array(errs)})
-}
-
 /// One source entry's full record (the sqlar row + its side-table rows), read
 /// once from the source box's at-rest sqlar so the writers below never re-read.
 struct SrcEntry {
@@ -1369,6 +1332,126 @@ pub fn promote_into_parent(box_id: i64, parent: i64,
     };
     let tombstone_as_whiteout = lower_has(parent, rel);
     promote_record(&e, box_id, parent, parent_live, rel, tombstone_as_whiteout)
+}
+
+/// apply's SIBLING preservation (the three-action model: apply promotes a
+/// box's changes UP into its parent — or the host — but must not change any
+/// OTHER box's merged view). `a`'s direct children are safe by construction
+/// (they read the same bytes through `a`'s consumed row's destination), but
+/// `a`'s SIBLINGS — every other box with the same parent (for a top-level
+/// box: every other top-level box) — read the parent/host `a` is about to
+/// mutate. Before the promote, each sibling that inherits `rel` (no own row)
+/// gets its CURRENT view snapshotted as its own row: the first parent-chain
+/// box owning `rel` copies down (a whiteout stays a whiteout via
+/// copy_down_entry), and a chain miss snapshots the real host entry — where
+/// an ABSENT host path becomes a whiteout, so a sibling doesn't suddenly see
+/// the file `a` is newly creating. Fail-closed: an error means the caller
+/// must NOT promote this path.
+pub fn preserve_sibling_views(a: i64, rel: &str, ctx: &NestCtx)
+    -> Result<(), String> {
+    let rel = rel.trim_start_matches('/');
+    let boxes = crate::discover::discover();
+    let parent = boxes.get(&a).and_then(|b| b.parent);
+    let sibs: Vec<i64> = boxes.values()
+        .filter(|b| b.parent == parent && b.box_id != a)
+        .map(|b| b.box_id).collect();
+    if sibs.is_empty() {
+        return Ok(());
+    }
+    // The source of the siblings' current view of `rel`: the first box in the
+    // parent chain (starting AT the parent) with an own row; None = the view
+    // falls through every box to the real host.
+    let mut src: Option<i64> = None;
+    let mut cur = parent;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(o) = cur {
+        if !seen.insert(o) { break; }
+        if own_kind(o, rel).is_some() { src = Some(o); break; }
+        cur = boxes.get(&o).and_then(|b| b.parent);
+    }
+    for s in sibs {
+        let live = ctx.live(s);
+        match src {
+            Some(o) => copy_down_entry(o, s, rel, live.as_deref())
+                .map_err(|e| format!("preserve sibling {s}: {e}"))?,
+            None => snapshot_host_into(s, live.as_deref(), rel)
+                .map_err(|e| format!("preserve sibling {s}: {e}"))?,
+        }
+    }
+    Ok(())
+}
+
+/// Snapshot the HOST's current entry at `rel` into box `dst` as its own row —
+/// sibling preservation when the old view fell through the whole chain to the
+/// real host. Only if `dst` has no own row (same guard as copy_down_entry).
+/// An ABSENT host path snapshots as a whiteout: the sibling's old view was
+/// "no such file" and must stay that way once the host gains the file.
+fn snapshot_host_into(dst: i64, dst_live: Option<&crate::capture::BoxState>,
+                      rel: &str) -> Result<(), String> {
+    let rel = rel.trim_start_matches('/');
+    let has = open_ro(dst)
+        .map(|c| crate::depot::archive_exists(&c, rel))
+        .unwrap_or(false);
+    if has {
+        return Ok(());
+    }
+    let host = Path::new("/").join(rel);
+    let cc = open_rw(dst).ok_or("destination archive unavailable")?;
+    let md = host.symlink_metadata();
+    let result: Result<(), String> = (|| {
+        let Ok(md) = md else {
+            crate::depot::archive_upsert(&cc, rel, S_IFCHR, 0, 0, None, 0)?;
+            return Ok(());
+        };
+        use std::os::unix::fs::MetadataExt;
+        let mode = md.mode();
+        let mtime_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
+        match mode & S_IFMT {
+            S_IFLNK => {
+                let tgt = std::fs::read_link(&host)
+                    .map_err(|e| e.to_string())?;
+                let bytes = tgt.as_os_str().as_encoded_bytes().to_vec();
+                crate::depot::archive_upsert(&cc, rel, mode, mtime_ns,
+                                             bytes.len() as i64,
+                                             Some(&bytes), 0)?;
+            }
+            0o040000 => {
+                crate::depot::archive_upsert(&cc, rel, mode, mtime_ns,
+                                             0, None, 0)?;
+            }
+            0o100000 => {
+                let rowid = crate::depot::archive_upsert(
+                    &cc, rel, mode, mtime_ns, md.size() as i64, None, 0)?;
+                let dstb = blob_path(dst, rowid);
+                if let Some(p) = dstb.parent() {
+                    std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+                }
+                std::fs::copy(&host, &dstb).map_err(|e| e.to_string())?;
+            }
+            // fifo / block device: node + device number. A host CHAR device
+            // is unrepresentable (S_IFCHR rows are the tombstone convention);
+            // fail closed rather than snapshot a "deleted" view.
+            k if k == S_IFIFO || k == S_IFBLK => {
+                crate::depot::archive_upsert(&cc, rel, mode, mtime_ns,
+                                             0, None, 0)?;
+                cc.execute("INSERT OR REPLACE INTO rdev(name,dev) \
+                            VALUES(?1,?2)", params![rel, md.rdev() as i64])
+                  .map_err(|e| e.to_string())?;
+            }
+            _ => return Err(format!(
+                "host {rel}: unrepresentable file type {:o}", mode & S_IFMT)),
+        }
+        cc.execute("INSERT OR REPLACE INTO ownership(name,uid,gid) \
+                    VALUES(?1,?2,?3)", params![rel, md.uid(), md.gid()])
+          .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    drop(cc);
+    result?;
+    if let Some(cb) = dst_live {
+        cb.reload_entry(rel);
+    }
+    Ok(())
 }
 
 /// Copy a single parent entry DOWN into a child box, but ONLY if the child has

@@ -611,7 +611,10 @@ def main():
         m.sync_request(sock, type="ui", verb="delete", args=[cc])
 
 
-        # ── file rules: dissolve finalizes by glob (apply *.txt, discard *.log) ─
+        # ── dissolve NEVER writes the host, whatever the file rules say ──────
+        # (three-action model: apply promotes UP; dissolve promotes DOWN into
+        # children and a childless box's writes simply vanish. An apply rule
+        # must not turn a dissolve into a host write.)
         rules_f = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.RS" / "filerules"
         rules_f.parent.mkdir(parents=True, exist_ok=True)
         rules_f.write_text("apply **/*.txt\ndiscard **/*.log\n")
@@ -631,18 +634,19 @@ def main():
             dr2 = (m.sync_request(sock, type="ui", verb="dissolve", args=[frid])
                    or {}).get("r") or {}
             check(dr2.get("ok") is True, "engine-rs: dissolve-with-rules succeeds")
-            check(hk.read_bytes() == b"keepme\n",
-                  "engine-rs: file rule 'apply *.txt' wrote the host file")
+            check(not hk.exists(),
+                  "engine-rs: dissolve did NOT write the apply-ruled file to host")
             check(not hd.exists(),
-                  "engine-rs: file rule 'discard *.log' did NOT write the host")
+                  "engine-rs: dissolve did NOT write the discard-ruled file either")
             check(not m.sqlar_path(frid).exists(),
-                  "engine-rs: box freed after rule-driven finalize")
+                  "engine-rs: childless box freed, its writes discarded")
         finally:
             hk.unlink(missing_ok=True); hd.unlink(missing_ok=True)
             rules_f.unlink(missing_ok=True)
 
-        # ── dissolve: childless box finalizes+frees; with-children is REFUSED ─
-        # (1) childless box WITH a real change + an apply rule: finalize writes it.
+        # ── dissolve frees; children get copy-down + re-parent ───────────────
+        # (1) childless box WITH a real change + an apply rule: the change
+        #     still never reaches the host (dissolve promotes DOWN, not up).
         drf = Path(os.environ["XDG_CONFIG_HOME"]) / "slopbox.RS" / "filerules"
         drf.parent.mkdir(parents=True, exist_ok=True)
         drf.write_text("apply **/*.keep\n")
@@ -660,8 +664,8 @@ def main():
             dr = (m.sync_request(sock, type="ui", verb="dissolve", args=[did])
                   or {}).get("r") or {}
             check(dr.get("ok") is True, "engine-rs: dissolve of a childless box succeeds")
-            check(dzhost.read_bytes() == b"kept\n",
-                  "engine-rs: dissolve finalized the apply-matched change to the host")
+            check(not dzhost.exists(),
+                  "engine-rs: dissolve did NOT write the apply-matched change to host")
             check(not m.sqlar_path(did).exists(),
                   "engine-rs: dissolved box freed")
         finally:

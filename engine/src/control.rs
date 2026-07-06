@@ -757,41 +757,40 @@ fn reap(state: &State, id: i64) {
                              "session_id": id.to_string()}));
 }
 
-/// dissolve: remove a box, finalizing its own changes by the file rules
-/// (apply-matched paths materialized to the host, the rest discarded), then
-/// freeing it. Refuses a running box.
+/// dissolve: remove a box WITHOUT affecting any other box's view. The box's
+/// changes are promoted DOWN — every path it captured is copied into each
+/// child that has no entry of its own for it (copy_down_entry), so each child
+/// keeps reading exactly what it saw through this box once it's gone — then
+/// the children are re-parented onto this box's own parent, and the box is
+/// reaped. Nothing is ever written to the parent or the host: promotion UP is
+/// `apply`'s job, and only apply's.
 ///
-/// A box WITH children preserves each child's merged view first: every path the
-/// parent captured (apply- and discard-bound alike) is copied DOWN into each
-/// child that has no entry of its own for it (copy_down_entry), so the child
-/// keeps reading exactly what it saw through the parent once the parent is gone.
-/// Then the children are re-parented to the dissolving box's own parent and the
-/// parent is freed. Children may be LIVE: copy-down and re-parent both route
-/// through the live BoxState (connection + RAM mirror) when the child is
-/// running, so a mounted FUSE view keeps serving the right bytes — no rival
-/// on-disk handle racing the serve thread. Only the dissolving box itself must
-/// be stopped (its archive is rewritten by finalize).
+/// (The three user actions: apply promotes a box's changes UP into its parent
+/// or the host while preserving sibling views; dissolve removes a box
+/// promoting its changes DOWN; rotate swaps a parent-child pair. None of the
+/// three changes the merged view of any other box.)
+///
+/// Children may be LIVE: copy-down and re-parent both route through the live
+/// BoxState (connection + RAM mirror) when the child is running, so a mounted
+/// FUSE view keeps serving the right bytes — no rival on-disk handle racing
+/// the serve thread.
 fn dissolve(state: &State, id: i64) -> Value {
-    free_box(state, id, true)
+    free_box(state, id)
 }
 
-/// Free box `id`, KEEPING any boxes stacked on it — the shared core of both
-/// `dissolve` and `delete`. Whatever the box contributed to its children's
-/// merged view is copied DOWN into each child that lacks its own entry (so the
-/// children read exactly what they saw before), then the children are
-/// re-parented onto this box's own parent, then the box is reaped. This is why
-/// neither operation can ever orphan/corrupt a child.
+/// Free box `id`, KEEPING any boxes stacked on it — the shared core of
+/// `dissolve` and `delete` (two names for the same operation). Whatever the
+/// box contributed to its children's merged view is copied DOWN into each
+/// child that lacks its own entry (so the children read exactly what they saw
+/// before), then the children are re-parented onto this box's own parent,
+/// then the box is reaped. This is why the operation can never orphan/corrupt
+/// a child. The box's own writes never reach the parent or the host; only the
+/// copied-down content survives, in the children.
 ///
-/// `finalize` decides only what happens to THIS box's OWN changes:
-///   - dissolve (`true`):  materialize rule-matched paths to the host, discard
-///     the rest (finalize_by_rules).
-///   - delete (`false`):   discard the box's own writes entirely — they never
-///     reach the host; only the copied-down content survives, in the children.
-///
-/// A running box is refused when work needs its blobs stable (a finalize, or a
-/// copy-down to children). A leaf delete (no children, no finalize) is a plain
-/// reap and may proceed even while running — matching the old raw `delete`.
-fn free_box(state: &State, id: i64, finalize: bool) -> Value {
+/// A running box is refused when work needs its blobs stable (a copy-down to
+/// children). A leaf delete (no children) is a plain reap and may proceed
+/// even while running.
+fn free_box(state: &State, id: i64) -> Value {
     let boxes = discover::discover();
     let Some(me) = boxes.get(&id) else {
         return json!({"ok": false, "error": "no slopbox"});
@@ -799,8 +798,7 @@ fn free_box(state: &State, id: i64, finalize: bool) -> Value {
     let grandparent = me.parent;
     let children: Vec<i64> = boxes.values()
         .filter(|b| b.parent == Some(id)).map(|b| b.box_id).collect();
-    if lock(state).box_pids.contains_key(&id)
-        && (finalize || !children.is_empty()) {
+    if lock(state).box_pids.contains_key(&id) && !children.is_empty() {
         return json!({"ok": false, "error": "box is running; stop it first"});
     }
     let ov = lock(state).overlay.clone();
@@ -822,20 +820,6 @@ fn free_box(state: &State, id: i64, finalize: bool) -> Value {
             }
         }
     }
-    // This box's own changes: finalize by rules (dissolve) or discard (delete).
-    // Fail-closed on a finalize error — don't free the box.
-    let fin = if finalize {
-        let fin = crate::review::finalize_by_rules(
-            id, &crate::review::NestCtx::new(ov.clone()));
-        if fin.get("errors").and_then(Value::as_array).map(|a| !a.is_empty())
-            .unwrap_or(false) {
-            return json!({"ok": false, "error": "finalize had errors; nothing freed",
-                          "finalize_errors": fin.get("errors").cloned()});
-        }
-        fin
-    } else {
-        json!({})
-    };
     // Re-parent the children onto this box's own parent. For a LIVE child write
     // the meta through its BoxState (one connection); for one at rest write the
     // on-disk sqlar. Also update the overlay's in-RAM parent.
@@ -871,10 +855,7 @@ fn free_box(state: &State, id: i64, finalize: bool) -> Value {
         }
     }
     reap(state, id);
-    json!({"ok": true,
-           "applied": fin.get("applied").cloned().unwrap_or(json!([])),
-           "discarded": fin.get("discarded").cloned().unwrap_or(json!([])),
-           "reparented": children})
+    json!({"ok": true, "reparented": children})
 }
 
 /// Audit H3: apply/discard read the box's pool blobs (`blob_path(id, rowid)`) —
@@ -1710,7 +1691,7 @@ macro_rules! ui_verbs {
             None => json!({"ok": false, "error": "no slopbox"}),
         }
         }
-        "dissolve", "SID", "finalize a box by file-rules and free it" => { match arg_sid(args) {
+        "dissolve", "SID", "remove a box, promoting its changes down into children" => { match arg_sid(args) {
             Some(id) => dissolve(state, id),
             None => json!({"ok": false, "error": "no slopbox"}),
         }
@@ -2158,14 +2139,14 @@ macro_rules! ui_verbs {
         }
         // discovery is always fresh; nothing to do
         "rescan", "", "no-op; discovery is always fresh" => { json!(null) }
-        "delete", "SID", "discard a box's writes and free it, keeping children" => { match arg_sid(args) {
+        "delete", "SID", "remove a box, promoting its changes down (alias of dissolve)" => { match arg_sid(args) {
             // Free the box, KEEPING any boxes stacked on it: children have this
             // box's view copied down into them and are re-parented onto the
-            // grandparent, so their merged view is unchanged. Unlike dissolve,
-            // this box's OWN writes are discarded (not finalized to the host).
+            // grandparent, so their merged view is unchanged. Same operation as
+            // dissolve — the box's OWN writes never reach the parent or host.
             // A raw reap here would orphan the children — so delete never does
             // one when children exist, and never destroys a box not named.
-            Some(id) => free_box(state, id, false),
+            Some(id) => free_box(state, id),
             None => json!({"ok": false}),
         }
         }
