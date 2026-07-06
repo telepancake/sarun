@@ -11,5 +11,6 @@
 
 pub mod cdp;
 pub mod font;
+pub mod launch;
 pub mod render;
 pub mod session;

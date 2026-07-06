@@ -503,6 +503,10 @@ fn main() {
         // `sarun oaita …` — the second entry into the oaita duty (symlinked
         // `oaita` binary is the first, handled above). Equivalent code path.
         Some("oaita") => std::process::exit(oaita::cli::main(&argv[1..])),
+        // `sarun browser [--dump|--dump-text] [--size WxH] URL` — the
+        // engine-native textmode browser (DESIGN-cellulose.md), driving a
+        // stock headless Chromium over CDP. Replaces the carbonyl launcher.
+        Some("browser") => std::process::exit(browser::launch::browser_cli(&argv[1..])),
         // Bare launch / explicit `attach` / `--once` headless render → UI role,
         // auto-spawning the engine when its socket is down.
         None => std::process::exit(ui_launch(&argv)),

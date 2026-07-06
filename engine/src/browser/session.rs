@@ -173,51 +173,20 @@ mod tests {
     use super::*;
 
     /// Spawn headless Chromium directly (no box), reach it over the websocket
-    /// transport, and render a positioned-text fixture — asserting the DOM
-    /// text lands on the exact predicted cell, i.e. full-pipeline parity with
-    /// the Python prototype. Ignored (needs a browser); run with `--ignored`.
+    /// transport (`--remote-debugging-pipe`, the production transport), and
+    /// render a positioned-text fixture — asserting the DOM text lands on the
+    /// exact predicted cell, i.e. full-pipeline parity with the Python
+    /// prototype. Ignored (needs a browser); run with `--ignored`.
     #[test]
     #[ignore]
     fn e2e_renders_positioned_text() {
-        use std::io::Read;
-        let bin = std::env::var("CELLULOSE_BROWSER").unwrap_or_else(|_| {
-            "/opt/pw-browsers/chromium-1194/chrome-linux/chrome".to_string()
-        });
-        let mut child = std::process::Command::new(bin)
-            .args([
-                "--headless",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--remote-debugging-port=0",
-                "--disable-features=EncryptedClientHello",
-                "--force-color-profile=srgb",
-                "about:blank",
-            ])
-            .stderr(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn chromium");
-        let mut err = child.stderr.take().unwrap();
-        let mut buf = Vec::new();
-        let mut one = [0u8; 256];
-        let ws = loop {
-            let n = err.read(&mut one).expect("read stderr");
-            assert!(n > 0, "chromium exited early");
-            buf.extend_from_slice(&one[..n]);
-            let t = String::from_utf8_lossy(&buf);
-            if let Some(i) = t.find("ws://") {
-                let end = t[i..].find(char::is_whitespace).map(|e| i + e).unwrap_or(t.len());
-                break t[i..end].to_string();
-            }
-        };
-
-        let (r, w) = super::super::cdp::ws_connect(&ws).expect("ws connect");
-        let cdp = Cdp::new(r, w);
-        let sess = BrowserSession::attach(cdp, 80, 30).expect("attach");
+        let browser = crate::browser::launch::spawn_host_chromium().expect("spawn chromium");
+        let sess = BrowserSession::attach(browser.cdp.clone(), 80, 30).expect("attach");
 
         // absolutely-positioned red text at left:160px top:128px → col 20,
-        // row 8 (same geometry as the prototype fixture's REDTEXT).
-        let html = "<body style='margin:0;background:#fff'>\
+        // row 8 (same geometry as the prototype fixture's REDTEXT). No '#'
+        // (data: fragment terminator); body defaults to white.
+        let html = "<body style='margin:0'>\
             <div style='position:absolute;left:160px;top:128px;\
             color:rgb(200,0,0);font-size:30px'>REDTEXT</div></body>";
         let url = format!("data:text/html;charset=utf-8,{}", urlencode(html));
@@ -237,9 +206,6 @@ mod tests {
         let word: String = (20..27).map(|c| row8[c].ch.clone()).collect();
         assert_eq!(word, "REDTEXT");
         assert_eq!(row8[20].fg, (200, 0, 0));
-
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     fn urlencode(s: &str) -> String {

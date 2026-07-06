@@ -10,8 +10,7 @@
 // every pending and future `call` fails fast instead of hanging to timeout.
 
 use std::collections::HashMap;
-use std::io::{self, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::io::{self, BufReader, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -141,170 +140,59 @@ impl Cdp {
         std::mem::take(&mut *self.inner.events.lock().unwrap())
     }
 
+    #[allow(dead_code)]
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
     }
 }
 
-// ── websocket transport ─────────────────────────────────────────────────────
+// ── pipe transport (--remote-debugging-pipe) ────────────────────────────────
 
-/// Connect to a `ws://host:port/path` DevTools endpoint and return a
-/// reader/writer pair. A minimal RFC 6455 client: masked client frames,
-/// reassembled server messages, control frames handled. We require an HTTP
-/// 101 but do not validate the `Sec-WebSocket-Accept` hash (no sha1 dep; the
-/// endpoint is localhost-trusted).
-pub fn ws_connect(url: &str) -> io::Result<(Box<dyn CdpReader>, Box<dyn CdpWriter>)> {
-    let rest = url
-        .strip_prefix("ws://")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a ws:// url"))?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let host_port = if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{authority}:80")
-    };
-    let stream = TcpStream::connect(&host_port)?;
-    stream.set_nodelay(true).ok();
-
-    // Handshake.
-    let mut key = [0u8; 16];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut key[..]);
-    use base64::Engine as _;
-    let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUpgrade: websocket\r\n\
-         Connection: Upgrade\r\nSec-WebSocket-Key: {key_b64}\r\n\
-         Sec-WebSocket-Version: 13\r\n\r\n"
-    );
-    (&stream).write_all(req.as_bytes())?;
-
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let status = read_http_headers(&mut reader)?;
-    if !status.contains(" 101") {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("websocket upgrade rejected: {status}"),
-        ));
-    }
-
-    let ws_reader = WsReader { r: reader };
-    let ws_writer = WsWriter { w: stream };
-    Ok((Box::new(ws_reader), Box::new(ws_writer)))
+/// CDP over two fds, framed as NUL-delimited JSON — Chromium's
+/// `--remote-debugging-pipe` protocol. This is the box transport
+/// (DESIGN-cellulose.md C1): the engine passes a socketpair/pipe into the box
+/// exactly like the existing conn-fd, so no port and no netns dial is needed.
+/// `read_fd` receives from Chromium (its fd 4), `write_fd` sends to it (fd 3).
+pub fn pipe_transport(
+    read_fd: std::os::fd::RawFd,
+    write_fd: std::os::fd::RawFd,
+) -> (Box<dyn CdpReader>, Box<dyn CdpWriter>) {
+    use std::os::fd::FromRawFd;
+    let r = unsafe { std::fs::File::from_raw_fd(read_fd) };
+    let w = unsafe { std::fs::File::from_raw_fd(write_fd) };
+    (
+        Box::new(PipeReader { r: BufReader::new(r) }),
+        Box::new(PipeWriter { w }),
+    )
 }
 
-/// Read the status line + headers up to the blank line; return the status line.
-fn read_http_headers<R: Read>(r: &mut R) -> io::Result<String> {
-    let mut buf = Vec::new();
-    let mut one = [0u8; 1];
-    loop {
-        let n = r.read(&mut one)?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in headers"));
-        }
-        buf.push(one[0]);
-        if buf.ends_with(b"\r\n\r\n") {
-            break;
-        }
-        if buf.len() > 64 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "header too large"));
-        }
-    }
-    let text = String::from_utf8_lossy(&buf);
-    Ok(text.lines().next().unwrap_or("").to_string())
+struct PipeReader {
+    r: BufReader<std::fs::File>,
+}
+struct PipeWriter {
+    w: std::fs::File,
 }
 
-struct WsReader {
-    r: BufReader<TcpStream>,
-}
-
-struct WsWriter {
-    w: TcpStream,
-}
-
-impl CdpReader for WsReader {
+impl CdpReader for PipeReader {
     fn recv(&mut self) -> io::Result<Option<String>> {
-        read_ws_message(&mut self.r)
+        use std::io::BufRead;
+        let mut buf = Vec::new();
+        let n = self.r.read_until(0, &mut buf)?;
+        if n == 0 {
+            return Ok(None); // EOF
+        }
+        if buf.last() == Some(&0) {
+            buf.pop();
+        }
+        Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
     }
 }
 
-impl CdpWriter for WsWriter {
+impl CdpWriter for PipeWriter {
     fn send(&mut self, msg: &str) -> io::Result<()> {
-        let frame = encode_ws_frame(0x1, msg.as_bytes());
-        self.w.write_all(&frame)?;
+        self.w.write_all(msg.as_bytes())?;
+        self.w.write_all(&[0])?;
         self.w.flush()
-    }
-}
-
-/// Encode one masked client frame (FIN set) with the given opcode.
-fn encode_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(payload.len() + 14);
-    out.push(0x80 | opcode);
-    let len = payload.len();
-    if len < 126 {
-        out.push(0x80 | len as u8);
-    } else if len <= 0xffff {
-        out.push(0x80 | 126);
-        out.extend_from_slice(&(len as u16).to_be_bytes());
-    } else {
-        out.push(0x80 | 127);
-        out.extend_from_slice(&(len as u64).to_be_bytes());
-    }
-    let mut mask = [0u8; 4];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut mask[..]);
-    out.extend_from_slice(&mask);
-    out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i & 3]));
-    out
-}
-
-/// Read and reassemble one application message (text/binary), skipping and
-/// handling control frames. `Ok(None)` on a close frame or clean EOF.
-fn read_ws_message<R: Read>(r: &mut R) -> io::Result<Option<String>> {
-    let mut payload: Vec<u8> = Vec::new();
-    loop {
-        let mut h = [0u8; 2];
-        match r.read_exact(&mut h) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        let fin = h[0] & 0x80 != 0;
-        let opcode = h[0] & 0x0f;
-        let masked = h[1] & 0x80 != 0;
-        let mut len = (h[1] & 0x7f) as u64;
-        if len == 126 {
-            let mut b = [0u8; 2];
-            r.read_exact(&mut b)?;
-            len = u16::from_be_bytes(b) as u64;
-        } else if len == 127 {
-            let mut b = [0u8; 8];
-            r.read_exact(&mut b)?;
-            len = u64::from_be_bytes(b);
-        }
-        let mut mask = [0u8; 4];
-        if masked {
-            r.read_exact(&mut mask)?;
-        }
-        let mut data = vec![0u8; len as usize];
-        r.read_exact(&mut data)?;
-        if masked {
-            for (i, b) in data.iter_mut().enumerate() {
-                *b ^= mask[i & 3];
-            }
-        }
-        match opcode {
-            0x8 => return Ok(None),         // close
-            0x9 | 0xa => continue,          // ping/pong — ignore (localhost)
-            0x0 | 0x1 | 0x2 => {
-                payload.extend_from_slice(&data);
-                if fin {
-                    return Ok(Some(String::from_utf8_lossy(&payload).into_owned()));
-                }
-            }
-            _ => continue,
-        }
     }
 }
 
@@ -314,24 +202,20 @@ mod tests {
     use std::sync::mpsc::{Receiver, Sender};
 
     #[test]
-    fn ws_frame_roundtrip() {
-        // Encode as a client (masked), decode with the server-side reader.
-        for payload in [&b""[..], b"hi", &vec![b'x'; 130][..], &vec![b'y'; 70000][..]] {
-            let frame = encode_ws_frame(0x1, payload);
-            let mut cursor = std::io::Cursor::new(frame);
-            let msg = read_ws_message(&mut cursor).unwrap().unwrap();
-            assert_eq!(msg.as_bytes(), payload);
-        }
+    fn pipe_frames_nul_delimited_json() {
+        use std::os::fd::IntoRawFd;
+        // A connected socketpair: bytes written to the writer end surface on
+        // the reader end. pipe_transport(read=a, write=b) → reading a returns
+        // what was sent to b.
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut r, mut w) = pipe_transport(a.into_raw_fd(), b.into_raw_fd());
+        w.send("{\"id\":1}").unwrap();
+        w.send("{\"id\":2}").unwrap();
+        assert_eq!(r.recv().unwrap().as_deref(), Some("{\"id\":1}"));
+        assert_eq!(r.recv().unwrap().as_deref(), Some("{\"id\":2}"));
     }
 
-    #[test]
-    fn ws_close_frame_ends_stream() {
-        let frame = encode_ws_frame(0x8, b"");
-        let mut cursor = std::io::Cursor::new(frame);
-        assert!(read_ws_message(&mut cursor).unwrap().is_none());
-    }
-
-    // A mock transport backed by channels, so the client's correlation logic
+            // A mock transport backed by channels, so the client's correlation logic
     // is testable without a browser: the "server" reads what the client sent
     // and pushes replies/events back.
     struct MockReader {
@@ -420,74 +304,7 @@ mod tests {
     // client handshakes (Chromium's origin check accepts our no-Origin
     // request) and the CDP round-trip works. Ignored by default — needs a
     // browser; run with `--ignored`. Path via $CELLULOSE_BROWSER.
-    #[test]
-    #[ignore]
-    fn e2e_evaluate_against_chromium() {
-        use std::io::Read;
-        let bin = std::env::var("CELLULOSE_BROWSER").unwrap_or_else(|_| {
-            "/opt/pw-browsers/chromium-1194/chrome-linux/chrome".to_string()
-        });
-        let mut child = std::process::Command::new(bin)
-            .args([
-                "--headless",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--remote-debugging-port=0",
-                "--disable-features=EncryptedClientHello",
-                "about:blank",
-            ])
-            .stderr(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn chromium");
-        // Parse the DevTools ws url off stderr.
-        let mut err = child.stderr.take().unwrap();
-        let mut buf = Vec::new();
-        let mut one = [0u8; 256];
-        let ws = loop {
-            let n = err.read(&mut one).expect("read stderr");
-            assert!(n > 0, "chromium exited without a DevTools line");
-            buf.extend_from_slice(&one[..n]);
-            let text = String::from_utf8_lossy(&buf);
-            if let Some(i) = text.find("ws://") {
-                let end = text[i..].find(char::is_whitespace).map(|e| i + e).unwrap_or(text.len());
-                break text[i..end].to_string();
-            }
-        };
-        let (r, w) = ws_connect(&ws).expect("ws connect");
-        let cdp = Cdp::new(r, w);
-        let targets = cdp
-            .call("Target.getTargets", json!({}), None, Duration::from_secs(5))
-            .expect("getTargets");
-        let page = targets["targetInfos"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["type"] == "page")
-            .expect("a page target");
-        let attached = cdp
-            .call(
-                "Target.attachToTarget",
-                json!({ "targetId": page["targetId"], "flatten": true }),
-                None,
-                Duration::from_secs(5),
-            )
-            .expect("attach");
-        let sid = attached["sessionId"].as_str().unwrap().to_string();
-        let res = cdp
-            .call(
-                "Runtime.evaluate",
-                json!({ "expression": "1+2", "returnByValue": true }),
-                Some(&sid),
-                Duration::from_secs(5),
-            )
-            .expect("evaluate");
-        assert_eq!(res["result"]["value"], 3);
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    #[test]
+        #[test]
     fn call_fails_fast_once_closed() {
         let (cdp, to_client, _from_client) = mock_pair();
         drop(to_client); // server closes → reader sees None → fail_all
