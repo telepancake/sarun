@@ -71,6 +71,36 @@ TV_LDFLAGS := -static
 SUD_CFLAGS  := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer -I.
 SUD_LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none
 
+# The sud wrappers build with the SAME zig toolchain as the engine —
+# no host C compiler (a non-x86 or gcc-less host must still produce
+# the x86 wrappers). zig comes from the ziglang wheel that
+# `make engine` installs alongside cargo-zigbuild (`uv tool install
+# --with ziglang cargo-zigbuild`); override ZIG to use another zig.
+# -ffreestanding makes zig cc drop its bundled include dirs, so the
+# musl + kernel-UAPI headers come back via -idirafter (host /usr/
+# include is never consulted). lld has no -Ttext-segment; the image
+# base flag is --image-base (same placement, checked by the
+# __sud_begin/__sud_end bracketing). No libgcc: zig cannot attach
+# compiler_rt to a -nostdlib link, so the 32-bit 64-bit-division
+# intrinsics are in-tree (libc-fs/divdi3.c).
+UV_TOOL_DIR := $(shell uv tool dir 2>/dev/null)
+ZIG ?= $(firstword $(wildcard $(UV_TOOL_DIR)/cargo-zigbuild/lib/python3*/site-packages/ziglang/zig) $(shell command -v zig 2>/dev/null))
+ifeq ($(ZIG),)
+$(warning zig not found: run `uv tool install --with ziglang cargo-zigbuild` or set ZIG=/path/to/zig)
+endif
+ZIG_LIBC_INC := $(patsubst %/zig,%,$(ZIG))/lib/libc/include
+SUD_INC64 := -idirafter $(ZIG_LIBC_INC)/x86_64-linux-musl -idirafter $(ZIG_LIBC_INC)/generic-musl -idirafter $(ZIG_LIBC_INC)/x86-linux-any -idirafter $(ZIG_LIBC_INC)/any-linux-any
+SUD_INC32 := -idirafter $(ZIG_LIBC_INC)/x86-linux-musl -idirafter $(ZIG_LIBC_INC)/generic-musl -idirafter $(ZIG_LIBC_INC)/x86-linux-any -idirafter $(ZIG_LIBC_INC)/any-linux-any
+SUD_CC64 := $(ZIG) cc -target x86_64-linux-musl $(SUD_INC64)
+# -mstackrealign: clang emits 16-byte-aligned SSE stores for big stack
+# locals and ASSUMES aligned entry; the freestanding 32-bit _start
+# inherits whatever alignment the kernel's argv/envp sizes produce, so
+# every function realigns its own frame (a GP-fault segfault that
+# comes and goes with the environment size otherwise).
+SUD_CC32 := $(ZIG) cc -target x86-linux-musl -mstackrealign $(SUD_INC32)
+SUD_BASE64 := -Wl,--image-base=0x40000000
+SUD_BASE32 := -Wl,--image-base=0x20000000
+
 # Set SIGSYS_DIAG=1 to enable the SIGSYS handler entry/exit diagnostic dumps.
 # This prints the saved ucontext (registers, stack pointer, uc_stack) at both
 # handler entry and exit so that signal-frame corruption can be detected.
@@ -81,7 +111,7 @@ SUD_CFLAGS  += -DSUDTRACE_SIGSYS_DIAG
 endif
 SUD_ADDINS ?= sud/trace
 SUD_SRCS    := sud/wrapper.c sud/state.c sud/addin.c sud/raw.c sud/elf.c sud/handler.c sud/loader.c sud/runtime_config.c
-SUD_SRCS    += libc-fs/libc.c libc-fs/deps/printf/printf.c
+SUD_SRCS    += libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
 ifneq ($(filter sud/trace,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_TRACE
 SUD_SRCS    += sud/trace/event.c sud/trace/addin.c
@@ -189,10 +219,10 @@ clean-tv:
 	rm -f tv $(TV_C_OBJS)
 
 sud64: $(SUD_SRCS) sudtrace.lds
-	$(CC) -m64 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sud64 $(SUD_SRCS) -lgcc
+	$(SUD_CC64) $(SUD_CFLAGS) $(SUD_LDFLAGS) $(SUD_BASE64) -T sudtrace.lds -o sud64 $(SUD_SRCS)
 
 sud32: $(SUD_SRCS) sudtrace.lds
-	$(CC) -m32 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x20000000 -T sudtrace.lds -o sud32 $(SUD_SRCS) -lgcc
+	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) $(SUD_BASE32) -T sudtrace.lds -o sud32 $(SUD_SRCS)
 
 .PHONY: libc-fs-test
 libc-fs-test:
@@ -209,7 +239,7 @@ PATH_REMAP_TEST_SRCS := sud/path_remap/tests/test_overlay.c \
                         sud/path_remap/fakeroot.c \
                         sud/path_remap/rules.c \
                         sud/runtime_config.c \
-                        libc-fs/libc.c libc-fs/deps/printf/printf.c
+                        libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
 PATH_REMAP_TEST_HDRS := sud/path_remap/overlay.h \
                         sud/path_remap/path.h \
                         sud/path_remap/fakeroot.h \
@@ -225,13 +255,13 @@ path-remap-test: build/path_remap_test64 build/path_remap_test32
 
 build/path_remap_test64: $(PATH_REMAP_TEST_SRCS) $(PATH_REMAP_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m64 $(SUD_CFLAGS) $(SUD_LDFLAGS) \
-	    -o $@ $(PATH_REMAP_TEST_SRCS) -lgcc
+	$(SUD_CC64) $(SUD_CFLAGS) $(SUD_LDFLAGS) \
+	    -o $@ $(PATH_REMAP_TEST_SRCS)
 
 build/path_remap_test32: $(PATH_REMAP_TEST_SRCS) $(PATH_REMAP_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m32 $(SUD_CFLAGS) $(SUD_LDFLAGS) \
-	    -o $@ $(PATH_REMAP_TEST_SRCS) -lgcc
+	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) \
+	    -o $@ $(PATH_REMAP_TEST_SRCS)
 
 # path_remap × trace dispatch-order tests.  Built three times in each
 # bitness — both addins, path_remap-only, trace-only — to verify the
@@ -245,7 +275,7 @@ DISPATCH_TEST_LDFLAGS     := -nostdlib -static -no-pie -Wl,--build-id=none
 DISPATCH_TEST_COMMON_SRCS := sud/path_remap/tests/test_dispatcher.c \
                              sud/addin.c \
                              sud/runtime_config.c \
-                             libc-fs/libc.c libc-fs/deps/printf/printf.c
+                             libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
 DISPATCH_TEST_PATHREMAP_SRCS := sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c sud/path_remap/rules.c
 DISPATCH_TEST_HDRS := sud/addin.h sud/path_remap/overlay.h sud/path_remap/path.h \
                       sud/path_remap/fakeroot.h \
@@ -279,39 +309,39 @@ dispatcher-test: $(DISPATCH_TEST_BIN64_BOTH) $(DISPATCH_TEST_BIN32_BOTH) \
 
 $(DISPATCH_TEST_BIN64_BOTH): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m64 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE -DSUD_ADDIN_PATH_REMAP \
+	$(SUD_CC64) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE -DSUD_ADDIN_PATH_REMAP \
 	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) -lgcc
+	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS)
 
 $(DISPATCH_TEST_BIN32_BOTH): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m32 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE -DSUD_ADDIN_PATH_REMAP \
+	$(SUD_CC32) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE -DSUD_ADDIN_PATH_REMAP \
 	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) -lgcc
+	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS)
 
 $(DISPATCH_TEST_BIN64_PR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m64 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_PATH_REMAP \
+	$(SUD_CC64) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_PATH_REMAP \
 	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) -lgcc
+	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS)
 
 $(DISPATCH_TEST_BIN32_PR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m32 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_PATH_REMAP \
+	$(SUD_CC32) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_PATH_REMAP \
 	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) -lgcc
+	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS)
 
 $(DISPATCH_TEST_BIN64_TR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m64 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE \
+	$(SUD_CC64) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE \
 	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS) -lgcc
+	    $(DISPATCH_TEST_COMMON_SRCS)
 
 $(DISPATCH_TEST_BIN32_TR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m32 $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE \
+	$(SUD_CC32) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE \
 	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS) -lgcc
+	    $(DISPATCH_TEST_COMMON_SRCS)
 
 .PHONY: wire-test
 wire-test: tv
@@ -325,7 +355,7 @@ INRAMFS_TEST_SRCS := sud/inramfs/tests/test_inramfs.c \
                      sud/inramfs/super.c sud/inramfs/vfs.c sud/inramfs/addin.c \
                      sud/path_remap/path.c \
                      sud/runtime_config.c \
-                     libc-fs/libc.c libc-fs/deps/printf/printf.c
+                     libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
 INRAMFS_TEST_HDRS := sud/inramfs/inramfs.h sud/inramfs/internal.h \
                      sud/path_remap/path.h \
                      sud/addin.h sud/runtime_config.h \
@@ -367,13 +397,13 @@ inramfs-test-sqlite: tests/inramfs_sqlite_e2e.sh
 
 build/inramfs_test64: $(INRAMFS_TEST_SRCS) $(INRAMFS_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m64 $(SUD_CFLAGS) -DSUD_ADDIN_INRAMFS $(SUD_LDFLAGS) \
-	    -o $@ $(INRAMFS_TEST_SRCS) -lgcc
+	$(SUD_CC64) $(SUD_CFLAGS) -DSUD_ADDIN_INRAMFS $(SUD_LDFLAGS) \
+	    -o $@ $(INRAMFS_TEST_SRCS)
 
 build/inramfs_test32: $(INRAMFS_TEST_SRCS) $(INRAMFS_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m32 $(SUD_CFLAGS) -DSUD_ADDIN_INRAMFS $(SUD_LDFLAGS) \
-	    -o $@ $(INRAMFS_TEST_SRCS) -lgcc
+	$(SUD_CC32) $(SUD_CFLAGS) -DSUD_ADDIN_INRAMFS $(SUD_LDFLAGS) \
+	    -o $@ $(INRAMFS_TEST_SRCS)
 
 # fake-exec addin self-tests.  Pure-function tests over the classifier
 # and the builtin registry; the SYS_exit-emitting addin path is exercised
@@ -382,7 +412,7 @@ FAKE_EXEC_TEST_SRCS := sud/fake-exec/tests/test_fake_exec.c \
                        sud/fake-exec/detect.c \
                        sud/fake-exec/builtins.c \
                        sud/runtime_config.c \
-                       libc-fs/libc.c libc-fs/deps/printf/printf.c
+                       libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
 FAKE_EXEC_TEST_HDRS := sud/fake-exec/fake_exec.h sud/fake-exec/builtins.h \
                        sud/addin.h sud/runtime_config.h \
                        libc-fs/libc.h libc-fs/fmt.h
@@ -393,8 +423,8 @@ fake-exec-test: build/fake_exec_test64
 
 build/fake_exec_test64: $(FAKE_EXEC_TEST_SRCS) $(FAKE_EXEC_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m64 $(SUD_CFLAGS) -DSUD_ADDIN_FAKE_EXEC $(SUD_LDFLAGS) \
-	    -o $@ $(FAKE_EXEC_TEST_SRCS) -lgcc
+	$(SUD_CC64) $(SUD_CFLAGS) -DSUD_ADDIN_FAKE_EXEC $(SUD_LDFLAGS) \
+	    -o $@ $(FAKE_EXEC_TEST_SRCS)
 
 # cmd-rewrite addin self-tests.  Pure-function tests over the rule
 # parser, pattern matchers (basename/glob/path), and apply paths;
@@ -402,7 +432,7 @@ build/fake_exec_test64: $(FAKE_EXEC_TEST_SRCS) $(FAKE_EXEC_TEST_HDRS)
 CMD_REWRITE_TEST_SRCS := sud/cmd-rewrite/tests/test_cmd_rewrite.c \
                          sud/cmd-rewrite/rules.c \
                          sud/runtime_config.c \
-                         libc-fs/libc.c libc-fs/deps/printf/printf.c
+                         libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
 CMD_REWRITE_TEST_HDRS := sud/cmd-rewrite/cmd_rewrite.h \
                          sud/cmd-rewrite/rules.h \
                          sud/addin.h sud/runtime_config.h \
@@ -414,8 +444,8 @@ cmd-rewrite-test: build/cmd_rewrite_test64
 
 build/cmd_rewrite_test64: $(CMD_REWRITE_TEST_SRCS) $(CMD_REWRITE_TEST_HDRS)
 	@mkdir -p build
-	$(CC) -m64 $(SUD_CFLAGS) -DSUD_ADDIN_CMD_REWRITE $(SUD_LDFLAGS) \
-	    -o $@ $(CMD_REWRITE_TEST_SRCS) -lgcc
+	$(SUD_CC64) $(SUD_CFLAGS) -DSUD_ADDIN_CMD_REWRITE $(SUD_LDFLAGS) \
+	    -o $@ $(CMD_REWRITE_TEST_SRCS)
 
 # fake-exec performance regression gate.  Runs sudtrace over a
 # fixture loop with --no-fake-exec vs the default and asserts the
