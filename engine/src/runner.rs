@@ -63,12 +63,28 @@ pub fn pidfd_open_pub(pid: i32) -> i32 { pidfd_open(pid) }
 /// /proc ancestry (the same identity path register uses). This is a one-
 /// shot control message — NOT a register, NOT a box channel: the engine
 /// records the recipe's brushprov rows and closes. The conn is acquired
-/// via the FD broker (`SARUN_BROKER` — bound by our parent inner). Best-
-/// effort: any failure (no broker, send error) is swallowed so the recipe
+/// via the FD broker (`SARUN_BROKER` — bound by our parent inner). A sud
+/// box has NO inner (so no broker); run_sud exports `SARUN_SUD_PROV` = the
+/// engine's control-socket path instead, and we dial that directly — a
+/// filesystem UDS crosses the box's netns, and the sud remap does not
+/// intercept connect(), so the host path works from inside the traced
+/// tree. Same one-shot wire shape (line + pidfd) either way. Best-
+/// effort: any failure (no channel, send error) is swallowed so the recipe
 /// still runs unchanged. `line` must already be newline-terminated.
 pub fn send_nested_prov(line: &[u8]) {
-    let Ok(name) = std::env::var("SARUN_BROKER") else { return; };
-    let Ok(conn) = broker_dial(&name) else { return; };
+    let broker = std::env::var("SARUN_BROKER").ok().filter(|s| !s.is_empty());
+    let conn = match broker {
+        Some(name) => {
+            let Ok(c) = broker_dial(&name) else { return; };
+            c
+        }
+        None => {
+            let Ok(sock) = std::env::var("SARUN_SUD_PROV") else { return; };
+            if sock.is_empty() { return; }
+            let Ok(c) = UnixStream::connect(&sock) else { return; };
+            c
+        }
+    };
     let pidfd = pidfd_open(std::process::id() as i32);
     send_register(&conn, line, pidfd, None);
     if pidfd >= 0 { unsafe { libc::close(pidfd); } }
@@ -858,8 +874,10 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // -b brush: the box's shell IS the embedded brush, run as the TRACED
     // target — the engine binary under the wrapper via `brush-sh`, so brush +
     // coreutils/find/xargs + make(kati)/ninja(n2) all execute in one traced
-    // process. (Gap in DESIGN-sud.md: no box channel in the traced process, so
-    // semantic-provenance frames are skipped; provenance comes from the trace.)
+    // process. There is no box channel in the traced process (no inner, so no
+    // FD broker either); semantic provenance — per-pipeline records, build
+    // edges, done/state stamps — reaches the engine over its control socket
+    // directly via SARUN_SUD_PROV (see send_nested_prov).
     let self_exe: Option<String> = std::env::current_exe().ok()
         .and_then(|p| p.to_str().map(String::from));
     let cmd = if brush {
@@ -913,6 +931,11 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         None => { sc.args(&cmd); }
     }
     if let Some(d) = &chdir { sc.current_dir(d); }
+    // Semantic-provenance channel: no inner in a sud box, so no FD broker.
+    // Hand the traced tree the engine's control-socket path instead —
+    // send_nested_prov dials it directly for brush pipeline records, build
+    // edges, and done/state stamps (the l and g screens' data).
+    sc.env("SARUN_SUD_PROV", &sock);
     // Launch under the wrapper contract and wait for the traced tree.
     let code = sud_launcher_exec(sc, wrapper, trace_w);
     // Sweep the upper into the box's sqlar on a FRESH conn (the register conn
