@@ -746,8 +746,13 @@ static void test_copyup_modify_vs_write(void)
     fixture_teardown();
 }
 
-/* FOR_MODIFY of a whiteouted name must not resurrect the lower: no
- * copy-up runs, and the upper stays the whiteout marker. */
+/* FOR_MODIFY of a whiteouted name must not resurrect the lower: the
+ * name is logically absent, so the resolve reports WHITEOUT (the
+ * caller surfaces -ENOENT — never the bare marker node, which an open
+ * would hit as a char-dev → ENXIO), no copy-up runs, and the upper
+ * stays the whiteout marker.  FOR_CREATE is the opposite: the marker
+ * is removed so the create lands fresh in the upper (a delete-then-
+ * recreate cycle, e.g. ld unlinking then reopening its output). */
 static void test_modify_whiteout_no_resurrect(void)
 {
     g_curtest = "modify_whiteout_no_resurrect";
@@ -761,11 +766,18 @@ static void test_modify_whiteout_no_resurrect(void)
 
     snprintf(m, sizeof(m), "%s/gone", g_merged);
     int rc = sud_overlay_resolve(m, SUD_OVERLAY_FOR_MODIFY, out, sizeof(out));
-    TASSERT_EQ(rc, SUD_OVERLAY_RESOLVED, "modify of whiteout resolves to upper");
+    TASSERT_EQ(rc, SUD_OVERLAY_WHITEOUT, "modify of whiteout reports WHITEOUT");
     /* The upper entry is still the char-dev whiteout, not a copied-up
      * regular file. */
     TASSERT_EQ(t_lmode(up) & S_IFMT, S_IFCHR,
                "upper stays a whiteout (lower not resurrected)");
+
+    /* FOR_CREATE clears the marker and resolves to the upper path;
+     * the lower's bytes stay hidden (no copy-up after a whiteout). */
+    rc = sud_overlay_resolve(m, SUD_OVERLAY_FOR_CREATE, out, sizeof(out));
+    TASSERT_EQ(rc, SUD_OVERLAY_RESOLVED, "create over whiteout resolves");
+    TASSERT_STREQ(out, up, "create resolved path is upper");
+    TASSERT(!t_exists(up), "whiteout removed, no lower copy-up");
 
     fixture_teardown();
 }

@@ -529,15 +529,33 @@ int sud_overlay_resolve(const char *path, int for_write,
     if (for_write) {
         if (!upper) return SUD_OVERLAY_READONLY;
         ensure_parent_in_upper(upper, upper_len, tail);
+        /* A whiteout occupies the upper name: the entry is logically
+         * ABSENT.  A create-class op (FOR_CREATE) needs the marker out
+         * of the way — otherwise open(O_CREAT) opens the bare char-dev
+         * (ENXIO) and mkdir/mknod/symlink/linkat hit EEXIST on a name
+         * the merged view doesn't have.  Every other write op must see
+         * "no such file", never the marker node. */
+        if (upper_state == 1) {
+            if (for_write == SUD_OVERLAY_FOR_CREATE)
+                raw_unlinkat(AT_FDCWD, upath, 0);
+            else
+                return SUD_OVERLAY_WHITEOUT;
+        }
         /* MODIFY (content or metadata) of an entry that exists only in
          * a lower: COPY IT UP first, or the modification sees a
          * nonexistent upper file — open(O_WRONLY) of a host file
          * ENOENTed, O_APPEND started empty, chmod/chown/utimensat of a
          * host file failed, and O_CREAT|O_EXCL wrongly succeeded on a
-         * name the merged view already had.  Plain FOR_WRITE (create /
-         * replace / delete) skips the copy: the old bytes are dead
-         * weight there (rm of a big lower file must not copy it). */
-        if (for_write == SUD_OVERLAY_FOR_MODIFY && upper_state == 0)
+         * name the merged view already had.  CREATE gets the same
+         * copy-up (open(O_CREAT) without O_TRUNC of a lower file must
+         * see its content, O_CREAT|O_EXCL must EEXIST truthfully) —
+         * but NOT after a cleared whiteout above (upper_state == 1):
+         * the name was logically absent, so it starts fresh.  Plain
+         * FOR_WRITE (replace / delete) skips the copy: the old bytes
+         * are dead weight there (rm of a big lower file must not copy
+         * it). */
+        if ((for_write == SUD_OVERLAY_FOR_MODIFY
+             || for_write == SUD_OVERLAY_FOR_CREATE) && upper_state == 0)
             copy_up_from_lowers(r, tail, upath);
         return copy_resolved(out, out_sz, upath);
     }

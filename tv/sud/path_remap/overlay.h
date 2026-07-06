@@ -99,10 +99,18 @@ int sud_overlay_fd_upper_redirect(int fd, char *out, size_t out_sz);
  * existing entry's content or metadata (open-for-write, chmod/chown/
  * utimensat, truncate, xattr set): a lower-only entry is COPIED UP
  * first so the operation acts on the box's copy and O_EXCL/no-O_CREAT
- * opens see the merged view's existence truthfully. */
+ * opens see the merged view's existence truthfully.  FOR_CREATE
+ * (re)creates the name (open with O_CREAT, mkdir, mknod, symlink,
+ * rename/link destination): like FOR_WRITE, but an upper WHITEOUT
+ * marker is removed first — without that, a delete-then-recreate
+ * cycle (ld unlinks its old output, then creates it) hands the
+ * syscall the bare char-dev marker: open → ENXIO, mkdir/linkat →
+ * EEXIST.  Non-create writes on a whiteout resolve to _WHITEOUT
+ * (the name is logically absent) instead of the marker node. */
 #define SUD_OVERLAY_FOR_READ    0
 #define SUD_OVERLAY_FOR_WRITE   1
 #define SUD_OVERLAY_FOR_MODIFY  2
+#define SUD_OVERLAY_FOR_CREATE  3
 
 int sud_overlay_resolve(const char *path, int for_write,
                         char *out, size_t out_sz);

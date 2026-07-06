@@ -889,8 +889,9 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
             if (fd != SUD_OVERLAY_NO_DIR) return short_circuit(ctx, fd);
         }
         int rc = remap_path_arg(ctx, 0,
-            open_is_write(flags) ? SUD_OVERLAY_FOR_MODIFY
-                                 : SUD_OVERLAY_FOR_READ);
+            (flags & O_CREAT)      ? SUD_OVERLAY_FOR_CREATE
+            : open_is_write(flags) ? SUD_OVERLAY_FOR_MODIFY
+                                   : SUD_OVERLAY_FOR_READ);
         return handle_overlay_result(ctx, rc);
     }
 #endif
@@ -904,8 +905,9 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
             if (fd != SUD_OVERLAY_NO_DIR) return short_circuit(ctx, fd);
         }
         int rc = remap_path_arg_at(ctx, 0, 1,
-            open_is_write(flags) ? SUD_OVERLAY_FOR_MODIFY
-                                 : SUD_OVERLAY_FOR_READ);
+            (flags & O_CREAT)      ? SUD_OVERLAY_FOR_CREATE
+            : open_is_write(flags) ? SUD_OVERLAY_FOR_MODIFY
+                                   : SUD_OVERLAY_FOR_READ);
         return handle_overlay_result(ctx, rc);
     }
 #endif
@@ -1064,25 +1066,25 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
     /* ---- mkdir / mknod / symlink / link / rename / truncate ----- */
 #ifdef __NR_mkdir
     if (nr == __NR_mkdir) {
-        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_WRITE);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_CREATE);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_mkdirat
     if (nr == __NR_mkdirat) {
-        int rc = remap_path_arg_at(ctx, 0, 1, SUD_OVERLAY_FOR_WRITE);
+        int rc = remap_path_arg_at(ctx, 0, 1, SUD_OVERLAY_FOR_CREATE);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_mknod
     if (nr == __NR_mknod) {
-        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_WRITE);
+        int rc = remap_path_arg(ctx, 0, SUD_OVERLAY_FOR_CREATE);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_mknodat
     if (nr == __NR_mknodat) {
-        int rc = remap_path_arg_at(ctx, 0, 1, SUD_OVERLAY_FOR_WRITE);
+        int rc = remap_path_arg_at(ctx, 0, 1, SUD_OVERLAY_FOR_CREATE);
         return handle_overlay_result(ctx, rc);
     }
 #endif
@@ -1090,13 +1092,13 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
     if (nr == __NR_symlink) {
         /* arg0 is symlink target (just a string, not a fs lookup),
          * arg1 is the link path that gets created. */
-        int rc = remap_path_arg(ctx, 1, SUD_OVERLAY_FOR_WRITE);
+        int rc = remap_path_arg(ctx, 1, SUD_OVERLAY_FOR_CREATE);
         return handle_overlay_result(ctx, rc);
     }
 #endif
 #ifdef __NR_symlinkat
     if (nr == __NR_symlinkat) {
-        int rc = remap_path_arg_at(ctx, 1, 2, SUD_OVERLAY_FOR_WRITE);
+        int rc = remap_path_arg_at(ctx, 1, 2, SUD_OVERLAY_FOR_CREATE);
         return handle_overlay_result(ctx, rc);
     }
 #endif
