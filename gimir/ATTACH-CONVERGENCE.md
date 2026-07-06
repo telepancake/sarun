@@ -101,8 +101,9 @@ design; supersedes the earlier spine/side-chain sketch;
 ✅ git portion IMPLEMENTED 2026-07-06 — gitdepot store v2 in
 `gitdepot/src/store.rs` over wikimak-depot; batch prepends via the
 depot's normative `compose_f1`/`chunk_newest_first` composition, also
-adopted by wikipedia's import; v1 stores migrate on open; the non-FF /
-retire / salvage mechanisms are deleted): one tiered
+adopted by wikipedia's import; NO migrations — one format, older
+stores error loudly and re-import (mirrors are rebuildable); the
+non-FF / retire / salvage mechanisms are deleted): one tiered
 store (wikimak-depot chains — bounded prepend for free) holding a
 trees chain, a commits chain, and a reflog chain. Records get stable
 indices counted from the OLDEST end — prepend-invariant by
@@ -115,8 +116,12 @@ records keep their indices forever — no non-FF path, no re-import,
 no retirement, no salvage check (all three interim mechanisms get
 DELETED by this chip). Commit records carry parent indices (lineage
 lives in the data, not in storage topology) and the sha as the
-export-fidelity payload; a sha→idx sqlite index exists only as a
-derived, rebuildable import-dedup aid. The trees chain stores REVERSE
+export-fidelity payload; sha→idx is an in-RAM map built by one
+commits-chain walk per open store handle — sqlite holds ONLY kv +
+current refs. COMMITS/REFLOG objects are BATCHED into one chain
+record per ingest (`base_idx | count | length-prefixed objects,
+oldest-first`), so f0 and the refPrefix anchors have meat instead of
+one tiny object each. The trees chain stores REVERSE
 DELTAS (head = full layer; older = diff rebuilding older-from-newer,
 v1's proven record family), and tree fetch is the cached-walk: make a
 cached tree state out of f0, keep applying reverse deltas from the
@@ -124,6 +129,8 @@ chain, at each frame boundary re-encode the current state to use as
 the refPrefix for the next older frame, until the target index is
 reached. Prepend demotes the former head to a bridge delta in the
 accumulator (bounded: f0 + f1 re-encode only, cold untouched). Tree
-dedup keys on the full view's canonical bytes, not delta bytes —, (8) depot verbs on the UDS,
+dedup is parent-tree-oid comparison plus an intra-ingest map — no
+persistent oid index; a revert to a distant ancestor's tree just costs
+one small delta record —, (8) depot verbs on the UDS,
 (9) first script-driven mirror (ietf is smallest) proving the loop,
 (10) wikipedia logic migrated, dump-scan as an engine service.

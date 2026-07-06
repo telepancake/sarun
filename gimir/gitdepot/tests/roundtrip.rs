@@ -234,9 +234,13 @@ fn incremental_update_appends_and_exports_sha_exact() {
     assert_eq!(o2.depot_prepends, 0, "no-op update wrote chain records");
 }
 
-/// Batch prepend ≡ sequential prepends: the same three commits landed
-/// as one 3-commit update and as three 1-commit updates must produce
-/// byte-identical tree/commit records with identical stable indices.
+/// Batch prepend ≡ sequential prepends at OBJECT level: the same three
+/// commits landed as one 3-commit update and as three 1-commit updates
+/// must produce identical commit objects at identical stable indices,
+/// identical refs rows and sha↔idx mapping, and byte-identical TREES
+/// records —
+/// batch-record boundaries legitimately differ (one 3-object batch vs
+/// three 1-object batches).
 #[test]
 fn batch_update_equals_sequential_updates() {
     let tmp = tempfile::tempdir().unwrap();
@@ -277,15 +281,28 @@ fn batch_update_equals_sequential_updates() {
     let sb = gitdepot::store::Store::open(&b).unwrap();
     let ra = sa.commit_records().unwrap();
     let rb = sb.commit_records().unwrap();
-    assert_eq!(ra, rb, "commit records diverge between batch and sequential");
-    let va = sa.tree_views(None).unwrap();
-    let vb = sb.tree_views(None).unwrap();
-    assert_eq!(va.len(), vb.len(), "tree counts diverge");
-    for (i, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
-        let ex = depot::codec::encode(&depot::diff(None, Some(x)));
-        let ey = depot::codec::encode(&depot::diff(None, Some(y)));
-        assert_eq!(ex, ey, "tree at newest-first position {i} diverges");
-    }
+    assert_eq!(ra, rb, "commit objects diverge between batch and sequential");
+    assert_eq!(sa.ref_rows().unwrap(), sb.ref_rows().unwrap(), "refs diverge");
+    // The derived sha → idx mapping agrees (walk-built; no sqlite index).
+    let sha_pairs = |st: &gitdepot::store::Store| -> Vec<(u64, String)> {
+        let mut v: Vec<(u64, String)> = st
+            .commit_records()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.idx, r.sha))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(sha_pairs(&sa), sha_pairs(&sb), "sha↔idx mapping diverges");
+    // TREES is untouched by batching: raw records byte-identical.
+    let tree_recs = |st: &gitdepot::store::Store| -> Vec<Vec<u8>> {
+        let mut recs = Vec::new();
+        st.walk_tree_views(None, &mut |_, rec, _| recs.push(rec.to_vec()))
+            .unwrap();
+        recs
+    };
+    assert_eq!(tree_recs(&sa), tree_recs(&sb), "tree records diverge");
 }
 
 #[test]
@@ -426,42 +443,122 @@ fn update_io_is_bounded_not_o_history() {
              bytes after doubling the commit count) — prepend is O(history)");
 }
 
-/// A v1 store (flat chain + legacy bookkeeping) migrates to v2 on open:
-/// depot + schema=2 sqlite appear, the chain file disappears, and the
-/// round-trip stays SHA-exact across the migration.
+/// Object reads across batch-record boundaries: each update lands one
+/// batch per touched chain, so several updates make several batches —
+/// commit_at must return the right object at every index (first/last
+/// of every batch included), and the reflog must come back complete
+/// and ordered across its batches.
 #[test]
-fn v1_store_migrates_on_open() {
+fn object_reads_cross_batch_boundaries() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     let store = tmp.path().join("store");
-    let v1 = tmp.path().join("store-v1");
+    build_fixture(&repo);
+    // Import batch: 13 commits → indices 0..=12 in one batch.
+    gitdepot::import(&repo, &store, 3).unwrap();
+    let mut expected: Vec<String> = {
+        let meta = gitdepot::store::read_meta(&store).unwrap();
+        meta.commits.iter().rev().map(|c| c.sha.clone()).collect()
+    };
+    // Three more batches of 3, 1, 2 commits.
+    for (batch, n) in [(0u32, 3u32), (1, 1), (2, 2)] {
+        for i in 0..n {
+            std::fs::write(repo.join("doc.txt"), format!("b{batch} c{i}\n")).unwrap();
+            sh_git(&repo, &["add", "-A"]);
+            sh_git(&repo, &["commit", "-q", "-m", &format!("b{batch} c{i}")]);
+            expected.push(sh_git(&repo, &["rev-parse", "HEAD"]).trim().to_string());
+        }
+        gitdepot::update(&repo, &store, 3).unwrap();
+    }
+    assert_eq!(gitdepot::commit_count(&store).unwrap(), expected.len());
+    // Every index — boundaries 0/12/13/15/16/17/18 included.
+    for (idx, sha) in expected.iter().enumerate() {
+        assert_eq!(
+            &gitdepot::commit_at(&store, idx).unwrap().sha,
+            sha,
+            "commit_at({idx}) crossed a batch boundary wrong"
+        );
+    }
+    // Reflog: complete, oldest-first, indices consistent across batches.
+    let log = gitdepot::store::reflog(&store).unwrap();
+    assert!(log.len() >= 2 + 3, "reflog lost rows across batches: {}", log.len());
+    let mains: Vec<_> = log.iter().filter(|e| e.refname == "refs/heads/main").collect();
+    assert_eq!(mains.last().unwrap().new_sha.as_deref(), Some(expected.last().unwrap().as_str()));
+    for w in mains.windows(2) {
+        assert_eq!(w[1].old_commit_idx, w[0].new_commit_idx,
+                   "reflog rows out of order across batches");
+    }
+}
+
+/// Tree dedup is parent-oid comparison + an intra-ingest map, NOT a
+/// persistent index: an empty commit (tree oid == parent's) reuses the
+/// parent's tree_idx with no new TREES record — across the update path
+/// too (parent tree oid fetched from the buffer) — while a tree
+/// bit-identical to a DISTANT ancestor (revert) deliberately mints a
+/// new (small) record.
+#[test]
+fn tree_dedup_reuses_parent_not_distant_ancestors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let store = tmp.path().join("store");
+    build_fixture(&repo);
+    sh_git(&repo, &["commit", "-q", "--allow-empty", "-m", "same tree"]);
+    gitdepot::import(&repo, &store, 3).unwrap();
+
+    let st = gitdepot::store::Store::open(&store).unwrap();
+    let n_commits = st.count(gitdepot::store::COMMITS).unwrap();
+    assert_eq!(n_commits, 14);
+    assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 13,
+               "identical-to-parent tree minted a fresh TREES record");
+    let tip = st.commit_record_at(n_commits - 1).unwrap();
+    let parent = st.commit_record_at(tip.parent_idxs[0]).unwrap();
+    assert_eq!(tip.tree_idx, parent.tree_idx);
+    drop(st);
+
+    // Update path: empty commit on top, parent already in the store.
+    sh_git(&repo, &["commit", "-q", "--allow-empty", "-m", "same tree again"]);
+    gitdepot::update(&repo, &store, 3).unwrap();
+    let st = gitdepot::store::Store::open(&store).unwrap();
+    assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 13);
+    let tip = st.commit_record_at(14).unwrap();
+    assert_eq!(tip.tree_idx, 12);
+    drop(st);
+
+    // Revert to a distant ancestor's exact tree: same view, NEW record
+    // (the explicit trade — no persistent all-history oid index).
+    sh_git(&repo, &["rm", "-r", "-q", "."]);
+    sh_git(&repo, &["checkout", "-q", "main~6", "--", "."]);
+    sh_git(&repo, &["commit", "-q", "-m", "revert to ancestor"]);
+    assert_eq!(
+        sh_git(&repo, &["rev-parse", "main^{tree}"]),
+        sh_git(&repo, &["rev-parse", "main~7^{tree}"]),
+        "fixture: revert did not reproduce the ancestor tree"
+    );
+    gitdepot::update(&repo, &store, 3).unwrap();
+    let st = gitdepot::store::Store::open(&store).unwrap();
+    assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 14,
+               "revert-to-ancestor should mint a new TREES record");
+}
+
+/// Exactly ONE supported on-disk format: a mismatched kv schema value
+/// (a store written by older code) fails open loudly.
+#[test]
+fn open_refuses_mismatched_schema() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let store = tmp.path().join("store");
     build_fixture(&repo);
     gitdepot::import(&repo, &store, 3).unwrap();
-    gitdepot::store::legacy::write_v1_from_v2_for_tests(&store, &v1, 3).unwrap();
-    assert!(v1.join("chain").exists() && v1.join("meta.json").exists());
-
-    // Any open migrates: a read path suffices.
-    assert_eq!(gitdepot::commit_count(&v1).unwrap(), 13);
-    assert!(v1.join("meta.sqlite").exists(), "migration did not mint sqlite");
-    assert!(v1.join("depot").is_dir(), "migration did not build the depot");
-    assert!(!v1.join("chain").exists(), "v1 chain left behind");
-    assert!(!v1.join("meta.json").exists(), "legacy json left behind");
-
-    // Resolution + stable indices work post-migration.
-    let meta = gitdepot::store::read_meta(&v1).unwrap();
-    let (sha, idx) = gitdepot::resolve_ref(&v1, "main").unwrap().unwrap();
-    assert_eq!(sha, meta.commits[0].sha);
-    assert_eq!(idx, 12, "main is the newest commit (stable index N-1)");
-
-    // Writes keep working (a one-commit update) and export is SHA-exact.
-    std::fs::write(repo.join("doc.txt"), "post-migration\n").unwrap();
-    sh_git(&repo, &["add", "-A"]);
-    sh_git(&repo, &["commit", "-q", "-m", "post-migration"]);
-    let o = gitdepot::update(&repo, &v1, 3).unwrap();
-    assert_eq!((o.new_commits, o.total_commits), (1, 14));
-    let out = tmp.path().join("out");
-    let refs = gitdepot::export(&v1, &out).unwrap();
-    assert!(!refs.is_empty(), "post-migration export lost refs");
+    let conn = rusqlite::Connection::open(store.join("meta.sqlite")).unwrap();
+    conn.execute("UPDATE kv SET value = '2' WHERE key = 'schema'", []).unwrap();
+    drop(conn);
+    match gitdepot::store::Store::open(&store) {
+        Err(gitdepot::Error::Chain(m)) => {
+            assert!(m.contains("older code") && m.contains("re-import"), "weak error: {m}")
+        }
+        Err(e) => panic!("expected schema error, got: {e}"),
+        Ok(_) => panic!("open succeeded on a store written by older code"),
+    }
 }
 
 /// resolve_ref point-lookup semantics: bare name, full refname, tag,
@@ -495,6 +592,9 @@ fn resolve_ref_point_lookups() {
     }
     assert_eq!(gitdepot::resolve_ref(&store, &target[..plen]).unwrap().unwrap(),
                (target.clone(), n - 6));
+    // Both prefix parities resolve (a longer unique prefix stays unique).
+    assert_eq!(gitdepot::resolve_ref(&store, &target[..plen + 1]).unwrap().unwrap(),
+               (target.clone(), n - 6));
     // Stable index round-trips through commit_at.
     assert_eq!(gitdepot::commit_at(&store, n - 6).unwrap().sha, *target);
 
@@ -511,8 +611,8 @@ fn resolve_ref_point_lookups() {
 
 /// §9 anti-sabotage, METADATA cost axis: a one-commit update must do
 /// O(new) bookkeeping. The proof is structural: every pre-existing
-/// sha_idx row keeps its exact (sha, index) pair — stable indices are
-/// never renumbered — and the new commit lands at index N.
+/// commit keeps its exact (sha, index) pair — stable indices are never
+/// renumbered — and the new commit lands at index N.
 #[test]
 fn update_metadata_is_o_new_not_o_history() {
     let tmp = tempfile::tempdir().unwrap();
@@ -526,17 +626,14 @@ fn update_metadata_is_o_new_not_o_history() {
     }
     gitdepot::import(&repo, &store, 3).unwrap();
 
-    let rows = |store: &Path| -> Vec<(i64, String)> {
-        let conn = rusqlite::Connection::open(store.join("meta.sqlite")).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT commit_idx, sha FROM sha_idx ORDER BY commit_idx ASC")
-            .unwrap();
-        let v = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    let rows = |store: &Path| -> Vec<(u64, String)> {
+        gitdepot::store::Store::open(store)
             .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        v
+            .commit_records()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.idx, r.sha))
+            .collect()
     };
     let before = rows(&store);
     assert_eq!(before.len(), 133);

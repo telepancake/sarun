@@ -1,17 +1,31 @@
-//! Store v2 — three tiered chains + stable indices (ATTACH-CONVERGENCE.md
+//! Store — three tiered chains + stable indices (ATTACH-CONVERGENCE.md
 //! chip 7, design of record 2026-07-06).
 //!
 //! `<store>/depot/`      — ONE wikimak-depot instance holding three chains:
 //!                         TREES=0, COMMITS=1, REFLOG=2.
-//! `<store>/meta.sqlite` — bookkeeping (WAL): `kv` (schema=2, label, url,
+//! `<store>/meta.sqlite` — bookkeeping (WAL): `kv` (schema=3, label, url,
 //!                         n_trees/n_commits/n_reflog counts — the
 //!                         AUTHORITATIVE index base), `refs` (CURRENT refs
-//!                         only: name → commit_idx, tree_idx), `sha_idx`
-//!                         (sha → commit_idx; DERIVED import-dedup index,
-//!                         rebuildable from the commits chain), `tree_hash`
-//!                         (sha256 of a tree's canonical full-view bytes →
-//!                         tree_idx; DERIVED dedup index, rebuildable,
-//!                         never in any record).
+//!                         only: name → commit_idx, tree_idx). NOTHING
+//!                         else: every id-keyed lookup derives from the
+//!                         chains on demand. sha → idx is an in-RAM map
+//!                         built by ONE object-level walk of the COMMITS
+//!                         chain, cached for the life of the open Store
+//!                         handle (one walk per mirror-tick process); a
+//!                         ref-NAME attach is a refs point-read plus a
+//!                         tip-biased object fetch — it never builds the
+//!                         map; a sha attach walks once per process.
+//!
+//! Tree dedup at ingest is (1) an in-RAM git-tree-oid → tree_idx map
+//! scoped to the Ingest and (2) reuse of the parent's tree_idx when the
+//! incoming commit's tree oid equals a parent's (empty/metadata
+//! commits — the dominant case; oid equality ⇔ canonical-view equality
+//! here because no tree node is cooked: modes verbatim as attrs, blobs
+//! as-is, gitlink oids as blobs). A tree bit-identical to a DISTANT
+//! ancestor (revert) is deliberately NOT deduped: it costs one ordinary
+//! reverse-delta record sized by the actual change, which beats
+//! carrying a persistent all-history oid index (100+MB at linux
+//! scale) for the rare revert.
 //!
 //! **Stable indices**: records are numbered from the OLDEST end. Record k
 //! of a chain whose kv count is N sits at newest-first walk position
@@ -39,34 +53,41 @@
 //! (bit-exact canonical encoding is load-bearing — encoder and decoder
 //! share `codec::encode(diff(None, view))`). Fetching tree k therefore
 //! walks head→k applying deltas (O(distance from tip)); the tip itself is
-//! one standalone frame. COMMITS/REFLOG records stand alone, so their
-//! demotion is verbatim and cold anchors are simply the last record
-//! decoded (the wikipedia discipline).
+//! one standalone frame.
+//!
+//! COMMITS/REFLOG chain records are BATCHES: one record per ingest
+//! (an update's new commits, an import, one ref transaction), never
+//! split by the seal threshold — sealing stays a between-prepends
+//! decision on the accumulator. Batch record layout:
+//!   `u64 LE base_idx | u32 LE count | count × (u32 LE len | object)`,
+//! objects OLDEST-FIRST within the batch, object stable index =
+//! base_idx + offset. Batch records stand alone, so their demotion is
+//! verbatim and cold anchors are simply the last record decoded (the
+//! wikipedia discipline). Object reads walk records newest-first and
+//! skip a batch on its header alone when the wanted index is out of
+//! its [base, base+count) range. kv counts are OBJECT counts.
 //!
 //! **Durability/integrity**: depot writes are flushed durable BEFORE the
 //! sqlite transaction commits, so kv counts are never ahead of the
-//! chains. COMMITS/REFLOG records embed their own stable index; on open
-//! the head record of each non-empty chain must carry idx == count-1 or
-//! the store errors loudly (a crash between depot flush and sqlite commit
-//! can leave orphan newer frames — detected, not auto-repaired). TREES
-//! records are pure codec bytes (they double as refPrefix anchors), so
-//! the trees chain is cross-checked through the head commit's tree_idx
-//! bound and verified in depth by any walk.
+//! chains. COMMITS/REFLOG objects embed their own stable index; on open
+//! the head batch of each non-empty chain must cover exactly up to
+//! count-1 or the store errors loudly (a crash between depot flush and
+//! sqlite commit can leave orphan newer frames — detected, not
+//! auto-repaired). TREES records are pure codec bytes (they double as
+//! refPrefix anchors), so the trees chain is cross-checked through the
+//! head commit's tree_idx bound and verified in depth by any walk.
 //!
-//! A v1 store (flat `chain` file + schema=1 meta.sqlite or legacy
-//! meta.json) is migrated to v2 in full on ANY open — read paths
-//! included — after which the v1 chain file and bookkeeping are removed.
+//! There is exactly ONE on-disk format: kv schema=3. A store written by
+//! older code errors loudly on open — delete and re-import; mirrors are
+//! rebuildable.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension};
-use sha2::Digest as _;
 use wikimak_depot::{Depot, DepotConfig};
 
 use crate::{CommitMeta, Error, Meta, RefMeta, Result};
-
-pub mod legacy;
 
 pub const TREES: u64 = 0;
 pub const COMMITS: u64 = 1;
@@ -96,15 +117,6 @@ CREATE TABLE IF NOT EXISTS refs(
     commit_idx INTEGER NOT NULL,
     tree_idx   INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS sha_idx(
-    sha        TEXT PRIMARY KEY,
-    commit_idx INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS sha_idx_rev ON sha_idx(commit_idx);
-CREATE TABLE IF NOT EXISTS tree_hash(
-    hash     BLOB PRIMARY KEY,
-    tree_idx INTEGER NOT NULL
-);
 ";
 
 pub(crate) fn sql_err(e: rusqlite::Error) -> Error {
@@ -115,20 +127,17 @@ fn db_path(store: &Path) -> PathBuf {
     store.join("meta.sqlite")
 }
 
-/// True when `store` holds a store in ANY format (v2, v1 sqlite, or
-/// legacy meta.json) — "is there a store here?".
+/// "Is there a store here?"
 pub fn store_exists(store: &Path) -> bool {
-    db_path(store).exists() || store.join("meta.json").exists()
+    db_path(store).exists()
 }
 
+/// The one supported on-disk format. Anything else on open = loud
+/// error (unreleased software: no migrations, mirrors are rebuildable).
+const SCHEMA_VERSION: &str = "3";
+
 fn configure(conn: &Connection) -> Result<()> {
-    // sha-prefix resolution goes through LIKE; git shas are
-    // case-sensitive, and case-sensitive LIKE can use the sha index.
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;\n\
-         PRAGMA case_sensitive_like=ON;",
-    )
-    .map_err(sql_err)
+    conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(sql_err)
 }
 
 fn now_secs() -> i64 {
@@ -183,7 +192,8 @@ impl<'a> Cur<'a> {
     }
 }
 
-/// One COMMITS-chain record. Lineage is `parent_idxs` — stable indices,
+/// One COMMITS-chain object (batched into chain records). Lineage is
+/// `parent_idxs` — stable indices,
 /// not shas; the sha is kept as the export-fidelity payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRecord {
@@ -201,6 +211,15 @@ pub struct CommitRecord {
 }
 
 impl CommitRecord {
+    /// `(idx, sha)` without decoding the rest — the sha-map builder.
+    fn peek_idx_sha(b: &[u8]) -> Result<(u64, String)> {
+        let mut c = Cur::new(b);
+        let idx = c.u64()?;
+        let sha = String::from_utf8(c.bytes()?.to_vec())
+            .map_err(|_| Error::Chain("commit record: non-utf8 sha".into()))?;
+        Ok((idx, sha))
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.idx.to_le_bytes());
@@ -259,7 +278,8 @@ impl CommitRecord {
     }
 }
 
-/// One REFLOG-chain record: an observed ref movement. `old` absent =
+/// One REFLOG-chain object (batched into chain records): an observed
+/// ref movement. `old` absent =
 /// creation; `new` absent = deletion. Values are `(commit_idx,
 /// tree_idx)` pairs. Prepended BEFORE the refs table row changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +371,42 @@ fn frame_entry(rec: &[u8]) -> Vec<u8> {
     out
 }
 
+// ---------------------------------------------------------- batch records
+// COMMITS/REFLOG chain record = one ingest's objects (module doc):
+// u64 LE base_idx | u32 LE count | count × (u32 LE len | object bytes),
+// objects oldest-first, object stable idx = base_idx + offset.
+
+fn encode_batch(base_idx: u64, objects_oldest_first: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        12 + objects_oldest_first.iter().map(|o| o.len() + 4).sum::<usize>(),
+    );
+    out.extend_from_slice(&base_idx.to_le_bytes());
+    out.extend_from_slice(&(objects_oldest_first.len() as u32).to_le_bytes());
+    for o in objects_oldest_first {
+        put_bytes(&mut out, o);
+    }
+    out
+}
+
+/// `(base_idx, count)` — the range check needs no object decoding.
+fn batch_header(rec: &[u8]) -> Result<(u64, u32)> {
+    let mut c = Cur::new(rec);
+    Ok((c.u64()?, c.u32()?))
+}
+
+/// `(base_idx, objects oldest-first)`.
+fn decode_batch(rec: &[u8]) -> Result<(u64, Vec<Vec<u8>>)> {
+    let mut c = Cur::new(rec);
+    let base = c.u64()?;
+    let n = c.u32()? as usize;
+    let mut objs = Vec::with_capacity(n);
+    for _ in 0..n {
+        objs.push(c.bytes()?.to_vec());
+    }
+    c.done()?;
+    Ok((base, objs))
+}
+
 /// How the former head record joins the accumulator on prepend.
 pub(crate) enum Demote<'a> {
     /// Record stands alone (COMMITS, REFLOG): moves in verbatim.
@@ -366,12 +422,16 @@ pub struct Store {
     depot: Depot,
     pub(crate) conn: Connection,
     root: PathBuf,
+    /// Lazily built sha → stable idx map (ONE commits-chain walk),
+    /// never persisted, discarded with the handle; invalidated by
+    /// ingest flushes.
+    sha_map: std::cell::OnceCell<HashMap<String, u64>>,
 }
 
 impl Store {
-    /// Create a fresh, empty v2 store. Errors if one is already there.
+    /// Create a fresh, empty store. Errors if one is already there.
     pub fn create(store: &Path) -> Result<Store> {
-        if store_exists(store) || store.join("chain").exists() {
+        if store_exists(store) {
             return Err(Error::Chain(format!(
                 "store {} already populated",
                 store.display()
@@ -382,10 +442,10 @@ impl Store {
         let conn = Connection::open(db_path(store)).map_err(sql_err)?;
         configure(&conn)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        let s = Store { depot, conn, root: store.to_path_buf() };
+        let s = Store { depot, conn, root: store.to_path_buf(), sha_map: Default::default() };
         let tx = s.conn.unchecked_transaction().map_err(sql_err)?;
         for (k, v) in [
-            ("schema", "2"),
+            ("schema", SCHEMA_VERSION),
             ("label", ""),
             ("url", ""),
             ("n_trees", "0"),
@@ -398,14 +458,10 @@ impl Store {
         Ok(s)
     }
 
-    /// Open an existing store. A v1 store is migrated to v2 first (the
-    /// flat chain + v1 bookkeeping are consumed and removed).
+    /// Open an existing store.
     pub fn open(store: &Path) -> Result<Store> {
         if !store_exists(store) {
             return Err(Error::Chain(format!("no store at {}", store.display())));
-        }
-        if schema_version(store)? < 2 {
-            legacy::migrate(store)?;
         }
         let depot = open_depot(store)?;
         let conn = Connection::open_with_flags(
@@ -414,13 +470,23 @@ impl Store {
         )
         .map_err(sql_err)?;
         configure(&conn)?;
-        let s = Store { depot, conn, root: store.to_path_buf() };
+        let schema = kv_get(&conn, "schema")?.unwrap_or_default();
+        if schema != SCHEMA_VERSION {
+            return Err(Error::Chain(format!(
+                "store {} has schema {schema:?}, this build writes {SCHEMA_VERSION} — \
+                 store written by older code; delete and re-import (mirrors are \
+                 rebuildable)",
+                store.display()
+            )));
+        }
+        let s = Store { depot, conn, root: store.to_path_buf(), sha_map: Default::default() };
         s.integrity_check()?;
         Ok(s)
     }
 
     /// Loud count/chain agreement check (see module doc): the head
-    /// record of each self-indexing chain must carry idx == count-1.
+    /// batch of each self-indexing chain must cover exactly up to
+    /// count-1.
     fn integrity_check(&self) -> Result<()> {
         for (chain, name, count) in [
             (COMMITS, "commits", self.count(COMMITS)?),
@@ -432,13 +498,13 @@ impl Store {
             let head = self
                 .read_head(chain)?
                 .ok_or_else(|| Error::Chain(format!("{name}: count {count} but empty chain")))?;
-            let idx = Cur::new(&head).u64()?;
-            if idx != count - 1 {
+            let (base, n) = batch_header(&head)?;
+            if base + n as u64 != count {
                 return Err(Error::Chain(format!(
-                    "{name}: head record idx {idx} != count-1 ({}) — chains and \
-                     bookkeeping disagree (crash between depot flush and sqlite \
-                     commit?); re-mirror the store",
-                    count - 1
+                    "{name}: head batch covers [{base}, {}) but kv count is {count} — \
+                     chains and bookkeeping disagree (crash between depot flush and \
+                     sqlite commit?); re-mirror the store",
+                    base + n as u64
                 )));
             }
         }
@@ -547,25 +613,70 @@ impl Store {
             .map_err(|e| Error::Chain(e.to_string()))
     }
 
-    /// All records of a standalone-record chain (COMMITS, REFLOG),
-    /// newest-first. Anchors: f1 on the f0 record; each cold frame on
-    /// the last (oldest) record decoded before it.
-    pub(crate) fn records_newest_first(&self, chain: u64) -> Result<Vec<Vec<u8>>> {
+    /// Walk the records of a standalone-record chain (COMMITS, REFLOG —
+    /// each record a batch) newest-first; `visit` returns true to stop
+    /// (later tiers stay undecompressed). Anchors: f1 on the f0 record;
+    /// each cold frame on the last (oldest) record decoded before it.
+    fn walk_records(
+        &self,
+        chain: u64,
+        visit: &mut dyn FnMut(&[u8]) -> Result<bool>,
+    ) -> Result<()> {
         let Some(head) = self.read_head(chain)? else {
-            return Ok(Vec::new());
+            return Ok(());
         };
-        let mut out = vec![head];
+        if visit(&head)? {
+            return Ok(());
+        }
+        let mut anchor = head;
         if let Some(f1) = self.depot.read_f1(chain).map_err(|e| Error::Chain(e.to_string()))? {
-            let raw = decompress(&f1, Some(&out[0]))?;
-            out.extend(split_records(&raw)?);
+            let raw = decompress(&f1, Some(&anchor))?;
+            for rec in split_records(&raw)? {
+                if visit(&rec)? {
+                    return Ok(());
+                }
+                anchor = rec;
+            }
         }
         for cold in self.depot.cold_iter(chain).map_err(|e| Error::Chain(e.to_string()))? {
             let frame = cold.map_err(|e| Error::Chain(e.to_string()))?;
-            let anchor = out.last().expect("cold after f1").clone();
             let raw = decompress(&frame, Some(&anchor))?;
-            out.extend(split_records(&raw)?);
+            for rec in split_records(&raw)? {
+                if visit(&rec)? {
+                    return Ok(());
+                }
+                anchor = rec;
+            }
         }
+        Ok(())
+    }
+
+    /// All OBJECTS of a batched chain, newest-first (batches expanded).
+    pub(crate) fn objects_newest_first(&self, chain: u64) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        self.walk_records(chain, &mut |rec| {
+            let (_, objs) = decode_batch(rec)?;
+            out.extend(objs.into_iter().rev());
+            Ok(false)
+        })?;
         Ok(out)
+    }
+
+    /// The object at stable index `idx` of a batched chain — batches
+    /// whose header range excludes `idx` are skipped undecoded, and
+    /// the walk stops at the hit (tip-biased reads never touch cold).
+    fn object_at(&self, chain: u64, idx: u64) -> Result<Option<Vec<u8>>> {
+        let mut hit = None;
+        self.walk_records(chain, &mut |rec| {
+            let (base, count) = batch_header(rec)?;
+            if idx < base || idx >= base + count as u64 {
+                return Ok(false);
+            }
+            let (_, mut objs) = decode_batch(rec)?;
+            hit = Some(objs.swap_remove((idx - base) as usize));
+            Ok(true)
+        })?;
+        Ok(hit)
     }
 
     /// Walk the TREES chain newest-first, reconstructing views into ONE
@@ -662,33 +773,36 @@ impl Store {
 
     // -------------------------------------------------------- lookups
 
+    /// The lazily built sha → idx map (module doc cost model). Name
+    /// resolution must NOT come through here.
+    pub(crate) fn sha_map(&self) -> Result<&HashMap<String, u64>> {
+        if self.sha_map.get().is_none() {
+            let mut m = HashMap::new();
+            self.walk_records(COMMITS, &mut |rec| {
+                let (_, objs) = decode_batch(rec)?;
+                for o in objs {
+                    let (idx, sha) = CommitRecord::peek_idx_sha(&o)?;
+                    m.insert(sha, idx);
+                }
+                Ok(false)
+            })?;
+            let _ = self.sha_map.set(m);
+        }
+        Ok(self.sha_map.get().expect("just set"))
+    }
+
     pub fn sha_to_idx(&self, sha: &str) -> Result<Option<u64>> {
-        self.conn
-            .query_row("SELECT commit_idx FROM sha_idx WHERE sha = ?1", [sha], |r| {
-                r.get::<_, i64>(0).map(|v| v as u64)
-            })
-            .optional()
-            .map_err(sql_err)
+        Ok(self.sha_map()?.get(sha).copied())
     }
 
+    /// idx → sha via the commit object itself (batch-skipping,
+    /// tip-biased) — deliberately NOT the map, so name-keyed paths
+    /// never pay the full walk.
     pub fn idx_to_sha(&self, idx: u64) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT sha FROM sha_idx WHERE commit_idx = ?1",
-                [idx as i64],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(sql_err)
-    }
-
-    pub fn tree_idx_for_hash(&self, hash: &[u8]) -> Result<Option<u64>> {
-        self.conn
-            .query_row("SELECT tree_idx FROM tree_hash WHERE hash = ?1", [hash], |r| {
-                r.get::<_, i64>(0).map(|v| v as u64)
-            })
-            .optional()
-            .map_err(sql_err)
+        match self.object_at(COMMITS, idx)? {
+            Some(o) => Ok(Some(CommitRecord::peek_idx_sha(&o)?.1)),
+            None => Ok(None),
+        }
     }
 
     /// CURRENT refs: name → (commit_idx, tree_idx), name-ordered.
@@ -737,15 +851,13 @@ impl Store {
         if idx >= n {
             return Err(Error::Meta(format!("no commit at index {idx}")));
         }
-        let pos = (n - 1 - idx) as usize;
-        let recs = self.records_newest_first(COMMITS)?;
-        let rec = recs
-            .get(pos)
+        let obj = self
+            .object_at(COMMITS, idx)?
             .ok_or_else(|| Error::Chain(format!("commits chain short of index {idx}")))?;
-        let cr = CommitRecord::decode(rec)?;
+        let cr = CommitRecord::decode(&obj)?;
         if cr.idx != idx {
             return Err(Error::Chain(format!(
-                "commit record at position {pos} carries idx {} (wanted {idx})",
+                "commit object at batch offset for {idx} carries idx {}",
                 cr.idx
             )));
         }
@@ -755,7 +867,7 @@ impl Store {
     /// All commit records, oldest-first (position = stable index).
     pub fn commit_records(&self) -> Result<Vec<CommitRecord>> {
         let mut recs = self
-            .records_newest_first(COMMITS)?
+            .objects_newest_first(COMMITS)?
             .iter()
             .map(|b| CommitRecord::decode(b))
             .collect::<Result<Vec<_>>>()?;
@@ -776,7 +888,7 @@ impl Store {
         let mut parents = Vec::with_capacity(rec.parent_idxs.len());
         for p in &rec.parent_idxs {
             parents.push(self.idx_to_sha(*p)?.ok_or_else(|| {
-                Error::Meta(format!("parent index {p} has no sha in sha_idx"))
+                Error::Meta(format!("parent index {p} has no sha in the commits chain"))
             })?);
         }
         Ok(CommitMeta {
@@ -810,22 +922,6 @@ fn open_depot(store: &Path) -> Result<Depot> {
     .map_err(|e| Error::Chain(e.to_string()))
 }
 
-fn schema_version(store: &Path) -> Result<i64> {
-    if !db_path(store).exists() {
-        return Ok(0); // legacy meta.json
-    }
-    let conn = Connection::open_with_flags(
-        db_path(store),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(sql_err)?;
-    let v: Option<String> = conn
-        .query_row("SELECT value FROM kv WHERE key = 'schema'", [], |r| r.get(0))
-        .optional()
-        .map_err(sql_err)?;
-    Ok(v.and_then(|s| s.parse().ok()).unwrap_or(1))
-}
-
 pub(crate) fn kv_get(conn: &Connection, key: &str) -> Result<Option<String>> {
     conn.query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0))
         .optional()
@@ -840,12 +936,6 @@ pub(crate) fn kv_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
     )
     .map_err(sql_err)?;
     Ok(())
-}
-
-/// sha256 of a tree's canonical full-view bytes — the DERIVED dedup key
-/// (never stored in any record).
-pub(crate) fn tree_hash(full_record: &[u8]) -> Vec<u8> {
-    sha2::Sha256::digest(full_record).to_vec()
 }
 
 // ------------------------------------------------------ staged ref diff
@@ -899,8 +989,8 @@ pub(crate) fn diff_refs(
     out
 }
 
-/// Prepend the reflog records for `changes` (one batch), then return
-/// the closure-side refs-table mutations for the caller's transaction.
+/// Prepend the reflog objects for `changes` as ONE batch record, then
+/// return the object count for the caller's bookkeeping transaction.
 pub(crate) fn stage_ref_changes(
     store: &Store,
     changes: &[RefChange],
@@ -911,7 +1001,7 @@ pub(crate) fn stage_ref_changes(
     }
     let at = now_secs();
     let base = store.count(REFLOG)?;
-    let recs: Vec<Vec<u8>> = changes
+    let objs: Vec<Vec<u8>> = changes
         .iter()
         .enumerate()
         .map(|(i, ch)| {
@@ -926,11 +1016,8 @@ pub(crate) fn stage_ref_changes(
             .encode()
         })
         .collect();
-    let (head, older) = recs.split_last().expect("non-empty");
-    // recs are oldest-first; the chain wants newest-first entries.
-    let mut older_rev: Vec<Vec<u8>> = older.to_vec();
-    older_rev.reverse();
-    store.prepend_batch(REFLOG, head, &older_rev, Demote::Verbatim, level)?;
+    let batch = encode_batch(base, &objs);
+    store.prepend_batch(REFLOG, &batch, &[], Demote::Verbatim, level)?;
     Ok(changes.len() as u64)
 }
 
@@ -980,13 +1067,14 @@ pub(crate) struct Ingest<'a> {
     tree_entries: Vec<Vec<u8>>,
     tree_entry_bytes: usize,
     n_trees: u64,
-    new_tree_hashes: Vec<(Vec<u8>, u64)>,
-    tree_cache: HashMap<Vec<u8>, u64>,
-    // COMMITS staging (encoded records, oldest-first).
+    /// Intra-ingest dedup only (git tree oid → tree_idx), discarded
+    /// with the Ingest.
+    tree_cache: HashMap<String, u64>,
+    // COMMITS staging (encoded objects, oldest-first; each flush =
+    // one batch record).
     commit_recs: Vec<Vec<u8>>,
     commit_rec_bytes: usize,
     n_commits: u64,
-    new_shas: Vec<(String, u64)>,
     sha_cache: HashMap<String, u64>,
     tree_of_commit: HashMap<u64, u64>,
 }
@@ -1013,12 +1101,10 @@ impl<'a> Ingest<'a> {
             tree_entries: Vec::new(),
             tree_entry_bytes: 0,
             n_trees,
-            new_tree_hashes: Vec::new(),
             tree_cache: HashMap::new(),
             commit_recs: Vec::new(),
             commit_rec_bytes: 0,
             n_commits,
-            new_shas: Vec::new(),
             sha_cache: HashMap::new(),
             tree_of_commit: HashMap::new(),
         })
@@ -1037,14 +1123,29 @@ impl<'a> Ingest<'a> {
             .ok_or_else(|| Error::Meta(format!("parent {sha} not in store")))
     }
 
-    fn tree_idx_for(&mut self, view: &depot::View, full_record: &[u8]) -> Result<u64> {
-        let h = tree_hash(full_record);
-        if let Some(i) = self.tree_cache.get(&h) {
+    // Dedup key = git's own root tree oid (free at import from the
+    // commit's `tree` header). `same_tree_parent` = a parent sha whose
+    // tree oid equals `tree_oid` (caller-checked from the fetch
+    // buffer): reuse its tree_idx — no persistent oid index (module
+    // doc).
+    fn tree_idx_for(
+        &mut self,
+        tree_oid: &str,
+        same_tree_parent: Option<&str>,
+        view: &depot::View,
+        full_record: &[u8],
+    ) -> Result<u64> {
+        if let Some(i) = self.tree_cache.get(tree_oid) {
             return Ok(*i);
         }
-        if let Some(i) = self.st.tree_idx_for_hash(&h)? {
-            self.tree_cache.insert(h, i);
-            return Ok(i);
+        if let Some(p) = same_tree_parent {
+            let cidx = self.parent_idx(p)?;
+            let t = match self.tree_of_commit.get(&cidx) {
+                Some(t) => *t,
+                None => self.st.commit_record_at_n(cidx, self.n_commits)?.tree_idx,
+            };
+            self.tree_cache.insert(tree_oid.to_string(), t);
+            return Ok(t);
         }
         // New distinct tree: stage its record. The delta pushed rebuilds
         // the CURRENT staged head from this (next-newer) view; the very
@@ -1061,8 +1162,7 @@ impl<'a> Ingest<'a> {
         self.n_trees += 1;
         self.head_view = Some(view.clone());
         self.head_full = Some(full_record.to_vec());
-        self.tree_cache.insert(h.clone(), idx);
-        self.new_tree_hashes.push((h, idx));
+        self.tree_cache.insert(tree_oid.to_string(), idx);
         // NEVER sub-batch on the seal threshold: within one prepend
         // there is exactly one f1 re-encode regardless of size, so
         // splitting a batch buys nothing and churns dead head frames
@@ -1102,11 +1202,12 @@ impl<'a> Ingest<'a> {
     }
 
     fn flush_commit_batch(&mut self) -> Result<()> {
-        if let Some((head, older)) = self.commit_recs.split_last() {
-            let mut older_rev: Vec<Vec<u8>> = older.to_vec();
-            older_rev.reverse();
+        if !self.commit_recs.is_empty() {
+            let base = self.n_commits - self.commit_recs.len() as u64;
+            let batch = encode_batch(base, &self.commit_recs);
             self.st
-                .prepend_batch(COMMITS, head, &older_rev, Demote::Verbatim, self.level)?;
+                .prepend_batch(COMMITS, &batch, &[], Demote::Verbatim, self.level)?;
+            self.st.sha_map.take();
         }
         self.commit_recs.clear();
         self.commit_rec_bytes = 0;
@@ -1114,14 +1215,18 @@ impl<'a> Ingest<'a> {
     }
 
     /// Stage one commit (must arrive oldest-first: parents before
-    /// children). `full_record` = `codec::encode(diff(None, view))`.
+    /// children). `tree_oid` = the commit's `tree` header value;
+    /// `same_tree_parent` = a parent sha with the same tree oid, if
+    /// any; `full_record` = `codec::encode(diff(None, view))`.
     pub(crate) fn add_commit(
         &mut self,
         cm: &CommitMeta,
+        tree_oid: &str,
+        same_tree_parent: Option<&str>,
         view: &depot::View,
         full_record: &[u8],
     ) -> Result<u64> {
-        let tree_idx = self.tree_idx_for(view, full_record)?;
+        let tree_idx = self.tree_idx_for(tree_oid, same_tree_parent, view, full_record)?;
         let parent_idxs = cm
             .parents
             .iter()
@@ -1148,7 +1253,6 @@ impl<'a> Ingest<'a> {
             self.flush_commit_batch()?;
         }
         self.sha_cache.insert(cm.sha.clone(), idx);
-        self.new_shas.push((cm.sha.clone(), idx));
         self.tree_of_commit.insert(idx, tree_idx);
         Ok(idx)
     }
@@ -1173,25 +1277,11 @@ impl<'a> Ingest<'a> {
     }
 
     fn commit_bookkeeping(self, changes: &[RefChange], n_reflog: u64) -> Result<()> {
-        let Ingest { st, n_trees, n_commits, new_tree_hashes, new_shas, .. } = self;
+        let Ingest { st, n_trees, n_commits, .. } = self;
         st.with_txn(|tx| {
             kv_set(tx, "n_trees", &n_trees.to_string())?;
             kv_set(tx, "n_commits", &n_commits.to_string())?;
             kv_set(tx, "n_reflog", &n_reflog.to_string())?;
-            for (sha, idx) in &new_shas {
-                tx.execute(
-                    "INSERT INTO sha_idx(sha, commit_idx) VALUES (?1, ?2)",
-                    rusqlite::params![sha, *idx as i64],
-                )
-                .map_err(sql_err)?;
-            }
-            for (h, idx) in &new_tree_hashes {
-                tx.execute(
-                    "INSERT INTO tree_hash(hash, tree_idx) VALUES (?1, ?2)",
-                    rusqlite::params![h, *idx as i64],
-                )
-                .map_err(sql_err)?;
-            }
             apply_ref_changes(tx, changes)?;
             Ok(())
         })
@@ -1213,36 +1303,6 @@ impl<'a> Ingest<'a> {
         self.commit_bookkeeping(&changes, n_reflog)
     }
 
-    /// Migration variant: reflog records are supplied verbatim (v1
-    /// carried its own timestamps), refs rows likewise.
-    pub(crate) fn finish_migration(
-        mut self,
-        reflog_recs: Vec<ReflogRecord>,
-        ref_rows: Vec<(String, u64, u64)>,
-    ) -> Result<()> {
-        self.flush_chains()?;
-        let n_reflog = reflog_recs.len() as u64;
-        if let Some((head, older)) = reflog_recs
-            .iter()
-            .map(ReflogRecord::encode)
-            .collect::<Vec<_>>()
-            .split_last()
-        {
-            let mut older_rev: Vec<Vec<u8>> = older.to_vec();
-            older_rev.reverse();
-            self.st
-                .prepend_batch(REFLOG, head, &older_rev, Demote::Verbatim, self.level)?;
-        }
-        let changes: Vec<RefChange> = ref_rows
-            .into_iter()
-            .map(|(name, c, t)| RefChange { name, old: None, new: Some((c, t)), note: "" })
-            .collect();
-        self.commit_bookkeeping(&changes, n_reflog)
-    }
-
-    pub(crate) fn ref_row_pub(&self, sha: &str) -> Result<(u64, u64)> {
-        self.ref_row(sha)
-    }
 }
 
 // --------------------------------------------------------- public reads
@@ -1277,17 +1337,6 @@ pub fn commit_at(store: &Path, idx: usize) -> Result<CommitMeta> {
     s.commit_meta(&rec)
 }
 
-fn like_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '%' | '_' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// Resolve REF — a ref name (`main` matches `refs/heads/main`, tags
 /// likewise, or the full refname) or a unique commit-sha prefix (ANY
 /// commit in the store is addressable, not just the tips) — to
@@ -1314,19 +1363,20 @@ pub fn resolve_ref(store: &Path, refname: &str) -> Result<Option<(String, usize)
             .ok_or_else(|| Error::Meta("ref target not in chain".into()))?;
         return Ok(Some((sha, idx as usize)));
     }
-    let mut stmt = s
-        .conn
-        .prepare("SELECT sha, commit_idx FROM sha_idx WHERE sha LIKE ?1 ESCAPE '\\' LIMIT 2")
-        .map_err(sql_err)?;
-    let hits = stmt
-        .query_map([format!("{}%", like_escape(refname))], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })
-        .map_err(sql_err)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(sql_err)?;
+    // sha / sha-prefix resolution: the walk-built map (one commits
+    // walk per handle). Two hits suffice to prove ambiguity.
+    let mut hits: Vec<(&String, u64)> = Vec::new();
+    for (sha, idx) in s.sha_map()? {
+        if !sha.starts_with(refname) {
+            continue;
+        }
+        hits.push((sha, *idx));
+        if hits.len() == 2 {
+            break;
+        }
+    }
     match hits.as_slice() {
-        [(sha, idx)] => Ok(Some((sha.clone(), *idx as usize))),
+        [(sha, idx)] => Ok(Some(((*sha).clone(), *idx as usize))),
         [] => Ok(None),
         _ => Err(Error::Meta(format!("commit prefix {refname} is ambiguous"))),
     }
@@ -1349,7 +1399,7 @@ pub struct ReflogEntry {
 pub fn reflog(store: &Path) -> Result<Vec<ReflogEntry>> {
     let s = Store::open(store)?;
     let mut recs = s
-        .records_newest_first(REFLOG)?
+        .objects_newest_first(REFLOG)?
         .iter()
         .map(|b| ReflogRecord::decode(b))
         .collect::<Result<Vec<_>>>()?;

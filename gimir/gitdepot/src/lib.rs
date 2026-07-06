@@ -22,19 +22,21 @@
 //! data — a pointer into a repo we do not hold — and is stored as the
 //! node's blob.
 //!
-//! On-disk store v2 (ATTACH-CONVERGENCE.md chip 7 — THREE CHAINS +
+//! On-disk store (ATTACH-CONVERGENCE.md chip 7 — THREE CHAINS +
 //! STABLE INDICES; full layout/discipline in `store.rs`):
 //!
 //! * `<dir>/depot/` — one tiered wikimak-depot instance (f0/f1/cold,
 //!   bounded prepend) holding three chains: TREES (reverse-delta tree
-//!   layers, tip full at f0), COMMITS (one record per commit: sha,
-//!   PARENT INDICES, tree index, author/committer/message), REFLOG
-//!   (every observed ref movement, deletions included).
-//! * `<dir>/meta.sqlite` (WAL) — kv (schema=2, label/url, the
+//!   layers, tip full at f0), COMMITS (one object per commit — sha,
+//!   PARENT INDICES, tree index, author/committer/message — batched
+//!   one chain record per ingest), REFLOG (every observed ref movement,
+//!   deletions included, batched likewise).
+//! * `<dir>/meta.sqlite` (WAL) — kv (schema=3, label/url, the
 //!   authoritative per-chain record counts), refs (CURRENT refs only:
-//!   name → commit_idx + tree_idx), and the DERIVED, rebuildable dedup
-//!   indexes sha_idx (sha → commit_idx) and tree_hash (sha256 of
-//!   canonical view bytes → tree_idx).
+//!   name → commit_idx + tree_idx) — NOTHING else: sha → idx is an
+//!   in-RAM map derived by one commits-chain walk per open handle
+//!   (store.rs cost model), and tree dedup is parent-oid comparison
+//!   plus an intra-ingest map, never persisted.
 //!
 //! Records carry STABLE indices counted from the oldest end (record k =
 //! newest-first frame N-1-k; prepends only grow N), so lineage lives in
@@ -71,9 +73,8 @@ pub struct CommitMeta {
     /// export, not referenced by any layer.
     pub sha: String,
     pub parents: Vec<String>,
-    /// Raw `author`/`committer` header values and the message, hex-coded
-    /// in RAM (sqlite stores the raw bytes; legacy meta.json carried the
-    /// hex, and this struct still serializes to that format).
+    /// Raw `author`/`committer` header values and the message,
+    /// hex-coded in RAM (the chain records store the raw bytes).
     pub author_hex: String,
     pub committer_hex: String,
     pub message_hex: String,
@@ -306,13 +307,16 @@ fn tree_layer(entries: &[TreeEntry], blobs: &BTreeMap<String, Vec<u8>>) -> Resul
     Ok(Layer { root })
 }
 
-fn parse_commit(raw: &[u8]) -> Result<CommitMeta> {
+/// Returns the meta plus the commit's root tree oid (the `tree`
+/// header) — the TREES dedup key.
+fn parse_commit(raw: &[u8]) -> Result<(CommitMeta, String)> {
     let body_at = raw
         .windows(2)
         .position(|w| w == b"\n\n")
         .ok_or_else(|| Error::Git("commit: no header/body split".into()))?;
     let (headers, message) = (&raw[..body_at], &raw[body_at + 2..]);
     let mut parents = Vec::new();
+    let mut tree_oid = None;
     let mut extra_headers = Vec::new();
     let (mut author, mut committer) = (None, None);
     for line in headers.split(|&b| b == b'\n') {
@@ -325,7 +329,7 @@ fn parse_commit(raw: &[u8]) -> Result<CommitMeta> {
             continue;
         }
         match key {
-            b"tree" => {}
+            b"tree" => tree_oid = Some(String::from_utf8_lossy(val).into_owned()),
             b"parent" => parents.push(String::from_utf8_lossy(val).into_owned()),
             b"author" => author = Some(val.to_vec()),
             b"committer" => committer = Some(val.to_vec()),
@@ -339,7 +343,7 @@ fn parse_commit(raw: &[u8]) -> Result<CommitMeta> {
             }
         }
     }
-    Ok(CommitMeta {
+    let cm = CommitMeta {
         sha: String::new(), // filled by caller
         parents,
         author_hex: hex::encode(author.ok_or_else(|| Error::Git("commit: no author".into()))?),
@@ -353,7 +357,8 @@ fn parse_commit(raw: &[u8]) -> Result<CommitMeta> {
             hex::encode(raw)
         },
         extra_headers,
-    })
+    };
+    Ok((cm, tree_oid.ok_or_else(|| Error::Git("commit: no tree header".into()))?))
 }
 
 /// Size comparison across encodings of the same history (bytes).
@@ -442,10 +447,42 @@ fn rev_list_oldest_first(repo: &Path) -> Result<Vec<String>> {
     Ok(shas)
 }
 
+/// Memoized commit-sha → root-tree-oid over the fetch buffer, for the
+/// parent-tree dedup check (store::Ingest — no persistent oid index).
+/// Parents outside the walked set (update path) cost one rev-parse;
+/// the buffer always has them (ancestors of a fetched tip).
+#[derive(Default)]
+struct TreeOidMemo(BTreeMap<String, String>);
+
+impl TreeOidMemo {
+    fn insert(&mut self, sha: &str, tree_oid: &str) {
+        self.0.insert(sha.to_string(), tree_oid.to_string());
+    }
+
+    /// A parent of `cm` whose tree oid equals `tree_oid`, if any.
+    fn same_tree_parent(
+        &mut self,
+        repo: &Path,
+        cm: &CommitMeta,
+        tree_oid: &str,
+    ) -> Result<Option<String>> {
+        for p in &cm.parents {
+            if !self.0.contains_key(p) {
+                let oid = git_str(repo, &["rev-parse", &format!("{p}^{{tree}}")])?;
+                self.0.insert(p.clone(), oid.trim().to_string());
+            }
+            if self.0[p] == tree_oid {
+                return Ok(Some(p.clone()));
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// One commit's meta + resolved view.
-fn commit_view(repo: &Path, sha: &str) -> Result<(CommitMeta, depot::View)> {
+fn commit_view(repo: &Path, sha: &str) -> Result<(CommitMeta, String, depot::View)> {
     let raw = git(repo, &["cat-file", "commit", sha])?;
-    let mut cm = parse_commit(&raw)?;
+    let (mut cm, tree_oid) = parse_commit(&raw)?;
     cm.sha = sha.to_string();
     let entries = ls_tree(repo, sha)?;
     let blobs = fetch_blobs(
@@ -458,7 +495,7 @@ fn commit_view(repo: &Path, sha: &str) -> Result<(CommitMeta, depot::View)> {
     let full = tree_layer(&entries, &blobs)?;
     let view = depot::apply(None, &full)
         .ok_or_else(|| Error::Unsupported(format!("commit {sha} has an empty tree")))?;
-    Ok((cm, view))
+    Ok((cm, tree_oid, view))
 }
 
 /// Import a git repo into `store` (created; must not exist).
@@ -483,13 +520,16 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
     // reconstructed views; bit-exactness of that anchor is load-bearing.
     let mut commits = Vec::with_capacity(shas.len());
     let mut rep = report.then(ReportAccum::default);
+    let mut tree_oids = TreeOidMemo::default();
     for sha in &shas {
-        let (cm, view) = commit_view(repo, sha)?;
+        let (cm, tree_oid, view) = commit_view(repo, sha)?;
+        let same = tree_oids.same_tree_parent(repo, &cm, &tree_oid)?;
+        tree_oids.insert(sha, &tree_oid);
         let full = codec::encode(&depot::diff(None, Some(&view)));
         if let Some(r) = rep.as_mut() {
             r.push(&view, full.clone());
         }
-        ingest.add_commit(&cm, &view, &full)?;
+        ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view, &full)?;
         commits.push(cm);
     }
     ingest.finish(&refs)?;
@@ -600,7 +640,7 @@ pub struct UpdateOutcome {
 /// (MIRRORS.md phase 3). Cost is proportional to the new history plus
 /// the accumulator tier — never the cold tier (the depot's bounded
 /// prepend). There is no non-fast-forward case: any commit not yet in
-/// `sha_idx` is simply new records with fresh stable indices, and every
+/// the store is simply new records with fresh stable indices, and every
 /// observed ref movement (rewrites and deletions included) is one
 /// reflog record + a refs-table repoint. Old records keep their indices
 /// forever.
@@ -612,13 +652,16 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
     let base_prepends = st.depot_prepends();
     let mut ingest = store::Ingest::new(&mut st, level)?;
     let mut k = 0usize;
+    let mut tree_oids = TreeOidMemo::default();
     for sha in &shas {
         if ingest.knows_sha(sha)? {
             continue;
         }
-        let (cm, view) = commit_view(repo, sha)?;
+        let (cm, tree_oid, view) = commit_view(repo, sha)?;
+        let same = tree_oids.same_tree_parent(repo, &cm, &tree_oid)?;
+        tree_oids.insert(sha, &tree_oid);
         let full = codec::encode(&depot::diff(None, Some(&view)));
-        ingest.add_commit(&cm, &view, &full)?;
+        ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view, &full)?;
         k += 1;
     }
     ingest.finish(&refs)?;
