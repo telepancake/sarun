@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Mon, 06 Jul 2026 14:12:50 +0000
+Subject: [PATCH] brush-core: background jobs, coproc, substitutions on real threads
+
+---
+diff --git a/src/commands.rs b/src/commands.rs
+index 00f5c4f..9b7aa2f 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -922,7 +922,16 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
+ 
+     let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
+ 
+-    let cmd_join_handle = tokio::spawn(run_substitution_command(subshell, params, s));
++    // sarun: real thread — the $(…) body does BLOCKING writes into the
++    // pipe; on the current-thread runtime a >pipe-buffer write parked the
++    // only worker with the async reader never polled again (same
++    // starvation class as background jobs / compound pipeline stages).
++    let cmd_join_handle = tokio::task::spawn_blocking(move || {
++        let rt = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()?;
++        rt.block_on(run_substitution_command(subshell, params, s))
++    });
+ 
+     let output_str = async_reader.read_to_string().await?;
+ 
+diff --git a/src/interp.rs b/src/interp.rs
+index 2256c0a..86b5cc4 100644
+--- a/src/interp.rs
++++ b/src/interp.rs
+@@ -364,10 +364,21 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
+         cloned_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
+     }
+ 
+-    let join_handle = tokio::spawn(async move {
+-        cloned_ao_list
+-            .execute(&mut cloned_shell, &cloned_params)
+-            .await
++    // sarun: background jobs run on a REAL THREAD (spawn_blocking), not a
++    // plain tokio task — the shell runs on a current-thread runtime and a
++    // background job doing BLOCKING IO parks the only worker, starving the
++    // foreground forever: `( echo tok > fifo & ); read t < fifo` wedged
++    // with the writer never scheduled. Same fix as compound pipeline
++    // stages (which had the identical hazard).
++    let join_handle = tokio::task::spawn_blocking(move || {
++        let rt = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()?;
++        rt.block_on(async move {
++            cloned_ao_list
++                .execute(&mut cloned_shell, &cloned_params)
++                .await
++        })
+     });
+ 
+     shell.jobs_mut().add_as_current(jobs::Job::new(
+@@ -907,18 +918,25 @@ impl Execute for ast::CoprocessCommand {
+             .set_fd(OpenFiles::STDOUT_FD, stdout_writer.into());
+ 
+         let body = self.body.clone();
+-        let join_handle = tokio::spawn(async move {
+-            let pipeline_context = PipelineExecutionContext {
+-                shell: commands::ShellForCommand::ParentShell(&mut child_shell),
+-                process_group_id: None,
+-            };
+-            let spawn_result = body
+-                .execute_in_pipeline(pipeline_context, child_params)
+-                .await?;
+-            match spawn_result.wait().await? {
+-                ExecutionWaitResult::Completed(result) => Ok(result),
+-                ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
+-            }
++        // sarun: real thread — same blocking-starvation hazard as
++        // background jobs above (a coprocess IS a background job).
++        let join_handle = tokio::task::spawn_blocking(move || {
++            let rt = tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()?;
++            rt.block_on(async move {
++                let pipeline_context = PipelineExecutionContext {
++                    shell: commands::ShellForCommand::ParentShell(&mut child_shell),
++                    process_group_id: None,
++                };
++                let spawn_result = body
++                    .execute_in_pipeline(pipeline_context, child_params)
++                    .await?;
++                match spawn_result.wait().await? {
++                    ExecutionWaitResult::Completed(result) => Ok(result),
++                    ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
++                }
++            })
+         });
+ 
+         let job = shell.jobs_mut().add_as_current(jobs::Job::new(
+@@ -2162,12 +2180,22 @@ fn setup_process_substitution(
+     // Asynchronously spawn off the subshell; we intentionally don't block on its
+     // completion.
+     let subshell_cmd = subshell_cmd.to_owned();
+-    tokio::spawn(async move {
+-        // Intentionally ignore the result of the subshell command.
+-        let _ = subshell_cmd
+-            .list
+-            .execute(&mut subshell, &child_params)
+-            .await;
++    // sarun: real thread — a <(…)/>(…) subshell blocks on its pipe end;
++    // as a plain task it parks the only runtime worker (same starvation
++    // class as background jobs).
++    tokio::task::spawn_blocking(move || {
++        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++        {
++            rt.block_on(async move {
++                // Intentionally ignore the result of the subshell command.
++                let _ = subshell_cmd
++                    .list
++                    .execute(&mut subshell, &child_params)
++                    .await;
++            });
++        }
+     });
+ 
+     // Starting at 63 (a.k.a. 64-1)--and decrementing--look for an

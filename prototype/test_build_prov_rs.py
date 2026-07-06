@@ -156,6 +156,28 @@ def main():
                   f"{backend}: brushprov pipelines recorded for ninja "
                   f"(got {prov})")
 
+            # ── named fifo in /tmp works (make 4.4 jobserver shape) ──────
+            # GNU make >= 4.4 puts its jobserver in a NAMED FIFO under
+            # /tmp; in a sud box /tmp is inramfs, which had no mknod at
+            # all — every `make -j` died on "cannot open jobserver" or
+            # wedged. Exercise the raw mechanism (mkfifo + cross-process
+            # writer/reader + blocking open) so the fix can't regress
+            # even on hosts whose make is 4.3.
+            fifo_py = ("import os,sys; p='/tmp/bp.fifo'; os.mkfifo(p);\n"
+                       "pid=os.fork()\n"
+                       "if pid==0:\n"
+                       "    fd=os.open(p,os.O_WRONLY); os.write(fd,b'tok');"
+                       " os.close(fd); os._exit(0)\n"
+                       "fd=os.open(p,os.O_RDONLY); d=os.read(fd,16);"
+                       " os.close(fd); os.waitpid(pid,0); os.unlink(p);\n"
+                       "print('got='+d.decode())\n")
+            r = run_box(backend, f"BP-FIFO-{backend}", work,
+                        ["/usr/bin/timeout", "60", "/usr/bin/python3",
+                         "-c", fifo_py])
+            check("got=tok" in r.stdout,
+                  f"{backend}: named fifo in /tmp round-trips "
+                  f"(jobserver mechanism; out={r.stdout[-200:]!r})")
+
             # ── compound-stage pipeline completes (wedge regression) ─────
             r = run_box(backend, f"BP-WEDGE-{backend}", work,
                         ["sh", "-c",
