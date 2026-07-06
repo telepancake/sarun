@@ -1695,18 +1695,29 @@ fn materialize_snapshots<'a>(
     // Stream straight into the child: the union of snapshots can be
     // checkout-sized and must not be assembled in RAM.
     let mut stdin = std::io::BufWriter::new(child.stdin.take().expect("piped stdin"));
-    let mut blob_marks: HashMap<Vec<u8>, usize> = HashMap::new();
+    // Dedup by git blob oid, never by content: content keys copy every
+    // distinct blob into the map (a union of linux-tip snapshots is GBs
+    // — this walk once drove the driver to a 15.7G OOM).
+    let mut blob_marks: HashMap<String, usize> = HashMap::new();
     let mut next_mark = 1usize;
     let mut wrote_any = false;
     for view in views {
         wrote_any = true;
         let mut files = Vec::new();
         walk_files(view, &mut Vec::new(), &mut files)?;
+        let mut file_marks: Vec<usize> = Vec::with_capacity(files.len());
         for (_, mode, content) in &files {
-            if mode == "160000" || blob_marks.contains_key(*content) {
+            if mode == "160000" {
+                file_marks.push(0);
                 continue;
             }
-            blob_marks.insert(content.to_vec(), next_mark);
+            let oid = git_obj_oid("blob", content);
+            if let Some(&m) = blob_marks.get(&oid) {
+                file_marks.push(m);
+                continue;
+            }
+            blob_marks.insert(oid, next_mark);
+            file_marks.push(next_mark);
             stdin.write_all(
                 format!("blob\nmark :{next_mark}\ndata {}\n", content.len()).as_bytes(),
             )?;
@@ -1717,12 +1728,11 @@ fn materialize_snapshots<'a>(
         stdin.write_all(
             b"commit refs/gitdepot/seed\ncommitter gitdepot <gitdepot@localhost> 0 +0000\ndata 0\ndeleteall\n",
         )?;
-        for (path, mode, content) in &files {
+        for ((path, mode, content), m) in files.iter().zip(&file_marks) {
             if mode == "160000" {
                 let sha = String::from_utf8_lossy(content);
                 stdin.write_all(format!("M 160000 {sha} {}\n", quote_path(path)).as_bytes())?;
             } else {
-                let m = blob_marks[*content];
                 stdin.write_all(format!("M {mode} :{m} {}\n", quote_path(path)).as_bytes())?;
             }
         }

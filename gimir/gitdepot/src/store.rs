@@ -922,6 +922,17 @@ impl Store {
         tx.commit().map_err(sql_err)
     }
 
+    /// Depot flush + eviction pass. Early-landing ingests call this
+    /// after each landed chunk: every chunk supersedes the previous
+    /// f0/f1 frames (a bootstrap's f0 is a full snapshot, ~tens of MB),
+    /// and eviction otherwise only runs at the ingest-final `with_txn`
+    /// — by which time a linux-scale bootstrap has parked hundreds of
+    /// fully-dead snapshot frames on disk (measured: 5.3G dead f0 for
+    /// 21k commits).
+    pub(crate) fn evict_pass(&mut self) -> Result<()> {
+        self.depot.flush().map_err(|e| Error::Chain(e.to_string()))
+    }
+
     // -------------------------------------------------------- lookups
 
     /// The lazily built sha → idx map (module doc cost model). Name
@@ -1702,6 +1713,7 @@ impl<'a> Ingest<'a> {
         if self.tree_entries.bytes >= self.frame_bound.max(self.last_boundary_len) {
             self.mark_dirty()?;
             self.flush_tree_batch()?;
+            self.st.evict_pass()?;
         }
         Ok(idx)
     }
@@ -1878,6 +1890,7 @@ impl<'a> Ingest<'a> {
         if self.commit_recs.bytes >= self.batch_bound {
             self.mark_dirty()?;
             self.flush_commit_batch()?;
+            self.st.evict_pass()?;
         }
         Ok(idx)
     }
@@ -1928,6 +1941,7 @@ impl<'a> Ingest<'a> {
         if self.tag_recs.bytes >= self.batch_bound {
             self.mark_dirty()?;
             self.flush_tag_batch()?;
+            self.st.evict_pass()?;
         }
         Ok(idx)
     }
