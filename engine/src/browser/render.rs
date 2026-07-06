@@ -206,6 +206,12 @@ const QUADS: [char; 16] = [
     ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
 ];
 
+/// True for a quadrant-block pixel glyph (not a real text character). Used to
+/// blank pixels out of a plain-text dump.
+pub fn is_pixel_glyph(ch: char) -> bool {
+    ch != ' ' && QUADS.contains(&ch)
+}
+
 fn dist2(a: Rgb, b: Rgb) -> i64 {
     let d = |x: u8, y: u8| (x as i64 - y as i64).pow(2);
     d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)
