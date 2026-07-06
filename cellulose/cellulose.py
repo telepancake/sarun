@@ -211,12 +211,19 @@ class Browser:
             "--hide-scrollbars",
             "--mute-audio",
             "--force-color-profile=srgb",
+            # resolve via the system's getaddrinfo like every other CLI tool;
+            # the built-in async resolver throws DNS_PROBE_FINISHED_BAD_CONFIG
+            # on systemd-resolved stubs, VPN resolv.confs, nsswitch-only hosts
+            "--disable-features=AsyncDns",
             "--headless",
             "about:blank",
         ]
         proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         if proxy:
             args.insert(-1, f"--proxy-server={proxy}")
+        extra = os.environ.get("CELLULOSE_ARGS")
+        if extra:
+            args[-1:-1] = extra.split()
         self.proc = subprocess.Popen(
             args, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL
         )
