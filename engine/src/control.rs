@@ -1781,7 +1781,7 @@ macro_rules! ui_verbs {
         }
         // Attach a git ref from a gitdepot mirror store
         // (ATTACH-CONVERGENCE.md): bookkeeping only — resolve ref→sha
-        // from meta.json (no chain walk, no import, no new box) and
+        // from meta.sqlite (no chain walk, no import, no new box) and
         // append an Ext row to sid's RO attachments; the overlay serves
         // the tree straight from the store on first read. args:
         // [sid, store_path, refname, prefix?] — prefix nests the tree
@@ -1801,56 +1801,41 @@ macro_rules! ui_verbs {
                 return json!({"ok": false, "error": "need store path + ref"});
             };
             let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
-            // meta.json alone carries refs + the commit list — enough to
-            // resolve and membership-check without decoding the chain.
-            let meta =
-                match gitdepot::chain::read_meta(std::path::Path::new(store)) {
-                    Ok(v) => v,
-                    Err(e) => return json!({"ok": false,
-                                            "error": format!("store: {e}")}),
-                };
+            let store_path = std::path::Path::new(store);
             // REF may be a ref name ("main" matches "refs/heads/main")
             // or a unique commit-sha prefix — ANY commit in the chain is
-            // attachable, not just the tips.
-            let sha = match meta.refs.iter().find(|r| {
-                r.name == refname
-                    || r.name.strip_prefix("refs/heads/") == Some(refname)
-                    || r.name.strip_prefix("refs/tags/") == Some(refname)
-            }) {
-                Some(r) => r.sha.clone(),
-                None => {
-                    let hits: Vec<&str> = meta.commits.iter()
-                        .map(|c| c.sha.as_str())
-                        .filter(|s| s.starts_with(refname))
-                        .collect();
-                    match hits.as_slice() {
-                        [one] => one.to_string(),
-                        [] => return json!({"ok": false, "error":
-                            format!("no ref or commit {refname} in store")}),
-                        _ => return json!({"ok": false, "error":
-                            format!("commit prefix {refname} is ambiguous")}),
-                    }
-                }
+            // attachable, not just the tips. Point lookups in the
+            // store's meta.sqlite (gitdepot::resolve_ref owns the
+            // semantics) — no commit-list materialization on attach.
+            let sha = match gitdepot::resolve_ref(store_path, refname) {
+                Ok(Some((sha, _pos))) => sha,
+                Ok(None) => return json!({"ok": false, "error":
+                    format!("no ref or commit {refname} in store")}),
+                Err(gitdepot::Error::Meta(msg)) =>
+                    return json!({"ok": false, "error": msg}),
+                Err(e) => return json!({"ok": false,
+                                        "error": format!("store: {e}")}),
             };
-            if !meta.commits.iter().any(|c| c.sha == sha) {
-                return json!({"ok": false, "error": "ref target not in chain"});
-            }
             // WHICH git: the store's label (`mirror` stamps it from the
             // URL). Unlabeled direct imports fall back to the store's
             // path: the directory itself, unless it's the mirror
             // layout's generic `store`, then its parent.
-            let label = if meta.label.is_empty() {
-                let p = std::path::Path::new(store);
-                let name = p.file_name().map(|n| n.to_string_lossy());
+            let stored_label = match gitdepot::label(store_path) {
+                Ok(l) => l,
+                Err(e) => return json!({"ok": false,
+                                        "error": format!("store: {e}")}),
+            };
+            let label = if stored_label.is_empty() {
+                let name = store_path.file_name().map(|n| n.to_string_lossy());
                 match name.as_deref() {
-                    Some("store") | None => p.parent()
+                    Some("store") | None => store_path.parent()
                         .and_then(|q| q.file_name())
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "repo".into()),
                     Some(n) => n.to_string(),
                 }
             } else {
-                meta.label.clone()
+                stored_label
             };
             let short: String = sha.chars().take(8).collect();
             let name = format!("git:{label}/{refname}@{short}");

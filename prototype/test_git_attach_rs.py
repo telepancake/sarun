@@ -2,7 +2,7 @@
 """git_attach (ATTACH-CONVERGENCE.md) against the RUST engine: a git
 ref from a gitdepot mirror store attaches to a box as an EXTERNAL RO
 reference — bookkeeping only, no import, no new at-rest box. The verb
-resolves ref→sha from the store's meta.json, pins it as an Ext row,
+resolves ref→sha from the store's meta.sqlite, pins it as an Ext row,
 and the overlay serves the tree straight from the store on first read;
 from there DEPOT-DESIGN.md §8 semantics apply.
 

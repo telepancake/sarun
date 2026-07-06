@@ -747,6 +747,7 @@ version = "0.0.0"
 dependencies = [
  "depot",
  "hex",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

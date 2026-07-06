@@ -358,3 +358,237 @@ fn update_io_is_bounded_not_o_history() {
             "one-commit update wrote {cost} bytes against a {chain_len}-byte \
              store — prepend is O(history), the tiering is sabotaged");
 }
+
+/// A pre-sqlite store (meta.json) still opens read-only, and the first
+/// write converts it: sqlite appears, the json disappears, and the
+/// round-trip stays SHA-exact across the conversion.
+#[test]
+fn legacy_json_store_reads_and_converts_on_first_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let store = tmp.path().join("store");
+    build_fixture(&repo);
+    gitdepot::import(&repo, &store, 3).unwrap();
+
+    // Regress the store to the legacy format: Meta still serializes to
+    // the exact meta.json shape (hex fields), so the fixture is minted
+    // from the live store.
+    let meta = gitdepot::chain::read_meta(&store).unwrap();
+    let json = serde_json::to_string_pretty(&meta).unwrap();
+    std::fs::write(store.join("meta.json"), json).unwrap();
+    for f in ["meta.sqlite", "meta.sqlite-wal", "meta.sqlite-shm"] {
+        let p = store.join(f);
+        if p.exists() {
+            std::fs::remove_file(p).unwrap();
+        }
+    }
+
+    // Legacy reads: full load, point accessors, resolution.
+    let back = gitdepot::chain::read_meta(&store).unwrap();
+    assert_eq!(back.commits.len(), meta.commits.len());
+    assert_eq!(gitdepot::commit_count(&store).unwrap(), 13);
+    let (sha, pos) = gitdepot::resolve_ref(&store, "main").unwrap().unwrap();
+    assert_eq!(pos, 0, "main is the newest commit");
+    assert_eq!(sha, meta.commits[0].sha);
+
+    // First write (a one-commit update) converts.
+    std::fs::write(repo.join("doc.txt"), "post-legacy\n").unwrap();
+    sh_git(&repo, &["add", "-A"]);
+    sh_git(&repo, &["commit", "-q", "-m", "post-legacy"]);
+    let o = gitdepot::update(&repo, &store, 3).unwrap();
+    assert_eq!((o.new_commits, o.total_commits), (1, 14));
+    assert!(store.join("meta.sqlite").exists(), "conversion did not mint sqlite");
+    assert!(!store.join("meta.json").exists(), "legacy json left behind");
+
+    let out = tmp.path().join("out");
+    let refs = gitdepot::export(&store, &out).unwrap();
+    assert!(!refs.is_empty(), "post-conversion export lost refs");
+}
+
+/// resolve_ref point-lookup semantics: bare name, full refname, tag,
+/// unique sha prefix (with frame index), ambiguity, and misses.
+#[test]
+fn resolve_ref_point_lookups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let store = tmp.path().join("store");
+    build_fixture(&repo);
+    sh_git(&repo, &["tag", "v1", "main~1"]); // lightweight: commit type
+    gitdepot::import(&repo, &store, 3).unwrap();
+    let meta = gitdepot::chain::read_meta(&store).unwrap();
+
+    let main_sha = meta.refs.iter()
+        .find(|r| r.name == "refs/heads/main").unwrap().sha.clone();
+    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap(),
+               (main_sha.clone(), 0));
+    assert_eq!(gitdepot::resolve_ref(&store, "refs/heads/main").unwrap().unwrap(),
+               (main_sha.clone(), 0));
+    let (v1_sha, v1_pos) = gitdepot::resolve_ref(&store, "v1").unwrap().unwrap();
+    assert_eq!(v1_sha, meta.commits[v1_pos].sha, "tag pos mismatched sha");
+    assert_ne!(v1_pos, 0, "main~1 is not the newest frame");
+
+    // A NON-tip commit by unique sha prefix, with its frame index.
+    let target = &meta.commits[5].sha;
+    let mut plen = 4;
+    while meta.commits.iter().filter(|c| c.sha.starts_with(&target[..plen])).count() > 1 {
+        plen += 1;
+    }
+    assert_eq!(gitdepot::resolve_ref(&store, &target[..plen]).unwrap().unwrap(),
+               (target.clone(), 5));
+    // Frame index round-trips through commit_at.
+    assert_eq!(gitdepot::commit_at(&store, 5).unwrap().sha, *target);
+
+    // Empty prefix matches every commit: ambiguous, exact message.
+    match gitdepot::resolve_ref(&store, "") {
+        Err(gitdepot::Error::Meta(m)) => assert_eq!(m, "commit prefix  is ambiguous"),
+        other => panic!("expected ambiguity error, got {other:?}"),
+    }
+    // No such ref or commit.
+    assert!(gitdepot::resolve_ref(&store, "zzzz").unwrap().is_none());
+    // LIKE wildcards in the query are literals, not patterns.
+    assert!(gitdepot::resolve_ref(&store, "%").unwrap().is_none());
+}
+
+/// §9 anti-sabotage, METADATA cost axis: a one-commit update must do
+/// O(new) sqlite work. The proof is structural: every pre-existing
+/// commits row keeps its exact (pos, sha) key — nothing is renumbered
+/// or rewritten — and the new commit lands at MIN(pos)-1.
+#[test]
+fn update_metadata_is_o_new_not_o_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let store = tmp.path().join("store");
+    build_fixture(&repo);
+    for i in 0..120 {
+        std::fs::write(repo.join("doc.txt"), format!("pad rev {i}\n")).unwrap();
+        sh_git(&repo, &["add", "-A"]);
+        sh_git(&repo, &["commit", "-q", "-m", &format!("pad {i}")]);
+    }
+    gitdepot::import(&repo, &store, 3).unwrap();
+
+    let rows = |store: &Path| -> Vec<(i64, String)> {
+        let conn = rusqlite::Connection::open(store.join("meta.sqlite")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT pos, sha FROM commits ORDER BY pos ASC")
+            .unwrap();
+        let v = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        v
+    };
+    let before = rows(&store);
+    assert_eq!(before.len(), 133);
+    assert_eq!(before[0].0, 0, "import numbers from 0");
+
+    std::fs::write(repo.join("doc.txt"), "one more line\n").unwrap();
+    sh_git(&repo, &["add", "-A"]);
+    sh_git(&repo, &["commit", "-q", "-m", "tip"]);
+    gitdepot::update(&repo, &store, 3).unwrap();
+
+    let after = rows(&store);
+    assert_eq!(after.len(), 134);
+    assert_eq!(after[1..], before[..],
+               "pre-existing rows were renumbered — update is O(history)");
+    assert_eq!(after[0].0, -1, "new commit must land at MIN(pos)-1");
+    // And the shifted keys still read back as frame indices.
+    assert_eq!(gitdepot::commit_at(&store, 0).unwrap().sha, after[0].1);
+    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().1, 0);
+}
+
+/// Upstream deletes a branch: the mirror marks the ref (deleted_at),
+/// logs the prune, stops resolving the name — but the commits the ref
+/// pinned STAY in the store. Local history is never destroyed.
+#[test]
+fn upstream_branch_deletion_marks_ref_and_keeps_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    let root = tmp.path().join("mirror");
+    build_fixture(&origin);
+    gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    let store = root.join("store");
+    let side_sha = gitdepot::resolve_ref(&store, "side").unwrap().unwrap().0;
+    let n = gitdepot::commit_count(&store).unwrap();
+
+    sh_git(&origin, &["branch", "-D", "side"]);
+    let o = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert!(!o.reimported, "a ref deletion must not force a re-import");
+    assert_eq!(o.update.new_commits, 0);
+
+    // The name no longer resolves; the commit (and the count) survive.
+    assert!(gitdepot::resolve_ref(&store, "side").unwrap().is_none());
+    assert_eq!(gitdepot::commit_count(&store).unwrap(), n);
+    assert_eq!(gitdepot::resolve_ref(&store, &side_sha).unwrap().unwrap().0,
+               side_sha);
+    // Live listings exclude it; the row is marked, not dropped.
+    assert!(!gitdepot::chain::refs(&store).unwrap().iter()
+        .any(|r| r.name == "refs/heads/side"));
+    let conn = rusqlite::Connection::open(store.join("meta.sqlite")).unwrap();
+    let deleted_at: Option<i64> = conn
+        .query_row("SELECT deleted_at FROM refs WHERE name = 'refs/heads/side'",
+                   [], |r| r.get(0))
+        .unwrap();
+    assert!(deleted_at.is_some(), "pruned ref must be marked, not dropped");
+    // The reflog observed the deletion.
+    let log = gitdepot::chain::reflog(&store).unwrap();
+    let prune = log.iter().rev()
+        .find(|e| e.refname == "refs/heads/side" && e.new_sha.is_none())
+        .expect("no prune row in reflog");
+    assert_eq!(prune.old_sha.as_deref(), Some(side_sha.as_str()));
+    assert_eq!(prune.note, "pruned upstream");
+    // The store still updates incrementally afterwards.
+    std::fs::write(origin.join("after.txt"), "x\n").unwrap();
+    sh_git(&origin, &["add", "-A"]);
+    sh_git(&origin, &["commit", "-q", "-m", "after prune"]);
+    let o2 = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert_eq!((o2.update.new_commits, o2.reimported), (1, false));
+    assert_eq!(gitdepot::commit_count(&store).unwrap(), n + 1);
+}
+
+/// Upstream force-push: the old store is RETIRED (renamed, intact and
+/// still readable), never deleted; the new store serves the new history
+/// and its reflog records the rewrite naming the retired path.
+#[test]
+fn upstream_rewrite_retires_old_store_and_logs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    let root = tmp.path().join("mirror");
+    build_fixture(&origin);
+    gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    let store = root.join("store");
+    let old_main = gitdepot::resolve_ref(&store, "main").unwrap().unwrap().0;
+    let old_count = gitdepot::commit_count(&store).unwrap();
+
+    sh_git(&origin, &["commit", "-q", "--amend", "-m", "amended"]);
+    let o = gitdepot::mirror(origin.to_str().unwrap(), &root).unwrap();
+    assert!(o.reimported);
+
+    let retired: Vec<_> = std::fs::read_dir(&root).unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("store.retired."))
+        .collect();
+    assert_eq!(retired.len(), 1, "old store not retired");
+    let retired = retired[0].path();
+    // The retired store is intact: bookkeeping AND chain read back.
+    let (old_meta, old_views) = gitdepot::chain::read_store(&retired).unwrap();
+    assert_eq!(old_meta.commits.len(), old_count);
+    assert_eq!(old_views.len(), old_count);
+    assert_eq!(gitdepot::resolve_ref(&retired, "main").unwrap().unwrap().0,
+               old_main);
+
+    // The new store serves the new history…
+    let new_main = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
+    assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap(),
+               (new_main.clone(), 0));
+    // …and its reflog records the rewrite, naming the retired path.
+    let log = gitdepot::chain::reflog(&store).unwrap();
+    let rw = log.iter().rev()
+        .find(|e| e.refname == "refs/heads/main"
+              && e.old_sha.as_deref() == Some(old_main.as_str()))
+        .expect("no rewrite row in reflog");
+    assert_eq!(rw.new_sha.as_deref(), Some(new_main.as_str()));
+    assert!(rw.note.starts_with("rewrite"), "note {:?}", rw.note);
+    assert!(rw.note.contains(retired.to_str().unwrap()),
+            "note {:?} does not name the retired store", rw.note);
+}

@@ -23,11 +23,20 @@
 //! data — a pointer into a repo we do not hold — and is stored as the
 //! node's blob.
 //!
-//! On-disk store: `<dir>/meta.json` + `<dir>/chain` (frames newest-first,
+//! On-disk store: `<dir>/meta.sqlite` (WAL; refs + reflog + commit
+//! bookkeeping, point-readable — see `chain.rs`) + `<dir>/chain`
+//! (frames newest-first,
 //! each `[u32 raw_len | u32 zstd_len | zstd bytes]`, frame 0 standalone,
 //! frame i compressed with record i-1 as zstd refPrefix). git itself is
 //! driven by shelling out — sarun custom — so this tool needs a `git`
 //! binary and runs host-side.
+//!
+//! Bookkeeping split (DEPOT-DESIGN.md §3): refs and derived indexes are
+//! the permanently-sqlite part. The commits table — and the reflog —
+//! are corpus data, date-ordered and prepend-shaped; when this store
+//! moves behind the tiered depot variant (ATTACH-CONVERGENCE.md chip 7)
+//! they belong in a depot chain, and their sqlite tables here are the
+//! interim scaled representation.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -39,6 +48,8 @@ use depot::{Attrs, BlobOp, Layer, Node};
 
 pub mod chain;
 pub mod readout;
+
+pub use chain::{commit_at, commit_count, label, resolve_ref};
 
 // ------------------------------------------------------------------ meta
 
@@ -56,7 +67,8 @@ pub struct CommitMeta {
     pub sha: String,
     pub parents: Vec<String>,
     /// Raw `author`/`committer` header values and the message, hex-coded
-    /// so arbitrary bytes survive JSON.
+    /// in RAM (sqlite stores the raw bytes; legacy meta.json carried the
+    /// hex, and this struct still serializes to that format).
     pub author_hex: String,
     pub committer_hex: String,
     pub message_hex: String,
@@ -506,31 +518,57 @@ pub struct UpdateOutcome {
 /// Anything else (rewritten history, or new commits that topo-interleave
 /// into old ones) is refused — re-import for those.
 pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
-    let old_meta = chain::read_meta(store)?;
+    let old_shas = chain::commit_shas(store)?;
     let refs = collect_refs(repo)?;
     let shas = rev_list(repo)?;
 
-    let old_shas: Vec<&str> = old_meta.commits.iter().map(|c| c.sha.as_str()).collect();
-    if shas.len() < old_shas.len()
-        || shas[shas.len() - old_shas.len()..]
-            .iter()
-            .map(String::as_str)
-            .ne(old_shas.iter().copied())
+    // New commits must be a clean PREFIX of the repo's walk; every
+    // remaining repo sha must be known to the store IN STORE ORDER (an
+    // upstream ref deletion may drop known commits from the walk — the
+    // store keeps them; see the reflog). Anything else is a rewrite.
+    let old_set: std::collections::HashSet<&str> =
+        old_shas.iter().map(String::as_str).collect();
+    let k = shas.iter().take_while(|s| !old_set.contains(s.as_str())).count();
     {
-        return Err(Error::Unsupported(
-            "store history is not a suffix of the repo's (non-fast-forward or \
-             topo-interleaved new commits) — re-import"
-            .into(),
-        ));
+        let mut old_it = old_shas.iter();
+        for s in &shas[k..] {
+            if !old_set.contains(s.as_str()) || !old_it.any(|o| o == s) {
+                return Err(Error::Unsupported(
+                    "store history is not a suffix of the repo's (non-fast-forward \
+                     or topo-interleaved new commits) — re-import"
+                    .into(),
+                ));
+            }
+        }
     }
-    let k = shas.len() - old_shas.len();
-    let total = shas.len();
+    // Ref-level fast-forward guard: for every upstream ref the store
+    // already tracks, the OLD target must still be in the repo's walk —
+    // a ref whose old tip vanished was rewritten (amend/force-push),
+    // not fast-forwarded, even when the commit walk above still
+    // subsequence-matches (the rewrite drops the old tip and adds a new
+    // one, which is indistinguishable from prune+append at the commit
+    // level). A ref absent upstream is a deletion, handled by marking.
+    {
+        let repo_set: std::collections::HashSet<&str> =
+            shas.iter().map(String::as_str).collect();
+        let known = chain::refs(store)?;
+        for r in &refs {
+            if let Some(old) = known.iter().find(|o| o.name == r.name) {
+                if old.sha != r.sha && !repo_set.contains(old.sha.as_str()) {
+                    return Err(Error::Unsupported(format!(
+                        "{} was rewritten upstream (old target {} no longer \
+                         reachable) — re-import",
+                        r.name, old.sha
+                    )));
+                }
+            }
+        }
+    }
+    let total = old_shas.len() + k;
     if k == 0 {
         // Content unchanged; refs may still have moved between known
         // commits (branch created/renamed onto an old sha).
-        let meta = Meta { label: old_meta.label, url: old_meta.url,
-                          refs: refs.clone(), commits: old_meta.commits };
-        chain::write_meta(store, &meta)?;
+        chain::write_refs(store, &refs)?;
         return Ok(UpdateOutcome { new_commits: 0, total_commits: total, refs });
     }
 
@@ -561,11 +599,7 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
     let oldest_new = prev_view.expect("k > 0");
     delta_records.push(codec::encode(&depot::diff(Some(&oldest_new), Some(&old_head_view))));
 
-    let mut all_commits = commits;
-    all_commits.extend(old_meta.commits);
-    let meta = Meta { label: old_meta.label, url: old_meta.url,
-                      refs: refs.clone(), commits: all_commits };
-    chain::prepend_store(store, &meta, &delta_records, &full_records, level)?;
+    chain::prepend_store(store, &commits, &refs, &delta_records, &full_records, level)?;
     Ok(UpdateOutcome { new_commits: k, total_commits: total, refs })
 }
 
@@ -611,7 +645,7 @@ pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome
     let store = root.join("store");
     if repo.join("HEAD").exists() {
         git(&repo, &["remote", "update", "--prune"])?;
-    } else if store.join("meta.json").exists() {
+    } else if chain::store_exists(&store) {
         // The store is the ONLY authoritative copy; repo.git is a
         // transient fetch buffer, reconstructible because export is
         // SHA-exact. Re-seed it from the store (bare, wired like
@@ -636,7 +670,7 @@ pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome
             )));
         }
     }
-    let out = if !store.join("meta.json").exists() {
+    let out = if !chain::store_exists(&store) {
         let o = import(&repo, &store, 3)?;
         let n = o.meta.commits.len();
         MirrorOutcome {
@@ -647,15 +681,31 @@ pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome
         match update(&repo, &store, 3) {
             Ok(u) => MirrorOutcome { update: u, reimported: false },
             Err(Error::Unsupported(_)) => {
-                // Remote rewrote history out from under the store: replace
-                // the store wholesale with the fresh state.
+                // Remote rewrote history out from under the store: import
+                // the fresh state, RETIRE the old store (rename, intact —
+                // an upstream force-push must never destroy local
+                // history), and log what the rewrite did to each ref.
+                let old_refs = chain::refs(&store)?;
                 let fresh = root.join("store.new");
                 if fresh.exists() {
+                    // Scratch from an interrupted re-import, not a store.
                     std::fs::remove_dir_all(&fresh)?;
                 }
                 let o = import(&repo, &fresh, 3)?;
-                std::fs::remove_dir_all(&store)?;
+                let mut ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let retired = loop {
+                    let p = root.join(format!("store.retired.{ts}"));
+                    if !p.exists() {
+                        break p;
+                    }
+                    ts += 1;
+                };
+                std::fs::rename(&store, &retired)?;
                 std::fs::rename(&fresh, &store)?;
+                chain::log_rewrite(&store, &old_refs, &retired)?;
                 let n = o.meta.commits.len();
                 MirrorOutcome {
                     update: UpdateOutcome { new_commits: n, total_commits: n, refs: o.meta.refs },
@@ -667,11 +717,9 @@ pub fn mirror_opts(url: &str, root: &Path, frugal: bool) -> Result<MirrorOutcome
     };
     // Stamp identity ("WHICH git?") — listings and attachment names key
     // off it.
-    let mut meta = chain::read_meta(&store)?;
-    if meta.label.is_empty() || meta.url != url {
-        meta.label = label_from_url(url);
-        meta.url = url.to_string();
-        chain::write_meta(&store, &meta)?;
+    let (label, old_url) = chain::identity(&store)?;
+    if label.is_empty() || old_url != url {
+        chain::set_identity(&store, &label_from_url(url), url)?;
     }
     if frugal {
         std::fs::remove_dir_all(&repo)?;
@@ -690,26 +738,27 @@ pub struct MirrorEntry {
     pub refs: Vec<RefMeta>,
 }
 
-/// Scan a mirrors root for `<root>/*/store/meta.json` — the answer to
-/// "which repos do I have?".
+/// Scan a mirrors root for `<root>/*/store` bookkeeping — the answer to
+/// "which repos do I have?". Point reads only (identity, count, refs) —
+/// no commit-list materialization per store.
 pub fn list_mirrors(root: &Path) -> Result<Vec<MirrorEntry>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(root)?.flatten() {
         let store = e.path().join("store");
-        if !store.join("meta.json").exists() {
+        if !chain::store_exists(&store) {
             continue;
         }
-        let meta = chain::read_meta(&store)?;
+        let (label, url) = chain::identity(&store)?;
         out.push(MirrorEntry {
             dir: e.file_name().to_string_lossy().into_owned(),
-            label: if meta.label.is_empty() {
+            label: if label.is_empty() {
                 e.file_name().to_string_lossy().into_owned()
             } else {
-                meta.label.clone()
+                label
             },
-            url: meta.url,
-            commits: meta.commits.len(),
-            refs: meta.refs,
+            url,
+            commits: chain::commit_count(&store)?,
+            refs: chain::refs(&store)?,
         });
     }
     out.sort_by(|a, b| a.label.cmp(&b.label));
