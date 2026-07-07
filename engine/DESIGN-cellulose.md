@@ -169,21 +169,32 @@ rustls).
   driving the real binary through a PTY (allocate pty, send keystrokes, read
   frames): a page renders, scroll/reload respond, `^Q` exits.
 
-Remaining:
+- **E3 — DONE** the launcher swap; carbonyl retired. `build_launch`'s
+  `Browser` arm runs `/proc/self/exe browser --spki KEY URL` (the ferried
+  engine binary, re-exec'd via the `/proc/self/exe` idiom `inner` resolves)
+  in the `CHROMIUM_IMAGE` box — **chromedp/headless-shell**, a minimal image
+  carrying stock headless Chromium (150.x), pinned by digest, replacing the
+  frozen carbonyl fork. `sarun browser` finds the in-image binary at
+  `/headless-shell/headless-shell` and passes the SPKI through to Chromium so
+  it trusts the MITM leaf. The PTY-pane browser detection and the launch test
+  were updated; the `Action`/label/replay-fn names de-carbonyl'd.
 
-- **E3 — the launcher swap.** Point `build_launch`'s `Browser` arm
-  (`ui.rs:11397`) at `sarun browser URL` (the ferried engine binary, via the
-  `/proc/self/exe` idiom `inner` already resolves) instead of
-  `/carbonyl/carbonyl`, on a **box image that carries a stock Chromium** —
-  passing `--ignore-certificate-errors-spki-list` through to Chromium so it
-  trusts the MITM leaf, and pointing `$CELLULOSE_BROWSER` at the in-image
-  Chromium. The code change is ~10 lines; the gating dependency is producing
-  that Chromium box image (build a Dockerfile via `sarun oci build`, or pin a
-  public one) to replace `CARBONYL_IMAGE`. Then delete the carbonyl image
-  reference. Left undone deliberately: pointing the launcher at a
-  not-yet-built image would break the browser launcher, and the image
-  choice/packaging is a call to make explicitly, not fake.
+  **Verified end to end** in a real box: `sarun oci run --net tap --webcap
+  <CHROMIUM_IMAGE> -- /proc/self/exe browser --dump-text --spki <KEY> URL`
+  renders example.com. Two-sided proof that traffic traverses the MITM (so
+  webcap capture is live): it fails `ERR_CERT_AUTHORITY_INVALID` *without*
+  the SPKI and renders *with* it — the real cert would validate with no SPKI
+  if the MITM weren't in the path.
 
 Stage-1 (drop-in carbonyl→cellulose swap over carbonyl's own frozen Chromium)
-is intentionally skipped: it would wire the launcher to a patched M110 fork,
-undermining the whole "stock current Chromium" point.
+was intentionally skipped: it would have wired the launcher to a patched M110
+fork, undermining the whole "stock current Chromium" point.
+
+## Status: DONE
+
+carbonyl is retired. The sarun UI's Browser launcher runs cellulose (stock
+headless Chromium driven in-box over CDP, rendered to the box PTY), with
+webcap capture and W4.2 replay working unchanged. `sarun browser URL` is also
+a standalone terminal browser. Follow-ups, none blocking: sextant/braille
+pixel modes, iframe text, an adblock filter list, and the W-archival crawl
+driver reusing the `browser` module.

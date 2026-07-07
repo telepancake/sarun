@@ -27,10 +27,13 @@ fn find_browser() -> Result<String> {
     }
     cands.extend(
         [
+            // the chromedp/headless-shell image (the cellulose box image)
+            "/headless-shell/headless-shell",
             "/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
             "chromium",
             "chromium-browser",
             "google-chrome",
+            "headless_shell",
         ]
         .iter()
         .map(|s| s.to_string()),
@@ -71,8 +74,12 @@ impl Drop for HostBrowser {
     }
 }
 
-/// Spawn headless Chromium wired to a CDP pipe on fds 3/4.
-pub fn spawn_host_chromium() -> Result<HostBrowser> {
+/// Spawn headless Chromium wired to a CDP pipe on fds 3/4. `spki`, when set,
+/// is the sarun MITM root's SubjectPublicKeyInfo hash — passed as
+/// `--ignore-certificate-errors-spki-list` so a Chromium in a MITM'd tap box
+/// trusts the engine's leaf certs (Chromium reads neither the overlay CA
+/// bundle nor SSL_CERT_FILE).
+pub fn spawn_host_chromium(spki: Option<&str>) -> Result<HostBrowser> {
     // engine_read ← chromium fd 4 (child_w); engine_write → chromium fd 3 (child_r)
     let (engine_read, child_w) = os_pipe()?;
     let (child_r, engine_write) = os_pipe()?;
@@ -94,8 +101,12 @@ pub fn spawn_host_chromium() -> Result<HostBrowser> {
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null());
+    if let Some(k) = spki {
+        cmd.arg(format!("--ignore-certificate-errors-spki-list={k}"));
+    }
     // Honor an ambient proxy (this is a standalone host browser, not a tap
-    // box). On a direct connection Chromium needs nothing.
+    // box). On a direct connection, or inside a tap box (transparent MITM),
+    // Chromium needs nothing.
     if let Ok(proxy) = std::env::var("HTTPS_PROXY").or_else(|_| std::env::var("https_proxy")) {
         cmd.arg(format!("--proxy-server={proxy}"));
     }
@@ -436,6 +447,7 @@ usage:
     --dump        one 24-bit-color ANSI frame, then exit
     --dump-text   one plain-text frame (no pixels), then exit
     --size WxH    grid size in cells (default: terminal size)
+    --spki KEY    trust a MITM root by SPKI hash (for tap boxes)
 
 Interactive keys: ^Q quit, ^L url bar, ^R reload, alt-←/→ back/forward,
 arrows/PgUp/PgDn scroll, mouse click, typing goes to the page.
@@ -448,6 +460,7 @@ pub fn browser_cli(args: &[String]) -> i32 {
     let mut mode = "interactive";
     let mut size: Option<(usize, usize)> = None;
     let mut url: Option<String> = None;
+    let mut spki: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -457,6 +470,7 @@ pub fn browser_cli(args: &[String]) -> i32 {
             }
             "--dump" => mode = "dump",
             "--dump-text" => mode = "text",
+            "--spki" => spki = it.next().cloned(),
             "--size" => match it.next().and_then(|s| parse_size(s)) {
                 Some(sz) => size = Some(sz),
                 None => {
@@ -482,10 +496,10 @@ pub fn browser_cli(args: &[String]) -> i32 {
     }
     let result = if mode == "interactive" {
         let (cols, trows) = size.unwrap_or_else(term_size);
-        run_interactive(&url, cols, trows.saturating_sub(1).max(1))
+        run_interactive(&url, cols, trows.saturating_sub(1).max(1), spki.as_deref())
     } else {
         let (cols, rows) = size.unwrap_or((100, 36));
-        render_once(&url, cols, rows, mode)
+        render_once(&url, cols, rows, mode, spki.as_deref())
     };
     match result {
         Ok(code) => code,
@@ -498,9 +512,9 @@ pub fn browser_cli(args: &[String]) -> i32 {
 
 /// Spawn Chromium, attach a session sized to the terminal, navigate, and run
 /// the interactive TUI. `rows` is the content height (the status bar adds one).
-fn run_interactive(url: &str, cols: usize, rows: usize) -> Result<i32> {
+fn run_interactive(url: &str, cols: usize, rows: usize, spki: Option<&str>) -> Result<i32> {
     let url = normalize_url(url);
-    let browser = spawn_host_chromium()?;
+    let browser = spawn_host_chromium(spki)?;
     let sess = BrowserSession::attach(browser.cdp.clone(), cols, rows)?;
     sess.navigate(&url)?;
     sess.wait_load(Duration::from_secs(15));
@@ -514,13 +528,13 @@ fn parse_size(s: &str) -> Option<(usize, usize)> {
     Some((c.parse().ok()?, r.parse().ok()?))
 }
 
-fn render_once(url: &str, cols: usize, rows: usize, mode: &str) -> Result<i32> {
+fn render_once(url: &str, cols: usize, rows: usize, mode: &str, spki: Option<&str>) -> Result<i32> {
     let url = if url.contains("://") || url.starts_with("data:") || url.starts_with("about:") {
         url.to_string()
     } else {
         format!("https://{url}")
     };
-    let browser = spawn_host_chromium()?;
+    let browser = spawn_host_chromium(spki)?;
     let sess = BrowserSession::attach(browser.cdp.clone(), cols, rows)?;
     let mut code = 0;
     if let Some(err) = sess.navigate(&url)? {

@@ -337,7 +337,7 @@ mod tests {
     #[test]
     #[ignore]
     fn e2e_renders_positioned_text() {
-        let browser = crate::browser::launch::spawn_host_chromium().expect("spawn chromium");
+        let browser = crate::browser::launch::spawn_host_chromium(None).expect("spawn chromium");
         let sess = BrowserSession::attach(browser.cdp.clone(), 80, 30).expect("attach");
 
         // absolutely-positioned red text at left:160px top:128px → col 20,

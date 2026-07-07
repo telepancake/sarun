@@ -592,7 +592,7 @@ enum Action {
     /// Reuse("BROWSER") + webcap, so the Chromium profile persists across
     /// launches and every page is captured to the box's web archive. Refused
     /// (visible status) if the MITM CA is unavailable.
-    BrowserCarbonyl,
+    Browser,
     /// Api pane: run `oaita local` on a PTY — download a tiny tool-capable
     /// model + CPU runtime and serve a local OpenAI-compatible endpoint.
     OaitaLocalPty,
@@ -3971,7 +3971,7 @@ impl App {
                     }
                 } else if mime.starts_with("text/html")
                     || mime == "application/xhtml+xml" {
-                    open_replay_in_carbonyl(self, &sid, &url);
+                    open_replay_in_browser(self, &sid, &url);
                 } else {
                     self.status = format!(
                         "{mime}: Enter opens image (sixel) and HTML (carbonyl \
@@ -6215,7 +6215,7 @@ fn api_log_detail_lines(app: &App) -> Vec<Line<'static>> {
 /// MITM, the browser dials the real URL and the engine serves the stored
 /// response — no URL rewriting. Replay needs tap (the MITM) and the SPKI so
 /// Chromium trusts the leaf; refuse visibly if the CA is missing.
-fn open_replay_in_carbonyl(app: &mut App, source_sid: &str, url: &str) {
+fn open_replay_in_browser(app: &mut App, source_sid: &str, url: &str) {
     let spki = match crate::net::ca::root_spki_sha256_b64() {
         Ok(s) => s,
         Err(e) => { app.status = format!("replay: MITM CA unavailable ({e})"); return; }
@@ -11240,10 +11240,12 @@ fn pty_command_configured() -> Option<String> {
         .map(str::to_string)
 }
 
-/// The carbonyl image, pinned by multi-arch manifest-list digest (the
-/// upstream 0.0.3 release; tags are mutable, digests are the pin).
-const CARBONYL_IMAGE: &str = "docker.io/fathyb/carbonyl@sha256:\
-77b3686f46a16375004985b522cef8f66e27fabc4a7d80209609bbb20fdfb362";
+/// The cellulose browser-box image: chromedp/headless-shell, a minimal image
+/// carrying a stock headless Chromium (150.x). Pinned by manifest-list digest
+/// (tags are mutable, digests are the pin). The box runs `sarun browser URL`
+/// against this Chromium; see DESIGN-cellulose.md.
+const CHROMIUM_IMAGE: &str = "docker.io/chromedp/headless-shell@sha256:\
+9a775cee6db63bd75eb206bb8bdb30a70b34fa22d76bcdd2e0647e7889861925";
 
 /// Absolute path to this very binary (the engine's PTY does no PATH lookup —
 /// it execvp's argv[0] as given, so prompts and menu entries always use the
@@ -11271,8 +11273,8 @@ fn open_pty_menu(app: &mut App) {
             hint: "", action: Action::NewFromImage,
         },
         ActionItem {
-            label: "Browser — carbonyl (container; flows captured)".into(),
-            hint: "", action: Action::BrowserCarbonyl,
+            label: "Browser — cellulose (headless Chromium; flows captured)".into(),
+            hint: "", action: Action::Browser,
         },
         ActionItem {
             label: format!("Host shell — {host_shell} (NOT captured)"),
@@ -11529,20 +11531,19 @@ fn build_launch(target: &LaunchTarget, how: &How) -> Vec<String> {
         LaunchTarget::Command(cmd) => run_argv(how, true, cmd),
         LaunchTarget::Image(reference) => oci_run_argv(how, reference, &[]),
         LaunchTarget::Browser { url, spki } => {
-            let mut cmd = vec![
-                "/carbonyl/carbonyl".to_string(),
-                "--no-sandbox".into(),
-                "--disable-dev-shm-usage".into(),
-                "--user-data-dir=/carbonyl/data".into(),
-            ];
-            if let Some(k) = spki {
-                cmd.push(format!("--ignore-certificate-errors-spki-list={k}"));
-            }
-            // The validated URL is the last positional; a blank one lets
-            // carbonyl open its own start page rather than a dud "https://".
+            // cellulose (DESIGN-cellulose.md): the box runs the ferried engine
+            // binary as `sarun browser URL` (re-exec via the /proc/self/exe
+            // idiom `inner` resolves), driving the image's headless Chromium
+            // over a local CDP pipe and rendering to the box PTY. The MITM
+            // SPKI is passed through so the in-box Chromium trusts the leaf.
             let dest = if url.trim().is_empty() { "about:blank" } else { url.trim() };
+            let mut cmd = vec!["/proc/self/exe".to_string(), "browser".into()];
+            if let Some(k) = spki {
+                cmd.push("--spki".into());
+                cmd.push(k.clone());
+            }
             cmd.push(dest.to_string());
-            oci_run_argv(how, CARBONYL_IMAGE, &cmd)
+            oci_run_argv(how, CHROMIUM_IMAGE, &cmd)
         }
         LaunchTarget::Ai { task } => ai_argv(how, task),
     }
@@ -11882,9 +11883,10 @@ impl PtyPane {
             std::sync::Arc::new(PtyTermConfig),
             "sarun", env!("CARGO_PKG_VERSION"),
             response_writer);
-        // Browser detection: the carbonyl launch always carries the in-
-        // container binary path in its argv (see LaunchTarget::Browser).
-        let browser = argv.iter().any(|a| a == "/carbonyl/carbonyl");
+        // Browser detection: the cellulose launch runs the ferried engine
+        // binary as `… browser …` in the box (see LaunchTarget::Browser).
+        let browser = argv.iter().any(|a| a == "/proc/self/exe")
+            && argv.iter().any(|a| a == "browser");
         Ok(PtyPane { terminal: term, writer, rx, rows, cols, eof: false, browser })
     }
 
@@ -12426,7 +12428,7 @@ fn run_action(app: &mut App, a: Action) {
                     "selected box is not a loaded image".into(),
             }
         }
-        Action::BrowserCarbonyl => {
+        Action::Browser => {
             // Open a real URL field (DESIGN-web.md W3). The MITM SPKI is
             // required — Chromium ignores the overlay CA bundle and pin-trusts
             // this key instead, so without it TLS interception fails silently
@@ -13982,14 +13984,14 @@ mod tests {
         let j = argv.join(" ");
         assert!(j.starts_with(
             "sarun oci run --net tap --name BROWSER --webcap --webfilter \
-             docker.io/fathyb/carbonyl@sha256:"),
+             docker.io/chromedp/headless-shell@sha256:"),
             "persistent + captured + filtered oci run, got {j:?}");
+        // the box CMD re-execs the ferried engine as `browser`, with the SPKI
         assert!(argv.contains(&"--".to_string())
-            && argv.contains(&"/carbonyl/carbonyl".to_string()),
-            "explicit CMD names the binary, got {j:?}");
-        for flag in ["--no-sandbox", "--disable-dev-shm-usage",
-                     "--user-data-dir=/carbonyl/data",
-                     "--ignore-certificate-errors-spki-list=AbC="] {
+            && argv.contains(&"/proc/self/exe".to_string())
+            && argv.contains(&"browser".to_string()),
+            "explicit CMD runs the in-box browser, got {j:?}");
+        for flag in ["--spki", "AbC="] {
             assert!(argv.iter().any(|a| a == flag), "missing {flag} in {j:?}");
         }
         assert_eq!(argv.last().map(String::as_str), Some("https://example.com"),
