@@ -427,12 +427,15 @@ fn late_alias_follows_only_after_its_redirect_revision_exists() {
     // With real start_ts, LateAlias is a genuine RED link before t3 — same
     // as Ghost (a title with no page row at all).
     let html_before = render_at(&inst, "Article", "[[LateAlias]] [[Ghost]]", Some(tau_before));
+    // Red links now carry a `title="X (page does not exist)"` between class
+    // and `>` (MediaWiki-faithful, per the parser-fidelity pass), so match the
+    // class and the anchor text rather than an exact `class="new">X`.
     assert!(
-        html_before.contains(r#"class="new">LateAlias"#),
+        html_before.contains("class=\"new\"") && html_before.contains(">LateAlias<"),
         "LateAlias renders red before its first revision:\n{html_before}"
     );
     assert!(
-        html_before.contains(r#"class="new">Ghost"#),
+        html_before.contains("class=\"new\"") && html_before.contains(">Ghost<"),
         "a title with no page row (Ghost) is also a red link:\n{html_before}"
     );
 

@@ -4,6 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[dev-dependencies]
+# The corpus-module diagnostic loads the same gzip'd fixture bundles the
+# wikitext corpus test uses, to reproduce real module invoke errors.
+flate2 = "1"
+serde_json = { workspace = true }
+
 [dependencies]
 wikimak-wikitext = { workspace = true }
 # Plan §3.3 engine choice (a): vendored PUC Lua 5.1 — exact pattern and

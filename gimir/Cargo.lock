@@ -2670,7 +2670,9 @@ dependencies = [
 name = "wikimak-scribunto"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "mlua",
+ "serde_json",
  "thiserror 1.0.69",
  "wikimak-wikitext",
 ]

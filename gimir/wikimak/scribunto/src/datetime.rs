@@ -189,6 +189,149 @@ pub fn format_php_date(fmt: &str, c: &Civil, unix: i64) -> String {
     out
 }
 
+/// Parse a timestamp STRING as `mw.language:formatDate` accepts one (PHP
+/// `strtotime`/`wfTimestamp` territory). Not the full grammar — the subset
+/// real modules feed formatDate: MediaWiki 14-digit stamps, ISO/`Y-M-D`
+/// with optional time, `D Month Y` / `Month D, Y` / `Month Y` / bare year.
+/// Returns unix seconds. `now` resolves to τ. None = unrecognized.
+pub fn parse_timestamp(raw: &str, tau_secs: i64) -> Option<i64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let low = s.to_ascii_lowercase();
+    if low == "now" {
+        return Some(tau_secs);
+    }
+
+    // MediaWiki 14-digit YYYYMMDDHHMMSS (and shorter all-digit prefixes).
+    if s.len() >= 4 && s.bytes().all(|b| b.is_ascii_digit()) {
+        if s.len() == 14 {
+            let g = |a: usize, b: usize| s[a..b].parse::<i64>().ok();
+            let (y, mo, d) = (g(0, 4)?, g(4, 6)? as u32, g(6, 8)? as u32);
+            let (h, mi, se) = (g(8, 10)? as u32, g(10, 12)? as u32, g(12, 14)? as u32);
+            return Some(unix_from_fields(y, mo, d, h, mi, se));
+        }
+        if s.len() == 4 {
+            return Some(unix_from_fields(s.parse().ok()?, 1, 1, 0, 0, 0));
+        }
+    }
+
+    // Split off a time part if present (after 'T' or a space).
+    let (date_part, time_part) = split_date_time(s);
+    let (mut h, mut mi, mut se) = (0u32, 0u32, 0u32);
+    if let Some(tp) = time_part {
+        let tp = tp.trim_end_matches('Z').trim();
+        let mut it = tp.split(':');
+        h = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+        mi = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        se = it.next().and_then(|x| x.split('.').next().unwrap_or("0").parse().ok()).unwrap_or(0);
+    }
+
+    // Numeric Y-M-D or Y/M/D.
+    if let Some((y, mo, d)) = parse_ymd(date_part) {
+        return Some(unix_from_fields(y, mo, d, h, mi, se));
+    }
+    // Month-name forms. A year-less form ("1 January", "1January") defaults
+    // to τ's year, matching PHP strtotime (CS1 feeds these for validation).
+    let default_year = civil_from_unix(tau_secs).year;
+    if let Some((y, mo, d)) = parse_named(date_part, default_year) {
+        return Some(unix_from_fields(y, mo, d, h, mi, se));
+    }
+    None
+}
+
+fn split_date_time(s: &str) -> (&str, Option<&str>) {
+    if let Some(i) = s.find('T') {
+        return (&s[..i], Some(&s[i + 1..]));
+    }
+    // A space separating a date from a HH:MM(:SS) time.
+    if let Some(i) = s.find(' ') {
+        let rest = &s[i + 1..];
+        if rest.contains(':') {
+            return (&s[..i], Some(rest));
+        }
+    }
+    (s, None)
+}
+
+fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
+    let sep = if s.contains('-') { '-' } else if s.contains('/') { '/' } else { return None };
+    let mut it = s.split(sep);
+    let y: i64 = it.next()?.trim().parse().ok()?;
+    // Reject a leading day (D-M-Y) heuristically: a 4-digit first field is a
+    // year; otherwise not our format (named parser handles D Month Y).
+    if !(1..=9999).contains(&y) || s.split(sep).next()?.trim().len() < 3 {
+        return None;
+    }
+    let mo: u32 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(1);
+    let d: u32 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(1);
+    if it.next().is_some() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, mo, d))
+}
+
+fn month_num(name: &str) -> Option<u32> {
+    let n = name.trim().to_ascii_lowercase();
+    if n.is_empty() {
+        return None;
+    }
+    MONTHS
+        .iter()
+        .position(|m| {
+            let ml = m.to_ascii_lowercase();
+            ml == n || ml.starts_with(&n) && n.len() >= 3
+        })
+        .map(|i| i as u32 + 1)
+}
+
+fn parse_named(s: &str, default_year: i64) -> Option<(i64, u32, u32)> {
+    // Tokens split on spaces and commas: "1 January 2020", "January 1, 2020",
+    // "January 2020", "Jan 2020".
+    // Split on spaces/commas, THEN split any digit⇄letter boundary so
+    // glued forms like "1January" or "January2020" tokenize ("1","January").
+    let mut toks: Vec<String> = Vec::new();
+    for raw in s.split(|c: char| c == ' ' || c == ',').filter(|t| !t.is_empty()) {
+        let mut cur = String::new();
+        let mut prev_digit: Option<bool> = None;
+        for ch in raw.chars() {
+            let is_d = ch.is_ascii_digit();
+            if let Some(pd) = prev_digit {
+                if pd != is_d {
+                    toks.push(std::mem::take(&mut cur));
+                }
+            }
+            cur.push(ch);
+            prev_digit = Some(is_d);
+        }
+        if !cur.is_empty() {
+            toks.push(cur);
+        }
+    }
+    if toks.is_empty() {
+        return None;
+    }
+    let toks: Vec<&str> = toks.iter().map(|s| s.as_str()).collect();
+    let (mut year, mut month, mut day) = (None, None, None);
+    for t in &toks {
+        if let Some(m) = month_num(t) {
+            month = Some(m);
+        } else if let Ok(n) = t.trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<i64>() {
+            if n >= 1000 {
+                year = Some(n);
+            } else if day.is_none() && (1..=31).contains(&n) {
+                day = Some(n as u32);
+            } else {
+                year = Some(n);
+            }
+        }
+    }
+    let m = month?;
+    let y = year.unwrap_or(default_year);
+    Some((y, m, day.unwrap_or(1)))
+}
+
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
@@ -241,5 +384,32 @@ mod tests {
         assert_eq!(strftime("%Y-%m-%d", &c), "2005-03-01");
         assert_eq!(strftime("%A %B", &c), "Tuesday March");
         assert_eq!(strftime("%H:%M:%S", &c), "12:34:56");
+    }
+
+    #[test]
+    fn timestamp_string_parsing() {
+        // τ = 2005-03-01 12:34:56 UTC, used for `now` and year-less defaults.
+        let tau = 1_109_680_496;
+        let fmt = |raw: &str| parse_timestamp(raw, tau).map(|u| {
+            let c = civil_from_unix(u);
+            format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", c.year, c.month, c.day, c.hour, c.min, c.sec)
+        });
+        // Y-M-D (single and zero-padded), the form CS1's Configuration feeds.
+        assert_eq!(fmt("2022-1-1").as_deref(), Some("2022-01-01 00:00:00"));
+        assert_eq!(fmt("2022-03-09").as_deref(), Some("2022-03-09 00:00:00"));
+        // ISO with time.
+        assert_eq!(fmt("2022-03-09T05:06:07Z").as_deref(), Some("2022-03-09 05:06:07"));
+        // MediaWiki 14-digit stamp and bare year.
+        assert_eq!(fmt("20200215123000").as_deref(), Some("2020-02-15 12:30:00"));
+        assert_eq!(fmt("1999").as_deref(), Some("1999-01-01 00:00:00"));
+        // Month-name forms, including the glued "1January" and year-less
+        // (defaults to τ's year).
+        assert_eq!(fmt("1 January 2020").as_deref(), Some("2020-01-01 00:00:00"));
+        assert_eq!(fmt("January 1, 2020").as_deref(), Some("2020-01-01 00:00:00"));
+        assert_eq!(fmt("August 2017").as_deref(), Some("2017-08-01 00:00:00"));
+        assert_eq!(fmt("1January").as_deref(), Some("2005-01-01 00:00:00"));
+        assert_eq!(fmt("now").as_deref(), Some("2005-03-01 12:34:56"));
+        // Unrecognized returns None (the caller surfaces "invalid timestamp").
+        assert_eq!(parse_timestamp("not a date", tau), None);
     }
 }

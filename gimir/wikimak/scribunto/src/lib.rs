@@ -103,12 +103,25 @@ impl LuaInvoker {
         store: &dyn PageStore,
     ) -> Result<String, LuaError> {
         let tau_secs = store.timestamp_micros().div_euclid(1_000_000);
+
+        // Normalize the invoke frame's title to the module's canonical
+        // prefixed title. MediaWiki resolves `{{#invoke:citation/CS1|…}}` to
+        // `Module:Citation/CS1`, and `frame:getTitle()` returns THAT — modules
+        // rely on it (CS1 does `getTitle():gsub('^Module:Citation/CS1','')` to
+        // find its own subpage suffix; the raw lowercased title would leave the
+        // pattern unmatched and mangle every submodule path). The frozen
+        // preprocessor hands us the raw name, so we canonicalize here.
+        let canonical_title = mwlib::module_title(module).prefixed(store.site());
+        let mut frame = frame.clone();
+        frame.title = canonical_title.clone();
+        let frame = &frame;
+
         let ctx = Ctx {
             store,
             invoker: self,
             site: store.site(),
             tau_secs,
-            current_title: frame.title.clone(),
+            current_title: canonical_title,
             logs: &self.logs,
             source_cache: &self.source_cache,
         };
@@ -203,7 +216,7 @@ impl ModuleInvoker for LuaInvoker {
 }
 
 fn fetch_source(ctx: &Ctx, name: &str) -> Option<String> {
-    let title = mwlib::module_title(name);
+    let title = mwlib::resolve_module(name, ctx.site);
     let key = title.text.clone();
     if let Some(cached) = ctx.source_cache.borrow().get(&key) {
         return cached.clone();
@@ -231,9 +244,15 @@ where
         if !matches!(cached, Value::Nil) {
             return Ok(cached);
         }
-        let src = fetch_source(ctx, &name).ok_or_else(|| {
-            LuaError::RuntimeError(format!("Script error: No such module \"{name}\"."))
-        })?;
+        // Scribunto-shipped lualib modules (strict, libraryUtil, mw) are
+        // required by bare name and never appear in a wiki's Module: closure;
+        // resolve them before hitting the store.
+        let src = match crate::lua_src::builtin_lib(&name) {
+            Some(builtin) => builtin.to_string(),
+            None => fetch_source(ctx, &name).ok_or_else(|| {
+                LuaError::RuntimeError(format!("Script error: No such module \"{name}\"."))
+            })?,
+        };
         let value: Value = lua
             .load(&src)
             .set_name(name.clone())
@@ -265,7 +284,12 @@ fn load_entry_module(lua: &Lua, ctx: &Ctx, module: &str) -> mlua::Result<Table> 
 
 fn coerce_return(v: Value) -> mlua::Result<String> {
     Ok(match v {
-        Value::String(s) => s.to_str()?.to_string(),
+        // Lenient decode: a module that sliced a multibyte value mid-character
+        // can return bytes that aren't valid UTF-8. The output feeds HTML
+        // (which must be UTF-8), so substitute U+FFFD rather than failing the
+        // whole invoke — the citation renders with one glyph mangled instead
+        // of vanishing into a script-error box.
+        Value::String(s) => s.to_string_lossy().to_string(),
         Value::Integer(n) => n.to_string(),
         Value::Number(n) => n.to_string(),
         Value::Boolean(b) => b.to_string(),

@@ -9,17 +9,20 @@
 //! faces. Fixtures are gzip'd snapshots captured by `corpus/capture.py`
 //! (page wikitext + closure + reader HTML + siteinfo, all at one instant).
 //!
-//! We grade USER-VISIBLE output, not editor scaffolding. The signature step
-//! strips what the in-page editor needs and the reader ignores — TemplateStyles
-//! `<style>` blocks, `mw-editsection` links, and (by dropping every attribute)
-//! the `data-mw` / `typeof=` / `about=` / RESTBase-id cruft — from BOTH sides
-//! before comparing. What's left is structure + visible text.
+//! We grade USER-VISIBLE output, not editor scaffolding: the chrome-strip
+//! removes TemplateStyles `<style>` blocks and `mw-editsection` links, and the
+//! inventory ignores attributes entirely (so `data-mw`/`typeof=`/`about=`/
+//! RESTBase-id cruft never counts).
 //!
-//! The score is a Dice coefficient over token bigrams of that stripped stream.
-//! It is a MEASUREMENT, not a spec: real pages lean on Wikidata, unsupported
-//! extensions, and templates we render partially, so perfection is not the
-//! bar. The floored aggregate catches regressions; the per-page printout is
-//! the straightedge you watch while improving the parser.
+//! This is a DIAGNOSTIC, not a score. It prints a per-page structure inventory
+//! (reader vs ours, with Δ) and a ranked work-list of what fails — which
+//! modules error on `#invoke`, which templates go missing, which extension
+//! tags are unsupported — so the harness tells you WHAT to build next. The one
+//! hard gate is the total actionable-failure count ([`MAX_TOTAL_FAILURES`]):
+//! it can only be lowered by rendering more real content, never by cosmetics,
+//! and a silently-dropped failure resurfaces as missing structure in the
+//! inventory. A single similarity number would say nothing and invite gaming;
+//! a list of missing structures invites fixing.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -63,6 +66,18 @@ struct SiteInfo {
     namespaces: HashMap<String, NsRow>,
     #[serde(default)]
     namespacealiases: Vec<NsAlias>,
+    #[serde(default)]
+    magicwords: Vec<MagicWordRow>,
+}
+
+#[derive(Deserialize)]
+struct MagicWordRow {
+    /// Canonical magic-word id, e.g. "if", "pagename", "!".
+    name: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(rename = "case-sensitive", default)]
+    case_sensitive: bool,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +140,22 @@ fn build_site(b: &Bundle) -> SiteConfig {
         .and_then(|v| v.as_str())
         .map(|s| if s.starts_with("//") { format!("https:{s}") } else { s.to_string() })
         .unwrap_or_default();
+    // Magic-word alias index: each alias (trailing `:` from the subst-family
+    // and any leading `#` are not present in siteinfo aliases) → canonical id.
+    // Case-insensitive words are also keyed by their lowercased alias so the
+    // preprocessor can resolve either casing.
+    let mut magic_aliases = std::collections::BTreeMap::new();
+    for mw in &b.siteinfo.magicwords {
+        for alias in &mw.aliases {
+            let token = alias.strip_suffix(':').unwrap_or(alias).to_string();
+            magic_aliases.entry(token.clone()).or_insert_with(|| mw.name.clone());
+            if !mw.case_sensitive {
+                magic_aliases
+                    .entry(token.to_lowercase())
+                    .or_insert_with(|| mw.name.clone());
+            }
+        }
+    }
     SiteConfig {
         site_name: b.meta.sitename.clone(),
         db_name: format!("{}wiki", b.meta.lang),
@@ -134,6 +165,7 @@ fn build_site(b: &Bundle) -> SiteConfig {
         script_path: "/w".into(),
         namespaces,
         interwiki: Default::default(),
+        magic_aliases,
     }
 }
 
@@ -235,10 +267,12 @@ fn count(hay: &str, needle: &str) -> usize {
 }
 
 /// Inventory the reader-visible structures in `html` (chrome already stripped).
-/// `refs` counts reference-list definitions (`id="cite_note-…"`, the scheme both
-/// MediaWiki and our Cite use); `images` counts `<img>` — for our render that is
-/// 0 (media is placeholdered), so the images delta is exactly "pictures the
-/// reader sees that we don't", which the miss inventory attributes.
+/// `refs` counts the inline citation markers via their `href="#cite_note-…"`
+/// backlink — a signal BOTH MediaWiki and our Cite emit (the reference-list
+/// item ids differ between the two, so keying on those would compare our format
+/// against nothing). `images` counts `<img>`; ours is 0 (media placeholdered),
+/// so the images delta is exactly "pictures the reader sees that we don't",
+/// which the miss inventory attributes.
 fn inventory(html: &str) -> Counts {
     let s = strip_chrome(html);
     let headings = (2..=6).map(|h| count(&s, &format!("<h{h}"))).sum();
@@ -247,7 +281,7 @@ fn inventory(html: &str) -> Counts {
         tables: count(&s, "<table"),
         list_items: count(&s, "<li"),
         links: count(&s, "<a "),
-        refs: count(&s, "id=\"cite_note-"),
+        refs: count(&s, "href=\"#cite_note-"),
         images: count(&s, "<img"),
         paragraphs: count(&s, "<p>") + count(&s, "<p "),
     }
@@ -405,7 +439,8 @@ fn measure(b: &Bundle) -> Rendered {
 /// dropping a failure to dodge it would show up as a missing structure in the
 /// printed inventory below. Snapshot of today's count; it must not grow. Lower
 /// it as the parser handles more. NOT a quality score — a regression tripwire.
-const MAX_TOTAL_FAILURES: usize = 2154; // measured 2026-07 over the 12-page corpus
+const MAX_TOTAL_FAILURES: usize = 936; // 2026-07: 2154 → 936 after the preprocessor
+                                       // + Scribunto mw.* passes. Ratchets DOWN.
 
 #[test]
 fn corpus_render_report() {
@@ -507,14 +542,15 @@ fn print_ranked(header: &str, m: &HashMap<String, usize>) {
 /// empty and hide regressions).
 #[test]
 fn inventory_counts_structure_and_strips_chrome() {
-    let c = inventory(r#"<div class="mw-parser-output"><style>x{y:z}</style>
+    let c = inventory(r##"<div class="mw-parser-output"><style>x{y:z}</style>
         <h2>Hello <span class="mw-editsection">[edit]</span></h2>
         <table><tbody><tr><td>a</td></tr></tbody></table>
-        <p>World</p><ol class="references"><li id="cite_note-1">ref</li></ol></div>"#);
+        <p>World<sup class="reference"><a href="#cite_note-1">[1]</a></sup></p>
+        <ol class="references"><li id="cite_note-1">ref</li></ol></div>"##);
     assert_eq!(c.headings, 1, "one heading");
     assert_eq!(c.tables, 1, "one table");
     assert_eq!(c.paragraphs, 1, "one paragraph");
-    assert_eq!(c.refs, 1, "one reference definition");
+    assert_eq!(c.refs, 1, "one inline citation marker");
     // Chrome must be gone: the <style> block's `z` and the editsection [edit]
     // must not survive into the stripped text (would inflate paragraph/word
     // scans and mask real content).

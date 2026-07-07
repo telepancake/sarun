@@ -75,6 +75,12 @@ pub struct SiteConfig {
     pub script_path: String,
     pub namespaces: BTreeMap<i32, NamespaceInfo>,
     pub interwiki: BTreeMap<String, InterwikiEntry>,
+    /// Localized magic-word aliases from siteinfo (`siteinfo.magicwords`):
+    /// each alias token (leading `#` and trailing `:` removed) mapped to its
+    /// canonical magic-word id — e.g. "תנאי" → "if", "שם הדף" → "pagename".
+    /// Case-insensitive words are additionally keyed by their lowercased
+    /// alias at build time. Empty ⇒ only the built-in English names resolve.
+    pub magic_aliases: BTreeMap<String, String>,
 }
 
 /// Everything the renderer asks the wiki. Implementations are already

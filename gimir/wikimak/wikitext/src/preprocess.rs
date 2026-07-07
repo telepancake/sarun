@@ -375,6 +375,11 @@ fn expand_body(ctx: &mut Ctx, text: &str, frame: &Frame, transcluding: bool) -> 
     let (t, prot) = protect_tags(&t);
     let nodes = parse_nodes(&t);
     let mut out = expand_nodes(ctx, &nodes, frame);
+    // TemplateStyles is a known extension tag whose CSS the reader renders and
+    // we do not emit; consume it here (before restoring nowiki/pre) so it never
+    // reaches the parser as an "unknown tag". Done per body, so a `<style>` src
+    // that arrives via transclusion is caught wherever it surfaces.
+    strip_templatestyles(&mut out);
     restore_tags(&mut out, &prot);
     out
 }
@@ -470,28 +475,90 @@ fn detect(head: &[Node]) -> Option<(String, bool, Vec<Node>)> {
     Some((name, colon, arg0))
 }
 
+/// String form of [`detect`]: split an already-expanded name into
+/// (name, colon-seen, arg0-nodes). Always succeeds — a bare string is a
+/// name with no colon; the part after the first colon becomes arg0 text.
+fn detect_str(s: &str) -> (String, bool, Vec<Node>) {
+    match s.find(':') {
+        Some(idx) => {
+            let rest = &s[idx + 1..];
+            let arg0 = if rest.is_empty() {
+                Vec::new()
+            } else {
+                vec![Node::Text(rest.to_string())]
+            };
+            (s[..idx].to_string(), true, arg0)
+        }
+        None => (s.to_string(), false, Vec::new()),
+    }
+}
+
+/// Map a raw parser-function/variable token to its canonical magic-word id
+/// via siteinfo aliases, preserving a leading `#`. Localized tokens
+/// (`#תנאי` → `#if`, `שם הדף` → `pagename`) resolve to the English id the
+/// dispatcher/variable table use. Unknown tokens — and every token when
+/// siteinfo carries no aliases — pass through unchanged, so the built-in
+/// English names always keep working.
+fn resolve_magic(site: &SiteConfig, raw: &str) -> String {
+    if site.magic_aliases.is_empty() {
+        return raw.to_string();
+    }
+    let (hash, bare) = match raw.strip_prefix('#') {
+        Some(r) => (true, r.trim()),
+        None => (false, raw.trim()),
+    };
+    let canon = site
+        .magic_aliases
+        .get(bare)
+        .or_else(|| site.magic_aliases.get(&bare.to_lowercase()));
+    match canon {
+        Some(c) if hash => format!("#{c}"),
+        Some(c) => c.clone(),
+        None => raw.to_string(),
+    }
+}
+
 fn expand_template(ctx: &mut Ctx, parts: &[Part], frame: &Frame) -> String {
     let head = head_nodes(&parts[0]);
     let mut detected = detect(&head);
-    // Strip transparent prefixes (subst:/safesubst:/msg:/raw:) and re-detect.
-    while let Some((name, true, arg0)) = &detected {
-        let key = name.trim().to_ascii_lowercase();
-        if matches!(key.as_str(), "subst" | "safesubst" | "msg" | "raw" | "msgnw") {
-            let a = arg0.clone();
-            detected = detect(&a);
-        } else {
+    // A dynamic name — a non-text node before the first colon, e.g.
+    // `{{ {{{|safesubst:}}}#invoke:String|len}}` — yields None here.
+    // MediaWiki computes the call title by EXPANDING the name first and only
+    // then looks for a subst prefix / parser function / variable. Mirror
+    // that: expand the head and re-detect on the text, so the inner
+    // `#invoke:`/`#if:` is dispatched instead of transcluded as a literal
+    // title (the top "missing template" the corpus surfaced).
+    if detected.is_none() {
+        let expanded = expand_nodes(ctx, &head, frame);
+        detected = Some(detect_str(&expanded));
+    }
+    // Strip transparent prefixes (subst:/safesubst:/msg:/raw:, plus their
+    // localized siteinfo aliases) and re-detect the remainder. When the
+    // remainder is itself dynamic, expand it before re-detecting.
+    loop {
+        let Some((name, true, arg0)) = detected.as_ref() else { break };
+        let key = resolve_magic(ctx.site, name.trim()).to_ascii_lowercase();
+        if !matches!(key.as_str(), "subst" | "safesubst" | "msg" | "raw" | "msgnw") {
             break;
         }
+        let arg0 = arg0.clone();
+        detected = Some(match detect(&arg0) {
+            Some(d) => d,
+            None => detect_str(&expand_nodes(ctx, &arg0, frame)),
+        });
     }
 
     if let Some((name, colon, arg0)) = &detected {
-        let key = name.trim();
+        // Canonicalize a localized/alias token to its English magic-word id
+        // before dispatch (`#תנאי:` → `#if:`, `{{שם הדף}}` → `{{PAGENAME}}`).
+        // Unknown names pass through unchanged → template transclusion.
+        let canon = resolve_magic(ctx.site, name.trim());
         if *colon {
-            if let Some(r) = dispatch_colon(ctx, key, arg0, &parts[1..], frame) {
+            if let Some(r) = dispatch_colon(ctx, &canon, arg0, &parts[1..], frame) {
                 return r;
             }
         }
-        let upper = key.to_ascii_uppercase();
+        let upper = canon.to_ascii_uppercase();
         let arg_str = if *colon {
             Some(expand_nodes(ctx, arg0, frame).trim().to_string())
         } else {
@@ -516,6 +583,10 @@ fn expand_template(ctx: &mut Ctx, parts: &[Part], frame: &Frame) -> String {
 /// so a genuinely unknown name falls through to template transclusion.
 fn magic_word(ctx: &mut Ctx, upper: &str, arg: Option<&str>) -> Option<String> {
     match upper {
+        // Standard MediaWiki builtins on every wiki: `{{!}}` → a literal pipe
+        // (survives template arg splitting), `{{=}}` → a literal equals.
+        "!" => return Some("|".to_string()),
+        "=" => return Some("=".to_string()),
         "DISPLAYTITLE" => {
             if let Some(a) = arg {
                 ctx.display_title = Some(a.to_string());
@@ -1666,15 +1737,183 @@ fn normalize_ns_key(s: &str) -> String {
 
 fn apply_inclusion(text: &str, transcluding: bool) -> String {
     if transcluding {
-        if contains_ci(text, "<onlyinclude>") {
-            return collect_regions(text, "<onlyinclude>", "</onlyinclude>");
-        }
-        let t = remove_region(text, "<noinclude>", "</noinclude>");
-        remove_tags(&t, &["<includeonly>", "</includeonly>"])
+        // `<onlyinclude>`: when any region exists, ONLY those are transcluded —
+        // but includeonly/noinclude WITHIN them still apply.
+        let base = if has_incl_open(text, "onlyinclude") {
+            collect_onlyinclude(text)
+        } else {
+            text.to_string()
+        };
+        let t = strip_incl_region(&base, "noinclude", false); // drop noinclude
+        strip_incl_region(&t, "includeonly", true) // unwrap includeonly
     } else {
-        let t = remove_region(text, "<includeonly>", "</includeonly>");
-        remove_tags(&t, &["<noinclude>", "</noinclude>", "<onlyinclude>", "</onlyinclude>"])
+        let t = strip_incl_region(text, "includeonly", false); // drop includeonly
+        let t = strip_incl_region(&t, "noinclude", true); // unwrap noinclude
+        strip_incl_region(&t, "onlyinclude", true) // unwrap onlyinclude tags
     }
+}
+
+/// Match an inclusion tag (`<name…>`, `</name…>`, `<name…/>`, `<name/>`) at
+/// byte `i` (which must be `<`). Returns (is_close, is_self_closing, end).
+/// Attributes/whitespace inside the tag are tolerated and ignored — these
+/// preprocessor-only tags never carry meaningful attributes, and MediaWiki
+/// matches them leniently. Case-insensitive; the name must end at a tag
+/// boundary so `<includeonlyx>` is not mistaken for `<includeonly>`.
+fn match_incl_tag(bytes: &[u8], i: usize, name: &str) -> Option<(bool, bool, usize)> {
+    if bytes.get(i) != Some(&b'<') {
+        return None;
+    }
+    let mut j = i + 1;
+    let is_close = bytes.get(j) == Some(&b'/');
+    if is_close {
+        j += 1;
+    }
+    if !matches_ci_at(bytes, name.as_bytes(), j) {
+        return None;
+    }
+    j += name.len();
+    match bytes.get(j) {
+        Some(b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r') => {}
+        _ => return None,
+    }
+    while j < bytes.len() && bytes[j] != b'>' {
+        j += 1;
+    }
+    if j >= bytes.len() {
+        return None; // no terminating '>'
+    }
+    let self_closing = bytes[j - 1] == b'/';
+    Some((is_close, self_closing, j + 1))
+}
+
+/// Is there an opening `<name…>` inclusion tag anywhere in `text`?
+fn has_incl_open(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some((false, false, _)) = match_incl_tag(bytes, i, name) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Byte range of the next `</name>` close at or after `from`: (start, end).
+fn find_incl_close(bytes: &[u8], from: usize, name: &str) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some((true, _, end)) = match_incl_tag(bytes, i, name) {
+                return Some((i, end));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Concatenate the bodies of every `<onlyinclude>…</onlyinclude>` region,
+/// dropping everything outside them (transclusion view). A region with no
+/// close runs to end of text.
+fn collect_onlyinclude(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some((false, self_closing, end)) = match_incl_tag(bytes, i, "onlyinclude") {
+                if self_closing {
+                    i = end;
+                    continue;
+                }
+                match find_incl_close(bytes, end, "onlyinclude") {
+                    Some((cstart, cend)) => {
+                        out.push_str(&text[end..cstart]);
+                        i = cend;
+                    }
+                    None => {
+                        out.push_str(&text[end..]);
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Process one inclusion-tag family. `keep_inner=true` unwraps the tags
+/// (keeps the body); `false` drops body and tags. Self-closing forms
+/// (`<name/>`) and stray close tags are consumed to nothing (a self-closing
+/// tag is an empty region). Handles attributes/whitespace, case-insensitive.
+fn strip_incl_region(text: &str, name: &str, keep_inner: bool) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some((is_close, self_closing, end)) = match_incl_tag(bytes, i, name) {
+                if self_closing || is_close {
+                    i = end; // empty region or stray close: consume the tag
+                    continue;
+                }
+                match find_incl_close(bytes, end, name) {
+                    Some((cstart, cend)) => {
+                        if keep_inner {
+                            out.push_str(&text[end..cstart]);
+                        }
+                        i = cend;
+                    }
+                    None => {
+                        if keep_inner {
+                            out.push_str(&text[end..]);
+                        }
+                        break; // unterminated open: rest handled above
+                    }
+                }
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        let l = ch.len_utf8();
+        out.push_str(&text[i..i + l]);
+        i += l;
+    }
+    out
+}
+
+/// Consume `<templatestyles …>` (and any stray close) — a known extension tag
+/// whose CSS the reader renders and we do not; emitting nothing keeps it off
+/// the parser's unknown-tag list.
+fn strip_templatestyles(text: &mut String) {
+    if !contains_ci(text, "<templatestyles") {
+        return;
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<'
+            && (matches_ci_at(bytes, b"<templatestyles", i)
+                || matches_ci_at(bytes, b"</templatestyles", i))
+        {
+            match text[i..].find('>') {
+                Some(rel) => i += rel + 1,
+                None => i = bytes.len(),
+            }
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap();
+        let l = ch.len_utf8();
+        out.push_str(&text[i..i + l]);
+        i += l;
+    }
+    *text = out;
 }
 
 /// Case-insensitive substring search returning a byte index. ASCII-only
@@ -1715,69 +1954,6 @@ fn matches_ci_at(hay: &[u8], needle: &[u8], i: usize) -> bool {
         }
     }
     true
-}
-
-fn remove_region(text: &str, open: &str, close: &str) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    while let Some(o) = find_ci_from(text, open, i) {
-        out.push_str(&text[i..o]);
-        match find_ci_from(text, close, o + open.len()) {
-            Some(c) => i = c + close.len(),
-            None => {
-                i = text.len();
-                break;
-            }
-        }
-    }
-    out.push_str(&text[i..]);
-    out
-}
-
-fn remove_tags(text: &str, tags: &[&str]) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    while i < text.len() {
-        // If a tag starts exactly here, drop it.
-        let here = tags
-            .iter()
-            .find(|t| matches_ci_at(text.as_bytes(), t.as_bytes(), i));
-        if let Some(t) = here {
-            i += t.len();
-            continue;
-        }
-        let next = tags.iter().filter_map(|t| find_ci_from(text, t, i)).min();
-        match next {
-            Some(n) => {
-                out.push_str(&text[i..n]);
-                i = n;
-            }
-            None => {
-                out.push_str(&text[i..]);
-                break;
-            }
-        }
-    }
-    out
-}
-
-fn collect_regions(text: &str, open: &str, close: &str) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    while let Some(o) = find_ci_from(text, open, i) {
-        let cs = o + open.len();
-        match find_ci_from(text, close, cs) {
-            Some(c) => {
-                out.push_str(&text[cs..c]);
-                i = c + close.len();
-            }
-            None => {
-                out.push_str(&text[cs..]);
-                break;
-            }
-        }
-    }
-    out
 }
 
 /// Strip HTML comments with MediaWiki's newline-eating rule: a comment
@@ -1847,8 +2023,21 @@ fn protect_tags(text: &str) -> (String, Vec<String>) {
                     .map(|b| matches!(b, b'>' | b' ' | b'/' | b'\t' | b'\n'))
                     .unwrap_or(false);
                 if ok {
+                    // End of the opening tag.
+                    let open_end = match text[i..].find('>') {
+                        Some(rel) => i + rel + 1,
+                        None => text.len(),
+                    };
+                    // A self-closing `<nowiki/>` / `<pre/>` is an empty tag that
+                    // produces no output but breaks surrounding syntax — consume
+                    // it. (Left in, it swallows to the next matching close and
+                    // corrupts every later nowiki, leaking them to the parser.)
+                    if open_end >= 2 && text.as_bytes()[open_end - 2] == b'/' {
+                        i = open_end;
+                        continue 'scan;
+                    }
                     let close = format!("</{tag}>");
-                    let end = match find_ci_from(text, &close, i) {
+                    let end = match find_ci_from(text, &close, open_end) {
                         Some(c) => c + close.len(),
                         None => text.len(),
                     };

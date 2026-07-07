@@ -634,3 +634,305 @@ fn wall_clock_backstop_fires() {
         start.elapsed()
     );
 }
+
+// ------------------------------------------------- Scribunto built-in libs
+
+#[test]
+fn strict_and_libraryutil_are_requirable() {
+    // Community modules `require('strict')` and `require('libraryUtil')` — the
+    // Scribunto lualib modules that never appear in a wiki closure. strict
+    // installs its _G metatable and returns it; libraryUtil.checkType enforces.
+    let mut store = TestStore::new();
+    store.add_module(
+        "Lib",
+        r####"
+        require('strict')
+        local checkType = require('libraryUtil').checkType
+        local p = {}
+        function p.main(f)
+            local ok = pcall(checkType, 'f', 1, 5, 'string')  -- 5 is not a string
+            checkType('f', 1, 'hi', 'string')                 -- passes
+            return tostring(ok) .. "/ok"
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(invoke(&store, "Lib", "main", &f).unwrap(), "false/ok");
+}
+
+#[test]
+fn require_resolves_localized_module_namespace() {
+    // Non-English wikis require modules by the LOCALIZED Module: prefix; the
+    // source is stored under the resolved (828, Name). Give ns 828 a localized
+    // alias and require through it.
+    let mut namespaces = BTreeMap::new();
+    let ns = |id: i32, canon: &str, aliases: Vec<&str>| NamespaceInfo {
+        id,
+        canonical: canon.to_string(),
+        aliases: aliases.into_iter().map(|s| s.to_string()).collect(),
+        case_first_letter: true,
+    };
+    namespaces.insert(0, ns(0, "", vec![]));
+    namespaces.insert(828, ns(828, "Module", vec!["Модуль"]));
+    let mut store = TestStore::new();
+    store.site.namespaces = namespaces;
+    store.add_module("Helper", "return { v = function() return 'hi' end }");
+    store.add_module(
+        "Main",
+        r####"
+        local p = {}
+        function p.main(f)
+            local h = require('Модуль:Helper')  -- localized prefix
+            return h.v()
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(invoke(&store, "Main", "main", &f).unwrap(), "hi");
+}
+
+// ------------------------------------------------------------- mw.title (rich)
+
+#[test]
+fn mw_title_urls_and_subpage_fields() {
+    let mut store = TestStore::new();
+    store.site.server = "https://ex.org".into();
+    store.site.script_path = "/w".into();
+    store.add_module(
+        "Ti",
+        r####"
+        local p = {}
+        function p.main(f)
+            local t = mw.title.makeTitle('Module', 'Foo/Bar/Baz')
+            local m = mw.title.makeTitle('Template', 'X')  -- string namespace name
+            return t.rootText .. "|" .. t.baseText .. "|" .. t.subpageText
+                .. "|" .. t:fullUrl('action=edit')
+                .. "|" .. m.namespace .. "|" .. tostring(m.talkPageTitle.namespace)
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(
+        invoke(&store, "Ti", "main", &f).unwrap(),
+        "Foo|Foo/Bar|Baz|https://ex.org/w/Module:Foo/Bar/Baz?action=edit|10|11"
+    );
+}
+
+// -------------------------------------------------------------------- mw.uri
+
+#[test]
+fn mw_uri_new_parses_components() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "U",
+        r####"
+        local p = {}
+        function p.main(f)
+            local u = mw.uri.new('https://web.archive.org/web/2017/http://x.com/a?b=1#frag')
+            return u.protocol .. "|" .. u.host .. "|" .. u.fragment .. "|" .. u.query.b
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(
+        invoke(&store, "U", "main", &f).unwrap(),
+        "https|web.archive.org|frag|1"
+    );
+}
+
+// --------------------------------------------------------------- mw.language
+
+#[test]
+fn mw_language_getdir_and_formatdate_string() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "L",
+        r####"
+        local p = {}
+        function p.main(f)
+            local en = mw.language.new('en')
+            local ar = mw.language.new('ar')
+            -- formatDate accepts a timestamp STRING (parsed like #time).
+            local d = en:formatDate('F', '2022-3-1')
+            local names = mw.language.fetchLanguageNames('en', 'all')  -- empty table, no data
+            local cnt = 0; for _ in pairs(names) do cnt = cnt + 1 end
+            return en:getDir() .. "|" .. ar:getDir() .. "|" .. d .. "|" .. cnt
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(invoke(&store, "L", "main", &f).unwrap(), "ltr|rtl|March|0");
+}
+
+// ---------------------------------------------------------------- mw.ustring
+
+#[test]
+fn ustring_nul_class_pattern_and_gcodepoint() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "U2",
+        r####"
+        local p = {}
+        function p.main(f)
+            -- A control-char class built with a literal NUL must not crash the
+            -- byte matcher (it did: "malformed pattern (missing ']')").
+            local ctrl = "[" .. string.char(0) .. "-" .. string.char(8) .. "]"
+            local hit = mw.ustring.find("ab\tcd", ctrl) and "found" or "clean"
+            -- gcodepoint iterates codepoints.
+            local cps = {}
+            for c in mw.ustring.gcodepoint("A€") do cps[#cps+1] = c end
+            -- sub defaults i to 1.
+            local lead = mw.ustring.sub("héllo", nil, 2)
+            return hit .. "|" .. cps[1] .. "," .. cps[2] .. "|" .. lead
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    // "ab\tcd" has no byte in 0..8 range (\t is 9), so "clean"; € is U+20AC.
+    assert_eq!(invoke(&store, "U2", "main", &f).unwrap(), "clean|65,8364|hé");
+}
+
+#[test]
+fn string_gains_ustring_method_aliases() {
+    // Several wikis extend `string` with codepoint-aware method aliases so a
+    // plain string can `:ulower()` / `:ulen()` (ukwiki CS1 leans on this).
+    let mut store = TestStore::new();
+    store.add_module(
+        "S",
+        r####"
+        local p = {}
+        function p.main(f)
+            local s = "CAFÉ"
+            return s:ulower() .. "|" .. s:ulen()
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(invoke(&store, "S", "main", &f).unwrap(), "café|4");
+}
+
+// ------------------------------------------------------------------- mw.site
+
+#[test]
+fn mw_site_namespace_subsets_are_objects() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "Si",
+        r####"
+        local p = {}
+        function p.main(f)
+            -- subjectNamespaces[id] must be the full namespace OBJECT, not a
+            -- bare name (Namespace detect reads .name / iterates .aliases).
+            local main = mw.site.subjectNamespaces[0]
+            local tmpl = mw.site.namespaces['Template']
+            local ok = (main.name == "") and "main-ok" or "main-bad"
+            return ok .. "|" .. tmpl.id .. "|" .. type(tmpl.aliases)
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(invoke(&store, "Si", "main", &f).unwrap(), "main-ok|10|table");
+}
+
+// ------------------------------------------------------------- frame:extensionTag
+
+#[test]
+fn frame_extension_tag_templatestyles_and_generic() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "E",
+        r####"
+        local p = {}
+        function p.main(frame)
+            -- templatestyles is invisible reader chrome -> empty.
+            local ts = frame:extensionTag{ name = 'templatestyles', args = { src = 'M/styles.css' } }
+            -- a generic tag round-trips to markup.
+            local ref = frame:extensionTag('ref', 'body', { name = 'r1' })
+            return "[" .. ts .. "]" .. ref
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(
+        invoke(&store, "E", "main", &f).unwrap(),
+        "[]<ref name=\"r1\">body</ref>"
+    );
+}
+
+// ----------------------------------------------------------------- mw.wikibase
+
+#[test]
+fn mw_wikibase_present_but_empty() {
+    // No Wikidata depot: mw.wikibase EXISTS (so guarding modules don't crash on
+    // `index field 'wikibase'`) and every lookup returns nil/empty.
+    let mut store = TestStore::new();
+    store.add_module(
+        "W",
+        r####"
+        local p = {}
+        function p.main(f)
+            local ent = mw.wikibase.getEntity()
+            local stmts = mw.wikibase.getBestStatements('Q1', 'P1')
+            return tostring(ent) .. "|" .. #stmts .. "|" .. tostring(mw.wikibase.getLabel('Q1'))
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(invoke(&store, "W", "main", &f).unwrap(), "nil|0|nil");
+}
+
+// ------------------------------------------------------------------- mw.text
+
+#[test]
+fn mw_text_unstrip_helpers() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "Tx",
+        r####"
+        local p = {}
+        function p.main(f)
+            -- unstripNoWiki has no strip state to consult -> identity.
+            local a = mw.text.unstripNoWiki("plain")
+            -- killMarkers removes UNIQ…QINU marker syntax.
+            local b = mw.text.killMarkers("x\127UNIQ--nowiki-0-QINU\127y")
+            return a .. "|" .. b
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(invoke(&store, "Tx", "main", &f).unwrap(), "plain|xy");
+}
+
+// ---------------------------------------------------------------- mw.message
+
+#[test]
+fn mw_message_new_raw_message() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "Mr",
+        r####"
+        local p = {}
+        function p.main(f)
+            -- newRawMessage uses its argument as raw text, with $N params; a
+            -- single table argument is the whole parameter list.
+            local a = mw.message.newRawMessage('Hello $1 and $2', {'Ada', 'Bob'}):plain()
+            local b = mw.message.newRawMessage('$1%', 42):plain()
+            return a .. "|" .. b
+        end
+        return p
+        "####,
+    );
+    let f = frame_with(&[]);
+    assert_eq!(invoke(&store, "Mr", "main", &f).unwrap(), "Hello Ada and Bob|42%");
+}
