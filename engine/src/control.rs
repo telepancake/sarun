@@ -1691,18 +1691,31 @@ macro_rules! ui_verbs {
             (Some(id), Some(rel)) => discover::first_writer_prov(id, rel), _ => Value::Null,
         }
         }
-        "stuck", "SID", "live processes of a running box with wchan/syscall (wedge diagnosis)" => { match arg_sid(args) {
+        "stuck", "SID", "live THREADS of a running box with wchan/syscall (wedge diagnosis)" => { match arg_sid(args) {
             // A wedged box is invisible from the outside — this answers
-            // WHERE it is stuck without strace: every live process whose
-            // ancestry reaches the box's runner, with its comm, state,
-            // kernel wait channel and current syscall number. Read
-            // straight from /proc at call time; no box cooperation needed.
+            // WHERE it is stuck without strace. Descend to THREADS, not
+            // just processes: the engine's own workers (a wedged in-box
+            // build is often a blocked tokio worker or coreutil thread,
+            // e.g. sarun-uu_sort in unix_stream_data_wait) live as tasks
+            // inside one pid, and the tgid leader alone shows "running"
+            // for the idle main thread — useless. For each process whose
+            // ancestry reaches the box's runner we walk /proc/<pid>/task/
+            // and report every thread's comm / state / kernel wchan /
+            // current syscall. Read straight from /proc; no box help.
             Some(id) => {
                 let rp = lock(state).box_runpids.get(&id).copied();
                 match rp {
                     None => json!({"ok": false, "error": "box not running"}),
                     Some(rp) => {
-                        let mut procs = vec![];
+                        // stat "pid (comm) STATE …" — state char follows the
+                        // LAST ')' (comm may contain parens).
+                        let state_of = |path: &str| std::fs::read_to_string(path)
+                            .ok()
+                            .and_then(|s| s.rfind(')')
+                                .and_then(|i| s[i + 1..].trim().chars().next())
+                                .map(|c| c.to_string()))
+                            .unwrap_or_default();
+                        let mut threads = vec![];
                         if let Ok(rd) = std::fs::read_dir("/proc") {
                             for ent in rd.flatten() {
                                 let Some(pid) = ent.file_name().to_str()
@@ -1719,34 +1732,44 @@ macro_rules! ui_verbs {
                                     cur = pp;
                                 }
                                 if !hit { continue; }
-                                let rd1 = |f: &str| std::fs::read_to_string(
-                                    format!("/proc/{pid}/{f}"))
-                                    .unwrap_or_default().trim().to_string();
-                                let comm = rd1("comm");
-                                let wchan = rd1("wchan");
-                                // /proc/pid/syscall: first token = nr (-1 =
-                                // not in a syscall, "running" while on-CPU).
-                                let sysc = rd1("syscall")
-                                    .split_whitespace().next()
-                                    .unwrap_or("").to_string();
-                                // stat: "pid (comm) STATE …" — the state
-                                // char follows the LAST ')' (comm may
-                                // itself contain parens).
-                                let state = std::fs::read_to_string(
-                                    format!("/proc/{pid}/stat"))
-                                    .ok()
-                                    .and_then(|s| s.rfind(')')
-                                        .and_then(|i| s[i + 1..].trim()
-                                            .chars().next())
-                                        .map(|c| c.to_string()))
-                                    .unwrap_or_default();
-                                procs.push(json!({
-                                    "pid": pid, "comm": comm, "state": state,
-                                    "wchan": wchan, "syscall": sysc,
-                                }));
+                                let Ok(tasks) = std::fs::read_dir(
+                                    format!("/proc/{pid}/task")) else { continue };
+                                for te in tasks.flatten() {
+                                    let Some(tid) = te.file_name().to_str()
+                                        .and_then(|s| s.parse::<i32>().ok())
+                                    else { continue };
+                                    let base = format!("/proc/{pid}/task/{tid}");
+                                    let rd1 = |f: &str| std::fs::read_to_string(
+                                        format!("{base}/{f}"))
+                                        .unwrap_or_default().trim().to_string();
+                                    let comm = rd1("comm");
+                                    let wchan = rd1("wchan");
+                                    // /proc/.../syscall: first token = nr
+                                    // (-1 = not in a syscall, "running").
+                                    let sysc = rd1("syscall")
+                                        .split_whitespace().next()
+                                        .unwrap_or("").to_string();
+                                    let state = state_of(&format!("{base}/stat"));
+                                    threads.push(json!({
+                                        "pid": pid, "tid": tid, "comm": comm,
+                                        "state": state, "wchan": wchan,
+                                        "syscall": sysc,
+                                    }));
+                                }
                             }
                         }
-                        json!({"ok": true, "runner": rp, "procs": procs})
+                        // Blocked threads first (a wedge is a thread NOT
+                        // running), then by pid/tid — so the smoking gun is
+                        // at the top instead of buried under idle workers.
+                        threads.sort_by_key(|t| {
+                            let st = t.get("state").and_then(Value::as_str)
+                                .unwrap_or("");
+                            let running = matches!(st, "R");
+                            (running,
+                             t.get("pid").and_then(Value::as_i64).unwrap_or(0),
+                             t.get("tid").and_then(Value::as_i64).unwrap_or(0))
+                        });
+                        json!({"ok": true, "runner": rp, "procs": threads})
                     }
                 }
             }
@@ -3871,19 +3894,19 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                     let empty = vec![];
                     let procs = r.get("procs").and_then(Value::as_array)
                         .unwrap_or(&empty);
-                    println!("{:>8} {:>2} {:>18} {:>8}  {}",
-                             "PID", "ST", "WCHAN", "SYSCALL", "COMM");
+                    println!("{:>7} {:>7} {:>2} {:>20} {:>8}  {}",
+                             "PID", "TID", "ST", "WCHAN", "SYSCALL", "COMM");
                     for p in procs {
                         let g = |k: &str| p.get(k).and_then(Value::as_str)
                             .unwrap_or("").to_string();
-                        let pid = p.get("pid").and_then(Value::as_i64)
+                        let n = |k: &str| p.get(k).and_then(Value::as_i64)
                             .unwrap_or(0);
-                        println!("{:>8} {:>2} {:>18} {:>8}  {}",
-                                 pid, g("state"), g("wchan"),
+                        println!("{:>7} {:>7} {:>2} {:>20} {:>8}  {}",
+                                 n("pid"), n("tid"), g("state"), g("wchan"),
                                  g("syscall"), g("comm"));
                     }
                     if procs.is_empty() {
-                        println!("(no live processes — the box's tree has \
+                        println!("(no live threads — the box's tree has \
                                   exited; the runner may be stuck in \
                                   teardown)");
                     }

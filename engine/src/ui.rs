@@ -4506,18 +4506,20 @@ impl App {
                 let procs = r.get("procs").and_then(Value::as_array)
                     .unwrap_or(&empty);
                 let mut lines = vec![format!(
-                    "{:>8} {:>2} {:>18} {:>8}  {}",
-                    "PID", "ST", "WCHAN", "SYSCALL", "COMM")];
+                    "{:>7} {:>7} {:>2} {:>20} {:>8}  {}",
+                    "PID", "TID", "ST", "WCHAN", "SYSCALL", "COMM")];
                 for p in procs {
                     let g = |k: &str| p.get(k).and_then(Value::as_str)
                         .unwrap_or("").to_string();
+                    let n = |k: &str| p.get(k).and_then(Value::as_i64)
+                        .unwrap_or(0);
                     lines.push(format!(
-                        "{:>8} {:>2} {:>18} {:>8}  {}",
-                        p.get("pid").and_then(Value::as_i64).unwrap_or(0),
-                        g("state"), g("wchan"), g("syscall"), g("comm")));
+                        "{:>7} {:>7} {:>2} {:>20} {:>8}  {}",
+                        n("pid"), n("tid"), g("state"), g("wchan"),
+                        g("syscall"), g("comm")));
                 }
                 if procs.is_empty() {
-                    lines.push("(no live processes — the tree exited; \
+                    lines.push("(no live threads — the tree exited; \
                                 the runner may be stuck in teardown)".into());
                 }
                 lines.push(String::new());
