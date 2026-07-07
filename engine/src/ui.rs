@@ -441,6 +441,16 @@ enum Modal {
     /// launch_env) so they persist across launches this session and are
     /// applied to whichever destination Enter picks.
     Launcher { items: Vec<ActionItem>, sel: usize },
+    /// Scoped apply/discard: pick "All" or a named file-group (files_*.glob),
+    /// so you can save/discard just the browser session without fishing files.
+    /// Each row is (label, selection) where selection None = the whole box and
+    /// Some(paths) = that group's matching changes. `discard` picks the verb.
+    FileGroupPick {
+        discard: bool,
+        sid: String,
+        rows: Vec<(String, Option<Vec<String>>)>,
+        sel: usize,
+    },
     /// Task entry for "run an oaita agent session ON a box". `box_name` is
     /// the box the session's sandbox is parented on; `session` is the
     /// auto-derived turn-folder name; `buf` is the task the user types.
@@ -4412,6 +4422,10 @@ impl App {
 
     fn apply(&mut self) {
         if self.batch_apply_discard(false) { return; }
+        // Box-level accept from the Sessions pane offers the scoped picker
+        // ("All" + file-groups like the browser session); per-change apply on
+        // the Changes/Hunks panes stays immediate.
+        if self.focus == Pane::Sessions && self.open_file_group_pick(false) { return; }
         let Some(sid) = self.cur_sid() else { return };
         let sel = self.review_selector();
         match rpc(&self.sock, "review.apply", json!([sid, sel])) {
@@ -4427,6 +4441,7 @@ impl App {
 
     fn discard(&mut self) {
         if self.batch_apply_discard(true) { return; }
+        if self.focus == Pane::Sessions && self.open_file_group_pick(true) { return; }
         let Some(sid) = self.cur_sid() else { return };
         let sel = self.review_selector();
         match rpc(&self.sock, "review.discard", json!([sid, sel])) {
@@ -4435,6 +4450,60 @@ impl App {
                 self.status = format!("discarded {n} change(s)");
             }
             Err(e) => self.status = format!("discard: {e}"),
+        }
+        self.refresh_sessions();
+        self.load_changes();
+    }
+
+    /// Open the scoped apply/discard picker for the cursored box: "All" plus
+    /// each file-group (files_*.glob) that selects some of the box's changes.
+    /// Returns false — caller does the plain op — when the box has no changes.
+    fn open_file_group_pick(&mut self, discard: bool) -> bool {
+        let Some(sid) = self.cur_sid() else { return false };
+        let total = rpc(&self.sock, "review.session_changes", json!([sid]))
+            .ok()
+            .and_then(|v| v.as_array().map(|a| a.len()))
+            .unwrap_or(0);
+        if total == 0 {
+            return false;
+        }
+        let mut rows: Vec<(String, Option<Vec<String>>)> =
+            vec![(format!("All  ({total} change(s))"), None)];
+        if let Ok(r) = rpc(&self.sock, "review.file_groups", json!([sid])) {
+            if let Some(groups) = r.get("groups").and_then(Value::as_array) {
+                for g in groups {
+                    let count = g.get("count").and_then(Value::as_i64).unwrap_or(0);
+                    if count == 0 {
+                        continue; // only offer groups that match something
+                    }
+                    let name = g.get("name").and_then(Value::as_str).unwrap_or("group");
+                    let paths: Vec<String> = g.get("paths").and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|p| p.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    rows.push((format!("{name}  ({count})"), Some(paths)));
+                }
+            }
+        }
+        self.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel: 0 });
+        true
+    }
+
+    /// Apply/discard the picked selection (None = the whole box, Some = a
+    /// file-group's matching changes).
+    fn run_file_group(&mut self, discard: bool, sid: &str, label: &str,
+                      paths: Option<Vec<String>>) {
+        let verb = if discard { "review.discard" } else { "review.apply" };
+        let args = match &paths {
+            Some(p) => json!([sid, p]),
+            None => json!([sid]),
+        };
+        let key = if discard { "discarded" } else { "applied" };
+        match rpc(&self.sock, verb, args) {
+            Ok(r) => {
+                let n = r.get(key).and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                self.status = format!("{key} {n} change(s) — {}", label.trim());
+            }
+            Err(e) => self.status = format!("{key}: {e}"),
         }
         self.refresh_sessions();
         self.load_changes();
@@ -6993,6 +7062,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::Search { rows, .. } => (rows.len() as u16) + 6,
         Modal::ActionMenu { items, .. } => (items.len() as u16) + 5,
         Modal::Launcher { items, .. } => (items.len() as u16) + 8,
+        Modal::FileGroupPick { rows, .. } => (rows.len() as u16) + 6,
         // rows can wrap (mirror/alias resolution details are long), so
         // budget up to two display rows per item.
         Modal::ImagePicker { stack, .. } => stack.last()
@@ -7161,6 +7231,28 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 "↑/↓ move · Enter run · Esc cancel",
                 Style::default().fg(Color::Gray))));
             (" actions ", body)
+        }
+        Modal::FileGroupPick { discard, rows, sel, .. } => {
+            let verb = if *discard { "Discard" } else { "Apply" };
+            let mut body = vec![
+                Line::from(Span::styled(
+                    format!("{verb} which of the box's changes?"),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+            ];
+            for (i, (label, _)) in rows.iter().enumerate() {
+                let style = if i == *sel {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                body.push(Line::from(Span::styled(format!("  {label}"), style)));
+            }
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "↑/↓ move · Enter pick · Esc cancel",
+                Style::default().fg(Color::Gray))));
+            (if *discard { " discard changes " } else { " apply changes " }, body)
         }
         Modal::Launcher { items, sel } => {
             // Option chips first — visible, toggleable state, not flags to
@@ -12778,6 +12870,28 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::Launcher { items, sel }),
         },
+        Modal::FileGroupPick { discard, sid, rows, mut sel } => match code {
+            KeyCode::Esc => app.status = "cancelled".into(),
+            KeyCode::Up => {
+                if sel > 0 { sel -= 1; }
+                app.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel });
+            }
+            KeyCode::Down => {
+                if sel + 1 < rows.len() { sel += 1; }
+                app.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel });
+            }
+            KeyCode::Home => app.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel: 0 }),
+            KeyCode::End => {
+                let last = rows.len().saturating_sub(1);
+                app.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel: last });
+            }
+            KeyCode::Enter => {
+                if let Some((label, paths)) = rows.get(sel) {
+                    app.run_file_group(discard, &sid, label, paths.clone());
+                }
+            }
+            _ => app.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel }),
+        },
         Modal::ImagePicker { mut crumbs, mut stack } => match code {
             KeyCode::Esc => app.status = "image picker cancelled".into(),
             KeyCode::Up => {
@@ -14490,6 +14604,35 @@ mod tests {
                 "does NOT select the unrelated file: {paths:?}");
         assert_eq!(bs.get("count").and_then(Value::as_i64), Some(paths.len() as i64),
                    "count matches the selected paths: {bs}");
+    }
+
+    /// The apply/discard picker offers "All" plus each matching file-group —
+    /// so you can save/discard just the browser session. Drives the real UI
+    /// method against a live box.
+    #[test]
+    fn file_group_picker_offers_browser_session() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (_sid, root) = make_box(&eng.sock);
+        std::fs::create_dir_all(root.join("cellulose-profile/Default")).expect("mkdir");
+        std::fs::write(root.join("cellulose-profile/Default/Cookies"), b"c").expect("w");
+        let mut app = App::new(eng.sock.clone());
+        app.refresh_sessions();
+        let opened = app.open_file_group_pick(false);
+        assert!(opened, "picker should open (box has changes); status={}", app.status);
+        match &app.modal {
+            Some(Modal::FileGroupPick { rows, .. }) => {
+                let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
+                assert!(labels.iter().any(|l| l.starts_with("All")),
+                        "offers All: {labels:?}");
+                assert!(labels.iter().any(|l| l.contains("browser session")),
+                        "offers the browser session group: {labels:?}");
+            }
+            Some(_) => panic!("wrong modal opened; status={}", app.status),
+            None => panic!("no picker modal opened; status={}", app.status),
+        }
     }
 
     #[test]
