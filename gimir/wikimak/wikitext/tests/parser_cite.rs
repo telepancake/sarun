@@ -145,7 +145,7 @@ fn nested_markup_inside_ref_is_rendered() {
          <li id=\"cite_note-1\">\
          <span class=\"mw-cite-backlink\"><a href=\"#cite_ref-1\">^</a></span> \
          <span class=\"reference-text\">See <i>Foo</i> and \
-         <a href=\"/wiki/Berlin\">Berlin</a></span></li></ol>"
+         <a href=\"/wiki/Berlin\" title=\"Berlin\">Berlin</a></span></li></ol>"
     );
 }
 

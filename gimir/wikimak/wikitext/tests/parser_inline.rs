@@ -89,9 +89,12 @@ fn br_self_closed_variants() {
 
 #[test]
 fn html_entities_are_preserved_bare_amp_escaped() {
+    // MediaWiki normalizes references: amp stays in word form, a defined
+    // named entity (nbsp) becomes its decimal numeric form, a bare `&` is
+    // escaped.
     assert_eq!(
         render_inner("A &amp; B &nbsp; C & D"),
-        "<p>A &amp; B &nbsp; C &amp; D</p>"
+        "<p>A &amp; B &#160; C &amp; D</p>"
     );
 }
 
@@ -130,6 +133,6 @@ fn ref_tag_renders_footnote_and_auto_appends_list() {
 fn bold_inside_link_label_is_processed() {
     assert_eq!(
         render_inner("[[Berlin|'''big''']]"),
-        "<p><a href=\"/wiki/Berlin\"><b>big</b></a></p>"
+        "<p><a href=\"/wiki/Berlin\" title=\"Berlin\"><b>big</b></a></p>"
     );
 }

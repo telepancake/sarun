@@ -509,6 +509,19 @@ impl<'a> Ctx<'a> {
                 continue;
             }
 
+            // A line carrying a block-level HTML tag (open or close) closes
+            // any open paragraph and is emitted as its own block — MediaWiki's
+            // BlockLevelPass never wraps such a line in <p> (so `<div>`,
+            // `<center>`, `<table>`, … at block level are hoisted, while
+            // inline tags like `<big>`/`<font>` stay in the paragraph).
+            if line_has_block_tag(line) {
+                self.flush_para(&mut para, &mut out);
+                let rendered = self.inline(line);
+                out.push_str(&rendered);
+                i += 1;
+                continue;
+            }
+
             para.push(line.to_string());
             i += 1;
         }
@@ -694,14 +707,20 @@ impl<'a> Ctx<'a> {
         if let Some(cap) = caption {
             html.push_str(&cap);
         }
-        for (attrs, cells) in rows {
-            html.push_str(&format!("<tr{}>", html::sanitize_attrs(&attrs)));
-            for cell in cells {
-                let tag = if cell.header { "th" } else { "td" };
-                let inner = self.inline(cell.content.trim());
-                html.push_str(&format!("<{tag}{}>{}</{tag}>", cell.attrs, inner));
+        // MediaWiki wraps the rows in an implicit <tbody> (the caption stays
+        // outside it). An empty table emits no tbody.
+        if !rows.is_empty() {
+            html.push_str("<tbody>");
+            for (attrs, cells) in rows {
+                html.push_str(&format!("<tr{}>", html::sanitize_attrs(&attrs)));
+                for cell in cells {
+                    let tag = if cell.header { "th" } else { "td" };
+                    let inner = self.inline(cell.content.trim());
+                    html.push_str(&format!("<{tag}{}>{}</{tag}>", cell.attrs, inner));
+                }
+                html.push_str("</tr>");
             }
-            html.push_str("</tr>");
+            html.push_str("</tbody>");
         }
         html.push_str("</table>");
         (html, i)
@@ -729,10 +748,16 @@ impl<'a> Ctx<'a> {
         while i < b.len() {
             if b[i] == b'[' && b.get(i + 1) == Some(&b'[') {
                 if let Some((inner, after, trail)) = find_link(s, i) {
-                    let html = self.render_internal_link(inner, trail);
-                    out.push_str(&html);
-                    i = after;
-                    continue;
+                    // `[[` whose target is a URL is NOT a wikilink (MediaWiki):
+                    // leave the brackets so the external-link pass turns the
+                    // inner `[url …]` into an external link with literal
+                    // surrounding brackets.
+                    if !link_target_is_url(inner) {
+                        let html = self.render_internal_link(inner, trail);
+                        out.push_str(&html);
+                        i = after;
+                        continue;
+                    }
                 }
             }
             let l = html::utf8_len(b[i]);
@@ -790,20 +815,32 @@ impl<'a> Ctx<'a> {
         label: &str,
         trail: &str,
     ) -> String {
-        let path = html::encode_path(&title.prefixed(self.site));
+        let prefixed = title.prefixed(self.site);
+        let path = html::encode_path(&prefixed);
         let mut href = format!("{}{}{}", self.opts.link_prefix, path, self.opts.asof_query);
         if let Some(f) = frag {
             href.push('#');
             href.push_str(&html::encode_frag(f));
         }
-        let class = if self.store.page_exists(title) {
-            String::new()
+        // MediaWiki tags every internal link with the prefixed page title.
+        // A red link additionally carries `class="new"` and the localized
+        // "(page does not exist)" suffix on its title. The href stays on the
+        // serve layer's `link_prefix` route (see the module note on the
+        // red-link/serve tension) rather than MediaWiki's index.php form.
+        let (class, title_attr) = if self.store.page_exists(title) {
+            (String::new(), prefixed.clone())
         } else {
-            " class=\"new\"".to_string()
+            (
+                " class=\"new\"".to_string(),
+                format!("{prefixed} (page does not exist)"),
+            )
         };
-        let open = self
-            .strip
-            .stash_inline(format!("<a href=\"{}\"{}>", html::escape(&href), class));
+        let open = self.strip.stash_inline(format!(
+            "<a href=\"{}\"{} title=\"{}\">",
+            html::escape(&href),
+            class,
+            html::escape(&title_attr)
+        ));
         let close = self.strip.stash_inline("</a>".to_string());
         format!("{open}{label}{trail}{close}")
     }
@@ -980,9 +1017,9 @@ impl<'a> Ctx<'a> {
             None => (inner, ""),
         };
         let open = self.strip.stash_inline(format!(
-            "<a href=\"{}\" class=\"external {}\">",
-            html::escape(url),
-            if label.is_empty() { "autonumber" } else { "text" }
+            "<a rel=\"nofollow\" class=\"external {}\" href=\"{}\">",
+            if label.is_empty() { "autonumber" } else { "text" },
+            html::escape(url)
         ));
         let close = self.strip.stash_inline("</a>".to_string());
         if label.is_empty() {
@@ -1008,7 +1045,7 @@ impl<'a> Ctx<'a> {
                         let end = consume_url(s, i + scheme_len);
                         let url = &s[i..end];
                         let open = self.strip.stash_inline(format!(
-                            "<a href=\"{}\" class=\"external free\">",
+                            "<a rel=\"nofollow\" class=\"external free\" href=\"{}\">",
                             html::escape(url)
                         ));
                         let close = self.strip.stash_inline("</a>".to_string());
@@ -1491,6 +1528,81 @@ fn has_url_scheme(s: &str) -> bool {
         || low.starts_with("irc://")
         || low.starts_with("news:")
         || low.starts_with("gopher://")
+}
+
+/// True when a `[[…]]` target (the part before the first `|`) is a URL —
+/// MediaWiki does not treat such a bracket pair as a wikilink.
+fn link_target_is_url(inner: &str) -> bool {
+    let target = inner.split('|').next().unwrap_or("").trim();
+    has_url_scheme(target)
+}
+
+/// True when `line` carries a block-level HTML tag (opening or closing) —
+/// MediaWiki's `BlockLevelPass` open/close match. Such a line closes any
+/// open paragraph and is emitted as its own block instead of being
+/// `<p>`-wrapped. Inline tags (`<big>`, `<font>`, `<span>`, …) are absent
+/// from the set, so they stay inside paragraphs.
+fn line_has_block_tag(line: &str) -> bool {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'<' {
+            let mut j = i + 1;
+            if b.get(j) == Some(&b'/') {
+                j += 1;
+            }
+            let start = j;
+            while j < b.len() && b[j].is_ascii_alphanumeric() {
+                j += 1;
+            }
+            if j > start {
+                // The maximal alnum run is the tag name; membership doubles as
+                // the regex's `\b` boundary (`<division>` reads "division",
+                // not "div").
+                if is_block_html_tag(&line[start..j].to_ascii_lowercase()) {
+                    return true;
+                }
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// The block-level element names from MediaWiki's `BlockLevelPass`
+/// open/close regexes (both the opening and closing form of each break a
+/// paragraph).
+fn is_block_html_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "table"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "pre"
+            | "p"
+            | "ul"
+            | "ol"
+            | "dl"
+            | "tr"
+            | "caption"
+            | "dt"
+            | "dd"
+            | "li"
+            | "td"
+            | "th"
+            | "center"
+            | "blockquote"
+            | "div"
+            | "hr"
+            | "aside"
+            | "figure"
+    )
 }
 
 fn autolink_scheme(s: &str) -> Option<usize> {

@@ -31,9 +31,11 @@ fn style_scrubs_dangerous_declaration_keeps_safe() {
 
 #[test]
 fn style_strips_expression() {
+    // <div> is block-level: MediaWiki's BlockLevelPass hoists it out of a
+    // paragraph, so it is not wrapped in <p>.
     assert_eq!(
         render_inner("<div style=\"width:expression(alert(1)); height:2px\">d</div>"),
-        "<p><div style=\"height:2px\">d</div></p>"
+        "<div style=\"height:2px\">d</div>"
     );
 }
 
@@ -78,9 +80,11 @@ fn gallery_is_placeholder() {
 
 #[test]
 fn colspan_rowspan_kept() {
+    // <td> is block-level (BlockLevelPass), so a bare cell is not <p>-wrapped;
+    // the colspan/rowspan attributes survive the sanitizer.
     assert_eq!(
         render_inner("<td colspan=\"2\" rowspan=\"3\">x</td>"),
-        "<p><td colspan=\"2\" rowspan=\"3\">x</td></p>"
+        "<td colspan=\"2\" rowspan=\"3\">x</td>"
     );
 }
 

@@ -6,18 +6,20 @@ use common::*;
 
 #[test]
 fn internal_link_blue() {
+    // MediaWiki tags every internal link with the prefixed page title.
     assert_eq!(
         render_inner("[[Berlin]]"),
-        "<p><a href=\"/wiki/Berlin\">Berlin</a></p>"
+        "<p><a href=\"/wiki/Berlin\" title=\"Berlin\">Berlin</a></p>"
     );
 }
 
 #[test]
 fn internal_link_red_when_missing() {
     // First-letter is uppercased for the target; display keeps source case.
+    // A red link carries class="new" and the "(page does not exist)" title.
     assert_eq!(
         render_inner("[[missingpage]]"),
-        "<p><a href=\"/wiki/Missingpage\" class=\"new\">missingpage</a></p>"
+        "<p><a href=\"/wiki/Missingpage\" class=\"new\" title=\"Missingpage (page does not exist)\">missingpage</a></p>"
     );
 }
 
@@ -25,7 +27,7 @@ fn internal_link_red_when_missing() {
 fn piped_label() {
     assert_eq!(
         render_inner("[[Foo bar|the label]]"),
-        "<p><a href=\"/wiki/Foo_bar\">the label</a></p>"
+        "<p><a href=\"/wiki/Foo_bar\" title=\"Foo bar\">the label</a></p>"
     );
 }
 
@@ -33,15 +35,16 @@ fn piped_label() {
 fn link_trail_letters_join_inside_anchor() {
     assert_eq!(
         render_inner("[[cat]]s"),
-        "<p><a href=\"/wiki/Cat\">cats</a></p>"
+        "<p><a href=\"/wiki/Cat\" title=\"Cat\">cats</a></p>"
     );
 }
 
 #[test]
 fn fragment_in_href() {
+    // The title attribute is the page (no fragment); the fragment stays in href.
     assert_eq!(
         render_inner("[[Berlin#History|hist]]"),
-        "<p><a href=\"/wiki/Berlin#History\">hist</a></p>"
+        "<p><a href=\"/wiki/Berlin#History\" title=\"Berlin\">hist</a></p>"
     );
 }
 
@@ -49,7 +52,7 @@ fn fragment_in_href() {
 fn namespaced_link_display_keeps_prefix() {
     assert_eq!(
         render_inner("[[Help:Contents]]"),
-        "<p><a href=\"/wiki/Help:Contents\">Help:Contents</a></p>"
+        "<p><a href=\"/wiki/Help:Contents\" title=\"Help:Contents\">Help:Contents</a></p>"
     );
 }
 
@@ -57,7 +60,7 @@ fn namespaced_link_display_keeps_prefix() {
 fn pipe_trick_strips_namespace_and_parenthetical() {
     assert_eq!(
         render_inner("[[Help:Foo (bar)|]]"),
-        "<p><a href=\"/wiki/Help:Foo_(bar)\" class=\"new\">Foo</a></p>"
+        "<p><a href=\"/wiki/Help:Foo_(bar)\" class=\"new\" title=\"Help:Foo (bar) (page does not exist)\">Foo</a></p>"
     );
 }
 
@@ -65,7 +68,7 @@ fn pipe_trick_strips_namespace_and_parenthetical() {
 fn pipe_trick_strips_after_comma() {
     assert_eq!(
         render_inner("[[Berlin, Germany|]]"),
-        "<p><a href=\"/wiki/Berlin,_Germany\" class=\"new\">Berlin</a></p>"
+        "<p><a href=\"/wiki/Berlin,_Germany\" class=\"new\" title=\"Berlin, Germany (page does not exist)\">Berlin</a></p>"
     );
 }
 
@@ -80,7 +83,7 @@ fn category_collected_not_rendered() {
 fn leading_colon_category_renders_as_link() {
     assert_eq!(
         render_inner("[[:Category:Animals]]"),
-        "<p><a href=\"/wiki/Category:Animals\" class=\"new\">Category:Animals</a></p>"
+        "<p><a href=\"/wiki/Category:Animals\" class=\"new\" title=\"Category:Animals (page does not exist)\">Category:Animals</a></p>"
     );
     // ...and does not collect a category.
     assert!(render_out("[[:Category:Animals]]").categories.is_empty());
@@ -90,7 +93,7 @@ fn leading_colon_category_renders_as_link() {
 fn leading_colon_file_renders_as_link_not_image() {
     assert_eq!(
         render_inner("[[:File:Pic.jpg]]"),
-        "<p><a href=\"/wiki/File:Pic.jpg\" class=\"new\">File:Pic.jpg</a></p>"
+        "<p><a href=\"/wiki/File:Pic.jpg\" class=\"new\" title=\"File:Pic.jpg (page does not exist)\">File:Pic.jpg</a></p>"
     );
 }
 
@@ -122,7 +125,7 @@ fn interwiki_local_instance_is_not_external() {
 fn external_link_with_label() {
     assert_eq!(
         render_inner("[http://example.com Label]"),
-        "<p><a href=\"http://example.com\" class=\"external text\">Label</a></p>"
+        "<p><a rel=\"nofollow\" class=\"external text\" href=\"http://example.com\">Label</a></p>"
     );
 }
 
@@ -130,8 +133,8 @@ fn external_link_with_label() {
 fn external_link_bare_autonumbered() {
     assert_eq!(
         render_inner("[http://example.com] [https://b.example]"),
-        "<p><a href=\"http://example.com\" class=\"external autonumber\">[1]</a> \
-         <a href=\"https://b.example\" class=\"external autonumber\">[2]</a></p>"
+        "<p><a rel=\"nofollow\" class=\"external autonumber\" href=\"http://example.com\">[1]</a> \
+         <a rel=\"nofollow\" class=\"external autonumber\" href=\"https://b.example\">[2]</a></p>"
     );
 }
 
@@ -139,7 +142,7 @@ fn external_link_bare_autonumbered() {
 fn bare_url_autolinked_with_trailing_punctuation_trim() {
     assert_eq!(
         render_inner("see http://x.example/a, ok"),
-        "<p>see <a href=\"http://x.example/a\" class=\"external free\">http://x.example/a</a>, ok</p>"
+        "<p>see <a rel=\"nofollow\" class=\"external free\" href=\"http://x.example/a\">http://x.example/a</a>, ok</p>"
     );
 }
 
@@ -153,6 +156,6 @@ fn asof_query_carried_through_internal_links() {
 fn two_links_and_trail() {
     assert_eq!(
         render_inner("[[cat]]s and [[Dog]]gy"),
-        "<p><a href=\"/wiki/Cat\">cats</a> and <a href=\"/wiki/Dog\">Doggy</a></p>"
+        "<p><a href=\"/wiki/Cat\" title=\"Cat\">cats</a> and <a href=\"/wiki/Dog\" title=\"Dog\">Doggy</a></p>"
     );
 }

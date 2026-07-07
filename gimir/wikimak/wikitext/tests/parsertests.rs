@@ -51,7 +51,11 @@ use wikimak_wikitext::{
 
 /// Number of vendored core-subset cases the renderer passes today. Set to
 /// the measured value; a drop below this fails [`core_subset_meets_floor`].
-const CORE_FLOOR_PASSED: usize = 23;
+/// Raised 23 → 34 after the parser-fidelity pass (link title=, entity
+/// normalization, table tbody/attr-dedup, block-tag paragraph breaks,
+/// `[[url]]` handling). The one still-red case is "Broken link" — a
+/// deliberate serve-routing tradeoff on the red-link href form.
+const CORE_FLOOR_PASSED: usize = 34;
 
 const CORE_SUBSET: &str = include_str!("parsertests_data/core-subset.txt");
 
