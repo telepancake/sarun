@@ -40,14 +40,14 @@
 //! tree View. Its git tree oid ([`crate::view_tree_oid`]) equals the
 //! real object.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use depot::{codec, View};
 use wikimak_depot::{Depot, DepotConfig, FrameDecoder, FrameEncoder};
 
-use crate::lanes::{assign_lanes, LaneId};
+use crate::lanes::{assign_lanes, cluster_variants, LaneId};
 use crate::{Error, Result};
 
 /// The single combined-state chain id in this store's private depot.
@@ -55,8 +55,120 @@ const CHAIN: u64 = 0;
 /// Width, in bytes, of the big-endian lane-id child name.
 const LANE_KEY_LEN: usize = 4;
 
+/// The encode-time similarity cutoff — the SINGLE policy point for the
+/// variant-delta path (see [`crate::lanes::cluster_variants`]). It is a
+/// choice of the encoder, NOT part of the stored format: the frame
+/// records only the resulting base-lane pointer, so changing this
+/// constant changes future encodes, never how an existing store reads.
+pub const VARIANT_CUTOFF: f64 = 0.5;
+
+/// Attr key stamped on a lane child that is stored as a base-relative
+/// variant delta rather than its own full subtree. Its value is the
+/// 4-byte big-endian id of the BASE lane the delta is expressed against
+/// (the base-in-effect at that revision, recorded AS DATA — the reader
+/// consults it, it is never recomputed). A NUL lead byte cannot collide
+/// with a git tree's own attr (`mode`) nor with any path segment. The
+/// child's `blob` holds the encoded `diff(base_subtree, variant_subtree)`
+/// layer. Recording the base per revision (it rides each stored combined
+/// state) is exactly the hook a later base-switching increment needs: the
+/// pointer can differ across revisions with no format change.
+const VARIANT_MARK: &[u8] = b"\x00vbase";
+
 fn lane_key(l: LaneId) -> Vec<u8> {
     l.to_be_bytes().to_vec()
+}
+
+fn decode_lane_key(key: &[u8]) -> Result<LaneId> {
+    let a: [u8; LANE_KEY_LEN] =
+        key.try_into().map_err(|_| Error::Chain("bad lane key width".into()))?;
+    Ok(LaneId::from_be_bytes(a))
+}
+
+/// Collect the git blob oids (hex) of every non-gitlink leaf under a full
+/// subtree View — the pure oid set the variant metric clusters on. A
+/// gitlink (mode 160000) is a commit pointer, not a blob, so it is
+/// excluded.
+fn collect_blob_oids(view: &View, out: &mut HashSet<Vec<u8>>) {
+    if let Some(blob) = &view.blob {
+        let gitlink = view.attrs.get(&b"mode"[..]).map(|m| m.as_slice() == b"160000").unwrap_or(false);
+        if !gitlink {
+            out.insert(crate::git_obj_oid("blob", blob).into_bytes());
+        }
+    }
+    for child in view.children.values() {
+        collect_blob_oids(child, out);
+    }
+}
+
+/// Rewrite a FULL combined state (every lane child its own full subtree)
+/// into the STORED combined state that actually lands in the frame:
+/// cluster the live lanes ([`cluster_variants`]); each group's BASE lane
+/// keeps its full subtree, and every VARIANT lane is replaced by a marker
+/// child carrying `diff(base_subtree, variant_subtree)` — so the
+/// frame-resident uncompressed content of a group is one base subtree plus
+/// small per-variant deltas, not N full trees. Independent lanes are
+/// singleton groups and stay full, exactly as the non-variant path stores
+/// every lane. This is representation (a): the delta lives IN the child
+/// slot behind a marker, self-describing, consulted by the reader.
+fn build_stored(full: &View, cutoff: f64) -> Result<View> {
+    let mut live: Vec<LaneId> = Vec::with_capacity(full.children.len());
+    let mut blob_sets: HashMap<LaneId, HashSet<Vec<u8>>> = HashMap::new();
+    for (key, child) in &full.children {
+        let lane = decode_lane_key(key)?;
+        let mut set = HashSet::new();
+        collect_blob_oids(child, &mut set);
+        blob_sets.insert(lane, set);
+        live.push(lane);
+    }
+    let groups = cluster_variants(&live, &blob_sets, cutoff);
+    let mut stored = View::default();
+    for g in &groups {
+        let base_key = lane_key(g.base);
+        let base_sub = full
+            .children
+            .get(&base_key)
+            .ok_or_else(|| Error::Chain(format!("base lane {} not live", g.base)))?;
+        // Base: its own full subtree (Arc-shared, no copy).
+        stored.children.insert(base_key, base_sub.clone());
+        for &v in &g.variants {
+            let v_sub = full
+                .children
+                .get(&lane_key(v))
+                .ok_or_else(|| Error::Chain(format!("variant lane {v} not live")))?;
+            let layer = depot::diff(Some(base_sub.as_ref()), Some(v_sub.as_ref()));
+            let mut node = View::default();
+            node.blob = Some(codec::encode(&layer).into());
+            node.attrs.insert(VARIANT_MARK.to_vec(), g.base.to_be_bytes().to_vec());
+            stored.children.insert(lane_key(v), Arc::new(node));
+        }
+    }
+    Ok(stored)
+}
+
+/// Reconstruct lane `lane`'s FULL subtree from a reconstructed stored
+/// combined state. The one canonical composition order: a variant child
+/// is `apply(base_subtree, variant_delta)` with the base resolved FIRST
+/// (base is always stored full in the same combined state — the base stays
+/// alive across the revisions it spans in this increment), then the
+/// variant delta on top. A non-variant child is already its full subtree.
+fn resolve_lane_subtree(combined: &View, lane: LaneId) -> Result<View> {
+    let child = combined
+        .children
+        .get(&lane_key(lane))
+        .ok_or_else(|| Error::Chain(format!("lane child missing (lane {lane})")))?;
+    match child.attrs.get(VARIANT_MARK) {
+        Some(base_bytes) => {
+            let base = decode_lane_key(base_bytes)?;
+            let base_sub = resolve_lane_subtree(combined, base)?;
+            let bytes = child
+                .blob
+                .as_ref()
+                .ok_or_else(|| Error::Chain("variant child without delta blob".into()))?;
+            let layer = codec::decode(bytes)?;
+            Ok(depot::apply(Some(&base_sub), &layer).unwrap_or_default())
+        }
+        None => Ok((**child).clone()),
+    }
 }
 
 fn cf(e: String) -> Error {
@@ -87,6 +199,27 @@ impl LaneStore {
     /// `cat-file` + `tree_layer`) to build each commit's full tree View
     /// and the depot frame codec to store the reverse-delta chain.
     pub fn encode_repo(repo: &Path, dir: &Path, level: i32) -> Result<LaneStore> {
+        Self::encode_impl(repo, dir, level, None)
+    }
+
+    /// Like [`encode_repo`](Self::encode_repo) but stores near-identical
+    /// live lanes as base-relative variant deltas (the variant/cross-lane
+    /// axis composed with the temporal axis — "delta-of-delta"). Grouping,
+    /// metric, cutoff and base pick are the encoder's policy (behind
+    /// [`cluster_variants`] and [`VARIANT_CUTOFF`]); the format records only
+    /// the outcome. Reconstruction is SHA-exact and the frame-resident
+    /// content of a variant group is ~one base subtree + small deltas, not
+    /// N full trees.
+    pub fn encode_repo_variant(repo: &Path, dir: &Path, level: i32) -> Result<LaneStore> {
+        Self::encode_impl(repo, dir, level, Some(VARIANT_CUTOFF))
+    }
+
+    fn encode_impl(
+        repo: &Path,
+        dir: &Path,
+        level: i32,
+        variant_cutoff: Option<f64>,
+    ) -> Result<LaneStore> {
         let (sha_of, parents) = topo_parents(repo)?;
         let assignment = assign_lanes(&parents);
         let lane_of = assignment.lane_of;
@@ -104,15 +237,22 @@ impl LaneStore {
         // Build combined states forward, emitting the newest full record
         // and the reverse deltas (record j rebuilds combined[j] from
         // combined[j+1]).
-        let mut combined = View::default();
+        // `full_combined` carries every live lane as its own full subtree
+        // (the increment-1 shape); `cur` is what actually lands in the
+        // frame — identical to `full_combined` on the non-variant path, or
+        // the variant-delta rewrite when a cutoff is set.
+        let mut full_combined = View::default();
         let mut prev: Option<View> = None;
         let mut reverse: Vec<Vec<u8>> = Vec::new(); // reverse[j], j = 0..n_rev-2
         let mut newest_full: Vec<u8> = Vec::new();
         for i in 0..n_rev {
-            combined
+            full_combined
                 .children
                 .insert(lane_key(lane_of[i]), Arc::new(trees[i].clone()));
-            let cur = combined.clone();
+            let cur = match variant_cutoff {
+                Some(c) => build_stored(&full_combined, c)?,
+                None => full_combined.clone(),
+            };
             if let Some(p) = &prev {
                 // Rebuilds combined[i-1] from combined[i].
                 reverse.push(codec::encode(&depot::diff(Some(&cur), Some(p))));
@@ -195,12 +335,7 @@ impl LaneStore {
     /// combined state's child for that revision's lane.
     pub fn tree_at(&self, rev: usize) -> Result<View> {
         let combined = self.combined_at(rev)?;
-        let key = lane_key(self.lane_of[rev]);
-        combined
-            .children
-            .get(&key)
-            .map(|c| (**c).clone())
-            .ok_or_else(|| Error::Chain(format!("lane child missing at revision {rev}")))
+        resolve_lane_subtree(&combined, self.lane_of[rev])
     }
 
     /// The git tree oid of the commit at revision `rev` (reconstructed).
@@ -240,6 +375,22 @@ impl LaneStore {
     /// `combined[rev-1]` from `combined[rev]`, at position `n_rev - rev`.
     pub fn advance_record_pos(&self, rev: usize) -> usize {
         self.n_rev - rev
+    }
+
+    /// Total UNCOMPRESSED bytes of every stored chain record (the head
+    /// full record plus all reverse deltas). This is the frame-resident
+    /// content BEFORE zstd — the honest measure of what variant-delta
+    /// changes: at scale zstd's 128 MB window cannot dedup N full trees
+    /// once they overflow it, so the win must live in this pre-compression
+    /// content. A variant group here is ~one base subtree + small deltas,
+    /// not N full trees.
+    pub fn uncompressed_record_bytes(&self) -> Result<u64> {
+        let mut total = 0u64;
+        self.walk_records(&mut |_pos, rec| {
+            total += rec.len() as u64;
+            Ok(false)
+        })?;
+        Ok(total)
     }
 
     pub fn lane_of(&self, rev: usize) -> LaneId {

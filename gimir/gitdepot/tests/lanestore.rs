@@ -221,3 +221,136 @@ fn lane_roundtrip_empty_tree_branch() {
 
     assert_roundtrip(&repo, tmp.path(), "empty");
 }
+
+// -------------------------------------------------------- variant-delta
+
+/// SHA-exact round-trip over the VARIANT-DELTA path: encode with
+/// `encode_repo_variant`, reconstruct every reachable commit's tree
+/// (variant lanes via base+delta), assert the git tree oid. Returns the
+/// store so callers can measure its frame-resident size. Does NOT assert
+/// the one-lane-prefix property — variant-delta deliberately breaks it
+/// (a base advance re-expresses its variants at that revision).
+fn assert_variant_roundtrip(repo: &Path, tmp: &Path, tag: &str) -> gitdepot::lanestore::LaneStore {
+    let dir = tmp.join(format!("variant-{tag}"));
+    let store = gitdepot::lanestore::LaneStore::encode_repo_variant(repo, &dir, 3)
+        .unwrap_or_else(|e| panic!("[{tag}] encode: {e}"));
+    let shas: Vec<String> =
+        sh_git(repo, &["rev-list", "--branches", "--tags"]).lines().map(str::to_string).collect();
+    assert!(!shas.is_empty(), "[{tag}] no commits");
+    for sha in &shas {
+        let want = sh_git(repo, &["rev-parse", &format!("{sha}^{{tree}}")]).trim().to_string();
+        let got = store
+            .tree_oid_of_commit(sha)
+            .unwrap_or_else(|e| panic!("[{tag}] reconstruct {sha}: {e}"));
+        assert_eq!(got, want, "[{tag}] commit {sha}: tree oid mismatch");
+    }
+    store
+}
+
+/// A base branch plus N near-identical feature branches (each forks the
+/// base tip and changes exactly ONE small file over a large shared blob).
+/// All N+1 tips stay live lanes. Returns the N feature branch names.
+fn build_near_identical(repo: &Path, n: usize, shared: &str) -> Vec<String> {
+    init(repo);
+    // A large shared blob plus several smaller shared files every branch
+    // carries verbatim — the content whose N-fold duplication variant-delta
+    // must collapse. Multiple shared blobs keep the base/variant Jaccard
+    // overlap comfortably above the cutoff (a single unique file per branch
+    // then leaves overlap well past 0.5).
+    write(repo, "shared/big.dat", shared);
+    for k in 0..4 {
+        write(repo, &format!("shared/c{k}.txt"), &format!("common {k}\n"));
+    }
+    commit(repo, "base");
+    let base_tip = sh_git(repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let mut names = Vec::new();
+    for i in 0..n {
+        let br = format!("feat{i}");
+        sh_git(repo, &["checkout", "-q", "-b", &br, &base_tip]);
+        // Change exactly one small file; the big shared blob is untouched,
+        // so this branch's tree overlaps the base past the cutoff.
+        write(repo, &format!("feat_{i}.txt"), &format!("feature {i} body\n"));
+        commit(repo, &format!("feat {i}"));
+        names.push(br);
+    }
+    sh_git(repo, &["checkout", "-q", "main"]);
+    names
+}
+
+#[test]
+fn variant_roundtrip_and_size_reduction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("variant");
+    // ~120 KB of incompressible-ish shared content so the size numbers
+    // reflect real duplication, not a run of zeros.
+    let shared: String = (0u32..30_000).map(|k| ((k.wrapping_mul(2654435761) >> 24) as u8 % 26 + b'a') as char).collect();
+    let n = 6;
+    build_near_identical(&repo, n, &shared);
+
+    // (i) SHA-exact for every commit, variant lanes reconstructed via
+    // base+delta.
+    let store = assert_variant_roundtrip(&repo, tmp.path(), "near");
+
+    // (ii) SIZE: the variant-delta store's frame-resident UNCOMPRESSED
+    // content is ~one shared tree + small deltas, dramatically smaller
+    // than the independents-only control that stores all N+1 full trees
+    // side by side.
+    let control_dir = tmp.path().join("control-indep");
+    let control = gitdepot::lanestore::LaneStore::encode_repo(&repo, &control_dir, 3).unwrap();
+    let variant_bytes = store.uncompressed_record_bytes().unwrap();
+    let control_bytes = control.uncompressed_record_bytes().unwrap();
+    let shared_len = shared.len() as u64;
+
+    // The control holds ~ (N+1) copies of the shared blob; the variant
+    // store holds ~1. Expect a multi-x reduction and an absolute bound of
+    // a small multiple of a single tree.
+    assert!(
+        (variant_bytes as f64) < (control_bytes as f64) * 0.5,
+        "variant {variant_bytes} not < half of control {control_bytes} \
+         (shared blob {shared_len} B, N={n})"
+    );
+    assert!(
+        variant_bytes < shared_len * 3,
+        "variant {variant_bytes} exceeds 3x a single shared tree ({shared_len} B) \
+         — variants are not delta-encoded"
+    );
+    assert!(
+        control_bytes > shared_len * (n as u64),
+        "control {control_bytes} should carry ~N+1 full copies of the shared blob ({shared_len} B)"
+    );
+}
+
+#[test]
+fn variant_roundtrip_empty_tree_variant() {
+    // A base branch with content and a variant branch that empties out to
+    // the empty tree — the variant delta must reconstruct the empty tree
+    // SHA-exact (existence fix), reconstructed as base+delta.
+    let empty_oid = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("variant-empty");
+    init(&repo);
+    write(&repo, "shared/big.dat", &"x".repeat(4096));
+    write(&repo, "a.txt", "a\n");
+    write(&repo, "b.txt", "b\n");
+    commit(&repo, "base");
+    let base_tip = sh_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // A near-identical variant (one changed file) to force a real
+    // variant group alongside the empty one.
+    sh_git(&repo, &["checkout", "-q", "-b", "feat", &base_tip]);
+    write(&repo, "c.txt", "c\n");
+    commit(&repo, "feat");
+
+    // A branch that deletes everything -> empty tree.
+    sh_git(&repo, &["checkout", "-q", "-b", "wipe", &base_tip]);
+    sh_git(&repo, &["rm", "-q", "-r", "."]);
+    let wipe = commit(&repo, "wipe all");
+    assert_eq!(
+        sh_git(&repo, &["rev-parse", &format!("{wipe}^{{tree}}")]).trim(),
+        empty_oid
+    );
+    sh_git(&repo, &["checkout", "-q", "main"]);
+
+    let store = assert_variant_roundtrip(&repo, tmp.path(), "empty-variant");
+    assert_eq!(store.tree_oid_of_commit(&wipe).unwrap(), empty_oid);
+}
