@@ -111,6 +111,58 @@ fn syscall_arg0_is_fd(nr: i64) -> bool {
                  | 232 | 288)
 }
 
+/// Symbolized backtraces of every thread in `pids`, keyed by tid — the layer
+/// `/proc` can't give. wchan/syscall answer WHERE a thread blocks in the
+/// KERNEL, but a thread that reads "running" (spinning in userspace) or an
+/// idle worker parked in futex leaves the actual SOURCE line invisible;
+/// that is the case a wedge diagnosis most needs. The release binary now
+/// keeps line-table debug info (Cargo `[profile.release] debug`), so gdb
+/// resolves real `func (file:line)` frames. We shell out once per pid
+/// (`thread apply all bt`), bounded by `timeout`, and parse the
+/// `Thread N (LWP <tid> …)` blocks. Empty map when gdb/timeout are absent —
+/// the /proc layer still stands on its own.
+fn thread_backtraces(pids: &[i32], depth: usize)
+    -> std::collections::HashMap<i32, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    // gdb must exist; if not, degrade silently to the /proc-only view.
+    if std::process::Command::new("gdb").arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null()).status()
+        .map(|s| !s.success()).unwrap_or(true) {
+        return out;
+    }
+    for &pid in pids {
+        let res = std::process::Command::new("timeout")
+            .args(["8", "gdb", "-p", &pid.to_string(), "-batch",
+                   "-nx", "-ex", "set pagination off",
+                   "-ex", &format!("thread apply all bt {depth}")])
+            .stderr(std::process::Stdio::null())
+            .output();
+        let Ok(res) = res else { continue };
+        let text = String::from_utf8_lossy(&res.stdout);
+        let mut cur_tid: Option<i32> = None;
+        for line in text.lines() {
+            let l = line.trim_start();
+            if let Some(rest) = l.strip_prefix("Thread ") {
+                // "Thread N (LWP <tid> …)" — the LWP is the kernel tid.
+                cur_tid = rest.find("LWP ").and_then(|i| {
+                    rest[i + 4..].split(|c: char| !c.is_ascii_digit())
+                        .next().and_then(|d| d.parse::<i32>().ok())
+                });
+            } else if l.starts_with('#') {
+                if let Some(tid) = cur_tid {
+                    // Keep the readable tail: "func (…) at file:line" —
+                    // drop the leading "#N  0xADDR in ".
+                    let frame = l.split_once(" in ")
+                        .map(|(_, r)| r).unwrap_or(l).trim().to_string();
+                    out.entry(tid).or_insert_with(Vec::new).push(frame);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// PPid of `pid` from /proc/<pid>/status (host namespace); 0 if unreadable.
 fn ppid_of(pid: i32) -> i32 {
     let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
@@ -1786,6 +1838,11 @@ macro_rules! ui_verbs {
                             }
                             fd_tab.insert(pid, t);
                         }
+                        // Symbolized backtraces (gdb + retained debug info) —
+                        // the layer that localizes a "running" (spinning)
+                        // thread, which /proc wchan/syscall cannot. Best-
+                        // effort: empty when gdb is absent.
+                        let bt_map = thread_backtraces(&box_pids, 8);
                         let mut threads = vec![];
                         for &pid in &box_pids {
                             let Ok(tasks) = std::fs::read_dir(
@@ -1859,12 +1916,16 @@ macro_rules! ui_verbs {
                                         "running".into()
                                     } else { wchan.clone() },
                                 };
+                                let bt = bt_map.get(&tid)
+                                    .map(|v| v.iter().take(6).cloned()
+                                        .collect::<Vec<_>>())
+                                    .unwrap_or_default();
                                 threads.push(json!({
                                     "pid": pid, "tid": tid, "comm": comm,
                                     "state": state, "wchan": wchan,
                                     "syscall": toks.first().copied()
                                         .unwrap_or("").to_string(),
-                                    "detail": detail,
+                                    "detail": detail, "bt": bt,
                                 }));
                             }
                         }
@@ -4014,6 +4075,20 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                         println!("{:>7} {:>7} {:>2} {:<16} {}",
                                  n("pid"), n("tid"), g("state"), g("comm"),
                                  g("detail"));
+                        // Backtrace under the thread — the only thing that
+                        // localizes a "running" spin. Print for spinning /
+                        // non-idle threads; skip the dozen idle futex workers.
+                        let idle = g("detail").starts_with("futex")
+                            || g("detail").starts_with("epoll")
+                            || g("detail") == "wait4()";
+                        if !idle {
+                            if let Some(bt) = p.get("bt")
+                                .and_then(Value::as_array) {
+                                for f in bt.iter().filter_map(Value::as_str) {
+                                    println!("{:>19}   {}", "", f);
+                                }
+                            }
+                        }
                     }
                     if procs.is_empty() {
                         println!("(no live threads — the box's tree has \
