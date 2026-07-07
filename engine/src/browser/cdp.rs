@@ -41,6 +41,10 @@ struct Inner {
     pending: Mutex<HashMap<u64, Sender<Value>>>,
     events: Mutex<Vec<Value>>,
     closed: AtomicBool,
+    /// A fd the reader pokes (one byte) whenever an event lands or the
+    /// connection closes, so an event loop can `poll` on it and wake the
+    /// instant something arrives instead of timing out. -1 = unset.
+    wake_fd: std::sync::atomic::AtomicI32,
 }
 
 impl Inner {
@@ -49,6 +53,17 @@ impl Inner {
     fn fail_all(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.pending.lock().unwrap().clear();
+        self.poke();
+    }
+
+    /// Wake a registered event-loop fd (non-blocking; a full pipe already
+    /// means "pending", so a dropped byte is harmless).
+    fn poke(&self) {
+        let fd = self.wake_fd.load(Ordering::Relaxed);
+        if fd >= 0 {
+            let b = [1u8];
+            unsafe { libc::write(fd, b.as_ptr() as *const _, 1) };
+        }
     }
 }
 
@@ -59,6 +74,7 @@ impl Cdp {
             pending: Mutex::new(HashMap::new()),
             events: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
+            wake_fd: std::sync::atomic::AtomicI32::new(-1),
         });
         let rinner = inner.clone();
         std::thread::Builder::new()
@@ -76,6 +92,7 @@ impl Cdp {
                             }
                         } else {
                             rinner.events.lock().unwrap().push(msg);
+                            rinner.poke();
                         }
                     }
                     Ok(None) | Err(_) => {
@@ -138,6 +155,13 @@ impl Cdp {
     /// Take and clear the queued events (methods without an id).
     pub fn drain_events(&self) -> Vec<Value> {
         std::mem::take(&mut *self.inner.events.lock().unwrap())
+    }
+
+    /// Register a fd to be poked (one byte) whenever an event arrives or the
+    /// connection closes — for an event loop that wants to `poll` and wake
+    /// immediately rather than spin on a timeout.
+    pub fn set_wake_fd(&self, fd: std::os::fd::RawFd) {
+        self.inner.wake_fd.store(fd, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]

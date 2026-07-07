@@ -221,12 +221,6 @@ fn restore_raw(fd: i32, saved: &libc::termios) {
     unsafe { libc::tcsetattr(fd, libc::TCSADRAIN, saved) };
 }
 
-/// Poll fd for readability with a millisecond timeout.
-fn poll_in(fd: i32, ms: i32) -> bool {
-    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-    unsafe { libc::poll(&mut pfd, 1, ms) > 0 && (pfd.revents & libc::POLLIN) != 0 }
-}
-
 /// Split one input token off the front of `buf`; returns (token, consumed).
 /// (None, 0) means an incomplete escape sequence — wait for more bytes.
 fn next_token(buf: &[u8]) -> (Option<Vec<u8>>, usize) {
@@ -263,12 +257,30 @@ fn next_token(buf: &[u8]) -> (Option<Vec<u8>>, usize) {
     (Some(buf[..n].to_vec()), n)
 }
 
-/// Draw a frame with per-row diffing; returns this frame's rows for the next
-/// diff. `frame_png` is the latest screencast frame (or None → pull a frame).
-fn draw(
+/// The status/help line (page-controlled title/url sanitized to spaces).
+fn status_line(sess: &BrowserSession, url_edit: Option<&str>, mouse_grab: bool) -> String {
+    let s = match url_edit {
+        Some(e) => format!(" url: {e}_"),
+        None => {
+            let (url, title) = sess.url_and_title();
+            // Hints FIRST (fixed, never truncated); title/url fill the rest and
+            // get cut if long. The mouse-mode indicator is always visible.
+            let sel = if mouse_grab { "^X sel" } else { "SEL·^X" };
+            let page = if title.is_empty() { url } else { format!("{title} — {url}") };
+            format!(" ^L ^R alt←→ {sel} ^Q  │  {page}")
+        }
+    };
+    let s: String = s.chars().map(|c| if c < ' ' { ' ' } else { c }).take(sess.cols).collect();
+    format!("{s:<width$}", width = sess.cols)
+}
+
+/// Compose + diff-draw the page grid plus the status row. Text and pixels come
+/// from the SAME frame, so they never tear apart. Returns the drawn rows.
+fn draw_page(
     sess: &BrowserSession,
     out: &mut impl Write,
     url_edit: Option<&str>,
+    mouse_grab: bool,
     frame_png: Option<&[u8]>,
     prev: Option<&Vec<String>>,
 ) -> Result<Vec<String>> {
@@ -276,22 +288,11 @@ fn draw(
         Some(png) => sess.frame_from_png(png)?,
         None => sess.frame()?,
     };
-    let (url, title) = sess.url_and_title();
-    let status = match url_edit {
-        Some(e) => format!(" url: {e}_"),
-        None => format!(" {title}  {url}  [^L url ^R reload alt-←→ hist ^Q quit]"),
-    };
-    let status: String = status.chars().map(|c| if c < ' ' { ' ' } else { c }).collect();
-    let status: String = status.chars().take(sess.cols).collect();
-    let status = format!("{status:<width$}", width = sess.cols);
-
     let mut lines: Vec<String> = grid.iter().map(|r| row_to_ansi(r)).collect();
-    lines.push(format!("\x1b[7m{status}\x1b[0m"));
+    lines.push(format!("\x1b[7m{}\x1b[0m", status_line(sess, url_edit, mouse_grab)));
     for (i, line) in lines.iter().enumerate() {
-        if let Some(p) = prev {
-            if p.get(i) == Some(line) {
-                continue;
-            }
+        if prev.and_then(|p| p.get(i)) == Some(line) {
+            continue;
         }
         write!(out, "\x1b[{};1H{}", i + 1, line)?;
     }
@@ -299,44 +300,110 @@ fn draw(
     Ok(lines)
 }
 
+/// Rewrite just the status row (cheap — for URL-bar / mode changes that don't
+/// touch the page). Keeps `prev`'s last entry in sync so the next page draw
+/// doesn't redundantly rewrite it.
+fn draw_status(
+    sess: &BrowserSession,
+    out: &mut impl Write,
+    url_edit: Option<&str>,
+    mouse_grab: bool,
+    prev: &mut Option<Vec<String>>,
+) -> Result<()> {
+    let line = format!("\x1b[7m{}\x1b[0m", status_line(sess, url_edit, mouse_grab));
+    write!(out, "\x1b[{};1H{}", sess.rows + 1, line)?;
+    out.flush()?;
+    if let Some(p) = prev.as_mut() {
+        if let Some(last) = p.last_mut() {
+            *last = line;
+        }
+    }
+    Ok(())
+}
+
+fn set_mouse_tracking(out: &mut impl Write, on: bool) {
+    let _ = if on {
+        write!(out, "\x1b[?1002h\x1b[?1006h")
+    } else {
+        write!(out, "\x1b[?1002l\x1b[?1006l")
+    };
+    let _ = out.flush();
+}
+
 /// Run the interactive browser TUI against an attached session.
 pub fn interactive(sess: &BrowserSession) -> Result<()> {
     use base64::Engine as _;
     let mut out = std::io::stdout();
     let saved = set_raw(0);
-    write!(out, "\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h")?;
+    write!(out, "\x1b[?1049h\x1b[?25l")?;
     out.flush()?;
+
+    // Self-pipe waker: the CDP reader pokes wake_w on every event, so the loop
+    // blocks in poll() and wakes the instant a frame (or input) arrives — no
+    // fixed-timeout lag. Non-blocking write end so a poke never stalls.
+    let mut wfds = [0 as libc::c_int; 2];
+    let (wake_r, wake_w) = if unsafe { libc::pipe(wfds.as_mut_ptr()) } == 0 {
+        unsafe {
+            let fl = libc::fcntl(wfds[1], libc::F_GETFL);
+            libc::fcntl(wfds[1], libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        (wfds[0], wfds[1])
+    } else {
+        (-1, -1)
+    };
+    if wake_w >= 0 {
+        sess.cdp().set_wake_fd(wake_w);
+    }
+
+    let mut mouse_grab = true;
+    set_mouse_tracking(&mut out, true);
     sess.start_screencast()?;
 
     let mut prev: Option<Vec<String>> = None;
     let mut frame_png: Option<Vec<u8>> = None;
     let mut inbuf: Vec<u8> = Vec::new();
     let mut url_edit: Option<String> = None;
-    let mut dirty = true;
+    let mut page_dirty = true; // first paint
+    let mut chrome_dirty = false;
 
     let result = (|| -> Result<()> {
         loop {
-            if dirty {
-                prev = Some(draw(sess, &mut out, url_edit.as_deref(),
-                                 frame_png.as_deref(), prev.as_ref())?);
-                dirty = false;
+            // Page render (text+pixels together) only when the page changed;
+            // otherwise a cheap status-row rewrite. Never snapshot per keypress.
+            if page_dirty {
+                prev = Some(draw_page(sess, &mut out, url_edit.as_deref(),
+                                      mouse_grab, frame_png.as_deref(), prev.as_ref())?);
+                page_dirty = false;
+                chrome_dirty = false;
+            } else if chrome_dirty {
+                draw_status(sess, &mut out, url_edit.as_deref(), mouse_grab, &mut prev)?;
+                chrome_dirty = false;
             }
-            let ready = poll_in(0, 100);
+
+            // Block until input, a CDP event (via the waker), or a fallback tick.
+            let (stdin_ready, woke) = poll2(0, wake_r, 250);
+            if woke {
+                drain_fd(wake_r);
+            }
+
+            // Coalesce: keep only the newest screencast frame this wake.
             for ev in sess.cdp().drain_events() {
                 match ev.get("method").and_then(|m| m.as_str()) {
                     Some("Page.screencastFrame") => {
                         let sid = ev["params"]["sessionId"].as_i64().unwrap_or(0);
                         sess.ack_frame(sid);
                         if let Some(d) = ev["params"]["data"].as_str() {
-                            if let Ok(png) = base64::engine::general_purpose::STANDARD.decode(d) {
+                            if let Ok(png) =
+                                base64::engine::general_purpose::STANDARD.decode(d)
+                            {
                                 frame_png = Some(png);
-                                dirty = true;
+                                page_dirty = true;
                             }
                         }
                     }
                     Some("Page.loadEventFired") | Some("Page.frameNavigated") => {
                         let _ = sess.start_screencast(); // navigation stops the cast
-                        dirty = true;
+                        page_dirty = true;
                     }
                     _ => {}
                 }
@@ -344,7 +411,7 @@ pub fn interactive(sess: &BrowserSession) -> Result<()> {
             if sess.cdp().is_closed() {
                 return Ok(());
             }
-            if !ready {
+            if !stdin_ready {
                 continue;
             }
             let mut tmp = [0u8; 4096];
@@ -353,7 +420,6 @@ pub fn interactive(sess: &BrowserSession) -> Result<()> {
                 return Ok(());
             }
             inbuf.extend_from_slice(&tmp[..n as usize]);
-            dirty = true;
             loop {
                 let (tok, used) = next_token(&inbuf);
                 let Some(tok) = tok else { break };
@@ -366,20 +432,27 @@ pub fn interactive(sess: &BrowserSession) -> Result<()> {
                                 let _ = sess.navigate(&u);
                             }
                             url_edit = None;
+                            chrome_dirty = true;
                         }
-                        b"\x1b" | b"\x11" => url_edit = None,
-                        b"\x7f" => {
-                            edit.pop();
+                        b"\x1b" | b"\x11" => { url_edit = None; chrome_dirty = true; }
+                        b"\x7f" => { edit.pop(); chrome_dirty = true; }
+                        t if t[0] >= 0x20 => {
+                            edit.push_str(&String::from_utf8_lossy(t));
+                            chrome_dirty = true;
                         }
-                        t if t[0] >= 0x20 => edit.push_str(&String::from_utf8_lossy(t)),
                         _ => {}
                     }
                     continue;
                 }
                 match tok.as_slice() {
-                    b"\x11" => return Ok(()),                 // Ctrl-Q
-                    b"\x0c" => url_edit = Some(String::new()), // Ctrl-L
-                    b"\x12" => { let _ = sess.reload(); }      // Ctrl-R
+                    b"\x11" => return Ok(()),                  // Ctrl-Q
+                    b"\x0c" => { url_edit = Some(String::new()); chrome_dirty = true; } // ^L
+                    b"\x18" => {                                // Ctrl-X: mouse mode
+                        mouse_grab = !mouse_grab;
+                        set_mouse_tracking(&mut out, mouse_grab);
+                        chrome_dirty = true;
+                    }
+                    b"\x12" => { let _ = sess.reload(); }       // Ctrl-R
                     b"\x02" | b"\x1b[1;3D" | b"\x1b\x1b[D" => { let _ = sess.history_go(-1); }
                     b"\x06" | b"\x1b[1;3C" | b"\x1b\x1b[C" => { let _ = sess.history_go(1); }
                     b"\x1b[A" => { let _ = sess.scroll(-3); }
@@ -390,9 +463,13 @@ pub fn interactive(sess: &BrowserSession) -> Result<()> {
                     b"\t" => { let _ = sess.key("Tab", "Tab", 9, ""); }
                     b"\x7f" => { let _ = sess.key("Backspace", "Backspace", 8, ""); }
                     t if t.starts_with(b"\x1b[<") => {
-                        if let Some((col, row, press)) = parse_sgr_mouse(t) {
-                            if press {
-                                let _ = sess.click(col, row);
+                        // Only when we hold the mouse (in SELECT mode the
+                        // terminal owns it and sends us nothing anyway).
+                        if mouse_grab {
+                            if let Some((col, row, press)) = parse_sgr_mouse(t) {
+                                if press {
+                                    let _ = sess.click(col, row);
+                                }
                             }
                         }
                     }
@@ -405,12 +482,44 @@ pub fn interactive(sess: &BrowserSession) -> Result<()> {
         }
     })();
 
-    write!(out, "\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?1049l")?;
+    sess.cdp().set_wake_fd(-1);
+    if wake_r >= 0 { unsafe { libc::close(wake_r); libc::close(wake_w); } }
+    set_mouse_tracking(&mut out, false);
+    write!(out, "\x1b[?25h\x1b[?1049l")?;
     out.flush()?;
     if let Some(s) = saved {
         restore_raw(0, &s);
     }
     result
+}
+
+/// Poll stdin (`fd0`) and the waker (`wake`) with a millisecond fallback.
+/// Returns (stdin_readable, waker_readable).
+fn poll2(fd0: i32, wake: i32, ms: i32) -> (bool, bool) {
+    let mut pfds = [
+        libc::pollfd { fd: fd0, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+    ];
+    let n = if wake >= 0 { 2 } else { 1 };
+    let rc = unsafe { libc::poll(pfds.as_mut_ptr(), n as libc::nfds_t, ms) };
+    if rc <= 0 {
+        return (false, false);
+    }
+    (
+        pfds[0].revents & libc::POLLIN != 0,
+        wake >= 0 && pfds[1].revents & libc::POLLIN != 0,
+    )
+}
+
+/// Drain a non-blocking/ready fd (the waker) so it doesn't re-fire.
+fn drain_fd(fd: i32) {
+    let mut buf = [0u8; 256];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n < buf.len() as isize {
+            break;
+        }
+    }
 }
 
 /// Parse an SGR mouse report `ESC [ < b ; col ; row (M|m)` → (col0, row0,
@@ -450,7 +559,9 @@ usage:
     --spki KEY    trust a MITM root by SPKI hash (for tap boxes)
 
 Interactive keys: ^Q quit, ^L url bar, ^R reload, alt-←/→ back/forward,
-arrows/PgUp/PgDn scroll, mouse click, typing goes to the page.
+arrows/PgUp/PgDn scroll, mouse click, ^X toggle terminal text-selection
+(hands the mouse back to your terminal so you can select/copy), typing
+goes to the page.
 
 Drives a stock headless Chromium over the DevTools Protocol; no carbonyl.
 Set $CELLULOSE_BROWSER to choose the browser binary.";
