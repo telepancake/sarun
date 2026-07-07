@@ -280,12 +280,39 @@ fn symbolize_addrs(exe: Option<&std::path::Path>, addrs: &[u64]) -> Vec<String> 
         if func.starts_with("sarun::selfbt::") { continue; }
         // Strip the ` (.llvm.<hash>)` cold-split suffix — pure noise.
         let func = func.split(" (.llvm.").next().unwrap_or(func).trim();
+        let func = collapse_generics(func);
         let loc = loc.rsplit('/').next().unwrap_or(loc);
         frames.push(if loc == "??:0" || loc == "??:?" {
-            func.to_string()
+            func
         } else { format!("{func} ({loc})") });
     }
     frames
+}
+
+/// Collapse the monomorphized generic parameters in a demangled Rust symbol so
+/// a frame fits on one line: each balanced `<…>` group (and the `$LT$…$GT$`
+/// form llvm-addr2line leaves when it can't fully demangle) becomes a bare
+/// `<…>`. `map<std::sys::fs::unix::FileAttr, …, fn(…) -> …>` — six wrapped
+/// lines in the panel — shrinks to `map<…>`. Without this the stuck panel is
+/// unreadable.
+fn collapse_generics(s: &str) -> String {
+    // Normalize the un-demangled bracket spelling first so both forms collapse.
+    let s = s.replace("$LT$", "<").replace("$GT$", ">");
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0u32;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => {
+                if depth == 0 { out.push_str("<…>"); }
+                depth += 1;
+            }
+            '>' => { depth = depth.saturating_sub(1); }
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A box process's brush/engine text range [lo, hi), from /proc/<pid>/maps: the
