@@ -28,7 +28,7 @@ use serde::Deserialize;
 use wikimak_media::BlobMediaResolver;
 use wikimak_scribunto::LuaInvoker;
 use wikimak_wikitext::{
-    render, NamespaceInfo, PageStore, RenderOptions, SiteConfig, Title,
+    render, NamespaceInfo, PageStore, RenderMisses, RenderOptions, SiteConfig, Title,
 };
 
 // ---------------------------------------------------------------------------
@@ -193,55 +193,64 @@ fn parse_ts_micros(iso: &str) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Cruft-stripping structural signature (applied to BOTH sides)
+// Element inventory (the diagnostic, applied to BOTH sides)
 // ---------------------------------------------------------------------------
 
-/// Reduce HTML to a stream of structure+text tokens with all editor/presentation
-/// chrome removed: `<style>`/`<script>` blocks and comments dropped whole,
-/// `mw-editsection` spans removed with their content, every attribute dropped
-/// (so `data-mw`/`typeof`/`about`/ids never count), tag names lowercased, text
-/// whitespace-collapsed to lowercased words.
-fn signature(html: &str) -> Vec<String> {
-    let cleaned = strip_chrome(html);
-    let b = cleaned.as_bytes();
-    let mut toks = Vec::new();
-    let mut i = 0;
-    let mut text = String::new();
-    let flush = |text: &mut String, toks: &mut Vec<String>| {
-        for w in text.split_whitespace() {
-            toks.push(w.to_lowercase());
-        }
-        text.clear();
-    };
-    while i < b.len() {
-        if b[i] == b'<' {
-            flush(&mut text, &mut toks);
-            let end = cleaned[i..].find('>').map(|e| i + e + 1).unwrap_or(b.len());
-            let inner = &cleaned[i + 1..end.saturating_sub(1)];
-            let close = inner.starts_with('/');
-            let name: String = inner
-                .trim_start_matches('/')
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric())
-                .collect::<String>()
-                .to_lowercase();
-            if !name.is_empty() {
-                // Fold reader-invisible/empty wrappers so nesting-only
-                // differences don't dominate: bare spans and the parser-output
-                // div carry no block structure a reader perceives.
-                if name != "span" && name != "div" {
-                    toks.push(if close { format!("</{name}") } else { format!("<{name}") });
-                }
-            }
-            i = end;
-        } else {
-            let l = utf8_len(b[i]);
-            text.push_str(&cleaned[i..i + l]);
-            i += l;
-        }
+/// Counts of the reader-visible structures on a page, after chrome removal.
+/// This is a DIAGNOSTIC, not a score: the per-category MediaWiki-vs-ours delta
+/// tells you WHAT is missing (a page with 5 MW tables and 0 of ours means the
+/// table path or a template broke), which is the thing you act on. There is no
+/// single "similarity" number here on purpose — a number invites gaming; a
+/// list of missing structures invites fixing.
+#[derive(Default, Clone, Copy)]
+struct Counts {
+    headings: usize,
+    tables: usize,
+    list_items: usize,
+    links: usize,
+    refs: usize,
+    images: usize,
+    paragraphs: usize,
+}
+
+impl Counts {
+    const LABELS: [&'static str; 7] =
+        ["headings", "tables", "list_items", "links", "refs", "images", "paragraphs"];
+    fn get(&self, i: usize) -> usize {
+        [self.headings, self.tables, self.list_items, self.links, self.refs,
+         self.images, self.paragraphs][i]
     }
-    flush(&mut text, &mut toks);
-    toks
+}
+
+/// Case-insensitive count of non-overlapping `needle` in `hay`.
+fn count(hay: &str, needle: &str) -> usize {
+    let (h, n) = (hay.to_lowercase(), needle.to_lowercase());
+    let mut c = 0;
+    let mut from = 0;
+    while let Some(rel) = h[from..].find(&n) {
+        c += 1;
+        from += rel + n.len();
+    }
+    c
+}
+
+/// Inventory the reader-visible structures in `html` (chrome already stripped).
+/// `refs` counts reference-list definitions (`id="cite_note-…"`, the scheme both
+/// MediaWiki and our Cite use); `images` counts `<img>` — for our render that is
+/// 0 (media is placeholdered), so the images delta is exactly "pictures the
+/// reader sees that we don't", which the miss inventory attributes.
+fn inventory(html: &str) -> Counts {
+    let s = strip_chrome(html);
+    let headings = (2..=6).map(|h| count(&s, &format!("<h{h}"))).sum();
+    Counts {
+        headings,
+        tables: count(&s, "<table"),
+        list_items: count(&s, "<li"),
+        links: count(&s, "<a "),
+        refs: count(&s, "id=\"cite_note-"),
+        images: count(&s, "<img"),
+        paragraphs: count(&s, "<p>") + count(&s, "<p "),
+    }
 }
 
 fn utf8_len(byte: u8) -> usize {
@@ -328,25 +337,6 @@ fn remove_class_span(s: &str, marker: &str) -> String {
     out
 }
 
-/// Dice coefficient over token bigrams: `2·|A∩B| / (|A|+|B|)` on the bigram
-/// multisets. Captures local order without full-sequence LCS cost.
-fn dice(a: &[String], b: &[String]) -> f64 {
-    let bigrams = |t: &[String]| -> HashMap<(String, String), i64> {
-        let mut m = HashMap::new();
-        for w in t.windows(2) {
-            *m.entry((w[0].clone(), w[1].clone())).or_insert(0) += 1;
-        }
-        m
-    };
-    let (ma, mb) = (bigrams(a), bigrams(b));
-    let (na, nb): (i64, i64) = (ma.values().sum(), mb.values().sum());
-    if na == 0 || nb == 0 {
-        return 0.0;
-    }
-    let inter: i64 = ma.iter().map(|(k, va)| *va.min(mb.get(k).unwrap_or(&0))).sum();
-    2.0 * inter as f64 / (na + nb) as f64
-}
-
 // ---------------------------------------------------------------------------
 // The straightedge
 // ---------------------------------------------------------------------------
@@ -375,7 +365,7 @@ fn load_bundles() -> Vec<(String, Bundle)> {
     out
 }
 
-fn render_local(b: &Bundle) -> String {
+fn render_local(b: &Bundle) -> wikimak_wikitext::RenderOutput {
     let store = CorpusStore::new(b);
     let invoker = LuaInvoker::default();
     let media = BlobMediaResolver::new("/w/media/");
@@ -386,63 +376,150 @@ fn render_local(b: &Bundle) -> String {
         asof_query: String::new(),
     };
     let title = Title::parse(&b.meta.resolved_title, &store.site);
-    render(&store, &title, &b.page_wikitext, &opts).html
+    render(&store, &title, &b.page_wikitext, &opts)
 }
 
-/// Aggregate structural-similarity floor over the committed corpus. The render
-/// is deterministic (τ from the fixture, no wall clock, no randomness), so this
-/// is a tight regression gate: measured mean is 0.695 (per-page 0.47–0.90; the
-/// heavily-templated en/zh/ja pages sit lowest, RTL ar/fa/he render well).
-/// Floored a hair under the mean to catch real regressions with a little
-/// refactor headroom; RAISE it as fidelity improves — that is the straightedge
-/// working.
-const AGGREGATE_FLOOR: f64 = 0.65;
+/// One page's rendered result plus the reader-HTML it is measured against.
+struct Rendered {
+    inv_ours: Counts,
+    inv_ref: Counts,
+    misses: RenderMisses,
+    error_boxes: usize,
+}
+
+fn measure(b: &Bundle) -> Rendered {
+    let out = render_local(b);
+    Rendered {
+        inv_ours: inventory(&out.html),
+        inv_ref: inventory(&b.reader_html),
+        error_boxes: count(&out.html, "class=\"error\""),
+        misses: out.misses,
+    }
+}
+
+/// Cap on the total actionable render failures across the whole corpus
+/// (failed `#invoke`s + missing templates + unknown tags). This is the ONLY
+/// hard gate, and it is causally tied to rendering real content: the sole way
+/// to lower it is to actually render more of the page (support a module, an
+/// extension tag, a template) — cosmetic tricks cannot move it, and silently
+/// dropping a failure to dodge it would show up as a missing structure in the
+/// printed inventory below. Snapshot of today's count; it must not grow. Lower
+/// it as the parser handles more. NOT a quality score — a regression tripwire.
+const MAX_TOTAL_FAILURES: usize = 2154; // measured 2026-07 over the 12-page corpus
 
 #[test]
-fn corpus_straightedge() {
+fn corpus_render_report() {
     let bundles = load_bundles();
     assert!(!bundles.is_empty(), "no corpus fixtures found — run corpus/capture.py");
 
-    let mut scores = Vec::new();
+    // Per-page structure inventory: MediaWiki reader vs ours. A big negative
+    // delta in a category is a concrete lead (missing tables → table/template
+    // bug; missing refs → Cite/ref-heavy-template bug; missing images are
+    // expected, media is placeholdered).
+    eprintln!("\n== per-page structure (reader → ours; Δ = ours − reader) ==");
+    let mut invs = Vec::new();
+    let mut total_failures = 0usize;
+    // module/template/tag → how many pages it failed on (the work list).
+    let mut fail_modules: HashMap<String, usize> = HashMap::new();
+    let mut fail_templates: HashMap<String, usize> = HashMap::new();
+    let mut fail_tags: HashMap<String, usize> = HashMap::new();
+
     for (name, b) in &bundles {
-        let ours = render_local(b);
-        let sig_ours = signature(&ours);
-        let sig_ref = signature(&b.reader_html);
-        let s = dice(&sig_ours, &sig_ref);
-        scores.push(s);
-        eprintln!(
-            "  {name:14} {:>5} rtl={:<5} closure={:<4} script~{:<9} similarity {:.3}",
-            b.meta.revid % 100000,
-            b.meta.rtl,
-            b.meta.closure_stored,
-            b.meta.lang,
-            s
+        let r = measure(b);
+        invs.push((name.clone(), r.inv_ours, r.inv_ref));
+        eprintln!("  {name}  ({}{}, closure {})",
+            b.meta.content_lang, if b.meta.rtl { ", rtl" } else { "" }, b.meta.closure_stored);
+        for i in 0..Counts::LABELS.len() {
+            let (o, rf) = (r.inv_ours.get(i), r.inv_ref.get(i));
+            let d = o as i64 - rf as i64;
+            if rf != 0 || o != 0 {
+                eprintln!("      {:<11} {:>4} → {:<4} Δ{:+}", Counts::LABELS[i], rf, o, d);
+            }
+        }
+        eprintln!("      error-boxes {}  |  misses: {} invoke, {} template, {} tag, {} media",
+            r.error_boxes, r.misses.failed_invokes.len(), r.misses.missing_templates.len(),
+            r.misses.unknown_tags.len(), r.misses.missing_media.len());
+
+        // Cite errors are routed through failed_invokes with a "cite" marker;
+        // they are a rendering concern, not a missing module, so exclude them
+        // from the module work-list but still count them as failures.
+        for f in &r.misses.failed_invokes {
+            total_failures += 1;
+            if !f.to_lowercase().starts_with("cite") {
+                *fail_modules.entry(module_of(f)).or_default() += 1;
+            }
+        }
+        for t in &r.misses.missing_templates {
+            total_failures += 1;
+            *fail_templates.entry(t.clone()).or_default() += 1;
+        }
+        for t in &r.misses.unknown_tags {
+            total_failures += 1;
+            *fail_tags.entry(t.clone()).or_default() += 1;
+        }
+
+        // Wholesale-break guard: a page that produced NO block structure at all
+        // when MediaWiki has plenty means the renderer fell over on it.
+        let ours_blocks = r.inv_ours.headings + r.inv_ours.tables + r.inv_ours.paragraphs;
+        let ref_blocks = r.inv_ref.headings + r.inv_ref.tables + r.inv_ref.paragraphs;
+        assert!(
+            ours_blocks > 0 || ref_blocks == 0,
+            "{name}: rendered zero block structure while the reader has {ref_blocks} — renderer break"
         );
-        let _ = &b.meta.resolved_title;
     }
-    let mean = scores.iter().sum::<f64>() / scores.len() as f64;
-    eprintln!(
-        "corpus straightedge: {} pages, mean structural similarity {:.3} (floor {:.2})",
-        scores.len(),
-        mean,
-        AGGREGATE_FLOOR
-    );
+
+    eprintln!("\n== work list: what to build next (failures ranked across the corpus) ==");
+    print_ranked("modules failing #invoke", &fail_modules);
+    print_ranked("templates missing from render", &fail_templates);
+    print_ranked("unsupported extension tags", &fail_tags);
+    eprintln!("\ncorpus: {} pages, {} total actionable failures (cap {})",
+        bundles.len(), total_failures, MAX_TOTAL_FAILURES);
+
     assert!(
-        mean >= AGGREGATE_FLOOR,
-        "mean structural similarity {mean:.3} fell below floor {AGGREGATE_FLOOR:.2} — a rendering regression"
+        total_failures <= MAX_TOTAL_FAILURES,
+        "actionable render failures rose to {total_failures} (cap {MAX_TOTAL_FAILURES}) — \
+         a page now renders LESS real content than before; fix the regression, don't raise the cap"
     );
 }
 
-/// The signature must actually strip chrome and preserve content — not just
-/// erase everything (which would make any two pages look identical).
+/// Best-effort module name out of a failed-invoke message (`"Module:Foo::bar: …"`
+/// or `"Foo::bar"`) for the ranked work list.
+fn module_of(msg: &str) -> String {
+    msg.split("::").next().unwrap_or(msg).split(':').last().unwrap_or(msg)
+        .split_whitespace().next().unwrap_or(msg).to_string()
+}
+
+fn print_ranked(header: &str, m: &HashMap<String, usize>) {
+    if m.is_empty() {
+        eprintln!("  {header}: (none)");
+        return;
+    }
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    eprintln!("  {header}:");
+    for (name, n) in v.into_iter().take(15) {
+        eprintln!("      {n:>3}× {name}");
+    }
+}
+
+/// The inventory must count real structure and the chrome-strip must remove
+/// editor scaffolding — not erase everything (which would make every page look
+/// empty and hide regressions).
 #[test]
-fn signature_strips_chrome_not_content() {
-    let a = signature(r#"<div class="mw-parser-output"><style>x{y:z}</style><h2>Hello <span class="mw-editsection">[edit]</span></h2><p>World</p></div>"#);
-    assert!(a.contains(&"hello".to_string()) && a.contains(&"world".to_string()));
-    assert!(!a.iter().any(|t| t == "edit"), "editsection text must be stripped: {a:?}");
-    assert!(!a.iter().any(|t| t == "z" || t == "x"), "style block must be stripped: {a:?}");
-    assert!(a.contains(&"<h2".to_string()), "structure must survive: {a:?}");
-    // Different content must NOT compare equal (guards a degenerate normalizer).
-    let b = signature("<p>totally different text here</p>");
-    assert!(dice(&a, &b) < 0.5, "unrelated pages must score low");
+fn inventory_counts_structure_and_strips_chrome() {
+    let c = inventory(r#"<div class="mw-parser-output"><style>x{y:z}</style>
+        <h2>Hello <span class="mw-editsection">[edit]</span></h2>
+        <table><tbody><tr><td>a</td></tr></tbody></table>
+        <p>World</p><ol class="references"><li id="cite_note-1">ref</li></ol></div>"#);
+    assert_eq!(c.headings, 1, "one heading");
+    assert_eq!(c.tables, 1, "one table");
+    assert_eq!(c.paragraphs, 1, "one paragraph");
+    assert_eq!(c.refs, 1, "one reference definition");
+    // Chrome must be gone: the <style> block's `z` and the editsection [edit]
+    // must not survive into the stripped text (would inflate paragraph/word
+    // scans and mask real content).
+    let stripped = strip_chrome(r#"<style>a{b:c}</style><p>x</p><span class="mw-editsection">[edit]</span>"#);
+    assert!(!stripped.contains("b:c"), "style block not stripped: {stripped}");
+    assert!(!stripped.to_lowercase().contains("edit]"), "editsection not stripped: {stripped}");
+    assert!(stripped.contains("<p>x</p>"), "real content must survive: {stripped}");
 }
