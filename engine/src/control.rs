@@ -131,14 +131,21 @@ fn thread_backtraces(pids: &[i32], depth: usize)
         .map(|s| !s.success()).unwrap_or(true) {
         return out;
     }
-    for &pid in pids {
-        let res = std::process::Command::new("timeout")
-            .args(["8", "gdb", "-p", &pid.to_string(), "-batch",
+    // Attach to every pid CONCURRENTLY: gdb attaching to a sud-traced process
+    // is slow (it can hit the full timeout), so a serial loop over N pids
+    // wedged `stuck` for N×timeout. Spawn them all, then collect — total wall
+    // time is bounded by the single slowest attach, not their sum.
+    let children: Vec<_> = pids.iter().filter_map(|&pid| {
+        std::process::Command::new("timeout")
+            .args(["5", "gdb", "-p", &pid.to_string(), "-batch",
                    "-nx", "-ex", "set pagination off",
                    "-ex", &format!("thread apply all bt {depth}")])
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .output();
-        let Ok(res) = res else { continue };
+            .spawn().ok()
+    }).collect();
+    for child in children {
+        let Ok(res) = child.wait_with_output() else { continue };
         let text = String::from_utf8_lossy(&res.stdout);
         let mut cur_tid: Option<i32> = None;
         for line in text.lines() {
@@ -159,6 +166,128 @@ fn thread_backtraces(pids: &[i32], depth: usize)
                 }
             }
         }
+    }
+    out
+}
+
+/// In-process self-unwind backtraces — the layer that works UNDER sud, where
+/// external gdb resolves the relocated engine to `?? ()`. We ask each on-CPU
+/// (R-state) thread to dump its own symbolized stack (via a preinstalled
+/// realtime-signal handler that writes `std::backtrace` to the host sink file
+/// the runner opened) and parse the blocks back. `rp` is the box's runner host
+/// pid (the sink-file key); `box_pids` its process set. Empty map when the box
+/// predates this mechanism (no sink) or nothing on-CPU answered.
+fn selfbt_backtraces(rp: i32, box_pids: &[i32])
+    -> std::collections::HashMap<i32, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    let path = crate::selfbt::sink_path(rp);
+    // Truncate the sink so we read only THIS invocation's dumps.
+    let Ok(f) = std::fs::OpenOptions::new().write(true).truncate(true)
+        .open(&path) else { return out; };
+    drop(f);
+    // Aim only at R-state threads: those are the spins gdb can't localize, and
+    // signalling a blocked thread risks EINTR-perturbing the box.
+    let sig = crate::selfbt::dump_signal();
+    let mut aimed = 0;
+    for &pid in box_pids {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task"))
+            else { continue };
+        for te in tasks.flatten() {
+            let Some(tid) = te.file_name().to_str()
+                .and_then(|s| s.parse::<i32>().ok()) else { continue };
+            let st = std::fs::read_to_string(
+                format!("/proc/{pid}/task/{tid}/stat")).ok()
+                .and_then(|s| s.rfind(')')
+                    .and_then(|i| s[i + 1..].trim().chars().next()));
+            if st != Some('R') { continue; }
+            unsafe {
+                libc::syscall(libc::SYS_tgkill, pid as libc::c_long,
+                              tid as libc::c_long, sig as libc::c_long);
+            }
+            aimed += 1;
+        }
+    }
+    if aimed == 0 { return out; }
+    // Give the handlers time to walk + write.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let Ok(text) = std::fs::read_to_string(&path) else { return out; };
+    // Parse blocks: "=== tid N bias 0xB ===" then hex return addresses. Collect
+    // per tid the (bias, [addr…]); symbolize below with one addr2line pass.
+    let mut raw: std::collections::HashMap<i32, (u64, Vec<u64>)> =
+        Default::default();
+    let mut cur: Option<i32> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("=== tid ") {
+            // "N bias 0xB ==="
+            let mut it = rest.split_whitespace();
+            let tid = it.next().and_then(|s| s.parse::<i32>().ok());
+            let bias = it.nth(1)  // skip "bias"
+                .and_then(|s| u64::from_str_radix(
+                    s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            if let Some(tid) = tid {
+                cur = Some(tid);
+                raw.entry(tid).or_insert((bias, vec![]));
+            }
+            continue;
+        }
+        if let (Some(tid), Some(addr)) = (cur, line.trim().strip_prefix("0x")
+            .and_then(|h| u64::from_str_radix(h, 16).ok())) {
+            raw.entry(tid).or_insert((0, vec![])).1.push(addr);
+        }
+    }
+    // Symbolize offline: vaddr = addr - bias, then addr2line -f -C against the
+    // engine's own binary (same one the box runs; debug info retained). One
+    // process invocation per thread keeps it simple and bounded.
+    let exe = std::env::current_exe().ok();
+    for (tid, (_bias, addrs)) in raw {
+        if addrs.is_empty() { continue; }
+        let Some(exe) = &exe else { break };
+        // sarun is a non-PIE static ET_EXEC: the sud loader honors its fixed
+        // vaddrs, so a captured runtime address IS its ELF virtual address —
+        // feed it to addr2line as-is (the reported bias is for a hypothetical
+        // future PIE build and is intentionally NOT subtracted here).
+        let vaddrs: Vec<String> = addrs.iter()
+            .map(|a| format!("0x{a:x}")).collect();
+        // Prefer llvm-addr2line: binutils addr2line can spin forever in its
+        // DWARF range walker on some of these frames (a known upstream bug),
+        // which wedged `stuck` outright. llvm-addr2line resolves the same
+        // addresses in ~1s. Fall back to binutils, and either way cap the
+        // wall time with `timeout` + a null stdin so it can never hang the
+        // diagnostic.
+        let a2l = if std::process::Command::new("llvm-addr2line")
+            .arg("--version").stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()).status()
+            .map(|s| s.success()).unwrap_or(false) {
+            "llvm-addr2line"
+        } else { "addr2line" };
+        let mut cmd = std::process::Command::new("timeout");
+        cmd.arg("15").arg(a2l).arg("-f").arg("-C").arg("-e").arg(exe)
+            .args(&vaddrs)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let Ok(o) = cmd.output() else { continue };
+        let text = String::from_utf8_lossy(&o.stdout);
+        // addr2line -f emits pairs of lines: <function>\n<file:line>.
+        let lines: Vec<&str> = text.lines().collect();
+        let mut frames = vec![];
+        let mut i = 0;
+        while i + 1 < lines.len() {
+            let func = lines[i].trim();
+            let loc = lines[i + 1].trim();
+            i += 2;
+            if func == "??" { continue; }   // unresolved: skip the garbage
+            // Drop the handler/signal prologue frames.
+            if func.starts_with("sarun::selfbt::") { continue; }
+            // Strip the ` (.llvm.<hash>)` cold-split suffix llvm-addr2line
+            // leaves on outlined symbols — pure noise for a reader.
+            let func = func.split(" (.llvm.").next().unwrap_or(func).trim();
+            let loc = loc.rsplit('/').next().unwrap_or(loc);
+            frames.push(if loc == "??:0" || loc == "??:?" {
+                func.to_string()
+            } else { format!("{func} ({loc})") });
+        }
+        if !frames.is_empty() { out.insert(tid, frames); }
     }
     out
 }
@@ -1838,11 +1967,23 @@ macro_rules! ui_verbs {
                             }
                             fd_tab.insert(pid, t);
                         }
-                        // Symbolized backtraces (gdb + retained debug info) —
-                        // the layer that localizes a "running" (spinning)
-                        // thread, which /proc wchan/syscall cannot. Best-
-                        // effort: empty when gdb is absent.
-                        let bt_map = thread_backtraces(&box_pids, 8);
+                        // Symbolized backtraces, two sources merged. Under sud
+                        // external gdb yields `?? ()` for the relocated engine,
+                        // so the on-CPU spins — the ones /proc wchan/syscall
+                        // can't localize — come from in-process self-unwind
+                        // (each R thread dumps its own std::backtrace). gdb
+                        // still covers the non-sud path and blocked threads.
+                        let mut bt_map = thread_backtraces(&box_pids, 8);
+                        // Drop gdb's unsymbolizable `?? ()` frames so the diag
+                        // stops emitting misleading garbage.
+                        for v in bt_map.values_mut() {
+                            v.retain(|f| !f.starts_with("?? "));
+                        }
+                        bt_map.retain(|_, v| !v.is_empty());
+                        // Self-unwind wins for any thread it localized.
+                        for (tid, frames) in selfbt_backtraces(rp, &box_pids) {
+                            if !frames.is_empty() { bt_map.insert(tid, frames); }
+                        }
                         let mut threads = vec![];
                         for &pid in &box_pids {
                             let Ok(tasks) = std::fs::read_dir(

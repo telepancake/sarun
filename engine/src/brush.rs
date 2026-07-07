@@ -1476,6 +1476,10 @@ pub fn brush_sh(argv: &[String]) -> i32 {
         eprintln!("sarun-engine brush-sh: empty argv");
         return 2;
     }
+    // In-process self-unwind sink for `stuck` (no-op unless the runner set
+    // SARUN_STUCK_FD): lets a spinning box thread dump its own symbolized
+    // stack, which external gdb cannot under the sud loader.
+    crate::selfbt::install();
     let arg0 = &argv[0];
     let base = std::path::Path::new(arg0)
         .file_name().and_then(|s| s.to_str()).unwrap_or("sh").to_string();

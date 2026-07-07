@@ -936,6 +936,11 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // send_nested_prov dials it directly for brush pipeline records, build
     // edges, and done/state stamps (the l and g screens' data).
     sc.env("SARUN_SUD_PROV", &sock);
+    // Self-unwind sink for `stuck`: open a host file and hand the box an
+    // inherited fd it dumps its own symbolized backtraces to on demand (gdb
+    // can't symbolize the sud-relocated engine). Keyed by this runner's host
+    // pid, which the engine's `stuck` verb already tracks (box_runpids).
+    crate::selfbt::runner_setup(&mut sc, std::process::id() as i32);
     // Teardown wiring: the wrapper tree gets its OWN process group, and two
     // watchers forward a stop to it (the traced tree is ordinary host
     // processes — nothing else stops it):

@@ -6,3 +6,8 @@
 
 [build]
 target = "x86_64-unknown-linux-musl"
+# Keep frame pointers so the `stuck` diagnostic's in-box self-unwind (a
+# frame-pointer walk seeded from the signal ucontext — the only way to get a
+# real stack out of a spinning thread under the sud loader, where external gdb
+# sees `?? ()`) can walk the interrupted stack. Costs one register; worth it.
+rustflags = ["-Cforce-frame-pointers=yes"]
