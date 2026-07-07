@@ -236,58 +236,185 @@ fn selfbt_backtraces(rp: i32, box_pids: &[i32])
             raw.entry(tid).or_insert((0, vec![])).1.push(addr);
         }
     }
-    // Symbolize offline: vaddr = addr - bias, then addr2line -f -C against the
-    // engine's own binary (same one the box runs; debug info retained). One
-    // process invocation per thread keeps it simple and bounded.
     let exe = std::env::current_exe().ok();
     for (tid, (_bias, addrs)) in raw {
-        if addrs.is_empty() { continue; }
-        let Some(exe) = &exe else { break };
-        // sarun is a non-PIE static ET_EXEC: the sud loader honors its fixed
-        // vaddrs, so a captured runtime address IS its ELF virtual address —
-        // feed it to addr2line as-is (the reported bias is for a hypothetical
-        // future PIE build and is intentionally NOT subtracted here).
-        let vaddrs: Vec<String> = addrs.iter()
-            .map(|a| format!("0x{a:x}")).collect();
-        // Prefer llvm-addr2line: binutils addr2line can spin forever in its
-        // DWARF range walker on some of these frames (a known upstream bug),
-        // which wedged `stuck` outright. llvm-addr2line resolves the same
-        // addresses in ~1s. Fall back to binutils, and either way cap the
-        // wall time with `timeout` + a null stdin so it can never hang the
-        // diagnostic.
-        let a2l = if std::process::Command::new("llvm-addr2line")
-            .arg("--version").stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()).status()
-            .map(|s| s.success()).unwrap_or(false) {
-            "llvm-addr2line"
-        } else { "addr2line" };
-        let mut cmd = std::process::Command::new("timeout");
-        cmd.arg("15").arg(a2l).arg("-f").arg("-C").arg("-e").arg(exe)
-            .args(&vaddrs)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let Ok(o) = cmd.output() else { continue };
-        let text = String::from_utf8_lossy(&o.stdout);
-        // addr2line -f emits pairs of lines: <function>\n<file:line>.
-        let lines: Vec<&str> = text.lines().collect();
-        let mut frames = vec![];
-        let mut i = 0;
-        while i + 1 < lines.len() {
-            let func = lines[i].trim();
-            let loc = lines[i + 1].trim();
-            i += 2;
-            if func == "??" { continue; }   // unresolved: skip the garbage
-            // Drop the handler/signal prologue frames.
-            if func.starts_with("sarun::selfbt::") { continue; }
-            // Strip the ` (.llvm.<hash>)` cold-split suffix llvm-addr2line
-            // leaves on outlined symbols — pure noise for a reader.
-            let func = func.split(" (.llvm.").next().unwrap_or(func).trim();
-            let loc = loc.rsplit('/').next().unwrap_or(loc);
-            frames.push(if loc == "??:0" || loc == "??:?" {
-                func.to_string()
-            } else { format!("{func} ({loc})") });
-        }
+        let frames = symbolize_addrs(exe.as_deref(), &addrs);
         if !frames.is_empty() { out.insert(tid, frames); }
+    }
+    out
+}
+
+/// Symbolize a captured chain of absolute return addresses against the engine's
+/// own binary. sarun is a non-PIE static ET_EXEC, so a runtime address IS its
+/// ELF virtual address — no relocation to undo. Prefers llvm-addr2line
+/// (binutils addr2line can infinite-loop in its DWARF range walker on some of
+/// these frames — a known upstream bug that wedged `stuck` outright); either
+/// way a `timeout` + null stdin caps the wall time. Unresolved `??` frames are
+/// dropped.
+fn symbolize_addrs(exe: Option<&std::path::Path>, addrs: &[u64]) -> Vec<String> {
+    let (Some(exe), false) = (exe, addrs.is_empty()) else { return vec![] };
+    let vaddrs: Vec<String> = addrs.iter().map(|a| format!("0x{a:x}")).collect();
+    let a2l = if std::process::Command::new("llvm-addr2line")
+        .arg("--version").stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null()).status()
+        .map(|s| s.success()).unwrap_or(false) {
+        "llvm-addr2line"
+    } else { "addr2line" };
+    let out = std::process::Command::new("timeout")
+        .arg("15").arg(a2l).arg("-f").arg("-C").arg("-e").arg(exe)
+        .args(&vaddrs)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(o) = out else { return vec![] };
+    let text = String::from_utf8_lossy(&o.stdout);
+    // addr2line -f emits pairs of lines: <function>\n<file:line>.
+    let lines: Vec<&str> = text.lines().collect();
+    let mut frames = vec![];
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        let func = lines[i].trim();
+        let loc = lines[i + 1].trim();
+        i += 2;
+        if func == "??" { continue; }
+        if func.starts_with("sarun::selfbt::") { continue; }
+        // Strip the ` (.llvm.<hash>)` cold-split suffix — pure noise.
+        let func = func.split(" (.llvm.").next().unwrap_or(func).trim();
+        let loc = loc.rsplit('/').next().unwrap_or(loc);
+        frames.push(if loc == "??:0" || loc == "??:?" {
+            func.to_string()
+        } else { format!("{func} ({loc})") });
+    }
+    frames
+}
+
+/// A box process's brush/engine text range [lo, hi), from /proc/<pid>/maps: the
+/// largest anonymous `r-xp` mapping (the sud loader places the ET_EXEC text in
+/// anonymous memory — that's exactly why external gdb can't symbolize it). A
+/// box RIP inside this range is brush/engine code (walkable + symbolizable
+/// against our binary); outside it is the sud dispatcher on its alt-stack.
+/// (0, 0) if it can't be determined.
+fn box_text_range(pid: i32) -> (u64, u64) {
+    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+        return (0, 0);
+    };
+    let mut best = (0u64, 0u64);
+    for line in maps.lines() {
+        let mut it = line.split_whitespace();
+        let range = it.next().unwrap_or("");
+        let perms = it.next().unwrap_or("");
+        let _off = it.next();
+        let _dev = it.next();
+        let inode = it.next().unwrap_or("");
+        let path = it.next();
+        // Anonymous executable segment: r-xp, inode 0, no pathname.
+        if !perms.starts_with("r-x") || inode != "0" || path.is_some() {
+            continue;
+        }
+        let Some((s, e)) = range.split_once('-') else { continue };
+        let (Ok(s), Ok(e)) = (u64::from_str_radix(s, 16),
+                              u64::from_str_radix(e, 16)) else { continue };
+        if e - s > best.1 - best.0 { best = (s, e); }
+    }
+    best
+}
+
+/// Ptrace-based backtraces — the ROBUST path that works regardless of thread
+/// state and does NOT depend on an in-box signal handler (sud masks all
+/// signals inside its SIGSYS dispatcher, so a syscall-heavy spin — the common
+/// real wedge — never lets the in-box self-unwind run). sud uses SIGSYS user
+/// dispatch, not ptrace, so the engine is free to PTRACE_SEIZE each box thread,
+/// read its registers and stack memory from outside, walk the frame pointers,
+/// and symbolize offline. Reads absolute addresses; sarun is ET_EXEC so those
+/// are ELF vaddrs. Best-effort: a thread we can't seize is simply skipped.
+fn ptrace_backtraces(box_pids: &[i32])
+    -> std::collections::HashMap<i32, Vec<String>> {
+    use std::os::unix::fs::FileExt;
+    const PTRACE_SEIZE: i32 = 0x4206;
+    const PTRACE_INTERRUPT: i32 = 0x4207;
+    const PTRACE_GETREGSET: i32 = 0x4204;
+    const PTRACE_CONT: i32 = 7;
+    const PTRACE_DETACH: i32 = 17;
+    const NT_PRSTATUS: i32 = 1;
+    const WALL: i32 = 0x4000_0000;
+    let exe = std::env::current_exe().ok();
+    let mut out = std::collections::HashMap::new();
+    // The engine's own executable text range. sarun is a fixed-address
+    // ET_EXEC, so the box runs the SAME vaddrs — a box RIP inside this range
+    // is brush/engine code (walkable), a RIP outside it is the sud dispatcher
+    // on its alt-stack (SA_ONSTACK), whose frames don't chain back to the
+    // brush stack. We retry the stop until we catch the thread IN this range.
+    for &pid in box_pids {
+        let (text_lo, text_hi) = box_text_range(pid);
+        // One /proc/<pid>/mem handle per process (threads share the address
+        // space); pread it at the frame-pointer addresses while stopped.
+        let mem = std::fs::File::open(format!("/proc/{pid}/mem")).ok();
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task"))
+            else { continue };
+        for te in tasks.flatten() {
+            let Some(tid) = te.file_name().to_str()
+                .and_then(|s| s.parse::<i32>().ok()) else { continue };
+            let addrs = unsafe {
+                if libc::ptrace(PTRACE_SEIZE as _, tid, 0, 0) < 0 { continue; }
+                let mut chain = vec![];
+                // Retry: interrupt, sample RIP; if it's in the sud dispatcher
+                // (outside the engine text) let it run and try again, up to a
+                // bound. Catches a syscall-heavy spin in its brief brush-code
+                // window between traps.
+                for attempt in 0..24 {
+                    libc::ptrace(PTRACE_INTERRUPT as _, tid, 0, 0);
+                    let mut status = 0i32;
+                    if libc::waitpid(tid, &mut status, WALL) < 0 { break; }
+                    let mut regs: libc::user_regs_struct = std::mem::zeroed();
+                    let mut iov = libc::iovec {
+                        iov_base: (&mut regs as *mut libc::user_regs_struct)
+                            .cast(),
+                        iov_len: std::mem::size_of::<libc::user_regs_struct>(),
+                    };
+                    if libc::ptrace(PTRACE_GETREGSET as _, tid,
+                        NT_PRSTATUS as *mut libc::c_void,
+                        (&mut iov as *mut libc::iovec)
+                            .cast::<libc::c_void>()) < 0 { break; }
+                    let (rip, mut fp) = (regs.rip, regs.rbp);
+                    let in_text = text_hi > text_lo
+                        && rip >= text_lo && rip < text_hi;
+                    // Accept when in brush code, or on the final attempt take
+                    // whatever we have rather than nothing.
+                    if in_text || attempt == 23 {
+                        chain.push(rip);
+                        if let Some(mem) = &mem {
+                            let read_u64 = |a: u64| -> Option<u64> {
+                                let mut b = [0u8; 8];
+                                mem.read_exact_at(&mut b, a).ok()
+                                    .map(|_| u64::from_le_bytes(b))
+                            };
+                            let mut prev = fp;
+                            for _ in 0..64 {
+                                if fp == 0 || (fp & 7) != 0 || fp < prev {
+                                    break;
+                                }
+                                let (Some(saved), Some(ret)) =
+                                    (read_u64(fp), read_u64(fp + 8))
+                                    else { break };
+                                if ret == 0 { break; }
+                                chain.push(ret);
+                                if saved <= fp { break; }
+                                prev = fp;
+                                fp = saved;
+                            }
+                        }
+                        break;
+                    }
+                    // Not in brush code: resume and resample.
+                    libc::ptrace(PTRACE_CONT as _, tid, 0, 0);
+                }
+                libc::ptrace(PTRACE_DETACH as _, tid, 0, 0);
+                chain
+            };
+            if addrs.is_empty() { continue; }
+            let frames = symbolize_addrs(exe.as_deref(), &addrs);
+            if !frames.is_empty() { out.insert(tid, frames); }
+        }
     }
     out
 }
@@ -1982,6 +2109,14 @@ macro_rules! ui_verbs {
                         bt_map.retain(|_, v| !v.is_empty());
                         // Self-unwind wins for any thread it localized.
                         for (tid, frames) in selfbt_backtraces(rp, &box_pids) {
+                            if !frames.is_empty() { bt_map.insert(tid, frames); }
+                        }
+                        // Ptrace path wins over both: it works for ANY thread
+                        // state and the sud-wrapper/foreign frames the in-box
+                        // signal handler can't reach (sud masks signals in its
+                        // dispatcher). This is what localizes a syscall-heavy
+                        // spin — the common real wedge.
+                        for (tid, frames) in ptrace_backtraces(&box_pids) {
                             if !frames.is_empty() { bt_map.insert(tid, frames); }
                         }
                         let mut threads = vec![];
