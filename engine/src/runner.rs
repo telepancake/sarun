@@ -1173,50 +1173,72 @@ fn sud_shadow_rules(sc: &mut Command, upper: &str, exe: &str)
     // rules are capped and truncation is LOUD.
     const SHADOW_RULE_CAP: usize = 40;
     let (sh, mk, nj) = crate::overlay::shadow_glob_strings();
-    let mut targets: Vec<String> = vec![];
+    // Split shadow patterns into literals and globs. A LITERAL path becomes a
+    // concrete `remap:` rule (verbatim — present on the host or not). A GLOB is
+    // handed to the wrapper as a `redirect:pathglob:` cmd-rewrite rule that
+    // tests the pattern against the ONE path being exec'd, at execve time,
+    // exactly as FUSE does. The old code instead ran `glob::glob(pat)` — an
+    // unbounded, symlink-following FILESYSTEM WALK to enumerate matches, which
+    // wedged box STARTUP (before the child ran) whenever a pattern's `**`
+    // reached a symlink loop or a huge tree. There is no reason to read a
+    // single directory to shadow a command: either the exec path matches the
+    // glob or it does not.
+    let mut literals: Vec<String> = vec![];
+    let mut globs: Vec<String> = vec![];
     for pat in sh.iter().chain(mk.iter()).chain(nj.iter()) {
         if !pat.starts_with('/') {
             continue; // the FUSE loader already warned about these
         }
-        if pat.contains(['*', '?', '[']) {
-            if let Ok(hits) = glob::glob(pat) {
-                for h in hits.flatten() {
-                    if h.is_file() {
-                        targets.push(h.to_string_lossy().into_owned());
-                    }
-                }
-            }
-        } else {
-            targets.push(pat.clone());
-        }
+        if pat.contains(['*', '?', '[']) { globs.push(pat.clone()); }
+        else { literals.push(pat.clone()); }
     }
-    targets.sort();
-    targets.dedup();
-    let mut n = 0usize;
-    for t in &targets {
-        let Some(base) = Path::new(t).file_name().and_then(|s| s.to_str())
-        else { continue };
-        if !matches!(base, "sh" | "bash" | "dash" | "make" | "gmake"
-                           | "ninja") {
-            eprintln!("sarun-engine run --sud: shadow glob hit {t:?} \
-                       skipped (basename {base:?} is not a dispatched \
-                       shell/make/ninja name)");
-            continue;
-        }
-        if n == SHADOW_RULE_CAP {
-            eprintln!("sarun-engine run --sud: shadow rules capped at \
-                       {SHADOW_RULE_CAP}; remaining glob hits NOT \
-                       shadowed — narrow the shadow_*.glob patterns");
-            break;
-        }
+    // The six dispatched shim links, created once. The wrapper's redirect rule
+    // rewrites a matched exec to <shadow_dir>/<basename> only when that link
+    // exists, so a glob that happens to match a non-dispatched binary is left
+    // alone — same effect as the old basename filter, without the walk.
+    let ensure_link = |base: &str| -> Result<(), String> {
         let link = shadow_dir.join(base);
         if !link.exists() {
             std::os::unix::fs::symlink(exe, &link)
                 .map_err(|e| format!("-b shadow link {}: {e}",
                                      link.display()))?;
         }
+        Ok(())
+    };
+    literals.sort();
+    literals.dedup();
+    let mut n = 0usize;
+    for t in &literals {
+        let Some(base) = Path::new(t).file_name().and_then(|s| s.to_str())
+        else { continue };
+        if !matches!(base, "sh" | "bash" | "dash" | "make" | "gmake"
+                           | "ninja") {
+            eprintln!("sarun-engine run --sud: shadow literal {t:?} \
+                       skipped (basename {base:?} is not a dispatched \
+                       shell/make/ninja name)");
+            continue;
+        }
+        if n == SHADOW_RULE_CAP {
+            eprintln!("sarun-engine run --sud: shadow rules capped at \
+                       {SHADOW_RULE_CAP}");
+            break;
+        }
+        ensure_link(base)?;
+        let link = shadow_dir.join(base);
         sc.args(["--remap-rule", &format!("remap:{t}={}", link.display())]);
         n += 1;
+    }
+    if !globs.is_empty() {
+        // Any dispatched name could be the basename a glob matches, so the
+        // shim dir needs all six links present before the rules take effect.
+        for base in ["sh", "bash", "dash", "make", "gmake", "ninja"] {
+            ensure_link(base)?;
+        }
+        let sdir = shadow_dir.to_string_lossy().into_owned();
+        for pat in &globs {
+            sc.args(["--cmd-rule",
+                     &format!("redirect:pathglob:{pat}:{sdir}")]);
+        }
     }
     Ok(())
 }

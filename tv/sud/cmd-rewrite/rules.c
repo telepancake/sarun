@@ -151,12 +151,69 @@ int sud_cmd_match_glob(const char *path, const char *glob)
     return glob_match_str(path_basename(path), glob);
 }
 
+/* Separator-aware glob over the WHOLE path.  Supports:
+ *   *    any run of non-separator bytes
+ *   **   any run INCLUDING separators (spans directories)
+ *   ?    any single non-separator byte
+ *   literals (no character classes here — shadow patterns don't use them)
+ * Recursive, like glob_match_str, but boundary-sensitive: a double-star
+ * matches across directories while a single star never crosses a
+ * separator. So a "sdk / double-star / make" pattern matches both
+ * "/sdk/a/b/make" and "/sdk/make". */
+static int path_glob_match(const char *s, const char *p)
+{
+    if (!*p) return *s == '\0';
+    if (p[0] == '*' && p[1] == '*') {
+        const char *rest = p + 2;
+        if (*rest == '/') rest++;      /* a separator after ** may match 0 dirs */
+        for (const char *t = s;; t++) {
+            if (path_glob_match(t, rest)) return 1;
+            if (!*t) return 0;
+        }
+    }
+    if (*p == '*') {
+        for (const char *t = s;; t++) {
+            if (path_glob_match(t, p + 1)) return 1;
+            if (!*t || *t == '/') return 0;   /* '*' stops at a separator */
+        }
+    }
+    if (*p == '?') {
+        if (!*s || *s == '/') return 0;
+        return path_glob_match(s + 1, p + 1);
+    }
+    if (*p == '\\' && p[1]) {
+        if (*s != p[1]) return 0;
+        return path_glob_match(s + 1, p + 2);
+    }
+    if (*s && *s == *p) return path_glob_match(s + 1, p + 1);
+    return 0;
+}
+
+int sud_cmd_match_pathglob(const char *path, const char *glob)
+{
+    if (!path || !glob) return 0;
+    /* Collapse runs of '/' in the path before matching: the exec path can
+     * arrive with a doubled leading slash ("//root/...") from absolutisation,
+     * which a single-slash pattern would miss. */
+    char norm[4096];
+    int n = 0;
+    int prev_slash = 0;
+    for (const char *p = path; *p && n < (int)sizeof(norm) - 1; p++) {
+        if (*p == '/' && prev_slash) continue;
+        prev_slash = (*p == '/');
+        norm[n++] = *p;
+    }
+    norm[n] = '\0';
+    return path_glob_match(norm, glob);
+}
+
 int sud_cmd_rule_matches(const struct sud_cmd_rule *r, const char *path)
 {
     if (!r || !path) return 0;
     switch (r->match) {
     case SUD_CMD_MATCH_BASENAME: return sud_cmd_match_basename(path, r->pattern);
     case SUD_CMD_MATCH_GLOB:     return sud_cmd_match_glob(path, r->pattern);
+    case SUD_CMD_MATCH_PATHGLOB: return sud_cmd_match_pathglob(path, r->pattern);
     case SUD_CMD_MATCH_PATH:     return sud_cmd_match_path(path, r->pattern);
     default:                     return 0;
     }
@@ -248,6 +305,8 @@ static enum sud_cmd_rule_kind parse_kind(const char *s, int *off)
         return SUD_CMD_KIND_EXEC_STRIP;
     if (len == 7  && memcmp(p, "exec-as",  7) == 0)
         return SUD_CMD_KIND_EXEC_AS;
+    if (len == 8  && memcmp(p, "redirect", 8) == 0)
+        return SUD_CMD_KIND_REDIRECT;
     *off = start;
     return SUD_CMD_KIND_INVALID;
 }
@@ -260,6 +319,7 @@ static enum sud_cmd_match_kind parse_match_kind(const char *s, int *off)
     const char *p = s + start;
     if (len == 8 && memcmp(p, "basename", 8) == 0) return SUD_CMD_MATCH_BASENAME;
     if (len == 4 && memcmp(p, "glob",     4) == 0) return SUD_CMD_MATCH_GLOB;
+    if (len == 8 && memcmp(p, "pathglob", 8) == 0) return SUD_CMD_MATCH_PATHGLOB;
     if (len == 4 && memcmp(p, "path",     4) == 0) return SUD_CMD_MATCH_PATH;
     *off = start;
     return SUD_CMD_MATCH_INVALID;
@@ -294,12 +354,14 @@ static int build_rule_name(char *buf, int buflen,
     case SUD_CMD_KIND_COMPILER_WRAP: kstr = "compiler-wrap"; break;
     case SUD_CMD_KIND_EXEC_STRIP:    kstr = "exec-strip";    break;
     case SUD_CMD_KIND_EXEC_AS:       kstr = "exec-as";       break;
+    case SUD_CMD_KIND_REDIRECT:      kstr = "redirect";      break;
     default: return -1;
     }
     const char *mstr = "?";
     switch (match) {
     case SUD_CMD_MATCH_BASENAME: mstr = "basename"; break;
     case SUD_CMD_MATCH_GLOB:     mstr = "glob";     break;
+    case SUD_CMD_MATCH_PATHGLOB: mstr = "pathglob"; break;
     case SUD_CMD_MATCH_PATH:     mstr = "path";     break;
     default: return -1;
     }
@@ -341,6 +403,7 @@ static int parse_rule(const char *s, struct sud_cmd_rule *r, char *name_out)
     if (has_more) off++;                    /* step past patched NUL */
 
     r->tool          = 0;
+    r->redirect_to   = 0;
     r->strip_default = 0;
     r->strip.singletons[0] = '\0';
     r->strip.arg_takers[0] = '\0';
@@ -352,6 +415,11 @@ static int parse_rule(const char *s, struct sud_cmd_rule *r, char *name_out)
         if (!has_more || !s[off]) return -1;
         r->tool = m + off;
         /* tool runs to end of string. */
+    } else if (r->kind == SUD_CMD_KIND_REDIRECT) {
+        /* redirect:<match>:<pattern>:<shim-dir> — the shim dir runs to
+         * end of string. */
+        if (!has_more || !s[off]) return -1;
+        r->redirect_to = m + off;
     } else if (r->kind == SUD_CMD_KIND_EXEC_STRIP) {
         if (!has_more || !s[off]) {
             /* Default flag-skip spec from the basename of the

@@ -48,6 +48,13 @@ enum sud_cmd_rule_kind {
     SUD_CMD_KIND_COMPILER_WRAP,
     SUD_CMD_KIND_EXEC_STRIP,
     SUD_CMD_KIND_EXEC_AS,
+    /* redirect: on an exec whose path matches, rewrite the exec PATH to
+     * <redirect_to>/<basename> (argv untouched, so argv[0]'s basename is
+     * preserved for the shim's sh/make/ninja dispatch). This is how the
+     * `-b` shadow works under sud WITHOUT the old glob::glob filesystem
+     * walk: the pattern is tested against the single path being exec'd,
+     * exactly as FUSE does — no enumeration, no directory reads. */
+    SUD_CMD_KIND_REDIRECT,
 };
 
 enum sud_cmd_match_kind {
@@ -55,6 +62,10 @@ enum sud_cmd_match_kind {
     SUD_CMD_MATCH_BASENAME,
     SUD_CMD_MATCH_GLOB,
     SUD_CMD_MATCH_PATH,
+    /* pathglob: a separator-aware fnmatch over the WHOLE path, where a
+     * double-star spans path separators (matches across directories).
+     * Distinct from GLOB, which matches the basename only. */
+    SUD_CMD_MATCH_PATHGLOB,
 };
 
 /* exec-strip flag-skip spec: which option words to consume after the
@@ -88,6 +99,11 @@ struct sud_cmd_rule {
 
     /* compiler-wrap: tool to prepend ("/usr/bin/ccache" etc.). */
     const char             *tool;
+
+    /* redirect: directory holding the per-basename shim links; a match
+     * rewrites the exec path to "<redirect_to>/<basename>" when that
+     * link exists. */
+    const char             *redirect_to;
 
     /* exec-strip: flag-skip spec.  `strip_default` means: use the
      * built-in spec for known wrappers (sudo, fakeroot-ng, env);
@@ -124,6 +140,7 @@ void sud_cmd_rule_add_suppression(const char *name);
 /* Match predicates — exposed for unit tests. */
 int sud_cmd_match_basename(const char *path, const char *basename);
 int sud_cmd_match_glob(const char *path, const char *glob);
+int sud_cmd_match_pathglob(const char *path, const char *glob);
 int sud_cmd_match_path(const char *path, const char *want);
 
 /* Dispatch a rule against `path` (resolved binary path) and `argv`.

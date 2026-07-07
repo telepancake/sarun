@@ -289,6 +289,39 @@ static int apply_exec_as(const struct sud_cmd_rule *r)
     return 0;
 }
 
+/* redirect: rewrite the exec PATH to "<redirect_to>/<basename>" when that
+ * shim link exists (the engine pre-creates one per dispatched sh/make/ninja
+ * name). argv is left untouched, so argv[0]'s basename still drives the
+ * shim's brush/kati/n2 dispatch. Returns -1 (leave args alone) when the
+ * basename isn't a dispatched name — i.e. no shim link — so an exec that
+ * merely lives under the pattern but isn't a shell/make/ninja runs normally. */
+static int apply_redirect(struct sud_syscall_ctx *ctx,
+                          const struct sud_cmd_rule *r,
+                          const char *path, struct bump *b)
+{
+    if (!r->redirect_to) return -1;
+    const char *bn = path;
+    for (const char *p = path; *p; p++) if (*p == '/') bn = p + 1;
+    if (!*bn) return -1;
+    char cand[PATH_MAX];
+    int n = 0;
+    for (const char *p = r->redirect_to; *p; p++) {
+        if (n >= (int)sizeof(cand) - 2) return -1;
+        cand[n++] = *p;
+    }
+    if (n == 0 || cand[n - 1] != '/') cand[n++] = '/';
+    for (const char *p = bn; *p; p++) {
+        if (n >= (int)sizeof(cand) - 1) return -1;
+        cand[n++] = *p;
+    }
+    cand[n] = '\0';
+    if (!faccessat_x(cand)) return -1;   /* no shim link -> not dispatched */
+    char *np = bump_strdup(b, cand);
+    if (!np) return -1;
+    ctx->args[0] = (long)np;
+    return 0;
+}
+
 /* ---- Pre-syscall ------------------------------------------------ */
 
 static int handle_execve(struct sud_syscall_ctx *ctx,
@@ -326,6 +359,9 @@ static int handle_execve(struct sud_syscall_ctx *ctx,
         case SUD_CMD_KIND_EXEC_AS:
             rc = apply_exec_as(r);
             break;
+        case SUD_CMD_KIND_REDIRECT:
+            rc = apply_redirect(ctx, r, path, &b);
+            break;
         default:
             continue;
         }
@@ -336,8 +372,11 @@ static int handle_execve(struct sud_syscall_ctx *ctx,
             continue;
         }
 
-        /* Auto-suppress this rule for descendants. */
-        sud_cmd_rule_add_suppression(r->name);
+        /* Auto-suppress this rule for descendants — EXCEPT redirect: a
+         * build re-execs make/sh many times down the tree and every one
+         * must be shadowed, so a redirect rule must keep firing. */
+        if (r->kind != SUD_CMD_KIND_REDIRECT)
+            sud_cmd_rule_add_suppression(r->name);
 
         /* Refresh argc/argv for any subsequent rule that wants to
          * compose: the new args may match a different rule.  In
