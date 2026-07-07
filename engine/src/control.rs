@@ -89,6 +89,28 @@ fn host_pid_from_pidfd(pidfd: i32) -> i32 {
     0
 }
 
+/// x86_64 syscall number → name, for the handful that a wedge parks in.
+/// The blocking ones are what matter (read/write/recv/…); the rest render
+/// as `sysN`. Kept tiny on purpose — this is a diagnosis aid, not strace.
+fn syscall_name(nr: i64) -> &'static str {
+    match nr {
+        0 => "read", 1 => "write", 3 => "close", 7 => "poll", 8 => "lseek",
+        17 => "pread64", 18 => "pwrite64", 22 => "pipe", 23 => "select",
+        42 => "connect", 43 => "accept", 44 => "sendto", 45 => "recvfrom",
+        46 => "sendmsg", 47 => "recvmsg", 61 => "wait4", 202 => "futex",
+        230 => "nanosleep", 232 => "epoll_wait", 270 => "pselect6",
+        271 => "ppoll", 281 => "epoll_pwait", 288 => "accept4",
+        _ => "",
+    }
+}
+
+/// True when this syscall's FIRST argument is a file descriptor — so the
+/// wedge report can resolve it to the pipe/socket/file it names.
+fn syscall_arg0_is_fd(nr: i64) -> bool {
+    matches!(nr, 0 | 1 | 3 | 8 | 17 | 18 | 42 | 43 | 44 | 45 | 46 | 47
+                 | 232 | 288)
+}
+
 /// PPid of `pid` from /proc/<pid>/status (host namespace); 0 if unreadable.
 fn ppid_of(pid: i32) -> i32 {
     let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
@@ -1715,47 +1737,135 @@ macro_rules! ui_verbs {
                                 .and_then(|i| s[i + 1..].trim().chars().next())
                                 .map(|c| c.to_string()))
                             .unwrap_or_default();
-                        let mut threads = vec![];
+                        // The box's process set (ancestry reaches the runner).
+                        let mut box_pids: Vec<i32> = vec![];
                         if let Ok(rd) = std::fs::read_dir("/proc") {
                             for ent in rd.flatten() {
                                 let Some(pid) = ent.file_name().to_str()
                                     .and_then(|s| s.parse::<i32>().ok())
                                 else { continue };
-                                // Ancestry walk (same shape derive_parent_box
-                                // uses): include the runner itself.
                                 let mut cur = pid;
-                                let mut hit = false;
                                 for _ in 0..64 {
-                                    if cur == rp { hit = true; break; }
+                                    if cur == rp { box_pids.push(pid); break; }
                                     let pp = ppid_of(cur);
                                     if pp <= 1 { break; }
                                     cur = pp;
                                 }
-                                if !hit { continue; }
-                                let Ok(tasks) = std::fs::read_dir(
-                                    format!("/proc/{pid}/task")) else { continue };
-                                for te in tasks.flatten() {
-                                    let Some(tid) = te.file_name().to_str()
+                            }
+                        }
+                        // Per-pid fd → target (readlink), plus a box-wide
+                        // pipe/socket-inode → holders map so a thread blocked
+                        // on a pipe/socket names WHO is on the other end —
+                        // turning "unix_stream_data_wait" into an actual
+                        // deadlock topology. Linux threads share the fd
+                        // table, so fds are keyed per pid, not per tid.
+                        let mut fd_tab: std::collections::HashMap<i32,
+                            std::collections::HashMap<i32, String>> =
+                            Default::default();
+                        let mut holders: std::collections::HashMap<String,
+                            Vec<i32>> = Default::default();
+                        for &pid in &box_pids {
+                            let mut t = std::collections::HashMap::new();
+                            if let Ok(fds) = std::fs::read_dir(
+                                format!("/proc/{pid}/fd")) {
+                                for fe in fds.flatten() {
+                                    let Some(n) = fe.file_name().to_str()
                                         .and_then(|s| s.parse::<i32>().ok())
                                     else { continue };
-                                    let base = format!("/proc/{pid}/task/{tid}");
-                                    let rd1 = |f: &str| std::fs::read_to_string(
-                                        format!("{base}/{f}"))
-                                        .unwrap_or_default().trim().to_string();
-                                    let comm = rd1("comm");
-                                    let wchan = rd1("wchan");
-                                    // /proc/.../syscall: first token = nr
-                                    // (-1 = not in a syscall, "running").
-                                    let sysc = rd1("syscall")
-                                        .split_whitespace().next()
-                                        .unwrap_or("").to_string();
-                                    let state = state_of(&format!("{base}/stat"));
-                                    threads.push(json!({
-                                        "pid": pid, "tid": tid, "comm": comm,
-                                        "state": state, "wchan": wchan,
-                                        "syscall": sysc,
-                                    }));
+                                    if let Ok(tgt) = std::fs::read_link(fe.path()) {
+                                        let tgt = tgt.to_string_lossy()
+                                            .into_owned();
+                                        if tgt.starts_with("pipe:")
+                                            || tgt.starts_with("socket:") {
+                                            holders.entry(tgt.clone())
+                                                .or_default().push(pid);
+                                        }
+                                        t.insert(n, tgt);
+                                    }
                                 }
+                            }
+                            fd_tab.insert(pid, t);
+                        }
+                        let mut threads = vec![];
+                        for &pid in &box_pids {
+                            let Ok(tasks) = std::fs::read_dir(
+                                format!("/proc/{pid}/task")) else { continue };
+                            for te in tasks.flatten() {
+                                let Some(tid) = te.file_name().to_str()
+                                    .and_then(|s| s.parse::<i32>().ok())
+                                else { continue };
+                                let base = format!("/proc/{pid}/task/{tid}");
+                                let rd1 = |f: &str| std::fs::read_to_string(
+                                    format!("{base}/{f}"))
+                                    .unwrap_or_default().trim().to_string();
+                                let comm = rd1("comm");
+                                let wchan = rd1("wchan");
+                                let state = state_of(&format!("{base}/stat"));
+                                // /proc/.../syscall: "nr arg0 arg1 … sp pc"
+                                // (nr decimal, args hex), or "running"/"-1".
+                                let raw = rd1("syscall");
+                                let toks: Vec<&str> = raw.split_whitespace()
+                                    .collect();
+                                let nr = toks.first().and_then(|t|
+                                    t.parse::<i64>().ok());
+                                // Decode the syscall + resolve its fd arg to
+                                // the pipe/socket/file it names, then name the
+                                // peer holding the other end. This is the join
+                                // that makes wchan actionable.
+                                let detail = match nr {
+                                    Some(nr) if nr >= 0 => {
+                                        let name = syscall_name(nr);
+                                        let name = if name.is_empty() {
+                                            format!("sys{nr}")
+                                        } else { name.to_string() };
+                                        if syscall_arg0_is_fd(nr) {
+                                            let fd = toks.get(1)
+                                                .and_then(|h| i64::from_str_radix(
+                                                    h.trim_start_matches("0x"),
+                                                    16).ok());
+                                            match fd {
+                                                Some(fd) => {
+                                                    let tgt = fd_tab.get(&pid)
+                                                        .and_then(|t| t.get(
+                                                            &(fd as i32)))
+                                                        .cloned()
+                                                        .unwrap_or_else(||
+                                                            "?".into());
+                                                    let mut d = format!(
+                                                        "{name}(fd {fd} → {tgt})");
+                                                    if let Some(h) = holders
+                                                        .get(&tgt) {
+                                                        let peers: Vec<String> =
+                                                            h.iter()
+                                                             .filter(|p| **p != pid)
+                                                             .map(|p| p.to_string())
+                                                             .collect();
+                                                        if !peers.is_empty() {
+                                                            d.push_str(
+                                                                &format!("  peer pid {}",
+                                                                    peers.join(",")));
+                                                        }
+                                                    }
+                                                    d
+                                                }
+                                                None => format!("{name}()"),
+                                            }
+                                        } else { format!("{name}()") }
+                                    }
+                                    // "running"/-1: on-CPU, no syscall — fall
+                                    // back to the kernel wait channel (which is
+                                    // "0"/empty when truly on-CPU).
+                                    _ => if wchan.is_empty() || wchan == "0" {
+                                        "running".into()
+                                    } else { wchan.clone() },
+                                };
+                                threads.push(json!({
+                                    "pid": pid, "tid": tid, "comm": comm,
+                                    "state": state, "wchan": wchan,
+                                    "syscall": toks.first().copied()
+                                        .unwrap_or("").to_string(),
+                                    "detail": detail,
+                                }));
                             }
                         }
                         // Blocked threads first (a wedge is a thread NOT
@@ -3894,16 +4004,16 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                     let empty = vec![];
                     let procs = r.get("procs").and_then(Value::as_array)
                         .unwrap_or(&empty);
-                    println!("{:>7} {:>7} {:>2} {:>20} {:>8}  {}",
-                             "PID", "TID", "ST", "WCHAN", "SYSCALL", "COMM");
+                    println!("{:>7} {:>7} {:>2} {:<16} {}",
+                             "PID", "TID", "ST", "COMM", "BLOCKED-ON");
                     for p in procs {
                         let g = |k: &str| p.get(k).and_then(Value::as_str)
                             .unwrap_or("").to_string();
                         let n = |k: &str| p.get(k).and_then(Value::as_i64)
                             .unwrap_or(0);
-                        println!("{:>7} {:>7} {:>2} {:>20} {:>8}  {}",
-                                 n("pid"), n("tid"), g("state"), g("wchan"),
-                                 g("syscall"), g("comm"));
+                        println!("{:>7} {:>7} {:>2} {:<16} {}",
+                                 n("pid"), n("tid"), g("state"), g("comm"),
+                                 g("detail"));
                     }
                     if procs.is_empty() {
                         println!("(no live threads — the box's tree has \

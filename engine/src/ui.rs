@@ -4506,25 +4506,27 @@ impl App {
                 let procs = r.get("procs").and_then(Value::as_array)
                     .unwrap_or(&empty);
                 let mut lines = vec![format!(
-                    "{:>7} {:>7} {:>2} {:>20} {:>8}  {}",
-                    "PID", "TID", "ST", "WCHAN", "SYSCALL", "COMM")];
+                    "{:>7} {:>7} {:>2} {:<16} {}",
+                    "PID", "TID", "ST", "COMM", "BLOCKED-ON")];
                 for p in procs {
                     let g = |k: &str| p.get(k).and_then(Value::as_str)
                         .unwrap_or("").to_string();
                     let n = |k: &str| p.get(k).and_then(Value::as_i64)
                         .unwrap_or(0);
                     lines.push(format!(
-                        "{:>7} {:>7} {:>2} {:>20} {:>8}  {}",
-                        n("pid"), n("tid"), g("state"), g("wchan"),
-                        g("syscall"), g("comm")));
+                        "{:>7} {:>7} {:>2} {:<16} {}",
+                        n("pid"), n("tid"), g("state"), g("comm"),
+                        g("detail")));
                 }
                 if procs.is_empty() {
                     lines.push("(no live threads — the tree exited; \
                                 the runner may be stuck in teardown)".into());
                 }
                 lines.push(String::new());
-                lines.push("R + wchan '-' = userspace spin · S = sleeping \
-                            in the named wait channel".into());
+                lines.push("BLOCKED-ON = current syscall + the fd it names + \
+                            the peer pid holding the other end.".into());
+                lines.push("A deadlock reads as: X blocked read(fd→pipe/sock) \
+                            whose peer is itself blocked.".into());
                 self.modal = Some(Modal::Report {
                     title: format!(" stuck · box {sid} "),
                     lines,

@@ -300,3 +300,15 @@ uu_whoami                = { path = "vendor/uu_whoami" }
 # 0.9.0 copy pulled in by vendored findutils is a different version and stays on
 # the registry, unaffected (a [patch] only matches the version it provides).
 uucore                   = { path = "vendor/uucore" }
+
+# Release binary keeps line-table debug info (strip=false, debug=1) so a
+# wedged box is DEBUGGABLE — gdb/addr2line resolve real file:line frames
+# instead of `?? ()`. This is the enabling half of the `stuck` wedge
+# diagnosis: wchan + fd topology (from /proc, always available) plus a
+# symbolized backtrace when you attach. line-tables-only keeps the size
+# growth modest and does NOT affect the fully-static musl linkage
+# (prototype/test_musl_rs.py still passes). Not `debug=2` — locals aren't
+# worth the bloat for a first cut.
+[profile.release]
+strip = false
+debug = "line-tables-only"
