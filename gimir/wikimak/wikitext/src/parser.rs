@@ -1590,8 +1590,14 @@ fn match_open(s: &str, pos: usize, name: &str) -> Option<usize> {
         return None;
     }
     let after_lt = &rest[1..];
-    if after_lt.len() < name.len() || !after_lt[..name.len()].eq_ignore_ascii_case(name) {
-        return None;
+    // Byte compare, not `after_lt[..name.len()]`: `name` is ASCII but
+    // `after_lt` can have a multibyte char straddling that offset, and a
+    // str-slice on a non-char-boundary panics — aborting the whole render
+    // on any `<` near a non-ASCII char. `get` + byte compare is
+    // boundary-safe.
+    match after_lt.as_bytes().get(..name.len()) {
+        Some(head) if head.eq_ignore_ascii_case(name.as_bytes()) => {}
+        _ => return None,
     }
     match after_lt.as_bytes().get(name.len()).copied() {
         Some(c) if c.is_ascii_whitespace() || c == b'>' || c == b'/' => {}
@@ -1615,8 +1621,11 @@ fn match_ext_tag<'b>(s: &'b str, pos: usize, name: &str) -> Option<(&'b str, boo
         return None;
     }
     let after_lt = &rest[1..];
-    if after_lt.len() < name.len() || !after_lt[..name.len()].eq_ignore_ascii_case(name) {
-        return None;
+    // Boundary-safe byte compare (see match_open): a str-slice at
+    // `name.len()` panics when a multibyte char straddles the offset.
+    match after_lt.as_bytes().get(..name.len()) {
+        Some(head) if head.eq_ignore_ascii_case(name.as_bytes()) => {}
+        _ => return None,
     }
     match after_lt.as_bytes().get(name.len()).copied() {
         Some(c) if c.is_ascii_whitespace() || c == b'/' || c == b'>' => {}
@@ -1666,10 +1675,21 @@ fn ref_attrs(attrs: &str) -> (String, String) {
 /// `</name>` (case-insensitive). Returns (inner, index-past-close); with
 /// no close, consumes to end of string.
 fn read_to_close<'b>(s: &'b str, after: usize, name: &str) -> (&'b str, usize) {
+    // `</` + an ASCII tag name; search bytes case-insensitively. Indexing
+    // `s` with a `to_lowercase()` offset was wrong whenever the body held
+    // a case-length-changing char (İ→i̇, ẞ→ß, …): the offset no longer
+    // aligned with the original bytes, corrupting the slice or panicking.
+    // `rel` here indexes the start of `</` (ASCII), so `after + rel` is a
+    // valid char boundary.
     let needle = format!("</{}", name);
-    let hay = &s[after..];
-    let low = hay.to_lowercase();
-    if let Some(rel) = low.find(&needle) {
+    let nb = needle.as_bytes();
+    let hay = s[after..].as_bytes();
+    let rel = if hay.len() >= nb.len() {
+        (0..=hay.len() - nb.len()).find(|&i| hay[i..i + nb.len()].eq_ignore_ascii_case(nb))
+    } else {
+        None
+    };
+    if let Some(rel) = rel {
         let inner = &s[after..after + rel];
         let close_gt = s[after + rel..].find('>').map(|g| after + rel + g + 1);
         (inner, close_gt.unwrap_or(s.len()))
