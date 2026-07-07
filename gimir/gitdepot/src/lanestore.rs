@@ -349,15 +349,20 @@ impl LaneStore {
                     )));
                 }
                 // Evict lanes that die at i BEFORE this revision's state is
-                // built (variant path only — see above). The eviction shows
-                // up in `cur` as a tombstone in the reverse delta at i (the
-                // lane child is dropped); walking back re-adds it, so a
-                // commit on the dead lane at r < i still reconstructs exactly.
-                if variant_cutoff.is_some() {
-                    for &dead in &dying_at[i] {
-                        full_combined.children.remove(&lane_key(dead));
-                        lane_blob_sets.remove(&dead);
-                    }
+                // built — the model's live-lane semantics, on BOTH paths, so
+                // RAM is O(peak live lanes × tree), not O(total lanes ever
+                // born × tree). The eviction shows up in `cur` as a tombstone
+                // in the reverse delta at i (the dead lane's child is
+                // dropped); walking back re-adds it, so a commit on the dead
+                // lane at r < i still reconstructs exactly. A merge revision
+                // thus touches two lane prefixes — the mainline it advances
+                // and the second-parent lane it tombstones — which is correct
+                // ("minimize the frame-to-frame diff": the dead lane really
+                // did leave the state), not the strict one-lane-per-record
+                // shape the roundtrip test used to assert.
+                for &dead in &dying_at[i] {
+                    full_combined.children.remove(&lane_key(dead));
+                    lane_blob_sets.remove(&dead);
                 }
                 let child = Arc::new(view.clone());
                 full_combined.children.insert(lane_key(lane_of[i]), child.clone());
