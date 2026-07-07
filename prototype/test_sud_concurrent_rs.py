@@ -113,6 +113,38 @@ cnt=$(ls x | grep -c '^f'); [ "$cnt" = 300 ] || echo "FINAL-COUNT $cnt" >> error
 if [ -s errors ]; then echo "VIS-ERRORS"; sort errors | uniq -c | head; else echo VIS-ALLOK; fi
 '''
 
+# The box's /tmp is a SEPARATE hand-rolled in-memory fs (inramfs), and the rest
+# is the copy-on-write overlay — different code, different bugs. This exercises
+# inramfs semantics directly AND the overlay<->inramfs boundary (rename/cp both
+# directions), plus inramfs under 6-reader concurrency. Builds live in /tmp
+# (TMPDIR / configure / compilers), so this path is not optional.
+INRAMFS_WORKLOAD = r'''
+set -u
+P(){ echo "PASS $1"; }
+F(){ echo "FAIL $1 :: $2"; }
+D=/tmp/ir; rm -rf $D; mkdir -p $D; cd $D
+printf 'abcdef' > t; truncate -s 3 t; [ "$(cat t)" = abc ] && P ir-trunc || F ir-trunc "$(cat t)"
+echo AAA > rx; echo BBB > ry; mv ry rx; [ "$(cat rx)" = BBB ] && [ ! -e ry ] && P ir-rename-over || F ir-rename-over "$(cat rx)"
+( exec 7>uf; echo LIVE>&7; rm uf; [ -e uf ]&&{ echo "FAIL ir-unlink-name::listed";exit;}; echo M>&7; exec 7>&-; echo "PASS ir-unlink-fd-write")
+printf HELD>uf2; exec 8<uf2; rm uf2; r=$(cat<&8); exec 8<&-; [ "$r" = HELD ] && P ir-unlink-fd-read || F ir-unlink-fd-read "[$r]"
+chmod 741 rx; [ "$(stat -c%a rx)" = 741 ] && P ir-chmod || F ir-chmod "$(stat -c%a rx)"
+mkdir sub; echo z>sub/f; ls sub|grep -q '^f$' && P ir-readdir || F ir-readdir "[$(ls sub)]"
+mkdir -p /root/w/bnd
+echo FROMIR > $D/x1; mv $D/x1 /root/w/bnd/x1; [ "$(cat /root/w/bnd/x1)" = FROMIR ] && [ ! -e $D/x1 ] && P bnd-ir-to-overlay || F bnd-ir-to-overlay "$(cat /root/w/bnd/x1 2>&1)"
+echo FROMOV > /root/w/bnd/x2; mv /root/w/bnd/x2 $D/x2; [ "$(cat $D/x2)" = FROMOV ] && [ ! -e /root/w/bnd/x2 ] && P bnd-overlay-to-ir || F bnd-overlay-to-ir "$(cat $D/x2 2>&1)"
+cp /root/w/bnd/x1 $D/cp1 2>/dev/null && [ "$(cat $D/cp1)" = FROMIR ] && P bnd-cp-overlay-to-ir || F bnd-cp "$(cat $D/cp1 2>&1)"
+cd $D; : > errors; mkdir -p cc ctmp
+( for i in $(seq 1 300); do echo "v$i">ctmp/$i; mv ctmp/$i cc/f$i; done; : > cc/.done ) &
+for r in 1 2 3 4 5 6; do
+ ( while [ ! -e cc/.done ]; do for f in cc/f*; do [ "$f" = 'cc/f*' ]&&continue; if ! v=$(cat "$f" 2>/dev/null); then echo "READFAIL $f">>errors; elif [ -z "$v" ]; then echo "EMPTY $f">>errors; fi; done; done ) &
+done
+wait
+for i in $(seq 1 300); do [ -r cc/f$i ] || echo "MISSING cc/f$i">>errors; done
+c=$(ls cc|grep -c '^f'); [ "$c" = 300 ]||echo "COUNT $c">>errors
+[ -s errors ] && { echo "IR-CONC-FAIL"; sort errors|uniq -c|head; } || echo IR-CONC-ALLOK
+echo INRAMFS-DONE
+'''
+
 # --- workloads (run inside the box, self-checking) ------------------------
 
 # N background workers each create M files (via tmp+rename) in ONE shared dir,
@@ -219,6 +251,22 @@ def main():
         check("SEMANTICS-DONE" in r.stdout,
               f"semantics workload ran to completion "
               f"(out={r.stdout.strip()[-200:]!r})")
+
+        # inramfs (/tmp) semantics + overlay<->inramfs boundary + inramfs
+        # concurrency — a distinct code path from the overlay above.
+        fresh()
+        r = box.run("IR", INRAMFS_WORKLOAD)
+        for line in r.stdout.splitlines():
+            if line.startswith("PASS "):
+                check(True, "inramfs: " + line[5:])
+            elif line.startswith("FAIL "):
+                check(False, "inramfs: " + line[5:])
+        check("IR-CONC-ALLOK" in r.stdout,
+              f"inramfs concurrent visibility (6 readers, 300 files in /tmp) "
+              f"(out={r.stdout.strip()[-160:]!r})")
+        check("INRAMFS-DONE" in r.stdout,
+              f"inramfs workload ran to completion "
+              f"(out={r.stdout.strip()[-160:]!r})")
 
         # Concurrency — a race that fires 1-in-K only shows with repetition.
         for rnd in range(4):
