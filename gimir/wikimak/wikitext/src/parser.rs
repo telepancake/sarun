@@ -1906,7 +1906,10 @@ fn split_multi(s: &str, seps: &[&str]) -> Vec<String> {
                 continue;
             }
         }
-        i += 1;
+        // Advance a whole UTF-8 char, not a byte: the `[]{}` arms above are
+        // ASCII, but a bare multibyte char (an en-dash in "e2–e4") walked one
+        // byte at a time would land `s[i..]` mid-char and panic.
+        i += html::utf8_len(b[i]);
     }
     parts.push(s[start..].to_string());
     parts

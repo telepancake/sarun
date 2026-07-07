@@ -12,3 +12,13 @@ thiserror = { workspace = true }
 # the network (tests/parsertests.rs). Same blocking client as the livewiki
 # tests; the floored core-subset test is fully offline.
 reqwest = { workspace = true }
+# The real-page straightedge (tests/corpus.rs) renders captured Wikipedia
+# pages through the FULL pipeline and diffs against their reader HTML.
+# scribunto + media are wired as the invoker/resolver — a dev-dependency
+# cycle (both depend on this crate), which Cargo permits for dev-deps only.
+# flate2 reads the gzip'd fixture bundles; serde_json parses them.
+wikimak-scribunto = { workspace = true }
+wikimak-media = { workspace = true }
+flate2 = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }

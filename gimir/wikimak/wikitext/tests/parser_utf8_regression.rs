@@ -53,3 +53,12 @@ fn ref_body_many_case_changing_chars() {
     assert!(out.contains("B"), "trailing text after </ref> must survive: {out}");
     assert!(!out.contains("İ</ref"), "close tag must not be swallowed: {out}");
 }
+
+/// A multibyte char (en-dash) inside an inline table cell must not panic the
+/// separator splitter (`split_multi` walked bytes, then sliced `s[i..]`
+/// mid-char). Found by the real-page corpus straightedge on de:Schach.
+#[test]
+fn inline_table_cell_with_endash_does_not_panic() {
+    let out = render_wikitext("{|\n! a !! e2–e4 || Bauer zieht von e2 nach e4\n|}");
+    assert!(out.contains("e2–e4"), "en-dash cell must render: {out}");
+}
