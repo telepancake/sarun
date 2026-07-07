@@ -45,7 +45,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use depot::{codec, View};
-use wikimak_depot::{Depot, DepotConfig, FrameDecoder, FrameEncoder};
+use wikimak_depot::{
+    compress_frame, decompress_frame, Depot, DepotConfig, FrameDecoder, FrameEncoder,
+};
 
 use crate::lanes::{assign_lanes, cluster_variants, LaneId};
 use crate::{Error, Result};
@@ -84,20 +86,37 @@ fn decode_lane_key(key: &[u8]) -> Result<LaneId> {
     Ok(LaneId::from_be_bytes(a))
 }
 
-/// Collect the git blob oids (hex) of every non-gitlink leaf under a full
-/// subtree View — the pure oid set the variant metric clusters on. A
-/// gitlink (mode 160000) is a commit pointer, not a blob, so it is
-/// excluded.
-fn collect_blob_oids(view: &View, out: &mut HashSet<Vec<u8>>) {
-    if let Some(blob) = &view.blob {
-        let gitlink = view.attrs.get(&b"mode"[..]).map(|m| m.as_slice() == b"160000").unwrap_or(false);
-        if !gitlink {
-            out.insert(crate::git_obj_oid("blob", blob).into_bytes());
-        }
-    }
-    for child in view.children.values() {
-        collect_blob_oids(child, out);
-    }
+/// Raw (uncompressed) f1 accumulator seal point for the combined-state
+/// chain — the SAME discipline (and the SAME test override) the shipped
+/// TREES store uses in `store.rs`. When absorbing a batch would push the
+/// accumulator past this, the old f1 retires verbatim to cold rather than
+/// being recompressed, so no prepend ever recompresses a huge frame and
+/// the in-RAM record buffer stays bounded to one batch. Test-overridable
+/// via `GITDEPOT_TEST_SEAL` (bytes).
+const SEAL_THRESHOLD: u64 = 256 * 1024;
+
+fn seal_threshold() -> u64 {
+    std::env::var("GITDEPOT_TEST_SEAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SEAL_THRESHOLD)
+}
+
+/// In-RAM reverse-delta buffer bound: a batch is prepended (one depot
+/// prepend, one new full-state f0) once its records reach this many
+/// bytes. Decoupled from — and much larger than — the seal threshold on
+/// purpose: each prepend rewrites the whole-combined-state f0, so FEW big
+/// batches (not thousands of tiny ones) keeps both the f0-rewrite cost and
+/// the transient dead-frame footprint down, while the buffer itself stays
+/// far under any memory concern. Test-overridable via `GITDEPOT_TEST_BATCH`
+/// so a small fixture can force many batches (multi-cold-frame coverage).
+const BATCH_RAM_BOUND: u64 = 32 << 20;
+
+fn batch_ram_bound() -> u64 {
+    std::env::var("GITDEPOT_TEST_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BATCH_RAM_BOUND)
 }
 
 /// Rewrite a FULL combined state (every lane child its own full subtree)
@@ -125,18 +144,13 @@ fn collect_blob_oids(view: &View, out: &mut HashSet<Vec<u8>>) {
 /// lanes are emitted; a dead lane is absent from this revision's stored
 /// state (its states stay reconstructable at the earlier revisions it was
 /// live — dying removes it from the live set, not from the chain).
-fn build_stored(full: &View, live: &[LaneId], cutoff: f64) -> Result<View> {
-    let mut blob_sets: HashMap<LaneId, HashSet<Vec<u8>>> = HashMap::new();
-    for &lane in live {
-        let child = full
-            .children
-            .get(&lane_key(lane))
-            .ok_or_else(|| Error::Chain(format!("live lane {lane} missing from combined")))?;
-        let mut set = HashSet::new();
-        collect_blob_oids(child, &mut set);
-        blob_sets.insert(lane, set);
-    }
-    let groups = cluster_variants(live, &blob_sets, cutoff);
+fn build_stored(
+    full: &View,
+    live: &[LaneId],
+    blob_sets: &HashMap<LaneId, HashSet<Vec<u8>>>,
+    cutoff: f64,
+) -> Result<View> {
+    let groups = cluster_variants(live, blob_sets, cutoff);
     let mut stored = View::default();
     for g in &groups {
         let base_key = lane_key(g.base);
@@ -285,31 +299,48 @@ impl LaneStore {
             }
         }
 
-        // Build combined states forward, emitting the newest full record
-        // and the reverse deltas (record j rebuilds combined[j] from
-        // combined[j+1]). Per-commit tree Views are built the SCALABLE
-        // way — the shipped importer's `frontier_walk`: each commit's
-        // `View` is its first parent's frontier view + `delta_layer`
-        // (Arc-shared, O(delta)), streamed in `dag.order` (== `sha_of`),
-        // NOT rebuilt whole-tree per commit. The variant/lockstep/
-        // base-switching lane encoding below is unchanged; only the
-        // source of each revision's View moved to the streaming frontier.
+        // Lanes that DIE at revision i (absorbed as a non-first parent of
+        // the merge at i) — evicted from the RAM combined state at i so it
+        // carries only the lanes LIVE at i (the model's live-lane
+        // semantics). `death[l] < n_rev` ⇒ the lane merges; a never-merged
+        // lane stays to the end and is never evicted.
+        let mut dying_at: Vec<Vec<LaneId>> = vec![Vec::new(); n_rev + 1];
+        for l in 0..death.len() {
+            if death[l] < n_rev {
+                dying_at[death[l]].push(l as LaneId);
+            }
+        }
+
+        // Build combined states forward and SEAL them into the chain as the
+        // chain grows (the TREES store's tiered prepend / FrameEncoder +
+        // seal discipline — `seal_prepend`), so at most one batch's worth of
+        // reverse-delta records is ever buffered in RAM. Per-commit tree
+        // Views come from the shipped importer's `frontier_walk` (each View
+        // is its first parent's frontier + `delta_layer`, Arc-shared,
+        // O(delta), streamed in `dag.order`).
         //
-        // `full_combined` carries every live lane as its own full subtree
-        // (the increment-1 shape); `cur` is what actually lands in the
-        // frame — identical to `full_combined` on the non-variant path, or
+        // `full_combined` carries only the LIVE lanes as their own full
+        // subtrees: it inserts the advanced lane at i and EVICTS lanes that
+        // die at i (variant path), so RAM is O(peak_live_lanes × tree), not
+        // O(total_lanes × tree). `cur` is what lands in the frame —
+        // `full_combined` itself on the non-variant path (which keeps the
+        // one-lane-per-record lockstep invariant, so it does NOT evict), or
         // the variant-delta rewrite when a cutoff is set.
+        let depot = open_depot(dir)?;
+        let batch_bound = batch_ram_bound();
         let mut full_combined = View::default();
+        let mut lane_blob_sets: HashMap<LaneId, HashSet<Vec<u8>>> = HashMap::new();
         let mut prev: Option<View> = None;
-        let mut reverse: Vec<Vec<u8>> = Vec::new(); // reverse[j], j = 0..n_rev-2
-        let mut newest_full: Vec<u8> = Vec::new();
+        let mut batch: Vec<Vec<u8>> = Vec::new(); // reverse records, forward order
+        let mut batch_bytes: u64 = 0;
         let mut expect = 0usize;
         crate::frontier_walk(
             repo,
             &dag,
             Vec::new(),
             &Default::default(),
-            &mut |cm, _tree_oid, view, _cat| {
+            variant_cutoff.is_some(),
+            &mut |cm, _tree_oid, view, oids, _cat| {
                 let i = expect;
                 if i >= n_rev || cm.sha != sha_of[i] {
                     return Err(Error::Chain(format!(
@@ -317,11 +348,29 @@ impl LaneStore {
                         cm.sha
                     )));
                 }
-                full_combined
-                    .children
-                    .insert(lane_key(lane_of[i]), Arc::new(view.clone()));
+                // Evict lanes that die at i BEFORE this revision's state is
+                // built (variant path only — see above). The eviction shows
+                // up in `cur` as a tombstone in the reverse delta at i (the
+                // lane child is dropped); walking back re-adds it, so a
+                // commit on the dead lane at r < i still reconstructs exactly.
+                if variant_cutoff.is_some() {
+                    for &dead in &dying_at[i] {
+                        full_combined.children.remove(&lane_key(dead));
+                        lane_blob_sets.remove(&dead);
+                    }
+                }
+                let child = Arc::new(view.clone());
+                full_combined.children.insert(lane_key(lane_of[i]), child.clone());
                 let cur = match variant_cutoff {
                     Some(c) => {
+                        // The frontier maintained this commit's git-oid set
+                        // as its first parent's set + this commit's changes
+                        // (zero hashing). It IS the advanced lane's blob-oid
+                        // set this revision; every other live lane keeps its
+                        // cached set. `oids` is a multiset (count per oid) —
+                        // its live KEYS are the set the metric clusters on.
+                        let set: HashSet<Vec<u8>> = oids.keys().cloned().collect();
+                        lane_blob_sets.insert(lane_of[i], set);
                         // Lanes live at revision i: born and not yet merged
                         // away (birth ≤ i < death). A merged-away base drops
                         // out here, so clustering reframes onto a surviving
@@ -331,18 +380,37 @@ impl LaneStore {
                         let live: Vec<LaneId> = (0..death.len() as LaneId)
                             .filter(|&l| birth[l as usize] <= i && i < death[l as usize])
                             .collect();
-                        build_stored(&full_combined, &live, c)?
+                        build_stored(&full_combined, &live, &lane_blob_sets, c)?
                     }
                     None => full_combined.clone(),
                 };
-                if let Some(p) = &prev {
-                    // Rebuilds combined[i-1] from combined[i].
-                    reverse.push(codec::encode(&depot::diff(Some(&cur), Some(p))));
-                }
-                if i == n_rev - 1 {
-                    newest_full = codec::encode(&depot::diff(None, Some(&cur)));
+                if i == 0 {
+                    // Seed the chain's f0 with the first full state; the
+                    // depot forbids f1 on a chain's first prepend.
+                    let f0raw = codec::encode(&depot::diff(None, Some(&cur)));
+                    let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
+                    depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
+                } else if let Some(p) = &prev {
+                    // Reverse delta rebuilding combined[i-1] from combined[i].
+                    let rec = codec::encode(&depot::diff(Some(&cur), Some(p)));
+                    batch_bytes += 8 + rec.len() as u64;
+                    batch.push(rec);
                 }
                 prev = Some(cur);
+                // Seal a batch once it reaches a frame's worth: `prev` is
+                // combined[i], the newest state in the batch, so its full
+                // encoding is the new f0 and the batch's reverse deltas
+                // (newest-first) become the accumulator.
+                if !batch.is_empty() && batch_bytes >= batch_bound {
+                    let head = codec::encode(&depot::diff(None, prev.as_ref()));
+                    let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
+                    seal_prepend(&depot, &head, &staged, level)?;
+                    batch_bytes = 0;
+                    // Flush now so eviction reclaims the just-superseded f0/f1
+                    // frames — bounds the encode's transient disk footprint
+                    // instead of letting dead full-state frames pile up.
+                    depot.flush().map_err(|e| cf(e.to_string()))?;
+                }
                 expect += 1;
                 Ok(())
             },
@@ -352,30 +420,14 @@ impl LaneStore {
                 "frontier walk produced {expect} of {n_rev} revisions"
             )));
         }
-
-        let depot = open_depot(dir)?;
+        // Final partial batch: its newest state (`prev` == combined[n-1])
+        // becomes the chain's f0.
+        if !batch.is_empty() {
+            let head = codec::encode(&depot::diff(None, prev.as_ref()));
+            let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
+            seal_prepend(&depot, &head, &staged, level)?;
+        }
         if n_rev > 0 {
-            // f0 = newest full record. First prepend forbids f1.
-            let f0 = wikimak_depot::compress_frame(&newest_full, None, level).map_err(cf)?;
-            depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
-
-            if !reverse.is_empty() {
-                // f1 = older records newest-first: reverse[n-2],
-                // reverse[n-3], … reverse[0]. Each u64-length-prefixed,
-                // anchored on the f0 record — the TREES frame discipline.
-                let f1_records: Vec<&[u8]> = reverse.iter().rev().map(|r| r.as_slice()).collect();
-                let total: u64 = f1_records.iter().map(|r| 8 + r.len() as u64).sum();
-                let mut enc = FrameEncoder::new(total, Some(&newest_full), level).map_err(cf)?;
-                for r in &f1_records {
-                    enc.write(&(r.len() as u64).to_le_bytes()).map_err(cf)?;
-                    enc.write(r).map_err(cf)?;
-                }
-                let f1 = enc.finish().map_err(cf)?;
-                let f0 = wikimak_depot::compress_frame(&newest_full, None, level).map_err(cf)?;
-                depot
-                    .prepend(CHAIN, &f0, Some(&f1), false)
-                    .map_err(|e| cf(e.to_string()))?;
-            }
             depot.flush().map_err(|e| cf(e.to_string()))?;
         }
 
@@ -402,6 +454,20 @@ impl LaneStore {
     /// The combined-state chain lives in `dir/depot` (reopened) and the
     /// sha→(rev,lane) and ref→sha bindings in `dir/meta.sqlite`; every
     /// commit's / ref's tree reconstructs SHA-exact from these.
+    /// Number of sealed cold frames in the combined-state chain — test
+    /// support: proves the multi-cold-frame seal path (`seal_prepend`'s
+    /// seal-old branch + the cold-frame anchor recompute in the walk) was
+    /// actually exercised, which only happens once the staged reverse
+    /// deltas cross the seal threshold more than once.
+    pub fn cold_frame_count(&self) -> Result<usize> {
+        let mut n = 0;
+        for cold in self.depot.cold_iter(CHAIN).map_err(|e| cf(e.to_string()))? {
+            cold.map_err(|e| cf(e.to_string()))?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     pub fn open(dir: &Path) -> Result<LaneStore> {
         let depot = open_depot(dir)?;
         let (n_rev, lane_of, sha_of, refs) = load_meta(dir)?;
@@ -536,17 +602,25 @@ impl LaneStore {
 
     /// Walk the combined-state chain newest-first, handing each stored
     /// record (raw codec bytes) to `visit(pos, rec)`; `visit` returns
-    /// true to stop. f0 is position 0; f1 records follow, anchored on the
-    /// f0 record.
+    /// true to stop. f0 is position 0; then the f1 records and every cold
+    /// frame's records in stored order. This is the sealed TREES chain's
+    /// walk (`store.rs::walk_tree_views`): the records are REVERSE DELTAS,
+    /// so a cold frame's zstd refPrefix is the CANONICAL FULL-VIEW BYTES
+    /// at its newest boundary — recomputed from the working view walked so
+    /// far, NOT the previous record. f1 is anchored on the f0 record (the
+    /// newest full-view bytes). The working view is reconstructed here
+    /// only to supply those boundary anchors.
     fn walk_records(
         &self,
         visit: &mut dyn FnMut(usize, &[u8]) -> Result<bool>,
     ) -> Result<()> {
         let head = match self.depot.read_f0(CHAIN) {
-            Ok(frame) => wikimak_depot::decompress_frame(&frame, None).map_err(cf)?,
+            Ok(frame) => decompress_frame(&frame, None).map_err(cf)?,
             Err(wikimak_depot::Error::NoFrame) => return Ok(()),
             Err(e) => return Err(cf(e.to_string())),
         };
+        let mut cur: Option<View> = None;
+        depot::apply_mut(&mut cur, &codec::decode(&head)?);
         let mut pos = 0usize;
         if visit(pos, &head)? {
             return Ok(());
@@ -555,9 +629,28 @@ impl LaneStore {
             let mut stopped = false;
             stream_f1_records(&f1, &head, &mut |rec| {
                 pos += 1;
+                depot::apply_mut(&mut cur, &codec::decode(rec)?);
                 stopped = visit(pos, rec)?;
                 Ok(stopped)
             })?;
+            if stopped {
+                return Ok(());
+            }
+        }
+        for cold in self.depot.cold_iter(CHAIN).map_err(|e| cf(e.to_string()))? {
+            let frame = cold.map_err(|e| cf(e.to_string()))?;
+            // Canonical full-view bytes at this frame's newest boundary.
+            let anchor = codec::encode(&depot::diff(None, cur.as_ref()));
+            let mut stopped = false;
+            stream_f1_records(&frame, &anchor, &mut |rec| {
+                pos += 1;
+                depot::apply_mut(&mut cur, &codec::decode(rec)?);
+                stopped = visit(pos, rec)?;
+                Ok(stopped)
+            })?;
+            if stopped {
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -785,6 +878,62 @@ fn stream_f1_records(
             return Ok(());
         }
     }
+}
+
+/// One incremental prepend to the combined-state chain, reusing the
+/// TREES store's seal discipline (`store.rs::prepend_batch`, the
+/// `Demote::Dropped` case): `head_record` is the new full f0; `staged`
+/// are this batch's reverse-delta records NEWEST-FIRST, whose OLDEST
+/// entry is the bridge that rebuilds the former head from the new one —
+/// so the old head is superseded and nothing else joins the accumulator.
+/// The new f1 is stream-composed (never materialized raw) from `staged`
+/// then the old f1's bytes, UNLESS absorbing the batch would push the
+/// accumulator past the seal threshold — then the old f1 retires verbatim
+/// to cold; and if the batch alone exceeds the threshold the just-written
+/// f1 is sealed immediately, so no later prepend ever recompresses a huge
+/// frame. The chain MUST already be seeded (f0 present).
+fn seal_prepend(depot: &Depot, head_record: &[u8], staged: &[Vec<u8>], level: i32) -> Result<()> {
+    let old_f1 = depot.read_f1(CHAIN).map_err(|e| cf(e.to_string()))?;
+    let old_raw_len = match &old_f1 {
+        Some(z) => zstd::zstd_safe::get_frame_content_size(z)
+            .map_err(|_| cf("zstd frame content size".into()))?
+            .ok_or_else(|| cf("zstd frame without content size".into()))?,
+        None => 0,
+    };
+    let entries_len: u64 = staged.iter().map(|r| 8 + r.len() as u64).sum();
+    let seal_old = old_f1.is_some() && old_raw_len + entries_len > seal_threshold();
+    let total_raw = entries_len + if seal_old { 0 } else { old_raw_len };
+    let mut enc = FrameEncoder::new(total_raw, Some(head_record), level).map_err(cf)?;
+    for r in staged {
+        enc.write(&(r.len() as u64).to_le_bytes()).map_err(cf)?;
+        enc.write(r).map_err(cf)?;
+    }
+    if !seal_old {
+        if let Some(z) = &old_f1 {
+            use std::io::Read as _;
+            // The old f1 was compressed against the CURRENT f0 record.
+            let old_head = decompress_frame(&depot.read_f0(CHAIN).map_err(|e| cf(e.to_string()))?, None)
+                .map_err(cf)?;
+            let mut dec = FrameDecoder::new(z, Some(&old_head)).map_err(cf)?;
+            let mut buf = vec![0u8; 128 << 10];
+            loop {
+                let n = dec.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                enc.write(&buf[..n]).map_err(cf)?;
+            }
+        }
+    }
+    let new_f1 = enc.finish().map_err(cf)?;
+    let new_f0 = compress_frame(head_record, None, level).map_err(cf)?;
+    depot
+        .prepend(CHAIN, &new_f0, Some(&new_f1), seal_old)
+        .map_err(|e| cf(e.to_string()))?;
+    if total_raw > seal_threshold() {
+        depot.seal_f1(CHAIN).map_err(|e| cf(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn open_depot(dir: &Path) -> Result<Depot> {

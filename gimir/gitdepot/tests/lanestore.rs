@@ -584,6 +584,86 @@ fn variant_roundtrip_empty_tree_variant() {
     assert_eq!(store.tree_oid_of_commit(&wipe).unwrap(), empty_oid);
 }
 
+/// Dead-lane eviction correctness FROM DISK: a branch that merges away
+/// (its metro lane DIES, so eviction drops its child from the combined
+/// state at and after the merge) must still reconstruct its PRE-death
+/// commits SHA-exact after the store is persisted and reopened without the
+/// repo. Eviction only removes a lane from RECENT states; walking the chain
+/// back to a pre-death revision re-adds it, so history stays intact.
+#[test]
+fn evicted_lane_pre_death_reconstructs_from_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("evict");
+    init(&repo);
+    // A shared payload so `topic` clusters as a variant of main while both
+    // are live (exercises eviction of a variant/base lane, not just a bare
+    // independent one).
+    write_shared(&repo);
+    write(&repo, "a.txt", "a\n");
+    commit(&repo, "base");
+    let base_tip = sh_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // `topic` develops two commits off base, then merges back into main
+    // (main is FIRST parent → topic's lane dies at the merge).
+    sh_git(&repo, &["checkout", "-q", "-b", "topic", &base_tip]);
+    write(&repo, "topic.txt", "t1\n");
+    let t1 = commit(&repo, "t1");
+    write(&repo, "topic.txt", "t2\n");
+    let t2 = commit(&repo, "t2");
+    sh_git(&repo, &["checkout", "-q", "main"]);
+    write(&repo, "a.txt", "a2\n");
+    commit(&repo, "main2");
+    sh_git(&repo, &["merge", "-q", "--no-ff", "-m", "merge topic", "topic"]);
+
+    // Capture expected trees while the repo exists.
+    let shas: Vec<String> =
+        sh_git(&repo, &["rev-list", "--branches", "--tags"]).lines().map(str::to_string).collect();
+    let want: std::collections::HashMap<String, String> = shas
+        .iter()
+        .map(|s| (s.clone(), sh_git(&repo, &["rev-parse", &format!("{s}^{{tree}}")]).trim().to_string()))
+        .collect();
+
+    // Encode with the evicting variant encoder, drop the handle, reopen
+    // from disk alone.
+    let dir = tmp.path().join("evicted-store");
+    {
+        let _ = gitdepot::lanestore::LaneStore::encode_repo_variant(&repo, &dir, 3).unwrap();
+    }
+    let store = gitdepot::lanestore::LaneStore::open(&dir).unwrap();
+
+    // The pre-death commits on the now-dead `topic` lane reconstruct exactly.
+    for sha in [&t1, &t2] {
+        assert_eq!(
+            store.tree_oid_of_commit(sha).unwrap(),
+            want[sha],
+            "pre-death commit {sha} on evicted lane"
+        );
+    }
+    // And every reachable commit round-trips from the reopened store.
+    for rev in 0..store.n_rev() {
+        let sha = store.sha_at(rev).to_string();
+        assert_eq!(store.tree_oid_at(rev).unwrap(), want[&sha], "commit {sha}");
+    }
+
+    // Eviction actually happened: the dead `topic` lane is GONE from the
+    // head combined state (its prefix is not a child), while the mainline
+    // lane it merged into is still present. Without eviction this test's
+    // reconstruction would still pass (reconstruction is exact regardless),
+    // so assert the structural fact directly.
+    let topic_lane = store.lane_of(store.rev_of(&t1).unwrap());
+    let topic_prefix = store.lane_prefix(topic_lane);
+    let head = store.combined_at(store.n_rev() - 1).unwrap();
+    assert!(
+        !head.children.contains_key(&topic_prefix),
+        "dead topic lane {topic_lane} still present in the head state — not evicted"
+    );
+    let main_lane = store.lane_of(store.n_rev() - 1); // the merge commit's lane
+    assert!(
+        head.children.contains_key(&store.lane_prefix(main_lane)),
+        "mainline lane {main_lane} missing from head state"
+    );
+}
+
 // -------------------------------------------------------- base-switching
 
 /// Write the shared payload every branch in a variant group carries: a

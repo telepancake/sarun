@@ -709,6 +709,7 @@ impl Drop for CatFile {
 struct RawChange {
     status: u8,
     new_mode: String,
+    old_oid: String,
     new_oid: String,
     path: Vec<u8>,
 }
@@ -815,7 +816,7 @@ impl LogStream {
                 ))
             })?;
             let f: Vec<&str> = meta.split(' ').collect();
-            let [_, new_mode, _, new_oid, status] = f.as_slice() else {
+            let [_, new_mode, old_oid, new_oid, status] = f.as_slice() else {
                 return Err(Error::Git(format!("diff-tree: bad meta {meta:?}")));
             };
             let path = self
@@ -824,6 +825,7 @@ impl LogStream {
             changes.push(RawChange {
                 status: status.bytes().next().unwrap_or(0),
                 new_mode: new_mode.to_string(),
+                old_oid: old_oid.to_string(),
                 new_oid: new_oid.to_string(),
                 path,
             });
@@ -1094,20 +1096,88 @@ fn walk_order(
 /// clone is O(root fanout)), so a fork costs almost nothing and N live
 /// views that diverged by k commits cost one tree + O(k·delta), not N
 /// trees — the term that OOM'd wide-frontier imports.
+/// A blob-oid MULTISET: count per git oid (hex bytes). A multiset, not a
+/// set, because the same blob oid can sit at multiple paths, so a removal
+/// (D/M of one path) must be refcounted and only drop the key when the last
+/// path holding that oid goes. This rides the frontier exactly like the
+/// views: a commit's multiset is its FIRST parent's multiset with the
+/// commit's changes applied, cloned/moved at the SAME points the view is,
+/// so fork/merge/continue inherit correct sets for free from the existing
+/// refcount logic. Empty (and never touched) when the walk's `track_oids`
+/// is false, so the shipped importer pays nothing.
+type OidSet = HashMap<Vec<u8>, u32>;
+
+/// True for git's all-zero placeholder oid (an add's old side, a delete's
+/// new side) — nothing to add or remove for it.
+fn oid_absent(oid: &str) -> bool {
+    oid.is_empty() || oid.bytes().all(|b| b == b'0')
+}
+
+fn oid_inc(set: &mut OidSet, oid: &str) {
+    if !oid_absent(oid) {
+        *set.entry(oid.as_bytes().to_vec()).or_insert(0) += 1;
+    }
+}
+
+fn oid_dec(set: &mut OidSet, oid: &str) {
+    if oid_absent(oid) {
+        return;
+    }
+    match set.get_mut(oid.as_bytes()) {
+        Some(c) => {
+            *c -= 1;
+            if *c == 0 {
+                set.remove(oid.as_bytes());
+            }
+        }
+        // Every decrement must match an earlier increment: a commit's
+        // old-side oid was, by construction, a blob in its first parent's
+        // tree and so is counted in the inherited multiset. A miss means
+        // desync — today only reachable if the walk is ever seeded with a
+        // non-empty base whose multiset wasn't seeded to match (the lane
+        // encoder seeds empty). Trip loudly in debug so that latent hole
+        // can't land silently; in release it stays a harmless no-op (the
+        // multiset only feeds clustering, never reconstruction).
+        None => debug_assert!(false, "oid_dec on absent oid {oid}: blob-oid multiset desync"),
+    }
+}
+
+/// Apply a commit's first-parent changes to its blob-oid multiset (its
+/// first parent's, already cloned/moved in). `A` adds the new oid; `D`
+/// removes the old; `M`/`T` swap old for new. Gitlinks (mode 160000) carry
+/// the pinned commit id in the same `old_oid`/`new_oid` fields, so submodule
+/// pins participate in similarity with no special-casing.
+fn apply_oids(set: &mut OidSet, changes: &[RawChange]) {
+    for ch in changes {
+        match ch.status {
+            b'A' => oid_inc(set, &ch.new_oid),
+            b'D' => oid_dec(set, &ch.old_oid),
+            _ => {
+                oid_dec(set, &ch.old_oid);
+                oid_inc(set, &ch.new_oid);
+            }
+        }
+    }
+}
+
 struct Frontier {
-    views: HashMap<String, (depot::View, u32)>,
+    views: HashMap<String, (depot::View, OidSet, u32)>,
     max: usize,
 }
 
 impl Frontier {
-    /// Take the base view for a first parent: the last remaining child
-    /// moves it out, earlier ones clone.
-    fn take(&mut self, sha: &str) -> Result<depot::View> {
+    /// Take the base view (and oid multiset) for a first parent: the last
+    /// remaining child moves them out, earlier ones clone. The multiset
+    /// rides the view — one refcount, cloned/moved together.
+    fn take(&mut self, sha: &str) -> Result<(depot::View, OidSet)> {
         match self.views.get_mut(sha) {
-            Some((_, rc)) if *rc == 1 => Ok(self.views.remove(sha).expect("present").0),
-            Some((v, rc)) => {
+            Some((_, _, rc)) if *rc == 1 => {
+                let (v, o, _) = self.views.remove(sha).expect("present");
+                Ok((v, o))
+            }
+            Some((v, o, rc)) => {
                 *rc -= 1;
-                Ok(v.clone())
+                Ok((v.clone(), o.clone()))
             }
             None => Err(Error::Git(format!(
                 "parent {sha} not in frontier (shallow clone, or a parent \
@@ -1121,9 +1191,9 @@ impl Frontier {
         self.take(sha).map(|_| ())
     }
 
-    fn insert(&mut self, sha: String, view: depot::View, rc: u32) {
+    fn insert(&mut self, sha: String, view: depot::View, oids: OidSet, rc: u32) {
         if rc > 0 {
-            self.views.insert(sha, (view, rc));
+            self.views.insert(sha, (view, oids, rc));
             self.max = self.max.max(self.views.len());
         }
     }
@@ -1255,7 +1325,7 @@ fn ingest_stream(
     mut rep: Option<&mut ReportAccum>,
     on_commit: &mut dyn FnMut(&CommitMeta) -> Result<()>,
 ) -> Result<(usize, usize)> {
-    frontier_walk(repo, dag, seeds, known, &mut |cm, tree_oid, view, cat| {
+    frontier_walk(repo, dag, seeds, known, false, &mut |cm, tree_oid, view, _oids, cat| {
         let same = same_tree_parent(cm, tree_oid, tree_oids, cat)?;
         tree_oids.insert(cm.sha.clone(), tree_oid.to_string());
         // The full record (`encode(diff(None, view))`, O(tree)) is only
@@ -1288,7 +1358,8 @@ fn frontier_walk(
     dag: &Dag,
     seeds: Vec<(String, depot::View)>,
     known: &std::collections::HashSet<String>,
-    sink: &mut dyn FnMut(&CommitMeta, &str, &depot::View, &mut CatFile) -> Result<()>,
+    track_oids: bool,
+    sink: &mut dyn FnMut(&CommitMeta, &str, &depot::View, &OidSet, &mut CatFile) -> Result<()>,
 ) -> Result<(usize, usize)> {
     let counts = &dag.counts;
     let mut cat = CatFile::new(repo)?;
@@ -1296,7 +1367,7 @@ fn frontier_walk(
     let mut frontier = Frontier { views: HashMap::new(), max: 0 };
     for (sha, view) in seeds {
         let rc = counts.get(&sha).copied().unwrap_or(0);
-        frontier.insert(sha, view, rc);
+        frontier.insert(sha, view, OidSet::new(), rc);
     }
     let mut new_count = 0usize;
     while let Some((sha, changes)) = stream.next_commit()? {
@@ -1306,29 +1377,37 @@ fn frontier_walk(
         let raw = cat.get(&sha)?;
         let (mut cm, tree_oid) = parse_commit(&raw)?;
         cm.sha = sha.clone();
-        // Base = FIRST parent's view (the raw delta is vs the first
-        // parent); other parents only release their frontier refs.
-        let mut view = match cm.parents.split_first() {
-            None => None,
+        // Base = FIRST parent's view AND oid multiset (the raw delta is vs
+        // the first parent); other parents only release their frontier refs.
+        // A root starts from an empty view and an empty multiset.
+        let (mut view, mut oids) = match cm.parents.split_first() {
+            None => (None, OidSet::new()),
             Some((p1, rest)) => {
-                let base = frontier.take(p1)?;
+                let (base, base_oids) = frontier.take(p1)?;
                 for p in rest {
                     frontier.release(p)?;
                 }
-                Some(base)
+                (Some(base), base_oids)
             }
         };
         depot::apply_mut(&mut view, &delta_layer(&changes, &mut cat)?);
+        // Maintain the git-oid multiset alongside the view — first parent's
+        // set with this commit's changes applied. Skipped entirely (empty
+        // set flows through) when the sink does not need it, so the shipped
+        // importer's behavior is byte-identical.
+        if track_oids {
+            apply_oids(&mut oids, &changes);
+        }
         // A git tree object always EXISTS, including the empty root tree
         // (4b825dc…): an absent resolved view is that empty-but-present
         // root, not an error. Existence is first-class in the depot now,
         // so no sentinel is needed — `view_tree_oid` of the empty View is
         // exactly the empty-tree oid.
         let view = view.unwrap_or_default();
-        sink(&cm, &tree_oid, &view, &mut cat)?;
+        sink(&cm, &tree_oid, &view, &oids, &mut cat)?;
         new_count += 1;
         let rc = counts.get(&sha).copied().unwrap_or(0);
-        frontier.insert(sha, view, rc);
+        frontier.insert(sha, view, oids, rc);
     }
     Ok((new_count, frontier.max))
 }
