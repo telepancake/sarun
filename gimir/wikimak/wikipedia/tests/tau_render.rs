@@ -394,13 +394,12 @@ fn portal_is_own_page_before_redirect_then_follows() {
 // Redirect-at-τ, "does NOT follow before the redirect revision, follows
 // after". `LateAlias`'s only revision (a redirect) appears at t3.
 //
-// This pins the REAL importer behavior, not an idealized red-link one: the
-// open [0,∞) title interval means the title already "exists" before t3
-// (exists_at → true, blue link), but with no revision text at τ. So
-// resolve_at stops AT LateAlias (terminal text-less page, id 500) instead of
-// following through to Article; only at head does the redirect text exist
-// and the resolution reach Article. Genuine red-link-at-τ is covered by the
-// `Ghost` assertions in the era tests (a title with no page row at all).
+// The importer now opens a page's title interval at its EARLIEST revision
+// (import.rs `ensure_title`), so before t3 the title does NOT exist at τ:
+// exists_at → false, a genuine RED link, and resolve_at → None (not a
+// text-less terminal). At head the redirect revision exists ⇒ resolution
+// reaches Article. (Previously the open [0,∞) interval made this a blue,
+// text-less terminal — the wayback gap that real start_ts closes.)
 // ---------------------------------------------------------------------------
 #[test]
 fn late_alias_follows_only_after_its_redirect_revision_exists() {
@@ -411,25 +410,30 @@ fn late_alias_follows_only_after_its_redirect_revision_exists() {
 
     let article_id = inst.page_id_by_title_at("Article", None).unwrap().unwrap();
 
-    // BEFORE t3: no redirect text at τ, so resolution does NOT reach Article.
+    // BEFORE t3: the title does not exist at τ (its first revision is t3),
+    // so it neither has text nor resolves.
     assert_eq!(
         inst.page_text_at(500, Some(tau_before)).unwrap(),
         None,
         "no LateAlias revision before t3"
     );
+    assert!(
+        !inst.exists_at("LateAlias", Some(tau_before)).unwrap(),
+        "title does not exist before its first revision"
+    );
     let before = resolve_at(&inst, "LateAlias", Some(tau_before), MAX_HOPS).unwrap();
-    assert_eq!(before, Some(500), "stops at the text-less title, does not follow");
+    assert_eq!(before, None, "does not resolve before its first revision");
     assert_ne!(before, Some(article_id), "crucially, has NOT reached Article yet");
-    // The open title interval means the link is BLUE (exists_at is title-only),
-    // NOT a red link — the documented importer gap, pinned as-is.
+    // With real start_ts, LateAlias is a genuine RED link before t3 — same
+    // as Ghost (a title with no page row at all).
     let html_before = render_at(&inst, "Article", "[[LateAlias]] [[Ghost]]", Some(tau_before));
     assert!(
-        html_before.contains(r#"<a href="/wiki/LateAlias">LateAlias</a>"#),
-        "LateAlias renders blue (title exists via open interval):\n{html_before}"
+        html_before.contains(r#"class="new">LateAlias"#),
+        "LateAlias renders red before its first revision:\n{html_before}"
     );
     assert!(
         html_before.contains(r#"class="new">Ghost"#),
-        "a title with no page row (Ghost) is the genuine red link:\n{html_before}"
+        "a title with no page row (Ghost) is also a red link:\n{html_before}"
     );
 
     // AFTER (head): the redirect revision exists ⇒ follows to Article.

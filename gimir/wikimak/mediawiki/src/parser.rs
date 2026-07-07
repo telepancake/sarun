@@ -13,7 +13,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::Reader;
 
-use crate::types::{Contributor, Error, Namespace, Page, Result, Revision, SiteInfo};
+use crate::types::{Contributor, Error, Interwiki, Namespace, Page, Result, Revision, SiteInfo};
 
 /// Streaming iterator over `<page>` elements in an export-0.11 document.
 ///
@@ -151,6 +151,7 @@ fn parse_site_info<B: BufRead>(reader: &mut Reader<B>) -> Result<SiteInfo> {
         generator: String::new(),
         case: String::new(),
         namespaces: Default::default(),
+        interwiki: Vec::new(),
     };
     let mut buf = Vec::new();
     loop {
@@ -168,11 +169,62 @@ fn parse_site_info<B: BufRead>(reader: &mut Reader<B>) -> Result<SiteInfo> {
                     b"generator" => si.generator = read_text(reader, &name)?,
                     b"case" => si.case = read_text(reader, &name)?,
                     b"namespaces" => parse_namespaces(reader, &mut si)?,
+                    // Not part of export-0.11's header, but a snapshot may
+                    // embed the API interwikimap; parse it if present.
+                    b"interwikimap" | b"interwiki" => {
+                        parse_interwiki(reader, &mut si, &name)?
+                    }
                     _ => skip_to_end(reader, QName(&name))?,
                 }
             }
             Event::End(e) if local_name_end(&e) == b"siteinfo" => return Ok(si),
             Event::Eof => return Err(Error::Xml("EOF inside <siteinfo>".into())),
+            _ => {}
+        }
+    }
+}
+
+/// Parse an `<interwikimap>`/`<interwiki>` wrapper of `<iw>` entries in the
+/// `action=query&meta=siteinfo&siprop=interwikimap` XML shape
+/// (`<iw prefix="w" url="https://…/$1" local="" />`). A plain dump header
+/// has no such element, so this is normally never reached.
+///
+/// The `local` attribute is MediaWiki's same-farm flag; it is recorded on
+/// [`Interwiki::is_local`] but the wikipedia layer treats a foreign wiki as
+/// external regardless (it only turns a prefix into a local link when the
+/// prefix maps to an instance WE mirror).
+fn parse_interwiki<B: BufRead>(reader: &mut Reader<B>, si: &mut SiteInfo, end: &[u8]) -> Result<()> {
+    // Pull the (prefix, url, is_local) out of an `<iw>` start tag.
+    fn push_iw(si: &mut SiteInfo, s: &BytesStart<'_>) {
+        let prefix = attr_string(s, b"prefix");
+        if prefix.is_empty() {
+            return;
+        }
+        si.interwiki.push(Interwiki {
+            prefix,
+            url: attr_string(s, b"url"),
+            is_local: attr_present(s, b"local"),
+        });
+    }
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let ev = reader
+            .read_event_into(&mut buf)
+            .map_err(|e| Error::Xml(e.to_string()))?;
+        match ev {
+            // `<iw .../>` — the API-XML shape (always empty in practice).
+            Event::Empty(s) if local_name(&s) == b"iw" => push_iw(si, &s),
+            // `<iw ...>…</iw>` — defensive; consume the body.
+            Event::Start(s) => {
+                let n = local_name(&s).to_vec();
+                if n == b"iw" {
+                    push_iw(si, &s);
+                }
+                skip_to_end(reader, QName(&n))?;
+            }
+            Event::End(e) if local_name_end(&e) == end => return Ok(()),
+            Event::Eof => return Err(Error::Xml("EOF inside <interwikimap>".into())),
             _ => {}
         }
     }
@@ -197,6 +249,7 @@ fn parse_namespaces<B: BufRead>(reader: &mut Reader<B>, si: &mut SiteInfo) -> Re
                             id: key,
                             case,
                             name,
+                            aliases: Vec::new(),
                         },
                     );
                 } else {
@@ -214,6 +267,7 @@ fn parse_namespaces<B: BufRead>(reader: &mut Reader<B>, si: &mut SiteInfo) -> Re
                             id: key,
                             case,
                             name: String::new(),
+                            aliases: Vec::new(),
                         },
                     );
                 }

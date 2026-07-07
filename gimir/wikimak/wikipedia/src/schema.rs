@@ -37,6 +37,21 @@ pub const META_DDL: &[&str] = &[
         captured_at INTEGER PRIMARY KEY,
         json BLOB NOT NULL
     )",
+    // Interwiki map, captured alongside a siteinfo snapshot (shared
+    // `captured_at`), so the τ read API can pick the map contemporaneous
+    // with the site config it renders against (browsing plan §2:
+    // interwikimap-at-τ). `is_local` = the prefix resolves to a wiki WE
+    // mirror (a local cross-instance link); false for every external wiki.
+    // Export-0.11 dumps carry no interwiki data, so in practice this table
+    // is empty and asof seeds a built-in map — but the wiring is here for
+    // an API/sitematrix source (import plan §1.3) that does carry one.
+    "CREATE TABLE IF NOT EXISTS interwiki_map (
+        captured_at INTEGER NOT NULL,
+        prefix TEXT NOT NULL,
+        url TEXT NOT NULL,
+        is_local INTEGER NOT NULL,
+        PRIMARY KEY(captured_at, prefix)
+    ) WITHOUT ROWID",
     // Extension beyond SPEC sketch: per-revision dedup. SPEC §"Crash-
     // safety contract" says dedup is sqlite-driven; we materialize a
     // (page_id, rev_id) table to make idempotent re-imports cheap.
@@ -68,4 +83,5 @@ pub const META_TABLES: &[&str] = &[
     "category_intervals",
     "parts_seen",
     "siteinfo_snapshots",
+    "interwiki_map",
 ];

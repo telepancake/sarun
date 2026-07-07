@@ -96,7 +96,32 @@ pub struct Page {
 pub struct Namespace {
     pub id: i32,
     pub case: String,
+    /// The localized namespace name — the element text of `<namespace>` in
+    /// the dump's `<siteinfo>` (content-language name, e.g. "Vorlage" on
+    /// dewiki, "Template" on enwiki). Empty for the main namespace (id 0).
     pub name: String,
+    /// Additional resolvable names for this namespace. The export-0.11
+    /// `<siteinfo>` header carries NO aliases (only the single localized
+    /// name above), so the parser leaves this empty; it exists so a richer
+    /// source (`action=query&meta=siteinfo&siprop=namespacealiases`) can
+    /// populate it without another struct change. Never fabricated.
+    pub aliases: Vec<String>,
+}
+
+/// One interwiki-map prefix. Export-0.11 `<siteinfo>` normally carries no
+/// interwiki data (it lives in `action=query&meta=siteinfo`); the parser
+/// fills this only if a snapshot embeds an `<interwikimap>`/`<interwiki>`
+/// element (API-XML shape). Otherwise it stays empty and the wikipedia
+/// layer seeds a built-in map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interwiki {
+    pub prefix: String,
+    /// URL pattern with `$1` standing in for the target title.
+    pub url: String,
+    /// MediaWiki's own `local` flag for the prefix (same-farm interwiki).
+    /// This is NOT "mirrored by us" — the wikipedia layer never derives a
+    /// local-link decision from it.
+    pub is_local: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -107,4 +132,6 @@ pub struct SiteInfo {
     pub generator: String,
     pub case: String,
     pub namespaces: BTreeMap<i32, Namespace>,
+    /// Interwiki map, empty for a plain dump header (see [`Interwiki`]).
+    pub interwiki: Vec<Interwiki>,
 }

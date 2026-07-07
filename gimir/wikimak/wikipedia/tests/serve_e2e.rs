@@ -12,6 +12,12 @@
 //! revision. That exercises template-revision-at-τ end to end — the whole
 //! point of the local renderer (plan §1).
 
+// This suite drives the serve stack (renderer + HTTP), so it only builds
+// with the `serve` feature — matching its sibling `tau_render.rs`. Without
+// this guard a `--no-default-features --features fetch` build fails on the
+// `wikimak_wikipedia::serve` import.
+#![cfg(feature = "serve")]
+
 mod common;
 
 use std::io::{Read, Write};

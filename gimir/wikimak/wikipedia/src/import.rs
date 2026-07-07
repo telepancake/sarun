@@ -133,15 +133,34 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
     }
     let g = &*g;
 
+    // Earliest revision timestamp for THIS dump's copy of the page — the
+    // real start of a title interval (browsing plan §2 wayback contract).
+    // Computed over all revisions in hand (not just the new ones) so an
+    // idempotent reimport of an already-seen title recomputes the SAME
+    // value and touches nothing. `None` (a page with no revisions) leaves
+    // the interval logic a no-op.
+    let earliest_ts: Option<i64> = page
+        .revisions
+        .iter()
+        .map(|r| r.timestamp.timestamp_micros())
+        .min();
+
     // Begin the per-page transaction.
     g.conn.execute("BEGIN IMMEDIATE", [])?;
     let outcome = (|| -> Result<bool> {
-        // Title bookkeeping. Tests assert ONE title_intervals row per
-        // stable-title page (PHASES W6 revisits rename history). For
-        // this phase: insert the page's title ONCE on first appearance.
+        // Title bookkeeping: title pool + reverse index, and the
+        // rename-aware title-interval bookkeeping (a moved page closes its
+        // open interval and opens a new one — browsing plan §2).
         let ns_i = page.namespace as i64;
         let normalized = page.title.trim().as_bytes().to_vec();
-        ensure_title(&g, page_id, ns_i, &normalized, instance.title_shard_count)?;
+        ensure_title(
+            &g,
+            page_id,
+            ns_i,
+            &normalized,
+            instance.title_shard_count,
+            earliest_ts,
+        )?;
 
         // Collect the page's NEW revisions in source order (oldest →
         // newest); skip those already in revisions_seen. Source order
@@ -197,16 +216,32 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
     }
 }
 
-/// Insert title pool entry + meta.db rows on first sighting of a
-/// (ns, normalized_title) pair. Subsequent calls are no-ops for the
-/// pool but DO insert `title_intervals` and `page_to_title_id` if not
-/// already present for this page.
+/// Insert title pool entry + meta.db rows for a `(ns, normalized_title)`
+/// pair, and maintain the page's `title_intervals` (the wayback title
+/// time-travel index, browsing plan §2).
+///
+/// Interval discipline (`earliest_ts` = the earliest revision timestamp of
+/// this dump's copy of the page):
+///
+///   * First sighting of the page → open ONE interval
+///     `[earliest_ts, ∞)` (real start, NOT 0 — so `exists_at` is false
+///     before the page's first revision).
+///   * Reimport with the SAME title as the current open interval → no-op
+///     (idempotent: a re-run of the same dump must not churn rows).
+///   * Reimport with a DIFFERENT title whose earliest revision is strictly
+///     LATER than the open interval's start (a real move) → CLOSE the open
+///     interval at `earliest_ts` and OPEN a new one `[earliest_ts, ∞)` for
+///     the new title. The old title then stops resolving at `earliest_ts`.
+///   * A different title whose earliest revision is NOT later (a re-run of
+///     an older title's slice after the page was already moved) → left
+///     alone, so re-running the whole history is idempotent.
 fn ensure_title(
     g: &InstanceInner,
     page_id: u64,
     ns: i64,
     normalized: &[u8],
     title_shard_count: u32,
+    earliest_ts: Option<i64>,
 ) -> Result<()> {
     // Look up an existing title_id for this (ns, normalized_title).
     let existing: Option<i64> = g
@@ -246,15 +281,62 @@ fn ensure_title(
         params![page_id as i64, title_id as i64],
     )?;
 
-    // Title-intervals row: one per (page_id, start_ts). For this phase
-    // we use start_ts = 0 and end_ts NULL — a stable title yields one
-    // open-ended interval. INSERT OR IGNORE makes re-import a no-op.
-    g.conn.execute(
-        "INSERT OR IGNORE INTO title_intervals
-            (page_id, ns, normalized_title, start_ts, end_ts)
-         VALUES(?1, ?2, ?3, 0, NULL)",
-        params![page_id as i64, ns, normalized],
-    )?;
+    // A page with no revisions in this dump has no anchor for an interval;
+    // leave the interval table untouched.
+    let Some(start) = earliest_ts else {
+        return Ok(());
+    };
+
+    // The page's current OPEN interval (end_ts IS NULL), if any. A legacy
+    // start_ts=0 row is also open and matches here — its title is compared
+    // like any other, so a rename off a pre-interval import still works.
+    let open: Option<(i64, Vec<u8>)> = g
+        .conn
+        .query_row(
+            "SELECT start_ts, normalized_title FROM title_intervals
+             WHERE page_id = ?1 AND end_ts IS NULL
+             ORDER BY start_ts DESC LIMIT 1",
+            params![page_id as i64],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+
+    match open {
+        None => {
+            // First interval for this page. Real start = earliest revision.
+            // INSERT OR IGNORE guards the (page_id, start_ts) PK against a
+            // same-instant re-run.
+            g.conn.execute(
+                "INSERT OR IGNORE INTO title_intervals
+                    (page_id, ns, normalized_title, start_ts, end_ts)
+                 VALUES(?1, ?2, ?3, ?4, NULL)",
+                params![page_id as i64, ns, normalized, start],
+            )?;
+        }
+        Some((open_start, open_title)) => {
+            if open_title == normalized {
+                // Same title still open — nothing to do (idempotent).
+            } else if start > open_start {
+                // A move: this title's history begins strictly after the
+                // open interval opened. Close the old interval at the
+                // handoff instant and open the new one there.
+                g.conn.execute(
+                    "UPDATE title_intervals SET end_ts = ?1
+                     WHERE page_id = ?2 AND start_ts = ?3 AND end_ts IS NULL",
+                    params![start, page_id as i64, open_start],
+                )?;
+                g.conn.execute(
+                    "INSERT OR IGNORE INTO title_intervals
+                        (page_id, ns, normalized_title, start_ts, end_ts)
+                     VALUES(?1, ?2, ?3, ?4, NULL)",
+                    params![page_id as i64, ns, normalized, start],
+                )?;
+            }
+            // else: a different title whose earliest revision is not later
+            // than the open interval (an out-of-order re-run of a slice
+            // predating the move). Leave intervals as-is to stay idempotent.
+        }
+    }
     Ok(())
 }
 
@@ -409,21 +491,25 @@ fn decode_rev_id(rec: &[u8]) -> Result<i64> {
 
 fn capture_siteinfo(conn: &rusqlite::Connection, si: &wikimak_mediawiki::SiteInfo) -> Result<()> {
     let captured_at = chrono::Utc::now().timestamp_micros();
-    // Namespaces are ADDITIVE keys (browsing plan §2 / §7 siteinfo): the
-    // asof read API tolerates snapshots written before this field
-    // existed. The mediawiki `SiteInfo` (wikimak/mediawiki/src/types.rs)
-    // carries only id/name/case per namespace — no per-namespace aliases
-    // in the dump's <siteinfo>, so `aliases` is emitted empty for now
-    // (localized aliases would come from a magicwords/aliases source).
+    // Per-namespace JSON (browsing plan §2 / §7 siteinfo). Keys are
+    // ADDITIVE: the asof read API tolerates snapshots written before a key
+    // existed. The dump's `<namespace>` gives one localized name + the
+    // key; we record it as `localized` and fill `canonical` from the fixed
+    // MediaWiki canonical-namespace map (real, not fabricated — the CANON
+    // is a name, and the only ALIAS derived downstream is the dump's own
+    // localized name). `aliases` stays empty because the export header
+    // carries none (namespacealiases live only in the API's siteinfo).
     let namespaces: Vec<_> = si
         .namespaces
         .values()
         .map(|n| {
+            let canonical = canonical_namespace_name(n.id).unwrap_or(n.name.as_str());
             json!({
                 "id": n.id,
-                "canonical": n.name,
+                "canonical": canonical,
+                "localized": n.name,
                 "case": n.case,
-                "aliases": Vec::<String>::new(),
+                "aliases": n.aliases,
             })
         })
         .collect();
@@ -444,7 +530,53 @@ fn capture_siteinfo(conn: &rusqlite::Connection, si: &wikimak_mediawiki::SiteInf
         "INSERT OR IGNORE INTO siteinfo_snapshots(captured_at, json) VALUES(?1, ?2)",
         params![captured_at, bytes],
     )?;
+    // Interwiki map for this snapshot. Export dumps carry none, so this is
+    // normally a no-op and asof falls back to the built-in seed; when a
+    // richer source (API/sitematrix) fills `si.interwiki`, its prefixes
+    // persist here keyed to the same `captured_at`. `is_local` is written
+    // FALSE unconditionally: MediaWiki's own same-farm `local` flag is a
+    // different notion from "mirrored by us", and we mirror nothing here
+    // (never a local link for a foreign wiki — import plan §3 constraint).
+    for iw in &si.interwiki {
+        if iw.prefix.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO interwiki_map(captured_at, prefix, url, is_local)
+             VALUES(?1, ?2, ?3, 0)",
+            params![captured_at, iw.prefix, iw.url],
+        )?;
+    }
     Ok(())
+}
+
+/// Canonical (content-language-independent) MediaWiki name for a core
+/// namespace id, or `None` for a wiki-specific / extension namespace. These
+/// are fixed built-ins (Manual:Namespace), the same set every MediaWiki
+/// accepts as an English prefix regardless of content language — so a
+/// title's localized prefix AND its canonical prefix both resolve.
+fn canonical_namespace_name(id: i32) -> Option<&'static str> {
+    Some(match id {
+        -2 => "Media",
+        -1 => "Special",
+        0 => "",
+        1 => "Talk",
+        2 => "User",
+        3 => "User talk",
+        4 => "Project",
+        5 => "Project talk",
+        6 => "File",
+        7 => "File talk",
+        8 => "MediaWiki",
+        9 => "MediaWiki talk",
+        10 => "Template",
+        11 => "Template talk",
+        12 => "Help",
+        13 => "Help talk",
+        14 => "Category",
+        15 => "Category talk",
+        _ => return None,
+    })
 }
 
 /// FNV-1a 64-bit. Used solely to pick a strpool shard deterministically

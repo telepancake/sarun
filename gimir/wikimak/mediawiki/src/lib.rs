@@ -26,5 +26,6 @@ pub use fetch::{fetch, VerifyingReader};
 pub use parser::{new_page_stream, site_info, PageStream};
 pub use sha1::verify_rev_sha1;
 pub use types::{
-    Contributor, Error, Namespace, Page, Part, Result, Revision, Run, RunSource, SiteInfo,
+    Contributor, Error, Interwiki, Namespace, Page, Part, Result, Revision, Run, RunSource,
+    SiteInfo,
 };

@@ -5,13 +5,17 @@
 //! built by importing synthesized XML — every assertion is a concrete
 //! input→output check that a stub would fail.
 //!
-//! Honest scope note (see the `title_at_tau_*` tests): the importer
-//! records ONE open title interval `[0, ∞)` per page (import.rs
-//! `ensure_title`: start_ts = 0, end_ts = NULL — no rename tracking), so
-//! title-at-τ resolution is exercised two ways: (a) the importer's real
-//! single-interval behavior, and (b) synthetic bounded intervals written
-//! straight into meta.db to pin the τ-window SQL that render-time
-//! rename-aware lookups depend on.
+//! Honest scope note (see the `title_at_tau_*` tests): the importer now
+//! records ONE open interval per stable title, starting at the page's
+//! EARLIEST revision timestamp (import.rs `ensure_title`: start_ts =
+//! earliest rev ts, end_ts = NULL), and closes/reopens it on a real
+//! rename (pinned in `tests/title_rename.rs`). So title-at-τ resolution is
+//! exercised three ways: (a) the importer's real single-interval behavior
+//! (now gated on the first revision — a τ before it does NOT resolve);
+//! (b) synthetic bounded intervals written straight into meta.db to pin
+//! the τ-window SQL; (c) real rename intervals in `title_rename.rs`.
+//! Back-compat: pre-interval imports left `start_ts = 0` rows, which still
+//! resolve for any τ ≥ 0 under the same window SQL (pinned below).
 
 mod common;
 
@@ -33,6 +37,7 @@ const FIXTURE: &str = r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0
     <generator>g</generator><case>first-letter</case>
     <namespaces>
       <namespace key="0" case="first-letter"/>
+      <namespace key="4" case="first-letter">Wikipédia</namespace>
       <namespace key="10" case="first-letter">Template</namespace>
     </namespaces>
   </siteinfo>
@@ -199,13 +204,14 @@ fn title_at_tau_importer_behavior() {
 
     // None τ → current mapping (exact title match).
     assert_eq!(id_at(&inst, "Multi Rev", None), Some(100));
-    // Some τ → interval covers [0,∞), so any τ ≥ 0 resolves.
+    // Some τ ≥ the first revision → the interval [t10, ∞) resolves.
     assert_eq!(id_at(&inst, "Multi Rev", Some(t20)), Some(100));
-    // Because start_ts is 0, even a τ BEFORE the first revision resolves
-    // the title (the importer does not gate title existence on revision
-    // time — recorded as a gap; true rename time-travel needs richer
-    // import bookkeeping).
-    assert_eq!(id_at(&inst, "Multi Rev", Some(t10 - 1)), Some(100));
+    // The first interval now starts at the EARLIEST revision (t10), so a τ
+    // BEFORE the page's first revision does NOT resolve — the title did
+    // not exist yet (real wayback gating, replacing the old start_ts=0).
+    assert_eq!(id_at(&inst, "Multi Rev", Some(t10 - 1)), None);
+    // exactly at the first revision → resolves (start inclusive).
+    assert_eq!(id_at(&inst, "Multi Rev", Some(t10)), Some(100));
     // whitespace is trimmed to match import's normalization.
     assert_eq!(id_at(&inst, "  Multi Rev  ", Some(t20)), Some(100));
     // unknown title → None at any τ and at head.
@@ -312,13 +318,45 @@ fn title_at_tau_falls_back_to_current_mapping() {
 fn exists_at_title_only() {
     let tmp = TempDir::new().unwrap();
     let inst = fixture_instance(&tmp);
-    let t20 = history_micros(&inst, 100)[1].1;
+    let hist = history_micros(&inst, 100);
+    let t20 = hist[1].1;
+    let t10 = hist[2].1;
 
     assert!(inst.exists_at("Multi Rev", Some(t20)).unwrap());
     assert!(inst.exists_at("Multi Rev", None).unwrap());
     assert!(inst.exists_at("Redir One", Some(t20)).unwrap());
     assert!(!inst.exists_at("No Such Page", Some(t20)).unwrap());
     assert!(!inst.exists_at("No Such Page", None).unwrap());
+    // exists_at correctness (real start_ts): FALSE before the page's first
+    // revision, TRUE from it on.
+    assert!(!inst.exists_at("Multi Rev", Some(t10 - 1)).unwrap(),
+        "title must not exist before its first revision");
+    assert!(inst.exists_at("Multi Rev", Some(t10)).unwrap(),
+        "title exists from its first revision (start inclusive)");
+}
+
+// ---------------------------------------------------------------------------
+// Back-compat: a pre-interval import left a `start_ts = 0` open row. Under
+// the same window SQL it must still resolve for any τ ≥ 0 (old depots keep
+// working). Simulated by rewriting page 100's interval start_ts to 0.
+// ---------------------------------------------------------------------------
+#[test]
+fn back_compat_start_ts_zero_row_resolves() {
+    let tmp = TempDir::new().unwrap();
+    let inst = fixture_instance(&tmp);
+
+    let conn = meta_conn(&tmp);
+    conn.execute(
+        "UPDATE title_intervals SET start_ts = 0 WHERE page_id = 100 AND end_ts IS NULL",
+        [],
+    )
+    .unwrap();
+
+    // A tiny τ (a legacy start_ts=0 row covers all of [0, ∞)).
+    assert_eq!(id_at(&inst, "Multi Rev", Some(1)), Some(100));
+    assert!(inst.exists_at("Multi Rev", Some(1)).unwrap());
+    // τ = 0 exactly resolves (start inclusive at 0).
+    assert_eq!(id_at(&inst, "Multi Rev", Some(0)), Some(100));
 }
 
 // ---------------------------------------------------------------------------
@@ -392,8 +430,170 @@ fn site_config_at_carries_namespaces() {
         .expect("Template namespace captured");
     assert_eq!(ns10["canonical"], "Template");
     assert_eq!(ns10["case"], "first-letter");
+    // The dump carries no per-namespace aliases → the raw JSON `aliases`
+    // stays empty. ns 10's localized name equals its canonical, so no alias
+    // is derived (see the ns-4 case for a real derived alias).
     assert!(ns10["aliases"].as_array().unwrap().is_empty());
+    assert_eq!(ns10["localized"], "Template");
+    assert!(wikimak_wikipedia::asof::namespace_aliases(ns10).is_empty());
     assert!(namespaces.iter().any(|n| n["id"] == 0), "mainspace captured");
+}
+
+// ---------------------------------------------------------------------------
+// Namespace aliases (browsing plan §7): the dump gives ONE localized name
+// per namespace. When it differs from the canonical (Project ns 4 localized
+// to "Wikipédia" in the fixture), the canonical fills from the built-in
+// MediaWiki map and the localized name becomes a resolvable alias — never
+// fabricated, only the dump's own name. Pins capture + `namespace_aliases`
+// (the derivation `build_site_config` uses, compile-checked under serve).
+// ---------------------------------------------------------------------------
+#[test]
+fn namespace_localized_becomes_alias() {
+    let tmp = TempDir::new().unwrap();
+    let inst = fixture_instance(&tmp);
+
+    let cfg = inst.site_config_at(None).unwrap().unwrap();
+    let namespaces = cfg["namespaces"].as_array().unwrap();
+    let ns4 = namespaces
+        .iter()
+        .find(|n| n["id"] == 4)
+        .expect("Project namespace captured");
+
+    // Canonical comes from the built-in map; localized is the dump text.
+    assert_eq!(ns4["canonical"], "Project", "canonical from built-in map");
+    assert_eq!(ns4["localized"], "Wikipédia", "localized from the dump");
+
+    let aliases = wikimak_wikipedia::asof::namespace_aliases(ns4);
+    assert!(
+        aliases.iter().any(|a| a == "Wikipédia"),
+        "localized name resolves as an alias, got {aliases:?}"
+    );
+    // The canonical is NOT duplicated into aliases.
+    assert!(!aliases.iter().any(|a| a == "Project"));
+
+    // Direct unit pins on the pure derivation (no import needed).
+    // Same-name namespace → no derived alias.
+    let same = serde_json::json!({"canonical": "Template", "localized": "Template", "aliases": []});
+    assert!(wikimak_wikipedia::asof::namespace_aliases(&same).is_empty());
+    // Old snapshot missing `localized` → tolerated, only explicit aliases.
+    let legacy = serde_json::json!({"canonical": "Help"});
+    assert!(wikimak_wikipedia::asof::namespace_aliases(&legacy).is_empty());
+    // Explicit aliases carried through, plus a differing localized name.
+    let both = serde_json::json!({
+        "canonical": "Category", "localized": "Kategorie", "aliases": ["CAT"]
+    });
+    let got = wikimak_wikipedia::asof::namespace_aliases(&both);
+    assert!(got.iter().any(|a| a == "CAT"));
+    assert!(got.iter().any(|a| a == "Kategorie"));
+}
+
+// ---------------------------------------------------------------------------
+// Interwiki map (browsing plan §2). Export dumps carry no interwiki data,
+// so a freshly-imported instance has an empty interwiki_map table and
+// `interwiki_at` returns the built-in SEED (real prefixes, correct $1 URLs).
+// When rows ARE captured (a future API/sitematrix source), they take over.
+// Pins the fetch-side of the wiring; `build_site_config` (serve) maps these
+// rows into SiteConfig.interwiki (compile-checked under serve).
+// ---------------------------------------------------------------------------
+#[test]
+fn interwiki_seed_prefixes_are_real() {
+    let seed = wikimak_wikipedia::asof::seed_interwiki();
+    let get = |p: &str| seed.iter().find(|e| e.prefix == p).map(|e| e.url.clone());
+    assert_eq!(get("w").as_deref(), Some("https://en.wikipedia.org/wiki/$1"));
+    assert_eq!(get("wikt").as_deref(), Some("https://en.wiktionary.org/wiki/$1"));
+    assert_eq!(get("commons").as_deref(), Some("https://commons.wikimedia.org/wiki/$1"));
+    assert_eq!(get("meta").as_deref(), Some("https://meta.wikimedia.org/wiki/$1"));
+    assert_eq!(get("d").as_deref(), Some("https://www.wikidata.org/wiki/$1"));
+    // Every seed URL is a real https pattern with a $1 placeholder, and
+    // NONE is marked local (we mirror none of these).
+    for e in &seed {
+        assert!(e.url.starts_with("https://") && e.url.contains("$1"), "{e:?}");
+        assert!(!e.is_local, "seed prefix must never be local: {e:?}");
+    }
+}
+
+#[test]
+fn interwiki_at_seeds_then_prefers_captured_rows() {
+    let tmp = TempDir::new().unwrap();
+    let inst = fixture_instance(&tmp);
+
+    use wikimak_wikipedia::asof::interwiki_at;
+
+    // No interwiki rows captured (export dump has none) → the seed.
+    let map = interwiki_at(&inst, None).unwrap();
+    assert!(map.iter().any(|e| e.prefix == "commons"), "seed used when table empty");
+    assert!(!map.iter().any(|e| e.prefix == "es"), "seed has no es prefix");
+
+    // Attach an interwiki row to THE snapshot the importer captured, so the
+    // τ selection lands on it; interwiki_at then prefers the captured rows.
+    let conn = meta_conn(&tmp);
+    let captured_at: i64 = conn
+        .query_row(
+            "SELECT captured_at FROM siteinfo_snapshots ORDER BY captured_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO interwiki_map(captured_at, prefix, url, is_local)
+         VALUES(?1, 'es', 'https://es.wikipedia.org/wiki/$1', 0)",
+        params![captured_at],
+    )
+    .unwrap();
+
+    let map = interwiki_at(&inst, None).unwrap();
+    assert!(map.iter().any(|e| e.prefix == "es"), "captured row surfaces");
+    // Captured rows REPLACE the seed for that snapshot (not merged).
+    assert!(!map.iter().any(|e| e.prefix == "commons"), "captured rows replace seed");
+    let es = map.iter().find(|e| e.prefix == "es").unwrap();
+    assert_eq!(es.url, "https://es.wikipedia.org/wiki/$1");
+    assert!(!es.is_local);
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end interwiki capture: a dump whose <siteinfo> embeds an
+// <interwikimap> is PARSED (mediawiki parser) and its prefixes PERSISTED
+// (capture_siteinfo) into interwiki_map, then surfaced by interwiki_at —
+// replacing the seed. Pins the parser + capture + read path together, so
+// neither can be a stub. `is_local` is stored FALSE even though the dump's
+// <iw> carries the same-farm `local` flag (foreign wikis are never local).
+// ---------------------------------------------------------------------------
+#[test]
+fn interwiki_captured_from_dump_interwikimap() {
+    const DOC: &str = r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
+  <siteinfo>
+    <sitename>IW Wiki</sitename><dbname>iwwiki</dbname><base>http://x/</base>
+    <generator>g</generator><case>first-letter</case>
+    <namespaces><namespace key="0" case="first-letter"/></namespaces>
+    <interwikimap>
+      <iw prefix="es" url="https://es.wikipedia.org/wiki/$1" />
+      <iw prefix="self" url="https://iw.example.org/wiki/$1" local="" />
+    </interwikimap>
+  </siteinfo>
+  <page><title>P</title><ns>0</ns><id>1</id>
+    <revision><id>1</id><timestamp>2020-01-01T00:00:00Z</timestamp>
+      <contributor><username>U</username><id>1</id></contributor>
+      <comment>c</comment><model>wikitext</model><format>text/x-wiki</format>
+      <text bytes="1" sha1="x" xml:space="preserve">x</text><sha1>x</sha1>
+    </revision>
+  </page>
+</mediawiki>"#;
+
+    let tmp = TempDir::new().unwrap();
+    let inst = make_instance(&tmp, 16);
+    let mut stream = new_page_stream(Cursor::new(DOC.as_bytes().to_vec()));
+    inst.import(&mut stream).expect("import");
+    inst.flush().expect("flush");
+
+    let map = wikimak_wikipedia::asof::interwiki_at(&inst, None).unwrap();
+    // The parsed prefixes surface, and the seed is replaced (no "commons").
+    let es = map.iter().find(|e| e.prefix == "es").expect("es captured from dump");
+    assert_eq!(es.url, "https://es.wikipedia.org/wiki/$1");
+    assert!(!map.iter().any(|e| e.prefix == "commons"), "captured rows replace the seed");
+    // Even a dump-`local` prefix is stored non-local (never a local link
+    // for a wiki we don't mirror).
+    let selfp = map.iter().find(|e| e.prefix == "self").expect("self captured");
+    assert!(!selfp.is_local, "dump local flag must NOT become our is_local");
 }
 
 // ---------------------------------------------------------------------------
