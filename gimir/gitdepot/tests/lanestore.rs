@@ -354,3 +354,167 @@ fn variant_roundtrip_empty_tree_variant() {
     let store = assert_variant_roundtrip(&repo, tmp.path(), "empty-variant");
     assert_eq!(store.tree_oid_of_commit(&wipe).unwrap(), empty_oid);
 }
+
+// -------------------------------------------------------- base-switching
+
+/// Write the shared payload every branch in a variant group carries: a
+/// large blob plus several small files, enough shared blob oids that one
+/// unique file per branch keeps the base/variant Jaccard overlap well past
+/// the 0.5 cutoff.
+fn write_shared(repo: &Path) {
+    write(repo, "shared/big.dat", &"y".repeat(8192));
+    for k in 0..6 {
+        write(repo, &format!("shared/c{k}.txt"), &format!("common {k}\n"));
+    }
+}
+
+/// Base-switching, single promotion: a group's BASE branch (main) merges
+/// away (dies as a metro lane) while a VARIANT branch (feat) keeps
+/// developing past the merge. Assert EVERY commit — before and after the
+/// switch — reconstructs SHA-exact: the old base's pre-switch commits still
+/// resolve against the old base (its states stay in the chain), and the
+/// promoted variant's post-switch commits resolve against the new (self)
+/// base.
+#[test]
+fn variant_base_death_single_promotion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("base-death");
+    init(&repo);
+    write_shared(&repo);
+    commit(&repo, "base"); // main, lane 0 — the initial base
+    let base_tip = sh_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // feat forks the base and develops — near-identical (keeps the whole
+    // shared payload, adds one small file), so it clusters as a variant of
+    // lane 0 while both are live.
+    sh_git(&repo, &["checkout", "-q", "-b", "feat", &base_tip]);
+    write(&repo, "feat.txt", "feat body\n");
+    let pre_feat = commit(&repo, "feat1"); // variant lane
+
+    // main advances so the upcoming merge is a real non-ff merge.
+    sh_git(&repo, &["checkout", "-q", "main"]);
+    let pre_main = commit(&repo, "main2"); // stays on lane 0 (allow-empty)
+
+    // The base (main) merges INTO feat: feat is the FIRST parent (its lane
+    // continues), main is the SECOND parent — so the base's metro lane DIES
+    // at this merge. This is the switch boundary.
+    sh_git(&repo, &["checkout", "-q", "feat"]);
+    sh_git(&repo, &["merge", "-q", "--no-ff", "-m", "feat<-main", "main"]);
+    let boundary = sh_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // feat keeps developing PAST the switch — now the promoted base.
+    write(&repo, "feat.txt", "feat body 2\n");
+    let post = commit(&repo, "feat3");
+
+    // Every reachable commit reconstructs SHA-exact across the boundary.
+    let store = assert_variant_roundtrip(&repo, tmp.path(), "base-death");
+    for sha in [&pre_feat, &pre_main, &boundary, &post] {
+        let want = sh_git(&repo, &["rev-parse", &format!("{sha}^{{tree}}")]).trim().to_string();
+        assert_eq!(store.tree_oid_of_commit(sha).unwrap(), want, "commit {sha}");
+    }
+}
+
+/// Base-switching with TWO variants: the base dies, one variant is promoted
+/// to base and the OTHER is re-expressed against the newly promoted base
+/// going forward. SHA-exact across the boundary for all branches.
+#[test]
+fn variant_base_death_two_variants_reframe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("base-death-2");
+    init(&repo);
+    write_shared(&repo);
+    commit(&repo, "base"); // main, lane 0 — initial base
+    let base_tip = sh_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // Two near-identical variants off the base, both live.
+    sh_git(&repo, &["checkout", "-q", "-b", "feat1", &base_tip]);
+    write(&repo, "feat1.txt", "one\n");
+    commit(&repo, "feat1 a");
+    sh_git(&repo, &["checkout", "-q", "-b", "feat2", &base_tip]);
+    write(&repo, "feat2.txt", "two\n");
+    commit(&repo, "feat2 a");
+
+    // main advances so its merge is a real merge.
+    sh_git(&repo, &["checkout", "-q", "main"]);
+    commit(&repo, "main2");
+
+    // Base (main) merges INTO feat1 — lane 0 dies; feat1 & feat2 survive.
+    // Post-switch, feat1 (lowest surviving id) is the promoted base and
+    // feat2 is re-expressed as a delta against it.
+    sh_git(&repo, &["checkout", "-q", "feat1"]);
+    sh_git(&repo, &["merge", "-q", "--no-ff", "-m", "feat1<-main", "main"]);
+
+    // Both survivors develop past the switch.
+    write(&repo, "feat1.txt", "one v2\n");
+    let post1 = commit(&repo, "feat1 b");
+    sh_git(&repo, &["checkout", "-q", "feat2"]);
+    write(&repo, "feat2.txt", "two v2\n");
+    let post2 = commit(&repo, "feat2 b");
+    sh_git(&repo, &["checkout", "-q", "main"]);
+
+    let store = assert_variant_roundtrip(&repo, tmp.path(), "base-death-2");
+    for sha in [&post1, &post2] {
+        let want = sh_git(&repo, &["rev-parse", &format!("{sha}^{{tree}}")]).trim().to_string();
+        assert_eq!(store.tree_oid_of_commit(sha).unwrap(), want, "post-switch {sha}");
+    }
+}
+
+/// Immutability of the past across a switch: reconstructing a PRE-switch
+/// revision yields the identical tree oid whether or not later (post-switch)
+/// history exists. Encode a prefix (only pre-switch commits) and the full
+/// history, then assert every pre-switch commit reconstructs identically in
+/// both — adding the switch boundary and post-switch commits never rewrites
+/// an earlier frame's base-in-effect.
+#[test]
+fn variant_switch_past_is_immutable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("immutable");
+    init(&repo);
+    write_shared(&repo);
+    commit(&repo, "base");
+    let base_tip = sh_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+    sh_git(&repo, &["checkout", "-q", "-b", "feat", &base_tip]);
+    write(&repo, "feat.txt", "feat body\n");
+    commit(&repo, "feat1");
+    sh_git(&repo, &["checkout", "-q", "main"]);
+    commit(&repo, "main2");
+
+    // Pre-switch commit set = everything reachable right now.
+    let pre_shas: Vec<String> = sh_git(&repo, &["rev-list", "--branches", "--tags"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+
+    // Encode the PREFIX (no switch yet — lane 0 still live throughout).
+    let prefix = gitdepot::lanestore::LaneStore::encode_repo_variant(
+        &repo,
+        &tmp.path().join("store-prefix"),
+        3,
+    )
+    .unwrap();
+
+    // Now add the switch (base dies) and post-switch history.
+    sh_git(&repo, &["checkout", "-q", "feat"]);
+    sh_git(&repo, &["merge", "-q", "--no-ff", "-m", "feat<-main", "main"]);
+    write(&repo, "feat.txt", "feat body 2\n");
+    commit(&repo, "feat3");
+    sh_git(&repo, &["checkout", "-q", "main"]);
+
+    let full = gitdepot::lanestore::LaneStore::encode_repo_variant(
+        &repo,
+        &tmp.path().join("store-full"),
+        3,
+    )
+    .unwrap();
+
+    // Every pre-switch commit reconstructs identically in both stores and
+    // equals git — the later switch did not disturb the past.
+    for sha in &pre_shas {
+        let want = sh_git(&repo, &["rev-parse", &format!("{sha}^{{tree}}")]).trim().to_string();
+        let a = prefix.tree_oid_of_commit(sha).unwrap();
+        let b = full.tree_oid_of_commit(sha).unwrap();
+        assert_eq!(a, want, "prefix store: {sha}");
+        assert_eq!(b, want, "full store: {sha}");
+        assert_eq!(a, b, "pre-switch {sha} differs prefix vs full — past not immutable");
+    }
+}

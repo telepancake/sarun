@@ -102,25 +102,41 @@ fn collect_blob_oids(view: &View, out: &mut HashSet<Vec<u8>>) {
 
 /// Rewrite a FULL combined state (every lane child its own full subtree)
 /// into the STORED combined state that actually lands in the frame:
-/// cluster the live lanes ([`cluster_variants`]); each group's BASE lane
-/// keeps its full subtree, and every VARIANT lane is replaced by a marker
-/// child carrying `diff(base_subtree, variant_subtree)` — so the
-/// frame-resident uncompressed content of a group is one base subtree plus
-/// small per-variant deltas, not N full trees. Independent lanes are
-/// singleton groups and stay full, exactly as the non-variant path stores
-/// every lane. This is representation (a): the delta lives IN the child
-/// slot behind a marker, self-describing, consulted by the reader.
-fn build_stored(full: &View, cutoff: f64) -> Result<View> {
-    let mut live: Vec<LaneId> = Vec::with_capacity(full.children.len());
+/// cluster the LIVE lanes at this revision ([`cluster_variants`]); each
+/// group's BASE lane keeps its full subtree, and every VARIANT lane is
+/// replaced by a marker child carrying `diff(base_subtree,
+/// variant_subtree)` — so the frame-resident uncompressed content of a
+/// group is one base subtree plus small per-variant deltas, not N full
+/// trees. Independent lanes are singleton groups and stay full, exactly as
+/// the non-variant path stores every lane. This is representation (a): the
+/// delta lives IN the child slot behind a marker, self-describing,
+/// consulted by the reader.
+///
+/// `live` is the set of lanes that are alive at THIS revision (birth ≤ i ≤
+/// death from the topology). Clustering only the live set is exactly the
+/// base-switching mechanism: when a group's base lane dies, it drops out of
+/// `live`, so [`cluster_variants`] recomputes the group over the smaller
+/// set and its own "lowest live id is the base" rule promotes a surviving
+/// variant to base — stored FULL from that revision on, the other survivors
+/// re-expressed against it. Lane ids are monotonic in birth order, so the
+/// lowest live id only ever rises as lanes die: a base switch moves the
+/// pointer strictly forward, never back, and never touches an earlier
+/// frame (each revision's frame records its own base-in-effect). Only live
+/// lanes are emitted; a dead lane is absent from this revision's stored
+/// state (its states stay reconstructable at the earlier revisions it was
+/// live — dying removes it from the live set, not from the chain).
+fn build_stored(full: &View, live: &[LaneId], cutoff: f64) -> Result<View> {
     let mut blob_sets: HashMap<LaneId, HashSet<Vec<u8>>> = HashMap::new();
-    for (key, child) in &full.children {
-        let lane = decode_lane_key(key)?;
+    for &lane in live {
+        let child = full
+            .children
+            .get(&lane_key(lane))
+            .ok_or_else(|| Error::Chain(format!("live lane {lane} missing from combined")))?;
         let mut set = HashSet::new();
         collect_blob_oids(child, &mut set);
         blob_sets.insert(lane, set);
-        live.push(lane);
     }
-    let groups = cluster_variants(&live, &blob_sets, cutoff);
+    let groups = cluster_variants(live, &blob_sets, cutoff);
     let mut stored = View::default();
     for g in &groups {
         let base_key = lane_key(g.base);
@@ -147,10 +163,20 @@ fn build_stored(full: &View, cutoff: f64) -> Result<View> {
 
 /// Reconstruct lane `lane`'s FULL subtree from a reconstructed stored
 /// combined state. The one canonical composition order: a variant child
-/// is `apply(base_subtree, variant_delta)` with the base resolved FIRST
-/// (base is always stored full in the same combined state — the base stays
-/// alive across the revisions it spans in this increment), then the
-/// variant delta on top. A non-variant child is already its full subtree.
+/// is `apply(base_subtree, variant_delta)` with the base resolved FIRST,
+/// then the variant delta on top. A non-variant child is already its full
+/// subtree.
+///
+/// The base is read PER REVISION from the child's `VARIANT_MARK` attr (the
+/// base-in-effect recorded as data in this revision's frame), never
+/// recomputed — so base-switching needs no reader change. The recorded
+/// base is guaranteed present (live) and stored full in the SAME combined
+/// state, because the encoder only ever expresses a variant against a base
+/// that is live at that revision: below a switch boundary the mark points
+/// at the old base (still live and reconstructable there), above it at the
+/// promoted lane. Reconstruction is therefore immutable across switches —
+/// an earlier revision resolves against whatever base its own frame pins,
+/// independent of any later history.
 fn resolve_lane_subtree(combined: &View, lane: LaneId) -> Result<View> {
     let child = combined
         .children
@@ -222,8 +248,27 @@ impl LaneStore {
     ) -> Result<LaneStore> {
         let (sha_of, parents) = topo_parents(repo)?;
         let assignment = assign_lanes(&parents);
-        let lane_of = assignment.lane_of;
+        let lane_of = assignment.lane_of.clone();
         let n_rev = sha_of.len();
+        // Per-lane liveness window `[birth, death)` in revision indices.
+        // Birth is the lane's first commit (`span.0`). Death is the model's
+        // metro-lane death — a MERGE: the revision of the merge commit that
+        // absorbs the lane as a NON-first parent. A lane never merged stays
+        // live to the end (it is a live branch tip; retirement is a later
+        // increment), so its death is `n_rev`. This — not "the lane has no
+        // more commits" — is the base-switching trigger: a base lane that
+        // merges away drops out of the live set while its still-unmerged
+        // variants remain, and clustering promotes a survivor.
+        let birth: Vec<usize> = assignment.span.iter().map(|s| s.0).collect();
+        let mut death: Vec<usize> = vec![n_rev; assignment.span.len()];
+        for i in 0..n_rev {
+            for &p in parents[i].iter().skip(1) {
+                let l = lane_of[p] as usize;
+                if i < death[l] {
+                    death[l] = i;
+                }
+            }
+        }
 
         // Per-commit tree View, built exactly as the importer builds a
         // standalone tree (full ls-tree + blobs → layer → apply). An
@@ -250,7 +295,18 @@ impl LaneStore {
                 .children
                 .insert(lane_key(lane_of[i]), Arc::new(trees[i].clone()));
             let cur = match variant_cutoff {
-                Some(c) => build_stored(&full_combined, c)?,
+                Some(c) => {
+                    // Lanes live at revision i: born and not yet merged
+                    // away (birth ≤ i < death). A merged-away base drops
+                    // out here, so clustering reframes onto a surviving
+                    // base. The lane advanced at i is always live (a merge
+                    // that ends lane l happens strictly after l's own
+                    // commits), so it is always present.
+                    let live: Vec<LaneId> = (0..death.len() as LaneId)
+                        .filter(|&l| birth[l as usize] <= i && i < death[l as usize])
+                        .collect();
+                    build_stored(&full_combined, &live, c)?
+                }
                 None => full_combined.clone(),
             };
             if let Some(p) = &prev {
