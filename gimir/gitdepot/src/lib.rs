@@ -1255,6 +1255,41 @@ fn ingest_stream(
     mut rep: Option<&mut ReportAccum>,
     on_commit: &mut dyn FnMut(&CommitMeta) -> Result<()>,
 ) -> Result<(usize, usize)> {
+    frontier_walk(repo, dag, seeds, known, &mut |cm, tree_oid, view, cat| {
+        let same = same_tree_parent(cm, tree_oid, tree_oids, cat)?;
+        tree_oids.insert(cm.sha.clone(), tree_oid.to_string());
+        // The full record (`encode(diff(None, view))`, O(tree)) is only
+        // for the report accumulator's comparison harness; the store
+        // path mints fulls once per prepend batch (store::tree_idx_for).
+        if let Some(r) = rep.as_deref_mut() {
+            r.push(view, codec::encode(&depot::diff(None, Some(view))));
+        }
+        ingest.add_commit(cm, tree_oid, same.as_deref(), view)?;
+        on_commit(cm)?;
+        Ok(())
+    })
+}
+
+/// The ONE streaming frontier walk both the shipped importer
+/// (`ingest_stream`) and the lane-store encoder (`lanestore`) drive —
+/// the O(delta) view construction, factored out so only the SINK
+/// differs. Streams the walked scope in `dag.order`, and for every
+/// not-yet-`known` commit builds its `depot::View` in O(delta): the
+/// first parent's frontier view (Arc-shared, moved out on its last
+/// child else cloned) with `apply_mut` of that commit's first-parent
+/// `delta_layer` on top; other parents only release their frontier
+/// refs. Each such commit is handed to `sink(cm, tree_oid, view, cat)`
+/// (the persistent `cat-file` is lent so a sink can peel parents), THEN
+/// inserted into the frontier for its own children. `seeds` are
+/// boundary views (update path) pre-inserted with their refcounts.
+/// Returns (new commit count, peak frontier size).
+fn frontier_walk(
+    repo: &Path,
+    dag: &Dag,
+    seeds: Vec<(String, depot::View)>,
+    known: &std::collections::HashSet<String>,
+    sink: &mut dyn FnMut(&CommitMeta, &str, &depot::View, &mut CatFile) -> Result<()>,
+) -> Result<(usize, usize)> {
     let counts = &dag.counts;
     let mut cat = CatFile::new(repo)?;
     let mut stream = LogStream::spawn(repo, &dag.order)?;
@@ -1290,16 +1325,7 @@ fn ingest_stream(
         // so no sentinel is needed — `view_tree_oid` of the empty View is
         // exactly the empty-tree oid.
         let view = view.unwrap_or_default();
-        let same = same_tree_parent(&cm, &tree_oid, tree_oids, &mut cat)?;
-        tree_oids.insert(sha.clone(), tree_oid.clone());
-        // The full record (`encode(diff(None, view))`, O(tree)) is only
-        // for the report accumulator's comparison harness; the store
-        // path mints fulls once per prepend batch (store::tree_idx_for).
-        if let Some(r) = rep.as_deref_mut() {
-            r.push(&view, codec::encode(&depot::diff(None, Some(&view))));
-        }
-        ingest.add_commit(&cm, &tree_oid, same.as_deref(), &view)?;
-        on_commit(&cm)?;
+        sink(&cm, &tree_oid, &view, &mut cat)?;
         new_count += 1;
         let rc = counts.get(&sha).copied().unwrap_or(0);
         frontier.insert(sha, view, rc);

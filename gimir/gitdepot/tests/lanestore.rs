@@ -12,6 +12,235 @@
 use std::path::Path;
 use std::process::Command;
 
+// ---------------------------------------------------- persistence
+
+/// Encode a branchy repo with the SCALABLE variant encoder, then reopen
+/// the store FROM DISK ALONE (`LaneStore::open`) and reconstruct every
+/// commit's and every ref's tree SHA-exact without touching the repo.
+#[test]
+fn persist_reopen_roundtrip_without_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("branchy");
+    init(&repo);
+    write(&repo, "shared/big.dat", &"z".repeat(4096));
+    write(&repo, "a.txt", "a\n");
+    commit(&repo, "base");
+    let base = sh_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // Two feature branches off base, each near-identical (variant group),
+    // and a merge back on one — exercises lanes, variants and a death.
+    sh_git(&repo, &["checkout", "-q", "-b", "feat1", &base]);
+    write(&repo, "f1.txt", "one\n");
+    commit(&repo, "f1a");
+    sh_git(&repo, &["checkout", "-q", "-b", "feat2", &base]);
+    write(&repo, "f2.txt", "two\n");
+    commit(&repo, "f2a");
+    sh_git(&repo, &["checkout", "-q", "main"]);
+    write(&repo, "a.txt", "a2\n");
+    commit(&repo, "main2");
+    sh_git(&repo, &["merge", "-q", "--no-ff", "-m", "merge feat1", "feat1"]);
+    sh_git(&repo, &["tag", "v1"]);
+
+    let dir = tmp.path().join("persisted");
+    {
+        // Encode and drop the in-memory handle entirely.
+        let _ = gitdepot::lanestore::LaneStore::encode_repo_variant(&repo, &dir, 3).unwrap();
+    }
+
+    // Capture expected oids while the repo exists, then reopen the store
+    // from disk and reconstruct WITHOUT the repo.
+    let shas: Vec<String> =
+        sh_git(&repo, &["rev-list", "--branches", "--tags"]).lines().map(str::to_string).collect();
+    let want: std::collections::HashMap<String, String> = shas
+        .iter()
+        .map(|s| {
+            let t = sh_git(&repo, &["rev-parse", &format!("{s}^{{tree}}")]).trim().to_string();
+            (s.clone(), t)
+        })
+        .collect();
+    let want_main = sh_git(&repo, &["rev-parse", "refs/heads/main^{tree}"]).trim().to_string();
+    let want_v1 = sh_git(&repo, &["rev-parse", "refs/tags/v1^{tree}"]).trim().to_string();
+
+    let store = gitdepot::lanestore::LaneStore::open(&dir).unwrap();
+    assert_eq!(store.n_rev(), shas.len(), "reopened rev count");
+    for rev in 0..store.n_rev() {
+        let sha = store.sha_at(rev).to_string();
+        let got = store.tree_oid_at(rev).unwrap();
+        assert_eq!(got, want[&sha], "reopened commit {sha}");
+    }
+    // Refs resolve from disk alone.
+    assert_eq!(store.tree_oid_of_ref("refs/heads/main").unwrap(), want_main);
+    assert_eq!(store.tree_oid_of_ref("refs/tags/v1").unwrap(), want_v1);
+}
+
+// ---------------------------------------------------- git.git proof
+//
+// The hard gate: encode a real git.git mirror with the scalable variant
+// encoder, reopen from disk, and reconstruct EVERY commit's tree
+// SHA-exact from persisted state — reporting wall/RSS/size numbers.
+// #[ignore] so the normal suite never pays for it; run by name:
+//   cargo test -p gitdepot --release --test lanestore -- --ignored --nocapture gitgit_proof
+// Repo/scratch overridable via GITGIT_REPO / GITGIT_SCRATCH.
+
+fn dir_size(p: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            let m = e.metadata().unwrap();
+            total += if m.is_dir() { dir_size(&e.path()) } else { m.len() };
+        }
+    }
+    total
+}
+
+fn peak_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:").map(|v| {
+            v.trim().trim_end_matches(" kB").trim().parse::<u64>().unwrap_or(0)
+        }))
+        .unwrap_or(0)
+}
+
+#[test]
+#[ignore]
+fn gitgit_proof() {
+    gitgit_proof_run(true);
+}
+
+/// Same proof over the NON-variant lockstep encoder (`encode_repo`) — no
+/// per-revision variant clustering, one-lane reverse deltas. Isolates the
+/// base-advance re-expression cost by contrast with `gitgit_proof`.
+#[test]
+#[ignore]
+fn gitgit_proof_lockstep() {
+    gitgit_proof_run(false);
+}
+
+/// Cheap topology-only stats (no tree building) that explain the encode
+/// RAM: total lanes, peak concurrent LIVE lanes, and lanes still live at
+/// the end — `full_combined` retains one full tree per lane ever born.
+#[test]
+#[ignore]
+fn gitgit_lane_stats() {
+    let repo = std::env::var("GITGIT_REPO").unwrap_or_else(|_| {
+        "/tmp/claude-0/-home-user-sarun/5df6fa05-fb5d-5959-9227-2afc1158ad07/scratchpad/gitgit.git"
+            .to_string()
+    });
+    let repo = Path::new(&repo);
+    let out = sh_git(repo, &["rev-list", "--parents", "--topo-order", "--reverse", "--branches", "--tags"]);
+    let mut idx = std::collections::HashMap::new();
+    let mut parents: Vec<Vec<usize>> = Vec::new();
+    for line in out.lines() {
+        let mut it = line.split(' ');
+        let sha = it.next().unwrap();
+        let i = parents.len();
+        idx.insert(sha.to_string(), i);
+        parents.push(it.filter_map(|p| idx.get(p).copied()).collect());
+    }
+    let n = parents.len();
+    let a = gitdepot::lanes::assign_lanes(&parents);
+    let n_lanes = a.n_lanes() as usize;
+    // Deaths: a lane dies at the merge that absorbs it as a non-first parent.
+    let birth: Vec<usize> = a.span.iter().map(|s| s.0).collect();
+    let mut death = vec![n; n_lanes];
+    for i in 0..n {
+        for &p in parents[i].iter().skip(1) {
+            let l = a.lane_of[p] as usize;
+            if i < death[l] { death[l] = i; }
+        }
+    }
+    // Peak concurrent live lanes across revisions (sweep birth/death).
+    let mut ev: Vec<(usize, i32)> = Vec::new();
+    for l in 0..n_lanes { ev.push((birth[l], 1)); ev.push((death[l], -1)); }
+    ev.sort();
+    let (mut cur, mut peak) = (0i32, 0i32);
+    for (_, d) in ev { cur += d; peak = peak.max(cur); }
+    let end_live = (0..n_lanes).filter(|&l| death[l] == n).count();
+    println!("\n==== git.git lane topology ====");
+    println!("commits:              {n}");
+    println!("total lanes:          {n_lanes}");
+    println!("peak concurrent live: {peak}");
+    println!("lanes live at end:    {end_live}");
+    println!("(full_combined retains ~one full tree per lane EVER born = {n_lanes})");
+    println!("===============================\n");
+}
+
+fn gitgit_proof_run(variant: bool) {
+    let repo = std::env::var("GITGIT_REPO").unwrap_or_else(|_| {
+        "/tmp/claude-0/-home-user-sarun/5df6fa05-fb5d-5959-9227-2afc1158ad07/scratchpad/gitgit.git"
+            .to_string()
+    });
+    let repo = Path::new(&repo);
+    assert!(repo.exists(), "git.git mirror not found at {}", repo.display());
+    let scratch = std::env::var("GITGIT_SCRATCH").unwrap_or_else(|_| {
+        "/tmp/claude-0/-home-user-sarun/5df6fa05-fb5d-5959-9227-2afc1158ad07/scratchpad/gitgit-lane"
+            .to_string()
+    });
+    let dir = Path::new(&scratch);
+    let _ = std::fs::remove_dir_all(dir);
+
+    // git.git pack size (the 564MB reference).
+    let pack = dir_size(&repo.join("objects/pack"));
+
+    // (1) encode via the scalable lane encoder.
+    let t0 = std::time::Instant::now();
+    let store = if variant {
+        gitdepot::lanestore::LaneStore::encode_repo_variant(repo, dir, 3)
+    } else {
+        gitdepot::lanestore::LaneStore::encode_repo(repo, dir, 3)
+    }
+    .expect("encode git.git");
+    let encode_secs = t0.elapsed().as_secs_f64();
+    let n_rev = store.n_rev();
+    let n_lanes = (0..n_rev).map(|r| store.lane_of(r)).max().map(|m| m + 1).unwrap_or(0);
+    drop(store); // prove reopen serves from disk
+
+    // (2) reopen from disk and reconstruct EVERY commit SHA-exact.
+    let store = gitdepot::lanestore::LaneStore::open(dir).expect("reopen git.git store");
+    assert_eq!(store.n_rev(), n_rev, "reopened rev count");
+    // Expected commit->tree oids in one pass.
+    let map_out = sh_git(repo, &["log", "--branches", "--tags", "--format=%H %T"]);
+    let want: std::collections::HashMap<&str, &str> = map_out
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .collect();
+    let t1 = std::time::Instant::now();
+    let mut checked = 0usize;
+    for rev in 0..store.n_rev() {
+        let sha = store.sha_at(rev).to_string();
+        let got = store
+            .tree_oid_at(rev)
+            .unwrap_or_else(|e| panic!("reconstruct rev {rev} ({sha}): {e}"));
+        let w = want.get(sha.as_str()).unwrap_or_else(|| panic!("no expected tree for {sha}"));
+        assert_eq!(&got, w, "commit {sha}: tree oid mismatch");
+        checked += 1;
+    }
+    let recon_secs = t1.elapsed().as_secs_f64();
+
+    let store_bytes = dir_size(dir);
+    let uncompressed = store.uncompressed_record_bytes().unwrap();
+    let rss = peak_rss_kb();
+    let trees_known_mb = 374u64; // shipped TREES store of git.git (design figure)
+
+    println!("\n==== git.git lane-store proof ({}) ====", if variant { "variant" } else { "lockstep" });
+    println!("commits (revisions):   {n_rev}");
+    println!("commits reconstructed: {checked}  (SHA-exact: {})", checked == n_rev);
+    println!("lanes:                 {n_lanes}");
+    println!("encode wall:           {encode_secs:.1}s");
+    println!("reconstruct wall:      {recon_secs:.1}s (every commit, from disk)");
+    println!("peak RSS:              {:.1} MB", rss as f64 / 1024.0);
+    println!("git pack:              {:.1} MB", pack as f64 / 1e6);
+    println!("lane store on disk:    {:.1} MB", store_bytes as f64 / 1e6);
+    println!("  uncompressed records:{:.1} MB", uncompressed as f64 / 1e6);
+    println!("shipped TREES (known): {trees_known_mb} MB");
+    println!("lane/pack ratio:       {:.2}x", store_bytes as f64 / pack as f64);
+    println!("lane/TREES ratio:      {:.2}x", store_bytes as f64 / (trees_known_mb as f64 * 1e6));
+    println!("==================================\n");
+    assert_eq!(checked, n_rev, "not every commit reconstructed");
+}
+
 fn sh_git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")

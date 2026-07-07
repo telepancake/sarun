@@ -214,6 +214,9 @@ pub struct LaneStore {
     sha_of: Vec<String>,
     /// Commit sha → revision index.
     sha_to_rev: HashMap<String, usize>,
+    /// ref name → resolved commit sha (persisted; lets a reopened store
+    /// serve any ref's tree from disk alone).
+    refs: HashMap<String, String>,
 }
 
 impl LaneStore {
@@ -246,10 +249,22 @@ impl LaneStore {
         level: i32,
         variant_cutoff: Option<f64>,
     ) -> Result<LaneStore> {
-        let (sha_of, parents) = topo_parents(repo)?;
+        // Revision order + per-commit parents come from the SAME
+        // O(changes) discovery the shipped importer uses: one
+        // `rev-list --parents` pass yields `dag.order` (walk_order — a
+        // valid topological order, parents before children, that keeps
+        // first-parent segments contiguous) and the per-commit parent
+        // indices. The lane axis rides that order.
+        let dag = crate::dag_scope(repo, &[])?;
+        let sha_of = dag.order.clone();
+        let n_rev = sha_of.len();
+        let mut index_of: HashMap<String, usize> = HashMap::with_capacity(n_rev);
+        for (i, s) in sha_of.iter().enumerate() {
+            index_of.insert(s.clone(), i);
+        }
+        let parents = parents_by_index(repo, &index_of)?;
         let assignment = assign_lanes(&parents);
         let lane_of = assignment.lane_of.clone();
-        let n_rev = sha_of.len();
         // Per-lane liveness window `[birth, death)` in revision indices.
         // Birth is the lane's first commit (`span.0`). Death is the model's
         // metro-lane death — a MERGE: the revision of the merge commit that
@@ -270,18 +285,16 @@ impl LaneStore {
             }
         }
 
-        // Per-commit tree View, built exactly as the importer builds a
-        // standalone tree (full ls-tree + blobs → layer → apply). An
-        // empty tree is the empty-but-present View (existence is
-        // first-class in the depot).
-        let mut trees: Vec<View> = Vec::with_capacity(n_rev);
-        for sha in &sha_of {
-            trees.push(commit_tree_view(repo, sha)?);
-        }
-
         // Build combined states forward, emitting the newest full record
         // and the reverse deltas (record j rebuilds combined[j] from
-        // combined[j+1]).
+        // combined[j+1]). Per-commit tree Views are built the SCALABLE
+        // way — the shipped importer's `frontier_walk`: each commit's
+        // `View` is its first parent's frontier view + `delta_layer`
+        // (Arc-shared, O(delta)), streamed in `dag.order` (== `sha_of`),
+        // NOT rebuilt whole-tree per commit. The variant/lockstep/
+        // base-switching lane encoding below is unchanged; only the
+        // source of each revision's View moved to the streaming frontier.
+        //
         // `full_combined` carries every live lane as its own full subtree
         // (the increment-1 shape); `cur` is what actually lands in the
         // frame — identical to `full_combined` on the non-variant path, or
@@ -290,33 +303,54 @@ impl LaneStore {
         let mut prev: Option<View> = None;
         let mut reverse: Vec<Vec<u8>> = Vec::new(); // reverse[j], j = 0..n_rev-2
         let mut newest_full: Vec<u8> = Vec::new();
-        for i in 0..n_rev {
-            full_combined
-                .children
-                .insert(lane_key(lane_of[i]), Arc::new(trees[i].clone()));
-            let cur = match variant_cutoff {
-                Some(c) => {
-                    // Lanes live at revision i: born and not yet merged
-                    // away (birth ≤ i < death). A merged-away base drops
-                    // out here, so clustering reframes onto a surviving
-                    // base. The lane advanced at i is always live (a merge
-                    // that ends lane l happens strictly after l's own
-                    // commits), so it is always present.
-                    let live: Vec<LaneId> = (0..death.len() as LaneId)
-                        .filter(|&l| birth[l as usize] <= i && i < death[l as usize])
-                        .collect();
-                    build_stored(&full_combined, &live, c)?
+        let mut expect = 0usize;
+        crate::frontier_walk(
+            repo,
+            &dag,
+            Vec::new(),
+            &Default::default(),
+            &mut |cm, _tree_oid, view, _cat| {
+                let i = expect;
+                if i >= n_rev || cm.sha != sha_of[i] {
+                    return Err(Error::Chain(format!(
+                        "frontier walk out of revision order at {i}: got {}",
+                        cm.sha
+                    )));
                 }
-                None => full_combined.clone(),
-            };
-            if let Some(p) = &prev {
-                // Rebuilds combined[i-1] from combined[i].
-                reverse.push(codec::encode(&depot::diff(Some(&cur), Some(p))));
-            }
-            if i == n_rev - 1 {
-                newest_full = codec::encode(&depot::diff(None, Some(&cur)));
-            }
-            prev = Some(cur);
+                full_combined
+                    .children
+                    .insert(lane_key(lane_of[i]), Arc::new(view.clone()));
+                let cur = match variant_cutoff {
+                    Some(c) => {
+                        // Lanes live at revision i: born and not yet merged
+                        // away (birth ≤ i < death). A merged-away base drops
+                        // out here, so clustering reframes onto a surviving
+                        // base. The lane advanced at i is always live (a merge
+                        // that ends lane l happens strictly after l's own
+                        // commits), so it is always present.
+                        let live: Vec<LaneId> = (0..death.len() as LaneId)
+                            .filter(|&l| birth[l as usize] <= i && i < death[l as usize])
+                            .collect();
+                        build_stored(&full_combined, &live, c)?
+                    }
+                    None => full_combined.clone(),
+                };
+                if let Some(p) = &prev {
+                    // Rebuilds combined[i-1] from combined[i].
+                    reverse.push(codec::encode(&depot::diff(Some(&cur), Some(p))));
+                }
+                if i == n_rev - 1 {
+                    newest_full = codec::encode(&depot::diff(None, Some(&cur)));
+                }
+                prev = Some(cur);
+                expect += 1;
+                Ok(())
+            },
+        )?;
+        if expect != n_rev {
+            return Err(Error::Chain(format!(
+                "frontier walk produced {expect} of {n_rev} revisions"
+            )));
         }
 
         let depot = open_depot(dir)?;
@@ -345,12 +379,53 @@ impl LaneStore {
             depot.flush().map_err(|e| cf(e.to_string()))?;
         }
 
+        let sha_to_rev: HashMap<String, usize> = sha_of
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
+
+        // Refs that resolve to an in-scope commit — persisted so a
+        // reopened store serves any ref's tree from disk alone.
+        let mut refs = HashMap::new();
+        for (name, sha) in collect_ref_commits(repo)? {
+            if sha_to_rev.contains_key(&sha) {
+                refs.insert(name, sha);
+            }
+        }
+
+        persist_meta(dir, n_rev, &lane_of, &sha_of, &refs)?;
+        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs })
+    }
+
+    /// Reopen a persisted lane store from `dir` alone — no repo access.
+    /// The combined-state chain lives in `dir/depot` (reopened) and the
+    /// sha→(rev,lane) and ref→sha bindings in `dir/meta.sqlite`; every
+    /// commit's / ref's tree reconstructs SHA-exact from these.
+    pub fn open(dir: &Path) -> Result<LaneStore> {
+        let depot = open_depot(dir)?;
+        let (n_rev, lane_of, sha_of, refs) = load_meta(dir)?;
         let sha_to_rev = sha_of
             .iter()
             .enumerate()
             .map(|(i, s)| (s.clone(), i))
             .collect();
-        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev })
+        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs })
+    }
+
+    /// ref name → resolved commit sha (persisted set).
+    pub fn refs(&self) -> &HashMap<String, String> {
+        &self.refs
+    }
+
+    /// The git tree oid the ref `name` points at, reconstructed from the
+    /// store (no repo access).
+    pub fn tree_oid_of_ref(&self, name: &str) -> Result<String> {
+        let sha = self
+            .refs
+            .get(name)
+            .ok_or_else(|| Error::Chain(format!("ref {name} not in lane store")))?;
+        self.tree_oid_of_commit(sha)
     }
 
     // ---------------------------------------------------------- read
@@ -488,44 +563,189 @@ impl LaneStore {
     }
 }
 
-/// The commit's full tree View (ls-tree + blobs → layer → apply). Same
-/// construction the importer uses for a standalone tagged tree.
-fn commit_tree_view(repo: &Path, sha: &str) -> Result<View> {
-    let entries = crate::ls_tree(repo, sha)?;
-    let blobs = crate::fetch_blobs(
-        repo,
-        entries
-            .iter()
-            .filter(|e| e.mode != "160000")
-            .map(|e| e.oid.clone()),
-    )?;
-    let layer = crate::tree_layer(&entries, &blobs)?;
-    Ok(depot::apply(None, &layer).unwrap_or_default())
-}
-
-/// `(shas_in_topo_order, parents_as_indices)` for every reachable commit
-/// (branches + tags), parents-before-children. First parent first;
-/// out-of-scope parents (none, in a full non-shallow walk) are dropped.
-fn topo_parents(repo: &Path) -> Result<(Vec<String>, Vec<Vec<usize>>)> {
+/// `parents[i]` — the in-scope parent revision indices of the commit at
+/// `dag.order` position `i`, FIRST PARENT FIRST, remapped through
+/// `index_of` from ONE `rev-list --parents` pass. Out-of-scope parents
+/// (none in a full non-shallow branches+tags walk) are dropped. Every
+/// kept index is `< i` because `dag.order` (walk_order) lists parents
+/// before children — exactly what `assign_lanes` requires.
+fn parents_by_index(
+    repo: &Path,
+    index_of: &HashMap<String, usize>,
+) -> Result<Vec<Vec<usize>>> {
     let out = crate::git_str(
         repo,
-        &["rev-list", "--parents", "--topo-order", "--reverse", "--branches", "--tags"],
+        &["rev-list", "--parents", "--branches", "--tags"],
     )?;
-    let mut shas: Vec<String> = Vec::new();
-    let mut idx: HashMap<String, usize> = HashMap::new();
-    let mut parents: Vec<Vec<usize>> = Vec::new();
+    let mut parents: Vec<Vec<usize>> = vec![Vec::new(); index_of.len()];
     for line in out.lines() {
-        let mut it = line.split_whitespace();
+        let mut it = line.split(' ');
         let Some(sha) = it.next() else { continue };
-        let i = shas.len();
-        idx.insert(sha.to_string(), i);
-        shas.push(sha.to_string());
-        // Parents already seen (topo --reverse guarantees this for all
-        // in-scope parents); keep first-parent order.
-        let ps: Vec<usize> = it.filter_map(|p| idx.get(p).copied()).collect();
-        parents.push(ps);
+        let Some(&i) = index_of.get(sha) else { continue };
+        parents[i] = it.filter_map(|p| index_of.get(p).copied()).collect();
     }
-    Ok((shas, parents))
+    Ok(parents)
+}
+
+/// ref name → resolved commit sha, for branches and commit-peeled tags.
+/// A tag peeling to a tree (no commit) is skipped — the lane store
+/// indexes commits; a tree-only tag has no revision to bind.
+fn collect_ref_commits(repo: &Path) -> Result<Vec<(String, String)>> {
+    let out = crate::git_str(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(objecttype) %(*objectname) %(refname)",
+            "refs/heads",
+            "refs/tags",
+        ],
+    )?;
+    let mut v = Vec::new();
+    for line in out.lines() {
+        let mut it = line.splitn(4, ' ');
+        let objn = it.next().unwrap_or_default();
+        let objt = it.next().unwrap_or_default();
+        let peeled = it.next().unwrap_or_default();
+        let name = it.next().unwrap_or_default();
+        // A tag's peeled commit is %(*objectname); a branch points at a
+        // commit directly.
+        let sha = if objt == "tag" { peeled } else { objn };
+        if sha.is_empty() || name.is_empty() {
+            continue;
+        }
+        v.push((name.to_string(), sha.to_string()));
+    }
+    Ok(v)
+}
+
+// ------------------------------------------------------- persistence
+//
+// A minimal sidecar `dir/meta.sqlite` (kv + two tables) recording what
+// a reopen needs and nothing more. The combined-state chain itself (the
+// tree data + the per-revision variant base pointers) lives in the
+// depot and is NOT duplicated here; meta only maps shas/refs to the
+// revision/lane axis the chain is indexed by.
+
+const META_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS revs(rev INTEGER PRIMARY KEY, sha TEXT NOT NULL, lane INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS refs(name TEXT PRIMARY KEY, sha TEXT NOT NULL, rev INTEGER NOT NULL, lane INTEGER NOT NULL);
+";
+const META_SCHEMA_VERSION: &str = "1";
+
+fn meta_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("meta.sqlite")
+}
+
+fn map_sql(e: rusqlite::Error) -> Error {
+    Error::Meta(e.to_string())
+}
+
+/// Write the sha→(rev,lane) and ref→(sha,rev,lane) bindings so the store
+/// reopens without any repo access.
+fn persist_meta(
+    dir: &Path,
+    n_rev: usize,
+    lane_of: &[LaneId],
+    sha_of: &[String],
+    refs: &HashMap<String, String>,
+) -> Result<()> {
+    let mut conn = rusqlite::Connection::open(meta_path(dir)).map_err(map_sql)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(map_sql)?;
+    conn.execute_batch(META_SCHEMA).map_err(map_sql)?;
+    let tx = conn.transaction().map_err(map_sql)?;
+    tx.execute("DELETE FROM revs", []).map_err(map_sql)?;
+    tx.execute("DELETE FROM refs", []).map_err(map_sql)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO kv(key,value) VALUES('schema',?1),('n_rev',?2)",
+        rusqlite::params![META_SCHEMA_VERSION, n_rev.to_string()],
+    )
+    .map_err(map_sql)?;
+    {
+        let mut ins = tx
+            .prepare("INSERT INTO revs(rev,sha,lane) VALUES(?1,?2,?3)")
+            .map_err(map_sql)?;
+        for (i, sha) in sha_of.iter().enumerate() {
+            ins.execute(rusqlite::params![i as i64, sha, lane_of[i] as i64])
+                .map_err(map_sql)?;
+        }
+    }
+    {
+        let idx: HashMap<&str, usize> =
+            sha_of.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+        let mut ins = tx
+            .prepare("INSERT INTO refs(name,sha,rev,lane) VALUES(?1,?2,?3,?4)")
+            .map_err(map_sql)?;
+        for (name, sha) in refs {
+            let rev = idx[sha.as_str()];
+            ins.execute(rusqlite::params![name, sha, rev as i64, lane_of[rev] as i64])
+                .map_err(map_sql)?;
+        }
+    }
+    tx.commit().map_err(map_sql)?;
+    Ok(())
+}
+
+/// Reload `(n_rev, lane_of, sha_of, refs)` from the sidecar.
+#[allow(clippy::type_complexity)]
+fn load_meta(
+    dir: &Path,
+) -> Result<(usize, Vec<LaneId>, Vec<String>, HashMap<String, String>)> {
+    let p = meta_path(dir);
+    if !p.exists() {
+        return Err(Error::Chain(format!("no lane store at {}", dir.display())));
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &p,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(map_sql)?;
+    let schema: String = conn
+        .query_row("SELECT value FROM kv WHERE key='schema'", [], |r| r.get(0))
+        .map_err(map_sql)?;
+    if schema != META_SCHEMA_VERSION {
+        return Err(Error::Chain(format!(
+            "lane store schema {schema:?}, this build reads {META_SCHEMA_VERSION}"
+        )));
+    }
+    let n_rev: i64 = conn
+        .query_row("SELECT value FROM kv WHERE key='n_rev'", [], |r| {
+            let v: String = r.get(0)?;
+            Ok(v.parse::<i64>().unwrap_or(0))
+        })
+        .map_err(map_sql)?;
+    let n_rev = n_rev as usize;
+    let mut sha_of = vec![String::new(); n_rev];
+    let mut lane_of = vec![0 as LaneId; n_rev];
+    {
+        let mut q = conn.prepare("SELECT rev,sha,lane FROM revs").map_err(map_sql)?;
+        let rows = q
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })
+            .map_err(map_sql)?;
+        for row in rows {
+            let (rev, sha, lane) = row.map_err(map_sql)?;
+            let rev = rev as usize;
+            if rev >= n_rev {
+                return Err(Error::Chain(format!("meta: rev {rev} out of range")));
+            }
+            sha_of[rev] = sha;
+            lane_of[rev] = lane as LaneId;
+        }
+    }
+    let mut refs = HashMap::new();
+    {
+        let mut q = conn.prepare("SELECT name,sha FROM refs").map_err(map_sql)?;
+        let rows = q
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(map_sql)?;
+        for row in rows {
+            let (name, sha) = row.map_err(map_sql)?;
+            refs.insert(name, sha);
+        }
+    }
+    Ok((n_rev, lane_of, sha_of, refs))
 }
 
 /// Stream the u64-length-prefixed records of an f1 frame in stored
