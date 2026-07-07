@@ -215,6 +215,44 @@ fn cf(e: String) -> Error {
     Error::Chain(e)
 }
 
+/// How a revision's combined state is physically laid out in a frame —
+/// the ONE reader-visible choice, recorded as data (a `kv` row) so a
+/// reopened store reconstructs with the matching extractor. It is NOT a
+/// frame-format change: every mode stores the same reverse-delta chain of
+/// depot Views; only the shape of each View and how a lane is pulled back
+/// out of it differ.
+#[derive(Clone, Copy, PartialEq)]
+enum Repr {
+    /// Lane-keyed root, every live lane its own full subtree.
+    Full,
+    /// Lane-keyed root, near-identical live lanes stored as base-relative
+    /// variant deltas (cutoff = the similarity threshold).
+    Variant(f64),
+    /// Union-variant: ONE tree keyed by real path; a file's distinct
+    /// (attrs, content) versions live under `\0v`/`\0m` sibling keys with a
+    /// lane bitmap. A lane is pulled back with [`crate::variants::extract`].
+    /// Content is byte-stable across lane-membership changes, so a base
+    /// commit that shifts no blob yields an empty frame-to-frame delta.
+    Union,
+}
+
+impl Repr {
+    fn tag(self) -> &'static str {
+        match self {
+            Repr::Full => "full",
+            Repr::Variant(_) => "variant",
+            Repr::Union => "union",
+        }
+    }
+    fn from_tag(s: &str) -> Repr {
+        match s {
+            "union" => Repr::Union,
+            "variant" => Repr::Variant(VARIANT_CUTOFF),
+            _ => Repr::Full,
+        }
+    }
+}
+
 /// A built lane store: a private `wikimak_depot` instance on disk (the
 /// combined-state chain) plus the RAM bookkeeping a reader needs to map
 /// a commit to its revision index and lane.
@@ -231,6 +269,8 @@ pub struct LaneStore {
     /// ref name → resolved commit sha (persisted; lets a reopened store
     /// serve any ref's tree from disk alone).
     refs: HashMap<String, String>,
+    /// Physical layout of the stored states — picks the read-side extractor.
+    repr: Repr,
 }
 
 impl LaneStore {
@@ -242,7 +282,18 @@ impl LaneStore {
     /// `cat-file` + `tree_layer`) to build each commit's full tree View
     /// and the depot frame codec to store the reverse-delta chain.
     pub fn encode_repo(repo: &Path, dir: &Path, level: i32) -> Result<LaneStore> {
-        Self::encode_impl(repo, dir, level, None)
+        Self::encode_impl(repo, dir, level, Repr::Full)
+    }
+
+    /// Like [`encode_repo`](Self::encode_repo) but stores every revision's
+    /// live lanes as ONE union-variant tree (see [`Repr::Union`] and
+    /// [`crate::variants`]). No base, no delta-of-delta, no base-switching:
+    /// content nodes are byte-stable across lane-membership changes, so a
+    /// trunk commit that touches one lane leaves every other lane's content
+    /// untouched and the frame-to-frame reverse delta is proportional to
+    /// real blob churn. Reconstruction is SHA-exact.
+    pub fn encode_repo_union(repo: &Path, dir: &Path, level: i32) -> Result<LaneStore> {
+        Self::encode_impl(repo, dir, level, Repr::Union)
     }
 
     /// Like [`encode_repo`](Self::encode_repo) but stores near-identical
@@ -254,15 +305,18 @@ impl LaneStore {
     /// content of a variant group is ~one base subtree + small deltas, not
     /// N full trees.
     pub fn encode_repo_variant(repo: &Path, dir: &Path, level: i32) -> Result<LaneStore> {
-        Self::encode_impl(repo, dir, level, Some(VARIANT_CUTOFF))
+        Self::encode_impl(repo, dir, level, Repr::Variant(VARIANT_CUTOFF))
     }
 
     fn encode_impl(
         repo: &Path,
         dir: &Path,
         level: i32,
-        variant_cutoff: Option<f64>,
+        repr: Repr,
     ) -> Result<LaneStore> {
+        // Whether we need the frontier's per-commit blob-oid sets (only the
+        // variant clustering metric consumes them).
+        let want_oids = matches!(repr, Repr::Variant(_));
         // Revision order + per-commit parents come from the SAME
         // O(changes) discovery the shipped importer uses: one
         // `rev-list --parents` pass yields `dag.order` (walk_order — a
@@ -330,6 +384,11 @@ impl LaneStore {
         let batch_bound = batch_ram_bound();
         let mut full_combined = View::default();
         let mut lane_blob_sets: HashMap<LaneId, HashSet<Vec<u8>>> = HashMap::new();
+        // Union path: each live lane's CURRENT tree, indexed by lane id
+        // (None = absent/evicted). `union(&lane_views)` is this revision's
+        // stored state; only one entry changes per revision.
+        let n_lanes = assignment.span.len();
+        let mut lane_views: Vec<Option<View>> = vec![None; n_lanes];
         let mut prev: Option<View> = None;
         let mut batch: Vec<Vec<u8>> = Vec::new(); // reverse records, forward order
         let mut batch_bytes: u64 = 0;
@@ -339,7 +398,7 @@ impl LaneStore {
             &dag,
             Vec::new(),
             &Default::default(),
-            variant_cutoff.is_some(),
+            want_oids,
             &mut |cm, _tree_oid, view, oids, _cat| {
                 let i = expect;
                 if i >= n_rev || cm.sha != sha_of[i] {
@@ -363,11 +422,19 @@ impl LaneStore {
                 for &dead in &dying_at[i] {
                     full_combined.children.remove(&lane_key(dead));
                     lane_blob_sets.remove(&dead);
+                    lane_views[dead as usize] = None;
                 }
                 let child = Arc::new(view.clone());
                 full_combined.children.insert(lane_key(lane_of[i]), child.clone());
-                let cur = match variant_cutoff {
-                    Some(c) => {
+                lane_views[lane_of[i] as usize] = Some(view.clone());
+                let cur = match repr {
+                    Repr::Union => {
+                        // The whole live-lane set, unioned into one path-keyed
+                        // tree. Content stays byte-stable when a lane doesn't
+                        // move, so the reverse delta against `prev` is tiny.
+                        crate::variants::union(&lane_views).unwrap_or_default()
+                    }
+                    Repr::Variant(c) => {
                         // The frontier maintained this commit's git-oid set
                         // as its first parent's set + this commit's changes
                         // (zero hashing). It IS the advanced lane's blob-oid
@@ -387,7 +454,7 @@ impl LaneStore {
                             .collect();
                         build_stored(&full_combined, &live, &lane_blob_sets, c)?
                     }
-                    None => full_combined.clone(),
+                    Repr::Full => full_combined.clone(),
                 };
                 if i == 0 {
                     // Seed the chain's f0 with the first full state; the
@@ -451,8 +518,8 @@ impl LaneStore {
             }
         }
 
-        persist_meta(dir, n_rev, &lane_of, &sha_of, &refs)?;
-        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs })
+        persist_meta(dir, n_rev, &lane_of, &sha_of, &refs, repr)?;
+        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs, repr })
     }
 
     /// Reopen a persisted lane store from `dir` alone — no repo access.
@@ -475,13 +542,13 @@ impl LaneStore {
 
     pub fn open(dir: &Path) -> Result<LaneStore> {
         let depot = open_depot(dir)?;
-        let (n_rev, lane_of, sha_of, refs) = load_meta(dir)?;
+        let (n_rev, lane_of, sha_of, refs, repr) = load_meta(dir)?;
         let sha_to_rev = sha_of
             .iter()
             .enumerate()
             .map(|(i, s)| (s.clone(), i))
             .collect();
-        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs })
+        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs, repr })
     }
 
     /// ref name → resolved commit sha (persisted set).
@@ -537,7 +604,10 @@ impl LaneStore {
     /// combined state's child for that revision's lane.
     pub fn tree_at(&self, rev: usize) -> Result<View> {
         let combined = self.combined_at(rev)?;
-        resolve_lane_subtree(&combined, self.lane_of[rev])
+        match self.repr {
+            Repr::Union => Ok(crate::variants::extract(&combined, self.lane_of[rev] as usize)),
+            Repr::Full | Repr::Variant(_) => resolve_lane_subtree(&combined, self.lane_of[rev]),
+        }
     }
 
     /// The git tree oid of the commit at revision `rev` (reconstructed).
@@ -747,6 +817,7 @@ fn persist_meta(
     lane_of: &[LaneId],
     sha_of: &[String],
     refs: &HashMap<String, String>,
+    repr: Repr,
 ) -> Result<()> {
     let mut conn = rusqlite::Connection::open(meta_path(dir)).map_err(map_sql)?;
     conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(map_sql)?;
@@ -754,9 +825,11 @@ fn persist_meta(
     let tx = conn.transaction().map_err(map_sql)?;
     tx.execute("DELETE FROM revs", []).map_err(map_sql)?;
     tx.execute("DELETE FROM refs", []).map_err(map_sql)?;
+    // `repr` is DATA in the existing kv table (no table/column change), so
+    // an older store with no such row reads back as Full.
     tx.execute(
-        "INSERT OR REPLACE INTO kv(key,value) VALUES('schema',?1),('n_rev',?2)",
-        rusqlite::params![META_SCHEMA_VERSION, n_rev.to_string()],
+        "INSERT OR REPLACE INTO kv(key,value) VALUES('schema',?1),('n_rev',?2),('repr',?3)",
+        rusqlite::params![META_SCHEMA_VERSION, n_rev.to_string(), repr.tag()],
     )
     .map_err(map_sql)?;
     {
@@ -788,7 +861,7 @@ fn persist_meta(
 #[allow(clippy::type_complexity)]
 fn load_meta(
     dir: &Path,
-) -> Result<(usize, Vec<LaneId>, Vec<String>, HashMap<String, String>)> {
+) -> Result<(usize, Vec<LaneId>, Vec<String>, HashMap<String, String>, Repr)> {
     let p = meta_path(dir);
     if !p.exists() {
         return Err(Error::Chain(format!("no lane store at {}", dir.display())));
@@ -843,7 +916,12 @@ fn load_meta(
             refs.insert(name, sha);
         }
     }
-    Ok((n_rev, lane_of, sha_of, refs))
+    // Absent in stores written before the union path — default to Full.
+    let repr = conn
+        .query_row("SELECT value FROM kv WHERE key='repr'", [], |r| r.get::<_, String>(0))
+        .map(|s| Repr::from_tag(&s))
+        .unwrap_or(Repr::Full);
+    Ok((n_rev, lane_of, sha_of, refs, repr))
 }
 
 /// Stream the u64-length-prefixed records of an f1 frame in stored
