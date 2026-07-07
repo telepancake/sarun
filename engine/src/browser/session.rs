@@ -19,9 +19,16 @@ use super::render::{self, Grid, Rgb};
 
 const CALL: Duration = Duration::from_secs(20);
 
+/// One browser tab: its CDP target plus the attached flat session.
+struct Tab {
+    target_id: String,
+    session_id: String,
+}
+
 pub struct BrowserSession {
     cdp: Arc<Cdp>,
-    session_id: String,
+    tabs: Vec<Tab>,
+    active: usize,
     pub cols: usize,
     pub rows: usize,
 }
@@ -35,9 +42,10 @@ impl BrowserSession {
             .as_array()
             .and_then(|ts| ts.iter().find(|t| t["type"] == "page"))
             .context("no page target")?;
+        let target_id = page["targetId"].as_str().context("no targetId")?.to_string();
         let attached = cdp.call(
             "Target.attachToTarget",
-            json!({ "targetId": page["targetId"], "flatten": true }),
+            json!({ "targetId": target_id, "flatten": true }),
             None,
             CALL,
         )?;
@@ -46,33 +54,110 @@ impl BrowserSession {
             .context("attach: no sessionId")?
             .to_string();
 
-        let me = Self { cdp, session_id, cols, rows };
-        let s = Some(me.session_id.as_str());
-        me.cdp.call("Page.enable", json!({}), s, CALL)?;
-        me.cdp.call("DOM.enable", json!({}), s, CALL)?;
-        me.cdp.call("DOMSnapshot.enable", json!({}), s, CALL)?;
-        me.cdp.call(
+        let me = Self {
+            cdp,
+            tabs: vec![Tab { target_id, session_id: session_id.clone() }],
+            active: 0,
+            cols,
+            rows,
+        };
+        me.setup_target(&session_id)?;
+        Ok(me)
+    }
+
+    /// Per-tab CDP setup: enable the domains, force device metrics, inject the
+    /// cell font on every document. Run once per target (tab).
+    fn setup_target(&self, sid: &str) -> Result<()> {
+        let s = Some(sid);
+        self.cdp.call("Page.enable", json!({}), s, CALL)?;
+        self.cdp.call("DOM.enable", json!({}), s, CALL)?;
+        self.cdp.call("DOMSnapshot.enable", json!({}), s, CALL)?;
+        self.cdp.call(
             "Emulation.setDeviceMetricsOverride",
             json!({
-                "width": cols as i64 * CELL_W,
-                "height": rows as i64 * CELL_H,
+                "width": self.cols as i64 * CELL_W,
+                "height": self.rows as i64 * CELL_H,
                 "deviceScaleFactor": 1,
                 "mobile": false
             }),
             s,
             CALL,
         )?;
-        me.cdp.call(
+        self.cdp.call(
             "Page.addScriptToEvaluateOnNewDocument",
             json!({ "source": inject_js(), "runImmediately": true }),
             s,
             CALL,
         )?;
-        Ok(me)
+        Ok(())
     }
 
     fn s(&self) -> Option<&str> {
-        Some(self.session_id.as_str())
+        Some(self.tabs[self.active].session_id.as_str())
+    }
+
+    /// The active tab's flat session id (for filtering its screencast frames).
+    pub fn active_session(&self) -> &str {
+        &self.tabs[self.active].session_id
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    /// Open a new tab (a fresh page target), set it active, and navigate it.
+    /// The caller re-issues start_screencast on the new active session.
+    pub fn new_tab(&mut self, url: &str) -> Result<()> {
+        let created = self.cdp.call(
+            "Target.createTarget",
+            json!({ "url": "about:blank" }),
+            None,
+            CALL,
+        )?;
+        let target_id = created["targetId"].as_str().context("createTarget: no id")?.to_string();
+        let attached = self.cdp.call(
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+            None,
+            CALL,
+        )?;
+        let session_id = attached["sessionId"].as_str().context("no sessionId")?.to_string();
+        self.setup_target(&session_id)?;
+        self.tabs.push(Tab { target_id, session_id });
+        self.active = self.tabs.len() - 1;
+        self.navigate(url)?;
+        Ok(())
+    }
+
+    /// Close the active tab. Returns false if it was the last one (caller
+    /// should quit). Otherwise the previous tab becomes active.
+    pub fn close_tab(&mut self) -> bool {
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        let tab = self.tabs.remove(self.active);
+        let _ = self.cdp.call(
+            "Target.closeTarget",
+            json!({ "targetId": tab.target_id }),
+            None,
+            CALL,
+        );
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        true
+    }
+
+    /// Switch to the next / previous tab (wraps).
+    pub fn cycle_tab(&mut self, delta: isize) {
+        let n = self.tabs.len();
+        if n > 1 {
+            self.active = (self.active as isize + delta).rem_euclid(n as isize) as usize;
+        }
     }
 
     /// Navigate; returns any `errorText` reported by the browser.
@@ -213,6 +298,12 @@ impl BrowserSession {
             CALL,
         )?;
         Ok(())
+    }
+
+    /// Stop the active tab's screencast (before switching away from it, so a
+    /// background tab never keeps pushing frames).
+    pub fn stop_screencast(&self) {
+        let _ = self.cdp.call("Page.stopScreencast", json!({}), self.s(), CALL);
     }
 
     pub fn ack_frame(&self, frame_session: i64) {

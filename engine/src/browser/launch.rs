@@ -266,8 +266,22 @@ fn status_line(sess: &BrowserSession, url_edit: Option<&str>, mouse_grab: bool) 
             // Hints FIRST (fixed, never truncated); title/url fill the rest and
             // get cut if long. The mouse-mode indicator is always visible.
             let sel = if mouse_grab { "^X sel" } else { "SEL·^X" };
+            // Tab strip only when there's more than one tab.
+            let tabs = if sess.tab_count() > 1 {
+                let mut t = String::new();
+                for i in 0..sess.tab_count() {
+                    if i == sess.active_index() {
+                        t.push_str(&format!("[{}]", i + 1));
+                    } else {
+                        t.push_str(&format!(" {} ", i + 1));
+                    }
+                }
+                format!("{t} │ ")
+            } else {
+                String::new()
+            };
             let page = if title.is_empty() { url } else { format!("{title} — {url}") };
-            format!(" ^L ^R alt←→ {sel} ^Q  │  {page}")
+            format!(" {tabs}^L ^R ^T+ ^W- ^N▸ {sel} ^Q  │  {page}")
         }
     };
     let s: String = s.chars().map(|c| if c < ' ' { ' ' } else { c }).take(sess.cols).collect();
@@ -331,7 +345,7 @@ fn set_mouse_tracking(out: &mut impl Write, on: bool) {
 }
 
 /// Run the interactive browser TUI against an attached session.
-pub fn interactive(sess: &BrowserSession) -> Result<()> {
+pub fn interactive(sess: &mut BrowserSession) -> Result<()> {
     use base64::Engine as _;
     let mut out = std::io::stdout();
     let saved = set_raw(0);
@@ -390,14 +404,22 @@ pub fn interactive(sess: &BrowserSession) -> Result<()> {
             for ev in sess.cdp().drain_events() {
                 match ev.get("method").and_then(|m| m.as_str()) {
                     Some("Page.screencastFrame") => {
-                        let sid = ev["params"]["sessionId"].as_i64().unwrap_or(0);
-                        sess.ack_frame(sid);
-                        if let Some(d) = ev["params"]["data"].as_str() {
-                            if let Ok(png) =
-                                base64::engine::general_purpose::STANDARD.decode(d)
-                            {
-                                frame_png = Some(png);
-                                page_dirty = true;
+                        // Only the active tab's frames drive the view; a stale
+                        // in-flight frame from a tab we just switched away from
+                        // is dropped (not acked, so its cast — already stopped —
+                        // stays quiet).
+                        let from_active = ev.get("sessionId").and_then(|v| v.as_str())
+                            == Some(sess.active_session());
+                        if from_active {
+                            let sid = ev["params"]["sessionId"].as_i64().unwrap_or(0);
+                            sess.ack_frame(sid);
+                            if let Some(d) = ev["params"]["data"].as_str() {
+                                if let Ok(png) =
+                                    base64::engine::general_purpose::STANDARD.decode(d)
+                                {
+                                    frame_png = Some(png);
+                                    page_dirty = true;
+                                }
                             }
                         }
                     }
@@ -446,6 +468,38 @@ pub fn interactive(sess: &BrowserSession) -> Result<()> {
                 }
                 match tok.as_slice() {
                     b"\x11" => return Ok(()),                  // Ctrl-Q
+                    b"\x14" => {                                // Ctrl-T: new tab
+                        sess.stop_screencast();
+                        if sess.new_tab("about:blank").is_ok() {
+                            let _ = sess.start_screencast();
+                            url_edit = Some(String::new()); // type where to go
+                        }
+                        frame_png = None;
+                        page_dirty = true;
+                        chrome_dirty = true;
+                    }
+                    b"\x17" => {                                // Ctrl-W: close tab
+                        if !sess.close_tab() {
+                            return Ok(()); // last tab → quit
+                        }
+                        let _ = sess.start_screencast();
+                        frame_png = None;
+                        page_dirty = true;
+                    }
+                    b"\x0e" => {                                // Ctrl-N: next tab
+                        sess.stop_screencast();
+                        sess.cycle_tab(1);
+                        let _ = sess.start_screencast();
+                        frame_png = None;
+                        page_dirty = true;
+                    }
+                    b"\x10" => {                                // Ctrl-P: prev tab
+                        sess.stop_screencast();
+                        sess.cycle_tab(-1);
+                        let _ = sess.start_screencast();
+                        frame_png = None;
+                        page_dirty = true;
+                    }
                     b"\x0c" => { url_edit = Some(String::new()); chrome_dirty = true; } // ^L
                     b"\x18" => {                                // Ctrl-X: mouse mode
                         mouse_grab = !mouse_grab;
@@ -559,9 +613,9 @@ usage:
     --spki KEY    trust a MITM root by SPKI hash (for tap boxes)
 
 Interactive keys: ^Q quit, ^L url bar, ^R reload, alt-←/→ back/forward,
-arrows/PgUp/PgDn scroll, mouse click, ^X toggle terminal text-selection
-(hands the mouse back to your terminal so you can select/copy), typing
-goes to the page.
+^T new tab, ^W close tab, ^N/^P next/prev tab, arrows/PgUp/PgDn scroll,
+mouse click, ^X toggle terminal text-selection (hands the mouse back to
+your terminal so you can select/copy), typing goes to the page.
 
 Drives a stock headless Chromium over the DevTools Protocol; no carbonyl.
 Set $CELLULOSE_BROWSER to choose the browser binary.";
@@ -626,11 +680,11 @@ pub fn browser_cli(args: &[String]) -> i32 {
 fn run_interactive(url: &str, cols: usize, rows: usize, spki: Option<&str>) -> Result<i32> {
     let url = normalize_url(url);
     let browser = spawn_host_chromium(spki)?;
-    let sess = BrowserSession::attach(browser.cdp.clone(), cols, rows)?;
+    let mut sess = BrowserSession::attach(browser.cdp.clone(), cols, rows)?;
     sess.navigate(&url)?;
     sess.wait_load(Duration::from_secs(15));
     std::thread::sleep(Duration::from_millis(300)); // font settle
-    interactive(&sess)?;
+    interactive(&mut sess)?;
     Ok(0)
 }
 
