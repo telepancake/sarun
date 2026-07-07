@@ -3244,12 +3244,12 @@ impl App {
         self.load_mirrors();
     }
 
-    /// 'b' on Mirrors: browse the selected WIKI mirror in carbonyl
-    /// (MIRRORS.md §Serve/browse). Starts a host-side `wikimak serve` over
-    /// the mirror's depot root (reused if already running) and opens
-    /// carbonyl at its loopback address with `--net host` so the boxed
-    /// browser can reach the host-side server. Plain HTTP to localhost, so
-    /// no MITM SPKI is needed (unlike the replay path).
+    /// 'b' on Mirrors: browse the selected WIKI mirror in the in-box
+    /// browser (MIRRORS.md §Serve/browse). Starts a host-side `wikimak
+    /// serve` over the mirror's depot root (reused if already running) and
+    /// opens the browser at its loopback address with `--net host` so the
+    /// boxed browser can reach the host-side server. Plain HTTP to
+    /// localhost, so no MITM SPKI is needed (unlike the replay path).
     fn mirror_browse_selected(&mut self) {
         let Some(job) = self.mirror_jobs.get(self.sel_mirror) else { return };
         if job.kind != "wiki" {
@@ -3273,7 +3273,7 @@ impl App {
         let argv = build_launch(
             &LaunchTarget::Browser { url: url.clone(), spki: None }, &how);
         self.open_pty(argv);
-        self.status = format!("wiki #{id}: browsing {url} in carbonyl");
+        self.status = format!("wiki #{id}: browsing {url}");
     }
 
     /// 'R' on Mirrors: start every due, unpaused, not-running job.
@@ -6237,12 +6237,12 @@ fn open_replay_in_browser(app: &mut App, source_sid: &str, url: &str) {
     app.status = format!("replaying box {source_sid} in carbonyl — {url}");
 }
 
-/// Host-side `wikimak serve` children backing the carbonyl wiki reader
+/// Host-side `wikimak serve` children backing the in-box wiki reader
 /// (MIRRORS.md §Serve/browse). A wiki mirror's depot lives on the host
 /// filesystem and the server binds host loopback, so serve runs as a child
 /// of THIS engine (a self-exec of the embedded `wikimak` driver), NOT in a
-/// box — carbonyl then reaches it with `--net host`. One server per depot
-/// root; the port is derived from the root so a re-browse reuses it.
+/// box — the browser then reaches it with `--net host`. One server per
+/// depot root; the port is derived from the root so a re-browse reuses it.
 mod wiki_serve {
     use std::collections::HashMap;
     use std::process::Child;
@@ -7608,7 +7608,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('f'), PaneGate::On(Pane::BuildEdges), PaneAction::ToggleEdgeRunning, Some("toggle running-only (on Targets)")),
     (Key::Char('r'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRun,     Some("force-run selected mirror job (on Mirrors)")),
     (Key::Char('R'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRunPending, Some("run all pending mirror jobs (on Mirrors)")),
-    (Key::Char('b'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorBrowse,  Some("browse wiki mirror in carbonyl (on Mirrors)")),
+    (Key::Char('b'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorBrowse,  Some("browse wiki mirror in the browser (on Mirrors)")),
     (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
     (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
     (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
@@ -12321,7 +12321,7 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                 mk(if paused { "Resume this job" } else { "Pause this job" },
                    "space", Action::MirrorTogglePause),
                 mk("Delete this job",     "D", Action::MirrorRemove),
-                mk("Browse in carbonyl",  "b", Action::MirrorBrowse),
+                mk("Browse this wiki",    "b", Action::MirrorBrowse),
             ]))
         }
         Pane::Pty => {
