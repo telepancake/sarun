@@ -4517,6 +4517,16 @@ impl App {
                         "{:>7} {:>7} {:>2} {:<16} {}",
                         n("pid"), n("tid"), g("state"), g("comm"),
                         g("detail")));
+                    // Symbolized backtrace (ptrace/gdb) — the layer that
+                    // localizes a "running" spin. The CLI prints this; the
+                    // panel must too, or every wedge reads as a bare "running".
+                    if let Some(bt) = p.get("bt").and_then(Value::as_array) {
+                        for f in bt {
+                            if let Some(s) = f.as_str() {
+                                lines.push(format!("{:22}{}", "", s));
+                            }
+                        }
+                    }
                 }
                 if procs.is_empty() {
                     lines.push("(no live threads — the tree exited; \
