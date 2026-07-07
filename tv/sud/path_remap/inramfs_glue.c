@@ -138,7 +138,24 @@ static int resolve_two_tickets(struct sud_syscall_ctx *ctx,
     int r = resolve_ticket(ctx, src_dirfd, src_path,
                            0 /*follow=0 for link/rename*/,
                            1 /*want_parent*/, src_t);
-    if (r < 0) return r;
+    if (r < 0) {
+        /* Src is outside the inramfs mount (r == -1) or a resolve error.
+         * If the DESTINATION is under the mount, this is a cross-boundary
+         * rename/link (overlay/host -> inramfs). We must claim it and
+         * surface -EXDEV so mv/ln fall back to copy+unlink — otherwise it
+         * falls through to the overlay, which kernel-renames the source
+         * into a path inramfs shadows: source gone, destination invisible,
+         * SILENT DATA LOSS. Symmetric with the src-inside/dst-outside case
+         * below, which already returns -EXDEV. */
+        if (r == -1) {
+            struct sud_pr_inramfs_ticket probe;
+            int dr = sud_pr_resolve_at_inramfs_ticket(
+                dst_dirfd, dst_path, 0 /*follow*/, 1 /*want_parent*/,
+                ctx->scratch, ctx->scratch_size, &probe);
+            if (dr >= 0) return -EXDEV;   /* dst inside, src outside */
+        }
+        return r;                          /* neither ours, or a real error */
+    }
     size_t l = strlen(src_t->abs_path);
     if (l + 1 > src_save_sz) return -ENAMETOOLONG;
     /* Re-point basename into the src_save buffer so it survives
