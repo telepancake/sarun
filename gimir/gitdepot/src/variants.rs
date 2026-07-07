@@ -28,7 +28,7 @@
 //! no base-switching.
 
 use depot::{Attrs, Bytes, Name, View};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Marker byte leading every non-path key. Real git path segments never
@@ -78,15 +78,24 @@ pub fn union(lanes: &[Option<View>]) -> Option<View> {
 fn union_node(lanes: &[Option<&View>]) -> Option<View> {
     // A version = a distinct (attrs, content); its value is the lane bitmap.
     let mut versions: BTreeMap<(Attrs, Bytes), Vec<u8>> = BTreeMap::new();
-    let mut dir_names: BTreeSet<Name> = BTreeSet::new();
+    // One sorted cursor per lane that is a directory here; a k-way merge
+    // over these walks every child name across all lanes in lockstep,
+    // linear in total entries — no per-name re-lookup per lane.
+    type Cursor<'a> = std::iter::Peekable<Box<dyn Iterator<Item = (&'a Name, &'a Arc<View>)> + 'a>>;
+    let mut cursors: Vec<Cursor> = Vec::with_capacity(lanes.len());
+    let empty = || -> Cursor { (Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>).peekable() };
     let mut any = false;
-    for (i, v) in lanes.iter().enumerate() {
-        let Some(v) = v else { continue };
+    for v in lanes {
+        let Some(v) = v else {
+            cursors.push(empty()); // absent lane: contributes nothing here
+            continue;
+        };
         any = true;
         if let Some(content) = &v.blob {
-            set_bit(versions.entry((v.attrs.clone(), content.clone())).or_default(), i);
+            set_bit(versions.entry((v.attrs.clone(), content.clone())).or_default(), cursors.len());
+            cursors.push(empty()); // a file has no child names to merge
         } else {
-            dir_names.extend(v.children.keys().cloned());
+            cursors.push((Box::new(v.children.iter()) as Box<dyn Iterator<Item = _>>).peekable());
         }
     }
     if !any {
@@ -110,17 +119,19 @@ fn union_node(lanes: &[Option<&View>]) -> Option<View> {
             Arc::new(View { blob: None, attrs, children: BTreeMap::new() }),
         );
     }
-    for name in dir_names {
-        let sub: Vec<Option<&View>> = lanes
-            .iter()
-            .map(|v| {
-                v.and_then(|v| {
-                    if v.blob.is_none() {
-                        v.children.get(&name).map(Arc::as_ref)
-                    } else {
-                        None
-                    }
-                })
+    // K-way merge: repeatedly take the smallest name any cursor sits on,
+    // gather that name's subtree from every lane parked on it (advancing
+    // only those cursors), and recurse.
+    loop {
+        let Some(name) = cursors.iter_mut().filter_map(|c| c.peek().map(|(n, _)| *n)).min().cloned()
+        else {
+            break;
+        };
+        let sub: Vec<Option<&View>> = cursors
+            .iter_mut()
+            .map(|c| match c.peek() {
+                Some((n, _)) if **n == name => c.next().map(|(_, v)| Arc::as_ref(v)),
+                _ => None,
             })
             .collect();
         if let Some(u) = union_node(&sub) {
