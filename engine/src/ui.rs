@@ -7751,11 +7751,19 @@ fn dispatch_pane_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
 fn menubar_chips(app: &App) -> Vec<(char, &'static str)> {
     let has = |k: &str| app.box_summary.get(k)
         .and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false);
-    PANE_KEYS.iter().filter(|(_, pane, _, vis, _)| match vis {
+    // `New (N)` is ALWAYS first: it opens the launcher (a shell/container/
+    // browser box, or the host shell). Previously the only menubar route to
+    // the launcher was the `P` chip, which is hidden until a PTY already
+    // exists — a chicken-and-egg where you couldn't discover how to open your
+    // first window. This makes "new window" a visible menu entry, not an F7
+    // treasure hunt.
+    let mut chips = vec![('N', "New")];
+    chips.extend(PANE_KEYS.iter().filter(|(_, pane, _, vis, _)| match vis {
         PaneVis::Always => true,
         PaneVis::Data(k) => has(k) || app.focus == *pane,
         PaneVis::Pty => !app.ptys.is_empty(),
-    }).map(|(key, _, label, _, _)| (*key, *label)).collect()
+    }).map(|(key, _, label, _, _)| (*key, *label)));
+    chips
 }
 
 fn menubar_spans(app: &App) -> Vec<Span<'static>> {
@@ -12512,6 +12520,13 @@ fn run_action(app: &mut App, a: Action) {
 }
 
 fn dispatch_menubar_key(app: &mut App, k: char) {
+    // `New` opens the launcher directly — the one always-available menu entry
+    // for starting a shell / container / browser box, so it's discoverable
+    // without already having a window open.
+    if k == 'N' {
+        open_pty_menu(app);
+        return;
+    }
     // PTY is special: focus a live PTY if one's open, else prompt for the
     // login command. Every other accelerator routes through the PANE_KEYS
     // table to `go_to_pane`, so the binding lives in exactly one place.
@@ -13525,7 +13540,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             shutdown_rpc(&app.sock);
                             app.should_quit = true;
                         }
-                        KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'
+                        KeyCode::Char(c @ ('N'|'b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'
                                            |'?'|'P'|'i'|'w'|'v'|'s'|'M')) =>
                             dispatch_menubar_key(&mut app, c),
                         _ => {}
@@ -13588,7 +13603,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // Letter accelerators: route through the same
                     // dispatch_menubar_key the F9 menu-nav path uses,
                     // so the two paths can't diverge.
-                    KeyCode::Char(c @ ('b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'w'|'v'|'s'|'M')) =>
+                    KeyCode::Char(c @ ('N'|'b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'w'|'v'|'s'|'M')) =>
                         dispatch_menubar_key(&mut app, c),
                     // Esc / Backspace from the packet drill-down pops back
                     // to the flows list, keeping its cursor + detail state.
