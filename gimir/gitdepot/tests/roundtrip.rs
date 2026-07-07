@@ -1119,3 +1119,73 @@ fn mirror_discards_a_stale_partial_clone_scratch() {
     let tip = sh_git(&origin, &["rev-parse", "main"]).trim().to_string();
     assert_eq!(gitdepot::resolve_ref(&store, "main").unwrap().unwrap().sha(), tip);
 }
+
+/// The empty git tree (4b825dc…) imports and reconstructs with NO sentinel
+/// and NO `Unsupported("empty tree")` — it is simply the empty-but-present
+/// root View. Covers an initial `--allow-empty` commit in a fresh repo AND
+/// a mid-history commit that deletes every file (both have the empty tree).
+#[test]
+fn empty_tree_commits_roundtrip() {
+    let empty_oid = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let store = tmp.path().join("store");
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&repo).unwrap();
+    sh_git(&repo, &["init", "-q", "-b", "main"]);
+    sh_git(&repo, &["config", "commit.gpgsign", "false"]);
+
+    // 1. Initial empty commit in an empty repo — its tree IS the empty tree.
+    sh_git(&repo, &["commit", "-q", "--allow-empty", "-m", "empty root"]);
+    assert_eq!(
+        sh_git(&repo, &["rev-parse", "HEAD^{tree}"]).trim(),
+        empty_oid,
+        "initial commit is not the empty tree"
+    );
+
+    // 2. Add files, then a commit that deletes them all -> empty tree again.
+    std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+    std::fs::create_dir_all(repo.join("d")).unwrap();
+    std::fs::write(repo.join("d/b.txt"), "world\n").unwrap();
+    sh_git(&repo, &["add", "-A"]);
+    sh_git(&repo, &["commit", "-q", "-m", "add files"]);
+    sh_git(&repo, &["rm", "-q", "-r", "."]);
+    sh_git(&repo, &["commit", "-q", "-m", "delete everything"]);
+    assert_eq!(
+        sh_git(&repo, &["rev-parse", "HEAD^{tree}"]).trim(),
+        empty_oid,
+        "delete-all commit is not the empty tree"
+    );
+    // A final non-empty commit so head has content again.
+    std::fs::write(repo.join("c.txt"), "again\n").unwrap();
+    sh_git(&repo, &["add", "-A"]);
+    sh_git(&repo, &["commit", "-q", "-m", "re-add"]);
+
+    let refs_before: Vec<String> =
+        sh_git(&repo, &["for-each-ref", "--format=%(objectname) %(refname)"])
+            .lines()
+            .map(str::to_string)
+            .collect();
+
+    // Import must NOT error on the empty trees (no Unsupported path).
+    gitdepot::import(&repo, &store, 3).unwrap();
+    let refs_after = gitdepot::export(&store, &out).unwrap();
+    let mut after = ref_lines(&refs_after);
+    after.sort();
+    let mut before = refs_before;
+    before.sort();
+    assert_eq!(after, before, "empty-tree history changed ref object ids");
+
+    // The reconstructed empty-tree commits carry oid 4b825dc… exactly.
+    assert_eq!(
+        sh_git(&out, &["log", "--format=%T", "main"]),
+        sh_git(&repo, &["log", "--format=%T", "main"]),
+        "exported tree oids differ from origin"
+    );
+    assert!(
+        sh_git(&out, &["log", "--format=%T", "main"])
+            .lines()
+            .any(|t| t == empty_oid),
+        "no empty tree reconstructed in the export"
+    );
+}

@@ -90,6 +90,86 @@ fn view_blob(bytes: &[u8]) -> std::sync::Arc<View> {
     std::sync::Arc::new(View { blob: Some(bytes.into()), ..View::default() })
 }
 
+// --------------------------------------------- explicit empty directories
+
+/// An empty directory — `{blob:None, attrs:{}, children:{}}` — is now a
+/// first-class, canonical [`View`], DISTINCT from absence. It must survive
+/// every operation (diff→apply, compose, squash, codec) byte/structure
+/// exactly, and be encoded differently from "not there at all".
+#[test]
+fn explicit_empty_directories() {
+    use depot::codec::{decode, encode};
+    use std::sync::Arc;
+
+    let empty = || Arc::new(View::default());
+    // A tree with: a top-level empty dir `e`; `a/b` where `b` is empty
+    // (and `a` non-empty, holding it); a top-level empty dir `c`; a real
+    // file `f`; and `g` holding a real file `h` beside an empty dir `i`.
+    let target = View {
+        blob: None,
+        attrs: Attrs::new(),
+        children: BTreeMap::from([
+            (n(b"a"), Arc::new(View { children: BTreeMap::from([(n(b"b"), empty())]), ..View::default() })),
+            (n(b"c"), empty()),
+            (n(b"e"), empty()),
+            (n(b"f"), view_blob(b"data")),
+            (n(b"g"), Arc::new(View {
+                children: BTreeMap::from([(n(b"h"), view_blob(b"x")), (n(b"i"), empty())]),
+                ..View::default()
+            })),
+        ]),
+    };
+
+    // 1. diff→apply round-trips the empty dirs, from nothing and from a base.
+    let from_nothing = diff(None, Some(&target));
+    assert_eq!(apply(None, &from_nothing).as_ref(), Some(&target), "diff(None) lost an empty dir");
+    let base = View { children: BTreeMap::from([(n(b"f"), view_blob(b"old")), (n(b"z"), empty())]), ..View::default() };
+    let d = diff(Some(&base), Some(&target));
+    assert_eq!(apply(Some(&base), &d).as_ref(), Some(&target), "diff(base) lost an empty dir");
+
+    // 2. compose / squash preserve the empty dirs.
+    assert_eq!(apply(None, &squash(&[&from_nothing])).as_ref(), Some(&target), "squash lost an empty dir");
+    let composed = compose(&Layer::empty(), &from_nothing);
+    assert_eq!(apply(None, &composed).as_ref(), Some(&target), "compose lost an empty dir");
+    // Two-step: seed the base, then compose the base→target delta on top.
+    let seed = diff(None, Some(&base));
+    let combined = compose(&seed, &d);
+    assert_eq!(apply(None, &combined).as_ref(), Some(&target), "compose(seed,delta) lost an empty dir");
+
+    // 3. codec encode→decode is exact, and re-encoding is byte-identical.
+    let bytes = encode(&from_nothing);
+    let back = decode(&bytes).expect("decode");
+    assert_eq!(back, from_nothing, "codec changed the layer");
+    assert_eq!(encode(&back), bytes, "codec not deterministic");
+
+    // 4. An empty-present node and an absent node are DISTINCT: different
+    //    diff, different canonical bytes.
+    let with_x = View { children: BTreeMap::from([(n(b"x"), empty())]), ..View::default() };
+    let without_x = View::default(); // empty ROOT, but no child `x`
+    let present = diff(None, Some(&with_x));
+    let absent = diff(None, Some(&without_x));
+    assert_ne!(present, absent, "empty-present and absent produced the same delta");
+    assert_ne!(encode(&present), encode(&absent), "empty-present and absent encode identically");
+    assert_eq!(apply(None, &present).as_ref(), Some(&with_x));
+    assert_eq!(apply(None, &absent).as_ref(), Some(&View::default()), "empty ROOT view must itself be representable");
+    assert!(apply(None, &present).unwrap().children.contains_key(&n(b"x")));
+
+    // 5. A pure no-op keep over an ABSENT base still yields absence: a
+    //    `Keep`/inherit node asserts nothing, so keep-over-nothing stays
+    //    nothing (NOT a spurious empty node).
+    let noop = layer(with_children(live(), vec![(b"x", live())]));
+    assert_eq!(apply(None, &noop), None, "keep-over-absent must stay absent");
+    // Whereas an explicit empty-dir assertion (replace attrs with the
+    // empty map) DOES materialize the empty node.
+    let assert_empty = layer(with_children(
+        live(),
+        vec![(b"x", Node { attrs: Some(Attrs::new()), ..Node::keep() })],
+    ));
+    let got = apply(None, &assert_empty).expect("empty-dir assertion must materialize");
+    let x = &got.children[&n(b"x")];
+    assert!(x.blob.is_none() && x.attrs.is_empty() && x.children.is_empty(), "explicit empty dir must exist and be empty");
+}
+
 // ------------------------------------------------------------ the laws
 
 fn assert_squash_law(stack: &[&Layer]) {
@@ -610,3 +690,4 @@ fn randomized_diff_ignores_sharing() {
         );
     }
 }
+

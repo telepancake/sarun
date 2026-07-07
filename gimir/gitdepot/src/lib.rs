@@ -1171,8 +1171,9 @@ fn tag_tree_idx(
             .map(|e| e.oid.clone()),
     )?;
     let full = tree_layer(&entries, &blobs)?;
-    let view = depot::apply(None, &full)
-        .ok_or_else(|| Error::Unsupported(format!("tagged tree {tree_oid} is empty")))?;
+    // An empty tagged tree is the empty-but-present root View (existence is
+    // first-class now), not an error.
+    let view = depot::apply(None, &full).unwrap_or_default();
     ingest.tree_idx_for(tree_oid, None, &view)
 }
 
@@ -1282,8 +1283,12 @@ fn ingest_stream(
             }
         };
         depot::apply_mut(&mut view, &delta_layer(&changes, &mut cat)?);
-        let view = view
-            .ok_or_else(|| Error::Unsupported(format!("commit {sha} has an empty tree")))?;
+        // A git tree object always EXISTS, including the empty root tree
+        // (4b825dc…): an absent resolved view is that empty-but-present
+        // root, not an error. Existence is first-class in the depot now,
+        // so no sentinel is needed — `view_tree_oid` of the empty View is
+        // exactly the empty-tree oid.
+        let view = view.unwrap_or_default();
         let same = same_tree_parent(&cm, &tree_oid, tree_oids, &mut cat)?;
         tree_oids.insert(sha.clone(), tree_oid.clone());
         // The full record (`encode(diff(None, view))`, O(tree)) is only

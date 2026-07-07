@@ -189,12 +189,34 @@ impl Layer {
 
 // ---------------------------------------------------------------- apply
 
+/// A resolved node with no content of its own: no blob, no attrs, no
+/// children. Such a node is a legitimate, canonical [`View`] — "this
+/// directory exists and is empty" — as long as it is *present* in its
+/// parent's `children` map (or is the `Some` root). It is DISTINCT from
+/// absence (the key not being in the map at all).
+fn is_empty_view(v: &View) -> bool {
+    v.blob.is_none() && v.attrs.is_empty() && v.children.is_empty()
+}
+
+/// Does this delta node *positively assert its own existence*, at its own
+/// scope, independent of what sits below? A `Set`/`Remove` blob, replaced
+/// attrs (even the empty map — the minimal existence witness), or an
+/// opaque mask each assert "this node exists"; a pure `Keep`/inherit with
+/// no attrs and no opaque asserts nothing. (Children are handled
+/// separately — a surviving child gives the node content directly.)
+fn asserts_self(node: &Node) -> bool {
+    !matches!(node.blob, BlobOp::Keep) || node.attrs.is_some() || node.opaque
+}
+
 /// Overlay one delta node on an optional base view. `None` in = the name
 /// does not exist below; `None` out = the name does not exist after.
 fn apply_node(base: Option<&View>, node: &Node) -> Option<View> {
     if node.presence == Presence::Tombstone {
         return None;
     }
+    // Whether the base was itself an explicitly-present empty node: its
+    // presence is a carried existence assertion a pure inherit preserves.
+    let base_empty_present = base.is_some_and(is_empty_view);
     let blob = match &node.blob {
         BlobOp::Keep => base.and_then(|b| b.blob.clone()),
         BlobOp::Set(bytes) => Some(bytes.clone()),
@@ -226,15 +248,24 @@ fn apply_node(base: Option<&View>, node: &Node) -> Option<View> {
             children.insert(name.clone(), Arc::new(v));
         }
     }
-    // Canonical-form rule: an empty node — no blob, no attrs, no
-    // children — does not exist. This is what makes views canonical
-    // (existence = content), the identity delta prunable, `diff`
-    // minimal, and compose/apply commute even when later layers empty
-    // out a node an earlier layer created ("materialize but inherit" is
-    // deliberately inexpressible). A variant that needs empty
-    // directories to exist carries attrs on them (an fs layer's mode
-    // already does).
-    if blob.is_none() && attrs.is_empty() && children.is_empty() {
+    // Canonical-form rule: existence is EXPLICIT, not implied by content
+    // (DEPOT-DESIGN.md §6, revised). A node exists in the result iff it
+    // has content of its own (a blob, attrs, or a surviving child), OR the
+    // delta positively asserts it (`asserts_self`: a Set/Remove blob,
+    // replaced attrs, or an opaque mask), OR the base was itself an
+    // explicitly-present empty node this delta merely inherited. Only a
+    // pure no-op inherit over an absent (or vacuously-emptied) base
+    // collapses to `None` — "keep over nothing stays nothing." An empty
+    // directory that was asserted (here or below) survives, and is a
+    // DISTINCT canonical form from absence. This is what lets the depot
+    // represent an empty directory — a filesystem has them — without
+    // reintroducing spurious nodes.
+    let exists = blob.is_some()
+        || !attrs.is_empty()
+        || !children.is_empty()
+        || asserts_self(node)
+        || base_empty_present;
+    if !exists {
         return None;
     }
     Some(View { blob, attrs, children })
@@ -253,14 +284,16 @@ fn apply_node_mut(slot: &mut Option<View>, node: &Node) {
         *slot = None;
         return;
     }
+    let base_empty_present = slot.as_ref().is_some_and(is_empty_view);
     let mut v = slot.take().unwrap_or_default();
     mutate_view(&mut v, node);
-    // Same canonical-form rule as apply_node: empty nodes don't exist.
-    *slot = if v.blob.is_none() && v.attrs.is_empty() && v.children.is_empty() {
-        None
-    } else {
-        Some(v)
-    };
+    // Same explicit-existence rule as apply_node.
+    let exists = v.blob.is_some()
+        || !v.attrs.is_empty()
+        || !v.children.is_empty()
+        || asserts_self(node)
+        || base_empty_present;
+    *slot = exists.then_some(v);
 }
 
 /// Path-copying recursion of [`apply_node_mut`] below the root: only the
@@ -272,14 +305,16 @@ fn apply_child_mut(slot: &mut Option<Arc<View>>, node: &Node) {
         *slot = None;
         return;
     }
+    let base_empty_present = slot.as_ref().is_some_and(|a| is_empty_view(a));
     let mut arc = slot.take().unwrap_or_default();
     mutate_view(Arc::make_mut(&mut arc), node);
-    // Same canonical-form rule as apply_node: empty nodes don't exist.
-    *slot = if arc.blob.is_none() && arc.attrs.is_empty() && arc.children.is_empty() {
-        None
-    } else {
-        Some(arc)
-    };
+    // Same explicit-existence rule as apply_node.
+    let exists = arc.blob.is_some()
+        || !arc.attrs.is_empty()
+        || !arc.children.is_empty()
+        || asserts_self(node)
+        || base_empty_present;
+    *slot = exists.then_some(arc);
 }
 
 /// The per-node mutation shared by `apply_node_mut` (root) and
@@ -427,12 +462,12 @@ fn compose_node(a: &Node, b: &Node) -> Node {
 }
 
 /// Would this delta node materialize a view when applied over an absent
-/// base? Mirrors `apply_node`'s inherit-absence rule.
+/// base? Mirrors `apply_node`'s explicit-existence rule: a live node
+/// materializes iff it asserts itself (a Set/Remove blob, replaced attrs
+/// — even empty — or an opaque mask) or has a materializing child.
 fn materializes(n: &Node) -> bool {
     n.presence == Presence::Live
-        && (matches!(n.blob, BlobOp::Set(_))
-            || n.attrs.as_ref().is_some_and(|a| !a.is_empty())
-            || n.children.values().any(materializes))
+        && (asserts_self(n) || n.children.values().any(materializes))
 }
 
 /// Harden a delta so it inherits nothing — used when whatever is composed
@@ -524,10 +559,24 @@ fn diff_node(base: Option<&View>, target: &View) -> Node {
             children.insert(name.clone(), d);
         }
     }
-    // Canonical views contain no empty nodes (apply prunes them), so a
-    // live target always sets something and the delta materializes it.
-    Node { presence: Presence::Live, blob, opaque: false, attrs,
-           anchor: Anchor::Lower, children }
+    let mut node = Node { presence: Presence::Live, blob, opaque: false, attrs,
+                          anchor: Anchor::Lower, children };
+    // Existence witness: `target` is an explicitly-present EMPTY node (no
+    // blob, no attrs, no children). The natural delta reaching it (Keep /
+    // inherit, plus per-child tombstones for anything the base had) asserts
+    // nothing of its own, so `apply` would collapse it to absence — unless
+    // the base was *already* an explicitly-present empty node (existence
+    // carried) or the delta already asserts itself. Otherwise force a
+    // minimal existence assertion (replace attrs with `target`'s — the
+    // empty map) so `apply(base, diff) == target` round-trips the empty
+    // directory exactly, distinct from absence.
+    if is_empty_view(target)
+        && !asserts_self(&node)
+        && !base.is_some_and(is_empty_view)
+    {
+        node.attrs = Some(target.attrs.clone());
+    }
+    node
 }
 
 /// Delta from one optional view to another. `target = None` yields a
