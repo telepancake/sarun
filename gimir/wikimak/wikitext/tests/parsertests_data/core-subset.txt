@@ -1,0 +1,417 @@
+# gimir wikimak-wikitext — vendored parserTests core subset
+#
+# The test cases below (each "!! test" .. "!! end" block) are copied
+# VERBATIM from MediaWiki core's parser conformance corpus:
+#
+#   Source:  tests/parser/parserTests.txt, MediaWiki core
+#   URL:     https://raw.githubusercontent.com/wikimedia/mediawiki/master/tests/parser/parserTests.txt
+#   License: GPL-2.0-or-later  (the upstream file's header states:
+#            "All (C) their respective authors and released under the GPL")
+#
+# They are functional test fixtures (wikitext input -> expected HTML), used
+# here unmodified to measure this renderer's conformance. GPL-2.0+ is
+# compatible with vendoring for test purposes with attribution; see the URL
+# above for the full corpus and authorship. Nothing here is hand-authored:
+# it is a bit-for-bit subset selected to cover the core constructs the
+# parser claims (paragraphs, lists, headings, hr, bold/italic apostrophe
+# handling, internal/external links, nowiki, entities, a table). Cases that
+# fail expose real parser gaps (see parsertests.rs for the measured rate).
+#
+# To refresh or extend: re-run scripts (see meta) that extract named blocks
+# verbatim from the upstream URL. Do NOT edit the expected HTML by hand.
+
+!! test
+Blank input
+!! wikitext
+!! html
+!! end
+!! test
+Simple paragraph
+!! wikitext
+This is a simple paragraph.
+!! html
+<p>This is a simple paragraph.
+</p>
+!! end
+!! test
+Simple list
+!! wikitext
+*Item 1
+*Item 2
+!! html
+<ul><li>Item 1</li>
+<li>Item 2</li></ul>
+!! end
+!! test
+Common list
+!! wikitext
+*Common list
+*item 2
+*item 3
+!! html
+<ul><li>Common list</li>
+<li>item 2</li>
+<li>item 3</li></ul>
+!! end
+!! test
+Numbered list
+!! wikitext
+#Numbered list
+#item 2
+#item 3
+!! html
+<ol><li>Numbered list</li>
+<li>item 2</li>
+<li>item 3</li></ol>
+!! end
+!! test
+Mixed list
+!! wikitext
+*Mixed list
+*#with numbers
+**and bullets
+*#and numbers
+*bullets again
+**bullet level 2
+***bullet level 3
+***#Number on level 4
+**bullet level 2
+**#Number on level 3
+**#Number on level 3
+*#number level 2
+*Level 1
+***Level 3
+#**Level 3, but ordered
+!! html
+<ul><li>Mixed list
+<ol><li>with numbers</li></ol>
+<ul><li>and bullets</li></ul>
+<ol><li>and numbers</li></ol></li>
+<li>bullets again
+<ul><li>bullet level 2
+<ul><li>bullet level 3
+<ol><li>Number on level 4</li></ol></li></ul></li>
+<li>bullet level 2
+<ol><li>Number on level 3</li>
+<li>Number on level 3</li></ol></li></ul>
+<ol><li>number level 2</li></ol></li>
+<li>Level 1
+<ul><li><ul><li>Level 3</li></ul></li></ul></li></ul>
+<ol><li><ul><li><ul><li>Level 3, but ordered</li></ul></li></ul></li></ol>
+!! end
+!! test
+Nested lists 1
+!! wikitext
+*foo
+**bar
+!! html
+<ul><li>foo
+<ul><li>bar</li></ul></li></ul>
+!! end
+!! test
+Nested lists 2
+!! wikitext
+**foo
+*bar
+!! html
+<ul><li><ul><li>foo</li></ul></li>
+<li>bar</li></ul>
+!! end
+!! test
+Nested lists 3 (first element empty)
+!! wikitext
+*
+**bar
+!! html
+<ul><li>
+<ul><li>bar</li></ul></li></ul>
+!! end
+!! test
+1. Nested mixed wikitext and html list
+!! wikitext
+*hi
+*<ul><li>ho</li></ul>
+*hi
+**ho
+!! html/php
+<ul><li>hi</li>
+<li><ul><li>ho</li></ul></li>
+<li>hi
+<ul><li>ho</li></ul></li></ul>
+!! html/parsoid
+<ul><li>hi</li>
+<li><ul data-parsoid='{"stx":"html"}'><li data-parsoid='{"stx":"html"}'>ho</li></ul></li>
+<li>hi
+<ul><li>ho</li></ul></li></ul>
+!! end
+!! test
+List interrupted by empty line or heading
+!! wikitext
+*foo
+
+**bar
+==A heading==
+*Another list item
+!! html
+<ul><li>foo</li></ul>
+<ul><li><ul><li>bar</li></ul></li></ul>
+<div class="mw-heading mw-heading2"><h2 id="A_heading">A heading</h2><span class="mw-editsection"><span class="mw-editsection-bracket">[</span><a href="/index.php?title=Parser_test&amp;action=edit&amp;section=1" title="Edit section: A heading">edit</a><span class="mw-editsection-bracket">]</span></span></div>
+<ul><li>Another list item</li></ul>
+!! html/parsoid
+<ul><li>foo</li></ul>
+
+<ul><li><ul><li>bar</li></ul></li></ul>
+<h2 id="A_heading">A heading</h2>
+<ul><li>Another list item</li></ul>
+!!end
+!! test
+Horizontal ruler -- 4+ dashes render hr
+!! wikitext
+----
+!! html
+<hr />
+!! end
+!! test
+Horizontal ruler -- <4 dashes render as plain text
+!! wikitext
+---
+!! html
+<p>---
+</p>
+!! end
+!! test
+Horizontal ruler -- eats additional dashes on the same line
+!! wikitext
+---------
+!! html
+<hr />
+!! end
+!! test
+Horizontal ruler -- does not collapse dashes on consecutive lines
+!! wikitext
+----
+----
+!! html
+<hr />
+<hr />
+!! end
+!! test
+Horizontal ruler -- Supports content following dashes on same line
+!! wikitext
+---- Foo
+!! html/php
+<hr /><p> Foo</p>
+!! html/parsoid
+<hr data-parsoid='{"lineContent":true}'/><p> Foo</p>
+!! end
+!!test
+Mixing markup for italics and bold
+!! options
+!! wikitext
+'''bold''''''bold''bolditalics'''''
+!! html
+<p>'<i>bold'</i><b>bold<i>bolditalics</i></b>
+</p>
+!! end
+!! test
+Inline wiki vs wiki block nesting
+!! wikitext
+'''Bold paragraph
+
+New wiki paragraph
+!! html
+<p><b>Bold paragraph</b>
+</p><p>New wiki paragraph
+</p>
+!! end
+!! test
+<s> or <strike> for strikethrough
+!! wikitext
+<strike>strike</strike>
+
+<s>s</s>
+!! html
+<p><strike>strike</strike>
+</p><p><s>s</s>
+</p>
+!! end
+!! test
+Non-html5 tags should be accepted
+!! wikitext
+<center>''foo''</center>
+<big>''foo''</big>
+<font style="123">''foo''</font>
+<strike>''foo''</strike>
+<tt>''foo''</tt>
+!! html
+<center><i>foo</i></center>
+<p><big><i>foo</i></big>
+<font style="123"><i>foo</i></font>
+<strike><i>foo</i></strike>
+<tt><i>foo</i></tt>
+</p>
+!! end
+!! test
+Plain link, capitalized
+!! wikitext
+[[Main Page]]
+!! html
+<p><a href="/wiki/Main_Page" title="Main Page">Main Page</a>
+</p>
+!! end
+!! test
+Plain link, uncapitalized
+!! wikitext
+[[main Page]]
+!! html
+<p><a href="/wiki/Main_Page" title="Main Page">main Page</a>
+</p>
+!! end
+!! test
+Piped link
+!! wikitext
+[[Main Page|The Main Page]]
+!! html
+<p><a href="/wiki/Main_Page" title="Main Page">The Main Page</a>
+</p>
+!! end
+!! test
+Broken link
+!! wikitext
+[[Zigzagzogzagzig]]
+!! html/php
+<p><a href="/index.php?title=Zigzagzogzagzig&amp;action=edit&amp;redlink=1" class="new" title="Zigzagzogzagzig (page does not exist)">Zigzagzogzagzig</a>
+</p>
+!! html/parsoid
+<p><a rel="mw:WikiLink" href="./Zigzagzogzagzig?action=edit&amp;redlink=1" title="Zigzagzogzagzig" class="new" typeof="mw:LocalizedAttrs" data-parsoid='{"stx":"simple","a":{"href":"./Zigzagzogzagzig"},"sa":{"href":"Zigzagzogzagzig"}}' data-mw-i18n='{"title":{"lang":"x-page","key":"red-link-title","params":["Zigzagzogzagzig"]}}'>Zigzagzogzagzig</a></p>
+!! end
+!! test
+Link with suffix
+!! wikitext
+[[Main Page]]xxx, [[Main Page]]XXX, [[Main Page]]!!!
+!! html
+<p><a href="/wiki/Main_Page" title="Main Page">Main Pagexxx</a>, <a href="/wiki/Main_Page" title="Main Page">Main Page</a>XXX, <a href="/wiki/Main_Page" title="Main Page">Main Page</a>!!!
+</p>
+!! end
+!! test
+Link with prefix
+!! wikitext
+xxx[[main Page]], xxx[[Main Page]], Xxx[[main Page]] XXX[[main Page]], XXX[[Main Page]]
+!! html
+<p>xxx<a href="/wiki/Main_Page" title="Main Page">main Page</a>, xxx<a href="/wiki/Main_Page" title="Main Page">Main Page</a>, Xxx<a href="/wiki/Main_Page" title="Main Page">main Page</a> XXX<a href="/wiki/Main_Page" title="Main Page">main Page</a>, XXX<a href="/wiki/Main_Page" title="Main Page">Main Page</a>
+</p>
+!! end
+!! test
+Plain link to URL with link text
+!! wikitext
+[[http://www.example.com Link text]]
+!! html
+<p>[<a rel="nofollow" class="external text" href="http://www.example.com">Link text</a>]
+</p>
+!! end
+!! test
+<nowiki> unordered list
+!! wikitext
+<nowiki>* This is not an unordered list item.</nowiki>
+!! html/php
+<p>* This is not an unordered list item.
+</p>
+!! html/parsoid
+<p><span typeof="mw:Nowiki">* This is not an unordered list item.</span></p>
+!! end
+!! test
+nowiki 3
+!! wikitext
+:There is not nowiki.
+:There is <nowiki>nowiki</nowiki>.
+
+#There is not nowiki.
+#There is <nowiki>nowiki</nowiki>.
+
+*There is not nowiki.
+*There is <nowiki>nowiki</nowiki>.
+!! html/php
+<dl><dd>There is not nowiki.</dd>
+<dd>There is nowiki.</dd></dl>
+<ol><li>There is not nowiki.</li>
+<li>There is nowiki.</li></ol>
+<ul><li>There is not nowiki.</li>
+<li>There is nowiki.</li></ul>
+!! html/parsoid
+<dl><dd data-parsoid='{}'>There is not nowiki.</dd>
+<dd data-parsoid='{}'>There is <span typeof="mw:Nowiki">nowiki</span>.</dd></dl>
+
+<ol><li data-parsoid='{}'>There is not nowiki.</li>
+<li data-parsoid='{}'>There is <span typeof="mw:Nowiki">nowiki</span>.</li></ol>
+
+<ul><li data-parsoid='{}'>There is not nowiki.</li>
+<li data-parsoid='{}'>There is <span typeof="mw:Nowiki">nowiki</span>.</li></ul>
+!! end
+!! test
+Entities inside <nowiki>
+!! wikitext
+<nowiki>&lt;</nowiki>
+!! html/php
+<p>&lt;
+</p>
+!! html/parsoid
+<p><span typeof="mw:Nowiki"><span typeof="mw:Entity" data-parsoid='{"src":"&amp;lt;","srcContent":"&lt;"}'>&lt;</span></span></p>
+!! end
+!! test
+text with character entity: eacute
+!! wikitext
+I always thought &eacute; was a cute letter.
+!! html
+<p>I always thought &#233; was a cute letter.
+</p>
+!! end
+!! test
+text with undefined character entity: xacute
+!! wikitext
+I always thought &xacute; was a cute letter.
+!! html
+<p>I always thought &amp;xacute; was a cute letter.
+</p>
+!! end
+!! test
+Text with HTML5 semicolon-less entity (should not decode)
+!! wikitext
+&ampamp;
+!! html/php
+<p>&amp;ampamp;
+</p>
+!! html/parsoid
+<p>&amp;ampamp;</p>
+!! end
+!! test
+Definition list code coverage
+!! options
+parsoid=wt2html,html2html
+!! wikitext
+;title   :def
+;title :def
+;title:def
+!! html/php
+<dl><dt>title</dt>
+<dd>def</dd>
+<dt>title</dt>
+<dd>def</dd>
+<dt>title</dt>
+<dd>def</dd></dl>
+!! html/parsoid
+<dl><dt>title   </dt><dd>def</dd>
+<dt>title </dt><dd>def</dd>
+<dt>title</dt><dd>def</dd></dl>
+!! end
+!! test
+Table multiple attributes correction
+!! wikitext
+{|
+!+ class="error" class="awesome"|status
+|}
+!! html
+<table>
+<tbody><tr>
+<th class="awesome">status
+</th></tr></tbody></table>
+!! end

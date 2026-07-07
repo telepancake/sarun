@@ -8,3 +8,7 @@ license.workspace = true
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# Only the `#[ignore]`d full-corpus parserTests conformance test fetches over
+# the network (tests/parsertests.rs). Same blocking client as the livewiki
+# tests; the floored core-subset test is fully offline.
+reqwest = { workspace = true }
