@@ -14455,6 +14455,43 @@ mod tests {
         );
     }
 
+    /// The `review.file_groups` verb selects a named subset of a box's changes
+    /// by glob — the "save/discard just the browser session" mechanism. The
+    /// built-in "browser session" group (/cellulose-profile/**) must match a
+    /// profile file and NOT an unrelated one.
+    #[test]
+    fn file_groups_select_profile_changes() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        let (sid, root) = make_box(&eng.sock);
+        std::fs::create_dir_all(root.join("cellulose-profile/Default")).expect("mkdir");
+        std::fs::write(root.join("cellulose-profile/Default/Cookies"), b"c").expect("w1");
+        std::fs::create_dir_all(root.join("home")).expect("mkdir2");
+        std::fs::write(root.join("home/notes.txt"), b"n").expect("w2");
+
+        let r = rpc(&eng.sock, "review.file_groups", json!([sid])).expect("file_groups");
+        let groups = r.get("groups").and_then(Value::as_array).expect("groups array");
+        let bs = groups
+            .iter()
+            .find(|g| g.get("name").and_then(Value::as_str) == Some("browser session"))
+            .expect("browser session group present");
+        let paths: Vec<&str> = bs.get("paths").and_then(Value::as_array).unwrap()
+            .iter().filter_map(Value::as_str).collect();
+        // Selects everything under the profile (the Cookies file, plus the
+        // mkdir'd dirs it lives in) …
+        assert!(paths.iter().any(|p| p.contains("cellulose-profile/Default/Cookies")),
+                "selects the profile file: {paths:?}");
+        assert!(paths.iter().all(|p| p.starts_with("cellulose-profile")),
+                "selects ONLY profile paths: {paths:?}");
+        // … and NOT the unrelated change.
+        assert!(!paths.iter().any(|p| p.contains("notes.txt")),
+                "does NOT select the unrelated file: {paths:?}");
+        assert_eq!(bs.get("count").and_then(Value::as_i64), Some(paths.len() as i64),
+                   "count matches the selected paths: {bs}");
+    }
+
     #[test]
     fn unknown_verb_is_graceful() {
         let Some(eng) = boot() else {

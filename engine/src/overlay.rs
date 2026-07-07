@@ -388,6 +388,84 @@ fn compile_globs(raw: &[String]) -> Vec<glob::Pattern> {
     }).collect()
 }
 
+/// The cellulose browser box writes its Chromium profile here (a fixed
+/// `--user-data-dir` in the box), so "browser session" is one gloctable dir.
+const BROWSER_SESSION_GLOBS: &[&str] = &["/cellulose-profile/**"];
+
+/// A named set of path globs for scoping apply/discard to a subset of a box's
+/// changes — "save/discard just the browser session", say, instead of fishing
+/// individual files. Same absolute per-line glob format as `shadow_*.glob`.
+pub struct FileGroup {
+    pub name: String,
+    pub patterns: Vec<glob::Pattern>,
+}
+
+impl FileGroup {
+    /// True when this group selects the (box-relative or absolute) path `rel`.
+    pub fn matches(&self, rel: &str) -> bool {
+        let abs = if rel.starts_with('/') {
+            rel.to_string()
+        } else {
+            format!("/{rel}")
+        };
+        self.patterns.iter().any(|p| p.matches(&abs))
+    }
+}
+
+/// Named file-selection groups: one per `{config_home}/files_<name>.glob` (the
+/// `<name>` is the group's display label, underscores → spaces), each a list of
+/// absolute path globs like the `shadow_*.glob` files. A built-in "browser
+/// session" group (the cellulose profile dir) is appended unless the user
+/// defined their own `files_browser_session.glob`.
+pub fn file_groups() -> Vec<FileGroup> {
+    let mut groups: Vec<FileGroup> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(crate::paths::config_home()) {
+        for e in rd.flatten() {
+            let fname = e.file_name().to_string_lossy().into_owned();
+            if let Some(stub) = fname
+                .strip_prefix("files_")
+                .and_then(|s| s.strip_suffix(".glob"))
+            {
+                let patterns = compile_globs(&load_glob_strings(&e.path(), &[]));
+                if !patterns.is_empty() {
+                    groups.push(FileGroup { name: stub.replace('_', " "), patterns });
+                }
+            }
+        }
+    }
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    if !groups.iter().any(|g| g.name == "browser session") {
+        let raw: Vec<String> = BROWSER_SESSION_GLOBS.iter().map(|s| s.to_string()).collect();
+        groups.push(FileGroup { name: "browser session".into(), patterns: compile_globs(&raw) });
+    }
+    groups
+}
+
+#[cfg(test)]
+mod file_group_tests {
+    use super::*;
+
+    #[test]
+    fn browser_session_matches_profile_paths() {
+        let g = FileGroup {
+            name: "browser session".into(),
+            patterns: compile_globs(&["/cellulose-profile/**".to_string()]),
+        };
+        assert!(g.matches("cellulose-profile/Default/Cookies")); // box-relative
+        assert!(g.matches("/cellulose-profile/Local Storage/leveldb/000003.log"));
+        assert!(!g.matches("home/user/notes.txt"));
+    }
+
+    #[test]
+    fn builtin_browser_session_always_present() {
+        // With no user files_*.glob in a scratch config home, the built-in
+        // group is still offered.
+        let groups = file_groups();
+        assert!(groups.iter().any(|g| g.name == "browser session"),
+                "built-in 'browser session' group must always be available");
+    }
+}
+
 enum Layer {
     Absent,
     UpperFile { owner: i64, rowid: i64, mode: u32 },

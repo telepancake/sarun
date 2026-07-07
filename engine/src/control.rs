@@ -2772,6 +2772,20 @@ macro_rules! ui_verbs {
             None => json!({"discarded": [], "errors": []}),
         }
         }
+        "review.file_groups", "SID", "named file-groups + how many of the box's changes each selects" => {
+            match arg_sid(args) {
+                Some(id) => {
+                    let paths = crate::review::changed_paths(id);
+                    let groups: Vec<Value> = crate::overlay::file_groups().iter().map(|g| {
+                        let matched: Vec<&String> =
+                            paths.iter().filter(|p| g.matches(p)).collect();
+                        json!({"name": g.name, "count": matched.len(), "paths": matched})
+                    }).collect();
+                    json!({"ok": true, "groups": groups})
+                }
+                None => json!({"ok": false, "error": "no slopbox"}),
+            }
+        }
         "review.patch_text", "SID", "whole-box patch as base64" => { match arg_sid(args) {
             Some(id) => {
                 let data = crate::review::patch_text(id);

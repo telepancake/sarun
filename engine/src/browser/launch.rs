@@ -104,6 +104,13 @@ pub fn spawn_host_chromium(spki: Option<&str>) -> Result<HostBrowser> {
     if let Some(k) = spki {
         cmd.arg(format!("--ignore-certificate-errors-spki-list={k}"));
     }
+    // Inside a sarun box, put the profile at a fixed, gloctable path so
+    // "browser session" (files_browser_session.glob → /cellulose-profile/**)
+    // selects exactly the profile for scoped save/discard. On the host CLI we
+    // leave Chromium's default (a throwaway temp dir).
+    if std::env::var("SARUN_BROKER").is_ok_and(|v| !v.is_empty()) {
+        cmd.arg("--user-data-dir=/cellulose-profile");
+    }
     // Honor an ambient proxy (this is a standalone host browser, not a tap
     // box). On a direct connection, or inside a tap box (transparent MITM),
     // Chromium needs nothing.
