@@ -117,6 +117,8 @@ test-contract: ## Syscall-level (strace) contract test for the native builtins (
 test-sud: ## sud vs FUSE equivalence + sud exec capabilities (needs `make engine`; builds sud64/sud32)
 	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_sud_equiv_rs.py
+	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	  python test_sud_concurrent_rs.py
 
 # ---- Housekeeping ---------------------------------------------------------
 
