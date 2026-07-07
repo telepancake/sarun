@@ -564,11 +564,12 @@ enum Action {
     DeleteRule,
     MoveRuleUp,
     MoveRuleDown,
-    /// Mirrors pane: the r / R / space / D key actions, menu-discoverable.
+    /// Mirrors pane: the r / R / space / D / b key actions, menu-discoverable.
     MirrorRun,
     MirrorRunPending,
     MirrorTogglePause,
     MirrorRemove,
+    MirrorBrowse,
     PtyNew,
     PtyKill,
     PtyEmbedToggle,
@@ -3241,6 +3242,38 @@ impl App {
             Err(e) => format!("mirror #{id}: {e}"),
         };
         self.load_mirrors();
+    }
+
+    /// 'b' on Mirrors: browse the selected WIKI mirror in carbonyl
+    /// (MIRRORS.md §Serve/browse). Starts a host-side `wikimak serve` over
+    /// the mirror's depot root (reused if already running) and opens
+    /// carbonyl at its loopback address with `--net host` so the boxed
+    /// browser can reach the host-side server. Plain HTTP to localhost, so
+    /// no MITM SPKI is needed (unlike the replay path).
+    fn mirror_browse_selected(&mut self) {
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else { return };
+        if job.kind != "wiki" {
+            self.status = format!(
+                "mirror #{}: browse is for wiki mirrors (this is {})", job.id, job.kind);
+            return;
+        }
+        let (id, root) = (job.id, job.dest.clone());
+        let url = match wiki_serve::ensure(&self_exe(), &root) {
+            Ok(u) => u,
+            Err(e) => { self.status = format!("wiki #{id}: {e}"); return; }
+        };
+        let how = How {
+            net: "host".into(),
+            env: self.launch_env,
+            placement: Placement::Reuse(format!("wiki-{id}")),
+            webcap: false,
+            webfilter: false,
+            replay: None,
+        };
+        let argv = build_launch(
+            &LaunchTarget::Browser { url: url.clone(), spki: None }, &how);
+        self.open_pty(argv);
+        self.status = format!("wiki #{id}: browsing {url} in carbonyl");
     }
 
     /// 'R' on Mirrors: start every due, unpaused, not-running job.
@@ -6204,6 +6237,105 @@ fn open_replay_in_carbonyl(app: &mut App, source_sid: &str, url: &str) {
     app.status = format!("replaying box {source_sid} in carbonyl — {url}");
 }
 
+/// Host-side `wikimak serve` children backing the carbonyl wiki reader
+/// (MIRRORS.md §Serve/browse). A wiki mirror's depot lives on the host
+/// filesystem and the server binds host loopback, so serve runs as a child
+/// of THIS engine (a self-exec of the embedded `wikimak` driver), NOT in a
+/// box — carbonyl then reaches it with `--net host`. One server per depot
+/// root; the port is derived from the root so a re-browse reuses it.
+mod wiki_serve {
+    use std::collections::HashMap;
+    use std::process::Child;
+    use std::sync::{Mutex, OnceLock};
+
+    struct Server {
+        child: Child,
+    }
+
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Server>>> = OnceLock::new();
+
+    fn registry() -> &'static Mutex<HashMap<String, Server>> {
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Deterministic loopback port for a depot root (FNV-1a → 8700..9500),
+    /// so re-browsing the same mirror lands on the same server.
+    fn port_for(root: &str) -> u16 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in root.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        8700 + (h % 800) as u16
+    }
+
+    /// Ensure a server is running for `root`; return its loopback base URL.
+    /// Reuses a live child; otherwise spawns
+    /// `<self_exe> wikimak serve <root> 127.0.0.1:<port>`, waits up to ~2s
+    /// for the port to accept, and registers the child for shutdown.
+    pub fn ensure(self_exe: &str, root: &str) -> Result<String, String> {
+        let port = port_for(root);
+        let addr = format!("127.0.0.1:{port}");
+        let mut reg = registry().lock().expect("wiki_serve registry poisoned");
+        if let Some(s) = reg.get_mut(root) {
+            match s.child.try_wait() {
+                Ok(None) => return Ok(format!("http://{addr}/")), // still live
+                _ => { reg.remove(root); }                        // exited; respawn
+            }
+        }
+        let child = std::process::Command::new(self_exe)
+            .args(["wikimak", "serve", root, &addr])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("spawn wikimak serve: {e}"))?;
+        let mut child = child;
+        let mut bound = false;
+        for _ in 0..40 {
+            if std::net::TcpStream::connect(&addr).is_ok() {
+                bound = true;
+                break;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(format!("wikimak serve exited ({status}) before binding {addr}"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !bound {
+            let _ = child.kill();
+            return Err(format!("wikimak serve did not bind {addr} within 2s"));
+        }
+        reg.insert(root.to_string(), Server { child });
+        Ok(format!("http://{addr}/"))
+    }
+
+    /// Kill every serve child (engine quit/detach).
+    pub fn shutdown_all() {
+        if let Some(r) = REGISTRY.get() {
+            let mut reg = r.lock().expect("wiki_serve registry poisoned");
+            for (_, mut s) in reg.drain() {
+                let _ = s.child.kill();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn port_is_deterministic_and_in_range() {
+            let a = port_for("/depot/enwiki");
+            let b = port_for("/depot/enwiki");
+            let c = port_for("/depot/dewiki");
+            assert_eq!(a, b, "same root → same port (re-browse reuse)");
+            assert_ne!(a, c, "different roots → different ports (typically)");
+            assert!((8700..9500).contains(&a) && (8700..9500).contains(&c));
+        }
+    }
+}
+
 fn open_image_view(app: &mut App, source: &str, bytes: &[u8]) {
     let img = match image::load_from_memory(bytes) {
         Ok(i) => i,
@@ -7429,7 +7561,7 @@ enum PaneAction {
     ApplyHunk, DiscardHunk, ApplyFile, DiscardFile, ApplyAll, DiscardAll,
     ConfirmKill, ConfirmDissolve, ConfirmMirrorRemove,
     NewRule, DeleteRule, StartRename,
-    MirrorRun, MirrorRunPending, MirrorTogglePause,
+    MirrorRun, MirrorRunPending, MirrorTogglePause, MirrorBrowse,
     ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
     ToggleEdgeRunning,
     ToggleMark, RangeMark,
@@ -7476,6 +7608,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('f'), PaneGate::On(Pane::BuildEdges), PaneAction::ToggleEdgeRunning, Some("toggle running-only (on Targets)")),
     (Key::Char('r'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRun,     Some("force-run selected mirror job (on Mirrors)")),
     (Key::Char('R'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRunPending, Some("run all pending mirror jobs (on Mirrors)")),
+    (Key::Char('b'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorBrowse,  Some("browse wiki mirror in carbonyl (on Mirrors)")),
     (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
     (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
     (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
@@ -7488,8 +7621,8 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
 /// original inline arms — same semantics, one place now.
 fn run_pane_action(app: &mut App, action: PaneAction) {
     match action {
-        PaneAction::Quit => { shutdown_rpc(&app.sock); app.should_quit = true; }
-        PaneAction::Detach => app.should_quit = true,
+        PaneAction::Quit => { wiki_serve::shutdown_all(); shutdown_rpc(&app.sock); app.should_quit = true; }
+        PaneAction::Detach => { wiki_serve::shutdown_all(); app.should_quit = true; }
         PaneAction::MoveDown => app.move_down(),
         PaneAction::MoveUp => app.move_up(),
         PaneAction::NextPane => app.next_pane(),
@@ -7539,6 +7672,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::DeleteRule => app.delete_rule(),
         PaneAction::MirrorRun => app.mirror_run_selected(),
         PaneAction::MirrorRunPending => app.mirror_run_pending(),
+        PaneAction::MirrorBrowse => app.mirror_browse_selected(),
         PaneAction::MirrorTogglePause => app.mirror_toggle_pause(),
         PaneAction::StartRename => app.renaming = Some(String::new()),
         PaneAction::ToggleFilter => app.toggle_filter(),
@@ -12185,6 +12319,7 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                 mk(if paused { "Resume this job" } else { "Pause this job" },
                    "space", Action::MirrorTogglePause),
                 mk("Delete this job",     "D", Action::MirrorRemove),
+                mk("Browse in carbonyl",  "b", Action::MirrorBrowse),
             ]))
         }
         Pane::Pty => {
@@ -12252,6 +12387,7 @@ fn run_action(app: &mut App, a: Action) {
         Action::MirrorRunPending  => app.mirror_run_pending(),
         Action::MirrorTogglePause => app.mirror_toggle_pause(),
         Action::MirrorRemove      => app.confirm_mirror_remove(),
+        Action::MirrorBrowse      => app.mirror_browse_selected(),
         Action::PtyNew         => open_pty_menu(app),
         // Every launch below funnels through build_launch(target, how) — one
         // builder, the same net/env/placement for all. Targets that are ready
