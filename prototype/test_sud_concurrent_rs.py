@@ -56,6 +56,63 @@ def wait_socket(sock, timeout=10.0):
     return False
 
 
+# Single-process POSIX fs-semantics matrix (run inside the box, self-checking).
+# These are the dimensions a userland overlay re-implements and can get wrong:
+# truncate grow/shrink, sparse holes, mtime ordering, mode bits, rename-over
+# atomicity, UNLINKED-FILE-HELD-BY-FD (read+write survive the unlink), O_APPEND,
+# readdir-sees-create, mid-file seek/overwrite. Prints one PASS/FAIL per probe.
+SEMANTICS_WORKLOAD = r'''
+set -u
+cd /root/w
+P(){ echo "PASS $1"; }
+F(){ echo "FAIL $1 :: $2"; }
+printf 'abcdef' > t; truncate -s 3 t
+[ "$(stat -c%s t)" = 3 ] && [ "$(cat t)" = abc ] && P trunc-shrink || F trunc-shrink "$(stat -c%s t)/$(cat t)"
+truncate -s 6 t; [ "$(stat -c%s t)" = 6 ] && P trunc-grow || F trunc-grow "$(stat -c%s t)"
+rm -f sp; dd if=/dev/zero of=sp bs=1 seek=1048576 count=1 2>/dev/null
+[ "$(stat -c%s sp)" = 1048577 ] && P sparse-size || F sparse-size "$(stat -c%s sp)"
+[ "$(stat -c%b sp)" -lt 200 ] 2>/dev/null && P sparse-holes || F sparse-holes "blocks=$(stat -c%b sp)"
+echo a > m; m1=$(stat -c%Y m); sleep 1.1; echo b > m; m2=$(stat -c%Y m)
+[ "$m2" -gt "$m1" ] && P mtime-advances || F mtime-advances "$m1/$m2"
+echo x > c; chmod 741 c; [ "$(stat -c%a c)" = 741 ] && P chmod-bits || F chmod-bits "$(stat -c%a c)"
+echo AAA > rx; echo BBB > ry; mv ry rx
+[ "$(cat rx)" = BBB ] && [ ! -e ry ] && P rename-over || F rename-over "$(cat rx)/$([ -e ry ]&&echo y)"
+( exec 7>uf; echo LIVE >&7; rm uf; [ -e uf ] && { echo "FAIL unlink-name-gone :: listed"; exit; }
+  echo MORE >&7; exec 7>&-; echo "PASS unlink-fd-write" )
+printf HELD > uf2; exec 8<uf2; rm uf2; r=$(cat <&8); exec 8<&-
+[ "$r" = HELD ] && P unlink-fd-read || F unlink-fd-read "[$r]"
+rm -f ap; echo one >> ap; echo two >> ap; [ "$(wc -l < ap)" = 2 ] && P append || F append "$(wc -l < ap)"
+mkdir -p d9; echo z > d9/file; ls d9 | grep -q '^file$' && P readdir-sees-create || F readdir-sees-create "[$(ls d9)]"
+printf '0123456789' > sk; printf XY | dd of=sk bs=1 seek=4 conv=notrunc 2>/dev/null
+[ "$(cat sk)" = '0123XY6789' ] && P seek-overwrite || F seek-overwrite "$(cat sk)"
+echo SEMANTICS-DONE
+'''
+
+# Concurrent VISIBILITY under contention: a writer creates 300 STABLE files
+# (temp lives outside the read dir, so readers never glob a mid-rename temp),
+# while 6 readers repeatedly list the dir and read every file. A stable file
+# that is listed but not readable — or reads empty — is a merged-directory /
+# copy-up visibility bug. Ends with an exact-count + all-readable check.
+VIS_WORKLOAD = r'''
+set -u
+cd /root/w
+: > errors; mkdir -p x tmp
+( for i in $(seq 1 300); do echo "v$i" > tmp/$i; mv tmp/$i x/f$i; done; : > x/.done ) &
+for r in 1 2 3 4 5 6; do
+ ( while [ ! -e x/.done ]; do
+     for f in x/f*; do
+       [ "$f" = 'x/f*' ] && continue
+       if ! v=$(cat "$f" 2>/dev/null); then echo "READFAIL $f" >> errors
+       elif [ -z "$v" ]; then echo "EMPTYREAD $f" >> errors; fi
+     done
+   done ) &
+done
+wait
+for i in $(seq 1 300); do [ -r x/f$i ] || echo "FINAL-MISSING x/f$i" >> errors; done
+cnt=$(ls x | grep -c '^f'); [ "$cnt" = 300 ] || echo "FINAL-COUNT $cnt" >> errors
+if [ -s errors ]; then echo "VIS-ERRORS"; sort errors | uniq -c | head; else echo VIS-ALLOK; fi
+'''
+
 # --- workloads (run inside the box, self-checking) ------------------------
 
 # N background workers each create M files (via tmp+rename) in ONE shared dir,
@@ -147,21 +204,39 @@ def main():
     work = Path("/root/w")
     box = Box()
     try:
-        # A few rounds — a race that fires 1-in-K only shows with repetition.
-        for rnd in range(4):
-            if work.exists():
-                shutil.rmtree(work, ignore_errors=True)
+        def fresh():
+            shutil.rmtree(work, ignore_errors=True)
             work.mkdir(parents=True, exist_ok=True)
+
+        # Single-process POSIX semantics matrix (once — deterministic).
+        fresh()
+        r = box.run("SEM", SEMANTICS_WORKLOAD)
+        for line in r.stdout.splitlines():
+            if line.startswith("PASS "):
+                check(True, "semantics: " + line[5:])
+            elif line.startswith("FAIL "):
+                check(False, "semantics: " + line[5:])
+        check("SEMANTICS-DONE" in r.stdout,
+              f"semantics workload ran to completion "
+              f"(out={r.stdout.strip()[-200:]!r})")
+
+        # Concurrency — a race that fires 1-in-K only shows with repetition.
+        for rnd in range(4):
+            fresh()
             r = box.run(f"BG{rnd}", BG_WORKLOAD)
             check("BG-ALLOK" in r.stdout,
-                  f"round {rnd}: background-job contention on a shared dir "
-                  f"holds fs invariants (out={r.stdout.strip()[-200:]!r})")
-
-            shutil.rmtree(work, ignore_errors=True); work.mkdir(parents=True)
+                  f"round {rnd}: background-job writes into a shared dir don't "
+                  f"lose data (out={r.stdout.strip()[-160:]!r})")
+            fresh()
             r = box.run(f"MK{rnd}", MAKE_WORKLOAD)
             check("MK-ALLOK" in r.stdout,
                   f"round {rnd}: make -j32 contention on a shared output dir "
-                  f"holds fs invariants (out={r.stdout.strip()[-200:]!r})")
+                  f"(out={r.stdout.strip()[-160:]!r})")
+            fresh()
+            r = box.run(f"VIS{rnd}", VIS_WORKLOAD)
+            check("VIS-ALLOK" in r.stdout,
+                  f"round {rnd}: a listed stable file is always readable under "
+                  f"6 concurrent readers (out={r.stdout.strip()[-160:]!r})")
     finally:
         box.close()
         shutil.rmtree(work, ignore_errors=True)
