@@ -2,3 +2,4 @@
 0020-vendor-drop-stray-Cargo.lock-.cargo_vcs_info.json-from-uutil.patch
 0030-sort--entry-takes-logical-cwd--join-relative-paths--operands.patch
 0040-sort--entry-takes-logical-env--TMPDIR-temp-dir-default-and-L.patch
+0050-uu-sort--drain-injected-stdin-lazily-so-a-file-operand-sort.patch

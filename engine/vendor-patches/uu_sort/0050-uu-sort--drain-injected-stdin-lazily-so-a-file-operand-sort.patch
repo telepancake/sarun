@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Tue, 07 Jul 2026 06:57:07 +0000
+Subject: [PATCH] uu_sort: drain injected stdin lazily so a file-operand sort never blocks on it
+
+---
+diff --git a/src/sort.rs b/src/sort.rs
+index f62d9ad..39bdd66 100644
+--- a/src/sort.rs
++++ b/src/sort.rs
+@@ -90,7 +90,19 @@ use crate::tmp_dir::TmpDirWrapper;
+ // bypasses this buffer entirely, exactly as upstream.
+ thread_local! {
+     /// Bytes drained from the injected `stdin`, shared by every `open("-")`.
++    /// `None` until the first `open("-")` actually needs it: draining is LAZY
++    /// (see [`SORT_STDIN_SRC`]) so `sort FILE` with only real operands never
++    /// touches the injected reader — matching upstream, and avoiding a hang when
++    /// that reader is a live pipe/socket the shell handed us as fd 0 but that this
++    /// invocation has no reason to read (`sort <(...)`, `sort FILE </dev/tty`).
+     static SORT_STDIN: RefCell<Option<std::sync::Arc<Vec<u8>>>> = const { RefCell::new(None) };
++    /// Erased raw pointer to the `&mut dyn Read` injected into [`sort`], valid for
++    /// the duration of that call. The first `logical_stdin()` drains it into
++    /// [`SORT_STDIN`] and clears this. Only ever dereferenced on the thread that
++    /// called [`sort`] — every `open("-")` call site opens on the main thread and
++    /// hands the resulting `Send` `Cursor` to worker threads — so the non-`Send`
++    /// borrow is never crossed between threads.
++    static SORT_STDIN_SRC: RefCell<Option<*mut (dyn Read + 'static)>> = const { RefCell::new(None) };
+     /// Buffer that the no-`-o` `Output` writer appends to; flushed to the
+     /// injected `out` at the end of [`sort`].
+     static SORT_STDOUT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+@@ -191,12 +203,18 @@ pub fn sort(
+     // not the engine process's env.
+     SORT_ENV.with(|e| *e.borrow_mut() = env.to_vec());
+ 
+-    // Drain the injected stdin once; share it with every `open("-")`.
+-    let mut buf = Vec::new();
+-    stdin
+-        .read_to_end(&mut buf)
+-        .map_err(|e| USimpleError::new(2, format!("sort: read error: {e}")))?;
+-    SORT_STDIN.with(|cell| *cell.borrow_mut() = Some(std::sync::Arc::new(buf)));
++    // Publish the injected reader for LAZY draining. We intentionally do NOT read
++    // it here: `sort FILE` with only real operands must never touch the injected
++    // reader (upstream doesn't, and that reader may be a live fd — e.g. the shell's
++    // fd 0 under `sort <(...)` — whose `read_to_end` would block forever). The
++    // first `open("-")` (default / no-operand / explicit `-` input) drains it via
++    // `logical_stdin()`. SAFETY: `stdin` outlives this call; the pointer is only
++    // dereferenced on this thread (all `open` call sites run here), so erasing the
++    // borrow's lifetime is sound under that thread/lifetime discipline.
++    let stdin_ptr: *mut (dyn Read + '_) = stdin;
++    let stdin_ptr: *mut (dyn Read + 'static) = unsafe { std::mem::transmute(stdin_ptr) };
++    SORT_STDIN_SRC.with(|cell| *cell.borrow_mut() = Some(stdin_ptr));
++    SORT_STDIN.with(|cell| *cell.borrow_mut() = None);
+     SORT_STDOUT.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+ 
+     let result = sort_inner(args, err);
+@@ -204,6 +222,7 @@ pub fn sort(
+     // Flush buffered default output to the injected `out`, then clear state.
+     let produced =
+         SORT_STDOUT.with(|cell| cell.borrow_mut().take().unwrap_or_default());
++    SORT_STDIN_SRC.with(|cell| *cell.borrow_mut() = None);
+     SORT_STDIN.with(|cell| *cell.borrow_mut() = None);
+     SORT_CWD.with(|cell| cell.borrow_mut().clear());
+     SORT_ENV.with(|cell| cell.borrow_mut().clear());
+@@ -221,9 +240,24 @@ pub fn sort(
+ /// case where re-`stdin()` would reread the same fd). `Arc<Vec<u8>>` is `Send`,
+ /// satisfying `open`'s `Box<dyn Read + Send>` return type without any `unsafe`.
+ fn logical_stdin() -> Box<dyn Read + Send> {
+-    let bytes = SORT_STDIN
+-        .with(|cell| cell.borrow().clone())
+-        .unwrap_or_default();
++    // Drain the injected reader lazily on first use, then cache + share the bytes
++    // so repeated `open("-")` (upstream reopens each operand) each see the full
++    // input without re-reading the already-consumed fd.
++    let bytes = SORT_STDIN.with(|cell| {
++        if cell.borrow().is_none() {
++            let mut buf = Vec::new();
++            SORT_STDIN_SRC.with(|src| {
++                if let Some(ptr) = src.borrow_mut().take() {
++                    // SAFETY: `ptr` is the `&mut dyn Read` passed to `sort`, alive
++                    // for the whole call; `logical_stdin` only runs on that thread.
++                    let reader: &mut dyn Read = unsafe { &mut *ptr };
++                    let _ = reader.read_to_end(&mut buf);
++                }
++            });
++            *cell.borrow_mut() = Some(std::sync::Arc::new(buf));
++        }
++        cell.borrow().clone().unwrap_or_default()
++    });
+     Box::new(Cursor::new(SharedBytes(bytes)))
+ }
+ 
