@@ -15,32 +15,40 @@ half/quarter-block pixel compositing, input mapping. This document is only the
 *sarun-shaped* concerns the prototype doesn't have: where Chromium runs, how
 the engine reaches its CDP endpoint, and how the output becomes a pane.
 
-## C0 · The shape — driver in the engine, Chromium in a box
+## C0 · The shape — renderer in the box, over the box's PTY
 
 carbonyl is a *self-rendering* browser: Chromium draws itself to the terminal,
 so sarun runs it as a PTY child (`ui.rs` `open_pty`) and never understands
-what it shows. cellulose inverts this: Chromium runs **headless** (renders
-nothing to a terminal) inside the same kind of tap box carbonyl uses, and the
-**engine** is the renderer — it drives CDP, pulls a DOM snapshot + a
-screenshot, and composes a `(char, fg, bg)` cell grid the UI draws directly.
+what it shows. cellulose keeps that exact integration but splits the browser
+in two, **both inside the box**: headless Chromium plus a small renderer
+(`sarun browser`) that drives it over CDP and paints the cell grid. The
+renderer emits its frames to stdout, so the box's existing PTY channel carries
+them to the UI — the UI embeds `sarun browser` precisely as it embeds carbonyl.
+
+> **The engine does NOT drive CDP.** An earlier draft had headless Chromium in
+> the box and the *engine* driving CDP across the box boundary (threading the
+> pipe out via a new `inner_browser` fd-passing mode). That coupling is
+> unnecessary: CDP is a local pipe between two processes that already live in
+> the same box, so it never needs to cross the sandbox. The renderer runs
+> in-box next to Chromium and speaks to it over `--remote-debugging-pipe`
+> locally; only finished cell frames leave the box, over the PTY. This deletes
+> the fd-threading, the engine-side CDP client, and any new UI pane type.
 
 Two consequences, both wins:
 
-- **The browser is finally just a box that browses.** Its HTTP(S) still flows
-  through the per-box MITM (`net/mitm.rs`), so webcap capture (W1/W2) and
-  replay (W4.2) work unchanged — they never knew or cared that carbonyl was on
-  the other end, and they won't care that headless Chromium is.
-- **The CDP client the crawler wants (W-archival) already exists.** The same
-  driver that renders a page can scroll it, follow links, and wait for network
-  idle — the browsertrix-style crawl driver DESIGN-web sketches is this module
-  with a different front end.
+- **The browser is still just a box that browses.** Its HTTP(S) flows through
+  the per-box MITM (`net/mitm.rs`), so webcap capture (W1/W2) and replay
+  (W4.2) work unchanged — Chromium is headless in a tap box, exactly where
+  carbonyl was.
+- **The CDP client the crawler wants (W-archival) already exists** — it's the
+  in-box `browser` module; a crawl driver is the same code with a scripted
+  front end instead of the interactive loop.
 
-Chromium stays sandboxed exactly as carbonyl was: an OCI image, `oci_run_argv`,
-tap netns, `--ignore-certificate-errors-spki-list=<root_spki_sha256_b64()>`
-so it trusts the MITM leaf (`net/ca.rs:43`). Nothing about the box, the CA, or
-the overlay changes. Only the argv (headless + a debugging endpoint instead of
-carbonyl's TUI) and the *consumer* of the box (an engine renderer, not a PTY
-pane) change.
+Chromium stays sandboxed exactly as carbonyl was: a box on tap netns,
+`--ignore-certificate-errors-spki-list=<root_spki_sha256_b64()>` so it trusts
+the MITM leaf (`net/ca.rs:43`). The only change is *what the box runs*:
+`sarun browser URL` (the ferried engine binary) instead of
+`/carbonyl/carbonyl URL`, against a box image that carries a stock Chromium.
 
 ## C1 · Transport — how the engine reaches Chromium's CDP
 
@@ -152,25 +160,30 @@ rustls).
   URL`** CLI verb. Verified against live and offline pages in a real
   bwrap/FUSE environment. This is the complete engine-native renderer.
 
-Remaining (each independently landable):
+- **E2 — DONE** the interactive TUI. `session.rs` gained the input +
+  screencast methods; `launch.rs` has the full interactive loop (raw mode,
+  `Page.startScreencast` refresh, per-row diff redraw, input→CDP, URL bar).
+  `sarun browser URL` runs interactive on a tty. **Because the renderer runs
+  in-box and emits over the PTY, no new UI pane type is needed** — the UI's
+  existing PTY-pane machinery embeds it exactly like carbonyl. Verified by
+  driving the real binary through a PTY (allocate pty, send keystrokes, read
+  frames): a page renders, scroll/reload respond, `^Q` exits.
 
-- **E1 — box transport.** A new `inner_browser` mode (sibling to `inner_pty`
-  / `inner_capture` in `runner.rs`) that dup2's a ferried CDP fd to 3/4 and
-  execs headless Chromium with `--remote-debugging-pipe` inside a **tap** box,
-  so its HTTP(S) flows through the MITM and webcap capture/replay (W1/W2/W4.2)
-  work. The engine holds the pipe's other end and builds a `BrowserSession`
-  over it. Threads a socketpair through the register/spawn path the same way
-  `conn_fd` and the ferried engine binary already cross the bwrap boundary.
-  Verifiable headlessly (via webcap rows).
-- **E2 — the `Screen::Browser` pane.** Draw the `Grid` via
-  `buffer[(x,y)].set_symbol().set_style(Color::Rgb…)` (as `render_pty_into`
-  does), route key/mouse to `session.key()/click()/scroll()`,
-  `Page.startScreencast`-driven refresh, sixel pixel-peek via `sixel.rs`.
-  Needs an attached interactive terminal to verify — not doable in a headless
-  harness.
-- **E3 — retire carbonyl.** Delete the `CARBONYL_IMAGE` `build_launch` arm and
-  the vendored image; point the launcher at the pane. The crawl driver
-  (W-archival) reuses `BrowserSession`.
+Remaining:
 
-Stage-1 (drop-in carbonyl→cellulose PTY swap) is intentionally skipped: it
-would build a throwaway argv path E2 deletes.
+- **E3 — the launcher swap.** Point `build_launch`'s `Browser` arm
+  (`ui.rs:11397`) at `sarun browser URL` (the ferried engine binary, via the
+  `/proc/self/exe` idiom `inner` already resolves) instead of
+  `/carbonyl/carbonyl`, on a **box image that carries a stock Chromium** —
+  passing `--ignore-certificate-errors-spki-list` through to Chromium so it
+  trusts the MITM leaf, and pointing `$CELLULOSE_BROWSER` at the in-image
+  Chromium. The code change is ~10 lines; the gating dependency is producing
+  that Chromium box image (build a Dockerfile via `sarun oci build`, or pin a
+  public one) to replace `CARBONYL_IMAGE`. Then delete the carbonyl image
+  reference. Left undone deliberately: pointing the launcher at a
+  not-yet-built image would break the browser launcher, and the image
+  choice/packaging is a call to make explicitly, not fake.
+
+Stage-1 (drop-in carbonyl→cellulose swap over carbonyl's own frozen Chromium)
+is intentionally skipped: it would wire the launcher to a patched M110 fork,
+undermining the whole "stock current Chromium" point.
