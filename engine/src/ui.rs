@@ -5795,6 +5795,24 @@ fn processes_lines(app: &App) -> Vec<Line<'static>> {
 /// Returns the transcript lines plus the index of the FIRST line of the
 /// selected write, so the render can keep the selection scrolled into view
 /// while the left list is focused.
+/// Byte-offset substring, snapped OUTWARD to char boundaries so it can never
+/// panic on multi-byte UTF-8. `lo` floors to the boundary at or before it,
+/// `hi` ceils to the boundary at or after it; a crossed pair yields "".
+fn char_safe_slice(s: &str, mut lo: usize, mut hi: usize) -> &str {
+    lo = lo.min(s.len());
+    hi = hi.min(s.len());
+    while lo > 0 && !s.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    while hi < s.len() && !s.is_char_boundary(hi) {
+        hi += 1;
+    }
+    if lo >= hi {
+        return "";
+    }
+    &s[lo..hi]
+}
+
 fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut sel_line = 0usize;
@@ -5850,7 +5868,12 @@ fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
         // Visible slice of this segment.
         let lo = start.saturating_sub(seg_start);
         let hi = txt.len() - seg_end.saturating_sub(end);
-        let vis = &txt[lo..hi];
+        // start/end are byte offsets from a byte-sized window; snap to char
+        // boundaries before slicing so multi-byte UTF-8 output (block glyphs,
+        // box-drawing, CJK — a browser box's frames are full of them) can't
+        // panic mid-character. This is the "scrolling Outputs of a browser box
+        // crashes sarun" bug: the window edge lands inside a 3-byte glyph.
+        let vis = char_safe_slice(txt, lo, hi);
         let is_sel = Some(*oid) == sel_oid;
         let mut text_style = Style::default();
         if *stream == 1 { text_style = text_style.fg(Color::Red); }
@@ -13671,6 +13694,26 @@ pub fn ui_main(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use super::char_safe_slice;
+
+    /// The "scrolling Outputs of a browser box crashes sarun" regression:
+    /// slicing a byte-window out of multi-byte UTF-8 output must snap to char
+    /// boundaries instead of panicking. Every offset into a string full of
+    /// 3-byte block glyphs must be safe.
+    #[test]
+    fn char_safe_slice_never_splits_a_glyph() {
+        let s = "▄▌▐█ hi 漢字"; // 3-byte block glyphs + ASCII + 3-byte CJK
+        for lo in 0..=s.len() {
+            for hi in lo..=s.len() {
+                let got = char_safe_slice(s, lo, hi); // must not panic
+                assert!(s.contains(got) || got.is_empty());
+            }
+        }
+        // out-of-range is clamped, not a panic
+        assert_eq!(char_safe_slice(s, 100, 200), "");
+        // a boundary-aligned window is returned verbatim
+        assert_eq!(char_safe_slice("abcdef", 2, 4), "cd");
+    }
 
     /// F1/'?' help is headless-renderable text: it must carry the "Verbs"
     /// section derived in-process from control::VERB_DOCS, with at least
