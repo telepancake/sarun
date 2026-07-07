@@ -90,6 +90,7 @@ use depot::{Attrs, BlobOp, Layer, Node};
 mod cli;
 pub use cli::cli_main;
 pub mod lanes;
+pub mod lanestore;
 pub mod readout;
 pub mod store;
 
