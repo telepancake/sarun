@@ -200,7 +200,15 @@ _Static_assert(sizeof(struct sud_ir_inode) == 80,
 
 /* ---- Directory entry block ------------------------------------ */
 
-#define SUD_IR_DIRENTS_PER_BLOCK 62
+/* A dirblock is allocated as exactly ONE SUD_IR_BLOCK_SIZE block by
+ * sud_ir_dir_link (via sud_ir_block_alloc(1)), so the whole struct MUST fit
+ * in SUD_IR_BLOCK_SIZE. Header = 64 bytes; each dirent = 72 bytes
+ * (4 + 1 + 1 + 2 + 64). So (4096 - 64) / 72 = 56 entries fit. This was 62 —
+ * entries 56..61 spilled past the 4096-byte allocation into the next block
+ * and were silently lost (create 250, readdir/stat see only 226: exactly the
+ * 6 tail entries of every 62-entry block, at indices 56-61, 118-123, ...).
+ * A static assert below pins the invariant so it can't drift again. */
+#define SUD_IR_DIRENTS_PER_BLOCK 56
 
 struct sud_ir_dirent {
     /* Inode index (1-based; 0 == empty slot).  We don't reuse slot
@@ -220,6 +228,11 @@ struct sud_ir_dirblock {
     uint32_t _pad[14];          /* align to 64 bytes */
     struct sud_ir_dirent ents[SUD_IR_DIRENTS_PER_BLOCK];
 };
+
+/* A dirblock must fit in the single block sud_ir_block_alloc(1) hands out,
+ * or its tail entries spill past the allocation and vanish. */
+_Static_assert(sizeof(struct sud_ir_dirblock) <= SUD_IR_BLOCK_SIZE,
+               "sud_ir_dirblock must fit in one SUD_IR_BLOCK_SIZE block");
 
 /* ---- Superblock ----------------------------------------------- */
 
