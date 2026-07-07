@@ -111,10 +111,18 @@ fn html_comment_removed() {
 }
 
 #[test]
-fn ref_tag_becomes_placeholder_not_dropped() {
+fn ref_tag_renders_footnote_and_auto_appends_list() {
+    // The Cite extension (browsing plan §3.5) replaced the old dropped
+    // `[ref]` placeholder: a <ref> now becomes a numbered footnote and,
+    // with no <references/> on the page, MediaWiki appends the list.
     assert_eq!(
         render_inner("text <ref>cite here</ref> more"),
-        "<p>text <sup class=\"reference\">[ref]</sup> more</p>"
+        "<p>text <sup class=\"reference\" id=\"cite_ref-1\">\
+         <a href=\"#cite_note-1\">[1]</a></sup> more</p>\
+         <ol class=\"references\">\
+         <li id=\"cite_note-1\">\
+         <span class=\"mw-cite-backlink\"><a href=\"#cite_ref-1\">^</a></span> \
+         <span class=\"reference-text\">cite here</span></li></ol>"
     );
 }
 

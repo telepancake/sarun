@@ -22,6 +22,12 @@ use crate::{
     html, InterwikiEntry, PageStore, RenderMisses, RenderOptions, RenderOutput, SiteConfig, Title,
 };
 
+// The Cite extension (<ref>/<references>) lives in a sibling source file.
+// lib.rs is frozen, so it is attached here via #[path] rather than a crate
+// root `mod` — it stays private to the parser (state never crosses lib.rs).
+#[path = "cite.rs"]
+mod cite;
+
 const SEP: char = '\u{7f}';
 
 /// Holds final HTML fragments behind opaque markers. `block` records which
@@ -53,6 +59,25 @@ impl Strip {
 
     fn stash_block(&mut self, html: String) -> String {
         self.stash(html, true)
+    }
+
+    /// Reserve an empty slot (filled later via [`Strip::set`]) and return
+    /// its index. Used by Cite: a `<ref>`'s inline `<sup>` and a group's
+    /// `<references>` list are only knowable after the whole page is seen.
+    fn reserve(&mut self, block: bool) -> usize {
+        let idx = self.items.len();
+        self.items.push(String::new());
+        self.block.push(block);
+        idx
+    }
+
+    fn set(&mut self, idx: usize, html: String) {
+        self.items[idx] = html;
+    }
+
+    /// The marker text that resolves to slot `idx`.
+    fn marker(idx: usize) -> String {
+        format!("{SEP}{idx}{SEP}")
     }
 
     /// If `line` (trimmed) is exactly one block-level marker, its index.
@@ -116,6 +141,7 @@ struct Ctx<'a> {
     strip: Strip,
     ext_counter: u32,
     depth: u32,
+    cite: cite::CiteState,
 }
 
 pub fn to_html(
@@ -136,6 +162,7 @@ pub fn to_html(
         strip: Strip::new(),
         ext_counter: 0,
         depth: 0,
+        cite: cite::CiteState::default(),
     };
 
     // Guard the marker namespace and normalize line endings.
@@ -144,6 +171,11 @@ pub fn to_html(
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     let text = ctx.strip_extension_tags(&text);
+    // Cite is a two-pass extension: the strip pass collects every ref and
+    // reserves markers; finalize backfills the inline <sup>s (now that use
+    // counts are known) and each group's <references> list, auto-appending
+    // where the page cited but never placed a list.
+    let text = ctx.finalize_cite(text);
     let body = ctx.parse_blocks(&text);
 
     let mut open = String::from("<div class=\"mw-parser-output\"");
@@ -200,20 +232,16 @@ impl<'a> Ctx<'a> {
                     i = next;
                     continue;
                 }
-                if let Some(after) = match_open_selfclose(s, i, "ref") {
-                    let m = self
-                        .strip
-                        .stash_inline("<sup class=\"reference\">[ref]</sup>".to_string());
-                    out.push_str(&m);
-                    i = after;
+                // <references> before <ref>: "references" has "ref" as a
+                // prefix, but match_ext_tag requires a name boundary so the
+                // ref matcher never swallows it — order is for clarity only.
+                if let Some((attrs, self_closing, past)) = match_ext_tag(s, i, "references") {
+                    let next = self.handle_references(&mut out, attrs, self_closing, s, past);
+                    i = next;
                     continue;
                 }
-                if let Some(after) = match_open(s, i, "ref") {
-                    let (_inner, next) = read_to_close(s, after, "ref");
-                    let m = self
-                        .strip
-                        .stash_inline("<sup class=\"reference\">[ref]</sup>".to_string());
-                    out.push_str(&m);
+                if let Some((attrs, self_closing, past)) = match_ext_tag(s, i, "ref") {
+                    let next = self.handle_ref(&mut out, attrs, self_closing, s, past);
                     i = next;
                     continue;
                 }
@@ -235,6 +263,168 @@ impl<'a> Ctx<'a> {
             }
         }
         out
+    }
+
+    // ---- Cite: <ref> / <references> ----------------------------------
+
+    /// Handle one `<ref …>…</ref>` or `<ref …/>`. Emits a reserved inline
+    /// marker (backfilled in [`Ctx::finalize_cite`]) and returns the index
+    /// in `s` just past the tag. `attrs`/`s` borrow the strip input; the
+    /// name/group are copied out before any `&mut self` rendering.
+    fn handle_ref(
+        &mut self,
+        out: &mut String,
+        attrs: &str,
+        self_closing: bool,
+        s: &str,
+        past: usize,
+    ) -> usize {
+        let (name, group) = ref_attrs(attrs);
+        let gidx = self.cite.group_idx(&group);
+
+        // Read the body (open form only) BEFORE touching cite/strip.
+        let (raw, next) = if self_closing {
+            ("", past)
+        } else {
+            read_to_close(s, past, "ref")
+        };
+        let has_body = !raw.trim().is_empty();
+
+        // No name and no content is a hard Cite error — no note created.
+        if name.is_empty() && !has_body {
+            let m = self
+                .strip
+                .stash_inline(html::cite_error("<ref> with no content and no name"));
+            out.push_str(&m);
+            self.misses
+                .failed_invokes
+                .push("cite: empty <ref>".to_string());
+            return next;
+        }
+
+        // Render the body through the inline path (escapes any HTML/markup
+        // — this is the XSS boundary) before it becomes note content.
+        let content = if has_body { Some(self.inline(raw)) } else { None };
+        let name_opt = if name.is_empty() {
+            None
+        } else {
+            Some(name.as_str())
+        };
+
+        let strip_idx = self.strip.reserve(false);
+        let rec = self.cite.record_use(gidx, name_opt, content, strip_idx);
+        if rec.redefinition {
+            self.misses
+                .failed_invokes
+                .push(format!("cite: redefinition of ref name \"{name}\""));
+        }
+        out.push_str(&Strip::marker(strip_idx));
+        next
+    }
+
+    /// Handle one `<references …/>` or `<references …>…</references>`.
+    /// Reserves the group's list marker (first placement wins) and, for the
+    /// body form, registers any list-defined references it carries.
+    fn handle_references(
+        &mut self,
+        out: &mut String,
+        attrs: &str,
+        self_closing: bool,
+        s: &str,
+        past: usize,
+    ) -> usize {
+        let (_name, group) = ref_attrs(attrs);
+        let gidx = self.cite.group_idx(&group);
+
+        let next = if self_closing {
+            past
+        } else {
+            let (inner, nxt) = read_to_close(s, past, "references");
+            self.process_ldr(gidx, inner);
+            nxt
+        };
+
+        if self.cite.groups[gidx].references_marker.is_none() {
+            let idx = self.strip.reserve(true);
+            self.cite.groups[gidx].references_marker = Some(idx);
+            out.push_str(&Strip::marker(idx));
+        } else {
+            // A second <references/> for the same group renders nothing.
+            self.misses
+                .failed_invokes
+                .push(format!("cite: duplicate <references/> for group \"{group}\""));
+        }
+        next
+    }
+
+    /// Scan a `<references>` body for `<ref name="x">…</ref>` definitions
+    /// (list-defined references) and attach their content to the already-
+    /// used named notes. Anonymous or unused entries are inert. Nested
+    /// `<ref>` inside a body is not re-scanned (no recursion → no loop).
+    fn process_ldr(&mut self, gidx: usize, inner: &str) {
+        let b = inner.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'<' {
+                if let Some((attrs, self_closing, past)) = match_ext_tag(inner, i, "ref") {
+                    let (name, _group) = ref_attrs(attrs);
+                    if self_closing {
+                        i = past;
+                        continue;
+                    }
+                    let (body, next) = read_to_close(inner, past, "ref");
+                    if !name.is_empty() && !body.trim().is_empty() {
+                        let rendered = self.inline(body);
+                        self.cite.define(gidx, &name, rendered);
+                    }
+                    i = next;
+                    continue;
+                }
+            }
+            i += html::utf8_len(b[i]);
+        }
+    }
+
+    /// Two-pass finalize (see [`to_html`]): backfill every inline `<sup>`
+    /// now that use counts are known, then render each group's `<references>`
+    /// list — auto-appending (with a miss) for a group that cited but never
+    /// placed a list. Returns the (possibly extended) block text.
+    fn finalize_cite(&mut self, mut text: String) -> String {
+        let cite = std::mem::take(&mut self.cite);
+
+        for g in &cite.groups {
+            for note in &g.notes {
+                let multi = note.uses.len() > 1;
+                for (u, &strip_idx) in note.uses.iter().enumerate() {
+                    self.strip
+                        .set(strip_idx, cite::sup_html(&g.name, note.number, u, multi));
+                }
+            }
+        }
+
+        for g in &cite.groups {
+            if g.notes.is_empty() {
+                // A bare <references/> with no refs: leave its reserved slot
+                // empty (renders nothing), matching MediaWiki.
+                continue;
+            }
+            let list = cite::references_list_html(g);
+            match g.references_marker {
+                Some(idx) => self.strip.set(idx, list),
+                None => {
+                    self.misses.failed_invokes.push(format!(
+                        "cite: <ref> in group \"{}\" with no <references/>",
+                        g.name
+                    ));
+                    let idx = self.strip.reserve(true);
+                    self.strip.set(idx, list);
+                    text.push('\n');
+                    text.push_str(&Strip::marker(idx));
+                    text.push('\n');
+                }
+            }
+        }
+        text
     }
 
     // ---- block level -------------------------------------------------
@@ -1414,8 +1604,12 @@ fn match_open(s: &str, pos: usize, name: &str) -> Option<usize> {
     Some(pos + gt + 1)
 }
 
-/// Match a self-closing tag `<name … />` at `pos`. Returns index past `>`.
-fn match_open_selfclose(s: &str, pos: usize, name: &str) -> Option<usize> {
+/// Match an extension tag `<name …>` or `<name …/>` at `pos`, returning
+/// (raw attributes, is_self_closing, index-just-past-`>`). The `>` scan is
+/// quote-aware so a `>` inside an attribute value does not end the tag.
+/// Requires a name boundary (whitespace/`>`/`/`) so `<references>` is not
+/// matched as `<ref>`. Unterminated (`<ref` with no `>`) yields None.
+fn match_ext_tag<'b>(s: &'b str, pos: usize, name: &str) -> Option<(&'b str, bool, usize)> {
     let rest = &s[pos..];
     if !rest.starts_with('<') {
         return None;
@@ -1428,12 +1622,44 @@ fn match_open_selfclose(s: &str, pos: usize, name: &str) -> Option<usize> {
         Some(c) if c.is_ascii_whitespace() || c == b'/' || c == b'>' => {}
         _ => return None,
     }
-    let gt = rest.find('>')?;
-    if rest.as_bytes()[gt - 1] == b'/' {
-        Some(pos + gt + 1)
-    } else {
-        None
+    let attrs_start = pos + 1 + name.len();
+    let b = s.as_bytes();
+    let mut j = attrs_start;
+    let mut quote = 0u8;
+    while j < b.len() {
+        let c = b[j];
+        if quote != 0 {
+            if c == quote {
+                quote = 0;
+            }
+        } else if c == b'"' || c == b'\'' {
+            quote = c;
+        } else if c == b'>' {
+            break;
+        }
+        j += 1;
     }
+    if j >= b.len() {
+        return None; // unterminated
+    }
+    let self_closing = j > attrs_start && b[j - 1] == b'/';
+    let attrs_end = if self_closing { j - 1 } else { j };
+    Some((&s[attrs_start..attrs_end], self_closing, j + 1))
+}
+
+/// Extract the (name, group) of a `<ref>`/`<references>` tag, trimmed.
+/// Empty string = absent. Other attributes are ignored.
+fn ref_attrs(attrs: &str) -> (String, String) {
+    let mut name = String::new();
+    let mut group = String::new();
+    for (k, v) in html::parse_attrs(attrs) {
+        match k.to_ascii_lowercase().as_str() {
+            "name" => name = v,
+            "group" => group = v,
+            _ => {}
+        }
+    }
+    (name.trim().to_string(), group.trim().to_string())
 }
 
 /// From `after` (just past an opening tag), read to the matching

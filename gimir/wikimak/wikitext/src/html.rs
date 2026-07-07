@@ -153,6 +153,63 @@ pub fn error_box(msg: &str) -> String {
     format!(r#"<span class="error">{}</span>"#, escape(msg))
 }
 
+// ---- Cite (<ref>/<references>) presentation ---------------------------
+//
+// All ids/hrefs/labels these take are RAW strings, escaped here (single
+// choke point); `content`/`backlinks` are already-final HTML from the
+// parser and pass through verbatim.
+
+/// Inline citation marker: `<sup class="reference" id=…><a href=…>[n]</a></sup>`.
+pub fn ref_marker(ref_id: &str, note_id: &str, label: &str) -> String {
+    format!(
+        "<sup class=\"reference\" id=\"{}\"><a href=\"#{}\">{}</a></sup>",
+        escape(ref_id),
+        escape(note_id),
+        escape(label)
+    )
+}
+
+/// Inline Cite error (empty ref, malformed tag, undefined named ref).
+pub fn cite_error(msg: &str) -> String {
+    format!(
+        "<span class=\"error mw-ext-cite-error\">Cite error: {}</span>",
+        escape(msg)
+    )
+}
+
+/// Single-use back-link: `^` pointing at the sole use.
+pub fn ref_backlink_single(ref_id: &str) -> String {
+    format!(
+        "<span class=\"mw-cite-backlink\"><a href=\"#{}\">^</a></span>",
+        escape(ref_id)
+    )
+}
+
+/// Multi-use back-links: `^ a b c …`, one anchor per (ref_id, label) use.
+pub fn ref_backlink_multi(entries: &[(String, String)]) -> String {
+    let mut s = String::from("<span class=\"mw-cite-backlink\">^");
+    for (rid, label) in entries {
+        s.push_str(&format!(" <a href=\"#{}\">{}</a>", escape(rid), escape(label)));
+    }
+    s.push_str("</span>");
+    s
+}
+
+/// One `<li>` in the references list: back-link(s) then the note text.
+pub fn reference_item(note_id: &str, backlinks: &str, content: &str) -> String {
+    format!(
+        "<li id=\"{}\">{} <span class=\"reference-text\">{}</span></li>",
+        escape(note_id),
+        backlinks,
+        content
+    )
+}
+
+/// Wrap rendered `<li>` items in the ordered references list.
+pub fn references_wrap(items: &str) -> String {
+    format!("<ol class=\"references\">{}</ol>", items)
+}
+
 // ---- URL/anchor encoding ---------------------------------------------
 
 /// Percent-encode a title for use as a link path. Spaces → `_`, then the
