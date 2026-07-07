@@ -100,6 +100,163 @@ impl BrowserSession {
         false
     }
 
+    /// Scroll by `dy_cells` terminal rows (positive = down).
+    pub fn scroll(&self, dy_cells: i64) -> Result<()> {
+        self.cdp.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseWheel",
+                "x": self.cols as i64 * CELL_W / 2,
+                "y": self.rows as i64 * CELL_H / 2,
+                "deltaX": 0,
+                "deltaY": dy_cells * CELL_H
+            }),
+            self.s(),
+            CALL,
+        )?;
+        Ok(())
+    }
+
+    /// Click at a terminal cell (col, row), centered in the cell.
+    pub fn click(&self, col: usize, row: usize) -> Result<()> {
+        let x = (col as i64 * CELL_W) + CELL_W / 2;
+        let y = (row as i64 * CELL_H) + CELL_H / 2;
+        for typ in ["mousePressed", "mouseReleased"] {
+            self.cdp.call(
+                "Input.dispatchMouseEvent",
+                json!({ "type": typ, "x": x, "y": y, "button": "left", "clickCount": 1 }),
+                self.s(),
+                CALL,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Type literal text into the focused element.
+    pub fn type_text(&self, text: &str) -> Result<()> {
+        self.cdp
+            .call("Input.insertText", json!({ "text": text }), self.s(), CALL)?;
+        Ok(())
+    }
+
+    /// Dispatch a named key (Enter/Tab/Backspace/arrows…).
+    pub fn key(&self, key: &str, code: &str, vk: i64, text: &str) -> Result<()> {
+        let mut down = json!({
+            "type": "rawKeyDown", "key": key, "code": code,
+            "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk
+        });
+        if !text.is_empty() {
+            down["type"] = json!("keyDown");
+            down["text"] = json!(text);
+            down["unmodifiedText"] = json!(text);
+        }
+        self.cdp.call("Input.dispatchKeyEvent", down, self.s(), CALL)?;
+        self.cdp.call(
+            "Input.dispatchKeyEvent",
+            json!({ "type": "keyUp", "key": key, "code": code,
+                    "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk }),
+            self.s(),
+            CALL,
+        )?;
+        Ok(())
+    }
+
+    pub fn reload(&self) -> Result<()> {
+        self.cdp.call("Page.reload", json!({}), self.s(), CALL)?;
+        Ok(())
+    }
+
+    /// Walk the navigation history by `delta` (-1 back, +1 forward).
+    pub fn history_go(&self, delta: i64) -> Result<()> {
+        let hist = self
+            .cdp
+            .call("Page.getNavigationHistory", json!({}), self.s(), CALL)?;
+        let cur = hist["currentIndex"].as_i64().unwrap_or(0);
+        let entries = hist["entries"].as_array().cloned().unwrap_or_default();
+        let i = cur + delta;
+        if i >= 0 && (i as usize) < entries.len() {
+            let id = entries[i as usize]["id"].clone();
+            self.cdp.call(
+                "Page.navigateToHistoryEntry",
+                json!({ "entryId": id }),
+                self.s(),
+                CALL,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Current URL and title from the navigation history.
+    pub fn url_and_title(&self) -> (String, String) {
+        if let Ok(h) = self
+            .cdp
+            .call("Page.getNavigationHistory", json!({}), self.s(), CALL)
+        {
+            let i = h["currentIndex"].as_u64().unwrap_or(0) as usize;
+            if let Some(e) = h["entries"].as_array().and_then(|a| a.get(i)) {
+                return (
+                    e["url"].as_str().unwrap_or("").to_string(),
+                    e["title"].as_str().unwrap_or("").to_string(),
+                );
+            }
+        }
+        (String::new(), String::new())
+    }
+
+    /// Start push-based frame delivery (Page.screencastFrame events fire only
+    /// when the compositor produced a new frame).
+    pub fn start_screencast(&self) -> Result<()> {
+        self.cdp.call(
+            "Page.startScreencast",
+            json!({ "format": "png", "everyNthFrame": 1 }),
+            self.s(),
+            CALL,
+        )?;
+        Ok(())
+    }
+
+    pub fn ack_frame(&self, frame_session: i64) {
+        let _ = self.cdp.call(
+            "Page.screencastFrameAck",
+            json!({ "sessionId": frame_session }),
+            self.s(),
+            CALL,
+        );
+    }
+
+    /// Compose a grid from a screencast frame's PNG bytes plus a fresh DOM
+    /// snapshot (text lands crisp on top of the downscaled pixels).
+    pub fn frame_from_png(&self, png: &[u8]) -> Result<Grid> {
+        let snap = self.snapshot()?;
+        let text = render::snapshot_text(&snap, self.cols, self.rows);
+        Ok(self.compose_png(png, &text))
+    }
+
+    fn compose_png(&self, png: &[u8], text: &[render::Placement]) -> Grid {
+        let img = match image::load_from_memory(png) {
+            Ok(i) => i.to_rgb8(),
+            Err(_) => return vec![vec![render::Cell {
+                ch: " ".into(), fg: (0, 0, 0), bg: (0, 0, 0),
+            }; self.cols]; self.rows],
+        };
+        let resized = image::imageops::resize(
+            &img,
+            (self.cols * 2) as u32,
+            (self.rows * 2) as u32,
+            image::imageops::FilterType::Triangle,
+        );
+        let sample = |x: usize, y: usize| -> Rgb {
+            let p = resized.get_pixel(x as u32, y as u32);
+            (p[0], p[1], p[2])
+        };
+        render::compose(sample, text, self.cols, self.rows)
+    }
+
+    /// Access the underlying CDP client (for event draining in the UI loop).
+    pub fn cdp(&self) -> &Arc<Cdp> {
+        &self.cdp
+    }
+
     fn snapshot(&self) -> Result<Value> {
         self.cdp.call(
             "DOMSnapshot.captureSnapshot",
