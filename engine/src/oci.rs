@@ -962,10 +962,18 @@ pub(crate) fn resolve_image_top_local(reference: &str) -> Result<(i64, String)> 
     // the probe didn't prove the loaded stack stale. With no probe (offline /
     // unsupported source) this is exactly the v1 behavior.
     let mut prefix = String::new();
+    // A `@sha256:` reference is content-addressed and can NEVER be stale — the
+    // ref IS the identity. Skip the moved-tag check for it: for a multi-arch
+    // image the probe returns the manifest-LIST digest while the loader stamps
+    // the resolved PLATFORM manifest digest, so the naive `probed != stored`
+    // comparison would spuriously "detect a moved tag" and re-pull a
+    // digest-pinned image on every run (e.g. the cellulose browser image).
+    let is_digest_pin = reference.contains("@sha256:");
     if let Some(start) = find_loaded_by_reference(&boxes, reference) {
         let stored = boxes.get(&start).and_then(|b| b.meta.get("oci_manifest_digest"));
-        let stale = matches!((probed.as_deref(), stored),
-                             (Some(p), Some(s)) if p != s.as_str());
+        let stale = !is_digest_pin
+            && matches!((probed.as_deref(), stored),
+                        (Some(p), Some(s)) if p != s.as_str());
         if stale {
             prefix = format!("sarun oci: image '{reference}' tag moved (manifest \
                               changed) — re-pulling\n");
