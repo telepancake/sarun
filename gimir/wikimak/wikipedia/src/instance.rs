@@ -264,8 +264,11 @@ impl Instance {
         -> Result<Vec<(u64, String)>>
     {
         let g = self.inner.lock().expect("instance mutex poisoned");
+        // Open intervals only: a page renamed away keeps its old title as a
+        // closed interval, which must not surface as a current page.
         let mut st = g.conn.prepare(
             "SELECT page_id, normalized_title FROM title_intervals
+             WHERE end_ts IS NULL
              ORDER BY normalized_title")?;
         let rows = st.query_map([], |r| Ok((
             r.get::<_, i64>(0)? as u64, r.get::<_, Vec<u8>>(1)?)))?;
@@ -366,6 +369,24 @@ impl Instance {
                 |r| r.get(0),
             )
             .ok();
+        // Fall back to the untimed mapping ONLY for a genuinely pre-interval
+        // page (no title_intervals rows at all). If the resolved page IS
+        // interval-tracked but none of its intervals carry this title, the
+        // title was retitled away by a rename — it never covered τ, so →
+        // None rather than the all-τ resolution that would report the page
+        // before it existed (adversarial-review leak: a renamed-away title
+        // resolving at every τ). The page stays reachable under its current
+        // title's interval and, for τ = None, under `page_by_title`.
+        if let Some(pid) = current {
+            let tracked: i64 = g.conn.query_row(
+                "SELECT COUNT(*) FROM title_intervals WHERE page_id = ?1",
+                rusqlite::params![pid],
+                |r| r.get(0),
+            )?;
+            if tracked > 0 {
+                return Ok(None);
+            }
+        }
         Ok(current.map(|id| id as u64))
     }
 
@@ -424,11 +445,10 @@ impl Instance {
     /// Existence of `title` at τ — the red-link / `#ifexist` fast path.
     ///
     /// Title tables only, NO frame decode: resolves through the same
-    /// `title_intervals` window as [`Instance::page_id_by_title_at`].
-    /// NOTE: because import records a single open interval `[0, ∞)` per
-    /// title (start_ts = 0, end_ts = NULL — no rename tracking yet), for
-    /// any τ ≥ 0 this reports whether the title EVER existed, not whether
-    /// its first revision predates τ (that would need a frame decode).
+    /// `title_intervals` window as [`Instance::page_id_by_title_at`], so it
+    /// is `false` for τ before the title's first interval opens (import
+    /// records the real earliest-revision start, not 0). Legacy pre-interval
+    /// depots (start_ts = 0) still report existence from t = 0.
     pub fn exists_at(&self, title: &str, ts_micros: Option<i64>) -> Result<bool> {
         Ok(self.page_id_by_title_at(title, ts_micros)?.is_some())
     }

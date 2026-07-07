@@ -5,15 +5,21 @@
 //! fetch`. Every assertion is a concrete input→output check against a real
 //! imported instance; a stub that ignores renames would fail them.
 //!
-//! Scenario: page_id 5 is imported first as "Old Name" (two revisions at
-//! T1 < T2), then RE-imported — same page_id — as "New Name" (one revision
-//! at T3 > T2), modelling a MediaWiki move. The importer must:
+//! Core scenario (the DATABLE rename shape): page_id 5 is imported first as
+//! "Old Name" (revisions at T1 < T2), then as "New Name" (one NEW revision
+//! at T3 > T2) — an INCREMENTAL adds-changes dump (W6) that carries only the
+//! post-move revisions, so T3 IS the recoverable handoff. The importer must:
 //!
 //!   * close the "Old Name" interval at T3 and open "New Name" at T3;
 //!   * resolve "Old Name" only within [T1, T3) and "New Name" from T3 on;
 //!   * NOT resolve either title before the page's first revision (T1);
-//!   * leave the interval rows byte-for-byte unchanged on a full re-import
-//!     (idempotence — no spurious churn).
+//!   * leave the interval rows byte-for-byte unchanged on a full re-import.
+//!
+//! The adversarial-review regressions at the bottom cover the shapes a dump
+//! CANNOT date: a full-history re-export under the new title (latest-dump-
+//! wins, since the move instant is not in the XML — that needs the
+//! mediawiki_history TSV, W5), the renamed-away title not leaking an all-τ
+//! resolution, and an earlier-revision backfill lowering the interval start.
 
 mod common;
 
@@ -198,4 +204,89 @@ fn first_import_opens_interval_at_earliest_revision() {
     // Gated on the first revision.
     assert_eq!(id_at(&inst, "Old Name", t1 - 1), None);
     assert_eq!(id_at(&inst, "Old Name", t1), Some(5));
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial-review regressions (2026-07). new_dump above is an INCREMENTAL
+// slice (post-move revisions only) — the datable-rename shape. These pin the
+// two shapes it did NOT cover: a full-history re-export under the new title
+// (the move instant is unrecoverable from the dump), and the renamed-away
+// title no longer leaking a resolution at every τ.
+// ---------------------------------------------------------------------------
+
+/// A full re-export as "New Name" carrying the WHOLE history (51,52,53) —
+/// the shape a real full-history dump takes after a move. The move instant
+/// is not in the dump, so the new title is adopted as authoritative across
+/// the page's history and the old title stops resolving.
+fn new_dump_full() -> String {
+    doc("New Name", &format!("{}{}{}",
+        rev(51, 2001, "one"), rev(52, 2002, "two"), rev(53, 2003, "three")))
+}
+
+#[test]
+fn full_history_reexport_adopts_new_title_authoritatively() {
+    let tmp = TempDir::new().unwrap();
+    let inst = make_instance(&tmp, 4096);
+    import(&inst, old_dump());       // page 5 = "Old Name" {51,52}
+    import(&inst, new_dump_full());  // re-export as "New Name" {51,52,53}
+    inst.flush().expect("flush");
+
+    let t1 = ts_of(&inst, 51);
+    // ONE open interval under the new title, from the earliest revision.
+    assert_eq!(intervals(&tmp), vec![("New Name".to_string(), t1, None)]);
+
+    // "New Name" resolves across the page's whole history; "Old Name" no
+    // longer resolves at any τ (it kept no interval — the move is undatable
+    // from dumps, so latest-dump-wins).
+    assert_eq!(id_at(&inst, "New Name", ts_of(&inst, 53)), Some(5));
+    assert_eq!(id_at(&inst, "New Name", t1), Some(5));
+    assert_eq!(id_at(&inst, "Old Name", t1), None);
+    assert_eq!(id_at(&inst, "Old Name", ts_of(&inst, 53)), None);
+    // Still gated on first existence.
+    assert_eq!(id_at(&inst, "New Name", t1 - 1), None);
+}
+
+/// After an incremental move, the renamed-away "Old Name" must resolve to
+/// None OUTSIDE its [T1,T3) window — not leak an all-τ resolution via the
+/// untimed fallback (the reviewer's 2b).
+#[test]
+fn renamed_away_title_does_not_resolve_at_all_tau() {
+    let tmp = TempDir::new().unwrap();
+    let inst = make_instance(&tmp, 4096);
+    import(&inst, old_dump());
+    import(&inst, new_dump());   // incremental: closes Old at T3, opens New
+    inst.flush().expect("flush");
+
+    let t1 = ts_of(&inst, 51);
+    let t3 = ts_of(&inst, 53);
+    // Inside its window: resolves. Before creation and after the move: None.
+    assert_eq!(id_at(&inst, "Old Name", t1), Some(5));
+    assert_eq!(id_at(&inst, "Old Name", t1 - 1), None, "must not exist pre-creation");
+    assert_eq!(id_at(&inst, "Old Name", t3), None, "must not resolve after the move");
+    assert_eq!(id_at(&inst, "Old Name", t3 + 1_000_000), None, "no all-τ leak");
+}
+
+/// A later dump that BACKFILLS an earlier revision under the same title
+/// lowers the interval's start, so exists_at stays honest (the reviewer's
+/// finding #1).
+#[test]
+fn backfilled_earlier_revision_lowers_interval_start() {
+    let tmp = TempDir::new().unwrap();
+    let inst = make_instance(&tmp, 4096);
+    // First: only the 2002 revision.
+    import(&inst, doc("Page", &rev(52, 2002, "two")));
+    inst.flush().expect("flush");
+    let t2 = ts_of(&inst, 52);
+    assert_eq!(id_at(&inst, "Page", t2 - 1), None, "only knows the 2002 start");
+
+    // Backfill: a part supplying the earlier 2000 revision, same title.
+    import(&inst, doc("Page", &rev(50, 2000, "zero")));
+    inst.flush().expect("flush");
+    let t0 = ts_of(&inst, 50);
+    assert_eq!(intervals(&tmp), vec![("Page".to_string(), t0, None)],
+               "start lowered to the backfilled earliest revision");
+    assert_eq!(id_at(&inst, "Page", t0), Some(5));
+    assert_eq!(id_at(&inst, "Page", t0 - 1), None);
+    // The read APIs now agree: content present ⇔ title resolves.
+    assert!(inst.page_text_at(5, Some(t0)).unwrap().is_some());
 }

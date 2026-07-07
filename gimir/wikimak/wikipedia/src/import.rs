@@ -145,6 +145,18 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
         .map(|r| r.timestamp.timestamp_micros())
         .min();
 
+    // Does this dump carry the page FORWARD — i.e. is its newest revision
+    // one we have not already stored? A re-run of the same or an older
+    // slice (crash-resume, idempotent reimport) does not, and must never
+    // change a page's title bookkeeping; only a fresh dump (seed,
+    // incremental, or a newer re-export) is authoritative for the title.
+    let dump_extends_head: bool = page
+        .revisions
+        .iter()
+        .max_by_key(|r| r.timestamp.timestamp_micros())
+        .map(|r| !revision_seen(&g.conn, page_id, r.id as u64).unwrap_or(false))
+        .unwrap_or(false);
+
     // Begin the per-page transaction.
     g.conn.execute("BEGIN IMMEDIATE", [])?;
     let outcome = (|| -> Result<bool> {
@@ -160,6 +172,7 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
             &normalized,
             instance.title_shard_count,
             earliest_ts,
+            dump_extends_head,
         )?;
 
         // Collect the page's NEW revisions in source order (oldest →
@@ -221,20 +234,30 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
 /// time-travel index, browsing plan §2).
 ///
 /// Interval discipline (`earliest_ts` = the earliest revision timestamp of
-/// this dump's copy of the page):
+/// this dump's copy of the page). The dump only ever states a page's
+/// CURRENT title; the rename INSTANT is not in the XML export (that lives
+/// in the `mediawiki_history` TSV, import plan §2.4 / W5 — plan §2 "title
+/// history is approximate"). So this bookkeeping does what a dump can
+/// support and no more:
 ///
-///   * First sighting of the page → open ONE interval
-///     `[earliest_ts, ∞)` (real start, NOT 0 — so `exists_at` is false
-///     before the page's first revision).
-///   * Reimport with the SAME title as the current open interval → no-op
-///     (idempotent: a re-run of the same dump must not churn rows).
-///   * Reimport with a DIFFERENT title whose earliest revision is strictly
-///     LATER than the open interval's start (a real move) → CLOSE the open
-///     interval at `earliest_ts` and OPEN a new one `[earliest_ts, ∞)` for
-///     the new title. The old title then stops resolving at `earliest_ts`.
-///   * A different title whose earliest revision is NOT later (a re-run of
-///     an older title's slice after the page was already moved) → left
-///     alone, so re-running the whole history is idempotent.
+///   * First sighting of the page → open ONE interval `[earliest_ts, ∞)`
+///     (real start, NOT 0 — so `exists_at` is false before the page's first
+///     revision).
+///   * SAME title still open → idempotent, EXCEPT a later dump that
+///     backfills an EARLIER revision (a full-history dump split across parts
+///     imported out of order) lowers the interval's start to `earliest_ts`,
+///     keeping `exists_at` honest.
+///   * DIFFERENT title whose earliest revision is strictly LATER than the
+///     open interval's start → an INCREMENTAL move: an adds-changes dump
+///     (W6) carries only the post-move revisions, so `earliest_ts` IS the
+///     handoff. CLOSE the old interval there and OPEN the new one — the one
+///     rename shape a dump can date. Old title stops resolving at the move.
+///   * DIFFERENT title, earliest NOT later → a FULL-HISTORY re-export under
+///     the page's current (post-move) title: it re-lists every revision from
+///     the first, so the move cannot be dated. Adopt the new title as
+///     authoritative by RETITLING the open interval in place (single-valued;
+///     the prior title keeps no interval and stops resolving at τ). Real
+///     per-instant rename history awaits the TSV.
 fn ensure_title(
     g: &InstanceInner,
     page_id: u64,
@@ -242,6 +265,7 @@ fn ensure_title(
     normalized: &[u8],
     title_shard_count: u32,
     earliest_ts: Option<i64>,
+    dump_extends_head: bool,
 ) -> Result<()> {
     // Look up an existing title_id for this (ns, normalized_title).
     let existing: Option<i64> = g
@@ -315,11 +339,27 @@ fn ensure_title(
         }
         Some((open_start, open_title)) => {
             if open_title == normalized {
-                // Same title still open — nothing to do (idempotent).
+                // Same title. Backfill only: a later dump may supply an
+                // EARLIER revision (history split across parts, imported out
+                // of order) — lower the start so exists_at stays correct.
+                // Otherwise a true no-op (idempotent reimport).
+                if start < open_start {
+                    g.conn.execute(
+                        "UPDATE title_intervals SET start_ts = ?1
+                         WHERE page_id = ?2 AND start_ts = ?3 AND end_ts IS NULL",
+                        params![start, page_id as i64, open_start],
+                    )?;
+                }
+            } else if !dump_extends_head {
+                // A DIFFERENT title but this dump adds no new head — a
+                // re-run of an older slice (crash-resume, idempotent
+                // reimport) under a title the page has already moved past.
+                // Leave every interval alone.
             } else if start > open_start {
-                // A move: this title's history begins strictly after the
-                // open interval opened. Close the old interval at the
-                // handoff instant and open the new one there.
+                // Incremental move (adds-changes / W6): a fresh dump whose
+                // revisions begin strictly after the open interval, so
+                // earliest_ts IS the handoff. Close the old interval there
+                // and open the new one — the one datable rename shape.
                 g.conn.execute(
                     "UPDATE title_intervals SET end_ts = ?1
                      WHERE page_id = ?2 AND start_ts = ?3 AND end_ts IS NULL",
@@ -331,10 +371,21 @@ fn ensure_title(
                      VALUES(?1, ?2, ?3, ?4, NULL)",
                     params![page_id as i64, ns, normalized, start],
                 )?;
+            } else {
+                // A fresh full-history re-export under a new (post-move)
+                // title: it re-lists every revision from the first, so the
+                // move instant is not in the dump. Adopt the new title as
+                // authoritative — retitle the open interval in place, keeping
+                // it single-valued (the prior title then has no interval and
+                // stops resolving at τ). Backfill the start too.
+                let new_start = start.min(open_start);
+                g.conn.execute(
+                    "UPDATE title_intervals
+                        SET normalized_title = ?1, ns = ?2, start_ts = ?3
+                     WHERE page_id = ?4 AND start_ts = ?5 AND end_ts IS NULL",
+                    params![normalized, ns, new_start, page_id as i64, open_start],
+                )?;
             }
-            // else: a different title whose earliest revision is not later
-            // than the open interval (an out-of-order re-run of a slice
-            // predating the move). Leave intervals as-is to stay idempotent.
         }
     }
     Ok(())
