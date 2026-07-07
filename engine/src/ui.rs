@@ -14394,6 +14394,52 @@ mod tests {
         assert!(!present(&app), "change should be gone after discard; status={}", app.status);
     }
 
+    /// `x` (discard one change) is a PROPER DISSOLVE of that change, not a
+    /// naive row-delete: the change is copied DOWN into any child box (so the
+    /// child keeps seeing it) BEFORE it is removed from this box. The box
+    /// reverts; the child's view is preserved; no other box changes.
+    #[test]
+    fn discard_dissolves_change_into_children() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        // Parent box with one captured change.
+        let (psid, proot) = make_box(&eng.sock);
+        let dir = proot.join("tmp");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("f.txt"), b"PARENT\n").expect("write");
+
+        // Child box stacked on the parent — it inherits the parent's view.
+        let r = rpc(&eng.sock, "box_new", json!([psid])).expect("box_new child");
+        let croot = PathBuf::from(r.get("root").and_then(Value::as_str).unwrap());
+        assert_eq!(
+            std::fs::read(croot.join("tmp/f.txt")).ok(),
+            Some(b"PARENT\n".to_vec()),
+            "child should inherit the parent's change before discard"
+        );
+
+        // Discard the change in the PARENT (its only change).
+        let d = rpc(&eng.sock, "review.discard", json!([psid])).expect("discard");
+        assert!(
+            d.get("discarded").and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false),
+            "the change was discarded: {d}"
+        );
+
+        // Parent reverts — its own change is gone …
+        assert!(
+            !proot.join("tmp/f.txt").exists(),
+            "parent should revert: the discarded change is gone from the parent"
+        );
+        // … but the CHILD still sees it — dissolved DOWN, not deleted.
+        assert_eq!(
+            std::fs::read(croot.join("tmp/f.txt")).ok(),
+            Some(b"PARENT\n".to_vec()),
+            "child view must be preserved — discard dissolves the change down, \
+             it does not corrupt the child"
+        );
+    }
+
     #[test]
     fn unknown_verb_is_graceful() {
         let Some(eng) = boot() else {
