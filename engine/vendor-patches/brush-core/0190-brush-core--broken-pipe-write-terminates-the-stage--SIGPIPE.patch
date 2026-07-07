@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Tue, 07 Jul 2026 08:22:00 +0000
+Subject: [PATCH] brush-core: broken-pipe write terminates the stage (SIGPIPE), not just exit 141
+
+---
+diff --git a/src/commands.rs b/src/commands.rs
+index 9b7aa2f..34386e0 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -834,10 +834,23 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
+     match (builtin.execute_func)(context, args).await {
+         Ok(result) => Ok(result),
+         Err(e) => {
+-            // Broken pipe errors should silently return the appropriate exit code
++            // Broken pipe returns the SIGPIPE exit code (141) AND
++            // terminates the shell instance. A builtin writing to a pipe
++            // whose reader has closed IS SIGPIPE, which in bash kills the
++            // process running the pipe's producer. Returning a NORMAL-flow
++            // 141 (as this used to) fixed only the exit code: `while :; do
++            // echo x; done | head -1` then spun forever at 100% CPU
++            // because `while :` ignores echo's failure. Rust ignores
++            // SIGPIPE process-wide, so we emulate the death: ExitShell
++            // unwinds the loop and ends this pipeline stage (a cloned
++            // subshell), leaving the parent shell running — exactly as
++            // SIGPIPE-killing the producer subshell would.
+             if let Some(io_err) = e.as_io_error() {
+                 if io_err.kind() == std::io::ErrorKind::BrokenPipe {
+-                    return Ok(ExecutionExitCode::from(io_err).into());
++                    let mut r: ExecutionResult =
++                        ExecutionExitCode::from(io_err).into();
++                    r.next_control_flow = ExecutionControlFlow::ExitShell;
++                    return Ok(r);
+                 }
+             }
+ 
