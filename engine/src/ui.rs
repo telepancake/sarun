@@ -559,6 +559,7 @@ enum Action {
     ApplyHunk,
     DiscardHunk,
     ApplyBox,
+    ApplyToCopy,
     DiscardBox,
     /// Box removal from the context menu, mirroring the K / D keys: dissolve
     /// (changes promoted down into children, remove) and kill (SIGTERM). Both
@@ -4453,6 +4454,21 @@ impl App {
         }
         self.refresh_sessions();
         self.load_changes();
+    }
+
+    /// Apply the box's changes onto a fresh COPY of its parent (the real
+    /// parent is left untouched); the copy appears as a new sibling box.
+    fn apply_to_copy(&mut self) {
+        let Some(sid) = self.cur_sid() else { return };
+        match rpc(&self.sock, "apply_to_copy", json!([sid])) {
+            Ok(r) => {
+                let name = r.get("name").and_then(Value::as_str).unwrap_or("copy");
+                let n = r.get("applied").and_then(Value::as_i64).unwrap_or(0);
+                self.status = format!("applied {n} change(s) onto a copy of the parent → {name}");
+            }
+            Err(e) => self.status = format!("apply-to-copy: {e}"),
+        }
+        self.refresh_sessions();
     }
 
     /// Open the scoped apply/discard picker for the cursored box: "All" plus
@@ -12406,6 +12422,7 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
             let mut items = vec![
                 mk("Open changes view", "Enter",  Action::OpenSelection),
                 mk("Apply ALL changes to host", "a", Action::ApplyBox),
+                mk("Apply changes to a COPY of the parent (parent untouched)", "", Action::ApplyToCopy),
                 mk("Delete box (changes promoted down, keep child boxes)", "D",
                    Action::DissolveBox),
                 mk("Discard ALL changes", "x",    Action::DiscardBox),
@@ -12498,6 +12515,7 @@ fn run_action(app: &mut App, a: Action) {
         Action::ApplyHunk      => app.apply_hunk(),
         Action::DiscardHunk    => app.discard_hunk(),
         Action::ApplyBox       => app.apply(),
+        Action::ApplyToCopy    => app.apply_to_copy(),
         Action::DiscardBox     => app.discard(),
         Action::DissolveBox    => app.modal = Some(Modal::Confirm {
             prompt: format!("Delete {}? Its changes are promoted down into \
@@ -14633,6 +14651,44 @@ mod tests {
             Some(_) => panic!("wrong modal opened; status={}", app.status),
             None => panic!("no picker modal opened; status={}", app.status),
         }
+    }
+
+    /// `apply_to_copy` promotes a box's changes onto a fresh COPY of its
+    /// parent, leaving the real parent untouched: the copy holds parent +
+    /// child changes; the parent still holds only its own.
+    #[test]
+    fn apply_to_copy_branches_the_parent() {
+        let Some(eng) = boot() else {
+            eprintln!("SKIP: engine binary missing or FUSE unavailable");
+            return;
+        };
+        // Parent P with a change, child B (on P) with its own change.
+        let (psid, proot) = make_box(&eng.sock);
+        std::fs::write(proot.join("pfile.txt"), b"P").expect("wp");
+        let r = rpc(&eng.sock, "box_new", json!([psid])).expect("box_new child");
+        let bsid = r.get("sid").and_then(Value::as_str).unwrap().to_string();
+        let broot = PathBuf::from(r.get("root").and_then(Value::as_str).unwrap());
+        std::fs::write(broot.join("bfile.txt"), b"B").expect("wb");
+
+        let res = rpc(&eng.sock, "apply_to_copy", json!([bsid])).expect("apply_to_copy");
+        let new_sid = res.get("new_sid").and_then(Value::as_str)
+            .expect(&format!("new_sid in {res}")).to_string();
+
+        let paths = |sid: &str| -> Vec<String> {
+            rpc(&eng.sock, "review.session_changes", json!([sid])).unwrap()
+                .as_array().unwrap().iter()
+                .filter_map(|c| c.get("path").and_then(Value::as_str).map(String::from))
+                .collect()
+        };
+        // The COPY holds BOTH the parent's change and the child's.
+        let copy = paths(&new_sid);
+        assert!(copy.iter().any(|p| p.contains("pfile.txt")), "copy has parent change: {copy:?}");
+        assert!(copy.iter().any(|p| p.contains("bfile.txt")), "copy has child change: {copy:?}");
+        // The real PARENT is untouched — its own change only, NOT the child's.
+        let par = paths(&psid);
+        assert!(par.iter().any(|p| p.contains("pfile.txt")), "parent keeps its change: {par:?}");
+        assert!(!par.iter().any(|p| p.contains("bfile.txt")),
+                "parent must NOT gain the child's change: {par:?}");
     }
 
     #[test]

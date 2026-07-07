@@ -1226,6 +1226,67 @@ fn free_box(state: &State, id: i64) -> Value {
     json!({"ok": true, "reparented": children})
 }
 
+/// Apply box `id`'s changes onto a fresh COPY of its parent, leaving the real
+/// parent (and its other children) untouched. Composes existing primitives:
+/// create a new box beside the parent (child of the grandparent), copy the
+/// parent's own changes into it (so it starts as a snapshot of the parent),
+/// then promote `id`'s changes on top. The result is a new sibling box holding
+/// "parent + id's changes"; nothing else in the tree moves.
+fn apply_to_copy(state: &State, boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+                 id: i64) -> Value {
+    let Some(me) = boxes.get(&id) else {
+        return json!({"ok": false, "error": "no slopbox"});
+    };
+    let Some(parent) = me.parent else {
+        return json!({"ok": false,
+            "error": "box has no parent box to copy (a top-level box applies to the host)"});
+    };
+    if box_is_running(state, id) || box_is_running(state, parent) {
+        return json!({"ok": false, "error": "box or its parent is running; stop it first"});
+    }
+    let grandparent = boxes.get(&parent).and_then(|b| b.parent);
+    let Some(ov) = lock(state).overlay.clone() else {
+        return json!({"ok": false, "error": "overlay not mounted"});
+    };
+    let new_id = boxes.keys().max().copied().unwrap_or(0) + 1;
+    let parent_name = boxes.get(&parent).map(|b| b.name.clone()).unwrap_or_default();
+    let new_name = if parent_name.is_empty() {
+        format!("copy{new_id}")
+    } else {
+        format!("{parent_name}-copy")
+    };
+    // 1. Create the copy box as a child of the grandparent (a sibling of the
+    //    real parent).
+    match crate::capture::BoxState::create(new_id) {
+        Ok(b) => {
+            b.set_parent(grandparent);
+            if let Some(gp) = grandparent {
+                b.set_meta("parent_box_id", &gp.to_string());
+            }
+            b.set_meta("name", &new_name);
+            ov.add_box(std::sync::Arc::new(b));
+        }
+        Err(e) => return json!({"ok": false, "error": format!("create copy box: {e}")}),
+    }
+    // 2. Copy the parent's OWN changes into the copy (snapshot of the parent).
+    for rel in crate::review::changed_paths(parent) {
+        if let Err(e) = crate::review::copy_down_entry(parent, new_id, &rel, None) {
+            return json!({"ok": false, "error": format!("copy parent '{rel}': {e}")});
+        }
+    }
+    // 3. Promote this box's changes onto the copy.
+    let mut applied = 0usize;
+    for rel in crate::review::changed_paths(id) {
+        if let Err(e) = crate::review::promote_into_parent(id, new_id, None, &rel) {
+            return json!({"ok": false, "error": format!("apply '{rel}' onto copy: {e}")});
+        }
+        applied += 1;
+    }
+    broadcast(state, &json!({"type": "session_new",
+        "session_id": new_id.to_string(), "name": new_name}));
+    json!({"ok": true, "new_sid": new_id.to_string(), "name": new_name, "applied": applied})
+}
+
 /// Audit H3: apply/discard read the box's pool blobs (`blob_path(id, rowid)`) —
 /// the exact files a LIVE FUSE write may be mid-`write_at` on. Reading one of
 /// those while it's being written stamps a TORN blob onto the host. So, like
@@ -2265,6 +2326,12 @@ macro_rules! ui_verbs {
             Some(id) => dissolve(state, id),
             None => json!({"ok": false, "error": "no slopbox"}),
         }
+        }
+        "apply_to_copy", "SID", "apply a box's changes onto a COPY of its parent (parent untouched)" => {
+            match arg_sid(args) {
+                Some(id) => apply_to_copy(state, boxes, id),
+                None => json!({"ok": false, "error": "no slopbox"}),
+            }
         }
         // RO attachments (DEPOT-DESIGN.md §8): reference another box's
         // layer read-only, between this box and its parent in the lookup
