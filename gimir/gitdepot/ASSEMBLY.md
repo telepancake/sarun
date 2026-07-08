@@ -171,6 +171,28 @@ back rather than guessing.
 - Invariant: **#lanes ≥ #live refs** (each live ref points at a commit → at
   least one lane).
 
+### Lane assignment across layers (persistent lanes)
+
+A lane is a **persistent slot**: at any layer each lane holds one git commit,
+and lane `j` in the previous layer and in the new layer are THE SAME lane. That
+is what makes the delta minimal — `layer::delta_multi_lane` matches variants by
+their tree-entry identity `(mode, oid)` and keeps a variant's storage slot
+stable, so an unchanged commit (its tree oid at a path unchanged) churns no
+bitmap.
+
+The commit→lane assignment (the caller's job, upstream of `delta_multi_lane`,
+which only consumes the aligned `old_lanes` / `new_lanes` arrays) balances two
+failure modes:
+
+- **too smart** — diffing trees to place commits: kills import perf.
+- **too dumb** — random/renumbered lanes each layer: churns EVERY lane bitmap
+  (every variant's lane set shifts), killing size.
+
+The rule: **keep an unchanged commit in its existing lane; for an advanced
+commit, inherit the lane of its ancestor** (a ref moving `C → C'` keeps `C'` in
+`C`'s lane). New refs take fresh lanes. Then most paths' `(mode, oid)` variants
+are untouched and prune; a changed path moves a single bit.
+
 ## 6. Component / dependency order
 
 1. **Encoding + iterator** (§2, §3) — foundation; everything reads/writes it.
