@@ -55,7 +55,7 @@ const CHAIN: u64 = 0;
 /// is recent. Blobs are not cached: they are fetched by oid only to emit a
 /// `\0v` and then dropped.
 type TreeEnts = std::sync::Arc<Vec<(Vec<u8>, crate::oidenc::Ent)>>;
-const TREE_CACHE_CAP: usize = 1 << 16; // ~64k trees (recent working set)
+const TREE_CACHE_CAP: usize = 4096; // recent working set (root + hot dirs); no CPU gain from more
 
 struct Cat<'a> {
     cat: &'a mut crate::CatFile,
