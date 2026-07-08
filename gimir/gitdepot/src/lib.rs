@@ -91,6 +91,7 @@ mod cli;
 pub use cli::cli_main;
 pub mod lanes;
 pub mod lanestore;
+pub mod oidenc;
 pub mod reslot;
 pub mod unionenc;
 pub mod variants;
@@ -653,14 +654,14 @@ fn collect_tag_objects(repo: &Path, refs: &[RefMeta]) -> Result<Vec<TagObj>> {
 /// request-one/read-one interleaving: a single pending request never
 /// outgrows the pipe buffer, so no writer thread is needed (contrast
 /// fetch_blobs, which streams thousands of requests ahead).
-struct CatFile {
+pub(crate) struct CatFile {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
     out: std::io::BufReader<std::process::ChildStdout>,
 }
 
 impl CatFile {
-    fn new(repo: &Path) -> Result<CatFile> {
+    pub(crate) fn new(repo: &Path) -> Result<CatFile> {
         let mut child = Command::new("git")
             .arg("-C")
             .arg(repo)
@@ -674,8 +675,9 @@ impl CatFile {
         Ok(CatFile { child, stdin, out })
     }
 
-    /// The raw bytes of one object (any type).
-    fn get(&mut self, oid: &str) -> Result<Vec<u8>> {
+    /// The raw bytes of one object (any type) — a tree's binary entries or a
+    /// blob's content, served by oid straight from the object store.
+    pub(crate) fn get(&mut self, oid: &str) -> Result<Vec<u8>> {
         use std::io::{BufRead as _, Read as _};
         writeln!(self.stdin, "{oid}")?;
         self.stdin.flush()?;
