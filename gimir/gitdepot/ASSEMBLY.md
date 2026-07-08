@@ -195,12 +195,22 @@ are untouched and prune; a changed path moves a single bit.
 
 ## 6. Component / dependency order
 
-1. **Encoding + iterator** (§2, §3) — foundation; everything reads/writes it.
-2. **Merge** (§4 algebra) over the encoding + iterator; then the geometric
-   stack driver.
-3. **Delta generation**: lockstep iterate full-state + stack + git trees →
-   new delta.
-4. **Sharding harness** (§1): per-shard threads over 1–3.
-5. **Reflog** (§5).
-6. Wire into `LaneStore`-equivalent + SHA-exact proof; then swap blob
-   acquisition (`cat-file` → `fetch-pack --shallow-since` + `unpack-objects`).
+Status: 1–6 BUILT and tested against a SHA-exact oracle (git tree oids,
+anchored to git's real constants); a live-git blob source is the remaining
+integration.
+
+1. **Encoding + iterator** (§2, §3) — DONE (`layer.rs`: names/orders both
+   proven, `visit_entries`, `walk` cursor).
+2. **Merge** (§4 algebra) + geometric stack driver — DONE
+   (`depot::stream` compose/overlay, `geostack.rs`).
+3. **Delta generation** — DONE (`layer.rs`: `delta_multi_lane[_stacked]`,
+   reslot by `(mode,oid)`; `visit_current` reads current state from
+   base+stack without materializing; 400-seed randomized vs overlay oracle).
+4. **Sharding harness** (§1) — DONE (`shards.rs`: per-shard threads, stable
+   path hash, cross-shard reconstruction; oid invariant across shard counts).
+5. **Reflog** (§5) — DONE (`reflog.rs`: per-layer lanes+refs, #lanes≥#refs).
+6. **Frame lifecycle + SHA-exact proof** — DONE (`frame.rs`: refPrefix +
+   geostack + seal; `reconstruct_lane_tree_oid`; `reflog.rs` DAG capstone
+   drives lanes→union→git oid). REMAINING: swap the synthetic lane trees for
+   a live blob source (`cat-file` → `fetch-pack --shallow-since` +
+   `unpack-objects`) and run against real git.git.
