@@ -226,6 +226,7 @@ long sud_inramfs_op_write(int fd, const void *buf, size_t count);
 long sud_inramfs_op_pread(int fd, void *buf, size_t count, off_t off);
 long sud_inramfs_op_pwrite(int fd, const void *buf, size_t count, off_t off);
 long sud_inramfs_op_lseek(int fd, off_t off, int whence);
+long sud_inramfs_op_llseek(int fd, int64_t off, int whence, int64_t *result);
 long sud_inramfs_op_ftruncate(int fd, off_t length);
 long sud_inramfs_op_fstat(int fd, void *st_buf);          /* writes a struct stat for the running ABI */
 long sud_inramfs_op_fchmod(int fd, int mode);

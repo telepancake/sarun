@@ -506,6 +506,29 @@ long sud_inramfs_op_lseek(int fd, off_t off, int whence)
     return newp;
 }
 
+/* 32-bit _llseek(2): a full 64-bit seek that can't be expressed
+ * through op_lseek's (i386) 32-bit off_t.  Computes the new offset in
+ * 64-bit and writes it back through *result, mirroring the kernel
+ * ABI.  Returns 0 on success or -errno. */
+long sud_inramfs_op_llseek(int fd, int64_t off, int whence, int64_t *result)
+{
+    struct sud_ir_open_file *of = fdtab_lookup(fd);
+    if (!of) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    if (!ino) return -EBADF;
+    int64_t newp;
+    switch (whence) {
+        case SEEK_SET: newp = off; break;
+        case SEEK_CUR: newp = (int64_t)of->pos + off; break;
+        case SEEK_END: newp = (int64_t)ino->size + off; break;
+        default: return -EINVAL;
+    }
+    if (newp < 0) return -EINVAL;
+    of->pos = (uint64_t)newp;
+    if (result) *result = newp;
+    return 0;
+}
+
 long sud_inramfs_op_ftruncate(int fd, off_t length)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
@@ -1330,6 +1353,47 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
         int out_fd = (int)ctx->args[2];
         if (sud_inramfs_owns_fd(in_fd) || sud_inramfs_owns_fd(out_fd))
             return short_circuit(ctx, -EINVAL);
+    }
+#endif
+
+    /* 32-bit _llseek: musl's i386 lseek() issues _llseek, not the
+     * plain SYS_lseek in the fd table, so without this an inramfs fd's
+     * logical position would never move (reads/writes stay stuck at
+     * the last position — a held fd can't rewind). */
+#ifdef SYS__llseek
+    if (nr == SYS__llseek) {
+        int fd = (int)ctx->args[0];
+        if (sud_inramfs_owns_fd(fd)) {
+            unsigned long hi = (unsigned long)ctx->args[1];
+            unsigned long lo = (unsigned long)ctx->args[2];
+            int64_t off = (int64_t)(((uint64_t)hi << 32) | (uint64_t)lo);
+            int64_t *result = (int64_t *)ctx->args[3];
+            int whence = (int)ctx->args[4];
+            return short_circuit(ctx,
+                sud_inramfs_op_llseek(fd, off, whence, result));
+        }
+    }
+#endif
+
+    /* statx on an inramfs-owned fd with an empty pathname (AT_EMPTY_PATH)
+     * is the fstat form: musl's i386 fstat() routes through statx, which
+     * is not in the fd table and whose non-empty-path form is handled
+     * path-side by inramfs_glue.  Without this the call falls through to
+     * the kernel and stats the empty backing memfd (size 0). */
+#ifdef SYS_statx
+    if (nr == SYS_statx) {
+        int fd = (int)ctx->args[0];
+        const char *path = (const char *)ctx->args[1];
+        int flags = (int)ctx->args[2];
+        if ((flags & AT_EMPTY_PATH) && (!path || path[0] == '\0')
+            && sud_inramfs_owns_fd(fd)) {
+            struct sud_ir_open_file *of = fdtab_lookup(fd);
+            if (of)
+                return short_circuit(ctx,
+                    sud_inramfs_op_statx_fill_inode(of->inode_idx,
+                                                    (unsigned int)ctx->args[3],
+                                                    (void *)ctx->args[4]));
+        }
     }
 #endif
 
