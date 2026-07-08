@@ -95,6 +95,42 @@ fn compose_corner_fixtures() {
     check_compose(&a6, &b6, "empty-dir");
 }
 
+/// Regression for the two-sided-collapse corner: a child that composes to
+/// the identity delta even though neither side encodes as `[0,0]` — one
+/// side is identity, the other a facetless keep whose only child is itself
+/// identity (and so is dropped, leaving an empty keep). `compose_node`
+/// prunes the whole child; the streaming merge must too.
+#[test]
+fn compose_two_sided_collapse_to_identity() {
+    let n = |b: &[u8]| b.to_vec();
+    let kids = |kk: Vec<(&[u8], Node)>| {
+        let mut node = Node::keep();
+        for (k, v) in kk {
+            node.children.insert(n(k), v);
+        }
+        node
+    };
+    // a: child c = identity keep. b: child c = keep holding an identity
+    // grandchild g. compose(a,b).c = keep with g dropped = identity → the
+    // whole c must vanish, leaving the empty root.
+    let a = Layer { root: kids(vec![(b"c", Node::keep())]) };
+    let b = Layer { root: kids(vec![(b"c", kids(vec![(b"g", Node::keep())]))]) };
+    check_compose(&a, &b, "two-sided-collapse");
+    assert_eq!(compose_bytes(&a, &b), encode(&Layer::empty()), "did not collapse to empty root");
+
+    // Deeper: c/d both facetless keeps that cancel through two levels.
+    let a2 = Layer { root: kids(vec![(b"c", kids(vec![(b"d", Node::keep())]))]) };
+    let b2 = Layer { root: kids(vec![(b"c", kids(vec![(b"d", kids(vec![(b"e", Node::keep())]))]))]) };
+    check_compose(&a2, &b2, "two-sided-collapse-deep");
+
+    // Control: a surviving facet anywhere keeps the child (must NOT prune).
+    let a3 = Layer { root: kids(vec![(b"c", Node::keep())]) };
+    let set = Node { blob: BlobOp::Set(b"x".to_vec().into()), ..Node::keep() };
+    let b3 = Layer { root: kids(vec![(b"c", kids(vec![(b"g", set)]))]) };
+    check_compose(&a3, &b3, "two-sided-survivor");
+    assert_ne!(compose_bytes(&a3, &b3), encode(&Layer::empty()), "wrongly pruned a survivor");
+}
+
 #[test]
 fn compose_matches_reference_randomized() {
     for seed in 1..400u64 {
