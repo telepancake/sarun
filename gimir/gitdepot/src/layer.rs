@@ -903,6 +903,23 @@ pub fn reconstruct_lane_tree_oid(union: &[u8], lane: u32) -> Result<String, WErr
     tree_oid_of_entries(&extract_lane_entries(union, lane)?)
 }
 
+/// Encode a single-lane delta directly from a change list (as `git diff-tree`
+/// yields it): `(path, Some((mode, content)))` sets/replaces a file,
+/// `(path, None)` removes it (a hole). Slot 0, no bitmap. Used to build a
+/// per-commit delta from a diff without materializing either full tree.
+pub fn encode_single_lane_delta(changes: &[(Vec<u8>, Option<(Mode, Vec<u8>)>)]) -> Vec<u8> {
+    let mut root = depot::Node::keep();
+    for (path, change) in changes {
+        match change {
+            Some((mode, content)) => {
+                put_variant(&mut root, path, 0, variant_node(content, *mode, None));
+            }
+            None => put_variant(&mut root, path, 0, depot::Node::hole()),
+        }
+    }
+    depot::codec::encode(&depot::Layer { root })
+}
+
 // ------------------------------------------------------------ iterator
 
 /// One file entry yielded by the layer iterator. `content`/`bitmap` borrow

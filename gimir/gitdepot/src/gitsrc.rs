@@ -67,6 +67,45 @@ pub fn commit_tree_oid(repo: &std::path::Path, commit: &str) -> Result<String, S
     Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
 
+/// The per-commit change list between `a` and `b` (as `git diff-tree -r`):
+/// `(path, Some((mode, content)))` for an add/modify/typechange,
+/// `(path, None)` for a delete. Only changed blobs are fetched. Feed straight
+/// to [`crate::layer::encode_single_lane_delta`].
+pub fn diff_changes(
+    repo: &std::path::Path,
+    a: &str,
+    b: &str,
+) -> Result<Vec<(Vec<u8>, Option<(Mode, Vec<u8>)>)>, String> {
+    // ":<om> <nm> <oo> <no> <status>\0<path>\0" records, no rename detection.
+    let raw = git(repo, &["diff-tree", "-r", "-z", "--no-renames", a, b])?;
+    let mut out = Vec::new();
+    let mut it = raw.split(|&b| b == 0).peekable();
+    while let Some(meta) = it.next() {
+        if meta.is_empty() {
+            break;
+        }
+        // meta starts with ':'
+        let fields: Vec<&[u8]> = meta[1..].split(|&b| b == b' ').collect();
+        let new_mode = fields.get(1).copied().unwrap_or(b"");
+        let new_oid = fields.get(3).copied().unwrap_or(b"");
+        let status = fields.get(4).and_then(|s| s.first()).copied().unwrap_or(b'?');
+        let path = it.next().ok_or("diff-tree: no path")?.to_vec();
+        if status == b'D' {
+            out.push((path, None));
+        } else {
+            let mode = mode_from_git(new_mode).ok_or_else(|| format!("bad mode {new_mode:?}"))?;
+            let content = if mode == Mode::Gitlink {
+                new_oid.to_vec()
+            } else {
+                let oid_s = std::str::from_utf8(new_oid).map_err(|_| "oid utf8")?;
+                git(repo, &["cat-file", "blob", oid_s])?
+            };
+            out.push((path, Some((mode, content))));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +190,63 @@ mod tests {
 
         // Also confirm the direct reference path matches git for a single tree.
         assert_eq!(layer::lanetree_tree_oid(&lanes[0]).unwrap(), want_main);
+    }
+
+    fn zstd_len(bytes: &[u8], level: i32) -> usize {
+        zstd::bulk::compress(bytes, level).unwrap().len()
+    }
+
+    /// Measure the engine on a REAL repo's first-parent history: sum of
+    /// per-commit single-lane deltas (built from `git diff-tree`, only changed
+    /// blobs) + the tip refPrefix, raw and zstd, vs git's own pack. Point it at
+    /// a repo with GITDEPOT_MEASURE_REPO; skips if unset. Prints numbers.
+    #[test]
+    fn measure_against_real_history() {
+        let repo = match std::env::var("GITDEPOT_MEASURE_REPO") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => return,
+        };
+        // First-parent history oldest→newest.
+        let out = git(&repo, &["rev-list", "--reverse", "--first-parent", "HEAD"]).unwrap();
+        let commits: Vec<String> =
+            String::from_utf8_lossy(&out).lines().map(|s| s.to_string()).collect();
+        assert!(commits.len() > 1);
+
+        // All delta layers concatenated (the f1 frame), and their raw total.
+        let mut all_deltas: Vec<u8> = Vec::new();
+        let mut delta_raw = 0usize;
+        for w in commits.windows(2) {
+            let changes = diff_changes(&repo, &w[0], &w[1]).unwrap();
+            let d = layer::encode_single_lane_delta(&changes);
+            delta_raw += d.len();
+            all_deltas.extend_from_slice(&d);
+        }
+        // The tip refPrefix (f0): the full tree of HEAD as a single-lane union.
+        let tip = read_commit_tree(&repo, "HEAD").unwrap();
+        // Reconstruct sanity: the tip encodes to git's tree oid.
+        assert_eq!(layer::lanetree_tree_oid(&tip).unwrap(), commit_tree_oid(&repo, "HEAD").unwrap());
+        let tip_entries: Vec<_> =
+            tip.iter().map(|(p, e)| (p.clone(), e.mode, e.content.clone())).collect();
+        let refprefix = layer::encode_lane(&tip_entries);
+
+        let git_pack = git(&repo, &["count-objects", "-v"]).unwrap();
+        let pack_kib: usize = String::from_utf8_lossy(&git_pack)
+            .lines()
+            .find_map(|l| l.strip_prefix("size-pack: ").and_then(|v| v.trim().parse().ok()))
+            .unwrap_or(0);
+
+        let lvl = 19;
+        let deltas_z = zstd_len(&all_deltas, lvl);
+        let refprefix_z = zstd_len(&refprefix, lvl);
+        let mut combined = all_deltas.clone();
+        combined.extend_from_slice(&refprefix);
+        let combined_z = zstd_len(&combined, lvl);
+        eprintln!("=== gitdepot size measurement ({} commits) ===", commits.len());
+        eprintln!("delta layers (f1):  raw {:>10}  zstd {:>10}", delta_raw, deltas_z);
+        eprintln!("refPrefix   (f0):  raw {:>10}  zstd {:>10}", refprefix.len(), refprefix_z);
+        eprintln!("f0+f1 separate zstd-19:           {:>10}", deltas_z + refprefix_z);
+        eprintln!("f0+f1 one zstd-19 stream:         {:>10}", combined_z);
+        eprintln!("f1 alone (complete store) zstd-19:{:>10}", deltas_z);
+        eprintln!("git pack (size-pack):             {:>10} ({} KiB)", pack_kib * 1024, pack_kib);
     }
 }
