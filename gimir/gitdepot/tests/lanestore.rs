@@ -106,7 +106,7 @@ fn peak_rss_kb() -> u64 {
 #[test]
 #[ignore]
 fn gitgit_proof() {
-    gitgit_proof_run(true);
+    gitgit_proof_run(Mode::Variant);
 }
 
 /// Same proof over the NON-variant lockstep encoder (`encode_repo`) — no
@@ -115,7 +115,35 @@ fn gitgit_proof() {
 #[test]
 #[ignore]
 fn gitgit_proof_lockstep() {
-    gitgit_proof_run(false);
+    gitgit_proof_run(Mode::Lockstep);
+}
+
+/// The proof for the union-variant store (`encode_repo_union`): all live
+/// lanes unioned into ONE path-keyed tree per revision, content byte-stable
+/// across lane-membership changes so a trunk commit yields a tiny frame
+/// delta. This is the representation meant to replace the variant path —
+/// the numbers here are the gate.
+#[test]
+#[ignore]
+fn gitgit_proof_union() {
+    gitgit_proof_run(Mode::Union);
+}
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Variant,
+    Lockstep,
+    Union,
+}
+
+impl Mode {
+    fn tag(self) -> &'static str {
+        match self {
+            Mode::Variant => "variant",
+            Mode::Lockstep => "lockstep",
+            Mode::Union => "union",
+        }
+    }
 }
 
 /// Cheap topology-only stats (no tree building) that explain the encode
@@ -167,34 +195,34 @@ fn gitgit_lane_stats() {
     println!("===============================\n");
 }
 
-fn gitgit_proof_run(variant: bool) {
+fn gitgit_proof_run(mode: Mode) {
     let repo = std::env::var("GITGIT_REPO").unwrap_or_else(|_| {
         "/tmp/claude-0/-home-user-sarun/5df6fa05-fb5d-5959-9227-2afc1158ad07/scratchpad/gitgit.git"
             .to_string()
     });
     let repo = Path::new(&repo);
     assert!(repo.exists(), "git.git mirror not found at {}", repo.display());
-    // Distinct scratch per test: the two proof tests run in parallel, so a
+    // Distinct scratch per test: the proof tests run in parallel, so a
     // shared dir would race two encodes onto one depot (a non-virgin seed →
     // "non-first prepend requires f1").
     let scratch = std::env::var("GITGIT_SCRATCH").unwrap_or_else(|_| {
         format!(
             "/tmp/claude-0/-home-user-sarun/5df6fa05-fb5d-5959-9227-2afc1158ad07/scratchpad/gitgit-lane-{}",
-            if variant { "variant" } else { "lockstep" }
+            mode.tag()
         )
     });
     let dir = Path::new(&scratch);
     let _ = std::fs::remove_dir_all(dir);
 
-    // git.git pack size (the 564MB reference).
+    // git.git pack size (the 591MB reference).
     let pack = dir_size(&repo.join("objects/pack"));
 
     // (1) encode via the scalable lane encoder.
     let t0 = std::time::Instant::now();
-    let store = if variant {
-        gitdepot::lanestore::LaneStore::encode_repo_variant(repo, dir, 3)
-    } else {
-        gitdepot::lanestore::LaneStore::encode_repo(repo, dir, 3)
+    let store = match mode {
+        Mode::Variant => gitdepot::lanestore::LaneStore::encode_repo_variant(repo, dir, 3),
+        Mode::Lockstep => gitdepot::lanestore::LaneStore::encode_repo(repo, dir, 3),
+        Mode::Union => gitdepot::lanestore::LaneStore::encode_repo_union(repo, dir, 3),
     }
     .expect("encode git.git");
     let encode_secs = t0.elapsed().as_secs_f64();
@@ -229,7 +257,7 @@ fn gitgit_proof_run(variant: bool) {
     let rss = peak_rss_kb();
     let trees_known_mb = 374u64; // shipped TREES store of git.git (design figure)
 
-    println!("\n==== git.git lane-store proof ({}) ====", if variant { "variant" } else { "lockstep" });
+    println!("\n==== git.git lane-store proof ({}) ====", mode.tag());
     println!("commits (revisions):   {n_rev}");
     println!("commits reconstructed: {checked}  (SHA-exact: {})", checked == n_rev);
     println!("lanes:                 {n_lanes}");
