@@ -96,13 +96,9 @@ pub mod reflog;
 pub mod shards;
 pub mod layer;
 pub mod lanes;
-pub mod lanestore;
-pub mod oidenc;
-pub mod reslot;
-
-pub mod variants;
 pub mod readout;
 pub mod store;
+pub mod unionstore;
 
 pub use store::{commit_at, commit_count, label, resolve_ref, Resolved};
 
@@ -1351,10 +1347,9 @@ fn ingest_stream(
     })
 }
 
-/// The ONE streaming frontier walk both the shipped importer
-/// (`ingest_stream`) and the lane-store encoder (`lanestore`) drive —
-/// the O(delta) view construction, factored out so only the SINK
-/// differs. Streams the walked scope in `dag.order`, and for every
+/// The ONE streaming frontier walk the shipped importer
+/// (`ingest_stream`) drives — the O(delta) view construction, factored
+/// out so only the SINK differs. Streams the walked scope in `dag.order`, and for every
 /// not-yet-`known` commit builds its `depot::View` in O(delta): the
 /// first parent's frontier view (Arc-shared, moved out on its last
 /// child else cloned) with `apply_mut` of that commit's first-parent
