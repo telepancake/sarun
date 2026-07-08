@@ -385,16 +385,14 @@ impl LaneStore {
         let mut full_combined = View::default();
         let mut lane_blob_sets: HashMap<LaneId, HashSet<Vec<u8>>> = HashMap::new();
         // Union path: each live lane's CURRENT tree, indexed by lane id
-        // (None = absent/evicted). The stored state at revision i is the
-        // union of these; only one entry changes per revision. The frame is
-        // produced by `variants::reverse_delta` walking the lane trees —
-        // never by materializing that union. `prev_lanes` is the previous
-        // revision's snapshot (Arc-cheap: one entry differs), the older side
-        // of each reverse delta; `no_lanes` is the all-absent base of an f0.
+        // (None = absent/evicted). The stored state is produced by the
+        // stateful `unionenc::Encoder`, which holds the union as slot state
+        // per path (see `reslot`) and turns each revision's slot changes
+        // into the frame delta — no combined tree, stable slots. `lane_views`
+        // is just the encoder's per-revision input.
         let n_lanes = assignment.span.len();
-        let no_lanes: Vec<Option<View>> = vec![None; n_lanes];
         let mut lane_views: Vec<Option<View>> = vec![None; n_lanes];
-        let mut prev_lanes: Vec<Option<View>> = vec![None; n_lanes];
+        let mut enc = crate::unionenc::Encoder::new();
         let mut prev: Option<View> = None;
         let mut batch: Vec<Vec<u8>> = Vec::new(); // reverse records, forward order
         let mut batch_bytes: u64 = 0;
@@ -432,23 +430,23 @@ impl LaneStore {
                 }
                 lane_views[lane_of[i] as usize] = Some(view.clone());
                 if repr == Repr::Union {
-                    // Frame = reverse delta between this revision's lane set
-                    // and the previous one, produced by the streaming walk
-                    // (no combined tree). f0 is the walk against the empty
-                    // base; every older record rebuilds `prev_lanes` from the
-                    // current lanes.
+                    // Advance the encoder to this revision's lane set. It
+                    // returns the reverse delta rebuilding the PREVIOUS state
+                    // from this one (each older record); f0/seal heads are its
+                    // forward full state. No combined tree; slots are stable.
+                    let refs: Vec<Option<&View>> = lane_views.iter().map(Option::as_ref).collect();
+                    let rev = enc.advance(&refs);
                     if i == 0 {
-                        let f0raw = codec::encode(&crate::variants::reverse_delta(&no_lanes, &lane_views));
+                        let f0raw = codec::encode(&enc.full());
                         let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
                         depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
                     } else {
-                        let rec = codec::encode(&crate::variants::reverse_delta(&lane_views, &prev_lanes));
+                        let rec = codec::encode(&rev);
                         batch_bytes += 8 + rec.len() as u64;
                         batch.push(rec);
                     }
-                    prev_lanes.clone_from(&lane_views);
                     if !batch.is_empty() && batch_bytes >= batch_bound {
-                        let head = codec::encode(&crate::variants::reverse_delta(&no_lanes, &lane_views));
+                        let head = codec::encode(&enc.full());
                         let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
                         seal_prepend(&depot, &head, &staged, level)?;
                         batch_bytes = 0;
@@ -524,7 +522,7 @@ impl LaneStore {
         // the empty base; the other paths diff the retained `prev` View.
         if !batch.is_empty() {
             let head = if repr == Repr::Union {
-                codec::encode(&crate::variants::reverse_delta(&no_lanes, &lane_views))
+                codec::encode(&enc.full())
             } else {
                 codec::encode(&depot::diff(None, prev.as_ref()))
             };

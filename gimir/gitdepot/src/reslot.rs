@@ -35,50 +35,58 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// A variant id — opaque bytes (a git blob oid, or oid+mode). Compared for
 /// equality only; never interpreted here.
-pub type VarId = Vec<u8>;
 /// A lane membership bitmap (bit `l` set ⇒ lane `l` carries this variant).
 pub type Bitmap = Vec<u8>;
 
-/// What occupies a slot: a variant id and the lanes that carry it.
+/// What occupies a slot: a variant identity `V` and the lanes that carry it.
+/// `V` is whatever the caller keys variants by — the encoder uses the
+/// `(attrs, content)` pair so a slot's occupant directly yields the bytes
+/// and mode for a `\0v`/`\0m` frame node; the tests use a byte-string.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Occupant {
-    pub id: VarId,
+pub struct Occupant<V> {
+    pub id: V,
     pub bitmap: Bitmap,
 }
 
 /// One slot that changed in a reslot step. `before`/`after` are the
 /// occupant on each side (`None` = empty): `None→Some` is a create,
 /// `Some→None` a delete, `Some→Some` an edit (content and/or bitmap). The
-/// caller turns this into a frame delta at the path — fetching `after`'s
-/// content bytes by id for a forward store, or `before`'s for a reverse
-/// one. Unchanged slots are never returned.
+/// caller turns this into a frame delta at the path — using `after` for a
+/// forward store, `before` for a reverse one. Unchanged slots never appear.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SlotChange {
+pub struct SlotChange<V> {
     pub slot: u32,
-    pub before: Option<Occupant>,
-    pub after: Option<Occupant>,
+    pub before: Option<Occupant<V>>,
+    pub after: Option<Occupant<V>>,
 }
 
-/// The persistent per-path slot state (tiny — ids and bitmaps only), held
-/// in RAM across the whole encode and mutated one revision at a time.
-#[derive(Clone, Debug, Default)]
-pub struct Slots {
+/// The persistent per-path slot state, held in RAM across the whole encode
+/// and mutated one revision at a time. Tiny when `V` is an id; the encoder's
+/// `V = (attrs, content)` is Arc-backed so its content shares storage.
+#[derive(Clone, Debug)]
+pub struct Slots<V> {
     /// slot key → occupant. Absent key = free slot. Sparse; freed keys are
     /// reused lowest-first so the key space stays compact.
-    by_slot: BTreeMap<u32, Occupant>,
+    by_slot: BTreeMap<u32, Occupant<V>>,
+}
+
+impl<V> Default for Slots<V> {
+    fn default() -> Self {
+        Slots { by_slot: BTreeMap::new() }
+    }
 }
 
 fn common_lanes(a: &[u8], b: &[u8]) -> u32 {
     a.iter().zip(b).map(|(x, y)| (x & y).count_ones()).sum()
 }
 
-impl Slots {
+impl<V: Ord + Clone> Slots<V> {
     pub fn is_empty(&self) -> bool {
         self.by_slot.is_empty()
     }
 
     /// The current occupant of each slot, for reconstruction/inspection.
-    pub fn iter(&self) -> impl Iterator<Item = (u32, &Occupant)> {
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &Occupant<V>)> {
         self.by_slot.iter().map(|(k, v)| (*k, v))
     }
 
@@ -94,12 +102,12 @@ impl Slots {
     /// Reconcile the slots with the path's new variant set (`new_variants`:
     /// id → bitmap) and return the slots that changed. Mutates in place to
     /// the new assignment.
-    pub fn reslot(&mut self, new_variants: &BTreeMap<VarId, Bitmap>) -> Vec<SlotChange> {
+    pub fn reslot(&mut self, new_variants: &BTreeMap<V, Bitmap>) -> Vec<SlotChange<V>> {
         let mut changes = Vec::new();
         // Slots still up for grabs (start with all), and new variants still
         // needing a home.
         let mut free_old: BTreeSet<u32> = self.by_slot.keys().copied().collect();
-        let mut pending: Vec<(&VarId, &Bitmap)> = Vec::new();
+        let mut pending: Vec<(&V, &Bitmap)> = Vec::new();
 
         // Pass 1 — id match: an id that already occupies a slot keeps it.
         for (id, bm) in new_variants {
@@ -170,7 +178,7 @@ impl Slots {
 mod tests {
     use super::*;
 
-    fn id(s: &str) -> VarId {
+    fn id(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
     }
     /// Bitmap from a list of lane ids.
@@ -185,10 +193,10 @@ mod tests {
         }
         b
     }
-    fn variants(items: &[(&str, &[usize])]) -> BTreeMap<VarId, Bitmap> {
+    fn variants(items: &[(&str, &[usize])]) -> BTreeMap<Vec<u8>, Bitmap> {
         items.iter().map(|(i, l)| (id(i), bm(l))).collect()
     }
-    fn occ(slots: &Slots) -> BTreeMap<u32, (VarId, Bitmap)> {
+    fn occ(slots: &Slots<Vec<u8>>) -> BTreeMap<u32, (Vec<u8>, Bitmap)> {
         slots.iter().map(|(k, o)| (k, (o.id.clone(), o.bitmap.clone()))).collect()
     }
 

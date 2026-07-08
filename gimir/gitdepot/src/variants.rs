@@ -45,15 +45,27 @@ const META: u8 = b'm';
 /// file's whole attr set verbatim alongside the bitmap.
 const LANES: &[u8] = b"\0lanes";
 
-fn content_key(idx: u32) -> Name {
+pub(crate) fn content_key(idx: u32) -> Name {
     let mut k = vec![VAR, CONTENT];
     k.extend_from_slice(&idx.to_be_bytes());
     k
 }
-fn meta_key(idx: u32) -> Name {
+pub(crate) fn meta_key(idx: u32) -> Name {
     let mut k = vec![VAR, META];
     k.extend_from_slice(&idx.to_be_bytes());
     k
+}
+/// The `\0v<slot>` content-leaf View for a variant: its blob is the content,
+/// nothing else. (`unionenc` builds reverse deltas from these.)
+pub(crate) fn content_view(content: &Bytes) -> View {
+    View { blob: Some(content.clone()), attrs: Attrs::new(), children: BTreeMap::new() }
+}
+/// The `\0m<slot>` meta-leaf View for a variant: no blob; attrs = the file's
+/// attrs plus the private `\0lanes` bitmap.
+pub(crate) fn meta_view(attrs: &Attrs, bitmap: &[u8]) -> View {
+    let mut a = attrs.clone();
+    a.insert(LANES.to_vec(), bitmap.to_vec());
+    View { blob: None, attrs: a, children: BTreeMap::new() }
 }
 fn is_var(key: &[u8]) -> bool {
     key.first() == Some(&VAR)
@@ -125,7 +137,7 @@ fn versions_at(lanes: &[Option<&View>]) -> Vec<Version> {
 
 /// The sorted set of real (directory) child names across the dir-lanes at
 /// one path.
-fn dir_names(lanes: &[Option<&View>]) -> BTreeSet<Name> {
+pub(crate) fn dir_names(lanes: &[Option<&View>]) -> BTreeSet<Name> {
     let mut names = BTreeSet::new();
     for v in lanes.iter().flatten() {
         if v.blob.is_none() {
@@ -137,7 +149,7 @@ fn dir_names(lanes: &[Option<&View>]) -> BTreeSet<Name> {
 
 /// Each lane's child View at `name` (only dir-lanes that have it), with
 /// lane indices preserved so the recursion stays aligned.
-fn sub_at<'a>(lanes: &[Option<&'a View>], name: &[u8]) -> Vec<Option<&'a View>> {
+pub(crate) fn sub_at<'a>(lanes: &[Option<&'a View>], name: &[u8]) -> Vec<Option<&'a View>> {
     lanes
         .iter()
         .map(|v| v.and_then(|v| if v.blob.is_none() { v.children.get(name).map(Arc::as_ref) } else { None }))
@@ -160,7 +172,7 @@ fn lanes_equal(base: &[Option<&View>], target: &[Option<&View>]) -> bool {
 /// A leaf delta child reconstructing `target` from `base` (either may be
 /// absent). A `\0v`/`\0m` version node is a leaf, so this is a pure
 /// blob/attrs/tombstone op with no children.
-fn leaf_delta(base: Option<&View>, target: Option<&View>) -> Node {
+pub(crate) fn leaf_delta(base: Option<&View>, target: Option<&View>) -> Node {
     match target {
         None => Node::tombstone(), // gone in target → removed when rebuilt
         Some(t) => {

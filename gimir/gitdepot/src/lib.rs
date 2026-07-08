@@ -92,6 +92,7 @@ pub use cli::cli_main;
 pub mod lanes;
 pub mod lanestore;
 pub mod reslot;
+pub mod unionenc;
 pub mod variants;
 pub mod readout;
 pub mod store;
