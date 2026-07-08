@@ -270,10 +270,22 @@ pub fn delta_single_lane(
         new.iter().map(|(p, m, c)| (p.as_slice(), (*m, c.as_slice()))).collect();
     let mut root = depot::Node::keep();
     for (path, (nmode, ncontent)) in &nm {
-        if om.get(path) == Some(&(*nmode, ncontent)) {
+        let old = om.get(path);
+        if old == Some(&(*nmode, ncontent)) {
             continue; // unchanged
         }
-        put_variant(&mut root, path, 0, variant_node(ncontent, *nmode, None));
+        let mut node = variant_node(ncontent, *nmode, None);
+        // Same slot 0 ⇒ this delta OVERLAYS the old variant; an absent mode tag
+        // would leave the old one in place. So when the old mode carried a tag
+        // the new mode drops, hole that tag explicitly.
+        if let Some((omode, _)) = old {
+            if let Some(otag) = omode.tag() {
+                if omode.tag() != nmode.tag() {
+                    node.children.insert(otag.to_vec(), depot::Node::hole());
+                }
+            }
+        }
+        put_variant(&mut root, path, 0, node);
     }
     for path in om.keys() {
         if !nm.contains_key(path) {
@@ -371,27 +383,28 @@ pub fn encode_union(lanes: &[LaneTree]) -> Vec<u8> {
 /// the variant's bitmap has this file at that oid — never by hashing the
 /// stored content (§3).
 fn current_variants(
-    old_full: &[u8],
+    base: &[u8],
+    stack: &[Vec<u8>],
     old_lanes: &[LaneTree],
 ) -> BTreeMap<Vec<u8>, Vec<(u32, VarId, Option<Vec<u8>>)>> {
     let mut cur: BTreeMap<Vec<u8>, Vec<(u32, VarId, Option<Vec<u8>>)>> = BTreeMap::new();
-    visit_entries(old_full, |e| {
+    visit_current(base, stack, |path, mode, slot, bitmap| {
         // A representative lane carrying this variant: the lowest set bit, or
         // (bitmap omitted ⇒ all lanes) lane 0.
-        let rep = match e.bitmap {
+        let rep = match &bitmap {
             Some(b) => (0..(b.len() * 8) as u32).find(|&i| b[(i / 8) as usize] & (1 << (i % 8)) != 0),
             None => Some(0),
         };
         let oid = rep
             .and_then(|l| old_lanes.get(l as usize))
-            .and_then(|t| t.get(e.path))
+            .and_then(|t| t.get(path))
             .map(|le| le.oid.clone())
             .expect("a variant's representative lane must carry the file");
         // mode comes from the stored variant (its mode tag), oid from the lane.
-        let id: VarId = (e.mode, oid);
-        cur.entry(e.path.to_vec()).or_default().push((e.slot, id, e.bitmap.map(|b| b.to_vec())));
+        let id: VarId = (mode, oid);
+        cur.entry(path.to_vec()).or_default().push((slot, id, bitmap));
     })
-    .expect("old_full is canonical");
+    .expect("base + stack are canonical");
     cur
 }
 
@@ -409,9 +422,22 @@ fn current_variants(
 /// `overlay_full(old_full, delta)` is the union over `new_lanes`: each new
 /// lane extracted from it reconstructs that lane's tree exactly.
 pub fn delta_multi_lane(old_full: &[u8], old_lanes: &[LaneTree], new_lanes: &[LaneTree]) -> Vec<u8> {
+    delta_multi_lane_stacked(old_full, &[], old_lanes, new_lanes)
+}
+
+/// As [`delta_multi_lane`], but reads the current state from `base` overlaid
+/// with the live delta `stack` (via [`visit_current`]) instead of a
+/// pre-materialized full-state — the between-seals path where the union is
+/// never built. `old_lanes` supplies the current variants' oids (§3).
+pub fn delta_multi_lane_stacked(
+    base: &[u8],
+    stack: &[Vec<u8>],
+    old_lanes: &[LaneTree],
+    new_lanes: &[LaneTree],
+) -> Vec<u8> {
     let new_n = new_lanes.len() as u32;
     let newg = union_groups(new_lanes);
-    let cur = current_variants(old_full, old_lanes);
+    let cur = current_variants(base, stack, old_lanes);
 
     let mut root = depot::Node::keep();
     let paths: BTreeSet<&Vec<u8>> = newg.keys().chain(cur.keys()).collect();
@@ -460,6 +486,316 @@ pub fn delta_multi_lane(old_full: &[u8], old_lanes: &[LaneTree], new_lanes: &[La
         }
     }
     depot::codec::encode(&depot::Layer { root })
+}
+
+// ------------------------------------------- streaming current-state reader
+
+use depot::walk::{Cursor, DecodeError as WErr};
+
+/// A meta child that REMOVES the facet: a pure hole (backdrop-anchored, no blob,
+/// no children). A backdrop node WITH a blob is a restoration (compose can
+/// re-establish a holed tag), so its facet is PRESENT — only the pure hole
+/// removes.
+fn is_removal(n: &depot::walk::Node) -> bool {
+    n.backdrop && n.blob.is_none() && n.child_count == 0
+}
+
+/// The effective current variants — the base full-state overlaid with the live
+/// delta stack — yielded per file in container order WITHOUT materializing the
+/// union (§3). Directories are walked in lockstep; only a TOUCHED leaf variant
+/// is resolved (into a few owned facets), an untouched base subtree is walked
+/// straight through. `visit` gets `(path, mode, slot, bitmap)` — content is not
+/// needed for the reslot (a variant's oid comes from the lane trees).
+///
+/// The stack is collapsed first with `compose_stream` (holes survive); the
+/// geostack keeps it to ~log(n) small layers, so the collapse and the second
+/// lockstep stream stay bounded — the big `base` is never re-sorted or copied.
+pub fn visit_current(
+    base: &[u8],
+    stack: &[Vec<u8>],
+    mut visit: impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>),
+) -> Result<(), WErr> {
+    let mut combined = Vec::new();
+    if let Some((first, rest)) = stack.split_first() {
+        combined = first.clone();
+        for layer in rest {
+            let mut next = Vec::new();
+            depot::stream::compose_stream(&combined, layer, &mut next)?; // lower, upper
+            combined = next;
+        }
+    }
+    let mut path = Vec::new();
+    let mut bc = Cursor::new(base);
+    if combined.is_empty() {
+        let bn = bc.node()?;
+        return base_subtree(&mut bc, bn.child_count, &mut path, &mut visit);
+    }
+    let mut dc = Cursor::new(&combined);
+    let bn = bc.node()?;
+    let dn = dc.node()?;
+    merge_children(Some(&mut bc), bn.child_count, Some(&mut dc), dn.child_count, &mut path, &mut visit)
+}
+
+/// Read the next child name from a side with children remaining (owned copy —
+/// names are short); `None` once exhausted.
+fn next_name(cur: &mut Option<&mut Cursor>, remaining: &mut u64) -> Result<Option<Vec<u8>>, WErr> {
+    if *remaining == 0 {
+        return Ok(None);
+    }
+    *remaining -= 1;
+    Ok(Some(cur.as_mut().unwrap().name()?.to_vec()))
+}
+
+/// Lockstep-merge one directory level of the base and the delta by container
+/// order (raw name bytewise — the codec's stored order). Each cursor, when
+/// present, is positioned just past its dir header (at its first child name).
+fn merge_children(
+    mut b: Option<&mut Cursor>,
+    mut brem: u64,
+    mut d: Option<&mut Cursor>,
+    mut drem: u64,
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>),
+) -> Result<(), WErr> {
+    let mut bname = next_name(&mut b, &mut brem)?;
+    let mut dname = next_name(&mut d, &mut drem)?;
+    loop {
+        let order = match (&bname, &dname) {
+            (None, None) => break,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(bn), Some(dn)) => bn.cmp(dn),
+        };
+        match order {
+            std::cmp::Ordering::Less => {
+                let name = bname.take().unwrap();
+                base_child(b.as_mut().unwrap(), &name, path, visit)?;
+                bname = next_name(&mut b, &mut brem)?;
+            }
+            std::cmp::Ordering::Greater => {
+                let name = dname.take().unwrap();
+                delta_only_child(d.as_mut().unwrap(), &name, path, visit)?;
+                dname = next_name(&mut d, &mut drem)?;
+            }
+            std::cmp::Ordering::Equal => {
+                let name = bname.take().unwrap();
+                both_child(b.as_mut().unwrap(), d.as_mut().unwrap(), &name, path, visit)?;
+                bname = next_name(&mut b, &mut brem)?;
+                dname = next_name(&mut d, &mut drem)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a variant node's mode + bitmap facets from `cur` (positioned at the
+/// node), consuming it whole. Content is skipped — not needed for reslot.
+fn read_facets(cur: &mut Cursor) -> Result<(Mode, Option<Vec<u8>>), WErr> {
+    let n = cur.node()?;
+    let mut mode = Mode::File;
+    let mut bitmap = None;
+    for _ in 0..n.child_count {
+        let m = cur.name()?.to_vec();
+        let mn = cur.node()?;
+        match m.as_slice() {
+            LANES => bitmap = Some(mn.blob.unwrap_or(&[]).to_vec()),
+            TAG_EXEC => mode = Mode::Exec,
+            TAG_SYMLINK => mode = Mode::Symlink,
+            TAG_GITLINK => mode = Mode::Gitlink,
+            _ => {}
+        }
+        for _ in 0..mn.child_count {
+            cur.name()?;
+            cur.skip()?;
+        }
+    }
+    Ok((mode, bitmap))
+}
+
+/// A child present only in the base (delta does not touch it): walk it as-is.
+fn base_child(
+    cur: &mut Cursor,
+    name: &[u8],
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>),
+) -> Result<(), WErr> {
+    match classify(name) {
+        Some(Kind::File(gitname, slot)) => {
+            let base = push_seg(path, gitname);
+            let (mode, bitmap) = read_facets(cur)?;
+            visit(&path[..], mode, slot, bitmap);
+            path.truncate(base);
+        }
+        Some(Kind::Dir(gitname)) => {
+            let base = push_seg(path, gitname);
+            let n = cur.node()?;
+            base_subtree(cur, n.child_count, path, visit)?;
+            path.truncate(base);
+        }
+        None => cur.skip()?,
+    }
+    Ok(())
+}
+
+/// Walk a whole base subtree (no delta), yielding every variant.
+fn base_subtree(
+    cur: &mut Cursor,
+    count: u64,
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>),
+) -> Result<(), WErr> {
+    for _ in 0..count {
+        let name = cur.name()?.to_vec();
+        base_child(cur, &name, path, visit)?;
+    }
+    Ok(())
+}
+
+/// Read a delta file node's meta as ABSOLUTE facets (base is empty — a fresh
+/// variant or a backdrop restoration), consuming the node's children, and emit
+/// it if it is a real variant (carries content). A pure hole (no blob, no
+/// children) is consumed and yields nothing.
+fn emit_absolute_file(
+    cur: &mut Cursor,
+    node: &depot::walk::Node,
+    gitname: &[u8],
+    slot: u32,
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>),
+) -> Result<(), WErr> {
+    let mut mode = Mode::File;
+    let mut bitmap = None;
+    for _ in 0..node.child_count {
+        let m = cur.name()?.to_vec();
+        let mn = cur.node()?;
+        if !is_removal(&mn) {
+            match m.as_slice() {
+                LANES => bitmap = Some(mn.blob.unwrap_or(&[]).to_vec()),
+                TAG_EXEC => mode = Mode::Exec,
+                TAG_SYMLINK => mode = Mode::Symlink,
+                TAG_GITLINK => mode = Mode::Gitlink,
+                _ => {}
+            }
+        }
+        for _ in 0..mn.child_count {
+            cur.name()?;
+            cur.skip()?;
+        }
+    }
+    if node.blob.is_some() {
+        let base = push_seg(path, gitname);
+        visit(&path[..], mode, slot, bitmap);
+        path.truncate(base);
+    }
+    Ok(())
+}
+
+/// A child present only in the delta: its current value is the delta resolved
+/// over nothing — a pure hole vanishes, a set (or backdrop restoration)
+/// appears, a subtree recurses.
+fn delta_only_child(
+    cur: &mut Cursor,
+    name: &[u8],
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>),
+) -> Result<(), WErr> {
+    match classify(name) {
+        Some(Kind::File(gitname, slot)) => {
+            let n = cur.node()?;
+            emit_absolute_file(cur, &n, gitname, slot, path, visit)?;
+        }
+        Some(Kind::Dir(gitname)) => {
+            // A backdrop dir is a restoration/hole: over nothing it is just its
+            // own (possibly empty) positive children.
+            let n = cur.node()?;
+            let base = push_seg(path, gitname);
+            merge_children(None, 0, Some(cur), n.child_count, path, visit)?;
+            path.truncate(base);
+        }
+        None => cur.skip()?,
+    }
+    Ok(())
+}
+
+/// A child present in both. A `backdrop` delta node ERASES the base and
+/// resolves over nothing (a hole → gone, a restoration → its own content); a
+/// non-backdrop node overlays onto the base (keep/replace blob, override meta).
+fn both_child(
+    b: &mut Cursor,
+    d: &mut Cursor,
+    name: &[u8],
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>),
+) -> Result<(), WErr> {
+    match classify(name) {
+        Some(Kind::File(gitname, slot)) => {
+            let dn = d.node()?;
+            if dn.backdrop {
+                // Base erased; emit the delta node's own positive form.
+                b.skip()?;
+                emit_absolute_file(d, &dn, gitname, slot, path, visit)?;
+                return Ok(());
+            }
+            // Overlay: base facets, then delta meta as overrides (deltas carry
+            // only the CHANGED meta; an absent meta child keeps the base's). A
+            // non-backdrop node never removes — the variant exists.
+            let (mut mode, mut bitmap) = read_facets(b)?;
+            for _ in 0..dn.child_count {
+                let m = d.name()?.to_vec();
+                let mn = d.node()?;
+                let tag = match m.as_slice() {
+                    LANES => {
+                        bitmap = if is_removal(&mn) { None } else { Some(mn.blob.unwrap_or(&[]).to_vec()) };
+                        None
+                    }
+                    TAG_EXEC => Some(Mode::Exec),
+                    TAG_SYMLINK => Some(Mode::Symlink),
+                    TAG_GITLINK => Some(Mode::Gitlink),
+                    _ => None,
+                };
+                if let Some(t) = tag {
+                    if is_removal(&mn) {
+                        // Holing a tag reverts to plain ONLY if it was the
+                        // active one — a hole of some other mode's leftover tag
+                        // must not clobber a tag Set (or restored) by another
+                        // child here.
+                        if mode == t {
+                            mode = Mode::File;
+                        }
+                    } else {
+                        mode = t;
+                    }
+                }
+                for _ in 0..mn.child_count {
+                    d.name()?;
+                    d.skip()?;
+                }
+            }
+            let base = push_seg(path, gitname);
+            visit(&path[..], mode, slot, bitmap);
+            path.truncate(base);
+        }
+        Some(Kind::Dir(gitname)) => {
+            let dn = d.node()?;
+            if dn.backdrop {
+                // Base subtree erased; the delta subtree resolves over nothing.
+                b.skip()?;
+                let base = push_seg(path, gitname);
+                merge_children(None, 0, Some(d), dn.child_count, path, visit)?;
+                path.truncate(base);
+                return Ok(());
+            }
+            let bn = b.node()?;
+            let base = push_seg(path, gitname);
+            merge_children(Some(b), bn.child_count, Some(d), dn.child_count, path, visit)?;
+            path.truncate(base);
+        }
+        None => {
+            b.skip()?;
+            d.skip()?;
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------ iterator
@@ -832,6 +1168,121 @@ mod tests {
         let mut slots = Vec::new();
         visit_entries(&delta, |e| slots.push(e.slot)).unwrap();
         assert!(!slots.contains(&1), "unchanged B2 (slot 1) must be pruned, saw {slots:?}");
+    }
+
+    // ---- streaming current-state reader vs materialized overlay oracle ----
+
+    type CurRow = (Vec<u8>, Mode, u32, Option<Vec<u8>>);
+
+    /// Materialize current state by sequential overlay, then read it back.
+    fn oracle_current(base: &[u8], stack: &[Vec<u8>]) -> Vec<CurRow> {
+        let mut mat = base.to_vec();
+        for layer in stack {
+            let mut next = Vec::new();
+            depot::stream::overlay_full(&mat, layer, &mut next).unwrap();
+            mat = next;
+        }
+        let mut rows = Vec::new();
+        visit_entries(&mat, |e| rows.push((e.path.to_vec(), e.mode, e.slot, e.bitmap.map(|b| b.to_vec())))).unwrap();
+        rows
+    }
+
+    fn stream_current(base: &[u8], stack: &[Vec<u8>]) -> Vec<CurRow> {
+        let mut rows = Vec::new();
+        visit_current(base, stack, |p, m, s, bm| rows.push((p.to_vec(), m, s, bm))).unwrap();
+        rows
+    }
+
+    /// Nested paths, add / remove / change / mode-flip across a two-deep stack:
+    /// the streaming reader must equal the materialized overlay exactly.
+    #[test]
+    fn visit_current_matches_overlay_single_lane() {
+        let t0 = vec![
+            (b"dir/a".to_vec(), Mode::File, b"A".to_vec()),
+            (b"dir/b".to_vec(), Mode::Exec, b"B".to_vec()),
+            (b"top".to_vec(), Mode::File, b"T".to_vec()),
+            (b"gone".to_vec(), Mode::File, b"G".to_vec()),
+        ];
+        let t1 = vec![
+            (b"dir/a".to_vec(), Mode::File, b"A2".to_vec()),
+            (b"dir/b".to_vec(), Mode::Exec, b"B".to_vec()),
+            (b"top".to_vec(), Mode::Symlink, b"T".to_vec()),
+            (b"new".to_vec(), Mode::File, b"N".to_vec()),
+        ];
+        let t2 = vec![
+            (b"dir/a".to_vec(), Mode::File, b"A2".to_vec()),
+            (b"dir/c".to_vec(), Mode::File, b"C".to_vec()),
+            (b"new".to_vec(), Mode::File, b"N2".to_vec()),
+        ];
+        let base = encode_lane(&t0);
+        let d0 = delta_single_lane(&t0, &t1);
+        let d1 = delta_single_lane(&t1, &t2);
+        let stack = vec![d0, d1];
+
+        assert_eq!(stream_current(&base, &stack), oracle_current(&base, &stack));
+        // And with an empty stack the reader is just the base walk.
+        assert_eq!(stream_current(&base, &[]), oracle_current(&base, &[]));
+    }
+
+    /// Multi-variant paths with a lanes-only bitmap update (a variant absorbs a
+    /// lane, another vanishes): exercises `both_child`'s meta override and the
+    /// all-ones bitmap dropping to `None`.
+    #[test]
+    fn visit_current_matches_overlay_multi_lane() {
+        let la = lane(&[(b"same", Mode::File, b"S", b"S"), (b"split", Mode::File, b"P0", b"P0"), (b"d/n", Mode::File, b"N", b"N")]);
+        let lb = lane(&[(b"same", Mode::File, b"S", b"S"), (b"split", Mode::File, b"P1", b"P1"), (b"d/n", Mode::File, b"N", b"N")]);
+        let old_lanes = vec![la.clone(), lb.clone()];
+        // Lane 1's `split` changes to match lane 0 → the two variants collapse
+        // to one all-ones variant (lanes child dropped); `d/n` untouched.
+        let lb2 = lane(&[(b"same", Mode::File, b"S", b"S"), (b"split", Mode::File, b"P0", b"P0"), (b"d/n", Mode::File, b"N", b"N")]);
+        let new_lanes = vec![la.clone(), lb2];
+
+        let base = encode_union(&old_lanes);
+        let delta = delta_multi_lane(&base, &old_lanes, &new_lanes);
+        let stack = vec![delta];
+
+        assert_eq!(stream_current(&base, &stack), oracle_current(&base, &stack));
+    }
+
+    /// Randomized: random single-lane states chained into a stack; the
+    /// streaming reader must match the materialized overlay for every seed.
+    #[test]
+    fn visit_current_matches_overlay_randomized() {
+        fn next(rng: &mut u64) -> u64 {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        }
+        let paths: [&[u8]; 6] = [b"a", b"d/x", b"d/y", b"d/e/f", b"m", b"z"];
+        let modes = [Mode::File, Mode::Exec, Mode::Symlink, Mode::Gitlink];
+        let gen_state = |rng: &mut u64| {
+            let mut s: Vec<(Vec<u8>, Mode, Vec<u8>)> = Vec::new();
+            for p in paths {
+                if next(rng) % 3 != 0 {
+                    let mode = modes[(next(rng) % 4) as usize];
+                    let content = vec![(next(rng) % 7) as u8];
+                    s.push((p.to_vec(), mode, content));
+                }
+            }
+            s
+        };
+        let mut rng = 0xda3e_39cbu64;
+        for _ in 0..400 {
+            let depth = 1 + (next(&mut rng) % 4) as usize;
+            let mut states = vec![gen_state(&mut rng)];
+            for _ in 0..depth {
+                states.push(gen_state(&mut rng));
+            }
+            let base = encode_lane(&states[0]);
+            let stack: Vec<Vec<u8>> =
+                (1..states.len()).map(|i| delta_single_lane(&states[i - 1], &states[i])).collect();
+            assert_eq!(
+                stream_current(&base, &stack),
+                oracle_current(&base, &stack),
+                "mismatch depth {depth}, states={states:?}"
+            );
+        }
     }
 
     #[test]
