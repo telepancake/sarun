@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use common::{random_layer, random_layer_anchored, Rng};
 use depot::codec::{decode, encode};
-use depot::stream::{compose_stream, diff_stream};
+use depot::stream::{compose_stream, diff_stream, overlay_full};
 use depot::{apply, compose, diff, resolve, Attrs, BlobOp, Layer, Node, View};
 
 // ------------------------------------------------------------- helpers
@@ -240,6 +240,139 @@ fn diff_matches_reference_randomized() {
         }
     }
     assert!(checked > 100, "too few randomized diff cases: {checked}");
+}
+
+// --------------------------------------------------------- overlay_full
+
+/// Streamed overlay of `d` on full-state `base` equals the positive
+/// full-state of the applied view, byte for byte — and never carries a
+/// tombstone (it is a proper full-state).
+fn check_overlay(base_view: &View, d: &Layer, ctx: &str) {
+    let base = diff(None, Some(base_view)); // positive full-state record
+    let want = encode(&diff(None, apply(Some(base_view), d).as_ref()));
+    let mut got = Vec::new();
+    overlay_full(&encode(&base), &encode(d), &mut got).expect("overlay_full");
+    assert_eq!(got, want, "overlay_full bytes diverge: {ctx}");
+    // The applied view matches, and the record is canonical (a fixpoint of
+    // diff-from-nothing), so a seal of it needs no recompute.
+    let applied = apply(None, &decode(&got).expect("decode"));
+    assert_eq!(applied, apply(Some(base_view), d), "overlay view: {ctx}");
+}
+
+#[test]
+fn overlay_corner_fixtures() {
+    let n = |b: &[u8]| b.to_vec();
+    let blob = |b: &[u8]| Arc::new(View { blob: Some(b.into()), ..View::default() });
+    let empty = || Arc::new(View::default());
+    let set = |b: &[u8]| Node { blob: BlobOp::Set(b.into()), ..Node::keep() };
+    let kids = |mut node: Node, kk: Vec<(&[u8], Node)>| {
+        for (k, v) in kk {
+            node.children.insert(n(k), v);
+        }
+        node
+    };
+
+    let base = View {
+        blob: None,
+        attrs: Attrs::new(),
+        children: BTreeMap::from([
+            (n(b"keep"), blob(b"K")),
+            (n(b"edit"), blob(b"old")),
+            (n(b"del"), blob(b"D")),
+            (n(b"edir"), empty()),
+        ]),
+    };
+    // Edit one file, delete another, add a third — the delta a commit makes.
+    let d = Layer {
+        root: kids(
+            Node::keep(),
+            vec![
+                (b"edit", set(b"new")),
+                (b"del", Node::tombstone()), // deletion must VANISH, not tombstone
+                (b"add", set(b"A")),
+            ],
+        ),
+    };
+    check_overlay(&base, &d, "edit+del+add");
+    // Deleting the only-empty-dir; adding a nested tree.
+    let d2 = Layer {
+        root: kids(
+            Node::keep(),
+            vec![
+                (b"edir", Node::tombstone()),
+                (b"sub", kids(Node::keep(), vec![(b"x", set(b"X"))])),
+            ],
+        ),
+    };
+    check_overlay(&base, &d2, "del-emptydir+add-subtree");
+    // An opaque delta node masks the base's children under that name.
+    let base2 = View {
+        children: BTreeMap::from([(
+            n(b"d"),
+            Arc::new(View { children: BTreeMap::from([(n(b"old"), blob(b"O"))]), ..View::default() }),
+        )]),
+        ..View::default()
+    };
+    let mut opq = kids(Node::keep(), vec![(b"z", set(b"Z"))]);
+    opq.opaque = true;
+    let d3 = Layer { root: kids(Node::keep(), vec![(b"d", opq)]) };
+    check_overlay(&base2, &d3, "opaque-mask");
+    // No-op delta leaves the full-state identical.
+    check_overlay(&base, &Layer::empty(), "noop");
+}
+
+#[test]
+fn overlay_matches_reference_randomized() {
+    let mut checked = 0;
+    for seed in 1..600u64 {
+        let mut rng = Rng(seed ^ 0x0003);
+        let base = resolve(&[&random_layer(&mut rng)]);
+        let d = random_layer(&mut rng);
+        if let Some(base) = base {
+            check_overlay(&base, &d, &format!("seed {seed}"));
+            checked += 1;
+        }
+    }
+    assert!(checked > 100, "too few overlay cases: {checked}");
+}
+
+/// The depot updater's real loop, purely streaming: keep a positive
+/// full-state, overlay each revision's delta to advance it, and derive the
+/// stored reverse delta by diffing the new full-state against the old —
+/// reconstruct every intermediate view exactly, no `View` held for the
+/// frame.
+#[test]
+fn overlay_then_diff_is_the_updater_loop() {
+    for seed in 1..200u64 {
+        let mut rng = Rng(seed ^ 0x100f);
+        // Seed the full-state from the first view.
+        let mut view = match resolve(&[&random_layer(&mut rng)]) {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut full = encode(&diff(None, Some(&view)));
+        for step in 0..4 {
+            let d = random_layer(&mut rng);
+            let next = match apply(Some(&view), &d) {
+                Some(v) => v,
+                None => break, // whole state deleted; stop this chain
+            };
+            // Advance the full-state by streaming overlay.
+            let mut new_full = Vec::new();
+            overlay_full(&full, &encode(&d), &mut new_full).unwrap();
+            assert_eq!(new_full, encode(&diff(None, Some(&next))), "overlay drift, seed {seed} step {step}");
+            // The chain's reverse delta: rebuild the old full-state from the new.
+            let mut rev = Vec::new();
+            diff_stream(&new_full, &full, &mut rev).unwrap();
+            assert_eq!(
+                apply(Some(&next), &decode(&rev).unwrap()).as_ref(),
+                Some(&view),
+                "reverse delta wrong, seed {seed} step {step}"
+            );
+            full = new_full;
+            view = next;
+        }
+    }
 }
 
 /// The two functions compose end-to-end the way the depot updater uses

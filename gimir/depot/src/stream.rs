@@ -54,7 +54,7 @@ use crate::codec::{
     self, put_bytes, put_varint, BLOB_KEEP, BLOB_MASK, BLOB_REMOVE, BLOB_SET, FLAG_ATTRS,
     FLAG_BACKDROP, FLAG_OPAQUE, FLAG_TOMBSTONE, KNOWN_FLAGS,
 };
-use crate::{harden, Presence};
+use crate::{apply, diff, harden, Layer, Presence};
 
 pub use codec::DecodeError;
 
@@ -512,6 +512,192 @@ fn norm_attrs(attrs: Option<&[u8]>) -> Option<&[u8]> {
         // count 0 (the empty-dir existence witness) reads as no attrs.
         Some([0]) => None,
         other => other,
+    }
+}
+
+// ============================================================= overlay
+
+/// The mmap updater's fundamental step: overlay delta `d` on the current
+/// full-state `base` and write the NEW full-state — positive (canonical
+/// `diff(None, view)`) form, in a single forward pass. `base` MUST be a
+/// canonical full-state record; `d` is a plain lower-anchored delta (the
+/// per-revision change; no holes). Output equals
+/// `codec::encode(&diff(None, apply(view(base), d).as_ref()))`, byte for
+/// byte — the exact record the reader recomputes as a cold-frame anchor,
+/// so a driver can seal it with no `View` ever built.
+///
+/// Distinct from [`compose_stream`]: compose is faithful and keeps the
+/// delta's tombstones/removes, so its output is a valid layer but not the
+/// minimal positive full-state. Overlay resolves each name over the
+/// full-state and emits only what survives — a deleted path simply
+/// vanishes — so the result is a proper full-state that never accretes
+/// tombstones commit over commit.
+///
+/// The huge side (`base`) is only ever spliced verbatim (untouched
+/// children) or recursed (touched children); only the small delta subtrees
+/// are briefly decoded (reusing the reference `apply`+`diff` so a
+/// delta-only or masked subtree cannot drift). Both cursors advance
+/// monotonically forward.
+pub fn overlay_full(base: &[u8], d: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeError> {
+    overlay_node(&mut Cur::new(base), &mut Cur::new(d), out)?;
+    Ok(())
+}
+
+/// Emit `apply(view(base_node), delta_node)` in positive form; returns
+/// whether the node exists (survived). Both cursors are on a present node
+/// and are left just past it. Mirrors `apply_node` for the merge and
+/// `diff_node(None, .)` for the emission.
+fn overlay_node(base: &mut Cur, delta: &mut Cur, out: &mut Vec<u8>) -> Result<bool, DecodeError> {
+    let bh = read_head(base)?;
+    let dh = read_head(delta)?;
+
+    // The base is a full-state node: its view-blob is its `Set` payload,
+    // its view-attrs the normalized attrs, and it is "empty present" (a
+    // bare directory) when it carries none of blob/attrs/children.
+    let base_blob = match bh.blob {
+        Blob::Set(x) => Some(x),
+        _ => None,
+    };
+    let base_attrs = norm_attrs(bh.attrs);
+    let base_empty_present = base_blob.is_none() && base_attrs.is_none() && bh.child_count == 0;
+
+    // apply: blob is the delta's set/remove, else inherited; attrs replace
+    // or inherit.
+    let res_blob = match dh.blob {
+        Blob::Set(x) => Some(x),
+        Blob::Remove => None,
+        Blob::Keep => base_blob,
+    };
+    let res_attrs = match dh.attrs {
+        Some(_) => norm_attrs(dh.attrs),
+        None => base_attrs,
+    };
+    let delta_asserts = !matches!(dh.blob, Blob::Keep) || dh.attrs.is_some() || dh.opaque;
+
+    let base_children = collect_children(base, bh.child_count)?;
+    let delta_children = collect_children(delta, dh.child_count)?;
+
+    // Survivors as (name, bytes-source). Existence of each is decided here
+    // without scanning the base.
+    enum Src<'a> {
+        CopyBase(&'a [u8]),
+        Both(&'a [u8], &'a [u8]),
+        Owned(Vec<u8>),
+    }
+    let mut items: Vec<(&[u8], Src)> = Vec::new();
+
+    if dh.opaque {
+        // Opaque masks every lower child: each delta child resolves over
+        // NOTHING, and no base child survives.
+        for (name, dsub) in &delta_children {
+            if let Some(bytes) = positive_over_nothing(dsub)? {
+                items.push((name, Src::Owned(bytes)));
+            }
+        }
+    } else {
+        let mut ib = base_children.iter().peekable();
+        let mut id = delta_children.iter().peekable();
+        loop {
+            match (ib.peek(), id.peek()) {
+                (Some((bn, bsub)), Some((dn, dsub))) => {
+                    use std::cmp::Ordering::*;
+                    match bn.cmp(dn) {
+                        // Untouched base child: already positive, survives.
+                        Less => {
+                            items.push((bn, Src::CopyBase(bsub)));
+                            ib.next();
+                        }
+                        // Delta-only child resolves over nothing.
+                        Greater => {
+                            if let Some(bytes) = positive_over_nothing(dsub)? {
+                                items.push((dn, Src::Owned(bytes)));
+                            }
+                            id.next();
+                        }
+                        // Touched child: a non-tombstone delta over a
+                        // present (positive) base always survives; a
+                        // tombstone deletes it.
+                        Equal => {
+                            if !is_tombstone(dsub) {
+                                items.push((bn, Src::Both(bsub, dsub)));
+                            }
+                            ib.next();
+                            id.next();
+                        }
+                    }
+                }
+                (Some((bn, bsub)), None) => {
+                    items.push((bn, Src::CopyBase(bsub)));
+                    ib.next();
+                }
+                (None, Some((dn, dsub))) => {
+                    if let Some(bytes) = positive_over_nothing(dsub)? {
+                        items.push((dn, Src::Owned(bytes)));
+                    }
+                    id.next();
+                }
+                (None, None) => break,
+            }
+        }
+    }
+
+    // apply_node's explicit-existence rule, positive form.
+    let exists = res_blob.is_some()
+        || res_attrs.is_some()
+        || !items.is_empty()
+        || delta_asserts
+        || base_empty_present;
+    if !exists {
+        return Ok(false);
+    }
+
+    // Positive facets: blob is a Set or absent; attrs replace when
+    // non-empty, else the empty-node existence witness when the whole node
+    // resolved empty; never opaque or backdrop (a view has neither).
+    let view_empty = res_blob.is_none() && res_attrs.is_none() && items.is_empty();
+    let attrs_out: Option<&[u8]> = match res_attrs {
+        Some(raw) => Some(raw),
+        None if view_empty => Some(&[0]),
+        None => None,
+    };
+    let blob_out = match res_blob {
+        Some(x) => Blob::Set(x),
+        None => Blob::Keep,
+    };
+    emit_facets(out, blob_out, false, false, attrs_out);
+    put_varint(out, items.len() as u64);
+    for (name, src) in items {
+        put_bytes(out, name);
+        match src {
+            Src::CopyBase(s) => out.extend_from_slice(s),
+            Src::Owned(v) => out.extend_from_slice(&v),
+            Src::Both(bsub, dsub) => {
+                // The child was pre-judged to survive; emit it.
+                overlay_node(&mut Cur::new(bsub), &mut Cur::new(dsub), out)?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Is this encoded node a bare tombstone (single `FLAG_TOMBSTONE` byte)?
+fn is_tombstone(sub: &[u8]) -> bool {
+    sub == [FLAG_TOMBSTONE]
+}
+
+/// The positive encoding of a delta subtree resolved over NOTHING —
+/// `diff(None, apply(None, delta))` — or `None` if it materializes
+/// nothing. The delta subtree is bounded (a per-revision change), so this
+/// reuses the reference `apply`+`diff` in memory and cannot drift.
+fn positive_over_nothing(sub: &[u8]) -> Result<Option<Vec<u8>>, DecodeError> {
+    let (node, _) = codec::decode_node(sub, 0)?;
+    match apply(None, &Layer { root: node }) {
+        Some(view) => {
+            let mut out = Vec::new();
+            codec::encode_node(&mut out, &diff(None, Some(&view)).root);
+            Ok(Some(out))
+        }
+        None => Ok(None),
     }
 }
 
