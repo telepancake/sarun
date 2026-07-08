@@ -211,6 +211,47 @@ pub fn entry_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     c1.cmp(&c2)
 }
 
+// ------------------------------------------------------------- encoder
+
+/// A file variant node: content blob plus meta children. A mode tag and the
+/// `lanes` node carry a (possibly empty) `Set` blob so they are NON-identity
+/// and survive `compose`/`overlay` — an identity `[0,0]` child would be
+/// pruned, silently dropping the mode or bitmap. Pass `bitmap = None` to omit
+/// the `lanes` child (all-ones → every live lane).
+pub fn variant_node(content: &[u8], mode: Mode, bitmap: Option<&[u8]>) -> depot::Node {
+    let empty = || depot::Node { blob: depot::BlobOp::Set((&b""[..]).into()), ..depot::Node::keep() };
+    let mut n = depot::Node { blob: depot::BlobOp::Set(content.into()), ..depot::Node::keep() };
+    if let Some(tag) = mode.tag() {
+        n.children.insert(tag.to_vec(), empty());
+    }
+    if let Some(bm) = bitmap {
+        n.children.insert(LANES.to_vec(), depot::Node { blob: depot::BlobOp::Set(bm.into()), ..depot::Node::keep() });
+    }
+    n
+}
+
+/// Build the container bytes for a SINGLE lane's full tree: every file is one
+/// variant at slot 0 with no bitmap (one lane ⇒ all-ones ⇒ omitted). This is
+/// the initial full-state (the f0 refPrefix seed), built once; subsequent
+/// commits are deltas, never a full rebuild. `entries` are
+/// `(path, mode, content)` with `/`-separated paths, any order.
+pub fn encode_lane(entries: &[(Vec<u8>, Mode, Vec<u8>)]) -> Vec<u8> {
+    let mut root = depot::Node::keep();
+    for (path, mode, content) in entries {
+        let parts: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+        let mut node = &mut root;
+        for dir in &parts[..parts.len() - 1] {
+            node = node
+                .children
+                .entry(dir_key(dir))
+                .or_insert_with(depot::Node::keep);
+        }
+        let leaf = parts[parts.len() - 1];
+        node.children.insert(file_key(leaf, 0), variant_node(content, *mode, None));
+    }
+    depot::codec::encode(&depot::Layer { root })
+}
+
 // ------------------------------------------------------------ iterator
 
 /// One file entry yielded by the layer iterator. `content`/`bitmap` borrow
@@ -375,20 +416,29 @@ mod tests {
 
     // ---- round-trip: build a union, iterate it back in container order ----
 
-    use depot::{codec, BlobOp, Layer, Node};
+    use depot::{codec, Layer, Node};
 
-    /// A variant node: content blob, plus meta children. A mode tag and the
-    /// `lanes` node carry an empty `Set` blob so they are NON-identity and
-    /// survive `compose`/`overlay` (an identity `[0,0]` child would be pruned).
-    fn variant_node(content: &[u8], mode: Mode, bitmap: Option<&[u8]>) -> Node {
-        let mut n = Node { blob: BlobOp::Set(content.into()), ..Node::keep() };
-        if let Some(tag) = mode.tag() {
-            n.children.insert(tag.to_vec(), Node { blob: BlobOp::Set((&b""[..]).into()), ..Node::keep() });
-        }
-        if let Some(bm) = bitmap {
-            n.children.insert(LANES.to_vec(), Node { blob: BlobOp::Set(bm.into()), ..Node::keep() });
-        }
-        n
+    #[test]
+    fn encode_lane_round_trips() {
+        let entries = vec![
+            (b"a.txt".to_vec(), Mode::File, b"hello".to_vec()),
+            (b"src/main.rs".to_vec(), Mode::File, b"fn main".to_vec()),
+            (b"src/run.sh".to_vec(), Mode::Exec, b"#!".to_vec()),
+            (b"dir/sub/deep".to_vec(), Mode::Symlink, b"target".to_vec()),
+        ];
+        let bytes = encode_lane(&entries);
+        let mut got: Vec<(Vec<u8>, Mode, Vec<u8>)> = Vec::new();
+        visit_entries(&bytes, |e| {
+            assert_eq!(e.slot, 0);
+            assert_eq!(e.bitmap, None, "single lane omits the bitmap");
+            got.push((e.path.to_vec(), e.mode, e.content.to_vec()));
+        })
+        .unwrap();
+        // Container order == git order here (no file-vs-dir prefix collisions):
+        // a.txt, dir/sub/deep, src/main.rs, src/run.sh.
+        let mut want = entries.clone();
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got, want);
     }
 
     #[test]
