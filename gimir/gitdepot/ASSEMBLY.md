@@ -38,9 +38,9 @@ path's shard must be stable across re-shard for the offline tool to work.
 
 ## 2. Layer encoding (the union tree shape)
 
-Directories are ordinary name nodes (no variant tag). A file at path segment
-`name` is stored as one node **per variant**, siblings named
-`name\0<varint slot>` (the `\0` + varint slot suffix). Per variant node:
+A file at path segment `name` is stored as one node **per variant**, siblings
+named `name` + `0x00` + `varint(slot)`. A directory is named `dirname` + `0x2F`
+(a trailing `/`) — see §3 for why. Per variant node:
 
 - **content** = the node's blob (the file bytes), a `const byte range` in the
   encoding.
@@ -49,11 +49,9 @@ Directories are ordinary name nodes (no variant tag). A file at path segment
 - **mode**: NOTHING stored for a normal file or directory. Executable file →
   an empty child node named `x`; symlink → `l`; gitlink → `m`.
 
-No `mode` attr anywhere. (Meta children `lanes`/`x`/`l`/`m` are unambiguous
-because a file variant node has no real filesystem children.)
-
-OPEN: exact child names for meta (`lanes` vs `\0lanes`); ensure they cannot
-collide with the variant-sibling scheme or git ordering.
+No `mode` attr anywhere. Meta children (`lanes`/`x`/`l`/`m`) live UNDER a
+variant node — one level below where sibling files/dirs sort — so they never
+interleave with real entries (verified: agent, git `base_name_compare`).
 
 ## 3. Layer iterator
 
@@ -63,10 +61,13 @@ git-tree iterator, yielding in **exactly git tree object order**. Per entry:
 - file path, file mode, variant index (slot), lane bitmap, **const byte range
   of the content**.
 
-Git tree order = entries sorted by name with a trailing `/` appended to
-directory names for the comparison. The `name\0<slot>` encoding must sort so
-that iterating (and extracting a lane) reproduces git's order exactly —
-including the file-vs-dir-same-name case that arises across lanes in the union.
+Git tree order = git's `base_name_compare` (`read-cache.c`): bytewise, but the
+byte just past the shorter name is synthesized as `0x00` for a file and `0x2F`
+(`/`) for a directory. So naming files `name\0<slot>` and directories
+`dirname/` makes the container's bytewise child order reproduce git order
+EXACTLY — including file-vs-dir same name across lanes (`foo\0…` < `foo/` since
+`0x00 < 0x2F`, and git puts the file first too). Reconstructing a git name:
+strip the trailing `/` from a dir, strip `\0<varint>` from a file.
 
 During delta generation, the full-state and every delta on the stack are
 iterated **in lockstep** to read the previously-written bitmap and other
@@ -83,12 +84,24 @@ of the next entry's size:
 
 This keeps ~log(n) layers of geometrically increasing size.
 
-### Merge algebra (per path, `merge(lower, upper)`)
+### TWO merges
 
-- upper sets content → content (newer wins)
-- upper hole, lower **something** → **nothing** (annihilate)
-- upper hole, lower **nothing** → **hole** (persist — associativity)
-- upper absent → lower unchanged
+There are two distinct merges, and the `something+hole→nothing` rule was these
+conflated:
+
+1. **delta ∘ delta** (compacting the geometric stack): an upper **hole
+   survives** — `Content+Hole→Hole`, `Absent+Hole→Hole`, `Hole+Hole→Hole`.
+   This is associative (brute-checked n=3,4) — required, since the stack's
+   merge grouping is size-dependent — and is exactly `depot::stream::
+   compose_stream` unchanged. (Disproof that a surviving hole is required:
+   layers `[set X, set X, hole]` merged top-first vs bottom-first with
+   `something+hole→nothing` give `setX` vs `nothing` — non-associative.)
+2. **delta ∘ full-state** (applying the collapsed deltas at a seal): a hole
+   **dissolves** to a removal, and the result is a positive full-state (no
+   markers) — exactly `depot::stream::overlay_full`.
+
+So merge = `compose_stream`, apply-to-full = `overlay_full`; both already
+exist and are tested.
 
 The two hole rules are the user's stated invariant "something+hole → nothing,
 nothing+hole → hole" which preserves associativity of merge. NOTE TO SELF:
