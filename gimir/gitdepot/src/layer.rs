@@ -238,16 +238,47 @@ pub fn variant_node(content: &[u8], mode: Mode, bitmap: Option<&[u8]>) -> depot:
 pub fn encode_lane(entries: &[(Vec<u8>, Mode, Vec<u8>)]) -> Vec<u8> {
     let mut root = depot::Node::keep();
     for (path, mode, content) in entries {
-        let parts: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
-        let mut node = &mut root;
-        for dir in &parts[..parts.len() - 1] {
-            node = node
-                .children
-                .entry(dir_key(dir))
-                .or_insert_with(depot::Node::keep);
+        put_variant(&mut root, path, 0, variant_node(content, *mode, None));
+    }
+    depot::codec::encode(&depot::Layer { root })
+}
+
+/// Descend the dir path (creating `Keep` dir nodes) and place `node` at the
+/// leaf under `file_key(leaf, slot)`.
+fn put_variant(root: &mut depot::Node, path: &[u8], slot: u32, node: depot::Node) {
+    let parts: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+    let mut cur = root;
+    for dir in &parts[..parts.len() - 1] {
+        cur = cur.children.entry(dir_key(dir)).or_insert_with(depot::Node::keep);
+    }
+    cur.children.insert(file_key(parts[parts.len() - 1], slot), node);
+}
+
+/// The delta that turns one lane's tree `old` into `new`, as container bytes:
+/// a changed/added file emits its full variant node, a removed file emits a
+/// hole (single lane ⇒ slot 0, no bitmap). `overlay_full(encode_lane(old),
+/// this)` equals `encode_lane(new)`. This is the trivial-reslot base case;
+/// the multi-lane version matches variants by oid and moves lane bits.
+pub fn delta_single_lane(
+    old: &[(Vec<u8>, Mode, Vec<u8>)],
+    new: &[(Vec<u8>, Mode, Vec<u8>)],
+) -> Vec<u8> {
+    use std::collections::BTreeMap;
+    let om: BTreeMap<&[u8], (Mode, &[u8])> =
+        old.iter().map(|(p, m, c)| (p.as_slice(), (*m, c.as_slice()))).collect();
+    let nm: BTreeMap<&[u8], (Mode, &[u8])> =
+        new.iter().map(|(p, m, c)| (p.as_slice(), (*m, c.as_slice()))).collect();
+    let mut root = depot::Node::keep();
+    for (path, (nmode, ncontent)) in &nm {
+        if om.get(path) == Some(&(*nmode, ncontent)) {
+            continue; // unchanged
         }
-        let leaf = parts[parts.len() - 1];
-        node.children.insert(file_key(leaf, 0), variant_node(content, *mode, None));
+        put_variant(&mut root, path, 0, variant_node(ncontent, *nmode, None));
+    }
+    for path in om.keys() {
+        if !nm.contains_key(path) {
+            put_variant(&mut root, path, 0, depot::Node::hole());
+        }
     }
     depot::codec::encode(&depot::Layer { root })
 }
@@ -473,6 +504,52 @@ mod tests {
                 (b"z".to_vec(), Mode::Symlink, 1, Some(vec![0b10]), b"v1".to_vec()),
             ]
         );
+    }
+
+    /// The write-side invariant: applying `delta_single_lane(old,new)` to the
+    /// full-state of `old` reproduces the full-state of `new`, byte-identical.
+    /// Both sides are the canonical positive full-state of `new`, so equality
+    /// is exact. Covers content change, add, remove, and mode change.
+    #[test]
+    fn delta_single_lane_overlays_to_new() {
+        let old = vec![
+            (b"keep.txt".to_vec(), Mode::File, b"same".to_vec()),
+            (b"change.rs".to_vec(), Mode::File, b"old".to_vec()),
+            (b"src/run.sh".to_vec(), Mode::Exec, b"#!old".to_vec()),
+            (b"gone/away".to_vec(), Mode::File, b"bye".to_vec()),
+            (b"modeflip".to_vec(), Mode::File, b"body".to_vec()),
+        ];
+        let new = vec![
+            (b"keep.txt".to_vec(), Mode::File, b"same".to_vec()),
+            (b"change.rs".to_vec(), Mode::File, b"new".to_vec()),
+            (b"src/run.sh".to_vec(), Mode::Exec, b"#!new".to_vec()),
+            (b"added.md".to_vec(), Mode::File, b"hi".to_vec()),
+            (b"modeflip".to_vec(), Mode::Symlink, b"body".to_vec()),
+        ];
+        let old_full = encode_lane(&old);
+        let new_full = encode_lane(&new);
+        let delta = delta_single_lane(&old, &new);
+        let mut got = Vec::new();
+        depot::stream::overlay_full(&old_full, &delta, &mut got).unwrap();
+        assert_eq!(got, new_full, "overlay_full(old, delta) must equal new full-state");
+    }
+
+    /// A no-op delta (old == new) overlays to the same bytes and is minimal
+    /// (an empty root: no children touched).
+    #[test]
+    fn delta_single_lane_noop_is_empty() {
+        let same = vec![
+            (b"a".to_vec(), Mode::File, b"x".to_vec()),
+            (b"d/b".to_vec(), Mode::Exec, b"y".to_vec()),
+        ];
+        let full = encode_lane(&same);
+        let delta = delta_single_lane(&same, &same);
+        let mut got = Vec::new();
+        depot::stream::overlay_full(&full, &delta, &mut got).unwrap();
+        assert_eq!(got, full);
+        // The delta is a bare Keep root with no children.
+        let empty = codec::encode(&Layer { root: Node::keep() });
+        assert_eq!(delta, empty, "unchanged inputs produce an empty delta");
     }
 
     #[test]
