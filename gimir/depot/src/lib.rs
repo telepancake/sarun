@@ -49,6 +49,7 @@ use std::sync::Arc;
 pub mod codec;
 pub mod stream;
 pub mod variant;
+pub mod walk;
 
 /// A node key: opaque bytes. Ordering is byte-lexicographic in this
 /// reference implementation (canonical-encoding walks depend on ONE
