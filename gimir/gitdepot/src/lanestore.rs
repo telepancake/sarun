@@ -253,6 +253,25 @@ impl LaneStore {
             }
             trans.push((l, adv_old.as_ref(), Some(&adv_new)));
 
+            // Skeleton-only measurement path: grow the skeleton to the full
+            // union with no blob traffic, no delta, no sealing; report its
+            // exact heap footprint at the end.
+            if std::env::var("GITDEPOT_SKEL_MEASURE").is_ok() {
+                enc.advance_skel(&trans, &mut objs)?;
+                for &d in &dying_at[i] {
+                    lane_tree[d as usize] = None;
+                }
+                lane_tree[l] = Some(tree_oid);
+                if i + 1 == n_rev {
+                    let (nodes, slots, bytes, mallocs) = enc.mem_report();
+                    return Err(Error::Chain(format!(
+                        "SKEL_MEASURE n_rev={n_rev} nodes={nodes} slots={slots} \
+                         owned_heap_bytes={bytes} malloc_objects={mallocs}"
+                    )));
+                }
+                continue;
+            }
+
             // Reverse chain record for this revision (O(changed) — reads only
             // the changed subtrees). Removals are holes.
             let rev = enc.advance(&trans, &mut objs)?;

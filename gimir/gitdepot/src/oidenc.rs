@@ -156,13 +156,19 @@ fn new_variant_set(slots: &Slots<VarKey>, trans: &[Trans]) -> BTreeMap<VarKey, B
 /// changed directory children, reading tree objects only where a subtree oid
 /// actually changed. The returned node, applied to the NEW union state,
 /// rebuilds the previous one (removals as holes).
-fn advance_node(skel: &mut Skel, trans: &[Trans], obj: &mut dyn Objects) -> Result<Node> {
+fn advance_node(skel: &mut Skel, trans: &[Trans], obj: &mut dyn Objects, emit: bool) -> Result<Node> {
     let mut out = Node::keep();
 
     // File variants at this path.
     if !skel.slots.is_empty() || trans.iter().any(|(_, o, n)| is_file(*o) || is_file(*n)) {
         let new_set = new_variant_set(&skel.slots, trans);
         for ch in skel.slots.reslot(&new_set) {
+            // `emit == false` measures the skeleton alone: reslot still runs
+            // (it mutates the slots), but no blob content is fetched and no
+            // delta is built.
+            if !emit {
+                continue;
+            }
             // reverse: rebuild `before` (old) from `after` (new) — the chain
             // record. A slot that appears only in the new state is a HOLE
             // here (removed when walking back), never a tombstone.
@@ -221,7 +227,7 @@ fn advance_node(skel: &mut Skel, trans: &[Trans], obj: &mut dyn Objects) -> Resu
         let sr: Vec<Trans> = sub.iter().map(|(l, o, n)| (*l, o.as_ref(), n.as_ref())).collect();
         let (cnode, empty) = {
             let child = skel.children.entry(name.clone()).or_default();
-            let cn = advance_node(child, &sr, obj)?;
+            let cn = advance_node(child, &sr, obj, emit)?;
             (cn, child.is_empty())
         };
         if empty {
@@ -275,7 +281,45 @@ impl Encoder {
     /// record (removals as holes). Reads tree objects for the changed
     /// subtrees only.
     pub fn advance(&mut self, trans: &[Trans], obj: &mut dyn Objects) -> Result<Layer> {
-        Ok(Layer { root: advance_node(&mut self.root, trans, obj)? })
+        Ok(Layer { root: advance_node(&mut self.root, trans, obj, true)? })
+    }
+
+    /// Update ONLY the skeleton for this revision — reslot the slots without
+    /// fetching any blob content or building a delta. For memory measurement:
+    /// it grows the skeleton to the full union with no blob traffic.
+    pub fn advance_skel(&mut self, trans: &[Trans], obj: &mut dyn Objects) -> Result<()> {
+        advance_node(&mut self.root, trans, obj, false)?;
+        Ok(())
+    }
+
+    /// Exact heap footprint of the live skeleton: `(nodes, slots,
+    /// owned_heap_bytes, malloc_objects)`. `owned_heap_bytes` sums the
+    /// capacities of every `Vec`/`String` the skeleton owns (mode, oid,
+    /// bitmap, child names); `malloc_objects` counts them. BTreeMap internal
+    /// node allocations are NOT included (they add on top).
+    pub fn mem_report(&self) -> (usize, usize, usize, usize) {
+        fn go(s: &Skel, nodes: &mut usize, slots: &mut usize, bytes: &mut usize, mallocs: &mut usize) {
+            *nodes += 1;
+            for (_slot, occ) in s.slots.iter() {
+                *slots += 1;
+                for cap in [occ.id.0.capacity(), occ.id.1.capacity(), occ.bitmap.capacity()] {
+                    if cap > 0 {
+                        *bytes += cap;
+                        *mallocs += 1;
+                    }
+                }
+            }
+            for (name, child) in &s.children {
+                if name.capacity() > 0 {
+                    *bytes += name.capacity();
+                    *mallocs += 1;
+                }
+                go(child, nodes, slots, bytes, mallocs);
+            }
+        }
+        let (mut nodes, mut slots, mut bytes, mut mallocs) = (0, 0, 0, 0);
+        go(&self.root, &mut nodes, &mut slots, &mut bytes, &mut mallocs);
+        (nodes, slots, bytes, mallocs)
     }
 
     /// The forward full delta of the current state — the `f0` head and every
