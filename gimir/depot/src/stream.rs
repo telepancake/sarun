@@ -348,11 +348,16 @@ fn compose_node(a: &mut Cur, b: &mut Cur, out: &mut Vec<u8>) -> Result<(), Decod
                         ib.next();
                     }
                     Equal => {
-                        // compose(ac, bc) is identity only when BOTH sides
-                        // are already identity (a one-sided non-identity
-                        // survives); prune exactly that, matching
-                        // `compose_node`'s `if !c.is_identity()`.
-                        if !(*asub == ID && *bsub == ID) {
+                        // `compose_node` prunes a two-sided child when the
+                        // COMPOSED result is identity — which can happen
+                        // even when neither side encodes as `ID` (a
+                        // facetless keep whose every child cancels). Decide
+                        // it exactly, reading heads only: the predicate
+                        // short-circuits at the first surviving facet or
+                        // a-only descendant, so real content (any `Set`/
+                        // attrs child, any a-only entry) exits at once with
+                        // no subtree ever buffered.
+                        if !compose_collapses(asub, bsub)? {
                             items.push((an, Src::Both(asub, bsub)));
                         }
                         ia.next();
@@ -409,6 +414,79 @@ fn compose_node(a: &mut Cur, b: &mut Cur, out: &mut Vec<u8>) -> Result<(), Decod
             items.push((name, Src::CopyB(bsub)));
         }
         Ok(())
+    }
+}
+
+/// Does `compose(a, b)` reduce to the identity delta? Mirrors the identity
+/// conditions of `crate::compose_node` + `Node::is_identity`, reading node
+/// heads only and returning `false` the instant a surviving facet or an
+/// a-only child is found — so on canonical content (a full-state directory
+/// always carries entries `b` did not touch, and any real leaf carries a
+/// `Set`/attrs facet) it exits immediately without descending or buffering.
+/// It recurses only through the pathological all-facetless skeleton that
+/// might actually cancel; that shape never occurs in depot data.
+fn compose_collapses(a: &[u8], b: &[u8]) -> Result<bool, DecodeError> {
+    let mut ca = Cur::new(a);
+    let mut cb = Cur::new(b);
+    let bh = read_head(&mut cb)?;
+    // b tombstone → tombstone; b backdrop → b (an anchored node, never
+    // identity); a tombstone → harden (tombstone or opaque-forced) — none
+    // are the identity delta.
+    if bh.tombstone || bh.backdrop {
+        return Ok(false);
+    }
+    let ah = read_head(&mut ca)?;
+    if ah.tombstone {
+        return Ok(false);
+    }
+    // Any own-facet on either side survives the compose (blob is b's unless
+    // b keeps, then a's; attrs are b's-or-a's; opaque/backdrop are a's or
+    // b's mask) — the result is then non-identity.
+    let blob_keep = matches!(bh.blob, Blob::Keep) && matches!(ah.blob, Blob::Keep);
+    if !blob_keep
+        || bh.attrs.is_some()
+        || ah.attrs.is_some()
+        || bh.opaque
+        || ah.opaque
+        || ah.backdrop
+    {
+        return Ok(false);
+    }
+    // Facetless keep over facetless keep: identity iff every child cancels.
+    let a_children = collect_children(&mut ca, ah.child_count)?;
+    let b_children = collect_children(&mut cb, bh.child_count)?;
+    let mut ia = a_children.iter().peekable();
+    let mut ib = b_children.iter().peekable();
+    loop {
+        match (ia.peek(), ib.peek()) {
+            (Some((an, _)), Some((bn, bsub))) => {
+                use std::cmp::Ordering::*;
+                match an.cmp(bn) {
+                    // a-only child passes through verbatim — a survivor.
+                    Less => return Ok(false),
+                    // b-only child survives unless it is itself identity.
+                    Greater => {
+                        if *bsub != ID {
+                            return Ok(false);
+                        }
+                        ib.next();
+                    }
+                    Equal => {
+                        if !compose_collapses(ia.next().unwrap().1, ib.next().unwrap().1)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+            (Some(_), None) => return Ok(false), // an a-only child survives
+            (None, Some((_, bsub))) => {
+                if *bsub != ID {
+                    return Ok(false);
+                }
+                ib.next();
+            }
+            (None, None) => return Ok(true), // every child cancelled
+        }
     }
 }
 
