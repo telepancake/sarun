@@ -854,6 +854,16 @@ fn tree_oid(dir: &BTreeMap<Vec<u8>, TNode>) -> Result<String, WErr> {
     Ok(crate::git_obj_oid("tree", &body))
 }
 
+/// The git tree oid of a single lane tree, built directly from its entries
+/// (no union) — the reference/expected value a union reconstruction must match.
+pub fn lanetree_tree_oid(tree: &LaneTree) -> Result<String, WErr> {
+    let mut root = BTreeMap::new();
+    for (path, e) in tree {
+        tnode_insert(&mut root, path, e.mode, e.content.clone());
+    }
+    tree_oid(&root)
+}
+
 /// Reconstruct lane `lane`'s git tree from the union bytes and return its
 /// root tree oid — the SHA-exact ground-truth check: this must equal the git
 /// commit's recorded tree oid. Extracts the lane (the variant whose bitmap
