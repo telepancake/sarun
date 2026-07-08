@@ -1271,7 +1271,12 @@ static long unlink_at_inode_internal(uint32_t parent_idx,
         sud_ir_inode_free(cidx);
     } else {
         if (child->nlink) child->nlink--;
-        if (child->nlink == 0) sud_ir_inode_free(cidx);
+        /* POSIX: an inode with open fds survives unlink until the last
+         * close.  Free now only if nothing holds it open; otherwise
+         * leave it orphaned and let fdtab_drop_inode_ref reclaim it on
+         * the close that drops open_refs to 0. */
+        if (child->nlink == 0 && child->open_refs == 0)
+            sud_ir_inode_free(cidx);
     }
     sud_ir_unlock(&sb->lock);
     return 0;

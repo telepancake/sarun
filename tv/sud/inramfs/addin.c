@@ -103,16 +103,49 @@ static struct sud_ir_open_file *fdtab_alloc(int kfd, uint32_t inode_idx,
             g_fdtab[i].pos        = 0;
             g_fdtab[i].flags      = flags;
             g_fdtab[i].dir_cookie = 0;
+            /* Maintain the cross-process open-fd count so an inode
+             * unlinked while still open is kept alive until the last
+             * fd closes (POSIX unlink-open semantics).  Registration
+             * (op_open_inode, create-open, inherited-fd adoption) all
+             * funnel through here, so this is the single increment
+             * choke point. */
+            if (ino) {
+                struct sud_ir_super *sb = sud_ir_sb();
+                sud_ir_lock(&sb->lock);
+                ino->open_refs++;
+                sud_ir_unlock(&sb->lock);
+            }
             return &g_fdtab[i];
         }
     }
     return 0;
 }
 
+/* Drop one open reference against `inode_idx`.  If this was the last
+ * open fd and the inode is already unlinked (nlink==0), reclaim it
+ * now — the deferred free for the unlink-while-open case. */
+static void fdtab_drop_inode_ref(uint32_t inode_idx)
+{
+    if (inode_idx == 0) return;
+    struct sud_ir_super *sb = sud_ir_sb();
+    sud_ir_lock(&sb->lock);
+    struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
+    if (ino) {
+        if (ino->open_refs) ino->open_refs--;
+        if (ino->open_refs == 0 && ino->nlink == 0)
+            sud_ir_inode_free(inode_idx);
+    }
+    sud_ir_unlock(&sb->lock);
+}
+
 static void fdtab_release(int fd)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (of) of->kfd = -1;
+    if (of) {
+        uint32_t idx = of->inode_idx;
+        of->kfd = -1;
+        fdtab_drop_inode_ref(idx);
+    }
     /* Drop any path_remap dirfd entry; harmless no-op for non-dirs. */
     sud_pr_dirfd_forget(fd);
 }
@@ -216,7 +249,11 @@ static int try_adopt_inherited_fd(int fd)
 static void fdtab_forget(int fd)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (of) of->kfd = -1;
+    if (of) {
+        uint32_t idx = of->inode_idx;
+        of->kfd = -1;
+        fdtab_drop_inode_ref(idx);
+    }
     sud_pr_dirfd_forget(fd);
 }
 
