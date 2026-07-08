@@ -277,6 +277,21 @@ impl Encoder {
     pub fn full(&self, obj: &mut dyn Objects) -> Result<Layer> {
         Ok(depot::diff(None, Some(&full_view(&self.root, obj)?)))
     }
+
+    /// (total variant slots, total directory nodes) in the live skeleton —
+    /// for instrumentation. Both are bounded by the current union's size.
+    pub fn stats(&self) -> (usize, usize) {
+        fn go(s: &Skel, slots: &mut usize, nodes: &mut usize) {
+            *nodes += 1;
+            *slots += s.slots.iter().count();
+            for c in s.children.values() {
+                go(c, slots, nodes);
+            }
+        }
+        let (mut slots, mut nodes) = (0, 0);
+        go(&self.root, &mut slots, &mut nodes);
+        (slots, nodes)
+    }
 }
 
 #[cfg(test)]
