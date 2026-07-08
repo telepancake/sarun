@@ -91,6 +91,7 @@ mod cli;
 pub use cli::cli_main;
 pub mod frame;
 pub mod geostack;
+pub mod shards;
 pub mod layer;
 pub mod lanes;
 pub mod lanestore;
