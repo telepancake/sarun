@@ -158,12 +158,16 @@ back rather than guessing.
 - Lanes carry trees with no extra ascribed meaning, so a single delta layer
   MAY pack multiple commits — even several commits of the same ref forming one
   chain.
-- WHY pack many commits per layer: variant locality. With variants stored as
-  siblings (§2), packing e.g. 64 consecutive commits as 64 lanes in ONE layer
-  places all 64 versions of each file adjacently, so zstd finds short local
-  matches across them. Split into 64 separate layers, each file's versions land
-  in different frames and that context is lost. Variant-as-sibling (§2) and
-  many-commits-per-layer are the same decision: locality for the compressor.
+- WHY pack many commits per layer: variant locality → zstd MATCH DISTANCE.
+  With variants stored as siblings (§2), packing e.g. 64 consecutive commits as
+  64 lanes in ONE layer places a file's 64 versions ADJACENT (~one file apart)
+  → short back-references. This is not about frame boundaries: a full import is
+  ~two frames (f0 = refPrefix, f1 = all delta layers), and one frame holds as
+  many layers as practical, so 64 separate layers still share the f1 frame —
+  but there each file's 64 versions are scattered ~one-layer apart (one copy
+  per layer), giving long references or exceeding the window at scale.
+  Variant-as-sibling (§2) and many-commits-per-layer are the same decision:
+  locality for the compressor.
 - Invariant: **#lanes ≥ #live refs** (each live ref points at a commit → at
   least one lane).
 
