@@ -47,6 +47,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod codec;
+pub mod stream;
 pub mod variant;
 
 /// A node key: opaque bytes. Ordering is byte-lexicographic in this
@@ -478,7 +479,7 @@ fn materializes(n: &Node) -> bool {
 /// `Keep`/`Remove` → `Remove`, inherit-attrs → replace-with-what-it-sees
 /// (empty), opaque forced, children hardened with the non-materializing
 /// ones dropped (the forced opaque already masks their names).
-fn harden(n: &Node) -> Node {
+pub(crate) fn harden(n: &Node) -> Node {
     if !materializes(n) {
         return Node::tombstone();
     }
