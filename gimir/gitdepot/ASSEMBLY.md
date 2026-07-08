@@ -88,6 +88,21 @@ of the next entry's size:
 
 This keeps ~log(n) layers of geometrically increasing size.
 
+### Frame-write lifecycle
+
+The stack accumulates and compacts deltas BETWEEN frame writes. On a frame
+write (seal), the WHOLE stack is **flattened and emptied to produce the new
+refPrefix**:
+
+1. flatten the stack — `compose_stream`-merge every layer into one combined
+   delta (holes survive) = `geostack.collapse(compose_stream)`.
+2. `overlay_full(old_refPrefix, combined)` → the new refPrefix (holes dissolve
+   to removals; positive full-state).
+3. write the new refPrefix frame; **clear the stack**.
+
+So between writes a read is `refPrefix` + the few live stack layers; at a
+write the stack collapses into the refPrefix and starts fresh.
+
 ### TWO merges
 
 There are two distinct merges, and the `something+hole→nothing` rule was these
