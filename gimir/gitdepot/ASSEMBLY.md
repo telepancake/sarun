@@ -45,7 +45,10 @@ named `name` + `0x00` + `varint(slot)`. A directory is named `dirname` + `0x2F`
 - **content** = the node's blob (the file bytes), a `const byte range` in the
   encoding.
 - **lanes** = a CHILD node (name `lanes`) whose content is the lane bitmap —
-  a child, NOT an attr, so a lane join/leave rewrites only that child.
+  a child, NOT an attr, so a lane join/leave rewrites only that child. OMITTED
+  when the bitmap is all-ones: absence means "in every live lane" (the common
+  case — a file identical across branches), so most variants store no bitmap.
+  A bitmap-less variant is the ONLY variant at its path.
 - **mode**: NOTHING stored for a normal file or directory. Executable file →
   an empty child node named `x`; symlink → `l`; gitlink → `m`.
 

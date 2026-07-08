@@ -13,6 +13,13 @@
 //!   bitmap) and at most one mode tag `x` (executable) / `l` (symlink) /
 //!   `m` (gitlink). A plain file / directory carries no mode tag.
 //!
+//! The `lanes` child is **omitted when the bitmap is all-ones** — its absence
+//! means "this variant is in EVERY live lane". That is the common case (a
+//! file identical across all branches), so most variants store no bitmap. A
+//! bitmap-less variant is necessarily the ONLY variant at its path (if one
+//! variant covers all lanes, no sibling variant can), and `extract(lane L)`
+//! always matches it. A variant with siblings always carries a `lanes` child.
+//!
 //! ## Order: the big side never reorders
 //!
 //! The container's codec bytewise order (on the clean names above) is THE
