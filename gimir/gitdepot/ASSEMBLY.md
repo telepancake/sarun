@@ -61,13 +61,17 @@ git-tree iterator, yielding in **exactly git tree object order**. Per entry:
 - file path, file mode, variant index (slot), lane bitmap, **const byte range
   of the content**.
 
-Git tree order = git's `base_name_compare` (`read-cache.c`): bytewise, but the
-byte just past the shorter name is synthesized as `0x00` for a file and `0x2F`
-(`/`) for a directory. So naming files `name\0<slot>` and directories
-`dirname/` makes the container's bytewise child order reproduce git order
-EXACTLY — including file-vs-dir same name across lanes (`foo\0…` < `foo/` since
-`0x00 < 0x2F`, and git puts the file first too). Reconstructing a git name:
-strip the trailing `/` from a dir, strip `\0<varint>` from a file.
+ORDER — the big side never reorders. Node names stay clean (files
+`name\0<slot>`, dirs bare `name`). The container's codec bytewise order
+(`layer::container_cmp`) is authoritative; the hundreds-of-MB full-state is
+walked in a single pass in exactly that order, never re-sorted. The git trees
+are tiny (one level), so THEY adapt: parsed trees are sorted into container
+order once, at object-cache insertion (free on reuse). Only reconstructing a
+git tree object for SHA sorts a small level back into git's `base_name_compare`
+order (`layer::entry_cmp`). git's rule (`read-cache.c`): bytewise, but the byte
+past the shorter name is `0x00` for a file, `0x2F` for a dir — so it and our
+bare-dir order diverge only on file-vs-dir prefixes, a divergence confined to
+the tiny git side.
 
 During delta generation, the full-state and every delta on the stack are
 iterated **in lockstep** to read the previously-written bitmap and other
