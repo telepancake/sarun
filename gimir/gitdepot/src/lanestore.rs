@@ -438,19 +438,33 @@ impl LaneStore {
                 // ("minimize the frame-to-frame diff": the dead lane really
                 // did leave the state), not the strict one-lane-per-record
                 // shape the roundtrip test used to assert.
-                for &dead in &dying_at[i] {
-                    full_combined.children.remove(&lane_key(dead));
-                    lane_blob_sets.remove(&dead);
-                    lane_views[dead as usize] = None;
-                }
-                lane_views[lane_of[i] as usize] = Some(view.clone());
                 if repr == Repr::Union {
-                    // Advance the encoder to this revision's lane set. It
-                    // returns the reverse delta rebuilding the PREVIOUS state
-                    // from this one (each older record); f0/seal heads are its
-                    // forward full state. No combined tree; slots are stable.
-                    let refs: Vec<Option<&View>> = lane_views.iter().map(Option::as_ref).collect();
-                    let rev = enc.advance(&refs);
+                    // This revision's lane transitions: each dying lane leaves
+                    // (old tree → absent) and the advancing lane changes (old
+                    // tree → this commit's tree). The encoder walks only the
+                    // paths these actually change; unchanged subtrees are
+                    // pruned by Arc identity. Build the transitions from the
+                    // PRE-mutation `lane_views`, advance, THEN apply them.
+                    let mut trans: Vec<crate::unionenc::Trans> = Vec::new();
+                    for &dead in &dying_at[i] {
+                        // Compaction can hand the advancing lane the very index
+                        // a lane dying THIS revision just freed (a merge that
+                        // both forks and absorbs). Then the advancing
+                        // transition below — old = the dying lane's tree (still
+                        // in `lane_views[idx]`), new = this commit's tree —
+                        // already moves that bit correctly; a separate dying
+                        // transition for the same index would be a duplicate
+                        // that wrongly deletes the shared paths. Skip it.
+                        if dead != lane_of[i] {
+                            trans.push((dead as usize, lane_views[dead as usize].as_ref(), None));
+                        }
+                    }
+                    trans.push((lane_of[i] as usize, lane_views[lane_of[i] as usize].as_ref(), Some(view)));
+                    let rev = enc.advance(&trans);
+                    for &dead in &dying_at[i] {
+                        lane_views[dead as usize] = None;
+                    }
+                    lane_views[lane_of[i] as usize] = Some(view.clone());
                     if i == 0 {
                         let f0raw = codec::encode(&enc.full());
                         let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
@@ -470,6 +484,12 @@ impl LaneStore {
                     expect += 1;
                     return Ok(());
                 }
+                for &dead in &dying_at[i] {
+                    full_combined.children.remove(&lane_key(dead));
+                    lane_blob_sets.remove(&dead);
+                    lane_views[dead as usize] = None;
+                }
+                lane_views[lane_of[i] as usize] = Some(view.clone());
                 let child = Arc::new(view.clone());
                 full_combined.children.insert(lane_key(lane_of[i]), child.clone());
                 let cur = match repr {

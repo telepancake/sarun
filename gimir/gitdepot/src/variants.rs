@@ -20,7 +20,7 @@
 //! that lane's bit.
 
 use depot::{Anchor, Attrs, BlobOp, Bytes, Name, Node, Presence, View};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Marker byte leading every non-path key. Real git path segments never
@@ -63,27 +63,6 @@ fn is_var(key: &[u8]) -> bool {
 fn bit(bm: &[u8], i: usize) -> bool {
     let byte = i / 8;
     byte < bm.len() && (bm[byte] >> (i % 8)) & 1 == 1
-}
-
-/// The sorted set of real (directory) child names across the dir-lanes at
-/// one path — the names [`crate::unionenc`] recurses into.
-pub(crate) fn dir_names(lanes: &[Option<&View>]) -> BTreeSet<Name> {
-    let mut names = BTreeSet::new();
-    for v in lanes.iter().flatten() {
-        if v.blob.is_none() {
-            names.extend(v.children.keys().cloned());
-        }
-    }
-    names
-}
-
-/// Each lane's child View at `name` (only dir-lanes that have it), lane
-/// indices preserved so a recursion stays aligned.
-pub(crate) fn sub_at<'a>(lanes: &[Option<&'a View>], name: &[u8]) -> Vec<Option<&'a View>> {
-    lanes
-        .iter()
-        .map(|v| v.and_then(|v| if v.blob.is_none() { v.children.get(name).map(Arc::as_ref) } else { None }))
-        .collect()
 }
 
 /// A leaf delta child reconstructing `target` from `base` (either may be
