@@ -1,0 +1,120 @@
+# gitdepot assembly — sharded, geometric-stack, content-addressed union
+
+The ASSEMBLY of pieces already built, into their final form — NOT a redesign.
+Everything here is a thin driver over parts that exist:
+
+| Spec item | Existing piece it uses |
+|---|---|
+| geometric-stack merge (§4) | `depot::stream::compose_stream` + the hole-annihilation rule |
+| apply merged stack to full-state (§4) | `depot::stream::overlay_full` (the mmap driver) |
+| layer iterator (§3) | single forward pass over the `depot::codec` byte grammar |
+| variant tree (§2) | `gitdepot::variants` with `\0NNNN` name / mode-tag / lanes-child tweaks |
+| delta / full-state bytes | `depot::codec`; VBF frames = `depot-vbf` |
+| lanes / reflog (§5) | `gitdepot::lanes` + VBF metadata |
+
+The ONLY thing dropped is the skeleton + per-seal `full_view` dead-end — the
+one part never asked for.
+
+## 0. Why the flat form (numbers)
+
+Full-state = the flat refPrefix (written anyway) + a bounded stack of delta
+layers merged geometrically; overlaid at seals with `overlay_full`. No `View`,
+no skeleton. git.git rev 20000: 74-byte delta, 66.9 MiB raw refPrefix
+(3.46 MiB zstd), 373 KiB skeleton — three orders of magnitude of transient
+`Arc<View>` churn to emit 74 bytes was the waste.
+
+## 1. Sharding
+
+- Each mirror has a **`shard-bits`** parameter (fixed at import; a later
+  offline re-shard process adjusts it).
+- A path is assigned to a shard by the first `shard-bits` bits of a hash of
+  its **full git path** (NOT including the `\0NNNN` variant tag).
+- Import is **multithreaded**: one thread per shard, all sharing the same git
+  object source, each with completely separate delta / VBF state.
+- Bounds per-shard full-state size (no 20 TB single full-state).
+
+OPEN: hash function (fnv/xxhash/sha-prefix?). Bits taken from which end. A
+path's shard must be stable across re-shard for the offline tool to work.
+
+## 2. Layer encoding (the union tree shape)
+
+Directories are ordinary name nodes (no variant tag). A file at path segment
+`name` is stored as one node **per variant**, siblings named
+`name\0<varint slot>` (the `\0` + varint slot suffix). Per variant node:
+
+- **content** = the node's blob (the file bytes), a `const byte range` in the
+  encoding.
+- **lanes** = a CHILD node (name `lanes`) whose content is the lane bitmap —
+  a child, NOT an attr, so a lane join/leave rewrites only that child.
+- **mode**: NOTHING stored for a normal file or directory. Executable file →
+  an empty child node named `x`; symlink → `l`; gitlink → `m`.
+
+No `mode` attr anywhere. (Meta children `lanes`/`x`/`l`/`m` are unambiguous
+because a file variant node has no real filesystem children.)
+
+OPEN: exact child names for meta (`lanes` vs `\0lanes`); ensure they cannot
+collide with the variant-sibling scheme or git ordering.
+
+## 3. Layer iterator
+
+A single-pass iterator over the binary layer encoding, same interface as the
+git-tree iterator, yielding in **exactly git tree object order**. Per entry:
+
+- file path, file mode, variant index (slot), lane bitmap, **const byte range
+  of the content**.
+
+Git tree order = entries sorted by name with a trailing `/` appended to
+directory names for the comparison. The `name\0<slot>` encoding must sort so
+that iterating (and extracting a lane) reproduces git's order exactly —
+including the file-vs-dir-same-name case that arises across lanes in the union.
+
+During delta generation, the full-state and every delta on the stack are
+iterated **in lockstep** to read the previously-written bitmap and other
+per-path info.
+
+## 4. Geometric delta stack
+
+When a delta layer has been generated and handed to the VBF code (on disk, or
+kept in memory below a threshold — implementation choice), push it on a stack.
+Then repeat until the stack has one entry OR the top entry is smaller than 70%
+of the next entry's size:
+
+    pop the two topmost layers, MERGE them (lower then upper), push the result.
+
+This keeps ~log(n) layers of geometrically increasing size.
+
+### Merge algebra (per path, `merge(lower, upper)`)
+
+- upper sets content → content (newer wins)
+- upper hole, lower **something** → **nothing** (annihilate)
+- upper hole, lower **nothing** → **hole** (persist — associativity)
+- upper absent → lower unchanged
+
+The two hole rules are the user's stated invariant "something+hole → nothing,
+nothing+hole → hole" which preserves associativity of merge. NOTE TO SELF:
+verify associativity + apply-to-full-state round-trip empirically; if a
+counterexample exists (e.g. content then two holes), bring the concrete case
+back rather than guessing.
+
+## 5. Reflog
+
+- **One reflog entry per written layer.** It explicitly records ALL lanes of
+  that layer, plus any ref changes at that point.
+- Each lane records a **commit index**.
+- Lanes carry trees with no extra ascribed meaning, so a single delta layer
+  MAY pack multiple commits — even several commits of the same ref forming one
+  chain.
+- Invariant: **#lanes ≥ #live refs** (each live ref points at a commit → at
+  least one lane).
+
+## 6. Component / dependency order
+
+1. **Encoding + iterator** (§2, §3) — foundation; everything reads/writes it.
+2. **Merge** (§4 algebra) over the encoding + iterator; then the geometric
+   stack driver.
+3. **Delta generation**: lockstep iterate full-state + stack + git trees →
+   new delta.
+4. **Sharding harness** (§1): per-shard threads over 1–3.
+5. **Reflog** (§5).
+6. Wire into `LaneStore`-equivalent + SHA-exact proof; then swap blob
+   acquisition (`cat-file` → `fetch-pack --shallow-since` + `unpack-objects`).
