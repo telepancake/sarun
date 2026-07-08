@@ -385,10 +385,16 @@ impl LaneStore {
         let mut full_combined = View::default();
         let mut lane_blob_sets: HashMap<LaneId, HashSet<Vec<u8>>> = HashMap::new();
         // Union path: each live lane's CURRENT tree, indexed by lane id
-        // (None = absent/evicted). `union(&lane_views)` is this revision's
-        // stored state; only one entry changes per revision.
+        // (None = absent/evicted). The stored state at revision i is the
+        // union of these; only one entry changes per revision. The frame is
+        // produced by `variants::reverse_delta` walking the lane trees —
+        // never by materializing that union. `prev_lanes` is the previous
+        // revision's snapshot (Arc-cheap: one entry differs), the older side
+        // of each reverse delta; `no_lanes` is the all-absent base of an f0.
         let n_lanes = assignment.span.len();
+        let no_lanes: Vec<Option<View>> = vec![None; n_lanes];
         let mut lane_views: Vec<Option<View>> = vec![None; n_lanes];
+        let mut prev_lanes: Vec<Option<View>> = vec![None; n_lanes];
         let mut prev: Option<View> = None;
         let mut batch: Vec<Vec<u8>> = Vec::new(); // reverse records, forward order
         let mut batch_bytes: u64 = 0;
@@ -424,16 +430,37 @@ impl LaneStore {
                     lane_blob_sets.remove(&dead);
                     lane_views[dead as usize] = None;
                 }
+                lane_views[lane_of[i] as usize] = Some(view.clone());
+                if repr == Repr::Union {
+                    // Frame = reverse delta between this revision's lane set
+                    // and the previous one, produced by the streaming walk
+                    // (no combined tree). f0 is the walk against the empty
+                    // base; every older record rebuilds `prev_lanes` from the
+                    // current lanes.
+                    if i == 0 {
+                        let f0raw = codec::encode(&crate::variants::reverse_delta(&no_lanes, &lane_views));
+                        let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
+                        depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
+                    } else {
+                        let rec = codec::encode(&crate::variants::reverse_delta(&lane_views, &prev_lanes));
+                        batch_bytes += 8 + rec.len() as u64;
+                        batch.push(rec);
+                    }
+                    prev_lanes.clone_from(&lane_views);
+                    if !batch.is_empty() && batch_bytes >= batch_bound {
+                        let head = codec::encode(&crate::variants::reverse_delta(&no_lanes, &lane_views));
+                        let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
+                        seal_prepend(&depot, &head, &staged, level)?;
+                        batch_bytes = 0;
+                        depot.flush().map_err(|e| cf(e.to_string()))?;
+                    }
+                    expect += 1;
+                    return Ok(());
+                }
                 let child = Arc::new(view.clone());
                 full_combined.children.insert(lane_key(lane_of[i]), child.clone());
-                lane_views[lane_of[i] as usize] = Some(view.clone());
                 let cur = match repr {
-                    Repr::Union => {
-                        // The whole live-lane set, unioned into one path-keyed
-                        // tree. Content stays byte-stable when a lane doesn't
-                        // move, so the reverse delta against `prev` is tiny.
-                        crate::variants::union(&lane_views).unwrap_or_default()
-                    }
+                    Repr::Union => unreachable!("handled above"),
                     Repr::Variant(c) => {
                         // The frontier maintained this commit's git-oid set
                         // as its first parent's set + this commit's changes
@@ -492,10 +519,15 @@ impl LaneStore {
                 "frontier walk produced {expect} of {n_rev} revisions"
             )));
         }
-        // Final partial batch: its newest state (`prev` == combined[n-1])
-        // becomes the chain's f0.
+        // Final partial batch: its newest state (combined[n-1]) becomes the
+        // chain's f0. Union rebuilds that full state with the walk against
+        // the empty base; the other paths diff the retained `prev` View.
         if !batch.is_empty() {
-            let head = codec::encode(&depot::diff(None, prev.as_ref()));
+            let head = if repr == Repr::Union {
+                codec::encode(&crate::variants::reverse_delta(&no_lanes, &lane_views))
+            } else {
+                codec::encode(&depot::diff(None, prev.as_ref()))
+            };
             let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
             seal_prepend(&depot, &head, &staged, level)?;
         }
