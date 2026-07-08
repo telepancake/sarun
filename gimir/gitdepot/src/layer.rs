@@ -798,6 +798,81 @@ fn both_child(
     Ok(())
 }
 
+// ---------------------------------------------------- SHA reconstruction
+
+/// A reconstructed git tree node while rebuilding one lane's tree for its oid.
+enum TNode {
+    File(Mode, Vec<u8>),
+    Dir(BTreeMap<Vec<u8>, TNode>),
+}
+
+fn tnode_insert(dir: &mut BTreeMap<Vec<u8>, TNode>, path: &[u8], mode: Mode, content: Vec<u8>) {
+    match path.iter().position(|&b| b == b'/') {
+        Some(sl) => {
+            let seg = path[..sl].to_vec();
+            let sub = dir.entry(seg).or_insert_with(|| TNode::Dir(BTreeMap::new()));
+            if let TNode::Dir(m) = sub {
+                tnode_insert(m, &path[sl + 1..], mode, content);
+            }
+        }
+        None => {
+            dir.insert(path.to_vec(), TNode::File(mode, content));
+        }
+    }
+}
+
+/// The git tree oid of a reconstructed level, bottom-up. Entries are ordered by
+/// git's `base_name_compare` (a directory sorts as `name/`); a gitlink's blob
+/// content IS its pinned commit id (matching the store's convention).
+fn tree_oid(dir: &BTreeMap<Vec<u8>, TNode>) -> Result<String, WErr> {
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (git sort key, raw)
+    for (name, node) in dir {
+        let (mode_bytes, oid, is_dir) = match node {
+            TNode::File(mode, content) => {
+                let oid = if *mode == Mode::Gitlink {
+                    String::from_utf8_lossy(content).into_owned()
+                } else {
+                    crate::git_obj_oid("blob", content)
+                };
+                (mode.octal().to_vec(), oid, false)
+            }
+            TNode::Dir(sub) => (b"40000".to_vec(), tree_oid(sub)?, true),
+        };
+        let mut raw = mode_bytes;
+        raw.push(b' ');
+        raw.extend_from_slice(name);
+        raw.push(0);
+        raw.extend_from_slice(&hex::decode(&oid).map_err(|_| WErr::Truncated)?);
+        let mut key = name.clone();
+        if is_dir {
+            key.push(b'/');
+        }
+        entries.push((key, raw));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let body: Vec<u8> = entries.into_iter().flat_map(|(_, r)| r).collect();
+    Ok(crate::git_obj_oid("tree", &body))
+}
+
+/// Reconstruct lane `lane`'s git tree from the union bytes and return its
+/// root tree oid — the SHA-exact ground-truth check: this must equal the git
+/// commit's recorded tree oid. Extracts the lane (the variant whose bitmap
+/// includes `lane`, or the sole all-ones variant), rebuilds the nested tree,
+/// and hashes bottom-up in git order.
+pub fn reconstruct_lane_tree_oid(union: &[u8], lane: u32) -> Result<String, WErr> {
+    let mut root = BTreeMap::new();
+    visit_entries(union, |e| {
+        let inl = match e.bitmap {
+            Some(b) => (b.get((lane / 8) as usize).copied().unwrap_or(0) & (1 << (lane % 8))) != 0,
+            None => true,
+        };
+        if inl {
+            tnode_insert(&mut root, e.path, e.mode, e.content.to_vec());
+        }
+    })?;
+    tree_oid(&root)
+}
+
 // ------------------------------------------------------------ iterator
 
 /// One file entry yielded by the layer iterator. `content`/`bitmap` borrow
@@ -1283,6 +1358,59 @@ mod tests {
                 "mismatch depth {depth}, states={states:?}"
             );
         }
+    }
+
+    /// Reconstructing each lane's tree oid from the union must equal building
+    /// that tree oid straight from the input lane — the union encode + lane
+    /// extract preserve exact git tree identity (SHA-exact). Independent of the
+    /// synthetic `oid` field: both sides hash the real content.
+    #[test]
+    fn union_reconstructs_exact_tree_oids() {
+        let gl = b"0123456789abcdef0123456789abcdef01234567"; // a valid 40-hex gitlink id
+        let lanes = vec![
+            lane(&[
+                (b"README", Mode::File, b"r0", b"hello\n"),
+                (b"src/main.rs", Mode::File, b"m0", b"fn main() {}\n"),
+                (b"src/run.sh", Mode::Exec, b"x0", b"#!/bin/sh\n"),
+                (b"link", Mode::Symlink, b"l0", b"src/main.rs"),
+                (b"dep", Mode::Gitlink, b"g0", gl),
+            ]),
+            lane(&[
+                (b"README", Mode::File, b"r1", b"hello world\n"),
+                (b"src/main.rs", Mode::File, b"m0", b"fn main() {}\n"),
+                (b"src/lib.rs", Mode::File, b"lib", b"pub fn f() {}\n"),
+            ]),
+        ];
+        let union = encode_union(&lanes);
+
+        // Reference: tree oid built directly from each input lane's tree.
+        for (j, t) in lanes.iter().enumerate() {
+            let mut root = BTreeMap::new();
+            for (path, e) in t {
+                tnode_insert(&mut root, path, e.mode, e.content.clone());
+            }
+            let want = tree_oid(&root).unwrap();
+            let got = reconstruct_lane_tree_oid(&union, j as u32).unwrap();
+            assert_eq!(got, want, "lane {j} tree oid");
+        }
+        // The two lanes genuinely differ, so the oids must too.
+        assert_ne!(
+            reconstruct_lane_tree_oid(&union, 0).unwrap(),
+            reconstruct_lane_tree_oid(&union, 1).unwrap(),
+        );
+    }
+
+    /// Ground-truth anchors: the reconstruction's hashing must match git's
+    /// real object ids, not just itself. These constants are git's canonical
+    /// empty-tree oid and the blob oid of "hello\n".
+    #[test]
+    fn tree_oid_matches_real_git_constants() {
+        assert_eq!(tree_oid(&BTreeMap::new()).unwrap(), "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+        assert_eq!(crate::git_obj_oid("blob", b"hello\n"), "ce013625030ba8dba906f756967f9e9ca394464a");
+        // A one-file tree `hello` (100644) → `git write-tree` value.
+        let mut root = BTreeMap::new();
+        root.insert(b"hello".to_vec(), TNode::File(Mode::File, b"hello\n".to_vec()));
+        assert_eq!(tree_oid(&root).unwrap(), "b4d01e9b0c4a9356736dfddf8830ba9a54f5271c");
     }
 
     #[test]
