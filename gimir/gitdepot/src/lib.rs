@@ -90,6 +90,7 @@ use depot::{Attrs, BlobOp, Layer, Node};
 mod cli;
 pub use cli::cli_main;
 pub mod frame;
+pub mod gitsrc;
 pub mod geostack;
 pub mod reflog;
 pub mod shards;
