@@ -280,6 +280,22 @@ impl LaneStore {
             }
             lane_tree[l] = Some(tree_oid);
 
+            // Compare the flat full-state (refPrefix) and this revision's VBF
+            // delta against the skeleton's heap footprint at a checkpoint.
+            if std::env::var("GITDEPOT_MEASURE").is_ok() && i == 20000 {
+                let delta_bytes = codec::encode(&rev).len();
+                let raw = codec::encode(&enc.full(&mut objs)?);
+                let zstd = compress_frame(&raw, None, level).map(|c| c.len()).unwrap_or(0);
+                let (nodes, slots, heap, mallocs) = enc.mem_report();
+                return Err(Error::Chain(format!(
+                    "MEASURE rev {i}: refPrefix_raw={} refPrefix_zstd={} \
+                     delta_raw={delta_bytes} skel_nodes={nodes} skel_slots={slots} \
+                     skel_owned_heap={heap} skel_mallocs={mallocs}",
+                    raw.len(),
+                    zstd
+                )));
+            }
+
             if i == 0 {
                 // Seed f0 with the positive full-state (all `Set`, no
                 // removals — a full record from nothing).
