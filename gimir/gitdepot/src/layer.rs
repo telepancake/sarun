@@ -854,33 +854,53 @@ fn tree_oid(dir: &BTreeMap<Vec<u8>, TNode>) -> Result<String, WErr> {
     Ok(crate::git_obj_oid("tree", &body))
 }
 
-/// The git tree oid of a single lane tree, built directly from its entries
-/// (no union) — the reference/expected value a union reconstruction must match.
-pub fn lanetree_tree_oid(tree: &LaneTree) -> Result<String, WErr> {
+/// The canonical encoding of an EMPTY full-state (a keep root, no children).
+/// `overlay_full` can emit zero bytes when a whole tree is removed; a
+/// full-state must stay decodable, so callers substitute this.
+pub fn empty_union() -> Vec<u8> {
+    depot::codec::encode(&depot::Layer { root: depot::Node::keep() })
+}
+
+/// The git tree oid of a set of flat `(path, mode, content)` entries, built
+/// bottom-up in git order. Used to hash a lane whose entries were gathered
+/// across shards (§1) as well as a single union.
+pub fn tree_oid_of_entries(entries: &[(Vec<u8>, Mode, Vec<u8>)]) -> Result<String, WErr> {
     let mut root = BTreeMap::new();
-    for (path, e) in tree {
-        tnode_insert(&mut root, path, e.mode, e.content.clone());
+    for (path, mode, content) in entries {
+        tnode_insert(&mut root, path, *mode, content.clone());
     }
     tree_oid(&root)
 }
 
-/// Reconstruct lane `lane`'s git tree from the union bytes and return its
-/// root tree oid — the SHA-exact ground-truth check: this must equal the git
-/// commit's recorded tree oid. Extracts the lane (the variant whose bitmap
-/// includes `lane`, or the sole all-ones variant), rebuilds the nested tree,
-/// and hashes bottom-up in git order.
-pub fn reconstruct_lane_tree_oid(union: &[u8], lane: u32) -> Result<String, WErr> {
-    let mut root = BTreeMap::new();
+/// The git tree oid of a single lane tree, built directly from its entries
+/// (no union) — the reference/expected value a union reconstruction must match.
+pub fn lanetree_tree_oid(tree: &LaneTree) -> Result<String, WErr> {
+    let entries: Vec<_> = tree.iter().map(|(p, e)| (p.clone(), e.mode, e.content.clone())).collect();
+    tree_oid_of_entries(&entries)
+}
+
+/// Extract lane `lane`'s flat `(path, mode, content)` entries from a union —
+/// the variant whose bitmap includes `lane` (or the sole all-ones variant) at
+/// each path. Sharding gathers a lane's entries across shards before hashing.
+pub fn extract_lane_entries(union: &[u8], lane: u32) -> Result<Vec<(Vec<u8>, Mode, Vec<u8>)>, WErr> {
+    let mut out = Vec::new();
     visit_entries(union, |e| {
         let inl = match e.bitmap {
             Some(b) => (b.get((lane / 8) as usize).copied().unwrap_or(0) & (1 << (lane % 8))) != 0,
             None => true,
         };
         if inl {
-            tnode_insert(&mut root, e.path, e.mode, e.content.to_vec());
+            out.push((e.path.to_vec(), e.mode, e.content.to_vec()));
         }
     })?;
-    tree_oid(&root)
+    Ok(out)
+}
+
+/// Reconstruct lane `lane`'s git tree from the union bytes and return its
+/// root tree oid — the SHA-exact ground-truth check: this must equal the git
+/// commit's recorded tree oid.
+pub fn reconstruct_lane_tree_oid(union: &[u8], lane: u32) -> Result<String, WErr> {
+    tree_oid_of_entries(&extract_lane_entries(union, lane)?)
 }
 
 // ------------------------------------------------------------ iterator

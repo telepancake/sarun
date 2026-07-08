@@ -24,7 +24,12 @@ use crate::layer::{self, LaneTree};
 fn compose(lower: Vec<u8>, upper: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::new();
     depot::stream::compose_stream(&lower, &upper, &mut out).expect("compose_stream on canonical layers");
-    out
+    // A fully-annihilating merge can yield nothing; keep the layer decodable.
+    if out.is_empty() {
+        layer::empty_union()
+    } else {
+        out
+    }
 }
 
 fn size(l: &Vec<u8>) -> u64 {
@@ -69,7 +74,13 @@ impl Frame {
         let mut out = Vec::new();
         depot::stream::overlay_full(&self.refprefix, &combined, &mut out)
             .expect("overlay_full on canonical layers");
-        out
+        // overlay can emit nothing when the whole tree is removed; keep the
+        // full-state decodable.
+        if out.is_empty() {
+            layer::empty_union()
+        } else {
+            out
+        }
     }
 
     /// Write the frame: collapse the whole stack into a new `refPrefix`
