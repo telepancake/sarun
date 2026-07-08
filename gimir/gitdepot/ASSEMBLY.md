@@ -82,7 +82,11 @@ Reslot matches variants by git OID, obtained for free (git trees already carry
 every entry's oid) — the container's stored content is NEVER read back and
 hashed. Co-iterate by path:
 
-- the **previous encoded layer** — gives each current variant's slot + bitmap;
+- the **current state** — NOT a materialized layer: the full-state plus every
+  live delta on the stack, co-iterated, and at each path the touching values
+  stacked (full-state at bottom, deltas oldest→newest) by the per-path overlay
+  rule → the effective current variants' slots + bitmaps. The geostack keeps
+  this to ~log(n)+1 byte streams, so it stays a bounded k-way lockstep.
 - the **previous lanes' git trees** and the **new lanes' git trees**.
 
 A current variant's identity = its bitmap → any lane in it → that lane's tree
