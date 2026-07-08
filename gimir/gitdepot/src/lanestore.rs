@@ -55,33 +55,47 @@ const CHAIN: u64 = 0;
 /// is recent. Blobs are not cached: they are fetched by oid only to emit a
 /// `\0v` and then dropped.
 type TreeEnts = std::sync::Arc<Vec<(Vec<u8>, crate::oidenc::Ent)>>;
-const TREE_CACHE_CAP: usize = 4096; // recent working set (root + hot dirs); no CPU gain from more
+/// Cache BUDGET in bytes, not tree count: git.git has huge directory trees
+/// (thousands of entries each), so a count cap can't bound RAM — 4096 big
+/// trees was ~900 MB. This keeps the hot working set (root + recently
+/// touched dirs) resident and is small on purpose: the cache saves cat-file
+/// IPC on re-reads, but the encode's throughput floor is blob fetches, so a
+/// bigger cache buys no speed.
+const TREE_CACHE_BUDGET: usize = 64 << 20; // 64 MB
+
+fn tree_bytes(ents: &[(Vec<u8>, crate::oidenc::Ent)]) -> usize {
+    ents.iter().map(|(n, e)| n.len() + e.mode.len() + e.oid.len() + 48).sum::<usize>() + 32
+}
 
 struct Cat<'a> {
     cat: &'a mut crate::CatFile,
-    trees: HashMap<String, TreeEnts>,
-    order: std::collections::VecDeque<String>, // FIFO eviction
+    trees: HashMap<String, (TreeEnts, usize)>, // oid → (entries, byte size)
+    order: std::collections::VecDeque<String>, // FIFO eviction order
+    bytes: usize,
 }
 
 impl<'a> Cat<'a> {
     fn new(cat: &'a mut crate::CatFile) -> Self {
-        Cat { cat, trees: HashMap::new(), order: std::collections::VecDeque::new() }
+        Cat { cat, trees: HashMap::new(), order: std::collections::VecDeque::new(), bytes: 0 }
     }
 }
 
 impl crate::oidenc::Objects for Cat<'_> {
     fn tree(&mut self, oid: &str) -> Result<TreeEnts> {
-        if let Some(t) = self.trees.get(oid) {
+        if let Some((t, _)) = self.trees.get(oid) {
             return Ok(t.clone());
         }
         let ents = std::sync::Arc::new(crate::oidenc::parse_tree(&self.cat.get(oid)?)?);
-        if self.trees.len() >= TREE_CACHE_CAP {
-            if let Some(old) = self.order.pop_front() {
-                self.trees.remove(&old);
+        let sz = tree_bytes(&ents);
+        while self.bytes + sz > TREE_CACHE_BUDGET {
+            let Some(old) = self.order.pop_front() else { break };
+            if let Some((_, osz)) = self.trees.remove(&old) {
+                self.bytes -= osz;
             }
         }
-        self.trees.insert(oid.to_string(), ents.clone());
+        self.trees.insert(oid.to_string(), (ents.clone(), sz));
         self.order.push_back(oid.to_string());
+        self.bytes += sz;
         Ok(ents)
     }
     fn blob(&mut self, oid: &str) -> Result<depot::Bytes> {
@@ -209,6 +223,10 @@ impl LaneStore {
         let mut batch_bytes: u64 = 0;
 
         for i in 0..n_rev {
+            if std::env::var("GITDEPOT_PROBE").is_ok() && i % 20000 == 0 {
+                let (slots, nodes) = enc.stats();
+                eprintln!("PROBE rev {i}/{n_rev} slots={slots} nodes={nodes} cache_mb={}", objs.bytes >> 20);
+            }
             let sha = &sha_of[i];
             let tree_oid =
                 tree_of.get(sha).ok_or_else(|| Error::Chain(format!("no tree for {sha}")))?.clone();
