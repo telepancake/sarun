@@ -148,6 +148,38 @@ static void test_match_glob(void)
     TASSERT(sud_cmd_match_glob("/x/dabc",       "[!abc]*"),    "neg-class hit");
 }
 
+/* Whole-path glob (the shadow `redirect:pathglob:` matcher): '**' spans
+ * separators, '*' does not, and leading multi-slash paths are normalised. */
+static void test_match_pathglob(void)
+{
+    g_curtest = "match_pathglob";
+    /* The reported case: leading '**' + a triple-slash exec path. */
+    TASSERT(sud_cmd_match_pathglob("///opt/sdk/bin/bash", "/**/bin/bash"),
+            "triple-slash path, leading **");
+    TASSERT(sud_cmd_match_pathglob("//opt/sdk/bin/bash", "/**/bin/bash"),
+            "double-slash path");
+    TASSERT(sud_cmd_match_pathglob("/opt/sdk/bin/bash", "/**/bin/bash"),
+            "single-slash path");
+    /* '**' matches zero intermediate dirs. */
+    TASSERT(sud_cmd_match_pathglob("/bin/bash", "/**/bin/bash"),
+            "** matches zero dirs");
+    /* Mid-pattern '**'. */
+    TASSERT(sud_cmd_match_pathglob("/sdk/a/b/make", "/sdk/**/make"), "mid **");
+    TASSERT(sud_cmd_match_pathglob("/sdk/make", "/sdk/**/make"), "mid ** zero");
+    /* '*' must NOT cross a separator. */
+    TASSERT(sud_cmd_match_pathglob("/a/b/c", "/a/*/c"),  "* single segment");
+    TASSERT(!sud_cmd_match_pathglob("/a/b/x/c", "/a/*/c"), "* not across /");
+    TASSERT(sud_cmd_match_pathglob("/a/b/x/c", "/a/**/c"), "** across /");
+    /* Basename must still match. */
+    TASSERT(!sud_cmd_match_pathglob("/opt/sdk/bin/dash", "/**/bin/bash"),
+            "wrong basename");
+    TASSERT(!sud_cmd_match_pathglob("/opt/bash", "/**/bin/bash"),
+            "missing /bin/ segment");
+    /* '?' is a single non-separator. */
+    TASSERT(sud_cmd_match_pathglob("/x/bash", "/x/bas?"), "? one char");
+    TASSERT(!sud_cmd_match_pathglob("/x/ba/h", "/x/ba?h"), "? not across /");
+}
+
 /* ---- Rule parser ------------------------------------------------- */
 
 static void test_parse_compiler_wrap(void)
@@ -374,6 +406,7 @@ int main(int argc, char **argv)
     test_match_basename();
     test_match_path();
     test_match_glob();
+    test_match_pathglob();
     test_parse_compiler_wrap();
     test_parse_exec_strip();
     test_parse_exec_as();

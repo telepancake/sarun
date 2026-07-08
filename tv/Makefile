@@ -438,13 +438,23 @@ CMD_REWRITE_TEST_HDRS := sud/cmd-rewrite/cmd_rewrite.h \
                          sud/addin.h sud/runtime_config.h \
                          libc-fs/libc.h libc-fs/fmt.h
 .PHONY: cmd-rewrite-test
-cmd-rewrite-test: build/cmd_rewrite_test64
+cmd-rewrite-test: build/cmd_rewrite_test64 build/cmd_rewrite_test32
 	@echo '--- running 64-bit cmd-rewrite tests ---'
 	./build/cmd_rewrite_test64
+	@echo '--- running 32-bit cmd-rewrite tests ---'
+	./build/cmd_rewrite_test32
 
 build/cmd_rewrite_test64: $(CMD_REWRITE_TEST_SRCS) $(CMD_REWRITE_TEST_HDRS)
 	@mkdir -p build
 	$(SUD_CC64) $(SUD_CFLAGS) -DSUD_ADDIN_CMD_REWRITE $(SUD_LDFLAGS) \
+	    -o $@ $(CMD_REWRITE_TEST_SRCS)
+
+# The matchers/parsers are pure logic and SHOULD be arch-identical — but this
+# codebase has taught us not to assume 32==64, so run the unit suite on 32-bit
+# too. (Pure C, no syscalls, so it runs directly on x86-64 hosts.)
+build/cmd_rewrite_test32: $(CMD_REWRITE_TEST_SRCS) $(CMD_REWRITE_TEST_HDRS)
+	@mkdir -p build
+	$(SUD_CC32) $(SUD_CFLAGS) -DSUD_ADDIN_CMD_REWRITE $(SUD_LDFLAGS) \
 	    -o $@ $(CMD_REWRITE_TEST_SRCS)
 
 # fake-exec performance regression gate.  Runs sudtrace over a
