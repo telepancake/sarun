@@ -1,34 +1,37 @@
-//! Union-variant representation of parallel lane trees (design of
-//! 2026-07). All lanes live in ONE tree keyed by real path. At each file
-//! path its distinct versions are stored, and — crucially — a version's
-//! **content** and its **(mode, lane-bitmap)** live in SEPARATE sibling
-//! keys, so adding a lane rewrites only the small bitmap sibling, never
-//! the content node (the content stays byte-identical, so the reverse
-//! delta and zstd both stay small). A file identical across all lanes is
-//! a single version whose bitmap names every lane — stored uniformly, no
-//! "equal vs differs" special case.
+//! Union-variant encoding of parallel lane trees, and the streaming
+//! encoder that produces a revision's frame WITHOUT ever materializing a
+//! combined tree.
 //!
-//! Layout at a file path `P` (a node with only `\0`-led children):
-//!   * `\0v<idx>` → a node whose blob IS the version's content, nothing
+//! ## The representation
+//!
+//! All lanes live in ONE tree keyed by real path. At a file path its
+//! distinct versions are stored, and a version's **content** and its
+//! **(attrs, lane-bitmap)** live in SEPARATE sibling keys so that adding a
+//! lane rewrites only the small bitmap, never the content:
+//!   * `\0v<idx>` — a node whose blob IS the version's content, nothing
 //!     else. Byte-stable across lane-membership changes.
-//!   * `\0m<idx>` → a node with no blob, attrs `{mode, lanes}` — the
-//!     version's mode and lane bitmap. This is the only thing a new lane
-//!     touches.
+//!   * `\0m<idx>` — a node with no blob; attrs = the file's whole attr set
+//!     plus a private `\0lanes` bitmap. The only thing a new lane touches.
 //! Directories are ordinary real-name nodes. Git forbids empty
 //! directories, so a node's children are either real names (a directory)
-//! or `\0`-led keys (a file's versions) — never ambiguous; a file-vs-dir
-//! clash across lanes is representable (version children for the file
-//! lanes + real-name children for the directory lanes).
+//! or `\0`-led keys (a file's versions) — never ambiguous, and a
+//! file-in-one-lane / dir-in-another clash is representable (both kinds of
+//! child coexist). A lane is pulled back out with [`extract`], which at
+//! each file picks the one version whose bitmap has that lane's bit.
 //!
-//! `union` builds the treewide structure while grouping, per path, the
-//! objects at that path into (mode, content) versions with lane bitmaps;
-//! `extract` walks the union and at each file picks the one version whose
-//! bitmap has the wanted lane's bit — giving that lane's git tree back
-//! exactly (round-trip property tests below). No base, no delta-of-delta,
-//! no base-switching.
+//! ## The encoder
+//!
+//! A revision's frame is a depot reverse delta between two states — the
+//! union at revision `i` and at `i-1`. [`reverse_delta`] computes that
+//! delta by walking the two states' per-lane git trees in lockstep and
+//! emitting only what differs, never building either union tree. Because
+//! exactly one lane advances per revision, every path where that lane did
+//! not move has identical lanes in both states and is pruned in O(1) by
+//! [`lanes_equal`]; the record ends up proportional to the real churn. No
+//! base, no delta-of-delta, no base-switching.
 
-use depot::{Attrs, Bytes, Name, View};
-use std::collections::BTreeMap;
+use depot::{Anchor, Attrs, BlobOp, Bytes, Layer, Name, Node, Presence, View};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Marker byte leading every non-path key. Real git path segments never
@@ -36,10 +39,10 @@ use std::sync::Arc;
 const VAR: u8 = 0;
 const CONTENT: u8 = b'v';
 const META: u8 = b'm';
-/// Attr on a `\0m<idx>` node: the version's lane bitmap. Leads with `\0`
-/// so it can never collide with a real git attr (git attrs — `mode` and
-/// any future addition — are plain ASCII), letting the meta node carry
-/// the file's whole attr set verbatim alongside the bitmap.
+/// Attr on a `\0m<idx>` node: the version's lane bitmap. Leads with `\0` so
+/// it can never collide with a real git attr (git attrs — `mode` and any
+/// future addition — are plain ASCII), letting the meta node carry the
+/// file's whole attr set verbatim alongside the bitmap.
 const LANES: &[u8] = b"\0lanes";
 
 fn content_key(idx: u32) -> Name {
@@ -68,81 +71,175 @@ fn bit(bm: &[u8], i: usize) -> bool {
     byte < bm.len() && (bm[byte] >> (i % 8)) & 1 == 1
 }
 
-/// Build the union-variant tree of `lanes` (`lanes[i]` = lane i's git tree,
-/// or `None`). `None` if no lane is present.
-pub fn union(lanes: &[Option<View>]) -> Option<View> {
-    let refs: Vec<Option<&View>> = lanes.iter().map(Option::as_ref).collect();
-    union_node(&refs)
+// -------------------------------------------------------------- encoder
+
+/// One version at a path: a distinct `(attrs, content)` and the bitmap of
+/// lanes that carry it — built locally by the walk, never stored as a tree.
+struct Version {
+    attrs: Attrs,
+    content: Bytes,
+    bitmap: Vec<u8>,
 }
 
-fn union_node(lanes: &[Option<&View>]) -> Option<View> {
-    // A version = a distinct (attrs, content); its value is the lane bitmap.
-    let mut versions: BTreeMap<(Attrs, Bytes), Vec<u8>> = BTreeMap::new();
-    // One sorted cursor per lane that is a directory here; a k-way merge
-    // over these walks every child name across all lanes in lockstep,
-    // linear in total entries — no per-name re-lookup per lane.
-    type Cursor<'a> = std::iter::Peekable<Box<dyn Iterator<Item = (&'a Name, &'a Arc<View>)> + 'a>>;
-    let mut cursors: Vec<Cursor> = Vec::with_capacity(lanes.len());
-    let empty = || -> Cursor { (Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>).peekable() };
-    let mut any = false;
-    for v in lanes {
-        let Some(v) = v else {
-            cursors.push(empty()); // absent lane: contributes nothing here
-            continue;
-        };
-        any = true;
-        if let Some(content) = &v.blob {
-            set_bit(versions.entry((v.attrs.clone(), content.clone())).or_default(), cursors.len());
-            cursors.push(empty()); // a file has no child names to merge
-        } else {
-            cursors.push((Box::new(v.children.iter()) as Box<dyn Iterator<Item = _>>).peekable());
-        }
+impl Version {
+    /// The `\0v<idx>` content leaf View.
+    fn content_leaf(&self) -> View {
+        View { blob: Some(self.content.clone()), attrs: Attrs::new(), children: BTreeMap::new() }
     }
-    if !any {
-        return None;
+    /// The `\0m<idx>` meta leaf View: file attrs + the lane bitmap.
+    fn meta_leaf(&self) -> View {
+        let mut attrs = self.attrs.clone();
+        attrs.insert(LANES.to_vec(), self.bitmap.clone());
+        View { blob: None, attrs, children: BTreeMap::new() }
     }
-    let mut children: BTreeMap<Name, Arc<View>> = BTreeMap::new();
-    for (idx, ((file_attrs, content), bm)) in versions.into_iter().enumerate() {
-        let idx = idx as u32;
-        // Content node: blob only, byte-stable across lane changes.
-        children.insert(
-            content_key(idx),
-            Arc::new(View { blob: Some(content), attrs: Attrs::new(), children: BTreeMap::new() }),
-        );
-        // Meta sibling: the file's whole attr set + bitmap. Adding a lane
-        // rewrites only the bitmap; the file attrs travel verbatim so the
-        // round-trip is exact for any attrs, not just `mode`.
-        let mut attrs = file_attrs;
-        attrs.insert(LANES.to_vec(), bm);
-        children.insert(
-            meta_key(idx),
-            Arc::new(View { blob: None, attrs, children: BTreeMap::new() }),
-        );
-    }
-    // K-way merge: repeatedly take the smallest name any cursor sits on,
-    // gather that name's subtree from every lane parked on it (advancing
-    // only those cursors), and recurse.
-    loop {
-        let Some(name) = cursors.iter_mut().filter_map(|c| c.peek().map(|(n, _)| *n)).min().cloned()
-        else {
-            break;
-        };
-        let sub: Vec<Option<&View>> = cursors
-            .iter_mut()
-            .map(|c| match c.peek() {
-                Some((n, _)) if **n == name => c.next().map(|(_, v)| Arc::as_ref(v)),
-                _ => None,
-            })
-            .collect();
-        if let Some(u) = union_node(&sub) {
-            children.insert(name, Arc::new(u));
-        }
-    }
-    Some(View { blob: None, attrs: Attrs::new(), children })
 }
 
-/// Reconstruct lane `l`'s git tree. A present lane contributing nothing at
-/// the root is the empty tree, so the top level returns that, not "absent".
+/// Group the file-lanes at one path into ordered versions (sorted by
+/// `(attrs, content)` so the index is deterministic), each with its lane
+/// bitmap. Directory-lanes and absent lanes contribute nothing here.
+fn versions_at(lanes: &[Option<&View>]) -> Vec<Version> {
+    let mut by_key: BTreeMap<(Attrs, Bytes), Vec<u8>> = BTreeMap::new();
+    for (i, v) in lanes.iter().enumerate() {
+        if let Some(v) = v {
+            if let Some(content) = &v.blob {
+                set_bit(by_key.entry((v.attrs.clone(), content.clone())).or_default(), i);
+            }
+        }
+    }
+    by_key
+        .into_iter()
+        .map(|((attrs, content), bitmap)| Version { attrs, content, bitmap })
+        .collect()
+}
+
+/// The sorted set of real (directory) child names across the dir-lanes at
+/// one path.
+fn dir_names(lanes: &[Option<&View>]) -> BTreeSet<Name> {
+    let mut names = BTreeSet::new();
+    for v in lanes.iter().flatten() {
+        if v.blob.is_none() {
+            names.extend(v.children.keys().cloned());
+        }
+    }
+    names
+}
+
+/// Each lane's child View at `name` (only dir-lanes that have it), with
+/// lane indices preserved so the recursion stays aligned.
+fn sub_at<'a>(lanes: &[Option<&'a View>], name: &[u8]) -> Vec<Option<&'a View>> {
+    lanes
+        .iter()
+        .map(|v| v.and_then(|v| if v.blob.is_none() { v.children.get(name).map(Arc::as_ref) } else { None }))
+        .collect()
+}
+
+/// True iff every lane presents the identical View (by pointer or value) in
+/// both states — then the whole union subtree here is unchanged and the
+/// walk prunes it without descending. Pointer equality gives the O(1) skip
+/// that makes a one-lane-advance revision cost O(its own churn).
+fn lanes_equal(base: &[Option<&View>], target: &[Option<&View>]) -> bool {
+    base.len() == target.len()
+        && base.iter().zip(target).all(|(b, t)| match (b, t) {
+            (None, None) => true,
+            (Some(b), Some(t)) => std::ptr::eq(*b, *t) || b == t,
+            _ => false,
+        })
+}
+
+/// A leaf delta child reconstructing `target` from `base` (either may be
+/// absent). A `\0v`/`\0m` version node is a leaf, so this is a pure
+/// blob/attrs/tombstone op with no children.
+fn leaf_delta(base: Option<&View>, target: Option<&View>) -> Node {
+    match target {
+        None => Node::tombstone(), // gone in target → removed when rebuilt
+        Some(t) => {
+            if base == Some(t) {
+                return Node::keep(); // identity — pruned by the caller
+            }
+            Node {
+                presence: Presence::Live,
+                blob: match &t.blob {
+                    Some(bytes) => BlobOp::Set(bytes.clone()),
+                    None => BlobOp::Remove,
+                },
+                opaque: false,
+                // `Some` even when empty: the minimal existence witness, so a
+                // no-blob `\0m` node still materializes with its attrs.
+                attrs: Some(t.attrs.clone()),
+                anchor: Anchor::Lower,
+                children: BTreeMap::new(),
+            }
+        }
+    }
+}
+
+/// The depot reverse-delta [`Layer`] that turns `union(base)` into
+/// `union(target)`, computed by the lockstep lane walk — no union tree is
+/// ever built. `base[i]`/`target[i]` are lane `i`'s git tree (or `None`).
+/// The `f0` full frame is this with `base` all-`None`.
+pub fn reverse_delta(base: &[Option<View>], target: &[Option<View>]) -> Layer {
+    let b: Vec<Option<&View>> = base.iter().map(Option::as_ref).collect();
+    let t: Vec<Option<&View>> = target.iter().map(Option::as_ref).collect();
+    Layer { root: rdelta(&b, &t) }
+}
+
+/// The reverse-delta node at one path: turn `base`'s union node into
+/// `target`'s. Emits changed `\0v`/`\0m` version leaves and recurses into
+/// changed directory children. Only ever called with a `target` that still
+/// exists at this path (removal is decided by the parent), so its own root
+/// is never a tombstone.
+fn rdelta(base: &[Option<&View>], target: &[Option<&View>]) -> Node {
+    let mut node = Node::keep();
+    if lanes_equal(base, target) {
+        return node; // identity: nothing at or below this path changed
+    }
+
+    // Version leaves. idx is the sorted position, so a change to the version
+    // SET can shift indices and rewrite several leaves at this path — local
+    // and cheap, and reconstruction only needs the set internally consistent.
+    let bv = versions_at(base);
+    let tv = versions_at(target);
+    for idx in 0..bv.len().max(tv.len()) {
+        let i = idx as u32;
+        let (b, t) = (bv.get(idx), tv.get(idx));
+        let c = leaf_delta(b.map(Version::content_leaf).as_ref(), t.map(Version::content_leaf).as_ref());
+        if !c.is_identity() {
+            node.children.insert(content_key(i), c);
+        }
+        let m = leaf_delta(b.map(Version::meta_leaf).as_ref(), t.map(Version::meta_leaf).as_ref());
+        if !m.is_identity() {
+            node.children.insert(meta_key(i), m);
+        }
+    }
+
+    // Directory children over the union of real names in both states.
+    // Removal (present in base, gone in target) is decided HERE and emitted
+    // as a tombstone, so a child's own `rdelta` is only ever called with a
+    // still-present target.
+    let mut names = dir_names(base);
+    names.extend(dir_names(target));
+    for name in names {
+        let bs = sub_at(base, &name);
+        let ts = sub_at(target, &name);
+        let t_present = ts.iter().any(Option::is_some);
+        let b_present = bs.iter().any(Option::is_some);
+        if b_present && !t_present {
+            node.children.insert(name, Node::tombstone());
+        } else if t_present {
+            let child = rdelta(&bs, &ts);
+            if !child.is_identity() {
+                node.children.insert(name, child);
+            }
+        }
+    }
+    node
+}
+
+// ------------------------------------------------------------ extract
+
+/// Reconstruct lane `l`'s git tree from a materialized union View. A
+/// present lane contributing nothing at the root is the empty tree, so the
+/// top level returns that, not "absent".
 pub fn extract(u: &View, l: usize) -> View {
     extract_node(u, l).unwrap_or_default()
 }
@@ -154,15 +251,9 @@ fn extract_node(u: &View, l: usize) -> Option<View> {
             if meta.attrs.get(LANES).is_some_and(|bm| bit(bm, l)) {
                 let idx = u32::from_be_bytes(key[2..].try_into().ok()?);
                 let content = u.children.get(&content_key(idx))?;
-                // The file's attrs are everything on the meta node except
-                // our private bitmap key.
                 let mut attrs = meta.attrs.clone();
-                attrs.remove(LANES);
-                return Some(View {
-                    blob: content.blob.clone(),
-                    attrs,
-                    children: BTreeMap::new(),
-                });
+                attrs.remove(LANES); // the file's attrs, minus our private key
+                return Some(View { blob: content.blob.clone(), attrs, children: BTreeMap::new() });
             }
         }
     }
@@ -182,6 +273,8 @@ fn extract_node(u: &View, l: usize) -> Option<View> {
     }
 }
 
+// --------------------------------------------------------------- tests
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,15 +288,21 @@ mod tests {
         View {
             blob: None,
             attrs: Attrs::new(),
-            children: entries
-                .iter()
-                .map(|(n, v)| (n.as_bytes().to_vec(), Arc::new(v.clone())))
-                .collect(),
+            children: entries.iter().map(|(n, v)| (n.as_bytes().to_vec(), Arc::new(v.clone()))).collect(),
         }
     }
+    fn some(lanes: &[View]) -> Vec<Option<View>> {
+        lanes.iter().cloned().map(Some).collect()
+    }
+
+    /// The union View as it only ever exists in practice: the result of
+    /// applying the `f0` full frame (base = all absent). Never built directly.
+    fn union_view(lanes: &[Option<View>]) -> Option<View> {
+        let none: Vec<Option<View>> = vec![None; lanes.len()];
+        depot::apply(None, &reverse_delta(&none, lanes))
+    }
     fn assert_roundtrip(lanes: &[View]) {
-        let opt: Vec<Option<View>> = lanes.iter().cloned().map(Some).collect();
-        let u = union(&opt).expect("non-empty");
+        let u = union_view(&some(lanes)).expect("non-empty");
         for (i, want) in lanes.iter().enumerate() {
             assert_eq!(&extract(&u, i), want, "lane {i} mis-reconstructed");
         }
@@ -234,7 +333,10 @@ mod tests {
     }
     #[test]
     fn mode_difference_is_a_distinct_version() {
-        assert_roundtrip(&[dir(&[("s", leaf("#!/bin/sh", "100644"))]), dir(&[("s", leaf("#!/bin/sh", "100755"))])]);
+        assert_roundtrip(&[
+            dir(&[("s", leaf("#!/bin/sh", "100644"))]),
+            dir(&[("s", leaf("#!/bin/sh", "100755"))]),
+        ]);
     }
     #[test]
     fn file_in_one_lane_dir_in_another() {
@@ -246,7 +348,7 @@ mod tests {
     fn empty_tree_lane_round_trips() {
         let empty = View::default();
         let full = dir(&[("a", leaf("a", "100644"))]);
-        let u = union(&[Some(empty.clone()), Some(full.clone())]).unwrap();
+        let u = union_view(&some(&[empty.clone(), full.clone()])).unwrap();
         assert_eq!(extract(&u, 0), empty);
         assert_eq!(extract(&u, 1), full);
     }
@@ -261,10 +363,6 @@ mod tests {
             .collect();
         assert_roundtrip(&lanes);
     }
-
-    /// A file with no attrs round-trips to no attrs (not `{mode:[]}`), and
-    /// an arbitrary extra attr survives — the meta node carries the whole
-    /// attr set verbatim, so the contract holds beyond just `mode`.
     #[test]
     fn arbitrary_attrs_round_trip_exactly() {
         let bare = View { blob: Some("x".as_bytes().into()), attrs: Attrs::new(), children: BTreeMap::new() };
@@ -275,17 +373,60 @@ mod tests {
         assert_roundtrip(&[dir(&[("bare", bare)]), dir(&[("bare", rich)])]);
     }
 
-    /// The point of the split: adding a lane leaves every CONTENT node
-    /// byte-identical — only the bitmap (meta) siblings change.
+    /// A real two-state transition — the encoder's actual job. Build the
+    /// newest state as `f0`, then the reverse delta to the older state, and
+    /// reconstruct BOTH by applying the chain newest-first. Exercises the
+    /// walk's pruning and the version reindex on a changed path.
+    fn assert_transition(older: &[View], newer: &[View]) {
+        let (o, n) = (some(older), some(newer));
+        let f0 = reverse_delta(&vec![None; n.len()], &n);
+        let rec = reverse_delta(&n, &o); // base = newer, target = older
+        // Newest state from f0.
+        let u_new = depot::apply(None, &f0).expect("f0 non-empty");
+        for (i, want) in newer.iter().enumerate() {
+            assert_eq!(&extract(&u_new, i), want, "newer lane {i}");
+        }
+        // Older state by applying the reverse delta on top.
+        let u_old = depot::apply(Some(&u_new), &rec).expect("older non-empty");
+        for (i, want) in older.iter().enumerate() {
+            assert_eq!(&extract(&u_old, i), want, "older lane {i}");
+        }
+    }
+
+    #[test]
+    fn transition_one_lane_advances() {
+        // Two lanes; between states only lane 1's `diff` file moves. Lane 0
+        // and the shared file are byte-identical, so the walk prunes them.
+        let older = [
+            dir(&[("same", leaf("x", "100644")), ("d", leaf("old", "100644"))]),
+            dir(&[("same", leaf("x", "100644")), ("d", leaf("l1-old", "100644"))]),
+        ];
+        let newer = [
+            dir(&[("same", leaf("x", "100644")), ("d", leaf("old", "100644"))]),
+            dir(&[("same", leaf("x", "100644")), ("d", leaf("l1-new", "100644"))]),
+        ];
+        assert_transition(&older, &newer);
+    }
+
+    #[test]
+    fn transition_add_and_remove_paths() {
+        // A file appears in one state and a whole subdir disappears — checks
+        // the add (Set) and the parent-level tombstone removal paths.
+        let older = [dir(&[("keep", leaf("k", "100644")), ("gone", dir(&[("f", leaf("f", "100644"))]))])];
+        let newer = [dir(&[("keep", leaf("k", "100644")), ("added", leaf("a", "100644"))])];
+        assert_transition(&older, &newer);
+    }
+
+    /// Adding a lane leaves every CONTENT node byte-identical — only the
+    /// bitmap (meta) siblings change.
     #[test]
     fn adding_a_lane_touches_only_bitmaps_not_content() {
         let a = dir(&[("f", leaf("shared", "100644")), ("g", leaf("A", "100644"))]);
         let b = dir(&[("f", leaf("shared", "100644")), ("g", leaf("B", "100644"))]);
         let c = dir(&[("f", leaf("shared", "100644")), ("g", leaf("A", "100644"))]); // == a's g
-        let before = union(&[Some(a.clone()), Some(b.clone())]).unwrap();
-        let after = union(&[Some(a.clone()), Some(b.clone()), Some(c.clone())]).unwrap();
+        let before = union_view(&some(&[a.clone(), b.clone()])).unwrap();
+        let after = union_view(&some(&[a.clone(), b.clone(), c.clone()])).unwrap();
 
-        // Collect every content node (\0v*) keyed by its variant slot.
         fn contents(v: &View, path: Vec<u8>, out: &mut BTreeMap<Vec<u8>, Option<Bytes>>) {
             for (k, ch) in &v.children {
                 let mut p = path.clone();
@@ -297,16 +438,10 @@ mod tests {
                 }
             }
         }
-        let mut cb = BTreeMap::new();
-        let mut ca = BTreeMap::new();
+        let (mut cb, mut ca) = (BTreeMap::new(), BTreeMap::new());
         contents(&before, vec![], &mut cb);
         contents(&after, vec![], &mut ca);
-        // Every content node present before is byte-identical after (adding
-        // lane c introduced no new content — it reused a's version of g and
-        // the shared f — so the content maps are equal).
         assert_eq!(cb, ca, "adding a lane changed content nodes, not just bitmaps");
-
-        // And it still round-trips.
         for (i, want) in [&a, &b, &c].iter().enumerate() {
             assert_eq!(&extract(&after, i), *want);
         }
