@@ -92,7 +92,7 @@ fn multi_cold_frame_roundtrip_is_sha_exact() {
 
     let dir = tmp.path().join("store");
     {
-        gitdepot::lanestore::LaneStore::encode_repo_variant(&repo, &dir, 3).unwrap();
+        gitdepot::lanestore::LaneStore::encode_repo_union(&repo, &dir, 3).unwrap();
     }
     let store = gitdepot::lanestore::LaneStore::open(&dir).unwrap();
 

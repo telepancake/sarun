@@ -1,28 +1,20 @@
 //! Branch-lane topology — the model's lane layer (see
 //! `gimir/notes/branch-lane-model.md`). Pure functions, no store I/O:
 //! given a commit DAG and per-lane content, assign each commit to a
-//! lane and cluster live lanes into variant groups. Nothing here reads
+//! lane, and remap lane ids to a compact reused space. Nothing here reads
 //! or writes the depot; the caller (ingest) maps its shas to indices,
 //! runs these, and encodes the result.
 //!
-//! Two settled properties this file is the home of:
+//! * **Append-only lane assignment.** [`assign_lanes`] freezes a commit's
+//!   lane from its first parent's (already-frozen) lane: it continues that
+//!   lane if no earlier-processed sibling already took it, else opens a
+//!   fresh one. Ids are minted monotonically in processing order.
 //!
-//! * **Append-only lane assignment.** A commit's lane is frozen at
-//!   ingest from its first parent's (already-frozen) lane: it continues
-//!   that lane if no earlier-processed sibling already took it, else it
-//!   opens a fresh lane. Lane ids are minted monotonically in
-//!   processing order, so running the assignment over a prefix and then
-//!   over the whole DAG agrees on every shared commit — new history only
-//!   ever appends lanes, never renumbers old ones. A ref tracks a lane
-//!   purely by pointing at a commit whose lane is fixed forever.
-//!
-//! * **Variant grouping is encode-time policy, not format.** The
-//!   similarity metric, the cutoff, and the base pick live behind
-//!   [`cluster_variants`]; the store records only the outcome (a base
-//!   lane id per group). Swapping the policy changes future encodes, not
-//!   the format or any written frame.
+//! * **Compaction with reuse.** [`compact_lanes`] then remaps those
+//!   monotonic ids to a compact space, reusing a lane's index once it dies,
+//!   so a bitmap over live lanes is only as wide as the peak concurrent
+//!   count — not the total lanes ever minted.
 
-use std::collections::{HashMap, HashSet};
 
 /// A lane id: monotonic, frozen at birth, never reused.
 pub type LaneId = u32;
@@ -128,77 +120,9 @@ pub fn compact_lanes(birth: &[usize], death: &[usize], n_rev: usize) -> (Vec<Lan
     (compact, next as usize)
 }
 
-/// A variant group: a `base` lane and the `variants` stored as deltas
-/// against it. An independent lane is a singleton group (`variants`
-/// empty, it is its own base).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VariantGroup {
-    pub base: LaneId,
-    pub variants: Vec<LaneId>,
-}
-
-/// Cluster live lanes into variant groups by blob-oid overlap.
-///
-/// `blob_sets[l]` is lane `l`'s set of blob oids at the revision being
-/// grouped. Two lanes are variants when their Jaccard overlap exceeds
-/// `cutoff`. Greedy and deterministic: lanes are considered in ascending
-/// id, each joins the first existing group whose base it overlaps past
-/// the cutoff, else it opens a new group as its own base (lowest id in a
-/// group is the base — stable across incremental runs, so a group does
-/// not needlessly reframe).
-///
-/// This whole function is the policy seam (see module docs): metric,
-/// cutoff, and base pick are here and only here, and the store keeps
-/// only the resulting base ids.
-pub fn cluster_variants(
-    live: &[LaneId],
-    blob_sets: &HashMap<LaneId, HashSet<Vec<u8>>>,
-    cutoff: f64,
-) -> Vec<VariantGroup> {
-    let mut groups: Vec<VariantGroup> = Vec::new();
-    let mut order = live.to_vec();
-    order.sort_unstable();
-    for lane in order {
-        let empty = HashSet::new();
-        let s = blob_sets.get(&lane).unwrap_or(&empty);
-        let mut placed = false;
-        for g in groups.iter_mut() {
-            let bs = blob_sets.get(&g.base).unwrap_or(&empty);
-            if jaccard(s, bs) > cutoff {
-                g.variants.push(lane);
-                placed = true;
-                break;
-            }
-        }
-        if !placed {
-            groups.push(VariantGroup { base: lane, variants: Vec::new() });
-        }
-    }
-    groups
-}
-
-/// Jaccard overlap of two oid sets. Two empty sets are identical (1.0);
-/// an empty set against a non-empty one shares nothing (0.0).
-fn jaccard(a: &HashSet<Vec<u8>>, b: &HashSet<Vec<u8>>) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
-    let inter = a.iter().filter(|x| b.contains(*x)).count();
-    let union = a.len() + b.len() - inter;
-    if union == 0 {
-        0.0
-    } else {
-        inter as f64 / union as f64
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn oids(items: &[&str]) -> HashSet<Vec<u8>> {
-        items.iter().map(|s| s.as_bytes().to_vec()).collect()
-    }
 
     #[test]
     fn compact_reuses_freed_indices() {
@@ -295,39 +219,4 @@ mod tests {
         assert_eq!(after.n_lanes(), 1);
     }
 
-    #[test]
-    fn variants_cluster_independents_stand_alone() {
-        // Lanes 0 and 1 share most blobs (variants); lane 2 shares
-        // nothing (independent).
-        let mut sets = HashMap::new();
-        sets.insert(0u32, oids(&["a", "b", "c", "d"]));
-        sets.insert(1u32, oids(&["a", "b", "c", "e"])); // 3/5 with lane 0
-        sets.insert(2u32, oids(&["x", "y", "z"]));
-        let g = cluster_variants(&[0, 1, 2], &sets, 0.5);
-        assert_eq!(g.len(), 2);
-        assert_eq!(g[0], VariantGroup { base: 0, variants: vec![1] });
-        assert_eq!(g[1], VariantGroup { base: 2, variants: vec![] });
-    }
-
-    #[test]
-    fn clustering_base_is_lowest_id_and_deterministic() {
-        let mut sets = HashMap::new();
-        sets.insert(5u32, oids(&["a", "b", "c"]));
-        sets.insert(2u32, oids(&["a", "b", "c"])); // identical
-        sets.insert(9u32, oids(&["a", "b", "c"]));
-        let g = cluster_variants(&[9, 5, 2], &sets, 0.5);
-        assert_eq!(g.len(), 1);
-        assert_eq!(g[0].base, 2); // lowest id, regardless of input order
-        assert_eq!(g[0].variants, vec![5, 9]);
-    }
-
-    #[test]
-    fn empty_trees_are_identical_not_independent() {
-        let mut sets = HashMap::new();
-        sets.insert(0u32, HashSet::new());
-        sets.insert(1u32, HashSet::new());
-        let g = cluster_variants(&[0, 1], &sets, 0.5);
-        assert_eq!(g.len(), 1);
-        assert_eq!(g[0], VariantGroup { base: 0, variants: vec![1] });
-    }
 }

@@ -38,9 +38,11 @@ impl Ent {
 }
 
 /// The git object store, addressed by oid. `tree` yields a directory's
-/// entries; `blob` yields a leaf's raw content.
+/// entries (a shared handle — implementations cache parsed trees by oid so
+/// a content-addressed tree is fetched once, not re-read per traversal);
+/// `blob` yields a leaf's raw content (not cached — fetched only to emit).
 pub trait Objects {
-    fn tree(&mut self, oid: &str) -> Result<Vec<(Name, Ent)>>;
+    fn tree(&mut self, oid: &str) -> Result<std::sync::Arc<Vec<(Name, Ent)>>>;
     fn blob(&mut self, oid: &str) -> Result<Bytes>;
 }
 
@@ -187,11 +189,11 @@ fn advance_node(skel: &mut Skel, trans: &[Trans], obj: &mut dyn Objects) -> Resu
             }
         }
         let om: BTreeMap<Name, Ent> = match od {
-            Some(e) => obj.tree(&e.oid)?.into_iter().collect(),
+            Some(e) => obj.tree(&e.oid)?.iter().cloned().collect(),
             None => BTreeMap::new(),
         };
         let nm: BTreeMap<Name, Ent> = match nd {
-            Some(e) => obj.tree(&e.oid)?.into_iter().collect(),
+            Some(e) => obj.tree(&e.oid)?.iter().cloned().collect(),
             None => BTreeMap::new(),
         };
         let names: BTreeSet<&Name> = om.keys().chain(nm.keys()).collect();
@@ -224,29 +226,19 @@ fn advance_node(skel: &mut Skel, trans: &[Trans], obj: &mut dyn Objects) -> Resu
     Ok(out)
 }
 
-/// Forward full node — build the current skeleton state from the empty base
-/// (fetching each live variant's content). The `f0`/seal head.
-fn full_node(skel: &Skel, obj: &mut dyn Objects) -> Result<Node> {
-    let mut out = Node::keep();
+/// Materialize the current skeleton state as the union View (fetching each
+/// live variant's content). The `f0`/seal head is then `diff(None, view)` —
+/// see [`Encoder::full`] for why it is produced that way.
+fn full_view(skel: &Skel, obj: &mut dyn Objects) -> Result<View> {
+    let mut children: BTreeMap<Name, std::sync::Arc<View>> = BTreeMap::new();
     for (slot, occ) in skel.slots.iter() {
-        let c = leaf_delta(None, Some(&occ_content(obj, occ)?));
-        if !c.is_identity() {
-            out.children.insert(content_key(slot), c);
-        }
-        let m = leaf_delta(None, Some(&occ_meta(occ)));
-        if !m.is_identity() {
-            out.children.insert(meta_key(slot), m);
-        }
+        children.insert(content_key(slot), std::sync::Arc::new(occ_content(obj, occ)?));
+        children.insert(meta_key(slot), std::sync::Arc::new(occ_meta(occ)));
     }
-    // deterministic order (BTreeMap already sorted)
-    let names: Vec<Name> = skel.children.keys().cloned().collect();
-    for name in names {
-        let cn = full_node(&skel.children[&name], obj)?;
-        if !cn.is_identity() {
-            out.children.insert(name, cn);
-        }
+    for (name, child) in &skel.children {
+        children.insert(name.clone(), std::sync::Arc::new(full_view(child, obj)?));
     }
-    Ok(out)
+    Ok(View { blob: None, attrs: Attrs::new(), children })
 }
 
 fn is_file(e: Option<&Ent>) -> bool {
@@ -278,9 +270,12 @@ impl Encoder {
     }
 
     /// The forward full delta of the current state — the `f0` head and every
-    /// seal boundary (fetches the whole current tree's blobs).
+    /// seal boundary. Produced as `diff(None, materialized-view)` (not by
+    /// emitting nodes directly) so it is byte-identical to the anchor the
+    /// reader recomputes for a cold frame — `diff(None, reconstructed-view)`.
+    /// Any non-canonical divergence there fails the frame's refPrefix check.
     pub fn full(&self, obj: &mut dyn Objects) -> Result<Layer> {
-        Ok(Layer { root: full_node(&self.root, obj)? })
+        Ok(depot::diff(None, Some(&full_view(&self.root, obj)?)))
     }
 }
 
@@ -297,8 +292,8 @@ mod tests {
         blobs: HashMap<String, Bytes>,
     }
     impl Objects for Mem {
-        fn tree(&mut self, oid: &str) -> Result<Vec<(Name, Ent)>> {
-            Ok(self.trees.get(oid).cloned().unwrap_or_default())
+        fn tree(&mut self, oid: &str) -> Result<std::sync::Arc<Vec<(Name, Ent)>>> {
+            Ok(std::sync::Arc::new(self.trees.get(oid).cloned().unwrap_or_default()))
         }
         fn blob(&mut self, oid: &str) -> Result<Bytes> {
             Ok(self.blobs.get(oid).cloned().unwrap_or_else(|| Bytes::from(&b""[..])))
