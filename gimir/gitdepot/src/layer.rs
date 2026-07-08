@@ -58,7 +58,7 @@ pub const TAG_SYMLINK: &[u8] = b"l";
 pub const TAG_GITLINK: &[u8] = b"m";
 
 /// A git file mode, reduced to the four cases the mode tags encode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Mode {
     /// `100644` — a normal file (no tag).
     File,
@@ -278,6 +278,185 @@ pub fn delta_single_lane(
     for path in om.keys() {
         if !nm.contains_key(path) {
             put_variant(&mut root, path, 0, depot::Node::hole());
+        }
+    }
+    depot::codec::encode(&depot::Layer { root })
+}
+
+// ----------------------------------------------------- multi-lane reslot
+
+use std::collections::{BTreeMap, BTreeSet};
+
+/// A git object id, opaque here — the reslot matches variants by it and never
+/// hashes stored content (§3). Tests use synthetic ids.
+pub type Oid = Vec<u8>;
+
+/// One lane's view of a path: the git mode, the tree entry's oid, and the file
+/// content (needed only when a genuinely new variant must be written).
+#[derive(Clone, Debug)]
+pub struct LaneEntry {
+    pub mode: Mode,
+    pub oid: Oid,
+    pub content: Vec<u8>,
+}
+
+/// A lane = one commit's tree, as `path -> entry` (paths `/`-separated, no
+/// leading slash). Absent path ⇒ file not in that lane.
+pub type LaneTree = BTreeMap<Vec<u8>, LaneEntry>;
+
+/// Canonical little-endian bitmap bytes for a lane set: bit `l` = lane `l`, no
+/// trailing zero byte (the highest set bit lands in the last byte). An empty
+/// set ⇒ empty slice.
+fn bitmap_bytes(set: &BTreeSet<u32>) -> Vec<u8> {
+    let mut v = Vec::new();
+    for &l in set {
+        let byte = (l / 8) as usize;
+        while v.len() <= byte {
+            v.push(0);
+        }
+        v[byte] |= 1 << (l % 8);
+    }
+    v
+}
+
+/// A file variant's identity: the git tree entry's `(mode, oid)`. The SAME
+/// blob appearing as a plain vs an executable file (a chmod) is TWO tree
+/// entries → two variants, so mode is part of the identity, not just oid.
+type VarId = (Mode, Oid);
+
+/// Group `lanes` into per-path variants: `path -> [(id, content, laneset)]` in
+/// first-appearance order (lane order). All lanes sharing a `(mode, oid)` at a
+/// path are ONE variant (that is what makes them one variant).
+fn union_groups(lanes: &[LaneTree]) -> BTreeMap<Vec<u8>, Vec<(VarId, Vec<u8>, BTreeSet<u32>)>> {
+    let mut out: BTreeMap<Vec<u8>, Vec<(VarId, Vec<u8>, BTreeSet<u32>)>> = BTreeMap::new();
+    for (j, tree) in lanes.iter().enumerate() {
+        let j = j as u32;
+        for (path, e) in tree {
+            let id: VarId = (e.mode, e.oid.clone());
+            let groups = out.entry(path.clone()).or_default();
+            match groups.iter_mut().find(|(gid, ..)| *gid == id) {
+                Some((_, _, set)) => {
+                    set.insert(j);
+                }
+                None => {
+                    let mut set = BTreeSet::new();
+                    set.insert(j);
+                    groups.push((id, e.content.clone(), set));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build the full-state (refPrefix seed) for a multi-lane frame: every path's
+/// variants stored as siblings, slot = first-appearance rank, bitmap omitted
+/// when it covers all lanes (all-ones → every live lane). Built once per frame;
+/// subsequent layers are deltas via [`delta_multi_lane`].
+pub fn encode_union(lanes: &[LaneTree]) -> Vec<u8> {
+    let n = lanes.len() as u32;
+    let groups = union_groups(lanes);
+    let mut root = depot::Node::keep();
+    for (path, variants) in &groups {
+        for (slot, ((mode, _oid), content, set)) in variants.iter().enumerate() {
+            let bm = (set.len() as u32 != n).then(|| bitmap_bytes(set));
+            put_variant(&mut root, path, slot as u32, variant_node(content, *mode, bm.as_deref()));
+        }
+    }
+    depot::codec::encode(&depot::Layer { root })
+}
+
+/// The current variants stored in `old_full`, per path: `(slot, oid, raw stored
+/// bitmap bytes)`. The oid is obtained for FREE from `old_lanes` — any lane in
+/// the variant's bitmap has this file at that oid — never by hashing the
+/// stored content (§3).
+fn current_variants(
+    old_full: &[u8],
+    old_lanes: &[LaneTree],
+) -> BTreeMap<Vec<u8>, Vec<(u32, VarId, Option<Vec<u8>>)>> {
+    let mut cur: BTreeMap<Vec<u8>, Vec<(u32, VarId, Option<Vec<u8>>)>> = BTreeMap::new();
+    visit_entries(old_full, |e| {
+        // A representative lane carrying this variant: the lowest set bit, or
+        // (bitmap omitted ⇒ all lanes) lane 0.
+        let rep = match e.bitmap {
+            Some(b) => (0..(b.len() * 8) as u32).find(|&i| b[(i / 8) as usize] & (1 << (i % 8)) != 0),
+            None => Some(0),
+        };
+        let oid = rep
+            .and_then(|l| old_lanes.get(l as usize))
+            .and_then(|t| t.get(e.path))
+            .map(|le| le.oid.clone())
+            .expect("a variant's representative lane must carry the file");
+        // mode comes from the stored variant (its mode tag), oid from the lane.
+        let id: VarId = (e.mode, oid);
+        cur.entry(e.path.to_vec()).or_default().push((e.slot, id, e.bitmap.map(|b| b.to_vec())));
+    })
+    .expect("old_full is canonical");
+    cur
+}
+
+/// The delta turning the multi-lane full-state `old_full` (whose variants are
+/// identified via `old_lanes`) into the union over `new_lanes`, matching
+/// variants by oid and keeping slots stable (§3):
+///
+/// - an oid present in both ⇒ same slot; emit ONLY a `lanes`-child update if
+///   the stored bitmap form changed (content/mode untouched — never re-fetched),
+///   else emit nothing (pruned);
+/// - an oid only in `new_lanes` ⇒ a fresh slot (past the max at that path) with
+///   its full variant node (the one place content is read from git);
+/// - an oid only in `old_full` ⇒ carried by no new lane ⇒ a hole at its slot.
+///
+/// `overlay_full(old_full, delta)` is the union over `new_lanes`: each new
+/// lane extracted from it reconstructs that lane's tree exactly.
+pub fn delta_multi_lane(old_full: &[u8], old_lanes: &[LaneTree], new_lanes: &[LaneTree]) -> Vec<u8> {
+    let new_n = new_lanes.len() as u32;
+    let newg = union_groups(new_lanes);
+    let cur = current_variants(old_full, old_lanes);
+
+    let mut root = depot::Node::keep();
+    let paths: BTreeSet<&Vec<u8>> = newg.keys().chain(cur.keys()).collect();
+    for path in paths {
+        let empty_c = Vec::new();
+        let empty_g = Vec::new();
+        let cvars = cur.get(path).unwrap_or(&empty_c);
+        let nvars = newg.get(path).unwrap_or(&empty_g);
+
+        let old_by_id: BTreeMap<&VarId, (u32, &Option<Vec<u8>>)> =
+            cvars.iter().map(|(s, id, bm)| (id, (*s, bm))).collect();
+        let new_ids: BTreeSet<&VarId> = nvars.iter().map(|(id, ..)| id).collect();
+        let mut next_slot = cvars.iter().map(|(s, ..)| *s + 1).max().unwrap_or(0);
+
+        for (id, content, set) in nvars {
+            let (mode, _oid) = id;
+            let bm = (set.len() as u32 != new_n).then(|| bitmap_bytes(set));
+            match old_by_id.get(id) {
+                Some((slot, old_bm)) => {
+                    if old_bm.as_deref() == bm.as_deref() {
+                        continue; // unchanged — pruned
+                    }
+                    // Minimal update: keep content/mode, rewrite only `lanes`.
+                    let mut node = depot::Node::keep();
+                    let child = match &bm {
+                        Some(b) => depot::Node {
+                            blob: depot::BlobOp::Set(b.as_slice().into()),
+                            ..depot::Node::keep()
+                        },
+                        None => depot::Node::hole(), // now all-ones ⇒ drop the child
+                    };
+                    node.children.insert(LANES.to_vec(), child);
+                    put_variant(&mut root, path, *slot, node);
+                }
+                None => {
+                    let slot = next_slot;
+                    next_slot += 1;
+                    put_variant(&mut root, path, slot, variant_node(content, *mode, bm.as_deref()));
+                }
+            }
+        }
+        for (slot, id, _) in cvars {
+            if !new_ids.contains(id) {
+                put_variant(&mut root, path, *slot, depot::Node::hole());
+            }
         }
     }
     depot::codec::encode(&depot::Layer { root })
@@ -550,6 +729,109 @@ mod tests {
         // The delta is a bare Keep root with no children.
         let empty = codec::encode(&Layer { root: Node::keep() });
         assert_eq!(delta, empty, "unchanged inputs produce an empty delta");
+    }
+
+    // ---- multi-lane reslot: extract each lane back, SHA-relevant oracle ----
+
+    fn lane(entries: &[(&[u8], Mode, &[u8], &[u8])]) -> LaneTree {
+        entries
+            .iter()
+            .map(|(p, m, oid, c)| (p.to_vec(), LaneEntry { mode: *m, oid: oid.to_vec(), content: c.to_vec() }))
+            .collect()
+    }
+
+    /// Reconstruct lane `j`'s tree from a union's bytes: at each path the sole
+    /// variant whose bitmap includes `j` (omitted bitmap ⇒ every lane).
+    fn view_lane(bytes: &[u8], j: u32) -> BTreeMap<Vec<u8>, (Mode, Vec<u8>)> {
+        let mut m = BTreeMap::new();
+        visit_entries(bytes, |e| {
+            let inl = match e.bitmap {
+                Some(b) => (b.get((j / 8) as usize).copied().unwrap_or(0) & (1 << (j % 8))) != 0,
+                None => true,
+            };
+            if inl {
+                m.insert(e.path.to_vec(), (e.mode, e.content.to_vec()));
+            }
+        })
+        .unwrap();
+        m
+    }
+
+    fn expect_lane(t: &LaneTree) -> BTreeMap<Vec<u8>, (Mode, Vec<u8>)> {
+        t.iter().map(|(p, e)| (p.clone(), (e.mode, e.content.clone()))).collect()
+    }
+
+    /// `encode_union` then extract every lane must reproduce each input tree.
+    #[test]
+    fn encode_union_reconstructs_every_lane() {
+        let lanes = vec![
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"B", b"B"), (b"c", Mode::File, b"C", b"C")]),
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"B2", b"B2"), (b"c", Mode::File, b"C", b"C")]),
+            lane(&[(b"a", Mode::Exec, b"A", b"A"), (b"c", Mode::File, b"C", b"C")]),
+        ];
+        let bytes = encode_union(&lanes);
+        for (j, t) in lanes.iter().enumerate() {
+            assert_eq!(view_lane(&bytes, j as u32), expect_lane(t), "lane {j}");
+        }
+    }
+
+    /// The multi-lane write invariant: `overlay_full(old_full, delta)` is the
+    /// union over `new_lanes` — extracting each new lane reconstructs its tree.
+    /// Exercises: bitmap grow (new lane joins a variant), variant appear (new
+    /// oid → fresh slot), variant vanish (oid in no new lane → hole), path
+    /// removed in one lane, and an all-ones prune.
+    #[test]
+    fn delta_multi_lane_overlays_to_new_union() {
+        let old_lanes = vec![
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"B", b"B"), (b"common", Mode::File, b"C", b"C")]),
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"B2", b"B2"), (b"common", Mode::File, b"C", b"C")]),
+        ];
+        let new_lanes = vec![
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"B", b"B"), (b"common", Mode::File, b"C", b"C")]),
+            lane(&[(b"b", Mode::File, b"B2", b"B2"), (b"common", Mode::File, b"C", b"C"), (b"d", Mode::File, b"D", b"D")]),
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"B", b"B"), (b"common", Mode::File, b"C2", b"C2")]),
+        ];
+        let old_full = encode_union(&old_lanes);
+        let delta = delta_multi_lane(&old_full, &old_lanes, &new_lanes);
+        let mut new_full = Vec::new();
+        depot::stream::overlay_full(&old_full, &delta, &mut new_full).unwrap();
+
+        for (j, t) in new_lanes.iter().enumerate() {
+            assert_eq!(view_lane(&new_full, j as u32), expect_lane(t), "lane {j}");
+        }
+        // It must match a from-scratch union of the new lanes (semantically):
+        let fresh = encode_union(&new_lanes);
+        for j in 0..new_lanes.len() as u32 {
+            assert_eq!(view_lane(&new_full, j), view_lane(&fresh, j), "lane {j} vs fresh");
+        }
+    }
+
+    /// An unchanged variant (`b2` in lane 1, same oid, same lane set) is pruned
+    /// — its slot appears nowhere in the delta.
+    #[test]
+    fn delta_multi_lane_prunes_unchanged() {
+        let old_lanes = vec![
+            lane(&[(b"b", Mode::File, b"B", b"B")]),
+            lane(&[(b"b", Mode::File, b"B2", b"B2")]),
+        ];
+        // Only lane 0's `b` changes; lane 1's `b` (oid B2, lane {1}) is untouched.
+        let new_lanes = vec![
+            lane(&[(b"b", Mode::File, b"BX", b"BX")]),
+            lane(&[(b"b", Mode::File, b"B2", b"B2")]),
+        ];
+        let old_full = encode_union(&old_lanes);
+        let delta = delta_multi_lane(&old_full, &old_lanes, &new_lanes);
+        // Reconstruct and check correctness first.
+        let mut new_full = Vec::new();
+        depot::stream::overlay_full(&old_full, &delta, &mut new_full).unwrap();
+        for (j, t) in new_lanes.iter().enumerate() {
+            assert_eq!(view_lane(&new_full, j as u32), expect_lane(t));
+        }
+        // The B2 variant kept slot 1 in old (B=slot0{0}, B2=slot1{1}); the delta
+        // must not touch slot 1 — only slot 0's content changed.
+        let mut slots = Vec::new();
+        visit_entries(&delta, |e| slots.push(e.slot)).unwrap();
+        assert!(!slots.contains(&1), "unchanged B2 (slot 1) must be pruned, saw {slots:?}");
     }
 
     #[test]
