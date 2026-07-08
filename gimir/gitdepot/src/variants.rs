@@ -78,9 +78,15 @@ pub(crate) fn leaf_delta(base: Option<&View>, target: Option<&View>) -> Node {
             }
             Node {
                 presence: Presence::Live,
-                blob: match &t.blob {
-                    Some(bytes) => BlobOp::Set(bytes.clone()),
-                    None => BlobOp::Remove,
+                // Match `depot::diff`'s canonical form exactly — the seal
+                // path recomputes a cold frame's anchor as `diff(None, cur)`
+                // and it MUST be byte-identical to the sealed full state, so
+                // a no-blob node over a no-blob base is `Keep`, not `Remove`
+                // (both reconstruct to no blob, but only `Keep` is canonical).
+                blob: match (&t.blob, base.and_then(|b| b.blob.as_ref())) {
+                    (Some(bytes), _) => BlobOp::Set(bytes.clone()),
+                    (None, Some(_)) => BlobOp::Remove, // base had a blob → drop it
+                    (None, None) => BlobOp::Keep,       // neither has a blob (a `\0m` node)
                 },
                 opaque: false,
                 // `Some` even when empty: the minimal existence witness, so a

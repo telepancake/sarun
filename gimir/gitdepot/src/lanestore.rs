@@ -1,102 +1,80 @@
-//! The combined-state lockstep lane encoder (branch-lane model, first
-//! correctness increment — see `gimir/notes/branch-lane-model.md` and
-//! `branch-lane-buildspec.md`).
+//! The union lane store: a git repo's history as ONE reverse-delta chain
+//! of union-variant states, built straight off the git object store.
 //!
-//! This is a NEW store path that lives ALONGSIDE the shipped TREES
-//! store (`store.rs`) and changes nothing in it. It proves the
-//! lane-prefix + lockstep model round-trips SHA-exact. There is NO
-//! variant-delta and NO base-switching here (later increments); every
-//! lane is carried as its own subtree under a combined-state root, and
-//! the revision axis is one deterministic lockstep chain of reverse
-//! deltas — exactly the physical shape the TREES chain uses, through
-//! the same `wikimak_depot` frame/codec plumbing.
+//! This is a NEW store path that lives ALONGSIDE the shipped TREES store
+//! (`store.rs`) and changes nothing in it. It uses the same
+//! `wikimak_depot` frame/codec plumbing (f0 + f1 + cold frames, sealed by
+//! `seal_prepend`, walked newest-first by `walk_records`).
 //!
 //! ## Model
 //!
-//! * **Lockstep revision axis.** Commits are processed in the append-only
-//!   topological order [`crate::lanes::assign_lanes`] consumes (parents
-//!   before children). Each commit is ONE revision step and advances
-//!   EXACTLY ONE lane — its `lane_of[i]`.
-//! * **Combined state** at revision `i` is a depot [`View`] whose
-//!   top-level children are keyed by lane id (a 4-byte big-endian name,
-//!   so ordering is stable). At revision `i` the child for lane
-//!   `lane_of[i]` is replaced by commit `i`'s tree; every other live
-//!   lane's child is carried UNCHANGED (structural sharing via the
-//!   depot's `Arc` views — the lockstep empty delta is literally no
-//!   work). A lane's child appears from its birth revision and is kept
-//!   through the end (retirement is a later increment).
-//! * **Chain record** at revision `i` is `diff(combined[i-1],
-//!   combined[i])` — but stored, like TREES, as a REVERSE delta: the
-//!   newest combined state is a full record (f0), every older record
-//!   rebuilds `combined[k]` from `combined[k+1]`. Because only one lane's
-//!   subtree changed between consecutive revisions, each such record
-//!   touches exactly one lane prefix (`depot::diff`'s `Arc::ptr_eq` fast
-//!   path prunes the rest) — lanes never oscillate.
+//! * **Lanes.** Each commit is assigned to a branch lane
+//!   ([`crate::lanes::assign_lanes`]) in append-only topological order;
+//!   lane indices are compacted with reuse ([`crate::lanes::compact_lanes`])
+//!   so the bitmap width is peak concurrent lanes. Each commit is ONE
+//!   revision advancing exactly its `lane_of[i]` (plus any lanes a merge
+//!   kills).
+//! * **State** at each revision is the UNION of the live lanes' git trees
+//!   in one path-keyed tree: at a file path its distinct `(mode, blob-oid)`
+//!   versions are stored under `\0v`/`\0m` slots with a lane bitmap (see
+//!   [`crate::variants`] and [`crate::reslot`]). Content is byte-stable
+//!   across lane-membership changes.
+//! * **Encoder.** [`crate::oidenc`] holds the union as slot state per path
+//!   and, per revision, applies only the advancing/dying lanes' tree diffs —
+//!   reading git tree objects by oid on demand (through a cache) and pruning
+//!   unchanged subtrees by oid. It emits the depot REVERSE delta (rebuild
+//!   the previous state from the new); f0 and seal heads are the forward
+//!   full state.
 //!
 //! ## Reconstruction
 //!
-//! Walk the chain newest-first applying reverse deltas to rebuild
-//! `combined[i]`, then extract child `lane_of[commit]` — that commit's
-//! tree View. Its git tree oid ([`crate::view_tree_oid`]) equals the
-//! real object.
+//! Walk the chain newest-first applying reverse deltas to rebuild the union
+//! state at a revision, then [`crate::variants::extract`] its lane — that
+//! commit's git tree. Its git tree oid equals the real object (SHA-exact).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use depot::{codec, View};
 use wikimak_depot::{
     compress_frame, decompress_frame, Depot, DepotConfig, FrameDecoder, FrameEncoder,
 };
 
-use crate::lanes::{assign_lanes, cluster_variants, LaneId};
+use crate::lanes::{assign_lanes, LaneId};
 use crate::{Error, Result};
 
 /// The single combined-state chain id in this store's private depot.
 const CHAIN: u64 = 0;
-/// Width, in bytes, of the big-endian lane-id child name.
-const LANE_KEY_LEN: usize = 4;
 
-/// The encode-time similarity cutoff — the SINGLE policy point for the
-/// variant-delta path (see [`crate::lanes::cluster_variants`]). It is a
-/// choice of the encoder, NOT part of the stored format: the frame
-/// records only the resulting base-lane pointer, so changing this
-/// constant changes future encodes, never how an existing store reads.
-pub const VARIANT_CUTOFF: f64 = 0.5;
+/// Adapts the persistent `cat-file --batch` to the encoder's object store,
+/// with an oid→tree cache: a content-addressed tree object is fetched and
+/// parsed ONCE and then served from memory, so traversing the same
+/// directory across revisions or lanes never re-reads it. Blobs are not
+/// cached — they are fetched by oid only to emit a `\0v` and then dropped.
+type TreeEnts = std::sync::Arc<Vec<(Vec<u8>, crate::oidenc::Ent)>>;
+struct Cat<'a> {
+    cat: &'a mut crate::CatFile,
+    trees: HashMap<String, TreeEnts>,
+}
 
-/// Attr key stamped on a lane child that is stored as a base-relative
-/// variant delta rather than its own full subtree. Its value is the
-/// 4-byte big-endian id of the BASE lane the delta is expressed against
-/// (the base-in-effect at that revision, recorded AS DATA — the reader
-/// consults it, it is never recomputed). A NUL lead byte cannot collide
-/// with a git tree's own attr (`mode`) nor with any path segment. The
-/// child's `blob` holds the encoded `diff(base_subtree, variant_subtree)`
-/// layer. Recording the base per revision (it rides each stored combined
-/// state) is exactly the hook a later base-switching increment needs: the
-/// pointer can differ across revisions with no format change.
-const VARIANT_MARK: &[u8] = b"\x00vbase";
-
-/// Adapts the persistent `cat-file --batch` to the encoder's object store:
-/// a tree oid → its parsed entries, a blob oid → its raw bytes.
-struct Cat<'a>(&'a mut crate::CatFile);
+impl<'a> Cat<'a> {
+    fn new(cat: &'a mut crate::CatFile) -> Self {
+        Cat { cat, trees: HashMap::new() }
+    }
+}
 
 impl crate::oidenc::Objects for Cat<'_> {
-    fn tree(&mut self, oid: &str) -> Result<Vec<(Vec<u8>, crate::oidenc::Ent)>> {
-        crate::oidenc::parse_tree(&self.0.get(oid)?)
+    fn tree(&mut self, oid: &str) -> Result<TreeEnts> {
+        if let Some(t) = self.trees.get(oid) {
+            return Ok(t.clone());
+        }
+        let ents = std::sync::Arc::new(crate::oidenc::parse_tree(&self.cat.get(oid)?)?);
+        self.trees.insert(oid.to_string(), ents.clone());
+        Ok(ents)
     }
     fn blob(&mut self, oid: &str) -> Result<depot::Bytes> {
-        Ok(self.0.get(oid)?.into())
+        Ok(self.cat.get(oid)?.into())
     }
-}
-
-fn lane_key(l: LaneId) -> Vec<u8> {
-    l.to_be_bytes().to_vec()
-}
-
-fn decode_lane_key(key: &[u8]) -> Result<LaneId> {
-    let a: [u8; LANE_KEY_LEN] =
-        key.try_into().map_err(|_| Error::Chain("bad lane key width".into()))?;
-    Ok(LaneId::from_be_bytes(a))
 }
 
 /// Raw (uncompressed) f1 accumulator seal point for the combined-state
@@ -132,139 +110,10 @@ fn batch_ram_bound() -> u64 {
         .unwrap_or(BATCH_RAM_BOUND)
 }
 
-/// Rewrite a FULL combined state (every lane child its own full subtree)
-/// into the STORED combined state that actually lands in the frame:
-/// cluster the LIVE lanes at this revision ([`cluster_variants`]); each
-/// group's BASE lane keeps its full subtree, and every VARIANT lane is
-/// replaced by a marker child carrying `diff(base_subtree,
-/// variant_subtree)` — so the frame-resident uncompressed content of a
-/// group is one base subtree plus small per-variant deltas, not N full
-/// trees. Independent lanes are singleton groups and stay full, exactly as
-/// the non-variant path stores every lane. This is representation (a): the
-/// delta lives IN the child slot behind a marker, self-describing,
-/// consulted by the reader.
-///
-/// `live` is the set of lanes that are alive at THIS revision (birth ≤ i ≤
-/// death from the topology). Clustering only the live set is exactly the
-/// base-switching mechanism: when a group's base lane dies, it drops out of
-/// `live`, so [`cluster_variants`] recomputes the group over the smaller
-/// set and its own "lowest live id is the base" rule promotes a surviving
-/// variant to base — stored FULL from that revision on, the other survivors
-/// re-expressed against it. Lane ids are monotonic in birth order, so the
-/// lowest live id only ever rises as lanes die: a base switch moves the
-/// pointer strictly forward, never back, and never touches an earlier
-/// frame (each revision's frame records its own base-in-effect). Only live
-/// lanes are emitted; a dead lane is absent from this revision's stored
-/// state (its states stay reconstructable at the earlier revisions it was
-/// live — dying removes it from the live set, not from the chain).
-fn build_stored(
-    full: &View,
-    live: &[LaneId],
-    blob_sets: &HashMap<LaneId, HashSet<Vec<u8>>>,
-    cutoff: f64,
-) -> Result<View> {
-    let groups = cluster_variants(live, blob_sets, cutoff);
-    let mut stored = View::default();
-    for g in &groups {
-        let base_key = lane_key(g.base);
-        let base_sub = full
-            .children
-            .get(&base_key)
-            .ok_or_else(|| Error::Chain(format!("base lane {} not live", g.base)))?;
-        // Base: its own full subtree (Arc-shared, no copy).
-        stored.children.insert(base_key, base_sub.clone());
-        for &v in &g.variants {
-            let v_sub = full
-                .children
-                .get(&lane_key(v))
-                .ok_or_else(|| Error::Chain(format!("variant lane {v} not live")))?;
-            let layer = depot::diff(Some(base_sub.as_ref()), Some(v_sub.as_ref()));
-            let mut node = View::default();
-            node.blob = Some(codec::encode(&layer).into());
-            node.attrs.insert(VARIANT_MARK.to_vec(), g.base.to_be_bytes().to_vec());
-            stored.children.insert(lane_key(v), Arc::new(node));
-        }
-    }
-    Ok(stored)
-}
-
-/// Reconstruct lane `lane`'s FULL subtree from a reconstructed stored
-/// combined state. The one canonical composition order: a variant child
-/// is `apply(base_subtree, variant_delta)` with the base resolved FIRST,
-/// then the variant delta on top. A non-variant child is already its full
-/// subtree.
-///
-/// The base is read PER REVISION from the child's `VARIANT_MARK` attr (the
-/// base-in-effect recorded as data in this revision's frame), never
-/// recomputed — so base-switching needs no reader change. The recorded
-/// base is guaranteed present (live) and stored full in the SAME combined
-/// state, because the encoder only ever expresses a variant against a base
-/// that is live at that revision: below a switch boundary the mark points
-/// at the old base (still live and reconstructable there), above it at the
-/// promoted lane. Reconstruction is therefore immutable across switches —
-/// an earlier revision resolves against whatever base its own frame pins,
-/// independent of any later history.
-fn resolve_lane_subtree(combined: &View, lane: LaneId) -> Result<View> {
-    let child = combined
-        .children
-        .get(&lane_key(lane))
-        .ok_or_else(|| Error::Chain(format!("lane child missing (lane {lane})")))?;
-    match child.attrs.get(VARIANT_MARK) {
-        Some(base_bytes) => {
-            let base = decode_lane_key(base_bytes)?;
-            let base_sub = resolve_lane_subtree(combined, base)?;
-            let bytes = child
-                .blob
-                .as_ref()
-                .ok_or_else(|| Error::Chain("variant child without delta blob".into()))?;
-            let layer = codec::decode(bytes)?;
-            Ok(depot::apply(Some(&base_sub), &layer).unwrap_or_default())
-        }
-        None => Ok((**child).clone()),
-    }
-}
-
 fn cf(e: String) -> Error {
     Error::Chain(e)
 }
 
-/// How a revision's combined state is physically laid out in a frame —
-/// the ONE reader-visible choice, recorded as data (a `kv` row) so a
-/// reopened store reconstructs with the matching extractor. It is NOT a
-/// frame-format change: every mode stores the same reverse-delta chain of
-/// depot Views; only the shape of each View and how a lane is pulled back
-/// out of it differ.
-#[derive(Clone, Copy, PartialEq)]
-enum Repr {
-    /// Lane-keyed root, every live lane its own full subtree.
-    Full,
-    /// Lane-keyed root, near-identical live lanes stored as base-relative
-    /// variant deltas (cutoff = the similarity threshold).
-    Variant(f64),
-    /// Union-variant: ONE tree keyed by real path; a file's distinct
-    /// (attrs, content) versions live under `\0v`/`\0m` sibling keys with a
-    /// lane bitmap. A lane is pulled back with [`crate::variants::extract`].
-    /// Content is byte-stable across lane-membership changes, so a base
-    /// commit that shifts no blob yields an empty frame-to-frame delta.
-    Union,
-}
-
-impl Repr {
-    fn tag(self) -> &'static str {
-        match self {
-            Repr::Full => "full",
-            Repr::Variant(_) => "variant",
-            Repr::Union => "union",
-        }
-    }
-    fn from_tag(s: &str) -> Repr {
-        match s {
-            "union" => Repr::Union,
-            "variant" => Repr::Variant(VARIANT_CUTOFF),
-            _ => Repr::Full,
-        }
-    }
-}
 
 /// A built lane store: a private `wikimak_depot` instance on disk (the
 /// combined-state chain) plus the RAM bookkeeping a reader needs to map
@@ -282,24 +131,13 @@ pub struct LaneStore {
     /// ref name → resolved commit sha (persisted; lets a reopened store
     /// serve any ref's tree from disk alone).
     refs: HashMap<String, String>,
-    /// Physical layout of the stored states — picks the read-side extractor.
-    repr: Repr,
 }
 
 impl LaneStore {
     // ---------------------------------------------------------- encode
 
-    /// Encode a git repo's trees into a combined-state lane store rooted
-    /// at `dir` (created; its `depot/` subdir holds the chain). `level`
-    /// is the zstd level. Reuses the fetch-side helpers (`ls-tree` +
-    /// `cat-file` + `tree_layer`) to build each commit's full tree View
-    /// and the depot frame codec to store the reverse-delta chain.
-    pub fn encode_repo(repo: &Path, dir: &Path, level: i32) -> Result<LaneStore> {
-        Self::encode_impl(repo, dir, level, Repr::Full)
-    }
-
     /// Like [`encode_repo`](Self::encode_repo) but stores every revision's
-    /// live lanes as ONE union-variant tree (see [`Repr::Union`] and
+    /// live lanes as ONE union-variant tree (see
     /// [`crate::variants`]). No base, no delta-of-delta, no base-switching:
     /// content nodes are byte-stable across lane-membership changes, so a
     /// trunk commit that touches one lane leaves every other lane's content
@@ -352,6 +190,7 @@ impl LaneStore {
         let depot = open_depot(dir)?;
         let batch_bound = batch_ram_bound();
         let mut cat = crate::CatFile::new(repo)?;
+        let mut objs = Cat::new(&mut cat); // one persistent tree cache
         let mut enc = Encoder::new();
         let mut lane_tree: Vec<Option<String>> = vec![None; width];
         let mut batch: Vec<Vec<u8>> = Vec::new();
@@ -380,17 +219,14 @@ impl LaneStore {
             }
             trans.push((l, adv_old.as_ref(), Some(&adv_new)));
 
-            let rev = {
-                let mut objs = Cat(&mut cat);
-                enc.advance(&trans, &mut objs)?
-            };
+            let rev = enc.advance(&trans, &mut objs)?;
             for &d in &dying_at[i] {
                 lane_tree[d as usize] = None;
             }
             lane_tree[l] = Some(tree_oid);
 
             if i == 0 {
-                let f0raw = codec::encode(&enc.full(&mut Cat(&mut cat))?);
+                let f0raw = codec::encode(&enc.full(&mut objs)?);
                 let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
                 depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
             } else {
@@ -399,7 +235,7 @@ impl LaneStore {
                 batch.push(rec);
             }
             if !batch.is_empty() && batch_bytes >= batch_bound {
-                let head = codec::encode(&enc.full(&mut Cat(&mut cat))?);
+                let head = codec::encode(&enc.full(&mut objs)?);
                 let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
                 seal_prepend(&depot, &head, &staged, level)?;
                 batch_bytes = 0;
@@ -407,7 +243,7 @@ impl LaneStore {
             }
         }
         if !batch.is_empty() {
-            let head = codec::encode(&enc.full(&mut Cat(&mut cat))?);
+            let head = codec::encode(&enc.full(&mut objs)?);
             let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
             seal_prepend(&depot, &head, &staged, level)?;
         }
@@ -423,300 +259,10 @@ impl LaneStore {
                 refs.insert(name, sha);
             }
         }
-        persist_meta(dir, n_rev, &lane_of, &sha_of, &refs, Repr::Union)?;
-        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs, repr: Repr::Union })
+        persist_meta(dir, n_rev, &lane_of, &sha_of, &refs)?;
+        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs })
     }
 
-    /// Like [`encode_repo`](Self::encode_repo) but stores near-identical
-    /// live lanes as base-relative variant deltas (the variant/cross-lane
-    /// axis composed with the temporal axis — "delta-of-delta"). Grouping,
-    /// metric, cutoff and base pick are the encoder's policy (behind
-    /// [`cluster_variants`] and [`VARIANT_CUTOFF`]); the format records only
-    /// the outcome. Reconstruction is SHA-exact and the frame-resident
-    /// content of a variant group is ~one base subtree + small deltas, not
-    /// N full trees.
-    pub fn encode_repo_variant(repo: &Path, dir: &Path, level: i32) -> Result<LaneStore> {
-        Self::encode_impl(repo, dir, level, Repr::Variant(VARIANT_CUTOFF))
-    }
-
-    fn encode_impl(
-        repo: &Path,
-        dir: &Path,
-        level: i32,
-        repr: Repr,
-    ) -> Result<LaneStore> {
-        // Whether we need the frontier's per-commit blob-oid sets (only the
-        // variant clustering metric consumes them).
-        let want_oids = matches!(repr, Repr::Variant(_));
-        // Revision order + per-commit parents come from the SAME
-        // O(changes) discovery the shipped importer uses: one
-        // `rev-list --parents` pass yields `dag.order` (walk_order — a
-        // valid topological order, parents before children, that keeps
-        // first-parent segments contiguous) and the per-commit parent
-        // indices. The lane axis rides that order.
-        let dag = crate::dag_scope(repo, &[])?;
-        let sha_of = dag.order.clone();
-        let n_rev = sha_of.len();
-        let mut index_of: HashMap<String, usize> = HashMap::with_capacity(n_rev);
-        for (i, s) in sha_of.iter().enumerate() {
-            index_of.insert(s.clone(), i);
-        }
-        let parents = parents_by_index(repo, &index_of)?;
-        let assignment = assign_lanes(&parents);
-        let lane_of = assignment.lane_of.clone();
-        // Per-lane liveness window `[birth, death)` in revision indices.
-        // Birth is the lane's first commit (`span.0`). Death is the model's
-        // metro-lane death — a MERGE: the revision of the merge commit that
-        // absorbs the lane as a NON-first parent. A lane never merged stays
-        // live to the end (it is a live branch tip; retirement is a later
-        // increment), so its death is `n_rev`. This — not "the lane has no
-        // more commits" — is the base-switching trigger: a base lane that
-        // merges away drops out of the live set while its still-unmerged
-        // variants remain, and clustering promotes a survivor.
-        let birth: Vec<usize> = assignment.span.iter().map(|s| s.0).collect();
-        let mut death: Vec<usize> = vec![n_rev; assignment.span.len()];
-        for i in 0..n_rev {
-            for &p in parents[i].iter().skip(1) {
-                let l = lane_of[p] as usize;
-                if i < death[l] {
-                    death[l] = i;
-                }
-            }
-        }
-
-        // The union path COMPACTS lane indices: a lane's index is freed at
-        // its death and reused by the next-born lane, so the bitmap width is
-        // peak concurrent live lanes, not total lanes ever. The other paths
-        // keep the monotonic ids their lane-keyed roots / variant clustering
-        // assume. `eff_id` maps a monotonic lane to its effective id.
-        let (compact_of, union_width) = crate::lanes::compact_lanes(&birth, &death, n_rev);
-        let eff_id = |l: usize| -> LaneId {
-            if repr == Repr::Union {
-                compact_of[l]
-            } else {
-                l as LaneId
-            }
-        };
-        let lane_of: Vec<LaneId> = lane_of.iter().map(|&l| eff_id(l as usize)).collect();
-
-        // Lanes that DIE at revision i (absorbed as a non-first parent of
-        // the merge at i) — evicted from the RAM state at i so it carries
-        // only the lanes LIVE at i. `death[l] < n_rev` ⇒ the lane merges; a
-        // never-merged lane stays to the end and is never evicted. Recorded
-        // under the effective (compacted, for union) id.
-        let mut dying_at: Vec<Vec<LaneId>> = vec![Vec::new(); n_rev + 1];
-        for l in 0..death.len() {
-            if death[l] < n_rev {
-                dying_at[death[l]].push(eff_id(l));
-            }
-        }
-
-        // Build combined states forward and SEAL them into the chain as the
-        // chain grows (the TREES store's tiered prepend / FrameEncoder +
-        // seal discipline — `seal_prepend`), so at most one batch's worth of
-        // reverse-delta records is ever buffered in RAM. Per-commit tree
-        // Views come from the shipped importer's `frontier_walk` (each View
-        // is its first parent's frontier + `delta_layer`, Arc-shared,
-        // O(delta), streamed in `dag.order`).
-        //
-        // `full_combined` carries only the LIVE lanes as their own full
-        // subtrees: it inserts the advanced lane at i and EVICTS lanes that
-        // die at i (variant path), so RAM is O(peak_live_lanes × tree), not
-        // O(total_lanes × tree). `cur` is what lands in the frame —
-        // `full_combined` itself on the non-variant path (which keeps the
-        // one-lane-per-record lockstep invariant, so it does NOT evict), or
-        // the variant-delta rewrite when a cutoff is set.
-        let depot = open_depot(dir)?;
-        let batch_bound = batch_ram_bound();
-        let mut full_combined = View::default();
-        let mut lane_blob_sets: HashMap<LaneId, HashSet<Vec<u8>>> = HashMap::new();
-        // Union path: each live lane's CURRENT tree, indexed by lane id
-        // (None = absent/evicted). The stored state is produced by the
-        // stateful `unionenc::Encoder`, which holds the union as slot state
-        // per path (see `reslot`) and turns each revision's slot changes
-        // into the frame delta — no combined tree, stable slots. `lane_views`
-        // is just the encoder's per-revision input.
-        let n_lanes = if repr == Repr::Union { union_width } else { assignment.span.len() };
-        let mut lane_views: Vec<Option<View>> = vec![None; n_lanes];
-        let mut enc = crate::unionenc::Encoder::new();
-        let mut prev: Option<View> = None;
-        let mut batch: Vec<Vec<u8>> = Vec::new(); // reverse records, forward order
-        let mut batch_bytes: u64 = 0;
-        let mut expect = 0usize;
-        crate::frontier_walk(
-            repo,
-            &dag,
-            Vec::new(),
-            &Default::default(),
-            want_oids,
-            &mut |cm, _tree_oid, view, oids, _cat| {
-                let i = expect;
-                if i >= n_rev || cm.sha != sha_of[i] {
-                    return Err(Error::Chain(format!(
-                        "frontier walk out of revision order at {i}: got {}",
-                        cm.sha
-                    )));
-                }
-                // Evict lanes that die at i BEFORE this revision's state is
-                // built — the model's live-lane semantics, on BOTH paths, so
-                // RAM is O(peak live lanes × tree), not O(total lanes ever
-                // born × tree). The eviction shows up in `cur` as a tombstone
-                // in the reverse delta at i (the dead lane's child is
-                // dropped); walking back re-adds it, so a commit on the dead
-                // lane at r < i still reconstructs exactly. A merge revision
-                // thus touches two lane prefixes — the mainline it advances
-                // and the second-parent lane it tombstones — which is correct
-                // ("minimize the frame-to-frame diff": the dead lane really
-                // did leave the state), not the strict one-lane-per-record
-                // shape the roundtrip test used to assert.
-                if repr == Repr::Union {
-                    // This revision's lane transitions: each dying lane leaves
-                    // (old tree → absent) and the advancing lane changes (old
-                    // tree → this commit's tree). The encoder walks only the
-                    // paths these actually change; unchanged subtrees are
-                    // pruned by Arc identity. Build the transitions from the
-                    // PRE-mutation `lane_views`, advance, THEN apply them.
-                    let mut trans: Vec<crate::unionenc::Trans> = Vec::new();
-                    for &dead in &dying_at[i] {
-                        // Compaction can hand the advancing lane the very index
-                        // a lane dying THIS revision just freed (a merge that
-                        // both forks and absorbs). Then the advancing
-                        // transition below — old = the dying lane's tree (still
-                        // in `lane_views[idx]`), new = this commit's tree —
-                        // already moves that bit correctly; a separate dying
-                        // transition for the same index would be a duplicate
-                        // that wrongly deletes the shared paths. Skip it.
-                        if dead != lane_of[i] {
-                            trans.push((dead as usize, lane_views[dead as usize].as_ref(), None));
-                        }
-                    }
-                    trans.push((lane_of[i] as usize, lane_views[lane_of[i] as usize].as_ref(), Some(view)));
-                    let rev = enc.advance(&trans);
-                    for &dead in &dying_at[i] {
-                        lane_views[dead as usize] = None;
-                    }
-                    lane_views[lane_of[i] as usize] = Some(view.clone());
-                    if i == 0 {
-                        let f0raw = codec::encode(&enc.full());
-                        let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
-                        depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
-                    } else {
-                        let rec = codec::encode(&rev);
-                        batch_bytes += 8 + rec.len() as u64;
-                        batch.push(rec);
-                    }
-                    if !batch.is_empty() && batch_bytes >= batch_bound {
-                        let head = codec::encode(&enc.full());
-                        let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
-                        seal_prepend(&depot, &head, &staged, level)?;
-                        batch_bytes = 0;
-                        depot.flush().map_err(|e| cf(e.to_string()))?;
-                    }
-                    expect += 1;
-                    return Ok(());
-                }
-                for &dead in &dying_at[i] {
-                    full_combined.children.remove(&lane_key(dead));
-                    lane_blob_sets.remove(&dead);
-                    lane_views[dead as usize] = None;
-                }
-                lane_views[lane_of[i] as usize] = Some(view.clone());
-                let child = Arc::new(view.clone());
-                full_combined.children.insert(lane_key(lane_of[i]), child.clone());
-                let cur = match repr {
-                    Repr::Union => unreachable!("handled above"),
-                    Repr::Variant(c) => {
-                        // The frontier maintained this commit's git-oid set
-                        // as its first parent's set + this commit's changes
-                        // (zero hashing). It IS the advanced lane's blob-oid
-                        // set this revision; every other live lane keeps its
-                        // cached set. `oids` is a multiset (count per oid) —
-                        // its live KEYS are the set the metric clusters on.
-                        let set: HashSet<Vec<u8>> = oids.keys().cloned().collect();
-                        lane_blob_sets.insert(lane_of[i], set);
-                        // Lanes live at revision i: born and not yet merged
-                        // away (birth ≤ i < death). A merged-away base drops
-                        // out here, so clustering reframes onto a surviving
-                        // base. The lane advanced at i is always live (a merge
-                        // that ends lane l happens strictly after l's own
-                        // commits), so it is always present.
-                        let live: Vec<LaneId> = (0..death.len() as LaneId)
-                            .filter(|&l| birth[l as usize] <= i && i < death[l as usize])
-                            .collect();
-                        build_stored(&full_combined, &live, &lane_blob_sets, c)?
-                    }
-                    Repr::Full => full_combined.clone(),
-                };
-                if i == 0 {
-                    // Seed the chain's f0 with the first full state; the
-                    // depot forbids f1 on a chain's first prepend.
-                    let f0raw = codec::encode(&depot::diff(None, Some(&cur)));
-                    let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
-                    depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
-                } else if let Some(p) = &prev {
-                    // Reverse delta rebuilding combined[i-1] from combined[i].
-                    let rec = codec::encode(&depot::diff(Some(&cur), Some(p)));
-                    batch_bytes += 8 + rec.len() as u64;
-                    batch.push(rec);
-                }
-                prev = Some(cur);
-                // Seal a batch once it reaches a frame's worth: `prev` is
-                // combined[i], the newest state in the batch, so its full
-                // encoding is the new f0 and the batch's reverse deltas
-                // (newest-first) become the accumulator.
-                if !batch.is_empty() && batch_bytes >= batch_bound {
-                    let head = codec::encode(&depot::diff(None, prev.as_ref()));
-                    let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
-                    seal_prepend(&depot, &head, &staged, level)?;
-                    batch_bytes = 0;
-                    // Flush now so eviction reclaims the just-superseded f0/f1
-                    // frames — bounds the encode's transient disk footprint
-                    // instead of letting dead full-state frames pile up.
-                    depot.flush().map_err(|e| cf(e.to_string()))?;
-                }
-                expect += 1;
-                Ok(())
-            },
-        )?;
-        if expect != n_rev {
-            return Err(Error::Chain(format!(
-                "frontier walk produced {expect} of {n_rev} revisions"
-            )));
-        }
-        // Final partial batch: its newest state (combined[n-1]) becomes the
-        // chain's f0. Union rebuilds that full state with the walk against
-        // the empty base; the other paths diff the retained `prev` View.
-        if !batch.is_empty() {
-            let head = if repr == Repr::Union {
-                codec::encode(&enc.full())
-            } else {
-                codec::encode(&depot::diff(None, prev.as_ref()))
-            };
-            let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
-            seal_prepend(&depot, &head, &staged, level)?;
-        }
-        if n_rev > 0 {
-            depot.flush().map_err(|e| cf(e.to_string()))?;
-        }
-
-        let sha_to_rev: HashMap<String, usize> = sha_of
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.clone(), i))
-            .collect();
-
-        // Refs that resolve to an in-scope commit — persisted so a
-        // reopened store serves any ref's tree from disk alone.
-        let mut refs = HashMap::new();
-        for (name, sha) in collect_ref_commits(repo)? {
-            if sha_to_rev.contains_key(&sha) {
-                refs.insert(name, sha);
-            }
-        }
-
-        persist_meta(dir, n_rev, &lane_of, &sha_of, &refs, repr)?;
-        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs, repr })
-    }
 
     /// Reopen a persisted lane store from `dir` alone — no repo access.
     /// The combined-state chain lives in `dir/depot` (reopened) and the
@@ -738,13 +284,13 @@ impl LaneStore {
 
     pub fn open(dir: &Path) -> Result<LaneStore> {
         let depot = open_depot(dir)?;
-        let (n_rev, lane_of, sha_of, refs, repr) = load_meta(dir)?;
+        let (n_rev, lane_of, sha_of, refs) = load_meta(dir)?;
         let sha_to_rev = sha_of
             .iter()
             .enumerate()
             .map(|(i, s)| (s.clone(), i))
             .collect();
-        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs, repr })
+        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs })
     }
 
     /// ref name → resolved commit sha (persisted set).
@@ -796,14 +342,11 @@ impl LaneStore {
         done.ok_or_else(|| Error::Chain(format!("chain fell short of revision {rev}")))
     }
 
-    /// The reconstructed tree View of the commit at revision `rev`: the
-    /// combined state's child for that revision's lane.
+    /// The reconstructed git tree View of the commit at revision `rev`:
+    /// extract its lane from the reconstructed union state.
     pub fn tree_at(&self, rev: usize) -> Result<View> {
         let combined = self.combined_at(rev)?;
-        match self.repr {
-            Repr::Union => Ok(crate::variants::extract(&combined, self.lane_of[rev] as usize)),
-            Repr::Full | Repr::Variant(_) => resolve_lane_subtree(&combined, self.lane_of[rev]),
-        }
+        Ok(crate::variants::extract(&combined, self.lane_of[rev] as usize))
     }
 
     /// The git tree oid of the commit at revision `rev` (reconstructed).
@@ -818,31 +361,6 @@ impl LaneStore {
             .rev_of(sha)
             .ok_or_else(|| Error::Chain(format!("commit {sha} not in lane store")))?;
         self.tree_oid_at(rev)
-    }
-
-    /// Per newest-first record position, the sorted set of top-level
-    /// (lane) prefixes its stored delta touches. Position 0 is the full
-    /// head record (all live lanes); every older position is a reverse
-    /// delta and MUST touch exactly one lane prefix (the lockstep
-    /// O(one-lane) proof).
-    pub fn record_prefixes(&self) -> Result<Vec<Vec<Vec<u8>>>> {
-        let mut out = Vec::new();
-        self.walk_records(&mut |_pos, rec| {
-            let layer = codec::decode(rec)?;
-            let mut keys: Vec<Vec<u8>> = layer.root.children.keys().cloned().collect();
-            keys.sort();
-            out.push(keys);
-            Ok(false)
-        })?;
-        Ok(out)
-    }
-
-    /// Map a revision that advances a lane to the newest-first record
-    /// position whose reverse delta expresses that advance. Revision
-    /// `rev` (for `1 <= rev < n_rev`) is expressed by the record rebuilding
-    /// `combined[rev-1]` from `combined[rev]`, at position `n_rev - rev`.
-    pub fn advance_record_pos(&self, rev: usize) -> usize {
-        self.n_rev - rev
     }
 
     /// Total UNCOMPRESSED bytes of every stored chain record (the head
@@ -863,10 +381,6 @@ impl LaneStore {
 
     pub fn lane_of(&self, rev: usize) -> LaneId {
         self.lane_of[rev]
-    }
-
-    pub fn lane_prefix(&self, l: LaneId) -> Vec<u8> {
-        lane_key(l)
     }
 
     // ------------------------------------------------------- internals
@@ -1013,7 +527,6 @@ fn persist_meta(
     lane_of: &[LaneId],
     sha_of: &[String],
     refs: &HashMap<String, String>,
-    repr: Repr,
 ) -> Result<()> {
     let mut conn = rusqlite::Connection::open(meta_path(dir)).map_err(map_sql)?;
     conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(map_sql)?;
@@ -1021,11 +534,9 @@ fn persist_meta(
     let tx = conn.transaction().map_err(map_sql)?;
     tx.execute("DELETE FROM revs", []).map_err(map_sql)?;
     tx.execute("DELETE FROM refs", []).map_err(map_sql)?;
-    // `repr` is DATA in the existing kv table (no table/column change), so
-    // an older store with no such row reads back as Full.
     tx.execute(
-        "INSERT OR REPLACE INTO kv(key,value) VALUES('schema',?1),('n_rev',?2),('repr',?3)",
-        rusqlite::params![META_SCHEMA_VERSION, n_rev.to_string(), repr.tag()],
+        "INSERT OR REPLACE INTO kv(key,value) VALUES('schema',?1),('n_rev',?2)",
+        rusqlite::params![META_SCHEMA_VERSION, n_rev.to_string()],
     )
     .map_err(map_sql)?;
     {
@@ -1057,7 +568,7 @@ fn persist_meta(
 #[allow(clippy::type_complexity)]
 fn load_meta(
     dir: &Path,
-) -> Result<(usize, Vec<LaneId>, Vec<String>, HashMap<String, String>, Repr)> {
+) -> Result<(usize, Vec<LaneId>, Vec<String>, HashMap<String, String>)> {
     let p = meta_path(dir);
     if !p.exists() {
         return Err(Error::Chain(format!("no lane store at {}", dir.display())));
@@ -1112,12 +623,7 @@ fn load_meta(
             refs.insert(name, sha);
         }
     }
-    // Absent in stores written before the union path — default to Full.
-    let repr = conn
-        .query_row("SELECT value FROM kv WHERE key='repr'", [], |r| r.get::<_, String>(0))
-        .map(|s| Repr::from_tag(&s))
-        .unwrap_or(Repr::Full);
-    Ok((n_rev, lane_of, sha_of, refs, repr))
+    Ok((n_rev, lane_of, sha_of, refs))
 }
 
 /// Stream the u64-length-prefixed records of an f1 frame in stored
@@ -1226,5 +732,3 @@ fn open_depot(dir: &Path) -> Result<Depot> {
     .map_err(|e| cf(e.to_string()))
 }
 
-// LANE_KEY_LEN documents the wire width; assert it matches the id type.
-const _: () = assert!(LANE_KEY_LEN == std::mem::size_of::<LaneId>());
