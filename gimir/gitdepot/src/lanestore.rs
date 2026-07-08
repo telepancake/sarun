@@ -47,19 +47,25 @@ use crate::{Error, Result};
 const CHAIN: u64 = 0;
 
 /// Adapts the persistent `cat-file --batch` to the encoder's object store,
-/// with an oid→tree cache: a content-addressed tree object is fetched and
-/// parsed ONCE and then served from memory, so traversing the same
-/// directory across revisions or lanes never re-reads it. Blobs are not
-/// cached — they are fetched by oid only to emit a `\0v` and then dropped.
+/// with a BOUNDED oid→tree cache: a content-addressed tree object is fetched
+/// and parsed once and served from memory, so the hot re-reads (the
+/// advancing lane's old tree is the new tree of its prior revision; a birth
+/// re-reads shared subtrees) don't re-hit git. The cache is capped and
+/// evicts FIFO so it can't grow without bound — the working set that matters
+/// is recent. Blobs are not cached: they are fetched by oid only to emit a
+/// `\0v` and then dropped.
 type TreeEnts = std::sync::Arc<Vec<(Vec<u8>, crate::oidenc::Ent)>>;
+const TREE_CACHE_CAP: usize = 1 << 18; // ~256k trees
+
 struct Cat<'a> {
     cat: &'a mut crate::CatFile,
     trees: HashMap<String, TreeEnts>,
+    order: std::collections::VecDeque<String>, // FIFO eviction
 }
 
 impl<'a> Cat<'a> {
     fn new(cat: &'a mut crate::CatFile) -> Self {
-        Cat { cat, trees: HashMap::new() }
+        Cat { cat, trees: HashMap::new(), order: std::collections::VecDeque::new() }
     }
 }
 
@@ -69,7 +75,13 @@ impl crate::oidenc::Objects for Cat<'_> {
             return Ok(t.clone());
         }
         let ents = std::sync::Arc::new(crate::oidenc::parse_tree(&self.cat.get(oid)?)?);
+        if self.trees.len() >= TREE_CACHE_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.trees.remove(&old);
+            }
+        }
         self.trees.insert(oid.to_string(), ents.clone());
+        self.order.push_back(oid.to_string());
         Ok(ents)
     }
     fn blob(&mut self, oid: &str) -> Result<depot::Bytes> {
