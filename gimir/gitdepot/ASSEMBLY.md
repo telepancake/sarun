@@ -76,9 +76,24 @@ past the shorter name is `0x00` for a file, `0x2F` for a dir — so it and our
 bare-dir order diverge only on file-vs-dir prefixes, a divergence confined to
 the tiny git side.
 
-During delta generation, the full-state and every delta on the stack are
-iterated **in lockstep** to read the previously-written bitmap and other
-per-path info.
+### Delta generation — match by oid, never hash content
+
+Reslot matches variants by git OID, obtained for free (git trees already carry
+every entry's oid) — the container's stored content is NEVER read back and
+hashed. Co-iterate by path:
+
+- the **previous encoded layer** — gives each current variant's slot + bitmap;
+- the **previous lanes' git trees** and the **new lanes' git trees**.
+
+A current variant's identity = its bitmap → any lane in it → that lane's tree
+oid at this path (all lanes in a variant share the oid — that is what makes
+them one variant). A new variant's identity = the new lane's tree oid here.
+Match old↔new by oid, reslot, emit. Content (a `\0v` blob) is fetched from git
+ONLY to write a genuinely new variant. Unchanged lanes share old==new tree oid
+and are pruned in O(1); only the advancing lane's changed subtrees are walked.
+
+Only extra state: the **lane→tree-oid map** (O(#lanes), tiny, reflog-derived) —
+NOT a per-path skeleton, NOT any hashing of the full-state.
 
 ## 4. Geometric delta stack
 
