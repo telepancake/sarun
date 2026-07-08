@@ -70,6 +70,17 @@ fn bit(bm: &[u8], i: usize) -> bool {
     let byte = i / 8;
     byte < bm.len() && (bm[byte] >> (i % 8)) & 1 == 1
 }
+/// The lowest set lane bit — a variant's stable key. Panics only on an
+/// all-zero bitmap, which never occurs: a version is minted only from a
+/// lane that carries it, so at least one bit is set.
+fn min_bit(bm: &[u8]) -> u32 {
+    for (byte, &b) in bm.iter().enumerate() {
+        if b != 0 {
+            return (byte * 8 + b.trailing_zeros() as usize) as u32;
+        }
+    }
+    unreachable!("a version always has at least one lane bit")
+}
 
 // -------------------------------------------------------------- encoder
 
@@ -194,21 +205,28 @@ fn rdelta(base: &[Option<&View>], target: &[Option<&View>]) -> Node {
         return node; // identity: nothing at or below this path changed
     }
 
-    // Version leaves. idx is the sorted position, so a change to the version
-    // SET can shift indices and rewrite several leaves at this path — local
-    // and cheap, and reconstruction only needs the set internally consistent.
-    let bv = versions_at(base);
-    let tv = versions_at(target);
-    for idx in 0..bv.len().max(tv.len()) {
-        let i = idx as u32;
-        let (b, t) = (bv.get(idx), tv.get(idx));
+    // Version leaves, keyed by variant IDENTITY — the lowest lane in the
+    // variant's bitmask. Variants partition the lanes, so bitmasks are
+    // disjoint and the min bit is a unique, STABLE key derivable from the
+    // bitmask alone: an unchanged variant keeps its key, so a variant present
+    // in both states is emitted as nothing; a content edit that keeps the
+    // lane-set reuses the key (only `\0v` changes); a lane joining a variant
+    // above its min keeps the key (only `\0m`'s bitmap changes, `\0v` content
+    // stays). Positional indexing did none of this — it re-keyed on every set
+    // change. (`min_bit` exists because every version has ≥1 lane bit.)
+    let bv: BTreeMap<u32, Version> =
+        versions_at(base).into_iter().map(|v| (min_bit(&v.bitmap), v)).collect();
+    let tv: BTreeMap<u32, Version> =
+        versions_at(target).into_iter().map(|v| (min_bit(&v.bitmap), v)).collect();
+    for key in bv.keys().chain(tv.keys()).copied().collect::<BTreeSet<_>>() {
+        let (b, t) = (bv.get(&key), tv.get(&key));
         let c = leaf_delta(b.map(Version::content_leaf).as_ref(), t.map(Version::content_leaf).as_ref());
         if !c.is_identity() {
-            node.children.insert(content_key(i), c);
+            node.children.insert(content_key(key), c);
         }
         let m = leaf_delta(b.map(Version::meta_leaf).as_ref(), t.map(Version::meta_leaf).as_ref());
         if !m.is_identity() {
-            node.children.insert(meta_key(i), m);
+            node.children.insert(meta_key(key), m);
         }
     }
 
@@ -414,6 +432,36 @@ mod tests {
         // the add (Set) and the parent-level tombstone removal paths.
         let older = [dir(&[("keep", leaf("k", "100644")), ("gone", dir(&[("f", leaf("f", "100644"))]))])];
         let newer = [dir(&[("keep", leaf("k", "100644")), ("added", leaf("a", "100644"))])];
+        assert_transition(&older, &newer);
+    }
+
+    /// A pure lane-set change (a lane joins a variant whose content already
+    /// exists) emits the `\0m` bitmap update but NO `\0v` content leaf — the
+    /// stable min-bit key means the content is inherited, not rewritten.
+    #[test]
+    fn lane_joins_variant_emits_meta_not_content() {
+        // older: lane0 f=X, lane1 f=Y (two variants). newer: lane1 f=X too
+        // (both share X; Y is gone). The reverse delta rebuilding older from
+        // newer must Set Y back and re-point lane1's bit, but must NOT carry
+        // a fresh copy of X's content — X is unchanged.
+        let older = [dir(&[("f", leaf("X", "100644"))]), dir(&[("f", leaf("Y", "100644"))])];
+        let newer = [dir(&[("f", leaf("X", "100644"))]), dir(&[("f", leaf("X", "100644"))])];
+        let (o, n) = (some(&older), some(&newer));
+        let rec = reverse_delta(&n, &o); // rebuild older from newer
+        // Find the delta node at path "f" and inspect its version children.
+        let fnode = rec.root.children.get(b"f".as_slice()).expect("f changed");
+        let mut set_content = 0;
+        for (k, ch) in &fnode.children {
+            if k.len() >= 2 && k[0] == VAR && k[1] == CONTENT {
+                // Only Y (min-bit key = lane 1) may be Set back; X's key
+                // (lane 0) must be identity/absent — content unchanged.
+                if matches!(ch.blob, BlobOp::Set(_)) {
+                    set_content += 1;
+                }
+            }
+        }
+        assert_eq!(set_content, 1, "only the reintroduced variant's content is Set, not X's");
+        // And it round-trips.
         assert_transition(&older, &newer);
     }
 
