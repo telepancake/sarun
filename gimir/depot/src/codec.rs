@@ -37,20 +37,22 @@ use std::collections::BTreeMap;
 
 use crate::{Attrs, BlobOp, Layer, Name, Node, Presence};
 
-const FLAG_TOMBSTONE: u8 = 1 << 0;
-const BLOB_SHIFT: u32 = 1;
-const BLOB_MASK: u8 = 0b11 << BLOB_SHIFT;
-const BLOB_KEEP: u8 = 0b00 << BLOB_SHIFT;
-const BLOB_SET: u8 = 0b01 << BLOB_SHIFT;
-const BLOB_REMOVE: u8 = 0b10 << BLOB_SHIFT;
-const FLAG_OPAQUE: u8 = 1 << 3;
-const FLAG_ATTRS: u8 = 1 << 4;
+// Flag layout, shared with the streaming algebra (`crate::stream`) so the
+// two encoders can never drift on the wire format.
+pub(crate) const FLAG_TOMBSTONE: u8 = 1 << 0;
+pub(crate) const BLOB_SHIFT: u32 = 1;
+pub(crate) const BLOB_MASK: u8 = 0b11 << BLOB_SHIFT;
+pub(crate) const BLOB_KEEP: u8 = 0b00 << BLOB_SHIFT;
+pub(crate) const BLOB_SET: u8 = 0b01 << BLOB_SHIFT;
+pub(crate) const BLOB_REMOVE: u8 = 0b10 << BLOB_SHIFT;
+pub(crate) const FLAG_OPAQUE: u8 = 1 << 3;
+pub(crate) const FLAG_ATTRS: u8 = 1 << 4;
 /// Backdrop anchor (a pure such node is a hole). FORMAT MIGRATION NOTE:
 /// bit 5 was added with the anchor axis; encodings written before it
 /// decode unchanged (the bit reads as Lower), and no view-anchored
 /// stores existed at the flag's introduction.
-const FLAG_BACKDROP: u8 = 1 << 5;
-const KNOWN_FLAGS: u8 =
+pub(crate) const FLAG_BACKDROP: u8 = 1 << 5;
+pub(crate) const KNOWN_FLAGS: u8 =
     FLAG_TOMBSTONE | BLOB_MASK | FLAG_OPAQUE | FLAG_ATTRS | FLAG_BACKDROP;
 
 /// Decode failure. The input is untrusted bytes (a transfer source, a
@@ -93,7 +95,7 @@ impl std::error::Error for DecodeError {}
 
 // --------------------------------------------------------------- encode
 
-fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+pub(crate) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let byte = (v & 0x7f) as u8;
         v >>= 7;
@@ -105,12 +107,12 @@ fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_varint(out, b.len() as u64);
     out.extend_from_slice(b);
 }
 
-fn encode_node(out: &mut Vec<u8>, node: &Node) {
+pub(crate) fn encode_node(out: &mut Vec<u8>, node: &Node) {
     if node.presence == Presence::Tombstone {
         // A tombstone carries nothing: its other fields are meaningless
         // by the model, and the canonical form does not encode them.
@@ -256,6 +258,17 @@ impl<'a> Reader<'a> {
             children,
         })
     }
+}
+
+/// Decode one canonical node starting at `pos`, returning the node and the
+/// position just past it. Used by the streaming algebra (`crate::stream`)
+/// to materialize the single, bounded subtree the semantics-heavy corners
+/// (harden under a tombstone/opaque mask) genuinely need — never the whole
+/// frame.
+pub(crate) fn decode_node(buf: &[u8], pos: usize) -> Result<(Node, usize), DecodeError> {
+    let mut r = Reader { buf, pos };
+    let node = r.node()?;
+    Ok((node, r.pos))
 }
 
 /// Decode one canonical layer, consuming the whole input.
