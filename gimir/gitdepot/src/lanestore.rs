@@ -353,15 +353,30 @@ impl LaneStore {
             }
         }
 
+        // The union path COMPACTS lane indices: a lane's index is freed at
+        // its death and reused by the next-born lane, so the bitmap width is
+        // peak concurrent live lanes, not total lanes ever. The other paths
+        // keep the monotonic ids their lane-keyed roots / variant clustering
+        // assume. `eff_id` maps a monotonic lane to its effective id.
+        let (compact_of, union_width) = crate::lanes::compact_lanes(&birth, &death, n_rev);
+        let eff_id = |l: usize| -> LaneId {
+            if repr == Repr::Union {
+                compact_of[l]
+            } else {
+                l as LaneId
+            }
+        };
+        let lane_of: Vec<LaneId> = lane_of.iter().map(|&l| eff_id(l as usize)).collect();
+
         // Lanes that DIE at revision i (absorbed as a non-first parent of
-        // the merge at i) — evicted from the RAM combined state at i so it
-        // carries only the lanes LIVE at i (the model's live-lane
-        // semantics). `death[l] < n_rev` ⇒ the lane merges; a never-merged
-        // lane stays to the end and is never evicted.
+        // the merge at i) — evicted from the RAM state at i so it carries
+        // only the lanes LIVE at i. `death[l] < n_rev` ⇒ the lane merges; a
+        // never-merged lane stays to the end and is never evicted. Recorded
+        // under the effective (compacted, for union) id.
         let mut dying_at: Vec<Vec<LaneId>> = vec![Vec::new(); n_rev + 1];
         for l in 0..death.len() {
             if death[l] < n_rev {
-                dying_at[death[l]].push(l as LaneId);
+                dying_at[death[l]].push(eff_id(l));
             }
         }
 
@@ -390,7 +405,7 @@ impl LaneStore {
         // per path (see `reslot`) and turns each revision's slot changes
         // into the frame delta — no combined tree, stable slots. `lane_views`
         // is just the encoder's per-revision input.
-        let n_lanes = assignment.span.len();
+        let n_lanes = if repr == Repr::Union { union_width } else { assignment.span.len() };
         let mut lane_views: Vec<Option<View>> = vec![None; n_lanes];
         let mut enc = crate::unionenc::Encoder::new();
         let mut prev: Option<View> = None;
