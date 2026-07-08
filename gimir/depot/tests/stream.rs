@@ -131,6 +131,122 @@ fn compose_two_sided_collapse_to_identity() {
     assert_ne!(compose_bytes(&a3, &b3), encode(&Layer::empty()), "wrongly pruned a survivor");
 }
 
+/// Regression from the git.git encode (rev 21): `overlay_full` produced an
+/// INVALID full-state (later "bad flag byte 0x6d" on the next read). The
+/// exact overlay inputs are captured — a valid full-state base and a
+/// per-revision forward delta with hole removals. Overlay must equal the
+/// compose oracle and stay canonical.
+#[test]
+fn overlay_on_captured_gitgit_inputs() {
+    let base = include_bytes!("ov_base.bin").to_vec();
+    let delta = include_bytes!("ov_delta.bin").to_vec();
+    let base_layer = decode(&base).expect("base decodes");
+    let delta_layer = decode(&delta).expect("delta decodes");
+
+    let mut got = Vec::new();
+    overlay_full(&base, &delta, &mut got).expect("overlay must not error");
+    decode(&got).expect("overlay output must decode");
+    // Oracle: positive full-state of the delta composed over the base
+    // against the empty backdrop (compose resolves holes; apply does not).
+    let oracle = encode(&diff(None, apply(None, &compose(&base_layer, &delta_layer)).as_ref()));
+    assert_eq!(got, oracle, "overlay diverged on the captured git.git rev-21 inputs");
+}
+
+/// A deep + wide union-shaped view: dirs with >127 entries (multi-byte
+/// child-count varint), blobs >127 bytes (multi-byte length varint),
+/// `\0v`/`\0m` keys, nested several levels — the shape real git.git data
+/// has and the small random corpus never produces. Overlaying its full
+/// positive delta onto the empty base must round-trip identically (a clean,
+/// hole-free oracle: `overlay(empty, diff(None,v)) == diff(None,v)`), so any
+/// cursor desync on multi-byte varints shows up here.
+#[test]
+fn wide_deep_union_shaped() {
+    fn dir(depth: u32, width: u32, blob_len: usize) -> View {
+        let mut children = BTreeMap::new();
+        for i in 0..width {
+            let name = format!("entry{i:04}").into_bytes();
+            if depth > 0 && i % 50 == 0 {
+                children.insert(name, Arc::new(dir(depth - 1, width, blob_len)));
+            } else {
+                // A union file node: `\0v` content + `\0m` meta with a bitmap.
+                let mut fc = BTreeMap::new();
+                let blob: Vec<u8> = (0..blob_len).map(|j| (i as usize + j) as u8).collect();
+                fc.insert(vec![0, b'v', 0, 0, 0, 0], Arc::new(View { blob: Some(blob.into()), ..View::default() }));
+                fc.insert(vec![0, b'm', 0, 0, 0, 0], Arc::new(View {
+                    attrs: Attrs::from([
+                        (b"mode".to_vec(), b"100644".to_vec()),
+                        (vec![0, b'l', b'a', b'n', b'e', b's'], vec![0x01]),
+                    ]),
+                    ..View::default()
+                }));
+                children.insert(name, Arc::new(View { children: fc, ..View::default() }));
+            }
+        }
+        View { children, ..View::default() }
+    }
+    let view = dir(3, 200, 500); // 200 entries/dir (2-byte count), 500-byte blobs, 4 levels
+    let full = encode(&diff(None, Some(&view)));
+    let empty_full = encode(&diff(None, Some(&View::default())));
+
+    // Overlaying the full positive delta onto the empty base reproduces it
+    // exactly — a pure cursor/round-trip check with no hole ambiguity.
+    let mut got = Vec::new();
+    overlay_full(&empty_full, &full, &mut got).expect("overlay_full wide/deep");
+    if got != full {
+        let d = (0..got.len().min(full.len())).find(|&i| got[i] != full[i]).unwrap_or(got.len().min(full.len()));
+        let lo = d.saturating_sub(10);
+        panic!(
+            "overlay desync at {d} (got.len={} want.len={}):\n got={:?}\nwant={:?}",
+            got.len(), full.len(),
+            &got[lo..(d + 16).min(got.len())], &full[lo..(d + 16).min(full.len())]
+        );
+    }
+    // compose_stream and diff_stream on the same shape.
+    let mut comp = Vec::new();
+    compose_stream(&empty_full, &full, &mut comp).expect("compose wide/deep");
+    let mut d2 = Vec::new();
+    diff_stream(&full, &empty_full, &mut d2).expect("diff wide/deep");
+
+    // --- Now the reader/reverse paths at scale: holes on a wide/deep base
+    // and diff_stream_holes over two large full-states. entry0000 is a dir
+    // (i%50==0), so removing it holes a whole deep subtree.
+    let view1 = dir(3, 200, 500);
+    let mut view2 = view1.clone();
+    view2.children.remove(b"entry0000".as_slice()); // remove a deep subtree
+    // edit a file's content
+    if let Some(f) = view2.children.get(b"entry0001".as_slice()) {
+        let mut fc = (**f).clone();
+        fc.children.insert(vec![0, b'v', 0, 0, 0, 0], Arc::new(View { blob: Some(vec![42u8; 700].into()), ..View::default() }));
+        view2.children.insert(b"entry0001".to_vec(), Arc::new(fc));
+    }
+    let full1 = encode(&diff(None, Some(&view1)));
+    let full2 = encode(&diff(None, Some(&view2)));
+
+    // Forward: a delta turning view1→view2 (hole removes the subtree),
+    // overlaid on full1, must equal full2. Oracle via compose (which, unlike
+    // apply, resolves holes).
+    let mut fwd = Node::keep();
+    fwd.children.insert(b"entry0000".to_vec(), Node::hole());
+    fwd.children.insert(
+        b"entry0001".to_vec(),
+        Node { children: BTreeMap::from([(vec![0, b'v', 0, 0, 0, 0], Node { blob: BlobOp::Set(vec![42u8; 700].into()), ..Node::keep() })]), ..Node::keep() },
+    );
+    let fwd = Layer { root: fwd };
+    let mut got_fwd = Vec::new();
+    overlay_full(&full1, &encode(&fwd), &mut got_fwd).expect("overlay hole wide/deep");
+    let oracle = encode(&diff(None, apply(None, &compose(&decode(&full1).unwrap(), &fwd)).as_ref()));
+    assert_eq!(got_fwd, oracle, "overlay-with-hole diverged on wide/deep");
+    assert_eq!(got_fwd, full2, "overlay-with-hole != target full-state");
+
+    // Reverse: diff_stream_holes(full2, full1) overlaid onto full2 rebuilds
+    // full1 — the reader's walk-back at scale.
+    let mut rev = Vec::new();
+    diff_stream_holes(&full2, &full1, &mut rev).expect("diff_stream_holes wide/deep");
+    let mut back = Vec::new();
+    overlay_full(&full2, &rev, &mut back).expect("overlay reverse wide/deep");
+    assert_eq!(back, full1, "wide/deep hole reverse round-trip failed");
+}
+
 #[test]
 fn compose_matches_reference_randomized() {
     for seed in 1..400u64 {
@@ -379,6 +495,33 @@ fn hole_reverse_delta_walks_back() {
             assert_eq!(back, old_full, "hole reverse delta did not rebuild old, seed {seed}");
         }
     }
+}
+
+/// `overlay_full`'s exact spec, with HOLES in the delta:
+/// `overlay(full, d) == diff(None, apply(None, compose(full, d)))`. Uses
+/// backdrop-anchored (hole-bearing) random deltas — the shape that empties
+/// nodes and that the tombstone/`apply` oracle above cannot express. This
+/// is the class the git.git rev-21 "move into tools/" bug lived in.
+#[test]
+fn overlay_with_holes_matches_compose_randomized() {
+    let mut checked = 0;
+    for seed in 1..600u64 {
+        let mut rng = Rng(seed ^ 0x40b1);
+        let base = resolve(&[&random_layer(&mut rng)]);
+        let d = random_layer_anchored(&mut rng); // may contain holes
+        if let Some(base) = base {
+            let full = encode(&diff(None, Some(&base)));
+            let full_layer = decode(&full).unwrap();
+            let oracle = encode(&diff(None, apply(None, &compose(&full_layer, &d)).as_ref()));
+            let mut got = Vec::new();
+            overlay_full(&full, &encode(&d), &mut got).expect("overlay_full");
+            assert_eq!(got, oracle, "overlay/compose diverge with holes, seed {seed}");
+            // And it stays canonical.
+            decode(&got).expect("overlay output canonical");
+            checked += 1;
+        }
+    }
+    assert!(checked > 100, "too few hole-overlay cases: {checked}");
 }
 
 #[test]

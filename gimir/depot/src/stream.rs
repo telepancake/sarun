@@ -550,11 +550,14 @@ fn norm_attrs(attrs: Option<&[u8]>) -> Option<&[u8]> {
 /// full-state: the result is always positive and never accretes removal
 /// markers commit over commit.
 ///
-/// The huge side (`base`) is only ever spliced verbatim (untouched
-/// children) or recursed (touched children); only the small delta subtrees
-/// are briefly decoded (reusing the reference `apply`+`diff` so a
-/// delta-only or masked subtree cannot drift). Both cursors advance
-/// monotonically forward.
+/// The huge side (`base`) is spliced verbatim wherever the delta does not
+/// touch it (an untouched child is one raw byte-range copy — no decode).
+/// Only a TOUCHED child is resolved eagerly, into a bounded temp buffer,
+/// because a delta can empty a node (all its variants holed away) and it
+/// must then vanish — its survival cannot be pre-judged from the head as
+/// `compose`'s can. Touched children are exactly the (small) footprint of
+/// one revision's delta, so the transient buffering is bounded by that, not
+/// by the frame. Both cursors advance monotonically forward.
 pub fn overlay_full(base: &[u8], d: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeError> {
     overlay_node(&mut Cur::new(base), &mut Cur::new(d), out)?;
     Ok(())
@@ -565,8 +568,33 @@ pub fn overlay_full(base: &[u8], d: &[u8], out: &mut Vec<u8>) -> Result<(), Deco
 /// and are left just past it. Mirrors `apply_node` for the merge and
 /// `diff_node(None, .)` for the emission.
 fn overlay_node(base: &mut Cur, delta: &mut Cur, out: &mut Vec<u8>) -> Result<bool, DecodeError> {
+    let delta_start = delta.pos;
     let bh = read_head(base)?;
     let dh = read_head(delta)?;
+
+    // This delta node re-bases the name on the backdrop (a hole, or a
+    // backdrop restoration): the base is erased entirely and the delta
+    // resolves over nothing. (Child-level backdrops are intercepted before
+    // recursion; this catches a backdrop at the recursion root.)
+    if dh.backdrop {
+        // Erase the base subtree (its head is already read; drop its
+        // children) and consume the delta node's children.
+        for _ in 0..bh.child_count {
+            base.slice()?;
+            skip_node(base)?;
+        }
+        for _ in 0..dh.child_count {
+            delta.slice()?;
+            skip_node(delta)?;
+        }
+        return match positive_over_nothing(&delta.buf[delta_start..delta.pos])? {
+            Some(bytes) => {
+                out.extend_from_slice(&bytes);
+                Ok(true)
+            }
+            None => Ok(false),
+        };
+    }
 
     // The base is a full-state node: its view-blob is its `Set` payload,
     // its view-attrs the normalized attrs, and it is "empty present" (a
@@ -594,11 +622,14 @@ fn overlay_node(base: &mut Cur, delta: &mut Cur, out: &mut Vec<u8>) -> Result<bo
     let base_children = collect_children(base, bh.child_count)?;
     let delta_children = collect_children(delta, dh.child_count)?;
 
-    // Survivors as (name, bytes-source). Existence of each is decided here
-    // without scanning the base.
+    // Survivors as (name, bytes-source): an untouched base child spliced
+    // verbatim, or a fully-resolved child's bytes. A touched child is
+    // resolved eagerly (into `Owned`) because a delta can EMPTY a node —
+    // all its union variants holed away — and then it must vanish, unlike
+    // in compose where a two-sided child always survives; its existence
+    // cannot be pre-judged from the head alone.
     enum Src<'a> {
         CopyBase(&'a [u8]),
-        Both(&'a [u8], &'a [u8]),
         Owned(Vec<u8>),
     }
     let mut items: Vec<(&[u8], Src)> = Vec::new();
@@ -643,7 +674,13 @@ fn overlay_node(base: &mut Cur, delta: &mut Cur, out: &mut Vec<u8>) -> Result<bo
                                     items.push((bn, Src::Owned(bytes)));
                                 }
                             } else if !is_tombstone(dsub) {
-                                items.push((bn, Src::Both(bsub, dsub)));
+                                // Overlay the touched child; keep it only if
+                                // it still materializes (its variants may
+                                // all have been holed away).
+                                let mut tmp = Vec::new();
+                                if overlay_node(&mut Cur::new(bsub), &mut Cur::new(dsub), &mut tmp)? {
+                                    items.push((bn, Src::Owned(tmp)));
+                                }
                             }
                             ib.next();
                             id.next();
@@ -695,10 +732,6 @@ fn overlay_node(base: &mut Cur, delta: &mut Cur, out: &mut Vec<u8>) -> Result<bo
         match src {
             Src::CopyBase(s) => out.extend_from_slice(s),
             Src::Owned(v) => out.extend_from_slice(&v),
-            Src::Both(bsub, dsub) => {
-                // The child was pre-judged to survive; emit it.
-                overlay_node(&mut Cur::new(bsub), &mut Cur::new(dsub), out)?;
-            }
         }
     }
     Ok(true)
