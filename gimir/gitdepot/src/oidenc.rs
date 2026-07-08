@@ -11,6 +11,13 @@
 //! oids and bits only, independent of blob size. Blob CONTENT is fetched by
 //! oid ([`Objects::blob`]) only when a `\0v` node is actually emitted into a
 //! frame; it is never retained.
+//!
+//! [`Encoder::advance`] emits the FORWARD delta (advance the previous union
+//! state to the new one); the driver overlays it onto a running full-state
+//! byte blob ([`depot::stream::overlay_full`]) and derives the chain's
+//! newest-first reverse record from two full-states
+//! ([`depot::stream::diff_stream`]) — so no whole union is ever materialized
+//! as a `View`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -147,9 +154,10 @@ fn new_variant_set(slots: &Slots<VarKey>, trans: &[Trans]) -> BTreeMap<VarKey, B
     set
 }
 
-/// Reverse delta at one path: reslot the file variants and recurse into the
+/// Forward delta at one path: reslot the file variants and recurse into the
 /// changed directory children, reading tree objects only where a subtree oid
-/// actually changed.
+/// actually changed. The returned node, applied to the previous union state,
+/// yields the new one.
 fn advance_node(skel: &mut Skel, trans: &[Trans], obj: &mut dyn Objects) -> Result<Node> {
     let mut out = Node::keep();
 
@@ -157,16 +165,18 @@ fn advance_node(skel: &mut Skel, trans: &[Trans], obj: &mut dyn Objects) -> Resu
     if !skel.slots.is_empty() || trans.iter().any(|(_, o, n)| is_file(*o) || is_file(*n)) {
         let new_set = new_variant_set(&skel.slots, trans);
         for ch in skel.slots.reslot(&new_set) {
-            // reverse: rebuild `before` (old) from `after` (new).
+            // forward: build `after` (new) from `before` (old) — the change
+            // this revision makes. The chain's reverse record is derived
+            // downstream by `diff_stream(new_full, old_full)`.
             let bc = opt_content(obj, ch.before.as_ref())?;
             let ac = opt_content(obj, ch.after.as_ref())?;
-            let c = leaf_delta(ac.as_ref(), bc.as_ref());
+            let c = leaf_delta(bc.as_ref(), ac.as_ref());
             if !c.is_identity() {
                 out.children.insert(content_key(ch.slot), c);
             }
             let bm = ch.before.as_ref().map(occ_meta);
             let am = ch.after.as_ref().map(occ_meta);
-            let m = leaf_delta(am.as_ref(), bm.as_ref());
+            let m = leaf_delta(bm.as_ref(), am.as_ref());
             if !m.is_identity() {
                 out.children.insert(meta_key(ch.slot), m);
             }
@@ -262,9 +272,10 @@ impl Encoder {
         Encoder::default()
     }
 
-    /// Apply this revision's lane transitions and return the reverse delta
-    /// rebuilding the PREVIOUS state from the new one — each older chain
-    /// record. Reads tree objects for the changed subtrees only.
+    /// Apply this revision's lane transitions and return the forward delta
+    /// advancing the previous union state to the new one — the input the
+    /// mmap updater overlays onto the running full-state. Reads tree objects
+    /// for the changed subtrees only.
     pub fn advance(&mut self, trans: &[Trans], obj: &mut dyn Objects) -> Result<Layer> {
         Ok(Layer { root: advance_node(&mut self.root, trans, obj)? })
     }
@@ -298,7 +309,24 @@ impl Encoder {
 mod tests {
     use super::*;
     use crate::variants::extract;
+    use depot::stream::{diff_stream_holes, overlay_full};
     use std::collections::HashMap;
+
+    /// Empty positive full-state (a present empty root) — what the driver
+    /// seeds the running blob with before the first revision.
+    fn empty_full() -> Vec<u8> {
+        depot::codec::encode(&depot::diff(None, Some(&View::default())))
+    }
+    /// Overlay a forward delta onto the running full-state blob.
+    fn overlay(full: &[u8], fwd: &Layer) -> Vec<u8> {
+        let mut out = Vec::new();
+        overlay_full(full, &depot::codec::encode(fwd), &mut out).unwrap();
+        out
+    }
+    /// The union View a full-state blob resolves to.
+    fn view_of(full: &[u8]) -> View {
+        depot::apply(None, &depot::codec::decode(full).unwrap()).unwrap_or_default()
+    }
 
     /// An in-memory object store: oid → tree entries or blob bytes.
     #[derive(Default)]
@@ -343,11 +371,14 @@ mod tests {
         let t1 = m.tree_ent("t1", vec![("shared", x.clone()), ("f", b.clone())]);
 
         let mut enc = Encoder::new();
-        // Birth both lanes (one advance each, from empty).
-        enc.advance(&[(0, None, Some(&t0))], &mut m).unwrap();
-        enc.advance(&[(1, None, Some(&t1))], &mut m).unwrap();
-        let f0 = enc.full(&mut m).unwrap();
-        let u = depot::apply(None, &f0).unwrap();
+        // Birth both lanes (one advance each, from empty), driving the
+        // running full-state by streaming overlay.
+        let mut full = empty_full();
+        full = overlay(&full, &enc.advance(&[(0, None, Some(&t0))], &mut m).unwrap());
+        full = overlay(&full, &enc.advance(&[(1, None, Some(&t1))], &mut m).unwrap());
+        // The overlay-maintained full-state matches the materialized oracle.
+        assert_eq!(depot::codec::encode(&enc.full(&mut m).unwrap()), full);
+        let u = view_of(&full);
 
         let l0 = extract_lane(&u, 0);
         let l1 = extract_lane(&u, 1);
@@ -358,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_reverse_reconstructs_old_state() {
+    fn edit_forward_advances_and_reverse_reconstructs() {
         let mut m = Mem::default();
         let old = m.blob_ent("old");
         let new = m.blob_ent("new");
@@ -367,15 +398,24 @@ mod tests {
         let t_new = m.tree_ent("tnew", vec![("shared", x.clone()), ("f", new.clone())]);
 
         let mut enc = Encoder::new();
-        enc.advance(&[(0, None, Some(&t_old))], &mut m).unwrap(); // birth = state old
-        let rec = enc.advance(&[(0, Some(&t_old), Some(&t_new))], &mut m).unwrap(); // → state new
-        let f0 = enc.full(&mut m).unwrap();
+        let mut full = empty_full();
+        full = overlay(&full, &enc.advance(&[(0, None, Some(&t_old))], &mut m).unwrap()); // state old
+        let old_full = full.clone();
+        // Forward delta advances old→new; overlay must match the oracle.
+        full = overlay(&full, &enc.advance(&[(0, Some(&t_old), Some(&t_new))], &mut m).unwrap());
+        assert_eq!(depot::codec::encode(&enc.full(&mut m).unwrap()), full, "overlay != materialized");
+        let new_full = full;
 
         // newest (state new)
-        let mut cur = depot::apply(None, &f0);
-        assert_eq!(extract(cur.as_ref().unwrap(), 0).children[b"f".as_slice()].blob.as_deref(), Some(&b"new"[..]));
-        // reverse record rebuilds state old — only `f` changed, `shared` inherited.
-        depot::apply_mut(&mut cur, &rec);
+        assert_eq!(extract(&view_of(&new_full), 0).children[b"f".as_slice()].blob.as_deref(), Some(&b"new"[..]));
+        // The chain's reverse record (hole-diff of the two full-states),
+        // overlaid on the new full-state, rebuilds state old — only `f`
+        // changed, `shared` inherited.
+        let mut rev = Vec::new();
+        diff_stream_holes(&new_full, &old_full, &mut rev).unwrap();
+        let mut back = Vec::new();
+        overlay_full(&new_full, &rev, &mut back).unwrap();
+        let cur = Some(view_of(&back));
         let l = extract(cur.as_ref().unwrap(), 0);
         assert_eq!(l.children[b"f".as_slice()].blob.as_deref(), Some(&b"old"[..]));
         assert_eq!(l.children[b"shared".as_slice()].blob.as_deref(), Some(&b"x"[..]));
@@ -394,15 +434,23 @@ mod tests {
         let r1 = m.tree_ent("r1", vec![("src", src1)]);
 
         let mut enc = Encoder::new();
-        enc.advance(&[(0, None, Some(&r0))], &mut m).unwrap();
-        let rec = enc.advance(&[(0, Some(&r0), Some(&r1))], &mut m).unwrap();
-        let f0 = enc.full(&mut m).unwrap();
-        let mut cur = depot::apply(None, &f0);
+        let mut full = empty_full();
+        full = overlay(&full, &enc.advance(&[(0, None, Some(&r0))], &mut m).unwrap());
+        let old_full = full.clone();
+        full = overlay(&full, &enc.advance(&[(0, Some(&r0), Some(&r1))], &mut m).unwrap());
+        assert_eq!(depot::codec::encode(&enc.full(&mut m).unwrap()), full, "overlay != materialized");
+        let new_full = full;
         // newest: src/m == m1
-        let nl = extract(cur.as_ref().unwrap(), 0);
+        let nl = extract(&view_of(&new_full), 0);
         assert_eq!(nl.children[b"src".as_slice()].children[b"m".as_slice()].blob.as_deref(), Some(&b"m1"[..]));
-        depot::apply_mut(&mut cur, &rec);
-        let ol = extract(cur.as_ref().unwrap(), 0);
+        // reverse record (overlaid on the new full-state) rebuilds the old
+        // state — src/l pruned by oid.
+        let mut rev = Vec::new();
+        diff_stream_holes(&new_full, &old_full, &mut rev).unwrap();
+        let mut back = Vec::new();
+        overlay_full(&new_full, &rev, &mut back).unwrap();
+        let old_view = view_of(&back);
+        let ol = extract(&old_view, 0);
         assert_eq!(ol.children[b"src".as_slice()].children[b"m".as_slice()].blob.as_deref(), Some(&b"m0"[..]));
         assert_eq!(ol.children[b"src".as_slice()].children[b"l".as_slice()].blob.as_deref(), Some(&b"L"[..]));
     }

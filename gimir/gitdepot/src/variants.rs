@@ -67,11 +67,16 @@ fn bit(bm: &[u8], i: usize) -> bool {
 
 /// A leaf delta child reconstructing `target` from `base` (either may be
 /// absent). A `\0v`/`\0m` version node is a leaf, so this is a pure
-/// blob/attrs/tombstone op with no children. [`crate::unionenc`] builds
+/// blob/attrs/hole op with no children (removal is a hole, not a
+/// tombstone — the store occludes no host). [`crate::unionenc`] builds
 /// every version node with it.
 pub(crate) fn leaf_delta(base: Option<&View>, target: Option<&View>) -> Node {
     match target {
-        None => Node::tombstone(), // gone in target → removed when rebuilt
+        // Gone in target → removed. The union occludes no host, so removal
+        // is a HOLE ("not occluded here"), never a tombstone (which would
+        // mask a backdrop there is none of). Overlaid on the running
+        // full-state it erases the key over the empty backdrop.
+        None => Node::hole(),
         Some(t) => {
             if base == Some(t) {
                 return Node::keep(); // identity — pruned by the caller
