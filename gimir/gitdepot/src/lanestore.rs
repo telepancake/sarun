@@ -76,6 +76,19 @@ pub const VARIANT_CUTOFF: f64 = 0.5;
 /// pointer can differ across revisions with no format change.
 const VARIANT_MARK: &[u8] = b"\x00vbase";
 
+/// Adapts the persistent `cat-file --batch` to the encoder's object store:
+/// a tree oid → its parsed entries, a blob oid → its raw bytes.
+struct Cat<'a>(&'a mut crate::CatFile);
+
+impl crate::oidenc::Objects for Cat<'_> {
+    fn tree(&mut self, oid: &str) -> Result<Vec<(Vec<u8>, crate::oidenc::Ent)>> {
+        crate::oidenc::parse_tree(&self.0.get(oid)?)
+    }
+    fn blob(&mut self, oid: &str) -> Result<depot::Bytes> {
+        Ok(self.0.get(oid)?.into())
+    }
+}
+
 fn lane_key(l: LaneId) -> Vec<u8> {
     l.to_be_bytes().to_vec()
 }
@@ -293,7 +306,125 @@ impl LaneStore {
     /// untouched and the frame-to-frame reverse delta is proportional to
     /// real blob churn. Reconstruction is SHA-exact.
     pub fn encode_repo_union(repo: &Path, dir: &Path, level: i32) -> Result<LaneStore> {
-        Self::encode_impl(repo, dir, level, Repr::Union)
+        use crate::oidenc::{Ent, Encoder, Trans};
+
+        // Topology only (cheap): revision order, per-commit parents, lane
+        // assignment, liveness, and the compacted (reused) lane indices.
+        let dag = crate::dag_scope(repo, &[])?;
+        let sha_of = dag.order.clone();
+        let n_rev = sha_of.len();
+        let mut index_of: HashMap<String, usize> = HashMap::with_capacity(n_rev);
+        for (i, s) in sha_of.iter().enumerate() {
+            index_of.insert(s.clone(), i);
+        }
+        let parents = parents_by_index(repo, &index_of)?;
+        let assignment = assign_lanes(&parents);
+        let mono = assignment.lane_of.clone();
+        let birth: Vec<usize> = assignment.span.iter().map(|s| s.0).collect();
+        let mut death: Vec<usize> = vec![n_rev; assignment.span.len()];
+        for i in 0..n_rev {
+            for &p in parents[i].iter().skip(1) {
+                let l = mono[p] as usize;
+                if i < death[l] {
+                    death[l] = i;
+                }
+            }
+        }
+        let (compact_of, width) = crate::lanes::compact_lanes(&birth, &death, n_rev);
+        let lane_of: Vec<LaneId> = mono.iter().map(|&l| compact_of[l as usize]).collect();
+        let mut dying_at: Vec<Vec<LaneId>> = vec![Vec::new(); n_rev + 1];
+        for l in 0..death.len() {
+            if death[l] < n_rev {
+                dying_at[death[l]].push(compact_of[l]);
+            }
+        }
+
+        // sha → root tree oid (one log pass).
+        let mut tree_of: HashMap<String, String> = HashMap::with_capacity(n_rev);
+        for line in crate::git_str(repo, &["log", "--format=%H %T", "--branches", "--tags"])?.lines() {
+            if let Some((s, t)) = line.split_once(' ') {
+                tree_of.insert(s.to_string(), t.to_string());
+            }
+        }
+
+        // The encoder reads git objects by oid on demand; nothing is
+        // materialized. `lane_tree[l]` is lane l's current root tree oid.
+        let depot = open_depot(dir)?;
+        let batch_bound = batch_ram_bound();
+        let mut cat = crate::CatFile::new(repo)?;
+        let mut enc = Encoder::new();
+        let mut lane_tree: Vec<Option<String>> = vec![None; width];
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        let mut batch_bytes: u64 = 0;
+
+        for i in 0..n_rev {
+            let sha = &sha_of[i];
+            let tree_oid =
+                tree_of.get(sha).ok_or_else(|| Error::Chain(format!("no tree for {sha}")))?.clone();
+            let l = lane_of[i] as usize;
+
+            // Transitions: each dying lane leaves; the advancing lane moves.
+            // Skip a dying lane whose compacted index the advancing lane is
+            // reusing this revision — its advancing transition (old = the
+            // dying tree, still in `lane_tree[idx]`) already moves the bit.
+            let dead_old: Vec<(usize, Option<Ent>)> = dying_at[i]
+                .iter()
+                .filter(|&&d| d != lane_of[i])
+                .map(|&d| (d as usize, lane_tree[d as usize].clone().map(Ent::dir)))
+                .collect();
+            let adv_old = lane_tree[l].clone().map(Ent::dir);
+            let adv_new = Ent::dir(tree_oid.clone());
+            let mut trans: Vec<Trans> = Vec::with_capacity(dead_old.len() + 1);
+            for (d, oe) in &dead_old {
+                trans.push((*d, oe.as_ref(), None));
+            }
+            trans.push((l, adv_old.as_ref(), Some(&adv_new)));
+
+            let rev = {
+                let mut objs = Cat(&mut cat);
+                enc.advance(&trans, &mut objs)?
+            };
+            for &d in &dying_at[i] {
+                lane_tree[d as usize] = None;
+            }
+            lane_tree[l] = Some(tree_oid);
+
+            if i == 0 {
+                let f0raw = codec::encode(&enc.full(&mut Cat(&mut cat))?);
+                let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
+                depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
+            } else {
+                let rec = codec::encode(&rev);
+                batch_bytes += 8 + rec.len() as u64;
+                batch.push(rec);
+            }
+            if !batch.is_empty() && batch_bytes >= batch_bound {
+                let head = codec::encode(&enc.full(&mut Cat(&mut cat))?);
+                let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
+                seal_prepend(&depot, &head, &staged, level)?;
+                batch_bytes = 0;
+                depot.flush().map_err(|e| cf(e.to_string()))?;
+            }
+        }
+        if !batch.is_empty() {
+            let head = codec::encode(&enc.full(&mut Cat(&mut cat))?);
+            let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
+            seal_prepend(&depot, &head, &staged, level)?;
+        }
+        if n_rev > 0 {
+            depot.flush().map_err(|e| cf(e.to_string()))?;
+        }
+
+        let sha_to_rev: HashMap<String, usize> =
+            sha_of.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
+        let mut refs = HashMap::new();
+        for (name, sha) in collect_ref_commits(repo)? {
+            if sha_to_rev.contains_key(&sha) {
+                refs.insert(name, sha);
+            }
+        }
+        persist_meta(dir, n_rev, &lane_of, &sha_of, &refs, Repr::Union)?;
+        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs, repr: Repr::Union })
     }
 
     /// Like [`encode_repo`](Self::encode_repo) but stores near-identical
