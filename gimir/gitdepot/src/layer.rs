@@ -13,6 +13,11 @@
 //!   bitmap) and at most one mode tag `x` (executable) / `l` (symlink) /
 //!   `m` (gitlink). A plain file / directory carries no mode tag.
 //!
+//! Meta nodes (`lanes`, `x`/`l`/`m`) carry a (possibly empty) `Set` blob so
+//! they are NON-identity — an identity `[0,0]` child would be pruned by
+//! `compose`/`overlay`, silently dropping the mode or bitmap. Their presence
+//! (and, for `lanes`, content) is the signal; a mode tag's content is empty.
+//!
 //! The `lanes` child is **omitted when the bitmap is all-ones** — its absence
 //! means "this variant is in EVERY live lane". That is the common case (a
 //! file identical across all branches), so most variants store no bitmap. A
@@ -206,6 +211,93 @@ pub fn entry_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     c1.cmp(&c2)
 }
 
+// ------------------------------------------------------------ iterator
+
+/// One file entry yielded by the layer iterator. `content`/`bitmap` borrow
+/// the input buffer (an mmap) — nothing copied; `path` borrows the reused
+/// accumulation buffer for the duration of the call.
+pub struct Entry<'p, 'b> {
+    /// Full git path, e.g. `src/main.rs` (no leading slash).
+    pub path: &'p [u8],
+    pub mode: Mode,
+    /// Which variant (slot) this is at its path.
+    pub slot: u32,
+    /// The lane bitmap, or `None` when omitted (all-ones → every live lane).
+    pub bitmap: Option<&'b [u8]>,
+    /// The file content.
+    pub content: &'b [u8],
+}
+
+/// Walk a layer's canonical bytes in a single forward pass, calling `visit`
+/// on each file variant in container order. No `View`, no per-node
+/// allocation beyond the reused path buffer and O(depth) recursion; content
+/// and bitmap are slices into `bytes`.
+pub fn visit_entries<'b>(
+    bytes: &'b [u8],
+    mut visit: impl FnMut(Entry<'_, 'b>),
+) -> Result<(), depot::walk::DecodeError> {
+    let mut cur = depot::walk::Cursor::new(bytes);
+    let mut path = Vec::new();
+    visit_level(&mut cur, &mut path, &mut visit)
+}
+
+fn visit_level<'b>(
+    cur: &mut depot::walk::Cursor<'b>,
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(Entry<'_, 'b>),
+) -> Result<(), depot::walk::DecodeError> {
+    let node = cur.node()?; // a directory (or the root): no blob, has children
+    for _ in 0..node.child_count {
+        let name = cur.name()?;
+        match classify(name) {
+            Some(Kind::Dir(gitname)) => {
+                let base = push_seg(path, gitname);
+                visit_level(cur, path, visit)?;
+                path.truncate(base);
+            }
+            Some(Kind::File(gitname, slot)) => {
+                let vnode = cur.node()?; // the variant node: blob = content
+                let content = vnode.blob.unwrap_or(&[]);
+                // Meta children: `lanes` bitmap and at most one mode tag.
+                let mut mode = Mode::File;
+                let mut bitmap = None;
+                for _ in 0..vnode.child_count {
+                    let mname = cur.name()?;
+                    let mnode = cur.node()?;
+                    match mname {
+                        LANES => bitmap = Some(mnode.blob.unwrap_or(&[])),
+                        TAG_EXEC => mode = Mode::Exec,
+                        TAG_SYMLINK => mode = Mode::Symlink,
+                        TAG_GITLINK => mode = Mode::Gitlink,
+                        _ => {}
+                    }
+                    // Meta nodes are leaves; drain any children defensively.
+                    for _ in 0..mnode.child_count {
+                        cur.name()?;
+                        cur.skip()?;
+                    }
+                }
+                let base = push_seg(path, gitname);
+                visit(Entry { path: &path[..], mode, slot, bitmap, content });
+                path.truncate(base);
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Push `/seg` (or `seg` at the root) onto the path; returns the prior length
+/// to truncate back to.
+fn push_seg(path: &mut Vec<u8>, seg: &[u8]) -> usize {
+    let base = path.len();
+    if !path.is_empty() {
+        path.push(b'/');
+    }
+    path.extend_from_slice(seg);
+    base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +371,58 @@ mod tests {
             }
         }
         assert!(saw_reorder, "test never exercised a case where bytewise != git");
+    }
+
+    // ---- round-trip: build a union, iterate it back in container order ----
+
+    use depot::{codec, BlobOp, Layer, Node};
+
+    /// A variant node: content blob, plus meta children. A mode tag and the
+    /// `lanes` node carry an empty `Set` blob so they are NON-identity and
+    /// survive `compose`/`overlay` (an identity `[0,0]` child would be pruned).
+    fn variant_node(content: &[u8], mode: Mode, bitmap: Option<&[u8]>) -> Node {
+        let mut n = Node { blob: BlobOp::Set(content.into()), ..Node::keep() };
+        if let Some(tag) = mode.tag() {
+            n.children.insert(tag.to_vec(), Node { blob: BlobOp::Set((&b""[..]).into()), ..Node::keep() });
+        }
+        if let Some(bm) = bitmap {
+            n.children.insert(LANES.to_vec(), Node { blob: BlobOp::Set(bm.into()), ..Node::keep() });
+        }
+        n
+    }
+
+    #[test]
+    fn iterator_round_trips_a_union() {
+        // Root: a universal file, a dir with a normal + an exec file, and a
+        // two-variant file. `Owned` container keys keep child order canonical.
+        let mut root = Node::keep();
+        root.children.insert(file_key(b"a.txt", 0), variant_node(b"hello", Mode::File, None));
+        let mut src = Node::keep();
+        src.children.insert(file_key(b"main.rs", 0), variant_node(b"fn main", Mode::File, None));
+        src.children.insert(file_key(b"run.sh", 0), variant_node(b"#!", Mode::Exec, Some(&[0b11])));
+        root.children.insert(dir_key(b"src"), src);
+        root.children.insert(file_key(b"z", 0), variant_node(b"v0", Mode::File, Some(&[0b01])));
+        root.children.insert(file_key(b"z", 1), variant_node(b"v1", Mode::Symlink, Some(&[0b10])));
+
+        let bytes = codec::encode(&Layer { root });
+
+        let mut got: Vec<(Vec<u8>, Mode, u32, Option<Vec<u8>>, Vec<u8>)> = Vec::new();
+        visit_entries(&bytes, |e| {
+            got.push((e.path.to_vec(), e.mode, e.slot, e.bitmap.map(|b| b.to_vec()), e.content.to_vec()));
+        })
+        .unwrap();
+
+        // Container (bytewise) order: a.txt, src/main.rs, src/run.sh, z#0, z#1.
+        assert_eq!(
+            got,
+            vec![
+                (b"a.txt".to_vec(), Mode::File, 0, None, b"hello".to_vec()),
+                (b"src/main.rs".to_vec(), Mode::File, 0, None, b"fn main".to_vec()),
+                (b"src/run.sh".to_vec(), Mode::Exec, 0, Some(vec![0b11]), b"#!".to_vec()),
+                (b"z".to_vec(), Mode::File, 0, Some(vec![0b01]), b"v0".to_vec()),
+                (b"z".to_vec(), Mode::Symlink, 1, Some(vec![0b10]), b"v1".to_vec()),
+            ]
+        );
     }
 
     #[test]
