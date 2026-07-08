@@ -82,6 +82,52 @@ pub fn assign_lanes(parents: &[Vec<usize>]) -> LaneAssignment {
     LaneAssignment { lane_of, span }
 }
 
+/// Remap the monotonic lane ids to COMPACT ids with reuse: a lane's index
+/// is freed when the lane dies and the next-born lane takes the lowest free
+/// index. Because a reused index is only ever handed to a lane whose life
+/// starts at/after the previous holder's death, two lanes sharing an index
+/// have disjoint `[birth, death)` windows and so are never both live at the
+/// same revision — the bitmap stays a valid per-revision lane set. The
+/// result: bitmap width = PEAK CONCURRENT live lanes, not total lanes ever
+/// (which for a long-lived repo is a large difference).
+///
+/// `birth[l]`/`death[l]` are lane `l`'s live window in revision indices
+/// (`death == n_rev` ⇒ never dies, index never freed). Returns the compact
+/// id per original lane and the total width (highest index + 1 ever used).
+/// Deaths at a revision are freed before that revision's births are placed,
+/// so an index freed at revision `r` is available to a lane born at `r`.
+pub fn compact_lanes(birth: &[usize], death: &[usize], n_rev: usize) -> (Vec<LaneId>, usize) {
+    use std::collections::BinaryHeap;
+    let n = birth.len();
+    let mut born_at: Vec<Vec<usize>> = vec![Vec::new(); n_rev + 1];
+    let mut die_at: Vec<Vec<usize>> = vec![Vec::new(); n_rev + 1];
+    for l in 0..n {
+        born_at[birth[l]].push(l);
+        if death[l] < n_rev {
+            die_at[death[l]].push(l);
+        }
+    }
+    let mut compact = vec![0u32; n];
+    let mut free: BinaryHeap<std::cmp::Reverse<u32>> = BinaryHeap::new();
+    let mut next: u32 = 0;
+    for rev in 0..=n_rev {
+        for &l in &die_at[rev] {
+            free.push(std::cmp::Reverse(compact[l]));
+        }
+        for &l in &born_at[rev] {
+            compact[l] = match free.pop() {
+                Some(std::cmp::Reverse(c)) => c,
+                None => {
+                    let c = next;
+                    next += 1;
+                    c
+                }
+            };
+        }
+    }
+    (compact, next as usize)
+}
+
 /// A variant group: a `base` lane and the `variants` stored as deltas
 /// against it. An independent lane is a singleton group (`variants`
 /// empty, it is its own base).
@@ -152,6 +198,41 @@ mod tests {
 
     fn oids(items: &[&str]) -> HashSet<Vec<u8>> {
         items.iter().map(|s| s.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn compact_reuses_freed_indices() {
+        // Three lanes, n_rev = 30. Lane 0 lives the whole way (never dies).
+        // Lane 1 dies at 10; lane 2 is born at 10 → it should reuse lane 1's
+        // freed index. Peak concurrent = 2, so width = 2, not 3.
+        let birth = vec![0, 0, 10];
+        let death = vec![30, 10, 30];
+        let (compact, width) = compact_lanes(&birth, &death, 30);
+        assert_eq!(width, 2, "peak concurrent live lanes is 2");
+        assert_eq!(compact[0], 0);
+        assert_eq!(compact[1], 1);
+        assert_eq!(compact[2], compact[1], "lane 2 reuses lane 1's freed index");
+    }
+
+    #[test]
+    fn compact_disjoint_lanes_share_one_index() {
+        // A chain of short-lived lanes, each dying before the next is born,
+        // all collapse onto a single index.
+        let birth = vec![0, 5, 10, 15];
+        let death = vec![5, 10, 15, 20];
+        let (compact, width) = compact_lanes(&birth, &death, 20);
+        assert_eq!(width, 1, "never more than one live at a time");
+        assert!(compact.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn compact_never_collides_live_lanes() {
+        // Two permanently-live lanes must keep distinct indices.
+        let birth = vec![0, 3];
+        let death = vec![20, 20];
+        let (compact, width) = compact_lanes(&birth, &death, 20);
+        assert_eq!(width, 2);
+        assert_ne!(compact[0], compact[1]);
     }
 
     #[test]
