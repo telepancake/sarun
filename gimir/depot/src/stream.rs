@@ -1,4 +1,4 @@
-//! Streaming layer algebra — the two FUNDAMENTAL depot operations, done
+//! Streaming layer algebra — the FUNDAMENTAL depot operations, done
 //! directly over the canonical byte encoding (`crate::codec`), never over
 //! an in-memory [`View`]/[`Node`] tree of the whole frame.
 //!
@@ -6,12 +6,18 @@
 //!   streams `a` and `b`; writes the byte stream of `compose(a, b)`: the
 //!   layer of `b` overlaid on the layer of `a`. Byte-for-byte identical to
 //!   `codec::encode(compose(decode(a), decode(b)))`.
-//! - [`diff_stream`] — Function B (the reverse). Reads two canonical
-//!   **full-state** layer byte streams `a` and `b` (each a positive
-//!   `diff(None, view)` record); writes the delta layer that turns the
-//!   first into the second: `compose(a, diff_stream(a, b))` resolves to
-//!   the same view as `b`. Byte-for-byte identical to
-//!   `codec::encode(diff(view(a), view(b)))`.
+//! - [`diff_stream`] / [`diff_stream_holes`] — Function B (the reverse).
+//!   Reads two canonical **full-state** byte streams `a` and `b` (each a
+//!   positive `diff(None, view)` record); writes the delta layer that turns
+//!   the first into the second. `diff_stream` marks a removed key with a
+//!   tombstone (matching `diff` exactly); `diff_stream_holes` marks it with
+//!   a HOLE — the semantically correct removal for a backdrop-anchored store
+//!   that occludes no host (the depot's reverse chain records use it).
+//! - [`overlay_full`] — the mmap updater's step. Overlays a per-revision
+//!   delta on a full-state and writes the NEW positive full-state in one
+//!   pass; a hole overlaid on a key REMOVES it (resolves over the empty
+//!   backdrop), leaving no marker. This is what advances the running
+//!   full-state on encode and walks it back on decode.
 //!
 //! # Why streaming
 //!
@@ -495,13 +501,22 @@ fn compose_collapses(a: &[u8], b: &[u8]) -> Result<bool, DecodeError> {
 /// Function B: the delta layer that turns full-state `a` into full-state
 /// `b`. Both inputs MUST be canonical full-state records (a positive
 /// `diff(None, view)` form: live nodes, `Set`/absent blobs, no tombstones,
-/// no opaque, no backdrop). Output equals
+/// no opaque, no backdrop). Removed keys become TOMBSTONES. Output equals
 /// `codec::encode(&diff(view(a), view(b)))`, byte for byte, where
 /// `view(x) = apply(None, decode(x))`.
 pub fn diff_stream(a: &[u8], b: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeError> {
-    let mut ca = Cur::new(a);
-    let mut cb = Cur::new(b);
-    diff_node(&mut ca, &mut cb, out)
+    diff_node(&mut Cur::new(a), &mut Cur::new(b), &[FLAG_TOMBSTONE], out)
+}
+
+/// [`diff_stream`], but a removed key becomes a HOLE (backdrop anchor)
+/// rather than a tombstone — the semantically correct removal for a
+/// backdrop-anchored store (the git mirror occludes no host). Applied via
+/// [`overlay_full`], such a delta erases the key over the empty backdrop
+/// exactly as a tombstone would, but stays honest under composition and
+/// resolution over any backdrop. This is the form the depot's reverse
+/// chain records use.
+pub fn diff_stream_holes(a: &[u8], b: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeError> {
+    diff_node(&mut Cur::new(a), &mut Cur::new(b), &[FLAG_BACKDROP, 0], out)
 }
 
 /// Normalize an attrs block to "the view's attrs": an absent block and an
@@ -520,18 +535,20 @@ fn norm_attrs(attrs: Option<&[u8]>) -> Option<&[u8]> {
 /// The mmap updater's fundamental step: overlay delta `d` on the current
 /// full-state `base` and write the NEW full-state — positive (canonical
 /// `diff(None, view)`) form, in a single forward pass. `base` MUST be a
-/// canonical full-state record; `d` is a plain lower-anchored delta (the
-/// per-revision change; no holes). Output equals
-/// `codec::encode(&diff(None, apply(view(base), d).as_ref()))`, byte for
-/// byte — the exact record the reader recomputes as a cold-frame anchor,
-/// so a driver can seal it with no `View` ever built.
+/// canonical full-state record; `d` is the per-revision change. Output
+/// equals `codec::encode(&diff(None, apply(None, &compose(base, d))))`,
+/// byte for byte — the positive full-state of `d` composed over `base`
+/// against the EMPTY backdrop — the exact record the reader recomputes as
+/// a cold-frame anchor, so a driver can seal it with no `View` ever built.
 ///
-/// Distinct from [`compose_stream`]: compose is faithful and keeps the
-/// delta's tombstones/removes, so its output is a valid layer but not the
-/// minimal positive full-state. Overlay resolves each name over the
-/// full-state and emits only what survives — a deleted path simply
-/// vanishes — so the result is a proper full-state that never accretes
-/// tombstones commit over commit.
+/// A removal in `d` is a HOLE (backdrop anchor), not a tombstone: the git
+/// mirror occludes no host, so "this key is gone" means "not occluded
+/// here", which over the empty backdrop resolves to nothing. Overlaid on a
+/// key, a hole REMOVES it — the key simply vanishes from the new
+/// full-state, leaving no tombstone. This is why overlay, not the faithful
+/// [`compose_stream`] (which would keep the marker), maintains the
+/// full-state: the result is always positive and never accretes removal
+/// markers commit over commit.
 ///
 /// The huge side (`base`) is only ever spliced verbatim (untouched
 /// children) or recursed (touched children); only the small delta subtrees
@@ -614,11 +631,18 @@ fn overlay_node(base: &mut Cur, delta: &mut Cur, out: &mut Vec<u8>) -> Result<bo
                             }
                             id.next();
                         }
-                        // Touched child: a non-tombstone delta over a
-                        // present (positive) base always survives; a
-                        // tombstone deletes it.
+                        // Touched child. A hole re-bases the name on the
+                        // backdrop (erasing the base) and a tombstone masks
+                        // it — over the empty backdrop both resolve the
+                        // name over nothing (a pure hole/tombstone → gone;
+                        // a backdrop restoration → its own content). A plain
+                        // delta overlays on the present base.
                         Equal => {
-                            if !is_tombstone(dsub) {
+                            if is_backdrop(dsub) {
+                                if let Some(bytes) = positive_over_nothing(dsub)? {
+                                    items.push((bn, Src::Owned(bytes)));
+                                }
+                            } else if !is_tombstone(dsub) {
                                 items.push((bn, Src::Both(bsub, dsub)));
                             }
                             ib.next();
@@ -685,6 +709,14 @@ fn is_tombstone(sub: &[u8]) -> bool {
     sub == [FLAG_TOMBSTONE]
 }
 
+/// Is this encoded node backdrop-anchored (a hole, or a backdrop
+/// restoration)? Its facets resolve against the backdrop, erasing whatever
+/// the base recorded below — so overlaid on a key it removes it (over the
+/// empty backdrop a pure hole resolves to nothing).
+fn is_backdrop(sub: &[u8]) -> bool {
+    sub.first().is_some_and(|f| f & FLAG_BACKDROP != 0)
+}
+
 /// The positive encoding of a delta subtree resolved over NOTHING —
 /// `diff(None, apply(None, delta))` — or `None` if it materializes
 /// nothing. The delta subtree is bounded (a per-revision change), so this
@@ -704,7 +736,7 @@ fn positive_over_nothing(sub: &[u8]) -> Result<Option<Vec<u8>>, DecodeError> {
 /// One node of `diff(Some(view(a)), Some(view(b)))`. Both cursors sit on a
 /// present node (the parent only recurses on two-sided survivors, and the
 /// roots are present); on return both sit just past their node.
-fn diff_node(a: &mut Cur, b: &mut Cur, out: &mut Vec<u8>) -> Result<(), DecodeError> {
+fn diff_node(a: &mut Cur, b: &mut Cur, remove: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeError> {
     let ah = read_head(a)?;
     let bh = read_head(b)?;
 
@@ -745,11 +777,12 @@ fn diff_node(a: &mut Cur, b: &mut Cur, out: &mut Vec<u8>) -> Result<(), DecodeEr
     let a_children = collect_children(a, ah.child_count)?;
     let b_children = collect_children(b, bh.child_count)?;
 
-    // Merge: `a`-only → per-entry tombstone; `b`-only → the child's
-    // full-state bytes verbatim (they already ARE `diff(None, child)`);
-    // two-sided → prune if byte-equal (equal view), else recurse.
+    // Merge: `a`-only → per-entry removal marker (tombstone or hole);
+    // `b`-only → the child's full-state bytes verbatim (they already ARE
+    // `diff(None, child)`); two-sided → prune if byte-equal (equal view),
+    // else recurse.
     enum Src<'a> {
-        Tomb,
+        Remove,
         CopyB(&'a [u8]),
         Both(&'a [u8], &'a [u8]),
     }
@@ -762,7 +795,7 @@ fn diff_node(a: &mut Cur, b: &mut Cur, out: &mut Vec<u8>) -> Result<(), DecodeEr
                 use std::cmp::Ordering::*;
                 match an.cmp(bn) {
                     Less => {
-                        items.push((an, Src::Tomb));
+                        items.push((an, Src::Remove));
                         ia.next();
                     }
                     Greater => {
@@ -779,7 +812,7 @@ fn diff_node(a: &mut Cur, b: &mut Cur, out: &mut Vec<u8>) -> Result<(), DecodeEr
                 }
             }
             (Some((an, _)), None) => {
-                items.push((an, Src::Tomb));
+                items.push((an, Src::Remove));
                 ia.next();
             }
             (None, Some((bn, bsub))) => {
@@ -812,10 +845,10 @@ fn diff_node(a: &mut Cur, b: &mut Cur, out: &mut Vec<u8>) -> Result<(), DecodeEr
     for (name, src) in items {
         put_bytes(out, name);
         match src {
-            Src::Tomb => out.push(FLAG_TOMBSTONE),
+            Src::Remove => out.extend_from_slice(remove),
             Src::CopyB(s) => out.extend_from_slice(s),
             Src::Both(asub, bsub) => {
-                diff_node(&mut Cur::new(asub), &mut Cur::new(bsub), out)?;
+                diff_node(&mut Cur::new(asub), &mut Cur::new(bsub), remove, out)?;
             }
         }
     }

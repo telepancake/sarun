@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use common::{random_layer, random_layer_anchored, Rng};
 use depot::codec::{decode, encode};
-use depot::stream::{compose_stream, diff_stream, overlay_full};
+use depot::stream::{compose_stream, diff_stream, diff_stream_holes, overlay_full};
 use depot::{apply, compose, diff, resolve, Attrs, BlobOp, Layer, Node, View};
 
 // ------------------------------------------------------------- helpers
@@ -319,6 +319,66 @@ fn overlay_corner_fixtures() {
     check_overlay(&base2, &d3, "opaque-mask");
     // No-op delta leaves the full-state identical.
     check_overlay(&base, &Layer::empty(), "noop");
+}
+
+/// A HOLE overlaid on a key removes it — the same positive full-state a
+/// tombstone would yield over the empty backdrop, but the stored delta
+/// carries a hole (a semantically honest "not occluded here"), never a
+/// tombstone. This is the removal form the git mirror's deltas use.
+#[test]
+fn hole_overlay_removes_the_key() {
+    let n = |b: &[u8]| b.to_vec();
+    let blob = |b: &[u8]| Arc::new(View { blob: Some(b.into()), ..View::default() });
+    let set = |b: &[u8]| Node { blob: BlobOp::Set(b.into()), ..Node::keep() };
+    let base = View {
+        children: BTreeMap::from([(n(b"keep"), blob(b"K")), (n(b"gone"), blob(b"G"))]),
+        ..View::default()
+    };
+    let base_full = encode(&diff(None, Some(&base)));
+
+    // Delta: edit `keep`, remove `gone` with a HOLE (not a tombstone).
+    let mut root = Node::keep();
+    root.children.insert(n(b"keep"), set(b"K2"));
+    root.children.insert(n(b"gone"), Node::hole());
+    let delta = Layer { root };
+
+    let mut got = Vec::new();
+    overlay_full(&base_full, &encode(&delta), &mut got).unwrap();
+
+    // The new full-state has `gone` removed and `keep` edited — and is the
+    // positive form (no marker left behind).
+    let want_view = View {
+        children: BTreeMap::from([(n(b"keep"), blob(b"K2"))]),
+        ..View::default()
+    };
+    assert_eq!(got, encode(&diff(None, Some(&want_view))), "hole did not cleanly remove the key");
+    // The delta the reader stores was a hole, and applying it over the base
+    // resolves the key over the empty backdrop = absent.
+    assert_eq!(apply(None, &decode(&got).unwrap()).as_ref(), Some(&want_view));
+}
+
+/// The hole-based reverse chain record: `diff_stream_holes(new, old)`
+/// applied to `new` via `overlay_full` rebuilds `old` exactly — the depot's
+/// actual walk-back, with removals as holes throughout, no tombstone ever
+/// produced by the encoder.
+#[test]
+fn hole_reverse_delta_walks_back() {
+    for seed in 1..400u64 {
+        let mut rng = Rng(seed ^ 0x401e);
+        let old = resolve(&[&random_layer(&mut rng)]);
+        let new = resolve(&[&random_layer(&mut rng)]);
+        if let (Some(old), Some(new)) = (old, new) {
+            let old_full = encode(&diff(None, Some(&old)));
+            let new_full = encode(&diff(None, Some(&new)));
+            // Reverse record: turns new → old, removals as holes.
+            let mut rev = Vec::new();
+            diff_stream_holes(&new_full, &old_full, &mut rev).unwrap();
+            // Walk back: overlay the reverse record onto the new full-state.
+            let mut back = Vec::new();
+            overlay_full(&new_full, &rev, &mut back).unwrap();
+            assert_eq!(back, old_full, "hole reverse delta did not rebuild old, seed {seed}");
+        }
+    }
 }
 
 #[test]

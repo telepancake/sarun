@@ -20,17 +20,26 @@
 //!   [`crate::variants`] and [`crate::reslot`]). Content is byte-stable
 //!   across lane-membership changes.
 //! * **Encoder.** [`crate::oidenc`] holds the union as slot state per path
-//!   and, per revision, applies only the advancing/dying lanes' tree diffs —
-//!   reading git tree objects by oid on demand (through a cache) and pruning
-//!   unchanged subtrees by oid. It emits the depot REVERSE delta (rebuild
-//!   the previous state from the new); f0 and seal heads are the forward
-//!   full state.
+//!   and, per revision, emits the FORWARD delta of only the advancing/dying
+//!   lanes' tree diffs — reading git tree objects by oid on demand (through
+//!   a cache) and pruning unchanged subtrees by oid. The driver keeps the
+//!   running full-state as a canonical POSITIVE byte blob and advances it by
+//!   ONE streaming overlay per revision ([`depot::stream::overlay_full`]) —
+//!   never a materialized `View`. That blob IS the f0 / seal head, read
+//!   straight out; the newest-first reverse chain record is the streaming
+//!   hole-diff of two consecutive full-states
+//!   ([`depot::stream::diff_stream_holes`]). Removals are HOLES, not
+//!   tombstones: the union occludes no host, so "this key is gone" is "not
+//!   occluded here", which resolves to nothing over the empty backdrop.
 //!
 //! ## Reconstruction
 //!
-//! Walk the chain newest-first applying reverse deltas to rebuild the union
-//! state at a revision, then [`crate::variants::extract`] its lane — that
-//! commit's git tree. Its git tree oid equals the real object (SHA-exact).
+//! Walk the chain newest-first, overlaying each reverse record onto the
+//! running full-state ([`depot::stream::overlay_full`]) to step one
+//! revision older — a hole erases its key over the empty backdrop, which is
+//! why the walk is compose-then-resolve (overlay), never fold-apply. Then
+//! [`crate::variants::extract`] the target revision's lane — that commit's
+//! git tree. Its git tree oid equals the real object (SHA-exact).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -221,6 +230,12 @@ impl LaneStore {
         let mut lane_tree: Vec<Option<String>> = vec![None; width];
         let mut batch: Vec<Vec<u8>> = Vec::new();
         let mut batch_bytes: u64 = 0;
+        // The running full-state as a canonical POSITIVE byte blob (never a
+        // materialized View). Seeded empty; advanced each revision by a
+        // single streaming overlay of the forward delta. This IS the f0 /
+        // seal head — read straight from here, never recomputed.
+        let mut full: Vec<u8> = codec::encode(&depot::diff(None, Some(&View::default())));
+        let verify_full = std::env::var("GITDEPOT_VERIFY_FULL").is_ok();
 
         for i in 0..n_rev {
             if std::env::var("GITDEPOT_PROBE").is_ok() && i % 20000 == 0 {
@@ -249,33 +264,51 @@ impl LaneStore {
             }
             trans.push((l, adv_old.as_ref(), Some(&adv_new)));
 
-            let rev = enc.advance(&trans, &mut objs)?;
+            // Forward delta advancing the previous union state to this one.
+            let fwd = codec::encode(&enc.advance(&trans, &mut objs)?);
             for &d in &dying_at[i] {
                 lane_tree[d as usize] = None;
             }
             lane_tree[l] = Some(tree_oid);
 
+            // Advance the running full-state by ONE streaming overlay — no
+            // union is ever materialized as a View.
+            let mut new_full = Vec::new();
+            depot::stream::overlay_full(&full, &fwd, &mut new_full).map_err(|e| cf(e.to_string()))?;
+            if verify_full {
+                debug_assert_eq!(
+                    new_full,
+                    codec::encode(&enc.full(&mut objs)?),
+                    "overlay full-state diverged from the materialized oracle at rev {i}"
+                );
+            }
+
             if i == 0 {
-                let f0raw = codec::encode(&enc.full(&mut objs)?);
-                let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
+                let f0 = compress_frame(&new_full, None, level).map_err(cf)?;
                 depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
             } else {
-                let rec = codec::encode(&rev);
+                // The chain's newest-first reverse record: rebuild the
+                // previous full-state from the new one. Removals are HOLES —
+                // the reader walks back by overlaying these records, so a
+                // hole erases the key over the empty backdrop.
+                let mut rec = Vec::new();
+                depot::stream::diff_stream_holes(&new_full, &full, &mut rec)
+                    .map_err(|e| cf(e.to_string()))?;
                 batch_bytes += 8 + rec.len() as u64;
                 batch.push(rec);
             }
+            full = new_full;
+
             if !batch.is_empty() && batch_bytes >= batch_bound {
-                let head = codec::encode(&enc.full(&mut objs)?);
                 let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
-                seal_prepend(&depot, &head, &staged, level)?;
+                seal_prepend(&depot, &full, &staged, level)?;
                 batch_bytes = 0;
                 depot.flush().map_err(|e| cf(e.to_string()))?;
             }
         }
         if !batch.is_empty() {
-            let head = codec::encode(&enc.full(&mut objs)?);
             let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
-            seal_prepend(&depot, &head, &staged, level)?;
+            seal_prepend(&depot, &full, &staged, level)?;
         }
         if n_rev > 0 {
             depot.flush().map_err(|e| cf(e.to_string()))?;
@@ -359,12 +392,10 @@ impl LaneStore {
             return Err(Error::Chain(format!("no revision {rev}")));
         }
         let target_pos = self.n_rev - 1 - rev; // newest-first position
-        let mut cur: Option<View> = None;
         let mut done: Option<View> = None;
-        self.walk_records(&mut |pos, rec| {
-            depot::apply_mut(&mut cur, &codec::decode(rec)?);
+        self.walk_records(&mut |pos, _rec, full| {
             if pos == target_pos {
-                done = Some(cur.clone().unwrap_or_default());
+                done = Some(depot::apply(None, &codec::decode(full)?).unwrap_or_default());
                 return Ok(true);
             }
             Ok(false)
@@ -402,7 +433,7 @@ impl LaneStore {
     /// not N full trees.
     pub fn uncompressed_record_bytes(&self) -> Result<u64> {
         let mut total = 0u64;
-        self.walk_records(&mut |_pos, rec| {
+        self.walk_records(&mut |_pos, rec, _full| {
             total += rec.len() as u64;
             Ok(false)
         })?;
@@ -416,36 +447,47 @@ impl LaneStore {
     // ------------------------------------------------------- internals
 
     /// Walk the combined-state chain newest-first, handing each stored
-    /// record (raw codec bytes) to `visit(pos, rec)`; `visit` returns
-    /// true to stop. f0 is position 0; then the f1 records and every cold
-    /// frame's records in stored order. This is the sealed TREES chain's
-    /// walk (`store.rs::walk_tree_views`): the records are REVERSE DELTAS,
-    /// so a cold frame's zstd refPrefix is the CANONICAL FULL-VIEW BYTES
-    /// at its newest boundary — recomputed from the working view walked so
-    /// far, NOT the previous record. f1 is anchored on the f0 record (the
-    /// newest full-view bytes). The working view is reconstructed here
-    /// only to supply those boundary anchors.
+    /// record and the full-state it produces to `visit(pos, rec, full)`;
+    /// `visit` returns true to stop. f0 is position 0; then the f1 records
+    /// and every cold frame's records in stored order. The records are
+    /// REVERSE DELTAS (removals as holes): the running full-state is carried
+    /// as POSITIVE canonical bytes and each record is OVERLAID onto it (not
+    /// fold-applied — a hole must resolve over the empty backdrop), so a
+    /// cold frame's zstd refPrefix is exactly that blob at its newest
+    /// boundary, read straight out with no recompute. f1 is anchored on the
+    /// f0 record (the newest full-state bytes).
     fn walk_records(
         &self,
-        visit: &mut dyn FnMut(usize, &[u8]) -> Result<bool>,
+        visit: &mut dyn FnMut(usize, &[u8], &[u8]) -> Result<bool>,
     ) -> Result<()> {
         let head = match self.depot.read_f0(CHAIN) {
             Ok(frame) => decompress_frame(&frame, None).map_err(cf)?,
             Err(wikimak_depot::Error::NoFrame) => return Ok(()),
             Err(e) => return Err(cf(e.to_string())),
         };
-        let mut cur: Option<View> = None;
-        depot::apply_mut(&mut cur, &codec::decode(&head)?);
+        // The running full-state as canonical POSITIVE bytes — never a
+        // materialized View. f0 IS the newest full-state; each reverse
+        // record walks it one revision older by a single streaming overlay
+        // (removals are holes, which fold-apply cannot resolve — overlay
+        // erases them over the empty backdrop). The cold-frame refPrefix is
+        // then exactly this blob at the frame's boundary, no recompute.
+        let mut cur_full = head.clone();
         let mut pos = 0usize;
-        if visit(pos, &head)? {
+        if visit(pos, &head, &cur_full)? {
             return Ok(());
         }
+        let overlay = |cur: &mut Vec<u8>, rec: &[u8]| -> Result<()> {
+            let mut next = Vec::new();
+            depot::stream::overlay_full(cur, rec, &mut next).map_err(|e| cf(e.to_string()))?;
+            *cur = next;
+            Ok(())
+        };
         if let Some(f1) = self.depot.read_f1(CHAIN).map_err(|e| cf(e.to_string()))? {
             let mut stopped = false;
             stream_f1_records(&f1, &head, &mut |rec| {
                 pos += 1;
-                depot::apply_mut(&mut cur, &codec::decode(rec)?);
-                stopped = visit(pos, rec)?;
+                overlay(&mut cur_full, rec)?;
+                stopped = visit(pos, rec, &cur_full)?;
                 Ok(stopped)
             })?;
             if stopped {
@@ -454,13 +496,14 @@ impl LaneStore {
         }
         for cold in self.depot.cold_iter(CHAIN).map_err(|e| cf(e.to_string()))? {
             let frame = cold.map_err(|e| cf(e.to_string()))?;
-            // Canonical full-view bytes at this frame's newest boundary.
-            let anchor = codec::encode(&depot::diff(None, cur.as_ref()));
+            // The positive full-state at this frame's newest boundary — the
+            // refPrefix it was sealed against.
+            let anchor = cur_full.clone();
             let mut stopped = false;
             stream_f1_records(&frame, &anchor, &mut |rec| {
                 pos += 1;
-                depot::apply_mut(&mut cur, &codec::decode(rec)?);
-                stopped = visit(pos, rec)?;
+                overlay(&mut cur_full, rec)?;
+                stopped = visit(pos, rec, &cur_full)?;
                 Ok(stopped)
             })?;
             if stopped {
