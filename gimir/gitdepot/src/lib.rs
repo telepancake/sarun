@@ -89,6 +89,7 @@ use depot::{Attrs, BlobOp, Layer, Node};
 
 mod cli;
 pub use cli::cli_main;
+pub mod geostack;
 pub mod lanes;
 pub mod lanestore;
 pub mod oidenc;
