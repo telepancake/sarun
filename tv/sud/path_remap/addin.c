@@ -302,11 +302,96 @@ static int handle_rename(struct sud_syscall_ctx *ctx,
     return short_circuit(ctx, ret);
 }
 
+/* Kernel stat view (arch-pinned) — we only read st_nlink; same layout
+ * pinned by sud/path_remap/overlay.c. */
+struct link_stat {
+#if defined(__x86_64__)
+    unsigned long _a[2];
+    unsigned long st_nlink;      /* offset 16 */
+    unsigned long _rest[16];
+#else
+    unsigned long long _a0;
+    unsigned char  _pad0[4];
+    unsigned long  _ino;
+    unsigned int   _mode;
+    unsigned int   st_nlink;     /* offset 20 */
+    unsigned long  _rest[16];
+#endif
+};
+
+/* True for /proc/self/fd/<n> or /proc/<pid>/fd/<n> — the path a tool
+ * hands linkat to materialize an O_TMPFILE (or otherwise fd-referenced)
+ * inode into the tree. */
+static int is_proc_fd_path(const char *p)
+{
+    if (!p) return 0;
+    if (strncmp(p, "/proc/", 6) != 0) return 0;
+    const char *q = p + 6;
+    if (strncmp(q, "self/", 5) == 0) {
+        q += 5;
+    } else {
+        if (!(*q >= '0' && *q <= '9')) return 0;
+        while (*q >= '0' && *q <= '9') q++;
+        if (*q != '/') return 0;
+        q++;
+    }
+    return strncmp(q, "fd/", 3) == 0;
+}
+
+/* O_TMPFILE materialization: linkat("/proc/self/fd/N", dst, AT_SYMLINK_
+ * FOLLOW) names an anonymous, link-count-0 inode. Its bytes live on the
+ * fs its O_TMPFILE dir resolved to — the overlay UPPER for a tree dir —
+ * so linking it to the upper dst is same-device and legitimate, but
+ * resolve_upper_pair only sees the /proc source (a carve-out) and would
+ * EXDEV it. Materialize straight to the upper here. Gated on nlink==0 so
+ * a /proc/self/fd link of a NAMED lower/host file still falls through to
+ * the normal cross-layer EXDEV guard (never alias a real host inode). */
+static int try_link_from_tmpfile(struct sud_syscall_ctx *ctx,
+                                 int olddirfd, const char *oldpath,
+                                 int newdirfd_idx, int newpath_idx)
+{
+    struct link_stat st;
+#ifdef __NR_newfstatat
+    long sr = raw_syscall6(__NR_newfstatat, olddirfd, (long)oldpath,
+                           (long)&st, 0 /*follow the magic symlink*/, 0, 0);
+#else
+    long sr = raw_syscall6(__NR_fstatat64, olddirfd, (long)oldpath,
+                           (long)&st, 0 /*follow the magic symlink*/, 0, 0);
+#endif
+    if (sr < 0 || st.st_nlink != 0) return 0;   /* not an anon inode */
+
+    int newdirfd = (newdirfd_idx >= 0) ? (int)ctx->args[newdirfd_idx]
+                                       : AT_FDCWD;
+    char merged[PATH_MAX];
+    if (merged_abs_of(newdirfd, (const char *)ctx->args[newpath_idx],
+                      merged, sizeof(merged)) != 0)
+        return 0;
+    int rc = sud_overlay_resolve(merged, SUD_OVERLAY_FOR_WRITE,
+                                 ctx->scratch, ctx->scratch_size);
+    if (rc == SUD_OVERLAY_PASSTHROUGH) return 0;          /* dst not ours */
+    if (rc == SUD_OVERLAY_READONLY)  return short_circuit(ctx, -EROFS);
+    if (rc != SUD_OVERLAY_RESOLVED)  return 0;
+
+    long ret = raw_syscall6(__NR_linkat, olddirfd, (long)oldpath,
+                            AT_FDCWD, (long)ctx->scratch, AT_SYMLINK_FOLLOW, 0);
+    return short_circuit(ctx, ret);
+}
+
 /* Overlay-aware link.  No whiteout: link leaves the source in place. */
 static int handle_link(struct sud_syscall_ctx *ctx,
                        int olddirfd_idx, int oldpath_idx,
                        int newdirfd_idx, int newpath_idx)
 {
+    /* O_TMPFILE / fd-source materialization (see try_link_from_tmpfile). */
+    const char *oldpath = (const char *)ctx->args[oldpath_idx];
+    if (is_proc_fd_path(oldpath)) {
+        int olddirfd = (olddirfd_idx >= 0) ? (int)ctx->args[olddirfd_idx]
+                                           : AT_FDCWD;
+        int handled = try_link_from_tmpfile(ctx, olddirfd, oldpath,
+                                            newdirfd_idx, newpath_idx);
+        if (handled) return handled;
+    }
+
     char upper_src[PATH_MAX], *dbuf;
     int pr = resolve_upper_pair(ctx, olddirfd_idx, oldpath_idx,
                                 newdirfd_idx, newpath_idx, &dbuf,

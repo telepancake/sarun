@@ -83,13 +83,36 @@ def check(cond, msg):
 # to set an xattr (no setfattr in this image). Static so it needs no in-box
 # dynamic loader path — important for exec-from-inramfs / exec-from-parent-box.
 SUDTOOL_C = r"""
+#define _GNU_SOURCE
 #include <sys/xattr.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "mark")) {
         printf("MARK:%s\n", argv[2]); return 0;
+    }
+    /* Raw rename(2) SRC DST — NOT `mv`, whose EXDEV copy+unlink fallback
+     * would mask a broken cross-store bridge. */
+    if (argc >= 4 && !strcmp(argv[1], "xrename")) {
+        if (rename(argv[2], argv[3]) != 0) { perror("rename"); return 1; }
+        printf("XRENAMED\n"); return 0;
+    }
+    /* O_TMPFILE in DIR then linkat("/proc/self/fd/N", DIR/out) — atomic
+     * output-file creation (ld/gas/install); EXDEV'd under sud pre-fix. */
+    if (argc >= 3 && !strcmp(argv[1], "otmpfile")) {
+        int fd = open(argv[2], O_TMPFILE | O_RDWR, 0644);
+        if (fd < 0) { perror("O_TMPFILE"); return 1; }
+        (void)!write(fd, "TMPDATA", 7);
+        char p[64], dst[256];
+        snprintf(p, sizeof(p), "/proc/self/fd/%d", fd);
+        snprintf(dst, sizeof(dst), "%s/otmp.out", argv[2]);
+        if (linkat(AT_FDCWD, p, AT_FDCWD, dst, AT_SYMLINK_FOLLOW) != 0) {
+            perror("linkat"); return 1;
+        }
+        printf("OTMPLINKED\n"); return 0;
     }
     if (argc >= 5 && !strcmp(argv[1], "setxattr")) {
         if (lsetxattr(argv[2], argv[3], argv[4], strlen(argv[4]), 0) != 0) {
@@ -317,6 +340,37 @@ def sud_inramfs_exec(sudtool):
         r = eng.run("IRBOX", script)
         host_bin.unlink(missing_ok=True)
         return (r.returncode == 0 and "MARK:FROMINRAMFS" in r.stdout, r)
+    finally:
+        eng.close()
+
+
+def sud_xstore_bridge(sudtool):
+    """Cross-store rename/link between inramfs /tmp and the overlay tree
+    must behave as one device (the FUSE backend presents them so). A raw
+    rename(2) from /tmp into the tree, and an O_TMPFILE+linkat inside the
+    tree, both used to fail EXDEV — silently losing a staged build output.
+    Uses the raw-syscall helper so a tool's own EXDEV fallback can't mask
+    a regression."""
+    eng = Engine("sud")
+    try:
+        host_bin = Path(TMPBASE) / "sudeq_xsbin"
+        shutil.copy(sudtool, host_bin); host_bin.chmod(0o755)
+        script = (
+            "cp %s /tmp/xs && chmod +x /tmp/xs && "
+            # raw rename /tmp (inramfs) -> /root (overlay): content survives
+            "echo HDRDATA > /tmp/staged.h && "
+            "/tmp/xs xrename /tmp/staged.h /root/moved.h && "
+            "cat /root/moved.h && "
+            # O_TMPFILE + linkat inside the overlay tree
+            "mkdir -p /root/od && /tmp/xs otmpfile /root/od && "
+            "cat /root/od/otmp.out"
+        ) % host_bin
+        r = eng.run("XSBOX", script)
+        host_bin.unlink(missing_ok=True)
+        ok = (r.returncode == 0 and "XRENAMED" in r.stdout
+              and "HDRDATA" in r.stdout and "OTMPLINKED" in r.stdout
+              and "TMPDATA" in r.stdout)
+        return (ok, r)
     finally:
         eng.close()
 
@@ -566,6 +620,11 @@ def main():
         check(ok_pb, "sud: nested box execs a binary from its PARENT box's layer"
                      + ("" if ok_pb else f" (rc={r_pb.returncode} "
                         f"out={r_pb.stdout[-120:]!r} err={r_pb.stderr[-160:]!r})"))
+        ok_xs, r_xs = sud_xstore_bridge(sudtool)
+        check(ok_xs, "sud: cross-store rename /tmp->tree + O_TMPFILE linkat "
+                     "bridge like one device"
+                     + ("" if ok_xs else f" (rc={r_xs.returncode} "
+                        f"out={r_xs.stdout[-160:]!r} err={r_xs.stderr[-160:]!r})"))
     except Exception as e:
         print(f"test_sud_equiv_rs: sud capability section unavailable ({e})")
 

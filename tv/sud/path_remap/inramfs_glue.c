@@ -38,6 +38,7 @@
 
 #include "sud/path_remap/inramfs_glue.h"
 #include "sud/path_remap/path.h"
+#include "sud/path_remap/overlay.h"
 #include "sud/inramfs/inramfs.h"
 #include "sud/raw.h"
 
@@ -120,6 +121,176 @@ static int resolve_ticket(struct sud_syscall_ctx *ctx,
                                             ctx->scratch_size, out);
 }
 
+/* ================================================================
+ * Cross-store bridge — kills the inramfs <-> overlay EXDEV class.
+ *
+ * A rename/link with ONE side under the inramfs mount (/tmp) and the
+ * other in the overlay tree is, at the sud layer, genuinely cross-
+ * device (two backing stores). The FUSE backend presents /tmp and the
+ * tree as ONE device, so a build that stages a file in /tmp and moves
+ * it into the tree "just works" there. To match FUSE we copy the bytes
+ * across and — for rename — drop the source, exactly as `mv` does over
+ * real filesystems, but TRANSPARENTLY: a tool that issues a bare
+ * rename(2) and never handles EXDEV still wins (which is the failure a
+ * plain overlay-vs-inramfs EXDEV caused: the staged output vanished and
+ * the next build step hit "No such file"). Directories are not bridged
+ * (return -EXDEV, as the kernel does for a cross-fs directory rename).
+ * ================================================================ */
+
+/* Kernel stat layout, arch-pinned (only st_mode is read). Matches the
+ * struct the *stat syscalls / sud_inramfs_op_stat_inode fill — same
+ * layout sud/path_remap/overlay.c depends on. */
+struct xs_stat {
+#if defined(__x86_64__)
+    unsigned long _a[3];
+    unsigned int  st_mode;   /* offset 24 */
+    unsigned int  _b[9];
+    unsigned long _rest[16];
+#else
+    unsigned long long _a0;
+    unsigned char  _pad0[4];
+    unsigned long  _ino;
+    unsigned int   st_mode;  /* offset 16 */
+    unsigned int   _b[7];
+    unsigned long  _rest[16];
+#endif
+};
+
+#define XSTORE_BUF 8192
+
+/* resolve_two_tickets() cross-boundary signals (positive, distinct from
+ * 0 = both-inramfs, -1 = neither, other <0 = real -errno). */
+enum { XS_IR_TO_OV = 1, XS_OV_TO_IR = 2 };
+
+/* Copy an inramfs source file into an overlay destination path; for
+ * rename, unlink the inramfs source afterwards. `is_link` leaves the
+ * source in place and fails EEXIST if the destination already exists. */
+static long xstore_ir_to_ov(int is_link,
+                            const struct sud_pr_inramfs_ticket *src,
+                            int dst_dirfd, const char *dst_path)
+{
+    if (!src->leaf_idx) return -ENOENT;
+    if (sud_inramfs_inode_is_dir(src->leaf_idx)) return -EXDEV;
+
+    struct xs_stat st;
+    if (sud_inramfs_op_stat_inode(src->leaf_idx, &st) < 0) return -EIO;
+    int mode = (int)(st.st_mode & 07777);
+
+    int sfd = (int)sud_inramfs_op_open_inode(src->leaf_idx, O_RDONLY);
+    if (sfd < 0) return sfd;
+
+    char up[PATH_MAX];
+    int rc = sud_overlay_resolve_at(dst_dirfd, dst_path,
+                                    SUD_OVERLAY_FOR_WRITE, up, sizeof(up));
+    if (rc != SUD_OVERLAY_RESOLVED) {
+        sud_inramfs_op_close(sfd);
+        return (rc == SUD_OVERLAY_READONLY) ? -EROFS : -EXDEV;
+    }
+
+    int oflags = O_WRONLY | O_CREAT | O_TRUNC | (is_link ? O_EXCL : 0);
+    int dfd = raw_open3(up, oflags, mode);
+    if (dfd < 0) { sud_inramfs_op_close(sfd); return dfd; }
+
+    char buf[XSTORE_BUF];
+    long n, err = 0;
+    while ((n = sud_inramfs_op_read(sfd, buf, sizeof(buf))) > 0) {
+        long off = 0;
+        while (off < n) {
+            long w = raw_write(dfd, buf + off, (size_t)(n - off));
+            if (w <= 0) { err = (w < 0) ? w : -EIO; break; }
+            off += w;
+        }
+        if (err) break;
+    }
+    if (n < 0 && !err) err = n;
+    raw_close(dfd);
+    sud_inramfs_op_close(sfd);
+    if (err) {
+        /* Leave no half-written destination the build could mistake for
+         * a complete output. */
+        raw_syscall6(SYS_unlinkat, AT_FDCWD, (long)up, 0, 0, 0, 0);
+        return err;
+    }
+    if (!is_link)
+        return sud_inramfs_op_unlink_at_inode(src->parent_idx,
+                                              src->basename,
+                                              src->basename_len);
+    return 0;
+}
+
+/* Copy an overlay source file into an inramfs destination; for rename,
+ * whiteout the overlay source afterwards. */
+static long xstore_ov_to_ir(int is_link,
+                            int src_dirfd, const char *src_path,
+                            const struct sud_pr_inramfs_ticket *dst)
+{
+    if (is_link && dst->leaf_idx) return -EEXIST;
+
+    char rp[PATH_MAX], absbuf[PATH_MAX];
+    int rc = sud_overlay_resolve_at(src_dirfd, src_path,
+                                    SUD_OVERLAY_FOR_READ, rp, sizeof(rp));
+    const char *readpath;
+    if (rc == SUD_OVERLAY_RESOLVED) {
+        readpath = rp;
+    } else if (rc == SUD_OVERLAY_PASSTHROUGH) {
+        if (sud_pr_absolutise(src_dirfd, src_path, absbuf, sizeof(absbuf)) != 0)
+            return -EXDEV;
+        readpath = absbuf;
+    } else {
+        return (rc == SUD_OVERLAY_WHITEOUT) ? -ENOENT : -EXDEV;
+    }
+
+    struct xs_stat st;
+#ifdef SYS_newfstatat
+    if (raw_syscall6(SYS_newfstatat, AT_FDCWD, (long)readpath, (long)&st,
+                     AT_SYMLINK_NOFOLLOW, 0, 0) < 0) return -ENOENT;
+#else
+    if (raw_syscall6(SYS_fstatat64, AT_FDCWD, (long)readpath, (long)&st,
+                     AT_SYMLINK_NOFOLLOW, 0, 0) < 0) return -ENOENT;
+#endif
+    if ((st.st_mode & 0170000) == 0040000) return -EXDEV;  /* directory */
+    int mode = (int)(st.st_mode & 07777);
+
+    int sfd = raw_open(readpath, O_RDONLY);
+    if (sfd < 0) return sfd;
+    int dfd = (int)sud_inramfs_op_create_open_inode(
+                  dst->parent_idx, dst->basename, dst->basename_len,
+                  O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (dfd < 0) { raw_close(sfd); return dfd; }
+
+    char buf[XSTORE_BUF];
+    long n, err = 0;
+    while ((n = raw_read(sfd, buf, sizeof(buf))) > 0) {
+        long off = 0;
+        while (off < n) {
+            long w = sud_inramfs_op_write(dfd, buf + off, (size_t)(n - off));
+            if (w <= 0) { err = (w < 0) ? w : -EIO; break; }
+            off += w;
+        }
+        if (err) break;
+    }
+    if (n < 0 && !err) err = n;
+    sud_inramfs_op_close(dfd);
+    raw_close(sfd);
+    if (err) {
+        sud_inramfs_op_unlink_at_inode(dst->parent_idx, dst->basename,
+                                       dst->basename_len);
+        return err;
+    }
+    if (!is_link) {
+        /* Drop the overlay source: unlink its upper copy (if any) and
+         * whiteout so a lower layer doesn't resurface the old name. */
+        char merged[PATH_MAX], sup[PATH_MAX];
+        if (sud_pr_absolutise(src_dirfd, src_path, merged, sizeof(merged)) == 0) {
+            if (sud_overlay_resolve(merged, SUD_OVERLAY_FOR_WRITE,
+                                    sup, sizeof(sup)) == SUD_OVERLAY_RESOLVED)
+                raw_syscall6(SYS_unlinkat, AT_FDCWD, (long)sup, 0, 0, 0, 0);
+            sud_overlay_create_whiteout(merged);
+        }
+    }
+    return 0;
+}
+
 /* Resolve a (src, dst) pair for rename/link.  Both must lie under
  * the inramfs mount; mixed (one in, one out) is rejected with
  * -EXDEV, matching kernel cross-FS link/rename semantics.
@@ -141,18 +312,16 @@ static int resolve_two_tickets(struct sud_syscall_ctx *ctx,
     if (r < 0) {
         /* Src is outside the inramfs mount (r == -1) or a resolve error.
          * If the DESTINATION is under the mount, this is a cross-boundary
-         * rename/link (overlay/host -> inramfs). We must claim it and
-         * surface -EXDEV so mv/ln fall back to copy+unlink — otherwise it
-         * falls through to the overlay, which kernel-renames the source
-         * into a path inramfs shadows: source gone, destination invisible,
-         * SILENT DATA LOSS. Symmetric with the src-inside/dst-outside case
-         * below, which already returns -EXDEV. */
+         * rename/link (overlay/host -> inramfs): claim it and return
+         * XS_OV_TO_IR so the caller BRIDGES it (copy + source whiteout).
+         * Letting it fall through to the overlay would kernel-rename the
+         * source into a path inramfs shadows — source gone, destination
+         * invisible: SILENT DATA LOSS. */
         if (r == -1) {
-            struct sud_pr_inramfs_ticket probe;
             int dr = sud_pr_resolve_at_inramfs_ticket(
                 dst_dirfd, dst_path, 0 /*follow*/, 1 /*want_parent*/,
-                ctx->scratch, ctx->scratch_size, &probe);
-            if (dr >= 0) return -EXDEV;   /* dst inside, src outside */
+                ctx->scratch, ctx->scratch_size, dst_t);
+            if (dr >= 0) return XS_OV_TO_IR;  /* dst inside, src outside */
         }
         return r;                          /* neither ours, or a real error */
     }
@@ -169,8 +338,8 @@ static int resolve_two_tickets(struct sud_syscall_ctx *ctx,
                                          0 /*follow=0*/, 1 /*want_parent*/,
                                          ctx->scratch, ctx->scratch_size,
                                          dst_t);
-    /* Source under mount, destination not → cross-FS. */
-    if (r < 0) return -EXDEV;
+    /* Source under mount, destination not → bridge inramfs -> overlay. */
+    if (r < 0) return XS_IR_TO_OV;
     return 0;
 }
 
@@ -590,19 +759,31 @@ static int dispatch_single_path(struct sud_syscall_ctx *ctx)
 static int dispatch_two_path(struct sud_syscall_ctx *ctx,
                              int src_dirfd_idx, int src_path_idx,
                              int dst_dirfd_idx, int dst_path_idx,
-                             ir_two_path_handler h)
+                             ir_two_path_handler h, int is_link, long xflags)
 {
     char src_save[PATH_MAX];
     int src_dirfd = (src_dirfd_idx < 0) ? AT_FDCWD
                                         : (int)ctx->args[src_dirfd_idx];
     int dst_dirfd = (dst_dirfd_idx < 0) ? AT_FDCWD
                                         : (int)ctx->args[dst_dirfd_idx];
+    const char *src_path = (const char *)ctx->args[src_path_idx];
+    const char *dst_path = (const char *)ctx->args[dst_path_idx];
     struct sud_pr_inramfs_ticket src_t, dst_t;
-    int r = resolve_two_tickets(ctx,
-                                src_dirfd, (const char *)ctx->args[src_path_idx],
-                                dst_dirfd, (const char *)ctx->args[dst_path_idx],
+    int r = resolve_two_tickets(ctx, src_dirfd, src_path, dst_dirfd, dst_path,
                                 src_save, sizeof(src_save), &src_t, &dst_t);
     if (r == -1) return 0;
+    if (r == XS_IR_TO_OV || r == XS_OV_TO_IR) {
+        /* Cross-store rename/link: bridge it (copy + source drop) so it
+         * behaves like the single-device FUSE backend. renameat2 flags
+         * (EXCHANGE/NOREPLACE/WHITEOUT) have no atomic cross-store form —
+         * surface the kernel's cross-fs -EXDEV so the caller copes. */
+        if (xflags != 0) return short_circuit(ctx, -EXDEV);
+        if (r == XS_IR_TO_OV)
+            return short_circuit(ctx,
+                xstore_ir_to_ov(is_link, &src_t, dst_dirfd, dst_path));
+        return short_circuit(ctx,
+            xstore_ov_to_ir(is_link, src_dirfd, src_path, &dst_t));
+    }
     if (r < 0)   return short_circuit(ctx, r);
     return short_circuit(ctx, h(ctx, &src_t, &dst_t));
 }
@@ -625,23 +806,24 @@ int sud_pr_inramfs_route_pre_syscall(struct sud_syscall_ctx *ctx)
      * because rename/link don't appear in ir_path_dispatch[]. */
 #ifdef SYS_rename
     if (nr == SYS_rename)
-        return dispatch_two_path(ctx, -1, 0, -1, 1, h_rename);
+        return dispatch_two_path(ctx, -1, 0, -1, 1, h_rename, 0, 0);
 #endif
 #ifdef SYS_renameat
     if (nr == SYS_renameat)
-        return dispatch_two_path(ctx,  0, 1,  2, 3, h_rename);
+        return dispatch_two_path(ctx,  0, 1,  2, 3, h_rename, 0, 0);
 #endif
 #ifdef SYS_renameat2
     if (nr == SYS_renameat2)
-        return dispatch_two_path(ctx,  0, 1,  2, 3, h_renameat2);
+        return dispatch_two_path(ctx,  0, 1,  2, 3, h_renameat2, 0,
+                                 (long)ctx->args[4]);
 #endif
 #ifdef SYS_link
     if (nr == SYS_link)
-        return dispatch_two_path(ctx, -1, 0, -1, 1, h_link);
+        return dispatch_two_path(ctx, -1, 0, -1, 1, h_link, 1, 0);
 #endif
 #ifdef SYS_linkat
     if (nr == SYS_linkat)
-        return dispatch_two_path(ctx,  0, 1,  2, 3, h_link);
+        return dispatch_two_path(ctx,  0, 1,  2, 3, h_link, 1, 0);
 #endif
 
     /* fstatat / statx parse AT_SYMLINK_NOFOLLOW from per-call flags,
