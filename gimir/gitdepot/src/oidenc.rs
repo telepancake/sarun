@@ -450,9 +450,41 @@ pub struct Encoder {
     root: Skel,
 }
 
+/// One variant read back from a stored boundary union, to seed the encoder for
+/// an incremental update: its path, the SLOT KEY it occupied (read from the
+/// stored frame so a prepended reverse delta reconstructs that frame exactly),
+/// its git mode octal + blob oid (the `(mode, oid)` identity, sourced from the
+/// boundary lane trees per §6 — never by hashing stored content), and its lane
+/// bitmap (an omitted `lanes` child is expanded to the boundary live set by the
+/// caller before seeding).
+pub struct SeedVariant {
+    pub path: Vec<u8>,
+    pub slot: u32,
+    pub mode: Vec<u8>,
+    pub oid: String,
+    pub bitmap: Vec<u8>,
+}
+
 impl Encoder {
     pub fn new() -> Self {
         Encoder::default()
+    }
+
+    /// Reconstruct an encoder whose skeleton IS a stored boundary union: place
+    /// each variant back at its recorded slot with its `(mode, oid)` identity
+    /// and bitmap. The result equals the encoder state at the end of the
+    /// original encode, so `advance`-ing new revisions onto it and prepending
+    /// the reverse deltas reproduces the stored boundary byte-for-byte.
+    pub fn seed(variants: Vec<SeedVariant>) -> Encoder {
+        let mut root = Skel::default();
+        for v in variants {
+            let mut cur = &mut root;
+            for seg in v.path.split(|&b| b == b'/') {
+                cur = cur.children.entry(seg.to_vec()).or_default();
+            }
+            cur.slots.set(v.slot, Occupant { id: (v.mode, v.oid), bitmap: v.bitmap });
+        }
+        Encoder { root }
     }
 
     /// Apply this revision's lane transitions and return the reverse delta

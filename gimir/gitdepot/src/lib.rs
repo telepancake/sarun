@@ -3010,6 +3010,15 @@ pub fn union_import(repo: &Path, store: &Path, level: i32) -> Result<UnionOutcom
     Ok(UnionOutcome { n_rev, n_lanes, on_disk: dir_size(store) })
 }
 
+/// Incrementally update the union store at `store` from `repo` (§11) — folds
+/// only the new commits' union deltas onto the stored boundary, O(new).
+pub fn union_update(repo: &Path, store: &Path, level: i32) -> Result<UnionOutcome> {
+    let s = crate::lanestore::LaneStore::update(repo, store, level)?;
+    let n_rev = s.n_rev();
+    let n_lanes = (0..n_rev).map(|r| s.lane_of(r)).max().map(|m| m as usize + 1).unwrap_or(0);
+    Ok(UnionOutcome { n_rev, n_lanes, on_disk: dir_size(store) })
+}
+
 /// Reopen the union store at `store` and check that every `stride`-th commit's
 /// tree reconstructs SHA-exact from the stored union bytes, against `repo` as
 /// the oracle. Returns `(checked, mismatches)`.
