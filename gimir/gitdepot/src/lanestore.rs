@@ -652,6 +652,42 @@ impl LaneStore {
         crate::layer::tree_oid_of_entries(&self.lane_entries_at(rev)?).map_err(|e| cf(format!("{e:?}")))
     }
 
+    /// The commit-at-`rev`'s git tree as a nested `depot::View`: leaf files
+    /// carry the blob content and a `mode` attr (git octal, e.g. `100644` /
+    /// `100664`). This is the shape the mirror's readout and export consume, so
+    /// the union is the mirror's TREES payload with no per-commit tree stored.
+    pub fn tree_view_at(&self, rev: usize) -> Result<View> {
+        use std::sync::Arc;
+        let mut root = View::default();
+        for (path, mode, content) in self.lane_entries_at(rev)? {
+            let segs: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+            let mut cur = &mut root;
+            for (i, s) in segs.iter().enumerate() {
+                if i + 1 == segs.len() {
+                    let mut attrs = depot::Attrs::new();
+                    attrs.insert(b"mode".to_vec(), mode.octal());
+                    cur.children.insert(
+                        s.to_vec(),
+                        Arc::new(View { blob: Some(content.clone().into()), attrs, children: Default::default() }),
+                    );
+                } else {
+                    let e = cur
+                        .children
+                        .entry(s.to_vec())
+                        .or_insert_with(|| Arc::new(View::default()));
+                    cur = Arc::make_mut(e);
+                }
+            }
+        }
+        Ok(root)
+    }
+
+    /// The commit named `sha`'s git tree as a nested `depot::View`.
+    pub fn tree_view_of_commit(&self, sha: &str) -> Result<View> {
+        let rev = self.rev_of(sha).ok_or_else(|| Error::Chain(format!("commit {sha} not in store")))?;
+        self.tree_view_at(rev)
+    }
+
     /// The git tree oid of the commit named by `sha` (reconstructed from
     /// the lane store) — the SHA-exact round-trip entry point.
     pub fn tree_oid_of_commit(&self, sha: &str) -> Result<String> {
