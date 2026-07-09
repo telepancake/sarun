@@ -3,8 +3,10 @@
 Read `gitdepot/pipeline/00-context.md`, `gitdepot/DESIGN.md`, and
 `gitdepot/VALIDATION.md`.
 
-Measure the engine on real repositories (use `/home/user/sarun` itself, and any
-other real repo available locally), reading results back out of the stored data:
+Measure the engine on real repositories, reading results back out of the stored
+data. Local repos to use are in `/home/user/eval-repos/` (bare clones:
+`git.git`, `sqlite.git`, `ripgrep.git`, `jq.git`); `/home/user/sarun` itself is
+also available. Measure across a range of sizes:
 
 - reconstruct trees from what is stored and check them against git's own object
   ids;
