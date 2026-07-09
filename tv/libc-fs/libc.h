@@ -38,6 +38,21 @@
 #define SYS_read           __NR_read
 #define SYS_write          __NR_write
 #define SYS_writev         __NR_writev
+#ifdef __NR_readv
+#define SYS_readv          __NR_readv
+#endif
+#ifdef __NR_preadv
+#define SYS_preadv         __NR_preadv
+#endif
+#ifdef __NR_pwritev
+#define SYS_pwritev        __NR_pwritev
+#endif
+#ifdef __NR_preadv2
+#define SYS_preadv2        __NR_preadv2
+#endif
+#ifdef __NR_pwritev2
+#define SYS_pwritev2       __NR_pwritev2
+#endif
 #define SYS_openat         __NR_openat
 #define SYS_close          __NR_close
 #define SYS_pread64        __NR_pread64

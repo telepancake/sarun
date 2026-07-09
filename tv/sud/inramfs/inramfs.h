@@ -225,6 +225,12 @@ long sud_inramfs_op_read(int fd, void *buf, size_t count);
 long sud_inramfs_op_write(int fd, const void *buf, size_t count);
 long sud_inramfs_op_pread(int fd, void *buf, size_t count, off_t off);
 long sud_inramfs_op_pwrite(int fd, const void *buf, size_t count, off_t off);
+/* Vectored I/O (writev/readv and the positional preadv/pwritev family).
+ * `iov` points at the caller's struct iovec array; iterated in place. */
+long sud_inramfs_op_writev(int fd, const void *iov, int iovcnt);
+long sud_inramfs_op_readv(int fd, const void *iov, int iovcnt);
+long sud_inramfs_op_pwritev(int fd, const void *iov, int iovcnt, off_t off);
+long sud_inramfs_op_preadv(int fd, const void *iov, int iovcnt, off_t off);
 long sud_inramfs_op_lseek(int fd, off_t off, int whence);
 long sud_inramfs_op_llseek(int fd, int64_t off, int whence, int64_t *result);
 long sud_inramfs_op_ftruncate(int fd, off_t length);

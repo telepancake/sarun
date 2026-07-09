@@ -154,6 +154,56 @@ static void test_open_write_read(void)
     teardown_mount();
 }
 
+/* Vectored I/O (writev/readv and positional preadv/pwritev): musl
+ * stdio flushes buffered FILE* writes via writev, so a build tool
+ * writing intermediates to /tmp corrupts them (zero-length files) if
+ * these ops fall through to the empty backing memfd instead of the
+ * inramfs store.  struct iovec layout is {ptr, size_t} on both arches. */
+struct test_iovec { void *iov_base; size_t iov_len; };
+
+static void test_vectored_io(void)
+{
+    g_curtest = "vectored_io";
+    setup_mount("/inramfs", 4, "test_vec");
+    int fd = (int)sud_inramfs_op_open("/inramfs/v", O_RDWR | O_CREAT, 0644);
+    TASSERT(fd >= 0, "open v");
+
+    /* writev: two fragments concatenated at the fd position. */
+    struct test_iovec w[2] = { { "Hello, ", 7 }, { "World!\n", 7 } };
+    TASSERT_EQ(sud_inramfs_op_writev(fd, w, 2), 14, "writev 14");
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 0, SEEK_END), 14, "size 14");
+
+    /* readv: split the readback across two buffers. */
+    char b1[7] = {0}, b2[7] = {0};
+    struct test_iovec r[2] = { { b1, 7 }, { b2, 7 } };
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 0, SEEK_SET), 0, "rewind");
+    TASSERT_EQ(sud_inramfs_op_readv(fd, r, 2), 14, "readv 14");
+    TASSERT(memcmp(b1, "Hello, ", 7) == 0, "readv frag 0");
+    TASSERT(memcmp(b2, "World!\n", 7) == 0, "readv frag 1");
+
+    /* pwritev/preadv are positional and must NOT disturb the fd pos. */
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 3, SEEK_SET), 3, "pos to 3");
+    struct test_iovec pw[2] = { { "AB", 2 }, { "CD", 2 } };
+    TASSERT_EQ(sud_inramfs_op_pwritev(fd, pw, 2, 7), 4, "pwritev 4 @7");
+    char pr1[2] = {0}, pr2[2] = {0};
+    struct test_iovec pr[2] = { { pr1, 2 }, { pr2, 2 } };
+    TASSERT_EQ(sud_inramfs_op_preadv(fd, pr, 2, 7), 4, "preadv 4 @7");
+    TASSERT(pr1[0] == 'A' && pr1[1] == 'B', "preadv frag 0");
+    TASSERT(pr2[0] == 'C' && pr2[1] == 'D', "preadv frag 1");
+    /* positional ops left the fd position untouched. */
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 0, SEEK_CUR), 3, "pos unchanged");
+
+    /* readv over a zero-length fragment skips it and keeps going. */
+    char z1[3] = {0};
+    struct test_iovec zr[3] = { { z1, 0 }, { z1, 3 }, { z1, 0 } };
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 0, SEEK_SET), 0, "rewind2");
+    TASSERT_EQ(sud_inramfs_op_readv(fd, zr, 3), 3, "readv skips empties");
+    TASSERT(memcmp(z1, "Hel", 3) == 0, "readv into 2nd frag");
+
+    sud_inramfs_op_close(fd);
+    teardown_mount();
+}
+
 static void test_lseek_holes(void)
 {
     g_curtest = "lseek_holes";
@@ -780,6 +830,7 @@ int main(int argc, char **argv)
     test_init_and_root();
     test_mkdir_lookup();
     test_open_write_read();
+    test_vectored_io();
     test_lseek_holes();
     test_truncate();
     test_unlink_rename();

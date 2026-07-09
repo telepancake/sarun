@@ -488,6 +488,55 @@ long sud_inramfs_op_pwrite(int fd, const void *buf, size_t count, off_t off)
     return sud_ir_file_write(ino, buf, count, off);
 }
 
+/* Kernel struct iovec layout for the running arch (pointer + size_t;
+ * 8 bytes on i386, 16 on x86_64 — matches what writev/readv pass). */
+struct ir_iovec { void *iov_base; size_t iov_len; };
+
+/* Shared body for the vectored ops.  `positional` != 0 means the
+ * preadv/pwritev family: transfer starts at `off` and the fd position
+ * is NOT advanced; otherwise (readv/writev) each fragment goes through
+ * the sequential op_read/op_write which advance of->pos.  `is_write`
+ * picks the direction.  Follows kernel short-transfer semantics: on the
+ * FIRST fragment an error is returned as-is; a later error (or a short
+ * fragment) stops the loop and returns the bytes transferred so far. */
+static long sud_inramfs_vec(int fd, const struct ir_iovec *iov, int iovcnt,
+                            int is_write, int positional, off_t off)
+{
+    if (iovcnt < 0) return -EINVAL;
+    long total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        void  *base = iov[i].iov_base;
+        size_t len  = iov[i].iov_len;
+        if (len == 0) continue;
+        long n;
+        if (positional) {
+            n = is_write
+                ? sud_inramfs_op_pwrite(fd, base, len, off + total)
+                : sud_inramfs_op_pread (fd, base, len, off + total);
+        } else {
+            n = is_write
+                ? sud_inramfs_op_write(fd, base, len)
+                : sud_inramfs_op_read (fd, base, len);
+        }
+        if (n < 0) return total > 0 ? total : n;
+        total += n;
+        if ((size_t)n < len) break;   /* short transfer — stop, like the kernel */
+    }
+    return total;
+}
+
+long sud_inramfs_op_writev(int fd, const void *iov, int iovcnt)
+{ return sud_inramfs_vec(fd, (const struct ir_iovec *)iov, iovcnt, 1, 0, 0); }
+
+long sud_inramfs_op_readv(int fd, const void *iov, int iovcnt)
+{ return sud_inramfs_vec(fd, (const struct ir_iovec *)iov, iovcnt, 0, 0, 0); }
+
+long sud_inramfs_op_pwritev(int fd, const void *iov, int iovcnt, off_t off)
+{ return sud_inramfs_vec(fd, (const struct ir_iovec *)iov, iovcnt, 1, 1, off); }
+
+long sud_inramfs_op_preadv(int fd, const void *iov, int iovcnt, off_t off)
+{ return sud_inramfs_vec(fd, (const struct ir_iovec *)iov, iovcnt, 0, 1, off); }
+
 long sud_inramfs_op_lseek(int fd, off_t off, int whence)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
@@ -1067,6 +1116,41 @@ static long h_pread  (struct sud_syscall_ctx *c, int fd)
 static long h_pwrite (struct sud_syscall_ctx *c, int fd)
 { return sud_inramfs_op_pwrite(fd, (const void *)c->args[1],
                                (size_t)c->args[2], pread_offset(c->args)); }
+static long h_writev (struct sud_syscall_ctx *c, int fd)
+{ return sud_inramfs_op_writev(fd, (const void *)c->args[1], (int)c->args[2]); }
+static long h_readv  (struct sud_syscall_ctx *c, int fd)
+{ return sud_inramfs_op_readv (fd, (const void *)c->args[1], (int)c->args[2]); }
+/* preadv/pwritev split the 64-bit offset into two longs (pos_l, pos_h)
+ * on BOTH arches — unlike pread64/pwrite64, whose x86_64 form is a
+ * single 64-bit register.  preadv2/pwritev2 carry a flags arg and let
+ * pos == -1 mean "use the current file position" (the readv/writev
+ * form). */
+static off_t preadv_offset(const long *args)
+{
+    return (off_t)(((uint64_t)(uint32_t)args[3])
+                 | ((uint64_t)(uint32_t)args[4] << 32));
+}
+static int preadv_use_pos(const long *args)
+{
+    return (uint32_t)args[3] == 0xffffffffu
+        && (uint32_t)args[4] == 0xffffffffu;
+}
+static long h_pwritev(struct sud_syscall_ctx *c, int fd)
+{
+    if (preadv_use_pos(c->args))
+        return sud_inramfs_op_writev(fd, (const void *)c->args[1],
+                                     (int)c->args[2]);
+    return sud_inramfs_op_pwritev(fd, (const void *)c->args[1],
+                                  (int)c->args[2], preadv_offset(c->args));
+}
+static long h_preadv (struct sud_syscall_ctx *c, int fd)
+{
+    if (preadv_use_pos(c->args))
+        return sud_inramfs_op_readv(fd, (const void *)c->args[1],
+                                    (int)c->args[2]);
+    return sud_inramfs_op_preadv(fd, (const void *)c->args[1],
+                                 (int)c->args[2], preadv_offset(c->args));
+}
 static long h_lseek  (struct sud_syscall_ctx *c, int fd)
 { return sud_inramfs_op_lseek(fd, (off_t)c->args[1], (int)c->args[2]); }
 static long h_close  (struct sud_syscall_ctx *c, int fd)
@@ -1129,6 +1213,24 @@ static const struct ir_fd_row ir_fd_dispatch[] = {
 #endif
 #ifdef SYS_pwrite64
     ROW_FD(SYS_pwrite64,    0, h_pwrite),
+#endif
+#ifdef SYS_writev
+    ROW_FD(SYS_writev,      0, h_writev),
+#endif
+#ifdef SYS_readv
+    ROW_FD(SYS_readv,       0, h_readv),
+#endif
+#ifdef SYS_pwritev
+    ROW_FD(SYS_pwritev,     0, h_pwritev),
+#endif
+#ifdef SYS_preadv
+    ROW_FD(SYS_preadv,      0, h_preadv),
+#endif
+#ifdef SYS_pwritev2
+    ROW_FD(SYS_pwritev2,    0, h_pwritev),
+#endif
+#ifdef SYS_preadv2
+    ROW_FD(SYS_preadv2,     0, h_preadv),
 #endif
 #ifdef SYS_lseek
     ROW_FD(SYS_lseek,       0, h_lseek),
