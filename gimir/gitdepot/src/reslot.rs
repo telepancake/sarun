@@ -90,6 +90,14 @@ impl<V: Ord + Clone> Slots<V> {
         self.by_slot.iter().map(|(k, v)| (*k, v))
     }
 
+    /// Directly place an occupant at a slot — used to reconstruct the slot
+    /// state of a stored boundary union for an incremental update, where the
+    /// slot keys must match what was originally assigned (read back from the
+    /// stored frame, not re-derived).
+    pub fn set(&mut self, slot: u32, occ: Occupant<V>) {
+        self.by_slot.insert(slot, occ);
+    }
+
     /// Lowest free slot key.
     fn free_slot(&self) -> u32 {
         let mut k = 0;

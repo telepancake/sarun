@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 fn usage() -> i32 {
     eprintln!(
-        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal] [--whole]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>\n       gitdepot union <git-repo> <store-dir> [--level N]\n       gitdepot union-verify <git-repo> <store-dir> [stride]"
+        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal] [--whole]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>\n       gitdepot union <git-repo> <store-dir> [--level N]\n       gitdepot union-update <git-repo> <store-dir> [--level N]\n       gitdepot union-verify <git-repo> <store-dir> [stride]"
     );
     2
 }
@@ -161,6 +161,19 @@ pub fn cli_main(args: &[String]) -> i32 {
                 _ => return usage(),
             };
             crate::union_import(&PathBuf::from(repo), &PathBuf::from(store), level).map(|o| {
+                println!("{} revisions, {} lanes, {} bytes on disk", o.n_rev, o.n_lanes, o.on_disk);
+            })
+        }
+        ("union-update", [repo, store, rest @ ..]) => {
+            let level = match rest {
+                [] => 3,
+                [flag, n] if flag == "--level" => match n.parse() {
+                    Ok(v) => v,
+                    Err(_) => return usage(),
+                },
+                _ => return usage(),
+            };
+            crate::union_update(&PathBuf::from(repo), &PathBuf::from(store), level).map(|o| {
                 println!("{} revisions, {} lanes, {} bytes on disk", o.n_rev, o.n_lanes, o.on_disk);
             })
         }

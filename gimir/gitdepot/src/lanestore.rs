@@ -45,6 +45,7 @@ use wikimak_depot::{
 };
 
 use crate::lanes::{assign_lanes, LaneId};
+use crate::oidenc::{Encoder, Objects};
 use crate::{Error, Result};
 
 /// The single combined-state chain id in this store's private depot.
@@ -76,11 +77,14 @@ struct Cat<'a> {
     trees: HashMap<String, (TreeEnts, usize)>, // oid → (entries, byte size)
     order: std::collections::VecDeque<String>, // FIFO eviction order
     bytes: usize,
+    /// git object fetches actually issued (tree cache MISSES + blob reads) —
+    /// the honest measure of ingest work, used to prove an update is O(new).
+    reads: usize,
 }
 
 impl<'a> Cat<'a> {
     fn new(cat: &'a mut crate::CatFile) -> Self {
-        Cat { cat, trees: HashMap::new(), order: std::collections::VecDeque::new(), bytes: 0 }
+        Cat { cat, trees: HashMap::new(), order: std::collections::VecDeque::new(), bytes: 0, reads: 0 }
     }
 }
 
@@ -89,6 +93,7 @@ impl crate::oidenc::Objects for Cat<'_> {
         if let Some((t, _)) = self.trees.get(oid) {
             return Ok(t.clone());
         }
+        self.reads += 1;
         let ents = std::sync::Arc::new(crate::oidenc::parse_tree(&self.cat.get(oid)?)?);
         let sz = tree_bytes(&ents);
         while self.bytes + sz > TREE_CACHE_BUDGET {
@@ -103,6 +108,7 @@ impl crate::oidenc::Objects for Cat<'_> {
         Ok(ents)
     }
     fn blob(&mut self, oid: &str) -> Result<depot::Bytes> {
+        self.reads += 1;
         Ok(self.cat.get(oid)?.into())
     }
 }
@@ -159,6 +165,262 @@ fn clear_live_bit(bm: &mut [u8], l: usize) {
         bm[byte] &= !(1 << (l % 8));
     }
 }
+/// Lowest set compact-lane bit, if any.
+fn first_live_bit(bm: &[u8]) -> Option<usize> {
+    for (byte, &b) in bm.iter().enumerate() {
+        if b != 0 {
+            return Some(byte * 8 + b.trailing_zeros() as usize);
+        }
+    }
+    None
+}
+
+/// The lane assignment for a fixed topological `order`: monotonic lanes
+/// (`lanes::assign_lanes`), their births/deaths (death = the revision a merge
+/// second-parent's lane ends), and the compacted (reused) indices
+/// (`lanes::compact_lanes`). An UPDATE reuses this over `old_shas ++ new`, and
+/// because processing revisions `0..old_n` is identical to the original encode
+/// (same births/deaths in range), the compact index of every already-stored
+/// commit is unchanged — §8 stable lanes without renumbering.
+struct LanePlan {
+    n_rev: usize,
+    /// Compact lane per revision.
+    lane_of: Vec<LaneId>,
+    width: usize,
+    dying_at: Vec<Vec<LaneId>>,
+}
+
+fn plan_lanes(repo: &Path, order: &[String]) -> Result<LanePlan> {
+    let n_rev = order.len();
+    let mut index_of: HashMap<String, usize> = HashMap::with_capacity(n_rev);
+    for (i, s) in order.iter().enumerate() {
+        index_of.insert(s.clone(), i);
+    }
+    let parents = parents_by_index(repo, &index_of)?;
+    let assignment = assign_lanes(&parents);
+    let mono = assignment.lane_of.clone();
+    let birth: Vec<usize> = assignment.span.iter().map(|s| s.0).collect();
+    let mut death: Vec<usize> = vec![n_rev; assignment.span.len()];
+    for i in 0..n_rev {
+        for &p in parents[i].iter().skip(1) {
+            let l = mono[p] as usize;
+            if i < death[l] {
+                death[l] = i;
+            }
+        }
+    }
+    let (compact_of, width) = crate::lanes::compact_lanes(&birth, &death, n_rev);
+    let lane_of: Vec<LaneId> = mono.iter().map(|&l| compact_of[l as usize]).collect();
+    let mut dying_at: Vec<Vec<LaneId>> = vec![Vec::new(); n_rev + 1];
+    for l in 0..death.len() {
+        if death[l] < n_rev {
+            dying_at[death[l]].push(compact_of[l]);
+        }
+    }
+    Ok(LanePlan { n_rev, lane_of, width, dying_at })
+}
+
+/// `sha -> root tree oid` for every reachable commit (one log pass).
+fn tree_map(repo: &Path) -> Result<HashMap<String, String>> {
+    let mut tree_of = HashMap::new();
+    for line in crate::git_str(repo, &["log", "--format=%H %T", "--branches", "--tags"])?.lines() {
+        if let Some((s, t)) = line.split_once(' ') {
+            tree_of.insert(s.to_string(), t.to_string());
+        }
+    }
+    Ok(tree_of)
+}
+
+/// Mutable per-run encoding state shared by the initial encode and an update.
+struct RunState {
+    lane_tree: Vec<Option<String>>,
+    live: Vec<u8>,
+    batch: Vec<Vec<u8>>,
+    batch_bytes: u64,
+}
+
+/// Encode revisions `range` onto the depot: advance the encoder one revision at
+/// a time (O(changed) each), accumulate reverse-delta records, and seal a batch
+/// (a prepend + fresh full head) whenever it fills. `fresh` seeds f0 from the
+/// very first revision (a new store); an update leaves `fresh=false` so every
+/// new revision is a prepended reverse delta over the reconstructed boundary.
+#[allow(clippy::too_many_arguments)]
+fn run_range(
+    depot: &Depot,
+    enc: &mut Encoder,
+    objs: &mut Cat,
+    plan: &LanePlan,
+    tree_of: &HashMap<String, String>,
+    sha_of: &[String],
+    range: std::ops::Range<usize>,
+    st: &mut RunState,
+    batch_bound: u64,
+    level: i32,
+    fresh: bool,
+) -> Result<()> {
+    use crate::oidenc::{Ent, Trans};
+    for i in range {
+        let sha = &sha_of[i];
+        let tree_oid = tree_of.get(sha).ok_or_else(|| cf(format!("no tree for {sha}")))?.clone();
+        let l = plan.lane_of[i] as usize;
+        let dead_old: Vec<(usize, Option<Ent>)> = plan.dying_at[i]
+            .iter()
+            .filter(|&&d| d != plan.lane_of[i])
+            .map(|&d| (d as usize, st.lane_tree[d as usize].clone().map(Ent::dir)))
+            .collect();
+        let adv_old = st.lane_tree[l].clone().map(Ent::dir);
+        let adv_new = Ent::dir(tree_oid.clone());
+        let mut trans: Vec<Trans> = Vec::with_capacity(dead_old.len() + 1);
+        for (d, oe) in &dead_old {
+            trans.push((*d, oe.as_ref(), None));
+        }
+        trans.push((l, adv_old.as_ref(), Some(&adv_new)));
+
+        let prev_live = st.live.clone();
+        for &d in &plan.dying_at[i] {
+            clear_live_bit(&mut st.live, d as usize);
+        }
+        set_live_bit(&mut st.live, l);
+        let new_live = st.live.clone();
+
+        let rev = enc.advance(&trans, objs, &prev_live, &new_live)?;
+        for &d in &plan.dying_at[i] {
+            st.lane_tree[d as usize] = None;
+        }
+        st.lane_tree[l] = Some(tree_oid);
+
+        if fresh && i == 0 {
+            // Seed f0 with the positive full-state (the newest, i.e. only,
+            // revision so far); `rev` (a delta from nothing) is discarded.
+            let f0raw = codec::encode(&enc.full(objs, &st.live)?);
+            let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
+            depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
+        } else {
+            let rec = codec::encode(&rev);
+            st.batch_bytes += 8 + rec.len() as u64;
+            st.batch.push(rec);
+        }
+        if !st.batch.is_empty() && st.batch_bytes >= batch_bound {
+            let head = codec::encode(&enc.full(objs, &st.live)?);
+            let staged: Vec<Vec<u8>> = st.batch.drain(..).rev().collect();
+            seal_prepend(depot, &head, &staged, level)?;
+            st.batch_bytes = 0;
+            depot.flush().map_err(|e| cf(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Seal any remaining batch and flush.
+fn finish_range(depot: &Depot, enc: &Encoder, objs: &mut Cat, st: &mut RunState, level: i32) -> Result<()> {
+    if !st.batch.is_empty() {
+        let head = codec::encode(&enc.full(objs, &st.live)?);
+        let staged: Vec<Vec<u8>> = st.batch.drain(..).rev().collect();
+        seal_prepend(depot, &head, &staged, level)?;
+    }
+    depot.flush().map_err(|e| cf(e.to_string()))?;
+    Ok(())
+}
+
+/// Descend the boundary lane's tip tree by `path` (via the object source's
+/// cache) to the git `(mode, oid)` of the entry there — the variant identity
+/// §6 reads from the lane trees, never by hashing stored content (correct for
+/// gitlinks too, whose content is a commit id, not a blob).
+fn lookup_oid(objs: &mut Cat, tip: &str, path: &[u8]) -> Result<Option<(Vec<u8>, String)>> {
+    let comps: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+    let mut cur = tip.to_string();
+    for (i, comp) in comps.iter().enumerate() {
+        let ents = objs.tree(&cur)?;
+        let Some((_, e)) = ents.iter().find(|(n, _)| n == comp) else { return Ok(None) };
+        if i + 1 == comps.len() {
+            return Ok(Some((e.mode.clone(), e.oid.clone())));
+        }
+        if !e.is_dir {
+            return Ok(None);
+        }
+        cur = e.oid.clone();
+    }
+    Ok(None)
+}
+
+/// Reconstruct the encoder state at the stored boundary (the newest stored
+/// revision) for an incremental update: the live lanes and their tip trees come
+/// from the plan + `tree_of`; the per-path SLOTS and lane bitmaps are read back
+/// from the stored f0 (so a prepended reverse delta reproduces f0 exactly); and
+/// each variant's `(mode, oid)` identity is sourced from the boundary lane trees
+/// (§6), not by hashing f0's content. Returns the seeded encoder plus the
+/// boundary `lane_tree`/`live` state.
+fn reconstruct_boundary(
+    depot: &Depot,
+    plan: &LanePlan,
+    tree_of: &HashMap<String, String>,
+    sha_of: &[String],
+    old_n: usize,
+    objs: &mut Cat,
+) -> Result<(Encoder, Vec<Option<String>>, Vec<u8>)> {
+    // The ACTUAL live lanes and their tip trees at the boundary — replay the
+    // per-revision lane_tree updates the encode loop performs (a compact lane
+    // dies when it appears in `dying_at`, is (re)born/advanced when it is the
+    // revision's lane). Not `birth<=r<death`: a lane merged as a 2nd parent can
+    // still continue via a first-parent child, and a compacted index can be
+    // freed and reused, so only this replay gives the true boundary state. It
+    // is O(old_n) integer work — no object reads.
+    let mut alive = vec![false; plan.width];
+    let mut tip_rev = vec![usize::MAX; plan.width];
+    for r in 0..old_n {
+        for &d in &plan.dying_at[r] {
+            alive[d as usize] = false;
+        }
+        let c = plan.lane_of[r] as usize;
+        alive[c] = true;
+        tip_rev[c] = r;
+    }
+    let mut lane_tree: Vec<Option<String>> = vec![None; plan.width];
+    let mut live: Vec<u8> = Vec::new();
+    for c in 0..plan.width {
+        if alive[c] {
+            set_live_bit(&mut live, c);
+            let tip = tree_of
+                .get(&sha_of[tip_rev[c]])
+                .ok_or_else(|| cf(format!("no tree for boundary tip {}", sha_of[tip_rev[c]])))?;
+            lane_tree[c] = Some(tip.clone());
+        }
+    }
+
+    let f0 = match depot.read_f0(CHAIN) {
+        Ok(frame) => decompress_frame(&frame, None).map_err(cf)?,
+        Err(e) => return Err(cf(format!("no boundary f0: {e}"))),
+    };
+    // (path, slot, bitmap) per variant; an omitted `lanes` child ⇒ all live.
+    let mut raw: Vec<(Vec<u8>, u32, Vec<u8>)> = Vec::new();
+    crate::layer::visit_entries(&f0, |e| {
+        let bm = match e.bitmap {
+            Some(b) => b.to_vec(),
+            None => live.clone(),
+        };
+        raw.push((e.path.to_vec(), e.slot, bm));
+    })
+    .map_err(|e| cf(format!("decode boundary f0: {e:?}")))?;
+
+    let mut variants = Vec::with_capacity(raw.len());
+    for (path, slot, bitmap) in raw {
+        let lane = first_live_bit(&bitmap).ok_or_else(|| {
+            cf(format!(
+                "boundary variant {} slot {slot} carries no live lane",
+                String::from_utf8_lossy(&path)
+            ))
+        })?;
+        let tip = lane_tree[lane]
+            .as_ref()
+            .ok_or_else(|| cf(format!("boundary variant in dead lane {lane}")))?
+            .clone();
+        let (mode, oid) = lookup_oid(objs, &tip, &path)?.ok_or_else(|| {
+            cf(format!("boundary variant {} absent from lane {lane} tree", String::from_utf8_lossy(&path)))
+        })?;
+        variants.push(crate::oidenc::SeedVariant { path, slot, mode, oid, bitmap });
+    }
+    Ok((Encoder::seed(variants), lane_tree, live))
+}
 
 
 /// A built lane store: a private `wikimak_depot` instance on disk (the
@@ -189,182 +451,111 @@ impl LaneStore {
     /// untouched and the frame-to-frame reverse delta is proportional to
     /// real blob churn. Reconstruction is SHA-exact.
     pub fn encode_repo_union(repo: &Path, dir: &Path, level: i32) -> Result<LaneStore> {
-        use crate::oidenc::{Ent, Encoder, Trans};
+        Ok(Self::encode_repo_union_stats(repo, dir, level)?.0)
+    }
 
-        // Topology only (cheap): revision order, per-commit parents, lane
-        // assignment, liveness, and the compacted (reused) lane indices.
+    /// As [`encode_repo_union`](Self::encode_repo_union), also returning the
+    /// number of git object fetches issued (the ingest-work measure).
+    pub fn encode_repo_union_stats(repo: &Path, dir: &Path, level: i32) -> Result<(LaneStore, usize)> {
+        // Topology only (cheap): revision order + lane assignment.
         let dag = crate::dag_scope(repo, &[])?;
         let sha_of = dag.order.clone();
-        let n_rev = sha_of.len();
-        let mut index_of: HashMap<String, usize> = HashMap::with_capacity(n_rev);
-        for (i, s) in sha_of.iter().enumerate() {
-            index_of.insert(s.clone(), i);
-        }
-        let parents = parents_by_index(repo, &index_of)?;
-        let assignment = assign_lanes(&parents);
-        let mono = assignment.lane_of.clone();
-        let birth: Vec<usize> = assignment.span.iter().map(|s| s.0).collect();
-        let mut death: Vec<usize> = vec![n_rev; assignment.span.len()];
-        for i in 0..n_rev {
-            for &p in parents[i].iter().skip(1) {
-                let l = mono[p] as usize;
-                if i < death[l] {
-                    death[l] = i;
-                }
-            }
-        }
-        let (compact_of, width) = crate::lanes::compact_lanes(&birth, &death, n_rev);
-        let lane_of: Vec<LaneId> = mono.iter().map(|&l| compact_of[l as usize]).collect();
-        let mut dying_at: Vec<Vec<LaneId>> = vec![Vec::new(); n_rev + 1];
-        for l in 0..death.len() {
-            if death[l] < n_rev {
-                dying_at[death[l]].push(compact_of[l]);
-            }
-        }
+        let plan = plan_lanes(repo, &sha_of)?;
+        let tree_of = tree_map(repo)?;
 
-        // sha → root tree oid (one log pass).
-        let mut tree_of: HashMap<String, String> = HashMap::with_capacity(n_rev);
-        for line in crate::git_str(repo, &["log", "--format=%H %T", "--branches", "--tags"])?.lines() {
-            if let Some((s, t)) = line.split_once(' ') {
-                tree_of.insert(s.to_string(), t.to_string());
-            }
-        }
-
-        // The encoder reads git objects by oid on demand; nothing is
-        // materialized. `lane_tree[l]` is lane l's current root tree oid.
         let depot = open_depot(dir)?;
-        let batch_bound = batch_ram_bound();
         let mut cat = crate::CatFile::new(repo)?;
         let mut objs = Cat::new(&mut cat); // one persistent tree cache
         let mut enc = Encoder::new();
-        let mut lane_tree: Vec<Option<String>> = vec![None; width];
-        let mut batch: Vec<Vec<u8>> = Vec::new();
-        let mut batch_bytes: u64 = 0;
-        // The lanes LIVE at the current revision (a compact-lane bitmap) —
-        // drives the §2 all-ones `lanes` omission. A lane is live iff it holds
-        // a tree (`lane_tree[l].is_some()`); this bitmap tracks that set.
-        let mut live: Vec<u8> = Vec::new();
-
-        for i in 0..n_rev {
-            if std::env::var("GITDEPOT_PROBE").is_ok() && i % 20000 == 0 {
-                let (slots, nodes) = enc.stats();
-                eprintln!("PROBE rev {i}/{n_rev} slots={slots} nodes={nodes} cache_mb={}", objs.bytes >> 20);
-            }
-            let sha = &sha_of[i];
-            let tree_oid =
-                tree_of.get(sha).ok_or_else(|| Error::Chain(format!("no tree for {sha}")))?.clone();
-            let l = lane_of[i] as usize;
-
-            // Transitions: each dying lane leaves; the advancing lane moves.
-            // Skip a dying lane whose compacted index the advancing lane is
-            // reusing this revision — its advancing transition (old = the
-            // dying tree, still in `lane_tree[idx]`) already moves the bit.
-            let dead_old: Vec<(usize, Option<Ent>)> = dying_at[i]
-                .iter()
-                .filter(|&&d| d != lane_of[i])
-                .map(|&d| (d as usize, lane_tree[d as usize].clone().map(Ent::dir)))
-                .collect();
-            let adv_old = lane_tree[l].clone().map(Ent::dir);
-            let adv_new = Ent::dir(tree_oid.clone());
-            let mut trans: Vec<Trans> = Vec::with_capacity(dead_old.len() + 1);
-            for (d, oe) in &dead_old {
-                trans.push((*d, oe.as_ref(), None));
-            }
-            trans.push((l, adv_old.as_ref(), Some(&adv_new)));
-
-            // Live set before/after this revision: dying lanes leave, the
-            // advancing lane joins. `prev_live`/`new_live` drive the omission.
-            let prev_live = live.clone();
-            for &d in &dying_at[i] {
-                clear_live_bit(&mut live, d as usize);
-            }
-            set_live_bit(&mut live, l);
-            let new_live = live.clone();
-
-            // Skeleton-only measurement path: grow the skeleton to the full
-            // union with no blob traffic, no delta, no sealing; report its
-            // exact heap footprint at the end.
-            if std::env::var("GITDEPOT_SKEL_MEASURE").is_ok() {
-                enc.advance_skel(&trans, &mut objs)?;
-                for &d in &dying_at[i] {
-                    lane_tree[d as usize] = None;
-                }
-                lane_tree[l] = Some(tree_oid);
-                if i + 1 == n_rev {
-                    let (nodes, slots, bytes, mallocs) = enc.mem_report();
-                    return Err(Error::Chain(format!(
-                        "SKEL_MEASURE n_rev={n_rev} nodes={nodes} slots={slots} \
-                         owned_heap_bytes={bytes} malloc_objects={mallocs}"
-                    )));
-                }
-                continue;
-            }
-
-            // Reverse chain record for this revision (O(changed) — reads only
-            // the changed subtrees). Removals are holes.
-            let rev = enc.advance(&trans, &mut objs, &prev_live, &new_live)?;
-            for &d in &dying_at[i] {
-                lane_tree[d as usize] = None;
-            }
-            lane_tree[l] = Some(tree_oid);
-
-            // Compare the flat full-state (refPrefix) and this revision's VBF
-            // delta against the skeleton's heap footprint at a checkpoint.
-            if std::env::var("GITDEPOT_MEASURE").is_ok() && i == 20000 {
-                let delta_bytes = codec::encode(&rev).len();
-                let raw = codec::encode(&enc.full(&mut objs, &new_live)?);
-                let zstd = compress_frame(&raw, None, level).map(|c| c.len()).unwrap_or(0);
-                let (nodes, slots, heap, mallocs) = enc.mem_report();
-                return Err(Error::Chain(format!(
-                    "MEASURE rev {i}: refPrefix_raw={} refPrefix_zstd={} \
-                     delta_raw={delta_bytes} skel_nodes={nodes} skel_slots={slots} \
-                     skel_owned_heap={heap} skel_mallocs={mallocs}",
-                    raw.len(),
-                    zstd
-                )));
-            }
-
-            if i == 0 {
-                // Seed f0 with the positive full-state (all `Set`, no
-                // removals — a full record from nothing).
-                let f0raw = codec::encode(&enc.full(&mut objs, &new_live)?);
-                let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
-                depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
-            } else {
-                let rec = codec::encode(&rev);
-                batch_bytes += 8 + rec.len() as u64;
-                batch.push(rec);
-            }
-            // Materialize the union full-state ONLY at a seal boundary (not
-            // per commit); it is the positive head the batch's reverse
-            // records anchor on. `live` here is the newest revision's live set.
-            if !batch.is_empty() && batch_bytes >= batch_bound {
-                let head = codec::encode(&enc.full(&mut objs, &live)?);
-                let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
-                seal_prepend(&depot, &head, &staged, level)?;
-                batch_bytes = 0;
-                depot.flush().map_err(|e| cf(e.to_string()))?;
-            }
+        let mut st = RunState {
+            lane_tree: vec![None; plan.width],
+            live: Vec::new(),
+            batch: Vec::new(),
+            batch_bytes: 0,
+        };
+        run_range(&depot, &mut enc, &mut objs, &plan, &tree_of, &sha_of, 0..plan.n_rev, &mut st, batch_ram_bound(), level, true)?;
+        if plan.n_rev > 0 {
+            finish_range(&depot, &enc, &mut objs, &mut st, level)?;
         }
-        if !batch.is_empty() {
-            let head = codec::encode(&enc.full(&mut objs, &live)?);
-            let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
-            seal_prepend(&depot, &head, &staged, level)?;
-        }
-        if n_rev > 0 {
-            depot.flush().map_err(|e| cf(e.to_string()))?;
-        }
+        let reads = objs.reads;
 
         let sha_to_rev: HashMap<String, usize> =
             sha_of.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
-        let mut refs = HashMap::new();
-        for (name, sha) in collect_ref_commits(repo)? {
-            if sha_to_rev.contains_key(&sha) {
-                refs.insert(name, sha);
+        let refs = live_refs(repo, &sha_to_rev)?;
+        persist_meta(dir, plan.n_rev, &plan.lane_of, &sha_of, &refs)?;
+        Ok((LaneStore { depot, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of, sha_to_rev, refs }, reads))
+    }
+
+    /// Incremental O(new) update (§11): fold only the NEW commits' union deltas
+    /// onto the stored boundary, prepending them — no full re-encode. Stored
+    /// commits keep their lanes (§8): the fixed order `old_shas ++ new` makes
+    /// `plan_lanes` reproduce every stored commit's compact lane, asserted below.
+    /// The boundary encoder state is reconstructed from the stored f0 + boundary
+    /// lane trees (§6), then advanced through the new revisions only.
+    pub fn update(repo: &Path, dir: &Path, level: i32) -> Result<LaneStore> {
+        Ok(Self::update_stats(repo, dir, level)?.0)
+    }
+
+    /// As [`update`](Self::update), also returning `(new_revisions_advanced,
+    /// git_object_reads)` — the O(new) proof: an update advances only the new
+    /// revisions and its reads are bounded by the boundary frontier + new work,
+    /// not the whole history.
+    pub fn update_stats(repo: &Path, dir: &Path, level: i32) -> Result<(LaneStore, usize, usize)> {
+        let existing = LaneStore::open(dir)?;
+        let old_n = existing.n_rev;
+        let old_sha = existing.sha_of.clone();
+        let old_lane = existing.lane_of.clone();
+        if old_n == 0 {
+            drop(existing);
+            let (s, reads) = LaneStore::encode_repo_union_stats(repo, dir, level)?;
+            let n = s.n_rev;
+            return Ok((s, n, reads));
+        }
+
+        // Fixed order: stored commits (unchanged order) then the new reachable
+        // commits in the full walk order — a valid topo order (every parent
+        // precedes its child) that freezes the stored prefix.
+        let dag = crate::dag_scope(repo, &[])?;
+        let old_set: std::collections::HashSet<&str> = old_sha.iter().map(|s| s.as_str()).collect();
+        let mut order = old_sha.clone();
+        for c in &dag.order {
+            if !old_set.contains(c.as_str()) {
+                order.push(c.clone());
             }
         }
-        persist_meta(dir, n_rev, &lane_of, &sha_of, &refs)?;
-        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs })
+        if order.len() == old_n {
+            // Nothing new — just refresh refs and return.
+            let sha_to_rev = existing.sha_to_rev.clone();
+            let refs = live_refs(repo, &sha_to_rev)?;
+            persist_meta(dir, old_n, &old_lane, &old_sha, &refs)?;
+            return Ok((LaneStore { refs, ..existing }, 0, 0));
+        }
+
+        let plan = plan_lanes(repo, &order)?;
+        // §8 stability: every stored commit keeps its compact lane.
+        if plan.lane_of[..old_n] != old_lane[..] {
+            return Err(cf("incremental update would renumber a stored lane \
+                (non-fast-forward history rewrite is not supported here)".into()));
+        }
+        let tree_of = tree_map(repo)?;
+
+        let depot = existing.depot;
+        let mut cat = crate::CatFile::new(repo)?;
+        let mut objs = Cat::new(&mut cat);
+        // Reconstruct the encoder at the boundary from stored bytes + lane trees.
+        let (mut enc, lane_tree, live) = reconstruct_boundary(&depot, &plan, &tree_of, &old_sha, old_n, &mut objs)?;
+        let mut st = RunState { lane_tree, live, batch: Vec::new(), batch_bytes: 0 };
+        // Advance ONLY the new revisions (O(new)); prepend their reverse deltas.
+        run_range(&depot, &mut enc, &mut objs, &plan, &tree_of, &order, old_n..plan.n_rev, &mut st, batch_ram_bound(), level, false)?;
+        finish_range(&depot, &enc, &mut objs, &mut st, level)?;
+        let reads = objs.reads;
+        let new_revs = plan.n_rev - old_n;
+
+        let sha_to_rev: HashMap<String, usize> =
+            order.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
+        let refs = live_refs(repo, &sha_to_rev)?;
+        persist_meta(dir, plan.n_rev, &plan.lane_of, &order, &refs)?;
+        Ok((LaneStore { depot, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of: order, sha_to_rev, refs }, new_revs, reads))
     }
 
 
@@ -604,6 +795,17 @@ fn parents_by_index(
         parents[i] = it.filter_map(|p| index_of.get(p).copied()).collect();
     }
     Ok(parents)
+}
+
+/// The current ref → sha map, keeping only refs whose commit is in the store.
+fn live_refs(repo: &Path, sha_to_rev: &HashMap<String, usize>) -> Result<HashMap<String, String>> {
+    let mut refs = HashMap::new();
+    for (name, sha) in collect_ref_commits(repo)? {
+        if sha_to_rev.contains_key(&sha) {
+            refs.insert(name, sha);
+        }
+    }
+    Ok(refs)
 }
 
 /// ref name → resolved commit sha, for branches and commit-peeled tags.

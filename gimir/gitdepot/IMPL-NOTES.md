@@ -232,3 +232,58 @@ union-tree mode driving `oidenc` (commit→lane), replacing `tree_idx_for`;
 (c) rewire `readout`/`export`/`write_stub` to reconstruct via
 `extract_lane_entries`; (d) rewrite the 6 test files to the union contract;
 (e) delete the single-tree TREES encoding. Keep COMMITS/REFLOG/TAGS + meta.
+
+---
+
+## 8. Blocker #3 RESOLVED — incremental O(new) update in the union engine (§6/§8/§11)
+
+`LaneStore::update(repo, dir, level)` folds only the NEW commits' union deltas
+onto the stored boundary and prepends them — no full re-encode. Landed compiling
+and green; the encode/update loop is one shared `run_range`.
+
+- **Boundary state from stored bytes (§6).** `reconstruct_boundary` rebuilds the
+  encoder skeleton at the newest stored revision: the per-path SLOTS and lane
+  bitmaps are read back from the stored **f0** (via `layer::visit_entries`), so a
+  prepended reverse delta reproduces f0 exactly; each variant's `(mode, oid)`
+  identity is sourced from the **boundary lane trees** (`lookup_oid`, §6 — never
+  by hashing f0 content, which would be wrong for gitlinks). `oidenc::Encoder::
+  seed` + `reslot::Slots::set` place variants back at their recorded slots.
+  - Subtle bug found and fixed: the boundary live-lane set is NOT `birth ≤ r <
+    death` — a lane merged as a 2nd parent can still continue via a first-parent
+    child (and a compacted index can be freed then reused), so `death` is not
+    "no longer live". The true live set + tips are obtained by **replaying the
+    per-revision `lane_tree` updates** (dying_at / advancing) over `0..old_n` —
+    exactly the state the encode loop tracks. This surfaced only on git.git's
+    merge-heavy frontier-37 slice (a lane merged at rev 1590 that lived to 1795).
+- **Stable cross-update lanes (§8).** The update plans lanes over the fixed order
+  `old_shas ++ new` (a valid topo order that freezes the stored prefix); because
+  `plan_lanes` processing of `0..old_n` is identical to the original encode
+  (same births/deaths in range), every stored commit keeps its exact compact
+  lane — asserted (`plan.lane_of[..old_n] == old_lane`; non-fast-forward rewrite
+  is rejected rather than silently renumbering).
+- **O(new).** Only revisions `old_n..N` are advanced and prepended; the cheap
+  topo/lane pass is O(commits) integer work with no object IO, and the boundary
+  reconstruction reads the frontier lane trees once. `update_stats` returns
+  `(new_revs, git_reads)` for the proof.
+
+Wired to the CLI: `gitdepot union-update <repo> <store>` (and `lib::union_update`).
+
+### Verification (from stored bytes, real repos + a suite test)
+
+`tests/lanestore_update.rs` imports a 60-commit prefix, updates with a 6-commit
+increment (incl. a merge), and asserts: every revision SHA-exact after the
+update; the updated store reconstructs identically to a separate full encode
+(equivalence); the stored prefix kept its exact lanes (§8); `new_revs == m`; and
+`reads_update·2 < reads_full` (O(new)).
+
+Real import→`union-update`→`union-verify` (SHA-exact from stored bytes, O(new)
+read ratio = update-reads ÷ full-encode-reads):
+
+    git.git earliest  prefix 200 → +248 (5 lanes, 100664 modes): 0/448 mismatches, ratio 0.63
+    git.git earliest  prefix 440 → +8   (tiny increment):        0/448 mismatches, ratio 0.11
+    ripgrep           prefix 1400 → +833 (4 lanes):              0 mismatches (stride)
+    git.git merge-heavy prefix 1800 → +1007 (7 lanes, frontier 37): 0 mismatches (stride), ratio 0.39
+
+This resolves blocker #3. Item 1's remaining mirror-side wiring (§7 steps b–e:
+`CommitRecord.tree_idx → (rev,lane)` across `store.rs`/`lib.rs`/`readout`/
+`export` + the dedup-test rewrite) is the next hop, per the coordinator.
