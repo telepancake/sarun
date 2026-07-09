@@ -24,6 +24,13 @@ Also fix the correctness gap the evaluation found: git.git's earliest commits
 reconstruct to wrong tree oids (`EVALUATION.md`). Find the cause and fix it, or,
 if it is genuinely separable, describe it precisely in `IMPL-NOTES.md`.
 
+The deliverable is the whole unification working and reachable from the CLI —
+not a first step toward it. "Large and interdependent" is the task, not a reason
+to stop; do the interdependent work. If you truly cannot finish a part, that is a
+specific technical obstacle you hit and must state concretely (what you tried,
+why it blocks) in `gitdepot/IMPL-NOTES.md` — not a scope you chose to defer to
+someone later.
+
 Build until it compiles. Write what you changed, what you removed and why it was
-safe, and anything left undone, to `gitdepot/IMPL-NOTES.md`. Return a short
-summary and the build status.
+safe, and any genuine remaining obstacle, to `gitdepot/IMPL-NOTES.md`. Return a
+short summary and the build status.
