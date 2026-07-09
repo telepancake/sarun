@@ -89,20 +89,13 @@ use depot::{Attrs, BlobOp, Layer, Node};
 
 mod cli;
 pub use cli::cli_main;
-pub mod frame;
-pub mod gitsrc;
-pub mod geostack;
 pub mod lanestore;
 pub mod oidenc;
-pub mod reflog;
 pub mod reslot;
-pub mod shards;
 pub mod layer;
 pub mod lanes;
 pub mod readout;
 pub mod store;
-pub mod unionstore;
-pub mod variants;
 
 pub use store::{commit_at, commit_count, label, resolve_ref, Resolved};
 
@@ -2978,6 +2971,69 @@ fn materialize_tree(repo: &Path, view: &depot::View) -> Result<String> {
 /// existing repo; `git init` is run there). Returns the regenerated tip
 /// shas by ref name; fails if any regenerated commit id differs from the
 /// one recorded at import (the fidelity check).
+// ------------------------------------------------------- union tree store
+//
+// The design's §1/§2 path made reachable from the CLI: the revision-indexed
+// UNION of the live lanes' git trees, encoded in the §2 variant tree
+// (`layer.rs`) and stored newest-full / older-reverse (§7) — driven straight
+// off git by `lanestore::encode_repo_union`. A commit resolves to `(revision,
+// lane)`; a tree reconstructs by folding reverse deltas and extracting the
+// commit's lane. This replaces the one-tree-per-commit model with the union of
+// live lanes as the tree payload.
+
+/// Summary of a union-store build.
+pub struct UnionOutcome {
+    pub n_rev: usize,
+    pub n_lanes: usize,
+    pub on_disk: u64,
+}
+
+fn dir_size(p: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            match e.metadata() {
+                Ok(m) if m.is_dir() => total += dir_size(&e.path()),
+                Ok(m) => total += m.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
+/// Build the union-of-lanes tree store for `repo` at `store` (§1/§2/§7).
+pub fn union_import(repo: &Path, store: &Path, level: i32) -> Result<UnionOutcome> {
+    let s = crate::lanestore::LaneStore::encode_repo_union(repo, store, level)?;
+    let n_rev = s.n_rev();
+    let n_lanes = (0..n_rev).map(|r| s.lane_of(r)).max().map(|m| m as usize + 1).unwrap_or(0);
+    Ok(UnionOutcome { n_rev, n_lanes, on_disk: dir_size(store) })
+}
+
+/// Reopen the union store at `store` and check that every `stride`-th commit's
+/// tree reconstructs SHA-exact from the stored union bytes, against `repo` as
+/// the oracle. Returns `(checked, mismatches)`.
+pub fn union_verify(repo: &Path, store: &Path, stride: usize) -> Result<(usize, usize)> {
+    let s = crate::lanestore::LaneStore::open(store)?;
+    let mut real: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in git_str(repo, &["log", "--format=%H %T", "--branches", "--tags"])?.lines() {
+        if let Some((h, t)) = line.split_once(' ') {
+            real.insert(h.to_string(), t.to_string());
+        }
+    }
+    let stride = stride.max(1);
+    let (mut checked, mut bad) = (0usize, 0usize);
+    for rev in (0..s.n_rev()).step_by(stride) {
+        let sha = s.sha_at(rev).to_string();
+        let got = s.tree_oid_at(rev)?;
+        if real.get(&sha).map(|w| w.as_str()) != Some(got.as_str()) {
+            bad += 1;
+        }
+        checked += 1;
+    }
+    Ok((checked, bad))
+}
+
 pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
     // Everything walks: all commit records plus every tree view,
     // reconstructed newest→oldest (the stated O(history) export cost).

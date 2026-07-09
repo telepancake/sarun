@@ -3,8 +3,8 @@
 //! several lanes coexist and files both agree and diverge across them,
 //! encodes it as ONE path-keyed union tree per revision, reopens the
 //! store from disk alone, and reconstructs every commit's — and every
-//! ref's — git tree oid, checking it equals the real object. A bug in
-//! `variants::union`/`extract` or in how the temporal reverse-delta chain
+//! ref's — git tree oid, checking it equals the real object. A bug in the
+//! §2 encoding (`layer`/`oidenc`) or in how the temporal reverse-delta chain
 //! carries the union states would mis-reconstruct some lane.
 //!
 //! Needs a `git` binary.

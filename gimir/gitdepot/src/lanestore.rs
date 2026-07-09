@@ -16,9 +16,9 @@
 //!   kills).
 //! * **State** at each revision is the UNION of the live lanes' git trees
 //!   in one path-keyed tree: at a file path its distinct `(mode, blob-oid)`
-//!   versions are stored under `\0v`/`\0m` slots with a lane bitmap (see
-//!   [`crate::variants`] and [`crate::reslot`]). Content is byte-stable
-//!   across lane-membership changes.
+//!   versions are stored as sibling variant nodes (`name\0<slot>`) with a
+//!   lane bitmap — the §2 encoding in [`crate::layer`], keyed via
+//!   [`crate::reslot`]. Content is byte-stable across lane-membership changes.
 //! * **Encoder.** [`crate::oidenc`] holds the union as slot state per path
 //!   and, per revision, emits the REVERSE delta of only the advancing/dying
 //!   lanes' tree diffs — reading git tree objects by oid on demand (through
@@ -32,9 +32,9 @@
 //!
 //! Walk the chain newest-first, folding each reverse record into the working
 //! view with `apply_mut` (O(delta); over the empty backdrop a removal hole
-//! is resolved as a tombstone). Then [`crate::variants::extract`] the target
-//! revision's lane — that commit's git tree. Its git tree oid equals the
-//! real object (SHA-exact).
+//! is resolved as a tombstone). Then [`crate::layer::extract_lane_entries`]
+//! pulls the target revision's lane out of the §2 union bytes — that commit's
+//! git tree. Its git tree oid equals the real object (SHA-exact).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -166,9 +166,8 @@ pub struct LaneStore {
 impl LaneStore {
     // ---------------------------------------------------------- encode
 
-    /// Like [`encode_repo`](Self::encode_repo) but stores every revision's
-    /// live lanes as ONE union-variant tree (see
-    /// [`crate::variants`]). No base, no delta-of-delta, no base-switching:
+    /// Stores every revision's live lanes as ONE §2 union-variant tree
+    /// ([`crate::layer`]). No base, no delta-of-delta, no base-switching:
     /// content nodes are byte-stable across lane-membership changes, so a
     /// trunk commit that touches one lane leaves every other lane's content
     /// untouched and the frame-to-frame reverse delta is proportional to
@@ -418,16 +417,19 @@ impl LaneStore {
         done.ok_or_else(|| Error::Chain(format!("chain fell short of revision {rev}")))
     }
 
-    /// The reconstructed git tree View of the commit at revision `rev`:
-    /// extract its lane from the reconstructed union state.
-    pub fn tree_at(&self, rev: usize) -> Result<View> {
+    /// Lane `lane`'s flat `(path, mode, content)` entries at revision `rev`,
+    /// extracted from the reconstructed §2 union state via the authoritative
+    /// `layer` extractor (on the canonical union bytes).
+    pub fn lane_entries_at(&self, rev: usize) -> Result<Vec<(Vec<u8>, crate::layer::Mode, Vec<u8>)>> {
         let combined = self.combined_at(rev)?;
-        Ok(crate::variants::extract(&combined, self.lane_of[rev] as usize))
+        let bytes = codec::encode(&depot::diff(None, Some(&combined)));
+        crate::layer::extract_lane_entries(&bytes, self.lane_of[rev] as u32).map_err(|e| cf(format!("{e:?}")))
     }
 
-    /// The git tree oid of the commit at revision `rev` (reconstructed).
+    /// The git tree oid of the commit at revision `rev` (reconstructed) — the
+    /// SHA-exact ground truth from the stored §2 union bytes.
     pub fn tree_oid_at(&self, rev: usize) -> Result<String> {
-        crate::view_tree_oid(&self.tree_at(rev)?)
+        crate::layer::tree_oid_of_entries(&self.lane_entries_at(rev)?).map_err(|e| cf(format!("{e:?}")))
     }
 
     /// The git tree oid of the commit named by `sha` (reconstructed from
