@@ -190,14 +190,30 @@ struct LanePlan {
     dying_at: Vec<Vec<LaneId>>,
 }
 
-fn plan_lanes(repo: &Path, order: &[String]) -> Result<LanePlan> {
-    let n_rev = order.len();
-    let mut index_of: HashMap<String, usize> = HashMap::with_capacity(n_rev);
+/// The in-scope parent revision indices for `order`, from ONE
+/// `rev-list --parents` pass over the repo. In a SHALLOW repo the
+/// commits at the graft boundary lose their parent edges — callers that
+/// need a stable prefix (the update path) must instead take the prefix
+/// parents from the persisted meta and only compute the new suffix here.
+fn compute_parents(repo: &Path, order: &[String]) -> Result<Vec<Vec<usize>>> {
+    let mut index_of: HashMap<String, usize> = HashMap::with_capacity(order.len());
     for (i, s) in order.iter().enumerate() {
         index_of.insert(s.clone(), i);
     }
-    let parents = parents_by_index(repo, &index_of)?;
-    let assignment = assign_lanes(&parents);
+    parents_by_index(repo, &index_of)
+}
+
+fn plan_lanes(repo: &Path, order: &[String]) -> Result<(LanePlan, Vec<Vec<usize>>)> {
+    let parents = compute_parents(repo, order)?;
+    Ok((plan_from_parents(&parents), parents))
+}
+
+/// The lane plan for a fixed order given its per-revision parent indices.
+/// Pure — no repo access — so an update can feed it a prefix taken from
+/// stored meta plus a repo-computed suffix.
+fn plan_from_parents(parents: &[Vec<usize>]) -> LanePlan {
+    let n_rev = parents.len();
+    let assignment = assign_lanes(parents);
     let mono = assignment.lane_of.clone();
     let birth: Vec<usize> = assignment.span.iter().map(|s| s.0).collect();
     let mut death: Vec<usize> = vec![n_rev; assignment.span.len()];
@@ -217,7 +233,7 @@ fn plan_lanes(repo: &Path, order: &[String]) -> Result<LanePlan> {
             dying_at[death[l]].push(compact_of[l]);
         }
     }
-    Ok(LanePlan { n_rev, lane_of, width, dying_at })
+    LanePlan { n_rev, lane_of, width, dying_at }
 }
 
 /// `sha -> root tree oid` for every reachable commit (one log pass).
@@ -350,6 +366,23 @@ fn lookup_oid(objs: &mut Cat, tip: &str, path: &[u8]) -> Result<Option<(Vec<u8>,
 /// each variant's `(mode, oid)` identity is sourced from the boundary lane trees
 /// (§6), not by hashing f0's content. Returns the seeded encoder plus the
 /// boundary `lane_tree`/`live` state.
+/// The revision that is the tip of each live lane at the boundary
+/// (`old_n`), by replaying the per-revision lane life/death — the same
+/// logic `reconstruct_boundary` uses. Pure integer work, O(old_n).
+fn boundary_tip_revs(plan: &LanePlan, old_n: usize) -> Vec<usize> {
+    let mut alive = vec![false; plan.width];
+    let mut tip_rev = vec![usize::MAX; plan.width];
+    for r in 0..old_n {
+        for &d in &plan.dying_at[r] {
+            alive[d as usize] = false;
+        }
+        let c = plan.lane_of[r] as usize;
+        alive[c] = true;
+        tip_rev[c] = r;
+    }
+    (0..plan.width).filter(|&c| alive[c]).map(|c| tip_rev[c]).collect()
+}
+
 fn reconstruct_boundary(
     depot: &Depot,
     plan: &LanePlan,
@@ -460,7 +493,7 @@ impl LaneStore {
         // Topology only (cheap): revision order + lane assignment.
         let dag = crate::dag_scope(repo, &[])?;
         let sha_of = dag.order.clone();
-        let plan = plan_lanes(repo, &sha_of)?;
+        let (plan, parents) = plan_lanes(repo, &sha_of)?;
         let tree_of = tree_map(repo)?;
 
         let depot = open_depot(dir)?;
@@ -482,7 +515,7 @@ impl LaneStore {
         let sha_to_rev: HashMap<String, usize> =
             sha_of.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
         let refs = live_refs(repo, &sha_to_rev)?;
-        persist_meta(dir, plan.n_rev, &plan.lane_of, &sha_of, &refs)?;
+        persist_meta(dir, plan.n_rev, &plan.lane_of, &sha_of, &parents, &refs)?;
         Ok((LaneStore { depot, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of, sha_to_rev, refs }, reads))
     }
 
@@ -505,6 +538,10 @@ impl LaneStore {
         let old_n = existing.n_rev;
         let old_sha = existing.sha_of.clone();
         let old_lane = existing.lane_of.clone();
+        // Stored prefix parent edges — the repo may be SHALLOW (bootstrap
+        // re-pin), so the old commits' topology must come from meta, not a
+        // repo rev-list that would see them as parentless roots.
+        let (_, _, _, old_parents, _) = load_meta(dir)?;
         if old_n == 0 {
             drop(existing);
             let (s, reads) = LaneStore::encode_repo_union_stats(repo, dir, level)?;
@@ -527,17 +564,34 @@ impl LaneStore {
             // Nothing new — just refresh refs and return.
             let sha_to_rev = existing.sha_to_rev.clone();
             let refs = live_refs(repo, &sha_to_rev)?;
-            persist_meta(dir, old_n, &old_lane, &old_sha, &refs)?;
+            persist_meta(dir, old_n, &old_lane, &old_sha, &old_parents, &refs)?;
             return Ok((LaneStore { refs, ..existing }, 0, 0));
         }
 
-        let plan = plan_lanes(repo, &order)?;
-        // §8 stability: every stored commit keeps its compact lane.
+        // Parent edges for the full order: the new suffix from the repo
+        // (present, freshly fetched), the stored prefix from meta. This
+        // freezes the prefix regardless of a shallow repo.
+        let mut parents = compute_parents(repo, &order)?;
+        parents[..old_n].clone_from_slice(&old_parents[..old_n]);
+        let plan = plan_from_parents(&parents);
+        // §8 stability: every stored commit keeps its compact lane. With
+        // the frozen prefix parents this holds by construction; the check
+        // guards against a non-fast-forward that reorders the prefix.
         if plan.lane_of[..old_n] != old_lane[..] {
             return Err(cf("incremental update would renumber a stored lane \
                 (non-fast-forward history rewrite is not supported here)".into()));
         }
-        let tree_of = tree_map(repo)?;
+        let mut tree_of = tree_map(repo)?;
+        // A live boundary tip may be an OLD commit that a history rewrite
+        // (amend) made unreachable in the buffer, so `git log` over the
+        // repo omits it. Its tree oid is still reconstructable from the
+        // stored union — backfill those before consuming the depot.
+        for r in boundary_tip_revs(&plan, old_n) {
+            let sha = &old_sha[r];
+            if !tree_of.contains_key(sha) {
+                tree_of.insert(sha.clone(), existing.tree_oid_at(r)?);
+            }
+        }
 
         let depot = existing.depot;
         let mut cat = crate::CatFile::new(repo)?;
@@ -554,7 +608,7 @@ impl LaneStore {
         let sha_to_rev: HashMap<String, usize> =
             order.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
         let refs = live_refs(repo, &sha_to_rev)?;
-        persist_meta(dir, plan.n_rev, &plan.lane_of, &order, &refs)?;
+        persist_meta(dir, plan.n_rev, &plan.lane_of, &order, &parents, &refs)?;
         Ok((LaneStore { depot, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of: order, sha_to_rev, refs }, new_revs, reads))
     }
 
@@ -577,9 +631,24 @@ impl LaneStore {
         Ok(n)
     }
 
+    /// The commit shas that are live lane tips at the stored boundary —
+    /// the trees an incremental [`update`](Self::update) reconstructs from
+    /// (§6). A caller driving update against a possibly-shallow buffer
+    /// must ensure these trees are materialized there first: a lane can be
+    /// live at the boundary yet its tip commit be unreachable from the
+    /// current refs (a deleted branch), so `git` alone can't supply it.
+    pub fn boundary_tip_shas(dir: &Path) -> Result<Vec<String>> {
+        let (n_rev, _lane_of, sha_of, parents, _refs) = load_meta(dir)?;
+        if n_rev == 0 {
+            return Ok(Vec::new());
+        }
+        let plan = plan_from_parents(&parents);
+        Ok(boundary_tip_revs(&plan, n_rev).into_iter().map(|r| sha_of[r].clone()).collect())
+    }
+
     pub fn open(dir: &Path) -> Result<LaneStore> {
         let depot = open_depot(dir)?;
-        let (n_rev, lane_of, sha_of, refs) = load_meta(dir)?;
+        let (n_rev, lane_of, sha_of, _parents, refs) = load_meta(dir)?;
         let sha_to_rev = sha_of
             .iter()
             .enumerate()
@@ -885,10 +954,10 @@ fn collect_ref_commits(repo: &Path) -> Result<Vec<(String, String)>> {
 
 const META_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS revs(rev INTEGER PRIMARY KEY, sha TEXT NOT NULL, lane INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS revs(rev INTEGER PRIMARY KEY, sha TEXT NOT NULL, lane INTEGER NOT NULL, parents TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS refs(name TEXT PRIMARY KEY, sha TEXT NOT NULL, rev INTEGER NOT NULL, lane INTEGER NOT NULL);
 ";
-const META_SCHEMA_VERSION: &str = "1";
+const META_SCHEMA_VERSION: &str = "2";
 
 fn meta_path(dir: &Path) -> std::path::PathBuf {
     dir.join("meta.sqlite")
@@ -905,6 +974,7 @@ fn persist_meta(
     n_rev: usize,
     lane_of: &[LaneId],
     sha_of: &[String],
+    parents: &[Vec<usize>],
     refs: &HashMap<String, String>,
 ) -> Result<()> {
     let mut conn = rusqlite::Connection::open(meta_path(dir)).map_err(map_sql)?;
@@ -920,10 +990,11 @@ fn persist_meta(
     .map_err(map_sql)?;
     {
         let mut ins = tx
-            .prepare("INSERT INTO revs(rev,sha,lane) VALUES(?1,?2,?3)")
+            .prepare("INSERT INTO revs(rev,sha,lane,parents) VALUES(?1,?2,?3,?4)")
             .map_err(map_sql)?;
         for (i, sha) in sha_of.iter().enumerate() {
-            ins.execute(rusqlite::params![i as i64, sha, lane_of[i] as i64])
+            let ps = parents[i].iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+            ins.execute(rusqlite::params![i as i64, sha, lane_of[i] as i64, ps])
                 .map_err(map_sql)?;
         }
     }
@@ -947,7 +1018,7 @@ fn persist_meta(
 #[allow(clippy::type_complexity)]
 fn load_meta(
     dir: &Path,
-) -> Result<(usize, Vec<LaneId>, Vec<String>, HashMap<String, String>)> {
+) -> Result<(usize, Vec<LaneId>, Vec<String>, Vec<Vec<usize>>, HashMap<String, String>)> {
     let p = meta_path(dir);
     if !p.exists() {
         return Err(Error::Chain(format!("no lane store at {}", dir.display())));
@@ -974,21 +1045,32 @@ fn load_meta(
     let n_rev = n_rev as usize;
     let mut sha_of = vec![String::new(); n_rev];
     let mut lane_of = vec![0 as LaneId; n_rev];
+    let mut parents = vec![Vec::new(); n_rev];
     {
-        let mut q = conn.prepare("SELECT rev,sha,lane FROM revs").map_err(map_sql)?;
+        let mut q = conn.prepare("SELECT rev,sha,lane,parents FROM revs").map_err(map_sql)?;
         let rows = q
             .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
             })
             .map_err(map_sql)?;
         for row in rows {
-            let (rev, sha, lane) = row.map_err(map_sql)?;
+            let (rev, sha, lane, ps) = row.map_err(map_sql)?;
             let rev = rev as usize;
             if rev >= n_rev {
                 return Err(Error::Chain(format!("meta: rev {rev} out of range")));
             }
             sha_of[rev] = sha;
             lane_of[rev] = lane as LaneId;
+            parents[rev] = if ps.is_empty() {
+                Vec::new()
+            } else {
+                ps.split(',').map(|p| p.parse::<usize>().unwrap_or(0)).collect()
+            };
         }
     }
     let mut refs = HashMap::new();
@@ -1002,7 +1084,7 @@ fn load_meta(
             refs.insert(name, sha);
         }
     }
-    Ok((n_rev, lane_of, sha_of, refs))
+    Ok((n_rev, lane_of, sha_of, parents, refs))
 }
 
 /// Stream the u64-length-prefixed records of an f1 frame in stored

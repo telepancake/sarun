@@ -209,6 +209,7 @@ fn canon(v: &depot::View) -> Vec<u8> {
 /// git's own answers for the same repo.
 fn assert_store_matches_git(repo: &Path, store: &Path, shas: &[String]) {
     let st = gitdepot::store::Store::open(store).unwrap();
+    let ls = st.union().unwrap();
     let recs = st.commit_records().unwrap();
     assert_eq!(recs.len(), shas.len(), "commit count");
     let idx_of: BTreeMap<&str, u64> = recs.iter().map(|r| (r.sha.as_str(), r.idx)).collect();
@@ -252,17 +253,21 @@ fn assert_store_matches_git(repo: &Path, store: &Path, shas: &[String]) {
         // The decoded tree view equals the from-scratch ls-tree build,
         // byte-for-byte in canonical encoding.
         assert_eq!(
-            canon(&st.tree_view(r.tree_idx).unwrap()),
+            canon(&ls.tree_view_of_commit(sha).unwrap()),
             canon(&reference_view(repo, sha)),
             "{sha} tree view diverges from the ls-tree reference"
         );
-        // Tree dedup discipline preserved: same oid as a parent ⇒ same
-        // tree_idx as that parent.
+        // Union contract: the reconstructed tree is SHA-exact equal to
+        // git's; when a parent has the same git tree oid, this commit's
+        // reconstructed tree oid equals that parent's.
         let tree_oid = hdr("tree");
+        let rev = ls.rev_of(sha).expect("commit in union");
+        assert_eq!(ls.tree_oid_at(rev).unwrap(), tree_oid, "{sha} tree oid not SHA-exact");
         for p in raw.lines().take_while(|l| !l.is_empty()).filter_map(|l| l.strip_prefix("parent ")) {
             if sh_git(repo, &["rev-parse", &format!("{p}^{{tree}}")]).trim() == tree_oid {
-                assert_eq!(r.tree_idx, recs[idx_of[p] as usize].tree_idx,
-                           "{sha} minted a new tree despite a same-tree parent");
+                let prev = ls.rev_of(p).expect("parent in union");
+                assert_eq!(ls.tree_oid_at(rev).unwrap(), ls.tree_oid_at(prev).unwrap(),
+                           "{sha} tree diverges from a same-tree parent");
             }
         }
     }
@@ -349,12 +354,11 @@ fn incremental_update_equals_full_import_across_merges() {
     assert_eq!(sa.commit_records().unwrap(), sb.commit_records().unwrap(),
                "commit objects diverge between import and update");
     assert_eq!(sa.ref_rows().unwrap(), sb.ref_rows().unwrap(), "refs diverge");
-    let tree_recs = |st: &gitdepot::store::Store| -> Vec<Vec<u8>> {
-        let mut recs = Vec::new();
-        st.walk_tree_views(None, &mut |_, rec, _| recs.push(rec.to_vec())).unwrap();
-        recs
+    let tree_oids = |st: &gitdepot::store::Store| -> Vec<String> {
+        let ls = st.union().unwrap();
+        (0..ls.n_rev()).map(|r| ls.tree_oid_at(r).unwrap()).collect()
     };
-    assert_eq!(tree_recs(&sa), tree_recs(&sb), "TREES records diverge");
+    assert_eq!(tree_oids(&sa), tree_oids(&sb), "union trees diverge");
     drop((sa, sb));
     assert_store_matches_git(&repo, &b, &shas);
 }
@@ -388,9 +392,10 @@ fn laddered_bootstrap_equals_single_shot_import() {
     .unwrap();
     assert!(o.rungs.len() >= 2, "fixture tags must produce a real ladder");
     assert_eq!(o.update.new_commits, shas.len());
-    // THE batch invariant: 1 prepend per touched chain (TREES seed +
-    // TREES batch + COMMITS + TAGS + REFLOG) — for ANY rung count.
-    assert_eq!(o.update.depot_prepends, 5,
+    // THE batch invariant: the commit-side store lands as one prepend
+    // per touched chain (COMMITS + TAGS + REFLOG) — for ANY rung count.
+    // (The union tree store lands separately, per rung, in store/trees.)
+    assert_eq!(o.update.depot_prepends, 3,
                "bootstrap must land as one prepend per touched chain");
     let b = root.join("store");
 
@@ -403,6 +408,8 @@ fn laddered_bootstrap_equals_single_shot_import() {
         rb.iter().map(|r| (r.sha.as_str(), r)).collect();
     let sha_of_a: Vec<&str> = ra.iter().map(|r| r.sha.as_str()).collect();
     let sha_of_b: Vec<&str> = rb.iter().map(|r| r.sha.as_str()).collect();
+    let lsa = sa.union().unwrap();
+    let lsb = sb.union().unwrap();
     for x in &ra {
         let y = by_sha_b[x.sha.as_str()];
         assert_eq!(x.author, y.author, "{} author", x.sha);
@@ -414,8 +421,8 @@ fn laddered_bootstrap_equals_single_shot_import() {
         let pb: Vec<&str> = y.parent_idxs.iter().map(|p| sha_of_b[*p as usize]).collect();
         assert_eq!(pa, pb, "{} parent edges", x.sha);
         assert_eq!(
-            canon(&sa.tree_view(x.tree_idx).unwrap()),
-            canon(&sb.tree_view(y.tree_idx).unwrap()),
+            canon(&lsa.tree_view_of_commit(&x.sha).unwrap()),
+            canon(&lsb.tree_view_of_commit(&y.sha).unwrap()),
             "{} tree view", x.sha
         );
     }

@@ -230,38 +230,6 @@ fn git_str(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&git(repo, args)?).into_owned())
 }
 
-// ---------------------------------------------------------------- import
-
-struct TreeEntry {
-    mode: String,
-    oid: String,
-    path: Vec<u8>,
-}
-
-fn ls_tree(repo: &Path, commit: &str) -> Result<Vec<TreeEntry>> {
-    let out = git(repo, &["ls-tree", "-r", "-z", "--full-tree", commit])?;
-    let mut entries = Vec::new();
-    for rec in out.split(|&b| b == 0) {
-        if rec.is_empty() {
-            continue;
-        }
-        // "<mode> <type> <oid>\t<path>"
-        let tab = rec
-            .iter()
-            .position(|&b| b == b'\t')
-            .ok_or_else(|| Error::Git("ls-tree: no tab".into()))?;
-        let head = std::str::from_utf8(&rec[..tab])
-            .map_err(|_| Error::Git("ls-tree: non-utf8 header".into()))?;
-        let mut it = head.split(' ');
-        let (mode, _typ, oid) = (
-            it.next().unwrap_or_default().to_string(),
-            it.next().unwrap_or_default(),
-            it.next().unwrap_or_default().to_string(),
-        );
-        entries.push(TreeEntry { mode, oid, path: rec[tab + 1..].to_vec() });
-    }
-    Ok(entries)
-}
 
 /// Fetch every oid's raw content (any object type) through ONE
 /// `git cat-file --batch` process. The oid→bytes map is the import's
@@ -330,35 +298,6 @@ fn fetch_blobs(
         buf = &buf[start + size + 1..]; // skip trailing \n
     }
     Ok(map)
-}
-
-/// Build the full-content layer for one commit's tree.
-fn tree_layer(entries: &[TreeEntry], blobs: &BTreeMap<String, Vec<u8>>) -> Result<Layer> {
-    let mut root = Node::keep();
-    for e in entries {
-        let content: Vec<u8> = if e.mode == "160000" {
-            // gitlink: the pinned commit id IS the source data.
-            e.oid.clone().into_bytes()
-        } else {
-            blobs
-                .get(&e.oid)
-                .ok_or_else(|| Error::Git(format!("missing blob {}", e.oid)))?
-                .clone()
-        };
-        let mut node = &mut root;
-        let mut segs = e.path.split(|&b| b == b'/').peekable();
-        while let Some(seg) = segs.next() {
-            if seg.is_empty() {
-                return Err(Error::Unsupported("empty path segment".into()));
-            }
-            node = node.children.entry(seg.to_vec()).or_insert_with(Node::keep);
-            if segs.peek().is_none() {
-                node.blob = BlobOp::Set(content.clone().into());
-                node.attrs = Some(Attrs::from([(b"mode".to_vec(), e.mode.clone().into_bytes())]));
-            }
-        }
-    }
-    Ok(Layer { root })
 }
 
 /// Returns the meta plus the commit's root tree oid (the `tree`
@@ -708,364 +647,6 @@ impl Drop for CatFile {
     }
 }
 
-/// One `--raw -z` changed-path line: the new side + status is all the
-/// frontier needs (D carries no new oid).
-struct RawChange {
-    status: u8,
-    new_mode: String,
-    old_oid: String,
-    new_oid: String,
-    path: Vec<u8>,
-}
-
-/// The one streaming change source: `git diff-tree --stdin -r -z
-/// --root --no-renames --no-abbrev --diff-merges=first-parent`, fed the
-/// caller-computed chain landing order (`Dag::order`) by a writer
-/// thread (requests can outrun the pipe buffer while replies fill the
-/// other pipe — same deadlock shape as `fetch_blobs`). Stream grammar,
-/// NUL-tokenized (verified against git 2.43): `<sha>\0` then, iff the
-/// commit changes anything vs its first parent (empty tree for roots —
-/// `--root`; `--always` echoes even no-change commits, which the walk
-/// must still land), `:<meta>\0<path>\0` per change. Tokens are dispatched by
-/// their leading byte (`:` = meta, else sha) and by position (a path
-/// always follows a meta), never by path content, so arbitrary path
-/// bytes are safe.
-struct LogStream {
-    child: std::process::Child,
-    out: std::io::BufReader<std::process::ChildStdout>,
-    writer: Option<std::thread::JoinHandle<std::io::Result<()>>>,
-    /// The next commit's sha, read while scanning the previous one.
-    pending: Option<String>,
-    eof: bool,
-}
-
-impl LogStream {
-    fn spawn(repo: &Path, order: &[String]) -> Result<LogStream> {
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args([
-                "diff-tree",
-                "--stdin",
-                "-r",
-                "-z",
-                "--root",
-                "--always",
-                "--no-renames",
-                "--no-abbrev",
-                "--diff-merges=first-parent",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        let mut reqs = Vec::with_capacity(order.iter().map(|s| s.len() + 1).sum());
-        for sha in order {
-            reqs.extend_from_slice(sha.as_bytes());
-            reqs.push(b'\n');
-        }
-        let writer = std::thread::spawn(move || -> std::io::Result<()> {
-            stdin.write_all(&reqs) // drop closes stdin
-        });
-        let out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
-        Ok(LogStream { child, out, writer: Some(writer), pending: None, eof: false })
-    }
-
-    /// The next NUL-terminated token, delimiter stripped; None = EOF.
-    fn token(&mut self) -> Result<Option<Vec<u8>>> {
-        use std::io::BufRead as _;
-        let mut buf = Vec::new();
-        let n = self.out.read_until(0, &mut buf)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        if buf.last() == Some(&0) {
-            buf.pop();
-        }
-        Ok(Some(buf))
-    }
-
-    /// The next commit and its first-parent changes, request order
-    /// (the caller's order lists parents before children); None =
-    /// clean EOF.
-    fn next_commit(&mut self) -> Result<Option<(String, Vec<RawChange>)>> {
-        let sha = match self.pending.take() {
-            Some(s) => s,
-            None if self.eof => return Ok(None),
-            None => match self.token()? {
-                None => {
-                    self.finish()?;
-                    return Ok(None);
-                }
-                Some(t) => Self::sha_of(&t)?,
-            },
-        };
-        let mut changes = Vec::new();
-        loop {
-            let Some(tok) = self.token()? else {
-                self.finish()?;
-                self.eof = true;
-                break;
-            };
-            if tok.first() != Some(&b':') {
-                self.pending = Some(Self::sha_of(&tok)?);
-                break;
-            }
-            // Meta token: ":<old_mode> <new_mode> <old_oid> <new_oid> <status>".
-            let meta = std::str::from_utf8(&tok[1..]).map_err(|_| {
-                Error::Git(format!(
-                    "diff-tree: bad meta token {:?}",
-                    String::from_utf8_lossy(&tok)
-                ))
-            })?;
-            let f: Vec<&str> = meta.split(' ').collect();
-            let [_, new_mode, old_oid, new_oid, status] = f.as_slice() else {
-                return Err(Error::Git(format!("diff-tree: bad meta {meta:?}")));
-            };
-            let path = self
-                .token()?
-                .ok_or_else(|| Error::Git("diff-tree: meta without path".into()))?;
-            changes.push(RawChange {
-                status: status.bytes().next().unwrap_or(0),
-                new_mode: new_mode.to_string(),
-                old_oid: old_oid.to_string(),
-                new_oid: new_oid.to_string(),
-                path,
-            });
-        }
-        Ok(Some((sha, changes)))
-    }
-
-    fn sha_of(tok: &[u8]) -> Result<String> {
-        std::str::from_utf8(tok)
-            .map(str::to_string)
-            .map_err(|_| Error::Git("diff-tree: non-utf8 sha".into()))
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        use std::io::Read as _;
-        if let Some(w) = self.writer.take() {
-            w.join()
-                .map_err(|_| Error::Git("diff-tree writer panicked".into()))?
-                .map_err(Error::Io)?;
-        }
-        let status = self.child.wait()?;
-        if !status.success() {
-            let mut err = String::new();
-            if let Some(e) = self.child.stderr.as_mut() {
-                let _ = e.read_to_string(&mut err);
-            }
-            return Err(Error::Git(format!("diff-tree --stdin: {}", err.trim())));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for LogStream {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(w) = self.writer.take() {
-            let _ = w.join();
-        }
-    }
-}
-
-/// Build the delta layer for one commit from its changed paths, blobs
-/// fetched on demand (each at most once per appearance — a per-layer
-/// oid memo would only help pathological diffs). Corner shapes:
-/// file→dir = D of the file + A's beneath it (the tombstone must
-/// revive as a live node that removes the blob and the file's attrs);
-/// dir→file = D's of the children + A of the path (a leaf set on a
-/// node that also carries child tombstones — composes as-is).
-/// Parse a raw git tree object body into `(name, mode_bytes, hex_oid,
-/// is_tree)` entries. The mode is taken VERBATIM from the object bytes —
-/// git's `diff-tree`/`ls-tree` normalize non-canonical historical modes
-/// (e.g. `100664` → `100644`), which silently breaks SHA-exactness on the
-/// trees that carry them (git.git's earliest ten days). The raw tree body
-/// is the only mode-faithful source, and §11 guarantees the encoder holds
-/// those exact tree bytes.
-fn parse_tree_obj(bytes: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>, String, bool)>> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let sp = bytes[i..]
-            .iter()
-            .position(|&b| b == b' ')
-            .map(|p| p + i)
-            .ok_or_else(|| Error::Git("tree obj: no mode/name sep".into()))?;
-        let mode = bytes[i..sp].to_vec();
-        let nul = bytes[sp + 1..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| p + sp + 1)
-            .ok_or_else(|| Error::Git("tree obj: unterminated name".into()))?;
-        let name = bytes[sp + 1..nul].to_vec();
-        if nul + 21 > bytes.len() {
-            return Err(Error::Git("tree obj: truncated oid".into()));
-        }
-        let oid = hex::encode(&bytes[nul + 1..nul + 21]);
-        let is_tree = mode == b"40000";
-        out.push((name, mode, oid, is_tree));
-        i = nul + 21;
-    }
-    Ok(out)
-}
-
-/// Exact (mode-faithful) mode bytes for `path` within the tree rooted at
-/// `root_tree_oid`, by walking raw tree objects along the path. `cache`
-/// memoizes parsed tree bodies by oid so paths sharing a directory prefix
-/// (the common case in one commit's changeset) parse each subtree once.
-/// Returns `None` if the path is absent (caller falls back to the
-/// diff-tree mode — e.g. a tree that could not be read).
-type TreeCache = std::collections::HashMap<String, Vec<(Vec<u8>, Vec<u8>, String, bool)>>;
-fn exact_mode(
-    cat: &mut CatFile,
-    cache: &mut TreeCache,
-    root_tree_oid: &str,
-    path: &[u8],
-) -> Result<Option<Vec<u8>>> {
-    let comps: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
-    let mut cur = root_tree_oid.to_string();
-    for (i, comp) in comps.iter().enumerate() {
-        if !cache.contains_key(&cur) {
-            let body = match cat.get(&cur) {
-                Ok(b) => b,
-                Err(_) => return Ok(None),
-            };
-            cache.insert(cur.clone(), parse_tree_obj(&body)?);
-        }
-        let entries = &cache[&cur];
-        let Some((_, mode, oid, is_tree)) = entries.iter().find(|(n, ..)| n == comp) else {
-            return Ok(None);
-        };
-        if i + 1 == comps.len() {
-            return Ok(Some(mode.clone()));
-        }
-        if !is_tree {
-            return Ok(None);
-        }
-        cur = oid.clone();
-    }
-    Ok(None)
-}
-
-/// Mode-only changes between two trees that `diff-tree` cannot see: it
-/// normalizes modes (`100664`→`100644`), so a commit that only flips a
-/// file's permission bits (git.git's early history did this en masse)
-/// produces NO diff-tree entry, and the stale inherited mode would leak
-/// into a tree that must reconstruct with the new mode. We recover them by
-/// a lockstep walk of the raw parent/child tree objects, pruned by subtree
-/// oid (O(changed)): an identical subtree oid means every mode underneath
-/// is already correct, so it is skipped. Emitted as synthetic `M` changes
-/// (delta_layer re-derives the exact mode from the child tree).
-fn mode_only_changes(
-    cat: &mut CatFile,
-    cache: &mut TreeCache,
-    parent_tree: &str,
-    child_tree: &str,
-    prefix: &[u8],
-    out: &mut Vec<RawChange>,
-) -> Result<()> {
-    if parent_tree == child_tree {
-        return Ok(());
-    }
-    let read = |cat: &mut CatFile, cache: &mut TreeCache, oid: &str| -> Result<()> {
-        if !cache.contains_key(oid) {
-            let body = cat.get(oid)?;
-            cache.insert(oid.to_string(), parse_tree_obj(&body)?);
-        }
-        Ok(())
-    };
-    read(cat, cache, parent_tree)?;
-    read(cat, cache, child_tree)?;
-    let pents = cache[parent_tree].clone();
-    let cents = cache[child_tree].clone();
-    let pmap: std::collections::HashMap<&Vec<u8>, &(Vec<u8>, Vec<u8>, String, bool)> =
-        pents.iter().map(|e| (&e.0, e)).collect();
-    for c in &cents {
-        let (name, cmode, coid, cis_tree) = c;
-        let Some(p) = pmap.get(name) else { continue };
-        let (_, pmode, poid, pis_tree) = *p;
-        let mut path = prefix.to_vec();
-        if !path.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(name);
-        if *cis_tree && *pis_tree {
-            if poid != coid {
-                mode_only_changes(cat, cache, poid, coid, &path, out)?;
-            }
-        } else if !*cis_tree && !*pis_tree && poid == coid && pmode != cmode {
-            // Same file, same content (blob oid), mode changed only — the
-            // exact case diff-tree hides. (A blob-oid difference is a real
-            // content change already carried by diff-tree, mode included.)
-            out.push(RawChange {
-                status: b'M',
-                new_mode: String::from_utf8_lossy(cmode).into_owned(),
-                old_oid: poid.clone(),
-                new_oid: coid.clone(),
-                path,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn delta_layer(changes: &[RawChange], new_tree_oid: &str, cat: &mut CatFile) -> Result<Layer> {
-    let mut root = Node::keep();
-    let mut tcache: TreeCache = std::collections::HashMap::new();
-    for ch in changes {
-        let mut node = &mut root;
-        let mut segs = ch.path.split(|&b| b == b'/').peekable();
-        while let Some(seg) = segs.next() {
-            if seg.is_empty() {
-                return Err(Error::Unsupported("empty path segment".into()));
-            }
-            node = node.children.entry(seg.to_vec()).or_insert_with(Node::keep);
-            let leaf = segs.peek().is_none();
-            if !leaf && node.presence == depot::Presence::Tombstone {
-                // file→dir: the deleted file's name becomes a directory.
-                // Live + blob Remove + attrs replaced-with-empty (a
-                // canonical directory carries no attrs; the file's mode
-                // must not leak through inheritance).
-                node.presence = depot::Presence::Live;
-                node.blob = BlobOp::Remove;
-                node.attrs = Some(Attrs::new());
-            }
-            if leaf {
-                if ch.status == b'D' {
-                    // Children staged under this name (file→dir, A seen
-                    // first) must survive the delete of the old blob.
-                    if node.children.is_empty() {
-                        *node = Node::tombstone();
-                    } else {
-                        node.presence = depot::Presence::Live;
-                        node.blob = BlobOp::Remove;
-                        node.attrs = Some(Attrs::new());
-                    }
-                } else {
-                    // Mode from the raw tree object (mode-faithful), not
-                    // diff-tree (which normalizes 100664 → 100644 and so on).
-                    let mode = exact_mode(cat, &mut tcache, new_tree_oid, &ch.path)?
-                        .unwrap_or_else(|| ch.new_mode.clone().into_bytes());
-                    let content = if mode == b"160000" {
-                        // gitlink: the pinned commit id IS the source data.
-                        ch.new_oid.clone().into_bytes()
-                    } else {
-                        cat.get(&ch.new_oid)?
-                    };
-                    node.presence = depot::Presence::Live;
-                    node.blob = BlobOp::Set(content.into());
-                    node.attrs = Some(Attrs::from([(b"mode".to_vec(), mode)]));
-                }
-            }
-        }
-    }
-    Ok(Layer { root })
-}
-
 /// The walked scope, from ONE `rev-list --parents` pass (same scope
 /// as the change stream; minus `negations` for updates).
 struct Dag {
@@ -1242,325 +823,25 @@ fn walk_order(
 /// path holding that oid goes. This rides the frontier exactly like the
 /// views: a commit's multiset is its FIRST parent's multiset with the
 /// commit's changes applied, cloned/moved at the SAME points the view is,
-/// so fork/merge/continue inherit correct sets for free from the existing
-/// refcount logic. Empty (and never touched) when the walk's `track_oids`
-/// is false, so the shipped importer pays nothing.
-type OidSet = HashMap<Vec<u8>, u32>;
-
-/// True for git's all-zero placeholder oid (an add's old side, a delete's
-/// new side) — nothing to add or remove for it.
-fn oid_absent(oid: &str) -> bool {
-    oid.is_empty() || oid.bytes().all(|b| b == b'0')
-}
-
-fn oid_inc(set: &mut OidSet, oid: &str) {
-    if !oid_absent(oid) {
-        *set.entry(oid.as_bytes().to_vec()).or_insert(0) += 1;
-    }
-}
-
-fn oid_dec(set: &mut OidSet, oid: &str) {
-    if oid_absent(oid) {
-        return;
-    }
-    match set.get_mut(oid.as_bytes()) {
-        Some(c) => {
-            *c -= 1;
-            if *c == 0 {
-                set.remove(oid.as_bytes());
-            }
-        }
-        // Every decrement must match an earlier increment: a commit's
-        // old-side oid was, by construction, a blob in its first parent's
-        // tree and so is counted in the inherited multiset. A miss means
-        // desync — today only reachable if the walk is ever seeded with a
-        // non-empty base whose multiset wasn't seeded to match (the lane
-        // encoder seeds empty). Trip loudly in debug so that latent hole
-        // can't land silently; in release it stays a harmless no-op (the
-        // multiset only feeds clustering, never reconstruction).
-        None => debug_assert!(false, "oid_dec on absent oid {oid}: blob-oid multiset desync"),
-    }
-}
-
-/// Apply a commit's first-parent changes to its blob-oid multiset (its
-/// first parent's, already cloned/moved in). `A` adds the new oid; `D`
-/// removes the old; `M`/`T` swap old for new. Gitlinks (mode 160000) carry
-/// the pinned commit id in the same `old_oid`/`new_oid` fields, so submodule
-/// pins participate in similarity with no special-casing.
-fn apply_oids(set: &mut OidSet, changes: &[RawChange]) {
-    for ch in changes {
-        match ch.status {
-            b'A' => oid_inc(set, &ch.new_oid),
-            b'D' => oid_dec(set, &ch.old_oid),
-            _ => {
-                oid_dec(set, &ch.old_oid);
-                oid_inc(set, &ch.new_oid);
-            }
-        }
-    }
-}
-
-struct Frontier {
-    views: HashMap<String, (depot::View, OidSet, u32)>,
-    max: usize,
-}
-
-impl Frontier {
-    /// Take the base view (and oid multiset) for a first parent: the last
-    /// remaining child moves them out, earlier ones clone. The multiset
-    /// rides the view — one refcount, cloned/moved together.
-    fn take(&mut self, sha: &str) -> Result<(depot::View, OidSet)> {
-        match self.views.get_mut(sha) {
-            Some((_, _, rc)) if *rc == 1 => {
-                let (v, o, _) = self.views.remove(sha).expect("present");
-                Ok((v, o))
-            }
-            Some((v, o, rc)) => {
-                *rc -= 1;
-                Ok((v.clone(), o.clone()))
-            }
-            None => Err(Error::Git(format!(
-                "parent {sha} not in frontier (shallow clone, or a parent \
-                 outside the walked scope that is not in the store)"
-            ))),
-        }
-    }
-
-    /// Release one non-first-parent reference.
-    fn release(&mut self, sha: &str) -> Result<()> {
-        self.take(sha).map(|_| ())
-    }
-
-    fn insert(&mut self, sha: String, view: depot::View, oids: OidSet, rc: u32) {
-        if rc > 0 {
-            self.views.insert(sha, (view, oids, rc));
-            self.max = self.max.max(self.views.len());
-        }
-    }
-}
-
-/// One buffer pass over the walked scope mapping each commit's root
-/// tree oid to a commit sha owning it — the tagged-tree dedup check
-/// when the intra-ingest tree cache misses (update path: the tree's
-/// commit was ingested in an earlier run).
-fn commit_tree_map(repo: &Path) -> Result<BTreeMap<String, String>> {
-    let mut map = BTreeMap::new();
-    for line in git_str(repo, &["log", "--format=%H %T", "--branches", "--tags"])?.lines() {
-        if let Some((sha, tree)) = line.split_once(' ') {
-            map.insert(tree.to_string(), sha.to_string());
-        }
-    }
-    Ok(map)
-}
-
-/// Resolve a tagged tree's oid to a TREES index: dedup against a
-/// commit's tree (intra-ingest cache first, then one `git log %H %T`
-/// buffer pass — the linux v2.6.11-tree shape, no new record), else
-/// import the tree standalone via the same view path as commit trees
-/// (its reverse delta anchors like any other record).
-fn tag_tree_idx(
-    repo: &Path,
-    ingest: &mut store::Ingest,
-    tree_oid: &str,
-    tree_of_commits: &mut Option<BTreeMap<String, String>>,
-) -> Result<u64> {
-    if let Some(i) = ingest.known_tree_idx(tree_oid) {
-        return Ok(i);
-    }
-    if tree_of_commits.is_none() {
-        *tree_of_commits = Some(commit_tree_map(repo)?);
-    }
-    if let Some(csha) = tree_of_commits.as_ref().unwrap().get(tree_oid) {
-        return ingest.tree_idx_of_commit(&csha.clone(), tree_oid);
-    }
-    let entries = ls_tree(repo, tree_oid)?;
-    let blobs = fetch_blobs(
-        repo,
-        entries
-            .iter()
-            .filter(|e| e.mode != "160000")
-            .map(|e| e.oid.clone()),
-    )?;
-    let full = tree_layer(&entries, &blobs)?;
-    // An empty tagged tree is the empty-but-present root View (existence is
-    // first-class now), not an error.
-    let view = depot::apply(None, &full).unwrap_or_default();
-    ingest.tree_idx_for(tree_oid, None, &view)
-}
-
-/// Stage the repo's NEW annotated-tag objects; must run AFTER the
-/// commit loop so every peeled target index resolves.
 fn ingest_tags(repo: &Path, ingest: &mut store::Ingest, refs: &[RefMeta]) -> Result<()> {
-    let mut tree_of_commits = None;
     for t in collect_tag_objects(repo, refs)? {
         if ingest.knows_tag(&t.sha)? {
             continue;
         }
         let peel = match &t.target {
             TagPeelOid::Commit(sha) => store::TagPeel::Commit(sha),
-            TagPeelOid::Tree(oid) => store::TagPeel::Tree(tag_tree_idx(
-                repo,
-                ingest,
-                oid,
-                &mut tree_of_commits,
-            )?),
+            TagPeelOid::Tree(_) => {
+                // A tag peeling to a STANDALONE tree has no revision in the
+                // union to reference (the union stores only commit trees).
+                return Err(Error::Unsupported(format!(
+                    "tag {} peels to a standalone tree — not supported by the union mirror",
+                    t.sha
+                )));
+            }
         };
         ingest.add_tag(&t.sha, peel, &t.raw)?;
     }
     Ok(())
-}
-
-/// A parent of `cm` whose tree oid equals `tree_oid`, if any — the
-/// TREES dedup check. `memo` holds every streamed commit's tree oid;
-/// a miss (boundary parent) costs one small cat-file fetch.
-fn same_tree_parent(
-    cm: &CommitMeta,
-    tree_oid: &str,
-    memo: &mut HashMap<String, String>,
-    cat: &mut CatFile,
-) -> Result<Option<String>> {
-    for p in &cm.parents {
-        if !memo.contains_key(p) {
-            let raw = cat.get(p)?;
-            let (_, t) = parse_commit(&raw)?;
-            memo.insert(p.clone(), t);
-        }
-        if memo[p] == tree_oid {
-            return Ok(Some(p.clone()));
-        }
-    }
-    Ok(None)
-}
-
-/// Drive the streaming walk into `ingest`: every not-yet-known commit
-/// gets its view built as (first parent's frontier view) + apply_mut of
-/// the first-parent raw delta, then lands via the UNCHANGED chain path
-/// (`Ingest::add_commit` — same records, same reverse deltas, same
-/// batching/anchoring as before). `seeds` are boundary views (update
-/// path: parents/known commits whose views live only in the store),
-/// pre-inserted with their refcounts. `tree_oids` is the sha → root
-/// tree oid memo for `same_tree_parent` — callers that stream in
-/// several passes over one ingest (the laddered bootstrap) share it so
-/// a rung-boundary parent never needs a cat-file the buffer may no
-/// longer answer. Per new commit, `on_commit` is called (right after
-/// `add_commit`) with that commit's CommitMeta — the walk itself
-/// hoards NOTHING per commit (the old Vec<CommitMeta> return measured
-/// ~17KB/commit of linear RSS growth, ~9.6GB extrapolated at linux
-/// scale); callers keep only what they actually use. Returns the new
-/// commit count plus the max frontier size (instrumentation).
-///
-/// Permanent per-commit walk state that DOES remain, with expected
-/// linux-scale footprint (~1.3M commits; ~100-150B/commit each is
-/// acceptable): `tree_oids` (sha → root tree oid hex, ~130B/commit),
-/// the caller's known/known_all sha sets (~90B/commit), and Ingest's
-/// sha_cache (~90B/commit) + tree_of_commit (~50B/commit) maps.
-#[allow(clippy::too_many_arguments)]
-fn ingest_stream(
-    repo: &Path,
-    ingest: &mut store::Ingest,
-    dag: &Dag,
-    seeds: Vec<(String, depot::View)>,
-    known: &std::collections::HashSet<String>,
-    tree_oids: &mut HashMap<String, String>,
-    mut rep: Option<&mut ReportAccum>,
-    on_commit: &mut dyn FnMut(&CommitMeta) -> Result<()>,
-) -> Result<(usize, usize)> {
-    frontier_walk(repo, dag, seeds, known, false, &mut |cm, tree_oid, view, _oids, cat| {
-        let same = same_tree_parent(cm, tree_oid, tree_oids, cat)?;
-        tree_oids.insert(cm.sha.clone(), tree_oid.to_string());
-        // The full record (`encode(diff(None, view))`, O(tree)) is only
-        // for the report accumulator's comparison harness; the store
-        // path mints fulls once per prepend batch (store::tree_idx_for).
-        if let Some(r) = rep.as_deref_mut() {
-            r.push(view, codec::encode(&depot::diff(None, Some(view))));
-        }
-        ingest.add_commit(cm, tree_oid, same.as_deref(), view)?;
-        on_commit(cm)?;
-        Ok(())
-    })
-}
-
-/// The ONE streaming frontier walk the shipped importer
-/// (`ingest_stream`) drives — the O(delta) view construction, factored
-/// out so only the SINK differs. Streams the walked scope in `dag.order`, and for every
-/// not-yet-`known` commit builds its `depot::View` in O(delta): the
-/// first parent's frontier view (Arc-shared, moved out on its last
-/// child else cloned) with `apply_mut` of that commit's first-parent
-/// `delta_layer` on top; other parents only release their frontier
-/// refs. Each such commit is handed to `sink(cm, tree_oid, view, cat)`
-/// (the persistent `cat-file` is lent so a sink can peel parents), THEN
-/// inserted into the frontier for its own children. `seeds` are
-/// boundary views (update path) pre-inserted with their refcounts.
-/// Returns (new commit count, peak frontier size).
-fn frontier_walk(
-    repo: &Path,
-    dag: &Dag,
-    seeds: Vec<(String, depot::View)>,
-    known: &std::collections::HashSet<String>,
-    track_oids: bool,
-    sink: &mut dyn FnMut(&CommitMeta, &str, &depot::View, &OidSet, &mut CatFile) -> Result<()>,
-) -> Result<(usize, usize)> {
-    let counts = &dag.counts;
-    let mut cat = CatFile::new(repo)?;
-    let mut stream = LogStream::spawn(repo, &dag.order)?;
-    let mut frontier = Frontier { views: HashMap::new(), max: 0 };
-    for (sha, view) in seeds {
-        let rc = counts.get(&sha).copied().unwrap_or(0);
-        frontier.insert(sha, view, OidSet::new(), rc);
-    }
-    let mut new_count = 0usize;
-    while let Some((sha, changes)) = stream.next_commit()? {
-        if known.contains(&sha) {
-            continue; // already in the store; its view was seeded
-        }
-        let raw = cat.get(&sha)?;
-        let (mut cm, tree_oid) = parse_commit(&raw)?;
-        cm.sha = sha.clone();
-        // Recover mode-only changes diff-tree normalizes away (see
-        // `mode_only_changes`), by diffing the first parent's raw tree
-        // against this commit's, pruned by subtree oid.
-        let mut changes = changes;
-        if let Some(p1) = cm.parents.first() {
-            let praw = cat.get(p1)?;
-            let (_, parent_tree) = parse_commit(&praw)?;
-            let mut mcache: TreeCache = std::collections::HashMap::new();
-            let mut extra = Vec::new();
-            mode_only_changes(&mut cat, &mut mcache, &parent_tree, &tree_oid, b"", &mut extra)?;
-            changes.extend(extra);
-        }
-        // Base = FIRST parent's view AND oid multiset (the raw delta is vs
-        // the first parent); other parents only release their frontier refs.
-        // A root starts from an empty view and an empty multiset.
-        let (mut view, mut oids) = match cm.parents.split_first() {
-            None => (None, OidSet::new()),
-            Some((p1, rest)) => {
-                let (base, base_oids) = frontier.take(p1)?;
-                for p in rest {
-                    frontier.release(p)?;
-                }
-                (Some(base), base_oids)
-            }
-        };
-        depot::apply_mut(&mut view, &delta_layer(&changes, &tree_oid, &mut cat)?);
-        // Maintain the git-oid multiset alongside the view — first parent's
-        // set with this commit's changes applied. Skipped entirely (empty
-        // set flows through) when the sink does not need it, so the shipped
-        // importer's behavior is byte-identical.
-        if track_oids {
-            apply_oids(&mut oids, &changes);
-        }
-        // A git tree object always EXISTS, including the empty root tree
-        // (4b825dc…): an absent resolved view is that empty-but-present
-        // root, not an error. Existence is first-class in the depot now,
-        // so no sentinel is needed — `view_tree_oid` of the empty View is
-        // exactly the empty-tree oid.
-        let view = view.unwrap_or_default();
-        sink(&cm, &tree_oid, &view, &oids, &mut cat)?;
-        new_count += 1;
-        let rc = counts.get(&sha).copied().unwrap_or(0);
-        frontier.insert(sha, view, oids, rc);
-    }
-    Ok((new_count, frontier.max))
 }
 
 /// Import a git repo into `store` (created; must not exist).
@@ -1571,118 +852,41 @@ pub fn import(repo: &Path, store: &Path, level: i32) -> Result<ImportOutcome> {
 /// `report`: also measure the alternative encodings (full/delta ×
 /// standalone/refPrefix + solid bound) — the straightedge's comparison
 /// harness, NOT part of storing.
-pub fn import_opts(repo: &Path, store: &Path, level: i32, report: bool)
+/// Ingest commit metadata (+ its lane reference) for revisions `start..` of
+/// the union store `ls`, in union-revision order so each commit's stable index
+/// equals its revision. Trees are NOT stored here — a commit points at its tree
+/// by `(rev = idx, lane)` into `ls`.
+fn ingest_commits(
+    repo: &Path,
+    ingest: &mut store::Ingest,
+    ls: &crate::lanestore::LaneStore,
+    start: usize,
+) -> Result<usize> {
+    let mut cat = CatFile::new(repo)?;
+    for rev in start..ls.n_rev() {
+        let sha = ls.sha_at(rev).to_string();
+        let raw = cat.get(&sha)?;
+        let (mut cm, _tree_oid) = parse_commit(&raw)?;
+        cm.sha = sha;
+        ingest.add_commit(&cm, ls.lane_of(rev) as u64)?;
+    }
+    Ok(ls.n_rev() - start)
+}
+
+pub fn import_opts(repo: &Path, store: &Path, level: i32, _report: bool)
     -> Result<ImportOutcome>
 {
     let refs = collect_refs(repo)?;
-    let dag = dag_scope(repo, &[])?;
-
+    // 1. Build the union-of-lanes tree store (§1/§2/§7) in `store/trees`.
     let mut st = store::Store::create(store)?;
+    let ls = crate::lanestore::LaneStore::encode_repo_union(repo, &store.join("trees"), level)?;
+    // 2. Ingest commit metadata + tags + refs, each commit referencing its
+    //    `(rev, lane)` tree in the union.
     let mut ingest = store::Ingest::new(&mut st, level)?;
-    // Walk oldest → newest, one resolved view at a time. The full
-    // record for a new tree is derived from the VIEW via
-    // diff(None, view) — the same function the decoder uses to
-    // recompute refPrefix anchors from reconstructed views;
-    // bit-exactness of that anchor is load-bearing.
-    let mut rep = report.then(ReportAccum::default);
-    let (new_commits, max_frontier) = ingest_stream(
-        repo,
-        &mut ingest,
-        &dag,
-        Vec::new(),
-        &Default::default(),
-        &mut HashMap::new(),
-        rep.as_mut(),
-        &mut |_| Ok(()), // per-commit metadata is never hoarded
-    )?;
+    let new_commits = ingest_commits(repo, &mut ingest, &ls, 0)?;
     ingest_tags(repo, &mut ingest, &refs)?;
     ingest.finish(&refs)?;
-
-    let report = match rep {
-        Some(r) => Some(r.finish(level)?),
-        None => None,
-    };
-    Ok(ImportOutcome { refs, new_commits, report, max_frontier })
-}
-
-/// Report-only accumulator: rebuilds the v1 comparison record families
-/// (newest-first full + delta records) from an oldest-first walk.
-#[derive(Default)]
-struct ReportAccum {
-    fulls: Vec<Vec<u8>>,
-    deltas: Vec<Vec<u8>>, // record for view i, pushed when view i+1 arrives
-    prev: Option<depot::View>,
-}
-
-impl ReportAccum {
-    fn push(&mut self, view: &depot::View, full: Vec<u8>) {
-        if let Some(prev) = &self.prev {
-            self.deltas
-                .push(codec::encode(&depot::diff(Some(view), Some(prev))));
-        }
-        self.fulls.push(full);
-        self.prev = Some(view.clone());
-    }
-
-    fn finish(mut self, level: i32) -> Result<SizeReport> {
-        self.fulls.reverse();
-        let full_records = self.fulls;
-        let mut delta_records = Vec::with_capacity(full_records.len());
-        delta_records.push(full_records[0].clone());
-        delta_records.extend(self.deltas.into_iter().rev());
-        Ok(SizeReport {
-            commits: delta_records.len(),
-            zstd_level: level,
-            full_raw: full_records.iter().map(|r| r.len() as u64).sum(),
-            full_standalone: standalone_total(&full_records, level)?,
-            full_ref_chain: chain_bytes(&full_records, level)?,
-            delta_raw: delta_records.iter().map(|r| r.len() as u64).sum(),
-            delta_standalone: standalone_total(&delta_records, level)?,
-            delta_ref_chain: chain_bytes(&delta_records, level)?,
-            view_ref_chain: view_chain_total(&delta_records, &full_records, level)?,
-            solid_full: solid_total(&full_records, level)?,
-        })
-    }
-}
-
-fn standalone_total(records: &[Vec<u8>], level: i32) -> Result<u64> {
-    let mut total = 0u64;
-    for rec in records {
-        total += store::compress(rec, None, level)?.len() as u64;
-    }
-    Ok(total)
-}
-
-fn chain_bytes(records: &[Vec<u8>], level: i32) -> Result<u64> {
-    let mut total = 0u64;
-    for (i, rec) in records.iter().enumerate() {
-        let prefix = if i == 0 { None } else { Some(records[i - 1].as_slice()) };
-        total += 8 + store::compress(rec, prefix, level)?.len() as u64;
-    }
-    Ok(total)
-}
-
-/// The v1 stored form (delta records anchored on the previous commit's
-/// full VIEW bytes) — kept as a comparison line.
-fn view_chain_total(
-    delta_records: &[Vec<u8>],
-    full_records: &[Vec<u8>],
-    level: i32,
-) -> Result<u64> {
-    let mut total = 0u64;
-    for (i, rec) in delta_records.iter().enumerate() {
-        let prefix = if i == 0 { None } else { Some(full_records[i - 1].as_slice()) };
-        total += 8 + store::compress(rec, prefix, level)?.len() as u64;
-    }
-    Ok(total)
-}
-
-fn solid_total(records: &[Vec<u8>], level: i32) -> Result<u64> {
-    let mut concat = Vec::new();
-    for rec in records {
-        concat.extend_from_slice(rec);
-    }
-    Ok(store::compress(&concat, None, level)?.len() as u64)
+    Ok(ImportOutcome { refs, new_commits, report: None, max_frontier: 0 })
 }
 
 // ---------------------------------------------------------------- update
@@ -1710,93 +914,25 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
     let refs = collect_refs(repo)?;
     let mut st = store::Store::open(store)?;
     let base_prepends = st.depot_prepends();
+    let old_n = st.count(store::COMMITS)? as usize;
 
-    // The stream is RESTRICTED to new history: negate the store's
-    // current commit tips (the refs table's previous state). Anything
-    // that still streams but is already stored (a rewind, a tip whose
-    // negation object was pruned) is skipped, its view seeded below.
-    let mut negations: Vec<String> = st
-        .refs_meta()?
-        .iter()
-        .filter(|r| !r.sha.is_empty())
-        .map(|r| r.sha.clone())
-        .collect();
-    negations.sort();
-    negations.dedup();
-    let dag = dag_scope(repo, &negations)?;
-    let (counts, streamed) = (&dag.counts, &dag.streamed);
+    // Incrementally update the union tree store — O(new): only the new
+    // revisions' union deltas are folded onto the stored boundary (§11).
+    let ls = crate::lanestore::LaneStore::update(repo, &store.join("trees"), level)?;
+    let total = ls.n_rev();
 
-    // Boundary/known views: a new commit's parent can be an OLD commit
-    // whose view is in no frontier — reconstruct those from the store
-    // (ONE tree walk down to the deepest needed position), BEFORE the
-    // ingest starts (tree_view positions are kv-count-relative and the
-    // chain must not have unaccounted staged records).
-    let mut known = std::collections::HashSet::new();
-    let mut need: Vec<(String, u64)> = Vec::new(); // (sha, tree_idx)
-    for sha in streamed {
-        // Already stored but streaming again (rewind, recreated branch,
-        // pruned negation object): skip its records, seed its view if
-        // any streamed child needs it.
-        if let Some(idx) = st.sha_to_idx(sha)? {
-            known.insert(sha.clone());
-            if counts.get(sha).copied().unwrap_or(0) > 0 {
-                need.push((sha.clone(), st.commit_record_at(idx)?.tree_idx));
-            }
-        }
-    }
-    for sha in counts.keys() {
-        if streamed.contains(sha) {
-            continue;
-        }
-        let idx = st.sha_to_idx(sha)?.ok_or_else(|| {
-            Error::Meta(format!("parent {sha} not in store (shallow history?)"))
-        })?;
-        need.push((sha.clone(), st.commit_record_at(idx)?.tree_idx));
-    }
-    let seeds = seed_views(&st, need)?;
-
+    // Ingest ONLY the new commits (revisions `old_n..`), continuing the
+    // COMMITS chain (idx == rev).
     let mut ingest = store::Ingest::new(&mut st, level)?;
-    let (k, _max_frontier) = ingest_stream(
-        repo, &mut ingest, &dag, seeds, &known, &mut HashMap::new(), None,
-        &mut |_| Ok(()), // only the count is used
-    )?;
+    let k = ingest_commits(repo, &mut ingest, &ls, old_n)?;
     ingest_tags(repo, &mut ingest, &refs)?;
     ingest.finish(&refs)?;
     Ok(UpdateOutcome {
         new_commits: k,
-        total_commits: st.count(store::COMMITS)? as usize,
+        total_commits: total,
         refs,
         depot_prepends: st.depot_prepends() - base_prepends,
     })
-}
-
-/// Reconstruct the views for `(sha, tree_idx)` pairs in ONE tree-chain
-/// walk (head → deepest needed position).
-fn seed_views(
-    st: &store::Store,
-    need: Vec<(String, u64)>,
-) -> Result<Vec<(String, depot::View)>> {
-    if need.is_empty() {
-        return Ok(Vec::new());
-    }
-    let n = st.count(store::TREES)?;
-    let mut by_pos: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-    for (sha, tidx) in need {
-        if tidx >= n {
-            return Err(Error::Chain(format!("no tree at index {tidx}")));
-        }
-        by_pos.entry((n - 1 - tidx) as usize).or_default().push(sha);
-    }
-    let deepest = *by_pos.last_key_value().expect("non-empty").0;
-    let mut out = Vec::new();
-    st.walk_tree_views(Some(deepest), &mut |pos, _, view| {
-        if let Some(shas) = by_pos.get(&pos) {
-            for sha in shas {
-                out.push((sha.clone(), view.clone()));
-            }
-        }
-    })?;
-    Ok(out)
 }
 
 // ------------------------------------------------- git object identity
@@ -2032,14 +1168,13 @@ fn build_stub_at(dir: &Path, st: &store::Store, url: &str) -> Result<()> {
             recs.insert(r.sha.clone(), st.commit_record_at(idx)?);
         }
     }
-    // One tree walk for the views of every tip needing an assembled
-    // commit (raw-carrying records skip it).
-    let need: Vec<(String, u64)> = recs
-        .values()
-        .filter(|c| c.raw.is_empty())
-        .map(|c| (c.sha.clone(), c.tree_idx))
-        .collect();
-    let views: HashMap<String, depot::View> = seed_views(st, need)?.into_iter().collect();
+    // The views of every tip needing an assembled commit (raw-carrying
+    // records skip it), reconstructed from the union store.
+    let ls = st.union()?;
+    let mut views: HashMap<String, depot::View> = HashMap::new();
+    for c in recs.values().filter(|c| c.raw.is_empty()) {
+        views.insert(c.sha.clone(), ls.tree_view_of_commit(&c.sha)?);
+    }
     for (sha, rec) in &recs {
         let parents = rec
             .parent_idxs
@@ -2217,18 +1352,33 @@ fn materialize_tip_snapshots(
     st: &store::Store,
     only: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<()> {
-    let mut need: Vec<(String, u64)> = Vec::new();
+    let ls = st.union()?;
+    let mut views: Vec<depot::View> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    for (name, _cidx, tidx, _tag) in st.ref_rows()? {
-        if only.is_some_and(|f| !f.contains(&name)) {
+    for r in st.refs_meta()? {
+        if only.is_some_and(|f| !f.contains(&r.name)) {
             continue;
         }
-        if seen.insert(tidx) {
-            need.push((name, tidx));
+        if r.sha.is_empty() {
+            continue;
+        }
+        if seen.insert(r.sha.clone()) {
+            views.push(ls.tree_view_of_commit(&r.sha)?);
         }
     }
-    let views = seed_views(st, need)?;
-    materialize_snapshots(repo, views.iter().map(|(_, v)| v))?;
+    // A live boundary lane tip can be unreachable from the current refs
+    // (a deleted branch), yet the incremental update reconstructs its tree
+    // from the boundary — so it must be present in the buffer too. When
+    // `only` is set (the moved-refs fast path) these are left out; the
+    // caller falls back to the full pass on a boundary miss.
+    if only.is_none() {
+        for sha in crate::lanestore::LaneStore::boundary_tip_shas(&st.root().join("trees"))? {
+            if seen.insert(sha.clone()) {
+                views.push(ls.tree_view_of_commit(&sha)?);
+            }
+        }
+    }
+    materialize_snapshots(repo, views.iter())?;
     Ok(())
 }
 
@@ -2597,8 +1747,10 @@ fn bootstrap(
     }
 
     let mut st = store::Store::create(store_path)?;
+    let trees = store_path.join("trees");
     let mut ingest = store::Ingest::new(&mut st, level)?;
-    let mut tree_oids: HashMap<String, String> = HashMap::new();
+    // Commits already added to `ingest` (== union revisions folded so far).
+    let mut ingested = 0usize;
     let mut known_all: std::collections::HashSet<String> = Default::default();
     let mut prev_tips: Vec<String> = Vec::new();
     // Tips that appeared since the last snapshot materialization.
@@ -2643,21 +1795,18 @@ fn bootstrap(
         };
         rung_no += 1;
         // Pre-fetch: the stub contract's snapshot materialization,
-        // views from the staged (not-yet-landed) chain. EVERY current
-        // tip must be covered before any fetch (the server excludes
-        // each shallow have's snapshot unconditionally), but snapshot
-        // PACKS survive the re-pins, so each rung only builds the
-        // tips that appeared since the last one.
+        // views from the union store (landed by the previous rung's
+        // update). EVERY current tip must be covered before any fetch
+        // (the server excludes each shallow have's snapshot
+        // unconditionally), but snapshot PACKS survive the re-pins, so
+        // each rung only builds the tips that appeared since the last.
         if !fresh_tips.is_empty() {
-            let mut targets: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+            let ls = crate::lanestore::LaneStore::open(&trees)?;
+            let mut views = Vec::new();
             for sha in &fresh_tips {
-                let t = ingest.tree_idx_of_staged(sha).ok_or_else(|| {
-                    Error::Chain(format!("tip {sha} not staged (bootstrap invariant)"))
-                })?;
-                targets.entry(t).or_default().push(0);
+                views.push(ls.tree_view_of_commit(sha)?);
             }
-            let views = ingest.staged_views(&targets)?;
-            snap_packs.extend(materialize_snapshots(&repo, views.iter().map(|(_, v)| v))?);
+            snap_packs.extend(materialize_snapshots(&repo, views.iter())?);
             fresh_tips.clear();
         }
         let rung_refs = specs.as_ref().map_or(0, |s| s.len());
@@ -2672,43 +1821,21 @@ fn bootstrap(
             }
         }
         let buffer_peak_kb = dir_kb(&repo);
-        let negations = prev_tips.clone();
-        let dag = dag_scope(&repo, &negations)?;
-        let (counts, streamed) = (&dag.counts, &dag.streamed);
-        // Boundary/known seeding, mid-bootstrap flavor: views come
-        // from the staged chain, not the store.
-        let mut known = std::collections::HashSet::new();
-        let mut need: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-        let mut want = |sha: &str, ingest: &store::Ingest| -> Result<()> {
-            let t = ingest.tree_idx_of_staged(sha).ok_or_else(|| {
-                Error::Meta(format!("parent {sha} not in the staged import (shallow history?)"))
-            })?;
-            need.entry(t).or_default().push(sha.to_string());
-            Ok(())
+        // Fold this rung's new commits into the union tree store — O(new):
+        // the boundary is reconstructed from the store, only the newly
+        // fetched revisions are walked and encoded. Then ingest their
+        // commit metadata into the COMMITS chain (idx == rev).
+        let ls = if trees.exists() {
+            crate::lanestore::LaneStore::update(&repo, &trees, level)?
+        } else {
+            crate::lanestore::LaneStore::encode_repo_union(&repo, &trees, level)?
         };
-        for sha in streamed {
-            if known_all.contains(sha) {
-                known.insert(sha.clone());
-                if counts.get(sha).copied().unwrap_or(0) > 0 {
-                    want(sha, &ingest)?;
-                }
-            }
-        }
-        for sha in counts.keys() {
-            if !streamed.contains(sha) {
-                want(sha, &ingest)?;
-            }
-        }
-        let seeds = ingest.staged_views(&need)?;
-        // The sink keeps ONLY the sha (known_all needs it for later
-        // rungs); the rest of the CommitMeta is dropped per commit.
-        let (rung_new, frontier_peak) = ingest_stream(
-            &repo, &mut ingest, &dag, seeds, &known, &mut tree_oids, None,
-            &mut |cm| {
-                known_all.insert(cm.sha.clone());
-                Ok(())
-            },
-        )?;
+        let rung_new = ingest_commits(&repo, &mut ingest, &ls, ingested)?;
+        ingested = ls.n_rev();
+        // Refresh the imported-commit set for the next rung's READY-tag
+        // selection.
+        known_all = (0..ls.n_rev()).map(|r| ls.sha_at(r).to_string()).collect();
+        let frontier_peak = 0usize;
         total_new += rung_new;
         let staged_kb = ingest.staged_bytes() / 1024;
         let store_kb = dir_kb(store_path);
@@ -2905,15 +2032,6 @@ fn walk_files<'a>(
     Ok(())
 }
 
-fn object_exists(repo: &Path, oid: &str) -> Result<bool> {
-    Ok(Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["cat-file", "-e", oid])
-        .stderr(Stdio::null())
-        .status()?
-        .success())
-}
 
 /// Feed `input` to a git command and return trimmed stdout.
 fn git_stdin(repo: &Path, args: &[&str], input: &[u8]) -> Result<String> {
@@ -2935,36 +2053,6 @@ fn git_stdin(repo: &Path, args: &[&str], input: &[u8]) -> Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// Write `view` into the repo's object database bottom-up
-/// (`hash-object -w` per blob, `mktree -z` per directory) and return
-/// the root tree oid — the standalone-tagged-tree export path.
-fn materialize_tree(repo: &Path, view: &depot::View) -> Result<String> {
-    let mut lines: Vec<u8> = Vec::new();
-    for (name, child) in &view.children {
-        let (mode, typ, oid) = match &child.blob {
-            Some(content) => {
-                let mode = child
-                    .attrs
-                    .get(&b"mode"[..])
-                    .map(|m| String::from_utf8_lossy(m).into_owned())
-                    .ok_or_else(|| Error::Meta("file node without mode attr".into()))?;
-                if mode == "160000" {
-                    // gitlink: the stored blob IS the pinned commit id.
-                    (mode, "commit", String::from_utf8_lossy(content).into_owned())
-                } else {
-                    let oid = git_stdin(repo, &["hash-object", "-w", "--stdin"], content)?;
-                    (mode, "blob", oid)
-                }
-            }
-            None => ("040000".into(), "tree", materialize_tree(repo, child)?),
-        };
-        lines.extend_from_slice(format!("{mode} {typ} {oid}\t").as_bytes());
-        lines.extend_from_slice(name);
-        lines.push(0);
-    }
-    git_stdin(repo, &["mktree", "-z"], &lines)
 }
 
 /// Export a store into a fresh git repository at `repo` (must not be an
@@ -3048,19 +2136,9 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
     // reconstructed newest→oldest (the stated O(history) export cost).
     let st = store::Store::open(store)?;
     let recs = st.commit_records()?; // oldest-first (position = index)
-    let views_nf = st.tree_views(None)?; // newest-first
-    let n_trees = st.count(store::TREES)? as usize;
-    if views_nf.len() != n_trees {
-        return Err(Error::Chain(format!(
-            "{} tree frames but n_trees = {n_trees}",
-            views_nf.len()
-        )));
-    }
-    let view_of = |tree_idx: u64| -> Result<&depot::View> {
-        views_nf
-            .get(n_trees - 1 - tree_idx as usize)
-            .ok_or_else(|| Error::Chain(format!("no tree at index {tree_idx}")))
-    };
+    // The tree for a commit is its lane of the union at that commit's
+    // revision (idx == rev by construction).
+    let ls = st.union()?;
     let refs = st.refs_meta()?;
     std::fs::create_dir_all(repo)?;
     // Reinit is a no-op on an existing repo and preserves bareness —
@@ -3085,7 +2163,8 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
             )));
         }
         let mut files = Vec::new();
-        walk_files(view_of(cm.tree_idx)?, &mut Vec::new(), &mut files)?;
+        let view = ls.tree_view_at(cm.idx as usize)?;
+        walk_files(&view, &mut Vec::new(), &mut files)?;
 
         for (_, mode, content) in &files {
             if mode == "160000" {
@@ -3177,15 +2256,12 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
             // fast-import; a STANDALONE tagged tree must be
             // materialized from its TREES record first (mktree
             // bottom-up), and must regenerate its imported oid.
-            let (obj, typ) = parse_tag_target(&t.sha, &t.raw)?;
-            if typ == "tree" && !object_exists(repo, &obj)? {
-                let got = materialize_tree(repo, &st.tree_view(tidx)?)?;
-                if got != obj {
-                    return Err(Error::Meta(format!(
-                        "fidelity check failed: tagged tree regenerated as {got}, \
-                         imported as {obj}"
-                    )));
-                }
+            let _ = tidx;
+            let (_obj, typ) = parse_tag_target(&t.sha, &t.raw)?;
+            if typ == "tree" {
+                return Err(Error::Unsupported(
+                    "standalone tree tags are not supported by the union store".into(),
+                ));
             }
         }
         let mut child = Command::new("git")

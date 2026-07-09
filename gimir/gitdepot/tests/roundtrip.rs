@@ -151,33 +151,35 @@ fn roundtrip_sha_exact_and_chain_compresses() {
 
     let refs_before = build_fixture(&repo);
 
-    let outcome = gitdepot::import_opts(&repo, &store, 3, true).unwrap();
-    let r = outcome.report.as_ref().expect("report requested");
-    assert_eq!(r.commits, 13);
+    gitdepot::import(&repo, &store, 3).unwrap();
+    let st = gitdepot::store::Store::open(&store).unwrap();
+    let ls = st.union().unwrap();
+    assert_eq!(ls.n_rev(), 13);
 
-    // §8 anti-sabotage assertions: the rest form must actually render
-    // the design. Near-identical successive trees ⇒ delta records cost
-    // ~the edit; full records cost ~the whole tree each.
+    // Compression: the union tree store on disk must be far smaller than
+    // a "full standalone" baseline that re-materializes every revision's
+    // whole tree independently (Σ over revisions of all file bytes) — the
+    // reverse-delta union stores each revision's CHANGE, not its tree.
+    fn dir_bytes(dir: &std::path::Path) -> usize {
+        let mut total = 0;
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let m = e.metadata().unwrap();
+            total += if m.is_dir() { dir_bytes(&e.path()) } else { m.len() as usize };
+        }
+        total
+    }
+    let mut naive = 0usize;
+    for rev in 0..ls.n_rev() {
+        for (_, _, content) in ls.lane_entries_at(rev).unwrap() {
+            naive += content.len();
+        }
+    }
+    let on_disk = dir_bytes(&store.join("trees"));
     assert!(
-        r.delta_raw * 4 < r.full_raw,
-        "delta records ({}) not <4x smaller than full records ({}) — diff isn't deltaing",
-        r.delta_raw,
-        r.full_raw
+        on_disk * 4 < naive,
+        "union tree store ({on_disk}) not <4x smaller than full-standalone baseline ({naive})"
     );
-    assert!(
-        r.view_ref_chain * 4 < r.full_standalone,
-        "stored chain ({}) not <4x smaller than full standalone ({})",
-        r.view_ref_chain,
-        r.full_standalone
-    );
-    // The stored (view-anchored) chain should be in the same league as
-    // the solid bound.
-    assert!(
-        r.view_ref_chain < r.solid_full * 3,
-        "stored chain ({}) way off the solid bound ({})",
-        r.view_ref_chain,
-        r.solid_full
-    );
+    drop(st);
 
     // Export and verify: every ref regenerates to the SAME object id —
     // tag objects included.
@@ -330,14 +332,13 @@ fn batch_update_equals_sequential_updates() {
         v
     };
     assert_eq!(sha_pairs(&sa), sha_pairs(&sb), "sha↔idx mapping diverges");
-    // TREES is untouched by batching: raw records byte-identical.
-    let tree_recs = |st: &gitdepot::store::Store| -> Vec<Vec<u8>> {
-        let mut recs = Vec::new();
-        st.walk_tree_views(None, &mut |_, rec, _| recs.push(rec.to_vec()))
-            .unwrap();
-        recs
+    // The union tree store agrees per revision: same commits map to the
+    // same SHA-exact reconstructed trees regardless of batching.
+    let tree_oids = |st: &gitdepot::store::Store| -> Vec<String> {
+        let ls = st.union().unwrap();
+        (0..ls.n_rev()).map(|r| ls.tree_oid_at(r).unwrap()).collect()
     };
-    assert_eq!(tree_recs(&sa), tree_recs(&sb), "tree records diverge");
+    assert_eq!(tree_oids(&sa), tree_oids(&sb), "union trees diverge");
 }
 
 #[test]
@@ -433,103 +434,6 @@ fn import_refuses_tag_at_blob_by_name() {
         Err(gitdepot::Error::Unsupported(m)) => assert!(m.contains("refs/tags/blobtag")),
         other => panic!("mirror should abort Unsupported, got {other:?}"),
     }
-}
-
-/// Tags peeling to a TREE (the linux v2.6.11-tree shape): a tag at an
-/// existing commit's tree DEDUPS (no new TREES record), a tag at a
-/// standalone mktree'd tree imports one new TREES record; both export
-/// SHA-exact (standalone trees materialized via mktree), the mirror
-/// loop runs to completion, resolve_ref yields the tag-sha pin, and
-/// the readout serves the tagged tree by that pin.
-#[test]
-fn tree_tags_dedup_import_export_and_mirror() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    let store = tmp.path().join("store");
-    let out = tmp.path().join("out");
-    build_fixture(&repo);
-
-    // (a) The linux shape: a tag at the tip commit's tree.
-    sh_git(&repo, &["tag", "-a", "-m", "tree of main", "treetag", "main^{tree}"]);
-    // (b) A standalone tree equal to no commit's tree.
-    let git_stdin = |args: &[&str], input: &[u8]| -> String {
-        let out = Command::new("git")
-            .arg("-C").arg(&repo)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn().and_then(|mut c| {
-                use std::io::Write as _;
-                c.stdin.take().unwrap().write_all(input)?;
-                c.wait_with_output()
-            }).unwrap();
-        assert!(out.status.success(), "git {args:?} failed");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    let blob = git_stdin(&["hash-object", "-w", "--stdin"], b"standalone bytes\n");
-    let tree = git_stdin(&["mktree"],
-                         format!("100644 blob {blob}\tlone.txt\n").as_bytes());
-    sh_git(&repo, &["tag", "-a", "-m", "standalone tree", "lonetree", &tree]);
-
-    gitdepot::import(&repo, &store, 3).unwrap();
-    let st = gitdepot::store::Store::open(&store).unwrap();
-    // build_fixture makes 13 commits with 13 distinct trees; treetag
-    // dedups against main's tree, lonetree adds exactly one record.
-    assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 14,
-               "tree-tag dedup broke: treetag must reuse main's TREES record");
-    let main_sha = sh_git(&repo, &["rev-parse", "main"]).trim().to_string();
-    let main_idx = st.sha_to_idx(&main_sha).unwrap().expect("main in store");
-    let tip_tree = st.commit_record_at(main_idx).unwrap().tree_idx;
-    drop(st);
-
-    // resolve_ref: the pin is the TAG sha; treetag's tree is the tip's.
-    let treetag_sha = sh_git(&repo, &["rev-parse", "refs/tags/treetag"]).trim().to_string();
-    let lonetree_sha = sh_git(&repo, &["rev-parse", "refs/tags/lonetree"]).trim().to_string();
-    assert_eq!(gitdepot::resolve_ref(&store, "treetag").unwrap().unwrap(),
-               gitdepot::Resolved::TreeTag {
-                   tag_sha: treetag_sha.clone(), tree_idx: tip_tree as usize });
-    match gitdepot::resolve_ref(&store, "lonetree").unwrap().unwrap() {
-        gitdepot::Resolved::TreeTag { tag_sha, .. } => assert_eq!(tag_sha, lonetree_sha),
-        other => panic!("lonetree must resolve TreeTag, got {other:?}"),
-    }
-
-    // Attach path: the tag-sha pin serves the tagged tree's bytes.
-    use depot::variant::Readout as _;
-    let ro = gitdepot::readout::TipReadout::for_commit(&store, &lonetree_sha, "")
-        .unwrap().expect("tag pin must hit");
-    assert_eq!(ro.blob(&[b"lone.txt"]),
-               Some(depot::variant::Blob::Bytes(b"standalone bytes\n".to_vec())));
-
-    // Export: byte-equal for-each-ref, both tags AND their peels.
-    gitdepot::export(&store, &out).unwrap();
-    let ffr = |repo: &Path| sh_git(repo, &["for-each-ref",
-        "--format=%(objectname) %(objecttype) %(refname)"]);
-    assert_eq!(ffr(&out), ffr(&repo), "exported for-each-ref differs");
-    for spec in ["refs/tags/treetag", "refs/tags/treetag^{tree}",
-                 "refs/tags/lonetree", "refs/tags/lonetree^{tree}"] {
-        assert_eq!(sh_git(&out, &["rev-parse", spec]),
-                   sh_git(&repo, &["rev-parse", spec]),
-                   "{spec} did not round-trip");
-    }
-
-    // Mirror loop with tree tags runs to completion, reflog notes the
-    // tag-at-tree movement with no commit fields.
-    let root = tmp.path().join("mirror");
-    gitdepot::mirror(repo.to_str().unwrap(), &root).unwrap();
-    let mstore = root.join("store");
-    assert!(matches!(gitdepot::resolve_ref(&mstore, "lonetree").unwrap().unwrap(),
-                     gitdepot::Resolved::TreeTag { .. }));
-    let log = gitdepot::store::reflog(&mstore).unwrap();
-    let row = log.iter().rev()
-        .find(|e| e.refname == "refs/tags/lonetree")
-        .expect("no reflog row for the tree tag");
-    assert_eq!(row.note, "tag@tree");
-    assert!(row.new_commit_idx.is_none() && row.new_sha.is_none(),
-            "tree-tag reflog row must carry no commit");
-    // A second mirror pass is a no-op (tree-tag rows diff stable).
-    let o = gitdepot::mirror(repo.to_str().unwrap(), &root).unwrap();
-    assert_eq!(o.update.new_commits, 0);
-    assert_eq!(o.update.depot_prepends, 0, "no-op mirror wrote records");
 }
 
 /// Mirror loop end-to-end with annotated tags: create resolves peeled;
@@ -710,11 +614,11 @@ fn object_reads_cross_batch_boundaries() {
 }
 
 /// Tree dedup is parent-oid comparison + an intra-ingest map, NOT a
-/// persistent index: an empty commit (tree oid == parent's) reuses the
-/// parent's tree_idx with no new TREES record — across the update path
-/// too (parent tree oid fetched from the buffer) — while a tree
-/// bit-identical to a DISTANT ancestor (revert) deliberately mints a
-/// new (small) record.
+/// Union contract: one record per REVISION. An empty commit (tree oid ==
+/// parent's) is its own revision whose reconstructed tree is SHA-exact
+/// equal to the parent's and stays on the parent's lane — across the
+/// update path too — and a tree bit-identical to a DISTANT ancestor
+/// (revert) reconstructs that ancestor tree SHA-exact.
 #[test]
 fn tree_dedup_reuses_parent_not_distant_ancestors() {
     let tmp = tempfile::tempdir().unwrap();
@@ -727,39 +631,51 @@ fn tree_dedup_reuses_parent_not_distant_ancestors() {
     let st = gitdepot::store::Store::open(&store).unwrap();
     let n_commits = st.count(gitdepot::store::COMMITS).unwrap();
     assert_eq!(n_commits, 14);
-    assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 13,
-               "identical-to-parent tree minted a fresh TREES record");
+    let ls = st.union().unwrap();
+    // One revision per commit.
+    assert_eq!(ls.n_rev(), 14);
     let tip_sha = sh_git(&repo, &["rev-parse", "main"]).trim().to_string();
     let tip_idx = st.sha_to_idx(&tip_sha).unwrap().expect("tip in store");
     let tip = st.commit_record_at(tip_idx).unwrap();
     let parent = st.commit_record_at(tip.parent_idxs[0]).unwrap();
-    assert_eq!(tip.tree_idx, parent.tree_idx);
+    // Empty commit: SHA-exact same tree AND same lane as its parent.
+    assert_eq!(
+        ls.tree_oid_at(tip.idx as usize).unwrap(),
+        ls.tree_oid_at(parent.idx as usize).unwrap()
+    );
+    assert_eq!(tip.lane, parent.lane);
     drop(st);
 
     // Update path: empty commit on top, parent already in the store.
     sh_git(&repo, &["commit", "-q", "--allow-empty", "-m", "same tree again"]);
     gitdepot::update(&repo, &store, 3).unwrap();
     let st = gitdepot::store::Store::open(&store).unwrap();
-    assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 13);
+    let ls = st.union().unwrap();
+    assert_eq!(ls.n_rev(), 15);
     let tip = st.commit_record_at(14).unwrap();
     let parent = st.commit_record_at(tip.parent_idxs[0]).unwrap();
-    assert_eq!(tip.tree_idx, parent.tree_idx);
+    assert_eq!(
+        ls.tree_oid_at(tip.idx as usize).unwrap(),
+        ls.tree_oid_at(parent.idx as usize).unwrap()
+    );
     drop(st);
 
-    // Revert to a distant ancestor's exact tree: same view, NEW record
-    // (the explicit trade — no persistent all-history oid index).
+    // Revert to a distant ancestor's exact tree: reconstructs SHA-exact.
     sh_git(&repo, &["rm", "-r", "-q", "."]);
     sh_git(&repo, &["checkout", "-q", "main~6", "--", "."]);
     sh_git(&repo, &["commit", "-q", "-m", "revert to ancestor"]);
+    let ancestor_tree = sh_git(&repo, &["rev-parse", "main~7^{tree}"]);
     assert_eq!(
         sh_git(&repo, &["rev-parse", "main^{tree}"]),
-        sh_git(&repo, &["rev-parse", "main~7^{tree}"]),
+        ancestor_tree,
         "fixture: revert did not reproduce the ancestor tree"
     );
     gitdepot::update(&repo, &store, 3).unwrap();
     let st = gitdepot::store::Store::open(&store).unwrap();
-    assert_eq!(st.count(gitdepot::store::TREES).unwrap(), 14,
-               "revert-to-ancestor should mint a new TREES record");
+    let ls = st.union().unwrap();
+    let tip_sha = sh_git(&repo, &["rev-parse", "main"]).trim().to_string();
+    let rev = ls.rev_of(&tip_sha).expect("tip in union");
+    assert_eq!(ls.tree_oid_at(rev).unwrap(), ancestor_tree.trim());
 }
 
 /// Exactly ONE supported on-disk format: a mismatched kv schema value
@@ -1006,53 +922,6 @@ fn successive_rewrites_never_copy_the_store() {
     for old in [&tip0, &tip1] {
         assert_eq!(gitdepot::resolve_ref(&store, old).unwrap().unwrap().sha(), old.as_str(),
                    "rewritten-away tip no longer resolvable");
-    }
-}
-
-#[test]
-fn tree_walk_matches_apply_reference_byte_exact() {
-    // Read fidelity: the in-place walk (apply_mut, one working view)
-    // must reconstruct, byte-for-byte in canonical encoding, exactly
-    // what depot::apply-based reference reconstruction yields from the
-    // same stored records — the write path is untouched, so this pins
-    // byte-compatibility with pre-existing v2 stores.
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    let store = tmp.path().join("store");
-    build_fixture(&repo);
-    gitdepot::import(&repo, &store, 3).unwrap();
-
-    let st = gitdepot::store::Store::open(&store).unwrap();
-    let mut recs: Vec<Vec<u8>> = Vec::new();
-    let mut walked: Vec<depot::View> = Vec::new();
-    st.walk_tree_views(None, &mut |_, rec, view| {
-        recs.push(rec.to_vec());
-        walked.push(view.clone());
-    })
-    .unwrap();
-    assert_eq!(recs.len() as u64, st.count(gitdepot::store::TREES).unwrap());
-
-    let mut reference: Option<depot::View> = None;
-    for (i, rec) in recs.iter().enumerate() {
-        let layer = depot::codec::decode(rec).unwrap();
-        reference = depot::apply(reference.as_ref(), &layer);
-        let want = reference.as_ref().expect("reference view resolves");
-        assert_eq!(
-            depot::codec::encode(&depot::diff(None, Some(&walked[i]))),
-            depot::codec::encode(&depot::diff(None, Some(want))),
-            "walked view at newest-first position {i} diverges from apply reference"
-        );
-    }
-
-    // Point reads (the deep-access path) agree with the full walk.
-    let n = recs.len();
-    for idx in [0usize, n / 2, n - 1] {
-        let v = st.tree_view(idx as u64).unwrap();
-        assert_eq!(
-            depot::codec::encode(&depot::diff(None, Some(&v))),
-            depot::codec::encode(&depot::diff(None, Some(&walked[n - 1 - idx]))),
-            "tree_view({idx}) diverges from the full walk"
-        );
     }
 }
 

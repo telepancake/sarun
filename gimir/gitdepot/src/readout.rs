@@ -48,46 +48,44 @@ impl TipReadout {
     /// neither a commit nor a tag in the store.
     pub fn for_commit(store: &Path, sha: &str, prefix: &str) -> Result<Option<Self>> {
         let st = store::Store::open(store)?;
-        let tree_idx = match st.sha_to_idx(sha)? {
-            Some(cidx) => st.commit_record_at(cidx)?.tree_idx,
-            None => match st.tag_sha_to_idx(sha)? {
+        // Resolve the sha to a commit sha: either it is one directly, or
+        // it is an annotated tag whose target is a commit.
+        let commit_sha = if st.sha_to_idx(sha)?.is_some() {
+            sha.to_string()
+        } else {
+            match st.tag_sha_to_idx(sha)? {
                 Some(ti) => match st.tag_record_at(ti)?.target {
-                    store::TagTarget::Tree(t) => t,
-                    store::TagTarget::Commit(c) => st.commit_record_at(c)?.tree_idx,
+                    store::TagTarget::Commit(c) => st.commit_record_at(c)?.sha,
+                    // Standalone tree targets are no longer served.
+                    store::TagTarget::Tree(_) => return Ok(None),
                 },
                 None => return Ok(None),
-            },
+            }
         };
-        Ok(Some(Self::for_tree_open(&st, store, tree_idx, prefix)?))
+        let tree = st.union()?.tree_view_of_commit(&commit_sha)?;
+        Ok(Some(Self::from_tree(store, tree, prefix)))
     }
 
-    /// Readout of one TREES record by stable index — the tree-tag
-    /// serving path, trivial next to `for_commit`.
-    pub fn for_tree(store: &Path, tree_idx: u64, prefix: &str) -> Result<Self> {
-        let st = store::Store::open(store)?;
-        Self::for_tree_open(&st, store, tree_idx, prefix)
-    }
-
-    fn for_tree_open(
-        st: &store::Store,
-        store: &Path,
-        tree_idx: u64,
-        prefix: &str,
-    ) -> Result<Self> {
-        let tree = st.tree_view(tree_idx)?;
+    fn from_tree(store: &Path, tree: View, prefix: &str) -> Self {
         let prefix = split_prefix(prefix);
         let nested =
             nest_view(tree, &prefix.iter().map(|c| c.as_slice()).collect::<Vec<_>>());
         let view = OnceLock::new();
         view.set(Some(nested)).expect("fresh OnceLock");
-        Ok(TipReadout { store: store.to_path_buf(), prefix, view })
+        TipReadout { store: store.to_path_buf(), prefix, view }
     }
 
     fn view(&self) -> Option<&View> {
         self.view
             .get_or_init(|| {
-                let st = store::Store::open(&self.store).ok()?;
-                let tip = st.tree_views(Some(0)).ok()?.pop()?;
+                let ls = store::Store::open(&self.store).ok()?.union().ok()?;
+                let n = ls.n_rev();
+                if n == 0 {
+                    return None;
+                }
+                // The tip is the last revision in DAG order (HEAD of a
+                // linear history).
+                let tip = ls.tree_view_at(n - 1).ok()?;
                 let prefix: Vec<&[u8]> = self.prefix.iter().map(|c| c.as_slice()).collect();
                 Some(nest_view(tip, &prefix))
             })
