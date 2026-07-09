@@ -1,201 +1,216 @@
-# gitdepot — VALIDATION (Phase 4)
+# gitdepot — Validation against DESIGN.md
 
-Design (`DESIGN.md`) checked section-by-section against the current code. Each
-verdict is IMPLEMENTED / PARTIAL / MISSING with `file:symbol` evidence.
-Skeptical throughout: a part only counts as IMPLEMENTED for a code path if the
-**real, reachable** path realizes it, not merely a test fixture or an off-path
-module.
+Phase 4. Each design section is marked IMPLEMENTED / PARTIAL / MISSING against
+the code that is actually *reachable from the CLI*, not merely present in a test
+fixture. Evidence is `file:symbol` (or `file:line`).
 
-## The decisive reachability fact
+> This supersedes an earlier VALIDATION.md written before the tree changed: that
+> version predates the wiring of the `union` CLI command and references files
+> since deleted (`geostack.rs`, `frame.rs`, `unionstore.rs`, `shards.rs`,
+> `variants.rs`, `gitsrc.rs`, `reflog.rs`). Those files are gone; the current
+> reachability picture is below.
 
-The CLI (`cli.rs:cli_main` → `import`/`update`/`mirror`/`export`) reaches **one**
-engine: `lib.rs` → `store::Ingest` → `wikimak_depot::Depot`, storing **one git
-tree per commit** (`lib.rs:tree_layer` builds a plain `path → (blob, mode-attr)`
-`depot::Layer`; the TREES chain reverse-deltas between chain-neighbouring trees).
-Grepping the live path proves it: `lib.rs` and `store.rs` contain **zero**
-references to `UnionStore`, `LaneStore`, `encode_union`, `delta_multi_lane`,
-`assign_lanes`, `Shards`, or `Frame::` — the entire union/lane/shard machinery is
-unreachable from the binary.
+## The two code paths (read this first)
 
-The union-of-lanes design (§1/§2) lives only in two **off-path** clusters, wired
-to each other and their own tests but never to git:
+`gitdepot/src/cli.rs::cli_main` dispatches to **two disjoint stores** that do
+not share a corpus:
 
-- **B (union engine, §2-correct encoding, forward deltas):** `layer.rs` +
-  `geostack.rs` + `frame.rs` + `unionstore.rs` + `shards.rs` + `lanes.rs` +
-  `reflog.rs` + `gitsrc.rs`. Reachable only from inline unit tests and
-  `gitsrc.rs`'s test.
-- **C (reverse-delta union over a `\0v/\0m` nested encoding):** `lanestore.rs` +
-  `oidenc.rs` + `variants.rs` + `reslot.rs` (+ shared `lanes.rs`). Reachable only
-  from `tests/lanestore*.rs`.
+- **Legacy single-tree path** — `import` / `update` / `mirror` / `list` /
+  `log` / `export`. Entry points `lib.rs::import_opts`, `lib.rs::update`,
+  `lib.rs::mirror_opts`, `lib.rs::export`, backed by `store.rs::Store` /
+  `store.rs::Ingest`. This stores **one git tree per commit** (`depot::diff(None,
+  view)` over a single resolved view — `lib.rs::ingest_stream`). It has the
+  commit/reflog/tag chains and `meta.sqlite`, but **no lanes, no variants, no
+  union**. It is the pre-union design.
 
-So the design's *headline* — "the state stored at each revision is the union of
-the git trees of all live lanes" — is **not realized in the shipping path**, and
-no single engine is both §2-encoding-correct and §7-direction-correct.
+- **Union path** — `union` / `union-verify` (`cli.rs:154-176`). Entry points
+  `lib.rs::union_import` → `lanestore.rs::LaneStore::encode_repo_union`, and
+  `lib.rs::union_verify`. This is the code that realizes the lane/variant/union
+  model of DESIGN §1–§8. It uses `oidenc.rs::Encoder`, `layer.rs`, `reslot.rs`,
+  `lanes.rs`. It stores **only the tree union** (one chain, `lanestore.rs:51
+  const CHAIN`) plus a `meta.sqlite` of ref→(sha,rev,lane); it has **no commit,
+  reflog, or tag chain and no export**.
+
+DESIGN.md describes the union model, so the union path is the conforming target.
+But the union path is not a whole mirror (no ingest/fetch, no export, no
+commit/reflog/tag persistence), and the whole-mirror commands run the legacy
+path. **No single reachable command realizes the full design.** The context note
+("implemented in more than one place… which conforms is to be determined") is
+accurate: §10's chains live in the legacy `store.rs`; §1–§8's union lives in the
+union path; the two are not integrated.
+
+Files the context listed as "relevant" that **do not exist** in the tree:
+`variants.rs`, `gitsrc.rs`, `frame.rs`, `unionstore.rs`, `reflog.rs`,
+`shards.rs`. Their absence is the direct cause of the MISSING findings below
+(reflog-in-union, geometric stack as a named unit, sharding).
 
 ---
 
-## Per design section
+## §1 Domain model: revisions, lanes, union — IMPLEMENTED (union path)
 
-### §1 Domain model (revisions, lanes, the union)
-**Live path: MISSING. Off-path: PARTIAL (B/C).**
-- Live: `store.rs` TREES chain stores a single git tree per commit
-  (`lib.rs:tree_layer`, `lib.rs:delta_layer`). There is **no union of live
-  lanes** at a revision.
-- Off-path: `lanes.rs:assign_lanes` + `compact_lanes` realize "one live line per
-  concurrently-live branch, lane dies when its line ends, bitmap width = peak
-  concurrent"; `layer.rs:LaneTree` / `oidenc.rs` treat a lane as one live tree in
-  a union. These are correct but unreachable from the binary.
+`lanes.rs::assign_lanes` freezes each commit's lane from its first parent;
+`lanes.rs::compact_lanes` compacts monotonic ids into a reused index space.
+`lanestore.rs::encode_repo_union` (lines 180–207) drives it: lane birth/death
+from merge second-parents, `dying_at`, per-revision transitions. The union of
+all live lanes' trees is held as one node tree by `oidenc.rs::Skel` /
+`Encoder::advance`.
 
-### §2 Encoding: the variant/union tree — realized twice, and they disagree
-**`layer.rs`: IMPLEMENTED (but off-path). `variants.rs`: DIVERGES.**
-- `layer.rs` matches §2 point-for-point: `file_key` = `name\0varint(slot)` as a
-  single node; `dir_key` = bare name; `variant_node` puts content in the node
-  blob, mode as an `x`/`l`/`m` **mode-tag child** (`Mode::tag`), and a `lanes`
-  child **omitted when all-ones** (`bitmap: Option`, `None ⇒ omit`, documented at
-  `layer.rs:1`); meta children carry a non-identity `Set` blob so compose/overlay
-  won't prune them; `container_cmp` keeps bare-dir vs `\0`-led-file unambiguous.
-- `variants.rs` **contradicts §2**: it nests two children `\0v<slot>` (content)
-  and `\0m<slot>` (meta) **under a wrapper node named by the path**
-  (`variants.rs:content_key`/`meta_key`), where §2 requires **sibling** nodes,
-  not a wrapper. It stores **mode as an attr** on `\0m` (`variants.rs:meta_view`)
-  rather than as a mode-tag child, and it writes the `\0lanes` bitmap
-  **unconditionally** (`meta_view` always inserts `LANES`), never omitting it for
-  all-ones. Reachable only via cluster C.
+## §2 Variant/union tree encoding — PARTIAL (union path)
 
-### §3 One order
-**IMPLEMENTED (off-path, `layer.rs`).**
-- `layer.rs:container_cmp` is the single authoritative container order over clean
-  names; `layer.rs:entry_cmp` reproduces git `base_name_compare` used **only** to
-  reconstruct a tree for hashing. Git trees are sorted into container order once
-  on cache load (`oidenc.rs:parse_tree`). The slot tag is excluded from the
-  compare. C reuses `depot` codec `BTreeMap` order; not an independent §3 concern.
+Implemented: file variant key `name\0varint(slot)` (`layer.rs::file_key`, marker
+documented lines 8–9); bare directory nodes; mode-tag children `x`/`l`/`m`
+(`layer.rs::TAG_EXEC/TAG_SYMLINK/TAG_GITLINK`, applied by
+`oidenc.rs::set_mode_tag`); `lanes` bitmap as a child (`layer.rs::LANES`,
+written by `oidenc.rs::variant_reverse_node` and `full_view_dir`); single
+variant still stored as a variant; meta children non-identity.
 
-### §4 Operations: overlay / compose / delta
-**Streaming ops: IMPLEMENTED (shared `depot` crate). mmap/MADV updater: MISSING.**
-- `depot::stream` provides `compose_stream` (delta∘delta, holes survive),
-  `overlay_full` (delta∘full, holes dissolve), and the reverse `diff`; tombstone
-  vs hole are modeled (`depot/src/stream.rs`, `variants.rs:leaf_delta` uses
-  `Node::hole`). Used by B (`unionstore.rs:compose`, `frame.rs`) and C.
-- The §4 "mmap updater … single pass, `MADV_DONTNEED` on consumed front regions"
-  is **implemented nowhere**: both engines compose in-RAM `Vec<u8>`
-  (`unionstore.rs:compose`). The only `mmap`/`MADV` token in the tree is a
-  comment at `layer.rs:1026`. MISSING.
+Gap: the **all-ones `lanes` omission** (§2: "omitted when the bitmap is
+all-ones") is **not applied in the reachable union encoder**. `oidenc.rs:304`
+states outright "the all-ones omission is a size optimization not applied here,"
+and `variant_reverse_node`/`full_view_dir` always emit the bitmap. The omission
+is only supported by `layer.rs::variant_node` (`bitmap = None`), which the union
+path does not use. So the common-case size win of §2 is unrealized on the live
+path.
 
-### §5 Frame model: refPrefix + geometric delta stack
-**IMPLEMENTED (off-path, B). Absent from the live path.**
-- `geostack.rs:GeoStack::push` implements the 70% compaction with integer math
-  (`10*top < 7*next` ⇒ stop) and `collapse`; `frame.rs:Frame` / `unionstore.rs`
-  hold refPrefix + live stack and read current state by lockstep
-  (`layer.rs:visit_current`) without materializing a union; `frame.rs:Frame::seal`
-  = collapse + `overlay_full`. Correct, but unreachable from the binary; the live
-  store uses the VBF f0/f1 accumulator (§10) instead of a §5 geostack.
+## §3 One order — IMPLEMENTED
 
-### §6 Delta generation (write side) — realized twice
-**IMPLEMENTED (off-path), duplicated.**
-- B: `layer.rs:delta_multi_lane_stacked_oid` does the lockstep-of-three over
-  refPrefix+stack (`current_variants_ref`) and the lane trees, matching variants
-  by `(mode, oid)` read from the trees, never hashing stored content; a
-  bitmap-only change emits a bitmap update; a new oid takes a freed/lowest slot.
-  The oid-addressed `Objects` boundary (fetch blob only when a fresh variant is
-  emitted) is present (`layer.rs:Objects`, `MemObjects`), matching §6's
-  no-content-in-RAM requirement — the change described in `IMPL-NOTES.md`.
-- C: `reslot.rs:Slots` is the same §6 per-path algebra as a **second** copy
-  (`common_lanes` = most-shared-lanes among freed slots), used only by
-  `oidenc.rs:advance_node`, which adds genuine subtree-prune-by-oid.
+The codec's `container_cmp` bytewise order is the single walk order; git trees
+are reordered on load into the tree cache (`oidenc.rs::parse_tree` +
+`lanestore.rs::Cat` caching). Note the §3 clause "a blob's shard is assigned
+during that same cache load" is inert — sharding does not exist (§9).
 
-### §7 Delta direction: newest full, older reverse — no engine is both §2 and §7
-**Live (A): IMPLEMENTED. C: IMPLEMENTED. B: DIVERGES.**
-- Live: `store.rs` TREES — f0 is the newest tree in full, older records are
-  reverse deltas from the newer; `readout.rs:TipReadout` walks head→target
-  applying reverse deltas. Correct direction (over single trees, not a union).
-- C: `lanestore.rs` (module doc + `oidenc.rs:Encoder::advance` via `Trans`) emits
-  reverse deltas; full-state only at seal (`lanestore.rs:apply_reverse_record`).
-- B: `unionstore.rs` stores **forward** deltas over an old refPrefix base — its
-  own doc (`unionstore.rs:32`) marks reverse-at-seal **DEFERRED**. So the
-  §2-correct engine has the wrong delta direction, and the §7-correct engines
-  each miss §2 (A has no union; C has the §2-violating encoding).
+## §4 overlay / compose / delta — PARTIAL
 
-### §8 Lanes: assignment and lifecycle
-**Assignment/compaction: IMPLEMENTED (off-path). Inactivity retirement: MISSING.
-Live refs carry no lane: DIVERGES.**
-- `lanes.rs:assign_lanes` (first-parent freeze; earlier sibling forks a fresh
-  lane; monotonic ids) + `compact_lanes` (free-on-death reuse, width = peak
-  concurrent) match §8; `reflog.rs:LayerEntry` keeps #live lanes ≥ #live refs.
-  "Minimize-frame-delta" = the first-parent continuation rule (documented at
-  `lanes.rs:39`).
-- **Inactivity retirement** ("no new commit for a long stretch → declared
-  inactive, retired into the reflog") is **absent**: `assign_lanes` ends a lane
-  only at its last in-scope commit; there is no staleness clock. MISSING.
-- Live: `store.rs`/`meta.sqlite` refs carry **no lane id** (single-lane
-  degeneracy) — refs point at a commit+tree index only.
+The three streaming byte-level ops exist and are used: `depot::stream::
+overlay_full`, `compose_stream`, `diff_stream` / `diff_stream_holes`
+(`depot/src/stream.rs:561/251/507/518`). Tombstone vs hole semantics
+(hole dissolves on overlay, survives on compose) are implemented and unit-tested
+in `layer.rs`. **Gap:** the "mmap updater… single pass… `MADV_DONTNEED` on
+consumed front regions" adapter is **MISSING** — `MADV_DONTNEED`/`madvise`
+appears only in doc comments (`depot/src/stream.rs:16,36`); the real ops are
+plain `Vec`-building, no mmap driver.
 
-### §9 Sharding
-**PARTIAL (off-path, in-RAM only). Not persisted, not wired.**
-- `shards.rs:Shards` splits by the top `shard_bits` of a stable full-path hash
-  (`path_hash` FNV-1a, `shard_of`, `split`), reconstructs a lane across shards,
-  advances shards in lockstep, and preserves the tree oid across shard counts —
-  all §9. **But each shard is an in-RAM `frame::Frame`** (`shards.rs:32`
-  `frames: Vec<Frame>`), never persisted to a per-shard Depot, and is invoked
-  only from `gitsrc.rs`'s test. The live store and `lanestore.rs` are
-  single-shard with no `shard-bits`. §9 is unrealized in anything persisted.
+## §5 refPrefix + geometric delta stack — MISSING (from reachable code)
 
-### §10 Persistence: the VBF chains
-**IMPLEMENTED (live, A). Duplicated by two off-path drivers.**
-- Live: `store.rs` drives four chains `TREES/COMMITS/REFLOG/TAGS` over one
-  `wikimak_depot::Depot`: f0 standalone, f1 anchored on f0, `seal_f1`/cold
-  verbatim past `seal_threshold()`, `prepend_batch` (batch-not-split), oldest-end
-  stable indices (`frame idx = N-1-k`), no `deleted_at`; `meta.sqlite` holds
-  current refs only, superseded refs go to the REFLOG chain. This section is real
-  and correct on the shipping path.
-- Two more §10 drivers exist off-path (`unionstore.rs`: BASE+DELTAS chains;
-  `lanestore.rs:seal_prepend`: a single chain). Correct machinery, but §10's
-  "one depot per mirror" is nominally violated by having three prepend/seal
-  engines in the tree (only one reachable).
+The reachable union path does **not** implement the geometric stack. There is no
+push-and-compact with the "top ≥ 70% of the entry below" rule anywhere in the
+tree (grep for `70`, `0.7`, `geostack`, `GeoStack` finds only a doc phrase at
+`layer.rs:657` and unrelated numbers). `encode_repo_union` instead accumulates
+reverse-delta records in a flat `batch` and seals when `batch_bytes >=
+batch_ram_bound()` (`lanestore.rs:225-323`, `seal_prepend`). "Current state =
+refPrefix + live stack read by lockstep" is likewise absent from the live path:
+the union encoder tracks state in the in-RAM `oidenc.rs::Encoder`, not by
+lockstep over refPrefix + a delta stack. The `stack`-parameterized functions
+that would support §5 (`layer.rs::delta_multi_lane_stacked`,
+`current_variants_ref`, `visit_current`) are reachable **only from `layer.rs`
+unit tests** (all call sites are in `#[cfg(test)]` blocks, lines 1362–1692);
+`encode_repo_union` never calls them. §5 is thus not present in reachable code.
 
-### §11 Ingest / fetch
-**IMPLEMENTED (live, A), substantially. `gitsrc.rs` is a toy seam.**
-- Live: `lib.rs` runs its own linearization (`walk_order`), one
-  `git rev-list --parents` + one `git diff-tree --stdin` + one persistent
-  `cat-file --batch`, with frontier-style per-commit views. The **withhold-the-
-  boundary** fetch is realized as the shallow-stub contract (`lib.rs:1766` THE
-  STUB CONTRACT; `shallow` boundary written so the server resends boundary tips
-  and their trees); one-batch initial pull with a tag-wave ladder; no persistent
-  bare clone; the tag chain is handled (`ingest_tags`, `TagPeel`); a
-  non-fast-forward upstream is new records + a repoint, never a destructive
-  replace (`lib.rs:67`, `1563`). "Metadata-first, then blobs" is realized
-  pragmatically (ls-tree/cat-file batch; a `--filter=tree:0` wave is noted as
-  hazardous at `lib.rs:2376`) rather than as an explicit two-phase reachable-set
-  plan — PARTIAL on that one clause.
-- `gitsrc.rs:read_commit_tree` is an `ls-tree`+`cat-file` source feeding
-  `LaneTree`s: the B integration seam, not the negotiated fetch.
+## §6 Delta generation (reslot) — IMPLEMENTED (union path)
+
+Per-path variant algebra factored out as `reslot.rs` (`Slots::reslot`,
+`SlotChange`, most-shared-lanes freed-slot reuse). Variant identity by git
+`(mode, object id)` with no content hashing: `oidenc.rs::VarKey` /
+`new_variant_set` / `variant_reverse_node` compare `bo.id.1` (oid) and mode.
+Bitmap-only updates emitted when membership changes but oid does not
+(`variant_reverse_node` `(Some,Some)` arm). The tree-wide lockstep is driven by
+`Encoder::advance` over `Trans` transitions. Note: this path reslots against the
+encoder's live skeleton rather than the §6 "lockstep of three iterator sets over
+refPrefix+stack," because §5's stack is absent — the *result* conforms, the
+stated mechanism differs.
+
+## §7 Newest full, older reverse — IMPLEMENTED (union path)
+
+f0 is the newest full state (`encode_repo_union` i==0 seeds a positive full
+record, lines 298-303); every older revision is a reverse delta from the newer
+(`Encoder::advance` returns reverse-delta records; `apply_reverse_record` /
+`combined_at` reconstruct older by folding reverse deltas newest→oldest).
+Removals encoded as holes and converted to tombstones over the empty backdrop
+(`lanestore.rs::holes_to_tombstones`).
+
+## §8 Lanes: assignment and lifecycle — PARTIAL (union path)
+
+Implemented: first-parent lane freezing, monotonic ids, compaction with reuse so
+a bitmap is only as wide as peak concurrency (`lanes.rs::assign_lanes`,
+`compact_lanes`; tests `compact_reuses_freed_indices`,
+`merge_ends_the_second_parent_lane`). Lane death on merge (second-parent) is in
+`encode_repo_union` (death array, `dying_at`, lines 191-206).
+
+Gaps:
+- **`#live lanes ≥ #live refs` is not enforced.** Lanes are assigned purely by
+  commit ancestry; two refs pointing at the same commit share one lane, and
+  nothing guarantees a distinct lane per ref. No symbol establishes the
+  invariant.
+- **Inactivity retirement is MISSING.** "no new commit for a long stretch →
+  declared inactive → retired into the reflog" has no implementation — there is
+  no reflog in the union path at all, and no inactivity/staleness logic (grep
+  `inactive`/`stale` in `lanes.rs`/`lanestore.rs` finds nothing).
+- "Choose the advancing commit's lane to minimize the diff to the previous
+  frame" is not done; lane choice is fixed by ancestry only.
+- Synthetic-hidden-ref exclusion is not present on this path.
+
+## §9 Sharding — MISSING
+
+No implementation anywhere. There is no `shard-bits` parameter, no path-hash
+routing, no per-shard thread, no re-shard. `shards.rs` does not exist. The only
+occurrences of "shard" in gitdepot are aspirational doc comments
+(`layer.rs:1000`, `layer.rs:1018`); the sharding code under `wikimak/media` is an
+unrelated MediaWiki path layout. Import is single-threaded
+(`encode_repo_union` is a plain `for i in 0..n_rev`). §3's shard-on-load and
+§8's cross-shard gather are correspondingly inert.
+
+## §10 Persistence: VBF chains — PARTIAL / split
+
+- **Legacy path (`store.rs`)**: has the per-chain frame discipline (f0
+  standalone, f1 anchored on f0, cold seal past threshold), newest-first stable
+  indices numbered from the oldest end, `meta.sqlite` of current refs, and a
+  **reflog chain** (`store.rs::ReflogRecord`, `REFLOG`, `reflog()`), plus commit
+  and tag chains. But its tree state is **one tree per commit, unsharded** — not
+  the §9/§10 "sharded tree state per shard."
+- **Union path (`lanestore.rs`)**: implements the same frame discipline for the
+  tree-union chain (f0/f1/cold via `seal_prepend`, `walk_records`, stable
+  newest-first indices, `meta.sqlite` refs). But it has **only the one tree
+  chain** — **no commit chain, no reflog chain, no tag chain**, and the tree
+  chain is **not sharded**. The mandatory local reflog and non-fast-forward
+  recording of §10 are absent here.
+
+So §10 is realized in pieces across the two stores and by neither in full; the
+"per-shard tree + separate commit/reflog/tag chains" combination exists nowhere.
+
+## §11 Ingest / fetch — PARTIAL (legacy path only)
+
+The negotiation-driven fetch (withhold-boundary, metadata-first, single batch,
+no bare-clone-as-store) lives on the legacy path: `mirror_opts` / `update` and
+the `dag_scope`/negation machinery in `lib.rs`. The **union path does not fetch
+at all** — `encode_repo_union` reads an already-present local repo via `git log`
+/ cat-file (`lanestore.rs:211`, `Cat`), so §11 does not apply to the conforming
+store. Signed-commit/annotated-tag SHA-exactness is explicitly *unsupported* on
+export (`lib.rs::export` errors on `extra_headers`).
 
 ---
 
 ## Summary
 
-**Conforms.** The persistence, delta-direction, and ingest of the *shipping*
-one-tree-per-commit store (§7, §10, §11) are real and correct on the reachable
-CLI path (`lib.rs`/`store.rs`/`readout.rs`). SHA-exactness round-trips through
-`export`. The §2 variant encoding (`layer.rs`), the §5 geostack, the §6 reslot,
-and the §8 lane assignment/compaction are each individually correct.
+**Conforms (union path, reachable via `union`/`union-verify`):** §1 domain
+model, §3 one order, §6 reslot delta generation, §7 newest-full/older-reverse.
+These are solid and SHA-exact-verified by `union_verify` →
+`LaneStore::tree_oid_at`.
 
-**Does not conform.**
-1. **The core union model (§1/§2) is absent from the live path.** The binary
-   stores one git tree per commit; it never builds the union of live lanes. Every
-   union/lane/shard module is unreachable from `cli.rs`.
-2. **No single engine is both §2-correct and §7-correct.** B (`layer.rs` +
-   `unionstore.rs`) has the §2 encoding but forward deltas (reverse-at-seal
-   DEFERRED, `unionstore.rs:32`). C (`lanestore.rs` + `variants.rs`) has reverse
-   deltas but a `\0v/\0m` nested-wrapper encoding that violates §2 (wrapper node,
-   mode-as-attr, bitmap never omitted for all-ones).
-3. **Three parallel §10 frame drivers** exist (`store.rs`, `unionstore.rs`,
-   `lanestore.rs`); the design wants one depot per mirror.
-4. **Unimplemented anywhere:** §4 mmap/`MADV_DONTNEED` single-pass updater; §8
-   lane inactivity retirement; §9 *persisted* sharding (`shards.rs` is in-RAM
-   only). §11 metadata-first two-phase planning is only partial.
+**Partial:** §2 (all-ones bitmap omission not applied on the live encoder), §4
+(byte ops present; mmap/`MADV_DONTNEED` adapter missing), §8 (lane assignment and
+compaction yes; `#lanes≥#refs`, inactivity retirement, diff-minimizing lane
+choice no), §10 (frame discipline yes, but split across two stores and neither
+sharded/complete), §11 (fetch on legacy path only, not the union store).
 
-The path to conformance is unchanged from `WORKMAP.md`/`IMPL-NOTES.md`: converge
-on `layer.rs`'s §2 encoding, give `unionstore.rs` the §7 reverse-at-seal
-direction, fold the union payload into `store.rs`'s proven §10/§11 chains, then
-delete cluster C. The oid-addressed encoder boundary (§6) that this needs already
-landed in `layer.rs`; the remaining steps are the large, still-undone ones.
+**Missing entirely:** §5 geometric delta stack (union path uses a flat
+batch/seal; the stack-based functions are test-only), §9 sharding (no
+implementation, doc comments only). Both correspond to recently-deleted files
+(`frame.rs`/`unionstore.rs`, `shards.rs`) named in the context but absent from
+the tree.
+
+**Structural gap:** the design is a single integrated mirror; the code is two
+disjoint stores. The whole-mirror commands (`import`/`update`/`mirror`/`export`)
+run the legacy single-tree store (reflog/commit/tag chains, no union); the union
+model runs only under `union`, which has no fetch, no export, and no
+commit/reflog/tag persistence. No reachable command realizes DESIGN.md end to
+end.
