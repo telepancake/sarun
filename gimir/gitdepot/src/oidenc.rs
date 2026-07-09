@@ -309,7 +309,6 @@ fn advance_dir(
     children: &mut BTreeMap<Name, Skel>,
     trans: &[Trans],
     obj: &mut dyn Objects,
-    emit: bool,
     prev_live: &[u8],
     new_live: &[u8],
 ) -> Result<Node> {
@@ -323,9 +322,6 @@ fn advance_dir(
         if !child.slots.is_empty() || sr.iter().any(|(_, o, n)| is_file(*o) || is_file(*n)) {
             let new_set = new_variant_set(&child.slots, &sr);
             for ch in child.slots.reslot(&new_set) {
-                if !emit {
-                    continue;
-                }
                 if let Some(node) = variant_reverse_node(&ch, obj, prev_live, new_live)? {
                     out.children.insert(file_key(&name, ch.slot), node);
                 }
@@ -333,7 +329,7 @@ fn advance_dir(
         }
 
         // Subdirectory of `name` → bare `dir_key(name)` node.
-        let dnode = advance_dir(&mut child.children, &sr, obj, emit, prev_live, new_live)?;
+        let dnode = advance_dir(&mut child.children, &sr, obj, prev_live, new_live)?;
         if !dnode.is_identity() {
             out.children.insert(dir_key(&name), dnode);
         }
@@ -506,47 +502,9 @@ impl Encoder {
         if trim(prev_live) != trim(new_live) {
             remat_flips(&self.root, prev_live, new_live, &mut Vec::new(), &mut root);
         }
-        let changed = advance_dir(&mut self.root.children, trans, obj, true, prev_live, new_live)?;
+        let changed = advance_dir(&mut self.root.children, trans, obj, prev_live, new_live)?;
         merge_delta(&mut root, changed); // reslot deltas win over remat flips
         Ok(Layer { root })
-    }
-
-    /// Update ONLY the skeleton for this revision — reslot the slots without
-    /// fetching any blob content or building a delta. For memory measurement:
-    /// it grows the skeleton to the full union with no blob traffic.
-    pub fn advance_skel(&mut self, trans: &[Trans], obj: &mut dyn Objects) -> Result<()> {
-        advance_dir(&mut self.root.children, trans, obj, false, &[], &[])?;
-        Ok(())
-    }
-
-    /// Exact heap footprint of the live skeleton: `(nodes, slots,
-    /// owned_heap_bytes, malloc_objects)`. `owned_heap_bytes` sums the
-    /// capacities of every `Vec`/`String` the skeleton owns (mode, oid,
-    /// bitmap, child names); `malloc_objects` counts them. BTreeMap internal
-    /// node allocations are NOT included (they add on top).
-    pub fn mem_report(&self) -> (usize, usize, usize, usize) {
-        fn go(s: &Skel, nodes: &mut usize, slots: &mut usize, bytes: &mut usize, mallocs: &mut usize) {
-            *nodes += 1;
-            for (_slot, occ) in s.slots.iter() {
-                *slots += 1;
-                for cap in [occ.id.0.capacity(), occ.id.1.capacity(), occ.bitmap.capacity()] {
-                    if cap > 0 {
-                        *bytes += cap;
-                        *mallocs += 1;
-                    }
-                }
-            }
-            for (name, child) in &s.children {
-                if name.capacity() > 0 {
-                    *bytes += name.capacity();
-                    *mallocs += 1;
-                }
-                go(child, nodes, slots, bytes, mallocs);
-            }
-        }
-        let (mut nodes, mut slots, mut bytes, mut mallocs) = (0, 0, 0, 0);
-        go(&self.root, &mut nodes, &mut slots, &mut bytes, &mut mallocs);
-        (nodes, slots, bytes, mallocs)
     }
 
     /// The forward full delta of the current state — the `f0` head and every
@@ -556,21 +514,6 @@ impl Encoder {
     /// Any non-canonical divergence there fails the frame's refPrefix check.
     pub fn full(&self, obj: &mut dyn Objects, live: &[u8]) -> Result<Layer> {
         Ok(depot::diff(None, Some(&full_view_dir(&self.root, obj, live)?)))
-    }
-
-    /// (total variant slots, total directory nodes) in the live skeleton —
-    /// for instrumentation. Both are bounded by the current union's size.
-    pub fn stats(&self) -> (usize, usize) {
-        fn go(s: &Skel, slots: &mut usize, nodes: &mut usize) {
-            *nodes += 1;
-            *slots += s.slots.iter().count();
-            for c in s.children.values() {
-                go(c, slots, nodes);
-            }
-        }
-        let (mut slots, mut nodes) = (0, 0);
-        go(&self.root, &mut slots, &mut nodes);
-        (slots, nodes)
     }
 }
 
