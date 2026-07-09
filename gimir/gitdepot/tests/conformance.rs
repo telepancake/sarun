@@ -129,3 +129,26 @@ fn removed_trees_chain_stays_removed() {
         );
     }
 }
+
+/// D3 — the encoder must NOT hold the resident whole-repo union skeleton as a
+/// node tree (Method preamble: "run over the byte encoding directly; there is no
+/// auxiliary in-memory tree of nodes"; §5: "a full union is never built"). The
+/// `Encoder`'s resident state is the §2 byte encoding; `Skel` may exist only as
+/// a transient inside one op, never as an `Encoder` field.
+#[test]
+fn encoder_holds_no_resident_node_tree() {
+    let src = read("src/oidenc.rs");
+    // Isolate the `struct Encoder { ... }` body and check its fields.
+    let start = src.find("pub struct Encoder").expect("Encoder struct exists");
+    let body = &src[start..src[start..].find('}').map(|e| start + e).expect("struct close")];
+    assert!(
+        body.contains("state: Vec<u8>"),
+        "Encoder's resident state must be the byte encoding (state: Vec<u8>) — \
+         DESIGN §5/method preamble."
+    );
+    assert!(
+        !body.contains(": Skel"),
+        "Encoder holds a resident `Skel` node tree — the whole-repo union skeleton \
+         D3 forbids. Resident state must be the byte encoding, not a node tree."
+    );
+}

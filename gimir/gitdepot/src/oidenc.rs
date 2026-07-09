@@ -440,10 +440,60 @@ fn is_file(e: Option<&Ent>) -> bool {
     e.is_some_and(|e| !e.is_dir)
 }
 
-/// The stateful union encoder, driven off the git object store.
-#[derive(Default)]
+/// Serialize the content-free working state as §2 union bytes: each variant's
+/// git `(mode, oid)` identity stored with the OID HEX in the content slot (never
+/// the blob content — content is fetched by oid only when a real frame node is
+/// emitted, §6) and its EXPLICIT lane bitmap (no all-ones omission here — the
+/// working state is omission-independent; omission is applied only when a delta
+/// or full head is emitted, against the live set of that revision). This IS the
+/// encoder's resident state: the byte encoding, not a node tree (§5/method
+/// preamble — "run over the byte encoding directly; no auxiliary in-memory tree
+/// of nodes"). The `Skel` below is reconstituted transiently for one op and
+/// dropped; nothing whole-repo is held resident as nodes.
+fn state_bytes(root: &Skel) -> Vec<u8> {
+    fn dir(s: &Skel) -> Node {
+        let mut out = Node::keep();
+        for (name, sub) in &s.children {
+            for (slot, occ) in sub.slots.iter() {
+                let mode = occ_mode(occ);
+                out.children
+                    .insert(file_key(name, slot), variant_node(occ.id.1.as_bytes(), mode, Some(&occ.bitmap)));
+            }
+            if !sub.children.is_empty() {
+                out.children.insert(dir_key(name), dir(sub));
+            }
+        }
+        out
+    }
+    depot::codec::encode(&Layer { root: dir(root) })
+}
+
+/// Reconstitute the transient `Skel` from the working-state bytes: the exact
+/// inverse of [`state_bytes`]. Slot keys and raw bitmaps are read back
+/// verbatim, so the reslot and omission logic see byte-identical state to what
+/// was stored — a stored reverse delta reconstructs its frame exactly.
+fn state_to_skel(bytes: &[u8]) -> Result<Skel> {
+    let mut root = Skel::default();
+    layer::visit_entries(bytes, |e| {
+        let mut cur = &mut root;
+        for seg in e.path.split(|&b| b == b'/') {
+            cur = cur.children.entry(seg.to_vec()).or_default();
+        }
+        let oid = String::from_utf8_lossy(e.content).into_owned();
+        cur.slots.set(e.slot, Occupant { id: (e.mode.octal(), oid), bitmap: e.bitmap.unwrap_or(&[]).to_vec() });
+    })
+    .map_err(|d| crate::Error::Chain(format!("working-state decode: {d:?}")))?;
+    Ok(root)
+}
+
+/// The stateful union encoder. Its resident state is the §2 byte encoding of the
+/// current union (`state`), content-free (oids, not blobs). No whole-repo node
+/// tree is held between revisions — [`Skel`] is reconstituted transiently for
+/// one op and dropped. (Stage 2: replace the transient rebuild with an
+/// `O(changed)` lockstep so the state is a fixed `refPrefix` + delta stack read
+/// in one pruned pass, never rebuilt per revision — §5/§6.)
 pub struct Encoder {
-    root: Skel,
+    state: Vec<u8>,
 }
 
 /// One variant read back from a stored boundary union, to seed the encoder for
@@ -463,10 +513,10 @@ pub struct SeedVariant {
 
 impl Encoder {
     pub fn new() -> Self {
-        Encoder::default()
+        Encoder { state: state_bytes(&Skel::default()) }
     }
 
-    /// Reconstruct an encoder whose skeleton IS a stored boundary union: place
+    /// Reconstruct an encoder whose state IS a stored boundary union: place
     /// each variant back at its recorded slot with its `(mode, oid)` identity
     /// and bitmap. The result equals the encoder state at the end of the
     /// original encode, so `advance`-ing new revisions onto it and prepending
@@ -480,7 +530,7 @@ impl Encoder {
             }
             cur.slots.set(v.slot, Occupant { id: (v.mode, v.oid), bitmap: v.bitmap });
         }
-        Encoder { root }
+        Encoder { state: state_bytes(&root) }
     }
 
     /// Apply this revision's lane transitions and return the reverse delta
@@ -498,12 +548,14 @@ impl Encoder {
         prev_live: &[u8],
         new_live: &[u8],
     ) -> Result<Layer> {
+        let mut skel = state_to_skel(&self.state)?;
         let mut root = Node::keep();
         if trim(prev_live) != trim(new_live) {
-            remat_flips(&self.root, prev_live, new_live, &mut Vec::new(), &mut root);
+            remat_flips(&skel, prev_live, new_live, &mut Vec::new(), &mut root);
         }
-        let changed = advance_dir(&mut self.root.children, trans, obj, prev_live, new_live)?;
+        let changed = advance_dir(&mut skel.children, trans, obj, prev_live, new_live)?;
         merge_delta(&mut root, changed); // reslot deltas win over remat flips
+        self.state = state_bytes(&skel);
         Ok(Layer { root })
     }
 
@@ -513,7 +565,8 @@ impl Encoder {
     /// reader recomputes for a cold frame — `diff(None, reconstructed-view)`.
     /// Any non-canonical divergence there fails the frame's refPrefix check.
     pub fn full(&self, obj: &mut dyn Objects, live: &[u8]) -> Result<Layer> {
-        Ok(depot::diff(None, Some(&full_view_dir(&self.root, obj, live)?)))
+        let skel = state_to_skel(&self.state)?;
+        Ok(depot::diff(None, Some(&full_view_dir(&skel, obj, live)?)))
     }
 }
 
