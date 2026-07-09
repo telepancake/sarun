@@ -182,6 +182,34 @@ static void test_match_pathglob(void)
 
 /* ---- Rule parser ------------------------------------------------- */
 
+/* Regression: sud_cmd_rules_init must NOT mutate the shared runtime-config
+ * cmd_rules[] strings.  build_exec_argv re-serialises cmd_rules[] verbatim
+ * onto every child wrapper's argv, so if init patches a NUL into the string
+ * to delimit the pattern, the rule is truncated for every descendant
+ * generation.  For a redirect rule that drops the trailing <shim-dir>, so
+ * the child's parse fails and the rule vanishes — only the top-level exec
+ * is ever shadowed, and a shell/make exec'd by a shadowed shell (e.g. a
+ * build driver script) escapes interception entirely. */
+static void test_init_preserves_cmd_rule_string(void)
+{
+    g_curtest = "init_preserves_cmd_rule_string";
+    const char *rules[] = {
+        "redirect:pathglob:/**/bin/bash:/tmp/shim-bin",
+    };
+    install_rules(rules, 1, 0, 0);
+    int n;
+    const struct sud_cmd_rule *t = sud_cmd_rules_table(&n);
+    TASSERT_EQ(n, 1, "rule parsed");
+    TASSERT_EQ(t[0].kind, SUD_CMD_KIND_REDIRECT, "kind redirect");
+    TASSERT_STREQ(t[0].pattern, "/**/bin/bash", "pattern");
+    TASSERT_STREQ(t[0].redirect_to, "/tmp/shim-bin", "redirect_to");
+    /* The load-bearing assertion: the shared config string is byte-for-byte
+     * intact, so re-emission to a child wrapper carries the whole rule. */
+    TASSERT_STREQ(g_sud_runtime_config.cmd_rules[0],
+                  "redirect:pathglob:/**/bin/bash:/tmp/shim-bin",
+                  "config string intact after init (child re-emit safe)");
+}
+
 static void test_parse_compiler_wrap(void)
 {
     g_curtest = "parse_compiler_wrap";
@@ -407,6 +435,7 @@ int main(int argc, char **argv)
     test_match_path();
     test_match_glob();
     test_match_pathglob();
+    test_init_preserves_cmd_rule_string();
     test_parse_compiler_wrap();
     test_parse_exec_strip();
     test_parse_exec_as();

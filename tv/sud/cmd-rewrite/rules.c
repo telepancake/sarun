@@ -490,6 +490,17 @@ void sud_cmd_rules_reset_for_test(void)
     g_supp_arena_used = 0;
 }
 
+/* Private, mutable copies of each rule string.  parse_rule patches NULs
+ * into its input to delimit pattern/tool/redirect_to, and the rule's
+ * pattern/tool/redirect_to fields alias into that buffer.  It MUST NOT
+ * be handed g_sud_runtime_config.cmd_rules[i] directly: build_exec_argv
+ * re-serialises cmd_rules[] verbatim onto every child wrapper's argv, so
+ * mutating the shared string truncates the rule at the first patched ':'
+ * for every descendant generation (a redirect rule loses its <shim-dir>
+ * and fails to parse — so only the top-level exec is ever shadowed, and
+ * anything a launched shell/make/gcc execs escapes interception). */
+static char g_rule_strs[SUD_CMD_RULES_MAX][SUD_CMD_RULE_STR_MAX];
+
 void sud_cmd_rules_init(void)
 {
     if (g_init_done) return;
@@ -503,9 +514,14 @@ void sud_cmd_rules_init(void)
         const char *r = g_sud_runtime_config.cmd_rules[i];
         if (!r || !r[0]) continue;
         if (g_rule_count >= SUD_CMD_RULES_MAX) break;
+        /* Copy into private storage before parsing (see g_rule_strs). */
+        char *priv = g_rule_strs[g_rule_count];
+        int j = 0;
+        while (r[j] && j < SUD_CMD_RULE_STR_MAX - 1) { priv[j] = r[j]; j++; }
+        priv[j] = '\0';
         struct sud_cmd_rule *slot = &g_rules[g_rule_count];
         char *name = g_rule_names[g_rule_count];
-        if (parse_rule(r, slot, name) == 0)
+        if (parse_rule(priv, slot, name) == 0)
             g_rule_count++;
         /* Malformed rules silently skipped — the launcher is
          * responsible for surfacing CLI errors before getting here. */
