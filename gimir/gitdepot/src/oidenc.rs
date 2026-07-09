@@ -167,22 +167,68 @@ fn set_mode_tag(node: &mut Node, before: Mode, after: Mode) {
     }
 }
 
+/// Trailing-zero-trimmed view of a bitmap — its canonical form for equality
+/// (`set_bit`/`clear_bit` can leave trailing zero bytes).
+fn trim(b: &[u8]) -> &[u8] {
+    let mut n = b.len();
+    while n > 0 && b[n - 1] == 0 {
+        n -= 1;
+    }
+    &b[..n]
+}
+
+/// The §2 effective stored bitmap for a variant, given the lanes LIVE at this
+/// revision: `None` (omit the `lanes` child) when the variant is present in
+/// EVERY live lane — the all-ones case — else `Some(explicit bitmap)`. The
+/// reader treats an absent `lanes` child as "in every lane", and since a tree
+/// is only ever extracted for a lane live at its revision, the omission
+/// reconstructs SHA-exact.
+fn eff(bitmap: &[u8], live: &[u8]) -> Option<Vec<u8>> {
+    if trim(bitmap) == trim(live) {
+        None
+    } else {
+        Some(trim(bitmap).to_vec())
+    }
+}
+
+/// The `lanes`-child op that turns the NEW variant's effective bitmap form
+/// (`e_new`) into the OLD one (`e_before`) — `None` = omit that side:
+/// unchanged ⇒ no child; old omitted ⇒ hole (drop the bitmap); old explicit
+/// ⇒ Set it.
+fn lanes_delta_child(e_before: &Option<Vec<u8>>, e_new: &Option<Vec<u8>>) -> Option<Node> {
+    if e_before == e_new {
+        return None;
+    }
+    Some(match e_before {
+        None => Node::hole(),
+        Some(b) => Node { blob: BlobOp::Set(b.as_slice().into()), ..Node::keep() },
+    })
+}
+
 /// The §2 reverse-delta node for one slot change: applied onto the NEW union
 /// state's node at `file_key(name, slot)`, it rebuilds the PREVIOUS variant
-/// (`before`). `None` ⇒ nothing to emit (identity).
+/// (`before`). `None` ⇒ nothing to emit (identity). `prev_live`/`new_live` are
+/// the lane sets live at the previous/new revisions — they drive the all-ones
+/// `lanes` omission on each side.
 ///
 /// - new-only slot (`before=None`) ⇒ a HOLE (removed when walking back);
 /// - old-only slot (`after=None`) ⇒ the full previous variant node;
 /// - both ⇒ a minimal delta: `Set` the old content only if the blob oid
 ///   moved, retag the mode if it changed, and rewrite the `lanes` child only
-///   if the bitmap moved.
-fn variant_reverse_node(ch: &SlotChange<VarKey>, obj: &mut dyn Objects) -> Result<Option<Node>> {
+///   if the variant's effective (omission-aware) bitmap moved.
+fn variant_reverse_node(
+    ch: &SlotChange<VarKey>,
+    obj: &mut dyn Objects,
+    prev_live: &[u8],
+    new_live: &[u8],
+) -> Result<Option<Node>> {
     match (&ch.before, &ch.after) {
         (None, None) => Ok(None),
         (None, Some(_)) => Ok(Some(Node::hole())),
         (Some(bo), None) => {
             let content = obj.blob(&bo.id.1)?;
-            Ok(Some(variant_node(&content, occ_mode_id(&bo.id), Some(&bo.bitmap))))
+            let bm = eff(&bo.bitmap, prev_live);
+            Ok(Some(variant_node(&content, occ_mode_id(&bo.id), bm.as_deref())))
         }
         (Some(bo), Some(ao)) => {
             let mut node = Node::keep();
@@ -190,11 +236,10 @@ fn variant_reverse_node(ch: &SlotChange<VarKey>, obj: &mut dyn Objects) -> Resul
                 node.blob = BlobOp::Set(obj.blob(&bo.id.1)?.into());
             }
             set_mode_tag(&mut node, occ_mode_id(&bo.id), occ_mode_id(&ao.id));
-            if bo.bitmap != ao.bitmap {
-                node.children.insert(
-                    layer::LANES.to_vec(),
-                    Node { blob: BlobOp::Set(bo.bitmap.as_slice().into()), ..Node::keep() },
-                );
+            let e_before = eff(&bo.bitmap, prev_live);
+            let e_new = eff(&ao.bitmap, new_live);
+            if let Some(child) = lanes_delta_child(&e_before, &e_new) {
+                node.children.insert(layer::LANES.to_vec(), child);
             }
             Ok((!node.is_identity() || !node.children.is_empty()).then_some(node))
         }
@@ -265,6 +310,8 @@ fn advance_dir(
     trans: &[Trans],
     obj: &mut dyn Objects,
     emit: bool,
+    prev_live: &[u8],
+    new_live: &[u8],
 ) -> Result<Node> {
     let mut out = Node::keep();
     let child_trans = distribute_children(trans, obj)?;
@@ -279,14 +326,14 @@ fn advance_dir(
                 if !emit {
                     continue;
                 }
-                if let Some(node) = variant_reverse_node(&ch, obj)? {
+                if let Some(node) = variant_reverse_node(&ch, obj, prev_live, new_live)? {
                     out.children.insert(file_key(&name, ch.slot), node);
                 }
             }
         }
 
         // Subdirectory of `name` → bare `dir_key(name)` node.
-        let dnode = advance_dir(&mut child.children, &sr, obj, emit)?;
+        let dnode = advance_dir(&mut child.children, &sr, obj, emit, prev_live, new_live)?;
         if !dnode.is_identity() {
             out.children.insert(dir_key(&name), dnode);
         }
@@ -298,11 +345,63 @@ fn advance_dir(
     Ok(out)
 }
 
+/// Emit, into `out`, a `lanes`-child reverse-delta for every UNTOUCHED variant
+/// whose all-ones OMISSION status flips because the live-lane set changed
+/// (a lane born or died) between the previous and new revision — the variants
+/// the reslot transition does not report because their membership did not
+/// change, yet whose stored bitmap form must change so folding reconstructs the
+/// previous revision's omissions exactly. Walked over the PRE-advance skeleton;
+/// touched variants are later overwritten by `advance_dir`'s own deltas.
+fn remat_flips(dir: &Skel, prev_live: &[u8], new_live: &[u8], path: &mut Vec<Name>, out: &mut Node) {
+    for (name, sub) in &dir.children {
+        for (slot, occ) in sub.slots.iter() {
+            let e_before = eff(&occ.bitmap, prev_live);
+            let e_new = eff(&occ.bitmap, new_live);
+            if let Some(child) = lanes_delta_child(&e_before, &e_new) {
+                let mut vn = Node::keep();
+                vn.children.insert(layer::LANES.to_vec(), child);
+                insert_variant(out, path, &file_key(name, slot), vn);
+            }
+        }
+        if !sub.children.is_empty() {
+            path.push(name.clone());
+            remat_flips(sub, prev_live, new_live, path, out);
+            path.pop();
+        }
+    }
+}
+
+/// Descend `out` along `dirs` (creating bare `dir_key` Keep nodes) and insert
+/// `node` at the leaf `key`.
+fn insert_variant(out: &mut Node, dirs: &[Name], key: &[u8], node: Node) {
+    let mut cur = out;
+    for d in dirs {
+        cur = cur.children.entry(dir_key(d)).or_insert_with(Node::keep);
+    }
+    cur.children.insert(key.to_vec(), node);
+}
+
+/// Merge delta tree `from` into `into`, with `from` winning on any leaf key
+/// collision. Directory keys (bare names) present on both sides recurse; file
+/// variant keys (`\0`-led) never collide across the two callers (touched vs
+/// omission-flipped are disjoint), and `from` replaces if they ever did.
+fn merge_delta(into: &mut Node, from: Node) {
+    for (k, v) in from.children {
+        let is_dir = matches!(layer::classify(&k), Some(layer::Kind::Dir(_)));
+        match into.children.get_mut(&k) {
+            Some(existing) if is_dir => merge_delta(existing, v),
+            _ => {
+                into.children.insert(k, v);
+            }
+        }
+    }
+}
+
 /// The §2 variant View for an occupant — mirrors [`variant_node`] as a
 /// materialized View so the folded reverse-delta state and this fresh
-/// full-state are byte-identical under `diff(None, view)`. Bitmaps are stored
-/// explicitly (the all-ones omission is a size optimization not applied here).
-fn variant_view(content: Bytes, mode: Mode, bitmap: &[u8]) -> View {
+/// full-state are byte-identical under `diff(None, view)`. `bitmap = None`
+/// omits the `lanes` child (the all-ones case).
+fn variant_view(content: Bytes, mode: Mode, bitmap: Option<&[u8]>) -> View {
     let mut children: BTreeMap<Name, Arc<View>> = BTreeMap::new();
     if let Some(tag) = mode.tag() {
         let blob: Bytes = if let Mode::Other(m) = mode {
@@ -312,25 +411,30 @@ fn variant_view(content: Bytes, mode: Mode, bitmap: &[u8]) -> View {
         };
         children.insert(tag.to_vec(), Arc::new(View { blob: Some(blob), attrs: Attrs::new(), children: BTreeMap::new() }));
     }
-    children.insert(
-        layer::LANES.to_vec(),
-        Arc::new(View { blob: Some(bitmap.to_vec().into()), attrs: Attrs::new(), children: BTreeMap::new() }),
-    );
+    if let Some(bm) = bitmap {
+        children.insert(
+            layer::LANES.to_vec(),
+            Arc::new(View { blob: Some(bm.to_vec().into()), attrs: Attrs::new(), children: BTreeMap::new() }),
+        );
+    }
     View { blob: Some(content), attrs: Attrs::new(), children }
 }
 
-/// Materialize the current skeleton state as the §2 union View. Each child
-/// name emits its file variants as `file_key(name, slot)` siblings and its
-/// subtree as `dir_key(name)`. The `f0`/seal head is `diff(None, view)`.
-fn full_view_dir(dir: &Skel, obj: &mut dyn Objects) -> Result<View> {
+/// Materialize the current skeleton state as the §2 union View, with the
+/// all-ones `lanes` omission applied against `live` (the lanes live at this —
+/// the newest — revision). Each child name emits its file variants as
+/// `file_key(name, slot)` siblings and its subtree as `dir_key(name)`. The
+/// `f0`/seal head is `diff(None, view)`.
+fn full_view_dir(dir: &Skel, obj: &mut dyn Objects, live: &[u8]) -> Result<View> {
     let mut children: BTreeMap<Name, Arc<View>> = BTreeMap::new();
     for (name, sub) in &dir.children {
         for (slot, occ) in sub.slots.iter() {
             let content = obj.blob(&occ.id.1)?;
-            children.insert(file_key(name, slot), Arc::new(variant_view(content.into(), occ_mode(occ), &occ.bitmap)));
+            let bm = eff(&occ.bitmap, live);
+            children.insert(file_key(name, slot), Arc::new(variant_view(content.into(), occ_mode(occ), bm.as_deref())));
         }
         if !sub.children.is_empty() {
-            children.insert(dir_key(name), Arc::new(full_view_dir(sub, obj)?));
+            children.insert(dir_key(name), Arc::new(full_view_dir(sub, obj, live)?));
         }
     }
     Ok(View { blob: None, attrs: Attrs::new(), children })
@@ -354,16 +458,32 @@ impl Encoder {
     /// Apply this revision's lane transitions and return the reverse delta
     /// rebuilding the PREVIOUS state from the new one — each older chain
     /// record (removals as holes). Reads tree objects for the changed
-    /// subtrees only.
-    pub fn advance(&mut self, trans: &[Trans], obj: &mut dyn Objects) -> Result<Layer> {
-        Ok(Layer { root: advance_dir(&mut self.root.children, trans, obj, true)? })
+    /// subtrees only. `prev_live`/`new_live` are the lane sets live at the
+    /// previous/new revisions; they drive the all-ones `lanes` omission and,
+    /// when they differ (a lane born/died), the untouched-variant
+    /// re-materialization (`remat_flips`) so folding reconstructs the previous
+    /// revision's omissions exactly.
+    pub fn advance(
+        &mut self,
+        trans: &[Trans],
+        obj: &mut dyn Objects,
+        prev_live: &[u8],
+        new_live: &[u8],
+    ) -> Result<Layer> {
+        let mut root = Node::keep();
+        if trim(prev_live) != trim(new_live) {
+            remat_flips(&self.root, prev_live, new_live, &mut Vec::new(), &mut root);
+        }
+        let changed = advance_dir(&mut self.root.children, trans, obj, true, prev_live, new_live)?;
+        merge_delta(&mut root, changed); // reslot deltas win over remat flips
+        Ok(Layer { root })
     }
 
     /// Update ONLY the skeleton for this revision — reslot the slots without
     /// fetching any blob content or building a delta. For memory measurement:
     /// it grows the skeleton to the full union with no blob traffic.
     pub fn advance_skel(&mut self, trans: &[Trans], obj: &mut dyn Objects) -> Result<()> {
-        advance_dir(&mut self.root.children, trans, obj, false)?;
+        advance_dir(&mut self.root.children, trans, obj, false, &[], &[])?;
         Ok(())
     }
 
@@ -402,8 +522,8 @@ impl Encoder {
     /// emitting nodes directly) so it is byte-identical to the anchor the
     /// reader recomputes for a cold frame — `diff(None, reconstructed-view)`.
     /// Any non-canonical divergence there fails the frame's refPrefix check.
-    pub fn full(&self, obj: &mut dyn Objects) -> Result<Layer> {
-        Ok(depot::diff(None, Some(&full_view_dir(&self.root, obj)?)))
+    pub fn full(&self, obj: &mut dyn Objects, live: &[u8]) -> Result<Layer> {
+        Ok(depot::diff(None, Some(&full_view_dir(&self.root, obj, live)?)))
     }
 
     /// (total variant slots, total directory nodes) in the live skeleton —
@@ -442,9 +562,21 @@ mod tests {
         lane_map(u, l).get(path).map(|(_, c)| c.clone())
     }
 
-    /// The newest union View: materialize the encoder's full state.
-    fn newest(enc: &Encoder, m: &mut Mem) -> View {
-        depot::apply(None, &enc.full(m).unwrap()).unwrap_or_default()
+    /// A little-endian compact-lane bitmap for a set of live lanes.
+    fn bm(lanes: &[usize]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for &l in lanes {
+            let byte = l / 8;
+            if b.len() <= byte {
+                b.resize(byte + 1, 0);
+            }
+            b[byte] |= 1 << (l % 8);
+        }
+        b
+    }
+    /// The newest union View: materialize the encoder's full state at `live`.
+    fn newest(enc: &Encoder, m: &mut Mem, live: &[u8]) -> View {
+        depot::apply(None, &enc.full(m, live).unwrap()).unwrap_or_default()
     }
     /// Fold a reverse-delta record into the working view, resolving removal
     /// holes as tombstones over the empty backdrop (the reader's rule).
@@ -506,10 +638,10 @@ mod tests {
         let t1 = m.tree_ent("t1", vec![("shared", x.clone()), ("f", b.clone())]);
 
         let mut enc = Encoder::new();
-        // Birth both lanes (one advance each, from empty).
-        enc.advance(&[(0, None, Some(&t0))], &mut m).unwrap();
-        enc.advance(&[(1, None, Some(&t1))], &mut m).unwrap();
-        let u = newest(&enc, &mut m);
+        // Birth both lanes (one advance each, from empty); live grows {0}→{0,1}.
+        enc.advance(&[(0, None, Some(&t0))], &mut m, &bm(&[]), &bm(&[0])).unwrap();
+        enc.advance(&[(1, None, Some(&t1))], &mut m, &bm(&[0]), &bm(&[0, 1])).unwrap();
+        let u = newest(&enc, &mut m, &bm(&[0, 1]));
 
         assert_eq!(lane_map(&u, 0).len(), 2);
         assert_eq!(content(&u, 0, b"f").as_deref(), Some(&b"A"[..]));
@@ -527,11 +659,11 @@ mod tests {
         let t_new = m.tree_ent("tnew", vec![("shared", x.clone()), ("f", new.clone())]);
 
         let mut enc = Encoder::new();
-        enc.advance(&[(0, None, Some(&t_old))], &mut m).unwrap(); // birth = state old
-        let rec = enc.advance(&[(0, Some(&t_old), Some(&t_new))], &mut m).unwrap(); // → state new
+        enc.advance(&[(0, None, Some(&t_old))], &mut m, &bm(&[]), &bm(&[0])).unwrap(); // birth = state old
+        let rec = enc.advance(&[(0, Some(&t_old), Some(&t_new))], &mut m, &bm(&[0]), &bm(&[0])).unwrap(); // → state new
 
         // newest (state new)
-        let mut cur = Some(newest(&enc, &mut m));
+        let mut cur = Some(newest(&enc, &mut m, &bm(&[0])));
         assert_eq!(content(cur.as_ref().unwrap(), 0, b"f").as_deref(), Some(&b"new"[..]));
         // reverse record rebuilds state old — only `f` changed, `shared`
         // inherited (holes resolve as tombstones over the empty backdrop).
@@ -553,9 +685,9 @@ mod tests {
         let r1 = m.tree_ent("r1", vec![("src", src1)]);
 
         let mut enc = Encoder::new();
-        enc.advance(&[(0, None, Some(&r0))], &mut m).unwrap();
-        let rec = enc.advance(&[(0, Some(&r0), Some(&r1))], &mut m).unwrap();
-        let mut cur = Some(newest(&enc, &mut m));
+        enc.advance(&[(0, None, Some(&r0))], &mut m, &bm(&[]), &bm(&[0])).unwrap();
+        let rec = enc.advance(&[(0, Some(&r0), Some(&r1))], &mut m, &bm(&[0]), &bm(&[0])).unwrap();
+        let mut cur = Some(newest(&enc, &mut m, &bm(&[0])));
         // newest: src/m == m1
         assert_eq!(content(cur.as_ref().unwrap(), 0, b"src/m").as_deref(), Some(&b"m1"[..]));
         // reverse record rebuilds the old state — src/l pruned by oid.
