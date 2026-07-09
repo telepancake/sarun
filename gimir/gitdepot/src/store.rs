@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS kv(
 CREATE TABLE IF NOT EXISTS refs(
     name       TEXT PRIMARY KEY,
     commit_idx INTEGER,
-    tree_idx   INTEGER NOT NULL,
+    lane       INTEGER NOT NULL,
     tag_idx    INTEGER
 );
 ";
@@ -185,7 +185,7 @@ pub fn store_exists(store: &Path) -> bool {
 
 /// The one supported on-disk format. Anything else on open = loud
 /// error (unreleased software: no migrations, mirrors are rebuildable).
-const SCHEMA_VERSION: &str = "6";
+const SCHEMA_VERSION: &str = "7";
 
 fn configure(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(sql_err)
@@ -250,7 +250,11 @@ impl<'a> Cur<'a> {
 pub struct CommitRecord {
     pub idx: u64,
     pub sha: String,
-    pub tree_idx: u64,
+    /// The commit's LANE in the union of live lanes (§1). Its git tree is the
+    /// `lane`-th lane extracted from the union state at revision `idx`
+    /// (`rev == idx`) — the `(rev, lane)` reference that replaces the old
+    /// one-tree-per-commit index.
+    pub lane: u64,
     pub parent_idxs: Vec<u64>,
     pub author: Vec<u8>,
     pub committer: Vec<u8>,
@@ -275,7 +279,7 @@ impl CommitRecord {
         let mut out = Vec::new();
         out.extend_from_slice(&self.idx.to_le_bytes());
         put_bytes(&mut out, self.sha.as_bytes());
-        out.extend_from_slice(&self.tree_idx.to_le_bytes());
+        out.extend_from_slice(&self.lane.to_le_bytes());
         out.extend_from_slice(&(self.parent_idxs.len() as u32).to_le_bytes());
         for p in &self.parent_idxs {
             out.extend_from_slice(&p.to_le_bytes());
@@ -296,7 +300,7 @@ impl CommitRecord {
         let idx = c.u64()?;
         let sha = String::from_utf8(c.bytes()?.to_vec())
             .map_err(|_| Error::Chain("commit record: non-utf8 sha".into()))?;
-        let tree_idx = c.u64()?;
+        let lane = c.u64()?;
         let n = c.u32()? as usize;
         let mut parent_idxs = Vec::with_capacity(n);
         for _ in 0..n {
@@ -318,7 +322,7 @@ impl CommitRecord {
         Ok(CommitRecord {
             idx,
             sha,
-            tree_idx,
+            lane,
             parent_idxs,
             author,
             committer,
@@ -904,88 +908,11 @@ impl Store {
         Ok(hit)
     }
 
-    /// Walk the TREES chain newest-first, reconstructing views into ONE
-    /// working view mutated in place per record (O(delta) per step —
-    /// only the frame-boundary anchor re-encode is O(tree), once per
-    /// cold frame). `visit(pos, record, view)` per position; stops after
-    /// newest-first position `until_pos` when given. Cold anchors are
-    /// the canonical full-view bytes at the frame boundary, recomputed
-    /// from the walked view. Public for the read-fidelity tests.
-    #[doc(hidden)]
-    pub fn walk_tree_views(
-        &self,
-        until_pos: Option<usize>,
-        visit: &mut dyn FnMut(usize, &[u8], &depot::View),
-    ) -> Result<()> {
-        let Some(head) = self.read_head(TREES)? else {
-            return Ok(());
-        };
-        let mut cur: Option<depot::View> = None;
-        let mut pos: usize = 0;
-        let mut step = |cur: &mut Option<depot::View>, pos: &mut usize, rec: &[u8]| -> Result<bool> {
-            let layer = depot::codec::decode(rec)?;
-            depot::apply_mut(cur, &layer);
-            let view = cur.as_ref().ok_or_else(|| {
-                Error::Chain(format!("tree frame {pos} resolves to nothing"))
-            })?;
-            visit(*pos, rec, view);
-            *pos += 1;
-            Ok(until_pos.is_some_and(|p| *pos > p))
-        };
-        if step(&mut cur, &mut pos, &head)? {
-            return Ok(());
-        }
-        if let Some(f1) = self.depot.read_f1(TREES).map_err(|e| Error::Chain(e.to_string()))? {
-            let mut stopped = false;
-            stream_frame_records(&f1, &head, &mut |rec| {
-                stopped = step(&mut cur, &mut pos, &rec)?;
-                Ok(stopped)
-            })?;
-            if stopped {
-                return Ok(());
-            }
-        }
-        for cold in self.depot.cold_iter(TREES).map_err(|e| Error::Chain(e.to_string()))? {
-            let frame = cold.map_err(|e| Error::Chain(e.to_string()))?;
-            // The cold anchor: canonical full-view bytes at the frame
-            // boundary, recomputed from the walked view.
-            let anchor = depot::codec::encode(&depot::diff(None, cur.as_ref()));
-            let mut stopped = false;
-            stream_frame_records(&frame, &anchor, &mut |rec| {
-                stopped = step(&mut cur, &mut pos, &rec)?;
-                Ok(stopped)
-            })?;
-            if stopped {
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
-
-    /// All walked views newest-first (down to `until_pos` inclusive when
-    /// given) — O(count × tree) RAM by construction; only for callers
-    /// that genuinely need every view (export, migration fixtures).
-    pub fn tree_views(&self, until_pos: Option<usize>) -> Result<Vec<depot::View>> {
-        let mut views = Vec::new();
-        self.walk_tree_views(until_pos, &mut |_, _, v| views.push(v.clone()))?;
-        Ok(views)
-    }
-
-    /// The view of tree `tree_idx` (stable index) — walks head→idx, one
-    /// working view, returns only the target.
-    pub fn tree_view(&self, tree_idx: u64) -> Result<depot::View> {
-        let n = self.count(TREES)?;
-        if tree_idx >= n {
-            return Err(Error::Chain(format!("no tree at index {tree_idx}")));
-        }
-        let target = (n - 1 - tree_idx) as usize;
-        let mut out = None;
-        self.walk_tree_views(Some(target), &mut |pos, _, v| {
-            if pos == target {
-                out = Some(v.clone());
-            }
-        })?;
-        out.ok_or_else(|| Error::Chain(format!("tree walk fell short of index {tree_idx}")))
+    /// The union tree store (`lanestore`) that holds this mirror's trees —
+    /// opened from the `trees/` subdir. A commit's git tree is
+    /// `union().tree_view_at(commit.idx)`.
+    pub fn union(&self) -> Result<crate::lanestore::LaneStore> {
+        crate::lanestore::LaneStore::open(&self.root().join("trees"))
     }
 
     /// Flush the depot durable, then run `stage` inside one sqlite
@@ -1100,13 +1027,13 @@ impl Store {
         Ok(recs)
     }
 
-    /// CURRENT refs: name → (commit_idx, tree_idx, tag_idx), name-ordered.
-    /// commit_idx/tree_idx are PEELED for annotated tags (tag_idx set);
-    /// commit_idx is NULL for a tag peeling to a tree.
+    /// CURRENT refs: name → (commit_idx, lane, tag_idx), name-ordered.
+    /// commit_idx is PEELED for annotated tags (tag_idx set); `lane` is the
+    /// commit's union lane (its tree = `(rev = commit_idx, lane)`).
     pub fn ref_rows(&self) -> Result<Vec<(String, Option<u64>, u64, Option<u64>)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT name, commit_idx, tree_idx, tag_idx FROM refs ORDER BY name")
+            .prepare("SELECT name, commit_idx, lane, tag_idx FROM refs ORDER BY name")
             .map_err(sql_err)?;
         let rows = stmt
             .query_map([], |r| {
@@ -1387,11 +1314,11 @@ pub(crate) fn apply_ref_changes(
         match ch.new {
             Some((c, t, g)) => {
                 tx.execute(
-                    "INSERT INTO refs(name, commit_idx, tree_idx, tag_idx)
+                    "INSERT INTO refs(name, commit_idx, lane, tag_idx)
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(name) DO UPDATE SET
                        commit_idx = excluded.commit_idx,
-                       tree_idx = excluded.tree_idx,
+                       lane = excluded.lane,
                        tag_idx = excluded.tag_idx",
                     rusqlite::params![ch.name, c.map(|v| v as i64), t as i64,
                                       g.map(|v| v as i64)],
@@ -1626,28 +1553,17 @@ impl Drop for Staged {
 pub(crate) struct Ingest<'a> {
     st: &'a mut Store,
     level: i32,
-    // TREES staging. `entries` are reverse deltas in ADD order: the
-    // first entry rebuilds the stored chain head (the bridge), each
-    // later one rebuilds the previously-added tree.
-    head_view: Option<depot::View>,
-    seed_full: Option<Vec<u8>>,
-    tree_entries: Staged,
-    /// Stable index one past the last LANDED tree (= n_trees at open;
-    /// nothing lands before `finish()`). Staged trees are
-    /// `tree_base..n_trees`.
-    tree_base: u64,
-    n_trees: u64,
-    /// Intra-ingest dedup only (git tree oid → tree_idx), discarded
-    /// with the Ingest.
-    tree_cache: HashMap<String, u64>,
-    // COMMITS staging (encoded objects, oldest-first).
+    // COMMITS staging (encoded objects, oldest-first). Trees are NOT stored
+    // here: a commit references its tree by `(rev, lane)` into the union store
+    // (`lanestore`) — `rev == the commit's stable index`.
     commit_recs: Staged,
     n_commits: u64,
     /// sha → staged idx, one entry per staged commit for the life of
     /// the ingest — ~90B/commit, acceptable at linux scale (~1.3M).
     sha_cache: HashMap<String, u64>,
-    /// staged commit idx → tree idx, same lifetime — ~50B/commit.
-    tree_of_commit: HashMap<u64, u64>,
+    /// staged commit idx → lane, same lifetime — the `(rev, lane)` a ref or
+    /// tag resolves to for its tree.
+    lane_of_commit: HashMap<u64, u64>,
     // TAGS staging (encoded objects, oldest-first).
     tag_recs: Staged,
     n_tags: u64,
@@ -1656,18 +1572,8 @@ pub(crate) struct Ingest<'a> {
 
 impl<'a> Ingest<'a> {
     pub(crate) fn new(st: &'a mut Store, level: i32) -> Result<Self> {
-        let n_trees = st.count(TREES)?;
         let n_commits = st.count(COMMITS)?;
         let n_tags = st.count(TAGS)?;
-        let head_view = if n_trees > 0 {
-            Some(
-                st.tree_views(Some(0))?
-                    .pop()
-                    .ok_or_else(|| Error::Chain("trees count > 0 but empty chain".into()))?,
-            )
-        } else {
-            None
-        };
         let bound = std::env::var("GITDEPOT_SPILL_BOUND")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1676,26 +1582,19 @@ impl<'a> Ingest<'a> {
         Ok(Ingest {
             st,
             level,
-            head_view,
-            seed_full: None,
-            tree_entries: Staged::new(staging.join("trees"), bound, SPILL_BLOCK),
-            tree_base: n_trees,
-            n_trees,
-            tree_cache: HashMap::new(),
             commit_recs: Staged::new(staging.join("commits"), bound, SPILL_BLOCK),
             n_commits,
             sha_cache: HashMap::new(),
-            tree_of_commit: HashMap::new(),
+            lane_of_commit: HashMap::new(),
             tag_recs: Staged::new(staging.join("tags"), bound, SPILL_BLOCK),
             n_tags,
             tag_cache: HashMap::new(),
         })
     }
 
-    /// RAW staged bytes across the three stages (RAM + spill) —
-    /// instrumentation for the bootstrap rung report.
+    /// RAW staged bytes across the stages (RAM + spill) — instrumentation.
     pub(crate) fn staged_bytes(&self) -> u64 {
-        self.tree_entries.bytes + self.commit_recs.bytes + self.tag_recs.bytes
+        self.commit_recs.bytes + self.tag_recs.bytes
     }
 
     fn parent_idx(&self, sha: &str) -> Result<u64> {
@@ -1705,181 +1604,6 @@ impl<'a> Ingest<'a> {
         self.st
             .sha_to_idx(sha)?
             .ok_or_else(|| Error::Meta(format!("parent {sha} not in store")))
-    }
-
-    // Dedup key = git's own root tree oid (free at import from the
-    // commit's `tree` header). `same_tree_parent` = a parent sha whose
-    // tree oid equals `tree_oid` (caller-checked from the fetch
-    // buffer): reuse its tree_idx — no persistent oid index (module
-    // doc).
-    pub(crate) fn tree_idx_for(
-        &mut self,
-        tree_oid: &str,
-        same_tree_parent: Option<&str>,
-        view: &depot::View,
-    ) -> Result<u64> {
-        if let Some(i) = self.tree_cache.get(tree_oid) {
-            return Ok(*i);
-        }
-        if let Some(p) = same_tree_parent {
-            let cidx = self.parent_idx(p)?;
-            let t = match self.tree_of_commit.get(&cidx) {
-                Some(t) => *t,
-                None => self.st.commit_record_at_n(cidx, self.n_commits)?.tree_idx,
-            };
-            self.tree_cache.insert(tree_oid.to_string(), t);
-            return Ok(t);
-        }
-        // New distinct tree: stage its record. The delta pushed rebuilds
-        // the CURRENT staged head from this (next-newer) view; the very
-        // first tree of a fresh store seeds the chain instead. The full
-        // record (`encode(diff(None, view))`, O(tree)) is minted ONCE
-        // per fresh store here and once per prepend batch at flush —
-        // never per commit; per-commit cost is this delta, whose diff
-        // short-circuits every subtree `view` and `prev` still share.
-        match &self.head_view {
-            Some(prev) => {
-                let d = depot::diff(Some(view), Some(prev));
-                let delta = depot::codec::encode(&d);
-                if std::env::var_os("GITDEPOT_TRACE_RECORDS").is_some() {
-                    fn walk(n: &depot::Node, nodes: &mut u64, sets: &mut u64, setb: &mut u64, tomb: &mut u64) {
-                        *nodes += 1;
-                        if n.presence == depot::Presence::Tombstone { *tomb += 1; }
-                        if let depot::BlobOp::Set(b) = &n.blob { *sets += 1; *setb += b.len() as u64; }
-                        for c in n.children.values() { walk(c, nodes, sets, setb, tomb); }
-                    }
-                    let (mut nodes, mut sets, mut setb, mut tomb) = (0, 0, 0, 0);
-                    walk(&d.root, &mut nodes, &mut sets, &mut setb, &mut tomb);
-                    eprintln!("TRACE rec={} len={} nodes={} sets={} setbytes={} tombs={}",
-                              self.n_trees, delta.len(), nodes, sets, setb, tomb);
-                }
-                self.tree_entries.push(delta)?;
-            }
-            None => {
-                self.seed_full =
-                    Some(depot::codec::encode(&depot::diff(None, Some(view))));
-            }
-        }
-        let idx = self.n_trees;
-        self.n_trees += 1;
-        self.head_view = Some(view.clone());
-        self.tree_cache.insert(tree_oid.to_string(), idx);
-        Ok(idx)
-    }
-
-    /// Reconstruct the view of tree `tree_idx` mid-ingest: staged
-    /// trees by walking the staged reverse deltas backward from the
-    /// staged head — the mid-ingest analogue of
-    /// `Store::walk_tree_views` (a laddered bootstrap needs boundary
-    /// views before the ingest commits) — and trees already STORED
-    /// (below `tree_base`) by walking the chain. One backward pass
-    /// per side serves many targets:
-    /// `targets` maps stable tree idx → keys wanting that view.
-    pub(crate) fn staged_views<K: Clone>(
-        &self,
-        targets: &std::collections::BTreeMap<u64, Vec<K>>,
-    ) -> Result<Vec<(K, depot::View)>> {
-        let mut out = Vec::new();
-        if targets.is_empty() {
-            return Ok(out);
-        }
-        // Staged entry 0 (the bridge) rebuilds the LANDED chain head,
-        // tree_base - 1 — the staged walk bottoms out there; anything
-        // lower comes from the chain.
-        let first_rebuilt = if self.tree_base == 0 { 0 } else { self.tree_base - 1 };
-        let mut stored: std::collections::BTreeMap<u64, &Vec<K>> = Default::default();
-        let mut staged: std::collections::BTreeMap<u64, &Vec<K>> = Default::default();
-        for (i, ks) in targets {
-            if *i < first_rebuilt {
-                stored.insert(*i, ks);
-            } else {
-                staged.insert(*i, ks);
-            }
-        }
-        if !staged.is_empty() {
-            let lowest = *staged.keys().next().expect("non-empty");
-            let mut cur = self
-                .head_view
-                .clone()
-                .ok_or_else(|| Error::Chain("staged view walk on an empty ingest".into()))?;
-            let mut idx = self.n_trees - 1;
-            let mut j = self.tree_entries.len();
-            loop {
-                if let Some(keys) = staged.get(&idx) {
-                    for k in *keys {
-                        out.push((k.clone(), cur.clone()));
-                    }
-                }
-                if idx == lowest {
-                    break;
-                }
-                if j == 0 {
-                    return Err(Error::Chain(format!(
-                        "staged walk exhausted at tree {idx} before reaching {lowest}"
-                    )));
-                }
-                j -= 1;
-                let rec = self.tree_entries.get(j)?;
-                let layer = depot::codec::decode(&rec)?;
-                let mut v = Some(cur);
-                depot::apply_mut(&mut v, &layer);
-                cur = v.ok_or_else(|| {
-                    Error::Chain(format!("staged tree {} resolves to nothing", idx - 1))
-                })?;
-                idx -= 1;
-            }
-        }
-        if !stored.is_empty() {
-            // Chain head = tree tree_base - 1 at walk position 0.
-            let base = self.tree_base;
-            let lowest = *stored.keys().next().expect("non-empty");
-            let until = (base - 1 - lowest) as usize;
-            self.st.walk_tree_views(Some(until), &mut |pos, _, v| {
-                let idx = base - 1 - pos as u64;
-                if let Some(keys) = stored.get(&idx) {
-                    for k in *keys {
-                        out.push((k.clone(), v.clone()));
-                    }
-                }
-            })?;
-        }
-        Ok(out)
-    }
-
-    /// The staged view of a commit already added to THIS ingest.
-    pub(crate) fn tree_idx_of_staged(&self, sha: &str) -> Option<u64> {
-        self.sha_cache.get(sha).and_then(|c| self.tree_of_commit.get(c)).copied()
-    }
-
-    /// Land everything TREES-staged as ONE batch prepend: f0 = the
-    /// staged head's full record; the f1 streams the staged reverse
-    /// deltas newest-first — the oldest of which is the bridge that
-    /// replaces the demoted former head (`Demote::Dropped`).
-    fn flush_tree_batch(&mut self) -> Result<()> {
-        if let Some(seed_rec) = self.seed_full.take() {
-            self.st
-                .prepend_batch(TREES, &seed_rec, None, Demote::Verbatim, self.level)?;
-        }
-        if self.tree_entries.is_empty() {
-            self.tree_base = self.n_trees;
-            return Ok(());
-        }
-        // The batch-head full record, minted here (once per prepend)
-        // from the staged head view — byte-equal to what the old
-        // per-commit path carried forward (diff/encode are canonical).
-        let head_full = depot::codec::encode(&depot::diff(
-            None,
-            Some(self.head_view.as_ref().expect("staged tree entries imply a staged head")),
-        ));
-        self.st.prepend_batch(
-            TREES,
-            &head_full,
-            Some(&mut self.tree_entries),
-            Demote::Dropped,
-            self.level,
-        )?;
-        self.tree_base = self.n_trees;
-        Ok(())
     }
 
     fn flush_commit_batch(&mut self) -> Result<()> {
@@ -1906,17 +1630,10 @@ impl<'a> Ingest<'a> {
     }
 
     /// Stage one commit (must arrive oldest-first: parents before
-    /// children). `tree_oid` = the commit's `tree` header value;
-    /// `same_tree_parent` = a parent sha with the same tree oid, if
-    /// any.
-    pub(crate) fn add_commit(
-        &mut self,
-        cm: &CommitMeta,
-        tree_oid: &str,
-        same_tree_parent: Option<&str>,
-        view: &depot::View,
-    ) -> Result<u64> {
-        let tree_idx = self.tree_idx_for(tree_oid, same_tree_parent, view)?;
+    /// children, in union-revision order so `idx == rev`). `lane` is the
+    /// commit's compact lane in the union (`lanestore`); its tree is
+    /// `(rev = idx, lane)`.
+    pub(crate) fn add_commit(&mut self, cm: &CommitMeta, lane: u64) -> Result<u64> {
         let parent_idxs = cm
             .parents
             .iter()
@@ -1928,7 +1645,7 @@ impl<'a> Ingest<'a> {
         let rec = CommitRecord {
             idx,
             sha: cm.sha.clone(),
-            tree_idx,
+            lane,
             parent_idxs,
             author: dehex(&cm.author_hex)?,
             committer: dehex(&cm.committer_hex)?,
@@ -1938,7 +1655,7 @@ impl<'a> Ingest<'a> {
         };
         self.commit_recs.push(rec.encode())?;
         self.sha_cache.insert(cm.sha.clone(), idx);
-        self.tree_of_commit.insert(idx, tree_idx);
+        self.lane_of_commit.insert(idx, lane);
         Ok(idx)
     }
 
@@ -1946,22 +1663,15 @@ impl<'a> Ingest<'a> {
         Ok(self.tag_cache.contains_key(sha) || self.st.tag_sha_to_idx(sha)?.is_some())
     }
 
-    /// tree_idx already known to this ingest for a git tree oid
-    /// (every staged commit's root tree lands here).
-    pub(crate) fn known_tree_idx(&self, tree_oid: &str) -> Option<u64> {
-        self.tree_cache.get(tree_oid).copied()
-    }
-
-    /// The tree_idx of a commit already staged or stored, memoized
-    /// under `tree_oid` for later tag lookups.
-    pub(crate) fn tree_idx_of_commit(&mut self, sha: &str, tree_oid: &str) -> Result<u64> {
+    /// The `(commit_idx, lane)` of a commit already staged or stored — the
+    /// `(rev, lane)` reference a tag/ref resolves to for its tree.
+    fn commit_ref(&self, sha: &str) -> Result<(u64, u64)> {
         let cidx = self.parent_idx(sha)?;
-        let t = match self.tree_of_commit.get(&cidx) {
-            Some(t) => *t,
-            None => self.st.commit_record_at_n(cidx, self.n_commits)?.tree_idx,
+        let lane = match self.lane_of_commit.get(&cidx) {
+            Some(l) => *l,
+            None => self.st.commit_record_at_n(cidx, self.n_commits)?.lane,
         };
-        self.tree_cache.insert(tree_oid.to_string(), t);
-        Ok(t)
+        Ok((cidx, lane))
     }
 
     /// Stage one annotated-tag object. Nested chains must arrive
@@ -2007,30 +1717,23 @@ impl<'a> Ingest<'a> {
         Ok(())
     }
 
-    /// (commit_idx, tree_idx) for an observed ref target.
+    /// (commit_idx, lane) for an observed ref target — the `(rev, lane)` the
+    /// ref's tree reconstructs from.
     fn ref_row(&self, sha: &str) -> Result<(u64, u64)> {
-        let cidx = self.parent_idx(sha)?;
-        if let Some(t) = self.tree_of_commit.get(&cidx) {
-            return Ok((cidx, *t));
-        }
-        // Mid-ingest the chain already holds the staged records; the kv
-        // count updates last.
-        Ok((cidx, self.st.commit_record_at_n(cidx, self.n_commits)?.tree_idx))
+        self.commit_ref(sha)
     }
 
-    /// One batch prepend per touched chain (trees, commits, tags) for
-    /// everything staged — the whole ingest.
+    /// One batch prepend per touched chain (commits, tags) for everything
+    /// staged. Trees live in the union store, ingested separately.
     fn flush_chains(&mut self) -> Result<()> {
-        self.flush_tree_batch()?;
         self.flush_commit_batch()?;
         self.flush_tag_batch()
     }
 
     fn commit_bookkeeping(self, changes: &[RefChange], n_reflog: u64) -> Result<()> {
-        let Ingest { st, n_trees, n_commits, n_tags, .. } = self;
+        let Ingest { st, n_commits, n_tags, .. } = self;
         let _ = std::fs::remove_dir_all(st.root().join("staging"));
         st.with_txn(|tx| {
-            kv_set(tx, "n_trees", &n_trees.to_string())?;
             kv_set(tx, "n_commits", &n_commits.to_string())?;
             kv_set(tx, "n_reflog", &n_reflog.to_string())?;
             kv_set(tx, "n_tags", &n_tags.to_string())?;
@@ -2060,21 +1763,17 @@ impl<'a> Ingest<'a> {
                     })
                 };
                 if !r.tree_sha.is_empty() {
-                    // Tag at a tree: no commit; the tree_idx is in the
-                    // tag record (chains are flushed by now).
-                    let ti = tag.ok_or_else(|| {
-                        Error::Meta(format!("tree-target ref {} without a tag", r.name))
-                    })?;
-                    let TagTarget::Tree(t) = self.st.tag_record_at(ti)?.target else {
-                        return Err(Error::Meta(format!(
-                            "ref {} peels to a tree but tag {} records a commit",
-                            r.name, r.tag_sha
-                        )));
-                    };
-                    return Ok((r.name.clone(), None, t, tag));
+                    // A tag peeling to a STANDALONE tree (not any commit's
+                    // tree) has no revision in the union to reference. Not in
+                    // scope for the union mirror (no eval corpus has one).
+                    return Err(Error::Unsupported(format!(
+                        "ref {} peels to a standalone tree — union mirror stores \
+                         only commit trees",
+                        r.name
+                    )));
                 }
-                let (c, t) = self.ref_row(&r.sha)?;
-                Ok((r.name.clone(), Some(c), t, tag))
+                let (c, lane) = self.ref_row(&r.sha)?;
+                Ok((r.name.clone(), Some(c), lane, tag))
             })
             .collect::<Result<Vec<_>>>()?;
         let changes = diff_refs(&self.st.ref_rows()?, &observed);
@@ -2158,7 +1857,7 @@ pub fn resolve_ref(store: &Path, refname: &str) -> Result<Option<Resolved>> {
     let hit: Option<(Option<i64>, i64, Option<i64>)> = s
         .conn
         .query_row(
-            "SELECT commit_idx, tree_idx, tag_idx FROM refs
+            "SELECT commit_idx, lane, tag_idx FROM refs
              WHERE name = ?1 OR name = 'refs/heads/' || ?1
                 OR name = 'refs/tags/' || ?1
              ORDER BY name LIMIT 1",

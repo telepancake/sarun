@@ -16,7 +16,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use gitdepot::store::{COMMITS, REFLOG, TAGS, TREES};
+use gitdepot::store::{COMMITS, REFLOG, TAGS};
 use wikimak_depot::{Depot, DepotConfig};
 
 fn sh_git(repo: &Path, args: &[&str]) -> String {
@@ -78,6 +78,26 @@ fn frames(store: &Path, chain: u64) -> (bool, bool, Vec<Vec<u8>>) {
     (f0, f1, cold)
 }
 
+/// Frame census for the union tree store's single chain (its depot lives
+/// under `store/trees/depot`, one chain).
+fn union_frames(store: &Path) -> (bool, bool, Vec<Vec<u8>>) {
+    let depot = Depot::open(DepotConfig {
+        root: store.join("trees/depot"),
+        max_chain_id: 1,
+        file_size_threshold: 4 << 20,
+        eviction_dead_ratio: 0.5,
+    })
+    .unwrap();
+    let f0 = depot.read_f0(0).is_ok();
+    let f1 = depot.read_f1(0).map(|o| o.is_some()).unwrap_or(false);
+    let cold = if f0 {
+        depot.cold_iter(0).unwrap().map(|r| r.unwrap()).collect()
+    } else {
+        Vec::new()
+    };
+    (f0, f1, cold)
+}
+
 #[test]
 fn one_prepend_per_chain_and_immediate_seal() {
     let tmp = tempfile::tempdir().unwrap();
@@ -92,10 +112,11 @@ fn one_prepend_per_chain_and_immediate_seal() {
     build(&repo, 45);
     let oa = gitdepot::update(&repo, &a, 3).unwrap();
     assert_eq!(oa.new_commits, 40);
-    // ONE prepend per touched chain: TREES, COMMITS, TAGS, REFLOG.
-    assert_eq!(oa.depot_prepends, 4, "update must land one prepend per chain");
+    // ONE prepend per touched chain in the commit-side store: COMMITS,
+    // TAGS, REFLOG. (The union tree store lands separately in store/trees.)
+    assert_eq!(oa.depot_prepends, 3, "update must land one prepend per chain");
     assert!(!a.join("staging").exists(), "staging residue survived finish()");
-    for chain in [TREES, COMMITS, TAGS, REFLOG] {
+    for chain in [COMMITS, TAGS, REFLOG] {
         let (f0, f1, cold) = frames(&a, chain);
         assert!(f0, "chain {chain}: no f0");
         // Small history: nothing crossed the 256K seal threshold —
@@ -103,6 +124,11 @@ fn one_prepend_per_chain_and_immediate_seal() {
         assert!(f1, "chain {chain}: expected an f1 accumulator");
         assert!(cold.is_empty(), "chain {chain}: unexpected cold frames");
     }
+    // The union tree store landed its own f0 + f1, no cold at this scale.
+    let (tf0, tf1, tcold) = union_frames(&a);
+    assert!(tf0, "union trees: no f0");
+    assert!(tf1, "union trees: expected an f1 accumulator");
+    assert!(tcold.is_empty(), "union trees: unexpected cold frames");
 
     // The reference store: same 55-commit end state, default seal —
     // imported BEFORE the env var below poisons the process.
@@ -117,10 +143,10 @@ fn one_prepend_per_chain_and_immediate_seal() {
     std::env::set_var("GITDEPOT_TEST_SEAL", "512");
     let c = tmp.path().join("store-c");
     gitdepot::import(&repo, &c, 3).unwrap();
-    let (f0, f1, tree_cold_1) = frames(&c, TREES);
-    assert!(f0, "TREES: no f0");
-    assert!(!f1, "TREES: oversized f1 must be sealed immediately");
-    assert_eq!(tree_cold_1.len(), 1, "TREES: exactly one immediately-sealed frame");
+    let (f0, f1, tree_cold_1) = union_frames(&c);
+    assert!(f0, "union trees: no f0");
+    assert!(!f1, "union trees: oversized f1 must be sealed immediately");
+    assert_eq!(tree_cold_1.len(), 1, "union trees: exactly one immediately-sealed frame");
     // Every multi-record chain landed f0 + (f1 XOR immediate cold).
     for chain in [COMMITS, TAGS, REFLOG] {
         let (f0, f1, cold) = frames(&c, chain);
@@ -135,12 +161,12 @@ fn one_prepend_per_chain_and_immediate_seal() {
     build(&repo, 70);
     let oc = gitdepot::update(&repo, &c, 3).unwrap();
     assert_eq!(oc.new_commits, 15);
-    let (_, _, tree_cold_2) = frames(&c, TREES);
+    let (_, _, tree_cold_2) = union_frames(&c);
     assert!(
         tree_cold_2.ends_with(&tree_cold_1[..]),
-        "TREES: the pre-update cold frame was rewritten (must stay byte-identical)"
+        "union trees: the pre-update cold frame was rewritten (must stay byte-identical)"
     );
-    assert!(tree_cold_2.len() > 1, "TREES: update batch should also have sealed");
+    assert!(tree_cold_2.len() > 1, "union trees: update batch should also have sealed");
     // COMMITS: the update prepend demotes the import batch into an f1;
     // with the shrunk threshold that f1 seals immediately too.
     let (_, cf1, ccold) = frames(&c, COMMITS);
@@ -166,13 +192,11 @@ fn one_prepend_per_chain_and_immediate_seal() {
             "commit {i} diverges"
         );
     }
-    // Every reconstructed tree view, byte-for-byte — the walk crosses
-    // f0 → (no f1) → immediately-sealed cold frames, whose refPrefix
-    // anchors must reproduce exactly.
-    let tree_walk = |st: &gitdepot::store::Store| -> Vec<depot::View> {
-        let mut views = Vec::new();
-        st.walk_tree_views(None, &mut |_, _, v| views.push(v.clone())).unwrap();
-        views
+    // Every reconstructed union tree, SHA-exact — reconstruction crosses
+    // the union store's frame/seal boundaries and must reproduce exactly.
+    let tree_oids = |st: &gitdepot::store::Store| -> Vec<String> {
+        let ls = st.union().unwrap();
+        (0..ls.n_rev()).map(|r| ls.tree_oid_at(r).unwrap()).collect()
     };
-    assert_eq!(tree_walk(&sc), tree_walk(&sd), "tree views diverge across seal shapes");
+    assert_eq!(tree_oids(&sc), tree_oids(&sd), "union trees diverge across seal shapes");
 }

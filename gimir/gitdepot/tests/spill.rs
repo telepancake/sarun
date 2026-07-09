@@ -70,10 +70,11 @@ fn spilled_update_equals_in_ram_update_with_one_prepend_per_chain() {
     std::env::remove_var("GITDEPOT_SPILL_BOUND");
     assert_eq!(oa.new_commits, 40);
     assert_eq!(ob.new_commits, 40);
-    // The batch invariant, both media: TREES + COMMITS + TAGS + REFLOG
-    // = 4 prepends for this update, never more under spill.
-    assert_eq!(oa.depot_prepends, 4);
-    assert_eq!(ob.depot_prepends, 4, "spill must not change prepend structure");
+    // The batch invariant, both media: COMMITS + TAGS + REFLOG = 3
+    // prepends in the commit-side store for this update, never more
+    // under spill. (The union tree store lands separately in store/trees.)
+    assert_eq!(oa.depot_prepends, 3);
+    assert_eq!(ob.depot_prepends, 3, "spill must not change prepend structure");
     // No staging residue.
     assert!(!a.join("staging").exists() && !b.join("staging").exists());
 
@@ -84,10 +85,9 @@ fn spilled_update_equals_in_ram_update_with_one_prepend_per_chain() {
     assert_eq!(sa.commit_records().unwrap(), sb.commit_records().unwrap());
     assert_eq!(sa.tag_records().unwrap(), sb.tag_records().unwrap());
     assert_eq!(sa.ref_rows().unwrap(), sb.ref_rows().unwrap());
-    let tree_recs = |st: &gitdepot::store::Store| -> Vec<Vec<u8>> {
-        let mut recs = Vec::new();
-        st.walk_tree_views(None, &mut |_, rec, _| recs.push(rec.to_vec())).unwrap();
-        recs
+    let tree_oids = |st: &gitdepot::store::Store| -> Vec<String> {
+        let ls = st.union().unwrap();
+        (0..ls.n_rev()).map(|r| ls.tree_oid_at(r).unwrap()).collect()
     };
-    assert_eq!(tree_recs(&sa), tree_recs(&sb), "TREES records diverge under spill");
+    assert_eq!(tree_oids(&sa), tree_oids(&sb), "union trees diverge under spill");
 }

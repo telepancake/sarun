@@ -98,27 +98,35 @@ fn tree_records_scale_with_touched_bytes_not_tree_size() {
     let store = tmp.path().join("store");
     gitdepot::import(&repo, &store, 3).unwrap();
 
-    // Sum the RAW reverse-delta records (skip the head full record —
-    // it alone legitimately carries the whole tree).
+    // The union tree store's TOTAL on-disk size must scale with the
+    // touched bytes, not with N × full-tree. Its head full record
+    // legitimately carries the whole tree (the ~100KB bulk) ONCE; every
+    // other revision's reverse delta is sized by what that revision
+    // touched. A degenerate encode that re-embeds the bulk per revision
+    // blows this budget immediately.
     let st = gitdepot::store::Store::open(&store).unwrap();
-    let mut delta_bytes = 0usize;
-    let mut n_deltas = 0usize;
-    st.walk_tree_views(None, &mut |pos, rec, _| {
-        if pos > 0 {
-            delta_bytes += rec.len();
-            n_deltas += 1;
+    let ls = st.union().unwrap();
+    let n_revs = ls.n_rev();
+    assert!(n_revs >= 16, "fixture landed too few revisions: {n_revs}");
+    fn dir_bytes(dir: &Path) -> usize {
+        let mut total = 0;
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let m = e.metadata().unwrap();
+            if m.is_dir() {
+                total += dir_bytes(&e.path());
+            } else {
+                total += m.len() as usize;
+            }
         }
-    })
-    .unwrap();
-    assert!(n_deltas >= 16, "fixture landed too few tree records: {n_deltas}");
-    // Budget: a generous constant per record (paths, modes, framing)
-    // plus a small multiple of the truly-touched bytes. The bulk is
-    // ~100KB; ONE degenerate record already costs more than the whole
-    // budget.
-    let budget = 2048 * n_deltas + 8 * touched;
+        total
+    }
+    let on_disk = dir_bytes(&store.join("trees"));
+    // One full record (~bulk) + a generous per-revision constant + a
+    // small multiple of the truly-touched bytes.
+    let budget = 2 * bulk_bytes + 4096 * n_revs + 8 * touched;
     assert!(
-        delta_bytes < budget,
-        "tree deltas no longer scale with touched bytes: {delta_bytes} raw bytes \
-         over {n_deltas} records (touched ~{touched}, bulk {bulk_bytes}, budget {budget})"
+        on_disk < budget,
+        "union tree store no longer scales with touched bytes: {on_disk} bytes \
+         over {n_revs} revisions (touched ~{touched}, bulk {bulk_bytes}, budget {budget})"
     );
 }
