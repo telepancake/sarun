@@ -144,6 +144,22 @@ fn cf(e: String) -> Error {
     Error::Chain(e)
 }
 
+/// Set compact-lane bit `l` in a little-endian lane bitmap.
+fn set_live_bit(bm: &mut Vec<u8>, l: usize) {
+    let byte = l / 8;
+    if bm.len() <= byte {
+        bm.resize(byte + 1, 0);
+    }
+    bm[byte] |= 1 << (l % 8);
+}
+/// Clear compact-lane bit `l`.
+fn clear_live_bit(bm: &mut [u8], l: usize) {
+    let byte = l / 8;
+    if byte < bm.len() {
+        bm[byte] &= !(1 << (l % 8));
+    }
+}
+
 
 /// A built lane store: a private `wikimak_depot` instance on disk (the
 /// combined-state chain) plus the RAM bookkeeping a reader needs to map
@@ -224,6 +240,10 @@ impl LaneStore {
         let mut lane_tree: Vec<Option<String>> = vec![None; width];
         let mut batch: Vec<Vec<u8>> = Vec::new();
         let mut batch_bytes: u64 = 0;
+        // The lanes LIVE at the current revision (a compact-lane bitmap) —
+        // drives the §2 all-ones `lanes` omission. A lane is live iff it holds
+        // a tree (`lane_tree[l].is_some()`); this bitmap tracks that set.
+        let mut live: Vec<u8> = Vec::new();
 
         for i in 0..n_rev {
             if std::env::var("GITDEPOT_PROBE").is_ok() && i % 20000 == 0 {
@@ -252,6 +272,15 @@ impl LaneStore {
             }
             trans.push((l, adv_old.as_ref(), Some(&adv_new)));
 
+            // Live set before/after this revision: dying lanes leave, the
+            // advancing lane joins. `prev_live`/`new_live` drive the omission.
+            let prev_live = live.clone();
+            for &d in &dying_at[i] {
+                clear_live_bit(&mut live, d as usize);
+            }
+            set_live_bit(&mut live, l);
+            let new_live = live.clone();
+
             // Skeleton-only measurement path: grow the skeleton to the full
             // union with no blob traffic, no delta, no sealing; report its
             // exact heap footprint at the end.
@@ -273,7 +302,7 @@ impl LaneStore {
 
             // Reverse chain record for this revision (O(changed) — reads only
             // the changed subtrees). Removals are holes.
-            let rev = enc.advance(&trans, &mut objs)?;
+            let rev = enc.advance(&trans, &mut objs, &prev_live, &new_live)?;
             for &d in &dying_at[i] {
                 lane_tree[d as usize] = None;
             }
@@ -283,7 +312,7 @@ impl LaneStore {
             // delta against the skeleton's heap footprint at a checkpoint.
             if std::env::var("GITDEPOT_MEASURE").is_ok() && i == 20000 {
                 let delta_bytes = codec::encode(&rev).len();
-                let raw = codec::encode(&enc.full(&mut objs)?);
+                let raw = codec::encode(&enc.full(&mut objs, &new_live)?);
                 let zstd = compress_frame(&raw, None, level).map(|c| c.len()).unwrap_or(0);
                 let (nodes, slots, heap, mallocs) = enc.mem_report();
                 return Err(Error::Chain(format!(
@@ -298,7 +327,7 @@ impl LaneStore {
             if i == 0 {
                 // Seed f0 with the positive full-state (all `Set`, no
                 // removals — a full record from nothing).
-                let f0raw = codec::encode(&enc.full(&mut objs)?);
+                let f0raw = codec::encode(&enc.full(&mut objs, &new_live)?);
                 let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
                 depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
             } else {
@@ -308,9 +337,9 @@ impl LaneStore {
             }
             // Materialize the union full-state ONLY at a seal boundary (not
             // per commit); it is the positive head the batch's reverse
-            // records anchor on.
+            // records anchor on. `live` here is the newest revision's live set.
             if !batch.is_empty() && batch_bytes >= batch_bound {
-                let head = codec::encode(&enc.full(&mut objs)?);
+                let head = codec::encode(&enc.full(&mut objs, &live)?);
                 let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
                 seal_prepend(&depot, &head, &staged, level)?;
                 batch_bytes = 0;
@@ -318,7 +347,7 @@ impl LaneStore {
             }
         }
         if !batch.is_empty() {
-            let head = codec::encode(&enc.full(&mut objs)?);
+            let head = codec::encode(&enc.full(&mut objs, &live)?);
             let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
             seal_prepend(&depot, &head, &staged, level)?;
         }
