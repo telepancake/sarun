@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Thu, 09 Jul 2026 20:19:13 +0000
+Subject: [PATCH] bootstrap: set MAKE_HOST and advertise jobserver in .FEATURES
+
+---
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index d30b6dd..a99d73d 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -60,6 +60,12 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>>
+     // sarun: upstream pins 4.2.1 for Android-build stability; we declared
+     // GNU make 4.3 (Ubuntu 22.04 LTS) as our compat target, so report that.
+     bootstrap.put_slice(b"MAKE_VERSION?=4.3\n");
++    // sarun: GNU make also reports the triple it was built for. Vendor/SDK
++    // Makefiles derive arch-keyed include paths from MAKE_HOST; an empty
++    // value makes those `-include`s resolve to nothing and prerequisite
++    // lists vanish silently. `?=` keeps GNU origin precedence (env wins).
++    bootstrap.put_slice(
++        format!("MAKE_HOST?={}-pc-linux-gnu\n", std::env::consts::ARCH).as_bytes());
+     // sarun: MAKELEVEL tracks recursion depth across sub-makes. Real make
+     // reads it from the environment (default 0), reports it via $(MAKELEVEL),
+     // and bumps it by 1 in every recipe environment so child make
+@@ -81,7 +87,7 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>>
+     // output is corpus-comparable.
+     bootstrap.put_slice(
+         b".FEATURES?=target-specific order-only second-expansion else-if \
+-          shortest-stem undefine oneshell\n",
++          shortest-stem undefine oneshell jobserver\n",
+     );
+ 
+     if !FLAGS.no_builtin_rules {

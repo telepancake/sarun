@@ -157,6 +157,14 @@ fn read_bootstrap_makefile(
     // sarun: report GNU make 4.3 (matches our compat target); Makefiles
     // gated on `ifeq ($(MAKE_VERSION),4.x)` see what they expect.
     bootstrap.put_slice(b"MAKE_VERSION?=4.3\n");
+    // sarun: GNU make also reports the triple it was built for. Vendor/SDK
+    // Makefiles derive arch- and OS-keyed paths from it (e.g. `include
+    // mk/$(word 1,$(subst -, ,$(MAKE_HOST))).mk`) — with MAKE_HOST empty
+    // those includes resolve to nothing and whole prerequisite lists vanish
+    // SILENTLY (`-include mk/.mk` is not an error). `?=` mirrors GNU
+    // origin precedence: an env-seeded value wins over this default.
+    bootstrap.put_slice(
+        format!("MAKE_HOST?={}-pc-linux-gnu\n", std::env::consts::ARCH).as_bytes());
     // sarun: MAKELEVEL tracks recursion across sub-makes. The caller passes
     // the level from the make's OWN inherited environment (seed_env) — many
     // in-process makes share one process env, so reading std::env here gave
@@ -173,9 +181,12 @@ fn read_bootstrap_makefile(
     // matching, order-only prerequisites — so advertise them; anything kati
     // doesn't actually implement would surface as its own visible error
     // elsewhere, not silently no-op because of a missing .FEATURES token.
+    // `jobserver` is real here too: jobserver.rs advertises the engine's
+    // slip pool into MAKEFLAGS, so builds gating their parallel plumbing on
+    // $(filter jobserver,$(.FEATURES)) get the coordinated path.
     bootstrap.put_slice(
         b".FEATURES?=target-specific order-only second-expansion else-if \
-          shortest-stem undefine oneshell\n",
+          shortest-stem undefine oneshell jobserver\n",
     );
     if !no_builtin_rules {
         bootstrap.put_slice(b".c.o:\n");
