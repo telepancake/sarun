@@ -32,10 +32,12 @@ fn is_call_site(line: &str, name: &str) -> bool {
 
 /// D4 — the parallel union/delta encoder in `layer.rs`
 /// (`encode_union`/`delta_multi_lane*`/`encode_lane`/`delta_single_lane`/
-/// `visit_current`) is dead: the live encoder is `oidenc.rs` + `reslot.rs`.
-/// Its only callers must live inside `#[cfg(test)]`; the moment production code
-/// depends on it again, the two encoders have diverged silently (DESIGN §6 —
-/// the freed-slot / most-lanes reslot rule lives only in `reslot.rs`).
+/// `visit_current`) was a second, DEAD implementation of the whole encode/delta
+/// path, kept green only by its own unit tests while diverging from DESIGN §6
+/// (the freed-slot / most-lanes reslot rule lives only in `reslot.rs`). It has
+/// been removed; the live encoder is `oidenc.rs` + `reslot.rs`. These names must
+/// never reappear as functions — a reintroduction is a second encoder drifting
+/// out of sync with the shipped one, which is exactly what D4 was.
 const DEAD_ENCODER_FAMILY: &[&str] = &[
     "encode_lane",
     "delta_single_lane",
@@ -47,44 +49,46 @@ const DEAD_ENCODER_FAMILY: &[&str] = &[
     "visit_current",
 ];
 
+/// Every gitdepot source file (the removed encoder must be gone from all of
+/// them, not merely uncalled).
+const SRC_FILES: &[&str] = &[
+    "src/layer.rs", "src/oidenc.rs", "src/reslot.rs", "src/lanestore.rs",
+    "src/store.rs", "src/readout.rs", "src/lib.rs", "src/cli.rs", "src/lanes.rs",
+];
+
 #[test]
-fn dead_layer_encoder_has_no_caller_outside_layer_rs() {
-    // No production module may reference the parallel encoder family. The live
-    // path imports only the §2 name codec + reconstruction helpers from layer.
-    for rel in ["src/oidenc.rs", "src/reslot.rs", "src/lanestore.rs", "src/store.rs",
-                "src/readout.rs", "src/lib.rs", "src/cli.rs", "src/lanes.rs"] {
+fn dead_layer_encoder_family_is_removed_not_defined_anywhere() {
+    // The strongest form of the D4 fix: not "dead but present", but gone. No
+    // source file may DEFINE any of the family — the live path is oidenc+reslot.
+    for rel in SRC_FILES {
         let src = read(rel);
-        for (i, line) in src.lines().enumerate() {
-            for name in DEAD_ENCODER_FAMILY {
-                assert!(
-                    !is_call_site(line, name),
-                    "{rel}:{} references dead layer.rs encoder `{name}` — the live \
-                     encoder is oidenc.rs+reslot.rs (DESIGN §6). If this is a real \
-                     new dependency the dead family must be revived deliberately, \
-                     not leaned on.\n  {}",
-                    i + 1,
-                    line.trim(),
-                );
-            }
+        for name in DEAD_ENCODER_FAMILY {
+            assert!(
+                !src.contains(&format!("fn {name}")),
+                "{rel} re-defines removed encoder `{name}` — the DESIGN §6 encoder \
+                 is oidenc.rs+reslot.rs; a second one drifts out of sync (D4)."
+            );
         }
     }
 }
 
 #[test]
-fn dead_layer_encoder_is_reached_only_from_within_layer_rs() {
-    // Inside layer.rs the family calls itself (one entry point delegates to the
-    // next) and is exercised by the `#[cfg(test)]` module — that is expected and
-    // is the whole point of D4: it is *only* reached from there. The guard that
-    // matters is the cross-file one above; here we just pin that the family is
-    // still self-contained in layer.rs and every public name still exists, so a
-    // silent rename can't quietly slip the guard.
-    let src = read("src/layer.rs");
-    for name in DEAD_ENCODER_FAMILY {
-        assert!(
-            src.contains(&format!("fn {name}")),
-            "layer.rs no longer defines `{name}` — update DEAD_ENCODER_FAMILY so \
-             the cross-file guard keeps matching the real symbols."
-        );
+fn dead_layer_encoder_family_has_no_caller() {
+    // Belt-and-braces: even a call to one of these names (e.g. via a re-added
+    // `pub use`) is forbidden across the whole crate.
+    for rel in SRC_FILES {
+        let src = read(rel);
+        for (i, line) in src.lines().enumerate() {
+            for name in DEAD_ENCODER_FAMILY {
+                assert!(
+                    !is_call_site(line, name),
+                    "{rel}:{} references removed encoder `{name}` — the live encoder \
+                     is oidenc.rs+reslot.rs (DESIGN §6).\n  {}",
+                    i + 1,
+                    line.trim(),
+                );
+            }
+        }
     }
 }
 
