@@ -1,39 +1,31 @@
-//! Store — four tiered chains + stable indices (ATTACH-CONVERGENCE.md
-//! chip 7, design of record 2026-07-06).
+//! Store — the three repo-global chains + stable indices.
 //!
-//! `<store>/depot/`      — ONE wikimak-depot instance holding four chains:
-//!                         TREES=0, COMMITS=1, REFLOG=2, TAGS=3.
-//! `<store>/meta.sqlite` — bookkeeping (WAL): `kv` (schema=6, label, url,
-//!                         n_trees/n_commits/n_reflog/n_tags counts — the
-//!                         AUTHORITATIVE index base), `refs` (CURRENT refs
-//!                         only: name → nullable commit_idx, tree_idx,
-//!                         plus a nullable tag_idx: tag_idx NULL =
-//!                         branch/lightweight tag; set = the ref is an
-//!                         annotated tag and commit_idx/tree_idx are its
-//!                         PEELED commit — name resolution and attach
-//!                         stay peeled. commit_idx NULL = the tag peels
-//!                         to a TREE (tag_idx set, tree_idx = the tagged
-//!                         tree; there is no commit to resolve to).
-//!                         NOTHING
-//!                         else: every id-keyed lookup derives from the
-//!                         chains on demand. sha → idx is an in-RAM map
-//!                         built by ONE object-level walk of the COMMITS
-//!                         chain, cached for the life of the open Store
-//!                         handle (one walk per mirror-tick process); a
-//!                         ref-NAME attach is a refs point-read plus a
-//!                         tip-biased object fetch — it never builds the
-//!                         map; a sha attach walks once per process.
+//! Tree state is NOT here. The mirror IS the union (DESIGN §1): every live
+//! lane's tree is held in the `LaneStore` union depot under `<store>/trees/`
+//! (its own `depot/` + `meta.sqlite`), reached via `Store::union()` and read by
+//! `readout.rs`. There is no per-commit tree chain and no reverse-delta-per-tree
+//! record. This module owns only the repo-global streams.
 //!
-//! Tree dedup at ingest is (1) an in-RAM git-tree-oid → tree_idx map
-//! scoped to the Ingest and (2) reuse of the parent's tree_idx when the
-//! incoming commit's tree oid equals a parent's (empty/metadata
-//! commits — the dominant case; oid equality ⇔ canonical-view equality
-//! here because no tree node is cooked: modes verbatim as attrs, blobs
-//! as-is, gitlink oids as blobs). A tree bit-identical to a DISTANT
-//! ancestor (revert) is deliberately NOT deduped: it costs one ordinary
-//! reverse-delta record sized by the actual change, which beats
-//! carrying a persistent all-history oid index (100+MB at linux
-//! scale) for the rare revert.
+//! `<store>/depot/`      — ONE wikimak-depot instance holding THREE chains:
+//!                         COMMITS=0, REFLOG=1, TAGS=2.
+//! `<store>/meta.sqlite` — bookkeeping (WAL): `kv` (schema, label, url,
+//!                         n_commits/n_reflog/n_tags counts — the AUTHORITATIVE
+//!                         index base), `refs` (CURRENT refs only: name →
+//!                         nullable commit_idx, tree_idx (the ref's tree as a
+//!                         stable index into the union store), plus a nullable
+//!                         tag_idx: tag_idx NULL = branch/lightweight tag; set =
+//!                         the ref is an annotated tag and commit_idx/tree_idx
+//!                         are its PEELED commit — name resolution and attach
+//!                         stay peeled. commit_idx NULL = the tag peels to a TREE
+//!                         (tag_idx set, tree_idx = the tagged tree; there is no
+//!                         commit to resolve to). NOTHING else: every id-keyed
+//!                         lookup derives from the chains on demand. sha → idx is
+//!                         an in-RAM map built by ONE object-level walk of the
+//!                         COMMITS chain, cached for the life of the open Store
+//!                         handle (one walk per mirror-tick process); a ref-NAME
+//!                         attach is a refs point-read plus a tip-biased object
+//!                         fetch — it never builds the map; a sha attach walks
+//!                         once per process.
 //!
 //! **Stable indices**: records are numbered from the OLDEST end. Record k
 //! of a chain whose kv count is N sits at newest-first walk position
@@ -58,18 +50,6 @@
 //!     chain; RAM and disk stay bounded by STREAMING the frame codec
 //!     (encode and decode), never by mid-ingest chunking.
 //!
-//! TREES chain records are REVERSE DELTAS: only the head (f0) record is
-//! the full layer `codec::encode(diff(None, head_view))`; record k < head
-//! is `codec::encode(diff(Some(view_{k+1}), Some(view_k)))` — the delta
-//! that rebuilds the older tree from the next-newer one. On prepend the
-//! former head's full record is REPLACED in the accumulator by its bridge
-//! delta. Cold-frame anchors for TREES are the canonical full-view bytes
-//! at the frame boundary, recomputed by the decoder from the walked view
-//! (bit-exact canonical encoding is load-bearing — encoder and decoder
-//! share `codec::encode(diff(None, view))`). Fetching tree k therefore
-//! walks head→k applying deltas (O(distance from tip)); the tip itself is
-//! one standalone frame.
-//!
 //! COMMITS/REFLOG/TAGS chain records are BATCHES: one record per
 //! ingest (an update's new commits, one ref transaction), never split
 //! by the seal threshold — sealing stays a per-prepend decision on
@@ -85,14 +65,10 @@
 //! TAGS chain objects are annotated-tag objects: `{sha, target, raw}` —
 //! `target` is the FULLY-PEELED end of the tag chain as a stable index,
 //! either a COMMITS index or (for a tag at a tree, the linux
-//! v2.6.11-tree shape) a TREES index (for a nested chain EVERY tag
+//! v2.6.11-tree shape) a union tree index (for a nested chain EVERY tag
 //! object is stored, inner tags at lower indices so export can write
 //! deepest-first, each with the final target's index; the intermediate
-//! target sha lives inside `raw` anyway). A tagged tree that equals
-//! some commit's root tree reuses that commit's TREES record; a
-//! genuinely standalone tagged tree is imported as an ordinary TREES
-//! record and its reverse delta anchors like any other record (chain
-//! position = wherever the ingest lands it). `raw` is the COMPLETE raw
+//! target sha lives inside `raw` anyway). `raw` is the COMPLETE raw
 //! tag object (header + message + signature verbatim) — the
 //! export-fidelity payload, same rationale as commit records. Tags
 //! whose peel ends at a BLOB are refused at import (a named
@@ -105,11 +81,9 @@
 //! the head batch of each non-empty chain must cover exactly up to
 //! count-1 or the store errors loudly (a crash between depot flush and
 //! sqlite commit can leave orphan newer frames — detected, not
-//! auto-repaired). TREES records are pure codec bytes (they double as
-//! refPrefix anchors), so the trees chain is cross-checked through the
-//! head commit's tree_idx bound and verified in depth by any walk.
+//! auto-repaired).
 //!
-//! There is exactly ONE on-disk format: kv schema=6. A store written by
+//! There is exactly ONE on-disk format, keyed by kv schema. A store written by
 //! older code errors loudly on open — delete and re-import; mirrors are
 //! rebuildable.
 
@@ -121,11 +95,13 @@ use wikimak_depot::{Depot, DepotConfig};
 
 use crate::{CommitMeta, Error, Meta, RefMeta, Result};
 
-pub const TREES: u64 = 0;
-pub const COMMITS: u64 = 1;
-pub const REFLOG: u64 = 2;
-pub const TAGS: u64 = 3;
-const MAX_CHAIN_ID: u64 = 4;
+// The mirror IS the union (DESIGN §1): tree state lives in the LaneStore union
+// depot (`<store>/trees/`), NOT in a per-commit reverse-delta chain. There is no
+// TREES chain — only the three repo-global streams below.
+pub const COMMITS: u64 = 0;
+pub const REFLOG: u64 = 1;
+pub const TAGS: u64 = 2;
+const MAX_CHAIN_ID: u64 = 3;
 
 /// Raw (decompressed) f1 accumulator seal point, per chain.
 /// Test-overridable via GITDEPOT_TEST_SEAL (bytes) so tests can
@@ -185,7 +161,7 @@ pub fn store_exists(store: &Path) -> bool {
 
 /// The one supported on-disk format. Anything else on open = loud
 /// error (unreleased software: no migrations, mirrors are rebuildable).
-const SCHEMA_VERSION: &str = "7";
+const SCHEMA_VERSION: &str = "8";
 
 fn configure(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(sql_err)
@@ -619,7 +595,6 @@ impl Store {
             ("schema", SCHEMA_VERSION),
             ("label", ""),
             ("url", ""),
-            ("n_trees", "0"),
             ("n_commits", "0"),
             ("n_reflog", "0"),
             ("n_tags", "0"),
@@ -1170,7 +1145,6 @@ impl Store {
 
 fn count_key(chain: u64) -> &'static str {
     match chain {
-        TREES => "n_trees",
         COMMITS => "n_commits",
         REFLOG => "n_reflog",
         TAGS => "n_tags",

@@ -63,7 +63,7 @@ fn frames(store: &Path, chain: u64) -> (bool, bool, Vec<Vec<u8>>) {
     // must be dropped before this opens the depot directly.
     let depot = Depot::open(DepotConfig {
         root: store.join("depot"),
-        max_chain_id: 4,
+        max_chain_id: 3,
         file_size_threshold: 4 << 20,
         eviction_dead_ratio: 0.5,
     })

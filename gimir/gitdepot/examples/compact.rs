@@ -7,7 +7,7 @@ fn main() {
     let store = std::path::PathBuf::from(std::env::args().nth(1).expect("store path"));
     let depot = wikimak_depot::Depot::open(wikimak_depot::DepotConfig {
         root: store.join("depot"),
-        max_chain_id: 4,
+        max_chain_id: 3,
         file_size_threshold: 4 << 20,
         eviction_dead_ratio: 0.5,
     })

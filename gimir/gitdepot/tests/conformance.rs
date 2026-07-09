@@ -93,13 +93,22 @@ fn dead_layer_encoder_family_has_no_caller() {
 }
 
 /// D1 — the reverse-delta-per-commit `TREES` chain was replaced by the union
-/// (DESIGN §1: "the mirror IS the union"). The `treecheck` example was the last
-/// fossil calling the removed `Store::tree_view(s)` / `CommitRecord::tree_idx`
-/// reconstruction API; it must stay gone so the build cannot resurrect it.
+/// (DESIGN §1: "the mirror IS the union"). Trees live in the LaneStore union
+/// depot under `<store>/trees/`; `store.rs` owns only COMMITS/REFLOG/TAGS. The
+/// dead chain, its constant, its phantom count, and the reconstruction fossils
+/// must all stay gone so the build cannot resurrect the replaced architecture.
 #[test]
-fn removed_trees_chain_reconstruction_api_stays_removed() {
+fn removed_trees_chain_stays_removed() {
     let store = read("src/store.rs");
-    // The reverse-delta reconstruction *methods* the fossil depended on.
+    // The dead chain-0 constant and its never-updated count key.
+    for gone in ["pub const TREES", "\"n_trees\"", "n_trees"] {
+        assert!(
+            !store.contains(gone),
+            "store.rs resurrects the dead TREES chain (`{gone}`) — tree state is \
+             the union under <store>/trees/, not a per-commit chain (DESIGN §1)."
+        );
+    }
+    // The reverse-delta reconstruction *methods* the fossil examples depended on.
     for gone in ["fn tree_view", "fn tree_views"] {
         assert!(
             !store.contains(gone),
@@ -107,8 +116,16 @@ fn removed_trees_chain_reconstruction_api_stays_removed() {
              reconstruction removed with the union switch (DESIGN §1)."
         );
     }
+    // The three-chain depot: exactly COMMITS/REFLOG/TAGS, no reserved 4th slot.
     assert!(
-        !Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/treecheck.rs").exists(),
-        "examples/treecheck.rs is back — it is a fossil of the removed TREES chain."
+        store.contains("const MAX_CHAIN_ID: u64 = 3"),
+        "store.rs no longer bounds the depot to 3 chains — a 4th reserved slot is \
+         the dead TREES chain (DESIGN §1)."
     );
+    for fossil in ["examples/treecheck.rs", "examples/verify.rs", "examples/dump.rs"] {
+        assert!(
+            !Path::new(env!("CARGO_MANIFEST_DIR")).join(fossil).exists(),
+            "{fossil} is back — it is a fossil of the removed TREES chain."
+        );
+    }
 }
