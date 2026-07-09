@@ -886,8 +886,143 @@ impl Drop for LogStream {
 /// revive as a live node that removes the blob and the file's attrs);
 /// dir→file = D's of the children + A of the path (a leaf set on a
 /// node that also carries child tombstones — composes as-is).
-fn delta_layer(changes: &[RawChange], cat: &mut CatFile) -> Result<Layer> {
+/// Parse a raw git tree object body into `(name, mode_bytes, hex_oid,
+/// is_tree)` entries. The mode is taken VERBATIM from the object bytes —
+/// git's `diff-tree`/`ls-tree` normalize non-canonical historical modes
+/// (e.g. `100664` → `100644`), which silently breaks SHA-exactness on the
+/// trees that carry them (git.git's earliest ten days). The raw tree body
+/// is the only mode-faithful source, and §11 guarantees the encoder holds
+/// those exact tree bytes.
+fn parse_tree_obj(bytes: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>, String, bool)>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let sp = bytes[i..]
+            .iter()
+            .position(|&b| b == b' ')
+            .map(|p| p + i)
+            .ok_or_else(|| Error::Git("tree obj: no mode/name sep".into()))?;
+        let mode = bytes[i..sp].to_vec();
+        let nul = bytes[sp + 1..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| p + sp + 1)
+            .ok_or_else(|| Error::Git("tree obj: unterminated name".into()))?;
+        let name = bytes[sp + 1..nul].to_vec();
+        if nul + 21 > bytes.len() {
+            return Err(Error::Git("tree obj: truncated oid".into()));
+        }
+        let oid = hex::encode(&bytes[nul + 1..nul + 21]);
+        let is_tree = mode == b"40000";
+        out.push((name, mode, oid, is_tree));
+        i = nul + 21;
+    }
+    Ok(out)
+}
+
+/// Exact (mode-faithful) mode bytes for `path` within the tree rooted at
+/// `root_tree_oid`, by walking raw tree objects along the path. `cache`
+/// memoizes parsed tree bodies by oid so paths sharing a directory prefix
+/// (the common case in one commit's changeset) parse each subtree once.
+/// Returns `None` if the path is absent (caller falls back to the
+/// diff-tree mode — e.g. a tree that could not be read).
+type TreeCache = std::collections::HashMap<String, Vec<(Vec<u8>, Vec<u8>, String, bool)>>;
+fn exact_mode(
+    cat: &mut CatFile,
+    cache: &mut TreeCache,
+    root_tree_oid: &str,
+    path: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let comps: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+    let mut cur = root_tree_oid.to_string();
+    for (i, comp) in comps.iter().enumerate() {
+        if !cache.contains_key(&cur) {
+            let body = match cat.get(&cur) {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            };
+            cache.insert(cur.clone(), parse_tree_obj(&body)?);
+        }
+        let entries = &cache[&cur];
+        let Some((_, mode, oid, is_tree)) = entries.iter().find(|(n, ..)| n == comp) else {
+            return Ok(None);
+        };
+        if i + 1 == comps.len() {
+            return Ok(Some(mode.clone()));
+        }
+        if !is_tree {
+            return Ok(None);
+        }
+        cur = oid.clone();
+    }
+    Ok(None)
+}
+
+/// Mode-only changes between two trees that `diff-tree` cannot see: it
+/// normalizes modes (`100664`→`100644`), so a commit that only flips a
+/// file's permission bits (git.git's early history did this en masse)
+/// produces NO diff-tree entry, and the stale inherited mode would leak
+/// into a tree that must reconstruct with the new mode. We recover them by
+/// a lockstep walk of the raw parent/child tree objects, pruned by subtree
+/// oid (O(changed)): an identical subtree oid means every mode underneath
+/// is already correct, so it is skipped. Emitted as synthetic `M` changes
+/// (delta_layer re-derives the exact mode from the child tree).
+fn mode_only_changes(
+    cat: &mut CatFile,
+    cache: &mut TreeCache,
+    parent_tree: &str,
+    child_tree: &str,
+    prefix: &[u8],
+    out: &mut Vec<RawChange>,
+) -> Result<()> {
+    if parent_tree == child_tree {
+        return Ok(());
+    }
+    let read = |cat: &mut CatFile, cache: &mut TreeCache, oid: &str| -> Result<()> {
+        if !cache.contains_key(oid) {
+            let body = cat.get(oid)?;
+            cache.insert(oid.to_string(), parse_tree_obj(&body)?);
+        }
+        Ok(())
+    };
+    read(cat, cache, parent_tree)?;
+    read(cat, cache, child_tree)?;
+    let pents = cache[parent_tree].clone();
+    let cents = cache[child_tree].clone();
+    let pmap: std::collections::HashMap<&Vec<u8>, &(Vec<u8>, Vec<u8>, String, bool)> =
+        pents.iter().map(|e| (&e.0, e)).collect();
+    for c in &cents {
+        let (name, cmode, coid, cis_tree) = c;
+        let Some(p) = pmap.get(name) else { continue };
+        let (_, pmode, poid, pis_tree) = *p;
+        let mut path = prefix.to_vec();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(name);
+        if *cis_tree && *pis_tree {
+            if poid != coid {
+                mode_only_changes(cat, cache, poid, coid, &path, out)?;
+            }
+        } else if !*cis_tree && !*pis_tree && poid == coid && pmode != cmode {
+            // Same file, same content (blob oid), mode changed only — the
+            // exact case diff-tree hides. (A blob-oid difference is a real
+            // content change already carried by diff-tree, mode included.)
+            out.push(RawChange {
+                status: b'M',
+                new_mode: String::from_utf8_lossy(cmode).into_owned(),
+                old_oid: poid.clone(),
+                new_oid: coid.clone(),
+                path,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn delta_layer(changes: &[RawChange], new_tree_oid: &str, cat: &mut CatFile) -> Result<Layer> {
     let mut root = Node::keep();
+    let mut tcache: TreeCache = std::collections::HashMap::new();
     for ch in changes {
         let mut node = &mut root;
         let mut segs = ch.path.split(|&b| b == b'/').peekable();
@@ -918,7 +1053,11 @@ fn delta_layer(changes: &[RawChange], cat: &mut CatFile) -> Result<Layer> {
                         node.attrs = Some(Attrs::new());
                     }
                 } else {
-                    let content = if ch.new_mode == "160000" {
+                    // Mode from the raw tree object (mode-faithful), not
+                    // diff-tree (which normalizes 100664 → 100644 and so on).
+                    let mode = exact_mode(cat, &mut tcache, new_tree_oid, &ch.path)?
+                        .unwrap_or_else(|| ch.new_mode.clone().into_bytes());
+                    let content = if mode == b"160000" {
                         // gitlink: the pinned commit id IS the source data.
                         ch.new_oid.clone().into_bytes()
                     } else {
@@ -926,10 +1065,7 @@ fn delta_layer(changes: &[RawChange], cat: &mut CatFile) -> Result<Layer> {
                     };
                     node.presence = depot::Presence::Live;
                     node.blob = BlobOp::Set(content.into());
-                    node.attrs = Some(Attrs::from([(
-                        b"mode".to_vec(),
-                        ch.new_mode.clone().into_bytes(),
-                    )]));
+                    node.attrs = Some(Attrs::from([(b"mode".to_vec(), mode)]));
                 }
             }
         }
@@ -1387,6 +1523,18 @@ fn frontier_walk(
         let raw = cat.get(&sha)?;
         let (mut cm, tree_oid) = parse_commit(&raw)?;
         cm.sha = sha.clone();
+        // Recover mode-only changes diff-tree normalizes away (see
+        // `mode_only_changes`), by diffing the first parent's raw tree
+        // against this commit's, pruned by subtree oid.
+        let mut changes = changes;
+        if let Some(p1) = cm.parents.first() {
+            let praw = cat.get(p1)?;
+            let (_, parent_tree) = parse_commit(&praw)?;
+            let mut mcache: TreeCache = std::collections::HashMap::new();
+            let mut extra = Vec::new();
+            mode_only_changes(&mut cat, &mut mcache, &parent_tree, &tree_oid, b"", &mut extra)?;
+            changes.extend(extra);
+        }
         // Base = FIRST parent's view AND oid multiset (the raw delta is vs
         // the first parent); other parents only release their frontier refs.
         // A root starts from an empty view and an empty multiset.
@@ -1400,7 +1548,7 @@ fn frontier_walk(
                 (Some(base), base_oids)
             }
         };
-        depot::apply_mut(&mut view, &delta_layer(&changes, &mut cat)?);
+        depot::apply_mut(&mut view, &delta_layer(&changes, &tree_oid, &mut cat)?);
         // Maintain the git-oid multiset alongside the view — first parent's
         // set with this commit's changes applied. Skipped entirely (empty
         // set flows through) when the sink does not need it, so the shipped
@@ -1677,6 +1825,15 @@ fn git_obj_oid(typ: &str, body: &[u8]) -> String {
 /// objects. Entry order is git's: byte order with directory names
 /// compared as `name/`; directory mode is `40000` (tree objects carry
 /// no leading zero).
+/// Public, mode-faithful git tree oid of a reconstructed view — the raw
+/// `mode` attr bytes are serialized verbatim (so non-canonical historical
+/// modes such as `100664` reproduce exactly). Exposed for verification
+/// tooling that must not go through `layer::Mode` (whose canonical enum
+/// cannot represent those modes).
+pub fn git_tree_oid_of_view(view: &depot::View) -> Result<String> {
+    view_tree_oid(view)
+}
+
 fn view_tree_oid(view: &depot::View) -> Result<String> {
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (sortkey, raw entry)
     for (name, child) in &view.children {
