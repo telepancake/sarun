@@ -80,14 +80,13 @@ Encoding invariants:
 
 Everything internal is walked in a single order: the codec's bytewise order over
 the clean node names above (`container_cmp`). The union is walked in one pass in
-this order and never re-sorted. The git trees the mirror diffs against are tiny
-and cached by oid; they are yielded in this same order (sorted once, at cache
-insertion), so the diff iterators and the stored union share one order.
+this order and never re-sorted.
 
-The mirror never re-serializes a tree into git's own `base_name_compare` order.
-The bit-exact tree bytes for the boundary commits come straight from the remote
-(§11), so no local git-order reserialization is ever needed. Node names stay
-clean — the order lives in the comparator, never as a byte baked into a name.
+The git trees the mirror diffs against are reordered into this order when they
+are loaded into the tree-object cache, so every iteration over them is already in
+the one order — the sort happens once per object, on load, and is free on reuse.
+The loading context knows a tree object's full path, so a blob's shard (§9) is
+assigned during that same cache load.
 
 ---
 
@@ -165,8 +164,12 @@ blob object ids from the lane trees — no content bytes:
   hashing stored content.
 - a variant whose `(mode, object id)` still exists keeps its slot; if only its
   lane membership changed, emit a bitmap update.
-- a new `(mode, object id)` takes the **smallest free slot** and stores the full
-  blob content (fetched by object id). A vanished variant frees its slot.
+- a new `(mode, object id)` is placed into a **freed slot** — one whose old
+  variant just vanished — choosing the freed slot it shares the **most lanes**
+  with, on the heuristic that it is an in-place edit of that slot's former file,
+  so the slot key stays put. If no freed slot fits, it takes the smallest free
+  slot. It stores the full blob content, fetched by object id.
+- a vanished variant with no successor frees its slot.
 
 A variant always holds the full blob content; slots are arbitrary small numbers
 whose only job is to be a stable key across revisions.
@@ -182,6 +185,10 @@ newest tree is read directly, and an older tree is reconstructed by applying
 reverse deltas from newer toward older through the stack/overlay machinery (§5).
 Reconstruction never walks deltas forward to rebuild the newest tree. New content
 is fetched by object id; the reverse side takes the older content by object id.
+
+An update re-creates the previous f0 as a delta layer by the same mechanism as
+any other older layer. The previous f0 is then discarded — an update never reads
+it again except as the refPrefix used to unpack the f1 it prepends to.
 
 ---
 
@@ -271,11 +278,6 @@ the older ones plus the previous f0 and f1 content as deltas against the newest
 tree, once, without repeating f0/f1 per tree. The seal/retire decision is made
 after a prepend, never during, and never forces splitting a batch; frames are
 kept as large as practical so huge f1 frames are not repeatedly recompressed.
-
-**Derived, not stored.** A sha → index map is built by one walk of the commits
-chain and cached for the life of the open handle; it is discardable and cheaply
-re-derived. Tree identity uses tree **indices** (already stored in refs, learned
-at import), not saved tree ids. There is no schema/migration scaffolding.
 
 ---
 
