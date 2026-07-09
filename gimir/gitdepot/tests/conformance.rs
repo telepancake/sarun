@@ -53,7 +53,7 @@ const DEAD_ENCODER_FAMILY: &[&str] = &[
 /// them, not merely uncalled).
 const SRC_FILES: &[&str] = &[
     "src/layer.rs", "src/oidenc.rs", "src/reslot.rs", "src/lanestore.rs",
-    "src/store.rs", "src/readout.rs", "src/lib.rs", "src/cli.rs", "src/lanes.rs",
+    "src/store.rs", "src/lib.rs", "src/cli.rs", "src/lanes.rs",
 ];
 
 #[test]

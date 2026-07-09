@@ -30,11 +30,14 @@
 //!
 //! ## Reconstruction
 //!
-//! Walk the chain newest-first, folding each reverse record into the working
-//! view with `apply_mut` (O(delta); over the empty backdrop a removal hole
-//! is resolved as a tombstone). Then [`crate::layer::extract_lane_entries`]
-//! pulls the target revision's lane out of the §2 union bytes — that commit's
-//! git tree. Its git tree oid equals the real object (SHA-exact).
+//! Walk the chain newest-first at the BYTE level: reverse records compose
+//! delta ∘ delta on a geometric stack (the asymptotically right "sum of
+//! deltas" — cost ∝ delta bytes, log depth) and ONE `overlay_full` lands
+//! them on the f0 base at the stop point (holes dissolve). Then
+//! [`crate::layer::extract_lane_entries`] pulls the target revision's lane
+//! out of the §2 union bytes — that commit's git tree. Its git tree oid
+//! equals the real object (SHA-exact). `checkout_entries` streams a
+//! commit's files off that fold with bounded memory.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -689,33 +692,93 @@ impl LaneStore {
         self.sha_to_rev.get(sha).copied()
     }
 
-    /// The reconstructed combined-state View at revision `rev` — walk the
-    /// chain newest-first applying reverse deltas down to it.
-    pub fn combined_at(&self, rev: usize) -> Result<View> {
+    /// The canonical §2 union bytes at revision `rev` — the chain walked
+    /// newest-first down to it, folded at the byte level: records compose
+    /// delta ∘ delta on a geometric stack and ONE overlay lands them on the
+    /// f0 base ([`walk_records_state`]). No View is built; memory is the
+    /// base bytes plus the geometric stack.
+    pub fn union_bytes_at(&self, rev: usize) -> Result<Vec<u8>> {
         if rev >= self.n_rev {
             return Err(Error::Chain(format!("no revision {rev}")));
         }
         let target_pos = self.n_rev - 1 - rev; // newest-first position
-        let mut cur: Option<View> = None;
-        let mut done: Option<View> = None;
-        self.walk_records(&mut |pos, rec| {
-            apply_reverse_record(&mut cur, rec)?;
-            if pos == target_pos {
-                done = Some(cur.clone().unwrap_or_default());
-                return Ok(true);
-            }
-            Ok(false)
-        })?;
-        done.ok_or_else(|| Error::Chain(format!("chain fell short of revision {rev}")))
+        self.walk_records_state(&mut |pos, _| Ok(pos == target_pos))?
+            .ok_or_else(|| Error::Chain(format!("chain fell short of revision {rev}")))
     }
 
     /// Lane `lane`'s flat `(path, mode, content)` entries at revision `rev`,
-    /// extracted from the reconstructed §2 union state via the authoritative
-    /// `layer` extractor (on the canonical union bytes).
+    /// extracted from the reconstructed §2 union bytes via the authoritative
+    /// `layer` extractor.
     pub fn lane_entries_at(&self, rev: usize) -> Result<Vec<(Vec<u8>, crate::layer::Mode, Vec<u8>)>> {
-        let combined = self.combined_at(rev)?;
-        let bytes = codec::encode(&depot::diff(None, Some(&combined)));
+        let bytes = self.union_bytes_at(rev)?;
         crate::layer::extract_lane_entries(&bytes, self.lane_of[rev] as u32).map_err(|e| cf(format!("{e:?}")))
+    }
+
+    /// Stream ONE commit's tree (or the subtree under `subpath`) as flat
+    /// `(path, mode, content)` entries in canonical container order — the
+    /// checkout primitive. Bounded memory: the union at the commit's revision
+    /// is folded once ([`union_bytes_at`]) and walked as bytes; each entry's
+    /// content is a slice into that buffer, never retained. `subpath` empty =
+    /// the whole tree; otherwise entries under it, paths relative to it.
+    pub fn checkout_entries(
+        &self,
+        sha: &str,
+        subpath: &[u8],
+        visit: &mut dyn FnMut(&[u8], crate::layer::Mode, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let rev =
+            self.rev_of(sha).ok_or_else(|| Error::Chain(format!("commit {sha} not in store")))?;
+        self.checkout_entries_at(rev, subpath, visit)
+    }
+
+    /// [`checkout_entries`] addressed by stable revision index instead of a
+    /// commit sha — the entry point for a tag-at-tree ref, whose pin is the
+    /// tag object's sha but whose tree is a revision's.
+    pub fn checkout_entries_at(
+        &self,
+        rev: usize,
+        subpath: &[u8],
+        visit: &mut dyn FnMut(&[u8], crate::layer::Mode, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let bytes = self.union_bytes_at(rev)?;
+        let lane = self.lane_of[rev] as u32;
+        let mut err: Option<Error> = None;
+        crate::layer::visit_entries(&bytes, |e| {
+            if err.is_some() {
+                return;
+            }
+            let inl = match e.bitmap {
+                Some(b) => (b.get((lane / 8) as usize).copied().unwrap_or(0) & (1 << (lane % 8))) != 0,
+                None => true,
+            };
+            if !inl {
+                return;
+            }
+            let rel: &[u8] = if subpath.is_empty() {
+                e.path
+            } else if e.path == subpath {
+                // The subpath names a file: serve it under its own name.
+                match e.path.rsplit(|&b| b == b'/').next() {
+                    Some(base) => base,
+                    None => e.path,
+                }
+            } else if e.path.len() > subpath.len()
+                && e.path.starts_with(subpath)
+                && e.path[subpath.len()] == b'/'
+            {
+                &e.path[subpath.len() + 1..]
+            } else {
+                return; // outside the requested subtree
+            };
+            if let Err(x) = visit(rel, e.mode, e.content) {
+                err = Some(x);
+            }
+        })
+        .map_err(|e| cf(format!("{e:?}")))?;
+        match err {
+            Some(x) => Err(x),
+            None => Ok(()),
+        }
     }
 
     /// The git tree oid of the commit at revision `rev` (reconstructed) — the
@@ -794,90 +857,101 @@ impl LaneStore {
     /// Walk the combined-state chain newest-first, handing each stored
     /// record (raw codec bytes) to `visit(pos, rec)`; `visit` returns true
     /// to stop. f0 is position 0; then the f1 records and every cold frame's
-    /// records in stored order. The records are REVERSE DELTAS (removals as
-    /// holes) folded into the working view with `apply_mut` (O(delta)); a
-    /// cold frame's zstd refPrefix is the canonical full-view bytes at its
-    /// newest boundary, recomputed from the view walked so far. f1 is
-    /// anchored on the f0 record (the newest full-view bytes).
+    /// records in stored order.
     fn walk_records(
         &self,
         visit: &mut dyn FnMut(usize, &[u8]) -> Result<bool>,
     ) -> Result<()> {
+        self.walk_records_state(visit).map(|_| ())
+    }
+
+    /// [`walk_records`], maintaining the working full-state at the BYTE
+    /// level as a base (`refPrefix` bytes, seeded by the f0 record) plus a
+    /// geometric delta stack — the read-side twin of the encoder's §5 state
+    /// and the asymptotically right "sum of deltas": each reverse record
+    /// composes delta ∘ delta on the stack (cost ∝ delta bytes, log depth,
+    /// holes survive), and the full state is touched only where it is
+    /// actually needed — a cold frame's boundary anchor (where the fold also
+    /// reseeds the base, exactly a §5 seal) and the caller's stop point —
+    /// never once per record. Returns the folded full-state bytes at the
+    /// stop point (`None` if the walk ran out without `visit` stopping).
+    /// A cold frame's zstd refPrefix IS that boundary fold, so any
+    /// non-canonical byte in it fails the decompression loudly.
+    fn walk_records_state(
+        &self,
+        visit: &mut dyn FnMut(usize, &[u8]) -> Result<bool>,
+    ) -> Result<Option<Vec<u8>>> {
         let head = match self.depot.read_f0(CHAIN) {
             Ok(frame) => decompress_frame(&frame, None).map_err(cf)?,
-            Err(wikimak_depot::Error::NoFrame) => return Ok(()),
+            Err(wikimak_depot::Error::NoFrame) => return Ok(None),
             Err(e) => return Err(cf(e.to_string())),
         };
-        // The working view is reconstructed only to supply cold-frame
-        // boundary anchors: each record is a reverse delta folded with
-        // `apply_mut` (O(delta), not O(union)). Over the empty backdrop a
-        // removal HOLE means "absent" — exactly a tombstone's effect — so it
-        // is resolved as one. A cold frame's zstd refPrefix is the canonical
-        // full-view bytes at its newest boundary, recomputed from the view.
-        let mut cur: Option<View> = None;
-        apply_reverse_record(&mut cur, &head)?;
+        let mut base = head.clone();
+        let mut stack: crate::geostack::GeoStack<Vec<u8>> = crate::geostack::GeoStack::new();
         let mut pos = 0usize;
         if visit(pos, &head)? {
-            return Ok(());
+            return Ok(Some(base));
         }
         if let Some(f1) = self.depot.read_f1(CHAIN).map_err(|e| cf(e.to_string()))? {
             let mut stopped = false;
             stream_f1_records(&f1, &head, &mut |rec| {
                 pos += 1;
-                apply_reverse_record(&mut cur, rec)?;
+                stack.push(rec.to_vec(), |l| l.len() as u64, compose_bytes);
                 stopped = visit(pos, rec)?;
                 Ok(stopped)
             })?;
             if stopped {
-                return Ok(());
+                return Ok(Some(fold_state(&base, std::mem::take(&mut stack))));
             }
         }
         for cold in self.depot.cold_iter(CHAIN).map_err(|e| cf(e.to_string()))? {
             let frame = cold.map_err(|e| cf(e.to_string()))?;
-            let anchor = codec::encode(&depot::diff(None, cur.as_ref()));
+            // The boundary anchor is the full state here; folding it also
+            // reseeds the base (a §5 seal on the read side).
+            base = fold_state(&base, std::mem::take(&mut stack));
             let mut stopped = false;
-            stream_f1_records(&frame, &anchor, &mut |rec| {
+            stream_f1_records(&frame, &base, &mut |rec| {
                 pos += 1;
-                apply_reverse_record(&mut cur, rec)?;
+                stack.push(rec.to_vec(), |l| l.len() as u64, compose_bytes);
                 stopped = visit(pos, rec)?;
                 Ok(stopped)
             })?;
             if stopped {
-                return Ok(());
+                return Ok(Some(fold_state(&base, std::mem::take(&mut stack))));
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
-/// Fold one reverse-delta record into the working view. Removals in the
-/// record are HOLES (backdrop anchors); over the empty backdrop a hole means
-/// "not present", so it is converted to a tombstone — whose `apply_mut`
-/// effect over any lower view is exactly that removal — keeping the fold
-/// O(delta). (The union never resolves over a non-empty backdrop, where the
-/// two would differ.)
-fn apply_reverse_record(cur: &mut Option<View>, rec: &[u8]) -> Result<()> {
-    let mut layer = codec::decode(rec)?;
-    holes_to_tombstones(&mut layer.root);
-    depot::apply_mut(cur, &layer);
-    Ok(())
+/// delta ∘ delta at the byte level (§4 compose — holes survive).
+fn compose_bytes(lower: Vec<u8>, upper: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::new();
+    depot::stream::compose_stream(&lower, &upper, &mut out)
+        .expect("compose_stream on canonical records");
+    out
 }
 
-/// Recursively rewrite each pure removal hole (a backdrop-anchored
-/// `Keep`/no-attrs/no-children node) to a tombstone. Encoder deltas only
-/// hole at leaves, but the walk is general.
-fn holes_to_tombstones(node: &mut depot::Node) {
-    if node.anchor == depot::Anchor::Backdrop
-        && node.presence == depot::Presence::Live
-        && node.blob == depot::BlobOp::Keep
-        && node.attrs.is_none()
-        && node.children.is_empty()
-    {
-        *node = depot::Node::tombstone();
-        return;
-    }
-    for child in node.children.values_mut() {
-        holes_to_tombstones(child);
+/// The full-state bytes of base + stack: collapse the geometric stack to one
+/// combined delta and overlay it onto the base ONCE (holes dissolve to
+/// removals). An empty stack is the base itself.
+fn fold_state(base: &[u8], stack: crate::geostack::GeoStack<Vec<u8>>) -> Vec<u8> {
+    match stack.collapse(compose_bytes) {
+        None => base.to_vec(),
+        Some(combined) => {
+            let mut out = Vec::new();
+            depot::stream::overlay_full(base, &combined, &mut out)
+                .expect("overlay_full on canonical records");
+            if out.is_empty() {
+                // The union root always exists (§2: an empty node is a real
+                // object). A delta that empties the whole state resolves to
+                // the canonical empty full-state — exactly the writer's
+                // full() bytes for an empty revision, so anchors stay
+                // bit-exact.
+                out = codec::encode(&depot::diff(None, Some(&View::default())));
+            }
+            out
+        }
     }
 }
 

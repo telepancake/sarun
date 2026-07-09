@@ -99,7 +99,8 @@ fn top_level_help() -> &'static str {
        sarun serve                        run the engine headless (no UI)\n  \
        sarun run [FLAGS] [NAME] -- CMD    run CMD in a sandbox box (needs a running engine/UI)\n  \
        sarun <NAME> [apply|discard|rename NEW|patch|stuck]  operate on a box from the CLI\n  \
-       sarun <NAME> attach git|wiki|ietf SRC REF [AT]  attach a mirror object as a read-only reference\n  \
+       sarun <NAME> checkout STORE REF [DEST] [SUB]    check a commit out of a git mirror into the box\n  \
+       sarun <NAME> attach wiki|ietf SRC REF [AT]      attach a mirror object as a read-only reference\n  \
        sarun mirror <ls|add|run|pause|resume|rm> ...   scheduled mirror updates\n  \
        sarun gitdepot|wikimak|ietfmak ...              embedded mirror-driver CLIs\n  \
        sarun verbs [FILTER]               list the engine's UI verbs (args + help)\n  \

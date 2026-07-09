@@ -596,7 +596,9 @@ impl Encoder {
             let mut out = Vec::new();
             depot::stream::overlay_full(&self.refprefix, &combined, &mut out)
                 .expect("overlay_full on canonical state layers");
-            self.refprefix = out;
+            // A stack that empties the whole state resolves to the canonical
+            // empty state, never zero bytes (the root always exists, §2).
+            self.refprefix = if out.is_empty() { empty_state() } else { out };
         }
     }
 }

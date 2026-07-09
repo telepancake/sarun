@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""git_attach (ATTACH-CONVERGENCE.md) against the RUST engine: a git
-ref from a gitdepot mirror store attaches to a box as an EXTERNAL RO
-reference — bookkeeping only, no import, no new at-rest box. The verb
-resolves ref→sha from the store's meta.sqlite, pins it as an Ext row,
-and the overlay serves the tree straight from the store on first read;
-from there DEPOT-DESIGN.md §8 semantics apply.
+"""git_checkout against the RUST engine: the ONE official way to get a
+commit's files into a box is checking them out into the box's CHANGES —
+ordinary captured rows + pool blobs, exactly as if the box had written
+them. The store streams the commit (union folded once at the byte level
+— geometric delta compose + one overlay — then walked as bytes), so
+memory stays bounded; nothing tree-sized stays resident in the engine.
 
-Real-effect assertions (never shape-only):
-  • attach reply carries name+sha, NO box id; box count is unchanged
-  • the served tree shows the NEWEST commit's bytes + exec bits (modes
-    converted) through the mount — no checkout, no working tree
-  • read-through: `cat` of an attached repo file captures its bytes
-  • EROFS: writing an attached repo key fails, leaving no captured row
-  • the attachment shows in the session dict's "attachments" (UI
-    visibility), named git:<label>/<ref>@<sha8>
+The RAM-resident git RO-attachment (TipReadout) is REMOVED: a decoded
+whole-tree View pinned for the attachment's lifetime is not a readout
+over an on-disk image, it is a resident dataset. This test proves the
+replacement semantics:
+
+  • git_checkout reply carries sha+files; NO new box is created
+  • the checkout lands as captured rows: bytes exact, exec mode kept
+  • the box reads the files through the mount like any of its changes
+  • the files are the box's OWN changes — overwriting them SUCCEEDS
+    (the old attachment was EROFS; a checkout is not an attachment)
+  • DEST nests the checkout; SUBPATH checks out a subtree only
+  • the git_attach verb is GONE from the wire (named error, no row)
 
 Needs FUSE + bwrap + git + a built gitdepot (cargo builds it if absent).
 Run:
     uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \\
-      python test_git_attach_rs.py
+      python test_git_checkout_rs.py
 """
 import os, shutil, socket, sqlite3, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -76,14 +80,12 @@ def sh_git(repo, *args):
     return r.stdout
 
 
-def newest_sqlar():
-    return max(Path(os.environ["XDG_STATE_HOME"]).joinpath("slopbox.GAT")
-               .glob("*.sqlar"), key=lambda p: int(p.stem))
+def sqlar_dir():
+    return Path(os.environ["XDG_STATE_HOME"]) / "slopbox.GCO"
 
 
 def sqlar_set():
-    return {p.name for p in Path(os.environ["XDG_STATE_HOME"])
-            .joinpath("slopbox.GAT").glob("*.sqlar")}
+    return {p.name for p in sqlar_dir().glob("*.sqlar")}
 
 
 def rows(sp):
@@ -105,13 +107,13 @@ def row_bytes(m, sp, name):
 
 def main():
     if not ensure_binaries():
-        raise SystemExit("test_git_attach_rs: engine or gitdepot binary "
+        raise SystemExit("test_git_checkout_rs: engine or gitdepot binary "
                          "unavailable — run `make engine` / cargo build")
-    tmp = Path(tempfile.mkdtemp(prefix="gat-"))
+    tmp = Path(tempfile.mkdtemp(prefix="gco-"))
     for k, sub in (("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
                    ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):
         os.environ[k] = str(tmp / sub)
-    os.environ["SLOPBOX_NS"] = "GAT"
+    os.environ["SLOPBOX_NS"] = "GCO"
     m = SourceFileLoader("slopbox", SARUN).load_module()
     m.ensure_dirs()
     eng = None
@@ -128,14 +130,10 @@ def main():
         (repo / "README").write_text("readme v1\n")
         sh_git(repo, "add", "-A")
         sh_git(repo, "commit", "-q", "-m", "v1")
-        # Second commit so the attached ref is provably the NEWEST view.
+        # Second commit so the checked-out ref is provably the NEWEST tree.
         (repo / "README").write_text("readme v2\n")
         sh_git(repo, "add", "-A")
         sh_git(repo, "commit", "-q", "-m", "v2")
-        # A tag at a TREE (the linux v2.6.11-tree shape) — attachable
-        # by name, pinned by the tag's own sha.
-        sh_git(repo, "config", "tag.gpgsign", "false")
-        sh_git(repo, "tag", "-a", "-m", "tree tag", "treetag", "main^{tree}")
         store = tmp / "store"
         r = subprocess.run([str(GITDEPOT), "import", str(repo), str(store)],
                            capture_output=True, text=True)
@@ -149,92 +147,88 @@ def main():
                                + out.decode(errors="replace"))
         sock = m.sock_path()
 
-        # A working box, then attach main under /gitsdk.
+        def sid_of(name):
+            rep = m.sync_request(sock, type="ui", verb="resolve_box",
+                                 args=[name])
+            return int((rep or {}).get("r"))
+
+        # A working box, then check main out under /gitsdk.
         r = subprocess.run([str(BIN), "run", "WORK", "--", "true"],
                            capture_output=True, text=True, timeout=60)
         check(r.returncode == 0, f"setup run exits 0 (rc={r.returncode}: {r.stderr[:200]})")
-        sp = newest_sqlar()
-        sid = int(sp.stem)
+        sid = sid_of("WORK")
+        sp = sqlar_dir() / f"{sid}.sqlar"
         before = sqlar_set()
+
+        # The old attach path is GONE from the wire: a named error, no row.
         rep = m.sync_request(sock, type="ui", verb="git_attach",
                              args=[sid, str(store), "main", "gitsdk"])
-        rr = (rep or {}).get("r", {})
-        check(rr.get("ok") is True, f"git_attach verb succeeds (got {rep!r})")
-        check("box" not in rr, f"reply carries NO box id (got {rr!r})")
-        aname = rr.get("name") or ""
-        sha = rr.get("sha") or ""
-        check(aname.startswith("git:") and "/main@" in aname,
-              f"reply names the attachment repo/ref (got {aname!r})")
-        check(len(sha) == 40 and aname.endswith(sha[:8]),
-              f"reply pins the full sha, name carries sha8 (got {sha!r})")
-        check(sqlar_set() == before,
-              "box count unchanged — reference, not import")
+        gr = (rep or {}).get("r", rep or {})
+        check(gr.get("ok") is not True,
+              f"git_attach verb is gone from the wire (got {rep!r})")
 
-        # The served tree is the NEWEST commit, modes converted, through
-        # the mount (there is no imported box to inspect).
+        rep = m.sync_request(sock, type="ui", verb="git_checkout",
+                             args=[sid, str(store), "main", "gitsdk"])
+        rr = (rep or {}).get("r", {})
+        check(rr.get("ok") is True, f"git_checkout verb succeeds (got {rep!r})")
+        sha = rr.get("sha") or ""
+        check(len(sha) == 40, f"reply pins the full commit sha (got {sha!r})")
+        check(rr.get("files") == 3, f"reply counts the files (got {rr!r})")
+        check(sqlar_set() == before,
+              "no NEW box — the checkout lands in the existing box")
+
+        # The files ARE the box's captured changes: bytes + modes exact.
+        check(row_bytes(m, sp, "gitsdk/README") == b"readme v2\n",
+              "checkout wrote the NEWEST commit's bytes as a captured row")
+        check(row_bytes(m, sp, "gitsdk/sdk/tool.txt") == b"SDK from git\n",
+              "nested file captured with exact bytes")
+        rmode = rows(sp).get("gitsdk/sdk/run.sh", (0, 0, None))[1]
+        check(rmode & 0o111 != 0,
+              f"exec bit survived the git mode conversion (mode {rmode:o})")
+
+        # Served through the mount like any change of the box.
         r = subprocess.run(
             [str(BIN), "run", "WORK", "--", "sh", "-c",
              "cat /gitsdk/README > /readme.txt; "
              "test -x /gitsdk/sdk/run.sh && echo exec > /xbit.txt"],
             capture_output=True, text=True, timeout=60)
         check(r.returncode == 0,
-              f"served-tree probe exits 0 (rc={r.returncode}: {r.stderr[:200]})")
+              f"checked-out tree probe exits 0 (rc={r.returncode}: {r.stderr[:200]})")
         check(row_bytes(m, sp, "readme.txt") == b"readme v2\n",
-              "attachment serves the NEWEST commit's bytes")
+              "box reads the checked-out bytes through the mount")
         check(row_bytes(m, sp, "xbit.txt") == b"exec\n",
-              "executable bit survived the git mode conversion")
+              "exec bit visible in the box")
 
-        # Read-through into the working box's captured layer.
+        # The checkout is the box's OWN change — overwriting SUCCEEDS
+        # (the removed attachment was EROFS; this is not an attachment).
         r = subprocess.run(
             [str(BIN), "run", "WORK", "--",
-             "sh", "-c", "cat /gitsdk/sdk/tool.txt > /copied.txt"],
+             "sh", "-c", "echo mine > /gitsdk/README"],
             capture_output=True, text=True, timeout=60)
         check(r.returncode == 0,
-              f"read of attached git file succeeds (rc={r.returncode}: {r.stderr[:200]})")
-        check(row_bytes(m, sp, "copied.txt") == b"SDK from git\n",
-              "attached bytes read through into a captured row")
+              f"overwriting a checked-out file succeeds (rc={r.returncode}: {r.stderr[:200]})")
+        check(row_bytes(m, sp, "gitsdk/README") == b"mine\n",
+              "the overwrite landed in the box's own row")
 
-        # EROFS on matched keys; no capture side effect.
-        r = subprocess.run(
-            [str(BIN), "run", "WORK", "--",
-             "sh", "-c", "echo overwrite > /gitsdk/README"],
-            capture_output=True, text=True, timeout=60)
-        check(r.returncode != 0, "write to attached git key fails")
-        check("gitsdk/README" not in rows(sp),
-              "rejected write left NO captured row")
-
-        # Attach by TREE-TAG name: no commit exists; the pin is the TAG
-        # object's sha and the overlay serves the tagged tree.
-        rep = m.sync_request(sock, type="ui", verb="git_attach",
-                             args=[sid, str(store), "treetag", "gittree"])
-        tr = (rep or {}).get("r", {})
-        check(tr.get("ok") is True, f"tree-tag git_attach succeeds (got {rep!r})")
-        tag_sha = sh_git(repo, "rev-parse", "refs/tags/treetag").strip()
-        check(tr.get("sha") == tag_sha,
-              f"tree-tag pin is the TAG object's sha (got {tr.get('sha')!r})")
-        tname = tr.get("name") or ""
-        r = subprocess.run(
-            [str(BIN), "run", "WORK", "--",
-             "sh", "-c", "cat /gittree/README > /treereadme.txt"],
-            capture_output=True, text=True, timeout=60)
-        check(r.returncode == 0,
-              f"read of tree-tag attachment succeeds (rc={r.returncode}: {r.stderr[:200]})")
-        check(row_bytes(m, sp, "treereadme.txt") == b"readme v2\n",
-              "tree-tag attachment serves the tagged tree's bytes")
-
-        # UI visibility: the attachments ride the session dict's
-        # "attachments" (they are NOT boxes, so never parents).
-        rep = m.sync_request(sock, type="ui", verb="session_dicts", args=[])
-        sessions = (rep or {}).get("r", [])
-        mine = next((s for s in sessions if s.get("box_id") == sid), {})
-        atts = mine.get("attachments") or []
-        check([a.get("name") for a in atts] == [aname, tname],
-              f"attachments listed in session attachments (got {atts!r})")
-        check(atts and atts[0].get("kind") == "git"
-              and atts[0].get("rev") == sha,
-              f"attachment row pins kind+rev (got {atts!r})")
-        check(mine.get("parents") == [],
-              f"no phantom parent for the attachment (got {mine.get('parents')!r})")
+        # SUBPATH: a second box takes only sdk/, nested under /vendor.
+        r = subprocess.run([str(BIN), "run", "PART", "--", "true"],
+                           capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0, f"PART setup exits 0 (rc={r.returncode})")
+        sid2 = sid_of("PART")
+        sp2 = sqlar_dir() / f"{sid2}.sqlar"
+        rep = m.sync_request(sock, type="ui", verb="git_checkout",
+                             args=[sid2, str(store), "main", "vendor", "sdk"])
+        pr = (rep or {}).get("r", {})
+        check(pr.get("ok") is True and pr.get("files") == 2,
+              f"subtree checkout serves only sdk/ (got {rep!r})")
+        check(row_bytes(m, sp2, "vendor/tool.txt") == b"SDK from git\n",
+              "subtree file lands relative to DEST")
+        check("vendor/README" not in rows(sp2) and "README" not in rows(sp2),
+              "nothing outside the subtree was written")
+        # (Tag-at-STANDALONE-tree checkout is wired through
+        # Resolved::TreeTag, but the union mirror's IMPORT still refuses
+        # such tags — a named Unsupported, §11 — so it is not testable
+        # end-to-end yet.)
     finally:
         if eng:
             eng.terminate()
@@ -244,10 +238,10 @@ def main():
 
     if _fails:
         raise AssertionError(_fails)
-    print("test_git_attach_rs: all checks passed")
+    print("test_git_checkout_rs: all checks passed")
 
 
-def test_git_attach_rs():
+def test_git_checkout_rs():
     main()
 
 

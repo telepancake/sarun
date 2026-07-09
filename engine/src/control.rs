@@ -2397,14 +2397,17 @@ macro_rules! ui_verbs {
             ov.invalidate_ext(sid);
             json!({"ok": true})
         }
-        // Attach a git ref from a gitdepot mirror store
-        // (ATTACH-CONVERGENCE.md): bookkeeping only — resolve ref→sha
-        // from meta.sqlite (no chain walk, no import, no new box) and
-        // append an Ext row to sid's RO attachments; the overlay serves
-        // the tree straight from the store on first read. args:
-        // [sid, store_path, refname, prefix?] — prefix nests the tree
-        // (e.g. "src" serves the repo under /src).
-        "git_attach", "SID STORE REF [PREFIX]", "attach a git ref from a mirror store as a read-only external reference" => {
+        // Check a commit out of a gitdepot mirror store INTO the box's
+        // changes: resolve ref→sha from meta.sqlite, then STREAM the
+        // commit's tree (or the subtree under SUBPATH) out of the store —
+        // the union at that revision is folded once at the byte level
+        // (geometric delta compose + one overlay) and walked as bytes, so
+        // memory stays bounded; each entry lands as an ordinary change row
+        // + pool blob, exactly as if the box had written it. args:
+        // [sid, store_path, refname, dest?, subpath?] — dest prefixes the
+        // written paths (checkout into a subdirectory of the box).
+        "git_checkout", "SID STORE REF [DEST] [SUBPATH]", "check a commit out of a mirror store into the box's changes" => {
+            use crate::depot::BoxDepot as _;
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -2418,18 +2421,21 @@ macro_rules! ui_verbs {
             ) else {
                 return json!({"ok": false, "error": "need store path + ref"});
             };
-            let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
+            let dest = args.get(3).and_then(Value::as_str).unwrap_or("")
+                .trim_matches('/').to_string();
+            let subpath = args.get(4).and_then(Value::as_str).unwrap_or("")
+                .trim_matches('/').to_string();
             let store_path = std::path::Path::new(store);
-            // REF may be a ref name ("main" matches "refs/heads/main")
-            // or a unique commit-sha prefix — ANY commit in the chain is
-            // attachable, not just the tips. Point lookups in the
-            // store's meta.sqlite (gitdepot::resolve_ref owns the
-            // semantics) — no commit-list materialization on attach.
-            // A tag-at-tree ref attaches the tagged tree; its pin is
-            // the TAG object's sha (content-addressed like a commit
-            // pin — the readout dispatches on it).
-            let sha = match gitdepot::resolve_ref(store_path, refname) {
-                Ok(Some(r)) => r.sha().to_string(),
+            // REF may be a ref name ("main" matches "refs/heads/main") or a
+            // unique commit-sha prefix — ANY commit in the chain, not just
+            // the tips (gitdepot::resolve_ref owns the semantics).
+            // A commit checks out its own tree; a tag-at-tree ref (the
+            // linux v2.6.11-tree shape) pins the TAG object's sha and
+            // checks out the tagged tree's revision.
+            let (sha, rev) = match gitdepot::resolve_ref(store_path, refname) {
+                Ok(Some(gitdepot::Resolved::Commit { sha, idx })) => (sha, idx),
+                Ok(Some(gitdepot::Resolved::TreeTag { tag_sha, tree_idx })) =>
+                    (tag_sha, tree_idx),
                 Ok(None) => return json!({"ok": false, "error":
                     format!("no ref or commit {refname} in store")}),
                 Err(gitdepot::Error::Meta(msg)) =>
@@ -2437,39 +2443,70 @@ macro_rules! ui_verbs {
                 Err(e) => return json!({"ok": false,
                                         "error": format!("store: {e}")}),
             };
-            // WHICH git: the store's label (`mirror` stamps it from the
-            // URL). Unlabeled direct imports fall back to the store's
-            // path: the directory itself, unless it's the mirror
-            // layout's generic `store`, then its parent.
-            let stored_label = match gitdepot::label(store_path) {
-                Ok(l) => l,
+            let ls = match gitdepot::store::Store::open(store_path)
+                .and_then(|st| st.union())
+            {
+                Ok(ls) => ls,
                 Err(e) => return json!({"ok": false,
                                         "error": format!("store: {e}")}),
             };
-            let label = if stored_label.is_empty() {
-                let name = store_path.file_name().map(|n| n.to_string_lossy());
-                match name.as_deref() {
-                    Some("store") | None => store_path.parent()
-                        .and_then(|q| q.file_name())
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "repo".into()),
-                    Some(n) => n.to_string(),
+            let mut files = 0u64;
+            let mut bytes = 0u64;
+            // Ancestor DIRECTORY rows: the mount traverses real dir rows,
+            // so each intermediate directory lands once, like mkdir -p.
+            let mut dirs_done = std::collections::HashSet::new();
+            let mut ensure_dirs = |b: &crate::capture::BoxState, path: &str,
+                                   dirs_done: &mut std::collections::HashSet<String>| {
+                let mut at = 0usize;
+                while let Some(i) = path[at..].find('/') {
+                    let d = &path[..at + i];
+                    if dirs_done.insert(d.to_string()) {
+                        b.set_dir(d, 0o040755, 0);
+                    }
+                    at += i + 1;
                 }
-            } else {
-                stored_label
             };
-            let short: String = sha.chars().take(8).collect();
-            let name = format!("git:{label}/{refname}@{short}");
-            let mut rows = b.ro_attachment_list();
-            rows.push(crate::capture::RoAttachment::Ext(
-                crate::capture::ExtRef {
-                    kind: "git".into(), store: store.to_string(),
-                    refname: refname.to_string(), rev: sha.clone(),
-                    prefix: prefix.to_string(), name: name.clone(),
-                }));
-            b.set_ro_attachments(rows);
-            ov.invalidate_ext(sid);
-            json!({"ok": true, "name": name, "sha": sha})
+            let res = ls.checkout_entries_at(rev, subpath.as_bytes(), &mut |rel, mode, content| {
+                let rel_s = String::from_utf8_lossy(rel);
+                let path = if dest.is_empty() {
+                    rel_s.into_owned()
+                } else {
+                    format!("{dest}/{rel_s}")
+                };
+                ensure_dirs(&b, &path, &mut dirs_done);
+                use gitdepot::layer::Mode;
+                match mode {
+                    Mode::Symlink => {
+                        let target = String::from_utf8_lossy(content).into_owned();
+                        b.set_symlink(&path, std::path::Path::new(&target), 0);
+                    }
+                    Mode::Gitlink => {} // a submodule pointer has no content here
+                    m => {
+                        let full_mode = match m {
+                            Mode::File => 0o100644,
+                            Mode::Exec => 0o100755,
+                            Mode::Other(x) => x,
+                            _ => 0o100644,
+                        };
+                        let rid = b.ensure_file_row(&path, full_mode, 0);
+                        let bp = crate::depot::blob_path(sid, rid);
+                        if let Some(dir) = bp.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        std::fs::write(&bp, content).map_err(|e| gitdepot::Error::Chain(
+                            format!("write {}: {e}", bp.display())))?;
+                        b.finalize_file(&path, content.len() as i64, 0, 0);
+                        files += 1;
+                        bytes += content.len() as u64;
+                    }
+                }
+                Ok(())
+            });
+            if let Err(e) = res {
+                return json!({"ok": false, "error": format!("checkout: {e}")});
+            }
+            b.load_mirror();
+            json!({"ok": true, "sha": sha, "files": files, "bytes": bytes})
         }
         // Attach a wikipedia mirror page (wikimak instance root) as an
         // external RO reference: args [sid, root, page_id, prefix?].
@@ -4505,24 +4542,71 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                 other => report(other),
             }
         }
-        // sarun NAME attach git <store> <ref> [PREFIX]
-        //                  attach wiki <root> <page-id> [PREFIX]
+        // sarun NAME checkout <store> <ref> [DEST] [SUBPATH]
+        // Stream a commit out of a gitdepot mirror store into NAME's
+        // changes — ordinary files the box owns, bounded memory.
+        Some("checkout") => {
+            let (Some(src), Some(refname)) = (argv.get(2), argv.get(3)) else {
+                eprintln!("usage: sarun NAME checkout <store> <ref> [DEST] [SUBPATH]");
+                return 2;
+            };
+            let src = std::fs::canonicalize(src)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| src.clone());
+            let sid = match one(json!({"type": "ui", "verb": "resolve_box",
+                                       "args": [name]})) {
+                Ok(v) => match v.get("r").and_then(Value::as_str)
+                    .and_then(|s| s.parse::<i64>().ok()) {
+                    Some(id) => id,
+                    None => { eprintln!("sarun-engine: no box {name}"); return 1; }
+                },
+                Err(e) => { eprintln!("sarun-engine: {e}"); return 1; }
+            };
+            let mut vargs = vec![json!(sid), json!(src), json!(refname)];
+            if let Some(d) = argv.get(4) { vargs.push(json!(d)); }
+            if let Some(sp) = argv.get(5) { vargs.push(json!(sp)); }
+            match one(json!({"type": "ui", "verb": "git_checkout",
+                             "args": vargs})) {
+                Ok(v) => {
+                    let r = v.get("r").cloned().unwrap_or(v);
+                    if r.get("ok").and_then(Value::as_bool) == Some(true) {
+                        println!("checked out {} into {name} ({} files)",
+                            r.get("sha").and_then(Value::as_str).unwrap_or("?"),
+                            r.get("files").and_then(Value::as_u64).unwrap_or(0));
+                        0
+                    } else {
+                        eprintln!("sarun-engine: {}",
+                            r.get("error").and_then(Value::as_str)
+                             .unwrap_or("checkout failed"));
+                        1
+                    }
+                }
+                Err(e) => { eprintln!("sarun-engine: {e}"); 1 }
+            }
+        }
+        // sarun NAME attach wiki <root> <page-id> [PREFIX]
         //                  attach ietf <root> <draft> [PREFIX]
-        // Mirror serve path (ATTACH-CONVERGENCE.md): pin the mirror
-        // object as an external RO reference on NAME — no import, the
-        // overlay serves it from the store on first read.
+        // Mirror serve path (ATTACH-CONVERGENCE.md) for BOUNDED
+        // single-object stores: pin the mirror object as an external RO
+        // reference on NAME — no import, the overlay serves it from the
+        // store on first read. (git is NOT attachable: a whole tree is
+        // checked out instead — see `checkout`.)
         Some("attach") => {
             let (Some(kind), Some(src), Some(key)) =
                 (argv.get(2), argv.get(3), argv.get(4)) else {
-                eprintln!("usage: sarun NAME attach git|wiki|ietf <src> <ref|page|draft> [PREFIX]");
+                eprintln!("usage: sarun NAME attach wiki|ietf <src> <page|draft> [PREFIX]");
                 return 2;
             };
             let verb = match kind.as_str() {
-                "git" => "git_attach",
                 "wiki" => "wiki_attach",
                 "ietf" => "ietf_attach",
+                "git" => {
+                    eprintln!("sarun-engine: git attach was removed — use \
+`sarun {name} checkout <store> <ref> [DEST]` to stream the commit into the box");
+                    return 2;
+                }
                 other => {
-                    eprintln!("sarun-engine: unknown attach kind {other:?} (git|wiki|ietf)");
+                    eprintln!("sarun-engine: unknown attach kind {other:?} (wiki|ietf)");
                     return 2;
                 }
             };

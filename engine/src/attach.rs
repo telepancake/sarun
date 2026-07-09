@@ -9,13 +9,17 @@
 //! memo (sound within one hydration: the readout decodes once behind
 //! a OnceLock, so what it serves cannot change underneath the memo).
 //!
-//! Pinning honesty: `git` is pinned by content (full sha —
-//! re-lookup finds byte-identical trees or fails naming the sha).
-//! `wiki`/`ietf` record the head rev seen at attach time for identity
-//! and display, but their adapters serve the store's CURRENT head at
-//! first-use decode — true serve-at-rev needs read-at-rev adapters
-//! (adapters v2 chip). Within a hydration the OnceLock freezes what
-//! is served either way.
+//! Attachments are for BOUNDED single-object adapters only (a wiki
+//! page, an ietf draft): on-demand reads with small resident state,
+//! like reading a file out of an on-disk image. Whole-tree sources do
+//! NOT attach — a git commit is CHECKED OUT into the box's changes
+//! (`git_checkout`), streamed with bounded memory.
+//!
+//! Pinning honesty: `wiki`/`ietf` record the head rev seen at attach
+//! time for identity and display, but their adapters serve the store's
+//! CURRENT head at first-use decode — true serve-at-rev needs
+//! read-at-rev adapters (adapters v2 chip). Within a hydration the
+//! OnceLock freezes what is served either way.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -140,20 +144,17 @@ impl ExtAttachment {
     }
 }
 
-/// Per-kind store open + readout construction. Each arm re-validates
-/// the pin where the store can: git re-resolves the sha (content-
-/// addressed — byte-identical or a named failure).
+/// Per-kind store open + readout construction, for BOUNDED single-object
+/// adapters only (a wiki page, an ietf draft — on-demand reads with small
+/// resident state). Whole-tree sources are NOT attachable: a git commit is
+/// CHECKED OUT into the box's changes (`git_checkout`), streamed with
+/// bounded memory — never held resident as a decoded tree.
 fn open_readout(ext: &ExtRef) -> Result<Arc<dyn Readout>, String> {
     match ext.kind.as_str() {
-        "git" => {
-            let ro = gitdepot::readout::TipReadout::for_commit(
-                    std::path::Path::new(&ext.store), &ext.rev, "")
-                .map_err(|e| format!("git store {}: {e}", ext.store))?
-                .ok_or_else(|| format!(
-                    "commit {} no longer in {} (history rewritten?) — \
-                     re-attach to pin the new tree", ext.rev, ext.store))?;
-            Ok(Arc::new(ro))
-        }
+        "git" => Err(format!(
+            "git attachments were removed (unbounded resident tree): check the \
+             commit out instead — `git_checkout` streams {} into the box's \
+             changes", ext.rev)),
         "wiki" => {
             let inst = open_wiki_instance(&ext.store)?;
             let page: u64 = ext.refname.parse().map_err(|_|

@@ -95,7 +95,6 @@ pub mod oidenc;
 pub mod reslot;
 pub mod layer;
 pub mod lanes;
-pub mod readout;
 pub mod store;
 
 pub use store::{commit_at, commit_count, label, resolve_ref, Resolved};
