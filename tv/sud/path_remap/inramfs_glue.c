@@ -156,7 +156,12 @@ struct xs_stat {
 #endif
 };
 
-#define XSTORE_BUF 8192
+/* Copy chunk. Kept SMALL on purpose: the bridge runs inside the SIGSYS
+ * handler, whose frames must stay lean (the handler's own comment warns a
+ * few KiB per frame; a large on-stack buffer here risks overrunning the
+ * per-task signal stack under a deep/heavily-threaded build). A few extra
+ * read/write syscalls on a big staged file is a fine trade for safety. */
+#define XSTORE_BUF 2048
 
 /* resolve_two_tickets() cross-boundary signals (positive, distinct from
  * 0 = both-inramfs, -1 = neither, other <0 = real -errno). */
@@ -226,32 +231,30 @@ static long xstore_ov_to_ir(int is_link,
 {
     if (is_link && dst->leaf_idx) return -EEXIST;
 
-    char rp[PATH_MAX], absbuf[PATH_MAX];
+    /* One path buffer, reused: the read path first, then (after the copy)
+     * the merged source path for removal. Keeps the handler frame small. */
+    char pbuf[PATH_MAX];
     int rc = sud_overlay_resolve_at(src_dirfd, src_path,
-                                    SUD_OVERLAY_FOR_READ, rp, sizeof(rp));
-    const char *readpath;
-    if (rc == SUD_OVERLAY_RESOLVED) {
-        readpath = rp;
-    } else if (rc == SUD_OVERLAY_PASSTHROUGH) {
-        if (sud_pr_absolutise(src_dirfd, src_path, absbuf, sizeof(absbuf)) != 0)
+                                    SUD_OVERLAY_FOR_READ, pbuf, sizeof(pbuf));
+    if (rc == SUD_OVERLAY_PASSTHROUGH) {
+        if (sud_pr_absolutise(src_dirfd, src_path, pbuf, sizeof(pbuf)) != 0)
             return -EXDEV;
-        readpath = absbuf;
-    } else {
+    } else if (rc != SUD_OVERLAY_RESOLVED) {
         return (rc == SUD_OVERLAY_WHITEOUT) ? -ENOENT : -EXDEV;
     }
 
     struct xs_stat st;
 #ifdef SYS_newfstatat
-    if (raw_syscall6(SYS_newfstatat, AT_FDCWD, (long)readpath, (long)&st,
+    if (raw_syscall6(SYS_newfstatat, AT_FDCWD, (long)pbuf, (long)&st,
                      AT_SYMLINK_NOFOLLOW, 0, 0) < 0) return -ENOENT;
 #else
-    if (raw_syscall6(SYS_fstatat64, AT_FDCWD, (long)readpath, (long)&st,
+    if (raw_syscall6(SYS_fstatat64, AT_FDCWD, (long)pbuf, (long)&st,
                      AT_SYMLINK_NOFOLLOW, 0, 0) < 0) return -ENOENT;
 #endif
     if ((st.st_mode & 0170000) == 0040000) return -EXDEV;  /* directory */
     int mode = (int)(st.st_mode & 07777);
 
-    int sfd = raw_open(readpath, O_RDONLY);
+    int sfd = raw_open(pbuf, O_RDONLY);   /* pbuf free after this open */
     if (sfd < 0) return sfd;
     int dfd = (int)sud_inramfs_op_create_open_inode(
                   dst->parent_idx, dst->basename, dst->basename_len,
@@ -279,13 +282,14 @@ static long xstore_ov_to_ir(int is_link,
     }
     if (!is_link) {
         /* Drop the overlay source: unlink its upper copy (if any) and
-         * whiteout so a lower layer doesn't resurface the old name. */
-        char merged[PATH_MAX], sup[PATH_MAX];
-        if (sud_pr_absolutise(src_dirfd, src_path, merged, sizeof(merged)) == 0) {
-            if (sud_overlay_resolve(merged, SUD_OVERLAY_FOR_WRITE,
+         * whiteout so a lower layer doesn't resurface the old name. pbuf
+         * (the read path) is done; reuse it for the merged source path. */
+        char sup[PATH_MAX];
+        if (sud_pr_absolutise(src_dirfd, src_path, pbuf, sizeof(pbuf)) == 0) {
+            if (sud_overlay_resolve(pbuf, SUD_OVERLAY_FOR_WRITE,
                                     sup, sizeof(sup)) == SUD_OVERLAY_RESOLVED)
                 raw_syscall6(SYS_unlinkat, AT_FDCWD, (long)sup, 0, 0, 0, 0);
-            sud_overlay_create_whiteout(merged);
+            sud_overlay_create_whiteout(pbuf);
         }
     }
     return 0;
