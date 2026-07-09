@@ -92,13 +92,17 @@ pub use cli::cli_main;
 pub mod frame;
 pub mod gitsrc;
 pub mod geostack;
+pub mod lanestore;
+pub mod oidenc;
 pub mod reflog;
+pub mod reslot;
 pub mod shards;
 pub mod layer;
 pub mod lanes;
 pub mod readout;
 pub mod store;
 pub mod unionstore;
+pub mod variants;
 
 pub use store::{commit_at, commit_count, label, resolve_ref, Resolved};
 
