@@ -18,12 +18,18 @@
 //! empty backdrop. [`Encoder::full`] is the positive full-state head.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-use depot::{Attrs, Bytes, Layer, Name, Node, View};
+use depot::{Attrs, BlobOp, Bytes, Layer, Name, Node, View};
 
-use crate::reslot::{Bitmap, Occupant, Slots};
-use crate::variants::{content_key, content_view, leaf_delta, meta_key, meta_view};
+use crate::layer::{self, dir_key, file_key, variant_node, Mode};
+use crate::reslot::{Bitmap, Occupant, SlotChange, Slots};
 use crate::Result;
+
+/// The `Mode` of a slot occupant (its variant identity carries the octal).
+fn occ_mode(o: &Occupant<VarKey>) -> Mode {
+    Mode::from_octal(&o.id.0).unwrap_or(Mode::File)
+}
 
 /// A tree entry as it stands for one lane at one path: the git mode, the
 /// object oid (hex), and whether it is a subdirectory (mode `40000`).
@@ -119,16 +125,6 @@ fn clear_bit(bm: &mut [u8], i: usize) {
     }
 }
 
-fn occ_meta(o: &Occupant<VarKey>) -> View {
-    let mut attrs = Attrs::new();
-    attrs.insert(b"mode".to_vec(), o.id.0.clone());
-    meta_view(&attrs, &o.bitmap)
-}
-/// The `\0v` content leaf for an occupant — its blob fetched by oid.
-fn occ_content(obj: &mut dyn Objects, o: &Occupant<VarKey>) -> Result<View> {
-    Ok(content_view(&obj.blob(&o.id.1)?))
-}
-
 /// The new variant set at a path: the skeleton's current variants (all
 /// lanes), with each transitioning lane's bit moved to whatever FILE it now
 /// carries here (removed if it no longer has a file here). Non-transitioning
@@ -152,44 +148,73 @@ fn new_variant_set(slots: &Slots<VarKey>, trans: &[Trans]) -> BTreeMap<VarKey, B
     set
 }
 
-/// Reverse delta at one path: reslot the file variants and recurse into the
-/// changed directory children, reading tree objects only where a subtree oid
-/// actually changed. The returned node, applied to the NEW union state,
-/// rebuilds the previous one (removals as holes).
-fn advance_node(skel: &mut Skel, trans: &[Trans], obj: &mut dyn Objects, emit: bool) -> Result<Node> {
-    let mut out = Node::keep();
-
-    // File variants at this path.
-    if !skel.slots.is_empty() || trans.iter().any(|(_, o, n)| is_file(*o) || is_file(*n)) {
-        let new_set = new_variant_set(&skel.slots, trans);
-        for ch in skel.slots.reslot(&new_set) {
-            // `emit == false` measures the skeleton alone: reslot still runs
-            // (it mutates the slots), but no blob content is fetched and no
-            // delta is built.
-            if !emit {
-                continue;
-            }
-            // reverse: rebuild `before` (old) from `after` (new) — the chain
-            // record. A slot that appears only in the new state is a HOLE
-            // here (removed when walking back), never a tombstone.
-            let bc = opt_content(obj, ch.before.as_ref())?;
-            let ac = opt_content(obj, ch.after.as_ref())?;
-            let c = leaf_delta(ac.as_ref(), bc.as_ref());
-            if !c.is_identity() {
-                out.children.insert(content_key(ch.slot), c);
-            }
-            let bm = ch.before.as_ref().map(occ_meta);
-            let am = ch.after.as_ref().map(occ_meta);
-            let m = leaf_delta(am.as_ref(), bm.as_ref());
-            if !m.is_identity() {
-                out.children.insert(meta_key(ch.slot), m);
-            }
+/// Set `node` (a variant-delta node overlaid on the NEW variant's node) to
+/// carry the mode `before`, holing the tag `after` currently shows if it is a
+/// different tag. Compared by tag NAME, so an `o` (non-canonical) tag's octal
+/// blob is simply overwritten to `before`'s octal.
+fn set_mode_tag(node: &mut Node, before: Mode, after: Mode) {
+    if before == after {
+        return;
+    }
+    if let Some(atag) = after.tag() {
+        if before.tag() != Some(atag) {
+            node.children.insert(atag.to_vec(), Node::hole());
         }
     }
+    if let Some(btag) = before.tag() {
+        let blob = if let Mode::Other(m) = before { format!("{m:o}").into_bytes() } else { Vec::new() };
+        node.children.insert(btag.to_vec(), Node { blob: BlobOp::Set(blob.into()), ..Node::keep() });
+    }
+}
 
-    // Directory children: read each dir-transitioning lane's old/new tree
-    // (skipping any whose oid is unchanged — that subtree is identical), diff
-    // by name, and recurse only the children that changed.
+/// The §2 reverse-delta node for one slot change: applied onto the NEW union
+/// state's node at `file_key(name, slot)`, it rebuilds the PREVIOUS variant
+/// (`before`). `None` ⇒ nothing to emit (identity).
+///
+/// - new-only slot (`before=None`) ⇒ a HOLE (removed when walking back);
+/// - old-only slot (`after=None`) ⇒ the full previous variant node;
+/// - both ⇒ a minimal delta: `Set` the old content only if the blob oid
+///   moved, retag the mode if it changed, and rewrite the `lanes` child only
+///   if the bitmap moved.
+fn variant_reverse_node(ch: &SlotChange<VarKey>, obj: &mut dyn Objects) -> Result<Option<Node>> {
+    match (&ch.before, &ch.after) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Ok(Some(Node::hole())),
+        (Some(bo), None) => {
+            let content = obj.blob(&bo.id.1)?;
+            Ok(Some(variant_node(&content, occ_mode_id(&bo.id), Some(&bo.bitmap))))
+        }
+        (Some(bo), Some(ao)) => {
+            let mut node = Node::keep();
+            if bo.id.1 != ao.id.1 {
+                node.blob = BlobOp::Set(obj.blob(&bo.id.1)?.into());
+            }
+            set_mode_tag(&mut node, occ_mode_id(&bo.id), occ_mode_id(&ao.id));
+            if bo.bitmap != ao.bitmap {
+                node.children.insert(
+                    layer::LANES.to_vec(),
+                    Node { blob: BlobOp::Set(bo.bitmap.as_slice().into()), ..Node::keep() },
+                );
+            }
+            Ok((!node.is_identity() || !node.children.is_empty()).then_some(node))
+        }
+    }
+}
+
+fn occ_mode_id(id: &VarKey) -> Mode {
+    Mode::from_octal(&id.0).unwrap_or(Mode::File)
+}
+
+/// Distribute a directory's per-lane `(old_tree, new_tree)` transitions into
+/// per-child-name transitions, reading each lane's tree object by oid and
+/// pruning any subtree whose oid is unchanged (the O(1) oid prune, O(changed)
+/// per commit). A child that is a file in one lane and a directory in another
+/// simply accumulates both kinds of transition under its name.
+#[allow(clippy::type_complexity)]
+fn distribute_children(
+    trans: &[Trans],
+    obj: &mut dyn Objects,
+) -> Result<BTreeMap<Name, Vec<(usize, Option<Ent>, Option<Ent>)>>> {
     let mut child_trans: BTreeMap<Name, Vec<(usize, Option<Ent>, Option<Ent>)>> = BTreeMap::new();
     for (lane, o, n) in trans {
         let od = o.filter(|e| e.is_dir);
@@ -215,7 +240,11 @@ fn advance_node(skel: &mut Skel, trans: &[Trans], obj: &mut dyn Objects, emit: b
             let oc = om.get(name);
             let nc = nm.get(name);
             let changed = match (oc, nc) {
-                (Some(a), Some(b)) => a.oid != b.oid || a.is_dir != b.is_dir,
+                // Mode matters as much as oid: a pure mode change (e.g. the
+                // historical 100664→100644 flip) keeps the blob oid, so it is
+                // invisible unless mode is compared too — else the stale mode
+                // variant keeps this lane's bit and the tree oid diverges.
+                (Some(a), Some(b)) => a.oid != b.oid || a.is_dir != b.is_dir || a.mode != b.mode,
                 _ => true,
             };
             if changed {
@@ -223,46 +252,92 @@ fn advance_node(skel: &mut Skel, trans: &[Trans], obj: &mut dyn Objects, emit: b
             }
         }
     }
-    for (name, sub) in child_trans {
-        let sr: Vec<Trans> = sub.iter().map(|(l, o, n)| (*l, o.as_ref(), n.as_ref())).collect();
-        let (cnode, empty) = {
-            let child = skel.children.entry(name.clone()).or_default();
-            let cn = advance_node(child, &sr, obj, emit)?;
-            (cn, child.is_empty())
-        };
-        if empty {
-            skel.children.remove(&name);
+    Ok(child_trans)
+}
+
+/// Reverse delta for a DIRECTORY level (`children` = its child sub-skeletons):
+/// diff each lane's old/new tree, and for every changed child NAME emit that
+/// name's §2 contributions — file variants as `file_key(name, slot)` siblings
+/// and its subdirectory as a bare `dir_key(name)` node. The returned node,
+/// applied onto the NEW union state, rebuilds the previous one.
+fn advance_dir(
+    children: &mut BTreeMap<Name, Skel>,
+    trans: &[Trans],
+    obj: &mut dyn Objects,
+    emit: bool,
+) -> Result<Node> {
+    let mut out = Node::keep();
+    let child_trans = distribute_children(trans, obj)?;
+    for (name, sub_raw) in child_trans {
+        let sr: Vec<Trans> = sub_raw.iter().map(|(l, o, n)| (*l, o.as_ref(), n.as_ref())).collect();
+        let child = children.entry(name.clone()).or_default();
+
+        // File variants of `name` → `file_key(name, slot)` siblings.
+        if !child.slots.is_empty() || sr.iter().any(|(_, o, n)| is_file(*o) || is_file(*n)) {
+            let new_set = new_variant_set(&child.slots, &sr);
+            for ch in child.slots.reslot(&new_set) {
+                if !emit {
+                    continue;
+                }
+                if let Some(node) = variant_reverse_node(&ch, obj)? {
+                    out.children.insert(file_key(&name, ch.slot), node);
+                }
+            }
         }
-        if !cnode.is_identity() {
-            out.children.insert(name, cnode);
+
+        // Subdirectory of `name` → bare `dir_key(name)` node.
+        let dnode = advance_dir(&mut child.children, &sr, obj, emit)?;
+        if !dnode.is_identity() {
+            out.children.insert(dir_key(&name), dnode);
+        }
+
+        if child.is_empty() {
+            children.remove(&name);
         }
     }
     Ok(out)
 }
 
-/// Materialize the current skeleton state as the union View (fetching each
-/// live variant's content). The `f0`/seal head is then `diff(None, view)` —
-/// see [`Encoder::full`] for why it is produced that way.
-fn full_view(skel: &Skel, obj: &mut dyn Objects) -> Result<View> {
-    let mut children: BTreeMap<Name, std::sync::Arc<View>> = BTreeMap::new();
-    for (slot, occ) in skel.slots.iter() {
-        children.insert(content_key(slot), std::sync::Arc::new(occ_content(obj, occ)?));
-        children.insert(meta_key(slot), std::sync::Arc::new(occ_meta(occ)));
+/// The §2 variant View for an occupant — mirrors [`variant_node`] as a
+/// materialized View so the folded reverse-delta state and this fresh
+/// full-state are byte-identical under `diff(None, view)`. Bitmaps are stored
+/// explicitly (the all-ones omission is a size optimization not applied here).
+fn variant_view(content: Bytes, mode: Mode, bitmap: &[u8]) -> View {
+    let mut children: BTreeMap<Name, Arc<View>> = BTreeMap::new();
+    if let Some(tag) = mode.tag() {
+        let blob: Bytes = if let Mode::Other(m) = mode {
+            format!("{m:o}").into_bytes().into()
+        } else {
+            (&b""[..]).into()
+        };
+        children.insert(tag.to_vec(), Arc::new(View { blob: Some(blob), attrs: Attrs::new(), children: BTreeMap::new() }));
     }
-    for (name, child) in &skel.children {
-        children.insert(name.clone(), std::sync::Arc::new(full_view(child, obj)?));
+    children.insert(
+        layer::LANES.to_vec(),
+        Arc::new(View { blob: Some(bitmap.to_vec().into()), attrs: Attrs::new(), children: BTreeMap::new() }),
+    );
+    View { blob: Some(content), attrs: Attrs::new(), children }
+}
+
+/// Materialize the current skeleton state as the §2 union View. Each child
+/// name emits its file variants as `file_key(name, slot)` siblings and its
+/// subtree as `dir_key(name)`. The `f0`/seal head is `diff(None, view)`.
+fn full_view_dir(dir: &Skel, obj: &mut dyn Objects) -> Result<View> {
+    let mut children: BTreeMap<Name, Arc<View>> = BTreeMap::new();
+    for (name, sub) in &dir.children {
+        for (slot, occ) in sub.slots.iter() {
+            let content = obj.blob(&occ.id.1)?;
+            children.insert(file_key(name, slot), Arc::new(variant_view(content.into(), occ_mode(occ), &occ.bitmap)));
+        }
+        if !sub.children.is_empty() {
+            children.insert(dir_key(name), Arc::new(full_view_dir(sub, obj)?));
+        }
     }
     Ok(View { blob: None, attrs: Attrs::new(), children })
 }
 
 fn is_file(e: Option<&Ent>) -> bool {
     e.is_some_and(|e| !e.is_dir)
-}
-fn opt_content(obj: &mut dyn Objects, occ: Option<&Occupant<VarKey>>) -> Result<Option<View>> {
-    match occ {
-        Some(o) => Ok(Some(occ_content(obj, o)?)),
-        None => Ok(None),
-    }
 }
 
 /// The stateful union encoder, driven off the git object store.
@@ -281,14 +356,14 @@ impl Encoder {
     /// record (removals as holes). Reads tree objects for the changed
     /// subtrees only.
     pub fn advance(&mut self, trans: &[Trans], obj: &mut dyn Objects) -> Result<Layer> {
-        Ok(Layer { root: advance_node(&mut self.root, trans, obj, true)? })
+        Ok(Layer { root: advance_dir(&mut self.root.children, trans, obj, true)? })
     }
 
     /// Update ONLY the skeleton for this revision — reslot the slots without
     /// fetching any blob content or building a delta. For memory measurement:
     /// it grows the skeleton to the full union with no blob traffic.
     pub fn advance_skel(&mut self, trans: &[Trans], obj: &mut dyn Objects) -> Result<()> {
-        advance_node(&mut self.root, trans, obj, false)?;
+        advance_dir(&mut self.root.children, trans, obj, false)?;
         Ok(())
     }
 
@@ -328,7 +403,7 @@ impl Encoder {
     /// reader recomputes for a cold frame — `diff(None, reconstructed-view)`.
     /// Any non-canonical divergence there fails the frame's refPrefix check.
     pub fn full(&self, obj: &mut dyn Objects) -> Result<Layer> {
-        Ok(depot::diff(None, Some(&full_view(&self.root, obj)?)))
+        Ok(depot::diff(None, Some(&full_view_dir(&self.root, obj)?)))
     }
 
     /// (total variant slots, total directory nodes) in the live skeleton —
@@ -350,8 +425,22 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::variants::extract;
     use std::collections::HashMap;
+
+    /// Reconstruct lane `l` from a §2 union View as a flat `path -> (mode,
+    /// content)` map, via the authoritative `layer` extractor on the canonical
+    /// union bytes.
+    fn lane_map(u: &View, l: u32) -> BTreeMap<Vec<u8>, (Mode, Vec<u8>)> {
+        let bytes = depot::codec::encode(&depot::diff(None, Some(u)));
+        layer::extract_lane_entries(&bytes, l)
+            .unwrap()
+            .into_iter()
+            .map(|(p, m, c)| (p, (m, c)))
+            .collect()
+    }
+    fn content(u: &View, l: u32, path: &[u8]) -> Option<Vec<u8>> {
+        lane_map(u, l).get(path).map(|(_, c)| c.clone())
+    }
 
     /// The newest union View: materialize the encoder's full state.
     fn newest(enc: &Encoder, m: &mut Mem) -> View {
@@ -406,11 +495,6 @@ mod tests {
         }
     }
 
-    /// A lane's git tree, for building the oracle: name → content|subtree.
-    fn extract_lane(u: &View, l: usize) -> View {
-        extract(u, l)
-    }
-
     #[test]
     fn two_lanes_shared_and_divergent() {
         let mut m = Mem::default();
@@ -427,12 +511,10 @@ mod tests {
         enc.advance(&[(1, None, Some(&t1))], &mut m).unwrap();
         let u = newest(&enc, &mut m);
 
-        let l0 = extract_lane(&u, 0);
-        let l1 = extract_lane(&u, 1);
-        assert_eq!(l0.children.len(), 2);
-        assert_eq!(l0.children[b"f".as_slice()].blob.as_deref(), Some(&b"A"[..]));
-        assert_eq!(l1.children[b"f".as_slice()].blob.as_deref(), Some(&b"B"[..]));
-        assert_eq!(l0.children[b"shared".as_slice()].blob.as_deref(), Some(&b"x"[..]));
+        assert_eq!(lane_map(&u, 0).len(), 2);
+        assert_eq!(content(&u, 0, b"f").as_deref(), Some(&b"A"[..]));
+        assert_eq!(content(&u, 1, b"f").as_deref(), Some(&b"B"[..]));
+        assert_eq!(content(&u, 0, b"shared").as_deref(), Some(&b"x"[..]));
     }
 
     #[test]
@@ -450,13 +532,12 @@ mod tests {
 
         // newest (state new)
         let mut cur = Some(newest(&enc, &mut m));
-        assert_eq!(extract(cur.as_ref().unwrap(), 0).children[b"f".as_slice()].blob.as_deref(), Some(&b"new"[..]));
+        assert_eq!(content(cur.as_ref().unwrap(), 0, b"f").as_deref(), Some(&b"new"[..]));
         // reverse record rebuilds state old — only `f` changed, `shared`
         // inherited (holes resolve as tombstones over the empty backdrop).
         apply_reverse(&mut cur, &rec);
-        let l = extract(cur.as_ref().unwrap(), 0);
-        assert_eq!(l.children[b"f".as_slice()].blob.as_deref(), Some(&b"old"[..]));
-        assert_eq!(l.children[b"shared".as_slice()].blob.as_deref(), Some(&b"x"[..]));
+        assert_eq!(content(cur.as_ref().unwrap(), 0, b"f").as_deref(), Some(&b"old"[..]));
+        assert_eq!(content(cur.as_ref().unwrap(), 0, b"shared").as_deref(), Some(&b"x"[..]));
     }
 
     #[test]
@@ -476,13 +557,11 @@ mod tests {
         let rec = enc.advance(&[(0, Some(&r0), Some(&r1))], &mut m).unwrap();
         let mut cur = Some(newest(&enc, &mut m));
         // newest: src/m == m1
-        let nl = extract(cur.as_ref().unwrap(), 0);
-        assert_eq!(nl.children[b"src".as_slice()].children[b"m".as_slice()].blob.as_deref(), Some(&b"m1"[..]));
+        assert_eq!(content(cur.as_ref().unwrap(), 0, b"src/m").as_deref(), Some(&b"m1"[..]));
         // reverse record rebuilds the old state — src/l pruned by oid.
         apply_reverse(&mut cur, &rec);
-        let ol = extract(cur.as_ref().unwrap(), 0);
-        assert_eq!(ol.children[b"src".as_slice()].children[b"m".as_slice()].blob.as_deref(), Some(&b"m0"[..]));
-        assert_eq!(ol.children[b"src".as_slice()].children[b"l".as_slice()].blob.as_deref(), Some(&b"L"[..]));
+        assert_eq!(content(cur.as_ref().unwrap(), 0, b"src/m").as_deref(), Some(&b"m0"[..]));
+        assert_eq!(content(cur.as_ref().unwrap(), 0, b"src/l").as_deref(), Some(&b"L"[..]));
     }
 
     #[test]

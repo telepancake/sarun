@@ -56,9 +56,18 @@ pub const LANES: &[u8] = b"lanes";
 pub const TAG_EXEC: &[u8] = b"x";
 pub const TAG_SYMLINK: &[u8] = b"l";
 pub const TAG_GITLINK: &[u8] = b"m";
+/// A non-canonical mode (e.g. `100664`) — tag `o`, whose blob carries the raw
+/// octal bytes (unlike `x`/`l`/`m`, whose blobs are empty). SHA-exactness on
+/// historical git trees demands the exact mode be reproduced, so a mode git's
+/// porcelain would normalize away is preserved verbatim through this tag.
+pub const TAG_OTHER: &[u8] = b"o";
 
-/// A git file mode, reduced to the four cases the mode tags encode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// A git file mode. The three canonical non-plain modes are encoded as empty
+/// `x`/`l`/`m` mode-tag children; a plain file carries no tag; anything else
+/// (a non-canonical historical mode such as `100664`) is `Other(raw)` and
+/// encodes as an `o` tag whose blob is the octal bytes. `Other` holds the
+/// numeric mode so `Mode` stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Mode {
     /// `100644` — a normal file (no tag).
     File,
@@ -68,37 +77,71 @@ pub enum Mode {
     Symlink,
     /// `160000` — gitlink / submodule (tag `m`).
     Gitlink,
+    /// Any other (non-canonical) blob mode, held as its raw numeric value
+    /// (e.g. `0o100664`) — tag `o`, blob = octal bytes.
+    Other(u32),
+}
+
+/// Parse octal mode bytes (e.g. `b"100664"`) to their numeric value.
+fn mode_num(b: &[u8]) -> u32 {
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| u32::from_str_radix(s, 8).ok())
+        .unwrap_or(0)
 }
 
 impl Mode {
     /// The git octal mode bytes.
-    pub fn octal(self) -> &'static [u8] {
+    pub fn octal(self) -> Vec<u8> {
         match self {
-            Mode::File => b"100644",
-            Mode::Exec => b"100755",
-            Mode::Symlink => b"120000",
-            Mode::Gitlink => b"160000",
+            Mode::File => b"100644".to_vec(),
+            Mode::Exec => b"100755".to_vec(),
+            Mode::Symlink => b"120000".to_vec(),
+            Mode::Gitlink => b"160000".to_vec(),
+            Mode::Other(m) => format!("{m:o}").into_bytes(),
         }
     }
-    /// The mode of a git tree entry, or `None` if it is a directory (`40000`)
-    /// — directories carry no variant/tag.
+    /// The mode of a git tree entry, or `None` if it is a directory — directories
+    /// carry no variant/tag. A non-canonical blob mode becomes `Other`.
     pub fn from_octal(mode: &[u8]) -> Option<Mode> {
         match mode {
             b"100644" => Some(Mode::File),
             b"100755" => Some(Mode::Exec),
             b"120000" => Some(Mode::Symlink),
             b"160000" => Some(Mode::Gitlink),
-            _ => None, // 40000 (dir) or anything unexpected
+            _ => {
+                let n = mode_num(mode);
+                // S_IFDIR (0o040000) tree entries carry no variant.
+                if n == 0 || (n & 0o170000) == 0o040000 {
+                    None
+                } else {
+                    Some(Mode::Other(n))
+                }
+            }
         }
     }
-    /// The meta-child tag for this mode, if any (a plain file has none).
+    /// The meta-child tag NAME for this mode, if any (a plain file has none).
+    /// `Other` shares tag `o`; its distinguishing octal lives in the tag blob.
     pub fn tag(self) -> Option<&'static [u8]> {
         match self {
             Mode::File => None,
             Mode::Exec => Some(TAG_EXEC),
             Mode::Symlink => Some(TAG_SYMLINK),
             Mode::Gitlink => Some(TAG_GITLINK),
+            Mode::Other(_) => Some(TAG_OTHER),
         }
+    }
+}
+
+/// Decode a mode-tag child (`x`/`l`/`m`/`o`) into its `Mode`, reading the `o`
+/// tag's blob for the exact octal. Returns `None` if `name` is not a mode tag.
+fn tag_mode(name: &[u8], blob: Option<&[u8]>) -> Option<Mode> {
+    match name {
+        TAG_EXEC => Some(Mode::Exec),
+        TAG_SYMLINK => Some(Mode::Symlink),
+        TAG_GITLINK => Some(Mode::Gitlink),
+        TAG_OTHER => Some(Mode::Other(mode_num(blob.unwrap_or(&[])))),
+        _ => None,
     }
 }
 
@@ -219,10 +262,13 @@ pub fn entry_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 /// pruned, silently dropping the mode or bitmap. Pass `bitmap = None` to omit
 /// the `lanes` child (all-ones → every live lane).
 pub fn variant_node(content: &[u8], mode: Mode, bitmap: Option<&[u8]>) -> depot::Node {
-    let empty = || depot::Node { blob: depot::BlobOp::Set((&b""[..]).into()), ..depot::Node::keep() };
+    let tagged = |blob: Vec<u8>| depot::Node { blob: depot::BlobOp::Set(blob.into()), ..depot::Node::keep() };
     let mut n = depot::Node { blob: depot::BlobOp::Set(content.into()), ..depot::Node::keep() };
     if let Some(tag) = mode.tag() {
-        n.children.insert(tag.to_vec(), empty());
+        // Canonical tags (`x`/`l`/`m`) carry an empty non-identity blob; the
+        // `o` tag carries the exact octal so the mode reconstructs verbatim.
+        let blob = if let Mode::Other(m) = mode { format!("{m:o}").into_bytes() } else { Vec::new() };
+        n.children.insert(tag.to_vec(), tagged(blob));
     }
     if let Some(bm) = bitmap {
         n.children.insert(LANES.to_vec(), depot::Node { blob: depot::BlobOp::Set(bm.into()), ..depot::Node::keep() });
@@ -697,12 +743,10 @@ fn read_facets(cur: &mut Cursor) -> Result<(Mode, Option<Vec<u8>>), WErr> {
     for _ in 0..n.child_count {
         let m = cur.name()?.to_vec();
         let mn = cur.node()?;
-        match m.as_slice() {
-            LANES => bitmap = Some(mn.blob.unwrap_or(&[]).to_vec()),
-            TAG_EXEC => mode = Mode::Exec,
-            TAG_SYMLINK => mode = Mode::Symlink,
-            TAG_GITLINK => mode = Mode::Gitlink,
-            _ => {}
+        if m.as_slice() == LANES {
+            bitmap = Some(mn.blob.unwrap_or(&[]).to_vec());
+        } else if let Some(tm) = tag_mode(&m, mn.blob) {
+            mode = tm;
         }
         for _ in 0..mn.child_count {
             cur.name()?;
@@ -769,12 +813,10 @@ fn emit_absolute_file(
         let m = cur.name()?.to_vec();
         let mn = cur.node()?;
         if !is_removal(&mn) {
-            match m.as_slice() {
-                LANES => bitmap = Some(mn.blob.unwrap_or(&[]).to_vec()),
-                TAG_EXEC => mode = Mode::Exec,
-                TAG_SYMLINK => mode = Mode::Symlink,
-                TAG_GITLINK => mode = Mode::Gitlink,
-                _ => {}
+            if m.as_slice() == LANES {
+                bitmap = Some(mn.blob.unwrap_or(&[]).to_vec());
+            } else if let Some(tm) = tag_mode(&m, mn.blob) {
+                mode = tm;
             }
         }
         for _ in 0..mn.child_count {
@@ -843,27 +885,19 @@ fn both_child(
             for _ in 0..dn.child_count {
                 let m = d.name()?.to_vec();
                 let mn = d.node()?;
-                let tag = match m.as_slice() {
-                    LANES => {
-                        bitmap = if is_removal(&mn) { None } else { Some(mn.blob.unwrap_or(&[]).to_vec()) };
-                        None
-                    }
-                    TAG_EXEC => Some(Mode::Exec),
-                    TAG_SYMLINK => Some(Mode::Symlink),
-                    TAG_GITLINK => Some(Mode::Gitlink),
-                    _ => None,
-                };
-                if let Some(t) = tag {
+                if m.as_slice() == LANES {
+                    bitmap = if is_removal(&mn) { None } else { Some(mn.blob.unwrap_or(&[]).to_vec()) };
+                } else if tag_mode(&m, None).is_some() {
+                    // A mode tag child. A removal reverts to plain ONLY if it
+                    // was the active tag (compare by tag NAME, so an `o` tag's
+                    // blob is irrelevant to the revert); otherwise it sets the
+                    // decoded mode (reading the `o` blob for the exact octal).
                     if is_removal(&mn) {
-                        // Holing a tag reverts to plain ONLY if it was the
-                        // active one — a hole of some other mode's leftover tag
-                        // must not clobber a tag Set (or restored) by another
-                        // child here.
-                        if mode == t {
+                        if mode.tag() == Some(m.as_slice()) {
                             mode = Mode::File;
                         }
-                    } else {
-                        mode = t;
+                    } else if let Some(tm) = tag_mode(&m, mn.blob) {
+                        mode = tm;
                     }
                 }
                 for _ in 0..mn.child_count {
@@ -934,7 +968,7 @@ fn tree_oid(dir: &BTreeMap<Vec<u8>, TNode>) -> Result<String, WErr> {
                 } else {
                     crate::git_obj_oid("blob", content)
                 };
-                (mode.octal().to_vec(), oid, false)
+                (mode.octal(), oid, false)
             }
             TNode::Dir(sub) => (b"40000".to_vec(), tree_oid(sub)?, true),
         };
@@ -1073,12 +1107,10 @@ fn visit_level<'b>(
                 for _ in 0..vnode.child_count {
                     let mname = cur.name()?;
                     let mnode = cur.node()?;
-                    match mname {
-                        LANES => bitmap = Some(mnode.blob.unwrap_or(&[])),
-                        TAG_EXEC => mode = Mode::Exec,
-                        TAG_SYMLINK => mode = Mode::Symlink,
-                        TAG_GITLINK => mode = Mode::Gitlink,
-                        _ => {}
+                    if mname == LANES {
+                        bitmap = Some(mnode.blob.unwrap_or(&[]));
+                    } else if let Some(tm) = tag_mode(mname, mnode.blob) {
+                        mode = tm;
                     }
                     // Meta nodes are leaves; drain any children defensively.
                     for _ in 0..mnode.child_count {
@@ -1330,6 +1362,38 @@ mod tests {
         let bytes = encode_union(&lanes);
         for (j, t) in lanes.iter().enumerate() {
             assert_eq!(view_lane(&bytes, j as u32), expect_lane(t), "lane {j}");
+        }
+    }
+
+    /// Non-canonical historical modes (e.g. `100664`) must round-trip verbatim
+    /// through the union: encode → extract → serialize reproduces the exact mode
+    /// bytes, so the reconstructed git tree oid is SHA-exact. This is the §2
+    /// capability that makes the union a valid TREES payload for git.git's
+    /// earliest history.
+    #[test]
+    fn other_mode_round_trips_through_union() {
+        let m664 = Mode::from_octal(b"100664").expect("100664 is a file mode");
+        assert_eq!(m664, Mode::Other(0o100664));
+        assert_eq!(m664.octal(), b"100664");
+        assert_eq!(Mode::from_octal(b"40000"), None, "dir carries no variant");
+        let lanes = vec![
+            lane(&[(b"a", m664, b"A", b"A"), (b"b", Mode::File, b"B", b"B")]),
+            lane(&[(b"a", m664, b"A", b"A"), (b"b", Mode::Exec, b"B2", b"B2")]),
+        ];
+        let bytes = encode_union(&lanes);
+        for (j, t) in lanes.iter().enumerate() {
+            assert_eq!(view_lane(&bytes, j as u32), expect_lane(t), "lane {j} mode-faithful");
+        }
+        // A delta that FLIPS a's mode 100664 -> 100644 (a fresh variant/slot):
+        let new_lanes = vec![
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"B", b"B")]),
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::Exec, b"B2", b"B2")]),
+        ];
+        let delta = delta_multi_lane(&bytes, &lanes, &new_lanes);
+        let mut nf = Vec::new();
+        depot::stream::overlay_full(&bytes, &delta, &mut nf).unwrap();
+        for (j, t) in new_lanes.iter().enumerate() {
+            assert_eq!(view_lane(&nf, j as u32), expect_lane(t), "flipped lane {j}");
         }
     }
 
