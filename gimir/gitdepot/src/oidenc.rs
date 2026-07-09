@@ -22,14 +22,10 @@ use std::sync::Arc;
 
 use depot::{Attrs, BlobOp, Bytes, Layer, Name, Node, View};
 
+use crate::geostack::GeoStack;
 use crate::layer::{self, dir_key, file_key, variant_node, Mode};
 use crate::reslot::{Bitmap, Occupant, SlotChange, Slots};
 use crate::Result;
-
-/// The `Mode` of a slot occupant (its variant identity carries the octal).
-fn occ_mode(o: &Occupant<VarKey>) -> Mode {
-    Mode::from_octal(&o.id.0).unwrap_or(Mode::File)
-}
 
 /// A tree entry as it stands for one lane at one path: the git mode, the
 /// object oid (hex), and whether it is a subdirectory (mode `40000`).
@@ -100,16 +96,9 @@ type VarKey = (Vec<u8>, String);
 /// `old = None`.
 pub type Trans<'a> = (usize, Option<&'a Ent>, Option<&'a Ent>);
 
-#[derive(Default)]
-struct Skel {
-    slots: Slots<VarKey>,
-    children: BTreeMap<Name, Skel>,
-}
-impl Skel {
-    fn is_empty(&self) -> bool {
-        self.slots.is_empty() && self.children.is_empty()
-    }
-}
+/// A per-path lane transition (a file appearing / changing / vanishing at a
+/// path for one lane), owned — as distributed by [`distribute_children`].
+type OwnedTrans = (usize, Option<Ent>, Option<Ent>);
 
 fn set_bit(bm: &mut Bitmap, i: usize) {
     let byte = i / 8;
@@ -300,95 +289,71 @@ fn distribute_children(
     Ok(child_trans)
 }
 
-/// Reverse delta for a DIRECTORY level (`children` = its child sub-skeletons):
-/// diff each lane's old/new tree, and for every changed child NAME emit that
-/// name's §2 contributions — file variants as `file_key(name, slot)` siblings
-/// and its subdirectory as a bare `dir_key(name)` node. The returned node,
-/// applied onto the NEW union state, rebuilds the previous one.
-fn advance_dir(
-    children: &mut BTreeMap<Name, Skel>,
+/// Recursively distribute the revision's root transitions into per-PATH file
+/// transitions (§6, the git side of the lockstep): `full path → [(lane, old
+/// entry, new entry)]` for every path where some lane's FILE appears, changes,
+/// or vanishes. O(changed) — an unchanged subtree is pruned by oid at every
+/// level ([`distribute_children`]).
+fn collect_trans(
     trans: &[Trans],
     obj: &mut dyn Objects,
-    prev_live: &[u8],
-    new_live: &[u8],
-) -> Result<Node> {
-    let mut out = Node::keep();
+    path: &mut Vec<u8>,
+    out: &mut BTreeMap<Vec<u8>, Vec<OwnedTrans>>,
+) -> Result<()> {
     let child_trans = distribute_children(trans, obj)?;
     for (name, sub_raw) in child_trans {
+        let base = path.len();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&name);
+        if sub_raw.iter().any(|(_, o, n)| is_file(o.as_ref()) || is_file(n.as_ref())) {
+            out.insert(path.clone(), sub_raw.clone());
+        }
         let sr: Vec<Trans> = sub_raw.iter().map(|(l, o, n)| (*l, o.as_ref(), n.as_ref())).collect();
-        let child = children.entry(name.clone()).or_default();
-
-        // File variants of `name` → `file_key(name, slot)` siblings.
-        if !child.slots.is_empty() || sr.iter().any(|(_, o, n)| is_file(*o) || is_file(*n)) {
-            let new_set = new_variant_set(&child.slots, &sr);
-            for ch in child.slots.reslot(&new_set) {
-                if let Some(node) = variant_reverse_node(&ch, obj, prev_live, new_live)? {
-                    out.children.insert(file_key(&name, ch.slot), node);
-                }
-            }
-        }
-
-        // Subdirectory of `name` → bare `dir_key(name)` node.
-        let dnode = advance_dir(&mut child.children, &sr, obj, prev_live, new_live)?;
-        if !dnode.is_identity() {
-            out.children.insert(dir_key(&name), dnode);
-        }
-
-        if child.is_empty() {
-            children.remove(&name);
-        }
+        collect_trans(&sr, obj, path, out)?;
+        path.truncate(base);
     }
-    Ok(out)
+    Ok(())
 }
 
-/// Emit, into `out`, a `lanes`-child reverse-delta for every UNTOUCHED variant
-/// whose all-ones OMISSION status flips because the live-lane set changed
-/// (a lane born or died) between the previous and new revision — the variants
-/// the reslot transition does not report because their membership did not
-/// change, yet whose stored bitmap form must change so folding reconstructs the
-/// previous revision's omissions exactly. Walked over the PRE-advance skeleton;
-/// touched variants are later overwritten by `advance_dir`'s own deltas.
-fn remat_flips(dir: &Skel, prev_live: &[u8], new_live: &[u8], path: &mut Vec<Name>, out: &mut Node) {
-    for (name, sub) in &dir.children {
-        for (slot, occ) in sub.slots.iter() {
-            let e_before = eff(&occ.bitmap, prev_live);
-            let e_new = eff(&occ.bitmap, new_live);
-            if let Some(child) = lanes_delta_child(&e_before, &e_new) {
-                let mut vn = Node::keep();
-                vn.children.insert(layer::LANES.to_vec(), child);
-                insert_variant(out, path, &file_key(name, slot), vn);
-            }
-        }
-        if !sub.children.is_empty() {
-            path.push(name.clone());
-            remat_flips(sub, prev_live, new_live, path, out);
-            path.pop();
-        }
-    }
-}
-
-/// Descend `out` along `dirs` (creating bare `dir_key` Keep nodes) and insert
-/// `node` at the leaf `key`.
-fn insert_variant(out: &mut Node, dirs: &[Name], key: &[u8], node: Node) {
+/// Descend `out` along the `/`-separated `path` (creating bare `dir_key` Keep
+/// nodes) and insert `node` at `file_key(leaf, slot)`.
+fn put_variant(out: &mut Node, path: &[u8], slot: u32, node: Node) {
+    let parts: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
     let mut cur = out;
-    for d in dirs {
-        cur = cur.children.entry(dir_key(d)).or_insert_with(Node::keep);
+    for dir in &parts[..parts.len() - 1] {
+        cur = cur.children.entry(dir_key(dir)).or_insert_with(Node::keep);
     }
-    cur.children.insert(key.to_vec(), node);
+    cur.children.insert(file_key(parts[parts.len() - 1], slot), node);
 }
 
-/// Merge delta tree `from` into `into`, with `from` winning on any leaf key
-/// collision. Directory keys (bare names) present on both sides recurse; file
-/// variant keys (`\0`-led) never collide across the two callers (touched vs
-/// omission-flipped are disjoint), and `from` replaces if they ever did.
-fn merge_delta(into: &mut Node, from: Node) {
-    for (k, v) in from.children {
-        let is_dir = matches!(layer::classify(&k), Some(layer::Kind::Dir(_)));
-        match into.children.get_mut(&k) {
-            Some(existing) if is_dir => merge_delta(existing, v),
-            _ => {
-                into.children.insert(k, v);
+/// The FORWARD state-delta node for one slot change — applied onto the current
+/// content-free state it produces the new one. The mirror of
+/// [`variant_reverse_node`], with the oid hex as the content and the bitmap
+/// always explicit (the resident state is omission-independent; the all-ones
+/// omission is applied only on emission into a frame, against that revision's
+/// live set).
+fn variant_forward_node(ch: &SlotChange<VarKey>) -> Option<Node> {
+    match (&ch.before, &ch.after) {
+        (None, None) => None,
+        (Some(_), None) => Some(Node::hole()),
+        (None, Some(ao)) => {
+            Some(variant_node(ao.id.1.as_bytes(), occ_mode_id(&ao.id), Some(&ao.bitmap)))
+        }
+        (Some(bo), Some(ao)) => {
+            let mut node = Node::keep();
+            if bo.id.1 != ao.id.1 {
+                node.blob = BlobOp::Set(ao.id.1.as_bytes().into());
             }
+            set_mode_tag(&mut node, occ_mode_id(&ao.id), occ_mode_id(&bo.id));
+            if bo.bitmap != ao.bitmap {
+                node.children.insert(
+                    layer::LANES.to_vec(),
+                    Node { blob: BlobOp::Set(ao.bitmap.as_slice().into()), ..Node::keep() },
+                );
+            }
+            (!node.is_identity() || !node.children.is_empty()).then_some(node)
         }
     }
 }
@@ -416,84 +381,33 @@ fn variant_view(content: Bytes, mode: Mode, bitmap: Option<&[u8]>) -> View {
     View { blob: Some(content), attrs: Attrs::new(), children }
 }
 
-/// Materialize the current skeleton state as the §2 union View, with the
-/// all-ones `lanes` omission applied against `live` (the lanes live at this —
-/// the newest — revision). Each child name emits its file variants as
-/// `file_key(name, slot)` siblings and its subtree as `dir_key(name)`. The
-/// `f0`/seal head is `diff(None, view)`.
-fn full_view_dir(dir: &Skel, obj: &mut dyn Objects, live: &[u8]) -> Result<View> {
-    let mut children: BTreeMap<Name, Arc<View>> = BTreeMap::new();
-    for (name, sub) in &dir.children {
-        for (slot, occ) in sub.slots.iter() {
-            let content = obj.blob(&occ.id.1)?;
-            let bm = eff(&occ.bitmap, live);
-            children.insert(file_key(name, slot), Arc::new(variant_view(content.into(), occ_mode(occ), bm.as_deref())));
-        }
-        if !sub.children.is_empty() {
-            children.insert(dir_key(name), Arc::new(full_view_dir(sub, obj, live)?));
-        }
-    }
-    Ok(View { blob: None, attrs: Attrs::new(), children })
-}
-
 fn is_file(e: Option<&Ent>) -> bool {
     e.is_some_and(|e| !e.is_dir)
 }
 
-/// Serialize the content-free working state as §2 union bytes: each variant's
-/// git `(mode, oid)` identity stored with the OID HEX in the content slot (never
-/// the blob content — content is fetched by oid only when a real frame node is
-/// emitted, §6) and its EXPLICIT lane bitmap (no all-ones omission here — the
-/// working state is omission-independent; omission is applied only when a delta
-/// or full head is emitted, against the live set of that revision). This IS the
-/// encoder's resident state: the byte encoding, not a node tree (§5/method
-/// preamble — "run over the byte encoding directly; no auxiliary in-memory tree
-/// of nodes"). The `Skel` below is reconstituted transiently for one op and
-/// dropped; nothing whole-repo is held resident as nodes.
-fn state_bytes(root: &Skel) -> Vec<u8> {
-    fn dir(s: &Skel) -> Node {
-        let mut out = Node::keep();
-        for (name, sub) in &s.children {
-            for (slot, occ) in sub.slots.iter() {
-                let mode = occ_mode(occ);
-                out.children
-                    .insert(file_key(name, slot), variant_node(occ.id.1.as_bytes(), mode, Some(&occ.bitmap)));
-            }
-            if !sub.children.is_empty() {
-                out.children.insert(dir_key(name), dir(sub));
-            }
-        }
-        out
-    }
-    depot::codec::encode(&Layer { root: dir(root) })
+/// delta ∘ delta for the stack (§4 compose — holes survive), at the byte level.
+fn compose2(lower: Vec<u8>, upper: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::new();
+    depot::stream::compose_stream(&lower, &upper, &mut out)
+        .expect("compose_stream on canonical state layers");
+    out
 }
 
-/// Reconstitute the transient `Skel` from the working-state bytes: the exact
-/// inverse of [`state_bytes`]. Slot keys and raw bitmaps are read back
-/// verbatim, so the reslot and omission logic see byte-identical state to what
-/// was stored — a stored reverse delta reconstructs its frame exactly.
-fn state_to_skel(bytes: &[u8]) -> Result<Skel> {
-    let mut root = Skel::default();
-    layer::visit_entries(bytes, |e| {
-        let mut cur = &mut root;
-        for seg in e.path.split(|&b| b == b'/') {
-            cur = cur.children.entry(seg.to_vec()).or_default();
-        }
-        let oid = String::from_utf8_lossy(e.content).into_owned();
-        cur.slots.set(e.slot, Occupant { id: (e.mode.octal(), oid), bitmap: e.bitmap.unwrap_or(&[]).to_vec() });
-    })
-    .map_err(|d| crate::Error::Chain(format!("working-state decode: {d:?}")))?;
-    Ok(root)
+/// The canonical bytes of the empty state (an empty union is a real object).
+fn empty_state() -> Vec<u8> {
+    depot::codec::encode(&Layer { root: Node::keep() })
 }
 
-/// The stateful union encoder. Its resident state is the §2 byte encoding of the
-/// current union (`state`), content-free (oids, not blobs). No whole-repo node
-/// tree is held between revisions — [`Skel`] is reconstituted transiently for
-/// one op and dropped. (Stage 2: replace the transient rebuild with an
-/// `O(changed)` lockstep so the state is a fixed `refPrefix` + delta stack read
-/// in one pruned pass, never rebuilt per revision — §5/§6.)
+/// The stateful union encoder (§5). Its resident state is the byte encoding:
+/// `refprefix` — the sealed full-state, canonical §2 layer bytes of the
+/// content-free union (the git oid hex in each variant's content slot, lane
+/// bitmaps explicit) — plus the live forward-delta `stack`, geometric-compacted
+/// (70% rule) with `compose_stream`. Current state is read by ONE lockstep
+/// stream over `refprefix` + stack ([`layer::visit_stacked`]); a full union is
+/// never built to make the next delta, and no whole-repo node tree exists.
 pub struct Encoder {
-    state: Vec<u8>,
+    refprefix: Vec<u8>,
+    stack: GeoStack<Vec<u8>>,
 }
 
 /// One variant read back from a stored boundary union, to seed the encoder for
@@ -513,7 +427,7 @@ pub struct SeedVariant {
 
 impl Encoder {
     pub fn new() -> Self {
-        Encoder { state: state_bytes(&Skel::default()) }
+        Encoder { refprefix: empty_state(), stack: GeoStack::new() }
     }
 
     /// Reconstruct an encoder whose state IS a stored boundary union: place
@@ -522,25 +436,30 @@ impl Encoder {
     /// original encode, so `advance`-ing new revisions onto it and prepending
     /// the reverse deltas reproduces the stored boundary byte-for-byte.
     pub fn seed(variants: Vec<SeedVariant>) -> Encoder {
-        let mut root = Skel::default();
+        let mut root = Node::keep();
         for v in variants {
-            let mut cur = &mut root;
-            for seg in v.path.split(|&b| b == b'/') {
-                cur = cur.children.entry(seg.to_vec()).or_default();
-            }
-            cur.slots.set(v.slot, Occupant { id: (v.mode, v.oid), bitmap: v.bitmap });
+            let mode = Mode::from_octal(&v.mode).unwrap_or(Mode::File);
+            put_variant(&mut root, &v.path, v.slot, variant_node(v.oid.as_bytes(), mode, Some(&v.bitmap)));
         }
-        Encoder { state: state_bytes(&root) }
+        Encoder { refprefix: depot::codec::encode(&Layer { root }), stack: GeoStack::new() }
     }
 
     /// Apply this revision's lane transitions and return the reverse delta
     /// rebuilding the PREVIOUS state from the new one — each older chain
-    /// record (removals as holes). Reads tree objects for the changed
-    /// subtrees only. `prev_live`/`new_live` are the lane sets live at the
-    /// previous/new revisions; they drive the all-ones `lanes` omission and,
-    /// when they differ (a lane born/died), the untouched-variant
-    /// re-materialization (`remat_flips`) so folding reconstructs the previous
-    /// revision's omissions exactly.
+    /// record (removals as holes). §6, both sides of the lockstep:
+    ///
+    /// - **git side** — [`collect_trans`] distributes the lane transitions into
+    ///   per-path file transitions, O(changed) by the oid prune;
+    /// - **stored side** — ONE lockstep stream over `refprefix` + stack
+    ///   ([`layer::visit_stacked`]) yields the current variants (slot, `(mode,
+    ///   oid)`, bitmap) at the changed paths — the oid read from the stream,
+    ///   never by hashing — and, when the live-lane set moved (a lane born or
+    ///   died), the untouched variants whose all-ones omission flips.
+    ///
+    /// Each changed path is reconciled by the §6 reslot; each slot change emits
+    /// a reverse node into the chain record (content fetched by oid only here)
+    /// and a forward node into the state delta, which is pushed on the
+    /// geometric stack (§5 — push and compact, holes survive).
     pub fn advance(
         &mut self,
         trans: &[Trans],
@@ -548,15 +467,73 @@ impl Encoder {
         prev_live: &[u8],
         new_live: &[u8],
     ) -> Result<Layer> {
-        let mut skel = state_to_skel(&self.state)?;
-        let mut root = Node::keep();
-        if trim(prev_live) != trim(new_live) {
-            remat_flips(&skel, prev_live, new_live, &mut Vec::new(), &mut root);
+        // §6 git side: the changed paths and their per-lane transitions.
+        let mut path_trans: BTreeMap<Vec<u8>, Vec<OwnedTrans>> = BTreeMap::new();
+        collect_trans(trans, obj, &mut Vec::new(), &mut path_trans)?;
+
+        // §6 stored side: one lockstep pass over refPrefix + stack.
+        let live_changed = trim(prev_live) != trim(new_live);
+        let mut rev_root = Node::keep();
+        let mut cur_vars: BTreeMap<Vec<u8>, Vec<(u32, VarKey, Bitmap)>> = BTreeMap::new();
+        layer::visit_stacked(&self.refprefix, self.stack.layers(), |path, mode, slot, bitmap, content| {
+            let bm = bitmap.unwrap_or_default();
+            if path_trans.contains_key(path) {
+                let oid = String::from_utf8_lossy(&content).into_owned();
+                cur_vars.entry(path.to_vec()).or_default().push((slot, (mode.octal(), oid), bm));
+            } else if live_changed {
+                // Untouched path: emit the omission flip if the variant's
+                // stored `lanes` form moves with the live set.
+                if let Some(child) = lanes_delta_child(&eff(&bm, prev_live), &eff(&bm, new_live)) {
+                    let mut vn = Node::keep();
+                    vn.children.insert(layer::LANES.to_vec(), child);
+                    put_variant(&mut rev_root, path, slot, vn);
+                }
+            }
+        })
+        .map_err(|e| crate::Error::Chain(format!("state stream: {e:?}")))?;
+
+        // Per-path reslot: reverse chain node + forward state node per change.
+        let mut fwd_root = Node::keep();
+        for (path, tlist) in &path_trans {
+            let cvars = cur_vars.remove(path).unwrap_or_default();
+            let mut slots: Slots<VarKey> = Slots::default();
+            for (s, id, bm) in &cvars {
+                slots.set(*s, Occupant { id: id.clone(), bitmap: bm.clone() });
+            }
+            let tr: Vec<Trans> = tlist.iter().map(|(l, o, n)| (*l, o.as_ref(), n.as_ref())).collect();
+            let new_set = new_variant_set(&slots, &tr);
+            let changes = slots.reslot(&new_set);
+            let changed: std::collections::BTreeSet<u32> = changes.iter().map(|c| c.slot).collect();
+            for ch in &changes {
+                if let Some(node) = variant_reverse_node(ch, obj, prev_live, new_live)? {
+                    put_variant(&mut rev_root, path, ch.slot, node);
+                }
+                if let Some(node) = variant_forward_node(ch) {
+                    put_variant(&mut fwd_root, path, ch.slot, node);
+                }
+            }
+            if live_changed {
+                // Slots at this path the reslot did not touch still flip their
+                // omission form when the live set moved.
+                for (s, _, bm) in &cvars {
+                    if changed.contains(s) {
+                        continue;
+                    }
+                    if let Some(child) = lanes_delta_child(&eff(bm, prev_live), &eff(bm, new_live)) {
+                        let mut vn = Node::keep();
+                        vn.children.insert(layer::LANES.to_vec(), child);
+                        put_variant(&mut rev_root, path, *s, vn);
+                    }
+                }
+            }
         }
-        let changed = advance_dir(&mut skel.children, trans, obj, prev_live, new_live)?;
-        merge_delta(&mut root, changed); // reslot deltas win over remat flips
-        self.state = state_bytes(&skel);
-        Ok(Layer { root })
+
+        // §5 push and compact (holes survive under compose).
+        if !fwd_root.children.is_empty() {
+            let delta = depot::codec::encode(&Layer { root: fwd_root });
+            self.stack.push(delta, |l| l.len() as u64, compose2);
+        }
+        Ok(Layer { root: rev_root })
     }
 
     /// The forward full delta of the current state — the `f0` head and every
@@ -564,9 +541,63 @@ impl Encoder {
     /// emitting nodes directly) so it is byte-identical to the anchor the
     /// reader recomputes for a cold frame — `diff(None, reconstructed-view)`.
     /// Any non-canonical divergence there fails the frame's refPrefix check.
+    /// This materializes the union — by design only at a frame write (§5 seal).
     pub fn full(&self, obj: &mut dyn Objects, live: &[u8]) -> Result<Layer> {
-        let skel = state_to_skel(&self.state)?;
-        Ok(depot::diff(None, Some(&full_view_dir(&skel, obj, live)?)))
+        // Container-keyed view tree, built from one stream over the state.
+        enum Vn {
+            File(View),
+            Dir(BTreeMap<Vec<u8>, Vn>),
+        }
+        fn to_view(dir: BTreeMap<Vec<u8>, Vn>) -> View {
+            let mut children: BTreeMap<Name, Arc<View>> = BTreeMap::new();
+            for (k, v) in dir {
+                let vv = match v {
+                    Vn::File(f) => f,
+                    Vn::Dir(d) => to_view(d),
+                };
+                children.insert(k, Arc::new(vv));
+            }
+            View { blob: None, attrs: Attrs::new(), children }
+        }
+
+        let mut flat: Vec<(Vec<u8>, Mode, u32, Bitmap, String)> = Vec::new();
+        layer::visit_stacked(&self.refprefix, self.stack.layers(), |path, mode, slot, bitmap, content| {
+            let oid = String::from_utf8_lossy(&content).into_owned();
+            flat.push((path.to_vec(), mode, slot, bitmap.unwrap_or_default(), oid));
+        })
+        .map_err(|e| crate::Error::Chain(format!("state stream: {e:?}")))?;
+
+        let mut root: BTreeMap<Vec<u8>, Vn> = BTreeMap::new();
+        for (path, mode, slot, bm, oid) in flat {
+            let content = obj.blob(&oid)?;
+            let ebm = eff(&bm, live);
+            let segs: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+            let mut cur = &mut root;
+            for seg in &segs[..segs.len() - 1] {
+                let e = cur.entry(dir_key(seg)).or_insert_with(|| Vn::Dir(BTreeMap::new()));
+                cur = match e {
+                    Vn::Dir(d) => d,
+                    Vn::File(_) => unreachable!("dir_key/file_key never collide"),
+                };
+            }
+            cur.insert(
+                file_key(segs[segs.len() - 1], slot),
+                Vn::File(variant_view(content, mode, ebm.as_deref())),
+            );
+        }
+        Ok(depot::diff(None, Some(&to_view(root))))
+    }
+
+    /// §5 seal (a frame write): flatten the live stack into a fresh
+    /// `refPrefix` — overlay, holes dissolve to removals — and clear it.
+    pub fn seal_state(&mut self) {
+        let stack = std::mem::take(&mut self.stack);
+        if let Some(combined) = stack.collapse(compose2) {
+            let mut out = Vec::new();
+            depot::stream::overlay_full(&self.refprefix, &combined, &mut out)
+                .expect("overlay_full on canonical state layers");
+            self.refprefix = out;
+        }
     }
 }
 

@@ -53,7 +53,7 @@ const NUL: u8 = 0;
 
 /// Meta child names under a variant node.
 use std::collections::BTreeMap;
-use depot::walk::DecodeError as WErr;
+use depot::walk::{Cursor, DecodeError as WErr};
 
 pub const LANES: &[u8] = b"lanes";
 pub const TAG_EXEC: &[u8] = b"x";
@@ -364,6 +364,304 @@ pub fn extract_lane_entries(union: &[u8], lane: u32) -> Result<Vec<(Vec<u8>, Mod
         }
     })?;
     Ok(out)
+}
+
+// --------------------------------------------- stacked current-state reader
+
+/// A hole in the byte encoding: backdrop anchor, no blob, no children.
+fn is_removal(n: &depot::walk::Node) -> bool {
+    n.backdrop && n.blob.is_none() && n.child_count == 0
+}
+
+/// The effective current variants — the base full-state overlaid with the live
+/// delta stack (§5: `refPrefix` + stack) — yielded per file in container order
+/// WITHOUT materializing the union. Directories are walked in lockstep; only a
+/// TOUCHED leaf variant is resolved (into a few owned facets), an untouched
+/// base subtree streams straight through. `visit` gets `(path, mode, slot,
+/// bitmap, content)` — over the encoder's content-free state the content is
+/// the variant's git oid hex, so the §6 `(mode, oid)` identity is read directly
+/// from the stream, never by hashing.
+///
+/// The stack is collapsed first with `compose_stream` (delta ∘ delta — holes
+/// survive); the geometric stack keeps it to ~log(n) small layers, so the
+/// collapse and the second lockstep stream stay bounded — the big `base` is
+/// never re-sorted or copied.
+pub fn visit_stacked(
+    base: &[u8],
+    stack: &[Vec<u8>],
+    mut visit: impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>, Vec<u8>),
+) -> Result<(), WErr> {
+    let mut combined = Vec::new();
+    if let Some((first, rest)) = stack.split_first() {
+        combined = first.clone();
+        for layer in rest {
+            let mut next = Vec::new();
+            depot::stream::compose_stream(&combined, layer, &mut next)?; // lower, upper
+            combined = next;
+        }
+    }
+    let mut path = Vec::new();
+    let mut bc = Cursor::new(base);
+    if combined.is_empty() {
+        let bn = bc.node()?;
+        return base_subtree(&mut bc, bn.child_count, &mut path, &mut visit);
+    }
+    let mut dc = Cursor::new(&combined);
+    let bn = bc.node()?;
+    let dn = dc.node()?;
+    merge_children(Some(&mut bc), bn.child_count, Some(&mut dc), dn.child_count, &mut path, &mut visit)
+}
+
+fn next_name(cur: &mut Option<&mut Cursor>, remaining: &mut u64) -> Result<Option<Vec<u8>>, WErr> {
+    if *remaining == 0 {
+        return Ok(None);
+    }
+    *remaining -= 1;
+    Ok(Some(cur.as_mut().unwrap().name()?.to_vec()))
+}
+
+/// Lockstep-merge one directory level of the base and the delta by container
+/// order (raw name bytewise — the codec's stored order). Each cursor, when
+/// present, is positioned just past its dir header (at its first child name).
+fn merge_children(
+    mut b: Option<&mut Cursor>,
+    mut brem: u64,
+    mut d: Option<&mut Cursor>,
+    mut drem: u64,
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>, Vec<u8>),
+) -> Result<(), WErr> {
+    let mut bname = next_name(&mut b, &mut brem)?;
+    let mut dname = next_name(&mut d, &mut drem)?;
+    loop {
+        let order = match (&bname, &dname) {
+            (None, None) => break,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(bn), Some(dn)) => bn.cmp(dn),
+        };
+        match order {
+            std::cmp::Ordering::Less => {
+                let name = bname.take().unwrap();
+                base_child(b.as_mut().unwrap(), &name, path, visit)?;
+                bname = next_name(&mut b, &mut brem)?;
+            }
+            std::cmp::Ordering::Greater => {
+                let name = dname.take().unwrap();
+                delta_only_child(d.as_mut().unwrap(), &name, path, visit)?;
+                dname = next_name(&mut d, &mut drem)?;
+            }
+            std::cmp::Ordering::Equal => {
+                let name = bname.take().unwrap();
+                both_child(b.as_mut().unwrap(), d.as_mut().unwrap(), &name, path, visit)?;
+                bname = next_name(&mut b, &mut brem)?;
+                dname = next_name(&mut d, &mut drem)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a variant node's content + mode + bitmap facets from `cur` (positioned
+/// at the node), consuming it whole.
+fn read_facets(cur: &mut Cursor) -> Result<(Mode, Option<Vec<u8>>, Vec<u8>), WErr> {
+    let n = cur.node()?;
+    let content = n.blob.unwrap_or(&[]).to_vec();
+    let mut mode = Mode::File;
+    let mut bitmap = None;
+    for _ in 0..n.child_count {
+        let m = cur.name()?.to_vec();
+        let mn = cur.node()?;
+        if m.as_slice() == LANES {
+            bitmap = Some(mn.blob.unwrap_or(&[]).to_vec());
+        } else if let Some(tm) = tag_mode(&m, mn.blob) {
+            mode = tm;
+        }
+        for _ in 0..mn.child_count {
+            cur.name()?;
+            cur.skip()?;
+        }
+    }
+    Ok((mode, bitmap, content))
+}
+
+/// A child present only in the base (delta does not touch it): walk it as-is.
+fn base_child(
+    cur: &mut Cursor,
+    name: &[u8],
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>, Vec<u8>),
+) -> Result<(), WErr> {
+    match classify(name) {
+        Some(Kind::File(gitname, slot)) => {
+            let base = push_seg(path, gitname);
+            let (mode, bitmap, content) = read_facets(cur)?;
+            visit(&path[..], mode, slot, bitmap, content);
+            path.truncate(base);
+        }
+        Some(Kind::Dir(gitname)) => {
+            let base = push_seg(path, gitname);
+            let n = cur.node()?;
+            base_subtree(cur, n.child_count, path, visit)?;
+            path.truncate(base);
+        }
+        None => cur.skip()?,
+    }
+    Ok(())
+}
+
+/// Walk a whole base subtree (no delta), yielding every variant.
+fn base_subtree(
+    cur: &mut Cursor,
+    count: u64,
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>, Vec<u8>),
+) -> Result<(), WErr> {
+    for _ in 0..count {
+        let name = cur.name()?.to_vec();
+        base_child(cur, &name, path, visit)?;
+    }
+    Ok(())
+}
+
+/// Read a delta file node's meta as ABSOLUTE facets (base is empty — a fresh
+/// variant or a backdrop restoration), consuming the node's children, and emit
+/// it if it is a real variant (carries content). A pure hole (no blob, no
+/// children) is consumed and yields nothing.
+fn emit_absolute_file(
+    cur: &mut Cursor,
+    node: &depot::walk::Node,
+    gitname: &[u8],
+    slot: u32,
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>, Vec<u8>),
+) -> Result<(), WErr> {
+    let mut mode = Mode::File;
+    let mut bitmap = None;
+    for _ in 0..node.child_count {
+        let m = cur.name()?.to_vec();
+        let mn = cur.node()?;
+        if !is_removal(&mn) {
+            if m.as_slice() == LANES {
+                bitmap = Some(mn.blob.unwrap_or(&[]).to_vec());
+            } else if let Some(tm) = tag_mode(&m, mn.blob) {
+                mode = tm;
+            }
+        }
+        for _ in 0..mn.child_count {
+            cur.name()?;
+            cur.skip()?;
+        }
+    }
+    if let Some(content) = node.blob {
+        let base = push_seg(path, gitname);
+        visit(&path[..], mode, slot, bitmap, content.to_vec());
+        path.truncate(base);
+    }
+    Ok(())
+}
+
+/// A child present only in the delta: its current value is the delta resolved
+/// over nothing — a pure hole vanishes, a set (or backdrop restoration)
+/// appears, a subtree recurses.
+fn delta_only_child(
+    cur: &mut Cursor,
+    name: &[u8],
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>, Vec<u8>),
+) -> Result<(), WErr> {
+    match classify(name) {
+        Some(Kind::File(gitname, slot)) => {
+            let n = cur.node()?;
+            emit_absolute_file(cur, &n, gitname, slot, path, visit)?;
+        }
+        Some(Kind::Dir(gitname)) => {
+            // A backdrop dir is a restoration/hole: over nothing it is just its
+            // own (possibly empty) positive children.
+            let n = cur.node()?;
+            let base = push_seg(path, gitname);
+            merge_children(None, 0, Some(cur), n.child_count, path, visit)?;
+            path.truncate(base);
+        }
+        None => cur.skip()?,
+    }
+    Ok(())
+}
+
+/// A child present in both. A `backdrop` delta node ERASES the base and
+/// resolves over nothing (a hole → gone, a restoration → its own content); a
+/// non-backdrop node overlays onto the base (keep/replace blob, override meta).
+fn both_child(
+    b: &mut Cursor,
+    d: &mut Cursor,
+    name: &[u8],
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<Vec<u8>>, Vec<u8>),
+) -> Result<(), WErr> {
+    match classify(name) {
+        Some(Kind::File(gitname, slot)) => {
+            let dn = d.node()?;
+            if dn.backdrop {
+                // Base erased; emit the delta node's own positive form.
+                b.skip()?;
+                emit_absolute_file(d, &dn, gitname, slot, path, visit)?;
+                return Ok(());
+            }
+            // Overlay: base facets, then delta meta as overrides (deltas carry
+            // only the CHANGED meta; an absent meta child keeps the base's). A
+            // non-backdrop node never removes — the variant exists.
+            let (mut mode, mut bitmap, mut content) = read_facets(b)?;
+            if let Some(blob) = dn.blob {
+                content = blob.to_vec();
+            }
+            for _ in 0..dn.child_count {
+                let m = d.name()?.to_vec();
+                let mn = d.node()?;
+                if m.as_slice() == LANES {
+                    bitmap = if is_removal(&mn) { None } else { Some(mn.blob.unwrap_or(&[]).to_vec()) };
+                } else if tag_mode(&m, None).is_some() {
+                    // A mode tag child. A removal reverts to plain ONLY if it
+                    // was the active tag (compare by tag NAME, so an `o` tag's
+                    // blob is irrelevant to the revert); otherwise it sets the
+                    // decoded mode (reading the `o` blob for the exact octal).
+                    if is_removal(&mn) {
+                        if mode.tag() == Some(m.as_slice()) {
+                            mode = Mode::File;
+                        }
+                    } else if let Some(tm) = tag_mode(&m, mn.blob) {
+                        mode = tm;
+                    }
+                }
+                for _ in 0..mn.child_count {
+                    d.name()?;
+                    d.skip()?;
+                }
+            }
+            let base = push_seg(path, gitname);
+            visit(&path[..], mode, slot, bitmap, content);
+            path.truncate(base);
+        }
+        Some(Kind::Dir(gitname)) => {
+            let dn = d.node()?;
+            if dn.backdrop {
+                // Base subtree erased; the delta subtree resolves over nothing.
+                b.skip()?;
+                let base = push_seg(path, gitname);
+                merge_children(None, 0, Some(d), dn.child_count, path, visit)?;
+                path.truncate(base);
+                return Ok(());
+            }
+            let bn = b.node()?;
+            let base = push_seg(path, gitname);
+            merge_children(Some(b), bn.child_count, Some(d), dn.child_count, path, visit)?;
+            path.truncate(base);
+        }
+        None => {
+            b.skip()?;
+            d.skip()?;
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------ iterator

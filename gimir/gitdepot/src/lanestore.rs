@@ -311,6 +311,7 @@ fn run_range(
             let f0raw = codec::encode(&enc.full(objs, &st.live)?);
             let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
             depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
+            enc.seal_state(); // §5: a frame write flattens the stack
         } else {
             let rec = codec::encode(&rev);
             st.batch_bytes += 8 + rec.len() as u64;
@@ -320,6 +321,7 @@ fn run_range(
             let head = codec::encode(&enc.full(objs, &st.live)?);
             let staged: Vec<Vec<u8>> = st.batch.drain(..).rev().collect();
             seal_prepend(depot, &head, &staged, level)?;
+            enc.seal_state(); // §5: a frame write flattens the stack
             st.batch_bytes = 0;
             depot.flush().map_err(|e| cf(e.to_string()))?;
         }
@@ -328,11 +330,12 @@ fn run_range(
 }
 
 /// Seal any remaining batch and flush.
-fn finish_range(depot: &Depot, enc: &Encoder, objs: &mut Cat, st: &mut RunState, level: i32) -> Result<()> {
+fn finish_range(depot: &Depot, enc: &mut Encoder, objs: &mut Cat, st: &mut RunState, level: i32) -> Result<()> {
     if !st.batch.is_empty() {
         let head = codec::encode(&enc.full(objs, &st.live)?);
         let staged: Vec<Vec<u8>> = st.batch.drain(..).rev().collect();
         seal_prepend(depot, &head, &staged, level)?;
+        enc.seal_state(); // §5: a frame write flattens the stack
     }
     depot.flush().map_err(|e| cf(e.to_string()))?;
     Ok(())
@@ -508,7 +511,7 @@ impl LaneStore {
         };
         run_range(&depot, &mut enc, &mut objs, &plan, &tree_of, &sha_of, 0..plan.n_rev, &mut st, batch_ram_bound(), level, true)?;
         if plan.n_rev > 0 {
-            finish_range(&depot, &enc, &mut objs, &mut st, level)?;
+            finish_range(&depot, &mut enc, &mut objs, &mut st, level)?;
         }
         let reads = objs.reads;
 
@@ -601,7 +604,7 @@ impl LaneStore {
         let mut st = RunState { lane_tree, live, batch: Vec::new(), batch_bytes: 0 };
         // Advance ONLY the new revisions (O(new)); prepend their reverse deltas.
         run_range(&depot, &mut enc, &mut objs, &plan, &tree_of, &order, old_n..plan.n_rev, &mut st, batch_ram_bound(), level, false)?;
-        finish_range(&depot, &enc, &mut objs, &mut st, level)?;
+        finish_range(&depot, &mut enc, &mut objs, &mut st, level)?;
         let reads = objs.reads;
         let new_revs = plan.n_rev - old_n;
 

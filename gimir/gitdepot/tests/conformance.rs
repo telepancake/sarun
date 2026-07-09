@@ -130,25 +130,40 @@ fn removed_trees_chain_stays_removed() {
     }
 }
 
-/// D3 — the encoder must NOT hold the resident whole-repo union skeleton as a
-/// node tree (Method preamble: "run over the byte encoding directly; there is no
-/// auxiliary in-memory tree of nodes"; §5: "a full union is never built"). The
-/// `Encoder`'s resident state is the §2 byte encoding; `Skel` may exist only as
-/// a transient inside one op, never as an `Encoder` field.
+/// D3 — the encoder must be the §5 frame model, not a node tree (Method
+/// preamble: "run over the byte encoding directly; there is no auxiliary
+/// in-memory tree of nodes"; §5: `refPrefix` + geometric delta stack, current
+/// state read by lockstep iteration — "a full union is never built just to
+/// read a value or to make the next delta").
 #[test]
-fn encoder_holds_no_resident_node_tree() {
+fn encoder_is_refprefix_plus_geometric_stack() {
     let src = read("src/oidenc.rs");
     // Isolate the `struct Encoder { ... }` body and check its fields.
     let start = src.find("pub struct Encoder").expect("Encoder struct exists");
     let body = &src[start..src[start..].find('}').map(|e| start + e).expect("struct close")];
     assert!(
-        body.contains("state: Vec<u8>"),
-        "Encoder's resident state must be the byte encoding (state: Vec<u8>) — \
-         DESIGN §5/method preamble."
+        body.contains("refprefix: Vec<u8>") && body.contains("stack: GeoStack<Vec<u8>>"),
+        "Encoder's resident state must be the §5 frame model — `refprefix: Vec<u8>` \
+         plus `stack: GeoStack<Vec<u8>>` — got:\n{body}"
+    );
+    // The whole-repo node tree (D3's subject) must not exist in any form.
+    for gone in ["struct Skel", ": Skel", "state_to_skel"] {
+        assert!(
+            !src.contains(gone),
+            "oidenc.rs resurrects the resident union node tree (`{gone}`) — \
+             DESIGN §5/method preamble forbid it (DEFECTS D3)."
+        );
+    }
+    // The §5 mechanics must be live: the 70% geometric compaction and the
+    // lockstep stacked read.
+    let geo = read("src/geostack.rs");
+    assert!(
+        geo.contains("10 * top < 7 * next"),
+        "geostack.rs lost the 70% compaction rule (DESIGN §5)."
     );
     assert!(
-        !body.contains(": Skel"),
-        "Encoder holds a resident `Skel` node tree — the whole-repo union skeleton \
-         D3 forbids. Resident state must be the byte encoding, not a node tree."
+        src.contains("visit_stacked"),
+        "oidenc.rs no longer reads current state by lockstep over refPrefix + \
+         stack (layer::visit_stacked) — DESIGN §5/§6."
     );
 }
