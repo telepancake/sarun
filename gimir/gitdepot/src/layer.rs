@@ -336,24 +336,81 @@ fn bitmap_bytes(set: &BTreeSet<u32>) -> Vec<u8> {
 /// entries → two variants, so mode is part of the identity, not just oid.
 type VarId = (Mode, Oid);
 
-/// Group `lanes` into per-path variants: `path -> [(id, content, laneset)]` in
-/// first-appearance order (lane order). All lanes sharing a `(mode, oid)` at a
-/// path are ONE variant (that is what makes them one variant).
-fn union_groups(lanes: &[LaneTree]) -> BTreeMap<Vec<u8>, Vec<(VarId, Vec<u8>, BTreeSet<u32>)>> {
-    let mut out: BTreeMap<Vec<u8>, Vec<(VarId, Vec<u8>, BTreeSet<u32>)>> = BTreeMap::new();
+/// A lane's view of a path WITHOUT the blob content — just the git `(mode,
+/// oid)`, which is all the reslot needs (§6): variants are matched by `(mode,
+/// oid)` and lane bits are moved with no bytes compared. Content is fetched by
+/// oid ([`Objects::blob`]) only when a genuinely new variant node is emitted,
+/// so a whole lane's file contents are never held in RAM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneRef {
+    pub mode: Mode,
+    pub oid: Oid,
+}
+
+/// A content-free lane tree: `path -> (mode, oid)` (paths `/`-separated, no
+/// leading slash). The oid-addressed counterpart of [`LaneTree`].
+pub type LaneTreeRef = BTreeMap<Vec<u8>, LaneRef>;
+
+/// A source of blob content addressed by git oid (§6). The delta/union
+/// encoders read a lane's `(mode, oid)` for free from the lane trees and call
+/// [`Objects::blob`] ONLY when a new variant node must actually be written, so
+/// no encoder ever holds a lane's full file content in memory. The real store
+/// backs this with the git object source; tests back it with [`MemObjects`].
+pub trait Objects {
+    /// The raw blob bytes for `oid`. Called only to emit a fresh variant.
+    fn blob(&mut self, oid: &Oid) -> Result<Vec<u8>, WErr>;
+}
+
+/// An in-memory `oid -> content` map. Backs the content-carrying adapter
+/// ([`encode_union`], [`delta_multi_lane_stacked`]) and the unit tests. Since
+/// git is content-addressed, a repeated oid always maps to identical bytes, so
+/// building one from a set of [`LaneTree`]s is well-defined.
+pub struct MemObjects(pub std::collections::HashMap<Oid, Vec<u8>>);
+
+impl MemObjects {
+    /// Collect every `(oid -> content)` pair carried by these lane trees.
+    pub fn from_lanes(lanes: &[LaneTree]) -> Self {
+        let mut m = std::collections::HashMap::new();
+        for tree in lanes {
+            for e in tree.values() {
+                m.entry(e.oid.clone()).or_insert_with(|| e.content.clone());
+            }
+        }
+        MemObjects(m)
+    }
+}
+
+impl Objects for MemObjects {
+    fn blob(&mut self, oid: &Oid) -> Result<Vec<u8>, WErr> {
+        Ok(self.0.get(oid).cloned().unwrap_or_default())
+    }
+}
+
+/// Strip content off a lane tree, keeping only `(mode, oid)` — the bridge from
+/// the content-carrying [`LaneTree`] API to the oid-addressed one.
+pub fn lane_ref(tree: &LaneTree) -> LaneTreeRef {
+    tree.iter().map(|(p, e)| (p.clone(), LaneRef { mode: e.mode, oid: e.oid.clone() })).collect()
+}
+
+/// Group `lanes` into per-path variants: `path -> [(id, laneset)]` in
+/// first-appearance order (lane order), reading only `(mode, oid)` — no blob
+/// content. All lanes sharing a `(mode, oid)` at a path are ONE variant (that
+/// is what makes them one variant).
+fn union_groups_oid(lanes: &[LaneTreeRef]) -> BTreeMap<Vec<u8>, Vec<(VarId, BTreeSet<u32>)>> {
+    let mut out: BTreeMap<Vec<u8>, Vec<(VarId, BTreeSet<u32>)>> = BTreeMap::new();
     for (j, tree) in lanes.iter().enumerate() {
         let j = j as u32;
         for (path, e) in tree {
             let id: VarId = (e.mode, e.oid.clone());
             let groups = out.entry(path.clone()).or_default();
-            match groups.iter_mut().find(|(gid, ..)| *gid == id) {
-                Some((_, _, set)) => {
+            match groups.iter_mut().find(|(gid, _)| *gid == id) {
+                Some((_, set)) => {
                     set.insert(j);
                 }
                 None => {
                     let mut set = BTreeSet::new();
                     set.insert(j);
-                    groups.push((id, e.content.clone(), set));
+                    groups.push((id, set));
                 }
             }
         }
@@ -361,32 +418,46 @@ fn union_groups(lanes: &[LaneTree]) -> BTreeMap<Vec<u8>, Vec<(VarId, Vec<u8>, BT
     out
 }
 
-/// Build the full-state (refPrefix seed) for a multi-lane frame: every path's
-/// variants stored as siblings, slot = first-appearance rank, bitmap omitted
-/// when it covers all lanes (all-ones → every live lane). Built once per frame;
-/// subsequent layers are deltas via [`delta_multi_lane`].
-pub fn encode_union(lanes: &[LaneTree]) -> Vec<u8> {
+/// Build the full-state (refPrefix seed) for a multi-lane frame from
+/// content-free lane trees, fetching each variant's content by oid from `obj`
+/// (§6) only at the moment its node is emitted. Every path's variants are
+/// stored as siblings, slot = first-appearance rank, bitmap omitted when it
+/// covers all lanes (all-ones → every live lane). Built once per frame;
+/// subsequent layers are deltas via [`delta_multi_lane_stacked_oid`].
+pub fn encode_union_oid(lanes: &[LaneTreeRef], obj: &mut dyn Objects) -> Result<Vec<u8>, WErr> {
     let n = lanes.len() as u32;
-    let groups = union_groups(lanes);
+    let groups = union_groups_oid(lanes);
     let mut root = depot::Node::keep();
     for (path, variants) in &groups {
-        for (slot, ((mode, _oid), content, set)) in variants.iter().enumerate() {
+        for (slot, ((mode, oid), set)) in variants.iter().enumerate() {
             let bm = (set.len() as u32 != n).then(|| bitmap_bytes(set));
-            put_variant(&mut root, path, slot as u32, variant_node(content, *mode, bm.as_deref()));
+            let content = obj.blob(oid)?;
+            put_variant(&mut root, path, slot as u32, variant_node(&content, *mode, bm.as_deref()));
         }
     }
-    depot::codec::encode(&depot::Layer { root })
+    Ok(depot::codec::encode(&depot::Layer { root }))
 }
 
-/// The current variants stored in `old_full`, per path: `(slot, oid, raw stored
-/// bitmap bytes)`. The oid is obtained for FREE from `old_lanes` — any lane in
-/// the variant's bitmap has this file at that oid — never by hashing the
-/// stored content (§3).
-fn current_variants(
+/// Build the full-state (refPrefix seed) for a multi-lane frame — the
+/// content-carrying adapter over [`encode_union_oid`]: every path's variants
+/// stored as siblings, slot = first-appearance rank, bitmap omitted when it
+/// covers all lanes. Built once per frame; subsequent layers are deltas via
+/// [`delta_multi_lane`].
+pub fn encode_union(lanes: &[LaneTree]) -> Vec<u8> {
+    let refs: Vec<LaneTreeRef> = lanes.iter().map(lane_ref).collect();
+    let mut obj = MemObjects::from_lanes(lanes);
+    encode_union_oid(&refs, &mut obj).expect("in-memory objects never fail")
+}
+
+/// The current variants stored in `base` + the live delta `stack`, per path:
+/// `(slot, (mode, oid), raw stored bitmap bytes)`. The oid is obtained for FREE
+/// from `old_lanes` — any lane in the variant's bitmap has this file at that
+/// oid — never by hashing the stored content (§3).
+fn current_variants_ref(
     base: &[u8],
     stack: &[Vec<u8>],
-    old_lanes: &[LaneTree],
-) -> BTreeMap<Vec<u8>, Vec<(u32, VarId, Option<Vec<u8>>)>> {
+    old_lanes: &[LaneTreeRef],
+) -> Result<BTreeMap<Vec<u8>, Vec<(u32, VarId, Option<Vec<u8>>)>>, WErr> {
     let mut cur: BTreeMap<Vec<u8>, Vec<(u32, VarId, Option<Vec<u8>>)>> = BTreeMap::new();
     visit_current(base, stack, |path, mode, slot, bitmap| {
         // A representative lane carrying this variant: the lowest set bit, or
@@ -403,9 +474,8 @@ fn current_variants(
         // mode comes from the stored variant (its mode tag), oid from the lane.
         let id: VarId = (mode, oid);
         cur.entry(path.to_vec()).or_default().push((slot, id, bitmap));
-    })
-    .expect("base + stack are canonical");
-    cur
+    })?;
+    Ok(cur)
 }
 
 /// The delta turning the multi-lane full-state `old_full` (whose variants are
@@ -428,16 +498,45 @@ pub fn delta_multi_lane(old_full: &[u8], old_lanes: &[LaneTree], new_lanes: &[La
 /// As [`delta_multi_lane`], but reads the current state from `base` overlaid
 /// with the live delta `stack` (via [`visit_current`]) instead of a
 /// pre-materialized full-state — the between-seals path where the union is
-/// never built. `old_lanes` supplies the current variants' oids (§3).
+/// never built. The content-carrying adapter over
+/// [`delta_multi_lane_stacked_oid`]: `old_lanes`/`new_lanes` supply only their
+/// `(mode, oid)`, and the fresh-variant content is served from an in-memory
+/// [`MemObjects`] built off `new_lanes` (the only side content is ever read).
 pub fn delta_multi_lane_stacked(
     base: &[u8],
     stack: &[Vec<u8>],
     old_lanes: &[LaneTree],
     new_lanes: &[LaneTree],
 ) -> Vec<u8> {
+    let old_refs: Vec<LaneTreeRef> = old_lanes.iter().map(lane_ref).collect();
+    let new_refs: Vec<LaneTreeRef> = new_lanes.iter().map(lane_ref).collect();
+    let mut obj = MemObjects::from_lanes(new_lanes);
+    delta_multi_lane_stacked_oid(base, stack, &old_refs, &new_refs, &mut obj)
+        .expect("in-memory objects never fail")
+}
+
+/// The oid-addressed delta generator (§6): reads the previous side (`base` +
+/// `stack`, with oids supplied by `old_lanes`) and the new side (`new_lanes`)
+/// as `(mode, oid)` only, matches variants by that identity, keeps slots
+/// stable, and fetches blob content from `obj` ONLY when a genuinely new
+/// variant node is emitted — so a whole lane's contents are never held in RAM.
+///
+/// - an oid present in both ⇒ same slot; emit ONLY a `lanes`-child update if
+///   the stored bitmap form changed (content/mode untouched — never fetched),
+///   else emit nothing (pruned);
+/// - an oid only in `new_lanes` ⇒ a fresh slot with its full variant node
+///   (the one place `obj.blob` is called);
+/// - an oid only on the previous side ⇒ carried by no new lane ⇒ a hole.
+pub fn delta_multi_lane_stacked_oid(
+    base: &[u8],
+    stack: &[Vec<u8>],
+    old_lanes: &[LaneTreeRef],
+    new_lanes: &[LaneTreeRef],
+    obj: &mut dyn Objects,
+) -> Result<Vec<u8>, WErr> {
     let new_n = new_lanes.len() as u32;
-    let newg = union_groups(new_lanes);
-    let cur = current_variants(base, stack, old_lanes);
+    let newg = union_groups_oid(new_lanes);
+    let cur = current_variants_ref(base, stack, old_lanes)?;
 
     let mut root = depot::Node::keep();
     let paths: BTreeSet<&Vec<u8>> = newg.keys().chain(cur.keys()).collect();
@@ -449,11 +548,11 @@ pub fn delta_multi_lane_stacked(
 
         let old_by_id: BTreeMap<&VarId, (u32, &Option<Vec<u8>>)> =
             cvars.iter().map(|(s, id, bm)| (id, (*s, bm))).collect();
-        let new_ids: BTreeSet<&VarId> = nvars.iter().map(|(id, ..)| id).collect();
+        let new_ids: BTreeSet<&VarId> = nvars.iter().map(|(id, _)| id).collect();
         let mut next_slot = cvars.iter().map(|(s, ..)| *s + 1).max().unwrap_or(0);
 
-        for (id, content, set) in nvars {
-            let (mode, _oid) = id;
+        for (id, set) in nvars {
+            let (mode, oid) = id;
             let bm = (set.len() as u32 != new_n).then(|| bitmap_bytes(set));
             match old_by_id.get(id) {
                 Some((slot, old_bm)) => {
@@ -475,7 +574,8 @@ pub fn delta_multi_lane_stacked(
                 None => {
                     let slot = next_slot;
                     next_slot += 1;
-                    put_variant(&mut root, path, slot, variant_node(content, *mode, bm.as_deref()));
+                    let content = obj.blob(oid)?;
+                    put_variant(&mut root, path, slot, variant_node(&content, *mode, bm.as_deref()));
                 }
             }
         }
@@ -485,7 +585,7 @@ pub fn delta_multi_lane_stacked(
             }
         }
     }
-    depot::codec::encode(&depot::Layer { root })
+    Ok(depot::codec::encode(&depot::Layer { root }))
 }
 
 // ------------------------------------------- streaming current-state reader
@@ -1292,6 +1392,67 @@ mod tests {
         assert!(!slots.contains(&1), "unchanged B2 (slot 1) must be pruned, saw {slots:?}");
     }
 
+    /// The oid-addressed API (§6): content-free [`LaneTreeRef`]s plus a
+    /// [`MemObjects`] source produce byte-identical unions and deltas to the
+    /// content-carrying path, and `blob` is called ONLY to emit fresh variants
+    /// — never for a pruned or bitmap-only update. This is the "no lane content
+    /// in RAM" guarantee the git wiring builds on.
+    #[test]
+    fn oid_addressed_matches_content_path_and_fetches_minimally() {
+        let old_lanes = vec![
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"B", b"B")]),
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"B2", b"B2")]),
+        ];
+        // lane 0: b edits A->BX (fresh oid, one blob fetch). lane 1: b unchanged
+        // (pruned, no fetch). A new lane 2 joins `a` (bitmap-only, no fetch).
+        let new_lanes = vec![
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"BX", b"BX")]),
+            lane(&[(b"a", Mode::File, b"A", b"A"), (b"b", Mode::File, b"B2", b"B2")]),
+            lane(&[(b"a", Mode::File, b"A", b"A")]),
+        ];
+
+        // Content-free lane views + an oid->content source.
+        let old_refs: Vec<LaneTreeRef> = old_lanes.iter().map(lane_ref).collect();
+        let new_refs: Vec<LaneTreeRef> = new_lanes.iter().map(lane_ref).collect();
+
+        // A counting object source over the union of both sides' blobs.
+        struct Counting(MemObjects, std::cell::RefCell<Vec<Oid>>);
+        impl Objects for Counting {
+            fn blob(&mut self, oid: &Oid) -> Result<Vec<u8>, WErr> {
+                self.1.borrow_mut().push(oid.clone());
+                self.0.blob(oid)
+            }
+        }
+
+        // Seed union: oid path == content path, byte for byte.
+        let base_content = encode_union(&old_lanes);
+        let mut seed_obj = Counting(MemObjects::from_lanes(&old_lanes), Default::default());
+        let base_oid = encode_union_oid(&old_refs, &mut seed_obj).unwrap();
+        assert_eq!(base_oid, base_content, "seed union: oid path must match content path");
+
+        // Delta: oid path == content path, byte for byte.
+        let delta_content = delta_multi_lane(&base_content, &old_lanes, &new_lanes);
+        let mut d_obj = Counting(MemObjects::from_lanes(&new_lanes), Default::default());
+        let delta_oid =
+            delta_multi_lane_stacked_oid(&base_oid, &[], &old_refs, &new_refs, &mut d_obj).unwrap();
+        assert_eq!(delta_oid, delta_content, "delta: oid path must match content path");
+
+        // Only the one genuinely new variant (BX) triggered a blob fetch — the
+        // pruned B2 and the bitmap-only `a` join fetched nothing.
+        assert_eq!(
+            *d_obj.1.borrow(),
+            vec![b"BX".to_vec()],
+            "delta must fetch content only for the fresh variant"
+        );
+
+        // The oid-path result still reconstructs every new lane exactly.
+        let mut new_full = Vec::new();
+        depot::stream::overlay_full(&base_oid, &delta_oid, &mut new_full).unwrap();
+        for (j, t) in new_lanes.iter().enumerate() {
+            assert_eq!(view_lane(&new_full, j as u32), expect_lane(t), "lane {j}");
+        }
+    }
+
     // ---- streaming current-state reader vs materialized overlay oracle ----
 
     type CurRow = (Vec<u8>, Mode, u32, Option<Vec<u8>>);
@@ -1405,6 +1566,42 @@ mod tests {
                 "mismatch depth {depth}, states={states:?}"
             );
         }
+    }
+
+    /// §2: "a path that is a file in one lane and a directory in another is
+    /// representable" — the node model stores `dir_key(x)` (bare) and
+    /// `file_key(x, slot)` (`\0`-led) as unambiguous siblings. Here `x` is a
+    /// plain file in lane 0 and a directory (`x/y`, `x/z`) in lane 1; encoding
+    /// the union then extracting each lane must reproduce that lane's exact git
+    /// tree oid, proving the file/dir collision does not corrupt either side.
+    #[test]
+    fn file_in_one_lane_dir_in_another_reconstructs_exact() {
+        let lanes = vec![
+            lane(&[
+                (b"a", Mode::File, b"a0", b"shared\n"),
+                (b"x", Mode::File, b"xf", b"i am a file\n"),
+            ]),
+            lane(&[
+                (b"a", Mode::File, b"a0", b"shared\n"),
+                (b"x/y", Mode::File, b"xy", b"i am a dir entry\n"),
+                (b"x/z", Mode::Exec, b"xz", b"#!/bin/sh\n"),
+            ]),
+        ];
+        let union = encode_union(&lanes);
+        for (j, t) in lanes.iter().enumerate() {
+            let mut root = BTreeMap::new();
+            for (path, e) in t {
+                tnode_insert(&mut root, path, e.mode, e.content.clone());
+            }
+            let want = tree_oid(&root).unwrap();
+            let got = reconstruct_lane_tree_oid(&union, j as u32).unwrap();
+            assert_eq!(got, want, "lane {j} tree oid (file-vs-dir at `x`)");
+        }
+        // The lanes genuinely disagree on `x`'s kind, so their oids differ.
+        assert_ne!(
+            reconstruct_lane_tree_oid(&union, 0).unwrap(),
+            reconstruct_lane_tree_oid(&union, 1).unwrap(),
+        );
     }
 
     /// Reconstructing each lane's tree oid from the union must equal building

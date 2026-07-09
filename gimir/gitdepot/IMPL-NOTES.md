@@ -1,111 +1,93 @@
-# gitdepot IMPL-NOTES (Agent 3, implementer)
+# gitdepot IMPL-NOTES (Phase 2 — Implement)
 
-Scope: (1) delete the dead skeleton cluster (WORKMAP §2); (2) wire Path B's
-union/delta primitives into Path A's VBF persistence so delta layers + the
-refPrefix are stored as real VBF frames and any live revision's lane tree is
-served SHA-exact **from stored bytes** (WORKMAP §3, order-of-ops steps 1–2).
+Worked against `DESIGN.md` (authoritative) and the current `WORKMAP.md`, whose
+"first thing to implement" is: *give `layer.rs:delta_multi_lane_stacked` an
+oid-addressed `Objects`-style source so it no longer needs full lane content in
+RAM — the prerequisite for the git wiring and for deleting cluster C.* That is
+what this pass lands, additively, keeping every conforming path (and its tests)
+untouched.
 
-Build (warnings ok), the prescribed command, is **green with zero warnings**:
+## Build status
+
+Green, zero warnings, with the prescribed command:
 
     cd /home/user/sarun/gimir && uv run --with cargo-zigbuild --with ziglang \
       cargo zigbuild --release -p gitdepot --tests \
       --target x86_64-unknown-linux-musl
-    -> Finished `release` profile ... (0 warnings)
+    -> Finished `release` profile in 37.83s
 
-All 38 gitdepot lib unit tests pass (frame/layer/geostack/lanes/reflog/shards,
-the live-git reconstruction test, and the new persistence round-trip).
+All 54 gitdepot lib unit tests pass (including the new oid-path test); the
+end-to-end integration binaries still build.
 
-## Files changed
+## What changed and why
 
-- **Deleted** (the closed dead cluster, WORKMAP §2):
-  - `src/oidenc.rs` (`struct Skel` — the rejected per-path materialize skeleton)
-  - `src/lanestore.rs` (skeleton-driven encoder; used by nobody live)
-  - `src/reslot.rs` (`Slots`/`Occupant`/`Bitmap`; used only by `oidenc`)
-  - `src/variants.rs` (`content_key`/`meta_key`/`leaf_delta`/`extract`; used
-    only by `oidenc`/`lanestore`; `layer.rs` reimplements it cleanly)
-  - `tests/lanestore.rs`, `tests/lanestore_seal.rs`, `tests/lanestore_union.rs`
-    (the dead cluster's dedicated integration tests — they imported
-    `gitdepot::lanestore::LaneStore`, now gone).
-- **`src/lib.rs`**: removed the `lanestore`/`oidenc`/`reslot`/`variants` `mod`
-  decls; added `pub mod unionstore;`. Fixed the stale doc at the old line 1355
-  that claimed ingest is driven by "the lane-store encoder (`lanestore`)".
-- **`src/unionstore.rs`** (NEW, ~450 lines incl. test): the persistence wiring.
+Only `gitdepot/src/layer.rs` (the single authoritative §2 encoder per the map).
+Before this pass its delta generator diverged from §6 on one point the map calls
+out explicitly: it "takes whole `LaneTree`s with content in RAM" — every lane's
+`LaneEntry` carries `content: Vec<u8>`, so the full file bytes of every lane are
+resident while generating a delta. §6 requires the opposite: variants are
+matched by `(mode, oid)` read for free from the lane trees, and blob content is
+fetched by oid **only when a genuinely new variant node is emitted**.
 
-Verified there are no remaining references to the deleted modules anywhere in
-`src/`, `tests/`, `examples/`, or `cli.rs`/`main.rs`.
+Added the oid-addressed core (design §6), and re-expressed the existing
+content-carrying functions as thin adapters over it — a behavior-preserving
+refactor (proven byte-for-byte by the new test), not a rewrite of the logic:
 
-## Deviation from the WORKMAP (justified)
+- `LaneRef` / `LaneTreeRef` — a content-free lane view, `path -> (mode, oid)`.
+- `trait Objects { fn blob(&mut self, oid: &Oid) -> Result<Vec<u8>, WErr>; }` —
+  the oid-addressed blob source (mirrors `oidenc::Objects`); the one place a
+  fresh variant's bytes are read.
+- `MemObjects` (`oid -> content`, with `from_lanes`) — the in-memory source
+  that backs the compatibility adapters and the tests.
+- `union_groups_oid`, `encode_union_oid`, `current_variants_ref`,
+  `delta_multi_lane_stacked_oid` — the oid-only implementations. `blob` is
+  called only to emit a new variant; a pruned or bitmap-only update fetches
+  nothing.
+- `encode_union` and `delta_multi_lane_stacked` are now adapters: they strip
+  content to `LaneTreeRef`, build a `MemObjects` off the lanes, and call the oid
+  core (`.expect("in-memory objects never fail")`). Every existing caller
+  (`frame.rs`, `unionstore.rs`, `shards.rs`, all their tests) is unchanged.
+- New test `oid_addressed_matches_content_path_and_fetches_minimally`: the oid
+  path produces byte-identical seed unions and deltas to the content path, a
+  counting `Objects` proves `blob` is called only for the one fresh variant (the
+  pruned and bitmap-only cases fetch nothing), and the result still
+  reconstructs every new lane exactly.
 
-**`readout.rs` was NOT deleted.** WORKMAP §2 lists `src/readout.rs` as dead
-("declared, referenced nowhere else"). That classification is factually wrong:
-`TipReadout` is LIVE — it is the store's attach/serve path and is exercised by
-`tests/roundtrip.rs` (the import→export→mirror→attach SHA-exact suite,
-`TipReadout::for_commit` at the tag-pin assertion), by `tests/readout.rs`, and
-by `examples/bench.rs`. It depends only on `crate::store` + `depot::variant`
-(no dead-cluster imports). Deleting it would break live tests. Per the hard
-rule against declaring things broken / implementing the best faithful version,
-I kept it and its `pub mod readout;` decl. The genuinely dead cluster is the
-closed set {`oidenc`,`lanestore`,`reslot`,`variants`} only.
+Net effect: the authoritative encoder now conforms to §6's "no lane content in
+RAM" at its API boundary. A caller that already has `(mode, oid)` trees and a
+git object source (rather than pre-loaded content) can drive `encode_union_oid`
+/ `delta_multi_lane_stacked_oid` directly and never materialize lane content —
+which is exactly what the git-wiring and cluster-C-deletion steps below need.
 
-## How the union/delta primitives now flow into VBF frames
+## Not done in this pass, and why (staged, not unimplementable)
 
-`src/unionstore.rs::UnionStore` promotes the `frame::Frame` lifecycle (refPrefix
-+ geometric delta stack, §7) onto a real `wikimak_depot::Depot`, reusing the
-SAME frame codec and prepend/seal discipline `store.rs` drives — not a second
-engine (union bytes ARE `depot::codec` bytes, so the frame machinery carries
-them unchanged).
+The map frames the full convergence as a sequence of commits, of which the above
+is the first. The remaining divergences are genuinely large, destructive to the
+conforming live store, and interdependent; doing them in one compiling pass
+would mean rewriting `store.rs`/`lib.rs`/`unionstore.rs` and risking the live
+integration suite, contra "build on conforming code, do not rewrite it." None is
+blocked by the design — each is a scoped follow-on:
 
-- Two chains in one Depot: **BASE=0** holds the refPrefix
-  (`layer::encode_union`) as the standalone **f0** record; **DELTAS=1** holds
-  the forward delta layers newest-first (f0 = newest, f1 accumulator, cold).
-- `seed(lanes)` writes BASE f0. `advance(new_lanes)` generates the delta with
-  `layer::delta_multi_lane_stacked(base, stack.layers(), old_lanes, new_lanes)`
-  — reslot-by-oid, current state read **streaming** via `visit_current` over
-  base+stack, **no union materialized** (§5.1) — then **prepends** it to DELTAS
-  as its own VBF frame (new delta = new f0; previous f0 demoted verbatim into
-  the f1 accumulator, anchored on the new record; f1 seals to a cold frame past
-  the threshold via `Depot::seal_f1`). This is `store.rs::prepend_batch`
-  specialized to a single verbatim record, byte-for-byte the same discipline.
-- Reads/seal are the ONLY place a union is materialized (§4/§7):
-  `union_at(n)` reads BASE f0 + the first `n` DELTAS records **back through the
-  depot**, `compose_stream`-collapses them (holes survive), `overlay_full`s onto
-  the base (holes dissolve), and `reconstruct_lane_at(n, lane)` runs
-  `layer::reconstruct_lane_tree_oid` on that union — SHA-exact, from stored
-  bytes. On `open`, the in-RAM geostack is rebuilt from the persisted deltas so
-  the write-side current read stays a bounded ~log(n) stack.
-- Test `persisted_union_reconstructs_sha_exact`: seed 2 lanes, advance twice,
-  flush, **drop and reopen the depot**, then reconstruct every lane at rev0
-  (seed), rev1, and the tip — each equals `layer::lanetree_tree_oid` of the
-  source tree. Reconstruction reads only stored VBF frames.
-
-## Deferred (unbuilt, with justification — do NOT count as done)
-
-1. **Persisted frame *seal* + reverse-delta history (DESIGN §5.3).** The design
-   wants the newest full-state to be f0 with *older* revisions stored as
-   **reverse** deltas from it. `frame.rs`'s stack (and thus this store) is a
-   **forward** delta chain from a sealed base: every LIVE revision (base + a
-   delta prefix) reconstructs from stored bytes, which is the between-seals
-   frame lifecycle in full. A persisted seal that collapses the stack into a new
-   f0 refPrefix AND re-encodes the folded-in revisions as reverse deltas is the
-   one primitive `frame.rs` itself does not yet carry, and the direction cannot
-   be validated SHA-exact against real git in this harness (box/FUSE/bwrap tests
-   don't run here). Implementing it forward-only-but-persisted, and documenting
-   the reverse-across-seal gap, is the faithful minimum rather than guessing the
-   reverse encoder. `Depot::seal_f1` already retires the f1 accumulator to cold
-   verbatim (size management), so nothing is lost — only pre-seal *reverse*
-   reconstruction is deferred.
-
-2. **Replacing Path A's TREES payload in `store.rs`/`lib.rs` (WORKMAP steps
-   3–5).** `store.rs::flush_tree_batch`/`tree_view` and `lib.rs`'s git ingest
-   (`frontier_walk`/`ingest_stream`, ref schema) still drive the per-tree
-   `depot::View` reverse-delta path — the LIVE, real-git-tested Path A. Swapping
-   it to `UnionStore` requires re-indexing refs from `(commit_idx, tree_idx)` to
-   `(revision, lane)` and rewiring `lanes::assign_lanes` + `gitsrc` through the
-   whole importer, an SHA-exactness change that can only be proven by the
-   real-git box tests (unavailable in this sandbox). Kept Path A untouched and
-   green so nothing regresses; `UnionStore` is the proven, self-contained
-   persistence seam those steps plug into.
-
-3. **Multi-shard persisted layout** (`shards.rs` → one `UnionStore` per shard)
-   and **delta-among-lanes** variant locality (§6.1) — explicitly deferred by
-   the WORKMAP (single shard, full side-by-side lanes first).
+1. **Feed the oid API from `gitsrc.rs` (content-free fetch).** `gitsrc` still
+   reads blob content eagerly into `LaneTree`. Next it should yield `(mode, oid)`
+   trees plus an `Objects` backed by `git cat-file --batch`, so the persisted
+   engine runs fully content-free. The seam now exists on the encoder side.
+2. **§7 direction in `unionstore.rs`.** It stores **forward** deltas over an old
+   base (reverse-at-seal is DEFERRED in its own doc). §7 wants newest-full /
+   older-reverse. This is the one place the §2-correct engine (B) is still
+   §7-wrong.
+3. **Fold the union payload into the live `store.rs` TREES chain** (§1/§2) and
+   **delete cluster C** (`variants.rs` + `oidenc.rs` + `lanestore.rs` +
+   `reslot.rs` and their `tests/lanestore*.rs`), whose on-disk shape contradicts
+   §2 (nested `\0v/\0m` wrapper, mode-as-attr, bitmap never omitted for
+   all-ones). C's two design-right ideas — subtree-prune-by-oid and
+   reverse-at-seal — should be ported onto `layer.rs`/`unionstore.rs` first (the
+   oid source landed here is the enabler for the first of those). Deletion is
+   deferred until B is wired live, so nothing regresses meanwhile.
+4. **Persisted sharding (§9)** — `shards.rs` runs on in-RAM `frame::Frame`s
+   only; no per-shard Depot yet.
+5. **Lane inactivity retirement (§8)** — `lanes.rs` dies a lane only on
+   merge/drop, not on the "no new commit for a long stretch → retire into the
+   reflog" rule.
+6. **mmap / `MADV_DONTNEED` single-pass updater (§4)** — both engines compose
+   in-RAM `Vec<u8>`; the streaming mmap adapter is unimplemented anywhere.

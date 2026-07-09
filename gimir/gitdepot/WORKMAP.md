@@ -1,201 +1,223 @@
 # gitdepot WORK MAP
 
-Grounded in DESIGN-RECOVERED.md (authoritative) + ASSEMBLY.md + the code on
-disk. The repo currently holds **two parallel implementations**:
+Mapped against `DESIGN.md` (authoritative, current). Verdicts are CONFORMS /
+PARTIAL / DIVERGES with `file:symbol` and the design section. Where a design
+part is implemented in more than one place, the conforming one is named and the
+others are marked as removal candidates against the exact point they violate.
 
-- **Path A — LIVE & PERSISTED (one-tree-per-record).** `lib.rs` +
-  `store.rs` + `wikimak_depot::Depot` (`depot-vbf`). Drives real git
-  (import/update/mirror/export), stores each git tree as a `depot::View`
-  reverse-delta record in the TREES chain, SHA-exact, tested against real
-  git.git. This is NOT the union-of-lanes design — it is the working
-  scaffold whose TREES-chain payload must be replaced.
-- **Path B — DESIGN-FAITHFUL PRIMITIVES, NOT PERSISTED.** `layer.rs`,
-  `geostack.rs`, `frame.rs`, `lanes.rs`, `reflog.rs`, `shards.rs`,
-  `gitsrc.rs`. The union/variant encoding, reslot-by-oid, geometric stack,
-  lanes, in-memory frame lifecycle. SHA-exact against a git-oid oracle but
-  lives entirely in RAM — never reaches `depot-vbf`/`store`.
-- **Dead skeleton cluster — DELETE.** `lanestore.rs`, `oidenc.rs`,
-  `reslot.rs`, `variants.rs`. The rejected "skeleton"/materialize approach.
-  Self-contained, referenced by nobody outside itself.
+## The three implementations on disk
 
-The real work is joining B's encoding into A's persistence and deleting the
-dead cluster.
+The tree holds **three** encoders of the same history, only one of which is
+wired to real git:
+
+- **A — LIVE / one-tree-per-commit (the shipped scaffold).**
+  `lib.rs` → `store.rs` → `wikimak_depot::Depot`, plus `readout.rs`, `cli.rs`.
+  Drives real git (import/update/mirror/export), four VBF chains, SHA-exact,
+  tested end-to-end (`tests/roundtrip.rs`, `equivalence.rs`, `two_frames.rs`,
+  `spill.rs`, `staging_size.rs`, `readout.rs`, `stub.rs`). Stores **one git
+  tree per commit** as a reverse-delta record — it does **not** build the
+  union of live lanes. Conforms to the persistence/direction/ingest sections
+  (§7, §8-refs, §10, §11) but **diverges from the core §1/§2 union model**.
+
+- **B — UNION ENGINE, §2-conforming encoding (not wired to git, not the live
+  store).** `layer.rs` (encoding) + `geostack.rs` (§5 stack) + `frame.rs`
+  (in-RAM lifecycle) + `unionstore.rs` (persisted union over a real Depot) +
+  `shards.rs` (§9) + `reflog.rs` (§8/§10 reflog) + `gitsrc.rs` (§11 source) +
+  `lanes.rs` (§8). Only inline unit tests + `tests/lanestore.rs` touches
+  `lanes`. `unionstore` persists but stores **forward** deltas (reverse-at-seal
+  explicitly DEFERRED — see its module doc), so it is PARTIAL on §7.
+
+- **C — REVERSE-DELTA union over a nested `\0v/\0m` encoding.**
+  `lanestore.rs` + `oidenc.rs` + `variants.rs` + `reslot.rs` (+ shares
+  `lanes.rs`). A persisted reverse-delta union store off the git object store,
+  tested by `tests/lanestore*.rs`. Conforms to §7's direction and §6's
+  O(changed) reslot, but its **on-disk shape (`variants.rs`) contradicts §2**.
+
+`lanes.rs` is the one module both B and C depend on. `lib.rs`/`store.rs`
+reference **neither** B nor C.
 
 ---
 
-## 1. DONE & CORRECT (keep)
+## Per design section
 
-Faithful to the recovered design, SHA-exact tested.
+### §1 Domain model: revisions, lanes, the union
+- **CONFORMS (B/C):** `lanes.rs:assign_lanes` + `compact_lanes` realize "one
+  live line per concurrently-live branch, lane dies on merge, bitmap width =
+  peak concurrent". `layer.rs:LaneTree` / `oidenc.rs` treat a lane as "one live
+  tree in the union".
+- **DIVERGES (A):** `store.rs` (TREES chain, `flush_tree_batch`) stores a single
+  git tree per commit — there is no union of live lanes at a revision. This is
+  the live path yet it does not implement §1's "state stored at each revision is
+  the union of the git trees of all live lanes". Removal/replacement candidate
+  for the TREES *payload* (not the chain machinery).
 
-- `layer.rs:encode_union` / `variant_node` / `file_key` / `dir_key` — union
-  tree shape (§2): `name\0<slot>` variants, bare dirs, `x/l/m` mode-tag
-  children, `lanes` bitmap child omitted when all-ones. Correct.
-- `layer.rs:container_cmp` / `entry_cmp` — the two orders (§3): authoritative
-  container order for the big side, git `base_name_compare` only for
-  reconstruction. Names stay clean.
-- `layer.rs:delta_multi_lane` / `delta_multi_lane_stacked` — reslot by
-  `(mode,oid)` read for free from lane trees, never hashing stored content
-  (§5.2). Correct.
-- `layer.rs:visit_current` — lockstep read of `refPrefix + stack` with no
-  materialized union (§5.1, §10). This is the pillar; keep.
-- `layer.rs:visit_entries` / `walk` / `reconstruct_lane_tree_oid` /
-  `extract_lane_entries` — single-pass iterator + SHA reconstruction.
-- `geostack.rs:GeoStack::push` / `collapse` — geometric 70%-rule stack (§7).
-  Model-tested, codec-independent. Correct.
-- `depot::stream::compose_stream` — delta∘delta, holes survive (§4). The
-  merge; tested.
-- `depot::stream::overlay_full` — delta∘full, holes dissolve (§4). The apply.
-- `depot::stream::diff_stream` / `diff_stream_holes` — byte-level delta
-  generators (§4).
-- `lanes.rs:assign_lanes` — persistent ancestry-frozen lane assignment,
-  first-parent inheritance, compaction-with-reuse (§6). Correct.
-- `reflog.rs` — per-layer lanes+refs, `#lanes ≥ #refs`, DAG capstone that
-  drives lanes→union→git oid (§5, §6). Keep as the validated capstone.
-- `shards.rs` — per-shard threads, stable full-path hash, cross-shard
-  reconstruction, oid invariant across shard counts, lockstep advance (§9).
-- `gitsrc.rs:read_commit_tree` — live git blob source (`ls-tree`+`cat-file`)
-  feeding `LaneTree`s (§11). The integration seam for a real repo.
-- `frame.rs:Frame` (advance/union/seal/reconstruct_tree_oid) — the correct
-  **shape** of the §7 lifecycle (refPrefix + geostack + seal, no skeleton),
-  SHA-exact tested. KEEP AS THE INTEGRATION TEMPLATE — but see §3: its
-  persistence is a stub (in-memory, seal discards history).
-- `store.rs` Depot machinery — `open_depot`, four-chain layout
-  (TREES/COMMITS/REFLOG/TAGS), `stream_frame_records`, `encode_batch`,
-  stable oldest-first indices, `seal_threshold`/`seal_f1`, `Ingest`
-  bookkeeping, `meta.sqlite` current-refs-only. §8 persistence is REAL and
-  correct; reuse it wholesale.
-- `lib.rs` git plumbing — `LogStream`, `CatFile`, `dag_scope`, `walk_order`,
-  `Frontier`, ls-remote/fetch/mirror/export. The real-git ingest/serve
-  scaffold; reuse.
+### §2 Encoding: the variant/union tree — **covered in two places, they disagree**
+- **CONFORMS (B):** `layer.rs:file_key` = `name\0<slot>` single node;
+  `layer.rs:variant_node` puts content in the node blob, mode as an `x`/`l`/`m`
+  **mode-tag child**, and a `lanes` child **omitted when all-ones**
+  (`bitmap: Option`, `None ⇒ omit`); `layer.rs:dir_key` = bare name. This is §2
+  point-for-point. `container_cmp` keeps bare-dir vs `\0`-led-file unambiguous.
+- **DIVERGES (C):** `variants.rs` nests two children `\0v<slot>` (content) and
+  `\0m<slot>` (meta) **under a wrapper node named by the path** — violating §2
+  "stored as **sibling nodes, not nested under a wrapper**" and "File variant —
+  node named `name` + `0x00` + `varint(slot)`". It also stores **mode as an
+  attr** on `\0m` rather than an `x`/`l`/`m` mode-tag child (violates §2 "Mode"),
+  and `variants.rs:meta_view` **always** writes the `\0lanes` bitmap, never
+  omitting it for all-ones (violates §2 "the `lanes` child is omitted when the
+  bitmap is all-ones"). **Removal candidate — `variants.rs` and everything built
+  on it (`oidenc.rs`, `lanestore.rs`).**
 
-## 2. DELETE IMMEDIATELY
+### §3 One order
+- **CONFORMS (B):** `layer.rs:container_cmp` (authoritative container order) and
+  `layer.rs:entry_cmp` (git `base_name_compare` for reconstruction only);
+  git trees reordered once on load (`oidenc.rs:parse_tree` + the cache). Names
+  stay clean (no slot tag in the compare).
+- C reuses `depot` codec order via `BTreeMap`; not independently a §3 concern.
 
-Dead skeleton reimplementation — the exact "materialize a per-path skeleton
-of malloc'd nodes" approach the user rejected (§12.2). Referenced only within
-its own cluster; nothing in the live path or Path B touches it.
+### §4 Operations: overlay / compose / delta
+- **CONFORMS (shared, `depot` crate):** `depot::stream::compose_stream`
+  (delta∘delta, holes survive), `overlay_full` (delta∘full, holes dissolve),
+  `diff_stream` / `diff_stream_holes` (reverse). Tombstone vs hole modeled
+  (`depot/src/stream.rs`). Used by B (`frame.rs`/`unionstore.rs:compose`) and,
+  as removal-side markers, by C (`variants.rs:leaf_delta` uses `Node::hole`).
+- The §4 "mmap updater / MADV_DONTNEED single pass" is **not implemented**
+  anywhere; both B and C compose in-RAM `Vec<u8>`. PARTIAL.
 
-- `oidenc.rs` — **`struct Skel`**, the per-path variant skeleton. The
-  rejected approach. Used only by `lanestore.rs`.
-- `lanestore.rs` — skeleton-driven lane encoder; `GITDEPOT_SKEL_MEASURE` /
-  `advance_skel`. Used by NOBODY (only a mod decl + a stale doc mention in
-  `lib.rs:1355`). Superseded by `layer.rs` + `frame.rs`.
-- `reslot.rs` — `Slots`/`Occupant`/`Bitmap` reslotter. Used ONLY by
-  `oidenc.rs`. Superseded by `layer.rs:delta_multi_lane` (reslot-by-oid).
-- `variants.rs` — `content_key`/`meta_key`/`leaf_delta`/`extract`. Used ONLY
-  by `oidenc.rs`+`lanestore.rs`. `layer.rs` reimplements this cleanly.
-- `readout.rs` — declared (`lib.rs:104`), referenced nowhere else. Dead.
+### §5 Frame model: refPrefix + geometric delta stack
+- **CONFORMS (B):** `geostack.rs:GeoStack::push` (70% rule, integer
+  `10·top ≥ 7·next`) + `collapse`; `frame.rs:Frame` and
+  `unionstore.rs:UnionStore` hold `refPrefix` + live stack and read current
+  state by lockstep (`layer.rs:visit_current`), never materializing a union to
+  read/delta. `frame.rs:Frame::seal` = collapse + `overlay_full`.
+- **DIVERGES/absent (A, C):** neither the live store nor `lanestore.rs` uses a
+  §5 geometric stack; both lean on the VBF f0/f1 accumulator (§10) instead.
+  Acceptable as a different altitude, but the §5 in-RAM geostack exists only in
+  B, unwired to git.
 
-Also fix the misleading claim: `lib.rs:1355` doc says ingest is driven by
-"the lane-store encoder (`lanestore`)" — false; nothing drives it. Remove the
-mod decls (`lib.rs:99–104`) and the doc mention when deleting.
+### §6 Delta generation (write side) — **covered in two places**
+- **CONFORMS (B):** `layer.rs:delta_multi_lane_stacked` does the lockstep-of-
+  three-iterator-sets over `refPrefix`+stack (`current_variants`) and the lane
+  trees; variants matched by `(mode, oid)` read for free from `LaneTree`, never
+  by hashing stored content; `lanes`-only change emits a bitmap update; new oid
+  → fresh slot. Matches §6.
+- **CONFORMS (C), duplicate:** `reslot.rs:Slots::reslot` is the same §6 per-path
+  algebra as a standalone unit (pass 1 id-match, pass 2 most-shared-lanes among
+  freed slots `common_lanes`, pass 3 lowest free, pass 4 delete). Faithful to
+  §6, but it is a **second copy** used only by `oidenc.rs`. Removal candidate
+  once C is dropped; or promote it as the shared reslot and delete the inline
+  copy in `layer.rs`. `oidenc.rs` adds the §6 "fetch content by oid only when a
+  `\0v` node is emitted, prune unchanged subtrees by oid" — genuinely §6/§9
+  O(changed) behavior that `layer.rs` currently lacks (it takes whole
+  `LaneTree`s with content in RAM).
 
-Do NOT delete `frame.rs` — despite its in-memory `seal()` discarding history,
-it does not duplicate `wikimak_depot::Depot` (a different layer: the union
-geostack driver, not a VBF frame chain). It is the template for §3.
+### §7 Delta direction: newest full, older reverse — **covered in two places**
+- **CONFORMS (A):** `store.rs` TREES chain — f0 is the newest tree in full,
+  older records are reverse deltas from the newer (`lib.rs` header; `readout.rs:
+  TipReadout::for_commit` walks head→target applying reverse deltas).
+- **CONFORMS (C):** `oidenc.rs:Encoder::advance` emits the reverse delta;
+  full-state materialized only at seal (`lanestore.rs` module doc).
+- **PARTIAL/DIVERGES (B):** `unionstore.rs` stores **forward** deltas over an
+  old `refPrefix` base (its doc: reverse-at-seal per §7 is "DEFERRED"). So the
+  §2-conforming engine has the wrong delta *direction*, and the §7-correct
+  engines (A single-tree, C nested-encoding) each miss something else. **No
+  single implementation is both §2- and §7-correct.**
 
-## 3. UNFINISHED — the real work
+### §8 Lanes: assignment and lifecycle
+- **CONFORMS (B/C):** `lanes.rs:assign_lanes` (first-parent freeze, sibling
+  forks a fresh lane, monotonic ids) + `compact_lanes` (reuse on death, width =
+  peak concurrent). `reflog.rs` enforces **#live lanes ≥ #live refs**
+  (`LayerEntry`). "Minimize-frame-delta" lane choice = the first-parent rule.
+- **NOT implemented:** inactivity retirement ("no new commit for a long stretch
+  → inactive, retired into the reflog") is absent — `lanes.rs` only dies a lane
+  on merge/drop. PARTIAL on §8.
+- **DIVERGES (A):** live refs in `store.rs`/`meta.sqlite` carry no lane id
+  (single-lane degeneracy).
 
-Wire Path B's union encoding into Path A's persisted Depot so the TREES chain
-stores union-of-lanes layers (not one-tree-per-record Views), and any
-historical ref's tree serves SHA-exact from stored bytes. `store.rs`'s Depot,
-seal/cold, stable indices, sqlite bookkeeping are REUSED unchanged; only the
-TREES-chain *payload* and its producer/consumer change.
+### §9 Sharding
+- **PARTIAL (B):** `shards.rs:Shards` splits by top `shard_bits` of a stable
+  full-path hash (`path_hash` FNV-1a, `shard_of`, `split`), reconstructs a lane
+  across shards, lockstep advance, oid invariant across shard counts — all §9.
+  **But it runs in-RAM `frame::Frame`s only**, never persisted (no per-shard
+  Depot), and is unwired to `store.rs`/`unionstore.rs`. The hash is flagged an
+  open placeholder (§9 "swappable"), which is fine.
+- **DIVERGES/absent (A, C):** the live store and `lanestore.rs` are single-shard;
+  no `shard-bits`. §9 unrealized in anything persisted.
 
-**Producer seam (write side)** — replace per-tree View deltas with union
-layers:
-- `lib.rs:tree_layer` / `delta_layer` / `frontier_walk` / `ingest_stream`
-  currently build a `depot::View`/`Layer` per commit. Replace with: assign
-  commits to lanes (`lanes::assign_lanes`), build `LaneTree`s from
-  `gitsrc::read_commit_tree`, generate the delta with
-  `layer::delta_multi_lane_stacked(refPrefix, stack.layers(), old_lanes,
-  new_lanes)`, push onto a `geostack::GeoStack`. This is exactly
-  `frame::Frame::advance` — promote that logic out of `frame.rs` into the
-  ingest path.
-- `store.rs:flush_tree_batch` — currently encodes single-tree reverse deltas
-  into TREES. Change it to prepend the geostack's live delta layers (as
-  `codec` byte records, oldest→newest) via the existing
-  `Depot::prepend`/`stream_frame_records` path. The union bytes ARE
-  `depot::codec` bytes, so the frame machinery carries them unchanged.
-- Frame-write/seal: on a frame write, flatten the geostack
-  (`GeoStack::collapse(compose)`) and `overlay_full` onto the old refPrefix
-  to produce the new refPrefix full-state record (== `frame::Frame::seal`),
-  then let `store.rs`'s existing `seal_f1`/cold-frame path retire the old f1
-  verbatim (§8 seal). refPrefix = the TREES f0 record.
+### §10 Persistence: the VBF chains
+- **CONFORMS (A):** `store.rs` — four chains `TREES/COMMITS/REFLOG/TAGS`, f0
+  standalone, f1 anchored-on-f0, `seal_f1`/cold verbatim past
+  `seal_threshold()`, `prepend_batch` (batch-not-split), oldest-numbered stable
+  indices (`frame idx = N-1-k`), no `deleted_at`. `meta.sqlite` current-refs
+  only; reflog chain for superseded refs. This section is real and correct.
+- **CONFORMS (B), parallel:** `unionstore.rs` reuses the same discipline
+  (`prepend_delta`, `seal_f1`, `cold_iter`, `stream_frame_records`) for BASE +
+  DELTAS chains; tested to cold (`persisted_seals_to_cold_and_reconstructs_
+  every_revision`). Correct machinery, but a **second frame driver** beside
+  `store.rs` (and a third in `lanestore.rs`). §10 "pick one" is violated by
+  having three.
 
-**Consumer seam (read side)** — serve a historical ref's tree from union
-bytes:
-- `store.rs:tree_view` / `walk_tree_views` / `peeled_tree_oid` and
-  `lib.rs:view_tree_oid` / `materialize_tree` currently walk single-tree View
-  deltas. Replace tree reconstruction with `layer::visit_current` (lockstep
-  `refPrefix` + live stack, no materialization) then
-  `layer::reconstruct_lane_tree_oid` / `extract_lane_entries` for the wanted
-  lane. A ref → (commit_idx, lane, revision) → union bytes for that revision
-  → that lane's git tree.
-- Cold/historical revisions: the union layers walk newest→oldest exactly like
-  today's reverse-delta walk; `visit_current` over the reconstructed
-  refPrefix+deltas at the target revision yields the lane's entries.
+### §11 Ingest / fetch
+- **CONFORMS (A):** `lib.rs` — `walk_order` (own linearization), one
+  `git rev-list --parents` + `diff-tree --stdin` + persistent `cat-file
+  --batch`, frontier-style per-commit views; withhold-boundary fetch,
+  metadata-first, one-batch initial pull, no bare clone, tag chain
+  (`ingest_tags`, `TagPeel`). §11 substantially realized in the live path.
+- **CONFORMS (B), toy:** `gitsrc.rs:read_commit_tree` is a `ls-tree`+`cat-file`
+  source feeding `LaneTree`s — the integration seam, not the negotiated fetch.
 
-**Lane/reflog feed**:
-- `lanes::assign_lanes` (upstream of `delta_multi_lane`) supplies the aligned
-  `old_lanes`/`new_lanes` arrays; the lane→tree-oid map is reflog-derived
-  (`reflog.rs`), the only extra state. One `store.rs` REFLOG batch record per
-  written layer records the layer's lanes+refs — reuse `encode_batch`.
+---
 
-**Sharding path** (§9) — `shards.rs` runs per-shard `Frame`s in memory today.
-Persisted form: one Depot **per shard** (or one chain-group per shard) each
-with its own refPrefix/stack/lanes, advancing in lockstep (empty deltas OK).
-Cross-shard tree reconstruction (already in `shards.rs`) gathers each lane's
-entries from every shard and hashes together. UNBUILT against `store.rs`.
+## Removal candidates (contradict the design or duplicate a conforming part)
 
-**Multi-lane variant-locality path** (§6.1, deferred not dropped) — lanes are
-stored full side-by-side today (correct first step). Delta-among-lanes
-(base-lane pick + reframe) is a later optimization; do NOT build it before
-full-lanes-through-Depot is green.
+1. **`variants.rs`** — on-disk shape contradicts **§2** (nested-under-wrapper,
+   `\0v/\0m` two-key split, mode-as-attr, bitmap never omitted for all-ones).
+   The authoritative §2 encoding is `layer.rs`.
+2. **`oidenc.rs`**, **`lanestore.rs`** — built entirely on `variants.rs`; carry
+   the §2 violation. Their §6 subtree-prune-by-oid and §7 reverse-at-seal ideas
+   are worth **porting onto `layer.rs`** before deletion (they are the two
+   things `layer.rs`/`unionstore.rs` lack).
+3. **`reslot.rs`** — a correct but **duplicate** §6 reslot used only by
+   `oidenc.rs`; either delete with cluster C or make it the single shared reslot
+   and remove `layer.rs`'s inline copy. One §6 implementation, not two.
+4. **Duplicate frame drivers** — three §10 prepend/seal engines
+   (`store.rs`, `unionstore.rs`, `lanestore.rs`). §10 wants one depot per mirror;
+   keep `store.rs`'s and fold the union payload into it.
 
-## 4. TERMINOLOGY MAP
+Not removal: `layer.rs`, `geostack.rs`, `lanes.rs`, `reflog.rs`, `shards.rs`,
+`gitsrc.rs`, `frame.rs` (the §2-conforming primitives, unwired but correct);
+`store.rs`, `lib.rs`, `readout.rs`, `cli.rs` (the live persistence/ingest).
 
-Use ONE vocabulary. Left = layer.rs/design; right = store.rs/depot-vbf.
+## What is missing (no implementation anywhere)
+- The union-of-lanes tree in the **live, persisted, git-driven** path (§1/§2):
+  A stores single trees; B/C are not wired to git.
+- A single engine that is **both** §2-encoding-correct **and** §7-direction-
+  correct (newest full, older reverse). B has §2 but forward deltas; C has
+  reverse deltas but the §2-violating encoding.
+- §8 lane inactivity retirement; §9 persisted sharding; §4 mmap/MADV_DONTNEED
+  single-pass updater.
 
-| Path B (union engine) | Path A (Depot/VBF persistence) |
-|---|---|
-| `refPrefix` (full-state union) | TREES chain **f0** record (`codec` bytes) |
-| live delta layer on the geostack | an additional TREES **f1** record, newest-first |
-| geostack collapse + `overlay_full` at a frame write | produce the new f0; old f1 → **cold** verbatim |
-| `frame::Frame::seal` | `store.rs` frame-write + `Depot::seal_f1` |
-| `frame::Frame::advance` | `store.rs:flush_tree_batch` (rewritten) → `Depot::prepend` |
-| union bytes | `depot::codec`-encoded `Layer` record |
-| delta∘delta (`compose_stream`) | stack compaction between prepends |
-| delta∘full (`overlay_full`) | apply-at-seal → new f0 full-state |
-| lane / lane tree | REFLOG chain entry (per layer), `#lanes ≥ #refs` |
-| lane→tree-oid map | reflog-derived, in-RAM for the ingest |
-| shard (path-hash bucket) | one Depot / chain-group per shard |
-| "prepend" (NEVER "append") | `Depot::prepend` — newest-first |
+---
 
-Note: `depot-vbf::VbfDepot`/`VbfStore` is a cleaner wrapper over
-`wikimak_depot::Depot` used by tests/other mirror crates; `store.rs` calls
-`wikimak_depot::Depot` directly with its own frame code. Pick ONE (prefer
-extending `store.rs`'s existing path) — do not add a third.
+## Summary + first thing to implement
 
-## 5. ORDER OF OPERATIONS (smallest diff, reuse-first)
+**Summary.** The design's core — a persisted union of live lanes in the
+`name\0<slot>` variant tree (§1/§2), stored newest-full/older-reverse (§7),
+sharded (§9), driven by real git (§11) — is **not realized in one place**. What
+ships (`lib.rs`+`store.rs`) is a §7/§10/§11-correct one-tree-per-commit scaffold
+with **no union**. Two parallel union engines exist off the live path: **B**
+(`layer.rs`+`unionstore.rs`) has the §2-correct encoding but forward deltas;
+**C** (`lanestore.rs`+`variants.rs`) has §7 reverse deltas but an encoding that
+**contradicts §2**. `layer.rs` is the single authoritative §2 encoding.
 
-1. **Delete the dead cluster** (`lanestore.rs`, `oidenc.rs`, `reslot.rs`,
-   `variants.rs`, `readout.rs`) + their `lib.rs` mod decls + the stale
-   `lib.rs:1355` doc line. Compile clean. Zero behavior change (all unused).
-2. **Promote `frame::Frame` logic into a persisted producer.** Keep
-   `frame.rs` as the reference; add a `store.rs` path where
-   `flush_tree_batch` builds union delta layers via `delta_multi_lane_stacked`
-   + `GeoStack` and prepends them through the EXISTING `Depot::prepend` /
-   `stream_frame_records` seam. Wire `lanes::assign_lanes` + `gitsrc` in.
-3. **Frame-write = seal:** on frame write, `GeoStack::collapse` + `overlay_full`
-   → new f0; reuse `Depot::seal_f1`/cold for the old f1. No new frame engine.
-4. **Read side:** rewrite `tree_view`/`peeled_tree_oid`/`view_tree_oid` to
-   reconstruct via `visit_current` + `reconstruct_lane_tree_oid`. Prove
-   SHA-exact on real git.git (import → export round-trip), reusing existing
-   `lib.rs` export tests as the oracle.
-5. **Single shard first** (shard-bits=0), full lanes, no delta-among-lanes.
-   Get import/update/export green end-to-end before touching multi-shard
-   persistence (`shards.rs` → per-shard Depot) or variant-locality deltas.
-
-Guiding rule: minimal, direct, data-first. Reuse `store.rs`'s Depot/seal/index
-machinery and Path B's tested primitives. Do NOT build a parallel engine — the
-dead cluster in §2 is exactly what happens when you do.
+**First thing to implement:** collapse the encoding duplication in favor of
+§2. Delete cluster C's `variants.rs` shape after **porting its two design-right
+ideas onto `layer.rs`**: (a) `oidenc.rs`'s O(changed) *diff by tree-oid with
+subtree pruning* (so the delta generator reads git trees by oid instead of
+taking whole in-RAM `LaneTree`s), and (b) `lanestore.rs`'s *reverse-delta-from-
+newest / full-state-only-at-seal* lifecycle (the §7 direction `unionstore.rs`
+currently defers). Land that as the one union engine, then wire it as the TREES
+payload in `store.rs`'s existing `prepend_batch`/`seal_f1` machinery — reusing
+A's proven §10/§11 persistence and ingest unchanged. Concretely, the smallest
+first commit: give `layer.rs:delta_multi_lane_stacked` an oid-addressed
+`Objects`-style source (as `oidenc.rs` has) so it no longer needs full lane
+content in RAM — the prerequisite for both the git wiring and deleting C.
