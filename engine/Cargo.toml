@@ -233,8 +233,28 @@ wikimak_scribunto = { path = "../gimir/wikimak/scribunto", package = "wikimak-sc
 # the zigshim like onig_sys does.
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
-tree-sitter-python = "0.25"
+# =0.23.6 matches syntastica-parsers' exact pin, so the editor pane and the
+# oaita structural locators link ONE copy of the python grammar (0.25 here
+# would co-exist with syntastica's 0.23.6 — two ~500KB grammar objects). The
+# 0.23 crate exposes the same `LANGUAGE: LanguageFn` surface structural.rs
+# uses, so nothing else changes.
+tree-sitter-python = "=0.23.6"
 tree-sitter-bash = "0.25"
+# ── Editor pane (src/editor.rs): edtui vim-modal widget + syntastica
+# (tree-sitter) highlighting. edtui default features OFF: no arboard (X11
+# clipboard — a C/dlopen liability for static musl) and NOT its syntect
+# highlighter (regex-based, a second highlighting engine); highlighting is
+# the syntastica bridge in editor.rs. The parser pack is the 8 languages a
+# box plausibly edits; each grammar is exact-pinned by syntastica-parsers
+# (rust/bash unify with the locator grammars above). Measured in the editor
+# eval: ~+7MB on the static binary.
+edtui = { version = "0.11.3", default-features = false }
+syntastica = "0.6.1"
+syntastica-parsers = { version = "0.6.1", default-features = false, features = [
+    "rust", "python", "c", "javascript", "bash", "json", "yaml",
+    "markdown", "markdown_inline",
+] }
+syntastica-themes = "0.6.1"
 
 # sarun: redirect crates.io brush-core 0.5.0 to our vendored copy, which
 # pins commit 428f477 (PR #1181) — the fd-leak fix for shell pipelines.

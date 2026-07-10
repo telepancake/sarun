@@ -36,6 +36,7 @@ mod discover;
 // ahead of its consumer (the build driver), so allow the not-yet-used items.
 #[allow(dead_code)]
 mod dockerfile;
+mod editor;
 mod frames;
 mod hostfs;
 mod jobserver;
