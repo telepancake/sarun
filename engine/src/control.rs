@@ -2429,13 +2429,12 @@ macro_rules! ui_verbs {
             // REF may be a ref name ("main" matches "refs/heads/main") or a
             // unique commit-sha prefix — ANY commit in the chain, not just
             // the tips (gitdepot::resolve_ref owns the semantics).
-            // A commit checks out its own tree; a tag-at-tree ref (the
-            // linux v2.6.11-tree shape) pins the TAG object's sha and
-            // checks out the tagged tree's revision.
-            let (sha, rev) = match gitdepot::resolve_ref(store_path, refname) {
-                Ok(Some(gitdepot::Resolved::Commit { sha, idx })) => (sha, idx),
-                Ok(Some(gitdepot::Resolved::TreeTag { tag_sha, tree_idx })) =>
-                    (tag_sha, tree_idx),
+            // A commit checks out its own tree (revision resolved by SHA —
+            // tag-tree revisions interleave with commits, so the COMMITS
+            // index is not the revision); a tag-at-tree ref pins the TAG
+            // object's sha and checks out the tagged tree's revision.
+            let resolved = match gitdepot::resolve_ref(store_path, refname) {
+                Ok(Some(r)) => r,
                 Ok(None) => return json!({"ok": false, "error":
                     format!("no ref or commit {refname} in store")}),
                 Err(gitdepot::Error::Meta(msg)) =>
@@ -2449,6 +2448,15 @@ macro_rules! ui_verbs {
                 Ok(ls) => ls,
                 Err(e) => return json!({"ok": false,
                                         "error": format!("store: {e}")}),
+            };
+            let (sha, rev) = match resolved {
+                gitdepot::Resolved::Commit { sha, .. } => match ls.rev_of(&sha) {
+                    Some(rev) => (sha, rev),
+                    None => return json!({"ok": false, "error":
+                        format!("commit {sha} not in the union store")}),
+                },
+                gitdepot::Resolved::TreeTag { tag_sha, tree_idx } =>
+                    (tag_sha, tree_idx),
             };
             let mut files = 0u64;
             let mut bytes = 0u64;

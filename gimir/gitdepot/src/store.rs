@@ -1737,14 +1737,20 @@ impl<'a> Ingest<'a> {
                     })
                 };
                 if !r.tree_sha.is_empty() {
-                    // A tag peeling to a STANDALONE tree (not any commit's
-                    // tree) has no revision in the union to reference. Not in
-                    // scope for the union mirror (no eval corpus has one).
-                    return Err(Error::Unsupported(format!(
-                        "ref {} peels to a standalone tree — union mirror stores \
-                         only commit trees",
-                        r.name
-                    )));
+                    // A tag-at-tree ref: no commit; the row's third column
+                    // carries the tagged tree's union REVISION, read from the
+                    // tag record's target (the chains flushed above).
+                    let ti = tag.ok_or_else(|| {
+                        Error::Meta(format!("tree ref {} without a tag object", r.name))
+                    })?;
+                    let rec = self.st.tag_record_at(ti)?;
+                    let TagTarget::Tree(rev) = rec.target else {
+                        return Err(Error::Meta(format!(
+                            "tree ref {} whose tag {} does not target a tree",
+                            r.name, rec.sha
+                        )));
+                    };
+                    return Ok((r.name.clone(), None, rev, tag));
                 }
                 let (c, lane) = self.ref_row(&r.sha)?;
                 Ok((r.name.clone(), Some(c), lane, tag))

@@ -17,6 +17,7 @@ replacement semantics:
   • the files are the box's OWN changes — overwriting them SUCCEEDS
     (the old attachment was EROFS; a checkout is not an attachment)
   • DEST nests the checkout; SUBPATH checks out a subtree only
+  • a tag-at-tree ref checks out the tagged tree, pinned by tag sha
   • the git_attach verb is GONE from the wire (named error, no row)
 
 Needs FUSE + bwrap + git + a built gitdepot (cargo builds it if absent).
@@ -134,6 +135,10 @@ def main():
         (repo / "README").write_text("readme v2\n")
         sh_git(repo, "add", "-A")
         sh_git(repo, "commit", "-q", "-m", "v2")
+        # A tag at a TREE (the linux v2.6.11-tree shape): one more lane in
+        # the union, checkout-able by name, pinned by the tag's own sha.
+        sh_git(repo, "config", "tag.gpgsign", "false")
+        sh_git(repo, "tag", "-a", "-m", "tree tag", "treetag", "main^{tree}")
         store = tmp / "store"
         r = subprocess.run([str(GITDEPOT), "import", str(repo), str(store)],
                            capture_output=True, text=True)
@@ -225,10 +230,18 @@ def main():
               "subtree file lands relative to DEST")
         check("vendor/README" not in rows(sp2) and "README" not in rows(sp2),
               "nothing outside the subtree was written")
-        # (Tag-at-STANDALONE-tree checkout is wired through
-        # Resolved::TreeTag, but the union mirror's IMPORT still refuses
-        # such tags — a named Unsupported, §11 — so it is not testable
-        # end-to-end yet.)
+
+        # Tag-at-tree: pinned by the TAG object's sha, serves the tagged
+        # tree (one more lane in the union).
+        rep = m.sync_request(sock, type="ui", verb="git_checkout",
+                             args=[sid2, str(store), "treetag", "tagged"])
+        tr = (rep or {}).get("r", {})
+        check(tr.get("ok") is True, f"tree-tag checkout succeeds (got {rep!r})")
+        tag_sha = sh_git(repo, "rev-parse", "refs/tags/treetag").strip()
+        check(tr.get("sha") == tag_sha,
+              f"tree-tag pin is the TAG object's sha (got {tr.get('sha')!r})")
+        check(row_bytes(m, sp2, "tagged/README") == b"readme v2\n",
+              "tree-tag checkout serves the tagged tree's bytes")
     finally:
         if eng:
             eng.terminate()

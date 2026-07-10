@@ -467,13 +467,19 @@ fn reconstruct_boundary(
 /// a commit to its revision index and lane.
 pub struct LaneStore {
     depot: Depot,
-    /// Number of revisions (== number of in-scope commits).
+    /// Number of revisions — a revision is a ref-tree EVENT: almost always
+    /// a commit, occasionally a tag-at-tree's tagged tree (a lane that is
+    /// born once and never advances — the union just holds one more tree).
     n_rev: usize,
     /// `lane_of[i]` — lane advanced at revision `i`.
     lane_of: Vec<LaneId>,
-    /// `sha_of[i]` — the commit sha at revision `i`.
+    /// `sha_of[i]` — the commit sha at revision `i`; for a tag-tree
+    /// revision, the TREE oid itself (uniform for nested tag chains: every
+    /// tag peeling to that tree shares the one revision).
     sha_of: Vec<String>,
-    /// Commit sha → revision index.
+    /// `tag_rev[i]` — revision `i` is a tag-tree event, not a commit.
+    tag_rev: Vec<bool>,
+    /// Commit sha (or tag-tree oid) → revision index.
     sha_to_rev: HashMap<String, usize>,
     /// ref name → resolved commit sha (persisted; lets a reopened store
     /// serve any ref's tree from disk alone).
@@ -496,11 +502,29 @@ impl LaneStore {
     /// As [`encode_repo_union`](Self::encode_repo_union), also returning the
     /// number of git object fetches issued (the ingest-work measure).
     pub fn encode_repo_union_stats(repo: &Path, dir: &Path, level: i32) -> Result<(LaneStore, usize)> {
-        // Topology only (cheap): revision order + lane assignment.
+        // Topology only (cheap): revision order + lane assignment. Tag-at-
+        // tree refs append one revision per distinct tagged TREE after the
+        // commits — a parentless root lane that never advances (§8: every
+        // live ref occupies a lane; the union just holds one more tree).
         let dag = crate::dag_scope(repo, &[])?;
-        let sha_of = dag.order.clone();
+        let mut sha_of = dag.order.clone();
+        let tag_trees = collect_tree_tags(repo)?;
+        let mut seen: std::collections::HashSet<&str> =
+            sha_of.iter().map(|s| s.as_str()).collect();
+        let mut tag_revs: Vec<String> = Vec::new();
+        for (_name, _tag_sha, tree) in &tag_trees {
+            if seen.insert(tree.as_str()) {
+                tag_revs.push(tree.clone());
+            }
+        }
+        sha_of.extend(tag_revs.iter().cloned());
+        let n_commits = dag.order.len();
+        let tag_rev: Vec<bool> = (0..sha_of.len()).map(|i| i >= n_commits).collect();
         let (plan, parents) = plan_lanes(repo, &sha_of)?;
-        let tree_of = tree_map(repo)?;
+        let mut tree_of = tree_map(repo)?;
+        for t in &tag_revs {
+            tree_of.insert(t.clone(), t.clone()); // a tag-tree rev IS its tree
+        }
 
         let depot = open_depot(dir)?;
         let mut cat = crate::CatFile::new(repo)?;
@@ -521,8 +545,8 @@ impl LaneStore {
         let sha_to_rev: HashMap<String, usize> =
             sha_of.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
         let refs = live_refs(repo, &sha_to_rev)?;
-        persist_meta(dir, plan.n_rev, &plan.lane_of, &sha_of, &parents, &refs)?;
-        Ok((LaneStore { depot, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of, sha_to_rev, refs }, reads))
+        persist_meta(dir, plan.n_rev, &plan.lane_of, &sha_of, &tag_rev, &parents, &refs)?;
+        Ok((LaneStore { depot, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of, tag_rev, sha_to_rev, refs }, reads))
     }
 
     /// Incremental O(new) update (§11): fold only the NEW commits' union deltas
@@ -543,11 +567,12 @@ impl LaneStore {
         let existing = LaneStore::open(dir)?;
         let old_n = existing.n_rev;
         let old_sha = existing.sha_of.clone();
+        let old_tag = existing.tag_rev.clone();
         let old_lane = existing.lane_of.clone();
         // Stored prefix parent edges — the repo may be SHALLOW (bootstrap
         // re-pin), so the old commits' topology must come from meta, not a
         // repo rev-list that would see them as parentless roots.
-        let (_, _, _, old_parents, _) = load_meta(dir)?;
+        let (_, _, _, _, old_parents, _) = load_meta(dir)?;
         if old_n == 0 {
             drop(existing);
             let (s, reads) = LaneStore::encode_repo_union_stats(repo, dir, level)?;
@@ -559,18 +584,31 @@ impl LaneStore {
         // commits in the full walk order — a valid topo order (every parent
         // precedes its child) that freezes the stored prefix.
         let dag = crate::dag_scope(repo, &[])?;
-        let old_set: std::collections::HashSet<&str> = old_sha.iter().map(|s| s.as_str()).collect();
+        let mut old_set: std::collections::HashSet<String> =
+            old_sha.iter().cloned().collect();
         let mut order = old_sha.clone();
+        let mut tag_rev = old_tag.clone();
         for c in &dag.order {
-            if !old_set.contains(c.as_str()) {
+            if old_set.insert(c.clone()) {
                 order.push(c.clone());
+                tag_rev.push(false);
+            }
+        }
+        // NEW tag-at-tree refs append after the new commits, same rule as
+        // import; stored tag revisions ride in the frozen prefix.
+        let mut new_tag_trees: Vec<String> = Vec::new();
+        for (_name, _tag_sha, tree) in collect_tree_tags(repo)? {
+            if old_set.insert(tree.clone()) {
+                order.push(tree.clone());
+                tag_rev.push(true);
+                new_tag_trees.push(tree);
             }
         }
         if order.len() == old_n {
             // Nothing new — just refresh refs and return.
             let sha_to_rev = existing.sha_to_rev.clone();
             let refs = live_refs(repo, &sha_to_rev)?;
-            persist_meta(dir, old_n, &old_lane, &old_sha, &old_parents, &refs)?;
+            persist_meta(dir, old_n, &old_lane, &old_sha, &old_tag, &old_parents, &refs)?;
             return Ok((LaneStore { refs, ..existing }, 0, 0));
         }
 
@@ -588,6 +626,11 @@ impl LaneStore {
                 (non-fast-forward history rewrite is not supported here)".into()));
         }
         let mut tree_of = tree_map(repo)?;
+        for (i, sha) in order.iter().enumerate() {
+            if tag_rev[i] {
+                tree_of.insert(sha.clone(), sha.clone()); // tag-tree rev IS its tree
+            }
+        }
         // A live boundary tip may be an OLD commit that a history rewrite
         // (amend) made unreachable in the buffer, so `git log` over the
         // repo omits it. Its tree oid is still reconstructable from the
@@ -614,8 +657,8 @@ impl LaneStore {
         let sha_to_rev: HashMap<String, usize> =
             order.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
         let refs = live_refs(repo, &sha_to_rev)?;
-        persist_meta(dir, plan.n_rev, &plan.lane_of, &order, &parents, &refs)?;
-        Ok((LaneStore { depot, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of: order, sha_to_rev, refs }, new_revs, reads))
+        persist_meta(dir, plan.n_rev, &plan.lane_of, &order, &tag_rev, &parents, &refs)?;
+        Ok((LaneStore { depot, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of: order, tag_rev, sha_to_rev, refs }, new_revs, reads))
     }
 
 
@@ -644,23 +687,29 @@ impl LaneStore {
     /// live at the boundary yet its tip commit be unreachable from the
     /// current refs (a deleted branch), so `git` alone can't supply it.
     pub fn boundary_tip_shas(dir: &Path) -> Result<Vec<String>> {
-        let (n_rev, _lane_of, sha_of, parents, _refs) = load_meta(dir)?;
+        let (n_rev, _lane_of, sha_of, tag_rev, parents, _refs) = load_meta(dir)?;
         if n_rev == 0 {
             return Ok(Vec::new());
         }
         let plan = plan_from_parents(&parents);
-        Ok(boundary_tip_revs(&plan, n_rev).into_iter().map(|r| sha_of[r].clone()).collect())
+        // Tag-tree revisions are excluded: their tree rides the tag
+        // object's closure through the stub re-pin, not a commit want.
+        Ok(boundary_tip_revs(&plan, n_rev)
+            .into_iter()
+            .filter(|&r| !tag_rev[r])
+            .map(|r| sha_of[r].clone())
+            .collect())
     }
 
     pub fn open(dir: &Path) -> Result<LaneStore> {
         let depot = open_depot(dir)?;
-        let (n_rev, lane_of, sha_of, _parents, refs) = load_meta(dir)?;
+        let (n_rev, lane_of, sha_of, tag_rev, _parents, refs) = load_meta(dir)?;
         let sha_to_rev = sha_of
             .iter()
             .enumerate()
             .map(|(i, s)| (s.clone(), i))
             .collect();
-        Ok(LaneStore { depot, n_rev, lane_of, sha_of, sha_to_rev, refs })
+        Ok(LaneStore { depot, n_rev, lane_of, sha_of, tag_rev, sha_to_rev, refs })
     }
 
     /// ref name → resolved commit sha (persisted set).
@@ -690,6 +739,12 @@ impl LaneStore {
 
     pub fn rev_of(&self, sha: &str) -> Option<usize> {
         self.sha_to_rev.get(sha).copied()
+    }
+
+    /// Revision `rev` is a tag-tree event (its `sha_at` is a TREE oid), not
+    /// a commit.
+    pub fn is_tag_rev(&self, rev: usize) -> bool {
+        self.tag_rev.get(rev).copied().unwrap_or(false)
     }
 
     /// The canonical §2 union bytes at revision `rev` — the chain walked
@@ -987,6 +1042,13 @@ fn live_refs(repo: &Path, sha_to_rev: &HashMap<String, usize>) -> Result<HashMap
             refs.insert(name, sha);
         }
     }
+    // A tag-at-tree ref binds to its tagged TREE's revision (the tag-tree
+    // event keyed by the tree oid).
+    for (name, _tag_sha, tree) in collect_tree_tags(repo)? {
+        if sha_to_rev.contains_key(&tree) {
+            refs.insert(name, tree);
+        }
+    }
     Ok(refs)
 }
 
@@ -1021,6 +1083,38 @@ fn collect_ref_commits(repo: &Path) -> Result<Vec<(String, String)>> {
     Ok(v)
 }
 
+/// `(refname, outer tag sha, fully-peeled TREE oid)` for every tag ref
+/// peeling to a TREE — the tag-at-tree shape (linux v2.6.11-tree). `%(*…)`
+/// peels one level; a nested tag chain is finished with `rev-parse ^{}`.
+fn collect_tree_tags(repo: &Path) -> Result<Vec<(String, String, String)>> {
+    let out = crate::git_str(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(objecttype) %(*objectname) %(*objecttype) %(refname)",
+            "refs/tags",
+        ],
+    )?;
+    let mut v = Vec::new();
+    for line in out.lines() {
+        let f: Vec<&str> = line.splitn(5, ' ').collect();
+        if f.len() < 5 || f[1] != "tag" {
+            continue;
+        }
+        let (mut peeled, mut ptyp) = (f[2].to_string(), f[3].to_string());
+        if ptyp == "tag" {
+            peeled = crate::git_str(repo, &["rev-parse", &format!("{}^{{}}", f[4])])?
+                .trim()
+                .to_string();
+            ptyp = crate::git_str(repo, &["cat-file", "-t", &peeled])?.trim().to_string();
+        }
+        if ptyp == "tree" {
+            v.push((f[4].to_string(), f[0].to_string(), peeled));
+        }
+    }
+    Ok(v)
+}
+
 // ------------------------------------------------------- persistence
 //
 // A minimal sidecar `dir/meta.sqlite` (kv + two tables) recording what
@@ -1031,10 +1125,10 @@ fn collect_ref_commits(repo: &Path) -> Result<Vec<(String, String)>> {
 
 const META_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS revs(rev INTEGER PRIMARY KEY, sha TEXT NOT NULL, lane INTEGER NOT NULL, parents TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS revs(rev INTEGER PRIMARY KEY, sha TEXT NOT NULL, lane INTEGER NOT NULL, parents TEXT NOT NULL DEFAULT '', kind INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS refs(name TEXT PRIMARY KEY, sha TEXT NOT NULL, rev INTEGER NOT NULL, lane INTEGER NOT NULL);
 ";
-const META_SCHEMA_VERSION: &str = "2";
+const META_SCHEMA_VERSION: &str = "3";
 
 fn meta_path(dir: &Path) -> std::path::PathBuf {
     dir.join("meta.sqlite")
@@ -1051,6 +1145,7 @@ fn persist_meta(
     n_rev: usize,
     lane_of: &[LaneId],
     sha_of: &[String],
+    tag_rev: &[bool],
     parents: &[Vec<usize>],
     refs: &HashMap<String, String>,
 ) -> Result<()> {
@@ -1067,11 +1162,12 @@ fn persist_meta(
     .map_err(map_sql)?;
     {
         let mut ins = tx
-            .prepare("INSERT INTO revs(rev,sha,lane,parents) VALUES(?1,?2,?3,?4)")
+            .prepare("INSERT INTO revs(rev,sha,lane,parents,kind) VALUES(?1,?2,?3,?4,?5)")
             .map_err(map_sql)?;
         for (i, sha) in sha_of.iter().enumerate() {
             let ps = parents[i].iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
-            ins.execute(rusqlite::params![i as i64, sha, lane_of[i] as i64, ps])
+            let kind = if tag_rev.get(i).copied().unwrap_or(false) { 1i64 } else { 0 };
+            ins.execute(rusqlite::params![i as i64, sha, lane_of[i] as i64, ps, kind])
                 .map_err(map_sql)?;
         }
     }
@@ -1093,9 +1189,10 @@ fn persist_meta(
 
 /// Reload `(n_rev, lane_of, sha_of, refs)` from the sidecar.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 fn load_meta(
     dir: &Path,
-) -> Result<(usize, Vec<LaneId>, Vec<String>, Vec<Vec<usize>>, HashMap<String, String>)> {
+) -> Result<(usize, Vec<LaneId>, Vec<String>, Vec<bool>, Vec<Vec<usize>>, HashMap<String, String>)> {
     let p = meta_path(dir);
     if !p.exists() {
         return Err(Error::Chain(format!("no lane store at {}", dir.display())));
@@ -1122,9 +1219,10 @@ fn load_meta(
     let n_rev = n_rev as usize;
     let mut sha_of = vec![String::new(); n_rev];
     let mut lane_of = vec![0 as LaneId; n_rev];
+    let mut tag_rev = vec![false; n_rev];
     let mut parents = vec![Vec::new(); n_rev];
     {
-        let mut q = conn.prepare("SELECT rev,sha,lane,parents FROM revs").map_err(map_sql)?;
+        let mut q = conn.prepare("SELECT rev,sha,lane,parents,kind FROM revs").map_err(map_sql)?;
         let rows = q
             .query_map([], |r| {
                 Ok((
@@ -1132,17 +1230,19 @@ fn load_meta(
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
                 ))
             })
             .map_err(map_sql)?;
         for row in rows {
-            let (rev, sha, lane, ps) = row.map_err(map_sql)?;
+            let (rev, sha, lane, ps, kind) = row.map_err(map_sql)?;
             let rev = rev as usize;
             if rev >= n_rev {
                 return Err(Error::Chain(format!("meta: rev {rev} out of range")));
             }
             sha_of[rev] = sha;
             lane_of[rev] = lane as LaneId;
+            tag_rev[rev] = kind != 0;
             parents[rev] = if ps.is_empty() {
                 Vec::new()
             } else {
@@ -1161,7 +1261,7 @@ fn load_meta(
             refs.insert(name, sha);
         }
     }
-    Ok((n_rev, lane_of, sha_of, parents, refs))
+    Ok((n_rev, lane_of, sha_of, tag_rev, parents, refs))
 }
 
 /// Stream the u64-length-prefixed records of an f1 frame in stored

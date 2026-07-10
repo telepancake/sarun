@@ -1058,3 +1058,147 @@ fn empty_tree_commits_roundtrip() {
         "no empty tree reconstructed in the export"
     );
 }
+
+/// Tag-at-tree refs (the linux v2.6.11-tree shape) — BOTH kinds: a tag at a
+/// tree that equals a commit's root tree, and a tag at a genuinely
+/// STANDALONE tree (reachable from no commit). Each tagged tree is one more
+/// lane in the union (§8: every live ref occupies a lane); import must
+/// accept them, checkout must serve the tagged tree's bytes, and export must
+/// regenerate the tag object AND the tagged tree SHA-exact. A tag arriving
+/// via incremental update takes the same path.
+#[test]
+fn tag_at_tree_roundtrips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    sh_git(&repo, &["init", "-q", "-b", "main"]);
+    sh_git(&repo, &["config", "commit.gpgsign", "false"]);
+    sh_git(&repo, &["config", "tag.gpgsign", "false"]);
+    std::fs::write(repo.join("a.txt"), "alpha\n").unwrap();
+    std::fs::create_dir_all(repo.join("d")).unwrap();
+    std::fs::write(repo.join("d/b.txt"), "beta\n").unwrap();
+    sh_git(&repo, &["add", "-A"]);
+    sh_git(&repo, &["commit", "-q", "-m", "c1"]);
+    std::fs::write(repo.join("a.txt"), "alpha v2\n").unwrap();
+    sh_git(&repo, &["add", "-A"]);
+    sh_git(&repo, &["commit", "-q", "-m", "c2"]);
+
+    // Tag kind 1: at a commit's root tree (c1's — not the tip).
+    sh_git(&repo, &["tag", "-a", "-m", "commit tree tag", "at-commit-tree", "main~1^{tree}"]);
+    // Tag kind 2: at a STANDALONE tree never referenced by any commit.
+    let blob = sh_git(&repo, &["hash-object", "-w", "--stdin", "--path", "x"]);
+    let blob = blob.trim(); // hash of empty stdin content
+    let mktree_in = format!("100644 blob {blob}\tlonely.txt\n");
+    let tree = {
+        use std::io::Write as _;
+        let mut child = Command::new("git")
+            .arg("-C").arg(&repo).arg("mktree")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(mktree_in.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "mktree failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    sh_git(&repo, &["tag", "-a", "-m", "standalone tree tag", "standalone", &tree]);
+
+    let refs_before: Vec<String> =
+        sh_git(&repo, &["for-each-ref", "--format=%(objectname) %(refname)"])
+            .lines().map(str::to_string).collect();
+
+    // Import accepts both tags; the union gains one lane per tagged tree.
+    let store = tmp.path().join("store");
+    gitdepot::import(&repo, &store, 3).unwrap();
+
+    // Checkout through the resolve path: the tagged tree's bytes, exact.
+    let ls = gitdepot::store::Store::open(&store).unwrap().union().unwrap();
+    let resolved = gitdepot::resolve_ref(&store, "standalone").unwrap().unwrap();
+    let gitdepot::Resolved::TreeTag { tag_sha, tree_idx } = resolved else {
+        panic!("standalone must resolve as a TreeTag");
+    };
+    assert_eq!(tag_sha, sh_git(&repo, &["rev-parse", "refs/tags/standalone"]).trim());
+    let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    ls.checkout_entries_at(tree_idx, b"", &mut |p, _m, c| {
+        got.push((p.to_vec(), c.to_vec()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(got, vec![(b"lonely.txt".to_vec(), Vec::new())],
+        "standalone tagged tree serves exactly its one (empty) file");
+    // The commit-tree tag serves c1's tree (a.txt still \"alpha\").
+    let r2 = gitdepot::resolve_ref(&store, "at-commit-tree").unwrap().unwrap();
+    let gitdepot::Resolved::TreeTag { tree_idx: t2, .. } = r2 else {
+        panic!("at-commit-tree must resolve as a TreeTag");
+    };
+    let mut a = Vec::new();
+    ls.checkout_entries_at(t2, b"a.txt", &mut |_p, _m, c| {
+        a = c.to_vec();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(a, b"alpha\n", "commit-tree tag serves the OLDER tree's bytes");
+    drop(ls);
+
+    // Export: every ref (both tags included) regenerates SHA-exact, and
+    // the tagged trees peel to their original oids in the exported repo.
+    let out = tmp.path().join("out");
+    let refs_after = gitdepot::export(&store, &out).unwrap();
+    let mut after = ref_lines(&refs_after);
+    after.sort();
+    let mut before = refs_before.clone();
+    before.sort();
+    assert_eq!(after, before, "tag-at-tree history changed ref object ids");
+    assert_eq!(
+        sh_git(&out, &["rev-parse", "refs/tags/standalone^{tree}"]).trim(),
+        tree,
+        "exported standalone tag peels to the original tree oid"
+    );
+
+    // A tag arriving via UPDATE takes the same path: new standalone tree,
+    // new tag, incremental update, re-export.
+    let blob2 = {
+        use std::io::Write as _;
+        let mut child = Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"late\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let mktree2 = format!("100644 blob {blob2}\tlate.txt\n");
+    let tree2 = {
+        use std::io::Write as _;
+        let mut child = Command::new("git")
+            .arg("-C").arg(&repo).arg("mktree")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(mktree2.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    sh_git(&repo, &["tag", "-a", "-m", "late tree tag", "late", &tree2]);
+    std::fs::write(repo.join("a.txt"), "alpha v3\n").unwrap();
+    sh_git(&repo, &["add", "-A"]);
+    sh_git(&repo, &["commit", "-q", "-m", "c3"]);
+    gitdepot::update(&repo, &store, 3).unwrap();
+
+    let out2 = tmp.path().join("out2");
+    let refs2 = gitdepot::export(&store, &out2).unwrap();
+    let mut after2 = ref_lines(&refs2);
+    after2.sort();
+    let mut before2: Vec<String> =
+        sh_git(&repo, &["for-each-ref", "--format=%(objectname) %(refname)"])
+            .lines().map(str::to_string).collect();
+    before2.sort();
+    assert_eq!(after2, before2, "update-added tree tag changed ref object ids");
+    assert_eq!(
+        sh_git(&out2, &["rev-parse", "refs/tags/late^{tree}"]).trim(),
+        tree2,
+        "update-added standalone tag peels to its tree oid"
+    );
+}

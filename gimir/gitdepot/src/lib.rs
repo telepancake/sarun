@@ -823,20 +823,29 @@ fn walk_order(
 /// path holding that oid goes. This rides the frontier exactly like the
 /// views: a commit's multiset is its FIRST parent's multiset with the
 /// commit's changes applied, cloned/moved at the SAME points the view is,
-fn ingest_tags(repo: &Path, ingest: &mut store::Ingest, refs: &[RefMeta]) -> Result<()> {
+fn ingest_tags(
+    repo: &Path,
+    ingest: &mut store::Ingest,
+    refs: &[RefMeta],
+    ls: &crate::lanestore::LaneStore,
+) -> Result<()> {
     for t in collect_tag_objects(repo, refs)? {
         if ingest.knows_tag(&t.sha)? {
             continue;
         }
         let peel = match &t.target {
             TagPeelOid::Commit(sha) => store::TagPeel::Commit(sha),
-            TagPeelOid::Tree(_) => {
-                // A tag peeling to a STANDALONE tree has no revision in the
-                // union to reference (the union stores only commit trees).
-                return Err(Error::Unsupported(format!(
-                    "tag {} peels to a standalone tree — not supported by the union mirror",
-                    t.sha
-                )));
+            // A tag at a TREE targets the tagged tree's revision in the
+            // union — the tag-tree event the lane store appended (keyed by
+            // the tree oid, so nested chains all resolve to it).
+            TagPeelOid::Tree(tree) => {
+                let rev = ls.rev_of(tree).ok_or_else(|| {
+                    Error::Meta(format!(
+                        "tagged tree {tree} (tag {}) has no revision in the union",
+                        t.sha
+                    ))
+                })?;
+                store::TagPeel::Tree(rev as u64)
             }
         };
         ingest.add_tag(&t.sha, peel, &t.raw)?;
@@ -863,14 +872,27 @@ fn ingest_commits(
     start: usize,
 ) -> Result<usize> {
     let mut cat = CatFile::new(repo)?;
-    for rev in start..ls.n_rev() {
+    // `start` counts COMMITS (the chain ordinal), not revisions: tag-tree
+    // revisions interleave in the union's revision axis but never land in
+    // the COMMITS chain.
+    let mut ordinal = 0usize;
+    let mut added = 0usize;
+    for rev in 0..ls.n_rev() {
+        if ls.is_tag_rev(rev) {
+            continue;
+        }
+        ordinal += 1;
+        if ordinal <= start {
+            continue;
+        }
         let sha = ls.sha_at(rev).to_string();
         let raw = cat.get(&sha)?;
         let (mut cm, _tree_oid) = parse_commit(&raw)?;
         cm.sha = sha;
         ingest.add_commit(&cm, ls.lane_of(rev) as u64)?;
+        added += 1;
     }
-    Ok(ls.n_rev() - start)
+    Ok(added)
 }
 
 pub fn import_opts(repo: &Path, store: &Path, level: i32, _report: bool)
@@ -884,7 +906,7 @@ pub fn import_opts(repo: &Path, store: &Path, level: i32, _report: bool)
     //    `(rev, lane)` tree in the union.
     let mut ingest = store::Ingest::new(&mut st, level)?;
     let new_commits = ingest_commits(repo, &mut ingest, &ls, 0)?;
-    ingest_tags(repo, &mut ingest, &refs)?;
+    ingest_tags(repo, &mut ingest, &refs, &ls)?;
     ingest.finish(&refs)?;
     Ok(ImportOutcome { refs, new_commits, report: None, max_frontier: 0 })
 }
@@ -925,7 +947,7 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
     // COMMITS chain (idx == rev).
     let mut ingest = store::Ingest::new(&mut st, level)?;
     let k = ingest_commits(repo, &mut ingest, &ls, old_n)?;
-    ingest_tags(repo, &mut ingest, &refs)?;
+    ingest_tags(repo, &mut ingest, &refs, &ls)?;
     ingest.finish(&refs)?;
     Ok(UpdateOutcome {
         new_commits: k,
@@ -1871,7 +1893,10 @@ fn bootstrap(
     }
 
     let refs = collect_refs(&repo)?;
-    ingest_tags(&repo, &mut ingest, &refs)?;
+    // Tag-tree revisions were appended by the last rung's union encode;
+    // reopen the lane store to resolve their revision indices.
+    let ls = crate::lanestore::LaneStore::open(&trees)?;
+    ingest_tags(&repo, &mut ingest, &refs, &ls)?;
     ingest.finish(&refs)?;
     let total = st.count(store::COMMITS)? as usize;
     let prepends = st.depot_prepends();
@@ -2131,13 +2156,127 @@ pub fn union_verify(repo: &Path, store: &Path, stride: usize) -> Result<(usize, 
     Ok((checked, bad))
 }
 
+/// Write revision `rev`'s tree INTO `repo` as real git objects — blobs via
+/// `hash-object -w`, directories bottom-up via `mktree` — returning the root
+/// tree oid. Used for tag-at-tree export (rare, one tree), where fast-import
+/// has no commit to carry the tree.
+fn materialize_tree(repo: &Path, ls: &crate::lanestore::LaneStore, rev: usize) -> Result<String> {
+    use std::collections::BTreeMap;
+    // dir path -> entries (git-order sort key, mode, type, oid, name)
+    let mut dirs: BTreeMap<Vec<u8>, Vec<(Vec<u8>, String, &'static str, String, Vec<u8>)>> =
+        BTreeMap::new();
+    dirs.insert(Vec::new(), Vec::new());
+    let mut err: Option<Error> = None;
+    ls.checkout_entries_at(rev, b"", &mut |path, mode, content| {
+        let (dir, name) = match path.iter().rposition(|&b| b == b'/') {
+            Some(i) => (path[..i].to_vec(), path[i + 1..].to_vec()),
+            None => (Vec::new(), path.to_vec()),
+        };
+        // Ancestor dir rows so empty intermediate levels exist.
+        let mut at = Vec::new();
+        for seg in dir.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
+            if !at.is_empty() {
+                at.push(b'/');
+            }
+            at.extend_from_slice(seg);
+            dirs.entry(at.clone()).or_default();
+        }
+        let octal = String::from_utf8_lossy(&mode.octal()).into_owned();
+        let (typ, oid) = if octal == "160000" {
+            ("commit", String::from_utf8_lossy(content).into_owned())
+        } else {
+            let out = match run_stdin(
+                repo,
+                &["hash-object", "-w", "--stdin"],
+                content,
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    err = Some(e);
+                    return Ok(());
+                }
+            };
+            ("blob", out.trim().to_string())
+        };
+        let key = name.clone(); // files sort by bare name
+        dirs.entry(dir).or_default().push((key, octal, typ, oid, name));
+        Ok(())
+    })?;
+    if let Some(e) = err {
+        return Err(e);
+    }
+    // Bottom-up: deepest directories first (longer paths cannot be parents
+    // of shorter ones; equal-length paths are independent).
+    let mut order: Vec<Vec<u8>> = dirs.keys().cloned().collect();
+    order.sort_by_key(|d| std::cmp::Reverse(d.len()));
+    let mut oid_of_dir: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    for d in order {
+        let mut ents = dirs.remove(&d).unwrap_or_default();
+        // This dir's SUBDIR entries (already resolved).
+        let children: Vec<Vec<u8>> = oid_of_dir
+            .keys()
+            .filter(|c| {
+                if d.is_empty() {
+                    !c.contains(&b'/')
+                } else {
+                    c.len() > d.len()
+                        && c.starts_with(&d)
+                        && c[d.len()] == b'/'
+                        && !c[d.len() + 1..].contains(&b'/')
+                }
+            })
+            .cloned()
+            .collect();
+        for c in children {
+            let name = if d.is_empty() { c.clone() } else { c[d.len() + 1..].to_vec() };
+            let oid = oid_of_dir[&c].clone();
+            // Directories sort with a trailing '/' in git tree order.
+            let mut key = name.clone();
+            key.push(b'/');
+            ents.push((key, "040000".into(), "tree", oid, name));
+        }
+        ents.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut input = Vec::new();
+        for (_k, mode, typ, oid, name) in &ents {
+            input.extend_from_slice(format!("{mode} {typ} {oid}\t").as_bytes());
+            input.extend_from_slice(name);
+            input.push(b'\n');
+        }
+        let out = run_stdin(repo, &["mktree"], &input)?;
+        oid_of_dir.insert(d, out.trim().to_string());
+    }
+    Ok(oid_of_dir.remove(&Vec::new()).unwrap_or_default())
+}
+
+/// Run a git command in `repo` feeding `input` on stdin; returns stdout.
+fn run_stdin(repo: &Path, args: &[&str], input: &[u8]) -> Result<String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().expect("piped stdin").write_all(input)?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(Error::Git(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
     // Everything walks: all commit records plus every tree view,
     // reconstructed newest→oldest (the stated O(history) export cost).
     let st = store::Store::open(store)?;
     let recs = st.commit_records()?; // oldest-first (position = index)
     // The tree for a commit is its lane of the union at that commit's
-    // revision (idx == rev by construction).
+    // revision (sha-keyed — tag-tree revisions interleave with commits).
     let ls = st.union()?;
     let refs = st.refs_meta()?;
     std::fs::create_dir_all(repo)?;
@@ -2163,7 +2302,9 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
             )));
         }
         let mut files = Vec::new();
-        let view = ls.tree_view_at(cm.idx as usize)?;
+        // Sha-keyed: revisions are ref-tree EVENTS (commits + tag-trees),
+        // so a commit's COMMITS index no longer equals its revision.
+        let view = ls.tree_view_of_commit(&cm.sha)?;
         walk_files(&view, &mut Vec::new(), &mut files)?;
 
         for (_, mode, content) in &files {
@@ -2250,18 +2391,21 @@ pub fn export(store: &Path, repo: &Path) -> Result<Vec<RefMeta>> {
     // skips git's format lint (historical tags predate it); fidelity is
     // OUR check — the produced id must equal the imported one.
     for t in &st.tag_records()? {
-        if let store::TagTarget::Tree(tidx) = t.target {
-            // A tag at a tree references the tree by oid. A tree that
-            // equals some commit's tree already exists post
-            // fast-import; a STANDALONE tagged tree must be
-            // materialized from its TREES record first (mktree
-            // bottom-up), and must regenerate its imported oid.
-            let _ = tidx;
-            let (_obj, typ) = parse_tag_target(&t.sha, &t.raw)?;
+        if let store::TagTarget::Tree(rev) = t.target {
+            // A tag at a TREE: materialize the tagged tree from its union
+            // revision (blobs + mktree bottom-up) and check it regenerates
+            // the tag's recorded target oid exactly. A tree that equals
+            // some commit's tree is re-written idempotently.
+            let (target_oid, typ) = parse_tag_target(&t.sha, &t.raw)?;
             if typ == "tree" {
-                return Err(Error::Unsupported(
-                    "standalone tree tags are not supported by the union store".into(),
-                ));
+                let got = materialize_tree(repo, &ls, rev as usize)?;
+                if got != target_oid {
+                    return Err(Error::Meta(format!(
+                        "fidelity check failed: tagged tree regenerated as {got}, \
+                         imported as {target_oid} (tag {})",
+                        t.sha
+                    )));
+                }
             }
         }
         let mut child = Command::new("git")
