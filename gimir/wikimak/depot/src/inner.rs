@@ -149,6 +149,11 @@ impl Tier {
 pub struct DepotInner {
     cfg: DepotConfig,
     index: MmapMut,
+    /// The index file handle, kept for growth (`ftruncate` + remap).
+    index_file: File,
+    /// Current index capacity in SLOTS (on-disk length / 8). Grows —
+    /// never shrinks — on a write to a chain id beyond it.
+    slots: u64,
     f0: Tier,
     f1: Tier,
     cold_file: File,
@@ -184,8 +189,12 @@ impl DepotInner {
             std::fs::write(&format_path, format!("{FORMAT_VERSION}\n"))?;
         }
 
-        // Index: fixed-size mmap'd file of max_chain_id * 8 zeroed bytes.
-        let expected = cfg.max_chain_id * INDEX_ENTRY_LEN as u64;
+        // Index: sparse mmap'd array of 8-byte slots. `cfg.max_chain_id`
+        // is only the INITIAL size hint for a fresh depot; an existing
+        // index keeps the capacity its on-disk length records (the
+        // config is never a mismatch), and a write to a chain id beyond
+        // capacity grows the file — ftruncate, so it stays sparse. See
+        // SPEC §"Index".
         let index_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -193,11 +202,16 @@ impl DepotInner {
             .truncate(false)
             .open(&index_path)?;
         let current = index_file.metadata()?.len();
-        if current == 0 {
-            index_file.set_len(expected)?;
-        } else if current != expected {
-            return Err(Error::IndexSizeMismatch);
-        }
+        let slots = if current == 0 {
+            let hint = cfg.max_chain_id.clamp(1, crate::CHAIN_ID_CEILING);
+            index_file.set_len(hint * INDEX_ENTRY_LEN as u64)?;
+            hint
+        } else {
+            if current % INDEX_ENTRY_LEN as u64 != 0 {
+                return Err(Error::IndexSizeMismatch);
+            }
+            current / INDEX_ENTRY_LEN as u64
+        };
         // SAFETY: we own the file and serialize all access via the
         // outer Mutex; no other process maps it.
         let index = unsafe { MmapMut::map_mut(&index_file)? };
@@ -232,6 +246,8 @@ impl DepotInner {
         let inner = Self {
             cfg,
             index,
+            index_file,
+            slots,
             f0,
             f1,
             cold_file,
@@ -294,9 +310,7 @@ impl DepotInner {
         new_f1_bytes: Option<&[u8]>,
         seal_old_f1: bool,
     ) -> Result<()> {
-        if chain_id >= self.cfg.max_chain_id {
-            return Err(Error::ChainIdOutOfRange);
-        }
+        self.ensure_slot(chain_id)?;
         // zstd_len is u64 on disk; individual frames are only bounded
         // by the 48-bit per-file offset space, checked at append.
 
@@ -395,10 +409,7 @@ impl DepotInner {
     /// unreferenced cold frame behind. Durability, as everywhere in
     /// the depot, is the caller's `flush()`.
     pub fn seal_f1(&mut self, chain_id: u64) -> Result<()> {
-        if chain_id >= self.cfg.max_chain_id {
-            return Err(Error::ChainIdOutOfRange);
-        }
-        let f0_ptr = self.index_get(chain_id);
+        let f0_ptr = self.slot_ptr(chain_id)?;
         if f0_ptr == 0 {
             return Err(Error::NoFrame);
         }
@@ -432,10 +443,7 @@ impl DepotInner {
     }
 
     pub fn read_f0(&mut self, chain_id: u64) -> Result<Vec<u8>> {
-        if chain_id >= self.cfg.max_chain_id {
-            return Err(Error::ChainIdOutOfRange);
-        }
-        let ptr = self.index_get(chain_id);
+        let ptr = self.slot_ptr(chain_id)?;
         if ptr == 0 {
             return Err(Error::NoFrame);
         }
@@ -444,10 +452,7 @@ impl DepotInner {
     }
 
     pub fn read_f1(&mut self, chain_id: u64) -> Result<Option<Vec<u8>>> {
-        if chain_id >= self.cfg.max_chain_id {
-            return Err(Error::ChainIdOutOfRange);
-        }
-        let ptr = self.index_get(chain_id);
+        let ptr = self.slot_ptr(chain_id)?;
         if ptr == 0 {
             return Err(Error::NoFrame);
         }
@@ -462,10 +467,7 @@ impl DepotInner {
     }
 
     pub fn cold_head(&mut self, chain_id: u64) -> Result<u64> {
-        if chain_id >= self.cfg.max_chain_id {
-            return Err(Error::ChainIdOutOfRange);
-        }
-        let ptr = self.index_get(chain_id);
+        let ptr = self.slot_ptr(chain_id)?;
         if ptr == 0 {
             return Ok(0);
         }
@@ -652,11 +654,12 @@ impl DepotInner {
             .create(true)
             .truncate(true)
             .open(&index_path)?;
-        index_file.set_len(self.cfg.max_chain_id * INDEX_ENTRY_LEN as u64)?;
+        index_file.set_len(self.slots * INDEX_ENTRY_LEN as u64)?;
         index_file.sync_data()?;
         // SAFETY: same contract as open() — we own the file and all
         // access is serialized by the outer Mutex.
         self.index = unsafe { MmapMut::map_mut(&index_file)? };
+        self.index_file = index_file;
         // The persisted counters describe files about to vanish.
         let _ = std::fs::remove_file(self.cfg.root.join("counters"));
         // Unlink every f0/f1 file.
@@ -692,6 +695,50 @@ impl DepotInner {
         std::io::Write::write_all(&mut self.cold_file, frame)?;
         self.cold_len += frame.len() as u64;
         Ok(off)
+    }
+
+    /// Make `chain_id`'s index slot writable: reject ids at or above
+    /// the sanity ceiling LOUDLY (before any write), and GROW the
+    /// index — ftruncate to `next_power_of_two(id+1)`, at least a
+    /// doubling, then remap — when the id is beyond current capacity.
+    /// Growth mutates only the index file (no data file, no cold
+    /// bytes), so the counters-sidecar fence is deliberately blind to
+    /// it: the counters describe data files, and growth alone changes
+    /// nothing they describe. The new length is fsynced immediately;
+    /// losing it in a crash would only orphan frames whose index flip
+    /// was never durable either — the ordinary lost-prepend shape.
+    fn ensure_slot(&mut self, chain_id: u64) -> Result<()> {
+        if chain_id >= crate::CHAIN_ID_CEILING {
+            return Err(Error::ChainIdOutOfRange);
+        }
+        if chain_id < self.slots {
+            return Ok(());
+        }
+        let new_slots = (chain_id + 1)
+            .next_power_of_two()
+            .max(self.slots.saturating_mul(2))
+            .min(crate::CHAIN_ID_CEILING);
+        self.index_file
+            .set_len(new_slots * INDEX_ENTRY_LEN as u64)?;
+        self.index_file.sync_data()?;
+        // SAFETY: same contract as open() — we own the file and all
+        // access is serialized by the outer Mutex.
+        self.index = unsafe { MmapMut::map_mut(&self.index_file)? };
+        self.slots = new_slots;
+        Ok(())
+    }
+
+    /// Read-side slot lookup: above the ceiling is the loud error;
+    /// between capacity and the ceiling the chain simply has no frames
+    /// yet (capacity is a write-side artifact readers never see).
+    fn slot_ptr(&self, chain_id: u64) -> Result<u64> {
+        if chain_id >= crate::CHAIN_ID_CEILING {
+            return Err(Error::ChainIdOutOfRange);
+        }
+        if chain_id >= self.slots {
+            return Ok(0);
+        }
+        Ok(self.index_get(chain_id))
     }
 
     fn index_get(&self, chain_id: u64) -> u64 {

@@ -16,19 +16,22 @@ use crate::error::{Error, Result};
 use crate::import::do_import;
 use crate::schema::META_DDL;
 
-/// Default `max_chain_id` for fresh instances: sized for enwiki
-/// (~80M page ids in 2026) with headroom. The cost is the depot's
-/// index file at 8 bytes/chain — 800MB LOGICAL, but the index is
-/// created with `ftruncate` and stays sparse: untouched chains never
-/// allocate a disk block (pinned by the depot's sparse-index test).
+/// Default `max_chain_id` INDEX SIZE HINT for fresh instances: sized
+/// for enwiki (~80M page ids in 2026) with headroom. The cost is the
+/// depot's index file at 8 bytes/chain — 800MB LOGICAL, but the index
+/// is created with `ftruncate` and stays sparse: untouched chains
+/// never allocate a disk block (pinned by the depot's sparse-index
+/// test). It is ONLY a hint: page ids beyond it grow the index
+/// automatically; only ids at/above the depot's 2^40 sanity ceiling
+/// are rejected ([`crate::Error::PageIdOverflow`]).
 pub const DEFAULT_MAX_CHAIN_ID: u64 = 100_000_000;
 
-/// The `max_chain_id` an EXISTING instance root was created with —
-/// derived from the on-disk depot index (`max_chain_id * 8` bytes),
-/// so read-side opens never guess. A fresh root (no index yet) gets
-/// [`DEFAULT_MAX_CHAIN_ID`]. A mismatched explicit config still fails
-/// loudly in the depot (`IndexSizeMismatch`); this helper is how
-/// callers avoid manufacturing that mismatch.
+/// The index capacity an EXISTING instance root currently has —
+/// derived from the on-disk depot index (`capacity * 8` bytes). A
+/// fresh root (no index yet) gets [`DEFAULT_MAX_CHAIN_ID`]. The depot
+/// derives capacity from disk and auto-grows, so any hint opens any
+/// root; this helper just keeps a `--max-page-id`-less CLI open from
+/// passing a hint smaller than what the store already holds.
 pub fn max_chain_id_for_root(root: &std::path::Path) -> u64 {
     std::fs::metadata(root.join("depot").join("index"))
         .map(|m| m.len() / 8)
@@ -47,8 +50,10 @@ pub struct InstanceConfig {
     pub root: PathBuf,
     /// Wiki database name, e.g. `"enwiki"`, `"votewiki"`.
     pub dbname: String,
-    /// Maximum supported page id. Sizes the depot's index (`max_chain_id * 8`
-    /// bytes). For votewiki/cswiki ≪ 1M; for enwiki ≈ 100M.
+    /// Initial page-id capacity HINT: sizes a fresh depot index at
+    /// `max_chain_id * 8` sparse bytes. NOT a limit — the index grows
+    /// automatically for larger page ids; only ids at/above the
+    /// depot's 2^40 sanity ceiling are rejected at import.
     pub max_chain_id: u64,
     /// Depot tuning. The implementer can pass this through to
     /// [`DepotConfig`] — `root` is forced to `<root>/depot/`. Tests
@@ -130,6 +135,8 @@ pub struct Instance {
     /// the `Instance` — a history walk is frame-at-a-time, not a
     /// snapshot of the whole decompressed chain.
     pub(crate) inner: Arc<Mutex<InstanceInner>>,
+    /// Read/import page-id clip — always the depot's 2^40 sanity
+    /// ceiling (see `open`); ids below it are covered by index growth.
     pub(crate) max_chain_id: u64,
     pub(crate) f1_seal_threshold_bytes: u64,
     pub(crate) title_shard_count: u32,
@@ -222,7 +229,11 @@ impl Instance {
                 _lock: lock,
             })),
             suspect,
-            max_chain_id: cfg.max_chain_id,
+            // The page-id clip is the depot's 2^40 sanity ceiling, not
+            // the config value: `cfg.max_chain_id` is only the fresh
+            // index's SIZE HINT (the depot auto-grows past it), so a
+            // page imported beyond the hint must stay readable.
+            max_chain_id: wikimak_depot::CHAIN_ID_CEILING,
             f1_seal_threshold_bytes: if cfg.f1_seal_threshold_bytes == 0 {
                 256 * 1024
             } else {

@@ -23,9 +23,12 @@ pub enum Error {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
-    /// `page_id` exceeds the depot's `max_chain_id`. Reopen with a larger cap.
-    #[error("page id {page_id} exceeds max_chain_id {max_chain_id}")]
-    PageIdOverflow { page_id: u64, max_chain_id: u64 },
+    /// `page_id` is at or above the depot's 2^40 chain-id sanity
+    /// ceiling. Below the ceiling there is no bound to hit — the
+    /// depot's index auto-grows — so this fires only on a corrupt id
+    /// (or the wrong planet's wiki), and it fires BEFORE any write.
+    #[error("page id {page_id} exceeds the chain-id sanity ceiling {ceiling}")]
+    PageIdOverflow { page_id: u64, ceiling: u64 },
 
     /// Per-revision binary record was malformed on decode.
     #[error("revision codec: {0}")]

@@ -13,9 +13,11 @@ use common::make_instance;
 // ---------------------------------------------------------------------------
 // page_id_overflow_errors_before_writes
 //
-// Open with max_chain_id=100; feed a page with id=500. The implementer
-// may either return Err on import OR skip the offending page. EITHER
-// WAY: no depot frame for page 500, no meta.db row referencing page 500.
+// The depot index auto-grows below the 2^40 sanity ceiling, so the only
+// remaining overflow is a page id AT/ABOVE the ceiling (a corrupt id).
+// Feed one. The implementer may either return Err on import OR skip the
+// offending page. EITHER WAY: no depot frame and no meta.db row for it.
+// (Growth below the ceiling is pinned in overflow_loud.rs.)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -30,7 +32,7 @@ fn page_id_overflow_errors_before_writes() {
     <namespaces><namespace key="0" case="first-letter"/></namespaces>
   </siteinfo>
   <page>
-    <title>Toobig</title><ns>0</ns><id>500</id>
+    <title>Toobig</title><ns>0</ns><id>1099511627776</id>
     <revision>
       <id>5000</id><timestamp>2024-01-01T00:00:00Z</timestamp>
       <contributor><username>U</username><id>1</id></contributor>
@@ -58,41 +60,41 @@ fn page_id_overflow_errors_before_writes() {
         }
     }
 
-    // Post-condition (both branches): nothing about page 500 on disk.
+    // Post-condition (both branches): nothing about the overflowing page on disk.
     assert!(
-        instance.page_head(500).expect("page_head ok").is_none(),
+        instance.page_head(1099511627776).expect("page_head ok").is_none(),
         "no head for overflowed page id"
     );
 
     let conn = Connection::open(tmp.path().join("meta.db")).expect("meta.db");
     let count_pti: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM page_to_title_id WHERE page_id = 500",
+            "SELECT COUNT(*) FROM page_to_title_id WHERE page_id = 1099511627776",
             [],
             |r| r.get(0),
         )
         .expect("count page_to_title_id");
-    assert_eq!(count_pti, 0, "no meta.db row references page 500");
+    assert_eq!(count_pti, 0, "no meta.db row references the overflowing page");
     let count_ti: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM title_intervals WHERE page_id = 500",
+            "SELECT COUNT(*) FROM title_intervals WHERE page_id = 1099511627776",
             [],
             |r| r.get(0),
         )
         .expect("count title_intervals");
-    assert_eq!(count_ti, 0, "no title_intervals row references page 500");
+    assert_eq!(count_ti, 0, "no title_intervals row references the overflowing page");
 }
 
 // ---------------------------------------------------------------------------
 // import_is_per_page_atomic_around_overflow
 //
-// A stream with [ok page id=10, oversize page id=500, ok page id=20].
+// A stream with [ok page id=10, page id at the 2^40 ceiling, ok page id=20].
 // The two valid pages must commit; the offending page must leave no
 // state. Pin both possible policies (reject mid-stream, skip-and-
 // continue): assert pages 10 and 20 are observable iff the import
 // succeeded; in the reject case, assert at least page 10 committed
-// (per-page atomicity) and page 500/20 are absent or partial. In all
-// cases page 500 is absent from meta.db.
+// (per-page atomicity) and the overflowing page/20 are absent or partial. In all
+// cases the overflowing page is absent from meta.db.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -117,7 +119,7 @@ fn import_is_per_page_atomic_around_overflow() {
     </revision>
   </page>
   <page>
-    <title>BAD</title><ns>0</ns><id>500</id>
+    <title>BAD</title><ns>0</ns><id>1099511627776</id>
     <revision>
       <id>5000</id><timestamp>2024-01-01T00:00:00Z</timestamp>
       <contributor><username>U</username><id>1</id></contributor>
@@ -149,17 +151,17 @@ fn import_is_per_page_atomic_around_overflow() {
 
     // Page 500 must never exist.
     assert!(
-        instance.page_head(500).expect("ok").is_none(),
-        "page 500 must never be committed"
+        instance.page_head(1099511627776).expect("ok").is_none(),
+        "the overflowing page must never be committed"
     );
 
     let conn = Connection::open(tmp.path().join("meta.db")).expect("meta.db");
     let count_500: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM page_to_title_id WHERE page_id = 500",
+            "SELECT COUNT(*) FROM page_to_title_id WHERE page_id = 1099511627776",
             [],
             |r| r.get(0),
         )
         .expect("count");
-    assert_eq!(count_500, 0, "no meta.db state for page 500");
+    assert_eq!(count_500, 0, "no meta.db state for the overflowing page");
 }

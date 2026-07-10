@@ -58,10 +58,12 @@ pub struct ImportStats {
 ## Page → chain mapping
 
 The depot uses `u64 chain_id`. Wikipedia page ids are `i64`. Mapping:
-`chain_id = page_id as u64`. We assume page ids fit in the depot's
-`max_chain_id`. If a wiki has page id > `max_chain_id` we reject at import
-time and ask the user to re-open the instance with a larger cap. (No silent
-remapping.)
+`chain_id = page_id as u64`. `max_chain_id` is only the fresh index's
+size hint: the depot's sparse index auto-grows for page ids beyond it,
+so there is no user-visible capacity knob. A page id at or above the
+depot's 2^40 sanity ceiling (a corrupt id, not a big wiki) is rejected
+LOUDLY at import time, before any write for that page. (No silent
+remapping, no silent skipping.)
 
 ## Per-revision storage in the depot
 

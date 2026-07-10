@@ -98,18 +98,20 @@ pub(crate) fn do_import<R: Read>(
         let page_id = header.id as u64;
 
         // Reject-policy on overflow (PHASES §"page_id_overflow_errors_
-        // before_writes"): a page id past the instance's bound is a
-        // LOUD import error BEFORE any write for that page — checked
-        // even before the once-per-import siteinfo capture so a
-        // first-page overflow leaves meta.db untouched. Silently
-        // skipping instead would let the part watermark land over a
-        // lossy import (on enwiki, ~95% of pages gone invisibly).
-        // Pages already committed this run stay (per-page atomicity);
-        // the run fails, so no part is ever marked seen.
-        if page_id >= instance.max_chain_id {
+        // before_writes"): a page id at/above the depot's 2^40 sanity
+        // ceiling is a LOUD import error BEFORE any write for that
+        // page — checked even before the once-per-import siteinfo
+        // capture so a first-page overflow leaves meta.db untouched.
+        // Ids below the ceiling never overflow: the depot's index
+        // auto-grows (sparse) to cover them, so `--max-page-id` is only
+        // a fresh-index size hint. Silently skipping instead would let
+        // the part watermark land over a lossy import. Pages already
+        // committed this run stay (per-page atomicity); the run fails,
+        // so no part is ever marked seen.
+        if page_id >= wikimak_depot::CHAIN_ID_CEILING {
             return Err(crate::error::Error::PageIdOverflow {
                 page_id,
-                max_chain_id: instance.max_chain_id,
+                ceiling: wikimak_depot::CHAIN_ID_CEILING,
             });
         }
 

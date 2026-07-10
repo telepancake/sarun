@@ -50,11 +50,30 @@ rebuildable).
 
 ### Index
 
-Fixed-size file. Each entry is one u64 LE packing `file_id` in the low
-16 bits and `offset` in the high 48 (per-file cap 256TB, 65535 files
-per tier), pointing at the chain's f0 frame. `(0, 0)` = chain has no frames yet.
-File size = `8 * max_chain_id`. mmap'd r/w. Writing an index entry is one
-aligned 8-byte pwrite, atomic on real filesystems.
+Sparse flat array, one 8-byte slot per chain id. Each entry is one u64
+LE packing `file_id` in the low 16 bits and `offset` in the high 48
+(per-file cap 256TB, 65535 files per tier), pointing at the chain's f0
+frame. `(0, 0)` = chain has no frames yet. mmap'd r/w. Writing an index
+entry is one aligned 8-byte pwrite, atomic on real filesystems.
+
+Capacity is NOT a knob. A fresh depot creates the file at
+`8 * max_chain_id` bytes (the config value is only this initial size
+hint; `ftruncate`, so the file is born and stays sparse); an existing
+depot derives capacity from the on-disk length — a differing config
+hint is never an error. A WRITE to a chain id beyond capacity grows the
+file under the depot lock: `ftruncate` to
+`next_power_of_two(id + 1).max(capacity * 2) * 8` bytes (still sparse —
+untouched slots never allocate a block), fsync the new length, remap.
+Reads never grow anything: an id between capacity and the ceiling is
+simply an empty chain. Growth mutates ONLY the index file, so the
+counters-sidecar fence (which records data-file lengths, never the
+index) is deliberately blind to it — the counters stay valid across a
+growth, and a crash that loses an unfsynced growth loses only frames
+whose index flip was never durable either.
+
+One loud sanity ceiling remains: chain ids at or above 2^40
+(`CHAIN_ID_CEILING`) are rejected before any write — that is a corrupt
+id (8TB of logical index), not a big wiki.
 
 ### Frame format (same in all three tiers)
 
@@ -136,7 +155,7 @@ pub struct Depot { /* opaque */ }
 
 pub struct DepotConfig {
     pub root: PathBuf,
-    pub max_chain_id: u64,
+    pub max_chain_id: u64,              // INITIAL index size hint only; the index auto-grows (see "Index")
     pub file_size_threshold: u64,       // default ~1 GiB; rolls to a fresh f0/f1 file past this
     pub eviction_dead_ratio: f32,       // default 0.5
 }
@@ -344,8 +363,10 @@ T == f1). No decompression. No re-encoding.
 ### Open
 
 1. `mkdir -p` the tier dirs.
-2. mmap the index file (creating zero-filled if absent at `max_chain_id *
-   8` bytes — `ftruncate`, so it is born and stays sparse).
+2. mmap the index file. Absent → create at the `max_chain_id * 8`-byte
+   size hint (`ftruncate`, so it is born and stays sparse). Present →
+   capacity = on-disk length / 8; the config hint is not compared (see
+   "Index"; a length that is not a multiple of 8 is the one loud error).
 3. List existing files in f0/, f1/, cold/. Allocate the next file id =
    `max + 1` per tier.
 4. Open the cold file (creating empty if absent).
@@ -399,8 +420,10 @@ Open cost: O(data files) metadata on the sidecar path; O(total FRAMES)
 
 ## Limits
 
-- `chain_id < max_chain_id`. Opening with a different `max_chain_id`
-  than the index file's recorded size is an error.
+- `chain_id < 2^40` (`CHAIN_ID_CEILING`) — a sanity fence against
+  corrupt ids, not a capacity: the index auto-grows below it. Opening
+  with a different `max_chain_id` hint than the on-disk index size is
+  NOT an error; capacity derives from disk.
 - One frame's zstd bytes are bounded only by the 48-bit per-file
   offset space (zstd_len is u64 on disk).
 - Per-file size < 2^48 (offset is 48 bits); at most 65535 data files

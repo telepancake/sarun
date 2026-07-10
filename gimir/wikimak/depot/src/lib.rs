@@ -20,6 +20,14 @@ use inner::DepotInner;
 /// Result alias for depot operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Hard sanity ceiling on chain ids (2^40). The index auto-grows to
+/// cover any id BELOW this (see `DepotConfig::max_chain_id`), so the
+/// ceiling is not a capacity knob — it exists to fail LOUDLY on a
+/// corrupt id instead of ftruncating an index into the exabytes. At
+/// 8 bytes/slot a full ceiling-sized index is 8TB logical (sparse);
+/// real wikis top out around 10^8 pages.
+pub const CHAIN_ID_CEILING: u64 = 1 << 40;
+
 /// Errors returned by the depot.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -31,8 +39,9 @@ pub enum Error {
     #[error("chain has no frame")]
     NoFrame,
 
-    /// `chain_id` is >= `max_chain_id`.
-    #[error("chain id out of range")]
+    /// `chain_id` is at or above [`CHAIN_ID_CEILING`]. Ids below the
+    /// ceiling never see this error: the index grows to cover them.
+    #[error("chain id beyond the 2^40 sanity ceiling")]
     ChainIdOutOfRange,
 
     /// First prepend must pass `new_f1_bytes = None`.
@@ -47,8 +56,11 @@ pub enum Error {
     #[error("cannot seal: chain has no f1")]
     CannotSealNoF1,
 
-    /// Index file size on disk disagrees with the configured `max_chain_id`.
-    #[error("index size mismatch")]
+    /// The on-disk index file length is not a whole number of 8-byte
+    /// slots — a torn ftruncate or outside interference. (Capacity
+    /// itself is DERIVED from the length; a differing
+    /// `DepotConfig::max_chain_id` is a size hint, never an error.)
+    #[error("index file length is not a multiple of the 8-byte slot size")]
     IndexSizeMismatch,
 
     /// A frame would push a data file past the 48-bit pointer offset
@@ -71,7 +83,14 @@ pub enum Error {
 pub struct DepotConfig {
     /// Root directory holding `format`, `index`, `f0/`, `f1/`, `cold/cold`.
     pub root: PathBuf,
-    /// Maximum chain id; the index is sized at `max_chain_id * 8` bytes.
+    /// INITIAL chain-id capacity hint: a fresh depot's index is created
+    /// at `max_chain_id * 8` bytes (ftruncate — born and stays sparse).
+    /// An existing depot derives its capacity from the on-disk index
+    /// length; a write to a chain id beyond capacity GROWS the index
+    /// (to `next_power_of_two(id+1)`, at least doubling) under the
+    /// depot lock. Only ids at or above [`CHAIN_ID_CEILING`] are
+    /// rejected ([`Error::ChainIdOutOfRange`]) — a knob-free importer
+    /// cannot overflow on a real wiki.
     pub max_chain_id: u64,
     /// Roll to a fresh f0/f1 file once the current target hits this size.
     pub file_size_threshold: u64,

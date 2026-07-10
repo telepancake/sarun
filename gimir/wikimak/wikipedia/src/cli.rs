@@ -16,12 +16,13 @@ use std::path::PathBuf;
 use wikimak_mediawiki::new_page_stream;
 use crate::{Instance, InstanceConfig};
 
-/// Per-run page-id bound override (`--max-page-id N`), `None` = derive:
-/// an existing root keeps the bound its depot index was created with;
-/// a fresh root gets `DEFAULT_MAX_CHAIN_ID` (sized for enwiki — the
+/// Per-run index size HINT override (`--max-page-id N`), `None` =
+/// derive: an existing root reports its current on-disk capacity; a
+/// fresh root gets `DEFAULT_MAX_CHAIN_ID` (sized for enwiki — the
 /// index is 8 bytes/chain and created sparse, so the default costs no
-/// disk for small wikis). An explicit N against a mismatched existing
-/// index fails loudly in the depot (`IndexSizeMismatch`).
+/// disk for small wikis). Purely a hint either way: the depot derives
+/// real capacity from disk and auto-grows for larger page ids, so no
+/// N can make an import overflow below the 2^40 sanity ceiling.
 fn open_instance(root: PathBuf, max_page_id: Option<u64>) -> Result<Instance, String> {
     let max_chain_id =
         max_page_id.unwrap_or_else(|| crate::instance::max_chain_id_for_root(&root));

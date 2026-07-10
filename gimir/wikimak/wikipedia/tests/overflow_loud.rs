@@ -1,21 +1,29 @@
-//! Page-id overflow is a LOUD import error, never a silent skip.
+//! Page-id overflow is a LOUD import error, never a silent skip — and
+//! since the depot index auto-grows, the ONLY overflow left is the
+//! depot's 2^40 chain-id sanity ceiling.
 //!
 //! PHASES §"page_id_overflow_errors_before_writes" left the policy an
 //! implementer's choice; the silent-skip choice was a data-loss bug on
 //! enwiki (bound 4M, page ids to ~8e7: ~95% of pages dropped invisibly
 //! while the part watermark still landed, making the loss permanent).
-//! This suite pins the reject-policy:
+//! The bound itself was then retired as a knob: a page id beyond the
+//! configured hint GROWS the sparse index instead of erroring. This
+//! suite pins both halves:
 //!
-//!   * `import` returns `Err(PageIdOverflow)` naming both numbers;
-//!   * the offending page leaves NO depot bytes and NO sqlite rows —
-//!     for a first-page overflow the whole instance stays untouched;
-//!   * a `sync` run that hits an overflow FAILS and leaves NO part
+//!   * a page id past the fresh-index hint imports fine — the index
+//!     grows (sparse, real st_blocks effect) and the page round-trips;
+//!   * a page id at/above the 2^40 ceiling makes `import` return
+//!     `Err(PageIdOverflow)` naming both numbers, leaving NO depot
+//!     bytes and NO sqlite rows — for a first-page overflow the whole
+//!     instance stays untouched;
+//!   * a `sync` run that hits the ceiling FAILS and leaves NO part
 //!     watermark, so the next run re-fetches instead of skipping a
 //!     lossy part forever.
 
 mod common;
 
 use std::io::Cursor;
+use std::os::unix::fs::MetadataExt;
 
 use httpmock::prelude::*;
 use rusqlite::Connection;
@@ -26,15 +34,20 @@ use wikimak_wikipedia::{sync, Error};
 
 use common::{list_files, make_instance};
 
-/// One page (id 500) — above the test bound of 100.
-const OVERFLOW_DOC: &str = r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
+/// The depot's chain-id sanity ceiling (2^40) — the one id class that
+/// still rejects.
+const CEILING: u64 = 1 << 40;
+
+fn one_page_doc(page_id: u64) -> String {
+    format!(
+        r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
   <siteinfo>
     <sitename>x</sitename><dbname>x</dbname><base>x</base>
     <generator>g</generator><case>first-letter</case>
     <namespaces><namespace key="0" case="first-letter"/></namespaces>
   </siteinfo>
   <page>
-    <title>Toobig</title><ns>0</ns><id>500</id>
+    <title>Toobig</title><ns>0</ns><id>{page_id}</id>
     <revision>
       <id>5000</id><timestamp>2024-01-01T00:00:00Z</timestamp>
       <contributor><username>U</username><id>1</id></contributor>
@@ -43,7 +56,9 @@ const OVERFLOW_DOC: &str = r#"<mediawiki xmlns="http://www.mediawiki.org/xml/exp
       <sha1>aa</sha1>
     </revision>
   </page>
-</mediawiki>"#;
+</mediawiki>"#
+    )
+}
 
 /// Total bytes across every file under `dir` (recursive one level per
 /// tier layout: depot/{f0,f1,cold} hold flat files).
@@ -59,21 +74,54 @@ fn table_count(conn: &Connection, table: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// The retired knob, end to end through the importer: page id 500
+/// against a fresh-index hint of 100 imports by GROWING the index —
+/// sparse on disk — and the page reads back; a reopen deriving its
+/// hint from the on-disk size sees the same store.
 #[test]
-fn overflow_is_a_loud_error_before_any_write() {
+fn page_id_beyond_the_hint_grows_the_index_sparse() {
+    let tmp = TempDir::new().unwrap();
+    let index = tmp.path().join("depot").join("index");
+    {
+        let instance = make_instance(&tmp, 100);
+        assert_eq!(std::fs::metadata(&index).unwrap().len(), 100 * 8);
+
+        let mut stream = new_page_stream(Cursor::new(one_page_doc(500).into_bytes()));
+        let stats = instance
+            .import(&mut stream)
+            .expect("page id 500 past hint 100 must import via index growth");
+        assert_eq!(stats.revisions_new, 1);
+        assert_eq!(
+            instance.page_head_text(500).unwrap().unwrap(),
+            b"hi",
+            "grown page must round-trip"
+        );
+        instance.flush().unwrap();
+    }
+    // Growth = next_power_of_two(501) slots, and SPARSE: the file's
+    // allocated blocks stay tiny however far the id jumped.
+    let md = std::fs::metadata(&index).unwrap();
+    assert_eq!(md.len(), 512 * 8, "index grew to next_power_of_two(id+1) slots");
+    assert!(md.blocks() * 512 < 1 << 20, "grown index must be sparse");
+
+    // Reopen with the derived hint (what the CLI does): same store.
+    let instance = make_instance(&tmp, wikimak_wikipedia::max_chain_id_for_root(tmp.path()));
+    assert_eq!(instance.page_head(500).unwrap().unwrap().rev_id, 5000);
+    assert_eq!(instance.page_head_text(500).unwrap().unwrap(), b"hi");
+}
+
+#[test]
+fn ceiling_overflow_is_a_loud_error_before_any_write() {
     let tmp = TempDir::new().unwrap();
     let instance = make_instance(&tmp, 100);
 
-    let mut stream = new_page_stream(Cursor::new(OVERFLOW_DOC.as_bytes().to_vec()));
+    let mut stream = new_page_stream(Cursor::new(one_page_doc(CEILING).into_bytes()));
     let err = instance
         .import(&mut stream)
-        .expect_err("page id 500 past bound 100 must FAIL the import");
+        .expect_err("page id at the 2^40 ceiling must FAIL the import");
     match err {
-        Error::PageIdOverflow {
-            page_id,
-            max_chain_id,
-        } => {
-            assert_eq!((page_id, max_chain_id), (500, 100));
+        Error::PageIdOverflow { page_id, ceiling } => {
+            assert_eq!((page_id, ceiling), (CEILING, CEILING));
         }
         other => panic!("expected PageIdOverflow, got {other:?}"),
     }
@@ -81,13 +129,17 @@ fn overflow_is_a_loud_error_before_any_write() {
     let msg = format!(
         "{}",
         Error::PageIdOverflow {
-            page_id: 500,
-            max_chain_id: 100
+            page_id: CEILING + 7,
+            ceiling: CEILING
         }
     );
-    assert!(msg.contains("500") && msg.contains("100"), "unhelpful: {msg}");
+    assert!(
+        msg.contains(&(CEILING + 7).to_string()) && msg.contains(&CEILING.to_string()),
+        "unhelpful: {msg}"
+    );
 
-    // NO depot write: every tier is empty bytes on disk.
+    // NO depot write: every tier is empty bytes on disk, and the index
+    // kept its hint size (no growth toward the corrupt id either).
     for tier in ["depot/f0", "depot/f1", "depot/cold"] {
         assert_eq!(
             dir_bytes(&tmp.path().join(tier)),
@@ -95,6 +147,11 @@ fn overflow_is_a_loud_error_before_any_write() {
             "{tier} has bytes after a rejected import"
         );
     }
+    assert_eq!(
+        std::fs::metadata(tmp.path().join("depot/index")).unwrap().len(),
+        100 * 8,
+        "a rejected id must not grow the index"
+    );
 
     // NO sqlite rows: the overflow fired before the siteinfo capture,
     // the dirty stamp, and every per-page row.
@@ -117,9 +174,9 @@ fn overflow_is_a_loud_error_before_any_write() {
 }
 
 // ---------------------------------------------------------------------------
-// The sync path: an overflow mid-part fails the RUN and must leave no
-// `parts_seen` watermark — the skip signal for the next sync would
-// otherwise permanently paper over the loss.
+// The sync path: a ceiling overflow mid-part fails the RUN and must
+// leave no `parts_seen` watermark — the skip signal for the next sync
+// would otherwise permanently paper over the loss.
 // ---------------------------------------------------------------------------
 
 const PART: &str = "testwiki-20240601-pages-meta-history1.xml-p1p99";
@@ -127,7 +184,7 @@ const PART: &str = "testwiki-20240601-pages-meta-history1.xml-p1p99";
 #[test]
 fn sync_overflow_fails_run_and_leaves_no_watermark() {
     let server = MockServer::start();
-    let xml = OVERFLOW_DOC.as_bytes().to_vec();
+    let xml = one_page_doc(CEILING).into_bytes();
     let sha1_hex = hex::encode(Sha1::digest(&xml));
 
     server.mock(|when, then| {
