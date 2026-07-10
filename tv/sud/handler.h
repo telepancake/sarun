@@ -50,6 +50,7 @@ struct kernel_sigaction_raw {
 #define UC_ARG5(uc) ((long)(uc)->uc_mcontext.gregs[REG_R9])
 #define UC_SET_RET(uc, v) ((uc)->uc_mcontext.gregs[REG_RAX] = (v))
 #define UC_PC(uc) ((unsigned long)(uc)->uc_mcontext.gregs[REG_RIP])
+#define UC_SP(uc) ((unsigned long)(uc)->uc_mcontext.gregs[REG_RSP])
 #else
 #define UC_SYSCALL_NR(uc) ((long)(uc)->uc_mcontext.gregs[REG_EAX])
 #define UC_ARG0(uc) ((long)(uc)->uc_mcontext.gregs[REG_EBX])
@@ -60,6 +61,7 @@ struct kernel_sigaction_raw {
 #define UC_ARG5(uc) ((long)(uc)->uc_mcontext.gregs[REG_EBP])
 #define UC_SET_RET(uc, v) ((uc)->uc_mcontext.gregs[REG_EAX] = (v))
 #define UC_PC(uc) ((unsigned long)(uc)->uc_mcontext.gregs[REG_EIP])
+#define UC_SP(uc) ((unsigned long)(uc)->uc_mcontext.gregs[REG_ESP])
 #endif
 
 /* ================================================================

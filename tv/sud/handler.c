@@ -394,6 +394,38 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
     long ret;
 
     /*
+     * munmap of the range containing the interrupted thread's OWN stack
+     * pointer — musl's __unmapself, the detached-pthread exit path
+     * (`munmap(stack); exit(0)`, written to need no stack in between).
+     * Untraced, those are two bare instructions. Under SUD each traps
+     * here, so after the munmap's sigreturn the thread runs a few
+     * instructions with SP pointing into FREED memory before the exit
+     * traps; any signal frame the kernel must push in that window has
+     * nowhere to go and the kernel force-kills with SIGSEGV/SI_KERNEL,
+     * fault addr 0, unreadable stack — racy under heavy thread churn
+     * (Rust dropped-JoinHandle threads take this path constantly).
+     * Nothing but self-exit can follow unmapping your own stack, so
+     * perform the whole tail here: real munmap, then the thread's
+     * SYS_exit(0) (musl passes 0), never sigreturning onto freed
+     * memory. On munmap failure fall through normally — the stack is
+     * still mapped and the caller sees the error.
+     */
+#ifdef SYS_munmap
+    if (nr == SYS_munmap) {
+        unsigned long sp = UC_SP(uc);
+        unsigned long lo = (unsigned long)a0;
+        unsigned long len = (unsigned long)a1;
+        if (len > 0 && sp >= lo && sp - lo < len) {
+            long r = raw_syscall6(SYS_munmap, a0, a1, 0, 0, 0, 0);
+            if (r == 0)
+                raw_syscall6(SYS_exit, 0, 0, 0, 0, 0, 0); /* no return */
+            UC_SET_RET(uc, r);
+            return;
+        }
+    }
+#endif
+
+    /*
      * ptrace(PTRACE_TRACEME) — a child process wants a ptrace-based
      * tracer (e.g. nested uproctrace, fakeroot-ng) to trace it.
      *
