@@ -9,9 +9,30 @@ use std::path::PathBuf;
 
 fn usage() -> i32 {
     eprintln!(
-        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal] [--whole]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>\n       gitdepot union <git-repo> <store-dir> [--level N]\n       gitdepot union-update <git-repo> <store-dir> [--level N]\n       gitdepot union-verify <git-repo> <store-dir> [stride]"
+        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--shard-bits B] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal] [--whole]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>\n       gitdepot union <git-repo> <store-dir> [--level N] [--shard-bits B]\n       gitdepot union-update <git-repo> <store-dir> [--level N]\n       gitdepot union-verify <git-repo> <store-dir> [stride]"
     );
     2
+}
+
+/// Extract `--shard-bits B` (§9, a NEW-store parameter — an existing store
+/// keeps the bits it was created with) from an arg tail, exporting it for
+/// the store-creation path; returns the remaining args, `None` on a bad
+/// value.
+fn take_shard_bits(rest: &[String]) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == "--shard-bits" {
+            let v = rest.get(i + 1)?;
+            v.parse::<u32>().ok().filter(|&b| b <= 8)?;
+            std::env::set_var("GITDEPOT_SHARD_BITS", v);
+            i += 2;
+        } else {
+            out.push(rest[i].clone());
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 /// The `gitdepot` CLI entry, callable in-process: the sarun engine binary
@@ -24,7 +45,8 @@ pub fn cli_main(args: &[String]) -> i32 {
     };
     let result = match (cmd, rest) {
         ("import", [repo, store, rest @ ..]) => {
-            let (level, report) = match rest {
+            let Some(rest) = take_shard_bits(rest) else { return usage() };
+            let (level, report) = match &rest[..] {
                 [] => (3, false),
                 [f] if f == "--report" => (3, true),
                 [flag, n] if flag == "--level" => match n.parse() {
@@ -152,7 +174,8 @@ pub fn cli_main(args: &[String]) -> i32 {
             })
         }
         ("union", [repo, store, rest @ ..]) => {
-            let level = match rest {
+            let Some(rest) = take_shard_bits(rest) else { return usage() };
+            let level = match &rest[..] {
                 [] => 3,
                 [flag, n] if flag == "--level" => match n.parse() {
                     Ok(v) => v,

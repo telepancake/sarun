@@ -672,6 +672,111 @@ pub struct Entry<'p, 'b> {
     pub content: &'b [u8],
 }
 
+/// Pull-based twin of [`visit_entries`], for k-way merging across §9
+/// shards: yields file variants one at a time in container order. Each
+/// entry's path is owned (a merge holds k heads at once); content and
+/// bitmap stay borrowed slices into `bytes`.
+pub struct EntryCursor<'b> {
+    cur: depot::walk::Cursor<'b>,
+    /// Remaining children at each open level, innermost last.
+    levels: Vec<u64>,
+    /// Path length to restore when each open level closes.
+    keeps: Vec<usize>,
+    path: Vec<u8>,
+}
+
+/// One pulled entry: [`Entry`] with an owned path.
+pub struct OwnedEntry<'b> {
+    pub path: Vec<u8>,
+    pub mode: Mode,
+    pub slot: u32,
+    pub bitmap: Option<&'b [u8]>,
+    pub content: &'b [u8],
+}
+
+impl<'b> EntryCursor<'b> {
+    pub fn new(bytes: &'b [u8]) -> Result<Self, depot::walk::DecodeError> {
+        let mut cur = depot::walk::Cursor::new(bytes);
+        let node = cur.node()?;
+        Ok(EntryCursor { cur, levels: vec![node.child_count], keeps: Vec::new(), path: Vec::new() })
+    }
+
+    #[allow(clippy::should_implement_trait)] // lending shape: `Option` is inside `Result`
+    pub fn next(&mut self) -> Result<Option<OwnedEntry<'b>>, depot::walk::DecodeError> {
+        loop {
+            let Some(rem) = self.levels.last_mut() else { return Ok(None) };
+            if *rem == 0 {
+                self.levels.pop();
+                if let Some(k) = self.keeps.pop() {
+                    self.path.truncate(k);
+                }
+                continue;
+            }
+            *rem -= 1;
+            let name = self.cur.name()?;
+            match classify(name) {
+                Some(Kind::Dir(gitname)) => {
+                    let keep = push_seg(&mut self.path, gitname);
+                    let node = self.cur.node()?;
+                    self.keeps.push(keep);
+                    self.levels.push(node.child_count);
+                }
+                Some(Kind::File(gitname, slot)) => {
+                    let vnode = self.cur.node()?;
+                    let content = vnode.blob.unwrap_or(&[]);
+                    let mut mode = Mode::File;
+                    let mut bitmap = None;
+                    for _ in 0..vnode.child_count {
+                        let mname = self.cur.name()?;
+                        let mnode = self.cur.node()?;
+                        if mname == LANES {
+                            bitmap = Some(mnode.blob.unwrap_or(&[]));
+                        } else if let Some(tm) = tag_mode(mname, mnode.blob) {
+                            mode = tm;
+                        }
+                        for _ in 0..mnode.child_count {
+                            self.cur.name()?;
+                            self.cur.skip()?;
+                        }
+                    }
+                    let keep = push_seg(&mut self.path, gitname);
+                    let path = self.path.clone();
+                    self.path.truncate(keep);
+                    return Ok(Some(OwnedEntry { path, mode, slot, bitmap, content }));
+                }
+                None => self.cur.skip()?,
+            }
+        }
+    }
+}
+
+/// Container order (§3) of two full FILE paths: compare per level by the
+/// container KEY bytes — `dir_key` for a non-final segment, `file_key`
+/// for the final one — exactly the order a single-container walk yields,
+/// so a k-way merge of per-shard streams reproduces the unsharded order.
+pub fn container_path_cmp(a: &[u8], aslot: u32, b: &[u8], bslot: u32) -> std::cmp::Ordering {
+    use std::cmp::Ordering::Equal;
+    let (mut ai, mut bi) = (0usize, 0usize);
+    loop {
+        let ae = a[ai..].iter().position(|&c| c == b'/').map(|p| ai + p);
+        let be = b[bi..].iter().position(|&c| c == b'/').map(|p| bi + p);
+        let aseg = &a[ai..ae.unwrap_or(a.len())];
+        let bseg = &b[bi..be.unwrap_or(b.len())];
+        match (ae, be) {
+            (Some(a2), Some(b2)) => match aseg.cmp(bseg) {
+                Equal => {
+                    ai = a2 + 1;
+                    bi = b2 + 1;
+                }
+                o => return o,
+            },
+            (None, None) => return file_key(aseg, aslot).cmp(&file_key(bseg, bslot)),
+            (Some(_), None) => return dir_key(aseg).cmp(&file_key(bseg, bslot)),
+            (None, Some(_)) => return file_key(aseg, aslot).cmp(&dir_key(bseg)),
+        }
+    }
+}
+
 /// Walk a layer's canonical bytes in a single forward pass, calling `visit`
 /// on each file variant in container order. No `View`, no per-node
 /// allocation beyond the reused path buffer and O(depth) recursion; content

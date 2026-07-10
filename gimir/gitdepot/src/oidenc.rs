@@ -17,10 +17,9 @@
 //! HOLES (the store occludes no host), so the reader resolves them over the
 //! empty backdrop. [`Encoder::full`] is the positive full-state head.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
-use depot::{Attrs, BlobOp, Bytes, Layer, Name, Node, View};
+use depot::{BlobOp, Bytes, Layer, Name, Node};
 
 use crate::geostack::GeoStack;
 use crate::layer::{self, dir_key, file_key, variant_node, Mode};
@@ -382,6 +381,53 @@ fn collect_trans(
     Ok(())
 }
 
+/// The §9 stable path→shard router: the TOP `bits` of a 64-bit FNV-1a of
+/// the full git path (the `\0slot` variant tag is never part of the hash),
+/// so every version of a path lands in the same shard and the split is
+/// stable across a re-shard. `bits = 0` ⇒ a single shard. The hash is
+/// swappable without a format change (§9).
+pub fn shard_of(path: &[u8], bits: u32) -> usize {
+    if bits == 0 {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in path {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h >> (64 - bits)) as usize
+}
+
+/// One shard's per-path file transitions for a revision — the routed slice
+/// of the §6 git side, opaque to callers (paths + owned entries; `Send`,
+/// so a §9 shard thread can own it).
+pub struct PathTrans(BTreeMap<Vec<u8>, Vec<OwnedTrans>>);
+
+impl PathTrans {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The §6 git side once per revision, routed §9-style: distribute the lane
+/// transitions into per-path file transitions (O(changed), oid-pruned) and
+/// split them by [`shard_of`] into `2^bits` per-shard sets.
+pub fn route_trans(
+    trans: &[Trans],
+    obj: &mut dyn Objects,
+    bits: u32,
+) -> Result<Vec<PathTrans>> {
+    let mut all: BTreeMap<Vec<u8>, Vec<OwnedTrans>> = BTreeMap::new();
+    collect_trans(trans, obj, &mut Vec::new(), &mut all)?;
+    let mut per: Vec<BTreeMap<Vec<u8>, Vec<OwnedTrans>>> =
+        (0..1usize << bits).map(|_| BTreeMap::new()).collect();
+    for (path, t) in all {
+        let s = shard_of(&path, bits);
+        per[s].insert(path, t);
+    }
+    Ok(per.into_iter().map(PathTrans).collect())
+}
+
 /// Descend `out` along the `/`-separated `path` (creating bare `dir_key` Keep
 /// nodes) and insert `node` at `file_key(leaf, slot)`.
 fn put_variant(out: &mut Node, path: &[u8], slot: u32, node: Node) {
@@ -614,9 +660,29 @@ impl Encoder {
         // §6 git side: the changed paths and their per-lane transitions.
         let mut path_trans: BTreeMap<Vec<u8>, Vec<OwnedTrans>> = BTreeMap::new();
         collect_trans(trans, obj, &mut Vec::new(), &mut path_trans)?;
+        self.advance_paths(PathTrans(path_trans), obj, prev_live, new_live)
+    }
 
+    /// The stored side of [`Self::advance`] for an already-routed per-path
+    /// transition set — the §9 per-shard entry point: the git side ran once
+    /// globally ([`route_trans`]) and each shard advances its own state
+    /// with its slice. An empty slice is fine and expected (§9 lockstep —
+    /// every shard writes a layer per revision).
+    pub fn advance_paths(
+        &mut self,
+        paths: PathTrans,
+        obj: &mut dyn Objects,
+        prev_live: &[u8],
+        new_live: &[u8],
+    ) -> Result<Layer> {
+        let path_trans = paths.0;
         // §6 stored side: one lockstep pass over refPrefix + stack.
         let live_changed = trim(prev_live) != trim(new_live);
+        if path_trans.is_empty() && !live_changed {
+            // Untouched shard, unchanged live set: the state cannot move —
+            // no scan, an empty lockstep layer (§9).
+            return Ok(Layer { root: Node::keep() });
+        }
         let mut rev_root = Node::keep();
         let mut cur_vars: BTreeMap<Vec<u8>, Vec<(u32, VarKey, Bitmap)>> = BTreeMap::new();
         layer::visit_stacked(&self.refprefix, self.stack.layers(), |path, mode, slot, bitmap, content| {
@@ -722,6 +788,7 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use depot::{Attrs, View};
     use std::collections::HashMap;
 
     /// Reconstruct lane `l` from a §2 union View as a flat `path -> (mode,

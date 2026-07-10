@@ -51,8 +51,6 @@ use crate::lanes::{assign_lanes, LaneId};
 use crate::oidenc::{Encoder, Objects};
 use crate::{Error, Result};
 
-/// The single combined-state chain id in this store's private depot.
-const CHAIN: u64 = 0;
 
 /// Adapts the persistent `cat-file --batch` to the encoder's object store,
 /// with a BOUNDED oid→tree cache: a content-addressed tree object is fetched
@@ -254,19 +252,84 @@ fn tree_map(repo: &Path) -> Result<HashMap<String, String>> {
 struct RunState {
     lane_tree: Vec<Option<String>>,
     live: Vec<u8>,
-    batch: Vec<Vec<u8>>,
-    batch_bytes: u64,
 }
 
-/// Encode revisions `range` onto the depot: advance the encoder one revision at
-/// a time (O(changed) each), accumulate reverse-delta records, and seal a batch
-/// (a prepend + fresh full head) whenever it fills. `fresh` seeds f0 from the
-/// very first revision (a new store); an update leaves `fresh=false` so every
-/// new revision is a prepended reverse delta over the reconstructed boundary.
+/// One revision's routed work for a §9 shard thread.
+struct RevWork {
+    pt: crate::oidenc::PathTrans,
+    prev_live: std::sync::Arc<Vec<u8>>,
+    new_live: std::sync::Arc<Vec<u8>>,
+    /// Fresh store, first revision: seed this shard's f0 from the advanced
+    /// state instead of batching the (delta-from-nothing) record.
+    seed_f0: bool,
+}
+
+/// The per-shard encode worker (§9: one thread per shard, completely
+/// separate tree/delta state, sharing the git repo as the object source
+/// via its own reader). Consumes routed revisions in order — an empty
+/// slice still advances the lockstep (an empty record) — batches reverse
+/// records, seals at `bound`, and seals the remainder on channel close.
+/// Returns the shard's encoder (for the caller's later use) and its git
+/// object read count.
 #[allow(clippy::too_many_arguments)]
-fn run_range(
+fn shard_worker(
+    shard: u64,
+    mut enc: Encoder,
+    repo: &Path,
     depot: &Depot,
-    enc: &mut Encoder,
+    rx: std::sync::mpsc::Receiver<RevWork>,
+    bound: u64,
+    level: i32,
+) -> Result<(Encoder, usize)> {
+    let mut cat = crate::CatFile::new(repo)?;
+    let mut objs = Cat::new(&mut cat);
+    let mut batch: Vec<Vec<u8>> = Vec::new();
+    let mut batch_bytes = 0u64;
+    let mut live: Vec<u8> = Vec::new();
+    for w in rx {
+        let rev = enc.advance_paths(w.pt, &mut objs, &w.prev_live, &w.new_live)?;
+        live.clone_from(&w.new_live);
+        if w.seed_f0 {
+            // seal_record IS the §5 frame write: fold the stack, stream the
+            // record — no View, no node tree.
+            let f0raw = enc.seal_record(&mut objs, &live)?;
+            let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
+            depot.prepend(shard, &f0, None, false).map_err(|e| cf(e.to_string()))?;
+        } else {
+            let rec = codec::encode(&rev);
+            batch_bytes += 8 + rec.len() as u64;
+            batch.push(rec);
+        }
+        if !batch.is_empty() && batch_bytes >= bound {
+            let head = enc.seal_record(&mut objs, &live)?;
+            let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
+            seal_prepend(depot, shard, &head, &staged, level)?;
+            batch_bytes = 0;
+            depot.flush().map_err(|e| cf(e.to_string()))?;
+        }
+    }
+    if !batch.is_empty() {
+        let head = enc.seal_record(&mut objs, &live)?;
+        let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
+        seal_prepend(depot, shard, &head, &staged, level)?;
+    }
+    Ok((enc, objs.reads))
+}
+
+/// Encode revisions `range` onto the depot and seal every shard's remaining
+/// batch: the §9 run. The git side runs once per revision on this thread
+/// (lane transitions distributed and routed by path hash, O(changed)); each
+/// shard advances in its own thread in lockstep. `fresh` seeds each shard's
+/// f0 from the very first revision (a new store) and runs session-end
+/// compaction at the end (a fresh encode is already O(history); an update
+/// stays amortized — `flush`'s ratio-threshold eviction — keeping its I/O
+/// O(new), not O(history)).
+#[allow(clippy::too_many_arguments)]
+fn run_shards(
+    depot: &Depot,
+    encs: Vec<Encoder>,
+    bits: u32,
+    repo: &Path,
     objs: &mut Cat,
     plan: &LanePlan,
     tree_of: &HashMap<String, String>,
@@ -276,87 +339,96 @@ fn run_range(
     batch_bound: u64,
     level: i32,
     fresh: bool,
-) -> Result<()> {
-    use crate::oidenc::{Ent, Trans};
-    for i in range {
-        let sha = &sha_of[i];
-        let tree_oid = tree_of.get(sha).ok_or_else(|| cf(format!("no tree for {sha}")))?.clone();
-        let l = plan.lane_of[i] as usize;
-        let dead_old: Vec<(usize, Option<Ent>)> = plan.dying_at[i]
-            .iter()
-            .filter(|&&d| d != plan.lane_of[i])
-            .map(|&d| (d as usize, st.lane_tree[d as usize].clone().map(Ent::dir)))
-            .collect();
-        let adv_old = st.lane_tree[l].clone().map(Ent::dir);
-        let adv_new = Ent::dir(tree_oid.clone());
-        let mut trans: Vec<Trans> = Vec::with_capacity(dead_old.len() + 1);
-        for (d, oe) in &dead_old {
-            trans.push((*d, oe.as_ref(), None));
-        }
-        trans.push((l, adv_old.as_ref(), Some(&adv_new)));
+) -> Result<(Vec<Encoder>, usize)> {
+    use crate::oidenc::{route_trans, Ent, Trans};
+    use std::sync::Arc;
+    let n = encs.len();
+    let per_shard_bound = (batch_bound / n as u64).max(1);
+    let repo_buf = repo.to_path_buf();
 
-        let prev_live = st.live.clone();
-        for &d in &plan.dying_at[i] {
-            clear_live_bit(&mut st.live, d as usize);
+    std::thread::scope(|scope| -> Result<(Vec<Encoder>, usize)> {
+        let mut txs = Vec::with_capacity(n);
+        let mut handles = Vec::with_capacity(n);
+        for (s, enc) in encs.into_iter().enumerate() {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<RevWork>(64);
+            let repo_ref = &repo_buf;
+            handles.push(scope.spawn(move || {
+                shard_worker(s as u64, enc, repo_ref, depot, rx, per_shard_bound, level)
+            }));
+            txs.push(tx);
         }
-        set_live_bit(&mut st.live, l);
-        let new_live = st.live.clone();
+        // A send fails only when a worker died — fall through and surface
+        // its join error instead of the disconnect.
+        let mut send_broke = false;
+        'revs: for i in range {
+            let sha = &sha_of[i];
+            let tree_oid =
+                tree_of.get(sha).ok_or_else(|| cf(format!("no tree for {sha}")))?.clone();
+            let l = plan.lane_of[i] as usize;
+            let dead_old: Vec<(usize, Option<Ent>)> = plan.dying_at[i]
+                .iter()
+                .filter(|&&d| d != plan.lane_of[i])
+                .map(|&d| (d as usize, st.lane_tree[d as usize].clone().map(Ent::dir)))
+                .collect();
+            let adv_old = st.lane_tree[l].clone().map(Ent::dir);
+            let adv_new = Ent::dir(tree_oid.clone());
+            let mut trans: Vec<Trans> = Vec::with_capacity(dead_old.len() + 1);
+            for (d, oe) in &dead_old {
+                trans.push((*d, oe.as_ref(), None));
+            }
+            trans.push((l, adv_old.as_ref(), Some(&adv_new)));
 
-        let rev = enc.advance(&trans, objs, &prev_live, &new_live)?;
-        for &d in &plan.dying_at[i] {
-            st.lane_tree[d as usize] = None;
+            let prev_live = Arc::new(st.live.clone());
+            for &d in &plan.dying_at[i] {
+                clear_live_bit(&mut st.live, d as usize);
+            }
+            set_live_bit(&mut st.live, l);
+            let new_live = Arc::new(st.live.clone());
+
+            let routed = route_trans(&trans, objs, bits)?;
+            for (s, pt) in routed.into_iter().enumerate() {
+                let w = RevWork {
+                    pt,
+                    prev_live: prev_live.clone(),
+                    new_live: new_live.clone(),
+                    seed_f0: fresh && i == 0,
+                };
+                if txs[s].send(w).is_err() {
+                    send_broke = true;
+                    break 'revs;
+                }
+            }
+            for &d in &plan.dying_at[i] {
+                st.lane_tree[d as usize] = None;
+            }
+            st.lane_tree[l] = Some(tree_oid);
         }
-        st.lane_tree[l] = Some(tree_oid);
-
-        if fresh && i == 0 {
-            // Seed f0 with the positive full-state (the newest, i.e. only,
-            // revision so far); `rev` (a delta from nothing) is discarded.
-            // seal_record IS the §5 frame write: fold the stack, stream the
-            // record — no View, no node tree.
-            let f0raw = enc.seal_record(objs, &st.live)?;
-            let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
-            depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
+        drop(txs);
+        let mut out = Vec::with_capacity(n);
+        let mut reads = 0usize;
+        let mut first_err: Option<Error> = None;
+        for h in handles {
+            match h.join().map_err(|_| cf("shard worker panicked".into()))? {
+                Ok((enc, r)) => {
+                    out.push(enc);
+                    reads += r;
+                }
+                Err(e) => first_err = first_err.or(Some(e)),
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        if send_broke {
+            return Err(cf("shard worker exited early".into()));
+        }
+        if fresh {
+            depot.collect().map_err(|e| cf(e.to_string()))?;
         } else {
-            let rec = codec::encode(&rev);
-            st.batch_bytes += 8 + rec.len() as u64;
-            st.batch.push(rec);
-        }
-        if !st.batch.is_empty() && st.batch_bytes >= batch_bound {
-            let head = enc.seal_record(objs, &st.live)?;
-            let staged: Vec<Vec<u8>> = st.batch.drain(..).rev().collect();
-            seal_prepend(depot, &head, &staged, level)?;
-            st.batch_bytes = 0;
             depot.flush().map_err(|e| cf(e.to_string()))?;
         }
-    }
-    Ok(())
-}
-
-/// Seal any remaining batch and flush. `fresh` runs session-end compaction
-/// too: a fresh encode retires an f0/f1 per seal, and plain `flush` leaves
-/// them parked in the depot files as permanent on-disk waste (and as noise
-/// in any size measurement) — `collect` is O(store), a constant factor on a
-/// fresh encode. An incremental update stays amortized instead (`flush`'s
-/// ratio-threshold eviction), keeping its I/O O(new), not O(history).
-fn finish_range(
-    depot: &Depot,
-    enc: &mut Encoder,
-    objs: &mut Cat,
-    st: &mut RunState,
-    level: i32,
-    fresh: bool,
-) -> Result<()> {
-    if !st.batch.is_empty() {
-        let head = enc.seal_record(objs, &st.live)?;
-        let staged: Vec<Vec<u8>> = st.batch.drain(..).rev().collect();
-        seal_prepend(depot, &head, &staged, level)?;
-    }
-    if fresh {
-        depot.collect().map_err(|e| cf(e.to_string()))?;
-    } else {
-        depot.flush().map_err(|e| cf(e.to_string()))?;
-    }
-    Ok(())
+        Ok((out, reads))
+    })
 }
 
 /// Descend the boundary lane's tip tree by `path` (via the object source's
@@ -406,12 +478,13 @@ fn boundary_tip_revs(plan: &LanePlan, old_n: usize) -> Vec<usize> {
 
 fn reconstruct_boundary(
     depot: &Depot,
+    shard_bits: u32,
     plan: &LanePlan,
     tree_of: &HashMap<String, String>,
     sha_of: &[String],
     old_n: usize,
     objs: &mut Cat,
-) -> Result<(Encoder, Vec<Option<String>>, Vec<u8>)> {
+) -> Result<(Vec<Encoder>, Vec<Option<String>>, Vec<u8>)> {
     // The ACTUAL live lanes and their tip trees at the boundary — replay the
     // per-revision lane_tree updates the encode loop performs (a compact lane
     // dies when it appears in `dying_at`, is (re)born/advanced when it is the
@@ -441,39 +514,43 @@ fn reconstruct_boundary(
         }
     }
 
-    let f0 = match depot.read_f0(CHAIN) {
-        Ok(frame) => decompress_frame(&frame, None).map_err(cf)?,
-        Err(e) => return Err(cf(format!("no boundary f0: {e}"))),
-    };
-    // (path, slot, bitmap) per variant; an omitted `lanes` child ⇒ all live.
-    let mut raw: Vec<(Vec<u8>, u32, Vec<u8>)> = Vec::new();
-    crate::layer::visit_entries(&f0, |e| {
-        let bm = match e.bitmap {
-            Some(b) => b.to_vec(),
-            None => live.clone(),
+    let mut encs = Vec::with_capacity(1usize << shard_bits);
+    for shard in 0..(1u64 << shard_bits) {
+        let f0 = match depot.read_f0(shard) {
+            Ok(frame) => decompress_frame(&frame, None).map_err(cf)?,
+            Err(e) => return Err(cf(format!("no boundary f0 for shard {shard}: {e}"))),
         };
-        raw.push((e.path.to_vec(), e.slot, bm));
-    })
-    .map_err(|e| cf(format!("decode boundary f0: {e:?}")))?;
+        // (path, slot, bitmap) per variant; an omitted `lanes` child ⇒ all live.
+        let mut raw: Vec<(Vec<u8>, u32, Vec<u8>)> = Vec::new();
+        crate::layer::visit_entries(&f0, |e| {
+            let bm = match e.bitmap {
+                Some(b) => b.to_vec(),
+                None => live.clone(),
+            };
+            raw.push((e.path.to_vec(), e.slot, bm));
+        })
+        .map_err(|e| cf(format!("decode boundary f0 (shard {shard}): {e:?}")))?;
 
-    let mut variants = Vec::with_capacity(raw.len());
-    for (path, slot, bitmap) in raw {
-        let lane = first_live_bit(&bitmap).ok_or_else(|| {
-            cf(format!(
-                "boundary variant {} slot {slot} carries no live lane",
-                String::from_utf8_lossy(&path)
-            ))
-        })?;
-        let tip = lane_tree[lane]
-            .as_ref()
-            .ok_or_else(|| cf(format!("boundary variant in dead lane {lane}")))?
-            .clone();
-        let (mode, oid) = lookup_oid(objs, &tip, &path)?.ok_or_else(|| {
-            cf(format!("boundary variant {} absent from lane {lane} tree", String::from_utf8_lossy(&path)))
-        })?;
-        variants.push(crate::oidenc::SeedVariant { path, slot, mode, oid, bitmap });
+        let mut variants = Vec::with_capacity(raw.len());
+        for (path, slot, bitmap) in raw {
+            let lane = first_live_bit(&bitmap).ok_or_else(|| {
+                cf(format!(
+                    "boundary variant {} slot {slot} carries no live lane",
+                    String::from_utf8_lossy(&path)
+                ))
+            })?;
+            let tip = lane_tree[lane]
+                .as_ref()
+                .ok_or_else(|| cf(format!("boundary variant in dead lane {lane}")))?
+                .clone();
+            let (mode, oid) = lookup_oid(objs, &tip, &path)?.ok_or_else(|| {
+                cf(format!("boundary variant {} absent from lane {lane} tree", String::from_utf8_lossy(&path)))
+            })?;
+            variants.push(crate::oidenc::SeedVariant { path, slot, mode, oid, bitmap });
+        }
+        encs.push(Encoder::seed(variants));
     }
-    Ok((Encoder::seed(variants), lane_tree, live))
+    Ok((encs, lane_tree, live))
 }
 
 
@@ -482,6 +559,10 @@ fn reconstruct_boundary(
 /// a commit to its revision index and lane.
 pub struct LaneStore {
     depot: Depot,
+    /// §9 `shard-bits`: the union is split across `2^shard_bits` chains
+    /// (chain id = shard) by a stable hash of each full path. Fixed at
+    /// store creation; persisted in meta.
+    shard_bits: u32,
     /// Number of revisions — a revision is a ref-tree EVENT: almost always
     /// a commit, occasionally a tag-at-tree's tagged tree (a lane that is
     /// born once and never advances — the union just holds one more tree).
@@ -541,27 +622,27 @@ impl LaneStore {
             tree_of.insert(t.clone(), t.clone()); // a tag-tree rev IS its tree
         }
 
-        let depot = open_depot(dir)?;
+        let shard_bits = shard_bits_param();
+        let n_shards = 1u64 << shard_bits;
+        let depot = open_depot(dir, n_shards)?;
         let mut cat = crate::CatFile::new(repo)?;
         let mut objs = Cat::new(&mut cat); // one persistent tree cache
-        let mut enc = Encoder::new();
-        let mut st = RunState {
-            lane_tree: vec![None; plan.width],
-            live: Vec::new(),
-            batch: Vec::new(),
-            batch_bytes: 0,
-        };
-        run_range(&depot, &mut enc, &mut objs, &plan, &tree_of, &sha_of, 0..plan.n_rev, &mut st, batch_ram_bound(), level, true)?;
+        let encs: Vec<Encoder> = (0..n_shards).map(|_| Encoder::new()).collect();
+        let mut st = RunState { lane_tree: vec![None; plan.width], live: Vec::new() };
+        let mut reads = 0usize;
         if plan.n_rev > 0 {
-            finish_range(&depot, &mut enc, &mut objs, &mut st, level, true)?;
+            let (_encs, worker_reads) = run_shards(
+                &depot, encs, shard_bits, repo, &mut objs, &plan, &tree_of, &sha_of,
+                0..plan.n_rev, &mut st, batch_ram_bound(), level, true,
+            )?;
+            reads = objs.reads + worker_reads;
         }
-        let reads = objs.reads;
 
         let sha_to_rev: HashMap<String, usize> =
             sha_of.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
         let refs = live_refs(repo, &sha_to_rev)?;
-        persist_meta(dir, plan.n_rev, &plan.lane_of, &sha_of, &tag_rev, &parents, &refs)?;
-        Ok((LaneStore { depot, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of, tag_rev, sha_to_rev, refs }, reads))
+        persist_meta(dir, plan.n_rev, &plan.lane_of, &sha_of, &tag_rev, &parents, &refs, shard_bits)?;
+        Ok((LaneStore { depot, shard_bits, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of, tag_rev, sha_to_rev, refs }, reads))
     }
 
     /// Incremental O(new) update (§11): fold only the NEW commits' union deltas
@@ -587,7 +668,7 @@ impl LaneStore {
         // Stored prefix parent edges — the repo may be SHALLOW (bootstrap
         // re-pin), so the old commits' topology must come from meta, not a
         // repo rev-list that would see them as parentless roots.
-        let (_, _, _, _, old_parents, _) = load_meta(dir)?;
+        let (_, _, _, _, old_parents, _, _) = load_meta(dir)?;
         if old_n == 0 {
             drop(existing);
             let (s, reads) = LaneStore::encode_repo_union_stats(repo, dir, level)?;
@@ -623,7 +704,7 @@ impl LaneStore {
             // Nothing new — just refresh refs and return.
             let sha_to_rev = existing.sha_to_rev.clone();
             let refs = live_refs(repo, &sha_to_rev)?;
-            persist_meta(dir, old_n, &old_lane, &old_sha, &old_tag, &old_parents, &refs)?;
+            persist_meta(dir, old_n, &old_lane, &old_sha, &old_tag, &old_parents, &refs, existing.shard_bits)?;
             return Ok((LaneStore { refs, ..existing }, 0, 0));
         }
 
@@ -658,22 +739,27 @@ impl LaneStore {
         }
 
         let depot = existing.depot;
+        let shard_bits = existing.shard_bits;
         let mut cat = crate::CatFile::new(repo)?;
         let mut objs = Cat::new(&mut cat);
-        // Reconstruct the encoder at the boundary from stored bytes + lane trees.
-        let (mut enc, lane_tree, live) = reconstruct_boundary(&depot, &plan, &tree_of, &old_sha, old_n, &mut objs)?;
-        let mut st = RunState { lane_tree, live, batch: Vec::new(), batch_bytes: 0 };
+        // Reconstruct each shard's encoder at the boundary from its stored
+        // f0 + the boundary lane trees.
+        let (encs, lane_tree, live) =
+            reconstruct_boundary(&depot, shard_bits, &plan, &tree_of, &old_sha, old_n, &mut objs)?;
+        let mut st = RunState { lane_tree, live };
         // Advance ONLY the new revisions (O(new)); prepend their reverse deltas.
-        run_range(&depot, &mut enc, &mut objs, &plan, &tree_of, &order, old_n..plan.n_rev, &mut st, batch_ram_bound(), level, false)?;
-        finish_range(&depot, &mut enc, &mut objs, &mut st, level, false)?;
-        let reads = objs.reads;
+        let (_encs, worker_reads) = run_shards(
+            &depot, encs, shard_bits, repo, &mut objs, &plan, &tree_of, &order,
+            old_n..plan.n_rev, &mut st, batch_ram_bound(), level, false,
+        )?;
+        let reads = objs.reads + worker_reads;
         let new_revs = plan.n_rev - old_n;
 
         let sha_to_rev: HashMap<String, usize> =
             order.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
         let refs = live_refs(repo, &sha_to_rev)?;
-        persist_meta(dir, plan.n_rev, &plan.lane_of, &order, &tag_rev, &parents, &refs)?;
-        Ok((LaneStore { depot, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of: order, tag_rev, sha_to_rev, refs }, new_revs, reads))
+        persist_meta(dir, plan.n_rev, &plan.lane_of, &order, &tag_rev, &parents, &refs, shard_bits)?;
+        Ok((LaneStore { depot, shard_bits, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of: order, tag_rev, sha_to_rev, refs }, new_revs, reads))
     }
 
 
@@ -688,9 +774,11 @@ impl LaneStore {
     /// deltas cross the seal threshold more than once.
     pub fn cold_frame_count(&self) -> Result<usize> {
         let mut n = 0;
-        for cold in self.depot.cold_iter(CHAIN).map_err(|e| cf(e.to_string()))? {
-            cold.map_err(|e| cf(e.to_string()))?;
-            n += 1;
+        for shard in 0..self.n_shards() as u64 {
+            for cold in self.depot.cold_iter(shard).map_err(|e| cf(e.to_string()))? {
+                cold.map_err(|e| cf(e.to_string()))?;
+                n += 1;
+            }
         }
         Ok(n)
     }
@@ -702,7 +790,7 @@ impl LaneStore {
     /// live at the boundary yet its tip commit be unreachable from the
     /// current refs (a deleted branch), so `git` alone can't supply it.
     pub fn boundary_tip_shas(dir: &Path) -> Result<Vec<String>> {
-        let (n_rev, _lane_of, sha_of, tag_rev, parents, _refs) = load_meta(dir)?;
+        let (n_rev, _lane_of, sha_of, tag_rev, parents, _refs, _bits) = load_meta(dir)?;
         if n_rev == 0 {
             return Ok(Vec::new());
         }
@@ -717,14 +805,19 @@ impl LaneStore {
     }
 
     pub fn open(dir: &Path) -> Result<LaneStore> {
-        let depot = open_depot(dir)?;
-        let (n_rev, lane_of, sha_of, tag_rev, _parents, refs) = load_meta(dir)?;
+        let (n_rev, lane_of, sha_of, tag_rev, _parents, refs, shard_bits) = load_meta(dir)?;
+        let depot = open_depot(dir, 1u64 << shard_bits)?;
         let sha_to_rev = sha_of
             .iter()
             .enumerate()
             .map(|(i, s)| (s.clone(), i))
             .collect();
-        Ok(LaneStore { depot, n_rev, lane_of, sha_of, tag_rev, sha_to_rev, refs })
+        Ok(LaneStore { depot, shard_bits, n_rev, lane_of, sha_of, tag_rev, sha_to_rev, refs })
+    }
+
+    /// Number of §9 shards (union chains) in this store.
+    pub fn n_shards(&self) -> usize {
+        1usize << self.shard_bits
     }
 
     /// ref name → resolved commit sha (persisted set).
@@ -762,26 +855,38 @@ impl LaneStore {
         self.tag_rev.get(rev).copied().unwrap_or(false)
     }
 
-    /// The canonical §2 union bytes at revision `rev` — the chain walked
-    /// newest-first down to it, folded at the byte level: records compose
-    /// delta ∘ delta on a geometric stack and ONE overlay lands them on the
-    /// f0 base ([`walk_records_state`]). No View is built; memory is the
-    /// base bytes plus the geometric stack.
-    pub fn union_bytes_at(&self, rev: usize) -> Result<Vec<u8>> {
+    /// One §9 shard's canonical §2 union bytes at revision `rev` — that
+    /// shard's chain walked newest-first down to it, folded at the byte
+    /// level: records compose delta ∘ delta on a geometric stack and ONE
+    /// overlay lands them on the f0 base ([`walk_records_state`]). No View
+    /// is built; memory is the base bytes plus the geometric stack.
+    fn shard_bytes_at(&self, shard: u64, rev: usize) -> Result<Vec<u8>> {
         if rev >= self.n_rev {
             return Err(Error::Chain(format!("no revision {rev}")));
         }
         let target_pos = self.n_rev - 1 - rev; // newest-first position
-        self.walk_records_state(&mut |pos, _| Ok(pos == target_pos))?
-            .ok_or_else(|| Error::Chain(format!("chain fell short of revision {rev}")))
+        self.walk_records_state(shard, &mut |pos, _| Ok(pos == target_pos))?
+            .ok_or_else(|| Error::Chain(format!("shard {shard} fell short of revision {rev}")))
+    }
+
+    /// Every shard's union bytes at revision `rev` (§9: the union IS the
+    /// gather across shards).
+    fn all_shard_bytes_at(&self, rev: usize) -> Result<Vec<Vec<u8>>> {
+        (0..self.n_shards() as u64).map(|s| self.shard_bytes_at(s, rev)).collect()
     }
 
     /// Lane `lane`'s flat `(path, mode, content)` entries at revision `rev`,
-    /// extracted from the reconstructed §2 union bytes via the authoritative
-    /// `layer` extractor.
+    /// gathered across every shard (§9 — the split is invisible in the
+    /// resulting tree oid) via the authoritative `layer` extractor.
     pub fn lane_entries_at(&self, rev: usize) -> Result<Vec<(Vec<u8>, crate::layer::Mode, Vec<u8>)>> {
-        let bytes = self.union_bytes_at(rev)?;
-        crate::layer::extract_lane_entries(&bytes, self.lane_of[rev] as u32).map_err(|e| cf(format!("{e:?}")))
+        let mut out = Vec::new();
+        for bytes in self.all_shard_bytes_at(rev)? {
+            out.extend(
+                crate::layer::extract_lane_entries(&bytes, self.lane_of[rev] as u32)
+                    .map_err(|e| cf(format!("{e:?}")))?,
+            );
+        }
+        Ok(out)
     }
 
     /// Stream ONE commit's tree (or the subtree under `subpath`) as flat
@@ -810,27 +915,54 @@ impl LaneStore {
         subpath: &[u8],
         visit: &mut dyn FnMut(&[u8], crate::layer::Mode, &[u8]) -> Result<()>,
     ) -> Result<()> {
-        let bytes = self.union_bytes_at(rev)?;
+        use crate::layer::{container_path_cmp, EntryCursor};
         let lane = self.lane_of[rev] as u32;
-        let mut err: Option<Error> = None;
-        crate::layer::visit_entries(&bytes, |e| {
-            if err.is_some() {
-                return;
+        let shard_bytes = self.all_shard_bytes_at(rev)?;
+        // K-way lockstep over the shards' canonical streams — the merged
+        // visit order is exactly the unsharded container order. Content
+        // stays borrowed from each shard's folded buffer.
+        let mut curs: Vec<EntryCursor<'_>> = shard_bytes
+            .iter()
+            .map(|b| EntryCursor::new(b))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| cf(format!("{e:?}")))?;
+        let mut heads = Vec::with_capacity(curs.len());
+        for c in &mut curs {
+            heads.push(c.next().map_err(|e| cf(format!("{e:?}")))?);
+        }
+        loop {
+            let mut min: Option<usize> = None;
+            for (k, h) in heads.iter().enumerate() {
+                let Some(h) = h else { continue };
+                min = match min {
+                    None => Some(k),
+                    Some(m) => {
+                        let mh = heads[m].as_ref().expect("min head present");
+                        if container_path_cmp(&h.path, h.slot, &mh.path, mh.slot).is_lt() {
+                            Some(k)
+                        } else {
+                            Some(m)
+                        }
+                    }
+                };
             }
+            let Some(k) = min else { break };
+            let e = heads[k].take().expect("min head present");
+            heads[k] = curs[k].next().map_err(|ie| cf(format!("{ie:?}")))?;
             let inl = match e.bitmap {
                 Some(b) => (b.get((lane / 8) as usize).copied().unwrap_or(0) & (1 << (lane % 8))) != 0,
                 None => true,
             };
             if !inl {
-                return;
+                continue;
             }
             let rel: &[u8] = if subpath.is_empty() {
-                e.path
+                &e.path
             } else if e.path == subpath {
                 // The subpath names a file: serve it under its own name.
                 match e.path.rsplit(|&b| b == b'/').next() {
                     Some(base) => base,
-                    None => e.path,
+                    None => &e.path,
                 }
             } else if e.path.len() > subpath.len()
                 && e.path.starts_with(subpath)
@@ -838,17 +970,11 @@ impl LaneStore {
             {
                 &e.path[subpath.len() + 1..]
             } else {
-                return; // outside the requested subtree
+                continue; // outside the requested subtree
             };
-            if let Err(x) = visit(rel, e.mode, e.content) {
-                err = Some(x);
-            }
-        })
-        .map_err(|e| cf(format!("{e:?}")))?;
-        match err {
-            Some(x) => Err(x),
-            None => Ok(()),
+            visit(rel, e.mode, e.content)?;
         }
+        Ok(())
     }
 
     /// The git tree oid of the commit at revision `rev` (reconstructed) — the
@@ -911,10 +1037,12 @@ impl LaneStore {
     /// not N full trees.
     pub fn uncompressed_record_bytes(&self) -> Result<u64> {
         let mut total = 0u64;
-        self.walk_records(&mut |_pos, rec| {
-            total += rec.len() as u64;
-            Ok(false)
-        })?;
+        for shard in 0..self.n_shards() as u64 {
+            self.walk_records(shard, &mut |_pos, rec| {
+                total += rec.len() as u64;
+                Ok(false)
+            })?;
+        }
         Ok(total)
     }
 
@@ -930,9 +1058,10 @@ impl LaneStore {
     /// records in stored order.
     fn walk_records(
         &self,
+        shard: u64,
         visit: &mut dyn FnMut(usize, &[u8]) -> Result<bool>,
     ) -> Result<()> {
-        self.walk_records_state(visit).map(|_| ())
+        self.walk_records_state(shard, visit).map(|_| ())
     }
 
     /// [`walk_records`], maintaining the working full-state at the BYTE
@@ -949,9 +1078,10 @@ impl LaneStore {
     /// non-canonical byte in it fails the decompression loudly.
     fn walk_records_state(
         &self,
+        shard: u64,
         visit: &mut dyn FnMut(usize, &[u8]) -> Result<bool>,
     ) -> Result<Option<Vec<u8>>> {
-        let head = match self.depot.read_f0(CHAIN) {
+        let head = match self.depot.read_f0(shard) {
             Ok(frame) => decompress_frame(&frame, None).map_err(cf)?,
             Err(wikimak_depot::Error::NoFrame) => return Ok(None),
             Err(e) => return Err(cf(e.to_string())),
@@ -962,7 +1092,7 @@ impl LaneStore {
         if visit(pos, &head)? {
             return Ok(Some(base));
         }
-        if let Some(f1) = self.depot.read_f1(CHAIN).map_err(|e| cf(e.to_string()))? {
+        if let Some(f1) = self.depot.read_f1(shard).map_err(|e| cf(e.to_string()))? {
             let mut stopped = false;
             stream_f1_records(&f1, &head, &mut |rec| {
                 pos += 1;
@@ -974,7 +1104,7 @@ impl LaneStore {
                 return Ok(Some(fold_state(&base, std::mem::take(&mut stack))));
             }
         }
-        for cold in self.depot.cold_iter(CHAIN).map_err(|e| cf(e.to_string()))? {
+        for cold in self.depot.cold_iter(shard).map_err(|e| cf(e.to_string()))? {
             let frame = cold.map_err(|e| cf(e.to_string()))?;
             // The boundary anchor is the full state here; folding it also
             // reseeds the base (a §5 seal on the read side).
@@ -1143,7 +1273,7 @@ CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS revs(rev INTEGER PRIMARY KEY, sha TEXT NOT NULL, lane INTEGER NOT NULL, parents TEXT NOT NULL DEFAULT '', kind INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS refs(name TEXT PRIMARY KEY, sha TEXT NOT NULL, rev INTEGER NOT NULL, lane INTEGER NOT NULL);
 ";
-const META_SCHEMA_VERSION: &str = "3";
+const META_SCHEMA_VERSION: &str = "4";
 
 fn meta_path(dir: &Path) -> std::path::PathBuf {
     dir.join("meta.sqlite")
@@ -1163,6 +1293,7 @@ fn persist_meta(
     tag_rev: &[bool],
     parents: &[Vec<usize>],
     refs: &HashMap<String, String>,
+    shard_bits: u32,
 ) -> Result<()> {
     let mut conn = rusqlite::Connection::open(meta_path(dir)).map_err(map_sql)?;
     conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(map_sql)?;
@@ -1171,8 +1302,8 @@ fn persist_meta(
     tx.execute("DELETE FROM revs", []).map_err(map_sql)?;
     tx.execute("DELETE FROM refs", []).map_err(map_sql)?;
     tx.execute(
-        "INSERT OR REPLACE INTO kv(key,value) VALUES('schema',?1),('n_rev',?2)",
-        rusqlite::params![META_SCHEMA_VERSION, n_rev.to_string()],
+        "INSERT OR REPLACE INTO kv(key,value) VALUES('schema',?1),('n_rev',?2),('shard_bits',?3)",
+        rusqlite::params![META_SCHEMA_VERSION, n_rev.to_string(), shard_bits.to_string()],
     )
     .map_err(map_sql)?;
     {
@@ -1207,7 +1338,8 @@ fn persist_meta(
 #[allow(clippy::type_complexity)]
 fn load_meta(
     dir: &Path,
-) -> Result<(usize, Vec<LaneId>, Vec<String>, Vec<bool>, Vec<Vec<usize>>, HashMap<String, String>)> {
+) -> Result<(usize, Vec<LaneId>, Vec<String>, Vec<bool>, Vec<Vec<usize>>, HashMap<String, String>, u32)>
+{
     let p = meta_path(dir);
     if !p.exists() {
         return Err(Error::Chain(format!("no lane store at {}", dir.display())));
@@ -1276,7 +1408,13 @@ fn load_meta(
             refs.insert(name, sha);
         }
     }
-    Ok((n_rev, lane_of, sha_of, tag_rev, parents, refs))
+    let shard_bits: u32 = conn
+        .query_row("SELECT value FROM kv WHERE key='shard_bits'", [], |r| {
+            let v: String = r.get(0)?;
+            Ok(v.parse().unwrap_or(0))
+        })
+        .unwrap_or(0);
+    Ok((n_rev, lane_of, sha_of, tag_rev, parents, refs, shard_bits))
 }
 
 /// Stream the u64-length-prefixed records of an f1 frame in stored
@@ -1330,8 +1468,8 @@ fn stream_f1_records(
 /// to cold; and if the batch alone exceeds the threshold the just-written
 /// f1 is sealed immediately, so no later prepend ever recompresses a huge
 /// frame. The chain MUST already be seeded (f0 present).
-fn seal_prepend(depot: &Depot, head_record: &[u8], staged: &[Vec<u8>], level: i32) -> Result<()> {
-    let old_f1 = depot.read_f1(CHAIN).map_err(|e| cf(e.to_string()))?;
+fn seal_prepend(depot: &Depot, chain: u64, head_record: &[u8], staged: &[Vec<u8>], level: i32) -> Result<()> {
+    let old_f1 = depot.read_f1(chain).map_err(|e| cf(e.to_string()))?;
     let old_raw_len = match &old_f1 {
         Some(z) => zstd::zstd_safe::get_frame_content_size(z)
             .map_err(|_| cf("zstd frame content size".into()))?
@@ -1350,7 +1488,7 @@ fn seal_prepend(depot: &Depot, head_record: &[u8], staged: &[Vec<u8>], level: i3
         if let Some(z) = &old_f1 {
             use std::io::Read as _;
             // The old f1 was compressed against the CURRENT f0 record.
-            let old_head = decompress_frame(&depot.read_f0(CHAIN).map_err(|e| cf(e.to_string()))?, None)
+            let old_head = decompress_frame(&depot.read_f0(chain).map_err(|e| cf(e.to_string()))?, None)
                 .map_err(cf)?;
             let mut dec = FrameDecoder::new(z, Some(&old_head)).map_err(cf)?;
             let mut buf = vec![0u8; 128 << 10];
@@ -1366,22 +1504,36 @@ fn seal_prepend(depot: &Depot, head_record: &[u8], staged: &[Vec<u8>], level: i3
     let new_f1 = enc.finish().map_err(cf)?;
     let new_f0 = compress_frame(head_record, None, level).map_err(cf)?;
     depot
-        .prepend(CHAIN, &new_f0, Some(&new_f1), seal_old)
+        .prepend(chain, &new_f0, Some(&new_f1), seal_old)
         .map_err(|e| cf(e.to_string()))?;
     if total_raw > seal_threshold() {
-        depot.seal_f1(CHAIN).map_err(|e| cf(e.to_string()))?;
+        depot.seal_f1(chain).map_err(|e| cf(e.to_string()))?;
     }
     Ok(())
 }
 
-fn open_depot(dir: &Path) -> Result<Depot> {
+/// Open the combined-state depot with one chain per §9 shard (chain id =
+/// shard index). The index is sized at open, so the store's shard count is
+/// fixed at creation (an offline re-shard rebuilds the store).
+fn open_depot(dir: &Path, n_shards: u64) -> Result<Depot> {
     std::fs::create_dir_all(dir.join("depot"))?;
     Depot::open(DepotConfig {
         root: dir.join("depot"),
-        max_chain_id: 1,
+        max_chain_id: n_shards.max(1),
         file_size_threshold: 4 << 20,
         eviction_dead_ratio: 0.5,
     })
     .map_err(|e| cf(e.to_string()))
+}
+
+/// The §9 `shard-bits` for a NEW store: the CLI/env parameter (clamped to 8
+/// — 256 shards is already far past any thread-count win here). Existing
+/// stores read their bits from meta, never from this.
+fn shard_bits_param() -> u32 {
+    std::env::var("GITDEPOT_SHARD_BITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+        .min(8)
 }
 
