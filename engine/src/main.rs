@@ -671,6 +671,21 @@ fn main() {
                     "--vars" => unsafe {
                         std::env::set_var("SARUN_TRACE_VARS", "1");
                     },
+                    // --fuse  the explicit spelling of the default backend
+                    //         (bwrap + FUSE overlay) — the counterpart of
+                    //         --sud. Accepted so scripts can pin the backend;
+                    //         selects nothing new.
+                    "--fuse" => sud = false,
+                    // A bare word is the box NAME. A dash-word is a TYPO or
+                    // an unknown flag — refuse it loudly: silently taking it
+                    // as the NAME named every `sarun run --fuse …` box
+                    // "--fuse", and the SECOND parallel run then collided
+                    // with the first ("slopbox is already running").
+                    a if a.starts_with('-') => {
+                        eprintln!("sarun: unknown flag '{a}' for run \
+                                   (a box NAME cannot start with '-')");
+                        std::process::exit(2);
+                    }
                     _ => if name.is_none() { name = Some(a.clone()); },
                 }
             }
