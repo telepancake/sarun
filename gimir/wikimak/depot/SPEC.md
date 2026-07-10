@@ -32,6 +32,7 @@ Under `<root>/`:
 ```
 format                   one-line on-disk format version (currently "2")
 index                    fixed-size mmap'd array; entry per chain_id
+counters                 ADVISORY dead-byte counter sidecar (see below)
 f0/file-NNNN             append-only data files; one is the current write target
 f1/file-NNNN             same
 cold/cold                ONE file per depot instance, append-only
@@ -90,11 +91,43 @@ globally-unique-within-tier id.
 
 Each f0/f1 file has an in-memory `bytes_deprecated` counter. Bumped
 whenever a frame in that file is orphaned by a prepend (see Operations
-below). The counter is not persisted; on `open` it is rebuilt by walking
-the file's frames and checking each one's chain_id against the index.
+below).
 
 When a file's deprecation ratio exceeds a threshold (default 0.5), it
 becomes a victim for eviction (see Eviction below).
+
+### Counters sidecar
+
+`<root>/counters` persists the `bytes_deprecated` counters so `open`
+never scans the store (the old rebuild walked every frame of every data
+file — O(total bytes on disk) of read I/O before the first query; at
+enwiki scale, minutes). Plain text, written tmp+rename at every
+`flush`/`collect` (i.e. exactly when the lengths it records are
+durable):
+
+```
+wikimak-depot-counters v1
+cold <cold_len>
+f0 <file_id> <len> <bytes_deprecated>     (one line per f0 file)
+f1 <file_id> <len> <bytes_deprecated>     (one line per f1 file)
+```
+
+The recorded file set + per-file lengths + cold length ARE the
+dirty-shutdown fence: every mutation the depot can make (prepend,
+seal, evict, delete_all) changes at least one of them, so on `open`
+their equality with disk proves the sidecar describes this exact
+on-disk state. A missing, unparseable, or fenced-off sidecar degrades
+to a ONE-TIME rebuild from frame HEADERS (`header → seek past
+zstd_len`; payloads are never read, so even the rebuild is O(frames)
+small preads, not O(bytes)), which is then persisted.
+
+The sidecar is ADVISORY, which is why this stays simple: eviction uses
+the counters only to pick victims, and re-checks every frame's
+liveness against the index while migrating — wrong counters can only
+mistime eviction, never corrupt data. Readers go through the same
+`open` (no separate read-only mode: the embedders construct one
+`DepotConfig`, and with the sidecar the open is O(files) metadata
+either way).
 
 ## Public API
 
@@ -150,7 +183,9 @@ impl Depot {
     /// included (rolled first). See "Eviction".
     pub fn collect(&self) -> Result<()>;
 
-    /// Unlink the depot's cold file, all f0/f1 files, and zero the index.
+    /// Unlink the depot's cold file and all f0/f1 files; recreate the
+    /// index empty and SPARSE (ftruncate — never store zeros through
+    /// the mmap: at 1e8 chains that would dirty 800MB of pages).
     /// Used when the caller wants to delete the wiki instance.
     pub fn delete_all(self) -> Result<()>;
 }
@@ -310,19 +345,18 @@ T == f1). No decompression. No re-encoding.
 
 1. `mkdir -p` the tier dirs.
 2. mmap the index file (creating zero-filled if absent at `max_chain_id *
-   8` bytes).
+   8` bytes — `ftruncate`, so it is born and stays sparse).
 3. List existing files in f0/, f1/, cold/. Allocate the next file id =
    `max + 1` per tier.
-4. Rebuild in-memory `bytes_deprecated` for each f0/f1 file: walk frames,
-   look up index, count dead.
-5. Open the cold file (creating empty if absent).
+4. Open the cold file (creating empty if absent).
+5. Load `bytes_deprecated` from the `counters` sidecar (see "Counters
+   sidecar") after checking its fence. If the sidecar is missing or
+   fenced off (dirty shutdown), rebuild ONCE from frame headers — never
+   payloads — and persist.
 6. Done.
 
-Open cost: O(total f0+f1 bytes on disk) for the deprecation rebuild. For
-a small instance this is microseconds; for enwiki (~90 GB f0 + similar
-f1) it's tens of seconds. Acceptable for a personal-machine tool. (A
-sidecar persisting the counter is permitted by the spec if the
-implementer wants faster open; not required.)
+Open cost: O(data files) metadata on the sidecar path; O(total FRAMES)
+24-byte preads on the rebuild path. Open never reads frame payloads.
 
 ### Read paths
 
@@ -377,7 +411,10 @@ implementer wants faster open; not required.)
 
 ## Out of scope — do NOT add
 
-- Tombstone bitmaps, sidecars, journals, write-ahead logs.
+- Tombstone bitmaps, journals, write-ahead logs, or any sidecar that
+  data correctness depends on. (The one existing sidecar — `counters` —
+  is advisory eviction bookkeeping with a self-checking fence; losing
+  it costs a header walk, never data. Don't add another.)
 - Magic numbers, CRCs, checksums anywhere on disk.
 - Recovery commands, repair utilities, "fsck depot".
 - Multi-frame-per-chain in f0 or f1. Each chain has exactly one f0 and

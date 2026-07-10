@@ -64,3 +64,38 @@ fn hundred_million_chain_index_is_sparse() {
     let alloc = allocated(&index);
     assert!(alloc < 16 << 20, "reopen materialized the index: {alloc} bytes");
 }
+
+/// `delete_all` must not dirty the index either: zeroing 1e8 chains
+/// byte-by-byte through the mmap would fault in and write 800MB of
+/// pages. It recreates the file sparse (ftruncate) instead.
+#[test]
+fn delete_all_recreates_a_sparse_index() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("depot");
+    let depot = Depot::open(cfg(root.clone())).unwrap();
+    for cid in [0u64, 1_000_000, ENWIKI_SCALE - 1] {
+        depot.prepend(cid, b"doomed", None, false).unwrap();
+    }
+    depot.flush().unwrap();
+
+    depot.delete_all().unwrap();
+
+    let index = root.join("index");
+    let md = std::fs::metadata(&index).unwrap();
+    assert_eq!(md.len(), ENWIKI_SCALE * 8, "index keeps its logical size");
+    let alloc = allocated(&index);
+    assert!(
+        alloc < 16 << 20,
+        "delete_all materialized the index: {alloc} bytes allocated"
+    );
+
+    // The store reopens empty and stays sparse.
+    let depot = Depot::open(cfg(root)).unwrap();
+    for cid in [0u64, 1_000_000, ENWIKI_SCALE - 1] {
+        assert!(
+            matches!(depot.read_f0(cid), Err(wikimak_depot::Error::NoFrame)),
+            "chain {cid} must be gone"
+        );
+    }
+    assert!(alloc < 16 << 20);
+}

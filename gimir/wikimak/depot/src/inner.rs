@@ -28,6 +28,13 @@ const MAX_FILE_ID: u32 = u16::MAX as u32;
 /// real first-prepend index entry of `(file_id=1, offset=0)` is nonzero
 /// and distinguishable from the `(0,0)` "empty chain" sentinel.
 const COLD_FILE_ID: u32 = 0;
+/// First line of the `<root>/counters` sidecar (see `persist_counters`).
+/// Versioned independently of the frame FORMAT_VERSION: the sidecar is
+/// advisory (eviction picks victims by it; per-frame liveness is always
+/// re-checked against the index during eviction itself), so an
+/// unreadable or stale-fenced sidecar degrades to a rebuild, never to
+/// misread data.
+const COUNTERS_MAGIC: &str = "wikimak-depot-counters v1";
 
 /// One open f0 or f1 data file, with append-cursor and dead-byte count.
 struct DataFile {
@@ -146,6 +153,9 @@ pub struct DepotInner {
     f1: Tier,
     cold_file: File,
     cold_len: u64,
+    /// Open couldn't use the persisted counters sidecar and rebuilt the
+    /// dead-byte counters from frame headers. Instrumentation.
+    rebuilt_on_open: bool,
 }
 
 impl DepotInner {
@@ -206,19 +216,75 @@ impl DepotInner {
             .open(&cold_path)?;
         let cold_len = cold_file.metadata()?.len();
 
-        // Rebuild dead-byte counters for each f0/f1 file by walking each
-        // file's frames and checking liveness against the index.
-        rebuild_dead_f0(&mut f0, &index)?;
-        rebuild_dead_f1(&mut f1, &index, &f0)?;
+        // Dead-byte counters: load the sidecar persisted at the last
+        // flush/collect; when it is missing or its length fence trips
+        // (any file's recorded length — or the file set, or the cold
+        // length — disagrees with disk, i.e. a dirty shutdown mutated
+        // the store after the last persist), rebuild ONCE from frame
+        // HEADERS (never payloads) and persist. See SPEC §"Open".
+        let loaded = load_counters(&cfg.root, &mut f0, &mut f1, cold_len);
+        let rebuilt_on_open = !loaded;
+        if !loaded {
+            rebuild_dead_f0(&mut f0, &index)?;
+            rebuild_dead_f1(&mut f1, &index, &f0)?;
+        }
 
-        Ok(Self {
+        let inner = Self {
             cfg,
             index,
             f0,
             f1,
             cold_file,
             cold_len,
-        })
+            rebuilt_on_open,
+        };
+        if rebuilt_on_open {
+            inner.persist_counters()?;
+        }
+        Ok(inner)
+    }
+
+    /// Did this open rebuild the dead-byte counters (sidecar missing or
+    /// fenced off by a dirty shutdown)? Instrumentation for the
+    /// persisted-counters tests.
+    pub fn counters_rebuilt_on_open(&self) -> bool {
+        self.rebuilt_on_open
+    }
+
+    /// `(tier, file_id, len, dead)` per data file — instrumentation for
+    /// the persisted-counters tests (loaded counters must equal rebuilt
+    /// ones).
+    pub fn tier_stats(&self) -> Vec<(&'static str, u32, u64, u64)> {
+        let mut out = Vec::new();
+        for df in self.f0.files.values() {
+            out.push(("f0", df.id, df.len, df.dead));
+        }
+        for df in self.f1.files.values() {
+            out.push(("f1", df.id, df.len, df.dead));
+        }
+        out
+    }
+
+    /// Write the dead-byte counters sidecar (`<root>/counters`),
+    /// tmp+rename so a torn write parses as garbage (→ rebuild) rather
+    /// than as stale numbers. Called after flush/collect, when the
+    /// on-disk lengths it records are durable — those lengths ARE the
+    /// dirty-shutdown fence `load_counters` checks.
+    pub fn persist_counters(&self) -> Result<()> {
+        let mut s = String::with_capacity(64 + 32 * (self.f0.files.len() + self.f1.files.len()));
+        s.push_str(COUNTERS_MAGIC);
+        s.push('\n');
+        s.push_str(&format!("cold {}\n", self.cold_len));
+        for df in self.f0.files.values() {
+            s.push_str(&format!("f0 {} {} {}\n", df.id, df.len, df.dead));
+        }
+        for df in self.f1.files.values() {
+            s.push_str(&format!("f1 {} {} {}\n", df.id, df.len, df.dead));
+        }
+        let tmp = self.cfg.root.join("counters.tmp");
+        std::fs::write(&tmp, s.as_bytes())?;
+        std::fs::rename(&tmp, self.cfg.root.join("counters"))?;
+        Ok(())
     }
 
     pub fn prepend(
@@ -572,11 +638,27 @@ impl DepotInner {
     }
 
     pub fn delete_all(&mut self) -> Result<()> {
-        // Zero the index.
-        for b in self.index.iter_mut() {
-            *b = 0;
-        }
-        self.index.flush()?;
+        // Zero the index by RECREATING it sparse (ftruncate), never by
+        // storing zeros through the mmap — at 1e8 chains that would
+        // fault in and dirty 800MB of pages just to say "empty". The
+        // live mapping is replaced by a placeholder first so no map of
+        // the unlinked file outlives it.
+        let index_path = self.cfg.root.join("index");
+        self.index = MmapMut::map_anon(INDEX_ENTRY_LEN)?;
+        std::fs::remove_file(&index_path)?;
+        let index_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&index_path)?;
+        index_file.set_len(self.cfg.max_chain_id * INDEX_ENTRY_LEN as u64)?;
+        index_file.sync_data()?;
+        // SAFETY: same contract as open() — we own the file and all
+        // access is serialized by the outer Mutex.
+        self.index = unsafe { MmapMut::map_mut(&index_file)? };
+        // The persisted counters describe files about to vanish.
+        let _ = std::fs::remove_file(self.cfg.root.join("counters"));
         // Unlink every f0/f1 file.
         for (_, df) in std::mem::take(&mut self.f0.files) {
             let _ = std::fs::remove_file(&df.path);
@@ -717,21 +799,90 @@ fn index_lookup(index: &MmapMut, chain_id: u64) -> u64 {
     u64::from_le_bytes(index[s..s + 8].try_into().unwrap())
 }
 
+/// Load the persisted dead-byte counters into the tiers. Returns false
+/// (and leaves the tiers untouched) when the sidecar is missing,
+/// unparseable, or FENCED OFF: every mutation the depot can make
+/// (prepend, seal, evict, delete_all) changes some data-file length,
+/// the file set, or the cold length, so recorded-vs-actual equality of
+/// all three proves the store hasn't been touched since the counters
+/// were persisted — a dirty shutdown (durable writes, no flush) trips
+/// the fence and forces the one-time rebuild.
+fn load_counters(root: &std::path::Path, f0: &mut Tier, f1: &mut Tier, cold_len: u64) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join("counters")) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(COUNTERS_MAGIC) {
+        return false;
+    }
+    let mut cold_rec: Option<u64> = None;
+    let mut rec_f0: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    let mut rec_f1: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    for line in lines {
+        let mut it = line.split_ascii_whitespace();
+        match (it.next(), it.next(), it.next(), it.next(), it.next()) {
+            (Some("cold"), Some(len), None, ..) => match len.parse() {
+                Ok(v) => cold_rec = Some(v),
+                Err(_) => return false,
+            },
+            (Some(tier @ ("f0" | "f1")), Some(id), Some(len), Some(dead), None) => {
+                let (Ok(id), Ok(len), Ok(dead)) = (id.parse(), len.parse(), dead.parse()) else {
+                    return false;
+                };
+                let map = if tier == "f0" { &mut rec_f0 } else { &mut rec_f1 };
+                map.insert(id, (len, dead));
+            }
+            _ => return false,
+        }
+    }
+    if cold_rec != Some(cold_len) {
+        return false;
+    }
+    let fence = |tier: &Tier, rec: &BTreeMap<u32, (u64, u64)>| {
+        tier.files.len() == rec.len()
+            && tier
+                .files
+                .values()
+                .all(|df| rec.get(&df.id).is_some_and(|&(len, _)| len == df.len))
+    };
+    if !fence(f0, &rec_f0) || !fence(f1, &rec_f1) {
+        return false;
+    }
+    // All fences hold: adopt the counters.
+    for df in f0.files.values_mut() {
+        df.dead = rec_f0[&df.id].1;
+    }
+    for df in f1.files.values_mut() {
+        df.dead = rec_f1[&df.id].1;
+    }
+    true
+}
+
+/// Rebuild one tier's dead counters from frame HEADERS only: walk each
+/// file as `header → seek past zstd_len`, checking liveness against the
+/// index (and, for f1, against the owning f0 frame's next pointer read
+/// as 8 bytes). Payloads are never read — the rebuild is O(frames)
+/// small preads, not O(bytes on disk).
 fn rebuild_dead_f0(tier: &mut Tier, index: &MmapMut) -> Result<()> {
     let ids: Vec<u32> = tier.files.keys().copied().collect();
     for fid in ids {
-        let frames = walk_frames(tier.files.get(&fid).expect("present"))?;
+        let df = tier.files.get(&fid).expect("present");
         let mut dead: u64 = 0;
-        for wf in &frames {
-            let chain_id = u64::from_le_bytes(wf.header[0..8].try_into().unwrap());
+        let mut off: u64 = 0;
+        while off < df.len {
+            let mut header = [0u8; HEADER_LEN];
+            df.file.read_exact_at(&mut header, off)?;
+            let chain_id = u64::from_le_bytes(header[0..8].try_into().unwrap());
+            let zstd_len = u64::from_le_bytes(header[16..24].try_into().unwrap());
             let ptr = index_lookup(index, chain_id);
             let alive = ptr != 0 && {
                 let (lfid, loff) = unpack(ptr);
-                lfid == fid && loff == wf.offset
+                lfid == fid && loff == off
             };
             if !alive {
-                dead += HEADER_LEN as u64 + wf.zstd.len() as u64;
+                dead += HEADER_LEN as u64 + zstd_len;
             }
+            off += HEADER_LEN as u64 + zstd_len;
         }
         tier.files.get_mut(&fid).expect("present").dead = dead;
     }
@@ -741,10 +892,14 @@ fn rebuild_dead_f0(tier: &mut Tier, index: &MmapMut) -> Result<()> {
 fn rebuild_dead_f1(tier: &mut Tier, index: &MmapMut, f0_tier: &Tier) -> Result<()> {
     let ids: Vec<u32> = tier.files.keys().copied().collect();
     for fid in ids {
-        let frames = walk_frames(tier.files.get(&fid).expect("present"))?;
+        let df = tier.files.get(&fid).expect("present");
         let mut dead: u64 = 0;
-        for wf in &frames {
-            let chain_id = u64::from_le_bytes(wf.header[0..8].try_into().unwrap());
+        let mut off: u64 = 0;
+        while off < df.len {
+            let mut header = [0u8; HEADER_LEN];
+            df.file.read_exact_at(&mut header, off)?;
+            let chain_id = u64::from_le_bytes(header[0..8].try_into().unwrap());
+            let zstd_len = u64::from_le_bytes(header[16..24].try_into().unwrap());
             let ptr = index_lookup(index, chain_id);
             let alive = if ptr == 0 {
                 false
@@ -755,14 +910,15 @@ fn rebuild_dead_f1(tier: &mut Tier, index: &MmapMut, f0_tier: &Tier) -> Result<(
                         let mut np = [0u8; 8];
                         f0_df.file.read_exact_at(&mut np, loff + 8)?;
                         let (f1_fid, f1_off) = unpack(u64::from_le_bytes(np));
-                        f1_fid == fid && f1_off == wf.offset
+                        f1_fid == fid && f1_off == off
                     }
                     None => false,
                 }
             };
             if !alive {
-                dead += HEADER_LEN as u64 + wf.zstd.len() as u64;
+                dead += HEADER_LEN as u64 + zstd_len;
             }
+            off += HEADER_LEN as u64 + zstd_len;
         }
         tier.files.get_mut(&fid).expect("present").dead = dead;
     }

@@ -326,12 +326,15 @@ impl Depot {
     /// Flush all pending writes to durable storage. Also opportunistically
     /// runs eviction on any ROLLED f0/f1 file whose dead ratio exceeds the
     /// threshold; the current write target keeps its slack (that slack is
-    /// what bounds per-prepend I/O mid-session — see `collect`).
+    /// what bounds per-prepend I/O mid-session — see `collect`). The
+    /// now-durable dead-byte counters are persisted last, so the next
+    /// `open` loads them instead of walking the store.
     pub fn flush(&self) -> Result<()> {
         let mut g = self.inner.lock().expect("depot mutex poisoned");
         g.flush()?;
         g.maybe_evict()?;
-        g.flush()
+        g.flush()?;
+        g.persist_counters()
     }
 
     /// Session-end compaction: eviction with the current write file
@@ -341,10 +344,25 @@ impl Depot {
     pub fn collect(&self) -> Result<()> {
         let mut g = self.inner.lock().expect("depot mutex poisoned");
         g.collect()?;
-        g.flush()
+        g.flush()?;
+        g.persist_counters()
     }
 
-    /// Unlink the depot's data files and zero the index.
+    /// Did `open` have to rebuild the dead-byte counters (persisted
+    /// sidecar missing, or fenced off by a dirty shutdown)? False on
+    /// the fast path. Instrumentation for the persisted-counters tests.
+    pub fn counters_rebuilt_on_open(&self) -> bool {
+        self.inner.lock().expect("depot mutex poisoned").counters_rebuilt_on_open()
+    }
+
+    /// `(tier, file_id, len, dead_bytes)` per data file —
+    /// instrumentation for the persisted-counters tests.
+    pub fn tier_stats(&self) -> Vec<(&'static str, u32, u64, u64)> {
+        self.inner.lock().expect("depot mutex poisoned").tier_stats()
+    }
+
+    /// Unlink the depot's data files and recreate the index empty and
+    /// sparse (never zeroed through the mmap — see SPEC §delete_all).
     pub fn delete_all(self) -> Result<()> {
         let mut g = self.inner.into_inner().expect("depot mutex poisoned");
         g.delete_all()
