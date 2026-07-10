@@ -2872,6 +2872,21 @@ macro_rules! ui_verbs {
                 _ => json!({"ok": false, "error": "bad args"}),
             }
         }
+        "review.write_file", "SID REL B64", "overwrite one box path's bytes (editor save) — captured like the box's own write, host untouched" => {
+            let ov = lock(state).overlay.clone();
+            match (ov, arg_sid(args), args.get(1).and_then(Value::as_str),
+                   args.get(2).and_then(Value::as_str)) {
+                (Some(ov), Some(id), Some(rel), Some(b64)) => {
+                    match base64::engine::general_purpose::STANDARD.decode(b64) {
+                        Ok(bytes) => crate::review::write_file(id, rel, &bytes, &ov),
+                        Err(e) => json!({"ok": false,
+                                         "error": format!("bad base64: {e}")}),
+                    }
+                }
+                (None, ..) => json!({"ok": false, "error": "overlay not available"}),
+                _ => json!({"ok": false, "error": "bad args"}),
+            }
+        }
         "review.apply", "SID [PATHS]", "apply a box's changes to the host" => { match arg_sid(args) {
             // Audit H3: refuse a still-running box — its captured blobs may be
             // mid-write, so applying could stamp a torn blob onto the host.

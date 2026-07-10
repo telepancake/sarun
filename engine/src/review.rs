@@ -171,6 +171,109 @@ pub fn file_bytes(id: i64, rel: &str) -> Value {
     }
 }
 
+/// The write counterpart of `file_bytes`: overwrite one box path's CURRENT
+/// bytes — the editor pane's save path ('E' on Changes → Ctrl-S). The write
+/// goes through `Overlay::box_write_file`, i.e. the SAME copy_up → pool
+/// blob → finalize_file path the box's own FUSE writes take, so the
+/// captured row is indistinguishable from a box write and the mount serves
+/// it back (a live box's RAM mirror is updated by those same primitives;
+/// an at-rest box is hydrated on demand). The host is never touched.
+/// Fails loudly ({ok:false, error}) for tombstones, symlinks, directories,
+/// binary content (either side), and paths that exist nowhere.
+pub fn write_file(id: i64, rel: &str, bytes: &[u8],
+                  ov: &crate::overlay::Overlay) -> Value {
+    let rel = rel.trim_start_matches('/');
+    if let Err(e) = write_file_guard(id, rel, bytes) {
+        return json!({"ok": false, "error": e});
+    }
+    // A discard-hunk-reverted row keeps its bytes INLINE (data column, no
+    // pool blob). The overlay write path sources copy_up from the blob, and
+    // review reads prefer inline data — so materialize the inline bytes to
+    // the pool and clear the column first, making the row a standard
+    // blob-backed capture row before the write.
+    if let Err(e) = outline_inline_row(id, rel, ov) {
+        return json!({"ok": false, "error": e});
+    }
+    match ov.box_write_file(id, rel, bytes) {
+        Ok(()) => json!({"ok": true, "len": bytes.len()}),
+        Err(e) => json!({"ok": false, "error": format!("write {rel}: {e}")}),
+    }
+}
+
+/// The refusal gate for `write_file`, separated so it is unit-testable
+/// against sqlar fixtures without an Overlay. Same taxonomy as
+/// `file_bytes`, plus the binary guard in both directions: the text-editor
+/// verb must neither write NULs nor silently replace captured binary.
+fn write_file_guard(id: i64, rel: &str, bytes: &[u8]) -> Result<(), String> {
+    if rel.is_empty() {
+        return Err("empty path".into());
+    }
+    if bytes.contains(&0) {
+        return Err("binary content (NUL) refused — this is a text edit verb".into());
+    }
+    match current_mode(id, rel) {
+        Some(m) if m & S_IFMT == S_IFCHR => Err("deleted in box".into()),
+        Some(m) if m & S_IFMT == S_IFLNK => Err("symlink, not editable".into()),
+        Some(m) if m & S_IFMT == 0o040000 => Err("directory, not editable".into()),
+        Some(m) if m & S_IFMT != 0o100000 => {
+            Err(format!("not a regular file (mode {:o})", m & S_IFMT))
+        }
+        Some(_) => match current_bytes(id, rel) {
+            Some(cur) if cur.contains(&0) => {
+                Err("captured content is binary; refusing a text overwrite".into())
+            }
+            Some(_) => Ok(()),
+            None => Err("captured content unavailable".into()),
+        },
+        None => {
+            // Not in the change set: the edit shadows a HOST file — which
+            // must exist (the editor opens existing files; a path that
+            // exists nowhere is a caller bug, refused loudly).
+            let host = Path::new("/").join(rel);
+            let md = std::fs::symlink_metadata(&host).map_err(
+                |_| "no such file (neither captured nor on the host)".to_string())?;
+            if md.file_type().is_symlink() {
+                return Err("host symlink, not editable".into());
+            }
+            if !md.is_file() {
+                return Err("host path is not a regular file".into());
+            }
+            if lower_bytes(rel).contains(&0) {
+                return Err("host content is binary; refusing a text overwrite".into());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Materialize an INLINE-data regular-file row (a discard_hunk revert) to
+/// its pool blob and clear the column, refreshing a live box's RAM mirror.
+/// No-op for blob-backed rows and paths outside the change set.
+fn outline_inline_row(id: i64, rel: &str,
+                      ov: &crate::overlay::Overlay) -> Result<(), String> {
+    let Some(conn) = open_rw(id) else {
+        return Err("archive unavailable".into());
+    };
+    let Some(n) = crate::depot::archive_node(&conn, rel) else {
+        return Ok(());
+    };
+    let Some(data) = n.data else { return Ok(()) };
+    if n.mode & S_IFMT != 0o100000 {
+        return Ok(()); // symlink target etc — inline is its natural form
+    }
+    let bp = blob_path(id, n.rowid);
+    if let Some(p) = bp.parent() {
+        std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&bp, &data).map_err(|e| format!("materialize inline row: {e}"))?;
+    crate::depot::archive_clear_inline(&conn, rel).map_err(|e| e.to_string())?;
+    drop(conn);
+    if let Some(b) = ov.live_box(id) {
+        b.reload_entry(rel);
+    }
+    Ok(())
+}
+
 /// st_mtime_ns stored for `rel` in the box's sqlar, or None.
 pub fn current_mtime(id: i64, rel: &str) -> Option<i64> {
     let conn = open_ro(id)?;
@@ -1930,6 +2033,58 @@ mod tests {
             Some(_) => panic!("live parent mirror has wrong entry kind after promote"),
             None => panic!("live parent mirror NOT refreshed by promote (still absent)"),
         }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The editor-save refusal gate (`review.write_file`): tombstones,
+    /// symlinks, binary content (either direction) and paths that exist
+    /// nowhere all refuse with a SPECIFIC error; a captured text row and a
+    /// host-file fallback pass.
+    #[test]
+    fn write_file_guard_refuses_tombstone_symlink_binary_missing() {
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir()
+            .join(format!("sarun-wguard-{}-{:?}", std::process::id(),
+                          std::time::SystemTime::now()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: serialized by TEST_STATE_HOME_LOCK (same convention as the
+        // promote test above).
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let id = 9101;
+        let b = BoxState::create(id).unwrap();
+        b.set_whiteout("gone.txt", 0);
+        b.set_symlink("ln.txt", Path::new("/etc/hosts"), 0);
+        let put = |rel: &str, bytes: &[u8]| {
+            let rid = b.ensure_file_row(rel, 0o100644, 0);
+            let bp = blob_path(id, rid);
+            std::fs::create_dir_all(bp.parent().unwrap()).unwrap();
+            std::fs::write(&bp, bytes).unwrap();
+            b.finalize_file(rel, bytes.len() as i64, 0, 0);
+        };
+        put("bin.dat", b"\x7fELF\0\0junk");
+        put("ok.txt", b"hello\n");
+
+        let err = |rel: &str, bytes: &[u8]| {
+            write_file_guard(id, rel, bytes).expect_err(rel).to_string()
+        };
+        assert!(err("gone.txt", b"x").contains("deleted"), "tombstone refused");
+        assert!(err("ln.txt", b"x").contains("symlink"), "symlink refused");
+        assert!(err("bin.dat", b"x").contains("binary"), "captured binary refused");
+        assert!(err("ok.txt", b"a\0b").contains("binary"), "NUL payload refused");
+        let missing = tmp.join("absent.txt");
+        let missing_rel = missing.to_str().unwrap().trim_start_matches('/');
+        assert!(err(missing_rel, b"x").contains("no such file"),
+                "nowhere-path refused");
+        assert!(write_file_guard(id, "ok.txt", b"new\n").is_ok(),
+                "captured text row passes");
+        // Host fallback: a real host file outside the change set passes.
+        let host = tmp.join("host.txt");
+        std::fs::write(&host, "host\n").unwrap();
+        let host_rel = host.to_str().unwrap().trim_start_matches('/');
+        assert!(write_file_guard(id, host_rel, b"edited\n").is_ok(),
+                "host-file fallback passes");
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

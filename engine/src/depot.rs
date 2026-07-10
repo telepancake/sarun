@@ -149,6 +149,15 @@ pub fn archive_write_inline(conn: &Connection, rel: &str, data: &[u8])
     Ok(archive_node(conn, rel).map(|n| n.rowid))
 }
 
+/// Clear a node row's INLINE data — the bytes now live at
+/// `blob_path(id, rowid)`. The editor save path (review::write_file) uses
+/// this to convert a discard-hunk-reverted (inline) row back into a
+/// standard blob-backed capture row before writing through the overlay.
+pub fn archive_clear_inline(conn: &Connection, rel: &str) -> rusqlite::Result<()> {
+    conn.execute("UPDATE sqlar SET data=NULL WHERE name=?1", [rel])?;
+    Ok(())
+}
+
 /// INSERT OR REPLACE a full node row (apply-promote / copy-down target),
 /// returning the new rowid.
 pub fn archive_upsert(conn: &Connection, rel: &str, mode: u32, mtime: i64,
