@@ -261,12 +261,21 @@ fn run_kati(
     // the MAIN goals only — GNU -n still remakes included makefiles for real.
     dry_run: bool,
     ignore_errors: bool,
+    // GNU --trace: per-target run/skip decisions, printed to stderr.
+    trace: bool,
     // Optional includes known unmakeable from a previous remake pass —
     // don't queue them again.
     noremake: &std::collections::HashSet<Vec<u8>>,
 ) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
     ev.ignore_errors = ignore_errors;
+    ev.goal_trace = trace;
+    if trace {
+        kati::exec::emit_recipe_err(&format!(
+            "--trace: make in {} (makefile {:?}), goals {:?}",
+            working_dir.display(), makefile,
+            targets.iter().map(|t| t.to_string()).collect::<Vec<_>>()));
+    }
     // sarun: the Evaluator seeds working_dir from the process cwd; override it
     // with the caller's logical working dir. For the shadow path this equals the
     // process cwd; for the in-process builtin it's the make's dir resolved from
@@ -1220,7 +1229,7 @@ pub fn make_main(argv: &[String]) -> i32 {
                 .map(|s| s.to_vec())
                 .collect())
             .unwrap_or_default();
-    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, &noremake) {
+    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, &noremake) {
         Ok(r) => r,
         Err(e) => {
             // Recipe failure already printed its `*** [target] Error N`; just
@@ -1445,7 +1454,7 @@ pub fn make_builtin(
     // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
     let cmdline_flags = extract_long_flags(argv);
     let mut noremake: std::collections::HashSet<Vec<u8>> = Default::default();
-    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, &noremake);
+    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, &noremake);
     let mut remake_depth = 0u32;
     while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
         remake_depth += 1;
@@ -1461,7 +1470,7 @@ pub fn make_builtin(
         // forever).
         kati::file_cache::clear();
         kati::fileutil::clear_glob_cache();
-        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, &noremake);
+        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, &noremake);
     }
 
     kati::exec::set_recipe_out(prev_out);

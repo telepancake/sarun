@@ -5,10 +5,10 @@ Subject: [PATCH] make-role argv: GNU -i/-n semantics (ignore-errors / dry-run)
 
 ---
 diff --git a/src-rs/eval.rs b/src-rs/eval.rs
-index 3dae458..f1e4563 100644
+index 3dae458..7a8f3c1 100644
 --- a/src-rs/eval.rs
 +++ b/src-rs/eval.rs
-@@ -267,6 +267,14 @@ pub struct Evaluator {
+@@ -267,6 +267,18 @@ pub struct Evaluator {
      /// sarun: `.NOTPARALLEL:` was seen — this make's recipes run serially
      /// even when -j / a jobserver is in effect.
      pub not_parallel: bool,
@@ -20,33 +20,48 @@ index 3dae458..f1e4563 100644
 +    /// rkati still drives everything through FLAGS).
 +    pub dry_run: bool,
 +    pub ignore_errors: bool,
++    /// sarun: per-make GNU --trace (goal/recipe decision tracing; see
++    /// flags.rs). Named goal_trace — `trace` below is the pre-existing
++    /// variable-assignment tracer.
++    pub goal_trace: bool,
      /// sarun: per-instance global variable bindings, indexed by Symbol id.
      /// Moved off the process-global symbol table (symtab `symbol_data`) so each
      /// Evaluator — i.e. each make invocation — owns its OWN global namespace.
-@@ -370,6 +378,8 @@ impl Evaluator {
+@@ -370,6 +382,9 @@ impl Evaluator {
              rule_vars: HashMap::new(),
              vpath_patterns: Vec::new(),
              not_parallel: false,
 +            dry_run: false,
 +            ignore_errors: false,
++            goal_trace: false,
              global_vars: Arc::new(Mutex::new(Vec::new())),
              working_dir: std::env::current_dir().unwrap_or_default(),
              include_dirs: Vec::new(),
 diff --git a/src-rs/exec.rs b/src-rs/exec.rs
-index bff8dde..e1385b0 100644
+index bff8dde..aa98dd4 100644
 --- a/src-rs/exec.rs
 +++ b/src-rs/exec.rs
-@@ -146,6 +146,9 @@ struct Executor<'a> {
+@@ -117,7 +117,7 @@ impl std::fmt::Display for BuildFailed {
+ 
+ impl std::error::Error for BuildFailed {}
+ 
+-#[derive(Clone, Copy, PartialEq, Eq)]
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+ pub enum ExecStatus {
+     Processing,
+     Timestamp(Option<SystemTime>),
+@@ -146,6 +146,10 @@ struct Executor<'a> {
      shell: Bytes,
      shellflag: &'static [u8],
      num_commands: u64,
-+    /// Per-make GNU -n / -i, seeded from the Evaluator (see eval.rs).
++    /// Per-make GNU -n / -i / --trace, seeded from the Evaluator (see eval.rs).
 +    dry_run: bool,
 +    ignore_errors: bool,
++    trace: bool,
      /// Suppress the "*** [target] Error N" banner (and no-rule notes) —
      /// used when remaking OPTIONAL includes, whose failures GNU swallows
      /// silently.
-@@ -226,6 +229,9 @@ struct RunReq {
+@@ -226,6 +230,9 @@ struct RunReq {
      box_prefix: Bytes,
      /// The pre-run output timestamp to record as this node's result on success.
      result_ts: ExecStatus,
@@ -56,7 +71,7 @@ index bff8dde..e1385b0 100644
  }
  
  /// Build the `export NAME='value'` prefix (newline-terminated) for a target's
-@@ -304,7 +310,8 @@ fn run_node_commands(
+@@ -304,7 +311,8 @@ fn run_node_commands(
      // up-to-date) nodes are correctly left un-started. `req.output` is the node's
      // primary output (== build_edges.outs[0], the engine's match key).
      let output = req.output;
@@ -66,7 +81,7 @@ index bff8dde..e1385b0 100644
      if report {
          crate::fileutil::report_edge(output.as_bytes().as_ref(),
                                       crate::fileutil::EdgePhase::Start, 0, b"");
-@@ -323,12 +330,14 @@ fn run_node_commands(
+@@ -323,12 +331,14 @@ fn run_node_commands(
      };
      let emit = &mut emit as &mut dyn FnMut(&[u8]);
      for command in req.commands {
@@ -83,7 +98,7 @@ index bff8dde..e1385b0 100644
              continue;
          }
          // In-process runner gets the exports prefix SEPARATELY (it applies it
-@@ -354,7 +363,8 @@ fn run_node_commands(
+@@ -354,7 +364,8 @@ fn run_node_commands(
                  }
              };
          if !ok {
@@ -93,12 +108,13 @@ index bff8dde..e1385b0 100644
                  ignored.push((command.output, code));
              } else {
                  failure = Some((command.output, code));
-@@ -375,11 +385,15 @@ impl<'a> Executor<'a> {
+@@ -375,11 +386,17 @@ impl<'a> Executor<'a> {
      fn new(ev: &'a mut Evaluator) -> Result<Self> {
          let shell = ev.get_shell()?;
          let shellflag = ev.get_shell_flag();
 +        let dry_run = ev.dry_run;
 +        let ignore_errors = ev.ignore_errors;
++        let trace = ev.goal_trace;
          Ok(Executor {
              ce: CommandEvaluator::new(ev)?,
              shell,
@@ -106,10 +122,43 @@ index bff8dde..e1385b0 100644
              num_commands: 0,
 +            dry_run,
 +            ignore_errors,
++            trace,
              quiet_failures: false,
          })
      }
-@@ -546,7 +560,8 @@ list of the rule for '{output}' at {loc}"));
+@@ -536,17 +553,40 @@ list of the rule for '{output}' at {loc}"));
+             }
+         }
+         if output_ts >= latest && !is_phony {
++            if self.trace || FLAGS.is_trace {
++                emit_recipe_err(&format!(
++                    "--trace: '{output}': skip — up to date \
++(target {output_ts:?} >= newest prerequisite {latest:?})"));
++            }
+             return Ok((output_ts, None));
+         }
+         let (commands, exports) = self.eval_node_commands(&n)?;
+         if commands.is_empty() {
++            if self.trace || FLAGS.is_trace {
++                emit_recipe_err(&format!(
++                    "--trace: '{output}': skip — rule has no commands \
++(phony={is_phony}, exists={})", !matches!(output_ts, ExecStatus::Timestamp(None))));
++            }
+             return Ok((output_ts, None));
+         }
++        if self.trace || FLAGS.is_trace {
++            let why = if matches!(output_ts, ExecStatus::Timestamp(None)) {
++                "target does not exist".to_string()
++            } else if is_phony {
++                "phony".to_string()
++            } else {
++                format!("out of date (target {output_ts:?} < newest prerequisite {latest:?})")
++            };
++            emit_recipe_err(&format!(
++                "--trace: '{output}': RUN ({} command line(s)) — {why}",
++                commands.len()));
++        }
+         let cwd = Bytes::from(self.ce.ev.working_dir.as_os_str().as_bytes().to_vec());
          let box_prefix = self.ce.ev.box_export_prefix.clone();
          Ok((
              output_ts,
@@ -120,10 +169,10 @@ index bff8dde..e1385b0 100644
      }
  
 diff --git a/src-rs/flags.rs b/src-rs/flags.rs
-index 1faf9b8..439d4b5 100644
+index 1faf9b8..32b0bbc 100644
 --- a/src-rs/flags.rs
 +++ b/src-rs/flags.rs
-@@ -69,6 +69,13 @@ pub struct Flags {
+@@ -69,6 +69,17 @@ pub struct Flags {
      pub generate_empty_ninja: bool,
      pub is_dry_run: bool,
      pub is_silent_mode: bool,
@@ -134,10 +183,14 @@ index 1faf9b8..439d4b5 100644
 +    /// invoking `$(MAKE) -i -C dir` expects ignore-errors, and the old
 +    /// mapping silently turned those sub-makes into dry-run NOPs.
 +    pub is_ignore_errors: bool,
++    /// --trace (GNU): print, for every considered target, whether its recipe
++    /// runs or is skipped and WHY (up to date / no commands / out of date).
++    /// sarun's rendering is a diagnosis aid, not byte-parity with GNU's.
++    pub is_trace: bool,
      /// -k / --keep-going: on a recipe failure, keep building targets that
      /// don't depend on the failed one; exit non-zero at the end.
      pub is_keep_going: bool,
-@@ -268,6 +275,11 @@ impl Flags {
+@@ -268,6 +279,13 @@ impl Flags {
                  self.is_silent_mode = true;
              } else if tok == b"-k" || tok == b"--keep-going" {
                  self.is_keep_going = true;
@@ -146,10 +199,12 @@ index 1faf9b8..439d4b5 100644
 +            } else if tok == b"-n" || tok == b"--just-print"
 +                   || tok == b"--dry-run" || tok == b"--recon" {
 +                self.is_dry_run = true;
++            } else if tok == b"--trace" {
++                self.is_trace = true;
              } else if !tok.starts_with(b"-") && tok.contains(&b'=') {
                  let var = Bytes::from(tok.to_vec());
                  if !self.cl_vars.contains(&var) {
-@@ -283,6 +295,8 @@ impl Flags {
+@@ -283,6 +301,8 @@ impl Flags {
                          b'R' => self.no_builtin_variables = true,
                          b's' => self.is_silent_mode = true,
                          b'k' => self.is_keep_going = true,
@@ -158,7 +213,7 @@ index 1faf9b8..439d4b5 100644
                          _ => {}
                      }
                  }
-@@ -309,11 +323,19 @@ impl Flags {
+@@ -309,11 +329,20 @@ impl Flags {
                      should_propagate = false;
                  }
                  b"-c" => flags.is_syntax_check_only = true,
@@ -172,6 +227,7 @@ index 1faf9b8..439d4b5 100644
 +                b"-n" | b"--just-print" | b"--dry-run" | b"--recon" => {
 +                    flags.is_dry_run = true
 +                }
++                b"--trace" => flags.is_trace = true,
                  b"-s" => flags.is_silent_mode = true,
                  b"-r" => flags.no_builtin_rules = true,
                  b"-R" => flags.no_builtin_variables = true,
