@@ -15,6 +15,9 @@ hex = { workspace = true }
 # equality without a round-trip through git).
 sha1 = { workspace = true }
 libc = { workspace = true }
+# Native git object reads (gitobj.rs): zlib inflate for loose objects and
+# pack entries — pure-Rust backend, musl-safe.
+flate2 = "1"
 rusqlite = { workspace = true }
 wikimak-depot = { workspace = true }
 

@@ -90,6 +90,7 @@ use depot::{Attrs, BlobOp, Layer, Node};
 mod cli;
 pub use cli::cli_main;
 mod geostack;
+mod gitobj;
 pub mod lanestore;
 pub mod oidenc;
 pub mod reslot;
@@ -244,58 +245,11 @@ fn fetch_blobs(
     if uniq.is_empty() {
         return Ok(map);
     }
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["cat-file", "--batch"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    // Write requests from a thread: the request stream can exceed the
-    // pipe buffer (large trees) while git's replies fill the other
-    // pipe — writing and reading from one thread deadlocks both sides
-    // (observed: import wedged in anon_pipe_write on a real history).
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let reqs: Vec<String> = uniq.iter().cloned().collect();
-    let writer = std::thread::spawn(move || -> std::io::Result<()> {
-        for oid in &reqs {
-            writeln!(stdin, "{oid}")?;
-        }
-        Ok(()) // drop closes stdin
-    });
-    let out = child.wait_with_output()?;
-    writer.join().map_err(|_| Error::Git("cat-file writer panicked".into()))?
-        .map_err(Error::Io)?;
-    if !out.status.success() {
-        return Err(Error::Git("cat-file --batch failed".into()));
-    }
-    let mut buf = &out.stdout[..];
-    for oid in &uniq {
-        let nl = buf
-            .iter()
-            .position(|&b| b == b'\n')
-            .ok_or_else(|| Error::Git("cat-file: truncated header".into()))?;
-        let header = std::str::from_utf8(&buf[..nl])
-            .map_err(|_| Error::Git("cat-file: bad header".into()))?;
-        let mut it = header.split(' ');
-        let (h_oid, _typ, size) = (
-            it.next().unwrap_or_default(),
-            it.next().unwrap_or_default(),
-            it.next().unwrap_or_default(),
-        );
-        if h_oid != oid {
-            return Err(Error::Git(format!("cat-file: expected {oid}, got {h_oid}")));
-        }
-        let size: usize = size
-            .parse()
-            .map_err(|_| Error::Git("cat-file: bad size".into()))?;
-        let start = nl + 1;
-        if buf.len() < start + size + 1 {
-            return Err(Error::Git("cat-file: truncated body".into()));
-        }
-        map.insert(oid.clone(), buf[start..start + size].to_vec());
-        buf = &buf[start + size + 1..]; // skip trailing \n
+    // Native object reads (crate::gitobj) — no cat-file subprocess.
+    let mut st = crate::gitobj::ObjectStore::open(repo)?;
+    for oid in uniq {
+        let raw = st.get(&oid)?;
+        map.insert(oid, raw);
     }
     Ok(map)
 }
@@ -592,58 +546,22 @@ fn collect_tag_objects(repo: &Path, refs: &[RefMeta]) -> Result<Vec<TagObj>> {
 /// request-one/read-one interleaving: a single pending request never
 /// outgrows the pipe buffer, so no writer thread is needed (contrast
 /// fetch_blobs, which streams thousands of requests ahead).
+/// Object reads by oid, NATIVE (crate::gitobj): loose zlib + pack/idx with
+/// delta chains — no `cat-file` subprocess, no pipe. The name survives from
+/// the cat-file era; the API is the same one object-at-a-time `get`.
 pub(crate) struct CatFile {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    out: std::io::BufReader<std::process::ChildStdout>,
+    store: crate::gitobj::ObjectStore,
 }
 
 impl CatFile {
     pub(crate) fn new(repo: &Path) -> Result<CatFile> {
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["cat-file", "--batch"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
-        Ok(CatFile { child, stdin, out })
+        Ok(CatFile { store: crate::gitobj::ObjectStore::open(repo)? })
     }
 
     /// The raw bytes of one object (any type) — a tree's binary entries or a
     /// blob's content, served by oid straight from the object store.
     pub(crate) fn get(&mut self, oid: &str) -> Result<Vec<u8>> {
-        use std::io::{BufRead as _, Read as _};
-        writeln!(self.stdin, "{oid}")?;
-        self.stdin.flush()?;
-        let mut header = String::new();
-        self.out.read_line(&mut header)?;
-        let mut it = header.trim_end().split(' ');
-        let (h_oid, typ_or_miss, size) = (
-            it.next().unwrap_or_default(),
-            it.next().unwrap_or_default(),
-            it.next().unwrap_or_default(),
-        );
-        if typ_or_miss == "missing" || h_oid != oid {
-            return Err(Error::Git(format!("cat-file: {oid}: {}", header.trim_end())));
-        }
-        let size: usize = size
-            .parse()
-            .map_err(|_| Error::Git(format!("cat-file: bad size for {oid}")))?;
-        let mut buf = vec![0u8; size + 1]; // body + trailing \n
-        self.out.read_exact(&mut buf)?;
-        buf.pop();
-        Ok(buf)
-    }
-}
-
-impl Drop for CatFile {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.store.get(oid)
     }
 }
 
@@ -964,7 +882,7 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
 // tip commits and materialized snapshot trees are asserted against the
 // shas recorded at import. Never stored (the implicit-id rule).
 
-fn git_obj_oid(typ: &str, body: &[u8]) -> String {
+pub(crate) fn git_obj_oid(typ: &str, body: &[u8]) -> String {
     use sha1::Digest as _;
     let mut h = sha1::Sha1::new();
     h.update(format!("{typ} {}\0", body.len()).as_bytes());
