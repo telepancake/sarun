@@ -91,6 +91,7 @@ mod cli;
 pub use cli::cli_main;
 mod geostack;
 mod gitobj;
+pub mod memgraph;
 pub mod lanestore;
 pub mod oidenc;
 pub mod reslot;

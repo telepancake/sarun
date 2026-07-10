@@ -303,6 +303,59 @@ impl ObjectStore {
         Ok(self.get_typed(oid)?.1)
     }
 
+    // ---- pack enumeration (the memgraph experiment's scan surface) ----
+
+    pub(crate) fn pack_count(&self) -> usize {
+        self.packs.len()
+    }
+
+    pub(crate) fn pack_len(&self, pack: usize) -> usize {
+        self.packs[pack].n
+    }
+
+    /// The `i`-th (sha-ordered) entry of `pack`: its 20-byte oid and pack
+    /// offset.
+    pub(crate) fn pack_entry(&self, pack: usize, i: usize) -> ([u8; 20], u64) {
+        let mut sha = [0u8; 20];
+        sha.copy_from_slice(self.packs[pack].sha_at(i));
+        (sha, self.packs[pack].offset_at(i))
+    }
+
+    /// Every loose object's oid under the store's object dirs.
+    pub(crate) fn loose_oids(&self) -> Vec<[u8; 20]> {
+        let mut out = Vec::new();
+        for d in &self.dirs {
+            let Ok(rd) = std::fs::read_dir(d) else { continue };
+            for sub in rd.flatten() {
+                let name = sub.file_name();
+                let Some(pfx) = name.to_str().filter(|s| s.len() == 2) else { continue };
+                let Ok(hex2) = u8::from_str_radix(pfx, 16) else { continue };
+                let Ok(inner) = std::fs::read_dir(sub.path()) else { continue };
+                for f in inner.flatten() {
+                    let fname = f.file_name();
+                    let Some(rest) = fname.to_str().filter(|s| s.len() == 38) else { continue };
+                    let mut sha = [0u8; 20];
+                    sha[0] = hex2;
+                    if hex::decode_to_slice(rest, &mut sha[1..]).is_ok() {
+                        out.push(sha);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// [`Self::read_entry`], exposed for the memgraph scan (typed body at a
+    /// known pack offset).
+    pub(crate) fn entry_at(&mut self, pack: usize, ofs: u64) -> Result<(u8, Arc<Vec<u8>>)> {
+        self.read_entry(pack, ofs)
+    }
+
+    /// A loose object by binary oid, typed.
+    pub(crate) fn loose_typed(&self, oid: &[u8; 20]) -> Result<Option<(u8, Vec<u8>)>> {
+        self.read_loose(oid)
+    }
+
     fn get_typed(&mut self, oid: &str) -> Result<(u8, Vec<u8>)> {
         let mut bin = [0u8; 20];
         hex::decode_to_slice(oid, &mut bin)

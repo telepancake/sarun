@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 fn usage() -> i32 {
     eprintln!(
-        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--shard-bits B] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal] [--whole]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>\n       gitdepot union <git-repo> <store-dir> [--level N] [--shard-bits B]\n       gitdepot union-update <git-repo> <store-dir> [--level N]\n       gitdepot union-verify <git-repo> <store-dir> [stride]"
+        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--shard-bits B] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal] [--whole]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>\n       gitdepot union <git-repo> <store-dir> [--level N] [--shard-bits B]\n       gitdepot union-update <git-repo> <store-dir> [--level N]\n       gitdepot union-verify <git-repo> <store-dir> [stride]\n       gitdepot memgraph <git-repo>"
     );
     2
 }
@@ -199,6 +199,9 @@ pub fn cli_main(args: &[String]) -> i32 {
             crate::union_update(&PathBuf::from(repo), &PathBuf::from(store), level).map(|o| {
                 println!("{} revisions, {} lanes, {} bytes on disk", o.n_rev, o.n_lanes, o.on_disk);
             })
+        }
+        ("memgraph", [repo]) => {
+            crate::memgraph::report(&PathBuf::from(repo)).map(|s| println!("{s}"))
         }
         ("union-verify", [repo, store, rest @ ..]) => {
             let stride = match rest {
