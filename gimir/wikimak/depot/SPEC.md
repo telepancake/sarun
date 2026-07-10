@@ -196,6 +196,12 @@ impl Depot {
     /// Iterate the cold frames newest-first. Yields (zstd_bytes,).
     pub fn cold_iter(&self, chain_id: u64) -> Result<ColdIter<'_>>;
 
+    /// Bulk forward construction of an EMPTY chain (dump import fast
+    /// path) — see "Bulk forward construction".
+    pub fn begin_chain(&self, chain_id: u64) -> Result<ChainBuilder>;
+    pub fn append_history_frame(&self, b: &mut ChainBuilder, zstd: &[u8]) -> Result<()>;
+    pub fn finish_chain(&self, b: ChainBuilder, f0: &[u8], f1: Option<&[u8]>) -> Result<()>;
+
     pub fn flush(&self) -> Result<()>;
 
     /// Session-end compaction: run eviction with the current write file
@@ -312,6 +318,44 @@ framing and compression as ever):
 
 The caller then compresses new f0 standalone and new f1 anchored on the
 new f0 record per its own discipline, and calls `prepend` once.
+
+### Bulk forward construction (`ChainBuilder`)
+
+Dumps deliver a chain's records OLDEST-FIRST. Building through
+`prepend` costs each history byte several writes (every batch rewrites
+the accumulator, and sealing copies it again into cold); the chain
+format itself doesn't require any of that, because frame links point
+newer→older — a frame written AFTER its older neighbor already knows
+its `next_pointer`. So an EMPTY chain can be built forward:
+
+1. `begin_chain(chain_id)` — chain must be empty
+   (`Error::ChainNotEmpty` otherwise); nothing is written.
+2. `append_history_frame(&mut builder, zstd)` per history frame,
+   oldest first: one pure append into the cold file with
+   `next_pointer` = the previously appended frame (0 for the oldest).
+   Each frame is written exactly ONCE — write amplification 1.0 for
+   the history. The caller's compression contract is the ordinary
+   chain-walk invariant: each frame's refPrefix anchor must be the
+   record that becomes the OLDEST record of the frame appended after
+   it (for the last history frame: the oldest record of f1, or f0's
+   record if the head has no f1).
+3. `finish_chain(builder, f0, Some(f1))` — writes f1 with
+   `next_pointer` = the built cold head, f0 with `next_pointer` = f1
+   (or, with `f1 = None`, directly = the cold head: the `seal_f1`
+   pointer state), then flips the index slot. The flip is the atomic
+   commit.
+
+Crash story: until the flip the frames are unreferenced orphans —
+invisible to every read (the index still says "empty chain"), safe to
+abandon (dropping the builder writes nothing further). A died build's
+cold bytes are never reclaimed individually (cold is only ever
+unlinked whole, per "Cold file") — the accepted trade, same as any
+crashed prepend's orphan frames. The caller's dirty-flag machinery
+covers re-import: the chain is still empty, so a retry simply builds
+again. Note the sidecar fence: an aborted build changed `cold_len`
+without a `flush`, so the next open rebuilds the dead counters once —
+correct, not a bug (the orphan tier bytes of `finish_chain`, if it got
+that far, must be re-counted).
 
 ### Eviction of an f0 or f1 file
 

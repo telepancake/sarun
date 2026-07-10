@@ -23,6 +23,15 @@
 //! store-uncompressed scheme (no zstd, no seal) was the sabotage
 //! documented in meta/reports/vbf-recovery.md §4.
 //!
+//! A FRESH page (empty chain — the bulk-import common case) skips the
+//! prepend cycle entirely: dumps arrive oldest-first, and the depot's
+//! forward construction (`ChainBuilder`, SPEC §"Bulk forward
+//! construction") writes each RAM-bound batch as one cold frame, once
+//! (batch boundary = frame boundary; the batch's newest record is the
+//! frame's refPrefix anchor and carries into the next batch), with the
+//! tail landing as f0/f1 at the commit. History write amplification:
+//! 1.0. Update mode (existing chain) keeps the prepend path.
+//!
 //! ## Per-page atomicity — and the RAM bound
 //!
 //! Per SPEC §"Crash-safety contract":
@@ -79,6 +88,23 @@ fn ingest_ram_bound() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(INGEST_RAM_BOUND)
+}
+
+/// Test knob: route FRESH chains through the update prepend path
+/// instead of forward construction, so tests can build both stores
+/// from one dump and compare (forward_build.rs equivalence +
+/// write-amplification). Never set outside tests.
+fn force_prepend() -> bool {
+    std::env::var("WIKIMAK_TEST_FORCE_PREPEND").is_ok_and(|v| v == "1")
+}
+
+/// Test knob: `std::process::abort()` once a forward build has
+/// appended this many history frames — the crash-mid-construction
+/// fixture (forward_build.rs). Never set outside tests.
+fn abort_after_history_frames() -> Option<u64> {
+    std::env::var("WIKIMAK_TEST_ABORT_AFTER_COLD_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 pub(crate) fn do_import<R: Read>(
@@ -193,24 +219,52 @@ fn import_one_page<R: Read>(
         // revisions_seen. Source order isn't strictly
         // timestamp-ordered in the wild, but every test fixture has it
         // so. New records land on the chain in batches bounded by the
-        // ingest RAM bound — a bound-sized page is still ONE prepend
-        // (depot SPEC §"Prepend multiple records": one f0 swap, one f1
-        // re-encode, one seal check per page); only a page whose new
-        // records exceed the bound splits, oldest batch first, exactly
-        // the partition `wikimak_depot::chunk_newest_first` computes
-        // (greedy fill from the oldest record).
+        // ingest RAM bound, down one of two paths:
+        //
+        //   * FRESH chain (the bulk-import common case): forward
+        //     construction (depot SPEC §"Bulk forward construction").
+        //     Dumps are oldest-first and the chain format's links
+        //     point newer→older, so each full batch becomes ONE cold
+        //     frame written ONCE — batch boundary = frame boundary,
+        //     the batch's newest record excluded and carried as the
+        //     next frame's oldest record (it is the frame's refPrefix
+        //     anchor, exactly what the newest-first read walk decodes
+        //     against). The final partial batch (plus the carry)
+        //     lands as f0/f1 at `finish_chain`, whose index flip is
+        //     the commit — until then everything is an invisible
+        //     orphan. Write amplification for history: 1.0.
+        //
+        //   * EXISTING chain (update mode): the prepend path,
+        //     untouched — one prepend per bound-sized batch (depot
+        //     SPEC §"Prepend multiple records": one f0 swap, one f1
+        //     re-encode, one seal check), oldest batch first, exactly
+        //     the partition `wikimak_depot::chunk_newest_first`
+        //     computes.
         //
         // On a mid-page error the sqlite transaction rolls back but
-        // already-prepended batches stay on the chain (the depot is
-        // prepend-only). That is the same chain-ahead-of-bookkeeping
-        // state a crash leaves, and the same machinery heals it: the
-        // dirty flag is already stamped, so the next session opens
-        // suspect and re-derives revisions_seen from the chain before
-        // trusting it — no duplicate records on re-import.
+        // frames already on the chain (prepend path) stay — the same
+        // chain-ahead-of-bookkeeping state a crash leaves, healed by
+        // the same machinery: the dirty flag is already stamped, so
+        // the next session opens suspect and re-derives revisions_seen
+        // from the chain before trusting it. On the forward path the
+        // unfinished build stays invisible (index never flipped) and a
+        // re-import simply builds again; the orphan cold bytes die
+        // with the instance.
         let batch_bound = ingest_ram_bound().max(instance.f1_seal_threshold_bytes);
         let mut batch: Vec<Vec<u8>> = Vec::new(); // oldest-first
         let mut batch_bytes: u64 = 0;
         let mut new_this_page = 0u64;
+        // Fresh-vs-update fork (one index peek). The test knob forces
+        // the prepend path so suites can build both stores and compare.
+        let mut builder = if !force_prepend() && !g.depot.has_chain(page_id)? {
+            Some(g.depot.begin_chain(page_id)?)
+        } else {
+            None
+        };
+        // Forward path: the previous batch's newest record, excluded
+        // from its frame — the anchor it was compressed against, and
+        // the oldest record of the NEXT frame (or of the f0/f1 head).
+        let mut carry: Option<Vec<u8>> = None;
 
         // Earliest revision timestamp for THIS dump's copy of the page
         // — the real start of a title interval (browsing plan §2
@@ -257,17 +311,27 @@ fn import_one_page<R: Read>(
             // (a single oversized record still travels alone) — the
             // same greedy oldest-first partition as chunk_newest_first.
             if !batch.is_empty() && batch_bytes + record.len() as u64 > batch_bound {
-                batch.reverse(); // the chain wants newest-first
-                prepend_depot_frames(g, page_id, &batch, instance.f1_seal_threshold_bytes)?;
-                batch.clear();
+                match builder.as_mut() {
+                    Some(b) => forward_flush(g, b, &mut carry, &mut batch)?,
+                    None => {
+                        batch.reverse(); // the chain wants newest-first
+                        prepend_depot_frames(g, page_id, &batch, instance.f1_seal_threshold_bytes)?;
+                        batch.clear();
+                    }
+                }
                 batch_bytes = 0;
             }
             batch_bytes += record.len() as u64;
             batch.push(record);
         }
-        if !batch.is_empty() {
-            batch.reverse(); // the chain wants newest-first
-            prepend_depot_frames(g, page_id, &batch, instance.f1_seal_threshold_bytes)?;
+        match builder.take() {
+            Some(b) => forward_finish(g, b, carry, batch)?,
+            None => {
+                if !batch.is_empty() {
+                    batch.reverse(); // the chain wants newest-first
+                    prepend_depot_frames(g, page_id, &batch, instance.f1_seal_threshold_bytes)?;
+                }
+            }
         }
 
         // Title bookkeeping: title pool + reverse index, and the
@@ -547,6 +611,81 @@ fn encode_new_revision(rev: Revision, stats: &mut ImportStats) -> Vec<u8> {
         text_len: text.len() as u64,
     };
     encode_revision(&meta, text)
+}
+
+/// Forward-construction batch flush (fresh chains only): turn the full
+/// oldest-first `batch` into ONE cold frame written ONCE. The batch's
+/// NEWEST record is excluded — it is the frame's refPrefix anchor and
+/// becomes the next frame's oldest record (`carry`), reproducing the
+/// read walk's invariant (each cold frame decodes against the oldest
+/// record of the next-newer frame) in dump order. The frame holds, in
+/// newest-first record order: the batch minus its newest, then the
+/// incoming carry. A wrong anchor here would fail the read-back's zstd
+/// decode loudly — the equivalence test's real teeth.
+fn forward_flush(
+    g: &InstanceInner,
+    b: &mut wikimak_depot::ChainBuilder,
+    carry: &mut Option<Vec<u8>>,
+    batch: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    let newest = batch.pop().expect("forward_flush wants a non-empty batch");
+    // A single-record batch with no carry has nothing to frame: the
+    // record just becomes the carry (a lone oversized record travels
+    // to the NEXT frame as its oldest entry, or into the head).
+    if !batch.is_empty() || carry.is_some() {
+        let mut raw =
+            Vec::with_capacity(batch.iter().map(Vec::len).sum::<usize>()
+                + carry.as_ref().map_or(0, |c| c.len()));
+        // Newest-first; each drained record is freed as it is copied.
+        for rec in batch.drain(..).rev() {
+            raw.extend_from_slice(&rec);
+        }
+        if let Some(c) = carry.take() {
+            raw.extend_from_slice(&c);
+        }
+        let zstd = crate::frames::compress(&raw, Some(&newest))?;
+        g.depot.append_history_frame(b, &zstd)?;
+        if abort_after_history_frames().is_some_and(|n| b.frames_written() >= n) {
+            // Crash-mid-construction test knob: die BETWEEN frames,
+            // before the index flip — the build must stay invisible.
+            std::process::abort();
+        }
+    }
+    *carry = Some(newest);
+    Ok(())
+}
+
+/// Forward-construction commit: the final partial batch plus the carry
+/// are the chain HEAD — f0 = the newest record standalone, f1 = the
+/// rest (newest-first, refPrefix-anchored on f0's record, its oldest
+/// entry being the carry that anchors the newest cold frame). The
+/// depot's `finish_chain` index flip is the atomic commit. No new
+/// records at all ⇒ nothing was ever written; the builder just drops.
+fn forward_finish(
+    g: &InstanceInner,
+    b: wikimak_depot::ChainBuilder,
+    carry: Option<Vec<u8>>,
+    mut batch: Vec<Vec<u8>>,
+) -> Result<()> {
+    batch.reverse(); // newest-first
+    if let Some(c) = carry {
+        batch.push(c);
+    }
+    let Some((head, older)) = batch.split_first() else {
+        return Ok(());
+    };
+    let f0 = crate::frames::compress(head, None)?;
+    let f1 = if older.is_empty() {
+        None
+    } else {
+        let mut raw = Vec::with_capacity(older.iter().map(Vec::len).sum());
+        for rec in older {
+            raw.extend_from_slice(rec);
+        }
+        Some(crate::frames::compress(&raw, Some(head))?)
+    };
+    g.depot.finish_chain(b, &f0, f1.as_deref())?;
+    Ok(())
 }
 
 /// Prepend one or more revision records (NEWEST-first) to the depot

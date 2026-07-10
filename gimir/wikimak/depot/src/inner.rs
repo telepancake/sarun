@@ -79,6 +79,9 @@ struct Tier {
     /// allocated.
     current: Option<u32>,
     next_id: u32,
+    /// Bytes appended to this tier since open (headers + payloads,
+    /// eviction copies included) — write-amplification instrumentation.
+    written: u64,
 }
 
 impl Tier {
@@ -107,6 +110,7 @@ impl Tier {
             files,
             current,
             next_id,
+            written: 0,
         })
     }
 
@@ -142,6 +146,7 @@ impl Tier {
         // the outer Mutex; no O_APPEND, see DataFile::open).
         df.file.write_all_at(frame, off)?;
         df.len += frame.len() as u64;
+        self.written += frame.len() as u64;
         Ok((id, off))
     }
 }
@@ -158,6 +163,10 @@ pub struct DepotInner {
     f1: Tier,
     cold_file: File,
     cold_len: u64,
+    /// Bytes written outside the tiers since open: cold appends,
+    /// in-place pointer patches, index flips — the rest of the
+    /// write-amplification account (see `bytes_written`).
+    misc_written: u64,
     /// Open couldn't use the persisted counters sidecar and rebuilt the
     /// dead-byte counters from frame headers. Instrumentation.
     rebuilt_on_open: bool,
@@ -252,6 +261,7 @@ impl DepotInner {
             f1,
             cold_file,
             cold_len,
+            misc_written: 0,
             rebuilt_on_open,
         };
         if rebuilt_on_open {
@@ -435,10 +445,97 @@ impl DepotInner {
             .ok_or(Error::Corrupt("missing tier file"))?;
         let patch = OpenOptions::new().write(true).open(&f0_df.path)?;
         patch.write_all_at(&cold_ptr.to_le_bytes(), f0_off + 8)?;
+        self.misc_written += 8;
         // The old f1 frame is dead.
         if let Some(df) = self.f1.files.get_mut(&f1_fid) {
             df.dead += HEADER_LEN as u64 + f1_zstd.len() as u64;
         }
+        Ok(())
+    }
+
+    /// Does the chain have any frames? Index peek only — no frame
+    /// header, no payload, no read-counter noise. The importer's
+    /// fresh-vs-update fork.
+    pub fn has_chain(&self, chain_id: u64) -> Result<bool> {
+        Ok(self.slot_ptr(chain_id)? != 0)
+    }
+
+    /// Cumulative bytes this session wrote to disk: tier appends
+    /// (prepends, seals' new frames, eviction copies) + cold appends +
+    /// pointer patches + index flips. Divide the store's on-disk data
+    /// size by this to MEASURE write amplification instead of
+    /// asserting it.
+    pub fn bytes_written(&self) -> u64 {
+        self.f0.written + self.f1.written + self.misc_written
+    }
+
+    // --- Bulk forward construction (SPEC §"Bulk forward construction") ---
+    //
+    // For a chain with NO existing frames whose records arrive
+    // OLDEST-FIRST in bulk (a wiki dump), history frames are written
+    // straight to the cold file in dump order: each new frame's
+    // next_pointer is the ALREADY-WRITTEN previous frame's offset, so
+    // every frame is a pure append written exactly once — write
+    // amplification 1.0 for the history, versus the prepend path's
+    // rewrite-accumulator-per-batch + seal-copy. Until `finish_chain`
+    // flips the index slot the frames are unreferenced orphans:
+    // invisible to every read, byte-dead if the build dies (they cost
+    // cold bytes until the instance is deleted — the cold file is
+    // never compacted — which is the accepted trade), and fenced by
+    // the caller's dirty-flag machinery exactly like a crashed
+    // prepend.
+
+    /// Start a forward build. The chain must be EMPTY (never
+    /// prepended, or its slot would be clobbered silently).
+    pub fn begin_chain(&mut self, chain_id: u64) -> Result<()> {
+        self.ensure_slot(chain_id)?;
+        if self.index_get(chain_id) != 0 {
+            return Err(Error::ChainNotEmpty);
+        }
+        Ok(())
+    }
+
+    /// Append the next-NEWER history frame (opaque zstd) to the cold
+    /// file, linking it to `next_ptr` (the previously appended, older
+    /// frame — 0 for the oldest). Returns the new frame's pointer
+    /// word.
+    pub fn append_history_frame(
+        &mut self,
+        chain_id: u64,
+        next_ptr: u64,
+        zstd: &[u8],
+    ) -> Result<u64> {
+        let frame = encode_frame(chain_id, next_ptr, zstd);
+        let off = self.cold_append(&frame)?;
+        Ok(pack(COLD_FILE_ID, off))
+    }
+
+    /// Install the chain head over the built history and COMMIT: write
+    /// f1 (if any) pointing at `cold_head`, write f0 pointing at f1
+    /// (or, with no f1, directly at `cold_head` — the `seal_f1`
+    /// pointer state), and flip the index slot. A crash anywhere
+    /// before the flip leaves the chain empty and the frames orphaned.
+    pub fn finish_chain(
+        &mut self,
+        chain_id: u64,
+        cold_head: u64,
+        f0_bytes: &[u8],
+        f1_bytes: Option<&[u8]>,
+    ) -> Result<()> {
+        if self.index_get(chain_id) != 0 {
+            return Err(Error::ChainNotEmpty);
+        }
+        let f0_next = match f1_bytes {
+            Some(f1) => {
+                let f1_frame = encode_frame(chain_id, cold_head, f1);
+                let (fid, off) = self.f1.append(&f1_frame, self.cfg.file_size_threshold)?;
+                pack(fid, off)
+            }
+            None => cold_head,
+        };
+        let f0_frame = encode_frame(chain_id, f0_next, f0_bytes);
+        let (fid, off) = self.f0.append(&f0_frame, self.cfg.file_size_threshold)?;
+        self.index_put(chain_id, pack(fid, off));
         Ok(())
     }
 
@@ -624,6 +721,7 @@ impl DepotInner {
             // plain-write handle on the same path.
             let patch = OpenOptions::new().write(true).open(&f0_df.path)?;
             patch.write_all_at(&new_ptr.to_le_bytes(), f0_off + 8)?;
+            self.misc_written += 8;
             touched_f0.insert(f0_fid);
         }
         for df in self.f1.files.values() {
@@ -687,6 +785,7 @@ impl DepotInner {
         if self.cold_len == 0 {
             std::io::Write::write_all(&mut self.cold_file, &[0u8])?;
             self.cold_len = 1;
+            self.misc_written += 1;
         }
         if self.cold_len + frame.len() as u64 > MAX_OFFSET {
             return Err(Error::FrameTooLarge);
@@ -694,6 +793,7 @@ impl DepotInner {
         let off = self.cold_len;
         std::io::Write::write_all(&mut self.cold_file, frame)?;
         self.cold_len += frame.len() as u64;
+        self.misc_written += frame.len() as u64;
         Ok(off)
     }
 
@@ -749,6 +849,7 @@ impl DepotInner {
     fn index_put(&mut self, chain_id: u64, ptr: u64) {
         let start = chain_id as usize * INDEX_ENTRY_LEN;
         self.index[start..start + 8].copy_from_slice(&ptr.to_le_bytes());
+        self.misc_written += INDEX_ENTRY_LEN as u64;
     }
 }
 

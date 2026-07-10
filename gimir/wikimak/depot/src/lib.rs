@@ -56,6 +56,12 @@ pub enum Error {
     #[error("cannot seal: chain has no f1")]
     CannotSealNoF1,
 
+    /// Bulk forward construction ([`Depot::begin_chain`] /
+    /// [`Depot::finish_chain`]) requires a chain with NO existing
+    /// frames — it would otherwise silently clobber the live head.
+    #[error("bulk construction requires an empty chain")]
+    ChainNotEmpty,
+
     /// The on-disk index file length is not a whole number of 8-byte
     /// slots — a torn ftruncate or outside interference. (Capacity
     /// itself is DERIVED from the length; a differing
@@ -214,6 +220,31 @@ pub fn compose_f1(
     (raw, seal)
 }
 
+/// Forward (oldest-first) bulk construction of one EMPTY chain — the
+/// dump-import fast path (SPEC §"Bulk forward construction"). Obtained
+/// from [`Depot::begin_chain`]; feed history frames oldest-first
+/// through [`Depot::append_history_frame`] (each is a pure cold-file
+/// append written exactly once, linked to the previous frame), then
+/// commit the head with [`Depot::finish_chain`]. Owns no borrow of the
+/// depot (like [`ColdCursor`]); until `finish_chain` flips the index
+/// slot, everything written is an invisible orphan — dropping the
+/// builder abandons the build with the chain still empty.
+pub struct ChainBuilder {
+    chain_id: u64,
+    /// Pointer word of the newest history frame written so far
+    /// (0 = none yet) — the next frame's `next_pointer`, and the
+    /// f1/f0 cold-head at finish.
+    cold_head: u64,
+    frames: u64,
+}
+
+impl ChainBuilder {
+    /// History frames appended so far (test/crash-knob instrumentation).
+    pub fn frames_written(&self) -> u64 {
+        self.frames
+    }
+}
+
 /// Iterator over cold frames for a chain, newest-first. Each item is a
 /// `Result<Vec<u8>>` of the cold frame's opaque zstd bytes.
 pub struct ColdIter<'a> {
@@ -325,6 +356,54 @@ impl Depot {
     pub fn cold_iter(&self, chain_id: u64) -> Result<ColdIter<'_>> {
         let cursor = self.cold_cursor(chain_id)?;
         Ok(ColdIter { depot: self, cursor })
+    }
+
+    /// Does the chain have any frames? One index peek — no frame
+    /// header or payload read, no read-counter noise. How an importer
+    /// forks fresh-chain bulk construction from the update prepend
+    /// path.
+    pub fn has_chain(&self, chain_id: u64) -> Result<bool> {
+        self.inner.lock().expect("depot mutex poisoned").has_chain(chain_id)
+    }
+
+    /// Cumulative bytes written to disk since open (tier + cold frame
+    /// appends, eviction copies, pointer patches, index flips).
+    /// Divide by the store's on-disk data size to MEASURE write
+    /// amplification.
+    pub fn bytes_written(&self) -> u64 {
+        self.inner.lock().expect("depot mutex poisoned").bytes_written()
+    }
+
+    /// Begin forward bulk construction of the EMPTY chain `chain_id`
+    /// (else [`Error::ChainNotEmpty`]). See [`ChainBuilder`].
+    pub fn begin_chain(&self, chain_id: u64) -> Result<ChainBuilder> {
+        let mut g = self.inner.lock().expect("depot mutex poisoned");
+        g.begin_chain(chain_id)?;
+        Ok(ChainBuilder { chain_id, cold_head: 0, frames: 0 })
+    }
+
+    /// Append the next-NEWER history frame (opaque zstd; the caller's
+    /// compression discipline anchors it on the oldest record of the
+    /// frame that will follow). One pure append into the cold file,
+    /// written exactly once, linked to the previously appended frame.
+    pub fn append_history_frame(&self, b: &mut ChainBuilder, zstd: &[u8]) -> Result<()> {
+        let mut g = self.inner.lock().expect("depot mutex poisoned");
+        let ptr = g.append_history_frame(b.chain_id, b.cold_head, zstd)?;
+        drop(g);
+        b.cold_head = ptr;
+        b.frames += 1;
+        Ok(())
+    }
+
+    /// Commit the forward build: write the head — f0 (newest record,
+    /// standalone) and optionally f1 (pointing at the built history's
+    /// newest frame; with no f1, f0 points there directly, the
+    /// `seal_f1` pointer state) — then flip the chain's index slot.
+    /// The flip is the atomic commit; everything before it is orphan
+    /// bytes. Durability, as everywhere in the depot, is `flush()`.
+    pub fn finish_chain(&self, b: ChainBuilder, f0: &[u8], f1: Option<&[u8]>) -> Result<()> {
+        let mut g = self.inner.lock().expect("depot mutex poisoned");
+        g.finish_chain(b.chain_id, b.cold_head, f0, f1)
     }
 
     /// Seal the chain's CURRENT f1 to cold immediately: the f1's zstd

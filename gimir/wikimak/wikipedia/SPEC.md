@@ -84,6 +84,17 @@ Subsequent design pass may switch from "one frame per revision" to
 "frame per revision batch" once we measure the per-frame overhead on real
 data. The depot doesn't care.
 
+A FRESH page (empty chain — the bulk-import common case) is built
+FORWARD (depot SPEC §"Bulk forward construction"): the dump's
+oldest-first revisions stream through in ingest-RAM-bound batches, each
+full batch landing as ONE cold frame written ONCE (the batch's newest
+record is excluded — it is the frame's refPrefix anchor and carries into
+the next batch as its oldest record, reproducing the newest-first read
+walk's anchor invariant in dump order), and the final tail lands as
+f0/f1 at the commit (the depot index flip). History write amplification
+is 1.0, measured in the forward_build tests. A page whose chain already
+exists (update mode) takes the prepend path.
+
 ## sqlite schema (sketch)
 
 ```
