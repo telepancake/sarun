@@ -232,8 +232,13 @@ fn apply_event(b: &BoxState, st: &Stream,
     match ev.ty {
         sudwire::EV_EXEC => {
             // Snapshot the process row while /proc/<tgid> is alive —
-            // this is what post-exit sweeps structurally can't do.
-            if ev.tgid > 0 { b.writer_for(ev.tgid as u32); }
+            // this is what post-exit sweeps structurally can't do. An
+            // in-place execve (vendor `exec real-tool "$@"` wrappers)
+            // keeps (tgid,start), so refresh the existing row's image
+            // rather than trusting the first snapshot (capture.rs
+            // exec_refresh) — otherwise the process table shows the
+            // wrapper/shim forever and the real compilers never appear.
+            if ev.tgid > 0 { b.exec_refresh(ev.tgid as u32); }
         }
         sudwire::EV_CWD => {
             if let Ok(p) = String::from_utf8(ev.blob.clone()) {

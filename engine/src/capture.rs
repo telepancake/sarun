@@ -686,6 +686,43 @@ impl BoxState {
             .unwrap_or(tgid as i64)
     }
 
+    /// EXEC-event refresh: an in-place execve keeps the pid AND its kernel
+    /// start time, so the (tgid,start) incarnation key — and therefore the
+    /// cached process row — CANNOT tell the new image from the old. Vendor
+    /// toolchains hit this constantly: `gcc` is a shell wrapper ending in
+    /// `exec real-gcc "$@"`, so every tool invocation re-execs in place and
+    /// the snapshot taken at the FIRST exec (the wrapper, or the shell shim)
+    /// is what the process table shows forever — the actual compilers never
+    /// appear. On an EXEC event, re-read /proc and, when the row's image is
+    /// stale, update it in place (same row id, so output/edge attribution by
+    /// row id is unaffected).
+    pub fn exec_refresh(&self, pid: u32) -> i64 {
+        let (tgid, start, ppid, exe, cwd, argv) = Self::read_prov(pid);
+        if start == 0 && exe.is_empty() && argv.is_empty() {
+            // Process already gone — nothing fresher to record.
+            return self.writer_for(pid);
+        }
+        let cached = self.proc_cache.lock().unwrap().get(&(tgid, start)).copied();
+        let Some(rid) = cached else {
+            // First sighting of this incarnation: normal record path.
+            return self.writer_for(pid);
+        };
+        let argv_json = serde_json::to_string(&argv).unwrap_or_default();
+        let conn = self.conn.lock().unwrap();
+        let stale: bool = conn
+            .query_row("SELECT exe<>?1 OR argv<>?2 FROM process WHERE id=?3",
+                       params![exe, argv_json, rid], |r| r.get(0))
+            .unwrap_or(false);
+        if stale {
+            let _ = conn.execute(
+                "UPDATE process SET exe=?1, argv=?2, cwd=?3 WHERE id=?4",
+                params![exe, argv_json, cwd, rid]);
+            drop(conn);
+            self.push_event("", "process_added");
+        }
+        rid
+    }
+
     /// Insert/dedup ONE process incarnation (identity (tgid,start)) and return its
     /// row id. The parent is recorded FIRST (so parent_id is the parent's CURRENT
     /// incarnation ROW id, never a pid), bubbling the PPid chain up to the box root
