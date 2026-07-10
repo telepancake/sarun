@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Mirror serve path, all three kinds, through the REAL CLI
-(`sarun NAME attach git|wiki|ietf …` — ATTACH-CONVERGENCE.md): build a
-git mirror store, a wikimak wikipedia instance, and an ietf-mirror root
-(update against a local stand-in HTTP server), attach one object of
-each to a box as an EXTERNAL RO reference (no import, no new box), and
-prove the §8 semantics inside the box.
+"""Mirror serve path through the REAL CLI: bounded single-object
+adapters (`sarun NAME attach wiki|ietf …` — ATTACH-CONVERGENCE.md) plus
+the git CHECKOUT path (`sarun NAME checkout <store> <ref> [DEST]`) —
+git attach was REMOVED by design (no RAM-resident datasets; a commit is
+checked out into box changes instead), and this test pins the refusal.
 
 Real-effect assertions (never shape-only):
-  • each attach is bookkeeping-only: box count never changes
+  • `attach git` refuses loudly, pointing at checkout; no box appears
+  • wiki/ietf attaches are bookkeeping-only: box count never changes
+  • checkout streams the commit's bytes into WRITABLE box rows
   • each attached object's bytes are readable in the box (captured copy)
-  • a write to an attached key is EROFS with NO captured row
+  • a write to an ATTACHED key is EROFS with NO captured row
   • all three attachments appear in the session dict's "attachments",
     named for their objects (git:…/main@sha8, wiki:…@rN, ietf:…@rev)
 
@@ -182,14 +183,18 @@ def main():
         sp = newest_sqlar()
         sid = int(sp.stem)
 
-        # All three attach kinds, through the REAL CLI surface. Each is
-        # bookkeeping-only: the reply names the pinned object and NO box
-        # appears.
+        # git attach is GONE by design: the CLI refuses and points at
+        # checkout. The bounded adapters (wiki/ietf) attach as before;
+        # the git commit is CHECKED OUT into box changes.
         before = {p.name for p in Path(os.environ["XDG_STATE_HOME"])
                   .joinpath("slopbox.MAT").glob("*.sqlar")}
-        for cli, want in ((["attach", "git", str(store), "main", "gitsdk"],
-                           "attached git:gitstore/main@"),
-                          (["attach", "wiki", str(wroot), "1", "wiki"],
+        r = subprocess.run([str(BIN), "WORK", "attach", "git", str(store),
+                            "main", "gitsdk"],
+                           capture_output=True, text=True, timeout=60)
+        check(r.returncode != 0 and "checkout" in (r.stderr + r.stdout),
+              f"attach git refuses, pointing at checkout "
+              f"(rc={r.returncode}: {(r.stderr or r.stdout)[:200]})")
+        for cli, want in ((["attach", "wiki", str(wroot), "1", "wiki"],
                            "attached wiki:wiki/Old Title@r"),
                           (["attach", "ietf", str(iroot), "draft-test-mesh",
                             "ietf"],
@@ -199,10 +204,16 @@ def main():
             check(r.returncode == 0 and want in r.stdout,
                   f"CLI {' '.join(cli[:2])} succeeds, prints name+rev "
                   f"(rc={r.returncode}: {(r.stderr or r.stdout)[:200]})")
+        r = subprocess.run([str(BIN), "WORK", "checkout", str(store),
+                            "main", "gitsdk"],
+                           capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0,
+              f"checkout streams the commit into box changes "
+              f"(rc={r.returncode}: {(r.stderr or r.stdout)[:200]})")
         after = {p.name for p in Path(os.environ["XDG_STATE_HOME"])
                  .joinpath("slopbox.MAT").glob("*.sqlar")}
         check(after == before,
-              "box count unchanged by all three attaches (no import)")
+              "box count unchanged by attaches + checkout (no import)")
 
         # Read every attached object through the box; capture proves it.
         script = ("cat /gitsdk/tool.txt '/wiki/Old Title.txt' "
@@ -217,8 +228,16 @@ def main():
         check(len(gathered) > len(b"git tool v1\nmesh draft rev one\n"),
               "wiki page text read through (non-trivial bytes)")
 
-        # EROFS on each kind's key; no capture side effect.
-        for key in ("/gitsdk/tool.txt", "'/wiki/Old Title.txt'",
+        # Checked-out git rows are ORDINARY box changes: writable.
+        r = subprocess.run(
+            [str(BIN), "run", "WORK", "--", "sh", "-c",
+             "echo overwrite > /gitsdk/tool.txt"],
+            capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0,
+              f"checked-out git file is writable (rc={r.returncode})")
+
+        # EROFS on each ATTACHED kind's key; no capture side effect.
+        for key in ("'/wiki/Old Title.txt'",
                     "/ietf/draft-test-mesh-00.txt"):
             r = subprocess.run(
                 [str(BIN), "run", "WORK", "--", "sh", "-c",
@@ -228,21 +247,21 @@ def main():
             check(key.strip("'").lstrip("/") not in rows(sp),
                   f"rejected write to {key} left NO captured row")
 
-        # UI visibility: three rows in the session dict's "attachments",
-        # named for their objects; parents stay box-only (empty here).
+        # UI visibility: TWO rows in the session dict's "attachments"
+        # (wiki + ietf — a checkout is box content, not an attachment);
+        # parents stay box-only (empty here).
         rep = m.sync_request(sock, type="ui", verb="session_dicts", args=[])
         sessions = (rep or {}).get("r", [])
         mine = next((s for s in sessions if s.get("box_id") == sid), {})
         atts = mine.get("attachments") or []
-        check(len(atts) == 3,
-              f"three rows in session attachments (got {atts!r})")
+        check(len(atts) == 2,
+              f"two rows in session attachments (got {atts!r})")
         names = [a.get("name") for a in atts]
         kinds = [a.get("kind") for a in atts]
-        for want in ("git:gitstore/main@", "wiki:wiki/Old Title@r",
-                     "ietf:draft-test-mesh@01"):
+        for want in ("wiki:wiki/Old Title@r", "ietf:draft-test-mesh@01"):
             check(any(n and n.startswith(want) for n in names),
                   f"attachment named {want}… (names {names!r})")
-        check(kinds == ["git", "wiki", "ietf"]
+        check(kinds == ["wiki", "ietf"]
               and all(a.get("rev") for a in atts),
               f"attachment rows carry kind + pinned rev (got {atts!r})")
         check(mine.get("parents") == [],
