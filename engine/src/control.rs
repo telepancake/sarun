@@ -2574,10 +2574,10 @@ macro_rules! ui_verbs {
             };
             let title = match title {
                 Some(t) => t,
-                // Attached by id: recover the title for the name.
-                None => inst.pages(None, usize::MAX).ok()
-                    .and_then(|ps| ps.into_iter()
-                        .find(|(i, _)| *i == page).map(|(_, t)| t))
+                // Attached by id: recover the title for the name via
+                // the indexed dictionary hop (open interval →
+                // title_id_to_page) — never a pool-wide listing.
+                None => inst.page_current_title(page).ok().flatten()
                     .unwrap_or_else(|| format!("page-{page}")),
             };
             // page_head decodes ONE frame for the rev PIN — never a

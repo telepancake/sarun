@@ -654,6 +654,74 @@ impl Instance {
         self.title_shard_count
     }
 
+    /// The CURRENT title of `page_id` — the reverse of the exact-title
+    /// lookup, and the engine's attach-by-id name recovery. Indexed and
+    /// O(1): the open `title_intervals` row comes off the `(page_id,
+    /// start_ts)` primary key, its dense `title_id` resolves through
+    /// `title_id_to_page`'s PRIMARY KEY. No strpool shard is walked and
+    /// no pool-wide listing happens (this replaces an
+    /// `Instance::pages(None, usize::MAX)` sweep in the engine).
+    /// `Ok(None)` = the page has no open interval and no dictionary
+    /// mapping — it does not exist (or was never imported here).
+    ///
+    /// Compatibility tails, same discipline as every dictionary read:
+    /// an open interval the dictionary doesn't know (`title_id` NULL —
+    /// rows written outside import) answers from the row itself, and a
+    /// pre-interval legacy page falls back to its `page_to_title_id`
+    /// mapping — both indexed point lookups.
+    pub fn page_current_title(&self, page_id: u64) -> Result<Option<String>> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        // Open interval (end_ts IS NULL) → dense title_id. The newest
+        // open interval wins if several exist (import keeps one).
+        let open: Option<Option<i64>> = g
+            .conn
+            .prepare_cached(
+                "SELECT title_id FROM title_intervals
+                 WHERE page_id = ?1 AND end_ts IS NULL
+                 ORDER BY start_ts DESC LIMIT 1",
+            )?
+            .query_row([page_id as i64], |r| r.get(0))
+            .map(Some)
+            .or_else(ignore_no_rows)?;
+        let title: Option<Vec<u8>> = match open {
+            // The dictionary hop: dense id → title bytes, one PK lookup.
+            Some(Some(tid)) => g
+                .conn
+                .prepare_cached(
+                    "SELECT normalized_title FROM title_id_to_page WHERE title_id = ?1",
+                )?
+                .query_row([tid], |r| r.get(0))
+                .map(Some)
+                .or_else(ignore_no_rows)?,
+            // Unmapped row (written outside import): only here does the
+            // interval row's own bytes column answer — the same
+            // compatibility branch as `pages`/`page_id_by_title_at`.
+            Some(None) => g
+                .conn
+                .prepare_cached(
+                    "SELECT normalized_title FROM title_intervals
+                     WHERE page_id = ?1 AND end_ts IS NULL
+                     ORDER BY start_ts DESC LIMIT 1",
+                )?
+                .query_row([page_id as i64], |r| r.get(0))
+                .map(Some)
+                .or_else(ignore_no_rows)?,
+            // No interval at all: pre-interval legacy import — the
+            // page's dictionary mapping is the only title on record.
+            None => g
+                .conn
+                .prepare_cached(
+                    "SELECT t.normalized_title FROM page_to_title_id p
+                     JOIN title_id_to_page t ON t.title_id = p.title_id
+                     WHERE p.page_id = ?1 LIMIT 1",
+                )?
+                .query_row([page_id as i64], |r| r.get(0))
+                .map(Some)
+                .or_else(ignore_no_rows)?,
+        };
+        Ok(title.map(|b| String::from_utf8_lossy(&b).into_owned()))
+    }
+
     // --- asof-τ read API (browsing plan §2, the wayback contract) ---
     //
     // Title normalization here MUST match import's (`ensure_title` in

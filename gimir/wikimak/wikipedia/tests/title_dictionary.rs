@@ -139,6 +139,43 @@ fn exact_lookup_touches_exactly_one_shard() {
 }
 
 // ---------------------------------------------------------------------------
+// by_id_title_recovery_walks_no_shard
+//
+// The reverse lookup (`Instance::page_current_title`, the engine's
+// attach-by-id name recovery) is pure indexed sqlite — open interval →
+// title_id → title_id_to_page — and NEVER touches the strpool: zero
+// shard walks, where the pool-wide listing it replaced walked every
+// shard.
+// ---------------------------------------------------------------------------
+#[test]
+fn by_id_title_recovery_walks_no_shard() {
+    let tmp = TempDir::new().unwrap();
+    let inst = sharded_instance(&tmp);
+    import_titles(&inst, &fixture_titles(32));
+
+    let base = inst.title_scan_counts();
+    assert_eq!(
+        inst.page_current_title(7).expect("lookup").as_deref(),
+        Some("Topic Page 7"),
+        "by-id recovery names the current title"
+    );
+    assert_eq!(
+        inst.page_current_title(31).expect("lookup").as_deref(),
+        Some("Topic Page 31"),
+    );
+    assert_eq!(
+        inst.page_current_title(999).expect("lookup"),
+        None,
+        "unknown page is a quiet None"
+    );
+    assert_eq!(
+        inst.title_scan_counts(),
+        base,
+        "page-id → title walked ZERO strpool shards (indexed hops only)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // substring_search_touches_all_shards
 //
 // The pages listing / substring search is a parallel scan: one walk of
@@ -248,6 +285,11 @@ fn unmapped_rows_still_resolve_and_list() {
         all.last().map(|(id, t)| (*id, t.as_str())),
         Some((900, "Zz Synthetic Only")),
         "listing includes and byte-orders the unmapped row"
+    );
+    assert_eq!(
+        inst.page_current_title(900).unwrap().as_deref(),
+        Some("Zz Synthetic Only"),
+        "by-id recovery reaches an unmapped row via the compat branch"
     );
 }
 
@@ -383,6 +425,11 @@ fn retitle_in_place_rekeys_the_interval() {
         )
         .unwrap();
     assert_eq!(row_tid, dict_tid, "retitle UPDATE carried the new title_id");
+    assert_eq!(
+        inst.page_current_title(50).unwrap().as_deref(),
+        Some("New Name"),
+        "by-id recovery follows the retitled open interval"
+    );
 }
 
 // ---------------------------------------------------------------------------
