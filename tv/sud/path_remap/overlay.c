@@ -485,7 +485,11 @@ static int copy_resolved(char *out, size_t out_sz, const char *src)
     return SUD_OVERLAY_RESOLVED;
 }
 
-int sud_overlay_resolve(const char *path, int for_write,
+/* The resolver core: probes layers with the FULL virtual path. Correct
+ * only when the path's INTERMEDIATE components contain no symlinks that
+ * cross layers — see sud_overlay_resolve below, which expands those
+ * against the merged view first. */
+static int resolve_core(const char *path, int for_write,
                         char *out, size_t out_sz)
 {
     if (!g_rule_count) return SUD_OVERLAY_PASSTHROUGH;
@@ -591,6 +595,133 @@ int sud_overlay_resolve(const char *path, int for_write,
         return SUD_OVERLAY_RESOLVED;
     }
     return SUD_OVERLAY_PASSTHROUGH;
+}
+
+/* ----------------------------------------------------------------
+ *  Merged-view symlink expansion.
+ *
+ *  resolve_core hands the kernel a SINGLE layer's physical path, so
+ *  the kernel walks any intermediate symlink within that one layer.
+ *  A box build stages trees with relative symlinks (kernel
+ *  headers_install: link created in the box = UPPER; target =
+ *  pre-existing source = LOWER); such a chain exists in NO single
+ *  layer, every open through it ENOENTs, and the build fails with
+ *  "No such file" on headers it just staged. Real overlayfs resolves
+ *  symlinks against the MERGED tree; do the same here: walk the
+ *  virtual path's intermediate components, resolve each prefix via
+ *  resolve_core (prefixes already expanded => core is correct for
+ *  them), and when one is a symlink splice its target into the
+ *  virtual path and restart. The FINAL component is left alone —
+ *  trailing-symlink semantics belong to the caller (lstat/unlink...).
+ * ---------------------------------------------------------------- */
+
+/* Collapse "//", "/./" and "x/.." textually, in place. Safe here
+ * because it is only applied to prefixes proven symlink-free (the
+ * expansion loop) — where textual and physical parent agree. */
+static void collapse_dots(char *p)
+{
+    char *out = p;
+    const char *in = p;
+    while (*in) {
+        if (in[0] == '/') {
+            while (in[1] == '/') in++;                 /* "//" */
+            if (in[1] == '.' && (in[2] == '/' || in[2] == '\0')) {
+                in += 2;                               /* "/." */
+                continue;
+            }
+            if (in[1] == '.' && in[2] == '.'
+                && (in[3] == '/' || in[3] == '\0')) {   /* "/.." */
+                while (out > p && out[-1] != '/') out--;
+                if (out > p) out--;
+                in += 3;
+                continue;
+            }
+        }
+        *out++ = *in++;
+    }
+    if (out == p) *out++ = '/';
+    *out = '\0';
+}
+
+#define SUD_OVERLAY_LINK_BUDGET 40
+
+int sud_overlay_resolve(const char *path, int for_write,
+                        char *out, size_t out_sz)
+{
+    if (!g_rule_count) return SUD_OVERLAY_PASSTHROUGH;
+    if (!path || path[0] != '/') return SUD_OVERLAY_PASSTHROUGH;
+
+    char work[PATH_MAX];
+    size_t plen = strlen(path);
+    if (plen + 1 > sizeof(work))
+        return resolve_core(path, for_write, out, out_sz);
+    memcpy(work, path, plen + 1);
+
+    int budget = SUD_OVERLAY_LINK_BUDGET;
+restart:
+    {
+        /* Walk INTERMEDIATE components (never the final one). */
+        char *slash = work;             /* points at the '/' opening a component */
+        for (;;) {
+            char *next = strchr(slash + 1, '/');
+            if (!next) break;           /* slash+1.. is the FINAL component */
+            /* Prefix = work[0..next) */
+            char saved = *next;
+            *next = '\0';
+            char phys[PATH_MAX];
+            int rc = resolve_core(work, SUD_OVERLAY_FOR_READ,
+                                  phys, sizeof(phys));
+            *next = saved;
+            if (rc != SUD_OVERLAY_RESOLVED) break;  /* passthrough/whiteout:
+                                                       kernel semantics apply */
+            struct sud_overlay_stat st;
+            *next = '\0';
+            int have = (sud_ov_lstat(phys, &st) == 0);
+            *next = saved;
+            if (!have) break;           /* prefix absent: nothing to follow */
+            if ((st.st_mode & S_IFMT) != S_IFLNK) {
+                slash = next;
+                continue;
+            }
+            /* Symlink component: splice target + rest, restart. */
+            if (budget-- == 0) break;   /* give up; downstream ELOOPs */
+            char tgt[PATH_MAX];
+            ssize_t tl = raw_readlink(phys, tgt, sizeof(tgt) - 1);
+            if (tl <= 0) break;
+            tgt[tl] = '\0';
+            char merged[PATH_MAX * 2];
+            size_t off = 0;
+            if (tgt[0] == '/') {
+                /* absolute target replaces the whole prefix */
+            } else {
+                /* relative: dirname of the SYMLINK'S location */
+                size_t dl = (size_t)(slash - work);
+                if (dl >= sizeof(merged)) break;
+                memcpy(merged, work, dl);
+                off = dl;
+                merged[off++] = '/';
+            }
+            size_t tlen2 = strlen(tgt);
+            if (off + tlen2 + strlen(next) + 1 > sizeof(merged)) break;
+            memcpy(merged + off, tgt, tlen2);
+            off += tlen2;
+            {   /* rest incl. leading '/' (freestanding: no strcpy) */
+                size_t rl = strlen(next);
+                memcpy(merged + off, next, rl + 1);
+            }
+            if (strlen(merged) + 1 > sizeof(work)) break;
+            /* Textual collapse is safe: everything left of the splice
+             * point is symlink-free by construction. */
+            collapse_dots(merged);
+            {
+                size_t ml = strlen(merged);
+                if (ml + 1 > sizeof(work)) break;
+                memcpy(work, merged, ml + 1);
+            }
+            goto restart;
+        }
+    }
+    return resolve_core(work, for_write, out, out_sz);
 }
 
 /* ----------------------------------------------------------------
