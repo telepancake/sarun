@@ -142,6 +142,35 @@ pub fn hunks(id: i64, rel: &str) -> Value {
     json!({"is_text": true, "hunks": hunks})
 }
 
+/// Current content of one box path as the box sees it: the captured write
+/// when `rel` is in the change set, else the host file underneath. Feeds
+/// the UI's document reader ('V' on Changes); base64 because the socket
+/// protocol is JSON. Fails loudly ({ok:false, error}) for tombstones,
+/// symlinks, and paths that exist nowhere.
+pub fn file_bytes(id: i64, rel: &str) -> Value {
+    let rel = rel.trim_start_matches('/');
+    match current_mode(id, rel) {
+        Some(mode) if mode & S_IFMT == S_IFCHR => {
+            json!({"ok": false, "error": "deleted in box"})
+        }
+        Some(mode) if mode & S_IFMT == S_IFLNK => {
+            json!({"ok": false, "error": "symlink, not a document"})
+        }
+        Some(_) => match current_bytes(id, rel) {
+            Some(cur) => json!({"ok": true, "b64": b64(&cur)}),
+            None => json!({"ok": false, "error": "content unavailable"}),
+        },
+        None => {
+            let low = lower_bytes(rel);
+            if low.is_empty() && !Path::new("/").join(rel).is_file() {
+                json!({"ok": false, "error": "no such file"})
+            } else {
+                json!({"ok": true, "b64": b64(&low)})
+            }
+        }
+    }
+}
+
 /// st_mtime_ns stored for `rel` in the box's sqlar, or None.
 pub fn current_mtime(id: i64, rel: &str) -> Option<i64> {
     let conn = open_ro(id)?;

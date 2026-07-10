@@ -2866,6 +2866,12 @@ macro_rules! ui_verbs {
                             "diff": {"kind": "error", "error": "bad args"}}),
             }
         }
+        "review.file_bytes", "SID REL", "current bytes of one box path (captured write, else host), base64" => {
+            match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+                (Some(id), Some(rel)) => crate::review::file_bytes(id, rel),
+                _ => json!({"ok": false, "error": "bad args"}),
+            }
+        }
         "review.apply", "SID [PATHS]", "apply a box's changes to the host" => { match arg_sid(args) {
             // Audit H3: refuse a still-running box — its captured blobs may be
             // mid-write, so applying could stamp a torn blob onto the host.

@@ -292,6 +292,15 @@ enum Pane {
     /// derived state + next due time. 'r' force-runs the selected job,
     /// 'R' starts everything pending, Space pauses/resumes.
     Mirrors,
+    /// The document reader (engine/src/reader.rs): HTML / Markdown / plain
+    /// text rendered to styled lines with link follow, heading/anchor jumps
+    /// and search. Sources: a host path ('o' prompt), the selected change of
+    /// a box ('V' on Changes, bytes over the control socket), or a wiki
+    /// mirror page rendered from its wikimak store in-process ('V' on
+    /// Mirrors) — external URLs are show-only, the reader never dials out.
+    /// Left pane = the heading outline; right pane = the document; 'z' zooms
+    /// the SAME document widget to the whole body.
+    Reader,
     /// Variable provenance: every makefile-level assignment (name, loc,
     /// value, make dir) plus shell assignments from box shells, recorded in
     /// the box's makevar table. '/' sets the name/value query; the right
@@ -400,6 +409,9 @@ enum Modal {
     /// open time (the action refuses to open this modal if the CA is missing),
     /// so it's a plain String, never a silent None.
     BrowserUrl { buf: String, spki: String },
+    /// Reader path entry: the host file (html/md/txt by extension) to open
+    /// in the document reader. Enter opens; Esc cancels.
+    ReaderOpen { buf: String },
     /// Standalone image viewer popover (DESIGN-web.md W8). `title` is the
     /// caption (source · dimensions · format); `note` is a fallback message
     /// shown in the box body when there's no image to blit (no sixel support,
@@ -857,6 +869,15 @@ struct App {
     sel_mirror: usize,
     mirror_jobs: Vec<crate::mirrors::Job>,
     mirrors_loaded_at: Option<std::time::Instant>,
+    /// Document reader pane (engine/src/reader.rs): the open document with
+    /// its scroll / link-focus / search / history state, or None for the
+    /// empty-state hint. RefCell because render() re-renders the doc when
+    /// the viewport width changes but draw() only holds &App — the same
+    /// interior-mutability convention as the scroll Cells above.
+    reader: std::cell::RefCell<Option<crate::reader::Reader>>,
+    /// 'z' in the reader: draw the document over the whole body (the same
+    /// widget, a bigger Rect) instead of the outline+document split.
+    reader_full: bool,
     hunk_scroll: u16,
     out_scroll: u16,
     focus: Pane,
@@ -1143,6 +1164,8 @@ impl App {
             sel_mirror: 0,
             mirror_jobs: vec![],
             mirrors_loaded_at: None,
+            reader: std::cell::RefCell::new(None),
+            reader_full: false,
             hunk_scroll: 0,
             out_scroll: 0,
             focus: Pane::Sessions,
@@ -3349,6 +3372,95 @@ impl App {
         self.load_mirrors();
     }
 
+    // ── document reader ──
+
+    /// Mount a freshly opened document in the reader pane and focus it.
+    fn reader_mount(&mut self, r: crate::reader::Reader) {
+        let label = r.source_label();
+        self.reader.replace(Some(r));
+        if self.focus != Pane::Reader {
+            self.push_history();
+            self.snap_left();
+            self.focus = Pane::Reader;
+        }
+        self.status = format!(
+            "reading {label} · Tab/Enter links · n/p headings · / search · z zoom · Esc back");
+    }
+
+    /// Enter on the ReaderOpen prompt: open a host path in the reader.
+    /// Failure is LOUD on the status line and nothing is mounted.
+    fn reader_open_spec(&mut self, spec: &str) {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            self.status = "reader: no path given".into();
+            return;
+        }
+        match crate::reader::Reader::open_file(std::path::PathBuf::from(spec)) {
+            Ok(r) => self.reader_mount(r),
+            Err(e) => self.status = e.to_string(),
+        }
+    }
+
+    /// 'V' on Mirrors: read the selected WIKI mirror in the document reader —
+    /// pages render from the wikimak store in-process (no serve, no browser
+    /// box, no network); internal links follow inside the reader.
+    fn mirror_read_selected(&mut self) {
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
+            self.status = "no mirror job selected".into();
+            return;
+        };
+        if job.kind != "wiki" {
+            self.status = format!(
+                "mirror #{}: the reader is for wiki mirrors (this is {})",
+                job.id, job.kind);
+            return;
+        }
+        match crate::reader::Reader::open_wiki(
+            std::path::PathBuf::from(&job.dest), None)
+        {
+            Ok(r) => self.reader_mount(r),
+            Err(e) => self.status = format!("mirror #{}: {e}", job.id),
+        }
+    }
+
+    /// 'V' on Changes: open the selected change's CURRENT bytes in the
+    /// reader (html/md dispatch on the file name, plain text otherwise).
+    /// Bytes come over the control socket (`review.file_bytes`) — the UI
+    /// process never reads the box store directly.
+    fn change_read_selected(&mut self) {
+        let (Some(sid), Some(rel)) = (self.cur_sid(), self.cur_change_path()) else {
+            self.status = "no change selected".into();
+            return;
+        };
+        let raw = match rpc(&self.sock, "review.file_bytes", json!([sid, rel])) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                match v.get("b64").and_then(Value::as_str).map(|b| {
+                    base64::engine::general_purpose::STANDARD.decode(b)
+                }) {
+                    Some(Ok(bytes)) => bytes,
+                    _ => {
+                        self.status = format!("read {rel}: bad payload");
+                        return;
+                    }
+                }
+            }
+            Ok(v) => {
+                self.status = format!(
+                    "read {rel}: {}",
+                    v.get("error").and_then(Value::as_str).unwrap_or("failed"));
+                return;
+            }
+            Err(e) => {
+                self.status = format!("read {rel}: {e}");
+                return;
+            }
+        };
+        match crate::reader::Reader::open_bytes(format!("box:{sid}:/{rel}"), raw) {
+            Ok(r) => self.reader_mount(r),
+            Err(e) => self.status = e.to_string(),
+        }
+    }
+
     // ── navigation ── (driven by the interactive loop; not by headless tests)
 
     #[cfg_attr(test, allow(dead_code))]
@@ -3369,6 +3481,8 @@ impl App {
             return;
         }
         match self.focus {
+            // Reader: its own keymap consumed j/k before dispatch got here.
+            Pane::Reader => {}
             Pane::Sessions => {
                 if self.sel_session + 1 < self.sessions.len() {
                     self.nav_from = self.session_id_at(self.sel_session)
@@ -3465,6 +3579,7 @@ impl App {
             return;
         }
         match self.focus {
+            Pane::Reader => {}
             Pane::Sessions => {
                 if self.sel_session > 0 {
                     self.nav_from = self.session_id_at(self.sel_session)
@@ -3559,6 +3674,7 @@ impl App {
             return;
         }
         match self.focus {
+            Pane::Reader => {}
             Pane::Sessions => {
                 let total = self.sessions.len();
                 if total == 0 { return; }
@@ -3707,6 +3823,7 @@ impl App {
     /// plus the window start for the engine-windowed views).
     fn current_cursor_global(&self) -> usize {
         match self.focus {
+            Pane::Reader => 0,
             Pane::Sessions => self.sel_session,
             Pane::Changes | Pane::Hunks => self.changes_window_start + self.sel_change,
             Pane::Processes => self.processes_window_start + self.sel_proc,
@@ -3879,6 +3996,14 @@ impl App {
             }
             Pane::Inspect   => { self.focus = Pane::Inspect; self.ins_init(); }
             Pane::Mirrors   => { self.focus = Pane::Mirrors; self.load_mirrors(); }
+            Pane::Reader    => {
+                self.focus = Pane::Reader;
+                // Nothing open yet: land straight in the path prompt so the
+                // chip is useful on first visit.
+                if self.reader.borrow().is_none() {
+                    self.modal = Some(Modal::ReaderOpen { buf: String::new() });
+                }
+            }
             other           => { self.focus = other; }
         }
     }
@@ -3921,6 +4046,8 @@ impl App {
     /// Enter: open the selected row into the next pane.
     fn open(&mut self) {
         match self.focus {
+            // Reader: Enter = follow link, consumed by its own keymap.
+            Pane::Reader => {}
             Pane::Sessions => {
                 self.push_history();
                 self.load_changes();
@@ -4957,6 +5084,7 @@ impl App {
             app.goto_view_pos(v, if end { total - 1 } else { 0 });
         };
         match self.focus {
+            Pane::Reader => {}
             Pane::Sessions => {
                 if self.sessions.is_empty() { return; }
                 let new = if end { self.sessions.len() - 1 } else { 0 };
@@ -7217,6 +7345,16 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from("Enter open · Esc cancel"),
             ])
         }
+        Modal::ReaderOpen { buf } => {
+            (" open in reader ",
+             vec![
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from("host path of an .html / .md / text file — rendered \
+                            in the document reader (links, headings, search)"),
+                Line::from("Enter open · Esc cancel"),
+            ])
+        }
         Modal::ActionMenu { title, items, sel } => {
             let mut body = vec![
                 Line::from(Span::styled(title.clone(),
@@ -7587,6 +7725,7 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
         Pane::BuildEdges => Some(('g', "build",  FilterView::BuildEdges)),
         Pane::Rules     => Some(('e', "rules",   FilterView::Changes /* unused */)),
         Pane::Mirrors   => Some(('M', "mirrors", FilterView::Changes /* unused */)),
+        Pane::Reader    => Some(('u', "reader",  FilterView::Changes /* unused */)),
         Pane::Flows | Pane::Packets
                         => Some(('f', "flows",   FilterView::Changes /* unused */)),
         Pane::Help      => Some(('?', "help",    FilterView::Changes /* unused */)),
@@ -7617,6 +7756,7 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
     ('f', Pane::Flows,      "Flows",   PaneVis::Always,            "network flows — tshark-decoded HTTP/TLS from a -n box's pcap"),
     ('e', Pane::Rules,      "Rules",   PaneVis::Always,            "file rules — the ordered apply/discard/passthrough rules"),
     ('M', Pane::Mirrors,    "Mirrors", PaneVis::Always,            "scheduled mirror updates — r run selected, R run pending, space pause/resume, D delete"),
+    ('u', Pane::Reader,     "Read",    PaneVis::Always,            "docUment reader — html/md/text files + wiki mirror pages; o open, z fullscreen"),
     ('P', Pane::Pty,        "PTYs",    PaneVis::Pty,               "open an engine-held PTY — a live interactive shell pane"),
     ('i', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
     ('w', Pane::Network,    "Web",     PaneVis::Always,            "web captures — tap MITM HTTP(S) content archive (headers + body)"),
@@ -7707,6 +7847,7 @@ enum PaneAction {
     ConfirmKill, ConfirmDissolve, ConfirmMirrorRemove,
     NewRule, DeleteRule, StartRename,
     MirrorRun, MirrorRunPending, MirrorTogglePause, MirrorBrowse,
+    MirrorRead, ChangeRead,
     ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
     ToggleEdgeRunning,
     ToggleMark, RangeMark,
@@ -7754,6 +7895,8 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('r'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRun,     Some("force-run selected mirror job (on Mirrors)")),
     (Key::Char('R'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRunPending, Some("run all pending mirror jobs (on Mirrors)")),
     (Key::Char('b'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorBrowse,  Some("browse wiki mirror in the browser (on Mirrors)")),
+    (Key::Char('V'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRead,    Some("read the wiki mirror in the document reader (on Mirrors)")),
+    (Key::Char('V'), PaneGate::On(Pane::Changes), PaneAction::ChangeRead,    Some("open the selected change in the document reader (on Changes)")),
     (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
     (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
     (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
@@ -7818,6 +7961,8 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::MirrorRun => app.mirror_run_selected(),
         PaneAction::MirrorRunPending => app.mirror_run_pending(),
         PaneAction::MirrorBrowse => app.mirror_browse_selected(),
+        PaneAction::MirrorRead => app.mirror_read_selected(),
+        PaneAction::ChangeRead => app.change_read_selected(),
         PaneAction::MirrorTogglePause => app.mirror_toggle_pause(),
         PaneAction::StartRename => app.renaming = Some(String::new()),
         PaneAction::ToggleFilter => app.toggle_filter(),
@@ -7833,6 +7978,54 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
             } else {
                 app.status = "no actions for this row yet".into();
             }
+        }
+    }
+}
+
+/// The reader pane's empty-state text (right pane and 'z' zoom alike).
+const READER_EMPTY_HINT: &str =
+    "no document open — 'o' opens a host path (.html/.md/text); \
+     'V' on Mirrors reads a wiki mirror page; \
+     'V' on Changes reads the selected box file";
+
+/// Reader-pane keys (outside any modal; the F-keys were consumed earlier).
+/// Returns true when the key was consumed — false falls through to the pane
+/// accelerators / action table like any other pane. A standalone fn (not a
+/// main-loop block) so the headless tests can drive it.
+fn handle_reader_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
+    use crate::reader::KeyResult;
+    use crossterm::event::KeyCode;
+    let res = {
+        let mut rd = app.reader.borrow_mut();
+        match rd.as_mut() {
+            Some(r) => r.handle_key(code),
+            // Empty pane: only the open prompt and leaving make sense.
+            None => match code {
+                KeyCode::Char('o') => KeyResult::OpenPrompt,
+                KeyCode::Esc => KeyResult::Close,
+                _ => KeyResult::NotHandled,
+            },
+        }
+    };
+    match res {
+        KeyResult::Consumed => true,
+        KeyResult::NotHandled => false,
+        KeyResult::ToggleFull => {
+            app.reader_full = !app.reader_full;
+            true
+        }
+        KeyResult::OpenPrompt => {
+            app.modal = Some(Modal::ReaderOpen { buf: String::new() });
+            true
+        }
+        KeyResult::Close => {
+            // Esc unwinds one layer at a time: zoom first, then the pane.
+            if app.reader_full {
+                app.reader_full = false;
+            } else {
+                app.go_back();
+            }
+            true
         }
     }
 }
@@ -10053,6 +10246,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     } else if app.focus == Pane::Inspect {
         // The object inspector takes the whole body (its own screen).
         draw_inspector(f, app, body);
+    } else if app.focus == Pane::Reader && app.reader_full {
+        // 'z' zoom: the SAME reader widget the right pane renders, over the
+        // whole body (the outline column drops away).
+        match app.reader.borrow_mut().as_mut() {
+            Some(r) => r.render(f, body, true),
+            None => f.render_widget(
+                Paragraph::new(Span::styled(READER_EMPTY_HINT,
+                    Style::default().add_modifier(Modifier::DIM))),
+                body),
+        }
     } else {
         // Single-list-per-view layout (mirrors the prototype's _set_view /
         // LEFT/RIGHT scheme): the left half is the FOCUSED view's primary
@@ -10240,6 +10443,29 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
                 if !skip_right { f.render_widget(detail, right); }
+            }
+            Pane::Reader => {
+                let mut rd = app.reader.borrow_mut();
+                match rd.as_mut() {
+                    Some(r) => {
+                        // Left: the heading outline (position-highlighted);
+                        // right: the document — the same widget 'z' zooms.
+                        let p = Paragraph::new(Text::from(r.outline_lines()))
+                            .block(block(title("READER · outline", false), false));
+                        f.render_widget(p, left);
+                        if !skip_right { r.render(f, right, true); }
+                    }
+                    None => {
+                        let p = Paragraph::new(Span::styled("(no document)",
+                                Style::default().add_modifier(Modifier::DIM)))
+                            .block(block(title("READER · outline", lf), lf));
+                        f.render_widget(p, left);
+                        let detail = Paragraph::new(READER_EMPTY_HINT)
+                            .block(block(title("DOCUMENT", rf), rf))
+                            .wrap(Wrap { trim: false });
+                        if !skip_right { f.render_widget(detail, right); }
+                    }
+                }
             }
             Pane::Flows => {
                 let lines = flows_lines(app);
@@ -12829,6 +13055,19 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::BrowserUrl { buf, spki }),
         },
+        Modal::ReaderOpen { mut buf } => match code {
+            KeyCode::Enter => app.reader_open_spec(&buf),
+            KeyCode::Esc => app.status = "reader open cancelled".into(),
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::ReaderOpen { buf });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::ReaderOpen { buf });
+            }
+            _ => app.modal = Some(Modal::ReaderOpen { buf }),
+        },
         Modal::ActionMenu { title, items, mut sel } => match code {
             KeyCode::Esc => app.status = "menu cancelled".into(),
             KeyCode::Up => {
@@ -13673,10 +13912,17 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             app.should_quit = true;
                         }
                         KeyCode::Char(c @ ('N'|'b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'
-                                           |'?'|'P'|'i'|'w'|'v'|'s'|'M')) =>
+                                           |'?'|'P'|'i'|'w'|'v'|'s'|'M'|'u')) =>
                             dispatch_menubar_key(&mut app, c),
                         _ => {}
                     }
+                    continue;
+                }
+                // Reader pane: the document's own keymap (scroll, links,
+                // headings, search, zoom) consumes first; anything it does
+                // not know falls through to the accelerators / action table
+                // below, so pane switching and 'q' still work.
+                if app.focus == Pane::Reader && handle_reader_key(&mut app, k.code) {
                     continue;
                 }
                 // Banner-prompt keys take priority over EVERYTHING (so y/n/a/d
@@ -13735,7 +13981,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // Letter accelerators: route through the same
                     // dispatch_menubar_key the F9 menu-nav path uses,
                     // so the two paths can't diverge.
-                    KeyCode::Char(c @ ('N'|'b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'w'|'v'|'s'|'M')) =>
+                    KeyCode::Char(c @ ('N'|'b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'w'|'v'|'s'|'M'|'u')) =>
                         dispatch_menubar_key(&mut app, c),
                     // Esc / Backspace from the packet drill-down pops back
                     // to the flows list, keeping its cursor + detail state.
@@ -16826,5 +17072,78 @@ mod tests {
         for (w, h) in [(1u16, 1u16), (10, 5), (19, 24), (80, 24)] {
             render_to_string(&app, w, h).unwrap();
         }
+    }
+
+    /// The Reader pane: a mounted document renders in the two-pane split
+    /// (outline left, document right), and 'z' zooms the SAME widget over
+    /// the whole body (the outline drops away); Esc unwinds the zoom first.
+    #[test]
+    fn reader_pane_renders_document_outline_and_zoom() {
+        use crossterm::event::KeyCode;
+        let mut app = headless_app();
+        let r = crate::reader::Reader::open_bytes(
+            "guide.md".into(),
+            b"# Alpha Heading\n\nbody text with [a link](x.md)\n\n\
+              ## Beta Section\n\nmore\n".to_vec()).unwrap();
+        app.reader.replace(Some(r));
+        app.focus = Pane::Reader;
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("READER · outline"), "outline column:\n{buf}");
+        assert!(buf.contains("Alpha Heading"), "outline lists headings:\n{buf}");
+        assert!(buf.contains("Beta Section"));
+        assert!(buf.contains("body text"), "document body renders:\n{buf}");
+        assert!(buf.contains("guide.md"), "document title renders:\n{buf}");
+        assert!(handle_reader_key(&mut app, KeyCode::Char('z')));
+        assert!(app.reader_full, "'z' zooms");
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(!buf.contains("READER · outline"), "zoom drops the outline:\n{buf}");
+        assert!(buf.contains("body text"), "zoomed document renders:\n{buf}");
+        assert!(handle_reader_key(&mut app, KeyCode::Esc));
+        assert!(!app.reader_full, "Esc unwinds the zoom first");
+        // j (scroll) is consumed by the reader, so it never moves a list
+        // cursor; an unbound key falls through for the accelerators.
+        assert!(handle_reader_key(&mut app, KeyCode::Char('j')));
+        assert!(!handle_reader_key(&mut app, KeyCode::Char('c')),
+                "letter chips fall through to pane switching");
+    }
+
+    /// Reader empty state: the chip lands in the path prompt, the pane shows
+    /// the hint, and a bad path is a LOUD status — nothing mounts.
+    #[test]
+    fn reader_pane_empty_state_and_open_prompt() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = headless_app();
+        app.go_to_pane(Pane::Reader);
+        assert!(matches!(app.modal, Some(Modal::ReaderOpen { .. })),
+                "first visit opens the path prompt");
+        app.modal = None;
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("no document open"), "empty-state hint:\n{buf}");
+        assert!(handle_reader_key(&mut app, KeyCode::Char('o')),
+                "'o' reopens the prompt");
+        assert!(matches!(app.modal, Some(Modal::ReaderOpen { .. })));
+        // Type a bad path into the modal and confirm: loud error, no mount.
+        for c in "/no/such/file.md".chars() {
+            handle_modal_key(&mut app, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(app.modal.is_none());
+        assert!(app.reader.borrow().is_none(), "bad path must not mount");
+        assert!(app.status.contains("/no/such/file.md"), "{}", app.status);
+    }
+
+    /// The prompt spec path end to end on a real host file: the reader
+    /// mounts, focus moves to the pane, and the content renders.
+    #[test]
+    fn reader_opens_host_file_via_prompt_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("notes.md");
+        std::fs::write(&p, "# Notes\n\nhello reader\n").unwrap();
+        let mut app = headless_app();
+        app.reader_open_spec(p.to_str().unwrap());
+        assert!(app.focus == Pane::Reader, "mount focuses the reader: {}", app.status);
+        assert!(app.status.contains("reading"), "{}", app.status);
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("hello reader"), "document renders:\n{buf}");
     }
 }
