@@ -198,7 +198,8 @@ fn hash_of(text: &str) -> u64 {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Target {
     Host(PathBuf),
-    Box { sid: i64, rel: String },
+    /// `sid` as the control socket carries it (the UI's cur_sid string).
+    Box { sid: String, rel: String },
 }
 
 impl Target {
@@ -310,7 +311,7 @@ impl EditorPane {
 
     /// Open a BOX file's current bytes (fetched by the UI over
     /// `review.file_bytes`). Saves go back over `review.write_file`.
-    pub fn open_box(sid: i64, rel: String, bytes: Vec<u8>) -> anyhow::Result<Self> {
+    pub fn open_box(sid: String, rel: String, bytes: Vec<u8>) -> anyhow::Result<Self> {
         Self::from_bytes(Target::Box { sid, rel }, bytes, false)
     }
 
@@ -523,7 +524,7 @@ mod tests {
 
     fn pane_of(name: &str, text: &str) -> EditorPane {
         EditorPane::from_bytes(
-            Target::Box { sid: 1, rel: name.into() },
+            Target::Box { sid: "1".into(), rel: name.into() },
             text.as_bytes().to_vec(),
             false,
         )

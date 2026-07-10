@@ -301,6 +301,16 @@ enum Pane {
     /// Left pane = the heading outline; right pane = the document; 'z' zooms
     /// the SAME document widget to the whole body.
     Reader,
+    /// The text editor (engine/src/editor.rs): edtui vim-modal editing with
+    /// syntastica (tree-sitter) syntax highlighting, windowed span injection
+    /// and a 250ms-debounced re-highlight. Sources: a host path ('o' / the
+    /// chip prompt, direct I/O) or the selected change of a box ('E' on
+    /// Changes — bytes in over `review.file_bytes`, saves back over
+    /// `review.write_file` into the box's CAPTURED layer, never the host).
+    /// Left pane = the buffer info card; right pane = the editor; 'z' zooms
+    /// the SAME editor widget to the whole body; Esc (normal mode) unwinds
+    /// zoom first, then the pane.
+    Editor,
     /// Variable provenance: every makefile-level assignment (name, loc,
     /// value, make dir) plus shell assignments from box shells, recorded in
     /// the box's makevar table. '/' sets the name/value query; the right
@@ -412,6 +422,9 @@ enum Modal {
     /// Reader path entry: the host file (html/md/txt by extension) to open
     /// in the document reader. Enter opens; Esc cancels.
     ReaderOpen { buf: String },
+    /// Editor path entry: the host file to open in the text editor.
+    /// Enter opens; Esc cancels.
+    EditorOpen { buf: String },
     /// Standalone image viewer popover (DESIGN-web.md W8). `title` is the
     /// caption (source · dimensions · format); `note` is a fallback message
     /// shown in the box body when there's no image to blit (no sixel support,
@@ -878,6 +891,13 @@ struct App {
     /// 'z' in the reader: draw the document over the whole body (the same
     /// widget, a bigger Rect) instead of the outline+document split.
     reader_full: bool,
+    /// Text editor pane (engine/src/editor.rs): the open buffer with its
+    /// edtui state / highlight cache / dirty flag, or None for the
+    /// empty-state hint. RefCell for the same draw-holds-&App reason as
+    /// `reader`.
+    editor: std::cell::RefCell<Option<crate::editor::EditorPane>>,
+    /// 'z' in the editor: the same widget over the whole body.
+    editor_full: bool,
     hunk_scroll: u16,
     out_scroll: u16,
     focus: Pane,
@@ -1166,6 +1186,8 @@ impl App {
             mirrors_loaded_at: None,
             reader: std::cell::RefCell::new(None),
             reader_full: false,
+            editor: std::cell::RefCell::new(None),
+            editor_full: false,
             hunk_scroll: 0,
             out_scroll: 0,
             focus: Pane::Sessions,
@@ -3461,6 +3483,116 @@ impl App {
         }
     }
 
+    // ── text editor ──
+
+    /// Mount a freshly opened buffer in the editor pane and focus it. A
+    /// DIRTY open buffer refuses to be replaced — Ctrl-S first (silently
+    /// dropping unsaved edits is the one thing an editor must never do).
+    fn editor_mount(&mut self, e: crate::editor::EditorPane) {
+        if self.editor.borrow().as_ref().map(|c| c.dirty).unwrap_or(false) {
+            self.status =
+                "editor has UNSAVED changes — Ctrl-S to save them before opening another file"
+                    .into();
+            return;
+        }
+        let label = e.target.label();
+        self.editor.replace(Some(e));
+        if self.focus != Pane::Editor {
+            self.push_history();
+            self.snap_left();
+            self.focus = Pane::Editor;
+        }
+        self.status = format!(
+            "editing {label} · vim keys · Ctrl-S save · Ctrl-E lock · z zoom · Esc back");
+    }
+
+    /// Enter on the EditorOpen prompt: open a host path in the editor.
+    /// Failure is LOUD on the status line and nothing is mounted.
+    fn editor_open_spec(&mut self, spec: &str) {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            self.status = "editor: no path given".into();
+            return;
+        }
+        match crate::editor::EditorPane::open_host(std::path::PathBuf::from(spec)) {
+            Ok(e) => self.editor_mount(e),
+            Err(e) => self.status = e.to_string(),
+        }
+    }
+
+    /// 'E' on Changes: open the selected change's CURRENT bytes in the
+    /// editor. Bytes come over the control socket (`review.file_bytes`,
+    /// the reader's feed); saves go back over `review.write_file` into the
+    /// box's captured layer — the UI process never opens the box store.
+    fn change_edit_selected(&mut self) {
+        let (Some(sid), Some(rel)) = (self.cur_sid(), self.cur_change_path()) else {
+            self.status = "no change selected".into();
+            return;
+        };
+        let raw = match rpc(&self.sock, "review.file_bytes", json!([sid, rel])) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                match v.get("b64").and_then(Value::as_str).map(|b| {
+                    base64::engine::general_purpose::STANDARD.decode(b)
+                }) {
+                    Some(Ok(bytes)) => bytes,
+                    _ => {
+                        self.status = format!("edit {rel}: bad payload");
+                        return;
+                    }
+                }
+            }
+            Ok(v) => {
+                self.status = format!(
+                    "edit {rel}: {}",
+                    v.get("error").and_then(Value::as_str).unwrap_or("failed"));
+                return;
+            }
+            Err(e) => {
+                self.status = format!("edit {rel}: {e}");
+                return;
+            }
+        };
+        match crate::editor::EditorPane::open_box(sid, rel, raw) {
+            Ok(e) => self.editor_mount(e),
+            Err(e) => self.status = e.to_string(),
+        }
+    }
+
+    /// Ctrl-S in the editor: persist `save_bytes()` to the buffer's target —
+    /// direct I/O for a host file, `review.write_file` for a box file (the
+    /// captured layer; the host is untouched). Success marks the buffer
+    /// clean; failure is LOUD and the buffer stays dirty.
+    fn editor_save(&mut self) {
+        let Some((target, bytes)) = self.editor.borrow().as_ref().map(|e| {
+            (e.target.clone(), e.save_bytes())
+        }) else {
+            return;
+        };
+        let res: Result<(), String> = match &target {
+            crate::editor::Target::Host(p) => {
+                std::fs::write(p, &bytes).map_err(|e| e.to_string())
+            }
+            crate::editor::Target::Box { sid, rel } => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                match rpc(&self.sock, "review.write_file", json!([sid, rel, b64])) {
+                    Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => Ok(()),
+                    Ok(v) => Err(v.get("error").and_then(Value::as_str)
+                                 .unwrap_or("failed").to_string()),
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        match res {
+            Ok(()) => {
+                if let Some(e) = self.editor.borrow_mut().as_mut() {
+                    e.mark_saved();
+                }
+                self.status = format!("saved {} ({} bytes)", target.label(), bytes.len());
+            }
+            Err(e) => self.status = format!("save {}: {e}", target.label()),
+        }
+    }
+
     // ── navigation ── (driven by the interactive loop; not by headless tests)
 
     #[cfg_attr(test, allow(dead_code))]
@@ -3481,8 +3613,9 @@ impl App {
             return;
         }
         match self.focus {
-            // Reader: its own keymap consumed j/k before dispatch got here.
-            Pane::Reader => {}
+            // Reader/Editor: their own keymaps consumed j/k before dispatch
+            // got here.
+            Pane::Reader | Pane::Editor => {}
             Pane::Sessions => {
                 if self.sel_session + 1 < self.sessions.len() {
                     self.nav_from = self.session_id_at(self.sel_session)
@@ -3579,7 +3712,7 @@ impl App {
             return;
         }
         match self.focus {
-            Pane::Reader => {}
+            Pane::Reader | Pane::Editor => {}
             Pane::Sessions => {
                 if self.sel_session > 0 {
                     self.nav_from = self.session_id_at(self.sel_session)
@@ -3674,7 +3807,7 @@ impl App {
             return;
         }
         match self.focus {
-            Pane::Reader => {}
+            Pane::Reader | Pane::Editor => {}
             Pane::Sessions => {
                 let total = self.sessions.len();
                 if total == 0 { return; }
@@ -3823,7 +3956,7 @@ impl App {
     /// plus the window start for the engine-windowed views).
     fn current_cursor_global(&self) -> usize {
         match self.focus {
-            Pane::Reader => 0,
+            Pane::Reader | Pane::Editor => 0,
             Pane::Sessions => self.sel_session,
             Pane::Changes | Pane::Hunks => self.changes_window_start + self.sel_change,
             Pane::Processes => self.processes_window_start + self.sel_proc,
@@ -4004,6 +4137,13 @@ impl App {
                     self.modal = Some(Modal::ReaderOpen { buf: String::new() });
                 }
             }
+            Pane::Editor    => {
+                self.focus = Pane::Editor;
+                // Same first-visit prompt convention as the reader.
+                if self.editor.borrow().is_none() {
+                    self.modal = Some(Modal::EditorOpen { buf: String::new() });
+                }
+            }
             other           => { self.focus = other; }
         }
     }
@@ -4046,8 +4186,9 @@ impl App {
     /// Enter: open the selected row into the next pane.
     fn open(&mut self) {
         match self.focus {
-            // Reader: Enter = follow link, consumed by its own keymap.
-            Pane::Reader => {}
+            // Reader: Enter = follow link; Editor: Enter = newline/motion —
+            // both consumed by their own keymaps.
+            Pane::Reader | Pane::Editor => {}
             Pane::Sessions => {
                 self.push_history();
                 self.load_changes();
@@ -5084,7 +5225,7 @@ impl App {
             app.goto_view_pos(v, if end { total - 1 } else { 0 });
         };
         match self.focus {
-            Pane::Reader => {}
+            Pane::Reader | Pane::Editor => {}
             Pane::Sessions => {
                 if self.sessions.is_empty() { return; }
                 let new = if end { self.sessions.len() - 1 } else { 0 };
@@ -7355,6 +7496,16 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from("Enter open · Esc cancel"),
             ])
         }
+        Modal::EditorOpen { buf } => {
+            (" open in editor ",
+             vec![
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from("host path of a text file — vim-modal editing with \
+                            syntax highlighting (rs/py/c/js/sh/json/yaml/md)"),
+                Line::from("Enter open · Esc cancel"),
+            ])
+        }
         Modal::ActionMenu { title, items, sel } => {
             let mut body = vec![
                 Line::from(Span::styled(title.clone(),
@@ -7726,6 +7877,7 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
         Pane::Rules     => Some(('e', "rules",   FilterView::Changes /* unused */)),
         Pane::Mirrors   => Some(('M', "mirrors", FilterView::Changes /* unused */)),
         Pane::Reader    => Some(('u', "reader",  FilterView::Changes /* unused */)),
+        Pane::Editor    => Some(('W', "editor",  FilterView::Changes /* unused */)),
         Pane::Flows | Pane::Packets
                         => Some(('f', "flows",   FilterView::Changes /* unused */)),
         Pane::Help      => Some(('?', "help",    FilterView::Changes /* unused */)),
@@ -7757,6 +7909,7 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
     ('e', Pane::Rules,      "Rules",   PaneVis::Always,            "file rules — the ordered apply/discard/passthrough rules"),
     ('M', Pane::Mirrors,    "Mirrors", PaneVis::Always,            "scheduled mirror updates — r run selected, R run pending, space pause/resume, D delete"),
     ('u', Pane::Reader,     "Read",    PaneVis::Always,            "docUment reader — html/md/text files + wiki mirror pages; o open, z fullscreen"),
+    ('W', Pane::Editor,     "Edit",    PaneVis::Always,            "text editor (W = Write) — syntax-highlighted vim-modal editing of host + box files; Ctrl-S save, z fullscreen"),
     ('P', Pane::Pty,        "PTYs",    PaneVis::Pty,               "open an engine-held PTY — a live interactive shell pane"),
     ('i', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
     ('w', Pane::Network,    "Web",     PaneVis::Always,            "web captures — tap MITM HTTP(S) content archive (headers + body)"),
@@ -7847,7 +8000,7 @@ enum PaneAction {
     ConfirmKill, ConfirmDissolve, ConfirmMirrorRemove,
     NewRule, DeleteRule, StartRename,
     MirrorRun, MirrorRunPending, MirrorTogglePause, MirrorBrowse,
-    MirrorRead, ChangeRead,
+    MirrorRead, ChangeRead, ChangeEdit,
     ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
     ToggleEdgeRunning,
     ToggleMark, RangeMark,
@@ -7897,6 +8050,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Char('b'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorBrowse,  Some("browse wiki mirror in the browser (on Mirrors)")),
     (Key::Char('V'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRead,    Some("read the wiki mirror in the document reader (on Mirrors)")),
     (Key::Char('V'), PaneGate::On(Pane::Changes), PaneAction::ChangeRead,    Some("open the selected change in the document reader (on Changes)")),
+    (Key::Char('E'), PaneGate::On(Pane::Changes), PaneAction::ChangeEdit,    Some("edit the selected change in the text editor (on Changes)")),
     (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
     (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
     (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
@@ -7963,6 +8117,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::MirrorBrowse => app.mirror_browse_selected(),
         PaneAction::MirrorRead => app.mirror_read_selected(),
         PaneAction::ChangeRead => app.change_read_selected(),
+        PaneAction::ChangeEdit => app.change_edit_selected(),
         PaneAction::MirrorTogglePause => app.mirror_toggle_pause(),
         PaneAction::StartRename => app.renaming = Some(String::new()),
         PaneAction::ToggleFilter => app.toggle_filter(),
@@ -8022,6 +8177,60 @@ fn handle_reader_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
             // Esc unwinds one layer at a time: zoom first, then the pane.
             if app.reader_full {
                 app.reader_full = false;
+            } else {
+                app.go_back();
+            }
+            true
+        }
+    }
+}
+
+/// The editor pane's empty-state text (right pane and 'z' zoom alike).
+const EDITOR_EMPTY_HINT: &str =
+    "no file open — 'o' opens a host path in the editor; \
+     'E' on Changes edits the selected box file (Ctrl-S saves into the \
+     box's captured layer, never the host)";
+
+/// Editor-pane keys (outside any modal; the F-keys were consumed earlier).
+/// An OPEN buffer consumes EVERYTHING (normal-mode letters are vim
+/// motions/operators — pane accelerators intentionally don't fire from
+/// inside it; leave with Esc or F9). The empty state falls through like any
+/// other pane. A standalone fn so the headless tests can drive it.
+fn handle_editor_key(app: &mut App, code: crossterm::event::KeyCode,
+                     mods: crossterm::event::KeyModifiers) -> bool {
+    use crate::editor::KeyResult;
+    use crossterm::event::KeyCode;
+    let res = {
+        let mut ed = app.editor.borrow_mut();
+        match ed.as_mut() {
+            Some(e) => e.handle_key(code, mods),
+            // Empty pane: only the open prompt and leaving make sense.
+            None => match code {
+                KeyCode::Char('o') => KeyResult::OpenPrompt,
+                KeyCode::Esc => KeyResult::Close,
+                _ => KeyResult::NotHandled,
+            },
+        }
+    };
+    match res {
+        KeyResult::Consumed => true,
+        KeyResult::NotHandled => false,
+        KeyResult::ToggleFull => {
+            app.editor_full = !app.editor_full;
+            true
+        }
+        KeyResult::OpenPrompt => {
+            app.modal = Some(Modal::EditorOpen { buf: String::new() });
+            true
+        }
+        KeyResult::Save => {
+            app.editor_save();
+            true
+        }
+        KeyResult::Close => {
+            // Esc unwinds one layer at a time: zoom first, then the pane.
+            if app.editor_full {
+                app.editor_full = false;
             } else {
                 app.go_back();
             }
@@ -10256,6 +10465,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     Style::default().add_modifier(Modifier::DIM))),
                 body),
         }
+    } else if app.focus == Pane::Editor && app.editor_full {
+        // 'z' zoom: the SAME editor widget the right pane renders, over the
+        // whole body (the info card drops away).
+        match app.editor.borrow_mut().as_mut() {
+            Some(e) => e.render(f, body, true),
+            None => f.render_widget(
+                Paragraph::new(Span::styled(EDITOR_EMPTY_HINT,
+                    Style::default().add_modifier(Modifier::DIM))),
+                body),
+        }
     } else {
         // Single-list-per-view layout (mirrors the prototype's _set_view /
         // LEFT/RIGHT scheme): the left half is the FOCUSED view's primary
@@ -10462,6 +10681,47 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         f.render_widget(p, left);
                         let detail = Paragraph::new(READER_EMPTY_HINT)
                             .block(block(title("DOCUMENT", rf), rf))
+                            .wrap(Wrap { trim: false });
+                        if !skip_right { f.render_widget(detail, right); }
+                    }
+                }
+            }
+            Pane::Editor => {
+                let mut ed = app.editor.borrow_mut();
+                match ed.as_mut() {
+                    Some(e) => {
+                        // Left: the buffer info card; right: the editor —
+                        // the same widget 'z' zooms.
+                        let rows = e.state.lines.iter_row().count();
+                        let info = vec![
+                            Line::from(Span::styled(e.target.label(),
+                                Style::default().add_modifier(Modifier::BOLD))),
+                            Line::from(format!("language: {}", e.lang_label())),
+                            Line::from(format!(
+                                "state: {}{}",
+                                if e.dirty { "MODIFIED" } else { "saved" },
+                                if e.read_only { " · read-only" } else { "" })),
+                            Line::from(format!(
+                                "line {}/{}", e.state.cursor.row + 1, rows)),
+                            Line::from(""),
+                            Line::from("vim-modal editing (edtui)"),
+                            Line::from("Ctrl-S save · Ctrl-O open"),
+                            Line::from("Ctrl-E read-only lock"),
+                            Line::from("z zoom · Esc back"),
+                        ];
+                        let p = Paragraph::new(Text::from(info))
+                            .block(block(title("EDITOR", false), false))
+                            .wrap(Wrap { trim: false });
+                        f.render_widget(p, left);
+                        if !skip_right { e.render(f, right, true); }
+                    }
+                    None => {
+                        let p = Paragraph::new(Span::styled("(no file)",
+                                Style::default().add_modifier(Modifier::DIM)))
+                            .block(block(title("EDITOR", lf), lf));
+                        f.render_widget(p, left);
+                        let detail = Paragraph::new(EDITOR_EMPTY_HINT)
+                            .block(block(title("BUFFER", rf), rf))
                             .wrap(Wrap { trim: false });
                         if !skip_right { f.render_widget(detail, right); }
                     }
@@ -13068,6 +13328,19 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::ReaderOpen { buf }),
         },
+        Modal::EditorOpen { mut buf } => match code {
+            KeyCode::Enter => app.editor_open_spec(&buf),
+            KeyCode::Esc => app.status = "editor open cancelled".into(),
+            KeyCode::Backspace => {
+                buf.pop();
+                app.modal = Some(Modal::EditorOpen { buf });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.modal = Some(Modal::EditorOpen { buf });
+            }
+            _ => app.modal = Some(Modal::EditorOpen { buf }),
+        },
         Modal::ActionMenu { title, items, mut sel } => match code {
             KeyCode::Esc => app.status = "menu cancelled".into(),
             KeyCode::Up => {
@@ -13912,7 +14185,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             app.should_quit = true;
                         }
                         KeyCode::Char(c @ ('N'|'b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'
-                                           |'?'|'P'|'i'|'w'|'v'|'s'|'M'|'u')) =>
+                                           |'?'|'P'|'i'|'w'|'v'|'s'|'M'|'u'|'W')) =>
                             dispatch_menubar_key(&mut app, c),
                         _ => {}
                     }
@@ -13923,6 +14196,13 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 // not know falls through to the accelerators / action table
                 // below, so pane switching and 'q' still work.
                 if app.focus == Pane::Reader && handle_reader_key(&mut app, k.code) {
+                    continue;
+                }
+                // Editor pane: same shape — an open buffer's keymap (vim
+                // editing, Ctrl-S save, zoom) consumes first; the empty
+                // state falls through so chips and 'q' work.
+                if app.focus == Pane::Editor
+                    && handle_editor_key(&mut app, k.code, k.modifiers) {
                     continue;
                 }
                 // Banner-prompt keys take priority over EVERYTHING (so y/n/a/d
@@ -13981,7 +14261,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // Letter accelerators: route through the same
                     // dispatch_menubar_key the F9 menu-nav path uses,
                     // so the two paths can't diverge.
-                    KeyCode::Char(c @ ('N'|'b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'w'|'v'|'s'|'M'|'u')) =>
+                    KeyCode::Char(c @ ('N'|'b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'w'|'v'|'s'|'M'|'u'|'W')) =>
                         dispatch_menubar_key(&mut app, c),
                     // Esc / Backspace from the packet drill-down pops back
                     // to the flows list, keeping its cursor + detail state.
@@ -17145,5 +17425,110 @@ mod tests {
         assert!(app.status.contains("reading"), "{}", app.status);
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("hello reader"), "document renders:\n{buf}");
+    }
+
+    /// The Editor pane: a mounted buffer renders in the two-pane split
+    /// (info card left, editor right) with syntax-colored cells, and 'z'
+    /// zooms the SAME widget over the whole body (the card drops away);
+    /// Esc (normal mode) unwinds the zoom first.
+    #[test]
+    fn editor_pane_renders_buffer_info_and_zoom() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = headless_app();
+        let e = crate::editor::EditorPane::open_box(
+            "7".into(), "src/answer.py".into(),
+            b"def answer():\n    return 42\n".to_vec()).unwrap();
+        app.editor.replace(Some(e));
+        app.focus = Pane::Editor;
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("EDITOR"), "info card:\n{buf}");
+        assert!(buf.contains("box:7:/src/answer.py"), "target label:\n{buf}");
+        assert!(buf.contains("language: python"), "language line:\n{buf}");
+        assert!(buf.contains("return 42"), "buffer renders:\n{buf}");
+        assert!(handle_editor_key(&mut app, KeyCode::Char('z'),
+                                  KeyModifiers::empty()));
+        assert!(app.editor_full, "'z' zooms");
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(!buf.contains("info card") && !buf.contains("language: python"),
+                "zoom drops the info card:\n{buf}");
+        assert!(buf.contains("return 42"), "zoomed editor renders:\n{buf}");
+        assert!(handle_editor_key(&mut app, KeyCode::Esc, KeyModifiers::empty()));
+        assert!(!app.editor_full, "Esc unwinds the zoom first");
+        // An OPEN buffer consumes normal-mode letters (vim motions) — the
+        // 'c' chip must NOT fire from inside the editor.
+        assert!(handle_editor_key(&mut app, KeyCode::Char('c'),
+                                  KeyModifiers::empty()),
+                "open buffer consumes letters");
+    }
+
+    /// Editor empty state: the chip lands in the path prompt, the pane
+    /// shows the hint, keys fall through to the chips, and a bad path is a
+    /// LOUD status — nothing mounts.
+    #[test]
+    fn editor_pane_empty_state_and_open_prompt() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = headless_app();
+        app.go_to_pane(Pane::Editor);
+        assert!(matches!(app.modal, Some(Modal::EditorOpen { .. })),
+                "first visit opens the path prompt");
+        app.modal = None;
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("no file open"), "empty-state hint:\n{buf}");
+        assert!(!handle_editor_key(&mut app, KeyCode::Char('c'),
+                                   KeyModifiers::empty()),
+                "empty pane lets the letter chips fall through");
+        assert!(handle_editor_key(&mut app, KeyCode::Char('o'),
+                                  KeyModifiers::empty()),
+                "'o' reopens the prompt");
+        assert!(matches!(app.modal, Some(Modal::EditorOpen { .. })));
+        for c in "/no/such/file.rs".chars() {
+            handle_modal_key(&mut app, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(app.modal.is_none());
+        assert!(app.editor.borrow().is_none(), "bad path must not mount");
+        assert!(app.status.contains("/no/such/file.rs"), "{}", app.status);
+        // 'E' with no change selected: loud, no mount.
+        app.change_edit_selected();
+        assert!(app.status.contains("no change selected"), "{}", app.status);
+        assert!(app.editor.borrow().is_none());
+    }
+
+    /// The host-file path end to end IN PROCESS: prompt-spec mount, edit →
+    /// dirty flag on the card, Ctrl-S writes the host file byte-exactly and
+    /// clears the flag, and a dirty buffer refuses to be replaced.
+    #[test]
+    fn editor_edits_and_saves_host_file() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("conf.yaml");
+        std::fs::write(&p, "key: value\n").unwrap();
+        let mut app = headless_app();
+        app.editor_open_spec(p.to_str().unwrap());
+        assert!(app.focus == Pane::Editor, "mount focuses the editor: {}", app.status);
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("key: value"), "buffer renders:\n{buf}");
+        // i…Esc: prepend a comment char through the real vim handler.
+        for (c, m) in [('i', KeyModifiers::empty())] {
+            assert!(handle_editor_key(&mut app, KeyCode::Char(c), m));
+        }
+        assert!(handle_editor_key(&mut app, KeyCode::Char('#'),
+                                  KeyModifiers::empty()));
+        assert!(handle_editor_key(&mut app, KeyCode::Esc, KeyModifiers::empty()));
+        assert!(app.editor.borrow().as_ref().unwrap().dirty, "edit sets dirty");
+        let buf = render_to_string(&app, 100, 30).unwrap();
+        assert!(buf.contains("MODIFIED"), "dirty flag on the card:\n{buf}");
+        // A dirty buffer refuses to be replaced by another open.
+        let keep = app.editor.borrow().as_ref().unwrap().target.clone();
+        app.editor_open_spec(p.to_str().unwrap());
+        assert!(app.status.contains("UNSAVED"), "{}", app.status);
+        assert_eq!(app.editor.borrow().as_ref().unwrap().target, keep);
+        // Ctrl-S: byte-exact host write, flag cleared.
+        assert!(handle_editor_key(&mut app, KeyCode::Char('s'),
+                                  KeyModifiers::CONTROL));
+        assert_eq!(std::fs::read(&p).unwrap(), b"#key: value\n",
+                   "save round-trips byte-exact");
+        assert!(!app.editor.borrow().as_ref().unwrap().dirty);
+        assert!(app.status.contains("saved"), "{}", app.status);
     }
 }
