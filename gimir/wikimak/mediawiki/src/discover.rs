@@ -321,14 +321,25 @@ fn http_get(client: &Client, url: &str) -> Result<(Vec<u8>, StatusCode)> {
     Ok((body.to_vec(), status))
 }
 
+/// Existence probe that transfers NO body bytes: HEAD first; a server
+/// that rejects/doesn't match HEAD (405, or a mock that only routes
+/// GET) is retried with a plain GET whose response is dropped after
+/// the status line — the body is never read.
 fn http_exists(client: &Client, url: &str) -> bool {
-    match client.get(url).send() {
-        Ok(r) => {
-            let s = r.status();
-            // Drain to free the connection.
-            let _ = r.bytes();
-            s.is_success()
+    if let Ok(r) = client.head(url).send() {
+        if r.status().is_success() {
+            return true;
         }
+        if r.status() == StatusCode::METHOD_NOT_ALLOWED || r.status() == StatusCode::NOT_FOUND {
+            // fall through to the GET probe: a HEAD 404 may be a
+            // GET-only route (mock servers), and 405 is an explicit
+            // "use another method".
+        } else {
+            return false;
+        }
+    }
+    match client.get(url).send() {
+        Ok(r) => r.status().is_success(), // response dropped unread
         Err(_) => false,
     }
 }
@@ -341,22 +352,67 @@ fn http_fetch_ok(client: &Client, url: &str) -> Option<Vec<u8>> {
     resp.bytes().ok().map(|b| b.to_vec())
 }
 
+/// The `Content-Length` header as a number, if present and parseable.
+/// Read from the raw header — NOT `Response::content_length()`, whose
+/// value can reflect the (absent) HEAD body rather than the entity.
+fn header_content_length(resp: &Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The total size from a `Content-Range: bytes X-Y/TOTAL` (or
+/// `bytes */TOTAL`) header.
+fn header_content_range_total(resp: &Response) -> Option<u64> {
+    let v = resp.headers().get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    let total = v.rsplit('/').next()?.trim();
+    total.parse().ok()
+}
+
+/// Resolve a part's size from HTTP metadata WITHOUT transferring the
+/// body (a dump part is gigabytes; the old GET-and-drain here pulled
+/// every one of them just to learn a number the headers already
+/// carry). HEAD + `Content-Length` is the happy path; servers that
+/// don't answer HEAD get a `Range: bytes=0-0` GET whose headers
+/// (`Content-Range` total on 206/416, `Content-Length` on an
+/// ignored-Range 200) are read and whose body never is. No usable
+/// header on any route is a LOUD error, never a silent drain.
 fn http_resolve_size(client: &Client, url: &str) -> Result<u64> {
-    let resp: Response = client.get(url).send()?;
+    if let Ok(resp) = client.head(url).send() {
+        if resp.status().is_success() {
+            if let Some(len) = header_content_length(&resp) {
+                return Ok(len);
+            }
+        } else if !matches!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_FOUND
+        ) {
+            return Err(Error::HttpStatus {
+                status: resp.status().as_u16(),
+                url: url.to_string(),
+            });
+        }
+        // success-without-length, 405, or a GET-only mock route: fall
+        // through to the Range probe.
+    }
+    let resp: Response = client.get(url).header("Range", "bytes=0-0").send()?;
     let status = resp.status();
-    if !status.is_success() {
-        return Err(Error::HttpStatus {
-            status: status.as_u16(),
-            url: url.to_string(),
+    // Response is dropped unread in every arm below — headers only.
+    if status == StatusCode::PARTIAL_CONTENT || status == StatusCode::RANGE_NOT_SATISFIABLE {
+        return header_content_range_total(&resp).ok_or_else(|| {
+            Error::Parse(format!("no total in Content-Range for {url}"))
         });
     }
-    // Prefer Content-Length; otherwise drain and count.
-    if let Some(len) = resp.content_length() {
-        if len > 0 {
-            let _ = resp.bytes();
-            return Ok(len);
-        }
+    if status.is_success() {
+        return header_content_length(&resp)
+            .ok_or_else(|| Error::Parse(format!("no Content-Length for {url}")));
     }
-    let body = resp.bytes()?;
-    Ok(body.len() as u64)
+    Err(Error::HttpStatus {
+        status: status.as_u16(),
+        url: url.to_string(),
+    })
 }
