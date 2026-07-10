@@ -871,6 +871,18 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         return 1;
     }
     eprintln!("sarun-engine: box {sid}  (sud upper: {upper})");
+    // Continuing a box lineage is easy to do by accident (rerunning a NAMED
+    // box) and silently changes build behavior: everything earlier runs
+    // captured — including a broken run's stale or zero-length artifacts —
+    // is visible to this run as up-to-date files, so make-style tools skip
+    // the steps that would regenerate them. Say so, loudly, with the way out.
+    if !lowers.is_empty() {
+        eprintln!("sarun-engine: box {sid} continues atop {} prior captured \
+                   layer(s): earlier runs' outputs look like existing \
+                   up-to-date files to this build. For a from-scratch run: \
+                   `sarun <NAME> discard` or use a fresh box name.",
+                  lowers.len());
+    }
     // -b brush: the box's shell IS the embedded brush, run as the TRACED
     // target — the engine binary under the wrapper via `brush-sh`, so brush +
     // coreutils/find/xargs + make(kati)/ninja(n2) all execute in one traced

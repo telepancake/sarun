@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 10 Jul 2026 05:52:02 +0000
+Subject: [PATCH] make-role argv: GNU -i/-n semantics (ignore-errors / dry-run)
+
+---
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 3dae458..f1e4563 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -267,6 +267,14 @@ pub struct Evaluator {
+     /// sarun: `.NOTPARALLEL:` was seen — this make's recipes run serially
+     /// even when -j / a jobserver is in effect.
+     pub not_parallel: bool,
++    /// sarun: per-make GNU `-n` (dry run) / `-i` (ignore-errors). Carried on
++    /// the Evaluator — NOT the process-global FLAGS — because many in-process
++    /// makes share one process and only the FIRST argv installs FLAGS; a
++    /// recursive `$(MAKE) -n`/-i must not depend on what the top make was
++    /// invoked with. exec.rs ORs these with the global FLAGS (standalone
++    /// rkati still drives everything through FLAGS).
++    pub dry_run: bool,
++    pub ignore_errors: bool,
+     /// sarun: per-instance global variable bindings, indexed by Symbol id.
+     /// Moved off the process-global symbol table (symtab `symbol_data`) so each
+     /// Evaluator — i.e. each make invocation — owns its OWN global namespace.
+@@ -370,6 +378,8 @@ impl Evaluator {
+             rule_vars: HashMap::new(),
+             vpath_patterns: Vec::new(),
+             not_parallel: false,
++            dry_run: false,
++            ignore_errors: false,
+             global_vars: Arc::new(Mutex::new(Vec::new())),
+             working_dir: std::env::current_dir().unwrap_or_default(),
+             include_dirs: Vec::new(),
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index bff8dde..e1385b0 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -146,6 +146,9 @@ struct Executor<'a> {
+     shell: Bytes,
+     shellflag: &'static [u8],
+     num_commands: u64,
++    /// Per-make GNU -n / -i, seeded from the Evaluator (see eval.rs).
++    dry_run: bool,
++    ignore_errors: bool,
+     /// Suppress the "*** [target] Error N" banner (and no-rule notes) —
+     /// used when remaking OPTIONAL includes, whose failures GNU swallows
+     /// silently.
+@@ -226,6 +229,9 @@ struct RunReq {
+     box_prefix: Bytes,
+     /// The pre-run output timestamp to record as this node's result on success.
+     result_ts: ExecStatus,
++    /// Per-make GNU -n / -i (from the Executor; see Evaluator::dry_run).
++    dry_run: bool,
++    ignore_errors: bool,
+ }
+ 
+ /// Build the `export NAME='value'` prefix (newline-terminated) for a target's
+@@ -304,7 +310,8 @@ fn run_node_commands(
+     // up-to-date) nodes are correctly left un-started. `req.output` is the node's
+     // primary output (== build_edges.outs[0], the engine's match key).
+     let output = req.output;
+-    let report = !FLAGS.is_dry_run && !req.commands.is_empty();
++    let dry_run = FLAGS.is_dry_run || req.dry_run;
++    let report = !dry_run && !req.commands.is_empty();
+     if report {
+         crate::fileutil::report_edge(output.as_bytes().as_ref(),
+                                      crate::fileutil::EdgePhase::Start, 0, b"");
+@@ -323,12 +330,14 @@ fn run_node_commands(
+     };
+     let emit = &mut emit as &mut dyn FnMut(&[u8]);
+     for command in req.commands {
+-        if command.echo {
++        // GNU -n prints every command line, INCLUDING @-silenced ones —
++        // that's the point of a dry run.
++        if command.echo || dry_run {
+             // Echo LIVE, before running, so a hung command's line shows at once.
+             emit(&command.cmd);
+             emit(b"\n");
+         }
+-        if FLAGS.is_dry_run {
++        if dry_run {
+             continue;
+         }
+         // In-process runner gets the exports prefix SEPARATELY (it applies it
+@@ -354,7 +363,8 @@ fn run_node_commands(
+                 }
+             };
+         if !ok {
+-            if command.ignore_error {
++            // Global -i / --ignore-errors == every line '-'-prefixed.
++            if command.ignore_error || FLAGS.is_ignore_errors || req.ignore_errors {
+                 ignored.push((command.output, code));
+             } else {
+                 failure = Some((command.output, code));
+@@ -375,11 +385,15 @@ impl<'a> Executor<'a> {
+     fn new(ev: &'a mut Evaluator) -> Result<Self> {
+         let shell = ev.get_shell()?;
+         let shellflag = ev.get_shell_flag();
++        let dry_run = ev.dry_run;
++        let ignore_errors = ev.ignore_errors;
+         Ok(Executor {
+             ce: CommandEvaluator::new(ev)?,
+             shell,
+             shellflag,
+             num_commands: 0,
++            dry_run,
++            ignore_errors,
+             quiet_failures: false,
+         })
+     }
+@@ -546,7 +560,8 @@ list of the rule for '{output}' at {loc}"));
+         let box_prefix = self.ce.ev.box_export_prefix.clone();
+         Ok((
+             output_ts,
+-            Some(RunReq { output, commands, exports, cwd, box_prefix, result_ts: output_ts }),
++            Some(RunReq { output, commands, exports, cwd, box_prefix, result_ts: output_ts,
++                          dry_run: self.dry_run, ignore_errors: self.ignore_errors }),
+         ))
+     }
+ 
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index 1faf9b8..439d4b5 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -69,6 +69,13 @@ pub struct Flags {
+     pub generate_empty_ninja: bool,
+     pub is_dry_run: bool,
+     pub is_silent_mode: bool,
++    /// -i / --ignore-errors (GNU): treat every recipe line as if it were
++    /// '-'-prefixed — failures are reported "(ignored)" and the build goes
++    /// on. NOT upstream kati's `-i` (which meant dry run): sarun runs kati
++    /// AS `make`, so argv must carry GNU make semantics — a vendor build
++    /// invoking `$(MAKE) -i -C dir` expects ignore-errors, and the old
++    /// mapping silently turned those sub-makes into dry-run NOPs.
++    pub is_ignore_errors: bool,
+     /// -k / --keep-going: on a recipe failure, keep building targets that
+     /// don't depend on the failed one; exit non-zero at the end.
+     pub is_keep_going: bool,
+@@ -268,6 +275,11 @@ impl Flags {
+                 self.is_silent_mode = true;
+             } else if tok == b"-k" || tok == b"--keep-going" {
+                 self.is_keep_going = true;
++            } else if tok == b"-i" || tok == b"--ignore-errors" {
++                self.is_ignore_errors = true;
++            } else if tok == b"-n" || tok == b"--just-print"
++                   || tok == b"--dry-run" || tok == b"--recon" {
++                self.is_dry_run = true;
+             } else if !tok.starts_with(b"-") && tok.contains(&b'=') {
+                 let var = Bytes::from(tok.to_vec());
+                 if !self.cl_vars.contains(&var) {
+@@ -283,6 +295,8 @@ impl Flags {
+                         b'R' => self.no_builtin_variables = true,
+                         b's' => self.is_silent_mode = true,
+                         b'k' => self.is_keep_going = true,
++                        b'i' => self.is_ignore_errors = true,
++                        b'n' => self.is_dry_run = true,
+                         _ => {}
+                     }
+                 }
+@@ -309,11 +323,19 @@ impl Flags {
+                     should_propagate = false;
+                 }
+                 b"-c" => flags.is_syntax_check_only = true,
+-                b"-i" => flags.is_dry_run = true,
++                // sarun: GNU make argv semantics, NOT upstream kati's. kati's
++                // own CLI used `-i` for dry run; running kati AS `make` that
++                // mapping silently turned every `$(MAKE) -i -C dir` (a vendor
++                // staple: ignore-errors) into a dry-run NOP, and made `-n`
++                // BUILD FOR REAL. Crosswire undone:
++                b"-i" | b"--ignore-errors" => flags.is_ignore_errors = true,
++                b"-n" | b"--just-print" | b"--dry-run" | b"--recon" => {
++                    flags.is_dry_run = true
++                }
+                 b"-s" => flags.is_silent_mode = true,
+                 b"-r" => flags.no_builtin_rules = true,
+                 b"-R" => flags.no_builtin_variables = true,
+-                b"-w" | b"-n" => {} // accepted, semantically no-op in kati
++                b"-w" => {} // accepted, semantically no-op in kati
+                 b"-k" | b"--keep-going" => flags.is_keep_going = true,
+                 // sarun: GNU make's long forms of -w/its inverse. The kernel's
+                 // top Makefile passes --no-print-directory to every sub-make
+diff --git a/testcase/sarun_flag_i_ignore_errors.mk b/testcase/sarun_flag_i_ignore_errors.mk
+new file mode 100644
+index 0000000..00b3eb3
+--- /dev/null
++++ b/testcase/sarun_flag_i_ignore_errors.mk
+@@ -0,0 +1,10 @@
++# GNU -i (--ignore-errors): every recipe line behaves '-'-prefixed — the
++# failing step is reported ignored and the build CONTINUES, exit 0. Under
++# kati's upstream CLI mapping, -i meant dry run: a vendor build's
++# `$(MAKE) -i -C dir` silently became a NOP. stderr is dropped so the diff
++# compares only the markers (the "(ignored)" line formats differ).
++$(shell printf 'all: a b\na:\n\t@echo step-a\n\t@false\nb:\n\t@echo step-b\n' > child.mk)
++
++test:
++	@$(MAKE) --no-print-directory -f child.mk -i 2>/dev/null
++	@echo "rc=$$?"
+diff --git a/testcase/sarun_flag_n_dry_run.mk b/testcase/sarun_flag_n_dry_run.mk
+new file mode 100644
+index 0000000..572427a
+--- /dev/null
++++ b/testcase/sarun_flag_n_dry_run.mk
+@@ -0,0 +1,9 @@
++# GNU -n (dry run): sub-make prints every command line — INCLUDING
++# @-silenced ones — and executes NOTHING. kati's upstream CLI parked -n as
++# a no-op (and used -i for dry run), so `make -n` BUILT FOR REAL when kati
++# runs as `make`. The follow-up `test -f` pins that no file was created.
++$(shell printf 'built.txt:\n\t@echo quiet-step\n\ttouch built.txt\n' > child.mk)
++
++test:
++	@$(MAKE) --no-print-directory -f child.mk -n built.txt
++	@test -f built.txt && echo "DRY-RUN-VIOLATED" || echo "dry-run-clean"

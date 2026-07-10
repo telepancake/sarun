@@ -108,9 +108,8 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
             }
             // Short flags kati's flags.rs knows or that we handle above.
             // -s silent, -r no-builtin-rules, -R no-builtin-variables,
-            // -w print-directory, -k keep-going (currently no-op in kati
-            // but accepted so the kernel's MAKEFLAGS-inherited flags don't
-            // error), -n/-i dry-run. Refuse anything else.
+            // -w print-directory, -k keep-going, -n dry-run (GNU: print,
+            // don't execute), -i ignore-errors (GNU). Refuse anything else.
             "-s" | "-r" | "-R" | "-w" | "-k" | "-n" | "-i" => {
                 out.push(OsString::from(a));
                 i += 1;
@@ -257,11 +256,17 @@ fn run_kati(
     // doesn't do this automatically — without it that filter never matches and
     // a self-recursing `$(MAKE)` rule spins forever.
     cmdline_flags: &[OsString],
+    // GNU -n / -i for THIS make instance (a recursive in-process $(MAKE)
+    // can't use the once-installed process-global FLAGS). dry_run applies to
+    // the MAIN goals only — GNU -n still remakes included makefiles for real.
+    dry_run: bool,
+    ignore_errors: bool,
     // Optional includes known unmakeable from a previous remake pass —
     // don't queue them again.
     noremake: &std::collections::HashSet<Vec<u8>>,
 ) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
+    ev.ignore_errors = ignore_errors;
     // sarun: the Evaluator seeds working_dir from the process cwd; override it
     // with the caller's logical working dir. For the shadow path this equals the
     // process cwd; for the in-process builtin it's the make's dir resolved from
@@ -642,7 +647,11 @@ fn run_kati(
                 let _ = kati::exec::exec_opts(vec![node], &mut ev, true);
             }
         } else {
+            // GNU -n: print instead of run — but only the MAIN goals; the
+            // remake_active passes above rebuild included makefiles for real.
+            ev.dry_run = dry_run;
             kati::exec::exec(nodes, &mut ev)?;
+            ev.dry_run = false;
         }
         ev.finish()?;
     }
@@ -1211,7 +1220,7 @@ pub fn make_main(argv: &[String]) -> i32 {
                 .map(|s| s.to_vec())
                 .collect())
             .unwrap_or_default();
-    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, &noremake) {
+    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, &noremake) {
         Ok(r) => r,
         Err(e) => {
             // Recipe failure already printed its `*** [target] Error N`; just
@@ -1436,7 +1445,7 @@ pub fn make_builtin(
     // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
     let cmdline_flags = extract_long_flags(argv);
     let mut noremake: std::collections::HashSet<Vec<u8>> = Default::default();
-    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, &noremake);
+    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, &noremake);
     let mut remake_depth = 0u32;
     while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
         remake_depth += 1;
@@ -1452,7 +1461,7 @@ pub fn make_builtin(
         // forever).
         kati::file_cache::clear();
         kati::fileutil::clear_glob_cache();
-        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, &noremake);
+        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, &noremake);
     }
 
     kati::exec::set_recipe_out(prev_out);
