@@ -1213,7 +1213,7 @@ pub(crate) fn scan_best(
         if tau.is_some_and(|t| ts > t) {
             continue;
         }
-        if best.as_ref().map_or(true, |(b, _)| (ts, rev_id) > rev_key(b)) {
+        if best.as_ref().is_none_or(|(b, _)| (ts, rev_id) > rev_key(b)) {
             let (meta, text) = crate::revision::decode_revision_view(rec)?;
             best = Some((meta, if want_text { Some(text.to_vec()) } else { None }));
         }

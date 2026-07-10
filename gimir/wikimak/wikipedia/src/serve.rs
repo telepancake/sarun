@@ -76,13 +76,10 @@ pub fn serve(inst: Instance, cfg: ServeConfig) -> Result<(), String> {
     for _ in 0..POOL_THREADS {
         let server = Arc::clone(&server);
         let app = Arc::clone(&app);
-        handles.push(thread::spawn(move || loop {
-            match server.recv() {
-                Ok(req) => {
-                    let resp = handle(&app, &req);
-                    let _ = req.respond(resp);
-                }
-                Err(_) => break,
+        handles.push(thread::spawn(move || {
+            while let Ok(req) = server.recv() {
+                let resp = handle(&app, &req);
+                let _ = req.respond(resp);
             }
         }));
     }

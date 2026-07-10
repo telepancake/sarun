@@ -1229,8 +1229,10 @@ mod tests {
     /// and fails closed only at the 48-bit bound.
     #[test]
     fn cold_bound_is_48_bits() {
-        assert!(u32::MAX as u64 + 1 + HEADER_LEN as u64 <= MAX_OFFSET);
-        assert!(MAX_OFFSET + 1 > MAX_OFFSET); // trivially: the check is `> MAX_OFFSET`
         assert_eq!(MAX_OFFSET, (1u64 << 48) - 1);
+        // A frame header landing just past the u32 ceiling still fits —
+        // the exact shape the old u32 offsets rejected.
+        let past_u32 = u32::MAX as u64 + 1;
+        assert!(past_u32 + HEADER_LEN as u64 <= MAX_OFFSET);
     }
 }
