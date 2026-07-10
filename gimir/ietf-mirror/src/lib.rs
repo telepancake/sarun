@@ -409,7 +409,7 @@ impl Mirror {
                     matches!((&head_rev, batch.first()), (Some(h), Some((r, _))) if r <= h);
                 if needs_rebuild {
                     stats.chains_rebuilt += 1;
-                    Some(self.rebuild_chain(chain_id, batch)?)
+                    Some((chain_id, self.rebuild_chain(chain_id, batch)?))
                 } else {
                     let layers: Vec<Layer> = batch.into_iter().map(|(_, l)| l).collect();
                     self.store.put_layers(chain_id, &layers)?;
@@ -433,11 +433,11 @@ impl Mirror {
             self.set_dirty(false)?;
             self.suspect = false;
         }
-        // Session-end compaction: dead frames from this run's prepends/
-        // rebuilds otherwise sit in the under-threshold current write
-        // files forever. (What collect cannot reclaim: rebuild-orphaned
-        // chains — still index-live inside the depot — and cold-file
-        // bytes; see VbfDepot::collect.)
+        // Session-end compaction: dead frames from this run's prepends,
+        // rebuilds, and deleted (repointed-away) old chains otherwise
+        // sit in the under-threshold current write files forever. (What
+        // collect cannot reclaim: cold-file bytes — accounted dead,
+        // never compacted; see VbfDepot::collect.)
         self.store.collect()?;
         Ok(stats)
     }
@@ -466,7 +466,7 @@ impl Mirror {
             let mut repoint =
                 tx.prepare_cached("UPDATE drafts SET chain_id = ?2 WHERE name = ?1")?;
             for d in pending.iter() {
-                if let Some(new_chain) = d.repoint {
+                if let Some((_, new_chain)) = d.repoint {
                     repoint.execute(rusqlite::params![d.name, new_chain as i64])?;
                 }
                 for (rev, missing) in &d.done {
@@ -475,6 +475,18 @@ impl Mirror {
             }
         }
         tx.commit()?;
+        // The repoints are durable: nothing references the old chains
+        // any more — delete them so their f0/f1 frames become dead
+        // bytes the run-end collect() reclaims (before delete_chain
+        // they stayed index-live forever). Strictly AFTER the commit: a
+        // crash before it must leave the draft on its intact old chain.
+        // A crash between the commit and a delete leaks that one old
+        // chain (this exact window, once) — the accepted remainder.
+        for d in pending.iter() {
+            if let Some((old_chain, _)) = d.repoint {
+                self.store.delete_chain(old_chain)?;
+            }
+        }
         pending.clear();
         Ok(())
     }
@@ -522,8 +534,9 @@ impl Mirror {
     /// ascending by revision (dedup keeps the existing layer — the
     /// crash-recovery case refetches revisions the chain already has),
     /// and write them to a fresh chain id. The caller repoints the
-    /// draft's inventory row; the old chain becomes dead weight for the
-    /// depot's eviction. Store-only — no sqlite writes here, so a crash
+    /// draft's inventory row, then deletes the old chain once the
+    /// repoint is durable (`commit_pending`) so eviction can reclaim
+    /// its frames. Store-only — no sqlite writes here, so a crash
     /// leaves the draft on its intact old chain.
     #[cfg(feature = "fetch")]
     fn rebuild_chain(&mut self, old_chain: u64, batch: Vec<(String, Layer)>) -> Result<u64> {
@@ -727,9 +740,10 @@ struct PendingDraft {
     name: String,
     /// `(rev, missing)` watermarks to write.
     done: Vec<(String, bool)>,
-    /// Rebuilt chain id to repoint the inventory row at, atomically
-    /// with the watermarks.
-    repoint: Option<u64>,
+    /// `(old, new)` chain ids of a rebuild: the inventory row repoints
+    /// to `new` atomically with the watermarks, and `old` is deleted
+    /// from the store once that commit lands.
+    repoint: Option<(u64, u64)>,
 }
 
 /// Store-flush + watermark-tx cadence, in drafts. Bounds both the fsync

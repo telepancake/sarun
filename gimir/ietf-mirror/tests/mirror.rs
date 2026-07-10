@@ -523,6 +523,11 @@ fn legacy_heads_only_mirror_backfills_in_order() {
     }
     let conn = rusqlite::Connection::open(tmp.path().join("m/meta.db")).unwrap();
     conn.execute("DELETE FROM revisions_seen WHERE missing = 1", []).unwrap();
+    let old_chain: i64 = conn
+        .query_row("SELECT chain_id FROM drafts WHERE name = 'draft-test-delta'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
     drop(conn);
 
     // The archive serves the older revisions now, and the head bumps.
@@ -558,4 +563,48 @@ fn legacy_heads_only_mirror_backfills_in_order() {
     let m2 = mirror(&tmp);
     assert_eq!(m2.history("draft-test-delta").unwrap().len(), 7);
     assert_eq!(m2.head("draft-test-delta").unwrap().unwrap().text, b"delta six\n");
+
+    // The rebuild repointed the draft to a fresh chain and DELETED the
+    // old one: its slot reads empty, and after the run-end collect the
+    // f0/f1 tiers hold EXACTLY the new chain's live frames — the
+    // orphan's bytes really left the disk (before delete_chain they
+    // stayed index-live forever).
+    drop(m2);
+    let conn = rusqlite::Connection::open(tmp.path().join("m/meta.db")).unwrap();
+    let new_chain: i64 = conn
+        .query_row("SELECT chain_id FROM drafts WHERE name = 'draft-test-delta'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    drop(conn);
+    assert_ne!(new_chain, old_chain, "rebuild must land on a fresh chain id");
+    let depot_root = tmp.path().join("m/depot");
+    let depot = wikimak_depot::Depot::open(wikimak_depot::DepotConfig {
+        root: depot_root.clone(),
+        max_chain_id: 1 << 20,
+        file_size_threshold: 1 << 20,
+        eviction_dead_ratio: 0.5,
+    })
+    .unwrap();
+    assert!(
+        matches!(depot.read_f0(old_chain as u64), Err(wikimak_depot::Error::NoFrame)),
+        "the repointed-away chain's slot reads empty"
+    );
+    let f0_live = depot.read_f0(new_chain as u64).unwrap().len() as u64 + 24;
+    let f1_live = depot.read_f1(new_chain as u64).unwrap().expect("7-rev chain has an f1").len()
+        as u64
+        + 24;
+    let tier_bytes = |tier: &str| -> u64 {
+        std::fs::read_dir(depot_root.join(tier))
+            .unwrap()
+            .flatten()
+            .map(|e| e.metadata().unwrap().len())
+            .sum()
+    };
+    assert_eq!(
+        tier_bytes("f0"),
+        f0_live,
+        "f0 tier = the live head frame alone; orphan + rebuild garbage reclaimed"
+    );
+    assert_eq!(tier_bytes("f1"), f1_live, "f1 tier = the live accumulator alone");
 }

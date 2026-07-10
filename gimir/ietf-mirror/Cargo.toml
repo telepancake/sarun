@@ -23,6 +23,9 @@ fetch = ["dep:reqwest"]
 [dev-dependencies]
 httpmock = "0.7"
 tempfile = "3"
+# The rebuild test reaches under depot-vbf to prove the repointed-away
+# old chain's bytes really left the disk (tier sizes, raw frame reads).
+wikimak-depot = { path = "../wikimak/depot" }
 
 [[bin]]
 name = "ietfmak"

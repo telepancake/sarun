@@ -344,14 +344,23 @@ impl VbfDepot {
     /// the current write files into eviction so dead frames parked there
     /// stop being waste at rest. What it reclaims: DEPRECATED frames —
     /// old f0/f1 versions left behind by every prepend (and by a
-    /// rebuild's writes). What it can NOT reclaim: frames of chains the
-    /// caller's inventory no longer references (a rebuild-orphaned
-    /// chain's frames are still index-LIVE to the depot — dead weight
-    /// until something truncates the chain), and cold-file bytes (the
-    /// cold tier is append-only, never compacted). Cheap when there is
-    /// nothing to reclaim; call once per update run, not per chain.
+    /// rebuild's writes), and the frames of [`Self::delete_chain`]d
+    /// chains. What it can NOT reclaim: cold-file bytes (the cold tier
+    /// is append-only, never compacted — a deleted chain's cold frames
+    /// are only ACCOUNTED dead). Cheap when there is nothing to
+    /// reclaim; call once per update run, not per chain.
     pub fn collect(&self) -> Result<(), Error> {
         Ok(self.depot.collect()?)
+    }
+
+    /// Delete `chain_id` outright ([`wikimak_depot::Depot::delete_chain`]):
+    /// the chain reads as empty, its f0/f1 frames become dead bytes the
+    /// next `flush`/`collect` eviction reclaims, its cold frames are
+    /// accounted dead (bytes stay — cold is append-only). How a caller
+    /// retires a chain its inventory stopped referencing (a rebuild's
+    /// repointed-away old chain). Idempotent on empty chains.
+    pub fn delete_chain(&self, chain_id: u64) -> Result<(), Error> {
+        Ok(self.depot.delete_chain(chain_id)?)
     }
 }
 
