@@ -686,6 +686,29 @@ impl BoxState {
             .unwrap_or(tgid as i64)
     }
 
+    /// Mint (or refresh) a process row purely from trace-EVENT data — for
+    /// pids that are already gone by the time their EXEC event reaches the
+    /// engine (an `as`/`echo`-sized tool lives shorter than the pipe
+    /// latency, so the /proc snapshot in writer_for finds nothing and the
+    /// row silently never exists). Identity start = the event timestamp:
+    /// unique per exec, and no /proc is left to disagree with.
+    pub fn record_proc_event(&self, tgid: u32, ppid: u32, ts_ns: i64,
+                             exe: &str, cwd: &str, argv: &[String]) -> Option<i64> {
+        // If a live snapshot already recorded this tgid, refresh its image
+        // instead (same semantics as exec_refresh's in-place update).
+        if let Some((start, rid)) = self.proc_current.lock().unwrap()
+                                        .get(&tgid).copied() {
+            let _ = start;
+            let argv_json = serde_json::to_string(&argv).unwrap_or_default();
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute(
+                "UPDATE process SET exe=?1, argv=?2 WHERE id=?3 AND exe<>?1",
+                params![exe, argv_json, rid]);
+            return Some(rid);
+        }
+        self.record_proc(tgid, ts_ns, ppid, exe, cwd, argv, None, false)
+    }
+
     /// EXEC-event refresh: an in-place execve keeps the pid AND its kernel
     /// start time, so the (tgid,start) incarnation key — and therefore the
     /// cached process row — CANNOT tell the new image from the old. Vendor
@@ -696,16 +719,19 @@ impl BoxState {
     /// appear. On an EXEC event, re-read /proc and, when the row's image is
     /// stale, update it in place (same row id, so output/edge attribution by
     /// row id is unaffected).
-    pub fn exec_refresh(&self, pid: u32) -> i64 {
+    /// Returns None when the process was already gone from /proc — the
+    /// caller can then mint the row from the trace event's own data
+    /// (record_proc_event).
+    pub fn exec_refresh(&self, pid: u32) -> Option<i64> {
         let (tgid, start, ppid, exe, cwd, argv) = Self::read_prov(pid);
         if start == 0 && exe.is_empty() && argv.is_empty() {
             // Process already gone — nothing fresher to record.
-            return self.writer_for(pid);
+            return None;
         }
         let cached = self.proc_cache.lock().unwrap().get(&(tgid, start)).copied();
         let Some(rid) = cached else {
             // First sighting of this incarnation: normal record path.
-            return self.writer_for(pid);
+            return Some(self.writer_for(pid));
         };
         let argv_json = serde_json::to_string(&argv).unwrap_or_default();
         let conn = self.conn.lock().unwrap();
@@ -720,7 +746,7 @@ impl BoxState {
             drop(conn);
             self.push_event("", "process_added");
         }
-        rid
+        Some(rid)
     }
 
     /// Insert/dedup ONE process incarnation (identity (tgid,start)) and return its

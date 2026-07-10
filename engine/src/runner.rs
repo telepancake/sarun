@@ -1323,6 +1323,33 @@ extern "C" fn sud_on_term(_sig: i32) {
     }
 }
 
+/// Cross-process serialisation of trace-pipe writes, sharing the futex word
+/// at offset 4 of the wire-state page (struct sud_shared.wire_write_lock in
+/// tv/sud/trace/event.c). A pipe write is atomic only up to PIPE_BUF and the
+/// wrappers' events (EV_ARGV of a compiler command line) exceed that; the
+/// launcher's own EV_EXIT writes — one per reaped child, all build long —
+/// interleave into them and corrupt the framing unless every writer holds
+/// this lock. Non-PRIVATE futex ops: the word is shared across processes.
+unsafe fn wire_lock(word: *mut u32) {
+    let a = std::sync::atomic::AtomicU32::from_ptr(word);
+    if a.compare_exchange(0, 1, std::sync::atomic::Ordering::Acquire,
+                          std::sync::atomic::Ordering::Relaxed).is_ok() {
+        return;
+    }
+    loop {
+        let prev = a.swap(2, std::sync::atomic::Ordering::Acquire);
+        if prev == 0 { return; }
+        libc::syscall(libc::SYS_futex, word, 0 /*FUTEX_WAIT*/, 2u32,
+                      std::ptr::null::<libc::timespec>(), 0, 0);
+    }
+}
+unsafe fn wire_unlock(word: *mut u32) {
+    let a = std::sync::atomic::AtomicU32::from_ptr(word);
+    if a.swap(0, std::sync::atomic::Ordering::Release) == 2 {
+        libc::syscall(libc::SYS_futex, word, 1 /*FUTEX_WAKE*/, 1, 0, 0, 0);
+    }
+}
+
 fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32) -> i32 {
     let stream_id: u32;
     let state_page: *mut u32;
@@ -1353,7 +1380,10 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32) -> i32 {
         stream_id = (*std::sync::atomic::AtomicU32::from_ptr(state_page))
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let va = crate::sudwire::version_atom();
+        let lock_word = state_page.add(1); // sud_shared.wire_write_lock
+        wire_lock(lock_word);
         let _ = write_all_fd(trace_w, &va);
+        wire_unlock(lock_word);
     }
     // dup2 targets are not CLOEXEC, so they survive the exec into the wrapper.
     unsafe {
@@ -1415,7 +1445,12 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32) -> i32 {
                 .map(|d| d.as_nanos() as i64).unwrap_or(0);
             let buf = ev.build_exit(stream_id, ts, wpid as i64,
                                     tgid as i64, ppid as i64, wstatus);
-            let _ = write_all_fd(trace_w, &buf);
+            unsafe {
+                let lock_word = state_page.add(1);
+                wire_lock(lock_word);
+                let _ = write_all_fd(trace_w, &buf);
+                wire_unlock(lock_word);
+            }
         }
         if wpid == child_pid {
             code = if libc::WIFEXITED(wstatus) {

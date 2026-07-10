@@ -175,6 +175,20 @@ pub struct Decoder {
     poisoned: bool,
 }
 
+impl Decoder {
+    /// A poisoned decoder drops every later byte of the box's trace —
+    /// processes and outputs silently stop being recorded while the
+    /// control-socket records (pipelines, edges) march on. That split
+    /// is undebuggable if the poisoning itself is silent: SAY SO.
+    fn poison(&mut self, why: &str) {
+        if !self.poisoned {
+            eprintln!("sarun-engine: sud trace stream POISONED ({why}); \
+process/output capture stops here for this box");
+        }
+        self.poisoned = true;
+    }
+}
+
 /// Total encoded length of the atom at buf[0..], or None if incomplete.
 /// Err(()) on a malformed prefix (lensz=7 would exceed u64 — wire.h
 /// treats it as format error).
@@ -246,7 +260,9 @@ impl Decoder {
                             v |= (*b as u64) << (8 * i);
                         }
                         if v != TRACE_VERSION {
-                            self.poisoned = true;
+                            self.poison(&format!(
+                                "version atom {v} != {TRACE_VERSION} \
+(wrapper/engine build skew?)"));
                             return out;
                         }
                         self.versioned = true;
@@ -254,7 +270,9 @@ impl Decoder {
                         Self::decode_event(&mut self.states, payload) {
                         out.push(ev);
                     } else {
-                        self.poisoned = true;
+                        self.poison(&format!(
+                            "undecodable event atom ({len} bytes) after {} \
+good event(s) — framing corrupted (interleaved writer?)", out.len()));
                         self.buf.clear();
                         return out;
                     }
@@ -262,7 +280,7 @@ impl Decoder {
                 }
                 Ok(None) => break,
                 Err(()) => {
-                    self.poisoned = true;
+                    self.poison("malformed atom length prefix — framing lost");
                     self.buf.clear();
                     return out;
                 }

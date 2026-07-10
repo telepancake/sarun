@@ -66,6 +66,16 @@ struct sud_shared {
      * 2, 3, … for each child. Stream id 0 stays reserved for legacy /
      * "no stream id" producers. */
     volatile uint32_t next_stream_id;
+    /* Cross-process mutex serialising event writes onto the trace
+     * pipe. A pipe write is atomic only up to PIPE_BUF (4 KiB); an
+     * EV_ARGV blob for a real compiler command line routinely exceeds
+     * that, and a partial write (full pipe under a parallel build)
+     * splits an event at an arbitrary byte even below it. Interleaved
+     * fragments corrupt the length-prefixed framing and the engine's
+     * decoder poisons — silently dropping EVERY later event of the box
+     * (processes/outputs vanish while control-socket records march on).
+     * 0 = unlocked, 1 = locked, 2 = locked with waiters. */
+    volatile uint32_t wire_write_lock;
     /* Rest of the page is reserved for future use / padding. */
 };
 
@@ -202,16 +212,53 @@ static unsigned int sud_minor(unsigned long dev)
  * events interleave at event boundaries only — never inside one.
  * ================================================================ */
 
-/* Write all `len` bytes of `buf` to g_out_fd via raw_write. Used for
- * scratch-buffer-fits-the-event path; one call here = one atomic
- * event on the wire. Falls back to a loop only on partial writes
- * (regular files do this on EINTR / disk-full edge cases). */
+/* Cross-process futex mutex on the shared page (non-PRIVATE ops: the
+ * word is MAP_SHARED across every traced process, both ELF classes).
+ * Degenerates to the process-local fallback page when SUD_STATE_FD is
+ * absent — still correct, just process-local like the stream ids. */
+static void wire_lock(void)
+{
+    volatile uint32_t *w = &g_shared->wire_write_lock;
+    uint32_t expected = 0;
+    if (__sync_bool_compare_and_swap(w, 0u, 1u)) return;
+    for (;;) {
+        uint32_t cur = __sync_lock_test_and_set(w, 2u);
+        if (cur == 0) return;
+#ifdef SYS_futex
+        raw_syscall6(SYS_futex, (long)w, 0 /*FUTEX_WAIT*/, 2u, 0, 0, 0);
+#endif
+    }
+}
+
+static void wire_unlock(void)
+{
+    volatile uint32_t *w = &g_shared->wire_write_lock;
+    uint32_t prev = __sync_lock_test_and_set(w, 0u);
+    if (prev == 2u) {
+#ifdef SYS_futex
+        raw_syscall6(SYS_futex, (long)w, 1 /*FUTEX_WAKE*/, 1, 0, 0, 0);
+#endif
+    }
+}
+
+/* Write all `len` bytes of `buf` to g_out_fd via raw_write, as ONE
+ * event on the wire. The write is serialised across processes with
+ * wire_lock: pipe atomicity only covers a single write of <= PIPE_BUF
+ * bytes, and events (EV_ARGV of a long compiler command line, EV_ENV)
+ * exceed that — an unserialised big or partial write interleaves with
+ * a sibling's and corrupts the framing for the box's whole stream. */
 static void emit_raw(const void *buf, size_t len)
 {
+    /* Caller holds wire_lock (see emit_event): the lock must cover the
+     * BUILD as well as the write — g_event_buf, the delta-encoder
+     * g_ev_state and emit_exec_event's argv/env statics are one set of
+     * per-process globals shared by EVERY thread's SIGSYS handler, and
+     * a parallel build runs many recipe threads that all emit. */
     const char *p = (const char *)buf;
     size_t off = 0;
     while (off < len) {
         ssize_t n = raw_write(g_out_fd, p + off, len - off);
+        if (n == -EINTR) continue;   /* a truncated event kills framing */
         if (n <= 0) break;
         off += n;
     }
@@ -250,10 +297,10 @@ static uint64_t get_ts_ns(void)
  * never longjmp out of an emit. So a single static is safe. */
 static char g_event_buf[WIRE_EVENT_STACK_MAX];
 
-static void emit_event(int32_t type, pid_t pid, pid_t tgid, pid_t ppid,
-                       uint64_t ts_ns,
-                       const int64_t *extras, unsigned n_extras,
-                       const void *blob, size_t blen)
+static void emit_event_unlocked(int32_t type, pid_t pid, pid_t tgid,
+                                pid_t ppid, uint64_t ts_ns,
+                                const int64_t *extras, unsigned n_extras,
+                                const void *blob, size_t blen)
 {
     if (g_out_fd < 0) return;
     /* Lazy init in case a stand-alone use forgot to call sud_wire_init. */
@@ -277,6 +324,17 @@ static void emit_event(int32_t type, pid_t pid, pid_t tgid, pid_t ppid,
                   wire_src(blob, blen));
     if (!od.p) return;  /* event larger than scratch — drop */
     emit_raw(g_event_buf, (size_t)((uint8_t *)od.p - (uint8_t *)g_event_buf));
+}
+
+static void emit_event(int32_t type, pid_t pid, pid_t tgid, pid_t ppid,
+                       uint64_t ts_ns,
+                       const int64_t *extras, unsigned n_extras,
+                       const void *blob, size_t blen)
+{
+    wire_lock();
+    emit_event_unlocked(type, pid, tgid, ppid, ts_ns,
+                        extras, n_extras, blob, blen);
+    wire_unlock();
 }
 
 /* ================================================================
@@ -392,6 +450,11 @@ void emit_exec_event(pid_t pid, const char *fallback_exe,
     pid_t tgid = get_tgid(pid);
     pid_t ppid = get_ppid(pid);
     uint64_t ts = get_ts_ns();
+    /* One lock hold across the whole EXEC/ARGV/ENV sequence: the argv/env
+     * staging buffers below are process-global statics — another thread's
+     * exec emitting between our fill and our write would splice its bytes
+     * into ours (observed as interleaved paths in a poisoned stream). */
+    wire_lock();
 
     /* 1. EV_EXEC — blob is the resolved exe path. */
     char exe_buf[PATH_MAX];
@@ -399,10 +462,10 @@ void emit_exec_event(pid_t pid, const char *fallback_exe,
         ? fallback_exe
         : read_proc_exe(pid, exe_buf, sizeof(exe_buf));
     if (exe) {
-        emit_event(EV_EXEC, pid, tgid, ppid, ts, NULL, 0,
+        emit_event_unlocked(EV_EXEC, pid, tgid, ppid, ts, NULL, 0,
                    exe, strlen(exe));
     } else {
-        emit_event(EV_EXEC, pid, tgid, ppid, ts, NULL, 0, "", 0);
+        emit_event_unlocked(EV_EXEC, pid, tgid, ppid, ts, NULL, 0, "", 0);
     }
 
     /* 2. EV_ARGV — blob is the raw NUL-separated argv bytes. */
@@ -415,7 +478,7 @@ void emit_exec_event(pid_t pid, const char *fallback_exe,
                                   g_exec_cmdline, ARGV_MAX_READ);
         if (n > 0) argv_len = (size_t)n;
     }
-    emit_event(EV_ARGV, pid, tgid, ppid, ts, NULL, 0,
+    emit_event_unlocked(EV_ARGV, pid, tgid, ppid, ts, NULL, 0,
                g_exec_cmdline, argv_len);
 
     /* 3. EV_ENV — blob is /proc/PID/environ, raw NUL-separated.
@@ -424,10 +487,11 @@ void emit_exec_event(pid_t pid, const char *fallback_exe,
         ssize_t n = read_proc_raw(pid, "environ",
                                   g_exec_env_buf, ENV_MAX_READ);
         if (n > 0) {
-            emit_event(EV_ENV, pid, tgid, ppid, ts, NULL, 0,
+            emit_event_unlocked(EV_ENV, pid, tgid, ppid, ts, NULL, 0,
                        g_exec_env_buf, (size_t)n);
         }
     }
+    wire_unlock();
 }
 
 void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,

@@ -31,6 +31,9 @@ use crate::sudwire;
 pub struct Stream {
     /// rel path → process row id of the last writer seen opening it.
     pub writers: Mutex<HashMap<String, i64>>,
+    /// tgid → (ts_ns, exe) of an EXEC whose /proc had already vanished;
+    /// the following EV_ARGV completes it into an event-minted row.
+    pub pending_exec: Mutex<HashMap<i32, (i64, String)>>,
     /// Pipe hit EOF and every buffered event was applied.
     done: (Mutex<bool>, Condvar),
 }
@@ -171,6 +174,7 @@ pub fn stream_events(box_id: i64, fd: i32, b: Arc<BoxState>,
                      trace_path: std::path::PathBuf) {
     let st = Arc::new(Stream {
         writers: Mutex::new(HashMap::new()),
+        pending_exec: Mutex::new(HashMap::new()),
         done: (Mutex::new(false), Condvar::new()),
     });
     streams().lock().unwrap().insert(box_id, st.clone());
@@ -238,7 +242,27 @@ fn apply_event(b: &BoxState, st: &Stream,
             // rather than trusting the first snapshot (capture.rs
             // exec_refresh) — otherwise the process table shows the
             // wrapper/shim forever and the real compilers never appear.
-            if ev.tgid > 0 { b.exec_refresh(ev.tgid as u32); }
+            // A pid gone before the event arrives (echo/as-sized tools
+            // finish inside the pipe latency) minted NO row at all:
+            // stash the event's exe and let the EV_ARGV right behind it
+            // complete an event-data row instead.
+            if ev.tgid > 0 && b.exec_refresh(ev.tgid as u32).is_none() {
+                let exe = String::from_utf8_lossy(&ev.blob).into_owned();
+                st.pending_exec.lock().unwrap()
+                    .insert(ev.tgid, (ev.ts_ns as i64, exe));
+            }
+        }
+        sudwire::EV_ARGV => {
+            let pend = st.pending_exec.lock().unwrap().remove(&ev.tgid);
+            if let Some((ts, exe)) = pend {
+                let argv: Vec<String> = ev.blob.split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect();
+                let cwd = cwds.get(&ev.tgid).cloned().unwrap_or_default();
+                b.record_proc_event(ev.tgid as u32, ev.ppid as u32,
+                                    ts, &exe, &cwd, &argv);
+            }
         }
         sudwire::EV_CWD => {
             if let Ok(p) = String::from_utf8(ev.blob.clone()) {
