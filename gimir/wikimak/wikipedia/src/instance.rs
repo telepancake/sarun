@@ -40,6 +40,31 @@ pub fn max_chain_id_for_root(root: &std::path::Path) -> u64 {
         .unwrap_or(DEFAULT_MAX_CHAIN_ID)
 }
 
+/// The read-side [`InstanceConfig`] for an EXISTING root: the page-id
+/// bound derives from the on-disk depot index, everything else is the
+/// wikimak driver CLI's defaults. This is what the engine's attach
+/// verb and the pinned readout ([`crate::readout`]) open with — one
+/// place, so a read-side open always matches what the writer created.
+/// (The title shard count is not persisted on disk; this assumes the
+/// CLI default, as every read-side embedder always has.)
+pub fn read_config(root: PathBuf) -> InstanceConfig {
+    let max_chain_id = max_chain_id_for_root(&root);
+    InstanceConfig {
+        root,
+        dbname: "wiki".into(),
+        max_chain_id,
+        depot: DepotConfig {
+            root: PathBuf::new(), // forced to <root>/depot/
+            max_chain_id,
+            file_size_threshold: 1 << 30,
+            eviction_dead_ratio: 0.5,
+        },
+        title_shard_count: 4,
+        title_seal_threshold_bytes: 8 << 20,
+        f1_seal_threshold_bytes: 0,
+    }
+}
+
 /// Configuration for opening an [`Instance`].
 ///
 /// `root` is the per-dbname directory: e.g.
@@ -145,6 +170,9 @@ pub struct Instance {
     /// the depot (rows durable, frames lost). Imports repair each
     /// touched page's rows from the chain before trusting them.
     pub(crate) suspect: bool,
+    /// Opened under a shared flock ([`Instance::open_read`]): every
+    /// write API refuses loudly, and reads never backfill.
+    pub(crate) read_only: bool,
     #[allow(dead_code)]
     // dbname retained for future logging / sharding decisions; unread today.
     pub(crate) dbname: String,
@@ -191,6 +219,16 @@ impl Instance {
     pub fn open(cfg: InstanceConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.root)?;
 
+        // One-process-per-root guard: an exclusive flock on <root>/.lock,
+        // held for the Instance's lifetime and auto-released by the
+        // kernel on any exit (even a crash). Taken BEFORE the depot
+        // opens: its open reads tier-file metadata (and may persist a
+        // counters rebuild), which must not race the incumbent writer's
+        // prepends/evictions. Shared-flock readers
+        // ([`Instance::open_read`]) stay possible — only they and a
+        // second writing instance are locked out while we hold this.
+        let lock = flock_root(&cfg.root, libc::LOCK_EX)?;
+
         // Depot — root forced to <root>/depot/ per SPEC.
         let mut depot_cfg = cfg.depot;
         depot_cfg.root = cfg.root.join("depot");
@@ -207,13 +245,6 @@ impl Instance {
             },
             None,
         )?;
-
-        // One-process-per-root guard: an exclusive flock on <root>/.lock,
-        // held for the Instance's lifetime and auto-released by the
-        // kernel on any exit (even a crash). External READERS of
-        // meta.db stay possible — only a second writing instance is
-        // locked out (it would interleave depot prepends unsynchronized).
-        let lock = acquire_root_lock(&cfg.root)?;
 
         // meta.db.
         let conn = Connection::open(cfg.root.join("meta.db"))?;
@@ -245,6 +276,7 @@ impl Instance {
                 _lock: lock,
             })),
             suspect,
+            read_only: false,
             // The page-id clip is the depot's 2^40 sanity ceiling, not
             // the config value: `cfg.max_chain_id` is only the fresh
             // index's SIZE HINT (the depot auto-grows past it), so a
@@ -260,9 +292,98 @@ impl Instance {
         })
     }
 
+    /// Open an EXISTING instance for reading, under a SHARED flock: any
+    /// number of concurrent readers, excluded only while a writer
+    /// ([`Instance::open`]) holds the root — and vice versa. The flock
+    /// is what keeps the depot's file set stable under a reader (import
+    /// prepends and eviction unlink tier files and patch next-pointers
+    /// in place; lock-free reads against a live writer would chase
+    /// dangling pointers), so hold the handle only as long as the read
+    /// takes: decode, drop.
+    ///
+    /// Never creates or migrates anything: a non-instance root is a
+    /// loud error, a meta.db predating the read-side schema migrations
+    /// is [`Error::LegacySchema`] (open it writable once to migrate),
+    /// and every write API refuses with [`Error::ReadOnly`] — including
+    /// the legacy-row ts backfill, which stays writer-side. A dirty
+    /// flag left by a crashed writer still demotes reads to the
+    /// chain-scan path (`suspect`); the repair itself is import-side
+    /// and therefore refused here.
+    pub fn open_read(cfg: InstanceConfig) -> Result<Self> {
+        if !cfg.root.join("meta.db").exists() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no wikimak instance at {}", cfg.root.display()),
+            )));
+        }
+        // Shared lock FIRST, same discipline as `open`: the depot open
+        // below reads tier-file metadata, which must not race a writer.
+        let lock = flock_root(&cfg.root, libc::LOCK_SH)?;
+
+        let mut depot_cfg = cfg.depot;
+        depot_cfg.root = cfg.root.join("depot");
+        let depot = Depot::open(depot_cfg)?;
+        let titles = Pool::open(
+            &cfg.root.join("titles"),
+            PoolConfig {
+                shard_count: cfg.title_shard_count,
+                seal_threshold_bytes: cfg.title_seal_threshold_bytes,
+            },
+            None,
+        )?;
+
+        // No DDL, no pragma writes, no ALTERs: the writer created the
+        // schema; this connection only ever SELECTs. Reads key off the
+        // migrated `ts`/`title_id` columns, so a pre-migration db is a
+        // loud error naming the cure, never a wrong answer.
+        let conn = Connection::open_with_flags(
+            cfg.root.join("meta.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE, // WAL recovery may write; we never do
+        )?;
+        for (table, col) in [("revisions_seen", "ts"), ("title_intervals", "title_id")] {
+            if !has_column(&conn, table, col)? {
+                return Err(Error::LegacySchema(cfg.root.clone()));
+            }
+        }
+        let suspect: bool = conn
+            .query_row(
+                "SELECT value FROM instance_flags WHERE key = 'dirty'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+            .unwrap_or(false);
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(InstanceInner {
+                depot,
+                titles,
+                conn,
+                repaired: Default::default(),
+                dirty_stamped: false,
+                import_errored: false,
+                title_cache: crate::titles::TitleCache::new(crate::titles::TITLE_CACHE_BUDGET),
+                _lock: lock,
+            })),
+            suspect,
+            read_only: true,
+            max_chain_id: wikimak_depot::CHAIN_ID_CEILING,
+            f1_seal_threshold_bytes: if cfg.f1_seal_threshold_bytes == 0 {
+                256 * 1024
+            } else {
+                cfg.f1_seal_threshold_bytes
+            },
+            title_shard_count: cfg.title_shard_count,
+            dbname: cfg.dbname,
+        })
+    }
+
     /// Import one `PageStream` into the instance. Per-page atomic.
     /// Returns counters describing the import.
     pub fn import<R: Read>(&self, stream: &mut PageStream<R>) -> Result<ImportStats> {
+        if self.read_only {
+            return Err(Error::ReadOnly("import"));
+        }
         do_import(self, stream)
     }
 
@@ -680,6 +801,22 @@ impl Instance {
         Ok(self.revision_query(page_id, ts_micros, true)?.and_then(|(_, t)| t))
     }
 
+    /// Text bytes of EXACTLY revision `rev_id` of `page_id` — the
+    /// read-at-rev primitive behind pinned attachments
+    /// ([`crate::readout`]). One newest-first early-stopping chain walk
+    /// (no sqlite row is consulted — the pin names its record): a pin
+    /// at the chain head decodes f0 only; an older pin pays the frames
+    /// down to its record and nothing past it. Residency is one frame
+    /// plus the one text copied out. `Ok(None)` = no such page or the
+    /// chain holds no such revision.
+    pub fn revision_text(&self, page_id: u64, rev_id: u64) -> Result<Option<Vec<u8>>> {
+        if page_id >= self.max_chain_id {
+            return Ok(None);
+        }
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        Ok(find_revision(&g.depot, page_id, rev_id, true)?.and_then(|(_, t)| t))
+    }
+
     /// The shared read core behind [`page_head`](Self::page_head) /
     /// [`page_head_text`](Self::page_head_text) /
     /// [`revision_at`](Self::revision_at) /
@@ -753,8 +890,10 @@ impl Instance {
         // predate the ts column, backfill them inside one transaction
         // so the NEXT read takes the indexed path. Rows the chain
         // doesn't confirm are never invented here; suspect-mode import
-        // repair owns row re-derivation.
-        let backfill = total > 0 && with_ts < total;
+        // repair owns row re-derivation. A read-only open still scans
+        // (correct answer) but never backfills — that write belongs to
+        // the exclusive-lock holder.
+        let backfill = total > 0 && with_ts < total && !self.read_only;
         if backfill {
             g.conn.execute("BEGIN IMMEDIATE", [])?;
         }
@@ -863,6 +1002,9 @@ impl Instance {
     /// pages are durably flushed — the watermark is the skip signal for
     /// the next sync, so writing it early would drop data on a crash.
     pub fn mark_part_seen(&self, filename: &str, sha256: Option<&str>) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly("mark_part_seen"));
+        }
         let g = self.inner.lock().expect("instance mutex poisoned");
         g.conn.execute(
             "INSERT OR REPLACE INTO parts_seen(part_filename, sha256, completed_at)
@@ -877,6 +1019,9 @@ impl Instance {
     /// there is nothing to reclaim; call once after a batch of imports,
     /// not per part.
     pub fn collect(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly("collect"));
+        }
         let g = self.inner.lock().expect("instance mutex poisoned");
         g.depot.collect()?;
         Ok(())
@@ -884,6 +1029,11 @@ impl Instance {
 
     /// Flush depot + strpool + sqlite to durable storage.
     pub fn flush(&self) -> Result<()> {
+        if self.read_only {
+            // A read-only flush would also CLEAR the dirty flag a
+            // crashed writer left — never touch the fence from a reader.
+            return Err(Error::ReadOnly("flush"));
+        }
         let mut g = self.inner.lock().expect("instance mutex poisoned");
         g.dirty_stamped = false; // next import re-stamps
         let g = &*g;
@@ -911,19 +1061,33 @@ impl Instance {
     }
 }
 
-/// Take the exclusive per-root flock, or fail with `InstanceLocked`.
-fn acquire_root_lock(root: &std::path::Path) -> Result<std::fs::File> {
+/// Take the per-root flock (`op` = `LOCK_EX` for the one writer,
+/// `LOCK_SH` for readers), non-blocking: contention is a loud
+/// `InstanceLocked`, never a silent wait behind a possibly hours-long
+/// import run. Kernel-released on any exit (even a crash).
+fn flock_root(root: &std::path::Path, op: libc::c_int) -> Result<std::fs::File> {
     use std::os::fd::AsRawFd;
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(root.join(".lock"))?;
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let rc = unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) };
     if rc != 0 {
         return Err(crate::error::Error::InstanceLocked(root.to_path_buf()));
     }
     Ok(f)
+}
+
+/// Does `table` carry a column named `col`? (PRAGMA table_info — a
+/// pure read; `open_read`'s schema fence and the lazy migrations both
+/// probe through this.)
+fn has_column(conn: &Connection, table: &str, col: &str) -> Result<bool> {
+    Ok(conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .flatten()
+        .any(|name| name == col))
 }
 
 /// Total order used to pick the newest revision: latest timestamp wins,
@@ -949,12 +1113,7 @@ fn ignore_no_rows<T>(e: rusqlite::Error) -> std::result::Result<Option<T>, Error
 /// makes the head/τ argmax one logarithmic lookup. Runs after the DDL,
 /// BEFORE the index — the index references the column.
 fn ensure_revision_ts_schema(conn: &Connection) -> Result<()> {
-    let has_ts = conn
-        .prepare("PRAGMA table_info(revisions_seen)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .flatten()
-        .any(|name| name == "ts");
-    if !has_ts {
+    if !has_column(conn, "revisions_seen", "ts")? {
         conn.execute("ALTER TABLE revisions_seen ADD COLUMN ts INTEGER", [])?;
     }
     conn.execute(
@@ -987,12 +1146,7 @@ fn ensure_revision_ts_schema(conn: &Connection) -> Result<()> {
 ///     rows that are empty on any imported store — not a text index
 ///     entrenching the redundant title copy).
 fn ensure_title_dictionary_schema(conn: &Connection) -> Result<()> {
-    let has_title_id = conn
-        .prepare("PRAGMA table_info(title_intervals)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .flatten()
-        .any(|name| name == "title_id");
-    if !has_title_id {
+    if !has_column(conn, "title_intervals", "title_id")? {
         conn.execute("ALTER TABLE title_intervals ADD COLUMN title_id INTEGER", [])?;
     }
     conn.execute_batch(

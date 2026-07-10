@@ -14,6 +14,11 @@ Real-effect assertions (never shape-only):
     (readouts take the shared lock only for the decode, then drop it)
   • after the update bumps the head, the attachment still serves the
     PINNED revision's bytes; the new head file does not appear
+  • the SAME cure for wiki: `wikimak import` succeeds while the page
+    is attached+read; the attachment keeps serving the PINNED rev's
+    bytes after the head moves; a SECOND attachment on the same root
+    attaches and reads (pre-cure the first hydrated attachment held
+    the root's exclusive flock and both failed "locked")
   • a write to an ATTACHED key is EROFS with NO captured row
   • all three attachments appear in the session dict's "attachments",
     named for their objects (git:…/main@sha8, wiki:…@rN, ietf:…@rev)
@@ -103,6 +108,27 @@ class IetfHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b)
     def log_message(self, *a):
         pass
+
+
+# Page 1's head moved 100 → 101: the attachment pinned @r100 must keep
+# serving the redirect text after this lands.
+WIKI_BUMP = """<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
+  <siteinfo>
+    <sitename>TestWiki</sitename><dbname>testwiki</dbname><base>x</base>
+    <generator>g</generator><case>first-letter</case>
+    <namespaces><namespace key="0" case="first-letter"/></namespaces>
+  </siteinfo>
+  <page><title>Old Title</title><ns>0</ns><id>1</id>
+    <revision><id>101</id><parentid>100</parentid>
+      <timestamp>2026-05-05T00:00:00Z</timestamp>
+      <contributor><username>Alice</username><id>10</id></contributor>
+      <comment>no longer a redirect</comment>
+      <model>wikitext</model><format>text/x-wiki</format>
+      <text xml:space="preserve">no longer a redirect: real content now</text>
+    </revision>
+  </page>
+</mediawiki>
+"""
 
 
 class IetfBumpHandler(IetfHandler):
@@ -271,6 +297,59 @@ def main():
         check(row_bytes(m, sp, "pinned.txt") == b"mesh draft rev one\n",
               "attached content stays the pinned rev's bytes after head bump")
 
+        # The SAME cure for wiki. (a) `wikimak import` (exclusive
+        # flock) succeeds while the page attachment is hydrated and was
+        # already read: the old readout held the instance root's
+        # EXCLUSIVE flock for the attachment's lifetime and this import
+        # failed "locked by another process"; now the pinned decode
+        # borrows a SHARED lock and drops it.
+        bump = tmp / "wiki_bump.xml"
+        bump.write_text(WIKI_BUMP)
+        r = subprocess.run([str(TOOLS["wikimak"]), "import", str(bump),
+                            str(wroot)],
+                           capture_output=True, text=True)
+        check(r.returncode == 0 and "revisions new 1" in r.stdout,
+              f"wikimak import succeeds while the page is attached+read "
+              f"(rc={r.returncode}: {(r.stderr or r.stdout)[:300]})")
+        # The store REALLY moved: page 1's head text via the CLI.
+        r = subprocess.run([str(TOOLS["wikimak"]), "text", str(wroot), "1"],
+                           capture_output=True, text=True)
+        check(r.returncode == 0 and "no longer a redirect" in r.stdout,
+              f"store head moved to the imported revision "
+              f"(rc={r.returncode}: {(r.stderr or r.stdout)[:200]})")
+
+        # (b) Pin honesty: the attachment named @r100 keeps serving rev
+        # 100's bytes (the redirect) after the head moved to rev 101.
+        r = subprocess.run(
+            [str(BIN), "run", "WORK", "--", "sh", "-c",
+             "cat '/wiki/Old Title.txt' > /wikipinned.txt"],
+            capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0,
+              f"pinned wiki page still readable after import "
+              f"(rc={r.returncode}: {r.stderr[:300]})")
+        check(row_bytes(m, sp, "wikipinned.txt") == b"#REDIRECT [[New Title]]",
+              "attached wiki content stays the pinned rev's bytes after "
+              "head bump")
+
+        # (c) A SECOND attachment on the same root attaches and reads
+        # (pre-cure: the first attachment's held lock made this fail).
+        r = subprocess.run([str(BIN), "WORK", "attach", "wiki", str(wroot),
+                            "2", "wiki2"],
+                           capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0
+              and "attached wiki:wiki/New Title@r201" in r.stdout,
+              f"second attachment on the same wiki root succeeds "
+              f"(rc={r.returncode}: {(r.stderr or r.stdout)[:200]})")
+        r = subprocess.run(
+            [str(BIN), "run", "WORK", "--", "sh", "-c",
+             "cat '/wiki2/New Title.txt' > /wiki2.txt"],
+            capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0,
+              f"second wiki attachment readable (rc={r.returncode}: "
+              f"{r.stderr[:300]})")
+        check(row_bytes(m, sp, "wiki2.txt") == b"hello world, expanded.",
+              "second attachment serves ITS pinned page's bytes")
+
         # Checked-out git rows are ORDINARY box changes: writable.
         r = subprocess.run(
             [str(BIN), "run", "WORK", "--", "sh", "-c",
@@ -292,21 +371,22 @@ def main():
             check(key.strip("'").lstrip("/") not in rows(sp),
                   f"rejected write to {key} left NO captured row")
 
-        # UI visibility: TWO rows in the session dict's "attachments"
-        # (wiki + ietf — a checkout is box content, not an attachment);
-        # parents stay box-only (empty here).
+        # UI visibility: THREE rows in the session dict's "attachments"
+        # (wiki + ietf + the second wiki — a checkout is box content,
+        # not an attachment); parents stay box-only (empty here).
         rep = m.sync_request(sock, type="ui", verb="session_dicts", args=[])
         sessions = (rep or {}).get("r", [])
         mine = next((s for s in sessions if s.get("box_id") == sid), {})
         atts = mine.get("attachments") or []
-        check(len(atts) == 2,
-              f"two rows in session attachments (got {atts!r})")
+        check(len(atts) == 3,
+              f"three rows in session attachments (got {atts!r})")
         names = [a.get("name") for a in atts]
         kinds = [a.get("kind") for a in atts]
-        for want in ("wiki:wiki/Old Title@r", "ietf:draft-test-mesh@01"):
+        for want in ("wiki:wiki/Old Title@r100", "ietf:draft-test-mesh@01",
+                     "wiki:wiki/New Title@r201"):
             check(any(n and n.startswith(want) for n in names),
                   f"attachment named {want}… (names {names!r})")
-        check(kinds == ["wiki", "ietf"]
+        check(kinds == ["wiki", "ietf", "wiki"]
               and all(a.get("rev") for a in atts),
               f"attachment rows carry kind + pinned rev (got {atts!r})")
         check(mine.get("parents") == [],

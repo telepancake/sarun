@@ -15,14 +15,13 @@
 //! NOT attach — a git commit is CHECKED OUT into the box's changes
 //! (`git_checkout`), streamed with bounded memory.
 //!
-//! Pinning honesty: `ietf` serves the attachment row's PINNED revision
-//! (`DraftReadout` is a read-at-rev adapter: one leaf, bytes frozen at
-//! the pin, no lock held between reads — `ietfmak update` runs freely
-//! alongside). `wiki` still records the head rev seen at attach time
-//! for identity/display but serves the store's CURRENT head at
-//! first-use decode — its read-at-rev adapter is the remaining
-//! adapters-v2 chip. Within a hydration the OnceLock freezes what is
-//! served either way.
+//! Pinning honesty: both kinds serve the attachment row's PINNED
+//! revision through read-at-rev adapters (`PageReadout`,
+//! `DraftReadout`): one leaf, bytes frozen at the pin, decoded with a
+//! bounded early-stopping walk under a SHARED flock taken only for the
+//! decode — `wikimak import`/`ietfmak update` run freely alongside a
+//! hydrated attachment, and later head bumps stay invisible. Within a
+//! hydration the OnceLock freezes the readout either way.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -159,9 +158,15 @@ fn open_readout(ext: &ExtRef) -> Result<Arc<dyn Readout>, String> {
              commit out instead — `git_checkout` streams {} into the box's \
              changes", ext.rev)),
         "wiki" => {
-            let inst = open_wiki_instance(&ext.store)?;
+            // Bookkeeping only: PageReadout opens the store read-side
+            // (SHARED flock) at first access, decodes ONLY the pinned
+            // revision (ext.rev), and drops the lock — a hydrated
+            // attachment neither blocks `wikimak import`/`sync` nor
+            // drifts to a newer head.
             let page: u64 = ext.refname.parse().map_err(|_|
                 format!("wiki ref {:?} is not a page id", ext.refname))?;
+            let rev: u64 = ext.rev.parse().map_err(|_|
+                format!("wiki rev {:?} is not a revision id", ext.rev))?;
             // name is "wiki:<wiki>/<title>@r<rev>" (control.rs
             // wiki_attach): strip the kind, drop the pin at the LAST
             // '@' (titles may contain '@'), drop the wiki label at the
@@ -170,8 +175,8 @@ fn open_readout(ext: &ExtRef) -> Result<Arc<dyn Readout>, String> {
                 .and_then(|s| s.rsplit_once('@'))
                 .and_then(|(t, _)| t.split_once('/'))
                 .map(|(_, t)| t.to_string());
-            Ok(Arc::new(wikimak_wikipedia::readout::PageHeadReadout::new(
-                inst, page, title.as_deref())))
+            Ok(Arc::new(wikimak_wikipedia::readout::PageReadout::new(
+                ext.store.clone().into(), page, title.as_deref(), rev)))
         }
         "ietf" => {
             // Bookkeeping only: DraftReadout opens the store read-side
@@ -184,31 +189,6 @@ fn open_readout(ext: &ExtRef) -> Result<Arc<dyn Readout>, String> {
         }
         other => Err(format!("unknown attachment kind {other:?}")),
     }
-}
-
-/// Same sizing defaults as the wikimak driver CLI (and control.rs's
-/// read-side open — dedupe when the attach verbs move here). The
-/// page-id bound derives from the existing depot's on-disk index: a
-/// read-side open must match whatever the writer created it with.
-fn open_wiki_instance(root: &str)
-    -> Result<wikimak_wikipedia::Instance, String>
-{
-    let max_chain_id =
-        wikimak_wikipedia::max_chain_id_for_root(std::path::Path::new(root));
-    wikimak_wikipedia::Instance::open(wikimak_wikipedia::InstanceConfig {
-        root: std::path::PathBuf::from(root),
-        dbname: "wiki".into(),
-        max_chain_id,
-        depot: wikimak_depot::DepotConfig {
-            root: Default::default(),
-            max_chain_id,
-            file_size_threshold: 1 << 30,
-            eviction_dead_ratio: 0.5,
-        },
-        title_shard_count: 4,
-        title_seal_threshold_bytes: 8 << 20,
-        f1_seal_threshold_bytes: 0,
-    }).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -225,14 +205,41 @@ mod tests {
 
     // A broken/missing store must degrade to misses (resolve falls
     // through; §8 independence keeps the box valid), never panic or
-    // block hydration.
+    // block hydration. (The `git` kind's recorded error is the removal
+    // notice pointing at checkout — 6cc0869 — not an open failure.)
     #[test]
     fn missing_store_is_a_miss_not_an_error() {
         let a = ext("git", "sdk");
         assert_eq!(a.entry("sdk/README"), None);
         assert!(a.children("sdk").is_empty());
         assert!(a.blob("sdk/README").is_none());
-        assert!(a.error().unwrap().contains("/nonexistent"));
+        assert!(a.error().unwrap().contains("checkout"));
+    }
+
+    // Malformed wiki bookkeeping (non-numeric page/rev) is a recorded
+    // error; a well-formed row against a missing store is pure misses
+    // — the readout resolves those store-side at first access, so
+    // construction records nothing.
+    #[test]
+    fn wiki_rows_error_on_bad_pin_miss_on_missing_store() {
+        let a = ext("wiki", "sdk"); // refname "main": not a page id
+        assert_eq!(a.entry("sdk/x"), None);
+        assert!(a.error().unwrap().contains("page id"));
+
+        let mut e = ext("wiki", "sdk").ext;
+        e.refname = "7".into(); // rev "abc": not a revision id
+        let a = ExtAttachment::new(e);
+        assert_eq!(a.entry("sdk/x"), None);
+        assert!(a.error().unwrap().contains("revision id"));
+
+        let mut e = ext("wiki", "sdk").ext;
+        e.refname = "7".into();
+        e.rev = "100".into();
+        let a = ExtAttachment::new(e);
+        assert_eq!(a.entry("sdk/x"), None);
+        assert!(a.children("sdk").is_empty());
+        assert!(a.blob("sdk/x").is_none());
+        assert!(a.error().is_none(), "missing store is a readout miss, not an open error");
     }
 
     // The prefix chain is synthesized without opening the store: the

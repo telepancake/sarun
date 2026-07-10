@@ -29,8 +29,8 @@ pub(crate) mod titles;
 
 pub use error::{Error, Result};
 pub use instance::{
-    max_chain_id_for_root, ContributorMeta, HistoryEntry, HistoryIter, ImportStats, Instance,
-    InstanceConfig, RevisionMeta, DEFAULT_MAX_CHAIN_ID,
+    max_chain_id_for_root, read_config, ContributorMeta, HistoryEntry, HistoryIter, ImportStats,
+    Instance, InstanceConfig, RevisionMeta, DEFAULT_MAX_CHAIN_ID,
 };
 #[cfg(feature = "fetch")]
 pub use sync::{sync, SyncStats};

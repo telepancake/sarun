@@ -61,18 +61,19 @@ each corpus's shape wants, served through sarun. Three mirrors first:
    §8 byte-identical invariant and laziness (200-file store: attach is
    O(bookkeeping), one read = one cache blob).
 4. **Serve/browse**: all three attach verbs live — `git_attach`,
-   `wiki_attach` (a page's head text), `ietf_attach` (the pinned
-   revision of a draft, served read-at-rev) — one CLI surface:
+   `wiki_attach` (the pinned revision of a page), `ietf_attach` (the
+   pinned revision of a draft) — one CLI surface:
    `sarun NAME attach git|wiki|ietf
    SRC REF [AT]`. Each appends one pinned read-only reference (named
    `git:main@sha8`, `wiki:enwiki/Title@r100`, `ietf:draft-x@01`),
-   served lazily through the readout trait and shown on the owning
-   session row (`attachments` in the session dict). The
+   served read-at-rev, lazily through the readout trait (a SHARED
+   flock taken only for the bounded pinned decode — imports/updates
+   run freely alongside a hydrated attachment) and shown on the
+   owning session row (`attachments` in the session dict). The
    mirror crates' read paths are feature-gated (`fetch` off in-engine):
    the engine never dials out; fetching stays in wikimak/ietfmak/
    gitdepot. `test_mirror_attach_rs.py` proves all three through the
-   real CLI. Later: browse panes per mirror; a read-at-rev adapter
-   for wiki (it pins identity today; ietf and git pin content).
+   real CLI. Later: browse panes per mirror.
 
 ## Non-goals for now
 

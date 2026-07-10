@@ -41,4 +41,19 @@ pub enum Error {
     /// lock). One process at a time per root — by lock, not convention.
     #[error("instance {0} is locked by another process")]
     InstanceLocked(std::path::PathBuf),
+
+    /// A write API was called on an instance opened via
+    /// [`crate::Instance::open_read`] (shared flock — readers must not
+    /// mutate the store the writer's exclusive lock protects).
+    #[error("instance opened read-only (open_read): {0} refused")]
+    ReadOnly(&'static str),
+
+    /// `open_read` found a meta.db predating the read-side schema
+    /// migrations (`revisions_seen.ts` / `title_intervals.title_id`).
+    /// Only a writer open may ALTER; readers fail loudly, naming the cure.
+    #[error(
+        "meta.db at {0} predates the current schema: open it writable once \
+         (any wikimak command) to migrate, then retry"
+    )]
+    LegacySchema(std::path::PathBuf),
 }

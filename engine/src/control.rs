@@ -2518,10 +2518,11 @@ macro_rules! ui_verbs {
         }
         // Attach a wikipedia mirror page (wikimak instance root) as an
         // external RO reference: args [sid, root, page_id, prefix?].
-        // Bookkeeping only — title/id resolution + head rev pin here;
-        // the page text is decoded by the overlay's readout on first
-        // read and serves as <title>.txt under prefix.
-        "wiki_attach", "SID ROOT PAGE [PREFIX]", "attach a wikipedia mirror page as a read-only external reference" => {
+        // Bookkeeping only — title/id resolution here, and the head
+        // rev read here is the PIN: the readout serves exactly that
+        // revision as <title>.txt under prefix at first read
+        // (attach.rs), even after later imports move the head.
+        "wiki_attach", "SID ROOT PAGE [PREFIX]", "attach a wikipedia mirror page as a read-only external reference pinned at its current head revision" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -2533,6 +2534,9 @@ macro_rules! ui_verbs {
                 return json!({"ok": false, "error": "need root + page"});
             };
             let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
+            // Read-side open (shared flock, dropped at scope end): the
+            // pin must be attachable while another attachment is
+            // hydrated — and never block an import running elsewhere.
             let inst = match open_wiki_instance(root) {
                 Ok(i) => i,
                 Err(e) => return json!({"ok": false, "error": e}),
@@ -2576,8 +2580,9 @@ macro_rules! ui_verbs {
                         .find(|(i, _)| *i == page).map(|(_, t)| t))
                     .unwrap_or_else(|| format!("page-{page}")),
             };
-            // page_head only — the rev pin; text stays in the store
-            // until the overlay's readout decodes it at first read.
+            // page_head decodes ONE frame for the rev PIN — never a
+            // full history walk; the pinned decode happens readout-side
+            // at first read.
             let head = match inst.page_head(page) {
                 Ok(Some(h)) => h,
                 Ok(None) => return json!({"ok": false,
@@ -4122,29 +4127,17 @@ fn hydrate_box(ov: &crate::overlay::Overlay, sid: i64)
     ov.box_of(sid)
 }
 
-/// Open a wikimak instance READ-ONLY-ish (the read paths never write
-/// chains) with the same sizing defaults as the wikimak driver CLI.
-/// The page-id bound derives from the existing depot's on-disk index:
-/// a read-side open must match whatever the writer created it with.
+/// Open a wikimak instance READ-ONLY (shared flock, every write API
+/// refuses): sizing defaults come from `wikimak_wikipedia::read_config`
+/// (page-id bound derived from the existing depot's on-disk index).
+/// Coexists with hydrated attachments and other readers; only a
+/// writing `wikimak import`/`sync` briefly excludes it.
 fn open_wiki_instance(root: &str)
     -> Result<wikimak_wikipedia::Instance, String>
 {
-    let max_chain_id =
-        wikimak_wikipedia::max_chain_id_for_root(std::path::Path::new(root));
-    wikimak_wikipedia::Instance::open(wikimak_wikipedia::InstanceConfig {
-        root: std::path::PathBuf::from(root),
-        dbname: "wiki".into(),
-        max_chain_id,
-        depot: wikimak_depot::DepotConfig {
-            root: Default::default(), // forced to <root>/depot/
-            max_chain_id,
-            file_size_threshold: 1 << 30,
-            eviction_dead_ratio: 0.5,
-        },
-        title_shard_count: 4,
-        title_seal_threshold_bytes: 8 << 20,
-        f1_seal_threshold_bytes: 0,
-    }).map_err(|e| e.to_string())
+    wikimak_wikipedia::Instance::open_read(
+        wikimak_wikipedia::read_config(std::path::PathBuf::from(root)))
+        .map_err(|e| e.to_string())
 }
 
 // ── svc: engine-spliced host↔box service streams ────────────────────────────
