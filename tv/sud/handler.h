@@ -90,6 +90,38 @@ extern volatile unsigned int g_sud_syslog_head;
 #define SUD_SYSLOG_NORETURN ((long)0xDEADBEEFCAFEBABEULL)
 
 /* ================================================================
+ * Per-syscall profile: every trapped syscall's handler time (rdtsc
+ * cycles) accumulated per syscall nr, per PROCESS (threads share the
+ * table via atomic adds). The trace addin ships it as one EV_PROF
+ * event at exit_group so a slow box can be diagnosed from its trace
+ * — which syscalls burned the time, and how much of it was spent
+ * waiting on the trace wire itself (g_sud_prof_wire_cycles) versus
+ * doing real interception work. Costs two rdtsc + two atomic adds
+ * per trap — noise against the ~1.7µs trap floor.
+ * ================================================================ */
+#define SUD_PROF_MAX 512   /* [SUD_PROF_MAX] = overflow bucket for nr >= 512 */
+struct sud_prof_ent {
+    /* _Alignas: the i386 ABI aligns u64 to 4, but the atomic add wants
+     * natural (8-byte) alignment on both ELF classes. */
+    _Alignas(8) unsigned long long cycles;
+    unsigned int count;
+    unsigned int pad_;
+};
+extern struct sud_prof_ent g_sud_prof[SUD_PROF_MAX + 1];
+/* Cycles spent inside wire_lock + the trace-pipe write, across all
+ * events this process emitted — the backpressure signal: when this
+ * dominates, the box is throttled by the ENGINE's reader, not by
+ * interception cost. */
+extern _Alignas(8) volatile unsigned long long g_sud_prof_wire_cycles;
+
+static inline unsigned long long sud_prof_rdtsc(void)
+{
+    unsigned int lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((unsigned long long)hi << 32) | lo;
+}
+
+/* ================================================================
  * Function declarations
  * ================================================================ */
 void install_sigsys_handler_raw(void);

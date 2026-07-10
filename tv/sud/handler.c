@@ -292,12 +292,17 @@ static void sigsys_diag_dump(const char *tag, ucontext_t *uc,
  * ================================================================ */
 static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw);
 
+/* Per-process, threads share via atomic adds (see handler.h). */
+struct sud_prof_ent g_sud_prof[SUD_PROF_MAX + 1];
+_Alignas(8) volatile unsigned long long g_sud_prof_wire_cycles;
+
 void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 {
     ucontext_t *uc = (ucontext_t *)uctx_raw;
     long nr = UC_SYSCALL_NR(uc);
     unsigned long pc = UC_PC(uc);
     int tid = (int)raw_gettid();
+    unsigned long long prof_t0 = sud_prof_rdtsc();
 
     /* Allocate a ring slot up-front and mark it "in progress" so that
      * if the inner handler crashes (bad pointer, etc.) the crash
@@ -314,6 +319,14 @@ void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     __atomic_thread_fence(__ATOMIC_RELEASE);
 
     sigsys_handler_inner(sig, info, uctx_raw);
+
+    {
+        unsigned int idx = (nr >= 0 && nr < SUD_PROF_MAX)
+            ? (unsigned int)nr : SUD_PROF_MAX;
+        __sync_fetch_and_add(&g_sud_prof[idx].count, 1u);
+        __sync_fetch_and_add(&g_sud_prof[idx].cycles,
+                             sud_prof_rdtsc() - prof_t0);
+    }
 
     /* Record the final return value the handler placed into the ucontext.
      * The inner handler ends with `UC_SET_RET(uc, ret)` which writes the

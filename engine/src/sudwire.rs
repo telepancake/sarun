@@ -161,6 +161,11 @@ pub const EV_CWD: i64 = 6;
 pub const EV_OPEN: i64 = 5;
 pub const EV_STDOUT: i64 = 7;
 pub const EV_STDERR: i64 = 8;
+/// blob = LE u32 elf class (32|64), then {u32 nr, u32 count, u64 cycles}
+/// triples; nr 0xFFFFFFFE = handler overflow bucket, 0xFFFFFFFF = cycles
+/// waiting on the trace wire (lock + pipe write). One per process, at
+/// exit_group.
+pub const EV_PROF: i64 = 9;
 
 /// Incremental TRACE-stream decoder: feed() raw bytes as they arrive,
 /// collect complete events. Keeps one delta state per observed stream id

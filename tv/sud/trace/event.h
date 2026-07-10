@@ -80,6 +80,7 @@ void emit_unlink_event(pid_t pid, const char *path, long ret);
 void emit_write_event(pid_t pid, const char *stream,
                       const void *data_buf, size_t count);
 void emit_exit_event(pid_t pid, int status);
+void emit_prof_event(pid_t pid);
 
 /* ================================================================
  * STDOUT filtering

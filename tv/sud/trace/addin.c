@@ -72,6 +72,12 @@ static void trace_fork_child(void)
 
 static int trace_pre_syscall(struct sud_syscall_ctx *ctx)
 {
+    /* Last chance to account for this process: ship the per-syscall
+     * profile (handler cycles by nr + wire-wait share) before the
+     * process image goes away. Not handled — the real exit proceeds. */
+#ifdef SYS_exit_group
+    if (ctx->nr == SYS_exit_group) emit_prof_event(ctx->tid);
+#endif
 #ifdef SYS_readlinkat
     if (ctx->nr == SYS_readlinkat && g_target_exe[0] &&
         trace_is_proc_self_exe((const char *)ctx->args[1])) {

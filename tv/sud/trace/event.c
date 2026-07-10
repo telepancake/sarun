@@ -42,6 +42,7 @@
 #include "libc-fs/fmt.h"
 #include "sud/trace/event.h"
 #include "sud/state.h"
+#include "sud/handler.h"
 #include "wire/wire.h"
 #include "trace/trace.h"
 
@@ -215,26 +216,83 @@ static unsigned int sud_minor(unsigned long dev)
 /* Cross-process futex mutex on the shared page (non-PRIVATE ops: the
  * word is MAP_SHARED across every traced process, both ELF classes).
  * Degenerates to the process-local fallback page when SUD_STATE_FD is
- * absent — still correct, just process-local like the stream ids. */
+ * absent — still correct, just process-local like the stream ids.
+ *
+ * ROBUSTNESS: the word stores the holder's TID (bit 31 = "waiters"),
+ * not an anonymous 1/2. A holder can die WITHOUT unlocking — SIGKILL,
+ * the OOM killer, a build script's `kill -9`, all while blocked in
+ * raw_write on a momentarily full pipe (a wide window under -j30) —
+ * and a plain mutex would then freeze every traced process in the box
+ * at its next emit, forever. So a waiter never sleeps unbounded: it
+ * waits 1s at a time and, on each timeout, probes the recorded holder
+ * with tkill(tid, 0); a dead holder's lock is stolen. If the holder
+ * died mid-write the stream framing is torn and the engine's decoder
+ * poisons LOUDLY — capture degrades, the BUILD keeps running. Tracing
+ * must never wedge the workload it observes.
+ * (A stolen tid could in principle be recycled to an unrelated live
+ * task before we probe — the probe then keeps us waiting; another 1s
+ * cycle re-probes. Recycling into a task that never exits is the one
+ * case that still wedges; pid-space wraparound inside a 1s window is
+ * vanishingly rare.) */
+#define WIRE_WAITERS 0x80000000u
+#ifndef SYS_tkill
+#define SYS_tkill __NR_tkill
+#endif
+#ifndef ESRCH
+#define ESRCH 3
+#endif
+
+static int wire_tid_dead(uint32_t tid)
+{
+    return raw_syscall6(SYS_tkill, (long)tid, 0, 0, 0, 0, 0) == -ESRCH;
+}
+
 static void wire_lock(void)
 {
     volatile uint32_t *w = &g_shared->wire_write_lock;
-    uint32_t expected = 0;
-    if (__sync_bool_compare_and_swap(w, 0u, 1u)) return;
+    uint32_t self = (uint32_t)raw_gettid();
+    if (__sync_bool_compare_and_swap(w, 0u, self)) return;   /* fast path */
+    unsigned long long t0 = sud_prof_rdtsc();
     for (;;) {
-        uint32_t cur = __sync_lock_test_and_set(w, 2u);
-        if (cur == 0) return;
+        uint32_t cur = *w;
+        if (cur == 0) {
+            /* Reacquire with the waiters bit: we may have been one of
+             * several sleepers and can't tell — an unlock that wakes
+             * only us must still wake the next one after our unlock. */
+            if (__sync_bool_compare_and_swap(w, 0u, self | WIRE_WAITERS))
+                break;
+            continue;
+        }
+        if (!(cur & WIRE_WAITERS)) {
+            if (!__sync_bool_compare_and_swap(w, cur, cur | WIRE_WAITERS))
+                continue;
+            cur |= WIRE_WAITERS;
+        }
 #ifdef SYS_futex
-        raw_syscall6(SYS_futex, (long)w, 0 /*FUTEX_WAIT*/, 2u, 0, 0, 0);
+        {
+            struct timespec ts = { 1, 0 };
+            raw_syscall6(SYS_futex, (long)w, 0 /*FUTEX_WAIT*/, (long)cur,
+                         (long)&ts, 0, 0);
+        }
 #endif
+        cur = *w;
+        if (cur != 0) {
+            uint32_t holder = cur & ~WIRE_WAITERS;
+            if (holder && holder != self && wire_tid_dead(holder)) {
+                if (__sync_bool_compare_and_swap(w, cur,
+                                                 self | WIRE_WAITERS))
+                    break;   /* stole a dead holder's lock */
+            }
+        }
     }
+    __sync_fetch_and_add(&g_sud_prof_wire_cycles, sud_prof_rdtsc() - t0);
 }
 
 static void wire_unlock(void)
 {
     volatile uint32_t *w = &g_shared->wire_write_lock;
     uint32_t prev = __sync_lock_test_and_set(w, 0u);
-    if (prev == 2u) {
+    if (prev & WIRE_WAITERS) {
 #ifdef SYS_futex
         raw_syscall6(SYS_futex, (long)w, 1 /*FUTEX_WAKE*/, 1, 0, 0, 0);
 #endif
@@ -256,12 +314,17 @@ static void emit_raw(const void *buf, size_t len)
      * a parallel build runs many recipe threads that all emit. */
     const char *p = (const char *)buf;
     size_t off = 0;
+    unsigned long long t0 = sud_prof_rdtsc();
     while (off < len) {
         ssize_t n = raw_write(g_out_fd, p + off, len - off);
         if (n == -EINTR) continue;   /* a truncated event kills framing */
         if (n <= 0) break;
         off += n;
     }
+    /* Wire-wait accounting: time blocked writing INTO the trace pipe is
+     * the reader-backpressure signal — when it dominates a process's
+     * profile, the box is throttled by the engine, not by real work. */
+    __sync_fetch_and_add(&g_sud_prof_wire_cycles, sud_prof_rdtsc() - t0);
 }
 
 /* ================================================================
@@ -659,6 +722,53 @@ void emit_write_event(pid_t pid, const char *stream,
     int32_t ev = (stream[0] == 'S' && stream[3] == 'E') ? EV_STDERR
                                                         : EV_STDOUT;
     emit_event(ev, pid, tgid, ppid, ts, NULL, 0, data_buf, to_read);
+}
+
+/* Ship this process's per-syscall handler profile (see handler.h) as
+ * one EV_PROF event — called from the exit_group hook, the last emit
+ * this process makes. Blob: LE u32 elf class, then {u32 nr, u32 count,
+ * u64 cycles} per NONZERO bucket; two pseudo-nrs close the list:
+ * 0xFFFFFFFE = overflow bucket (nr >= 512), 0xFFFFFFFF = cycles spent
+ * waiting on the trace wire (lock + pipe write). */
+static void prof_put_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+void emit_prof_event(pid_t pid)
+{
+    static uint8_t blob[4 + (SUD_PROF_MAX + 2) * 16];
+    pid_t tgid = get_tgid(pid);
+    pid_t ppid = get_ppid(pid);
+    uint64_t ts = get_ts_ns();
+
+    size_t off = 4;
+#if defined(__x86_64__)
+    prof_put_u32(blob, 64);
+#else
+    prof_put_u32(blob, 32);
+#endif
+    for (unsigned i = 0; i <= SUD_PROF_MAX; i++) {
+        if (!g_sud_prof[i].count) continue;
+        uint32_t nr = (i == SUD_PROF_MAX) ? 0xFFFFFFFEu : i;
+        prof_put_u32(blob + off, nr);
+        prof_put_u32(blob + off + 4, g_sud_prof[i].count);
+        unsigned long long c = g_sud_prof[i].cycles;
+        prof_put_u32(blob + off + 8,  (uint32_t)c);
+        prof_put_u32(blob + off + 12, (uint32_t)(c >> 32));
+        off += 16;
+    }
+    unsigned long long wc = g_sud_prof_wire_cycles;
+    if (wc) {
+        prof_put_u32(blob + off, 0xFFFFFFFFu);
+        prof_put_u32(blob + off + 4, 1u);
+        prof_put_u32(blob + off + 8,  (uint32_t)wc);
+        prof_put_u32(blob + off + 12, (uint32_t)(wc >> 32));
+        off += 16;
+    }
+    if (off == 4) return;   /* nothing trapped — nothing to report */
+    emit_event(EV_PROF, pid, tgid, ppid, ts, NULL, 0, blob, off);
 }
 
 void emit_exit_event(pid_t pid, int status)

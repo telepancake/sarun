@@ -81,6 +81,12 @@ enum {
     EV_CWD    = 6,  /* blob = path bytes                  */
     EV_STDOUT = 7,  /* blob = stdout bytes                */
     EV_STDERR = 8,  /* blob = stderr bytes                */
+    EV_PROF   = 9,  /* blob = LE u32 elf class (32|64), then per-syscall
+                     * triples { u32 nr, u32 count, u64 cycles }; nr
+                     * 0xFFFFFFFE = handler overflow bucket (nr >= 512),
+                     * 0xFFFFFFFF = cycles spent waiting on the trace
+                     * wire (lock + pipe write). Emitted once per
+                     * process at exit_group. */
 };
 
 /* exit.status values */
