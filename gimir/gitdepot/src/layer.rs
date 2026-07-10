@@ -368,11 +368,6 @@ pub fn extract_lane_entries(union: &[u8], lane: u32) -> Result<Vec<(Vec<u8>, Mod
 
 // --------------------------------------------- stacked current-state reader
 
-/// A hole in the byte encoding: backdrop anchor, no blob, no children.
-fn is_removal(n: &depot::walk::Node) -> bool {
-    n.backdrop && n.blob.is_none() && n.child_count == 0
-}
-
 /// The effective current variants — the base full-state lockstep-merged with
 /// EVERY live delta layer (§5: "refPrefix plus the live stack, read by
 /// lockstep iteration") — yielded per file in container order. Nothing is
@@ -382,11 +377,12 @@ fn is_removal(n: &depot::walk::Node) -> bool {
 /// `visit` is a borrowed slice into one of the input buffers.
 ///
 /// Sources are ordered bottom→top: the base, then the stack layers oldest
-/// first. Per node the layers fold in that order: a backdrop node erases
-/// everything below it and re-resolves over nothing; a plain delta node
-/// overlays (blob replaces, meta children override individually). Untouched
-/// base subtrees stream straight through. `k` is the geostack depth
-/// (~log(revisions since the last seal)), so the merge stays narrow.
+/// first. Records are TOTAL (§4): at a file name the topmost source holding
+/// the name IS the variant (a hole means removed) — nothing below it is
+/// read. Directory nodes merge children across sources (a backdrop dir
+/// erases the sources below it first). Untouched base subtrees stream
+/// straight through. `k` is the geostack depth (~log(revisions since the
+/// last seal)), so the merge stays narrow.
 pub fn visit_stacked(
     base: &[u8],
     stack: &[Vec<u8>],
@@ -428,8 +424,9 @@ fn base_only_child<'a>(
     match classify(name) {
         Some(Kind::File(gitname, slot)) => {
             let keep = push_seg(path, gitname);
-            let (mode, bitmap, content) = read_facets(cur)?;
-            visit(&path[..], mode, slot, bitmap, content);
+            if let Some((mode, bitmap, content)) = read_variant(cur)? {
+                visit(&path[..], mode, slot, bitmap, content);
+            }
             path.truncate(keep);
         }
         Some(Kind::Dir(gitname)) => {
@@ -455,8 +452,8 @@ fn base_only_child<'a>(
 /// the cached delta minimum) costs ONE comparison and streams straight
 /// through; a delta-touched name costs one comparison per delta source —
 /// the same comparisons any merge must make — with the participant set
-/// recorded DURING the min scan and reused by the fold and advance phases,
-/// which perform no name comparisons at all.
+/// recorded DURING the min scan and reused by the read/skip and advance
+/// phases, which perform no name comparisons at all.
 fn klevel<'a>(
     srcs: &mut [Cursor<'a>],
     active: &[(usize, u64)],
@@ -545,18 +542,14 @@ fn klevel<'a>(
                 path.truncate(keep);
             }
             Some(Kind::File(gitname, slot)) => {
-                // Fold the participants' facets bottom→top; only slices move.
-                let mut acc: Option<(Mode, Option<&'a [u8]>, &'a [u8])> = None;
-                for &k in &group {
-                    let si = active[k].0;
-                    if si == 0 {
-                        // The base: a positive full-state variant.
-                        acc = Some(read_facets(&mut srcs[si])?);
-                    } else {
-                        acc = fold_delta_file(&mut srcs[si], acc)?;
-                    }
+                // §4 totality: a record at a name is a hole or the WHOLE
+                // variant — the topmost participant hides everything below
+                // it. Skip the hidden nodes, read the winner.
+                let (&top, hidden) = group.split_last().expect("min implies a participant");
+                for &k in hidden {
+                    srcs[active[k].0].skip()?;
                 }
-                if let Some((mode, bitmap, content)) = acc {
+                if let Some((mode, bitmap, content)) = read_variant(&mut srcs[active[top].0])? {
                     let keep = push_seg(path, gitname);
                     visit(&path[..], mode, slot, bitmap, content);
                     path.truncate(keep);
@@ -584,58 +577,16 @@ fn klevel<'a>(
     Ok(())
 }
 
-/// Fold ONE delta layer's file node onto the accumulated variant state.
-/// A backdrop node erases `acc` and re-resolves over nothing (exists iff it
-/// carries a blob — a pure hole vanishes); a plain node overlays: a Set blob
-/// replaces the content, meta children override individually (`lanes`
-/// set/removed; a mode tag set, or reverted to plain when the ACTIVE tag is
-/// removed). A plain node over nothing exists only if it sets a blob —
-/// `positive_over_nothing`'s rule.
-fn fold_delta_file<'a>(
+/// Read a variant node's content + mode + bitmap facets from `cur` (positioned
+/// at the node), consuming it whole. `None` ⇔ the node carries no blob — a
+/// hole, i.e. a removal under §4 totality (a record either doesn't mention a
+/// name or states its whole variant; base full-state variants always carry a
+/// blob). All facets are borrowed slices into the underlying buffer — nothing
+/// is copied.
+fn read_variant<'a>(
     cur: &mut Cursor<'a>,
-    acc: Option<(Mode, Option<&'a [u8]>, &'a [u8])>,
 ) -> Result<Option<(Mode, Option<&'a [u8]>, &'a [u8])>, WErr> {
     let n = cur.node()?;
-    let (mut mode, mut bitmap, mut content) = if n.backdrop {
-        (Mode::File, None, None)
-    } else {
-        match acc {
-            Some((m, b, c)) => (m, b, Some(c)),
-            None => (Mode::File, None, None),
-        }
-    };
-    if let Some(blob) = n.blob {
-        content = Some(blob);
-    }
-    for _ in 0..n.child_count {
-        let m = cur.name()?;
-        let mn = cur.node()?;
-        let removal = is_removal(&mn);
-        if m == LANES {
-            bitmap = if removal { None } else { Some(mn.blob.unwrap_or(&[])) };
-        } else if tag_mode(m, None).is_some() {
-            if removal {
-                if mode.tag() == Some(m) {
-                    mode = Mode::File;
-                }
-            } else if let Some(tm) = tag_mode(m, mn.blob) {
-                mode = tm;
-            }
-        }
-        for _ in 0..mn.child_count {
-            cur.name()?;
-            cur.skip()?;
-        }
-    }
-    Ok(content.map(|c| (mode, bitmap, c)))
-}
-
-/// Read a variant node's content + mode + bitmap facets from `cur` (positioned
-/// at the node), consuming it whole. All facets are borrowed slices into the
-/// underlying buffer — nothing is copied.
-fn read_facets<'a>(cur: &mut Cursor<'a>) -> Result<(Mode, Option<&'a [u8]>, &'a [u8]), WErr> {
-    let n = cur.node()?;
-    let content = n.blob.unwrap_or(&[]);
     let mut mode = Mode::File;
     let mut bitmap = None;
     for _ in 0..n.child_count {
@@ -651,7 +602,7 @@ fn read_facets<'a>(cur: &mut Cursor<'a>) -> Result<(Mode, Option<&'a [u8]>, &'a 
             cur.skip()?;
         }
     }
-    Ok((mode, bitmap, content))
+    Ok(n.blob.map(|content| (mode, bitmap, content)))
 }
 
 // ------------------------------------------------------------ iterator
