@@ -123,10 +123,17 @@ fn new_variant_set(slots: &Slots<VarKey>, trans: &[Trans]) -> BTreeMap<VarKey, B
     for (_, occ) in slots.iter() {
         set.insert(occ.id.clone(), occ.bitmap.clone());
     }
-    for (lane, _old, new) in trans {
+    // Clear FIRST, set SECOND — order-independent, because one lane may
+    // arrive as two events at the same name (a dir→file flip is a remove of
+    // the dir-side key plus an add of the file-side key in git's tree
+    // order): a sequential clear-then-set per event would erase the bit the
+    // earlier event just set.
+    for (lane, _old, _new) in trans {
         for bm in set.values_mut() {
             clear_bit(bm, *lane);
         }
+    }
+    for (lane, _old, new) in trans {
         if let Some(e) = new {
             if !e.is_dir {
                 set_bit(set.entry((e.mode.clone(), e.oid.clone())).or_default(), *lane);
@@ -249,17 +256,82 @@ fn variant_content(obj: &mut dyn Objects, id: &VarKey) -> Result<Bytes> {
     obj.blob(&id.1)
 }
 
-/// Distribute a directory's per-lane `(old_tree, new_tree)` transitions into
-/// per-child-name transitions, reading each lane's tree object by oid and
-/// pruning any subtree whose oid is unchanged (the O(1) oid prune, O(changed)
-/// per commit). A child that is a file in one lane and a directory in another
-/// simply accumulates both kinds of transition under its name.
-#[allow(clippy::type_complexity)]
-fn distribute_children(
+/// git's tree-entry order (`base_name_compare`): bytewise on the names,
+/// with the just-past-the-end character being `/` for a directory and NUL
+/// for a file — the order tree objects are STORED in, so two cached trees
+/// diff by a straight 2-way merge with no maps and no copies.
+fn git_entry_cmp(an: &[u8], ad: bool, bn: &[u8], bd: bool) -> std::cmp::Ordering {
+    let min = an.len().min(bn.len());
+    match an[..min].cmp(&bn[..min]) {
+        std::cmp::Ordering::Equal => {}
+        o => return o,
+    }
+    let ca = an.get(min).copied().unwrap_or(if ad { b'/' } else { 0 });
+    let cb = bn.get(min).copied().unwrap_or(if bd { b'/' } else { 0 });
+    ca.cmp(&cb)
+}
+
+/// One lane's old→new directory diff: 2-way merge of the two SORTED cached
+/// tree slices (git stores tree entries in `base_name_compare` order), with
+/// the "mode matters as much as oid" rule — a pure mode change (e.g. the
+/// historical 100664→100644 flip) keeps the blob oid, so it is invisible
+/// unless mode is compared too. `emit(name, old, new)` gets borrowed
+/// entries; only CHANGED names are ever touched beyond the walk itself.
+fn diff_sorted<'e>(
+    old: &'e [(Name, Ent)],
+    new: &'e [(Name, Ent)],
+    mut emit: impl FnMut(&'e [u8], Option<&'e Ent>, Option<&'e Ent>),
+) {
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() || j < new.len() {
+        let ord = if i == old.len() {
+            std::cmp::Ordering::Greater
+        } else if j == new.len() {
+            std::cmp::Ordering::Less
+        } else {
+            let (an, a) = &old[i];
+            let (bn, b) = &new[j];
+            git_entry_cmp(an, a.is_dir, bn, b.is_dir)
+        };
+        match ord {
+            std::cmp::Ordering::Less => {
+                emit(&old[i].0, Some(&old[i].1), None);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                emit(&new[j].0, None, Some(&new[j].1));
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let (a, b) = (&old[i].1, &new[j].1);
+                if a.oid != b.oid || a.is_dir != b.is_dir || a.mode != b.mode {
+                    emit(&old[i].0, Some(a), Some(b));
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+}
+
+/// Recursively distribute the revision's root transitions into per-PATH file
+/// transitions (§6, the git side of the lockstep): `full path → [(lane, old
+/// entry, new entry)]` for every path where some lane's FILE appears, changes,
+/// or vanishes. O(changed): an unchanged subtree is pruned by oid at every
+/// level, and a changed directory is diffed by 2-way merge over the two
+/// SORTED cached tree slices — never copied into maps. Owned data is created
+/// only for the changed paths recorded in `out`.
+fn collect_trans(
     trans: &[Trans],
     obj: &mut dyn Objects,
-) -> Result<BTreeMap<Name, Vec<(usize, Option<Ent>, Option<Ent>)>>> {
-    let mut child_trans: BTreeMap<Name, Vec<(usize, Option<Ent>, Option<Ent>)>> = BTreeMap::new();
+    path: &mut Vec<u8>,
+    out: &mut BTreeMap<Vec<u8>, Vec<OwnedTrans>>,
+) -> Result<()> {
+    // Pass 1: resolve each lane's dir sides (oid-pruned), HOLDING the cached
+    // tree Arcs for this frame — borrows below stay valid across the cache's
+    // own eviction.
+    let mut sides: Vec<(usize, Option<std::sync::Arc<Vec<(Name, Ent)>>>, Option<std::sync::Arc<Vec<(Name, Ent)>>>)> =
+        Vec::new();
     for (lane, o, n) in trans {
         let od = o.filter(|e| e.is_dir);
         let nd = n.filter(|e| e.is_dir);
@@ -271,57 +343,40 @@ fn distribute_children(
                 continue; // identical subtree — the O(1) oid prune
             }
         }
-        let om: BTreeMap<Name, Ent> = match od {
-            Some(e) => obj.tree(&e.oid)?.iter().cloned().collect(),
-            None => BTreeMap::new(),
+        let oa = match od {
+            Some(e) => Some(obj.tree(&e.oid)?),
+            None => None,
         };
-        let nm: BTreeMap<Name, Ent> = match nd {
-            Some(e) => obj.tree(&e.oid)?.iter().cloned().collect(),
-            None => BTreeMap::new(),
+        let na = match nd {
+            Some(e) => Some(obj.tree(&e.oid)?),
+            None => None,
         };
-        let names: BTreeSet<&Name> = om.keys().chain(nm.keys()).collect();
-        for name in names {
-            let oc = om.get(name);
-            let nc = nm.get(name);
-            let changed = match (oc, nc) {
-                // Mode matters as much as oid: a pure mode change (e.g. the
-                // historical 100664→100644 flip) keeps the blob oid, so it is
-                // invisible unless mode is compared too — else the stale mode
-                // variant keeps this lane's bit and the tree oid diverges.
-                (Some(a), Some(b)) => a.oid != b.oid || a.is_dir != b.is_dir || a.mode != b.mode,
-                _ => true,
-            };
-            if changed {
-                child_trans.entry(name.clone()).or_default().push((*lane, oc.cloned(), nc.cloned()));
-            }
-        }
+        sides.push((*lane, oa, na));
     }
-    Ok(child_trans)
-}
-
-/// Recursively distribute the revision's root transitions into per-PATH file
-/// transitions (§6, the git side of the lockstep): `full path → [(lane, old
-/// entry, new entry)]` for every path where some lane's FILE appears, changes,
-/// or vanishes. O(changed) — an unchanged subtree is pruned by oid at every
-/// level ([`distribute_children`]).
-fn collect_trans(
-    trans: &[Trans],
-    obj: &mut dyn Objects,
-    path: &mut Vec<u8>,
-    out: &mut BTreeMap<Vec<u8>, Vec<OwnedTrans>>,
-) -> Result<()> {
-    let child_trans = distribute_children(trans, obj)?;
-    for (name, sub_raw) in child_trans {
+    // Pass 2: per lane, 2-way merge the sorted slices; group the CHANGED
+    // names across lanes (borrowed keys — the only per-entry work at
+    // unchanged names is the comparison in the merge itself).
+    let mut changed: BTreeMap<&[u8], Vec<(usize, Option<&Ent>, Option<&Ent>)>> = BTreeMap::new();
+    for (lane, oa, na) in &sides {
+        let old: &[(Name, Ent)] = oa.as_deref().map(|v| &v[..]).unwrap_or(&[]);
+        let new: &[(Name, Ent)] = na.as_deref().map(|v| &v[..]).unwrap_or(&[]);
+        diff_sorted(old, new, |name, oc, nc| {
+            changed.entry(name).or_default().push((*lane, oc, nc));
+        });
+    }
+    for (name, sub) in changed {
         let base = path.len();
         if !path.is_empty() {
             path.push(b'/');
         }
-        path.extend_from_slice(&name);
-        if sub_raw.iter().any(|(_, o, n)| is_file(o.as_ref()) || is_file(n.as_ref())) {
-            out.insert(path.clone(), sub_raw.clone());
+        path.extend_from_slice(name);
+        if sub.iter().any(|(_, o, n)| is_file(*o) || is_file(*n)) {
+            out.insert(
+                path.clone(),
+                sub.iter().map(|(l, o, n)| (*l, o.cloned(), n.cloned())).collect(),
+            );
         }
-        let sr: Vec<Trans> = sub_raw.iter().map(|(l, o, n)| (*l, o.as_ref(), n.as_ref())).collect();
-        collect_trans(&sr, obj, path, out)?;
+        collect_trans(&sub, obj, path, out)?;
         path.truncate(base);
     }
     Ok(())
