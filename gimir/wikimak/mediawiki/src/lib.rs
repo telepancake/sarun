@@ -23,9 +23,9 @@ pub use bz2::{new_bz2_reader, Bz2Options, Bz2Reader};
 pub use discover::{discover, discover_with, Config, DUMPS_BASE_URL};
 #[cfg(feature = "fetch")]
 pub use fetch::{fetch, VerifyingReader};
-pub use parser::{new_page_stream, site_info, PageStream};
+pub use parser::{new_page_stream, new_revision_stream, site_info, PageStream, RevisionStream};
 pub use sha1::verify_rev_sha1;
 pub use types::{
-    Contributor, Error, Interwiki, Namespace, Page, Part, Result, Revision, Run, RunSource,
-    SiteInfo,
+    Contributor, Error, Interwiki, Namespace, Page, PageHeader, Part, Result, Revision, Run,
+    RunSource, SiteInfo,
 };

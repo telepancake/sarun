@@ -45,6 +45,9 @@ serve = ["dep:wikimak-wikitext", "dep:wikimak-scribunto", "dep:wikimak-media", "
 tempfile = "3"
 # `tests/sync.rs` stands in for dumps.wikimedia.org.
 httpmock = "0.7"
+# `tests/streaming_ram.rs` measures a spawned import's peak RSS via
+# getrusage(RUSAGE_CHILDREN).
+libc.workspace = true
 
 [lints.clippy]
 # Tester's `tests/sha1.rs` doc-comment uses a multi-line, visually-aligned

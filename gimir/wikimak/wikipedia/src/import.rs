@@ -23,15 +23,20 @@
 //! store-uncompressed scheme (no zstd, no seal) was the sabotage
 //! documented in meta/reports/vbf-recovery.md §4.
 //!
-//! ## Per-page atomicity
+//! ## Per-page atomicity — and the RAM bound
 //!
 //! Per SPEC §"Crash-safety contract":
 //!   1. `BEGIN IMMEDIATE` on sqlite.
-//!   2. All of the page's new revisions land on the chain as ONE batch
-//!      prepend (SPEC §"Prepend multiple records"). The depot index
-//!      flip is the depot's commit; if sqlite then rolls back, those
-//!      frames are orphaned but unreferenced (sqlite owns the
-//!      page-id↔chain-id story).
+//!   2. The page's revisions STREAM off the parser one at a time (a
+//!      hot full-history page must never be resident whole); each new
+//!      record is encoded as it arrives and lands on the chain in
+//!      batch prepends (SPEC §"Prepend multiple records") bounded by
+//!      the ingest RAM bound — one prepend for any page under the
+//!      bound. The depot index flip is the depot's commit; if sqlite
+//!      then rolls back, those frames are orphaned but unreferenced
+//!      (sqlite owns the page-id↔chain-id story) — the dirty flag is
+//!      already durable, so the next session's suspect-mode repair
+//!      re-derives `revisions_seen` from the chain.
 //!   3. Append the title bytes to the strpool ONCE per (ns, normalized
 //!      title) if not already present; record the resulting id.
 //!   4. Insert sqlite rows: `revisions_seen`, `title_id_to_page` (if
@@ -48,7 +53,9 @@ use std::io::Read;
 
 use rusqlite::params;
 use serde_json::json;
-use wikimak_mediawiki::{site_info, verify_rev_sha1, Contributor, Page, PageStream, Revision};
+use wikimak_mediawiki::{
+    verify_rev_sha1, Contributor, PageHeader, PageStream, Revision, RevisionStream,
+};
 
 use crate::error::Result;
 use crate::instance::{ContributorMeta, ImportStats, Instance, InstanceInner, RevisionMeta};
@@ -57,17 +64,38 @@ use crate::revision::{
     FLAG_SUPPRESSED, FLAG_TEXT_HIDDEN,
 };
 
+/// RAM bound for the per-page ingest batch: the encoded revision
+/// records resident between depot prepends. This bounds the
+/// COLLECTION, not just the prepend — revisions are encoded as they
+/// stream off the parser (one `Revision` resident at a time) and
+/// flushed to the chain in bounded batches, oldest batch first, so a
+/// full-history page of any size imports in ~this much memory.
+/// Test-overridable via `WIKIMAK_TEST_INGEST_RAM` (bytes), like the
+/// `GITDEPOT_TEST_*` knobs.
+const INGEST_RAM_BOUND: u64 = 256 << 20;
+
+fn ingest_ram_bound() -> u64 {
+    std::env::var("WIKIMAK_TEST_INGEST_RAM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(INGEST_RAM_BOUND)
+}
+
 pub(crate) fn do_import<R: Read>(
     instance: &Instance,
     stream: &mut PageStream<R>,
 ) -> Result<ImportStats> {
+    // Consume via the streaming core: pages yield a header, then
+    // revisions ONE AT A TIME — a hot full-history page (~10^6
+    // revisions, ~10^11 text bytes) must never be resident whole.
+    let stream = stream.revisions_mut();
     let mut stats = ImportStats::default();
     let mut siteinfo_captured = false;
 
-    while let Some(page) = stream.next() {
-        let page = page?;
+    while let Some(header) = stream.next_page() {
+        let header = header?;
 
-        let page_id = page.id as u64;
+        let page_id = header.id as u64;
 
         // Reject-policy on overflow (PHASES §"page_id_overflow_errors_
         // before_writes"): a page id past the instance's bound is a
@@ -85,11 +113,11 @@ pub(crate) fn do_import<R: Read>(
             });
         }
 
-        // Capture site_info once (PageStream parses it during the first
-        // `next()` call). Best-effort: skipping on missing or insert
-        // failure is fine — the table is not query-pinned by tests.
+        // Capture site_info once (parsed during the first `next_page()`
+        // call). Best-effort: skipping on missing or insert failure is
+        // fine — the table is not query-pinned by tests.
         if !siteinfo_captured {
-            if let Some(si) = site_info(stream) {
+            if let Some(si) = stream.site_info() {
                 // Use a Mutex-guarded conn; capture once.
                 let g = instance.inner.lock().expect("instance mutex poisoned");
                 capture_siteinfo(&g.conn, si)?;
@@ -97,14 +125,19 @@ pub(crate) fn do_import<R: Read>(
             }
         }
 
-        import_one_page(instance, page, &mut stats)?;
+        import_one_page(instance, &header, stream, &mut stats)?;
     }
 
     Ok(stats)
 }
 
-fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> Result<()> {
-    let page_id = page.id as u64;
+fn import_one_page<R: Read>(
+    instance: &Instance,
+    header: &PageHeader,
+    stream: &mut RevisionStream<R>,
+    stats: &mut ImportStats,
+) -> Result<()> {
+    let page_id = header.id as u64;
 
     let mut g = instance.inner.lock().expect("instance mutex poisoned");
 
@@ -143,78 +176,101 @@ fn import_one_page(instance: &Instance, page: Page, stats: &mut ImportStats) -> 
     }
     let g = &*g;
 
-    // Earliest revision timestamp for THIS dump's copy of the page — the
-    // real start of a title interval (browsing plan §2 wayback contract).
-    // Computed over all revisions in hand (not just the new ones) so an
-    // idempotent reimport of an already-seen title recomputes the SAME
-    // value and touches nothing. `None` (a page with no revisions) leaves
-    // the interval logic a no-op.
-    let earliest_ts: Option<i64> = page
-        .revisions
-        .iter()
-        .map(|r| r.timestamp.timestamp_micros())
-        .min();
-
-    // Does this dump carry the page FORWARD — i.e. is its newest revision
-    // one we have not already stored? A re-run of the same or an older
-    // slice (crash-resume, idempotent reimport) does not, and must never
-    // change a page's title bookkeeping; only a fresh dump (seed,
-    // incremental, or a newer re-export) is authoritative for the title.
-    let dump_extends_head: bool = page
-        .revisions
-        .iter()
-        .max_by_key(|r| r.timestamp.timestamp_micros())
-        .map(|r| !revision_seen(&g.conn, page_id, r.id as u64).unwrap_or(false))
-        .unwrap_or(false);
-
     // Begin the per-page transaction.
     g.conn.execute("BEGIN IMMEDIATE", [])?;
     let outcome = (|| -> Result<bool> {
-        // Title bookkeeping: title pool + reverse index, and the
-        // rename-aware title-interval bookkeeping (a moved page closes its
-        // open interval and opens a new one — browsing plan §2).
-        let ns_i = page.namespace as i64;
-        let normalized = page.title.trim().as_bytes().to_vec();
-        ensure_title(
-            &g,
-            page_id,
-            ns_i,
-            &normalized,
-            instance.title_shard_count,
-            earliest_ts,
-            dump_extends_head,
-        )?;
-
-        // Collect the page's NEW revisions in source order (oldest →
-        // newest); skip those already in revisions_seen. Source order
-        // isn't strictly timestamp-ordered in the wild, but every test
-        // fixture has it so. All N records then land as ONE batch
-        // prepend (depot SPEC §"Prepend multiple records") — one f0
-        // swap, one f1 re-encode, one seal check per page, not per
-        // revision.
+        // Stream the page's revisions in source order (oldest →
+        // newest, one resident at a time); skip those already in
+        // revisions_seen. Source order isn't strictly
+        // timestamp-ordered in the wild, but every test fixture has it
+        // so. New records land on the chain in batches bounded by the
+        // ingest RAM bound — a bound-sized page is still ONE prepend
+        // (depot SPEC §"Prepend multiple records": one f0 swap, one f1
+        // re-encode, one seal check per page); only a page whose new
+        // records exceed the bound splits, oldest batch first, exactly
+        // the partition `wikimak_depot::chunk_newest_first` computes
+        // (greedy fill from the oldest record).
+        //
+        // On a mid-page error the sqlite transaction rolls back but
+        // already-prepended batches stay on the chain (the depot is
+        // prepend-only). That is the same chain-ahead-of-bookkeeping
+        // state a crash leaves, and the same machinery heals it: the
+        // dirty flag is already stamped, so the next session opens
+        // suspect and re-derives revisions_seen from the chain before
+        // trusting it — no duplicate records on re-import.
+        let batch_bound = ingest_ram_bound().max(instance.f1_seal_threshold_bytes);
+        let mut batch: Vec<Vec<u8>> = Vec::new(); // oldest-first
+        let mut batch_bytes: u64 = 0;
         let mut new_this_page = 0u64;
-        let mut new_records: Vec<Vec<u8>> = Vec::new();
-        for rev in &page.revisions {
+
+        // Earliest revision timestamp for THIS dump's copy of the page
+        // — the real start of a title interval (browsing plan §2
+        // wayback contract). Over ALL revisions in hand (not just the
+        // new ones) so an idempotent reimport recomputes the SAME
+        // value. `None` (no revisions) leaves the interval logic a
+        // no-op.
+        let mut earliest_ts: Option<i64> = None;
+        // Does this dump carry the page FORWARD — is its newest
+        // revision (by timestamp; `>=` so ties resolve to the LAST
+        // maximal, matching the old `max_by_key` scan) one we had not
+        // already stored? Each revision's `seen` is checked before its
+        // own insert, so this matches the old pre-scan against the
+        // pre-import state.
+        let mut newest: Option<(i64, bool)> = None;
+
+        while let Some(rev) = stream.next_revision() {
+            let rev = rev?;
             let rev_id = rev.id as u64;
-            if revision_seen(&g.conn, page_id, rev_id)? {
+            let ts = rev.timestamp.timestamp_micros();
+            earliest_ts = Some(earliest_ts.map_or(ts, |e| e.min(ts)));
+
+            let seen = revision_seen(&g.conn, page_id, rev_id)?;
+            if newest.is_none_or(|(m, _)| ts >= m) {
+                newest = Some((ts, !seen));
+            }
+            if seen {
                 stats.revisions_deduped += 1;
                 continue;
             }
 
-            let (meta, text_bytes) = build_revision_record(rev, stats);
-            new_records.push(encode_revision(&meta, &text_bytes));
-
-            g.conn.execute(
-                "INSERT INTO revisions_seen(page_id, rev_id) VALUES(?1, ?2)",
-                params![page_id as i64, rev_id as i64],
-            )?;
+            let record = encode_new_revision(rev, stats);
+            g.conn
+                .prepare_cached("INSERT INTO revisions_seen(page_id, rev_id) VALUES(?1, ?2)")?
+                .execute(params![page_id as i64, rev_id as i64])?;
             new_this_page += 1;
+
+            // Flush BEFORE the record that would overflow the bound
+            // (a single oversized record still travels alone) — the
+            // same greedy oldest-first partition as chunk_newest_first.
+            if !batch.is_empty() && batch_bytes + record.len() as u64 > batch_bound {
+                batch.reverse(); // the chain wants newest-first
+                prepend_depot_frames(g, page_id, &batch, instance.f1_seal_threshold_bytes)?;
+                batch.clear();
+                batch_bytes = 0;
+            }
+            batch_bytes += record.len() as u64;
+            batch.push(record);
         }
-        if !new_records.is_empty() {
-            new_records.reverse(); // the chain wants newest-first
-            prepend_depot_frames(&g, page_id, &new_records,
-                                 instance.f1_seal_threshold_bytes)?;
+        if !batch.is_empty() {
+            batch.reverse(); // the chain wants newest-first
+            prepend_depot_frames(g, page_id, &batch, instance.f1_seal_threshold_bytes)?;
         }
+
+        // Title bookkeeping: title pool + reverse index, and the
+        // rename-aware title-interval bookkeeping (a moved page closes
+        // its open interval and opens a new one — browsing plan §2).
+        // After the revision loop (its inputs are streamed aggregates)
+        // but inside the same transaction — the commit stays atomic.
+        let dump_extends_head = newest.is_some_and(|(_, head_is_new)| head_is_new);
+        ensure_title(
+            g,
+            page_id,
+            header.namespace as i64,
+            header.title.trim().as_bytes(),
+            instance.title_shard_count,
+            earliest_ts,
+            dump_extends_head,
+        )?;
 
         stats.revisions_new += new_this_page;
         // Pages counter: bump even when the page was wholly deduped —
@@ -402,19 +458,22 @@ fn ensure_title(
 }
 
 fn revision_seen(conn: &rusqlite::Connection, page_id: u64, rev_id: u64) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM revisions_seen WHERE page_id = ?1 AND rev_id = ?2",
-        params![page_id as i64, rev_id as i64],
-        |r| r.get(0),
-    )?;
+    // prepare_cached: this runs once per revision of every page — a
+    // fresh prepare per call was measurable parse overhead at scale.
+    let n: i64 = conn
+        .prepare_cached("SELECT COUNT(*) FROM revisions_seen WHERE page_id = ?1 AND rev_id = ?2")?
+        .query_row(params![page_id as i64, rev_id as i64], |r| r.get(0))?;
     Ok(n > 0)
 }
 
-/// Build the RevisionMeta + raw text bytes for one mediawiki Revision.
-/// Updates `stats.sha1_*` counters as a side effect. Sets the
+/// Encode one NEW mediawiki Revision into its depot record. Consumes
+/// the revision: the meta strings (contributor, comment, sha1) MOVE
+/// into the codec input and the text is passed as a slice — no clone
+/// and no full-text copy besides the one into the record itself.
+/// Updates `stats.sha1_*` counters as a side effect; sets the
 /// SHA1_MISMATCH flag when the stored sha1 cannot be matched to the
 /// text by any newline-fudge variant.
-fn build_revision_record(rev: &Revision, stats: &mut ImportStats) -> (RevisionMeta, Vec<u8>) {
+fn encode_new_revision(rev: Revision, stats: &mut ImportStats) -> Vec<u8> {
     let mut flags: u32 = 0;
     if rev.text_hidden {
         flags |= FLAG_TEXT_HIDDEN;
@@ -444,33 +503,32 @@ fn build_revision_record(rev: &Revision, stats: &mut ImportStats) -> (RevisionMe
         }
     }
 
-    let contributor = match &rev.contributor {
-        Contributor::Anonymous { ip } => ContributorMeta::Anonymous { ip: ip.clone() },
+    let contributor = match rev.contributor {
+        Contributor::Anonymous { ip } => ContributorMeta::Anonymous { ip },
         Contributor::Named { username, user_id } => ContributorMeta::Named {
-            username: username.clone(),
-            user_id: *user_id as u64,
+            username,
+            user_id: user_id as u64,
         },
         Contributor::Hidden => ContributorMeta::Hidden,
     };
 
-    let text_bytes: Vec<u8> = if rev.text_hidden {
-        Vec::new()
+    let text: &[u8] = if rev.text_hidden {
+        &[]
     } else {
-        rev.text.as_bytes().to_vec()
+        rev.text.as_bytes()
     };
-    let text_len = text_bytes.len() as u64;
 
     let meta = RevisionMeta {
         rev_id: rev.id as u64,
         parent_id: rev.parent_id.unwrap_or(0) as u64,
         ts: rev.timestamp,
         contributor,
-        comment: rev.comment.clone(),
-        sha1: rev.sha1.clone(),
+        comment: rev.comment,
+        sha1: rev.sha1,
         flags,
-        text_len,
+        text_len: text.len() as u64,
     };
-    (meta, text_bytes)
+    encode_revision(&meta, text)
 }
 
 /// Prepend one or more revision records (NEWEST-first) to the depot
@@ -489,10 +547,11 @@ pub(crate) fn prepend_depot_frames(
     // one f1 re-encode regardless of size; splitting only churns dead
     // head frames. Sealing is decided BETWEEN prepends against the OLD
     // accumulator (compose_f1). Chunking survives solely as a RAM
-    // bound for pathological batches.
-    const INGEST_RAM_BOUND: u64 = 256 << 20;
+    // bound for pathological batches — the streaming import loop
+    // already flushes at this same bound (same greedy oldest-first
+    // partition), so for import this is a no-op invariant guard.
     let sizes: Vec<usize> = records_newest_first.iter().map(|r| r.len()).collect();
-    let chunks = wikimak_depot::chunk_newest_first(&sizes, INGEST_RAM_BOUND.max(seal_threshold));
+    let chunks = wikimak_depot::chunk_newest_first(&sizes, ingest_ram_bound().max(seal_threshold));
     if chunks.len() > 1 {
         for range in chunks {
             prepend_depot_frames(g, chain_id, &records_newest_first[range], seal_threshold)?;

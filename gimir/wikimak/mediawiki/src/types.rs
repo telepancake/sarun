@@ -92,6 +92,19 @@ pub struct Page {
     pub revisions: Vec<Revision>,
 }
 
+/// One `<page>`'s header fields — everything before its first
+/// `<revision>` — yielded by `RevisionStream::next_page` so a consumer
+/// can stream the revisions one at a time instead of materializing a
+/// whole [`Page`] (a hot enwiki page's full history is ~10^5..10^6
+/// revisions ≈ 10^11 bytes of text; it must never be resident at once).
+#[derive(Debug, Clone)]
+pub struct PageHeader {
+    pub title: String,
+    pub namespace: i32,
+    pub id: i64,
+    pub redirect_title: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Namespace {
     pub id: i32,
