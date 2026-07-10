@@ -1614,6 +1614,24 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
                        it is incompatible with -d (no overlay).");
             return 2;
         }
+        // -b -p: the brush branch used to win and SWALLOW -p — no box pty
+        // was ever allocated, fd 1 was brush's capture pipe, and a TUI in a
+        // `-b -p` box saw isatty(1)=false and fell back to 80x25. Compose
+        // the two instead: allocate the pty (inner_pty — winsize + SIGWINCH
+        // propagation, capture at the master) and have the pty child exec
+        // the box-shadowed shell. In a -b box /bin/sh IS the brush shim
+        // (SARUN_BRUSH_SH), so the command still runs through embedded
+        // brush with nested provenance — but on a real tty on fds 0/1/2.
+        if pty {
+            let script = crate::brush::script_from_argv(&cmd);
+            let shell = if crate::brush::shell_name_from_argv(&cmd) == "bash" {
+                "/bin/bash"
+            } else {
+                "/bin/sh"
+            };
+            return inner_pty(conn_fd, vec![shell.to_string(),
+                                           "-c".to_string(), script]);
+        }
         return crate::brush::inner_brush(conn_fd, cmd);
     }
     // PTY mode (third path): an interactive controlling-tty box whose output is
