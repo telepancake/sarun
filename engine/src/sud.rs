@@ -34,6 +34,14 @@ pub struct Stream {
     /// tgid → (ts_ns, exe) of an EXEC whose /proc had already vanished;
     /// the following EV_ARGV completes it into an event-minted row.
     pub pending_exec: Mutex<HashMap<i32, (i64, String)>>,
+    /// tgid → process row id, resolved once per incarnation. writer_for
+    /// re-reads 4 /proc files per call and a -j30 build emits an OPEN per
+    /// written file — at that rate the reader thread becomes the box-wide
+    /// bottleneck (the trace pipe fills and every traced syscall waits on
+    /// it). Safe against pid reuse because the wire is totally ordered:
+    /// the EV_EXIT that frees a pid removes it here before any event from
+    /// its successor arrives, and an in-place execve keeps its row id.
+    pub pid_rows: Mutex<HashMap<i32, i64>>,
     /// Pipe hit EOF and every buffered event was applied.
     done: (Mutex<bool>, Condvar),
 }
@@ -175,6 +183,7 @@ pub fn stream_events(box_id: i64, fd: i32, b: Arc<BoxState>,
     let st = Arc::new(Stream {
         writers: Mutex::new(HashMap::new()),
         pending_exec: Mutex::new(HashMap::new()),
+        pid_rows: Mutex::new(HashMap::new()),
         done: (Mutex::new(false), Condvar::new()),
     });
     streams().lock().unwrap().insert(box_id, st.clone());
@@ -246,10 +255,17 @@ fn apply_event(b: &BoxState, st: &Stream,
             // finish inside the pipe latency) minted NO row at all:
             // stash the event's exe and let the EV_ARGV right behind it
             // complete an event-data row instead.
-            if ev.tgid > 0 && b.exec_refresh(ev.tgid as u32).is_none() {
+            if ev.tgid > 0 {
                 let exe = String::from_utf8_lossy(&ev.blob).into_owned();
-                st.pending_exec.lock().unwrap()
-                    .insert(ev.tgid, (ev.ts_ns as i64, exe));
+                match b.exec_refresh(ev.tgid as u32, &exe) {
+                    Some(rid) => {
+                        st.pid_rows.lock().unwrap().insert(ev.tgid, rid);
+                    }
+                    None => {
+                        st.pending_exec.lock().unwrap()
+                            .insert(ev.tgid, (ev.ts_ns as i64, exe));
+                    }
+                }
             }
         }
         sudwire::EV_ARGV => {
@@ -260,8 +276,11 @@ fn apply_event(b: &BoxState, st: &Stream,
                     .map(|s| String::from_utf8_lossy(s).into_owned())
                     .collect();
                 let cwd = cwds.get(&ev.tgid).cloned().unwrap_or_default();
-                b.record_proc_event(ev.tgid as u32, ev.ppid as u32,
-                                    ts, &exe, &cwd, &argv);
+                if let Some(rid) = b.record_proc_event(ev.tgid as u32,
+                                                       ev.ppid as u32,
+                                                       ts, &exe, &cwd, &argv) {
+                    st.pid_rows.lock().unwrap().insert(ev.tgid, rid);
+                }
             }
         }
         sudwire::EV_CWD => {
@@ -286,13 +305,27 @@ fn apply_event(b: &BoxState, st: &Stream,
             if is_passthrough(&abs) { return; }
             let rel = abs.trim_start_matches('/').to_string();
             if rel.is_empty() { return; }
-            let w = b.writer_for(ev.tgid as u32);
+            let cached = st.pid_rows.lock().unwrap().get(&ev.tgid).copied();
+            let w = match cached {
+                Some(rid) => rid,
+                None => {
+                    let rid = b.writer_for(ev.tgid as u32);
+                    st.pid_rows.lock().unwrap().insert(ev.tgid, rid);
+                    rid
+                }
+            };
             st.writers.lock().unwrap().insert(rel, w);
         }
         // Match the FUSE sink numbering in overlay.rs: stdout = 0, stderr
         // = 1 (NOT the fd numbers) so the outputs table is backend-identical.
         sudwire::EV_STDOUT => b.add_output(0, ev.tgid as u32, &ev.blob),
         sudwire::EV_STDERR => b.add_output(1, ev.tgid as u32, &ev.blob),
+        sudwire::EV_EXIT => {
+            // The pid is free for kernel reuse from here — drop its row
+            // binding so a successor with the same pid re-resolves.
+            st.pid_rows.lock().unwrap().remove(&ev.tgid);
+            cwds.remove(&ev.tgid);
+        }
         _ => {}
     }
 }

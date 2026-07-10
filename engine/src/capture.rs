@@ -719,19 +719,35 @@ impl BoxState {
     /// appear. On an EXEC event, re-read /proc and, when the row's image is
     /// stale, update it in place (same row id, so output/edge attribution by
     /// row id is unaffected).
+    /// `event_exe` is the EXEC event's own exe blob — the program the BOX
+    /// sees. For a wrapper-launched tool (sud32 userspace-loading a 32-bit
+    /// binary) /proc/<pid>/exe is the WRAPPER for the process's whole life,
+    /// so /proc would file every 32-bit compiler as "sud32"; the event's
+    /// exe wins whenever it is non-empty. (argv needs no such override —
+    /// the loader rewrites the visible cmdline to the real program's.)
     /// Returns None when the process was already gone from /proc — the
     /// caller can then mint the row from the trace event's own data
     /// (record_proc_event).
-    pub fn exec_refresh(&self, pid: u32) -> Option<i64> {
-        let (tgid, start, ppid, exe, cwd, argv) = Self::read_prov(pid);
+    pub fn exec_refresh(&self, pid: u32, event_exe: &str) -> Option<i64> {
+        let (tgid, start, _ppid, exe, cwd, argv) = Self::read_prov(pid);
         if start == 0 && exe.is_empty() && argv.is_empty() {
             // Process already gone — nothing fresher to record.
             return None;
         }
+        let exe = if event_exe.is_empty() { exe }
+                  else { event_exe.to_string() };
         let cached = self.proc_cache.lock().unwrap().get(&(tgid, start)).copied();
         let Some(rid) = cached else {
-            // First sighting of this incarnation: normal record path.
-            return Some(self.writer_for(pid));
+            // First sighting of this incarnation: normal record path,
+            // then correct the /proc-snapshotted exe to the event's.
+            let rid = self.writer_for(pid);
+            if !event_exe.is_empty() {
+                let conn = self.conn.lock().unwrap();
+                let _ = conn.execute(
+                    "UPDATE process SET exe=?1 WHERE id=?2 AND exe<>?1",
+                    params![exe, rid]);
+            }
+            return Some(rid);
         };
         let argv_json = serde_json::to_string(&argv).unwrap_or_default();
         let conn = self.conn.lock().unwrap();

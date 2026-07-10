@@ -380,8 +380,21 @@ char *read_proc_cwd(pid_t pid, char *buf, size_t bufsz)
     return buf;
 }
 
+/* Every event emit calls get_tgid+get_ppid, and every emitter passes the
+ * TRAPPING THREAD's own tid — so the /proc round trips (open+read+close
+ * plus the kernel formatting /proc/N/{stat,status}, ~5μs each) that used
+ * to be the single biggest per-event cost collapse to getpid()/getppid(),
+ * two of the cheapest syscalls there are, and always kernel-fresh (no
+ * cache to go stale across fork/exec/reparenting). The /proc path stays
+ * as the fallback for the rare caller asking about a DIFFERENT task. */
+#ifndef SYS_getppid
+#define SYS_getppid __NR_getppid
+#endif
+
 pid_t get_ppid(pid_t pid)
 {
+    if (pid == raw_gettid())
+        return (pid_t)raw_syscall6(SYS_getppid, 0, 0, 0, 0, 0, 0);
     char buf[512];
     ssize_t n = read_proc_raw(pid, "stat", buf, sizeof(buf) - 1);
     if (n <= 0) return 0;
@@ -395,6 +408,8 @@ pid_t get_ppid(pid_t pid)
 
 pid_t get_tgid(pid_t pid)
 {
+    if (pid == raw_gettid())
+        return (pid_t)raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
     char buf[2048];
     ssize_t n = read_proc_raw(pid, "status", buf, sizeof(buf) - 1);
     if (n <= 0) return pid;
