@@ -416,10 +416,46 @@ fn skip_children(cur: &mut Cursor, count: u64) -> Result<(), WErr> {
     Ok(())
 }
 
+/// Stream one BASE-ONLY child (no delta touches it): a file emits its
+/// facets directly; a directory streams its whole subtree. The fast path —
+/// no merging, no scans, no allocation.
+fn base_only_child<'a>(
+    cur: &mut Cursor<'a>,
+    name: &[u8],
+    path: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], Mode, u32, Option<&[u8]>, &[u8]),
+) -> Result<(), WErr> {
+    match classify(name) {
+        Some(Kind::File(gitname, slot)) => {
+            let keep = push_seg(path, gitname);
+            let (mode, bitmap, content) = read_facets(cur)?;
+            visit(&path[..], mode, slot, bitmap, content);
+            path.truncate(keep);
+        }
+        Some(Kind::Dir(gitname)) => {
+            let n = cur.node()?;
+            let keep = push_seg(path, gitname);
+            for _ in 0..n.child_count {
+                let child = cur.name()?;
+                base_only_child(cur, child, path, visit)?;
+            }
+            path.truncate(keep);
+        }
+        None => cur.skip()?,
+    }
+    Ok(())
+}
+
 /// One directory level of the k-way lockstep. `active` lists the sources
 /// present at this level bottom→top as `(source index, child count)`; the
 /// cursors sit just past their level's node header. Names advance in
 /// bytewise (container) order across all sources at once.
+///
+/// The untouched majority takes a FAST PATH: the minimum of the DELTA
+/// sources' head names is cached (it moves only when a delta advances —
+/// rare), so a base head that is strictly smaller streams straight through
+/// with one comparison and no k-wide scans; the full merge below runs only
+/// at delta-touched names.
 fn klevel<'a>(
     srcs: &mut [Cursor<'a>],
     active: &[(usize, u64)],
@@ -436,7 +472,31 @@ fn klevel<'a>(
             None
         });
     }
+    // Position of the base source at this level, if it participates.
+    let kb = active.iter().position(|&(si, _)| si == 0);
+    let dmin = |heads: &[Option<&'a [u8]>]| -> Option<&'a [u8]> {
+        heads
+            .iter()
+            .enumerate()
+            .filter(|&(k, _)| Some(k) != kb)
+            .filter_map(|(_, h)| *h)
+            .min()
+    };
+    let mut delta_min = dmin(&heads);
     loop {
+        // Fast path: the base owns the minimum outright.
+        if let (Some(kb), Some(bh)) = (kb, kb.and_then(|k| heads[k])) {
+            if delta_min.map(|d| bh < d).unwrap_or(true) {
+                base_only_child(&mut srcs[active[kb].0], bh, path, visit)?;
+                heads[kb] = if rem[kb] > 0 {
+                    rem[kb] -= 1;
+                    Some(srcs[active[kb].0].name()?)
+                } else {
+                    None
+                };
+                continue;
+            }
+        }
         let Some(min) = heads.iter().flatten().min().copied() else { break };
         match classify(min) {
             Some(Kind::Dir(gitname)) => {
@@ -492,7 +552,8 @@ fn klevel<'a>(
                 }
             }
         }
-        // Advance every source that stood at `min`.
+        // Advance every source that stood at `min`; the delta-min cache
+        // refreshes only here (a delta advanced).
         for k in 0..active.len() {
             if heads[k] == Some(min) {
                 heads[k] = if rem[k] > 0 {
@@ -503,6 +564,7 @@ fn klevel<'a>(
                 };
             }
         }
+        delta_min = dmin(&heads);
     }
     Ok(())
 }
