@@ -1,77 +1,99 @@
-//! RO-attachment readout over ONE draft series
+//! RO-attachment readout over ONE PINNED draft revision
 //! (ATTACH-CONVERGENCE.md chip 2).
 //!
-//! Serves the shape the engine's `ietf_attach` verb serves today: every
-//! mirrored revision as a leaf `<draft>-<rev>.txt` at the readout root
-//! (a whole series is small and the history is the point of a drafts
-//! mirror). Construction is pure bookkeeping; the chain decode happens
-//! once, on first access, and is cached. Per-file lazy decode is not
-//! available from this store: f1/cold frames are refPrefix-anchored on
-//! the next-newer record, so decoding revision k requires decoding
-//! everything newer anyway — one `history()` walk IS the lazy unit.
+//! The attachment's name pins a revision (`ietf:<draft>@<rev>`), and
+//! this readout serves exactly that: one leaf `<draft>-<rev>.txt` at
+//! the readout root, bytes frozen at the pin — never "whatever is head
+//! by the time someone reads". Residency is the pinned revision's text
+//! alone; the decode walk visits newer records one frame at a time and
+//! drops them ([`Mirror::revision`]).
+//!
+//! Locking: construction does no I/O. The first access opens the
+//! mirror read-side (SHARED flock, [`Mirror::open_read`]) just long
+//! enough to decode the pinned revision, then drops it — an attached
+//! box never blocks `ietfmak update`, and an update in flight makes
+//! the access a MISS that is retried on the next access (never cached:
+//! only a real decode or a definitive no-such-store outcome is).
+//! Updates keep the exclusive lock; the pin keeps them invisible here.
 
-use std::sync::{Mutex, OnceLock};
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 use depot::variant::{Blob, Readout, ReadoutEntry, ReadoutKind};
 use depot::{Attrs, Name};
 
-use crate::Mirror;
+use crate::{Error, Mirror, MirrorConfig};
 
 pub struct DraftReadout {
-    /// `Mirror` holds a rusqlite `Connection` (Send, not Sync); the
-    /// mutex makes the one decode safe under concurrent readout.
-    mirror: Mutex<Mirror>,
+    root: PathBuf,
     draft: String,
-    /// `(file name, text)` sorted by name; `None` until first access.
-    /// Empty = no such draft (a miss, never an error).
-    files: OnceLock<Vec<(Name, Vec<u8>)>>,
+    rev: String,
+    /// `<draft>-<rev>.txt` — the single leaf name.
+    file_name: Vec<u8>,
+    /// Outer `None` = not resolved yet (or a writer held the root:
+    /// retry). Inner `None` = definitive miss (no such store/draft/rev).
+    text: Mutex<Option<Option<Vec<u8>>>>,
 }
 
 impl DraftReadout {
-    pub fn new(mirror: Mirror, draft: &str) -> Self {
-        DraftReadout { mirror: Mutex::new(mirror), draft: draft.to_string(), files: OnceLock::new() }
+    /// Pure bookkeeping — the store is not touched until first access.
+    pub fn new(root: PathBuf, draft: &str, rev: &str) -> Self {
+        DraftReadout {
+            root,
+            draft: draft.to_string(),
+            rev: rev.to_string(),
+            file_name: format!("{draft}-{rev}.txt").into_bytes(),
+            text: Mutex::new(None),
+        }
     }
 
-    fn files(&self) -> &[(Name, Vec<u8>)] {
-        self.files.get_or_init(|| {
-            let m = self.mirror.lock().expect("mirror mutex poisoned");
-            let mut files: Vec<(Name, Vec<u8>)> = m
-                .history(&self.draft)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|e| (format!("{}-{}.txt", self.draft, e.rev).into_bytes(), e.text))
-                .collect();
-            files.sort_by(|a, b| a.0.cmp(&b.0));
-            files
-        })
-    }
-
-    fn file(&self, name: &[u8]) -> Option<&(Name, Vec<u8>)> {
-        let files = self.files();
-        files.binary_search_by(|f| f.0.as_slice().cmp(name)).ok().map(|i| &files[i])
+    /// Run `f` over the pinned text (`None` = miss), resolving it on
+    /// first use. The closure form keeps the bytes behind the mutex —
+    /// only `blob` pays for a copy.
+    fn with_text<T>(&self, f: impl FnOnce(Option<&[u8]>) -> T) -> T {
+        let mut slot = self.text.lock().expect("readout mutex poisoned");
+        if slot.is_none() {
+            match Mirror::open_read(MirrorConfig::new(self.root.clone())) {
+                Ok(m) => {
+                    // Decode errors and absent draft/rev are the same
+                    // definitive miss to the overlay (never an error);
+                    // the Mirror (and its shared lock) drops right here.
+                    *slot = Some(m.revision(&self.draft, &self.rev).ok().flatten().map(|e| e.text));
+                }
+                // A writer holds the root (update in flight): miss NOW,
+                // resolve on a later access.
+                Err(Error::MirrorLocked(_)) => return f(None),
+                // No mirror at that root / unreadable: definitive miss.
+                Err(_) => *slot = Some(None),
+            }
+        }
+        f(slot.as_ref().expect("just resolved").as_deref())
     }
 }
 
 impl Readout for DraftReadout {
     fn entry(&self, at: &[&[u8]]) -> Option<ReadoutEntry> {
-        match at {
-            [] if !self.files().is_empty() => Some(ReadoutEntry {
-                kind: ReadoutKind::Branch,
-                blob_len: None,
-                attrs: Attrs::new(),
-            }),
-            [name] => self.file(name).map(|(_, text)| ReadoutEntry {
-                kind: ReadoutKind::Leaf,
-                blob_len: Some(text.len() as u64),
-                attrs: Attrs::new(),
-            }),
-            _ => None,
-        }
+        self.with_text(|text| {
+            let text = text?;
+            match at {
+                [] => Some(ReadoutEntry {
+                    kind: ReadoutKind::Branch,
+                    blob_len: None,
+                    attrs: Attrs::new(),
+                }),
+                [name] if *name == self.file_name.as_slice() => Some(ReadoutEntry {
+                    kind: ReadoutKind::Leaf,
+                    blob_len: Some(text.len() as u64),
+                    attrs: Attrs::new(),
+                }),
+                _ => None,
+            }
+        })
     }
 
     fn children(&self, at: &[&[u8]]) -> Vec<Name> {
-        if at.is_empty() {
-            self.files().iter().map(|(n, _)| n.clone()).collect()
+        if at.is_empty() && self.with_text(|t| t.is_some()) {
+            vec![self.file_name.clone()]
         } else {
             Vec::new()
         }
@@ -79,7 +101,9 @@ impl Readout for DraftReadout {
 
     fn blob(&self, at: &[&[u8]]) -> Option<Blob> {
         match at {
-            [name] => self.file(name).map(|(_, text)| Blob::Bytes(text.clone())),
+            [name] if *name == self.file_name.as_slice() => {
+                self.with_text(|t| t.map(|b| Blob::Bytes(b.to_vec())))
+            }
             _ => None,
         }
     }

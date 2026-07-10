@@ -15,11 +15,14 @@
 //! NOT attach — a git commit is CHECKED OUT into the box's changes
 //! (`git_checkout`), streamed with bounded memory.
 //!
-//! Pinning honesty: `wiki`/`ietf` record the head rev seen at attach
-//! time for identity and display, but their adapters serve the store's
-//! CURRENT head at first-use decode — true serve-at-rev needs
-//! read-at-rev adapters (adapters v2 chip). Within a hydration the
-//! OnceLock freezes what is served either way.
+//! Pinning honesty: `ietf` serves the attachment row's PINNED revision
+//! (`DraftReadout` is a read-at-rev adapter: one leaf, bytes frozen at
+//! the pin, no lock held between reads — `ietfmak update` runs freely
+//! alongside). `wiki` still records the head rev seen at attach time
+//! for identity/display but serves the store's CURRENT head at
+//! first-use decode — its read-at-rev adapter is the remaining
+//! adapters-v2 chip. Within a hydration the OnceLock freezes what is
+//! served either way.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -171,11 +174,13 @@ fn open_readout(ext: &ExtRef) -> Result<Arc<dyn Readout>, String> {
                 inst, page, title.as_deref())))
         }
         "ietf" => {
-            let m = ietf_mirror::Mirror::open(
-                    ietf_mirror::MirrorConfig::new(ext.store.clone().into()))
-                .map_err(|e| format!("ietf store {}: {e}", ext.store))?;
+            // Bookkeeping only: DraftReadout opens the store read-side
+            // (SHARED flock) at first access, decodes ONLY the pinned
+            // revision (ext.rev), and drops the lock — a hydrated
+            // attachment neither blocks `ietfmak update` nor drifts to
+            // a newer head.
             Ok(Arc::new(ietf_mirror::readout::DraftReadout::new(
-                m, &ext.refname)))
+                ext.store.clone().into(), &ext.refname, &ext.rev)))
         }
         other => Err(format!("unknown attachment kind {other:?}")),
     }

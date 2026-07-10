@@ -10,6 +10,10 @@ Real-effect assertions (never shape-only):
   • wiki/ietf attaches are bookkeeping-only: box count never changes
   • checkout streams the commit's bytes into WRITABLE box rows
   • each attached object's bytes are readable in the box (captured copy)
+  • `ietfmak update` succeeds WHILE the draft is attached and read
+    (readouts take the shared lock only for the decode, then drop it)
+  • after the update bumps the head, the attachment still serves the
+    PINNED revision's bytes; the new head file does not appear
   • a write to an ATTACHED key is EROFS with NO captured row
   • all three attachments appear in the session dict's "attachments",
     named for their objects (git:…/main@sha8, wiki:…@rN, ietf:…@rev)
@@ -101,6 +105,26 @@ class IetfHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class IetfBumpHandler(IetfHandler):
+    # The head moved 01 → 02 (00/01 are already watermarked host-side,
+    # so only 02 is fetched).
+    DOCS = dict(IetfHandler.DOCS)
+    DOCS["/id/all_id.txt"] = "draft-test-mesh-02\t2026-03-01\tActive\n"
+    DOCS["/archive/id/draft-test-mesh-02.txt"] = "mesh draft rev two\n"
+
+
+def ietf_update(iroot: Path, handler) -> "subprocess.CompletedProcess":
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    env = dict(os.environ,
+               IETFMAK_BASE_URL=f"http://127.0.0.1:{srv.server_port}")
+    r = subprocess.run([str(TOOLS["ietfmak"]), "update", str(iroot),
+                        "--delay-ms", "0"],
+                       capture_output=True, text=True, env=env)
+    srv.shutdown()
+    return r
+
+
 def build_mirrors(tmp: Path):
     """git store, wikimak instance, ietf root — all host-side inputs."""
     # git
@@ -122,14 +146,8 @@ def build_mirrors(tmp: Path):
     check(r.returncode == 0, f"wikimak import (rc={r.returncode}: {r.stderr[:200]})")
 
     # ietf (update against a local stand-in host)
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), IetfHandler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
     iroot = tmp / "ietf"
-    env = dict(os.environ,
-               IETFMAK_BASE_URL=f"http://127.0.0.1:{srv.server_port}")
-    r = subprocess.run([str(TOOLS["ietfmak"]), "update", str(iroot)],
-                       capture_output=True, text=True, env=env)
-    srv.shutdown()
+    r = ietf_update(iroot, IetfHandler)
     check(r.returncode == 0, f"ietfmak update (rc={r.returncode}: {r.stderr[:300]})")
     return store, wroot, iroot
 
@@ -225,9 +243,33 @@ def main():
               f"box reads all three mirrors (rc={r.returncode}: {r.stderr[:300]})")
         gathered = row_bytes(m, sp, "gathered.txt") or b""
         check(b"git tool v1" in gathered, "git bytes read through")
-        check(b"mesh draft rev one" in gathered, "ietf HEAD bytes read through")
+        check(b"mesh draft rev one" in gathered, "ietf PINNED bytes read through")
         check(len(gathered) > len(b"git tool v1\nmesh draft rev one\n"),
               "wiki page text read through (non-trivial bytes)")
+
+        # Update-while-attached: the box has READ the attachment, so
+        # its readout has decoded. The old readout held the mirror's
+        # EXCLUSIVE flock for the attachment's lifetime and this update
+        # failed "locked by another process"; now the decode borrows a
+        # SHARED lock and drops it, so the head bump must go through.
+        r = ietf_update(iroot, IetfBumpHandler)
+        check(r.returncode == 0 and "revisions fetched 1" in r.stdout,
+              f"ietfmak update succeeds while the draft is attached+read "
+              f"(rc={r.returncode}: {(r.stderr or r.stdout)[:300]})")
+
+        # Pin honesty: the attachment named @01 keeps serving rev 01's
+        # bytes after the mirror's head moved to 02, and the new head
+        # file does NOT appear under the attach prefix.
+        r = subprocess.run(
+            [str(BIN), "run", "WORK", "--", "sh", "-c",
+             "cat /ietf/draft-test-mesh-01.txt > /pinned.txt && "
+             "test ! -e /ietf/draft-test-mesh-02.txt"],
+            capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0,
+              f"pinned rev readable, bumped head absent (rc={r.returncode}: "
+              f"{r.stderr[:300]})")
+        check(row_bytes(m, sp, "pinned.txt") == b"mesh draft rev one\n",
+              "attached content stays the pinned rev's bytes after head bump")
 
         # Checked-out git rows are ORDINARY box changes: writable.
         r = subprocess.run(
@@ -238,8 +280,10 @@ def main():
               f"checked-out git file is writable (rc={r.returncode})")
 
         # EROFS on each ATTACHED kind's key; no capture side effect.
+        # (The ietf key is the PINNED leaf — the only file the pinned
+        # readout serves.)
         for key in ("'/wiki/Old Title.txt'",
-                    "/ietf/draft-test-mesh-00.txt"):
+                    "/ietf/draft-test-mesh-01.txt"):
             r = subprocess.run(
                 [str(BIN), "run", "WORK", "--", "sh", "-c",
                  f"echo overwrite > {key}"],

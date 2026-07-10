@@ -2605,11 +2605,13 @@ macro_rules! ui_verbs {
             json!({"ok": true, "name": name, "page": page,
                    "title": title, "rev": head.rev_id})
         }
-        // Attach an IETF draft series (ietf-mirror root) as an external
-        // RO reference: args [sid, root, draft, prefix?]. Bookkeeping
-        // only — head-rev pin here; the readout serves every mirrored
-        // revision as <draft>-<rev>.txt under prefix at first read.
-        "ietf_attach", "SID ROOT DRAFT [PREFIX]", "attach an IETF draft series as a read-only external reference" => {
+        // Attach an IETF draft (ietf-mirror root) as an external RO
+        // reference: args [sid, root, draft, prefix?]. Bookkeeping only
+        // — the head rev read here is the PIN, and the readout serves
+        // exactly that revision as <draft>-<rev>.txt under prefix at
+        // first read (attach.rs), even after later updates move the
+        // head.
+        "ietf_attach", "SID ROOT DRAFT [PREFIX]", "attach an IETF draft as a read-only external reference pinned at its current head revision" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -2624,13 +2626,16 @@ macro_rules! ui_verbs {
                 return json!({"ok": false, "error": "need root + draft"});
             };
             let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
-            let m = match ietf_mirror::Mirror::open(
+            // Read-side open (shared flock, dropped at scope end): the
+            // pin must be attachable while an update runs elsewhere.
+            let m = match ietf_mirror::Mirror::open_read(
                 ietf_mirror::MirrorConfig::new(root.into())) {
                 Ok(m) => m,
                 Err(e) => return json!({"ok": false, "error": e.to_string()}),
             };
-            // head() decodes ONE layer for the rev pin — never the full
-            // history() walk; that happens readout-side at first read.
+            // head() decodes ONE layer for the rev pin — never a full
+            // history walk; the pinned decode happens readout-side at
+            // first read.
             let head_rev = match m.head(draft) {
                 Ok(Some(h)) => h.rev,
                 Ok(None) => return json!({"ok": false,
