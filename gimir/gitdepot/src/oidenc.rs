@@ -486,14 +486,19 @@ impl Encoder {
         let mut rev_root = Node::keep();
         let mut cur_vars: BTreeMap<Vec<u8>, Vec<(u32, VarKey, Bitmap)>> = BTreeMap::new();
         layer::visit_stacked(&self.refprefix, self.stack.layers(), |path, mode, slot, bitmap, content| {
-            let bm = bitmap.unwrap_or_default();
+            // All params are borrowed slices into the state buffers; owned
+            // copies are made ONLY at the O(changed) paths retained below.
+            let bm = bitmap.unwrap_or(&[]);
             if path_trans.contains_key(path) {
-                let oid = String::from_utf8_lossy(&content).into_owned();
-                cur_vars.entry(path.to_vec()).or_default().push((slot, (mode.octal(), oid), bm));
+                let oid = String::from_utf8_lossy(content).into_owned();
+                cur_vars
+                    .entry(path.to_vec())
+                    .or_default()
+                    .push((slot, (mode.octal(), oid), bm.to_vec()));
             } else if live_changed {
                 // Untouched path: emit the omission flip if the variant's
                 // stored `lanes` form moves with the live set.
-                if let Some(child) = lanes_delta_child(&eff(&bm, prev_live), &eff(&bm, new_live)) {
+                if let Some(child) = lanes_delta_child(&eff(bm, prev_live), &eff(bm, new_live)) {
                     let mut vn = Node::keep();
                     vn.children.insert(layer::LANES.to_vec(), child);
                     put_variant(&mut rev_root, path, slot, vn);
@@ -572,8 +577,8 @@ impl Encoder {
 
         let mut flat: Vec<(Vec<u8>, Mode, u32, Bitmap, String)> = Vec::new();
         layer::visit_stacked(&self.refprefix, self.stack.layers(), |path, mode, slot, bitmap, content| {
-            let oid = String::from_utf8_lossy(&content).into_owned();
-            flat.push((path.to_vec(), mode, slot, bitmap.unwrap_or_default(), oid));
+            let oid = String::from_utf8_lossy(content).into_owned();
+            flat.push((path.to_vec(), mode, slot, bitmap.unwrap_or(&[]).to_vec(), oid));
         })
         .map_err(|e| crate::Error::Chain(format!("state stream: {e:?}")))?;
 
