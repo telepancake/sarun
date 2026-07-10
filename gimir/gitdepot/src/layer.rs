@@ -377,12 +377,14 @@ pub fn extract_lane_entries(union: &[u8], lane: u32) -> Result<Vec<(Vec<u8>, Mod
 /// `visit` is a borrowed slice into one of the input buffers.
 ///
 /// Sources are ordered bottom→top: the base, then the stack layers oldest
-/// first. Records are TOTAL (§4): at a file name the topmost source holding
-/// the name IS the variant (a hole means removed) — nothing below it is
-/// read. Directory nodes merge children across sources (a backdrop dir
-/// erases the sources below it first). Untouched base subtrees stream
-/// straight through. `k` is the geostack depth (~log(revisions since the
-/// last seal)), so the merge stays narrow.
+/// first. Records are TOTAL per KEY (§4): at each key of the container the
+/// newest recorded value wins whole (a hole removes the key; a backdrop
+/// occludes everything below it); a key a layer does not mention falls
+/// through. The merge resolves keys generically — [`assemble`], one level
+/// above it, is the only place key names are interpreted as variant facets.
+/// Directory nodes merge children across sources. Untouched base subtrees
+/// stream straight through. `k` is the geostack depth (~log(revisions since
+/// the last seal)), so the merge stays narrow.
 pub fn visit_stacked(
     base: &[u8],
     stack: &[Vec<u8>],
@@ -412,19 +414,22 @@ fn skip_children(cur: &mut Cursor, count: u64) -> Result<(), WErr> {
     Ok(())
 }
 
-/// Stream one BASE-ONLY child (no delta touches it): a file emits its
-/// facets directly; a directory streams its whole subtree. The fast path —
-/// no merging, no scans, no allocation.
+/// Stream one BASE-ONLY child (no delta touches it): a file resolves and
+/// emits its facets directly (a one-participant fold); a directory streams
+/// its whole subtree. The fast path — no merging, no scans, no allocation.
 fn base_only_child<'a>(
     cur: &mut Cursor<'a>,
     name: &[u8],
     path: &mut Vec<u8>,
+    keys: &mut NodeKeys<'a>,
     visit: &mut impl FnMut(&[u8], Mode, u32, Option<&[u8]>, &[u8]),
 ) -> Result<(), WErr> {
     match classify(name) {
         Some(Kind::File(gitname, slot)) => {
             let keep = push_seg(path, gitname);
-            if let Some((mode, bitmap, content)) = read_variant(cur)? {
+            keys.clear();
+            fold_node_keys(cur, keys)?;
+            if let Some((mode, bitmap, content)) = assemble(keys) {
                 visit(&path[..], mode, slot, bitmap, content);
             }
             path.truncate(keep);
@@ -434,7 +439,7 @@ fn base_only_child<'a>(
             let keep = push_seg(path, gitname);
             for _ in 0..n.child_count {
                 let child = cur.name()?;
-                base_only_child(cur, child, path, visit)?;
+                base_only_child(cur, child, path, keys, visit)?;
             }
             path.truncate(keep);
         }
@@ -482,14 +487,16 @@ fn klevel<'a>(
             .min()
     };
     let mut delta_min = dmin(&heads);
-    // The participant positions at the current minimum, reused across
-    // iterations (cleared, never reallocated).
+    // The participant positions at the current minimum, and the per-key
+    // resolution scratch — both reused across iterations (cleared, never
+    // reallocated).
     let mut group: Vec<usize> = Vec::with_capacity(active.len());
+    let mut keys = NodeKeys::default();
     loop {
         // Fast path: the base owns the minimum outright — one comparison.
         if let (Some(kb), Some(bh)) = (kb, kb.and_then(|k| heads[k])) {
             if delta_min.map(|d| bh < d).unwrap_or(true) {
-                base_only_child(&mut srcs[active[kb].0], bh, path, visit)?;
+                base_only_child(&mut srcs[active[kb].0], bh, path, &mut keys, visit)?;
                 heads[kb] = if rem[kb] > 0 {
                     rem[kb] -= 1;
                     Some(srcs[active[kb].0].name()?)
@@ -542,14 +549,14 @@ fn klevel<'a>(
                 path.truncate(keep);
             }
             Some(Kind::File(gitname, slot)) => {
-                // §4 totality: a record at a name is a hole or the WHOLE
-                // variant — the topmost participant hides everything below
-                // it. Skip the hidden nodes, read the winner.
-                let (&top, hidden) = group.split_last().expect("min implies a participant");
-                for &k in hidden {
-                    srcs[active[k].0].skip()?;
+                // Resolve the participants per KEY, bottom→top (§4: each
+                // key's newest record wins whole), then interpret the
+                // resolved keys one level above the merge.
+                keys.clear();
+                for &k in &group {
+                    fold_node_keys(&mut srcs[active[k].0], &mut keys)?;
                 }
-                if let Some((mode, bitmap, content)) = read_variant(&mut srcs[active[top].0])? {
+                if let Some((mode, bitmap, content)) = assemble(&keys) {
                     let keep = push_seg(path, gitname);
                     visit(&path[..], mode, slot, bitmap, content);
                     path.truncate(keep);
@@ -577,32 +584,75 @@ fn klevel<'a>(
     Ok(())
 }
 
-/// Read a variant node's content + mode + bitmap facets from `cur` (positioned
-/// at the node), consuming it whole. `None` ⇔ the node carries no blob — a
-/// hole, i.e. a removal under §4 totality (a record either doesn't mention a
-/// name or states its whole variant; base full-state variants always carry a
-/// blob). All facets are borrowed slices into the underlying buffer — nothing
-/// is copied.
-fn read_variant<'a>(
-    cur: &mut Cursor<'a>,
-) -> Result<Option<(Mode, Option<&'a [u8]>, &'a [u8])>, WErr> {
+/// The resolved per-key values of one file node across the participants at
+/// its name: the node's own blob, plus each child KEY's value. A `None`
+/// value records the key as removed; a key never recorded is absent. Purely
+/// structural — no key name is interpreted here (that is [`assemble`]'s
+/// job, one level above). All slices borrow the source buffers.
+#[derive(Default)]
+struct NodeKeys<'a> {
+    blob: Option<&'a [u8]>,
+    kids: Vec<(&'a [u8], Option<&'a [u8]>)>,
+}
+
+impl NodeKeys<'_> {
+    fn clear(&mut self) {
+        self.blob = None;
+        self.kids.clear();
+    }
+}
+
+/// Fold one participant's node into the per-key resolution. Callers fold
+/// bottom→top, so a later write at a key IS the newest record winning —
+/// §4 totality is per KEY: a recorded value replaces the accumulated one
+/// outright, a hole removes the key, and a backdrop node occludes every
+/// key accumulated below it. Generic: nothing here knows what a key means.
+fn fold_node_keys<'a>(cur: &mut Cursor<'a>, acc: &mut NodeKeys<'a>) -> Result<(), WErr> {
     let n = cur.node()?;
+    if n.backdrop {
+        acc.clear();
+    }
+    if let Some(b) = n.blob {
+        acc.blob = Some(b);
+    }
+    for _ in 0..n.child_count {
+        let name = cur.name()?;
+        let cn = cur.node()?;
+        // A hole (backdrop, no value, no children) removes the key; any
+        // recorded value replaces it whole.
+        let val = if cn.backdrop && cn.blob.is_none() && cn.child_count == 0 {
+            None
+        } else {
+            Some(cn.blob.unwrap_or(&[]))
+        };
+        match acc.kids.iter_mut().find(|(k, _)| *k == name) {
+            Some(kid) => kid.1 = val,
+            None => acc.kids.push((name, val)),
+        }
+        skip_children(cur, cn.child_count)?;
+    }
+    Ok(())
+}
+
+/// Interpret the resolved keys of a variant node (§2) — the ONLY place the
+/// stacked read gives key names a meaning: the node's own blob is the
+/// content (no content ⇒ the variant does not exist here), the `lanes` key
+/// is the bitmap (absent/removed ⇒ omitted, all-ones), and a mode-tag key
+/// holding a value sets the mode.
+fn assemble<'a>(keys: &NodeKeys<'a>) -> Option<(Mode, Option<&'a [u8]>, &'a [u8])> {
+    let content = keys.blob?;
     let mut mode = Mode::File;
     let mut bitmap = None;
-    for _ in 0..n.child_count {
-        let m = cur.name()?;
-        let mn = cur.node()?;
-        if m == LANES {
-            bitmap = Some(mn.blob.unwrap_or(&[]));
-        } else if let Some(tm) = tag_mode(m, mn.blob) {
-            mode = tm;
-        }
-        for _ in 0..mn.child_count {
-            cur.name()?;
-            cur.skip()?;
+    for &(name, val) in &keys.kids {
+        if name == LANES {
+            bitmap = val;
+        } else if val.is_some() {
+            if let Some(tm) = tag_mode(name, val) {
+                mode = tm;
+            }
         }
     }
-    Ok(n.blob.map(|content| (mode, bitmap, content)))
+    Some((mode, bitmap, content))
 }
 
 // ------------------------------------------------------------ iterator

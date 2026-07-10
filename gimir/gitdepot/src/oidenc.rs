@@ -13,14 +13,14 @@
 //! frame; it is never retained.
 //!
 //! [`Encoder::advance`] emits the REVERSE delta (rebuild the previous union
-//! state from the new one) — the chain's newest-first record, made of §4
-//! TOTAL nodes: a removal is a HOLE (the store occludes no host — the reader
-//! resolves it over the empty backdrop), anything else is the WHOLE previous
-//! variant. [`Encoder::seal_record`] streams the positive full-state head.
+//! state from the new one) — the chain's newest-first record. Removals are
+//! HOLES (the store occludes no host), so the reader resolves them over the
+//! empty backdrop. [`Encoder::full`] is the positive full-state head.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-use depot::{Bytes, Layer, Name, Node};
+use depot::{Attrs, BlobOp, Bytes, Layer, Name, Node, View};
 
 use crate::geostack::GeoStack;
 use crate::layer::{self, dir_key, file_key, variant_node, Mode};
@@ -144,13 +144,23 @@ fn new_variant_set(slots: &Slots<VarKey>, trans: &[Trans]) -> BTreeMap<VarKey, B
     set
 }
 
-/// Total-record anchor (§4): a delta record is a hole or the WHOLE variant.
-/// The backdrop anchor makes the node replace whatever sits below it outright
-/// under both overlay and compose — no facet of an older record shows through,
-/// so the stacked reader takes the topmost record at a name verbatim.
-fn total(mut n: Node) -> Node {
-    n.anchor = depot::Anchor::Backdrop;
-    n
+/// Set `node` (a variant-delta node overlaid on the NEW variant's node) to
+/// carry the mode `before`, holing the tag `after` currently shows if it is a
+/// different tag. Compared by tag NAME, so an `o` (non-canonical) tag's octal
+/// blob is simply overwritten to `before`'s octal.
+fn set_mode_tag(node: &mut Node, before: Mode, after: Mode) {
+    if before == after {
+        return;
+    }
+    if let Some(atag) = after.tag() {
+        if before.tag() != Some(atag) {
+            node.children.insert(atag.to_vec(), Node::hole());
+        }
+    }
+    if let Some(btag) = before.tag() {
+        let blob = if let Mode::Other(m) = before { format!("{m:o}").into_bytes() } else { Vec::new() };
+        node.children.insert(btag.to_vec(), Node { blob: BlobOp::Set(blob.into()), ..Node::keep() });
+    }
 }
 
 /// Trailing-zero-trimmed view of a bitmap — its canonical form for equality
@@ -177,31 +187,59 @@ fn eff(bitmap: &[u8], live: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// The `lanes`-child op that turns the NEW variant's effective bitmap form
+/// (`e_new`) into the OLD one (`e_before`) — `None` = omit that side:
+/// unchanged ⇒ no child; old omitted ⇒ hole (drop the bitmap); old explicit
+/// ⇒ Set it.
+fn lanes_delta_child(e_before: &Option<Vec<u8>>, e_new: &Option<Vec<u8>>) -> Option<Node> {
+    if e_before == e_new {
+        return None;
+    }
+    Some(match e_before {
+        None => Node::hole(),
+        Some(b) => Node { blob: BlobOp::Set(b.as_slice().into()), ..Node::keep() },
+    })
+}
+
 /// The §2 reverse-delta node for one slot change: applied onto the NEW union
-/// state at `file_key(name, slot)`, it rebuilds the PREVIOUS variant. Records
-/// are TOTAL (§4): a hole — the slot did not exist before, removed when
-/// walking back — or the WHOLE previous variant, backdrop-anchored so nothing
-/// of the newer node survives it. `None` ⇒ the two sides agree in the
-/// effective (omission-aware vs `prev_live`/`new_live`) form: nothing stored,
-/// the name falls through. An unmoved occupant whose omission form flips with
-/// the live set is just the `Some→Some` case — no special record.
+/// state's node at `file_key(name, slot)`, it rebuilds the PREVIOUS variant
+/// (`before`). `None` ⇒ nothing to emit (identity). `prev_live`/`new_live` are
+/// the lane sets live at the previous/new revisions — they drive the all-ones
+/// `lanes` omission on each side.
+///
+/// - new-only slot (`before=None`) ⇒ a HOLE (removed when walking back);
+/// - old-only slot (`after=None`) ⇒ the full previous variant node;
+/// - both ⇒ a minimal delta: `Set` the old content only if the blob oid
+///   moved, retag the mode if it changed, and rewrite the `lanes` child only
+///   if the variant's effective (omission-aware) bitmap moved.
 fn variant_reverse_node(
     ch: &SlotChange<VarKey>,
     obj: &mut dyn Objects,
     prev_live: &[u8],
     new_live: &[u8],
 ) -> Result<Option<Node>> {
-    let Some(bo) = &ch.before else {
-        return Ok(ch.after.is_some().then(Node::hole));
-    };
-    let e_before = eff(&bo.bitmap, prev_live);
-    if let Some(ao) = &ch.after {
-        if bo.id == ao.id && e_before == eff(&ao.bitmap, new_live) {
-            return Ok(None);
+    match (&ch.before, &ch.after) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Ok(Some(Node::hole())),
+        (Some(bo), None) => {
+            let content = variant_content(obj, &bo.id)?;
+            let bm = eff(&bo.bitmap, prev_live);
+            Ok(Some(variant_node(&content, occ_mode_id(&bo.id), bm.as_deref())))
+        }
+        (Some(bo), Some(ao)) => {
+            let mut node = Node::keep();
+            if bo.id.1 != ao.id.1 {
+                node.blob = BlobOp::Set(variant_content(obj, &bo.id)?.into());
+            }
+            set_mode_tag(&mut node, occ_mode_id(&bo.id), occ_mode_id(&ao.id));
+            let e_before = eff(&bo.bitmap, prev_live);
+            let e_new = eff(&ao.bitmap, new_live);
+            if let Some(child) = lanes_delta_child(&e_before, &e_new) {
+                node.children.insert(layer::LANES.to_vec(), child);
+            }
+            Ok((!node.is_identity() || !node.children.is_empty()).then_some(node))
         }
     }
-    let content = variant_content(obj, &bo.id)?;
-    Ok(Some(total(variant_node(&content, occ_mode_id(&bo.id), e_before.as_deref()))))
 }
 
 fn occ_mode_id(id: &VarKey) -> Mode {
@@ -357,21 +395,32 @@ fn put_variant(out: &mut Node, path: &[u8], slot: u32, node: Node) {
 
 /// The FORWARD state-delta node for one slot change — applied onto the current
 /// content-free state it produces the new one. The mirror of
-/// [`variant_reverse_node`], equally TOTAL (§4): a hole (slot removed) or the
-/// WHOLE new variant, backdrop-anchored — with the oid hex as the content and
-/// the bitmap always explicit (the resident state is omission-independent; the
-/// all-ones omission is applied only on emission into a frame, against that
-/// revision's live set).
+/// [`variant_reverse_node`], with the oid hex as the content and the bitmap
+/// always explicit (the resident state is omission-independent; the all-ones
+/// omission is applied only on emission into a frame, against that revision's
+/// live set).
 fn variant_forward_node(ch: &SlotChange<VarKey>) -> Option<Node> {
-    let Some(ao) = &ch.after else {
-        return ch.before.is_some().then(Node::hole);
-    };
-    if let Some(bo) = &ch.before {
-        if bo.id == ao.id && bo.bitmap == ao.bitmap {
-            return None;
+    match (&ch.before, &ch.after) {
+        (None, None) => None,
+        (Some(_), None) => Some(Node::hole()),
+        (None, Some(ao)) => {
+            Some(variant_node(ao.id.1.as_bytes(), occ_mode_id(&ao.id), Some(&ao.bitmap)))
+        }
+        (Some(bo), Some(ao)) => {
+            let mut node = Node::keep();
+            if bo.id.1 != ao.id.1 {
+                node.blob = BlobOp::Set(ao.id.1.as_bytes().into());
+            }
+            set_mode_tag(&mut node, occ_mode_id(&ao.id), occ_mode_id(&bo.id));
+            if bo.bitmap != ao.bitmap {
+                node.children.insert(
+                    layer::LANES.to_vec(),
+                    Node { blob: BlobOp::Set(ao.bitmap.as_slice().into()), ..Node::keep() },
+                );
+            }
+            (!node.is_identity() || !node.children.is_empty()).then_some(node)
         }
     }
-    Some(total(variant_node(ao.id.1.as_bytes(), occ_mode_id(&ao.id), Some(&ao.bitmap))))
 }
 
 fn is_file(e: Option<&Ent>) -> bool {
@@ -541,8 +590,7 @@ impl Encoder {
 
     /// Apply this revision's lane transitions and return the reverse delta
     /// rebuilding the PREVIOUS state from the new one — each older chain
-    /// record, made of §4 TOTAL nodes (a hole, or the whole previous
-    /// variant). §6, both sides of the lockstep:
+    /// record (removals as holes). §6, both sides of the lockstep:
     ///
     /// - **git side** — [`collect_trans`] distributes the lane transitions into
     ///   per-path file transitions, O(changed) by the oid prune;
@@ -571,7 +619,6 @@ impl Encoder {
         let live_changed = trim(prev_live) != trim(new_live);
         let mut rev_root = Node::keep();
         let mut cur_vars: BTreeMap<Vec<u8>, Vec<(u32, VarKey, Bitmap)>> = BTreeMap::new();
-        let mut flips: Vec<(Vec<u8>, u32, VarKey, Bitmap)> = Vec::new();
         layer::visit_stacked(&self.refprefix, self.stack.layers(), |path, mode, slot, bitmap, content| {
             // All params are borrowed slices into the state buffers; owned
             // copies are made ONLY at the O(changed) paths retained below.
@@ -582,22 +629,17 @@ impl Encoder {
                     .entry(path.to_vec())
                     .or_default()
                     .push((slot, (mode.octal(), oid), bm.to_vec()));
-            } else if live_changed && eff(bm, prev_live) != eff(bm, new_live) {
-                // Untouched path whose all-ones omission form moves with the
-                // live set: an unmoved occupant, recorded below like any
-                // other slot change (§4 total records — no special case).
-                let oid = String::from_utf8_lossy(content).into_owned();
-                flips.push((path.to_vec(), slot, (mode.octal(), oid), bm.to_vec()));
+            } else if live_changed {
+                // Untouched path: emit the omission flip if the variant's
+                // stored `lanes` form moves with the live set.
+                if let Some(child) = lanes_delta_child(&eff(bm, prev_live), &eff(bm, new_live)) {
+                    let mut vn = Node::keep();
+                    vn.children.insert(layer::LANES.to_vec(), child);
+                    put_variant(&mut rev_root, path, slot, vn);
+                }
             }
         })
         .map_err(|e| crate::Error::Chain(format!("state stream: {e:?}")))?;
-        for (path, slot, id, bm) in flips {
-            let occ = Occupant { id, bitmap: bm };
-            let ch = SlotChange { slot, before: Some(occ.clone()), after: Some(occ) };
-            if let Some(node) = variant_reverse_node(&ch, obj, prev_live, new_live)? {
-                put_variant(&mut rev_root, &path, slot, node);
-            }
-        }
 
         // Per-path reslot: reverse chain node + forward state node per change.
         let mut fwd_root = Node::keep();
@@ -621,16 +663,15 @@ impl Encoder {
             }
             if live_changed {
                 // Slots at this path the reslot did not touch still flip their
-                // omission form when the live set moved — unmoved occupants,
-                // recorded by the same total-record rule.
-                for (s, id, bm) in &cvars {
+                // omission form when the live set moved.
+                for (s, _, bm) in &cvars {
                     if changed.contains(s) {
                         continue;
                     }
-                    let occ = Occupant { id: id.clone(), bitmap: bm.clone() };
-                    let ch = SlotChange { slot: *s, before: Some(occ.clone()), after: Some(occ) };
-                    if let Some(node) = variant_reverse_node(&ch, obj, prev_live, new_live)? {
-                        put_variant(&mut rev_root, path, *s, node);
+                    if let Some(child) = lanes_delta_child(&eff(bm, prev_live), &eff(bm, new_live)) {
+                        let mut vn = Node::keep();
+                        vn.children.insert(layer::LANES.to_vec(), child);
+                        put_variant(&mut rev_root, path, *s, vn);
                     }
                 }
             }
@@ -681,7 +722,6 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use depot::View;
     use std::collections::HashMap;
 
     /// Reconstruct lane `l` from a §2 union View as a flat `path -> (mode,
