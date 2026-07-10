@@ -81,8 +81,9 @@ def sh_git(repo, *args):
 
 class IetfHandler(http.server.BaseHTTPRequestHandler):
     DOCS = {
+        # REAL all_id.txt shape: ONE line per draft, at its LATEST
+        # revision; the mirror enumerates 00..01 from the head number.
         "/id/all_id.txt":
-            "draft-test-mesh-00\t2026-01-01\tActive\n"
             "draft-test-mesh-01\t2026-02-01\tActive\n",
         "/archive/id/draft-test-mesh-00.txt": "mesh draft rev zero\n",
         "/archive/id/draft-test-mesh-01.txt": "mesh draft rev one\n",

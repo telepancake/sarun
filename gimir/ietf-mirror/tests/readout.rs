@@ -9,9 +9,9 @@ use ietf_mirror::{FetchConfig, Mirror, MirrorConfig};
 use reqwest::blocking::Client;
 use tempfile::TempDir;
 
-const IDX: &str = "\
-draft-test-alpha-00\t2024-01-01\tActive\n\
-draft-test-alpha-01\t2024-02-01\tActive\n";
+// REAL all_id.txt shape: each draft ONE line, at its LATEST revision;
+// the mirror enumerates 00..01 from it.
+const IDX: &str = "draft-test-alpha-01\t2024-02-01\tActive\n";
 
 /// Mirror two alpha revisions from a mocked ietf.org, hand the Mirror
 /// to the adapter.
@@ -34,7 +34,12 @@ fn mirrored() -> (TempDir, Mirror) {
     }
     let tmp = TempDir::new().unwrap();
     let mut m = Mirror::open(MirrorConfig::new(tmp.path().join("m"))).unwrap();
-    m.update(&Client::new(), &FetchConfig { base_url: server.base_url() }, |_, _| ()).unwrap();
+    let cfg = FetchConfig {
+        base_url: server.base_url(),
+        delay: std::time::Duration::ZERO,
+        ..FetchConfig::default()
+    };
+    m.update(&Client::new(), &cfg, |_, _| ()).unwrap();
     (tmp, m)
 }
 
