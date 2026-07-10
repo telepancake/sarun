@@ -17,7 +17,7 @@ sha1 = { workspace = true }
 libc = { workspace = true }
 # Native git object reads (gitobj.rs): zlib inflate for loose objects and
 # pack entries — pure-Rust backend, musl-safe.
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 rusqlite = { workspace = true }
 wikimak-depot = { workspace = true }
 
