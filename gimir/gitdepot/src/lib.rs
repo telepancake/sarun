@@ -884,11 +884,92 @@ pub fn update(repo: &Path, store: &Path, level: i32) -> Result<UpdateOutcome> {
 // shas recorded at import. Never stored (the implicit-id rule).
 
 pub(crate) fn git_obj_oid(typ: &str, body: &[u8]) -> String {
-    use sha1::Digest as _;
-    let mut h = sha1::Sha1::new();
-    h.update(format!("{typ} {}\0", body.len()).as_bytes());
-    h.update(body);
-    hex::encode(h.finalize())
+    HashKind::Sha1.obj_oid(typ, body)
+}
+
+/// The repository object-id format (git's hash transition): SHA-1, or the
+/// "new format" SHA-256 (`git init --object-format=sha256`). The oid WIDTH
+/// is the format's fingerprint — 40 vs 64 hex — so stores, refs, and
+/// entries self-describe and the kind is inferred, never persisted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HashKind {
+    Sha1,
+    Sha256,
+}
+
+impl HashKind {
+    pub fn oid_len(self) -> usize {
+        match self {
+            HashKind::Sha1 => 20,
+            HashKind::Sha256 => 32,
+        }
+    }
+
+    pub fn hex_len(self) -> usize {
+        self.oid_len() * 2
+    }
+
+    /// The kind whose hex oid has `len` characters.
+    pub fn of_hex_len(len: usize) -> Option<HashKind> {
+        match len {
+            40 => Some(HashKind::Sha1),
+            64 => Some(HashKind::Sha256),
+            _ => None,
+        }
+    }
+
+    /// A repository's object format, from `<git-dir>/config`
+    /// (`extensions.objectformat`); absent ⇒ SHA-1.
+    pub fn of_repo(repo: &Path) -> HashKind {
+        let dir = crate::gitobj::resolved_git_dir(repo);
+        let Ok(cfg) = std::fs::read_to_string(dir.join("config")) else {
+            return HashKind::Sha1;
+        };
+        for line in cfg.lines() {
+            let l = line.trim().to_ascii_lowercase().replace(' ', "");
+            if l == "objectformat=sha256" {
+                return HashKind::Sha256;
+            }
+        }
+        HashKind::Sha1
+    }
+
+    /// `sha("<type> <len>\0" + body)` in this format, binary: the digest
+    /// and its length.
+    pub fn obj_digest(self, typ: &str, body: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        match self {
+            HashKind::Sha1 => {
+                use sha1::Digest as _;
+                let mut h = sha1::Sha1::new();
+                h.update(format!("{typ} {}\0", body.len()).as_bytes());
+                h.update(body);
+                out[..20].copy_from_slice(&h.finalize());
+            }
+            HashKind::Sha256 => {
+                use sha2::Digest as _;
+                let mut h = sha2::Sha256::new();
+                h.update(format!("{typ} {}\0", body.len()).as_bytes());
+                h.update(body);
+                out.copy_from_slice(&h.finalize());
+            }
+        }
+        out
+    }
+
+    pub fn obj_oid(self, typ: &str, body: &[u8]) -> String {
+        hex::encode(&self.obj_digest(typ, body)[..self.oid_len()])
+    }
+
+    /// The (virtual) empty tree's oid in this format.
+    pub fn empty_tree_hex(self) -> &'static str {
+        match self {
+            HashKind::Sha1 => "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            HashKind::Sha256 => {
+                "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+            }
+        }
+    }
 }
 
 /// The git tree oid of a canonical view, bottom-up over assembled tree
@@ -901,10 +982,15 @@ pub(crate) fn git_obj_oid(typ: &str, body: &[u8]) -> String {
 /// tooling that must not go through `layer::Mode` (whose canonical enum
 /// cannot represent those modes).
 pub fn git_tree_oid_of_view(view: &depot::View) -> Result<String> {
-    view_tree_oid(view)
+    view_tree_oid(view, HashKind::Sha1)
 }
 
-fn view_tree_oid(view: &depot::View) -> Result<String> {
+/// [`git_tree_oid_of_view`] in an explicit object-id format.
+pub fn git_tree_oid_of_view_kind(view: &depot::View, kind: HashKind) -> Result<String> {
+    view_tree_oid(view, kind)
+}
+
+fn view_tree_oid(view: &depot::View, kind: HashKind) -> Result<String> {
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (sortkey, raw entry)
     for (name, child) in &view.children {
         let (mode, oid, is_dir) = match &child.blob {
@@ -918,11 +1004,11 @@ fn view_tree_oid(view: &depot::View) -> Result<String> {
                     // gitlink: the stored blob IS the pinned commit id.
                     String::from_utf8_lossy(content).into_owned()
                 } else {
-                    git_obj_oid("blob", content)
+                    kind.obj_oid("blob", content)
                 };
                 (mode, oid, false)
             }
-            None => ("40000".to_string(), view_tree_oid(child)?, true),
+            None => ("40000".to_string(), view_tree_oid(child, kind)?, true),
         };
         let mut raw = mode.trim_start_matches('0').to_string().into_bytes();
         raw.push(b' ');
@@ -942,7 +1028,7 @@ fn view_tree_oid(view: &depot::View) -> Result<String> {
     for (_, raw) in entries {
         body.extend_from_slice(&raw);
     }
-    Ok(git_obj_oid("tree", &body))
+    Ok(kind.obj_oid("tree", &body))
 }
 
 /// Reassemble the raw commit object bytes for a stored record.
@@ -1126,7 +1212,8 @@ fn build_stub_at(dir: &Path, st: &store::Store, url: &str) -> Result<()> {
             })
             .collect::<Result<Vec<_>>>()?;
         let tree_oid = match views.get(sha) {
-            Some(v) => view_tree_oid(v)?,
+            // The store's own sha width names its format.
+            Some(v) => view_tree_oid(v, HashKind::of_hex_len(sha.len()).unwrap_or(HashKind::Sha1))?,
             None => String::new(), // raw-carrying record: oid unused
         };
         write_object(dir, "commit", &assemble_commit_raw(rec, &parents, &tree_oid), sha)?;

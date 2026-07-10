@@ -74,6 +74,7 @@ fn tree_bytes(ents: &[(Vec<u8>, crate::oidenc::Ent)]) -> usize {
 }
 
 struct Cat {
+    kind: crate::HashKind,
     cat: crate::CatFile,
     trees: HashMap<String, (TreeEnts, usize)>, // oid → (entries, byte size)
     order: std::collections::VecDeque<String>, // FIFO eviction order
@@ -86,6 +87,7 @@ struct Cat {
 impl Cat {
     fn new(repo: &Path) -> Result<Self> {
         Ok(Cat {
+            kind: crate::HashKind::of_repo(repo),
             cat: crate::CatFile::new(repo)?,
             trees: HashMap::new(),
             order: std::collections::VecDeque::new(),
@@ -118,7 +120,10 @@ impl crate::oidenc::Objects for Cat {
             return Ok(t.clone());
         }
         self.reads += 1;
-        let ents = std::sync::Arc::new(crate::oidenc::parse_tree(&self.cat.get(oid)?)?);
+        let ents = std::sync::Arc::new(crate::oidenc::parse_tree_oids(
+            &self.cat.get(oid)?,
+            self.kind.oid_len(),
+        )?);
         let sz = tree_bytes(&ents);
         while self.bytes + sz > TREE_CACHE_BUDGET {
             let Some(old) = self.order.pop_front() else { break };
@@ -798,7 +803,13 @@ impl LaneStore {
         dir: &Path,
         level: i32,
     ) -> Result<(LaneStore, usize)> {
-        let pg = std::sync::Arc::new(crate::memgraph::build_pack(pack)?);
+        // The refs' oid width names the repo's hash format (§: the fetch
+        // dialogue's object-format capability, carried by the ref shas).
+        let kind = refs
+            .first()
+            .and_then(|(_, sha)| crate::HashKind::of_hex_len(sha.len()))
+            .ok_or_else(|| cf("pack-union: no refs (or malformed shas) to infer hash format".into()))?;
+        let pg = std::sync::Arc::new(crate::memgraph::build_pack(pack, kind)?);
         let g = &pg.graph;
 
         // Resolve each ref through tag chains: a commit binds the ref, a
@@ -1002,6 +1013,15 @@ impl LaneStore {
         1usize << self.shard_bits
     }
 
+    /// The store's object-id format, inferred from its stored oid widths
+    /// (never persisted — the width IS the format).
+    pub fn hash_kind(&self) -> crate::HashKind {
+        self.sha_of
+            .first()
+            .and_then(|s| crate::HashKind::of_hex_len(s.len()))
+            .unwrap_or(crate::HashKind::Sha1)
+    }
+
     /// ref name → resolved commit sha (persisted set).
     pub fn refs(&self) -> &HashMap<String, String> {
         &self.refs
@@ -1162,7 +1182,8 @@ impl LaneStore {
     /// The git tree oid of the commit at revision `rev` (reconstructed) — the
     /// SHA-exact ground truth from the stored §2 union bytes.
     pub fn tree_oid_at(&self, rev: usize) -> Result<String> {
-        crate::layer::tree_oid_of_entries(&self.lane_entries_at(rev)?).map_err(|e| cf(format!("{e:?}")))
+        crate::layer::tree_oid_of_entries(&self.lane_entries_at(rev)?, self.hash_kind())
+            .map_err(|e| cf(format!("{e:?}")))
     }
 
     /// The commit-at-`rev`'s git tree as a nested `depot::View`: leaf files

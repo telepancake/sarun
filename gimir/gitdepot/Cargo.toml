@@ -14,6 +14,7 @@ hex = { workspace = true }
 # Git object ids recomputed host-side (stub rebuild asserts sha
 # equality without a round-trip through git).
 sha1 = { workspace = true }
+sha2 = { workspace = true }
 libc = { workspace = true }
 # Native git object reads (gitobj.rs): zlib inflate for loose objects and
 # pack entries — pure-Rust backend, musl-safe.

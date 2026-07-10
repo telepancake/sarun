@@ -87,7 +87,10 @@ struct TagBody {
 /// indices are stable pointers). `shas[slot]` is the full 20-byte id.
 struct HeadTable {
     slots: Vec<Head>,
-    shas: Vec<[u8; 20]>,
+    /// Full oids, 32-byte slots (SHA-1 uses the first 20).
+    shas: Vec<[u8; 32]>,
+    /// Oid width in bytes.
+    olen: usize,
     mask: usize,
     n: usize,
 }
@@ -97,7 +100,8 @@ impl HeadTable {
         let cap = (objects * 4 / 3 + 64).next_power_of_two();
         HeadTable {
             slots: vec![Head { id: 0, kind: K_EMPTY, body: u32::MAX }; cap],
-            shas: vec![[0u8; 20]; cap],
+            shas: vec![[0u8; 32]; cap],
+            olen: 20,
             mask: cap - 1,
             n: 0,
         }
@@ -106,7 +110,8 @@ impl HeadTable {
     /// The slot of `sha`, inserting a dummy header if absent. The truncated
     /// id is its own hash; the full sha disambiguates (and detects) 64-bit
     /// prefix collisions.
-    fn find_or_insert(&mut self, sha: &[u8; 20]) -> Result<u32> {
+    fn find_or_insert(&mut self, sha: &[u8]) -> Result<u32> {
+        debug_assert_eq!(sha.len(), self.olen);
         let id = u64::from_be_bytes(sha[..8].try_into().unwrap());
         let mut i = (id as usize) & self.mask;
         loop {
@@ -118,15 +123,15 @@ impl HeadTable {
                     ));
                 }
                 self.slots[i] = Head { id, kind: K_DUMMY, body: u32::MAX };
-                self.shas[i] = *sha;
+                self.shas[i][..sha.len()].copy_from_slice(sha);
                 self.n += 1;
                 return Ok(i as u32);
             }
             if s.id == id {
-                if self.shas[i] != *sha {
+                if &self.shas[i][..sha.len()] != sha {
                     return Err(Error::Chain(format!(
                         "memgraph: 64-bit id collision: {} vs {}",
-                        hex::encode(self.shas[i]),
+                        hex::encode(&self.shas[i][..sha.len()]),
                         hex::encode(sha)
                     )));
                 }
@@ -136,7 +141,7 @@ impl HeadTable {
         }
     }
 
-    fn lookup(&self, sha: &[u8; 20]) -> Option<u32> {
+    fn lookup(&self, sha: &[u8]) -> Option<u32> {
         let id = u64::from_be_bytes(sha[..8].try_into().unwrap());
         let mut i = (id as usize) & self.mask;
         loop {
@@ -144,7 +149,7 @@ impl HeadTable {
             if s.kind == K_EMPTY {
                 return None;
             }
-            if s.id == id && self.shas[i] == *sha {
+            if s.id == id && &self.shas[i][..sha.len()] == sha {
                 return Some(i as u32);
             }
             i = (i + 1) & self.mask;
@@ -212,12 +217,12 @@ impl Listings {
     }
 }
 
-fn hex_sha(hex: &[u8]) -> Option<[u8; 20]> {
-    if hex.len() < 40 {
+fn hex_sha(hex: &[u8], olen: usize) -> Option<Vec<u8>> {
+    if hex.len() < olen * 2 {
         return None;
     }
-    let mut sha = [0u8; 20];
-    hex::decode_to_slice(std::str::from_utf8(&hex[..40]).ok()?, &mut sha).ok()?;
+    let mut sha = vec![0u8; olen];
+    hex::decode_to_slice(std::str::from_utf8(&hex[..olen * 2]).ok()?, &mut sha).ok()?;
     Some(sha)
 }
 
@@ -258,6 +263,7 @@ impl Stats {
 }
 
 pub(crate) struct MemGraph {
+    kind: crate::HashKind,
     heads: HeadTable,
     trees: Vec<TreeBody>,
     kids: Vec<u32>,
@@ -271,9 +277,12 @@ pub(crate) struct MemGraph {
 }
 
 impl MemGraph {
-    fn with_capacity(objects: usize) -> MemGraph {
+    fn with_capacity(kind: crate::HashKind, objects: usize) -> MemGraph {
+        let mut heads = HeadTable::with_capacity(objects);
+        heads.olen = kind.oid_len();
         MemGraph {
-            heads: HeadTable::with_capacity(objects),
+            kind,
+            heads,
             trees: Vec::new(),
             kids: Vec::new(),
             listings: Listings::default(),
@@ -286,7 +295,7 @@ impl MemGraph {
         }
     }
 
-    fn add(&mut self, sha: &[u8; 20], typ: u8, loc: Loc, data: &[u8]) -> Result<()> {
+    fn add(&mut self, sha: &[u8], typ: u8, loc: Loc, data: &[u8]) -> Result<()> {
         let slot = self.heads.find_or_insert(sha)?;
         let h = self.heads.slots[slot as usize];
         if h.kind != K_DUMMY {
@@ -299,7 +308,8 @@ impl MemGraph {
                 (K_BLOB, self.blobs.len() as u32 - 1)
             }
             2 => {
-                // Tree entries: `<mode> <name>\0<20-byte oid>`.
+                // Tree entries: `<mode> <name>\0<oid-width bytes>`.
+                let olen = self.kind.oid_len();
                 self.scratch.clear();
                 let kids_off = self.kids.len() as u32;
                 let mut entries = 0u32;
@@ -310,16 +320,14 @@ impl MemGraph {
                         .position(|&b| b == 0)
                         .ok_or_else(|| Error::Chain("memgraph: malformed tree".into()))?
                         + i;
-                    if nul + 21 > data.len() {
+                    if nul + 1 + olen > data.len() {
                         return Err(Error::Chain("memgraph: truncated tree entry".into()));
                     }
                     self.scratch.extend_from_slice(&data[i..nul + 1]);
-                    let mut child = [0u8; 20];
-                    child.copy_from_slice(&data[nul + 1..nul + 21]);
-                    let kid = self.heads.find_or_insert(&child)?;
+                    let kid = self.heads.find_or_insert(&data[nul + 1..nul + 1 + olen])?;
                     self.kids.push(kid);
                     entries += 1;
-                    i = nul + 21;
+                    i = nul + 1 + olen;
                 }
                 let scratch = std::mem::take(&mut self.scratch);
                 let listing = self.listings.intern(&scratch, entries);
@@ -331,13 +339,14 @@ impl MemGraph {
                 // Commit text: `tree <hex>` then `parent <hex>` lines.
                 let mut tree = u32::MAX;
                 let par_off = self.parents.len() as u32;
+                let olen = self.kind.oid_len();
                 for line in data.split(|&b| b == b'\n') {
                     if let Some(hexs) = line.strip_prefix(b"tree ") {
-                        let sha = hex_sha(hexs)
+                        let sha = hex_sha(hexs, olen)
                             .ok_or_else(|| Error::Chain("memgraph: bad tree line".into()))?;
                         tree = self.heads.find_or_insert(&sha)?;
                     } else if let Some(hexs) = line.strip_prefix(b"parent ") {
-                        let sha = hex_sha(hexs)
+                        let sha = hex_sha(hexs, olen)
                             .ok_or_else(|| Error::Chain("memgraph: bad parent line".into()))?;
                         let p = self.heads.find_or_insert(&sha)?;
                         self.parents.push(p);
@@ -353,7 +362,7 @@ impl MemGraph {
                 let mut target = u32::MAX;
                 for line in data.split(|&b| b == b'\n') {
                     if let Some(hexs) = line.strip_prefix(b"object ") {
-                        if let Some(sha) = hex_sha(hexs) {
+                        if let Some(sha) = hex_sha(hexs, self.kind.oid_len()) {
                             target = self.heads.find_or_insert(&sha)?;
                         }
                         break;
@@ -371,7 +380,10 @@ impl MemGraph {
     // ------------------------------------------------ graph accessors
 
     pub(crate) fn slot_of_hex(&self, oid: &str) -> Option<u32> {
-        self.heads.lookup(&hex_sha(oid.as_bytes())?)
+        if oid.len() != self.kind.hex_len() {
+            return None;
+        }
+        self.heads.lookup(&hex_sha(oid.as_bytes(), self.kind.oid_len())?)
     }
 
     fn kind(&self, slot: u32) -> u8 {
@@ -379,7 +391,7 @@ impl MemGraph {
     }
 
     pub(crate) fn sha_hex(&self, slot: u32) -> String {
-        hex::encode(self.heads.shas[slot as usize])
+        hex::encode(&self.heads.shas[slot as usize][..self.heads.olen])
     }
 
     pub(crate) fn is_commit(&self, slot: u32) -> bool {
@@ -443,7 +455,7 @@ impl MemGraph {
             listing_refs: self.listings.hits + self.listings.spans.len() as u64,
             head_slots: self.heads.slots.len(),
             bytes_heads: self.heads.slots.len() * std::mem::size_of::<Head>(),
-            bytes_shas: self.heads.shas.len() * 20,
+            bytes_shas: self.heads.shas.len() * self.heads.olen,
             bytes_tree_bodies: self.trees.len() * std::mem::size_of::<TreeBody>(),
             bytes_kids: self.kids.len() * 4,
             bytes_listings: self.listings.bytes.len()
@@ -526,11 +538,13 @@ impl PackReader {
 
     /// The typed body at `ofs`. `base_of(sha)` maps a REF_DELTA base to its
     /// pack offset (from the graph); unknown ⇒ `None` (a not-yet-scanned
-    /// forward reference — the scan defers the entry).
+    /// forward reference — the scan defers the entry). `olen` is the pack's
+    /// oid width (its repo's hash format).
     fn entry_at(
         &mut self,
         ofs: u64,
-        base_of: &dyn Fn(&[u8; 20]) -> Option<u64>,
+        olen: usize,
+        base_of: &dyn Fn(&[u8]) -> Option<u64>,
     ) -> Result<Option<(u8, Arc<Vec<u8>>)>> {
         if let Some(hit) = self.cache.get(&ofs) {
             return Ok(Some(hit.clone()));
@@ -547,7 +561,7 @@ impl PackReader {
                 let base_ofs = ofs
                     .checked_sub(rel)
                     .ok_or_else(|| Error::Chain("pack: ofs-delta before start".into()))?;
-                let Some((bt, base)) = self.entry_at(base_ofs, base_of)? else {
+                let Some((bt, base)) = self.entry_at(base_ofs, olen, base_of)? else {
                     return Ok(None);
                 };
                 let delta =
@@ -555,14 +569,14 @@ impl PackReader {
                 (bt, Arc::new(apply_delta(&base, &delta).map_err(|e| Error::Chain(e.to_string()))?))
             }
             7 => {
-                let mut sha = [0u8; 20];
-                self.file.read_at(&mut sha, ofs + hlen as u64)?;
-                let Some(base_ofs) = base_of(&sha) else { return Ok(None) };
-                let Some((bt, base)) = self.entry_at(base_ofs, base_of)? else {
+                let mut sha = [0u8; 32];
+                self.file.read_at(&mut sha[..olen], ofs + hlen as u64)?;
+                let Some(base_ofs) = base_of(&sha[..olen]) else { return Ok(None) };
+                let Some((bt, base)) = self.entry_at(base_ofs, olen, base_of)? else {
                     return Ok(None);
                 };
                 let delta =
-                    inflate_at(&self.file, ofs + hlen as u64 + 20, size as usize)?;
+                    inflate_at(&self.file, ofs + hlen as u64 + olen as u64, size as usize)?;
                 (bt, Arc::new(apply_delta(&base, &delta).map_err(|e| Error::Chain(e.to_string()))?))
             }
             t => return Err(Error::Chain(format!("pack: entry type {t}"))),
@@ -581,13 +595,12 @@ impl PackReader {
 
     /// The compressed span of the entry at `ofs` (header + zlib stream),
     /// i.e. where the NEXT entry starts — a sequential-scan step.
-    fn entry_span(&mut self, ofs: u64) -> Result<u64> {
-        use std::os::unix::fs::FileExt as _;
+    fn entry_span(&mut self, ofs: u64, olen: usize) -> Result<u64> {
         let (typ, size, hlen) = entry_header(&self.file, ofs)?;
         let extra = match typ {
             1..=4 => 0,
             6 => negofs(&self.file, ofs + hlen as u64)?.1 as u64,
-            7 => 20,
+            7 => olen as u64,
             t => return Err(Error::Chain(format!("pack: entry type {t}"))),
         };
         let mut probe = [0u8; 0];
@@ -607,9 +620,9 @@ pub(crate) struct PackGraph {
 
 /// Scan a SELF-CONTAINED pack (the `no-thin` fetch guarantee) into the
 /// resident graph: one forward sweep — inflate, resolve in-pack deltas,
-/// HASH each object (the wire carries no ids) — with ref-delta forward
-/// references deferred and retried until stable.
-pub(crate) fn build_pack(pack: &Path) -> Result<PackGraph> {
+/// HASH each object in the repo's format (the wire carries no ids) — with
+/// ref-delta forward references deferred and retried until stable.
+pub(crate) fn build_pack(pack: &Path, kind: crate::HashKind) -> Result<PackGraph> {
     use std::os::unix::fs::FileExt as _;
     let mut rd = PackReader::open(pack)?;
     let mut hdr = [0u8; 12];
@@ -622,12 +635,13 @@ pub(crate) fn build_pack(pack: &Path) -> Result<PackGraph> {
         return Err(Error::Chain(format!("pack version {ver} unsupported")));
     }
     let count = u32::from_be_bytes(hdr[8..12].try_into().unwrap()) as usize;
-    let mut g = MemGraph::with_capacity(count + count / 8 + 1024);
+    let mut g = MemGraph::with_capacity(kind, count + count / 8 + 1024);
 
+    let olen = kind.oid_len();
     let hash_add = |g: &mut MemGraph, rd: &mut PackReader, ofs: u64| -> Result<bool> {
         // Ref-delta bases resolve through what the graph has scanned so far.
         let (typ, data) = {
-            let base_of = |sha: &[u8; 20]| -> Option<u64> {
+            let base_of = |sha: &[u8]| -> Option<u64> {
                 let slot = g.heads.lookup(sha)?;
                 let h = g.heads.slots[slot as usize];
                 match h.kind {
@@ -640,15 +654,15 @@ pub(crate) fn build_pack(pack: &Path) -> Result<PackGraph> {
                     _ => None,
                 }
             };
-            match rd.entry_at(ofs, &base_of)? {
+            match rd.entry_at(ofs, olen, &base_of)? {
                 Some(r) => r,
                 None => {
                     // The base may be a TREE (no Loc) — rebuild its bytes.
-                    let base_of_tree = |sha: &[u8; 20]| -> Option<Vec<u8>> {
+                    let base_of_tree = |sha: &[u8]| -> Option<Vec<u8>> {
                         let slot = g.heads.lookup(sha)?;
                         g.is_tree(slot).then(|| tree_bytes(g, slot))
                     };
-                    match rd_entry_with_tree_base(rd, ofs, &base_of_tree)? {
+                    match rd_entry_with_tree_base(rd, ofs, olen, &base_of_tree)? {
                         Some(r) => r,
                         None => return Ok(false),
                     }
@@ -662,19 +676,15 @@ pub(crate) fn build_pack(pack: &Path) -> Result<PackGraph> {
             4 => "tag",
             t => return Err(Error::Chain(format!("pack: resolved type {t}"))),
         };
-        use sha1::Digest as _;
-        let mut h = sha1::Sha1::new();
-        h.update(format!("{typ_name} {}\0", data.len()).as_bytes());
-        h.update(&*data);
-        let sha: [u8; 20] = h.finalize().into();
-        g.add(&sha, typ, Loc { pack: 0, ofs }, &data)?;
+        let digest = kind.obj_digest(typ_name, &data);
+        g.add(&digest[..olen], typ, Loc { pack: 0, ofs }, &data)?;
         Ok(true)
     };
 
     let mut ofs = 12u64;
     let mut deferred: Vec<u64> = Vec::new();
     for _ in 0..count {
-        let span = rd.entry_span(ofs)?;
+        let span = rd.entry_span(ofs, olen)?;
         if !hash_add(&mut g, &mut rd, ofs)? {
             deferred.push(ofs);
         }
@@ -712,7 +722,7 @@ fn tree_bytes(g: &MemGraph, slot: u32) -> Vec<u8> {
         let nul = bytes[i..].iter().position(|&b| b == 0).unwrap() + i;
         out.extend_from_slice(&bytes[i..nul + 1]);
         let kid = g.kids[b.kids_off as usize + k as usize];
-        out.extend_from_slice(&g.heads.shas[kid as usize]);
+        out.extend_from_slice(&g.heads.shas[kid as usize][..g.heads.olen]);
         i = nul + 1;
     }
     out
@@ -723,17 +733,18 @@ fn tree_bytes(g: &MemGraph, slot: u32) -> Vec<u8> {
 fn rd_entry_with_tree_base(
     rd: &mut PackReader,
     ofs: u64,
-    base_of_tree: &dyn Fn(&[u8; 20]) -> Option<Vec<u8>>,
+    olen: usize,
+    base_of_tree: &dyn Fn(&[u8]) -> Option<Vec<u8>>,
 ) -> Result<Option<(u8, Arc<Vec<u8>>)>> {
     use std::os::unix::fs::FileExt as _;
     let (typ, size, hlen) = entry_header(&rd.file, ofs)?;
     if typ != 7 {
         return Ok(None);
     }
-    let mut sha = [0u8; 20];
-    rd.file.read_at(&mut sha, ofs + hlen as u64)?;
-    let Some(base) = base_of_tree(&sha) else { return Ok(None) };
-    let delta = inflate_at(&rd.file, ofs + hlen as u64 + 20, size as usize)?;
+    let mut sha = [0u8; 32];
+    rd.file.read_at(&mut sha[..olen], ofs + hlen as u64)?;
+    let Some(base) = base_of_tree(&sha[..olen]) else { return Ok(None) };
+    let delta = inflate_at(&rd.file, ofs + hlen as u64 + olen as u64, size as usize)?;
     let body = apply_delta(&base, &delta).map_err(|e| Error::Chain(e.to_string()))?;
     Ok(Some((2, Arc::new(body))))
 }
@@ -746,25 +757,43 @@ fn rd_entry_with_tree_base(
 pub(crate) struct GraphObjects {
     pg: Arc<PackGraph>,
     rd: PackReader,
-    trees: std::collections::HashMap<String, Arc<Vec<(Vec<u8>, Ent)>>>,
+    /// Parsed-tree cache, BOUNDED like the cat-file reader's: the parsed
+    /// form (per-entry heap strings) is ~40x the graph's compact listing,
+    /// so an unbounded cache would dwarf the graph itself (measured 12.5GB
+    /// on git.git). oid → (entries, approx bytes).
+    trees: std::collections::HashMap<String, (Arc<Vec<(Vec<u8>, Ent)>>, usize)>,
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
     reads: usize,
 }
 
-const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// Parsed-tree cache budget (see `lanestore`'s TREE_CACHE_BUDGET twin).
+const GRAPH_TREE_CACHE_BUDGET: usize = 64 << 20;
+
+fn ents_bytes(ents: &[(Vec<u8>, Ent)]) -> usize {
+    ents.iter().map(|(n, e)| 96 + n.len() + e.mode.len() + e.oid.len()).sum::<usize>() + 64
+}
 
 impl GraphObjects {
     pub(crate) fn new(pg: Arc<PackGraph>) -> Result<GraphObjects> {
         let rd = PackReader::open(&pg.pack)?;
-        Ok(GraphObjects { pg, rd, trees: Default::default(), reads: 0 })
+        Ok(GraphObjects {
+            pg,
+            rd,
+            trees: Default::default(),
+            order: Default::default(),
+            bytes: 0,
+            reads: 0,
+        })
     }
 }
 
 impl Objects for GraphObjects {
     fn tree(&mut self, oid: &str) -> Result<Arc<Vec<(Vec<u8>, Ent)>>> {
-        if let Some(hit) = self.trees.get(oid) {
+        if let Some((hit, _)) = self.trees.get(oid) {
             return Ok(hit.clone());
         }
-        if oid == EMPTY_TREE {
+        if oid == self.pg.graph.kind.empty_tree_hex() {
             return Ok(Arc::new(Vec::new()));
         }
         let slot = self
@@ -775,7 +804,16 @@ impl Objects for GraphObjects {
             .ok_or_else(|| Error::Chain(format!("memgraph: tree {oid} not in pack")))?;
         self.reads += 1;
         let ents = Arc::new(self.pg.graph.tree_ents(slot));
-        self.trees.insert(oid.to_string(), ents.clone());
+        let sz = ents_bytes(&ents);
+        while self.bytes + sz > GRAPH_TREE_CACHE_BUDGET {
+            let Some(old) = self.order.pop_front() else { break };
+            if let Some((_, osz)) = self.trees.remove(&old) {
+                self.bytes -= osz;
+            }
+        }
+        self.trees.insert(oid.to_string(), (ents.clone(), sz));
+        self.order.push_back(oid.to_string());
+        self.bytes += sz;
         Ok(ents)
     }
 
@@ -787,7 +825,7 @@ impl Objects for GraphObjects {
             .ok_or_else(|| Error::Chain(format!("memgraph: blob {oid} not in pack")))?;
         let ofs = g.blob_ofs(slot).expect("blob slot has a loc");
         self.reads += 1;
-        let base_of = |sha: &[u8; 20]| -> Option<u64> {
+        let base_of = |sha: &[u8]| -> Option<u64> {
             let s = g.heads.lookup(sha)?;
             let h = g.heads.slots[s as usize];
             match h.kind {
@@ -799,7 +837,7 @@ impl Objects for GraphObjects {
         };
         let (_, data) = self
             .rd
-            .entry_at(ofs, &base_of)?
+            .entry_at(ofs, g.kind.oid_len(), &base_of)?
             .ok_or_else(|| Error::Chain(format!("memgraph: blob {oid} base unresolvable")))?;
         Ok(data.as_ref().clone().into())
     }
@@ -815,12 +853,13 @@ impl Objects for GraphObjects {
 /// resident graph — the repo-based measurement path.
 pub fn build(repo: &Path) -> Result<Stats> {
     let mut st = ObjectStore::open(repo)?;
+    let kind = crate::HashKind::of_repo(repo);
     let loose = st.loose_oids();
     let packed: usize = (0..st.pack_count()).map(|p| st.pack_len(p)).sum();
-    let mut g = MemGraph::with_capacity(packed + loose.len() + (packed / 8) + 1024);
+    let mut g = MemGraph::with_capacity(kind, packed + loose.len() + (packed / 8) + 1024);
     for p in 0..st.pack_count() {
         // Offset order: one forward sweep through the pack file.
-        let mut order: Vec<(u64, [u8; 20])> = (0..st.pack_len(p))
+        let mut order: Vec<(u64, Vec<u8>)> = (0..st.pack_len(p))
             .map(|i| {
                 let (sha, ofs) = st.pack_entry(p, i);
                 (ofs, sha)
@@ -841,9 +880,14 @@ pub fn build(repo: &Path) -> Result<Stats> {
 }
 
 /// [`build`] straight off ONE pack file — no repo, no `.idx`: ids are
-/// hashed during the scan.
+/// hashed during the scan. A bare pack does not name its repo's hash
+/// format, so try SHA-1 and fall back to SHA-256 (the tree-entry oid
+/// width makes a wrong guess fail loudly, not silently).
 pub fn build_pack_stats(pack: &Path) -> Result<Stats> {
-    Ok(build_pack(pack)?.graph.stats())
+    match build_pack(pack, crate::HashKind::Sha1) {
+        Ok(pg) => Ok(pg.graph.stats()),
+        Err(_) => Ok(build_pack(pack, crate::HashKind::Sha256)?.graph.stats()),
+    }
 }
 
 fn render(s: &Stats, dt: std::time::Duration) -> String {

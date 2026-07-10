@@ -305,7 +305,7 @@ fn tnode_insert(dir: &mut BTreeMap<Vec<u8>, TNode>, path: &[u8], mode: Mode, con
 /// The git tree oid of a reconstructed level, bottom-up. Entries are ordered by
 /// git's `base_name_compare` (a directory sorts as `name/`); a gitlink's blob
 /// content IS its pinned commit id (matching the store's convention).
-fn tree_oid(dir: &BTreeMap<Vec<u8>, TNode>) -> Result<String, WErr> {
+fn tree_oid(dir: &BTreeMap<Vec<u8>, TNode>, kind: crate::HashKind) -> Result<String, WErr> {
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (git sort key, raw)
     for (name, node) in dir {
         let (mode_bytes, oid, is_dir) = match node {
@@ -313,11 +313,11 @@ fn tree_oid(dir: &BTreeMap<Vec<u8>, TNode>) -> Result<String, WErr> {
                 let oid = if *mode == Mode::Gitlink {
                     String::from_utf8_lossy(content).into_owned()
                 } else {
-                    crate::git_obj_oid("blob", content)
+                    kind.obj_oid("blob", content)
                 };
                 (mode.octal(), oid, false)
             }
-            TNode::Dir(sub) => (b"40000".to_vec(), tree_oid(sub)?, true),
+            TNode::Dir(sub) => (b"40000".to_vec(), tree_oid(sub, kind)?, true),
         };
         let mut raw = mode_bytes;
         raw.push(b' ');
@@ -332,7 +332,7 @@ fn tree_oid(dir: &BTreeMap<Vec<u8>, TNode>) -> Result<String, WErr> {
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let body: Vec<u8> = entries.into_iter().flat_map(|(_, r)| r).collect();
-    Ok(crate::git_obj_oid("tree", &body))
+    Ok(kind.obj_oid("tree", &body))
 }
 
 /// The canonical encoding of an EMPTY full-state (a keep root, no children).
@@ -341,12 +341,15 @@ fn tree_oid(dir: &BTreeMap<Vec<u8>, TNode>) -> Result<String, WErr> {
 /// The git tree oid of a set of flat `(path, mode, content)` entries, built
 /// bottom-up in git order. Used to hash a lane whose entries were gathered
 /// across shards (§1) as well as a single union.
-pub fn tree_oid_of_entries(entries: &[(Vec<u8>, Mode, Vec<u8>)]) -> Result<String, WErr> {
+pub fn tree_oid_of_entries(
+    entries: &[(Vec<u8>, Mode, Vec<u8>)],
+    kind: crate::HashKind,
+) -> Result<String, WErr> {
     let mut root = BTreeMap::new();
     for (path, mode, content) in entries {
         tnode_insert(&mut root, path, *mode, content.clone());
     }
-    tree_oid(&root)
+    tree_oid(&root, kind)
 }
 
 /// Extract lane `lane`'s flat `(path, mode, content)` entries from a union —
@@ -964,12 +967,12 @@ mod tests {
     /// empty-tree oid and the blob oid of "hello\n".
     #[test]
     fn tree_oid_matches_real_git_constants() {
-        assert_eq!(tree_oid(&BTreeMap::new()).unwrap(), "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+        assert_eq!(tree_oid(&BTreeMap::new(), crate::HashKind::Sha1).unwrap(), "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
         assert_eq!(crate::git_obj_oid("blob", b"hello\n"), "ce013625030ba8dba906f756967f9e9ca394464a");
         // A one-file tree `hello` (100644) → `git write-tree` value.
         let mut root = BTreeMap::new();
         root.insert(b"hello".to_vec(), TNode::File(Mode::File, b"hello\n".to_vec()));
-        assert_eq!(tree_oid(&root).unwrap(), "b4d01e9b0c4a9356736dfddf8830ba9a54f5271c");
+        assert_eq!(tree_oid(&root, crate::HashKind::Sha1).unwrap(), "b4d01e9b0c4a9356736dfddf8830ba9a54f5271c");
     }
 
     #[test]

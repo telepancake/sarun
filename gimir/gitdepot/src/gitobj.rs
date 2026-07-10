@@ -40,6 +40,12 @@ fn ge(msg: String) -> Error {
 
 /// The `.git` directory of `repo`: a `.git` dir, a `.git` gitfile
 /// (worktrees), or the repo itself when bare.
+/// The resolved git dir (gitfile-following), infallibly best-effort — the
+/// config probe's entry point.
+pub(crate) fn resolved_git_dir(repo: &Path) -> PathBuf {
+    git_dir(repo).unwrap_or_else(|_| repo.to_path_buf())
+}
+
 fn git_dir(repo: &Path) -> Result<PathBuf> {
     let dot = repo.join(".git");
     if dot.is_dir() {
@@ -63,12 +69,14 @@ struct Pack {
     file: std::fs::File,
     idx: Vec<u8>,
     n: usize,
+    /// Object-id width in bytes (20 = SHA-1, 32 = SHA-256).
+    olen: usize,
 }
 
 const IDX_MAGIC: [u8; 4] = [0xff, 0x74, 0x4f, 0x63];
 
 impl Pack {
-    fn open(idx_path: &Path) -> Result<Pack> {
+    fn open(idx_path: &Path, olen: usize) -> Result<Pack> {
         let idx = std::fs::read(idx_path)?;
         if idx.len() < 8 + 1024 || idx[..4] != IDX_MAGIC {
             return Err(ge(format!(
@@ -78,28 +86,25 @@ impl Pack {
         }
         let ver = u32::from_be_bytes(idx[4..8].try_into().unwrap());
         if ver != 2 {
-            return Err(ge(format!(
-                "{}: pack index v{ver} unsupported (sha256 repo?)",
-                idx_path.display()
-            )));
+            return Err(ge(format!("{}: pack index v{ver} unsupported", idx_path.display())));
         }
         let n = u32::from_be_bytes(idx[8 + 255 * 4..8 + 256 * 4].try_into().unwrap()) as usize;
-        // fanout(1024) + sha(20n) + crc(4n) + ofs(4n) + trailer(40); large
-        // offsets sit between ofs and trailer.
-        if idx.len() < 8 + 1024 + 28 * n + 40 {
+        // fanout(1024) + sha(olen*n) + crc(4n) + ofs(4n) + trailer(2*olen);
+        // large offsets sit between ofs and trailer.
+        if idx.len() < 8 + 1024 + (olen + 8) * n + 2 * olen {
             return Err(ge(format!("{}: truncated pack index", idx_path.display())));
         }
         let file = std::fs::File::open(idx_path.with_extension("pack"))?;
-        Ok(Pack { file, idx, n })
+        Ok(Pack { file, idx, n, olen })
     }
 
     fn sha_at(&self, i: usize) -> &[u8] {
-        let base = 8 + 1024 + 20 * i;
-        &self.idx[base..base + 20]
+        let base = 8 + 1024 + self.olen * i;
+        &self.idx[base..base + self.olen]
     }
 
     /// Binary-search the sorted oid table via the fanout.
-    fn lookup(&self, oid: &[u8; 20]) -> Option<u64> {
+    fn lookup(&self, oid: &[u8]) -> Option<u64> {
         let f = 8usize;
         let hi_end = u32::from_be_bytes(
             self.idx[f + oid[0] as usize * 4..f + oid[0] as usize * 4 + 4].try_into().unwrap(),
@@ -124,13 +129,13 @@ impl Pack {
     }
 
     fn offset_at(&self, i: usize) -> u64 {
-        let ofs_base = 8 + 1024 + 24 * self.n;
+        let ofs_base = 8 + 1024 + (self.olen + 4) * self.n;
         let v = u32::from_be_bytes(self.idx[ofs_base + 4 * i..ofs_base + 4 * i + 4].try_into().unwrap());
         if v & 0x8000_0000 == 0 {
             v as u64
         } else {
             let big = (v & 0x7fff_ffff) as usize;
-            let big_base = 8 + 1024 + 28 * self.n + 8 * big;
+            let big_base = 8 + 1024 + (self.olen + 8) * self.n + 8 * big;
             u64::from_be_bytes(self.idx[big_base..big_base + 8].try_into().unwrap())
         }
     }
@@ -247,6 +252,7 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
 /// The native reader: object directories (main + alternates), their packs,
 /// and a bytes-bounded resolved-base cache.
 pub(crate) struct ObjectStore {
+    kind: crate::HashKind,
     dirs: Vec<PathBuf>,
     packs: Vec<Pack>,
     cache: HashMap<(usize, u64), (u8, Arc<Vec<u8>>)>,
@@ -278,7 +284,9 @@ impl ObjectStore {
             }
             pending = next;
         }
+        let kind = crate::HashKind::of_repo(repo);
         let mut st = ObjectStore {
+            kind,
             dirs,
             packs: Vec::new(),
             cache: HashMap::new(),
@@ -301,7 +309,7 @@ impl ObjectStore {
             for e in rd.flatten() {
                 let p = e.path();
                 if p.extension().is_some_and(|x| x == "idx") {
-                    self.packs.push(Pack::open(&p)?);
+                    self.packs.push(Pack::open(&p, self.kind.oid_len())?);
                 }
             }
         }
@@ -326,14 +334,13 @@ impl ObjectStore {
 
     /// The `i`-th (sha-ordered) entry of `pack`: its 20-byte oid and pack
     /// offset.
-    pub(crate) fn pack_entry(&self, pack: usize, i: usize) -> ([u8; 20], u64) {
-        let mut sha = [0u8; 20];
-        sha.copy_from_slice(self.packs[pack].sha_at(i));
-        (sha, self.packs[pack].offset_at(i))
+    pub(crate) fn pack_entry(&self, pack: usize, i: usize) -> (Vec<u8>, u64) {
+        (self.packs[pack].sha_at(i).to_vec(), self.packs[pack].offset_at(i))
     }
 
     /// Every loose object's oid under the store's object dirs.
-    pub(crate) fn loose_oids(&self) -> Vec<[u8; 20]> {
+    pub(crate) fn loose_oids(&self) -> Vec<Vec<u8>> {
+        let olen = self.kind.oid_len();
         let mut out = Vec::new();
         for d in &self.dirs {
             let Ok(rd) = std::fs::read_dir(d) else { continue };
@@ -344,8 +351,9 @@ impl ObjectStore {
                 let Ok(inner) = std::fs::read_dir(sub.path()) else { continue };
                 for f in inner.flatten() {
                     let fname = f.file_name();
-                    let Some(rest) = fname.to_str().filter(|s| s.len() == 38) else { continue };
-                    let mut sha = [0u8; 20];
+                    let want = olen * 2 - 2;
+                    let Some(rest) = fname.to_str().filter(|s| s.len() == want) else { continue };
+                    let mut sha = vec![0u8; olen];
                     sha[0] = hex2;
                     if hex::decode_to_slice(rest, &mut sha[1..]).is_ok() {
                         out.push(sha);
@@ -363,25 +371,30 @@ impl ObjectStore {
     }
 
     /// A loose object by binary oid, typed.
-    pub(crate) fn loose_typed(&self, oid: &[u8; 20]) -> Result<Option<(u8, Vec<u8>)>> {
+    pub(crate) fn loose_typed(&self, oid: &[u8]) -> Result<Option<(u8, Vec<u8>)>> {
         self.read_loose(oid)
     }
 
     fn get_typed(&mut self, oid: &str) -> Result<(u8, Vec<u8>)> {
-        let mut bin = [0u8; 20];
-        hex::decode_to_slice(oid, &mut bin)
-            .map_err(|_| ge(format!("bad oid {oid:?} (sha256 repo?)")))?;
-        if let Some(hit) = self.get_bin(&bin)? {
+        let mut bin = [0u8; 32];
+        let olen = self.kind.oid_len();
+        if oid.len() != self.kind.hex_len() {
+            return Err(ge(format!("bad oid {oid:?} (repo is {:?})", self.kind)));
+        }
+        hex::decode_to_slice(oid, &mut bin[..olen])
+            .map_err(|_| ge(format!("bad oid {oid:?}")))?;
+        let bin = &bin[..olen].to_vec();
+        if let Some(hit) = self.get_bin(bin)? {
             return Ok(hit);
         }
         // Miss: a new pack may have landed since open (ladder rungs fetch
         // mid-run); rescan once, then try loose-vs-pack again.
         self.scan_packs()?;
-        self.get_bin(&bin)?
+        self.get_bin(bin)?
             .ok_or_else(|| ge(format!("object {oid} not found (loose or packed)")))
     }
 
-    fn get_bin(&mut self, oid: &[u8; 20]) -> Result<Option<(u8, Vec<u8>)>> {
+    fn get_bin(&mut self, oid: &[u8]) -> Result<Option<(u8, Vec<u8>)>> {
         for i in 0..self.packs.len() {
             if let Some(ofs) = self.packs[i].lookup(oid) {
                 let (t, data) = self.read_entry(i, ofs)?;
@@ -392,7 +405,7 @@ impl ObjectStore {
     }
 
     /// A loose object: one zlib stream holding `<type> <size>\0<body>`.
-    fn read_loose(&self, oid: &[u8; 20]) -> Result<Option<(u8, Vec<u8>)>> {
+    fn read_loose(&self, oid: &[u8]) -> Result<Option<(u8, Vec<u8>)>> {
         let hexid = hex::encode(oid);
         for d in &self.dirs {
             let p = d.join(&hexid[..2]).join(&hexid[2..]);
@@ -464,11 +477,13 @@ impl ObjectStore {
                 (bt, Arc::new(apply_delta(&base, &delta)?))
             }
             7 => {
-                // REF_DELTA: 20-byte base oid (local — thin packs are fixed
-                // by index-pack).
-                let mut base_oid = [0u8; 20];
-                base_oid.copy_from_slice(&hdr[p..p + 20]);
-                p += 20;
+                // REF_DELTA: oid-width base id (local — thin packs are
+                // fixed by index-pack).
+                let olen = self.kind.oid_len();
+                let mut base_oid = [0u8; 32];
+                base_oid[..olen].copy_from_slice(&hdr[p..p + olen]);
+                let base_oid = base_oid[..olen].to_vec();
+                p += olen;
                 let (bt, base) = self
                     .get_bin(&base_oid)?
                     .ok_or_else(|| ge(format!("pack: delta base {} missing", hex::encode(base_oid))))?;

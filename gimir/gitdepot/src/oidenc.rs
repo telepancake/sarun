@@ -57,8 +57,9 @@ pub trait Objects {
 }
 
 /// Parse the raw bytes of a git tree object into `(name, entry)` pairs.
-/// Format per entry: `<octal-mode> <name>\0<20-byte oid>`.
-pub fn parse_tree(raw: &[u8]) -> Result<Vec<(Name, Ent)>> {
+/// Format per entry: `<octal-mode> <name>\0<oid-width bytes>` — the width
+/// is the repo's hash format (20 = SHA-1, 32 = SHA-256).
+pub fn parse_tree_oids(raw: &[u8], olen: usize) -> Result<Vec<(Name, Ent)>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < raw.len() {
@@ -68,15 +69,20 @@ pub fn parse_tree(raw: &[u8]) -> Result<Vec<(Name, Ent)>> {
         let nul = raw[i..].iter().position(|&b| b == 0).map(|p| i + p).ok_or_else(bad)?;
         let name = raw[i..nul].to_vec();
         i = nul + 1;
-        if i + 20 > raw.len() {
+        if i + olen > raw.len() {
             return Err(bad());
         }
-        let oid = hex(&raw[i..i + 20]);
-        i += 20;
+        let oid = hex(&raw[i..i + olen]);
+        i += olen;
         let is_dir = mode == b"40000";
         out.push((name, Ent { mode, oid, is_dir }));
     }
     Ok(out)
+}
+
+/// [`parse_tree_oids`] for a SHA-1 repo (the historical shape).
+pub fn parse_tree(raw: &[u8]) -> Result<Vec<(Name, Ent)>> {
+    parse_tree_oids(raw, 20)
 }
 
 fn bad() -> crate::Error {
