@@ -49,7 +49,10 @@ pub struct ImportStats {
   depot/              # wikimak_depot::Depot::open(this)
     index
     f0/  f1/  cold/
-  titles/             # strpool::Pool::open(this); shard count tuned per wiki
+  titles/             # strpool::Pool::open(this); shard count tuned per wiki,
+                      # persisted at creation (meta.db 'title_shard_count' flag
+                      # — lookups route by fnv % count, so it is store truth;
+                      # legacy stores without the flag count as 4)
     shard-NNNN
   meta.db             # rusqlite: title intervals, categories, part watermarks,
                       # siteinfo timeline, page id ↔ chain id map

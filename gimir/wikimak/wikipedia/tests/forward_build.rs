@@ -282,9 +282,13 @@ fn crash_mid_construction_reopens_sound_and_reimports() {
     let orphan_bytes = cold_file.metadata().map(|m| m.len()).unwrap_or(0);
     assert!(orphan_bytes > 0, "the aborted build must have written cold frames");
 
-    // Reopen is sound and the half-built chain is INVISIBLE.
+    // Reopen is sound and the half-built chain is INVISIBLE. The CLI
+    // child created the store (4 title shards persisted); derive its
+    // count instead of asserting the test default 1.
     {
-        let inst = Instance::open(common::cfg(root.clone(), 1024)).expect("reopen after abort");
+        let mut cfg = common::cfg(root.clone(), 1024);
+        cfg.title_shard_count = 0;
+        let inst = Instance::open(cfg).expect("reopen after abort");
         assert!(inst.page_head(PAGE_ID).unwrap().is_none(), "orphans must not surface");
         assert_eq!(inst.page_history(PAGE_ID).unwrap().count(), 0);
     } // drop: release the root flock for the re-import child
@@ -302,7 +306,9 @@ fn crash_mid_construction_reopens_sound_and_reimports() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(&format!("revisions new {N}")), "re-import stats: {stdout}");
 
-    let inst = Instance::open(common::cfg(root.clone(), 1024)).unwrap();
+    let mut cfg = common::cfg(root.clone(), 1024);
+    cfg.title_shard_count = 0; // CLI-built store: derive its persisted count
+    let inst = Instance::open(cfg).unwrap();
     let mut n = 0usize;
     for entry in inst.page_history(PAGE_ID).unwrap() {
         let e = entry.unwrap();

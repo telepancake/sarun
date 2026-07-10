@@ -56,4 +56,20 @@ pub enum Error {
          (any wikimak command) to migrate, then retry"
     )]
     LegacySchema(std::path::PathBuf),
+
+    /// An explicit `InstanceConfig::title_shard_count` disagrees with
+    /// the count persisted at instance creation (the
+    /// `title_shard_count` instance flag). Exact-title lookups route by
+    /// `fnv1a(title) % count`, so opening with the wrong count would
+    /// silently miss titles — refuse loudly instead. Pass 0 to derive
+    /// the store's own count.
+    #[error(
+        "instance {root} was created with title_shard_count {on_disk}, \
+         but this open requested {requested} (pass 0 to derive)"
+    )]
+    TitleShardMismatch {
+        root: std::path::PathBuf,
+        on_disk: u32,
+        requested: u32,
+    },
 }

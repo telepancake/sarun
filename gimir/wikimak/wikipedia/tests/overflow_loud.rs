@@ -163,7 +163,6 @@ fn ceiling_overflow_is_a_loud_error_before_any_write() {
         "title_intervals",
         "siteinfo_snapshots",
         "parts_seen",
-        "instance_flags",
     ] {
         assert_eq!(
             table_count(&conn, table),
@@ -171,6 +170,21 @@ fn ceiling_overflow_is_a_loud_error_before_any_write() {
             "{table} has rows after a rejected import"
         );
     }
+    // instance_flags holds exactly the creation-time shard-count flag
+    // — open-time bookkeeping, not an import effect. In particular NO
+    // dirty stamp: the overflow fired before the first write.
+    let flags: Vec<String> = conn
+        .prepare("SELECT key FROM instance_flags ORDER BY key")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(
+        flags,
+        vec!["title_shard_count".to_string()],
+        "rejected import left flags beyond the creation one"
+    );
 }
 
 // ---------------------------------------------------------------------------

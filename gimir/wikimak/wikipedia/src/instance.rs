@@ -45,8 +45,9 @@ pub fn max_chain_id_for_root(root: &std::path::Path) -> u64 {
 /// wikimak driver CLI's defaults. This is what the engine's attach
 /// verb and the pinned readout ([`crate::readout`]) open with — one
 /// place, so a read-side open always matches what the writer created.
-/// (The title shard count is not persisted on disk; this assumes the
-/// CLI default, as every read-side embedder always has.)
+/// The title shard count is 0 = derive: [`Instance::open_read`] reads
+/// the count persisted in meta.db at creation (legacy stores without
+/// the flag: 4, the only count the CLI ever built).
 pub fn read_config(root: PathBuf) -> InstanceConfig {
     let max_chain_id = max_chain_id_for_root(&root);
     InstanceConfig {
@@ -59,7 +60,7 @@ pub fn read_config(root: PathBuf) -> InstanceConfig {
             file_size_threshold: 1 << 30,
             eviction_dead_ratio: 0.5,
         },
-        title_shard_count: 4,
+        title_shard_count: 0, // derive from the store's persisted count
         title_seal_threshold_bytes: 8 << 20,
         f1_seal_threshold_bytes: 0,
     }
@@ -85,6 +86,17 @@ pub struct InstanceConfig {
     /// supply a small `file_size_threshold` to drive eviction.
     pub depot: DepotConfig,
     /// Strpool shard count for the titles pool. Tests use 1.
+    ///
+    /// The EFFECTIVE count is a property of the store, not the open:
+    /// exact-title lookups route by `fnv1a(title) % count`, and shard
+    /// files are created lazily, so the truth cannot be recovered from
+    /// disk — it is persisted in meta.db at creation (the
+    /// `title_shard_count` instance flag). 0 = derive: use the
+    /// persisted count (a fresh root gets 4, the CLI default; a legacy
+    /// store without the flag counts as 4, the only value the CLI ever
+    /// built — a writer open backfills the flag). A nonzero value on
+    /// an existing store must MATCH the persisted count —
+    /// [`crate::Error::TitleShardMismatch`] otherwise.
     pub title_shard_count: u32,
     /// Strpool seal threshold for the titles pool.
     pub title_seal_threshold_bytes: u64,
@@ -229,6 +241,23 @@ impl Instance {
         // second writing instance are locked out while we hold this.
         let lock = flock_root(&cfg.root, libc::LOCK_EX)?;
 
+        // meta.db FIRST: the titles pool below must open with the
+        // store's persisted shard count, so resolve it before any pool
+        // file exists to get wrong.
+        let conn = Connection::open(cfg.root.join("meta.db"))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        for stmt in META_DDL {
+            conn.execute(stmt, [])?;
+        }
+        ensure_revision_ts_schema(&conn)?;
+        ensure_title_dictionary_schema(&conn)?;
+        // The effective shard count: persisted at creation, validated
+        // against an explicit config, backfilled (writer-side) on a
+        // legacy store — see `resolve_title_shard_count`.
+        let title_shard_count =
+            resolve_title_shard_count(&conn, &cfg.root, cfg.title_shard_count, true)?;
+
         // Depot — root forced to <root>/depot/ per SPEC.
         let mut depot_cfg = cfg.depot;
         depot_cfg.root = cfg.root.join("depot");
@@ -240,21 +269,12 @@ impl Instance {
         let titles = Pool::open(
             &titles_dir,
             PoolConfig {
-                shard_count: cfg.title_shard_count,
+                shard_count: title_shard_count,
                 seal_threshold_bytes: cfg.title_seal_threshold_bytes,
             },
             None,
         )?;
 
-        // meta.db.
-        let conn = Connection::open(cfg.root.join("meta.db"))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        for stmt in META_DDL {
-            conn.execute(stmt, [])?;
-        }
-        ensure_revision_ts_schema(&conn)?;
-        ensure_title_dictionary_schema(&conn)?;
         let suspect: bool = conn
             .query_row(
                 "SELECT value FROM instance_flags WHERE key = 'dirty'",
@@ -287,7 +307,7 @@ impl Instance {
             } else {
                 cfg.f1_seal_threshold_bytes
             },
-            title_shard_count: cfg.title_shard_count,
+            title_shard_count,
             dbname: cfg.dbname,
         })
     }
@@ -320,18 +340,6 @@ impl Instance {
         // below reads tier-file metadata, which must not race a writer.
         let lock = flock_root(&cfg.root, libc::LOCK_SH)?;
 
-        let mut depot_cfg = cfg.depot;
-        depot_cfg.root = cfg.root.join("depot");
-        let depot = Depot::open(depot_cfg)?;
-        let titles = Pool::open(
-            &cfg.root.join("titles"),
-            PoolConfig {
-                shard_count: cfg.title_shard_count,
-                seal_threshold_bytes: cfg.title_seal_threshold_bytes,
-            },
-            None,
-        )?;
-
         // No DDL, no pragma writes, no ALTERs: the writer created the
         // schema; this connection only ever SELECTs. Reads key off the
         // migrated `ts`/`title_id` columns, so a pre-migration db is a
@@ -345,6 +353,25 @@ impl Instance {
                 return Err(Error::LegacySchema(cfg.root.clone()));
             }
         }
+        // The store's shard count, NOT the config's assumption: exact
+        // lookups route by fnv % count, so a reader guessing wrong
+        // would silently miss titles. Derived from the flag persisted
+        // at creation; never backfilled here (read-only).
+        let title_shard_count =
+            resolve_title_shard_count(&conn, &cfg.root, cfg.title_shard_count, false)?;
+
+        let mut depot_cfg = cfg.depot;
+        depot_cfg.root = cfg.root.join("depot");
+        let depot = Depot::open(depot_cfg)?;
+        let titles = Pool::open(
+            &cfg.root.join("titles"),
+            PoolConfig {
+                shard_count: title_shard_count,
+                seal_threshold_bytes: cfg.title_seal_threshold_bytes,
+            },
+            None,
+        )?;
+
         let suspect: bool = conn
             .query_row(
                 "SELECT value FROM instance_flags WHERE key = 'dirty'",
@@ -373,7 +400,7 @@ impl Instance {
             } else {
                 cfg.f1_seal_threshold_bytes
             },
-            title_shard_count: cfg.title_shard_count,
+            title_shard_count,
             dbname: cfg.dbname,
         })
     }
@@ -618,6 +645,13 @@ impl Instance {
     /// lookup touches ONE shard; a substring search touches all).
     pub fn title_scan_counts(&self) -> Vec<u64> {
         self.inner.lock().expect("instance mutex poisoned").titles.scan_counts()
+    }
+
+    /// The EFFECTIVE titles-pool shard count this open resolved —
+    /// persisted at creation, derived (or validated) at every open.
+    /// Tests pin that a read-side open of an 8-shard store routes by 8.
+    pub fn title_shard_count(&self) -> u32 {
+        self.title_shard_count
     }
 
     // --- asof-τ read API (browsing plan §2, the wayback contract) ---
@@ -1168,6 +1202,84 @@ fn ensure_title_dictionary_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
     Ok(())
+}
+
+/// The shard count every store the pre-persistence CLI ever built
+/// used — the assumed truth for a LEGACY store (meta.db without the
+/// `title_shard_count` flag), and the creation default when a config
+/// says 0 (derive) against a fresh root.
+const LEGACY_TITLE_SHARD_COUNT: u32 = 4;
+
+/// The titles-pool shard count persisted at instance creation
+/// (`instance_flags` key `title_shard_count`), or `None` on a legacy
+/// store that predates the flag.
+fn persisted_title_shard_count(conn: &Connection) -> Result<Option<u32>> {
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM instance_flags WHERE key = 'title_shard_count'",
+            [],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(ignore_no_rows)?;
+    match v {
+        None => Ok(None),
+        // A zero/negative/absurd count can only be a hand-mangled flag;
+        // routing (or Pool::open's assert) would misbehave — refuse.
+        Some(v) if v < 1 || v > u32::MAX as i64 => {
+            Err(Error::Corrupt("title_shard_count instance flag"))
+        }
+        Some(v) => Ok(Some(v as u32)),
+    }
+}
+
+/// Resolve the EFFECTIVE titles shard count for an open. The count is
+/// a property of the store (shard = `fnv1a(title) % count`, and shard
+/// files are lazily created, so disk cannot answer): it is persisted
+/// in meta.db at creation and every open derives or validates against
+/// it.
+///
+///   * flag present, `requested` 0 (derive) → the persisted count;
+///   * flag present, `requested` equal → fine;
+///   * flag present, `requested` different → loud
+///     [`Error::TitleShardMismatch`] — a mis-counted open would
+///     silently route exact lookups to the wrong shard;
+///   * flag absent + `may_persist` (writer): a fresh root persists the
+///     requested count (0 → 4, the CLI default); a LEGACY store (built
+///     before the flag existed) gets the same treatment — the CLI only
+///     ever built 4-shard stores and derives (0) today, so the
+///     backfill records the truth;
+///   * flag absent + read-only: assume the legacy 4 (or trust an
+///     explicit count), persist nothing.
+fn resolve_title_shard_count(
+    conn: &Connection,
+    root: &std::path::Path,
+    requested: u32,
+    may_persist: bool,
+) -> Result<u32> {
+    match persisted_title_shard_count(conn)? {
+        Some(on_disk) => {
+            if requested != 0 && requested != on_disk {
+                return Err(Error::TitleShardMismatch {
+                    root: root.to_path_buf(),
+                    on_disk,
+                    requested,
+                });
+            }
+            Ok(on_disk)
+        }
+        None => {
+            let n = if requested == 0 { LEGACY_TITLE_SHARD_COUNT } else { requested };
+            if may_persist {
+                conn.execute(
+                    "INSERT OR REPLACE INTO instance_flags(key, value)
+                     VALUES('title_shard_count', ?1)",
+                    [n as i64],
+                )?;
+            }
+            Ok(n)
+        }
+    }
 }
 
 /// Do any `title_intervals` rows lack a dictionary id? O(1) via the

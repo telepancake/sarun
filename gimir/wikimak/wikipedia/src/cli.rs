@@ -36,7 +36,10 @@ fn open_instance(root: PathBuf, max_page_id: Option<u64>) -> Result<Instance, St
             file_size_threshold: 1 << 30,
             eviction_dead_ratio: 0.5,
         },
-        title_shard_count: 4,
+        // Derive from the store's persisted count (fresh root: 4).
+        // An explicit count here would refuse to open any store built
+        // with a different one — the count is the store's property.
+        title_shard_count: 0,
         title_seal_threshold_bytes: 8 << 20,
         f1_seal_threshold_bytes: 0, // default (256 KiB)
     })
