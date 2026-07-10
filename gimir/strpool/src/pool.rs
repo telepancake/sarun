@@ -1,6 +1,7 @@
 //! Public [`Pool`] facade. Holds one [`Shard`] per file under the pool dir.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
@@ -13,6 +14,11 @@ pub struct Pool {
     cfg: PoolConfig,
     shard_bits: u8,
     shards: Vec<Mutex<Shard>>,
+    /// Per-shard count of full-shard walks since open (every
+    /// [`Pool::for_each_in_shard`] call, and therefore every substring
+    /// scan leg). Instrumentation for callers that pin how many shards a
+    /// read touches — the same role the depot's `ReadCounts` plays.
+    scans: Vec<AtomicU64>,
 }
 
 impl Pool {
@@ -34,11 +40,37 @@ impl Pool {
             let shard = Shard::open(id, path, dict_provider.clone())?;
             shards.push(Mutex::new(shard));
         }
+        let scans = (0..cfg.shard_count).map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             cfg,
             shard_bits,
             shards,
+            scans,
         })
+    }
+
+    /// Number of shard files in the pool.
+    pub fn shard_count(&self) -> u32 {
+        self.cfg.shard_count
+    }
+
+    /// Per-shard full-walk counters since open. Index = shard id. A
+    /// caller pinning "an exact lookup touches ONE shard" diffs this
+    /// around the read.
+    pub fn scan_counts(&self) -> Vec<u64> {
+        self.scans.iter().map(|c| c.load(Ordering::Relaxed)).collect()
+    }
+
+    /// The shard's current entry count — a monotone stamp for caches of
+    /// the shard's contents. The pool is append-only, so a cache built
+    /// at stamp `n` stays a correct (if incomplete) subset until the
+    /// stamp changes; equality means the cache is complete. Sealing
+    /// compresses the tail without changing ids or entries, so the
+    /// stamp deliberately ignores the file layout.
+    pub fn shard_entry_count(&self, shard_id: u32) -> Result<u32> {
+        let shard = self.shard(shard_id)?;
+        let g = shard.lock().expect("shard mutex poisoned");
+        Ok(g.entry_count)
     }
 
     pub fn append(&self, shard_id: u32, s: &[u8]) -> Result<u64> {
@@ -89,6 +121,7 @@ impl Pool {
     ) -> Result<()> {
         let shard = self.shard(shard_id)?;
         let g = shard.lock().expect("shard mutex poisoned");
+        self.scans[shard_id as usize].fetch_add(1, Ordering::Relaxed);
         let shard_bits = self.shard_bits;
         g.for_each(|local, bytes| {
             let id = ((local as u64) << shard_bits) | (shard_id as u64);
