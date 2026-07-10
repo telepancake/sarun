@@ -57,10 +57,6 @@ impl From<codec::DecodeError> for Error {
     }
 }
 
-fn zerr(code: zstd::zstd_safe::ErrorCode) -> Error {
-    Error::Zstd(zstd::zstd_safe::get_error_name(code).to_string())
-}
-
 fn compress(raw: &[u8], prefix: Option<&[u8]>) -> Result<Vec<u8>, Error> {
     wikimak_depot::compress_frame(raw, prefix, 3).map_err(Error::Zstd)
 }
@@ -135,28 +131,122 @@ impl VbfDepot {
     }
 
     /// Every layer on `chain_id`, newest-first (owned; the chain is
-    /// walked eagerly).
+    /// walked eagerly — the WHOLE decoded chain is resident).
     pub fn layers_newest_first(&self, chain_id: u64) -> Result<Vec<Layer>, Error> {
-        let mut records: Vec<Vec<u8>> = Vec::new();
-        match self.depot.read_f0(chain_id) {
-            Ok(frame) => records.push(decompress(&frame, None)?),
-            Err(wikimak_depot::Error::NoFrame) => return Ok(vec![]),
+        let mut out = Vec::new();
+        self.scan_newest_first(chain_id, |layer| {
+            out.push(layer);
+            false
+        })?;
+        Ok(out)
+    }
+
+    /// Walk `chain_id` newest-first with BOUNDED residency: one
+    /// decompressed frame plus the running refPrefix anchor at a time,
+    /// never the whole chain. `visit` gets each layer newest-first;
+    /// return `true` to stop early (e.g. found the record you wanted).
+    pub fn scan_newest_first(
+        &self,
+        chain_id: u64,
+        mut visit: impl FnMut(Layer) -> bool,
+    ) -> Result<(), Error> {
+        let mut stop = false;
+        let mut err: Option<Error> = None;
+        self.scan_frames(chain_id, |records| {
+            for r in records {
+                match codec::decode(r) {
+                    Ok(layer) => stop = visit(layer),
+                    Err(e) => {
+                        err = Some(e.into());
+                        stop = true;
+                    }
+                }
+                if stop {
+                    break;
+                }
+            }
+            stop
+        })?;
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Decompressed byte length of each COLD frame on `chain_id`,
+    /// newest-first — instrumentation, like [`Self::prepend_count`]:
+    /// the seal-threshold discipline (frames stay ~threshold-sized,
+    /// oversized batches split) is observable, not folklore.
+    pub fn cold_frame_raw_lens(&self, chain_id: u64) -> Result<Vec<usize>, Error> {
+        // Frame 0 of the walk is f0 (one bare record); the f1
+        // accumulator follows iff the chain has one — cold frames are
+        // the rest.
+        let warm = 1 + match self.depot.read_f1(chain_id) {
+            Ok(f1) => f1.is_some() as usize,
+            Err(wikimak_depot::Error::NoFrame)
+            | Err(wikimak_depot::Error::ChainIdOutOfRange) => return Ok(vec![]),
             Err(e) => return Err(e.into()),
+        };
+        let mut lens = Vec::new();
+        let mut frame_no = 0usize;
+        self.scan_frames(chain_id, |records| {
+            if frame_no >= warm {
+                lens.push(records.iter().map(|r| r.len() + 4).sum());
+            }
+            frame_no += 1;
+            false
+        })?;
+        Ok(lens)
+    }
+
+    /// Newest-first FRAME walk: `visit` gets each frame's records
+    /// (newest-first within the frame; f0 is a single bare record) and
+    /// returns `true` to stop. Residency: the current frame's records
+    /// plus the one carried anchor record.
+    fn scan_frames(
+        &self,
+        chain_id: u64,
+        mut visit: impl FnMut(&[Vec<u8>]) -> bool,
+    ) -> Result<(), Error> {
+        let head = match self.depot.read_f0(chain_id) {
+            Ok(frame) => decompress(&frame, None)?,
+            Err(wikimak_depot::Error::NoFrame)
+            | Err(wikimak_depot::Error::ChainIdOutOfRange) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // The anchor is always the record immediately NEWER than the
+        // next frame's newest record: f1 was compressed against the
+        // head, and a sealed accumulator moved to cold verbatim — its
+        // anchor is the record demoted right after it (the previous
+        // frame's oldest).
+        let mut anchor = head;
+        if visit(std::slice::from_ref(&anchor)) {
+            return Ok(());
         }
         if let Some(f1) = self.depot.read_f1(chain_id)? {
-            let anchor = records[0].clone();
-            let mut raw_records = Vec::new();
-            undelimit(&decompress(&f1, Some(&anchor))?, &mut raw_records)?;
-            records.extend(raw_records);
+            let mut records = Vec::new();
+            undelimit(&decompress(&f1, Some(&anchor))?, &mut records)?;
+            let stop = visit(&records);
+            if let Some(last) = records.pop() {
+                anchor = last;
+            }
+            if stop {
+                return Ok(());
+            }
         }
         for cold in self.depot.cold_iter(chain_id)? {
             let frame = cold?;
-            let anchor = records.last().expect("cold after f1").clone();
-            let mut raw_records = Vec::new();
-            undelimit(&decompress(&frame, Some(&anchor))?, &mut raw_records)?;
-            records.extend(raw_records);
+            let mut records = Vec::new();
+            undelimit(&decompress(&frame, Some(&anchor))?, &mut records)?;
+            let stop = visit(&records);
+            if let Some(last) = records.pop() {
+                anchor = last;
+            }
+            if stop {
+                return Ok(());
+            }
         }
-        records.iter().map(|r| Ok(codec::decode(r)?)).collect()
+        Ok(())
     }
 
     /// The newest layer on `chain_id` alone (one small standalone
@@ -181,75 +271,87 @@ impl VbfDepot {
         self.put_layers(chain_id, std::slice::from_ref(layer))
     }
 
-    /// Prepend `layers` (oldest → newest) as ONE prepend: one f0 swap,
-    /// one f1 re-encode, one seal check — the normative multi-record
-    /// form (wikimak/depot SPEC §Prepend). Never splits the batch;
-    /// sealing is decided against the OLD accumulator (compose_f1).
+    /// Prepend `layers` (oldest → newest), the normative multi-record
+    /// form (wikimak/depot SPEC §Prepend): a batch is ONE f0 swap, one
+    /// f1 re-encode, one seal check — EXCEPT that a batch whose records
+    /// dwarf the seal threshold must not land as one frame (compose_f1's
+    /// documented contract: the accumulator, and the cold frame it seals
+    /// into, must stay ~threshold-sized). Such a batch is split by
+    /// [`wikimak_depot::chunk_newest_first`] and prepended chunk by
+    /// chunk, oldest first — prepend count scales with batch BYTES.
     pub fn put_layers(&mut self, chain_id: u64, layers: &[Layer]) -> Result<(), Error> {
-        let Some((newest, older_new)) = layers.split_last() else {
+        if layers.is_empty() {
             return Ok(());
-        };
-        let record = codec::encode(newest);
+        }
+        // Records newest-first (layers arrive oldest → newest). Sizes
+        // include the u32 length delimiter each record carries inside
+        // accumulator frames — the bytes the seal budget actually sees.
+        let records: Vec<Vec<u8>> = layers.iter().rev().map(codec::encode).collect();
+        let sizes: Vec<usize> = records.iter().map(|r| r.len() + 4).collect();
+        for range in wikimak_depot::chunk_newest_first(&sizes, self.seal_threshold) {
+            self.prepend_records(chain_id, &records[range])?;
+        }
+        Ok(())
+    }
+
+    /// One prepend of `records` (newest-first, non-empty): one f0 swap,
+    /// one f1 re-encode, one seal check. Sealing is decided against the
+    /// OLD accumulator (compose_f1).
+    fn prepend_records(&mut self, chain_id: u64, records: &[Vec<u8>]) -> Result<(), Error> {
+        let (newest, older_new) = records.split_first().expect("non-empty record chunk");
         let prev_f0 = match self.depot.read_f0(chain_id) {
             Ok(b) => Some(b),
             Err(wikimak_depot::Error::NoFrame) => None,
             Err(e) => return Err(e.into()),
         };
-        // Accumulator entries newest-first: the older NEW records, then
-        // the demoted old head (verbatim — full-snapshot records).
-        let mut entries_owned: Vec<Vec<u8>> = older_new.iter().rev()
-            .map(codec::encode).collect();
-        let (prev_record, old_f1_raw) = match &prev_f0 {
-            Some(frame) => {
-                let prev_record = decompress(frame, None)?;
-                let old_f1_raw = match self.depot.read_f1(chain_id)? {
-                    Some(f) => decompress(&f, Some(&prev_record))?,
-                    None => Vec::new(),
-                };
-                entries_owned.push(prev_record.clone());
-                (Some(prev_record), old_f1_raw)
+        let Some(prev_f0) = prev_f0 else {
+            // Empty chain: the depot forbids f1 on the first prepend —
+            // seed with the OLDEST record alone, then absorb the rest
+            // (now a plain non-empty-chain prepend) in one go.
+            let (oldest, newer) = records.split_last().expect("non-empty record chunk");
+            self.depot.prepend(chain_id, &compress(oldest, None)?, None, false)?;
+            if newer.is_empty() {
+                return Ok(());
             }
-            None => {
-                // Empty chain: the depot forbids f1 on the first
-                // prepend — seed with the OLDEST record, then absorb
-                // the rest as one batch.
-                if let Some(oldest) = entries_owned.pop() {
-                    self.depot.prepend(chain_id, &compress(&oldest, None)?,
-                                       None, false)?;
-                    entries_owned.insert(0, oldest);
-                    // Re-run now that the chain has a head. The seed
-                    // record is entries_owned's oldest again: rebuild
-                    // the batch minus the seed, plus the seed as head
-                    // demotee — simplest is recursion with the already
-                    // seeded chain.
-                    entries_owned.clear();
-                    return self.put_layers_seeded(chain_id, layers);
-                }
-                // Single layer onto empty chain.
-                return Ok(self.depot.prepend(chain_id, &compress(&record, None)?,
-                                             None, false)?);
-            }
+            return self.prepend_records(chain_id, newer);
         };
-        let _ = prev_record;
-        let delimited: Vec<Vec<u8>> = entries_owned.iter()
-            .map(|r| delimit(std::slice::from_ref(r))).collect();
+        // Accumulator entries newest-first: the older NEW records, then
+        // the demoted old head (verbatim — full-snapshot records), each
+        // length-delimited.
+        let prev_record = decompress(&prev_f0, None)?;
+        let old_f1_raw = match self.depot.read_f1(chain_id)? {
+            Some(f) => decompress(&f, Some(&prev_record))?,
+            None => Vec::new(),
+        };
+        let delimited: Vec<Vec<u8>> = older_new
+            .iter()
+            .chain(std::iter::once(&prev_record))
+            .map(|r| delimit(std::slice::from_ref(r)))
+            .collect();
         let refs: Vec<&[u8]> = delimited.iter().map(|e| e.as_slice()).collect();
         let (new_f1_raw, seal) = wikimak_depot::compose_f1(
             &refs,
             if old_f1_raw.is_empty() { None } else { Some(&old_f1_raw) },
             self.seal_threshold,
         );
-        let new_f0 = compress(&record, None)?;
-        let new_f1 = compress(&new_f1_raw, Some(&record))?;
+        let new_f0 = compress(newest, None)?;
+        let new_f1 = compress(&new_f1_raw, Some(newest))?;
         self.depot.prepend(chain_id, &new_f0, Some(&new_f1), seal)?;
         Ok(())
     }
 
-    /// `put_layers` continuation once the chain has its seeded head.
-    fn put_layers_seeded(&mut self, chain_id: u64, layers: &[Layer]) -> Result<(), Error> {
-        let rest = &layers[1..];
-        if rest.is_empty() { return Ok(()); }
-        self.put_layers(chain_id, rest)
+    /// Session-end compaction ([`wikimak_depot::Depot::collect`]): rolls
+    /// the current write files into eviction so dead frames parked there
+    /// stop being waste at rest. What it reclaims: DEPRECATED frames —
+    /// old f0/f1 versions left behind by every prepend (and by a
+    /// rebuild's writes). What it can NOT reclaim: frames of chains the
+    /// caller's inventory no longer references (a rebuild-orphaned
+    /// chain's frames are still index-LIVE to the depot — dead weight
+    /// until something truncates the chain), and cold-file bytes (the
+    /// cold tier is append-only, never compacted). Cheap when there is
+    /// nothing to reclaim; call once per update run, not per chain.
+    pub fn collect(&self) -> Result<(), Error> {
+        Ok(self.depot.collect()?)
     }
 }
 

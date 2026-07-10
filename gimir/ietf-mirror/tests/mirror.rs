@@ -187,6 +187,116 @@ fn second_process_is_locked_out() {
     }
 }
 
+/// Read-side opens share the root among themselves and exclude (only)
+/// the writer — in both directions; a read handle refuses to update.
+#[test]
+fn read_open_is_shared_and_read_only() {
+    let tmp = TempDir::new().unwrap();
+    drop(mirror(&tmp)); // create the root, release the writer lock
+    let cfg = || MirrorConfig::new(tmp.path().join("m"));
+
+    let r1 = Mirror::open_read(cfg()).unwrap();
+    let r2 = Mirror::open_read(cfg()).unwrap();
+    match Mirror::open(cfg()) {
+        Err(ietf_mirror::Error::MirrorLocked(_)) => {}
+        Err(e) => panic!("writer must be excluded by readers, got {e}"),
+        Ok(_) => panic!("writer must be excluded by readers"),
+    }
+    drop(r1);
+    drop(r2);
+
+    let w = mirror(&tmp);
+    match Mirror::open_read(cfg()) {
+        Err(ietf_mirror::Error::MirrorLocked(_)) => {}
+        Err(e) => panic!("reader must be excluded by the writer, got {e}"),
+        Ok(_) => panic!("reader must be excluded by the writer"),
+    }
+    drop(w);
+
+    let mut r = Mirror::open_read(cfg()).unwrap();
+    let s = StandIn::start();
+    match r.update(&Client::new(), &fast_cfg(&s), |_, _| ()) {
+        Err(ietf_mirror::Error::ReadOnly) => {}
+        other => panic!("read handle must refuse update, got {other:?}"),
+    }
+
+    // Never scaffold a store on the read path.
+    match Mirror::open_read(MirrorConfig::new(tmp.path().join("no-such-mirror"))) {
+        Err(ietf_mirror::Error::Io(_)) => {}
+        Err(e) => panic!("read open of a non-mirror must fail loudly, got {e}"),
+        Ok(_) => panic!("read open of a non-mirror must fail loudly"),
+    }
+    assert!(!tmp.path().join("no-such-mirror").exists());
+}
+
+/// The crash window the dirty flag exists for: kill the process AFTER
+/// the store flush, BEFORE the watermark tx (a real abort, via the
+/// IETFMAK_TEST_CRASH_AFTER_FLUSH knob, in a child `ietfmak update`).
+/// The re-run must reconcile from the chain — zero re-fetches, aligned
+/// watermarks, and above all NO duplicate revisions on the chain. Both
+/// crash shapes are exercised: a fresh multi-revision import and a
+/// single-revision head bump (the old `r < head` rebuild guard missed
+/// the equal case, so exactly this shape used to duplicate).
+#[test]
+fn crash_between_flush_and_watermark_leaves_no_duplicates() {
+    let s = StandIn::start();
+    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-crash-01\t2024-01-01\tActive\n"));
+    s.text("draft-test-crash-00", "crash zero\n");
+    s.text("draft-test-crash-01", "crash one\n");
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("m");
+    let crashing_update = |base_url: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_ietfmak"))
+            .args(["update", root.to_str().unwrap(), "--delay-ms", "0"])
+            .env("IETFMAK_BASE_URL", base_url)
+            .env("IETFMAK_TEST_CRASH_AFTER_FLUSH", "1")
+            .output()
+            .unwrap()
+    };
+    let no_dup_history = |m: &Mirror, want: &[&str]| {
+        let revs: Vec<String> =
+            m.history("draft-test-crash").unwrap().iter().map(|e| e.rev.clone()).collect();
+        assert_eq!(revs, want, "history must be exact — duplicates are forever");
+    };
+
+    // Crash shape 1: fresh import (00+01 flushed, no watermark).
+    let out = crashing_update(&s.base_url);
+    assert!(!out.status.success(), "the crash knob must abort the child");
+    assert_eq!(s.hits("/archive/id/draft-test-crash-00.txt"), 1);
+
+    let content_before = s.content_hits().len();
+    let mut m = mirror(&tmp);
+    let st = m.update(&Client::new(), &fast_cfg(&s), |_, _| ()).unwrap();
+    assert_eq!(st.revisions_fetched, 0, "reconcile must not re-fetch flushed bytes");
+    assert_eq!(st.revisions_reconciled, 2, "both crashed revisions aligned from the chain");
+    assert_eq!(st.chains_rebuilt, 0, "alignment, not a rebuild");
+    assert_eq!(s.content_hits().len(), content_before, "zero content GETs on reconcile");
+    no_dup_history(&m, &["01", "00"]);
+    drop(m);
+
+    // Crash shape 2: single-revision head bump (the r == head case).
+    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-crash-02\t2024-02-01\tActive\n"));
+    s.text("draft-test-crash-02", "crash two\n");
+    let out = crashing_update(&s.base_url);
+    assert!(!out.status.success(), "the crash knob must abort the child");
+    assert_eq!(s.hits("/archive/id/draft-test-crash-02.txt"), 1, "02 fetched before the crash");
+
+    let mut m = mirror(&tmp);
+    let st = m.update(&Client::new(), &fast_cfg(&s), |_, _| ()).unwrap();
+    assert_eq!((st.revisions_fetched, st.revisions_reconciled), (0, 1));
+    assert_eq!(s.hits("/archive/id/draft-test-crash-02.txt"), 1, "not re-fetched");
+    no_dup_history(&m, &["02", "01", "00"]);
+    assert_eq!(m.head("draft-test-crash").unwrap().unwrap().text, b"crash two\n");
+
+    // The reconciled mirror is clean again: one more pass is a plain
+    // idempotent no-op (no dirty flag left behind).
+    let st = m.update(&Client::new(), &fast_cfg(&s), |_, _| ()).unwrap();
+    assert_eq!((st.revisions_fetched, st.revisions_reconciled), (0, 0));
+    assert_eq!(st.revisions_skipped, 3);
+    no_dup_history(&m, &["02", "01", "00"]);
+}
+
 #[test]
 fn update_enumerates_history_from_latest_only_index() {
     let s = StandIn::start();

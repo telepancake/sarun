@@ -49,9 +49,10 @@ fn cmd_update(root: &str, delay_ms: Option<u64>) -> Result<(), String> {
         return Ok(());
     }
     println!(
-        "drafts {} ({} new)  revisions fetched {}  skipped {}  missing {}  chains rebuilt {}",
+        "drafts {} ({} new)  revisions fetched {}  skipped {}  missing {}  \
+         reconciled {}  chains rebuilt {}",
         s.drafts_seen, s.drafts_new, s.revisions_fetched, s.revisions_skipped,
-        s.revisions_missing, s.chains_rebuilt
+        s.revisions_missing, s.revisions_reconciled, s.chains_rebuilt
     );
     Ok(())
 }

@@ -121,35 +121,36 @@ fn near_identical_layers_compress_and_seal() {
             "vbf on disk ({disk}) not <1/4 of raw ({raw}) — discipline not rendered");
 }
 
-/// The normative batch form: put_layers(oldest→newest) must land ONE
-/// prepend and read back record-for-record identical to sequential
-/// put_layer calls — never split by the seal threshold (sealing is a
-/// between-prepends decision against the OLD accumulator).
+fn sized_layer(n: u32, body: &[u8]) -> depot::Layer {
+    let mut children = std::collections::BTreeMap::new();
+    children.insert(format!("f{n}").into_bytes(), depot::Node {
+        blob: depot::BlobOp::Set(body.to_vec().into()),
+        children: Default::default(),
+        presence: depot::Presence::Live,
+        opaque: false,
+        attrs: None,
+        anchor: depot::Anchor::Lower,
+    });
+    depot::Layer { root: depot::Node {
+        blob: depot::BlobOp::Keep,
+        children,
+        presence: depot::Presence::Live,
+        opaque: false,
+        attrs: None,
+        anchor: depot::Anchor::Lower,
+    }}
+}
+
+/// The normative batch form: put_layers(oldest→newest) reads back
+/// record-for-record identical to sequential put_layer calls. A batch
+/// UNDER the seal threshold is ONE prepend (plus the empty-chain
+/// seed); a batch several times the threshold is split per
+/// `chunk_newest_first` — prepends scale with batch BYTES.
 #[test]
 fn put_layers_batch_equals_sequential() {
-    fn layer(n: u32, body: &[u8]) -> depot::Layer {
-        let mut children = std::collections::BTreeMap::new();
-        children.insert(format!("f{n}").into_bytes(), depot::Node {
-            blob: depot::BlobOp::Set(body.to_vec().into()),
-            children: Default::default(),
-            presence: depot::Presence::Live,
-            opaque: false,
-            attrs: None,
-            anchor: depot::Anchor::Lower,
-        });
-        depot::Layer { root: depot::Node {
-            blob: depot::BlobOp::Keep,
-            children,
-            presence: depot::Presence::Live,
-            opaque: false,
-            attrs: None,
-            anchor: depot::Anchor::Lower,
-        }}
-    }
-    // Bodies big enough that the batch total far exceeds the seal
-    // threshold — the batch must still be one prepend.
+    // 24 x 4K bodies against a 16K threshold: ~6 chunks.
     let layers: Vec<depot::Layer> =
-        (0..24).map(|i| layer(i, &vec![b'a' + (i % 26) as u8; 4096])).collect();
+        (0..24).map(|i| sized_layer(i, &vec![b'a' + (i % 26) as u8; 4096])).collect();
 
     let t1 = tempfile::tempdir().unwrap();
     let mut seq = depot_vbf::VbfDepot::open(t1.path().into(), 8, 16 * 1024).unwrap();
@@ -158,14 +159,61 @@ fn put_layers_batch_equals_sequential() {
     let mut bat = depot_vbf::VbfDepot::open(t2.path().into(), 8, 16 * 1024).unwrap();
     let before = bat.prepend_count();
     bat.put_layers(3, &layers).unwrap();
-    // Seed (empty-chain constraint) + the batch = at most 2.
-    assert!(bat.prepend_count() - before <= 2,
-            "batch split into {} prepends", bat.prepend_count() - before);
+    let prepends = bat.prepend_count() - before;
+    assert!((2..24).contains(&prepends),
+            "oversized batch must chunk (a few prepends, not per-layer): {prepends}");
 
     let a = seq.layers_newest_first(3).unwrap();
     let b = bat.layers_newest_first(3).unwrap();
     assert_eq!(a.len(), b.len());
     for (x, y) in a.iter().zip(&b) {
+        assert_eq!(depot::codec::encode(x), depot::codec::encode(y));
+    }
+
+    // A batch that FITS the threshold stays one prepend (+ seed).
+    let small: Vec<depot::Layer> =
+        (0..8).map(|i| sized_layer(i, &vec![b'z'; 512])).collect();
+    let t3 = tempfile::tempdir().unwrap();
+    let mut one = depot_vbf::VbfDepot::open(t3.path().into(), 8, 16 * 1024).unwrap();
+    one.put_layers(3, &small).unwrap();
+    assert!(one.prepend_count() <= 2,
+            "under-threshold batch split into {} prepends", one.prepend_count());
+}
+
+/// compose_f1's documented contract, rendered: a batch several times
+/// the (test-shrunk) seal threshold must land as MULTIPLE ~threshold-
+/// sized cold frames, never one giant frame — the accumulator and the
+/// cold frames it seals into are the depot's I/O unit.
+#[test]
+fn oversized_batch_seals_threshold_sized_cold_frames() {
+    let threshold: u64 = 16 * 1024;
+    // Incompressible-ish distinct bodies so raw size ≈ what matters;
+    // ~40 x 4K = ~160K raw, 10x the threshold.
+    let layers: Vec<depot::Layer> = (0..40)
+        .map(|i| {
+            let mut rng = common::Rng(i as u64 + 1);
+            let body: Vec<u8> = (0..4096).map(|_| rng.next() as u8).collect();
+            sized_layer(i, &body)
+        })
+        .collect();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = depot_vbf::VbfDepot::open(tmp.path().into(), 8, threshold).unwrap();
+    store.put_layers(3, &layers).unwrap();
+    store.flush().unwrap();
+
+    let lens = store.cold_frame_raw_lens(3).unwrap();
+    assert!(lens.len() >= 3, "10x-threshold batch sealed only {} cold frames", lens.len());
+    for (i, len) in lens.iter().enumerate() {
+        // compose_f1 seals when old + new would EXCEED the threshold,
+        // so a frame tops out under threshold + one chunk (≤ 2x).
+        assert!(*len as u64 <= 2 * threshold,
+                "cold frame {i} is {len} B — not ~threshold ({threshold} B) sized");
+    }
+    // Fidelity across the splits.
+    let got = store.layers_newest_first(3).unwrap();
+    assert_eq!(got.len(), layers.len());
+    for (x, y) in got.iter().zip(layers.iter().rev()) {
         assert_eq!(depot::codec::encode(x), depot::codec::encode(y));
     }
 }

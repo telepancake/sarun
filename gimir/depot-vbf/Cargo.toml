@@ -8,7 +8,6 @@ publish = false
 [dependencies]
 depot = { path = "../depot" }
 wikimak-depot.workspace = true
-zstd = { workspace = true, features = ["experimental"] }
 
 [dev-dependencies]
 depot-stream = { path = "../depot-stream" }

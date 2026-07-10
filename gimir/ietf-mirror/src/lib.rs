@@ -19,13 +19,19 @@
 //! watermarked in `revisions_seen` is fetched (a 404 — expired from
 //! the archive — is watermarked `missing` and never re-tried).
 //!
-//! Durability handshake per draft, same shape as wikimak's sync:
-//! import all unseen revisions → depot flush → watermark the revisions.
-//! A crash before the watermark re-fetches those revisions on the next
-//! run; if the chain's head already covers them, the re-run lands on
-//! the rebuild path (see `Mirror::update`) and the merge dedupes — the
-//! watermark write is tiny, so the window is, too; `update` is
-//! idempotent across completed drafts either way.
+//! Durability handshake, same shape as wikimak's sync but BATCHED:
+//! store writes accumulate per draft; every `FLUSH_EVERY_DRAFTS` drafts
+//! (and once at the run's end) one depot flush is followed by one
+//! sqlite transaction watermarking everything since the last flush —
+//! bytes always durable BEFORE the bookkeeping that references them,
+//! without a per-draft fsync storm. The crash window between a flush
+//! and its watermark tx is covered by a dirty flag (wikimak's
+//! discipline): stamped durably before the run's first store write,
+//! cleared only after the final watermark commit. A run that opens
+//! dirty reconciles each touched draft against the CHAIN — revisions
+//! already stored are watermark-aligned (rev attrs decoded, texts
+//! dropped), never re-fetched, never re-prepended — so a crash at any
+//! point yields no duplicate records and no lost bytes.
 
 pub mod readout;
 #[cfg(feature = "fetch")]
@@ -72,6 +78,9 @@ pub enum Error {
     /// Another process holds this mirror root (meta.db exclusive lock).
     #[error("mirror {0} is locked by another process")]
     MirrorLocked(PathBuf),
+    /// `update` called on a [`Mirror::open_read`] handle.
+    #[error("mirror opened read-only (shared lock): updating requires Mirror::open")]
+    ReadOnly,
 }
 
 /// Configuration for the HTTP side. Production uses `Default`; tests
@@ -131,6 +140,10 @@ pub struct UpdateStats {
     /// Enumerated revisions whose text GET returned 404 (expired from
     /// the archive) — recorded as seen-but-missing, never re-tried.
     pub revisions_missing: u64,
+    /// Revisions found already ON the chain while reconciling after a
+    /// dirty (crashed) run: watermarks aligned from the chain — no
+    /// re-fetch, no duplicate prepend.
+    pub revisions_reconciled: u64,
     /// The index answered 304 Not Modified: nothing to do this pass.
     pub index_not_modified: bool,
     /// Chains rebuilt onto a fresh chain id because older revisions had
@@ -158,8 +171,12 @@ const DDL: &[&str] = &[
         missing INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(name, rev)
     ) WITHOUT ROWID",
-    // HTTP validators (index ETag / Last-Modified) for conditional
-    // re-fetch; written only after a fully successful update pass.
+    // Update-pass state: HTTP validators (index ETag / Last-Modified)
+    // for conditional re-fetch, written only after a fully successful
+    // pass; and the crash-window 'dirty' flag — '1' between a run's
+    // first store write and its final watermark commit, so a run that
+    // opens dirty knows chains may be AHEAD of revisions_seen and
+    // reconciles instead of re-prepending.
     "CREATE TABLE IF NOT EXISTS fetch_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -173,36 +190,90 @@ pub struct Mirror {
     _lock: std::fs::File,
     #[cfg_attr(not(feature = "fetch"), allow(dead_code))]
     max_chain_id: u64,
+    /// Opened under a shared flock: reads only, `update` refuses.
+    #[cfg_attr(not(feature = "fetch"), allow(dead_code))]
+    read_only: bool,
+    /// The previous writing session died between a store flush and its
+    /// watermark tx (the 'dirty' flag was set on open): chains may be
+    /// AHEAD of `revisions_seen`, so `update` reconciles each touched
+    /// draft against its chain before trusting the watermarks.
+    #[cfg_attr(not(feature = "fetch"), allow(dead_code))]
+    suspect: bool,
+}
+
+/// Take the per-root flock (`op` = `LOCK_EX` for the one writer,
+/// `LOCK_SH` for readers), non-blocking: contention is a loud
+/// [`Error::MirrorLocked`], never a silent wait behind a possibly
+/// hours-long update run. Kernel-released on any exit.
+fn flock_root(root: &std::path::Path, op: libc::c_int) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .create(true).truncate(false).write(true)
+        .open(root.join(".lock"))?;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(Error::MirrorLocked(root.to_path_buf()));
+    }
+    Ok(f)
 }
 
 impl Mirror {
-    /// Open or create the mirror at `cfg.root` (`meta.db` + `depot/`).
-    /// Re-open is idempotent.
+    /// Open or create the mirror at `cfg.root` (`meta.db` + `depot/`)
+    /// as THE writer (exclusive flock). Re-open is idempotent.
     pub fn open(cfg: MirrorConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.root)?;
+        // Lock BEFORE touching the depot: its open walks every tier
+        // file (dead-byte accounting), which must not race a writer.
+        let lock = flock_root(&cfg.root, libc::LOCK_EX)?;
         let store = VbfDepot::open(cfg.root.join("depot"), cfg.max_chain_id, cfg.seal_threshold)?;
-        // One-process-per-root guard: exclusive flock on <root>/.lock,
-        // held for the Mirror's lifetime, kernel-released on any exit.
-        // External readers of meta.db stay possible.
-        let lock = {
-            use std::os::fd::AsRawFd;
-            let f = std::fs::OpenOptions::new()
-                .create(true).truncate(false).write(true)
-                .open(cfg.root.join(".lock"))?;
-            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc != 0 {
-                return Err(Error::MirrorLocked(cfg.root.clone()));
-            }
-            f
-        };
-
         let conn = Connection::open(cfg.root.join("meta.db"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         for stmt in DDL {
             conn.execute(stmt, [])?;
         }
-        Ok(Mirror { conn, store, max_chain_id: cfg.max_chain_id, _lock: lock })
+        let suspect = read_dirty_flag(&conn)?;
+        Ok(Mirror {
+            conn,
+            store,
+            max_chain_id: cfg.max_chain_id,
+            _lock: lock,
+            read_only: false,
+            suspect,
+        })
+    }
+
+    /// Open an EXISTING mirror for reading, under a SHARED flock: any
+    /// number of concurrent readers, excluded only while a writer
+    /// ([`Mirror::open`]) holds the root — and vice versa. The flock is
+    /// what keeps the depot's file set stable under a reader (eviction
+    /// unlinks tier files and patches next-pointers in place; lock-free
+    /// reads against a live writer would chase dangling pointers), so
+    /// hold the handle only as long as the read takes: decode, drop.
+    /// Never creates anything: a non-mirror root is a loud error.
+    pub fn open_read(cfg: MirrorConfig) -> Result<Self> {
+        if !cfg.root.join("meta.db").exists() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no mirror at {}", cfg.root.display()),
+            )));
+        }
+        let lock = flock_root(&cfg.root, libc::LOCK_SH)?;
+        let store = VbfDepot::open(cfg.root.join("depot"), cfg.max_chain_id, cfg.seal_threshold)?;
+        // No DDL, no pragma writes: the writer created the schema; this
+        // connection only ever SELECTs.
+        let conn = Connection::open_with_flags(
+            cfg.root.join("meta.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE, // WAL recovery may write; we never do
+        )?;
+        Ok(Mirror {
+            conn,
+            store,
+            max_chain_id: cfg.max_chain_id,
+            _lock: lock,
+            read_only: true,
+            suspect: false,
+        })
     }
 
     /// Discover + fetch + import every unseen revision of every draft.
@@ -218,6 +289,9 @@ impl Mirror {
         cfg: &FetchConfig,
         mut progress: impl FnMut(&str, bool),
     ) -> Result<UpdateStats> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         let mut stats = UpdateStats::default();
         let Some((index, etag, last_modified)) = self.fetch_index_conditional(client, cfg)?
         else {
@@ -225,6 +299,13 @@ impl Mirror {
             return Ok(stats);
         };
         let mut pacer = Pacer::new(cfg.delay);
+        // Store writes accumulate; every FLUSH_EVERY_DRAFTS drafts (and
+        // once at the end) `commit_pending` runs ONE depot flush then
+        // ONE watermark tx for the whole batch — the bytes-before-
+        // bookkeeping fence holds per batch, without a per-draft fsync
+        // storm (a flush fsyncs every tier file).
+        let mut pending: Vec<PendingDraft> = Vec::new();
+        let mut dirty_stamped = false;
         for (name, (latest, date)) in &index {
             stats.drafts_seen += 1;
             // Revision numbers are sequential two-digit 00..NN: the
@@ -248,6 +329,15 @@ impl Mirror {
             if fresh.is_empty() {
                 continue;
             }
+            // Dirty fence, once per run, durable BEFORE the first store
+            // write: between a store write and its batch's watermark tx
+            // a chain is AHEAD of revisions_seen — a crash there leaves
+            // the flag set and the NEXT run reconciles from the chains
+            // instead of re-prepending refetched revisions forever.
+            if !dirty_stamped {
+                self.set_dirty(true)?;
+                dirty_stamped = true;
+            }
             let chain_id = match self.chain_id(name)? {
                 Some(id) => id,
                 None => {
@@ -255,11 +345,29 @@ impl Mirror {
                     self.alloc_chain(name)?
                 }
             };
+            let mut done: Vec<(String, bool)> = Vec::new();
+            // Suspect-mode reconcile (the previous session died dirty):
+            // the chain is the data fence — any unseen candidate ALREADY
+            // on the chain just gets its watermark aligned; only truly
+            // absent revisions are fetched, so no duplicate prepends.
+            if self.suspect {
+                let on_chain = self.chain_revs(chain_id)?;
+                fresh.retain(|(rev, _)| {
+                    if on_chain.contains(rev) {
+                        stats.revisions_reconciled += 1;
+                        progress(&format!("{name}-{rev}"), false);
+                        done.push((rev.clone(), false));
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             // Oldest→newest; the whole draft lands as ONE batch
             // prepend (the normative multi-record form — one f0 swap,
-            // one f1 re-encode), not a per-revision cycle. Fetch
-            // errors abort before any store write: idempotent refetch.
-            let mut done: Vec<(&str, bool)> = Vec::new();
+            // one f1 re-encode; depot-vbf splits only past the seal
+            // threshold), not a per-revision cycle. Fetch errors abort
+            // before any store write: idempotent refetch.
             let mut batch: Vec<(String, Layer)> = Vec::new();
             for (rev, date) in &fresh {
                 let label = format!("{name}-{rev}");
@@ -270,13 +378,13 @@ impl Mirror {
                     Some(text) => {
                         batch.push((rev.clone(), revision_layer(rev, date.as_deref(), &text)));
                         stats.revisions_fetched += 1;
-                        done.push((rev.as_str(), false));
+                        done.push((rev.clone(), false));
                     }
                     None => {
                         // Enumerated but gone (expired from the
                         // archive). Watermark as missing; never re-try.
                         stats.revisions_missing += 1;
-                        done.push((rev.as_str(), true));
+                        done.push((rev.clone(), true));
                     }
                 }
             }
@@ -284,50 +392,129 @@ impl Mirror {
             // `put_layers` makes the batch's LAST layer the new head.
             // The batch is ascending, so on a fresh chain or a head
             // bump the order is right by construction. If the chain's
-            // head is already NEWER than the batch's oldest revision (a
-            // legacy heads-only mirror being backfilled, or crash
-            // recovery), prepending would corrupt the order — rebuild
-            // the whole draft in order onto a fresh chain instead.
-            let head_rev = self
-                .store
-                .head_layer(chain_id)?
-                .map(|l| decode_revision_layer(&l, chain_id))
-                .transpose()?
-                .map(|e| e.rev);
-            let needs_rebuild =
-                matches!((&head_rev, batch.first()), (Some(h), Some((r, _))) if r < h);
-            let repoint = if needs_rebuild {
-                stats.chains_rebuilt += 1;
-                Some(self.rebuild_chain(chain_id, batch)?)
-            } else {
-                let layers: Vec<Layer> = batch.into_iter().map(|(_, l)| l).collect();
-                self.store.put_layers(chain_id, &layers)?;
+            // head is already at-or-past the batch's oldest revision (a
+            // legacy heads-only mirror being backfilled; a crashed run
+            // predating the dirty flag), prepending would corrupt the
+            // order or duplicate a record — rebuild the whole draft in
+            // order onto a fresh chain instead (the merge dedupes).
+            let repoint = if batch.is_empty() {
                 None
+            } else {
+                let head_rev = self
+                    .store
+                    .head_layer(chain_id)?
+                    .map(|l| layer_rev(&l, chain_id))
+                    .transpose()?;
+                let needs_rebuild =
+                    matches!((&head_rev, batch.first()), (Some(h), Some((r, _))) if r <= h);
+                if needs_rebuild {
+                    stats.chains_rebuilt += 1;
+                    Some(self.rebuild_chain(chain_id, batch)?)
+                } else {
+                    let layers: Vec<Layer> = batch.into_iter().map(|(_, l)| l).collect();
+                    self.store.put_layers(chain_id, &layers)?;
+                    None
+                }
             };
-            // Durability fence: bytes first, watermarks (and the chain
-            // repoint, atomically with them) after.
-            self.store.flush()?;
-            let tx = self.conn.transaction()?;
-            if let Some(new_chain) = repoint {
-                tx.execute(
-                    "UPDATE drafts SET chain_id = ?2 WHERE name = ?1",
-                    rusqlite::params![name, new_chain as i64],
-                )?;
+            pending.push(PendingDraft { name: name.clone(), done, repoint });
+            if pending.len() >= FLUSH_EVERY_DRAFTS {
+                self.commit_pending(&mut pending)?;
             }
-            for (rev, missing) in done {
-                tx.execute(
-                    "INSERT OR REPLACE INTO revisions_seen(name, rev, missing) VALUES(?1,?2,?3)",
-                    rusqlite::params![name, rev, missing as i64],
-                )?;
-            }
-            tx.commit()?;
         }
+        self.commit_pending(&mut pending)?;
         // Persist the index validators only after a FULLY successful
         // pass: an interrupted run must re-see the full index next time
         // (and resume via watermarks), never be 304'd past unfinished
         // drafts.
         self.set_index_validators(etag.as_deref(), last_modified.as_deref())?;
+        if dirty_stamped {
+            // Everything the run wrote is durable in order (bytes, then
+            // bookkeeping): a crash from here on is a clean shutdown.
+            self.set_dirty(false)?;
+            self.suspect = false;
+        }
+        // Session-end compaction: dead frames from this run's prepends/
+        // rebuilds otherwise sit in the under-threshold current write
+        // files forever. (What collect cannot reclaim: rebuild-orphaned
+        // chains — still index-live inside the depot — and cold-file
+        // bytes; see VbfDepot::collect.)
+        self.store.collect()?;
         Ok(stats)
+    }
+
+    /// The per-batch durability handshake: flush the depot, then one
+    /// transaction writing every pending draft's watermarks and chain
+    /// repoints. Bytes are durable strictly before the bookkeeping that
+    /// references them; a crash in between is what the dirty flag and
+    /// the reconcile path exist for.
+    #[cfg(feature = "fetch")]
+    fn commit_pending(&mut self, pending: &mut Vec<PendingDraft>) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.store.flush()?;
+        // Crash-window test knob: die AFTER the store flush, BEFORE the
+        // watermark tx — the exact window the dirty flag covers.
+        if std::env::var_os("IETFMAK_TEST_CRASH_AFTER_FLUSH").is_some() {
+            std::process::abort();
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut mark = tx.prepare_cached(
+                "INSERT OR REPLACE INTO revisions_seen(name, rev, missing) VALUES(?1,?2,?3)",
+            )?;
+            let mut repoint =
+                tx.prepare_cached("UPDATE drafts SET chain_id = ?2 WHERE name = ?1")?;
+            for d in pending.iter() {
+                if let Some(new_chain) = d.repoint {
+                    repoint.execute(rusqlite::params![d.name, new_chain as i64])?;
+                }
+                for (rev, missing) in &d.done {
+                    mark.execute(rusqlite::params![d.name, rev, *missing as i64])?;
+                }
+            }
+        }
+        tx.commit()?;
+        pending.clear();
+        Ok(())
+    }
+
+    /// Set/clear the crash-window dirty flag, durably (WAL checkpoint —
+    /// `synchronous=NORMAL` commits are not power-loss durable on their
+    /// own, and this flag is only useful if it survives exactly that).
+    #[cfg(feature = "fetch")]
+    fn set_dirty(&self, dirty: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO fetch_meta(key, value) VALUES('dirty', ?1)",
+            rusqlite::params![if dirty { "1" } else { "0" }],
+        )?;
+        self.conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+        Ok(())
+    }
+
+    /// Every `rev` attr present on `chain_id` — the reconcile read.
+    /// Bounded: the scan keeps one frame resident at a time, and only
+    /// the rev strings are RETAINED (texts drop with each layer).
+    #[cfg(feature = "fetch")]
+    fn chain_revs(&self, chain_id: u64) -> Result<std::collections::BTreeSet<String>> {
+        let mut revs = std::collections::BTreeSet::new();
+        let mut bad: Option<Error> = None;
+        self.store.scan_newest_first(chain_id, |layer| {
+            match layer_rev(&layer, chain_id) {
+                Ok(rev) => {
+                    revs.insert(rev);
+                    false
+                }
+                Err(e) => {
+                    bad = Some(e);
+                    true
+                }
+            }
+        })?;
+        match bad {
+            Some(e) => Err(e),
+            None => Ok(revs),
+        }
     }
 
     /// Re-lay a draft whose unseen revisions sort BELOW the chain's
@@ -370,6 +557,35 @@ impl Mirror {
         }
     }
 
+    /// ONE specific revision of `name` — the pinned-attachment read.
+    /// Bounded walk: newest-first, one frame resident at a time, stops
+    /// at the match; only the matching revision's text is materialized.
+    pub fn revision(&self, name: &str, rev: &str) -> Result<Option<RevisionEntry>> {
+        let Some(chain_id) = self.chain_id(name)? else { return Ok(None) };
+        let mut found: Option<RevisionEntry> = None;
+        let mut bad: Option<Error> = None;
+        self.store.scan_newest_first(chain_id, |layer| {
+            match layer_rev(&layer, chain_id) {
+                Ok(r) if r == rev => {
+                    match decode_revision_layer(&layer, chain_id) {
+                        Ok(e) => found = Some(e),
+                        Err(e) => bad = Some(e),
+                    }
+                    true
+                }
+                Ok(_) => false,
+                Err(e) => {
+                    bad = Some(e);
+                    true
+                }
+            }
+        })?;
+        match bad {
+            Some(e) => Err(e),
+            None => Ok(found),
+        }
+    }
+
     /// Every mirrored revision of `name`, newest-first.
     pub fn history(&self, name: &str) -> Result<Vec<RevisionEntry>> {
         let Some(chain_id) = self.chain_id(name)? else { return Ok(vec![]) };
@@ -381,7 +597,8 @@ impl Mirror {
     }
 
     fn chain_id(&self, name: &str) -> Result<Option<u64>> {
-        let mut st = self.conn.prepare("SELECT chain_id FROM drafts WHERE name = ?1")?;
+        // Once per draft per pass (~43k over the live corpus): cached.
+        let mut st = self.conn.prepare_cached("SELECT chain_id FROM drafts WHERE name = ?1")?;
         let mut rows = st.query([name])?;
         Ok(match rows.next()? {
             Some(row) => Some(row.get::<_, i64>(0)? as u64),
@@ -503,6 +720,34 @@ impl Mirror {
     }
 }
 
+/// One draft's not-yet-watermarked outcome, queued between batch
+/// flushes (see `Mirror::commit_pending`).
+#[cfg(feature = "fetch")]
+struct PendingDraft {
+    name: String,
+    /// `(rev, missing)` watermarks to write.
+    done: Vec<(String, bool)>,
+    /// Rebuilt chain id to repoint the inventory row at, atomically
+    /// with the watermarks.
+    repoint: Option<u64>,
+}
+
+/// Store-flush + watermark-tx cadence, in drafts. Bounds both the fsync
+/// rate (one flush per batch instead of per draft) and the redo work a
+/// crash can leave (a batch's worth of chains to reconcile).
+#[cfg(feature = "fetch")]
+const FLUSH_EVERY_DRAFTS: usize = 64;
+
+/// The stored crash-window flag ('dirty' in `fetch_meta`); absent (a
+/// pre-flag or never-updated mirror) reads as clean.
+fn read_dirty_flag(conn: &Connection) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let v: Option<String> = conn
+        .query_row("SELECT value FROM fetch_meta WHERE key = 'dirty'", [], |r| r.get(0))
+        .optional()?;
+    Ok(v.as_deref() == Some("1"))
+}
+
 /// Draft base name → `(latest rev, index date)`. The live index lists
 /// each draft exactly once, at its latest revision.
 pub type DraftIndex = BTreeMap<String, (String, Option<String>)>;
@@ -579,6 +824,21 @@ fn revision_layer(rev: &str, date: Option<&str>, text: &[u8]) -> Layer {
         },
     );
     Layer { root }
+}
+
+/// The `rev` attr alone — no text copy (the reconcile/scan hot path).
+fn layer_rev(layer: &Layer, chain_id: u64) -> Result<String> {
+    let rev = layer
+        .root
+        .children
+        .get(b"text".as_slice())
+        .ok_or(Error::CorruptLayer { chain_id, what: "no text node" })?
+        .attrs
+        .as_ref()
+        .ok_or(Error::CorruptLayer { chain_id, what: "no attrs" })?
+        .get(b"rev".as_slice())
+        .ok_or(Error::CorruptLayer { chain_id, what: "no rev attr" })?;
+    Ok(String::from_utf8_lossy(rev).into_owned())
 }
 
 fn decode_revision_layer(layer: &Layer, chain_id: u64) -> Result<RevisionEntry> {
