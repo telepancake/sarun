@@ -294,9 +294,10 @@ impl Depot {
 /// redundancy (the same logical record across revisions) sits far
 /// apart — a level-default window (~2MB at level 3) makes those
 /// matches unreachable at ANY search level (measured 5x size on a
-/// real corpus). Window-log therefore covers the frame, capped at 27
-/// (the decoder's default limit — readers need no configuration),
-/// with long-distance matching on.
+/// real corpus). Window-log therefore covers the frame PLUS its
+/// refPrefix anchor (see [`frame_window_log`]), capped at 27 (the
+/// decoder's default limit — readers need no configuration), with
+/// long-distance matching on.
 pub fn compress_frame(
     src: &[u8],
     prefix: Option<&[u8]>,
@@ -305,7 +306,7 @@ pub fn compress_frame(
     let err = |c| zstd::zstd_safe::get_error_name(c).to_string();
     let mut cctx = zstd::zstd_safe::CCtx::create();
     cctx.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(level)).map_err(err)?;
-    let wlog = (64 - (src.len().max(1 << 20) as u64).leading_zeros()).min(27);
+    let wlog = frame_window_log(src.len() as u64, prefix.map_or(0, |p| p.len() as u64));
     cctx.set_parameter(zstd::zstd_safe::CParameter::WindowLog(wlog)).map_err(err)?;
     cctx.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(true))
         .map_err(err)?;
@@ -338,10 +339,18 @@ pub fn decompress_frame(
 }
 
 /// The window log [`compress_frame`] picks for a frame of
-/// `total_raw_len` bytes — exposed so the streaming encoder (which
-/// cannot see the whole input) reproduces the bulk choice exactly.
-pub fn frame_window_log(total_raw_len: u64) -> u32 {
-    (64 - total_raw_len.max(1 << 20).leading_zeros()).min(27)
+/// `total_raw_len` bytes anchored on `prefix_len` bytes — exposed so the
+/// streaming encoder (which cannot see the whole input) reproduces the
+/// bulk choice exactly. The window must cover input PLUS prefix: a match
+/// from stream position `p` into the anchor spans a distance of `p` plus
+/// the un-matched anchor tail, up to `total + prefix`. Sizing the window
+/// to the input alone leaves the anchor unreachable from everywhere past
+/// `window − prefix` — refPrefix silently degrades to a no-op for most
+/// of a large frame. Still capped at 27 (the decoder's default limit —
+/// readers need no configuration); beyond 128 MB combined, the far end
+/// of the anchor degrades again, by that documented trade.
+pub fn frame_window_log(total_raw_len: u64, prefix_len: u64) -> u32 {
+    (64 - (total_raw_len + prefix_len).max(1 << 20).leading_zeros()).min(27)
 }
 
 /// Streaming form of [`compress_frame`]: IDENTICAL parameters (window
@@ -379,6 +388,7 @@ impl<'p> FrameEncoder<'p> {
             .map_err(err)?;
         cctx.set_parameter(zstd::zstd_safe::CParameter::WindowLog(frame_window_log(
             total_raw_len,
+            prefix.map_or(0, |p| p.len() as u64),
         )))
         .map_err(err)?;
         cctx.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(true))

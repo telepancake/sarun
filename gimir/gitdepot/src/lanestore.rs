@@ -332,14 +332,30 @@ fn run_range(
     Ok(())
 }
 
-/// Seal any remaining batch and flush.
-fn finish_range(depot: &Depot, enc: &mut Encoder, objs: &mut Cat, st: &mut RunState, level: i32) -> Result<()> {
+/// Seal any remaining batch and flush. `fresh` runs session-end compaction
+/// too: a fresh encode retires an f0/f1 per seal, and plain `flush` leaves
+/// them parked in the depot files as permanent on-disk waste (and as noise
+/// in any size measurement) — `collect` is O(store), a constant factor on a
+/// fresh encode. An incremental update stays amortized instead (`flush`'s
+/// ratio-threshold eviction), keeping its I/O O(new), not O(history).
+fn finish_range(
+    depot: &Depot,
+    enc: &mut Encoder,
+    objs: &mut Cat,
+    st: &mut RunState,
+    level: i32,
+    fresh: bool,
+) -> Result<()> {
     if !st.batch.is_empty() {
         let head = enc.seal_record(objs, &st.live)?;
         let staged: Vec<Vec<u8>> = st.batch.drain(..).rev().collect();
         seal_prepend(depot, &head, &staged, level)?;
     }
-    depot.flush().map_err(|e| cf(e.to_string()))?;
+    if fresh {
+        depot.collect().map_err(|e| cf(e.to_string()))?;
+    } else {
+        depot.flush().map_err(|e| cf(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -537,7 +553,7 @@ impl LaneStore {
         };
         run_range(&depot, &mut enc, &mut objs, &plan, &tree_of, &sha_of, 0..plan.n_rev, &mut st, batch_ram_bound(), level, true)?;
         if plan.n_rev > 0 {
-            finish_range(&depot, &mut enc, &mut objs, &mut st, level)?;
+            finish_range(&depot, &mut enc, &mut objs, &mut st, level, true)?;
         }
         let reads = objs.reads;
 
@@ -649,7 +665,7 @@ impl LaneStore {
         let mut st = RunState { lane_tree, live, batch: Vec::new(), batch_bytes: 0 };
         // Advance ONLY the new revisions (O(new)); prepend their reverse deltas.
         run_range(&depot, &mut enc, &mut objs, &plan, &tree_of, &order, old_n..plan.n_rev, &mut st, batch_ram_bound(), level, false)?;
-        finish_range(&depot, &mut enc, &mut objs, &mut st, level)?;
+        finish_range(&depot, &mut enc, &mut objs, &mut st, level, false)?;
         let reads = objs.reads;
         let new_revs = plan.n_rev - old_n;
 

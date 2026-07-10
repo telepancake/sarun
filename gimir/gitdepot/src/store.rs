@@ -1542,6 +1542,9 @@ pub(crate) struct Ingest<'a> {
     tag_recs: Staged,
     n_tags: u64,
     tag_cache: HashMap<String, u64>,
+    /// The store was empty when this ingest began — a fresh import (already
+    /// O(history)) compacts at the end; an update stays amortized (O(new)).
+    fresh: bool,
 }
 
 impl<'a> Ingest<'a> {
@@ -1563,6 +1566,7 @@ impl<'a> Ingest<'a> {
             tag_recs: Staged::new(staging.join("tags"), bound, SPILL_BLOCK),
             n_tags,
             tag_cache: HashMap::new(),
+            fresh: n_commits == 0 && n_tags == 0,
         })
     }
 
@@ -1758,6 +1762,13 @@ impl<'a> Ingest<'a> {
             .collect::<Result<Vec<_>>>()?;
         let changes = diff_refs(&self.st.ref_rows()?, &observed);
         let n_reflog = self.st.count(REFLOG)? + stage_ref_changes(self.st, &changes, self.level)?;
+        // Fresh-import session-end compaction: the ingest's retired frames
+        // are dead weight in the depot files — leave the store at rest
+        // without them. (All chain writes are staged by now; bookkeeping
+        // only flushes.) An update skips this to keep its I/O O(new).
+        if self.fresh {
+            self.st.depot.collect().map_err(|e| Error::Chain(e.to_string()))?;
+        }
         self.commit_bookkeeping(&changes, n_reflog)
     }
 
