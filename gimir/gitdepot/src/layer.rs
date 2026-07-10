@@ -451,11 +451,12 @@ fn base_only_child<'a>(
 /// cursors sit just past their level's node header. Names advance in
 /// bytewise (container) order across all sources at once.
 ///
-/// The untouched majority takes a FAST PATH: the minimum of the DELTA
-/// sources' head names is cached (it moves only when a delta advances —
-/// rare), so a base head that is strictly smaller streams straight through
-/// with one comparison and no k-wide scans; the full merge below runs only
-/// at delta-touched names.
+/// Comparison discipline: the untouched majority (base head strictly below
+/// the cached delta minimum) costs ONE comparison and streams straight
+/// through; a delta-touched name costs one comparison per delta source —
+/// the same comparisons any merge must make — with the participant set
+/// recorded DURING the min scan and reused by the fold and advance phases,
+/// which perform no name comparisons at all.
 fn klevel<'a>(
     srcs: &mut [Cursor<'a>],
     active: &[(usize, u64)],
@@ -474,6 +475,7 @@ fn klevel<'a>(
     }
     // Position of the base source at this level, if it participates.
     let kb = active.iter().position(|&(si, _)| si == 0);
+    // Min over the DELTA heads only — refreshed only when a delta advances.
     let dmin = |heads: &[Option<&'a [u8]>]| -> Option<&'a [u8]> {
         heads
             .iter()
@@ -483,8 +485,11 @@ fn klevel<'a>(
             .min()
     };
     let mut delta_min = dmin(&heads);
+    // The participant positions at the current minimum, reused across
+    // iterations (cleared, never reallocated).
+    let mut group: Vec<usize> = Vec::with_capacity(active.len());
     loop {
-        // Fast path: the base owns the minimum outright.
+        // Fast path: the base owns the minimum outright — one comparison.
         if let (Some(kb), Some(bh)) = (kb, kb.and_then(|k| heads[k])) {
             if delta_min.map(|d| bh < d).unwrap_or(true) {
                 base_only_child(&mut srcs[active[kb].0], bh, path, visit)?;
@@ -497,17 +502,35 @@ fn klevel<'a>(
                 continue;
             }
         }
-        let Some(min) = heads.iter().flatten().min().copied() else { break };
+        // One scan: min AND its participant set together.
+        group.clear();
+        let mut min: Option<&'a [u8]> = None;
+        for (k, h) in heads.iter().enumerate() {
+            let Some(h) = *h else { continue };
+            match min {
+                None => {
+                    min = Some(h);
+                    group.push(k);
+                }
+                Some(m) => match h.cmp(m) {
+                    std::cmp::Ordering::Less => {
+                        min = Some(h);
+                        group.clear();
+                        group.push(k);
+                    }
+                    std::cmp::Ordering::Equal => group.push(k),
+                    std::cmp::Ordering::Greater => {}
+                },
+            }
+        }
+        let Some(min) = min else { break };
         match classify(min) {
             Some(Kind::Dir(gitname)) => {
-                // Gather this name's participants bottom→top; a BACKDROP dir
-                // erases every participant below it (their subtrees are
-                // consumed and dropped) and re-resolves over nothing.
-                let mut sub: Vec<(usize, u64)> = Vec::new();
-                for k in 0..active.len() {
-                    if heads[k] != Some(min) {
-                        continue;
-                    }
+                // Participants bottom→top; a BACKDROP dir erases every
+                // participant below it (their subtrees consumed and dropped)
+                // and re-resolves over nothing.
+                let mut sub: Vec<(usize, u64)> = Vec::with_capacity(group.len());
+                for &k in &group {
                     let si = active[k].0;
                     let n = srcs[si].node()?;
                     if n.backdrop {
@@ -524,10 +547,7 @@ fn klevel<'a>(
             Some(Kind::File(gitname, slot)) => {
                 // Fold the participants' facets bottom→top; only slices move.
                 let mut acc: Option<(Mode, Option<&'a [u8]>, &'a [u8])> = None;
-                for k in 0..active.len() {
-                    if heads[k] != Some(min) {
-                        continue;
-                    }
+                for &k in &group {
                     let si = active[k].0;
                     if si == 0 {
                         // The base: a positive full-state variant.
@@ -543,26 +563,21 @@ fn klevel<'a>(
                 }
             }
             None => {
-                // Unclassifiable name (never produced by the encoder): skip
-                // it in every participant.
-                for k in 0..active.len() {
-                    if heads[k] == Some(min) {
-                        srcs[active[k].0].skip()?;
-                    }
+                // Unclassifiable name (never produced by the encoder).
+                for &k in &group {
+                    srcs[active[k].0].skip()?;
                 }
             }
         }
-        // Advance every source that stood at `min`; the delta-min cache
-        // refreshes only here (a delta advanced).
-        for k in 0..active.len() {
-            if heads[k] == Some(min) {
-                heads[k] = if rem[k] > 0 {
-                    rem[k] -= 1;
-                    Some(srcs[active[k].0].name()?)
-                } else {
-                    None
-                };
-            }
+        // Advance exactly the participants; the delta-min cache refreshes
+        // only here (a delta advanced).
+        for &k in &group {
+            heads[k] = if rem[k] > 0 {
+                rem[k] -= 1;
+                Some(srcs[active[k].0].name()?)
+            } else {
+                None
+            };
         }
         delta_min = dmin(&heads);
     }

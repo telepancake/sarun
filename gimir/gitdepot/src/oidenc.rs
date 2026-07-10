@@ -423,31 +423,110 @@ fn variant_forward_node(ch: &SlotChange<VarKey>) -> Option<Node> {
     }
 }
 
-/// The §2 variant View for an occupant — mirrors [`variant_node`] as a
-/// materialized View so the folded reverse-delta state and this fresh
-/// full-state are byte-identical under `diff(None, view)`. `bitmap = None`
-/// omits the `lanes` child (the all-ones case).
-fn variant_view(content: Bytes, mode: Mode, bitmap: Option<&[u8]>) -> View {
-    let mut children: BTreeMap<Name, Arc<View>> = BTreeMap::new();
-    if let Some(tag) = mode.tag() {
-        let blob: Bytes = if let Mode::Other(m) = mode {
-            format!("{m:o}").into_bytes().into()
-        } else {
-            (&b""[..]).into()
-        };
-        children.insert(tag.to_vec(), Arc::new(View { blob: Some(blob), attrs: Attrs::new(), children: BTreeMap::new() }));
-    }
-    if let Some(bm) = bitmap {
-        children.insert(
-            layer::LANES.to_vec(),
-            Arc::new(View { blob: Some(bm.to_vec().into()), attrs: Attrs::new(), children: BTreeMap::new() }),
-        );
-    }
-    View { blob: Some(content), attrs: Attrs::new(), children }
-}
-
 fn is_file(e: Option<&Ent>) -> bool {
     e.is_some_and(|e| !e.is_dir)
+}
+
+fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn walk_err(e: depot::walk::DecodeError) -> crate::Error {
+    crate::Error::Chain(format!("state stream: {e:?}"))
+}
+
+/// Emit one directory level of the seal record from the folded state bytes:
+/// the header and every name are span-copied verbatim (they are identical in
+/// state and record); each file variant is rewritten by [`emit_variant`].
+fn emit_dir(cur: &mut depot::walk::Cursor, obj: &mut dyn Objects, live: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    let h0 = cur.pos();
+    let n = cur.node().map_err(walk_err)?;
+    out.extend_from_slice(&cur.buf()[h0..cur.pos()]);
+    for _ in 0..n.child_count {
+        let n0 = cur.pos();
+        let name = cur.name().map_err(walk_err)?;
+        out.extend_from_slice(&cur.buf()[n0..cur.pos()]);
+        match layer::classify(name) {
+            Some(layer::Kind::Dir(_)) => emit_dir(cur, obj, live, out)?,
+            Some(layer::Kind::File(..)) => emit_variant(cur, obj, live, out)?,
+            None => {
+                // Never produced by the encoder; preserve verbatim.
+                let a = cur.pos();
+                cur.skip().map_err(walk_err)?;
+                out.extend_from_slice(&cur.buf()[a..cur.pos()]);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite one variant node from state form (blob = oid hex, bitmap always
+/// explicit) to record form (blob = content — the oid itself for a GITLINK —
+/// `lanes` trimmed and omitted when all-ones vs `live`). The flags byte and
+/// the mode-tag children are copied verbatim; meta children stay in their
+/// stored (canonical) order.
+fn emit_variant(cur: &mut depot::walk::Cursor, obj: &mut dyn Objects, live: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    let f0 = cur.pos();
+    let vn = cur.node().map_err(walk_err)?;
+    let flags = cur.buf()[f0];
+    let oid_hex = vn.blob.unwrap_or(&[]);
+    // Children: remember spans; find the lanes bitmap and gitlink-ness.
+    let buf = cur.buf();
+    let mut kids: Vec<(usize, usize, usize, Option<&[u8]>)> = Vec::with_capacity(vn.child_count as usize);
+    let mut is_gitlink = false;
+    for _ in 0..vn.child_count {
+        let s0 = cur.pos();
+        let cname = cur.name().map_err(walk_err)?;
+        let h = cur.pos();
+        let cn = cur.node().map_err(walk_err)?;
+        for _ in 0..cn.child_count {
+            cur.name().map_err(walk_err)?;
+            cur.skip().map_err(walk_err)?;
+        }
+        let s1 = cur.pos();
+        if cname == layer::TAG_GITLINK {
+            is_gitlink = true;
+        }
+        let bm = (cname == layer::LANES).then(|| cn.blob.unwrap_or(&[]));
+        kids.push((s0, h, s1, bm));
+    }
+    let bitmap = kids.iter().find_map(|&(.., bm)| bm).unwrap_or(&[]);
+    let ebm = eff(bitmap, live);
+    let content: Bytes = if is_gitlink {
+        oid_hex.to_vec().into()
+    } else {
+        let oid = std::str::from_utf8(oid_hex)
+            .map_err(|_| crate::Error::Chain("state: non-utf8 oid".into()))?;
+        obj.blob(oid)?
+    };
+    out.push(flags);
+    put_varint(out, content.len() as u64);
+    out.extend_from_slice(&content);
+    let omitted = ebm.is_none() as u64;
+    put_varint(out, vn.child_count - omitted);
+    for &(s0, h, s1, bm) in &kids {
+        match (bm, &ebm) {
+            (Some(_), None) => {} // all-ones: lanes child omitted
+            (Some(_), Some(trimmed)) => {
+                // name span verbatim, node re-emitted with the trimmed blob.
+                out.extend_from_slice(&buf[s0..h]);
+                out.push(buf[h]); // flags: BLOB_SET, no attrs — same shape
+                put_varint(out, trimmed.len() as u64);
+                out.extend_from_slice(trimmed);
+                put_varint(out, 0);
+            }
+            (None, _) => out.extend_from_slice(&buf[s0..s1]), // tag child verbatim
+        }
+    }
+    Ok(())
 }
 
 /// delta ∘ delta for the stack (§4 compose — holes survive), at the byte level.
@@ -606,56 +685,23 @@ impl Encoder {
         Ok(Layer { root: rev_root })
     }
 
-    /// The forward full delta of the current state — the `f0` head and every
-    /// seal boundary. Produced as `diff(None, materialized-view)` (not by
-    /// emitting nodes directly) so it is byte-identical to the anchor the
-    /// reader recomputes for a cold frame — `diff(None, reconstructed-view)`.
-    /// Any non-canonical divergence there fails the frame's refPrefix check.
-    /// This materializes the union — by design only at a frame write (§5 seal).
-    pub fn full(&self, obj: &mut dyn Objects, live: &[u8]) -> Result<Layer> {
-        // Container-keyed view tree, built from one stream over the state.
-        enum Vn {
-            File(View),
-            Dir(BTreeMap<Vec<u8>, Vn>),
-        }
-        fn to_view(dir: BTreeMap<Vec<u8>, Vn>) -> View {
-            let mut children: BTreeMap<Name, Arc<View>> = BTreeMap::new();
-            for (k, v) in dir {
-                let vv = match v {
-                    Vn::File(f) => f,
-                    Vn::Dir(d) => to_view(d),
-                };
-                children.insert(k, Arc::new(vv));
-            }
-            View { blob: None, attrs: Attrs::new(), children }
-        }
-
-        let mut flat: Vec<(Vec<u8>, Mode, u32, Bitmap, String)> = Vec::new();
-        layer::visit_stacked(&self.refprefix, self.stack.layers(), |path, mode, slot, bitmap, content| {
-            let oid = String::from_utf8_lossy(content).into_owned();
-            flat.push((path.to_vec(), mode, slot, bitmap.unwrap_or(&[]).to_vec(), oid));
-        })
-        .map_err(|e| crate::Error::Chain(format!("state stream: {e:?}")))?;
-
-        let mut root: BTreeMap<Vec<u8>, Vn> = BTreeMap::new();
-        for (path, mode, slot, bm, oid) in flat {
-            let content = variant_content(obj, &(mode.octal(), oid.clone()))?;
-            let ebm = eff(&bm, live);
-            let segs: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
-            let mut cur = &mut root;
-            for seg in &segs[..segs.len() - 1] {
-                let e = cur.entry(dir_key(seg)).or_insert_with(|| Vn::Dir(BTreeMap::new()));
-                cur = match e {
-                    Vn::Dir(d) => d,
-                    Vn::File(_) => unreachable!("dir_key/file_key never collide"),
-                };
-            }
-            cur.insert(
-                file_key(segs[segs.len() - 1], slot),
-                Vn::File(variant_view(content, mode, ebm.as_deref())),
-            );
-        }
-        Ok(depot::diff(None, Some(&to_view(root))))
+    /// The §5 frame write, as ONE streaming byte operation: fold the live
+    /// stack into `refPrefix` (holes dissolve — [`Self::seal_state`]) and
+    /// emit the full-state head RECORD directly from the folded bytes. The
+    /// content-free state and the record share their tree structure, so the
+    /// emitter span-copies structural bytes verbatim and rewrites only each
+    /// variant node — blob fetched by oid, written out, dropped — and its
+    /// `lanes` child (trimmed, omitted when all-ones vs `live`). No View,
+    /// no Layer, no node tree: peak memory is the output record plus one
+    /// blob. Canonicality is enforced loudly downstream — the record doubles
+    /// as the cold-frame zstd refPrefix anchor, where any non-canonical byte
+    /// fails decompression.
+    pub fn seal_record(&mut self, obj: &mut dyn Objects, live: &[u8]) -> Result<Vec<u8>> {
+        self.seal_state();
+        let mut out = Vec::with_capacity(self.refprefix.len());
+        let mut cur = depot::walk::Cursor::new(&self.refprefix);
+        emit_dir(&mut cur, obj, live, &mut out)?;
+        Ok(out)
     }
 
     /// §5 seal (a frame write): flatten the live stack into a fresh
@@ -705,9 +751,10 @@ mod tests {
         }
         b
     }
-    /// The newest union View: materialize the encoder's full state at `live`.
-    fn newest(enc: &Encoder, m: &mut Mem, live: &[u8]) -> View {
-        depot::apply(None, &enc.full(m, live).unwrap()).unwrap_or_default()
+    /// The newest union View, decoded from the streamed §5 seal record.
+    fn newest(enc: &mut Encoder, m: &mut Mem, live: &[u8]) -> View {
+        let rec = enc.seal_record(m, live).unwrap();
+        depot::apply(None, &depot::codec::decode(&rec).unwrap()).unwrap_or_default()
     }
     /// Fold a reverse-delta record into the working view, resolving removal
     /// holes as tombstones over the empty backdrop (the reader's rule).
@@ -772,7 +819,7 @@ mod tests {
         // Birth both lanes (one advance each, from empty); live grows {0}→{0,1}.
         enc.advance(&[(0, None, Some(&t0))], &mut m, &bm(&[]), &bm(&[0])).unwrap();
         enc.advance(&[(1, None, Some(&t1))], &mut m, &bm(&[0]), &bm(&[0, 1])).unwrap();
-        let u = newest(&enc, &mut m, &bm(&[0, 1]));
+        let u = newest(&mut enc, &mut m, &bm(&[0, 1]));
 
         assert_eq!(lane_map(&u, 0).len(), 2);
         assert_eq!(content(&u, 0, b"f").as_deref(), Some(&b"A"[..]));
@@ -794,7 +841,7 @@ mod tests {
         let rec = enc.advance(&[(0, Some(&t_old), Some(&t_new))], &mut m, &bm(&[0]), &bm(&[0])).unwrap(); // → state new
 
         // newest (state new)
-        let mut cur = Some(newest(&enc, &mut m, &bm(&[0])));
+        let mut cur = Some(newest(&mut enc, &mut m, &bm(&[0])));
         assert_eq!(content(cur.as_ref().unwrap(), 0, b"f").as_deref(), Some(&b"new"[..]));
         // reverse record rebuilds state old — only `f` changed, `shared`
         // inherited (holes resolve as tombstones over the empty backdrop).
@@ -818,7 +865,7 @@ mod tests {
         let mut enc = Encoder::new();
         enc.advance(&[(0, None, Some(&r0))], &mut m, &bm(&[]), &bm(&[0])).unwrap();
         let rec = enc.advance(&[(0, Some(&r0), Some(&r1))], &mut m, &bm(&[0]), &bm(&[0])).unwrap();
-        let mut cur = Some(newest(&enc, &mut m, &bm(&[0])));
+        let mut cur = Some(newest(&mut enc, &mut m, &bm(&[0])));
         // newest: src/m == m1
         assert_eq!(content(cur.as_ref().unwrap(), 0, b"src/m").as_deref(), Some(&b"m1"[..]));
         // reverse record rebuilds the old state — src/l pruned by oid.

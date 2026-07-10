@@ -311,20 +311,20 @@ fn run_range(
         if fresh && i == 0 {
             // Seed f0 with the positive full-state (the newest, i.e. only,
             // revision so far); `rev` (a delta from nothing) is discarded.
-            let f0raw = codec::encode(&enc.full(objs, &st.live)?);
+            // seal_record IS the §5 frame write: fold the stack, stream the
+            // record — no View, no node tree.
+            let f0raw = enc.seal_record(objs, &st.live)?;
             let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
             depot.prepend(CHAIN, &f0, None, false).map_err(|e| cf(e.to_string()))?;
-            enc.seal_state(); // §5: a frame write flattens the stack
         } else {
             let rec = codec::encode(&rev);
             st.batch_bytes += 8 + rec.len() as u64;
             st.batch.push(rec);
         }
         if !st.batch.is_empty() && st.batch_bytes >= batch_bound {
-            let head = codec::encode(&enc.full(objs, &st.live)?);
+            let head = enc.seal_record(objs, &st.live)?;
             let staged: Vec<Vec<u8>> = st.batch.drain(..).rev().collect();
             seal_prepend(depot, &head, &staged, level)?;
-            enc.seal_state(); // §5: a frame write flattens the stack
             st.batch_bytes = 0;
             depot.flush().map_err(|e| cf(e.to_string()))?;
         }
@@ -335,10 +335,9 @@ fn run_range(
 /// Seal any remaining batch and flush.
 fn finish_range(depot: &Depot, enc: &mut Encoder, objs: &mut Cat, st: &mut RunState, level: i32) -> Result<()> {
     if !st.batch.is_empty() {
-        let head = codec::encode(&enc.full(objs, &st.live)?);
+        let head = enc.seal_record(objs, &st.live)?;
         let staged: Vec<Vec<u8>> = st.batch.drain(..).rev().collect();
         seal_prepend(depot, &head, &staged, level)?;
-        enc.seal_state(); // §5: a frame write flattens the stack
     }
     depot.flush().map_err(|e| cf(e.to_string()))?;
     Ok(())
