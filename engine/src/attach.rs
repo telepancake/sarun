@@ -182,17 +182,21 @@ fn open_readout(ext: &ExtRef) -> Result<Arc<dyn Readout>, String> {
 }
 
 /// Same sizing defaults as the wikimak driver CLI (and control.rs's
-/// read-side open — dedupe when the attach verbs move here).
+/// read-side open — dedupe when the attach verbs move here). The
+/// page-id bound derives from the existing depot's on-disk index: a
+/// read-side open must match whatever the writer created it with.
 fn open_wiki_instance(root: &str)
     -> Result<wikimak_wikipedia::Instance, String>
 {
+    let max_chain_id =
+        wikimak_wikipedia::max_chain_id_for_root(std::path::Path::new(root));
     wikimak_wikipedia::Instance::open(wikimak_wikipedia::InstanceConfig {
         root: std::path::PathBuf::from(root),
         dbname: "wiki".into(),
-        max_chain_id: 4_000_000,
+        max_chain_id,
         depot: wikimak_depot::DepotConfig {
             root: Default::default(),
-            max_chain_id: 4_000_000,
+            max_chain_id,
             file_size_threshold: 1 << 30,
             eviction_dead_ratio: 0.5,
         },

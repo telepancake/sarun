@@ -67,6 +67,24 @@ pub(crate) fn do_import<R: Read>(
     while let Some(page) = stream.next() {
         let page = page?;
 
+        let page_id = page.id as u64;
+
+        // Reject-policy on overflow (PHASES §"page_id_overflow_errors_
+        // before_writes"): a page id past the instance's bound is a
+        // LOUD import error BEFORE any write for that page — checked
+        // even before the once-per-import siteinfo capture so a
+        // first-page overflow leaves meta.db untouched. Silently
+        // skipping instead would let the part watermark land over a
+        // lossy import (on enwiki, ~95% of pages gone invisibly).
+        // Pages already committed this run stay (per-page atomicity);
+        // the run fails, so no part is ever marked seen.
+        if page_id >= instance.max_chain_id {
+            return Err(crate::error::Error::PageIdOverflow {
+                page_id,
+                max_chain_id: instance.max_chain_id,
+            });
+        }
+
         // Capture site_info once (PageStream parses it during the first
         // `next()` call). Best-effort: skipping on missing or insert
         // failure is fine — the table is not query-pinned by tests.
@@ -77,14 +95,6 @@ pub(crate) fn do_import<R: Read>(
                 capture_siteinfo(&g.conn, si)?;
                 siteinfo_captured = true;
             }
-        }
-
-        let page_id = page.id as u64;
-
-        // Skip-policy on overflow: page never touches the depot or
-        // sqlite. Matches PHASES §"page_id_overflow_errors_before_writes".
-        if page_id >= instance.max_chain_id {
-            continue;
         }
 
         import_one_page(instance, page, &mut stats)?;

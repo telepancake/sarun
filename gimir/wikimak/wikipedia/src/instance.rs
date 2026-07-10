@@ -17,6 +17,27 @@ use crate::import::do_import;
 use crate::revision::decode_revision;
 use crate::schema::META_DDL;
 
+/// Default `max_chain_id` for fresh instances: sized for enwiki
+/// (~80M page ids in 2026) with headroom. The cost is the depot's
+/// index file at 8 bytes/chain — 800MB LOGICAL, but the index is
+/// created with `ftruncate` and stays sparse: untouched chains never
+/// allocate a disk block (pinned by the depot's sparse-index test).
+pub const DEFAULT_MAX_CHAIN_ID: u64 = 100_000_000;
+
+/// The `max_chain_id` an EXISTING instance root was created with —
+/// derived from the on-disk depot index (`max_chain_id * 8` bytes),
+/// so read-side opens never guess. A fresh root (no index yet) gets
+/// [`DEFAULT_MAX_CHAIN_ID`]. A mismatched explicit config still fails
+/// loudly in the depot (`IndexSizeMismatch`); this helper is how
+/// callers avoid manufacturing that mismatch.
+pub fn max_chain_id_for_root(root: &std::path::Path) -> u64 {
+    std::fs::metadata(root.join("depot").join("index"))
+        .map(|m| m.len() / 8)
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CHAIN_ID)
+}
+
 /// Configuration for opening an [`Instance`].
 ///
 /// `root` is the per-dbname directory: e.g.

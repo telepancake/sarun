@@ -28,7 +28,8 @@ pub mod sync;
 
 pub use error::{Error, Result};
 pub use instance::{
-    ContributorMeta, HistoryEntry, HistoryIter, ImportStats, Instance, InstanceConfig, RevisionMeta,
+    max_chain_id_for_root, ContributorMeta, HistoryEntry, HistoryIter, ImportStats, Instance,
+    InstanceConfig, RevisionMeta, DEFAULT_MAX_CHAIN_ID,
 };
 #[cfg(feature = "fetch")]
 pub use sync::{sync, SyncStats};

@@ -16,15 +16,22 @@ use std::path::PathBuf;
 use wikimak_mediawiki::new_page_stream;
 use crate::{Instance, InstanceConfig};
 
-fn open_instance(root: PathBuf) -> Result<Instance, String> {
+/// Per-run page-id bound override (`--max-page-id N`), `None` = derive:
+/// an existing root keeps the bound its depot index was created with;
+/// a fresh root gets `DEFAULT_MAX_CHAIN_ID` (sized for enwiki — the
+/// index is 8 bytes/chain and created sparse, so the default costs no
+/// disk for small wikis). An explicit N against a mismatched existing
+/// index fails loudly in the depot (`IndexSizeMismatch`).
+fn open_instance(root: PathBuf, max_page_id: Option<u64>) -> Result<Instance, String> {
+    let max_chain_id =
+        max_page_id.unwrap_or_else(|| crate::instance::max_chain_id_for_root(&root));
     Instance::open(InstanceConfig {
         root,
         dbname: "wiki".into(),
-        // Sized for full non-en wikis; enwiki wants ~1e8 (index = 8B/page).
-        max_chain_id: 4_000_000,
+        max_chain_id,
         depot: wikimak_depot::DepotConfig {
             root: PathBuf::new(), // forced to <root>/depot/
-            max_chain_id: 4_000_000,
+            max_chain_id,
             file_size_threshold: 1 << 30,
             eviction_dead_ratio: 0.5,
         },
@@ -35,8 +42,8 @@ fn open_instance(root: PathBuf) -> Result<Instance, String> {
     .map_err(|e| e.to_string())
 }
 
-fn cmd_import(dump: &str, root: &str) -> Result<(), String> {
-    let inst = open_instance(PathBuf::from(root))?;
+fn cmd_import(dump: &str, root: &str, max_page_id: Option<u64>) -> Result<(), String> {
+    let inst = open_instance(PathBuf::from(root), max_page_id)?;
     let f = std::fs::File::open(dump).map_err(|e| format!("{dump}: {e}"))?;
     let reader: Box<dyn Read + Send> = if dump.ends_with(".bz2") {
         Box::new(wikimak_mediawiki::bz2::new_bz2_reader(
@@ -76,8 +83,8 @@ fn cmd_discover(dbname: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_fetch(dbname: &str, root: &str) -> Result<(), String> {
-    let inst = open_instance(PathBuf::from(root))?;
+fn cmd_fetch(dbname: &str, root: &str, max_page_id: Option<u64>) -> Result<(), String> {
+    let inst = open_instance(PathBuf::from(root), max_page_id)?;
     let client = http_client()?;
     let (run, stats) = crate::sync(
         &inst, &client, &wikimak_mediawiki::Config::default(), dbname,
@@ -92,7 +99,7 @@ fn cmd_fetch(dbname: &str, root: &str) -> Result<(), String> {
 }
 
 fn cmd_pages(root: &str, filter: Option<&str>) -> Result<(), String> {
-    let inst = open_instance(PathBuf::from(root))?;
+    let inst = open_instance(PathBuf::from(root), None)?;
     for (id, title) in inst.pages(filter, 200).map_err(|e| e.to_string())? {
         println!("{id:>8}  {title}");
     }
@@ -100,7 +107,7 @@ fn cmd_pages(root: &str, filter: Option<&str>) -> Result<(), String> {
 }
 
 fn cmd_head(root: &str, page: u64) -> Result<(), String> {
-    let inst = open_instance(PathBuf::from(root))?;
+    let inst = open_instance(PathBuf::from(root), None)?;
     match inst.page_head(page).map_err(|e| e.to_string())? {
         Some(m) => {
             println!("rev {} parent {} ts {} comment {:?}",
@@ -112,7 +119,7 @@ fn cmd_head(root: &str, page: u64) -> Result<(), String> {
 }
 
 fn cmd_text(root: &str, page: u64) -> Result<(), String> {
-    let inst = open_instance(PathBuf::from(root))?;
+    let inst = open_instance(PathBuf::from(root), None)?;
     match inst.page_head_text(page).map_err(|e| e.to_string())? {
         Some(t) => {
             std::io::stdout().write_all(&t).map_err(|e| e.to_string())?;
@@ -124,7 +131,7 @@ fn cmd_text(root: &str, page: u64) -> Result<(), String> {
 
 #[cfg(feature = "serve")]
 fn cmd_serve(root: &str, addr: &str) -> Result<(), String> {
-    let inst = open_instance(PathBuf::from(root))?;
+    let inst = open_instance(PathBuf::from(root), None)?;
     let cfg = crate::serve::ServeConfig {
         addr: addr.to_string(),
         media_cache: PathBuf::from(root).join("media"),
@@ -133,7 +140,7 @@ fn cmd_serve(root: &str, addr: &str) -> Result<(), String> {
 }
 
 fn cmd_history(root: &str, page: u64) -> Result<(), String> {
-    let inst = open_instance(PathBuf::from(root))?;
+    let inst = open_instance(PathBuf::from(root), None)?;
     for entry in inst.page_history(page).map_err(|e| e.to_string())? {
         let e = entry.map_err(|e| e.to_string())?;
         println!("rev {}\tts {}\tlen {}\t{:?}",
@@ -146,11 +153,34 @@ fn cmd_history(root: &str, page: u64) -> Result<(), String> {
 /// embeds this crate (with `fetch`) and dispatches here on
 /// `sarun wikimak …` / an argv[0] symlink named `wikimak`.
 pub fn cli_main(args: &[String]) -> i32 {
-    let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Strip `--max-page-id N` / `--max-page-id=N` (any position): the
+    // page-id bound for `import`/`fetch` on a FRESH root. Existing
+    // roots derive the bound from their depot index; the flag against
+    // a mismatched existing index fails loudly (IndexSizeMismatch).
+    let mut max_page_id: Option<u64> = None;
+    let mut strs: Vec<&str> = Vec::with_capacity(args.len());
+    let mut it = args.iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        let v = if a == "--max-page-id" {
+            it.next()
+        } else if let Some(v) = a.strip_prefix("--max-page-id=") {
+            Some(v)
+        } else {
+            strs.push(a);
+            continue;
+        };
+        match v.and_then(|v| v.parse::<u64>().ok()).filter(|&n| n > 0) {
+            Some(n) => max_page_id = Some(n),
+            None => {
+                eprintln!("wikimak: --max-page-id wants a positive integer");
+                return 1;
+            }
+        }
+    }
     let r = match strs.as_slice() {
         ["discover", dbname] => cmd_discover(dbname),
-        ["fetch", dbname, root] => cmd_fetch(dbname, root),
-        ["import", dump, root] => cmd_import(dump, root),
+        ["fetch", dbname, root] => cmd_fetch(dbname, root, max_page_id),
+        ["import", dump, root] => cmd_import(dump, root, max_page_id),
         ["pages", root] => cmd_pages(root, None),
         ["pages", root, filter] => cmd_pages(root, Some(filter)),
         #[cfg(feature = "serve")]
@@ -165,8 +195,8 @@ pub fn cli_main(args: &[String]) -> i32 {
             .and_then(|p| cmd_history(root, p)),
         _ => Err("usage: wikimak discover <dbname>\n\
                   \x20      wikimak pages <root> [filter]\n\
-                  \x20      wikimak fetch <dbname> <root>\n\
-                  \x20      wikimak import <dump.xml[.bz2]> <root>\n\
+                  \x20      wikimak fetch <dbname> <root> [--max-page-id N]\n\
+                  \x20      wikimak import <dump.xml[.bz2]> <root> [--max-page-id N]\n\
                   \x20      wikimak serve <root> [addr]        (default 127.0.0.1:8642)\n\
                   \x20      wikimak head|text|history <root> <page_id>".into()),
     };

@@ -4119,16 +4119,20 @@ fn hydrate_box(ov: &crate::overlay::Overlay, sid: i64)
 
 /// Open a wikimak instance READ-ONLY-ish (the read paths never write
 /// chains) with the same sizing defaults as the wikimak driver CLI.
+/// The page-id bound derives from the existing depot's on-disk index:
+/// a read-side open must match whatever the writer created it with.
 fn open_wiki_instance(root: &str)
     -> Result<wikimak_wikipedia::Instance, String>
 {
+    let max_chain_id =
+        wikimak_wikipedia::max_chain_id_for_root(std::path::Path::new(root));
     wikimak_wikipedia::Instance::open(wikimak_wikipedia::InstanceConfig {
         root: std::path::PathBuf::from(root),
         dbname: "wiki".into(),
-        max_chain_id: 4_000_000,
+        max_chain_id,
         depot: wikimak_depot::DepotConfig {
             root: Default::default(), // forced to <root>/depot/
-            max_chain_id: 4_000_000,
+            max_chain_id,
             file_size_threshold: 1 << 30,
             eviction_dead_ratio: 0.5,
         },
