@@ -113,6 +113,37 @@ pub fn chunk_newest_first(
 pub struct Depot {
     inner: Mutex<DepotInner>,
     prepends: std::sync::atomic::AtomicU64,
+    reads_f0: std::sync::atomic::AtomicU64,
+    reads_f1: std::sync::atomic::AtomicU64,
+    reads_cold: std::sync::atomic::AtomicU64,
+}
+
+/// Cumulative frame PAYLOAD reads since open — instrumentation for the
+/// read-path contract (a head read touches f0 only; a τ read walks no
+/// further than the frame holding its target). Header peeks (next
+/// pointers, lengths) don't count; only zstd payload reads do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReadCounts {
+    pub f0: u64,
+    pub f1: u64,
+    pub cold: u64,
+}
+
+/// Opaque resumable cursor over a chain's cold frames, newest-first.
+/// Obtained from [`Depot::cold_cursor`], advanced by [`Depot::cold_next`].
+/// Owning no borrow of the depot, it can live across other depot calls —
+/// the walk-style readers hold one while frames stream one at a time.
+/// Positions stay valid for the depot's lifetime: cold frames are never
+/// moved or evicted (SPEC §"Cold file").
+pub struct ColdCursor {
+    next: u64,
+}
+
+impl ColdCursor {
+    /// True once the walk is exhausted.
+    pub fn done(&self) -> bool {
+        self.next == 0
+    }
 }
 
 /// Compose the f1 accumulator for a prepend of one or more records —
@@ -168,24 +199,18 @@ pub fn compose_f1(
 /// `Result<Vec<u8>>` of the cold frame's opaque zstd bytes.
 pub struct ColdIter<'a> {
     depot: &'a Depot,
-    next: u64,
+    cursor: ColdCursor,
 }
 
 impl<'a> Iterator for ColdIter<'a> {
     type Item = Result<Vec<u8>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next == 0 {
-            return None;
-        }
-        let mut g = self.depot.inner.lock().expect("depot mutex poisoned");
-        match g.read_cold_frame(self.next) {
-            Ok((bytes, next)) => {
-                self.next = next;
-                Some(Ok(bytes))
-            }
+        match self.depot.cold_next(&mut self.cursor) {
+            Ok(Some(bytes)) => Some(Ok(bytes)),
+            Ok(None) => None,
             Err(e) => {
-                self.next = 0;
+                self.cursor.next = 0;
                 Some(Err(e))
             }
         }
@@ -199,6 +224,9 @@ impl Depot {
         Ok(Self {
             inner: Mutex::new(inner),
             prepends: std::sync::atomic::AtomicU64::new(0),
+            reads_f0: std::sync::atomic::AtomicU64::new(0),
+            reads_f1: std::sync::atomic::AtomicU64::new(0),
+            reads_cold: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -206,6 +234,16 @@ impl Depot {
     /// batch-prepend invariant (N records = one prepend per chain).
     pub fn prepend_count(&self) -> u64 {
         self.prepends.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Frame-payload read counters since open (see [`ReadCounts`]).
+    pub fn read_counts(&self) -> ReadCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        ReadCounts {
+            f0: self.reads_f0.load(Relaxed),
+            f1: self.reads_f1.load(Relaxed),
+            cold: self.reads_cold.load(Relaxed),
+        }
     }
 
     /// Replace the chain's f0 and f1 with new bytes. See SPEC §"Prepend".
@@ -225,24 +263,49 @@ impl Depot {
     /// Read the current f0 frame's opaque zstd bytes (header stripped).
     pub fn read_f0(&self, chain_id: u64) -> Result<Vec<u8>> {
         let mut g = self.inner.lock().expect("depot mutex poisoned");
-        g.read_f0(chain_id)
+        let out = g.read_f0(chain_id)?;
+        self.reads_f0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(out)
     }
 
     /// Read the current f1 frame's opaque zstd bytes; `Ok(None)` if no f1.
     pub fn read_f1(&self, chain_id: u64) -> Result<Option<Vec<u8>>> {
         let mut g = self.inner.lock().expect("depot mutex poisoned");
-        g.read_f1(chain_id)
+        let out = g.read_f1(chain_id)?;
+        if out.is_some() {
+            self.reads_f1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(out)
+    }
+
+    /// Start a cold-frame walk for `chain_id` (newest-first). The cursor
+    /// borrows nothing; feed it back through [`Depot::cold_next`] to
+    /// stream the frames one at a time.
+    pub fn cold_cursor(&self, chain_id: u64) -> Result<ColdCursor> {
+        let mut g = self.inner.lock().expect("depot mutex poisoned");
+        let head = g.cold_head(chain_id)?;
+        Ok(ColdCursor { next: head })
+    }
+
+    /// Next cold frame's opaque zstd bytes, or `None` when the walk is
+    /// done. Exactly ONE frame is read (and resident) per call — the
+    /// streaming primitive the read paths are built on.
+    pub fn cold_next(&self, cursor: &mut ColdCursor) -> Result<Option<Vec<u8>>> {
+        if cursor.next == 0 {
+            return Ok(None);
+        }
+        let mut g = self.inner.lock().expect("depot mutex poisoned");
+        let (bytes, next) = g.read_cold_frame(cursor.next)?;
+        drop(g);
+        cursor.next = next;
+        self.reads_cold.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(bytes))
     }
 
     /// Iterate cold frames newest-first.
     pub fn cold_iter(&self, chain_id: u64) -> Result<ColdIter<'_>> {
-        let mut g = self.inner.lock().expect("depot mutex poisoned");
-        let head = g.cold_head(chain_id)?;
-        drop(g);
-        Ok(ColdIter {
-            depot: self,
-            next: head,
-        })
+        let cursor = self.cold_cursor(chain_id)?;
+        Ok(ColdIter { depot: self, cursor })
     }
 
     /// Seal the chain's CURRENT f1 to cold immediately: the f1's zstd

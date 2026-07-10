@@ -55,9 +55,20 @@ pub const META_DDL: &[&str] = &[
     // Extension beyond SPEC sketch: per-revision dedup. SPEC §"Crash-
     // safety contract" says dedup is sqlite-driven; we materialize a
     // (page_id, rev_id) table to make idempotent re-imports cheap.
+    //
+    // `ts` (unix micros) is the revision's timestamp, recorded at import
+    // so reads never scan a chain to find "the newest revision ≤ τ":
+    // chain order is import-prepend order, not timestamp order, so the
+    // argmax that used to require decoding the WHOLE chain is now one
+    // indexed sqlite lookup + an early-stopping frame walk to the named
+    // record. Rows written before the column existed are NULL; reads
+    // fall back to the full-chain scan once and backfill (see
+    // `Instance::revision_query`). The column is added to legacy dbs by
+    // `ensure_revision_ts_schema` at open.
     "CREATE TABLE IF NOT EXISTS revisions_seen (
         page_id INTEGER NOT NULL,
         rev_id INTEGER NOT NULL,
+        ts INTEGER,
         PRIMARY KEY(page_id, rev_id)
     ) WITHOUT ROWID",
     // Crash bookkeeping: 'dirty' = 1 between the first import write and

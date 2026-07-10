@@ -4,7 +4,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -14,7 +14,6 @@ use wikimak_mediawiki::PageStream;
 
 use crate::error::{Error, Result};
 use crate::import::do_import;
-use crate::revision::decode_revision;
 use crate::schema::META_DDL;
 
 /// Default `max_chain_id` for fresh instances: sized for enwiki
@@ -126,7 +125,11 @@ impl Iterator for HistoryIter {
 
 /// The per-dbname mirror. One process at a time per `root`.
 pub struct Instance {
-    pub(crate) inner: Mutex<InstanceInner>,
+    /// `Arc` so the streaming [`HistoryIter`] (and its lazy `fetch_text`
+    /// closures) can hold the handles across calls without borrowing
+    /// the `Instance` — a history walk is frame-at-a-time, not a
+    /// snapshot of the whole decompressed chain.
+    pub(crate) inner: Arc<Mutex<InstanceInner>>,
     pub(crate) max_chain_id: u64,
     pub(crate) f1_seal_threshold_bytes: u64,
     pub(crate) title_shard_count: u32,
@@ -152,6 +155,11 @@ pub(crate) struct InstanceInner {
     pub(crate) repaired: std::collections::HashSet<u64>,
     /// Whether this session has already stamped the dirty flag.
     pub(crate) dirty_stamped: bool,
+    /// An import errored mid-page this session: the chain may be AHEAD
+    /// of `revisions_seen` (prepends landed, rows rolled back). Reads
+    /// then distrust the rows and scan the chain, exactly like a
+    /// suspect open would after the crash-equivalent state.
+    pub(crate) import_errored: bool,
     /// The root's flock, held for the instance's lifetime.
     pub(crate) _lock: std::fs::File,
 }
@@ -193,6 +201,7 @@ impl Instance {
         for stmt in META_DDL {
             conn.execute(stmt, [])?;
         }
+        ensure_revision_ts_schema(&conn)?;
         let suspect: bool = conn
             .query_row(
                 "SELECT value FROM instance_flags WHERE key = 'dirty'",
@@ -203,14 +212,15 @@ impl Instance {
             .unwrap_or(false);
 
         Ok(Self {
-            inner: Mutex::new(InstanceInner {
+            inner: Arc::new(Mutex::new(InstanceInner {
                 depot,
                 titles,
                 conn,
                 repaired: Default::default(),
                 dirty_stamped: false,
+                import_errored: false,
                 _lock: lock,
-            }),
+            })),
             suspect,
             max_chain_id: cfg.max_chain_id,
             f1_seal_threshold_bytes: if cfg.f1_seal_threshold_bytes == 0 {
@@ -236,46 +246,49 @@ impl Instance {
     /// record, which is only the newest-by-time when revisions were
     /// appended in chronological order. Out-of-order / cross-import
     /// prepends (a later import supplying a gap revision) make f0 an older
-    /// revision, so the "current head" is computed as `argmax(ts)` over
-    /// the whole chain (via [`Instance::revision_at`] with `None` τ).
+    /// revision. The head's identity comes from the per-revision `ts`
+    /// rows import persists in sqlite (see [`Instance::revision_at`]);
+    /// in the common in-order case the named record IS f0, so a head
+    /// read decodes exactly one frame.
     pub fn page_head(&self, page_id: u64) -> Result<Option<RevisionMeta>> {
-        self.revision_at(page_id, None)
+        Ok(self.revision_query(page_id, None, false)?.map(|(m, _)| m))
     }
 
     /// Read the current head revision's text bytes (UTF-8) for
     /// `page_id` — the newest revision by timestamp (see [`page_head`]).
     /// `Ok(None)` if no such page.
     pub fn page_head_text(&self, page_id: u64) -> Result<Option<Vec<u8>>> {
-        self.page_text_at(page_id, None)
+        Ok(self.revision_query(page_id, None, true)?.and_then(|(_, t)| t))
     }
 
-    /// Iterate all revisions of `page_id`, newest-first.
+    /// Iterate all revisions of `page_id`, newest-first (chain order).
+    ///
+    /// STREAMING: the iterator holds at most one decompressed frame at a
+    /// time (plus the record anchoring the next frame's refPrefix) and
+    /// decodes metadata only — no text is materialized by iteration.
+    /// Each entry's `fetch_text` re-walks the chain to its record with
+    /// an early stop and copies out that one text. The iterator
+    /// snapshots f0/f1/cold-head on its first step, so a concurrent
+    /// import doesn't tear the walk (cold frames themselves are
+    /// immutable).
     pub fn page_history(&self, page_id: u64) -> Result<HistoryIter> {
-        // Walk the chain eagerly here (under the lock) to collect each
-        // record's encoded bytes; the lazy contract is satisfied by
-        // deferring the *decode* of text bytes into the fetch_text
-        // closure (the records themselves are small; text dominates).
-        let records: Vec<Vec<u8>> = if page_id >= self.max_chain_id {
-            Vec::new()
-        } else {
-            let g = self.inner.lock().expect("instance mutex poisoned");
-            collect_records(&g.depot, page_id)?
-        };
-
-        let iter = records.into_iter().map(|rec| {
-            let (meta, _text) = decode_revision(&rec)?;
-            // Clone of rec moves into the closure for lazy text decode.
-            let rec_for_text = rec;
-            let fetch_text: Box<dyn FnOnce() -> Result<Vec<u8>> + Send> = Box::new(move || {
-                let (_m, t) = decode_revision(&rec_for_text)?;
-                Ok(t)
-            });
-            Ok(HistoryEntry { meta, fetch_text })
-        });
-
+        if page_id >= self.max_chain_id {
+            return Ok(HistoryIter { inner: Box::new(std::iter::empty()) });
+        }
         Ok(HistoryIter {
-            inner: Box::new(iter),
+            inner: Box::new(HistoryWalk {
+                inner: Arc::clone(&self.inner),
+                chain_id: page_id,
+                walk: WalkState::new_snapshot(page_id),
+            }),
         })
+    }
+
+    /// Depot frame-payload read counters — instrumentation for the
+    /// read-path acceptance tests (a head read touches only f0; a τ
+    /// read stops at the frame holding its target).
+    pub fn depot_read_counts(&self) -> wikimak_depot::ReadCounts {
+        self.inner.lock().expect("instance mutex poisoned").depot.read_counts()
     }
 
     /// List `(page_id, title)` pairs, title-ordered, optionally filtered
@@ -417,50 +430,136 @@ impl Instance {
     /// revision whose timestamp is ≤ τ; `Ok(None)` when every revision is
     /// newer than τ (the page did not yet exist at τ).
     ///
-    /// The chain is walked in full and the answer chosen by `argmax` over
-    /// `(timestamp, rev_id)` — NOT the first record in chain order. Chain
-    /// order is import-prepend order, not timestamp order: an out-of-order
-    /// or cross-import gap revision (a later import supplying an earlier
-    /// revision) lands at the chain head, so "first with ts ≤ τ" would
-    /// return a non-newest revision. `argmax` is correct regardless of the
-    /// order revisions were imported in.
+    /// The answer is `argmax` over `(timestamp, rev_id)` — NOT the first
+    /// record in chain order. Chain order is import-prepend order, not
+    /// timestamp order: an out-of-order or cross-import gap revision (a
+    /// later import supplying an earlier revision) lands at the chain
+    /// head, so "first with ts ≤ τ" would return a non-newest revision.
+    /// The argmax itself is one indexed lookup over the per-revision `ts`
+    /// rows import persists in sqlite; the chain is then walked
+    /// newest-first, meta-only, stopping at the named record — never
+    /// decoding the frames past it. Only when the rows can't be trusted
+    /// (legacy NULL-ts rows, a suspect open, or sqlite ahead of the
+    /// chain after a crash) does the read fall back to the full
+    /// streaming scan — once, backfilling the rows it derived.
     pub fn revision_at(&self, page_id: u64, ts_micros: Option<i64>) -> Result<Option<RevisionMeta>> {
-        let mut best: Option<RevisionMeta> = None;
-        for entry in self.page_history(page_id)? {
-            let meta = entry?.meta;
-            if let Some(ts) = ts_micros {
-                if meta.ts.timestamp_micros() > ts {
-                    continue;
-                }
-            }
-            if best.as_ref().map_or(true, |b| rev_key(&meta) > rev_key(b)) {
-                best = Some(meta);
-            }
-        }
-        Ok(best)
+        Ok(self.revision_query(page_id, ts_micros, false)?.map(|(m, _)| m))
     }
 
     /// Text bytes of the revision selected by [`Instance::revision_at`].
     ///
-    /// Same `argmax` selection; decodes only the chosen revision's text.
-    /// `None` τ → newest-revision text; `Ok(None)` when no revision is ≤ τ.
+    /// Same selection; only the chosen revision's text is ever copied
+    /// out of its frame. `None` τ → newest-revision text; `Ok(None)`
+    /// when no revision is ≤ τ.
     pub fn page_text_at(&self, page_id: u64, ts_micros: Option<i64>) -> Result<Option<Vec<u8>>> {
-        let mut best: Option<HistoryEntry> = None;
-        for entry in self.page_history(page_id)? {
-            let entry = entry?;
-            if let Some(ts) = ts_micros {
-                if entry.meta.ts.timestamp_micros() > ts {
-                    continue;
+        Ok(self.revision_query(page_id, ts_micros, true)?.and_then(|(_, t)| t))
+    }
+
+    /// The shared read core behind [`page_head`](Self::page_head) /
+    /// [`page_head_text`](Self::page_head_text) /
+    /// [`revision_at`](Self::revision_at) /
+    /// [`page_text_at`](Self::page_text_at) — and, through those, the
+    /// serve layer and the engine's readout. Selection contract is
+    /// documented on [`Instance::revision_at`].
+    fn revision_query(
+        &self,
+        page_id: u64,
+        ts_micros: Option<i64>,
+        want_text: bool,
+    ) -> Result<Option<(RevisionMeta, Option<Vec<u8>>)>> {
+        if page_id >= self.max_chain_id {
+            return Ok(None);
+        }
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        let g = &*g;
+
+        // COUNT(ts) counts non-NULL rows: the page's bookkeeping is
+        // complete iff every row carries a timestamp.
+        let (total, with_ts): (i64, i64) = g
+            .conn
+            .prepare_cached("SELECT COUNT(*), COUNT(ts) FROM revisions_seen WHERE page_id = ?1")?
+            .query_row([page_id as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+
+        // Rows are authoritative only when timestamped AND this session
+        // has no reason to believe the chain diverged from them (a
+        // suspect open or a mid-page import error can leave the chain
+        // AHEAD of the rows — the chain is the data fence, so those
+        // states scan it).
+        let rows_trusted = total > 0 && with_ts == total && !self.suspect && !g.import_errored;
+        if rows_trusted {
+            let target: Option<i64> = match ts_micros {
+                None => g
+                    .conn
+                    .prepare_cached(
+                        "SELECT rev_id FROM revisions_seen WHERE page_id = ?1
+                         ORDER BY ts DESC, rev_id DESC LIMIT 1",
+                    )?
+                    .query_row([page_id as i64], |r| r.get(0))
+                    .map(Some)
+                    .or_else(ignore_no_rows)?,
+                Some(tau) => g
+                    .conn
+                    .prepare_cached(
+                        "SELECT rev_id FROM revisions_seen WHERE page_id = ?1 AND ts <= ?2
+                         ORDER BY ts DESC, rev_id DESC LIMIT 1",
+                    )?
+                    .query_row(rusqlite::params![page_id as i64, tau], |r| r.get(0))
+                    .map(Some)
+                    .or_else(ignore_no_rows)?,
+            };
+            match target {
+                Some(rev_id) => {
+                    if let Some(hit) = find_revision(&g.depot, page_id, rev_id as u64, want_text)? {
+                        return Ok(Some(hit));
+                    }
+                    // The named revision is not on the chain: sqlite got
+                    // ahead of the depot (rows durable, frames lost in a
+                    // crash) and this page wasn't repaired yet. Fall
+                    // through to the chain scan — the chain is truth.
+                }
+                // Complete, trusted rows and none qualifies: the page
+                // did not exist at τ. No frame is touched at all.
+                None => return Ok(None),
+            }
+        }
+
+        // Fallback: stream the whole chain (one frame resident at a
+        // time), argmax over (ts, rev_id) — and, when rows exist but
+        // predate the ts column, backfill them inside one transaction
+        // so the NEXT read takes the indexed path. Rows the chain
+        // doesn't confirm are never invented here; suspect-mode import
+        // repair owns row re-derivation.
+        let backfill = total > 0 && with_ts < total;
+        if backfill {
+            g.conn.execute("BEGIN IMMEDIATE", [])?;
+        }
+        let result = (|| {
+            let mut fill = if backfill {
+                Some(g.conn.prepare_cached(
+                    "UPDATE revisions_seen SET ts = ?3
+                     WHERE page_id = ?1 AND rev_id = ?2 AND ts IS NULL",
+                )?)
+            } else {
+                None
+            };
+            scan_best(&g.depot, page_id, ts_micros, want_text, &mut |rev_id, ts| {
+                if let Some(st) = fill.as_mut() {
+                    st.execute(rusqlite::params![page_id as i64, rev_id as i64, ts])?;
+                }
+                Ok(())
+            })
+        })();
+        if backfill {
+            match &result {
+                Ok(_) => {
+                    g.conn.execute("COMMIT", [])?;
+                }
+                Err(_) => {
+                    let _ = g.conn.execute("ROLLBACK", []);
                 }
             }
-            if best.as_ref().map_or(true, |b| rev_key(&entry.meta) > rev_key(&b.meta)) {
-                best = Some(entry);
-            }
         }
-        match best {
-            Some(entry) => Ok(Some((entry.fetch_text)()?)),
-            None => Ok(None),
-        }
+        result
     }
 
     /// Existence of `title` at τ — the red-link / `#ifexist` fast path.
@@ -602,14 +701,6 @@ fn acquire_root_lock(root: &std::path::Path) -> Result<std::fs::File> {
     Ok(f)
 }
 
-/// Collect every revision record on `chain_id`, newest-first. Walks the
-/// chain the way it was encoded (depot SPEC "The shape of a chain"):
-///   - f0 = newest record, standalone zstd;
-///   - f1 = older records concatenated newest-first, refPrefix-anchored
-///     on f0's record;
-///   - each cold frame is a sealed former accumulator, anchored on the
-///     OLDEST record of the next-newer frame — which is exactly the
-///     last record decoded so far in this newest-first walk.
 /// Total order used to pick the newest revision: latest timestamp wins,
 /// ties broken by higher rev_id. See [`Instance::revision_at`] for why
 /// chain position cannot be used instead.
@@ -617,53 +708,268 @@ fn rev_key(m: &RevisionMeta) -> (i64, u64) {
     (m.ts.timestamp_micros(), m.rev_id)
 }
 
-pub(crate) fn collect_records(depot: &Depot, chain_id: u64) -> Result<Vec<Vec<u8>>> {
-    let mut out = Vec::new();
-    match depot.read_f0(chain_id) {
-        Ok(frame) => out.push(crate::frames::decompress(&frame, None)?),
-        Err(wikimak_depot::Error::NoFrame) => return Ok(out),
-        Err(wikimak_depot::Error::ChainIdOutOfRange) => return Ok(out),
-        Err(e) => return Err(e.into()),
+/// Map rusqlite's no-rows to `Ok(None)` for optional single-row lookups.
+fn ignore_no_rows<T>(e: rusqlite::Error) -> std::result::Result<Option<T>, Error> {
+    match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        e => Err(e.into()),
     }
-    if let Some(f1) = depot.read_f1(chain_id)? {
-        let anchor = out[0].clone();
-        let raw = crate::frames::decompress(&f1, Some(&anchor))?;
-        split_concatenated_records(&raw, &mut out)?;
-    }
-    for cold in depot.cold_iter(chain_id)? {
-        let frame = cold?;
-        let anchor = out.last().expect("cold after f1").clone();
-        let raw = crate::frames::decompress(&frame, Some(&anchor))?;
-        split_concatenated_records(&raw, &mut out)?;
-    }
-    Ok(out)
 }
 
-/// Walk `buf` as zero or more revision records back-to-back; push each
-/// into `out`. Uses the codec's prefix sizes (fixed u32+u32+u64+u64+u64
-/// +u64+u8 = 41 bytes, then 4 varint-prefixed blobs) to compute the
-/// length of each record without copying.
-fn split_concatenated_records(buf: &[u8], out: &mut Vec<Vec<u8>>) -> Result<()> {
-    let mut i = 0;
-    while i < buf.len() {
-        let start = i;
-        // Skip fixed prefix: 4 + 4 + 8 + 8 + 8 + 8 + 1 = 41.
-        const FIXED: usize = 4 + 4 + 8 + 8 + 8 + 8 + 1;
-        if i + FIXED > buf.len() {
-            return Err(Error::Codec("truncated record fixed prefix"));
-        }
-        i += FIXED;
-        // Four length-prefixed byte fields (contributor, comment, sha1, text).
-        for _ in 0..4 {
-            let (len, n) = crate::revision::decode_varint(buf, i)?;
-            i += n;
-            let len = len as usize;
-            if i + len > buf.len() {
-                return Err(Error::Codec("truncated record payload"));
-            }
-            i += len;
-        }
-        out.push(buf[start..i].to_vec());
+/// Lazy meta.db migration for the per-revision `ts` column (2026-07,
+/// "reads must not decode whole chains"): a db created before the column
+/// existed gets it via ALTER (rows NULL — backfilled per page by the
+/// first read that needs them, see `Instance::revision_query`); fresh
+/// dbs already carry it from the DDL. The (page_id, ts, rev_id) index
+/// makes the head/τ argmax one logarithmic lookup. Runs after the DDL,
+/// BEFORE the index — the index references the column.
+fn ensure_revision_ts_schema(conn: &Connection) -> Result<()> {
+    let has_ts = conn
+        .prepare("PRAGMA table_info(revisions_seen)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .flatten()
+        .any(|name| name == "ts");
+    if !has_ts {
+        conn.execute("ALTER TABLE revisions_seen ADD COLUMN ts INTEGER", [])?;
     }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_revisions_seen_page_ts
+         ON revisions_seen(page_id, ts DESC, rev_id DESC)",
+        [],
+    )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// The streaming chain walk — the ONE decoder every read goes through.
+//
+// A chain is decoded the way it was encoded (depot SPEC "The shape of a
+// chain"): f0 = newest record, standalone zstd; f1 = older records
+// concatenated newest-first, refPrefix-anchored on f0's record; each
+// cold frame is a sealed former accumulator, anchored on the OLDEST
+// record of the next-newer frame — exactly the last record this
+// newest-first walk yielded before crossing the frame boundary. The
+// walk therefore streams: ONE decompressed frame resident at a time,
+// plus the (record-sized) anchor carried across the boundary. Reads
+// that used to `collect_records` the whole decompressed history now pay
+// for the frames up to their early stop and nothing past it.
+// ---------------------------------------------------------------------
+
+/// Resumable newest-first record walk over one chain. Drive it with
+/// [`WalkState::next_record`]; the yielded slice borrows the walk's
+/// current frame buffer — decode it meta-only and copy out at most the
+/// ONE text the read wants.
+pub(crate) struct WalkState {
+    chain_id: u64,
+    /// Snapshot f0/f1/cold-head in one step (under the caller's first
+    /// lock hold) instead of on arrival. Used by the cross-lock
+    /// [`HistoryWalk`] so a concurrent import can't tear the walk;
+    /// under-lock early-stop readers stay lazy so a head read never
+    /// touches f1.
+    eager: bool,
+    frame: WalkFrame,
+}
+
+enum WalkFrame {
+    Start,
+    InFrame {
+        /// Decompressed records of the current frame, newest-first.
+        raw: Vec<u8>,
+        /// Byte offset just past the last yielded record.
+        pos: usize,
+        /// Byte offset of the last yielded record — at frame end this
+        /// is the frame's oldest record, the next frame's anchor.
+        last: usize,
+        /// Compressed f1 frame captured by an eager snapshot, not yet
+        /// walked (Some only while still inside f0).
+        pending_f1: Option<Vec<u8>>,
+        /// Cold walk continuation; `None` until needed (lazy walks).
+        cold: Option<wikimak_depot::ColdCursor>,
+    },
+    Done,
+}
+
+impl WalkState {
+    /// Lazy walk: frames are read only when the walk reaches them. Use
+    /// under a single lock hold (early-stop readers).
+    pub(crate) fn new(chain_id: u64) -> Self {
+        WalkState { chain_id, eager: false, frame: WalkFrame::Start }
+    }
+
+    /// Snapshotting walk: the first step captures f0 + the COMPRESSED
+    /// f1 + the cold head together, so later steps only read immutable
+    /// cold frames. For walks that span lock holds ([`HistoryWalk`]).
+    pub(crate) fn new_snapshot(chain_id: u64) -> Self {
+        WalkState { chain_id, eager: true, frame: WalkFrame::Start }
+    }
+
+    /// Yield the next (newest-first) record, or `None` at chain end.
+    /// The slice borrows this walk; it is invalidated by the next call.
+    pub(crate) fn next_record(&mut self, depot: &Depot) -> Result<Option<&[u8]>> {
+        loop {
+            match &mut self.frame {
+                WalkFrame::Done => return Ok(None),
+                WalkFrame::Start => {
+                    let f0 = match depot.read_f0(self.chain_id) {
+                        Ok(frame) => frame,
+                        Err(wikimak_depot::Error::NoFrame)
+                        | Err(wikimak_depot::Error::ChainIdOutOfRange) => {
+                            self.frame = WalkFrame::Done;
+                            return Ok(None);
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    let raw = crate::frames::decompress(&f0, None)?;
+                    let (pending_f1, cold) = if self.eager {
+                        (depot.read_f1(self.chain_id)?, Some(depot.cold_cursor(self.chain_id)?))
+                    } else {
+                        (None, None)
+                    };
+                    self.frame = WalkFrame::InFrame { raw, pos: 0, last: 0, pending_f1, cold };
+                }
+                WalkFrame::InFrame { raw, pos, .. } if *pos < raw.len() => break,
+                WalkFrame::InFrame { .. } => self.advance_frame(depot)?,
+            }
+        }
+        // Yield phase, separated from the state mutation so the borrow
+        // of `raw` doesn't pin the whole loop.
+        let WalkFrame::InFrame { raw, pos, last, .. } = &mut self.frame else { unreachable!() };
+        let len = crate::revision::record_len(raw, *pos)?;
+        *last = *pos;
+        *pos += len;
+        let (last, pos) = (*last, *pos);
+        Ok(Some(&raw[last..pos]))
+    }
+
+    /// Cross a frame boundary: the current frame is exhausted; its
+    /// oldest record anchors the next frame's refPrefix decode.
+    fn advance_frame(&mut self, depot: &Depot) -> Result<()> {
+        let WalkFrame::InFrame { raw, last, pending_f1, cold, .. } =
+            std::mem::replace(&mut self.frame, WalkFrame::Done)
+        else {
+            return Ok(());
+        };
+        // Keep only the oldest record as the anchor; the frame buffer
+        // itself is dropped before the next frame is decompressed.
+        let anchor = raw[last..].to_vec();
+        drop(raw);
+        // Where are we? `pending_f1 = Some` ⇔ eager walk still in f0
+        // with a captured f1. `cold = None` ⇔ lazy walk still in f0
+        // (f1 unread — a head read that stopped there never touched
+        // it). `cold = Some` with no pending f1 ⇔ already in the tail
+        // (f1 walked or absent): only cold frames remain.
+        let pending_f1 = match (pending_f1, &cold) {
+            (Some(f1), _) => Some(f1),
+            (None, None) => depot.read_f1(self.chain_id)?,
+            (None, Some(_)) => None,
+        };
+        let mut cold = match cold {
+            Some(c) => c,
+            None => depot.cold_cursor(self.chain_id)?,
+        };
+        if let Some(f1) = pending_f1 {
+            let raw = crate::frames::decompress(&f1, Some(&anchor))?;
+            self.frame =
+                WalkFrame::InFrame { raw, pos: 0, last: 0, pending_f1: None, cold: Some(cold) };
+            return Ok(());
+        }
+        match depot.cold_next(&mut cold)? {
+            Some(frame) => {
+                let raw = crate::frames::decompress(&frame, Some(&anchor))?;
+                self.frame =
+                    WalkFrame::InFrame { raw, pos: 0, last: 0, pending_f1: None, cold: Some(cold) };
+            }
+            None => self.frame = WalkFrame::Done,
+        }
+        Ok(())
+    }
+}
+
+/// Find `rev_id` on the chain: newest-first early-stopping walk,
+/// records peeked by fixed offset (no per-record string decode), the
+/// target decoded once and its text copied out only if `want_text`.
+pub(crate) fn find_revision(
+    depot: &Depot,
+    chain_id: u64,
+    rev_id: u64,
+    want_text: bool,
+) -> Result<Option<(RevisionMeta, Option<Vec<u8>>)>> {
+    let mut walk = WalkState::new(chain_id);
+    while let Some(rec) = walk.next_record(depot)? {
+        if crate::revision::peek_rev_id(rec)? == rev_id {
+            let (meta, text) = crate::revision::decode_revision_view(rec)?;
+            let text = if want_text { Some(text.to_vec()) } else { None };
+            return Ok(Some((meta, text)));
+        }
+    }
+    Ok(None)
+}
+
+/// Stream the WHOLE chain and pick argmax over `(ts, rev_id)` among
+/// records with `ts ≤ τ` (all records for `None` τ) — the fallback for
+/// pages whose sqlite rows can't answer. `each` sees every record's
+/// `(rev_id, ts)` (the ts backfill hook). At most one frame plus the
+/// current best record's text (when `want_text`) is resident.
+pub(crate) fn scan_best(
+    depot: &Depot,
+    chain_id: u64,
+    tau: Option<i64>,
+    want_text: bool,
+    each: &mut dyn FnMut(u64, i64) -> Result<()>,
+) -> Result<Option<(RevisionMeta, Option<Vec<u8>>)>> {
+    let mut best: Option<(RevisionMeta, Option<Vec<u8>>)> = None;
+    let mut walk = WalkState::new(chain_id);
+    while let Some(rec) = walk.next_record(depot)? {
+        let rev_id = crate::revision::peek_rev_id(rec)?;
+        let ts = crate::revision::peek_ts(rec)?;
+        each(rev_id, ts)?;
+        if tau.is_some_and(|t| ts > t) {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(b, _)| (ts, rev_id) > rev_key(b)) {
+            let (meta, text) = crate::revision::decode_revision_view(rec)?;
+            best = Some((meta, if want_text { Some(text.to_vec()) } else { None }));
+        }
+    }
+    Ok(best)
+}
+
+/// The streaming iterator behind [`Instance::page_history`]. Owns the
+/// instance handles (`Arc`) so it and its entries' `fetch_text`
+/// closures outlive the borrow of `Instance`; each `next()` locks only
+/// for the step it takes.
+struct HistoryWalk {
+    inner: Arc<Mutex<InstanceInner>>,
+    chain_id: u64,
+    walk: WalkState,
+}
+
+impl Iterator for HistoryWalk {
+    type Item = Result<HistoryEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let meta = {
+            let g = self.inner.lock().expect("instance mutex poisoned");
+            let rec = match self.walk.next_record(&g.depot) {
+                Ok(Some(rec)) => rec,
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            };
+            match crate::revision::decode_revision_view(rec) {
+                Ok((meta, _text)) => meta, // text stays in the frame buffer
+                Err(e) => return Some(Err(e)),
+            }
+        };
+        let inner = Arc::clone(&self.inner);
+        let chain_id = self.chain_id;
+        let rev_id = meta.rev_id;
+        let fetch_text: Box<dyn FnOnce() -> Result<Vec<u8>> + Send> = Box::new(move || {
+            let g = inner.lock().expect("instance mutex poisoned");
+            match find_revision(&g.depot, chain_id, rev_id, true)? {
+                Some((_meta, Some(text))) => Ok(text),
+                _ => Err(Error::Corrupt("revision vanished from its chain")),
+            }
+        });
+        Some(Ok(HistoryEntry { meta, fetch_text }))
+    }
 }

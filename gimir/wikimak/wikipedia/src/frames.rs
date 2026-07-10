@@ -18,10 +18,6 @@ use crate::error::{Error, Result};
 
 const LEVEL: i32 = 3;
 
-fn zerr(_e: zstd::zstd_safe::ErrorCode) -> Error {
-    Error::Codec("zstd frame error")
-}
-
 /// Compress `raw`, optionally refPrefix-anchored on `prefix`.
 pub(crate) fn compress(raw: &[u8], prefix: Option<&[u8]>) -> Result<Vec<u8>> {
     wikimak_depot::compress_frame(raw, prefix, LEVEL)

@@ -157,24 +157,31 @@ fn import_one_page<R: Read>(
     // page's revisions_seen rows may reference frames that never became
     // durable. Re-derive the rows from the CHAIN (the depot is the data
     // fence; bookkeeping must never be ahead of it) once per page.
+    // Streaming: the chain is walked one frame at a time, each record
+    // peeked for (rev_id, ts) and inserted as it goes by — a hot page's
+    // decompressed history is never resident during repair either.
     if instance.suspect && !g.repaired.contains(&page_id) {
-        let actual: Vec<i64> = crate::instance::collect_records(&g.depot, page_id)?
-            .iter()
-            .map(|rec| decode_rev_id(rec))
-            .collect::<Result<_>>()?;
-        g.conn.execute(
+        let inner = &mut *g;
+        inner.conn.execute(
             "DELETE FROM revisions_seen WHERE page_id = ?1",
             params![page_id as i64],
         )?;
-        for rev_id in actual {
-            g.conn.execute(
-                "INSERT OR IGNORE INTO revisions_seen(page_id, rev_id) VALUES(?1, ?2)",
-                params![page_id as i64, rev_id],
-            )?;
+        let mut insert = inner.conn.prepare_cached(
+            "INSERT OR IGNORE INTO revisions_seen(page_id, rev_id, ts) VALUES(?1, ?2, ?3)",
+        )?;
+        let mut walk = crate::instance::WalkState::new(page_id);
+        while let Some(rec) = walk.next_record(&inner.depot)? {
+            insert.execute(params![
+                page_id as i64,
+                crate::revision::peek_rev_id(rec)? as i64,
+                crate::revision::peek_ts(rec)?,
+            ])?;
         }
+        drop(insert);
         g.repaired.insert(page_id);
     }
-    let g = &*g;
+    let mut guard = g;
+    let g = &*guard;
 
     // Begin the per-page transaction.
     g.conn.execute("BEGIN IMMEDIATE", [])?;
@@ -234,9 +241,14 @@ fn import_one_page<R: Read>(
             }
 
             let record = encode_new_revision(rev, stats);
+            // `ts` rides along so reads resolve "newest revision ≤ τ"
+            // in sqlite instead of decoding the chain (instance.rs
+            // `revision_query`).
             g.conn
-                .prepare_cached("INSERT INTO revisions_seen(page_id, rev_id) VALUES(?1, ?2)")?
-                .execute(params![page_id as i64, rev_id as i64])?;
+                .prepare_cached(
+                    "INSERT INTO revisions_seen(page_id, rev_id, ts) VALUES(?1, ?2, ?3)",
+                )?
+                .execute(params![page_id as i64, rev_id as i64, ts])?;
             new_this_page += 1;
 
             // Flush BEFORE the record that would overflow the bound
@@ -288,8 +300,12 @@ fn import_one_page<R: Read>(
         Err(e) => {
             // Rollback sqlite; depot frames already prepended are
             // orphaned (dead bytes), per SPEC's per-page atomicity
-            // contract.
+            // contract. The chain is now AHEAD of the rows for this
+            // page — flag it so reads this session distrust the rows
+            // and scan the chain (the dirty flag already routes the
+            // NEXT session through suspect-mode repair).
             let _ = g.conn.execute("ROLLBACK", []);
+            guard.import_errored = true;
             Err(e)
         }
     }
@@ -601,12 +617,6 @@ pub(crate) fn prepend_depot_frames(
     let new_f1 = crate::frames::compress(&new_f1_raw, Some(head))?;
     g.depot.prepend(chain_id, &new_f0, Some(&new_f1), seal)?;
     Ok(())
-}
-
-/// The rev id of one encoded revision record (suspect-mode repair).
-fn decode_rev_id(rec: &[u8]) -> Result<i64> {
-    let (meta, _text) = crate::revision::decode_revision(rec)?;
-    Ok(meta.rev_id as i64)
 }
 
 fn capture_siteinfo(conn: &rusqlite::Connection, si: &wikimak_mediawiki::SiteInfo) -> Result<()> {

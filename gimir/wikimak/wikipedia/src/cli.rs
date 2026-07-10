@@ -118,9 +118,14 @@ fn cmd_head(root: &str, page: u64) -> Result<(), String> {
     }
 }
 
-fn cmd_text(root: &str, page: u64) -> Result<(), String> {
+fn cmd_text(root: &str, page: u64, asof_micros: Option<i64>) -> Result<(), String> {
     let inst = open_instance(PathBuf::from(root), None)?;
-    match inst.page_head_text(page).map_err(|e| e.to_string())? {
+    let text = match asof_micros {
+        None => inst.page_head_text(page),
+        Some(ts) => inst.page_text_at(page, Some(ts)),
+    }
+    .map_err(|e| e.to_string())?;
+    match text {
         Some(t) => {
             std::io::stdout().write_all(&t).map_err(|e| e.to_string())?;
             Ok(())
@@ -190,7 +195,10 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["head", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_head(root, p)),
         ["text", root, page] => page.parse().map_err(|e| format!("{e}"))
-            .and_then(|p| cmd_text(root, p)),
+            .and_then(|p| cmd_text(root, p, None)),
+        ["text", root, page, asof] => page.parse().map_err(|e| format!("{e}"))
+            .and_then(|p| Ok((p, asof.parse::<i64>().map_err(|e| format!("asof: {e}"))?)))
+            .and_then(|(p, ts)| cmd_text(root, p, Some(ts))),
         ["history", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_history(root, p)),
         _ => Err("usage: wikimak discover <dbname>\n\
@@ -198,7 +206,8 @@ pub fn cli_main(args: &[String]) -> i32 {
                   \x20      wikimak fetch <dbname> <root> [--max-page-id N]\n\
                   \x20      wikimak import <dump.xml[.bz2]> <root> [--max-page-id N]\n\
                   \x20      wikimak serve <root> [addr]        (default 127.0.0.1:8642)\n\
-                  \x20      wikimak head|text|history <root> <page_id>".into()),
+                  \x20      wikimak head|history <root> <page_id>\n\
+                  \x20      wikimak text <root> <page_id> [asof-unix-micros]".into()),
     };
     match r {
         Ok(()) => 0,

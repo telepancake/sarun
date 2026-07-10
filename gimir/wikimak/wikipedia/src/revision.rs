@@ -81,9 +81,19 @@ pub fn encode_revision(meta: &RevisionMeta, text: &[u8]) -> Vec<u8> {
 }
 
 /// Decode one revision record. Returns the metadata + an owned copy of
-/// the text bytes (decoder doesn't borrow from `buf` because callers
-/// usually own a freshly-decompressed `Vec<u8>`).
+/// the text bytes. Prefer [`decode_revision_view`] anywhere the text is
+/// not (or not yet) needed — meta-only consumers must never pay the
+/// text copy (read paths walk records by the thousand).
 pub fn decode_revision(buf: &[u8]) -> Result<(RevisionMeta, Vec<u8>)> {
+    let (meta, text) = decode_revision_view(buf)?;
+    Ok((meta, text.to_vec()))
+}
+
+/// Decode one revision record's metadata, BORROWING the text bytes —
+/// the meta view for walk-style readers. Nothing text-sized is copied;
+/// extract the one text a read actually wants with `.to_vec()` on the
+/// returned slice.
+pub fn decode_revision_view(buf: &[u8]) -> Result<(RevisionMeta, &[u8])> {
     let mut off = 0usize;
     let ver = read_u32_le(buf, &mut off)?;
     if ver != REVISION_SCHEMA_VERSION {
@@ -121,7 +131,7 @@ pub fn decode_revision(buf: &[u8]) -> Result<(RevisionMeta, Vec<u8>)> {
 
     let (text_len, n) = decode_varint(buf, off)?;
     off += n;
-    let text = read_slice(buf, &mut off, text_len as usize)?.to_vec();
+    let text = read_slice(buf, &mut off, text_len as usize)?;
 
     let ts: DateTime<Utc> = Utc
         .timestamp_micros(ts_micros)
@@ -139,6 +149,50 @@ pub fn decode_revision(buf: &[u8]) -> Result<(RevisionMeta, Vec<u8>)> {
         text_len,
     };
     Ok((meta, text))
+}
+
+/// Peek a record's `rev_id` (fixed offset 8, after version + flags)
+/// without decoding anything else — the walk-style readers compare ids
+/// against their target for every record they pass.
+pub(crate) fn peek_rev_id(rec: &[u8]) -> Result<u64> {
+    if rec.len() < 16 {
+        return Err(Error::Codec("truncated record fixed prefix"));
+    }
+    Ok(u64::from_le_bytes(rec[8..16].try_into().unwrap()))
+}
+
+/// Peek a record's timestamp (unix micros; fixed offset 24) without
+/// decoding anything else.
+pub(crate) fn peek_ts(rec: &[u8]) -> Result<i64> {
+    if rec.len() < 32 {
+        return Err(Error::Codec("truncated record fixed prefix"));
+    }
+    Ok(u64::from_le_bytes(rec[24..32].try_into().unwrap()) as i64)
+}
+
+/// Byte length of the record starting at `start` in a buffer of zero or
+/// more concatenated records (codec fixed prefix + four varint-prefixed
+/// blobs). Lets a frame walk step record-to-record without decoding —
+/// and without copying — anything.
+pub(crate) fn record_len(buf: &[u8], start: usize) -> Result<usize> {
+    // Fixed prefix: u32 + u32 + u64 + u64 + u64 + u64 + u8 = 41 bytes.
+    const FIXED: usize = 4 + 4 + 8 + 8 + 8 + 8 + 1;
+    let mut i = start;
+    if i + FIXED > buf.len() {
+        return Err(Error::Codec("truncated record fixed prefix"));
+    }
+    i += FIXED;
+    // Four length-prefixed byte fields (contributor, comment, sha1, text).
+    for _ in 0..4 {
+        let (len, n) = decode_varint(buf, i)?;
+        i += n;
+        let len = len as usize;
+        if i + len > buf.len() {
+            return Err(Error::Codec("truncated record payload"));
+        }
+        i += len;
+    }
+    Ok(i - start)
 }
 
 /// Encode an unsigned LEB128 varint. Exposed for codec tests.
