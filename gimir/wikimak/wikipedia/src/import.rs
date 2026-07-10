@@ -480,9 +480,9 @@ fn ensure_title(
             // same-instant re-run.
             g.conn.execute(
                 "INSERT OR IGNORE INTO title_intervals
-                    (page_id, ns, normalized_title, start_ts, end_ts)
-                 VALUES(?1, ?2, ?3, ?4, NULL)",
-                params![page_id as i64, ns, normalized, start],
+                    (page_id, ns, normalized_title, title_id, start_ts, end_ts)
+                 VALUES(?1, ?2, ?3, ?4, ?5, NULL)",
+                params![page_id as i64, ns, normalized, title_id as i64, start],
             )?;
         }
         Some((open_start, open_title)) => {
@@ -515,9 +515,9 @@ fn ensure_title(
                 )?;
                 g.conn.execute(
                     "INSERT OR IGNORE INTO title_intervals
-                        (page_id, ns, normalized_title, start_ts, end_ts)
-                     VALUES(?1, ?2, ?3, ?4, NULL)",
-                    params![page_id as i64, ns, normalized, start],
+                        (page_id, ns, normalized_title, title_id, start_ts, end_ts)
+                     VALUES(?1, ?2, ?3, ?4, ?5, NULL)",
+                    params![page_id as i64, ns, normalized, title_id as i64, start],
                 )?;
             } else {
                 // A fresh full-history re-export under a new (post-move)
@@ -529,9 +529,9 @@ fn ensure_title(
                 let new_start = start.min(open_start);
                 g.conn.execute(
                     "UPDATE title_intervals
-                        SET normalized_title = ?1, ns = ?2, start_ts = ?3
-                     WHERE page_id = ?4 AND start_ts = ?5 AND end_ts IS NULL",
-                    params![normalized, ns, new_start, page_id as i64, open_start],
+                        SET normalized_title = ?1, ns = ?2, title_id = ?3, start_ts = ?4
+                     WHERE page_id = ?5 AND start_ts = ?6 AND end_ts IS NULL",
+                    params![normalized, ns, title_id as i64, new_start, page_id as i64, open_start],
                 )?;
             }
         }

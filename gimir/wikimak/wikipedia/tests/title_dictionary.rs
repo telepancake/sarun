@@ -221,8 +221,9 @@ fn unmapped_rows_still_resolve_and_list() {
         rusqlite::params![b"Zz Synthetic Only".to_vec()],
     )
     .unwrap();
-    // The insert trigger derived nothing (no dictionary entry) — the
-    // row must be unmapped, which is exactly the state under test.
+    // An external writer supplies no title_id (and the dictionary has
+    // no entry to derive one from) — the row is unmapped, which is
+    // exactly the state under test.
     let unmapped: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM title_intervals WHERE title_id IS NULL",
@@ -254,9 +255,9 @@ fn unmapped_rows_still_resolve_and_list() {
 // legacy_meta_db_backfills_title_id_on_open
 //
 // A meta.db from before the title_id column existed (rebuilt here for
-// real: table recreated without the column, triggers and indexes gone
-// with it) gets column + indexes + triggers + a full backfill at the
-// next open — the same lazy-migration fence as revisions_seen.ts.
+// real: table recreated without the column, its indexes gone with it)
+// gets column + indexes + a full backfill at the next open — the same
+// lazy-migration fence as revisions_seen.ts.
 // ---------------------------------------------------------------------------
 #[test]
 fn legacy_meta_db_backfills_title_id_on_open() {
@@ -314,9 +315,9 @@ fn legacy_meta_db_backfills_title_id_on_open() {
 // retitle_in_place_rekeys_the_interval
 //
 // Import's full-history-re-export rename path UPDATEs the open
-// interval's title in place (import.rs `ensure_title`); the schema-side
-// retitle trigger must re-derive its title_id so dictionary reads see
-// the NEW title and drop the old one.
+// interval's title in place (import.rs `ensure_title`), carrying the
+// new title's dictionary id with it, so dictionary reads see the NEW
+// title and drop the old one.
 // ---------------------------------------------------------------------------
 #[test]
 fn retitle_in_place_rekeys_the_interval() {
@@ -367,8 +368,8 @@ fn retitle_in_place_rekeys_the_interval() {
         "the renamed-away title stops resolving"
     );
 
-    // The trigger's real effect: the open interval row carries the
-    // dictionary id of "New Name", and nothing is left unmapped.
+    // The real effect: the open interval row carries the dictionary id
+    // of "New Name", and nothing is left unmapped.
     let conn = Connection::open(tmp.path().join("meta.db")).unwrap();
     let (row_tid, dict_tid): (i64, i64) = conn
         .query_row(
@@ -381,7 +382,7 @@ fn retitle_in_place_rekeys_the_interval() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(row_tid, dict_tid, "retitle trigger re-derived the title_id");
+    assert_eq!(row_tid, dict_tid, "retitle UPDATE carried the new title_id");
 }
 
 // ---------------------------------------------------------------------------

@@ -972,15 +972,15 @@ fn ensure_revision_ts_schema(conn: &Connection) -> Result<()> {
 ///   * Legacy dbs get the column via ALTER, then a one-shot backfill
 ///     joins each row to `title_id_to_page` on `(ns, normalized_title)`
 ///     — the same fence discipline as `ensure_revision_ts_schema`.
-///   * Import does not write the column yet (the importer's insert list
-///     is unchanged — see the follow-up note in the work order), so two
-///     TRIGGERS keep new rows keyed: AFTER INSERT derives a missing
-///     title_id, and AFTER UPDATE OF (ns, normalized_title) re-derives
-///     it when import's retitle-in-place rename path rewrites a row's
-///     title. Both fire inside import's own per-page transaction, on
-///     whatever connection performs the write. Once import writes the
-///     column itself the triggers become no-ops (INSERT trigger is
-///     WHEN NEW.title_id IS NULL).
+///   * Import writes the column directly (`ensure_title` carries
+///     title_id in every `title_intervals` INSERT and in the
+///     retitle-in-place UPDATE), so no write-path compatibility
+///     machinery remains: the two interim triggers that derived a
+///     missing title_id are DROPPED here (legacy dbs still carry them —
+///     they only existed for the window when import didn't write the
+///     column; the insert one was WHEN NEW.title_id IS NULL, a no-op
+///     since, and the retitle one re-derived the value the UPDATE now
+///     sets itself).
 ///   * A row whose title the dictionary genuinely lacks stays NULL and
 ///     is served by the reads' unmapped-row compatibility branch, whose
 ///     guard is O(1) via the partial index below (an INTEGER index over
@@ -1002,23 +1002,8 @@ fn ensure_title_dictionary_schema(conn: &Connection) -> Result<()> {
              ON page_to_title_id(title_id);
          CREATE INDEX IF NOT EXISTS idx_title_intervals_unmapped
              ON title_intervals(page_id) WHERE title_id IS NULL;
-         CREATE TRIGGER IF NOT EXISTS title_intervals_title_id_insert
-         AFTER INSERT ON title_intervals
-         WHEN NEW.title_id IS NULL
-         BEGIN
-             UPDATE title_intervals SET title_id =
-                 (SELECT title_id FROM title_id_to_page
-                   WHERE ns = NEW.ns AND normalized_title = NEW.normalized_title)
-             WHERE page_id = NEW.page_id AND start_ts = NEW.start_ts;
-         END;
-         CREATE TRIGGER IF NOT EXISTS title_intervals_title_id_retitle
-         AFTER UPDATE OF ns, normalized_title ON title_intervals
-         BEGIN
-             UPDATE title_intervals SET title_id =
-                 (SELECT title_id FROM title_id_to_page
-                   WHERE ns = NEW.ns AND normalized_title = NEW.normalized_title)
-             WHERE page_id = NEW.page_id AND start_ts = NEW.start_ts;
-         END;",
+         DROP TRIGGER IF EXISTS title_intervals_title_id_insert;
+         DROP TRIGGER IF EXISTS title_intervals_title_id_retitle;",
     )?;
     conn.execute(
         "UPDATE title_intervals SET title_id =
