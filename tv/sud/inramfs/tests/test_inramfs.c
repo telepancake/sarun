@@ -276,6 +276,33 @@ static void test_unlink_rename(void)
     teardown_mount();
 }
 
+/* `exec 8<f` is open + dup2 + close-the-original: the surviving fd is
+ * the DUPLICATE, so the dup must carry its own open reference on the
+ * inode — otherwise a later unlink sees refs==0, reclaims the inode,
+ * and reads through the held fd come back empty (the shell idiom
+ * `exec 8<f; rm f; cat <&8` breaks). */
+static void test_dup_holds_unlinked_inode(void)
+{
+    g_curtest = "dup_holds_unlinked_inode";
+    setup_mount("/inramfs", 4, "test_dhui");
+    int fd = (int)sud_inramfs_op_open("/inramfs/held", O_RDWR | O_CREAT, 0644);
+    TASSERT(fd >= 0, "create held");
+    TASSERT_EQ(sud_inramfs_op_write(fd, "HELD", 4), 4, "write");
+    long dup = sud_inramfs_op_dup(fd);
+    TASSERT(dup >= 0, "dup");
+    TASSERT_EQ(sud_inramfs_op_close(fd), 0, "close original");
+    TASSERT_EQ(sud_inramfs_op_unlink("/inramfs/held"), 0, "unlink");
+    char st[256];
+    TASSERT_EQ(sud_inramfs_op_stat("/inramfs/held", st, 1), -ENOENT,
+               "name gone");
+    char buf[8] = {0};
+    TASSERT_EQ(sud_inramfs_op_pread((int)dup, buf, 4, 0), 4,
+               "read via surviving dup");
+    TASSERT(memcmp(buf, "HELD", 4) == 0, "content survives unlink");
+    TASSERT_EQ(sud_inramfs_op_close((int)dup), 0, "close dup");
+    teardown_mount();
+}
+
 static void test_symlink(void)
 {
     g_curtest = "symlink";
@@ -834,6 +861,7 @@ int main(int argc, char **argv)
     test_lseek_holes();
     test_truncate();
     test_unlink_rename();
+    test_dup_holds_unlinked_inode();
     test_symlink();
     test_getdents();
     test_chmod_chown_utimens();

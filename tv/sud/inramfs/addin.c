@@ -950,10 +950,17 @@ static long fdtab_register_dup(struct sud_ir_open_file *src, int newkfd)
     fdtab_init();
     /* Defensive: if newkfd already has an entry (e.g. dup2 onto an
      * inramfs fd), the kernel already closed it on our behalf — drop
-     * the stale entry. */
+     * the stale entry.  Its inode ref is dropped only AFTER the new
+     * slot takes its own ref below: if old and new happen to share the
+     * inode, an unlinked (nlink==0) inode must not see refs dip to 0
+     * mid-dup and get reclaimed. */
+    uint32_t stale_idx = 0;
     {
         struct sud_ir_open_file *stale = fdtab_lookup(newkfd);
-        if (stale) stale->kfd = -1;
+        if (stale) {
+            stale_idx  = stale->inode_idx;
+            stale->kfd = -1;
+        }
         sud_pr_dirfd_forget(newkfd);
     }
     for (int i = 0; i < SUD_IR_FD_TABLE_SIZE; i++) {
@@ -964,6 +971,21 @@ static long fdtab_register_dup(struct sud_ir_open_file *src, int newkfd)
             g_fdtab[i].pos        = src->pos;
             g_fdtab[i].flags      = src->flags;
             g_fdtab[i].dir_cookie = src->dir_cookie;
+            /* The duplicate is one more open reference on the inode —
+             * without it, `exec 8<f` (open + dup2 + close the original)
+             * nets to refs 0, a later unlink reclaims the inode while
+             * fd 8 still reads it, and POSIX unlink-open semantics
+             * break (observed as empty reads through the held fd). */
+            {
+                struct sud_ir_inode *ino = sud_ir_inode_get(src->inode_idx);
+                if (ino) {
+                    struct sud_ir_super *sb = sud_ir_sb();
+                    sud_ir_lock(&sb->lock);
+                    ino->open_refs++;
+                    sud_ir_unlock(&sb->lock);
+                }
+            }
+            if (stale_idx) fdtab_drop_inode_ref(stale_idx);
             /* Inherit the abs-path used to open the source dirfd, if
              * any.  Without this, dup'd directory fds (e.g. those
              * minted by fdopendir, which is what `rm -rf` and many
@@ -977,6 +999,7 @@ static long fdtab_register_dup(struct sud_ir_open_file *src, int newkfd)
             return newkfd;
         }
     }
+    if (stale_idx) fdtab_drop_inode_ref(stale_idx);
     return -EMFILE;
 }
 
