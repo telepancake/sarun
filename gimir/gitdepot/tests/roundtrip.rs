@@ -1202,3 +1202,57 @@ fn tag_at_tree_roundtrips() {
         "update-added standalone tag peels to its tree oid"
     );
 }
+
+/// GITLINKS (submodules): the tree records a commit oid that lives in
+/// ANOTHER repository — it is typically absent from this object store and
+/// must never be fetched. Its variant content IS the oid hex (that is also
+/// what the reconstruction hashes). Surfaced by git.git's
+/// sha1collisiondetection submodule: import died fetching the submodule
+/// commit as a blob.
+#[test]
+fn gitlink_to_absent_commit_roundtrips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    sh_git(&repo, &["init", "-q", "-b", "main"]);
+    sh_git(&repo, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("a.txt"), "alpha\n").unwrap();
+    sh_git(&repo, &["add", "-A"]);
+    // A gitlink at sub/: an oid that exists in NO local object store.
+    let ghost = "19d97bf5af05312267c2e874ee6bcf584d9e9681";
+    sh_git(&repo, &["update-index", "--add", "--cacheinfo",
+                    &format!("160000,{ghost},sub")]);
+    sh_git(&repo, &["commit", "-q", "-m", "with submodule"]);
+    // Advance the submodule pointer in a second commit (the reslot's
+    // changed-blob arm must also not fetch).
+    let ghost2 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    sh_git(&repo, &["update-index", "--add", "--cacheinfo",
+                    &format!("160000,{ghost2},sub")]);
+    sh_git(&repo, &["commit", "-q", "-m", "bump submodule"]);
+
+    let store = tmp.path().join("store");
+    gitdepot::import(&repo, &store, 3).unwrap();
+
+    // Checkout streams the pointer as content (engine skips writing it as a
+    // file; here we assert the stored content IS the oid hex).
+    let ls = gitdepot::store::Store::open(&store).unwrap().union().unwrap();
+    let tip = sh_git(&repo, &["rev-parse", "main"]).trim().to_string();
+    let mut sub = Vec::new();
+    ls.checkout_entries(&tip, b"sub", &mut |_p, m, c| {
+        assert_eq!(m, gitdepot::layer::Mode::Gitlink);
+        sub = c.to_vec();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(sub, ghost2.as_bytes(), "gitlink content is the submodule oid hex");
+    drop(ls);
+
+    // Export reproduces both commits SHA-exact (fast-import M 160000).
+    let out = tmp.path().join("out");
+    let refs = gitdepot::export(&store, &out).unwrap();
+    assert_eq!(
+        refs.iter().find(|r| r.name == "refs/heads/main").unwrap().sha,
+        tip,
+        "gitlink history changed the commit sha"
+    );
+}

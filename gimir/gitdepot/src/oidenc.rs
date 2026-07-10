@@ -215,14 +215,14 @@ fn variant_reverse_node(
         (None, None) => Ok(None),
         (None, Some(_)) => Ok(Some(Node::hole())),
         (Some(bo), None) => {
-            let content = obj.blob(&bo.id.1)?;
+            let content = variant_content(obj, &bo.id)?;
             let bm = eff(&bo.bitmap, prev_live);
             Ok(Some(variant_node(&content, occ_mode_id(&bo.id), bm.as_deref())))
         }
         (Some(bo), Some(ao)) => {
             let mut node = Node::keep();
             if bo.id.1 != ao.id.1 {
-                node.blob = BlobOp::Set(obj.blob(&bo.id.1)?.into());
+                node.blob = BlobOp::Set(variant_content(obj, &bo.id)?.into());
             }
             set_mode_tag(&mut node, occ_mode_id(&bo.id), occ_mode_id(&ao.id));
             let e_before = eff(&bo.bitmap, prev_live);
@@ -237,6 +237,16 @@ fn variant_reverse_node(
 
 fn occ_mode_id(id: &VarKey) -> Mode {
     Mode::from_octal(&id.0).unwrap_or(Mode::File)
+}
+
+/// A variant's frame content: the blob bytes fetched by oid — except a
+/// GITLINK, whose "content" IS the oid hex itself (the submodule commit
+/// lives in another repository and must never be fetched here).
+fn variant_content(obj: &mut dyn Objects, id: &VarKey) -> Result<Bytes> {
+    if occ_mode_id(id) == Mode::Gitlink {
+        return Ok(id.1.as_bytes().to_vec().into());
+    }
+    obj.blob(&id.1)
 }
 
 /// Distribute a directory's per-lane `(old_tree, new_tree)` transitions into
@@ -569,7 +579,7 @@ impl Encoder {
 
         let mut root: BTreeMap<Vec<u8>, Vn> = BTreeMap::new();
         for (path, mode, slot, bm, oid) in flat {
-            let content = obj.blob(&oid)?;
+            let content = variant_content(obj, &(mode.octal(), oid.clone()))?;
             let ebm = eff(&bm, live);
             let segs: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
             let mut cur = &mut root;
