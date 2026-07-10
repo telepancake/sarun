@@ -164,7 +164,9 @@ fn bench_title_lookup_and_substring_search() {
     });
     println!("[bench] substring search AFTER (parallel shard scan): first {sa_first:.0}µs, steady {sa_rest:.0}µs");
 
-    // Sanity: both paths agree on the answer set size.
+    // Sanity: both paths agree on the answer set size — the 100 titles
+    // numbered 099900..099999 are the only ones whose six-digit id
+    // puts "0999" right after "Article ".
     let new_hits = inst.pages(Some("article 0999"), 200).unwrap();
-    assert_eq!(new_hits.len(), 10, "…0999 0..9 → ten hits");
+    assert_eq!(new_hits.len(), 100, "…0999xx → one hundred hits");
 }
