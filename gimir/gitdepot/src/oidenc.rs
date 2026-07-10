@@ -50,6 +50,10 @@ impl Ent {
 pub trait Objects {
     fn tree(&mut self, oid: &str) -> Result<std::sync::Arc<Vec<(Name, Ent)>>>;
     fn blob(&mut self, oid: &str) -> Result<Bytes>;
+    /// Object fetches actually issued — the O(new)-update work measure.
+    fn reads(&self) -> usize {
+        0
+    }
 }
 
 /// Parse the raw bytes of a git tree object into `(name, entry)` pairs.

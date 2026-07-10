@@ -40,7 +40,7 @@
 //! commit's files off that fold with bounded memory.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use depot::{codec, View};
 use wikimak_depot::{
@@ -73,8 +73,8 @@ fn tree_bytes(ents: &[(Vec<u8>, crate::oidenc::Ent)]) -> usize {
     ents.iter().map(|(n, e)| n.len() + e.mode.len() + e.oid.len() + 48).sum::<usize>() + 32
 }
 
-struct Cat<'a> {
-    cat: &'a mut crate::CatFile,
+struct Cat {
+    cat: crate::CatFile,
     trees: HashMap<String, (TreeEnts, usize)>, // oid → (entries, byte size)
     order: std::collections::VecDeque<String>, // FIFO eviction order
     bytes: usize,
@@ -83,13 +83,36 @@ struct Cat<'a> {
     reads: usize,
 }
 
-impl<'a> Cat<'a> {
-    fn new(cat: &'a mut crate::CatFile) -> Self {
-        Cat { cat, trees: HashMap::new(), order: std::collections::VecDeque::new(), bytes: 0, reads: 0 }
+impl Cat {
+    fn new(repo: &Path) -> Result<Self> {
+        Ok(Cat {
+            cat: crate::CatFile::new(repo)?,
+            trees: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            reads: 0,
+        })
     }
 }
 
-impl crate::oidenc::Objects for Cat<'_> {
+/// The encoder's object source for a run: the git repo (a persistent
+/// `cat-file --batch` per reader), or a scanned wire pack's graph — no git
+/// anywhere in that path.
+pub(crate) enum ObjSource {
+    Git(PathBuf),
+    Pack(std::sync::Arc<crate::memgraph::PackGraph>),
+}
+
+impl ObjSource {
+    fn objects(&self) -> Result<Box<dyn crate::oidenc::Objects + Send>> {
+        Ok(match self {
+            ObjSource::Git(repo) => Box::new(Cat::new(repo)?),
+            ObjSource::Pack(pg) => Box::new(crate::memgraph::GraphObjects::new(pg.clone())?),
+        })
+    }
+}
+
+impl crate::oidenc::Objects for Cat {
     fn tree(&mut self, oid: &str) -> Result<TreeEnts> {
         if let Some((t, _)) = self.trees.get(oid) {
             return Ok(t.clone());
@@ -111,6 +134,9 @@ impl crate::oidenc::Objects for Cat<'_> {
     fn blob(&mut self, oid: &str) -> Result<depot::Bytes> {
         self.reads += 1;
         Ok(self.cat.get(oid)?.into())
+    }
+    fn reads(&self) -> usize {
+        self.reads
     }
 }
 
@@ -275,24 +301,24 @@ struct RevWork {
 fn shard_worker(
     shard: u64,
     mut enc: Encoder,
-    repo: &Path,
+    src: &ObjSource,
     depot: &Depot,
     rx: std::sync::mpsc::Receiver<RevWork>,
     bound: u64,
     level: i32,
 ) -> Result<(Encoder, usize)> {
-    let mut cat = crate::CatFile::new(repo)?;
-    let mut objs = Cat::new(&mut cat);
+    let mut objs_box = src.objects()?;
+    let objs = objs_box.as_mut();
     let mut batch: Vec<Vec<u8>> = Vec::new();
     let mut batch_bytes = 0u64;
     let mut live: Vec<u8> = Vec::new();
     for w in rx {
-        let rev = enc.advance_paths(w.pt, &mut objs, &w.prev_live, &w.new_live)?;
+        let rev = enc.advance_paths(w.pt, objs, &w.prev_live, &w.new_live)?;
         live.clone_from(&w.new_live);
         if w.seed_f0 {
             // seal_record IS the §5 frame write: fold the stack, stream the
             // record — no View, no node tree.
-            let f0raw = enc.seal_record(&mut objs, &live)?;
+            let f0raw = enc.seal_record(objs, &live)?;
             let f0 = compress_frame(&f0raw, None, level).map_err(cf)?;
             depot.prepend(shard, &f0, None, false).map_err(|e| cf(e.to_string()))?;
         } else {
@@ -301,7 +327,7 @@ fn shard_worker(
             batch.push(rec);
         }
         if !batch.is_empty() && batch_bytes >= bound {
-            let head = enc.seal_record(&mut objs, &live)?;
+            let head = enc.seal_record(objs, &live)?;
             let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
             seal_prepend(depot, shard, &head, &staged, level)?;
             batch_bytes = 0;
@@ -309,11 +335,11 @@ fn shard_worker(
         }
     }
     if !batch.is_empty() {
-        let head = enc.seal_record(&mut objs, &live)?;
+        let head = enc.seal_record(objs, &live)?;
         let staged: Vec<Vec<u8>> = batch.drain(..).rev().collect();
         seal_prepend(depot, shard, &head, &staged, level)?;
     }
-    Ok((enc, objs.reads))
+    Ok((enc, objs.reads()))
 }
 
 /// Encode revisions `range` onto the depot and seal every shard's remaining
@@ -329,8 +355,8 @@ fn run_shards(
     depot: &Depot,
     encs: Vec<Encoder>,
     bits: u32,
-    repo: &Path,
-    objs: &mut Cat,
+    src: &ObjSource,
+    objs: &mut dyn crate::oidenc::Objects,
     plan: &LanePlan,
     tree_of: &HashMap<String, String>,
     sha_of: &[String],
@@ -344,16 +370,14 @@ fn run_shards(
     use std::sync::Arc;
     let n = encs.len();
     let per_shard_bound = (batch_bound / n as u64).max(1);
-    let repo_buf = repo.to_path_buf();
 
     std::thread::scope(|scope| -> Result<(Vec<Encoder>, usize)> {
         let mut txs = Vec::with_capacity(n);
         let mut handles = Vec::with_capacity(n);
         for (s, enc) in encs.into_iter().enumerate() {
             let (tx, rx) = std::sync::mpsc::sync_channel::<RevWork>(64);
-            let repo_ref = &repo_buf;
             handles.push(scope.spawn(move || {
-                shard_worker(s as u64, enc, repo_ref, depot, rx, per_shard_bound, level)
+                shard_worker(s as u64, enc, src, depot, rx, per_shard_bound, level)
             }));
             txs.push(tx);
         }
@@ -625,14 +649,14 @@ impl LaneStore {
         let shard_bits = shard_bits_param();
         let n_shards = 1u64 << shard_bits;
         let depot = open_depot(dir, n_shards)?;
-        let mut cat = crate::CatFile::new(repo)?;
-        let mut objs = Cat::new(&mut cat); // one persistent tree cache
+        let src = ObjSource::Git(repo.to_path_buf());
+        let mut objs = Cat::new(repo)?; // one persistent tree cache
         let encs: Vec<Encoder> = (0..n_shards).map(|_| Encoder::new()).collect();
         let mut st = RunState { lane_tree: vec![None; plan.width], live: Vec::new() };
         let mut reads = 0usize;
         if plan.n_rev > 0 {
             let (_encs, worker_reads) = run_shards(
-                &depot, encs, shard_bits, repo, &mut objs, &plan, &tree_of, &sha_of,
+                &depot, encs, shard_bits, &src, &mut objs, &plan, &tree_of, &sha_of,
                 0..plan.n_rev, &mut st, batch_ram_bound(), level, true,
             )?;
             reads = objs.reads + worker_reads;
@@ -740,8 +764,8 @@ impl LaneStore {
 
         let depot = existing.depot;
         let shard_bits = existing.shard_bits;
-        let mut cat = crate::CatFile::new(repo)?;
-        let mut objs = Cat::new(&mut cat);
+        let src = ObjSource::Git(repo.to_path_buf());
+        let mut objs = Cat::new(repo)?;
         // Reconstruct each shard's encoder at the boundary from its stored
         // f0 + the boundary lane trees.
         let (encs, lane_tree, live) =
@@ -749,7 +773,7 @@ impl LaneStore {
         let mut st = RunState { lane_tree, live };
         // Advance ONLY the new revisions (O(new)); prepend their reverse deltas.
         let (_encs, worker_reads) = run_shards(
-            &depot, encs, shard_bits, repo, &mut objs, &plan, &tree_of, &order,
+            &depot, encs, shard_bits, &src, &mut objs, &plan, &tree_of, &order,
             old_n..plan.n_rev, &mut st, batch_ram_bound(), level, false,
         )?;
         let reads = objs.reads + worker_reads;
@@ -762,6 +786,164 @@ impl LaneStore {
         Ok((LaneStore { depot, shard_bits, n_rev: plan.n_rev, lane_of: plan.lane_of, sha_of: order, tag_rev, sha_to_rev, refs }, new_revs, reads))
     }
 
+    /// Encode ONE self-contained received pack straight into a union store
+    /// — no git repo anywhere in the path (the direct-from-wire pipeline):
+    /// ids were hashed by the pack scan, trees and topology come from the
+    /// graph (listings + parent pointers), blob bytes from the transient
+    /// pack file, and `refs` is the fetch dialogue's `(name, sha)`
+    /// advertisement. Returns the store and the object-fetch count.
+    pub fn encode_pack_union_stats(
+        pack: &Path,
+        refs: &[(String, String)],
+        dir: &Path,
+        level: i32,
+    ) -> Result<(LaneStore, usize)> {
+        let pg = std::sync::Arc::new(crate::memgraph::build_pack(pack)?);
+        let g = &pg.graph;
+
+        // Resolve each ref through tag chains: a commit binds the ref, a
+        // tree is a §8 tag-at-tree revision, anything else is refused
+        // loudly (same rule as the git-side import).
+        let mut ref_commits: Vec<(String, u32)> = Vec::new();
+        let mut tree_tags: Vec<(String, String)> = Vec::new(); // (name, tree oid)
+        for (name, sha) in refs {
+            let mut slot = g
+                .slot_of_hex(sha)
+                .ok_or_else(|| cf(format!("ref {name}: {sha} not in pack")))?;
+            let mut hops = 0;
+            while g.is_tag(slot) {
+                slot = g.tag_target(slot);
+                hops += 1;
+                if hops > 32 {
+                    return Err(cf(format!("ref {name}: tag chain too deep")));
+                }
+            }
+            if g.is_commit(slot) {
+                ref_commits.push((name.clone(), slot));
+            } else if g.is_tree(slot) {
+                tree_tags.push((name.clone(), g.sha_hex(slot)));
+            } else {
+                return Err(cf(format!("ref {name} peels to neither commit nor tree")));
+            }
+        }
+
+        // Reachable commits, parents-first, deterministic: Kahn's ordering
+        // with the ready set keyed by sha. Out-of-pack parents (shallow
+        // cuts) drop, same as the rev-list path.
+        let mut indeg: HashMap<u32, usize> = HashMap::new();
+        let mut stack: Vec<u32> = ref_commits.iter().map(|(_, s)| *s).collect();
+        while let Some(s) = stack.pop() {
+            if indeg.contains_key(&s) {
+                continue;
+            }
+            let (_, ps) = g.commit_parts(s);
+            let in_pack: Vec<u32> = ps.iter().copied().filter(|&p| g.is_commit(p)).collect();
+            indeg.insert(s, in_pack.len());
+            stack.extend(in_pack);
+        }
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &s in indeg.keys() {
+            let (_, ps) = g.commit_parts(s);
+            for &p in ps.iter().filter(|&&p| g.is_commit(p)) {
+                children.entry(p).or_default().push(s);
+            }
+        }
+        let total = indeg.len();
+        let mut ready: std::collections::BTreeSet<(String, u32)> = indeg
+            .iter()
+            .filter(|&(_, &d)| d == 0)
+            .map(|(&s, _)| (g.sha_hex(s), s))
+            .collect();
+        let mut order_slots: Vec<u32> = Vec::with_capacity(total);
+        while let Some((_, s)) = ready.pop_first() {
+            order_slots.push(s);
+            if let Some(kids) = children.get(&s) {
+                for &k in kids {
+                    let d = indeg.get_mut(&k).expect("child in scope");
+                    *d -= 1;
+                    if *d == 0 {
+                        ready.insert((g.sha_hex(k), k));
+                    }
+                }
+            }
+        }
+        if order_slots.len() != total {
+            return Err(cf("pack: commit graph has a cycle (corrupt)".into()));
+        }
+
+        let mut sha_of: Vec<String> = order_slots.iter().map(|&s| g.sha_hex(s)).collect();
+        let idx_of: HashMap<String, usize> =
+            sha_of.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
+        let mut parents: Vec<Vec<usize>> = order_slots
+            .iter()
+            .map(|&s| {
+                let (_, ps) = g.commit_parts(s);
+                ps.iter()
+                    .filter(|&&p| g.is_commit(p))
+                    .map(|&p| idx_of[&g.sha_hex(p)])
+                    .collect()
+            })
+            .collect();
+        let mut tree_of: HashMap<String, String> = order_slots
+            .iter()
+            .map(|&s| (g.sha_hex(s), g.sha_hex(g.commit_parts(s).0)))
+            .collect();
+
+        // Tag-at-tree revisions append after the commits, one per distinct
+        // tagged tree — parentless root lanes (§8), exactly the repo path.
+        let n_commits = sha_of.len();
+        let mut seen_sha: std::collections::HashSet<String> = sha_of.iter().cloned().collect();
+        for (_name, tree) in &tree_tags {
+            if seen_sha.insert(tree.clone()) {
+                sha_of.push(tree.clone());
+                parents.push(Vec::new());
+                tree_of.insert(tree.clone(), tree.clone());
+            }
+        }
+        let tag_rev: Vec<bool> = (0..sha_of.len()).map(|i| i >= n_commits).collect();
+
+        let plan = plan_from_parents(&parents);
+        let shard_bits = shard_bits_param();
+        let n_shards = 1u64 << shard_bits;
+        let depot = open_depot(dir, n_shards)?;
+        let src = ObjSource::Pack(pg.clone());
+        let mut objs = crate::memgraph::GraphObjects::new(pg.clone())?;
+        let encs: Vec<Encoder> = (0..n_shards).map(|_| Encoder::new()).collect();
+        let mut st = RunState { lane_tree: vec![None; plan.width], live: Vec::new() };
+        let mut reads = 0usize;
+        if plan.n_rev > 0 {
+            let (_encs, worker_reads) = run_shards(
+                &depot, encs, shard_bits, &src, &mut objs, &plan, &tree_of, &sha_of,
+                0..plan.n_rev, &mut st, batch_ram_bound(), level, true,
+            )?;
+            reads = crate::oidenc::Objects::reads(&objs) + worker_reads;
+        }
+
+        let sha_to_rev: HashMap<String, usize> =
+            sha_of.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
+        let mut live: HashMap<String, String> = ref_commits
+            .iter()
+            .map(|(name, slot)| (name.clone(), g.sha_hex(*slot)))
+            .collect();
+        for (name, tree) in &tree_tags {
+            live.insert(name.clone(), tree.clone());
+        }
+        live.retain(|_, sha| sha_to_rev.contains_key(sha));
+        persist_meta(dir, plan.n_rev, &plan.lane_of, &sha_of, &tag_rev, &parents, &live, shard_bits)?;
+        Ok((
+            LaneStore {
+                depot,
+                shard_bits,
+                n_rev: plan.n_rev,
+                lane_of: plan.lane_of,
+                sha_of,
+                tag_rev,
+                sha_to_rev,
+                refs: live,
+            },
+            reads,
+        ))
+    }
 
     /// Reopen a persisted lane store from `dir` alone — no repo access.
     /// The combined-state chain lives in `dir/depot` (reopened) and the

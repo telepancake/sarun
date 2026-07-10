@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 fn usage() -> i32 {
     eprintln!(
-        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--shard-bits B] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal] [--whole]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>\n       gitdepot union <git-repo> <store-dir> [--level N] [--shard-bits B]\n       gitdepot union-update <git-repo> <store-dir> [--level N]\n       gitdepot union-verify <git-repo> <store-dir> [stride]\n       gitdepot memgraph <git-repo>"
+        "usage: gitdepot import <git-repo> <store-dir> [--level N] [--shard-bits B] [--report]\n       gitdepot update <git-repo> <store-dir> [--level N]\n       gitdepot mirror <url> <root-dir> [--frugal] [--whole]\n       gitdepot list <mirrors-root>\n       gitdepot log <store-dir>\n       gitdepot export <store-dir> <new-repo-dir>\n       gitdepot union <git-repo> <store-dir> [--level N] [--shard-bits B]\n       gitdepot union-update <git-repo> <store-dir> [--level N]\n       gitdepot union-verify <git-repo> <store-dir> [stride]\n       gitdepot memgraph <git-repo | file.pack>\n       gitdepot pack-union <file.pack> <refs-file> <store-dir> [--level N] [--shard-bits B]"
     );
     2
 }
@@ -202,6 +202,27 @@ pub fn cli_main(args: &[String]) -> i32 {
         }
         ("memgraph", [repo]) => {
             crate::memgraph::report(&PathBuf::from(repo)).map(|s| println!("{s}"))
+        }
+        ("pack-union", [pack, refs_file, store, rest @ ..]) => {
+            let Some(rest) = take_shard_bits(rest) else { return usage() };
+            let level = match &rest[..] {
+                [] => 3,
+                [flag, n] if flag == "--level" => match n.parse() {
+                    Ok(v) => v,
+                    Err(_) => return usage(),
+                },
+                _ => return usage(),
+            };
+            let refs = match std::fs::read_to_string(refs_file) {
+                Ok(t) => crate::parse_ref_lines(&t),
+                Err(e) => {
+                    eprintln!("gitdepot: {refs_file}: {e}");
+                    return 1;
+                }
+            };
+            crate::pack_union(&PathBuf::from(pack), &refs, &PathBuf::from(store), level).map(|o| {
+                println!("{} revisions, {} lanes, {} bytes on disk", o.n_rev, o.n_lanes, o.on_disk);
+            })
         }
         ("union-verify", [repo, store, rest @ ..]) => {
             let stride = match rest {

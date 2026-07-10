@@ -2042,6 +2042,36 @@ pub fn union_import(repo: &Path, store: &Path, level: i32) -> Result<UnionOutcom
     Ok(UnionOutcome { n_rev, n_lanes, on_disk: dir_size(store) })
 }
 
+/// The direct-from-wire path: encode a SELF-CONTAINED pack (a `no-thin`
+/// fetch's payload) into a union store with no git repo in between. `refs`
+/// is the `(name, sha)` set from the fetch dialogue (or `ls-remote`).
+pub fn pack_union(
+    pack: &Path,
+    refs: &[(String, String)],
+    store: &Path,
+    level: i32,
+) -> Result<UnionOutcome> {
+    let (s, _reads) = crate::lanestore::LaneStore::encode_pack_union_stats(pack, refs, store, level)?;
+    let n_rev = s.n_rev();
+    let n_lanes = (0..n_rev).map(|r| s.lane_of(r)).max().map(|m| m as usize + 1).unwrap_or(0);
+    Ok(UnionOutcome { n_rev, n_lanes, on_disk: dir_size(store) })
+}
+
+/// Parse `git ls-remote`-shaped ref lines: `<sha>\t<name>`, skipping the
+/// symbolic `HEAD` and the `^{}` peeled duplicates (peeling is ours).
+pub fn parse_ref_lines(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let (sha, name) = l.split_once(['\t', ' '])?;
+            let name = name.trim();
+            if name == "HEAD" || name.ends_with("^{}") || sha.len() < 40 {
+                return None;
+            }
+            Some((name.to_string(), sha.to_string()))
+        })
+        .collect()
+}
+
 /// Incrementally update the union store at `store` from `repo` (§11) — folds
 /// only the new commits' union deltas onto the stored boundary, O(new).
 pub fn union_update(repo: &Path, store: &Path, level: i32) -> Result<UnionOutcome> {

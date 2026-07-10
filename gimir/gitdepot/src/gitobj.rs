@@ -139,7 +139,18 @@ impl Pack {
 /// A positioned reader over a pack's zlib stream: `read_at` chunks fed to a
 /// raw `flate2::Decompress` until StreamEnd (the compressed length is not
 /// recorded — the stream is self-terminating).
-fn inflate_at(file: &std::fs::File, mut pos: u64, size_hint: usize) -> Result<Vec<u8>> {
+pub(crate) fn inflate_at(file: &std::fs::File, pos: u64, size_hint: usize) -> Result<Vec<u8>> {
+    Ok(inflate_at_counted(file, pos, size_hint)?.0)
+}
+
+/// [`inflate_at`], also returning the COMPRESSED length consumed — the wire
+/// pack records no per-entry compressed size, so a sequential scan needs it
+/// to find the next entry.
+pub(crate) fn inflate_at_counted(
+    file: &std::fs::File,
+    mut pos: u64,
+    size_hint: usize,
+) -> Result<(Vec<u8>, u64)> {
     let mut z = flate2::Decompress::new(true);
     let mut out = Vec::with_capacity(size_hint.max(64));
     let mut buf = [0u8; 16 * 1024];
@@ -158,7 +169,7 @@ fn inflate_at(file: &std::fs::File, mut pos: u64, size_hint: usize) -> Result<Ve
             .map_err(|e| ge(format!("object zlib: {e}")))?;
         pos += z.total_in() - before_in;
         match status {
-            flate2::Status::StreamEnd => return Ok(out),
+            flate2::Status::StreamEnd => return Ok((out, z.total_in())),
             flate2::Status::Ok | flate2::Status::BufError => {
                 if out.len() == out.capacity() {
                     out.reserve(64 * 1024);
@@ -171,7 +182,7 @@ fn inflate_at(file: &std::fs::File, mut pos: u64, size_hint: usize) -> Result<Ve
 }
 
 /// Apply a git pack delta (`base` + delta ops → object bytes).
-fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     let mut p = 0usize;
     let mut varint = || -> Result<u64> {
         let mut v = 0u64;
