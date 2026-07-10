@@ -3,12 +3,22 @@
 /// All DDL statements applied at `Instance::open` time. Each statement is
 /// `CREATE TABLE IF NOT EXISTS` so reopen is idempotent.
 pub const META_DDL: &[&str] = &[
+    // `title_id` keys the interval to the strpool title dictionary
+    // (title_id_to_page.title_id) so reads resolve a title by dense id
+    // — never by scanning this table's `normalized_title` BLOB (the
+    // third copy of every title; kept for the write-side derivation
+    // and the legacy backfill only). Import does not write the column
+    // yet: schema-side triggers derive it on INSERT/retitle, and
+    // `ensure_title_dictionary_schema` (instance.rs) adds + backfills
+    // it on legacy dbs — the same lazy-migration discipline as the
+    // revisions_seen.ts column.
     "CREATE TABLE IF NOT EXISTS title_intervals (
         page_id INTEGER NOT NULL,
         ns INTEGER NOT NULL,
         normalized_title BLOB NOT NULL,
         start_ts INTEGER NOT NULL,
         end_ts INTEGER,
+        title_id INTEGER,
         PRIMARY KEY(page_id, start_ts)
     ) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS title_id_to_page (

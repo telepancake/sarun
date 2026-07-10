@@ -25,6 +25,7 @@ pub mod serve;
 pub mod schema;
 #[cfg(feature = "fetch")]
 pub mod sync;
+pub(crate) mod titles;
 
 pub use error::{Error, Result};
 pub use instance::{

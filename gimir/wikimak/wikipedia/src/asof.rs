@@ -388,6 +388,17 @@ fn lang_from_db_name(db_name: &str) -> String {
         .to_string()
 }
 
+// Render-time link resolution cost model: the renderer calls these
+// per link/transclusion AS IT DISCOVERS them (template expansion can
+// mint links, so the "whole link set" does not exist up front — there
+// is nothing to pre-batch). Batching happens one level down instead:
+// every title resolves through the instance's bounded shard cache
+// (`titles::TitleCache`), so a render's link set costs at most ONE
+// decompress-walk per touched title shard — the first link landing in
+// a shard warms its map, every later link in that shard is a hash
+// probe — and a repeat render at the same (or another) τ re-walks
+// nothing while the cache stays warm. Pinned by
+// tests/title_dictionary.rs `render_walks_each_touched_shard_at_most_once`.
 #[cfg(feature = "serve")]
 impl wikimak_wikitext::PageStore for AsOfView<'_> {
     fn page_text(&self, title: &wikimak_wikitext::Title) -> Option<String> {

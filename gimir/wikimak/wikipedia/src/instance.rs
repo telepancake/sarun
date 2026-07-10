@@ -167,8 +167,22 @@ pub(crate) struct InstanceInner {
     /// then distrust the rows and scan the chain, exactly like a
     /// suspect open would after the crash-equivalent state.
     pub(crate) import_errored: bool,
+    /// Bounded LRU of decompressed-and-indexed title shards (exact
+    /// title → dense ids). See `titles::TitleCache` — this is what
+    /// makes a render's link set cost at most one shard walk per
+    /// touched shard.
+    pub(crate) title_cache: crate::titles::TitleCache,
     /// The root's flock, held for the instance's lifetime.
     pub(crate) _lock: std::fs::File,
+}
+
+impl InstanceInner {
+    /// Dense title-dictionary ids whose pool bytes equal `normalized`
+    /// — the exact-title read primitive. One fnv-picked shard at most;
+    /// cache hits touch no pool file at all.
+    pub(crate) fn title_ids(&mut self, shard_count: u32, normalized: &[u8]) -> Result<Vec<u64>> {
+        self.title_cache.lookup(&self.titles, shard_count, normalized)
+    }
 }
 
 impl Instance {
@@ -209,6 +223,7 @@ impl Instance {
             conn.execute(stmt, [])?;
         }
         ensure_revision_ts_schema(&conn)?;
+        ensure_title_dictionary_schema(&conn)?;
         let suspect: bool = conn
             .query_row(
                 "SELECT value FROM instance_flags WHERE key = 'dirty'",
@@ -226,6 +241,7 @@ impl Instance {
                 repaired: Default::default(),
                 dirty_stamped: false,
                 import_errored: false,
+                title_cache: crate::titles::TitleCache::new(crate::titles::TITLE_CACHE_BUDGET),
                 _lock: lock,
             })),
             suspect,
@@ -302,33 +318,115 @@ impl Instance {
         self.inner.lock().expect("instance mutex poisoned").depot.read_counts()
     }
 
+    /// Cumulative depot bytes written this session (frame appends,
+    /// eviction copies, pointer patches, index flips) — the numerator
+    /// of the import write-amplification MEASUREMENT (forward build
+    /// ≈ 1.0×, prepend path higher; see the forward_build tests).
+    pub fn depot_bytes_written(&self) -> u64 {
+        self.inner.lock().expect("instance mutex poisoned").depot.bytes_written()
+    }
+
     /// List `(page_id, title)` pairs, title-ordered, optionally filtered
     /// by a case-insensitive substring. The answer to "which pages do I
     /// have?" — ids alone are not a UI.
+    ///
+    /// Titles come from the sharded strpool dictionary, scanned in
+    /// parallel across ALL shards (`titles::scan_candidates`) with the
+    /// same lossy-UTF-8 lowercase `contains` filter this method has
+    /// always applied; the byte ordering equals the old
+    /// `ORDER BY normalized_title`. Each matched title resolves to its
+    /// page through the INTEGER-keyed `title_id` hop — reads never scan
+    /// `title_intervals.normalized_title`. Memory is bounded by the
+    /// scan window (≤ threads × `limit` candidates), never the corpus.
     pub fn pages(&self, filter: Option<&str>, limit: usize)
         -> Result<Vec<(u64, String)>>
     {
         let g = self.inner.lock().expect("instance mutex poisoned");
-        // Open intervals only: a page renamed away keeps its old title as a
-        // closed interval, which must not surface as a current page.
-        let mut st = g.conn.prepare(
-            "SELECT page_id, normalized_title FROM title_intervals
-             WHERE end_ts IS NULL
-             ORDER BY normalized_title")?;
-        let rows = st.query_map([], |r| Ok((
-            r.get::<_, i64>(0)? as u64, r.get::<_, Vec<u8>>(1)?)))?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let needle = filter.map(str::to_lowercase);
-        let mut out = Vec::new();
-        for row in rows.flatten() {
-            let title = String::from_utf8_lossy(&row.1).into_owned();
-            if let Some(n) = &needle {
-                if !title.to_lowercase().contains(n) {
-                    continue;
+        let matches = |bytes: &[u8]| -> bool {
+            match &needle {
+                None => true,
+                Some(n) => String::from_utf8_lossy(bytes).to_lowercase().contains(n.as_str()),
+            }
+        };
+
+        // Open intervals only: a page renamed away keeps its old title
+        // as a closed interval, which must not surface as current.
+        let mut open_rows = g.conn.prepare_cached(
+            "SELECT page_id FROM title_intervals
+             WHERE title_id = ?1 AND end_ts IS NULL
+             ORDER BY page_id",
+        )?;
+
+        // Degenerate compatibility set: open rows the dictionary does
+        // not know (rows written outside import, e.g. synthetic test
+        // fixtures; empty on any imported store — O(1) via the partial
+        // index). Collected once, merged into the ordered walk below.
+        let mut extras: Vec<(Vec<u8>, u64)> = Vec::new();
+        if has_unmapped_interval_rows(&g.conn)? {
+            let mut st = g.conn.prepare(
+                "SELECT normalized_title, page_id FROM title_intervals
+                 WHERE title_id IS NULL AND end_ts IS NULL",
+            )?;
+            let rows = st
+                .query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)? as u64)))?;
+            for row in rows {
+                let (bytes, pid) = row?;
+                if matches(&bytes) {
+                    extras.push((bytes, pid));
                 }
             }
-            out.push((row.0, title));
-            if out.len() >= limit {
-                break;
+            extras.sort();
+        }
+        let mut extras = extras.into_iter().peekable();
+
+        let mut out: Vec<(u64, String)> = Vec::new();
+        let mut window: Option<crate::titles::Candidate> = None;
+        loop {
+            let pass = crate::titles::scan_candidates(
+                &g.titles,
+                self.title_shard_count,
+                &matches,
+                limit - out.len(),
+                window.as_ref(),
+            )?;
+            for cand in &pass.candidates {
+                // Extras that sort at or before this candidate go first.
+                while out.len() < limit
+                    && extras.peek().is_some_and(|e| e.0.as_slice() <= cand.0.as_slice())
+                {
+                    let (bytes, pid) = extras.next().expect("peeked");
+                    out.push((pid, String::from_utf8_lossy(&bytes).into_owned()));
+                }
+                if out.len() >= limit {
+                    break;
+                }
+                let title = String::from_utf8_lossy(&cand.0).into_owned();
+                let pids = open_rows
+                    .query_map([cand.1 as i64], |r| r.get::<_, i64>(0))?
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                for pid in pids {
+                    out.push((pid as u64, title.clone()));
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            match (out.len() >= limit, pass.next_window) {
+                (true, _) | (false, None) => break,
+                (false, Some(bound)) => window = Some(bound),
+            }
+        }
+        // Extras past the last dictionary candidate.
+        while out.len() < limit {
+            match extras.next() {
+                Some((bytes, pid)) => {
+                    out.push((pid, String::from_utf8_lossy(&bytes).into_owned()))
+                }
+                None => break,
             }
         }
         Ok(out)
@@ -337,15 +435,68 @@ impl Instance {
     /// Resolve a page by exact title, else by unique case-insensitive
     /// substring. `Err(TitleAmbiguous)`-free by design: ambiguity comes
     /// back as `Ok(None)` plus the candidates for the caller to show.
+    ///
+    /// The exact hit goes through the title dictionary (one shard, no
+    /// pool-wide scan) — it can no longer be shadowed by 16 earlier
+    /// substring matches the way the old scan-then-find could miss it.
     pub fn page_by_title(&self, title: &str) -> Result<TitleResolution> {
         let all = self.pages(Some(title), 16)?;
         if let Some(hit) = all.iter().find(|(_, t)| t == title) {
             return Ok((Some(hit.0), all));
         }
+        if let Some(id) = self.exact_current_page_id(title.as_bytes())? {
+            return Ok((Some(id), all));
+        }
         match all.as_slice() {
             [(id, _)] => Ok((Some(*id), all)),
             _ => Ok((None, all)),
         }
+    }
+
+    /// The page currently holding EXACTLY `normalized` (open interval),
+    /// resolved through the dictionary: fnv-picked shard → dense ids →
+    /// integer-keyed interval rows. The smallest matching page id wins
+    /// (deterministic where the old scan order was not).
+    fn exact_current_page_id(&self, normalized: &[u8]) -> Result<Option<u64>> {
+        let mut g = self.inner.lock().expect("instance mutex poisoned");
+        let g = &mut *g;
+        let ids = g.title_ids(self.title_shard_count, normalized)?;
+        let mut best: Option<u64> = None;
+        for id in &ids {
+            let pid: Option<i64> = g
+                .conn
+                .prepare_cached(
+                    "SELECT page_id FROM title_intervals
+                     WHERE title_id = ?1 AND end_ts IS NULL
+                     ORDER BY page_id LIMIT 1",
+                )?
+                .query_row([*id as i64], |r| r.get(0))
+                .map(Some)
+                .or_else(ignore_no_rows)?;
+            if let Some(pid) = pid {
+                best = Some(best.map_or(pid as u64, |b| b.min(pid as u64)));
+            }
+        }
+        if best.is_none() && has_unmapped_interval_rows(&g.conn)? {
+            best = g
+                .conn
+                .prepare_cached(
+                    "SELECT page_id FROM title_intervals
+                     WHERE title_id IS NULL AND normalized_title = ?1 AND end_ts IS NULL
+                     ORDER BY page_id LIMIT 1",
+                )?
+                .query_row(rusqlite::params![normalized], |r| r.get::<_, i64>(0))
+                .map(|v| Some(v as u64))
+                .or_else(ignore_no_rows)?;
+        }
+        Ok(best)
+    }
+
+    /// Strpool per-shard walk counters for the titles pool —
+    /// instrumentation for the title-read acceptance tests (an exact
+    /// lookup touches ONE shard; a substring search touches all).
+    pub fn title_scan_counts(&self) -> Vec<u64> {
+        self.inner.lock().expect("instance mutex poisoned").titles.scan_counts()
     }
 
     // --- asof-τ read API (browsing plan §2, the wayback contract) ---
@@ -370,50 +521,113 @@ impl Instance {
     /// predates interval bookkeeping), fall back to the current
     /// title→page mapping. A title that HAS interval rows but none
     /// covering τ resolves to `None` — it did not exist at τ.
+    ///
+    /// Resolution is dictionary-first: the trimmed title's fnv-picked
+    /// strpool shard yields its dense ids (one shard walk, cached), and
+    /// every sqlite hop below is an INTEGER-keyed indexed lookup —
+    /// `title_intervals.normalized_title` is never scanned. Rows the
+    /// dictionary does not know (written outside import; none exist on
+    /// an imported store) are covered by an O(1)-guarded compatibility
+    /// branch over the unmapped-row set.
     pub fn page_id_by_title_at(&self, title: &str, ts_micros: Option<i64>) -> Result<Option<u64>> {
         let ts = match ts_micros {
-            None => return Ok(self.page_by_title(title)?.0),
+            None => {
+                // Exact-first through the dictionary: the common link-
+                // resolution case costs one shard probe, not the
+                // pool-wide substring scan `page_by_title` performs for
+                // its candidate list.
+                if let Some(id) = self.exact_current_page_id(title.as_bytes())? {
+                    return Ok(Some(id));
+                }
+                return Ok(self.page_by_title(title)?.0);
+            }
             Some(ts) => ts,
         };
         let key = title.trim().as_bytes().to_vec();
-        let g = self.inner.lock().expect("instance mutex poisoned");
-        let hit: Option<i64> = g
-            .conn
-            .query_row(
-                "SELECT page_id FROM title_intervals
-                 WHERE normalized_title = ?1
-                   AND start_ts <= ?2
-                   AND (end_ts IS NULL OR end_ts > ?2)
-                 ORDER BY start_ts DESC LIMIT 1",
-                rusqlite::params![key, ts],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(id) = hit {
+        let mut g = self.inner.lock().expect("instance mutex poisoned");
+        let g = &mut *g;
+        let ids = g.title_ids(self.title_shard_count, &key)?;
+        let unmapped = has_unmapped_interval_rows(&g.conn)?;
+        // The τ window per id: start_ts <= τ AND (end_ts IS NULL OR
+        // end_ts > τ), newest interval wins — same window SQL as ever,
+        // keyed by title_id via idx_title_intervals_title_id.
+        let mut hit: Option<(i64, i64)> = None; // (start_ts, page_id), max by start_ts
+        for id in &ids {
+            let row: Option<(i64, i64)> = g
+                .conn
+                .prepare_cached(
+                    "SELECT start_ts, page_id FROM title_intervals
+                     WHERE title_id = ?1
+                       AND start_ts <= ?2
+                       AND (end_ts IS NULL OR end_ts > ?2)
+                     ORDER BY start_ts DESC LIMIT 1",
+                )?
+                .query_row(rusqlite::params![*id as i64, ts], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(Some)
+                .or_else(ignore_no_rows)?;
+            if let Some(row) = row {
+                if hit.is_none_or(|h| row.0 > h.0) {
+                    hit = Some(row);
+                }
+            }
+        }
+        if unmapped {
+            let row: Option<(i64, i64)> = g
+                .conn
+                .prepare_cached(
+                    "SELECT start_ts, page_id FROM title_intervals
+                     WHERE title_id IS NULL AND normalized_title = ?1
+                       AND start_ts <= ?2
+                       AND (end_ts IS NULL OR end_ts > ?2)
+                     ORDER BY start_ts DESC LIMIT 1",
+                )?
+                .query_row(rusqlite::params![key, ts], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(Some)
+                .or_else(ignore_no_rows)?;
+            if let Some(row) = row {
+                if hit.is_none_or(|h| row.0 > h.0) {
+                    hit = Some(row);
+                }
+            }
+        }
+        if let Some((_, id)) = hit {
             return Ok(Some(id as u64));
         }
         // Distinguish "title has interval rows, none cover τ" (→ None,
         // did not exist at τ) from "no interval rows at all" (→ fall back
         // to the current mapping, for pre-interval imports).
-        let any_interval: i64 = g.conn.query_row(
-            "SELECT COUNT(*) FROM title_intervals WHERE normalized_title = ?1",
-            rusqlite::params![key],
-            |r| r.get(0),
-        )?;
+        let mut any_interval: i64 = 0;
+        for id in &ids {
+            any_interval += g
+                .conn
+                .prepare_cached("SELECT COUNT(*) FROM title_intervals WHERE title_id = ?1")?
+                .query_row([*id as i64], |r| r.get::<_, i64>(0))?;
+        }
+        if any_interval == 0 && unmapped {
+            any_interval += g.conn.query_row(
+                "SELECT COUNT(*) FROM title_intervals
+                 WHERE title_id IS NULL AND normalized_title = ?1",
+                rusqlite::params![key],
+                |r| r.get::<_, i64>(0),
+            )?;
+        }
         if any_interval > 0 {
             return Ok(None);
         }
-        let current: Option<i64> = g
-            .conn
-            .query_row(
-                "SELECT p.page_id FROM page_to_title_id p
-                 JOIN title_id_to_page t ON t.title_id = p.title_id
-                 WHERE t.normalized_title = ?1
-                 LIMIT 1",
-                rusqlite::params![key],
-                |r| r.get(0),
-            )
-            .ok();
+        let mut current: Option<i64> = None;
+        for id in &ids {
+            current = g
+                .conn
+                .prepare_cached(
+                    "SELECT page_id FROM page_to_title_id WHERE title_id = ?1 LIMIT 1",
+                )?
+                .query_row([*id as i64], |r| r.get(0))
+                .map(Some)
+                .or_else(ignore_no_rows)?;
+            if current.is_some() {
+                break;
+            }
+        }
         // Fall back to the untimed mapping ONLY for a genuinely pre-interval
         // page (no title_intervals rows at all). If the resolved page IS
         // interval-tracked but none of its intervals carry this title, the
@@ -749,6 +963,83 @@ fn ensure_revision_ts_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
     Ok(())
+}
+
+/// Lazy meta.db migration for `title_intervals.title_id` (2026-07,
+/// "wire the title dictionary"): reads resolve titles by dense strpool
+/// id, so every interval row must carry the id of its title.
+///
+///   * Legacy dbs get the column via ALTER, then a one-shot backfill
+///     joins each row to `title_id_to_page` on `(ns, normalized_title)`
+///     — the same fence discipline as `ensure_revision_ts_schema`.
+///   * Import does not write the column yet (the importer's insert list
+///     is unchanged — see the follow-up note in the work order), so two
+///     TRIGGERS keep new rows keyed: AFTER INSERT derives a missing
+///     title_id, and AFTER UPDATE OF (ns, normalized_title) re-derives
+///     it when import's retitle-in-place rename path rewrites a row's
+///     title. Both fire inside import's own per-page transaction, on
+///     whatever connection performs the write. Once import writes the
+///     column itself the triggers become no-ops (INSERT trigger is
+///     WHEN NEW.title_id IS NULL).
+///   * A row whose title the dictionary genuinely lacks stays NULL and
+///     is served by the reads' unmapped-row compatibility branch, whose
+///     guard is O(1) via the partial index below (an INTEGER index over
+///     rows that are empty on any imported store — not a text index
+///     entrenching the redundant title copy).
+fn ensure_title_dictionary_schema(conn: &Connection) -> Result<()> {
+    let has_title_id = conn
+        .prepare("PRAGMA table_info(title_intervals)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .flatten()
+        .any(|name| name == "title_id");
+    if !has_title_id {
+        conn.execute("ALTER TABLE title_intervals ADD COLUMN title_id INTEGER", [])?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_title_intervals_title_id
+             ON title_intervals(title_id, start_ts);
+         CREATE INDEX IF NOT EXISTS idx_page_to_title_id_title
+             ON page_to_title_id(title_id);
+         CREATE INDEX IF NOT EXISTS idx_title_intervals_unmapped
+             ON title_intervals(page_id) WHERE title_id IS NULL;
+         CREATE TRIGGER IF NOT EXISTS title_intervals_title_id_insert
+         AFTER INSERT ON title_intervals
+         WHEN NEW.title_id IS NULL
+         BEGIN
+             UPDATE title_intervals SET title_id =
+                 (SELECT title_id FROM title_id_to_page
+                   WHERE ns = NEW.ns AND normalized_title = NEW.normalized_title)
+             WHERE page_id = NEW.page_id AND start_ts = NEW.start_ts;
+         END;
+         CREATE TRIGGER IF NOT EXISTS title_intervals_title_id_retitle
+         AFTER UPDATE OF ns, normalized_title ON title_intervals
+         BEGIN
+             UPDATE title_intervals SET title_id =
+                 (SELECT title_id FROM title_id_to_page
+                   WHERE ns = NEW.ns AND normalized_title = NEW.normalized_title)
+             WHERE page_id = NEW.page_id AND start_ts = NEW.start_ts;
+         END;",
+    )?;
+    conn.execute(
+        "UPDATE title_intervals SET title_id =
+             (SELECT title_id FROM title_id_to_page t
+               WHERE t.ns = title_intervals.ns
+                 AND t.normalized_title = title_intervals.normalized_title)
+         WHERE title_id IS NULL",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Do any `title_intervals` rows lack a dictionary id? O(1) via the
+/// partial index; `false` on every imported store, so the reads'
+/// compatibility branches cost one point query and nothing more.
+fn has_unmapped_interval_rows(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM title_intervals WHERE title_id IS NULL)",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? != 0)
 }
 
 // ---------------------------------------------------------------------
