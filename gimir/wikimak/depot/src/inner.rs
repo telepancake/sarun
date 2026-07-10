@@ -33,8 +33,10 @@ const COLD_FILE_ID: u32 = 0;
 /// advisory (eviction picks victims by it; per-frame liveness is always
 /// re-checked against the index during eviction itself), so an
 /// unreadable or stale-fenced sidecar degrades to a rebuild, never to
-/// misread data.
-const COUNTERS_MAGIC: &str = "wikimak-depot-counters v1";
+/// misread data. v2 added the cold dead-byte count to the `cold` line
+/// (`delete_chain` accounting); a v1 sidecar fails the magic and
+/// degrades to the same one-time rebuild.
+const COUNTERS_MAGIC: &str = "wikimak-depot-counters v2";
 
 /// One open f0 or f1 data file, with append-cursor and dead-byte count.
 struct DataFile {
@@ -163,6 +165,15 @@ pub struct DepotInner {
     f1: Tier,
     cold_file: File,
     cold_len: u64,
+    /// Cold-file bytes belonging to no reachable chain (frames of
+    /// `delete_chain`d chains, plus — on a counter rebuild — every
+    /// frame whose chain's index slot is empty). Cold is append-only
+    /// and never compacted, so these bytes are NOT reclaimed; the
+    /// counter exists so a future cold compaction has the numbers.
+    /// Advisory like the tier counters, and a LOWER bound: orphan
+    /// cold frames of still-live chains (crashed seals/builds) are
+    /// not attributed.
+    cold_dead: u64,
     /// Bytes written outside the tiers since open: cold appends,
     /// in-place pointer patches, index flips — the rest of the
     /// write-amplification account (see `bytes_written`).
@@ -246,11 +257,15 @@ impl DepotInner {
         // the store after the last persist), rebuild ONCE from frame
         // HEADERS (never payloads) and persist. See SPEC §"Open".
         let loaded = load_counters(&cfg.root, &mut f0, &mut f1, cold_len);
-        let rebuilt_on_open = !loaded;
-        if !loaded {
-            rebuild_dead_f0(&mut f0, &index)?;
-            rebuild_dead_f1(&mut f1, &index, &f0)?;
-        }
+        let rebuilt_on_open = loaded.is_none();
+        let cold_dead = match loaded {
+            Some(cold_dead) => cold_dead,
+            None => {
+                rebuild_dead_f0(&mut f0, &index)?;
+                rebuild_dead_f1(&mut f1, &index, &f0)?;
+                rebuild_cold_dead(&cold_file, cold_len, &index)?
+            }
+        };
 
         let inner = Self {
             cfg,
@@ -261,6 +276,7 @@ impl DepotInner {
             f1,
             cold_file,
             cold_len,
+            cold_dead,
             misc_written: 0,
             rebuilt_on_open,
         };
@@ -291,6 +307,12 @@ impl DepotInner {
         out
     }
 
+    /// `(cold_len, cold_dead)` — instrumentation for the delete-chain
+    /// tests (cold bytes are never reclaimed, only accounted).
+    pub fn cold_stats(&self) -> (u64, u64) {
+        (self.cold_len, self.cold_dead)
+    }
+
     /// Write the dead-byte counters sidecar (`<root>/counters`),
     /// tmp+rename so a torn write parses as garbage (→ rebuild) rather
     /// than as stale numbers. Called after flush/collect, when the
@@ -300,7 +322,7 @@ impl DepotInner {
         let mut s = String::with_capacity(64 + 32 * (self.f0.files.len() + self.f1.files.len()));
         s.push_str(COUNTERS_MAGIC);
         s.push('\n');
-        s.push_str(&format!("cold {}\n", self.cold_len));
+        s.push_str(&format!("cold {} {}\n", self.cold_len, self.cold_dead));
         for df in self.f0.files.values() {
             s.push_str(&format!("f0 {} {} {}\n", df.id, df.len, df.dead));
         }
@@ -450,6 +472,71 @@ impl DepotInner {
         if let Some(df) = self.f1.files.get_mut(&f1_fid) {
             df.dead += HEADER_LEN as u64 + f1_zstd.len() as u64;
         }
+        Ok(())
+    }
+
+    /// Delete the chain outright (SPEC §"Chain delete"): mark its f0/f1
+    /// frames dead (eviction/collect then reclaims the bytes), account
+    /// its cold frames in `cold_dead` (cold is append-only — those
+    /// bytes stay on disk until the whole file is unlinked), and zero
+    /// the index slot so the chain reads as empty. Header-only walk —
+    /// no payload is ever read. Deleting an empty chain is a no-op.
+    ///
+    /// Fence discipline: deletion changes NO file length the counters
+    /// sidecar records (only the index slot and the in-memory
+    /// counters), so the length fence alone would NOT notice a crash
+    /// between this mutation and the next persist — stale counters
+    /// would undercount the dead bytes. The sidecar is therefore
+    /// removed FIRST: a crash anywhere from here until the caller's
+    /// next `flush`/`collect` re-persists leaves no sidecar, and the
+    /// next open takes the one-time header rebuild, which derives the
+    /// counters from the index slot as it landed on disk (deleted or
+    /// not — both are consistent states).
+    pub fn delete_chain(&mut self, chain_id: u64) -> Result<()> {
+        let ptr = self.slot_ptr(chain_id)?;
+        if ptr == 0 {
+            return Ok(()); // already empty: idempotent
+        }
+        let _ = std::fs::remove_file(self.cfg.root.join("counters"));
+
+        let (f0_fid, f0_off) = unpack(ptr);
+        let f0_next = read_next_pointer(&self.f0, f0_fid, f0_off)?;
+        let f0_size = HEADER_LEN as u64 + read_zstd_len(&self.f0, f0_fid, f0_off)?;
+        if let Some(df) = self.f0.files.get_mut(&f0_fid) {
+            df.dead += f0_size;
+        }
+        // f0 points at the f1, or (after `seal_f1`) directly at the
+        // cold head, or at nothing.
+        let cold_head = if f0_next == 0 {
+            0
+        } else if is_cold_ptr(f0_next) {
+            f0_next
+        } else {
+            let (f1_fid, f1_off) = unpack(f0_next);
+            let f1_size = HEADER_LEN as u64 + read_zstd_len(&self.f1, f1_fid, f1_off)?;
+            let next = read_next_pointer(&self.f1, f1_fid, f1_off)?;
+            if let Some(df) = self.f1.files.get_mut(&f1_fid) {
+                df.dead += f1_size;
+            }
+            next
+        };
+        // Cold frames: bytes stay (append-only tier, unlinked only
+        // whole) — walk the headers and account them dead.
+        let mut next = cold_head;
+        while next != 0 {
+            let (fid, off) = unpack(next);
+            if fid != COLD_FILE_ID {
+                return Err(Error::Corrupt("cold pointer with nonzero file_id"));
+            }
+            let mut header = [0u8; HEADER_LEN];
+            self.cold_file.read_exact_at(&mut header, off)?;
+            let zstd_len = u64::from_le_bytes(header[16..24].try_into().unwrap());
+            self.cold_dead += HEADER_LEN as u64 + zstd_len;
+            next = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        }
+        // The chain reads as empty from here on. Durability is the
+        // caller's `flush`, like every other mutation.
+        self.index_put(chain_id, 0);
         Ok(())
     }
 
@@ -775,6 +862,7 @@ impl DepotInner {
         self.cold_file.set_len(0)?;
         self.cold_file.sync_data()?;
         self.cold_len = 0;
+        self.cold_dead = 0;
         Ok(())
     }
 
@@ -947,44 +1035,52 @@ fn index_lookup(index: &MmapMut, chain_id: u64) -> u64 {
     u64::from_le_bytes(index[s..s + 8].try_into().unwrap())
 }
 
-/// Load the persisted dead-byte counters into the tiers. Returns false
+/// Load the persisted dead-byte counters into the tiers. Returns `None`
 /// (and leaves the tiers untouched) when the sidecar is missing,
 /// unparseable, or FENCED OFF: every mutation the depot can make
 /// (prepend, seal, evict, delete_all) changes some data-file length,
 /// the file set, or the cold length, so recorded-vs-actual equality of
 /// all three proves the store hasn't been touched since the counters
 /// were persisted — a dirty shutdown (durable writes, no flush) trips
-/// the fence and forces the one-time rebuild.
-fn load_counters(root: &std::path::Path, f0: &mut Tier, f1: &mut Tier, cold_len: u64) -> bool {
-    let Ok(text) = std::fs::read_to_string(root.join("counters")) else {
-        return false;
-    };
+/// the fence and forces the one-time rebuild. (`delete_chain` changes
+/// no length; it removes the sidecar itself as its fence.) On success,
+/// returns the recorded cold dead-byte count.
+fn load_counters(
+    root: &std::path::Path,
+    f0: &mut Tier,
+    f1: &mut Tier,
+    cold_len: u64,
+) -> Option<u64> {
+    let text = std::fs::read_to_string(root.join("counters")).ok()?;
     let mut lines = text.lines();
     if lines.next() != Some(COUNTERS_MAGIC) {
-        return false;
+        return None;
     }
-    let mut cold_rec: Option<u64> = None;
+    let mut cold_rec: Option<(u64, u64)> = None;
     let mut rec_f0: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
     let mut rec_f1: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
     for line in lines {
         let mut it = line.split_ascii_whitespace();
         match (it.next(), it.next(), it.next(), it.next(), it.next()) {
-            (Some("cold"), Some(len), None, ..) => match len.parse() {
-                Ok(v) => cold_rec = Some(v),
-                Err(_) => return false,
-            },
+            (Some("cold"), Some(len), Some(dead), None, ..) => {
+                let (Ok(len), Ok(dead)) = (len.parse(), dead.parse()) else {
+                    return None;
+                };
+                cold_rec = Some((len, dead));
+            }
             (Some(tier @ ("f0" | "f1")), Some(id), Some(len), Some(dead), None) => {
                 let (Ok(id), Ok(len), Ok(dead)) = (id.parse(), len.parse(), dead.parse()) else {
-                    return false;
+                    return None;
                 };
                 let map = if tier == "f0" { &mut rec_f0 } else { &mut rec_f1 };
                 map.insert(id, (len, dead));
             }
-            _ => return false,
+            _ => return None,
         }
     }
-    if cold_rec != Some(cold_len) {
-        return false;
+    let (rec_cold_len, rec_cold_dead) = cold_rec?;
+    if rec_cold_len != cold_len {
+        return None;
     }
     let fence = |tier: &Tier, rec: &BTreeMap<u32, (u64, u64)>| {
         tier.files.len() == rec.len()
@@ -994,7 +1090,7 @@ fn load_counters(root: &std::path::Path, f0: &mut Tier, f1: &mut Tier, cold_len:
                 .all(|df| rec.get(&df.id).is_some_and(|&(len, _)| len == df.len))
     };
     if !fence(f0, &rec_f0) || !fence(f1, &rec_f1) {
-        return false;
+        return None;
     }
     // All fences hold: adopt the counters.
     for df in f0.files.values_mut() {
@@ -1003,7 +1099,7 @@ fn load_counters(root: &std::path::Path, f0: &mut Tier, f1: &mut Tier, cold_len:
     for df in f1.files.values_mut() {
         df.dead = rec_f1[&df.id].1;
     }
-    true
+    Some(rec_cold_dead)
 }
 
 /// Rebuild one tier's dead counters from frame HEADERS only: walk each
@@ -1071,6 +1167,37 @@ fn rebuild_dead_f1(tier: &mut Tier, index: &MmapMut, f0_tier: &Tier) -> Result<(
         tier.files.get_mut(&fid).expect("present").dead = dead;
     }
     Ok(())
+}
+
+/// Rebuild the cold dead-byte count from frame HEADERS only: a cold
+/// frame whose chain's index slot is EMPTY is provably dead (an empty
+/// chain references nothing) — the frames of `delete_chain`d chains
+/// and of abandoned forward builds. Orphan cold frames of still-LIVE
+/// chains (crashed seals, superseded build attempts) cannot be told
+/// apart without walking every live chain, so they are counted live:
+/// the result is a LOWER bound, same advisory standing as the tier
+/// counters. Sequential `header → seek past zstd_len` walk; payloads
+/// are never read.
+fn rebuild_cold_dead(cold_file: &File, cold_len: u64, index: &MmapMut) -> Result<u64> {
+    let mut dead: u64 = 0;
+    // Offset 0 is the reserved pad byte (see `cold_append`).
+    let mut off: u64 = u64::from(cold_len > 0);
+    while off + HEADER_LEN as u64 <= cold_len {
+        let mut header = [0u8; HEADER_LEN];
+        cold_file.read_exact_at(&mut header, off)?;
+        let chain_id = u64::from_le_bytes(header[0..8].try_into().unwrap());
+        let zstd_len = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        let slot = chain_id as usize * INDEX_ENTRY_LEN;
+        // A chain id beyond the index capacity is an empty chain too
+        // (frames are only written after ensure_slot, so this arm is
+        // only reachable via a torn tail — count it dead, advisorily).
+        let live = slot + INDEX_ENTRY_LEN <= index.len() && index_lookup(index, chain_id) != 0;
+        if !live {
+            dead += HEADER_LEN as u64 + zstd_len;
+        }
+        off += HEADER_LEN as u64 + zstd_len;
+    }
+    Ok(dead)
 }
 
 #[cfg(test)]

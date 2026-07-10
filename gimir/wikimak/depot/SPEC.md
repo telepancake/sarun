@@ -101,6 +101,14 @@ operation has to be cheap, and putting cold in one file makes it `rm`.
 
 `file_id` for cold pointers is always 0 (one file, one id).
 
+The honest corollary: bytes that land in cold STAY on disk until the
+whole file is unlinked. `delete_chain` cannot reclaim a dead chain's
+cold frames — it only ACCOUNTS them, in a cold dead-byte counter
+carried in the counters sidecar (see below), so a future cold
+compaction has the numbers. The counter is a lower bound (orphan cold
+frames of still-live chains — crashed seals, abandoned forward builds
+whose id was later rebuilt — are not attributed).
+
 ### f0 / f1 files
 
 Each tier is a directory of files. New files are allocated when the
@@ -125,20 +133,24 @@ enwiki scale, minutes). Plain text, written tmp+rename at every
 durable):
 
 ```
-wikimak-depot-counters v1
-cold <cold_len>
+wikimak-depot-counters v2
+cold <cold_len> <cold_dead_bytes>
 f0 <file_id> <len> <bytes_deprecated>     (one line per f0 file)
 f1 <file_id> <len> <bytes_deprecated>     (one line per f1 file)
 ```
 
 The recorded file set + per-file lengths + cold length ARE the
-dirty-shutdown fence: every mutation the depot can make (prepend,
-seal, evict, delete_all) changes at least one of them, so on `open`
-their equality with disk proves the sidecar describes this exact
-on-disk state. A missing, unparseable, or fenced-off sidecar degrades
-to a ONE-TIME rebuild from frame HEADERS (`header → seek past
-zstd_len`; payloads are never read, so even the rebuild is O(frames)
-small preads, not O(bytes)), which is then persisted.
+dirty-shutdown fence: every LENGTH-moving mutation the depot can make
+(prepend, seal, evict, delete_all) changes at least one of them, so on
+`open` their equality with disk proves the sidecar describes this
+exact on-disk state. The one mutation that moves NO length —
+`delete_chain` — removes the sidecar itself instead (see "Chain
+delete"). A missing, unparseable, or fenced-off sidecar degrades to a
+ONE-TIME rebuild from frame HEADERS (`header → seek past zstd_len`;
+payloads are never read, so even the rebuild is O(frames) small
+preads, not O(bytes)), which is then persisted. The rebuild recomputes
+`cold_dead_bytes` as the total of cold frames whose chain's index slot
+is EMPTY — provably dead; the same lower bound the counter always is.
 
 The sidecar is ADVISORY, which is why this stays simple: eviction uses
 the counters only to pick victims, and re-checks every frame's
@@ -207,6 +219,11 @@ impl Depot {
     /// Session-end compaction: run eviction with the current write file
     /// included (rolled first). See "Eviction".
     pub fn collect(&self) -> Result<()>;
+
+    /// Delete one chain: f0/f1 frames marked dead (reclaimed by
+    /// eviction/collect), cold frames accounted dead (bytes stay —
+    /// cold is append-only), index slot zeroed. See "Chain delete".
+    pub fn delete_chain(&self, chain_id: u64) -> Result<()>;
 
     /// Unlink the depot's cold file and all f0/f1 files; recreate the
     /// index empty and SPARSE (ftruncate — never store zeros through
@@ -404,6 +421,43 @@ Cost per live frame: one verbatim copy + one 8-byte pwrite. Cost per dead
 frame: two 8-byte preads (chain_id, then the f0 next_pointer check for
 T == f1). No decompression. No re-encoding.
 
+### Chain delete (`delete_chain`)
+
+For a chain the CALLER's inventory no longer references — e.g. a
+mirror rebuild that repointed a name onto a fresh chain id, leaving
+the old chain index-live but unreachable from any bookkeeping. Without
+this, such a chain's frames count as live forever and eviction can
+never reclaim them.
+
+`delete_chain(chain_id)`, a header-only walk (no payload reads):
+
+1. Index lookup. `(0,0)` → no-op (idempotent; deleting a never-written
+   or already-deleted id is fine).
+2. Remove the counters sidecar. This IS the delete's crash fence:
+   deletion changes no data-file length, so the ordinary length fence
+   cannot see a crash between the delete and the next persist — stale
+   counters would undercount dead bytes. With the sidecar gone, a
+   crash anywhere before the caller's next `flush`/`collect`
+   re-persists forces the one-time header rebuild, which re-derives
+   every counter from the index slot as it landed on disk (zeroed or
+   not — both are consistent).
+3. Bump `bytes_deprecated` on the files holding the chain's f0 and
+   (if any) f1 by those frames' full sizes. Eviction reclaims them by
+   the ordinary machinery — the zeroed slot makes them provably dead.
+4. Walk the chain's cold frames by header (`next_pointer` chase) and
+   add their sizes to the cold dead-byte counter. The BYTES ARE NOT
+   RECLAIMED: cold is append-only and only ever unlinked whole (see
+   "Cold file") — the counter is the ledger a future cold compaction
+   would start from.
+5. Zero the index slot (one atomic 8-byte mmap write). The chain now
+   reads as empty and the id may be rebuilt from scratch.
+
+Durability, as everywhere, is the caller's `flush()`. A crash before
+the slot-zero is durable un-deletes the chain (intact — nothing else
+was mutated); a crash after leaves it deleted with the counters
+rebuilt on the next open. There is no tombstone and no journal: the
+slot IS the state.
+
 ### Open
 
 1. `mkdir -p` the tier dirs.
@@ -414,10 +468,12 @@ T == f1). No decompression. No re-encoding.
 3. List existing files in f0/, f1/, cold/. Allocate the next file id =
    `max + 1` per tier.
 4. Open the cold file (creating empty if absent).
-5. Load `bytes_deprecated` from the `counters` sidecar (see "Counters
-   sidecar") after checking its fence. If the sidecar is missing or
-   fenced off (dirty shutdown), rebuild ONCE from frame headers — never
-   payloads — and persist.
+5. Load `bytes_deprecated` and the cold dead count from the `counters`
+   sidecar (see "Counters sidecar") after checking its fence. If the
+   sidecar is missing or fenced off (dirty shutdown, crashed
+   `delete_chain`), rebuild ONCE from frame headers — never payloads —
+   (tier liveness against the index; cold dead = frames whose chain
+   slot is empty) and persist.
 6. Done.
 
 Open cost: O(data files) metadata on the sidecar path; O(total FRAMES)

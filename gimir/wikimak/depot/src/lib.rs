@@ -406,6 +406,36 @@ impl Depot {
         g.finish_chain(b.chain_id, b.cold_head, f0, f1)
     }
 
+    /// Delete `chain_id` outright: its f0/f1 frames are marked dead
+    /// (`flush`'s opportunistic eviction / `collect` then reclaims the
+    /// bytes), its cold frames are accounted dead (cold is append-only
+    /// — the bytes stay on disk until the whole cold file is unlinked
+    /// on instance delete; see [`Depot::cold_stats`]), and the index
+    /// slot is zeroed: the chain reads as empty and the id may be
+    /// rebuilt from scratch. Header-only walk — no payload reads.
+    /// Deleting an empty chain is a no-op. This is how a caller
+    /// retires a chain its own inventory no longer references (e.g. a
+    /// rebuild that repointed a name to a fresh chain id).
+    ///
+    /// Durability, as everywhere in the depot, is the caller's
+    /// `flush()`. The counters sidecar is dropped as part of the
+    /// delete (deletion changes no file length, so the ordinary fence
+    /// cannot see it): a crash before the next flush re-persists just
+    /// costs the one-time header rebuild on the next open.
+    pub fn delete_chain(&self, chain_id: u64) -> Result<()> {
+        let mut g = self.inner.lock().expect("depot mutex poisoned");
+        g.delete_chain(chain_id)
+    }
+
+    /// `(cold_len, cold_dead_bytes)` — cold-file accounting. Dead cold
+    /// bytes are never reclaimed in place (the cold tier is append-only
+    /// and only ever unlinked whole); the counter is the honest ledger
+    /// a future cold compaction would start from. Lower bound: orphan
+    /// frames of still-live chains are not attributed.
+    pub fn cold_stats(&self) -> (u64, u64) {
+        self.inner.lock().expect("depot mutex poisoned").cold_stats()
+    }
+
     /// Seal the chain's CURRENT f1 to cold immediately: the f1's zstd
     /// bytes move verbatim to a new cold frame (inheriting the f1's
     /// cold-head pointer) and the chain is left with f0 and no f1 —
