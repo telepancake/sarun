@@ -82,9 +82,12 @@ fn export_xml(n: usize, lines: usize) -> String {
     )
 }
 
-/// `(meta, text)` history newest-first plus a digest of the served
-/// stream — what "reads must be byte-identical" means concretely.
-fn served_history(inst: &Instance) -> (Vec<(u64, i64, Vec<u8>)>, [u8; 20]) {
+/// One served revision: `(rev_id, ts_micros, text)`.
+type Served = (u64, i64, Vec<u8>);
+
+/// History newest-first plus a digest of the served stream — what
+/// "reads must be byte-identical" means concretely.
+fn served_history(inst: &Instance) -> (Vec<Served>, [u8; 20]) {
     let mut out = Vec::new();
     let mut hasher = Sha1::new();
     for entry in inst.page_history(PAGE_ID).unwrap() {
@@ -144,7 +147,7 @@ fn forward_equals_prepend_and_amplification_is_measured() {
     // fresh early-stopping walk and would multiply the counters), and
     // watching the payload-read counters.
     let c0 = a.depot_read_counts();
-    let walked = a.page_history(PAGE_ID).unwrap().map(|e| e.unwrap().meta.rev_id).count();
+    let walked = a.page_history(PAGE_ID).unwrap().inspect(|e| assert!(e.is_ok())).count();
     assert_eq!(walked, N);
     let c1 = a.depot_read_counts();
     let cold_frames = c1.cold - c0.cold;

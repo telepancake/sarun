@@ -108,10 +108,11 @@ fn non_empty_chain_rejected_and_orphans_invisible() {
     assert_eq!(d.read_f0(4).unwrap(), b"sneaky".to_vec(), "live head untouched");
 
     // Abandoned build: frames appended, builder dropped before finish.
-    let mut b = d.begin_chain(5).unwrap();
-    d.append_history_frame(&mut b, b"orphan-1").unwrap();
-    d.append_history_frame(&mut b, b"orphan-2").unwrap();
-    drop(b);
+    {
+        let mut b = d.begin_chain(5).unwrap();
+        d.append_history_frame(&mut b, b"orphan-1").unwrap();
+        d.append_history_frame(&mut b, b"orphan-2").unwrap();
+    }
     assert!(matches!(d.read_f0(5), Err(Error::NoFrame)), "unfinished build must be invisible");
     d.flush().unwrap();
     drop(d);
