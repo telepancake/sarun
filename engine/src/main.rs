@@ -51,6 +51,7 @@ mod oci_verify;
 mod overlay;
 mod paths;
 mod pty;
+mod reader;
 mod review;
 mod rules;
 mod runner;

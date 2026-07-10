@@ -213,6 +213,19 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Key-based cosign signature verification (configured public key). Pure-Rust
 # RustCrypto ECDSA P-256 + PEM SPKI key parsing — no OpenSSL/C, static-musl safe.
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+# Document reader pane (src/reader.rs): HTML → styled terminal lines with a
+# link/heading/fragment index. Markdown goes through pulldown-cmark → HTML →
+# the same html2text path so both formats share one renderer. Measured in the
+# reader eval: +15 crates, ~+1.3MB on the static-musl binary.
+html2text = "0.17"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# The reader's WIKIPEDIA source renders wikimak store pages in-process — the
+# same wikitext→HTML path `wikimak serve` uses (store open_read + AsOfView +
+# render + optional Lua). Both crates are ALREADY compiled into the binary via
+# wikimak_wikipedia's "serve" feature; naming them directly just makes their
+# APIs reachable (no size cost).
+wikimak_wikitext = { path = "../gimir/wikimak/wikitext", package = "wikimak-wikitext" }
+wikimak_scribunto = { path = "../gimir/wikimak/scribunto", package = "wikimak-scribunto" }
 # Structural editing — tree-sitter + a starter pack of grammars. Drives the
 # inspect/write "symbol" locators (path symbol <name>[N]): inspect lists or
 # focuses named definitions; write splices new content into the symbol's
@@ -240,6 +253,12 @@ tree-sitter-bash = "0.25"
 # in the dep graph (which produces "expected (String, Registration<SE>),
 # found (String, Registration<_>)" type-mismatch noise across builtin
 # registration). Once brush-core 0.6 ships to crates.io, drop this.
+[dev-dependencies]
+# reader.rs's wiki test builds a tiny wikimak store in-test (the crate's own
+# acceptance-test recipe: Instance::open + import(new_page_stream) + flush).
+wikimak_mediawiki = { path = "../gimir/wikimak/mediawiki", package = "wikimak-mediawiki", default-features = false }
+tempfile = "3"
+
 [patch.crates-io]
 brush-core               = { path = "vendor/brush-core" }
 brush-builtins           = { path = "vendor/brush-builtins" }
