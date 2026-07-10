@@ -178,7 +178,7 @@ pub(crate) fn scan_candidates(
     if need == 0 {
         return Ok(ScanPass { candidates: Vec::new(), next_window: None });
     }
-    let threads = (shard_count as usize).min(MAX_SCAN_THREADS).max(1);
+    let threads = (shard_count as usize).clamp(1, MAX_SCAN_THREADS);
 
     // Per-thread: max-heap of the `need` smallest seen, plus an
     // overflow bound (everything discarded was >= the final heap max).
