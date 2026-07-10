@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 10 Jul 2026 11:47:06 +0000
+Subject: [PATCH] stall watchdog: exponential backoff per activity; SARUN_STALL_SECS=0 disables
+
+---
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 6e50e7b..9d908dd 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -444,24 +444,50 @@ pub fn activity_snapshot() -> Vec<(String, u64)> {
+         .collect()
+ }
+ 
+-/// Start the watchdog (idempotent). Every 30s, any activity older than
+-/// `stall_secs` is reported through `report` (once per interval, with its
+-/// age) — the report callback decides where it lands (recipe stderr).
++/// Start the watchdog (idempotent). Each activity is reported through
++/// `report` when it first crosses `stall_secs`, then again at DOUBLE the
++/// age each time (600s, 1200s, …) — not on every 30s scan. A -j30 build
++/// whose recipes all legitimately run long (a traced box multiplies
++/// syscall-heavy work) otherwise prints 30 lines every 30 seconds and the
++/// diagnostic drowns the build output it is meant to explain.
++/// `stall_secs == 0` disables the watchdog entirely.
+ pub fn start_stall_watchdog(stall_secs: u64, report: Arc<dyn Fn(&str) + Send + Sync>) {
++    if stall_secs == 0 {
++        return;
++    }
+     static ONCE: std::sync::Once = std::sync::Once::new();
+     ONCE.call_once(move || {
+         std::thread::Builder::new()
+             .name("kati-stall-watchdog".into())
+-            .spawn(move || loop {
+-                std::thread::sleep(std::time::Duration::from_secs(30));
+-                let now = std::time::Instant::now();
+-                for stack in ACTIVITY.lock().values() {
+-                    if let Some((desc, since)) = stack.last() {
++            .spawn(move || {
++                // Per-thread report state: (start of the activity we last
++                // reported, age threshold for its NEXT report). A different
++                // start Instant = a new activity = fresh threshold.
++                let mut seen: HashMap<
++                    std::thread::ThreadId,
++                    (std::time::Instant, u64),
++                > = HashMap::new();
++                loop {
++                    std::thread::sleep(std::time::Duration::from_secs(30));
++                    let now = std::time::Instant::now();
++                    let act = ACTIVITY.lock();
++                    seen.retain(|tid, _| act.contains_key(tid));
++                    for (tid, stack) in act.iter() {
++                        let Some((desc, since)) = stack.last() else {
++                            continue;
++                        };
+                         let age = now.duration_since(*since).as_secs();
+-                        if age >= stall_secs {
++                        let next = match seen.get(tid) {
++                            Some((s, next)) if s == since => *next,
++                            _ => stall_secs,
++                        };
++                        if age >= next {
+                             report(&format!(
+                                 "*kati*: STALL? {age}s without completing: {desc}"
+                             ));
++                            seen.insert(*tid, (*since, next.saturating_mul(2)));
++                        } else {
++                            seen.insert(*tid, (*since, next));
+                         }
+                     }
+                 }

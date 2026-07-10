@@ -55,3 +55,4 @@
 0550-kati--suffix-rules-consult-VPATH-for-the-implied-prerequisit.patch
 0560-bootstrap--set-MAKE-HOST-and-advertise-jobserver-in--FEATURE.patch
 0570-make-role-argv--GNU--i--n-semantics--ignore-errors---dry-run.patch
+0580-stall-watchdog--exponential-backoff-per-activity--SARUN-STAL.patch
