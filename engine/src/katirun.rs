@@ -106,11 +106,18 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
                 out.push(OsString::from(a));
                 i += 1;
             }
+            // -lN attached load limit: advisory; kati accepts and ignores.
+            _ if a.starts_with("-l")
+                && a[2..].chars().all(|c| c.is_ascii_digit() || c == '.') => {
+                out.push(OsString::from(a));
+                i += 1;
+            }
             // Short flags kati's flags.rs knows or that we handle above.
             // -s silent, -r no-builtin-rules, -R no-builtin-variables,
             // -w print-directory, -k keep-going, -n dry-run (GNU: print,
             // don't execute), -i ignore-errors (GNU). Refuse anything else.
-            "-s" | "-r" | "-R" | "-w" | "-k" | "-n" | "-i" => {
+            "-s" | "-r" | "-R" | "-w" | "-k" | "-n" | "-i" | "-B" | "-q"
+            | "-l" => {
                 out.push(OsString::from(a));
                 i += 1;
             }
@@ -227,6 +234,9 @@ fn read_bootstrap_makefile(
 /// visible (GNU make's remake-the-makefile loop).
 struct RunKatiResult {
     remake_active: bool,
+    /// -q: true iff the main-goal exec found anything that WOULD run
+    /// (drives GNU's exit-1 "not up to date" status).
+    would_run: bool,
     /// OPTIONAL (-include) remake targets that did NOT materialize this
     /// pass — the re-run passes them back as `noremake` so they aren't
     /// attempted again (GNU proceeds without an unmakeable optional
@@ -263,6 +273,11 @@ fn run_kati(
     ignore_errors: bool,
     // GNU --trace: per-target run/skip decisions, printed to stderr.
     trace: bool,
+    // GNU -B (rebuild unconditionally) / -q (question probe). Both apply to
+    // the MAIN goals only; makefile remaking stays real (and un-forced, or
+    // -B would re-remake includes every pass and never converge).
+    always_make: bool,
+    question: bool,
     // Optional includes known unmakeable from a previous remake pass —
     // don't queue them again.
     noremake: &std::collections::HashSet<Vec<u8>>,
@@ -656,11 +671,15 @@ fn run_kati(
                 let _ = kati::exec::exec_opts(vec![node], &mut ev, true);
             }
         } else {
-            // GNU -n: print instead of run — but only the MAIN goals; the
-            // remake_active passes above rebuild included makefiles for real.
+            // GNU -n/-B/-q apply to the MAIN goals only; the remake_active
+            // passes above rebuild included makefiles for real.
             ev.dry_run = dry_run;
+            ev.always_make = always_make;
+            ev.question = question;
             kati::exec::exec(nodes, &mut ev)?;
             ev.dry_run = false;
+            ev.always_make = false;
+            ev.question = false;
         }
         ev.finish()?;
     }
@@ -681,7 +700,8 @@ fn run_kati(
         })
         .map(|(sym, _)| sym.as_bytes().to_vec())
         .collect();
-    Ok(RunKatiResult { remake_active, failed_optional })
+    Ok(RunKatiResult { remake_active, failed_optional,
+                       would_run: ev.question_would_run })
 }
 
 /// Walk the kati dep graph reachable from `roots` and ship one
@@ -1229,7 +1249,7 @@ pub fn make_main(argv: &[String]) -> i32 {
                 .map(|s| s.to_vec())
                 .collect())
             .unwrap_or_default();
-    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, &noremake) {
+    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, &noremake) {
         Ok(r) => r,
         Err(e) => {
             // Recipe failure already printed its `*** [target] Error N`; just
@@ -1244,6 +1264,10 @@ pub fn make_main(argv: &[String]) -> i32 {
         }
     };
     flush_makevars();
+    // GNU -q: silent probe — exit 1 when something would be rebuilt.
+    if flags.is_question && run_result.would_run {
+        return 1;
+    }
     let code = 0;
 
     if run_result.remake_active && code == 0 {
@@ -1454,7 +1478,7 @@ pub fn make_builtin(
     // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
     let cmdline_flags = extract_long_flags(argv);
     let mut noremake: std::collections::HashSet<Vec<u8>> = Default::default();
-    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, &noremake);
+    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, &noremake);
     let mut remake_depth = 0u32;
     while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
         remake_depth += 1;
@@ -1470,7 +1494,7 @@ pub fn make_builtin(
         // forever).
         kati::file_cache::clear();
         kati::fileutil::clear_glob_cache();
-        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, &noremake);
+        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, &noremake);
     }
 
     kati::exec::set_recipe_out(prev_out);
@@ -1485,7 +1509,8 @@ pub fn make_builtin(
                 return 2;
             }
             let _ = out.flush();
-            0
+            // GNU -q: silent probe — exit 1 when something would be rebuilt.
+            if flags.is_question && r.would_run { 1 } else { 0 }
         }
         Err(e) => {
             // A recipe failure already emitted its `*** [target] Error N` line

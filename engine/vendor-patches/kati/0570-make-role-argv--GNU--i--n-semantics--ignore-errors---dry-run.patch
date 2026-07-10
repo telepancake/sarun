@@ -5,10 +5,10 @@ Subject: [PATCH] make-role argv: GNU -i/-n semantics (ignore-errors / dry-run)
 
 ---
 diff --git a/src-rs/eval.rs b/src-rs/eval.rs
-index 3dae458..7a8f3c1 100644
+index 3dae458..f186c0b 100644
 --- a/src-rs/eval.rs
 +++ b/src-rs/eval.rs
-@@ -267,6 +267,18 @@ pub struct Evaluator {
+@@ -267,6 +267,25 @@ pub struct Evaluator {
      /// sarun: `.NOTPARALLEL:` was seen — this make's recipes run serially
      /// even when -j / a jobserver is in effect.
      pub not_parallel: bool,
@@ -24,21 +24,31 @@ index 3dae458..7a8f3c1 100644
 +    /// flags.rs). Named goal_trace — `trace` below is the pre-existing
 +    /// variable-assignment tracer.
 +    pub goal_trace: bool,
++    /// sarun: per-make GNU -B (rebuild unconditionally) / -q (question mode:
++    /// run nothing, report via exit status). See flags.rs.
++    pub always_make: bool,
++    pub question: bool,
++    /// sarun: set by the executor after a run — under -q, true iff any
++    /// recipe WOULD have run (drives the exit-1 status).
++    pub question_would_run: bool,
      /// sarun: per-instance global variable bindings, indexed by Symbol id.
      /// Moved off the process-global symbol table (symtab `symbol_data`) so each
      /// Evaluator — i.e. each make invocation — owns its OWN global namespace.
-@@ -370,6 +382,9 @@ impl Evaluator {
+@@ -370,6 +389,12 @@ impl Evaluator {
              rule_vars: HashMap::new(),
              vpath_patterns: Vec::new(),
              not_parallel: false,
 +            dry_run: false,
 +            ignore_errors: false,
 +            goal_trace: false,
++            always_make: false,
++            question: false,
++            question_would_run: false,
              global_vars: Arc::new(Mutex::new(Vec::new())),
              working_dir: std::env::current_dir().unwrap_or_default(),
              include_dirs: Vec::new(),
 diff --git a/src-rs/exec.rs b/src-rs/exec.rs
-index bff8dde..aa98dd4 100644
+index bff8dde..d17e971 100644
 --- a/src-rs/exec.rs
 +++ b/src-rs/exec.rs
 @@ -117,7 +117,7 @@ impl std::fmt::Display for BuildFailed {
@@ -50,7 +60,7 @@ index bff8dde..aa98dd4 100644
  pub enum ExecStatus {
      Processing,
      Timestamp(Option<SystemTime>),
-@@ -146,6 +146,10 @@ struct Executor<'a> {
+@@ -146,6 +146,12 @@ struct Executor<'a> {
      shell: Bytes,
      shellflag: &'static [u8],
      num_commands: u64,
@@ -58,37 +68,40 @@ index bff8dde..aa98dd4 100644
 +    dry_run: bool,
 +    ignore_errors: bool,
 +    trace: bool,
++    always_make: bool,
++    question: bool,
      /// Suppress the "*** [target] Error N" banner (and no-rule notes) —
      /// used when remaking OPTIONAL includes, whose failures GNU swallows
      /// silently.
-@@ -226,6 +230,9 @@ struct RunReq {
+@@ -226,6 +232,10 @@ struct RunReq {
      box_prefix: Bytes,
      /// The pre-run output timestamp to record as this node's result on success.
      result_ts: ExecStatus,
-+    /// Per-make GNU -n / -i (from the Executor; see Evaluator::dry_run).
++    /// Per-make GNU -n / -i / -q (from the Executor; see Evaluator::dry_run).
 +    dry_run: bool,
 +    ignore_errors: bool,
++    question: bool,
  }
  
  /// Build the `export NAME='value'` prefix (newline-terminated) for a target's
-@@ -304,7 +311,8 @@ fn run_node_commands(
+@@ -304,7 +314,8 @@ fn run_node_commands(
      // up-to-date) nodes are correctly left un-started. `req.output` is the node's
      // primary output (== build_edges.outs[0], the engine's match key).
      let output = req.output;
 -    let report = !FLAGS.is_dry_run && !req.commands.is_empty();
-+    let dry_run = FLAGS.is_dry_run || req.dry_run;
++    let dry_run = FLAGS.is_dry_run || req.dry_run || req.question;
 +    let report = !dry_run && !req.commands.is_empty();
      if report {
          crate::fileutil::report_edge(output.as_bytes().as_ref(),
                                       crate::fileutil::EdgePhase::Start, 0, b"");
-@@ -323,12 +331,14 @@ fn run_node_commands(
+@@ -323,12 +334,14 @@ fn run_node_commands(
      };
      let emit = &mut emit as &mut dyn FnMut(&[u8]);
      for command in req.commands {
 -        if command.echo {
 +        // GNU -n prints every command line, INCLUDING @-silenced ones —
-+        // that's the point of a dry run.
-+        if command.echo || dry_run {
++        // that's the point of a dry run. GNU -q prints nothing at all.
++        if (command.echo || dry_run) && !req.question {
              // Echo LIVE, before running, so a hung command's line shows at once.
              emit(&command.cmd);
              emit(b"\n");
@@ -98,7 +111,7 @@ index bff8dde..aa98dd4 100644
              continue;
          }
          // In-process runner gets the exports prefix SEPARATELY (it applies it
-@@ -354,7 +364,8 @@ fn run_node_commands(
+@@ -354,7 +367,8 @@ fn run_node_commands(
                  }
              };
          if !ok {
@@ -108,13 +121,15 @@ index bff8dde..aa98dd4 100644
                  ignored.push((command.output, code));
              } else {
                  failure = Some((command.output, code));
-@@ -375,11 +386,17 @@ impl<'a> Executor<'a> {
+@@ -375,11 +389,21 @@ impl<'a> Executor<'a> {
      fn new(ev: &'a mut Evaluator) -> Result<Self> {
          let shell = ev.get_shell()?;
          let shellflag = ev.get_shell_flag();
 +        let dry_run = ev.dry_run;
 +        let ignore_errors = ev.ignore_errors;
 +        let trace = ev.goal_trace;
++        let always_make = ev.always_make;
++        let question = ev.question;
          Ok(Executor {
              ce: CommandEvaluator::new(ev)?,
              shell,
@@ -123,13 +138,17 @@ index bff8dde..aa98dd4 100644
 +            dry_run,
 +            ignore_errors,
 +            trace,
++            always_make,
++            question,
              quiet_failures: false,
          })
      }
-@@ -536,17 +553,40 @@ list of the rule for '{output}' at {loc}"));
+@@ -535,18 +559,42 @@ list of the rule for '{output}' at {loc}"));
+                 }
              }
          }
-         if output_ts >= latest && !is_phony {
+-        if output_ts >= latest && !is_phony {
++        if output_ts >= latest && !is_phony && !self.always_make {
 +            if self.trace || FLAGS.is_trace {
 +                emit_recipe_err(&format!(
 +                    "--trace: '{output}': skip — up to date \
@@ -164,15 +183,39 @@ index bff8dde..aa98dd4 100644
              output_ts,
 -            Some(RunReq { output, commands, exports, cwd, box_prefix, result_ts: output_ts }),
 +            Some(RunReq { output, commands, exports, cwd, box_prefix, result_ts: output_ts,
-+                          dry_run: self.dry_run, ignore_errors: self.ignore_errors }),
++                          dry_run: self.dry_run, ignore_errors: self.ignore_errors,
++                          question: self.question }),
          ))
      }
  
+@@ -884,9 +932,12 @@ pub fn exec_opts(
+     let cap = if parallel { FLAGS.num_jobs.max(1) } else { 1 };
+     let client = if cap > 1 { client } else { None };
+     executor.exec_graph(roots.clone(), cap, client)?;
++    // sarun: under -q the run is a pure probe — record whether anything
++    // WOULD have run (the exit-1 signal) and stay silent.
++    let would_run = executor.num_commands > 0;
+     // sarun: emit "Nothing to be done" only for roots whose rule has no
+-    // commands at all (or which had no rule).
+-    if executor.num_commands == 0 {
++    // commands at all (or which had no rule) — and never under -q.
++    if executor.num_commands == 0 && !executor.question {
+         for (sym, root) in roots {
+             let node = root.lock();
+             if node.cmds.is_empty() {
+@@ -898,5 +949,7 @@ pub fn exec_opts(
+             }
+         }
+     }
++    drop(executor);
++    ev.question_would_run = would_run;
+     Ok(())
+ }
 diff --git a/src-rs/flags.rs b/src-rs/flags.rs
-index 1faf9b8..32b0bbc 100644
+index 1faf9b8..e94a1ed 100644
 --- a/src-rs/flags.rs
 +++ b/src-rs/flags.rs
-@@ -69,6 +69,17 @@ pub struct Flags {
+@@ -69,6 +69,26 @@ pub struct Flags {
      pub generate_empty_ninja: bool,
      pub is_dry_run: bool,
      pub is_silent_mode: bool,
@@ -187,10 +230,19 @@ index 1faf9b8..32b0bbc 100644
 +    /// runs or is skipped and WHY (up to date / no commands / out of date).
 +    /// sarun's rendering is a diagnosis aid, not byte-parity with GNU's.
 +    pub is_trace: bool,
++    /// -B / --always-make (GNU): consider every target out of date and
++    /// rebuild it. Vendor drivers use it as "force rebuild"; refusing it
++    /// made those sub-makes exit 2 instantly — an invisible nop under a
++    /// driver that ignores sub-make status.
++    pub is_always_make: bool,
++    /// -q / --question (GNU): run nothing, print nothing; exit 0 if the
++    /// goals are up to date, 1 if anything would be rebuilt. Used in
++    /// driver-script guards (`if make -q; then skip; fi`).
++    pub is_question: bool,
      /// -k / --keep-going: on a recipe failure, keep building targets that
      /// don't depend on the failed one; exit non-zero at the end.
      pub is_keep_going: bool,
-@@ -268,6 +279,13 @@ impl Flags {
+@@ -268,6 +288,13 @@ impl Flags {
                  self.is_silent_mode = true;
              } else if tok == b"-k" || tok == b"--keep-going" {
                  self.is_keep_going = true;
@@ -204,16 +256,18 @@ index 1faf9b8..32b0bbc 100644
              } else if !tok.starts_with(b"-") && tok.contains(&b'=') {
                  let var = Bytes::from(tok.to_vec());
                  if !self.cl_vars.contains(&var) {
-@@ -283,6 +301,8 @@ impl Flags {
+@@ -283,6 +310,10 @@ impl Flags {
                          b'R' => self.no_builtin_variables = true,
                          b's' => self.is_silent_mode = true,
                          b'k' => self.is_keep_going = true,
 +                        b'i' => self.is_ignore_errors = true,
 +                        b'n' => self.is_dry_run = true,
++                        b'B' => self.is_always_make = true,
++                        b'q' => self.is_question = true,
                          _ => {}
                      }
                  }
-@@ -309,11 +329,20 @@ impl Flags {
+@@ -309,11 +340,32 @@ impl Flags {
                      should_propagate = false;
                  }
                  b"-c" => flags.is_syntax_check_only = true,
@@ -228,6 +282,18 @@ index 1faf9b8..32b0bbc 100644
 +                    flags.is_dry_run = true
 +                }
 +                b"--trace" => flags.is_trace = true,
++                b"-B" | b"--always-make" => flags.is_always_make = true,
++                b"-q" | b"--question" => flags.is_question = true,
++                // -l/--load-average/--max-load: advisory load limiting; the
++                // slip pool already bounds system-wide parallelism, so accept
++                // and ignore. The limit argument is attached-only (getopt
++                // optional_argument): `-l2.5`, `--load-average=2.5`; a
++                // detached number is a goal, exactly as in GNU make.
++                b"-l" | b"--load-average" | b"--max-load" => {}
++                t if t.starts_with(b"-l")
++                    && t[2..].iter().all(|b| b.is_ascii_digit() || *b == b'.') => {}
++                t if t.starts_with(b"--load-average=")
++                    || t.starts_with(b"--max-load=") => {}
                  b"-s" => flags.is_silent_mode = true,
                  b"-r" => flags.no_builtin_rules = true,
                  b"-R" => flags.no_builtin_variables = true,
@@ -236,6 +302,21 @@ index 1faf9b8..32b0bbc 100644
                  b"-k" | b"--keep-going" => flags.is_keep_going = true,
                  // sarun: GNU make's long forms of -w/its inverse. The kernel's
                  // top Makefile passes --no-print-directory to every sub-make
+diff --git a/testcase/sarun_flag_B_always_make.mk b/testcase/sarun_flag_B_always_make.mk
+new file mode 100644
+index 0000000..eeb9a77
+--- /dev/null
++++ b/testcase/sarun_flag_B_always_make.mk
+@@ -0,0 +1,9 @@
++# GNU -B (--always-make): rebuild even when up to date. kati refused -B
++# outright — the sub-make exited 2 instantly having built nothing, which a
++# driver with unchecked status reads as "make -C = nop".
++$(shell printf 'out:\n\t@echo REBUILT\n\t@touch out\n' > child.mk)
++
++test:
++	@$(MAKE) --no-print-directory -f child.mk out
++	@$(MAKE) --no-print-directory -f child.mk out
++	@$(MAKE) --no-print-directory -f child.mk -B out
 diff --git a/testcase/sarun_flag_i_ignore_errors.mk b/testcase/sarun_flag_i_ignore_errors.mk
 new file mode 100644
 index 0000000..00b3eb3
@@ -267,3 +348,19 @@ index 0000000..572427a
 +test:
 +	@$(MAKE) --no-print-directory -f child.mk -n built.txt
 +	@test -f built.txt && echo "DRY-RUN-VIOLATED" || echo "dry-run-clean"
+diff --git a/testcase/sarun_flag_q_question.mk b/testcase/sarun_flag_q_question.mk
+new file mode 100644
+index 0000000..634fe37
+--- /dev/null
++++ b/testcase/sarun_flag_q_question.mk
+@@ -0,0 +1,10 @@
++# GNU -q (--question): run nothing, print nothing; exit 1 when the goals
++# need rebuilding, 0 when up to date. Driver scripts use it as a guard
++# (`if make -q; then skip; fi`).
++$(shell printf 'out: ; @echo BUILT; touch out\n' > child.mk)
++
++test:
++	@$(MAKE) --no-print-directory -f child.mk -q out; echo "stale rc=$$?"
++	@$(MAKE) --no-print-directory -f child.mk out
++	@$(MAKE) --no-print-directory -f child.mk -q out; echo "fresh rc=$$?"
++	@test -f out && echo "built once" || echo "NEVER BUILT"
