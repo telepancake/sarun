@@ -181,6 +181,17 @@ const DDL: &[&str] = &[
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     ) WITHOUT ROWID",
+    // Chain ids a rebuild retired but the store has not yet deleted. The
+    // doomed id is recorded HERE, inside the same transaction that
+    // repoints the draft onto its fresh chain — so a crash between that
+    // commit and the store's `delete_chain` no longer leaks the old
+    // chain forever: the next update's `sweep_pending_deletes` finds the
+    // row, deletes the chain (idempotent against an already-empty slot),
+    // and clears it. A row is present iff the chain is repointed-away but
+    // still index-live in the depot.
+    "CREATE TABLE IF NOT EXISTS pending_deletes (
+        chain_id INTEGER PRIMARY KEY
+    ) WITHOUT ROWID",
 ];
 
 pub struct Mirror {
@@ -292,6 +303,12 @@ impl Mirror {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
+        // Reclaim any chain a previous run repointed away but crashed
+        // before deleting (the persisted-pending-delete recovery). Runs
+        // before the 304 short-circuit so even a no-change pass sweeps a
+        // prior crash's orphan; the bytes are reclaimed by this run's
+        // (or the next run's, on a 304) end-of-pass collect().
+        self.sweep_pending_deletes()?;
         let mut stats = UpdateStats::default();
         let Some((index, etag, last_modified)) = self.fetch_index_conditional(client, cfg)?
         else {
@@ -465,9 +482,16 @@ impl Mirror {
             )?;
             let mut repoint =
                 tx.prepare_cached("UPDATE drafts SET chain_id = ?2 WHERE name = ?1")?;
+            let mut record_delete = tx
+                .prepare_cached("INSERT OR REPLACE INTO pending_deletes(chain_id) VALUES(?1)")?;
             for d in pending.iter() {
-                if let Some((_, new_chain)) = d.repoint {
+                if let Some((old_chain, new_chain)) = d.repoint {
                     repoint.execute(rusqlite::params![d.name, new_chain as i64])?;
+                    // Record the doomed chain IN the repoint tx: once this
+                    // commits, nothing references the old chain, and a
+                    // crash before the delete below is swept by the next
+                    // run instead of leaking the chain forever.
+                    record_delete.execute(rusqlite::params![old_chain as i64])?;
                 }
                 for (rev, missing) in &d.done {
                     mark.execute(rusqlite::params![d.name, rev, *missing as i64])?;
@@ -475,20 +499,71 @@ impl Mirror {
             }
         }
         tx.commit()?;
-        // The repoints are durable: nothing references the old chains
-        // any more — delete them so their f0/f1 frames become dead
-        // bytes the run-end collect() reclaims (before delete_chain
-        // they stayed index-live forever). Strictly AFTER the commit: a
-        // crash before it must leave the draft on its intact old chain.
-        // A crash between the commit and a delete leaks that one old
-        // chain (this exact window, once) — the accepted remainder.
-        for d in pending.iter() {
-            if let Some((old_chain, _)) = d.repoint {
-                self.store.delete_chain(old_chain)?;
+        // Crash-window test knob: die AFTER the repoint commit, BEFORE
+        // the delete — the leak window BUG 1 closes. The pending_deletes
+        // row is now durable, so the next run's sweep reclaims the chain.
+        if std::env::var_os("IETFMAK_TEST_CRASH_AFTER_REPOINT").is_some() {
+            std::process::abort();
+        }
+        // The repoints are durable: nothing references the old chains any
+        // more — delete them so their f0/f1 frames become dead bytes the
+        // run-end collect() reclaims. Clear each chain's pending_deletes
+        // row only AFTER a flush makes its zeroed slot durable (the same
+        // bytes-before-bookkeeping fence): a crash before that flush
+        // leaves the row, and the next run's sweep re-runs the delete
+        // (idempotent against the now-empty slot).
+        let doomed: Vec<u64> =
+            pending.iter().filter_map(|d| d.repoint.map(|(old, _)| old)).collect();
+        if !doomed.is_empty() {
+            for old in &doomed {
+                self.store.delete_chain(*old)?;
             }
+            self.store.flush()?;
+            let tx = self.conn.transaction()?;
+            {
+                let mut clear =
+                    tx.prepare_cached("DELETE FROM pending_deletes WHERE chain_id = ?1")?;
+                for old in &doomed {
+                    clear.execute(rusqlite::params![*old as i64])?;
+                }
+            }
+            tx.commit()?;
         }
         pending.clear();
         Ok(())
+    }
+
+    /// Reclaim chains a previous run repointed away but died before
+    /// deleting (the persisted `pending_deletes` rows). `delete_chain` is
+    /// idempotent against an already-empty slot, so re-sweeping a chain
+    /// the crashed run had in fact already zeroed is a harmless no-op.
+    /// Self-contained and crash-safe: delete every recorded chain, flush
+    /// the store (durable slot-zeroing), THEN clear the rows — a crash
+    /// before the flush simply re-sweeps next run. Returns how many rows
+    /// were swept (0 on the clean common path).
+    #[cfg(feature = "fetch")]
+    fn sweep_pending_deletes(&mut self) -> Result<u64> {
+        let ids: Vec<u64> = {
+            let mut st = self.conn.prepare("SELECT chain_id FROM pending_deletes")?;
+            let rows = st.query_map([], |r| r.get::<_, i64>(0).map(|v| v as u64))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        for id in &ids {
+            self.store.delete_chain(*id)?;
+        }
+        self.store.flush()?;
+        let tx = self.conn.transaction()?;
+        {
+            let mut clear = tx.prepare_cached("DELETE FROM pending_deletes WHERE chain_id = ?1")?;
+            for id in &ids {
+                clear.execute(rusqlite::params![*id as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(ids.len() as u64)
     }
 
     /// Set/clear the crash-window dirty flag, durably (WAL checkpoint —

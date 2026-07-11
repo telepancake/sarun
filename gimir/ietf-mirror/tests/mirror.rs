@@ -16,8 +16,9 @@
 //!   - reopen from disk serves the same data (durability).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -164,6 +165,18 @@ fn serve_one(
 
 fn mirror(tmp: &TempDir) -> Mirror {
     Mirror::open(MirrorConfig::new(tmp.path().join("m"))).unwrap()
+}
+
+/// Open the mirror's depot directly (raw-frame / tier-byte inspection).
+/// The mirror must be closed first (no flock held).
+fn open_depot(root: &std::path::Path) -> wikimak_depot::Depot {
+    wikimak_depot::Depot::open(wikimak_depot::DepotConfig {
+        root: root.join("depot"),
+        max_chain_id: 1 << 20,
+        file_size_threshold: 1 << 20,
+        eviction_dead_ratio: 0.5,
+    })
+    .unwrap()
 }
 
 /// Test fetch config: no pacing, fast retries.
@@ -607,4 +620,190 @@ fn legacy_heads_only_mirror_backfills_in_order() {
         "f0 tier = the live head frame alone; orphan + rebuild garbage reclaimed"
     );
     assert_eq!(tier_bytes("f1"), f1_live, "f1 tier = the live accumulator alone");
+}
+
+/// BUG 1 (storage leak): a crash BETWEEN a rebuild's repoint tx commit
+/// and `delete_chain` used to leak the repointed-away old chain FOREVER
+/// — it stayed index-live, so collect() could never reclaim a byte. The
+/// fix records the doomed chain id INSIDE the repoint tx (`pending_
+/// deletes`); the next update's sweep deletes the chain and the run-end
+/// collect reclaims. Proven with a REAL abort in a child `ietfmak update`
+/// (IETFMAK_TEST_CRASH_AFTER_REPOINT) on a legacy-backfill rebuild.
+#[test]
+fn crash_between_repoint_and_delete_is_swept_next_run() {
+    let s = StandIn::start();
+    // Legacy heads-only shape: head at -05, everything below 404 → a
+    // singleton chain at 05; stripping the `missing` watermarks then
+    // leaves a newer head with its older revisions unseen.
+    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-orphan-05\t2024-05-01\tActive\n"));
+    s.text("draft-test-orphan-05", "orphan five\n");
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("m");
+    let client = Client::new();
+    {
+        let mut m = mirror(&tmp);
+        let st = m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
+        assert_eq!((st.revisions_fetched, st.revisions_missing), (1, 5));
+    }
+    let conn = rusqlite::Connection::open(root.join("meta.db")).unwrap();
+    conn.execute("DELETE FROM revisions_seen WHERE missing = 1", []).unwrap();
+    let old_chain: i64 = conn
+        .query_row("SELECT chain_id FROM drafts WHERE name = 'draft-test-orphan'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    drop(conn);
+
+    // The archive serves the backfill + a head bump: the next update must
+    // REBUILD the draft (older revisions under an existing head) onto a
+    // fresh chain id, retiring the old one.
+    for (doc, body) in [
+        ("draft-test-orphan-00", "orphan zero\n"),
+        ("draft-test-orphan-01", "orphan one\n"),
+        ("draft-test-orphan-02", "orphan two\n"),
+        ("draft-test-orphan-03", "orphan three\n"),
+        ("draft-test-orphan-04", "orphan four\n"),
+        ("draft-test-orphan-06", "orphan six\n"),
+    ] {
+        s.text(doc, body);
+    }
+    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-orphan-06\t2024-06-01\tActive\n"));
+
+    // Child update: rebuilds, COMMITS the repoint, then aborts BEFORE
+    // `delete_chain` — the exact leak window.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ietfmak"))
+        .args(["update", root.to_str().unwrap(), "--delay-ms", "0"])
+        .env("IETFMAK_BASE_URL", &s.base_url)
+        .env("IETFMAK_TEST_CRASH_AFTER_REPOINT", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the crash knob must abort the child");
+
+    // Post-crash: the draft is repointed onto a fresh chain (durable) and
+    // the old chain is recorded pending-delete but STILL index-live — the
+    // orphan that used to leak forever.
+    let new_chain: i64 = {
+        let conn = rusqlite::Connection::open(root.join("meta.db")).unwrap();
+        let new_chain: i64 = conn
+            .query_row("SELECT chain_id FROM drafts WHERE name = 'draft-test-orphan'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_ne!(new_chain, old_chain, "child committed the repoint before crashing");
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_deletes WHERE chain_id = ?1",
+                [old_chain],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "the doomed chain is recorded durably for the sweep");
+        new_chain
+    };
+    {
+        let depot = open_depot(&root);
+        assert!(
+            depot.read_f0(old_chain as u64).is_ok(),
+            "old chain still index-live after the crash — the leak the sweep reclaims"
+        );
+    }
+
+    // Recovery run: `sweep_pending_deletes` deletes the orphan; the
+    // run-end collect frees its bytes.
+    {
+        let mut m = mirror(&tmp);
+        m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
+        assert_eq!(
+            m.history("draft-test-orphan")
+                .unwrap()
+                .iter()
+                .map(|e| e.rev.clone())
+                .collect::<Vec<_>>(),
+            ["06", "05", "04", "03", "02", "01", "00"],
+            "history intact on the new chain after the sweep"
+        );
+    }
+    {
+        let conn = rusqlite::Connection::open(root.join("meta.db")).unwrap();
+        let pending: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pending_deletes", [], |r| r.get(0)).unwrap();
+        assert_eq!(pending, 0, "the sweep cleared the pending-delete row");
+    }
+
+    // The orphan really left the disk: its slot reads empty and the f0/f1
+    // tiers measure EXACTLY the new chain's live frames.
+    let depot = open_depot(&root);
+    assert!(
+        matches!(depot.read_f0(old_chain as u64), Err(wikimak_depot::Error::NoFrame)),
+        "swept orphan chain's slot reads empty"
+    );
+    let f0_live = depot.read_f0(new_chain as u64).unwrap().len() as u64 + 24;
+    let f1_live = depot.read_f1(new_chain as u64).unwrap().expect("7-rev chain has an f1").len()
+        as u64
+        + 24;
+    let depot_root = root.join("depot");
+    let tier_bytes = |tier: &str| -> u64 {
+        std::fs::read_dir(depot_root.join(tier))
+            .unwrap()
+            .flatten()
+            .map(|e| e.metadata().unwrap().len())
+            .sum()
+    };
+    assert_eq!(
+        tier_bytes("f0"),
+        f0_live,
+        "f0 tier = the live head frame alone; swept orphan + rebuild garbage reclaimed"
+    );
+    assert_eq!(tier_bytes("f1"), f1_live, "f1 tier = the live accumulator alone");
+}
+
+/// BUG 3: `ietfmak history` must not panic ("failed printing to stdout:
+/// Broken pipe") when its output is piped into a reader that closes early
+/// (`| head`). The standalone binary resets SIGPIPE to SIG_DFL, so the
+/// closed pipe terminates the process with the signal instead of the
+/// EPIPE the `println!` macros panic on. The read end is closed BEFORE
+/// the child's first line so the very first flush hits it.
+#[test]
+fn history_piped_to_early_close_does_not_panic() {
+    let s = StandIn::start();
+    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-pipe-04\t2024-01-01\tActive\n"));
+    for (doc, body) in [
+        ("draft-test-pipe-00", "p0\n"),
+        ("draft-test-pipe-01", "p1\n"),
+        ("draft-test-pipe-02", "p2\n"),
+        ("draft-test-pipe-03", "p3\n"),
+        ("draft-test-pipe-04", "p4\n"),
+    ] {
+        s.text(doc, body);
+    }
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("m");
+    {
+        let mut m = mirror(&tmp);
+        m.update(&Client::new(), &fast_cfg(&s), |_, _| ()).unwrap();
+    }
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ietfmak"))
+        .args(["history", root.to_str().unwrap(), "draft-test-pipe"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn ietfmak");
+    // Close the read end immediately: the child's first `println!` flush
+    // writes into a closed pipe.
+    drop(child.stdout.take().unwrap());
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    let status = child.wait().unwrap();
+
+    assert_ne!(status.code(), Some(101), "history panicked on the closed pipe: {stderr}");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("failed printing to stdout"),
+        "history printed a panic message: {stderr}"
+    );
+    assert!(
+        status.signal() == Some(13) || status.success(),
+        "expected SIGPIPE termination or success, got {status:?} (stderr: {stderr})"
+    );
 }
