@@ -107,6 +107,18 @@ fn abort_after_history_frames() -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
+/// Test knob: return a mid-page error while importing this page id,
+/// AFTER at least one staged batch is prepended to the chain — the
+/// in-session chain-ahead-of-rolled-back-rows fixture (crash_repair.rs).
+/// A non-fatal `Err` (the process survives), so the SAME process can
+/// re-import and must not duplicate the already-stored revisions. Never
+/// set outside tests.
+fn fail_after_prepend_page() -> Option<u64> {
+    std::env::var("WIKIMAK_TEST_FAIL_AFTER_PREPEND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
 pub(crate) fn do_import<R: Read>(
     instance: &Instance,
     stream: &mut PageStream<R>,
@@ -181,14 +193,27 @@ fn import_one_page<R: Read>(
         g.conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
         g.dirty_stamped = true;
     }
-    // Suspect-mode repair: the previous session died dirty, so this
-    // page's revisions_seen rows may reference frames that never became
-    // durable. Re-derive the rows from the CHAIN (the depot is the data
-    // fence; bookkeeping must never be ahead of it) once per page.
+    // Chain-scan repair: this page's revisions_seen rows may reference
+    // frames that never became durable, OR — the same shape from the
+    // other side — be MISSING rows for frames a mid-page error this very
+    // session already prepended (the tx rolled the rows back, the chain
+    // kept the frames). Both leave the chain AHEAD of the rows; both are
+    // healed by re-deriving the rows FROM THE CHAIN (the depot is the
+    // data fence; bookkeeping must never be ahead of it). Two triggers:
+    //   * `suspect` — a previous session died dirty: repair each touched
+    //     page ONCE (tracked in `repaired`).
+    //   * `errored_pages` — a mid-page import error THIS session: repair
+    //     on the next import of that page REGARDLESS of `repaired` (the
+    //     page may have been repaired earlier then errored again), and
+    //     clear it so a clean re-import doesn't pay the scan twice.
+    // Without the errored-page trigger a same-process re-import would
+    // treat the already-stored (but row-less) revisions as unseen and
+    // re-prepend them — duplicate records on the chain.
     // Streaming: the chain is walked one frame at a time, each record
     // peeked for (rev_id, ts) and inserted as it goes by — a hot page's
     // decompressed history is never resident during repair either.
-    if instance.suspect && !g.repaired.contains(&page_id) {
+    let page_errored = g.errored_pages.contains(&page_id);
+    if page_errored || (instance.suspect && !g.repaired.contains(&page_id)) {
         let inner = &mut *g;
         inner.conn.execute(
             "DELETE FROM revisions_seen WHERE page_id = ?1",
@@ -207,6 +232,7 @@ fn import_one_page<R: Read>(
         }
         drop(insert);
         g.repaired.insert(page_id);
+        g.errored_pages.remove(&page_id);
     }
     let mut guard = g;
     let g = &*guard;
@@ -284,6 +310,19 @@ fn import_one_page<R: Read>(
         while let Some(rev) = stream.next_revision() {
             let rev = rev?;
             let rev_id = rev.id as u64;
+            // Test knob: once at least one record is staged, flush it to
+            // the chain and fail — leaving the chain AHEAD of the rows the
+            // rollback drops (the in-session mid-page error this session's
+            // errored-page repair must heal). Prepend path only: on a
+            // forward build the unfinished frames stay invisible, so no
+            // duplicate is possible and the fixture doesn't apply.
+            if fail_after_prepend_page() == Some(page_id) && builder.is_none() && !batch.is_empty()
+            {
+                batch.reverse();
+                prepend_depot_frames(g, page_id, &batch, instance.f1_seal_threshold_bytes)?;
+                batch.clear();
+                return Err(crate::error::Error::Corrupt("WIKIMAK_TEST_FAIL_AFTER_PREPEND"));
+            }
             let ts = rev.timestamp.timestamp_micros();
             earliest_ts = Some(earliest_ts.map_or(ts, |e| e.min(ts)));
 
@@ -372,6 +411,11 @@ fn import_one_page<R: Read>(
             // NEXT session through suspect-mode repair).
             let _ = g.conn.execute("ROLLBACK", []);
             guard.import_errored = true;
+            // Route this page's NEXT same-process import through chain-scan
+            // repair: the frames prepended before the error are live on the
+            // chain but their rows just rolled back, so a naive re-import
+            // would re-prepend and duplicate them.
+            guard.errored_pages.insert(page_id);
             Err(e)
         }
     }

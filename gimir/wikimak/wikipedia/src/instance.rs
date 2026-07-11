@@ -207,6 +207,14 @@ pub(crate) struct InstanceInner {
     /// then distrust the rows and scan the chain, exactly like a
     /// suspect open would after the crash-equivalent state.
     pub(crate) import_errored: bool,
+    /// Pages whose in-session import errored mid-page and left the chain
+    /// AHEAD of the (rolled-back) rows. `suspect` is fixed at open, so a
+    /// same-process RE-import can't lean on it — but re-prepending the
+    /// revisions the crashed attempt already stored would duplicate them.
+    /// The next same-process import of such a page is routed through the
+    /// same chain-scan repair a suspect open uses (re-derive
+    /// `revisions_seen` from the chain), then the page is cleared here.
+    pub(crate) errored_pages: std::collections::HashSet<u64>,
     /// Bounded LRU of decompressed-and-indexed title shards (exact
     /// title → dense ids). See `titles::TitleCache` — this is what
     /// makes a render's link set cost at most one shard walk per
@@ -292,6 +300,7 @@ impl Instance {
                 repaired: Default::default(),
                 dirty_stamped: false,
                 import_errored: false,
+                errored_pages: Default::default(),
                 title_cache: crate::titles::TitleCache::new(crate::titles::TITLE_CACHE_BUDGET),
                 _lock: lock,
             })),
@@ -389,6 +398,7 @@ impl Instance {
                 repaired: Default::default(),
                 dirty_stamped: false,
                 import_errored: false,
+                errored_pages: Default::default(),
                 title_cache: crate::titles::TitleCache::new(crate::titles::TITLE_CACHE_BUDGET),
                 _lock: lock,
             })),

@@ -104,6 +104,96 @@ fn suspect_open_repairs_bookkeeping_ahead_of_depot() {
     assert_eq!(inst.page_history(1).unwrap().count(), n_before, "no duplicate records");
 }
 
+/// A minimal one-page dump with the given revisions (id, ts, text).
+fn one_page_dump(page_id: u64, title: &str, revs: &[(u64, &str, &str)]) -> Vec<u8> {
+    let mut r = String::new();
+    for (id, ts, text) in revs {
+        r.push_str(&format!(
+            "<revision><id>{id}</id><timestamp>{ts}</timestamp>\
+             <contributor><username>A</username><id>1</id></contributor>\
+             <comment>c</comment><model>wikitext</model><format>text/x-wiki</format>\
+             <text bytes=\"{}\" xml:space=\"preserve\">{text}</text><sha1></sha1></revision>",
+            text.len()
+        ));
+    }
+    format!(
+        "<mediawiki xmlns=\"http://www.mediawiki.org/xml/export-0.11/\" version=\"0.11\" \
+         xml:lang=\"en\"><siteinfo><sitename>T</sitename><dbname>testwiki</dbname>\
+         <namespaces><namespace key=\"0\" case=\"first-letter\" /></namespaces></siteinfo>\
+         <page><title>{title}</title><ns>0</ns><id>{page_id}</id>{r}</page></mediawiki>"
+    )
+    .into_bytes()
+}
+
+/// BUG 2 (in-session duplicate risk): `Instance::suspect` is fixed at
+/// open, so a SAME-PROCESS re-import after a mid-page error skipped the
+/// chain-scan repair — the frames the failed attempt already prepended
+/// were live on the chain but their rows had rolled back, so a naive
+/// re-import re-prepended and DUPLICATED them. The in-session
+/// `errored_pages` flag now routes the affected page back through the
+/// same repair a suspect open uses, in-process, before trusting the rows.
+#[test]
+fn in_session_reimport_after_midpage_error_no_duplicates() {
+    // Page id unique to this test: the FAIL knob is process-global, so it
+    // must not collide with any other test's page ids.
+    const PAGE: u64 = 909_090;
+    let tmp = tempfile::tempdir().unwrap();
+    let inst = make_instance(&tmp, 1 << 20);
+
+    // Import 1: one revision → an EXISTING chain (so import 2 takes the
+    // prepend path, where a mid-page error leaves visible frames).
+    let mut s = new_page_stream(std::io::Cursor::new(one_page_dump(
+        PAGE,
+        "P",
+        &[(700, "2024-01-01T00:00:00Z", "one")],
+    )));
+    inst.import(&mut s).expect("import 1");
+    inst.flush().unwrap();
+
+    // Import 2 (SAME process): the page + two more revisions, failing
+    // mid-page AFTER rev 701 is prepended — the chain now LEADS the rows
+    // the rollback drops (the crash-equivalent state).
+    std::env::set_var("WIKIMAK_TEST_FAIL_AFTER_PREPEND", PAGE.to_string());
+    let mut s = new_page_stream(std::io::Cursor::new(one_page_dump(
+        PAGE,
+        "P",
+        &[
+            (700, "2024-01-01T00:00:00Z", "one"),
+            (701, "2024-01-02T00:00:00Z", "two"),
+            (702, "2024-01-03T00:00:00Z", "three"),
+        ],
+    )));
+    inst.import(&mut s).expect_err("mid-page failure must be injected");
+    std::env::remove_var("WIKIMAK_TEST_FAIL_AFTER_PREPEND");
+
+    // Import 3 (SAME process): the full page again. The errored-page
+    // repair re-derives revisions_seen from the chain first, so rev 701
+    // (already stored) dedups instead of being prepended a second time.
+    let mut s = new_page_stream(std::io::Cursor::new(one_page_dump(
+        PAGE,
+        "P",
+        &[
+            (700, "2024-01-01T00:00:00Z", "one"),
+            (701, "2024-01-02T00:00:00Z", "two"),
+            (702, "2024-01-03T00:00:00Z", "three"),
+        ],
+    )));
+    inst.import(&mut s).expect("import 3");
+    inst.flush().unwrap();
+
+    // No duplicate records: every revision present exactly once.
+    let hist: Vec<u64> = inst
+        .page_history(PAGE)
+        .unwrap()
+        .map(|e| e.unwrap().meta.rev_id)
+        .collect();
+    let mut ids = hist.clone();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids, vec![700, 701, 702], "every revision present exactly once");
+    assert_eq!(hist.len(), 3, "no duplicate records on the chain (history was {hist:?})");
+}
+
 #[test]
 fn second_process_is_locked_out() {
     let tmp = tempfile::tempdir().unwrap();
