@@ -968,6 +968,10 @@ impl Overlay {
         self.hydrate_chain(Some(bid));
         match self.resolve(bid, rel) {
             Layer::UpperFile { owner, rowid, .. } => {
+                // Restore an inline (discard-reverted) row to its blob so this
+                // host-side read sees the reverted bytes, exactly as the FUSE
+                // read path does. See ensure_upper_blob.
+                self.ensure_upper_blob(owner, rowid, rel);
                 std::fs::read(crate::depot::blob_path(owner, rowid))
             }
             Layer::Lower => std::fs::read(self.host(rel)),
@@ -1545,12 +1549,34 @@ impl Overlay {
     /// (the parent box's version if nested, else the host file, else empty)
     /// into a fresh pool blob in THIS box (creating the row + provenance) and
     /// returns the RW blob file.
+    /// Ensure the pool blob backing an UpperFile row EXISTS on disk. A
+    /// discard-hunk-reverted row keeps its bytes INLINE in the sqlar `data`
+    /// column with NO pool blob (`review::write_current`); every path that
+    /// opens an upper blob — copy_up, the FUSE open/setattr/fallocate
+    /// handlers — funnels through here first, so such a row is transparently
+    /// re-materialized to a standard blob-backed capture row before any read
+    /// or write touches it. Without this the box's OWN write path fails
+    /// (EIO/ENOENT) against a file whose hunks it had discarded. No-op for
+    /// already-blob-backed rows.
+    fn ensure_upper_blob(&self, owner: i64, rowid: i64, rel: &str) {
+        if !blob_path(owner, rowid).exists() {
+            if let Some(ob) = self.box_of(owner) {
+                let _ = ob.outline_inline_row(rel);
+            }
+        }
+    }
+
     fn copy_up(&self, b: &BoxState, rel: &str, pid: u32) -> std::io::Result<File> {
         let writer = b.writer_for(pid);
         // Source the lower bytes + mode from the parent-chain resolution.
         let (src, mode): (Option<PathBuf>, u32) = match self.resolve(b.id, rel) {
-            Layer::UpperFile { owner, rowid, mode } =>
-                (Some(blob_path(owner, rowid)), mode),
+            Layer::UpperFile { owner, rowid, mode } => {
+                // Re-materialize an inline (discard-reverted) row to its blob
+                // so the copy below — and the box's own re-run write — has a
+                // source. See ensure_upper_blob.
+                self.ensure_upper_blob(owner, rowid, rel);
+                (Some(blob_path(owner, rowid)), mode)
+            }
             Layer::Lower => {
                 let m = self.host(rel).symlink_metadata().map(|m| m.mode())
                     .unwrap_or(0o100644);
@@ -1870,6 +1896,10 @@ impl Filesystem for Overlay {
         }
         let (file, upper) = match self.resolve(bid, &rel) {
             Layer::UpperFile { owner, rowid, .. } => {
+                // An inline (discard-reverted) row has no pool blob; restore
+                // it before the open so even a read of a reverted file (or a
+                // write onto it) doesn't EIO. See ensure_upper_blob.
+                self.ensure_upper_blob(owner, rowid, &rel);
                 let bp = blob_path(owner, rowid);
                 let own = owner == bid;
                 match OpenOptions::new().read(true).write(want_write && own).open(&bp) {
@@ -2249,8 +2279,13 @@ impl Filesystem for Overlay {
         if let Some(sz) = size {
             // truncate: a write — copy-up if still lower, then set_len.
             let f = match self.layer(&b, &rel) {
-                Layer::UpperFile { rowid, .. } => OpenOptions::new().write(true)
-                    .open(blob_path(bid, rowid)).ok(),
+                Layer::UpperFile { rowid, .. } => {
+                    // Materialize an inline (discard-reverted) row first, so
+                    // `> file` (delivered as setattr size=0) onto such a row
+                    // doesn't EIO. See ensure_upper_blob.
+                    self.ensure_upper_blob(bid, rowid, &rel);
+                    OpenOptions::new().write(true).open(blob_path(bid, rowid)).ok()
+                }
                 Layer::Lower => self.copy_up(&b, &rel, req.pid()).ok(),
                 _ => None,
             };
@@ -2305,6 +2340,9 @@ impl Filesystem for Overlay {
                         return reply.error(Errno::EIO);
                     }
                     if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
+                        // Materialize an inline (discard-reverted) row so the
+                        // blob exists for lchown. See ensure_upper_blob.
+                        self.ensure_upper_blob(bid, rowid, &rel);
                         let c = std::ffi::CString::new(
                             blob_path(bid, rowid).as_os_str().as_encoded_bytes()).unwrap();
                         let r = unsafe { libc::lchown(c.as_ptr(), nu, ng) };
@@ -2480,8 +2518,12 @@ impl Filesystem for Overlay {
         };
         let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
         let f = match self.layer(&b, &rel) {
-            Layer::UpperFile { rowid, .. } =>
-                OpenOptions::new().write(true).open(blob_path(bid, rowid)).ok(),
+            Layer::UpperFile { rowid, .. } => {
+                // Materialize an inline (discard-reverted) row first. See
+                // ensure_upper_blob.
+                self.ensure_upper_blob(bid, rowid, &rel);
+                OpenOptions::new().write(true).open(blob_path(bid, rowid)).ok()
+            }
             Layer::Lower => self.copy_up(&b, &rel, req.pid()).ok(),
             _ => None,
         };

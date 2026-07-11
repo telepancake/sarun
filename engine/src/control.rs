@@ -3300,7 +3300,7 @@ macro_rules! ui_verbs {
                 Err(e) => return json!({"ok": false, "error": e.to_string()}),
             }
         }
-        "box_file_write", "BOX PATH B64", "write a file into a box's layer" => {
+        "box_file_write", "BOX PATH B64", "write a file into a box's layer (oaita agent tool: same refusal gate as the editor save, but MAY create new files)" => {
             let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
@@ -3319,10 +3319,12 @@ macro_rules! ui_verbs {
                 Err(e) => return json!({"ok": false,
                     "error": format!("bad base64: {e}")}),
             };
-            match ov.box_write_file(id, rel, &bytes) {
-                Ok(()) => json!({"len": bytes.len()}),
-                Err(e) => return json!({"ok": false, "error": e.to_string()}),
-            }
+            // Shared guard+write core with review.write_file — the agent path
+            // gains the tombstone/symlink/dir/binary refusals it lacked.
+            // `return` (not fall-through) so a refusal reaches the executor
+            // as an envelope error, not a silently-wrapped {ok:false}.
+            // allow_create = true: the agent authors new files.
+            return crate::review::write_file_checked(id, rel, &bytes, &ov, true);
         }
         "box_dir_list", "BOX PATH", "list a directory in a box's merged view" => {
             let ov = lock(state).overlay.clone();

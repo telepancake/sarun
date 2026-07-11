@@ -182,16 +182,29 @@ pub fn file_bytes(id: i64, rel: &str) -> Value {
 /// binary content (either side), and paths that exist nowhere.
 pub fn write_file(id: i64, rel: &str, bytes: &[u8],
                   ov: &crate::overlay::Overlay) -> Value {
+    // The editor only opens files that already exist, so a path that exists
+    // nowhere is a caller bug — refuse (allow_create = false).
+    write_file_checked(id, rel, bytes, ov, false)
+}
+
+/// Shared guard-and-write core for the two box-file write verbs:
+/// `review.write_file` (the editor save, `allow_create = false`) and
+/// `box_file_write` (the oaita agent's file-write tool, `allow_create =
+/// true`). Both run the IDENTICAL refusal gate — tombstone / symlink /
+/// directory / binary-in-either-direction / NUL — and both stage the write
+/// through `Overlay::box_write_file` (the SAME copy_up → pool blob →
+/// finalize_file path a box's own FUSE writes take; the host is never
+/// touched). They differ ONLY in the one documented axis below: whether a
+/// path that exists NOWHERE is created (the agent authors new files) or
+/// refused (the editor can't save a file it never opened). A discard-hunk
+/// inline row needs no special handling here anymore — copy_up
+/// re-materializes it for every writer (`BoxDepot::outline_inline_row`).
+pub fn write_file_checked(id: i64, rel: &str, bytes: &[u8],
+                          ov: &crate::overlay::Overlay, allow_create: bool)
+    -> Value
+{
     let rel = rel.trim_start_matches('/');
-    if let Err(e) = write_file_guard(id, rel, bytes) {
-        return json!({"ok": false, "error": e});
-    }
-    // A discard-hunk-reverted row keeps its bytes INLINE (data column, no
-    // pool blob). The overlay write path sources copy_up from the blob, and
-    // review reads prefer inline data — so materialize the inline bytes to
-    // the pool and clear the column first, making the row a standard
-    // blob-backed capture row before the write.
-    if let Err(e) = outline_inline_row(id, rel, ov) {
+    if let Err(e) = write_file_guard(id, rel, bytes, allow_create) {
         return json!({"ok": false, "error": e});
     }
     match ov.box_write_file(id, rel, bytes) {
@@ -200,11 +213,16 @@ pub fn write_file(id: i64, rel: &str, bytes: &[u8],
     }
 }
 
-/// The refusal gate for `write_file`, separated so it is unit-testable
-/// against sqlar fixtures without an Overlay. Same taxonomy as
-/// `file_bytes`, plus the binary guard in both directions: the text-editor
-/// verb must neither write NULs nor silently replace captured binary.
-fn write_file_guard(id: i64, rel: &str, bytes: &[u8]) -> Result<(), String> {
+/// The refusal gate shared by both write verbs, separated so it is
+/// unit-testable against sqlar fixtures without an Overlay. Same taxonomy as
+/// `file_bytes`, plus the binary guard in both directions: neither write verb
+/// may write NULs nor silently replace captured/host binary. `allow_create`
+/// is the ONLY behavioral difference between the two callers (see
+/// `write_file_checked`): when true a path that exists nowhere passes (the
+/// agent creates a new file in the box's upper); when false it is refused.
+fn write_file_guard(id: i64, rel: &str, bytes: &[u8], allow_create: bool)
+    -> Result<(), String>
+{
     if rel.is_empty() {
         return Err("empty path".into());
     }
@@ -226,52 +244,29 @@ fn write_file_guard(id: i64, rel: &str, bytes: &[u8]) -> Result<(), String> {
             None => Err("captured content unavailable".into()),
         },
         None => {
-            // Not in the change set: the edit shadows a HOST file — which
-            // must exist (the editor opens existing files; a path that
-            // exists nowhere is a caller bug, refused loudly).
+            // Not in the change set: the edit shadows a HOST file.
             let host = Path::new("/").join(rel);
-            let md = std::fs::symlink_metadata(&host).map_err(
-                |_| "no such file (neither captured nor on the host)".to_string())?;
-            if md.file_type().is_symlink() {
-                return Err("host symlink, not editable".into());
+            match std::fs::symlink_metadata(&host) {
+                Ok(md) => {
+                    if md.file_type().is_symlink() {
+                        return Err("host symlink, not editable".into());
+                    }
+                    if !md.is_file() {
+                        return Err("host path is not a regular file".into());
+                    }
+                    if lower_bytes(rel).contains(&0) {
+                        return Err("host content is binary; refusing a text overwrite".into());
+                    }
+                    Ok(())
+                }
+                // Exists nowhere: the editor refuses (it opens existing
+                // files); the agent file-write tool creates it.
+                Err(_) if allow_create => Ok(()),
+                Err(_) => Err(
+                    "no such file (neither captured nor on the host)".into()),
             }
-            if !md.is_file() {
-                return Err("host path is not a regular file".into());
-            }
-            if lower_bytes(rel).contains(&0) {
-                return Err("host content is binary; refusing a text overwrite".into());
-            }
-            Ok(())
         }
     }
-}
-
-/// Materialize an INLINE-data regular-file row (a discard_hunk revert) to
-/// its pool blob and clear the column, refreshing a live box's RAM mirror.
-/// No-op for blob-backed rows and paths outside the change set.
-fn outline_inline_row(id: i64, rel: &str,
-                      ov: &crate::overlay::Overlay) -> Result<(), String> {
-    let Some(conn) = open_rw(id) else {
-        return Err("archive unavailable".into());
-    };
-    let Some(n) = crate::depot::archive_node(&conn, rel) else {
-        return Ok(());
-    };
-    let Some(data) = n.data else { return Ok(()) };
-    if n.mode & S_IFMT != 0o100000 {
-        return Ok(()); // symlink target etc — inline is its natural form
-    }
-    let bp = blob_path(id, n.rowid);
-    if let Some(p) = bp.parent() {
-        std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&bp, &data).map_err(|e| format!("materialize inline row: {e}"))?;
-    crate::depot::archive_clear_inline(&conn, rel).map_err(|e| e.to_string())?;
-    drop(conn);
-    if let Some(b) = ov.live_box(id) {
-        b.reload_entry(rel);
-    }
-    Ok(())
 }
 
 /// st_mtime_ns stored for `rel` in the box's sqlar, or None.
@@ -2066,25 +2061,94 @@ mod tests {
         put("bin.dat", b"\x7fELF\0\0junk");
         put("ok.txt", b"hello\n");
 
+        // The refusal matrix holds for BOTH callers — the editor save
+        // (allow_create = false) AND the oaita box_file_write agent tool
+        // (allow_create = true) share this exact gate; only the nowhere-path
+        // arm differs (asserted below). Every refusal here must fire in both.
         let err = |rel: &str, bytes: &[u8]| {
-            write_file_guard(id, rel, bytes).expect_err(rel).to_string()
+            let e = write_file_guard(id, rel, bytes, false).expect_err(rel).to_string();
+            // The shared gate: identical under allow_create for all these.
+            assert_eq!(write_file_guard(id, rel, bytes, true).expect_err(rel).to_string(),
+                       e, "guard for {rel} must not depend on allow_create");
+            e
         };
         assert!(err("gone.txt", b"x").contains("deleted"), "tombstone refused");
         assert!(err("ln.txt", b"x").contains("symlink"), "symlink refused");
         assert!(err("bin.dat", b"x").contains("binary"), "captured binary refused");
         assert!(err("ok.txt", b"a\0b").contains("binary"), "NUL payload refused");
+        // Nowhere-path: the ONE axis that differs. The editor refuses it; the
+        // agent tool (allow_create) creates it.
         let missing = tmp.join("absent.txt");
         let missing_rel = missing.to_str().unwrap().trim_start_matches('/');
-        assert!(err(missing_rel, b"x").contains("no such file"),
-                "nowhere-path refused");
-        assert!(write_file_guard(id, "ok.txt", b"new\n").is_ok(),
+        assert!(write_file_guard(id, missing_rel, b"x", false)
+                    .expect_err("editor").to_string().contains("no such file"),
+                "editor refuses a nowhere-path");
+        assert!(write_file_guard(id, missing_rel, b"x", true).is_ok(),
+                "agent tool creates a nowhere-path");
+        // …but a NUL payload to that nowhere-path is still refused for the
+        // agent (the binary guard precedes the existence check).
+        assert!(write_file_guard(id, missing_rel, b"a\0b", true)
+                    .expect_err("agent NUL").to_string().contains("binary"),
+                "agent tool still refuses a NUL payload");
+        assert!(write_file_guard(id, "ok.txt", b"new\n", false).is_ok(),
                 "captured text row passes");
         // Host fallback: a real host file outside the change set passes.
         let host = tmp.join("host.txt");
         std::fs::write(&host, "host\n").unwrap();
         let host_rel = host.to_str().unwrap().trim_start_matches('/');
-        assert!(write_file_guard(id, host_rel, b"edited\n").is_ok(),
+        assert!(write_file_guard(id, host_rel, b"edited\n", false).is_ok(),
                 "host-file fallback passes");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// BUG 1 root-fix, depot row states: a discard-hunk revert leaves an
+    /// INLINE regular-file row (bytes in `data`, blob dropped);
+    /// `outline_inline_row` must materialize it back to a blob-backed row so
+    /// copy_up (hence the box's own re-run write) can source it. No-op for
+    /// already-blob-backed rows and for absent paths.
+    #[test]
+    fn outline_inline_row_materializes_reverted_row() {
+        use crate::depot::BoxDepot;
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir()
+            .join(format!("sarun-outline-{}-{:?}", std::process::id(),
+                          std::time::SystemTime::now()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: serialized by TEST_STATE_HOME_LOCK.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let id = 9102;
+        let b = BoxState::create(id).unwrap();
+        // A normal blob-backed capture row.
+        let rid = b.ensure_file_row("f.txt", 0o100644, 0);
+        let bp = blob_path(id, rid);
+        std::fs::create_dir_all(bp.parent().unwrap()).unwrap();
+        std::fs::write(&bp, b"orig\n").unwrap();
+        b.finalize_file("f.txt", 5, 0, 0);
+        // Already blob-backed → no-op.
+        assert!(!b.outline_inline_row("f.txt").unwrap(),
+                "blob-backed row is a no-op");
+        // Simulate discard_hunk's revert: inline the bytes, drop the blob.
+        {
+            let conn = open_rw(id).unwrap();
+            crate::depot::archive_write_inline(&conn, "f.txt", b"reverted\n").unwrap();
+        }
+        std::fs::remove_file(&bp).ok();
+        assert!(!bp.exists(), "revert dropped the pool blob");
+        // Now the row is inline — copy_up could not source it. Materialize.
+        assert!(b.outline_inline_row("f.txt").unwrap(),
+                "inline row is materialized");
+        assert_eq!(std::fs::read(&bp).unwrap(), b"reverted\n",
+                   "inline bytes are now the pool blob");
+        {
+            let conn = open_ro(id).unwrap();
+            let n = crate::depot::archive_node(&conn, "f.txt").unwrap();
+            assert!(n.data.is_none(), "inline column cleared after materialize");
+        }
+        // Absent path → no-op, not an error.
+        assert!(!b.outline_inline_row("nope.txt").unwrap(),
+                "absent path is a no-op");
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

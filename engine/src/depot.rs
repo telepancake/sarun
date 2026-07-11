@@ -204,6 +204,18 @@ pub trait BoxDepot {
     fn ensure_file_row(&self, rel: &str, mode: u32, writer: i64) -> i64;
     /// Final size/mtime once the blob settles (close/flush).
     fn finalize_file(&self, rel: &str, sz: i64, mtime_ns: i64, writer: i64);
+    /// Normalize a discard-hunk-reverted INLINE regular-file row back to a
+    /// blob-backed capture row: write the inline `data` bytes out to the
+    /// row's pool blob and clear the column, then refresh the RAM mirror.
+    /// `copy_up` calls this when a resolved row has no backing blob, so an
+    /// inline row (which `discard_hunk`/`archive_write_inline` leaves behind
+    /// — bytes in `data`, blob dropped) is transparently re-materialized
+    /// before ANY writer (a live FUSE write OR `box_write_file`) sources
+    /// copy_up from it. Without this, a re-run box writing a file whose hunks
+    /// were discarded would fail its own capture path against its own
+    /// history. Returns whether it acted (false for already-blob-backed rows,
+    /// symlinks/tombstones, and absent paths).
+    fn outline_inline_row(&self, rel: &str) -> std::io::Result<bool>;
     fn set_dir(&self, rel: &str, mode: u32, writer: i64);
     fn set_symlink(&self, rel: &str, target: &std::path::Path, writer: i64);
     /// fifo / char / block device node.
@@ -272,6 +284,38 @@ impl BoxDepot for BoxState {
             "UPDATE sqlar SET sz=?2, mtime=?3, last_writer=?4 WHERE name=?1",
             params![rel, sz, mtime_ns, writer],
         );
+    }
+
+    /// Materialize an INLINE-data regular-file row to its pool blob and clear
+    /// the column (the invariant a regular-file row's bytes live at
+    /// `blob_path(id, rowid)`, restored). No-op for blob-backed rows, for
+    /// symlink/tombstone rows (inline is their natural form), and for absent
+    /// paths. See the trait doc for why the write path funnels through here.
+    fn outline_inline_row(&self, rel: &str) -> std::io::Result<bool> {
+        let (rowid, data) = {
+            let conn = self.conn.lock().unwrap();
+            let Some(n) = archive_node(&conn, rel) else { return Ok(false) };
+            if n.mode & 0o170000 != 0o100000 {
+                return Ok(false); // symlink target / whiteout — inline is right
+            }
+            match n.data {
+                Some(d) => (n.rowid, d),
+                None => return Ok(false), // already blob-backed
+            }
+        };
+        let bp = blob_path(self.id, rowid);
+        if let Some(p) = bp.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::write(&bp, &data)?;
+        {
+            let conn = self.conn.lock().unwrap();
+            archive_clear_inline(&conn, rel).map_err(std::io::Error::other)?;
+        }
+        // The RAM mirror still describes the (now stale) inline row; refresh
+        // it from the authoritative sqlar so a live mount serves the blob.
+        self.reload_entry(rel);
+        Ok(true)
     }
 
     /// Apply a new mode to an existing file/dir row (chmod). The audit found
