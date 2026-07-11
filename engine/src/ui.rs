@@ -13144,6 +13144,46 @@ fn dispatch_menubar_key(app: &mut App, k: char) {
     }
 }
 
+/// Is `c` a global menubar accelerator (a pane-switch chip)? Derived from
+/// `PANE_KEYS` plus `N` (New, the always-first launcher chip), so the set can
+/// never drift from the chips actually rendered. Notably this INCLUDES `t`
+/// (Trace) — previously the hand-maintained match arms omitted it, leaving the
+/// Trace chip keyboard-unreachable (F-keys only).
+fn is_menubar_accel(c: char) -> bool {
+    c == 'N' || PANE_KEYS.iter().any(|(k, ..)| *k == c)
+}
+
+/// Does the FOCUSED pane bind `c` as a per-row action (a `PaneGate::On(focus)`
+/// entry in `PANE_ACTION_KEYS`)? Such a binding is the more specific intent
+/// and must beat the global menubar accelerator of the same letter — e.g. `b`
+/// on Mirrors is MirrorBrowse, not "jump to Boxes"; `t` on Pipes toggles the
+/// tree, not "jump to Trace". `PaneGate::Any` rows are NOT counted here: they
+/// carry no pane-specific meaning that should override a chip.
+fn pane_row_key_on_focus(app: &App, c: char) -> bool {
+    PANE_ACTION_KEYS.iter().any(|(key, gate, ..)|
+        key.matches(crossterm::event::KeyCode::Char(c))
+        && matches!(gate, PaneGate::On(p) if *p == app.focus))
+}
+
+/// Route a normal-mode character key with the correct precedence between the
+/// per-pane action table and the global menubar accelerators:
+///   1. a pane-row key bound `On(the focused pane)` wins (the specific intent);
+///   2. otherwise a global menubar accelerator switches panes;
+///   3. otherwise the flat pane-action table (`PaneGate::Any` keys: q, j/k,
+///      a/x/d, …) handles it.
+/// This ordering is what makes `b` on Mirrors browse (not jump to Boxes) while
+/// `b` from every other pane still reaches Boxes, and lets `t` reach Trace.
+fn dispatch_char_key(app: &mut App, c: char) {
+    use crossterm::event::KeyCode;
+    if pane_row_key_on_focus(app, c) {
+        dispatch_pane_key(app, KeyCode::Char(c));
+    } else if is_menubar_accel(c) {
+        dispatch_menubar_key(app, c);
+    } else {
+        dispatch_pane_key(app, KeyCode::Char(c));
+    }
+}
+
 fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     mods: crossterm::event::KeyModifiers) {
     use crossterm::event::KeyCode;
@@ -14184,8 +14224,10 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             shutdown_rpc(&app.sock);
                             app.should_quit = true;
                         }
-                        KeyCode::Char(c @ ('N'|'b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'
-                                           |'?'|'P'|'i'|'w'|'v'|'s'|'M'|'u'|'W')) =>
+                        // Menubar accelerators still switch panes from Inspect
+                        // (Inspect has no per-row letter bindings of its own).
+                        // Derived from PANE_KEYS so 't' (Trace) is reachable.
+                        KeyCode::Char(c) if is_menubar_accel(c) =>
                             dispatch_menubar_key(&mut app, c),
                         _ => {}
                     }
@@ -14258,11 +14300,13 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // clears the right-pane scroll — carrying right_focused
                     // across views would put the cursor in the new view's
                     // detail body, which has no cursor of its own.
-                    // Letter accelerators: route through the same
-                    // dispatch_menubar_key the F9 menu-nav path uses,
-                    // so the two paths can't diverge.
-                    KeyCode::Char(c @ ('N'|'b'|'c'|'p'|'o'|'l'|'g'|'f'|'e'|'?'|'P'|'i'|'w'|'v'|'s'|'M'|'u'|'W')) =>
-                        dispatch_menubar_key(&mut app, c),
+                    // Character keys: a pane-row binding On(the focused pane)
+                    // wins over the same-letter global accelerator, else the
+                    // menubar chip switches panes, else the flat pane-action
+                    // table handles it (dispatch_char_key). This is what makes
+                    // 'b' on Mirrors browse (not jump to Boxes) and 't' reach
+                    // Trace, without disturbing the accelerators elsewhere.
+                    KeyCode::Char(c) => dispatch_char_key(&mut app, c),
                     // Esc / Backspace from the packet drill-down pops back
                     // to the flows list, keeping its cursor + detail state.
                     KeyCode::Backspace => app.go_back(),
@@ -16521,6 +16565,58 @@ mod tests {
         let mut app = headless_app();
         assert!(!dispatch_pane_key(&mut app, KeyCode::Char('§')),
                 "an unbound key must not be claimed by the pane-key table");
+    }
+
+    /// BUG 3, key-dispatch precedence (`dispatch_char_key`): a pane-row key
+    /// bound On(the focused pane) beats the same-letter global accelerator,
+    /// while the letter still reaches its global pane from every other pane;
+    /// and 't' now reaches Trace (it was missing from the accelerator list).
+    #[test]
+    fn char_key_dispatch_pane_row_beats_global_accelerator() {
+        // 'b' on Mirrors → MirrorBrowse (pane-row), NOT "jump to Boxes"
+        // (Sessions). With no mirror jobs the browse is a no-op, so the tell
+        // is simply that focus did NOT change to Sessions.
+        let mut app = headless_app();
+        app.focus = Pane::Mirrors;
+        dispatch_char_key(&mut app, 'b');
+        assert!(app.focus == Pane::Mirrors,
+                "'b' on Mirrors must NOT jump to Boxes (it browses)");
+
+        // 'b' from any OTHER pane still reaches Boxes (Sessions) — the global
+        // accelerator is intact where no pane-row binding shadows it.
+        let mut app = headless_app();
+        app.focus = Pane::Changes;
+        dispatch_char_key(&mut app, 'b');
+        assert!(app.focus == Pane::Sessions,
+                "'b' off Mirrors must still reach Boxes");
+
+        // 't' reaches Trace from a pane with no per-row 't' (Sessions). Before
+        // the fix 't' was absent from the accelerator list — Trace was
+        // keyboard-unreachable (F-keys only).
+        let mut app = headless_app();
+        app.focus = Pane::Sessions;
+        dispatch_char_key(&mut app, 't');
+        assert!(app.focus == Pane::Trace, "'t' must reach the Trace pane");
+
+        // …but 't' on Pipes keeps its pane-row meaning (toggle tree), so it
+        // must NOT jump to Trace there.
+        let mut app = headless_app();
+        app.focus = Pane::Pipelines;
+        dispatch_char_key(&mut app, 't');
+        assert!(app.focus == Pane::Pipelines,
+                "'t' on Pipes toggles the tree, it must not jump to Trace");
+
+        // The routing predicates themselves: 't' is a menubar accelerator
+        // (regression guard against the old omission), 'b' On(Mirrors) is a
+        // pane-row key, and 'b' is not a pane-row key off Mirrors.
+        assert!(is_menubar_accel('t'), "'t' must be a menubar accelerator");
+        assert!(is_menubar_accel('b') && is_menubar_accel('W') && is_menubar_accel('u'),
+                "b/W/u stay menubar accelerators");
+        let mut app = headless_app();
+        app.focus = Pane::Mirrors;
+        assert!(pane_row_key_on_focus(&app, 'b'), "'b' is a pane-row key on Mirrors");
+        app.focus = Pane::Sessions;
+        assert!(!pane_row_key_on_focus(&app, 'b'), "'b' is not a pane-row key off Mirrors");
     }
 
     /// Helper: select the box (and change) whose path matches `pred`, returning
