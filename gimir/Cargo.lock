@@ -1170,14 +1170,13 @@ name = "ietf-mirror"
 version = "0.0.0"
 dependencies = [
  "depot",
- "depot-vbf",
  "httpmock",
  "libc",
  "reqwest",
  "rusqlite",
  "tempfile",
  "thiserror 1.0.69",
- "wikimak-depot",
+ "zstd",
 ]
 
 [[package]]

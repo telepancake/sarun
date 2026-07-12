@@ -7,13 +7,10 @@ publish = false
 
 [dependencies]
 depot = { path = "../depot" }
-depot-vbf = { path = "../depot-vbf" }
 rusqlite.workspace = true
 thiserror.workspace = true
-# flock() for the one-process-per-root guard.
 libc.workspace = true
-# Optional behind `fetch` (default ON): the update/index HTTP surface.
-# Read-only embedders (the sarun engine's ietf_attach) build without it.
+zstd.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls-native-roots"], optional = true }
 
 [features]
@@ -23,9 +20,6 @@ fetch = ["dep:reqwest"]
 [dev-dependencies]
 httpmock = "0.7"
 tempfile = "3"
-# The rebuild test reaches under depot-vbf to prove the repointed-away
-# old chain's bytes really left the disk (tier sizes, raw frame reads).
-wikimak-depot = { path = "../wikimak/depot" }
 
 [[bin]]
 name = "ietfmak"

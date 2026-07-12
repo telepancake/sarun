@@ -230,6 +230,7 @@ const MAX_DOC_BYTES: u64 = 16 << 20;
 pub enum Source {
     File(PathBuf),
     Wiki { root: PathBuf, title: String },
+    Ietf { root: PathBuf, draft: Option<String> },
     Bytes { name: String },
 }
 
@@ -238,6 +239,8 @@ impl Source {
         match self {
             Source::File(p) => p.display().to_string(),
             Source::Wiki { title, .. } => format!("wiki:{title}"),
+            Source::Ietf { draft: None, .. } => "ietf:drafts".into(),
+            Source::Ietf { draft: Some(d), .. } => format!("ietf:{d}"),
             Source::Bytes { name } => name.clone(),
         }
     }
@@ -387,6 +390,36 @@ pub fn wiki_default_title(root: &Path) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("wiki store at {} has no pages", root.display()))
 }
 
+fn ietf_draft_list_html(root: &Path) -> anyhow::Result<(String, String)> {
+    let cfg = ietf_mirror::MirrorConfig::new(root.to_path_buf());
+    let m = ietf_mirror::Mirror::open_read(cfg)
+        .map_err(|e| anyhow::anyhow!("ietf open {}: {e}", root.display()))?;
+    let drafts = m.drafts()
+        .map_err(|e| anyhow::anyhow!("ietf drafts: {e}"))?;
+    let mut html = String::from("<h1>IETF Drafts</h1>\n<ul>\n");
+    for name in &drafts {
+        html.push_str(&format!(
+            "<li><a href=\"/ietf/{name}\">{name}</a></li>\n"));
+    }
+    html.push_str("</ul>\n");
+    if drafts.is_empty() {
+        html = "<h1>IETF Drafts</h1>\n<p>No drafts mirrored yet.</p>\n".into();
+    }
+    Ok((html, format!("{} drafts", drafts.len())))
+}
+
+fn ietf_draft_text(root: &Path, draft: &str) -> anyhow::Result<(Vec<u8>, String)> {
+    let cfg = ietf_mirror::MirrorConfig::new(root.to_path_buf());
+    let m = ietf_mirror::Mirror::open_read(cfg)
+        .map_err(|e| anyhow::anyhow!("ietf open {}: {e}", root.display()))?;
+    let entry = m.head(draft)
+        .map_err(|e| anyhow::anyhow!("ietf head {draft}: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no draft {draft}"))?;
+    let display = format!("{} rev {} {}", draft, entry.rev,
+        entry.date.as_deref().unwrap_or("-"));
+    Ok((entry.text, display))
+}
+
 fn load_source(source: &Source) -> anyhow::Result<(Vec<u8>, Kind, String)> {
     match source {
         Source::File(p) => {
@@ -407,6 +440,18 @@ fn load_source(source: &Source) -> anyhow::Result<(Vec<u8>, Kind, String)> {
         Source::Wiki { root, title } => {
             let (html, display) = wiki_page_html(root, title)?;
             Ok((html.into_bytes(), Kind::Html, display))
+        }
+        Source::Ietf { root, draft } => {
+            match draft {
+                None => {
+                    let (html, display) = ietf_draft_list_html(root)?;
+                    Ok((html.into_bytes(), Kind::Html, display))
+                }
+                Some(name) => {
+                    let (text, display) = ietf_draft_text(root, name)?;
+                    Ok((text, Kind::Text, display))
+                }
+            }
         }
         Source::Bytes { .. } => {
             anyhow::bail!("reader: byte sources are loaded by the caller")
@@ -483,6 +528,14 @@ impl Reader {
             None => wiki_default_title(&root)?,
         };
         let source = Source::Wiki { root, title };
+        let (raw, kind, display) = load_source(&source)?;
+        Reader::new(source, raw, kind, display)
+    }
+
+    /// Open an IETF mirror: `draft: None` lands on the draft list,
+    /// `Some(name)` opens that draft's latest revision as text.
+    pub fn open_ietf(root: PathBuf, draft: Option<String>) -> anyhow::Result<Reader> {
+        let source = Source::Ietf { root, draft };
         let (raw, kind, display) = load_source(&source)?;
         Reader::new(source, raw, kind, display)
     }
@@ -687,6 +740,13 @@ impl Reader {
                 };
                 Some(Source::File(resolved))
             }
+            Source::Ietf { root, .. } => match path_part.strip_prefix("/ietf/") {
+                Some(d) => {
+                    let draft = percent_decode(d);
+                    Some(Source::Ietf { root: root.clone(), draft: Some(draft) })
+                }
+                None => None,
+            },
             Source::Bytes { .. } => None,
         };
         let Some(target) = target else {

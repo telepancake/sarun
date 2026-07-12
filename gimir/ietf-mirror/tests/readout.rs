@@ -35,7 +35,7 @@ fn mirrored() -> (TempDir, MockServer) {
     }
     let tmp = TempDir::new().unwrap();
     let mut m = Mirror::open(MirrorConfig::new(tmp.path().join("m"))).unwrap();
-    m.update(&Client::new(), &cfg(&server), |_, _| ()).unwrap();
+    m.update(&Client::new(), &cfg(&server), |_| ()).unwrap();
     (tmp, server)
 }
 
@@ -127,7 +127,7 @@ fn update_while_attached_and_pin_survives_head_bump() {
     });
     let mut m = Mirror::open(MirrorConfig::new(root.clone()))
         .expect("update-while-attached: writer open must not be blocked by a readout");
-    let st = m.update(&Client::new(), &cfg(&bumped), |_, _| ()).unwrap();
+    let st = m.update(&Client::new(), &cfg(&bumped), |_| ()).unwrap();
     assert_eq!(st.revisions_fetched, 1);
     assert_eq!(m.head("draft-test-alpha").unwrap().unwrap().rev, "02");
     drop(m);

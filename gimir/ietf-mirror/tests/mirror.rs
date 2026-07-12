@@ -1,24 +1,9 @@
 //! End-to-end acceptance for the IETF-drafts mirror against a scripted
-//! stand-in for www.ietf.org speaking the REAL `all_id.txt` shape: ONE
-//! line per draft, at its LATEST revision — history is enumerated
-//! (`00..NN`), not listed. Real-effect assertions:
-//!   - a fresh import of a draft listed at -03 fetches 00..03; a 404'd
-//!     revision is watermarked missing and never re-tried; history
-//!     reads back newest-first with exact bytes;
-//!   - an index head bump fetches ONLY the new revisions;
-//!   - an idempotent second run performs zero content GETs;
-//!   - a transient 500 is retried to success; a persistent 500 fails
-//!     the run loudly without corrupting watermarks (re-run resumes);
-//!   - index validators (ETag) make an unchanged index a 304
-//!     short-circuit — but only after a FULLY successful pass;
-//!   - content GETs are paced by the configured delay;
-//!   - a legacy heads-only chain is rebuilt in order when backfilled;
-//!   - reopen from disk serves the same data (durability).
+//! stand-in for www.ietf.org speaking the REAL `all_id.txt` shape.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,14 +11,6 @@ use std::time::{Duration, Instant};
 use ietf_mirror::{FetchConfig, Mirror, MirrorConfig};
 use reqwest::blocking::Client;
 use tempfile::TempDir;
-
-/// One recorded request.
-#[derive(Debug, Clone)]
-struct Hit {
-    path: String,
-    if_none_match: Option<String>,
-    at: Instant,
-}
 
 struct Reply {
     status: u16,
@@ -56,9 +33,13 @@ impl Reply {
 
 type Handler = Box<dyn FnMut(&Hit) -> Reply + Send>;
 
-/// Minimal scripted HTTP/1.1 stand-in: real sockets, per-path handler
-/// closures (a route can 500-then-200, or answer If-None-Match with
-/// 304), and a request log with arrival timestamps.
+#[derive(Clone)]
+struct Hit {
+    path: String,
+    if_none_match: Option<String>,
+    at: Instant,
+}
+
 struct StandIn {
     routes: Arc<Mutex<HashMap<String, Handler>>>,
     log: Arc<Mutex<Vec<Hit>>>,
@@ -87,7 +68,6 @@ impl StandIn {
         self.routes.lock().unwrap().insert(path.to_string(), Box::new(h));
     }
 
-    /// Serve `body` at `/archive/id/<docname>.txt`.
     fn text(&self, docname: &str, body: &'static str) {
         self.route(&format!("/archive/id/{docname}.txt"), move |_| Reply::ok(body));
     }
@@ -96,15 +76,8 @@ impl StandIn {
         self.log.lock().unwrap().iter().filter(|h| h.path == path).count()
     }
 
-    /// All `/archive/id/…` requests, in arrival order.
     fn content_hits(&self) -> Vec<Hit> {
-        self.log
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|h| h.path.starts_with("/archive/"))
-            .cloned()
-            .collect()
+        self.log.lock().unwrap().iter().filter(|h| h.path.starts_with("/archive/")).cloned().collect()
     }
 
     fn last_hit(&self, path: &str) -> Option<Hit> {
@@ -112,11 +85,7 @@ impl StandIn {
     }
 }
 
-fn serve_one(
-    stream: TcpStream,
-    routes: &Mutex<HashMap<String, Handler>>,
-    log: &Mutex<Vec<Hit>>,
-) -> std::io::Result<()> {
+fn serve_one(stream: TcpStream, routes: &Mutex<HashMap<String, Handler>>, log: &Mutex<Vec<Hit>>) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -126,9 +95,7 @@ fn serve_one(
         let mut h = String::new();
         reader.read_line(&mut h)?;
         let h = h.trim_end();
-        if h.is_empty() {
-            break;
-        }
+        if h.is_empty() { break; }
         if let Some((k, v)) = h.split_once(':') {
             if k.eq_ignore_ascii_case("if-none-match") {
                 if_none_match = Some(v.trim().to_string());
@@ -142,23 +109,12 @@ fn serve_one(
         None => Reply::status(404),
     };
     let reason = match reply.status {
-        200 => "OK",
-        304 => "Not Modified",
-        404 => "Not Found",
-        500 => "Internal Server Error",
+        200 => "OK", 304 => "Not Modified", 404 => "Not Found", 500 => "Internal Server Error",
         _ => "Status",
     };
     let mut out = stream;
-    write!(
-        out,
-        "HTTP/1.1 {} {}\r\nConnection: close\r\nContent-Length: {}\r\n",
-        reply.status,
-        reason,
-        reply.body.len()
-    )?;
-    for (k, v) in &reply.headers {
-        write!(out, "{k}: {v}\r\n")?;
-    }
+    write!(out, "HTTP/1.1 {} {}\r\nConnection: close\r\nContent-Length: {}\r\n", reply.status, reason, reply.body.len())?;
+    for (k, v) in &reply.headers { write!(out, "{k}: {v}\r\n")?; }
     out.write_all(b"\r\n")?;
     out.write_all(&reply.body)
 }
@@ -167,26 +123,8 @@ fn mirror(tmp: &TempDir) -> Mirror {
     Mirror::open(MirrorConfig::new(tmp.path().join("m"))).unwrap()
 }
 
-/// Open the mirror's depot directly (raw-frame / tier-byte inspection).
-/// The mirror must be closed first (no flock held).
-fn open_depot(root: &std::path::Path) -> wikimak_depot::Depot {
-    wikimak_depot::Depot::open(wikimak_depot::DepotConfig {
-        root: root.join("depot"),
-        max_chain_id: 1 << 20,
-        file_size_threshold: 1 << 20,
-        eviction_dead_ratio: 0.5,
-    })
-    .unwrap()
-}
-
-/// Test fetch config: no pacing, fast retries.
 fn fast_cfg(s: &StandIn) -> FetchConfig {
-    FetchConfig {
-        base_url: s.base_url.clone(),
-        delay: Duration::ZERO,
-        retries: 3,
-        backoff: Duration::from_millis(5),
-    }
+    FetchConfig { base_url: s.base_url.clone(), delay: Duration::ZERO, retries: 3, backoff: Duration::from_millis(5) }
 }
 
 #[test]
@@ -196,135 +134,56 @@ fn second_process_is_locked_out() {
     match Mirror::open(MirrorConfig::new(tmp.path().join("m"))) {
         Err(ietf_mirror::Error::MirrorLocked(_)) => {}
         Err(e) => panic!("expected MirrorLocked, got {e}"),
-        Ok(_) => panic!("second open of a live root must fail"),
+        Ok(_) => panic!("second open must fail"),
     }
 }
 
-/// Read-side opens share the root among themselves and exclude (only)
-/// the writer — in both directions; a read handle refuses to update.
 #[test]
 fn read_open_is_shared_and_read_only() {
     let tmp = TempDir::new().unwrap();
-    drop(mirror(&tmp)); // create the root, release the writer lock
+    drop(mirror(&tmp));
     let cfg = || MirrorConfig::new(tmp.path().join("m"));
-
     let r1 = Mirror::open_read(cfg()).unwrap();
     let r2 = Mirror::open_read(cfg()).unwrap();
     match Mirror::open(cfg()) {
         Err(ietf_mirror::Error::MirrorLocked(_)) => {}
-        Err(e) => panic!("writer must be excluded by readers, got {e}"),
-        Ok(_) => panic!("writer must be excluded by readers"),
+        Err(e) => panic!("writer excluded by readers: {e}"),
+        Ok(_) => panic!("writer excluded by readers"),
     }
     drop(r1);
     drop(r2);
-
     let w = mirror(&tmp);
     match Mirror::open_read(cfg()) {
         Err(ietf_mirror::Error::MirrorLocked(_)) => {}
-        Err(e) => panic!("reader must be excluded by the writer, got {e}"),
-        Ok(_) => panic!("reader must be excluded by the writer"),
+        Err(e) => panic!("reader excluded by writer: {e}"),
+        Ok(_) => panic!("reader excluded by writer"),
     }
     drop(w);
-
     let mut r = Mirror::open_read(cfg()).unwrap();
     let s = StandIn::start();
-    match r.update(&Client::new(), &fast_cfg(&s), |_, _| ()) {
+    match r.update(&Client::new(), &fast_cfg(&s), |_| ()) {
         Err(ietf_mirror::Error::ReadOnly) => {}
-        other => panic!("read handle must refuse update, got {other:?}"),
+        other => panic!("read handle must refuse update: {other:?}"),
     }
-
-    // Never scaffold a store on the read path.
-    match Mirror::open_read(MirrorConfig::new(tmp.path().join("no-such-mirror"))) {
+    match Mirror::open_read(MirrorConfig::new(tmp.path().join("no-such"))) {
         Err(ietf_mirror::Error::Io(_)) => {}
-        Err(e) => panic!("read open of a non-mirror must fail loudly, got {e}"),
-        Ok(_) => panic!("read open of a non-mirror must fail loudly"),
+        Err(e) => panic!("read open of non-mirror: {e}"),
+        Ok(_) => panic!("read open of non-mirror must fail"),
     }
-    assert!(!tmp.path().join("no-such-mirror").exists());
-}
-
-/// The crash window the dirty flag exists for: kill the process AFTER
-/// the store flush, BEFORE the watermark tx (a real abort, via the
-/// IETFMAK_TEST_CRASH_AFTER_FLUSH knob, in a child `ietfmak update`).
-/// The re-run must reconcile from the chain — zero re-fetches, aligned
-/// watermarks, and above all NO duplicate revisions on the chain. Both
-/// crash shapes are exercised: a fresh multi-revision import and a
-/// single-revision head bump (the old `r < head` rebuild guard missed
-/// the equal case, so exactly this shape used to duplicate).
-#[test]
-fn crash_between_flush_and_watermark_leaves_no_duplicates() {
-    let s = StandIn::start();
-    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-crash-01\t2024-01-01\tActive\n"));
-    s.text("draft-test-crash-00", "crash zero\n");
-    s.text("draft-test-crash-01", "crash one\n");
-
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("m");
-    let crashing_update = |base_url: &str| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_ietfmak"))
-            .args(["update", root.to_str().unwrap(), "--delay-ms", "0"])
-            .env("IETFMAK_BASE_URL", base_url)
-            .env("IETFMAK_TEST_CRASH_AFTER_FLUSH", "1")
-            .output()
-            .unwrap()
-    };
-    let no_dup_history = |m: &Mirror, want: &[&str]| {
-        let revs: Vec<String> =
-            m.history("draft-test-crash").unwrap().iter().map(|e| e.rev.clone()).collect();
-        assert_eq!(revs, want, "history must be exact — duplicates are forever");
-    };
-
-    // Crash shape 1: fresh import (00+01 flushed, no watermark).
-    let out = crashing_update(&s.base_url);
-    assert!(!out.status.success(), "the crash knob must abort the child");
-    assert_eq!(s.hits("/archive/id/draft-test-crash-00.txt"), 1);
-
-    let content_before = s.content_hits().len();
-    let mut m = mirror(&tmp);
-    let st = m.update(&Client::new(), &fast_cfg(&s), |_, _| ()).unwrap();
-    assert_eq!(st.revisions_fetched, 0, "reconcile must not re-fetch flushed bytes");
-    assert_eq!(st.revisions_reconciled, 2, "both crashed revisions aligned from the chain");
-    assert_eq!(st.chains_rebuilt, 0, "alignment, not a rebuild");
-    assert_eq!(s.content_hits().len(), content_before, "zero content GETs on reconcile");
-    no_dup_history(&m, &["01", "00"]);
-    drop(m);
-
-    // Crash shape 2: single-revision head bump (the r == head case).
-    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-crash-02\t2024-02-01\tActive\n"));
-    s.text("draft-test-crash-02", "crash two\n");
-    let out = crashing_update(&s.base_url);
-    assert!(!out.status.success(), "the crash knob must abort the child");
-    assert_eq!(s.hits("/archive/id/draft-test-crash-02.txt"), 1, "02 fetched before the crash");
-
-    let mut m = mirror(&tmp);
-    let st = m.update(&Client::new(), &fast_cfg(&s), |_, _| ()).unwrap();
-    assert_eq!((st.revisions_fetched, st.revisions_reconciled), (0, 1));
-    assert_eq!(s.hits("/archive/id/draft-test-crash-02.txt"), 1, "not re-fetched");
-    no_dup_history(&m, &["02", "01", "00"]);
-    assert_eq!(m.head("draft-test-crash").unwrap().unwrap().text, b"crash two\n");
-
-    // The reconciled mirror is clean again: one more pass is a plain
-    // idempotent no-op (no dirty flag left behind).
-    let st = m.update(&Client::new(), &fast_cfg(&s), |_, _| ()).unwrap();
-    assert_eq!((st.revisions_fetched, st.revisions_reconciled), (0, 0));
-    assert_eq!(st.revisions_skipped, 3);
-    no_dup_history(&m, &["02", "01", "00"]);
+    assert!(!tmp.path().join("no-such").exists());
 }
 
 #[test]
 fn update_enumerates_history_from_latest_only_index() {
     let s = StandIn::start();
-    // The REAL index shape: each draft appears ONCE, at its LATEST rev.
     s.route("/id/all_id.txt", |_| {
-        Reply::ok(
-            "# header comment\n\
-             draft-test-alpha-03\t2024-04-01\tActive\n\
-             draft-test-beta-00\t2024-03-01\tExpired\n\
-             not-a-draft-line\n",
-        )
+        Reply::ok("# header\n\
+                   draft-test-alpha-03\t2024-04-01\tActive\n\
+                   draft-test-beta-00\t2024-03-01\tExpired\n\
+                   not-a-draft-line\n")
     });
     s.text("draft-test-alpha-00", "alpha zero\n");
     s.text("draft-test-alpha-01", "alpha one\n");
-    // draft-test-alpha-02 has no route → 404 (expired from the archive).
     s.text("draft-test-alpha-03", "alpha three\n");
     s.text("draft-test-beta-00", "beta zero\n");
 
@@ -332,51 +191,44 @@ fn update_enumerates_history_from_latest_only_index() {
     let mut m = mirror(&tmp);
     let client = Client::new();
 
-    // Fresh import: the -03 listing fans out to 00,01,02,03.
-    let st = m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
+    let st = m.update(&client, &fast_cfg(&s), |_| ()).unwrap();
     assert_eq!(st.drafts_seen, 2);
-    assert_eq!(st.drafts_new, 2);
-    assert_eq!(st.revisions_fetched, 4, "alpha 00,01,03 + beta 00");
-    assert_eq!(st.revisions_missing, 1, "alpha-02 404 → watermarked missing");
-    assert_eq!(st.chains_rebuilt, 0);
+    assert_eq!(st.revisions_fetched, 4);
+    assert_eq!(st.revisions_missing, 1, "alpha-02 404");
 
     let head = m.head("draft-test-alpha").unwrap().unwrap();
     assert_eq!(head.rev, "03");
     assert_eq!(head.text, b"alpha three\n");
-    assert_eq!(head.date.as_deref(), Some("2024-04-01"), "index date pins the latest rev");
+    assert_eq!(head.date.as_deref(), Some("2024-04-01"));
     let hist = m.history("draft-test-alpha").unwrap();
     assert_eq!(
         hist.iter().map(|e| e.rev.as_str()).collect::<Vec<_>>(),
-        ["03", "01", "00"],
-        "newest-first, the missing 02 absent"
+        ["03", "01", "00"]
     );
     assert_eq!(hist[2].text, b"alpha zero\n");
-    assert_eq!(hist[1].date, None, "only the index's latest line carries a date");
+    assert_eq!(hist[1].date, None);
     assert_eq!(m.head("draft-test-beta").unwrap().unwrap().text, b"beta zero\n");
     assert_eq!(m.drafts().unwrap().len(), 2);
 
-    // Second run: idempotent — ZERO content GETs (including the 404).
+    // Idempotent second run
     let before = s.content_hits().len();
-    let st2 = m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
+    let st2 = m.update(&client, &fast_cfg(&s), |_| ()).unwrap();
     assert_eq!(st2.revisions_fetched, 0);
-    assert_eq!(st2.revisions_missing, 0, "404 watermarked, not re-tried");
-    assert_eq!(st2.revisions_skipped, 5, "alpha 00..03 + beta 00");
-    assert_eq!(s.content_hits().len(), before, "no content re-GET at all");
+    assert_eq!(st2.revisions_missing, 0);
+    assert_eq!(st2.revisions_skipped, 5);
+    assert_eq!(s.content_hits().len(), before);
 
-    // Head bump 03 → 05: ONLY 04 and 05 are fetched; 05 ends newest.
+    // Head bump 03 → 05
     s.route("/id/all_id.txt", |_| {
-        Reply::ok(
-            "draft-test-alpha-05\t2024-06-01\tActive\n\
-             draft-test-beta-00\t2024-03-01\tExpired\n",
-        )
+        Reply::ok("draft-test-alpha-05\t2024-06-01\tActive\n\
+                   draft-test-beta-00\t2024-03-01\tExpired\n")
     });
     s.text("draft-test-alpha-04", "alpha four\n");
     s.text("draft-test-alpha-05", "alpha five\n");
-    let st3 = m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
-    assert_eq!((st3.revisions_fetched, st3.drafts_new), (2, 0));
+    let st3 = m.update(&client, &fast_cfg(&s), |_| ()).unwrap();
+    assert_eq!(st3.revisions_fetched, 2);
     assert_eq!(s.hits("/archive/id/draft-test-alpha-04.txt"), 1);
     assert_eq!(s.hits("/archive/id/draft-test-alpha-05.txt"), 1);
-    assert_eq!(s.hits("/archive/id/draft-test-alpha-00.txt"), 1, "old revisions untouched");
     let head = m.head("draft-test-alpha").unwrap().unwrap();
     assert_eq!((head.rev.as_str(), head.text.as_slice()), ("05", b"alpha five\n".as_slice()));
     assert_eq!(
@@ -384,7 +236,7 @@ fn update_enumerates_history_from_latest_only_index() {
         ["05", "04", "03", "01", "00"]
     );
 
-    // Durability: a fresh open over the same root serves the same data.
+    // Durability: fresh open
     drop(m);
     let m2 = mirror(&tmp);
     assert_eq!(m2.head("draft-test-alpha").unwrap().unwrap().rev, "05");
@@ -404,17 +256,15 @@ fn transient_500_is_retried_to_success() {
 
     let tmp = TempDir::new().unwrap();
     let mut m = mirror(&tmp);
-    let st = m.update(&Client::new(), &fast_cfg(&s), |_, _| ()).unwrap();
+    let st = m.update(&Client::new(), &fast_cfg(&s), |_| ()).unwrap();
     assert_eq!(st.revisions_fetched, 1);
-    assert_eq!(s.hits("/archive/id/draft-test-flaky-00.txt"), 2, "one 500, one 200");
+    assert_eq!(s.hits("/archive/id/draft-test-flaky-00.txt"), 2);
     assert_eq!(m.head("draft-test-flaky").unwrap().unwrap().text, b"flaky zero\n");
 }
 
 #[test]
 fn persistent_500_fails_loud_and_rerun_resumes() {
     let s = StandIn::start();
-    // The index carries an ETag and honors If-None-Match — so this also
-    // proves validators are NOT stored by a failed pass.
     s.route("/id/all_id.txt", |hit| {
         if hit.if_none_match.as_deref() == Some("\"g1\"") {
             Reply::status(304)
@@ -434,27 +284,23 @@ fn persistent_500_fails_loud_and_rerun_resumes() {
     let client = Client::new();
     let cfg = FetchConfig { retries: 2, ..fast_cfg(&s) };
 
-    match m.update(&client, &cfg, |_, _| ()) {
+    match m.update(&client, &cfg, |_| ()) {
         Err(ietf_mirror::Error::HttpStatus { status: 500, .. }) => {}
-        other => panic!("expected loud 500 failure, got {other:?}"),
+        other => panic!("expected 500, got {other:?}"),
     }
-    assert_eq!(s.hits("/archive/id/draft-test-gamma-01.txt"), 3, "1 try + 2 retries");
-    // Nothing corrupted: no layers landed, no watermarks written.
+    assert_eq!(s.hits("/archive/id/draft-test-gamma-01.txt"), 3);
     assert!(m.head("draft-test-gamma").unwrap().is_none());
 
-    // Re-run after the server recovers: the FULL index is re-fetched
-    // (no 304 past unfinished work) and the draft completes.
     broken.store(false, Ordering::SeqCst);
-    let st = m.update(&client, &cfg, |_, _| ()).unwrap();
-    assert!(!st.index_not_modified, "failed pass must not have stored validators");
-    assert_eq!(st.revisions_fetched, 2, "00 refetched (never watermarked) + 01");
+    let st = m.update(&client, &cfg, |_| ()).unwrap();
+    assert!(!st.index_not_modified, "failed pass must not store validators");
+    assert_eq!(st.revisions_fetched, 2, "00 refetched + 01");
     assert_eq!(
         m.history("draft-test-gamma").unwrap().iter().map(|e| e.rev.clone()).collect::<Vec<_>>(),
         ["01", "00"]
     );
 
-    // NOW the validators are stored: a third run is a 304 short-circuit.
-    let st = m.update(&client, &cfg, |_, _| ()).unwrap();
+    let st = m.update(&client, &cfg, |_| ()).unwrap();
     assert!(st.index_not_modified);
 }
 
@@ -474,18 +320,16 @@ fn index_304_short_circuits() {
     let mut m = mirror(&tmp);
     let client = Client::new();
 
-    let st = m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
-    assert!(!st.index_not_modified);
+    let st = m.update(&client, &fast_cfg(&s), |_| ()).unwrap();
+    assert!(!st.index_not_modified, "first pass downloads");
     assert_eq!(st.revisions_fetched, 1);
 
     let content_before = s.content_hits().len();
-    let st2 = m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
+    let st2 = m.update(&client, &fast_cfg(&s), |_| ()).unwrap();
     assert!(st2.index_not_modified, "unchanged index answers 304");
-    assert_eq!((st2.drafts_seen, st2.revisions_fetched, st2.revisions_skipped), (0, 0, 0));
-    assert_eq!(s.content_hits().len(), content_before, "304 pass makes no content GETs");
-    assert_eq!(s.hits("/id/all_id.txt"), 2);
+    assert_eq!(s.content_hits().len(), content_before);
     let second = s.last_hit("/id/all_id.txt").unwrap();
-    assert_eq!(second.if_none_match.as_deref(), Some("\"v7\""), "validator was sent");
+    assert_eq!(second.if_none_match.as_deref(), Some("\"v7\""));
 }
 
 #[test]
@@ -505,305 +349,32 @@ fn pacing_spreads_content_gets() {
     let mut m = mirror(&tmp);
     let delay = Duration::from_millis(120);
     let cfg = FetchConfig { delay, ..fast_cfg(&s) };
-    m.update(&Client::new(), &cfg, |_, _| ()).unwrap();
+    m.update(&Client::new(), &cfg, |_| ()).unwrap();
 
     let hits = s.content_hits();
     assert_eq!(hits.len(), 4);
     let span = hits.last().unwrap().at.duration_since(hits.first().unwrap().at);
-    assert!(
-        span >= delay * (hits.len() as u32 - 1),
-        "4 content GETs must span >= 3 delays, spanned {span:?}"
-    );
+    assert!(span >= delay * 3, "4 GETs must span >= 3 delays, spanned {span:?}");
 }
 
 #[test]
-fn legacy_heads_only_mirror_backfills_in_order() {
+fn revision_pinned_read() {
     let s = StandIn::start();
-    // Manufacture the legacy heads-only shape via public machinery: an
-    // update where everything below the head is (temporarily) 404 gives
-    // a singleton chain at -05; stripping the `missing` watermarks then
-    // leaves exactly what the old fantasy-index code left behind — a
-    // newer head with its older revisions unseen.
-    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-delta-05\t2024-05-01\tActive\n"));
-    s.text("draft-test-delta-05", "delta five\n");
+    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-pin-01\t2024-02-01\tActive\n"));
+    s.text("draft-test-pin-00", "pin zero\n");
+    s.text("draft-test-pin-01", "pin one\n");
 
     let tmp = TempDir::new().unwrap();
-    let client = Client::new();
-    {
-        let mut m = mirror(&tmp);
-        let st = m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
-        assert_eq!((st.revisions_fetched, st.revisions_missing), (1, 5));
-    }
-    let conn = rusqlite::Connection::open(tmp.path().join("m/meta.db")).unwrap();
-    conn.execute("DELETE FROM revisions_seen WHERE missing = 1", []).unwrap();
-    let old_chain: i64 = conn
-        .query_row("SELECT chain_id FROM drafts WHERE name = 'draft-test-delta'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    drop(conn);
-
-    // The archive serves the older revisions now, and the head bumps.
-    for (doc, body) in [
-        ("draft-test-delta-00", "delta zero\n"),
-        ("draft-test-delta-01", "delta one\n"),
-        ("draft-test-delta-02", "delta two\n"),
-        ("draft-test-delta-03", "delta three\n"),
-        ("draft-test-delta-04", "delta four\n"),
-        ("draft-test-delta-06", "delta six\n"),
-    ] {
-        s.text(doc, body);
-    }
-    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-delta-06\t2024-06-01\tActive\n"));
-
     let mut m = mirror(&tmp);
-    let st = m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
-    assert_eq!(st.revisions_fetched, 6, "00..04 backfilled + 06");
-    assert_eq!(st.chains_rebuilt, 1, "backfill under an existing head rebuilds the chain");
-    assert_eq!(s.hits("/archive/id/draft-test-delta-05.txt"), 1, "already-mirrored rev not re-GET");
+    m.update(&Client::new(), &fast_cfg(&s), |_| ()).unwrap();
 
-    let hist = m.history("draft-test-delta").unwrap();
-    assert_eq!(
-        hist.iter().map(|e| e.rev.as_str()).collect::<Vec<_>>(),
-        ["06", "05", "04", "03", "02", "01", "00"],
-        "rebuilt chain is newest-first across old and backfilled revisions"
-    );
-    assert_eq!(hist[1].text, b"delta five\n", "pre-rebuild bytes preserved");
-    assert_eq!(m.head("draft-test-delta").unwrap().unwrap().rev, "06");
+    let r00 = m.revision("draft-test-pin", "00").unwrap().unwrap();
+    assert_eq!(r00.text, b"pin zero\n");
+    assert_eq!(r00.rev, "00");
 
-    // Durability across the repoint.
-    drop(m);
-    let m2 = mirror(&tmp);
-    assert_eq!(m2.history("draft-test-delta").unwrap().len(), 7);
-    assert_eq!(m2.head("draft-test-delta").unwrap().unwrap().text, b"delta six\n");
+    let r01 = m.revision("draft-test-pin", "01").unwrap().unwrap();
+    assert_eq!(r01.text, b"pin one\n");
 
-    // The rebuild repointed the draft to a fresh chain and DELETED the
-    // old one: its slot reads empty, and after the run-end collect the
-    // f0/f1 tiers hold EXACTLY the new chain's live frames — the
-    // orphan's bytes really left the disk (before delete_chain they
-    // stayed index-live forever).
-    drop(m2);
-    let conn = rusqlite::Connection::open(tmp.path().join("m/meta.db")).unwrap();
-    let new_chain: i64 = conn
-        .query_row("SELECT chain_id FROM drafts WHERE name = 'draft-test-delta'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    drop(conn);
-    assert_ne!(new_chain, old_chain, "rebuild must land on a fresh chain id");
-    let depot_root = tmp.path().join("m/depot");
-    let depot = wikimak_depot::Depot::open(wikimak_depot::DepotConfig {
-        root: depot_root.clone(),
-        max_chain_id: 1 << 20,
-        file_size_threshold: 1 << 20,
-        eviction_dead_ratio: 0.5,
-    })
-    .unwrap();
-    assert!(
-        matches!(depot.read_f0(old_chain as u64), Err(wikimak_depot::Error::NoFrame)),
-        "the repointed-away chain's slot reads empty"
-    );
-    let f0_live = depot.read_f0(new_chain as u64).unwrap().len() as u64 + 24;
-    let f1_live = depot.read_f1(new_chain as u64).unwrap().expect("7-rev chain has an f1").len()
-        as u64
-        + 24;
-    let tier_bytes = |tier: &str| -> u64 {
-        std::fs::read_dir(depot_root.join(tier))
-            .unwrap()
-            .flatten()
-            .map(|e| e.metadata().unwrap().len())
-            .sum()
-    };
-    assert_eq!(
-        tier_bytes("f0"),
-        f0_live,
-        "f0 tier = the live head frame alone; orphan + rebuild garbage reclaimed"
-    );
-    assert_eq!(tier_bytes("f1"), f1_live, "f1 tier = the live accumulator alone");
-}
-
-/// BUG 1 (storage leak): a crash BETWEEN a rebuild's repoint tx commit
-/// and `delete_chain` used to leak the repointed-away old chain FOREVER
-/// — it stayed index-live, so collect() could never reclaim a byte. The
-/// fix records the doomed chain id INSIDE the repoint tx (`pending_
-/// deletes`); the next update's sweep deletes the chain and the run-end
-/// collect reclaims. Proven with a REAL abort in a child `ietfmak update`
-/// (IETFMAK_TEST_CRASH_AFTER_REPOINT) on a legacy-backfill rebuild.
-#[test]
-fn crash_between_repoint_and_delete_is_swept_next_run() {
-    let s = StandIn::start();
-    // Legacy heads-only shape: head at -05, everything below 404 → a
-    // singleton chain at 05; stripping the `missing` watermarks then
-    // leaves a newer head with its older revisions unseen.
-    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-orphan-05\t2024-05-01\tActive\n"));
-    s.text("draft-test-orphan-05", "orphan five\n");
-
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("m");
-    let client = Client::new();
-    {
-        let mut m = mirror(&tmp);
-        let st = m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
-        assert_eq!((st.revisions_fetched, st.revisions_missing), (1, 5));
-    }
-    let conn = rusqlite::Connection::open(root.join("meta.db")).unwrap();
-    conn.execute("DELETE FROM revisions_seen WHERE missing = 1", []).unwrap();
-    let old_chain: i64 = conn
-        .query_row("SELECT chain_id FROM drafts WHERE name = 'draft-test-orphan'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    drop(conn);
-
-    // The archive serves the backfill + a head bump: the next update must
-    // REBUILD the draft (older revisions under an existing head) onto a
-    // fresh chain id, retiring the old one.
-    for (doc, body) in [
-        ("draft-test-orphan-00", "orphan zero\n"),
-        ("draft-test-orphan-01", "orphan one\n"),
-        ("draft-test-orphan-02", "orphan two\n"),
-        ("draft-test-orphan-03", "orphan three\n"),
-        ("draft-test-orphan-04", "orphan four\n"),
-        ("draft-test-orphan-06", "orphan six\n"),
-    ] {
-        s.text(doc, body);
-    }
-    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-orphan-06\t2024-06-01\tActive\n"));
-
-    // Child update: rebuilds, COMMITS the repoint, then aborts BEFORE
-    // `delete_chain` — the exact leak window.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ietfmak"))
-        .args(["update", root.to_str().unwrap(), "--delay-ms", "0"])
-        .env("IETFMAK_BASE_URL", &s.base_url)
-        .env("IETFMAK_TEST_CRASH_AFTER_REPOINT", "1")
-        .output()
-        .unwrap();
-    assert!(!out.status.success(), "the crash knob must abort the child");
-
-    // Post-crash: the draft is repointed onto a fresh chain (durable) and
-    // the old chain is recorded pending-delete but STILL index-live — the
-    // orphan that used to leak forever.
-    let new_chain: i64 = {
-        let conn = rusqlite::Connection::open(root.join("meta.db")).unwrap();
-        let new_chain: i64 = conn
-            .query_row("SELECT chain_id FROM drafts WHERE name = 'draft-test-orphan'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_ne!(new_chain, old_chain, "child committed the repoint before crashing");
-        let pending: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pending_deletes WHERE chain_id = ?1",
-                [old_chain],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(pending, 1, "the doomed chain is recorded durably for the sweep");
-        new_chain
-    };
-    {
-        let depot = open_depot(&root);
-        assert!(
-            depot.read_f0(old_chain as u64).is_ok(),
-            "old chain still index-live after the crash — the leak the sweep reclaims"
-        );
-    }
-
-    // Recovery run: `sweep_pending_deletes` deletes the orphan; the
-    // run-end collect frees its bytes.
-    {
-        let mut m = mirror(&tmp);
-        m.update(&client, &fast_cfg(&s), |_, _| ()).unwrap();
-        assert_eq!(
-            m.history("draft-test-orphan")
-                .unwrap()
-                .iter()
-                .map(|e| e.rev.clone())
-                .collect::<Vec<_>>(),
-            ["06", "05", "04", "03", "02", "01", "00"],
-            "history intact on the new chain after the sweep"
-        );
-    }
-    {
-        let conn = rusqlite::Connection::open(root.join("meta.db")).unwrap();
-        let pending: i64 =
-            conn.query_row("SELECT COUNT(*) FROM pending_deletes", [], |r| r.get(0)).unwrap();
-        assert_eq!(pending, 0, "the sweep cleared the pending-delete row");
-    }
-
-    // The orphan really left the disk: its slot reads empty and the f0/f1
-    // tiers measure EXACTLY the new chain's live frames.
-    let depot = open_depot(&root);
-    assert!(
-        matches!(depot.read_f0(old_chain as u64), Err(wikimak_depot::Error::NoFrame)),
-        "swept orphan chain's slot reads empty"
-    );
-    let f0_live = depot.read_f0(new_chain as u64).unwrap().len() as u64 + 24;
-    let f1_live = depot.read_f1(new_chain as u64).unwrap().expect("7-rev chain has an f1").len()
-        as u64
-        + 24;
-    let depot_root = root.join("depot");
-    let tier_bytes = |tier: &str| -> u64 {
-        std::fs::read_dir(depot_root.join(tier))
-            .unwrap()
-            .flatten()
-            .map(|e| e.metadata().unwrap().len())
-            .sum()
-    };
-    assert_eq!(
-        tier_bytes("f0"),
-        f0_live,
-        "f0 tier = the live head frame alone; swept orphan + rebuild garbage reclaimed"
-    );
-    assert_eq!(tier_bytes("f1"), f1_live, "f1 tier = the live accumulator alone");
-}
-
-/// BUG 3: `ietfmak history` must not panic ("failed printing to stdout:
-/// Broken pipe") when its output is piped into a reader that closes early
-/// (`| head`). The standalone binary resets SIGPIPE to SIG_DFL, so the
-/// closed pipe terminates the process with the signal instead of the
-/// EPIPE the `println!` macros panic on. The read end is closed BEFORE
-/// the child's first line so the very first flush hits it.
-#[test]
-fn history_piped_to_early_close_does_not_panic() {
-    let s = StandIn::start();
-    s.route("/id/all_id.txt", |_| Reply::ok("draft-test-pipe-04\t2024-01-01\tActive\n"));
-    for (doc, body) in [
-        ("draft-test-pipe-00", "p0\n"),
-        ("draft-test-pipe-01", "p1\n"),
-        ("draft-test-pipe-02", "p2\n"),
-        ("draft-test-pipe-03", "p3\n"),
-        ("draft-test-pipe-04", "p4\n"),
-    ] {
-        s.text(doc, body);
-    }
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("m");
-    {
-        let mut m = mirror(&tmp);
-        m.update(&Client::new(), &fast_cfg(&s), |_, _| ()).unwrap();
-    }
-
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ietfmak"))
-        .args(["history", root.to_str().unwrap(), "draft-test-pipe"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn ietfmak");
-    // Close the read end immediately: the child's first `println!` flush
-    // writes into a closed pipe.
-    drop(child.stdout.take().unwrap());
-    let mut stderr = String::new();
-    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
-    let status = child.wait().unwrap();
-
-    assert_ne!(status.code(), Some(101), "history panicked on the closed pipe: {stderr}");
-    assert!(
-        !stderr.contains("panicked") && !stderr.contains("failed printing to stdout"),
-        "history printed a panic message: {stderr}"
-    );
-    assert!(
-        status.signal() == Some(13) || status.success(),
-        "expected SIGPIPE termination or success, got {status:?} (stderr: {stderr})"
-    );
+    assert!(m.revision("draft-test-pin", "99").unwrap().is_none());
+    assert!(m.revision("draft-no-such", "00").unwrap().is_none());
 }

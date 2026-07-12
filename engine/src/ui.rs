@@ -512,6 +512,14 @@ enum Modal {
         result: String,
         testing: bool,
     },
+    /// The `:` command prompt. Tab-completes from the action registry.
+    /// Enter dispatches the typed verb (or CLI-style command path)
+    /// through the registry. Esc cancels.
+    Command {
+        buf: String,
+        completions: Vec<&'static str>,
+        sel: usize,
+    },
 }
 
 /// One level of the image-picker menu stack.
@@ -606,6 +614,7 @@ enum Action {
     MirrorTogglePause,
     MirrorRemove,
     MirrorBrowse,
+    MirrorRead,
     PtyNew,
     PtyKill,
     PtyEmbedToggle,
@@ -3423,23 +3432,26 @@ impl App {
         }
     }
 
-    /// 'V' on Mirrors: read the selected WIKI mirror in the document reader —
-    /// pages render from the wikimak store in-process (no serve, no browser
-    /// box, no network); internal links follow inside the reader.
+    /// 'V' on Mirrors: read the selected mirror in the document reader.
+    /// Wiki mirrors render pages from the wikimak store in-process; ietf
+    /// mirrors show a draft list, and following a draft opens its text.
     fn mirror_read_selected(&mut self) {
         let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
             self.status = "no mirror job selected".into();
             return;
         };
-        if job.kind != "wiki" {
-            self.status = format!(
-                "mirror #{}: the reader is for wiki mirrors (this is {})",
-                job.id, job.kind);
-            return;
-        }
-        match crate::reader::Reader::open_wiki(
-            std::path::PathBuf::from(&job.dest), None)
-        {
+        let dest = std::path::PathBuf::from(&job.dest);
+        let result = match job.kind.as_str() {
+            "wiki" => crate::reader::Reader::open_wiki(dest, None),
+            "ietf" => crate::reader::Reader::open_ietf(dest, None),
+            _ => {
+                self.status = format!(
+                    "mirror #{}: reader supports wiki and ietf (this is {})",
+                    job.id, job.kind);
+                return;
+            }
+        };
+        match result {
             Ok(r) => self.reader_mount(r),
             Err(e) => self.status = format!("mirror #{}: {e}", job.id),
         }
@@ -3480,6 +3492,79 @@ impl App {
         match crate::reader::Reader::open_bytes(format!("box:{sid}:/{rel}"), raw) {
             Ok(r) => self.reader_mount(r),
             Err(e) => self.status = e.to_string(),
+        }
+    }
+
+    // ── command prompt ──
+
+    /// `:` opens the command prompt. Tab completes from the action registry.
+    fn open_command_prompt(&mut self) {
+        self.modal = Some(Modal::Command {
+            buf: String::new(),
+            completions: crate::registry::complete(""),
+            sel: 0,
+        });
+    }
+
+    /// Dispatch a command typed in the `:` prompt. The input can be:
+    ///   - A verb name: `mirror_run 5` → verb `mirror_run` with args `["5"]`
+    ///   - A CLI-style path: `mirror run 5` → looked up via cli_map()
+    ///   - A bare verb with no args: `mirror_jobs`
+    /// Args after the verb are whitespace-split. Integer args become JSON
+    /// numbers; everything else stays a string. The result is sent over
+    /// the control socket as `{"type":"ui","verb":"<name>","args":[...]}`.
+    fn dispatch_command(&mut self, input: &str) {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        if parts.is_empty() {
+            self.status = "command: empty".into();
+            return;
+        }
+
+        // Try exact verb match first, then CLI path lookup.
+        let (verb, arg_start) = if crate::registry::find(parts[0]).is_some() {
+            (parts[0], 1)
+        } else if parts.len() >= 2 {
+            // Try two-word CLI path: ["mirror", "run"]
+            let path: Vec<&str> = parts[..2].iter().copied().collect();
+            if let Some(v) = crate::registry::verb_for_cli(&path) {
+                (v, 2)
+            } else {
+                // Single-word: maybe it's a verb we don't have in the registry
+                // but the engine knows (e.g. "session_dicts"). Send it anyway.
+                (parts[0], 1)
+            }
+        } else {
+            (parts[0], 1)
+        };
+
+        let args: Vec<Value> = parts[arg_start..].iter().map(|s| {
+            if let Ok(n) = s.parse::<i64>() {
+                Value::Number(n.into())
+            } else if *s == "true" || *s == "false" {
+                Value::Bool(s.parse::<bool>().unwrap())
+            } else {
+                Value::String(s.to_string())
+            }
+        }).collect();
+
+        match rpc(&self.sock, verb, Value::Array(args)) {
+            Ok(v) => {
+                if v.get("ok").and_then(Value::as_bool) == Some(false) {
+                    self.status = format!("command: {}",
+                        v.get("error").and_then(Value::as_str).unwrap_or("failed"));
+                } else {
+                    // Success — show a brief summary
+                    let summary = if let Some(obj) = v.get("r").and_then(Value::as_object) {
+                        format!("{}: {} keys", verb, obj.len())
+                    } else if let Some(arr) = v.get("r").and_then(Value::as_array) {
+                        format!("{}: {} items", verb, arr.len())
+                    } else {
+                        format!("{}: ok", verb)
+                    };
+                    self.status = summary;
+                }
+            }
+            Err(e) => self.status = format!("command: {e}"),
         }
     }
 
@@ -7120,7 +7205,7 @@ fn mirror_due_label(next_due: Option<i64>) -> String {
 /// MIRRORS pane: one row per mirror-update job.
 fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
-        "scheduled mirror updates — r run selected · R run pending · space pause/resume",
+        "scheduled mirror updates — r run selected · R run pending · V read · space pause/resume",
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.mirror_jobs.is_empty() {
@@ -7357,6 +7442,9 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             (models.len() as u16 + 1).clamp(1, 18) + 7,
         // 3 fields + header + result + help + borders.
         Modal::ApiConfig { .. } => 11,
+        Modal::Command { completions, .. } => {
+            5 + (completions.len().min(10)) as u16 + 2
+        }
         Modal::Report { lines, .. } => (lines.len() as u16) + 4,
         _ => 7,
     };
@@ -7804,6 +7892,47 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         // Rendered by the early-return at the top of draw_modal (it owns its
         // own rect); this arm only satisfies exhaustiveness.
         Modal::ImageView { .. } => (" image ", vec![]),
+        Modal::Command { buf, completions, sel } => {
+            let mut body = vec![
+                Line::from(Span::styled(
+                    "command prompt — type a verb name (Tab completes)",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(": ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw(buf.clone()),
+                    Span::raw("_"),
+                ]),
+            ];
+            if !completions.is_empty() {
+                body.push(Line::from(""));
+                body.push(Line::from(Span::styled(
+                    "completions:",
+                    Style::default().fg(Color::DarkGray))));
+                let show = completions.iter().take(10);
+                for (i, c) in show.enumerate() {
+                    let style = if i == *sel {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    body.push(Line::from(vec![
+                        Span::styled("  ", style),
+                        Span::styled(*c, style),
+                    ]));
+                }
+                if completions.len() > 10 {
+                    body.push(Line::from(Span::styled(
+                        format!("  ... and {} more", completions.len() - 10),
+                        Style::default().fg(Color::DarkGray))));
+                }
+            }
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "Tab cycle · Enter dispatch · Esc cancel",
+                Style::default().fg(Color::Gray))));
+            (" : ", body)
+        }
     };
     let p = Paragraph::new(Text::from(body))
         .block(
@@ -7907,7 +8036,7 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
     ('g', Pane::BuildEdges, "Build",   PaneVis::Data("edges"),     "build Graph — parsed ninja/make build edges from a -b box"),
     ('f', Pane::Flows,      "Flows",   PaneVis::Always,            "network flows — tshark-decoded HTTP/TLS from a -n box's pcap"),
     ('e', Pane::Rules,      "Rules",   PaneVis::Always,            "file rules — the ordered apply/discard/passthrough rules"),
-    ('M', Pane::Mirrors,    "Mirrors", PaneVis::Always,            "scheduled mirror updates — r run selected, R run pending, space pause/resume, D delete"),
+    ('M', Pane::Mirrors,    "Mirrors", PaneVis::Always,            "scheduled mirror updates — r run selected, R run pending, V read, space pause/resume, D delete"),
     ('u', Pane::Reader,     "Read",    PaneVis::Always,            "docUment reader — html/md/text files + wiki mirror pages; o open, z fullscreen"),
     ('W', Pane::Editor,     "Edit",    PaneVis::Always,            "text editor (W = Write) — syntax-highlighted vim-modal editing of host + box files; Ctrl-S save, z fullscreen"),
     ('P', Pane::Pty,        "PTYs",    PaneVis::Pty,               "open an engine-held PTY — a live interactive shell pane"),
@@ -8004,6 +8133,7 @@ enum PaneAction {
     ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
     ToggleEdgeRunning,
     ToggleMark, RangeMark,
+    CommandOpen,
 }
 
 /// The main-loop pane keymap. ORDER MATTERS, and reproduces the original inline
@@ -8027,6 +8157,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     (Key::Tab,       PaneGate::Any,             PaneAction::NextPane,        None),
     (Key::Enter,     PaneGate::Any,             PaneAction::Open,            None),
     (Key::Char('m'), PaneGate::Any,             PaneAction::ActionMenu,      Some("actions popup for the selected row")),
+    (Key::Char(':'), PaneGate::Any,             PaneAction::CommandOpen,     Some("command prompt (Tab completes verbs)")),
     (Key::Char('a'), PaneGate::On(Pane::Hunks), PaneAction::ApplyHunk,       None),
     (Key::Char('x'), PaneGate::On(Pane::Hunks), PaneAction::DiscardHunk,     None),
     (Key::Char('d'), PaneGate::On(Pane::Hunks), PaneAction::DiscardHunk,     None),
@@ -8082,6 +8213,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         }
         PaneAction::ToggleMark => app.toggle_mark(),
         PaneAction::RangeMark => app.range_mark(),
+        PaneAction::CommandOpen => app.open_command_prompt(),
         PaneAction::ApplyHunk => app.apply_hunk(),
         PaneAction::DiscardHunk => app.discard_hunk(),
         PaneAction::ApplyFile => app.apply(),
@@ -8331,7 +8463,7 @@ fn cmdline_spans(app: &App) -> Vec<Span<'static>> {
         }
     }
     vec![prompt,
-         Span::styled("(idle — '/' filter · 'm' row actions · F2-F5 screens/windows)",
+         Span::styled("(idle — '/' filter · ':' command · 'm' row actions)",
              Style::default().add_modifier(Modifier::DIM))]
 }
 
@@ -12962,6 +13094,7 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                    "space", Action::MirrorTogglePause),
                 mk("Delete this job",     "D", Action::MirrorRemove),
                 mk("Browse this wiki",    "b", Action::MirrorBrowse),
+                mk("Read in document reader", "V", Action::MirrorRead),
             ]))
         }
         Pane::Pty => {
@@ -13031,6 +13164,7 @@ fn run_action(app: &mut App, a: Action) {
         Action::MirrorTogglePause => app.mirror_toggle_pause(),
         Action::MirrorRemove      => app.confirm_mirror_remove(),
         Action::MirrorBrowse      => app.mirror_browse_selected(),
+        Action::MirrorRead        => app.mirror_read_selected(),
         Action::PtyNew         => open_pty_menu(app),
         // Every launch below funnels through build_launch(target, how) — one
         // builder, the same net/env/placement for all. Targets that are ready
@@ -13687,6 +13821,44 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 }
                 _ => reopen(app, base_url, model, api_key, field,
                             result, testing),
+            }
+        }
+        Modal::Command { mut buf, mut completions, mut sel } => {
+            match code {
+                KeyCode::Esc => app.status = "command cancelled".into(),
+                KeyCode::Enter => {
+                    let input = buf.trim().to_string();
+                    if input.is_empty() {
+                        app.status = "command: empty input".into();
+                    } else {
+                        app.dispatch_command(&input);
+                    }
+                }
+                KeyCode::Tab => {
+                    // Cycle through completions
+                    if !completions.is_empty() {
+                        sel = (sel + 1) % completions.len();
+                        buf = completions[sel].to_string();
+                        app.modal = Some(Modal::Command { buf, completions, sel });
+                    }
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                    // Recompute completions
+                    completions = crate::registry::complete(&buf);
+                    sel = 0;
+                    if !completions.is_empty() {
+                        buf = completions[0].to_string();
+                    }
+                    app.modal = Some(Modal::Command { buf, completions, sel });
+                }
+                KeyCode::Char(c) => {
+                    buf.push(c);
+                    completions = crate::registry::complete(&buf);
+                    sel = 0;
+                    app.modal = Some(Modal::Command { buf, completions, sel });
+                }
+                _ => app.modal = Some(Modal::Command { buf, completions, sel }),
             }
         }
     }

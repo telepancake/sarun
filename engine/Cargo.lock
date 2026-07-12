@@ -1537,14 +1537,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "depot-vbf"
-version = "0.0.0"
-dependencies = [
- "depot",
- "wikimak-depot",
-]
-
-[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3114,11 +3106,11 @@ name = "ietf-mirror"
 version = "0.0.0"
 dependencies = [
  "depot",
- "depot-vbf",
  "libc",
  "reqwest 0.12.28",
  "rusqlite",
  "thiserror 1.0.69",
+ "zstd",
 ]
 
 [[package]]

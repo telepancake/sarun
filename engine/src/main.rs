@@ -53,6 +53,8 @@ mod overlay;
 mod paths;
 mod pty;
 mod reader;
+mod registry;
+mod parser;
 mod review;
 mod rules;
 mod runner;
