@@ -520,6 +520,10 @@ impl BoxDepot for BoxState {
     }
 
     fn set_whiteout(&self, rel: &str, writer: i64) {
+        let stale_rowid = match self.kinds.read().unwrap().get(rel) {
+            Some(Entry::File { rowid, .. }) => Some(*rowid),
+            _ => None,
+        };
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO sqlar(name,mode,mtime,sz,data,writer,last_writer)
@@ -528,6 +532,9 @@ impl BoxDepot for BoxState {
             params![rel, S_IFCHR, writer],
         );
         drop(conn);
+        if let Some(rid) = stale_rowid {
+            let _ = std::fs::remove_file(blob_path(self.id, rid));
+        }
         self.kinds.write().unwrap().insert(rel.to_string(), Entry::Whiteout);
     }
 
@@ -538,11 +545,18 @@ impl BoxDepot for BoxState {
     fn rename_row(&self, old: &str, new: &str) {
         let entry = self.kinds.read().unwrap().get(old).cloned();
         let Some(entry) = entry else { return };
+        let stale_rowid = match self.kinds.read().unwrap().get(new) {
+            Some(Entry::File { rowid, .. }) => Some(*rowid),
+            _ => None,
+        };
         {
             let conn = self.conn.lock().unwrap();
             let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [new]);
             let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1",
                                  params![old, new]);
+        }
+        if let Some(rid) = stale_rowid {
+            let _ = std::fs::remove_file(blob_path(self.id, rid));
         }
         let mut k = self.kinds.write().unwrap();
         k.remove(old);
@@ -563,13 +577,18 @@ impl BoxDepot for BoxState {
             let it = st.query_map(params![old, like], |r| r.get::<_, String>(0));
             match it { Ok(it) => it.flatten().collect(), Err(_) => return }
         };
+        let kinds = self.kinds.read().unwrap();
         for name in &names {
             let nn = if name == old { new.to_string() }
                      else { format!("{new}/{}", &name[op.len()..]) };
+            if let Some(Entry::File { rowid, .. }) = kinds.get(&nn) {
+                let _ = std::fs::remove_file(blob_path(self.id, *rowid));
+            }
             let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [&nn]);
             let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1",
                                  params![name, nn]);
         }
+        drop(kinds);
         drop(conn);
         let mut k = self.kinds.write().unwrap();
         for name in names {
@@ -955,6 +974,63 @@ mod tests {
         assert_eq!(std::fs::read(blob_path(dst_id, n.rowid)).unwrap(),
                    b"contents");
         assert_eq!(n.mtime, 1234);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn fresh_box(label: &str) -> (BoxState, i64, std::path::PathBuf) {
+        let tmp = std::env::temp_dir()
+            .join(format!("sarun-depotblob-{}-{}", std::process::id(), label));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let id = 9201;
+        let b = BoxState::create(id).unwrap();
+        (b, id, tmp)
+    }
+
+    fn add_file(b: &BoxState, id: i64, rel: &str, content: &[u8]) -> std::path::PathBuf {
+        let rid = b.ensure_file_row(rel, 0o100644, 0);
+        let bp = blob_path(id, rid);
+        std::fs::create_dir_all(bp.parent().unwrap()).unwrap();
+        std::fs::write(&bp, content).unwrap();
+        b.finalize_file(rel, content.len() as i64, 0, 0);
+        bp
+    }
+
+    #[test]
+    fn rename_row_cleans_up_overwritten_blob() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, id, tmp) = fresh_box("rename");
+        let bp_dst = add_file(&b, id, "dst", b"old dst");
+        let _bp_src = add_file(&b, id, "src", b"src");
+        assert!(bp_dst.exists());
+        b.rename_row("src", "dst");
+        assert!(!bp_dst.exists(), "rename_row orphaned the overwritten blob");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn set_whiteout_cleans_up_overwritten_blob() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, id, tmp) = fresh_box("whiteout");
+        let bp = add_file(&b, id, "victim", b"will be whited out");
+        assert!(bp.exists());
+        b.set_whiteout("victim", 0);
+        assert!(!bp.exists(), "set_whiteout orphaned the blob");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn reparent_cleans_up_overwritten_blobs() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, id, tmp) = fresh_box("reparent");
+        let bp_a = add_file(&b, id, "src/f", b"src f");
+        let bp_dst = add_file(&b, id, "dst/f", b"dst f");
+        assert!(bp_dst.exists());
+        b.reparent("src", "dst");
+        assert!(!bp_dst.exists(), "reparent orphaned the overwritten blob");
+        assert!(bp_a.exists(), "reparent should preserve the moved blob");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
