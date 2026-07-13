@@ -111,6 +111,8 @@ fn top_level_help() -> &'static str {
        sarun oci <load|run|build|save|dockerfile|author> ...   OCI images (`sarun oci -h`)\n  \
        sarun oaita <gen|run|call|tail|add|where> NAME          LLM chat/agent runner (`oaita -h`)\n  \
        sarun web <export-wacz|import-wacz> ...                 WACZ web-archive interop\n  \
+       sarun browser [FLAGS] URL        engine-native textmode browser (headless Chromium)\n  \
+       sarun engine                     alias for serve (headless)\n  \
        sarun --once --sock PATH           render one UI frame and exit (headless)\n\
      \n\
      run FLAGS:\n  \

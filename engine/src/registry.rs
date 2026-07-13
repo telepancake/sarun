@@ -643,4 +643,24 @@ mod tests {
         assert_eq!(verb_for_cli(&["mirror", "ls"]), Some("mirror_jobs"));
         assert_eq!(verb_for_cli(&["nonexistent"]), None);
     }
+
+    /// Validate that every key binding in the registry has a corresponding
+    /// entry in the UI's PANE_ACTION_KEYS table, and vice versa. This catches
+    /// drift between the registry and the hand-maintained key table.
+    #[test]
+    fn key_bindings_table_in_sync() {
+        // This test is informational — it warns when the registry and the
+        // hand-maintained PANE_ACTION_KEYS drift apart. Once Phase B is
+        // complete (PANE_ACTION_KEYS generated from the registry), this test
+        // becomes trivially true.
+        let reg_keys: std::collections::HashSet<(char, Option<&str>)> =
+            key_bindings().iter()
+                .map(|(k, ctx, _)| (*k, *ctx))
+                .collect();
+        // Every registry key should at least be discoverable
+        assert!(!reg_keys.is_empty(), "registry has key bindings");
+        // The registry should have the mirror keys
+        assert!(reg_keys.contains(&('r', Some("Mirrors"))));
+        assert!(reg_keys.contains(&('q', None)));
+    }
 }

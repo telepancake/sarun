@@ -7406,6 +7406,23 @@ fn help_lines() -> Vec<Line<'static>> {
                   else { format!("{} {}", vd.name, vd.args) };
         v.push(t(&format!("  {sig:<w$}  {}", vd.help)));
     }
+
+    // Registry actions — key bindings, CLI commands, and menu entries
+    // generated from the unified action registry (engine/src/registry.rs).
+    v.push(t(""));
+    v.push(h("Actions (registry · `:` command prompt)"));
+    v.push(d("  Type ':' to open a command prompt with tab-completion."));
+    v.push(d("  Key + CLI + menu labels are all derived from the verb name."));
+    for a in crate::registry::ACTIONS {
+        if a.key.is_some() || a.cli.is_some() {
+            let mut parts = Vec::new();
+            if let Some(k) = a.key { parts.push(format!("'{k}'")); }
+            if let Some(c) = a.ctx { parts.push(format!("on:{c}")); }
+            if let Some(c) = a.cli { parts.push(format!("sarun {}", c.join(" "))); }
+            v.push(t(&format!("  {:25} {:25}  {}",
+                format!("{}({})", a.verb, a.args), parts.join(", "), a.help)));
+        }
+    }
     v
 }
 
@@ -13040,6 +13057,28 @@ fn render_to_string(app: &App, w: u16, h: u16) -> Result<String, String> {
 /// current pane has nothing meaningful you'd do to a row (Help, Pty
 /// — both manage themselves). Caller wraps the returned list in
 /// Modal::ActionMenu and presents it.
+/// Generate menu items from the registry for a given pane context.
+/// Returns ActionItems with the registry's menu label and key hint.
+/// The verb name is stored as the item's label when no explicit menu
+/// label exists — the caller can override.
+fn registry_menu_items(ctx: &str) -> Vec<ActionItem> {
+    crate::registry::menu_entries().into_iter()
+        .filter(|(_, _, verb)| {
+            crate::registry::find(verb)
+                .and_then(|a| a.ctx)
+                .map(|c| c == ctx)
+                .unwrap_or(false)
+        })
+        .map(|(label, key, verb)| {
+            let hint = match key {
+                Some(k) => Box::leak(format!("{k}").into_boxed_str()),
+                None => "",
+            };
+            ActionItem { label: label.to_string(), hint, action: Action::OpenSelection }
+        })
+        .collect()
+}
+
 fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
     let mk = |label: &str, hint: &'static str, action: Action| ActionItem {
         label: label.into(), hint, action,

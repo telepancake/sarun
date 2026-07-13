@@ -590,6 +590,20 @@ impl Reader {
         Reader::new(source, raw, kind, display)
     }
 
+    /// Set a filter on an IETF draft list and reload. Only works when
+    /// the source is an IETF draft list (draft: None).
+    pub fn set_ietf_filter(&mut self, filter: &str) -> anyhow::Result<()> {
+        if let Source::Ietf { root, draft: None, .. } = &self.source {
+            let source = Source::Ietf {
+                root: root.clone(),
+                draft: None,
+                filter: if filter.is_empty() { None } else { Some(filter.to_string()) },
+            };
+            self.load_into(source)?;
+        }
+        Ok(())
+    }
+
     /// Open caller-supplied bytes (e.g. a box file fetched over the control
     /// socket); `name` decides html/md/text dispatch and titles the pane.
     pub fn open_bytes(name: String, raw: Vec<u8>) -> anyhow::Result<Reader> {

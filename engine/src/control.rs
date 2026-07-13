@@ -4317,6 +4317,54 @@ fn svc_splice(a: UnixStream, b: UnixStream) {
 
 /// `sarun mirror …` — the mirror-jobs CLI (schedule surface of
 /// mirrors.rs; the TUI's Mirrors pane shows the same rows).
+/// Generic CLI dispatcher: looks up the subcommand path in the registry
+/// and dispatches the corresponding verb over the control socket.
+/// Falls back to cli_mirror for backward compatibility.
+pub fn cli_dispatch(argv: &[String]) -> i32 {
+    let strs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    // Try registry lookup: ["mirror", "run", "5"] → verb "mirror_run" args ["5"]
+    if strs.len() >= 2 {
+        let path: Vec<&str> = strs[..2].iter().copied().collect();
+        if let Some(verb) = crate::registry::verb_for_cli(&path) {
+            let rest: Vec<Value> = strs[2..].iter().map(|s| {
+                if let Ok(n) = s.parse::<i64>() { Value::Number(n.into()) }
+                else if *s == "true" || *s == "false" { Value::Bool(s.parse().unwrap()) }
+                else { Value::String(s.to_string()) }
+            }).collect();
+            let sock = crate::paths::sock_path();
+            match crate::control::cli_rpc(&sock, verb, Value::Array(rest)) {
+                Ok(v) => {
+                    if v.get("ok").and_then(Value::as_bool) == Some(false) {
+                        eprintln!("{}", v.get("error").and_then(Value::as_str).unwrap_or("failed"));
+                        return 1;
+                    }
+                    return 0;
+                }
+                Err(e) => { eprintln!("sarun: {e}"); return 1; }
+            }
+        }
+    }
+    // Fallback to the existing per-command CLIs
+    match strs.first().copied() {
+        Some("mirror") => cli_mirror(argv),
+        _ => {
+            eprintln!("usage: sarun mirror <ls|add|run|pause|resume|rm> ...");
+            2
+        }
+    }
+}
+
+/// One-shot RPC: send a verb, read the reply, return the inner result.
+pub fn cli_rpc(sock: &std::path::Path, verb: &str, args: Value) -> Result<Value, String> {
+    let mut c = UnixStream::connect(sock).map_err(|_| "no engine running".to_string())?;
+    let msg = json!({"type": "ui", "verb": verb, "args": args});
+    c.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    BufReader::new(&c).read_line(&mut line).map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    Ok(v.get("r").cloned().unwrap_or(v))
+}
+
 pub fn cli_mirror(argv: &[String]) -> i32 {
     let sock = crate::paths::sock_path();
     let one = |verb: &str, args: Value| -> Result<Value, String> {
