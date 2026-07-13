@@ -331,6 +331,143 @@ pub static ACTIONS: &[ActionSpec] = &[
         verb: "verbs", help: "list every UI verb with its args and help",
         args: "[FILTER]", key: None, ctx: None, menu: None, cli: None,
     },
+
+    // ── HIDDEN BUT REACHABLE (via ':' prompt) ─────────────────────────
+    // These are internal/advanced verbs that have no key or CLI command
+    // but are useful enough to expose via the command prompt.
+
+    ActionSpec {
+        verb: "box_new", help: "create an empty box and expose its mount",
+        args: "[PARENT_SID]", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "box_drop", help: "unregister a box from the overlay (no reap)",
+        args: "SID", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "delete", help: "remove a box, promoting its changes down (alias of dissolve)",
+        args: "SID", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "select", help: "set the engine-side selected box",
+        args: "SID", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "session_dicts", help: "list every box with status metadata",
+        args: "", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "review.session_changes", help: "changed files of a box",
+        args: "SID", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "review.hunks", help: "unified-diff hunks for one changed file",
+        args: "SID REL", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "review.file_bytes", help: "current bytes of one box path (base64)",
+        args: "SID REL", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "review.box_summary", help: "outputs/changes/procs/pipelines/edges bundle",
+        args: "SID [LIMIT]", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "review.patch_text", help: "whole-box patch as base64",
+        args: "SID", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "review.makevars", help: "search recorded makefile variable assignments",
+        args: "SID [NAME_PAT] [VALUE_PAT] [LIMIT] [ANY]", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "processes", help: "captured process rows for a box",
+        args: "SID", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "outputs", help: "decoded stdout/stderr transcript rows",
+        args: "SID", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "flows.list", help: "tshark-decoded HTTP/TLS flow rows for a box",
+        args: "[SID]", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "flows.detail", help: "full tshark decode of one frame",
+        args: "[SID] FRAME", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "flows.packets", help: "every frame of one TCP stream",
+        args: "[SID] STREAM", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "struct_quick", help: "quick structural diff of a binary change",
+        args: "SID REL", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "ping", help: "liveness check; broadcasts a pong event",
+        args: "", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "reload_rules", help: "reload the file-rules from disk",
+        args: "", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "prompts.peek", help: "next pending network-permission prompt",
+        args: "", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "prompts.answer", help: "answer a prompt (yes_once|no_once|allow_save|deny_save)",
+        args: "ID VERDICT", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "box_file_read", help: "read a file from a box's merged view (base64)",
+        args: "BOX PATH", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "box_file_write", help: "write a file into a box's layer",
+        args: "BOX PATH B64", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "box_dir_list", help: "list a directory in a box's merged view",
+        args: "BOX PATH", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "oci.images", help: "loaded OCI images (top box of each chain)",
+        args: "", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "oci.resolve", help: "resolve an image reference to its local top box",
+        args: "REFERENCE", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "oaita.models", help: "GGUF local-model catalog for the picker",
+        args: "", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "oaita.status", help: "what the Api pane is wired to (external/local/none)",
+        args: "", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "oaita.probe", help: "1-token connection test of an external API config",
+        args: "SPEC", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "svc.up", help: "whether a svc.serve service is live",
+        args: "NAME", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "view.open", help: "open a server-side windowed view",
+        args: "KIND SID [FILTER] [RUNNING_ONLY]", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "view.window", help: "read one window of an open view",
+        args: "VIEW START SIZE", key: None, ctx: None, menu: None, cli: None,
+    },
+    ActionSpec {
+        verb: "view.close", help: "close a view",
+        args: "VIEW", key: None, ctx: None, menu: None, cli: None,
+    },
 ];
 
 // ── Generated projections ───────────────────────────────────────────────
