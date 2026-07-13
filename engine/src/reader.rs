@@ -396,16 +396,54 @@ fn ietf_draft_list_html(root: &Path) -> anyhow::Result<(String, String)> {
         .map_err(|e| anyhow::anyhow!("ietf open {}: {e}", root.display()))?;
     let drafts = m.drafts()
         .map_err(|e| anyhow::anyhow!("ietf drafts: {e}"))?;
-    let mut html = String::from("<h1>IETF Drafts</h1>\n<ul>\n");
-    for name in &drafts {
-        html.push_str(&format!(
-            "<li><a href=\"/ietf/{name}\">{name}</a></li>\n"));
-    }
-    html.push_str("</ul>\n");
     if drafts.is_empty() {
-        html = "<h1>IETF Drafts</h1>\n<p>No drafts mirrored yet.</p>\n".into();
+        return Ok((
+            "<h1>IETF Drafts</h1>\n<p>No drafts mirrored yet.</p>\n".into(),
+            "0 drafts".into(),
+        ));
+    }
+    // Group drafts by working group: "draft-ietf-<wg>-..." → <wg>.
+    // Non-ietf drafts go into "other".
+    let mut groups: std::collections::BTreeMap<String, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for name in &drafts {
+        let wg = ietf_wg_of(name);
+        groups.entry(wg.to_string()).or_default().push(name);
+    }
+    let mut html = String::from(
+        &format!("<h1>IETF Drafts</h1>\n<p>{} drafts in {} groups</p>\n",
+            drafts.len(), groups.len()));
+    for (wg, names) in &groups {
+        html.push_str(&format!(
+            "<h2>{wg} ({})</h2>\n<ul>\n", names.len()));
+        // Show first 50 drafts per group, with a note if truncated.
+        for name in names.iter().take(50) {
+            html.push_str(&format!(
+                "<li><a href=\"/ietf/{name}\">{name}</a></li>\n"));
+        }
+        if names.len() > 50 {
+            html.push_str(&format!(
+                "<li>... and {} more</li>\n", names.len() - 50));
+        }
+        html.push_str("</ul>\n");
     }
     Ok((html, format!("{} drafts", drafts.len())))
+}
+
+/// Extract the working group from a draft name: `draft-ietf-<wg>-...` → `<wg>`.
+/// Non-ietf drafts (e.g. `draft-ietf-ace-...` → "ace") and non-grouped drafts
+/// go into "other".
+fn ietf_wg_of(name: &str) -> &str {
+    let parts: Vec<&str> = name.splitn(4, '-').collect();
+    // draft-ietf-<wg>-... → <wg>
+    if parts.len() >= 4 && parts[0] == "draft" && parts[1] == "ietf" {
+        return parts[2];
+    }
+    // draft-<author>-... → "individual"
+    if parts.len() >= 3 && parts[0] == "draft" {
+        return "individual";
+    }
+    "other"
 }
 
 fn ietf_draft_text(root: &Path, draft: &str) -> anyhow::Result<(Vec<u8>, String)> {

@@ -189,6 +189,12 @@ pub static ACTIONS: &[ActionSpec] = &[
         menu: Some("Apply changes to a COPY of the parent"),
         cli: None,
     },
+    ActionSpec {
+        verb: "rotate", help: "promote a child box over its parent (both at rest)",
+        args: "SID", key: None, ctx: Some("Sessions"),
+        menu: Some("Rotate: promote child over parent"),
+        cli: None,
+    },
 
     // ── REVIEW / CHANGES ───────────────────────────────────────────────
     ActionSpec {

@@ -593,6 +593,7 @@ enum Action {
     DiscardHunk,
     ApplyBox,
     ApplyToCopy,
+    RotateBox,
     DiscardBox,
     /// Box removal from the context menu, mirroring the K / D keys: dissolve
     /// (changes promoted down into children, remove) and kill (SIGTERM). Both
@@ -3501,7 +3502,7 @@ impl App {
     fn open_command_prompt(&mut self) {
         self.modal = Some(Modal::Command {
             buf: String::new(),
-            completions: crate::registry::complete(""),
+            completions: crate::parser::fuzzy_complete(""),
             sel: 0,
         });
     }
@@ -3514,40 +3515,31 @@ impl App {
     /// numbers; everything else stays a string. The result is sent over
     /// the control socket as `{"type":"ui","verb":"<name>","args":[...]}`.
     fn dispatch_command(&mut self, input: &str) {
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        if parts.is_empty() {
+        let input = input.trim();
+        if input.is_empty() {
             self.status = "command: empty".into();
             return;
         }
 
-        // Try exact verb match first, then CLI path lookup.
-        let (verb, arg_start) = if crate::registry::find(parts[0]).is_some() {
-            (parts[0], 1)
-        } else if parts.len() >= 2 {
-            // Try two-word CLI path: ["mirror", "run"]
-            let path: Vec<&str> = parts[..2].iter().copied().collect();
-            if let Some(v) = crate::registry::verb_for_cli(&path) {
-                (v, 2)
-            } else {
-                // Single-word: maybe it's a verb we don't have in the registry
-                // but the engine knows (e.g. "session_dicts"). Send it anyway.
-                (parts[0], 1)
-            }
-        } else {
-            (parts[0], 1)
-        };
+        // Use the parser to split into verb + args.
+        // Handles both "mirror_run 5" and "mirror run 5".
+        let (verb, str_args) = crate::parser::parse_command(input);
+        if verb.is_empty() {
+            self.status = "command: could not parse".into();
+            return;
+        }
 
-        let args: Vec<Value> = parts[arg_start..].iter().map(|s| {
+        let args: Vec<Value> = str_args.iter().map(|s| {
             if let Ok(n) = s.parse::<i64>() {
                 Value::Number(n.into())
-            } else if *s == "true" || *s == "false" {
+            } else if s == "true" || s == "false" {
                 Value::Bool(s.parse::<bool>().unwrap())
             } else {
-                Value::String(s.to_string())
+                Value::String(s.clone())
             }
         }).collect();
 
-        match rpc(&self.sock, verb, Value::Array(args)) {
+        match rpc(&self.sock, &verb, Value::Array(args)) {
             Ok(v) => {
                 if v.get("ok").and_then(Value::as_bool) == Some(false) {
                     self.status = format!("command: {}",
@@ -4813,14 +4805,32 @@ impl App {
     /// parent is left untouched); the copy appears as a new sibling box.
     fn apply_to_copy(&mut self) {
         let Some(sid) = self.cur_sid() else { return };
-        match rpc(&self.sock, "apply_to_copy", json!([sid])) {
+        self.status = match rpc(&self.sock, "apply_to_copy", json!([sid])) {
             Ok(r) => {
                 let name = r.get("name").and_then(Value::as_str).unwrap_or("copy");
                 let n = r.get("applied").and_then(Value::as_i64).unwrap_or(0);
-                self.status = format!("applied {n} change(s) onto a copy of the parent → {name}");
+                format!("applied {n} change(s) onto a copy of the parent → {name}")
             }
-            Err(e) => self.status = format!("apply-to-copy: {e}"),
-        }
+            Err(e) => format!("apply-to-copy: {e}"),
+        };
+        self.refresh_sessions();
+    }
+
+    /// Rotate: promote the selected child box over its parent.
+    /// Both boxes must be at rest.
+    fn rotate_selected(&mut self) {
+        let Some(sid) = self.cur_sid() else {
+            self.status = "no box selected".into();
+            return;
+        };
+        self.status = match rpc(&self.sock, "rotate", json!([sid])) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                format!("rotate: box {sid} promoted over its parent")
+            }
+            Ok(v) => format!("rotate: {}",
+                v.get("error").and_then(Value::as_str).unwrap_or("failed")),
+            Err(e) => format!("rotate: {e}"),
+        };
         self.refresh_sessions();
     }
 
@@ -7895,41 +7905,48 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::Command { buf, completions, sel } => {
             let mut body = vec![
                 Line::from(Span::styled(
-                    "command prompt — type a verb name (Tab completes)",
+                    "command prompt — type a verb name (Tab/↑↓ completes)",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled(": ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                     Span::raw(buf.clone()),
-                    Span::raw("_"),
+                    Span::raw(if buf.ends_with('_') { "" } else { "_" }),
                 ]),
             ];
             if !completions.is_empty() {
                 body.push(Line::from(""));
+                let header = format!("{} completion(s):", completions.len());
                 body.push(Line::from(Span::styled(
-                    "completions:",
-                    Style::default().fg(Color::DarkGray))));
-                let show = completions.iter().take(10);
-                for (i, c) in show.enumerate() {
-                    let style = if i == *sel {
+                    header, Style::default().fg(Color::DarkGray))));
+                // Show a window of completions around the selection
+                let window = 8;
+                let start = (*sel).saturating_sub(window / 2);
+                let end = (start + window).min(completions.len());
+                let start = end.saturating_sub(window);
+                for (i, c) in completions[start..end].iter().enumerate() {
+                    let idx = start + i;
+                    let style = if idx == *sel {
                         Style::default().fg(Color::Black).bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::Gray)
                     };
                     body.push(Line::from(vec![
-                        Span::styled("  ", style),
+                        Span::styled(if idx == *sel { "▶ " } else { "  " }, style),
                         Span::styled(*c, style),
                     ]));
                 }
-                if completions.len() > 10 {
+                if completions.len() > window {
                     body.push(Line::from(Span::styled(
-                        format!("  ... and {} more", completions.len() - 10),
+                        format!("  ({} total — ↑↓ scroll, Tab select)",
+                            completions.len()),
                         Style::default().fg(Color::DarkGray))));
                 }
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                "Tab cycle · Enter dispatch · Esc cancel",
+                "↑↓ scroll · Tab fill+advance · Enter dispatch · Esc cancel",
                 Style::default().fg(Color::Gray))));
             (" : ", body)
         }
@@ -13041,6 +13058,7 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                 mk("Open changes view", "Enter",  Action::OpenSelection),
                 mk("Apply ALL changes to host", "a", Action::ApplyBox),
                 mk("Apply changes to a COPY of the parent (parent untouched)", "", Action::ApplyToCopy),
+                mk("Rotate: promote child over parent", "", Action::RotateBox),
                 mk("Delete box (changes promoted down, keep child boxes)", "D",
                    Action::DissolveBox),
                 mk("Discard ALL changes", "x",    Action::DiscardBox),
@@ -13135,6 +13153,7 @@ fn run_action(app: &mut App, a: Action) {
         Action::DiscardHunk    => app.discard_hunk(),
         Action::ApplyBox       => app.apply(),
         Action::ApplyToCopy    => app.apply_to_copy(),
+        Action::RotateBox      => app.rotate_selected(),
         Action::DiscardBox     => app.discard(),
         Action::DissolveBox    => app.modal = Some(Modal::Confirm {
             prompt: format!("Delete {}? Its changes are promoted down into \
@@ -13835,26 +13854,35 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     }
                 }
                 KeyCode::Tab => {
-                    // Cycle through completions
+                    // Tab fills the buffer with the selected completion,
+                    // then advances to the next one.
+                    if !completions.is_empty() {
+                        buf = completions[sel].to_string();
+                        sel = (sel + 1) % completions.len();
+                        app.modal = Some(Modal::Command { buf, completions, sel });
+                    }
+                }
+                KeyCode::Down => {
                     if !completions.is_empty() {
                         sel = (sel + 1) % completions.len();
-                        buf = completions[sel].to_string();
+                        app.modal = Some(Modal::Command { buf, completions, sel });
+                    }
+                }
+                KeyCode::Up => {
+                    if !completions.is_empty() {
+                        sel = if sel == 0 { completions.len() - 1 } else { sel - 1 };
                         app.modal = Some(Modal::Command { buf, completions, sel });
                     }
                 }
                 KeyCode::Backspace => {
                     buf.pop();
-                    // Recompute completions
-                    completions = crate::registry::complete(&buf);
+                    completions = crate::parser::fuzzy_complete(&buf);
                     sel = 0;
-                    if !completions.is_empty() {
-                        buf = completions[0].to_string();
-                    }
                     app.modal = Some(Modal::Command { buf, completions, sel });
                 }
                 KeyCode::Char(c) => {
                     buf.push(c);
-                    completions = crate::registry::complete(&buf);
+                    completions = crate::parser::fuzzy_complete(&buf);
                     sel = 0;
                     app.modal = Some(Modal::Command { buf, completions, sel });
                 }
