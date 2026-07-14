@@ -9,13 +9,20 @@ agent prompt.
 
 ## Required Codex environment properties
 
-Use a Linux x86-64 environment whose host kernel supports both:
+There are two supported ways to execute `sud32`:
 
-- `CONFIG_SYSCALL_USER_DISPATCH=y` (`prctl(PR_SET_SYSCALL_USER_DISPATCH)` must
-  succeed). This is mandatory for `sud32` and `sud64` runtime tracing.
-- `CONFIG_IA32_EMULATION=y`, with container/seccomp policy allowing execution of
-  i386 ELF binaries. Without this, native `./tv/sud32 ...` fails with
-  `Exec format error`.
+1. **Native i386 execution on the Codex host kernel.** Use a Linux x86-64
+   environment whose host kernel supports both:
+   - `CONFIG_SYSCALL_USER_DISPATCH=y` (`prctl(PR_SET_SYSCALL_USER_DISPATCH)`
+     must succeed). This is mandatory for `sud32` and `sud64` runtime tracing.
+   - `CONFIG_IA32_EMULATION=y`, with container/seccomp policy allowing execution
+     of i386 ELF binaries. Without this, native `./tv/sud32 ...` fails with
+     `Exec format error`.
+2. **Non-native execution in a tiny qemu-system guest.** This is the fallback for
+   Codex hosts whose kernel does not allow i386 ELF execution. Boot a small
+   x86_64 kernel+initramfs under `qemu-system-x86_64`; the guest kernel provides
+   syscall-user-dispatch and IA32 emulation, while the host only needs to run the
+   VM.
 
 `qemu-i386` is useful for running freestanding 32-bit unit binaries, but it is
 not enough to validate `sud32`: qemu-user currently rejects the syscall user
@@ -34,11 +41,19 @@ apt-get install -y --no-install-recommends \
   ca-certificates \
   curl \
   git \
+  linux-image-virtual \
   make \
   pkg-config \
   python3 \
+  busybox-static \
+  cpio \
+  qemu-system-x86 \
   qemu-user \
   rustup
+
+# If you use a prebuilt kernel artifact instead of the distro kernel package,
+# omit linux-image-virtual and set SUD32_QEMU_KERNEL=/path/to/bzImage when
+# running tv/tests/sud32_qemu_system_smoke.sh.
 
 # sarun and tv/sud builds use cargo-zigbuild plus zig's bundled musl and Linux
 # UAPI headers. This is what makes sud32 build without a host i386 sysroot.
@@ -70,9 +85,13 @@ Use these checks to confirm the environment can execute the binaries it builds:
 ./tv/build/inramfs_test64
 ./tv/build/inramfs_test32
 ./tv/sud64 /bin/true >/tmp/sud64.out 2>/tmp/sud64.err
+tv/tests/sud32_qemu_system_smoke.sh
 ```
 
-For `sud32`, compile a tiny i386 program and run it through the native wrapper:
+The `sud32_qemu_system_smoke.sh` check boots a tiny qemu-system guest and runs
+`sud32` against a freestanding i386 program inside the guest. If the Codex host
+itself supports native i386 execution, you can also compile a tiny i386 program
+and run it directly through the native wrapper:
 
 ```bash
 cat >/tmp/exit32.s <<'ASM'
@@ -88,11 +107,12 @@ ZIG="$(find "$(uv tool dir)/cargo-zigbuild" -path '*/ziglang/zig' -type f | head
 ./tv/sud32 /tmp/exit32 >/tmp/sud32.out 2>/tmp/sud32.err
 ```
 
-A passing environment exits `0`. If this returns `Exec format error`, the kernel
-or container does not allow i386 ELF execution. If stderr says
-`prctl(PR_SET_SYSCALL_USER_DISPATCH): Invalid argument`, the kernel/runtime does
-not provide syscall user dispatch to that process; using qemu-user is the common
-cause.
+A passing native environment exits `0`. If this returns `Exec format error`, the
+host kernel or container does not allow i386 ELF execution; use
+`tv/tests/sud32_qemu_system_smoke.sh` instead. If stderr says
+`prctl(PR_SET_SYSCALL_USER_DISPATCH): Invalid argument`, the active kernel/runtime
+does not provide syscall user dispatch to that process; using qemu-user is the
+common cause.
 
 ## Agent internet access
 
