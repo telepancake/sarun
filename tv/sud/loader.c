@@ -402,7 +402,7 @@ static void crash_diagnostic_handler(int sig, siginfo_t *info, void *uctx_raw)
     {
         struct kernel_sigaction_raw dfl;
         memset(&dfl, 0, sizeof(dfl));
-        dfl.handler = (void (*)(int))0; /* SIG_DFL */
+        dfl.handler = (void (*)(int, siginfo_t *, void *))0; /* SIG_DFL */
         dfl.flags = SA_RESTORER;
         dfl.restorer = sud_rt_sigreturn_restorer;
         raw_syscall6(SYS_rt_sigaction, sig, (long)&dfl, 0,
@@ -840,7 +840,7 @@ void load_and_run_elf(const char *path, int argc, char **argv,
     {
         struct kernel_sigaction_raw segv_sa;
         memset(&segv_sa, 0, sizeof(segv_sa));
-        segv_sa.handler = (void (*)(int))crash_diagnostic_handler;
+        segv_sa.handler = crash_diagnostic_handler;
         segv_sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER | SA_ONSTACK;
         segv_sa.restorer = sud_rt_sigreturn_restorer;
         segv_sa.mask = 0;

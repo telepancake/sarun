@@ -29,9 +29,11 @@
  *     file registers an entry whenever sud_inramfs_op_open returns
  *     a fd for a directory inode.
  *
- * The fd table is process-local (file descriptors don't survive
- * exec across the wrapper boundary in the initial implementation —
- * documented limitation).
+ * The fd-number table is process-local, but each entry points at a
+ * shared open-description record in the metadata shm.  That keeps
+ * dup/fork/exec-inherited descriptors on one cross-process offset.
+ * The lazy exec adoption path below reattaches inherited memfds by
+ * decoding their memfd names.
  */
 
 #include "sud/inramfs/inramfs.h"
@@ -53,16 +55,19 @@
  * ================================================================ */
 
 #define SUD_IR_FD_TABLE_SIZE 1024
+#define SUD_IR_OFD_TABLE_SIZE SUD_IR_FD_TABLE_SIZE
+
+/* Process-local open-file description.  All fd numbers created by
+ * dup/dup2/dup3/F_DUPFD point at the same descriptor, so file status
+ * flags, sequential offset, and directory cookie move exactly as a
+ * real Linux open file description does. */
+struct sud_ir_open_desc {
+    int shared_idx;          /* index into shared sud_ir_shared_ofd table */
+};
 
 struct sud_ir_open_file {
-    int      kfd;            /* real kernel fd; -1 = empty slot */
-    uint32_t inode_idx;
-    uint32_t generation;     /* sanity cookie vs. sud_ir_inode.generation */
-    uint64_t pos;            /* current file position */
-    int      flags;          /* O_RDONLY / O_WRONLY / O_RDWR / O_APPEND */
-    /* Directory-iteration cookie: byte offset into the dirblock chain
-     * at which the next getdents64 call resumes. */
-    uint32_t dir_cookie;
+    int kfd;                 /* real kernel fd; -1 = empty slot */
+    int desc_idx;            /* index into g_ofdtab; -1 = none */
     /* For directory fds: the absolute path used to open the fd is
      * registered with path_remap's dirfd table (sud_pr_dirfd_register)
      * in sud_inramfs_op_open and forgotten in sud_inramfs_op_close.
@@ -72,12 +77,18 @@ struct sud_ir_open_file {
 };
 
 static struct sud_ir_open_file g_fdtab[SUD_IR_FD_TABLE_SIZE];
+static struct sud_ir_open_desc g_ofdtab[SUD_IR_OFD_TABLE_SIZE];
 static int                    g_fdtab_init;
 
 static void fdtab_init(void)
 {
     if (g_fdtab_init) return;
-    for (int i = 0; i < SUD_IR_FD_TABLE_SIZE; i++) g_fdtab[i].kfd = -1;
+    for (int i = 0; i < SUD_IR_FD_TABLE_SIZE; i++) {
+        g_fdtab[i].kfd = -1;
+        g_fdtab[i].desc_idx = -1;
+    }
+    for (int i = 0; i < SUD_IR_OFD_TABLE_SIZE; i++)
+        g_ofdtab[i].shared_idx = -1;
     g_fdtab_init = 1;
 }
 
@@ -90,34 +101,85 @@ static struct sud_ir_open_file *fdtab_lookup(int fd)
     return 0;
 }
 
+static struct sud_ir_shared_ofd *ofd_shared(int shared_idx)
+{
+    struct sud_ir_super *sb = sud_ir_sb();
+    if (shared_idx < 0 || (uint32_t)shared_idx >= sb->ofd_count) return 0;
+    return &sud_ir_ofd_table()[shared_idx];
+}
+
+static struct sud_ir_shared_ofd *fdtab_desc(struct sud_ir_open_file *of)
+{
+    if (!of || of->desc_idx < 0 || of->desc_idx >= SUD_IR_OFD_TABLE_SIZE)
+        return 0;
+    if (g_ofdtab[of->desc_idx].shared_idx < 0) return 0;
+    struct sud_ir_shared_ofd *od = ofd_shared(g_ofdtab[of->desc_idx].shared_idx);
+    if (!od || od->refs == 0) return 0;
+    return od;
+}
+
+static void fdtab_drop_inode_ref(uint32_t inode_idx);
+
+static int shared_ofd_alloc(uint32_t inode_idx, int flags)
+{
+    struct sud_ir_super *sb = sud_ir_sb();
+    struct sud_ir_shared_ofd *tab = sud_ir_ofd_table();
+    sud_ir_lock(&sb->lock);
+    for (uint32_t i = 0; i < sb->ofd_count; i++) {
+        if (tab[i].refs == 0) {
+            struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
+            tab[i].refs = 1;
+            tab[i].lock = 0;
+            tab[i].inode_idx = inode_idx;
+            tab[i].generation = ino ? ino->generation : 0;
+            tab[i].pos = 0;
+            tab[i].flags = (uint32_t)flags;
+            tab[i].dir_cookie = 0;
+            if (ino) ino->open_refs++;
+            sud_ir_unlock(&sb->lock);
+            return (int)i;
+        }
+    }
+    sud_ir_unlock(&sb->lock);
+    return -1;
+}
+
+static int ofd_alloc(uint32_t inode_idx, int flags)
+{
+    int shared_idx = shared_ofd_alloc(inode_idx, flags);
+    if (shared_idx < 0) return -1;
+    for (int i = 0; i < SUD_IR_OFD_TABLE_SIZE; i++) {
+        if (g_ofdtab[i].shared_idx < 0) {
+            g_ofdtab[i].shared_idx = shared_idx;
+            return i;
+        }
+    }
+    struct sud_ir_shared_ofd *od = ofd_shared(shared_idx);
+    if (od) {
+        uint32_t idx = od->inode_idx;
+        od->refs = 0;
+        fdtab_drop_inode_ref(idx);
+    }
+    return -1;
+}
+
 static struct sud_ir_open_file *fdtab_alloc(int kfd, uint32_t inode_idx,
                                             int flags)
 {
     fdtab_init();
+    int desc_idx = ofd_alloc(inode_idx, flags);
+    if (desc_idx < 0) return 0;
     for (int i = 0; i < SUD_IR_FD_TABLE_SIZE; i++) {
         if (g_fdtab[i].kfd == -1) {
-            g_fdtab[i].kfd       = kfd;
-            g_fdtab[i].inode_idx = inode_idx;
-            struct sud_ir_inode *ino = sud_ir_inode_get(inode_idx);
-            g_fdtab[i].generation = ino ? ino->generation : 0;
-            g_fdtab[i].pos        = 0;
-            g_fdtab[i].flags      = flags;
-            g_fdtab[i].dir_cookie = 0;
-            /* Maintain the cross-process open-fd count so an inode
-             * unlinked while still open is kept alive until the last
-             * fd closes (POSIX unlink-open semantics).  Registration
-             * (op_open_inode, create-open, inherited-fd adoption) all
-             * funnel through here, so this is the single increment
-             * choke point. */
-            if (ino) {
-                struct sud_ir_super *sb = sud_ir_sb();
-                sud_ir_lock(&sb->lock);
-                ino->open_refs++;
-                sud_ir_unlock(&sb->lock);
-            }
+            g_fdtab[i].kfd = kfd;
+            g_fdtab[i].desc_idx = desc_idx;
             return &g_fdtab[i];
         }
     }
+    int shared_idx = g_ofdtab[desc_idx].shared_idx;
+    g_ofdtab[desc_idx].shared_idx = -1;
+    struct sud_ir_shared_ofd *od = ofd_shared(shared_idx);
+    if (od) { uint32_t idx = od->inode_idx; od->refs = 0; fdtab_drop_inode_ref(idx); }
     return 0;
 }
 
@@ -138,13 +200,35 @@ static void fdtab_drop_inode_ref(uint32_t inode_idx)
     sud_ir_unlock(&sb->lock);
 }
 
+static void ofd_release(int desc_idx)
+{
+    if (desc_idx < 0 || desc_idx >= SUD_IR_OFD_TABLE_SIZE) return;
+    int shared_idx = g_ofdtab[desc_idx].shared_idx;
+    if (shared_idx < 0) return;
+    g_ofdtab[desc_idx].shared_idx = -1;
+    struct sud_ir_shared_ofd *od = ofd_shared(shared_idx);
+    if (!od) return;
+    struct sud_ir_super *sb = sud_ir_sb();
+    sud_ir_lock(&sb->lock);
+    if (od->refs > 0) od->refs--;
+    if (od->refs == 0) {
+        uint32_t idx = od->inode_idx;
+        od->inode_idx = 0;
+        sud_ir_unlock(&sb->lock);
+        fdtab_drop_inode_ref(idx);
+        return;
+    }
+    sud_ir_unlock(&sb->lock);
+}
+
 static void fdtab_release(int fd)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
     if (of) {
-        uint32_t idx = of->inode_idx;
+        int desc_idx = of->desc_idx;
         of->kfd = -1;
-        fdtab_drop_inode_ref(idx);
+        of->desc_idx = -1;
+        ofd_release(desc_idx);
     }
     /* Drop any path_remap dirfd entry; harmless no-op for non-dirs. */
     sud_pr_dirfd_forget(fd);
@@ -216,7 +300,7 @@ static int try_adopt_inherited_fd(int fd)
     const size_t mlen = sizeof(marker) - 1;
     if ((size_t)r < mlen || memcmp(buf, marker, mlen) != 0) return 0;
 
-    /* Parse the inode index. */
+    /* Parse the inode index and optional shared-open-description id. */
     const char *q = buf + mlen;
     uint32_t idx = 0;
     int any = 0;
@@ -225,6 +309,15 @@ static int try_adopt_inherited_fd(int fd)
         q++; any = 1;
     }
     if (!any || idx == 0) return 0;
+    int shared_idx = -1;
+    if (*q == '-') {
+        q++; shared_idx = 0; any = 0;
+        while (*q >= '0' && *q <= '9') {
+            shared_idx = shared_idx * 10 + (*q - '0');
+            q++; any = 1;
+        }
+        if (!any) shared_idx = -1;
+    }
     /* Validate against the inode table — guard against bogus links
      * (e.g. a user crafting a memfd with the same name).  An invalid
      * idx would be silently absorbed and could cause later UB. */
@@ -236,6 +329,32 @@ static int try_adopt_inherited_fd(int fd)
      * locally on inramfs fds (the underlying memfd's own perms
      * gate the kernel-side access for the tools that talk to the
      * kfd directly, e.g. fstat, dup, fcntl). */
+    if (shared_idx >= 0 && ofd_shared(shared_idx)) {
+        fdtab_init();
+        for (int i = 0; i < SUD_IR_OFD_TABLE_SIZE; i++) {
+            if (g_ofdtab[i].shared_idx < 0) {
+                struct sud_ir_shared_ofd *od = ofd_shared(shared_idx);
+                struct sud_ir_super *sb = sud_ir_sb();
+                sud_ir_lock(&sb->lock);
+                if (od->refs == 0 || od->inode_idx != idx) {
+                    sud_ir_unlock(&sb->lock);
+                    break;
+                }
+                od->refs++;
+                sud_ir_unlock(&sb->lock);
+                g_ofdtab[i].shared_idx = shared_idx;
+                for (int j = 0; j < SUD_IR_FD_TABLE_SIZE; j++) {
+                    if (g_fdtab[j].kfd == -1) {
+                        g_fdtab[j].kfd = fd;
+                        g_fdtab[j].desc_idx = i;
+                        return 1;
+                    }
+                }
+                ofd_release(i);
+                return 0;
+            }
+        }
+    }
     fdtab_alloc(fd, idx, O_RDWR);
     return 1;
 }
@@ -250,9 +369,10 @@ static void fdtab_forget(int fd)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
     if (of) {
-        uint32_t idx = of->inode_idx;
+        int desc_idx = of->desc_idx;
         of->kfd = -1;
-        fdtab_drop_inode_ref(idx);
+        of->desc_idx = -1;
+        ofd_release(desc_idx);
     }
     sud_pr_dirfd_forget(fd);
 }
@@ -274,18 +394,19 @@ static void fdtab_forget(int fd)
  * registers the fd in the local table.
  * ================================================================ */
 
-static int alloc_kfd(uint32_t inode_idx)
+static int alloc_kfd(uint32_t inode_idx, int shared_idx)
 {
-    /* Cookie name encodes inode for debug-friendliness. */
-    char name[32];
-    snprintf(name, sizeof(name), "sud-inramfs-%u", inode_idx);
+    /* Cookie name encodes inode and shared open-description id so exec
+     * children reattach to the same cross-process file offset. */
+    char name[48];
+    snprintf(name, sizeof(name), "sud-inramfs-%u-%d", inode_idx, shared_idx);
 #ifdef SYS_memfd_create
     long fd = raw_syscall6(SYS_memfd_create, (long)name,
                            MFD_CLOEXEC, 0, 0, 0, 0);
     if (fd < 0) return (int)fd;
     return (int)fd;
 #else
-    (void)inode_idx;
+    (void)inode_idx; (void)shared_idx;
     return -ENOSYS;
 #endif
 }
@@ -331,10 +452,24 @@ long sud_inramfs_op_open_inode(uint32_t inode_idx, int flags)
         sud_ir_file_truncate(ino, 0);
     }
 
-    int kfd = alloc_kfd(inode_idx);
-    if (kfd < 0) return kfd;
-    struct sud_ir_open_file *of = fdtab_alloc(kfd, inode_idx, flags);
+    fdtab_init();
+    int desc_idx = ofd_alloc(inode_idx, flags);
+    if (desc_idx < 0) return -EMFILE;
+    int shared_idx = g_ofdtab[desc_idx].shared_idx;
+    int kfd = alloc_kfd(inode_idx, shared_idx);
+    if (kfd < 0) { ofd_release(desc_idx); return kfd; }
+    struct sud_ir_open_file *of = 0;
+    fdtab_init();
+    for (int i = 0; i < SUD_IR_FD_TABLE_SIZE; i++) {
+        if (g_fdtab[i].kfd == -1) {
+            g_fdtab[i].kfd = kfd;
+            g_fdtab[i].desc_idx = desc_idx;
+            of = &g_fdtab[i];
+            break;
+        }
+    }
     if (!of) {
+        ofd_release(desc_idx);
         raw_close(kfd);
         return -EMFILE;
     }
@@ -442,38 +577,45 @@ long sud_inramfs_op_close(int fd)
 long sud_inramfs_op_read(int fd, void *buf, size_t count)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    if ((of->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    if ((od->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
     if (ino->type != SUD_IR_T_REG) return -EISDIR;
-    long n = sud_ir_file_read(ino, buf, count, (off_t)of->pos);
-    if (n > 0) of->pos += (uint64_t)n;
+    sud_ir_lock(&od->lock);
+    long n = sud_ir_file_read(ino, buf, count, (off_t)od->pos);
+    if (n > 0) od->pos += (uint64_t)n;
+    sud_ir_unlock(&od->lock);
     return n;
 }
 
 long sud_inramfs_op_write(int fd, const void *buf, size_t count)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    if ((of->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    if ((od->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
     if (ino->type != SUD_IR_T_REG) return -EBADF;
+    sud_ir_lock(&od->lock);
     off_t off;
-    if (of->flags & O_APPEND) off = (off_t)ino->size;
-    else                      off = (off_t)of->pos;
+    if (od->flags & O_APPEND) off = (off_t)ino->size;
+    else                      off = (off_t)od->pos;
     long n = sud_ir_file_write(ino, buf, count, off);
-    if (n > 0) of->pos = (uint64_t)off + (uint64_t)n;
+    if (n > 0) od->pos = (uint64_t)off + (uint64_t)n;
+    sud_ir_unlock(&od->lock);
     return n;
 }
 
 long sud_inramfs_op_pread(int fd, void *buf, size_t count, off_t off)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    if ((of->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    if ((od->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
     return sud_ir_file_read(ino, buf, count, off);
 }
@@ -481,9 +623,10 @@ long sud_inramfs_op_pread(int fd, void *buf, size_t count, off_t off)
 long sud_inramfs_op_pwrite(int fd, const void *buf, size_t count, off_t off)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    if ((of->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    if ((od->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
     return sud_ir_file_write(ino, buf, count, off);
 }
@@ -540,18 +683,21 @@ long sud_inramfs_op_preadv(int fd, const void *iov, int iovcnt, off_t off)
 long sud_inramfs_op_lseek(int fd, off_t off, int whence)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
     int64_t newp;
     switch (whence) {
         case SEEK_SET: newp = off; break;
-        case SEEK_CUR: newp = (int64_t)of->pos + off; break;
+        case SEEK_CUR: newp = (int64_t)od->pos + off; break;
         case SEEK_END: newp = (int64_t)ino->size + off; break;
         default: return -EINVAL;
     }
     if (newp < 0) return -EINVAL;
-    of->pos = (uint64_t)newp;
+    sud_ir_lock(&od->lock);
+    od->pos = (uint64_t)newp;
+    sud_ir_unlock(&od->lock);
     return newp;
 }
 
@@ -562,18 +708,21 @@ long sud_inramfs_op_lseek(int fd, off_t off, int whence)
 long sud_inramfs_op_llseek(int fd, int64_t off, int whence, int64_t *result)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
     int64_t newp;
     switch (whence) {
         case SEEK_SET: newp = off; break;
-        case SEEK_CUR: newp = (int64_t)of->pos + off; break;
+        case SEEK_CUR: newp = (int64_t)od->pos + off; break;
         case SEEK_END: newp = (int64_t)ino->size + off; break;
         default: return -EINVAL;
     }
     if (newp < 0) return -EINVAL;
-    of->pos = (uint64_t)newp;
+    sud_ir_lock(&od->lock);
+    od->pos = (uint64_t)newp;
+    sud_ir_unlock(&od->lock);
     if (result) *result = newp;
     return 0;
 }
@@ -581,9 +730,10 @@ long sud_inramfs_op_llseek(int fd, int64_t off, int whence, int64_t *result)
 long sud_inramfs_op_ftruncate(int fd, off_t length)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    if ((of->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    if ((od->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
     if (ino->type != SUD_IR_T_REG) return -EINVAL;
     return sud_ir_file_truncate(ino, length);
@@ -592,18 +742,20 @@ long sud_inramfs_op_ftruncate(int fd, off_t length)
 long sud_inramfs_op_fstat(int fd, void *st_buf)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
-    sud_inramfs_fill_stat(st_buf, of->inode_idx, ino);
+    sud_inramfs_fill_stat(st_buf, od->inode_idx, ino);
     return 0;
 }
 
 long sud_inramfs_op_fchmod(int fd, int mode)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
     ino->mode = (uint32_t)(mode & 07777);
     ino->ctime_ns = sud_ir_now_ns();
@@ -613,8 +765,9 @@ long sud_inramfs_op_fchmod(int fd, int mode)
 long sud_inramfs_op_fchown(int fd, int uid, int gid)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
     if (uid != -1) ino->uid = (uint32_t)uid;
     if (gid != -1) ino->gid = (uint32_t)gid;
@@ -625,8 +778,9 @@ long sud_inramfs_op_fchown(int fd, int uid, int gid)
 long sud_inramfs_op_futimens(int fd, const struct timespec ts[2])
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) return -EBADF;
     uint64_t now = sud_ir_now_ns();
     if (!ts) {
@@ -653,15 +807,16 @@ long sud_inramfs_op_futimens(int fd, const struct timespec ts[2])
 long sud_inramfs_op_getdents64(int fd, void *buf, size_t count)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
-    struct sud_ir_inode *dir = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
+    struct sud_ir_inode *dir = sud_ir_inode_get(od->inode_idx);
     if (!dir) return -EBADF;
     if (dir->type != SUD_IR_T_DIR) return -ENOTDIR;
 
     char *out = (char *)buf;
     size_t written = 0;
     uint32_t emitted = 0;
-    uint32_t want_skip = of->dir_cookie;
+    uint32_t want_skip = od->dir_cookie;
 
     /* Inject "." and ".." as dirents 0 and 1. */
     static const struct {
@@ -677,14 +832,14 @@ long sud_inramfs_op_getdents64(int fd, void *buf, size_t count)
             return (long)written;
         }
         struct linux_dirent64 *de = (struct linux_dirent64 *)(out + written);
-        de->d_ino    = of->inode_idx;
+        de->d_ino    = od->inode_idx;
         de->d_off    = (int64_t)(emitted);
         de->d_reclen = (unsigned short)reclen;
         de->d_type   = DT_DIR;
         memcpy(de->d_name, dotdot[i].name, nlen);
         de->d_name[nlen] = '\0';
         written += reclen;
-        of->dir_cookie = emitted;
+        od->dir_cookie = emitted;
     }
 
     uint32_t off = dir->u.dir.dirblock_head_offset;
@@ -709,7 +864,7 @@ long sud_inramfs_op_getdents64(int fd, void *buf, size_t count)
             memcpy(de->d_name, src->name, nlen);
             de->d_name[nlen] = '\0';
             written += reclen;
-            of->dir_cookie = emitted;
+            od->dir_cookie = emitted;
         }
         off = db->next_offset;
     }
@@ -746,8 +901,9 @@ void *sud_inramfs_op_mmap(void *addr, size_t length, int prot, int flags,
                           int fd, off_t offset, int *err)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) { *err = EBADF; return MAP_FAILED; }
-    struct sud_ir_inode *ino = sud_ir_inode_get(of->inode_idx);
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) { *err = EBADF; return MAP_FAILED; }
+    struct sud_ir_inode *ino = sud_ir_inode_get(od->inode_idx);
     if (!ino) { *err = EBADF; return MAP_FAILED; }
     if (ino->type != SUD_IR_T_REG) { *err = ENODEV; return MAP_FAILED; }
     if (offset < 0) { *err = EINVAL; return MAP_FAILED; }
@@ -925,81 +1081,58 @@ long sud_inramfs_op_statx_fill(const char *abs_path, int follow,
 /* ================================================================
  * fd duplication.
  *
- * We delegate the actual fd-number allocation to the kernel via the
- * raw dup/dup3 syscalls — the kernel knows which numbers are free,
- * what FD_CLOEXEC needs to be set on the new fd, and how to close
- * an existing entry at `newfd` for dup2/dup3.  After the kernel
- * call returns the new fd number, we register it in our fd table so
- * subsequent read/write/lseek/close on the new fd dispatch back into
- * inramfs.
- *
- * Caveat: in Linux, dup2/dup3 produces two fds that share the same
- * "open file description" (and therefore f_pos).  Our fd table
- * stores a per-fd `pos`, so two duplicates each track their own
- * position.  This is wrong only for code that reads/writes through
- * one duplicate while another reads f_pos — uncommon in build
- * workloads.  The shared inode means file *contents* are correctly
- * shared, which is the property bash's redirect logic actually
- * relies on.
+ * We delegate fd-number allocation to the kernel, then attach the new
+ * fd-table entry to the same shared open-file description as the source
+ * fd.  That preserves POSIX/Linux dup semantics for file status flags,
+ * sequential file offset, and directory iteration cookies.
  * ================================================================ */
 
 static long fdtab_register_dup(struct sud_ir_open_file *src, int newkfd)
 {
-    /* Allocate a new fdtab slot for newkfd.  We can't reuse fdtab_alloc
-     * directly because it overwrites pos/flags; we want to inherit. */
+    struct sud_ir_shared_ofd *sd = fdtab_desc(src);
+    if (!sd) return -EBADF;
+
     fdtab_init();
-    /* Defensive: if newkfd already has an entry (e.g. dup2 onto an
-     * inramfs fd), the kernel already closed it on our behalf — drop
-     * the stale entry.  Its inode ref is dropped only AFTER the new
-     * slot takes its own ref below: if old and new happen to share the
-     * inode, an unlinked (nlink==0) inode must not see refs dip to 0
-     * mid-dup and get reclaimed. */
-    uint32_t stale_idx = 0;
+    int stale_desc = -1;
     {
         struct sud_ir_open_file *stale = fdtab_lookup(newkfd);
         if (stale) {
-            stale_idx  = stale->inode_idx;
+            stale_desc = stale->desc_idx;
             stale->kfd = -1;
+            stale->desc_idx = -1;
         }
         sud_pr_dirfd_forget(newkfd);
     }
+
+    int local_desc = -1;
+    for (int i = 0; i < SUD_IR_OFD_TABLE_SIZE; i++) {
+        if (g_ofdtab[i].shared_idx < 0) {
+            local_desc = i;
+            g_ofdtab[i].shared_idx = g_ofdtab[src->desc_idx].shared_idx;
+            break;
+        }
+    }
+    if (local_desc < 0) {
+        if (stale_desc >= 0) ofd_release(stale_desc);
+        return -EMFILE;
+    }
+    struct sud_ir_super *sb = sud_ir_sb();
+    sud_ir_lock(&sb->lock);
+    sd->refs++;
+    sud_ir_unlock(&sb->lock);
+
     for (int i = 0; i < SUD_IR_FD_TABLE_SIZE; i++) {
         if (g_fdtab[i].kfd == -1) {
-            g_fdtab[i].kfd        = newkfd;
-            g_fdtab[i].inode_idx  = src->inode_idx;
-            g_fdtab[i].generation = src->generation;
-            g_fdtab[i].pos        = src->pos;
-            g_fdtab[i].flags      = src->flags;
-            g_fdtab[i].dir_cookie = src->dir_cookie;
-            /* The duplicate is one more open reference on the inode —
-             * without it, `exec 8<f` (open + dup2 + close the original)
-             * nets to refs 0, a later unlink reclaims the inode while
-             * fd 8 still reads it, and POSIX unlink-open semantics
-             * break (observed as empty reads through the held fd). */
-            {
-                struct sud_ir_inode *ino = sud_ir_inode_get(src->inode_idx);
-                if (ino) {
-                    struct sud_ir_super *sb = sud_ir_sb();
-                    sud_ir_lock(&sb->lock);
-                    ino->open_refs++;
-                    sud_ir_unlock(&sb->lock);
-                }
-            }
-            if (stale_idx) fdtab_drop_inode_ref(stale_idx);
-            /* Inherit the abs-path used to open the source dirfd, if
-             * any.  Without this, dup'd directory fds (e.g. those
-             * minted by fdopendir, which is what `rm -rf` and many
-             * ftw-style traversals use) would lose their path and
-             * cause subsequent unlinkat/openat-relative ops on the
-             * dup to fail with EXDEV from sud_pr_absolutise().  The
-             * dirfd table is owned by path_remap; mirror the entry
-             * there. */
+            g_fdtab[i].kfd = newkfd;
+            g_fdtab[i].desc_idx = local_desc;
+            if (stale_desc >= 0) ofd_release(stale_desc);
             const char *src_path = sud_pr_dirfd_lookup(src->kfd);
             if (src_path) sud_pr_dirfd_register(newkfd, src_path);
             return newkfd;
         }
     }
-    if (stale_idx) fdtab_drop_inode_ref(stale_idx);
+    ofd_release(local_desc);
+    if (stale_desc >= 0) ofd_release(stale_desc);
     return -EMFILE;
 }
 
@@ -1065,23 +1198,25 @@ long sud_inramfs_op_fcntl_dupfd(int oldfd, int minfd, int cloexec)
 long sud_inramfs_op_fcntl_getfl(int fd)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
     /* Return access-mode | O_APPEND | O_NONBLOCK that we recorded at
      * open time (plus any later F_SETFL).  Other status bits are not
      * meaningful for in-RAM files. */
-    return (long)(of->flags & (O_ACCMODE | O_APPEND | O_NONBLOCK));
+    return (long)(od->flags & (O_ACCMODE | O_APPEND | O_NONBLOCK));
 }
 
 long sud_inramfs_op_fcntl_setfl(int fd, int flags)
 {
     struct sud_ir_open_file *of = fdtab_lookup(fd);
-    if (!of) return -EBADF;
+    struct sud_ir_shared_ofd *od = fdtab_desc(of);
+    if (!od) return -EBADF;
     /* fcntl(F_SETFL) only updates O_APPEND/O_NONBLOCK/O_DIRECT/O_ASYNC
      * — access mode and creation flags are immutable.  We only model
      * the first two. */
-    int keep = of->flags & ~(O_APPEND | O_NONBLOCK);
+    int keep = od->flags & ~(O_APPEND | O_NONBLOCK);
     int set  = flags & (O_APPEND | O_NONBLOCK);
-    of->flags = keep | set;
+    od->flags = keep | set;
     return 0;
 }
 
@@ -1513,9 +1648,10 @@ static int inramfs_pre_syscall(struct sud_syscall_ctx *ctx)
         if ((flags & AT_EMPTY_PATH) && (!path || path[0] == '\0')
             && sud_inramfs_owns_fd(fd)) {
             struct sud_ir_open_file *of = fdtab_lookup(fd);
-            if (of)
+            struct sud_ir_shared_ofd *od = fdtab_desc(of);
+            if (od)
                 return short_circuit(ctx,
-                    sud_inramfs_op_statx_fill_inode(of->inode_idx,
+                    sud_inramfs_op_statx_fill_inode(od->inode_idx,
                                                     (unsigned int)ctx->args[3],
                                                     (void *)ctx->args[4]));
         }
@@ -1543,9 +1679,20 @@ static void inramfs_target_launch(const struct sud_tracee_launch *l)
 
 static void inramfs_fork_child(void)
 {
-    /* fd table is a per-process map.  Child inherits memfds via fork
-     * just as it would inherit any other fd; the table contents are
-     * still valid for the child.  No reset needed. */
+    /* The child inherits the process-local fd table and the kernel
+     * memfds.  Mirror that extra set of fd references in the shared
+     * open-description table so parent/child closes do not invalidate
+     * each other's descriptors. */
+    if (!g_fdtab_init) return;
+    struct sud_ir_super *sb = sud_ir_sb();
+    sud_ir_lock(&sb->lock);
+    for (int i = 0; i < SUD_IR_FD_TABLE_SIZE; i++) {
+        if (g_fdtab[i].kfd < 0) continue;
+        int shared_idx = g_ofdtab[g_fdtab[i].desc_idx].shared_idx;
+        struct sud_ir_shared_ofd *od = ofd_shared(shared_idx);
+        if (od && od->refs > 0) od->refs++;
+    }
+    sud_ir_unlock(&sb->lock);
 }
 
 const struct sud_addin sud_inramfs_addin = {

@@ -41,7 +41,7 @@
 /* ---- Region layout constants ---------------------------------- */
 
 #define SUD_IR_MAGIC          0x494E5246u   /* "INRF" */
-#define SUD_IR_VERSION        1
+#define SUD_IR_VERSION        2
 #define SUD_IR_BLOCK_SIZE     4096u
 #define SUD_IR_NAME_MAX       255u
 /* Cap on the bookkeeping section so the rest of the region is data. */
@@ -52,6 +52,7 @@
  * return -ENAMETOOLONG instead of overflowing the on-stack parent
  * tracking buffer.  64 is well above any realistic FS tree. */
 #define SUD_IR_PARENT_STACK_MAX 64
+#define SUD_IR_MAX_OPEN_DESCS 4096u
 
 /* Threshold for small→large promotion (bytes).  Files at or below
  * this live as one contiguous extent in the shared small-file shm
@@ -234,6 +235,21 @@ struct sud_ir_dirblock {
 _Static_assert(sizeof(struct sud_ir_dirblock) <= SUD_IR_BLOCK_SIZE,
                "sud_ir_dirblock must fit in one SUD_IR_BLOCK_SIZE block");
 
+/* ---- Shared open file descriptions ----------------------------- */
+
+struct sud_ir_shared_ofd {
+    uint32_t refs;
+    uint32_t lock;
+    uint32_t inode_idx;
+    uint32_t generation;
+    uint64_t pos;
+    uint32_t flags;
+    uint32_t dir_cookie;
+} __attribute__((aligned(8)));
+
+_Static_assert(sizeof(struct sud_ir_shared_ofd) == 32,
+               "sud_ir_shared_ofd must be 32 bytes on every arch");
+
 /* ---- Superblock ----------------------------------------------- */
 
 struct sud_ir_super {
@@ -249,6 +265,8 @@ struct sud_ir_super {
      * itself follows the super in the region.  Slot 1 is always
      * the root directory; slot 0 is reserved as "no inode". */
     uint32_t inode_count;       /* size of inode table */
+    uint32_t ofd_count;         /* size of shared open-description table */
+    uint32_t ofd_table_off;
     uint32_t inode_bitmap_off;  /* byte offset to the bitmap */
     uint32_t inode_table_off;   /* byte offset to the inode table */
     /* Metadata block allocator (used for dirent blocks and symlink
@@ -300,8 +318,8 @@ struct sud_ir_super {
 };
 
 /* Same mixed-arch ABI pin as sud_ir_inode's (see above). */
-_Static_assert(sizeof(struct sud_ir_super) == 88,
-               "sud_ir_super must be 88 bytes on every arch");
+_Static_assert(sizeof(struct sud_ir_super) == 96,
+               "sud_ir_super must be 96 bytes on every arch");
 
 /* ---- super.c: region access and locking ----------------------- */
 
@@ -328,6 +346,12 @@ static inline uint32_t sud_ir_off(const void *p)
 static inline struct sud_ir_super *sud_ir_sb(void)
 {
     return (struct sud_ir_super *)sud_ir_base;
+}
+
+static inline struct sud_ir_shared_ofd *sud_ir_ofd_table(void)
+{
+    struct sud_ir_super *sb = sud_ir_sb();
+    return (struct sud_ir_shared_ofd *)sud_ir_ptr(sb->ofd_table_off);
 }
 
 /* Cross-process futex lock/unlock on a uint32_t word in the shared
