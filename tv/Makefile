@@ -9,7 +9,7 @@ all: tv sudtrace upttrace sud-bins mod-bins
 
 .PHONY: sud-bins mod-bins
 sud-bins: path-remap-test dispatcher-test inramfs-test fake-exec-test cmd-rewrite-test
-	$(MAKE) $(SUD_NATIVE)
+	$(MAKE) sud64 sud32
 
 mod-bins:
 	$(MAKE) -C $(MOD_DIR) all
@@ -112,6 +112,7 @@ endif
 SUD_ADDINS ?= sud/trace
 SUD_SRCS    := sud/wrapper.c sud/state.c sud/addin.c sud/raw.c sud/elf.c sud/handler.c sud/loader.c sud/runtime_config.c
 SUD_SRCS    += libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
+SUD_HDRS    := $(shell find sud libc-fs -name '*.h' 2>/dev/null)
 ifneq ($(filter sud/trace,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_TRACE
 SUD_SRCS    += sud/trace/event.c sud/trace/addin.c
@@ -218,10 +219,10 @@ release: tv sudtrace upttrace
 clean-tv:
 	rm -f tv $(TV_C_OBJS)
 
-sud64: $(SUD_SRCS) sudtrace.lds
+sud64: $(SUD_SRCS) $(SUD_HDRS) sudtrace.lds
 	$(SUD_CC64) $(SUD_CFLAGS) $(SUD_LDFLAGS) $(SUD_BASE64) -T sudtrace.lds -o sud64 $(SUD_SRCS)
 
-sud32: $(SUD_SRCS) sudtrace.lds
+sud32: $(SUD_SRCS) $(SUD_HDRS) sudtrace.lds
 	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) $(SUD_BASE32) -T sudtrace.lds -o sud32 $(SUD_SRCS)
 
 .PHONY: libc-fs-test
