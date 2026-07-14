@@ -1338,14 +1338,14 @@ extern "C" fn sud_on_term(_sig: i32) {
 const WIRE_WAITERS: u32 = 0x8000_0000;
 
 unsafe fn wire_tid_dead(tid: u32) -> bool {
-    libc::syscall(libc::SYS_tkill, tid, 0) == -1
+    (unsafe { libc::syscall(libc::SYS_tkill, tid, 0) }) == -1
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 unsafe fn wire_lock(word: *mut u32) {
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
-    let a = std::sync::atomic::AtomicU32::from_ptr(word);
-    let me = libc::syscall(libc::SYS_gettid) as u32;
+    let a = unsafe { std::sync::atomic::AtomicU32::from_ptr(word) };
+    let me = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
     if a.compare_exchange(0, me, Acquire, Relaxed).is_ok() { return; }
     loop {
         let cur = a.load(Relaxed);
@@ -1360,12 +1360,14 @@ unsafe fn wire_lock(word: *mut u32) {
             cur | WIRE_WAITERS
         } else { cur };
         let ts = libc::timespec { tv_sec: 1, tv_nsec: 0 };
-        libc::syscall(libc::SYS_futex, word, 0 /*FUTEX_WAIT*/, cur,
-                      &ts as *const libc::timespec, 0, 0);
+        unsafe {
+            libc::syscall(libc::SYS_futex, word, 0 /*FUTEX_WAIT*/, cur,
+                          &ts as *const libc::timespec, 0, 0);
+        }
         let cur = a.load(Relaxed);
         if cur != 0 {
             let holder = cur & !WIRE_WAITERS;
-            if holder != 0 && holder != me && wire_tid_dead(holder)
+            if holder != 0 && holder != me && unsafe { wire_tid_dead(holder) }
                 && a.compare_exchange(cur, me | WIRE_WAITERS,
                                       Acquire, Relaxed).is_ok() {
                 return; // stole a dead holder's lock
@@ -1374,9 +1376,9 @@ unsafe fn wire_lock(word: *mut u32) {
     }
 }
 unsafe fn wire_unlock(word: *mut u32) {
-    let a = std::sync::atomic::AtomicU32::from_ptr(word);
+    let a = unsafe { std::sync::atomic::AtomicU32::from_ptr(word) };
     if a.swap(0, std::sync::atomic::Ordering::Release) & WIRE_WAITERS != 0 {
-        libc::syscall(libc::SYS_futex, word, 1 /*FUTEX_WAKE*/, 1, 0, 0, 0);
+        unsafe { libc::syscall(libc::SYS_futex, word, 1 /*FUTEX_WAKE*/, 1, 0, 0, 0); }
     }
 }
 

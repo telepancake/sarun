@@ -592,6 +592,7 @@ impl Reader {
 
     /// Set a filter on an IETF draft list and reload. Only works when
     /// the source is an IETF draft list (draft: None).
+    #[allow(dead_code)]
     pub fn set_ietf_filter(&mut self, filter: &str) -> anyhow::Result<()> {
         if let Source::Ietf { root, draft: None, .. } = &self.source {
             let source = Source::Ietf {

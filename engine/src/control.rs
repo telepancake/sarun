@@ -2463,7 +2463,7 @@ macro_rules! ui_verbs {
             // Ancestor DIRECTORY rows: the mount traverses real dir rows,
             // so each intermediate directory lands once, like mkdir -p.
             let mut dirs_done = std::collections::HashSet::new();
-            let mut ensure_dirs = |b: &crate::capture::BoxState, path: &str,
+            let ensure_dirs = |b: &crate::capture::BoxState, path: &str,
                                    dirs_done: &mut std::collections::HashSet<String>| {
                 let mut at = 0usize;
                 while let Some(i) = path[at..].find('/') {
@@ -4320,6 +4320,7 @@ fn svc_splice(a: UnixStream, b: UnixStream) {
 /// Generic CLI dispatcher: looks up the subcommand path in the registry
 /// and dispatches the corresponding verb over the control socket.
 /// Falls back to cli_mirror for backward compatibility.
+#[allow(dead_code)]
 pub fn cli_dispatch(argv: &[String]) -> i32 {
     let strs: Vec<&str> = argv.iter().map(String::as_str).collect();
     // Try registry lookup: ["mirror", "run", "5"] → verb "mirror_run" args ["5"]
@@ -4355,6 +4356,7 @@ pub fn cli_dispatch(argv: &[String]) -> i32 {
 }
 
 /// One-shot RPC: send a verb, read the reply, return the inner result.
+#[allow(dead_code)]
 pub fn cli_rpc(sock: &std::path::Path, verb: &str, args: Value) -> Result<Value, String> {
     let mut c = UnixStream::connect(sock).map_err(|_| "no engine running".to_string())?;
     let msg = json!({"type": "ui", "verb": verb, "args": args});

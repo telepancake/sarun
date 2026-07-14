@@ -345,6 +345,7 @@ impl EditorPane {
     }
 
     /// True while an edit is waiting out the debounce quiet period.
+    #[allow(dead_code)]
     pub fn rehighlight_pending(&self) -> bool {
         self.rehl_due.is_some()
     }

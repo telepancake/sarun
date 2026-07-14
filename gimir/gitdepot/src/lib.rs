@@ -85,7 +85,6 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use depot::codec;
-use depot::{Attrs, BlobOp, Layer, Node};
 
 mod cli;
 pub use cli::cli_main;
@@ -572,9 +571,9 @@ struct Dag {
     /// Per-sha child count within the scope (the frontier refcount —
     /// parents outside the streamed set included: those are the update
     /// path's boundary parents).
-    counts: HashMap<String, u32>,
+    _counts: HashMap<String, u32>,
     /// The streamed set itself.
-    streamed: std::collections::HashSet<String>,
+    _streamed: std::collections::HashSet<String>,
     /// CHAIN LANDING ORDER (parents always before children): the order
     /// `ingest_stream` feeds to `git diff-tree --stdin` and therefore
     /// the order trees land in the TREES chain. Because each chain
@@ -611,7 +610,7 @@ fn dag_scope(repo: &Path, negations: &[String]) -> Result<Dag> {
         commits.push((sha, parents));
     }
     let order = walk_order(&commits, &streamed);
-    Ok(Dag { counts, streamed, order })
+    Ok(Dag { _counts: counts, _streamed: streamed, order })
 }
 
 /// The chain landing order — the size model of the TREES chain.
