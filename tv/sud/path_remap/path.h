@@ -12,7 +12,7 @@
  *     used by inramfs's vfs.c walker for prefix stripping)
  *   - chdir/getcwd/fchdir interception that maintains the shadow
  *
- * inramfs/* no longer holds any of this state.  The inramfs addin
+ * inramfs/ no longer holds any of this state.  The inramfs addin
  * registers a directory fd here (sud_pr_dirfd_register) when it opens
  * an inramfs directory so that subsequent (dirfd, relpath) syscalls
  * can be absolutised through the shared dirfd table.

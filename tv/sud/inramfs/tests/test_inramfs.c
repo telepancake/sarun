@@ -303,6 +303,111 @@ static void test_dup_holds_unlinked_inode(void)
     teardown_mount();
 }
 
+
+/* dup/dup2 must share the Linux open file description: reads, writes,
+ * lseek, F_SETFL and getdents cookies all operate through one shared
+ * file offset/status-flag object. */
+static void test_dup_shared_file_offset(void)
+{
+    g_curtest = "dup_shared_file_offset";
+    setup_mount("/inramfs", 4, "test_dso");
+
+    int fd = (int)sud_inramfs_op_open("/inramfs/f", O_RDWR | O_CREAT, 0644);
+    TASSERT(fd >= 0, "create f");
+    TASSERT_EQ(sud_inramfs_op_write(fd, "abcdef", 6), 6, "write body");
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 0, SEEK_SET), 0, "rewind");
+
+    long dup = sud_inramfs_op_dup(fd);
+    TASSERT(dup >= 0, "dup");
+
+    char b[4] = {0};
+    TASSERT_EQ(sud_inramfs_op_read(fd, b, 2), 2, "read first via fd");
+    TASSERT(memcmp(b, "ab", 2) == 0, "first bytes");
+    memset(b, 0, sizeof(b));
+    TASSERT_EQ(sud_inramfs_op_read((int)dup, b, 2), 2,
+               "read second via dup");
+    TASSERT(memcmp(b, "cd", 2) == 0, "dup sees advanced offset");
+
+    TASSERT_EQ(sud_inramfs_op_fcntl_setfl((int)dup, O_APPEND), 0,
+               "set append through dup");
+    TASSERT((sud_inramfs_op_fcntl_getfl(fd) & O_APPEND) != 0,
+            "status flags shared with original fd");
+
+    TASSERT_EQ(sud_inramfs_op_close((int)dup), 0, "close dup");
+    TASSERT_EQ(sud_inramfs_op_close(fd), 0, "close fd");
+    teardown_mount();
+}
+
+
+/* rename-over-existing is unlink of the destination name. If the
+ * replaced destination inode is still open, that fd must continue to
+ * address the old inode until close, just like unlink-open semantics. */
+
+static void test_fork_shared_file_offset(void)
+{
+    g_curtest = "fork_shared_file_offset";
+    setup_mount("/inramfs", 4, "test_fork_ofd");
+    int fd = (int)sud_inramfs_op_open("/inramfs/stdin", O_RDWR | O_CREAT, 0644);
+    TASSERT(fd >= 0, "create stdin-like file");
+    TASSERT_EQ(sud_inramfs_op_write(fd, "abcdef", 6), 6, "seed");
+    TASSERT_EQ(sud_inramfs_op_lseek(fd, 0, SEEK_SET), 0, "rewind");
+
+    long pid = fork();
+    if (pid == 0) {
+        char cbuf[3] = {0};
+        long n = sud_inramfs_op_read(fd, cbuf, 2);
+        if (n != 2 || memcmp(cbuf, "ab", 2) != 0)
+            raw_syscall6(SYS_exit, 21, 0, 0, 0, 0, 0);
+        raw_syscall6(SYS_exit, 0, 0, 0, 0, 0, 0);
+    }
+
+    int status = 0;
+    raw_syscall6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0);
+    TASSERT_EQ(status & 0xff7f, 0, "child consumed first bytes");
+
+    char pbuf[3] = {0};
+    TASSERT_EQ(sud_inramfs_op_read(fd, pbuf, 2), 2, "parent reads next bytes");
+    TASSERT(memcmp(pbuf, "cd", 2) == 0, "fork child advanced shared offset");
+    sud_inramfs_op_close(fd);
+    teardown_mount();
+}
+
+static void test_rename_over_held_destination(void)
+{
+    g_curtest = "rename_over_held_destination";
+    setup_mount("/inramfs", 4, "test_rohd");
+
+    int oldfd = (int)sud_inramfs_op_open("/inramfs/old",
+                                          O_RDWR | O_CREAT, 0644);
+    TASSERT(oldfd >= 0, "create old");
+    TASSERT_EQ(sud_inramfs_op_write(oldfd, "OLD", 3), 3, "write old");
+
+    int newfd = (int)sud_inramfs_op_open("/inramfs/new",
+                                          O_RDWR | O_CREAT, 0644);
+    TASSERT(newfd >= 0, "create new");
+    TASSERT_EQ(sud_inramfs_op_write(newfd, "NEW", 3), 3, "write new");
+    TASSERT_EQ(sud_inramfs_op_close(newfd), 0, "close new");
+
+    TASSERT_EQ(sud_inramfs_op_rename("/inramfs/new", "/inramfs/old", 0), 0,
+               "rename new over old");
+
+    char buf[8] = {0};
+    TASSERT_EQ(sud_inramfs_op_pread(oldfd, buf, 3, 0), 3,
+               "read held old fd");
+    TASSERT(memcmp(buf, "OLD", 3) == 0,
+            "held fd still sees replaced destination inode");
+
+    memset(buf, 0, sizeof(buf));
+    int pathfd = (int)sud_inramfs_op_open("/inramfs/old", O_RDONLY, 0);
+    TASSERT(pathfd >= 0, "open replaced path");
+    TASSERT_EQ(sud_inramfs_op_read(pathfd, buf, 3), 3, "read path");
+    TASSERT(memcmp(buf, "NEW", 3) == 0, "path sees replacement inode");
+
+    TASSERT_EQ(sud_inramfs_op_close(pathfd), 0, "close path fd");
+    TASSERT_EQ(sud_inramfs_op_close(oldfd), 0, "close held old fd");
+    teardown_mount();
+}
+
 static void test_symlink(void)
 {
     g_curtest = "symlink";
@@ -862,6 +967,9 @@ int main(int argc, char **argv)
     test_truncate();
     test_unlink_rename();
     test_dup_holds_unlinked_inode();
+    test_dup_shared_file_offset();
+    test_fork_shared_file_offset();
+    test_rename_over_held_destination();
     test_symlink();
     test_getdents();
     test_chmod_chown_utimens();

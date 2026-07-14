@@ -7,7 +7,7 @@
  * call (open/stat/mkdir/unlink/...), asks path_remap whether the
  * (dirfd, path) pair lies under the inramfs mount and — if so —
  * invokes the matching sud_inramfs_op_* helper.  No path resolution
- * happens inside sud/inramfs/* anymore; that file is now a pure
+ * happens inside sud/inramfs/ anymore; that file is now a pure
  * inode/data store keyed by absolute path and fd.
  *
  * Why this lives in path_remap and not in inramfs:

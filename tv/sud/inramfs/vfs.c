@@ -37,27 +37,6 @@
  * Internal helpers
  * ================================================================ */
 
-/* Compare a NUL-terminated string against a slice (name, len). */
-static int name_eq(const char *a, const char *b, size_t b_len)
-{
-    for (size_t i = 0; i < b_len; i++) {
-        if (a[i] == '\0' || a[i] != b[i]) return 0;
-    }
-    return a[b_len] == '\0';
-}
-
-/* d_type from inode type. */
-static uint8_t d_type_from_ino(const struct sud_ir_inode *ino)
-{
-    switch (ino->type) {
-        case SUD_IR_T_REG: return DT_REG;
-        case SUD_IR_T_DIR: return DT_DIR;
-        case SUD_IR_T_LNK: return DT_LNK;
-        case SUD_IR_T_FIFO: return DT_FIFO;
-    }
-    return DT_UNKNOWN;
-}
-
 /* mode_t-style mode (full S_IF*+perm) from inode. */
 static uint32_t full_mode(const struct sud_ir_inode *ino)
 {
@@ -1400,7 +1379,8 @@ long sud_inramfs_op_rename_at_inode(uint32_t old_par,
             /* Directory unlink takes 2 references off (.. removed). */
             dst_ino->nlink = 0;
         }
-        if (dst_ino->nlink == 0) sud_ir_inode_free(dst);
+        if (dst_ino->nlink == 0 && dst_ino->open_refs == 0)
+            sud_ir_inode_free(dst);
     }
 
     /* Unlink src from old_par, link into new_par. */

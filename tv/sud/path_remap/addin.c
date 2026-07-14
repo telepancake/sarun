@@ -1409,13 +1409,19 @@ static int path_remap_pre_syscall(struct sud_syscall_ctx *ctx)
      * classification. */
 #if defined(SYS_execve) || defined(SYS_execveat)
     {
-        int is_exec = 0, path_idx = 0, dirfd = AT_FDCWD;
+        int is_exec = 0, path_idx = 0;
+#ifdef SUD_ADDIN_INRAMFS
+        int dirfd = AT_FDCWD;
+#endif
 #ifdef SYS_execve
         if (nr == SYS_execve) { is_exec = 1; path_idx = 0; }
 #endif
 #ifdef SYS_execveat
         if (nr == SYS_execveat) {
-            is_exec = 1; path_idx = 1; dirfd = (int)ctx->args[0];
+            is_exec = 1; path_idx = 1;
+#ifdef SUD_ADDIN_INRAMFS
+            dirfd = (int)ctx->args[0];
+#endif
         }
 #endif
         if (is_exec) {

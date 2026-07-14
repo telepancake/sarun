@@ -698,6 +698,7 @@ void emit_open_event(pid_t pid, const char *path, int flags,
 
 void emit_unlink_event(pid_t pid, const char *path, long ret)
 {
+    (void)pid;
     /* UNLINK is an EV_OPEN-ish event in terms of carrying just a path,
      * but we don't have an EV_UNLINK in the wire format. Squash it
      * into EV_OPEN with fd=-1 and err = ret (0 on success, negative
