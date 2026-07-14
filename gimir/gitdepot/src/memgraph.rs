@@ -58,7 +58,7 @@ struct Head {
 /// pack-built graphs serve as an `Objects` source.)
 #[derive(Clone, Copy)]
 struct Loc {
-    pack: u32,
+    _pack: u32,
     ofs: u64,
 }
 
@@ -603,7 +603,7 @@ impl PackReader {
             7 => olen as u64,
             t => return Err(Error::Chain(format!("pack: entry type {t}"))),
         };
-        let mut probe = [0u8; 0];
+        let probe = [0u8; 0];
         let _ = probe; // (kept for symmetry; nothing to pre-read)
         let (_, consumed) =
             inflate_at_counted(&self.file, ofs + hlen as u64 + extra, size as usize)?;
@@ -677,7 +677,7 @@ pub(crate) fn build_pack(pack: &Path, kind: crate::HashKind) -> Result<PackGraph
             t => return Err(Error::Chain(format!("pack: resolved type {t}"))),
         };
         let digest = kind.obj_digest(typ_name, &data);
-        g.add(&digest[..olen], typ, Loc { pack: 0, ofs }, &data)?;
+        g.add(&digest[..olen], typ, Loc { _pack: 0, ofs }, &data)?;
         Ok(true)
     };
 
@@ -868,12 +868,12 @@ pub fn build(repo: &Path) -> Result<Stats> {
         order.sort_unstable();
         for (ofs, sha) in order {
             let (typ, data) = st.entry_at(p, ofs)?;
-            g.add(&sha, typ, Loc { pack: p as u32, ofs }, &data)?;
+            g.add(&sha, typ, Loc { _pack: p as u32, ofs }, &data)?;
         }
     }
     for sha in loose {
         if let Some((typ, data)) = st.loose_typed(&sha)? {
-            g.add(&sha, typ, Loc { pack: u32::MAX, ofs: 0 }, &data)?;
+            g.add(&sha, typ, Loc { _pack: u32::MAX, ofs: 0 }, &data)?;
         }
     }
     Ok(g.stats())

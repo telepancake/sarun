@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 /// One action in the registry.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct ActionSpec {
     /// Wire verb name (identity). Sent over the control socket as
     /// `{"verb":"<name>"}`. Also the canonical action identity.
@@ -47,16 +48,19 @@ pub struct ActionSpec {
 // ── Name derivation ─────────────────────────────────────────────────────
 
 /// `mirror_run` → `["mirror", "run"]`
+#[allow(dead_code)]
 pub fn split_name(name: &str) -> Vec<&str> {
     name.split('_').collect()
 }
 
 /// `mirror_run` → `mirror run`
+#[allow(dead_code)]
 pub fn derive_cli(name: &str) -> String {
     split_name(name).join(" ")
 }
 
 /// `mirror_run` → `Mirror run`
+#[allow(dead_code)]
 pub fn derive_menu(name: &str) -> String {
     let parts = split_name(name);
     let mut out = Vec::new();
@@ -78,6 +82,7 @@ pub fn derive_menu(name: &str) -> String {
 }
 
 /// `mirror_run` → `act_mirror_run`
+#[allow(dead_code)]
 pub fn derive_fn_name(name: &str) -> String {
     format!("act_{}", name)
 }
@@ -473,11 +478,13 @@ pub static ACTIONS: &[ActionSpec] = &[
 // ── Generated projections ───────────────────────────────────────────────
 
 /// Verb docs: `(name, args, help)` for the `sarun verbs` listing.
+#[allow(dead_code)]
 pub fn verb_docs() -> Vec<(&'static str, &'static str, &'static str)> {
     ACTIONS.iter().map(|a| (a.verb, a.args, a.help)).collect()
 }
 
 /// Key bindings: `(key, ctx, verb)` for the TUI key dispatch table.
+#[allow(dead_code)]
 pub fn key_bindings() -> Vec<(char, Option<&'static str>, &'static str)> {
     ACTIONS.iter()
         .filter_map(|a| a.key.map(|k| (k, a.ctx, a.verb)))
@@ -486,6 +493,7 @@ pub fn key_bindings() -> Vec<(char, Option<&'static str>, &'static str)> {
 
 /// Menu entries: `(label, key_hint, verb)` for context menus.
 /// If `menu` is `None`, the label is derived from the verb name.
+#[allow(dead_code)]
 pub fn menu_entries() -> Vec<(&'static str, Option<char>, &'static str)> {
     ACTIONS.iter()
         .filter(|a| a.menu.is_some() || a.key.is_some())
@@ -522,6 +530,7 @@ pub fn verb_for_cli(path: &[&str]) -> Option<&'static str> {
 }
 
 /// Tab-complete a partial verb name.
+#[allow(dead_code)]
 pub fn complete(prefix: &str) -> Vec<&'static str> {
     ACTIONS.iter()
         .filter(|a| a.verb.starts_with(prefix))
@@ -530,6 +539,7 @@ pub fn complete(prefix: &str) -> Vec<&'static str> {
 }
 
 /// Generate help text for the help pane.
+#[allow(dead_code)]
 pub fn help_text() -> String {
     let mut out = String::from("Actions:\n");
     for a in ACTIONS {
@@ -548,6 +558,7 @@ pub fn help_text() -> String {
 }
 
 /// Generate CLI usage text.
+#[allow(dead_code)]
 pub fn cli_usage() -> String {
     let mut out = String::from("usage:\n");
     let mut seen = std::collections::HashSet::new();

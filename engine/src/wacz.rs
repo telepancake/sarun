@@ -96,7 +96,7 @@ fn surt(url: &str) -> String {
 
 struct Row {
     ts: f64,
-    method: String,
+    _method: String,
     url: String,
     status: i32,
     mime: String,
@@ -112,7 +112,7 @@ fn read_rows(box_id: i64) -> anyhow::Result<Vec<Row>> {
         "SELECT ts,method,url,status,mime,resp_headers,resp_body \
          FROM webcap ORDER BY ts")?;
     let rows = st.query_map([], |r| Ok(Row {
-        ts: r.get(0)?, method: r.get(1)?, url: r.get(2)?, status: r.get(3)?,
+        ts: r.get(0)?, _method: r.get(1)?, url: r.get(2)?, status: r.get(3)?,
         mime: r.get(4)?, resp_headers: r.get(5)?, resp_body: r.get(6)?,
     }))?.filter_map(|r| r.ok()).collect();
     Ok(rows)
@@ -480,7 +480,7 @@ mod tests {
     fn warc_response_roundtrips_through_parse() {
         // Build one response record the way export does, then parse it back.
         let row = Row {
-            ts: 1609459200.0, method: "GET".into(),
+            ts: 1609459200.0, _method: "GET".into(),
             url: "https://ex.test/p".into(), status: 200,
             mime: "text/html".into(),
             resp_headers: "content-type: text/html\ncontent-length: 5\n".into(),

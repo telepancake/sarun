@@ -549,6 +549,7 @@ fn decode_batch(rec: &[u8]) -> Result<(u64, Vec<Vec<u8>>)> {
 }
 
 /// How the former head record joins the accumulator on prepend.
+#[allow(dead_code)]
 pub(crate) enum Demote {
     /// Record stands alone (COMMITS, REFLOG, TAGS): moves in verbatim
     /// as the OLDEST entry of the new f1 content.

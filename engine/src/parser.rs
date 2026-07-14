@@ -126,8 +126,6 @@
 //! the registry. As the Prolog engine is added, `parse` and `transform`
 //! will be implemented here.
 
-use std::collections::HashMap;
-
 /// Parse a command string into a verb + args.
 ///
 /// Currently a simple whitespace split. The Prolog engine will replace
@@ -195,16 +193,19 @@ fn is_arg(s: &str) -> bool {
 }
 
 /// Complete a partial verb name using the registry.
+#[allow(dead_code)]
 pub fn complete(prefix: &str) -> Vec<&'static str> {
     crate::registry::complete(prefix)
 }
 
 /// Transform a verb name into its CLI command form.
+#[allow(dead_code)]
 pub fn verb_to_cli(verb: &str) -> String {
     crate::registry::derive_cli(verb)
 }
 
 /// Transform a CLI command path into a verb name (reverse derivation).
+#[allow(dead_code)]
 pub fn cli_to_verb(path: &[&str]) -> Option<&'static str> {
     crate::registry::verb_for_cli(path)
 }
@@ -231,6 +232,7 @@ pub fn fuzzy_complete(input: &str) -> Vec<&'static str> {
 }
 
 /// Format a verb + args as a human-readable command string.
+#[allow(dead_code)]
 pub fn format_command(verb: &str, args: &[String]) -> String {
     if args.is_empty() {
         verb_to_cli(verb)
@@ -240,6 +242,7 @@ pub fn format_command(verb: &str, args: &[String]) -> String {
 }
 
 /// Get help text for a specific verb.
+#[allow(dead_code)]
 pub fn help_for(verb: &str) -> Option<String> {
     crate::registry::find(verb).map(|a| {
         let mut parts = vec![format!("{} ({})", a.verb, a.args)];
@@ -258,6 +261,7 @@ pub fn help_for(verb: &str) -> Option<String> {
 }
 
 /// All known representations of an action.
+#[allow(dead_code)]
 pub struct ActionRepr {
     pub verb: &'static str,
     pub cli: Option<String>,
@@ -267,6 +271,7 @@ pub struct ActionRepr {
 }
 
 /// Get all representations of an action (the "lens" view).
+#[allow(dead_code)]
 pub fn representations(verb: &str) -> Option<ActionRepr> {
     crate::registry::find(verb).map(|a| ActionRepr {
         verb: a.verb,

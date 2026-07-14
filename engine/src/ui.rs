@@ -13061,6 +13061,7 @@ fn render_to_string(app: &App, w: u16, h: u16) -> Result<String, String> {
 /// Returns ActionItems with the registry's menu label and key hint.
 /// The verb name is stored as the item's label when no explicit menu
 /// label exists — the caller can override.
+#[allow(dead_code)]
 fn registry_menu_items(ctx: &str) -> Vec<ActionItem> {
     crate::registry::menu_entries().into_iter()
         .filter(|(_, _, verb)| {
@@ -13069,7 +13070,7 @@ fn registry_menu_items(ctx: &str) -> Vec<ActionItem> {
                 .map(|c| c == ctx)
                 .unwrap_or(false)
         })
-        .map(|(label, key, verb)| {
+        .map(|(label, key, _verb)| {
             let hint = match key {
                 Some(k) => Box::leak(format!("{k}").into_boxed_str()),
                 None => "",
