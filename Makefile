@@ -46,13 +46,16 @@ vendor: ## Assemble engine/vendor/ from pinned upstreams + vendor-patches/ serie
 # The addin set the sarun runner requires of the sud wrappers.
 SUD_ADDINS := sud/trace sud/path_remap sud/cmd-rewrite sud/fake-exec sud/inramfs
 
+# Additional Cargo arguments used by opt-in engine variants.
+ENGINE_CARGO_ARGS ?=
+
 .PHONY: engine
 engine: vendor ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
 	@command -v uv >/dev/null || { echo "engine needs uv (https://docs.astral.sh/uv/)"; exit 1; }
 	uv tool install --with ziglang cargo-zigbuild
 	rustup target add x86_64-unknown-linux-musl
 	cd engine && PATH="$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
-	  cargo zigbuild --release --target x86_64-unknown-linux-musl
+	  cargo zigbuild --release --target x86_64-unknown-linux-musl $(ENGINE_CARGO_ARGS)
 	@ln -sfn engine/target/x86_64-unknown-linux-musl/release/sarun sarun
 	@# sud is the DEFAULT run backend: the wrappers must sit next to the
 	@# engine binary (runner::sud_wrapper_paths resolves the sibling).
@@ -69,6 +72,28 @@ engine: vendor ## Build the engine (fully-static musl binary; cargo-zigbuild + z
 	@for d in gitdepot wikimak ietfmak; do \
 	  ln -sf sarun engine/target/x86_64-unknown-linux-musl/release/$$d; done
 	@echo "→ ./sarun → engine/target/x86_64-unknown-linux-musl/release/sarun"
+
+.PHONY: swipl
+swipl: ## Build pinned static SWI-Prolog + zlib artifacts (cached outside the repo)
+	@command -v uv >/dev/null || { echo "swipl needs uv (https://docs.astral.sh/uv/)"; exit 1; }
+	uv tool install --with ziglang cargo-zigbuild
+	PATH="$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
+	  uv run --with cmake --with ninja python3 scripts/swipl.py
+
+.PHONY: test-action-grammar
+test-action-grammar: swipl ## Run the 20 core-only action grammar tests with pinned host SWI-Prolog
+	@shopt -s nullglob; \
+	  bins=( "$${XDG_CACHE_HOME:-$$HOME/.cache}"/sarun/swipl/9.2.9/pipeline-*/$$(uname -m)/native-swipl-build/src/swipl ); \
+	  (( $${#bins[@]} )) || { echo "pinned host swipl not found after make swipl"; exit 1; }; \
+	  "$${bins[-1]}" -q -f none -s engine/pl/test_action_grammar.pl \
+	    -g test_action_grammar:run_action_grammar_tests -t halt
+
+.PHONY: engine-prolog
+engine-prolog: swipl ## Build the static engine with embedded SWI-Prolog (opt-in)
+	$(MAKE) engine ENGINE_CARGO_ARGS=--features=prolog
+	@mkdir -p engine/target/x86_64-unknown-linux-musl/release/LICENSES
+	@cp LICENSES/SWI-Prolog.txt LICENSES/zlib.txt \
+	  engine/target/x86_64-unknown-linux-musl/release/LICENSES/
 
 # ---- Tests ----------------------------------------------------------------
 #

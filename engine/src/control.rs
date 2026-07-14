@@ -61,15 +61,24 @@ pub(crate) fn pidfd_open(pid: i32) -> i32 {
 pub(crate) fn pid_alive(pid: i32) -> bool {
     let fd = pidfd_open(pid);
     if fd >= 0 {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         true
     } else {
         false
     }
 }
 fn pidfd_signal(pidfd: i32, sig: i32) {
-    unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, sig,
-                           std::ptr::null::<libc::c_void>(), 0); }
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            sig,
+            std::ptr::null::<libc::c_void>(),
+            0,
+        );
+    }
 }
 
 /// The HOST-namespace pid named by `pidfd`, read from /proc/self/fdinfo/<fd>
@@ -82,8 +91,11 @@ fn host_pid_from_pidfd(pidfd: i32) -> i32 {
     };
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("Pid:") {
-            return rest.split_whitespace().next()
-                .and_then(|t| t.parse().ok()).unwrap_or(0);
+            return rest
+                .split_whitespace()
+                .next()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0);
         }
     }
     0
@@ -94,12 +106,29 @@ fn host_pid_from_pidfd(pidfd: i32) -> i32 {
 /// as `sysN`. Kept tiny on purpose — this is a diagnosis aid, not strace.
 fn syscall_name(nr: i64) -> &'static str {
     match nr {
-        0 => "read", 1 => "write", 3 => "close", 7 => "poll", 8 => "lseek",
-        17 => "pread64", 18 => "pwrite64", 22 => "pipe", 23 => "select",
-        42 => "connect", 43 => "accept", 44 => "sendto", 45 => "recvfrom",
-        46 => "sendmsg", 47 => "recvmsg", 61 => "wait4", 202 => "futex",
-        230 => "nanosleep", 232 => "epoll_wait", 270 => "pselect6",
-        271 => "ppoll", 281 => "epoll_pwait", 288 => "accept4",
+        0 => "read",
+        1 => "write",
+        3 => "close",
+        7 => "poll",
+        8 => "lseek",
+        17 => "pread64",
+        18 => "pwrite64",
+        22 => "pipe",
+        23 => "select",
+        42 => "connect",
+        43 => "accept",
+        44 => "sendto",
+        45 => "recvfrom",
+        46 => "sendmsg",
+        47 => "recvmsg",
+        61 => "wait4",
+        202 => "futex",
+        230 => "nanosleep",
+        232 => "epoll_wait",
+        270 => "pselect6",
+        271 => "ppoll",
+        281 => "epoll_pwait",
+        288 => "accept4",
         _ => "",
     }
 }
@@ -107,8 +136,10 @@ fn syscall_name(nr: i64) -> &'static str {
 /// True when this syscall's FIRST argument is a file descriptor — so the
 /// wedge report can resolve it to the pipe/socket/file it names.
 fn syscall_arg0_is_fd(nr: i64) -> bool {
-    matches!(nr, 0 | 1 | 3 | 8 | 17 | 18 | 42 | 43 | 44 | 45 | 46 | 47
-                 | 232 | 288)
+    matches!(
+        nr,
+        0 | 1 | 3 | 8 | 17 | 18 | 42 | 43 | 44 | 45 | 46 | 47 | 232 | 288
+    )
 }
 
 /// Symbolized backtraces of every thread in `pids`, keyed by tid — the layer
@@ -121,31 +152,49 @@ fn syscall_arg0_is_fd(nr: i64) -> bool {
 /// (`thread apply all bt`), bounded by `timeout`, and parse the
 /// `Thread N (LWP <tid> …)` blocks. Empty map when gdb/timeout are absent —
 /// the /proc layer still stands on its own.
-fn thread_backtraces(pids: &[i32], depth: usize)
-    -> std::collections::HashMap<i32, Vec<String>> {
+fn thread_backtraces(pids: &[i32], depth: usize) -> std::collections::HashMap<i32, Vec<String>> {
     let mut out = std::collections::HashMap::new();
     // gdb must exist; if not, degrade silently to the /proc-only view.
-    if std::process::Command::new("gdb").arg("--version")
+    if std::process::Command::new("gdb")
+        .arg("--version")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null()).status()
-        .map(|s| !s.success()).unwrap_or(true) {
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
         return out;
     }
     // Attach to every pid CONCURRENTLY: gdb attaching to a sud-traced process
     // is slow (it can hit the full timeout), so a serial loop over N pids
     // wedged `stuck` for N×timeout. Spawn them all, then collect — total wall
     // time is bounded by the single slowest attach, not their sum.
-    let children: Vec<_> = pids.iter().filter_map(|&pid| {
-        std::process::Command::new("timeout")
-            .args(["5", "gdb", "-p", &pid.to_string(), "-batch",
-                   "-nx", "-ex", "set pagination off",
-                   "-ex", &format!("thread apply all bt {depth}")])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn().ok()
-    }).collect();
+    let children: Vec<_> = pids
+        .iter()
+        .filter_map(|&pid| {
+            std::process::Command::new("timeout")
+                .args([
+                    "5",
+                    "gdb",
+                    "-p",
+                    &pid.to_string(),
+                    "-batch",
+                    "-nx",
+                    "-ex",
+                    "set pagination off",
+                    "-ex",
+                    &format!("thread apply all bt {depth}"),
+                ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()
+        })
+        .collect();
     for child in children {
-        let Ok(res) = child.wait_with_output() else { continue };
+        let Ok(res) = child.wait_with_output() else {
+            continue;
+        };
         let text = String::from_utf8_lossy(&res.stdout);
         let mut cur_tid: Option<i32> = None;
         for line in text.lines() {
@@ -153,15 +202,21 @@ fn thread_backtraces(pids: &[i32], depth: usize)
             if let Some(rest) = l.strip_prefix("Thread ") {
                 // "Thread N (LWP <tid> …)" — the LWP is the kernel tid.
                 cur_tid = rest.find("LWP ").and_then(|i| {
-                    rest[i + 4..].split(|c: char| !c.is_ascii_digit())
-                        .next().and_then(|d| d.parse::<i32>().ok())
+                    rest[i + 4..]
+                        .split(|c: char| !c.is_ascii_digit())
+                        .next()
+                        .and_then(|d| d.parse::<i32>().ok())
                 });
             } else if l.starts_with('#') {
                 if let Some(tid) = cur_tid {
                     // Keep the readable tail: "func (…) at file:line" —
                     // drop the leading "#N  0xADDR in ".
-                    let frame = l.split_once(" in ")
-                        .map(|(_, r)| r).unwrap_or(l).trim().to_string();
+                    let frame = l
+                        .split_once(" in ")
+                        .map(|(_, r)| r)
+                        .unwrap_or(l)
+                        .trim()
+                        .to_string();
                     out.entry(tid).or_insert_with(Vec::new).push(frame);
                 }
             }
@@ -177,53 +232,67 @@ fn thread_backtraces(pids: &[i32], depth: usize)
 /// the runner opened) and parse the blocks back. `rp` is the box's runner host
 /// pid (the sink-file key); `box_pids` its process set. Empty map when the box
 /// predates this mechanism (no sink) or nothing on-CPU answered.
-fn selfbt_backtraces(rp: i32, box_pids: &[i32])
-    -> std::collections::HashMap<i32, Vec<String>> {
+fn selfbt_backtraces(rp: i32, box_pids: &[i32]) -> std::collections::HashMap<i32, Vec<String>> {
     let mut out = std::collections::HashMap::new();
     let path = crate::selfbt::sink_path(rp);
     // Truncate the sink so we read only THIS invocation's dumps.
-    let Ok(f) = std::fs::OpenOptions::new().write(true).truncate(true)
-        .open(&path) else { return out; };
+    let Ok(f) = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+    else {
+        return out;
+    };
     drop(f);
     // Aim only at R-state threads: those are the spins gdb can't localize, and
     // signalling a blocked thread risks EINTR-perturbing the box.
     let sig = crate::selfbt::dump_signal();
     let mut aimed = 0;
     for &pid in box_pids {
-        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task"))
-            else { continue };
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            continue;
+        };
         for te in tasks.flatten() {
-            let Some(tid) = te.file_name().to_str()
-                .and_then(|s| s.parse::<i32>().ok()) else { continue };
-            let st = std::fs::read_to_string(
-                format!("/proc/{pid}/task/{tid}/stat")).ok()
-                .and_then(|s| s.rfind(')')
-                    .and_then(|i| s[i + 1..].trim().chars().next()));
-            if st != Some('R') { continue; }
+            let Some(tid) = te.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+                continue;
+            };
+            let st = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat"))
+                .ok()
+                .and_then(|s| s.rfind(')').and_then(|i| s[i + 1..].trim().chars().next()));
+            if st != Some('R') {
+                continue;
+            }
             unsafe {
-                libc::syscall(libc::SYS_tgkill, pid as libc::c_long,
-                              tid as libc::c_long, sig as libc::c_long);
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    pid as libc::c_long,
+                    tid as libc::c_long,
+                    sig as libc::c_long,
+                );
             }
             aimed += 1;
         }
     }
-    if aimed == 0 { return out; }
+    if aimed == 0 {
+        return out;
+    }
     // Give the handlers time to walk + write.
     std::thread::sleep(std::time::Duration::from_millis(200));
-    let Ok(text) = std::fs::read_to_string(&path) else { return out; };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
+    };
     // Parse blocks: "=== tid N bias 0xB ===" then hex return addresses. Collect
     // per tid the (bias, [addr…]); symbolize below with one addr2line pass.
-    let mut raw: std::collections::HashMap<i32, (u64, Vec<u64>)> =
-        Default::default();
+    let mut raw: std::collections::HashMap<i32, (u64, Vec<u64>)> = Default::default();
     let mut cur: Option<i32> = None;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("=== tid ") {
             // "N bias 0xB ==="
             let mut it = rest.split_whitespace();
             let tid = it.next().and_then(|s| s.parse::<i32>().ok());
-            let bias = it.nth(1)  // skip "bias"
-                .and_then(|s| u64::from_str_radix(
-                    s.trim_start_matches("0x"), 16).ok())
+            let bias = it
+                .nth(1) // skip "bias"
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0);
             if let Some(tid) = tid {
                 cur = Some(tid);
@@ -231,15 +300,21 @@ fn selfbt_backtraces(rp: i32, box_pids: &[i32])
             }
             continue;
         }
-        if let (Some(tid), Some(addr)) = (cur, line.trim().strip_prefix("0x")
-            .and_then(|h| u64::from_str_radix(h, 16).ok())) {
+        if let (Some(tid), Some(addr)) = (
+            cur,
+            line.trim()
+                .strip_prefix("0x")
+                .and_then(|h| u64::from_str_radix(h, 16).ok()),
+        ) {
             raw.entry(tid).or_insert((0, vec![])).1.push(addr);
         }
     }
     let exe = std::env::current_exe().ok();
     for (tid, (_bias, addrs)) in raw {
         let frames = symbolize_addrs(exe.as_deref(), &addrs);
-        if !frames.is_empty() { out.insert(tid, frames); }
+        if !frames.is_empty() {
+            out.insert(tid, frames);
+        }
     }
     out
 }
@@ -252,16 +327,29 @@ fn selfbt_backtraces(rp: i32, box_pids: &[i32])
 /// way a `timeout` + null stdin caps the wall time. Unresolved `??` frames are
 /// dropped.
 fn symbolize_addrs(exe: Option<&std::path::Path>, addrs: &[u64]) -> Vec<String> {
-    let (Some(exe), false) = (exe, addrs.is_empty()) else { return vec![] };
+    let (Some(exe), false) = (exe, addrs.is_empty()) else {
+        return vec![];
+    };
     let vaddrs: Vec<String> = addrs.iter().map(|a| format!("0x{a:x}")).collect();
     let a2l = if std::process::Command::new("llvm-addr2line")
-        .arg("--version").stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null()).status()
-        .map(|s| s.success()).unwrap_or(false) {
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
         "llvm-addr2line"
-    } else { "addr2line" };
+    } else {
+        "addr2line"
+    };
     let out = std::process::Command::new("timeout")
-        .arg("15").arg(a2l).arg("-f").arg("-C").arg("-e").arg(exe)
+        .arg("15")
+        .arg(a2l)
+        .arg("-f")
+        .arg("-C")
+        .arg("-e")
+        .arg(exe)
         .args(&vaddrs)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -276,15 +364,21 @@ fn symbolize_addrs(exe: Option<&std::path::Path>, addrs: &[u64]) -> Vec<String> 
         let func = lines[i].trim();
         let loc = lines[i + 1].trim();
         i += 2;
-        if func == "??" { continue; }
-        if func.starts_with("sarun::selfbt::") { continue; }
+        if func == "??" {
+            continue;
+        }
+        if func.starts_with("sarun::selfbt::") {
+            continue;
+        }
         // Strip the ` (.llvm.<hash>)` cold-split suffix — pure noise.
         let func = func.split(" (.llvm.").next().unwrap_or(func).trim();
         let func = collapse_generics(func);
         let loc = loc.rsplit('/').next().unwrap_or(loc);
         frames.push(if loc == "??:0" || loc == "??:?" {
             func
-        } else { format!("{func} ({loc})") });
+        } else {
+            format!("{func} ({loc})")
+        });
     }
     frames
 }
@@ -304,10 +398,14 @@ fn collapse_generics(s: &str) -> String {
     while let Some(c) = chars.next() {
         match c {
             '<' => {
-                if depth == 0 { out.push_str("<…>"); }
+                if depth == 0 {
+                    out.push_str("<…>");
+                }
                 depth += 1;
             }
-            '>' => { depth = depth.saturating_sub(1); }
+            '>' => {
+                depth = depth.saturating_sub(1);
+            }
             _ if depth == 0 => out.push(c),
             _ => {}
         }
@@ -338,10 +436,15 @@ fn box_text_range(pid: i32) -> (u64, u64) {
         if !perms.starts_with("r-x") || inode != "0" || path.is_some() {
             continue;
         }
-        let Some((s, e)) = range.split_once('-') else { continue };
-        let (Ok(s), Ok(e)) = (u64::from_str_radix(s, 16),
-                              u64::from_str_radix(e, 16)) else { continue };
-        if e - s > best.1 - best.0 { best = (s, e); }
+        let Some((s, e)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(s), Ok(e)) = (u64::from_str_radix(s, 16), u64::from_str_radix(e, 16)) else {
+            continue;
+        };
+        if e - s > best.1 - best.0 {
+            best = (s, e);
+        }
     }
     best
 }
@@ -354,8 +457,7 @@ fn box_text_range(pid: i32) -> (u64, u64) {
 /// read its registers and stack memory from outside, walk the frame pointers,
 /// and symbolize offline. Reads absolute addresses; sarun is ET_EXEC so those
 /// are ELF vaddrs. Best-effort: a thread we can't seize is simply skipped.
-fn ptrace_backtraces(box_pids: &[i32])
-    -> std::collections::HashMap<i32, Vec<String>> {
+fn ptrace_backtraces(box_pids: &[i32]) -> std::collections::HashMap<i32, Vec<String>> {
     use std::os::unix::fs::FileExt;
     const PTRACE_SEIZE: i32 = 0x4206;
     const PTRACE_INTERRUPT: i32 = 0x4207;
@@ -376,13 +478,17 @@ fn ptrace_backtraces(box_pids: &[i32])
         // One /proc/<pid>/mem handle per process (threads share the address
         // space); pread it at the frame-pointer addresses while stopped.
         let mem = std::fs::File::open(format!("/proc/{pid}/mem")).ok();
-        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task"))
-            else { continue };
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            continue;
+        };
         for te in tasks.flatten() {
-            let Some(tid) = te.file_name().to_str()
-                .and_then(|s| s.parse::<i32>().ok()) else { continue };
+            let Some(tid) = te.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+                continue;
+            };
             let addrs = unsafe {
-                if libc::ptrace(PTRACE_SEIZE as _, tid, 0, 0) < 0 { continue; }
+                if libc::ptrace(PTRACE_SEIZE as _, tid, 0, 0) < 0 {
+                    continue;
+                }
                 let mut chain = vec![];
                 // Retry: interrupt, sample RIP; if it's in the sud dispatcher
                 // (outside the engine text) let it run and try again, up to a
@@ -391,20 +497,25 @@ fn ptrace_backtraces(box_pids: &[i32])
                 for attempt in 0..24 {
                     libc::ptrace(PTRACE_INTERRUPT as _, tid, 0, 0);
                     let mut status = 0i32;
-                    if libc::waitpid(tid, &mut status, WALL) < 0 { break; }
+                    if libc::waitpid(tid, &mut status, WALL) < 0 {
+                        break;
+                    }
                     let mut regs: libc::user_regs_struct = std::mem::zeroed();
                     let mut iov = libc::iovec {
-                        iov_base: (&mut regs as *mut libc::user_regs_struct)
-                            .cast(),
+                        iov_base: (&mut regs as *mut libc::user_regs_struct).cast(),
                         iov_len: std::mem::size_of::<libc::user_regs_struct>(),
                     };
-                    if libc::ptrace(PTRACE_GETREGSET as _, tid,
+                    if libc::ptrace(
+                        PTRACE_GETREGSET as _,
+                        tid,
                         NT_PRSTATUS as *mut libc::c_void,
-                        (&mut iov as *mut libc::iovec)
-                            .cast::<libc::c_void>()) < 0 { break; }
+                        (&mut iov as *mut libc::iovec).cast::<libc::c_void>(),
+                    ) < 0
+                    {
+                        break;
+                    }
                     let (rip, mut fp) = (regs.rip, regs.rbp);
-                    let in_text = text_hi > text_lo
-                        && rip >= text_lo && rip < text_hi;
+                    let in_text = text_hi > text_lo && rip >= text_lo && rip < text_hi;
                     // Accept when in brush code, or on the final attempt take
                     // whatever we have rather than nothing.
                     if in_text || attempt == 23 {
@@ -412,7 +523,8 @@ fn ptrace_backtraces(box_pids: &[i32])
                         if let Some(mem) = &mem {
                             let read_u64 = |a: u64| -> Option<u64> {
                                 let mut b = [0u8; 8];
-                                mem.read_exact_at(&mut b, a).ok()
+                                mem.read_exact_at(&mut b, a)
+                                    .ok()
                                     .map(|_| u64::from_le_bytes(b))
                             };
                             let mut prev = fp;
@@ -420,12 +532,17 @@ fn ptrace_backtraces(box_pids: &[i32])
                                 if fp == 0 || (fp & 7) != 0 || fp < prev {
                                     break;
                                 }
-                                let (Some(saved), Some(ret)) =
-                                    (read_u64(fp), read_u64(fp + 8))
-                                    else { break };
-                                if ret == 0 { break; }
+                                let (Some(saved), Some(ret)) = (read_u64(fp), read_u64(fp + 8))
+                                else {
+                                    break;
+                                };
+                                if ret == 0 {
+                                    break;
+                                }
                                 chain.push(ret);
-                                if saved <= fp { break; }
+                                if saved <= fp {
+                                    break;
+                                }
                                 prev = fp;
                                 fp = saved;
                             }
@@ -438,9 +555,13 @@ fn ptrace_backtraces(box_pids: &[i32])
                 libc::ptrace(PTRACE_DETACH as _, tid, 0, 0);
                 chain
             };
-            if addrs.is_empty() { continue; }
+            if addrs.is_empty() {
+                continue;
+            }
             let frames = symbolize_addrs(exe.as_deref(), &addrs);
-            if !frames.is_empty() { out.insert(tid, frames); }
+            if !frames.is_empty() {
+                out.insert(tid, frames);
+            }
         }
     }
     out
@@ -502,7 +623,9 @@ pub type State = Arc<Mutex<Shared>>;
 /// (see `handle`), so a panicking handler is contained instead of unwinding out
 /// of its thread; this lock recovery is the second half of the same defense.
 fn lock(state: &State) -> std::sync::MutexGuard<'_, Shared> {
-    state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // The old api-proxy attribution shim (peer-pid → box-id lookup) was removed
@@ -515,10 +638,13 @@ pub fn broadcast_api_log(box_id: i64) {
     // We need the State to actually broadcast — go through a global handle
     // set up by serve().
     if let Some(state) = STATE_HANDLE.read().clone() {
-        broadcast(&state, &json!({
-            "type": "api_log_added",
-            "sid": box_id.to_string(),
-        }));
+        broadcast(
+            &state,
+            &json!({
+                "type": "api_log_added",
+                "sid": box_id.to_string(),
+            }),
+        );
     }
 }
 
@@ -526,10 +652,13 @@ pub fn broadcast_api_log(box_id: i64) {
 /// refreshes. Best-effort, mirroring `broadcast_api_log` (DESIGN-web.md W1).
 pub fn broadcast_webcap(box_id: i64) {
     if let Some(state) = STATE_HANDLE.read().clone() {
-        broadcast(&state, &json!({
-            "type": "webcap_added",
-            "sid": box_id.to_string(),
-        }));
+        broadcast(
+            &state,
+            &json!({
+                "type": "webcap_added",
+                "sid": box_id.to_string(),
+            }),
+        );
     }
 }
 
@@ -541,10 +670,15 @@ pub fn install_state_handle(s: State) {
 /// Record one D9 brush-shell provenance frame for box `id`: parse the JSON
 /// payload, write it into the live box's sqlar `brushprov` table, and broadcast
 /// a `brush_prov` event. Best-effort — a malformed payload is dropped quietly.
-fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>,
-                     id: i64, payload: &[u8]) {
-    let Ok(rec) = serde_json::from_slice::<Value>(payload) else { return; };
-    let cmd = rec.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
+fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>, id: i64, payload: &[u8]) {
+    let Ok(rec) = serde_json::from_slice::<Value>(payload) else {
+        return;
+    };
+    let cmd = rec
+        .get("cmd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     // The 0-based pipeline ordinal + the wall-clock spawn instant brush captured
     // right before running this pipeline's complete-command. The spawn_ts defines
     // the attribution window; the actual process↔pipeline stamping is done in one
@@ -562,18 +696,25 @@ fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>,
             b.set_cur_brush_pipeline(prov_id);
             // Remember this pipeline's output-redirect targets for the exact
             // file→process linkage made at teardown.
-            let targets: Vec<String> = rec.get("out_targets")
+            let targets: Vec<String> = rec
+                .get("out_targets")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
-                          .collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             b.on_brush_prov(prov_id, targets);
         }
     }
-    broadcast(state, &json!({"type": "brush_prov",
+    broadcast(
+        state,
+        &json!({"type": "brush_prov",
                             "session_id": id.to_string(),
                             "brushprov_id": prov_id, "seq": seq,
-                            "cmd": cmd, "record": rec}));
+                            "cmd": cmd, "record": rec}),
+    );
 }
 
 /// D9 nested-shell provenance verb. The brush-sh shim (a `sh -c RECIPE` the box
@@ -587,9 +728,15 @@ fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>,
 fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     // Resolve the shim's HOST pid from its pidfd (the wrap-immune identity path),
     // then derive the enclosing box from its /proc ancestry.
-    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0)
+    let host_pid = peer_pidfd
+        .map(host_pid_from_pidfd)
+        .filter(|p| *p > 0)
         .unwrap_or(0);
-    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    if let Some(fd) = peer_pidfd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
     let Some(id) = derive_parent_box(state, host_pid) else {
         return json!({"ok": false, "error": "no enclosing box"});
     };
@@ -600,7 +747,11 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
     };
     let mut n = 0i64;
     for rec in records {
-        let cmd = rec.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
+        let cmd = rec
+            .get("cmd")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let seq = rec.get("seq").and_then(Value::as_i64).unwrap_or(0);
         let spawn_ts = rec.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0);
         let uid = rec.get("uid").and_then(Value::as_i64).unwrap_or(0);
@@ -609,11 +760,16 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
         let mut prov_id = 0i64;
         if let Some(ov) = ov.as_ref() {
             if let Some(b) = ov.live_box(id) {
-                prov_id = b.add_brushprov_nested(&cmd, &record_json, seq, spawn_ts, uid, parent_uid);
-                let targets: Vec<String> = rec.get("out_targets")
+                prov_id =
+                    b.add_brushprov_nested(&cmd, &record_json, seq, spawn_ts, uid, parent_uid);
+                let targets: Vec<String> = rec
+                    .get("out_targets")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
-                              .collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 b.on_brush_prov(prov_id, targets);
                 // Set cur_brush_pipeline to the FIRST pipeline in this
@@ -628,10 +784,13 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
                 }
             }
         }
-        broadcast(state, &json!({"type": "brush_prov",
+        broadcast(
+            state,
+            &json!({"type": "brush_prov",
                                 "session_id": id.to_string(),
                                 "brushprov_id": prov_id, "seq": seq,
-                                "nested": true, "cmd": cmd, "record": rec}));
+                                "nested": true, "cmd": cmd, "record": rec}),
+        );
         n += 1;
     }
     json!({"ok": true, "recorded": n})
@@ -644,13 +803,23 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
 /// reader can show per-pipeline wall time and tell running (done_ts==0) from
 /// finished. Best-effort; one-shot reply.
 fn brush_prov_done(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
-    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let host_pid = peer_pidfd
+        .map(host_pid_from_pidfd)
+        .filter(|p| *p > 0)
+        .unwrap_or(0);
+    if let Some(fd) = peer_pidfd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
     let Some(id) = derive_parent_box(state, host_pid) else {
         return json!({"ok": false, "error": "no enclosing box"});
     };
-    let uids: Vec<i64> = msg.get("uids").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+    let uids: Vec<i64> = msg
+        .get("uids")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
     let code = msg.get("code").and_then(Value::as_i64).unwrap_or(0);
     let done_ts = msg.get("done_ts").and_then(Value::as_f64).unwrap_or(0.0);
     let ov = lock(state).overlay.clone();
@@ -668,18 +837,29 @@ fn brush_prov_done(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value
 /// during the recipe with a wrong (racy) attribution. The stderr flowed
 /// through fd 2 normally for live backread — this just fixes the DB linkage.
 fn recipe_fixup(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
-    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let host_pid = peer_pidfd
+        .map(host_pid_from_pidfd)
+        .filter(|p| *p > 0)
+        .unwrap_or(0);
+    if let Some(fd) = peer_pidfd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
     let Some(id) = derive_parent_box(state, host_pid) else {
         return json!({"ok": false, "error": "no enclosing box"});
     };
-    let uids: Vec<i64> = msg.get("uids").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+    let uids: Vec<i64> = msg
+        .get("uids")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
     let start_ts = msg.get("start_ts").and_then(Value::as_f64).unwrap_or(0.0);
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
-            let pipeline_id = uids.iter()
+            let pipeline_id = uids
+                .iter()
                 .map(|u| b.brushprov_id_for_uid(*u))
                 .find(|id| *id > 0)
                 .unwrap_or(0);
@@ -698,9 +878,15 @@ fn recipe_fixup(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
 /// (the same path register/brush_prov_nested use) and store each edge in the
 /// box's `build_edges` table. One-shot control reply; not a box channel.
 fn build_edges(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0)
+    let host_pid = peer_pidfd
+        .map(host_pid_from_pidfd)
+        .filter(|p| *p > 0)
         .unwrap_or(0);
-    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    if let Some(fd) = peer_pidfd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
     let Some(id) = derive_parent_box(state, host_pid) else {
         return json!({"ok": false, "error": "no enclosing box"});
     };
@@ -720,8 +906,11 @@ fn build_edges(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
             }
         }
     }
-    broadcast(state, &json!({"type": "build_edges",
-                            "session_id": id.to_string(), "edges": n}));
+    broadcast(
+        state,
+        &json!({"type": "build_edges",
+                            "session_id": id.to_string(), "edges": n}),
+    );
     json!({"ok": true, "recorded": n})
 }
 
@@ -752,24 +941,62 @@ pub struct MakeVarRow {
 /// `make_vars` frame: a batch of makefile variable assignments from a box's
 /// embedded make(s), recorded into the box's makevar table.
 fn make_vars(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
-    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let host_pid = peer_pidfd
+        .map(host_pid_from_pidfd)
+        .filter(|p| *p > 0)
+        .unwrap_or(0);
+    if let Some(fd) = peer_pidfd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
     let Some(id) = derive_parent_box(state, host_pid) else {
         return json!({"ok": false, "error": "no enclosing box"});
     };
-    let rows: Vec<MakeVarRow> = msg.get("rows")
+    let rows: Vec<MakeVarRow> = msg
+        .get("rows")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|r| Some(MakeVarRow {
-            name: r.get("name")?.as_str()?.to_string(),
-            loc: r.get("loc").and_then(Value::as_str).unwrap_or("").to_string(),
-            value: r.get("value").and_then(Value::as_str).unwrap_or("").to_string(),
-            make_dir: r.get("make").and_then(Value::as_str).unwrap_or("").to_string(),
-            edge_out: r.get("edge").and_then(Value::as_str).map(str::to_string),
-            uid: r.get("uid").and_then(Value::as_i64).unwrap_or(0),
-            rhs: r.get("rhs").and_then(Value::as_str).unwrap_or("").to_string(),
-            refs: r.get("refs").and_then(Value::as_str).unwrap_or("").to_string(),
-            flags: r.get("flags").and_then(Value::as_str).unwrap_or("").to_string(),
-        })).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| {
+                    Some(MakeVarRow {
+                        name: r.get("name")?.as_str()?.to_string(),
+                        loc: r
+                            .get("loc")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        value: r
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        make_dir: r
+                            .get("make")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        edge_out: r.get("edge").and_then(Value::as_str).map(str::to_string),
+                        uid: r.get("uid").and_then(Value::as_i64).unwrap_or(0),
+                        rhs: r
+                            .get("rhs")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        refs: r
+                            .get("refs")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        flags: r
+                            .get("flags")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
@@ -784,18 +1011,32 @@ fn make_vars(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
 /// recipes / $(shell) / parse phases with ages) — stored ephemerally on the
 /// BoxState for the UI's "what is it doing" feed.
 fn box_activity(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
-    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let host_pid = peer_pidfd
+        .map(host_pid_from_pidfd)
+        .filter(|p| *p > 0)
+        .unwrap_or(0);
+    if let Some(fd) = peer_pidfd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
     let Some(id) = derive_parent_box(state, host_pid) else {
         return json!({"ok": false, "error": "no enclosing box"});
     };
-    let items: Vec<(String, u64)> = msg.get("items")
+    let items: Vec<(String, u64)> = msg
+        .get("items")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|it| {
-            let arr = it.as_array()?;
-            Some((arr.first()?.as_str()?.to_string(),
-                  arr.get(1).and_then(Value::as_u64).unwrap_or(0)))
-        }).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|it| {
+                    let arr = it.as_array()?;
+                    Some((
+                        arr.first()?.as_str()?.to_string(),
+                        arr.get(1).and_then(Value::as_u64).unwrap_or(0),
+                    ))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
@@ -807,8 +1048,15 @@ fn box_activity(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
 }
 
 fn build_edge_state(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0).unwrap_or(0);
-    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+    let host_pid = peer_pidfd
+        .map(host_pid_from_pidfd)
+        .filter(|p| *p > 0)
+        .unwrap_or(0);
+    if let Some(fd) = peer_pidfd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
     let Some(id) = derive_parent_box(state, host_pid) else {
         return json!({"ok": false, "error": "no enclosing box"});
     };
@@ -823,13 +1071,16 @@ fn build_edge_state(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Valu
         if let Some(b) = ov.live_box(id) {
             match phase {
                 "start" => b.mark_build_edge_started(out, cmd, ts),
-                "done"  => b.mark_build_edge_done(out, cmd, code, ts, excerpt),
+                "done" => b.mark_build_edge_done(out, cmd, code, ts, excerpt),
                 _ => {}
             }
         }
     }
-    broadcast(state, &json!({"type": "build_edges",
-                            "session_id": id.to_string(), "edge_state": phase}));
+    broadcast(
+        state,
+        &json!({"type": "build_edges",
+                            "session_id": id.to_string(), "edge_state": phase}),
+    );
     json!({"ok": true})
 }
 
@@ -853,14 +1104,21 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>, Option<i32>) {
     // that races ahead of it would miss the pidfd — dropping a nested box's
     // only correct host-pid source. poll for readability, then a blocking peek.
     let fd = conn.as_raw_fd();
-    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
     let pr = unsafe { libc::poll(&mut pfd, 1, 30_000) };
     if pr <= 0 {
         return (None, None, None);
     }
     let mut fdbuf = [0i32; 8];
     let mut io = [0u8; 1];
-    let mut iov = libc::iovec { iov_base: io.as_mut_ptr().cast(), iov_len: 1 };
+    let mut iov = libc::iovec {
+        iov_base: io.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
     let mut cmsg = [0u8; 128];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
@@ -885,12 +1143,14 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>, Option<i32>) {
         while !c.is_null() {
             if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
                 let data = libc::CMSG_DATA(c);
-                let len = (*c).cmsg_len as usize
-                    - (libc::CMSG_DATA(c) as usize - c as usize);
+                let len = (*c).cmsg_len as usize - (libc::CMSG_DATA(c) as usize - c as usize);
                 let count = len / std::mem::size_of::<i32>();
                 for i in 0..count.min(fdbuf.len()) {
                     std::ptr::copy_nonoverlapping(
-                        data.add(i * 4), (&mut fdbuf[i] as *mut i32).cast(), 4);
+                        data.add(i * 4),
+                        (&mut fdbuf[i] as *mut i32).cast(),
+                        4,
+                    );
                     if first.is_none() {
                         first = Some(fdbuf[i]);
                     } else if second.is_none() {
@@ -933,15 +1193,17 @@ fn dispatch(state: &State, msg: &Value) -> Value {
         // and residue cleanup; here we only shape the report into a reply.
         "sud_ingest" => {
             let boxes = discover::discover();
-            match msg.get("sid").and_then(Value::as_str)
-                .and_then(|s| resolve(&boxes, s)) {
+            match msg
+                .get("sid")
+                .and_then(Value::as_str)
+                .and_then(|s| resolve(&boxes, s))
+            {
                 Some(id) => {
-                    let live = lock(state).overlay.clone()
-                        .and_then(|o| o.live_box(id));
+                    let live = lock(state).overlay.clone().and_then(|o| o.live_box(id));
                     match live {
                         Some(b) => {
-                            let runpid = lock(state).box_runpids
-                                .get(&id).copied().unwrap_or(0) as u32;
+                            let runpid =
+                                lock(state).box_runpids.get(&id).copied().unwrap_or(0) as u32;
                             let r = crate::sud::sweep(&b, id, runpid);
                             json!({"ok": true, "ingested": r.ingested,
                                    "errors": r.errors})
@@ -955,8 +1217,11 @@ fn dispatch(state: &State, msg: &Value) -> Value {
         }
         "patch" => {
             let boxes = discover::discover();
-            match msg.get("sid").and_then(Value::as_str)
-                .and_then(|s| resolve(&boxes, s)) {
+            match msg
+                .get("sid")
+                .and_then(Value::as_str)
+                .and_then(|s| resolve(&boxes, s))
+            {
                 Some(id) => {
                     let data = crate::review::patch_text(id);
                     json!({"ok": true, "patch":
@@ -971,11 +1236,13 @@ fn dispatch(state: &State, msg: &Value) -> Value {
         // with no trace (every FUSE box) answers with a clean error.
         "sudtrace" => {
             let boxes = discover::discover();
-            match msg.get("sid").and_then(Value::as_str)
-                .and_then(|s| resolve(&boxes, s)) {
+            match msg
+                .get("sid")
+                .and_then(Value::as_str)
+                .and_then(|s| resolve(&boxes, s))
+            {
                 Some(id) => {
-                    let live = lock(state).overlay.clone()
-                        .and_then(|o| o.live_box(id));
+                    let live = lock(state).overlay.clone().and_then(|o| o.live_box(id));
                     crate::sud::trace_events_json(live, id)
                 }
                 None => json!({"ok": false, "error": "no slopbox"}),
@@ -983,23 +1250,31 @@ fn dispatch(state: &State, msg: &Value) -> Value {
         }
         "apply" | "discard" => {
             let boxes = discover::discover();
-            match msg.get("sid").and_then(Value::as_str)
-                .and_then(|s| resolve(&boxes, s)) {
+            match msg
+                .get("sid")
+                .and_then(Value::as_str)
+                .and_then(|s| resolve(&boxes, s))
+            {
                 Some(id) if box_is_running(state, id) => json!({"ok": false,
                     "error": "box is running; stop it first"}),
                 Some(id) => {
                     let all = Value::Null; // CLI applies/discards the whole box
-                    let ctx = crate::review::NestCtx::new(
-                        lock(state).overlay.clone());
+                    let ctx = crate::review::NestCtx::new(lock(state).overlay.clone());
                     let (r, n) = if t == "apply" {
                         let r = crate::review::apply(id, &all, &ctx);
-                        let n = r.get("applied").and_then(Value::as_array)
-                            .map(|a| a.len()).unwrap_or(0);
+                        let n = r
+                            .get("applied")
+                            .and_then(Value::as_array)
+                            .map(|a| a.len())
+                            .unwrap_or(0);
                         (r, n)
                     } else {
                         let r = crate::review::discard(id, &all, &ctx);
-                        let n = r.get("discarded").and_then(Value::as_array)
-                            .map(|a| a.len()).unwrap_or(0);
+                        let n = r
+                            .get("discarded")
+                            .and_then(Value::as_array)
+                            .map(|a| a.len())
+                            .unwrap_or(0);
                         (r, n)
                     };
                     drop_if_empty(state, id);
@@ -1013,25 +1288,32 @@ fn dispatch(state: &State, msg: &Value) -> Value {
         "rename" => {
             let boxes = discover::discover();
             let newname = msg.get("name").and_then(Value::as_str).unwrap_or("");
-            match msg.get("sid").and_then(Value::as_str)
-                .and_then(|s| resolve(&boxes, s)) {
+            match msg
+                .get("sid")
+                .and_then(Value::as_str)
+                .and_then(|s| resolve(&boxes, s))
+            {
                 Some(id) => {
                     let old = discover::display_path(&boxes, id);
                     // Route the meta write through the LIVE BoxState when the box
                     // is running (one connection — never a rival on-disk handle
                     // racing the serve thread); otherwise write the at-rest sqlar.
-                    let live = lock(state).overlay.clone()
-                        .and_then(|o| o.live_box(id));
+                    let live = lock(state).overlay.clone().and_then(|o| o.live_box(id));
                     match live {
                         Some(cb) => cb.set_meta("name", newname),
                         // At-rest: still go through BoxState::set_meta so every
                         // box meta WRITE uses one upserting path, live or not.
-                        None => if let Ok(b) = crate::capture::BoxState::create(id) {
-                            b.set_meta("name", newname);
-                        },
+                        None => {
+                            if let Ok(b) = crate::capture::BoxState::create(id) {
+                                b.set_meta("name", newname);
+                            }
+                        }
                     }
-                    broadcast(state, &json!({"type": "session_renamed",
-                        "session_id": id.to_string(), "name": newname}));
+                    broadcast(
+                        state,
+                        &json!({"type": "session_renamed",
+                        "session_id": id.to_string(), "name": newname}),
+                    );
                     json!({"ok": true, "old": old, "name": newname})
                 }
                 None => json!({"ok": false, "error": "no slopbox"}),
@@ -1044,8 +1326,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             // died. Same signal the `kill` verb sends; the runner forwards
             // it to the wrapper's process group and tears down normally
             // (sweep included, while the engine is still here to serve it).
-            let fds: Vec<i32> =
-                lock(state).box_pids.values().copied().collect();
+            let fds: Vec<i32> = lock(state).box_pids.values().copied().collect();
             for fd in fds {
                 pidfd_signal(fd, libc::SIGTERM);
             }
@@ -1053,7 +1334,9 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             // tears down the overlay + control socket; everything that
             // follows in this dispatch is racing the exit, so reply ok now
             // and let the kernel deliver the signal a few syscalls later.
-            unsafe { libc::kill(libc::getpid(), libc::SIGTERM); }
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGTERM);
+            }
             json!({"ok": true})
         }
         other => json!({"ok": false,
@@ -1061,13 +1344,14 @@ fn dispatch(state: &State, msg: &Value) -> Value {
     }
 }
 
-fn resolve(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
-           ident: &str) -> Option<i64> {    if let Ok(id) = ident.parse::<i64>() {
+fn resolve(boxes: &std::collections::BTreeMap<i64, discover::Box_>, ident: &str) -> Option<i64> {
+    if let Ok(id) = ident.parse::<i64>() {
         if boxes.contains_key(&id) {
             return Some(id);
         }
     }
-    boxes.values()
+    boxes
+        .values()
         .find(|b| b.name == ident || discover::display_path(boxes, b.box_id) == ident)
         .map(|b| b.box_id)
 }
@@ -1075,15 +1359,21 @@ fn resolve(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
 /// The box_id of the box NAMED `name` whose parent is `parent` (None=top-level),
 /// else None — the rerun/uniqueness lookup (siblings have unique NAMEs). Mirrors
 /// the Python Supervisor._find_named_child (scans discovered on-disk boxes).
-fn find_named_child(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
-                    name: &str, parent: Option<i64>) -> Option<i64> {
-    boxes.values()
+fn find_named_child(
+    boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+    name: &str,
+    parent: Option<i64>,
+) -> Option<i64> {
+    boxes
+        .values()
         .find(|b| b.name == name && b.parent == parent)
         .map(|b| b.box_id)
 }
 
 fn selected_sid(state: &State) -> Option<i64> {
-    lock(state).selected.as_ref()
+    lock(state)
+        .selected
+        .as_ref()
         .and_then(|s| s.parse::<i64>().ok())
 }
 
@@ -1099,7 +1389,8 @@ fn flows_dir_for(box_id: i64) -> Option<std::path::PathBuf> {
 // returned an empty default. view.open already had this same dual parse.
 fn arg_sid(args: &[Value]) -> Option<i64> {
     let v = args.first()?;
-    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 /// Unconditionally remove a box: drop it from the overlay, delete its sqlar +
@@ -1115,14 +1406,14 @@ fn reap(state: &State, id: i64) {
     if let Some(ov) = lock(state).overlay.clone() {
         ov.remove_box(id);
     }
-    let _ = std::fs::remove_file(crate::paths::state_home()
-        .join(format!("{id}.sqlar")));
-    let _ = std::fs::remove_dir_all(crate::paths::live_home()
-        .join(id.to_string()));
-    let _ = std::fs::remove_dir_all(crate::paths::live_home()
-        .join("blob").join(id.to_string()));
-    broadcast(state, &json!({"type": "session_removed",
-                             "session_id": id.to_string()}));
+    let _ = std::fs::remove_file(crate::paths::state_home().join(format!("{id}.sqlar")));
+    let _ = std::fs::remove_dir_all(crate::paths::live_home().join(id.to_string()));
+    let _ = std::fs::remove_dir_all(crate::paths::live_home().join("blob").join(id.to_string()));
+    broadcast(
+        state,
+        &json!({"type": "session_removed",
+                             "session_id": id.to_string()}),
+    );
 }
 
 /// dissolve: remove a box WITHOUT affecting any other box's view. The box's
@@ -1164,8 +1455,11 @@ fn free_box(state: &State, id: i64) -> Value {
         return json!({"ok": false, "error": "no slopbox"});
     };
     let grandparent = me.parent;
-    let children: Vec<i64> = boxes.values()
-        .filter(|b| b.parent == Some(id)).map(|b| b.box_id).collect();
+    let children: Vec<i64> = boxes
+        .values()
+        .filter(|b| b.parent == Some(id))
+        .map(|b| b.box_id)
+        .collect();
     if lock(state).box_pids.contains_key(&id) && !children.is_empty() {
         return json!({"ok": false, "error": "box is running; stop it first"});
     }
@@ -1179,8 +1473,7 @@ fn free_box(state: &State, id: i64) -> Value {
         for &child in &children {
             let live = ov.as_ref().and_then(|o| o.live_box(child));
             for rel in &paths {
-                if let Err(e) = crate::review::copy_down_entry(
-                    id, child, rel, live.as_deref()) {
+                if let Err(e) = crate::review::copy_down_entry(id, child, rel, live.as_deref()) {
                     return json!({"ok": false,
                         "error": format!("copy-down to box {child} failed: {e}"),
                         "path": rel});
@@ -1199,13 +1492,14 @@ fn free_box(state: &State, id: i64) -> Value {
     // resolve()/scan_dir() fall the child's absent paths through to the real
     // host. So each child inherits the bit — exactly like content copy-down, the
     // child must keep seeing what it saw before (closed), not gain host fs.
-    let me_no_host =
-        me.meta.get("no_host_fallback").map(String::as_str) == Some("1");
+    let me_no_host = me.meta.get("no_host_fallback").map(String::as_str) == Some("1");
     for &child in &children {
         match ov.as_ref().and_then(|o| o.live_box(child)) {
             Some(cb) => {
-                cb.set_meta("parent_box_id",
-                    &grandparent.map(|p| p.to_string()).unwrap_or_default());
+                cb.set_meta(
+                    "parent_box_id",
+                    &grandparent.map(|p| p.to_string()).unwrap_or_default(),
+                );
                 if me_no_host {
                     cb.set_meta("no_host_fallback", "1");
                     cb.set_no_host_fallback(true);
@@ -1232,8 +1526,11 @@ fn free_box(state: &State, id: i64) -> Value {
 /// parent's own changes into it (so it starts as a snapshot of the parent),
 /// then promote `id`'s changes on top. The result is a new sibling box holding
 /// "parent + id's changes"; nothing else in the tree moves.
-fn apply_to_copy(state: &State, boxes: &std::collections::BTreeMap<i64, discover::Box_>,
-                 id: i64) -> Value {
+fn apply_to_copy(
+    state: &State,
+    boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+    id: i64,
+) -> Value {
     let Some(me) = boxes.get(&id) else {
         return json!({"ok": false, "error": "no slopbox"});
     };
@@ -1249,7 +1546,10 @@ fn apply_to_copy(state: &State, boxes: &std::collections::BTreeMap<i64, discover
         return json!({"ok": false, "error": "overlay not mounted"});
     };
     let new_id = boxes.keys().max().copied().unwrap_or(0) + 1;
-    let parent_name = boxes.get(&parent).map(|b| b.name.clone()).unwrap_or_default();
+    let parent_name = boxes
+        .get(&parent)
+        .map(|b| b.name.clone())
+        .unwrap_or_default();
     let new_name = if parent_name.is_empty() {
         format!("copy{new_id}")
     } else {
@@ -1282,8 +1582,11 @@ fn apply_to_copy(state: &State, boxes: &std::collections::BTreeMap<i64, discover
         }
         applied += 1;
     }
-    broadcast(state, &json!({"type": "session_new",
-        "session_id": new_id.to_string(), "name": new_name}));
+    broadcast(
+        state,
+        &json!({"type": "session_new",
+        "session_id": new_id.to_string(), "name": new_name}),
+    );
     json!({"ok": true, "new_sid": new_id.to_string(), "name": new_name, "applied": applied})
 }
 
@@ -1303,9 +1606,14 @@ fn drop_if_empty(state: &State, id: i64) {
     // orphan them (they read their inherited files THROUGH this layer). An
     // empty parent is a harmless empty layer; leave it until a real delete
     // (which cascades) or dissolve (which re-parents) removes it.
-    if has_children(id) { return; }
-    if crate::review::session_changes(id).as_array().map(|a| a.is_empty())
-        .unwrap_or(false) {
+    if has_children(id) {
+        return;
+    }
+    if crate::review::session_changes(id)
+        .as_array()
+        .map(|a| a.is_empty())
+        .unwrap_or(false)
+    {
         reap(state, id);
     }
 }
@@ -1313,7 +1621,8 @@ fn drop_if_empty(state: &State, id: i64) {
 fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')
+        && s.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')
         && !s.ends_with('-')
 }
 
@@ -1331,8 +1640,13 @@ fn valid_name(s: &str) -> bool {
 /// derivable enclosing box is an error (the box's pidfd closes on the early
 /// return when the caller's loop tears down). Capture mode stays downgraded in
 /// the ack (no echo/sinks yet — runner behaves as -t passthrough).
-fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
-            fd2_raw: Option<i32>, fd3_raw: Option<i32>) -> Value {
+fn register(
+    state: &State,
+    msg: &Value,
+    peer_pidfd: Option<i32>,
+    fd2_raw: Option<i32>,
+    fd3_raw: Option<i32>,
+) -> Value {
     // Assign the post-pidfd SCM_RIGHTS fds to roles from the message. The
     // runner sends them in a fixed order: [tap (if net_mode==tap)] then
     // [sud trace pipe (if want_sud)]. So:
@@ -1342,7 +1656,10 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     // Own each as an OwnedFd so every early-return path closes it; the tap
     // fd moves into prepare_net and the trace fd into stream_events only on
     // the success path.
-    let want_sud_fd = msg.get("want_sud").and_then(Value::as_bool).unwrap_or(false);
+    let want_sud_fd = msg
+        .get("want_sud")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let is_tap_fd = msg.get("net_mode").and_then(Value::as_str) == Some("tap");
     let (tap_raw, trace_raw) = match (want_sud_fd, is_tap_fd) {
         (true, true) => (fd2_raw, fd3_raw),
@@ -1351,24 +1668,36 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     };
     // Close any fd that didn't get a role (shouldn't happen in normal flow).
     if want_sud_fd && !is_tap_fd {
-        if let Some(fd) = fd3_raw { unsafe { libc::close(fd); } }
+        if let Some(fd) = fd3_raw {
+            unsafe {
+                libc::close(fd);
+            }
+        }
     }
-    let tap_fd: Option<std::os::fd::OwnedFd> = tap_raw.map(|fd| unsafe {
-        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
-    });
-    let sud_trace_owned: Option<std::os::fd::OwnedFd> = trace_raw.map(|fd| unsafe {
-        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
-    });
+    let tap_fd: Option<std::os::fd::OwnedFd> = tap_raw
+        .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    let sud_trace_owned: Option<std::os::fd::OwnedFd> = trace_raw
+        .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
     let ov = lock(state).overlay.clone();
     let Some(ov) = ov else {
-        if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+        if let Some(fd) = peer_pidfd {
+            unsafe {
+                libc::close(fd);
+            }
+        }
         return json!({"ok": false, "error": "overlay mount is not available"});
     };
     // Runner host pid: from the pidfd if sent (correct for nested runners whose
     // own getpid() is a parent-namespace pid); else the claimed tgid (top-level).
-    let host_pid = peer_pidfd.map(host_pid_from_pidfd).filter(|p| *p > 0)
-        .or_else(|| msg.get("prov").and_then(|p| p.get("tgid"))
-                 .and_then(Value::as_i64).map(|t| t as i32))
+    let host_pid = peer_pidfd
+        .map(host_pid_from_pidfd)
+        .filter(|p| *p > 0)
+        .or_else(|| {
+            msg.get("prov")
+                .and_then(|p| p.get("tgid"))
+                .and_then(Value::as_i64)
+                .map(|t| t as i32)
+        })
         .unwrap_or(0);
     let boxes = discover::discover();
     // ── PARENT + NAME RESOLUTION ───────────────────────────────────────────
@@ -1381,27 +1710,47 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     let mut name: Option<String> = None;
     if let Some(rel) = relname {
         if !rel.is_empty() && (!valid_name(rel) || rel.contains('.') || rel.contains('/')) {
-            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             return json!({"ok": false,
                 "error": "invalid relname: must be a single NAME segment"});
         }
         match derive_parent_box(state, host_pid) {
             Some(p) => parent = Some(p),
             None => {
-                if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                if let Some(fd) = peer_pidfd {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
                 return json!({"ok": false,
                     "error": "relname supplied but no enclosing box found"});
             }
         }
-        if !rel.is_empty() { name = Some(rel.to_string()); }
-    } else if let Some(want) = msg.get("session_id").and_then(Value::as_str)
-        .filter(|s| !s.is_empty()) {
+        if !rel.is_empty() {
+            name = Some(rel.to_string());
+        }
+    } else if let Some(want) = msg
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
         if let Some((prefix, last)) = want.rsplit_once('.') {
             // Dotted display path: parent = prefix box (must exist), NAME = last.
             match resolve(&boxes, prefix) {
-                Some(p) => { parent = Some(p); name = Some(last.to_string()); }
+                Some(p) => {
+                    parent = Some(p);
+                    name = Some(last.to_string());
+                }
                 None => {
-                    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                    if let Some(fd) = peer_pidfd {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
                     return json!({"ok": false,
                         "error": format!("parent box '{prefix}' does not exist")});
                 }
@@ -1425,45 +1774,80 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
         }
     }
     if rerun && lock(state).box_pids.contains_key(&existing_id.unwrap()) {
-        if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+        if let Some(fd) = peer_pidfd {
+            unsafe {
+                libc::close(fd);
+            }
+        }
         return json!({"ok": false, "error": "slopbox is already running"});
     }
     let live_max = ov.box_ids().into_iter().max().unwrap_or(0);
-    let id = existing_id.unwrap_or_else(||
-        boxes.keys().max().copied().unwrap_or(0).max(live_max) + 1);
+    let id =
+        existing_id.unwrap_or_else(|| boxes.keys().max().copied().unwrap_or(0).max(live_max) + 1);
     let name = name.unwrap_or_else(|| format!("A{id}"));
-    let env_capture = msg.get("want_env").and_then(Value::as_bool).unwrap_or(false);
-    let direct = msg.get("want_direct").and_then(Value::as_bool).unwrap_or(false);
+    let env_capture = msg
+        .get("want_env")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let direct = msg
+        .get("want_direct")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     // D-parent flags. `want_no_parent` is the runner's explicit "this box has
     // NO parent and the lower chain does NOT bottom at the host /": the box's
     // own contents are its entire filesystem (the bottom of an OCI image
     // stack). It overrides the kernel-derived parent walk, so even a runner
     // nested under another box can declare itself a rootfs.
-    let want_no_parent = msg.get("want_no_parent")
-        .and_then(Value::as_bool).unwrap_or(false);
-    let want_readonly_parent = msg.get("want_readonly_parent")
-        .and_then(Value::as_bool).unwrap_or(false);
-    let want_capture = msg.get("want_capture").and_then(Value::as_bool)
-        .unwrap_or(true) && !direct;
+    let want_no_parent = msg
+        .get("want_no_parent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let want_readonly_parent = msg
+        .get("want_readonly_parent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let want_capture = msg
+        .get("want_capture")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        && !direct;
     let backing = crate::paths::live_home().join(id.to_string());
     if let Err(e) = std::fs::create_dir_all(backing.join("up")) {
-        if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+        if let Some(fd) = peer_pidfd {
+            unsafe {
+                libc::close(fd);
+            }
+        }
         return json!({"ok": false, "error": format!("backing: {e}")});
     }
     let b = match crate::capture::BoxState::create(id) {
         Ok(b) => b,
         Err(e) => {
-            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             return json!({"ok": false, "error": format!("sqlar: {e}")});
         }
     };
     // RERUN: reopen the existing box's recorded state so prior writes show
     // through and prior process rows keep their ids (the new root is additive).
-    if rerun { b.load_mirror(); }
+    if rerun {
+        b.load_mirror();
+    }
     b.set_env_capture(env_capture);
     b.set_direct(direct);
-    b.set_is_brush(msg.get("want_brush").and_then(Value::as_bool).unwrap_or(false));
-    b.set_is_api(msg.get("want_api").and_then(Value::as_bool).unwrap_or(false));
+    b.set_is_brush(
+        msg.get("want_brush")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    b.set_is_api(
+        msg.get("want_api")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
     // Tap boxes reach the network through the engine's MITM proxy + synthetic
     // DNS, so they need the engine's CA appended to their trust store and their
     // resolver pointed at the gateway. The overlay serves both as shadows gated
@@ -1477,12 +1861,19 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     // pipe (fd-1023 read end) came in as its own SCM_RIGHTS fd
     // (sud_trace_owned), separate from the tap fd — so a sud box can be a
     // TAP box too (tap fd → prepare_net, trace fd → stream_events).
-    let want_sud = msg.get("want_sud").and_then(Value::as_bool).unwrap_or(false);
+    let want_sud = msg
+        .get("want_sud")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut sud_trace_fd: Option<std::os::fd::OwnedFd> = sud_trace_owned;
     if want_sud {
         let up = backing.join("sud-up");
         if let Err(e) = std::fs::create_dir_all(&up) {
-            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             return json!({"ok": false, "error": format!("sud upper: {e}")});
         }
         b.set_meta("sud", "1");
@@ -1510,11 +1901,17 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     let mut parent = parent;
     if want_sud && parent.is_none() && !want_no_parent {
         if let Some(enc) = derive_parent_box(state, host_pid) {
-            if boxes.get(&enc).is_some_and(
-                |bx| bx.meta.get("sud").map(String::as_str) == Some("1")) {
+            if boxes
+                .get(&enc)
+                .is_some_and(|bx| bx.meta.get("sud").map(String::as_str) == Some("1"))
+            {
                 parent = Some(enc);
             } else {
-                if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                if let Some(fd) = peer_pidfd {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
                 return json!({"ok": false, "error": format!(
                     "sud nesting is same-in-same: enclosing box {enc} is \
                      not a sud box (see engine/DESIGN-sud.md)")});
@@ -1541,7 +1938,11 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
             match crate::sud::export_box(id, &dest) {
                 Ok(_) => sud_lowers.push(dest.to_string_lossy().into_owned()),
                 Err(e) => {
-                    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                    if let Some(fd) = peer_pidfd {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
                     return json!({"ok": false,
                         "error": format!("sud lower export: {e}")});
                 }
@@ -1555,10 +1956,16 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
         let mut cur = parent;
         let mut seen = std::collections::HashSet::new();
         while let Some(aid) = cur {
-            if !seen.insert(aid) { break; }
+            if !seen.insert(aid) {
+                break;
+            }
             let Some(bx) = boxes.get(&aid) else { break };
             if bx.meta.get("sud").map(String::as_str) != Some("1") {
-                if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                if let Some(fd) = peer_pidfd {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
                 return json!({"ok": false, "error": format!(
                     "sud nesting is same-in-same: ancestor box {aid} is \
                      not a sud box (see engine/DESIGN-sud.md)")});
@@ -1571,7 +1978,9 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
                     }
                     None => {
                         if let Some(fd) = peer_pidfd {
-                            unsafe { libc::close(fd); }
+                            unsafe {
+                                libc::close(fd);
+                            }
                         }
                         return json!({"ok": false, "error": format!(
                             "running sud box {aid} has no recorded layer \
@@ -1583,7 +1992,11 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
             match crate::sud::export_box(aid, &dest) {
                 Ok(_) => sud_lowers.push(dest.to_string_lossy().into_owned()),
                 Err(e) => {
-                    if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+                    if let Some(fd) = peer_pidfd {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
                     return json!({"ok": false,
                         "error": format!("sud lower export: {e}")});
                 }
@@ -1596,7 +2009,11 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
         let up = backing.join("sud-up");
         let _ = std::fs::remove_dir_all(&up);
         if let Err(e) = std::fs::create_dir_all(&up) {
-            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             return json!({"ok": false, "error": format!("sud upper: {e}")});
         }
         // Record this box's full layer list (upper-first) so a nested
@@ -1621,7 +2038,9 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     }
     {
         let mut s = lock(state);
-        if host_pid > 0 { s.box_runpids.insert(id, host_pid); }
+        if host_pid > 0 {
+            s.box_runpids.insert(id, host_pid);
+        }
         // Hold a pidfd on the runner so `kill` can signal it pid-reuse-safely.
         // Prefer the runner's own pidfd (valid across pid namespaces); else open
         // one from the claimed tgid (top-level fallback).
@@ -1629,13 +2048,18 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
             s.box_pids.insert(id, fd);
         } else if host_pid > 0 {
             let fd = pidfd_open(host_pid);
-            if fd >= 0 { s.box_pids.insert(id, fd); }
+            if fd >= 0 {
+                s.box_pids.insert(id, fd);
+            }
         }
     }
     // --api opt-in: register this box with the oaita proxy so connections
     // from inside it are accepted (and route to its api_log table). Refresh
     // the runner-pid map the proxy uses for peer attribution.
-    let want_api = msg.get("want_api").and_then(Value::as_bool).unwrap_or(false);
+    let want_api = msg
+        .get("want_api")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if want_api {
         if let Some(p) = lock(state).api_proxy.clone() {
             p.enable_box(id);
@@ -1654,8 +2078,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     if let Some(fd) = sud_trace_fd.take() {
         if let Some(bx) = ov.live_box(id) {
             use std::os::fd::IntoRawFd;
-            crate::sud::stream_events(id, fd.into_raw_fd(), bx,
-                                      backing.join("sud.trace"));
+            crate::sud::stream_events(id, fd.into_raw_fd(), bx, backing.join("sud.trace"));
         }
     }
     // Announce the new box on the subscribe stream so attached UIs
@@ -1664,12 +2087,15 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     // just never fired here because we forgot to broadcast it.
     // session_removed (in delete / kill paths) and session_renamed
     // (in rename) were getting sent; this is the missing third leg.
-    broadcast(state, &json!({
-        "type": "session_added",
-        "sid": id.to_string(),
-        "name": name,
-        "parent": parent,
-    }));
+    broadcast(
+        state,
+        &json!({
+            "type": "session_added",
+            "sid": id.to_string(),
+            "name": name,
+            "parent": parent,
+        }),
+    );
     let root = crate::paths::mnt_point().join(id.to_string());
 
     // ── Networking (-n boxes only) ────────────────────────────────────────
@@ -1678,8 +2104,7 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
     // around that fd and return dns_ip + the CA bundle CONTENT so the runner can
     // wire bwrap up (it materializes the CA in its own namespace). The engine
     // creates no netns/device, so there is no netns_path.
-    let (dns_ip, ca_pem) =
-        prepare_net(state, id, msg, tap_fd).unwrap_or_default();
+    let (dns_ip, ca_pem) = prepare_net(state, id, msg, tap_fd).unwrap_or_default();
 
     // D-oci: if any ancestor in the parent chain has an oci_config meta key
     // (stamped by `sarun oci load` on the top layer of an image), surface
@@ -1712,10 +2137,13 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
         reply["sud_upper"] = json!(backing.join("sud-up").to_string_lossy());
         reply["sud_lowers"] = json!(sud_lowers);
         reply["sud_ir_key"] = json!(
-            lock(state).overlay.clone()
+            lock(state)
+                .overlay
+                .clone()
                 .and_then(|o| o.live_box(id))
                 .and_then(|bx| bx.get_meta("sud_ir_key"))
-                .unwrap_or_default());
+                .unwrap_or_default()
+        );
     }
     reply
 }
@@ -1725,12 +2153,16 @@ fn register(state: &State, msg: &Value, peer_pidfd: Option<i32>,
 /// view {env, cwd, cmd, entrypoint, user} the runner uses, or None when the
 /// chain has no OCI ancestor (a non-OCI box). Reads from the discover()
 /// snapshot's `Box_.meta` — no per-hop sqlar opens.
-fn oci_runtime_from_chain(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
-                          parent: Option<i64>) -> Option<Value> {
+fn oci_runtime_from_chain(
+    boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+    parent: Option<i64>,
+) -> Option<Value> {
     let mut cur = parent;
     let mut seen = std::collections::HashSet::new();
     while let Some(id) = cur {
-        if !seen.insert(id) { return None; }
+        if !seen.insert(id) {
+            return None;
+        }
         let b = boxes.get(&id)?;
         if let Some(cfg_json) = b.meta.get("oci_config") {
             return parse_oci_runtime(cfg_json);
@@ -1745,13 +2177,19 @@ fn oci_runtime_from_chain(boxes: &std::collections::BTreeMap<i64, discover::Box_
 /// filesystem underneath. Reads `Box_.meta` from the discover() snapshot, the
 /// same way oci_runtime_from_chain walks for oci_config. The box's OWN
 /// --no-parent is handled by the caller via `b.no_host_fallback()`.
-fn chain_has_no_host(boxes: &std::collections::BTreeMap<i64, discover::Box_>,
-                     parent: Option<i64>) -> bool {
+fn chain_has_no_host(
+    boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+    parent: Option<i64>,
+) -> bool {
     let mut cur = parent;
     let mut seen = std::collections::HashSet::new();
     while let Some(id) = cur {
-        if !seen.insert(id) { return false; }
-        let Some(b) = boxes.get(&id) else { return false };
+        if !seen.insert(id) {
+            return false;
+        }
+        let Some(b) = boxes.get(&id) else {
+            return false;
+        };
         if b.meta.get("no_host_fallback").map(String::as_str) == Some("1") {
             return true;
         }
@@ -1768,16 +2206,26 @@ fn parse_oci_runtime(cfg_json: &str) -> Option<Value> {
     let v: Value = serde_json::from_str(cfg_json).ok()?;
     let inner = v.get("config")?;
     let mut out = serde_json::Map::new();
-    if let Some(env) = inner.get("Env") { out.insert("env".into(), env.clone()); }
+    if let Some(env) = inner.get("Env") {
+        out.insert("env".into(), env.clone());
+    }
     if let Some(cwd) = inner.get("WorkingDir") {
         out.insert("cwd".into(), cwd.clone());
     }
-    if let Some(cmd) = inner.get("Cmd") { out.insert("cmd".into(), cmd.clone()); }
+    if let Some(cmd) = inner.get("Cmd") {
+        out.insert("cmd".into(), cmd.clone());
+    }
     if let Some(ep) = inner.get("Entrypoint") {
         out.insert("entrypoint".into(), ep.clone());
     }
-    if let Some(u) = inner.get("User") { out.insert("user".into(), u.clone()); }
-    if out.is_empty() { None } else { Some(Value::Object(out)) }
+    if let Some(u) = inner.get("User") {
+        out.insert("user".into(), u.clone());
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(Value::Object(out))
+    }
 }
 
 /// Equip a `-n` box's netns and start its smoltcp stack.
@@ -1786,12 +2234,15 @@ fn parse_oci_runtime(cfg_json: &str) -> Option<Value> {
 /// creates no netns or device — it only polls the fd. Returns (dns_ip,
 /// augmented_ca_bundle_path); empty strings for off/host. `None` on a real
 /// failure (caller surfaces it — never a silent dead network).
-fn prepare_net(state: &State, id: i64, msg: &Value,
-               tap_fd: Option<std::os::fd::OwnedFd>)
-    -> Option<(String, String)> {
+fn prepare_net(
+    state: &State,
+    id: i64,
+    msg: &Value,
+    tap_fd: Option<std::os::fd::OwnedFd>,
+) -> Option<(String, String)> {
     let net_mode = msg.get("net_mode").and_then(Value::as_str).unwrap_or("off");
     if net_mode != "tap" {
-        drop(tap_fd);   // off / host carry no TAP; close any fd the runner sent
+        drop(tap_fd); // off / host carry no TAP; close any fd the runner sent
         return Some((String::new(), String::new()));
     }
     // Tap REQUIRES the runner's TAP fd. Missing it is a protocol bug, not a
@@ -1802,7 +2253,8 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
     };
     let net = match lock(state).net.clone() {
         Some(n) => n,
-        None => {   // tap_owned drops here → fd closed
+        None => {
+            // tap_owned drops here → fd closed
             eprintln!("sarun-engine: net stack unavailable; -n refused for box {id}");
             return None;
         }
@@ -1813,14 +2265,24 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
     let gw_mac = crate::net::tap::gateway_mac();
     let box_dir = crate::paths::state_home().join(format!("flows/box{id}"));
     let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let flows = match crate::net::flows::FlowsLog::create(&box_dir, ts, box_id_u16) {
-        Ok(f) => f, Err(e) => {
-            eprintln!("sarun-engine: flows log: {e}"); return None;
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("sarun-engine: flows log: {e}");
+            return None;
         }
     };
     let stack = crate::net::stack::StackRuntime::start(
-        box_id_u16, subnet, gw_mac, crate::net::tap::BOX_MAC, tap_owned, flows.clone());
+        box_id_u16,
+        subnet,
+        gw_mac,
+        crate::net::tap::BOX_MAC,
+        tap_owned,
+        flows.clone(),
+    );
 
     // The augmented CA bundle (host bundle + engine CA) — sent as CONTENT; the
     // runner materializes + binds it in its own namespace (works for nested).
@@ -1839,33 +2301,57 @@ fn prepare_net(state: &State, id: i64, msg: &Value,
     // The capture sink resolves live_box(id) at record time off the overlay,
     // exactly like the oaita proxy's api_log sink; the filter loads the
     // webfilter ruleset. All-None → the MITM proxy runs its pure pass-through.
-    let want_webcap = msg.get("want_webcap").and_then(Value::as_bool).unwrap_or(false);
-    let want_webfilter = msg.get("want_webfilter").and_then(Value::as_bool).unwrap_or(false);
+    let want_webcap = msg
+        .get("want_webcap")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let want_webfilter = msg
+        .get("want_webfilter")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let capture = if want_webcap {
-        lock(state).overlay.clone()
+        lock(state)
+            .overlay
+            .clone()
             .map(|ov| crate::net::webcap::WebCapSink::new(ov, id))
-    } else { None };
+    } else {
+        None
+    };
     let filter = if want_webfilter {
         Some(std::sync::Arc::new(crate::net::filter::Filter::load()))
-    } else { None };
+    } else {
+        None
+    };
     // Replay (DESIGN-web.md W4.2): `replay_from` names the source box whose
     // captures answer this box's requests, with an optional `replay_asof`.
-    let replay = msg.get("replay_from").and_then(Value::as_i64)
+    let replay = msg
+        .get("replay_from")
+        .and_then(Value::as_i64)
         .map(|source_box| crate::net::ReplaySource {
             source_box,
             asof: msg.get("replay_asof").and_then(Value::as_f64),
         });
     let hooks = if capture.is_some() || filter.is_some() || replay.is_some() {
-        Some(std::sync::Arc::new(crate::net::ProxyHooks { capture, filter, replay }))
-    } else { None };
+        Some(std::sync::Arc::new(crate::net::ProxyHooks {
+            capture,
+            filter,
+            replay,
+        }))
+    } else {
+        None
+    };
     if let (Some(rt), Some(keylog)) = (lock(state).net_rt.clone(), keylog) {
         crate::net::dispatch::Dispatcher::start(
-            stack.clone(), stack.dns.clone(),
+            stack.clone(),
+            stack.dns.clone(),
             format!("box{id}"),
-            net.ca.clone(), keylog, upstream_tls,
+            net.ca.clone(),
+            keylog,
+            upstream_tls,
             net.prompts.clone(),
             hooks,
-            rt);
+            rt,
+        );
     }
 
     Some((ipv4_str(subnet.gateway_ip()), ca_pem))
@@ -1888,9 +2374,14 @@ fn augmented_ca_bundle(ca: &crate::net::ca::Ca) -> Option<String> {
         "/etc/pki/tls/certs/ca-bundle.crt",
         "/etc/ssl/cert.pem",
     ] {
-        if let Ok(s) = std::fs::read_to_string(p) { bundle = s; break; }
+        if let Ok(s) = std::fs::read_to_string(p) {
+            bundle = s;
+            break;
+        }
     }
-    if !bundle.ends_with('\n') { bundle.push('\n'); }
+    if !bundle.ends_with('\n') {
+        bundle.push('\n');
+    }
     bundle.push_str(&ca.cert_pem);
     Some(bundle)
 }
@@ -1900,15 +2391,15 @@ fn augmented_ca_bundle(ca: &crate::net::ca::Ca) -> Option<String> {
 /// content is engine-wide (the MITM CA is engine-wide, the box-side
 /// gateway IP is the fixed per-subnet value). Boxes never write here;
 /// the path lives under runtime_home alongside `api-box-oaita.toml`.
-pub fn write_api_box_net_shadows(net: &crate::net::Net)
-    -> std::io::Result<()>
-{
+pub fn write_api_box_net_shadows(net: &crate::net::Net) -> std::io::Result<()> {
     if let Some(bundle) = augmented_ca_bundle(&net.ca) {
         std::fs::write(crate::paths::api_box_ca_pem_path(), bundle)?;
     }
     let gw = ipv4_str(crate::net::tap::box_subnet().gateway_ip());
-    std::fs::write(crate::paths::api_box_resolv_conf_path(),
-                   format!("nameserver {gw}\n"))?;
+    std::fs::write(
+        crate::paths::api_box_resolv_conf_path(),
+        format!("nameserver {gw}\n"),
+    )?;
     Ok(())
 }
 
@@ -3567,12 +4058,18 @@ fn recv_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32>) -> isize {
         unsafe {
             let mut c = libc::CMSG_FIRSTHDR(&msg);
             while !c.is_null() {
-                if (*c).cmsg_level == libc::SOL_SOCKET
-                    && (*c).cmsg_type == libc::SCM_RIGHTS {
+                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
                     let mut got = 0i32;
                     std::ptr::copy_nonoverlapping(
-                        libc::CMSG_DATA(c), (&mut got as *mut i32).cast(), 4);
-                    if fd.is_none() { *fd = Some(got); } else { libc::close(got); }
+                        libc::CMSG_DATA(c),
+                        (&mut got as *mut i32).cast(),
+                        4,
+                    );
+                    if fd.is_none() {
+                        *fd = Some(got);
+                    } else {
+                        libc::close(got);
+                    }
                 }
                 c = libc::CMSG_NXTHDR(&msg, c);
             }
@@ -3603,8 +4100,12 @@ impl std::io::Read for Prebuffered {
     }
 }
 impl std::io::Write for Prebuffered {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.inner.write(buf) }
-    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 impl crate::pty::CloneStream for Prebuffered {
     fn clone_stream(&self) -> Self {
@@ -3632,8 +4133,14 @@ impl crate::pty::CloneStream for Prebuffered {
 /// the PTY child in an overlay-backed box reuses this exact frame mux and is the
 /// documented follow-on (DESIGN.md D9 — PTY mode toggle over the box channel).
 fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
-    let argv: Vec<String> = msg.get("argv").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    let argv: Vec<String> = msg
+        .get("argv")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     if argv.is_empty() {
         let _ = writer.write_all(b"{\"ok\":false,\"error\":\"pty_spawn: empty argv\"}\n");
@@ -3646,15 +4153,22 @@ fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
     // daemon's cwd (whatever it was when the daemon started, usually $HOME)
     // and `bash -i` opens in the wrong dir. Engine daemon is long-lived so
     // its own cwd is unreliable; the UI's is correct per-launch.
-    let cwd: Option<std::path::PathBuf> = msg.get("cwd").and_then(Value::as_str)
+    let cwd: Option<std::path::PathBuf> = msg
+        .get("cwd")
+        .and_then(Value::as_str)
         .map(std::path::PathBuf::from);
     // env: portable_pty's CommandBuilder starts from a MINIMAL env by
     // default — SHELL/HOME/USER/PATH absent, so `bash -i` lands in a
     // broken shell. The UI ships its own envvars and we lay them on top
     // of the daemon's so the user gets a normal session.
-    let env: Vec<(String, String)> = msg.get("env").and_then(Value::as_object)
-        .map(|m| m.iter().filter_map(|(k, v)|
-            v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+    let env: Vec<(String, String)> = msg
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
         .unwrap_or_default();
     // Ack BEFORE the frame mux begins so the client knows to switch to frames.
     if writer.write_all(b"{\"ok\":true,\"r\":\"pty\"}\n").is_err() {
@@ -3665,9 +4179,12 @@ fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
         Ok(s) => s,
         Err(_) => return,
     };
-    let chan = Prebuffered { pre: prebuf, pos: 0, inner: stream };
-    crate::pty::serve_pty(&argv, rows, cols, chan, None,
-                          cwd.as_deref(), &env);
+    let chan = Prebuffered {
+        pre: prebuf,
+        pos: 0,
+        inner: stream,
+    };
+    crate::pty::serve_pty(&argv, rows, cols, chan, None, cwd.as_deref(), &env);
 }
 
 /// Top-level handler for a control connection. `hint_box_id` is the box id
@@ -3692,8 +4209,10 @@ fn handle_guarded(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         handle_with_box(state, conn, hint_box_id)
     }));
     if r.is_err() {
-        eprintln!("sarun-engine: control connection handler panicked; \
-                   connection dropped (engine continues)");
+        eprintln!(
+            "sarun-engine: control connection handler panicked; \
+                   connection dropped (engine continues)"
+        );
     }
 }
 
@@ -3706,16 +4225,18 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
     // register message's SCM_RIGHTS after the pidfd. Own both so every
     // non-register path drops → closes them; the register call takes them and
     // sorts roles by want_sud + net_mode.
-    let mut peer_tapfd: Option<std::os::fd::OwnedFd> = peer_tapfd_raw.map(|fd| unsafe {
-        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
-    });
-    let mut peer_thirdfd: Option<std::os::fd::OwnedFd> = peer_thirdfd_raw.map(|fd| unsafe {
-        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
-    });
+    let mut peer_tapfd: Option<std::os::fd::OwnedFd> = peer_tapfd_raw
+        .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    let mut peer_thirdfd: Option<std::os::fd::OwnedFd> = peer_thirdfd_raw
+        .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
     let mut reader = BufReader::new(match conn.try_clone() {
         Ok(c) => c,
         Err(_) => {
-            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             return;
         }
     });
@@ -3725,7 +4246,11 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => {
-                if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+                if let Some(fd) = peer_pidfd.take() {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
                 return;
             }
             Ok(_) => {}
@@ -3734,7 +4259,11 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd.take() {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             return;
         };
         // Engine-held PTY (D7/D9): this connection becomes a bidirectional
@@ -3742,7 +4271,11 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         // newline-JSON verb dispatch below. Any register pidfd is irrelevant to a
         // PTY connection, so close it.
         if msg.get("type").and_then(Value::as_str) == Some("pty_spawn") {
-            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd.take() {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             handle_pty_spawn(&msg, &mut writer, reader.buffer().to_vec());
             return;
         }
@@ -3754,8 +4287,14 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         // the FRAME_API_OPEN/DATA/CLOSE mux on the box-channel — one conn
         // per HTTP call, no stream-id demux needed.
         if msg.get("type").and_then(Value::as_str) == Some("api.proxy") {
-            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
-            let Some(box_id) = hint_box_id else { return; };
+            if let Some(fd) = peer_pidfd.take() {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+            let Some(box_id) = hint_box_id else {
+                return;
+            };
             // No early budget gate here. We used to debit + write a 503
             // over the raw socket if the chain was exhausted, which closed
             // the conn while the client was still streaming its request
@@ -3780,18 +4319,34 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             };
             let (Some(rt), Some(proxy)) = (rt_opt, proxy_opt) else {
                 if let Some(p) = lock(&state).api_proxy.clone() {
-                    crate::oaita::proxy::log_call(&p, box_id, "POST", "/",
-                        "", 502, &[],
-                        b"engine runtime or proxy unavailable", false);
+                    crate::oaita::proxy::log_call(
+                        &p,
+                        box_id,
+                        "POST",
+                        "/",
+                        "",
+                        502,
+                        &[],
+                        b"engine runtime or proxy unavailable",
+                        false,
+                    );
                 }
                 return;
             };
             let prebuffered = reader.buffer().to_vec();
             drop(reader);
             if writer.set_nonblocking(true).is_err() {
-                crate::oaita::proxy::log_call(&proxy, box_id, "POST", "/",
-                    "", 502, &[],
-                    b"set_nonblocking on api.proxy conn failed", false);
+                crate::oaita::proxy::log_call(
+                    &proxy,
+                    box_id,
+                    "POST",
+                    "/",
+                    "",
+                    502,
+                    &[],
+                    b"set_nonblocking on api.proxy conn failed",
+                    false,
+                );
                 return;
             }
             let std_conn = writer;
@@ -3800,17 +4355,28 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 let tokio_conn = match tokio::net::UnixStream::from_std(std_conn) {
                     Ok(c) => c,
                     Err(e) => {
-                        crate::oaita::proxy::log_call(&proxy, box_id, "POST",
-                            "/", "", 502, &[],
+                        crate::oaita::proxy::log_call(
+                            &proxy,
+                            box_id,
+                            "POST",
+                            "/",
+                            "",
+                            502,
+                            &[],
                             format!("UnixStream::from_std: {e}").as_bytes(),
-                            false);
+                            false,
+                        );
                         return;
                     }
                 };
                 let io = PrebufferedIo::new(tokio_conn, prebuffered);
                 let _ = crate::oaita::proxy::serve_one_conn_for_box(
-                    proxy, state_for_proxy, box_id,
-                    hyper_util::rt::TokioIo::new(io)).await;
+                    proxy,
+                    state_for_proxy,
+                    box_id,
+                    hyper_util::rt::TokioIo::new(io),
+                )
+                .await;
             });
             return;
         }
@@ -3823,23 +4389,32 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         // in-box server (e.g. `oaita local`'s llama-server) becomes
         // host-reachable over sockets alone — no netns is ever shared.
         if msg.get("type").and_then(Value::as_str) == Some("svc.serve") {
-            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd.take() {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             let Some(name) = msg.get("name").and_then(Value::as_str) else {
-                let _ = writer.write_all(
-                    b"{\"ok\":false,\"error\":\"svc.serve: missing name\"}\n");
+                let _ = writer.write_all(b"{\"ok\":false,\"error\":\"svc.serve: missing name\"}\n");
                 return;
             };
             if !svc_name_ok(name) {
-                let _ = writer.write_all(
-                    b"{\"ok\":false,\"error\":\"svc.serve: bad name\"}\n");
+                let _ = writer.write_all(b"{\"ok\":false,\"error\":\"svc.serve: bad name\"}\n");
                 return;
             }
             drop(reader);
-            if writer.write_all(b"{\"ok\":true,\"r\":\"parked\"}\n").is_err() {
+            if writer
+                .write_all(b"{\"ok\":true,\"r\":\"parked\"}\n")
+                .is_err()
+            {
                 return;
             }
-            SVC_PARKED.lock().unwrap()
-                .entry(name.to_string()).or_default().push_back(writer);
+            SVC_PARKED
+                .lock()
+                .unwrap()
+                .entry(name.to_string())
+                .or_default()
+                .push_back(writer);
             return;
         }
         // svc.declare: a box declares that IT provides an on-demand service.
@@ -3851,15 +4426,17 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         // — an oci image, a downloaded model box — can advertise a server
         // this way. See engine/DESIGN.md "On-demand box services".
         if msg.get("type").and_then(Value::as_str) == Some("svc.declare") {
-            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd.take() {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             let name = msg.get("name").and_then(Value::as_str).unwrap_or("");
             let argv = msg.get("argv").cloned().unwrap_or(Value::Null);
             let net = msg.get("net").and_then(Value::as_str).unwrap_or("");
             let ok = svc_name_ok(name) && argv.is_array();
             if ok {
-                if let (Some(bid), Some(ov)) =
-                    (hint_box_id, lock(&state).overlay.clone())
-                {
+                if let (Some(bid), Some(ov)) = (hint_box_id, lock(&state).overlay.clone()) {
                     if let Some(b) = ov.box_of(bid) {
                         b.set_meta("svc_provide", name);
                         b.set_meta("svc_argv", &argv.to_string());
@@ -3867,8 +4444,11 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     }
                 }
             }
-            let reply = if ok { "{\"ok\":true}\n" }
-                        else { "{\"ok\":false,\"error\":\"svc.declare: bad name/argv\"}\n" };
+            let reply = if ok {
+                "{\"ok\":true}\n"
+            } else {
+                "{\"ok\":false,\"error\":\"svc.declare: bad name/argv\"}\n"
+            };
             let _ = writer.write_all(reply.as_bytes());
             return;
         }
@@ -3877,10 +4457,13 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         // Rides the ordinary control socket (like pty_spawn / api.proxy);
         // no extra listener or socket file exists for services.
         if msg.get("type").and_then(Value::as_str) == Some("svc.dial") {
-            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd.take() {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             let Some(name) = msg.get("name").and_then(Value::as_str) else {
-                let _ = writer.write_all(
-                    b"{\"ok\":false,\"error\":\"svc.dial: missing name\"}\n");
+                let _ = writer.write_all(b"{\"ok\":false,\"error\":\"svc.dial: missing name\"}\n");
                 return;
             };
             // Bytes the dialer pipelined right behind its dial line must
@@ -3888,10 +4471,13 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             let prebuffered = reader.buffer().to_vec();
             drop(reader);
             let Some(mut slot) = svc_pair(name) else {
-                let _ = writer.write_all(format!(
-                    "{{\"ok\":false,\"error\":\"svc.dial: no live \
-                     '{name}' service (is its box running?)\"}}\n")
-                    .as_bytes());
+                let _ = writer.write_all(
+                    format!(
+                        "{{\"ok\":false,\"error\":\"svc.dial: no live \
+                     '{name}' service (is its box running?)\"}}\n"
+                    )
+                    .as_bytes(),
+                );
                 return;
             };
             if writer.write_all(b"{\"ok\":true,\"r\":\"svc\"}\n").is_err() {
@@ -3910,7 +4496,11 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         // hint_box_id (set by the FD broker handshake) when the caller
         // is in-box and doesn't need to spell out its own identity.
         if msg.get("type").and_then(Value::as_str) == Some("budget.grant") {
-            if let Some(fd) = peer_pidfd.take() { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd.take() {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             let amount = msg.get("amount").and_then(Value::as_i64).unwrap_or(0);
             let name = msg.get("box").and_then(Value::as_str);
             let bid = match name {
@@ -3923,8 +4513,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             let resp = match bid {
                 Some(id) => {
                     crate::oaita::budget::grant(&state, id, amount);
-                    let rem = crate::oaita::budget::remaining(&state, id)
-                        .unwrap_or(0);
+                    let rem = crate::oaita::budget::remaining(&state, id).unwrap_or(0);
                     format!("{{\"ok\":true,\"remaining\":{rem}}}\n")
                 }
                 None => "{\"ok\":false,\"error\":\"box not resolvable\"}\n".to_string(),
@@ -3937,11 +4526,17 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         // See the FRAME_API_* handling in the post-register frame loop
         // below and frames::FRAME_API_{OPEN,DATA,CLOSE}.
         let mut reply = if msg.get("type").and_then(Value::as_str) == Some("register") {
-            register(&state, &msg, peer_pidfd.take(),
-                     peer_tapfd.take().map(|f|
-                         <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(f)),
-                     peer_thirdfd.take().map(|f|
-                         <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(f)))
+            register(
+                &state,
+                &msg,
+                peer_pidfd.take(),
+                peer_tapfd
+                    .take()
+                    .map(|f| <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(f)),
+                peer_thirdfd
+                    .take()
+                    .map(|f| <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(f)),
+            )
         } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_nested") {
             // D9 nested-shell provenance: a one-shot control message from the
             // brush-sh shim, carrying its OWN pidfd (like register) so we resolve
@@ -3973,9 +4568,12 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         } else {
             dispatch(&state, &msg)
         };
-        let subscribe = reply.get("_subscribe").and_then(Value::as_bool)
+        let subscribe = reply
+            .get("_subscribe")
+            .and_then(Value::as_bool)
             .unwrap_or(false);
-        let box_sid = reply.as_object_mut()
+        let box_sid = reply
+            .as_object_mut()
             .and_then(|o| o.remove("_box_sid"))
             .and_then(|v| v.as_i64());
         if writer.write_all(format!("{reply}\n").as_bytes()).is_err() {
@@ -4004,7 +4602,9 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                         crate::frames::FRAME_MUTE => {
                             if let Some(fd) = pending_fd.take() {
                                 let hp = host_pid_from_pidfd(fd);
-                                unsafe { libc::close(fd); }
+                                unsafe {
+                                    libc::close(fd);
+                                }
                                 if hp > 0 {
                                     muted_pid = Some(hp);
                                     if let Some(ov) = ov.as_ref() {
@@ -4024,8 +4624,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                             }
                         }
                         crate::frames::FRAME_UNMUTE => {
-                            if let (Some(hp), Some(ov)) =
-                                (muted_pid.take(), ov.as_ref()) {
+                            if let (Some(hp), Some(ov)) = (muted_pid.take(), ov.as_ref()) {
                                 ov.mute_remove(hp);
                             }
                         }
@@ -4049,22 +4648,28 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 // FRAME_CONN + SCM_RIGHTS. Attribution is intrinsic to
                 // the channel — every fresh conn is for THIS box.
                 for (ft, _) in &frames {
-                    if *ft != crate::frames::FRAME_OPEN_CONN { continue; }
+                    if *ft != crate::frames::FRAME_OPEN_CONN {
+                        continue;
+                    }
                     let writer = ov.as_ref().and_then(|o| o.echo_writer(id));
-                    let Some(writer) = writer else { continue; };
-                    let (server_side, runner_side) =
-                        match std::os::unix::net::UnixStream::pair() {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
+                    let Some(writer) = writer else {
+                        continue;
+                    };
+                    let (server_side, runner_side) = match std::os::unix::net::UnixStream::pair() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
                     let st_handler = state.clone();
                     let box_id_hint = id;
-                    std::thread::spawn(move || handle_guarded(
-                        st_handler, server_side, Some(box_id_hint)));
+                    std::thread::spawn(move || {
+                        handle_guarded(st_handler, server_side, Some(box_id_hint))
+                    });
                     use std::os::fd::AsRawFd;
-                    send_frame_with_fd(&writer,
+                    send_frame_with_fd(
+                        &writer,
                         &crate::frames::encode(crate::frames::FRAME_CONN, &[]),
-                        runner_side.as_raw_fd());
+                        runner_side.as_raw_fd(),
+                    );
                     drop(runner_side); // the receiver dup's it on recvmsg
                 }
                 fbuf.drain(..used);
@@ -4072,38 +4677,55 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     let mut tmp = [0u8; 4096];
                     let mut fd = None;
                     let n = recv_frame_bytes(raw, &mut tmp, &mut fd);
-                    if n <= 0 { break; }
+                    if n <= 0 {
+                        break;
+                    }
                     if let Some(f) = fd {
                         if let Some(old) = pending_fd.replace(f) {
-                            unsafe { libc::close(old); }
+                            unsafe {
+                                libc::close(old);
+                            }
                         }
                     }
                     fbuf.extend_from_slice(&tmp[..n as usize]);
                 }
             }
-            if let Some(fd) = pending_fd { unsafe { libc::close(fd); } }
+            if let Some(fd) = pending_fd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             if let Some(ov) = ov.as_ref() {
-                if let Some(hp) = muted_pid { ov.mute_remove(hp); }
+                if let Some(hp) = muted_pid {
+                    ov.mute_remove(hp);
+                }
                 // D9 brush↔process linkage: now that the box channel hit EOF the
                 // brush shell has exited — ALL pipelines + process rows exist, so
                 // attribute every brush-spawned process to its pipeline in one
                 // race-free pass (no-op for non-brush boxes).
-                if let Some(b) = ov.live_box(id) { b.finalize_brush_links(); }
+                if let Some(b) = ov.live_box(id) {
+                    b.finalize_brush_links();
+                }
                 ov.clear_echo(id);
                 ov.remove_box(id);
             }
             {
                 let mut s = lock(&state);
                 if let Some(fd) = s.box_pids.remove(&id) {
-                    unsafe { libc::close(fd); }
+                    unsafe {
+                        libc::close(fd);
+                    }
                 }
                 s.box_runpids.remove(&id);
                 if let Some(p) = s.api_proxy.clone() {
                     p.disable_box(id);
                 }
             }
-            broadcast(&state, &json!({"type": "session_removed",
-                                      "session_id": id.to_string()}));
+            broadcast(
+                &state,
+                &json!({"type": "session_removed",
+                                      "session_id": id.to_string()}),
+            );
             return;
         }
         if subscribe {
@@ -4121,8 +4743,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
 pub fn is_box_name(s: &str) -> bool {
     !s.is_empty()
         && s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()
-                         || c == '-' || c == '.')
+        && s.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-' || c == '.')
         && !s.ends_with('-')
 }
 
@@ -4136,11 +4758,15 @@ pub fn is_box_name(s: &str) -> bool {
 /// A live handle for `sid`, hydrating the at-rest box (open sqlar, load
 /// mirror, register) if it is not already live. The shared preamble of
 /// the attach/rotate verbs.
-fn hydrate_box(ov: &crate::overlay::Overlay, sid: i64)
-    -> Option<std::sync::Arc<crate::capture::BoxState>>
-{
+fn hydrate_box(
+    ov: &crate::overlay::Overlay,
+    sid: i64,
+) -> Option<std::sync::Arc<crate::capture::BoxState>> {
     if ov.box_of(sid).is_none() {
-        if !crate::paths::state_home().join(format!("{sid}.sqlar")).exists() {
+        if !crate::paths::state_home()
+            .join(format!("{sid}.sqlar"))
+            .exists()
+        {
             return None;
         }
         let tb = crate::capture::BoxState::create(sid).ok()?;
@@ -4155,12 +4781,11 @@ fn hydrate_box(ov: &crate::overlay::Overlay, sid: i64)
 /// (page-id bound derived from the existing depot's on-disk index).
 /// Coexists with hydrated attachments and other readers; only a
 /// writing `wikimak import`/`sync` briefly excludes it.
-fn open_wiki_instance(root: &str)
-    -> Result<wikimak_wikipedia::Instance, String>
-{
-    wikimak_wikipedia::Instance::open_read(
-        wikimak_wikipedia::read_config(std::path::PathBuf::from(root)))
-        .map_err(|e| e.to_string())
+fn open_wiki_instance(root: &str) -> Result<wikimak_wikipedia::Instance, String> {
+    wikimak_wikipedia::Instance::open_read(wikimak_wikipedia::read_config(
+        std::path::PathBuf::from(root),
+    ))
+    .map_err(|e| e.to_string())
 }
 
 // ── svc: engine-spliced host↔box service streams ────────────────────────────
@@ -4170,16 +4795,17 @@ fn open_wiki_instance(root: &str)
 // "paired" line write fails — and the next slot is tried.
 
 fn svc_name_ok(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64
-        && name.chars().all(|c| c.is_ascii_alphanumeric()
-                             || c == '-' || c == '_' || c == '.')
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
         && !name.starts_with('.')
 }
 
 static SVC_PARKED: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<
-        String, std::collections::VecDeque<UnixStream>>>>
-    = std::sync::LazyLock::new(Default::default);
+    std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<UnixStream>>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// (Re)write the safe-for-box `oaita.toml` from the CURRENT host config: the
 /// model name, no api_key, and a marker base_url (the in-box client uses the
@@ -4191,18 +4817,23 @@ pub fn write_api_box_oaita_toml() {
     // Model name: the host config's, or "local" when a sarun-local model is
     // available (so the box needs no config), else empty. The engine routes
     // regardless — this is just the name that rides in the request.
-    let model = host_cfg.model.as_deref()
+    let model = host_cfg
+        .model
+        .as_deref()
         .filter(|m| !m.trim().is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| if service_declared("oaita-local") {
-            "local".into()
-        } else {
-            String::new()
+        .unwrap_or_else(|| {
+            if service_declared("oaita-local") {
+                "local".into()
+            } else {
+                String::new()
+            }
         });
     let safe_toml = format!(
         "# Auto-generated by sarun for --api boxes. Read-only via FUSE.\n\
          model = {model:?}\n\
-         base_url = \"http://oaita-proxy/v1\"\n");
+         base_url = \"http://oaita-proxy/v1\"\n"
+    );
     let _ = std::fs::write(crate::paths::api_box_oaita_toml_path(), &safe_toml);
 }
 
@@ -4211,7 +4842,11 @@ pub fn write_api_box_oaita_toml() {
 /// and re-parks after each pairing, so this reliably reflects "up" under
 /// the sequential calls an agent makes.
 pub fn svc_has(name: &str) -> bool {
-    SVC_PARKED.lock().unwrap().get(name).is_some_and(|q| !q.is_empty())
+    SVC_PARKED
+        .lock()
+        .unwrap()
+        .get(name)
+        .is_some_and(|q| !q.is_empty())
 }
 
 /// Whether any box has DECLARED an on-demand service `name` (meta
@@ -4219,8 +4854,12 @@ pub fn svc_has(name: &str) -> bool {
 /// Lets the proxy default its upstream to a sarun-local model without any
 /// oaita.toml — the declaration IS the "a local model exists" signal.
 pub fn service_declared(name: &str) -> bool {
-    discover::discover().values()
-        .any(|b| b.meta.get("svc_provide").map(|s| s == name).unwrap_or(false))
+    discover::discover().values().any(|b| {
+        b.meta
+            .get("svc_provide")
+            .map(|s| s == name)
+            .unwrap_or(false)
+    })
 }
 
 /// GENERIC on-demand service start. When a box dials `svc://<name>` and
@@ -4234,19 +4873,30 @@ pub fn service_declared(name: &str) -> bool {
 /// mechanism behind `oaita local`; any box can advertise a server the same
 /// way. See engine/DESIGN.md "On-demand box services".
 pub async fn ensure_service(name: &str) -> Result<(), String> {
-    if svc_has(name) { return Ok(()); }
+    if svc_has(name) {
+        return Ok(());
+    }
     static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = LOCK.lock().await;
-    if svc_has(name) { return Ok(()); } // another caller won the race
+    if svc_has(name) {
+        return Ok(());
+    } // another caller won the race
     // Find the declaring box.
     let boxes = discover::discover();
-    let Some((&pid, decl)) = boxes.iter()
-        .find(|(_, b)| b.meta.get("svc_provide").map(|s| s == name).unwrap_or(false))
-    else {
-        return Err(format!("no box provides service '{name}' — nothing has \
-            declared it (svc.declare)"));
+    let Some((&pid, decl)) = boxes.iter().find(|(_, b)| {
+        b.meta
+            .get("svc_provide")
+            .map(|s| s == name)
+            .unwrap_or(false)
+    }) else {
+        return Err(format!(
+            "no box provides service '{name}' — nothing has \
+            declared it (svc.declare)"
+        ));
     };
-    let argv: Vec<String> = decl.meta.get("svc_argv")
+    let argv: Vec<String> = decl
+        .meta
+        .get("svc_argv")
         .and_then(|s| serde_json::from_str(s).ok())
         .ok_or_else(|| format!("service '{name}': malformed svc_argv"))?;
     if argv.is_empty() {
@@ -4256,43 +4906,70 @@ pub async fn ensure_service(name: &str) -> Result<(), String> {
     // fallback where netns is unavailable (mirrors box networking).
     let net = match decl.meta.get("svc_net").map(String::as_str) {
         Some(n) if !n.is_empty() => n.to_string(),
-        _ => if crate::net::tap::tap_available() { "tap" } else { "host" }.to_string(),
+        _ => if crate::net::tap::tap_available() {
+            "tap"
+        } else {
+            "host"
+        }
+        .to_string(),
     };
     // Serve sub-box parented on the declaring box (numeric-id prefix — the
     // engine resolves it as the parent, same stacking `oci run` uses).
-    let child = format!("SVC-{}", name.to_ascii_uppercase()
-        .chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
-        .collect::<String>());
+    let child = format!(
+        "SVC-{}",
+        name.to_ascii_uppercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            })
+            .collect::<String>()
+    );
     let serve_box = format!("{pid}.{child}");
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "sarun".into());
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(["run", "--net", &net, &serve_box, "--"]);
-    for a in &argv { cmd.arg(a); }
+    for a in &argv {
+        cmd.arg(a);
+    }
     cmd.stdin(std::process::Stdio::null())
-       .stdout(std::process::Stdio::null())
-       .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     // setsid: outlive whatever triggered the start.
     unsafe {
         use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| { libc::setsid(); Ok(()) });
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
     }
-    cmd.spawn().map_err(|e| format!("start service '{name}': {e}"))?;
-    for _ in 0..240 { // ~120s: cold server / model load
-        if svc_has(name) { return Ok(()); }
+    cmd.spawn()
+        .map_err(|e| format!("start service '{name}': {e}"))?;
+    for _ in 0..240 {
+        // ~120s: cold server / model load
+        if svc_has(name) {
+            return Ok(());
+        }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    Err(format!("service '{name}' did not become ready in time \
-        (check box '{serve_box}')"))
+    Err(format!(
+        "service '{name}' did not become ready in time \
+        (check box '{serve_box}')"
+    ))
 }
 
 /// Pop the first LIVE parked slot for `name` (a dead slot — its box exited
 /// — fails the "paired" write and the next one is tried).
 fn svc_pair(name: &str) -> Option<UnixStream> {
     loop {
-        let slot = SVC_PARKED.lock().unwrap()
-            .get_mut(name).and_then(|q| q.pop_front())?;
+        let slot = SVC_PARKED
+            .lock()
+            .unwrap()
+            .get_mut(name)
+            .and_then(|q| q.pop_front())?;
         let mut slot = slot;
         if slot.write_all(b"{\"ok\":true,\"r\":\"paired\"}\n").is_ok() {
             return Some(slot);
@@ -4303,7 +4980,9 @@ fn svc_pair(name: &str) -> Option<UnixStream> {
 /// Bidirectional byte splice between two blocking UnixStreams; each side's
 /// EOF shuts down the peer's write half so HTTP keep-alive teardown works.
 fn svc_splice(a: UnixStream, b: UnixStream) {
-    let (Ok(mut ar), Ok(mut bw)) = (a.try_clone(), b.try_clone()) else { return };
+    let (Ok(mut ar), Ok(mut bw)) = (a.try_clone(), b.try_clone()) else {
+        return;
+    };
     std::thread::spawn(move || {
         let _ = std::io::copy(&mut ar, &mut bw);
         let _ = bw.shutdown(std::net::Shutdown::Write);
@@ -4317,85 +4996,63 @@ fn svc_splice(a: UnixStream, b: UnixStream) {
 
 /// `sarun mirror …` — the mirror-jobs CLI (schedule surface of
 /// mirrors.rs; the TUI's Mirrors pane shows the same rows).
-/// Generic CLI dispatcher: looks up the subcommand path in the registry
-/// and dispatches the corresponding verb over the control socket.
-/// Falls back to cli_mirror for backward compatibility.
-#[allow(dead_code)]
-pub fn cli_dispatch(argv: &[String]) -> i32 {
-    let strs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    // Try registry lookup: ["mirror", "run", "5"] → verb "mirror_run" args ["5"]
-    if strs.len() >= 2 {
-        let path: Vec<&str> = strs[..2].iter().copied().collect();
-        if let Some(verb) = crate::registry::verb_for_cli(&path) {
-            let rest: Vec<Value> = strs[2..].iter().map(|s| {
-                if let Ok(n) = s.parse::<i64>() { Value::Number(n.into()) }
-                else if *s == "true" || *s == "false" { Value::Bool(s.parse().unwrap()) }
-                else { Value::String(s.to_string()) }
-            }).collect();
-            let sock = crate::paths::sock_path();
-            match crate::control::cli_rpc(&sock, verb, Value::Array(rest)) {
-                Ok(v) => {
-                    if v.get("ok").and_then(Value::as_bool) == Some(false) {
-                        eprintln!("{}", v.get("error").and_then(Value::as_str).unwrap_or("failed"));
-                        return 1;
-                    }
-                    return 0;
-                }
-                Err(e) => { eprintln!("sarun: {e}"); return 1; }
-            }
-        }
-    }
-    // Fallback to the existing per-command CLIs
-    match strs.first().copied() {
-        Some("mirror") => cli_mirror(argv),
-        _ => {
-            eprintln!("usage: sarun mirror <ls|add|run|pause|resume|rm> ...");
-            2
-        }
-    }
-}
-
-/// One-shot RPC: send a verb, read the reply, return the inner result.
-#[allow(dead_code)]
-pub fn cli_rpc(sock: &std::path::Path, verb: &str, args: Value) -> Result<Value, String> {
-    let mut c = UnixStream::connect(sock).map_err(|_| "no engine running".to_string())?;
-    let msg = json!({"type": "ui", "verb": verb, "args": args});
-    c.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
-    let mut line = String::new();
-    BufReader::new(&c).read_line(&mut line).map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-    Ok(v.get("r").cloned().unwrap_or(v))
-}
-
 pub fn cli_mirror(argv: &[String]) -> i32 {
     let sock = crate::paths::sock_path();
     let one = |verb: &str, args: Value| -> Result<Value, String> {
         let mut c = UnixStream::connect(&sock).map_err(|_| "no engine running".to_string())?;
         let msg = json!({"type": "ui", "verb": verb, "args": args});
-        c.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
+        c.write_all(format!("{msg}\n").as_bytes())
+            .map_err(|e| e.to_string())?;
         let mut line = String::new();
-        BufReader::new(&c).read_line(&mut line).map_err(|e| e.to_string())?;
+        BufReader::new(&c)
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
         let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
         // Wrapped ok/r on success; bare early-return errors.
         Ok(v.get("r").cloned().unwrap_or(v))
     };
-    let fail = |e: String| -> i32 { eprintln!("sarun-engine: {e}"); 1 };
-    let strs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    match strs.as_slice() {
-        ["ls"] | [] => match one("mirror_jobs", json!([])) {
+    let fail = |e: String| -> i32 {
+        eprintln!("sarun-engine: {e}");
+        1
+    };
+    let mut words = vec!["mirror"];
+    if argv.is_empty() {
+        words.push("ls");
+    } else {
+        words.extend(argv.iter().map(String::as_str));
+    }
+    let invocation = match crate::parser::parse_words(&words) {
+        crate::parser::ParseResult::Invocation(invocation) => invocation,
+        _ => {
+            eprintln!(
+                "usage: sarun mirror ls\n       sarun mirror add git|wiki|ietf|cmd SRC DEST [INTERVAL_SECS]  (cmd: SRC is a shell command, DEST = $1)\n       sarun mirror run [ID]        (no ID = run all pending)\n       sarun mirror pause|resume|rm ID"
+            );
+            return 2;
+        }
+    };
+    let rpc_args = invocation.json_args();
+    let protocol_verb = invocation.dispatch_name();
+    match invocation.action.verb {
+        "mirror_jobs" => match one(protocol_verb, rpc_args) {
             Ok(Value::Array(jobs)) => {
                 for j in jobs {
                     let g = |k: &str| j.get(k).cloned().unwrap_or(Value::Null);
-                    let due = g("next_due").as_i64()
+                    let due = g("next_due")
+                        .as_i64()
                         .map(|d| {
                             let dt = d - std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .map(|x| x.as_secs() as i64).unwrap_or(0);
-                            if dt <= 0 { "now".to_string() }
-                            else { format!("in {}m", dt / 60) }
+                                .map(|x| x.as_secs() as i64)
+                                .unwrap_or(0);
+                            if dt <= 0 {
+                                "now".to_string()
+                            } else {
+                                format!("in {}m", dt / 60)
+                            }
                         })
                         .unwrap_or_else(|| "-".into());
-                    println!("{:>3}  {:<9} {:<5} {:<28} → {:<24} every {}m  due {}{}",
+                    println!(
+                        "{:>3}  {:<9} {:<5} {:<28} → {:<24} every {}m  due {}{}",
                         g("id").as_i64().unwrap_or(0),
                         g("state").as_str().unwrap_or("?"),
                         g("kind").as_str().unwrap_or("?"),
@@ -4404,62 +5061,75 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
                         g("interval_secs").as_i64().unwrap_or(0) / 60,
                         due,
                         match g("last_detail").as_str() {
-                            Some(d) if !d.is_empty()
-                                && g("state").as_str() == Some("error") =>
+                            Some(d) if !d.is_empty() && g("state").as_str() == Some("error") =>
                                 format!("  [{}]", d.lines().last().unwrap_or("")),
                             _ => String::new(),
-                        });
+                        }
+                    );
                 }
                 0
             }
-            Ok(v) => fail(v.get("error").and_then(Value::as_str).unwrap_or("bad reply").into()),
+            Ok(v) => fail(
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("bad reply")
+                    .into(),
+            ),
             Err(e) => fail(e),
         },
-        ["add", kind, src, dest, rest @ ..] => {
-            let interval: i64 = rest.first().and_then(|s| s.parse().ok()).unwrap_or(24 * 3600);
-            match one("mirror_add", json!([kind, src, dest, interval])) {
-                Ok(v) if v.get("ok") == Some(&Value::Bool(true)) => {
-                    println!("job {} added", v.get("id").and_then(Value::as_i64).unwrap_or(-1));
-                    0
-                }
-                Ok(v) => fail(v.get("error").and_then(Value::as_str).unwrap_or("add failed").into()),
-                Err(e) => fail(e),
-            }
-        }
-        ["run"] => match one("mirror_run_pending", json!([])) {
+        "mirror_add" => match one(protocol_verb, rpc_args) {
             Ok(v) if v.get("ok") == Some(&Value::Bool(true)) => {
-                let n = v.get("started").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+                println!(
+                    "job {} added",
+                    v.get("id").and_then(Value::as_i64).unwrap_or(-1)
+                );
+                0
+            }
+            Ok(v) => fail(
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("add failed")
+                    .into(),
+            ),
+            Err(e) => fail(e),
+        },
+        "mirror_run_pending" => match one(protocol_verb, rpc_args) {
+            Ok(v) if v.get("ok") == Some(&Value::Bool(true)) => {
+                let n = v
+                    .get("started")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
                 println!("{n} pending job(s) started");
                 0
             }
-            Ok(v) => fail(v.get("error").and_then(Value::as_str).unwrap_or("run failed").into()),
+            Ok(v) => fail(
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("run failed")
+                    .into(),
+            ),
             Err(e) => fail(e),
         },
-        ["run", id] | ["pause", id] | ["resume", id] | ["rm", id] => {
-            let Ok(idn) = id.parse::<i64>() else { return fail("job id must be a number".into()) };
-            let (verb, args) = match strs[0] {
-                "run" => ("mirror_run", json!([idn])),
-                "pause" => ("mirror_pause", json!([idn, true])),
-                "resume" => ("mirror_pause", json!([idn, false])),
-                _ => ("mirror_rm", json!([idn])),
-            };
-            match one(verb, args) {
+        "mirror_run" | "mirror_pause" | "mirror_resume" | "mirror_rm" => {
+            match one(protocol_verb, rpc_args) {
                 Ok(v) if v.get("ok") == Some(&Value::Bool(true)) => {
-                    // mirror_rm reports buffer-vs-store semantics in `note`.
                     match v.get("note").and_then(Value::as_str) {
                         Some(n) if !n.is_empty() => println!("ok — {n}"),
                         _ => println!("ok"),
                     }
                     0
                 }
-                Ok(v) => fail(v.get("error").and_then(Value::as_str).unwrap_or("failed").into()),
+                Ok(v) => fail(
+                    v.get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed")
+                        .into(),
+                ),
                 Err(e) => fail(e),
             }
         }
-        _ => {
-            eprintln!("usage: sarun mirror ls\n       sarun mirror add git|wiki|ietf|cmd SRC DEST [INTERVAL_SECS]  (cmd: SRC is a shell command, DEST = $1)\n       sarun mirror run [ID]        (no ID = run all pending)\n       sarun mirror pause|resume|rm ID");
-            2
-        }
+        _ => 2,
     }
 }
 
@@ -4471,8 +5141,7 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
 pub fn cli_verbs(argv: &[String]) -> i32 {
     let filter = argv.first().cloned().unwrap_or_default();
     let sock = crate::paths::sock_path();
-    let broker_name = std::env::var("SARUN_BROKER").ok()
-        .filter(|s| !s.is_empty());
+    let broker_name = std::env::var("SARUN_BROKER").ok().filter(|s| !s.is_empty());
     let dial = || -> std::io::Result<UnixStream> {
         match broker_name.as_ref() {
             Some(n) => crate::runner::broker_dial(n),
@@ -4481,33 +5150,51 @@ pub fn cli_verbs(argv: &[String]) -> i32 {
     };
     let mut c = match dial() {
         Ok(c) => c,
-        Err(_) => { eprintln!("sarun-engine: no engine running"); return 1; }
+        Err(_) => {
+            eprintln!("sarun-engine: no engine running");
+            return 1;
+        }
     };
     let msg = json!({"type": "ui", "verb": "verbs", "args": [filter]});
     if let Err(e) = c.write_all(format!("{msg}\n").as_bytes()) {
-        eprintln!("sarun-engine: {e}"); return 1;
+        eprintln!("sarun-engine: {e}");
+        return 1;
     }
     let mut line = String::new();
     if BufReader::new(&c).read_line(&mut line).is_err() {
-        eprintln!("sarun-engine: read failed"); return 1;
+        eprintln!("sarun-engine: read failed");
+        return 1;
     }
     let v: Value = match serde_json::from_str(&line) {
-        Ok(v) => v, Err(e) => { eprintln!("sarun-engine: {e}"); return 1; }
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("sarun-engine: {e}");
+            return 1;
+        }
     };
     let Some(rows) = v.get("r").and_then(Value::as_array) else {
-        eprintln!("sarun-engine: {}",
-            v.get("error").and_then(Value::as_str).unwrap_or("bad reply"));
+        eprintln!(
+            "sarun-engine: {}",
+            v.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("bad reply")
+        );
         return 1;
     };
-    let g = |r: &Value, k: &str| r.get(k).and_then(Value::as_str)
-        .unwrap_or("").to_string();
+    let g = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let namew = rows.iter().map(|r| g(r, "verb").len()).max().unwrap_or(0);
     let argw = rows.iter().map(|r| g(r, "args").len()).max().unwrap_or(0);
     for r in rows {
-        println!("{:<namew$}  {:<argw$}  {}",
-                 g(r, "verb"), g(r, "args"), g(r, "help"));
+        println!(
+            "{:<namew$}  {:<argw$}  {}",
+            g(r, "verb"),
+            g(r, "args"),
+            g(r, "help")
+        );
     }
-    if rows.is_empty() { eprintln!("no verbs match '{filter}'"); }
+    if rows.is_empty() {
+        eprintln!("no verbs match '{filter}'");
+    }
     0
 }
 
@@ -4519,8 +5206,7 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
     // SARUN_BROKER — served by the parent inner). From HOST we use the
     // engine's filesystem control socket. No fallback chain.
     let sock = crate::paths::sock_path();
-    let broker_name = std::env::var("SARUN_BROKER").ok()
-        .filter(|s| !s.is_empty());
+    let broker_name = std::env::var("SARUN_BROKER").ok().filter(|s| !s.is_empty());
     let dial = || -> std::io::Result<UnixStream> {
         if let Some(n) = broker_name.as_ref() {
             crate::runner::broker_dial(n)
@@ -4530,17 +5216,28 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
     };
     let one = |msg: Value| -> Result<Value, String> {
         let mut c = dial().map_err(|_| "no engine running".to_string())?;
-        c.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
+        c.write_all(format!("{msg}\n").as_bytes())
+            .map_err(|e| e.to_string())?;
         let mut line = String::new();
-        BufReader::new(&c).read_line(&mut line).map_err(|e| e.to_string())?;
+        BufReader::new(&c)
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
         serde_json::from_str(&line).map_err(|e| e.to_string())
     };
     let report = |r: Result<Value, String>| -> i32 {
         match r {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => 0,
-            Ok(v) => { eprintln!("sarun-engine: {}",
-                v.get("error").and_then(Value::as_str).unwrap_or("failed")); 1 }
-            Err(e) => { eprintln!("sarun-engine: {e}"); 1 }
+            Ok(v) => {
+                eprintln!(
+                    "sarun-engine: {}",
+                    v.get("error").and_then(Value::as_str).unwrap_or("failed")
+                );
+                1
+            }
+            Err(e) => {
+                eprintln!("sarun-engine: {e}");
+                1
+            }
         }
     };
     match op {
@@ -4551,34 +5248,49 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
         Some("stuck") => {
             // arg_sid takes a numeric SID; resolve the NAME first.
             let sid = match one(json!({"type": "ui", "verb": "resolve_box",
-                                       "args": [name]})) {
-                Ok(v) => match v.get("r").and_then(Value::as_str)
-                    .map(String::from) {
+                                       "args": [name]}))
+            {
+                Ok(v) => match v.get("r").and_then(Value::as_str).map(String::from) {
                     Some(s) => s,
-                    None => { eprintln!("sarun-engine: no slopbox '{name}'");
-                              return 1; }
+                    None => {
+                        eprintln!("sarun-engine: no slopbox '{name}'");
+                        return 1;
+                    }
                 },
-                Err(e) => { eprintln!("sarun-engine: {e}"); return 1; }
+                Err(e) => {
+                    eprintln!("sarun-engine: {e}");
+                    return 1;
+                }
             };
             match one(json!({"type": "ui", "verb": "stuck",
-                             "args": [sid]})) {
-                Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true)
-                    && v.get("r").and_then(|r| r.get("ok"))
-                        .and_then(Value::as_bool) == Some(true) => {
+                             "args": [sid]}))
+            {
+                Ok(v)
+                    if v.get("ok").and_then(Value::as_bool) == Some(true)
+                        && v.get("r")
+                            .and_then(|r| r.get("ok"))
+                            .and_then(Value::as_bool)
+                            == Some(true) =>
+                {
                     let r = v.get("r").cloned().unwrap_or(Value::Null);
                     let empty = vec![];
-                    let procs = r.get("procs").and_then(Value::as_array)
-                        .unwrap_or(&empty);
-                    println!("{:>7} {:>7} {:>2} {:<16} {}",
-                             "PID", "TID", "ST", "COMM", "BLOCKED-ON");
+                    let procs = r.get("procs").and_then(Value::as_array).unwrap_or(&empty);
+                    println!(
+                        "{:>7} {:>7} {:>2} {:<16} {}",
+                        "PID", "TID", "ST", "COMM", "BLOCKED-ON"
+                    );
                     for p in procs {
-                        let g = |k: &str| p.get(k).and_then(Value::as_str)
-                            .unwrap_or("").to_string();
-                        let n = |k: &str| p.get(k).and_then(Value::as_i64)
-                            .unwrap_or(0);
-                        println!("{:>7} {:>7} {:>2} {:<16} {}",
-                                 n("pid"), n("tid"), g("state"), g("comm"),
-                                 g("detail"));
+                        let g =
+                            |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                        let n = |k: &str| p.get(k).and_then(Value::as_i64).unwrap_or(0);
+                        println!(
+                            "{:>7} {:>7} {:>2} {:<16} {}",
+                            n("pid"),
+                            n("tid"),
+                            g("state"),
+                            g("comm"),
+                            g("detail")
+                        );
                         // Backtrace under the thread — the only thing that
                         // localizes a "running" spin. Print for spinning /
                         // non-idle threads; skip the dozen idle futex workers.
@@ -4586,8 +5298,7 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                             || g("detail").starts_with("epoll")
                             || g("detail") == "wait4()";
                         if !idle {
-                            if let Some(bt) = p.get("bt")
-                                .and_then(Value::as_array) {
+                            if let Some(bt) = p.get("bt").and_then(Value::as_array) {
                                 for f in bt.iter().filter_map(Value::as_str) {
                                     println!("{:>19}   {}", "", f);
                                 }
@@ -4595,31 +5306,42 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                         }
                     }
                     if procs.is_empty() {
-                        println!("(no live threads — the box's tree has \
+                        println!(
+                            "(no live threads — the box's tree has \
                                   exited; the runner may be stuck in \
-                                  teardown)");
+                                  teardown)"
+                        );
                     }
                     0
                 }
                 Ok(v) => {
                     // The verb reply nests under "r" for ui verbs; surface
                     // either error shape.
-                    let e = v.get("r").and_then(|r| r.get("error"))
+                    let e = v
+                        .get("r")
+                        .and_then(|r| r.get("error"))
                         .and_then(Value::as_str)
                         .or_else(|| v.get("error").and_then(Value::as_str))
                         .unwrap_or("failed");
                     eprintln!("sarun-engine: {e}");
                     1
                 }
-                Err(e) => { eprintln!("sarun-engine: {e}"); 1 }
+                Err(e) => {
+                    eprintln!("sarun-engine: {e}");
+                    1
+                }
             }
         }
         Some("apply") | Some("discard") => {
             let t = op.unwrap();
             match one(json!({"type": t, "sid": name})) {
                 Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
-                    println!("{}: {} {}", name,
-                        v.get("count").and_then(Value::as_i64).unwrap_or(0), t);
+                    println!(
+                        "{}: {} {}",
+                        name,
+                        v.get("count").and_then(Value::as_i64).unwrap_or(0),
+                        t
+                    );
                     0
                 }
                 other => report(other),
@@ -4637,34 +5359,57 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| src.clone());
             let sid = match one(json!({"type": "ui", "verb": "resolve_box",
-                                       "args": [name]})) {
-                Ok(v) => match v.get("r").and_then(Value::as_str)
-                    .and_then(|s| s.parse::<i64>().ok()) {
+                                       "args": [name]}))
+            {
+                Ok(v) => match v
+                    .get("r")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(id) => id,
-                    None => { eprintln!("sarun-engine: no box {name}"); return 1; }
+                    None => {
+                        eprintln!("sarun-engine: no box {name}");
+                        return 1;
+                    }
                 },
-                Err(e) => { eprintln!("sarun-engine: {e}"); return 1; }
+                Err(e) => {
+                    eprintln!("sarun-engine: {e}");
+                    return 1;
+                }
             };
             let mut vargs = vec![json!(sid), json!(src), json!(refname)];
-            if let Some(d) = argv.get(4) { vargs.push(json!(d)); }
-            if let Some(sp) = argv.get(5) { vargs.push(json!(sp)); }
+            if let Some(d) = argv.get(4) {
+                vargs.push(json!(d));
+            }
+            if let Some(sp) = argv.get(5) {
+                vargs.push(json!(sp));
+            }
             match one(json!({"type": "ui", "verb": "git_checkout",
-                             "args": vargs})) {
+                             "args": vargs}))
+            {
                 Ok(v) => {
                     let r = v.get("r").cloned().unwrap_or(v);
                     if r.get("ok").and_then(Value::as_bool) == Some(true) {
-                        println!("checked out {} into {name} ({} files)",
+                        println!(
+                            "checked out {} into {name} ({} files)",
                             r.get("sha").and_then(Value::as_str).unwrap_or("?"),
-                            r.get("files").and_then(Value::as_u64).unwrap_or(0));
+                            r.get("files").and_then(Value::as_u64).unwrap_or(0)
+                        );
                         0
                     } else {
-                        eprintln!("sarun-engine: {}",
-                            r.get("error").and_then(Value::as_str)
-                             .unwrap_or("checkout failed"));
+                        eprintln!(
+                            "sarun-engine: {}",
+                            r.get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("checkout failed")
+                        );
                         1
                     }
                 }
-                Err(e) => { eprintln!("sarun-engine: {e}"); 1 }
+                Err(e) => {
+                    eprintln!("sarun-engine: {e}");
+                    1
+                }
             }
         }
         // sarun NAME attach wiki <root> <page-id> [PREFIX]
@@ -4675,8 +5420,7 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
         // store on first read. (git is NOT attachable: a whole tree is
         // checked out instead — see `checkout`.)
         Some("attach") => {
-            let (Some(kind), Some(src), Some(key)) =
-                (argv.get(2), argv.get(3), argv.get(4)) else {
+            let (Some(kind), Some(src), Some(key)) = (argv.get(2), argv.get(3), argv.get(4)) else {
                 eprintln!("usage: sarun NAME attach wiki|ietf <src> <page|draft> [PREFIX]");
                 return 2;
             };
@@ -4684,8 +5428,10 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                 "wiki" => "wiki_attach",
                 "ietf" => "ietf_attach",
                 "git" => {
-                    eprintln!("sarun-engine: git attach was removed — use \
-`sarun {name} checkout <store> <ref> [DEST]` to stream the commit into the box");
+                    eprintln!(
+                        "sarun-engine: git attach was removed — use \
+`sarun {name} checkout <store> <ref> [DEST]` to stream the commit into the box"
+                    );
                     return 2;
                 }
                 other => {
@@ -4699,14 +5445,24 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| src.clone());
             let sid = match one(json!({"type": "ui", "verb": "resolve_box",
-                                       "args": [name]})) {
+                                       "args": [name]}))
+            {
                 // resolve_box replies with the id as a STRING (or null).
-                Ok(v) => match v.get("r").and_then(Value::as_str)
-                    .and_then(|s| s.parse::<i64>().ok()) {
+                Ok(v) => match v
+                    .get("r")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(id) => id,
-                    None => { eprintln!("sarun-engine: no box {name}"); return 1; }
+                    None => {
+                        eprintln!("sarun-engine: no box {name}");
+                        return 1;
+                    }
                 },
-                Err(e) => { eprintln!("sarun-engine: {e}"); return 1; }
+                Err(e) => {
+                    eprintln!("sarun-engine: {e}");
+                    return 1;
+                }
             };
             // wiki pages go by title or id; the verb resolves either.
             let key_v: Value = json!(key);
@@ -4722,18 +5478,25 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                     if r.get("ok").and_then(Value::as_bool) == Some(true) {
                         // The attachment's display name carries the
                         // pinned rev ("…@<rev>") — the whole identity.
-                        println!("attached {} to {name}",
-                            r.get("name").and_then(Value::as_str)
-                             .unwrap_or("?"));
+                        println!(
+                            "attached {} to {name}",
+                            r.get("name").and_then(Value::as_str).unwrap_or("?")
+                        );
                         0
                     } else {
-                        eprintln!("sarun-engine: {}",
-                            r.get("error").and_then(Value::as_str)
-                             .unwrap_or("attach failed"));
+                        eprintln!(
+                            "sarun-engine: {}",
+                            r.get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("attach failed")
+                        );
                         1
                     }
                 }
-                Err(e) => { eprintln!("sarun-engine: {e}"); 1 }
+                Err(e) => {
+                    eprintln!("sarun-engine: {e}");
+                    1
+                }
             }
         }
         Some("rename") => {
@@ -4746,22 +5509,22 @@ pub fn cli_box_op(argv: &[String]) -> i32 {
                 other => report(other),
             }
         }
-        Some("patch") => {
-            match one(json!({"type": "patch", "sid": name})) {
-                Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
-                    if let Some(b64) = v.get("patch").and_then(Value::as_str) {
-                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD
-                            .decode(b64) {
-                            use std::io::Write;
-                            let _ = std::io::stdout().write_all(&bytes);
-                        }
+        Some("patch") => match one(json!({"type": "patch", "sid": name})) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                if let Some(b64) = v.get("patch").and_then(Value::as_str) {
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                        use std::io::Write;
+                        let _ = std::io::stdout().write_all(&bytes);
                     }
-                    0
                 }
-                other => report(other),
+                0
             }
+            other => report(other),
+        },
+        Some(o) => {
+            eprintln!("sarun-engine: unknown op '{o}'");
+            2
         }
-        Some(o) => { eprintln!("sarun-engine: unknown op '{o}'"); 2 }
     }
 }
 
@@ -4797,7 +5560,9 @@ pub fn acquire_instance_lock(sock: &std::path::Path) -> std::io::Result<Instance
     }
     let lock_path = sock.with_extension("lock");
     let f = std::fs::OpenOptions::new()
-        .create(true).read(true).write(true)
+        .create(true)
+        .read(true)
+        .write(true)
         .open(&lock_path)?;
     // SAFETY: f.as_raw_fd() is a valid open fd for the duration of the call.
     let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -4849,15 +5614,20 @@ struct PrebufferedIo {
 
 impl PrebufferedIo {
     fn new(inner: tokio::net::UnixStream, prefix: Vec<u8>) -> Self {
-        Self { prefix, pos: 0, inner }
+        Self {
+            prefix,
+            pos: 0,
+            inner,
+        }
     }
 }
 
 impl tokio::io::AsyncRead for PrebufferedIo {
-    fn poll_read(mut self: std::pin::Pin<&mut Self>,
-                 cx: &mut std::task::Context<'_>,
-                 buf: &mut tokio::io::ReadBuf<'_>)
-                 -> std::task::Poll<std::io::Result<()>> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         if self.pos < self.prefix.len() {
             let avail = self.prefix.len() - self.pos;
             let n = avail.min(buf.remaining());
@@ -4871,30 +5641,32 @@ impl tokio::io::AsyncRead for PrebufferedIo {
 }
 
 impl tokio::io::AsyncWrite for PrebufferedIo {
-    fn poll_write(mut self: std::pin::Pin<&mut Self>,
-                  cx: &mut std::task::Context<'_>, b: &[u8])
-                  -> std::task::Poll<std::io::Result<usize>> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        b: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
         std::pin::Pin::new(&mut self.inner).poll_write(cx, b)
     }
-    fn poll_flush(mut self: std::pin::Pin<&mut Self>,
-                  cx: &mut std::task::Context<'_>)
-                  -> std::task::Poll<std::io::Result<()>> {
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_flush(cx)
     }
-    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>,
-                     cx: &mut std::task::Context<'_>)
-                     -> std::task::Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
-
 
 /// Send a frame over the box-channel WITH an attached fd via SCM_RIGHTS.
 /// Engine-side analogue of runner::send_frame's pidfd path. Best-effort:
 /// a closed/blocked channel silently fails (the receiver will EOF later
 /// and we don't want one slow runner to deadlock the engine).
-fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>,
-                      frame: &[u8], fd: i32) {
+fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>, frame: &[u8], fd: i32) {
     use std::os::fd::AsRawFd;
     let c = channel.lock().unwrap();
     let conn_fd = c.as_raw_fd();
@@ -4913,8 +5685,7 @@ fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>,
         (*cm).cmsg_level = libc::SOL_SOCKET;
         (*cm).cmsg_type = libc::SCM_RIGHTS;
         (*cm).cmsg_len = libc::CMSG_LEN(4) as _;
-        std::ptr::copy_nonoverlapping((&fd as *const i32).cast(),
-                                       libc::CMSG_DATA(cm), 4);
+        std::ptr::copy_nonoverlapping((&fd as *const i32).cast(), libc::CMSG_DATA(cm), 4);
         libc::sendmsg(conn_fd, &msg, 0);
     }
 }
@@ -4930,7 +5701,11 @@ mod verb_tests {
     // we spot-check side-effect-free verbs instead.
     #[test]
     fn verb_docs_nonempty_and_unique() {
-        assert!(VERB_DOCS.len() >= 80, "table lost entries: {}", VERB_DOCS.len());
+        assert!(
+            VERB_DOCS.len() >= 80,
+            "table lost entries: {}",
+            VERB_DOCS.len()
+        );
         let mut names: Vec<&str> = VERB_DOCS.iter().map(|d| d.name).collect();
         names.sort_unstable();
         let n = names.len();
@@ -4947,8 +5722,10 @@ mod verb_tests {
         let boxes = std::collections::BTreeMap::new();
         let r = dispatch_ui_verb(&state, "no_such_verb", &[], &boxes);
         let err = r.get("error").and_then(Value::as_str).unwrap();
-        assert!(err.contains("unknown verb") && err.contains("see 'verbs'"),
-                "got: {err}");
+        assert!(
+            err.contains("unknown verb") && err.contains("see 'verbs'"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -4965,8 +5742,11 @@ mod verb_tests {
         // And the self-list actually lists itself + honors the filter arg.
         let r = dispatch_ui_verb(&state, "verbs", &[json!("mirror")], &boxes);
         let rows = r["r"].as_array().unwrap();
-        assert!(rows.iter().all(|x| x["verb"].as_str().unwrap().contains("mirror")
-                                 || x["help"].as_str().unwrap().contains("mirror")));
+        assert!(
+            rows.iter()
+                .all(|x| x["verb"].as_str().unwrap().contains("mirror")
+                    || x["help"].as_str().unwrap().contains("mirror"))
+        );
         assert!(rows.len() >= 5);
         let all = dispatch_ui_verb(&state, "verbs", &[], &boxes);
         assert_eq!(all["r"].as_array().unwrap().len(), VERB_DOCS.len());

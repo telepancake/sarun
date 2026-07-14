@@ -25,15 +25,17 @@ pub use net::NetMode;
 mod brush;
 mod builtin_exec;
 mod capture;
-mod exec_wrappers;
-mod find_builtin;
-mod xargs_builtin;
 mod containers_conf;
 mod control;
 mod depot;
 mod discover;
+mod exec_wrappers;
+mod find_builtin;
+mod xargs_builtin;
 // Dockerfile/Containerfile parser for `sarun oci build` / `oci run`. Lands
 // ahead of its consumer (the build driver), so allow the not-yet-used items.
+mod attach;
+mod browser;
 #[allow(dead_code)]
 mod dockerfile;
 mod editor;
@@ -41,8 +43,6 @@ mod frames;
 mod hostfs;
 mod jobserver;
 mod katirun;
-mod attach;
-mod browser;
 mod mirrors;
 mod n2run;
 mod net;
@@ -50,11 +50,13 @@ mod oaita;
 mod oci;
 mod oci_verify;
 mod overlay;
+mod parser;
 mod paths;
+#[cfg(feature = "prolog")]
+mod prolog;
 mod pty;
 mod reader;
 mod registry;
-mod parser;
 mod review;
 mod rules;
 mod runner;
@@ -72,10 +74,8 @@ mod wacz;
 // speaking the Python ChannelServer's protocol (single-instance guard, ui
 // verbs over on-disk box discovery, subscribe event feed). No boxes yet —
 // register is refused politely; the overlay arrives at m3.
-static SOCK_FOR_SIGNAL: std::sync::OnceLock<std::ffi::CString> =
-    std::sync::OnceLock::new();
-static MNT_FOR_SIGNAL: std::sync::OnceLock<std::ffi::CString> =
-    std::sync::OnceLock::new();
+static SOCK_FOR_SIGNAL: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+static MNT_FOR_SIGNAL: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 
 extern "C" fn on_term(_sig: i32) {
     // async-signal-safe teardown: lazy-unmount our FUSE overlay (MNT_DETACH
@@ -85,7 +85,9 @@ extern "C" fn on_term(_sig: i32) {
     // without it, the dead mountpoint stays in the kernel's mount table and
     // `create_dir_all` on it returns EEXIST instead of "already a dir".
     if let Some(p) = MNT_FOR_SIGNAL.get() {
-        unsafe { libc::umount2(p.as_ptr(), libc::MNT_DETACH); }
+        unsafe {
+            libc::umount2(p.as_ptr(), libc::MNT_DETACH);
+        }
     }
     if let Some(p) = SOCK_FOR_SIGNAL.get() {
         unsafe { libc::unlink(p.as_ptr()) };
@@ -144,8 +146,11 @@ fn serve() -> i32 {
     let _instance_lock = match control::acquire_instance_lock(&sock) {
         Ok(control::InstanceLock::Held(fd)) => fd,
         Ok(control::InstanceLock::AlreadyRunning) => {
-            eprintln!("sarun-engine: an engine/UI is already running \
-                       (control socket {}).", sock.display());
+            eprintln!(
+                "sarun-engine: an engine/UI is already running \
+                       (control socket {}).",
+                sock.display()
+            );
             return 4;
         }
         Err(e) => {
@@ -162,7 +167,8 @@ fn serve() -> i32 {
     // fusermount3 silently no-ops when there's nothing to unmount.
     let mnt = paths::mnt_point();
     let _ = std::process::Command::new("fusermount3")
-        .arg("-u").arg(&mnt)
+        .arg("-u")
+        .arg(&mnt)
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status();
@@ -179,7 +185,10 @@ fn serve() -> i32 {
     let listener = match control::bind_listener(&sock) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("sarun-engine: cannot bind control socket {}: {e}", sock.display());
+            eprintln!(
+                "sarun-engine: cannot bind control socket {}: {e}",
+                sock.display()
+            );
             return 1;
         }
     };
@@ -196,11 +205,12 @@ fn serve() -> i32 {
     let ov = overlay::Overlay::new(PathBuf::from("/"));
     let mut cfg = Config::default();
     cfg.mount_options = vec![MountOption::FSName("sarun-rs".into())];
-    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     cfg.n_threads = Some(n);
     cfg.clone_fd = n > 1;
-    let session = match fuser::spawn_mount2(ov.clone(),
-                                            &mnt, &cfg) {
+    let session = match fuser::spawn_mount2(ov.clone(), &mnt, &cfg) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("sarun-engine: overlay mount FAILED: {e} — boxes cannot run");
@@ -236,9 +246,17 @@ fn serve() -> i32 {
     // per accepted box-side connection) live on this. Leaked so the handle
     // stays valid for the engine's entire lifetime.
     let net_rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all().worker_threads(2).build()
-        .map(|rt| { let h = rt.handle().clone(); Box::leak(Box::new(rt)); h });
-    if let Ok(h) = net_rt { state.lock().unwrap().net_rt = Some(h); }
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .map(|rt| {
+            let h = rt.handle().clone();
+            Box::leak(Box::new(rt));
+            h
+        });
+    if let Ok(h) = net_rt {
+        state.lock().unwrap().net_rt = Some(h);
+    }
     // oaita API proxy: now lives as FRAME_API_OPEN/DATA/CLOSE on the
     // existing box-channel. The in-box runner serves /run/sarun/api.sock
     // inside the box and tunnels each accepted connection as logical
@@ -258,8 +276,11 @@ fn serve() -> i32 {
     // each --api box registers (control.rs), so a config written AFTER
     // startup — e.g. `oaita local` — reaches the box.
     control::write_api_box_oaita_toml();
-    println!("sarun-engine: listening · {}  ·  overlay {}",
-             sock.display(), mnt.display());
+    println!(
+        "sarun-engine: listening · {}  ·  overlay {}",
+        sock.display(),
+        mnt.display()
+    );
     // Engine -> UI event broadcaster. Lives for the engine process's
     // lifetime. Drains ONE shared queue and COALESCES bursts so a
     // write-storm in one box doesn't flood every subscriber. The rules:
@@ -296,18 +317,26 @@ fn serve() -> i32 {
                 for (sid, rel, op) in ov.drain_events() {
                     let kind: &'static str = if op == "process_added" {
                         "process_added"
-                    } else { "overlay" };
-                    let e = pending.entry((sid, kind))
+                    } else {
+                        "overlay"
+                    };
+                    let e = pending
+                        .entry((sid, kind))
                         .or_insert_with(|| (0, String::new()));
                     e.0 += 1;
-                    if !rel.is_empty() { e.1 = rel; }
+                    if !rel.is_empty() {
+                        e.1 = rel;
+                    }
                 }
                 let now = std::time::Instant::now();
                 pending.retain(|&(sid, kind), &mut (count, ref rel)| {
-                    let allowed = last_sent.get(&(sid, kind))
+                    let allowed = last_sent
+                        .get(&(sid, kind))
                         .map(|t| now.duration_since(*t) >= COALESCE_WINDOW)
                         .unwrap_or(true);
-                    if !allowed { return true; }   // still in cooldown — keep pending
+                    if !allowed {
+                        return true;
+                    } // still in cooldown — keep pending
                     let payload = if kind == "process_added" {
                         serde_json::json!({
                             "type": "process_added",
@@ -324,7 +353,7 @@ fn serve() -> i32 {
                     };
                     control::broadcast(&state, &payload);
                     last_sent.insert((sid, kind), now);
-                    false  // drop from pending — flushed
+                    false // drop from pending — flushed
                 });
             }
         });
@@ -357,7 +386,10 @@ fn ui_launch(args: &[String]) -> i32 {
         let log_path = paths::data_home().join("engine.log");
         let _ = std::fs::create_dir_all(paths::data_home());
         let log = match std::fs::OpenOptions::new()
-            .create(true).append(true).open(&log_path) {
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("sarun: cannot open {}: {e}", log_path.display());
@@ -365,8 +397,11 @@ fn ui_launch(args: &[String]) -> i32 {
             }
         };
         let log_err = log.try_clone().unwrap_or_else(|_| {
-            std::fs::OpenOptions::new().create(true).append(true)
-                .open(&log_path).expect("reopen engine.log")
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .expect("reopen engine.log")
         });
         let exe = match std::env::current_exe() {
             Ok(p) => p,
@@ -394,15 +429,21 @@ fn ui_launch(args: &[String]) -> i32 {
             // If the engine already exited, surface its log immediately
             // rather than waiting out the full deadline.
             if let Ok(Some(status)) = proc.try_wait() {
-                eprintln!("sarun: engine exited before serving (status: {status}). \
-                          Last log lines from {}:", log_path.display());
+                eprintln!(
+                    "sarun: engine exited before serving (status: {status}). \
+                          Last log lines from {}:",
+                    log_path.display()
+                );
                 tail_log(&log_path, 20);
                 return 1;
             }
             if std::time::Instant::now() >= deadline {
-                eprintln!("sarun: engine control socket never appeared at {} \
+                eprintln!(
+                    "sarun: engine control socket never appeared at {} \
                           (20s deadline). Last log lines from {}:",
-                          sock.display(), log_path.display());
+                    sock.display(),
+                    log_path.display()
+                );
                 tail_log(&log_path, 20);
                 return 1;
             }
@@ -442,7 +483,9 @@ fn driver_invocation() -> Option<i32> {
     let argv: Vec<String> = std::env::args().collect();
     let arg0 = argv.first().map(String::as_str).unwrap_or("");
     let base = std::path::Path::new(arg0)
-        .file_name().and_then(|s| s.to_str()).unwrap_or("");
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     if let Some(code) = run(base, &argv[1..]) {
         return Some(code);
     }
@@ -450,6 +493,9 @@ fn driver_invocation() -> Option<i32> {
 }
 
 fn main() {
+    #[cfg(feature = "prolog")]
+    prolog::ensure_linked();
+
     // Symlinked-as-`oaita` dispatch — same trick brush_sh / ninja / make use
     // below: when this engine binary is invoked under the name `oaita` (a
     // symlink to it), route straight to the oaita CLI. Detected BEFORE normal
@@ -519,9 +565,11 @@ fn main() {
         // auto-spawning the engine when its socket is down.
         None => std::process::exit(ui_launch(&argv)),
         Some("attach") => std::process::exit(ui_launch(&argv[1..])),
-        Some("--once") | Some("--sock") =>
-            std::process::exit(ui_launch(&argv)),
-        Some("-h") | Some("--help") => { print!("{}", top_level_help()); std::process::exit(0); }
+        Some("--once") | Some("--sock") => std::process::exit(ui_launch(&argv)),
+        Some("-h") | Some("--help") => {
+            print!("{}", top_level_help());
+            std::process::exit(0);
+        }
         // `engine` is the headless-serve alias Python uses; `serve` still works.
         Some("engine") | Some("serve") => std::process::exit(serve()),
         // ruletest <rulesfile> <rel> <box> <exe> <cwd> [argv...] — test hook for
@@ -538,7 +586,9 @@ fn main() {
             let rules = rules::Rules::parse(&text);
             let rel = &a[1];
             let subject = rules::Subject {
-                box_name: a[2].clone(), exe: a[3].clone(), cwd: a[4].clone(),
+                box_name: a[2].clone(),
+                exe: a[3].clone(),
+                cwd: a[4].clone(),
                 argv: a[5..].to_vec(),
             };
             let act = match rules.decide(rel, &subject) {
@@ -625,14 +675,18 @@ fn main() {
                         Some(m) => match NetMode::parse(m) {
                             Some(nm) => net_mode = nm,
                             None => {
-                                eprintln!("sarun: --net wants off|tap|host, \
-                                           got '{m}'");
+                                eprintln!(
+                                    "sarun: --net wants off|tap|host, \
+                                           got '{m}'"
+                                );
                                 std::process::exit(2);
                             }
                         },
                         None => {
-                            eprintln!("sarun: --net needs an argument \
-                                       (off|tap|host)");
+                            eprintln!(
+                                "sarun: --net needs an argument \
+                                       (off|tap|host)"
+                            );
                             std::process::exit(2);
                         }
                     },
@@ -689,33 +743,53 @@ fn main() {
                     // "--fuse", and the SECOND parallel run then collided
                     // with the first ("slopbox is already running").
                     a if a.starts_with('-') => {
-                        eprintln!("sarun: unknown flag '{a}' for run \
-                                   (a box NAME cannot start with '-')");
+                        eprintln!(
+                            "sarun: unknown flag '{a}' for run \
+                                   (a box NAME cannot start with '-')"
+                        );
                         std::process::exit(2);
                     }
-                    _ => if name.is_none() { name = Some(a.clone()); },
+                    _ => {
+                        if name.is_none() {
+                            name = Some(a.clone());
+                        }
+                    }
                 }
             }
             if cmd.is_empty() && !api {
-                eprintln!("usage: sarun run [FLAGS] [NAME] -- CMD...   (needs a running engine/UI)\n\
+                eprintln!(
+                    "usage: sarun run [FLAGS] [NAME] -- CMD...   (needs a running engine/UI)\n\
                     \x20 flags: -n/-N/--net off|tap|host  -t passthrough  -d direct  -e record-env\n\
                     \x20        -b brush-shell  -p pty  -C DIR  --no-parent  --readonly-parent  --api\n\
-                    \x20        --vars record variable assignments (Vars view)");
+                    \x20        --vars record variable assignments (Vars view)"
+                );
                 std::process::exit(2);
             }
             if sud {
                 if passthrough || direct || pty || api {
-                    eprintln!("sarun: --sud is incompatible with \
+                    eprintln!(
+                        "sarun: --sud is incompatible with \
                                -t/-d/-p/--api (step-1 scope, see \
-                               engine/DESIGN-sud.md)");
+                               engine/DESIGN-sud.md)"
+                    );
                     std::process::exit(2);
                 }
-                std::process::exit(
-                    runner::run_sud(name, env, chdir, net_mode, brush, cmd));
+                std::process::exit(runner::run_sud(name, env, chdir, net_mode, brush, cmd));
             }
-            std::process::exit(runner::run(name, passthrough, direct, env,
-                pty, brush, api, no_parent, readonly_parent, chdir,
-                net_mode, cmd));
+            std::process::exit(runner::run(
+                name,
+                passthrough,
+                direct,
+                env,
+                pty,
+                brush,
+                api,
+                no_parent,
+                readonly_parent,
+                chdir,
+                net_mode,
+                cmd,
+            ));
         }
         Some("verbs") => {
             // sarun verbs [FILTER] — the engine's UI-verb surface, from the
@@ -748,15 +822,35 @@ fn main() {
             let mut i = 0;
             while i < rest.len() {
                 if rest[i] == "--conn-fd" && i + 1 < rest.len() {
-                    conn_fd = rest[i + 1].parse().unwrap_or(-1); i += 2;
-                } else if rest[i] == "--capture" { capture = true; i += 1; }
-                else if rest[i] == "--pty" { pty = true; i += 1; }
-                else if rest[i] == "--brush" { brush = true; i += 1; }
-                else if rest[i] == "--api" { api = true; i += 1; }
-                else if rest[i] == "--" { i += 1; break; }
-                else { i += 1; }
+                    conn_fd = rest[i + 1].parse().unwrap_or(-1);
+                    i += 2;
+                } else if rest[i] == "--capture" {
+                    capture = true;
+                    i += 1;
+                } else if rest[i] == "--pty" {
+                    pty = true;
+                    i += 1;
+                } else if rest[i] == "--brush" {
+                    brush = true;
+                    i += 1;
+                } else if rest[i] == "--api" {
+                    api = true;
+                    i += 1;
+                } else if rest[i] == "--" {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
             }
-            std::process::exit(runner::inner(conn_fd, capture, pty, brush, api, rest[i..].to_vec()));
+            std::process::exit(runner::inner(
+                conn_fd,
+                capture,
+                pty,
+                brush,
+                api,
+                rest[i..].to_vec(),
+            ));
         }
         // CLI conveniences mirroring `slopbox NAME <op>`: a leading all-caps
         // (optionally dotted) box NAME selects it, and an optional op acts on it

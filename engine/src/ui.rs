@@ -72,9 +72,12 @@ use serde_json::json;
 fn rpc(sock: &str, verb: &str, args: Value) -> Result<Value, String> {
     let mut s = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
     let msg = json!({"type": "ui", "verb": verb, "args": args});
-    s.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
+    s.write_all(format!("{msg}\n").as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut line = String::new();
-    BufReader::new(&s).read_line(&mut line).map_err(|e| e.to_string())?;
+    BufReader::new(&s)
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
     let rep: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
     if rep.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(rep
@@ -93,7 +96,9 @@ fn rpc(sock: &str, verb: &str, args: Value) -> Result<Value, String> {
 /// Python prototype DOES, this branch is just for older Rust engines).
 #[cfg_attr(test, allow(dead_code))]
 fn shutdown_rpc(sock: &str) {
-    let Ok(mut s) = UnixStream::connect(sock) else { return };
+    let Ok(mut s) = UnixStream::connect(sock) else {
+        return;
+    };
     let _ = s.write_all(b"{\"type\":\"shutdown\"}\n");
     let mut line = String::new();
     let _ = BufReader::new(&s).read_line(&mut line);
@@ -106,9 +111,12 @@ fn shutdown_rpc(sock: &str) {
 fn rename_rpc(sock: &str, sid: &str, name: &str) -> Result<Value, String> {
     let mut s = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
     let msg = json!({"type": "rename", "sid": sid, "name": name});
-    s.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
+    s.write_all(format!("{msg}\n").as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut line = String::new();
-    BufReader::new(&s).read_line(&mut line).map_err(|e| e.to_string())?;
+    BufReader::new(&s)
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
     let rep: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
     if rep.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(rep
@@ -120,6 +128,47 @@ fn rename_rpc(sock: &str, sid: &str, name: &str) -> Result<Value, String> {
     Ok(rep)
 }
 
+/// Send one explicitly-supported top-level control message. Unlike `rpc`, this
+/// never wraps the action as a UI verb.
+fn control_message_rpc(
+    sock: &str,
+    invocation: &crate::parser::Invocation,
+) -> Result<Value, String> {
+    let message = match (invocation.dispatch_name(), invocation.args.as_slice()) {
+        (kind @ ("apply" | "discard"), [sid]) => {
+            let sid = sid.as_string().ok_or("control SID must be a string")?;
+            json!({"type": kind, "sid": sid})
+        }
+        ("rename", [sid, name]) => {
+            let sid = sid.as_string().ok_or("control SID must be a string")?;
+            let name = name.as_string().ok_or("control name must be a string")?;
+            json!({"type": "rename", "sid": sid, "name": name})
+        }
+        (kind @ ("apply" | "discard"), _) => {
+            return Err(format!("{kind} requires exactly SID in the command prompt"));
+        }
+        ("rename", _) => return Err("rename requires exactly SID NEW".into()),
+        (other, _) => return Err(format!("unsupported control action: {other}")),
+    };
+    let mut stream = UnixStream::connect(sock).map_err(|error| format!("connect: {error}"))?;
+    stream
+        .write_all(format!("{message}\n").as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut line = String::new();
+    BufReader::new(&stream)
+        .read_line(&mut line)
+        .map_err(|error| error.to_string())?;
+    let reply: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(reply
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("control message failed")
+            .to_string());
+    }
+    Ok(reply)
+}
+
 /// The engine's `sudtrace` is a top-level control type (like `patch`, not a
 /// "ui" verb): {"type":"sudtrace","sid":..} → {"ok":true,"events":[..],
 /// "truncated":bool}. Returns the whole reply so the caller reads `events` +
@@ -127,13 +176,19 @@ fn rename_rpc(sock: &str, sid: &str, name: &str) -> Result<Value, String> {
 fn sudtrace_rpc(sock: &str, sid: &str) -> Result<Value, String> {
     let mut s = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
     let msg = json!({"type": "sudtrace", "sid": sid});
-    s.write_all(format!("{msg}\n").as_bytes()).map_err(|e| e.to_string())?;
+    s.write_all(format!("{msg}\n").as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut line = String::new();
-    BufReader::new(&s).read_line(&mut line).map_err(|e| e.to_string())?;
+    BufReader::new(&s)
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
     let rep: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
     if rep.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(rep.get("error").and_then(Value::as_str)
-            .unwrap_or("sudtrace failed").to_string());
+        return Err(rep
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("sudtrace failed")
+            .to_string());
     }
     Ok(rep)
 }
@@ -146,7 +201,9 @@ fn sudtrace_rpc(sock: &str, sid: &str) -> Result<Value, String> {
 fn spawn_subscriber(sock: &str, tx: mpsc::Sender<Value>) {
     let sock = sock.to_string();
     std::thread::spawn(move || {
-        let Ok(mut s) = UnixStream::connect(&sock) else { return };
+        let Ok(mut s) = UnixStream::connect(&sock) else {
+            return;
+        };
         if s.write_all(b"{\"type\":\"subscribe\"}\n").is_err() {
             return;
         }
@@ -258,14 +315,22 @@ impl ViewFilter {
 /// JSON array of clauses the engine reparses against the same `rules::Clause`
 /// the UI uses.
 fn filter_to_json(clauses: Option<&[Clause]>) -> Value {
-    let Some(cs) = clauses else { return Value::Null };
-    Value::Array(cs.iter().map(|c| json!({
-        "kind": c.m.kind,
-        "pattern": c.m.pattern,
-        "join": match c.join { Join::And => "and", Join::Or => "or" },
-        "negate": c.negate,
-        "enabled": c.enabled,
-    })).collect())
+    let Some(cs) = clauses else {
+        return Value::Null;
+    };
+    Value::Array(
+        cs.iter()
+            .map(|c| {
+                json!({
+                    "kind": c.m.kind,
+                    "pattern": c.m.pattern,
+                    "join": match c.join { Join::And => "and", Join::Or => "or" },
+                    "negate": c.negate,
+                    "enabled": c.enabled,
+                })
+            })
+            .collect(),
+    )
 }
 
 // ── app state ───────────────────────────────────────────────────────────────
@@ -370,12 +435,19 @@ enum Pane {
 /// on Terminal/Browser. Terminal/Browser only enter the rotation while a
 /// PTY of that kind is open; the object Inspector is always there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Screen { Main, Terminal, Browser, Inspect }
+enum Screen {
+    Main,
+    Terminal,
+    Browser,
+    Inspect,
+}
 
 /// Wrapping cycle: the element `dir` steps away from index `i` in `items`.
 /// The one helper behind every F2-F5 rotation (screens, panes, PTYs).
 fn cycle_pick<T: Copy>(items: &[T], i: usize, dir: isize) -> Option<T> {
-    if items.is_empty() { return None; }
+    if items.is_empty() {
+        return None;
+    }
     let n = items.len() as isize;
     Some(items[((i as isize + dir).rem_euclid(n)) as usize])
 }
@@ -386,7 +458,10 @@ fn cycle_pick<T: Copy>(items: &[T], i: usize, dir: isize) -> Option<T> {
 #[cfg_attr(test, allow(dead_code))]
 enum Modal {
     /// A y/n confirmation. `action` names the destructive op to run on 'y'.
-    Confirm { prompt: String, action: ConfirmAction },
+    Confirm {
+        prompt: String,
+        action: ConfirmAction,
+    },
     /// A read-only text report (e.g. the `stuck` wedge diagnosis). Esc/q
     /// closes; content is preformatted lines.
     Report { title: String, lines: Vec<String> },
@@ -432,8 +507,12 @@ enum Modal {
     /// show `note` only), blitted to the tty AFTER ratatui draws — over the
     /// box interior at `cells` (x, y, w, h) — because pixels can't live in the
     /// cell buffer. Esc/q/Enter dismiss it.
-    ImageView { title: String, note: String, sixel: Vec<u8>,
-                cells: (u16, u16, u16, u16) },
+    ImageView {
+        title: String,
+        note: String,
+        sixel: Vec<u8>,
+        cells: (u16, u16, u16, u16),
+    },
     /// Vars-view query: `name [value]` — two whitespace-separated cmd_match
     /// text globs (bare word = substring); the second is optional.
     VarQuery { buf: String },
@@ -455,7 +534,10 @@ enum Modal {
     /// or built-in defaults), and /etc/containers/registries.conf short-name
     /// aliases — leaves show WHERE the pull will actually go (mirror/alias
     /// resolution) so policy-required mirrors are visible before committing.
-    ImagePicker { crumbs: Vec<String>, stack: Vec<PickLevel> },
+    ImagePicker {
+        crumbs: Vec<String>,
+        stack: Vec<PickLevel>,
+    },
     /// Free-text image reference entry — the picker's escape hatch (and the
     /// "enter tag…" leaf, which pre-fills `buf` with "image:").
     ImageRef { buf: String },
@@ -481,7 +563,11 @@ enum Modal {
     /// auto-derived turn-folder name; `buf` is the task the user types.
     /// Enter runs `oaita run --on <box> --task <buf> <session>` on a PTY —
     /// one step, no session to pre-scaffold, no NAME to remember.
-    OaitaTask { box_name: String, session: String, buf: String },
+    OaitaTask {
+        box_name: String,
+        session: String,
+        buf: String,
+    },
     /// Local-model picker for the Api pane. Opened when neither an external
     /// API nor a local model is configured (or from the pane's 'm' menu). The
     /// list is the engine's `oaita.models` catalog — a LIVE HuggingFace query
@@ -517,7 +603,7 @@ enum Modal {
     /// through the registry. Esc cancels.
     Command {
         buf: String,
-        completions: Vec<&'static str>,
+        completions: Vec<crate::parser::CompletionEntry>,
         sel: usize,
     },
 }
@@ -698,7 +784,10 @@ impl ClauseRow {
             crate::rules::wrap_bare_as_substring(self.pattern.trim())
         };
         Clause {
-            m: Match { kind: self.kind.clone(), pattern },
+            m: Match {
+                kind: self.kind.clone(),
+                pattern,
+            },
             join: self.join,
             negate: self.negate,
             enabled: self.enabled,
@@ -800,7 +889,7 @@ struct App {
     outputs_view_sid: Option<i64>,
     outputs_total: usize,
     outputs_window_start: usize,
-    rules: Vec<String>,    // raw filerules lines (apply/discard/passthrough <glob>)
+    rules: Vec<String>, // raw filerules lines (apply/discard/passthrough <glob>)
     /// D9 pipelines for the currently-loaded box — the DISPLAY window,
     /// after server-side filtering + client-side running_only + tree.
     pipelines: Vec<Value>,
@@ -1135,7 +1224,6 @@ struct App {
 /// window get rolled up into "… N earlier" / "… N more" elision lines.
 const OUTPUT_WINDOW_CAP: usize = 8000;
 
-
 impl App {
     /// Connected constructor: field defaults + the initial engine loads.
     fn new(sock: String) -> Self {
@@ -1285,16 +1373,17 @@ impl App {
     }
 
     fn session_id_at(&self, i: usize) -> Option<String> {
-        self.sessions.get(i)
+        self.sessions
+            .get(i)
             .and_then(|s| s.get("session_id"))
             .and_then(Value::as_str)
             .map(str::to_string)
     }
 
     fn session_index_of(&self, id: &str) -> Option<usize> {
-        self.sessions.iter().position(|s| {
-            s.get("session_id").and_then(Value::as_str) == Some(id)
-        })
+        self.sessions
+            .iter()
+            .position(|s| s.get("session_id").and_then(Value::as_str) == Some(id))
     }
 
     /// The DAG parents of a session row, as session-id strings (main
@@ -1303,8 +1392,12 @@ impl App {
         self.session_index_of(id)
             .and_then(|i| self.sessions[i].get("parents"))
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_i64)
-                      .map(|n| n.to_string()).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_i64)
+                    .map(|n| n.to_string())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1312,12 +1405,18 @@ impl App {
     /// in list order — the explicit DAG children.
     fn session_children(&self, id: &str) -> Vec<String> {
         let target: Option<i64> = id.parse().ok();
-        self.sessions.iter().filter(|s| {
-            s.get("parents").and_then(Value::as_array).is_some_and(|a| {
-                a.iter().filter_map(Value::as_i64).any(|p| Some(p) == target)
+        self.sessions
+            .iter()
+            .filter(|s| {
+                s.get("parents").and_then(Value::as_array).is_some_and(|a| {
+                    a.iter()
+                        .filter_map(Value::as_i64)
+                        .any(|p| Some(p) == target)
+                })
             })
-        }).filter_map(|s| s.get("session_id").and_then(Value::as_str))
-          .map(str::to_string).collect()
+            .filter_map(|s| s.get("session_id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
     }
 
     /// DAG sideways navigation: boxes (and build targets, and git) form a
@@ -1343,7 +1442,8 @@ impl App {
             return;
         }
         let cur_id = self.session_id_at(self.sel_session);
-        let pos = cur_id.as_deref()
+        let pos = cur_id
+            .as_deref()
             .and_then(|c| ring.iter().position(|r| r == c));
         let next = match pos {
             Some(p) => (p as isize + step).rem_euclid(ring.len() as isize) as usize,
@@ -1355,8 +1455,7 @@ impl App {
                 self.on_box_cursor_moved();
             }
             let kind = if arrived_up { "parent" } else { "child" };
-            self.status = format!("{kind} {}/{} of {}",
-                                  next + 1, ring.len(), from_id);
+            self.status = format!("{kind} {}/{} of {}", next + 1, ring.len(), from_id);
         }
     }
 
@@ -1386,11 +1485,14 @@ impl App {
         // Loaded-image metadata rides along with every sessions refresh (a
         // cheap engine-side meta scan). Errors (older engine) leave it empty.
         self.oci_images = match rpc(&self.sock, "oci.images", json!([])) {
-            Ok(Value::Array(a)) => a.iter().filter_map(|v| {
-                let name = v.get("name").and_then(Value::as_str)?;
-                let rf = v.get("reference").and_then(Value::as_str)?;
-                Some((name.to_string(), rf.to_string()))
-            }).collect(),
+            Ok(Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| {
+                    let name = v.get("name").and_then(Value::as_str)?;
+                    let rf = v.get("reference").and_then(Value::as_str)?;
+                    Some((name.to_string(), rf.to_string()))
+                })
+                .collect(),
             _ => vec![],
         };
     }
@@ -1408,9 +1510,14 @@ impl App {
         self.status = if conf.sources.is_empty() {
             "image picker · no /etc/containers/registries.conf — docker.io defaults".into()
         } else {
-            format!("image picker · registries.conf: {}",
-                    conf.sources.iter().map(|p| p.display().to_string())
-                        .collect::<Vec<_>>().join(", "))
+            format!(
+                "image picker · registries.conf: {}",
+                conf.sources
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         };
     }
 
@@ -1429,18 +1536,26 @@ impl App {
             let res = rpc(&sock, "oci.load", json!([refc])).map(|r| {
                 let name = r.get("top_name").and_then(Value::as_str).unwrap_or("?");
                 let n = r.get("n_layers").and_then(Value::as_i64).unwrap_or(0);
-                format!("loaded '{refc}' → box '{name}' ({n} layers) · \
-                         Pty+ → \"Container from image…\" to start it")
+                format!(
+                    "loaded '{refc}' → box '{name}' ({n} layers) · \
+                         Pty+ → \"Container from image…\" to start it"
+                )
             });
             let _ = tx.send(res);
         });
-        self.load_job = Some(LoadJob { rx, label: reference, spin: 0 });
+        self.load_job = Some(LoadJob {
+            rx,
+            label: reference,
+            spin: 0,
+        });
     }
 
     /// Drain a finished image load; animate the status spinner while one is
     /// still pending. Called once per main-loop tick (like pump_struct).
     fn pump_load(&mut self) {
-        let Some(job) = self.load_job.as_mut() else { return };
+        let Some(job) = self.load_job.as_mut() else {
+            return;
+        };
         match job.rx.try_recv() {
             Ok(Ok(msg)) => {
                 self.load_job = None;
@@ -1455,8 +1570,11 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => {
                 job.spin = job.spin.wrapping_add(1);
                 let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
-                self.status = format!("{} pulling {} …",
-                    frames[job.spin / 2 % frames.len()], job.label);
+                self.status = format!(
+                    "{} pulling {} …",
+                    frames[job.spin / 2 % frames.len()],
+                    job.label
+                );
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 let label = job.label.clone();
@@ -1474,39 +1592,65 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let sock = self.sock.clone();
         std::thread::spawn(move || {
-            let res = rpc(&sock, "oaita.models", json!([])).map(|r| {
-                let source = r.get("source").and_then(Value::as_str)
-                    .unwrap_or("").to_string();
-                let models = r.get("models").and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|m| Some(ModelRow {
-                        name: m.get("name")?.as_str()?.to_string(),
-                        url: m.get("url")?.as_str()?.to_string(),
-                        note: m.get("note").and_then(Value::as_str)
-                            .unwrap_or("").to_string(),
-                    })).collect())
-                    .unwrap_or_default();
-                (models, source)
-            }).map_err(|e| e.to_string());
+            let res = rpc(&sock, "oaita.models", json!([]))
+                .map(|r| {
+                    let source = r
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let models = r
+                        .get("models")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|m| {
+                                    Some(ModelRow {
+                                        name: m.get("name")?.as_str()?.to_string(),
+                                        url: m.get("url")?.as_str()?.to_string(),
+                                        note: m
+                                            .get("note")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (models, source)
+                })
+                .map_err(|e| e.to_string());
             let _ = tx.send(res);
         });
         self.models_job = Some(rx);
         self.modal = Some(Modal::ModelPicker {
-            models: vec![], source: String::new(), sel: 0, loading: true,
+            models: vec![],
+            source: String::new(),
+            sel: 0,
+            loading: true,
         });
         self.status = "local model picker · querying HuggingFace for current \
-                       models…".into();
+                       models…"
+            .into();
     }
 
     /// Drain the finished model-catalog fetch into the open ModelPicker.
     fn pump_models(&mut self) {
-        let Some(rx) = self.models_job.as_ref() else { return };
+        let Some(rx) = self.models_job.as_ref() else {
+            return;
+        };
         match rx.try_recv() {
             Ok(res) => {
                 self.models_job = None;
                 // Only fill the modal if it's still the (loading) picker — the
                 // user may have closed it while the fetch was in flight.
-                if let Some(Modal::ModelPicker { models, source, loading, .. })
-                    = self.modal.as_mut()
+                if let Some(Modal::ModelPicker {
+                    models,
+                    source,
+                    loading,
+                    ..
+                }) = self.modal.as_mut()
                 {
                     match res {
                         Ok((rows, src)) => {
@@ -1515,7 +1659,9 @@ impl App {
                             *loading = false;
                             self.status = format!(
                                 "local model picker · {} model(s) · {}",
-                                models.len(), source);
+                                models.len(),
+                                source
+                            );
                         }
                         Err(e) => {
                             *loading = false;
@@ -1528,8 +1674,9 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.models_job = None;
-                if let Some(Modal::ModelPicker { loading, source, .. })
-                    = self.modal.as_mut()
+                if let Some(Modal::ModelPicker {
+                    loading, source, ..
+                }) = self.modal.as_mut()
                 {
                     *loading = false;
                     *source = "catalog worker died".into();
@@ -1551,26 +1698,35 @@ impl App {
             result: String::new(),
             testing: false,
         });
-        self.status = format!("edit external API · writes {}",
-            crate::paths::oaita_config_path().display());
+        self.status = format!(
+            "edit external API · writes {}",
+            crate::paths::oaita_config_path().display()
+        );
     }
 
     /// Kick a background connection test (engine `oaita.probe`) for the
     /// ApiConfig editor's current values. Result lands via pump_probe().
-    fn start_api_probe(&mut self, base_url: String, model: String,
-                       api_key: String) {
+    fn start_api_probe(&mut self, base_url: String, model: String, api_key: String) {
         let (tx, rx) = mpsc::channel();
         let sock = self.sock.clone();
         std::thread::spawn(move || {
-            let res = rpc(&sock, "oaita.probe",
+            let res = rpc(
+                &sock,
+                "oaita.probe",
                 json!([{ "base_url": base_url, "model": model,
-                         "api_key": api_key }]));
+                         "api_key": api_key }]),
+            );
             let out = match res {
-                Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) =>
-                    Ok(v.get("detail").and_then(Value::as_str)
-                        .unwrap_or("connected").to_string()),
-                Ok(v) => Err(v.get("error").and_then(Value::as_str)
-                    .unwrap_or("probe failed").to_string()),
+                Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => Ok(v
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or("connected")
+                    .to_string()),
+                Ok(v) => Err(v
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("probe failed")
+                    .to_string()),
                 Err(e) => Err(e),
             };
             let _ = tx.send(out);
@@ -1580,12 +1736,15 @@ impl App {
 
     /// Drain a finished connection test into the open ApiConfig editor.
     fn pump_probe(&mut self) {
-        let Some(rx) = self.probe_job.as_ref() else { return };
+        let Some(rx) = self.probe_job.as_ref() else {
+            return;
+        };
         match rx.try_recv() {
             Ok(res) => {
                 self.probe_job = None;
-                if let Some(Modal::ApiConfig { result, testing, .. })
-                    = self.modal.as_mut()
+                if let Some(Modal::ApiConfig {
+                    result, testing, ..
+                }) = self.modal.as_mut()
                 {
                     *testing = false;
                     *result = match res {
@@ -1597,8 +1756,9 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.probe_job = None;
-                if let Some(Modal::ApiConfig { result, testing, .. })
-                    = self.modal.as_mut()
+                if let Some(Modal::ApiConfig {
+                    result, testing, ..
+                }) = self.modal.as_mut()
                 {
                     *testing = false;
                     *result = "✗ probe worker died".into();
@@ -1610,8 +1770,7 @@ impl App {
     /// Persist the ApiConfig editor to oaita.toml (model required). Returns a
     /// status string; refreshes the engine's --api box shadow so a running
     /// box picks up the new upstream without a restart.
-    fn save_api_config(&mut self, base_url: &str, model: &str, api_key: &str)
-        -> String {
+    fn save_api_config(&mut self, base_url: &str, model: &str, api_key: &str) -> String {
         if model.trim().is_empty() {
             return "model is required — fill it before saving".into();
         }
@@ -1623,7 +1782,9 @@ impl App {
             toml.push_str(&format!("api_key = {:?}\n", api_key.trim()));
         }
         let path = crate::paths::oaita_config_path();
-        if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         match std::fs::write(&path, toml) {
             Ok(()) => {
                 crate::control::write_api_box_oaita_toml();
@@ -1647,20 +1808,23 @@ impl App {
         self.hunk_scroll = 0;
         self.sel_hunk = 0;
         self.cancel_struct();
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         let filter = filter_to_json(self.f_changes.active());
         match rpc(&self.sock, "view.open", json!(["changes", sid, filter])) {
             Ok(v) => {
                 self.changes_view = v.get("view_id").and_then(Value::as_u64);
-                self.changes_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.changes_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.changes_view_sid = Some(sid);
             }
             Err(e) if e.contains("unknown verb") => {
                 self.status = format!(
                     "engine doesn't speak view.* — kill the stale engine \
                      (the socket {} is being answered by an old process) and \
-                     run sarun again", self.sock);
+                     run sarun again",
+                    self.sock
+                );
                 return;
             }
             Err(e) => {
@@ -1725,17 +1889,26 @@ impl App {
     fn fetch_changes_window(&mut self, start: usize) {
         let Some(vid) = self.changes_view else { return };
         let start = start.min(self.changes_total.saturating_sub(1).max(0));
-        match rpc(&self.sock, "view.window",
-                  json!([vid, start, WINDOW_SIZE])) {
+        match rpc(&self.sock, "view.window", json!([vid, start, WINDOW_SIZE])) {
             Ok(v) => {
-                self.changes_window_start =
-                    v.get("start").and_then(Value::as_u64).unwrap_or(start as u64) as usize;
+                self.changes_window_start = v
+                    .get("start")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(start as u64) as usize;
                 self.changes_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(self.changes_total as u64) as usize;
-                self.changes = v.get("rows").and_then(Value::as_array).cloned()
+                    v.get("total")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(self.changes_total as u64) as usize;
+                self.changes = v
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .cloned()
                     .unwrap_or_default();
             }
-            Err(e) => { self.status = format!("view.window changes: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.window changes: {e}");
+                return;
+            }
         }
         // Decorate the window's LEAF rows in ONE RPC — the engine looks up
         // each row's (kind, stale) by stat-ing the host; connectors get an
@@ -1747,28 +1920,46 @@ impl App {
         self.changes_decor = vec![(String::new(), false); self.changes.len()];
         let Some(sid) = self.cur_sid() else { return };
         let is_decoratable = |c: &Value| -> bool {
-            if c.get("connector").and_then(Value::as_bool) == Some(true) { return false; }
-            !matches!(c.get("kind").and_then(Value::as_str),
-                      Some("xattr") | Some("xattr-only"))
+            if c.get("connector").and_then(Value::as_bool) == Some(true) {
+                return false;
+            }
+            !matches!(
+                c.get("kind").and_then(Value::as_str),
+                Some("xattr") | Some("xattr-only")
+            )
         };
-        let leaf_paths: Vec<&str> = self.changes.iter()
+        let leaf_paths: Vec<&str> = self
+            .changes
+            .iter()
             .filter(|c| is_decoratable(c))
             .filter_map(|c| c.get("path").and_then(Value::as_str))
             .collect();
-        if leaf_paths.is_empty() { return; }
-        let leaf_paths_value: Vec<Value> = leaf_paths.iter()
-            .map(|p| Value::String((*p).into())).collect();
-        if let Ok(rep) = rpc(&self.sock, "review.decorate_many",
-                             json!([sid, leaf_paths_value])) {
+        if leaf_paths.is_empty() {
+            return;
+        }
+        let leaf_paths_value: Vec<Value> = leaf_paths
+            .iter()
+            .map(|p| Value::String((*p).into()))
+            .collect();
+        if let Ok(rep) = rpc(
+            &self.sock,
+            "review.decorate_many",
+            json!([sid, leaf_paths_value]),
+        ) {
             let decs = rep.as_array().cloned().unwrap_or_default();
             // Walk `self.changes` and `decs` in lockstep, skipping the
             // slots we filtered out so indices stay parallel.
             let mut di = 0;
             for (i, c) in self.changes.iter().enumerate() {
-                if !is_decoratable(c) { continue; }
+                if !is_decoratable(c) {
+                    continue;
+                }
                 if let Some(d) = decs.get(di) {
-                    let kind = d.get("kind").and_then(Value::as_str)
-                        .unwrap_or("changed").to_string();
+                    let kind = d
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("changed")
+                        .to_string();
                     let stale = d.get("stale").and_then(Value::as_bool).unwrap_or(false);
                     self.changes_decor[i] = (kind, stale);
                 }
@@ -1792,8 +1983,7 @@ impl App {
         let filter = filter_to_json(self.f_changes.active());
         match rpc(&self.sock, "view.filter", json!([vid, filter])) {
             Ok(v) => {
-                self.changes_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.changes_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.changes_window_start = 0;
                 self.sel_change = 0;
                 self.fetch_changes_window(0);
@@ -1814,17 +2004,21 @@ impl App {
     fn refresh_changes_preserving_cursor(&mut self) {
         let pinned_path = self.cur_change_path();
         let saved_start = self.changes_window_start;
-        let saved_sel   = self.sel_change;
+        let saved_sel = self.sel_change;
         self.close_changes_view();
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         let filter = filter_to_json(self.f_changes.active());
         match rpc(&self.sock, "view.open", json!(["changes", sid, filter])) {
             Ok(v) => {
                 self.changes_view = v.get("view_id").and_then(Value::as_u64);
-                self.changes_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.changes_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
             }
-            Err(e) => { self.status = format!("view.open changes: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.open changes: {e}");
+                return;
+            }
         }
         // Refetch the window we were on; if it slid off the end of the
         // new total, clamp.
@@ -1833,65 +2027,84 @@ impl App {
         // Pin sel_change by PATH if it's still in the window; otherwise
         // fall back to the saved offset.
         let restored = pinned_path.and_then(|p| {
-            self.changes.iter().position(|c|
-                c.get("path").and_then(Value::as_str) == Some(p.as_str()))
+            self.changes
+                .iter()
+                .position(|c| c.get("path").and_then(Value::as_str) == Some(p.as_str()))
         });
-        self.sel_change = restored
-            .unwrap_or_else(|| saved_sel.min(self.changes.len().saturating_sub(1)));
+        self.sel_change =
+            restored.unwrap_or_else(|| saved_sel.min(self.changes.len().saturating_sub(1)));
     }
 
     /// Same idea for procs: reopen + pin sel_proc by row id.
     fn refresh_processes_preserving_cursor(&mut self) {
-        let pinned_rid = self.processes.get(self.sel_proc)
+        let pinned_rid = self
+            .processes
+            .get(self.sel_proc)
             .and_then(|p| p.get("rid").and_then(Value::as_i64));
         let saved_start = self.processes_window_start;
-        let saved_sel   = self.sel_proc;
+        let saved_sel = self.sel_proc;
         self.close_processes_view();
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         let filter = filter_to_json(self.f_procs.active());
-        match rpc(&self.sock, "view.open", json!(["procs", sid, filter, self.proc_running_only])) {
+        match rpc(
+            &self.sock,
+            "view.open",
+            json!(["procs", sid, filter, self.proc_running_only]),
+        ) {
             Ok(v) => {
                 self.processes_view = v.get("view_id").and_then(Value::as_u64);
-                self.processes_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.processes_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
             }
-            Err(e) => { self.status = format!("view.open procs: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.open procs: {e}");
+                return;
+            }
         }
         let cap = self.processes_total.saturating_sub(1);
         self.fetch_processes_window(saved_start.min(cap));
         let restored = pinned_rid.and_then(|want| {
-            self.processes.iter().position(|p|
-                p.get("rid").and_then(Value::as_i64) == Some(want))
+            self.processes
+                .iter()
+                .position(|p| p.get("rid").and_then(Value::as_i64) == Some(want))
         });
-        self.sel_proc = restored
-            .unwrap_or_else(|| saved_sel.min(self.processes.len().saturating_sub(1)));
+        self.sel_proc =
+            restored.unwrap_or_else(|| saved_sel.min(self.processes.len().saturating_sub(1)));
     }
 
     /// Same for outputs: reopen + pin sel_output by output id.
     fn refresh_outputs_preserving_cursor(&mut self) {
-        let pinned_oid = self.outputs.get(self.sel_output)
+        let pinned_oid = self
+            .outputs
+            .get(self.sel_output)
             .and_then(|o| o.get("id").and_then(Value::as_i64));
         let saved_start = self.outputs_window_start;
-        let saved_sel   = self.sel_output;
+        let saved_sel = self.sel_output;
         self.close_outputs_view();
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         let filter = filter_to_json(self.f_outputs.active());
         match rpc(&self.sock, "view.open", json!(["outputs", sid, filter])) {
             Ok(v) => {
                 self.outputs_view = v.get("view_id").and_then(Value::as_u64);
-                self.outputs_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.outputs_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
             }
-            Err(e) => { self.status = format!("view.open outputs: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.open outputs: {e}");
+                return;
+            }
         }
         let cap = self.outputs_total.saturating_sub(1);
         self.fetch_outputs_window(saved_start.min(cap));
         let restored = pinned_oid.and_then(|want| {
-            self.outputs.iter().position(|o|
-                o.get("id").and_then(Value::as_i64) == Some(want))
+            self.outputs
+                .iter()
+                .position(|o| o.get("id").and_then(Value::as_i64) == Some(want))
         });
-        self.sel_output = restored
-            .unwrap_or_else(|| saved_sel.min(self.outputs.len().saturating_sub(1)));
+        self.sel_output =
+            restored.unwrap_or_else(|| saved_sel.min(self.outputs.len().saturating_sub(1)));
     }
 
     /// Pull the newest-first slice of the current box's sqlar — populates
@@ -1913,8 +2126,11 @@ impl App {
             self.status = "vars: press '/' and type a NAME (or NAME VALUE) query".into();
             return;
         }
-        match rpc(&self.sock, "review.makevars",
-                  json!([sid, n, v, 800, self.vars_any])) {
+        match rpc(
+            &self.sock,
+            "review.makevars",
+            json!([sid, n, v, 800, self.vars_any]),
+        ) {
             Ok(rows) => {
                 self.vars_rows = rows.as_array().cloned().unwrap_or_default();
                 self.status = format!("vars: {} assignment(s)", self.vars_rows.len());
@@ -1940,7 +2156,9 @@ impl App {
     /// pane skips its structural ancestors. `sel_change` is kept in
     /// [0, window.len()) after this returns.
     fn sel_change_global_advance(&mut self, delta: isize) {
-        if self.changes_total == 0 { return; }
+        if self.changes_total == 0 {
+            return;
+        }
         let step: isize = if delta > 0 { 1 } else { -1 };
         let mut global = self.changes_window_start + self.sel_change;
         loop {
@@ -1952,12 +2170,17 @@ impl App {
             let win_end = self.changes_window_start + self.changes.len();
             if global < self.changes_window_start || global >= win_end {
                 let quarter = WINDOW_SIZE / 4;
-                let new_start = global.saturating_sub(
-                    if step > 0 { quarter } else { WINDOW_SIZE - quarter });
+                let new_start = global.saturating_sub(if step > 0 {
+                    quarter
+                } else {
+                    WINDOW_SIZE - quarter
+                });
                 self.fetch_changes_window(new_start);
             }
             let off = global.saturating_sub(self.changes_window_start);
-            let is_connector = self.changes.get(off)
+            let is_connector = self
+                .changes
+                .get(off)
                 .and_then(|c| c.get("connector").and_then(Value::as_bool))
                 .unwrap_or(false);
             if !is_connector {
@@ -2034,7 +2257,10 @@ impl App {
             std::thread::spawn(move || {
                 let r = rpc(&sock, "struct_finish", json!([job]))
                     .unwrap_or_else(|e| json!({"lines": [["err", e]]}));
-                let _ = tx.send(StructResult { generation, lines: pairs_of(r.get("lines")) });
+                let _ = tx.send(StructResult {
+                    generation,
+                    lines: pairs_of(r.get("lines")),
+                });
             });
         } else {
             // unrecognized type: hexdump fallback (before/after bytes).
@@ -2046,7 +2272,9 @@ impl App {
     /// stale-generation result. Returns true if the cached lines changed (a
     /// redraw is warranted). Mirrors Python `_struct_done`.
     fn pump_struct(&mut self) -> bool {
-        let Some(rx) = self.struct_rx.as_ref() else { return false };
+        let Some(rx) = self.struct_rx.as_ref() else {
+            return false;
+        };
         match rx.try_recv() {
             Ok(res) => {
                 self.struct_rx = None;
@@ -2071,8 +2299,14 @@ impl App {
     /// size · mode · ⚠ stale), from review.decorate + review.change_mode + the
     /// change row's size. Mirrors Python `_update_cd_info`.
     fn binary_header(&self, sid: &str, rel: &str) -> Vec<(String, String)> {
-        let ent = self.visible_changes().get(self.sel_change).cloned().cloned();
-        let size = ent.as_ref().and_then(|c| c.get("size").and_then(Value::as_i64));
+        let ent = self
+            .visible_changes()
+            .get(self.sel_change)
+            .cloned()
+            .cloned();
+        let size = ent
+            .as_ref()
+            .and_then(|c| c.get("size").and_then(Value::as_i64));
         let row_kind = ent
             .as_ref()
             .and_then(|c| c.get("kind").and_then(Value::as_str))
@@ -2098,9 +2332,15 @@ impl App {
         if let Some(m) = mode {
             meta.push_str(&format!(" · {} {:o}", filemode(m), m & 0o7777));
         }
-        let mut out = vec![("bold".to_string(), format!("/{rel}")), ("dim".to_string(), meta)];
+        let mut out = vec![
+            ("bold".to_string(), format!("/{rel}")),
+            ("dim".to_string(), meta),
+        ];
         if stale {
-            out.push(("stale".to_string(), "⚠ host changed since capture".to_string()));
+            out.push((
+                "stale".to_string(),
+                "⚠ host changed since capture".to_string(),
+            ));
         }
         out
     }
@@ -2123,9 +2363,15 @@ impl App {
         let after = decode(diff.get("content"));
         if let Some(before_v) = diff.get("content_before") {
             let before = decode(Some(before_v));
-            out.push(format!("── before ── binary · {}", fmt_bytes(before.len() as i64)));
+            out.push(format!(
+                "── before ── binary · {}",
+                fmt_bytes(before.len() as i64)
+            ));
             hexdump_into(&before, &mut out);
-            out.push(format!("── after ──  binary · {}", fmt_bytes(after.len() as i64)));
+            out.push(format!(
+                "── after ──  binary · {}",
+                fmt_bytes(after.len() as i64)
+            ));
         } else {
             out.push(format!("binary · {}", fmt_bytes(after.len() as i64)));
         }
@@ -2141,7 +2387,11 @@ impl App {
         self.hunks
             .get("hunks")
             .and_then(Value::as_array)
-            .map(|hs| hs.iter().filter_map(|h| h.get("index").and_then(Value::as_i64)).collect())
+            .map(|hs| {
+                hs.iter()
+                    .filter_map(|h| h.get("index").and_then(Value::as_i64))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -2153,19 +2403,24 @@ impl App {
     /// Apply ONE hunk (review.apply_hunk sid,rel,index): the box already holds
     /// it, so applying it to the host stops it being a difference. Reloads.
     fn apply_hunk(&mut self) {
-        let (Some(sid), Some(rel), Some(ix)) =
-            (self.cur_sid(), self.cur_change_path(), self.cur_hunk_index())
-        else {
+        let (Some(sid), Some(rel), Some(ix)) = (
+            self.cur_sid(),
+            self.cur_change_path(),
+            self.cur_hunk_index(),
+        ) else {
             self.status = "no hunk under cursor".into();
             return;
         };
         match rpc(&self.sock, "review.apply_hunk", json!([sid, rel, ix])) {
-            Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) =>
-                self.status = format!("applied hunk {ix}"),
-            Ok(r) => self.status = format!(
-                "apply_hunk: {}",
-                r.get("error").and_then(Value::as_str).unwrap_or("failed")
-            ),
+            Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) => {
+                self.status = format!("applied hunk {ix}")
+            }
+            Ok(r) => {
+                self.status = format!(
+                    "apply_hunk: {}",
+                    r.get("error").and_then(Value::as_str).unwrap_or("failed")
+                )
+            }
             Err(e) => self.status = format!("apply_hunk: {e}"),
         }
         self.reload_after_hunk();
@@ -2174,19 +2429,24 @@ impl App {
     /// Discard ONE hunk (review.discard_hunk sid,rel,index): revert that hunk in
     /// the box back to the host's bytes. Reloads.
     fn discard_hunk(&mut self) {
-        let (Some(sid), Some(rel), Some(ix)) =
-            (self.cur_sid(), self.cur_change_path(), self.cur_hunk_index())
-        else {
+        let (Some(sid), Some(rel), Some(ix)) = (
+            self.cur_sid(),
+            self.cur_change_path(),
+            self.cur_hunk_index(),
+        ) else {
             self.status = "no hunk under cursor".into();
             return;
         };
         match rpc(&self.sock, "review.discard_hunk", json!([sid, rel, ix])) {
-            Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) =>
-                self.status = format!("discarded hunk {ix}"),
-            Ok(r) => self.status = format!(
-                "discard_hunk: {}",
-                r.get("error").and_then(Value::as_str).unwrap_or("failed")
-            ),
+            Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) => {
+                self.status = format!("discarded hunk {ix}")
+            }
+            Ok(r) => {
+                self.status = format!(
+                    "discard_hunk: {}",
+                    r.get("error").and_then(Value::as_str).unwrap_or("failed")
+                )
+            }
             Err(e) => self.status = format!("discard_hunk: {e}"),
         }
         self.reload_after_hunk();
@@ -2204,11 +2464,9 @@ impl App {
         self.close_changes_view();
         if let Some(sid) = self.cur_sid_i64() {
             let filter = filter_to_json(self.f_changes.active());
-            if let Ok(v) = rpc(&self.sock, "view.open",
-                               json!(["changes", sid, filter])) {
+            if let Ok(v) = rpc(&self.sock, "view.open", json!(["changes", sid, filter])) {
                 self.changes_view = v.get("view_id").and_then(Value::as_u64);
-                self.changes_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.changes_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
             }
         }
         self.fetch_changes_window(0);
@@ -2217,9 +2475,11 @@ impl App {
         // landed there. Cheap O(window_size) — millions of rows are still
         // shielded server-side.
         if let Some(p) = &path {
-            if let Some(i) = self.changes.iter().position(|c| {
-                c.get("path").and_then(Value::as_str) == Some(p.as_str())
-            }) {
+            if let Some(i) = self
+                .changes
+                .iter()
+                .position(|c| c.get("path").and_then(Value::as_str) == Some(p.as_str()))
+            {
                 self.sel_change = i;
             }
         }
@@ -2236,7 +2496,11 @@ impl App {
         let Some(sid) = self.cur_sid() else { return };
         match rpc(&self.sock, "review.apply", json!([sid, Value::Null])) {
             Ok(r) => {
-                let n = r.get("applied").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                let n = r
+                    .get("applied")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
                 self.status = format!("applied all ({n} change(s))");
             }
             Err(e) => self.status = format!("apply_all: {e}"),
@@ -2251,7 +2515,11 @@ impl App {
         let Some(sid) = self.cur_sid() else { return };
         match rpc(&self.sock, "review.discard", json!([sid, Value::Null])) {
             Ok(r) => {
-                let n = r.get("discarded").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                let n = r
+                    .get("discarded")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
                 self.status = format!("discarded all ({n} change(s))");
             }
             Err(e) => self.status = format!("discard_all: {e}"),
@@ -2297,23 +2565,33 @@ impl App {
         self.processes_total = 0;
         self.processes_window_start = 0;
         self.sel_proc = 0;
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         let filter = filter_to_json(self.f_procs.active());
-        match rpc(&self.sock, "view.open", json!(["procs", sid, filter, self.proc_running_only])) {
+        match rpc(
+            &self.sock,
+            "view.open",
+            json!(["procs", sid, filter, self.proc_running_only]),
+        ) {
             Ok(v) => {
                 self.processes_view = v.get("view_id").and_then(Value::as_u64);
-                self.processes_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.processes_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.processes_view_sid = Some(sid);
             }
             Err(e) if e.contains("unknown verb") => {
                 self.status = format!(
                     "engine doesn't speak view.* — kill the stale engine \
                      (the socket {} is being answered by an old process) and \
-                     run sarun again", self.sock);
+                     run sarun again",
+                    self.sock
+                );
                 return;
             }
-            Err(e) => { self.status = format!("view.open procs: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.open procs: {e}");
+                return;
+            }
         }
         self.fetch_processes_window(0);
         self.seek_first_real_proc();
@@ -2339,16 +2617,20 @@ impl App {
         self.pipelines_total = 0;
         self.pipelines_window_start = 0;
         self.sel_pipeline = 0;
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         let filter = filter_to_json(self.f_pipelines.active());
         match rpc(&self.sock, "view.open", json!(["pipelines", sid, filter])) {
             Ok(v) => {
                 self.pipelines_view = v.get("view_id").and_then(Value::as_u64);
-                self.pipelines_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.pipelines_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.pipelines_view_sid = Some(sid);
             }
-            Err(e) => { self.status = format!("view.open pipelines: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.open pipelines: {e}");
+                return;
+            }
         }
         if self.f_pipelines.on {
             self.fetch_pipelines_window(0);
@@ -2368,17 +2650,24 @@ impl App {
     }
 
     fn fetch_pipelines_window(&mut self, start: usize) {
-        let Some(vid) = self.pipelines_view else { return };
+        let Some(vid) = self.pipelines_view else {
+            return;
+        };
         let start = start.min(self.pipelines_total.saturating_sub(1).max(0));
-        match rpc(&self.sock, "view.window",
-                  json!([vid, start, WINDOW_SIZE])) {
+        match rpc(&self.sock, "view.window", json!([vid, start, WINDOW_SIZE])) {
             Ok(v) => {
-                self.pipelines_window_start =
-                    v.get("start").and_then(Value::as_u64).unwrap_or(start as u64) as usize;
+                self.pipelines_window_start = v
+                    .get("start")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(start as u64) as usize;
                 self.pipelines_total =
-                    v.get("total").and_then(Value::as_u64)
+                    v.get("total")
+                        .and_then(Value::as_u64)
                         .unwrap_or(self.pipelines_total as u64) as usize;
-                self.pipelines_flat = v.get("rows").and_then(Value::as_array).cloned()
+                self.pipelines_flat = v
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .cloned()
                     .unwrap_or_default();
             }
             Err(e) => self.status = format!("view.window pipelines: {e}"),
@@ -2393,8 +2682,12 @@ impl App {
     }
 
     fn refresh_pipelines_preserving_cursor(&mut self) {
-        let Some(sid) = self.cur_sid_i64() else { return };
-        let pinned_id = self.pipelines.get(self.sel_pipeline)
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
+        let pinned_id = self
+            .pipelines
+            .get(self.sel_pipeline)
             .and_then(|p| p.get("id").and_then(Value::as_i64));
         let saved_start = self.pipelines_window_start;
         let saved_sel = self.sel_pipeline;
@@ -2403,11 +2696,13 @@ impl App {
         match rpc(&self.sock, "view.open", json!(["pipelines", sid, filter])) {
             Ok(v) => {
                 self.pipelines_view = v.get("view_id").and_then(Value::as_u64);
-                self.pipelines_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.pipelines_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.pipelines_view_sid = Some(sid);
             }
-            Err(e) => { self.status = format!("view.open pipelines: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.open pipelines: {e}");
+                return;
+            }
         }
         let tail_start = if self.f_pipelines.on {
             0
@@ -2416,20 +2711,22 @@ impl App {
         };
         self.fetch_pipelines_window(saved_start.max(tail_start));
         let restored = pinned_id.and_then(|want| {
-            self.pipelines.iter().position(|p|
-                p.get("id").and_then(Value::as_i64) == Some(want))
+            self.pipelines
+                .iter()
+                .position(|p| p.get("id").and_then(Value::as_i64) == Some(want))
         });
-        self.sel_pipeline = restored
-            .unwrap_or_else(|| saved_sel.min(self.pipelines.len().saturating_sub(1)));
+        self.sel_pipeline =
+            restored.unwrap_or_else(|| saved_sel.min(self.pipelines.len().saturating_sub(1)));
     }
 
     fn push_pipelines_filter(&mut self) {
-        let Some(vid) = self.pipelines_view else { return };
+        let Some(vid) = self.pipelines_view else {
+            return;
+        };
         let filter = self.filter_json_for(FilterView::Pipelines);
         match rpc(&self.sock, "view.filter", json!([vid, filter])) {
             Ok(v) => {
-                self.pipelines_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.pipelines_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.pipelines_window_start = 0;
                 self.sel_pipeline = 0;
                 self.fetch_pipelines_window(0);
@@ -2443,9 +2740,11 @@ impl App {
     /// Client-side post-processing on top of the server-filtered window.
     fn rebuild_pipeline_view(&mut self) {
         let src: Vec<Value> = if self.pipe_running_only {
-            self.pipelines_flat.iter()
+            self.pipelines_flat
+                .iter()
                 .filter(|r| r.get("done_ts").and_then(Value::as_f64).unwrap_or(0.0) == 0.0)
-                .cloned().collect()
+                .cloned()
+                .collect()
         } else {
             self.pipelines_flat.clone()
         };
@@ -2464,8 +2763,14 @@ impl App {
     fn toggle_pipeline_tree(&mut self) {
         self.pipe_tree = !self.pipe_tree;
         self.rebuild_pipeline_view();
-        self.status = format!("pipelines: {} view",
-            if self.pipe_tree { "tree" } else { "flat chronological" });
+        self.status = format!(
+            "pipelines: {} view",
+            if self.pipe_tree {
+                "tree"
+            } else {
+                "flat chronological"
+            }
+        );
     }
 
     /// `f`: toggle showing only in-flight (running) pipelines — done_ts==0.
@@ -2487,16 +2792,20 @@ impl App {
         self.edges_total = 0;
         self.edges_window_start = 0;
         self.sel_edge = 0;
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         let filter = filter_to_json(self.f_edges.active());
         match rpc(&self.sock, "view.open", json!(["build_edges", sid, filter])) {
             Ok(v) => {
                 self.edges_view = v.get("view_id").and_then(Value::as_u64);
-                self.edges_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.edges_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.edges_view_sid = Some(sid);
             }
-            Err(e) => { self.status = format!("view.open build_edges: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.open build_edges: {e}");
+                return;
+            }
         }
         if self.f_edges.on {
             self.fetch_edges_window(0);
@@ -2518,15 +2827,20 @@ impl App {
     fn fetch_edges_window(&mut self, start: usize) {
         let Some(vid) = self.edges_view else { return };
         let start = start.min(self.edges_total.saturating_sub(1).max(0));
-        match rpc(&self.sock, "view.window",
-                  json!([vid, start, WINDOW_SIZE])) {
+        match rpc(&self.sock, "view.window", json!([vid, start, WINDOW_SIZE])) {
             Ok(v) => {
-                self.edges_window_start =
-                    v.get("start").and_then(Value::as_u64).unwrap_or(start as u64) as usize;
-                self.edges_total =
-                    v.get("total").and_then(Value::as_u64)
-                        .unwrap_or(self.edges_total as u64) as usize;
-                self.build_edges_flat = v.get("rows").and_then(Value::as_array).cloned()
+                self.edges_window_start = v
+                    .get("start")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(start as u64) as usize;
+                self.edges_total = v
+                    .get("total")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(self.edges_total as u64) as usize;
+                self.build_edges_flat = v
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .cloned()
                     .unwrap_or_default();
             }
             Err(e) => self.status = format!("view.window build_edges: {e}"),
@@ -2545,8 +2859,7 @@ impl App {
         let filter = self.filter_json_for(FilterView::BuildEdges);
         match rpc(&self.sock, "view.filter", json!([vid, filter])) {
             Ok(v) => {
-                self.edges_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.edges_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.edges_window_start = 0;
                 self.sel_edge = 0;
                 self.fetch_edges_window(0);
@@ -2562,9 +2875,11 @@ impl App {
     fn rebuild_edge_view(&mut self) {
         let filter = self.edges_running_only && self.cur_session_live();
         self.build_edges = if filter {
-            self.build_edges_flat.iter()
+            self.build_edges_flat
+                .iter()
                 .filter(|r| edge_running(r))
-                .cloned().collect()
+                .cloned()
+                .collect()
         } else {
             self.build_edges_flat.clone()
         };
@@ -2578,17 +2893,21 @@ impl App {
     /// running build as recipes start and finish. `rebuild_edge_view` clamps the
     /// selection into the (possibly shrunk) filtered set.
     fn refresh_build_edges_preserving_cursor(&mut self) {
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         self.close_edges_view();
         let filter = filter_to_json(self.f_edges.active());
         match rpc(&self.sock, "view.open", json!(["build_edges", sid, filter])) {
             Ok(v) => {
                 self.edges_view = v.get("view_id").and_then(Value::as_u64);
-                self.edges_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.edges_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.edges_view_sid = Some(sid);
             }
-            Err(e) => { self.status = format!("view.open build_edges: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.open build_edges: {e}");
+                return;
+            }
         }
         let start = self.edges_window_start;
         self.fetch_edges_window(start);
@@ -2630,17 +2949,24 @@ impl App {
     /// already flattened (each row has rid/tgid/ppid/exe/argv/depth/
     /// connector — same shape as the old ProcTreeRow).
     fn fetch_processes_window(&mut self, start: usize) {
-        let Some(vid) = self.processes_view else { return };
+        let Some(vid) = self.processes_view else {
+            return;
+        };
         let start = start.min(self.processes_total.saturating_sub(1).max(0));
-        match rpc(&self.sock, "view.window",
-                  json!([vid, start, WINDOW_SIZE])) {
+        match rpc(&self.sock, "view.window", json!([vid, start, WINDOW_SIZE])) {
             Ok(v) => {
-                self.processes_window_start =
-                    v.get("start").and_then(Value::as_u64).unwrap_or(start as u64) as usize;
+                self.processes_window_start = v
+                    .get("start")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(start as u64) as usize;
                 self.processes_total =
-                    v.get("total").and_then(Value::as_u64)
+                    v.get("total")
+                        .and_then(Value::as_u64)
                         .unwrap_or(self.processes_total as u64) as usize;
-                self.processes = v.get("rows").and_then(Value::as_array).cloned()
+                self.processes = v
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .cloned()
                     .unwrap_or_default();
             }
             Err(e) => self.status = format!("view.window procs: {e}"),
@@ -2656,12 +2982,13 @@ impl App {
     /// Push the local f_procs filter to the engine view, then refetch from
     /// the top. Same shape as push_changes_filter.
     fn push_procs_filter(&mut self) {
-        let Some(vid) = self.processes_view else { return };
+        let Some(vid) = self.processes_view else {
+            return;
+        };
         let filter = filter_to_json(self.f_procs.active());
         match rpc(&self.sock, "view.filter", json!([vid, filter])) {
             Ok(v) => {
-                self.processes_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.processes_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.processes_window_start = 0;
                 self.sel_proc = 0;
                 self.fetch_processes_window(0);
@@ -2676,7 +3003,9 @@ impl App {
     /// inside a filtered view never appear (the engine excludes them),
     /// so the skip loop only matters in the unfiltered tree.
     fn move_proc_cursor(&mut self, delta: isize) {
-        if self.processes_total == 0 { return; }
+        if self.processes_total == 0 {
+            return;
+        }
         let step: isize = if delta > 0 { 1 } else { -1 };
         // global cursor position within the engine view's idx
         let mut global = self.processes_window_start + self.sel_proc;
@@ -2690,14 +3019,19 @@ impl App {
             let win_end = self.processes_window_start + self.processes.len();
             if global < self.processes_window_start || global >= win_end {
                 let quarter = WINDOW_SIZE / 4;
-                let new_start = global.saturating_sub(
-                    if step > 0 { quarter } else { WINDOW_SIZE - quarter });
+                let new_start = global.saturating_sub(if step > 0 {
+                    quarter
+                } else {
+                    WINDOW_SIZE - quarter
+                });
                 self.fetch_processes_window(new_start);
             }
             // skip connectors (unfiltered view shows them, but the cursor
             // doesn't land on them — they're structural-ancestor dim rows)
             let off = global.saturating_sub(self.processes_window_start);
-            let is_connector = self.processes.get(off)
+            let is_connector = self
+                .processes
+                .get(off)
                 .and_then(|r| r.get("connector").and_then(Value::as_bool))
                 .unwrap_or(false);
             if !is_connector {
@@ -2709,7 +3043,9 @@ impl App {
     }
 
     fn move_pipeline_cursor(&mut self, delta: isize) {
-        if self.pipelines_total == 0 { return; }
+        if self.pipelines_total == 0 {
+            return;
+        }
         let step: isize = if delta > 0 { 1 } else { -1 };
         let mut global = self.pipelines_window_start + self.sel_pipeline;
         let new_global = global as isize + step;
@@ -2720,15 +3056,20 @@ impl App {
         let win_end = self.pipelines_window_start + self.pipelines.len();
         if global < self.pipelines_window_start || global >= win_end {
             let quarter = WINDOW_SIZE / 4;
-            let new_start = global.saturating_sub(
-                if step > 0 { quarter } else { WINDOW_SIZE - quarter });
+            let new_start = global.saturating_sub(if step > 0 {
+                quarter
+            } else {
+                WINDOW_SIZE - quarter
+            });
             self.fetch_pipelines_window(new_start);
         }
         self.sel_pipeline = global.saturating_sub(self.pipelines_window_start);
     }
 
     fn move_edge_cursor(&mut self, delta: isize) {
-        if self.edges_total == 0 { return; }
+        if self.edges_total == 0 {
+            return;
+        }
         let step: isize = if delta > 0 { 1 } else { -1 };
         let mut global = self.edges_window_start + self.sel_edge;
         let new_global = global as isize + step;
@@ -2739,8 +3080,11 @@ impl App {
         let win_end = self.edges_window_start + self.build_edges.len();
         if global < self.edges_window_start || global >= win_end {
             let quarter = WINDOW_SIZE / 4;
-            let new_start = global.saturating_sub(
-                if step > 0 { quarter } else { WINDOW_SIZE - quarter });
+            let new_start = global.saturating_sub(if step > 0 {
+                quarter
+            } else {
+                WINDOW_SIZE - quarter
+            });
             self.fetch_edges_window(new_start);
         }
         self.sel_edge = global.saturating_sub(self.edges_window_start);
@@ -2749,17 +3093,23 @@ impl App {
     fn page_pipeline_cursor(&mut self, delta: isize) {
         let n = delta.unsigned_abs();
         let step: isize = if delta > 0 { 1 } else { -1 };
-        for _ in 0..n { self.move_pipeline_cursor(step); }
+        for _ in 0..n {
+            self.move_pipeline_cursor(step);
+        }
     }
 
     fn page_edge_cursor(&mut self, delta: isize) {
         let n = delta.unsigned_abs();
         let step: isize = if delta > 0 { 1 } else { -1 };
-        for _ in 0..n { self.move_edge_cursor(step); }
+        for _ in 0..n {
+            self.move_edge_cursor(step);
+        }
     }
 
     fn move_output_cursor(&mut self, delta: isize) {
-        if self.outputs_total == 0 { return; }
+        if self.outputs_total == 0 {
+            return;
+        }
         let step: isize = if delta > 0 { 1 } else { -1 };
         let global = self.outputs_window_start + self.sel_output;
         let new_global = global as isize + step;
@@ -2770,8 +3120,11 @@ impl App {
         let win_end = self.outputs_window_start + self.outputs.len();
         if global < self.outputs_window_start || global >= win_end {
             let quarter = WINDOW_SIZE / 4;
-            let new_start = global.saturating_sub(
-                if step > 0 { quarter } else { WINDOW_SIZE - quarter });
+            let new_start = global.saturating_sub(if step > 0 {
+                quarter
+            } else {
+                WINDOW_SIZE - quarter
+            });
             self.fetch_outputs_window(new_start);
         }
         self.sel_output = global.saturating_sub(self.outputs_window_start);
@@ -2780,7 +3133,9 @@ impl App {
     fn page_output_cursor(&mut self, delta: isize) {
         let n = delta.unsigned_abs();
         let step: isize = if delta > 0 { 1 } else { -1 };
-        for _ in 0..n { self.move_output_cursor(step); }
+        for _ in 0..n {
+            self.move_output_cursor(step);
+        }
     }
 
     /// Load the captured flows for the selected box: one RPC, full list
@@ -2793,7 +3148,9 @@ impl App {
         self.flow_detail.clear();
         self.flow_detail_frame = 0;
         self.right_scroll = 0;
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         match rpc(&self.sock, "flows.list", json!([sid.to_string()])) {
             Ok(v) => {
                 if v.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -2804,7 +3161,9 @@ impl App {
                     self.status = format!("flows.list: {e}");
                 }
             }
-            Err(e) => { self.status = format!("flows.list: {e}"); }
+            Err(e) => {
+                self.status = format!("flows.list: {e}");
+            }
         }
         self.load_flow_detail();
     }
@@ -2829,8 +3188,12 @@ impl App {
     /// queue and the next tick's refresh_prompt picks up whatever's
     /// behind it (or None).
     fn answer_prompt(&mut self, verdict: &'static str) {
-        let Some(p) = self.pending_prompt.clone() else { return };
-        let Some(id) = p.get("id").and_then(Value::as_u64) else { return };
+        let Some(p) = self.pending_prompt.clone() else {
+            return;
+        };
+        let Some(id) = p.get("id").and_then(Value::as_u64) else {
+            return;
+        };
         let _ = rpc(&self.sock, "prompts.answer", json!([id, verdict]));
         self.pending_prompt = None;
         // Eager refresh so the banner doesn't flicker between answer and
@@ -2838,10 +3201,10 @@ impl App {
         self.refresh_prompt();
         let host = p.get("host").and_then(Value::as_str).unwrap_or("");
         self.status = match verdict {
-            "yes_once"  => format!("allow this once: {host}"),
-            "no_once"   => format!("deny this once: {host}"),
+            "yes_once" => format!("allow this once: {host}"),
+            "no_once" => format!("deny this once: {host}"),
             "allow_save" => format!("ALLOW + saved: apply host:{host}"),
-            "deny_save"  => format!("DENY + saved: discard host:{host}"),
+            "deny_save" => format!("DENY + saved: discard host:{host}"),
             _ => String::new(),
         };
     }
@@ -2850,8 +3213,12 @@ impl App {
     /// list. Open by `Enter` on the flows pane. Idempotent: re-entering
     /// with the same stream id replays the cached state.
     fn open_packets(&mut self) {
-        let Some(sid) = self.cur_sid_i64() else { return };
-        let Some(row) = self.flows.get(self.sel_flow) else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
+        let Some(row) = self.flows.get(self.sel_flow) else {
+            return;
+        };
         let stream = row.get("stream").and_then(Value::as_i64).unwrap_or(-1);
         if stream < 0 {
             self.status = "no tcp.stream for that flow".into();
@@ -2863,16 +3230,21 @@ impl App {
         self.packet_detail_frame = 0;
         self.packets_stream = stream;
         self.right_scroll = 0;
-        match rpc(&self.sock, "flows.packets",
-                  json!([sid.to_string(), stream])) {
+        match rpc(
+            &self.sock,
+            "flows.packets",
+            json!([sid.to_string(), stream]),
+        ) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
                 if let Some(arr) = v.get("packets").and_then(Value::as_array) {
                     self.packets = arr.clone();
                 }
             }
             Ok(v) => {
-                self.status = format!("flows.packets: {}",
-                    v.get("error").and_then(Value::as_str).unwrap_or("?"));
+                self.status = format!(
+                    "flows.packets: {}",
+                    v.get("error").and_then(Value::as_str).unwrap_or("?")
+                );
             }
             Err(e) => self.status = format!("flows.packets: {e}"),
         }
@@ -2881,9 +3253,11 @@ impl App {
         // not packet #1 of the connection).
         let want = row.get("frame").and_then(Value::as_u64).unwrap_or(0);
         if want > 0 {
-            if let Some(pos) = self.packets.iter().position(|r| {
-                r.get("frame").and_then(Value::as_u64) == Some(want)
-            }) {
+            if let Some(pos) = self
+                .packets
+                .iter()
+                .position(|r| r.get("frame").and_then(Value::as_u64) == Some(want))
+            {
                 self.sel_packet = pos;
             }
         }
@@ -2894,25 +3268,37 @@ impl App {
     /// Lazy-load tshark -V for the cursored packet (same engine verb as
     /// the flows pane; one frame is one frame).
     fn load_packet_detail(&mut self) {
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         let Some(row) = self.packets.get(self.sel_packet) else {
-            self.packet_detail.clear(); self.packet_detail_frame = 0; return;
+            self.packet_detail.clear();
+            self.packet_detail_frame = 0;
+            return;
         };
         let frame = row.get("frame").and_then(Value::as_u64).unwrap_or(0);
-        if frame == 0 { self.packet_detail.clear(); return; }
+        if frame == 0 {
+            self.packet_detail.clear();
+            return;
+        }
         if frame == self.packet_detail_frame && !self.packet_detail.is_empty() {
             return;
         }
         self.packet_detail_frame = frame;
-        match rpc(&self.sock, "flows.detail",
-                  json!([sid.to_string(), frame])) {
+        match rpc(&self.sock, "flows.detail", json!([sid.to_string(), frame])) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
-                self.packet_detail = v.get("text").and_then(Value::as_str)
-                    .unwrap_or("").to_string();
+                self.packet_detail = v
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
             }
-            Ok(v) => self.packet_detail = format!(
-                "tshark error: {}",
-                v.get("error").and_then(Value::as_str).unwrap_or("?")),
+            Ok(v) => {
+                self.packet_detail = format!(
+                    "tshark error: {}",
+                    v.get("error").and_then(Value::as_str).unwrap_or("?")
+                )
+            }
             Err(e) => self.packet_detail = format!("rpc error: {e}"),
         }
     }
@@ -2927,26 +3313,36 @@ impl App {
     /// Lazy-load tshark `-V` for the selected flow's frame. Cached
     /// until the cursor moves to a different frame.
     fn load_flow_detail(&mut self) {
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         let Some(row) = self.flows.get(self.sel_flow) else {
-            self.flow_detail.clear(); self.flow_detail_frame = 0; return;
+            self.flow_detail.clear();
+            self.flow_detail_frame = 0;
+            return;
         };
         let frame = row.get("frame").and_then(Value::as_u64).unwrap_or(0);
-        if frame == 0 { self.flow_detail.clear(); return; }
+        if frame == 0 {
+            self.flow_detail.clear();
+            return;
+        }
         if frame == self.flow_detail_frame && !self.flow_detail.is_empty() {
             return;
         }
         self.flow_detail_frame = frame;
-        match rpc(&self.sock, "flows.detail",
-                  json!([sid.to_string(), frame])) {
+        match rpc(&self.sock, "flows.detail", json!([sid.to_string(), frame])) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
-                self.flow_detail = v.get("text").and_then(Value::as_str)
-                    .unwrap_or("").to_string();
+                self.flow_detail = v
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
             }
             Ok(v) => {
                 self.flow_detail = format!(
                     "tshark error: {}",
-                    v.get("error").and_then(Value::as_str).unwrap_or("?"));
+                    v.get("error").and_then(Value::as_str).unwrap_or("?")
+                );
             }
             Err(e) => self.flow_detail = format!("rpc error: {e}"),
         }
@@ -2963,23 +3359,29 @@ impl App {
         self.outputs_window_start = 0;
         self.sel_output = 0;
         self.out_scroll = 0;
-        let Some(sid) = self.cur_sid_i64() else { return };
+        let Some(sid) = self.cur_sid_i64() else {
+            return;
+        };
         let filter = filter_to_json(self.f_outputs.active());
         match rpc(&self.sock, "view.open", json!(["outputs", sid, filter])) {
             Ok(v) => {
                 self.outputs_view = v.get("view_id").and_then(Value::as_u64);
-                self.outputs_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.outputs_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.outputs_view_sid = Some(sid);
             }
             Err(e) if e.contains("unknown verb") => {
                 self.status = format!(
                     "engine doesn't speak view.* — kill the stale engine \
                      (the socket {} is being answered by an old process) and \
-                     run sarun again", self.sock);
+                     run sarun again",
+                    self.sock
+                );
                 return;
             }
-            Err(e) => { self.status = format!("view.open outputs: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.open outputs: {e}");
+                return;
+            }
         }
         self.fetch_outputs_window(0);
     }
@@ -2991,9 +3393,11 @@ impl App {
     /// the empty state so "how do I get an endpoint?" answers itself).
     fn refresh_api_endpoint_note(&mut self) {
         let cfg = crate::oaita::config::Config::load();
-        self.api_endpoint_note =
-            endpoint_note_lines(cfg.resolve().ok()
-                .map(|(model, base_url, _)| (model, base_url)));
+        self.api_endpoint_note = endpoint_note_lines(
+            cfg.resolve()
+                .ok()
+                .map(|(model, base_url, _)| (model, base_url)),
+        );
     }
 
     /// The FIRST time the Api pane is shown with nothing wired up — no
@@ -3002,7 +3406,9 @@ impl App {
     /// instead of leaving the user to guess the 'm' menu / magic argv. One-shot: a
     /// dismissal is respected (see `model_picker_offered`).
     fn maybe_offer_model_picker(&mut self) {
-        if self.model_picker_offered || self.modal.is_some() { return; }
+        if self.model_picker_offered || self.modal.is_some() {
+            return;
+        }
         let none = matches!(rpc(&self.sock, "oaita.status", json!([])),
             Ok(v) if v.get("kind").and_then(Value::as_str) == Some("none"));
         if none {
@@ -3023,7 +3429,9 @@ impl App {
             Err(e) if e.contains("unknown verb") => {
                 self.status = "engine doesn't speak api_log — old engine?".into();
             }
-            Err(e) => { self.status = format!("api_log: {e}"); }
+            Err(e) => {
+                self.status = format!("api_log: {e}");
+            }
         }
     }
 
@@ -3052,7 +3460,9 @@ impl App {
             Err(e) if e.contains("unknown verb") => {
                 self.status = "engine doesn't speak webcap — old engine?".into();
             }
-            Err(e) => { self.status = format!("webcap: {e}"); }
+            Err(e) => {
+                self.status = format!("webcap: {e}");
+            }
         }
     }
 
@@ -3072,8 +3482,11 @@ impl App {
         let Some(sid) = self.cur_sid() else { return };
         match sudtrace_rpc(&self.sock, &sid) {
             Ok(rep) => {
-                self.trace_rows = rep.get("events")
-                    .and_then(Value::as_array).cloned().unwrap_or_default();
+                self.trace_rows = rep
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 self.trace_loaded_sid = Some(sid);
                 if self.sel_trace >= self.trace_rows.len() {
                     self.sel_trace = self.trace_rows.len().saturating_sub(1);
@@ -3121,18 +3534,26 @@ impl App {
     fn fetch_outputs_window(&mut self, start: usize) {
         let Some(vid) = self.outputs_view else { return };
         let start = start.min(self.outputs_total.saturating_sub(1).max(0));
-        match rpc(&self.sock, "view.window",
-                  json!([vid, start, WINDOW_SIZE])) {
+        match rpc(&self.sock, "view.window", json!([vid, start, WINDOW_SIZE])) {
             Ok(v) => {
-                self.outputs_window_start =
-                    v.get("start").and_then(Value::as_u64).unwrap_or(start as u64) as usize;
+                self.outputs_window_start = v
+                    .get("start")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(start as u64) as usize;
                 self.outputs_total =
-                    v.get("total").and_then(Value::as_u64)
+                    v.get("total")
+                        .and_then(Value::as_u64)
                         .unwrap_or(self.outputs_total as u64) as usize;
-                self.outputs = v.get("rows").and_then(Value::as_array).cloned()
+                self.outputs = v
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .cloned()
                     .unwrap_or_default();
             }
-            Err(e) => { self.status = format!("view.window outputs: {e}"); return; }
+            Err(e) => {
+                self.status = format!("view.window outputs: {e}");
+                return;
+            }
         }
         // Decode each window-row's captured bytes into a segment kept under
         // its origin (oid, stream). outputs_lines uses these to draw a
@@ -3145,7 +3566,9 @@ impl App {
             let oid = o.get("id").and_then(Value::as_i64).unwrap_or(-1);
             let stream = o.get("stream").and_then(Value::as_i64).unwrap_or(0);
             let text = match rpc(&self.sock, "output_detail", json!([sid, oid])) {
-                Ok(d) => d.get("content").and_then(|c| c.get("__b"))
+                Ok(d) => d
+                    .get("content")
+                    .and_then(|c| c.get("__b"))
                     .and_then(Value::as_str)
                     .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -3165,7 +3588,10 @@ impl App {
     /// Push the local f_outputs filter to the engine view, then refetch.
     /// True for the views where an errors-only lens is meaningful.
     fn err_capable(v: FilterView) -> bool {
-        matches!(v, FilterView::Outputs | FilterView::Pipelines | FilterView::BuildEdges)
+        matches!(
+            v,
+            FilterView::Outputs | FilterView::Pipelines | FilterView::BuildEdges
+        )
     }
 
     /// The wire filter for view `v`: the user's '/' clauses, plus a synthetic
@@ -3175,7 +3601,10 @@ impl App {
         if !(self.err_only && Self::err_capable(v)) {
             return base;
         }
-        let mut arr = match base { Value::Array(a) => a, _ => vec![] };
+        let mut arr = match base {
+            Value::Array(a) => a,
+            _ => vec![],
+        };
         arr.push(json!({"kind": "err", "pattern": "1", "join": "and",
                         "negate": false, "enabled": true}));
         Value::Array(arr)
@@ -3206,8 +3635,7 @@ impl App {
         let filter = self.filter_json_for(FilterView::Outputs);
         match rpc(&self.sock, "view.filter", json!([vid, filter])) {
             Ok(v) => {
-                self.outputs_total =
-                    v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.outputs_total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.outputs_window_start = 0;
                 self.sel_output = 0;
                 self.fetch_outputs_window(0);
@@ -3269,8 +3697,11 @@ impl App {
     fn mirror_verb(&self, verb: &str, args: Value) -> Result<Value, String> {
         let v = rpc(&self.sock, verb, args)?;
         if v.get("ok").and_then(Value::as_bool) == Some(false) {
-            return Err(v.get("error").and_then(Value::as_str)
-                .unwrap_or("failed").to_string());
+            return Err(v
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("failed")
+                .to_string());
         }
         Ok(v)
     }
@@ -3282,10 +3713,9 @@ impl App {
     /// combined process takes the same socket path (one code path). Clamps
     /// the cursor so a shrunken list never leaves it past the end.
     fn load_mirrors(&mut self) {
-        match rpc(&self.sock, "mirror_jobs", json!([]))
-            .and_then(|v| serde_json::from_value::<Vec<crate::mirrors::Job>>(v)
-                .map_err(|e| e.to_string()))
-        {
+        match rpc(&self.sock, "mirror_jobs", json!([])).and_then(|v| {
+            serde_json::from_value::<Vec<crate::mirrors::Job>>(v).map_err(|e| e.to_string())
+        }) {
             Ok(jobs) => {
                 self.mirror_jobs = jobs;
                 if self.sel_mirror >= self.mirror_jobs.len() {
@@ -3301,7 +3731,9 @@ impl App {
     /// Verb, not crate call: the run must be the ENGINE's child, or it
     /// dies with the attach UI and the engine never sees it.
     fn mirror_run_selected(&mut self) {
-        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else { return };
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
+            return;
+        };
         let id = job.id;
         self.status = match self.mirror_verb("mirror_run", json!([id])) {
             Ok(_) => format!("mirror #{id}: run started"),
@@ -3317,16 +3749,23 @@ impl App {
     /// boxed browser can reach the host-side server. Plain HTTP to
     /// localhost, so no MITM SPKI is needed (unlike the replay path).
     fn mirror_browse_selected(&mut self) {
-        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else { return };
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
+            return;
+        };
         if job.kind != "wiki" {
             self.status = format!(
-                "mirror #{}: browse is for wiki mirrors (this is {})", job.id, job.kind);
+                "mirror #{}: browse is for wiki mirrors (this is {})",
+                job.id, job.kind
+            );
             return;
         }
         let (id, root) = (job.id, job.dest.clone());
         let url = match wiki_serve::ensure(&self_exe(), &root) {
             Ok(u) => u,
-            Err(e) => { self.status = format!("wiki #{id}: {e}"); return; }
+            Err(e) => {
+                self.status = format!("wiki #{id}: {e}");
+                return;
+            }
         };
         let how = How {
             net: "host".into(),
@@ -3337,7 +3776,12 @@ impl App {
             replay: None,
         };
         let argv = build_launch(
-            &LaunchTarget::Browser { url: url.clone(), spki: None }, &how);
+            &LaunchTarget::Browser {
+                url: url.clone(),
+                spki: None,
+            },
+            &how,
+        );
         self.open_pty(argv);
         self.status = format!("wiki #{id}: browsing {url}");
     }
@@ -3346,10 +3790,16 @@ impl App {
     fn mirror_run_pending(&mut self) {
         self.status = match self.mirror_verb("mirror_run_pending", json!([])) {
             Ok(v) => {
-                let n = v.get("started").and_then(Value::as_array)
-                    .map(Vec::len).unwrap_or(0);
-                if n == 0 { "mirrors: nothing pending".into() }
-                else { format!("mirrors: started {n} job(s)") }
+                let n = v
+                    .get("started")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                if n == 0 {
+                    "mirrors: nothing pending".into()
+                } else {
+                    format!("mirrors: started {n} job(s)")
+                }
             }
             Err(e) => format!("mirrors: {e}"),
         };
@@ -3358,11 +3808,12 @@ impl App {
 
     /// Space on Mirrors: pause ⇄ resume the selected job.
     fn mirror_toggle_pause(&mut self) {
-        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else { return };
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
+            return;
+        };
         let (id, want) = (job.id, !job.paused);
         self.status = match self.mirror_verb("mirror_pause", json!([id, want])) {
-            Ok(_) => format!("mirror #{id}: {}",
-                              if want { "paused" } else { "resumed" }),
+            Ok(_) => format!("mirror #{id}: {}", if want { "paused" } else { "resumed" }),
             Err(e) => format!("mirror #{id}: {e}"),
         };
         self.load_mirrors();
@@ -3383,8 +3834,10 @@ impl App {
             String::new()
         };
         self.modal = Some(Modal::Confirm {
-            prompt: format!("Delete mirror job #{} ({} {} → {})?{tail}",
-                            job.id, job.kind, job.src, job.dest),
+            prompt: format!(
+                "Delete mirror job #{} ({} {} → {})?{tail}",
+                job.id, job.kind, job.src, job.dest
+            ),
             action: ConfirmAction::MirrorRemove(job.id),
         });
     }
@@ -3416,7 +3869,8 @@ impl App {
             self.focus = Pane::Reader;
         }
         self.status = format!(
-            "reading {label} · Tab/Enter links · n/p headings · / search · z zoom · Esc back");
+            "reading {label} · Tab/Enter links · n/p headings · / search · z zoom · Esc back"
+        );
     }
 
     /// Enter on the ReaderOpen prompt: open a host path in the reader.
@@ -3448,7 +3902,8 @@ impl App {
             _ => {
                 self.status = format!(
                     "mirror #{}: reader supports wiki and ietf (this is {})",
-                    job.id, job.kind);
+                    job.id, job.kind
+                );
                 return;
             }
         };
@@ -3469,9 +3924,11 @@ impl App {
         };
         let raw = match rpc(&self.sock, "review.file_bytes", json!([sid, rel])) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
-                match v.get("b64").and_then(Value::as_str).map(|b| {
-                    base64::engine::general_purpose::STANDARD.decode(b)
-                }) {
+                match v
+                    .get("b64")
+                    .and_then(Value::as_str)
+                    .map(|b| base64::engine::general_purpose::STANDARD.decode(b))
+                {
                     Some(Ok(bytes)) => bytes,
                     _ => {
                         self.status = format!("read {rel}: bad payload");
@@ -3482,7 +3939,8 @@ impl App {
             Ok(v) => {
                 self.status = format!(
                     "read {rel}: {}",
-                    v.get("error").and_then(Value::as_str).unwrap_or("failed"));
+                    v.get("error").and_then(Value::as_str).unwrap_or("failed")
+                );
                 return;
             }
             Err(e) => {
@@ -3498,66 +3956,101 @@ impl App {
 
     // ── command prompt ──
 
-    /// `:` opens the command prompt. Tab completes from the action registry.
+    /// `:` opens the command prompt with owned structured suggestions.
     fn open_command_prompt(&mut self) {
+        let completions = command_completions(self, "", 0);
         self.modal = Some(Modal::Command {
             buf: String::new(),
-            completions: crate::parser::fuzzy_complete(""),
+            completions,
             sel: 0,
         });
     }
 
-    /// Dispatch a command typed in the `:` prompt. The input can be:
-    ///   - A verb name: `mirror_run 5` → verb `mirror_run` with args `["5"]`
-    ///   - A CLI-style path: `mirror run 5` → looked up via cli_map()
-    ///   - A bare verb with no args: `mirror_jobs`
-    /// Args after the verb are whitespace-split. Integer args become JSON
-    /// numbers; everything else stays a string. The result is sent over
-    /// the control socket as `{"type":"ui","verb":"<name>","args":[...]}`.
     fn dispatch_command(&mut self, input: &str) {
-        let input = input.trim();
-        if input.is_empty() {
-            self.status = "command: empty".into();
-            return;
-        }
-
-        // Use the parser to split into verb + args.
-        // Handles both "mirror_run 5" and "mirror run 5".
-        let (verb, str_args) = crate::parser::parse_command(input);
-        if verb.is_empty() {
-            self.status = "command: could not parse".into();
-            return;
-        }
-
-        let args: Vec<Value> = str_args.iter().map(|s| {
-            if let Ok(n) = s.parse::<i64>() {
-                Value::Number(n.into())
-            } else if s == "true" || s == "false" {
-                Value::Bool(s.parse::<bool>().unwrap())
-            } else {
-                Value::String(s.clone())
+        let invocation = match crate::parser::parse(input.trim()) {
+            crate::parser::ParseResult::Invocation(invocation) => invocation,
+            crate::parser::ParseResult::Empty => {
+                self.status = "command: empty".into();
+                return;
             }
-        }).collect();
-
-        match rpc(&self.sock, &verb, Value::Array(args)) {
-            Ok(v) => {
-                if v.get("ok").and_then(Value::as_bool) == Some(false) {
-                    self.status = format!("command: {}",
-                        v.get("error").and_then(Value::as_str).unwrap_or("failed"));
-                } else {
-                    // Success — show a brief summary
-                    let summary = if let Some(obj) = v.get("r").and_then(Value::as_object) {
-                        format!("{}: {} keys", verb, obj.len())
-                    } else if let Some(arr) = v.get("r").and_then(Value::as_array) {
-                        format!("{}: {} items", verb, arr.len())
-                    } else {
-                        format!("{}: ok", verb)
-                    };
-                    self.status = summary;
+            crate::parser::ParseResult::Unknown(command) => {
+                self.status = format!("command: unknown action {command:?}");
+                return;
+            }
+            crate::parser::ParseResult::InvalidArguments(command) => {
+                self.status = format!("command: invalid arguments for {command:?}");
+                return;
+            }
+            crate::parser::ParseResult::BackendError(error) => {
+                self.status = format!("command parser: {error}");
+                return;
+            }
+        };
+        let name = invocation.dispatch_name();
+        match command_target(&invocation) {
+            crate::registry::ActionTarget::UiVerb => {
+                let args = invocation.json_args();
+                self.status = match rpc(&self.sock, name, args) {
+                    Ok(Value::Array(rows)) => format!("{name}: {} items", rows.len()),
+                    Ok(Value::Object(fields)) => format!("{name}: {} keys", fields.len()),
+                    Ok(_) => format!("{name}: ok"),
+                    Err(error) => format!("command: {error}"),
+                };
+            }
+            crate::registry::ActionTarget::ControlMessage => {
+                self.status = match control_message_rpc(&self.sock, &invocation) {
+                    Ok(_) => format!("{name}: ok"),
+                    Err(error) => format!("command: {error}"),
+                };
+                self.refresh_sessions();
+                self.load_changes();
+            }
+            crate::registry::ActionTarget::LocalUi => {
+                if !invocation.args.is_empty() {
+                    self.status = format!(
+                        "command: local action {} takes no arguments",
+                        invocation.action.verb
+                    );
+                } else if let Err(reason) = self.dispatch_local_command(invocation.action.verb) {
+                    self.status = format!("command: {reason}");
                 }
             }
-            Err(e) => self.status = format!("command: {e}"),
         }
+    }
+
+    fn dispatch_local_command(&mut self, verb: &str) -> Result<(), String> {
+        let action = match verb {
+            "quit" => PaneAction::Quit,
+            "detach" => PaneAction::Detach,
+            "refresh" => PaneAction::Refresh,
+            "filter" => PaneAction::ToggleFilter,
+            "action_menu" => PaneAction::ActionMenu,
+            "toggle_mark" => PaneAction::ToggleMark,
+            "mirror_browse" => PaneAction::MirrorBrowse,
+            "mirror_read" => PaneAction::MirrorRead,
+            "change_read" => PaneAction::ChangeRead,
+            "change_edit" => PaneAction::ChangeEdit,
+            "rule_new" => PaneAction::NewRule,
+            "rule_delete" => PaneAction::DeleteRule,
+            "rule_edit" => {
+                if self.focus != Pane::Rules {
+                    return Err("rule_edit requires the Rules pane".into());
+                }
+                let current = self
+                    .rules
+                    .get(self.sel_rule)
+                    .cloned()
+                    .ok_or("rule_edit requires a selected rule")?;
+                self.modal = Some(Modal::RuleForm {
+                    buf: current,
+                    editing: Some(self.sel_rule),
+                });
+                return Ok(());
+            }
+            other => return Err(format!("unsupported local action: {other}")),
+        };
+        run_pane_action(self, action);
+        Ok(())
     }
 
     // ── text editor ──
@@ -3566,7 +4059,13 @@ impl App {
     /// DIRTY open buffer refuses to be replaced — Ctrl-S first (silently
     /// dropping unsaved edits is the one thing an editor must never do).
     fn editor_mount(&mut self, e: crate::editor::EditorPane) {
-        if self.editor.borrow().as_ref().map(|c| c.dirty).unwrap_or(false) {
+        if self
+            .editor
+            .borrow()
+            .as_ref()
+            .map(|c| c.dirty)
+            .unwrap_or(false)
+        {
             self.status =
                 "editor has UNSAVED changes — Ctrl-S to save them before opening another file"
                     .into();
@@ -3579,8 +4078,8 @@ impl App {
             self.snap_left();
             self.focus = Pane::Editor;
         }
-        self.status = format!(
-            "editing {label} · vim keys · Ctrl-S save · Ctrl-E lock · z zoom · Esc back");
+        self.status =
+            format!("editing {label} · vim keys · Ctrl-S save · Ctrl-E lock · z zoom · Esc back");
     }
 
     /// Enter on the EditorOpen prompt: open a host path in the editor.
@@ -3608,9 +4107,11 @@ impl App {
         };
         let raw = match rpc(&self.sock, "review.file_bytes", json!([sid, rel])) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
-                match v.get("b64").and_then(Value::as_str).map(|b| {
-                    base64::engine::general_purpose::STANDARD.decode(b)
-                }) {
+                match v
+                    .get("b64")
+                    .and_then(Value::as_str)
+                    .map(|b| base64::engine::general_purpose::STANDARD.decode(b))
+                {
                     Some(Ok(bytes)) => bytes,
                     _ => {
                         self.status = format!("edit {rel}: bad payload");
@@ -3621,7 +4122,8 @@ impl App {
             Ok(v) => {
                 self.status = format!(
                     "edit {rel}: {}",
-                    v.get("error").and_then(Value::as_str).unwrap_or("failed"));
+                    v.get("error").and_then(Value::as_str).unwrap_or("failed")
+                );
                 return;
             }
             Err(e) => {
@@ -3640,21 +4142,25 @@ impl App {
     /// captured layer; the host is untouched). Success marks the buffer
     /// clean; failure is LOUD and the buffer stays dirty.
     fn editor_save(&mut self) {
-        let Some((target, bytes)) = self.editor.borrow().as_ref().map(|e| {
-            (e.target.clone(), e.save_bytes())
-        }) else {
+        let Some((target, bytes)) = self
+            .editor
+            .borrow()
+            .as_ref()
+            .map(|e| (e.target.clone(), e.save_bytes()))
+        else {
             return;
         };
         let res: Result<(), String> = match &target {
-            crate::editor::Target::Host(p) => {
-                std::fs::write(p, &bytes).map_err(|e| e.to_string())
-            }
+            crate::editor::Target::Host(p) => std::fs::write(p, &bytes).map_err(|e| e.to_string()),
             crate::editor::Target::Box { sid, rel } => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 match rpc(&self.sock, "review.write_file", json!([sid, rel, b64])) {
                     Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => Ok(()),
-                    Ok(v) => Err(v.get("error").and_then(Value::as_str)
-                                 .unwrap_or("failed").to_string()),
+                    Ok(v) => Err(v
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed")
+                        .to_string()),
                     Err(e) => Err(e),
                 }
             }
@@ -3695,8 +4201,7 @@ impl App {
             Pane::Reader | Pane::Editor => {}
             Pane::Sessions => {
                 if self.sel_session + 1 < self.sessions.len() {
-                    self.nav_from = self.session_id_at(self.sel_session)
-                        .map(|id| (id, false));
+                    self.nav_from = self.session_id_at(self.sel_session).map(|id| (id, false));
                     self.sel_session += 1;
                     self.on_box_cursor_moved();
                 }
@@ -3717,8 +4222,14 @@ impl App {
                     self.hunk_scroll = self.hunk_scroll.saturating_add(1);
                 }
             }
-            Pane::Processes => { self.move_proc_cursor(1); self.right_scroll = 0; }
-            Pane::Outputs => { self.move_output_cursor(1); self.right_scroll = 0; }
+            Pane::Processes => {
+                self.move_proc_cursor(1);
+                self.right_scroll = 0;
+            }
+            Pane::Outputs => {
+                self.move_output_cursor(1);
+                self.right_scroll = 0;
+            }
             Pane::Rules => {
                 if self.sel_rule + 1 < self.rules.len() {
                     self.sel_rule += 1;
@@ -3731,8 +4242,14 @@ impl App {
                     self.right_scroll = 0;
                 }
             }
-            Pane::Pipelines => { self.move_pipeline_cursor(1); self.right_scroll = 0; }
-            Pane::BuildEdges => { self.move_edge_cursor(1); self.right_scroll = 0; }
+            Pane::Pipelines => {
+                self.move_pipeline_cursor(1);
+                self.right_scroll = 0;
+            }
+            Pane::BuildEdges => {
+                self.move_edge_cursor(1);
+                self.right_scroll = 0;
+            }
             Pane::Flows => {
                 if self.sel_flow + 1 < self.flows.len() {
                     self.sel_flow += 1;
@@ -3792,8 +4309,7 @@ impl App {
             Pane::Reader | Pane::Editor => {}
             Pane::Sessions => {
                 if self.sel_session > 0 {
-                    self.nav_from = self.session_id_at(self.sel_session)
-                        .map(|id| (id, true));
+                    self.nav_from = self.session_id_at(self.sel_session).map(|id| (id, true));
                     self.sel_session -= 1;
                     self.on_box_cursor_moved();
                 }
@@ -3811,8 +4327,14 @@ impl App {
                     self.hunk_scroll = self.hunk_scroll.saturating_sub(1);
                 }
             }
-            Pane::Processes => { self.move_proc_cursor(-1); self.right_scroll = 0; }
-            Pane::Outputs => { self.move_output_cursor(-1); self.right_scroll = 0; }
+            Pane::Processes => {
+                self.move_proc_cursor(-1);
+                self.right_scroll = 0;
+            }
+            Pane::Outputs => {
+                self.move_output_cursor(-1);
+                self.right_scroll = 0;
+            }
             Pane::Rules => {
                 self.sel_rule = self.sel_rule.saturating_sub(1);
                 self.right_scroll = 0;
@@ -3821,8 +4343,14 @@ impl App {
                 self.sel_mirror = self.sel_mirror.saturating_sub(1);
                 self.right_scroll = 0;
             }
-            Pane::Pipelines => { self.move_pipeline_cursor(-1); self.right_scroll = 0; }
-            Pane::BuildEdges => { self.move_edge_cursor(-1); self.right_scroll = 0; }
+            Pane::Pipelines => {
+                self.move_pipeline_cursor(-1);
+                self.right_scroll = 0;
+            }
+            Pane::BuildEdges => {
+                self.move_edge_cursor(-1);
+                self.right_scroll = 0;
+            }
             Pane::Flows => {
                 if self.sel_flow > 0 {
                     self.sel_flow -= 1;
@@ -3865,9 +4393,13 @@ impl App {
     /// connector-skip stays correct; for the diff and help bodies it's a
     /// straight scroll bump.
     #[cfg_attr(test, allow(dead_code))]
-    fn page_down(&mut self) { self.page_move(PAGE_SIZE as isize); }
+    fn page_down(&mut self) {
+        self.page_move(PAGE_SIZE as isize);
+    }
     #[cfg_attr(test, allow(dead_code))]
-    fn page_up(&mut self) { self.page_move(-(PAGE_SIZE as isize)); }
+    fn page_up(&mut self) {
+        self.page_move(-(PAGE_SIZE as isize));
+    }
 
     fn page_move(&mut self, delta: isize) {
         let n = delta.unsigned_abs();
@@ -3879,15 +4411,18 @@ impl App {
                     .right_scroll
                     .saturating_add(n16)
                     .min(self.right_scroll_max.get());
+            } else {
+                self.right_scroll = self.right_scroll.saturating_sub(n16);
             }
-            else { self.right_scroll = self.right_scroll.saturating_sub(n16); }
             return;
         }
         match self.focus {
             Pane::Reader | Pane::Editor => {}
             Pane::Sessions => {
                 let total = self.sessions.len();
-                if total == 0 { return; }
+                if total == 0 {
+                    return;
+                }
                 let cur = self.sel_session as isize;
                 let new = (cur + delta).clamp(0, total as isize - 1) as usize;
                 if new != self.sel_session {
@@ -3896,7 +4431,9 @@ impl App {
                 }
             }
             Pane::Changes => {
-                if self.changes_total == 0 { return; }
+                if self.changes_total == 0 {
+                    return;
+                }
                 for _ in 0..n {
                     let g = self.changes_window_start + self.sel_change;
                     if (step > 0 && g + 1 >= self.changes_total) || (step < 0 && g == 0) {
@@ -3907,29 +4444,46 @@ impl App {
                 self.load_hunks();
             }
             Pane::Processes => {
-                for _ in 0..n { self.move_proc_cursor(step); }
+                for _ in 0..n {
+                    self.move_proc_cursor(step);
+                }
                 self.right_scroll = 0;
             }
-            Pane::Outputs => { self.page_output_cursor(delta); self.right_scroll = 0; }
+            Pane::Outputs => {
+                self.page_output_cursor(delta);
+                self.right_scroll = 0;
+            }
             Pane::Rules => {
                 let total = self.rules.len();
-                if total == 0 { return; }
+                if total == 0 {
+                    return;
+                }
                 let cur = self.sel_rule as isize;
                 self.sel_rule = (cur + delta).clamp(0, total as isize - 1) as usize;
                 self.right_scroll = 0;
             }
             Pane::Mirrors => {
                 let total = self.mirror_jobs.len();
-                if total == 0 { return; }
+                if total == 0 {
+                    return;
+                }
                 let cur = self.sel_mirror as isize;
                 self.sel_mirror = (cur + delta).clamp(0, total as isize - 1) as usize;
                 self.right_scroll = 0;
             }
-            Pane::Pipelines => { self.page_pipeline_cursor(delta); self.right_scroll = 0; }
-            Pane::BuildEdges => { self.page_edge_cursor(delta); self.right_scroll = 0; }
+            Pane::Pipelines => {
+                self.page_pipeline_cursor(delta);
+                self.right_scroll = 0;
+            }
+            Pane::BuildEdges => {
+                self.page_edge_cursor(delta);
+                self.right_scroll = 0;
+            }
             Pane::Flows => {
                 let total = self.flows.len();
-                if total == 0 { return; }
+                if total == 0 {
+                    return;
+                }
                 let cur = self.sel_flow as isize;
                 let new = (cur + delta).clamp(0, total as isize - 1) as usize;
                 if new != self.sel_flow {
@@ -3940,7 +4494,9 @@ impl App {
             }
             Pane::Packets => {
                 let total = self.packets.len();
-                if total == 0 { return; }
+                if total == 0 {
+                    return;
+                }
                 let cur = self.sel_packet as isize;
                 let new = (cur + delta).clamp(0, total as isize - 1) as usize;
                 if new != self.sel_packet {
@@ -3951,40 +4507,54 @@ impl App {
             }
             Pane::Hunks => {
                 let n16 = n as u16;
-                if step > 0 { self.hunk_scroll = self.hunk_scroll.saturating_add(n16); }
-                else { self.hunk_scroll = self.hunk_scroll.saturating_sub(n16); }
+                if step > 0 {
+                    self.hunk_scroll = self.hunk_scroll.saturating_add(n16);
+                } else {
+                    self.hunk_scroll = self.hunk_scroll.saturating_sub(n16);
+                }
             }
             Pane::Help => {
                 let n16 = n as u16;
-                if step > 0 { self.out_scroll = self.out_scroll.saturating_add(n16); }
-                else { self.out_scroll = self.out_scroll.saturating_sub(n16); }
+                if step > 0 {
+                    self.out_scroll = self.out_scroll.saturating_add(n16);
+                } else {
+                    self.out_scroll = self.out_scroll.saturating_sub(n16);
+                }
             }
             Pane::Pty => {}
             Pane::Inspect => self.ins_move(delta),
             Pane::ApiLogs => {
                 let total = self.api_log_rows.len();
-                if total == 0 { return; }
+                if total == 0 {
+                    return;
+                }
                 let cur = self.sel_api_log as isize;
                 self.sel_api_log = (cur + delta).clamp(0, total as isize - 1) as usize;
                 self.right_scroll = 0;
             }
             Pane::Network => {
                 let total = self.webcap_rows.len();
-                if total == 0 { return; }
+                if total == 0 {
+                    return;
+                }
                 let cur = self.sel_webcap as isize;
                 self.sel_webcap = (cur + delta).clamp(0, total as isize - 1) as usize;
                 self.right_scroll = 0;
             }
             Pane::Trace => {
                 let total = self.trace_rows.len();
-                if total == 0 { return; }
+                if total == 0 {
+                    return;
+                }
                 let cur = self.sel_trace as isize;
                 self.sel_trace = (cur + delta).clamp(0, total as isize - 1) as usize;
                 self.right_scroll = 0;
             }
             Pane::Vars => {
                 let total = self.vars_rows.len();
-                if total == 0 { return; }
+                if total == 0 {
+                    return;
+                }
                 let cur = self.sel_var as isize;
                 self.sel_var = (cur + delta).clamp(0, total as isize - 1) as usize;
                 self.sel_var_item = 0;
@@ -4000,10 +4570,19 @@ impl App {
     /// with no peer. Everywhere else the right pane is a (possibly long)
     /// detail body — give it a scroll focus.
     fn right_pane_scrollable(&self) -> bool {
-        matches!(self.focus,
-            Pane::Sessions | Pane::Processes | Pane::Outputs
-            | Pane::Pipelines | Pane::BuildEdges | Pane::Rules
-            | Pane::Mirrors | Pane::Flows | Pane::Packets | Pane::Vars)
+        matches!(
+            self.focus,
+            Pane::Sessions
+                | Pane::Processes
+                | Pane::Outputs
+                | Pane::Pipelines
+                | Pane::BuildEdges
+                | Pane::Rules
+                | Pane::Mirrors
+                | Pane::Flows
+                | Pane::Packets
+                | Pane::Vars
+        )
     }
 
     /// Snap focus back to the LEFT list and reset the right-pane scroll.
@@ -4062,8 +4641,7 @@ impl App {
         }
         let snap = NavSnapshot {
             pane: self.focus,
-            filter: Self::pane_filter_view(self.focus)
-                .map(|v| self.view_filter(v).clone()),
+            filter: Self::pane_filter_view(self.focus).map(|v| self.view_filter(v).clone()),
             cursor: self.current_cursor_global(),
             right_scroll: self.right_scroll,
             right_focused: self.right_focused,
@@ -4122,13 +4700,11 @@ impl App {
                     }
                 }
                 Pane::Rules => {
-                    self.sel_rule =
-                        snap.cursor.min(self.rules.len().saturating_sub(1));
+                    self.sel_rule = snap.cursor.min(self.rules.len().saturating_sub(1));
                 }
                 Pane::Mirrors => {
                     self.load_mirrors();
-                    self.sel_mirror =
-                        snap.cursor.min(self.mirror_jobs.len().saturating_sub(1));
+                    self.sel_mirror = snap.cursor.min(self.mirror_jobs.len().saturating_sub(1));
                 }
                 Pane::Flows => {
                     if !self.flows.is_empty() {
@@ -4143,23 +4719,19 @@ impl App {
                     }
                 }
                 Pane::ApiLogs => {
-                    self.sel_api_log =
-                        snap.cursor.min(self.api_log_rows.len().saturating_sub(1));
+                    self.sel_api_log = snap.cursor.min(self.api_log_rows.len().saturating_sub(1));
                 }
                 Pane::Network => {
-                    self.sel_webcap =
-                        snap.cursor.min(self.webcap_rows.len().saturating_sub(1));
+                    self.sel_webcap = snap.cursor.min(self.webcap_rows.len().saturating_sub(1));
                 }
                 Pane::Trace => {
-                    self.sel_trace =
-                        snap.cursor.min(self.trace_rows.len().saturating_sub(1));
+                    self.sel_trace = snap.cursor.min(self.trace_rows.len().saturating_sub(1));
                 }
                 Pane::Vars => {
                     self.vars_query = snap.vars_query.clone();
                     self.vars_any = snap.vars_any;
                     self.load_vars();
-                    self.sel_var =
-                        snap.cursor.min(self.vars_rows.len().saturating_sub(1));
+                    self.sel_var = snap.cursor.min(self.vars_rows.len().saturating_sub(1));
                 }
                 _ => {}
             }
@@ -4187,26 +4759,62 @@ impl App {
         }
         self.snap_left();
         match pane {
-            Pane::Changes   => { self.nav(Pane::Changes);   self.load_changes_if_needed(); }
-            Pane::Processes => { self.nav(Pane::Processes); self.load_processes_if_needed(); }
-            Pane::Outputs   => { self.nav(Pane::Outputs);   self.load_outputs_if_needed(); }
-            Pane::ApiLogs   => { self.nav(Pane::ApiLogs);   self.load_api_logs_if_needed(); }
-            Pane::Network   => { self.nav(Pane::Network);   self.load_webcap_if_needed(); }
-            Pane::Trace     => { self.focus = Pane::Trace;   self.load_trace_if_needed(); }
-            Pane::Flows     => { self.focus = Pane::Flows;      self.load_flows(); }
-            Pane::Pipelines => { self.nav(Pane::Pipelines);  self.load_pipelines_if_needed(); }
-            Pane::BuildEdges=> { self.nav(Pane::BuildEdges); self.load_edges_if_needed(); }
-            Pane::Help      => { self.focus = Pane::Help; self.out_scroll = 0; }
-            Pane::Vars      => {
+            Pane::Changes => {
+                self.nav(Pane::Changes);
+                self.load_changes_if_needed();
+            }
+            Pane::Processes => {
+                self.nav(Pane::Processes);
+                self.load_processes_if_needed();
+            }
+            Pane::Outputs => {
+                self.nav(Pane::Outputs);
+                self.load_outputs_if_needed();
+            }
+            Pane::ApiLogs => {
+                self.nav(Pane::ApiLogs);
+                self.load_api_logs_if_needed();
+            }
+            Pane::Network => {
+                self.nav(Pane::Network);
+                self.load_webcap_if_needed();
+            }
+            Pane::Trace => {
+                self.focus = Pane::Trace;
+                self.load_trace_if_needed();
+            }
+            Pane::Flows => {
+                self.focus = Pane::Flows;
+                self.load_flows();
+            }
+            Pane::Pipelines => {
+                self.nav(Pane::Pipelines);
+                self.load_pipelines_if_needed();
+            }
+            Pane::BuildEdges => {
+                self.nav(Pane::BuildEdges);
+                self.load_edges_if_needed();
+            }
+            Pane::Help => {
+                self.focus = Pane::Help;
+                self.out_scroll = 0;
+            }
+            Pane::Vars => {
                 self.focus = Pane::Vars;
                 self.load_vars();
                 if self.vars_query.0.is_empty() && self.vars_query.1.is_empty() {
                     self.modal = Some(Modal::VarQuery { buf: String::new() });
                 }
             }
-            Pane::Inspect   => { self.focus = Pane::Inspect; self.ins_init(); }
-            Pane::Mirrors   => { self.focus = Pane::Mirrors; self.load_mirrors(); }
-            Pane::Reader    => {
+            Pane::Inspect => {
+                self.focus = Pane::Inspect;
+                self.ins_init();
+            }
+            Pane::Mirrors => {
+                self.focus = Pane::Mirrors;
+                self.load_mirrors();
+            }
+            Pane::Reader => {
                 self.focus = Pane::Reader;
                 // Nothing open yet: land straight in the path prompt so the
                 // chip is useful on first visit.
@@ -4214,14 +4822,16 @@ impl App {
                     self.modal = Some(Modal::ReaderOpen { buf: String::new() });
                 }
             }
-            Pane::Editor    => {
+            Pane::Editor => {
                 self.focus = Pane::Editor;
                 // Same first-visit prompt convention as the reader.
                 if self.editor.borrow().is_none() {
                     self.modal = Some(Modal::EditorOpen { buf: String::new() });
                 }
             }
-            other           => { self.focus = other; }
+            other => {
+                self.focus = other;
+            }
         }
     }
 
@@ -4305,8 +4915,14 @@ impl App {
                 let (id, mime, url) = match self.webcap_rows.get(self.sel_webcap) {
                     Some(row) => (
                         row.get("id").and_then(Value::as_i64).unwrap_or(-1),
-                        row.get("mime").and_then(Value::as_str).unwrap_or("").to_string(),
-                        row.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+                        row.get("mime")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        row.get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
                     ),
                     None => return,
                 };
@@ -4314,29 +4930,42 @@ impl App {
                 if mime.starts_with("image/") {
                     match rpc(&self.sock, "webcap_body", json!([sid, id])) {
                         Ok(v) => {
-                            let b64 = v.get("b64").and_then(Value::as_str)
-                                .unwrap_or("").to_string();
+                            let b64 = v
+                                .get("b64")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
                             use base64::Engine;
                             match base64::engine::general_purpose::STANDARD.decode(&b64) {
-                                Ok(bytes) => open_image_view(
-                                    self, &format!("webcap #{id} {mime}"), &bytes),
+                                Ok(bytes) => {
+                                    open_image_view(self, &format!("webcap #{id} {mime}"), &bytes)
+                                }
                                 Err(e) => self.status = format!("image: bad body ({e})"),
                             }
                         }
                         Err(e) => self.status = format!("webcap_body: {e}"),
                     }
-                } else if mime.starts_with("text/html")
-                    || mime == "application/xhtml+xml" {
+                } else if mime.starts_with("text/html") || mime == "application/xhtml+xml" {
                     open_replay_in_browser(self, &sid, &url);
                 } else {
                     self.status = format!(
                         "{mime}: Enter opens image (sixel) and HTML (carbonyl \
-                         replay) captures; others show in the detail pane");
+                         replay) captures; others show in the detail pane"
+                    );
                 }
             }
-            Pane::Hunks | Pane::Processes | Pane::Outputs | Pane::Rules
-            | Pane::Mirrors | Pane::Pipelines | Pane::BuildEdges | Pane::Packets
-            | Pane::Help | Pane::Pty | Pane::ApiLogs | Pane::Trace => {}
+            Pane::Hunks
+            | Pane::Processes
+            | Pane::Outputs
+            | Pane::Rules
+            | Pane::Mirrors
+            | Pane::Pipelines
+            | Pane::BuildEdges
+            | Pane::Packets
+            | Pane::Help
+            | Pane::Pty
+            | Pane::ApiLogs
+            | Pane::Trace => {}
         }
     }
 
@@ -4362,8 +4991,10 @@ impl App {
     /// Act on the selected Vars detail item.
     fn var_item_act(&mut self) {
         let (_, items) = var_detail(self);
-        let Some((_, action)) = items.get(self.sel_var_item.min(
-            items.len().saturating_sub(1))) else { return };
+        let Some((_, action)) = items.get(self.sel_var_item.min(items.len().saturating_sub(1)))
+        else {
+            return;
+        };
         match action {
             VarNavAction::Query(name) => {
                 let name = name.clone();
@@ -4384,7 +5015,9 @@ impl App {
     }
 
     /// The currently-selected PTY pane, if any.
-    fn cur_pty(&self) -> Option<&PtyPane> { self.ptys.get(self.sel_pty) }
+    fn cur_pty(&self) -> Option<&PtyPane> {
+        self.ptys.get(self.sel_pty)
+    }
     #[cfg_attr(test, allow(dead_code))]
     fn cur_pty_mut(&mut self) -> Option<&mut PtyPane> {
         self.ptys.get_mut(self.sel_pty)
@@ -4411,8 +5044,12 @@ impl App {
     /// Browser only while a PTY of that kind is open.
     fn screens_available(&self) -> Vec<Screen> {
         let mut v = vec![Screen::Main];
-        if self.ptys.iter().any(|p| !p.browser) { v.push(Screen::Terminal); }
-        if self.ptys.iter().any(|p| p.browser) { v.push(Screen::Browser); }
+        if self.ptys.iter().any(|p| !p.browser) {
+            v.push(Screen::Terminal);
+        }
+        if self.ptys.iter().any(|p| p.browser) {
+            v.push(Screen::Browser);
+        }
         v.push(Screen::Inspect);
         v
     }
@@ -4441,9 +5078,16 @@ impl App {
             }
             Screen::Terminal | Screen::Browser => {
                 let want = s == Screen::Browser;
-                let remembered = if want { self.last_browser_pty } else { self.last_term_pty };
-                let pick = if self.ptys.get(remembered)
-                    .map(|p| p.browser == want).unwrap_or(false)
+                let remembered = if want {
+                    self.last_browser_pty
+                } else {
+                    self.last_term_pty
+                };
+                let pick = if self
+                    .ptys
+                    .get(remembered)
+                    .map(|p| p.browser == want)
+                    .unwrap_or(false)
                 {
                     Some(remembered)
                 } else {
@@ -4454,7 +5098,8 @@ impl App {
                     self.focus = Pane::Pty;
                     self.status = format!(
                         "screen: {} · F4/F5 cycle its windows · F2/F3 screens",
-                        if want { "browser" } else { "terminal" });
+                        if want { "browser" } else { "terminal" }
+                    );
                 }
             }
             Screen::Inspect => {
@@ -4474,15 +5119,17 @@ impl App {
             Screen::Main => {
                 // The window set is the visible menubar chips minus the PTY
                 // chip (that one jumps screens, not windows).
-                let chips: Vec<char> = menubar_chips(self).into_iter()
-                    .map(|(c, _)| c).filter(|c| *c != 'P').collect();
+                let chips: Vec<char> = menubar_chips(self)
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .filter(|c| *c != 'P')
+                    .collect();
                 let cur = view_of_pane(self.focus).map(|(k, _, _)| k);
-                let i = cur.and_then(|k| chips.iter().position(|c| *c == k))
+                let i = cur
+                    .and_then(|k| chips.iter().position(|c| *c == k))
                     .unwrap_or(0);
                 if let Some(next) = cycle_pick(&chips, i, dir) {
-                    if let Some((_, pane, _, _, _)) =
-                        PANE_KEYS.iter().find(|e| e.0 == next)
-                    {
+                    if let Some((_, pane, _, _, _)) = PANE_KEYS.iter().find(|e| e.0 == next) {
                         self.go_to_pane(*pane);
                     }
                 }
@@ -4497,29 +5144,42 @@ impl App {
 
     /// Cycle `sel_pty` among the PTYs of one kind (browser or not), wrapping.
     fn pty_cycle_kind(&mut self, dir: isize, browser: bool) {
-        let idxs: Vec<usize> = self.ptys.iter().enumerate()
+        let idxs: Vec<usize> = self
+            .ptys
+            .iter()
+            .enumerate()
             .filter(|(_, p)| p.browser == browser)
-            .map(|(i, _)| i).collect();
+            .map(|(i, _)| i)
+            .collect();
         let pos = idxs.iter().position(|&i| i == self.sel_pty).unwrap_or(0);
-        let Some(next) = cycle_pick(&idxs, pos, dir) else { return };
+        let Some(next) = cycle_pick(&idxs, pos, dir) else {
+            return;
+        };
         self.sel_pty = next;
-        self.status = format!("window {}/{} of the {} screen",
-            idxs.iter().position(|&i| i == next).unwrap_or(0) + 1, idxs.len(),
-            if browser { "browser" } else { "terminal" });
+        self.status = format!(
+            "window {}/{} of the {} screen",
+            idxs.iter().position(|&i| i == next).unwrap_or(0) + 1,
+            idxs.len(),
+            if browser { "browser" } else { "terminal" }
+        );
     }
     /// Kill the current PTY (drop the connection — engine SIGHUPs the
     /// child). Selector slides to the next PTY; focus snaps back to
     /// Sessions if the last one is gone.
     #[cfg_attr(test, allow(dead_code))]
     fn pty_kill(&mut self) {
-        if self.sel_pty >= self.ptys.len() { return; }
+        if self.sel_pty >= self.ptys.len() {
+            return;
+        }
         self.ptys.remove(self.sel_pty);
         if self.ptys.is_empty() {
             self.sel_pty = 0;
             self.focus = Pane::Sessions;
             self.status = "PTY killed (no more open)".into();
         } else {
-            if self.sel_pty >= self.ptys.len() { self.sel_pty = self.ptys.len() - 1; }
+            if self.sel_pty >= self.ptys.len() {
+                self.sel_pty = self.ptys.len() - 1;
+            }
             self.status = format!("PTY killed · {} remain", self.ptys.len());
         }
     }
@@ -4529,12 +5189,17 @@ impl App {
     /// active selection.
     #[cfg_attr(test, allow(dead_code))]
     fn open_pty(&mut self, mut argv: Vec<String>) {
-        if argv.is_empty() { self.status = "pty: empty command".into(); return; }
+        if argv.is_empty() {
+            self.status = "pty: empty command".into();
+            return;
+        }
         // The engine's PTY does no PATH lookup, so a bare `sarun` wouldn't
         // resolve — expand it to this very binary here. This keeps the
         // visible prompt default a readable `sarun run -b -- ` instead of
         // leaking the full install path into the dialog.
-        if argv[0] == "sarun" { argv[0] = self_exe(); }
+        if argv[0] == "sarun" {
+            argv[0] = self_exe();
+        }
         // Initial size: best guess from the actual terminal. The loop
         // calls fit_active_pty() once per redraw and resizes again
         // when the layout changes (split vs full-screen, embed
@@ -4558,7 +5223,9 @@ impl App {
                 self.focus = Pane::Pty;
                 self.status = format!(
                     "PTY {}/{} · F4/F5 cycle · F2/F3 screens · F8 kill · F12 detach",
-                    self.sel_pty + 1, self.ptys.len());
+                    self.sel_pty + 1,
+                    self.ptys.len()
+                );
             }
             Err(e) => self.status = format!("pty: {e}"),
         }
@@ -4579,7 +5246,9 @@ impl App {
     /// the next time they become active (they're not visible anyway).
     #[cfg_attr(test, allow(dead_code))]
     fn fit_active_pty(&mut self, term_cols: u16, term_rows: u16) {
-        if self.ptys.is_empty() { return; }
+        if self.ptys.is_empty() {
+            return;
+        }
         let body_rows = term_rows.saturating_sub(4).max(2);
         let (cols, rows) = if self.focus == Pane::Pty {
             // Full-screen PTY: subtract 1 for the title strip.
@@ -4630,12 +5299,20 @@ impl App {
     /// box session_ids for Sessions, change paths for Changes.
     fn mark_row_keys(&self) -> Vec<String> {
         match self.focus {
-            Pane::Sessions => self.sessions.iter()
-                .filter_map(|s| s.get("session_id").and_then(Value::as_str)
-                    .map(String::from)).collect(),
-            Pane::Changes => self.visible_changes().iter()
-                .filter_map(|c| c.get("path").and_then(Value::as_str)
-                    .map(String::from)).collect(),
+            Pane::Sessions => self
+                .sessions
+                .iter()
+                .filter_map(|s| {
+                    s.get("session_id")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
+                .collect(),
+            Pane::Changes => self
+                .visible_changes()
+                .iter()
+                .filter_map(|c| c.get("path").and_then(Value::as_str).map(String::from))
+                .collect(),
             _ => vec![],
         }
     }
@@ -4668,7 +5345,9 @@ impl App {
         self.ensure_mark_scope();
         let idx = self.mark_cursor();
         if let Some(k) = self.mark_row_keys().get(idx).cloned() {
-            if !self.marks.remove(&k) { self.marks.insert(k); }
+            if !self.marks.remove(&k) {
+                self.marks.insert(k);
+            }
             self.mark_anchor = Some(idx);
             self.status = format!("{} selected", self.marks.len());
         }
@@ -4678,14 +5357,18 @@ impl App {
     /// the cursor if none) and the current cursor. Both brackets do the same
     /// symmetric fill; the anchor then moves to the cursor so ranges chain.
     fn range_mark(&mut self) {
-        if self.selectable_pane().is_none() { return; }
+        if self.selectable_pane().is_none() {
+            return;
+        }
         self.ensure_mark_scope();
         let keys = self.mark_row_keys();
         let cur = self.mark_cursor();
         let anchor = self.mark_anchor.unwrap_or(cur);
         let (lo, hi) = (anchor.min(cur), anchor.max(cur));
         if let Some(slice) = keys.get(lo..=hi) {
-            for k in slice { self.marks.insert(k.clone()); }
+            for k in slice {
+                self.marks.insert(k.clone());
+            }
         }
         self.mark_anchor = Some(cur);
         self.status = format!("{} selected", self.marks.len());
@@ -4695,7 +5378,9 @@ impl App {
     /// (i.e. there was a selection to clear), so the caller doesn't also run
     /// Esc's other duties (clearing a generated filter).
     fn clear_marks(&mut self) -> bool {
-        if self.marks.is_empty() { return false; }
+        if self.marks.is_empty() {
+            return false;
+        }
         self.marks.clear();
         self.mark_anchor = None;
         self.mark_scope = None;
@@ -4707,8 +5392,10 @@ impl App {
     /// and there are any — else empty (callers fall back to the cursor row).
     fn marked_here(&self) -> Vec<String> {
         if self.mark_scope == Some(self.focus) && !self.marks.is_empty() {
-            self.mark_row_keys().into_iter()
-                .filter(|k| self.marks.contains(k)).collect()
+            self.mark_row_keys()
+                .into_iter()
+                .filter(|k| self.marks.contains(k))
+                .collect()
         } else {
             vec![]
         }
@@ -4724,21 +5411,37 @@ impl App {
     /// if it handled a selection (caller then skips the single-row path).
     fn batch_apply_discard(&mut self, discard: bool) -> bool {
         let marks = self.marked_here();
-        if marks.is_empty() { return false; }
-        let verb = if discard { "review.discard" } else { "review.apply" };
+        if marks.is_empty() {
+            return false;
+        }
+        let verb = if discard {
+            "review.discard"
+        } else {
+            "review.apply"
+        };
         let word = if discard { "discarded" } else { "applied" };
         let key = if discard { "discarded" } else { "applied" };
         match self.mark_scope {
             Some(Pane::Changes) => {
                 // All marked paths in ONE call against the current box.
-                let Some(sid) = self.cur_sid() else { return true; };
-                match rpc(&self.sock, verb, json!([sid, Value::Array(
-                    marks.iter().map(|p| Value::String(p.clone())).collect())])) {
+                let Some(sid) = self.cur_sid() else {
+                    return true;
+                };
+                match rpc(
+                    &self.sock,
+                    verb,
+                    json!([
+                        sid,
+                        Value::Array(marks.iter().map(|p| Value::String(p.clone())).collect())
+                    ]),
+                ) {
                     Ok(r) => {
-                        let n = r.get(key).and_then(Value::as_array)
-                            .map(|a| a.len()).unwrap_or(marks.len());
-                        self.status = format!("{word} {n} change(s) in {} file(s)",
-                            marks.len());
+                        let n = r
+                            .get(key)
+                            .and_then(Value::as_array)
+                            .map(|a| a.len())
+                            .unwrap_or(marks.len());
+                        self.status = format!("{word} {n} change(s) in {} file(s)", marks.len());
                     }
                     Err(e) => self.status = format!("{verb}: {e}"),
                 }
@@ -4767,16 +5470,24 @@ impl App {
     }
 
     fn apply(&mut self) {
-        if self.batch_apply_discard(false) { return; }
+        if self.batch_apply_discard(false) {
+            return;
+        }
         // Box-level accept from the Sessions pane offers the scoped picker
         // ("All" + file-groups like the browser session); per-change apply on
         // the Changes/Hunks panes stays immediate.
-        if self.focus == Pane::Sessions && self.open_file_group_pick(false) { return; }
+        if self.focus == Pane::Sessions && self.open_file_group_pick(false) {
+            return;
+        }
         let Some(sid) = self.cur_sid() else { return };
         let sel = self.review_selector();
         match rpc(&self.sock, "review.apply", json!([sid, sel])) {
             Ok(r) => {
-                let n = r.get("applied").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                let n = r
+                    .get("applied")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
                 self.status = format!("applied {n} change(s)");
             }
             Err(e) => self.status = format!("apply: {e}"),
@@ -4786,13 +5497,21 @@ impl App {
     }
 
     fn discard(&mut self) {
-        if self.batch_apply_discard(true) { return; }
-        if self.focus == Pane::Sessions && self.open_file_group_pick(true) { return; }
+        if self.batch_apply_discard(true) {
+            return;
+        }
+        if self.focus == Pane::Sessions && self.open_file_group_pick(true) {
+            return;
+        }
         let Some(sid) = self.cur_sid() else { return };
         let sel = self.review_selector();
         match rpc(&self.sock, "review.discard", json!([sid, sel])) {
             Ok(r) => {
-                let n = r.get("discarded").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                let n = r
+                    .get("discarded")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
                 self.status = format!("discarded {n} change(s)");
             }
             Err(e) => self.status = format!("discard: {e}"),
@@ -4827,8 +5546,10 @@ impl App {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
                 format!("rotate: box {sid} promoted over its parent")
             }
-            Ok(v) => format!("rotate: {}",
-                v.get("error").and_then(Value::as_str).unwrap_or("failed")),
+            Ok(v) => format!(
+                "rotate: {}",
+                v.get("error").and_then(Value::as_str).unwrap_or("failed")
+            ),
             Err(e) => format!("rotate: {e}"),
         };
         self.refresh_sessions();
@@ -4838,7 +5559,9 @@ impl App {
     /// each file-group (files_*.glob) that selects some of the box's changes.
     /// Returns false — caller does the plain op — when the box has no changes.
     fn open_file_group_pick(&mut self, discard: bool) -> bool {
-        let Some(sid) = self.cur_sid() else { return false };
+        let Some(sid) = self.cur_sid() else {
+            return false;
+        };
         let total = rpc(&self.sock, "review.session_changes", json!([sid]))
             .ok()
             .and_then(|v| v.as_array().map(|a| a.len()))
@@ -4856,22 +5579,42 @@ impl App {
                         continue; // only offer groups that match something
                     }
                     let name = g.get("name").and_then(Value::as_str).unwrap_or("group");
-                    let paths: Vec<String> = g.get("paths").and_then(Value::as_array)
-                        .map(|a| a.iter().filter_map(|p| p.as_str().map(String::from)).collect())
+                    let paths: Vec<String> = g
+                        .get("paths")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|p| p.as_str().map(String::from))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     rows.push((format!("{name}  ({count})"), Some(paths)));
                 }
             }
         }
-        self.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel: 0 });
+        self.modal = Some(Modal::FileGroupPick {
+            discard,
+            sid,
+            rows,
+            sel: 0,
+        });
         true
     }
 
     /// Apply/discard the picked selection (None = the whole box, Some = a
     /// file-group's matching changes).
-    fn run_file_group(&mut self, discard: bool, sid: &str, label: &str,
-                      paths: Option<Vec<String>>) {
-        let verb = if discard { "review.discard" } else { "review.apply" };
+    fn run_file_group(
+        &mut self,
+        discard: bool,
+        sid: &str,
+        label: &str,
+        paths: Option<Vec<String>>,
+    ) {
+        let verb = if discard {
+            "review.discard"
+        } else {
+            "review.apply"
+        };
         let args = match &paths {
             Some(p) => json!([sid, p]),
             None => json!([sid]),
@@ -4879,7 +5622,11 @@ impl App {
         let key = if discard { "discarded" } else { "applied" };
         match rpc(&self.sock, verb, args) {
             Ok(r) => {
-                let n = r.get(key).and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                let n = r
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
                 self.status = format!("{key} {n} change(s) — {}", label.trim());
             }
             Err(e) => self.status = format!("{key}: {e}"),
@@ -4894,12 +5641,12 @@ impl App {
     #[cfg_attr(test, allow(dead_code))]
     fn box_op_over_selection(&mut self, verb: &str) -> (usize, usize, Option<String>) {
         let marks = self.marked_here();
-        let mut targets: Vec<String> = if !marks.is_empty()
-            && self.mark_scope == Some(Pane::Sessions) {
-            marks
-        } else {
-            self.cur_sid().into_iter().collect()
-        };
+        let mut targets: Vec<String> =
+            if !marks.is_empty() && self.mark_scope == Some(Pane::Sessions) {
+                marks
+            } else {
+                self.cur_sid().into_iter().collect()
+            };
         // DEEPEST-FIRST: sessions are path-sorted (ancestor before descendant),
         // so reversing removes children before their parents. The engine keeps
         // any children (copy-down + re-parent) regardless of order, so this is
@@ -4911,7 +5658,10 @@ impl App {
         for id in &targets {
             match rpc(&self.sock, verb, json!([id])) {
                 Ok(_) => ok += 1,
-                Err(e) => { err += 1; last_err = Some(e); }
+                Err(e) => {
+                    err += 1;
+                    last_err = Some(e);
+                }
             }
         }
         self.clear_marks();
@@ -4932,12 +5682,13 @@ impl App {
     #[cfg_attr(test, allow(dead_code))]
     fn kill(&mut self) {
         let (ok, err, why) = self.box_op_over_selection("kill");
-        self.status = if err == 0 { format!("sent SIGTERM to {ok} box(es)") }
-                      else { format!("killed {ok}, {err} failed: {}",
-                                     why.unwrap_or_default()) };
+        self.status = if err == 0 {
+            format!("sent SIGTERM to {ok} box(es)")
+        } else {
+            format!("killed {ok}, {err} failed: {}", why.unwrap_or_default())
+        };
         self.refresh_sessions();
     }
-
 
     /// Wedge diagnosis (`stuck` verb): every live process of the selected
     /// box with its state / kernel wchan / current syscall, in a Report
@@ -4951,20 +5702,22 @@ impl App {
         match rpc(&self.sock, "stuck", json!([sid.clone()])) {
             Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) => {
                 let empty = vec![];
-                let procs = r.get("procs").and_then(Value::as_array)
-                    .unwrap_or(&empty);
+                let procs = r.get("procs").and_then(Value::as_array).unwrap_or(&empty);
                 let mut lines = vec![format!(
                     "{:>7} {:>7} {:>2} {:<16} {}",
-                    "PID", "TID", "ST", "COMM", "BLOCKED-ON")];
+                    "PID", "TID", "ST", "COMM", "BLOCKED-ON"
+                )];
                 for p in procs {
-                    let g = |k: &str| p.get(k).and_then(Value::as_str)
-                        .unwrap_or("").to_string();
-                    let n = |k: &str| p.get(k).and_then(Value::as_i64)
-                        .unwrap_or(0);
+                    let g = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                    let n = |k: &str| p.get(k).and_then(Value::as_i64).unwrap_or(0);
                     lines.push(format!(
                         "{:>7} {:>7} {:>2} {:<16} {}",
-                        n("pid"), n("tid"), g("state"), g("comm"),
-                        g("detail")));
+                        n("pid"),
+                        n("tid"),
+                        g("state"),
+                        g("comm"),
+                        g("detail")
+                    ));
                     // Symbolized backtrace (ptrace/gdb) — the layer that
                     // localizes a "running" spin. The CLI prints this; the
                     // panel must too, or every wedge reads as a bare "running".
@@ -4977,33 +5730,49 @@ impl App {
                     }
                 }
                 if procs.is_empty() {
-                    lines.push("(no live threads — the tree exited; \
-                                the runner may be stuck in teardown)".into());
+                    lines.push(
+                        "(no live threads — the tree exited; \
+                                the runner may be stuck in teardown)"
+                            .into(),
+                    );
                 }
                 lines.push(String::new());
-                lines.push("BLOCKED-ON = current syscall + the fd it names + \
-                            the peer pid holding the other end.".into());
-                lines.push("A deadlock reads as: X blocked read(fd→pipe/sock) \
-                            whose peer is itself blocked.".into());
+                lines.push(
+                    "BLOCKED-ON = current syscall + the fd it names + \
+                            the peer pid holding the other end."
+                        .into(),
+                );
+                lines.push(
+                    "A deadlock reads as: X blocked read(fd→pipe/sock) \
+                            whose peer is itself blocked."
+                        .into(),
+                );
                 self.modal = Some(Modal::Report {
                     title: format!(" stuck · box {sid} "),
                     lines,
                 });
             }
             Ok(r) => {
-                self.status = r.get("error").and_then(Value::as_str)
-                    .unwrap_or("stuck: failed").to_string();
+                self.status = r
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stuck: failed")
+                    .to_string();
             }
-            Err(e) => { self.status = format!("stuck: {e}"); }
+            Err(e) => {
+                self.status = format!("stuck: {e}");
+            }
         }
     }
 
     #[cfg_attr(test, allow(dead_code))]
     fn dissolve(&mut self) {
         let (ok, err, why) = self.box_op_over_selection("dissolve");
-        self.status = if err == 0 { format!("dissolved {ok} box(es)") }
-                      else { format!("dissolved {ok}, {err} failed: {}",
-                                     why.unwrap_or_default()) };
+        self.status = if err == 0 {
+            format!("dissolved {ok} box(es)")
+        } else {
+            format!("dissolved {ok}, {err} failed: {}", why.unwrap_or_default())
+        };
         self.refresh_sessions();
         self.load_changes();
     }
@@ -5048,7 +5817,9 @@ impl App {
 
     #[cfg_attr(test, allow(dead_code))]
     fn commit_rename(&mut self) {
-        let Some(name) = self.renaming.take() else { return };
+        let Some(name) = self.renaming.take() else {
+            return;
+        };
         let Some(sid) = self.cur_sid() else { return };
         match rename_rpc(&self.sock, &sid, &name) {
             Ok(_) => self.status = format!("renamed box {sid} -> {name}"),
@@ -5080,17 +5851,22 @@ impl App {
                 // affected sid matches the currently-loaded box. Routing
                 // to the cursor-preserving refreshers, never the reset-
                 // happy load_*() versions.
-                let sid = ev.get("sid").and_then(Value::as_str)
+                let sid = ev
+                    .get("sid")
+                    .and_then(Value::as_str)
                     .or_else(|| ev.get("session_id").and_then(Value::as_str));
                 if sid.is_some() && sid == self.cur_sid().as_deref() {
                     let kind = ev.get("type").and_then(Value::as_str).unwrap_or("");
                     match self.focus {
-                        Pane::Changes | Pane::Hunks if kind == "overlay" =>
-                            self.refresh_changes_preserving_cursor(),
-                        Pane::Processes if kind == "process_added" =>
-                            self.refresh_processes_preserving_cursor(),
-                        Pane::Outputs if kind == "overlay" =>
-                            self.refresh_outputs_preserving_cursor(),
+                        Pane::Changes | Pane::Hunks if kind == "overlay" => {
+                            self.refresh_changes_preserving_cursor()
+                        }
+                        Pane::Processes if kind == "process_added" => {
+                            self.refresh_processes_preserving_cursor()
+                        }
+                        Pane::Outputs if kind == "overlay" => {
+                            self.refresh_outputs_preserving_cursor()
+                        }
                         Pane::Sessions => self.refresh_recent_changes(),
                         _ => {}
                     }
@@ -5098,15 +5874,19 @@ impl App {
             }
             Some("brush_prov") => {
                 let sid = ev.get("session_id").and_then(Value::as_str);
-                if sid.is_some() && sid == self.cur_sid().as_deref()
-                    && self.focus == Pane::Pipelines {
+                if sid.is_some()
+                    && sid == self.cur_sid().as_deref()
+                    && self.focus == Pane::Pipelines
+                {
                     self.refresh_pipelines_preserving_cursor();
                 }
             }
             Some("build_edges") => {
                 let sid = ev.get("session_id").and_then(Value::as_str);
-                if sid.is_some() && sid == self.cur_sid().as_deref()
-                    && self.focus == Pane::BuildEdges {
+                if sid.is_some()
+                    && sid == self.cur_sid().as_deref()
+                    && self.focus == Pane::BuildEdges
+                {
                     self.refresh_build_edges_preserving_cursor();
                 }
             }
@@ -5116,8 +5896,8 @@ impl App {
             // selection so a grown list never strands the cursor.
             Some("webcap_added") => {
                 let sid = ev.get("sid").and_then(Value::as_str);
-                if sid.is_some() && sid == self.cur_sid().as_deref()
-                    && self.focus == Pane::Network {
+                if sid.is_some() && sid == self.cur_sid().as_deref() && self.focus == Pane::Network
+                {
                     self.load_webcap();
                 }
             }
@@ -5212,7 +5992,13 @@ impl App {
         } else {
             seed.iter().map(ClauseRow::from_clause).collect()
         };
-        self.modal = Some(Modal::Search { view: v, kinds, rows, sel: 0, field: ClauseField::Pattern });
+        self.modal = Some(Modal::Search {
+            view: v,
+            kinds,
+            rows,
+            sel: 0,
+            field: ClauseField::Pattern,
+        });
     }
 
     /// Commit the clause editor: drop empty-pattern rows; if any enabled clause
@@ -5229,7 +6015,11 @@ impl App {
             // (scroll_view_to_id is a no-op when the id was filtered out —
             // the cursor then rests at the top of the filtered list).
             let anchor_id = self.selected_item_id(v);
-            *self.view_filter_mut(v) = ViewFilter { clauses, on: true, generated: false };
+            *self.view_filter_mut(v) = ViewFilter {
+                clauses,
+                on: true,
+                generated: false,
+            };
             self.reset_view_cursor(v);
             self.push_view_filter(v);
             if let Some(aid) = anchor_id {
@@ -5304,9 +6094,13 @@ impl App {
     /// Home / End: jump to the first / last row of the focused list (or the
     /// top / bottom of a right-focused detail body).
     #[cfg_attr(test, allow(dead_code))]
-    fn move_home(&mut self) { self.move_extreme(false); }
+    fn move_home(&mut self) {
+        self.move_extreme(false);
+    }
     #[cfg_attr(test, allow(dead_code))]
-    fn move_end(&mut self) { self.move_extreme(true); }
+    fn move_end(&mut self) {
+        self.move_extreme(true);
+    }
 
     fn move_extreme(&mut self, end: bool) {
         if self.right_focused && self.right_pane_scrollable() {
@@ -5316,13 +6110,17 @@ impl App {
         // (view, total) for the windowed lists; the small in-memory lists
         // are handled per-pane below.
         let goto = |app: &mut Self, v: FilterView, total: usize| {
-            if total == 0 { return; }
+            if total == 0 {
+                return;
+            }
             app.goto_view_pos(v, if end { total - 1 } else { 0 });
         };
         match self.focus {
             Pane::Reader | Pane::Editor => {}
             Pane::Sessions => {
-                if self.sessions.is_empty() { return; }
+                if self.sessions.is_empty() {
+                    return;
+                }
                 let new = if end { self.sessions.len() - 1 } else { 0 };
                 if new != self.sel_session {
                     self.sel_session = new;
@@ -5337,24 +6135,43 @@ impl App {
                 goto(self, FilterView::Procs, self.processes_total);
                 // The first/last row can be a structural connector the cursor
                 // shouldn't land on; nudge off it in the inward direction.
-                let is_connector = self.processes.get(self.sel_proc)
+                let is_connector = self
+                    .processes
+                    .get(self.sel_proc)
                     .and_then(|r| r.get("connector").and_then(Value::as_bool))
                     .unwrap_or(false);
-                if is_connector { self.move_proc_cursor(if end { -1 } else { 1 }); }
+                if is_connector {
+                    self.move_proc_cursor(if end { -1 } else { 1 });
+                }
             }
-            Pane::Outputs => { goto(self, FilterView::Outputs, self.outputs_total); self.right_scroll = 0; }
-            Pane::Pipelines => { goto(self, FilterView::Pipelines, self.pipelines_total); self.right_scroll = 0; }
-            Pane::BuildEdges => { goto(self, FilterView::BuildEdges, self.edges_total); self.right_scroll = 0; }
+            Pane::Outputs => {
+                goto(self, FilterView::Outputs, self.outputs_total);
+                self.right_scroll = 0;
+            }
+            Pane::Pipelines => {
+                goto(self, FilterView::Pipelines, self.pipelines_total);
+                self.right_scroll = 0;
+            }
+            Pane::BuildEdges => {
+                goto(self, FilterView::BuildEdges, self.edges_total);
+                self.right_scroll = 0;
+            }
             Pane::Rules => {
-                if self.rules.is_empty() { return; }
+                if self.rules.is_empty() {
+                    return;
+                }
                 self.sel_rule = if end { self.rules.len() - 1 } else { 0 };
             }
             Pane::Mirrors => {
-                if self.mirror_jobs.is_empty() { return; }
+                if self.mirror_jobs.is_empty() {
+                    return;
+                }
                 self.sel_mirror = if end { self.mirror_jobs.len() - 1 } else { 0 };
             }
             Pane::Flows => {
-                if self.flows.is_empty() { return; }
+                if self.flows.is_empty() {
+                    return;
+                }
                 let new = if end { self.flows.len() - 1 } else { 0 };
                 if new != self.sel_flow {
                     self.sel_flow = new;
@@ -5363,7 +6180,9 @@ impl App {
                 }
             }
             Pane::Packets => {
-                if self.packets.is_empty() { return; }
+                if self.packets.is_empty() {
+                    return;
+                }
                 let new = if end { self.packets.len() - 1 } else { 0 };
                 if new != self.sel_packet {
                     self.sel_packet = new;
@@ -5372,32 +6191,44 @@ impl App {
                 }
             }
             Pane::ApiLogs => {
-                if self.api_log_rows.is_empty() { return; }
+                if self.api_log_rows.is_empty() {
+                    return;
+                }
                 self.sel_api_log = if end { self.api_log_rows.len() - 1 } else { 0 };
             }
             Pane::Network => {
-                if self.webcap_rows.is_empty() { return; }
+                if self.webcap_rows.is_empty() {
+                    return;
+                }
                 self.sel_webcap = if end { self.webcap_rows.len() - 1 } else { 0 };
             }
             Pane::Trace => {
-                if self.trace_rows.is_empty() { return; }
+                if self.trace_rows.is_empty() {
+                    return;
+                }
                 self.sel_trace = if end { self.trace_rows.len() - 1 } else { 0 };
             }
             Pane::Vars => {
-                if self.vars_rows.is_empty() { return; }
+                if self.vars_rows.is_empty() {
+                    return;
+                }
                 self.sel_var = if end { self.vars_rows.len() - 1 } else { 0 };
             }
             Pane::Hunks => {
                 if end {
                     let n = self.hunk_indices().len();
-                    if n > 1 { self.sel_hunk = n - 1; }
+                    if n > 1 {
+                        self.sel_hunk = n - 1;
+                    }
                 } else {
                     self.sel_hunk = 0;
                     self.hunk_scroll = 0;
                 }
             }
             Pane::Help => {
-                if !end { self.out_scroll = 0; }
+                if !end {
+                    self.out_scroll = 0;
+                }
             }
             Pane::Pty => {}
             Pane::Inspect => self.ins_extreme(end),
@@ -5436,10 +6267,13 @@ impl App {
     }
 
     fn scroll_view_to_id(&mut self, v: FilterView, target_id: i64) {
-        let Some(vid) = self.view_id_for(v) else { return };
+        let Some(vid) = self.view_id_for(v) else {
+            return;
+        };
         let pos = match rpc(&self.sock, "view.find", json!([vid, target_id])) {
-            Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) =>
-                r.get("pos").and_then(Value::as_u64).unwrap_or(0) as usize,
+            Ok(r) if r.get("ok").and_then(Value::as_bool) == Some(true) => {
+                r.get("pos").and_then(Value::as_u64).unwrap_or(0) as usize
+            }
             _ => return,
         };
         self.goto_view_pos(v, pos);
@@ -5505,7 +6339,10 @@ impl App {
             FilterView::Procs => {
                 let p = self.visible_processes();
                 let row = p.get(self.sel_proc)?;
-                let rid = row.as_array().and_then(|x| x.first()).and_then(Value::as_i64)?;
+                let rid = row
+                    .as_array()
+                    .and_then(|x| x.first())
+                    .and_then(Value::as_i64)?;
                 ("process", vec![rid])
             }
             FilterView::Outputs => {
@@ -5558,12 +6395,15 @@ impl App {
         };
         // Vars is not a FilterView, but a selected assignment carries its
         // execution context (recipe edge / pipeline) — cross-navigate on it.
-        if self.focus == Pane::Vars && let Some(dest) = dest {
+        if self.focus == Pane::Vars
+            && let Some(dest) = dest
+        {
             let src = self.vars_rows.get(self.sel_var).and_then(|r| {
                 if let Some(eid) = r.get("edge_id").and_then(Value::as_i64) {
                     Some(("edge", vec![eid]))
                 } else {
-                    r.get("pipeline_id").and_then(Value::as_i64)
+                    r.get("pipeline_id")
+                        .and_then(Value::as_i64)
                         .map(|pid| ("pipeline", vec![pid]))
                 }
             });
@@ -5588,10 +6428,17 @@ impl App {
     fn install_nav_filter(&mut self, dest: FilterView, ids: Option<Vec<i64>>) {
         let touched = match ids {
             Some(ids) => {
-                let pat = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                let pat = ids
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 *self.view_filter_mut(dest) = ViewFilter {
                     clauses: vec![Clause {
-                        m: Match { kind: "ids".into(), pattern: pat },
+                        m: Match {
+                            kind: "ids".into(),
+                            pattern: pat,
+                        },
                         join: Join::And,
                         negate: false,
                         enabled: true,
@@ -5607,18 +6454,22 @@ impl App {
                     *self.view_filter_mut(dest) = ViewFilter::default();
                     self.reset_view_cursor(dest);
                     true
-                } else { false }
+                } else {
+                    false
+                }
             }
         };
-        if touched { self.push_view_filter(dest); }
+        if touched {
+            self.push_view_filter(dest);
+        }
     }
 
     /// Translate provenance-domain row ids to `dest`'s domain (review.map_ids
     /// when they differ). None when nothing maps.
-    fn translate_ids(
-        &self, from: &str, ids: Vec<i64>, dest: FilterView,
-    ) -> Option<Vec<i64>> {
-        if ids.is_empty() { return None; }
+    fn translate_ids(&self, from: &str, ids: Vec<i64>, dest: FilterView) -> Option<Vec<i64>> {
+        if ids.is_empty() {
+            return None;
+        }
         let sid = self.cur_sid()?;
         let to = match dest {
             FilterView::Pipelines => "pipeline",
@@ -5648,7 +6499,8 @@ impl App {
 struct ProcTreeRow {
     rid: i64,
     tgid: i64,
-    #[allow(dead_code)] ppid: i64,
+    #[allow(dead_code)]
+    ppid: i64,
     exe: String,
     argv: Vec<String>,
     depth: usize,
@@ -5664,8 +6516,16 @@ fn pairs_of(v: Option<&Value>) -> Vec<(String, String)> {
             a.iter()
                 .map(|p| {
                     let arr = p.as_array();
-                    let style = arr.and_then(|x| x.first()).and_then(Value::as_str).unwrap_or("").to_string();
-                    let text = arr.and_then(|x| x.get(1)).and_then(Value::as_str).unwrap_or("").to_string();
+                    let style = arr
+                        .and_then(|x| x.first())
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let text = arr
+                        .and_then(|x| x.get(1))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     (style, text)
                 })
                 .collect()
@@ -5720,9 +6580,15 @@ fn filemode(mode: i64) -> String {
     let mut s = String::new();
     s.push(ft);
     let perms = [
-        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
-        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
-        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
+        (0o400, 'r'),
+        (0o200, 'w'),
+        (0o100, 'x'),
+        (0o040, 'r'),
+        (0o020, 'w'),
+        (0o010, 'x'),
+        (0o004, 'r'),
+        (0o002, 'w'),
+        (0o001, 'x'),
     ];
     for (mask, c) in perms {
         s.push(bit(m & mask != 0, c));
@@ -5737,10 +6603,20 @@ fn hexdump_into(data: &[u8], out: &mut Vec<String>) {
     let mut i = 0;
     while i < n {
         let chunk = &data[i..(i + 16).min(n)];
-        let hex = chunk.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+        let hex = chunk
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let ascii: String = chunk
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         out.push(format!("{i:04x}  {hex:<48}  {ascii}"));
         i += 16;
@@ -5755,11 +6631,17 @@ fn block(t: String, focused: bool) -> Block<'static> {
     // Focused pane: cyan-bold DOUBLE border (Norton/Turbo style); blurred:
     // gray plain. No "«focus»" tag in the title — the border carries it.
     let (style, btype) = if focused {
-        (Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-         ratatui::widgets::BorderType::Double)
+        (
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            ratatui::widgets::BorderType::Double,
+        )
     } else {
-        (Style::default().fg(Color::Gray),
-         ratatui::widgets::BorderType::Plain)
+        (
+            Style::default().fg(Color::Gray),
+            ratatui::widgets::BorderType::Plain,
+        )
     };
     Block::default()
         .borders(Borders::ALL)
@@ -5773,22 +6655,27 @@ fn block(t: String, focused: bool) -> Block<'static> {
 fn fmt_age(ts: f64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
     let s = (now - ts).max(0.0) as i64;
-    if s < 60 { format!("{s}s") }
-    else if s < 3600 { format!("{}m{:02}s", s / 60, s % 60) }
-    else { format!("{}h{:02}m", s / 3600, (s % 3600) / 60) }
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
 }
 
 /// Map a session status string to (single-char flag, color) — F column of
 /// the sessions pane (mirrors the prototype's sty()/flag scheme).
 fn session_flag(status: &str) -> (&'static str, Color) {
     match status {
-        "running"  => ("R", Color::Green),
+        "running" => ("R", Color::Green),
         "finished" => ("F", Color::DarkGray),
-        "killed"   => ("K", Color::Red),
-        "error"    => ("E", Color::Red),
-        _          => ("?", Color::Reset),
+        "killed" => ("K", Color::Red),
+        "error" => ("E", Color::Red),
+        _ => ("?", Color::Reset),
     }
 }
 
@@ -5807,8 +6694,10 @@ fn sessions_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let fixed = 1 + 1 + 4 + name_w + pid_w + age_w;
     let cmd_w = usable.saturating_sub(fixed).max(8);
     let mut out = vec![Line::from(Span::styled(
-        format!("{:<1}{:<1} {:<name_w$} {:<pid_w$} {:<cmd_w$} {:>age_w$}",
-                "", "F", "Name", "PID", "Cmd", "Age"),
+        format!(
+            "{:<1}{:<1} {:<name_w$} {:<pid_w$} {:<cmd_w$} {:>age_w$}",
+            "", "F", "Name", "PID", "Cmd", "Age"
+        ),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.sessions.is_empty() {
@@ -5819,7 +6708,9 @@ fn sessions_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     // DFS order — children land immediately after their parent. Depth is the
     // dot count; collapse_chains then flattens single-child runs (e.g. an OCI
     // image's base→layer→…→top spine) onto one indent column, marking each with ⋮.
-    let depths: Vec<usize> = app.sessions.iter()
+    let depths: Vec<usize> = app
+        .sessions
+        .iter()
         .map(|s| match s.get("path").and_then(Value::as_str) {
             Some(p) if !p.is_empty() => p.matches('.').count(),
             _ => 0,
@@ -5832,48 +6723,77 @@ fn sessions_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let (flag, color) = session_flag(&status);
         let path = g("path");
         let (depth, collapsed) = collapse[i];
-        let indent = format!("{}{}", "  ".repeat(depth),
-                             if collapsed { CHAIN_MARK } else { "" });
+        let indent = format!(
+            "{}{}",
+            "  ".repeat(depth),
+            if collapsed { CHAIN_MARK } else { "" }
+        );
         // Display label: name if present, else the dotted-path's last
         // segment, else the session id.
         let basename = {
             let n = g("name");
-            if !n.is_empty() { n }
-            else if !path.is_empty() { path.rsplit('.').next().unwrap_or(&path).to_string() }
-            else { g("session_id") }
+            if !n.is_empty() {
+                n
+            } else if !path.is_empty() {
+                path.rsplit('.').next().unwrap_or(&path).to_string()
+            } else {
+                g("session_id")
+            }
         };
         let pid = s.get("pid").and_then(Value::as_i64).unwrap_or(0);
-        let cmd = s.get("cmd").and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+        let cmd = s
+            .get("cmd")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
             .unwrap_or_default();
         let cmdc: String = cmd.chars().take(cmd_w).collect();
         let started = s.get("started").and_then(Value::as_f64).unwrap_or(0.0);
-        let age = if started > 0.0 { fmt_age(started) } else { String::new() };
-        let pid_str = if pid > 0 { pid.to_string() } else { String::new() };
+        let age = if started > 0.0 {
+            fmt_age(started)
+        } else {
+            String::new()
+        };
+        let pid_str = if pid > 0 {
+            pid.to_string()
+        } else {
+            String::new()
+        };
         let name_col: String = format!("{indent}{basename}").chars().take(name_w).collect();
         let marked = app.is_marked(&g("session_id"));
         let mark = if marked { MARK_GLYPH } else { " " };
-        let text = format!("{mark}{flag:<1} {name_col:<name_w$} {pid_str:<pid_w$} {cmdc:<cmd_w$} {age:>age_w$}");
+        let text = format!(
+            "{mark}{flag:<1} {name_col:<name_w$} {pid_str:<pid_w$} {cmdc:<cmd_w$} {age:>age_w$}"
+        );
         let base = if i == app.sel_session {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         } else if marked {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(color)
         };
         // External RO references (session_dict "attachments") ride the
         // owning row — they are not boxes, so they get no row of their
         // own; a dim trailing tag per attachment names the pinned rev.
-        let atts: String = s.get("attachments").and_then(Value::as_array)
-            .map(|a| a.iter()
-                .filter_map(|x| x.get("name").and_then(Value::as_str))
-                .map(|n| format!(" ⟨{n}⟩"))
-                .collect())
+        let atts: String = s
+            .get("attachments")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.get("name").and_then(Value::as_str))
+                    .map(|n| format!(" ⟨{n}⟩"))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut spans = vec![Span::styled(text, base)];
         if !atts.is_empty() {
-            spans.push(Span::styled(atts,
-                base.add_modifier(Modifier::DIM)));
+            spans.push(Span::styled(atts, base.add_modifier(Modifier::DIM)));
         }
         out.push(Line::from(spans));
     }
@@ -5883,7 +6803,9 @@ fn sessions_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 /// Plain-space tree indent (used by both the procs and changes panes —
 /// the earlier "└ " glyph hurt legibility more than it added structure;
 /// the depth alone is enough).
-fn tree_indent(depth: usize) -> String { "  ".repeat(depth) }
+fn tree_indent(depth: usize) -> String {
+    "  ".repeat(depth)
+}
 
 /// Marker prefixed to a row that belongs to a collapsed single-child chain
 /// (see `collapse_chains`). Three vertical dots — the run reads as one spine.
@@ -5911,7 +6833,11 @@ fn collapse_chains(depths: &[usize]) -> Vec<(usize, bool)> {
     for i in 0..n {
         // Unwind the ancestor stack to the nearest shallower row.
         while let Some(&t) = stack.last() {
-            if depths[t] >= depths[i] { stack.pop(); } else { break; }
+            if depths[t] >= depths[i] {
+                stack.pop();
+            } else {
+                break;
+            }
         }
         if let Some(&p) = stack.last() {
             // Only a row exactly one level up is a DIRECT parent; a deeper jump
@@ -5926,14 +6852,19 @@ fn collapse_chains(depths: &[usize]) -> Vec<(usize, bool)> {
     let mut dd = vec![0usize; n];
     for i in 0..n {
         let p = parent[i];
-        dd[i] = if p == usize::MAX { 0 }
-                else { dd[p] + usize::from(child_count[p] > 1) };
+        dd[i] = if p == usize::MAX {
+            0
+        } else {
+            dd[p] + usize::from(child_count[p] > 1)
+        };
     }
-    (0..n).map(|i| {
-        let sole_child = parent[i] != usize::MAX && child_count[parent[i]] == 1;
-        let has_one_child = child_count[i] == 1;
-        (dd[i], sole_child || has_one_child)
-    }).collect()
+    (0..n)
+        .map(|i| {
+            let sole_child = parent[i] != usize::MAX && child_count[parent[i]] == 1;
+            let has_one_child = child_count[i] == 1;
+            (dd[i], sole_child || has_one_child)
+        })
+        .collect()
 }
 
 /// Render the cached cd_info tuples (style-tag, text) as styled Lines —
@@ -5941,24 +6872,32 @@ fn collapse_chains(depths: &[usize]) -> Vec<(usize, bool)> {
 /// binary structural-diff header uses.
 fn cd_info_lines(app: &App) -> Vec<Line<'static>> {
     let Some(items) = app.cd_info.as_ref() else {
-        return vec![Line::from(Span::styled("(select a change)",
-            Style::default().add_modifier(Modifier::DIM)))];
+        return vec![Line::from(Span::styled(
+            "(select a change)",
+            Style::default().add_modifier(Modifier::DIM),
+        ))];
     };
-    items.iter().map(|(tag, txt)| {
-        let st = match tag.as_str() {
-            "bold" => Style::default().add_modifier(Modifier::BOLD),
-            "stale" => Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED),
-            _ => Style::default().fg(Color::DarkGray),
-        };
-        Line::from(Span::styled(txt.clone(), st))
-    }).collect()
+    items
+        .iter()
+        .map(|(tag, txt)| {
+            let st = match tag.as_str() {
+                "bold" => Style::default().add_modifier(Modifier::BOLD),
+                "stale" => Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::REVERSED),
+                _ => Style::default().fg(Color::DarkGray),
+            };
+            Line::from(Span::styled(txt.clone(), st))
+        })
+        .collect()
 }
 
 fn changes_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let mut out = legend_lines(
         "Flags: + - created, ~ - modified, - - deleted, @ - xattr, \
 ! - stale vs host",
-        width);
+        width,
+    );
     out.push(Line::from(Span::styled(
         format!("{:<1}{:<1} {:>10}  {}", "", "", "SIZE", "PATH"),
         Style::default().add_modifier(Modifier::BOLD),
@@ -5966,7 +6905,11 @@ fn changes_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let vis = app.visible_changes();
     if vis.is_empty() {
         let empty_msg = if app.changes_total == 0 {
-            if app.f_changes.active().is_some() { "(no changes match filter)" } else { "(no changes)" }
+            if app.f_changes.active().is_some() {
+                "(no changes match filter)"
+            } else {
+                "(no changes)"
+            }
         } else {
             "(empty window — engine view drifted)"
         };
@@ -5974,9 +6917,11 @@ fn changes_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         return out;
     }
     // Collapse single-child directory spines (a/b/c/d) onto one column.
-    let collapse = collapse_chains(&vis.iter()
-        .map(|c| c.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize)
-        .collect::<Vec<_>>());
+    let collapse = collapse_chains(
+        &vis.iter()
+            .map(|c| c.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize)
+            .collect::<Vec<_>>(),
+    );
     for (i, c) in vis.iter().enumerate() {
         let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
         let name = c.get("name").and_then(Value::as_str).unwrap_or("");
@@ -5984,18 +6929,21 @@ fn changes_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let connector = c.get("connector").and_then(Value::as_bool) == Some(true);
         // Prefer the per-row decoration (created vs modified, plus stale).
         // The source row's `kind` only knows deleted / symlink / changed.
-        let (dec_kind, stale) = app.changes_decor.get(i)
-            .map(|(k, s)| (k.as_str(), *s)).unwrap_or(("", false));
+        let (dec_kind, stale) = app
+            .changes_decor
+            .get(i)
+            .map(|(k, s)| (k.as_str(), *s))
+            .unwrap_or(("", false));
         let effective_kind = if !dec_kind.is_empty() { dec_kind } else { kind };
         let (glyph, color) = match effective_kind {
-            "created"  => ("+", Color::Green),
+            "created" => ("+", Color::Green),
             "modified" => ("~", Color::Yellow),
-            "deleted"  => ("-", Color::Red),
-            "symlink"  => ("~", Color::Magenta),
-            "changed"  => ("~", Color::Yellow),
+            "deleted" => ("-", Color::Red),
+            "symlink" => ("~", Color::Magenta),
+            "changed" => ("~", Color::Yellow),
             // xattr leaf: indented under its file, displays the key
             // (set as `name`) and the value byte count (set as `size`).
-            "xattr"    => ("@", Color::Cyan),
+            "xattr" => ("@", Color::Cyan),
             // xattr-only file: an xattr was set on a path whose data
             // didn't change (no sqlar row of its own — the box just
             // chattr-tagged a passthrough file). Distinct dim glyph so
@@ -6004,38 +6952,68 @@ fn changes_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             _ => ("…", Color::DarkGray),
         };
         let (cdepth, collapsed) = collapse[i];
-        let indent = format!("{}{}", tree_indent(cdepth),
-                             if collapsed { CHAIN_MARK } else { "" });
+        let indent = format!(
+            "{}{}",
+            tree_indent(cdepth),
+            if collapsed { CHAIN_MARK } else { "" }
+        );
         let path = c.get("path").and_then(Value::as_str).unwrap_or("");
         let marked = !connector && app.is_marked(path);
         let mk = if marked { MARK_GLYPH } else { " " };
         let line = if connector {
             let text = format!("{:<1}{:<1} {:>10}  {indent}{name}/", "", "", "");
-            Line::from(Span::styled(text,
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)))
+            Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ))
         } else if i == app.sel_change {
-            let sz = if size > 0 { fmt_bytes(size) } else { String::new() };
+            let sz = if size > 0 {
+                fmt_bytes(size)
+            } else {
+                String::new()
+            };
             let stale_mark = if stale { "!" } else { "" };
             let text = format!("{mk}{glyph}{stale_mark:<1} {sz:>10}  {indent}{name}");
-            Line::from(Span::styled(text,
-                Style::default().fg(Color::Black).bg(Color::Cyan)))
+            Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))
         } else {
-            let sz = if size > 0 { fmt_bytes(size) } else { String::new() };
+            let sz = if size > 0 {
+                fmt_bytes(size)
+            } else {
+                String::new()
+            };
             let mut spans = vec![
-                Span::styled(mk.to_string(),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    mk.to_string(),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(glyph.to_string(), Style::default().fg(color)),
             ];
             if stale {
-                spans.push(Span::styled("!",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED)));
+                spans.push(Span::styled(
+                    "!",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::REVERSED),
+                ));
             } else {
                 spans.push(Span::raw(" "));
             }
             spans.push(Span::raw(format!(" {sz:>10}  {indent}")));
-            spans.push(Span::styled(name.to_string(),
-                if stale { Style::default().fg(Color::Red) }
-                else { Style::default().fg(color) }));
+            spans.push(Span::styled(
+                name.to_string(),
+                if stale {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(color)
+                },
+            ));
             Line::from(spans)
         };
         out.push(line);
@@ -6065,8 +7043,14 @@ fn hunk_lines(app: &App) -> Vec<Line<'static>> {
                 if let Some(lines) = hunk.get("lines").and_then(Value::as_array) {
                     for l in lines {
                         let arr = l.as_array();
-                        let tag = arr.and_then(|a| a.first()).and_then(Value::as_str).unwrap_or(" ");
-                        let txt = arr.and_then(|a| a.get(1)).and_then(Value::as_str).unwrap_or("");
+                        let tag = arr
+                            .and_then(|a| a.first())
+                            .and_then(Value::as_str)
+                            .unwrap_or(" ");
+                        let txt = arr
+                            .and_then(|a| a.get(1))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
                         let (prefix, color) = match tag {
                             "hdr" => ("", Color::Cyan),
                             "+" => ("+", Color::Green),
@@ -6074,7 +7058,13 @@ fn hunk_lines(app: &App) -> Vec<Line<'static>> {
                             _ => (" ", Color::Gray),
                         };
                         // mark the hunk under the cursor (a/x apply/discard target).
-                        let mark = if on_cursor && tag == "hdr" { "▶ " } else if tag == "hdr" { "  " } else { "" };
+                        let mark = if on_cursor && tag == "hdr" {
+                            "▶ "
+                        } else if tag == "hdr" {
+                            "  "
+                        } else {
+                            ""
+                        };
                         let mut st = Style::default().fg(color);
                         if on_cursor {
                             st = st.add_modifier(Modifier::BOLD);
@@ -6096,7 +7086,9 @@ fn hunk_lines(app: &App) -> Vec<Line<'static>> {
         for (style, txt) in &app.structd.header {
             let st = match style.as_str() {
                 "bold" => Style::default().add_modifier(Modifier::BOLD),
-                "stale" => Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED),
+                "stale" => Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::REVERSED),
                 _ => Style::default().fg(Color::DarkGray),
             };
             out.push(Line::from(Span::styled(txt.clone(), st)));
@@ -6106,7 +7098,11 @@ fn hunk_lines(app: &App) -> Vec<Line<'static>> {
         }
         // If the full structural diff has returned, render it; else the quick
         // (type + header) lines, plus a spinner row while the finish is pending.
-        let lines = app.structd.full_lines.as_ref().unwrap_or(&app.structd.quick_lines);
+        let lines = app
+            .structd
+            .full_lines
+            .as_ref()
+            .unwrap_or(&app.structd.quick_lines);
         for (style, txt) in lines {
             let prefix = match style.as_str() {
                 "+" => "+",
@@ -6129,7 +7125,10 @@ fn hunk_lines(app: &App) -> Vec<Line<'static>> {
         }
         // hexdump fallback (unrecognized type): before/after bytes.
         for l in &app.structd.hex_lines {
-            out.push(Line::from(Span::styled(l.clone(), Style::default().fg(Color::DarkGray))));
+            out.push(Line::from(Span::styled(
+                l.clone(),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         if out.is_empty() {
             out.push(Line::from("(binary change)"));
@@ -6150,18 +7149,31 @@ impl App {
     /// walk per keystroke (that walk was N proc_info RPCs per row per
     /// render, which was the multi-second hot path).
     fn proc_tree_rows(&self) -> Vec<ProcTreeRow> {
-        self.processes.iter().map(|p| ProcTreeRow {
-            rid: p.get("rid").and_then(Value::as_i64).unwrap_or(-1),
-            tgid: p.get("tgid").and_then(Value::as_i64).unwrap_or(0),
-            ppid: p.get("ppid").and_then(Value::as_i64).unwrap_or(0),
-            exe: p.get("exe").and_then(Value::as_str).unwrap_or("").to_string(),
-            argv: p.get("argv").and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str)
-                          .map(String::from).collect())
-                .unwrap_or_default(),
-            depth: p.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize,
-            connector: p.get("connector").and_then(Value::as_bool).unwrap_or(false),
-        }).collect()
+        self.processes
+            .iter()
+            .map(|p| ProcTreeRow {
+                rid: p.get("rid").and_then(Value::as_i64).unwrap_or(-1),
+                tgid: p.get("tgid").and_then(Value::as_i64).unwrap_or(0),
+                ppid: p.get("ppid").and_then(Value::as_i64).unwrap_or(0),
+                exe: p
+                    .get("exe")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                argv: p
+                    .get("argv")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                depth: p.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize,
+                connector: p.get("connector").and_then(Value::as_bool).unwrap_or(false),
+            })
+            .collect()
     }
 }
 
@@ -6183,8 +7195,12 @@ fn processes_lines(app: &App) -> Vec<Line<'static>> {
         let msg = if app.processes_total == 0 {
             if app.f_procs.active().is_some() {
                 "(no processes match filter)"
-            } else { "(no captured processes)" }
-        } else { "(empty window — engine view drifted)" };
+            } else {
+                "(no captured processes)"
+            }
+        } else {
+            "(empty window — engine view drifted)"
+        };
         out.push(Line::from(msg));
         return out;
     }
@@ -6196,34 +7212,76 @@ fn processes_lines(app: &App) -> Vec<Line<'static>> {
         // back to exe when argv is empty (e.g. an exec without a recorded
         // argv). Take the basename so a long /usr/local/bin/foo doesn't
         // drown out the rest of the row.
-        let anchor_path = r.argv.first().filter(|s| !s.is_empty()).cloned()
+        let anchor_path = r
+            .argv
+            .first()
+            .filter(|s| !s.is_empty())
+            .cloned()
             .unwrap_or_else(|| r.exe.clone());
-        let anchor = anchor_path.rsplit('/').next().unwrap_or(&anchor_path).to_string();
-        let rest_argv = if r.argv.len() > 1 { r.argv[1..].join(" ") } else { String::new() };
+        let anchor = anchor_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&anchor_path)
+            .to_string();
+        let rest_argv = if r.argv.len() > 1 {
+            r.argv[1..].join(" ")
+        } else {
+            String::new()
+        };
         let (cdepth, collapsed) = collapse[i];
-        let indent = format!("{}{}", "  ".repeat(cdepth),
-                             if collapsed { CHAIN_MARK } else { "" });
+        let indent = format!(
+            "{}{}",
+            "  ".repeat(cdepth),
+            if collapsed { CHAIN_MARK } else { "" }
+        );
 
         let (anchor_style, rest_style) = if Some(i) == hi {
-            (Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
-             Style::default().fg(Color::Black).bg(Color::Cyan))
+            (
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            )
         } else if r.connector {
-            (Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-             Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))
+            (
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            )
         } else {
-            (Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-             Style::default().fg(Color::DarkGray))
+            (
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::DarkGray),
+            )
         };
-        let tgid_str = if r.connector { String::new() } else { r.tgid.to_string() };
+        let tgid_str = if r.connector {
+            String::new()
+        } else {
+            r.tgid.to_string()
+        };
         let mut spans = vec![
-            Span::styled(format!("{tgid_str:>6}  "),
-                         if Some(i) == hi {
-                             Style::default().fg(Color::Black).bg(Color::Cyan)
-                         } else { Style::default() }),
-            Span::styled(indent,
-                         if Some(i) == hi {
-                             Style::default().fg(Color::Black).bg(Color::Cyan)
-                         } else { Style::default() }),
+            Span::styled(
+                format!("{tgid_str:>6}  "),
+                if Some(i) == hi {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::styled(
+                indent,
+                if Some(i) == hi {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default()
+                },
+            ),
             Span::styled(anchor, anchor_style),
         ];
         if !rest_argv.is_empty() {
@@ -6269,13 +7327,21 @@ fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
     let (mut nout, mut nerr) = (0i64, 0i64);
     for o in &app.outputs {
         let len = o.get("len").and_then(Value::as_i64).unwrap_or(0);
-        if o.get("stream").and_then(Value::as_i64).unwrap_or(0) == 1 { nerr += len; }
-        else { nout += len; }
+        if o.get("stream").and_then(Value::as_i64).unwrap_or(0) == 1 {
+            nerr += len;
+        } else {
+            nout += len;
+        }
     }
     out.push(Line::from(Span::styled(
-        format!("{} write(s) · {} stdout B · {} stderr B",
-                app.outputs.len(), nout, nerr),
-        Style::default().add_modifier(Modifier::BOLD))));
+        format!(
+            "{} write(s) · {} stdout B · {} stderr B",
+            app.outputs.len(),
+            nout,
+            nerr
+        ),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
     if app.output_segs.is_empty() {
         out.push(Line::from("(no captured output)"));
         return (out, sel_line);
@@ -6283,14 +7349,18 @@ fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
     // Selected entry's id (used to drive the gutter mark and the window
     // centre). sel_output indexes the OUTPUTS index list, which lines up
     // with output_segs by construction.
-    let sel_oid = app.outputs.get(app.sel_output)
+    let sel_oid = app
+        .outputs
+        .get(app.sel_output)
         .and_then(|o| o.get("id").and_then(Value::as_i64));
     // Total concat size + selected entry's start offset (for centring).
     let total: usize = app.output_segs.iter().map(|(_, _, t)| t.len()).sum();
     let mut sel_off = 0usize;
     let mut acc = 0usize;
     for (oid, _st, txt) in &app.output_segs {
-        if Some(*oid) == sel_oid { sel_off = acc; }
+        if Some(*oid) == sel_oid {
+            sel_off = acc;
+        }
         acc += txt.len();
     }
     // Centre the window on sel_off, then clamp.
@@ -6300,11 +7370,14 @@ fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
         let e = (s + OUTPUT_WINDOW_CAP).min(total);
         s = e.saturating_sub(OUTPUT_WINDOW_CAP);
         (s, e)
-    } else { (0, total) };
+    } else {
+        (0, total)
+    };
     if start > 0 {
         out.push(Line::from(Span::styled(
             format!("  … {} earlier", fmt_bytes(start as i64)),
-            Style::default().add_modifier(Modifier::DIM))));
+            Style::default().add_modifier(Modifier::DIM),
+        )));
     }
     // Walk segments line-by-line within [start, end), applying gutter +
     // style per the prototype.
@@ -6313,7 +7386,9 @@ fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
         let seg_start = pos;
         let seg_end = pos + txt.len();
         pos = seg_end;
-        if seg_end <= start || seg_start >= end { continue; }
+        if seg_end <= start || seg_start >= end {
+            continue;
+        }
         // Visible slice of this segment.
         let lo = start.saturating_sub(seg_start);
         let hi = txt.len() - seg_end.saturating_sub(end);
@@ -6325,19 +7400,31 @@ fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
         let vis = char_safe_slice(txt, lo, hi);
         let is_sel = Some(*oid) == sel_oid;
         let mut text_style = Style::default();
-        if *stream == 1 { text_style = text_style.fg(Color::Red); }
+        if *stream == 1 {
+            text_style = text_style.fg(Color::Red);
+        }
         if is_sel {
-            text_style = text_style.add_modifier(Modifier::BOLD).bg(Color::Rgb(58, 58, 58));
+            text_style = text_style
+                .add_modifier(Modifier::BOLD)
+                .bg(Color::Rgb(58, 58, 58));
         }
         let gutter_style = if is_sel {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else { Style::default().add_modifier(Modifier::DIM) };
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
         let gutter = if is_sel { "▌ " } else { "  " };
-        if is_sel && sel_line == 0 { sel_line = out.len(); }
+        if is_sel && sel_line == 0 {
+            sel_line = out.len();
+        }
         let lines: Vec<&str> = vis.split('\n').collect();
         let last_idx = lines.len().saturating_sub(1);
         for (i, ln) in lines.iter().enumerate() {
-            if ln.is_empty() && i == last_idx && i > 0 { break; }
+            if ln.is_empty() && i == last_idx && i > 0 {
+                break;
+            }
             out.push(Line::from(vec![
                 Span::styled(gutter.to_string(), gutter_style),
                 Span::styled(ln.to_string(), text_style),
@@ -6347,7 +7434,8 @@ fn outputs_lines(app: &App) -> (Vec<Line<'static>>, usize) {
     if end < total {
         out.push(Line::from(Span::styled(
             format!("  … {} more", fmt_bytes((total - end) as i64)),
-            Style::default().add_modifier(Modifier::DIM))));
+            Style::default().add_modifier(Modifier::DIM),
+        )));
     }
     (out, sel_line)
 }
@@ -6394,13 +7482,15 @@ fn vars_index_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         format!("query: name~[{qn}] value~[{qv}]   ('/' to change)")
     };
     let mut out = vec![Line::from(Span::styled(
-        q, Style::default().add_modifier(Modifier::BOLD),
+        q,
+        Style::default().add_modifier(Modifier::BOLD),
     ))];
     out.extend(legend_lines(
         "Flags: s - simple :=, r - recursive =, a - append +=, q - if-unset ?=, \
 ! - shell-assign !=, e - environment, E - env override, c - command line, \
 o - override, u - automatic, S - script assignment, x - exported",
-        width));
+        width,
+    ));
     out.push(Line::from(Span::styled(
         format!("{:<4} {:<26} {}", "", "NAME", "VALUE"),
         Style::default().add_modifier(Modifier::BOLD),
@@ -6418,12 +7508,18 @@ o - override, u - automatic, S - script assignment, x - exported",
         let val = r.get("value").and_then(Value::as_str).unwrap_or("");
         let flags = makevar_flag_letters(r);
         let shellish = flags.starts_with('S');
-        let one: String = val.chars()
-            .map(|c| if c == '\n' { ' ' } else { c }).take(96).collect();
+        let one: String = val
+            .chars()
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .take(96)
+            .collect();
         let name_s: String = name.chars().take(26).collect();
         let text = format!("{:<4} {:<26} {}", flags, name_s, one);
         let line = if i == app.sel_var {
-            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+            Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))
         } else if shellish {
             Line::from(Span::styled(text, Style::default().fg(Color::Magenta)))
         } else {
@@ -6479,9 +7575,13 @@ enum VarNavAction {
 /// to it). Returns the lines and the navigable items (line index + action).
 fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
     let Some(row) = app.vars_rows.get(app.sel_var) else {
-        return (vec![Line::from(Span::styled(
-            "(no assignment selected)",
-            Style::default().add_modifier(Modifier::DIM)))], vec![]);
+        return (
+            vec![Line::from(Span::styled(
+                "(no assignment selected)",
+                Style::default().add_modifier(Modifier::DIM),
+            ))],
+            vec![],
+        );
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -6492,13 +7592,26 @@ fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
     let refs = row.get("refs").and_then(Value::as_str).unwrap_or("");
     let edge_out = row.get("edge_out").and_then(Value::as_str).unwrap_or("");
     let mut out = vec![
-        Line::from(vec![Span::styled("name   ", dim), Span::styled(name.to_string(), bold)]),
-        Line::from(vec![Span::styled("site   ", dim), Span::raw(makevar_site(row))]),
-        Line::from(vec![Span::styled("make   ", dim), Span::raw(mk.to_string())]),
+        Line::from(vec![
+            Span::styled("name   ", dim),
+            Span::styled(name.to_string(), bold),
+        ]),
+        Line::from(vec![
+            Span::styled("site   ", dim),
+            Span::raw(makevar_site(row)),
+        ]),
+        Line::from(vec![
+            Span::styled("make   ", dim),
+            Span::raw(mk.to_string()),
+        ]),
         Line::from(vec![
             Span::styled("flags  ", dim),
-            Span::raw(row.get("flags").and_then(Value::as_str)
-                .unwrap_or("").to_string()),
+            Span::raw(
+                row.get("flags")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
         ]),
     ];
     if !edge_out.is_empty() {
@@ -6522,17 +7635,17 @@ fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
     // in the wrong file.
     {
         let letters = makevar_flag_letters(row);
-        if letters.starts_with('q')
-            && letters.chars().any(|c| matches!(c, 'e' | 'E' | 'c' | 'o'))
-        {
+        if letters.starts_with('q') && letters.chars().any(|c| matches!(c, 'e' | 'E' | 'c' | 'o')) {
             let whom = match letters.chars().nth(1) {
                 Some('c') => "this make's command line",
                 Some('o') => "an override directive",
                 _ => "the environment",
             };
             out.push(Line::from(Span::styled(
-                format!("NOTE: this ?= did NOT assign — the value came from \
-{whom}; the rhs below is the losing default"),
+                format!(
+                    "NOTE: this ?= did NOT assign — the value came from \
+{whom}; the rhs below is the losing default"
+                ),
                 Style::default().fg(Color::Yellow),
             )));
         }
@@ -6549,20 +7662,26 @@ fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
     // Section headers as stand-out chips; rhs/value bodies get a painted
     // background so the value's exact extent — trailing whitespace included —
     // is visible.
-    let header = Style::default().fg(Color::Black).bg(Color::Yellow)
+    let header = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let body_bg = Style::default().bg(Color::Rgb(40, 40, 60));
     if !rhs.is_empty() {
         out.push(Line::from(""));
-        out.push(Line::from(Span::styled(" assignment (as written) ", header)));
+        out.push(Line::from(Span::styled(
+            " assignment (as written) ",
+            header,
+        )));
         for l in rhs.lines() {
             out.push(Line::from(Span::styled(l.to_string(), body_bg)));
         }
-        let ref_names: Vec<&str> =
-            refs.split_whitespace().filter(|r| *r != name).collect();
+        let ref_names: Vec<&str> = refs.split_whitespace().filter(|r| *r != name).collect();
         if !ref_names.is_empty() {
             out.push(Line::from(Span::styled(
-                "dereferences (Tab then ↑/↓ + Enter to follow)", dim)));
+                "dereferences (Tab then ↑/↓ + Enter to follow)",
+                dim,
+            )));
             for rn in ref_names {
                 let on = focused && items.len() == app.sel_var_item;
                 out.push(Line::from(vec![
@@ -6592,8 +7711,11 @@ fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
         }
         let site = tail_trunc(&makevar_site(r), 38);
         let v = r.get("value").and_then(Value::as_str).unwrap_or("");
-        let one: String = v.chars()
-            .map(|c| if c == '\n' { ' ' } else { c }).take(80).collect();
+        let one: String = v
+            .chars()
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .take(80)
+            .collect();
         let on = focused && items.len() == app.sel_var_item;
         let cur = if ri == app.sel_var { "▶" } else { " " };
         out.push(Line::from(vec![
@@ -6608,14 +7730,18 @@ fn var_detail(app: &App) -> (Vec<Line<'static>>, Vec<(usize, VarNavAction)>) {
 
 fn api_log_index_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
-        format!("{:<8} {:<6} {:<5} {:<24} {:<12} {:>7}",
-                "Time", "Method", "Stat", "Path", "Model", "Bytes"),
+        format!(
+            "{:<8} {:<6} {:<5} {:<24} {:<12} {:>7}",
+            "Time", "Method", "Stat", "Path", "Model", "Bytes"
+        ),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.api_log_rows.is_empty() {
         if app.api_endpoint_note.is_empty() {
-            out.push(Line::from("(no API calls — this box wasn't launched \
-                                 with --api, or hasn't made one yet)"));
+            out.push(Line::from(
+                "(no API calls — this box wasn't launched \
+                                 with --api, or hasn't made one yet)",
+            ));
         }
         for l in &app.api_endpoint_note {
             out.push(Line::from(l.clone()));
@@ -6631,19 +7757,30 @@ fn api_log_index_lines(app: &App) -> Vec<Line<'static>> {
         let resp_len = r.get("resp_len").and_then(Value::as_i64).unwrap_or(0);
         let time_label = {
             let secs = ts.rem_euclid(86400);
-            let h = secs / 3600; let m = (secs % 3600) / 60; let s = secs % 60;
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
             format!("{h:02}:{m:02}:{s:02}")
         };
         let path_short: String = path.chars().take(24).collect();
         let model_short: String = model.chars().take(12).collect();
-        let text = format!("{time_label:<8} {method:<6} {status:<5} \
-                            {path_short:<24} {model_short:<12} {resp_len:>7}");
+        let text = format!(
+            "{time_label:<8} {method:<6} {status:<5} \
+                            {path_short:<24} {model_short:<12} {resp_len:>7}"
+        );
         let line = if i == app.sel_api_log {
-            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+            Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))
         } else {
-            let color = if status >= 400 { Color::Red }
-                        else if status >= 200 && status < 300 { Color::Reset }
-                        else { Color::Yellow };
+            let color = if status >= 400 {
+                Color::Red
+            } else if status >= 200 && status < 300 {
+                Color::Reset
+            } else {
+                Color::Yellow
+            };
             Line::from(Span::styled(text, Style::default().fg(color)))
         };
         out.push(line);
@@ -6668,18 +7805,28 @@ fn api_log_detail_lines(app: &App) -> Vec<Line<'static>> {
     let path = row.get("path").and_then(Value::as_str).unwrap_or("");
     let status = row.get("status").and_then(Value::as_i64).unwrap_or(0);
     let stream = row.get("stream").and_then(Value::as_i64).unwrap_or(0) != 0;
-    out.push(Line::from(format!("{path} · model={model} · status={status} · \
-                                 stream={stream}")));
+    out.push(Line::from(format!(
+        "{path} · model={model} · status={status} · \
+                                 stream={stream}"
+    )));
     out.push(Line::from(""));
     if let Some(d) = detail {
-        out.push(Line::from(Span::styled("REQUEST",
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))));
+        out.push(Line::from(Span::styled(
+            "REQUEST",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Yellow),
+        )));
         for l in d.get("req").and_then(Value::as_str).unwrap_or("").lines() {
             out.push(Line::from(l.to_string()));
         }
         out.push(Line::from(""));
-        out.push(Line::from(Span::styled("RESPONSE",
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Green))));
+        out.push(Line::from(Span::styled(
+            "RESPONSE",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Green),
+        )));
         for l in d.get("resp").and_then(Value::as_str).unwrap_or("").lines() {
             out.push(Line::from(l.to_string()));
         }
@@ -6704,7 +7851,10 @@ fn api_log_detail_lines(app: &App) -> Vec<Line<'static>> {
 fn open_replay_in_browser(app: &mut App, source_sid: &str, url: &str) {
     let spki = match crate::net::ca::root_spki_sha256_b64() {
         Ok(s) => s,
-        Err(e) => { app.status = format!("replay: MITM CA unavailable ({e})"); return; }
+        Err(e) => {
+            app.status = format!("replay: MITM CA unavailable ({e})");
+            return;
+        }
     };
     // Per-source replay browser (so two sources don't share one profile), on
     // tap (replay is served by the MITM), capture/filter off — we're serving
@@ -6718,7 +7868,12 @@ fn open_replay_in_browser(app: &mut App, source_sid: &str, url: &str) {
         replay: Some(source_sid.to_string()),
     };
     let argv = build_launch(
-        &LaunchTarget::Browser { url: url.to_string(), spki: Some(spki) }, &how);
+        &LaunchTarget::Browser {
+            url: url.to_string(),
+            spki: Some(spki),
+        },
+        &how,
+    );
     app.open_pty(argv);
     app.status = format!("replaying box {source_sid} in carbonyl — {url}");
 }
@@ -6766,7 +7921,9 @@ mod wiki_serve {
         if let Some(s) = reg.get_mut(root) {
             match s.child.try_wait() {
                 Ok(None) => return Ok(format!("http://{addr}/")), // still live
-                _ => { reg.remove(root); }                        // exited; respawn
+                _ => {
+                    reg.remove(root);
+                } // exited; respawn
             }
         }
         let child = std::process::Command::new(self_exe)
@@ -6784,7 +7941,9 @@ mod wiki_serve {
                 break;
             }
             if let Ok(Some(status)) = child.try_wait() {
-                return Err(format!("wikimak serve exited ({status}) before binding {addr}"));
+                return Err(format!(
+                    "wikimak serve exited ({status}) before binding {addr}"
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -6825,7 +7984,10 @@ mod wiki_serve {
 fn open_image_view(app: &mut App, source: &str, bytes: &[u8]) {
     let img = match image::load_from_memory(bytes) {
         Ok(i) => i,
-        Err(e) => { app.status = format!("image: can't decode {source} ({e})"); return; }
+        Err(e) => {
+            app.status = format!("image: can't decode {source} ({e})");
+            return;
+        }
     };
     let (iw, ih) = (img.width(), img.height());
     let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 30));
@@ -6839,21 +8001,31 @@ fn open_image_view(app: &mut App, source: &str, bytes: &[u8]) {
     let icols = bw.saturating_sub(2);
     let irows = bh.saturating_sub(2);
     let (sixel, note) = if app.sixel_ok && icols > 0 && irows > 0 {
-        let (pw, ph) = crate::sixel::fit_pixels(iw, ih, icols, irows,
-                                                app.cell_px.0, app.cell_px.1);
+        let (pw, ph) = crate::sixel::fit_pixels(iw, ih, icols, irows, app.cell_px.0, app.cell_px.1);
         let resized = image::imageops::resize(
-            &img.to_rgb8(), pw.max(1), ph.max(1),
-            image::imageops::FilterType::Triangle);
-        (crate::sixel::encode_rgb(resized.as_raw(), pw as usize, ph as usize),
-         String::new())
+            &img.to_rgb8(),
+            pw.max(1),
+            ph.max(1),
+            image::imageops::FilterType::Triangle,
+        );
+        (
+            crate::sixel::encode_rgb(resized.as_raw(), pw as usize, ph as usize),
+            String::new(),
+        )
     } else {
-        (Vec::new(),
-         "this terminal reported no sixel support — set SARUN_SIXEL=1 to \
+        (
+            Vec::new(),
+            "this terminal reported no sixel support — set SARUN_SIXEL=1 to \
           force, or open sarun in a sixel terminal (foot, wezterm, xterm \
-          -ti vt340, mlterm).".to_string())
+          -ti vt340, mlterm)."
+                .to_string(),
+        )
     };
     app.modal = Some(Modal::ImageView {
-        title, note, sixel, cells: (bx, by, bw, bh),
+        title,
+        note,
+        sixel,
+        cells: (bx, by, bw, bh),
     });
 }
 
@@ -6863,13 +8035,17 @@ fn open_image_view(app: &mut App, source: &str, bytes: &[u8]) {
 /// cap. Rows arrive newest-first from the `webcap` verb.
 fn webcap_index_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
-        format!("{:<8} {:<6} {:<4} {:<16} {:>7} {}",
-                "Time", "Method", "Stat", "Type", "Bytes", "URL"),
+        format!(
+            "{:<8} {:<6} {:<4} {:<16} {:>7} {}",
+            "Time", "Method", "Stat", "Type", "Bytes", "URL"
+        ),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.webcap_rows.is_empty() {
-        out.push(Line::from("(no web captures — launch this box with --webcap \
-                             on --net tap, or use the browser, then browse)"));
+        out.push(Line::from(
+            "(no web captures — launch this box with --webcap \
+                             on --net tap, or use the browser, then browse)",
+        ));
         return out;
     }
     for (i, r) in app.webcap_rows.iter().enumerate() {
@@ -6882,19 +8058,30 @@ fn webcap_index_lines(app: &App) -> Vec<Line<'static>> {
         let truncated = r.get("truncated").and_then(Value::as_i64).unwrap_or(0) != 0;
         let time_label = {
             let secs = ts.rem_euclid(86400);
-            let h = secs / 3600; let m = (secs % 3600) / 60; let s = secs % 60;
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
             format!("{h:02}:{m:02}:{s:02}")
         };
         let mime_short: String = mime.chars().take(16).collect();
         let mark = if truncated { "‡" } else { "" };
-        let text = format!("{time_label:<8} {method:<6} {status:<4} \
-                            {mime_short:<16} {resp_len:>7} {mark}{url}");
+        let text = format!(
+            "{time_label:<8} {method:<6} {status:<4} \
+                            {mime_short:<16} {resp_len:>7} {mark}{url}"
+        );
         let line = if i == app.sel_webcap {
-            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+            Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))
         } else {
-            let color = if status >= 400 { Color::Red }
-                        else if status >= 200 && status < 300 { Color::Reset }
-                        else { Color::Yellow };
+            let color = if status >= 400 {
+                Color::Red
+            } else if status >= 200 && status < 300 {
+                Color::Reset
+            } else {
+                Color::Yellow
+            };
             Line::from(Span::styled(text, Style::default().fg(color)))
         };
         out.push(line);
@@ -6924,24 +8111,49 @@ fn webcap_detail_lines(app: &App) -> Vec<Line<'static>> {
     out.push(Line::from(format!("status={status} · type={mime}")));
     out.push(Line::from(""));
     if let Some(d) = detail {
-        let section = |out: &mut Vec<Line<'static>>, title: &str, color: Color,
-                       body: &str| {
-            if body.is_empty() { return; }
-            out.push(Line::from(Span::styled(title.to_string(),
-                Style::default().add_modifier(Modifier::BOLD).fg(color))));
-            for l in body.lines() { out.push(Line::from(l.to_string())); }
+        let section = |out: &mut Vec<Line<'static>>, title: &str, color: Color, body: &str| {
+            if body.is_empty() {
+                return;
+            }
+            out.push(Line::from(Span::styled(
+                title.to_string(),
+                Style::default().add_modifier(Modifier::BOLD).fg(color),
+            )));
+            for l in body.lines() {
+                out.push(Line::from(l.to_string()));
+            }
             out.push(Line::from(""));
         };
-        section(&mut out, "REQUEST HEADERS", Color::Yellow,
-                d.get("req_headers").and_then(Value::as_str).unwrap_or(""));
-        section(&mut out, "REQUEST BODY", Color::Yellow,
-                d.get("req_body").and_then(Value::as_str).unwrap_or(""));
-        section(&mut out, "RESPONSE HEADERS", Color::Green,
-                d.get("resp_headers").and_then(Value::as_str).unwrap_or(""));
+        section(
+            &mut out,
+            "REQUEST HEADERS",
+            Color::Yellow,
+            d.get("req_headers").and_then(Value::as_str).unwrap_or(""),
+        );
+        section(
+            &mut out,
+            "REQUEST BODY",
+            Color::Yellow,
+            d.get("req_body").and_then(Value::as_str).unwrap_or(""),
+        );
+        section(
+            &mut out,
+            "RESPONSE HEADERS",
+            Color::Green,
+            d.get("resp_headers").and_then(Value::as_str).unwrap_or(""),
+        );
         let truncated = d.get("truncated").and_then(Value::as_i64).unwrap_or(0) != 0;
         let resp_body = d.get("resp_body").and_then(Value::as_str).unwrap_or("");
-        section(&mut out, if truncated { "RESPONSE BODY (truncated at cap)" }
-                          else { "RESPONSE BODY" }, Color::Green, resp_body);
+        section(
+            &mut out,
+            if truncated {
+                "RESPONSE BODY (truncated at cap)"
+            } else {
+                "RESPONSE BODY"
+            },
+            Color::Green,
+            resp_body,
+        );
     } else {
         out.push(Line::from("(could not load detail — engine offline?)"));
     }
@@ -6958,8 +8170,10 @@ fn trace_index_lines(app: &App) -> Vec<Line<'static>> {
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.trace_rows.is_empty() {
-        out.push(Line::from("(no sud trace — this box was not run under --sud, \
-                             or its trace was reaped)"));
+        out.push(Line::from(
+            "(no sud trace — this box was not run under --sud, \
+                             or its trace was reaped)",
+        ));
         return out;
     }
     for (i, r) in app.trace_rows.iter().enumerate() {
@@ -6972,17 +8186,28 @@ fn trace_index_lines(app: &App) -> Vec<Line<'static>> {
             "STDOUT" | "STDERR" => format!("{} bytes", text.len()),
             "EXIT" => {
                 let ex = r.get("extras").and_then(Value::as_array);
-                let code = ex.and_then(|a| a.get(1)).and_then(Value::as_i64).unwrap_or(0);
-                let status = ex.and_then(|a| a.first()).and_then(Value::as_i64).unwrap_or(0);
-                if status == 1 { format!("signal {code}") }
-                else { format!("exit {code}") }
+                let code = ex
+                    .and_then(|a| a.get(1))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let status = ex
+                    .and_then(|a| a.first())
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if status == 1 {
+                    format!("signal {code}")
+                } else {
+                    format!("exit {code}")
+                }
             }
             _ => text.lines().next().unwrap_or("").to_string(),
         };
         let text_line = format!("{time_label:<12} {kind:<7} {pid:>7}  {summary}");
         let line = if i == app.sel_trace {
-            Line::from(Span::styled(text_line,
-                Style::default().fg(Color::Black).bg(Color::Cyan)))
+            Line::from(Span::styled(
+                text_line,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))
         } else {
             let color = match kind {
                 "EXEC" => Color::Green,
@@ -7018,32 +8243,55 @@ fn trace_detail_lines(app: &App) -> Vec<Line<'static>> {
     let tgid = row.get("tgid").and_then(Value::as_i64).unwrap_or(0);
     let ppid = row.get("ppid").and_then(Value::as_i64).unwrap_or(0);
     let text = row.get("text").and_then(Value::as_str).unwrap_or("");
-    let extras: Vec<i64> = row.get("extras").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+    let extras: Vec<i64> = row
+        .get("extras")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
     let mut out: Vec<Line<'static>> = Vec::new();
-    out.push(Line::from(Span::styled(format!("{kind}  @ {}", trace_time_label(ts)),
-        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))));
-    out.push(Line::from(format!("pid={pid}  tgid={tgid}  ppid={ppid}  ts_ns={ts}")));
+    out.push(Line::from(Span::styled(
+        format!("{kind}  @ {}", trace_time_label(ts)),
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan),
+    )));
+    out.push(Line::from(format!(
+        "pid={pid}  tgid={tgid}  ppid={ppid}  ts_ns={ts}"
+    )));
     out.push(Line::from(format!("extras={extras:?}")));
     out.push(Line::from(""));
     if !text.is_empty() {
-        out.push(Line::from(Span::styled("TEXT",
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Green))));
-        for l in text.lines() { out.push(Line::from(l.to_string())); }
+        out.push(Line::from(Span::styled(
+            "TEXT",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Green),
+        )));
+        for l in text.lines() {
+            out.push(Line::from(l.to_string()));
+        }
     }
     out
 }
 
 fn outputs_index_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
-        format!("{:<8} {:<6} {:<20} {:>10}", "Time", "Stream", "Process", "Bytes"),
+        format!(
+            "{:<8} {:<6} {:<20} {:>10}",
+            "Time", "Stream", "Process", "Bytes"
+        ),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.outputs.is_empty() {
         let msg = if app.outputs_total == 0 {
-            if app.f_outputs.active().is_some() { "(no outputs match filter)" }
-            else { "(no captured output)" }
-        } else { "(empty window — engine view drifted)" };
+            if app.f_outputs.active().is_some() {
+                "(no outputs match filter)"
+            } else {
+                "(no captured output)"
+            }
+        } else {
+            "(empty window — engine view drifted)"
+        };
         out.push(Line::from(msg));
         return out;
     }
@@ -7054,19 +8302,32 @@ fn outputs_index_lines(app: &App) -> Vec<Line<'static>> {
         let exe = o.get("exe").and_then(Value::as_str).unwrap_or("");
         let tgid = o.get("tgid").and_then(Value::as_i64).unwrap_or(0);
         let base = exe.rsplit('/').next().unwrap_or(exe);
-        let proc_label = if tgid > 0 { format!("{base}·{tgid}") } else { base.to_string() };
+        let proc_label = if tgid > 0 {
+            format!("{base}·{tgid}")
+        } else {
+            base.to_string()
+        };
         let proc_label: String = proc_label.chars().take(20).collect();
         let time_label = {
             let secs = ts.rem_euclid(86400);
-            let h = secs / 3600; let m = (secs % 3600) / 60; let s = secs % 60;
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
             format!("{h:02}:{m:02}:{s:02}")
         };
         let stream_label = if stream == 1 { "err" } else { "out" };
         let text = format!("{time_label:<8} {stream_label:<6} {proc_label:<20} {len:>10}");
         let line = if i == app.sel_output {
-            Line::from(Span::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan)))
+            Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))
         } else {
-            let color = if stream == 1 { Color::Red } else { Color::Reset };
+            let color = if stream == 1 {
+                Color::Red
+            } else {
+                Color::Reset
+            };
             Line::from(Span::styled(text, Style::default().fg(color)))
         };
         out.push(line);
@@ -7083,8 +8344,10 @@ fn outputs_index_lines(app: &App) -> Vec<Line<'static>> {
 fn rule_detail_lines(app: &App) -> Vec<Line<'static>> {
     let Some(line) = app.rules.get(app.sel_rule) else {
         return vec![
-            Line::from(Span::styled("n new · Enter edit · d delete",
-                Style::default().add_modifier(Modifier::DIM))),
+            Line::from(Span::styled(
+                "n new · Enter edit · d delete",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
             Line::from(""),
             Line::from(format!("file: {}", app.rules_path().display())),
             Line::from(""),
@@ -7095,26 +8358,37 @@ fn rule_detail_lines(app: &App) -> Vec<Line<'static>> {
     let Some(rule) = crate::rules::FileRule::parse(line) else {
         return vec![Line::from(Span::styled(
             "(unparseable rule)",
-            Style::default().fg(Color::Red)))];
+            Style::default().fg(Color::Red),
+        ))];
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let cyan = Style::default().fg(Color::Cyan);
     let (action_label, action_color) = match rule.action {
-        crate::rules::Action::Apply       => ("APPLY",       Color::Green),
-        crate::rules::Action::Discard     => ("DISCARD",     Color::Red),
+        crate::rules::Action::Apply => ("APPLY", Color::Green),
+        crate::rules::Action::Discard => ("DISCARD", Color::Red),
         crate::rules::Action::Passthrough => ("PASSTHROUGH", Color::Cyan),
-        crate::rules::Action::Ask         => ("ASK",         Color::Yellow),
+        crate::rules::Action::Ask => ("ASK", Color::Yellow),
     };
-    let mut out = vec![
-        Line::from(Span::styled(action_label.to_string(),
-            Style::default().fg(action_color).add_modifier(Modifier::BOLD))),
-    ];
+    let mut out = vec![Line::from(Span::styled(
+        action_label.to_string(),
+        Style::default()
+            .fg(action_color)
+            .add_modifier(Modifier::BOLD),
+    ))];
     for (n, c) in rule.clauses.iter().enumerate() {
         let mut lead = String::new();
-        if n > 0 { lead.push_str(match c.join {
-            crate::rules::Join::And => "and ", crate::rules::Join::Or => "or " }); }
-        if !c.enabled { lead.push_str("off "); }
-        if c.negate { lead.push_str("not "); }
+        if n > 0 {
+            lead.push_str(match c.join {
+                crate::rules::Join::And => "and ",
+                crate::rules::Join::Or => "or ",
+            });
+        }
+        if !c.enabled {
+            lead.push_str("off ");
+        }
+        if c.negate {
+            lead.push_str("not ");
+        }
         let kp = format!("{}:{}", c.m.kind, c.m.pattern);
         let kp_style = if c.enabled { Style::default() } else { dim };
         out.push(Line::from(vec![
@@ -7127,26 +8401,28 @@ fn rule_detail_lines(app: &App) -> Vec<Line<'static>> {
     // one-line glob semantics. Same text the prototype shows.
     let help = |k: &str| match k {
         "path" => "changed path (extended glob: * ** ? @(a|b) {a,b}; bare = any depth)",
-        "box"  => "the box's hierarchical name (same globs as paths)",
-        "exe"  => "triggering process's command pathname (path globs)",
-        "cwd"  => "triggering process's working directory (path globs)",
-        "arg"  => "any one of the triggering process's argv (raw glob)",
+        "box" => "the box's hierarchical name (same globs as paths)",
+        "exe" => "triggering process's command pathname (path globs)",
+        "cwd" => "triggering process's working directory (path globs)",
+        "arg" => "any one of the triggering process's argv (raw glob)",
         // -n net rule kinds (applied at SYN-accept time by the dispatcher;
         // file kinds in the same rule slide off because the field resolver
         // returns "" for unknown kinds → glob can't match)
-        "host"         => "DNS hostname the box dialed (or .X.0.2 reverse if no DNS)",
-        "port"         => "TCP destination port (numeric, exact-match patterns like 443)",
-        "scheme"       => "http / https / tcp — derived from port at SYN-accept",
-        "sni"          => "TLS SNI from the box's ClientHello (HTTPS gate)",
-        "http_path"    => "HTTP request path (post-decrypt; only on http/https)",
-        "http_method"  => "HTTP method (GET / POST / …) — post-decrypt",
-        "http_status"  => "HTTP response status code — post-decrypt",
-        "proto"        => "tcp / udp (always tcp for a SYN-time gate today)",
+        "host" => "DNS hostname the box dialed (or .X.0.2 reverse if no DNS)",
+        "port" => "TCP destination port (numeric, exact-match patterns like 443)",
+        "scheme" => "http / https / tcp — derived from port at SYN-accept",
+        "sni" => "TLS SNI from the box's ClientHello (HTTPS gate)",
+        "http_path" => "HTTP request path (post-decrypt; only on http/https)",
+        "http_method" => "HTTP method (GET / POST / …) — post-decrypt",
+        "http_status" => "HTTP response status code — post-decrypt",
+        "proto" => "tcp / udp (always tcp for a SYN-time gate today)",
         _ => "",
     };
     let mut seen: Vec<&str> = vec![];
     for c in &rule.clauses {
-        if !seen.contains(&c.m.kind.as_str()) { seen.push(c.m.kind.as_str()); }
+        if !seen.contains(&c.m.kind.as_str()) {
+            seen.push(c.m.kind.as_str());
+        }
     }
     for k in seen {
         out.push(Line::from(vec![
@@ -7178,7 +8454,10 @@ fn rules_lines(app: &App) -> Vec<Line<'static>> {
             Color::Green
         };
         let line = if i == app.sel_rule {
-            Line::from(Span::styled(r.clone(), Style::default().fg(Color::Black).bg(Color::Cyan)))
+            Line::from(Span::styled(
+                r.clone(),
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))
         } else {
             Line::from(Span::styled(r.clone(), Style::default().fg(color)))
         };
@@ -7202,14 +8481,21 @@ fn mirror_state_color(state: &str) -> Color {
 /// "in 5m" / "due" for a next_due unix timestamp (already-elapsed shows
 /// as the state column's "pending"; the due cell just says "due").
 fn mirror_due_label(next_due: Option<i64>) -> String {
-    let Some(due) = next_due else { return "—".into() };
+    let Some(due) = next_due else {
+        return "—".into();
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64).unwrap_or(0);
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let dt = due - now;
-    if dt <= 0 { "due".into() }
-    else if dt < 3600 { format!("in {}m", (dt + 59) / 60) }
-    else { format!("in {}h{:02}m", dt / 3600, (dt % 3600) / 60) }
+    if dt <= 0 {
+        "due".into()
+    } else if dt < 3600 {
+        format!("in {}m", (dt + 59) / 60)
+    } else {
+        format!("in {}h{:02}m", dt / 3600, (dt % 3600) / 60)
+    }
 }
 
 /// MIRRORS pane: one row per mirror-update job.
@@ -7225,14 +8511,24 @@ fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
     for (i, j) in app.mirror_jobs.iter().enumerate() {
         let text = format!(
             "{:>3} {:<9} {:<4} {} → {} every {}m {}",
-            j.id, j.state, j.kind, j.src, j.dest,
-            j.interval_secs / 60, mirror_due_label(j.next_due));
+            j.id,
+            j.state,
+            j.kind,
+            j.src,
+            j.dest,
+            j.interval_secs / 60,
+            mirror_due_label(j.next_due)
+        );
         let line = if i == app.sel_mirror {
-            Line::from(Span::styled(text,
-                Style::default().fg(Color::Black).bg(Color::Cyan)))
+            Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))
         } else {
-            Line::from(Span::styled(text,
-                Style::default().fg(mirror_state_color(&j.state))))
+            Line::from(Span::styled(
+                text,
+                Style::default().fg(mirror_state_color(&j.state)),
+            ))
         };
         out.push(line);
     }
@@ -7244,8 +8540,10 @@ fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
 fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
     let Some(j) = app.mirror_jobs.get(app.sel_mirror) else {
         return vec![
-            Line::from(Span::styled("r run · R run pending · space pause/resume",
-                Style::default().add_modifier(Modifier::DIM))),
+            Line::from(Span::styled(
+                "r run · R run pending · space pause/resume",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
             Line::from(""),
             Line::from("Mirror jobs keep local gitdepot / wikimak / ietfmak"),
             Line::from("stores fresh on a per-job interval. The engine"),
@@ -7254,33 +8552,60 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let cyan = Style::default().fg(Color::Cyan);
-    let ts = |t: Option<i64>| t.map(|s| {
-        let secs = s.rem_euclid(86400);
-        format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
-    }).unwrap_or_else(|| "—".into());
+    let ts = |t: Option<i64>| {
+        t.map(|s| {
+            let secs = s.rem_euclid(86400);
+            format!(
+                "{:02}:{:02}:{:02}",
+                secs / 3600,
+                (secs % 3600) / 60,
+                secs % 60
+            )
+        })
+        .unwrap_or_else(|| "—".into())
+    };
     let mut out = vec![Line::from(vec![
-        Span::styled(j.state.clone(),
-            Style::default().fg(mirror_state_color(&j.state))
-                .add_modifier(Modifier::BOLD)),
+        Span::styled(
+            j.state.clone(),
+            Style::default()
+                .fg(mirror_state_color(&j.state))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("  job #{}", j.id), dim),
     ])];
-    let field = |k: &str, v: String| Line::from(vec![
-        Span::styled(format!("{k:>9} "), cyan), Span::raw(v)]);
+    let field =
+        |k: &str, v: String| Line::from(vec![Span::styled(format!("{k:>9} "), cyan), Span::raw(v)]);
     out.push(field("kind", j.kind.clone()));
     out.push(field("src", j.src.clone()));
     out.push(field("dest", j.dest.clone()));
-    out.push(field("interval", format!("{}s ({}m)",
-        j.interval_secs, j.interval_secs / 60)));
+    out.push(field(
+        "interval",
+        format!("{}s ({}m)", j.interval_secs, j.interval_secs / 60),
+    ));
     out.push(field("paused", j.paused.to_string()));
-    out.push(field("next due", format!("{} ({})",
-        ts(j.next_due), mirror_due_label(j.next_due))));
-    out.push(field("last run", format!("{} → {} exit {}",
-        ts(j.last_start), ts(j.last_end),
-        j.last_exit.map(|e| e.to_string()).unwrap_or_else(|| "—".into()))));
+    out.push(field(
+        "next due",
+        format!("{} ({})", ts(j.next_due), mirror_due_label(j.next_due)),
+    ));
+    out.push(field(
+        "last run",
+        format!(
+            "{} → {} exit {}",
+            ts(j.last_start),
+            ts(j.last_end),
+            j.last_exit
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "—".into())
+        ),
+    ));
     if !j.last_detail.is_empty() {
         out.push(Line::from(""));
-        out.push(Line::from(Span::styled("LAST DETAIL",
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))));
+        out.push(Line::from(Span::styled(
+            "LAST DETAIL",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Yellow),
+        )));
         for l in j.last_detail.lines() {
             out.push(Line::from(l.to_string()));
         }
@@ -7291,9 +8616,21 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
 /// HELP pane: a static cheatsheet of the keybindings and the run→inspect→
 /// apply/discard loop.
 fn help_lines() -> Vec<Line<'static>> {
-    let h = |s: &str| Line::from(Span::styled(s.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    let h = |s: &str| {
+        Line::from(Span::styled(
+            s.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
     let t = |s: &str| Line::from(s.to_string());
-    let d = |s: &str| Line::from(Span::styled(s.to_string(), Style::default().fg(Color::DarkGray)));
+    let d = |s: &str| {
+        Line::from(Span::styled(
+            s.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
     let mut v = vec![
         h("sarun — sandboxed run → inspect → apply/discard"),
         t(""),
@@ -7311,8 +8648,14 @@ fn help_lines() -> Vec<Line<'static>> {
     ];
     // The pane index is GENERATED from PANE_KEYS — the same table that drives
     // the menubar and the key dispatch. Keys live in one place, never in prose.
-    v.extend(PANE_KEYS.iter().map(|(k, _, _, _, desc)| t(&format!("  {k}  {desc}"))));
-    v.push(d("     in a PTY pane: keys go to the box · Ctrl-] / F12 / Esc-Esc detaches"));
+    v.extend(
+        PANE_KEYS
+            .iter()
+            .map(|(k, _, _, _, desc)| t(&format!("  {k}  {desc}"))),
+    );
+    v.push(d(
+        "     in a PTY pane: keys go to the box · Ctrl-] / F12 / Esc-Esc detaches",
+    ));
     v.extend(vec![
         t(""),
         h("Navigation & filters"),
@@ -7366,10 +8709,14 @@ fn help_lines() -> Vec<Line<'static>> {
     // The destructive-action prompts (K/D/Z) pop a Confirm modal whose keys are
     // GENERATED from CONFIRM_KEYS — same single-source-of-truth principle.
     {
-        let keys = |want: fn(&ConfirmKey) -> bool| CONFIRM_KEYS.iter()
-            .filter(|(_, a, _)| want(a))
-            .map(|(k, _, _)| k.label())
-            .collect::<Vec<_>>().join("/");
+        let keys = |want: fn(&ConfirmKey) -> bool| {
+            CONFIRM_KEYS
+                .iter()
+                .filter(|(_, a, _)| want(a))
+                .map(|(k, _, _)| k.label())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
         let yes = keys(|a| matches!(a, ConfirmKey::Yes));
         let no = keys(|a| matches!(a, ConfirmKey::No));
         v.push(t(&format!("  {yes}  confirm the action     {no}  cancel")));
@@ -7399,11 +8746,17 @@ fn help_lines() -> Vec<Line<'static>> {
     // socket call, no second text. `sarun verbs [FILTER]` prints it too.
     v.push(t(""));
     v.push(h("Verbs (control-socket surface · `sarun verbs [FILTER]`)"));
-    let w = crate::control::VERB_DOCS.iter()
-        .map(|d2| d2.name.len() + 1 + d2.args.len()).max().unwrap_or(0);
+    let w = crate::control::VERB_DOCS
+        .iter()
+        .map(|d2| d2.name.len() + 1 + d2.args.len())
+        .max()
+        .unwrap_or(0);
     for vd in crate::control::VERB_DOCS {
-        let sig = if vd.args.is_empty() { vd.name.to_string() }
-                  else { format!("{} {}", vd.name, vd.args) };
+        let sig = if vd.args.is_empty() {
+            vd.name.to_string()
+        } else {
+            format!("{} {}", vd.name, vd.args)
+        };
         v.push(t(&format!("  {sig:<w$}  {}", vd.help)));
     }
 
@@ -7411,19 +8764,79 @@ fn help_lines() -> Vec<Line<'static>> {
     // generated from the unified action registry (engine/src/registry.rs).
     v.push(t(""));
     v.push(h("Actions (registry · `:` command prompt)"));
-    v.push(d("  Type ':' to open a command prompt with tab-completion."));
-    v.push(d("  Key + CLI + menu labels are all derived from the verb name."));
+    v.push(d(
+        "  Type ':' to open a command prompt with tab-completion.",
+    ));
+    v.push(d(
+        "  Key + CLI + menu labels are all derived from the verb name.",
+    ));
     for a in crate::registry::ACTIONS {
         if a.key.is_some() || a.cli.is_some() {
             let mut parts = Vec::new();
-            if let Some(k) = a.key { parts.push(format!("'{k}'")); }
-            if let Some(c) = a.ctx { parts.push(format!("on:{c}")); }
-            if let Some(c) = a.cli { parts.push(format!("sarun {}", c.join(" "))); }
-            v.push(t(&format!("  {:25} {:25}  {}",
-                format!("{}({})", a.verb, a.args), parts.join(", "), a.help)));
+            if let Some(k) = a.key {
+                parts.push(format!("'{k}'"));
+            }
+            if let Some(c) = a.ctx {
+                parts.push(format!("on:{c}"));
+            }
+            if let Some(c) = a.cli {
+                parts.push(format!("sarun {}", c.join(" ")));
+            }
+            v.push(t(&format!(
+                "  {:25} {:25}  {}",
+                format!("{}({})", a.verb, a.args),
+                parts.join(", "),
+                a.help
+            )));
         }
     }
     v
+}
+
+fn command_spans(buf: &str) -> crate::parser::BackendResult<Vec<Span<'_>>> {
+    let result = crate::parser::highlights(buf);
+    let mut highlights = result.value;
+    highlights.sort_by_key(|highlight| (highlight.span.start, highlight.span.end));
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for highlight in highlights {
+        let start = highlight.span.start.min(buf.len());
+        let end = highlight.span.end.min(buf.len());
+        if start >= end
+            || end <= cursor
+            || !buf.is_char_boundary(start)
+            || !buf.is_char_boundary(end)
+        {
+            continue;
+        }
+        let start = start.max(cursor);
+        if cursor < start {
+            spans.push(Span::raw(&buf[cursor..start]));
+        }
+        let style = match highlight.syntax.as_str() {
+            "action_identifier" => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            "command_namespace" => Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+            "action_word" => Style::default().fg(Color::LightCyan),
+            "integer" => Style::default().fg(Color::Yellow),
+            "string" => Style::default().fg(Color::Green),
+            "path" => Style::default().fg(Color::Magenta),
+            "boolean" => Style::default().fg(Color::LightMagenta),
+            _ => Style::default(),
+        };
+        spans.push(Span::styled(&buf[start..end], style));
+        cursor = end;
+    }
+    if cursor < buf.len() {
+        spans.push(Span::raw(&buf[cursor..]));
+    }
+    crate::parser::BackendResult {
+        value: spans,
+        status: result.status,
+    }
 }
 
 /// Render the active modal centered over the body. Returns the area consumed.
@@ -7431,9 +8844,20 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     // The image viewer owns its OWN rect (`cells`) so the border lines up with
     // the sixel blitted over the interior after this draw. The interior is
     // left blank for the pixels (or shows `note` when there's nothing to blit).
-    if let Modal::ImageView { title, note, cells, sixel } = modal {
+    if let Modal::ImageView {
+        title,
+        note,
+        cells,
+        sixel,
+    } = modal
+    {
         let (x, y, cw, ch) = *cells;
-        let rect = Rect { x, y, width: cw.min(area.width), height: ch.min(area.height) };
+        let rect = Rect {
+            x,
+            y,
+            width: cw.min(area.width),
+            height: ch.min(area.height),
+        };
         f.render_widget(ratatui::widgets::Clear, rect);
         let body: Vec<Line> = if !note.is_empty() {
             vec![Line::from(""), Line::from(note.clone())]
@@ -7447,9 +8871,11 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             .title(format!(" image · {title} "))
             .title_bottom(" Esc/q close ");
         f.render_widget(
-            Paragraph::new(Text::from(body)).block(block)
+            Paragraph::new(Text::from(body))
+                .block(block)
                 .wrap(Wrap { trim: false }),
-            rect);
+            rect,
+        );
         return;
     }
     // max-then-min, NOT clamp: clamp(20, width) panics when the terminal
@@ -7462,15 +8888,22 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::FileGroupPick { rows, .. } => (rows.len() as u16) + 6,
         // rows can wrap (mirror/alias resolution details are long), so
         // budget up to two display rows per item.
-        Modal::ImagePicker { stack, .. } => stack.last()
-            .map(|l| l.items.len() as u16 * 2).unwrap_or(0) + 6,
+        Modal::ImagePicker { stack, .. } => {
+            stack.last().map(|l| l.items.len() as u16 * 2).unwrap_or(0) + 6
+        }
         // one row per model + the "custom URL" row + source/help chrome.
-        Modal::ModelPicker { models, .. } =>
-            (models.len() as u16 + 1).clamp(1, 18) + 7,
+        Modal::ModelPicker { models, .. } => (models.len() as u16 + 1).clamp(1, 18) + 7,
         // 3 fields + header + result + help + borders.
         Modal::ApiConfig { .. } => 11,
-        Modal::Command { completions, .. } => {
-            5 + (completions.len().min(10)) as u16 + 2
+        Modal::Command {
+            buf, completions, ..
+        } => {
+            5 + (completions.len().min(10)) as u16
+                + 2
+                + u16::from(matches!(
+                    crate::parser::parse(buf),
+                    crate::parser::ParseResult::Invocation(_)
+                ))
         }
         Modal::Report { lines, .. } => (lines.len() as u16) + 4,
         _ => 7,
@@ -7478,7 +8911,12 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     let hgt = want.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(hgt)) / 2;
-    let rect = Rect { x, y, width: w, height: hgt };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: hgt,
+    };
     // clear behind the modal
     f.render_widget(ratatui::widgets::Clear, rect);
     let (title_s, body): (&str, Vec<Line>) = match modal {
@@ -7488,9 +8926,15 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         ),
         Modal::Confirm { prompt, .. } => (
             " confirm ",
-            vec![Line::from(prompt.clone()), Line::from(""), Line::from("y = yes · n / Esc = cancel")],
+            vec![
+                Line::from(prompt.clone()),
+                Line::from(""),
+                Line::from("y = yes · n / Esc = cancel"),
+            ],
         ),
-        Modal::Search { rows, sel, field, .. } => {
+        Modal::Search {
+            rows, sel, field, ..
+        } => {
             let mut body = vec![Line::from(Span::styled(
                 "keep only entries matching — rows folded top→bottom by each row's and/or",
                 Style::default().fg(Color::Gray),
@@ -7503,31 +8947,52 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                     let active = cur && *field == f;
                     let txt = format!("[{label}]");
                     let mut st = if on {
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().add_modifier(Modifier::DIM)
                     };
-                    if active { st = Style::default().fg(Color::Black).bg(Color::Cyan); }
+                    if active {
+                        st = Style::default().fg(Color::Black).bg(Color::Cyan);
+                    }
                     Span::styled(txt, st)
                 };
-                let joinlbl = if i == 0 { "   ".to_string() } else { match r.join { Join::And => "and".into(), Join::Or => "or ".into() } };
+                let joinlbl = if i == 0 {
+                    "   ".to_string()
+                } else {
+                    match r.join {
+                        Join::And => "and".into(),
+                        Join::Or => "or ".into(),
+                    }
+                };
                 let join_sp = {
                     let active = cur && *field == ClauseField::Join;
                     let mut st = Style::default();
-                    if active { st = st.fg(Color::Black).bg(Color::Cyan); }
+                    if active {
+                        st = st.fg(Color::Black).bg(Color::Cyan);
+                    }
                     Span::styled(joinlbl, st)
                 };
                 let kind_sp = {
                     let active = cur && *field == ClauseField::Kind;
                     let mut st = Style::default().fg(Color::Yellow);
-                    if active { st = Style::default().fg(Color::Black).bg(Color::Cyan); }
+                    if active {
+                        st = Style::default().fg(Color::Black).bg(Color::Cyan);
+                    }
                     Span::styled(format!("{:<5}", r.kind), st)
                 };
                 let pat_sp = {
                     let active = cur && *field == ClauseField::Pattern;
                     let mut st = Style::default();
-                    if active { st = st.fg(Color::Black).bg(Color::Cyan); }
-                    let shown = if active { format!("{}_", r.pattern) } else { r.pattern.clone() };
+                    if active {
+                        st = st.fg(Color::Black).bg(Color::Cyan);
+                    }
+                    let shown = if active {
+                        format!("{}_", r.pattern)
+                    } else {
+                        r.pattern.clone()
+                    };
                     Span::styled(shown, st)
                 };
                 body.push(Line::from(vec![
@@ -7552,7 +9017,11 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             (" filter ", body)
         }
         Modal::RuleForm { buf, editing } => (
-            if editing.is_some() { " edit rule " } else { " new rule " },
+            if editing.is_some() {
+                " edit rule "
+            } else {
+                " new rule "
+            },
             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
@@ -7564,7 +9033,9 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("one word matches NAME or VALUE (substring); two words = NAME VALUE; globs ok · Enter · Esc"),
+                Line::from(
+                    "one word matches NAME or VALUE (substring); two words = NAME VALUE; globs ok · Enter · Esc",
+                ),
             ],
         ),
         Modal::PtyCmd { buf } => {
@@ -7583,55 +9054,71 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                  `bash` is a plain host shell); prefix `sarun run -b -- CMD` \
                  to run CMD in a fresh captured box · Enter run · Esc cancel"
             };
-            (" run on a PTY ",
-             vec![
-                Line::from(format!("{buf}_")),
-                Line::from(""),
-                Line::from(help),
-            ])
+            (
+                " run on a PTY ",
+                vec![
+                    Line::from(format!("{buf}_")),
+                    Line::from(""),
+                    Line::from(help),
+                ],
+            )
         }
-        Modal::BrowserUrl { buf, .. } => {
-            (" open in browser ",
-             vec![
+        Modal::BrowserUrl { buf, .. } => (
+            " open in browser ",
+            vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("carbonyl (Chromium in the terminal) in the \
+                Line::from(
+                    "carbonyl (Chromium in the terminal) in the \
                             persistent BROWSER box — the profile persists and \
-                            every page is captured to the box's web archive"),
+                            every page is captured to the box's web archive",
+                ),
                 Line::from("Enter open · Esc cancel"),
-            ])
-        }
-        Modal::ReaderOpen { buf } => {
-            (" open in reader ",
-             vec![
+            ],
+        ),
+        Modal::ReaderOpen { buf } => (
+            " open in reader ",
+            vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("host path of an .html / .md / text file — rendered \
-                            in the document reader (links, headings, search)"),
+                Line::from(
+                    "host path of an .html / .md / text file — rendered \
+                            in the document reader (links, headings, search)",
+                ),
                 Line::from("Enter open · Esc cancel"),
-            ])
-        }
-        Modal::EditorOpen { buf } => {
-            (" open in editor ",
-             vec![
+            ],
+        ),
+        Modal::EditorOpen { buf } => (
+            " open in editor ",
+            vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("host path of a text file — vim-modal editing with \
-                            syntax highlighting (rs/py/c/js/sh/json/yaml/md)"),
+                Line::from(
+                    "host path of a text file — vim-modal editing with \
+                            syntax highlighting (rs/py/c/js/sh/json/yaml/md)",
+                ),
                 Line::from("Enter open · Esc cancel"),
-            ])
-        }
+            ],
+        ),
         Modal::ActionMenu { title, items, sel } => {
             let mut body = vec![
-                Line::from(Span::styled(title.clone(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(
+                    title.clone(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
             ];
             // Two-column rows: label on the left (wide), key hint on
             // the right (narrow). Active row reverses; arrows move,
             // Enter activates, Esc cancels.
-            let lw = items.iter().map(|i| i.label.chars().count())
-                              .max().unwrap_or(20).max(20);
+            let lw = items
+                .iter()
+                .map(|i| i.label.chars().count())
+                .max()
+                .unwrap_or(20)
+                .max(20);
             for (i, it) in items.iter().enumerate() {
                 let active = i == *sel;
                 let style = if active {
@@ -7642,22 +9129,30 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 let label = format!("  {:<lw$}", it.label, lw = lw);
                 body.push(Line::from(vec![
                     Span::styled(label, style),
-                    Span::styled(format!("  {}", it.hint),
-                        Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("  {}", it.hint),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
                 "↑/↓ move · Enter run · Esc cancel",
-                Style::default().fg(Color::Gray))));
+                Style::default().fg(Color::Gray),
+            )));
             (" actions ", body)
         }
-        Modal::FileGroupPick { discard, rows, sel, .. } => {
+        Modal::FileGroupPick {
+            discard, rows, sel, ..
+        } => {
             let verb = if *discard { "Discard" } else { "Apply" };
             let mut body = vec![
                 Line::from(Span::styled(
                     format!("{verb} which of the box's changes?"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
             ];
             for (i, (label, _)) in rows.iter().enumerate() {
@@ -7671,21 +9166,35 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
                 "↑/↓ move · Enter pick · Esc cancel",
-                Style::default().fg(Color::Gray))));
-            (if *discard { " discard changes " } else { " apply changes " }, body)
+                Style::default().fg(Color::Gray),
+            )));
+            (
+                if *discard {
+                    " discard changes "
+                } else {
+                    " apply changes "
+                },
+                body,
+            )
         }
         Modal::Launcher { items, sel } => {
             // Option chips first — visible, toggleable state, not flags to
             // remember. The active value is bold; the key cycles it in place.
             let chip = |key: &str, label: String, on: bool| {
                 let st = if on {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Yellow)
                 };
                 vec![
-                    Span::styled(format!("[{key}] "),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("[{key}] "),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(label, st),
                     Span::raw("   "),
                 ]
@@ -7698,34 +9207,54 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 format!("network: {}", NET_MODES[app.launch_net].to_uppercase())
             };
             if tap_dead {
-                opts.push(Span::styled("[n] ",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-                opts.push(Span::styled(net_label,
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                opts.push(Span::styled(
+                    "[n] ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                opts.push(Span::styled(
+                    net_label,
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
                 opts.push(Span::raw("   "));
             } else {
                 opts.extend(chip("n", net_label, app.launch_net != 0));
             }
-            opts.extend(chip("e", format!("record env: {}",
-                if app.launch_env { "ON" } else { "off" }), app.launch_env));
+            opts.extend(chip(
+                "e",
+                format!("record env: {}", if app.launch_env { "ON" } else { "off" }),
+                app.launch_env,
+            ));
             let net_hint = if app.tap_ok {
                 "n cycles network (tap → host → off)"
             } else {
                 "n cycles network (tap ✗ no CLONE_NEWNET here → host → off)"
             };
             let mut body = vec![
-                Line::from(Span::styled("New PTY — where should it run?",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(
+                    "New PTY — where should it run?",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
                 Line::from(opts),
                 Line::from(Span::styled(
-                    format!("{net_hint} · e toggles env capture — applied \
-                             to box/container launches"),
-                    Style::default().fg(Color::DarkGray))),
+                    format!(
+                        "{net_hint} · e toggles env capture — applied \
+                             to box/container launches"
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )),
                 Line::from(""),
             ];
-            let lw = items.iter().map(|i| i.label.chars().count())
-                              .max().unwrap_or(20).max(20);
+            let lw = items
+                .iter()
+                .map(|i| i.label.chars().count())
+                .max()
+                .unwrap_or(20)
+                .max(20);
             for (i, it) in items.iter().enumerate() {
                 let active = i == *sel;
                 let style = if active {
@@ -7735,30 +9264,42 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 };
                 body.push(Line::from(vec![
                     Span::styled(format!("  {:<lw$}", it.label, lw = lw), style),
-                    Span::styled(format!("  {}", it.hint),
-                        Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("  {}", it.hint),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
                 "↑/↓ move · Enter launch · Esc cancel",
-                Style::default().fg(Color::Gray))));
+                Style::default().fg(Color::Gray),
+            )));
             (" new PTY ", body)
         }
         Modal::ImagePicker { crumbs, stack } => {
             let mut body = vec![
                 Line::from(Span::styled(
-                    if crumbs.is_empty() { "Pick a base image".to_string() }
-                    else { crumbs.join(" › ") },
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                    if crumbs.is_empty() {
+                        "Pick a base image".to_string()
+                    } else {
+                        crumbs.join(" › ")
+                    },
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
             ];
             let level = stack.last();
-            let items: &[PickItem] = level.map(|l| l.items.as_slice())
-                .unwrap_or(&[]);
+            let items: &[PickItem] = level.map(|l| l.items.as_slice()).unwrap_or(&[]);
             let sel = level.map(|l| l.sel).unwrap_or(0);
-            let lw = items.iter().map(|i| i.label.chars().count())
-                          .max().unwrap_or(24).max(24);
+            let lw = items
+                .iter()
+                .map(|i| i.label.chars().count())
+                .max()
+                .unwrap_or(24)
+                .max(24);
             for (i, it) in items.iter().enumerate() {
                 let active = i == sel;
                 let style = if active {
@@ -7766,19 +9307,24 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 } else {
                     Style::default()
                 };
-                let marker = if matches!(it.next, PickNext::Menu(_)) { "▸" }
-                             else { " " };
+                let marker = if matches!(it.next, PickNext::Menu(_)) {
+                    "▸"
+                } else {
+                    " "
+                };
                 body.push(Line::from(vec![
-                    Span::styled(format!("  {:<lw$} {marker}", it.label, lw = lw),
-                                 style),
-                    Span::styled(format!("  {}", it.detail),
-                        Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("  {:<lw$} {marker}", it.label, lw = lw), style),
+                    Span::styled(
+                        format!("  {}", it.detail),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
                 "↑/↓ move · Enter pick/descend · Backspace up · Esc cancel",
-                Style::default().fg(Color::Gray))));
+                Style::default().fg(Color::Gray),
+            )));
             (" new box from image ", body)
         }
         Modal::ImageRef { buf } => (
@@ -7786,38 +9332,61 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("e.g. ubuntu:24.04 · ghcr.io/org/img:tag · \
+                Line::from(
+                    "e.g. ubuntu:24.04 · ghcr.io/org/img:tag · \
                             oci-archive:/path.tar — short names resolve via \
-                            /etc/containers · Enter pull · Esc cancel"),
+                            /etc/containers · Enter pull · Esc cancel",
+                ),
             ],
         ),
-        Modal::OaitaTask { box_name, session, buf } => (
+        Modal::OaitaTask {
+            box_name,
+            session,
+            buf,
+        } => (
             " agent task ",
             vec![
                 Line::from(Span::styled(
-                    format!("run an oaita agent on box '{box_name}' \
-                             (session '{session}', net {})", effective_net(app)),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                    format!(
+                        "run an oaita agent on box '{box_name}' \
+                             (session '{session}', net {})",
+                        effective_net(app)
+                    ),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("type the task, e.g. `summarize README.md` — Enter \
+                Line::from(
+                    "type the task, e.g. `summarize README.md` — Enter \
                             runs it in a captured box layered on this box \
-                            (net via the Pty+ chip) · Esc cancel"),
+                            (net via the Pty+ chip) · Esc cancel",
+                ),
             ],
         ),
-        Modal::ModelPicker { models, source, sel, loading } => {
+        Modal::ModelPicker {
+            models,
+            source,
+            sel,
+            loading,
+        } => {
             let mut body = vec![
                 Line::from(Span::styled(
                     "pick a local model — downloaded in a box, served on demand \
                      (no host writes)",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
             ];
             if *loading {
                 body.push(Line::from(Span::styled(
                     "  querying HuggingFace for current models…",
-                    Style::default().fg(Color::Yellow))));
+                    Style::default().fg(Color::Yellow),
+                )));
             } else {
                 // Model rows, then the custom-URL escape hatch as the last row.
                 let n = models.len();
@@ -7825,34 +9394,51 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                     let active = i == *sel;
                     let style = if active {
                         Style::default().fg(Color::Black).bg(Color::Cyan)
-                    } else { Style::default() };
+                    } else {
+                        Style::default()
+                    };
                     body.push(Line::from(vec![
                         Span::styled(format!("  {}", m.name), style),
-                        Span::styled(format!("  {}", m.note),
-                            Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("  {}", m.note),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                     ]));
                 }
                 let custom_active = *sel == n;
                 let cstyle = if custom_active {
                     Style::default().fg(Color::Black).bg(Color::Cyan)
-                } else { Style::default().fg(Color::Gray) };
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
                 body.push(Line::from(Span::styled(
-                    "  Enter a custom GGUF URL…", cstyle)));
+                    "  Enter a custom GGUF URL…",
+                    cstyle,
+                )));
                 if models.is_empty() {
                     body.push(Line::from(Span::styled(
                         "  (no catalog models — use the custom URL row)",
-                        Style::default().fg(Color::DarkGray))));
+                        Style::default().fg(Color::DarkGray),
+                    )));
                 }
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                format!("source: {} · override via {}/oaita-models.toml",
-                    if source.is_empty() { "…" } else { source.as_str() },
-                    crate::paths::config_home().display()),
-                Style::default().fg(Color::DarkGray))));
+                format!(
+                    "source: {} · override via {}/oaita-models.toml",
+                    if source.is_empty() {
+                        "…"
+                    } else {
+                        source.as_str()
+                    },
+                    crate::paths::config_home().display()
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
             body.push(Line::from(Span::styled(
                 "↑/↓ move · Enter download & serve · Esc cancel",
-                Style::default().fg(Color::Gray))));
+                Style::default().fg(Color::Gray),
+            )));
             (" local model picker ", body)
         }
         Modal::ModelUrl { buf } => (
@@ -7860,35 +9446,61 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("paste a GGUF URL (e.g. \
+                Line::from(
+                    "paste a GGUF URL (e.g. \
                             https://huggingface.co/…/model-Q4_K_M.gguf) — \
-                            Enter downloads it in a box & serves it · Esc cancel"),
+                            Enter downloads it in a box & serves it · Esc cancel",
+                ),
             ],
         ),
-        Modal::ApiConfig { base_url, model, api_key, field, result, testing } => {
+        Modal::ApiConfig {
+            base_url,
+            model,
+            api_key,
+            field,
+            result,
+            testing,
+        } => {
             // Three editable fields; the cursored one shows a trailing "_".
-            let masked: String = if api_key.is_empty() { String::new() }
-                else { "•".repeat(api_key.chars().count().min(24)) };
+            let masked: String = if api_key.is_empty() {
+                String::new()
+            } else {
+                "•".repeat(api_key.chars().count().min(24))
+            };
             let rows = [
                 ("model    ", model.as_str(), model.clone()),
-                ("base_url ", base_url.as_str(),
+                (
+                    "base_url ",
+                    base_url.as_str(),
                     if base_url.is_empty() {
                         "https://api.openai.com/v1 (default)".to_string()
-                    } else { base_url.clone() }),
+                    } else {
+                        base_url.clone()
+                    },
+                ),
                 ("api_key  ", api_key.as_str(), masked),
             ];
             let mut body = vec![
                 Line::from(Span::styled(
                     "external OpenAI-compatible endpoint — written to oaita.toml",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
             ];
             for (i, (label, _raw, shown)) in rows.iter().enumerate() {
                 let active = i == *field;
-                let val = if active { format!("{shown}_") } else { shown.clone() };
+                let val = if active {
+                    format!("{shown}_")
+                } else {
+                    shown.clone()
+                };
                 let lstyle = if active {
                     Style::default().fg(Color::Black).bg(Color::Cyan)
-                } else { Style::default().fg(Color::Gray) };
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
                 body.push(Line::from(vec![
                     Span::styled(format!(" {label}"), lstyle),
                     Span::raw("  "),
@@ -7897,45 +9509,87 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             }
             body.push(Line::from(""));
             let rline = if *testing {
-                Span::styled("  testing connection…",
-                    Style::default().fg(Color::Yellow))
+                Span::styled("  testing connection…", Style::default().fg(Color::Yellow))
             } else if result.is_empty() {
-                Span::styled("  (Ctrl-T tests the connection)",
-                    Style::default().fg(Color::DarkGray))
+                Span::styled(
+                    "  (Ctrl-T tests the connection)",
+                    Style::default().fg(Color::DarkGray),
+                )
             } else if result.starts_with('✓') {
-                Span::styled(format!("  {result}"),
-                    Style::default().fg(Color::Green))
+                Span::styled(format!("  {result}"), Style::default().fg(Color::Green))
             } else {
-                Span::styled(format!("  {result}"),
-                    Style::default().fg(Color::Red))
+                Span::styled(format!("  {result}"), Style::default().fg(Color::Red))
             };
             body.push(Line::from(rline));
             body.push(Line::from(Span::styled(
                 "Tab/↑/↓ field · type to edit · Ctrl-T test · Ctrl-S/Enter save \
                  · Esc cancel",
-                Style::default().fg(Color::Gray))));
+                Style::default().fg(Color::Gray),
+            )));
             (" configure external API ", body)
         }
         // Rendered by the early-return at the top of draw_modal (it owns its
         // own rect); this arm only satisfies exhaustiveness.
         Modal::ImageView { .. } => (" image ", vec![]),
-        Modal::Command { buf, completions, sel } => {
+        Modal::Command {
+            buf,
+            completions,
+            sel,
+        } => {
+            let mut input = vec![Span::styled(
+                ": ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            let highlighted = command_spans(buf);
+            let mut diagnostics = highlighted
+                .status
+                .diagnostic()
+                .map(str::to_owned)
+                .into_iter()
+                .collect::<Vec<_>>();
+            input.extend(highlighted.value);
+            input.push(Span::raw(if buf.ends_with('_') { "" } else { "_" }));
             let mut body = vec![
                 Line::from(Span::styled(
                     "command prompt — type a verb name (Tab/↑↓ completes)",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
-                Line::from(vec![
-                    Span::styled(": ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::raw(buf.clone()),
-                    Span::raw(if buf.ends_with('_') { "" } else { "_" }),
-                ]),
+                Line::from(input),
             ];
+            match crate::parser::parse(buf) {
+                crate::parser::ParseResult::Invocation(invocation) => {
+                    let rendered = crate::parser::render(&invocation);
+                    if let Some(error) = rendered.status.diagnostic() {
+                        diagnostics.push(error.to_string());
+                    }
+                    body.push(Line::from(Span::styled(
+                        format!("→ {}", rendered.value),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                crate::parser::ParseResult::BackendError(error) => diagnostics.push(error),
+                _ => {}
+            }
+            diagnostics.sort();
+            diagnostics.dedup();
+            for diagnostic in diagnostics {
+                body.push(Line::from(Span::styled(
+                    format!("parser backend: {diagnostic}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
             if !completions.is_empty() {
                 body.push(Line::from(""));
                 let header = format!("{} completion(s):", completions.len());
                 body.push(Line::from(Span::styled(
-                    header, Style::default().fg(Color::DarkGray))));
+                    header,
+                    Style::default().fg(Color::DarkGray),
+                )));
                 // Show a window of completions around the selection
                 let window = 8;
                 let start = (*sel).saturating_sub(window / 2);
@@ -7944,27 +9598,33 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 for (i, c) in completions[start..end].iter().enumerate() {
                     let idx = start + i;
                     let style = if idx == *sel {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::Gray)
                     };
                     body.push(Line::from(vec![
                         Span::styled(if idx == *sel { "▶ " } else { "  " }, style),
-                        Span::styled(*c, style),
+                        Span::styled(
+                            format!("{}  {} [{}]", c.display, c.annotation, c.provider),
+                            style,
+                        ),
                     ]));
                 }
                 if completions.len() > window {
                     body.push(Line::from(Span::styled(
-                        format!("  ({} total — ↑↓ scroll, Tab select)",
-                            completions.len()),
-                        Style::default().fg(Color::DarkGray))));
+                        format!("  ({} total — ↑↓ scroll, Tab select)", completions.len()),
+                        Style::default().fg(Color::DarkGray),
+                    )));
                 }
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
                 "↑↓ scroll · Tab fill+advance · Enter dispatch · Esc cancel",
-                Style::default().fg(Color::Gray))));
+                Style::default().fg(Color::Gray),
+            )));
             (" : ", body)
         }
     };
@@ -7972,7 +9632,11 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                .border_style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .title(title_s.to_string()),
         )
         .wrap(Wrap { trim: false });
@@ -7996,7 +9660,9 @@ fn legend_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > w {
             out.push(Line::from(Span::styled(std::mem::take(&mut cur), dim)));
         }
-        if !cur.is_empty() { cur.push(' '); }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
         cur.push_str(word);
     }
     if !cur.is_empty() {
@@ -8007,7 +9673,9 @@ fn legend_lines(text: &str, width: u16) -> Vec<Line<'static>> {
 
 fn scroll_for_cursor(cursor_line: usize, n_lines: usize, rect_h: u16) -> u16 {
     let visible = (rect_h as usize).saturating_sub(2);
-    if visible == 0 || n_lines <= visible { return 0; }
+    if visible == 0 || n_lines <= visible {
+        return 0;
+    }
     let third = visible / 3;
     let want = cursor_line.saturating_sub(third);
     want.min(n_lines.saturating_sub(visible)) as u16
@@ -8030,31 +9698,33 @@ fn wrapped_rows(lines: &[Line], inner_w: u16) -> usize {
 /// consistent in one place.
 fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
     match p {
-        Pane::Sessions => Some(('b', "boxes",    FilterView::Changes /* unused */)),
-        Pane::Changes | Pane::Hunks
-                       => Some(('c', "changes",  FilterView::Changes)),
-        Pane::Processes => Some(('p', "procs",   FilterView::Procs)),
-        Pane::Outputs   => Some(('o', "outputs", FilterView::Outputs)),
-        Pane::Pipelines => Some(('l', "pipes",   FilterView::Pipelines)),
-        Pane::BuildEdges => Some(('g', "build",  FilterView::BuildEdges)),
-        Pane::Rules     => Some(('e', "rules",   FilterView::Changes /* unused */)),
-        Pane::Mirrors   => Some(('M', "mirrors", FilterView::Changes /* unused */)),
-        Pane::Reader    => Some(('u', "reader",  FilterView::Changes /* unused */)),
-        Pane::Editor    => Some(('W', "editor",  FilterView::Changes /* unused */)),
-        Pane::Flows | Pane::Packets
-                        => Some(('f', "flows",   FilterView::Changes /* unused */)),
-        Pane::Help      => Some(('?', "help",    FilterView::Changes /* unused */)),
-        Pane::Pty       => Some(('P', "PTY",     FilterView::Changes /* unused */)),
-        Pane::ApiLogs   => Some(('i', "api",     FilterView::Changes /* unused */)),
-        Pane::Network   => Some(('w', "web",     FilterView::Changes /* unused */)),
-        Pane::Trace     => Some(('t', "trace",   FilterView::Changes /* unused */)),
-        Pane::Vars      => Some(('v', "vars",    FilterView::Changes /* unused */)),
-        Pane::Inspect   => Some(('s', "inspect", FilterView::Changes /* unused */)),
+        Pane::Sessions => Some(('b', "boxes", FilterView::Changes /* unused */)),
+        Pane::Changes | Pane::Hunks => Some(('c', "changes", FilterView::Changes)),
+        Pane::Processes => Some(('p', "procs", FilterView::Procs)),
+        Pane::Outputs => Some(('o', "outputs", FilterView::Outputs)),
+        Pane::Pipelines => Some(('l', "pipes", FilterView::Pipelines)),
+        Pane::BuildEdges => Some(('g', "build", FilterView::BuildEdges)),
+        Pane::Rules => Some(('e', "rules", FilterView::Changes /* unused */)),
+        Pane::Mirrors => Some(('M', "mirrors", FilterView::Changes /* unused */)),
+        Pane::Reader => Some(('u', "reader", FilterView::Changes /* unused */)),
+        Pane::Editor => Some(('W', "editor", FilterView::Changes /* unused */)),
+        Pane::Flows | Pane::Packets => Some(('f', "flows", FilterView::Changes /* unused */)),
+        Pane::Help => Some(('?', "help", FilterView::Changes /* unused */)),
+        Pane::Pty => Some(('P', "PTY", FilterView::Changes /* unused */)),
+        Pane::ApiLogs => Some(('i', "api", FilterView::Changes /* unused */)),
+        Pane::Network => Some(('w', "web", FilterView::Changes /* unused */)),
+        Pane::Trace => Some(('t', "trace", FilterView::Changes /* unused */)),
+        Pane::Vars => Some(('v', "vars", FilterView::Changes /* unused */)),
+        Pane::Inspect => Some(('s', "inspect", FilterView::Changes /* unused */)),
     }
 }
 
 /// When a pane chip is visible in the menubar.
-enum PaneVis { Always, Data(&'static str), Pty }
+enum PaneVis {
+    Always,
+    Data(&'static str),
+    Pty,
+}
 
 /// The single source of truth for the top-level pane keys: accelerator, the
 /// pane it selects, the menubar label, when its chip shows, and the one-line
@@ -8062,24 +9732,126 @@ enum PaneVis { Always, Data(&'static str), Pty }
 /// `App::go_to_pane`), and the help index all derive from this — so a key, a
 /// label, and its documentation can never drift apart.
 const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
-    ('b', Pane::Sessions,   "Boxes",   PaneVis::Always,            "boxes/sessions — the box list (path · id · status · cmd)"),
-    ('c', Pane::Changes,    "Changes", PaneVis::Always,            "changes — files the box wrote (Enter → its diff)"),
-    ('p', Pane::Processes,  "Procs",   PaneVis::Data("processes"), "processes — the captured process TREE (exe · argv · env)"),
-    ('o', Pane::Outputs,    "Outputs", PaneVis::Data("outputs"),   "outputs — decoded stdout/stderr transcript"),
-    ('l', Pane::Pipelines,  "Pipes",   PaneVis::Data("pipelines"), "pipeLines — shell pipelines a -b box ran (parsed structure)"),
-    ('g', Pane::BuildEdges, "Build",   PaneVis::Data("edges"),     "build Graph — parsed ninja/make build edges from a -b box"),
-    ('f', Pane::Flows,      "Flows",   PaneVis::Always,            "network flows — tshark-decoded HTTP/TLS from a -n box's pcap"),
-    ('e', Pane::Rules,      "Rules",   PaneVis::Always,            "file rules — the ordered apply/discard/passthrough rules"),
-    ('M', Pane::Mirrors,    "Mirrors", PaneVis::Always,            "scheduled mirror updates — r run selected, R run pending, V read, space pause/resume, D delete"),
-    ('u', Pane::Reader,     "Read",    PaneVis::Always,            "docUment reader — html/md/text files + wiki mirror pages; o open, z fullscreen"),
-    ('W', Pane::Editor,     "Edit",    PaneVis::Always,            "text editor (W = Write) — syntax-highlighted vim-modal editing of host + box files; Ctrl-S save, z fullscreen"),
-    ('P', Pane::Pty,        "PTYs",    PaneVis::Pty,               "open an engine-held PTY — a live interactive shell pane"),
-    ('i', Pane::ApiLogs,    "Api",     PaneVis::Always,            "the --api oaita proxy log"),
-    ('w', Pane::Network,    "Web",     PaneVis::Always,            "web captures — tap MITM HTTP(S) content archive (headers + body)"),
-    ('t', Pane::Trace,      "Trace",   PaneVis::Data("sudtrace"),  "sud Trace — a sud box's decoded wire-trace event stream"),
-    ('v', Pane::Vars,       "Vars",    PaneVis::Data("makevar"),   "variable provenance — make + shell assignments ('/' queries)"),
-    ('s', Pane::Inspect,    "Inspect", PaneVis::Always,            "object inspector — drill into every sarun object (':' takes oaita-inspect locators)"),
-    ('?', Pane::Help,       "Help",    PaneVis::Always,            "this help"),
+    (
+        'b',
+        Pane::Sessions,
+        "Boxes",
+        PaneVis::Always,
+        "boxes/sessions — the box list (path · id · status · cmd)",
+    ),
+    (
+        'c',
+        Pane::Changes,
+        "Changes",
+        PaneVis::Always,
+        "changes — files the box wrote (Enter → its diff)",
+    ),
+    (
+        'p',
+        Pane::Processes,
+        "Procs",
+        PaneVis::Data("processes"),
+        "processes — the captured process TREE (exe · argv · env)",
+    ),
+    (
+        'o',
+        Pane::Outputs,
+        "Outputs",
+        PaneVis::Data("outputs"),
+        "outputs — decoded stdout/stderr transcript",
+    ),
+    (
+        'l',
+        Pane::Pipelines,
+        "Pipes",
+        PaneVis::Data("pipelines"),
+        "pipeLines — shell pipelines a -b box ran (parsed structure)",
+    ),
+    (
+        'g',
+        Pane::BuildEdges,
+        "Build",
+        PaneVis::Data("edges"),
+        "build Graph — parsed ninja/make build edges from a -b box",
+    ),
+    (
+        'f',
+        Pane::Flows,
+        "Flows",
+        PaneVis::Always,
+        "network flows — tshark-decoded HTTP/TLS from a -n box's pcap",
+    ),
+    (
+        'e',
+        Pane::Rules,
+        "Rules",
+        PaneVis::Always,
+        "file rules — the ordered apply/discard/passthrough rules",
+    ),
+    (
+        'M',
+        Pane::Mirrors,
+        "Mirrors",
+        PaneVis::Always,
+        "scheduled mirror updates — r run selected, R run pending, V read, space pause/resume, D delete",
+    ),
+    (
+        'u',
+        Pane::Reader,
+        "Read",
+        PaneVis::Always,
+        "docUment reader — html/md/text files + wiki mirror pages; o open, z fullscreen",
+    ),
+    (
+        'W',
+        Pane::Editor,
+        "Edit",
+        PaneVis::Always,
+        "text editor (W = Write) — syntax-highlighted vim-modal editing of host + box files; Ctrl-S save, z fullscreen",
+    ),
+    (
+        'P',
+        Pane::Pty,
+        "PTYs",
+        PaneVis::Pty,
+        "open an engine-held PTY — a live interactive shell pane",
+    ),
+    (
+        'i',
+        Pane::ApiLogs,
+        "Api",
+        PaneVis::Always,
+        "the --api oaita proxy log",
+    ),
+    (
+        'w',
+        Pane::Network,
+        "Web",
+        PaneVis::Always,
+        "web captures — tap MITM HTTP(S) content archive (headers + body)",
+    ),
+    (
+        't',
+        Pane::Trace,
+        "Trace",
+        PaneVis::Data("sudtrace"),
+        "sud Trace — a sud box's decoded wire-trace event stream",
+    ),
+    (
+        'v',
+        Pane::Vars,
+        "Vars",
+        PaneVis::Data("makevar"),
+        "variable provenance — make + shell assignments ('/' queries)",
+    ),
+    (
+        's',
+        Pane::Inspect,
+        "Inspect",
+        PaneVis::Always,
+        "object inspector — drill into every sarun object (':' takes oaita-inspect locators)",
+    ),
+    ('?', Pane::Help, "Help", PaneVis::Always, "this help"),
 ];
 
 // ── keybindings as data: the remaining contexts ─────────────────────────────
@@ -8103,7 +9875,12 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
 /// table-driven contexts bind. Char matching is case-sensitive (so 'a' and 'A'
 /// are distinct, as the apply-one vs apply-all split needs).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Key { Char(char), Esc, Enter, Tab }
+enum Key {
+    Char(char),
+    Esc,
+    Enter,
+    Tab,
+}
 
 impl Key {
     /// Match against a real crossterm event code. False for codes this matcher
@@ -8132,7 +9909,10 @@ impl Key {
 /// What a Confirm-modal key does. The y/n/Esc contract lived inline in
 /// `handle_modal_key`; now it's the `CONFIRM_KEYS` table.
 #[derive(Clone, Copy)]
-enum ConfirmKey { Yes, No }
+enum ConfirmKey {
+    Yes,
+    No,
+}
 
 /// The Confirm modal's keymap: 'y'/'Y' run the pending destructive action,
 /// 'n'/'N'/Esc cancel. Anything else re-arms the modal (the dispatcher's "no
@@ -8140,16 +9920,19 @@ enum ConfirmKey { Yes, No }
 const CONFIRM_KEYS: &[(Key, ConfirmKey, &str)] = &[
     (Key::Char('y'), ConfirmKey::Yes, "confirm"),
     (Key::Char('Y'), ConfirmKey::Yes, "confirm"),
-    (Key::Char('n'), ConfirmKey::No,  "cancel"),
-    (Key::Char('N'), ConfirmKey::No,  "cancel"),
-    (Key::Esc,       ConfirmKey::No,  "cancel"),
+    (Key::Char('n'), ConfirmKey::No, "cancel"),
+    (Key::Char('N'), ConfirmKey::No, "cancel"),
+    (Key::Esc, ConfirmKey::No, "cancel"),
 ];
 
 /// Whether a `PaneAction` is gated on the focused pane. `Any` runs regardless;
 /// `On(pane)` only fires when `app.focus == pane`. The table is consulted in
 /// order, so a guarded entry listed first shadows a bare entry on the same key.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PaneGate { Any, On(Pane) }
+enum PaneGate {
+    Any,
+    On(Pane),
+}
 
 /// Actions reachable from the main key loop (outside any modal / PTY / menu-nav
 /// capture). Each variant is one mutation on `App`, so the dispatcher runs it
@@ -8157,16 +9940,40 @@ enum PaneGate { Any, On(Pane) }
 /// `go_to_pane` for the pane accelerators.
 #[derive(Clone, Copy)]
 enum PaneAction {
-    Quit, Detach,
-    MoveDown, MoveUp, NextPane, Open,
-    ApplyHunk, DiscardHunk, ApplyFile, DiscardFile, ApplyAll, DiscardAll,
-    ConfirmKill, ConfirmDissolve, ConfirmMirrorRemove,
-    NewRule, DeleteRule, StartRename,
-    MirrorRun, MirrorRunPending, MirrorTogglePause, MirrorBrowse,
-    MirrorRead, ChangeRead, ChangeEdit,
-    ToggleFilter, Refresh, ActionMenu, ToggleTree, ToggleRunningOnly, ToggleProcRunning,
+    Quit,
+    Detach,
+    MoveDown,
+    MoveUp,
+    NextPane,
+    Open,
+    ApplyHunk,
+    DiscardHunk,
+    ApplyFile,
+    DiscardFile,
+    ApplyAll,
+    DiscardAll,
+    ConfirmKill,
+    ConfirmDissolve,
+    ConfirmMirrorRemove,
+    NewRule,
+    DeleteRule,
+    StartRename,
+    MirrorRun,
+    MirrorRunPending,
+    MirrorTogglePause,
+    MirrorBrowse,
+    MirrorRead,
+    ChangeRead,
+    ChangeEdit,
+    ToggleFilter,
+    Refresh,
+    ActionMenu,
+    ToggleTree,
+    ToggleRunningOnly,
+    ToggleProcRunning,
     ToggleEdgeRunning,
-    ToggleMark, RangeMark,
+    ToggleMark,
+    RangeMark,
     CommandOpen,
 }
 
@@ -8185,51 +9992,234 @@ enum PaneAction {
 /// through `dispatch_menubar_key`, Esc (clear generated filter / close packets),
 /// and the banner-prompt y/n/a/d steal.
 const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
-    (Key::Char('q'), PaneGate::Any,             PaneAction::Quit,            Some("quit (stops the engine)")),
-    (Key::Char('j'), PaneGate::Any,             PaneAction::MoveDown,        None),
-    (Key::Char('k'), PaneGate::Any,             PaneAction::MoveUp,          None),
-    (Key::Tab,       PaneGate::Any,             PaneAction::NextPane,        None),
-    (Key::Enter,     PaneGate::Any,             PaneAction::Open,            None),
-    (Key::Char('m'), PaneGate::Any,             PaneAction::ActionMenu,      Some("actions popup for the selected row")),
-    (Key::Char(':'), PaneGate::Any,             PaneAction::CommandOpen,     Some("command prompt (Tab completes verbs)")),
-    (Key::Char('a'), PaneGate::On(Pane::Hunks), PaneAction::ApplyHunk,       None),
-    (Key::Char('x'), PaneGate::On(Pane::Hunks), PaneAction::DiscardHunk,     None),
-    (Key::Char('d'), PaneGate::On(Pane::Hunks), PaneAction::DiscardHunk,     None),
-    (Key::Char(' '), PaneGate::On(Pane::Mirrors), PaneAction::MirrorTogglePause, Some("pause/resume mirror job (on Mirrors)")),
-    (Key::Char(' '), PaneGate::Any,             PaneAction::ToggleMark,      Some("select/unselect row (Boxes/Changes) for batch a/x/D")),
-    (Key::Char('['), PaneGate::Any,             PaneAction::RangeMark,       Some("select range: anchor (Space) → cursor")),
-    (Key::Char(']'), PaneGate::Any,             PaneAction::RangeMark,       None),
-    (Key::Char('a'), PaneGate::Any,             PaneAction::ApplyFile,       Some("apply selected change / whole box (or all selected)")),
-    (Key::Char('x'), PaneGate::Any,             PaneAction::DiscardFile,     Some("discard selected change / whole box")),
-    (Key::Char('A'), PaneGate::Any,             PaneAction::ApplyAll,        Some("apply ALL the box's changes")),
-    (Key::Char('X'), PaneGate::Any,             PaneAction::DiscardAll,      Some("discard ALL the box's changes")),
-    (Key::Char('K'), PaneGate::Any,             PaneAction::ConfirmKill,     Some("kill box (SIGTERM, y/n)")),
-    (Key::Char('D'), PaneGate::On(Pane::Mirrors), PaneAction::ConfirmMirrorRemove, Some("delete mirror job (on Mirrors, y/n)")),
-    (Key::Char('D'), PaneGate::Any,             PaneAction::ConfirmDissolve, Some("delete box: changes promoted down into children, never to host (y/n)")),
-    (Key::Char('t'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleTree,  Some("toggle tree / flat chronological (on Pipes)")),
-    (Key::Char('f'), PaneGate::On(Pane::Pipelines), PaneAction::ToggleRunningOnly, Some("toggle running-only (on Pipes)")),
-    (Key::Char('f'), PaneGate::On(Pane::Processes), PaneAction::ToggleProcRunning, Some("toggle running-only (on Procs)")),
-    (Key::Char('f'), PaneGate::On(Pane::BuildEdges), PaneAction::ToggleEdgeRunning, Some("toggle running-only (on Targets)")),
-    (Key::Char('r'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRun,     Some("force-run selected mirror job (on Mirrors)")),
-    (Key::Char('R'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRunPending, Some("run all pending mirror jobs (on Mirrors)")),
-    (Key::Char('b'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorBrowse,  Some("browse wiki mirror in the browser (on Mirrors)")),
-    (Key::Char('V'), PaneGate::On(Pane::Mirrors), PaneAction::MirrorRead,    Some("read the wiki mirror in the document reader (on Mirrors)")),
-    (Key::Char('V'), PaneGate::On(Pane::Changes), PaneAction::ChangeRead,    Some("open the selected change in the document reader (on Changes)")),
-    (Key::Char('E'), PaneGate::On(Pane::Changes), PaneAction::ChangeEdit,    Some("edit the selected change in the text editor (on Changes)")),
-    (Key::Char('n'), PaneGate::On(Pane::Rules), PaneAction::NewRule,         Some("new rule (on Rules)")),
-    (Key::Char('d'), PaneGate::On(Pane::Rules), PaneAction::DeleteRule,      Some("delete rule (on Rules)")),
-    (Key::Char('d'), PaneGate::Any,             PaneAction::Detach,          Some("detach (leaves the engine running)")),
-    (Key::Char('/'), PaneGate::Any,             PaneAction::ToggleFilter,    Some("filter the active pane")),
-    (Key::Char('r'), PaneGate::Any,             PaneAction::StartRename,     Some("rename box")),
-    (Key::Char('R'), PaneGate::Any,             PaneAction::Refresh,         Some("refresh")),
+    (
+        Key::Char('q'),
+        PaneGate::Any,
+        PaneAction::Quit,
+        Some("quit (stops the engine)"),
+    ),
+    (Key::Char('j'), PaneGate::Any, PaneAction::MoveDown, None),
+    (Key::Char('k'), PaneGate::Any, PaneAction::MoveUp, None),
+    (Key::Tab, PaneGate::Any, PaneAction::NextPane, None),
+    (Key::Enter, PaneGate::Any, PaneAction::Open, None),
+    (
+        Key::Char('m'),
+        PaneGate::Any,
+        PaneAction::ActionMenu,
+        Some("actions popup for the selected row"),
+    ),
+    (
+        Key::Char(':'),
+        PaneGate::Any,
+        PaneAction::CommandOpen,
+        Some("command prompt (Tab completes verbs)"),
+    ),
+    (
+        Key::Char('a'),
+        PaneGate::On(Pane::Hunks),
+        PaneAction::ApplyHunk,
+        None,
+    ),
+    (
+        Key::Char('x'),
+        PaneGate::On(Pane::Hunks),
+        PaneAction::DiscardHunk,
+        None,
+    ),
+    (
+        Key::Char('d'),
+        PaneGate::On(Pane::Hunks),
+        PaneAction::DiscardHunk,
+        None,
+    ),
+    (
+        Key::Char(' '),
+        PaneGate::On(Pane::Mirrors),
+        PaneAction::MirrorTogglePause,
+        Some("pause/resume mirror job (on Mirrors)"),
+    ),
+    (
+        Key::Char(' '),
+        PaneGate::Any,
+        PaneAction::ToggleMark,
+        Some("select/unselect row (Boxes/Changes) for batch a/x/D"),
+    ),
+    (
+        Key::Char('['),
+        PaneGate::Any,
+        PaneAction::RangeMark,
+        Some("select range: anchor (Space) → cursor"),
+    ),
+    (Key::Char(']'), PaneGate::Any, PaneAction::RangeMark, None),
+    (
+        Key::Char('a'),
+        PaneGate::Any,
+        PaneAction::ApplyFile,
+        Some("apply selected change / whole box (or all selected)"),
+    ),
+    (
+        Key::Char('x'),
+        PaneGate::Any,
+        PaneAction::DiscardFile,
+        Some("discard selected change / whole box"),
+    ),
+    (
+        Key::Char('A'),
+        PaneGate::Any,
+        PaneAction::ApplyAll,
+        Some("apply ALL the box's changes"),
+    ),
+    (
+        Key::Char('X'),
+        PaneGate::Any,
+        PaneAction::DiscardAll,
+        Some("discard ALL the box's changes"),
+    ),
+    (
+        Key::Char('K'),
+        PaneGate::Any,
+        PaneAction::ConfirmKill,
+        Some("kill box (SIGTERM, y/n)"),
+    ),
+    (
+        Key::Char('D'),
+        PaneGate::On(Pane::Mirrors),
+        PaneAction::ConfirmMirrorRemove,
+        Some("delete mirror job (on Mirrors, y/n)"),
+    ),
+    (
+        Key::Char('D'),
+        PaneGate::Any,
+        PaneAction::ConfirmDissolve,
+        Some("delete box: changes promoted down into children, never to host (y/n)"),
+    ),
+    (
+        Key::Char('t'),
+        PaneGate::On(Pane::Pipelines),
+        PaneAction::ToggleTree,
+        Some("toggle tree / flat chronological (on Pipes)"),
+    ),
+    (
+        Key::Char('f'),
+        PaneGate::On(Pane::Pipelines),
+        PaneAction::ToggleRunningOnly,
+        Some("toggle running-only (on Pipes)"),
+    ),
+    (
+        Key::Char('f'),
+        PaneGate::On(Pane::Processes),
+        PaneAction::ToggleProcRunning,
+        Some("toggle running-only (on Procs)"),
+    ),
+    (
+        Key::Char('f'),
+        PaneGate::On(Pane::BuildEdges),
+        PaneAction::ToggleEdgeRunning,
+        Some("toggle running-only (on Targets)"),
+    ),
+    (
+        Key::Char('r'),
+        PaneGate::On(Pane::Mirrors),
+        PaneAction::MirrorRun,
+        Some("force-run selected mirror job (on Mirrors)"),
+    ),
+    (
+        Key::Char('R'),
+        PaneGate::On(Pane::Mirrors),
+        PaneAction::MirrorRunPending,
+        Some("run all pending mirror jobs (on Mirrors)"),
+    ),
+    (
+        Key::Char('b'),
+        PaneGate::On(Pane::Mirrors),
+        PaneAction::MirrorBrowse,
+        Some("browse wiki mirror in the browser (on Mirrors)"),
+    ),
+    (
+        Key::Char('V'),
+        PaneGate::On(Pane::Mirrors),
+        PaneAction::MirrorRead,
+        Some("read the wiki mirror in the document reader (on Mirrors)"),
+    ),
+    (
+        Key::Char('V'),
+        PaneGate::On(Pane::Changes),
+        PaneAction::ChangeRead,
+        Some("open the selected change in the document reader (on Changes)"),
+    ),
+    (
+        Key::Char('E'),
+        PaneGate::On(Pane::Changes),
+        PaneAction::ChangeEdit,
+        Some("edit the selected change in the text editor (on Changes)"),
+    ),
+    (
+        Key::Char('n'),
+        PaneGate::On(Pane::Rules),
+        PaneAction::NewRule,
+        Some("new rule (on Rules)"),
+    ),
+    (
+        Key::Char('d'),
+        PaneGate::On(Pane::Rules),
+        PaneAction::DeleteRule,
+        Some("delete rule (on Rules)"),
+    ),
+    (
+        Key::Char('d'),
+        PaneGate::Any,
+        PaneAction::Detach,
+        Some("detach (leaves the engine running)"),
+    ),
+    (
+        Key::Char('/'),
+        PaneGate::Any,
+        PaneAction::ToggleFilter,
+        Some("filter the active pane"),
+    ),
+    (
+        Key::Char('r'),
+        PaneGate::Any,
+        PaneAction::StartRename,
+        Some("rename box"),
+    ),
+    (
+        Key::Char('R'),
+        PaneGate::Any,
+        PaneAction::Refresh,
+        Some("refresh"),
+    ),
 ];
 
 /// Run a `PaneAction` against the app. Bodies are moved verbatim from the
 /// original inline arms — same semantics, one place now.
+fn command_target(invocation: &crate::parser::Invocation) -> crate::registry::ActionTarget {
+    invocation.target
+}
+
+fn command_completions(
+    app: &mut App,
+    input: &str,
+    cursor: usize,
+) -> Vec<crate::parser::CompletionEntry> {
+    let result = crate::parser::complete_at(input, cursor);
+    if let Some(error) = result.status.diagnostic() {
+        app.status = format!("command parser: {error}");
+    }
+    result.value
+}
+
 fn run_pane_action(app: &mut App, action: PaneAction) {
     match action {
-        PaneAction::Quit => { wiki_serve::shutdown_all(); shutdown_rpc(&app.sock); app.should_quit = true; }
-        PaneAction::Detach => { wiki_serve::shutdown_all(); app.should_quit = true; }
+        PaneAction::Quit => {
+            wiki_serve::shutdown_all();
+            shutdown_rpc(&app.sock);
+            app.should_quit = true;
+        }
+        PaneAction::Detach => {
+            wiki_serve::shutdown_all();
+            app.should_quit = true;
+        }
         PaneAction::MoveDown => app.move_down(),
         PaneAction::MoveUp => app.move_up(),
         PaneAction::NextPane => app.next_pane(),
@@ -8240,7 +10230,10 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::Open => {
             if app.focus == Pane::Rules {
                 let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
-                app.modal = Some(Modal::RuleForm { buf: cur, editing: Some(app.sel_rule) });
+                app.modal = Some(Modal::RuleForm {
+                    buf: cur,
+                    editing: Some(app.sel_rule),
+                });
             } else {
                 app.open();
             }
@@ -8259,24 +10252,34 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         // pane was the old 'D anywhere' trap.
         PaneAction::ConfirmKill => match app.cur_sid() {
             None => app.status = "no box selected".into(),
-            Some(_) => app.modal = Some(Modal::Confirm {
-                prompt: format!("Kill (SIGTERM) {}?", app.box_op_scope_label()),
-                action: ConfirmAction::Kill,
-            }),
+            Some(_) => {
+                app.modal = Some(Modal::Confirm {
+                    prompt: format!("Kill (SIGTERM) {}?", app.box_op_scope_label()),
+                    action: ConfirmAction::Kill,
+                })
+            }
         },
         PaneAction::ConfirmDissolve => match app.cur_sid() {
             None => app.status = "no box selected".into(),
-            Some(_) => app.modal = Some(Modal::Confirm {
-                prompt: format!("Delete {}? Its changes are promoted down into \
+            Some(_) => {
+                app.modal = Some(Modal::Confirm {
+                    prompt: format!(
+                        "Delete {}? Its changes are promoted down into \
                                  child boxes (never to the host); children are \
                                  kept and re-parented.",
-                                app.box_op_scope_label()),
-                action: ConfirmAction::Dissolve,
-            }),
+                        app.box_op_scope_label()
+                    ),
+                    action: ConfirmAction::Dissolve,
+                })
+            }
         },
         PaneAction::ConfirmMirrorRemove => app.confirm_mirror_remove(),
-        PaneAction::NewRule => app.modal = Some(Modal::RuleForm {
-            buf: String::new(), editing: None }),
+        PaneAction::NewRule => {
+            app.modal = Some(Modal::RuleForm {
+                buf: String::new(),
+                editing: None,
+            })
+        }
         PaneAction::DeleteRule => app.delete_rule(),
         PaneAction::MirrorRun => app.mirror_run_selected(),
         PaneAction::MirrorRunPending => app.mirror_run_pending(),
@@ -8295,7 +10298,11 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         }
         PaneAction::ActionMenu => {
             if let Some((title, items)) = pane_action_menu(app) {
-                app.modal = Some(Modal::ActionMenu { title, items, sel: 0 });
+                app.modal = Some(Modal::ActionMenu {
+                    title,
+                    items,
+                    sel: 0,
+                });
             } else {
                 app.status = "no actions for this row yet".into();
             }
@@ -8304,8 +10311,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
 }
 
 /// The reader pane's empty-state text (right pane and 'z' zoom alike).
-const READER_EMPTY_HINT: &str =
-    "no document open — 'o' opens a host path (.html/.md/text); \
+const READER_EMPTY_HINT: &str = "no document open — 'o' opens a host path (.html/.md/text); \
      'V' on Mirrors reads a wiki mirror page; \
      'V' on Changes reads the selected box file";
 
@@ -8352,8 +10358,7 @@ fn handle_reader_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
 }
 
 /// The editor pane's empty-state text (right pane and 'z' zoom alike).
-const EDITOR_EMPTY_HINT: &str =
-    "no file open — 'o' opens a host path in the editor; \
+const EDITOR_EMPTY_HINT: &str = "no file open — 'o' opens a host path in the editor; \
      'E' on Changes edits the selected box file (Ctrl-S saves into the \
      box's captured layer, never the host)";
 
@@ -8362,8 +10367,11 @@ const EDITOR_EMPTY_HINT: &str =
 /// motions/operators — pane accelerators intentionally don't fire from
 /// inside it; leave with Esc or F9). The empty state falls through like any
 /// other pane. A standalone fn so the headless tests can drive it.
-fn handle_editor_key(app: &mut App, code: crossterm::event::KeyCode,
-                     mods: crossterm::event::KeyModifiers) -> bool {
+fn handle_editor_key(
+    app: &mut App,
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) -> bool {
     use crate::editor::KeyResult;
     use crossterm::event::KeyCode;
     let res = {
@@ -8412,9 +10420,17 @@ fn handle_editor_key(app: &mut App, code: crossterm::event::KeyCode,
 /// `dispatch_menubar_key`.
 fn dispatch_pane_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
     for (key, gate, action, _) in PANE_ACTION_KEYS {
-        if !key.matches(code) { continue; }
-        let ok = match gate { PaneGate::Any => true, PaneGate::On(p) => app.focus == *p };
-        if ok { run_pane_action(app, *action); return true; }
+        if !key.matches(code) {
+            continue;
+        }
+        let ok = match gate {
+            PaneGate::Any => true,
+            PaneGate::On(p) => app.focus == *p,
+        };
+        if ok {
+            run_pane_action(app, *action);
+            return true;
+        }
     }
     false
 }
@@ -8425,8 +10441,13 @@ fn dispatch_pane_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
 /// the menubar render, F9 menu-nav dispatch, and the help index — one source of
 /// truth so they can't drift.
 fn menubar_chips(app: &App) -> Vec<(char, &'static str)> {
-    let has = |k: &str| app.box_summary.get(k)
-        .and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false);
+    let has = |k: &str| {
+        app.box_summary
+            .get(k)
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    };
     // `New (N)` is ALWAYS first: it opens the launcher (a shell/container/
     // browser box, or the host shell). Previously the only menubar route to
     // the launcher was the `P` chip, which is hidden until a PTY already
@@ -8434,11 +10455,16 @@ fn menubar_chips(app: &App) -> Vec<(char, &'static str)> {
     // first window. This makes "new window" a visible menu entry, not an F7
     // treasure hunt.
     let mut chips = vec![('N', "New")];
-    chips.extend(PANE_KEYS.iter().filter(|(_, pane, _, vis, _)| match vis {
-        PaneVis::Always => true,
-        PaneVis::Data(k) => has(k) || app.focus == *pane,
-        PaneVis::Pty => !app.ptys.is_empty(),
-    }).map(|(key, _, label, _, _)| (*key, *label)));
+    chips.extend(
+        PANE_KEYS
+            .iter()
+            .filter(|(_, pane, _, vis, _)| match vis {
+                PaneVis::Always => true,
+                PaneVis::Data(k) => has(k) || app.focus == *pane,
+                PaneVis::Pty => !app.ptys.is_empty(),
+            })
+            .map(|(key, _, label, _, _)| (*key, *label)),
+    );
     chips
 }
 
@@ -8454,22 +10480,34 @@ fn menubar_spans(app: &App) -> Vec<Span<'static>> {
         // "this is the view I'm currently on".
         let menu_cursor = app.menu_nav && app.menu_sel == i;
         let style = if menu_cursor {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else if on {
-            Style::default().fg(Color::Yellow)
+            Style::default()
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
         spans.push(Span::styled(format!("  {label}"), style));
-        spans.push(Span::styled(format!(" ({key}) "),
-            Style::default().fg(if on || menu_cursor { Color::Yellow }
-                                else { Color::DarkGray })));
+        spans.push(Span::styled(
+            format!(" ({key}) "),
+            Style::default().fg(if on || menu_cursor {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
+        ));
     }
     if app.menu_nav {
-        spans.push(Span::styled("   ←/→ move · Enter pick · Esc cancel",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)));
+        spans.push(Span::styled(
+            "   ←/→ move · Enter pick · Esc cancel",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
+        ));
     }
     spans
 }
@@ -8479,8 +10517,12 @@ fn menubar_spans(app: &App) -> Vec<Span<'static>> {
 /// Hook point for a future "type a command" input mode — today it's
 /// pure status surface.
 fn cmdline_spans(app: &App) -> Vec<Span<'static>> {
-    let prompt = Span::styled("$ ", Style::default().fg(Color::Cyan)
-                                                    .add_modifier(Modifier::BOLD));
+    let prompt = Span::styled(
+        "$ ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
     let active = view_of_pane(app.focus);
     if let Some((_, _, v)) = active {
         let f = app.view_filter(v);
@@ -8488,17 +10530,27 @@ fn cmdline_spans(app: &App) -> Vec<Span<'static>> {
             let expr = clauses_expr(&f.clauses);
             return vec![
                 prompt,
-                Span::styled("filter ",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "filter ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(expr, Style::default().fg(Color::Yellow)),
-                Span::styled("  ('/' clears)",
-                    Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    "  ('/' clears)",
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
             ];
         }
     }
-    vec![prompt,
-         Span::styled("(idle — '/' filter · ':' command · 'm' row actions)",
-             Style::default().add_modifier(Modifier::DIM))]
+    vec![
+        prompt,
+        Span::styled(
+            "(idle — '/' filter · ':' command · 'm' row actions)",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]
 }
 
 /// Norton-Commander-style F-key bar: ten contextual fields, one per
@@ -8509,8 +10561,12 @@ fn fkeybar_spans(app: &App) -> Vec<Span<'static>> {
     let cells = fkey_labels(app);
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (n, label) in cells.iter().enumerate() {
-        spans.push(Span::styled(format!("{} ", n + 1),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(
+            format!("{} ", n + 1),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
         // dim the label when unused (the label is "·")
         let lstyle = if *label == "·" {
             Style::default().add_modifier(Modifier::DIM)
@@ -8531,46 +10587,69 @@ fn fkeybar_spans(app: &App) -> Vec<Span<'static>> {
 /// alongside F1..F10. "·" means unbound; rendered dim.
 fn fkey_labels(app: &App) -> [&'static str; 11] {
     let pty_pane = app.focus == Pane::Pty;
-    let hunks    = app.focus == Pane::Hunks;
-    let rules    = app.focus == Pane::Rules;
+    let hunks = app.focus == Pane::Hunks;
+    let rules = app.focus == Pane::Rules;
     let sessions = app.focus == Pane::Sessions;
-    let changes  = app.focus == Pane::Changes;
-    let any_pty  = !app.ptys.is_empty();
+    let changes = app.focus == Pane::Changes;
+    let any_pty = !app.ptys.is_empty();
     [
-        "Help",     // F1   — always
+        "Help", // F1   — always
         // F2/F3 cycle SCREENS (main two-pane view / terminal / browser),
         // F4/F5 cycle the WINDOWS within the current screen: the data
         // panes on Main, the PTYs of the screen's kind on Terminal /
         // Browser.
-        "Scrn+",    // F2
-        "Scrn-",    // F3
+        "Scrn+",                                   // F2
+        "Scrn-",                                   // F3
         if pty_pane { "PtyNext" } else { "Win+" }, // F4
         if pty_pane { "PtyPrev" } else { "Win-" }, // F5
         // F6: in the PTY pane, toggle the mouse between the app (carbonyl/vim)
         // and the terminal's native drag-select/copy — label flips with state.
-        if pty_pane { if app.mouse_release { "Grab" } else { "Select" } }
-        else if sessions { "Rename" } else { "·" }, // F6
-        if pty_pane { "PtyNew" }
-        else if sessions { "Image+" }
-        else if rules { "NewRule" }
-        else { "Pty+" }, // F7 — the launcher everywhere else
-        if pty_pane { "PtyKill" }
-        else if hunks || changes { "Discard" }
-        else if rules { "DelRule" }
-        else if sessions { "Delete" }   // box: dissolve (keep children)
-        else { "·" }, // F8
+        if pty_pane {
+            if app.mouse_release { "Grab" } else { "Select" }
+        } else if sessions {
+            "Rename"
+        } else {
+            "·"
+        }, // F6
+        if pty_pane {
+            "PtyNew"
+        } else if sessions {
+            "Image+"
+        } else if rules {
+            "NewRule"
+        } else {
+            "Pty+"
+        }, // F7 — the launcher everywhere else
+        if pty_pane {
+            "PtyKill"
+        } else if hunks || changes {
+            "Discard"
+        } else if rules {
+            "DelRule"
+        } else if sessions {
+            "Delete"
+        }
+        // box: dissolve (keep children)
+        else {
+            "·"
+        }, // F8
         // F9: menubar nav on data panes; the row-actions popup on the
         // full-screen PTY (where 'm' would go to the shell).
         if pty_pane { "Actions" } else { "Menu" },
-        "Quit",     // F10  — always
+        "Quit", // F10  — always
         // F11: split/un-split. The label flips with `pty_in_right`
         // so the user can read what F11 will DO next. With no PTY there
         // is nothing to split — dim it (F7 is THE create-a-PTY key;
         // don't show the same button twice).
-        if pty_pane { "Embed" }
-        else if !any_pty { "·" }
-        else if app.pty_in_right { "Solo" }
-        else { "Split" },
+        if pty_pane {
+            "Embed"
+        } else if !any_pty {
+            "·"
+        } else if app.pty_in_right {
+            "Solo"
+        } else {
+            "Split"
+        },
     ]
 }
 
@@ -8579,20 +10658,26 @@ fn fkey_labels(app: &App) -> [&'static str; 11] {
 fn clauses_expr(clauses: &[Clause]) -> String {
     let mut s = String::new();
     for (i, c) in clauses.iter().enumerate() {
-        if !c.enabled { continue; }
+        if !c.enabled {
+            continue;
+        }
         if i > 0 {
             s.push(' ');
-            s.push_str(match c.join { Join::And => "and", Join::Or => "or" });
+            s.push_str(match c.join {
+                Join::And => "and",
+                Join::Or => "or",
+            });
             s.push(' ');
         }
-        if c.negate { s.push_str("not "); }
+        if c.negate {
+            s.push_str("not ");
+        }
         s.push_str(&c.m.kind);
         s.push(':');
         s.push_str(&c.m.pattern);
     }
     s
 }
-
 
 // ── the object inspector (Pane::Inspect) ────────────────────────────────────
 //
@@ -8630,9 +10715,13 @@ const INS_SAMPLE: usize = 4000;
 /// This is the SEQUENTIAL fallback — the facet summaries are preferred.
 fn ins_spans(lo: usize, hi: usize, page: usize) -> Option<Vec<(usize, usize)>> {
     let n = hi.checked_sub(lo)? + 1;
-    if n <= page { return None; }
+    if n <= page {
+        return None;
+    }
     let mut size = page;
-    while n.div_ceil(size) > page { size = size.saturating_mul(page); }
+    while n.div_ceil(size) > page {
+        size = size.saturating_mul(page);
+    }
     let mut out = vec![];
     let mut a = lo;
     while a <= hi {
@@ -8647,23 +10736,32 @@ fn ins_spans(lo: usize, hi: usize, page: usize) -> Option<Vec<(usize, usize)>> {
 /// char; a pattern with no wildcard matches as a substring (forgiving
 /// default, same spirit as cmd_match text globs).
 fn ins_wild(pat: &str, name: &str) -> bool {
-    if !pat.contains(['*', '?']) { return name.contains(pat); }
+    if !pat.contains(['*', '?']) {
+        return name.contains(pat);
+    }
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = name.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star, mut mark) = (usize::MAX, 0usize);
     while ti < t.len() {
         if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1; ti += 1;
+            pi += 1;
+            ti += 1;
         } else if pi < p.len() && p[pi] == '*' {
-            star = pi; mark = ti; pi += 1;
+            star = pi;
+            mark = ti;
+            pi += 1;
         } else if star != usize::MAX {
-            pi = star + 1; mark += 1; ti = mark;
+            pi = star + 1;
+            mark += 1;
+            ti = mark;
         } else {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == '*' { pi += 1; }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
     pi == p.len()
 }
 
@@ -8673,15 +10771,13 @@ fn ins_wild(pat: &str, name: &str) -> bool {
 fn ins_magic(bytes: &[u8]) -> Option<&'static str> {
     let m = bytes;
     Some(match m {
-        _ if m.starts_with(b"\x7fELF") => {
-            match m.get(16).copied().unwrap_or(0) {
-                2 => "ELF executable",
-                3 => "ELF shared object",
-                1 => "ELF relocatable object",
-                4 => "ELF core dump",
-                _ => "ELF binary",
-            }
-        }
+        _ if m.starts_with(b"\x7fELF") => match m.get(16).copied().unwrap_or(0) {
+            2 => "ELF executable",
+            3 => "ELF shared object",
+            1 => "ELF relocatable object",
+            4 => "ELF core dump",
+            _ => "ELF binary",
+        },
         _ if m.starts_with(b"MZ") => "PE/DOS executable",
         _ if m.starts_with(b"\x89PNG") => "PNG image",
         _ if m.starts_with(b"\xff\xd8\xff") => "JPEG image",
@@ -8690,8 +10786,7 @@ fn ins_magic(bytes: &[u8]) -> Option<&'static str> {
         _ if m.starts_with(b"\x28\xb5\x2f\xfd") => "zstd data",
         _ if m.starts_with(b"BZh") => "bzip2 data",
         _ if m.starts_with(b"\xfd7zXZ") => "xz data",
-        _ if m.starts_with(b"PK\x03\x04") || m.starts_with(b"PK\x05\x06") =>
-            "zip archive",
+        _ if m.starts_with(b"PK\x03\x04") || m.starts_with(b"PK\x05\x06") => "zip archive",
         _ if m.starts_with(b"!<arch>\n") => "ar archive",
         _ if m.starts_with(b"SQLite format 3\0") => "SQLite database",
         _ if m.len() > 262 && &m[257..262] == b"ustar" => "tar archive",
@@ -8704,10 +10799,20 @@ fn ins_magic(bytes: &[u8]) -> Option<&'static str> {
 fn ins_hex_row(bytes: &[u8], row: usize) -> String {
     let off = row * 16;
     let chunk = &bytes[off..(off + 16).min(bytes.len())];
-    let hex = chunk.iter().map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>().join(" ");
-    let ascii: String = chunk.iter()
-        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+    let hex = chunk
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ascii: String = chunk
+        .iter()
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
         .collect();
     format!("{off:08x}  {hex:<48}  {ascii}")
 }
@@ -8722,10 +10827,14 @@ fn ins_wrap(s: &str, w: usize) -> Vec<String> {
         if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > w {
             out.push(std::mem::take(&mut cur));
         }
-        if !cur.is_empty() { cur.push(' '); }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
         cur.push_str(word);
     }
-    if !cur.is_empty() { out.push(cur); }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
     out
 }
 
@@ -8760,7 +10869,11 @@ impl InsFacet {
             "build_edges" => "target",
             _ => "exe",
         };
-        let path_kind = if view == "build_edges" { "target" } else { "path" };
+        let path_kind = if view == "build_edges" {
+            "target"
+        } else {
+            "path"
+        };
         match self {
             InsFacet::Text(p) => Some((text_kind, p.clone())),
             InsFacet::Prefix(p) => Some((path_kind, format!("/{p}/**"))),
@@ -8798,9 +10911,13 @@ const INS_SIZE_STEPS: &[(u64, Option<u64>)] = &[
 
 fn ins_size_label(a: u64, b: Option<u64>) -> String {
     let human = |v: u64| -> String {
-        if v >= 1 << 20 { format!("{}M", v >> 20) }
-        else if v >= 1 << 10 { format!("{}K", v >> 10) }
-        else { format!("{v}B") }
+        if v >= 1 << 20 {
+            format!("{}M", v >> 20)
+        } else if v >= 1 << 10 {
+            format!("{}K", v >> 10)
+        } else {
+            format!("{v}B")
+        }
     };
     match b {
         Some(b) => format!("{}..{}", human(a), human(b)),
@@ -8812,7 +10929,11 @@ fn ins_size_label(a: u64, b: Option<u64>) -> String {
 /// api log — fetched whole, faceted client-side). One kind enum instead of
 /// three near-identical node variants.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum InsRowsKind { Flows, Webcap, ApiLog }
+enum InsRowsKind {
+    Flows,
+    Webcap,
+    ApiLog,
+}
 
 impl InsRowsKind {
     fn label(self) -> &'static str {
@@ -8830,9 +10951,11 @@ impl InsRowsKind {
                 .ok()
                 .and_then(|v| v.get("flows").and_then(Value::as_array).cloned()),
             InsRowsKind::Webcap => rpc(sock, "webcap", json!([sid.to_string()]))
-                .ok().and_then(|v| v.as_array().cloned()),
+                .ok()
+                .and_then(|v| v.as_array().cloned()),
             InsRowsKind::ApiLog => rpc(sock, "api_log", json!([sid.to_string()]))
-                .ok().and_then(|v| v.as_array().cloned()),
+                .ok()
+                .and_then(|v| v.as_array().cloned()),
         }
     }
     /// Candidate group-by fields for the summary level, most useful first.
@@ -8854,30 +10977,76 @@ enum InsNode {
     /// Top level: every sarun surface, one row each.
     Root,
     /// The box/session list (session_dicts).
-    Boxes { lo: usize, hi: usize },
+    Boxes {
+        lo: usize,
+        hi: usize,
+    },
     /// One box: its per-box tables, one row each.
-    Box { sid: i64, path: String },
+    Box {
+        sid: i64,
+        path: String,
+    },
     /// An engine list view of a box table (view.open/window/close),
     /// narrowed by the facet stack. `seq` forces sequential index buckets
     /// (the summary's escape hatch).
-    BoxView { sid: i64, view: &'static str, label: &'static str,
-              facets: Vec<InsFacet>, seq: bool, lo: usize, hi: usize },
+    BoxView {
+        sid: i64,
+        view: &'static str,
+        label: &'static str,
+        facets: Vec<InsFacet>,
+        seq: bool,
+        lo: usize,
+        hi: usize,
+    },
     /// One changed file's staged diff (review.hunks).
-    BoxFile { sid: i64, file: String },
+    BoxFile {
+        sid: i64,
+        file: String,
+    },
     /// An in-memory row list (flows / webcap / api log), narrowed by an
     /// optional field=value group and a substring/wildcard query.
-    Rows { sid: i64, kind: InsRowsKind, group: Option<(String, String)>,
-           query: Option<String>, seq: bool, lo: usize, hi: usize },
+    Rows {
+        sid: i64,
+        kind: InsRowsKind,
+        group: Option<(String, String)>,
+        query: Option<String>,
+        seq: bool,
+        lo: usize,
+        hi: usize,
+    },
     /// The ordered file rules.
     Rules,
     /// Host filesystem directory (glob-filterable) / file lines
     /// (substring-filterable, original numbering) / tree-sitter symbols.
-    Dir { path: String, pattern: Option<String>, lo: usize, hi: usize },
-    File { path: String, query: Option<String>, lo: usize, hi: usize },
-    Symbols { path: String, lo: usize, hi: usize },
-    Symbol { path: String, name: String, occ: usize },
+    Dir {
+        path: String,
+        pattern: Option<String>,
+        lo: usize,
+        hi: usize,
+    },
+    File {
+        path: String,
+        query: Option<String>,
+        lo: usize,
+        hi: usize,
+    },
+    Symbols {
+        path: String,
+        lo: usize,
+        hi: usize,
+    },
+    Symbol {
+        path: String,
+        name: String,
+        occ: usize,
+    },
     /// An arbitrary JSON value (engine rows drill into their fields).
-    Json { label: String, v: Value, lo: usize, hi: usize },
+    Json {
+        label: String,
+        v: Value,
+        lo: usize,
+        hi: usize,
+    },
 }
 
 impl InsNode {
@@ -8885,18 +11054,52 @@ impl InsNode {
     /// rows). Nodes that take no argument pass through unchanged.
     fn with_arg(self, s: &str) -> InsNode {
         match self {
-            InsNode::Dir { path, lo, hi, .. } =>
-                InsNode::Dir { path, pattern: Some(s.to_string()), lo, hi },
-            InsNode::File { path, lo, hi, .. } =>
-                InsNode::File { path, query: Some(s.to_string()), lo, hi },
-            InsNode::BoxView { sid, view, label, mut facets, seq, .. } => {
+            InsNode::Dir { path, lo, hi, .. } => InsNode::Dir {
+                path,
+                pattern: Some(s.to_string()),
+                lo,
+                hi,
+            },
+            InsNode::File { path, lo, hi, .. } => InsNode::File {
+                path,
+                query: Some(s.to_string()),
+                lo,
+                hi,
+            },
+            InsNode::BoxView {
+                sid,
+                view,
+                label,
+                mut facets,
+                seq,
+                ..
+            } => {
                 facets.push(InsFacet::Text(s.to_string()));
-                InsNode::BoxView { sid, view, label, facets, seq,
-                                   lo: 1, hi: INS_END }
+                InsNode::BoxView {
+                    sid,
+                    view,
+                    label,
+                    facets,
+                    seq,
+                    lo: 1,
+                    hi: INS_END,
+                }
             }
-            InsNode::Rows { sid, kind, group, seq, .. } =>
-                InsNode::Rows { sid, kind, group, query: Some(s.to_string()),
-                                seq, lo: 1, hi: INS_END },
+            InsNode::Rows {
+                sid,
+                kind,
+                group,
+                seq,
+                ..
+            } => InsNode::Rows {
+                sid,
+                kind,
+                group,
+                query: Some(s.to_string()),
+                seq,
+                lo: 1,
+                hi: INS_END,
+            },
             other => other,
         }
     }
@@ -8912,13 +11115,25 @@ struct InsEntry {
 }
 
 fn ins_row(text: impl Into<String>) -> InsEntry {
-    InsEntry { text: text.into(), child: None, arg: None }
+    InsEntry {
+        text: text.into(),
+        child: None,
+        arg: None,
+    }
 }
 fn ins_link(text: impl Into<String>, child: InsNode) -> InsEntry {
-    InsEntry { text: text.into(), child: Some(child), arg: None }
+    InsEntry {
+        text: text.into(),
+        child: Some(child),
+        arg: None,
+    }
 }
 fn ins_ask(text: impl Into<String>, child: InsNode, arg: &'static str) -> InsEntry {
-    InsEntry { text: text.into(), child: Some(child), arg: Some(arg) }
+    InsEntry {
+        text: text.into(),
+        child: Some(child),
+        arg: Some(arg),
+    }
 }
 
 /// First-time hints, the oaita mechanism transplanted to the UI: the DRILL
@@ -9023,11 +11238,8 @@ fn ins_clip(s: &str, cap: usize) -> String {
 
 /// Tally `key(item)` over a listing and return the groups by descending
 /// count — the shared engine behind every facet summary.
-fn ins_tally<T, K: Fn(&T) -> Option<String>>(items: &[T], key: K)
-    -> Vec<(String, usize)>
-{
-    let mut counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+fn ins_tally<T, K: Fn(&T) -> Option<String>>(items: &[T], key: K) -> Vec<(String, usize)> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for it in items {
         if let Some(k) = key(it) {
             *counts.entry(k).or_insert(0) += 1;
@@ -9039,7 +11251,9 @@ fn ins_tally<T, K: Fn(&T) -> Option<String>>(items: &[T], key: K)
 }
 
 /// "≈" marker when facet counts were derived from a truncated sample.
-fn ins_approx(sampled: bool) -> &'static str { if sampled { "\u{2248}" } else { "" } }
+fn ins_approx(sampled: bool) -> &'static str {
+    if sampled { "\u{2248}" } else { "" }
+}
 
 impl App {
     /// Ensure the stack has its Root frame (first entry into the screen).
@@ -9052,24 +11266,38 @@ impl App {
     }
 
     fn ins_move(&mut self, d: isize) {
-        let Some(f) = self.ins_stack.last_mut() else { return };
-        if f.entries.is_empty() { return; }
+        let Some(f) = self.ins_stack.last_mut() else {
+            return;
+        };
+        if f.entries.is_empty() {
+            return;
+        }
         let last = f.entries.len() as isize - 1;
         f.sel = (f.sel as isize + d).clamp(0, last) as usize;
         self.ins_refresh_card();
     }
 
     fn ins_extreme(&mut self, end: bool) {
-        let Some(f) = self.ins_stack.last_mut() else { return };
-        f.sel = if end { f.entries.len().saturating_sub(1) } else { 0 };
+        let Some(f) = self.ins_stack.last_mut() else {
+            return;
+        };
+        f.sel = if end {
+            f.entries.len().saturating_sub(1)
+        } else {
+            0
+        };
         self.ins_refresh_card();
     }
 
     /// Enter: drill into the selected row's child node. Rows with a
     /// mandatory argument open the inline input first.
     fn ins_enter(&mut self) {
-        let Some(f) = self.ins_stack.last() else { return };
-        let Some(e) = f.entries.get(f.sel) else { return };
+        let Some(f) = self.ins_stack.last() else {
+            return;
+        };
+        let Some(e) = f.entries.get(f.sel) else {
+            return;
+        };
         let Some(node) = e.child.clone() else {
             self.status = "no drill-down for this row".into();
             return;
@@ -9093,7 +11321,9 @@ impl App {
 
     /// A card hotspot by digit ('1'..'9').
     fn ins_hotspot(&mut self, n: usize) {
-        let Some(f) = self.ins_stack.last() else { return };
+        let Some(f) = self.ins_stack.last() else {
+            return;
+        };
         let Some((node, arg)) = f.hotspots.get(n).cloned() else {
             self.status = format!("no [{}] hotspot on this card", n + 1);
             return;
@@ -9106,14 +11336,18 @@ impl App {
         self.ins_pending = None;
         self.ins_input = Some((
             "locator (path \u{b7} path lines A..B \u{b7} path symbols \u{b7} \
-             path symbol NAME[N] \u{b7} box:<box>[/file])".to_string(),
-            String::new()));
+             path symbol NAME[N] \u{b7} box:<box>[/file])"
+                .to_string(),
+            String::new(),
+        ));
     }
 
     /// Enter on the inline input: an argument prompt fills the pending
     /// node; the ':' locator (no pending node) jumps.
     fn ins_input_done(&mut self) {
-        let Some((_, buf)) = self.ins_input.take() else { return };
+        let Some((_, buf)) = self.ins_input.take() else {
+            return;
+        };
         if self.ins_pending.is_some() {
             self.ins_arg_done(&buf);
         } else {
@@ -9123,7 +11357,9 @@ impl App {
 
     /// The answered argument prompt: fill it into the pending node, drill.
     fn ins_arg_done(&mut self, input: &str) {
-        let Some(node) = self.ins_pending.take() else { return };
+        let Some(node) = self.ins_pending.take() else {
+            return;
+        };
         let input = input.trim();
         if input.is_empty() {
             self.status = "inspect: empty argument — cancelled".into();
@@ -9166,8 +11402,12 @@ impl App {
                 }
                 let e = &parent.entries[i as usize];
                 // Arg-taking rows (refine prompts) are not siblings.
-                if e.arg.is_some() { continue; }
-                if let Some(n) = &e.child { break (i as usize, n.clone()); }
+                if e.arg.is_some() {
+                    continue;
+                }
+                if let Some(n) = &e.child {
+                    break (i as usize, n.clone());
+                }
             }
         };
         self.ins_stack[pi].sel = next;
@@ -9184,7 +11424,9 @@ impl App {
 
     /// 'R': rebuild the top frame from its node (fresh RPCs / fs reads).
     fn ins_reload(&mut self) {
-        let Some(f) = self.ins_stack.last() else { return };
+        let Some(f) = self.ins_stack.last() else {
+            return;
+        };
         let node = f.node.clone();
         let sel = f.sel;
         // Build with the frame we're replacing OFF the stack: ins_frame's
@@ -9201,9 +11443,11 @@ impl App {
 
     /// The ':' prompt — parse an `oaita inspect` locator and jump there.
     fn ins_goto(&mut self, input: &str) {
-        use crate::oaita::inspect::{parse_locator, Window};
+        use crate::oaita::inspect::{Window, parse_locator};
         let input = input.trim();
-        if input.is_empty() { return; }
+        if input.is_empty() {
+            return;
+        }
         let loc = parse_locator(input);
         // box:<id>[/<file>] — resolve <id> against the live session list by
         // display path, name, or numeric session id.
@@ -9220,49 +11464,73 @@ impl App {
                 p == box_ref || n == box_ref || id == box_ref
             });
             let Some(row) = hit else {
-                self.status = format!("inspect: no box matches {box_ref:?} \
-                                       (path, name, or id)");
+                self.status = format!(
+                    "inspect: no box matches {box_ref:?} \
+                                       (path, name, or id)"
+                );
                 return;
             };
-            let sid: i64 = row.get("session_id").and_then(Value::as_str)
-                .and_then(|s| s.parse().ok()).unwrap_or(-1);
-            let path = row.get("path").and_then(Value::as_str)
-                .unwrap_or(box_ref).to_string();
+            let sid: i64 = row
+                .get("session_id")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+            let path = row
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(box_ref)
+                .to_string();
             let node = match file {
-                Some(f) => InsNode::BoxFile { sid, file: f.to_string() },
+                Some(f) => InsNode::BoxFile {
+                    sid,
+                    file: f.to_string(),
+                },
                 None => InsNode::Box { sid, path },
             };
             self.ins_follow(node, None);
             return;
         }
         let file_at = |lo: usize, hi: usize| InsNode::File {
-            path: loc.path.clone(), query: None, lo, hi };
+            path: loc.path.clone(),
+            query: None,
+            lo,
+            hi,
+        };
         let node = match &loc.window {
             Window::Symbols => InsNode::Symbols {
-                path: loc.path.clone(), lo: 1, hi: INS_END },
+                path: loc.path.clone(),
+                lo: 1,
+                hi: INS_END,
+            },
             Window::Symbol(name, occ) => InsNode::Symbol {
-                path: loc.path.clone(), name: name.clone(), occ: *occ },
+                path: loc.path.clone(),
+                name: name.clone(),
+                occ: *occ,
+            },
             Window::Range(a, b) => file_at((*a).max(1), (*b).max(*a)),
             Window::Around(n) => file_at(
                 n.saturating_sub(INS_FILE_PAGE / 2).max(1),
-                n + INS_FILE_PAGE / 2),
+                n + INS_FILE_PAGE / 2,
+            ),
             Window::PageKey(_) => {
                 self.status = "inspect: next/previous here are \u{2190}/\u{2192} \
-                               sibling navigation".into();
+                               sibling navigation"
+                    .into();
                 return;
             }
-            Window::Default => {
-                match std::fs::metadata(&loc.path) {
-                    Ok(m) if m.is_dir() => InsNode::Dir {
-                        path: loc.path.clone(), pattern: None,
-                        lo: 1, hi: INS_END },
-                    Ok(_) => file_at(1, INS_END),
-                    Err(e) => {
-                        self.status = format!("inspect: {}: {e}", loc.path);
-                        return;
-                    }
+            Window::Default => match std::fs::metadata(&loc.path) {
+                Ok(m) if m.is_dir() => InsNode::Dir {
+                    path: loc.path.clone(),
+                    pattern: None,
+                    lo: 1,
+                    hi: INS_END,
+                },
+                Ok(_) => file_at(1, INS_END),
+                Err(e) => {
+                    self.status = format!("inspect: {}: {e}", loc.path);
+                    return;
                 }
-            }
+            },
         };
         self.ins_follow(node, None);
     }
@@ -9272,7 +11540,9 @@ impl App {
     /// values, and short descriptive text with [n] hotspots; never a bulk
     /// fetch.
     fn ins_refresh_card(&mut self) {
-        let Some(f) = self.ins_stack.last() else { return };
+        let Some(f) = self.ins_stack.last() else {
+            return;
+        };
         let (card, hotspots) = match f.entries.get(f.sel) {
             Some(e) => self.ins_card(e),
             None => (vec!["(empty listing)".into()], vec![]),
@@ -9286,9 +11556,7 @@ impl App {
     /// ([1], [2], …) woven in; the parallel hotspot list is what the
     /// digits follow. Falls back to the row's full text (the list may have
     /// truncated it).
-    fn ins_card(&self, e: &InsEntry)
-        -> (Vec<String>, Vec<(InsNode, Option<&'static str>)>)
-    {
+    fn ins_card(&self, e: &InsEntry) -> (Vec<String>, Vec<(InsNode, Option<&'static str>)>) {
         let mut lines: Vec<String> = vec![];
         let mut spots: Vec<(InsNode, Option<&'static str>)> = vec![];
         match &e.child {
@@ -9299,38 +11567,67 @@ impl App {
                 lines.push(String::new());
                 let sid = *sid;
                 let bv = |view: &'static str, label: &'static str| InsNode::BoxView {
-                    sid, view, label, facets: vec![], seq: false,
-                    lo: 1, hi: INS_END };
+                    sid,
+                    view,
+                    label,
+                    facets: vec![],
+                    seq: false,
+                    lo: 1,
+                    hi: INS_END,
+                };
                 let rows = |kind| InsNode::Rows {
-                    sid, kind, group: None, query: None, seq: false,
-                    lo: 1, hi: INS_END };
+                    sid,
+                    kind,
+                    group: None,
+                    query: None,
+                    seq: false,
+                    lo: 1,
+                    hi: INS_END,
+                };
                 let mut spot = |label: &str, node: InsNode| -> String {
                     spots.push((node, None));
                     format!("[{}] {label}", spots.len())
                 };
-                lines.push(format!("{} \u{b7} {} \u{b7} {}",
+                lines.push(format!(
+                    "{} \u{b7} {} \u{b7} {}",
                     spot("changes", bv("changes", "changes")),
                     spot("processes", bv("procs", "processes")),
-                    spot("outputs", bv("outputs", "outputs"))));
-                lines.push(format!("{} \u{b7} {} \u{b7} {}",
+                    spot("outputs", bv("outputs", "outputs"))
+                ));
+                lines.push(format!(
+                    "{} \u{b7} {} \u{b7} {}",
                     spot("pipelines", bv("pipelines", "pipelines")),
                     spot("build edges", bv("build_edges", "build edges")),
-                    spot("network flows", rows(InsRowsKind::Flows))));
-                lines.push(format!("{} \u{b7} {}",
+                    spot("network flows", rows(InsRowsKind::Flows))
+                ));
+                lines.push(format!(
+                    "{} \u{b7} {}",
                     spot("web captures", rows(InsRowsKind::Webcap)),
-                    spot("api log", rows(InsRowsKind::ApiLog))));
+                    spot("api log", rows(InsRowsKind::ApiLog))
+                ));
                 lines.push(String::new());
-                lines.push("Enter opens the box's table index; digits jump \
-                            straight to a table.".into());
+                lines.push(
+                    "Enter opens the box's table index; digits jump \
+                            straight to a table."
+                        .into(),
+                );
             }
-            Some(InsNode::Dir { path, pattern, lo, hi }) => {
+            Some(InsNode::Dir {
+                path,
+                pattern,
+                lo,
+                hi,
+            }) => {
                 let (dirs, files, total) = match std::fs::read_dir(path) {
                     Ok(rd) => {
                         let (mut d, mut fl, mut n) = (0usize, 0usize, 0usize);
                         for ent in rd.take(100_000).flatten() {
                             n += 1;
-                            if ent.file_type().map(|t| t.is_dir())
-                                .unwrap_or(false) { d += 1; } else { fl += 1; }
+                            if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                d += 1;
+                            } else {
+                                fl += 1;
+                            }
                         }
                         (d, fl, n)
                     }
@@ -9338,41 +11635,59 @@ impl App {
                 };
                 lines.push(format!("directory {path}"));
                 lines.push(String::new());
-                lines.push(format!("{total} entries \u{b7} {dirs} dirs \u{b7} \
+                lines.push(format!(
+                    "{total} entries \u{b7} {dirs} dirs \u{b7} \
                                     {files} files{}",
                     match pattern {
                         Some(p) => format!(" \u{b7} filter {p:?}"),
                         None => String::new(),
-                    }));
+                    }
+                ));
                 if *lo > 1 || *hi != INS_END {
-                    lines.push(format!("this bucket spans entries {lo}..{}",
-                        if *hi == INS_END { total } else { *hi }));
+                    lines.push(format!(
+                        "this bucket spans entries {lo}..{}",
+                        if *hi == INS_END { total } else { *hi }
+                    ));
                 }
                 lines.push(String::new());
                 spots.push((e.child.clone().unwrap(), None));
-                spots.push((InsNode::Dir { path: path.clone(), pattern: None,
-                                           lo: 1, hi: INS_END },
-                            Some("glob pattern (e.g. *.rs)")));
-                lines.push("[1] open \u{b7} [2] filter by glob\u{2026} \
-                            (mandatory pattern)".to_string());
+                spots.push((
+                    InsNode::Dir {
+                        path: path.clone(),
+                        pattern: None,
+                        lo: 1,
+                        hi: INS_END,
+                    },
+                    Some("glob pattern (e.g. *.rs)"),
+                ));
+                lines.push(
+                    "[1] open \u{b7} [2] filter by glob\u{2026} \
+                            (mandatory pattern)"
+                        .to_string(),
+                );
             }
             Some(InsNode::File { path, lo, hi, .. }) => {
                 // The value preview: a bounded head-read of the file — the
                 // same first bytes `read` would return — plus the drill
                 // hotspots. Text shows its first lines; binary shows its
                 // magic-sniffed format and the first hexdump rows.
-                let head = std::fs::File::open(path).ok().and_then(|mut f| {
-                    use std::io::Read;
-                    let mut buf = vec![0u8; 2048];
-                    let n = f.read(&mut buf).ok()?;
-                    buf.truncate(n);
-                    Some(buf)
-                }).unwrap_or_default();
+                let head = std::fs::File::open(path)
+                    .ok()
+                    .and_then(|mut f| {
+                        use std::io::Read;
+                        let mut buf = vec![0u8; 2048];
+                        let n = f.read(&mut buf).ok()?;
+                        buf.truncate(n);
+                        Some(buf)
+                    })
+                    .unwrap_or_default();
                 let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                 let binary = head.contains(&0);
                 let kind = if binary {
                     ins_magic(&head).unwrap_or("binary")
-                } else { "text" };
+                } else {
+                    "text"
+                };
                 lines.push(format!("file {path}"));
                 lines.push(String::new());
                 lines.push(format!("{size} bytes \u{b7} {kind}"));
@@ -9386,50 +11701,87 @@ impl App {
                         lines.push(ins_clip(l, 160));
                     }
                 }
-                if size as usize > head.len() { lines.push("\u{2026}".into()); }
+                if size as usize > head.len() {
+                    lines.push("\u{2026}".into());
+                }
                 lines.push(String::new());
                 if *lo > 1 || *hi != INS_END {
-                    lines.push(format!("this bucket spans lines {lo}..{}",
-                        if *hi == INS_END { 0 } else { *hi }));
+                    lines.push(format!(
+                        "this bucket spans lines {lo}..{}",
+                        if *hi == INS_END { 0 } else { *hi }
+                    ));
                 }
                 lines.push(String::new());
                 spots.push((e.child.clone().unwrap(), None));
-                spots.push((InsNode::File { path: path.clone(), query: None,
-                                            lo: 1, hi: INS_END },
-                            Some("substring / wildcard the lines must contain")));
-                let mut hot =
-                    "[1] view lines \u{b7} [2] grep lines\u{2026}".to_string();
-                let known_ext = std::path::Path::new(path).extension()
+                spots.push((
+                    InsNode::File {
+                        path: path.clone(),
+                        query: None,
+                        lo: 1,
+                        hi: INS_END,
+                    },
+                    Some("substring / wildcard the lines must contain"),
+                ));
+                let mut hot = "[1] view lines \u{b7} [2] grep lines\u{2026}".to_string();
+                let known_ext = std::path::Path::new(path)
+                    .extension()
                     .and_then(|x| x.to_str())
                     .map(|x| matches!(x, "rs" | "py" | "sh" | "bash"))
                     .unwrap_or(false);
                 if known_ext {
-                    spots.push((InsNode::Symbols { path: path.clone(),
-                                                   lo: 1, hi: INS_END }, None));
+                    spots.push((
+                        InsNode::Symbols {
+                            path: path.clone(),
+                            lo: 1,
+                            hi: INS_END,
+                        },
+                        None,
+                    ));
                     hot.push_str(" \u{b7} [3] symbols (tree-sitter)");
                 }
                 lines.push(hot);
             }
-            Some(InsNode::BoxView { sid, view, label, facets, .. }) => {
+            Some(InsNode::BoxView {
+                sid,
+                view,
+                label,
+                facets,
+                ..
+            }) => {
                 lines.push(format!("{label} of this box"));
                 lines.push(String::new());
                 if !facets.is_empty() {
-                    lines.push(format!("narrowed to: {}",
-                        facets.iter().map(InsFacet::label)
-                            .collect::<Vec<_>>().join(" \u{b7} ")));
+                    lines.push(format!(
+                        "narrowed to: {}",
+                        facets
+                            .iter()
+                            .map(InsFacet::label)
+                            .collect::<Vec<_>>()
+                            .join(" \u{b7} ")
+                    ));
                     lines.push(String::new());
                 }
                 spots.push((e.child.clone().unwrap(), None));
-                spots.push((InsNode::BoxView { sid: *sid, view, label,
-                                facets: facets.clone(), seq: false,
-                                lo: 1, hi: INS_END },
-                            Some("pattern (glob; filters this table)")));
-                lines.push("[1] open \u{b7} [2] narrow by pattern\u{2026} \
-                            (mandatory)".to_string());
+                spots.push((
+                    InsNode::BoxView {
+                        sid: *sid,
+                        view,
+                        label,
+                        facets: facets.clone(),
+                        seq: false,
+                        lo: 1,
+                        hi: INS_END,
+                    },
+                    Some("pattern (glob; filters this table)"),
+                ));
+                lines.push(
+                    "[1] open \u{b7} [2] narrow by pattern\u{2026} \
+                            (mandatory)"
+                        .to_string(),
+                );
             }
             Some(InsNode::Json { v, .. }) => {
-                let pretty = serde_json::to_string_pretty(v)
-                    .unwrap_or_else(|_| v.to_string());
+                let pretty = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
                 for l in pretty.lines().take(INS_PAGE) {
                     lines.push(l.to_string());
                 }
@@ -9445,17 +11797,22 @@ impl App {
                 lines.push("Enter shows the source.".into());
             }
             Some(_) => {
-                for l in e.text.split('\n') { lines.push(l.to_string()); }
+                for l in e.text.split('\n') {
+                    lines.push(l.to_string());
+                }
                 lines.push(String::new());
                 lines.push(match e.arg {
                     Some(a) => format!("Enter prompts for the {a}, then drills."),
                     None => "Enter drills in \u{b7} \u{2190}/\u{2192} walk \
-                             siblings.".into(),
+                             siblings."
+                        .into(),
                 });
             }
             None => {
                 // A leaf row: the card shows it in full (the list truncates).
-                for l in e.text.split('\n') { lines.push(l.to_string()); }
+                for l in e.text.split('\n') {
+                    lines.push(l.to_string());
+                }
             }
         }
         (lines, spots)
@@ -9474,18 +11831,29 @@ impl App {
         match &node {
             InsNode::Root => {
                 title = "sarun".into();
-                header.push("every sarun object, drillable \u{b7} Enter \
+                header.push(
+                    "every sarun object, drillable \u{b7} Enter \
                              descends \u{b7} Backspace up \u{b7} \u{2190}/\u{2192} \
                              siblings \u{b7} 1-9 card hotspots \u{b7} ':' \
                              locator (path lines A..B \u{b7} path symbols \u{b7} \
-                             box:<box>[/file])".into());
+                             box:<box>[/file])"
+                        .into(),
+                );
                 header.push(String::new());
-                entries.push(ins_link("boxes — every box/session, live and settled",
-                                      InsNode::Boxes { lo: 1, hi: INS_END }));
-                entries.push(ins_link("file rules — the ordered apply/discard/passthrough list",
-                                      InsNode::Rules));
+                entries.push(ins_link(
+                    "boxes — every box/session, live and settled",
+                    InsNode::Boxes { lo: 1, hi: INS_END },
+                ));
+                entries.push(ins_link(
+                    "file rules — the ordered apply/discard/passthrough list",
+                    InsNode::Rules,
+                ));
                 let dir_at = |p: String| InsNode::Dir {
-                    path: p, pattern: None, lo: 1, hi: INS_END };
+                    path: p,
+                    pattern: None,
+                    lo: 1,
+                    hi: INS_END,
+                };
                 let cwd = std::env::current_dir()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| "/".into());
@@ -9495,147 +11863,203 @@ impl App {
                 let state = crate::paths::state_home().to_string_lossy().into_owned();
                 entries.push(ins_link(
                     format!("state — {state} (oaita sessions live here)"),
-                    dir_at(state)));
+                    dir_at(state),
+                ));
                 let data = crate::paths::data_home().to_string_lossy().into_owned();
-                entries.push(ins_link(format!("data — {data} (box stores)"),
-                                      dir_at(data)));
+                entries.push(ins_link(
+                    format!("data — {data} (box stores)"),
+                    dir_at(data),
+                ));
                 entries.push(ins_link("filesystem — /", dir_at("/".into())));
             }
-            InsNode::Boxes { lo, hi } => {
-                match rpc(&self.sock, "session_dicts", json!([])) {
-                    Ok(v) => {
-                        let rows = v.as_array().cloned().unwrap_or_default();
-                        let n = rows.len();
-                        let (lo, hi) = ((*lo).max(1), (*hi).min(n));
-                        title = if lo == 1 && hi >= n { "boxes".into() }
-                                else { format!("boxes {lo}..{hi}") };
-                        header.push(format!("{n} box(es)"));
-                        header.push(String::new());
-                        if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
-                            for (a, b) in spans {
-                                let name = |i: usize| rows.get(i - 1)
+            InsNode::Boxes { lo, hi } => match rpc(&self.sock, "session_dicts", json!([])) {
+                Ok(v) => {
+                    let rows = v.as_array().cloned().unwrap_or_default();
+                    let n = rows.len();
+                    let (lo, hi) = ((*lo).max(1), (*hi).min(n));
+                    title = if lo == 1 && hi >= n {
+                        "boxes".into()
+                    } else {
+                        format!("boxes {lo}..{hi}")
+                    };
+                    header.push(format!("{n} box(es)"));
+                    header.push(String::new());
+                    if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
+                        for (a, b) in spans {
+                            let name = |i: usize| {
+                                rows.get(i - 1)
                                     .and_then(|r| r.get("path"))
-                                    .and_then(Value::as_str).unwrap_or("?");
-                                entries.push(ins_link(
-                                    format!("boxes {a}..{b} \u{b7} {} \u{21e2} {}",
-                                            ins_clip(name(a), 18),
-                                            ins_clip(name(b), 18)),
-                                    InsNode::Boxes { lo: a, hi: b }));
-                            }
-                        } else {
-                            for r in rows.iter().take(hi).skip(lo.saturating_sub(1)) {
-                                let path = r.get("path").and_then(Value::as_str)
-                                    .unwrap_or("?").to_string();
-                                let status = r.get("status").and_then(Value::as_str)
-                                    .unwrap_or("?");
-                                let cmd = r.get("cmd").and_then(Value::as_str)
-                                    .unwrap_or("");
-                                let sid: i64 = r.get("session_id")
                                     .and_then(Value::as_str)
-                                    .and_then(|s| s.parse().ok()).unwrap_or(-1);
-                                entries.push(ins_link(
-                                    format!("{path}  \u{b7}  {status}  \u{b7}  {cmd}"),
-                                    InsNode::Box { sid, path }));
-                            }
+                                    .unwrap_or("?")
+                            };
+                            entries.push(ins_link(
+                                format!(
+                                    "boxes {a}..{b} \u{b7} {} \u{21e2} {}",
+                                    ins_clip(name(a), 18),
+                                    ins_clip(name(b), 18)
+                                ),
+                                InsNode::Boxes { lo: a, hi: b },
+                            ));
+                        }
+                    } else {
+                        for r in rows.iter().take(hi).skip(lo.saturating_sub(1)) {
+                            let path = r
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .unwrap_or("?")
+                                .to_string();
+                            let status = r.get("status").and_then(Value::as_str).unwrap_or("?");
+                            let cmd = r.get("cmd").and_then(Value::as_str).unwrap_or("");
+                            let sid: i64 = r
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(-1);
+                            entries.push(ins_link(
+                                format!("{path}  \u{b7}  {status}  \u{b7}  {cmd}"),
+                                InsNode::Box { sid, path },
+                            ));
                         }
                     }
-                    Err(e) => {
-                        title = "boxes".into();
-                        header.push(format!("session_dicts: {e}"));
-                    }
                 }
-            }
+                Err(e) => {
+                    title = "boxes".into();
+                    header.push(format!("session_dicts: {e}"));
+                }
+            },
             InsNode::Box { sid, path } => {
                 title = format!("box {path}");
                 if let Ok(v) = rpc(&self.sock, "session_dicts", json!([])) {
-                    if let Some(row) = v.as_array().into_iter().flatten()
-                        .find(|r| r.get("session_id").and_then(Value::as_str)
-                            .and_then(|s| s.parse::<i64>().ok()) == Some(*sid))
-                    {
-                        entries.push(ins_link("session record — the raw dict",
-                            InsNode::Json { label: format!("box {path}"),
-                                            v: row.clone(), lo: 1, hi: INS_END }));
+                    if let Some(row) = v.as_array().into_iter().flatten().find(|r| {
+                        r.get("session_id")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<i64>().ok())
+                            == Some(*sid)
+                    }) {
+                        entries.push(ins_link(
+                            "session record — the raw dict",
+                            InsNode::Json {
+                                label: format!("box {path}"),
+                                v: row.clone(),
+                                lo: 1,
+                                hi: INS_END,
+                            },
+                        ));
                     }
                 }
                 let sid = *sid;
                 let bv = |view: &'static str, label: &'static str| InsNode::BoxView {
-                    sid, view, label, facets: vec![], seq: false,
-                    lo: 1, hi: INS_END };
+                    sid,
+                    view,
+                    label,
+                    facets: vec![],
+                    seq: false,
+                    lo: 1,
+                    hi: INS_END,
+                };
                 let rows = |kind| InsNode::Rows {
-                    sid, kind, group: None, query: None, seq: false,
-                    lo: 1, hi: INS_END };
-                entries.push(ins_link("changes — files the box wrote",
-                                      bv("changes", "changes")));
-                entries.push(ins_link("processes — the captured process tree",
-                                      bv("procs", "processes")));
-                entries.push(ins_link("outputs — decoded stdout/stderr writes",
-                                      bv("outputs", "outputs")));
-                entries.push(ins_link("pipelines — recorded shell pipelines",
-                                      bv("pipelines", "pipelines")));
-                entries.push(ins_link("build edges — parsed ninja/make graph",
-                                      bv("build_edges", "build edges")));
-                entries.push(ins_link("network flows — tshark-decoded pcap",
-                                      rows(InsRowsKind::Flows)));
-                entries.push(ins_link("web captures — tap MITM HTTP(S) archive",
-                                      rows(InsRowsKind::Webcap)));
-                entries.push(ins_link("api log — the --api oaita proxy log",
-                                      rows(InsRowsKind::ApiLog)));
+                    sid,
+                    kind,
+                    group: None,
+                    query: None,
+                    seq: false,
+                    lo: 1,
+                    hi: INS_END,
+                };
+                entries.push(ins_link(
+                    "changes — files the box wrote",
+                    bv("changes", "changes"),
+                ));
+                entries.push(ins_link(
+                    "processes — the captured process tree",
+                    bv("procs", "processes"),
+                ));
+                entries.push(ins_link(
+                    "outputs — decoded stdout/stderr writes",
+                    bv("outputs", "outputs"),
+                ));
+                entries.push(ins_link(
+                    "pipelines — recorded shell pipelines",
+                    bv("pipelines", "pipelines"),
+                ));
+                entries.push(ins_link(
+                    "build edges — parsed ninja/make graph",
+                    bv("build_edges", "build edges"),
+                ));
+                entries.push(ins_link(
+                    "network flows — tshark-decoded pcap",
+                    rows(InsRowsKind::Flows),
+                ));
+                entries.push(ins_link(
+                    "web captures — tap MITM HTTP(S) archive",
+                    rows(InsRowsKind::Webcap),
+                ));
+                entries.push(ins_link(
+                    "api log — the --api oaita proxy log",
+                    rows(InsRowsKind::ApiLog),
+                ));
             }
             InsNode::BoxView { .. } => {
                 title = self.ins_box_view_frame(&node, &mut header, &mut entries);
             }
             InsNode::BoxFile { sid, file } => {
                 title = file.clone();
-                match rpc(&self.sock, "review.hunks",
-                          json!([sid.to_string(), file])) {
+                match rpc(&self.sock, "review.hunks", json!([sid.to_string(), file])) {
                     Ok(r) => {
-                        let is_text = r.get("is_text")
-                            .and_then(Value::as_bool).unwrap_or(false);
-                        let diff_kind = r.get("diff").and_then(|d| d.get("kind"))
-                            .and_then(Value::as_str).unwrap_or("");
+                        let is_text = r.get("is_text").and_then(Value::as_bool).unwrap_or(false);
+                        let diff_kind = r
+                            .get("diff")
+                            .and_then(|d| d.get("kind"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
                         if diff_kind == "error" {
-                            header.push(r.get("diff").and_then(|d| d.get("error"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("not in change set").to_string());
+                            header.push(
+                                r.get("diff")
+                                    .and_then(|d| d.get("error"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("not in change set")
+                                    .to_string(),
+                            );
                         } else if !is_text {
                             // Binary change: the engine's structural pass
                             // (the same struct_quick the Changes pane's
                             // diff viewer runs) names the format and its
                             // top-level structure; the heavy struct_finish
                             // dump stays in the Changes pane ('c').
-                            header.push("binary (no text diff) — quick \
-                                         structural pass:".into());
+                            header.push(
+                                "binary (no text diff) — quick \
+                                         structural pass:"
+                                    .into(),
+                            );
                             header.push(String::new());
-                            if let Ok(q) = rpc(&self.sock, "struct_quick",
-                                               json!([sid.to_string(), file])) {
+                            if let Ok(q) =
+                                rpc(&self.sock, "struct_quick", json!([sid.to_string(), file]))
+                            {
                                 for (_, txt) in pairs_of(q.get("lines")) {
                                     entries.push(ins_row(txt));
                                 }
-                                if let Some(job) = q.get("job")
-                                    .and_then(Value::as_i64)
-                                {
-                                    let _ = rpc(&self.sock, "struct_cancel",
-                                                json!([job]));
+                                if let Some(job) = q.get("job").and_then(Value::as_i64) {
+                                    let _ = rpc(&self.sock, "struct_cancel", json!([job]));
                                     entries.push(ins_row(
                                         "\u{2026} full structural diff in the \
-                                         Changes pane ('c')"));
+                                         Changes pane ('c')",
+                                    ));
                                 }
                             }
                         } else {
                             header.push(format!("staged diff of {file}"));
                             header.push(String::new());
                             let empty = vec![];
-                            let hunks = r.get("hunks")
-                                .and_then(Value::as_array).unwrap_or(&empty);
+                            let hunks = r.get("hunks").and_then(Value::as_array).unwrap_or(&empty);
                             for hk in hunks {
-                                let hls = hk.get("lines")
-                                    .and_then(Value::as_array).unwrap_or(&empty);
+                                let hls =
+                                    hk.get("lines").and_then(Value::as_array).unwrap_or(&empty);
                                 for line in hls {
-                                    let Some(pair) = line.as_array() else { continue };
-                                    let tag = pair.first().and_then(Value::as_str)
-                                        .unwrap_or(" ");
-                                    let txt = pair.get(1).and_then(Value::as_str)
-                                        .unwrap_or("");
+                                    let Some(pair) = line.as_array() else {
+                                        continue;
+                                    };
+                                    let tag = pair.first().and_then(Value::as_str).unwrap_or(" ");
+                                    let txt = pair.get(1).and_then(Value::as_str).unwrap_or("");
                                     entries.push(ins_row(if tag == "hdr" {
                                         txt.to_string()
                                     } else {
@@ -9653,23 +12077,25 @@ impl App {
             }
             InsNode::Rules => {
                 title = "file rules".into();
-                header.push(format!("{} rule(s), first match wins",
-                                    self.rules.len()));
+                header.push(format!("{} rule(s), first match wins", self.rules.len()));
                 header.push(String::new());
                 for r in &self.rules {
                     entries.push(ins_row(r.clone()));
                 }
             }
-            InsNode::Dir { path, pattern, lo, hi } => {
+            InsNode::Dir {
+                path,
+                pattern,
+                lo,
+                hi,
+            } => {
                 match std::fs::read_dir(path) {
                     Ok(rd) => {
                         let mut items: Vec<(String, bool)> = rd
                             .filter_map(|e| e.ok())
                             .map(|e| {
-                                let is_dir = e.file_type()
-                                    .map(|t| t.is_dir()).unwrap_or(false);
-                                (e.file_name().to_string_lossy().into_owned(),
-                                 is_dir)
+                                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                                (e.file_name().to_string_lossy().into_owned(), is_dir)
                             })
                             .filter(|(name, _)| match pattern {
                                 Some(p) => ins_wild(p, name),
@@ -9695,42 +12121,67 @@ impl App {
                         entries.push(ins_ask(
                             "\u{2315} filter entries by glob\u{2026} \
                              (e.g. *.rs — mandatory pattern)",
-                            InsNode::Dir { path: path.clone(), pattern: None,
-                                           lo: 1, hi: INS_END },
-                            "glob pattern (e.g. *.rs)"));
+                            InsNode::Dir {
+                                path: path.clone(),
+                                pattern: None,
+                                lo: 1,
+                                hi: INS_END,
+                            },
+                            "glob pattern (e.g. *.rs)",
+                        ));
                         if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
                             // Alphabetic ranges labeled by their boundary
                             // names — a phone-book index, not blind numbers.
                             for (a, b) in spans {
-                                let name = |i: usize| items.get(i - 1)
-                                    .map(|(n, _)| n.as_str()).unwrap_or("?");
-                                entries.push(ins_link(
-                                    format!("entries {a}..{b} \u{b7} {} \u{21e2} {}",
-                                            ins_clip(name(a), 16),
-                                            ins_clip(name(b), 16)),
-                                    InsNode::Dir { path: path.clone(),
-                                                   pattern: pattern.clone(),
-                                                   lo: a, hi: b }));
-                            }
-                        } else {
-                            let join = |name: &str| if path.ends_with('/') {
-                                format!("{path}{name}")
-                            } else {
-                                format!("{path}/{name}")
-                            };
-                            for (name, is_dir) in
-                                items.iter().take(hi).skip(lo.saturating_sub(1))
-                            {
-                                let full = join(name);
-                                let (kind, child) = if *is_dir {
-                                    ("dir", InsNode::Dir { path: full,
-                                        pattern: None, lo: 1, hi: INS_END })
-                                } else {
-                                    ("file", InsNode::File { path: full,
-                                        query: None, lo: 1, hi: INS_END })
+                                let name = |i: usize| {
+                                    items.get(i - 1).map(|(n, _)| n.as_str()).unwrap_or("?")
                                 };
                                 entries.push(ins_link(
-                                    format!("{kind:>5}  {name}"), child));
+                                    format!(
+                                        "entries {a}..{b} \u{b7} {} \u{21e2} {}",
+                                        ins_clip(name(a), 16),
+                                        ins_clip(name(b), 16)
+                                    ),
+                                    InsNode::Dir {
+                                        path: path.clone(),
+                                        pattern: pattern.clone(),
+                                        lo: a,
+                                        hi: b,
+                                    },
+                                ));
+                            }
+                        } else {
+                            let join = |name: &str| {
+                                if path.ends_with('/') {
+                                    format!("{path}{name}")
+                                } else {
+                                    format!("{path}/{name}")
+                                }
+                            };
+                            for (name, is_dir) in items.iter().take(hi).skip(lo.saturating_sub(1)) {
+                                let full = join(name);
+                                let (kind, child) = if *is_dir {
+                                    (
+                                        "dir",
+                                        InsNode::Dir {
+                                            path: full,
+                                            pattern: None,
+                                            lo: 1,
+                                            hi: INS_END,
+                                        },
+                                    )
+                                } else {
+                                    (
+                                        "file",
+                                        InsNode::File {
+                                            path: full,
+                                            query: None,
+                                            lo: 1,
+                                            hi: INS_END,
+                                        },
+                                    )
+                                };
+                                entries.push(ins_link(format!("{kind:>5}  {name}"), child));
                             }
                         }
                     }
@@ -9740,7 +12191,12 @@ impl App {
                     }
                 }
             }
-            InsNode::File { path, query, lo, hi } => {
+            InsNode::File {
+                path,
+                query,
+                lo,
+                hi,
+            } => {
                 match std::fs::read(path) {
                     Ok(bytes) if bytes.contains(&0) => {
                         // Binary: name the format from its magic, then a
@@ -9753,20 +12209,33 @@ impl App {
                         title = if lo == 1 && hi >= rows {
                             format!("{path} ({kind}, {size} bytes)")
                         } else {
-                            format!("{path} bytes {:#x}..{:#x} of {size}",
-                                    (lo - 1) * 16, (hi * 16).min(size))
+                            format!(
+                                "{path} bytes {:#x}..{:#x} of {size}",
+                                (lo - 1) * 16,
+                                (hi * 16).min(size)
+                            )
                         };
-                        header.push(format!("{kind} \u{b7} {size} bytes \u{b7} \
+                        header.push(format!(
+                            "{kind} \u{b7} {size} bytes \u{b7} \
                                              hexdump (offset \u{b7} hex \u{b7} \
-                                             ASCII)"));
+                                             ASCII)"
+                        ));
                         header.push(String::new());
                         if let Some(spans) = ins_spans(lo, hi, INS_FILE_PAGE) {
                             for (a, b) in spans {
                                 entries.push(ins_link(
-                                    format!("bytes {:#08x}..{:#08x}",
-                                            (a - 1) * 16, (b * 16).min(size)),
-                                    InsNode::File { path: path.clone(),
-                                        query: query.clone(), lo: a, hi: b }));
+                                    format!(
+                                        "bytes {:#08x}..{:#08x}",
+                                        (a - 1) * 16,
+                                        (b * 16).min(size)
+                                    ),
+                                    InsNode::File {
+                                        path: path.clone(),
+                                        query: query.clone(),
+                                        lo: a,
+                                        hi: b,
+                                    },
+                                ));
                             }
                         } else {
                             for r in lo - 1..hi {
@@ -9777,7 +12246,9 @@ impl App {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes);
                         // Keep original line numbers through the grep filter.
-                        let lines: Vec<(usize, &str)> = text.lines().enumerate()
+                        let lines: Vec<(usize, &str)> = text
+                            .lines()
+                            .enumerate()
                             .map(|(i, l)| (i + 1, l))
                             .filter(|(_, l)| match query {
                                 Some(q) => ins_wild(q, l),
@@ -9795,22 +12266,32 @@ impl App {
                         } else {
                             format!("{path} lines {lo}..{hi} of {n}{qtag}")
                         };
-                        if query.is_none() && lo == 1 && hi >= n
-                            && crate::oaita::structural::parse_symbols(
-                                path, &bytes).is_some()
+                        if query.is_none()
+                            && lo == 1
+                            && hi >= n
+                            && crate::oaita::structural::parse_symbols(path, &bytes).is_some()
                         {
                             entries.push(ins_link(
                                 "\u{2261} symbols — named definitions \
                                  (tree-sitter)",
-                                InsNode::Symbols { path: path.clone(),
-                                                   lo: 1, hi: INS_END }));
+                                InsNode::Symbols {
+                                    path: path.clone(),
+                                    lo: 1,
+                                    hi: INS_END,
+                                },
+                            ));
                         }
                         entries.push(ins_ask(
                             "\u{2315} grep lines\u{2026} (substring or *glob*, \
                              keeps line numbers)",
-                            InsNode::File { path: path.clone(), query: None,
-                                            lo: 1, hi: INS_END },
-                            "substring / wildcard the lines must contain"));
+                            InsNode::File {
+                                path: path.clone(),
+                                query: None,
+                                lo: 1,
+                                hi: INS_END,
+                            },
+                            "substring / wildcard the lines must contain",
+                        ));
                         if let Some(spans) = ins_spans(lo, hi, INS_FILE_PAGE) {
                             for (a, b) in spans {
                                 // Label with the REAL line numbers at the
@@ -9818,14 +12299,16 @@ impl App {
                                 let (la, lb) = (lines[a - 1].0, lines[b - 1].0);
                                 entries.push(ins_link(
                                     format!("lines {la}..{lb}"),
-                                    InsNode::File { path: path.clone(),
-                                                    query: query.clone(),
-                                                    lo: a, hi: b }));
+                                    InsNode::File {
+                                        path: path.clone(),
+                                        query: query.clone(),
+                                        lo: a,
+                                        hi: b,
+                                    },
+                                ));
                             }
                         } else {
-                            for (num, l) in lines.iter().take(hi)
-                                .skip(lo.saturating_sub(1))
-                            {
+                            for (num, l) in lines.iter().take(hi).skip(lo.saturating_sub(1)) {
                                 entries.push(ins_row(format!("{num:>6}  {l}")));
                             }
                         }
@@ -9854,39 +12337,50 @@ impl App {
                                 // listing) so the drill target names the
                                 // Nth same-name collision.
                                 let mut occs: Vec<usize> = vec![0; n];
-                                let mut seen = std::collections::HashMap::
-                                    <String, usize>::new();
+                                let mut seen = std::collections::HashMap::<String, usize>::new();
                                 for (i, sym) in symbols.iter().enumerate() {
-                                    let c = seen.entry(sym.name.clone())
-                                        .or_insert(0);
+                                    let c = seen.entry(sym.name.clone()).or_insert(0);
                                     *c += 1;
                                     occs[i] = *c;
                                 }
                                 if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
                                     for (a, b) in spans {
-                                        let name = |i: usize| symbols.get(i - 1)
-                                            .map(|s| s.name.as_str()).unwrap_or("?");
+                                        let name = |i: usize| {
+                                            symbols
+                                                .get(i - 1)
+                                                .map(|s| s.name.as_str())
+                                                .unwrap_or("?")
+                                        };
                                         entries.push(ins_link(
-                                            format!("symbols {a}..{b} \u{b7} \
+                                            format!(
+                                                "symbols {a}..{b} \u{b7} \
                                                      {} \u{21e2} {}",
-                                                    ins_clip(name(a), 16),
-                                                    ins_clip(name(b), 16)),
-                                            InsNode::Symbols { path: path.clone(),
-                                                               lo: a, hi: b }));
+                                                ins_clip(name(a), 16),
+                                                ins_clip(name(b), 16)
+                                            ),
+                                            InsNode::Symbols {
+                                                path: path.clone(),
+                                                lo: a,
+                                                hi: b,
+                                            },
+                                        ));
                                     }
                                 } else {
                                     for i in lo - 1..hi {
                                         let sym = &symbols[i];
                                         let indent = "  ".repeat(sym.depth);
                                         entries.push(ins_link(
-                                            format!("{indent}{:>6}  {}   \
+                                            format!(
+                                                "{indent}{:>6}  {}   \
                                                      (lines {}..{})",
-                                                    sym.kind, sym.name,
-                                                    sym.start_line, sym.end_line),
+                                                sym.kind, sym.name, sym.start_line, sym.end_line
+                                            ),
                                             InsNode::Symbol {
                                                 path: path.clone(),
                                                 name: sym.name.clone(),
-                                                occ: occs[i] }));
+                                                occ: occs[i],
+                                            },
+                                        ));
                                     }
                                 }
                             }
@@ -9894,7 +12388,9 @@ impl App {
                                 title = format!("{path} symbols");
                                 header.push(
                                     "no tree-sitter grammar for this extension \
-                                     (currently: .rs, .py, .sh, .bash)".into());
+                                     (currently: .rs, .py, .sh, .bash)"
+                                        .into(),
+                                );
                             }
                         }
                     }
@@ -9908,102 +12404,130 @@ impl App {
                 title = format!("{name} in {path}");
                 match std::fs::read(path) {
                     Ok(bytes) => {
-                        let syms = crate::oaita::structural::parse_symbols(
-                            path, &bytes);
-                        match syms.as_deref().and_then(|ss|
-                            crate::oaita::structural::find_symbol(ss, name, *occ))
+                        let syms = crate::oaita::structural::parse_symbols(path, &bytes);
+                        match syms
+                            .as_deref()
+                            .and_then(|ss| crate::oaita::structural::find_symbol(ss, name, *occ))
                         {
                             Some(sym) => {
                                 header.push(format!(
                                     "{} {} (lines {}..{})",
-                                    sym.kind, sym.name,
-                                    sym.start_line, sym.end_line));
+                                    sym.kind, sym.name, sym.start_line, sym.end_line
+                                ));
                                 header.push(String::new());
-                                let src = String::from_utf8_lossy(
-                                    &bytes[sym.start_byte..sym.end_byte])
-                                    .into_owned();
+                                let src =
+                                    String::from_utf8_lossy(&bytes[sym.start_byte..sym.end_byte])
+                                        .into_owned();
                                 for (i, l) in src.lines().enumerate() {
-                                    entries.push(ins_row(format!(
-                                        "{:>6}  {l}", sym.start_line + i)));
+                                    entries
+                                        .push(ins_row(format!("{:>6}  {l}", sym.start_line + i)));
                                 }
                             }
-                            None => header.push(format!(
-                                "no symbol named {name:?} (occurrence {occ})")),
+                            None => {
+                                header.push(format!("no symbol named {name:?} (occurrence {occ})"))
+                            }
                         }
                     }
                     Err(e) => header.push(format!("read {path}: {e}")),
                 }
             }
-            InsNode::Json { label, v, lo, hi } => {
-                match v {
-                    Value::Object(map) => {
-                        let keys: Vec<&String> = map.keys().collect();
-                        let n = keys.len();
-                        let (lo, hi) = ((*lo).max(1), (*hi).min(n));
-                        title = if lo == 1 && hi >= n { label.clone() }
-                                else { format!("{label} keys {lo}..{hi}") };
-                        if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
-                            for (a, b) in spans {
-                                entries.push(ins_link(
-                                    format!("keys {a}..{b} \u{b7} {} \u{21e2} {}",
-                                            ins_clip(keys[a - 1], 16),
-                                            ins_clip(keys[b - 1], 16)),
-                                    InsNode::Json { label: label.clone(),
-                                        v: v.clone(), lo: a, hi: b }));
-                            }
-                        } else {
-                            let w = keys[lo - 1..hi].iter()
-                                .map(|k| k.chars().count()).max().unwrap_or(0);
-                            for k in &keys[lo - 1..hi] {
-                                let val = &map[k.as_str()];
-                                entries.push(ins_link(
-                                    format!("{k:>w$}  {}",
-                                            ins_json_preview(val, 160)),
-                                    InsNode::Json { label: (*k).clone(),
-                                        v: val.clone(), lo: 1, hi: INS_END }));
-                            }
+            InsNode::Json { label, v, lo, hi } => match v {
+                Value::Object(map) => {
+                    let keys: Vec<&String> = map.keys().collect();
+                    let n = keys.len();
+                    let (lo, hi) = ((*lo).max(1), (*hi).min(n));
+                    title = if lo == 1 && hi >= n {
+                        label.clone()
+                    } else {
+                        format!("{label} keys {lo}..{hi}")
+                    };
+                    if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
+                        for (a, b) in spans {
+                            entries.push(ins_link(
+                                format!(
+                                    "keys {a}..{b} \u{b7} {} \u{21e2} {}",
+                                    ins_clip(keys[a - 1], 16),
+                                    ins_clip(keys[b - 1], 16)
+                                ),
+                                InsNode::Json {
+                                    label: label.clone(),
+                                    v: v.clone(),
+                                    lo: a,
+                                    hi: b,
+                                },
+                            ));
                         }
-                    }
-                    Value::Array(arr) => {
-                        let n = arr.len();
-                        let (lo, hi) = ((*lo).max(1), (*hi).min(n));
-                        title = if lo == 1 && hi >= n {
-                            format!("{label} ({n} items)")
-                        } else {
-                            format!("{label} [{lo}..{hi}]")
-                        };
-                        if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
-                            for (a, b) in spans {
-                                entries.push(ins_link(
-                                    format!("[{}..{}] \u{b7} {} \u{21e2} {}",
-                                            a - 1, b - 1,
-                                            ins_json_preview(&arr[a - 1], 14),
-                                            ins_json_preview(&arr[b - 1], 14)),
-                                    InsNode::Json { label: label.clone(),
-                                        v: v.clone(), lo: a, hi: b }));
-                            }
-                        } else {
-                            for i in lo - 1..hi {
-                                entries.push(ins_link(
-                                    format!("[{i}]  {}",
-                                            ins_json_preview(&arr[i], 160)),
-                                    InsNode::Json { label: format!("{label}[{i}]"),
-                                        v: arr[i].clone(), lo: 1, hi: INS_END }));
-                            }
+                    } else {
+                        let w = keys[lo - 1..hi]
+                            .iter()
+                            .map(|k| k.chars().count())
+                            .max()
+                            .unwrap_or(0);
+                        for k in &keys[lo - 1..hi] {
+                            let val = &map[k.as_str()];
+                            entries.push(ins_link(
+                                format!("{k:>w$}  {}", ins_json_preview(val, 160)),
+                                InsNode::Json {
+                                    label: (*k).clone(),
+                                    v: val.clone(),
+                                    lo: 1,
+                                    hi: INS_END,
+                                },
+                            ));
                         }
-                    }
-                    Value::String(txt) => {
-                        title = label.clone();
-                        for l in txt.lines() {
-                            entries.push(ins_row(l.to_string()));
-                        }
-                    }
-                    other => {
-                        title = label.clone();
-                        entries.push(ins_row(other.to_string()));
                     }
                 }
-            }
+                Value::Array(arr) => {
+                    let n = arr.len();
+                    let (lo, hi) = ((*lo).max(1), (*hi).min(n));
+                    title = if lo == 1 && hi >= n {
+                        format!("{label} ({n} items)")
+                    } else {
+                        format!("{label} [{lo}..{hi}]")
+                    };
+                    if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
+                        for (a, b) in spans {
+                            entries.push(ins_link(
+                                format!(
+                                    "[{}..{}] \u{b7} {} \u{21e2} {}",
+                                    a - 1,
+                                    b - 1,
+                                    ins_json_preview(&arr[a - 1], 14),
+                                    ins_json_preview(&arr[b - 1], 14)
+                                ),
+                                InsNode::Json {
+                                    label: label.clone(),
+                                    v: v.clone(),
+                                    lo: a,
+                                    hi: b,
+                                },
+                            ));
+                        }
+                    } else {
+                        for i in lo - 1..hi {
+                            entries.push(ins_link(
+                                format!("[{i}]  {}", ins_json_preview(&arr[i], 160)),
+                                InsNode::Json {
+                                    label: format!("{label}[{i}]"),
+                                    v: arr[i].clone(),
+                                    lo: 1,
+                                    hi: INS_END,
+                                },
+                            ));
+                        }
+                    }
+                }
+                Value::String(txt) => {
+                    title = label.clone();
+                    for l in txt.lines() {
+                        entries.push(ins_row(l.to_string()));
+                    }
+                }
+                other => {
+                    title = label.clone();
+                    entries.push(ins_row(other.to_string()));
+                }
+            },
         }
         // First-occurrence hints: what this frame kind teaches, minus
         // whatever an ancestor frame in the chain already displays.
@@ -10032,11 +12556,20 @@ impl App {
             }
             _ => vec![],
         };
-        let hints: Vec<&'static str> = want.into_iter()
+        let hints: Vec<&'static str> = want
+            .into_iter()
             .filter(|id| !self.ins_stack.iter().any(|f| f.hints.contains(id)))
             .collect();
-        InsFrame { title, node, header, entries, sel: 0,
-                   card: vec![], hotspots: vec![], hints }
+        InsFrame {
+            title,
+            node,
+            header,
+            entries,
+            sel: 0,
+            card: vec![],
+            hotspots: vec![],
+            hints,
+        }
     }
 
     /// A box-table view frame. Wide listings become a FACET SUMMARY —
@@ -10045,19 +12578,38 @@ impl App {
     /// the engine-filtered listing (a "≈" marks sample-derived counts),
     /// plus the ⌕ refine row and a sequential escape hatch. Facets stack:
     /// drilling a group re-runs the view with one more filter clause.
-    fn ins_box_view_frame(&self, node: &InsNode,
-                          header: &mut Vec<String>,
-                          entries: &mut Vec<InsEntry>) -> String {
-        let InsNode::BoxView { sid, view, label, facets, seq, lo, hi } = node
-            else { unreachable!() };
-        let clauses: Vec<Value> = facets.iter()
+    fn ins_box_view_frame(
+        &self,
+        node: &InsNode,
+        header: &mut Vec<String>,
+        entries: &mut Vec<InsEntry>,
+    ) -> String {
+        let InsNode::BoxView {
+            sid,
+            view,
+            label,
+            facets,
+            seq,
+            lo,
+            hi,
+        } = node
+        else {
+            unreachable!()
+        };
+        let clauses: Vec<Value> = facets
+            .iter()
             .filter_map(|f| f.clause(view))
-            .map(|(kind, pattern)| json!({
+            .map(|(kind, pattern)| {
+                json!({
                 "kind": kind, "pattern": pattern, "join": "and",
-                "negate": false, "enabled": true }))
+                "negate": false, "enabled": true })
+            })
             .collect();
-        let filter = if clauses.is_empty() { Value::Null }
-                     else { Value::Array(clauses) };
+        let filter = if clauses.is_empty() {
+            Value::Null
+        } else {
+            Value::Array(clauses)
+        };
         let args = if *view == "procs" {
             json!([view, sid, filter, false])
         } else {
@@ -10072,30 +12624,45 @@ impl App {
         };
         let vid = opened.get("view_id").and_then(Value::as_u64).unwrap_or(0);
         let n = opened.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let ftag = if facets.is_empty() { String::new() } else {
-            format!(" \u{b7} {}", facets.iter().map(InsFacet::label)
-                .collect::<Vec<_>>().join(" \u{b7} "))
+        let ftag = if facets.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " \u{b7} {}",
+                facets
+                    .iter()
+                    .map(InsFacet::label)
+                    .collect::<Vec<_>>()
+                    .join(" \u{b7} ")
+            )
         };
         // Client-side Size facets need the rows; so do leaves and facet
         // derivation. One bounded window covers all three.
-        let sample = rpc(&self.sock, "view.window",
-                         json!([vid, 0, n.min(INS_SAMPLE)]))
-            .ok()
-            .and_then(|v| v.get("rows").and_then(|r| r.as_array().cloned()))
-            .unwrap_or_default();
+        let sample = rpc(
+            &self.sock,
+            "view.window",
+            json!([vid, 0, n.min(INS_SAMPLE)]),
+        )
+        .ok()
+        .and_then(|v| v.get("rows").and_then(|r| r.as_array().cloned()))
+        .unwrap_or_default();
         let _ = rpc(&self.sock, "view.close", json!([vid]));
         let sampled = n > sample.len();
 
-        let size_of = |r: &Value| r.get("size").and_then(Value::as_i64)
-            .unwrap_or(0) as u64;
-        let size_sel: Vec<(u64, Option<u64>)> = facets.iter()
+        let size_of = |r: &Value| r.get("size").and_then(Value::as_i64).unwrap_or(0) as u64;
+        let size_sel: Vec<(u64, Option<u64>)> = facets
+            .iter()
             .filter_map(|f| match f {
-                InsFacet::Size(a, b) => Some((*a, *b)), _ => None })
+                InsFacet::Size(a, b) => Some((*a, *b)),
+                _ => None,
+            })
             .collect();
-        let in_size = |r: &Value| size_sel.iter().all(|(a, b)| {
-            let s = size_of(r);
-            s >= *a && b.map(|b| s < b).unwrap_or(true)
-        });
+        let in_size = |r: &Value| {
+            size_sel.iter().all(|(a, b)| {
+                let s = size_of(r);
+                s >= *a && b.map(|b| s < b).unwrap_or(true)
+            })
+        };
 
         if !size_sel.is_empty() || *seq || n <= INS_PAGE {
             // Row-listing mode. Size facets filter the sample client-side
@@ -10106,60 +12673,102 @@ impl App {
             let (lo, hi) = ((*lo).max(1), (*hi).min(m));
             header.push(format!("{label}: {m} row(s){ftag}"));
             if sampled {
-                header.push(format!("(first {} of {n} — narrow to see the rest)",
-                                    sample.len()));
+                header.push(format!(
+                    "(first {} of {n} — narrow to see the rest)",
+                    sample.len()
+                ));
             }
             header.push(String::new());
             if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
                 for (a, b) in spans {
                     let sub = |a, b| InsNode::BoxView {
-                        sid: *sid, view, label, facets: facets.clone(),
-                        seq: true, lo: a, hi: b };
+                        sid: *sid,
+                        view,
+                        label,
+                        facets: facets.clone(),
+                        seq: true,
+                        lo: a,
+                        hi: b,
+                    };
                     // Boundary previews so even the sequential ranges say
                     // what's inside them.
                     let pv = |i: usize| ins_preview_of(rows[i - 1], view, 14);
                     entries.push(ins_link(
-                        format!("rows {a}..{b} \u{b7} {} \u{21e2} {}",
-                                pv(a), pv(b)), sub(a, b)));
+                        format!("rows {a}..{b} \u{b7} {} \u{21e2} {}", pv(a), pv(b)),
+                        sub(a, b),
+                    ));
                 }
             } else {
                 for r in rows.iter().take(hi).skip(lo.saturating_sub(1)) {
                     entries.push(ins_view_row(r, *sid, view, label));
                 }
             }
-            return if lo == 1 && hi >= m { format!("{label}{ftag}") }
-                   else { format!("{label} {lo}..{hi}{ftag}") };
+            return if lo == 1 && hi >= m {
+                format!("{label}{ftag}")
+            } else {
+                format!("{label} {lo}..{hi}{ftag}")
+            };
         }
 
         // SUMMARY mode: facet groups instead of blind ranges.
-        header.push(format!("{label}: {n} row(s){ftag} — pick a group, \
-                             refine by pattern, or browse sequentially"));
+        header.push(format!(
+            "{label}: {n} row(s){ftag} — pick a group, \
+                             refine by pattern, or browse sequentially"
+        ));
         header.push(String::new());
         let again = |extra: InsFacet| {
             let mut fs = facets.clone();
             fs.push(extra);
-            InsNode::BoxView { sid: *sid, view, label, facets: fs,
-                               seq: false, lo: 1, hi: INS_END }
+            InsNode::BoxView {
+                sid: *sid,
+                view,
+                label,
+                facets: fs,
+                seq: false,
+                lo: 1,
+                hi: INS_END,
+            }
         };
         entries.push(ins_ask(
-            format!("\u{2315} narrow by pattern\u{2026} (glob on the row's {}, \
+            format!(
+                "\u{2315} narrow by pattern\u{2026} (glob on the row's {}, \
                      mandatory)",
-                    match *view { "changes" => "path", "procs" => "exe",
-                                  "pipelines" => "command",
-                                  "build_edges" => "target", _ => "text" }),
-            InsNode::BoxView { sid: *sid, view, label, facets: facets.clone(),
-                               seq: false, lo: 1, hi: INS_END },
-            "pattern (glob; filters this table)"));
+                match *view {
+                    "changes" => "path",
+                    "procs" => "exe",
+                    "pipelines" => "command",
+                    "build_edges" => "target",
+                    _ => "text",
+                }
+            ),
+            InsNode::BoxView {
+                sid: *sid,
+                view,
+                label,
+                facets: facets.clone(),
+                seq: false,
+                lo: 1,
+                hi: INS_END,
+            },
+            "pattern (glob; filters this table)",
+        ));
         let ap = ins_approx(sampled);
         match *view {
             "changes" | "build_edges" => {
-                let cur_prefix: String = facets.iter().rev().find_map(|f|
-                    match f { InsFacet::Prefix(p) => Some(p.clone()), _ => None })
+                let cur_prefix: String = facets
+                    .iter()
+                    .rev()
+                    .find_map(|f| match f {
+                        InsFacet::Prefix(p) => Some(p.clone()),
+                        _ => None,
+                    })
                     .unwrap_or_default();
                 let rel_of = |r: &Value| -> Option<String> {
                     let p = ins_path_of(r, view)?;
                     let p = p.trim_start_matches('/');
-                    if cur_prefix.is_empty() { return Some(p.to_string()); }
+                    if cur_prefix.is_empty() {
+                        return Some(p.to_string());
+                    }
                     p.strip_prefix(cur_prefix.as_str())
                         .map(|s| s.trim_start_matches('/').to_string())
                 };
@@ -10175,13 +12784,18 @@ impl App {
                     if comp.is_empty() {
                         entries.push(ins_link(
                             format!("(files here) — {ap}{count}"),
-                            again(InsFacet::Here(cur_prefix.clone()))));
+                            again(InsFacet::Here(cur_prefix.clone())),
+                        ));
                     } else {
-                        let deeper = if cur_prefix.is_empty() { comp.clone() }
-                                     else { format!("{cur_prefix}/{comp}") };
+                        let deeper = if cur_prefix.is_empty() {
+                            comp.clone()
+                        } else {
+                            format!("{cur_prefix}/{comp}")
+                        };
                         entries.push(ins_link(
                             format!("{comp}/ — {ap}{count}"),
-                            again(InsFacet::Prefix(deeper))));
+                            again(InsFacet::Prefix(deeper)),
+                        ));
                     }
                 }
                 if *view == "changes" {
@@ -10189,27 +12803,32 @@ impl App {
                         let p = ins_path_of(r, view)?;
                         let base = p.rsplit('/').next()?;
                         let e = base.rsplit_once('.')?.1;
-                        (!e.is_empty() && e.len() <= 8
+                        (!e.is_empty()
+                            && e.len() <= 8
                             && e.chars().all(|c| c.is_ascii_alphanumeric()))
-                            .then(|| e.to_string())
+                        .then(|| e.to_string())
                     });
                     for (ext, count) in exts.iter().take(8) {
                         entries.push(ins_link(
                             format!("*.{ext} — {ap}{count}"),
-                            again(InsFacet::Ext(ext.clone()))));
+                            again(InsFacet::Ext(ext.clone())),
+                        ));
                     }
                     if !sampled {
                         // Exact only: size filtering is client-side.
                         for (a, b) in INS_SIZE_STEPS {
-                            let count = sample.iter().filter(|r| {
-                                let s = size_of(r);
-                                s >= *a && b.map(|b| s < b).unwrap_or(true)
-                            }).count();
+                            let count = sample
+                                .iter()
+                                .filter(|r| {
+                                    let s = size_of(r);
+                                    s >= *a && b.map(|b| s < b).unwrap_or(true)
+                                })
+                                .count();
                             if count > 0 {
                                 entries.push(ins_link(
-                                    format!("size {} — {count}",
-                                            ins_size_label(*a, *b)),
-                                    again(InsFacet::Size(*a, *b))));
+                                    format!("size {} — {count}", ins_size_label(*a, *b)),
+                                    again(InsFacet::Size(*a, *b)),
+                                ));
                             }
                         }
                     }
@@ -10217,23 +12836,29 @@ impl App {
             }
             "procs" => {
                 let groups = ins_tally(&sample, |r| {
-                    r.get("exe").and_then(Value::as_str)
+                    r.get("exe")
+                        .and_then(Value::as_str)
                         .map(|e| e.rsplit('/').next().unwrap_or(e).to_string())
                 });
                 for (g, count) in groups.iter().take(INS_PAGE) {
-                    entries.push(ins_link(format!("{g} — {ap}{count}"),
-                                          again(InsFacet::Group(g.clone()))));
+                    entries.push(ins_link(
+                        format!("{g} — {ap}{count}"),
+                        again(InsFacet::Group(g.clone())),
+                    ));
                 }
             }
             "pipelines" => {
                 let groups = ins_tally(&sample, |r| {
-                    r.get("cmd").and_then(Value::as_str)
+                    r.get("cmd")
+                        .and_then(Value::as_str)
                         .and_then(|c| c.split_whitespace().next())
                         .map(str::to_string)
                 });
                 for (g, count) in groups.iter().take(INS_PAGE) {
-                    entries.push(ins_link(format!("{g} \u{2026} — {ap}{count}"),
-                                          again(InsFacet::Group(g.clone()))));
+                    entries.push(ins_link(
+                        format!("{g} \u{2026} — {ap}{count}"),
+                        again(InsFacet::Group(g.clone())),
+                    ));
                 }
             }
             _ => {}
@@ -10242,8 +12867,16 @@ impl App {
         // be walked in order.
         entries.push(ins_link(
             format!("browse all {n} sequentially\u{2026}"),
-            InsNode::BoxView { sid: *sid, view, label, facets: facets.clone(),
-                               seq: true, lo: 1, hi: INS_END }));
+            InsNode::BoxView {
+                sid: *sid,
+                view,
+                label,
+                facets: facets.clone(),
+                seq: true,
+                lo: 1,
+                hi: INS_END,
+            },
+        ));
         format!("{label}{ftag}")
     }
 
@@ -10251,20 +12884,37 @@ impl App {
     /// shape as the box views, faceted client-side: field=value groups from
     /// the list's natural keys, a ⌕ query row (substring across the whole
     /// row), and a sequential escape hatch.
-    fn ins_rows_frame(&self, node: &InsNode,
-                      header: &mut Vec<String>,
-                      entries: &mut Vec<InsEntry>) -> String {
-        let InsNode::Rows { sid, kind, group, query, seq, lo, hi } = node
-            else { unreachable!() };
+    fn ins_rows_frame(
+        &self,
+        node: &InsNode,
+        header: &mut Vec<String>,
+        entries: &mut Vec<InsEntry>,
+    ) -> String {
+        let InsNode::Rows {
+            sid,
+            kind,
+            group,
+            query,
+            seq,
+            lo,
+            hi,
+        } = node
+        else {
+            unreachable!()
+        };
         let what = kind.label();
         let Some(all) = kind.fetch(&self.sock, *sid) else {
-            header.push(format!("{what}: unavailable (engine verb missing \
-                                 or no capture for this box)"));
+            header.push(format!(
+                "{what}: unavailable (engine verb missing \
+                                 or no capture for this box)"
+            ));
             return what.to_string();
         };
-        let rows: Vec<&Value> = all.iter()
+        let rows: Vec<&Value> = all
+            .iter()
             .filter(|r| match group {
-                Some((k, want)) => r.get(k.as_str())
+                Some((k, want)) => r
+                    .get(k.as_str())
                     .map(|v| ins_json_preview(v, 200) == *want)
                     .unwrap_or(false),
                 None => true,
@@ -10276,10 +12926,17 @@ impl App {
             .collect();
         let n = rows.len();
         let mut tags = vec![];
-        if let Some((k, v)) = group { tags.push(format!("{k}={v}")); }
-        if let Some(q) = query { tags.push(format!("~{q}")); }
-        let ftag = if tags.is_empty() { String::new() }
-                   else { format!(" \u{b7} {}", tags.join(" \u{b7} ")) };
+        if let Some((k, v)) = group {
+            tags.push(format!("{k}={v}"));
+        }
+        if let Some(q) = query {
+            tags.push(format!("~{q}"));
+        }
+        let ftag = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" \u{b7} {}", tags.join(" \u{b7} "))
+        };
         header.push(format!("{n} row(s){ftag}"));
         header.push(String::new());
 
@@ -10288,28 +12945,44 @@ impl App {
             entries.push(ins_ask(
                 "\u{2315} filter rows\u{2026} (substring or *glob* across the \
                  whole row, mandatory)",
-                node.clone(), "substring / wildcard the rows must contain"));
+                node.clone(),
+                "substring / wildcard the rows must contain",
+            ));
             let mut grouped = false;
             for key in kind.group_keys() {
-                let groups = ins_tally(&rows, |r| {
-                    r.get(*key).map(|v| ins_json_preview(v, 60))
-                });
-                if groups.len() < 2 { continue; }
+                let groups = ins_tally(&rows, |r| r.get(*key).map(|v| ins_json_preview(v, 60)));
+                if groups.len() < 2 {
+                    continue;
+                }
                 for (val, count) in groups.iter().take(INS_PAGE) {
                     entries.push(ins_link(
                         format!("{key} = {val} — {count}"),
-                        InsNode::Rows { sid: *sid, kind: *kind,
+                        InsNode::Rows {
+                            sid: *sid,
+                            kind: *kind,
                             group: Some((key.to_string(), val.clone())),
-                            query: query.clone(), seq: false,
-                            lo: 1, hi: INS_END }));
+                            query: query.clone(),
+                            seq: false,
+                            lo: 1,
+                            hi: INS_END,
+                        },
+                    ));
                 }
                 grouped = true;
                 break;
             }
             entries.push(ins_link(
                 format!("browse all {n} sequentially\u{2026}"),
-                InsNode::Rows { sid: *sid, kind: *kind, group: group.clone(),
-                    query: query.clone(), seq: true, lo: 1, hi: INS_END }));
+                InsNode::Rows {
+                    sid: *sid,
+                    kind: *kind,
+                    group: group.clone(),
+                    query: query.clone(),
+                    seq: true,
+                    lo: 1,
+                    hi: INS_END,
+                },
+            ));
             if grouped {
                 return format!("{what}{ftag}");
             }
@@ -10321,21 +12994,40 @@ impl App {
         if let Some(spans) = ins_spans(lo, hi, INS_PAGE) {
             for (a, b) in spans {
                 entries.push(ins_link(
-                    format!("rows {a}..{b} \u{b7} {} \u{21e2} {}",
-                            ins_json_preview(rows[a - 1], 14),
-                            ins_json_preview(rows[b - 1], 14)),
-                    InsNode::Rows { sid: *sid, kind: *kind, group: group.clone(),
-                        query: query.clone(), seq: true, lo: a, hi: b }));
+                    format!(
+                        "rows {a}..{b} \u{b7} {} \u{21e2} {}",
+                        ins_json_preview(rows[a - 1], 14),
+                        ins_json_preview(rows[b - 1], 14)
+                    ),
+                    InsNode::Rows {
+                        sid: *sid,
+                        kind: *kind,
+                        group: group.clone(),
+                        query: query.clone(),
+                        seq: true,
+                        lo: a,
+                        hi: b,
+                    },
+                ));
             }
         } else {
             for r in rows.iter().take(hi).skip(lo.saturating_sub(1)) {
-                entries.push(ins_link(ins_json_preview(r, 200),
-                    InsNode::Json { label: what.to_string(),
-                                    v: (*r).clone(), lo: 1, hi: INS_END }));
+                entries.push(ins_link(
+                    ins_json_preview(r, 200),
+                    InsNode::Json {
+                        label: what.to_string(),
+                        v: (*r).clone(),
+                        lo: 1,
+                        hi: INS_END,
+                    },
+                ));
             }
         }
-        if lo == 1 && hi >= n { format!("{what}{ftag}") }
-        else { format!("{what} {lo}..{hi}{ftag}") }
+        if lo == 1 && hi >= n {
+            format!("{what}{ftag}")
+        } else {
+            format!("{what} {lo}..{hi}{ftag}")
+        }
     }
 }
 
@@ -10343,8 +13035,10 @@ impl App {
 /// for build edges).
 fn ins_path_of(r: &Value, view: &str) -> Option<String> {
     if view == "build_edges" {
-        r.get("outs").and_then(Value::as_array)
-            .and_then(|a| a.first()).and_then(Value::as_str)
+        r.get("outs")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(Value::as_str)
             .map(str::to_string)
     } else {
         r.get("path").and_then(Value::as_str).map(str::to_string)
@@ -10361,22 +13055,39 @@ fn ins_preview_of(r: &Value, view: &str, cap: usize) -> String {
 
 /// One leaf row of a box-table view: changes get their per-file diff as the
 /// child, everything else drills into the row's fields.
-fn ins_view_row(r: &Value, sid: i64, view: &'static str,
-                label: &'static str) -> InsEntry {
+fn ins_view_row(r: &Value, sid: i64, view: &'static str, label: &'static str) -> InsEntry {
     if view == "changes" {
-        let path = r.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let path = r
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let kind = r.get("kind").and_then(Value::as_str).unwrap_or("?");
         let size = r.get("size").and_then(Value::as_i64).unwrap_or(0);
         // Directory-connector rows are structure, not leaves — no diff.
-        let child = if kind == "dir" { None } else {
-            Some(InsNode::BoxFile { sid, file: path.clone() })
+        let child = if kind == "dir" {
+            None
+        } else {
+            Some(InsNode::BoxFile {
+                sid,
+                file: path.clone(),
+            })
         };
-        InsEntry { text: format!("{kind:>7}  {size:>8}  {path}"),
-                   child, arg: None }
+        InsEntry {
+            text: format!("{kind:>7}  {size:>8}  {path}"),
+            child,
+            arg: None,
+        }
     } else {
-        ins_link(ins_json_preview(r, 200),
-            InsNode::Json { label: format!("{label} row"),
-                            v: r.clone(), lo: 1, hi: INS_END })
+        ins_link(
+            ins_json_preview(r, 200),
+            InsNode::Json {
+                label: format!("{label} row"),
+                v: r.clone(),
+                lo: 1,
+                hi: INS_END,
+            },
+        )
     }
 }
 
@@ -10388,9 +13099,13 @@ fn ins_view_row(r: &Value, sid: i64, view: &'static str,
 /// the card when a prompt or the ':' locator is active.
 fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect) {
     let Some(frame) = app.ins_stack.last() else {
-        f.render_widget(Paragraph::new(Span::styled(
-            "inspector: empty (press 's' again)",
-            Style::default().add_modifier(Modifier::DIM))), body);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "inspector: empty (press 's' again)",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+            body,
+        );
         return;
     };
     let split = Layout::default()
@@ -10406,16 +13121,17 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
     // scrolled off. Each ancestor keeps its own cursor highlighted (the
     // row you descended through), so the whole path reads at a glance.
     let min_col = 30u16;
-    let max_cols = ((top.width / min_col).max(1) as usize)
-        .min(app.ins_stack.len());
+    let max_cols = ((top.width / min_col).max(1) as usize).min(app.ins_stack.len());
     let frames = &app.ins_stack[app.ins_stack.len() - max_cols..];
     let hidden = app.ins_stack.len() - max_cols;
     // The active column gets a double share of the width.
     let shares: u32 = max_cols as u32 + 1;
-    let constraints: Vec<Constraint> = (0..max_cols).map(|i| {
-        let sh = if i + 1 == max_cols { 2 } else { 1 };
-        Constraint::Ratio(sh, shares)
-    }).collect();
+    let constraints: Vec<Constraint> = (0..max_cols)
+        .map(|i| {
+            let sh = if i + 1 == max_cols { 2 } else { 1 };
+            Constraint::Ratio(sh, shares)
+        })
+        .collect();
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)
@@ -10424,8 +13140,10 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
         let active = ci + 1 == max_cols;
         let mut lines: Vec<Line> = vec![];
         for h in &fr.header {
-            lines.push(Line::from(Span::styled(h.clone(),
-                Style::default().add_modifier(Modifier::DIM))));
+            lines.push(Line::from(Span::styled(
+                h.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
         }
         for (i, e) in fr.entries.iter().enumerate() {
             // The inline input edits IN PLACE: while a prompt is open, the
@@ -10434,40 +13152,62 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
             if active && i == fr.sel {
                 if let Some((prompt, buf)) = &app.ins_input {
                     lines.push(Line::from(vec![
-                        Span::styled("\u{2315} ", Style::default()
-                            .fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                        Span::styled(format!("{buf}_"), Style::default()
-                            .fg(Color::Black).bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)),
-                        Span::styled("  Enter go \u{b7} Esc cancel",
-                            Style::default().add_modifier(Modifier::DIM)),
+                        Span::styled(
+                            "\u{2315} ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("{buf}_"),
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            "  Enter go \u{b7} Esc cancel",
+                            Style::default().add_modifier(Modifier::DIM),
+                        ),
                     ]));
                     lines.push(Line::from(Span::styled(
                         format!("   {prompt}"),
-                        Style::default().fg(Color::Yellow)
-                            .add_modifier(Modifier::DIM))));
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::DIM),
+                    )));
                     continue;
                 }
             }
-            let marker = if e.arg.is_some() { "\u{2315} " }
-                         else if e.child.is_some() { "\u{25b8} " }
-                         else { "  " };
+            let marker = if e.arg.is_some() {
+                "\u{2315} "
+            } else if e.child.is_some() {
+                "\u{25b8} "
+            } else {
+                "  "
+            };
             let style = if i == fr.sel && active {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
             } else if i == fr.sel {
                 // The ancestor's cursor — the rung of the descent path.
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else if active {
                 Style::default()
             } else {
                 Style::default().add_modifier(Modifier::DIM)
             };
             lines.push(Line::from(Span::styled(
-                format!("{marker}{}", e.text), style)));
+                format!("{marker}{}", e.text),
+                style,
+            )));
         }
         if fr.entries.is_empty() && fr.header.is_empty() {
-            lines.push(Line::from(Span::styled("(empty)",
-                Style::default().add_modifier(Modifier::DIM))));
+            lines.push(Line::from(Span::styled(
+                "(empty)",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
         }
         // First-time hints belong to the FRAME, so they render on its
         // column (see INS_HINTS) — pre-wrapped to the column width.
@@ -10477,9 +13217,7 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
                 if let Some(h) = ins_hint(id) {
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(h.marker, dim)));
-                    for l in ins_wrap(h.body,
-                        cols[ci].width.saturating_sub(2) as usize)
-                    {
+                    for l in ins_wrap(h.body, cols[ci].width.saturating_sub(2) as usize) {
                         lines.push(Line::from(Span::styled(l, dim)));
                     }
                 }
@@ -10509,18 +13247,28 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
             let mut rest = l.as_str();
             while let Some(i) = rest.find('[') {
                 let (pre, tail) = rest.split_at(i);
-                if !pre.is_empty() { spans.push(Span::raw(pre.to_string())); }
+                if !pre.is_empty() {
+                    spans.push(Span::raw(pre.to_string()));
+                }
                 match tail.find(']') {
                     Some(j) => {
-                        spans.push(Span::styled(tail[..=j].to_string(),
-                            Style::default().fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)));
+                        spans.push(Span::styled(
+                            tail[..=j].to_string(),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ));
                         rest = &tail[j + 1..];
                     }
-                    None => { spans.push(Span::raw(tail.to_string())); rest = ""; }
+                    None => {
+                        spans.push(Span::raw(tail.to_string()));
+                        rest = "";
+                    }
                 }
             }
-            if !rest.is_empty() { spans.push(Span::raw(rest.to_string())); }
+            if !rest.is_empty() {
+                spans.push(Span::raw(rest.to_string()));
+            }
             card_lines.push(Line::from(spans));
         } else {
             card_lines.push(Line::from(l.clone()));
@@ -10541,7 +13289,6 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
     f.render_widget(card, bottom);
 }
 
-
 fn draw(f: &mut ratatui::Frame, app: &App) {
     // Norton-Commander-style chrome (top to bottom):
     //   menubar    : pane names with their letter accelerators (b/c/p/...)
@@ -10555,11 +13302,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),   // menubar
-            Constraint::Min(3),      // body
-            Constraint::Length(1),   // cmdline
-            Constraint::Length(1),   // fkeybar
-            Constraint::Length(1),   // status
+            Constraint::Length(1), // menubar
+            Constraint::Min(3),    // body
+            Constraint::Length(1), // cmdline
+            Constraint::Length(1), // fkeybar
+            Constraint::Length(1), // status
         ])
         .split(f.area());
     let menubar_area = root[0];
@@ -10569,9 +13316,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let status_area = root[4];
 
     // Top menubar.
-    f.render_widget(
-        Paragraph::new(Line::from(menubar_spans(app))),
-        menubar_area);
+    f.render_widget(Paragraph::new(Line::from(menubar_spans(app))), menubar_area);
 
     // The PTY pane takes the whole body. NO border block — the surrounding
     // frame would interfere with the host terminal's native click-drag
@@ -10593,11 +13338,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
                 .split(body);
             let title_bar = Paragraph::new(Line::from(vec![
-                Span::styled(tag, Style::default().fg(Color::Yellow)
-                                                   .add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    tag,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("   "),
-                Span::styled("F4/F5 cycle · F2/F3 screens · F7 new · F8 kill · F12 detach",
-                    Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    "F4/F5 cycle · F2/F3 screens · F7 new · F8 kill · F12 detach",
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
             ]));
             f.render_widget(title_bar, split[0]);
             // Direct paint into the buffer — we manage the cell-by-cell
@@ -10607,9 +13358,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             // No PTY open: a one-line message, also frame-less so the
             // empty-state matches the live-PTY layout.
             f.render_widget(
-                Paragraph::new(Span::styled("no PTY open",
-                    Style::default().add_modifier(Modifier::DIM))),
-                body);
+                Paragraph::new(Span::styled(
+                    "no PTY open",
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+                body,
+            );
         }
     } else if app.focus == Pane::Help {
         // The Help pane takes the whole body.
@@ -10627,9 +13381,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         match app.reader.borrow_mut().as_mut() {
             Some(r) => r.render(f, body, true),
             None => f.render_widget(
-                Paragraph::new(Span::styled(READER_EMPTY_HINT,
-                    Style::default().add_modifier(Modifier::DIM))),
-                body),
+                Paragraph::new(Span::styled(
+                    READER_EMPTY_HINT,
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+                body,
+            ),
         }
     } else if app.focus == Pane::Editor && app.editor_full {
         // 'z' zoom: the SAME editor widget the right pane renders, over the
@@ -10637,9 +13394,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         match app.editor.borrow_mut().as_mut() {
             Some(e) => e.render(f, body, true),
             None => f.render_widget(
-                Paragraph::new(Span::styled(EDITOR_EMPTY_HINT,
-                    Style::default().add_modifier(Modifier::DIM))),
-                body),
+                Paragraph::new(Span::styled(
+                    EDITOR_EMPTY_HINT,
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+                body,
+            ),
         }
     } else {
         // Single-list-per-view layout (mirrors the prototype's _set_view /
@@ -10651,7 +13411,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(body);
-        let left = cols[0]; let right = cols[1];
+        let left = cols[0];
+        let right = cols[1];
         // Border / title highlight follows the focused half: when
         // right_focused is set, the LEFT block dims and the RIGHT block
         // gets the focused styling — the same "active border" treatment
@@ -10685,12 +13446,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .constraints([Constraint::Length(1), Constraint::Min(1)])
                     .split(right);
                 let title_bar = Paragraph::new(Line::from(vec![
-                    Span::styled(tag,
-                        Style::default().fg(if rf { Color::Yellow } else { Color::DarkGray })
-                            .add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        tag,
+                        Style::default()
+                            .fg(if rf { Color::Yellow } else { Color::DarkGray })
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw("   "),
-                    Span::styled("F11 full-screen · F8 kill · F4/F5 cycle",
-                        Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "F11 full-screen · F8 kill · F4/F5 cycle",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
                 ]));
                 f.render_widget(title_bar, split[0]);
                 render_pty_into(f.buffer_mut(), split[1], pty);
@@ -10721,7 +13487,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("BOX · DETAIL", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::Processes => {
                 let lines = processes_lines(app);
@@ -10736,7 +13504,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("ENVIRONMENT · DETAIL", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::Outputs => {
                 let lines = outputs_index_lines(app);
@@ -10759,17 +13529,24 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let third = visible / 3;
                 let follow = (cursor_row.saturating_sub(third)).min(max as usize) as u16;
                 app.out_follow_scroll.set(follow);
-                let rs = if rf { app.right_scroll.min(max) } else { follow };
+                let rs = if rf {
+                    app.right_scroll.min(max)
+                } else {
+                    follow
+                };
                 let out = Paragraph::new(Text::from(out_lines))
                     .block(block(title("OUTPUT · stdout/stderr", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(out, right); }
+                if !skip_right {
+                    f.render_widget(out, right);
+                }
             }
             Pane::Pipelines => {
                 let lines = pipelines_lines(app, left.width);
                 let hdr = lines.len().saturating_sub(app.pipelines.len());
-                let scroll = scroll_for_cursor(app.sel_pipeline + hdr + 1, lines.len(), left.height);
+                let scroll =
+                    scroll_for_cursor(app.sel_pipeline + hdr + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
                     .block(block(title("PIPELINES · brush", lf), lf))
                     .scroll((scroll, 0));
@@ -10780,7 +13557,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("PIPELINE · DETAIL", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::BuildEdges => {
                 let lines = build_edges_lines(app, left.width);
@@ -10796,7 +13575,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("EDGE · DETAIL", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::Rules => {
                 let lines = rules_lines(app);
@@ -10812,7 +13593,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("WHAT IT MATCHES", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::Mirrors => {
                 let lines = mirrors_lines(app);
@@ -10827,7 +13610,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("JOB · DETAIL", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::Reader => {
                 let mut rd = app.reader.borrow_mut();
@@ -10838,17 +13623,23 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         let p = Paragraph::new(Text::from(r.outline_lines()))
                             .block(block(title("READER · outline", false), false));
                         f.render_widget(p, left);
-                        if !skip_right { r.render(f, right, true); }
+                        if !skip_right {
+                            r.render(f, right, true);
+                        }
                     }
                     None => {
-                        let p = Paragraph::new(Span::styled("(no document)",
-                                Style::default().add_modifier(Modifier::DIM)))
-                            .block(block(title("READER · outline", lf), lf));
+                        let p = Paragraph::new(Span::styled(
+                            "(no document)",
+                            Style::default().add_modifier(Modifier::DIM),
+                        ))
+                        .block(block(title("READER · outline", lf), lf));
                         f.render_widget(p, left);
                         let detail = Paragraph::new(READER_EMPTY_HINT)
                             .block(block(title("DOCUMENT", rf), rf))
                             .wrap(Wrap { trim: false });
-                        if !skip_right { f.render_widget(detail, right); }
+                        if !skip_right {
+                            f.render_widget(detail, right);
+                        }
                     }
                 }
             }
@@ -10860,15 +13651,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         // the same widget 'z' zooms.
                         let rows = e.state.lines.iter_row().count();
                         let info = vec![
-                            Line::from(Span::styled(e.target.label(),
-                                Style::default().add_modifier(Modifier::BOLD))),
+                            Line::from(Span::styled(
+                                e.target.label(),
+                                Style::default().add_modifier(Modifier::BOLD),
+                            )),
                             Line::from(format!("language: {}", e.lang_label())),
                             Line::from(format!(
                                 "state: {}{}",
                                 if e.dirty { "MODIFIED" } else { "saved" },
-                                if e.read_only { " · read-only" } else { "" })),
-                            Line::from(format!(
-                                "line {}/{}", e.state.cursor.row + 1, rows)),
+                                if e.read_only { " · read-only" } else { "" }
+                            )),
+                            Line::from(format!("line {}/{}", e.state.cursor.row + 1, rows)),
                             Line::from(""),
                             Line::from("vim-modal editing (edtui)"),
                             Line::from("Ctrl-S save · Ctrl-O open"),
@@ -10879,17 +13672,23 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                             .block(block(title("EDITOR", false), false))
                             .wrap(Wrap { trim: false });
                         f.render_widget(p, left);
-                        if !skip_right { e.render(f, right, true); }
+                        if !skip_right {
+                            e.render(f, right, true);
+                        }
                     }
                     None => {
-                        let p = Paragraph::new(Span::styled("(no file)",
-                                Style::default().add_modifier(Modifier::DIM)))
-                            .block(block(title("EDITOR", lf), lf));
+                        let p = Paragraph::new(Span::styled(
+                            "(no file)",
+                            Style::default().add_modifier(Modifier::DIM),
+                        ))
+                        .block(block(title("EDITOR", lf), lf));
                         f.render_widget(p, left);
                         let detail = Paragraph::new(EDITOR_EMPTY_HINT)
                             .block(block(title("BUFFER", rf), rf))
                             .wrap(Wrap { trim: false });
-                        if !skip_right { f.render_widget(detail, right); }
+                        if !skip_right {
+                            f.render_widget(detail, right);
+                        }
                     }
                 }
             }
@@ -10906,7 +13705,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("FLOW · DETAIL (tshark -V)", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::Packets => {
                 let lines = packets_lines(app);
@@ -10914,7 +13715,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let p = Paragraph::new(Text::from(lines))
                     .block(block(
                         title(&format!("PACKETS · stream {}", app.packets_stream), lf),
-                        lf))
+                        lf,
+                    ))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
                 let dl = packet_detail_lines(app);
@@ -10923,7 +13725,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("PACKET · DETAIL (tshark -V)", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::ApiLogs => {
                 let lines = api_log_index_lines(app);
@@ -10938,7 +13742,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("CALL · request + response", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::Network => {
                 let lines = webcap_index_lines(app);
@@ -10953,7 +13759,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("CAPTURE · headers + body", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::Trace => {
                 let lines = trace_index_lines(app);
@@ -10968,7 +13776,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("EVENT · full detail", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             Pane::Vars => {
                 let lines = vars_index_lines(app, left.width);
@@ -10984,7 +13794,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .block(block(title("VARIABLE · value + history", rf), rf))
                     .scroll((rs, 0))
                     .wrap(Wrap { trim: false });
-                if !skip_right { f.render_widget(detail, right); }
+                if !skip_right {
+                    f.render_widget(detail, right);
+                }
             }
             // Changes view (Pane::Changes is list-focused; Pane::Hunks is
             // diff-focused — same two-pane layout, different border). The
@@ -11012,14 +13824,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         Paragraph::new(Text::from(cd_info_lines(app)))
                             .block(block(title("path", false), false))
                             .wrap(Wrap { trim: false }),
-                        rsplit[0]);
+                        rsplit[0],
+                    );
 
                     let is_bin = !app.hunks.is_null()
                         && app.hunks.get("is_text").and_then(Value::as_bool) != Some(true);
                     let diff_title = if is_bin { "structural diff" } else { "diff" };
                     let hunks = Paragraph::new(Text::from(hunk_lines(app)))
-                        .block(block(title(diff_title, app.focus == Pane::Hunks),
-                                     app.focus == Pane::Hunks))
+                        .block(block(
+                            title(diff_title, app.focus == Pane::Hunks),
+                            app.focus == Pane::Hunks,
+                        ))
                         .scroll((app.hunk_scroll, 0))
                         .wrap(Wrap { trim: false });
                     f.render_widget(hunks, rsplit[1]);
@@ -11032,16 +13847,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     // expression for the focused view, prefixed with a "$" prompt
     // glyph; if no filter is set, just the dim "$" placeholder. A
     // future "type a command here" mode will hook into this row.
-    f.render_widget(
-        Paragraph::new(Line::from(cmdline_spans(app))),
-        cmdline_area);
+    f.render_widget(Paragraph::new(Line::from(cmdline_spans(app))), cmdline_area);
 
     // F-keybar: ten contextual fields. F1 / F10 are stable across
     // panes (help / quit); the middle ones change to reflect what
     // each key does HERE. Look down to know — no help-pane round-trip.
-    f.render_widget(
-        Paragraph::new(Line::from(fkeybar_spans(app))),
-        fkeybar_area);
+    f.render_widget(Paragraph::new(Line::from(fkeybar_spans(app))), fkeybar_area);
 
     // Banner-prompt overrides the regular status bar while a -n box
     // connection is waiting on a verdict. yellow + bold so it's
@@ -11053,10 +13864,15 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         let box_name = p.get("box").and_then(Value::as_str).unwrap_or("");
         let body = format!(
             "[{box_name}] connection: {scheme}://{host}:{port}  \
-             [y]es once  [n]o once  [a]llow+save  [d]eny+save");
+             [y]es once  [n]o once  [a]llow+save  [d]eny+save"
+        );
         Paragraph::new(Line::from(Span::styled(
-            body, Style::default().fg(Color::Black).bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD))))
+            body,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )))
     } else {
         let status_text = if let Some(buf) = &app.renaming {
             format!("rename -> {buf}_  (Enter to commit, Esc to cancel)")
@@ -11070,7 +13886,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     };
     f.render_widget(
         status_widget,
-        Rect { x: status_area.x, y: status_area.y, width: status_area.width, height: 1 },
+        Rect {
+            x: status_area.x,
+            y: status_area.y,
+            width: status_area.width,
+            height: 1,
+        },
     );
 
     if let Some(m) = &app.modal {
@@ -11086,8 +13907,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 /// count line and a small preview of recent paths.
 fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     let Some(s) = app.sessions.get(app.sel_session) else {
-        return vec![Line::from(Span::styled("(no slopbox selected)",
-            Style::default().add_modifier(Modifier::DIM)))];
+        return vec![Line::from(Span::styled(
+            "(no slopbox selected)",
+            Style::default().add_modifier(Modifier::DIM),
+        ))];
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -11097,28 +13920,51 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     let path = g("path");
     let name = g("name");
     let sid = g("session_id");
-    let label = if !path.is_empty() { path }
-                else if !name.is_empty() { name }
-                else { sid };
-    let cmd = s.get("cmd").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+    let label = if !path.is_empty() {
+        path
+    } else if !name.is_empty() {
+        name
+    } else {
+        sid
+    };
+    let cmd = s
+        .get("cmd")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .unwrap_or_default();
     let pid = s.get("pid").and_then(Value::as_i64).unwrap_or(0);
     let started = s.get("started").and_then(Value::as_f64).unwrap_or(0.0);
     let live = s.get("live").and_then(Value::as_bool).unwrap_or(false);
-    let preview_label = if live { "recently changed" } else { "↵ to review" };
+    let preview_label = if live {
+        "recently changed"
+    } else {
+        "↵ to review"
+    };
     let mut out = vec![
-        Line::from(Span::styled(label,
-            Style::default().fg(color).add_modifier(Modifier::BOLD))),
-        Line::from(vec![Span::styled("status  ", dim),
-                        Span::styled(status.clone(), Style::default().fg(color))]),
+        Line::from(Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("status  ", dim),
+            Span::styled(status.clone(), Style::default().fg(color)),
+        ]),
         Line::from(vec![Span::styled("cmd     ", dim), Span::raw(cmd)]),
         Line::from(vec![
             Span::styled("pid     ", dim),
             Span::raw(if pid > 0 { pid.to_string() } else { "0".into() }),
             Span::raw("    "),
             Span::styled("age ", dim),
-            Span::raw(if started > 0.0 { fmt_age(started) } else { String::new() }),
+            Span::raw(if started > 0.0 {
+                fmt_age(started)
+            } else {
+                String::new()
+            }),
         ]),
         Line::from(vec![
             Span::styled("changes ", dim),
@@ -11135,13 +13981,18 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     // Pull each list out of the bundle first (empty defaults if the bundle is
     // null — happens momentarily on session switch before the RPC returns) so
     // the per-section row budget can be computed from what's actually there.
-    let g_arr = |k: &str| app.box_summary.get(k)
-        .and_then(Value::as_array).cloned().unwrap_or_default();
-    let changes  = g_arr("changes");
-    let outputs  = g_arr("outputs");
-    let procs    = g_arr("processes");
-    let pipes    = g_arr("pipelines");
-    let edges    = g_arr("edges");
+    let g_arr = |k: &str| {
+        app.box_summary
+            .get(k)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let changes = g_arr("changes");
+    let outputs = g_arr("outputs");
+    let procs = g_arr("processes");
+    let pipes = g_arr("pipelines");
+    let edges = g_arr("edges");
     let failures = g_arr("failures");
 
     // Size the sections to the pane: split the rows below the 6-line head
@@ -11149,17 +14000,27 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     // header + trailing blank), floor 3 so a tiny pane still shows something.
     let inner_w = (area.width as usize).saturating_sub(2).max(20);
     let inner_h = (area.height as usize).saturating_sub(2);
-    let nonempty = [!changes.is_empty(), !outputs.is_empty(), !procs.is_empty(),
-                    !pipes.is_empty(), !edges.is_empty(), !failures.is_empty()]
-        .iter().filter(|b| **b).count().max(1);
+    let nonempty = [
+        !changes.is_empty(),
+        !outputs.is_empty(),
+        !procs.is_empty(),
+        !pipes.is_empty(),
+        !edges.is_empty(),
+        !failures.is_empty(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count()
+    .max(1);
     let budget = ((inner_h.saturating_sub(6) / nonempty).saturating_sub(2)).max(3);
 
-    let header = |title: &str| Line::from(
-        Span::styled(format!("── {title} ──"), dim));
+    let header = |title: &str| Line::from(Span::styled(format!("── {title} ──"), dim));
     // Each section renders its newest `budget` rows OLDEST-FIRST (newest at
     // the bottom, like a log tail) — the engine hands them newest-first.
     let render_changes_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
-        if rows.is_empty() { return; }
+        if rows.is_empty() {
+            return;
+        }
         out.push(header("recent changes"));
         for c in rows.iter().take(budget).rev() {
             let kind = c.get("kind").and_then(Value::as_str).unwrap_or("");
@@ -11167,7 +14028,7 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
             let (glyph, col) = match kind {
                 "deleted" => ("-", Color::Red),
                 "symlink" => ("~", Color::Magenta),
-                "xattr"   => ("@", Color::Cyan),
+                "xattr" => ("@", Color::Cyan),
                 "changed" => ("~", Color::Yellow),
                 _ => ("·", Color::DarkGray),
             };
@@ -11183,8 +14044,10 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
             if kind == "xattr" {
                 let key = c.get("xattr_key").and_then(Value::as_str).unwrap_or("");
                 let n = c.get("xattr_len").and_then(Value::as_i64).unwrap_or(0);
-                spans.push(Span::styled(format!("   {key}"),
-                    Style::default().fg(Color::Cyan)));
+                spans.push(Span::styled(
+                    format!("   {key}"),
+                    Style::default().fg(Color::Cyan),
+                ));
                 spans.push(Span::styled(format!("  ({n} B)"), dim));
             }
             out.push(Line::from(spans));
@@ -11192,17 +14055,25 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         out.push(Line::from(""));
     };
     let render_outputs_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
-        if rows.is_empty() { return; }
+        if rows.is_empty() {
+            return;
+        }
         out.push(header("recent outputs"));
         for r in rows.iter().take(budget).rev() {
             let stream = r.get("stream").and_then(Value::as_i64).unwrap_or(0);
             let len = r.get("len").and_then(Value::as_i64).unwrap_or(0);
             let preview = r.get("preview").and_then(Value::as_str).unwrap_or("");
             let tag = if stream == 1 { "err" } else { "out" };
-            let tag_col = if stream == 1 { Color::Red } else { Color::Green };
-            let one_line: String = preview.chars()
+            let tag_col = if stream == 1 {
+                Color::Red
+            } else {
+                Color::Green
+            };
+            let one_line: String = preview
+                .chars()
                 .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-                .take(inner_w.saturating_sub(16)).collect();
+                .take(inner_w.saturating_sub(16))
+                .collect();
             out.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(tag.to_string(), Style::default().fg(tag_col)),
@@ -11213,16 +14084,19 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         out.push(Line::from(""));
     };
     let render_processes_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
-        if rows.is_empty() { return; }
+        if rows.is_empty() {
+            return;
+        }
         out.push(header("recent processes"));
         for r in rows.iter().take(budget).rev() {
             let tgid = r.get("tgid").and_then(Value::as_i64).unwrap_or(0);
             let argv0 = r.get("argv0").and_then(Value::as_str).unwrap_or("");
             let exe = r.get("exe").and_then(Value::as_str).unwrap_or("");
             // basename of argv[0] (if any) else of exe
-            let head = std::path::Path::new(
-                if !argv0.is_empty() { argv0 } else { exe })
-                .file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let head = std::path::Path::new(if !argv0.is_empty() { argv0 } else { exe })
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
             out.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("{tgid:>6}  "), dim),
@@ -11232,7 +14106,9 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         out.push(Line::from(""));
     };
     let render_pipelines_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
-        if rows.is_empty() { return; }
+        if rows.is_empty() {
+            return;
+        }
         out.push(header("recent pipelines"));
         for r in rows.iter().take(budget).rev() {
             let cmd = r.get("cmd").and_then(Value::as_str).unwrap_or("");
@@ -11240,7 +14116,9 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
             let mark = if nested { "N" } else { "T" };
             let mark_style = if nested {
                 Style::default().fg(Color::Magenta)
-            } else { Style::default().fg(Color::Cyan) };
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
             let trimmed: String = cmd.chars().take(inner_w.saturating_sub(4)).collect();
             out.push(Line::from(vec![
                 Span::raw("  "),
@@ -11251,7 +14129,9 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         out.push(Line::from(""));
     };
     let render_edges_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
-        if rows.is_empty() { return; }
+        if rows.is_empty() {
+            return;
+        }
         out.push(header("recent build edges"));
         for r in rows.iter().take(budget).rev() {
             let target = r.get("out").and_then(Value::as_str).unwrap_or("(unnamed)");
@@ -11261,8 +14141,14 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
             let mark = if phony { "P" } else { "R" };
             let mark_style = if phony {
                 Style::default().fg(Color::DarkGray)
-            } else { Style::default().fg(Color::Green) };
-            let extra = if n > 1 { format!(" (+{})", n - 1) } else { String::new() };
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let extra = if n > 1 {
+                format!(" (+{})", n - 1)
+            } else {
+                String::new()
+            };
             out.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("{mark} "), mark_style),
@@ -11277,10 +14163,13 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     // line of their captured output) and failed pipelines. `g` (build) + '!'
     // filters to these; the edge detail pane has the full excerpt.
     let render_failures_section = |out: &mut Vec<Line<'static>>, rows: &[Value]| {
-        if rows.is_empty() { return; }
+        if rows.is_empty() {
+            return;
+        }
         out.push(Line::from(Span::styled(
             format!("── FAILURES ── ('!' in build/pipes/outputs filters to errors)"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
         // Hard cap: each failure takes 2 lines (label + excerpt) and a broken
         // -j build can fail dozens of edges at once — without the cap the
         // section shoves everything else off the pane.
@@ -11288,32 +14177,39 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         if rows.len() > cap {
             out.push(Line::from(Span::styled(
                 format!("  (+{} more — 'g' then '!' to see all)", rows.len() - cap),
-                Style::default().fg(Color::Red).add_modifier(Modifier::DIM))));
+                Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
+            )));
         }
         for r in rows.iter().take(cap).rev() {
             let label = r.get("label").and_then(Value::as_str).unwrap_or("");
             let code = r.get("code").and_then(Value::as_i64).unwrap_or(0);
             let kind = r.get("kind").and_then(Value::as_str).unwrap_or("");
             let mark = if kind == "edge" { "E" } else { "P" };
-            let label_short: String = label.chars()
+            let label_short: String = label
+                .chars()
                 .map(|c| if c == '\n' { ' ' } else { c })
-                .take(inner_w.saturating_sub(14)).collect();
+                .take(inner_w.saturating_sub(14))
+                .collect();
             out.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("✗{mark} "), Style::default().fg(Color::Red)),
                 Span::styled(label_short, bold),
-                Span::styled(format!("  exit {code}"),
-                    Style::default().fg(Color::Red)),
+                Span::styled(format!("  exit {code}"), Style::default().fg(Color::Red)),
             ]));
             // First non-empty excerpt line — usually the compiler/tool error.
-            if let Some(el) = r.get("excerpt").and_then(Value::as_str)
-                .and_then(|e| e.lines().rev().find(|l| !l.trim().is_empty())
-                               .map(String::from)) {
+            if let Some(el) = r.get("excerpt").and_then(Value::as_str).and_then(|e| {
+                e.lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .map(String::from)
+            }) {
                 let el: String = el.chars().take(inner_w.saturating_sub(6)).collect();
                 out.push(Line::from(vec![
                     Span::raw("     "),
-                    Span::styled(el, Style::default().fg(Color::Red)
-                                                     .add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        el,
+                        Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
+                    ),
                 ]));
             }
         }
@@ -11329,18 +14225,27 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     // the "running builtins" tree a stuck box otherwise lacks. Ages ≥5min
     // go loud red.
     {
-        let acts = app.box_summary.get("activity")
-            .and_then(Value::as_array).cloned().unwrap_or_default();
+        let acts = app
+            .box_summary
+            .get("activity")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         if !acts.is_empty() {
             out.push(Line::from(Span::styled(
                 "── IN FLIGHT ── (builtins running now — updated every 30s)",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
             for a in acts.iter().take(8) {
                 let desc = a.get("desc").and_then(Value::as_str).unwrap_or("");
                 let age = a.get("age").and_then(Value::as_u64).unwrap_or(0);
-                let desc_short: String = desc.chars()
+                let desc_short: String = desc
+                    .chars()
                     .map(|c| if c == '\n' { ' ' } else { c })
-                    .take(inner_w.saturating_sub(12)).collect();
+                    .take(inner_w.saturating_sub(12))
+                    .collect();
                 let age_style = if age >= 300 {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                 } else {
@@ -11370,18 +14275,30 @@ fn box_detail_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     if app.box_summary.is_null() {
         out.push(Line::from(Span::styled(
             "(no summary yet — engine is still answering review.box_summary)",
-            Style::default().add_modifier(Modifier::DIM).fg(Color::Yellow))));
-    } else if changes.is_empty() && outputs.is_empty() && procs.is_empty()
-        && pipes.is_empty() && edges.is_empty() {
+            Style::default()
+                .add_modifier(Modifier::DIM)
+                .fg(Color::Yellow),
+        )));
+    } else if changes.is_empty()
+        && outputs.is_empty()
+        && procs.is_empty()
+        && pipes.is_empty()
+        && edges.is_empty()
+    {
         out.push(Line::from(Span::styled(
             "(box is empty — no changes, outputs, processes yet)",
-            Style::default().add_modifier(Modifier::DIM))));
+            Style::default().add_modifier(Modifier::DIM),
+        )));
     }
     out
 }
 
 fn bold_count(n: usize) -> String {
-    if n == 1 { "1 file".into() } else { format!("{n} files") }
+    if n == 1 {
+        "1 file".into()
+    } else {
+        format!("{n} files")
+    }
 }
 
 /// One line per pipeline row: a single-letter origin marker (T = top-level,
@@ -11470,20 +14387,26 @@ fn pipelines_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     if app.pipelines.is_empty() {
         return vec![Line::from(Span::styled(
             "no pipelines yet — run something through brush (-b) to populate",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
-        ];
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))];
     }
     let mut out = legend_lines(
         "Flags: T - top-level, N - nested (spawned inside another pipeline); \
 red time - non-zero exit, yellow 'run' - still running",
-        width);
+        width,
+    );
     for (i, row) in app.pipelines.iter().enumerate() {
         let id = row.get("id").and_then(Value::as_i64).unwrap_or(0);
         let nested = row.get("nested").and_then(Value::as_bool) == Some(true);
         let pipeline = row.get("pipeline").and_then(Value::as_i64).unwrap_or(0);
         let cmd = row.get("cmd").and_then(Value::as_str).unwrap_or("");
-        let nprocs = row.get("processes").and_then(Value::as_array)
-            .map(|a| a.len()).unwrap_or(0);
+        let nprocs = row
+            .get("processes")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
         let mark = if nested { "N" } else { "T" };
         let mark_style = if nested {
             Style::default().fg(Color::Magenta)
@@ -11505,7 +14428,12 @@ red time - non-zero exit, yellow 'run' - still running",
             };
             (fmt_dur(done_ts - spawn_ts), style)
         } else {
-            ("• run".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            (
+                "• run".to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
         };
         // Tree indent: depth-1 levels of "│ " then a "└ " elbow (a nested
         // pipeline hangs off its parent). Depth 0 (roots) get no indent.
@@ -11516,12 +14444,13 @@ red time - non-zero exit, yellow 'run' - still running",
             format!("{}└ ", "│ ".repeat(depth - 1))
         };
         let mut spans = vec![
-            Span::styled(format!("{:>4}  ", id),
-                         Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:>4}  ", id), Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{mark}  "), mark_style),
             Span::styled(format!("{dur_txt:>7}  "), dur_style),
-            Span::styled(format!("p{pipeline:<2}  "),
-                         Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("p{pipeline:<2}  "),
+                Style::default().fg(Color::DarkGray),
+            ),
         ];
         if !indent.is_empty() {
             spans.push(Span::styled(indent, Style::default().fg(Color::DarkGray)));
@@ -11533,9 +14462,10 @@ red time - non-zero exit, yellow 'run' - still running",
         };
         spans.push(Span::styled(cmd.to_string(), cmd_style));
         if nprocs > 0 {
-            spans.push(Span::styled(format!("  ·  {nprocs} proc{}",
-                if nprocs == 1 { "" } else { "s" }),
-                Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                format!("  ·  {nprocs} proc{}", if nprocs == 1 { "" } else { "s" }),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
         let mut line = Line::from(spans);
         if i == app.sel_pipeline {
@@ -11552,7 +14482,8 @@ fn pipeline_detail_lines(app: &App) -> Vec<Line<'static>> {
     let Some(row) = app.pipelines.get(app.sel_pipeline) else {
         return vec![Line::from(Span::styled(
             "(select a pipeline)",
-            Style::default().fg(Color::DarkGray)))];
+            Style::default().fg(Color::DarkGray),
+        ))];
     };
     let nested = row.get("nested").and_then(Value::as_bool) == Some(true);
     let id = row.get("id").and_then(Value::as_i64).unwrap_or(0);
@@ -11560,52 +14491,98 @@ fn pipeline_detail_lines(app: &App) -> Vec<Line<'static>> {
     let cmd = row.get("cmd").and_then(Value::as_str).unwrap_or("");
     let ts = row.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
     let spawn_ts = row.get("spawn_ts").and_then(Value::as_f64);
-    let procs: Vec<String> = row.get("processes").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_i64().map(|i| i.to_string())).collect())
+    let procs: Vec<String> = row
+        .get("processes")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_i64().map(|i| i.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     let label = Style::default().fg(Color::DarkGray);
     let val = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = vec![
-        Line::from(vec![Span::styled("id        ", label),
-                        Span::styled(id.to_string(), val)]),
-        Line::from(vec![Span::styled("origin    ", label),
-                        Span::styled(if nested { "nested  (sh -c shim)" }
-                                     else { "top-level brush body" }, val)]),
-        Line::from(vec![Span::styled("seq       ", label),
-                        Span::styled(format!("p{pipeline}"), val)]),
-        Line::from(vec![Span::styled("ts        ", label),
-                        Span::raw(format!("{ts:.6}"))]),
+        Line::from(vec![
+            Span::styled("id        ", label),
+            Span::styled(id.to_string(), val),
+        ]),
+        Line::from(vec![
+            Span::styled("origin    ", label),
+            Span::styled(
+                if nested {
+                    "nested  (sh -c shim)"
+                } else {
+                    "top-level brush body"
+                },
+                val,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("seq       ", label),
+            Span::styled(format!("p{pipeline}"), val),
+        ]),
+        Line::from(vec![
+            Span::styled("ts        ", label),
+            Span::raw(format!("{ts:.6}")),
+        ]),
     ];
     if let Some(st) = spawn_ts {
-        lines.push(Line::from(vec![Span::styled("spawn_ts  ", label),
-                                    Span::raw(format!("{st:.6}"))]));
+        lines.push(Line::from(vec![
+            Span::styled("spawn_ts  ", label),
+            Span::raw(format!("{st:.6}")),
+        ]));
     }
     // Wall time + exit: done_ts==0 means still running (or never marked).
     let done_ts = row.get("done_ts").and_then(Value::as_f64).unwrap_or(0.0);
     let exit_code = row.get("exit_code").and_then(Value::as_i64).unwrap_or(-1);
     if done_ts > 0.0 {
         let dur = done_ts - spawn_ts.unwrap_or(done_ts);
-        lines.push(Line::from(vec![Span::styled("wall      ", label),
-                                    Span::styled(fmt_dur(dur), val)]));
-        lines.push(Line::from(vec![Span::styled("exit      ", label),
-                                    Span::styled(exit_code.to_string(),
-                                        if exit_code == 0 { val }
-                                        else { Style::default().fg(Color::Red).add_modifier(Modifier::BOLD) })]));
+        lines.push(Line::from(vec![
+            Span::styled("wall      ", label),
+            Span::styled(fmt_dur(dur), val),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("exit      ", label),
+            Span::styled(
+                exit_code.to_string(),
+                if exit_code == 0 {
+                    val
+                } else {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                },
+            ),
+        ]));
     } else {
-        lines.push(Line::from(vec![Span::styled("state     ", label),
-            Span::styled("running (not yet finished)",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]));
+        lines.push(Line::from(vec![
+            Span::styled("state     ", label),
+            Span::styled(
+                "running (not yet finished)",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
-    lines.push(Line::from(vec![Span::styled("cmd       ", label),
-                                Span::styled(cmd.to_string(), val)]));
+    lines.push(Line::from(vec![
+        Span::styled("cmd       ", label),
+        Span::styled(cmd.to_string(), val),
+    ]));
     if !procs.is_empty() {
-        lines.push(Line::from(vec![Span::styled("processes ", label),
-            Span::raw(procs.join(", "))]));
+        lines.push(Line::from(vec![
+            Span::styled("processes ", label),
+            Span::raw(procs.join(", ")),
+        ]));
     } else {
-        lines.push(Line::from(vec![Span::styled("processes ", label),
-            Span::styled("(none linked — brush ran this in-process)",
-                         Style::default().fg(Color::DarkGray)
-                                          .add_modifier(Modifier::ITALIC))]));
+        lines.push(Line::from(vec![
+            Span::styled("processes ", label),
+            Span::styled(
+                "(none linked — brush ran this in-process)",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
     }
     // Causal neighborhood — the "this started that" chain: the pipeline that
     // spawned this one, the pipelines it spawned, and the build edge whose
@@ -11615,29 +14592,34 @@ fn pipeline_detail_lines(app: &App) -> Vec<Line<'static>> {
             let fmt_one = |v: &Value| -> Option<(String, i64)> {
                 let cmd = v.get("cmd").and_then(Value::as_str)?;
                 let code = v.get("exit_code").and_then(Value::as_i64).unwrap_or(-1);
-                let one_line: String = cmd.chars()
+                let one_line: String = cmd
+                    .chars()
                     .map(|c| if c == '\n' { ' ' } else { c })
-                    .take(100).collect();
+                    .take(100)
+                    .collect();
                 Some((one_line, code))
             };
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "── started by / starts ──",
-                Style::default().fg(Color::DarkGray))));
+                Style::default().fg(Color::DarkGray),
+            )));
             match ctx.get("parent").and_then(|p| fmt_one(p)) {
                 Some((pcmd, pcode)) => {
                     lines.push(Line::from(vec![
                         Span::styled("↑ ", Style::default().fg(Color::Cyan)),
                         Span::raw(pcmd),
                         if pcode > 0 {
-                            Span::styled(format!("  exit {pcode}"),
-                                Style::default().fg(Color::Red))
-                        } else { Span::raw("") },
+                            Span::styled(format!("  exit {pcode}"), Style::default().fg(Color::Red))
+                        } else {
+                            Span::raw("")
+                        },
                     ]));
                 }
                 None => lines.push(Line::from(Span::styled(
                     "↑ (top of its shell — nothing started this)",
-                    Style::default().fg(Color::DarkGray)))),
+                    Style::default().fg(Color::DarkGray),
+                ))),
             }
             let edge_out = ctx.get("edge_out").and_then(Value::as_str).unwrap_or("");
             if !edge_out.is_empty() {
@@ -11654,9 +14636,13 @@ fn pipeline_detail_lines(app: &App) -> Vec<Line<'static>> {
                             Span::styled("↳ ", Style::default().fg(Color::Cyan)),
                             Span::raw(ccmd),
                             if ccode > 0 {
-                                Span::styled(format!("  exit {ccode}"),
-                                    Style::default().fg(Color::Red))
-                            } else { Span::raw("") },
+                                Span::styled(
+                                    format!("  exit {ccode}"),
+                                    Style::default().fg(Color::Red),
+                                )
+                            } else {
+                                Span::raw("")
+                            },
                         ]));
                     }
                 }
@@ -11666,7 +14652,8 @@ fn pipeline_detail_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "── parsed structure ──",
-        Style::default().fg(Color::DarkGray))));
+        Style::default().fg(Color::DarkGray),
+    )));
     let rec = row.get("record").cloned().unwrap_or(Value::Null);
     let pretty = serde_json::to_string_pretty(&rec).unwrap_or_default();
     for l in pretty.lines() {
@@ -11682,17 +14669,25 @@ fn build_edges_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     if app.build_edges.is_empty() {
         return vec![Line::from(Span::styled(
             "no build edges yet — run `ninja` or `make` inside a -b box",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
-        ];
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))];
     }
     let mut out = legend_lines(
         "Flags: R - recipe ran, P - phony/no recipe, • - building now; \
 red time - failed recipe",
-        width);
+        width,
+    );
     for (i, row) in app.build_edges.iter().enumerate() {
-        let outs = row.get("outs").and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
-                              .collect::<Vec<_>>())
+        let outs = row
+            .get("outs")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let cmd_opt = row.get("cmd").and_then(Value::as_str);
         let phony = cmd_opt.is_none() || cmd_opt == Some("");
@@ -11704,7 +14699,12 @@ red time - failed recipe",
         let exit = row.get("exit_code").and_then(Value::as_i64);
         let running = edge_running(row);
         let (mark, mark_style) = if running {
-            ("•", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            (
+                "•",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else if phony {
             ("P", Style::default().fg(Color::DarkGray))
         } else {
@@ -11712,7 +14712,12 @@ red time - failed recipe",
         };
         // Wall-time / state column, mirroring the pipelines pane.
         let (dur_txt, dur_style) = if running {
-            ("• run".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            (
+                "• run".to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else if started > 0.0 && ended > 0.0 {
             let failed = exit.map(|c| c != 0).unwrap_or(false);
             let style = if failed {
@@ -11727,7 +14732,9 @@ red time - failed recipe",
         let head = outs.first().cloned().unwrap_or_else(|| "(unnamed)".into());
         let extra = if outs.len() > 1 {
             format!(" (+{})", outs.len() - 1)
-        } else { String::new() };
+        } else {
+            String::new()
+        };
         let mut spans = vec![
             Span::styled(format!("{mark}  "), mark_style),
             Span::styled(format!("{dur_txt:>7}  "), dur_style),
@@ -11736,8 +14743,7 @@ red time - failed recipe",
         ];
         if let Some(cmd) = cmd_opt.filter(|c| !c.is_empty()) {
             let trimmed: String = cmd.chars().take(60).collect();
-            spans.push(Span::styled("  ←  ",
-                Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled("  ←  ", Style::default().fg(Color::DarkGray)));
             spans.push(Span::raw(trimmed));
         }
         let mut line = Line::from(spans);
@@ -11759,16 +14765,19 @@ fn flows_lines(app: &App) -> Vec<Line<'static>> {
         return vec![Line::from(Span::styled(
             "no flows — `sarun run -n -- …` writes pcapng + keylog under \
              state_home/flows/box<id>/",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)))];
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))];
     }
     let mut out = vec![];
     for row in &app.flows {
         let method = row.get("method").and_then(Value::as_str).unwrap_or("");
-        let host   = row.get("host").and_then(Value::as_str).unwrap_or("");
-        let sni    = row.get("sni").and_then(Value::as_str).unwrap_or("");
-        let uri    = row.get("uri").and_then(Value::as_str).unwrap_or("");
+        let host = row.get("host").and_then(Value::as_str).unwrap_or("");
+        let sni = row.get("sni").and_then(Value::as_str).unwrap_or("");
+        let uri = row.get("uri").and_then(Value::as_str).unwrap_or("");
         let status = row.get("status").and_then(Value::as_str).unwrap_or("");
-        let t      = row.get("t").and_then(Value::as_f64).unwrap_or(0.0);
+        let t = row.get("t").and_then(Value::as_f64).unwrap_or(0.0);
 
         let (mark, mark_style) = if !method.is_empty() || !status.is_empty() {
             ("R", Style::default().fg(Color::Green))
@@ -11778,14 +14787,17 @@ fn flows_lines(app: &App) -> Vec<Line<'static>> {
         let h = if !host.is_empty() { host } else { sni };
         let mut spans = vec![
             Span::styled(format!("{mark}  "), mark_style),
-            Span::styled(format!("{:>7.3}s  ", t),
-                         Style::default().fg(Color::DarkGray)),
-            Span::styled(h.to_string(),
-                         Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:>7.3}s  ", t),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(h.to_string(), Style::default().add_modifier(Modifier::BOLD)),
         ];
         if !method.is_empty() {
-            spans.push(Span::styled(format!("  {method} "),
-                Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(
+                format!("  {method} "),
+                Style::default().fg(Color::Yellow),
+            ));
             let u: String = uri.chars().take(60).collect();
             spans.push(Span::raw(u));
         }
@@ -11796,7 +14808,9 @@ fn flows_lines(app: &App) -> Vec<Line<'static>> {
                 Style::default().fg(Color::Cyan)
             } else if status.starts_with('4') || status.starts_with('5') {
                 Style::default().fg(Color::Red)
-            } else { Style::default() };
+            } else {
+                Style::default()
+            };
             spans.push(Span::styled(format!("  → {status}"), st_style));
         }
         out.push(Line::from(spans));
@@ -11812,9 +14826,15 @@ fn flow_detail_lines(app: &App) -> Vec<Line<'static>> {
     if app.flow_detail.is_empty() {
         return vec![Line::from(Span::styled(
             "(no flow selected)",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)))];
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))];
     }
-    app.flow_detail.lines().map(|s| Line::from(s.to_string())).collect()
+    app.flow_detail
+        .lines()
+        .map(|s| Line::from(s.to_string()))
+        .collect()
 }
 
 /// Packet drill-down list row. One row per ethernet frame in the
@@ -11825,17 +14845,20 @@ fn packets_lines(app: &App) -> Vec<Line<'static>> {
     if app.packets.is_empty() {
         return vec![Line::from(Span::styled(
             "no packets in this stream",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)))];
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))];
     }
     let mut out = vec![];
     for row in &app.packets {
-        let frame  = row.get("frame").and_then(Value::as_u64).unwrap_or(0);
-        let t      = row.get("t").and_then(Value::as_f64).unwrap_or(0.0);
-        let src    = row.get("src").and_then(Value::as_str).unwrap_or("");
-        let dst    = row.get("dst").and_then(Value::as_str).unwrap_or("");
-        let proto  = row.get("proto").and_then(Value::as_str).unwrap_or("");
-        let len    = row.get("len").and_then(Value::as_u64).unwrap_or(0);
-        let info   = row.get("info").and_then(Value::as_str).unwrap_or("");
+        let frame = row.get("frame").and_then(Value::as_u64).unwrap_or(0);
+        let t = row.get("t").and_then(Value::as_f64).unwrap_or(0.0);
+        let src = row.get("src").and_then(Value::as_str).unwrap_or("");
+        let dst = row.get("dst").and_then(Value::as_str).unwrap_or("");
+        let proto = row.get("proto").and_then(Value::as_str).unwrap_or("");
+        let len = row.get("len").and_then(Value::as_u64).unwrap_or(0);
+        let info = row.get("info").and_then(Value::as_str).unwrap_or("");
         let proto_color = match proto {
             "HTTP" | "HTTP/2" => Color::Yellow,
             "TLSv1.2" | "TLSv1.3" | "TLS" => Color::Cyan,
@@ -11844,16 +14867,28 @@ fn packets_lines(app: &App) -> Vec<Line<'static>> {
         };
         let info_short: String = info.chars().take(80).collect();
         out.push(Line::from(vec![
-            Span::styled(format!("{:>5}  ", frame),
-                Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{:>7.3}s  ", t),
-                Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{:>15} → {:<15}  ", src, dst),
-                Style::default().fg(Color::White)),
-            Span::styled(format!("{:<9} ", proto),
-                Style::default().fg(proto_color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{:>5}  ", len),
-                Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:>5}  ", frame),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("{:>7.3}s  ", t),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("{:>15} → {:<15}  ", src, dst),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!("{:<9} ", proto),
+                Style::default()
+                    .fg(proto_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:>5}  ", len),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::raw(info_short),
         ]));
     }
@@ -11864,9 +14899,15 @@ fn packet_detail_lines(app: &App) -> Vec<Line<'static>> {
     if app.packet_detail.is_empty() {
         return vec![Line::from(Span::styled(
             "(no packet selected)",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)))];
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))];
     }
-    app.packet_detail.lines().map(|s| Line::from(s.to_string())).collect()
+    app.packet_detail
+        .lines()
+        .map(|s| Line::from(s.to_string()))
+        .collect()
 }
 
 /// Right-hand detail for the selected build edge: full outs/ins lists,
@@ -11875,16 +14916,29 @@ fn build_edge_detail_lines(app: &App) -> Vec<Line<'static>> {
     let Some(row) = app.build_edges.get(app.sel_edge) else {
         return vec![Line::from(Span::styled(
             "(select an edge)",
-            Style::default().fg(Color::DarkGray)))];
+            Style::default().fg(Color::DarkGray),
+        ))];
     };
     let id = row.get("id").and_then(Value::as_i64).unwrap_or(0);
     let ts = row.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
-    let outs = row.get("outs").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
-                          .collect::<Vec<_>>()).unwrap_or_default();
-    let ins = row.get("ins").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from))
-                          .collect::<Vec<_>>()).unwrap_or_default();
+    let outs = row
+        .get("outs")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let ins = row
+        .get("ins")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let cmd = row.get("cmd").and_then(Value::as_str).unwrap_or("");
     let started = row.get("started_ts").and_then(Value::as_f64).unwrap_or(0.0);
     let ended = row.get("ended_ts").and_then(Value::as_f64).unwrap_or(0.0);
@@ -11892,8 +14946,12 @@ fn build_edge_detail_lines(app: &App) -> Vec<Line<'static>> {
     let label = Style::default().fg(Color::DarkGray);
     // Run-state line: building / finished (wall time + exit) / not run.
     let (state_txt, state_style) = if started > 0.0 && ended == 0.0 {
-        ("building…".to_string(),
-         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        (
+            "building…".to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
     } else if started > 0.0 && ended > 0.0 {
         let code = exit.unwrap_or(0);
         let txt = format!("done in {} (exit {code})", fmt_dur(ended - started));
@@ -11904,34 +14962,53 @@ fn build_edge_detail_lines(app: &App) -> Vec<Line<'static>> {
         };
         (txt, style)
     } else {
-        ("not run (up-to-date / phony)".to_string(),
-         Style::default().fg(Color::DarkGray))
+        (
+            "not run (up-to-date / phony)".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
     };
     let mut lines = vec![
-        Line::from(vec![Span::styled("id        ", label),
-                        Span::raw(id.to_string())]),
-        Line::from(vec![Span::styled("ts        ", label),
-                        Span::raw(format!("{ts:.6}"))]),
-        Line::from(vec![Span::styled("state     ", label),
-                        Span::styled(state_txt, state_style)]),
+        Line::from(vec![
+            Span::styled("id        ", label),
+            Span::raw(id.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("ts        ", label),
+            Span::raw(format!("{ts:.6}")),
+        ]),
+        Line::from(vec![
+            Span::styled("state     ", label),
+            Span::styled(state_txt, state_style),
+        ]),
         Line::from(""),
-        Line::from(Span::styled("outputs", Style::default().fg(Color::Green)
-                                                   .add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "outputs",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
     ];
     if outs.is_empty() {
-        lines.push(Line::from(Span::styled("  (none)",
-            Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            "  (none)",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
     for o in &outs {
         lines.push(Line::from(format!("  {o}")));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "inputs", Style::default().fg(Color::Cyan)
-                          .add_modifier(Modifier::BOLD))));
+        "inputs",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
     if ins.is_empty() {
-        lines.push(Line::from(Span::styled("  (none — leaf or phony)",
-            Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            "  (none — leaf or phony)",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
     for i in &ins {
         lines.push(Line::from(format!("  {i}")));
@@ -11940,10 +15017,15 @@ fn build_edge_detail_lines(app: &App) -> Vec<Line<'static>> {
     if cmd.is_empty() {
         lines.push(Line::from(Span::styled(
             "phony — no recipe; this edge only declares dependencies",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))));
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
     } else {
         lines.push(Line::from(Span::styled(
-            "recipe", Style::default().add_modifier(Modifier::BOLD))));
+            "recipe",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
         // Wrap-friendly: just hand the whole cmd to the paragraph; ratatui
         // re-wraps at the pane width via wrap: trim:false.
         lines.push(Line::from(cmd.to_string()));
@@ -11951,12 +15033,16 @@ fn build_edge_detail_lines(app: &App) -> Vec<Line<'static>> {
     // The recipe's captured output (first ~1KB, stderr+stdout merged) — THE
     // thing you need when the edge failed. Red-tinted on failure so the
     // error text stands out; the full stream lives in the Outputs view.
-    let excerpt = row.get("output_excerpt").and_then(Value::as_str).unwrap_or("");
+    let excerpt = row
+        .get("output_excerpt")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if !excerpt.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "output (tail ~1KB — full stream in Outputs)",
-            Style::default().add_modifier(Modifier::BOLD))));
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
         let body_style = if exit.unwrap_or(0) != 0 {
             Style::default().fg(Color::Red)
         } else {
@@ -11980,24 +15066,40 @@ fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
     //   ...or the "-e to record" hint when env is empty.
     let rows = app.proc_tree_rows();
     let Some(r) = rows.get(app.sel_proc) else {
-        return vec![Line::from(Span::styled("(no process selected)",
-            Style::default().add_modifier(Modifier::DIM)))];
+        return vec![Line::from(Span::styled(
+            "(no process selected)",
+            Style::default().add_modifier(Modifier::DIM),
+        ))];
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let cyan = Style::default().fg(Color::Cyan);
     let mut out = vec![
-        Line::from(Span::styled(format!("tgid {}  ppid {}", r.tgid, r.ppid), bold)),
-        Line::from(vec![Span::styled("exe   ", dim),
-                        Span::raw(if r.exe.is_empty() { "?".into() } else { r.exe.clone() })]),
-        Line::from(vec![Span::styled("argv  ", dim),
-                        Span::raw(r.argv.join(" "))]),
+        Line::from(Span::styled(
+            format!("tgid {}  ppid {}", r.tgid, r.ppid),
+            bold,
+        )),
+        Line::from(vec![
+            Span::styled("exe   ", dim),
+            Span::raw(if r.exe.is_empty() {
+                "?".into()
+            } else {
+                r.exe.clone()
+            }),
+        ]),
+        Line::from(vec![
+            Span::styled("argv  ", dim),
+            Span::raw(r.argv.join(" ")),
+        ]),
         Line::from(""),
         Line::from(Span::styled("── environment ──", dim)),
     ];
     let rid = r.rid;
-    if rid < 0 { return out; }
-    let env = app.cur_sid()
+    if rid < 0 {
+        return out;
+    }
+    let env = app
+        .cur_sid()
         .and_then(|sid| rpc(&app.sock, "process_env", json!([sid, rid])).ok());
     let obj = env.as_ref().and_then(|v| v.as_object());
     match obj {
@@ -12013,7 +15115,9 @@ fn proc_detail_lines(app: &App) -> Vec<Line<'static>> {
             }
         }
         _ => out.push(Line::from(Span::styled(
-            "(none captured — run with -e to record the environment)", dim))),
+            "(none captured — run with -e to record the environment)",
+            dim,
+        ))),
     }
     out
 }
@@ -12036,11 +15140,13 @@ fn pty_command_configured() -> Option<String> {
     };
     let base = match std::env::var("XDG_CONFIG_HOME") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
-        _ => PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
-            .join(".config"),
+        _ => {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into())).join(".config")
+        }
     };
     let s = std::fs::read_to_string(base.join(app_dir).join("pty_command")).ok()?;
-    s.lines().map(str::trim)
+    s.lines()
+        .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .map(str::to_string)
 }
@@ -12071,42 +15177,53 @@ fn open_pty_menu(app: &mut App) {
     let mut items = vec![
         ActionItem {
             label: "Shell in a NEW box (captured; sarun run -b)".into(),
-            hint: "", action: Action::PtyNewBoxShell,
+            hint: "",
+            action: Action::PtyNewBoxShell,
         },
         ActionItem {
             label: "Container from image… (pick a base image)".into(),
-            hint: "", action: Action::NewFromImage,
+            hint: "",
+            action: Action::NewFromImage,
         },
         ActionItem {
             label: "Browser — cellulose (headless Chromium; flows captured)".into(),
-            hint: "", action: Action::Browser,
+            hint: "",
+            action: Action::Browser,
         },
         ActionItem {
             label: format!("Host shell — {host_shell} (NOT captured)"),
-            hint: "", action: Action::PtyNewHostShell,
+            hint: "",
+            action: Action::PtyNewHostShell,
         },
     ];
-    if app.sessions.get(app.sel_session)
+    if app
+        .sessions
+        .get(app.sel_session)
         .and_then(|r| r.get("path").and_then(Value::as_str))
         .map(|p| app.oci_images.iter().any(|(n, _)| p.ends_with(n)))
         .unwrap_or(false)
     {
         items.push(ActionItem {
             label: "Container shell on the SELECTED image box".into(),
-            hint: "", action: Action::RunSelectedImage,
+            hint: "",
+            action: Action::RunSelectedImage,
         });
     }
-    if let Some(name) = app.sessions.get(app.sel_session)
+    if let Some(name) = app
+        .sessions
+        .get(app.sel_session)
         .and_then(|r| r.get("name").and_then(Value::as_str))
     {
         items.push(ActionItem {
             label: format!("oaita agent session ON box '{name}'…"),
-            hint: "", action: Action::OaitaOnSelectedBox,
+            hint: "",
+            action: Action::OaitaOnSelectedBox,
         });
     }
     items.push(ActionItem {
         label: "Custom command…".into(),
-        hint: "", action: Action::PtyNewCustom,
+        hint: "",
+        action: Action::PtyNewCustom,
     });
     // Don't offer a default that can't work here: when the netns probe says
     // tap is unavailable, pre-select host ONCE and say so. The tap chip
@@ -12116,7 +15233,8 @@ fn open_pty_menu(app: &mut App) {
         app.launch_net = 1;
         app.net_auto_bumped = true;
         app.status = "tap networking unavailable here (no CLONE_NEWNET) — \
-                      network: HOST pre-selected".into();
+                      network: HOST pre-selected"
+            .into();
     }
     app.modal = Some(Modal::Launcher { items, sel: 0 });
 }
@@ -12140,15 +15258,19 @@ fn endpoint_note_lines(resolved: Option<(String, String)>) -> Vec<String> {
             "(no endpoint configured — nothing to log yet)".to_string(),
             String::new(),
             "'m' → \"Configure an external API\" edits base_url / model / key \
-             (with a".to_string(),
+             (with a"
+                .to_string(),
             "connection test) and writes oaita.toml — the in-UI way to point \
-             at any".to_string(),
+             at any"
+                .to_string(),
             "OpenAI-compatible server.".to_string(),
             String::new(),
             "'m' → \"Pick a local model\" instead downloads a model in a box and \
-             serves".to_string(),
+             serves"
+                .to_string(),
             "it on demand — no external endpoint or key needed. Opens \
-             automatically the".to_string(),
+             automatically the"
+                .to_string(),
             "first time.".to_string(),
         ],
     }
@@ -12164,7 +15286,8 @@ use crate::net::tap::tap_available;
 /// and suffix `agent`. Deterministic, so re-running the action continues the
 /// same conversation on that box.
 fn oaita_session_for_box(box_name: &str) -> String {
-    let slug: String = box_name.chars()
+    let slug: String = box_name
+        .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
         .collect();
@@ -12248,11 +15371,22 @@ enum LaunchTarget {
 /// A short, valid ([A-Za-z0-9-], lowercase) slug for a derived box/session
 /// name — used when a placement needs a child name the user didn't give.
 fn slugify(s: &str, fallback: &str) -> String {
-    let slug: String = s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+    let slug: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>();
     let slug = slug.trim_matches('-').to_string();
-    if slug.is_empty() { fallback.to_string() } else { slug }
+    if slug.is_empty() {
+        fallback.to_string()
+    } else {
+        slug
+    }
 }
 
 /// `sarun run [-b] --net N [-e] [PLACEMENT] -- CMD`. Placement: New → auto
@@ -12260,18 +15394,32 @@ fn slugify(s: &str, fallback: &str) -> String {
 /// `p.<child>` (sub-box parented on p).
 fn run_argv(how: &How, brush: bool, cmd: &[String]) -> Vec<String> {
     let mut a = vec!["sarun".to_string(), "run".into()];
-    if brush { a.push("-b".into()); }
+    if brush {
+        a.push("-b".into());
+    }
     a.push("--net".into());
     a.push(how.net.clone());
-    if how.env { a.push("-e".into()); }
-    if how.webcap { a.push("--webcap".into()); }
-    if how.webfilter { a.push("--webfilter".into()); }
-    if let Some(src) = &how.replay { a.push("--replay".into()); a.push(src.clone()); }
+    if how.env {
+        a.push("-e".into());
+    }
+    if how.webcap {
+        a.push("--webcap".into());
+    }
+    if how.webfilter {
+        a.push("--webfilter".into());
+    }
+    if let Some(src) = &how.replay {
+        a.push("--replay".into());
+        a.push(src.clone());
+    }
     match &how.placement {
         Placement::New => {}
         Placement::Reuse(n) => a.push(n.clone()),
         Placement::On(p) => {
-            let child = cmd.first().map(|c| slugify(c, "run")).unwrap_or_else(|| "sh".into());
+            let child = cmd
+                .first()
+                .map(|c| slugify(c, "run"))
+                .unwrap_or_else(|| "sh".into());
             a.push(format!("{p}.{child}"));
         }
     }
@@ -12291,9 +15439,16 @@ fn oci_run_argv(how: &How, reference: &str, cmd: &[String]) -> Vec<String> {
         a.push("--name".into());
         a.push(n.clone());
     }
-    if how.webcap { a.push("--webcap".into()); }
-    if how.webfilter { a.push("--webfilter".into()); }
-    if let Some(src) = &how.replay { a.push("--replay".into()); a.push(src.clone()); }
+    if how.webcap {
+        a.push("--webcap".into());
+    }
+    if how.webfilter {
+        a.push("--webfilter".into());
+    }
+    if let Some(src) = &how.replay {
+        a.push("--replay".into());
+        a.push(src.clone());
+    }
     a.push(reference.into());
     if !cmd.is_empty() {
         a.push("--".into());
@@ -12330,8 +15485,9 @@ fn ai_argv(how: &How, task: &str) -> Vec<String> {
 fn build_launch(target: &LaunchTarget, how: &How) -> Vec<String> {
     match target {
         // The only un-boxed target: How cannot apply (no box, no net).
-        LaunchTarget::HostShell =>
-            vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())],
+        LaunchTarget::HostShell => {
+            vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())]
+        }
         LaunchTarget::Shell => run_argv(how, true, &[]),
         LaunchTarget::Command(cmd) => run_argv(how, true, cmd),
         LaunchTarget::Image(reference) => oci_run_argv(how, reference, &[]),
@@ -12341,7 +15497,11 @@ fn build_launch(target: &LaunchTarget, how: &How) -> Vec<String> {
             // idiom `inner` resolves), driving the image's headless Chromium
             // over a local CDP pipe and rendering to the box PTY. The MITM
             // SPKI is passed through so the in-box Chromium trusts the leaf.
-            let dest = if url.trim().is_empty() { "about:blank" } else { url.trim() };
+            let dest = if url.trim().is_empty() {
+                "about:blank"
+            } else {
+                url.trim()
+            };
             let mut cmd = vec!["/proc/self/exe".to_string(), "browser".into()];
             if let Some(k) = spki {
                 cmd.push("--spki".into());
@@ -12361,9 +15521,12 @@ fn build_launch(target: &LaunchTarget, how: &How) -> Vec<String> {
 /// never spawned with a tap that will fail. An explicit host/off is kept.
 fn effective_net(app: &App) -> &'static str {
     let sel = NET_MODES[app.launch_net];
-    if sel == "tap" && !tap_available() { "host" } else { sel }
+    if sel == "tap" && !tap_available() {
+        "host"
+    } else {
+        sel
+    }
 }
-
 
 /// One curated catalog group: display name, unqualified image name (resolved
 /// through registries.conf at display/pull time), and the tags offered.
@@ -12380,34 +15543,46 @@ struct CatalogGroup {
 fn image_catalog() -> Vec<CatalogGroup> {
     if let Ok(s) = std::fs::read_to_string(crate::paths::images_config_path()) {
         if let Ok(v) = s.parse::<toml::Value>() {
-            let groups: Vec<CatalogGroup> = v.get("group")
+            let groups: Vec<CatalogGroup> = v
+                .get("group")
                 .and_then(|g| g.as_array())
-                .map(|arr| arr.iter().filter_map(|g| {
-                    Some(CatalogGroup {
-                        name: g.get("name")?.as_str()?.to_string(),
-                        image: g.get("image")?.as_str()?.to_string(),
-                        tags: g.get("tags").and_then(|t| t.as_array())
-                            .map(|a| a.iter()
-                                .filter_map(|s| s.as_str().map(str::to_string))
-                                .collect())
-                            .unwrap_or_else(|| vec!["latest".into()]),
-                    })
-                }).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|g| {
+                            Some(CatalogGroup {
+                                name: g.get("name")?.as_str()?.to_string(),
+                                image: g.get("image")?.as_str()?.to_string(),
+                                tags: g
+                                    .get("tags")
+                                    .and_then(|t| t.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|s| s.as_str().map(str::to_string))
+                                            .collect()
+                                    })
+                                    .unwrap_or_else(|| vec!["latest".into()]),
+                            })
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
-            if !groups.is_empty() { return groups; }
+            if !groups.is_empty() {
+                return groups;
+            }
         }
     }
     let mk = |name: &str, image: &str, tags: &[&str]| CatalogGroup {
-        name: name.into(), image: image.into(),
+        name: name.into(),
+        image: image.into(),
         tags: tags.iter().map(|s| s.to_string()).collect(),
     };
     vec![
-        mk("Ubuntu",   "ubuntu",     &["24.04", "22.04", "latest"]),
-        mk("Debian",   "debian",     &["12", "stable-slim", "latest"]),
-        mk("Alpine",   "alpine",     &["3.21", "3.20", "latest"]),
-        mk("Fedora",   "fedora",     &["42", "41", "latest"]),
+        mk("Ubuntu", "ubuntu", &["24.04", "22.04", "latest"]),
+        mk("Debian", "debian", &["12", "stable-slim", "latest"]),
+        mk("Alpine", "alpine", &["3.21", "3.20", "latest"]),
+        mk("Fedora", "fedora", &["42", "41", "latest"]),
         mk("Rocky Linux", "rockylinux", &["9", "8"]),
-        mk("BusyBox",  "busybox",    &["latest", "musl"]),
+        mk("BusyBox", "busybox", &["latest", "musl"]),
     ]
 }
 
@@ -12415,7 +15590,9 @@ fn image_catalog() -> Vec<CatalogGroup> {
 /// from under the host's registries.conf (mirror / alias / search registry).
 fn resolve_detail(conf: &crate::containers_conf::ContainersConf, rf: &str) -> String {
     let r = conf.resolve(rf);
-    if let Some(b) = &r.blocked { return format!("BLOCKED: {b}"); }
+    if let Some(b) = &r.blocked {
+        return format!("BLOCKED: {b}");
+    }
     let s = match r.candidates.first() {
         Some(c) if c.via.is_empty() => c.reference.clone(),
         Some(c) => format!("{} ({})", c.reference, c.via),
@@ -12440,11 +15617,14 @@ fn build_image_picker(
 ) -> Vec<PickItem> {
     let mut top = Vec::new();
     if !local.is_empty() {
-        let items = local.iter().map(|(name, rf)| PickItem {
-            label: name.clone(),
-            detail: format!("{rf} · loaded — Enter: container shell"),
-            next: PickNext::RunLocal(name.clone()),
-        }).collect();
+        let items = local
+            .iter()
+            .map(|(name, rf)| PickItem {
+                label: name.clone(),
+                detail: format!("{rf} · loaded — Enter: container shell"),
+                next: PickNext::RunLocal(name.clone()),
+            })
+            .collect();
         top.push(PickItem {
             label: format!("Loaded images ({})", local.len()),
             detail: "already installed — start a container, no pull".into(),
@@ -12452,14 +15632,18 @@ fn build_image_picker(
         });
     }
     for g in catalog {
-        let mut items: Vec<PickItem> = g.tags.iter().map(|t| {
-            let rf = format!("{}:{t}", g.image);
-            PickItem {
-                label: rf.clone(),
-                detail: resolve_detail(conf, &rf),
-                next: PickNext::Pull(rf),
-            }
-        }).collect();
+        let mut items: Vec<PickItem> = g
+            .tags
+            .iter()
+            .map(|t| {
+                let rf = format!("{}:{t}", g.image);
+                PickItem {
+                    label: rf.clone(),
+                    detail: resolve_detail(conf, &rf),
+                    next: PickNext::Pull(rf),
+                }
+            })
+            .collect();
         items.push(PickItem {
             label: format!("{}:<other tag>…", g.image),
             detail: "type a tag".into(),
@@ -12467,28 +15651,38 @@ fn build_image_picker(
         });
         top.push(PickItem {
             label: g.name.clone(),
-            detail: resolve_detail(conf, &format!("{}:{}",
-                g.image, g.tags.first().map(String::as_str).unwrap_or("latest"))),
+            detail: resolve_detail(
+                conf,
+                &format!(
+                    "{}:{}",
+                    g.image,
+                    g.tags.first().map(String::as_str).unwrap_or("latest")
+                ),
+            ),
             next: PickNext::Menu(items),
         });
     }
     if !conf.aliases.is_empty() {
-        let items = conf.aliases.iter().map(|(short, target)| PickItem {
-            label: short.clone(),
-            detail: format!("→ {target}"),
-            next: PickNext::Menu(vec![
-                PickItem {
-                    label: format!("{short}:latest"),
-                    detail: resolve_detail(conf, &format!("{short}:latest")),
-                    next: PickNext::Pull(format!("{short}:latest")),
-                },
-                PickItem {
-                    label: format!("{short}:<tag>…"),
-                    detail: "type a tag".into(),
-                    next: PickNext::EnterRef(format!("{short}:")),
-                },
-            ]),
-        }).collect();
+        let items = conf
+            .aliases
+            .iter()
+            .map(|(short, target)| PickItem {
+                label: short.clone(),
+                detail: format!("→ {target}"),
+                next: PickNext::Menu(vec![
+                    PickItem {
+                        label: format!("{short}:latest"),
+                        detail: resolve_detail(conf, &format!("{short}:latest")),
+                        next: PickNext::Pull(format!("{short}:latest")),
+                    },
+                    PickItem {
+                        label: format!("{short}:<tag>…"),
+                        detail: "type a tag".into(),
+                        next: PickNext::EnterRef(format!("{short}:")),
+                    },
+                ]),
+            })
+            .collect();
         top.push(PickItem {
             label: format!("Short names ({}) — registries.conf", conf.aliases.len()),
             detail: "aliases from /etc/containers".into(),
@@ -12509,14 +15703,16 @@ fn build_image_picker(
 /// needs it — the inverse of shell_split, used to prefill the PtyCmd editor
 /// from build_launch so the user always sees (and can edit) the exact command.
 fn shell_join(argv: &[String]) -> String {
-    argv.iter().map(|a| {
-        if a.is_empty()
-            || a.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"') {
-            format!("'{}'", a.replace('\'', r"'\''"))
-        } else {
-            a.clone()
-        }
-    }).collect::<Vec<_>>().join(" ")
+    argv.iter()
+        .map(|a| {
+            if a.is_empty() || a.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"') {
+                format!("'{}'", a.replace('\'', r"'\''"))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn shell_split(s: &str) -> Vec<String> {
@@ -12529,17 +15725,27 @@ fn shell_split(s: &str) -> Vec<String> {
             '\'' | '"' => {
                 in_word = true;
                 while let Some(n) = chars.next() {
-                    if n == c { break; }
+                    if n == c {
+                        break;
+                    }
                     cur.push(n);
                 }
             }
             c if c.is_whitespace() => {
-                if in_word { out.push(std::mem::take(&mut cur)); in_word = false; }
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
             }
-            c => { in_word = true; cur.push(c); }
+            c => {
+                in_word = true;
+                cur.push(c);
+            }
         }
     }
-    if in_word { out.push(cur); }
+    if in_word {
+        out.push(cur);
+    }
     out
 }
 
@@ -12561,7 +15767,9 @@ fn shell_split(s: &str) -> Vec<String> {
 #[derive(Debug)]
 struct PtyTermConfig;
 impl tattoy_wezterm_term::TerminalConfiguration for PtyTermConfig {
-    fn scrollback_size(&self) -> usize { 10_000 }
+    fn scrollback_size(&self) -> usize {
+        10_000
+    }
     fn color_palette(&self) -> tattoy_wezterm_term::color::ColorPalette {
         tattoy_wezterm_term::color::ColorPalette::default()
     }
@@ -12612,10 +15820,10 @@ impl PtyPane {
         // sarun was invoked from, so we ship it explicitly. Same story
         // for env: portable_pty's CommandBuilder defaults to a minimal
         // env, so `bash -i` lands SHELL/HOME/PATH-less. We ship our own.
-        let cwd = std::env::current_dir().ok()
+        let cwd = std::env::current_dir()
+            .ok()
             .map(|p| p.to_string_lossy().into_owned());
-        let mut env: std::collections::BTreeMap<String, String> =
-            std::env::vars().collect();
+        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
         // The child talks to the embedded wezterm-term emulator, not the
         // host terminal — advertise the EMULATOR's capabilities, not the
         // inherited ones. TUI children (carbonyl among them) sniff these
@@ -12630,14 +15838,17 @@ impl PtyPane {
             "cwd": cwd,
             "env": env,
         });
-        s.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
+        s.write_all(format!("{req}\n").as_bytes())
+            .map_err(|e| e.to_string())?;
         s.flush().ok();
         let ack = read_one_line(&mut s)?;
-        let v: Value = serde_json::from_str(ack.trim())
-            .map_err(|e| format!("bad ack: {e}"))?;
+        let v: Value = serde_json::from_str(ack.trim()).map_err(|e| format!("bad ack: {e}"))?;
         if v.get("ok").and_then(Value::as_bool) != Some(true) {
-            return Err(v.get("error").and_then(Value::as_str)
-                .unwrap_or("pty_spawn refused").to_string());
+            return Err(v
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("pty_spawn refused")
+                .to_string());
         }
         // Share the UnixStream between three roles:
         //   * READER thread reads the byte stream → FRAME_PTY_DATA / EOF.
@@ -12647,7 +15858,8 @@ impl PtyPane {
         // Reader uses its own try_clone; the two writer roles share an
         // Arc<Mutex<>> so concurrent writes never interleave bytes mid-frame.
         let writer = std::sync::Arc::new(std::sync::Mutex::new(
-            s.try_clone().map_err(|e| e.to_string())?));
+            s.try_clone().map_err(|e| e.to_string())?,
+        ));
         let reader_handle = s.try_clone().map_err(|e| e.to_string())?;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -12664,7 +15876,9 @@ impl PtyPane {
                 acc.drain(..used);
                 for (ft, payload) in frames_v {
                     if ft == crate::frames::FRAME_PTY_DATA {
-                        if tx.send(PtyMsg::Data(payload)).is_err() { return; }
+                        if tx.send(PtyMsg::Data(payload)).is_err() {
+                            return;
+                        }
                     } else if ft == crate::frames::FRAME_PTY_EOF {
                         let _ = tx.send(PtyMsg::Eof);
                         return;
@@ -12679,20 +15893,33 @@ impl PtyPane {
         // PtyResponseWriter wrapping our shared UnixStream — that's how
         // DSR / DA1 / etc. replies flow upstream.
         let size = tattoy_wezterm_term::TerminalSize {
-            rows: rows as usize, cols: cols as usize,
-            pixel_width: 0, pixel_height: 0, dpi: 0,
+            rows: rows as usize,
+            cols: cols as usize,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
         };
         let response_writer = Box::new(PtyResponseWriter(writer.clone()));
         let term = tattoy_wezterm_term::Terminal::new(
             size,
             std::sync::Arc::new(PtyTermConfig),
-            "sarun", env!("CARGO_PKG_VERSION"),
-            response_writer);
+            "sarun",
+            env!("CARGO_PKG_VERSION"),
+            response_writer,
+        );
         // Browser detection: the cellulose launch runs the ferried engine
         // binary as `… browser …` in the box (see LaunchTarget::Browser).
-        let browser = argv.iter().any(|a| a == "/proc/self/exe")
-            && argv.iter().any(|a| a == "browser");
-        Ok(PtyPane { terminal: term, writer, rx, rows, cols, eof: false, browser })
+        let browser =
+            argv.iter().any(|a| a == "/proc/self/exe") && argv.iter().any(|a| a == "browser");
+        Ok(PtyPane {
+            terminal: term,
+            writer,
+            rx,
+            rows,
+            cols,
+            eof: false,
+            browser,
+        })
     }
 
     /// Drain any pending PTY output into the wezterm-term emulator.
@@ -12701,8 +15928,14 @@ impl PtyPane {
         let mut changed = false;
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                PtyMsg::Data(d) => { self.terminal.advance_bytes(&d); changed = true; }
-                PtyMsg::Eof => { self.eof = true; changed = true; }
+                PtyMsg::Data(d) => {
+                    self.terminal.advance_bytes(&d);
+                    changed = true;
+                }
+                PtyMsg::Eof => {
+                    self.eof = true;
+                    changed = true;
+                }
             }
         }
         changed
@@ -12734,16 +15967,23 @@ impl PtyPane {
     /// Tell the engine the pane was resized (FRAME_PTY_RESIZE) and resize
     /// the emulator's screen to match.
     fn resize(&mut self, rows: u16, cols: u16) {
-        if rows == self.rows && cols == self.cols { return; }
+        if rows == self.rows && cols == self.cols {
+            return;
+        }
         self.rows = rows;
         self.cols = cols;
         let size = tattoy_wezterm_term::TerminalSize {
-            rows: rows as usize, cols: cols as usize,
-            pixel_width: 0, pixel_height: 0, dpi: 0,
+            rows: rows as usize,
+            cols: cols as usize,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
         };
         self.terminal.resize(size);
-        let frame = crate::frames::encode(crate::frames::FRAME_PTY_RESIZE,
-            &crate::frames::pty_resize_payload(rows, cols));
+        let frame = crate::frames::encode(
+            crate::frames::FRAME_PTY_RESIZE,
+            &crate::frames::pty_resize_payload(rows, cols),
+        );
         let mut w = self.writer.lock().unwrap();
         let _ = w.write_all(&frame);
         let _ = w.flush();
@@ -12754,9 +15994,10 @@ impl PtyPane {
 /// Walks each visible row + its cells, translates wezterm CellAttributes
 /// to ratatui Style, writes one ratatui cell per terminal cell. Empty
 /// trailing space (default-attr) is left alone.
-fn render_pty_into(buffer: &mut ratatui::buffer::Buffer, area: Rect,
-                   pty: &PtyPane) {
-    if area.width == 0 || area.height == 0 { return; }
+fn render_pty_into(buffer: &mut ratatui::buffer::Buffer, area: Rect, pty: &PtyPane) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let screen = pty.terminal.screen();
     let phys_rows = screen.physical_rows;
     let phys_cols = screen.physical_cols;
@@ -12765,20 +16006,28 @@ fn render_pty_into(buffer: &mut ratatui::buffer::Buffer, area: Rect,
         // LAST physical_rows lines of the full line buffer. We iterate
         // for_each_phys_line and skip everything before the visible range.
         let mut total = 0usize;
-        screen.for_each_phys_line(|_idx, _line| { total += 1; });
+        screen.for_each_phys_line(|_idx, _line| {
+            total += 1;
+        });
         total
     };
     let visible_start = total_lines.saturating_sub(phys_rows);
     let max_rows = area.height as usize;
     let max_cols = area.width as usize;
     screen.for_each_phys_line(|idx, line| {
-        if idx < visible_start { return; }
+        if idx < visible_start {
+            return;
+        }
         let row = idx - visible_start;
-        if row >= max_rows || row >= phys_rows { return; }
+        if row >= max_rows || row >= phys_rows {
+            return;
+        }
         let y = area.y + row as u16;
         for cell in line.visible_cells() {
             let x = cell.cell_index();
-            if x >= max_cols || x >= phys_cols { break; }
+            if x >= max_cols || x >= phys_cols {
+                break;
+            }
             let s = cell.str();
             let style = wezterm_attrs_to_ratatui_style(cell.attrs());
             let bx = area.x + x as u16;
@@ -12792,9 +16041,9 @@ fn render_pty_into(buffer: &mut ratatui::buffer::Buffer, area: Rect,
 /// strikethrough, hidden, slow blink. Image-cell rendering isn't here
 /// yet (that's the sixel-passthrough follow-on we discussed).
 fn wezterm_attrs_to_ratatui_style(a: &tattoy_wezterm_term::CellAttributes) -> Style {
-    use tattoy_wezterm_term::color::ColorAttribute;
     use tattoy_wezterm_term::Intensity;
     use tattoy_wezterm_term::Underline;
+    use tattoy_wezterm_term::color::ColorAttribute;
     let mut st = Style::default();
     let map_color = |c: ColorAttribute| -> Option<Color> {
         match c {
@@ -12804,32 +16053,53 @@ fn wezterm_attrs_to_ratatui_style(a: &tattoy_wezterm_term::CellAttributes) -> St
                 Some(Color::Rgb(r, g, b))
             }
             ColorAttribute::PaletteIndex(i) => Some(match i {
-                0 => Color::Black, 1 => Color::Red, 2 => Color::Green,
-                3 => Color::Yellow, 4 => Color::Blue, 5 => Color::Magenta,
-                6 => Color::Cyan, 7 => Color::Gray,
-                8 => Color::DarkGray, 9 => Color::LightRed,
-                10 => Color::LightGreen, 11 => Color::LightYellow,
-                12 => Color::LightBlue, 13 => Color::LightMagenta,
-                14 => Color::LightCyan, 15 => Color::White,
+                0 => Color::Black,
+                1 => Color::Red,
+                2 => Color::Green,
+                3 => Color::Yellow,
+                4 => Color::Blue,
+                5 => Color::Magenta,
+                6 => Color::Cyan,
+                7 => Color::Gray,
+                8 => Color::DarkGray,
+                9 => Color::LightRed,
+                10 => Color::LightGreen,
+                11 => Color::LightYellow,
+                12 => Color::LightBlue,
+                13 => Color::LightMagenta,
+                14 => Color::LightCyan,
+                15 => Color::White,
                 n => Color::Indexed(n),
             }),
             ColorAttribute::Default => None,
         }
     };
-    if let Some(fg) = map_color(a.foreground()) { st = st.fg(fg); }
-    if let Some(bg) = map_color(a.background()) { st = st.bg(bg); }
+    if let Some(fg) = map_color(a.foreground()) {
+        st = st.fg(fg);
+    }
+    if let Some(bg) = map_color(a.background()) {
+        st = st.bg(bg);
+    }
     match a.intensity() {
         Intensity::Bold => st = st.add_modifier(Modifier::BOLD),
         Intensity::Half => st = st.add_modifier(Modifier::DIM),
         Intensity::Normal => {}
     }
-    if a.italic() { st = st.add_modifier(Modifier::ITALIC); }
+    if a.italic() {
+        st = st.add_modifier(Modifier::ITALIC);
+    }
     if !matches!(a.underline(), Underline::None) {
         st = st.add_modifier(Modifier::UNDERLINED);
     }
-    if a.reverse() { st = st.add_modifier(Modifier::REVERSED); }
-    if a.strikethrough() { st = st.add_modifier(Modifier::CROSSED_OUT); }
-    if a.invisible() { st = st.add_modifier(Modifier::HIDDEN); }
+    if a.reverse() {
+        st = st.add_modifier(Modifier::REVERSED);
+    }
+    if a.strikethrough() {
+        st = st.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if a.invisible() {
+        st = st.add_modifier(Modifier::HIDDEN);
+    }
     if a.blink() != tattoy_wezterm_term::Blink::None {
         st = st.add_modifier(Modifier::SLOW_BLINK);
     }
@@ -12844,7 +16114,12 @@ fn read_one_line(s: &mut UnixStream) -> Result<String, String> {
     loop {
         match s.read(&mut b) {
             Ok(0) => break,
-            Ok(_) => { if b[0] == b'\n' { break; } out.push(b[0]); }
+            Ok(_) => {
+                if b[0] == b'\n' {
+                    break;
+                }
+                out.push(b[0]);
+            }
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -12859,7 +16134,9 @@ fn read_one_line(s: &mut UnixStream) -> Result<String, String> {
 /// fit_active_pty() keeps for sizes, extended to origins for mouse
 /// translation. None when no PTY is on screen.
 fn pty_grid_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rect> {
-    if app.ptys.is_empty() { return None; }
+    if app.ptys.is_empty() {
+        return None;
+    }
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -12869,7 +16146,12 @@ fn pty_grid_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rect> {
             Constraint::Length(1),
             Constraint::Length(1),
         ])
-        .split(Rect { x: 0, y: 0, width: term_cols, height: term_rows });
+        .split(Rect {
+            x: 0,
+            y: 0,
+            width: term_cols,
+            height: term_rows,
+        });
     let body = root[1];
     let area = if app.focus == Pane::Pty {
         body
@@ -12892,14 +16174,18 @@ fn pty_grid_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rect> {
 /// crossterm mouse event → the emulator's event, grid-local. None when the
 /// event is outside the grid or of no interest (e.g. bare Moved without a
 /// button — children that want any-event tracking still get Drag moves).
-fn mouse_to_pty_event(m: crossterm::event::MouseEvent, grid: Rect)
-    -> Option<tattoy_wezterm_term::MouseEvent>
-{
+fn mouse_to_pty_event(
+    m: crossterm::event::MouseEvent,
+    grid: Rect,
+) -> Option<tattoy_wezterm_term::MouseEvent> {
     use crossterm::event::MouseButton as CB;
     use crossterm::event::MouseEventKind as CK;
     use tattoy_wezterm_term::input::{MouseButton, MouseEventKind};
-    if m.column < grid.x || m.row < grid.y
-        || m.column >= grid.x + grid.width || m.row >= grid.y + grid.height {
+    if m.column < grid.x
+        || m.row < grid.y
+        || m.column >= grid.x + grid.width
+        || m.row >= grid.y + grid.height
+    {
         return None;
     }
     let btn = |b: CB| match b {
@@ -12921,14 +16207,17 @@ fn mouse_to_pty_event(m: crossterm::event::MouseEvent, grid: Rect)
     if m.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
         mods |= tattoy_wezterm_term::KeyModifiers::SHIFT;
     }
-    if m.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+    if m.modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
         mods |= tattoy_wezterm_term::KeyModifiers::CTRL;
     }
     if m.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
         mods |= tattoy_wezterm_term::KeyModifiers::ALT;
     }
     Some(tattoy_wezterm_term::MouseEvent {
-        kind, button,
+        kind,
+        button,
         x: (m.column - grid.x) as usize,
         y: (m.row - grid.y) as i64,
         x_pixel_offset: 0,
@@ -12937,8 +16226,10 @@ fn mouse_to_pty_event(m: crossterm::event::MouseEvent, grid: Rect)
     })
 }
 
-fn key_to_pty_bytes(code: crossterm::event::KeyCode,
-                    mods: crossterm::event::KeyModifiers) -> Option<Vec<u8>> {
+fn key_to_pty_bytes(
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) -> Option<Vec<u8>> {
     use crossterm::event::KeyCode;
     use crossterm::event::KeyModifiers;
     Some(match code {
@@ -12994,10 +16285,10 @@ fn probe_terminal() -> (bool, (u16, u16)) {
     let px = cell_pixel_size().unwrap_or((10, 20));
     // Ask for DA1. Write straight to fd 1 so it isn't caught in a buffer.
     let query = b"\x1b[c";
-    let wrote = unsafe {
-        libc::write(1, query.as_ptr() as *const libc::c_void, query.len())
-    };
-    if wrote < 0 { return (false, px); }
+    let wrote = unsafe { libc::write(1, query.as_ptr() as *const libc::c_void, query.len()) };
+    if wrote < 0 {
+        return (false, px);
+    }
     // Collect the reply (`\x1b[?…c`) for up to ~250ms total, or until we see
     // the terminating 'c'. poll fd 0 between reads so a silent terminal can't
     // hang startup.
@@ -13006,17 +16297,25 @@ fn probe_terminal() -> (bool, (u16, u16)) {
     let mut spent = 0i32;
     let mut chunk = [0u8; 64];
     while spent < deadline_ms {
-        let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let step = 40i32;
         let r = unsafe { libc::poll(&mut pfd, 1, step) };
         spent += step;
-        if r <= 0 { continue; }
-        let n = unsafe {
-            libc::read(0, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
-        };
-        if n <= 0 { break; }
+        if r <= 0 {
+            continue;
+        }
+        let n = unsafe { libc::read(0, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+        if n <= 0 {
+            break;
+        }
         buf.extend_from_slice(&chunk[..n as usize]);
-        if buf.contains(&b'c') { break; }
+        if buf.contains(&b'c') {
+            break;
+        }
     }
     let reply = String::from_utf8_lossy(&buf);
     (crate::sixel::da1_reports_sixel(&reply), px)
@@ -13027,8 +16326,7 @@ fn probe_terminal() -> (bool, (u16, u16)) {
 fn cell_pixel_size() -> Option<(u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
-    if r != 0 || ws.ws_col == 0 || ws.ws_row == 0
-        || ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
+    if r != 0 || ws.ws_col == 0 || ws.ws_row == 0 || ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
         return None;
     }
     Some((ws.ws_xpixel / ws.ws_col, ws.ws_ypixel / ws.ws_row))
@@ -13063,7 +16361,8 @@ fn render_to_string(app: &App, w: u16, h: u16) -> Result<String, String> {
 /// label exists — the caller can override.
 #[allow(dead_code)]
 fn registry_menu_items(ctx: &str) -> Vec<ActionItem> {
-    crate::registry::menu_entries().into_iter()
+    crate::registry::menu_entries()
+        .into_iter()
         .filter(|(_, _, verb)| {
             crate::registry::find(verb)
                 .and_then(|a| a.ctx)
@@ -13075,104 +16374,168 @@ fn registry_menu_items(ctx: &str) -> Vec<ActionItem> {
                 Some(k) => Box::leak(format!("{k}").into_boxed_str()),
                 None => "",
             };
-            ActionItem { label: label.to_string(), hint, action: Action::OpenSelection }
+            ActionItem {
+                label: label.to_string(),
+                hint,
+                action: Action::OpenSelection,
+            }
         })
         .collect()
 }
 
 fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
     let mk = |label: &str, hint: &'static str, action: Action| ActionItem {
-        label: label.into(), hint, action,
+        label: label.into(),
+        hint,
+        action,
     };
-    let title = |what: &str, target: &str| if target.is_empty() {
-        format!("{what}")
-    } else {
-        format!("{what}: {target}")
+    let title = |what: &str, target: &str| {
+        if target.is_empty() {
+            format!("{what}")
+        } else {
+            format!("{what}: {target}")
+        }
     };
     match app.focus {
         Pane::Sessions => {
             let row = app.sessions.get(app.sel_session);
-            let path = row.and_then(|r| r.get("path").and_then(Value::as_str))
-                .unwrap_or("").to_string();
+            let path = row
+                .and_then(|r| r.get("path").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string();
             let mut items = vec![
-                mk("Open changes view", "Enter",  Action::OpenSelection),
+                mk("Open changes view", "Enter", Action::OpenSelection),
                 mk("Apply ALL changes to host", "a", Action::ApplyBox),
-                mk("Apply changes to a COPY of the parent (parent untouched)", "", Action::ApplyToCopy),
+                mk(
+                    "Apply changes to a COPY of the parent (parent untouched)",
+                    "",
+                    Action::ApplyToCopy,
+                ),
                 mk("Rotate: promote child over parent", "", Action::RotateBox),
-                mk("Delete box (changes promoted down, keep child boxes)", "D",
-                   Action::DissolveBox),
-                mk("Discard ALL changes", "x",    Action::DiscardBox),
-                mk("Kill (SIGTERM)",    "K",      Action::KillBox),
+                mk(
+                    "Delete box (changes promoted down, keep child boxes)",
+                    "D",
+                    Action::DissolveBox,
+                ),
+                mk("Discard ALL changes", "x", Action::DiscardBox),
+                mk("Kill (SIGTERM)", "K", Action::KillBox),
                 mk("Diagnose stuck (wchan/syscall)", "", Action::StuckBox),
-                mk("Rename box",        "r/F6",   Action::StartRename),
-                mk("New box from image…", "F7",   Action::NewFromImage),
-                mk("oaita agent session on this box…", "",
-                   Action::OaitaOnSelectedBox),
+                mk("Rename box", "r/F6", Action::StartRename),
+                mk("New box from image…", "F7", Action::NewFromImage),
+                mk(
+                    "oaita agent session on this box…",
+                    "",
+                    Action::OaitaOnSelectedBox,
+                ),
             ];
             // Loaded image boxes additionally offer a container shell.
-            if app.oci_images.iter().any(|(n, _)| path.ends_with(n.as_str())) {
-                items.push(mk("Container shell on this image", "",
-                              Action::RunSelectedImage));
+            if app
+                .oci_images
+                .iter()
+                .any(|(n, _)| path.ends_with(n.as_str()))
+            {
+                items.push(mk(
+                    "Container shell on this image",
+                    "",
+                    Action::RunSelectedImage,
+                ));
             }
             Some((title("Box", &path), items))
         }
         Pane::Changes => {
             let row = app.changes.get(app.sel_change);
-            let path = row.and_then(|r| r.get("path").and_then(Value::as_str))
-                .unwrap_or("").to_string();
-            Some((title("Change", &path), vec![
-                mk("Open diff",          "Enter",  Action::OpenSelection),
-                mk("Apply this file",    "a",      Action::ApplyFile),
-                mk("Discard this file",  "x/F8",   Action::DiscardFile),
-            ]))
+            let path = row
+                .and_then(|r| r.get("path").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string();
+            Some((
+                title("Change", &path),
+                vec![
+                    mk("Open diff", "Enter", Action::OpenSelection),
+                    mk("Apply this file", "a", Action::ApplyFile),
+                    mk("Discard this file", "x/F8", Action::DiscardFile),
+                ],
+            ))
         }
-        Pane::Hunks => Some(("Hunk (selected)".into(), vec![
-            mk("Apply this hunk",    "a",      Action::ApplyHunk),
-            mk("Discard this hunk",  "x/F8",   Action::DiscardHunk),
-        ])),
+        Pane::Hunks => Some((
+            "Hunk (selected)".into(),
+            vec![
+                mk("Apply this hunk", "a", Action::ApplyHunk),
+                mk("Discard this hunk", "x/F8", Action::DiscardHunk),
+            ],
+        )),
         Pane::Rules => {
             let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
-            Some((title("Rule", &cur), vec![
-                mk("Edit rule",   "Enter", Action::EditRule),
-                mk("New rule",    "n/F7", Action::NewRule),
-                mk("Delete rule", "d/F8", Action::DeleteRule),
-                mk("Move up",     "Ctrl-↑", Action::MoveRuleUp),
-                mk("Move down",   "Ctrl-↓", Action::MoveRuleDown),
-            ]))
+            Some((
+                title("Rule", &cur),
+                vec![
+                    mk("Edit rule", "Enter", Action::EditRule),
+                    mk("New rule", "n/F7", Action::NewRule),
+                    mk("Delete rule", "d/F8", Action::DeleteRule),
+                    mk("Move up", "Ctrl-↑", Action::MoveRuleUp),
+                    mk("Move down", "Ctrl-↓", Action::MoveRuleDown),
+                ],
+            ))
         }
         Pane::Mirrors => {
             let j = app.mirror_jobs.get(app.sel_mirror);
-            let target = j.map(|j| format!("#{} {} → {}", j.id, j.src, j.dest))
+            let target = j
+                .map(|j| format!("#{} {} → {}", j.id, j.src, j.dest))
                 .unwrap_or_default();
             let paused = j.map(|j| j.paused).unwrap_or(false);
-            Some((title("Mirror job", &target), vec![
-                mk("Force-run this job",  "r", Action::MirrorRun),
-                mk("Run all pending jobs", "R", Action::MirrorRunPending),
-                mk(if paused { "Resume this job" } else { "Pause this job" },
-                   "space", Action::MirrorTogglePause),
-                mk("Delete this job",     "D", Action::MirrorRemove),
-                mk("Browse this wiki",    "b", Action::MirrorBrowse),
-                mk("Read in document reader", "V", Action::MirrorRead),
-            ]))
+            Some((
+                title("Mirror job", &target),
+                vec![
+                    mk("Force-run this job", "r", Action::MirrorRun),
+                    mk("Run all pending jobs", "R", Action::MirrorRunPending),
+                    mk(
+                        if paused {
+                            "Resume this job"
+                        } else {
+                            "Pause this job"
+                        },
+                        "space",
+                        Action::MirrorTogglePause,
+                    ),
+                    mk("Delete this job", "D", Action::MirrorRemove),
+                    mk("Browse this wiki", "b", Action::MirrorBrowse),
+                    mk("Read in document reader", "V", Action::MirrorRead),
+                ],
+            ))
         }
         Pane::Pty => {
             let total = app.ptys.len();
             let sel = app.sel_pty + 1;
-            Some((format!("PTY {sel}/{total}"), vec![
-                mk("New PTY",         "F7",   Action::PtyNew),
-                mk("Kill this PTY",   "F8",   Action::PtyKill),
-                mk("Embed in pane",   "F11",  Action::PtyEmbedToggle),
-            ]))
+            Some((
+                format!("PTY {sel}/{total}"),
+                vec![
+                    mk("New PTY", "F7", Action::PtyNew),
+                    mk("Kill this PTY", "F8", Action::PtyKill),
+                    mk("Embed in pane", "F11", Action::PtyEmbedToggle),
+                ],
+            ))
         }
-        Pane::ApiLogs => Some(("API calls".into(), vec![
-            mk("Open call detail",   "Enter", Action::OpenSelection),
-            mk("Configure an external API (base_url / model / key)…", "",
-               Action::OpenApiConfig),
-            mk("Pick a local model (live catalog) & serve it…", "",
-               Action::OpenModelPicker),
-            mk("Set up the default local endpoint (oaita local)", "",
-               Action::OaitaLocalPty),
-        ])),
+        Pane::ApiLogs => Some((
+            "API calls".into(),
+            vec![
+                mk("Open call detail", "Enter", Action::OpenSelection),
+                mk(
+                    "Configure an external API (base_url / model / key)…",
+                    "",
+                    Action::OpenApiConfig,
+                ),
+                mk(
+                    "Pick a local model (live catalog) & serve it…",
+                    "",
+                    Action::OpenModelPicker,
+                ),
+                mk(
+                    "Set up the default local endpoint (oaita local)",
+                    "",
+                    Action::OaitaLocalPty,
+                ),
+            ],
+        )),
         // Procs / Outputs / Pipelines / BuildEdges: no destructive ops
         // worth grouping into a menu today; the popup would be just
         // "Open" → same as Enter. Defer until there's something to
@@ -13186,45 +16549,57 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
 /// any pane-specific data.
 fn run_action(app: &mut App, a: Action) {
     match a {
-        Action::OpenSelection  => app.open(),
-        Action::ApplyFile      => app.apply(),
-        Action::DiscardFile    => app.discard(),
-        Action::ApplyHunk      => app.apply_hunk(),
-        Action::DiscardHunk    => app.discard_hunk(),
-        Action::ApplyBox       => app.apply(),
-        Action::ApplyToCopy    => app.apply_to_copy(),
-        Action::RotateBox      => app.rotate_selected(),
-        Action::DiscardBox     => app.discard(),
-        Action::DissolveBox    => app.modal = Some(Modal::Confirm {
-            prompt: format!("Delete {}? Its changes are promoted down into \
+        Action::OpenSelection => app.open(),
+        Action::ApplyFile => app.apply(),
+        Action::DiscardFile => app.discard(),
+        Action::ApplyHunk => app.apply_hunk(),
+        Action::DiscardHunk => app.discard_hunk(),
+        Action::ApplyBox => app.apply(),
+        Action::ApplyToCopy => app.apply_to_copy(),
+        Action::RotateBox => app.rotate_selected(),
+        Action::DiscardBox => app.discard(),
+        Action::DissolveBox => {
+            app.modal = Some(Modal::Confirm {
+                prompt: format!(
+                    "Delete {}? Its changes are promoted down into \
                              child boxes (never to the host); children are \
                              kept and re-parented.",
-                            app.box_op_scope_label()),
-            action: ConfirmAction::Dissolve,
-        }),
-        Action::StuckBox       => app.stuck_box(),
-        Action::KillBox        => app.modal = Some(Modal::Confirm {
-            prompt: format!("Kill (SIGTERM) {}?", app.box_op_scope_label()),
-            action: ConfirmAction::Kill,
-        }),
-        Action::StartRename    => app.renaming = Some(String::new()),
-        Action::EditRule       => {
+                    app.box_op_scope_label()
+                ),
+                action: ConfirmAction::Dissolve,
+            })
+        }
+        Action::StuckBox => app.stuck_box(),
+        Action::KillBox => {
+            app.modal = Some(Modal::Confirm {
+                prompt: format!("Kill (SIGTERM) {}?", app.box_op_scope_label()),
+                action: ConfirmAction::Kill,
+            })
+        }
+        Action::StartRename => app.renaming = Some(String::new()),
+        Action::EditRule => {
             let cur = app.rules.get(app.sel_rule).cloned().unwrap_or_default();
-            app.modal = Some(Modal::RuleForm { buf: cur, editing: Some(app.sel_rule) });
+            app.modal = Some(Modal::RuleForm {
+                buf: cur,
+                editing: Some(app.sel_rule),
+            });
         }
-        Action::NewRule        => {
-            app.modal = Some(Modal::RuleForm { buf: String::new(), editing: None });
+        Action::NewRule => {
+            app.modal = Some(Modal::RuleForm {
+                buf: String::new(),
+                editing: None,
+            });
         }
-        Action::DeleteRule     => app.delete_rule(),
-        Action::MoveRuleUp     => app.move_rule(-1),
-        Action::MoveRuleDown   => app.move_rule(1),
-        Action::MirrorRun         => app.mirror_run_selected(),
-        Action::MirrorRunPending  => app.mirror_run_pending(),
+        Action::DeleteRule => app.delete_rule(),
+        Action::MoveRuleUp => app.move_rule(-1),
+        Action::MoveRuleDown => app.move_rule(1),
+        Action::MirrorRun => app.mirror_run_selected(),
+        Action::MirrorRunPending => app.mirror_run_pending(),
         Action::MirrorTogglePause => app.mirror_toggle_pause(),
-        Action::MirrorRemove      => app.confirm_mirror_remove(),
-        Action::MirrorBrowse      => app.mirror_browse_selected(),
-        Action::MirrorRead        => app.mirror_read_selected(),
-        Action::PtyNew         => open_pty_menu(app),
+        Action::MirrorRemove => app.confirm_mirror_remove(),
+        Action::MirrorBrowse => app.mirror_browse_selected(),
+        Action::MirrorRead => app.mirror_read_selected(),
+        Action::PtyNew => open_pty_menu(app),
         // Every launch below funnels through build_launch(target, how) — one
         // builder, the same net/env/placement for all. Targets that are ready
         // to run spawn directly; targets that need the user to finish
@@ -13234,32 +16609,40 @@ fn run_action(app: &mut App, a: Action) {
             app.open_pty(build_launch(&LaunchTarget::Shell, &app.how(Placement::New)));
         }
         Action::PtyNewHostShell => {
-            app.open_pty(build_launch(&LaunchTarget::HostShell, &app.how(Placement::New)));
+            app.open_pty(build_launch(
+                &LaunchTarget::HostShell,
+                &app.how(Placement::New),
+            ));
         }
-        Action::PtyNewCustom   => {
+        Action::PtyNewCustom => {
             // The user's configured default command if set; else a box shell
             // with the command left blank — the how-flags already in the built
             // argv, so editing starts from the real command that would run.
             // Trailing space: the cursor lands after `-- ` ready to type.
             let buf = pty_command_configured().unwrap_or_else(|| {
-                let argv = build_launch(&LaunchTarget::Command(vec![]),
-                                        &app.how(Placement::New));
+                let argv = build_launch(&LaunchTarget::Command(vec![]), &app.how(Placement::New));
                 shell_join(&argv) + " "
             });
             app.modal = Some(Modal::PtyCmd { buf });
         }
-        Action::NewFromImage   => app.open_image_picker(),
+        Action::NewFromImage => app.open_image_picker(),
         Action::RunSelectedImage => {
-            let name = app.sessions.get(app.sel_session)
+            let name = app
+                .sessions
+                .get(app.sel_session)
                 .and_then(|r| r.get("path").and_then(Value::as_str))
-                .and_then(|p| app.oci_images.iter()
-                    .find(|(n, _)| p.ends_with(n.as_str()))
-                    .map(|(n, _)| n.clone()));
+                .and_then(|p| {
+                    app.oci_images
+                        .iter()
+                        .find(|(n, _)| p.ends_with(n.as_str()))
+                        .map(|(n, _)| n.clone())
+                });
             match name {
-                Some(name) => app.open_pty(
-                    build_launch(&LaunchTarget::Image(name), &app.how(Placement::New))),
-                None => app.status =
-                    "selected box is not a loaded image".into(),
+                Some(name) => app.open_pty(build_launch(
+                    &LaunchTarget::Image(name),
+                    &app.how(Placement::New),
+                )),
+                None => app.status = "selected box is not a loaded image".into(),
             }
         }
         Action::Browser => {
@@ -13269,33 +16652,39 @@ fn run_action(app: &mut App, a: Action) {
             // in the browser. Refuse to launch (visible error) rather than
             // hand out a browser that can't load HTTPS.
             match crate::net::ca::root_spki_sha256_b64() {
-                Ok(spki) => app.modal = Some(Modal::BrowserUrl {
-                    buf: "https://".into(), spki,
-                }),
-                Err(e) => app.status =
-                    format!("browser: MITM CA unavailable ({e}); cannot launch"),
+                Ok(spki) => {
+                    app.modal = Some(Modal::BrowserUrl {
+                        buf: "https://".into(),
+                        spki,
+                    })
+                }
+                Err(e) => app.status = format!("browser: MITM CA unavailable ({e}); cannot launch"),
             }
         }
-        Action::OaitaLocalPty  => {
+        Action::OaitaLocalPty => {
             app.open_pty(vec![self_exe(), "oaita".into(), "local".into()]);
         }
         Action::OpenModelPicker => app.open_model_picker(),
-        Action::OpenApiConfig  => app.open_api_config(),
+        Action::OpenApiConfig => app.open_api_config(),
         Action::OaitaOnSelectedBox => {
             // Ask for the TASK; placement is On(this box). Enter builds the
             // agent launch through the same build_launch as everything else.
-            let name = app.sessions.get(app.sel_session)
+            let name = app
+                .sessions
+                .get(app.sel_session)
                 .and_then(|r| r.get("name").and_then(Value::as_str));
             match name {
-                Some(n) => app.modal = Some(Modal::OaitaTask {
-                    box_name: n.to_string(),
-                    session: oaita_session_for_box(n),
-                    buf: String::new(),
-                }),
+                Some(n) => {
+                    app.modal = Some(Modal::OaitaTask {
+                        box_name: n.to_string(),
+                        session: oaita_session_for_box(n),
+                        buf: String::new(),
+                    })
+                }
                 None => app.status = "no box selected".into(),
             }
         }
-        Action::PtyKill        => app.pty_kill(),
+        Action::PtyKill => app.pty_kill(),
         Action::PtyEmbedToggle => {
             if app.ptys.is_empty() {
                 app.status = "no PTY to split — F7 opens one".into();
@@ -13323,8 +16712,9 @@ fn dispatch_menubar_key(app: &mut App, k: char) {
         let any_live = app.ptys.iter().any(|p| !p.eof);
         if any_live {
             if app.cur_pty().map(|p| p.eof).unwrap_or(true) {
-                if let Some((i, _)) = app.ptys.iter().enumerate()
-                    .find(|(_, p)| !p.eof) { app.sel_pty = i; }
+                if let Some((i, _)) = app.ptys.iter().enumerate().find(|(_, p)| !p.eof) {
+                    app.sel_pty = i;
+                }
             }
             app.focus = Pane::Pty;
         } else {
@@ -13353,9 +16743,10 @@ fn is_menubar_accel(c: char) -> bool {
 /// tree, not "jump to Trace". `PaneGate::Any` rows are NOT counted here: they
 /// carry no pane-specific meaning that should override a chip.
 fn pane_row_key_on_focus(app: &App, c: char) -> bool {
-    PANE_ACTION_KEYS.iter().any(|(key, gate, ..)|
+    PANE_ACTION_KEYS.iter().any(|(key, gate, ..)| {
         key.matches(crossterm::event::KeyCode::Char(c))
-        && matches!(gate, PaneGate::On(p) if *p == app.focus))
+            && matches!(gate, PaneGate::On(p) if *p == app.focus)
+    })
 }
 
 /// Route a normal-mode character key with the correct precedence between the
@@ -13377,11 +16768,16 @@ fn dispatch_char_key(app: &mut App, c: char) {
     }
 }
 
-fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
-                    mods: crossterm::event::KeyModifiers) {
+fn handle_modal_key(
+    app: &mut App,
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) {
     use crossterm::event::KeyCode;
     use crossterm::event::KeyModifiers;
-    let Some(modal) = app.modal.take() else { return };
+    let Some(modal) = app.modal.take() else {
+        return;
+    };
     match modal {
         Modal::Confirm { prompt, action } => {
             // y/n/Esc is a fully enumerable keymap → driven from CONFIRM_KEYS
@@ -13393,20 +16789,36 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 None => app.modal = Some(Modal::Confirm { prompt, action }),
             }
         }
-        Modal::ImageView { title, note, sixel, cells } => {
+        Modal::ImageView {
+            title,
+            note,
+            sixel,
+            cells,
+        } => {
             // Any of Esc / q / Enter dismisses; other keys keep it open.
             match code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
-                _ => app.modal = Some(Modal::ImageView { title, note, sixel, cells }),
+                _ => {
+                    app.modal = Some(Modal::ImageView {
+                        title,
+                        note,
+                        sixel,
+                        cells,
+                    })
+                }
             }
         }
-        Modal::Report { title, lines } => {
-            match code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
-                _ => app.modal = Some(Modal::Report { title, lines }),
-            }
-        }
-        Modal::Search { view, kinds, mut rows, mut sel, mut field } => {
+        Modal::Report { title, lines } => match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
+            _ => app.modal = Some(Modal::Report { title, lines }),
+        },
+        Modal::Search {
+            view,
+            kinds,
+            mut rows,
+            mut sel,
+            mut field,
+        } => {
             let ctrl = mods.contains(KeyModifiers::CONTROL);
             // ^s / Enter → commit; Esc → cancel (no change). All else edits rows.
             if (ctrl && matches!(code, KeyCode::Char('s'))) || code == KeyCode::Enter {
@@ -13419,8 +16831,11 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             // field/row navigation and edits.
             let order = [
-                ClauseField::Enabled, ClauseField::Join, ClauseField::Negate,
-                ClauseField::Kind, ClauseField::Pattern,
+                ClauseField::Enabled,
+                ClauseField::Join,
+                ClauseField::Negate,
+                ClauseField::Kind,
+                ClauseField::Pattern,
             ];
             let cur_fi = order.iter().position(|f| *f == field).unwrap_or(4);
             match code {
@@ -13430,8 +16845,11 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 KeyCode::Down => sel = (sel + 1).min(rows.len().saturating_sub(1)),
                 KeyCode::Char('n') if field != ClauseField::Pattern => {
                     rows.push(ClauseRow {
-                        enabled: true, join: Join::And, negate: false,
-                        kind: kinds[0].to_string(), pattern: String::new(),
+                        enabled: true,
+                        join: Join::And,
+                        negate: false,
+                        kind: kinds[0].to_string(),
+                        pattern: String::new(),
                     });
                     sel = rows.len() - 1;
                     field = ClauseField::Pattern;
@@ -13440,19 +16858,31 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     if let Some(r) = rows.get_mut(sel) {
                         match field {
                             ClauseField::Pattern => match code {
-                                KeyCode::Backspace => { r.pattern.pop(); }
+                                KeyCode::Backspace => {
+                                    r.pattern.pop();
+                                }
                                 KeyCode::Char(c) => r.pattern.push(c),
                                 _ => {}
                             },
                             ClauseField::Enabled => {
-                                if matches!(code, KeyCode::Char(' ')) { r.enabled = !r.enabled; }
+                                if matches!(code, KeyCode::Char(' ')) {
+                                    r.enabled = !r.enabled;
+                                }
                             }
                             ClauseField::Negate => {
-                                if matches!(code, KeyCode::Char(' ')) { r.negate = !r.negate; }
+                                if matches!(code, KeyCode::Char(' ')) {
+                                    r.negate = !r.negate;
+                                }
                             }
                             ClauseField::Join => {
-                                if matches!(code, KeyCode::Char(' ') | KeyCode::Char('j') | KeyCode::Char('o')) {
-                                    r.join = match r.join { Join::And => Join::Or, Join::Or => Join::And };
+                                if matches!(
+                                    code,
+                                    KeyCode::Char(' ') | KeyCode::Char('j') | KeyCode::Char('o')
+                                ) {
+                                    r.join = match r.join {
+                                        Join::And => Join::Or,
+                                        Join::Or => Join::And,
+                                    };
                                 }
                             }
                             ClauseField::Kind => {
@@ -13465,7 +16895,13 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     }
                 }
             }
-            app.modal = Some(Modal::Search { view, kinds, rows, sel, field });
+            app.modal = Some(Modal::Search {
+                view,
+                kinds,
+                rows,
+                sel,
+                field,
+            });
         }
         Modal::RuleForm { mut buf, editing } => match code {
             KeyCode::Enter => app.commit_rule(buf, editing),
@@ -13488,11 +16924,7 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 let a = it.next().unwrap_or("").to_string();
                 let b = it.next().unwrap_or("").to_string();
                 app.vars_any = !a.is_empty() && b.is_empty();
-                app.vars_query = if app.vars_any {
-                    (a.clone(), a)
-                } else {
-                    (a, b)
-                };
+                app.vars_query = if app.vars_any { (a.clone(), a) } else { (a, b) };
                 app.load_vars();
             }
             KeyCode::Esc => {}
@@ -13534,7 +16966,12 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                     replay: None,
                 };
                 let argv = build_launch(
-                    &LaunchTarget::Browser { url: buf, spki: Some(spki) }, &how);
+                    &LaunchTarget::Browser {
+                        url: buf,
+                        spki: Some(spki),
+                    },
+                    &how,
+                );
                 app.open_pty(argv);
             }
             KeyCode::Esc => app.status = "browser cancelled".into(),
@@ -13574,21 +17011,38 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::EditorOpen { buf }),
         },
-        Modal::ActionMenu { title, items, mut sel } => match code {
+        Modal::ActionMenu {
+            title,
+            items,
+            mut sel,
+        } => match code {
             KeyCode::Esc => app.status = "menu cancelled".into(),
             KeyCode::Up => {
-                if sel > 0 { sel -= 1; }
+                if sel > 0 {
+                    sel -= 1;
+                }
                 app.modal = Some(Modal::ActionMenu { title, items, sel });
             }
             KeyCode::Down => {
-                if sel + 1 < items.len() { sel += 1; }
+                if sel + 1 < items.len() {
+                    sel += 1;
+                }
                 app.modal = Some(Modal::ActionMenu { title, items, sel });
             }
-            KeyCode::Home => app.modal = Some(Modal::ActionMenu {
-                title, items, sel: 0 }),
+            KeyCode::Home => {
+                app.modal = Some(Modal::ActionMenu {
+                    title,
+                    items,
+                    sel: 0,
+                })
+            }
             KeyCode::End => {
                 let last = items.len().saturating_sub(1);
-                app.modal = Some(Modal::ActionMenu { title, items, sel: last });
+                app.modal = Some(Modal::ActionMenu {
+                    title,
+                    items,
+                    sel: last,
+                });
             }
             KeyCode::Enter => {
                 if let Some(it) = items.get(sel) {
@@ -13603,11 +17057,15 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
         Modal::Launcher { items, mut sel } => match code {
             KeyCode::Esc => app.status = "launcher cancelled".into(),
             KeyCode::Up => {
-                if sel > 0 { sel -= 1; }
+                if sel > 0 {
+                    sel -= 1;
+                }
                 app.modal = Some(Modal::Launcher { items, sel });
             }
             KeyCode::Down => {
-                if sel + 1 < items.len() { sel += 1; }
+                if sel + 1 < items.len() {
+                    sel += 1;
+                }
                 app.modal = Some(Modal::Launcher { items, sel });
             }
             KeyCode::Home => app.modal = Some(Modal::Launcher { items, sel: 0 }),
@@ -13633,44 +17091,91 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::Launcher { items, sel }),
         },
-        Modal::FileGroupPick { discard, sid, rows, mut sel } => match code {
+        Modal::FileGroupPick {
+            discard,
+            sid,
+            rows,
+            mut sel,
+        } => match code {
             KeyCode::Esc => app.status = "cancelled".into(),
             KeyCode::Up => {
-                if sel > 0 { sel -= 1; }
-                app.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel });
+                if sel > 0 {
+                    sel -= 1;
+                }
+                app.modal = Some(Modal::FileGroupPick {
+                    discard,
+                    sid,
+                    rows,
+                    sel,
+                });
             }
             KeyCode::Down => {
-                if sel + 1 < rows.len() { sel += 1; }
-                app.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel });
+                if sel + 1 < rows.len() {
+                    sel += 1;
+                }
+                app.modal = Some(Modal::FileGroupPick {
+                    discard,
+                    sid,
+                    rows,
+                    sel,
+                });
             }
-            KeyCode::Home => app.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel: 0 }),
+            KeyCode::Home => {
+                app.modal = Some(Modal::FileGroupPick {
+                    discard,
+                    sid,
+                    rows,
+                    sel: 0,
+                })
+            }
             KeyCode::End => {
                 let last = rows.len().saturating_sub(1);
-                app.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel: last });
+                app.modal = Some(Modal::FileGroupPick {
+                    discard,
+                    sid,
+                    rows,
+                    sel: last,
+                });
             }
             KeyCode::Enter => {
                 if let Some((label, paths)) = rows.get(sel) {
                     app.run_file_group(discard, &sid, label, paths.clone());
                 }
             }
-            _ => app.modal = Some(Modal::FileGroupPick { discard, sid, rows, sel }),
+            _ => {
+                app.modal = Some(Modal::FileGroupPick {
+                    discard,
+                    sid,
+                    rows,
+                    sel,
+                })
+            }
         },
-        Modal::ImagePicker { mut crumbs, mut stack } => match code {
+        Modal::ImagePicker {
+            mut crumbs,
+            mut stack,
+        } => match code {
             KeyCode::Esc => app.status = "image picker cancelled".into(),
             KeyCode::Up => {
                 if let Some(l) = stack.last_mut() {
-                    if l.sel > 0 { l.sel -= 1; }
+                    if l.sel > 0 {
+                        l.sel -= 1;
+                    }
                 }
                 app.modal = Some(Modal::ImagePicker { crumbs, stack });
             }
             KeyCode::Down => {
                 if let Some(l) = stack.last_mut() {
-                    if l.sel + 1 < l.items.len() { l.sel += 1; }
+                    if l.sel + 1 < l.items.len() {
+                        l.sel += 1;
+                    }
                 }
                 app.modal = Some(Modal::ImagePicker { crumbs, stack });
             }
             KeyCode::Home => {
-                if let Some(l) = stack.last_mut() { l.sel = 0; }
+                if let Some(l) = stack.last_mut() {
+                    l.sel = 0;
+                }
                 app.modal = Some(Modal::ImagePicker { crumbs, stack });
             }
             KeyCode::End => {
@@ -13690,8 +17195,7 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 }
             }
             KeyCode::Enter | KeyCode::Right => {
-                let cur = stack.last()
-                    .and_then(|l| l.items.get(l.sel)).cloned();
+                let cur = stack.last().and_then(|l| l.items.get(l.sel)).cloned();
                 match cur.map(|it| (it.label, it.next)) {
                     Some((label, PickNext::Menu(items))) => {
                         crumbs.push(label);
@@ -13703,13 +17207,14 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                         // A loaded image is just an Image target — same
                         // builder as every other launch.
                         app.open_pty(build_launch(
-                            &LaunchTarget::Image(name), &app.how(Placement::New)));
+                            &LaunchTarget::Image(name),
+                            &app.how(Placement::New),
+                        ));
                     }
                     Some((_, PickNext::EnterRef(prefix))) => {
                         app.modal = Some(Modal::ImageRef { buf: prefix });
                     }
-                    None => app.modal =
-                        Some(Modal::ImagePicker { crumbs, stack }),
+                    None => app.modal = Some(Modal::ImagePicker { crumbs, stack }),
                 }
             }
             _ => app.modal = Some(Modal::ImagePicker { crumbs, stack }),
@@ -13734,14 +17239,22 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::ImageRef { buf }),
         },
-        Modal::OaitaTask { box_name, session, mut buf } => match code {
+        Modal::OaitaTask {
+            box_name,
+            session,
+            mut buf,
+        } => match code {
             KeyCode::Enter => {
                 let task = buf.trim().to_string();
                 if task.is_empty() {
                     // Don't launch an empty agent session — say what's needed
                     // instead of running a no-op (or, as before, erroring).
                     app.status = "type a task for the agent (Esc to cancel)".into();
-                    app.modal = Some(Modal::OaitaTask { box_name, session, buf });
+                    app.modal = Some(Modal::OaitaTask {
+                        box_name,
+                        session,
+                        buf,
+                    });
                 } else {
                     let how = app.how(Placement::On(box_name.clone()));
                     app.open_pty(build_launch(&LaunchTarget::Ai { task }, &how));
@@ -13750,21 +17263,46 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             KeyCode::Esc => app.status = "agent session cancelled".into(),
             KeyCode::Backspace => {
                 buf.pop();
-                app.modal = Some(Modal::OaitaTask { box_name, session, buf });
+                app.modal = Some(Modal::OaitaTask {
+                    box_name,
+                    session,
+                    buf,
+                });
             }
             KeyCode::Char(c) => {
                 buf.push(c);
-                app.modal = Some(Modal::OaitaTask { box_name, session, buf });
+                app.modal = Some(Modal::OaitaTask {
+                    box_name,
+                    session,
+                    buf,
+                });
             }
-            _ => app.modal = Some(Modal::OaitaTask { box_name, session, buf }),
+            _ => {
+                app.modal = Some(Modal::OaitaTask {
+                    box_name,
+                    session,
+                    buf,
+                })
+            }
         },
-        Modal::ModelPicker { models, source, mut sel, loading } => {
+        Modal::ModelPicker {
+            models,
+            source,
+            mut sel,
+            loading,
+        } => {
             // While the catalog is still loading, only Esc does anything.
             if loading {
                 match code {
                     KeyCode::Esc => app.status = "model picker cancelled".into(),
-                    _ => app.modal = Some(Modal::ModelPicker {
-                        models, source, sel, loading }),
+                    _ => {
+                        app.modal = Some(Modal::ModelPicker {
+                            models,
+                            source,
+                            sel,
+                            loading,
+                        })
+                    }
                 }
                 return;
             }
@@ -13775,34 +17313,65 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 KeyCode::Up => {
                     sel = sel.saturating_sub(1);
                     app.modal = Some(Modal::ModelPicker {
-                        models, source, sel, loading });
+                        models,
+                        source,
+                        sel,
+                        loading,
+                    });
                 }
                 KeyCode::Down => {
-                    if sel + 1 < n_rows { sel += 1; }
+                    if sel + 1 < n_rows {
+                        sel += 1;
+                    }
                     app.modal = Some(Modal::ModelPicker {
-                        models, source, sel, loading });
+                        models,
+                        source,
+                        sel,
+                        loading,
+                    });
                 }
-                KeyCode::Home => app.modal = Some(Modal::ModelPicker {
-                    models, source, sel: 0, loading }),
+                KeyCode::Home => {
+                    app.modal = Some(Modal::ModelPicker {
+                        models,
+                        source,
+                        sel: 0,
+                        loading,
+                    })
+                }
                 KeyCode::End => {
                     let last = n_rows.saturating_sub(1);
                     app.modal = Some(Modal::ModelPicker {
-                        models, source, sel: last, loading });
+                        models,
+                        source,
+                        sel: last,
+                        loading,
+                    });
                 }
                 KeyCode::Enter => {
                     if sel < models.len() {
                         // Boxed download of the chosen model, then serve on
                         // demand — the same flow F4 kicks, with a URL.
                         let url = models[sel].url.clone();
-                        app.open_pty(vec![self_exe(), "oaita".into(),
-                            "local".into(), "--model-url".into(), url]);
+                        app.open_pty(vec![
+                            self_exe(),
+                            "oaita".into(),
+                            "local".into(),
+                            "--model-url".into(),
+                            url,
+                        ]);
                     } else {
                         // The custom-URL escape hatch.
                         app.modal = Some(Modal::ModelUrl { buf: String::new() });
                     }
                 }
-                _ => app.modal = Some(Modal::ModelPicker {
-                    models, source, sel, loading }),
+                _ => {
+                    app.modal = Some(Modal::ModelPicker {
+                        models,
+                        source,
+                        sel,
+                        loading,
+                    })
+                }
             }
         }
         Modal::ModelUrl { mut buf } => match code {
@@ -13811,8 +17380,13 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 if url.is_empty() {
                     app.status = "model URL cancelled".into();
                 } else {
-                    app.open_pty(vec![self_exe(), "oaita".into(),
-                        "local".into(), "--model-url".into(), url]);
+                    app.open_pty(vec![
+                        self_exe(),
+                        "oaita".into(),
+                        "local".into(),
+                        "--model-url".into(),
+                        url,
+                    ]);
                 }
             }
             KeyCode::Esc => app.status = "model URL cancelled".into(),
@@ -13826,14 +17400,25 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
             }
             _ => app.modal = Some(Modal::ModelUrl { buf }),
         },
-        Modal::ApiConfig { mut base_url, mut model, mut api_key,
-                           mut field, mut result, mut testing } => {
+        Modal::ApiConfig {
+            mut base_url,
+            mut model,
+            mut api_key,
+            mut field,
+            mut result,
+            mut testing,
+        } => {
             let ctrl = mods.contains(KeyModifiers::CONTROL);
             // Field order matches the render: 0 model · 1 base_url · 2 api_key.
-            let reopen = |app: &mut App, base_url, model, api_key, field,
-                          result, testing| {
+            let reopen = |app: &mut App, base_url, model, api_key, field, result, testing| {
                 app.modal = Some(Modal::ApiConfig {
-                    base_url, model, api_key, field, result, testing });
+                    base_url,
+                    model,
+                    api_key,
+                    field,
+                    result,
+                    testing,
+                });
             };
             match code {
                 KeyCode::Esc => app.status = "api config cancelled".into(),
@@ -13849,86 +17434,125 @@ fn handle_modal_key(app: &mut App, code: crossterm::event::KeyCode,
                 KeyCode::Char('t') if ctrl => {
                     testing = true;
                     result = String::new();
-                    app.start_api_probe(base_url.clone(), model.clone(),
-                                        api_key.clone());
+                    app.start_api_probe(base_url.clone(), model.clone(), api_key.clone());
                     reopen(app, base_url, model, api_key, field, result, testing);
                 }
                 // Ctrl-S or Enter: persist to oaita.toml.
                 KeyCode::Char('s') if ctrl => {
                     app.status = app.save_api_config(&base_url, &model, &api_key);
                     if app.status.starts_with("model is required") {
-                        reopen(app, base_url, model, api_key, field,
-                               result, testing);
+                        reopen(app, base_url, model, api_key, field, result, testing);
                     }
                 }
                 KeyCode::Enter => {
                     app.status = app.save_api_config(&base_url, &model, &api_key);
                     if app.status.starts_with("model is required") {
-                        reopen(app, base_url, model, api_key, field,
-                               result, testing);
+                        reopen(app, base_url, model, api_key, field, result, testing);
                     }
                 }
                 KeyCode::Backspace => {
-                    match field { 0 => &mut model, 1 => &mut base_url,
-                                  _ => &mut api_key }.pop();
+                    match field {
+                        0 => &mut model,
+                        1 => &mut base_url,
+                        _ => &mut api_key,
+                    }
+                    .pop();
                     reopen(app, base_url, model, api_key, field, result, testing);
                 }
                 KeyCode::Char(c) => {
-                    match field { 0 => &mut model, 1 => &mut base_url,
-                                  _ => &mut api_key }.push(c);
+                    match field {
+                        0 => &mut model,
+                        1 => &mut base_url,
+                        _ => &mut api_key,
+                    }
+                    .push(c);
                     reopen(app, base_url, model, api_key, field, result, testing);
                 }
-                _ => reopen(app, base_url, model, api_key, field,
-                            result, testing),
+                _ => reopen(app, base_url, model, api_key, field, result, testing),
             }
         }
-        Modal::Command { mut buf, mut completions, mut sel } => {
-            match code {
-                KeyCode::Esc => app.status = "command cancelled".into(),
-                KeyCode::Enter => {
-                    let input = buf.trim().to_string();
-                    if input.is_empty() {
-                        app.status = "command: empty input".into();
+        Modal::Command {
+            mut buf,
+            mut completions,
+            mut sel,
+        } => match code {
+            KeyCode::Esc => app.status = "command cancelled".into(),
+            KeyCode::Enter => {
+                let input = buf.trim().to_string();
+                if input.is_empty() {
+                    app.status = "command: empty input".into();
+                } else {
+                    app.dispatch_command(&input);
+                }
+            }
+            KeyCode::Tab => {
+                if !completions.is_empty() {
+                    buf = crate::parser::apply_completion(&buf, &completions[sel]);
+                    completions = command_completions(app, &buf, buf.len());
+                    sel = if completions.is_empty() {
+                        0
                     } else {
-                        app.dispatch_command(&input);
-                    }
+                        (sel + 1) % completions.len()
+                    };
+                    app.modal = Some(Modal::Command {
+                        buf,
+                        completions,
+                        sel,
+                    });
                 }
-                KeyCode::Tab => {
-                    // Tab fills the buffer with the selected completion,
-                    // then advances to the next one.
-                    if !completions.is_empty() {
-                        buf = completions[sel].to_string();
-                        sel = (sel + 1) % completions.len();
-                        app.modal = Some(Modal::Command { buf, completions, sel });
-                    }
-                }
-                KeyCode::Down => {
-                    if !completions.is_empty() {
-                        sel = (sel + 1) % completions.len();
-                        app.modal = Some(Modal::Command { buf, completions, sel });
-                    }
-                }
-                KeyCode::Up => {
-                    if !completions.is_empty() {
-                        sel = if sel == 0 { completions.len() - 1 } else { sel - 1 };
-                        app.modal = Some(Modal::Command { buf, completions, sel });
-                    }
-                }
-                KeyCode::Backspace => {
-                    buf.pop();
-                    completions = crate::parser::fuzzy_complete(&buf);
-                    sel = 0;
-                    app.modal = Some(Modal::Command { buf, completions, sel });
-                }
-                KeyCode::Char(c) => {
-                    buf.push(c);
-                    completions = crate::parser::fuzzy_complete(&buf);
-                    sel = 0;
-                    app.modal = Some(Modal::Command { buf, completions, sel });
-                }
-                _ => app.modal = Some(Modal::Command { buf, completions, sel }),
             }
-        }
+            KeyCode::Down => {
+                if !completions.is_empty() {
+                    sel = (sel + 1) % completions.len();
+                    app.modal = Some(Modal::Command {
+                        buf,
+                        completions,
+                        sel,
+                    });
+                }
+            }
+            KeyCode::Up => {
+                if !completions.is_empty() {
+                    sel = if sel == 0 {
+                        completions.len() - 1
+                    } else {
+                        sel - 1
+                    };
+                    app.modal = Some(Modal::Command {
+                        buf,
+                        completions,
+                        sel,
+                    });
+                }
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                completions = command_completions(app, &buf, buf.len());
+                sel = 0;
+                app.modal = Some(Modal::Command {
+                    buf,
+                    completions,
+                    sel,
+                });
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                completions = command_completions(app, &buf, buf.len());
+                sel = 0;
+                app.modal = Some(Modal::Command {
+                    buf,
+                    completions,
+                    sel,
+                });
+            }
+            _ => {
+                app.modal = Some(Modal::Command {
+                    buf,
+                    completions,
+                    sel,
+                })
+            }
+        },
     }
 }
 
@@ -13978,7 +17602,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             // independently, but the UI only redraws on its own tick,
             // so we pump them all here even when only one is visible
             // (the rest accumulate output for when the user switches).
-            for pty in app.ptys.iter_mut() { pty.pump(); }
+            for pty in app.ptys.iter_mut() {
+                pty.pump();
+            }
             // Keep the active PTY sized to whatever space the layout
             // actually gives it. The child's $LINES / $COLUMNS / TIOCSWINSZ
             // tracks the real visible grid, so reedline / less / vim
@@ -14005,7 +17631,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             // are started by the engine's scheduler, so there is no push
             // event to react to. Throttled to ~2s while focused.
             if app.focus == Pane::Mirrors
-                && app.mirrors_loaded_at
+                && app
+                    .mirrors_loaded_at
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
             {
                 app.load_mirrors();
@@ -14059,7 +17686,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 } else {
                     execute!(term.backend_mut(), event::DisableMouseCapture)
                 };
-                if r.is_ok() { mouse_captured = want_mouse; }
+                if r.is_ok() {
+                    mouse_captured = want_mouse;
+                }
             }
             if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
                 continue;
@@ -14122,8 +17751,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         }
                         KeyCode::Left => {
                             if !chips.is_empty() {
-                                app.menu_sel = (app.menu_sel + chips.len() - 1)
-                                    % chips.len();
+                                app.menu_sel = (app.menu_sel + chips.len() - 1) % chips.len();
                             }
                         }
                         KeyCode::Right => {
@@ -14146,7 +17774,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             if let Some((key, _)) = chips.get(app.menu_sel).copied() {
                                 let letter_event = crossterm::event::KeyEvent::new(
                                     KeyCode::Char(key),
-                                    crossterm::event::KeyModifiers::empty());
+                                    crossterm::event::KeyModifiers::empty(),
+                                );
                                 // Replay through the same loop body by
                                 // re-injecting; cleaner: dispatch inline.
                                 dispatch_menubar_key(&mut app, key);
@@ -14199,8 +17828,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 // navigate boxes / changes / procs while a shell runs
                 // on the right.
                 let pty_input_active = app.focus == Pane::Pty
-                    || (app.pty_in_right && app.right_focused
-                        && !app.ptys.is_empty());
+                    || (app.pty_in_right && app.right_focused && !app.ptys.is_empty());
                 if pty_input_active {
                     use crossterm::event::KeyModifiers;
                     // EOF: child is dead. Any key detaches (no point typing
@@ -14212,17 +17840,31 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // screen's kind, F7 new, F8 kill, F9 actions, F12
                     // detach. Norton-style: stable mapping, the labels in
                     // the bar tell you what each does here).
-                    if matches!(k.code, KeyCode::F(2)) { app.cycle_screen(1); continue; }
-                    if matches!(k.code, KeyCode::F(3)) { app.cycle_screen(-1); continue; }
-                    if matches!(k.code, KeyCode::F(4)) { app.cycle_window(1); continue; }
-                    if matches!(k.code, KeyCode::F(5)) { app.cycle_window(-1); continue; }
+                    if matches!(k.code, KeyCode::F(2)) {
+                        app.cycle_screen(1);
+                        continue;
+                    }
+                    if matches!(k.code, KeyCode::F(3)) {
+                        app.cycle_screen(-1);
+                        continue;
+                    }
+                    if matches!(k.code, KeyCode::F(4)) {
+                        app.cycle_window(1);
+                        continue;
+                    }
+                    if matches!(k.code, KeyCode::F(5)) {
+                        app.cycle_window(-1);
+                        continue;
+                    }
                     if matches!(k.code, KeyCode::F(9)) {
                         // Context-menu popup inside the PTY pane (PTY-
                         // specific actions: new, kill, embed). Same
                         // entrypoint as 'm' in any other pane.
                         if let Some((title, items)) = pane_action_menu(&app) {
                             app.modal = Some(Modal::ActionMenu {
-                                title, items, sel: 0,
+                                title,
+                                items,
+                                sel: 0,
                             });
                         }
                         continue;
@@ -14231,7 +17873,10 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         open_pty_menu(&mut app);
                         continue;
                     }
-                    if matches!(k.code, KeyCode::F(8)) { app.pty_kill(); continue; }
+                    if matches!(k.code, KeyCode::F(8)) {
+                        app.pty_kill();
+                        continue;
+                    }
                     if matches!(k.code, KeyCode::F(6)) {
                         // Toggle the mouse between the child (carbonyl/vim get
                         // clicks + scroll) and the outer terminal (native
@@ -14240,10 +17885,12 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         app.mouse_release = !app.mouse_release;
                         app.status = if app.mouse_release {
                             "mouse released to the terminal — drag to select/copy \
-                             · F6 to hand it back to the app".into()
+                             · F6 to hand it back to the app"
+                                .into()
                         } else {
                             "mouse grabbed by the app — clicks/scroll go to the \
-                             page · F6 to release for selection".into()
+                             page · F6 to release for selection"
+                                .into()
                         };
                         continue;
                     }
@@ -14274,8 +17921,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     let f12 = matches!(k.code, KeyCode::F(12));
                     let now = std::time::Instant::now();
                     let esc_chord = matches!(k.code, KeyCode::Esc)
-                        && app.pty_esc_at.is_some_and(|t|
-                            now.duration_since(t) < Duration::from_millis(400));
+                        && app
+                            .pty_esc_at
+                            .is_some_and(|t| now.duration_since(t) < Duration::from_millis(400));
                     let detach = ctrl_bracket || raw_gs || f12 || esc_chord;
                     if dead {
                         // Drop the corpse from `ptys` (slides to next/prev)
@@ -14306,7 +17954,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         }
                         app.status = format!(
                             "PTY {}/{} detached (still running · Tab/P re-attach)",
-                            app.sel_pty + 1, app.ptys.len());
+                            app.sel_pty + 1,
+                            app.ptys.len()
+                        );
                     } else if matches!(k.code, KeyCode::Esc) {
                         // Arm the Esc-Esc chord; lone Esc still reaches
                         // the shell via the flush path below.
@@ -14321,7 +17971,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                                 }
                             }
                         }
-                        if let Some(pty) = app.cur_pty_mut() { pty.send_input(&bytes); }
+                        if let Some(pty) = app.cur_pty_mut() {
+                            pty.send_input(&bytes);
+                        }
                     }
                     continue;
                 }
@@ -14339,17 +17991,24 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 //   · F9 menu-nav               · F10 quit
                 if let KeyCode::F(n) = k.code {
                     match n {
-                        1 => { app.snap_left(); app.focus = Pane::Help; app.out_scroll = 0; }
-                        2 => { app.cycle_screen(1); }
-                        3 => { app.cycle_screen(-1); }
+                        1 => {
+                            app.snap_left();
+                            app.focus = Pane::Help;
+                            app.out_scroll = 0;
+                        }
+                        2 => {
+                            app.cycle_screen(1);
+                        }
+                        3 => {
+                            app.cycle_screen(-1);
+                        }
                         11 => {
                             // Embed the active PTY into the focused view's
                             // RIGHT column (or un-embed). With no PTY there
                             // is nothing to split — point at F7 instead of
                             // duplicating it (the fkeybar dims F11 too).
                             if app.ptys.is_empty() {
-                                app.status =
-                                    "no PTY to split — F7 opens one".into();
+                                app.status = "no PTY to split — F7 opens one".into();
                             } else {
                                 app.pty_in_right = !app.pty_in_right;
                                 // Right-focus follows the embedded PTY so
@@ -14358,8 +18017,12 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                                 app.right_scroll = 0;
                             }
                         }
-                        4 => { app.cycle_window(1); }
-                        5 => { app.cycle_window(-1); }
+                        4 => {
+                            app.cycle_window(1);
+                        }
+                        5 => {
+                            app.cycle_window(-1);
+                        }
                         6 => {
                             if app.focus == Pane::Sessions {
                                 app.renaming = Some(String::new());
@@ -14368,7 +18031,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         7 => {
                             if app.focus == Pane::Rules {
                                 app.modal = Some(Modal::RuleForm {
-                                    buf: String::new(), editing: None });
+                                    buf: String::new(),
+                                    editing: None,
+                                });
                             } else if app.focus == Pane::Sessions {
                                 // "Image+" — new box from a container image.
                                 app.open_image_picker();
@@ -14379,18 +18044,23 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             }
                         }
                         8 => {
-                            if app.focus == Pane::Hunks { app.discard_hunk(); }
-                            else if app.focus == Pane::Changes { app.discard(); }
-                            else if app.focus == Pane::Rules { app.delete_rule(); }
-                            else if app.focus == Pane::Sessions {
+                            if app.focus == Pane::Hunks {
+                                app.discard_hunk();
+                            } else if app.focus == Pane::Changes {
+                                app.discard();
+                            } else if app.focus == Pane::Rules {
+                                app.delete_rule();
+                            } else if app.focus == Pane::Sessions {
                                 // Box "Delete" = dissolve (changes promoted
                                 // down, keep children); Confirm-guarded.
                                 app.modal = Some(Modal::Confirm {
-                                    prompt: format!("Delete {}? Its changes \
+                                    prompt: format!(
+                                        "Delete {}? Its changes \
                                         are promoted down into child boxes \
                                         (never to the host); children are \
                                         kept and re-parented.",
-                                        app.box_op_scope_label()),
+                                        app.box_op_scope_label()
+                                    ),
                                     action: ConfirmAction::Dissolve,
                                 });
                             }
@@ -14402,15 +18072,18 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             // the currently-active view (or the
                             // first chip if no chip maps).
                             let chips = menubar_chips(&app);
-                            let active = view_of_pane(app.focus)
-                                .map(|(k, _, _)| k);
-                            app.menu_sel = chips.iter()
+                            let active = view_of_pane(app.focus).map(|(k, _, _)| k);
+                            app.menu_sel = chips
+                                .iter()
                                 .position(|(k, _)| Some(*k) == active)
                                 .unwrap_or(0);
                             app.menu_nav = true;
                             app.status = "menu — ←/→ move · Enter pick · Esc cancel".into();
                         }
-                        10 => { shutdown_rpc(&app.sock); app.should_quit = true; }
+                        10 => {
+                            shutdown_rpc(&app.sock);
+                            app.should_quit = true;
+                        }
                         _ => {}
                     }
                     continue;
@@ -14457,8 +18130,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         KeyCode::Right => app.ins_sibling(1),
                         KeyCode::Backspace | KeyCode::Esc => app.ins_pop(),
                         KeyCode::Char(':') => app.ins_open_goto(),
-                        KeyCode::Char(d @ '1'..='9') =>
-                            app.ins_hotspot((d as u8 - b'1') as usize),
+                        KeyCode::Char(d @ '1'..='9') => app.ins_hotspot((d as u8 - b'1') as usize),
                         KeyCode::Char('R') => app.ins_reload(),
                         KeyCode::Char('q') => {
                             shutdown_rpc(&app.sock);
@@ -14467,8 +18139,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         // Menubar accelerators still switch panes from Inspect
                         // (Inspect has no per-row letter bindings of its own).
                         // Derived from PANE_KEYS so 't' (Trace) is reachable.
-                        KeyCode::Char(c) if is_menubar_accel(c) =>
-                            dispatch_menubar_key(&mut app, c),
+                        KeyCode::Char(c) if is_menubar_accel(c) => {
+                            dispatch_menubar_key(&mut app, c)
+                        }
                         _ => {}
                     }
                     continue;
@@ -14483,8 +18156,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 // Editor pane: same shape — an open buffer's keymap (vim
                 // editing, Ctrl-S save, zoom) consumes first; the empty
                 // state falls through so chips and 'q' work.
-                if app.focus == Pane::Editor
-                    && handle_editor_key(&mut app, k.code, k.modifiers) {
+                if app.focus == Pane::Editor && handle_editor_key(&mut app, k.code, k.modifiers) {
                     continue;
                 }
                 // Banner-prompt keys take priority over EVERYTHING (so y/n/a/d
@@ -14493,10 +18165,22 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 // these four keys; the rest of the UI is fully usable.
                 if app.pending_prompt.is_some() {
                     match k.code {
-                        KeyCode::Char('y') => { app.answer_prompt("yes_once"); continue; }
-                        KeyCode::Char('n') => { app.answer_prompt("no_once");  continue; }
-                        KeyCode::Char('a') => { app.answer_prompt("allow_save"); continue; }
-                        KeyCode::Char('d') => { app.answer_prompt("deny_save");  continue; }
+                        KeyCode::Char('y') => {
+                            app.answer_prompt("yes_once");
+                            continue;
+                        }
+                        KeyCode::Char('n') => {
+                            app.answer_prompt("no_once");
+                            continue;
+                        }
+                        KeyCode::Char('a') => {
+                            app.answer_prompt("allow_save");
+                            continue;
+                        }
+                        KeyCode::Char('d') => {
+                            app.answer_prompt("deny_save");
+                            continue;
+                        }
                         _ => {}
                     }
                 }
@@ -14524,10 +18208,12 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // DAG sideways (sessions pane): cycle the alternatives
                     // of the last vertical traversal — all parents (main +
                     // RO attachments) or all explicit children.
-                    KeyCode::Left if app.focus == Pane::Sessions
-                        && !app.right_focused => app.sideways(-1),
-                    KeyCode::Right if app.focus == Pane::Sessions
-                        && !app.right_focused => app.sideways(1),
+                    KeyCode::Left if app.focus == Pane::Sessions && !app.right_focused => {
+                        app.sideways(-1)
+                    }
+                    KeyCode::Right if app.focus == Pane::Sessions && !app.right_focused => {
+                        app.sideways(1)
+                    }
                     KeyCode::PageDown => app.page_down(),
                     KeyCode::PageUp => app.page_up(),
                     KeyCode::Home => app.move_home(),
@@ -14550,8 +18236,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // Esc / Backspace from the packet drill-down pops back
                     // to the flows list, keeping its cursor + detail state.
                     KeyCode::Backspace => app.go_back(),
-                    KeyCode::Esc if app.focus == Pane::Packets =>
-                        app.close_packets(),
+                    KeyCode::Esc if app.focus == Pane::Packets => app.close_packets(),
                     KeyCode::Esc => {
                         // esc first drops an active multi-select; only if there
                         // was none does it fall through to clearing a generated
@@ -14565,7 +18250,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         }
                     }
                     // The table handles the rest; unmatched keys are no-ops.
-                    code => { dispatch_pane_key(&mut app, code); }
+                    code => {
+                        dispatch_pane_key(&mut app, code);
+                    }
                 }
             }
         }
@@ -14677,17 +18364,29 @@ mod tests {
     /// one real verb line.
     #[test]
     fn help_has_verbs_section() {
-        let text: Vec<String> = super::help_lines().iter()
-            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref())
-                 .collect::<String>())
+        let text: Vec<String> = super::help_lines()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>()
+            })
             .collect();
-        assert!(text.iter().any(|l| l.starts_with("Verbs")),
-                "no Verbs header in help");
-        assert!(text.iter().any(|l| l.contains("mirror_add")
-                                 && l.contains("add a scheduled")),
-                "no verb line in help");
+        assert!(
+            text.iter().any(|l| l.starts_with("Verbs")),
+            "no Verbs header in help"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l.contains("mirror_add") && l.contains("add a scheduled")),
+            "no verb line in help"
+        );
         assert!(text.iter().any(|l| l.starts_with("Keys")), "no Keys header");
-        assert!(text.iter().any(|l| l.starts_with("Panes")), "no Panes header");
+        assert!(
+            text.iter().any(|l| l.starts_with("Panes")),
+            "no Panes header"
+        );
     }
 
     /// DAG sideways navigation: the sessions list flattens by MAIN
@@ -14716,17 +18415,28 @@ mod tests {
         let mut app = headless_app();
         app.focus = Pane::Inspect;
         app.ins_init();
-        let texts: Vec<&str> = app.ins_stack.last().unwrap().entries.iter()
-            .map(|e| e.text.as_str()).collect();
+        let texts: Vec<&str> = app
+            .ins_stack
+            .last()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
         assert!(texts.iter().any(|t| t.starts_with("boxes")), "{texts:?}");
-        assert!(texts.iter().any(|t| t.starts_with("file rules")), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t.starts_with("file rules")),
+            "{texts:?}"
+        );
 
         // A real file long enough to bucket (302 lines > the 200-line page).
         let dir = std::env::temp_dir().join(format!("sarun-ins-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("probe.py");
         let mut body = String::from("def alpha():\n    return 1\n");
-        for i in 0..300 { body.push_str(&format!("x{i} = {i}\n")); }
+        for i in 0..300 {
+            body.push_str(&format!("x{i} = {i}\n"));
+        }
         std::fs::write(&file, &body).unwrap();
         for extra in ["a.rs", "b.py", "c.rs"] {
             std::fs::write(dir.join(extra), "x\n").unwrap();
@@ -14735,29 +18445,46 @@ mod tests {
         // ':' locator → the file: buckets, not a 302-line dump.
         app.ins_goto(file.to_str().unwrap());
         let f = app.ins_stack.last().unwrap();
-        let bucket = f.entries.iter().position(|e| e.text.contains("lines 1..200"))
+        let bucket = f
+            .entries
+            .iter()
+            .position(|e| e.text.contains("lines 1..200"))
             .expect("302 lines must bucket into pages");
-        assert!(f.entries.iter().any(|e| e.text.contains("symbols")),
-                "a .py file offers the symbols drill");
+        assert!(
+            f.entries.iter().any(|e| e.text.contains("symbols")),
+            "a .py file offers the symbols drill"
+        );
         app.ins_stack.last_mut().unwrap().sel = bucket;
         let depth = app.ins_stack.len();
         app.ins_enter();
         assert_eq!(app.ins_stack.len(), depth + 1, "a bucket is a level");
-        assert!(app.ins_stack.last().unwrap().entries.iter()
-                    .any(|e| e.text.contains("def alpha")),
-                "the leaf page shows the source");
+        assert!(
+            app.ins_stack
+                .last()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.text.contains("def alpha")),
+            "the leaf page shows the source"
+        );
         // Right = next SIBLING bucket, same depth, next span.
         app.ins_sibling(1);
         assert_eq!(app.ins_stack.len(), depth + 1);
-        assert!(app.ins_stack.last().unwrap().title.contains("201..302"),
-                "sibling title: {}", app.ins_stack.last().unwrap().title);
+        assert!(
+            app.ins_stack.last().unwrap().title.contains("201..302"),
+            "sibling title: {}",
+            app.ins_stack.last().unwrap().title
+        );
         app.ins_pop();
 
         // The dir's glob filter: a mandatory argument through the INLINE
         // card input (no modal), then a filtered listing.
         app.ins_goto(dir.to_str().unwrap());
         let f = app.ins_stack.last().unwrap();
-        let filt = f.entries.iter().position(|e| e.arg.is_some())
+        let filt = f
+            .entries
+            .iter()
+            .position(|e| e.arg.is_some())
             .expect("dir frames offer the glob filter row");
         app.ins_stack.last_mut().unwrap().sel = filt;
         app.ins_enter();
@@ -14768,16 +18495,21 @@ mod tests {
         let f = app.ins_stack.last().unwrap();
         assert!(f.title.contains("*.rs"), "title: {}", f.title);
         let names: Vec<&str> = f.entries.iter().map(|e| e.text.as_str()).collect();
-        assert!(names.iter().any(|t| t.contains("a.rs"))
-                    && names.iter().any(|t| t.contains("c.rs"))
-                    && !names.iter().any(|t| t.contains("b.py")),
-                "filtered listing: {names:?}");
+        assert!(
+            names.iter().any(|t| t.contains("a.rs"))
+                && names.iter().any(|t| t.contains("c.rs"))
+                && !names.iter().any(|t| t.contains("b.py")),
+            "filtered listing: {names:?}"
+        );
 
         // File grep: the mandatory-input row filters lines but keeps the
         // ORIGINAL line numbers.
         app.ins_goto(file.to_str().unwrap());
         let f = app.ins_stack.last().unwrap();
-        let grep = f.entries.iter().position(|e| e.arg.is_some())
+        let grep = f
+            .entries
+            .iter()
+            .position(|e| e.arg.is_some())
             .expect("file frames offer the grep row");
         app.ins_stack.last_mut().unwrap().sel = grep;
         app.ins_enter();
@@ -14785,17 +18517,24 @@ mod tests {
         app.ins_input_done();
         let f = app.ins_stack.last().unwrap();
         assert!(f.title.contains("alpha"), "title: {}", f.title);
-        assert!(f.entries.iter().any(|e| e.text.contains("     1  def alpha")),
-                "grep keeps original numbering: {:?}",
-                f.entries.iter().map(|e| &e.text).collect::<Vec<_>>());
+        assert!(
+            f.entries
+                .iter()
+                .any(|e| e.text.contains("     1  def alpha")),
+            "grep keeps original numbering: {:?}",
+            f.entries.iter().map(|e| &e.text).collect::<Vec<_>>()
+        );
         app.ins_pop();
         app.ins_pop();
 
         // Cards: a file row's card carries numbered hotspots.
         app.ins_extreme(false);
         let f = app.ins_stack.last().unwrap();
-        assert!(f.card.iter().any(|l| l.contains("[1]")),
-                "card must show hotspots: {:?}", f.card);
+        assert!(
+            f.card.iter().any(|l| l.contains("[1]")),
+            "card must show hotspots: {:?}",
+            f.card
+        );
 
         let buf = render_to_string(&app, 120, 40).unwrap();
         assert!(buf.contains("inspect"), "inspector title missing:\n{buf}");
@@ -14809,38 +18548,57 @@ mod tests {
         app.ins_goto(elf.to_str().unwrap());
         let f = app.ins_stack.last().unwrap();
         assert!(f.title.contains("ELF"), "magic sniff in title: {}", f.title);
-        assert!(f.entries.iter().any(|e| e.text.starts_with("bytes 0x")),
-                "200k of binary must bucket into byte ranges");
+        assert!(
+            f.entries.iter().any(|e| e.text.starts_with("bytes 0x")),
+            "200k of binary must bucket into byte ranges"
+        );
         app.ins_extreme(false);
         app.ins_enter();
-        assert!(app.ins_stack.last().unwrap().entries.iter()
-                    .any(|e| e.text.contains("7f 45 4c 46")),
-                "leaf pages are hexdump rows");
+        assert!(
+            app.ins_stack
+                .last()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.text.contains("7f 45 4c 46")),
+            "leaf pages are hexdump rows"
+        );
         app.ins_pop();
         app.ins_pop();
 
         // First-time hints treat the DRILL CHAIN as the session: the first
         // dir frame teaches, a nested dir frame stays clean, and popping
         // the carrying frame re-arms the hint (the UI's backtrack).
-        while app.ins_stack.len() > 1 { app.ins_pop(); }
+        while app.ins_stack.len() > 1 {
+            app.ins_pop();
+        }
         app.ins_goto(dir.to_str().unwrap());
-        assert!(app.ins_stack.last().unwrap().hints.contains(&"ins-dir"),
-                "first dir frame carries the hint");
+        assert!(
+            app.ins_stack.last().unwrap().hints.contains(&"ins-dir"),
+            "first dir frame carries the hint"
+        );
         let sub = dir.join("nest");
         std::fs::create_dir_all(&sub).unwrap();
         app.ins_reload();
         let f = app.ins_stack.last().unwrap();
-        let child = f.entries.iter().position(|e| e.text.contains("nest"))
+        let child = f
+            .entries
+            .iter()
+            .position(|e| e.text.contains("nest"))
             .expect("listing shows the subdir");
         app.ins_stack.last_mut().unwrap().sel = child;
         app.ins_enter();
-        assert!(app.ins_stack.last().unwrap().hints.is_empty(),
-                "a nested dir frame must not repeat the hint");
+        assert!(
+            app.ins_stack.last().unwrap().hints.is_empty(),
+            "a nested dir frame must not repeat the hint"
+        );
         app.ins_pop();
         app.ins_pop();
         app.ins_goto(sub.to_str().unwrap());
-        assert!(app.ins_stack.last().unwrap().hints.contains(&"ins-dir"),
-                "after popping the carrier, the hint refires");
+        assert!(
+            app.ins_stack.last().unwrap().hints.contains(&"ins-dir"),
+            "after popping the carrier, the hint refires"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -14870,11 +18628,17 @@ mod tests {
         app.move_up();
         assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("2"));
         app.sideways(1);
-        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("1"),
-                   "cycles to the other parent");
+        assert_eq!(
+            app.session_id_at(app.sel_session).as_deref(),
+            Some("1"),
+            "cycles to the other parent"
+        );
         app.sideways(1);
-        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("2"),
-                   "wraps around the parent ring");
+        assert_eq!(
+            app.session_id_at(app.sel_session).as_deref(),
+            Some("2"),
+            "wraps around the parent ring"
+        );
         app.sideways(-1);
         assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("1"));
 
@@ -14887,11 +18651,17 @@ mod tests {
         app.sideways(1);
         assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("5"));
         app.sideways(1);
-        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("3"),
-                   "attachment edge counts as an explicit child");
+        assert_eq!(
+            app.session_id_at(app.sel_session).as_deref(),
+            Some("3"),
+            "attachment edge counts as an explicit child"
+        );
         app.sideways(1);
-        assert_eq!(app.session_id_at(app.sel_session).as_deref(), Some("4"),
-                   "wraps around the sibling ring");
+        assert_eq!(
+            app.session_id_at(app.sel_session).as_deref(),
+            Some("4"),
+            "wraps around the sibling ring"
+        );
 
         // No prior vertical traversal → sideways is a no-op with a hint.
         app.nav_from = None;
@@ -14936,8 +18706,10 @@ mod tests {
         // thing collapses to one column, every node ⋮-marked (incl. the leaf).
         let depths = [0, 1, 2, 3];
         let got = collapse_chains(&depths);
-        assert!(got.iter().all(|&(d, c)| d == 0 && c),
-                "a pure single-child spine should flatten to depth 0, all marked: {got:?}");
+        assert!(
+            got.iter().all(|&(d, c)| d == 0 && c),
+            "a pure single-child spine should flatten to depth 0, all marked: {got:?}"
+        );
     }
 
     /// The App computes its filerules path from the (process-global) env, so the
@@ -14948,18 +18720,28 @@ mod tests {
     #[test]
     fn shell_split_handles_quotes() {
         assert_eq!(shell_split("bash"), vec!["bash"]);
-        assert_eq!(shell_split("sarun run -b -- make all"),
-                   vec!["sarun", "run", "-b", "--", "make", "all"]);
-        assert_eq!(shell_split("sh -c 'echo hi there'"),
-                   vec!["sh", "-c", "echo hi there"]);
+        assert_eq!(
+            shell_split("sarun run -b -- make all"),
+            vec!["sarun", "run", "-b", "--", "make", "all"]
+        );
+        assert_eq!(
+            shell_split("sh -c 'echo hi there'"),
+            vec!["sh", "-c", "echo hi there"]
+        );
         assert_eq!(shell_split(r#"a "b c" d"#), vec!["a", "b c", "d"]);
         assert!(shell_split("   ").is_empty());
     }
 
     // A How with the given net + placement (env off unless set) for tests.
     fn how(net: &str, placement: Placement) -> How {
-        How { net: net.to_string(), env: false, placement, webcap: false,
-              webfilter: false, replay: None }
+        How {
+            net: net.to_string(),
+            env: false,
+            placement,
+            webcap: false,
+            webfilter: false,
+            replay: None,
+        }
     }
 
     #[test]
@@ -14974,46 +18756,84 @@ mod tests {
         // --replay <src> so carbonyl serves that box's archive, not the live
         // net (no --webcap/--webfilter — we're replaying, not recording).
         let rhow = How {
-            net: "tap".into(), env: false,
+            net: "tap".into(),
+            env: false,
             placement: Placement::Reuse("REPLAY7".into()),
-            webcap: false, webfilter: false, replay: Some("7".into()),
+            webcap: false,
+            webfilter: false,
+            replay: Some("7".into()),
         };
         let rargv = build_launch(
-            &LaunchTarget::Browser { url: "https://x.test/".into(),
-                                     spki: Some("A=".into()) }, &rhow).join(" ");
-        assert!(rargv.contains("--name REPLAY7") && rargv.contains("--replay 7"),
-                "replay launch names the box + source: {rargv}");
-        assert!(!rargv.contains("--webcap") && !rargv.contains("--webfilter"),
-                "replay doesn't re-capture or filter: {rargv}");
-        assert!(rargv.ends_with("https://x.test/"), "replay opens the URL: {rargv}");
+            &LaunchTarget::Browser {
+                url: "https://x.test/".into(),
+                spki: Some("A=".into()),
+            },
+            &rhow,
+        )
+        .join(" ");
+        assert!(
+            rargv.contains("--name REPLAY7") && rargv.contains("--replay 7"),
+            "replay launch names the box + source: {rargv}"
+        );
+        assert!(
+            !rargv.contains("--webcap") && !rargv.contains("--webfilter"),
+            "replay doesn't re-capture or filter: {rargv}"
+        );
+        assert!(
+            rargv.ends_with("https://x.test/"),
+            "replay opens the URL: {rargv}"
+        );
 
         let how = How {
-            net: "tap".into(), env: false,
-            placement: Placement::Reuse("BROWSER".into()), webcap: true,
-            webfilter: true, replay: None,
+            net: "tap".into(),
+            env: false,
+            placement: Placement::Reuse("BROWSER".into()),
+            webcap: true,
+            webfilter: true,
+            replay: None,
         };
         let argv = build_launch(
-            &LaunchTarget::Browser { url: "https://example.com".into(),
-                                     spki: Some("AbC=".into()) }, &how);
+            &LaunchTarget::Browser {
+                url: "https://example.com".into(),
+                spki: Some("AbC=".into()),
+            },
+            &how,
+        );
         let j = argv.join(" ");
-        assert!(j.starts_with(
-            "sarun oci run --net tap --name BROWSER --webcap --webfilter \
-             docker.io/chromedp/headless-shell@sha256:"),
-            "persistent + captured + filtered oci run, got {j:?}");
+        assert!(
+            j.starts_with(
+                "sarun oci run --net tap --name BROWSER --webcap --webfilter \
+             docker.io/chromedp/headless-shell@sha256:"
+            ),
+            "persistent + captured + filtered oci run, got {j:?}"
+        );
         // the box CMD re-execs the ferried engine as `browser`, with the SPKI
-        assert!(argv.contains(&"--".to_string())
-            && argv.contains(&"/proc/self/exe".to_string())
-            && argv.contains(&"browser".to_string()),
-            "explicit CMD runs the in-box browser, got {j:?}");
+        assert!(
+            argv.contains(&"--".to_string())
+                && argv.contains(&"/proc/self/exe".to_string())
+                && argv.contains(&"browser".to_string()),
+            "explicit CMD runs the in-box browser, got {j:?}"
+        );
         for flag in ["--spki", "AbC="] {
             assert!(argv.iter().any(|a| a == flag), "missing {flag} in {j:?}");
         }
-        assert_eq!(argv.last().map(String::as_str), Some("https://example.com"),
-            "validated URL last, got {j:?}");
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("https://example.com"),
+            "validated URL last, got {j:?}"
+        );
         // Blank URL falls back to about:blank, never a dud "https://".
         let argv = build_launch(
-            &LaunchTarget::Browser { url: "  ".into(), spki: None }, &how);
-        assert!(!argv.iter().any(|a| a.contains("spki")), "no empty spki flag");
+            &LaunchTarget::Browser {
+                url: "  ".into(),
+                spki: None,
+            },
+            &how,
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("spki")),
+            "no empty spki flag"
+        );
         assert_eq!(argv.last().map(String::as_str), Some("about:blank"));
     }
 
@@ -15021,15 +18841,27 @@ mod tests {
     fn build_launch_honors_net_and_env_for_every_target() {
         // net is spliced identically; env (-e) only where a box run accepts
         // it (`sarun run`), never on oci run / host shell.
-        let h = How { net: "host".into(), env: true, placement: Placement::New,
-                      webcap: false, webfilter: false, replay: None };
-        assert_eq!(build_launch(&LaunchTarget::Shell, &h),
-            vec!["sarun", "run", "-b", "--net", "host", "-e", "--"]);
-        assert_eq!(build_launch(&LaunchTarget::Command(vec!["make".into()]), &h),
-            vec!["sarun", "run", "-b", "--net", "host", "-e", "--", "make"]);
+        let h = How {
+            net: "host".into(),
+            env: true,
+            placement: Placement::New,
+            webcap: false,
+            webfilter: false,
+            replay: None,
+        };
+        assert_eq!(
+            build_launch(&LaunchTarget::Shell, &h),
+            vec!["sarun", "run", "-b", "--net", "host", "-e", "--"]
+        );
+        assert_eq!(
+            build_launch(&LaunchTarget::Command(vec!["make".into()]), &h),
+            vec!["sarun", "run", "-b", "--net", "host", "-e", "--", "make"]
+        );
         // oci run: net honored, -e never added (it has no such flag).
-        assert_eq!(build_launch(&LaunchTarget::Image("alpine:3.20".into()), &h),
-            vec!["sarun", "oci", "run", "--net", "host", "alpine:3.20"]);
+        assert_eq!(
+            build_launch(&LaunchTarget::Image("alpine:3.20".into()), &h),
+            vec!["sarun", "oci", "run", "--net", "host", "alpine:3.20"]
+        );
         // host shell: the one un-boxed target — no flags at all.
         let hs = build_launch(&LaunchTarget::HostShell, &h);
         assert_eq!(hs.len(), 1, "host shell is bare, got {hs:?}");
@@ -15041,34 +18873,75 @@ mod tests {
         // upper. On(p): a sub-box parented on p. Same axis, every target.
         let n = |p| how("tap", p);
         // run: Reuse -> bare NAME positional; On -> dotted parent.child.
-        assert_eq!(build_launch(&LaunchTarget::Shell, &n(Placement::New)),
-            vec!["sarun", "run", "-b", "--net", "tap", "--"]);
-        assert_eq!(build_launch(&LaunchTarget::Shell, &n(Placement::Reuse("WORK".into()))),
-            vec!["sarun", "run", "-b", "--net", "tap", "WORK", "--"]);
         assert_eq!(
-            build_launch(&LaunchTarget::Command(vec!["make".into()]),
-                         &n(Placement::On("BUILD".into()))),
-            vec!["sarun", "run", "-b", "--net", "tap", "BUILD.make", "--", "make"]);
+            build_launch(&LaunchTarget::Shell, &n(Placement::New)),
+            vec!["sarun", "run", "-b", "--net", "tap", "--"]
+        );
+        assert_eq!(
+            build_launch(&LaunchTarget::Shell, &n(Placement::Reuse("WORK".into()))),
+            vec!["sarun", "run", "-b", "--net", "tap", "WORK", "--"]
+        );
+        assert_eq!(
+            build_launch(
+                &LaunchTarget::Command(vec!["make".into()]),
+                &n(Placement::On("BUILD".into()))
+            ),
+            vec![
+                "sarun",
+                "run",
+                "-b",
+                "--net",
+                "tap",
+                "BUILD.make",
+                "--",
+                "make"
+            ]
+        );
         // oci run: Reuse -> --name; On degrades to New (an image can't be
         // parented elsewhere).
         assert_eq!(
-            build_launch(&LaunchTarget::Image("alpine".into()),
-                         &n(Placement::Reuse("A".into()))),
-            vec!["sarun", "oci", "run", "--net", "tap", "--name", "A", "alpine"]);
+            build_launch(
+                &LaunchTarget::Image("alpine".into()),
+                &n(Placement::Reuse("A".into()))
+            ),
+            vec![
+                "sarun", "oci", "run", "--net", "tap", "--name", "A", "alpine"
+            ]
+        );
         assert_eq!(
-            build_launch(&LaunchTarget::Image("alpine".into()),
-                         &n(Placement::On("X".into()))),
-            vec!["sarun", "oci", "run", "--net", "tap", "alpine"]);
+            build_launch(
+                &LaunchTarget::Image("alpine".into()),
+                &n(Placement::On("X".into()))
+            ),
+            vec!["sarun", "oci", "run", "--net", "tap", "alpine"]
+        );
     }
 
     #[test]
     fn build_launch_ai_on_box_is_the_agent_natural_placement() {
         // The agent's On(box) is oaita's own --on; the session is derived
         // from the box so re-running continues the same conversation.
-        let argv = build_launch(&LaunchTarget::Ai { task: "fix the bug".into() },
-            &how("host", Placement::On("WORK".into())));
-        assert_eq!(argv, vec!["sarun", "oaita", "run", "--on", "WORK",
-            "--net", "host", "--task", "fix the bug", "workagent"]);
+        let argv = build_launch(
+            &LaunchTarget::Ai {
+                task: "fix the bug".into(),
+            },
+            &how("host", Placement::On("WORK".into())),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "sarun",
+                "oaita",
+                "run",
+                "--on",
+                "WORK",
+                "--net",
+                "host",
+                "--task",
+                "fix the bug",
+                "workagent"
+            ]
+        );
     }
 
     #[test]
@@ -15077,24 +18950,47 @@ mod tests {
         // are inverses for the commands build_launch emits, incl. an arg with
         // spaces.
         for argv in [
-            build_launch(&LaunchTarget::Browser { url: "https://x.test".into(),
-                                                  spki: Some("A=".into()) },
-                         &how("tap", Placement::New)),
-            vec!["sarun".into(), "run".into(), "-b".into(), "--".into(),
-                 "echo".into(), "a b".into()],
+            build_launch(
+                &LaunchTarget::Browser {
+                    url: "https://x.test".into(),
+                    spki: Some("A=".into()),
+                },
+                &how("tap", Placement::New),
+            ),
+            vec![
+                "sarun".into(),
+                "run".into(),
+                "-b".into(),
+                "--".into(),
+                "echo".into(),
+                "a b".into(),
+            ],
         ] {
-            assert_eq!(shell_split(&shell_join(&argv)), argv,
-                "join/split roundtrip failed for {argv:?}");
+            assert_eq!(
+                shell_split(&shell_join(&argv)),
+                argv,
+                "join/split roundtrip failed for {argv:?}"
+            );
         }
     }
 
     #[test]
     fn mouse_translates_grid_local_and_rejects_outside() {
-        use crossterm::event::{MouseButton as CB, MouseEvent as CM,
-                               MouseEventKind as CK, KeyModifiers as KM};
-        let grid = Rect { x: 10, y: 2, width: 20, height: 10 };
-        let ev = |col, row, kind| CM { kind, column: col, row,
-                                       modifiers: KM::empty() };
+        use crossterm::event::{
+            KeyModifiers as KM, MouseButton as CB, MouseEvent as CM, MouseEventKind as CK,
+        };
+        let grid = Rect {
+            x: 10,
+            y: 2,
+            width: 20,
+            height: 10,
+        };
+        let ev = |col, row, kind| CM {
+            kind,
+            column: col,
+            row,
+            modifiers: KM::empty(),
+        };
         // Inside: coords become 0-based grid-local.
         let p = mouse_to_pty_event(ev(10, 2, CK::Down(CB::Left)), grid)
             .expect("top-left corner is inside");
@@ -15104,8 +19000,10 @@ mod tests {
         assert_eq!((p.x, p.y), (19, 9));
         // Outside on every edge: swallowed, never forwarded.
         for (c, r) in [(9, 5), (30, 5), (15, 1), (15, 12)] {
-            assert!(mouse_to_pty_event(ev(c, r, CK::Moved), grid).is_none(),
-                    "({c},{r}) is outside the grid");
+            assert!(
+                mouse_to_pty_event(ev(c, r, CK::Moved), grid).is_none(),
+                "({c},{r}) is outside the grid"
+            );
         }
         // Wheel maps to the emulator convention: Press + WheelUp/Down.
         use tattoy_wezterm_term::input::{MouseButton, MouseEventKind};
@@ -15116,30 +19014,42 @@ mod tests {
     #[test]
     fn pty_default_cmd_is_configurable_not_enforced() {
         // A saved "login command" in the config wins …
-        let tmp = std::env::temp_dir()
-            .join(format!("sarun-ptycfg-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sarun-ptycfg-{}", std::process::id()));
         let cfgdir = tmp.join("slopbox.PTYCFG");
         std::fs::create_dir_all(&cfgdir).unwrap();
-        std::fs::write(cfgdir.join("pty_command"),
-                       "# comment\n\nsarun run -b -- make\n").unwrap();
+        std::fs::write(
+            cfgdir.join("pty_command"),
+            "# comment\n\nsarun run -b -- make\n",
+        )
+        .unwrap();
         let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         let prev_ns = std::env::var("SLOPBOX_NS").ok();
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", &tmp);
             std::env::set_var("SLOPBOX_NS", "PTYCFG");
         }
-        assert_eq!(pty_command_configured().as_deref(), Some("sarun run -b -- make"),
-                   "configured login command must be used verbatim");
+        assert_eq!(
+            pty_command_configured().as_deref(),
+            Some("sarun run -b -- make"),
+            "configured login command must be used verbatim"
+        );
         // … and with no config there is None, so the Custom entry falls back
         // to the unified build_launch box-shell template (asserted separately).
         std::fs::remove_file(cfgdir.join("pty_command")).unwrap();
-        assert_eq!(pty_command_configured(), None,
-                   "no config → None → unified template prefill");
+        assert_eq!(
+            pty_command_configured(),
+            None,
+            "no config → None → unified template prefill"
+        );
         unsafe {
-            match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                             None => std::env::remove_var("XDG_CONFIG_HOME") }
-            match prev_ns { Some(v) => std::env::set_var("SLOPBOX_NS", v),
-                            None => std::env::remove_var("SLOPBOX_NS") }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_ns {
+                Some(v) => std::env::set_var("SLOPBOX_NS", v),
+                None => std::env::remove_var("SLOPBOX_NS"),
+            }
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -15178,7 +19088,11 @@ mod tests {
         use std::sync::atomic::AtomicU64;
         use std::sync::atomic::Ordering;
         static N: AtomicU64 = AtomicU64::new(0);
-        let ns = format!("uit{}_{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst));
+        let ns = format!(
+            "uit{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        );
         let tmp = std::env::temp_dir().join(format!("sarun-ui-{ns}"));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).ok()?;
@@ -15264,9 +19178,15 @@ mod tests {
         // Single-list-per-view layout: the boxes view shows the sessions
         // list (left) + box detail (right). No changes/diff pane until the
         // user navigates to those views via c/Enter.
-        assert!(buf.contains(&sid), "frame should contain box id {sid}; got:\n{buf}");
+        assert!(
+            buf.contains(&sid),
+            "frame should contain box id {sid}; got:\n{buf}"
+        );
         assert!(buf.contains("boxes"), "sessions pane title missing");
-        assert!(buf.contains("BOX · DETAIL"), "box-detail pane title missing");
+        assert!(
+            buf.contains("BOX · DETAIL"),
+            "box-detail pane title missing"
+        );
     }
 
     #[test]
@@ -15296,8 +19216,10 @@ mod tests {
         // Kind is shown as the prototype's single-char glyph. With per-row
         // decoration now wired up, a newly-written file renders as '+'
         // (created); a modified one would be '~'.
-        assert!(buf.contains('+') || buf.contains('~'),
-                "kind glyph (+ / ~) missing:\n{buf}");
+        assert!(
+            buf.contains('+') || buf.contains('~'),
+            "kind glyph (+ / ~) missing:\n{buf}"
+        );
         // the 19-byte write's size must show in the pane.
         assert!(buf.contains("19"), "size column missing:\n{buf}");
     }
@@ -15348,7 +19270,11 @@ mod tests {
         };
         assert!(present(&app), "change should be present before discard");
         app.discard();
-        assert!(!present(&app), "change should be gone after discard; status={}", app.status);
+        assert!(
+            !present(&app),
+            "change should be gone after discard; status={}",
+            app.status
+        );
     }
 
     /// `x` (discard one change) is a PROPER DISSOLVE of that change, not a
@@ -15379,7 +19305,10 @@ mod tests {
         // Discard the change in the PARENT (its only change).
         let d = rpc(&eng.sock, "review.discard", json!([psid])).expect("discard");
         assert!(
-            d.get("discarded").and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false),
+            d.get("discarded")
+                .and_then(Value::as_array)
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
             "the change was discarded: {d}"
         );
 
@@ -15414,24 +19343,43 @@ mod tests {
         std::fs::write(root.join("home/notes.txt"), b"n").expect("w2");
 
         let r = rpc(&eng.sock, "review.file_groups", json!([sid])).expect("file_groups");
-        let groups = r.get("groups").and_then(Value::as_array).expect("groups array");
+        let groups = r
+            .get("groups")
+            .and_then(Value::as_array)
+            .expect("groups array");
         let bs = groups
             .iter()
             .find(|g| g.get("name").and_then(Value::as_str) == Some("browser session"))
             .expect("browser session group present");
-        let paths: Vec<&str> = bs.get("paths").and_then(Value::as_array).unwrap()
-            .iter().filter_map(Value::as_str).collect();
+        let paths: Vec<&str> = bs
+            .get("paths")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
         // Selects everything under the profile (the Cookies file, plus the
         // mkdir'd dirs it lives in) …
-        assert!(paths.iter().any(|p| p.contains("cellulose-profile/Default/Cookies")),
-                "selects the profile file: {paths:?}");
-        assert!(paths.iter().all(|p| p.starts_with("cellulose-profile")),
-                "selects ONLY profile paths: {paths:?}");
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.contains("cellulose-profile/Default/Cookies")),
+            "selects the profile file: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| p.starts_with("cellulose-profile")),
+            "selects ONLY profile paths: {paths:?}"
+        );
         // … and NOT the unrelated change.
-        assert!(!paths.iter().any(|p| p.contains("notes.txt")),
-                "does NOT select the unrelated file: {paths:?}");
-        assert_eq!(bs.get("count").and_then(Value::as_i64), Some(paths.len() as i64),
-                   "count matches the selected paths: {bs}");
+        assert!(
+            !paths.iter().any(|p| p.contains("notes.txt")),
+            "does NOT select the unrelated file: {paths:?}"
+        );
+        assert_eq!(
+            bs.get("count").and_then(Value::as_i64),
+            Some(paths.len() as i64),
+            "count matches the selected paths: {bs}"
+        );
     }
 
     /// The apply/discard picker offers "All" plus each matching file-group —
@@ -15449,14 +19397,22 @@ mod tests {
         let mut app = App::new(eng.sock.clone());
         app.refresh_sessions();
         let opened = app.open_file_group_pick(false);
-        assert!(opened, "picker should open (box has changes); status={}", app.status);
+        assert!(
+            opened,
+            "picker should open (box has changes); status={}",
+            app.status
+        );
         match &app.modal {
             Some(Modal::FileGroupPick { rows, .. }) => {
                 let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
-                assert!(labels.iter().any(|l| l.starts_with("All")),
-                        "offers All: {labels:?}");
-                assert!(labels.iter().any(|l| l.contains("browser session")),
-                        "offers the browser session group: {labels:?}");
+                assert!(
+                    labels.iter().any(|l| l.starts_with("All")),
+                    "offers All: {labels:?}"
+                );
+                assert!(
+                    labels.iter().any(|l| l.contains("browser session")),
+                    "offers the browser session group: {labels:?}"
+                );
             }
             Some(_) => panic!("wrong modal opened; status={}", app.status),
             None => panic!("no picker modal opened; status={}", app.status),
@@ -15481,24 +19437,41 @@ mod tests {
         std::fs::write(broot.join("bfile.txt"), b"B").expect("wb");
 
         let res = rpc(&eng.sock, "apply_to_copy", json!([bsid])).expect("apply_to_copy");
-        let new_sid = res.get("new_sid").and_then(Value::as_str)
-            .expect(&format!("new_sid in {res}")).to_string();
+        let new_sid = res
+            .get("new_sid")
+            .and_then(Value::as_str)
+            .expect(&format!("new_sid in {res}"))
+            .to_string();
 
         let paths = |sid: &str| -> Vec<String> {
-            rpc(&eng.sock, "review.session_changes", json!([sid])).unwrap()
-                .as_array().unwrap().iter()
+            rpc(&eng.sock, "review.session_changes", json!([sid]))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
                 .filter_map(|c| c.get("path").and_then(Value::as_str).map(String::from))
                 .collect()
         };
         // The COPY holds BOTH the parent's change and the child's.
         let copy = paths(&new_sid);
-        assert!(copy.iter().any(|p| p.contains("pfile.txt")), "copy has parent change: {copy:?}");
-        assert!(copy.iter().any(|p| p.contains("bfile.txt")), "copy has child change: {copy:?}");
+        assert!(
+            copy.iter().any(|p| p.contains("pfile.txt")),
+            "copy has parent change: {copy:?}"
+        );
+        assert!(
+            copy.iter().any(|p| p.contains("bfile.txt")),
+            "copy has child change: {copy:?}"
+        );
         // The real PARENT is untouched — its own change only, NOT the child's.
         let par = paths(&psid);
-        assert!(par.iter().any(|p| p.contains("pfile.txt")), "parent keeps its change: {par:?}");
-        assert!(!par.iter().any(|p| p.contains("bfile.txt")),
-                "parent must NOT gain the child's change: {par:?}");
+        assert!(
+            par.iter().any(|p| p.contains("pfile.txt")),
+            "parent keeps its change: {par:?}"
+        );
+        assert!(
+            !par.iter().any(|p| p.contains("bfile.txt")),
+            "parent must NOT gain the child's change: {par:?}"
+        );
     }
 
     #[test]
@@ -15510,7 +19483,10 @@ mod tests {
         // a verb a parallel agent may still be adding — must NOT panic, just Err.
         let r = rpc(&eng.sock, "apply_hunk", json!(["1", "x", 0]));
         assert!(r.is_err(), "unknown verb should be an Err, not a crash");
-        assert!(r.unwrap_err().contains("unknown verb"), "error should name the unknown verb");
+        assert!(
+            r.unwrap_err().contains("unknown verb"),
+            "error should name the unknown verb"
+        );
     }
 
     #[test]
@@ -15536,7 +19512,10 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert!(saw_pong, "expected a 'pong' live event on the subscribe feed");
+        assert!(
+            saw_pong,
+            "expected a 'pong' live event on the subscribe feed"
+        );
 
         // A fresh box registration should ALSO broadcast — this was
         // missing for a long time (engine sent session_removed and
@@ -15547,7 +19526,8 @@ mod tests {
         for _ in 0..10 {
             if let Ok(ev) = rx.recv_timeout(Duration::from_secs(2)) {
                 if ev.get("type").and_then(Value::as_str) == Some("session_added")
-                   && ev.get("sid").and_then(Value::as_str) == Some(sid.as_str()) {
+                    && ev.get("sid").and_then(Value::as_str) == Some(sid.as_str())
+                {
                     saw_added = true;
                     break;
                 }
@@ -15595,7 +19575,10 @@ mod tests {
             "apply status should report success; got {}",
             app.status
         );
-        assert!(host_path.exists(), "applied file should materialize on host at {host_path:?}");
+        assert!(
+            host_path.exists(),
+            "applied file should materialize on host at {host_path:?}"
+        );
         let _ = std::fs::remove_file(&host_path);
     }
 
@@ -15618,10 +19601,16 @@ mod tests {
             app.load_processes();
             !app.processes.is_empty()
         });
-        assert!(idx.is_some(), "expected at least one box with captured processes");
+        assert!(
+            idx.is_some(),
+            "expected at least one box with captured processes"
+        );
         app.focus = Pane::Processes;
         let buf = render_to_string(&app, 160, 40).unwrap();
-        assert!(buf.contains("PROCESSES"), "processes pane title missing:\n{buf}");
+        assert!(
+            buf.contains("PROCESSES"),
+            "processes pane title missing:\n{buf}"
+        );
         // the real exe of the command we ran must appear.
         assert!(
             buf.contains("echo"),
@@ -15649,9 +19638,15 @@ mod tests {
         let found = (0..app.sessions.len()).any(|i| {
             app.sel_session = i;
             app.load_outputs();
-            app.output_segs.iter().any(|(_, _, t)| t.contains("OUTPUT_MARKER_qqq"))
+            app.output_segs
+                .iter()
+                .any(|(_, _, t)| t.contains("OUTPUT_MARKER_qqq"))
         });
-        assert!(found, "expected the echoed bytes in some box's outputs; status={}", app.status);
+        assert!(
+            found,
+            "expected the echoed bytes in some box's outputs; status={}",
+            app.status
+        );
         app.focus = Pane::Outputs;
         let buf = render_to_string(&app, 160, 40).unwrap();
         assert!(buf.contains("OUTPUT"), "outputs pane title missing:\n{buf}");
@@ -15693,29 +19688,35 @@ mod tests {
                 "method": "", "uri": "", "status": "200",
             }),
         ];
-        app.sel_flow = 1;  // the GET request row
+        app.sel_flow = 1; // the GET request row
         app.flow_detail = "Frame 12: 480 bytes on wire\n\
                             Transmission Control Protocol\n\
                             Hypertext Transfer Protocol\n    \
                             GET / HTTP/1.1\n    \
-                            Host: example.com\n".into();
+                            Host: example.com\n"
+            .into();
         app.flow_detail_frame = 12;
         let buf = render_to_string(&app, 160, 30).unwrap();
         // The LEFT column shows the request-marker R, the host, method,
         // and status code mark — all three rows must appear in this
         // 30-row terminal.
-        assert!(buf.contains("FLOWS"),
-                "flows pane title missing:\n{buf}");
-        assert!(buf.contains("example.com"),
-                "host/SNI didn't render:\n{buf}");
+        assert!(buf.contains("FLOWS"), "flows pane title missing:\n{buf}");
+        assert!(
+            buf.contains("example.com"),
+            "host/SNI didn't render:\n{buf}"
+        );
         assert!(buf.contains("GET"), "method didn't render:\n{buf}");
         assert!(buf.contains("200"), "status didn't render:\n{buf}");
         // The RIGHT column shows the tshark -V dissection of the
         // selected GET frame.
-        assert!(buf.contains("FLOW") && buf.contains("DETAIL"),
-                "flow detail pane title missing:\n{buf}");
-        assert!(buf.contains("GET / HTTP/1.1"),
-                "tshark dissection didn't render in the right pane:\n{buf}");
+        assert!(
+            buf.contains("FLOW") && buf.contains("DETAIL"),
+            "flow detail pane title missing:\n{buf}"
+        );
+        assert!(
+            buf.contains("GET / HTTP/1.1"),
+            "tshark dissection didn't render in the right pane:\n{buf}"
+        );
     }
 
     /// Packet drill-down render: synthetic packet rows + a fake -V
@@ -15751,21 +19752,31 @@ mod tests {
         app.packet_detail = "Frame 12: 480 bytes on wire\n\
                               Hypertext Transfer Protocol\n    \
                               GET / HTTP/1.1\n    \
-                              Host: example.com\n".into();
+                              Host: example.com\n"
+            .into();
         app.packet_detail_frame = 12;
         let buf = render_to_string(&app, 200, 30).unwrap();
-        assert!(buf.contains("PACKETS"),
-                "packets pane title missing:\n{buf}");
-        assert!(buf.contains("stream 0"),
-                "stream id missing from title:\n{buf}");
-        assert!(buf.contains("Client Hello"),
-                "TLS Client Hello row missing:\n{buf}");
-        assert!(buf.contains("GET /"),
-                "HTTP info missing:\n{buf}");
-        assert!(buf.contains("PACKET") && buf.contains("DETAIL"),
-                "packet detail title missing:\n{buf}");
-        assert!(buf.contains("Host: example.com"),
-                "tshark dissection didn't render in the right pane:\n{buf}");
+        assert!(
+            buf.contains("PACKETS"),
+            "packets pane title missing:\n{buf}"
+        );
+        assert!(
+            buf.contains("stream 0"),
+            "stream id missing from title:\n{buf}"
+        );
+        assert!(
+            buf.contains("Client Hello"),
+            "TLS Client Hello row missing:\n{buf}"
+        );
+        assert!(buf.contains("GET /"), "HTTP info missing:\n{buf}");
+        assert!(
+            buf.contains("PACKET") && buf.contains("DETAIL"),
+            "packet detail title missing:\n{buf}"
+        );
+        assert!(
+            buf.contains("Host: example.com"),
+            "tshark dissection didn't render in the right pane:\n{buf}"
+        );
     }
 
     /// Pane transitions for the drill-down: open_packets sets focus
@@ -15793,8 +19804,11 @@ mod tests {
             "stream": 7,
         })];
         app.sel_flow = 0;
-        app.open_packets();   // rpc will fail; we just want the focus shift
-        assert!(matches!(app.focus, Pane::Packets), "focus should be Packets");
+        app.open_packets(); // rpc will fail; we just want the focus shift
+        assert!(
+            matches!(app.focus, Pane::Packets),
+            "focus should be Packets"
+        );
         assert_eq!(app.packets_stream, 7);
         app.close_packets();
         assert!(matches!(app.focus, Pane::Flows), "focus should be Flows");
@@ -15813,8 +19827,10 @@ mod tests {
         let mut app = App::new(eng.sock.clone());
         // No prompt: regular status bar (which has app.status text).
         let plain = render_to_string(&app, 160, 30).unwrap();
-        assert!(!plain.contains("[y]es once"),
-                "no banner should be visible without a pending prompt");
+        assert!(
+            !plain.contains("[y]es once"),
+            "no banner should be visible without a pending prompt"
+        );
         // Inject a pending prompt; the banner should render at the
         // bottom row with all four key labels.
         app.pending_prompt = Some(serde_json::json!({
@@ -15822,13 +19838,21 @@ mod tests {
             "host": "tracker.example", "port": 443, "scheme": "https",
         }));
         let buf = render_to_string(&app, 160, 30).unwrap();
-        assert!(buf.contains("[BOX3]"),
-                "box name missing from banner:\n{buf}");
-        assert!(buf.contains("tracker.example:443"),
-                "host:port missing from banner:\n{buf}");
-        assert!(buf.contains("[y]es once") && buf.contains("[n]o once")
-                && buf.contains("[a]llow+save") && buf.contains("[d]eny+save"),
-                "all four verdicts must label-into the banner:\n{buf}");
+        assert!(
+            buf.contains("[BOX3]"),
+            "box name missing from banner:\n{buf}"
+        );
+        assert!(
+            buf.contains("tracker.example:443"),
+            "host:port missing from banner:\n{buf}"
+        );
+        assert!(
+            buf.contains("[y]es once")
+                && buf.contains("[n]o once")
+                && buf.contains("[a]llow+save")
+                && buf.contains("[d]eny+save"),
+            "all four verdicts must label-into the banner:\n{buf}"
+        );
     }
 
     /// Flows pane keyboard nav: j/k moves the cursor (with detail
@@ -15842,21 +19866,33 @@ mod tests {
         };
         let mut app = App::new(eng.sock.clone());
         app.focus = Pane::Flows;
-        app.flows = (0..5).map(|i| serde_json::json!({
-            "frame": (i + 1) as u64, "t": 0.0,
-            "src": "240.1.0.2", "dst": "240.1.1.0",
-            "sni": "", "host": format!("h{i}.example"),
-            "method": "GET", "uri": "/", "status": "",
-        })).collect();
-        for _ in 0..10 { app.move_down(); }       // overshoot
-        assert_eq!(app.sel_flow, app.flows.len() - 1,
-                   "down should clamp at len-1");
-        for _ in 0..10 { app.move_up(); }         // overshoot back
+        app.flows = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "frame": (i + 1) as u64, "t": 0.0,
+                    "src": "240.1.0.2", "dst": "240.1.1.0",
+                    "sni": "", "host": format!("h{i}.example"),
+                    "method": "GET", "uri": "/", "status": "",
+                })
+            })
+            .collect();
+        for _ in 0..10 {
+            app.move_down();
+        } // overshoot
+        assert_eq!(
+            app.sel_flow,
+            app.flows.len() - 1,
+            "down should clamp at len-1"
+        );
+        for _ in 0..10 {
+            app.move_up();
+        } // overshoot back
         assert_eq!(app.sel_flow, 0, "up should clamp at 0");
         // Empty list: cursor stays at 0 and nothing panics.
         app.flows.clear();
         app.sel_flow = 0;
-        app.move_down(); app.move_up();
+        app.move_down();
+        app.move_up();
         assert_eq!(app.sel_flow, 0);
     }
 
@@ -15891,7 +19927,10 @@ mod tests {
         );
         // ...and the rules pane must render it.
         let buf = render_to_string(&app, 160, 40).unwrap();
-        assert!(buf.contains("FILE RULES"), "rules pane title missing:\n{buf}");
+        assert!(
+            buf.contains("FILE RULES"),
+            "rules pane title missing:\n{buf}"
+        );
         assert!(
             buf.contains("RULEMARKER_log"),
             "rules pane should show the added rule; got:\n{buf}"
@@ -15901,12 +19940,21 @@ mod tests {
         app.sel_rule = 0;
         app.commit_rule("apply src/**".into(), Some(0));
         let edited = std::fs::read_to_string(app.rules_path()).unwrap_or_default();
-        assert!(edited.contains("apply src/**"), "edit should replace the rule: {edited:?}");
-        assert!(!edited.contains("RULEMARKER_log"), "old rule should be gone: {edited:?}");
+        assert!(
+            edited.contains("apply src/**"),
+            "edit should replace the rule: {edited:?}"
+        );
+        assert!(
+            !edited.contains("RULEMARKER_log"),
+            "old rule should be gone: {edited:?}"
+        );
         app.sel_rule = 0;
         app.delete_rule();
         let after = std::fs::read_to_string(app.rules_path()).unwrap_or_default();
-        assert!(after.trim().is_empty(), "delete should empty the file: {after:?}");
+        assert!(
+            after.trim().is_empty(),
+            "delete should empty the file: {after:?}"
+        );
     }
 
     #[test]
@@ -15924,16 +19972,23 @@ mod tests {
             action: ConfirmAction::Dissolve,
         });
         let buf = render_to_string(&app, 100, 30).unwrap();
-        assert!(buf.contains("confirm"), "confirm modal title missing:\n{buf}");
+        assert!(
+            buf.contains("confirm"),
+            "confirm modal title missing:\n{buf}"
+        );
         assert!(buf.contains("Delete?"), "confirm prompt missing:\n{buf}");
         assert!(
-            app.sessions.iter().any(|s| s.get("session_id").and_then(Value::as_str) == Some(&sid)),
+            app.sessions
+                .iter()
+                .any(|s| s.get("session_id").and_then(Value::as_str) == Some(&sid)),
             "box should still exist while only the modal is open"
         );
         // running the guarded action actually deletes it.
         app.run_confirm(ConfirmAction::Dissolve);
         assert!(
-            !app.sessions.iter().any(|s| s.get("session_id").and_then(Value::as_str) == Some(&sid)),
+            !app.sessions
+                .iter()
+                .any(|s| s.get("session_id").and_then(Value::as_str) == Some(&sid)),
             "box should be gone after the confirmed delete; status={}",
             app.status
         );
@@ -15960,22 +20015,37 @@ mod tests {
         let total = app.processes.len();
         // a typed exe-clause that matches nothing hides every row.
         let bogus = vec![ClauseRow {
-            enabled: true, join: Join::And, negate: false,
-            kind: "exe".into(), pattern: "NO_SUCH_PROC_zzzz".into(),
+            enabled: true,
+            join: Join::And,
+            negate: false,
+            kind: "exe".into(),
+            pattern: "NO_SUCH_PROC_zzzz".into(),
         }];
         app.commit_filter(FilterView::Procs, &bogus);
-        assert!(app.visible_processes().is_empty(), "bogus exe clause should hide all rows");
+        assert!(
+            app.visible_processes().is_empty(),
+            "bogus exe clause should hide all rows"
+        );
         // an exe clause on '**/echo' keeps the echo row.
         let keep = vec![ClauseRow {
-            enabled: true, join: Join::And, negate: false,
-            kind: "exe".into(), pattern: "**/echo".into(),
+            enabled: true,
+            join: Join::And,
+            negate: false,
+            kind: "exe".into(),
+            pattern: "**/echo".into(),
         }];
         app.commit_filter(FilterView::Procs, &keep);
         let vis = app.visible_processes();
-        assert!(!vis.is_empty() && vis.len() <= total, "exe clause should keep ≥1, ≤all rows");
+        assert!(
+            !vis.is_empty() && vis.len() <= total,
+            "exe clause should keep ≥1, ≤all rows"
+        );
         app.focus = Pane::Processes;
         let buf = render_to_string(&app, 160, 40).unwrap();
-        assert!(buf.contains("echo"), "filtered processes pane should still show echo:\n{buf}");
+        assert!(
+            buf.contains("echo"),
+            "filtered processes pane should still show echo:\n{buf}"
+        );
         // Filtering now happens server-side (engine's views::rebuild_idx
         // runs the same rules::eval_clauses); the cross-check that the UI's
         // filtered output matches an in-process eval_clauses was for the
@@ -15991,8 +20061,14 @@ mod tests {
             return;
         };
         // a 3-level chain: sh -> sh -c (parent) -> a grandchild marker process.
-        if !run_cmd(&eng, &["/bin/sh", "-c",
-            "/bin/sh -c '/bin/sleep 0.05; /bin/echo TREEKID_marker'"]) {
+        if !run_cmd(
+            &eng,
+            &[
+                "/bin/sh",
+                "-c",
+                "/bin/sh -c '/bin/sleep 0.05; /bin/echo TREEKID_marker'",
+            ],
+        ) {
             eprintln!("SKIP: could not run a box command");
             return;
         }
@@ -16006,22 +20082,32 @@ mod tests {
         assert!(ok, "expected a box with a multi-process tree");
         let rows = app.proc_tree_rows();
         // there must be at least one row at depth>0 (a child indented under a parent).
-        assert!(rows.iter().any(|r| r.depth > 0),
-                "proc tree should have an indented child; rows depths: {:?}",
-                rows.iter().map(|r| r.depth).collect::<Vec<_>>());
+        assert!(
+            rows.iter().any(|r| r.depth > 0),
+            "proc tree should have an indented child; rows depths: {:?}",
+            rows.iter().map(|r| r.depth).collect::<Vec<_>>()
+        );
         // a parent must appear before its deeper child in DFS order.
         let first_deep = rows.iter().position(|r| r.depth > 0).unwrap();
-        assert!(rows[..first_deep].iter().any(|r| r.depth == 0),
-                "a depth-0 ancestor must precede the first deep row");
+        assert!(
+            rows[..first_deep].iter().any(|r| r.depth == 0),
+            "a depth-0 ancestor must precede the first deep row"
+        );
         app.focus = Pane::Processes;
         let buf = render_to_string(&app, 160, 40).unwrap();
         // the rendered grid must show indentation (leading spaces before an exe).
-        assert!(buf.lines().any(|l| {
-            let t = l.trim_start_matches(|c: char| c.is_ascii_digit() || c == ' ');
-            // a deeper row has MORE leading spaces in the EXE column than a root.
-            l.contains("sh") && l.matches("  ").count() >= 2 && !t.is_empty()
-        }), "rendered tree should show indented rows:\n{buf}");
-        assert!(buf.contains("sh"), "tree should show the sh processes:\n{buf}");
+        assert!(
+            buf.lines().any(|l| {
+                let t = l.trim_start_matches(|c: char| c.is_ascii_digit() || c == ' ');
+                // a deeper row has MORE leading spaces in the EXE column than a root.
+                l.contains("sh") && l.matches("  ").count() >= 2 && !t.is_empty()
+            }),
+            "rendered tree should show indented rows:\n{buf}"
+        );
+        assert!(
+            buf.contains("sh"),
+            "tree should show the sh processes:\n{buf}"
+        );
     }
 
     /// changes→procs navigation installs a GENERATED ids filter pinning the procs
@@ -16038,7 +20124,10 @@ mod tests {
         let (_sid0, root) = make_box(&eng.sock);
         std::fs::write(root.join("tmp").join("navids_seed.txt"), b"seed\n").ok();
         // a real box command that writes a file (its captured proc is the writer).
-        if !run_cmd(&eng, &["/bin/cp", "/bin/echo", "/tmp/navids_marker_file.txt"]) {
+        if !run_cmd(
+            &eng,
+            &["/bin/cp", "/bin/echo", "/tmp/navids_marker_file.txt"],
+        ) {
             eprintln!("SKIP: could not run a box command");
             return;
         }
@@ -16049,7 +20138,9 @@ mod tests {
         for i in 0..app.sessions.len() {
             app.sel_session = i;
             app.load_changes();
-            if app.processes.is_empty() { continue; }
+            if app.processes.is_empty() {
+                continue;
+            }
             let sid = app.cur_sid().unwrap();
             let vc = app.visible_changes();
             if let Some(ci) = vc.iter().position(|c| {
@@ -16071,32 +20162,47 @@ mod tests {
         let sid = app.cur_sid().unwrap();
         let rel = app.cur_change_path().unwrap();
         let expect_ids = app.change_writer_ids(&sid, &rel);
-        assert!(!expect_ids.is_empty(), "the written file must have a recorded writer");
+        assert!(
+            !expect_ids.is_empty(),
+            "the written file must have a recorded writer"
+        );
 
         // changes→procs nav: a generated ids filter must appear on procs.
         app.nav(Pane::Processes);
         assert!(app.focus == Pane::Processes);
-        assert!(app.f_procs.on && app.f_procs.generated,
-                "procs pane should carry a generated filter after nav");
+        assert!(
+            app.f_procs.on && app.f_procs.generated,
+            "procs pane should carry a generated filter after nav"
+        );
         // the procs pane must be narrowed to exactly the writer row(s).
         // Engine-side view rows are objects {rid,tgid,ppid,exe,argv,depth,connector}.
-        let vis: Vec<i64> = app.visible_processes().iter().map(|p|
-            p.get("rid").and_then(Value::as_i64).unwrap_or(-1)).collect();
+        let vis: Vec<i64> = app
+            .visible_processes()
+            .iter()
+            .map(|p| p.get("rid").and_then(Value::as_i64).unwrap_or(-1))
+            .collect();
         assert!(!vis.is_empty(), "filtered procs must be non-empty");
         for id in &vis {
-            assert!(expect_ids.contains(id),
-                "procs filter must show only the writer ids {expect_ids:?}, saw {id}");
+            assert!(
+                expect_ids.contains(id),
+                "procs filter must show only the writer ids {expect_ids:?}, saw {id}"
+            );
         }
 
         // esc on the procs pane clears the generated (cross-nav) filter.
         app.focus = Pane::Processes;
         assert!(app.f_procs.generated, "filter still generated before esc");
         app.clear_filter(FilterView::Procs);
-        assert!(!app.f_procs.on && !app.f_procs.generated && app.f_procs.clauses.is_empty(),
-                "esc/clear must drop the generated ids filter entirely");
+        assert!(
+            !app.f_procs.on && !app.f_procs.generated && app.f_procs.clauses.is_empty(),
+            "esc/clear must drop the generated ids filter entirely"
+        );
         // and the procs pane is back to the full set.
-        assert_eq!(app.visible_processes().len(), app.processes.len(),
-                   "cleared filter shows all processes again");
+        assert_eq!(
+            app.visible_processes().len(),
+            app.processes.len(),
+            "cleared filter shows all processes again"
+        );
     }
 
     #[test]
@@ -16105,20 +20211,43 @@ mod tests {
         // eval_clauses would receive them and assert the in-crate engine agrees
         // with the hand-computed boolean fold.
         let exe_clause = Clause {
-            m: Match { kind: "exe".into(), pattern: "**/echo".into() },
-            join: Join::And, negate: false, enabled: true,
+            m: Match {
+                kind: "exe".into(),
+                pattern: "**/echo".into(),
+            },
+            join: Join::And,
+            negate: false,
+            enabled: true,
         };
-        let yes = ProcFilterTarget { row_id: 1, err: false,
-            subject: Subject { box_name: "B".into(), exe: "/bin/echo".into(),
-                               cwd: "/".into(), argv: vec!["echo".into(), "hi".into()] } };
-        let no = ProcFilterTarget { row_id: 2, err: false,
-            subject: Subject { exe: "/bin/cat".into(), ..Default::default() } };
+        let yes = ProcFilterTarget {
+            row_id: 1,
+            err: false,
+            subject: Subject {
+                box_name: "B".into(),
+                exe: "/bin/echo".into(),
+                cwd: "/".into(),
+                argv: vec!["echo".into(), "hi".into()],
+            },
+        };
+        let no = ProcFilterTarget {
+            row_id: 2,
+            err: false,
+            subject: Subject {
+                exe: "/bin/cat".into(),
+                ..Default::default()
+            },
+        };
         assert!(eval_clauses(&yes, std::slice::from_ref(&exe_clause)));
         assert!(!eval_clauses(&no, std::slice::from_ref(&exe_clause)));
         // an ids clause pins to an exact row set (the generated-filter form).
         let ids_clause = Clause {
-            m: Match { kind: "ids".into(), pattern: "1,5".into() },
-            join: Join::And, negate: false, enabled: true,
+            m: Match {
+                kind: "ids".into(),
+                pattern: "1,5".into(),
+            },
+            join: Join::And,
+            negate: false,
+            enabled: true,
         };
         assert!(eval_clauses(&yes, std::slice::from_ref(&ids_clause)));
         assert!(!eval_clauses(&no, std::slice::from_ref(&ids_clause)));
@@ -16130,6 +20259,53 @@ mod tests {
     /// with no live engine.
     fn headless_app() -> App {
         App::bare(String::new())
+    }
+
+    #[test]
+    fn command_modal_styles_exact_command_and_previews_canonical_form() {
+        let spans = command_spans("mirror_run 5").value;
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "mirror_run 5"
+        );
+        assert_eq!(spans[0].style.fg, Some(Color::Cyan));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[2].style.fg, Some(Color::Yellow));
+
+        let mut app = headless_app();
+        app.modal = Some(Modal::Command {
+            buf: "mirror_run 5".into(),
+            completions: vec![],
+            sel: 0,
+        });
+        let rendered = render_to_string(&app, 100, 24).unwrap();
+        assert!(rendered.contains(": mirror_run 5_"), "{rendered}");
+        assert!(rendered.contains("→ mirror run 5"), "{rendered}");
+    }
+
+    #[test]
+    fn command_modal_partial_and_unicode_input_are_safe() {
+        let mut app = headless_app();
+        for input in ["mirror r", "mirror rün", "mirror_run 五", "λ"] {
+            let spans = command_spans(input).value;
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                input
+            );
+            app.modal = Some(Modal::Command {
+                buf: input.into(),
+                completions: vec![],
+                sel: 0,
+            });
+            let rendered = render_to_string(&app, 100, 24).unwrap();
+            assert!(rendered.contains(input), "{input:?} missing from render");
+        }
     }
 
     /// The Pty+ entry point must be a discoverable chooser, not a raw
@@ -16144,7 +20320,10 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.iter().any(|l| l.contains("NEW box")), "{labels:?}");
         assert!(labels.iter().any(|l| l.contains("image")), "{labels:?}");
-        assert!(labels.iter().any(|l| l.contains("Host shell")), "{labels:?}");
+        assert!(
+            labels.iter().any(|l| l.contains("Host shell")),
+            "{labels:?}"
+        );
         assert!(labels.iter().any(|l| l.contains("Custom")), "{labels:?}");
         // Render: the choices AND the option chips must be visible.
         let buf = render_to_string(&app, 100, 30).unwrap();
@@ -16168,19 +20347,30 @@ mod tests {
         assert_eq!(NET_MODES[app.launch_net], "host");
         assert!(app.launch_env);
         let buf = render_to_string(&app, 100, 30).unwrap();
-        assert!(buf.contains("network: HOST"), "chip must show new mode:\n{buf}");
-        assert!(buf.contains("record env: ON"), "chip must show env on:\n{buf}");
+        assert!(
+            buf.contains("network: HOST"),
+            "chip must show new mode:\n{buf}"
+        );
+        assert!(
+            buf.contains("record env: ON"),
+            "chip must show env on:\n{buf}"
+        );
         // The chips reach the argv through the ONE builder: a box run gets
         // --net + -e; an oci run gets --net (no -e).
-        assert_eq!(build_launch(&LaunchTarget::Shell, &app.how(Placement::New)),
-                   vec!["sarun", "run", "-b", "--net", "host", "-e", "--"]);
-        assert_eq!(build_launch(&LaunchTarget::Image("x".into()),
-                                &app.how(Placement::New)),
-                   vec!["sarun", "oci", "run", "--net", "host", "x"]);
+        assert_eq!(
+            build_launch(&LaunchTarget::Shell, &app.how(Placement::New)),
+            vec!["sarun", "run", "-b", "--net", "host", "-e", "--"]
+        );
+        assert_eq!(
+            build_launch(&LaunchTarget::Image("x".into()), &app.how(Placement::New)),
+            vec!["sarun", "oci", "run", "--net", "host", "x"]
+        );
         // Custom command prefill carries the toggles into the editable line.
         let sel_custom = match &app.modal {
-            Some(Modal::Launcher { items, .. }) =>
-                items.iter().position(|i| i.label.contains("Custom")).unwrap(),
+            Some(Modal::Launcher { items, .. }) => items
+                .iter()
+                .position(|i| i.label.contains("Custom"))
+                .unwrap(),
             _ => unreachable!(),
         };
         if let Some(Modal::Launcher { sel, .. }) = app.modal.as_mut() {
@@ -16212,7 +20402,8 @@ mod tests {
         })];
         open_pty_menu(&mut app);
         let sel_oaita = match &app.modal {
-            Some(Modal::Launcher { items, .. }) => items.iter()
+            Some(Modal::Launcher { items, .. }) => items
+                .iter()
                 .position(|i| i.label.contains("oaita agent session ON box 'WORK'"))
                 .expect("launcher must offer the oaita-on-box entry"),
             _ => panic!("launcher expected"),
@@ -16222,17 +20413,24 @@ mod tests {
         }
         handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
         // Picking it opens a TASK modal (not a broken command prefill).
-        let Some(Modal::OaitaTask { box_name, session, .. }) = &app.modal else {
-            panic!("must open the agent-task modal, got {:?}",
-                   app.modal.is_some());
+        let Some(Modal::OaitaTask {
+            box_name, session, ..
+        }) = &app.modal
+        else {
+            panic!(
+                "must open the agent-task modal, got {:?}",
+                app.modal.is_some()
+            );
         };
         assert_eq!(box_name, "WORK");
         assert_eq!(session, "workagent");
         // Enter with an EMPTY task must NOT launch — it must prompt, and
         // keep the modal open (the old flow ran and errored).
         handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
-        assert!(matches!(app.modal, Some(Modal::OaitaTask { .. })),
-                "empty task must keep the modal open, not launch");
+        assert!(
+            matches!(app.modal, Some(Modal::OaitaTask { .. })),
+            "empty task must keep the modal open, not launch"
+        );
         assert!(app.status.contains("type a task"));
         // Type a multi-word task and submit.
         for c in "fix the bug".chars() {
@@ -16240,18 +20438,36 @@ mod tests {
         }
         // The argv the modal WOULD run (open_pty needs a live engine, so
         // assert the pure builder that feeds it — a complete command).
-        let argv = build_launch(&LaunchTarget::Ai { task: "fix the bug".into() },
-                                &how("host", Placement::On("WORK".into())));
-        assert_eq!(&argv[1..], &["oaita", "run", "--on", "WORK",
-                                 "--net", "host", "--task", "fix the bug",
-                                 "workagent"]);
+        let argv = build_launch(
+            &LaunchTarget::Ai {
+                task: "fix the bug".into(),
+            },
+            &how("host", Placement::On("WORK".into())),
+        );
+        assert_eq!(
+            &argv[1..],
+            &[
+                "oaita",
+                "run",
+                "--on",
+                "WORK",
+                "--net",
+                "host",
+                "--task",
+                "fix the bug",
+                "workagent"
+            ]
+        );
         // task is ONE argv element — spaces need no quoting.
         assert_eq!(argv.iter().filter(|a| a.contains(' ')).count(), 1);
         // the sessions context menu carries the same action
         app.focus = Pane::Sessions;
         let (_, items) = pane_action_menu(&app).unwrap();
-        assert!(items.iter().any(|i|
-            matches!(i.action, Action::OaitaOnSelectedBox)));
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i.action, Action::OaitaOnSelectedBox))
+        );
     }
 
     /// THE bug the user hit: picking "host" (or "off") in the Pty+ chip
@@ -16263,14 +20479,23 @@ mod tests {
         let mut app = headless_app();
         // host chip (index 1)
         app.launch_net = 1;
-        let argv = build_launch(&LaunchTarget::Ai { task: "what os is this?".into() },
-                                &app.how(Placement::On("C1".into())));
-        let i = argv.iter().position(|a| a == "--net").expect("--net present");
+        let argv = build_launch(
+            &LaunchTarget::Ai {
+                task: "what os is this?".into(),
+            },
+            &app.how(Placement::On("C1".into())),
+        );
+        let i = argv
+            .iter()
+            .position(|a| a == "--net")
+            .expect("--net present");
         assert_eq!(argv[i + 1], "host", "host selection must reach the box");
         // off chip (index 2)
         app.launch_net = 2;
-        let argv = build_launch(&LaunchTarget::Ai { task: "x".into() },
-                                &app.how(Placement::On("C1".into())));
+        let argv = build_launch(
+            &LaunchTarget::Ai { task: "x".into() },
+            &app.how(Placement::On("C1".into())),
+        );
         let i = argv.iter().position(|a| a == "--net").unwrap();
         assert_eq!(argv[i + 1], "off", "off selection must reach the box");
     }
@@ -16278,12 +20503,17 @@ mod tests {
     #[test]
     fn oaita_session_name_is_valid_and_alnum() {
         // must satisfy the engine's validator (alphanumeric only).
-        for (box_name, want) in [("C1","c1agent"), ("WORK.SUB","worksubagent"),
-                                 ("---","boxagent")] {
+        for (box_name, want) in [
+            ("C1", "c1agent"),
+            ("WORK.SUB", "worksubagent"),
+            ("---", "boxagent"),
+        ] {
             let s = oaita_session_for_box(box_name);
             assert_eq!(s, want);
-            assert!(crate::oaita::turns::validate_session_name(&s).is_ok(),
-                    "derived session {s:?} must be valid");
+            assert!(
+                crate::oaita::turns::validate_session_name(&s).is_ok(),
+                "derived session {s:?} must be valid"
+            );
         }
     }
 
@@ -16293,11 +20523,15 @@ mod tests {
     #[test]
     fn ptycmd_help_is_honest_about_sarun_commands() {
         let mut app = headless_app();
-        app.modal = Some(Modal::PtyCmd { buf: "sarun run -b -- ".into() });
+        app.modal = Some(Modal::PtyCmd {
+            buf: "sarun run -b -- ".into(),
+        });
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("sandboxed"), "sarun prefill help:\n{buf}");
-        assert!(!buf.contains("no box, no capture"),
-                "must not claim no-capture for a sarun command:\n{buf}");
+        assert!(
+            !buf.contains("no box, no capture"),
+            "must not claim no-capture for a sarun command:\n{buf}"
+        );
         // a non-sarun command keeps the host-shell caveat
         app.modal = Some(Modal::PtyCmd { buf: "bash".into() });
         let buf = render_to_string(&app, 100, 30).unwrap();
@@ -16314,10 +20548,15 @@ mod tests {
         let mut app = headless_app();
         app.tap_ok = false;
         open_pty_menu(&mut app);
-        assert_eq!(NET_MODES[app.launch_net], "host",
-                   "host must be pre-selected when tap can't work");
-        assert!(app.status.contains("tap networking unavailable"),
-                "why must be stated: {}", app.status);
+        assert_eq!(
+            NET_MODES[app.launch_net], "host",
+            "host must be pre-selected when tap can't work"
+        );
+        assert!(
+            app.status.contains("tap networking unavailable"),
+            "why must be stated: {}",
+            app.status
+        );
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("network: HOST"), "{buf}");
         assert!(buf.contains("tap ✗"), "cycle hint must mark tap:\n{buf}");
@@ -16326,13 +20565,14 @@ mod tests {
         handle_modal_key(&mut app, KeyCode::Char('n'), KeyModifiers::empty());
         assert_eq!(NET_MODES[app.launch_net], "tap");
         let buf = render_to_string(&app, 100, 30).unwrap();
-        assert!(buf.contains("TAP ✗ unavailable here"),
-                "tap chip must carry the marker:\n{buf}");
+        assert!(
+            buf.contains("TAP ✗ unavailable here"),
+            "tap chip must carry the marker:\n{buf}"
+        );
         // reopening the launcher must NOT fight the deliberate choice
         app.modal = None;
         open_pty_menu(&mut app);
-        assert_eq!(NET_MODES[app.launch_net], "tap",
-                   "auto-bump is one-shot");
+        assert_eq!(NET_MODES[app.launch_net], "tap", "auto-bump is one-shot");
     }
 
     /// The image picker is a HIERARCHY (groups → tags → pull), seeded from
@@ -16341,7 +20581,8 @@ mod tests {
     #[test]
     fn image_picker_tree_respects_registries_conf() {
         let mut conf = crate::containers_conf::ContainersConf::default();
-        assert!(conf.merge_toml(r#"
+        assert!(conf.merge_toml(
+            r#"
             unqualified-search-registries = ["docker.io"]
             [aliases]
             "corp/tool" = "registry.corp.example/tool"
@@ -16350,10 +20591,13 @@ mod tests {
             location = "docker.io"
             [[registry.mirror]]
             location = "mirror.corp.example/hub"
-        "#));
+        "#
+        ));
         let catalog = image_catalog(); // built-in defaults in tests
-        let local = vec![("ubuntu-24.04".to_string(),
-                          "docker.io/library/ubuntu:24.04".to_string())];
+        let local = vec![(
+            "ubuntu-24.04".to_string(),
+            "docker.io/library/ubuntu:24.04".to_string(),
+        )];
         let top = build_image_picker(&conf, &catalog, &local);
         let label = |it: &PickItem| it.label.clone();
         // top level: loaded images, every catalog group, aliases, escape hatch
@@ -16365,21 +20609,36 @@ mod tests {
         assert!(top.iter().any(|i| i.label == "Enter reference…"));
         // descend Ubuntu: tags are leaves whose detail shows the MIRROR
         let ubuntu = top.iter().find(|i| i.label == "Ubuntu").unwrap();
-        let PickNext::Menu(tags) = &ubuntu.next else { panic!("group must nest") };
+        let PickNext::Menu(tags) = &ubuntu.next else {
+            panic!("group must nest")
+        };
         let first = tags.first().unwrap();
         assert!(matches!(first.next, PickNext::Pull(_)), "{}", label(first));
-        assert!(first.detail.contains("mirror.corp.example/hub"),
-                "leaf must surface the mirror: {}", first.detail);
+        assert!(
+            first.detail.contains("mirror.corp.example/hub"),
+            "leaf must surface the mirror: {}",
+            first.detail
+        );
         // each group ends with an enter-a-tag escape hatch
         assert!(matches!(tags.last().unwrap().next, PickNext::EnterRef(_)));
         // aliases branch resolves through the alias target
-        let al = top.iter().find(|i| i.label.contains("Short names")).unwrap();
-        let PickNext::Menu(als) = &al.next else { panic!() };
-        assert!(als.iter().any(|a| a.label == "corp/tool"),
-                "{:?}", als.iter().map(|a| &a.label).collect::<Vec<_>>());
+        let al = top
+            .iter()
+            .find(|i| i.label.contains("Short names"))
+            .unwrap();
+        let PickNext::Menu(als) = &al.next else {
+            panic!()
+        };
+        assert!(
+            als.iter().any(|a| a.label == "corp/tool"),
+            "{:?}",
+            als.iter().map(|a| &a.label).collect::<Vec<_>>()
+        );
         // loaded image leaf runs locally, no pull
         let loaded = top.iter().find(|i| i.label.starts_with("Loaded")).unwrap();
-        let PickNext::Menu(ls) = &loaded.next else { panic!() };
+        let PickNext::Menu(ls) = &loaded.next else {
+            panic!()
+        };
         assert!(matches!(&ls[0].next, PickNext::RunLocal(n) if n == "ubuntu-24.04"));
 
         // and the modal renders: group names + resolution detail visible
@@ -16390,7 +20649,10 @@ mod tests {
         });
         let buf = render_to_string(&app, 110, 35).unwrap();
         assert!(buf.contains("Ubuntu"), "picker not rendered:\n{buf}");
-        assert!(buf.contains("Enter reference"), "escape hatch missing:\n{buf}");
+        assert!(
+            buf.contains("Enter reference"),
+            "escape hatch missing:\n{buf}"
+        );
     }
 
     /// Picker keyboard model: Enter descends into a group, Backspace pops,
@@ -16406,16 +20668,22 @@ mod tests {
             stack: vec![PickLevel { items: top, sel: 0 }],
         });
         // sel 0 = first catalog group (no loaded images) → descend
-        handle_modal_key(&mut app, crossterm::event::KeyCode::Enter,
-                         crossterm::event::KeyModifiers::empty());
+        handle_modal_key(
+            &mut app,
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        );
         let Some(Modal::ImagePicker { crumbs, stack }) = &app.modal else {
             panic!("Enter on a group must descend");
         };
         assert_eq!(crumbs.len(), 1);
         assert_eq!(stack.len(), 2);
         // Enter on the first tag leaf → background load kicked, modal closed
-        handle_modal_key(&mut app, crossterm::event::KeyCode::Enter,
-                         crossterm::event::KeyModifiers::empty());
+        handle_modal_key(
+            &mut app,
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        );
         assert!(app.modal.is_none(), "leaf pick must close the picker");
         assert!(app.load_job.is_some(), "leaf pick must start a load job");
         // pump until the (failing, no engine) job reports
@@ -16423,11 +20691,17 @@ mod tests {
             app.pump_load();
             app.pump_models();
             app.pump_probe();
-            if app.load_job.is_none() { break; }
+            if app.load_job.is_none() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(app.load_job.is_none(), "job must complete");
-        assert!(app.status.contains("oci load"), "failure surfaced: {}", app.status);
+        assert!(
+            app.status.contains("oci load"),
+            "failure surfaced: {}",
+            app.status
+        );
     }
 
     /// The standalone image viewer (DESIGN-web.md W8): on a sixel terminal it
@@ -16440,7 +20714,8 @@ mod tests {
         let img = image::RgbImage::from_pixel(4, 4, image::Rgb([255, 0, 0]));
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut png, image::ImageFormat::Png).unwrap();
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
         let bytes = png.into_inner();
 
         let mut app = headless_app();
@@ -16448,16 +20723,23 @@ mod tests {
         app.cell_px = (10, 20);
         open_image_view(&mut app, "webcap #1 image/png", &bytes);
         match &app.modal {
-            Some(Modal::ImageView { sixel, title, note, .. }) => {
-                assert!(sixel.starts_with(b"\x1bPq") && sixel.ends_with(b"\x1b\\"),
-                        "carries encoded sixel");
+            Some(Modal::ImageView {
+                sixel, title, note, ..
+            }) => {
+                assert!(
+                    sixel.starts_with(b"\x1bPq") && sixel.ends_with(b"\x1b\\"),
+                    "carries encoded sixel"
+                );
                 assert!(title.contains("4×4"), "dimensions captioned: {title}");
                 assert!(note.is_empty());
             }
             _ => panic!("expected an ImageView modal"),
         }
         let buf = render_to_string(&app, 100, 30).unwrap();
-        assert!(buf.contains("image · webcap #1"), "popover caption drawn:\n{buf}");
+        assert!(
+            buf.contains("image · webcap #1"),
+            "popover caption drawn:\n{buf}"
+        );
 
         // Non-sixel terminal: metadata note, no pixels.
         app.sixel_ok = false;
@@ -16471,7 +20753,10 @@ mod tests {
             _ => panic!("expected an ImageView modal (fallback)"),
         }
         let buf = render_to_string(&app, 100, 30).unwrap();
-        assert!(buf.contains("no sixel support"), "fallback note drawn:\n{buf}");
+        assert!(
+            buf.contains("no sixel support"),
+            "fallback note drawn:\n{buf}"
+        );
     }
 
     /// F6 in the PTY pane toggles the mouse between the app and the terminal's
@@ -16481,11 +20766,17 @@ mod tests {
     fn f6_mouse_toggle_label_flips() {
         let mut app = headless_app();
         app.focus = Pane::Pty;
-        assert_eq!(fkey_labels(&app)[5], "Select",
-                   "grabbed → F6 offers to release for selection");
+        assert_eq!(
+            fkey_labels(&app)[5],
+            "Select",
+            "grabbed → F6 offers to release for selection"
+        );
         app.mouse_release = true;
-        assert_eq!(fkey_labels(&app)[5], "Grab",
-                   "released → F6 offers to hand the mouse back to the app");
+        assert_eq!(
+            fkey_labels(&app)[5],
+            "Grab",
+            "released → F6 offers to hand the mouse back to the app"
+        );
         // Outside the PTY pane F6 keeps its list-pane meaning (Rename on Boxes).
         app.focus = Pane::Sessions;
         assert_eq!(fkey_labels(&app)[5], "Rename");
@@ -16502,8 +20793,10 @@ mod tests {
         app.focus = Pane::Network;
         // Empty state names the on-ramp.
         let buf = render_to_string(&app, 110, 30).unwrap();
-        assert!(buf.contains("WEB") && buf.contains("no web captures"),
-                "empty Network pane must show the --webcap on-ramp:\n{buf}");
+        assert!(
+            buf.contains("WEB") && buf.contains("no web captures"),
+            "empty Network pane must show the --webcap on-ramp:\n{buf}"
+        );
         // With rows: header + a capture line with method/status/url.
         app.webcap_rows = vec![
             json!({"id": 2, "ts": 0.0, "method": "GET", "url": "https://example.com/app.js",
@@ -16514,13 +20807,18 @@ mod tests {
                    "truncated": 0, "req_len": 0, "resp_len": 0}),
         ];
         let buf = render_to_string(&app, 110, 30).unwrap();
-        assert!(buf.contains("Method") && buf.contains("Type") && buf.contains("Bytes"),
-                "header row rendered:\n{buf}");
-        assert!(buf.contains("GET") && buf.contains("200")
-                && buf.contains("application/java"),
-                "the 200 capture row rendered (method/status/type):\n{buf}");
-        assert!(buf.contains("204"),
-                "the blocked (204) capture is shown too:\n{buf}");
+        assert!(
+            buf.contains("Method") && buf.contains("Type") && buf.contains("Bytes"),
+            "header row rendered:\n{buf}"
+        );
+        assert!(
+            buf.contains("GET") && buf.contains("200") && buf.contains("application/java"),
+            "the 200 capture row rendered (method/status/type):\n{buf}"
+        );
+        assert!(
+            buf.contains("204"),
+            "the blocked (204) capture is shown too:\n{buf}"
+        );
     }
 
     /// The Api pane must surface the local on-ramp: an unconfigured endpoint
@@ -16533,23 +20831,31 @@ mod tests {
         app.api_endpoint_note = endpoint_note_lines(None);
         let buf = render_to_string(&app, 110, 30).unwrap();
         assert!(buf.contains("no endpoint configured"), "{buf}");
-        assert!(buf.contains("local model") || buf.contains("Pick a local"),
-                "empty state must name the zero-endpoint on-ramp:\n{buf}");
+        assert!(
+            buf.contains("local model") || buf.contains("Pick a local"),
+            "empty state must name the zero-endpoint on-ramp:\n{buf}"
+        );
         // configured endpoint: summary instead of the how-to
-        app.api_endpoint_note = endpoint_note_lines(Some(
-            ("qwen3".into(), "http://127.0.0.1:18181/v1".into())));
+        app.api_endpoint_note =
+            endpoint_note_lines(Some(("qwen3".into(), "http://127.0.0.1:18181/v1".into())));
         let buf = render_to_string(&app, 110, 30).unwrap();
         assert!(buf.contains("http://127.0.0.1:18181/v1"), "{buf}");
         assert!(buf.contains("--api"), "{buf}");
         // action menu carries BOTH on-ramp entries
         let (title, items) = pane_action_menu(&app).expect("Api pane menu");
         assert!(title.contains("API"), "{title}");
-        assert!(items.iter().any(|i|
-            matches!(i.action, Action::OpenModelPicker)),
-            "menu must offer the model picker");
-        assert!(items.iter().any(|i|
-            matches!(i.action, Action::OaitaLocalPty)),
-            "menu must offer plain oaita local");
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i.action, Action::OpenModelPicker)),
+            "menu must offer the model picker"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i.action, Action::OaitaLocalPty)),
+            "menu must offer plain oaita local"
+        );
     }
 
     /// The model picker: opening it (with no engine to answer oaita.models)
@@ -16562,11 +20868,11 @@ mod tests {
         let mut app = headless_app();
         // Simulate a delivered catalog directly in the modal (no engine RPC).
         app.modal = Some(Modal::ModelPicker {
-            models: vec![
-                ModelRow { name: "Qwen3-4B".into(),
-                    url: "https://hf/x-Q4_K_M.gguf".into(),
-                    note: "Q4 · 2 GiB".into() },
-            ],
+            models: vec![ModelRow {
+                name: "Qwen3-4B".into(),
+                url: "https://hf/x-Q4_K_M.gguf".into(),
+                note: "Q4 · 2 GiB".into(),
+            }],
             source: "HuggingFace (1 live)".into(),
             sel: 0,
             loading: false,
@@ -16577,8 +20883,10 @@ mod tests {
         // Down to the custom-URL row (index == models.len()), Enter → ModelUrl.
         handle_modal_key(&mut app, KeyCode::Down, KeyModifiers::empty());
         handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
-        assert!(matches!(app.modal, Some(Modal::ModelUrl { .. })),
-                "custom-URL row must open the URL entry, not launch a download");
+        assert!(
+            matches!(app.modal, Some(Modal::ModelUrl { .. })),
+            "custom-URL row must open the URL entry, not launch a download"
+        );
     }
 
     /// The external-API editor: three editable fields (model / base_url /
@@ -16591,13 +20899,21 @@ mod tests {
         // menu offers the editor
         app.focus = Pane::ApiLogs;
         let (_, items) = pane_action_menu(&app).expect("Api pane menu");
-        assert!(items.iter().any(|i| matches!(i.action, Action::OpenApiConfig)),
-                "menu must offer the external-API editor");
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i.action, Action::OpenApiConfig)),
+            "menu must offer the external-API editor"
+        );
         // open it: field 0 is `model`
         app.modal = Some(Modal::ApiConfig {
-            base_url: String::new(), model: String::new(),
-            api_key: String::new(), field: 0, result: String::new(),
-            testing: false });
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+            field: 0,
+            result: String::new(),
+            testing: false,
+        });
         let none = KeyModifiers::empty();
         for c in "gpt-4o".chars() {
             handle_modal_key(&mut app, KeyCode::Char(c), none);
@@ -16613,7 +20929,12 @@ mod tests {
             handle_modal_key(&mut app, KeyCode::Char(c), none);
         }
         match &app.modal {
-            Some(Modal::ApiConfig { model, base_url, api_key, .. }) => {
+            Some(Modal::ApiConfig {
+                model,
+                base_url,
+                api_key,
+                ..
+            }) => {
                 assert_eq!(model, "gpt-4o");
                 assert_eq!(base_url, "http://h:1/v1");
                 assert_eq!(api_key, "sk-secret");
@@ -16621,7 +20942,10 @@ mod tests {
             _ => panic!("editor must stay open across edits"),
         }
         let buf = render_to_string(&app, 100, 30).unwrap();
-        assert!(buf.contains("gpt-4o") && buf.contains("http://h:1/v1"), "{buf}");
+        assert!(
+            buf.contains("gpt-4o") && buf.contains("http://h:1/v1"),
+            "{buf}"
+        );
         assert!(!buf.contains("sk-secret"), "api_key must be masked:\n{buf}");
         assert!(buf.contains("•"), "masked key must render dots:\n{buf}");
     }
@@ -16633,10 +20957,14 @@ mod tests {
     fn multiselect_toggle_range_clear_and_scope() {
         let mut app = headless_app();
         app.focus = Pane::Sessions;
-        app.sessions = (0..5).map(|i| serde_json::json!({
-            "session_id": i.to_string(), "name": format!("b{i}"),
-            "path": format!("b{i}"), "status": "done",
-        })).collect();
+        app.sessions = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "session_id": i.to_string(), "name": format!("b{i}"),
+                    "path": format!("b{i}"), "status": "done",
+                })
+            })
+            .collect();
         let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         // Space marks the cursor row (idx 0), which becomes the anchor.
@@ -16656,7 +20984,10 @@ mod tests {
 
         // The gutter glyph renders for marked rows.
         let buf = render_to_string(&app, 100, 20).unwrap();
-        assert!(buf.contains(MARK_GLYPH), "marked rows show the glyph:\n{buf}");
+        assert!(
+            buf.contains(MARK_GLYPH),
+            "marked rows show the glyph:\n{buf}"
+        );
 
         // Esc clears the selection (and reports it consumed the Esc).
         assert!(app.clear_marks());
@@ -16687,19 +21018,38 @@ mod tests {
         // rows, so render extra-tall to assert every generated line is present.
         let buf = render_to_string(&app, 120, 120).unwrap();
         assert!(buf.contains("help"), "help pane title missing:\n{buf}");
-        assert!(buf.contains("apply") && buf.contains("discard"), "help should mention apply/discard:\n{buf}");
-        assert!(buf.contains("processes"), "help should mention the processes pane:\n{buf}");
+        assert!(
+            buf.contains("apply") && buf.contains("discard"),
+            "help should mention apply/discard:\n{buf}"
+        );
+        assert!(
+            buf.contains("processes"),
+            "help should mention the processes pane:\n{buf}"
+        );
         // the richer manual must cover the loop, filter kinds, rule syntax, nesting.
-        assert!(buf.contains("copy-on-write") || buf.contains("overlay"),
-                "manual should explain the overlay loop:\n{buf}");
-        assert!(buf.contains("hunk"), "manual should mention per-hunk apply:\n{buf}");
-        assert!(buf.contains("passthrough"), "manual should document rule actions:\n{buf}");
-        assert!(buf.contains("ctrl+"), "manual should mention rule reorder:\n{buf}");
+        assert!(
+            buf.contains("copy-on-write") || buf.contains("overlay"),
+            "manual should explain the overlay loop:\n{buf}"
+        );
+        assert!(
+            buf.contains("hunk"),
+            "manual should mention per-hunk apply:\n{buf}"
+        );
+        assert!(
+            buf.contains("passthrough"),
+            "manual should document rule actions:\n{buf}"
+        );
+        assert!(
+            buf.contains("ctrl+"),
+            "manual should mention rule reorder:\n{buf}"
+        );
         // The pane index must be GENERATED from PANE_KEYS — every accelerator
         // and its description present, never hardcoded prose that can drift.
         for (key, _, _, _, desc) in PANE_KEYS {
-            assert!(buf.contains(&format!("{key}  {desc}")),
-                    "help pane index missing generated line for {key:?}:\n{buf}");
+            assert!(
+                buf.contains(&format!("{key}  {desc}")),
+                "help pane index missing generated line for {key:?}:\n{buf}"
+            );
         }
         // The remaining contexts' help must ALSO be generated from their tables,
         // not hardcoded prose. Every PANE_ACTION_KEYS entry with a help string
@@ -16708,22 +21058,36 @@ mod tests {
         for (key, _, _, help) in PANE_ACTION_KEYS {
             if let Some(desc) = help {
                 let want = format!("{}  {desc}", key.label());
-                assert!(buf.contains(&want),
-                        "help missing generated pane-action line {want:?}:\n{buf}");
+                assert!(
+                    buf.contains(&want),
+                    "help missing generated pane-action line {want:?}:\n{buf}"
+                );
             }
         }
         // The Confirm modal's y/n keymap is generated from CONFIRM_KEYS too: the
         // 'y'/'Y' (confirm) and 'n'/'N'/Esc (cancel) labels must appear joined
         // exactly as help_lines builds them, so the prompt help can't drift from
         // the table the modal actually dispatches.
-        let yes = CONFIRM_KEYS.iter().filter(|(_, a, _)| matches!(a, ConfirmKey::Yes))
-            .map(|(k, _, _)| k.label()).collect::<Vec<_>>().join("/");
-        let no = CONFIRM_KEYS.iter().filter(|(_, a, _)| matches!(a, ConfirmKey::No))
-            .map(|(k, _, _)| k.label()).collect::<Vec<_>>().join("/");
-        assert!(buf.contains(&format!("{yes}  confirm the action")),
-                "help missing generated confirm-keys (yes={yes:?}):\n{buf}");
-        assert!(buf.contains(&format!("{no}  cancel")),
-                "help missing generated confirm-keys (no={no:?}):\n{buf}");
+        let yes = CONFIRM_KEYS
+            .iter()
+            .filter(|(_, a, _)| matches!(a, ConfirmKey::Yes))
+            .map(|(k, _, _)| k.label())
+            .collect::<Vec<_>>()
+            .join("/");
+        let no = CONFIRM_KEYS
+            .iter()
+            .filter(|(_, a, _)| matches!(a, ConfirmKey::No))
+            .map(|(k, _, _)| k.label())
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(
+            buf.contains(&format!("{yes}  confirm the action")),
+            "help missing generated confirm-keys (yes={yes:?}):\n{buf}"
+        );
+        assert!(
+            buf.contains(&format!("{no}  cancel")),
+            "help missing generated confirm-keys (no={no:?}):\n{buf}"
+        );
     }
 
     /// The keybindings-as-data dispatch is exercised directly (no live engine):
@@ -16741,38 +21105,46 @@ mod tests {
         // a cancel key ('n') clears the modal and notes "cancelled".
         let mut app = headless_app();
         app.modal = Some(Modal::Confirm {
-            prompt: "Delete?".into(), action: ConfirmAction::Dissolve });
+            prompt: "Delete?".into(),
+            action: ConfirmAction::Dissolve,
+        });
         handle_modal_key(&mut app, KeyCode::Char('n'), none);
         assert!(app.modal.is_none(), "'n' should dismiss the Confirm modal");
         assert_eq!(app.status, "cancelled");
         // Esc is also a cancel key in the table.
         app.modal = Some(Modal::Confirm {
-            prompt: "Delete?".into(), action: ConfirmAction::Dissolve });
+            prompt: "Delete?".into(),
+            action: ConfirmAction::Dissolve,
+        });
         handle_modal_key(&mut app, KeyCode::Esc, none);
         assert!(app.modal.is_none(), "Esc should dismiss the Confirm modal");
         // a key NOT in the table re-arms the modal (the old `_ =>` arm).
         app.modal = Some(Modal::Confirm {
-            prompt: "Delete?".into(), action: ConfirmAction::Dissolve });
+            prompt: "Delete?".into(),
+            action: ConfirmAction::Dissolve,
+        });
         handle_modal_key(&mut app, KeyCode::Char('z'), none);
-        assert!(matches!(app.modal, Some(Modal::Confirm { .. })),
-                "an unbound key must leave the Confirm modal up");
+        assert!(
+            matches!(app.modal, Some(Modal::Confirm { .. })),
+            "an unbound key must leave the Confirm modal up"
+        );
 
         // ── per-pane action keys (PANE_ACTION_KEYS) ──
         // 'K' opens a Kill Confirm; 'D' the box-delete (dissolve) Confirm.
-        for (key, want) in [
-            ('K', ConfirmAction::Kill),
-            ('D', ConfirmAction::Dissolve),
-        ] {
+        for (key, want) in [('K', ConfirmAction::Kill), ('D', ConfirmAction::Dissolve)] {
             let mut app = headless_app();
             app.focus = Pane::Sessions;
             // The box-op confirms need a subject now: no session rows →
             // status-line no-op instead of a modal (tested separately).
             app.sessions = vec![json!({"session_id": "1", "path": "a"})];
-            assert!(dispatch_pane_key(&mut app, KeyCode::Char(key)),
-                    "'{key}' must be handled by the pane-key table");
+            assert!(
+                dispatch_pane_key(&mut app, KeyCode::Char(key)),
+                "'{key}' must be handled by the pane-key table"
+            );
             match app.modal {
-                Some(Modal::Confirm { action, .. }) => assert!(action == want,
-                    "'{key}' opened the wrong Confirm action"),
+                Some(Modal::Confirm { action, .. }) => {
+                    assert!(action == want, "'{key}' opened the wrong Confirm action")
+                }
                 _ => panic!("'{key}' should open a Confirm modal"),
             }
         }
@@ -16782,7 +21154,10 @@ mod tests {
         let mut app = headless_app();
         app.focus = Pane::Changes;
         assert!(dispatch_pane_key(&mut app, KeyCode::Char('d')));
-        assert!(app.should_quit, "'d' off Hunks/Rules must detach (set should_quit)");
+        assert!(
+            app.should_quit,
+            "'d' off Hunks/Rules must detach (set should_quit)"
+        );
         let mut app = headless_app();
         app.focus = Pane::Rules; // 'd' here is the guarded delete-rule, not detach
         assert!(dispatch_pane_key(&mut app, KeyCode::Char('d')));
@@ -16792,8 +21167,10 @@ mod tests {
         let mut app = headless_app();
         app.focus = Pane::Rules;
         assert!(dispatch_pane_key(&mut app, KeyCode::Char('n')));
-        assert!(matches!(app.modal, Some(Modal::RuleForm { editing: None, .. })),
-                "'n' on Rules should open a blank RuleForm");
+        assert!(
+            matches!(app.modal, Some(Modal::RuleForm { editing: None, .. })),
+            "'n' on Rules should open a blank RuleForm"
+        );
 
         // 'r' starts a rename (engine-free state toggle).
         let mut app = headless_app();
@@ -16803,8 +21180,10 @@ mod tests {
 
         // an unbound key returns false (caller handles it inline / no-op).
         let mut app = headless_app();
-        assert!(!dispatch_pane_key(&mut app, KeyCode::Char('§')),
-                "an unbound key must not be claimed by the pane-key table");
+        assert!(
+            !dispatch_pane_key(&mut app, KeyCode::Char('§')),
+            "an unbound key must not be claimed by the pane-key table"
+        );
     }
 
     /// BUG 3, key-dispatch precedence (`dispatch_char_key`): a pane-row key
@@ -16819,16 +21198,20 @@ mod tests {
         let mut app = headless_app();
         app.focus = Pane::Mirrors;
         dispatch_char_key(&mut app, 'b');
-        assert!(app.focus == Pane::Mirrors,
-                "'b' on Mirrors must NOT jump to Boxes (it browses)");
+        assert!(
+            app.focus == Pane::Mirrors,
+            "'b' on Mirrors must NOT jump to Boxes (it browses)"
+        );
 
         // 'b' from any OTHER pane still reaches Boxes (Sessions) — the global
         // accelerator is intact where no pane-row binding shadows it.
         let mut app = headless_app();
         app.focus = Pane::Changes;
         dispatch_char_key(&mut app, 'b');
-        assert!(app.focus == Pane::Sessions,
-                "'b' off Mirrors must still reach Boxes");
+        assert!(
+            app.focus == Pane::Sessions,
+            "'b' off Mirrors must still reach Boxes"
+        );
 
         // 't' reaches Trace from a pane with no per-row 't' (Sessions). Before
         // the fix 't' was absent from the accelerator list — Trace was
@@ -16843,20 +21226,30 @@ mod tests {
         let mut app = headless_app();
         app.focus = Pane::Pipelines;
         dispatch_char_key(&mut app, 't');
-        assert!(app.focus == Pane::Pipelines,
-                "'t' on Pipes toggles the tree, it must not jump to Trace");
+        assert!(
+            app.focus == Pane::Pipelines,
+            "'t' on Pipes toggles the tree, it must not jump to Trace"
+        );
 
         // The routing predicates themselves: 't' is a menubar accelerator
         // (regression guard against the old omission), 'b' On(Mirrors) is a
         // pane-row key, and 'b' is not a pane-row key off Mirrors.
         assert!(is_menubar_accel('t'), "'t' must be a menubar accelerator");
-        assert!(is_menubar_accel('b') && is_menubar_accel('W') && is_menubar_accel('u'),
-                "b/W/u stay menubar accelerators");
+        assert!(
+            is_menubar_accel('b') && is_menubar_accel('W') && is_menubar_accel('u'),
+            "b/W/u stay menubar accelerators"
+        );
         let mut app = headless_app();
         app.focus = Pane::Mirrors;
-        assert!(pane_row_key_on_focus(&app, 'b'), "'b' is a pane-row key on Mirrors");
+        assert!(
+            pane_row_key_on_focus(&app, 'b'),
+            "'b' is a pane-row key on Mirrors"
+        );
         app.focus = Pane::Sessions;
-        assert!(!pane_row_key_on_focus(&app, 'b'), "'b' is not a pane-row key off Mirrors");
+        assert!(
+            !pane_row_key_on_focus(&app, 'b'),
+            "'b' is not a pane-row key off Mirrors"
+        );
     }
 
     /// Helper: select the box (and change) whose path matches `pred`, returning
@@ -16867,7 +21260,10 @@ mod tests {
             app.sel_session = i;
             app.load_changes();
             let pos = app.visible_changes().iter().position(|c| {
-                c.get("path").and_then(Value::as_str).map(&pred).unwrap_or(false)
+                c.get("path")
+                    .and_then(Value::as_str)
+                    .map(&pred)
+                    .unwrap_or(false)
             });
             if let Some(ci) = pos {
                 app.focus = Pane::Changes;
@@ -16890,9 +21286,14 @@ mod tests {
         };
         // create an ELF binary change inside the box by copying a host ELF.
         let (_sid, root) = make_box(&eng.sock);
-        let src = ["/bin/true", "/usr/bin/true", "/bin/echo"].iter()
-            .map(PathBuf::from).find(|p| p.exists());
-        let Some(src) = src else { eprintln!("SKIP: no host ELF to copy"); return; };
+        let src = ["/bin/true", "/usr/bin/true", "/bin/echo"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+        let Some(src) = src else {
+            eprintln!("SKIP: no host ELF to copy");
+            return;
+        };
         let bytes = std::fs::read(&src).expect("read host ELF");
         assert_eq!(&bytes[..4], b"\x7fELF", "test fixture must be an ELF");
         let dir = root.join("tmp");
@@ -16905,29 +21306,56 @@ mod tests {
             return;
         }
         // it must be a BINARY change driving the structural pane.
-        assert!(app.hunks.get("is_text").and_then(Value::as_bool) != Some(true),
-                "ELF change should be binary, not text");
+        assert!(
+            app.hunks.get("is_text").and_then(Value::as_bool) != Some(true),
+            "ELF change should be binary, not text"
+        );
         // quick half ran: the type line names ELF, and a finish job was kicked.
-        let quick_joined: String = app.structd.quick_lines.iter()
-            .map(|(_, t)| t.clone()).collect::<Vec<_>>().join("\n");
-        assert!(quick_joined.to_lowercase().contains("elf"),
-                "struct_quick should report the ELF type; got: {quick_joined}");
+        let quick_joined: String = app
+            .structd
+            .quick_lines
+            .iter()
+            .map(|(_, t)| t.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            quick_joined.to_lowercase().contains("elf"),
+            "struct_quick should report the ELF type; got: {quick_joined}"
+        );
         // drive the worker to completion (it runs readelf in a sandbox).
         let mut done = false;
         for _ in 0..100 {
-            if app.pump_struct() { done = true; break; }
+            if app.pump_struct() {
+                done = true;
+                break;
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
         // render the pane and assert it shows a REAL readelf keyword OR (if the
         // sandbox/readelf is unavailable here) at least the ELF type line.
         let buf = render_to_string(&app, 160, 60).unwrap();
-        let readelf_ok = done && app.structd.full_lines.as_ref().map(|ls| {
-            let j = ls.iter().map(|(_,t)| t.clone()).collect::<Vec<_>>().join("\n");
-            j.contains("ELF Header") || j.contains("Section Headers")
-                || j.contains("Program Headers") || j.contains(".text")
-                || j.contains("readelf")
-        }).unwrap_or(false);
-        assert!(buf.contains("structural diff"), "pane title should be structural:\n{buf}");
+        let readelf_ok = done
+            && app
+                .structd
+                .full_lines
+                .as_ref()
+                .map(|ls| {
+                    let j = ls
+                        .iter()
+                        .map(|(_, t)| t.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    j.contains("ELF Header")
+                        || j.contains("Section Headers")
+                        || j.contains("Program Headers")
+                        || j.contains(".text")
+                        || j.contains("readelf")
+                })
+                .unwrap_or(false);
+        assert!(
+            buf.contains("structural diff"),
+            "pane title should be structural:\n{buf}"
+        );
         assert!(
             readelf_ok || buf.to_lowercase().contains("elf"),
             "structural pane should show real ELF structure (or at least the ELF \
@@ -16946,9 +21374,10 @@ mod tests {
         let (_sid, root) = make_box(&eng.sock);
         // bytes with a NUL (→ binary) and a recognizable hex signature, but no
         // known magic (so no differ → hexdump fallback).
-        let data: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33,
-                                 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB,
-                                 0x00, 0xCC];
+        let data: Vec<u8> = vec![
+            0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+            0xAA, 0xBB, 0x00, 0xCC,
+        ];
         let dir = root.join("tmp");
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(dir.join("struct_hex_marker.bin"), &data).expect("write");
@@ -16958,15 +21387,25 @@ mod tests {
             eprintln!("SKIP: binary change not captured");
             return;
         }
-        assert!(app.hunks.get("is_text").and_then(Value::as_bool) != Some(true),
-                "should be a binary change");
+        assert!(
+            app.hunks.get("is_text").and_then(Value::as_bool) != Some(true),
+            "should be a binary change"
+        );
         // unrecognized → no finish job, hexdump fallback built immediately.
-        assert!(app.structd.job.is_none(), "unrecognized type must not kick a job");
-        assert!(!app.structd.hex_lines.is_empty(), "hexdump fallback must be built");
+        assert!(
+            app.structd.job.is_none(),
+            "unrecognized type must not kick a job"
+        );
+        assert!(
+            !app.structd.hex_lines.is_empty(),
+            "hexdump fallback must be built"
+        );
         let buf = render_to_string(&app, 160, 40).unwrap();
         // the real leading bytes must appear in the hexdump (offset 0 row).
-        assert!(buf.contains("dead beef") || buf.contains("de ad be ef"),
-                "hexdump should show the real bytes; got:\n{buf}");
+        assert!(
+            buf.contains("dead beef") || buf.contains("de ad be ef"),
+            "hexdump should show the real bytes; got:\n{buf}"
+        );
     }
 
     /// HUNK APPLY: a 2-hunk text change. Drive `a` on hunk 0 via the UI key path
@@ -16983,7 +21422,11 @@ mod tests {
         let host = PathBuf::from(format!("/tmp/hunk2_{}.txt", std::process::id()));
         let base: String = (1..=40).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&host, &base).expect("seed host file");
-        let rel = host.strip_prefix("/").unwrap().to_string_lossy().to_string();
+        let rel = host
+            .strip_prefix("/")
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
 
         let (sid, root) = make_box(&eng.sock);
         // edit line 2 and line 38 in the box's view of the same file.
@@ -17008,20 +21451,35 @@ mod tests {
         app.sel_hunk = 0;
         let first_ix = app.cur_hunk_index().unwrap();
         app.apply_hunk();
-        assert!(app.status.starts_with("applied hunk"),
-                "apply_hunk status should report success; got {}", app.status);
+        assert!(
+            app.status.starts_with("applied hunk"),
+            "apply_hunk status should report success; got {}",
+            app.status
+        );
         // the host file must now contain hunk 0's content but NOT hunk 1's (still
         // pending in the box).
         let on_host = std::fs::read_to_string(&host).unwrap_or_default();
-        assert!(on_host.contains("CHANGED_TOP"),
-                "host should have the applied top hunk; got:\n{on_host}");
-        assert!(!on_host.contains("CHANGED_BOTTOM"),
-                "host must NOT yet have the un-applied bottom hunk; got:\n{on_host}");
+        assert!(
+            on_host.contains("CHANGED_TOP"),
+            "host should have the applied top hunk; got:\n{on_host}"
+        );
+        assert!(
+            !on_host.contains("CHANGED_BOTTOM"),
+            "host must NOT yet have the un-applied bottom hunk; got:\n{on_host}"
+        );
         // and the box still reports a remaining (bottom) hunk for this path.
-        let remaining = rpc(&eng.sock, "review.hunks", json!([app.cur_sid().unwrap(), rel]))
-            .ok().and_then(|v| v.get("hunks").and_then(Value::as_array).map(|a| a.len()))
-            .unwrap_or(0);
-        assert!(remaining >= 1, "the other hunk must remain pending (idx {first_ix} applied)");
+        let remaining = rpc(
+            &eng.sock,
+            "review.hunks",
+            json!([app.cur_sid().unwrap(), rel]),
+        )
+        .ok()
+        .and_then(|v| v.get("hunks").and_then(Value::as_array).map(|a| a.len()))
+        .unwrap_or(0);
+        assert!(
+            remaining >= 1,
+            "the other hunk must remain pending (idx {first_ix} applied)"
+        );
         let _ = std::fs::remove_file(&host);
     }
 
@@ -17040,7 +21498,9 @@ mod tests {
         for (i, n) in names.iter().enumerate() {
             std::fs::write(dir.join(n), format!("content {i}\n")).expect("write");
         }
-        for n in &names { let _ = std::fs::remove_file(PathBuf::from("/tmp").join(n)); }
+        for n in &names {
+            let _ = std::fs::remove_file(PathBuf::from("/tmp").join(n));
+        }
 
         let mut app = App::new(eng.sock.clone());
         app.refresh_sessions();
@@ -17048,25 +21508,45 @@ mod tests {
         let ok = (0..app.sessions.len()).any(|i| {
             app.sel_session = i;
             app.load_changes();
-            names.iter().all(|n| app.changes.iter().any(|c|
-                c.get("path").and_then(Value::as_str).map(|p| p.contains(n)).unwrap_or(false)))
+            names.iter().all(|n| {
+                app.changes.iter().any(|c| {
+                    c.get("path")
+                        .and_then(Value::as_str)
+                        .map(|p| p.contains(n))
+                        .unwrap_or(false)
+                })
+            })
         });
         assert!(ok, "expected a box holding both changes");
-        assert!(app.changes.len() >= 2, "expected ≥2 changes before apply_all");
+        assert!(
+            app.changes.len() >= 2,
+            "expected ≥2 changes before apply_all"
+        );
         app.apply_all();
-        assert!(app.status.starts_with("applied all"),
-                "apply_all status should report success; got {}", app.status);
+        assert!(
+            app.status.starts_with("applied all"),
+            "apply_all status should report success; got {}",
+            app.status
+        );
         // both files must now exist on the host.
         for n in &names {
             let hp = PathBuf::from("/tmp").join(n);
-            assert!(hp.exists(), "apply_all should materialize {hp:?} on the host");
+            assert!(
+                hp.exists(),
+                "apply_all should materialize {hp:?} on the host"
+            );
             let _ = std::fs::remove_file(&hp);
         }
         // and the box's pending changes are gone.
-        assert!(app.changes.is_empty() || app.changes.iter().all(|c|
-            !names.iter().any(|n| c.get("path").and_then(Value::as_str)
-                .map(|p| p.contains(n)).unwrap_or(false))),
-            "applied changes should no longer be pending");
+        assert!(
+            app.changes.is_empty()
+                || app.changes.iter().all(|c| !names.iter().any(|n| c
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(|p| p.contains(n))
+                    .unwrap_or(false))),
+            "applied changes should no longer be pending"
+        );
     }
 
     /// RULE MOVE: two rules; ctrl-down on the first swaps the on-disk order and
@@ -17090,19 +21570,28 @@ mod tests {
         app.commit_rule("discard **/*.log".into(), None);
         let before = std::fs::read_to_string(app.rules_path()).unwrap_or_default();
         let lines_before: Vec<&str> = before.lines().collect();
-        assert_eq!(lines_before, vec!["apply src/**", "discard **/*.log"],
-                   "two rules in insertion order on disk");
+        assert_eq!(
+            lines_before,
+            vec!["apply src/**", "discard **/*.log"],
+            "two rules in insertion order on disk"
+        );
         // ctrl-down on the first rule.
         app.sel_rule = 0;
         app.move_rule(1);
         assert_eq!(app.sel_rule, 1, "cursor should follow the moved rule");
         let after = std::fs::read_to_string(app.rules_path()).unwrap_or_default();
         let lines_after: Vec<&str> = after.lines().collect();
-        assert_eq!(lines_after, vec!["discard **/*.log", "apply src/**"],
-                   "ctrl-down must swap the on-disk order; got: {after:?}");
+        assert_eq!(
+            lines_after,
+            vec!["discard **/*.log", "apply src/**"],
+            "ctrl-down must swap the on-disk order; got: {after:?}"
+        );
         // save_rules calls reload_rules — status reflects the reload.
-        assert!(app.status.contains("reloaded"),
-                "rule move should reload_rules; status={}", app.status);
+        assert!(
+            app.status.contains("reloaded"),
+            "rule move should reload_rules; status={}",
+            app.status
+        );
         // restore a clean filerules file (shared in-process path).
         let _ = std::fs::remove_file(app.rules_path());
     }
@@ -17120,8 +21609,7 @@ mod tests {
             return;
         };
         let (_sid, root) = make_box(&eng.sock);
-        std::fs::write(root.join("root/box_detail_marker.txt"),
-                       b"hi\n").expect("write");
+        std::fs::write(root.join("root/box_detail_marker.txt"), b"hi\n").expect("write");
         let mut app = App::new(eng.sock.clone());
         app.refresh_sessions();
         app.load_changes();
@@ -17131,13 +21619,20 @@ mod tests {
         assert!(buf.contains("cmd     "), "cmd label missing:\n{buf}");
         assert!(buf.contains("pid     "), "pid label missing:\n{buf}");
         assert!(buf.contains("age "), "age label missing:\n{buf}");
-        assert!(buf.contains("changes "), "changes count line missing:\n{buf}");
+        assert!(
+            buf.contains("changes "),
+            "changes count line missing:\n{buf}"
+        );
         // The finished-box preview label.
-        assert!(buf.contains("[↵ to review]"),
-                "↵ to review label missing for finished box:\n{buf}");
+        assert!(
+            buf.contains("[↵ to review]"),
+            "↵ to review label missing for finished box:\n{buf}"
+        );
         // The actual written path makes it into the preview.
-        assert!(buf.contains("box_detail_marker.txt"),
-                "recent preview missing the written path:\n{buf}");
+        assert!(
+            buf.contains("box_detail_marker.txt"),
+            "recent preview missing the written path:\n{buf}"
+        );
     }
 
     /// The keybar carries one chip per view (b/c/p/o/e) and the active
@@ -17161,8 +21656,10 @@ mod tests {
         // chip letters appear inside parentheses, e.g. " (b) ".
         for k in ['b', 'c', 'e', '?'] {
             let lit = format!("({k})");
-            assert!(buf.contains(&lit),
-                    "menubar accelerator {lit:?} missing:\n{buf}");
+            assert!(
+                buf.contains(&lit),
+                "menubar accelerator {lit:?} missing:\n{buf}"
+            );
         }
         // Move focus to Procs (forcing it shown since the box has no
         // procs yet — view_of_pane's "active overrides hide" rule
@@ -17170,7 +21667,10 @@ mod tests {
         app.focus = Pane::Processes;
         app.load_processes();
         let buf2 = render_to_string(&app, 160, 30).unwrap();
-        assert!(buf2.contains("Procs"), "Procs label missing after focus:\n{buf2}");
+        assert!(
+            buf2.contains("Procs"),
+            "Procs label missing after focus:\n{buf2}"
+        );
     }
 
     /// Active filter on the focused view surfaces in the COMMAND LINE
@@ -17190,15 +21690,22 @@ mod tests {
         app.load_changes();
         app.focus = Pane::Changes;
         let rows = vec![ClauseRow {
-            enabled: true, join: Join::And, negate: false,
-            kind: "path".into(), pattern: "**/PUMPKIN*".into(),
+            enabled: true,
+            join: Join::And,
+            negate: false,
+            kind: "path".into(),
+            pattern: "**/PUMPKIN*".into(),
         }];
         app.commit_filter(FilterView::Changes, &rows);
         let buf = render_to_string(&app, 160, 30).unwrap();
-        assert!(buf.contains("filter"),
-                "cmdline must surface 'filter' tag when one is active:\n{buf}");
-        assert!(buf.contains("path:**/PUMPKIN*"),
-                "filter expression missing from cmdline:\n{buf}");
+        assert!(
+            buf.contains("filter"),
+            "cmdline must surface 'filter' tag when one is active:\n{buf}"
+        );
+        assert!(
+            buf.contains("path:**/PUMPKIN*"),
+            "filter expression missing from cmdline:\n{buf}"
+        );
     }
 
     /// A freshly-created file (no host counterpart at lower) renders as
@@ -17222,10 +21729,14 @@ mod tests {
         app.load_changes();
         app.focus = Pane::Changes;
         let buf = render_to_string(&app, 160, 30).unwrap();
-        assert!(buf.contains("created_only_xyzzy.txt"),
-                "the file should appear in the changes pane:\n{buf}");
-        assert!(buf.contains('+'),
-                "created file should render with '+' glyph:\n{buf}");
+        assert!(
+            buf.contains("created_only_xyzzy.txt"),
+            "the file should appear in the changes pane:\n{buf}"
+        );
+        assert!(
+            buf.contains('+'),
+            "created file should render with '+' glyph:\n{buf}"
+        );
     }
 
     /// cd-info strip (path / kind / size / mode) renders ABOVE the diff
@@ -17239,16 +21750,17 @@ mod tests {
         let (_sid, root) = make_box(&eng.sock);
         let dir = root.join("tmp");
         std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join("cd_info_TARGET.txt"),
-                       b"sample bytes\n").expect("write");
+        std::fs::write(dir.join("cd_info_TARGET.txt"), b"sample bytes\n").expect("write");
         let mut app = App::new(eng.sock.clone());
         app.refresh_sessions();
         app.load_changes();
-        app.open();          // sessions → changes
-        app.open();          // changes → hunks (loads the diff + cd-info)
+        app.open(); // sessions → changes
+        app.open(); // changes → hunks (loads the diff + cd-info)
         let buf = render_to_string(&app, 160, 40).unwrap();
-        assert!(buf.contains("/tmp/cd_info_TARGET.txt"),
-                "cd-info should show the leading-slashed full path:\n{buf}");
+        assert!(
+            buf.contains("/tmp/cd_info_TARGET.txt"),
+            "cd-info should show the leading-slashed full path:\n{buf}"
+        );
         assert!(buf.contains("path"), "cd-info title 'path' missing:\n{buf}");
     }
 
@@ -17264,8 +21776,7 @@ mod tests {
         let dir = root.join("tmp/page");
         std::fs::create_dir_all(&dir).expect("mkdir");
         for i in 0..60 {
-            std::fs::write(dir.join(format!("f_{i:04}.txt")),
-                           b"x").expect("write");
+            std::fs::write(dir.join(format!("f_{i:04}.txt")), b"x").expect("write");
         }
         let mut app = App::new(eng.sock.clone());
         app.refresh_sessions();
@@ -17278,9 +21789,14 @@ mod tests {
         // We don't require EXACTLY PAGE_SIZE because the tree has connector
         // rows that the cursor skips; just assert it moved by more than one
         // and less than 2× PAGE_SIZE.
-        assert!(moved > 1, "page_down should move more than 1 row, got {moved}");
-        assert!(moved <= PAGE_SIZE * 2,
-                "page_down moved {moved} rows, expected around {PAGE_SIZE}");
+        assert!(
+            moved > 1,
+            "page_down should move more than 1 row, got {moved}"
+        );
+        assert!(
+            moved <= PAGE_SIZE * 2,
+            "page_down moved {moved} rows, expected around {PAGE_SIZE}"
+        );
     }
 
     /// The rules pane right side parses the selected rule and prints the
@@ -17300,8 +21816,10 @@ mod tests {
         assert!(buf.contains("path:src/**"), "first clause missing:\n{buf}");
         assert!(buf.contains("exe:**/gcc"), "second clause missing:\n{buf}");
         // per-kind help line should appear for at least one kind.
-        assert!(buf.contains("changed path"),
-                "path-kind help line missing:\n{buf}");
+        assert!(
+            buf.contains("changed path"),
+            "path-kind help line missing:\n{buf}"
+        );
     }
 
     /// The overlay's mutating ops push (sid, rel, op) events through the
@@ -17319,16 +21837,16 @@ mod tests {
         let (sid, root) = make_box(&eng.sock);
         let dir = root.join("tmp");
         std::fs::create_dir_all(&dir).expect("mkdir through mount");
-        std::fs::write(dir.join("overlay_evt_marker.txt"), b"hi\n")
-            .expect("write through mount");
+        std::fs::write(dir.join("overlay_evt_marker.txt"), b"hi\n").expect("write through mount");
         // Wait for an overlay event whose sid matches the box we just wrote.
         let mut saw = false;
         for _ in 0..15 {
             if let Ok(ev) = rx.recv_timeout(Duration::from_secs(2)) {
                 if ev.get("type").and_then(Value::as_str) == Some("overlay")
-                   && ev.get("sid").and_then(Value::as_str) == Some(sid.as_str())
+                    && ev.get("sid").and_then(Value::as_str) == Some(sid.as_str())
                 {
-                    saw = true; break;
+                    saw = true;
+                    break;
                 }
             }
         }
@@ -17359,11 +21877,15 @@ mod tests {
         for _ in 0..15 {
             if let Ok(ev) = rx.recv_timeout(Duration::from_secs(2)) {
                 if ev.get("type").and_then(Value::as_str) == Some("process_added") {
-                    saw = true; break;
+                    saw = true;
+                    break;
                 }
             }
         }
-        assert!(saw, "expected a process_added event after running a command");
+        assert!(
+            saw,
+            "expected a process_added event after running a command"
+        );
     }
 
     /// Sessions sorted by dotted path so children land right after their
@@ -17381,8 +21903,10 @@ mod tests {
         // refresh_sessions sorts by `path`; sel_session=0 picks a real box.
         assert!(!app.sessions.is_empty(), "expected at least one session");
         let buf = render_to_string(&app, 160, 30).unwrap();
-        assert!(buf.contains('F') || buf.contains('R'),
-                "session F/R status flag missing:\n{buf}");
+        assert!(
+            buf.contains('F') || buf.contains('R'),
+            "session F/R status flag missing:\n{buf}"
+        );
         assert!(buf.contains("Name"), "Name column header missing:\n{buf}");
         assert!(buf.contains("PID"), "PID column header missing:\n{buf}");
         assert!(buf.contains("Cmd"), "Cmd column header missing:\n{buf}");
@@ -17407,26 +21931,36 @@ mod tests {
         app.load_pipelines();
         let buf = render_to_string(&app, 160, 30).unwrap();
         assert!(buf.contains("PIPELINES"), "pipelines title missing:\n{buf}");
-        assert!(buf.contains("no pipelines yet"),
-                "empty-state hint missing on pipelines pane:\n{buf}");
-        assert!(buf.contains("(l)") || buf.contains("Pipes"),
-                "menubar must surface the pipelines chip:\n{buf}");
+        assert!(
+            buf.contains("no pipelines yet"),
+            "empty-state hint missing on pipelines pane:\n{buf}"
+        );
+        assert!(
+            buf.contains("(l)") || buf.contains("Pipes"),
+            "menubar must surface the pipelines chip:\n{buf}"
+        );
         app.focus = Pane::BuildEdges;
         app.load_build_edges();
         let buf = render_to_string(&app, 160, 30).unwrap();
-        assert!(buf.contains("BUILD EDGES"), "build-edges title missing:\n{buf}");
-        assert!(buf.contains("no build edges yet"),
-                "empty-state hint missing on build-edges pane:\n{buf}");
-        assert!(buf.contains("(g)") || buf.contains("Build"),
-                "menubar must surface the build-edges chip:\n{buf}");
+        assert!(
+            buf.contains("BUILD EDGES"),
+            "build-edges title missing:\n{buf}"
+        );
+        assert!(
+            buf.contains("no build edges yet"),
+            "empty-state hint missing on build-edges pane:\n{buf}"
+        );
+        assert!(
+            buf.contains("(g)") || buf.contains("Build"),
+            "menubar must surface the build-edges chip:\n{buf}"
+        );
     }
 
     /// Run a real command in a -b BRUSH box (so brushprov rows actually
     /// land in the box's sqlar). Mirrors `run_cmd` but prepends `-b TAG`.
     fn run_cmd_brush(eng: &Engine, tag: &str, cmd: &[&str]) -> bool {
         let bin = engine_bin().expect("engine bin");
-        let mut args: Vec<String> = vec!["run".into(), "-b".into(),
-            tag.into(), "--".into()];
+        let mut args: Vec<String> = vec!["run".into(), "-b".into(), tag.into(), "--".into()];
         args.extend(cmd.iter().map(|s| s.to_string()));
         Command::new(&bin)
             .args(&args)
@@ -17455,8 +21989,15 @@ mod tests {
             eprintln!("SKIP: engine binary missing or FUSE unavailable");
             return;
         };
-        if !run_cmd_brush(&eng, "BRPIPE", &["sh", "-c",
-            "echo hi | tr a-z A-Z > /tmp/brush_pipe_uitest.txt"]) {
+        if !run_cmd_brush(
+            &eng,
+            "BRPIPE",
+            &[
+                "sh",
+                "-c",
+                "echo hi | tr a-z A-Z > /tmp/brush_pipe_uitest.txt",
+            ],
+        ) {
             eprintln!("SKIP: -b box failed to run (likely no userns / bwrap)");
             return;
         }
@@ -17466,17 +22007,24 @@ mod tests {
         app.sel_session = 0;
         app.focus = Pane::Pipelines;
         app.load_pipelines();
-        assert!(!app.pipelines.is_empty(),
+        assert!(
+            !app.pipelines.is_empty(),
             "load_pipelines returned 0 rows for a -b box that DID record a \
              pipeline — brushprov RPC wire format probably regressed (arg_sid \
-             rejecting i64 sids again?)");
+             rejecting i64 sids again?)"
+        );
         let buf = render_to_string(&app, 160, 30).unwrap();
-        assert!(!buf.contains("no pipelines yet"),
+        assert!(
+            !buf.contains("no pipelines yet"),
             "Pipes pane STILL renders the empty hint despite \
-             app.pipelines.len() = {}:\n{buf}", app.pipelines.len());
+             app.pipelines.len() = {}:\n{buf}",
+            app.pipelines.len()
+        );
         // the command text we ran must be visible on the pane.
-        assert!(buf.contains("tr") && buf.contains("echo hi"),
-            "rendered pane does not surface the recorded cmd:\n{buf}");
+        assert!(
+            buf.contains("tr") && buf.contains("echo hi"),
+            "rendered pane does not surface the recorded cmd:\n{buf}"
+        );
     }
 
     /// build_pipeline_tree reorders flat brushprov rows into DFS pre-order by
@@ -17491,8 +22039,10 @@ mod tests {
         ];
         let tree = build_pipeline_tree(rows);
         let at = |i: usize| {
-            (tree[i].get("cmd").and_then(Value::as_str).unwrap(),
-             tree[i].get("depth").and_then(Value::as_i64).unwrap())
+            (
+                tree[i].get("cmd").and_then(Value::as_str).unwrap(),
+                tree[i].get("depth").and_then(Value::as_i64).unwrap(),
+            )
         };
         // DFS pre-order: recipe → inner → echo deep, then the sibling root.
         assert_eq!(at(0), ("recipe", 0));
@@ -17509,7 +22059,9 @@ mod tests {
         // building: started, not yet ended.
         assert!(edge_running(&json!({"started_ts": 100.0, "ended_ts": 0.0})));
         // finished: both stamped.
-        assert!(!edge_running(&json!({"started_ts": 100.0, "ended_ts": 101.0})));
+        assert!(!edge_running(
+            &json!({"started_ts": 100.0, "ended_ts": 101.0})
+        ));
         // never ran (up-to-date / phony): no started_ts at all (NULL → 0).
         assert!(!edge_running(&json!({"outs": ["all"], "cmd": null})));
         // never ran, explicit zeros.
@@ -17525,7 +22077,10 @@ mod tests {
         ];
         let tree = build_pipeline_tree(rows);
         assert_eq!(tree.len(), 2);
-        assert!(tree.iter().all(|r| r.get("depth").and_then(Value::as_i64) == Some(0)));
+        assert!(
+            tree.iter()
+                .all(|r| r.get("depth").and_then(Value::as_i64) == Some(0))
+        );
     }
 
     /// Minimal control-socket stand-in serving just the mirror_* verbs the
@@ -17535,8 +22090,8 @@ mod tests {
     /// fixture SETUP still calls crate::mirrors directly, like other pane
     /// tests inject their data.
     fn mirror_verb_server(tag: &str) -> String {
-        let sock = std::env::temp_dir()
-            .join(format!("sarun-mvs-{tag}-{}.sock", std::process::id()));
+        let sock =
+            std::env::temp_dir().join(format!("sarun-mvs-{tag}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
@@ -17545,10 +22100,15 @@ mod tests {
                 if BufReader::new(&conn).read_line(&mut line).is_err() {
                     continue;
                 }
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
                 let verb = msg.get("verb").and_then(Value::as_str).unwrap_or("");
-                let args = msg.get("args").and_then(Value::as_array)
-                    .cloned().unwrap_or_default();
+                let args = msg
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 let id = args.first().and_then(Value::as_i64).unwrap_or(-1);
                 let r = match verb {
                     "mirror_jobs" => match crate::mirrors::jobs_list() {
@@ -17589,21 +22149,25 @@ mod tests {
     #[test]
     fn mirrors_pane_lists_jobs_and_space_toggles_pause() {
         let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir()
-            .join(format!("sarun-mirrorsui-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sarun-mirrorsui-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         // SAFETY: serialized by TEST_STATE_HOME_LOCK with the other
         // state-home-dependent tests.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
-        let id = crate::mirrors::job_add(
-            "git", "https://example.com/x.git", "/depot/x", 3600).unwrap();
+        let id =
+            crate::mirrors::job_add("git", "https://example.com/x.git", "/depot/x", 3600).unwrap();
         let mut app = App::bare(mirror_verb_server("pause"));
         app.go_to_pane(Pane::Mirrors);
         assert!(matches!(app.focus, Pane::Mirrors));
-        let job = app.mirror_jobs.iter().find(|j| j.id == id)
+        let job = app
+            .mirror_jobs
+            .iter()
+            .find(|j| j.id == id)
             .expect("job must load on focus");
         assert_eq!(job.state, "pending", "never-ran job is due now");
         let buf = render_to_string(&app, 120, 30).unwrap();
@@ -17625,40 +22189,58 @@ mod tests {
     fn mirrors_pane_d_deletes_the_selected_job_with_confirm() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir()
-            .join(format!("sarun-mirrorsrm-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sarun-mirrorsrm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         // SAFETY: serialized by TEST_STATE_HOME_LOCK with the other
         // state-home-dependent tests.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
-        let id = crate::mirrors::job_add(
-            "git", "file:///src.git", "/depot/g", 3600).unwrap();
+        let id = crate::mirrors::job_add("git", "file:///src.git", "/depot/g", 3600).unwrap();
         let mut app = App::bare(mirror_verb_server("rm"));
         app.go_to_pane(Pane::Mirrors);
-        assert!(dispatch_pane_key(&mut app, KeyCode::Char('D')),
-                "'D' must be handled by the pane-key table");
+        assert!(
+            dispatch_pane_key(&mut app, KeyCode::Char('D')),
+            "'D' must be handled by the pane-key table"
+        );
         assert!(!app.should_quit, "'D' on Mirrors must not quit");
         match &app.modal {
-            Some(Modal::Confirm { action: ConfirmAction::MirrorRemove(j), prompt }) => {
+            Some(Modal::Confirm {
+                action: ConfirmAction::MirrorRemove(j),
+                prompt,
+            }) => {
                 assert_eq!(*j, id);
                 assert!(prompt.contains("file:///src.git"), "{prompt}");
             }
-            other => panic!("'D' on Mirrors must open the mirror-rm confirm, got {:?}",
-                            other.is_some()),
+            other => panic!(
+                "'D' on Mirrors must open the mirror-rm confirm, got {:?}",
+                other.is_some()
+            ),
         }
         // The confirm renders (no draw panic), then 'y' deletes + reloads.
         let buf = render_to_string(&app, 120, 30).unwrap();
-        assert!(buf.contains("Delete mirror job"), "confirm not rendered:\n{buf}");
+        assert!(
+            buf.contains("Delete mirror job"),
+            "confirm not rendered:\n{buf}"
+        );
         handle_modal_key(&mut app, KeyCode::Char('y'), KeyModifiers::empty());
         assert!(app.modal.is_none());
         assert!(!app.should_quit);
         assert!(app.status.contains("deleted"), "{}", app.status);
-        assert!(app.mirror_jobs.iter().all(|j| j.id != id), "pane must reload");
-        assert!(crate::mirrors::jobs_list().unwrap().iter().all(|j| j.id != id),
-                "job must be gone from the store");
+        assert!(
+            app.mirror_jobs.iter().all(|j| j.id != id),
+            "pane must reload"
+        );
+        assert!(
+            crate::mirrors::jobs_list()
+                .unwrap()
+                .iter()
+                .all(|j| j.id != id),
+            "job must be gone from the store"
+        );
     }
 
     /// The destructive box ops (D dissolve / K kill) NO-OP with a status
@@ -17684,7 +22266,9 @@ mod tests {
     fn confirm_modal_renders_on_a_tiny_terminal() {
         let mut app = headless_app();
         app.modal = Some(Modal::Confirm {
-            prompt: "Delete?".into(), action: ConfirmAction::Dissolve });
+            prompt: "Delete?".into(),
+            action: ConfirmAction::Dissolve,
+        });
         for (w, h) in [(1u16, 1u16), (10, 5), (19, 24), (80, 24)] {
             render_to_string(&app, w, h).unwrap();
         }
@@ -17700,27 +22284,38 @@ mod tests {
         let r = crate::reader::Reader::open_bytes(
             "guide.md".into(),
             b"# Alpha Heading\n\nbody text with [a link](x.md)\n\n\
-              ## Beta Section\n\nmore\n".to_vec()).unwrap();
+              ## Beta Section\n\nmore\n"
+                .to_vec(),
+        )
+        .unwrap();
         app.reader.replace(Some(r));
         app.focus = Pane::Reader;
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("READER · outline"), "outline column:\n{buf}");
-        assert!(buf.contains("Alpha Heading"), "outline lists headings:\n{buf}");
+        assert!(
+            buf.contains("Alpha Heading"),
+            "outline lists headings:\n{buf}"
+        );
         assert!(buf.contains("Beta Section"));
         assert!(buf.contains("body text"), "document body renders:\n{buf}");
         assert!(buf.contains("guide.md"), "document title renders:\n{buf}");
         assert!(handle_reader_key(&mut app, KeyCode::Char('z')));
         assert!(app.reader_full, "'z' zooms");
         let buf = render_to_string(&app, 100, 30).unwrap();
-        assert!(!buf.contains("READER · outline"), "zoom drops the outline:\n{buf}");
+        assert!(
+            !buf.contains("READER · outline"),
+            "zoom drops the outline:\n{buf}"
+        );
         assert!(buf.contains("body text"), "zoomed document renders:\n{buf}");
         assert!(handle_reader_key(&mut app, KeyCode::Esc));
         assert!(!app.reader_full, "Esc unwinds the zoom first");
         // j (scroll) is consumed by the reader, so it never moves a list
         // cursor; an unbound key falls through for the accelerators.
         assert!(handle_reader_key(&mut app, KeyCode::Char('j')));
-        assert!(!handle_reader_key(&mut app, KeyCode::Char('c')),
-                "letter chips fall through to pane switching");
+        assert!(
+            !handle_reader_key(&mut app, KeyCode::Char('c')),
+            "letter chips fall through to pane switching"
+        );
     }
 
     /// Reader empty state: the chip lands in the path prompt, the pane shows
@@ -17730,13 +22325,17 @@ mod tests {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = headless_app();
         app.go_to_pane(Pane::Reader);
-        assert!(matches!(app.modal, Some(Modal::ReaderOpen { .. })),
-                "first visit opens the path prompt");
+        assert!(
+            matches!(app.modal, Some(Modal::ReaderOpen { .. })),
+            "first visit opens the path prompt"
+        );
         app.modal = None;
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("no document open"), "empty-state hint:\n{buf}");
-        assert!(handle_reader_key(&mut app, KeyCode::Char('o')),
-                "'o' reopens the prompt");
+        assert!(
+            handle_reader_key(&mut app, KeyCode::Char('o')),
+            "'o' reopens the prompt"
+        );
         assert!(matches!(app.modal, Some(Modal::ReaderOpen { .. })));
         // Type a bad path into the modal and confirm: loud error, no mount.
         for c in "/no/such/file.md".chars() {
@@ -17757,7 +22356,11 @@ mod tests {
         std::fs::write(&p, "# Notes\n\nhello reader\n").unwrap();
         let mut app = headless_app();
         app.reader_open_spec(p.to_str().unwrap());
-        assert!(app.focus == Pane::Reader, "mount focuses the reader: {}", app.status);
+        assert!(
+            app.focus == Pane::Reader,
+            "mount focuses the reader: {}",
+            app.status
+        );
         assert!(app.status.contains("reading"), "{}", app.status);
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("hello reader"), "document renders:\n{buf}");
@@ -17772,8 +22375,11 @@ mod tests {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = headless_app();
         let e = crate::editor::EditorPane::open_box(
-            "7".into(), "src/answer.py".into(),
-            b"def answer():\n    return 42\n".to_vec()).unwrap();
+            "7".into(),
+            "src/answer.py".into(),
+            b"def answer():\n    return 42\n".to_vec(),
+        )
+        .unwrap();
         app.editor.replace(Some(e));
         app.focus = Pane::Editor;
         let buf = render_to_string(&app, 100, 30).unwrap();
@@ -17781,20 +22387,30 @@ mod tests {
         assert!(buf.contains("box:7:/src/answer.py"), "target label:\n{buf}");
         assert!(buf.contains("language: python"), "language line:\n{buf}");
         assert!(buf.contains("return 42"), "buffer renders:\n{buf}");
-        assert!(handle_editor_key(&mut app, KeyCode::Char('z'),
-                                  KeyModifiers::empty()));
+        assert!(handle_editor_key(
+            &mut app,
+            KeyCode::Char('z'),
+            KeyModifiers::empty()
+        ));
         assert!(app.editor_full, "'z' zooms");
         let buf = render_to_string(&app, 100, 30).unwrap();
-        assert!(!buf.contains("info card") && !buf.contains("language: python"),
-                "zoom drops the info card:\n{buf}");
+        assert!(
+            !buf.contains("info card") && !buf.contains("language: python"),
+            "zoom drops the info card:\n{buf}"
+        );
         assert!(buf.contains("return 42"), "zoomed editor renders:\n{buf}");
-        assert!(handle_editor_key(&mut app, KeyCode::Esc, KeyModifiers::empty()));
+        assert!(handle_editor_key(
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::empty()
+        ));
         assert!(!app.editor_full, "Esc unwinds the zoom first");
         // An OPEN buffer consumes normal-mode letters (vim motions) — the
         // 'c' chip must NOT fire from inside the editor.
-        assert!(handle_editor_key(&mut app, KeyCode::Char('c'),
-                                  KeyModifiers::empty()),
-                "open buffer consumes letters");
+        assert!(
+            handle_editor_key(&mut app, KeyCode::Char('c'), KeyModifiers::empty()),
+            "open buffer consumes letters"
+        );
     }
 
     /// Editor empty state: the chip lands in the path prompt, the pane
@@ -17805,17 +22421,21 @@ mod tests {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = headless_app();
         app.go_to_pane(Pane::Editor);
-        assert!(matches!(app.modal, Some(Modal::EditorOpen { .. })),
-                "first visit opens the path prompt");
+        assert!(
+            matches!(app.modal, Some(Modal::EditorOpen { .. })),
+            "first visit opens the path prompt"
+        );
         app.modal = None;
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("no file open"), "empty-state hint:\n{buf}");
-        assert!(!handle_editor_key(&mut app, KeyCode::Char('c'),
-                                   KeyModifiers::empty()),
-                "empty pane lets the letter chips fall through");
-        assert!(handle_editor_key(&mut app, KeyCode::Char('o'),
-                                  KeyModifiers::empty()),
-                "'o' reopens the prompt");
+        assert!(
+            !handle_editor_key(&mut app, KeyCode::Char('c'), KeyModifiers::empty()),
+            "empty pane lets the letter chips fall through"
+        );
+        assert!(
+            handle_editor_key(&mut app, KeyCode::Char('o'), KeyModifiers::empty()),
+            "'o' reopens the prompt"
+        );
         assert!(matches!(app.modal, Some(Modal::EditorOpen { .. })));
         for c in "/no/such/file.rs".chars() {
             handle_modal_key(&mut app, KeyCode::Char(c), KeyModifiers::empty());
@@ -17841,17 +22461,31 @@ mod tests {
         std::fs::write(&p, "key: value\n").unwrap();
         let mut app = headless_app();
         app.editor_open_spec(p.to_str().unwrap());
-        assert!(app.focus == Pane::Editor, "mount focuses the editor: {}", app.status);
+        assert!(
+            app.focus == Pane::Editor,
+            "mount focuses the editor: {}",
+            app.status
+        );
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("key: value"), "buffer renders:\n{buf}");
         // i…Esc: prepend a comment char through the real vim handler.
         for (c, m) in [('i', KeyModifiers::empty())] {
             assert!(handle_editor_key(&mut app, KeyCode::Char(c), m));
         }
-        assert!(handle_editor_key(&mut app, KeyCode::Char('#'),
-                                  KeyModifiers::empty()));
-        assert!(handle_editor_key(&mut app, KeyCode::Esc, KeyModifiers::empty()));
-        assert!(app.editor.borrow().as_ref().unwrap().dirty, "edit sets dirty");
+        assert!(handle_editor_key(
+            &mut app,
+            KeyCode::Char('#'),
+            KeyModifiers::empty()
+        ));
+        assert!(handle_editor_key(
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::empty()
+        ));
+        assert!(
+            app.editor.borrow().as_ref().unwrap().dirty,
+            "edit sets dirty"
+        );
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("MODIFIED"), "dirty flag on the card:\n{buf}");
         // A dirty buffer refuses to be replaced by another open.
@@ -17860,10 +22494,16 @@ mod tests {
         assert!(app.status.contains("UNSAVED"), "{}", app.status);
         assert_eq!(app.editor.borrow().as_ref().unwrap().target, keep);
         // Ctrl-S: byte-exact host write, flag cleared.
-        assert!(handle_editor_key(&mut app, KeyCode::Char('s'),
-                                  KeyModifiers::CONTROL));
-        assert_eq!(std::fs::read(&p).unwrap(), b"#key: value\n",
-                   "save round-trips byte-exact");
+        assert!(handle_editor_key(
+            &mut app,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL
+        ));
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"#key: value\n",
+            "save round-trips byte-exact"
+        );
         assert!(!app.editor.borrow().as_ref().unwrap().dirty);
         assert!(app.status.contains("saved"), "{}", app.status);
     }
