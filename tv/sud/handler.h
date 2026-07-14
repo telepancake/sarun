@@ -31,7 +31,7 @@ extern volatile unsigned char *g_sud_selector_ptr;
  * used with the raw rt_sigaction syscall.
  * ================================================================ */
 struct kernel_sigaction_raw {
-    void (*handler)(int);
+    void (*handler)(int, siginfo_t *, void *);
     unsigned long flags;
     void (*restorer)(void);
     sud_sigset_word_t mask;

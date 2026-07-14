@@ -262,10 +262,9 @@ int sud_inramfs_owns_fd(int fd);
  *                                               fcntl F_DUPFD[_CLOEXEC]
  *
  * On success returns the new fd (which is registered in the inramfs
- * fd table, sharing the same inode/flags as oldfd).  Each duplicated
- * fd has its own seek position (a documented divergence from
- * Linux's "shared open file description" for dup2/3 — exercising
- * shared positions across dup'd fds is rare in build workloads). */
+ * fd table, sharing the same inode, file-status flags, seek position,
+ * and directory cookie as oldfd, matching Linux's shared open file
+ * description semantics across dup and fork. */
 long sud_inramfs_op_dup(int oldfd);
 long sud_inramfs_op_dup3(int oldfd, int newfd, int flags);
 long sud_inramfs_op_fcntl_dupfd(int oldfd, int minfd, int cloexec);

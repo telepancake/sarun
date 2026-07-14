@@ -27,7 +27,7 @@ void install_sigsys_handler_raw(void)
 #ifdef SYS_rt_sigaction
     struct kernel_sigaction_raw sa;
     memset(&sa, 0, sizeof(sa));
-    sa.handler = (void (*)(int))sigsys_handler;
+    sa.handler = sigsys_handler;
     /* SA_ONSTACK: run the SIGSYS handler on the alternate signal stack
      * installed by ensure_sud_altstack(). The handler is invoked for
      * every syscall the traced program makes and uses several KiB of
@@ -395,7 +395,7 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
     char addin_scratch[PATH_MAX * 2];
     struct sud_syscall_ctx ctx = {
         nr, { a0, a1, a2, a3, a4, a5 }, 0, tid,
-        addin_scratch, sizeof(addin_scratch)
+        addin_scratch, sizeof(addin_scratch), { 0 }
     };
     if (sud_addins_pre_syscall(&ctx)) {
         UC_SET_RET(uc, ctx.ret);

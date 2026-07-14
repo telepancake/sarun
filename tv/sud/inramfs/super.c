@@ -785,15 +785,12 @@ static void *fixed_addr(void)
  * MAP_NORESERVE region so its full virtual size (8 GiB by default)
  * is reserved up front but only physical pages for blocks that get
  * touched are actually allocated. */
+#if defined(__x86_64__)
 static void *fixed_data_addr(void)
 {
-#if defined(__x86_64__)
     return (void *)0x600000000000UL;
-#else
-    /* Unused on 32-bit. */
-    return (void *)0;
-#endif
 }
+#endif
 
 /* Initialise a freshly-created **metadata** region.  Caller has the
  * init latch.  meta_size is the user-chosen metadata mapping length.
@@ -818,6 +815,11 @@ static void init_meta_region(struct sud_ir_super *sb, uint64_t meta_size)
     sb->small_shm_size = SUD_IR_SMALL_SHM_SIZE;
 
     uint32_t off = (uint32_t)((sizeof(*sb) + 63) & ~63u);
+
+    sb->ofd_count         = SUD_IR_MAX_OPEN_DESCS;
+    sb->ofd_table_off     = off;
+    off += sb->ofd_count * (uint32_t)sizeof(struct sud_ir_shared_ofd);
+    off = (off + 63) & ~63u;
 
     sb->inode_count       = SUD_IR_MAX_INODES;
     sb->inode_bitmap_off  = off;
