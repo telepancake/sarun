@@ -128,28 +128,32 @@ fn rename_rpc(sock: &str, sid: &str, name: &str) -> Result<Value, String> {
     Ok(rep)
 }
 
+fn control_message(invocation: &crate::parser::Invocation) -> Result<Value, String> {
+    match (invocation.dispatch_name(), invocation.args.as_slice()) {
+        (kind @ ("apply" | "discard"), [sid]) => {
+            let sid = sid.as_string().ok_or("control SID must be a string")?;
+            Ok(json!({"type": kind, "sid": sid}))
+        }
+        ("rename", [sid, name]) => {
+            let sid = sid.as_string().ok_or("control SID must be a string")?;
+            let name = name.as_string().ok_or("control name must be a string")?;
+            Ok(json!({"type": "rename", "sid": sid, "name": name}))
+        }
+        (kind @ ("apply" | "discard"), _) => {
+            Err(format!("{kind} requires exactly SID in the command prompt"))
+        }
+        ("rename", _) => Err("rename requires exactly SID NEW".into()),
+        (other, _) => Err(format!("unsupported control action: {other}")),
+    }
+}
+
 /// Send one explicitly-supported top-level control message. Unlike `rpc`, this
 /// never wraps the action as a UI verb.
 fn control_message_rpc(
     sock: &str,
     invocation: &crate::parser::Invocation,
 ) -> Result<Value, String> {
-    let message = match (invocation.dispatch_name(), invocation.args.as_slice()) {
-        (kind @ ("apply" | "discard"), [sid]) => {
-            let sid = sid.as_string().ok_or("control SID must be a string")?;
-            json!({"type": kind, "sid": sid})
-        }
-        ("rename", [sid, name]) => {
-            let sid = sid.as_string().ok_or("control SID must be a string")?;
-            let name = name.as_string().ok_or("control name must be a string")?;
-            json!({"type": "rename", "sid": sid, "name": name})
-        }
-        (kind @ ("apply" | "discard"), _) => {
-            return Err(format!("{kind} requires exactly SID in the command prompt"));
-        }
-        ("rename", _) => return Err("rename requires exactly SID NEW".into()),
-        (other, _) => return Err(format!("unsupported control action: {other}")),
-    };
+    let message = control_message(invocation)?;
     let mut stream = UnixStream::connect(sock).map_err(|error| format!("connect: {error}"))?;
     stream
         .write_all(format!("{message}\n").as_bytes())
@@ -18338,7 +18342,25 @@ pub fn ui_main(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::char_safe_slice;
+    use super::{char_safe_slice, control_message};
+
+    #[test]
+    fn control_messages_keep_sid_as_a_string() {
+        for (input, expected) in [
+            ("apply 5", serde_json::json!({"type": "apply", "sid": "5"})),
+            (
+                "discard 5",
+                serde_json::json!({"type": "discard", "sid": "5"}),
+            ),
+            (
+                "rename 5 NEW",
+                serde_json::json!({"type": "rename", "sid": "5", "name": "NEW"}),
+            ),
+        ] {
+            let invocation = crate::parser::parse_action(input).unwrap();
+            assert_eq!(control_message(&invocation).unwrap(), expected, "{input}");
+        }
+    }
 
     /// The "scrolling Outputs of a browser box crashes sarun" regression:
     /// slicing a byte-window out of multi-byte UTF-8 output must snap to char

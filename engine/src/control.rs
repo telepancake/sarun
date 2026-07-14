@@ -1393,6 +1393,14 @@ fn arg_sid(args: &[Value]) -> Option<i64> {
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
+fn flow_args<'a>(state: &State, args: &'a [Value]) -> Option<(i64, &'a Value)> {
+    match args {
+        [value] => Some((selected_sid(state)?, value)),
+        [sid, value] => Some((sid.as_str()?.parse().ok()?, value)),
+        _ => None,
+    }
+}
+
 /// Unconditionally remove a box: drop it from the overlay, delete its sqlar +
 /// backing + pool blobs, broadcast session_removed. The `delete` verb's body.
 /// Whether any box stacks ON `id` (i.e. `id` is a parent). A box with children
@@ -3378,7 +3386,7 @@ macro_rules! ui_verbs {
                 _ => json!({"ok": false, "error": "bad args"}),
             }
         }
-        "review.apply", "SID [PATHS]", "apply a box's changes to the host" => { match arg_sid(args) {
+        "review.apply", "SID [PATHS...]", "apply a box's changes to the host" => { match arg_sid(args) {
             // Audit H3: refuse a still-running box — its captured blobs may be
             // mid-write, so applying could stamp a torn blob onto the host.
             Some(id) if box_is_running(state, id) => json!({"applied": [],
@@ -3392,7 +3400,7 @@ macro_rules! ui_verbs {
             None => json!({"applied": [], "errors": []}),
         }
         }
-        "review.discard", "SID [PATHS]", "discard a box's changes" => { match arg_sid(args) {
+        "review.discard", "SID [PATHS...]", "discard a box's changes" => { match arg_sid(args) {
             // Audit H3: same running-box guard as apply (discard reads the same
             // blobs to copy them DOWN into children before dropping the row).
             Some(id) if box_is_running(state, id) => json!({"discarded": [],
@@ -3669,9 +3677,9 @@ macro_rules! ui_verbs {
             }
         }
         "flows.detail", "[SID] FRAME", "full tshark decode of one frame" => {
-            let frame = args.get(1).and_then(Value::as_u64).unwrap_or(0);
-            match arg_sid(args).or_else(|| selected_sid(state)) {
-                Some(id) if frame > 0 => match flows_dir_for(id) {
+            match flow_args(state, args)
+                    .and_then(|(id, frame)| frame.as_u64().map(|frame| (id, frame))) {
+                Some((id, frame)) if frame > 0 => match flows_dir_for(id) {
                     Some(dir) => match crate::net::flows::tshark_detail(&dir, frame) {
                         Ok(text) => json!({"ok": true, "text": text}),
                         Err(e) => json!({"ok": false, "error": e}),
@@ -3734,9 +3742,9 @@ macro_rules! ui_verbs {
         // (i.e. the connection the user just drilled into from the flows
         // list pane). Powers the packet-list view inside Pane::Packets.
         "flows.packets", "[SID] STREAM", "every frame of one TCP stream" => {
-            let stream = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
-            match arg_sid(args).or_else(|| selected_sid(state)) {
-                Some(id) if stream >= 0 => match flows_dir_for(id) {
+            match flow_args(state, args)
+                    .and_then(|(id, stream)| stream.as_i64().map(|stream| (id, stream))) {
+                Some((id, stream)) if stream >= 0 => match flows_dir_for(id) {
                     Some(dir) => match crate::net::flows::tshark_packets(&dir, stream) {
                         Ok(rows) => json!({"ok": true,
                             "packets": rows.iter().map(|r| r.to_json())
@@ -5750,5 +5758,53 @@ mod verb_tests {
         assert!(rows.len() >= 5);
         let all = dispatch_ui_verb(&state, "verbs", &[], &boxes);
         assert_eq!(all["r"].as_array().unwrap().len(), VERB_DOCS.len());
+    }
+
+    #[test]
+    fn flow_args_accept_optional_string_sid_and_numeric_value() {
+        let state: State = Default::default();
+        lock(&state).selected = Some("42".into());
+
+        let selected_args = [json!(34)];
+        let explicit_args = [json!("12"), json!(34)];
+        assert_eq!(flow_args(&state, &selected_args), Some((42, &json!(34))));
+        assert_eq!(flow_args(&state, &explicit_args), Some((12, &json!(34))));
+
+        for args in [
+            vec![],
+            vec![json!(12), json!(34)],
+            vec![json!("bad"), json!(34)],
+            vec![json!("12"), json!(34), json!(56)],
+        ] {
+            assert_eq!(flow_args(&state, &args), None, "accepted {args:?}");
+        }
+
+        let no_selection: State = Default::default();
+        assert_eq!(flow_args(&no_selection, &selected_args), None);
+    }
+
+    #[test]
+    fn flow_handlers_accept_explicit_or_selected_sid() {
+        let state: State = Default::default();
+        lock(&state).selected = Some("42".into());
+        let boxes = std::collections::BTreeMap::new();
+
+        for (verb, value) in [("flows.detail", 1), ("flows.packets", 0)] {
+            for args in [vec![json!(value)], vec![json!("42"), json!(value)]] {
+                let r = dispatch_ui_verb(&state, verb, &args, &boxes);
+                assert_eq!(r["r"]["error"], "no flows dir for box", "{verb} {args:?}");
+            }
+            for args in [
+                vec![json!("42")],
+                vec![json!(42), json!(value)],
+                vec![json!("42"), json!("not numeric")],
+            ] {
+                let r = dispatch_ui_verb(&state, verb, &args, &boxes);
+                assert_eq!(r["r"]["error"], "bad args", "{verb} {args:?}");
+            }
+        }
+
+        assert_eq!(dispatch_ui_verb(&state, "flows.detail", &[json!(0)], &boxes)["r"]["error"], "bad args");
+        assert_eq!(dispatch_ui_verb(&state, "flows.packets", &[json!(-1)], &boxes)["r"]["error"], "bad args");
     }
 }

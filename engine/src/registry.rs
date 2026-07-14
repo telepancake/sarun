@@ -53,6 +53,7 @@ pub enum ArgValue {
     Number(i64),
     Bool(bool),
     String(String),
+    Array(Vec<ArgValue>),
 }
 
 impl ArgValue {
@@ -61,6 +62,9 @@ impl ArgValue {
             Self::Number(value) => serde_json::Value::Number((*value).into()),
             Self::Bool(value) => serde_json::Value::Bool(*value),
             Self::String(value) => serde_json::Value::String(value.clone()),
+            Self::Array(values) => {
+                serde_json::Value::Array(values.iter().map(Self::json).collect())
+            }
         }
     }
 
@@ -69,6 +73,18 @@ impl ArgValue {
             Self::Number(value) => value.to_string(),
             Self::Bool(value) => value.to_string(),
             Self::String(value) => value.clone(),
+            Self::Array(values) => values
+                .iter()
+                .flat_map(Self::source_tokens)
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
+    pub fn source_tokens(&self) -> Vec<String> {
+        match self {
+            Self::Array(values) => values.iter().flat_map(Self::source_tokens).collect(),
+            _ => vec![self.text()],
         }
     }
 
@@ -87,6 +103,7 @@ pub struct ArgSpec {
     pub kind: ArgKind,
     pub required: bool,
     pub variadic: bool,
+    pub wire_array: bool,
 }
 
 const NO_ARGS: &[ArgSpec] = &[];
@@ -96,24 +113,28 @@ const MIRROR_ADD_ARGS: &[ArgSpec] = &[
         kind: ArgKind::String,
         required: true,
         variadic: false,
+        wire_array: false,
     },
     ArgSpec {
         name: "SRC",
         kind: ArgKind::String,
         required: true,
         variadic: false,
+        wire_array: false,
     },
     ArgSpec {
         name: "DEST",
         kind: ArgKind::Path,
         required: true,
         variadic: false,
+        wire_array: false,
     },
     ArgSpec {
         name: "INTERVAL_SECS",
         kind: ArgKind::Integer,
         required: false,
         variadic: false,
+        wire_array: false,
     },
 ];
 const MIRROR_JOB_ARGS: &[ArgSpec] = &[ArgSpec {
@@ -121,6 +142,7 @@ const MIRROR_JOB_ARGS: &[ArgSpec] = &[ArgSpec {
     kind: ArgKind::MirrorJobId,
     required: true,
     variadic: false,
+    wire_array: false,
 }];
 const MIRROR_PAUSE_ARGS: &[ArgSpec] = &[
     ArgSpec {
@@ -128,12 +150,14 @@ const MIRROR_PAUSE_ARGS: &[ArgSpec] = &[
         kind: ArgKind::MirrorJobId,
         required: true,
         variadic: false,
+        wire_array: false,
     },
     ArgSpec {
         name: "PAUSED",
         kind: ArgKind::Bool,
         required: true,
         variadic: false,
+        wire_array: false,
     },
 ];
 
@@ -155,9 +179,10 @@ pub struct ActionSpec {
 fn derived_kind(name: &str) -> ArgKind {
     match name {
         "BOOL" | "PAUSED" | "RUNNING_ONLY" | "ANY" => ArgKind::Bool,
-        "SID" | "ID" | "ROW" | "OUTPUT" | "FRAME" | "STREAM" | "VIEW" | "START" | "SIZE"
-        | "LIMIT" | "JOB" | "HUNK_IX" | "PROV_ID" | "AMOUNT" | "PARENT_SID" | "ROW_ID"
-        | "RO_ID" | "PIPELINE" | "INTERVAL_SECS" | "IDS" => ArgKind::Integer,
+        "ID" | "ROW" | "OUTPUT" | "FRAME" | "STREAM" | "VIEW" | "START" | "SIZE"
+        | "LIMIT" | "JOB" | "HUNK_IX" | "PROV_ID" | "AMOUNT" | "ROW_ID" | "RO_ID"
+        | "PIPELINE" | "INTERVAL_SECS" | "IDS" => ArgKind::Integer,
+        "SID" | "PARENT_SID" | "BOX" => ArgKind::String,
         "PATH" | "PATHS" | "REL" | "RELS" | "DEST" | "ROOT" | "SUBPATH" => ArgKind::Path,
         "B64" => ArgKind::Base64,
         "SPEC" => ArgKind::Spec,
@@ -183,6 +208,7 @@ fn derive_arg_schema(notation: &'static str) -> Box<[ArgSpec]> {
                 kind: derived_kind(name),
                 required,
                 variadic,
+                wire_array: variadic && matches!(name, "PATHS" | "RELS" | "IDS"),
             }
         })
         .collect()
@@ -243,8 +269,18 @@ fn parse_schema_args(schema: &[ArgSpec], args: &[&str]) -> Option<Vec<ArgValue>>
         if spec.required && take == 0 {
             return None;
         }
-        for value in &args[value_ix..value_ix + take] {
-            parsed.push(parse_arg(spec, value)?);
+        if spec.wire_array {
+            let values = args[value_ix..value_ix + take]
+                .iter()
+                .map(|value| parse_arg(spec, value))
+                .collect::<Option<Vec<_>>>()?;
+            if take > 0 || required_after > 0 {
+                parsed.push(ArgValue::Array(values));
+            }
+        } else {
+            for value in &args[value_ix..value_ix + take] {
+                parsed.push(parse_arg(spec, value)?);
+            }
         }
         value_ix += take;
     }
@@ -513,7 +549,7 @@ pub static ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         verb: "apply",
         help: "apply a box's changes to the host",
-        args: "SID [PATHS]",
+        args: "SID",
         key: Some('a'),
         ctx: None,
         menu: Some("Apply ALL changes to host"),
@@ -522,7 +558,7 @@ pub static ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         verb: "discard",
         help: "discard a box's changes",
-        args: "SID [PATHS]",
+        args: "SID",
         key: Some('x'),
         ctx: None,
         menu: Some("Discard ALL changes"),
@@ -1289,20 +1325,23 @@ mod tests {
             &[
                 ArgSpec {
                     name: "SID",
-                    kind: ArgKind::Integer,
+                    kind: ArgKind::String,
                     required: false,
                     variadic: false,
+                    wire_array: false,
                 },
                 ArgSpec {
                     name: "FRAME",
                     kind: ArgKind::Integer,
                     required: true,
                     variadic: false,
+                    wire_array: false,
                 },
             ]
         );
         let rels = find("review.decorate_many").unwrap().arg_schema().unwrap();
         assert!(rels[1].variadic);
+        assert!(rels[1].wire_array);
         assert_eq!(rels[1].kind, ArgKind::Path);
         assert_eq!(
             find("oaita.probe").unwrap().arg_schema().unwrap()[0].kind,
@@ -1319,6 +1358,79 @@ mod tests {
             ArgKind::MirrorJobId
         );
         assert!(mirror_id.parse_args(&["-1"]).is_none());
+    }
+
+    #[test]
+    fn protocol_identifier_and_numeric_kinds_are_distinct() {
+        for (verb, index) in [
+            ("review.hunks", 0),
+            ("box_new", 0),
+            ("box_file_read", 0),
+        ] {
+            assert_eq!(
+                find(verb).unwrap().arg_schema().unwrap()[index].kind,
+                ArgKind::String,
+                "{verb}"
+            );
+        }
+        assert_eq!(
+            find("box_file_read").unwrap().arg_schema().unwrap()[1].kind,
+            ArgKind::Path
+        );
+        for (verb, index) in [("flows.detail", 1), ("view.window", 0), ("view.window", 1)] {
+            assert_eq!(
+                find(verb).unwrap().arg_schema().unwrap()[index].kind,
+                ArgKind::Integer,
+                "{verb}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_wire_variadics_are_grouped() {
+        assert_eq!(
+            find("review.apply").unwrap().parse_args(&["box", "a", "b"]),
+            Some(vec![
+                ArgValue::String("box".into()),
+                ArgValue::Array(vec![
+                    ArgValue::String("a".into()),
+                    ArgValue::String("b".into()),
+                ]),
+            ])
+        );
+        assert_eq!(
+            find("review.map_ids")
+                .unwrap()
+                .parse_args(&["box", "process", "edge"]),
+            Some(vec![
+                ArgValue::String("box".into()),
+                ArgValue::String("process".into()),
+                ArgValue::Array(vec![]),
+                ArgValue::String("edge".into()),
+            ])
+        );
+        assert_eq!(
+            find("review.decorate_many").unwrap().parse_args(&["box"]),
+            Some(vec![ArgValue::String("box".into())])
+        );
+        assert_eq!(
+            find("ro_attach").unwrap().parse_args(&["box", "2", "3"]),
+            Some(vec![
+                ArgValue::String("box".into()),
+                ArgValue::Number(2),
+                ArgValue::Number(3),
+            ])
+        );
+    }
+
+    #[test]
+    fn top_level_control_schemas_have_exact_arity() {
+        for verb in ["apply", "discard"] {
+            assert!(find(verb).unwrap().accepts_args(&["box"]));
+            assert!(!find(verb).unwrap().accepts_args(&["box", "path"]));
+        }
+        assert!(find("rename").unwrap().accepts_args(&["box", "new"]));
+        assert!(!find("rename").unwrap().accepts_args(&["box"]));
     }
 
     #[test]

@@ -485,7 +485,7 @@ pub fn parse_command(input: &str) -> (String, Vec<String>) {
             invocation
                 .args
                 .iter()
-                .map(crate::registry::ArgValue::text)
+                .flat_map(crate::registry::ArgValue::source_tokens)
                 .collect(),
         ),
         _ => (String::new(), Vec::new()),
@@ -917,7 +917,7 @@ pub fn format_command(verb: &str, args: &[crate::registry::ArgValue]) -> String 
             format!(
                 "{verb} {}",
                 args.iter()
-                    .map(crate::registry::ArgValue::text)
+                    .flat_map(crate::registry::ArgValue::source_tokens)
                     .collect::<Vec<_>>()
                     .join(" ")
             )
@@ -941,7 +941,7 @@ pub fn format_command(verb: &str, args: &[crate::registry::ArgValue]) -> String 
             "{command} {}",
             rendered_args
                 .iter()
-                .map(crate::registry::ArgValue::text)
+                .flat_map(crate::registry::ArgValue::source_tokens)
                 .collect::<Vec<_>>()
                 .join(" ")
         )
@@ -1030,7 +1030,7 @@ mod tests {
         assert_eq!(local.target, crate::registry::ActionTarget::LocalUi);
         assert_eq!(parse_command("quit").0, "quit");
 
-        for verb in ["apply", "discard", "rename"] {
+        for verb in ["apply", "discard"] {
             let input = format!("{verb} 5");
             let ParseResult::Invocation(invocation) = parse(&input) else {
                 panic!("not parsed")
@@ -1040,6 +1040,18 @@ mod tests {
                 crate::registry::ActionTarget::ControlMessage
             );
         }
+        let ParseResult::Invocation(rename) = parse("rename 5 NEW") else {
+            panic!("rename did not parse")
+        };
+        assert_eq!(
+            rename.target,
+            crate::registry::ActionTarget::ControlMessage
+        );
+        assert!(matches!(
+            parse("rename 5"),
+            ParseResult::InvalidArguments(_)
+        ));
+
         let ParseResult::Invocation(ui) = parse("mirror_jobs") else {
             panic!("not parsed")
         };
@@ -1154,6 +1166,9 @@ mod tests {
             "mirror run 5",
             "mirror pause 5",
             "mirror resume 5",
+            "review.apply 12 one two",
+            "review.map_ids 12 process edge",
+            "ro_attach 12 2 3",
         ] {
             let invocation = parse_action(input).unwrap();
             let rendered = format_invocation(&invocation);
@@ -1161,6 +1176,7 @@ mod tests {
             let reparsed = parse_action(&rendered).unwrap();
             assert_eq!(reparsed.dispatch_name(), invocation.dispatch_name());
             assert_eq!(reparsed.args, invocation.args);
+            assert_eq!(reparsed.json_args(), invocation.json_args());
         }
     }
 
@@ -1207,18 +1223,20 @@ mod tests {
     #[test]
     fn derived_ui_schemas_serialize_numbers_and_bools() {
         for (input, expected) in [
-            ("api_log 12", serde_json::json!([12])),
-            ("flows.detail 12 34", serde_json::json!([12, 34])),
-            ("flows.packets 12 34", serde_json::json!([12, 34])),
+            ("api_log 12", serde_json::json!(["12"])),
+            ("flows.detail 12 34", serde_json::json!(["12", 34])),
+            ("flows.detail 34", serde_json::json!([34])),
+            ("flows.packets 12 34", serde_json::json!(["12", 34])),
+            ("flows.packets 34", serde_json::json!([34])),
             ("view.window 7 8 9", serde_json::json!([7, 8, 9])),
             ("prompts.ui_active true", serde_json::json!([true])),
             (
                 "view.open changes 12 123 true",
-                serde_json::json!(["changes", 12, "123", true]),
+                serde_json::json!(["changes", "12", "123", true]),
             ),
             (
                 "review.makevars 12 123 456 10 false",
-                serde_json::json!([12, "123", "456", 10, false]),
+                serde_json::json!(["12", "123", "456", 10, false]),
             ),
         ] {
             assert_eq!(
@@ -1233,17 +1251,31 @@ mod tests {
     fn derived_ui_schemas_handle_optional_and_variadic_args() {
         for (input, expected) in [
             ("flows.list", serde_json::json!([])),
-            ("flows.list 12", serde_json::json!([12])),
+            ("flows.list 12", serde_json::json!(["12"])),
             ("box_new", serde_json::json!([])),
-            ("box_new 12", serde_json::json!([12])),
+            ("box_new 12", serde_json::json!(["12"])),
             (
                 "review.decorate_many 12 one 2 three",
-                serde_json::json!([12, "one", "2", "three"]),
+                serde_json::json!(["12", ["one", "2", "three"]]),
             ),
             (
                 "review.map_ids 12 process 2 3 edge",
-                serde_json::json!([12, "process", 2, 3, "edge"]),
+                serde_json::json!(["12", "process", [2, 3], "edge"]),
             ),
+            (
+                "review.map_ids 12 process edge",
+                serde_json::json!(["12", "process", [], "edge"]),
+            ),
+            ("review.apply 12", serde_json::json!(["12"])),
+            (
+                "review.apply 12 one two",
+                serde_json::json!(["12", ["one", "two"]]),
+            ),
+            (
+                "review.discard 12 one two",
+                serde_json::json!(["12", ["one", "two"]]),
+            ),
+            ("ro_attach 12 2 3", serde_json::json!(["12", 2, 3])),
         ] {
             assert_eq!(
                 parse_action(input).unwrap().json_args(),
@@ -1262,8 +1294,13 @@ mod tests {
         for (input, expected) in [
             ("box_file_read 123 456", serde_json::json!(["123", "456"])),
             (
+                "box_file_write 123 456 789",
+                serde_json::json!(["123", "456", "789"]),
+            ),
+            ("box_dir_list 123 456", serde_json::json!(["123", "456"])),
+            (
                 "review.write_file 12 345 678",
-                serde_json::json!([12, "345", "678"]),
+                serde_json::json!(["12", "345", "678"]),
             ),
             ("oaita.probe 123", serde_json::json!(["123"])),
         ] {
@@ -1316,6 +1353,23 @@ mod tests {
                 .annotation
                 .contains("list scheduled mirror-update jobs")
         );
+    }
+
+    #[cfg(feature = "prolog")]
+    #[test]
+    fn rename_uses_registry_fallback_in_prolog_mode() {
+        let ParseResult::Invocation(invocation) = parse("rename 5 NEW") else {
+            panic!("rename did not fall back to the registry parser")
+        };
+        assert_eq!(invocation.action.verb, "rename");
+        assert_eq!(invocation.json_args(), serde_json::json!(["5", "NEW"]));
+        let rendered = render(&invocation);
+        assert_eq!(rendered.status, BackendStatus::Unsupported);
+        assert_eq!(rendered.value, "rename 5 NEW");
+        assert!(matches!(
+            parse("rename 5"),
+            ParseResult::InvalidArguments(_)
+        ));
     }
 
     #[cfg(feature = "prolog")]
