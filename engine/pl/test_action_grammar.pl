@@ -69,19 +69,19 @@ parse_words(Words, Command) :-
 run_test(catalog_is_complete_and_valid) :-
     findall(Action, action(Action, _, _, _, _, _, _), Actions),
     sort(Actions, Unique),
-    length(Actions, 115),
-    length(Unique, 115),
+    length(Actions, 108),
+    length(Unique, 108),
     expect(all_valid(Actions)).
 
 run_test(wire_identities_are_explicit_unique_and_normalized) :-
     findall(Code-Handler, wire_handler(Handler, Code), Rows),
-    length(Rows, 102),
+    length(Rows, 95),
     findall(Code, wire_handler(_, Code), Codes),
     sort(Codes, UniqueCodes),
-    length(UniqueCodes, 102),
+    length(UniqueCodes, 95),
     findall(Handler, wire_handler(Handler, _), Handlers),
     sort(Handlers, UniqueHandlers),
-    length(UniqueHandlers, 102),
+    length(UniqueHandlers, 95),
     expect(all_wire_handlers_are_actions(Handlers)),
     once(representation(mirror_resume, wire, Wire)),
     expect_equal(

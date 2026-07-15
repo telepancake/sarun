@@ -68,11 +68,7 @@ action(mirror_resume, mirror_pause, ui, "ID", "resume a mirror job", visible, 79
 action(mirror_rm, mirror_rm, ui, "ID", "remove a mirror job (git: drops the repo.git fetch buffer, keeps <dest>/store)", visible, 75).
 action(rotate, rotate, ui, "SID", "promote a child box over its parent (both at rest)", visible, 50).
 action(reload_rules, reload_rules, ui, "", "reload the file-rules from disk", visible, 50).
-action(rescan, rescan, ui, "", "no-op; discovery is always fresh", visible, 50).
 action(delete, delete, ui, "SID", "remove a box, promoting its changes down (alias of dissolve)", visible, 50).
-action(open_files, open_files, ui, "", "compat stub; always []", internal, 10).
-action(review_state, review_state, ui, "", "consolidation status + the selected box", internal, 10).
-action(review_live, review_live, ui, "", "compat stub; always false", internal, 10).
 action('review.session_changes', 'review.session_changes', ui, "SID", "changed files of a box", visible, 50).
 action('review.hunks', 'review.hunks', ui, "SID REL", "unified-diff hunks for one changed file", visible, 50).
 action('review.file_bytes', 'review.file_bytes', ui, "SID REL", "current bytes of one box path (captured write, else host), base64", visible, 50).
@@ -96,9 +92,6 @@ action('view.window', 'view.window', ui, "VIEW START SIZE", "read one window of 
 action('view.filter', 'view.filter', ui, "VIEW FILTER", "re-filter an open view", internal, 10).
 action('view.find', 'view.find', ui, "VIEW ROW_ID", "locate a row id inside a view", internal, 10).
 action('view.close', 'view.close', ui, "VIEW", "close a view", internal, 10).
-action(consolidate_start, consolidate_start, ui, "", "compat no-op lifecycle poke", internal, 10).
-action('review.invalidate_consolidation', 'review.invalidate_consolidation', ui, "", "compat no-op lifecycle poke", internal, 10).
-action('review.invalidate_struct', 'review.invalidate_struct', ui, "", "compat no-op lifecycle poke", internal, 10).
 action(ping, ping, ui, "", "liveness check; broadcasts a pong event", visible, 50).
 action(box_new, box_new, ui, "[PARENT_SID]", "create an empty box and expose its mount", visible, 50).
 action(struct_quick, struct_quick, ui, "SID REL", "quick structural diff of a binary change", visible, 50).
@@ -170,8 +163,6 @@ wire_handler('review.discard_hunk', 21).
 wire_handler('review.file_bytes', 22).
 wire_handler('review.file_groups', 23).
 wire_handler('review.hunks', 24).
-wire_handler('review.invalidate_consolidation', 25).
-wire_handler('review.invalidate_struct', 26).
 wire_handler('review.makevars', 27).
 wire_handler('review.map_ids', 28).
 wire_handler('review.patch_text', 29).
@@ -196,7 +187,6 @@ wire_handler(box_new, 47).
 wire_handler(box_path_kind, 48).
 wire_handler(brushprov, 49).
 wire_handler(build_edges, 50).
-wire_handler(consolidate_start, 51).
 wire_handler(delete, 52).
 wire_handler(display_path, 53).
 wire_handler(dissolve, 54).
@@ -211,7 +201,6 @@ wire_handler(mirror_pause, 62).
 wire_handler(mirror_rm, 63).
 wire_handler(mirror_run, 64).
 wire_handler(mirror_run_pending, 65).
-wire_handler(open_files, 66).
 wire_handler(output_detail, 67).
 wire_handler(output_pipeline, 68).
 wire_handler(outputs, 69).
@@ -225,10 +214,7 @@ wire_handler(process_env, 76).
 wire_handler(processes, 77).
 wire_handler(processes_live, 78).
 wire_handler(reload_rules, 79).
-wire_handler(rescan, 80).
 wire_handler(resolve_box, 81).
-wire_handler(review_live, 82).
-wire_handler(review_state, 83).
 wire_handler(ro_attach, 84).
 wire_handler(rotate, 85).
 wire_handler(select, 86).

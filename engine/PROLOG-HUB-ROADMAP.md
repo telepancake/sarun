@@ -101,6 +101,12 @@ replace that path with a projection of the ordinary relation before doing
 further feature work. Do not describe an adjacent implementation as though it
 already satisfies this contract.
 
+Unchecked items in this roadmap are required implementation work. They must
+not be relabelled as optional extensions, compatibility modes, or possible
+future improvements in code, documentation, or status reports. Completion
+means proving the singular relation is the authority and deleting the
+superseded path; it does not mean leaving both paths present behind a choice.
+
 ## Current bad state being replaced
 
 There are three competing authorities:
@@ -507,7 +513,7 @@ belong to the relation.
 - Inventoried every `ui.sock` connection family and wrote the binary cutover
   contract. Consolidated the pre-existing TRACE atom code into one bounded
   tv-compatible Rust primitive and cut the box/PTY mux over to compound atoms.
-- Assigned explicit, order-independent numeric identities to all 102 wire
+- Assigned explicit, order-independent numeric identities to all 95 live wire
   action handlers in the relation. Wire projection occurs after alias
   normalization, so (for example) `mirror_resume` projects the actual
   `mirror_pause` handler and its two-argument schema, while local-only actions
@@ -537,7 +543,7 @@ belong to the relation.
 - Moved `representation/3` and `convert/4` into the hub beside the executable
   form relation. Canonical verb, CLI, syntax, wire, help, key, and menu values
   now project from the normalized facts and executable specs. Exhaustive tests
-  render and reparse minimal and fully populated canonical forms for all 115
+  render and reparse minimal and fully populated canonical forms for all 108
   actions and every explicit CLI form, covering optional/repeated shapes.
 - Added the normalized non-action transport relation: 16 requests, 5 response
   payloads, 7 connection modes, 10 compact event invalidations, and 11
@@ -550,6 +556,11 @@ belong to the relation.
   only reproduce JSON's schema-less object tree with smaller tags. Concrete
   per-handler result schemas remain an explicit prerequisite for generated
   action reply codecs.
+- Deleted seven Python-era wire actions whose implementations were explicit
+  compatibility no-ops and which had no Rust UI caller: `rescan`, `open_files`,
+  `review_state`, `review_live`, `consolidate_start`, and the two consolidation
+  invalidation pokes. Their stable codes remain retired rather than being
+  recycled into unrelated meanings.
 - Routed transport facts, types, enum cases, and tagged variants through the
   same `representation/3` and `convert/4` hub, embedded the catalog in the
   static SWI resource, and added closure/uniqueness/bounds/projection tests.

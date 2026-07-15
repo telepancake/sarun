@@ -251,9 +251,9 @@ impl ActionSpec {
 
     pub fn target(&self) -> ActionTarget {
         match self.verb {
-            "apply" | "discard" | "rename" => ActionTarget::ControlMessage,
+            "apply" | "discard" | "rename" | "quit" => ActionTarget::ControlMessage,
             "mirror_browse" | "mirror_read" | "change_read" | "change_edit" | "rule_new"
-            | "rule_delete" | "rule_edit" | "quit" | "detach" | "refresh" | "filter"
+            | "rule_delete" | "rule_edit" | "detach" | "refresh" | "filter"
             | "action_menu" | "toggle_mark" => ActionTarget::LocalUi,
             _ => ActionTarget::UiVerb,
         }
@@ -270,8 +270,6 @@ impl ActionSpec {
     /// Explicitly hidden actions remain exactly parseable but are omitted from completion.
     pub fn hidden_reason(&self) -> Option<&'static str> {
         match self.verb {
-            "open_files" | "review_live" => Some("compatibility stub retained for old clients"),
-            "review_state" => Some("legacy review-status transport"),
             "prompts.ui_active" => Some("internal TUI prompt-consumer handshake"),
             "struct_finish" | "struct_cancel" => Some("internal structural-diff job lifecycle"),
             "view.open" | "view.window" | "view.filter" | "view.find" | "view.close" => {
@@ -1423,7 +1421,7 @@ mod tests {
             ActionTarget::ControlMessage
         );
         assert_eq!(find("mirror_read").unwrap().target(), ActionTarget::LocalUi);
-        assert_eq!(find("quit").unwrap().target(), ActionTarget::LocalUi);
+        assert_eq!(find("quit").unwrap().target(), ActionTarget::ControlMessage);
     }
 
     #[test]
@@ -1442,7 +1440,6 @@ mod tests {
             "user-facing VERB_DOCS entries are merged"
         );
         for name in [
-            "open_files",
             "prompts.ui_active",
             "view.open",
             "review.decorate_many",

@@ -3334,8 +3334,6 @@ macro_rules! ui_verbs {
             }
             json!(null)
         }
-        // discovery is always fresh; nothing to do
-        "rescan", "", "no-op; discovery is always fresh" => { json!(null) }
         "delete", "SID", "remove a box, promoting its changes down (alias of dissolve)" => { match arg_sid(args) {
             // Free the box, KEEPING any boxes stacked on it: children have this
             // box's view copied down into them and are re-parented onto the
@@ -3346,15 +3344,6 @@ macro_rules! ui_verbs {
             Some(id) => free_box(state, id),
             None => json!({"ok": false}),
         }
-        }
-        "open_files", "", "compat stub; always []" => { json!([])
-        }
-        "review_state", "", "consolidation status + the selected box" => { json!({
-            "consolidating": [], "consolidated": [],
-            "selected": lock(state).selected,
-        })
-        }
-        "review_live", "", "compat stub; always false" => { json!(false)
         }
         "review.session_changes", "SID", "changed files of a box" => { match arg_sid(args) {
             Some(id) => crate::review::session_changes(id),
@@ -3609,12 +3598,6 @@ macro_rules! ui_verbs {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let mut s = lock(state);
             crate::views::close(&mut s.views, vid)
-        }
-        // At-rest-the-instant-it-exits Rust box (DESIGN.md D4): no consolidate
-        // phase, no separate caches — these UI lifecycle pokes are vacuous, but
-        // must not return "unknown verb".
-        "consolidate_start" | "review.invalidate_consolidation"
-        | "review.invalidate_struct", "", "compat no-op lifecycle poke" => { json!(null)
         }
         "ping", "", "liveness check; broadcasts a pong event" => {
             broadcast(state, &json!({"type": "pong"}));
@@ -5746,9 +5729,9 @@ mod verb_tests {
     fn documented_verbs_spot_check_dispatch() {
         let state: State = Default::default();
         let boxes = std::collections::BTreeMap::new();
-        // Three safe representatives: the self-list, a pure stub, and an
-        // args-validating mutator that errors before any side effect.
-        for v in ["verbs", "rescan", "mirror_pause"] {
+        // Two safe representatives: the self-list and an args-validating
+        // mutator that errors before any side effect.
+        for v in ["verbs", "mirror_pause"] {
             let r = dispatch_ui_verb(&state, v, &[], &boxes);
             let err = r.get("error").and_then(Value::as_str).unwrap_or("");
             assert!(!err.contains("unknown verb"), "{v} fell through: {err}");
