@@ -714,6 +714,13 @@ belong to the relation.
   as objects. All 42 pure relation tests and the generated-source freshness
   check pass; the full native aarch64-musl suite remains at 306 passed with one
   existing browser e2e test ignored.
+- Moved `session_dicts` onto the generated request/success variant and deleted
+  its mutable JSON row constructor. Discovery now constructs bounded
+  `BoxSession` values directly, keeps shared-memory and upper paths as raw OS
+  bytes, strictly decodes heterogeneous read-only attachment metadata, and
+  merges live process/error state before the temporary listener projection.
+  A focused closed-row test was added; the full native aarch64-musl suite passes
+  307 tests with one existing browser e2e test ignored.
 
 ## Stop conditions
 

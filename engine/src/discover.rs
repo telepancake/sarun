@@ -6,6 +6,7 @@
 // never by opening a sqlar itself. Read-only.
 
 use std::collections::{BTreeMap, HashMap};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -133,59 +134,71 @@ pub fn display_path(boxes: &BTreeMap<i64, Box_>, box_id: i64) -> String {
     parts.join(".")
 }
 
-pub fn session_dict(boxes: &BTreeMap<i64, Box_>, b: &Box_) -> Value {
-    // The DAG edges (DEPOT-DESIGN.md §8): the MAIN parent first (the tree
-    // the sessions pane flattens by), then RO attachments. The UI's
-    // sideways navigation cycles these.
-    let mut parents: Vec<i64> = b.parent.into_iter().collect();
-    // ro_attachments is heterogeneous (capture::RoAttachment): ints are
-    // box ids (DAG edges → parents), objects are external references
-    // (→ "attachments"). Open-error state lives on the LIVE overlay
-    // ExtAttachment; this reads on-disk meta only, so the session_dicts
-    // verb (control.rs) enriches these rows with "error".
-    let mut attachments: Vec<Value> = vec![];
-    if let Some(j) = b.meta.get("ro_attachments") {
-        if let Ok(rows) = serde_json::from_str::<Vec<Value>>(j) {
-            for r in rows {
-                if let Some(id) = r.as_i64() {
-                    parents.push(id);
-                } else if r.is_object() {
-                    attachments.push(json!({
-                        "name": r.get("name").cloned().unwrap_or_default(),
-                        "kind": r.get("kind").cloned().unwrap_or_default(),
-                        "rev": r.get("rev").cloned().unwrap_or_default(),
-                    }));
+pub fn session_typed(
+    boxes: &BTreeMap<i64, Box_>,
+    b: &Box_,
+    run_pid: Option<i32>,
+    attachment_errors: &HashMap<String, String>,
+) -> Result<crate::generated_wire::BoxSession, String> {
+    use crate::generated_wire::{BoxSession, ExternalAttachment, SessionStatus};
+
+    let box_id = u64::try_from(b.box_id).map_err(|_| "negative box id in session row")?;
+    let parent = b.parent
+        .map(|id| u64::try_from(id).map_err(|_| "negative parent box id"))
+        .transpose()?;
+    let mut parents = parent.into_iter().collect::<Vec<_>>();
+    let mut attachments = Vec::new();
+    if let Some(stored) = b.meta.get("ro_attachments") {
+        let rows = serde_json::from_str::<Vec<crate::capture::RoAttachment>>(stored)
+            .map_err(|error| format!("invalid stored read-only attachments: {error}"))?;
+        for row in rows {
+            match row {
+                crate::capture::RoAttachment::Box(id) => parents.push(
+                    u64::try_from(id).map_err(|_| "negative attachment box id")?),
+                crate::capture::RoAttachment::Ext(ext) => {
+                    attachments.push(ExternalAttachment {
+                        error: attachment_errors.get(&ext.name)
+                            .map(|error| relation_text(error)).transpose()?,
+                        name: relation_text(&ext.name)?,
+                        kind: relation_short_text(&ext.kind)?,
+                        revision: relation_short_text(&ext.rev)?,
+                    });
                 }
             }
         }
     }
-    json!({
-        "session_id": b.box_id.to_string(),
-        "cmd": b.cmd,
-        "shm_dir": paths::live_home().join(b.box_id.to_string()).to_string_lossy(),
-        "killed": false,
-        "errored": false,
-        "exit_code": Value::Null,
-        "live": false,
-        "has_sqlar": b.has_sqlar,
-        "box_id": b.box_id,
-        "name": b.name,
-        "run_pid": 0,
-        "run_pidfd": -1,
-        "parent_box_id": b.parent,
-        // The DAG edges (DEPOT-DESIGN.md §8): the MAIN parent first (the
-        // tree the sessions pane flattens by), then RO attachments. The
-        // UI's sideways navigation cycles these.
-        "parents": parents,
-        // External RO references (Ext rows): identity for the UI —
-        // NOT DAG edges, they have no box id.
-        "attachments": attachments,
-        "started": b.started,
-        "pid": 0,
-        "status": "finished",
-        "upper": paths::live_home().join(b.box_id.to_string()).join("up")
-                 .to_string_lossy(),
-        "path": display_path(boxes, b.box_id),
+    let command = b.cmd.iter()
+        .map(|word| relation_os_string(word))
+        .collect::<Result<Vec<_>, _>>()?;
+    let command = crate::wire::BoundedVec::new(command)
+        .map_err(|error| format!("session command exceeds relation bound: {error:?}"))?;
+    let parents = crate::wire::BoundedVec::new(parents)
+        .map_err(|error| format!("session parent list exceeds relation bound: {error:?}"))?;
+    let attachments = crate::wire::BoundedVec::new(attachments)
+        .map_err(|error| format!("session attachment list exceeds relation bound: {error:?}"))?;
+    let path = |path: std::path::PathBuf| {
+        crate::wire::BoundedBytes::new(path.as_os_str().as_bytes().to_vec())
+            .map_err(|error| format!("session path exceeds relation bound: {error:?}"))
+    };
+    let live = run_pid.is_some();
+    Ok(BoxSession {
+        r#box: box_id,
+        name: relation_short_text(&b.name)?,
+        command,
+        shared_memory: path(paths::live_home().join(b.box_id.to_string()))?,
+        live,
+        has_archive: b.has_sqlar,
+        exit_code: None,
+        run_pid: run_pid
+            .map(|pid| u32::try_from(pid).map_err(|_| "invalid running process id"))
+            .transpose()?,
+        parent,
+        parents,
+        attachments,
+        started_at: b.started,
+        status: if live { SessionStatus::Running } else { SessionStatus::Finished },
+        upper: path(paths::live_home().join(b.box_id.to_string()).join("up"))?,
+        display_path: relation_text(&display_path(boxes, b.box_id))?,
     })
 }
 
@@ -973,6 +986,49 @@ pub fn pipeline_provenance_json(record: &crate::generated_wire::PipelineProvenan
 mod relation_row_tests {
     use super::*;
     use crate::generated_wire::PipelineStage;
+
+    #[test]
+    fn session_rows_construct_the_closed_relation_type_before_projection() {
+        let mut meta = HashMap::new();
+        meta.insert("ro_attachments".into(), serde_json::to_string(&vec![
+            crate::capture::RoAttachment::Box(3),
+            crate::capture::RoAttachment::Ext(crate::capture::ExtRef {
+                kind: "git".into(),
+                store: "/store".into(),
+                refname: "main".into(),
+                rev: "abc".into(),
+                prefix: String::new(),
+                name: "src".into(),
+            }),
+        ]).unwrap());
+        let row = Box_ {
+            box_id: 7,
+            name: "work".into(),
+            parent: Some(2),
+            cmd: vec!["echo".into(), "hi".into()],
+            started: 1.25,
+            has_sqlar: true,
+            meta,
+        };
+        let mut boxes = BTreeMap::new();
+        boxes.insert(row.box_id, row);
+        let mut errors = HashMap::new();
+        errors.insert("src".into(), "store unavailable".into());
+
+        let session = session_typed(&boxes, boxes.get(&7).unwrap(), Some(123), &errors)
+            .unwrap();
+        assert_eq!(session.r#box, 7);
+        assert_eq!(session.parent, Some(2));
+        assert_eq!(session.parents.as_slice(), &[2, 3]);
+        assert_eq!(session.run_pid, Some(123));
+        assert!(session.live);
+        assert_eq!(session.command.as_slice()[0].as_slice(), b"echo");
+        assert_eq!(session.attachments.as_slice()[0].name.as_str(), "src");
+        assert_eq!(
+            session.attachments.as_slice()[0].error.as_ref().unwrap().as_str(),
+            "store unavailable",
+        );
+    }
 
     #[test]
     fn stored_pipeline_json_normalizes_once_to_the_closed_relation_type() {

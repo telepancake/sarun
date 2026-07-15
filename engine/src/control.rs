@@ -1592,6 +1592,27 @@ fn dispatch_action(
                 .map_err(|error| format!("help rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::Verbs { value })
         }
+        ActionRequest::SessionDicts => {
+            let boxes = discover::discover();
+            let (run_pids, overlay) = {
+                let shared = lock(state);
+                (shared.box_runpids.clone(), shared.overlay.clone())
+            };
+            let rows = boxes.values().map(|row| {
+                let errors = overlay.as_ref()
+                    .map(|overlay| overlay.ext_errors(row.box_id))
+                    .unwrap_or_default();
+                discover::session_typed(
+                    &boxes,
+                    row,
+                    run_pids.get(&row.box_id).copied(),
+                    &errors,
+                )
+            }).collect::<Result<Vec<_>, _>>()?;
+            let value = crate::wire::BoundedVec::new(rows)
+                .map_err(|error| format!("session rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::SessionDicts { value })
+        }
         ActionRequest::ViewOpen {
             kind,
             r#box,
@@ -1870,6 +1891,52 @@ fn legacy_view_window(value: crate::generated_wire::ViewWindow) -> Value {
     }
 }
 
+fn legacy_box_session(value: crate::generated_wire::BoxSession) -> Value {
+    use crate::generated_wire::SessionStatus;
+    let status = match value.status {
+        SessionStatus::Running => "running",
+        SessionStatus::Finished => "finished",
+        SessionStatus::Failed => "failed",
+        SessionStatus::Killed => "killed",
+    };
+    let killed = value.status == SessionStatus::Killed;
+    let errored = value.status == SessionStatus::Failed;
+    let run_pid = value.run_pid.unwrap_or(0);
+    json!({
+        "session_id": value.r#box.to_string(),
+        "cmd": value.command.into_inner().into_iter().map(legacy_bytes)
+            .collect::<Vec<_>>(),
+        "shm_dir": legacy_bytes(value.shared_memory),
+        "killed": killed,
+        "errored": errored,
+        "exit_code": value.exit_code,
+        "live": value.live,
+        "has_sqlar": value.has_archive,
+        "box_id": value.r#box,
+        "name": value.name.into_inner(),
+        "run_pid": run_pid,
+        "run_pidfd": -1,
+        "parent_box_id": value.parent,
+        "parents": value.parents.into_inner(),
+        "attachments": value.attachments.into_inner().into_iter().map(|row| {
+            let mut projected = json!({
+                "name": row.name.into_inner(),
+                "kind": row.kind.into_inner(),
+                "rev": row.revision.into_inner(),
+            });
+            if let Some(error) = row.error {
+                projected["error"] = Value::String(error.into_inner());
+            }
+            projected
+        }).collect::<Vec<_>>(),
+        "started": value.started_at,
+        "pid": run_pid,
+        "status": status,
+        "upper": legacy_bytes(value.upper),
+        "path": value.display_path.into_inner(),
+    })
+}
+
 fn legacy_ui_action_reply(
     result: Result<crate::generated_wire::ActionSuccess, String>,
 ) -> Value {
@@ -1942,6 +2009,8 @@ fn legacy_ui_action_reply(
                 "help": row.description.into_inner(),
             }))
             .collect()),
+        Ok(ActionSuccess::SessionDicts { value }) => Value::Array(value.into_inner()
+            .into_iter().map(legacy_box_session).collect()),
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -3084,50 +3153,9 @@ pub fn write_api_box_net_shadows(net: &crate::net::Net) -> std::io::Result<()> {
 macro_rules! ui_verbs {
     ($emit:ident) => { $emit! { (state, verb, args, boxes)
         "session_dicts" => {
-            // discover::session_dict reads on-disk metadata only, so every box
-            // looks "finished" to it. Override `live` / `status` / `pid` for
-            // boxes whose runner is still registered with this engine — that's
-            // what the UI uses to flip on live-mode rendering (e.g., the
-            // boxes view's "recently changed" panel and the procs view's
-            // active-set behavior).
-            let runpids: std::collections::HashMap<i64, i32> =
-                lock(state).box_runpids.clone();
-            let ov = lock(state).overlay.clone();
-            Value::Array(boxes.values().map(|b| {
-                let mut sd = discover::session_dict(&boxes, b);
-                // Ext attachments carry an open error only on the LIVE
-                // overlay object (discover reads meta alone) — merge it
-                // in by name, without triggering any build/open.
-                if let Some(ov) = ov.as_ref() {
-                    let errs = ov.ext_errors(b.box_id);
-                    if !errs.is_empty() {
-                        if let Some(atts) = sd.get_mut("attachments")
-                            .and_then(Value::as_array_mut)
-                        {
-                            for a in atts {
-                                if let Some(e) = a.get("name")
-                                    .and_then(Value::as_str)
-                                    .and_then(|n| errs.get(n))
-                                {
-                                    a["error"] = json!(e);
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(&pid) = runpids.get(&b.box_id) {
-                    if let Some(obj) = sd.as_object_mut() {
-                        obj.insert("live".into(), Value::Bool(true));
-                        obj.insert("status".into(),
-                                   Value::String("running".into()));
-                        obj.insert("pid".into(),
-                                   Value::Number((pid as i64).into()));
-                        obj.insert("run_pid".into(),
-                                   Value::Number((pid as i64).into()));
-                    }
-                }
-                sd
-            }).collect())
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::SessionDicts,
+            ));
         }
         "display_path" => {
             let Some(sid) = legacy_u64(args, 0) else {
