@@ -142,6 +142,83 @@ context staging, caching/invalidation keys, exception containment, and FFI
 marshalling. Grammar declarations and client calls must stay terse even when
 those mechanisms are active.
 
+### Engine/client contract before grammar syntax
+
+Do not elaborate or sugar the grammar vocabulary until the engine/client
+contract works end to end. `grammar_ir.pl` is frozen as a capability probe in
+the meantime; its spelling is not a public language and sarun must not grow
+dependencies on its current term shapes.
+
+The engine has one public operation: bounded relation transformation. Its
+conceptual request and reply are:
+
+```
+transform(
+    GrammarHandle,
+    GivenRepresentations,
+    WantedProjections,
+    ContextObservations,
+    Limits,
+    Reply)
+
+Reply = solutions(Solutions, ContextQueries, DependencyKeys, Diagnostics)
+```
+
+The exact Rust and Prolog data types may refine this notation, but the
+separation is mandatory:
+
+- `GrammarHandle` is an opaque, engine-owned handle to an immutable grammar
+  value. It may be content-addressed or established during engine startup. It
+  is not a grammar-name switch, and Rust cannot inspect the grammar AST.
+- Given representations are neutral typed values such as text/byte sources,
+  semantic values, rendered values, tears, and prior context observations.
+  Wanted projections name outputs, not algorithms. Parse and print differ by
+  which representations are given and wanted, not by an operation enum.
+- A solution contains generic representation bindings plus evidence and
+  ranking. Application-specific typed values are decoded by generated adapters
+  outside the engine boundary.
+- Context queries are ordinary unresolved relational dependencies using the
+  `empty`, `one`, and `all` cardinalities. A client executes them through a
+  generic provider interface and resubmits observations; it never receives a
+  grammar callback or decides how a query affects parsing.
+- Dependency keys and diagnostics are returned uniformly for every grammar and
+  projection. Completion and highlighting consume the same solution evidence;
+  there is no adjacent completion/highlight request protocol.
+- Limits cover input/output bytes, solutions, ambiguity, recursion, inference,
+  context graph size, and primitive work. Bounds are data on every request,
+  not hidden globals chosen by an application grammar.
+
+The Rust transport across the SWI worker must be typed and structured. The
+public API must not expose Prolog source strings, `format!("request(...)")`,
+operation atoms, predicate names, or operation-specific response decoders.
+Rust constructs SWI terms through a bounded generic value encoder (or an
+equivalent compact typed envelope), and decodes one generic reply shape.
+Ergonomic sarun methods such as `parse_command` may exist as thin generated or
+typed adapters, but they must all call this one transformation and contain no
+grammar semantics.
+
+The grammar/engine side of the same boundary is equally strict. A grammar
+provides an immutable grammar value. It does not provide terminal callbacks,
+parsing predicates, printers, completion walkers, or context planners. The
+engine interprets the value without importing the grammar module or switching
+on its identity. Grammar composition resolves values/handles as data.
+
+Boundary acceptance tests must prove all of the following before grammar
+notation work resumes:
+
+- a foreign test grammar is installed and transformed without importing
+  `action_grammar` or changing engine code;
+- the same generic request shape parses, renders, exposes a tear completion,
+  projects highlights, and returns a context query/observation dependency;
+- sarun actions use the generic transformation path while preserving the real
+  command-modal and control-socket behavior tests;
+- Rust has no `Operation::{Parse, Complete, Highlights, Render, ...}` dispatch,
+  and Prolog has no corresponding `dispatch_application/3` table;
+- the boundary contains no textual Prolog request construction and no
+  action-specific term decoder;
+- dependency tests enforce engine -> no grammar/client imports, grammar -> no
+  engine traversal callbacks, and client -> no grammar-AST inspection.
+
 Two portability tests constrain the grammar IR before it is considered
 generic:
 
@@ -167,12 +244,13 @@ not change the engine or Rust API. Representative translated fixtures—one
 precedence/conflict/external-token language fragment and one
 length/dispatch/checksum protocol fragment—are required architecture tests.
 
-Current IR checkpoint: `grammar_ir.pl` defines and closes the first grammar
-value vocabulary, and independent Tree-sitter-shaped and Wireshark-shaped
-fixtures validate as pure data. Undeclared rule references and undeclared
-primitive callbacks fail closed. This is schema validation, not yet execution:
-the next engine slice must interpret these values uniformly, after which the
-fixtures must be upgraded from validation tests to parse/render/tear tests.
+Current IR checkpoint: `grammar_ir.pl` defines and closes an initial capability
+probe, and independent Tree-sitter-shaped and Wireshark-shaped fixtures
+validate as pure data. Undeclared rule references and undeclared primitive
+callbacks fail closed. Its syntax is now deliberately frozen. First replace
+the leaky operation-specific engine/sarun boundary and prove uniform execution;
+only then revise this probe into the actual grammar language and upgrade the
+fixtures from validation tests to transformation tests.
 
 Immediate extraction order:
 
@@ -183,20 +261,22 @@ Immediate extraction order:
       projection into the grammar-independent engine rather than action
       grammar helpers; prove span rejection, ambiguity retention, ranking, and
       paint projection with the foreign grammar test.
-- [ ] Replace the flat action-only spec vocabulary with composable grammar
-      values for sequence, choice, repetition, named fields, constraints, and
-      embedded grammars.
-- [ ] Define precedence/conflict/lexical-extra and bounded byte-cursor/layout
-      constructs sufficient for representative Tree-sitter and Wireshark
-      translations; reject constructs that would require hidden effects.
-- [ ] Move primitive text/value and bounded blob codecs into reusable grammar
-      modules; eliminate action-specific structured JSON handling from the
-      engine layer.
-- [ ] Move context planning/completion/dependency projection behind the same
-      generic grammar-value interface.
 - [ ] Replace operation-specific and action-specific Rust term decoders with a
       bounded generic transformation envelope plus generated typed projections
       at application boundaries.
+- [ ] Replace `action_grammar:application/3` and its dispatch table with the
+      single generic transformation entry point; make context queries and
+      evidence ordinary reply data.
+- [ ] Drive a foreign grammar and then sarun actions through that same boundary,
+      preserving user-facing parse/render/completion/highlight/context tests.
+- [ ] Replace the flat action-only spec vocabulary and terminal callback with
+      immutable composable grammar values interpreted only by the engine.
+- [ ] Move primitive text/value and bounded blob codecs into reusable grammar
+      modules; eliminate action-specific structured JSON handling from the
+      engine layer.
+- [ ] After the boundary is proven, revise rather than merely sugar the grammar
+      IR for sequence, choice, repetition, fields, constraints, references,
+      embedding, precedence/conflicts/extras, and bounded byte layouts.
 - [ ] Keep `sarun_actions` and transport/packet/patch/brush grammars as clients
       of the engine; enforce the dependency direction in tests and build inputs.
 
