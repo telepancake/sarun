@@ -1387,14 +1387,31 @@ catalog(Visibility, Rows) :-
 % related fields.
 
 action_help(Target, Rows) :-
+    action_help(Target, "", Rows).
+
+%! action_help(+Target, +Filter, -Rows) is det.
+%
+% Filtering is part of the relation projection, rather than a consumer-side
+% reinterpretation of action metadata. The empty filter projects every row.
+
+action_help(Target, Filter, Rows) :-
     findall(record(Action, Notation, Description),
             ( action(Action, _, RowTarget, Notation, Description, _, _),
-              help_target_matches(Target, RowTarget)
+              help_target_matches(Target, RowTarget),
+              help_filter_matches(Filter, Action, Description)
             ),
             Rows).
 
 help_target_matches(all, _).
 help_target_matches(Target, Target) :- Target \== all.
+
+help_filter_matches("", _, _).
+help_filter_matches(Filter, Action, Description) :-
+    Filter \== "",
+    atom_string(Action, ActionText),
+    ( sub_string(ActionText, _, _, _, Filter)
+    ; sub_string(Description, _, _, _, Filter)
+    ).
 
 visibility_matches(all, _).
 visibility_matches(visible, visible).
@@ -1437,6 +1454,12 @@ dispatch_application(catalog, request(Visibility), ok(Rows)) :-
 dispatch_application(action_help, request(Target), Response) :-
     !, ( ( Target == all ; Target == ui ; Target == control ; Target == local )
        -> action_help(Target, Rows), Response = ok(Rows)
+       ;  Response = error(invalid_request)
+       ).
+dispatch_application(action_help, request(Target, Filter), Response) :-
+    !, ( ( Target == all ; Target == ui ; Target == control ; Target == local ),
+         string(Filter)
+       -> action_help(Target, Filter, Rows), Response = ok(Rows)
        ;  Response = error(invalid_request)
        ).
 dispatch_application(convert, request(FromKind, From, ToKind), ok(Results)) :-

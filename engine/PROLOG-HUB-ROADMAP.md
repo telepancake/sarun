@@ -706,6 +706,14 @@ belong to the relation.
   old spelling exists only at the temporary listener boundary. Focused tests
   and the full native aarch64-musl suite pass: 306 tests passed and one existing
   browser e2e test remained ignored.
+- Moved `display_path`, `resolve_box`, `select`, `ping`, `reload_rules`, and
+  `verbs` onto generated request/success variants. Help filtering now executes
+  inside the relation's help projection; Rust no longer reinterprets names and
+  descriptions with its own substring algorithm. The direct dispatcher
+  produces bounded help rows and only the temporary JSON listener spells them
+  as objects. All 42 pure relation tests and the generated-source freshness
+  check pass; the full native aarch64-musl suite remains at 306 passed with one
+  existing browser e2e test ignored.
 
 ## Stop conditions
 

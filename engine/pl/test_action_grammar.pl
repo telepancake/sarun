@@ -58,11 +58,24 @@ expect_equal(Actual, Expected) :-
 run_test(help_projection_is_complete_and_targeted) :-
     action_grammar:action_help(all, All),
     action_grammar:action_help(ui, Ui),
+    action_grammar:action_help(ui, "mirror", Mirror),
+    action_grammar:action_help(ui, "no-such-action", Missing),
     length(All, 108),
     length(Ui, 91),
     expect(list_has(record(verbs, "[FILTER]",
                           "list every UI verb with its args and help"), Ui)),
-    expect(\+ list_has(record(quit, _, _), Ui)).
+    expect(\+ list_has(record(quit, _, _), Ui)),
+    expect(list_has(record(mirror_add, _, _), Mirror)),
+    expect(all_help_rows_match("mirror", Mirror)),
+    expect_equal(Missing, []).
+
+all_help_rows_match(_, []).
+all_help_rows_match(Filter, [record(Action, _, Description)|Rows]) :-
+    atom_string(Action, ActionText),
+    ( sub_string(ActionText, _, _, _, Filter)
+    ; sub_string(Description, _, _, _, Filter)
+    ),
+    all_help_rows_match(Filter, Rows).
 
 list_has(Value, [Head|_]) :- Value = Head.
 list_has(Value, [_|Tail]) :- list_has(Value, Tail).

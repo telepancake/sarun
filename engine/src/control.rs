@@ -1551,6 +1551,47 @@ fn dispatch_action(
                 value: discover::first_writer_prov_typed(id, rel.as_slice())?,
             })
         }
+        ActionRequest::DisplayPath { sid } => {
+            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            let boxes = discover::discover();
+            let value = if boxes.contains_key(&id) {
+                Some(crate::wire::BoundedText::new(discover::display_path(&boxes, id))
+                    .map_err(|error| {
+                        format!("display path exceeds relation bound: {error:?}")
+                    })?)
+            } else {
+                None
+            };
+            Ok(ActionSuccess::DisplayPath { value })
+        }
+        ActionRequest::ResolveBox { name_or_id } => {
+            let boxes = discover::discover();
+            let value = resolve(&boxes, name_or_id.as_str())
+                .and_then(|id| u64::try_from(id).ok());
+            Ok(ActionSuccess::ResolveBox { value })
+        }
+        ActionRequest::Select { sid } => {
+            let id = existing_box_id(sid)?;
+            lock(state).selected = Some(id.to_string());
+            Ok(ActionSuccess::Select { value: () })
+        }
+        ActionRequest::Ping => {
+            broadcast(state, &json!({"type": "pong"}));
+            Ok(ActionSuccess::Ping { value: () })
+        }
+        ActionRequest::ReloadRules => {
+            if let Some(overlay) = lock(state).overlay.clone() {
+                overlay.reload_rules();
+            }
+            Ok(ActionSuccess::ReloadRules { value: () })
+        }
+        ActionRequest::Verbs { filter } => {
+            let filter = filter.as_ref().map_or("", |value| value.as_str());
+            let rows = crate::prolog::global()?.ui_action_help_matching(filter)?;
+            let value = crate::wire::BoundedVec::new(rows)
+                .map_err(|error| format!("help rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::Verbs { value })
+        }
         ActionRequest::ViewOpen {
             kind,
             r#box,
@@ -1887,6 +1928,20 @@ fn legacy_ui_action_reply(
         | Ok(ActionSuccess::FirstWriterId { value }) => json!(value),
         Ok(ActionSuccess::FirstWriterProv { value }) => value.as_ref()
             .map(discover::writer_provenance_json).unwrap_or(Value::Null),
+        Ok(ActionSuccess::DisplayPath { value }) => value
+            .map(|value| Value::String(value.into_inner())).unwrap_or(Value::Null),
+        Ok(ActionSuccess::ResolveBox { value }) => value
+            .map(|value| Value::String(value.to_string())).unwrap_or(Value::Null),
+        Ok(ActionSuccess::Select { .. }) => json!({"ok": true}),
+        Ok(ActionSuccess::Ping { .. }) => json!("pong"),
+        Ok(ActionSuccess::ReloadRules { .. }) => Value::Null,
+        Ok(ActionSuccess::Verbs { value }) => Value::Array(value.into_inner().into_iter()
+            .map(|row| json!({
+                "verb": row.verb.into_inner(),
+                "args": row.arguments.into_inner(),
+                "help": row.description.into_inner(),
+            }))
+            .collect()),
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -3074,22 +3129,32 @@ macro_rules! ui_verbs {
                 sd
             }).collect())
         }
-        "display_path" => { match arg_sid(args) {
-            Some(id) => Value::String(discover::display_path(&boxes, id)),
-            None => Value::Null,
+        "display_path" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::DisplayPath { sid },
+            ));
         }
-        }
-        "resolve_box" => { match args.first().and_then(Value::as_str)
-            .and_then(|s| resolve(&boxes, s)) {
-            Some(id) => Value::String(id.to_string()),
-            None => Value::Null,
-        }
+        "resolve_box" => {
+            let Some(name_or_id) = args.first().and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "missing box name or id"});
+            };
+            let Ok(name_or_id) = crate::wire::BoundedText::new(name_or_id.to_owned()) else {
+                return json!({"ok": false, "error": "box name or id exceeds relation bound"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ResolveBox { name_or_id },
+            ));
         }
         "select" => {
-            if let Some(id) = arg_sid(args) {
-                lock(state).selected = Some(id.to_string());
-            }
-            json!({"ok": true})
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Select { sid },
+            ));
         }
         "processes" => {
             let Some(id) = arg_sid(args).and_then(|id| u64::try_from(id).ok()) else {
@@ -3975,10 +4040,9 @@ macro_rules! ui_verbs {
             json!({"ok": true, "parent": child_id, "child": parent_id})
         }
         "reload_rules" => {
-            if let Some(ov) = lock(state).overlay.clone() {
-                ov.reload_rules();
-            }
-            json!(null)
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReloadRules,
+            ));
         }
         "delete" => { match arg_sid(args) {
             // Free the box, KEEPING any boxes stacked on it: children have this
@@ -4279,8 +4343,9 @@ macro_rules! ui_verbs {
             ));
         }
         "ping" => {
-            broadcast(state, &json!({"type": "pong"}));
-            json!("pong")
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Ping,
+            ));
         }
         "box_new" => {
             // m3a: create a box and expose <mnt>/<id> — the overlay-core path
@@ -4656,25 +4721,20 @@ macro_rules! ui_verbs {
                     "error": format!("{base_url}: {e}")}),
             }
         }
-        // The self-listing verb is a projection of the embedded relation,
-        // optionally filtered over name/description. Dispatch owns behavior
-        // only; it does not carry a second help/schema catalog.
         "verbs" => {
-            let filt = args.first().and_then(Value::as_str).unwrap_or("");
-            let rows = match crate::prolog::global().and_then(|hub| hub.ui_action_help()) {
-                Ok(rows) => rows,
-                Err(error) => return json!({"ok": false, "error": error}),
+            let filter = match args.first() {
+                None => None,
+                Some(Value::String(value)) => {
+                    let Ok(value) = crate::wire::BoundedText::new(value.clone()) else {
+                        return json!({"ok": false, "error": "help filter exceeds relation bound"});
+                    };
+                    Some(value)
+                }
+                Some(_) => return json!({"ok": false, "error": "help filter must be text"}),
             };
-            Value::Array(rows.into_iter()
-                .filter(|row| filt.is_empty()
-                    || row.verb.as_str().contains(filt)
-                    || row.description.as_str().contains(filt))
-                .map(|row| json!({
-                    "verb": row.verb.as_str(),
-                    "args": row.arguments.as_str(),
-                    "help": row.description.as_str(),
-                }))
-                .collect())
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Verbs { filter },
+            ));
         }
     } };
 }

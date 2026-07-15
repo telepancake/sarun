@@ -510,6 +510,17 @@ impl Prolog {
         decode_action_help_response(&response)
     }
 
+    pub fn ui_action_help_matching(
+        &self,
+        filter: &str,
+    ) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
+        let response = self.application(
+            Operation::ActionHelp,
+            format!("request(ui,{})", quote_string(filter)),
+        )?;
+        decode_action_help_response(&response)
+    }
+
     pub fn context_query(
         &self,
         query: &ContextQuery,
@@ -2594,5 +2605,12 @@ mod tests {
             .find(|row| row.verb.as_str() == "display_path")
             .expect("UI action missing from relation help surface");
         assert_eq!(display_path.arguments.as_str(), "SID");
+
+        let filtered = global().unwrap().ui_action_help_matching("mirror").unwrap();
+        assert!(filtered.len() >= 5);
+        assert!(filtered.iter().all(|row| {
+            row.verb.as_str().contains("mirror")
+                || row.description.as_str().contains("mirror")
+        }));
     }
 }
