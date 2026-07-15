@@ -918,6 +918,13 @@ belong to the relation.
   ready for direct binary framing; register, subscriptions, PTY, API, and
   service requests remain connection-mode handoffs rather than ordinary
   replies.
+- Moved PTY handoff onto `TransportRequest::PtySpawn`: argv is a non-empty
+  bounded byte vector, dimensions are checked `u16` values, cwd remains an OS
+  byte path, and environment is the generated bounded byte map. The PTY
+  implementation no longer filters malformed JSON items or silently defaults
+  invalid values; it consumes the closed request before acknowledging and
+  entering the raw PTY frame mux. The temporary listener performs the sole
+  legacy conversion until `ConnectionMode::Pty` is written directly.
 
 ## Stop conditions
 

@@ -6207,8 +6207,8 @@ impl crate::pty::CloneStream for Prebuffered {
     }
 }
 
-/// Engine-held-PTY connection (D7/D9). `msg` is the `pty_spawn` request:
-///   {"type":"pty_spawn","argv":[...],"rows":R,"cols":C}
+/// Engine-held-PTY connection (D7/D9). `request` is the generated bounded
+/// `TransportRequest::PtySpawn` value.
 /// We ack one JSON line, then the connection becomes a bidirectional FRAME_PTY_*
 /// mux driven by `crate::pty::serve_pty` (master↔client + EOF). `prebuf` is any
 /// bytes the BufReader already consumed past the request line.
@@ -6217,44 +6217,56 @@ impl crate::pty::CloneStream for Prebuffered {
 /// overlay box). The mux/render/input loop is the proven, reusable half; wrapping
 /// the PTY child in an overlay-backed box reuses this exact frame mux and is the
 /// documented follow-on (DESIGN.md D9 — PTY mode toggle over the box channel).
-fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
-    let argv: Vec<String> = msg
-        .get("argv")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    if argv.is_empty() {
-        let _ = writer.write_all(b"{\"ok\":false,\"error\":\"pty_spawn: empty argv\"}\n");
+fn handle_pty_spawn(
+    request: crate::generated_wire::TransportRequest,
+    writer: &mut UnixStream,
+    prebuf: Vec<u8>,
+) {
+    let crate::generated_wire::TransportRequest::PtySpawn {
+        argv, rows, columns, cwd, environment,
+    } = request else {
+        let _ = writer.write_all(b"{\"ok\":false,\"error\":\"expected PTY request\"}\n");
         return;
-    }
-    let rows = msg.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
-    let cols = msg.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
+    };
+    let decoded: Result<(
+        Vec<String>,
+        Option<std::path::PathBuf>,
+        Vec<(String, String)>,
+    ), String> = (|| {
+        let argv = argv.into_inner().into_iter().map(|value|
+            String::from_utf8(value.into_inner())
+                .map_err(|_| "PTY argv is not UTF-8".to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let cwd = cwd.map(|value| {
+            use std::os::unix::ffi::OsStringExt;
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(value.into_inner()))
+        });
+        let environment = environment.into_inner().into_iter().map(|(key, value)| {
+            let key = String::from_utf8(key.into_inner())
+                .map_err(|_| "PTY environment key is not UTF-8".to_string())?;
+            let value = String::from_utf8(value.into_inner())
+                .map_err(|_| "PTY environment value is not UTF-8".to_string())?;
+            Ok((key, value))
+        }).collect::<Result<Vec<_>, String>>()?;
+        Ok((argv, cwd, environment))
+    })();
+    let (argv, cwd, environment) = match decoded {
+        Ok(value) => value,
+        Err(error) => {
+            let reply = json!({"ok": false, "error": error});
+            let _ = writer.write_all(format!("{reply}\n").as_bytes());
+            return;
+        }
+    };
     // cwd: the UI's $PWD at the moment it sent the spawn — what the user
     // sees as "where I am". Without this the child inherits the engine
     // daemon's cwd (whatever it was when the daemon started, usually $HOME)
     // and `bash -i` opens in the wrong dir. Engine daemon is long-lived so
     // its own cwd is unreliable; the UI's is correct per-launch.
-    let cwd: Option<std::path::PathBuf> = msg
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(std::path::PathBuf::from);
     // env: portable_pty's CommandBuilder starts from a MINIMAL env by
     // default — SHELL/HOME/USER/PATH absent, so `bash -i` lands in a
     // broken shell. The UI ships its own envvars and we lay them on top
     // of the daemon's so the user gets a normal session.
-    let env: Vec<(String, String)> = msg
-        .get("env")
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
     // Ack BEFORE the frame mux begins so the client knows to switch to frames.
     if writer.write_all(b"{\"ok\":true,\"r\":\"pty\"}\n").is_err() {
         return;
@@ -6269,7 +6281,7 @@ fn handle_pty_spawn(msg: &Value, writer: &mut UnixStream, prebuf: Vec<u8>) {
         pos: 0,
         inner: stream,
     };
-    crate::pty::serve_pty(&argv, rows, cols, chan, None, cwd.as_deref(), &env);
+    crate::pty::serve_pty(&argv, rows, columns, chan, None, cwd.as_deref(), &environment);
 }
 
 /// Top-level handler for a control connection. `hint_box_id` is the box id
@@ -6361,7 +6373,54 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     libc::close(fd);
                 }
             }
-            handle_pty_spawn(&msg, &mut writer, reader.buffer().to_vec());
+            let request: Result<crate::generated_wire::TransportRequest, String> = (|| {
+                let values = msg.get("argv").and_then(Value::as_array)
+                    .ok_or("pty_spawn: missing argv")?;
+                let argv = values.iter().map(|value| {
+                    let value = value.as_str().ok_or("pty_spawn: argv item is not text")?;
+                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                        .map_err(|_| "pty_spawn: argv item exceeds relation bound")
+                }).collect::<Result<Vec<_>, _>>()?;
+                let argv = crate::wire::BoundedVec::new(argv)
+                    .map_err(|error| format!("pty_spawn: argv exceeds relation bound: {error:?}"))?;
+                let dimension = |name: &str, default: u16| {
+                    let value = msg.get(name).and_then(Value::as_u64)
+                        .unwrap_or(u64::from(default));
+                    u16::try_from(value).map_err(|_| format!("pty_spawn: {name} exceeds u16"))
+                };
+                let cwd = msg.get("cwd").and_then(Value::as_str).map(|value|
+                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                        .map_err(|_| "pty_spawn: cwd exceeds relation bound".to_string()))
+                    .transpose()?;
+                let mut entries = std::collections::BTreeMap::new();
+                for (key, value) in msg.get("env").and_then(Value::as_object)
+                    .into_iter().flatten()
+                {
+                    let value = value.as_str()
+                        .ok_or_else(|| "pty_spawn: environment value is not text".to_string())?;
+                    let key = crate::wire::BoundedBytes::new(key.as_bytes().to_vec())
+                        .map_err(|_| "pty_spawn: environment key exceeds relation bound".to_string())?;
+                    let value = crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                        .map_err(|_| "pty_spawn: environment value exceeds relation bound".to_string())?;
+                    entries.insert(key, value);
+                }
+                let environment = crate::wire::BoundedMap::new(entries)
+                    .map_err(|error| format!("pty_spawn: environment exceeds relation bound: {error:?}"))?;
+                Ok(crate::generated_wire::TransportRequest::PtySpawn {
+                    argv,
+                    rows: dimension("rows", 24)?,
+                    columns: dimension("cols", 80)?,
+                    cwd,
+                    environment,
+                })
+            })();
+            match request {
+                Ok(request) => handle_pty_spawn(request, &mut writer, reader.buffer().to_vec()),
+                Err(error) => {
+                    let reply = json!({"ok": false, "error": error});
+                    let _ = writer.write_all(format!("{reply}\n").as_bytes());
+                }
+            }
             return;
         }
         // api.proxy: LLM-API passthrough conn from an in-box `oaita` client.
