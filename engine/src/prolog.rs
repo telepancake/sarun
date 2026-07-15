@@ -192,6 +192,29 @@ pub struct ContextQueryNode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextBinding {
+    pub query_id: String,
+    pub argument_index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextPlan {
+    pub command: CommandAst,
+    pub queries: Vec<ContextQueryNode>,
+    pub bindings: Vec<ContextBinding>,
+    pub evidence: Vec<Evidence>,
+    pub preference: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextCompletionPlan {
+    pub action: String,
+    pub replace: Span,
+    pub surface: String,
+    pub query: ContextQueryNode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseStatus {
     Complete,
     Incomplete { edit_id: String },
@@ -275,6 +298,9 @@ enum Operation {
     ContextQuery,
     ContextObserve,
     ContextReady,
+    ContextPlan,
+    ContextResolve,
+    ContextCompletion,
 }
 
 impl Operation {
@@ -287,6 +313,9 @@ impl Operation {
             Self::ContextQuery => "context_query",
             Self::ContextObserve => "context_observe",
             Self::ContextReady => "context_ready",
+            Self::ContextPlan => "context_plan",
+            Self::ContextResolve => "context_resolve",
+            Self::ContextCompletion => "context_completion",
         }
     }
 }
@@ -462,6 +491,59 @@ impl Prolog {
             format!("request({graph},[{observations}])"),
         )?;
         decode_context_ready_response(&response)
+    }
+
+    pub fn context_plans(
+        &self,
+        input: &GrammarInput,
+        assist_edit: Option<&'static str>,
+    ) -> Result<Vec<ContextPlan>, String> {
+        let items = encode_input(input)?;
+        let mode = assist_edit.map_or_else(
+            || Ok("exact".to_string()),
+            |id| checked_atom(id).map(|id| format!("assist({id})")).ok_or("invalid edit tear id"),
+        )?;
+        let response = self.application(
+            Operation::ContextPlan,
+            format!("request({items},{mode})"),
+        )?;
+        decode_context_plans_response(&response)
+    }
+
+    pub fn resolve_context_plan(
+        &self,
+        plan: &ContextPlan,
+        observations: &[ContextObservation],
+    ) -> Result<CommandAst, QueryError> {
+        let observations = observations
+            .iter()
+            .map(encode_context_observation)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(QueryError::Backend)?
+            .join(",");
+        let request = format!(
+            "request({},[{}])",
+            encode_context_plan(plan).map_err(QueryError::Backend)?,
+            observations,
+        );
+        let response = self
+            .application(Operation::ContextResolve, request)
+            .map_err(QueryError::Backend)?;
+        decode_context_command_response(&response)
+    }
+
+    pub fn context_completion_plans(
+        &self,
+        input: &GrammarInput,
+        edit_id: &'static str,
+    ) -> Result<Vec<ContextCompletionPlan>, String> {
+        let items = encode_input(input)?;
+        let id = checked_atom(edit_id).ok_or("invalid edit tear id")?;
+        let response = self.application(
+            Operation::ContextCompletion,
+            format!("request({items},{id})"),
+        )?;
+        decode_context_completion_plans_response(&response)
     }
 
     fn application(&self, operation: Operation, request: String) -> Result<String, String> {
@@ -1113,13 +1195,8 @@ fn encode_context_graph(graph: &[ContextQueryNode]) -> Result<String, String> {
     ))
 }
 
-fn encode_parse_candidate(result: &ParseCandidate) -> String {
-    let status = match &result.status {
-        ParseStatus::Complete => "complete".to_string(),
-        ParseStatus::Incomplete { edit_id } => format!("incomplete(edit({}))", quote_atom(edit_id)),
-    };
-    let evidence = result
-        .evidence
+fn encode_evidence_items(evidence: &[Evidence]) -> String {
+    evidence
         .iter()
         .map(|item| {
             let paints = item
@@ -1141,7 +1218,38 @@ fn encode_parse_candidate(result: &ParseCandidate) -> String {
             )
         })
         .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn encode_context_plan(plan: &ContextPlan) -> Result<String, String> {
+    let bindings = plan
+        .bindings
+        .iter()
+        .map(|binding| {
+            format!(
+                "bind({},arg({}),entry_value)",
+                quote_atom(&binding.query_id),
+                binding.argument_index,
+            )
+        })
+        .collect::<Vec<_>>()
         .join(",");
+    Ok(format!(
+        "plan({}, {}, [{}], [{}], {})",
+        encode_command(&plan.command),
+        encode_context_graph(&plan.queries)?,
+        bindings,
+        encode_evidence_items(&plan.evidence),
+        plan.preference,
+    ))
+}
+
+fn encode_parse_candidate(result: &ParseCandidate) -> String {
+    let status = match &result.status {
+        ParseStatus::Complete => "complete".to_string(),
+        ParseStatus::Incomplete { edit_id } => format!("incomplete(edit({}))", quote_atom(edit_id)),
+    };
+    let evidence = encode_evidence_items(&result.evidence);
     format!(
         "parse_result({},{},[{}],{})",
         encode_command(&result.command),
@@ -1497,6 +1605,52 @@ fn decode_context_node(term: &ParsedTerm) -> Result<ContextQueryNode, String> {
     })
 }
 
+fn decode_context_binding(term: &ParsedTerm) -> Result<ContextBinding, String> {
+    let args = compound(term, "bind", 3)?;
+    let argument = compound(&args[1], "arg", 1)?;
+    if atom(&args[2])? != "entry_value" {
+        return Err("invalid context binding projection".into());
+    }
+    let argument_index = nonnegative(&argument[0])?;
+    if argument_index == 0 {
+        return Err("context binding uses zero argument index".into());
+    }
+    Ok(ContextBinding {
+        query_id: atom(&args[0])?.to_owned(),
+        argument_index,
+    })
+}
+
+fn decode_context_plan(term: &ParsedTerm) -> Result<ContextPlan, String> {
+    let args = compound(term, "plan", 5)?;
+    Ok(ContextPlan {
+        command: decode_command(&args[0])?,
+        queries: list(&args[1])?
+            .iter()
+            .map(decode_context_node)
+            .collect::<Result<_, _>>()?,
+        bindings: list(&args[2])?
+            .iter()
+            .map(decode_context_binding)
+            .collect::<Result<_, _>>()?,
+        evidence: list(&args[3])?
+            .iter()
+            .map(decode_evidence)
+            .collect::<Result<_, _>>()?,
+        preference: integer(&args[4])?,
+    })
+}
+
+fn decode_context_completion_plan(term: &ParsedTerm) -> Result<ContextCompletionPlan, String> {
+    let args = compound(term, "completion_context", 4)?;
+    Ok(ContextCompletionPlan {
+        action: atom(&args[0])?.to_owned(),
+        replace: decode_span(&args[1])?,
+        surface: text(&args[2])?.to_owned(),
+        query: decode_context_node(&args[3])?,
+    })
+}
+
 fn decode_context_outcome_response(response: &str) -> Result<Option<ContextResult>, String> {
     decode_context_outcome(&response_value(response)?)
 }
@@ -1511,6 +1665,40 @@ fn decode_context_ready_response(response: &str) -> Result<Vec<ContextQueryNode>
         .iter()
         .map(decode_context_node)
         .collect()
+}
+
+fn decode_context_plans_response(response: &str) -> Result<Vec<ContextPlan>, String> {
+    let value = response_value(response)?;
+    list(&value)?.iter().map(decode_context_plan).collect()
+}
+
+fn decode_context_completion_plans_response(
+    response: &str,
+) -> Result<Vec<ContextCompletionPlan>, String> {
+    let value = response_value(response)?;
+    list(&value)?
+        .iter()
+        .map(decode_context_completion_plan)
+        .collect()
+}
+
+fn decode_context_command_response(response: &str) -> Result<CommandAst, QueryError> {
+    let term = TermParser::parse(response).map_err(QueryError::Backend)?;
+    if let Ok(args) = compound(&term, "ok", 1) {
+        return decode_command(&args[0]).map_err(QueryError::Backend);
+    }
+    if let Ok(args) = compound(&term, "error", 1) {
+        if atom(&args[0]).ok() == Some("no_solution") {
+            return Err(QueryError::NoSolution);
+        }
+        return Err(QueryError::Backend(format!(
+            "action grammar rejected request: {}",
+            term_text(&args[0])
+        )));
+    }
+    Err(QueryError::Backend(
+        "invalid context resolution response".into(),
+    ))
 }
 
 fn decode_span(term: &ParsedTerm) -> Result<Span, String> {
@@ -1697,6 +1885,28 @@ pub(crate) fn ensure_linked() {
 mod tests {
     use super::*;
 
+    fn grammar_words(words: &[&str]) -> GrammarInput {
+        let mut start = 0;
+        let mut items = Vec::with_capacity(words.len());
+        for word in words {
+            let end = start + word.len();
+            items.push(InputItem::Unit(KnownUnit {
+                semantic: Semantic::Text((*word).into()),
+                span: Span { start, end },
+                paint_spans: vec![Span { start, end }],
+                surface: (*word).into(),
+                syntax: "command_source".into(),
+                provider: "rust".into(),
+                preference: 0,
+            }));
+            start = end + 1;
+        }
+        GrammarInput {
+            items,
+            end: start.saturating_sub(1),
+        }
+    }
+
     fn command(action: &str, id: Option<i64>) -> CommandAst {
         CommandAst {
             action: action.into(),
@@ -1860,6 +2070,80 @@ mod tests {
                     ),
                     compound("prefix", vec![RelationValue::String("src/".into())]),
                 ],
+            ),
+        );
+    }
+
+    #[test]
+    fn contextual_command_plans_and_resolution_cross_embedded_boundary() {
+        let prolog = global().unwrap();
+        let plans = prolog
+            .context_plans(&grammar_words(&["rename", "work", "new-name"]), None)
+            .unwrap();
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        assert_eq!(plan.command.args[0], CommandValue::String("work".into()));
+        assert_eq!(plan.queries.len(), 1);
+        assert_eq!(plan.queries[0].query.cardinality, ContextCardinality::One);
+        assert_eq!(plan.queries[0].query.domain, RelationValue::Atom("box".into()));
+        assert_eq!(
+            plan.bindings,
+            vec![ContextBinding {
+                query_id: "q1".into(),
+                argument_index: 1,
+            }],
+        );
+
+        let entry = ContextEntry {
+            domain: RelationValue::Atom("box".into()),
+            identity: RelationValue::Integer(5),
+            names: vec!["work".into()],
+            value: RelationValue::Compound(
+                "string".into(),
+                vec![RelationValue::String("5".into())],
+            ),
+            attributes: Vec::new(),
+        };
+        let observation = ContextObservation {
+            id: "q1".into(),
+            query: plan.queries[0].query.clone(),
+            provider: RelationValue::Atom("boxes".into()),
+            revision: RelationValue::Integer(7),
+            outcome: Some(ContextResult::One(entry)),
+        };
+        assert_eq!(
+            prolog.resolve_context_plan(plan, &[observation]).unwrap().args,
+            vec![
+                CommandValue::String("5".into()),
+                CommandValue::String("new-name".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn contextual_completion_plan_crosses_embedded_boundary() {
+        let mut input = grammar_words(&["rename"]);
+        input.items.push(InputItem::EditTear {
+            id: "edit",
+            span: Span { start: 7, end: 9 },
+            surface: "wo".into(),
+        });
+        input.end = 9;
+
+        let plans = global()
+            .unwrap()
+            .context_completion_plans(&input, "edit")
+            .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].action, "rename");
+        assert_eq!(plans[0].replace, Span { start: 7, end: 9 });
+        assert_eq!(plans[0].surface, "wo");
+        assert_eq!(plans[0].query.query.cardinality, ContextCardinality::All);
+        assert_eq!(
+            plans[0].query.query.selector,
+            RelationValue::Compound(
+                "prefix".into(),
+                vec![RelationValue::String("wo".into())],
             ),
         );
     }

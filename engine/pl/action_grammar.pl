@@ -747,6 +747,15 @@ dispatch_application(context_observe, request(Id, Query, Snapshot), ok(Observati
     !, observe_query(Id, Query, Snapshot, Observation).
 dispatch_application(context_ready, request(Graph, Observations), ok(Ready)) :-
     !, ready_queries(Graph, Observations, Ready).
+dispatch_application(context_plan, request(Items, Mode), ok(Plans)) :-
+    !, findall(Plan, context_plan(Items, Mode, Plan), Plans).
+dispatch_application(context_resolve, request(Plan, Observations), Response) :-
+    !, ( resolve_context_plan(Plan, Observations, Command)
+       -> Response = ok(Command)
+       ;  Response = error(no_solution)
+       ).
+dispatch_application(context_completion, request(Items, EditId), ok(Plans)) :-
+    !, findall(Plan, context_completion_plan(Items, EditId, Plan), Plans).
 dispatch_application(parse, _, error(invalid_request)) :- !.
 dispatch_application(complete, _, error(invalid_request)) :- !.
 dispatch_application(highlights, _, error(invalid_request)) :- !.
@@ -756,4 +765,7 @@ dispatch_application(convert, _, error(invalid_request)) :- !.
 dispatch_application(context_query, _, error(invalid_request)) :- !.
 dispatch_application(context_observe, _, error(invalid_request)) :- !.
 dispatch_application(context_ready, _, error(invalid_request)) :- !.
+dispatch_application(context_plan, _, error(invalid_request)) :- !.
+dispatch_application(context_resolve, _, error(invalid_request)) :- !.
+dispatch_application(context_completion, _, error(invalid_request)) :- !.
 dispatch_application(_, _, error(invalid_operation)).
