@@ -122,6 +122,8 @@ pub struct Invocation {
     pub handler: String,
     pub target: ActionTarget,
     pub args: Vec<ArgValue>,
+    /// Exact external observations used to resolve this invocation.
+    pub context: Vec<crate::prolog::ContextObservation>,
 }
 
 impl Invocation {
@@ -172,14 +174,44 @@ pub struct Highlight {
     pub origin: String,
 }
 
+/// Supplies a snapshot for an explicit query emitted by the relation.
+///
+/// Implementations route semantic domains to engine state, sockets, or other
+/// stores. They do not decide which source position needs which domain or
+/// cardinality: the complete typed request is supplied by Prolog. The pure
+/// relation evaluates that request against the returned snapshot.
+pub trait ContextProvider {
+    fn snapshot(
+        &self,
+        request: &crate::prolog::ContextQueryNode,
+    ) -> Result<crate::prolog::ContextSnapshot, String>;
+}
+
+/// A real, empty external context for callers whose grammar has no live
+/// object store (for example, context-free CLI forms and parser unit tests).
+pub struct EmptyContext;
+
+impl ContextProvider for EmptyContext {
+    fn snapshot(
+        &self,
+        _request: &crate::prolog::ContextQueryNode,
+    ) -> Result<crate::prolog::ContextSnapshot, String> {
+        Ok(crate::prolog::ContextSnapshot {
+            provider: crate::prolog::RelationValue::Atom("empty_context".into()),
+            revision: crate::prolog::RelationValue::Integer(0),
+            entries: Vec::new(),
+        })
+    }
+}
+
 /// Parse neutral source words through the same mandatory relation as text input.
-pub fn parse_words(parts: &[&str]) -> ParseResult {
-    parse(&parts.join(" "))
+pub fn parse_words(parts: &[&str], context: &dyn ContextProvider) -> ParseResult {
+    parse(&parts.join(" "), context)
 }
 
 /// Parse a command into a typed, wire-ready invocation through the mandatory
 /// Prolog relation. There is no alternate parser.
-pub fn parse(input: &str) -> ParseResult {
+pub fn parse(input: &str, context: &dyn ContextProvider) -> ParseResult {
     if input.trim().is_empty() {
         return ParseResult::Empty;
     }
@@ -190,23 +222,72 @@ pub fn parse(input: &str) -> ParseResult {
         Ok(prolog) => prolog,
         Err(error) => return ParseResult::BackendError(error),
     };
-    let candidates = match prolog.parse(&grammar_input, None) {
-        Ok(candidates) => candidates,
+    let mut plans = match prolog.context_plans(&grammar_input, None) {
+        Ok(plans) => plans,
         Err(error) => return ParseResult::BackendError(error),
     };
-    let Some(candidate) = candidates
-        .into_iter()
-        .max_by_key(|candidate| candidate.preference)
-    else {
-        return ParseResult::Unknown(input.to_string());
-    };
-    match invocation_from_prolog(candidate.command) {
-        Ok(invocation) => ParseResult::Invocation(invocation),
-        Err(error) => ParseResult::BackendError(error),
+    plans.sort_by_key(|plan| std::cmp::Reverse(plan.preference));
+    let mut provider_error = None;
+    for plan in plans {
+        match execute_context_plan(prolog, &plan, context) {
+            Ok(Some((command, observations))) => {
+                return match invocation_from_prolog(command, observations) {
+                    Ok(invocation) => ParseResult::Invocation(invocation),
+                    Err(error) => ParseResult::BackendError(error),
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                provider_error.get_or_insert(error);
+            }
+        };
+    }
+    provider_error.map_or_else(
+        || ParseResult::Unknown(input.to_string()),
+        ParseResult::BackendError,
+    )
+}
+
+fn execute_context_plan(
+    prolog: &crate::prolog::Prolog,
+    plan: &crate::prolog::ContextPlan,
+    context: &dyn ContextProvider,
+) -> Result<Option<(crate::prolog::CommandAst, Vec<crate::prolog::ContextObservation>)>, String> {
+    let mut observations = Vec::with_capacity(plan.queries.len());
+    while observations.len() < plan.queries.len() {
+        let ready = prolog.ready_context_queries(&plan.queries, &observations)?;
+        if ready.is_empty() {
+            return Ok(None);
+        }
+        for resolved in ready {
+            let Some(original) = plan.queries.iter().find(|node| node.id == resolved.id) else {
+                return Err(format!(
+                    "context relation returned unknown ready query {}",
+                    resolved.id
+                ));
+            };
+            let snapshot = context.snapshot(&resolved)?;
+            let outcome = prolog.context_query(&resolved.query, &snapshot)?;
+            observations.push(crate::prolog::ContextObservation {
+                id: original.id.clone(),
+                query: original.query.clone(),
+                provider: snapshot.provider,
+                revision: snapshot.revision,
+                outcome,
+            });
+        }
+    }
+    match prolog.resolve_context_plan(plan, &observations) {
+        Ok(command) => Ok(Some((command, observations))),
+        Err(crate::prolog::QueryError::NoSolution) => Ok(None),
+        Err(crate::prolog::QueryError::Backend(error)) => Err(error),
     }
 }
 
-fn invocation_from_prolog(command: crate::prolog::CommandAst) -> Result<Invocation, String> {
+fn invocation_from_prolog(
+    command: crate::prolog::CommandAst,
+    context: Vec<crate::prolog::ContextObservation>,
+) -> Result<Invocation, String> {
     use crate::prolog::CommandValue;
     fn convert_value(value: CommandValue) -> ArgValue {
         match value {
@@ -234,6 +315,7 @@ fn invocation_from_prolog(command: crate::prolog::CommandAst) -> Result<Invocati
         handler: command.handler,
         target,
         args,
+        context,
     })
 }
 
@@ -326,7 +408,11 @@ fn word_spans(input: &str) -> Vec<(usize, usize)> {
 
 /// Structured completion for an edit tear at `cursor`. The replacement span
 /// covers the whole identifier even when the cursor is in its middle.
-pub fn complete_at(input: &str, cursor: usize) -> Result<Vec<CompletionEntry>, String> {
+pub fn complete_at(
+    input: &str,
+    cursor: usize,
+    _context: &dyn ContextProvider,
+) -> Result<Vec<CompletionEntry>, String> {
     let cursor = floor_char_boundary(input, cursor.min(input.len()));
     let Some(grammar_input) = grammar_input(input, Some(cursor)) else {
         return Err("command input exceeds parser limits".into());
@@ -417,7 +503,7 @@ pub fn apply_completion(input: &str, completion: &CompletionEntry) -> String {
     )
 }
 
-pub fn highlights(input: &str) -> Result<Vec<Highlight>, String> {
+pub fn highlights(input: &str, _context: &dyn ContextProvider) -> Result<Vec<Highlight>, String> {
     let Some(grammar_input) = grammar_input(input, None) else {
         return Err("command input exceeds parser limits".into());
     };
@@ -487,7 +573,7 @@ mod tests {
     use super::*;
 
     fn invocation(input: &str) -> Invocation {
-        match parse(input) {
+        match parse(input, &EmptyContext) {
             ParseResult::Invocation(invocation) => invocation,
             other => panic!("{input:?} did not parse: {other:?}"),
         }
@@ -503,7 +589,7 @@ mod tests {
         assert_eq!(one.action, "mirror_run");
         assert_eq!(one.args, vec![ArgValue::Number(5)]);
         assert!(matches!(
-            parse("mirror run 5 extra"),
+            parse("mirror run 5 extra", &EmptyContext),
             ParseResult::Unknown(_)
         ));
     }
@@ -531,7 +617,7 @@ mod tests {
     #[test]
     fn completion_preserves_utf8_boundaries() {
         let input = "mirror rün";
-        assert!(complete_at(input, input.len()).is_ok());
+        assert!(complete_at(input, input.len(), &EmptyContext).is_ok());
         let inside_umlaut = input.find('ü').unwrap() + 1;
         assert!(grammar_input(input, Some(inside_umlaut)).is_none());
     }

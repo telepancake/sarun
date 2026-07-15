@@ -28,6 +28,17 @@ handler identity to executable code is an implementation boundary, not a
 second semantic registry. It must contain no duplicated schemas, aliases,
 descriptions, syntax, keys, menus, or rendering rules.
 
+`ui.sock` is a direct Rust-process transport, not a Prolog RPC mechanism. Its
+request/reply/event encoding must be compact binary rather than JSON. Sending,
+receiving, framing, decoding the binary envelope, and executing an already
+typed command stay entirely in Rust; Prolog is not invoked on that hot path,
+just as it is not invoked merely to forward an IP packet. The relation is the
+sole definition of how the typed wire representation corresponds to command
+text, CLI, logging, help, and every other representation. Rust wire opcodes and
+codecs must be generated/projected from that definition, not maintained as a
+parallel hand-written catalog. Cut over to the binary protocol and delete the
+JSON protocol rather than retaining a compatibility mode.
+
 The relation and FFI must remain generic enough to host future grammars for
 packets/protocol stacks, patches and editing, nested highlighting, build
 graphs, and brush syntax. UI actions are the first complete practical client,
@@ -274,15 +285,26 @@ belong to the relation.
 - [x] Remove every `cfg(feature = "prolog")` and negative counterpart.
 - [x] Remove `BackendStatus::{Disabled,Used,Unsupported,Error}` and the notion
       of a selectable backend.
-- [ ] Make parse failure/no-solution a normal typed parse result and runtime
+- [x] Make parse failure/no-solution a normal typed parse result and runtime
       failure a visible hard error; never invoke a second parser.
 - [x] Route command prompt parse/render/highlight/completion only through the
       relation.
 - [x] Route the mirror CLI through the same relation (its `parse_words` call is
       now only neutral framing into the mandatory parser).
 - [ ] Route every other command ingress through the same relation.
-- [ ] Route wire-message decoding/validation through the relation before Rust
-      handler execution.
+- [ ] Inventory every `ui.sock` request, reply, event, and stream frame and
+      specify bounded binary framing plus typed scalar/array/value encodings.
+- [ ] Give every wire action/message a stable binary identity in the relation;
+      project/generate the Rust opcode and codec definitions from it.
+- [ ] Replace JSON `ui.sock` request/reply transport with direct Rust binary
+      encode/decode and handler dispatch, with no Prolog call in message
+      delivery and no retained JSON compatibility mode.
+- [ ] Exercise relation-based conversion only at representation boundaries
+      (command line, command prompt, logging, diagnostics, help), producing or
+      consuming the same typed binary-wire value used by direct transport.
+- [ ] Add direct binary round-trip, malformed-frame/bounds, request/reply, and
+      runner-to-server integration tests; verify the socket hot path no longer
+      serializes or parses `serde_json::Value` frames.
 - [ ] Query help, menus, and binding data from the relation and cache immutable
       projections if needed.
 - [ ] Route key events through relation-derived action identities while keeping
@@ -367,6 +389,15 @@ belong to the relation.
   graphs, cycle/dangling-ref validation, and staged reference substitution.
 - Added generic Rust relation values and typed context envelopes; embedded
   aarch64 tests round-trip a box lookup and make a dependent path query ready.
+- Exposed contextual command/completion plans and command resolution through
+  the bounded embedded FFI, including aarch64-native boundary tests.
+- Made command parsing execute the relation-emitted query graph in dependency
+  order through an explicit provider, retain the exact observations, and feed
+  them back into the relation for wire-ready resolution. The UI box provider
+  supplies revision-tagged identities, names, display paths, and typed values.
+- Recorded the direct binary `ui.sock` transport boundary: Prolog owns
+  representation relationships and conversion, while already-typed
+  request/reply delivery is a Rust-only hot path.
 
 ## Stop conditions
 
@@ -378,6 +409,7 @@ The feature is not complete merely because a subset works. Do not stop with:
 - generated projections that are not the runtime path;
 - only mirror actions in Prolog;
 - wire parsing, CLI parsing, key dispatch, or help bypassing the relation;
+- JSON or Prolog-mediated `ui.sock` message delivery;
 - an x86-only normal build.
 
 Completion means the UI action surface has one Prolog definition and every

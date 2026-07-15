@@ -5032,7 +5032,10 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
     } else {
         words.extend(argv.iter().map(String::as_str));
     }
-    let invocation = match crate::parser::parse_words(&words) {
+    let invocation = match crate::parser::parse_words(
+        &words,
+        &crate::parser::EmptyContext,
+    ) {
         crate::parser::ParseResult::Invocation(invocation) => invocation,
         _ => {
             eprintln!(

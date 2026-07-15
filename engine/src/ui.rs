@@ -864,6 +864,8 @@ const PAGE_SIZE: usize = 20;
 struct App {
     sock: String,
     sessions: Vec<Value>,
+    /// Monotonic provenance for context observations over `sessions`.
+    sessions_revision: u64,
     /// Changes WINDOW for the selected box: a contiguous slice of the engine's
     /// view starting at `changes_window_start`. `sel_change` is the cursor
     /// inside this window (NOT global), so when the cursor walks off an edge
@@ -1223,6 +1225,69 @@ struct App {
     ins_pending: Option<InsNode>,
 }
 
+impl crate::parser::ContextProvider for App {
+    fn snapshot(
+        &self,
+        request: &crate::prolog::ContextQueryNode,
+    ) -> Result<crate::prolog::ContextSnapshot, String> {
+        use crate::prolog::{ContextEntry, ContextSnapshot, RelationValue};
+
+        // Domain routing is the provider boundary. The action relation—not
+        // this adapter—chooses the domain, selector, cardinality, and source
+        // position. Prolog also re-evaluates the complete query against this
+        // snapshot before accepting an observation.
+        if request.query.domain != RelationValue::Atom("box".into()) {
+            return Err(format!(
+                "no UI context provider for domain {:?}",
+                request.query.domain
+            ));
+        }
+
+        let mut entries = Vec::with_capacity(self.sessions.len());
+        for row in &self.sessions {
+            let Some(id_text) = row.get("session_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(identity) = id_text.parse::<i64>() else {
+                continue;
+            };
+            let mut names = vec![id_text.to_string()];
+            for field in ["name", "path"] {
+                if let Some(name) = row.get(field).and_then(Value::as_str)
+                    && !name.is_empty()
+                    && !names.iter().any(|known| known == name)
+                {
+                    names.push(name.to_string());
+                }
+            }
+            let mut attributes = Vec::new();
+            if let Some(status) = row.get("status").and_then(Value::as_str) {
+                attributes.push(RelationValue::Compound(
+                    "status".into(),
+                    vec![RelationValue::String(status.into())],
+                ));
+            }
+            entries.push(ContextEntry {
+                domain: RelationValue::Atom("box".into()),
+                identity: RelationValue::Integer(identity),
+                names,
+                // This is the typed command value projected by bind/3.
+                value: RelationValue::Compound(
+                    "string".into(),
+                    vec![RelationValue::String(id_text.into())],
+                ),
+                attributes,
+            });
+        }
+
+        Ok(ContextSnapshot {
+            provider: RelationValue::Atom("ui_sessions".into()),
+            revision: RelationValue::Integer(self.sessions_revision as i64),
+            entries,
+        })
+    }
+}
+
 /// Cap on the transcript window: chars rendered in one frame, centred on
 /// the selected entry (prototype's _OUT_CAP = 8000). Bytes outside the
 /// window get rolled up into "… N earlier" / "… N more" elision lines.
@@ -1245,6 +1310,7 @@ impl App {
         App {
             sock,
             sessions: vec![],
+            sessions_revision: 0,
             changes: vec![],
             changes_view: None, changes_view_sid: None,
             changes_total: 0,
@@ -1478,12 +1544,20 @@ impl App {
                     let py = y.get("path").and_then(Value::as_str).unwrap_or("");
                     px.cmp(py)
                 });
-                self.sessions = a;
+                if self.sessions != a {
+                    self.sessions_revision = self.sessions_revision.wrapping_add(1);
+                    self.sessions = a;
+                }
                 if self.sel_session >= self.sessions.len() {
                     self.sel_session = self.sessions.len().saturating_sub(1);
                 }
             }
-            Ok(_) => self.sessions.clear(),
+            Ok(_) => {
+                if !self.sessions.is_empty() {
+                    self.sessions_revision = self.sessions_revision.wrapping_add(1);
+                    self.sessions.clear();
+                }
+            }
             Err(e) => self.status = format!("session_dicts: {e}"),
         }
         // Loaded-image metadata rides along with every sessions refresh (a
@@ -3971,7 +4045,7 @@ impl App {
     }
 
     fn dispatch_command(&mut self, input: &str) {
-        let invocation = match crate::parser::parse(input.trim()) {
+        let invocation = match crate::parser::parse(input.trim(), self) {
             crate::parser::ParseResult::Invocation(invocation) => invocation,
             crate::parser::ParseResult::Empty => {
                 self.status = "command: empty".into();
@@ -8793,8 +8867,11 @@ fn help_lines() -> Vec<Line<'static>> {
     v
 }
 
-fn command_spans(buf: &str) -> Result<Vec<Span<'_>>, String> {
-    let mut highlights = crate::parser::highlights(buf)?;
+fn command_spans<'a>(
+    buf: &'a str,
+    context: &dyn crate::parser::ContextProvider,
+) -> Result<Vec<Span<'a>>, String> {
+    let mut highlights = crate::parser::highlights(buf, context)?;
     highlights.sort_by_key(|highlight| (highlight.span.start, highlight.span.end));
     let mut spans = Vec::new();
     let mut cursor = 0;
@@ -8897,7 +8974,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             5 + (completions.len().min(10)) as u16
                 + 2
                 + u16::from(matches!(
-                    crate::parser::parse(buf),
+                    crate::parser::parse(buf, app),
                     crate::parser::ParseResult::Invocation(_)
                 ))
         }
@@ -9538,7 +9615,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )];
-            let (highlighted, mut diagnostics) = match command_spans(buf) {
+            let (highlighted, mut diagnostics) = match command_spans(buf, app) {
                 Ok(spans) => (spans, Vec::new()),
                 Err(error) => (vec![Span::raw(buf)], vec![error]),
             };
@@ -9554,7 +9631,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from(""),
                 Line::from(input),
             ];
-            match crate::parser::parse(buf) {
+            match crate::parser::parse(buf, app) {
                 crate::parser::ParseResult::Invocation(invocation) => {
                     match crate::parser::render(&invocation) {
                         Ok(rendered) => body.push(Line::from(Span::styled(
@@ -10194,7 +10271,7 @@ fn command_completions(
     input: &str,
     cursor: usize,
 ) -> Vec<crate::parser::CompletionEntry> {
-    match crate::parser::complete_at(input, cursor) {
+    match crate::parser::complete_at(input, cursor, app) {
         Ok(entries) => entries,
         Err(error) => {
             app.status = format!("command parser: {error}");
@@ -18332,10 +18409,17 @@ pub fn ui_main(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_safe_slice, control_message};
+    use super::{App, char_safe_slice, control_message};
 
     #[test]
     fn control_messages_keep_sid_as_a_string() {
+        let mut app = App::bare(String::new());
+        app.sessions = vec![serde_json::json!({
+            "session_id": "5",
+            "name": "work",
+            "path": "work",
+            "status": "finished",
+        })];
         for (input, expected) in [
             ("apply 5", serde_json::json!({"type": "apply", "sid": "5"})),
             (
@@ -18343,16 +18427,21 @@ mod tests {
                 serde_json::json!({"type": "discard", "sid": "5"}),
             ),
             (
-                "rename 5 NEW",
+                "rename work NEW",
                 serde_json::json!({"type": "rename", "sid": "5", "name": "NEW"}),
             ),
         ] {
             let crate::parser::ParseResult::Invocation(invocation) =
-                crate::parser::parse(input)
+                crate::parser::parse(input, &app)
             else {
                 panic!("{input:?} did not parse")
             };
             assert_eq!(control_message(&invocation).unwrap(), expected, "{input}");
+            assert_eq!(invocation.context.len(), 1, "{input}");
+            assert!(matches!(
+                &invocation.context[0].outcome,
+                Some(crate::prolog::ContextResult::One(_))
+            ));
         }
     }
 
@@ -20279,7 +20368,7 @@ mod tests {
 
     #[test]
     fn command_modal_styles_exact_command_and_previews_canonical_form() {
-        let spans = command_spans("mirror_run 5").unwrap();
+        let spans = command_spans("mirror_run 5", &crate::parser::EmptyContext).unwrap();
         assert_eq!(
             spans
                 .iter()
@@ -20306,7 +20395,8 @@ mod tests {
     fn command_modal_partial_and_unicode_input_are_safe() {
         let mut app = headless_app();
         for input in ["mirror r", "mirror rün", "mirror_run 五", "λ"] {
-            let spans = command_spans(input).unwrap_or_else(|_| vec![Span::raw(input)]);
+            let spans = command_spans(input, &crate::parser::EmptyContext)
+                .unwrap_or_else(|_| vec![Span::raw(input)]);
             assert_eq!(
                 spans
                     .iter()
