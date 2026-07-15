@@ -67,6 +67,33 @@ packets/protocol stacks, patches and editing, nested highlighting, build
 graphs, and brush syntax. UI actions are the first complete practical client,
 not a command-specific architecture baked into the FFI.
 
+SWI remains the singular relation engine after an explicit comparison with
+egglog and egglog-experimental. Egglog's monotone bottom-up saturation and
+cost-based extraction are attractive for persistent equivalence classes, but
+the hub primarily needs demand-driven queries over partially bound terms,
+query-scoped changing inputs, exact zero/one/all cardinalities, and successful
+parse witnesses carrying explicit context observations. Do not introduce an
+egglog side engine. Borrow its useful separation between generating all valid
+alternatives and selecting a preferred representative through declarative
+costs.
+
+Generic binary grammars operate on bounded immutable blobs and borrowed byte
+slices, not lists containing one Prolog integer per byte. Small native pure
+primitives may provide bounds-checked length, slice, scalar-endian, checksum,
+and compound-layout operations; the relation must still own field order,
+length dependencies, validation, semantic types, and representation meaning.
+Every representation relation declares and tests its supported mode matrix
+(for example decode, encode/render, and validate); relational notation alone
+does not prove termination when insufficient arguments are bound.
+
+A tear is an explicit typed hole in the ordinary grammar, not input to a
+second completion algorithm. Matching a terminal or contextual value against
+a tear yields candidate evidence, and only a successful parse of the complete
+surrounding input records that binding as a completion. This automatically
+checks suffix viability and makes the completion carry the exact context
+query graph and observations used by the successful parse. Recording means
+returning pure evidence, never asserting state during backtracking.
+
 ## Current bad state being replaced
 
 There are three competing authorities:
@@ -287,6 +314,12 @@ belong to the relation.
 - [x] Generalize parse/render/completion/highlight predicates over all actions.
 - [ ] Add n-way representation queries for canonical verb, CLI, wire, key,
       menu, help/description, and syntax.
+- [ ] Add the generic bounded blob/slice layout relation and native pure byte
+      primitives; cover decode, encode, and validation modes with malformed,
+      truncated, length-dependent, and checksum fixtures.
+- [ ] Make tear matching part of the ordinary terminal/argument matcher and
+      derive completions by projecting successful full-parse tear evidence;
+      remove the separate completion traversal once this path is complete.
 - [ ] Add invariants proving unique public identities, valid handlers/targets,
       schema/form agreement, and complete handler coverage.
 - [x] Implement the pure `empty|one|all` evaluator, canonical typed matching,
@@ -380,6 +413,9 @@ belong to the relation.
 - [ ] Numeric-looking strings, paths, base64, and specs remain strings.
 - [ ] Optional and repeated arguments preserve exact wire array shape.
 - [ ] Completion supports partial tokens and mid-token UTF-8 byte spans.
+- [ ] Completion candidates are exactly the tear bindings used by successful
+      whole-input parses, including suffix viability, ranking evidence, and
+      contextual dependency observations.
 - [ ] Box/object/path completion is derived from revision-tagged context facts;
       dependent domains such as box paths use earlier parsed identities.
 - [x] Canonical observations compare equal exactly when a context change cannot
