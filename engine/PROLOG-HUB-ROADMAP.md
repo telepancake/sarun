@@ -39,6 +39,15 @@ codecs must be generated/projected from that definition, not maintained as a
 parallel hand-written catalog. Cut over to the binary protocol and delete the
 JSON protocol rather than retaining a compatibility mode.
 
+Persist and record canonical binary data without eagerly converting it to a
+human representation. Logs should retain compact typed wire frames with only
+the framing/provenance required to replay or select them; log views invoke the
+relation on demand for the visible window. Packet capture follows the same
+rule: preserve packet bytes and capture metadata, then decode, describe,
+highlight, or complete only when a consumer asks to view or transform them.
+This late-decoding rule keeps transport and recording fast while allowing rich
+relational presentation to take the time it needs.
+
 The relation and FFI must remain generic enough to host future grammars for
 packets/protocol stacks, patches and editing, nested highlighting, build
 graphs, and brush syntax. UI actions are the first complete practical client,
@@ -302,9 +311,15 @@ belong to the relation.
 - [ ] Exercise relation-based conversion only at representation boundaries
       (command line, command prompt, logging, diagnostics, help), producing or
       consuming the same typed binary-wire value used by direct transport.
+- [ ] Store logs as compact binary wire frames plus minimal provenance; remove
+      eager JSON/text log encoding and decode only requested display windows.
+- [ ] Apply the same late-decoding contract to packet data: retain original
+      bytes and metadata, and run relational packet decoding/rendering only for
+      explicit views or conversions.
 - [ ] Add direct binary round-trip, malformed-frame/bounds, request/reply, and
       runner-to-server integration tests; verify the socket hot path no longer
-      serializes or parses `serde_json::Value` frames.
+      serializes or parses `serde_json::Value` frames, and recording paths do
+      not eagerly invoke Prolog or human-oriented rendering.
 - [ ] Query help, menus, and binding data from the relation and cache immutable
       projections if needed.
 - [ ] Route key events through relation-derived action identities while keeping
