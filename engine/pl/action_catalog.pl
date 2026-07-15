@@ -5,6 +5,7 @@
             key_binding/4,
             menu_label/2,
             argument_context/4,
+            wire_handler/2,
             representation/3,
             convert/4,
             visible_action/1
@@ -141,6 +142,111 @@ action(refresh, refresh, local, "", "refresh sessions, changes, and rules", visi
 action(filter, filter, local, "", "filter the active pane", visible, 50).
 action(action_menu, action_menu, local, "", "show the actions popup for the selected row", visible, 50).
 action(toggle_mark, toggle_mark, local, "", "select/unselect row for batch operations", visible, 50).
+
+% Stable direct-Rust wire identities. These are explicit protocol facts: never
+% derive them from declaration order. Public aliases relate through their
+% normalized Handler identity, so mirror_resume uses mirror_pause's opcode and
+% two-field wire schema. Local UI actions deliberately have no wire identity.
+wire_handler('flows.detail', 1).
+wire_handler('flows.list', 2).
+wire_handler('flows.packets', 3).
+wire_handler('oaita.models', 4).
+wire_handler('oaita.probe', 5).
+wire_handler('oaita.status', 6).
+wire_handler('oci.build', 7).
+wire_handler('oci.images', 8).
+wire_handler('oci.load', 9).
+wire_handler('oci.resolve', 10).
+wire_handler('prompts.answer', 11).
+wire_handler('prompts.peek', 12).
+wire_handler('prompts.ui_active', 13).
+wire_handler('review.apply', 14).
+wire_handler('review.apply_hunk', 15).
+wire_handler('review.box_summary', 16).
+wire_handler('review.change_mode', 17).
+wire_handler('review.decorate', 18).
+wire_handler('review.decorate_many', 19).
+wire_handler('review.discard', 20).
+wire_handler('review.discard_hunk', 21).
+wire_handler('review.file_bytes', 22).
+wire_handler('review.file_groups', 23).
+wire_handler('review.hunks', 24).
+wire_handler('review.invalidate_consolidation', 25).
+wire_handler('review.invalidate_struct', 26).
+wire_handler('review.makevars', 27).
+wire_handler('review.map_ids', 28).
+wire_handler('review.patch_text', 29).
+wire_handler('review.pipeline_context', 30).
+wire_handler('review.recent_changes', 31).
+wire_handler('review.session_changes', 32).
+wire_handler('review.write_file', 33).
+wire_handler('svc.up', 34).
+wire_handler('view.close', 35).
+wire_handler('view.filter', 36).
+wire_handler('view.find', 37).
+wire_handler('view.open', 38).
+wire_handler('view.window', 39).
+wire_handler(api_log, 40).
+wire_handler(api_log_detail, 41).
+wire_handler(apply_to_copy, 42).
+wire_handler(box_dir_list, 43).
+wire_handler(box_drop, 44).
+wire_handler(box_file_read, 45).
+wire_handler(box_file_write, 46).
+wire_handler(box_new, 47).
+wire_handler(box_path_kind, 48).
+wire_handler(brushprov, 49).
+wire_handler(build_edges, 50).
+wire_handler(consolidate_start, 51).
+wire_handler(delete, 52).
+wire_handler(display_path, 53).
+wire_handler(dissolve, 54).
+wire_handler(first_writer_id, 55).
+wire_handler(first_writer_prov, 56).
+wire_handler(git_checkout, 57).
+wire_handler(ietf_attach, 58).
+wire_handler(kill, 59).
+wire_handler(mirror_add, 60).
+wire_handler(mirror_jobs, 61).
+wire_handler(mirror_pause, 62).
+wire_handler(mirror_rm, 63).
+wire_handler(mirror_run, 64).
+wire_handler(mirror_run_pending, 65).
+wire_handler(open_files, 66).
+wire_handler(output_detail, 67).
+wire_handler(output_pipeline, 68).
+wire_handler(outputs, 69).
+wire_handler(ping, 70).
+wire_handler(pipeline_procs, 71).
+wire_handler(proc_info, 72).
+wire_handler(proc_pipeline, 73).
+wire_handler(proc_prov, 74).
+wire_handler(proc_roots, 75).
+wire_handler(process_env, 76).
+wire_handler(processes, 77).
+wire_handler(processes_live, 78).
+wire_handler(reload_rules, 79).
+wire_handler(rescan, 80).
+wire_handler(resolve_box, 81).
+wire_handler(review_live, 82).
+wire_handler(review_state, 83).
+wire_handler(ro_attach, 84).
+wire_handler(rotate, 85).
+wire_handler(select, 86).
+wire_handler(session_dicts, 87).
+wire_handler(struct_cancel, 88).
+wire_handler(struct_finish, 89).
+wire_handler(struct_quick, 90).
+wire_handler(stuck, 91).
+wire_handler(verbs, 92).
+wire_handler(webcap, 93).
+wire_handler(webcap_body, 94).
+wire_handler(webcap_detail, 95).
+wire_handler(wiki_attach, 96).
+wire_handler(writer_id, 97).
+wire_handler(apply, 128).
+wire_handler(discard, 129).
+wire_handler(rename, 130).
 
 % Explicit shell forms. `Normalizer` relates parsed source arguments to the
 % handler's wire arguments. Shared paths are intentional and resolved by the
@@ -291,9 +397,10 @@ argument_kind(_, string).
 
 representation(Action, action, Action) :-
     action(Action, _, _, _, _, _, _).
-representation(Action, wire, wire(Handler, Target, Schema)) :-
+representation(Action, wire, wire(Code, Handler, Target, Schema)) :-
     action(Action, Handler, Target, _, _, _, _),
-    argument_schema(Action, Schema).
+    wire_handler(Handler, Code),
+    argument_schema(Handler, Schema).
 representation(Action, help, help(Notation, Description)) :-
     action(Action, _, _, Notation, Description, _, _).
 representation(Action, cli, cli(Words, Normalizer)) :-

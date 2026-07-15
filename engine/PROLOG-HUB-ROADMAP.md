@@ -324,8 +324,12 @@ belong to the relation.
 - [x] Inventory every `ui.sock` request, reply, event, and stream frame and
       specify bounded binary framing plus typed scalar/array/value encodings.
       The durable cutover contract is `UI-SOCK-BINARY.md`.
-- [ ] Give every wire action/message a stable binary identity in the relation;
-      project/generate the Rust opcode and codec definitions from it.
+- [x] Give every wire action a stable binary identity in the relation. Alias
+      actions normalize to their handler's identity and schema; local actions
+      have no invented wire form.
+- [ ] Give every non-action request/reply/event a stable binary identity and
+      schema in the relation; project/generate the Rust opcode and codec
+      definitions from the complete relation.
 - [ ] Replace JSON `ui.sock` request/reply transport with direct Rust binary
       encode/decode and handler dispatch, with no Prolog call in message
       delivery and no retained JSON compatibility mode.
@@ -453,6 +457,12 @@ belong to the relation.
 - Inventoried every `ui.sock` connection family and wrote the binary cutover
   contract. Consolidated the pre-existing TRACE atom code into one bounded
   tv-compatible Rust primitive and cut the box/PTY mux over to compound atoms.
+- Assigned explicit, order-independent numeric identities to all 100 wire
+  action handlers in the relation. Wire projection occurs after alias
+  normalization, so (for example) `mirror_resume` projects the actual
+  `mirror_pause` handler and its two-argument schema, while local-only actions
+  do not pretend to be transport messages. Relation invariants prove identity
+  uniqueness and complete UI/control handler coverage.
 - Recorded the direct binary `ui.sock` transport boundary: Prolog owns
   representation relationships and conversion, while already-typed
   request/reply delivery is a Rust-only hot path.

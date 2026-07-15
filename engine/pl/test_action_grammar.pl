@@ -5,6 +5,7 @@
 
 % Core-only test runner: this same file runs in the package-free embedded image.
 test_name(catalog_is_complete_and_valid).
+test_name(wire_identities_are_explicit_unique_and_normalized).
 test_name(neutral_source_parses_canonical_form).
 test_name(shared_cli_form_uses_complete_schema).
 test_name(alias_normalization_is_wire_ready).
@@ -67,6 +68,30 @@ run_test(catalog_is_complete_and_valid) :-
     length(Actions, 114),
     length(Unique, 114),
     expect(all_valid(Actions)).
+
+run_test(wire_identities_are_explicit_unique_and_normalized) :-
+    findall(Code-Handler, wire_handler(Handler, Code), Rows),
+    length(Rows, 100),
+    findall(Code, wire_handler(_, Code), Codes),
+    sort(Codes, UniqueCodes),
+    length(UniqueCodes, 100),
+    findall(Handler, wire_handler(Handler, _), Handlers),
+    sort(Handlers, UniqueHandlers),
+    length(UniqueHandlers, 100),
+    expect(all_wire_handlers_are_actions(Handlers)),
+    once(representation(mirror_resume, wire, Wire)),
+    expect_equal(
+        Wire,
+        wire(62, mirror_pause, ui,
+             [arg(id, integer, required, scalar),
+              arg(paused, boolean, required, scalar)])),
+    expect(\+ representation(quit, wire, _)).
+
+all_wire_handlers_are_actions([]).
+all_wire_handlers_are_actions([Handler|Handlers]) :-
+    action(Handler, Handler, Target, _, _, _, _),
+    ( Target = ui ; Target = control ),
+    all_wire_handlers_are_actions(Handlers).
 
 all_valid([]).
 all_valid([Action|Actions]) :-

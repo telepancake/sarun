@@ -1,5 +1,7 @@
 :- module(action_grammar,
           [ action/7,
+            wire_handler/2,
+            representation/3,
             valid_action/1,
             parse/2,
             parse/3,
@@ -48,7 +50,19 @@ valid_action(Action) :-
     number(Preference),
     argument_schema(Action, Schema),
     valid_schema(Schema),
+    valid_action_wire(Target, Handler),
     once(action_form(Action, verb, _, _)).
+
+valid_action_wire(local, Handler) :- \+ wire_handler(Handler, _).
+valid_action_wire(ui, Handler) :- valid_wire_handler(Handler).
+valid_action_wire(control, Handler) :- valid_wire_handler(Handler).
+
+valid_wire_handler(Handler) :-
+    wire_handler(Handler, Code),
+    integer(Code),
+    Code > 0,
+    argument_schema(Handler, Schema),
+    valid_schema(Schema).
 
 valid_target(ui).
 valid_target(control).
