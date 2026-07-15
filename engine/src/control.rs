@@ -1129,7 +1129,10 @@ fn dispatch(state: &State, msg: &Value) -> Value {
     let t = msg.get("type").and_then(Value::as_str).unwrap_or("");
     match t {
         "subscribe" => json!({"ok": true, "_subscribe": true}),
-        "register" => register(state, msg, None, None, None),
+        "register" => match legacy_register_request(msg) {
+            Ok(request) => register(state, &request, None, None, None),
+            Err(error) => json!({"ok": false, "error": error}),
+        },
         "select" => {
             let sid = msg.get("sid").and_then(Value::as_str).map(String::from);
             let boxes = discover::discover();
@@ -3830,6 +3833,61 @@ fn legacy_process_provenance(value: &Value)
     })
 }
 
+fn legacy_register_request(msg: &Value)
+    -> Result<crate::generated_wire::TransportRequest, String>
+{
+    use crate::generated_wire::{NetMode, RegistrationName, RunBackend, TransportRequest};
+    let command = msg.get("cmd").and_then(Value::as_array)
+        .ok_or("register has no command")?.iter().map(|value| {
+            let value = value.as_str().ok_or("register command argument is not text")?;
+            crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                .map_err(|error| format!("register command exceeds relation bound: {error:?}"))
+        }).collect::<Result<Vec<_>, String>>()?;
+    let name = if let Some(name) = msg.get("relname").and_then(Value::as_str) {
+        RegistrationName::Nested {
+            name: crate::wire::BoundedText::new(name.to_owned())
+                .map_err(|_| "nested registration name exceeds relation bound")?,
+        }
+    } else if let Some(selector) = msg.get("session_id").and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        RegistrationName::Host {
+            selector: crate::wire::BoundedText::new(selector.to_owned())
+                .map_err(|_| "registration selector exceeds relation bound")?,
+        }
+    } else {
+        RegistrationName::Automatic
+    };
+    let net_mode = match msg.get("net_mode").and_then(Value::as_str).unwrap_or("off") {
+        "off" => NetMode::Off,
+        "host" => NetMode::Host,
+        "tap" => NetMode::Tap,
+        _ => return Err("invalid registration network mode".into()),
+    };
+    Ok(TransportRequest::Register {
+        command: crate::wire::BoundedVec::new(command)
+            .map_err(|error| format!("register command exceeds relation bound: {error:?}"))?,
+        provenance: legacy_process_provenance(msg.get("prov")
+            .ok_or("register has no process provenance")?)?,
+        name,
+        backend: if msg.get("want_sud").and_then(Value::as_bool).unwrap_or(false) {
+            RunBackend::Sud
+        } else { RunBackend::Fuse },
+        net_mode,
+        capture: msg.get("want_capture").and_then(Value::as_bool).unwrap_or(true),
+        direct: msg.get("want_direct").and_then(Value::as_bool).unwrap_or(false),
+        capture_environment: msg.get("want_env").and_then(Value::as_bool).unwrap_or(false),
+        brush: msg.get("want_brush").and_then(Value::as_bool).unwrap_or(false),
+        api: msg.get("want_api").and_then(Value::as_bool).unwrap_or(false),
+        web_capture: msg.get("want_webcap").and_then(Value::as_bool).unwrap_or(false),
+        web_filter: msg.get("want_webfilter").and_then(Value::as_bool).unwrap_or(false),
+        replay_from: msg.get("replay_from").and_then(Value::as_u64),
+        no_parent: msg.get("want_no_parent").and_then(Value::as_bool).unwrap_or(false),
+        readonly_parent: msg.get("want_readonly_parent").and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
 /// The runner register handshake. Mints a box_id, creates the backing sentinel
 /// (live/<id>/up) and the box's sqlar (root process row from the message's
 /// prov), registers the box on the overlay, and acks with the <mnt>/<id> bind
@@ -3846,11 +3904,19 @@ fn legacy_process_provenance(value: &Value)
 /// the ack (no echo/sinks yet — runner behaves as -t passthrough).
 fn register(
     state: &State,
-    msg: &Value,
+    request: &crate::generated_wire::TransportRequest,
     peer_pidfd: Option<i32>,
     fd2_raw: Option<i32>,
     fd3_raw: Option<i32>,
 ) -> Value {
+    use crate::generated_wire::{NetMode, RegistrationName, RunBackend, TransportRequest};
+    let TransportRequest::Register {
+        command: _, provenance, name: registration_name, backend, net_mode,
+        capture, direct, capture_environment, brush, api, web_capture,
+        web_filter, replay_from, no_parent, readonly_parent,
+    } = request else {
+        return json!({"ok": false, "error": "expected register request"});
+    };
     // Assign the post-pidfd SCM_RIGHTS fds to roles from the message. The
     // runner sends them in a fixed order: [tap (if net_mode==tap)] then
     // [sud trace pipe (if want_sud)]. So:
@@ -3860,11 +3926,8 @@ fn register(
     // Own each as an OwnedFd so every early-return path closes it; the tap
     // fd moves into prepare_net and the trace fd into stream_events only on
     // the success path.
-    let want_sud_fd = msg
-        .get("want_sud")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let is_tap_fd = msg.get("net_mode").and_then(Value::as_str) == Some("tap");
+    let want_sud_fd = *backend == RunBackend::Sud;
+    let is_tap_fd = *net_mode == NetMode::Tap;
     let (tap_raw, trace_raw) = match (want_sud_fd, is_tap_fd) {
         (true, true) => (fd2_raw, fd3_raw),
         (true, false) => (None, fd2_raw),
@@ -3897,10 +3960,7 @@ fn register(
         .map(host_pid_from_pidfd)
         .filter(|p| *p > 0)
         .or_else(|| {
-            msg.get("prov")
-                .and_then(|p| p.get("tgid"))
-                .and_then(Value::as_i64)
-                .map(|t| t as i32)
+            i32::try_from(provenance.tgid).ok()
         })
         .unwrap_or(0);
     let boxes = discover::discover();
@@ -3909,10 +3969,10 @@ fn register(
     //   supplies only a single-segment relative NAME (or "" → auto A<n>).
     // HOST (no relname): top-level by default; a supplied session_id may be a
     //   single NAME or a dotted display path (A.B) whose prefix names the parent.
-    let relname = msg.get("relname").and_then(Value::as_str);
     let mut parent: Option<i64> = None;
     let mut name: Option<String> = None;
-    if let Some(rel) = relname {
+    if let RegistrationName::Nested { name: nested_name } = registration_name {
+        let rel = nested_name.as_str();
         if !rel.is_empty() && (!valid_name(rel) || rel.contains('.') || rel.contains('/')) {
             if let Some(fd) = peer_pidfd {
                 unsafe {
@@ -3937,11 +3997,8 @@ fn register(
         if !rel.is_empty() {
             name = Some(rel.to_string());
         }
-    } else if let Some(want) = msg
-        .get("session_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
+    } else if let RegistrationName::Host { selector } = registration_name {
+        let want = selector.as_str();
         if let Some((prefix, last)) = want.rsplit_once('.') {
             // Dotted display path: parent = prefix box (must exist), NAME = last.
             match resolve(&boxes, prefix) {
@@ -3989,32 +4046,16 @@ fn register(
     let id =
         existing_id.unwrap_or_else(|| boxes.keys().max().copied().unwrap_or(0).max(live_max) + 1);
     let name = name.unwrap_or_else(|| format!("A{id}"));
-    let env_capture = msg
-        .get("want_env")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let direct = msg
-        .get("want_direct")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let env_capture = *capture_environment;
+    let direct = *direct;
     // D-parent flags. `want_no_parent` is the runner's explicit "this box has
     // NO parent and the lower chain does NOT bottom at the host /": the box's
     // own contents are its entire filesystem (the bottom of an OCI image
     // stack). It overrides the kernel-derived parent walk, so even a runner
     // nested under another box can declare itself a rootfs.
-    let want_no_parent = msg
-        .get("want_no_parent")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let want_readonly_parent = msg
-        .get("want_readonly_parent")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let want_capture = msg
-        .get("want_capture")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-        && !direct;
+    let want_no_parent = *no_parent;
+    let want_readonly_parent = *readonly_parent;
+    let want_capture = *capture && !direct;
     let backing = crate::paths::live_home().join(id.to_string());
     if let Err(e) = std::fs::create_dir_all(backing.join("up")) {
         if let Some(fd) = peer_pidfd {
@@ -4042,21 +4083,13 @@ fn register(
     }
     b.set_env_capture(env_capture);
     b.set_direct(direct);
-    b.set_is_brush(
-        msg.get("want_brush")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    );
-    b.set_is_api(
-        msg.get("want_api")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    );
+    b.set_is_brush(*brush);
+    b.set_is_api(*api);
     // Tap boxes reach the network through the engine's MITM proxy + synthetic
     // DNS, so they need the engine's CA appended to their trust store and their
     // resolver pointed at the gateway. The overlay serves both as shadows gated
     // on this flag (see overlay.rs).
-    b.set_is_tap(msg.get("net_mode").and_then(Value::as_str) == Some("tap"));
+    b.set_is_tap(*net_mode == NetMode::Tap);
     b.set_meta("name", &name);
     // --sud (WIP, see engine/DESIGN-sud.md): the box runs under the sud64
     // wrapper with a directory upper instead of on the FUSE mount. Create
@@ -4065,10 +4098,7 @@ fn register(
     // pipe (fd-1023 read end) came in as its own SCM_RIGHTS fd
     // (sud_trace_owned), separate from the tap fd — so a sud box can be a
     // TAP box too (tap fd → prepare_net, trace fd → stream_events).
-    let want_sud = msg
-        .get("want_sud")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let want_sud = *backend == RunBackend::Sud;
     let mut sud_trace_fd: Option<std::os::fd::OwnedFd> = sud_trace_owned;
     if want_sud {
         let up = backing.join("sud-up");
@@ -4237,10 +4267,7 @@ fn register(
     // no host filesystem underneath. Surfaced to the runner so it can pick the
     // right default cwd ("/" when there's no host directory to inherit).
     let no_host = b.no_host_fallback() || chain_has_no_host(&boxes, parent);
-    match msg.get("prov").ok_or_else(|| "register has no process provenance".to_owned())
-        .and_then(legacy_process_provenance)
-        .and_then(|provenance| b.root_process(&provenance, i64::from(host_pid)))
-    {
+    match b.root_process(provenance, i64::from(host_pid)) {
         Ok(()) => (),
         Err(error) => {
             if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
@@ -4267,10 +4294,7 @@ fn register(
     // --api opt-in: register this box with the oaita proxy so connections
     // from inside it are accepted (and route to its api_log table). Refresh
     // the runner-pid map the proxy uses for peer attribution.
-    let want_api = msg
-        .get("want_api")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let want_api = *api;
     if want_api {
         if let Some(p) = lock(state).api_proxy.clone() {
             p.enable_box(id);
@@ -4315,13 +4339,7 @@ fn register(
     // around that fd and return dns_ip + the CA bundle CONTENT so the runner can
     // wire bwrap up (it materializes the CA in its own namespace). The engine
     // creates no netns/device, so there is no netns_path.
-    let net_mode = match msg.get("net_mode").and_then(Value::as_str).unwrap_or("off") {
-        "off" => crate::generated_wire::NetMode::Off,
-        "host" => crate::generated_wire::NetMode::Host,
-        "tap" => crate::generated_wire::NetMode::Tap,
-        _ => return json!({"ok": false, "error": "invalid network mode"}),
-    };
-    let replay_from = match msg.get("replay_from").and_then(Value::as_u64) {
+    let replay_from = match *replay_from {
         Some(value) if i64::try_from(value).is_err() => {
             return json!({"ok": false, "error": "replay box id exceeds engine range"});
         }
@@ -4330,9 +4348,9 @@ fn register(
     let (dns_ip, ca_pem) = prepare_net(
         state,
         id,
-        net_mode,
-        msg.get("want_webcap").and_then(Value::as_bool).unwrap_or(false),
-        msg.get("want_webfilter").and_then(Value::as_bool).unwrap_or(false),
+        *net_mode,
+        *web_capture,
+        *web_filter,
         replay_from,
         tap_fd,
     ).unwrap_or_default();
@@ -6395,17 +6413,18 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         // See the FRAME_API_* handling in the post-register frame loop
         // below and frames::FRAME_API_{OPEN,DATA,CLOSE}.
         let mut reply = if msg.get("type").and_then(Value::as_str) == Some("register") {
-            register(
-                &state,
-                &msg,
-                peer_pidfd.take(),
-                peer_tapfd
-                    .take()
-                    .map(|f| <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(f)),
-                peer_thirdfd
-                    .take()
-                    .map(|f| <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(f)),
-            )
+            match legacy_register_request(&msg) {
+                Ok(request) => register(
+                    &state,
+                    &request,
+                    peer_pidfd.take(),
+                    peer_tapfd.take().map(|fd|
+                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
+                    peer_thirdfd.take().map(|fd|
+                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
+                ),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
         } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_nested") {
             // D9 nested-shell provenance: a one-shot control message from the
             // brush-sh shim, carrying its OWN pidfd (like register) so we resolve

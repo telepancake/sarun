@@ -883,6 +883,14 @@ belong to the relation.
   path. Replay identities are range-checked before setup. The full native
   aarch64-musl suite passes 308 tests with one existing browser e2e test
   ignored.
+- Moved the complete registration input path onto generated
+  `TransportRequest::Register` fields. Name authority is the closed
+  automatic/host/nested choice; backend and network mode are enums; command,
+  process provenance, flags, and replay identity are bounded before the
+  registration implementation runs. The temporary newline listener now has
+  one strict conversion at its boundary rather than JSON reads throughout
+  registration. The full native aarch64-musl suite passes 308 tests with one
+  existing browser e2e test ignored.
 
 ## Stop conditions
 
