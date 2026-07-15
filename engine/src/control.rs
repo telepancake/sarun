@@ -1394,14 +1394,14 @@ fn dispatch_action(
             }
             let context = crate::review::NestCtx::new(lock(state).overlay.clone());
             let value = if applying {
-                let result = crate::review::apply_typed(id, &Value::Null, &context)?;
+                let result = crate::review::apply_typed(id, &[], &context)?;
                 crate::generated_wire::ActionMutationResult {
                     r#box: sid,
                     count: result.applied.as_slice().len() as u64,
                     errors: result.errors,
                 }
             } else {
-                let result = crate::review::discard_typed(id, &Value::Null, &context)?;
+                let result = crate::review::discard_typed(id, &[], &context)?;
                 crate::generated_wire::ActionMutationResult {
                     r#box: sid,
                     count: result.discarded.as_slice().len() as u64,
@@ -1799,6 +1799,73 @@ fn dispatch_action(
                 crate::review::decorate_many_typed(id, &paths)?)
                 .map_err(|error| format!("decorations exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::ReviewDecorateMany { value })
+        }
+        request @ (ActionRequest::ReviewApply { sid, .. }
+            | ActionRequest::ReviewDiscard { sid, .. }) => {
+            let applying = matches!(&request, ActionRequest::ReviewApply { .. });
+            let paths = match request {
+                ActionRequest::ReviewApply { paths, .. }
+                | ActionRequest::ReviewDiscard { paths, .. } => paths,
+                _ => unreachable!(),
+            };
+            let id = existing_box_id(sid)?;
+            let selected = paths.as_slice().iter().map(action_relative_path)
+                .collect::<Result<Vec<_>, String>>()?;
+            if box_is_running(state, id) {
+                let message = crate::wire::BoundedText::new(
+                    "box is running; stop it first".to_owned())
+                    .map_err(|error| format!("review error exceeds relation bound: {error:?}"))?;
+                let errors = crate::wire::BoundedVec::new(vec![
+                    crate::generated_wire::PathError { path: None, message }])
+                    .map_err(|error| format!("review errors exceed relation bound: {error:?}"))?;
+                return Ok(if applying {
+                    ActionSuccess::ReviewApply {
+                        value: crate::generated_wire::ApplyResult {
+                            applied: crate::wire::BoundedVec::new(Vec::new())
+                                .map_err(|error| format!("review paths exceed bound: {error:?}"))?,
+                            errors,
+                        },
+                    }
+                } else {
+                    ActionSuccess::ReviewDiscard {
+                        value: crate::generated_wire::DiscardResult {
+                            discarded: crate::wire::BoundedVec::new(Vec::new())
+                                .map_err(|error| format!("review paths exceed bound: {error:?}"))?,
+                            errors,
+                        },
+                    }
+                });
+            }
+            let context = crate::review::NestCtx::new(lock(state).overlay.clone());
+            let result = if applying {
+                ActionSuccess::ReviewApply {
+                    value: crate::review::apply_typed(id, &selected, &context)?,
+                }
+            } else {
+                ActionSuccess::ReviewDiscard {
+                    value: crate::review::discard_typed(id, &selected, &context)?,
+                }
+            };
+            drop_if_empty(state, id);
+            Ok(result)
+        }
+        ActionRequest::ReviewApplyHunk { sid, rel, hunk_ix } => {
+            let id = existing_box_id(sid)?;
+            if box_is_running(state, id) {
+                return Err("box is running; stop it first".into());
+            }
+            crate::review::apply_hunk_typed(id, action_relative_path(&rel)?, hunk_ix)?;
+            drop_if_empty(state, id);
+            Ok(ActionSuccess::ReviewApplyHunk { value: () })
+        }
+        ActionRequest::ReviewDiscardHunk { sid, rel, hunk_ix } => {
+            let id = existing_box_id(sid)?;
+            if box_is_running(state, id) {
+                return Err("box is running; stop it first".into());
+            }
+            crate::review::discard_hunk_typed(id, action_relative_path(&rel)?, hunk_ix)?;
+            drop_if_empty(state, id);
+            Ok(ActionSuccess::ReviewDiscardHunk { value: () })
         }
         request @ (ActionRequest::Delete { sid } | ActionRequest::Dissolve { sid }) => {
             let deleting = matches!(request, ActionRequest::Delete { .. });
@@ -2476,6 +2543,19 @@ fn legacy_file_diff(value: crate::generated_wire::FileDiff) -> Value {
     }
 }
 
+fn legacy_review_errors(
+    errors: crate::wire::BoundedVec<
+        crate::generated_wire::PathError,
+        0,
+        { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+    >,
+) -> Vec<Value> {
+    errors.into_inner().into_iter().map(|error| json!({
+        "path": error.path.map(legacy_bytes).unwrap_or_default(),
+        "error": error.message.into_inner(),
+    })).collect()
+}
+
 fn legacy_view_window(value: crate::generated_wire::ViewWindow) -> Value {
     use crate::generated_wire::{EchoStream, ViewWindow};
     match value {
@@ -2781,6 +2861,18 @@ fn legacy_ui_action_reply(
         Ok(ActionSuccess::ReviewDecorate { value }) => legacy_change_decoration(value),
         Ok(ActionSuccess::ReviewDecorateMany { value }) => Value::Array(value.into_inner()
             .into_iter().map(legacy_change_decoration).collect()),
+        Ok(ActionSuccess::ReviewApply { value }) => json!({
+            "applied": value.applied.into_inner().into_iter()
+                .map(legacy_bytes).collect::<Vec<_>>(),
+            "errors": legacy_review_errors(value.errors),
+        }),
+        Ok(ActionSuccess::ReviewDiscard { value }) => json!({
+            "discarded": value.discarded.into_inner().into_iter()
+                .map(legacy_bytes).collect::<Vec<_>>(),
+            "errors": legacy_review_errors(value.errors),
+        }),
+        Ok(ActionSuccess::ReviewApplyHunk { .. })
+        | Ok(ActionSuccess::ReviewDiscardHunk { .. }) => json!({"ok": true}),
         Ok(ActionSuccess::Delete { value }) | Ok(ActionSuccess::Dissolve { value }) => json!({
             "ok": true,
             "reparented": value.reparented.into_inner(),
@@ -3071,6 +3163,25 @@ fn legacy_u64(args: &[Value], index: usize) -> Option<u64> {
 
 fn legacy_path_arg(args: &[Value], index: usize) -> Option<crate::generated_wire::Path> {
     crate::wire::BoundedBytes::new(args.get(index)?.as_str()?.as_bytes().to_vec()).ok()
+}
+
+fn legacy_path_list(value: Option<&Value>) -> Result<crate::wire::BoundedVec<
+    crate::generated_wire::Path,
+    0,
+    { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+>, String> {
+    let values = match value {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(values)) => values.as_slice(),
+        Some(_) => return Err("paths must be an array".into()),
+    };
+    let paths = values.iter().map(|value| {
+        let path = value.as_str().ok_or("path must be text")?;
+        crate::wire::BoundedBytes::new(path.as_bytes().to_vec())
+            .map_err(|error| format!("path exceeds relation bound: {error:?}"))
+    }).collect::<Result<Vec<_>, String>>()?;
+    crate::wire::BoundedVec::new(paths)
+        .map_err(|error| format!("path list exceeds relation bound: {error:?}"))
 }
 
 /// Unconditionally remove a box: drop it from the overlay, delete its sqlar +
@@ -4879,33 +4990,29 @@ macro_rules! ui_verbs {
                 state, crate::generated_wire::ActionRequest::ReviewWriteFile { sid, rel, b64 },
             ));
         }
-        "review.apply" => { match arg_sid(args) {
-            // Audit H3: refuse a still-running box — its captured blobs may be
-            // mid-write, so applying could stamp a torn blob onto the host.
-            Some(id) if box_is_running(state, id) => json!({"applied": [],
-                "errors": [{"path": "", "error": "box is running; stop it first"}]}),
-            Some(id) => {
-                let ctx = crate::review::NestCtx::new(
-                    lock(state).overlay.clone());
-                let r = crate::review::apply(id,
-                    args.get(1).unwrap_or(&Value::Null), &ctx);
-                drop_if_empty(state, id); r }
-            None => json!({"applied": [], "errors": []}),
+        "review.apply" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": true, "r": {"applied": [], "errors": []}});
+            };
+            let paths = match legacy_path_list(args.get(1)) {
+                Ok(paths) => paths,
+                Err(error) => return json!({"ok": false, "error": error}),
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewApply { sid, paths },
+            ));
         }
-        }
-        "review.discard" => { match arg_sid(args) {
-            // Audit H3: same running-box guard as apply (discard reads the same
-            // blobs to copy them DOWN into children before dropping the row).
-            Some(id) if box_is_running(state, id) => json!({"discarded": [],
-                "errors": [{"path": "", "error": "box is running; stop it first"}]}),
-            Some(id) => {
-                let ctx = crate::review::NestCtx::new(
-                    lock(state).overlay.clone());
-                let r = crate::review::discard(id,
-                    args.get(1).unwrap_or(&Value::Null), &ctx);
-                drop_if_empty(state, id); r }
-            None => json!({"discarded": [], "errors": []}),
-        }
+        "review.discard" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": true, "r": {"discarded": [], "errors": []}});
+            };
+            let paths = match legacy_path_list(args.get(1)) {
+                Ok(paths) => paths,
+                Err(error) => return json!({"ok": false, "error": error}),
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewDiscard { sid, paths },
+            ));
         }
         "review.file_groups" => {
             let Some(sid) = legacy_u64(args, 0) else {
@@ -5050,23 +5157,33 @@ macro_rules! ui_verbs {
                 state, crate::generated_wire::ActionRequest::ReviewDecorateMany { sid, rels },
             ));
         }
-        "review.apply_hunk" => { match (arg_sid(args), args.get(1).and_then(Value::as_str),
-                                      args.get(2).and_then(Value::as_i64)) {
-            (Some(id), Some(rel), Some(ix)) => {
-                let r = crate::review::apply_hunk(id, rel, ix);
-                drop_if_empty(state, id); r
-            }
-            _ => json!({"ok": false, "error": "bad args"}),
+        "review.apply_hunk" => {
+            let (Some(sid), Some(rel), Some(hunk_ix)) = (
+                legacy_u64(args, 0), legacy_path_arg(args, 1),
+                args.get(2).and_then(Value::as_u64)
+                    .and_then(|index| u32::try_from(index).ok()),
+            ) else {
+                return json!({"ok": false, "error": "bad args"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewApplyHunk {
+                    sid, rel, hunk_ix,
+                },
+            ));
         }
-        }
-        "review.discard_hunk" => { match (arg_sid(args), args.get(1).and_then(Value::as_str),
-                                        args.get(2).and_then(Value::as_i64)) {
-            (Some(id), Some(rel), Some(ix)) => {
-                let r = crate::review::discard_hunk(id, rel, ix);
-                drop_if_empty(state, id); r
-            }
-            _ => json!({"ok": false, "error": "bad args"}),
-        }
+        "review.discard_hunk" => {
+            let (Some(sid), Some(rel), Some(hunk_ix)) = (
+                legacy_u64(args, 0), legacy_path_arg(args, 1),
+                args.get(2).and_then(Value::as_u64)
+                    .and_then(|index| u32::try_from(index).ok()),
+            ) else {
+                return json!({"ok": false, "error": "bad args"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewDiscardHunk {
+                    sid, rel, hunk_ix,
+                },
+            ));
         }
         // ── server-side windowed views over per-box data ────────────────────
         // The UI lists are millions of rows in the limit; shipping the whole

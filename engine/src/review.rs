@@ -1022,9 +1022,9 @@ fn materialize_at(root: BorrowedFd, conn: &Connection, id: i64, rel: &str) -> Re
     Ok(())
 }
 
-fn paths_arg(id: i64, paths: &Value) -> Vec<String> {
-    if let Some(arr) = paths.as_array() {
-        return arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+fn paths_arg(id: i64, paths: &[&str]) -> Vec<String> {
+    if !paths.is_empty() {
+        return paths.iter().map(|path| (*path).to_owned()).collect();
     }
     changed_paths(id)
 }
@@ -1094,7 +1094,7 @@ fn relation_path_error(
 
 pub fn apply_typed(
     id: i64,
-    paths: &Value,
+    paths: &[&str],
     ctx: &NestCtx,
 ) -> Result<crate::generated_wire::ApplyResult, String> {
     let Some(conn) = open_rw(id) else {
@@ -1168,22 +1168,6 @@ pub fn apply_typed(
     })
 }
 
-pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
-    match apply_typed(id, paths, ctx) {
-        Ok(result) => json!({
-            "applied": result.applied.into_inner().into_iter()
-                .map(|path| String::from_utf8_lossy(path.as_slice()).into_owned())
-                .collect::<Vec<_>>(),
-            "errors": result.errors.into_inner().into_iter().map(|error| json!({
-                "path": error.path.map(|path|
-                    String::from_utf8_lossy(path.as_slice()).into_owned()).unwrap_or_default(),
-                "error": error.message.into_inner(),
-            })).collect::<Vec<_>>(),
-        }),
-        Err(error) => json!({"applied": [], "errors": [{"path": "", "error": error}]}),
-    }
-}
-
 /// discard == drop each change from the box WITHOUT writing the host — but first
 /// copy it DOWN into any immediate child that inherits it, so the child's merged
 /// view is unchanged. Mirror of Python ChangeReview.discard. A copy-down failure
@@ -1191,7 +1175,7 @@ pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
 /// inherited view.
 pub fn discard_typed(
     id: i64,
-    paths: &Value,
+    paths: &[&str],
     ctx: &NestCtx,
 ) -> Result<crate::generated_wire::DiscardResult, String> {
     let mut discarded = Vec::new();
@@ -1217,22 +1201,6 @@ pub fn discard_typed(
         errors: crate::wire::BoundedVec::new(errors)
             .map_err(|error| format!("discard errors exceed relation bound: {error:?}"))?,
     })
-}
-
-pub fn discard(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
-    match discard_typed(id, paths, ctx) {
-        Ok(result) => json!({
-            "discarded": result.discarded.into_inner().into_iter()
-                .map(|path| String::from_utf8_lossy(path.as_slice()).into_owned())
-                .collect::<Vec<_>>(),
-            "errors": result.errors.into_inner().into_iter().map(|error| json!({
-                "path": error.path.map(|path|
-                    String::from_utf8_lossy(path.as_slice()).into_owned()).unwrap_or_default(),
-                "error": error.message.into_inner(),
-            })).collect::<Vec<_>>(),
-        }),
-        Err(error) => json!({"discarded": [], "errors": [{"path": "", "error": error}]}),
-    }
 }
 
 /// Split bytes into lines on '\n', keeping the terminator on each line (the last
@@ -1278,8 +1246,8 @@ fn hunk_groups(id: i64, rel: &str) -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Gr
     // Group via the SAME line-diff path hunks() uses (cross-checked equal to
     // Python difflib), then carry the indices onto the raw byte-line vectors so
     // the splice stays byte-exact (CR/CRLF, missing final newline preserved).
-    let lo = String::from_utf8_lossy(&low).into_owned();
-    let cu = String::from_utf8_lossy(&cur).into_owned();
+    let lo = String::from_utf8(low.clone()).ok()?;
+    let cu = String::from_utf8(cur.clone()).ok()?;
     let diff = TextDiff::from_lines(&lo, &cu);
     let mut groups = vec![];
     for g in diff.grouped_ops(3) {
@@ -1298,24 +1266,15 @@ fn hunk_groups(id: i64, rel: &str) -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Gr
 
 /// Write `new_lower` (a sequence of raw byte-lines) to the host at `rel`,
 /// refusing to write through a symlink. Mirror of Python _write_host_hunk.
-fn write_host_hunk(rel: &str, new_lower: &[Vec<u8>]) -> Value {
+fn write_host_hunk(rel: &str, new_lower: &[Vec<u8>]) -> Result<(), String> {
     // Same symlink-safety as materialize (audit C2): resolve the parent beneath
     // `/` without following any symlinked component, and refuse to write through
     // a symlink at the leaf. Preserve the existing file's mode (this is an
     // in-place text edit, not a fresh capture).
-    let root = match hostfs::open_root() {
-        Ok(r) => r,
-        Err(e) => return json!({"ok": false, "error": format!("open root: {e}")}),
-    };
-    let (parent, leaf) = match hostfs::parent_beneath(root.as_fd(), rel, true) {
-        Ok(x) => x,
-        Err(e) => return json!({"ok": false, "error": e}),
-    };
+    let root = hostfs::open_root().map_err(|error| format!("open root: {error}"))?;
+    let (parent, leaf) = hostfs::parent_beneath(root.as_fd(), rel, true)?;
     let bytes: Vec<u8> = new_lower.concat();
-    match hostfs::write_file_preserve_mode_at(parent.as_fd(), &leaf, &bytes) {
-        Ok(()) => json!({"ok": true}),
-        Err(e) => json!({"ok": false, "error": e}),
-    }
+    hostfs::write_file_preserve_mode_at(parent.as_fd(), &leaf, &bytes)
 }
 
 /// After a hunk op the diff is gone exactly when the stored current bytes equal
@@ -1335,30 +1294,33 @@ fn settle(id: i64, rel: &str) {
 /// Revert bytes back into the box's current state for `rel` (discard_hunk): write
 /// the new bytes inline into the sqlar row's data and drop the stale pool blob so
 /// it can't shadow the new content. Mirror of SqlarSource.write_current.
-fn write_current(id: i64, rel: &str, data: &[u8]) -> Option<Value> {
+fn write_current(id: i64, rel: &str, data: &[u8]) -> Result<(), String> {
     let rel = rel.trim_start_matches('/');
-    let conn = open_rw(id)?;
-    let rowid = match crate::depot::archive_write_inline(&conn, rel, data) {
-        Ok(r) => r,
-        Err(e) => return Some(json!({"ok": false, "error": e.to_string()})),
-    };
+    let conn = open_rw(id).ok_or("archive unavailable")?;
+    let rowid = crate::depot::archive_write_inline(&conn, rel, data)
+        .map_err(|error| error.to_string())?;
     if let Some(r) = rowid {
-        let _ = std::fs::remove_file(blob_path(id, r));
+        match std::fs::remove_file(blob_path(id, r)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
-    None
+    Ok(())
 }
 
 /// apply_hunk: splice ONE hunk group onto the host. The box already contains it,
 /// so that hunk simply stops being a difference. Byte-exact on raw byte-lines.
-/// Mirror of Python ChangeReview.apply_hunk; returns {ok, ...}.
-pub fn apply_hunk(id: i64, rel: &str, index: i64) -> Value {
+/// Mirror of Python ChangeReview.apply_hunk.
+pub fn apply_hunk_typed(id: i64, rel: &str, index: u32) -> Result<(), String> {
     let Some((ll, ul, groups)) = hunk_groups(id, rel) else {
-        return json!({"ok": false, "error": "not a text change"});
+        return Err("not a text change".into());
     };
-    if index < 0 || index as usize >= groups.len() {
-        return json!({"ok": false, "error": "stale hunk"});
+    let index = index as usize;
+    if index >= groups.len() {
+        return Err("stale hunk".into());
     }
-    let g = &groups[index as usize];
+    let g = &groups[index];
     let a1 = g[0].1;
     let a2 = g[g.len() - 1].2;
     let b1 = g[0].3;
@@ -1367,24 +1329,22 @@ pub fn apply_hunk(id: i64, rel: &str, index: i64) -> Value {
     new_lower.extend_from_slice(&ll[..a1]);
     new_lower.extend_from_slice(&ul[b1..b2]);
     new_lower.extend_from_slice(&ll[a2..]);
-    let res = write_host_hunk(rel, &new_lower);
-    if res.get("ok").and_then(Value::as_bool) != Some(true) {
-        return res;
-    }
+    write_host_hunk(rel, &new_lower)?;
     settle(id, rel);
-    json!({"ok": true})
+    Ok(())
 }
 
 /// discard_hunk: revert one hunk in the box (back to the host's bytes at that
-/// range). Mirror of Python ChangeReview.discard_hunk; returns {ok, ...}.
-pub fn discard_hunk(id: i64, rel: &str, index: i64) -> Value {
+/// range). Mirror of Python ChangeReview.discard_hunk.
+pub fn discard_hunk_typed(id: i64, rel: &str, index: u32) -> Result<(), String> {
     let Some((ll, ul, groups)) = hunk_groups(id, rel) else {
-        return json!({"ok": false, "error": "not a text change"});
+        return Err("not a text change".into());
     };
-    if index < 0 || index as usize >= groups.len() {
-        return json!({"ok": false, "error": "stale hunk"});
+    let index = index as usize;
+    if index >= groups.len() {
+        return Err("stale hunk".into());
     }
-    let g = &groups[index as usize];
+    let g = &groups[index];
     let a1 = g[0].1;
     let a2 = g[g.len() - 1].2;
     let b1 = g[0].3;
@@ -1394,11 +1354,9 @@ pub fn discard_hunk(id: i64, rel: &str, index: i64) -> Value {
     new_upper.extend_from_slice(&ll[a1..a2]);
     new_upper.extend_from_slice(&ul[b2..]);
     let bytes: Vec<u8> = new_upper.concat();
-    if let Some(err) = write_current(id, rel, &bytes) {
-        return err;
-    }
+    write_current(id, rel, &bytes)?;
     settle(id, rel);
-    json!({"ok": true})
+    Ok(())
 }
 
 /// One source entry's full record (the sqlar row + its side-table rows), read

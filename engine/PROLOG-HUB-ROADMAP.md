@@ -823,6 +823,16 @@ belong to the relation.
   walks the same typed diff, and the old JSON hunk/decorating algorithms and
   review-side base64 helper are gone. The full native aarch64-musl suite passes
   308 tests with one existing browser e2e test ignored.
+- Moved `review.apply`, `review.discard`, `review.apply_hunk`, and
+  `review.discard_hunk` onto generated request/success variants. An empty
+  bounded path list explicitly selects the whole change set; otherwise all
+  paths are validated before mutation. Whole-change and hunk mutations share
+  the running-box guard, hunk writes return ordinary typed errors, archive and
+  pool cleanup errors are no longer discarded, and invalid UTF-8 cannot enter
+  the text-hunk algorithm through lossy conversion. Removed all four JSON
+  implementation wrappers; only the temporary listener projects their legacy
+  reply spellings. The full native aarch64-musl suite passes 308 tests with one
+  existing browser e2e test ignored.
 
 ## Stop conditions
 
