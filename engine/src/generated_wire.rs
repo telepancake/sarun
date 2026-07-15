@@ -3,9 +3,9 @@
 // source-sha256 engine/pl/action_catalog.pl 3943f522f7b5a2b94abac859f11f5293765201a054a3221610e8077eb7a0c8f0
 // source-sha256 engine/pl/action_grammar.pl c1e1fdb2d85b0452392863c9cb0b88840aefbfcd89942da4749cd6e94c509b51
 // source-sha256 engine/pl/context_relation.pl cbf9d8788d006f18250dd45d07ce8664ec28e1fc997630b7a0ca717c2f8f3a0c
-// source-sha256 engine/pl/transport_catalog.pl 4f963a403a3d96405a677fee90b00d58e15903a97db83a20827a194a8f83f090
+// source-sha256 engine/pl/transport_catalog.pl a34ee54e12804150abca2415971e5eba39ee44577f3bb958daf6afa1c9b05f16
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
-// source-sha256 scripts/wire_codegen.py 075191daf48bc56a9b2b06b71d0f6cfb034c189e7663a1826fc94dce42d59b04
+// source-sha256 scripts/wire_codegen.py 3a281991190c9c76898e4dad47065ffb16590080fef3f9588e20d4c6fcc4e561
 
 use crate::prolog::RelationValue;
 use crate::wire::{
@@ -186,7 +186,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "44516a5eb30caf3c23ee2f97314c6438615c95a6ebc43b112ce6394c9ae67afc";
+    "690c2116eec0e55210dcc46a1ccea1fe39f1e6a61053a6a24a7b5e7a209d2950";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -11661,6 +11661,7 @@ pub const TRANSPORT_RESPONSE_IDENTITIES: &[(&str, u64)] = &[
     ("recorded", 3),
     ("sud_ingested", 4),
     ("budget", 5),
+    ("action", 6),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -11680,6 +11681,9 @@ pub enum TransportResponse {
     Budget {
         remaining: i64,
     },
+    Action {
+        value: ActionSuccess,
+    },
 }
 
 impl TransportResponse {
@@ -11690,6 +11694,7 @@ impl TransportResponse {
             Self::Recorded { .. } => 3,
             Self::SudIngested { .. } => 4,
             Self::Budget { .. } => 5,
+            Self::Action { .. } => 6,
         }
     }
 }
@@ -11714,6 +11719,9 @@ impl WireValue for TransportResponse {
             Self::Budget { remaining } => {
                 remaining.encode_atom(&mut fields)?;
             }
+            Self::Action { value } => {
+                value.encode_atom(&mut fields)?;
+            }
         }
         put_compound_payload(output, &fields)
     }
@@ -11735,6 +11743,9 @@ impl WireValue for TransportResponse {
             },
             5 => Self::Budget {
                 remaining: <i64 as WireValue>::decode_atom(&mut fields)?,
+            },
+            6 => Self::Action {
+                value: <ActionSuccess as WireValue>::decode_atom(&mut fields)?,
             },
             _ => return Err(DecodeError::InvalidValue),
         };
@@ -11787,6 +11798,15 @@ impl RelationWireValue for TransportResponse {
                 let mut fields = fields.iter();
                 Ok(Self::Budget {
                     remaining: <i64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                })
+            }
+            "action" => {
+                require_relation_arity(fields, 1)?;
+                let mut fields = fields.iter();
+                Ok(Self::Action {
+                    value: <ActionSuccess as RelationWireValue>::from_relation(
+                        fields.next().unwrap(),
+                    )?,
                 })
             }
             _ => Err(format!("unknown TransportResponse relation choice {case}")),
@@ -12181,6 +12201,49 @@ impl RelationWireValue for SubscriptionEvent {
             }
             _ => Err(format!("unknown SubscriptionEvent relation choice {case}")),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RequestEnvelope {
+    Action(ActionRequest),
+    Transport(TransportRequest),
+}
+
+impl RequestEnvelope {
+    pub const fn code(&self) -> u64 {
+        match self {
+            Self::Action(value) => value.code(),
+            Self::Transport(value) => value.code(),
+        }
+    }
+}
+
+impl WireValue for RequestEnvelope {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        match self {
+            Self::Action(value) => value.encode_atom(output),
+            Self::Transport(value) => value.encode_atom(output),
+        }
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut probe = *input;
+        let mut fields = get_atom(&mut probe, LIMIT_FRAME_BYTES)?;
+        let code = get_u64(&mut fields)?;
+        if ACTION_REQUEST_IDENTITIES
+            .iter()
+            .any(|(_, known)| *known == code)
+        {
+            return ActionRequest::decode_atom(input).map(Self::Action);
+        }
+        if TRANSPORT_REQUEST_IDENTITIES
+            .iter()
+            .any(|(_, known)| *known == code)
+        {
+            return TransportRequest::decode_atom(input).map(Self::Transport);
+        }
+        Err(DecodeError::InvalidValue)
     }
 }
 
@@ -13995,6 +14058,9 @@ mod generated_tests {
                 errors: BoundedVec::new(vec![]).unwrap(),
             },
             TransportResponse::Budget { remaining: 0i64 },
+            TransportResponse::Action {
+                value: ActionSuccess::Ping { value: () },
+            },
         ];
         assert_eq!(values.len(), TRANSPORT_RESPONSE_IDENTITIES.len());
         for (value, (name, code)) in values.into_iter().zip(TRANSPORT_RESPONSE_IDENTITIES) {
@@ -14144,6 +14210,17 @@ mod generated_tests {
             assert_eq!(value.code(), *code, "{name}");
             roundtrip(value);
         }
+    }
+
+    #[test]
+    fn combined_request_envelope_uses_the_relation_opcode_namespaces() {
+        roundtrip(RequestEnvelope::Action(ActionRequest::Ping));
+        roundtrip(RequestEnvelope::Transport(TransportRequest::Subscribe));
+        assert_eq!(RequestEnvelope::Action(ActionRequest::Ping).code(), 70);
+        assert_eq!(
+            RequestEnvelope::Transport(TransportRequest::Subscribe).code(),
+            256
+        );
     }
 
     #[test]

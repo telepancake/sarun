@@ -70,7 +70,7 @@ does not need a string family tag. The catalog currently defines:
 
 - 16 lifecycle/stream requests, including registration, provenance ingestion,
   PTY/API/service handoffs, budget grants, subscriptions, and sud ingestion;
-- 5 typed transport response payloads and 7 first-reply connection modes;
+- 6 typed transport response payloads and 7 first-reply connection modes;
 - 10 compact event invalidations and 11 box/PTY/service stream frames;
 - every record, enum, tagged choice, collection bound, transition, direction,
   and conditional SCM_RIGHTS role used by those messages.
@@ -79,6 +79,9 @@ Each action opcode is likewise inseparable from its bounded success type in
 `wire_handler(Handler, Code, ResultType)`. Parser/source schemas remain a
 different representation: concrete binary request-field schemas are required
 before codec generation, and generic `spec` arguments cannot cross that gate.
+The ordinary `reply` mode carries either a transport response or the generated
+closed `ActionSuccess` sum; action replies do not pass through a JSON-shaped
+value tree.
 
 `select`, `apply`, `discard`, `rename`, `review.patch_text`, `sudtrace`, and
 quit are actions. They use `action_catalog:wire_handler/3`; there is no second

@@ -555,7 +555,7 @@ belong to the relation.
   now project from the normalized facts and executable specs. Exhaustive tests
   render and reparse minimal and fully populated canonical forms for all 108
   actions and every explicit CLI form, covering optional/repeated shapes.
-- Added the normalized non-action transport relation: 16 requests, 5 response
+- Added the normalized non-action transport relation: 16 requests, 6 response
   payloads, 7 connection modes, 10 compact event invalidations, and 11
   stream-frame identities, plus bounded records/enums/tagged choices and exact
   conditional descriptor roles. Action and transport-only request namespaces
@@ -633,6 +633,14 @@ belong to the relation.
   JSON argument array remains only as the active transport projection to be
   deleted by the binary socket cutover; control-message dispatch already reads
   the generated request instead of reinterpreting parser values.
+- Added the direct socket request envelope over the disjoint generated action
+  and transport opcode namespaces, and made the ordinary reply mode carry the
+  closed generated `ActionSuccess` sum. Added exact streaming atom I/O which
+  validates the protocol version and bounds before allocation without reading
+  into a subsequent raw-stream handoff. Fragmented request, reply, event,
+  malformed-length, and wrong-version tests pass on aarch64; the listener and
+  clients still require the single coordinated cutover, so that gate remains
+  unchecked.
 
 ## Stop conditions
 

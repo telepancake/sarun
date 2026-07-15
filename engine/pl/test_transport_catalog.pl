@@ -43,11 +43,12 @@ run_test(catalog_is_closed_bounded_and_valid) :-
     findall(Name, wire_event(Name, _, _), Events),
     findall(Stream-Name, wire_frame(Stream, Name, _, _, _, _, _), Frames),
     length(Requests, 16),
-    length(Responses, 5),
+    length(Responses, 6),
     length(Modes, 7),
     length(Events, 10),
     length(Frames, 11),
-    expect(wire_limit(frame_bytes, 16777216)).
+    expect(wire_limit(frame_bytes, 16777216)),
+    expect(wire_response(action, 6, [field(value, action_success)])).
 
 run_test(namespaces_are_explicit_unique_and_disjoint) :-
     expect(wire_protocol_version(1)),

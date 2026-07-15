@@ -64,6 +64,7 @@ mod runner;
 mod selfbt;
 mod sixel;
 mod slippool;
+mod socket_wire;
 mod sud;
 mod sudir;
 mod sudwire;

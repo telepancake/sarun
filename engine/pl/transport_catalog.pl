@@ -34,6 +34,7 @@ Numeric identities are facts, never declaration-order indexes.
 The type algebra is deliberately small:
 
   * scalar atoms: `bool`, `u16`, `u32`, `u64`, `s32`, `s64`, `f64`;
+  * the generated `action_success` sum used only by the reply envelope;
   * `text(Limit)`, `bytes(Limit)`, and `fixed_bytes(Length)`;
   * `option(Type)`, `list(Type, Limit)`, `list(Type, Min, Limit)`, and
     `map(Key, Value, Limit)`;
@@ -947,6 +948,7 @@ wire_response(sud_ingested, 4, [
     field(errors, list(text(text_bytes), error_items))
 ]).
 wire_response(budget,       5, [field(remaining, s64)]).
+wire_response(action,       6, [field(value, action_success)]).
 
 % The first engine compound always selects one of these modes. Box mode carries
 % the register result. Service-accept remains atom-framed until `paired`, then
@@ -1108,6 +1110,7 @@ valid_type(s32, _).
 valid_type(s64, _).
 valid_type(f64, _).
 valid_type(response, _).
+valid_type(action_success, _).
 valid_type(text(Limit), _) :- wire_limit(Limit, _).
 valid_type(bytes(Limit), _) :- wire_limit(Limit, _).
 valid_type(fixed_bytes(Length), _) :- integer(Length), Length > 0.

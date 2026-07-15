@@ -228,6 +228,7 @@ class Generator:
                 "bool": "bool", "u16": "u16", "u32": "u32", "u64": "u64",
                 "s32": "i32", "s64": "i64", "f64": "f64",
                 "response": "TransportResponse",
+                "action_success": "ActionSuccess",
             }
             return primitive.get(term, pascal(term))
         if isinstance(term, Compound):
@@ -682,6 +683,7 @@ class Generator:
                 "bool": "false", "u16": "0u16", "u32": "0u32",
                 "u64": "0u64", "s32": "0i32", "s64": "0i64",
                 "f64": "0.0f64", "response": "TransportResponse::Empty",
+                "action_success": "ActionSuccess::Ping { value: () }",
             }
             if term in primitive:
                 return primitive[term]
@@ -759,6 +761,47 @@ class Generator:
         ]
         return "\n".join(lines)
 
+    def request_envelope(self) -> str:
+        return "\n".join([
+            "#[derive(Clone, Debug, PartialEq)]",
+            "pub enum RequestEnvelope {",
+            "    Action(ActionRequest),",
+            "    Transport(TransportRequest),",
+            "}",
+            "",
+            "impl RequestEnvelope {",
+            "    pub const fn code(&self) -> u64 {",
+            "        match self {",
+            "            Self::Action(value) => value.code(),",
+            "            Self::Transport(value) => value.code(),",
+            "        }",
+            "    }",
+            "}",
+            "",
+            "impl WireValue for RequestEnvelope {",
+            "    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {",
+            "        match self {",
+            "            Self::Action(value) => value.encode_atom(output),",
+            "            Self::Transport(value) => value.encode_atom(output),",
+            "        }",
+            "    }",
+            "",
+            "    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {",
+            "        let mut probe = *input;",
+            "        let mut fields = get_atom(&mut probe, LIMIT_FRAME_BYTES)?;",
+            "        let code = get_u64(&mut fields)?;",
+            "        if ACTION_REQUEST_IDENTITIES.iter().any(|(_, known)| *known == code) {",
+            "            return ActionRequest::decode_atom(input).map(Self::Action);",
+            "        }",
+            "        if TRANSPORT_REQUEST_IDENTITIES.iter().any(|(_, known)| *known == code) {",
+            "            return TransportRequest::decode_atom(input).map(Self::Transport);",
+            "        }",
+            "        Err(DecodeError::InvalidValue)",
+            "    }",
+            "}",
+            "",
+        ])
+
     def tests(self, sums: list[tuple[str, str,
                                      list[tuple[str, int, list[Term]]]]]) -> str:
         action_rows = next(rows for name, _, rows in sums
@@ -814,6 +857,14 @@ class Generator:
                 lines.append("            assert_eq!(value.handler(), *name);")
             lines += ["            roundtrip(value);", "        }", "    }", ""]
         lines += [
+            "    #[test]",
+            "    fn combined_request_envelope_uses_the_relation_opcode_namespaces() {",
+            "        roundtrip(RequestEnvelope::Action(ActionRequest::Ping));",
+            "        roundtrip(RequestEnvelope::Transport(TransportRequest::Subscribe));",
+            "        assert_eq!(RequestEnvelope::Action(ActionRequest::Ping).code(), 70);",
+            "        assert_eq!(RequestEnvelope::Transport(TransportRequest::Subscribe).code(), 256);",
+            "    }",
+            "",
             "    #[test]",
             "    fn relational_identity_tables_are_unique() {",
         ]
@@ -948,6 +999,8 @@ class Generator:
             chunks.append(self.identity_constant(constant, rows))
             chunks.append(self.relation_sum(rust_name, rows))
             sums.append((rust_name, constant, rows))
+
+        chunks.append(self.request_envelope())
 
         frames: dict[str, list[tuple[str, int, list[Term]]]] = {}
         for category, values in self.rows:
