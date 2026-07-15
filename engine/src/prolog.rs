@@ -211,7 +211,8 @@ pub struct ContextCompletionPlan {
     pub action: String,
     pub replace: Span,
     pub surface: String,
-    pub query: ContextQueryNode,
+    pub queries: Vec<ContextQueryNode>,
+    pub target_query_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1269,11 +1270,12 @@ fn encode_context_plan(plan: &ContextPlan) -> Result<String, String> {
 
 fn encode_context_completion_plan(plan: &ContextCompletionPlan) -> Result<String, String> {
     Ok(format!(
-        "completion_context({},{},{},{})",
+        "completion_context({},{},{},{},{})",
         quote_atom(&plan.action),
         encode_span(plan.replace),
         quote_string(&plan.surface),
-        encode_context_node(&plan.query)?,
+        encode_context_graph(&plan.queries)?,
+        quote_atom(&plan.target_query_id),
     ))
 }
 
@@ -1675,12 +1677,16 @@ fn decode_context_plan(term: &ParsedTerm) -> Result<ContextPlan, String> {
 }
 
 fn decode_context_completion_plan(term: &ParsedTerm) -> Result<ContextCompletionPlan, String> {
-    let args = compound(term, "completion_context", 4)?;
+    let args = compound(term, "completion_context", 5)?;
     Ok(ContextCompletionPlan {
         action: atom(&args[0])?.to_owned(),
         replace: decode_span(&args[1])?,
         surface: text(&args[2])?.to_owned(),
-        query: decode_context_node(&args[3])?,
+        queries: list(&args[3])?
+            .iter()
+            .map(decode_context_node)
+            .collect::<Result<_, _>>()?,
+        target_query_id: atom(&args[4])?.to_owned(),
     })
 }
 
@@ -2171,9 +2177,11 @@ mod tests {
         assert_eq!(plans[0].action, "rename");
         assert_eq!(plans[0].replace, Span { start: 7, end: 9 });
         assert_eq!(plans[0].surface, "wo");
-        assert_eq!(plans[0].query.query.cardinality, ContextCardinality::All);
+        assert_eq!(plans[0].queries.len(), 1);
+        assert_eq!(plans[0].target_query_id, "q1");
+        assert_eq!(plans[0].queries[0].query.cardinality, ContextCardinality::All);
         assert_eq!(
-            plans[0].query.query.selector,
+            plans[0].queries[0].query.selector,
             RelationValue::Compound(
                 "prefix".into(),
                 vec![RelationValue::String("wo".into())],
@@ -2191,8 +2199,8 @@ mod tests {
             attributes: Vec::new(),
         };
         let observation = ContextObservation {
-            id: plans[0].query.id.clone(),
-            query: plans[0].query.query.clone(),
+            id: plans[0].queries[0].id.clone(),
+            query: plans[0].queries[0].query.clone(),
             provider: RelationValue::Atom("boxes".into()),
             revision: RelationValue::Integer(7),
             outcome: Some(ContextResult::All(vec![entry])),

@@ -423,23 +423,53 @@ replace_nth(Index, [Head|Values], Value, [Head|Result]) :-
 
 context_completion_plan(Items, EditId,
                         completion_context(Action, Span, Surface,
-                                           query(q1, ask(all, Domain,
-                                                        prefix(Surface))))) :-
+                                           Queries, TargetId)) :-
     input_body(Items, Body, End),
     valid_body(Body, End),
     action(Action, _, _, _, _, visible, _),
     action_form(Action, _Style, Specs, _Normalizer),
     split_edit(Body, EditId, Before, Span, Surface, After),
     split_context_argument(Specs, BeforeSpecs, Name, AfterSpecs),
-    argument_context(Action, Name, Domain, root),
-    match_known_prefix(BeforeSpecs, Before),
+    argument_context(Action, Name, Domain, Scope),
+    context_prefix_queries(Action, BeforeSpecs, Before, 1, [],
+                           PrefixQueries, TargetIndex, KnownArguments),
+    query_id(TargetIndex, TargetId),
+    context_completion_selector(Scope, KnownArguments, Surface, Selector),
+    append(PrefixQueries,
+           [query(TargetId, ask(all, Domain, Selector))], Queries),
     viable_suffix(AfterSpecs, After).
 
+context_prefix_queries(_, [], [], QueryIndex, Known,
+                       [], QueryIndex, Known).
+context_prefix_queries(Action, [Spec|Specs], [Item|Items], QueryIndex0, Known0,
+                       Queries, QueryIndex, Known) :-
+    match_known_item(Spec, Item),
+    ( Spec = argument(arg(Name, _, _, _)),
+      argument_context(Action, Name, Domain, Scope)
+    -> source_unit(Item, _, _, Surface, _, _),
+       query_id(QueryIndex0, Id),
+       context_selector(Scope, Known0, Surface, Selector),
+       Queries = [query(Id, ask(one, Domain, Selector))|Rest],
+       NextIndex is QueryIndex0 + 1,
+       NextKnown = [Name-Id|Known0]
+    ;  Queries = Rest,
+       NextIndex = QueryIndex0,
+       NextKnown = Known0
+    ),
+    context_prefix_queries(Action, Specs, Items, NextIndex, NextKnown,
+                           Rest, QueryIndex, Known).
+
+context_completion_selector(root, _, Surface, prefix(Surface)).
+context_completion_selector(within(Template), Known, Surface,
+                            within(Resolved, prefix(Surface))) :-
+    resolve_argument_refs(Template, Known, Resolved).
+
 resolve_context_completion(
-    completion_context(Action, Span, Surface, query(Id, Query)),
+    completion_context(Action, Span, Surface, Queries, TargetId),
     Observations, Completions) :-
     action(Action, _, _, _, _, _, ActionPreference),
-    context_all_observation(Id, Query, Observations, Provider, Entries),
+    list_query(TargetId, Query, Queries),
+    context_all_observation(TargetId, Query, Observations, Provider, Entries),
     findall(completion_key(Span, Name)-
                 (alternative(context(Action, Domain, Identity),
                              context_argument, Provider)-ActionPreference),

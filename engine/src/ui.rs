@@ -1236,6 +1236,9 @@ impl crate::parser::ContextProvider for App {
         // this adapter—chooses the domain, selector, cardinality, and source
         // position. Prolog also re-evaluates the complete query against this
         // snapshot before accepting an observation.
+        if request.query.domain == RelationValue::Atom("path".into()) {
+            return path_context_snapshot(self, request);
+        }
         if request.query.domain != RelationValue::Atom("box".into()) {
             return Err(format!(
                 "no UI context provider for domain {:?}",
@@ -1286,6 +1289,86 @@ impl crate::parser::ContextProvider for App {
             entries,
         })
     }
+}
+
+fn path_context_snapshot(
+    app: &App,
+    request: &crate::prolog::ContextQueryNode,
+) -> Result<crate::prolog::ContextSnapshot, String> {
+    use crate::prolog::{ContextEntry, ContextSnapshot, RelationValue};
+    use std::hash::Hasher;
+
+    let RelationValue::Compound(within, selector_parts) = &request.query.selector else {
+        return Err("path context query has no containing box".into());
+    };
+    let [scope, _path_selector] = selector_parts.as_slice() else {
+        return Err("path context query has invalid within selector".into());
+    };
+    if within != "within" {
+        return Err("path context query has no within selector".into());
+    }
+    let RelationValue::Compound(box_scope, box_parts) = scope else {
+        return Err("path context query has invalid box scope".into());
+    };
+    let [box_value] = box_parts.as_slice() else {
+        return Err("path context query has invalid box value".into());
+    };
+    if box_scope != "box" {
+        return Err("path context query has no box scope".into());
+    }
+    let RelationValue::Compound(string_kind, value_parts) = box_value else {
+        return Err("path context query has untyped box value".into());
+    };
+    let [RelationValue::String(box_id)] = value_parts.as_slice() else {
+        return Err("path context query has invalid box value".into());
+    };
+    if string_kind != "string" {
+        return Err("path context query box value is not a string".into());
+    }
+
+    let rows = match rpc(&app.sock, "review.session_changes", json!([box_id]))? {
+        Value::Array(rows) => rows,
+        _ => return Err("path context provider returned invalid changes".into()),
+    };
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let Some(path) = row.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut attributes = vec![RelationValue::Compound(
+            "box".into(),
+            vec![box_value.clone()],
+        )];
+        if let Some(kind) = row.get("kind").and_then(Value::as_str) {
+            attributes.push(RelationValue::Compound(
+                "kind".into(),
+                vec![RelationValue::String(kind.into())],
+            ));
+        }
+        entries.push(ContextEntry {
+            domain: RelationValue::Atom("path".into()),
+            identity: RelationValue::Compound(
+                "path".into(),
+                vec![
+                    RelationValue::String(box_id.clone()),
+                    RelationValue::String(path.into()),
+                ],
+            ),
+            names: vec![path.into()],
+            value: RelationValue::Compound(
+                "string".into(),
+                vec![RelationValue::String(path.into())],
+            ),
+            attributes,
+        });
+    }
+    let mut revision = std::collections::hash_map::DefaultHasher::new();
+    revision.write(serde_json::to_string(&rows).unwrap_or_default().as_bytes());
+    Ok(ContextSnapshot {
+        provider: RelationValue::Atom("ui_box_changes".into()),
+        revision: RelationValue::Integer(revision.finish() as i64),
+        entries,
+    })
 }
 
 /// Cap on the transcript window: chars rendered in one frame, centred on

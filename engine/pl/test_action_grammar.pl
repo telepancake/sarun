@@ -18,6 +18,7 @@ test_name(context_resolution_rewrites_wire_argument).
 test_name(dependent_path_plan_references_box_query).
 test_name(context_completion_uses_all_prefix_query).
 test_name(context_completion_resolution_uses_entry_names).
+test_name(dependent_context_completion_graph).
 
 run_action_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -167,11 +168,12 @@ run_test(context_completion_uses_all_prefix_query) :-
     once(context_completion_plan(Items, edit, Plan)),
     expect_equal(Plan,
                  completion_context(rename, span(7, 9), "wo",
-                                    query(q1, ask(all, box, prefix("wo"))))).
+                                    [query(q1, ask(all, box, prefix("wo")))],
+                                    q1)).
 
 run_test(context_completion_resolution_uses_entry_names) :-
     Plan = completion_context(rename, span(7, 9), "wo",
-                              query(q1, Query)),
+                              [query(q1, Query)], q1),
     Query = ask(all, box, prefix("wo")),
     Observations =
         [observed(q1, Query, source(boxes, 7),
@@ -185,3 +187,17 @@ run_test(context_completion_resolution_uses_entry_names) :-
                   completion(span(7, 9), "world",
                              [alternative(context(rename, box, 9),
                                           context_argument, boxes, 50)], 50, 2)]).
+
+run_test(dependent_context_completion_graph) :-
+    neutral("writer_id", 0, Writer),
+    neutral("work", 10, Box),
+    Items = [Writer, Box, edit_tear(edit, span(15, 18), "src"), end(18)],
+    once(context_completion_plan(Items, edit, Plan)),
+    expect_equal(
+        Plan,
+        completion_context(
+            writer_id, span(15, 18), "src",
+            [query(q1, ask(one, box, name("work"))),
+             query(q2, ask(all, path,
+                           within(box(ref(q1)), prefix("src"))))],
+            q2)).

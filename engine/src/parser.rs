@@ -253,14 +253,29 @@ fn execute_context_plan(
     plan: &crate::prolog::ContextPlan,
     context: &dyn ContextProvider,
 ) -> Result<Option<(crate::prolog::CommandAst, Vec<crate::prolog::ContextObservation>)>, String> {
-    let mut observations = Vec::with_capacity(plan.queries.len());
-    while observations.len() < plan.queries.len() {
-        let ready = prolog.ready_context_queries(&plan.queries, &observations)?;
+    let Some(observations) = execute_context_graph(prolog, &plan.queries, context)? else {
+        return Ok(None);
+    };
+    match prolog.resolve_context_plan(plan, &observations) {
+        Ok(command) => Ok(Some((command, observations))),
+        Err(crate::prolog::QueryError::NoSolution) => Ok(None),
+        Err(crate::prolog::QueryError::Backend(error)) => Err(error),
+    }
+}
+
+fn execute_context_graph(
+    prolog: &crate::prolog::Prolog,
+    graph: &[crate::prolog::ContextQueryNode],
+    context: &dyn ContextProvider,
+) -> Result<Option<Vec<crate::prolog::ContextObservation>>, String> {
+    let mut observations = Vec::with_capacity(graph.len());
+    while observations.len() < graph.len() {
+        let ready = prolog.ready_context_queries(graph, &observations)?;
         if ready.is_empty() {
             return Ok(None);
         }
         for resolved in ready {
-            let Some(original) = plan.queries.iter().find(|node| node.id == resolved.id) else {
+            let Some(original) = graph.iter().find(|node| node.id == resolved.id) else {
                 return Err(format!(
                     "context relation returned unknown ready query {}",
                     resolved.id
@@ -277,11 +292,7 @@ fn execute_context_plan(
             });
         }
     }
-    match prolog.resolve_context_plan(plan, &observations) {
-        Ok(command) => Ok(Some((command, observations))),
-        Err(crate::prolog::QueryError::NoSolution) => Ok(None),
-        Err(crate::prolog::QueryError::Backend(error)) => Err(error),
-    }
+    Ok(Some(observations))
 }
 
 fn invocation_from_prolog(
@@ -420,16 +431,10 @@ pub fn complete_at(
     let prolog = crate::prolog::global()?;
     let mut completions = prolog.complete(&grammar_input, "edit")?;
     for plan in prolog.context_completion_plans(&grammar_input, "edit")? {
-        let snapshot = context.snapshot(&plan.query)?;
-        let outcome = prolog.context_query(&plan.query.query, &snapshot)?;
-        let observation = crate::prolog::ContextObservation {
-            id: plan.query.id.clone(),
-            query: plan.query.query.clone(),
-            provider: snapshot.provider,
-            revision: snapshot.revision,
-            outcome,
+        let Some(observations) = execute_context_graph(prolog, &plan.queries, context)? else {
+            continue;
         };
-        completions.extend(prolog.resolve_context_completion(&plan, &[observation])?);
+        completions.extend(prolog.resolve_context_completion(&plan, &observations)?);
     }
     Ok(merge_completion_entries(completion_entries(completions)))
 }
@@ -586,6 +591,54 @@ fn floor_char_boundary(input: &str, mut cursor: usize) -> usize {
 mod tests {
     use super::*;
 
+    struct FixtureContext;
+
+    impl ContextProvider for FixtureContext {
+        fn snapshot(
+            &self,
+            request: &crate::prolog::ContextQueryNode,
+        ) -> Result<crate::prolog::ContextSnapshot, String> {
+            use crate::prolog::{ContextEntry, ContextSnapshot, RelationValue};
+            let string = |value: &str| {
+                RelationValue::Compound(
+                    "string".into(),
+                    vec![RelationValue::String(value.into())],
+                )
+            };
+            let entry = match &request.query.domain {
+                RelationValue::Atom(domain) if domain == "box" => ContextEntry {
+                    domain: RelationValue::Atom("box".into()),
+                    identity: RelationValue::Integer(5),
+                    names: vec!["5".into(), "work".into()],
+                    value: string("5"),
+                    attributes: Vec::new(),
+                },
+                RelationValue::Atom(domain) if domain == "path" => ContextEntry {
+                    domain: RelationValue::Atom("path".into()),
+                    identity: RelationValue::Compound(
+                        "path".into(),
+                        vec![
+                            RelationValue::String("5".into()),
+                            RelationValue::String("src/main.rs".into()),
+                        ],
+                    ),
+                    names: vec!["src/main.rs".into()],
+                    value: string("src/main.rs"),
+                    attributes: vec![RelationValue::Compound(
+                        "box".into(),
+                        vec![string("5")],
+                    )],
+                },
+                _ => return Err("unexpected fixture context domain".into()),
+            };
+            Ok(ContextSnapshot {
+                provider: RelationValue::Atom("fixture".into()),
+                revision: RelationValue::Integer(1),
+                entries: vec![entry],
+            })
+        }
+    }
+
     fn invocation(input: &str) -> Invocation {
         match parse(input, &EmptyContext) {
             ParseResult::Invocation(invocation) => invocation,
@@ -634,5 +687,16 @@ mod tests {
         assert!(complete_at(input, input.len(), &EmptyContext).is_ok());
         let inside_umlaut = input.find('ü').unwrap() + 1;
         assert!(grammar_input(input, Some(inside_umlaut)).is_none());
+    }
+
+    #[test]
+    fn dependent_completion_resolves_box_before_querying_paths() {
+        let input = "writer_id work src";
+        let completions = complete_at(input, input.len(), &FixtureContext).unwrap();
+        assert!(completions.iter().any(|entry| {
+            entry.insert == "src/main.rs"
+                && entry.provider == "fixture"
+                && entry.annotation.contains("context(writer_id,path")
+        }));
     }
 }

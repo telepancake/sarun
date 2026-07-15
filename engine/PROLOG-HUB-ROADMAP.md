@@ -300,6 +300,12 @@ belong to the relation.
 - [x] Resolve successful `one` observations into wire-ready command arguments,
       derive `all`/`prefix` queries for contextual completion, and derive path
       queries containing `ref/1` dependencies on earlier box arguments.
+- [x] Execute dependent completion graphs in readiness order and return all
+      observations to Prolog for ranked completion rendering; the initial UI
+      path provider supplies changed paths tagged by their resolved box value.
+- [ ] Back the path domain with the complete box-visible path index rather than
+      only recorded changed paths, without moving prefix/cardinality semantics
+      into the provider.
 - [ ] Add local lexical environments that resolve internal bindings without
       external queries and compose independently from external query graphs.
 
@@ -428,6 +434,9 @@ belong to the relation.
   feed the observation back into Prolog, which selects matching entry names
   and produces the ordinary ranked completion representation. Live UI box
   names now complete without Rust interpreting selectors or argument kinds.
+- Generalized completion plans to query graphs with an explicit target node;
+  dependent path completion resolves its preceding box `one` query before the
+  `all` path query, and the UI path source returns typed containment facts.
 - Recorded the direct binary `ui.sock` transport boundary: Prolog owns
   representation relationships and conversion, while already-typed
   request/reply delivery is a Rust-only hot path.
