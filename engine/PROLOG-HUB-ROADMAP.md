@@ -949,6 +949,16 @@ belong to the relation.
   Parsing, completion, highlighting, help, and rendering all consume that same
   form. `mirror_pause`/`mirror_resume` boolean injection remains solely an
   argument-to-wire projection and cannot rename either action.
+- Added real command-modal key-path coverage after `: quit` exposed the gap
+  between component tests and user behavior. Control submission no longer
+  refreshes sessions/Changes after a failed request, and successful `quit`
+  performs its one typed control send then exits the TUI without querying the
+  engine it just stopped. The regression drives colon, character, Tab/selection,
+  and Enter events through the actual modal dispatcher; a temporary Unix socket
+  replies to quit and disappears before any accidental refresh, while the kill
+  path asserts the rendered `kill C1` / `kill 1` preview and absence of parser
+  diagnostics. Native aarch64 verification passes 315 tests with the browser
+  E2E test ignored.
 
 ## Stop conditions
 

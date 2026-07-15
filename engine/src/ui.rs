@@ -4149,12 +4149,24 @@ impl App {
                 };
             }
             crate::parser::ActionTarget::ControlMessage => {
-                self.status = match control_message_rpc(&self.sock, &invocation) {
-                    Ok(_) => format!("{name}: ok"),
-                    Err(error) => format!("command: {error}"),
-                };
-                self.refresh_sessions();
-                self.load_changes();
+                let result = control_message_rpc(&self.sock, &invocation);
+                if invocation.action == "quit" {
+                    self.status = match result {
+                        Ok(_) => format!("{name}: ok"),
+                        Err(error) => format!("command: {error}"),
+                    };
+                    wiki_serve::shutdown_all();
+                    self.should_quit = true;
+                } else {
+                    match result {
+                        Ok(_) => {
+                            self.status = format!("{name}: ok");
+                            self.refresh_sessions();
+                            self.load_changes();
+                        }
+                        Err(error) => self.status = format!("command: {error}"),
+                    }
+                }
             }
             crate::parser::ActionTarget::LocalUi => {
                 if !invocation.args.is_empty() {
@@ -18434,6 +18446,7 @@ pub fn ui_main(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{App, char_safe_slice, control_message};
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     #[test]
     fn control_messages_keep_sid_as_a_string() {
@@ -18513,6 +18526,94 @@ mod tests {
                 crate::generated_wire::ActionRequest::Kill { sid: 1 }),
         );
         assert_eq!(crate::parser::render(&invocation).unwrap(), "kill 1");
+    }
+
+    #[test]
+    fn command_modal_key_path_completes_and_previews_kill() {
+        let mut app = App::bare(String::new());
+        app.sessions = vec![serde_json::json!({
+            "session_id": "1",
+            "name": "C1",
+            "path": "C1",
+            "status": "running",
+        })];
+
+        dispatch_char_key(&mut app, ':');
+        for character in "kill ".chars() {
+            handle_modal_key(
+                &mut app,
+                KeyCode::Char(character),
+                KeyModifiers::empty(),
+            );
+        }
+        let (selected, target, count) = match app.modal.as_ref() {
+            Some(Modal::Command {
+                completions, sel, ..
+            }) => {
+                let target = completions
+                    .iter()
+                    .position(|entry| entry.insert == "C1")
+                    .expect("C1 offered by the live modal");
+                (*sel, target, completions.len())
+            }
+            _ => panic!("colon key did not open the command modal"),
+        };
+        for _ in 0..(target + count - selected) % count {
+            handle_modal_key(&mut app, KeyCode::Down, KeyModifiers::empty());
+        }
+        handle_modal_key(&mut app, KeyCode::Tab, KeyModifiers::empty());
+
+        let rendered = render_to_string(&app, 100, 24).unwrap();
+        assert!(rendered.contains(": kill C1_"), "{rendered}");
+        assert!(rendered.contains("→ kill 1"), "{rendered}");
+        assert!(!rendered.contains("parser backend:"), "{rendered}");
+    }
+
+    #[test]
+    fn command_modal_key_path_quit_does_not_refresh_dead_engine() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sarun-command-quit-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            drop(listener);
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&request).unwrap(),
+                serde_json::json!({"type": "quit"})
+            );
+            stream.write_all(b"{\"ok\":true}\n").unwrap();
+        });
+
+        let mut app = App::bare(path.to_string_lossy().into_owned());
+        dispatch_char_key(&mut app, ':');
+        for character in "quit".chars() {
+            handle_modal_key(
+                &mut app,
+                KeyCode::Char(character),
+                KeyModifiers::empty(),
+            );
+        }
+        handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert!(app.should_quit);
+        assert_eq!(app.status, "quit: ok");
+        assert!(!app.status.contains("view.open changes"));
     }
 
     /// The "scrolling Outputs of a browser box crashes sarun" regression:
