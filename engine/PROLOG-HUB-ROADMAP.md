@@ -678,6 +678,17 @@ belong to the relation.
   database functions. Nested stored pipeline JSON is normalized at its durable
   representation boundary and has focused old/current record tests. The
   aarch64-musl suite passes 302 tests with one ignored.
+- Moved `proc_pipeline`, `output_pipeline`, `pipeline_procs`, `output_detail`,
+  `proc_info`, `proc_prov`, `proc_roots`, and `process_env` execution onto the
+  generated request/success variants. Their database readers now construct
+  closed `PipelineSummary`, `OutputDetail`, `ProcessInfo`, `ProcessSubject`,
+  row-id list, and bounded byte-map values; malformed stored JSON is an error
+  rather than silently becoming null or empty. Missing historical linkage
+  columns have an explicit no-row meaning. Deleted the eight JSON-producing
+  database handlers; base64 and JSON spelling now occur only in the temporary
+  outer listener projection. Focused conversion/projection tests and the full
+  native aarch64-musl suite pass: 304 tests passed and one existing browser
+  e2e test remained ignored.
 
 ## Stop conditions
 

@@ -215,6 +215,13 @@ fn relation_os_string(value: &str) -> Result<crate::generated_wire::OsString, St
         .map_err(|error| format!("OS string exceeds relation bound: {error:?}"))
 }
 
+fn relation_short_os_string(
+    value: &str,
+) -> Result<crate::generated_wire::ShortOsString, String> {
+    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+        .map_err(|error| format!("short OS string exceeds relation bound: {error:?}"))
+}
+
 fn relation_argv(
     stored: Option<String>,
 ) -> Result<crate::wire::BoundedVec<
@@ -308,6 +315,22 @@ fn relation_pipeline_provenance(
         edge_output: value.get("edge_out").and_then(Value::as_str)
             .map(relation_path).transpose()?,
     })
+}
+
+fn relation_environment(
+    stored: Option<&str>,
+) -> Result<crate::generated_wire::Environment, String> {
+    let entries = match stored {
+        Some(stored) => serde_json::from_str::<BTreeMap<String, String>>(stored)
+            .map_err(|error| format!("invalid stored process environment: {error}"))?,
+        None => BTreeMap::new(),
+    };
+    let entries = entries.into_iter().map(|(key, value)| Ok((
+        relation_short_os_string(&key)?,
+        relation_os_string(&value)?,
+    ))).collect::<Result<BTreeMap<_, _>, String>>()?;
+    crate::wire::BoundedMap::new(entries)
+        .map_err(|error| format!("process environment exceeds relation bound: {error:?}"))
 }
 
 pub fn processes_typed(box_id: i64) -> Result<Vec<crate::generated_wire::ProcessRow>, String> {
@@ -600,8 +623,17 @@ mod replay_tests {
     }
 }
 
+fn relation_output_stream(value: i64) -> Result<crate::generated_wire::EchoStream, String> {
+    use crate::generated_wire::EchoStream;
+    match value {
+        0 => Ok(EchoStream::Stdout),
+        1 => Ok(EchoStream::Stderr),
+        value => Err(format!("unknown captured output stream {value}")),
+    }
+}
+
 pub fn outputs_typed(box_id: i64) -> Result<Vec<crate::generated_wire::OutputRow>, String> {
-    use crate::generated_wire::{EchoStream, OutputRow};
+    use crate::generated_wire::OutputRow;
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
@@ -619,11 +651,7 @@ pub fn outputs_typed(box_id: i64) -> Result<Vec<crate::generated_wire::OutputRow
         )));
         if let Ok(it) = it {
             for (id, time, process, stream, length) in it.flatten() {
-                let stream = match stream {
-                    0 => EchoStream::Stdout,
-                    1 => EchoStream::Stderr,
-                    stream => return Err(format!("unknown captured output stream {stream}")),
-                };
+                let stream = relation_output_stream(stream)?;
                 rows.push(OutputRow {
                     id: id.try_into().map_err(|_| "negative output row id")?,
                     time,
@@ -831,6 +859,56 @@ mod relation_row_tests {
         assert_eq!(record.spawned_at, 0.0);
         assert!(!record.nested);
     }
+
+    #[test]
+    fn detail_rows_project_only_after_closed_type_construction() {
+        use crate::generated_wire::{EchoStream, OutputDetail, OutputRow, ProcessInfo,
+            ProcessSubject};
+        use base64::Engine as _;
+
+        let pipeline = pipeline_summary(9, 1.5, "echo hi".into(), "null".into(), Some(3))
+            .unwrap();
+        assert_eq!(pipeline_summary_json(&pipeline), json!({
+            "id": 9, "ts": 1.5, "cmd": "echo hi", "record": null, "pipeline": 3,
+        }));
+        assert!(pipeline_summary(-1, 0.0, String::new(), "null".into(), None).is_err());
+        assert!(pipeline_summary(1, 0.0, String::new(), "{".into(), None).is_err());
+
+        let argv = relation_argv(Some(r#"["echo","hi"]"#.into())).unwrap();
+        let info = ProcessInfo {
+            tgid: Some(20), ppid: Some(10), parent: Some(2),
+            executable: relation_path("/bin/echo").unwrap(), argv: argv.clone(),
+        };
+        assert_eq!(process_info_json(&info), json!([
+            20, 10, 2, "/bin/echo", ["echo", "hi"],
+        ]));
+        let subject = ProcessSubject {
+            executable: info.executable.clone(), cwd: relation_path("/tmp").unwrap(), argv,
+        };
+        assert_eq!(process_subject_json(&subject), json!({
+            "exe": "/bin/echo", "cwd": "/tmp", "argv": ["echo", "hi"],
+        }));
+
+        let detail = OutputDetail {
+            summary: OutputRow {
+                id: 7, time: 2.5, process: Some(2), stream: EchoStream::Stderr, length: 3,
+            },
+            content: crate::wire::BoundedBytes::new(vec![0, 1, 255]).unwrap(),
+        };
+        assert_eq!(output_detail_json(&detail), json!({
+            "id": 7, "ts": 2.5, "process_id": 2, "stream": 1,
+            "content": {"__b": base64::engine::general_purpose::STANDARD.encode([0, 1, 255])},
+        }));
+    }
+
+    #[test]
+    fn stored_environment_must_match_the_closed_byte_map() {
+        let environment = relation_environment(Some(r#"{"A":"1","PATH":"/bin"}"#))
+            .unwrap();
+        assert_eq!(environment_json(&environment), json!({"A": "1", "PATH": "/bin"}));
+        assert!(relation_environment(Some(r#"{"A":1}"#)).is_err());
+        assert_eq!(environment_json(&relation_environment(None).unwrap()), json!({}));
+    }
 }
 
 pub fn pipeline_rows_json(rows: &[crate::generated_wire::PipelineRow]) -> Value {
@@ -942,39 +1020,95 @@ pub fn build_edge_rows_json(rows: &[crate::generated_wire::BuildEdgeRow]) -> Val
     })).collect())
 }
 
+fn pipeline_summary(
+    id: i64,
+    time: f64,
+    command: String,
+    record: String,
+    pipeline: Option<i64>,
+) -> Result<crate::generated_wire::PipelineSummary, String> {
+    let record: Value = serde_json::from_str(&record)
+        .map_err(|error| format!("invalid stored pipeline record: {error}"))?;
+    Ok(crate::generated_wire::PipelineSummary {
+        id: id.try_into().map_err(|_| "negative pipeline row id")?,
+        time,
+        command: relation_text(&command)?,
+        record: if record.is_null() {
+            None
+        } else {
+            Some(relation_pipeline_provenance(&record)?)
+        },
+        pipeline: pipeline.map(|value| value.try_into()
+            .map_err(|_| "negative pipeline sequence")).transpose()?,
+    })
+}
+
+fn pipeline_summary_by_id(
+    conn: &rusqlite::Connection,
+    id: i64,
+) -> Result<Option<crate::generated_wire::PipelineSummary>, String> {
+    let row = conn.query_row(
+        "SELECT id,ts,cmd,record,pipeline FROM brushprov WHERE id=?1",
+        [id],
+        |row| Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, f64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+        )),
+    );
+    match row {
+        Ok((id, time, command, record, pipeline)) =>
+            pipeline_summary(id, time, command, record, pipeline).map(Some),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(format!("read pipeline row: {error}")),
+    }
+}
+
 /// D9 brush↔process linkage, process→pipeline direction: the brushprov pipeline
-/// row that spawned process `row_id` (its exact cmd + parsed structure), or Null
-/// if that process was not spawned by a brush pipeline (or the box isn't -b).
-/// Walks up the process tree (parent_id) when the direct process lacks a
-/// brush_pipeline_id — output writers are often grandchildren of the pipeline
-/// command (e.g. `rm` forked by a shell forked by make).
-pub fn proc_pipeline(box_id: i64, row_id: i64) -> Value {
-    let Some(c) = open_ro(box_id) else { return Value::Null };
-    let mut cur = row_id;
+/// row that spawned process `row_id`, or None if the process was not spawned by
+/// one. Walk parent_id because output writers are often grandchildren of the
+/// pipeline command (for example `rm` forked by a shell forked by make).
+pub fn proc_pipeline_typed(
+    box_id: i64,
+    row_id: u64,
+) -> Result<Option<crate::generated_wire::PipelineSummary>, String> {
+    let Some(conn) = open_ro(box_id) else { return Ok(None) };
+    if !has_table(&conn, "process") || !has_table(&conn, "brushprov")
+        || !has_col(&conn, "process", "brush_pipeline_id") {
+        return Ok(None);
+    }
+    let mut current = i64::try_from(row_id)
+        .map_err(|_| "process row id exceeds sqlite range")?;
     for _ in 0..64 {
-        if let Ok(v) = c.query_row(
+        let row = conn.query_row(
             "SELECT bp.id,bp.ts,bp.cmd,bp.record,bp.pipeline \
              FROM process p JOIN brushprov bp ON p.brush_pipeline_id=bp.id \
              WHERE p.id=?1",
-            [cur], |r| {
-                let rec: String = r.get(3)?;
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
-                    "cmd": r.get::<_, String>(2)?,
-                    "record": serde_json::from_str::<Value>(&rec).unwrap_or(Value::Null),
-                    "pipeline": r.get::<_, Option<i64>>(4)?,
-                }))
-            }) {
-            return v;
+            [current], |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            )));
+        match row {
+            Ok((id, time, command, record, pipeline)) =>
+                return pipeline_summary(id, time, command, record, pipeline).map(Some),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(error) => return Err(format!("read process pipeline: {error}")),
         }
-        match c.query_row(
-            "SELECT parent_id FROM process WHERE id=?1", [cur],
-            |r| r.get::<_, Option<i64>>(0)) {
-            Ok(Some(pid)) if pid != cur => cur = pid,
+        match conn.query_row(
+            "SELECT parent_id FROM process WHERE id=?1", [current],
+            |row| row.get::<_, Option<i64>>(0)) {
+            Ok(Some(parent)) if parent != current => current = parent,
+            Err(rusqlite::Error::QueryReturnedNoRows) | Ok(None) => break,
+            Err(error) => return Err(format!("read process parent: {error}")),
             _ => break,
         }
     }
-    Value::Null
+    Ok(None)
 }
 
 /// Output→pipeline: find the brushprov pipeline that produced output `output_id`.
@@ -983,55 +1117,59 @@ pub fn proc_pipeline(box_id: i64, row_id: i64) -> Value {
 /// not exist (pre-column data). When the column exists but is NULL, the output
 /// genuinely has no pipeline — guessing via process ancestry produces wrong
 /// results for in-process builtins whose process_id is the shared brush root.
-pub fn output_pipeline(box_id: i64, output_id: i64) -> Value {
-    let Some(c) = open_ro(box_id) else { return Value::Null };
-    let has_bp_col = has_col(&c, "outputs", "brush_pipeline_id");
+pub fn output_pipeline_typed(
+    box_id: i64,
+    output_id: u64,
+) -> Result<Option<crate::generated_wire::PipelineSummary>, String> {
+    let Some(conn) = open_ro(box_id) else { return Ok(None) };
+    if !has_table(&conn, "outputs") { return Ok(None); }
+    let output_id = i64::try_from(output_id)
+        .map_err(|_| "output row id exceeds sqlite range")?;
+    let has_bp_col = has_col(&conn, "outputs", "brush_pipeline_id");
     let bp_col = if has_bp_col { "brush_pipeline_id" } else { "NULL" };
     let q = format!("SELECT process_id,{bp_col} FROM outputs WHERE id=?1");
-    let (process_id, bp_id): (Option<i64>, Option<i64>) = match c.query_row(
-        &q, [output_id], |r| Ok((r.get(0)?, r.get(1)?))) {
-        Ok(v) => v,
-        Err(_) => return Value::Null,
+    let (process_id, pipeline_id): (Option<i64>, Option<i64>) = match conn.query_row(
+        &q, [output_id], |row| Ok((row.get(0)?, row.get(1)?))) {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(format!("read output pipeline reference: {error}")),
     };
-    if let Some(bp) = bp_id {
-        if let Ok(v) = c.query_row(
-            "SELECT id,ts,cmd,record,pipeline FROM brushprov WHERE id=?1",
-            [bp], |r| {
-                let rec: String = r.get(3)?;
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
-                    "cmd": r.get::<_, String>(2)?,
-                    "record": serde_json::from_str::<Value>(&rec).unwrap_or(Value::Null),
-                    "pipeline": r.get::<_, Option<i64>>(4)?,
-                }))
-            }) {
-            return v;
-        }
+    if let Some(pipeline_id) = pipeline_id {
+        return pipeline_summary_by_id(&conn, pipeline_id);
     }
     // Only fall back to process-tree walk when the column doesn't exist at
     // all (old data). If the column exists but is NULL, the output was not
     // attributed to any pipeline at capture time — don't guess.
     if !has_bp_col {
-        if let Some(pid) = process_id {
-            let v = proc_pipeline(box_id, pid);
-            if !v.is_null() { return v; }
+        if let Some(process_id) = process_id {
+            let process_id = process_id.try_into()
+                .map_err(|_| "negative output process row id")?;
+            return proc_pipeline_typed(box_id, process_id);
         }
     }
-    Value::Null
+    Ok(None)
 }
 
 /// D9 brush↔process linkage, pipeline→processes direction: the process row ids
 /// the brushprov pipeline `brushprov_id` spawned (empty if none/unknown).
-pub fn pipeline_procs(box_id: i64, brushprov_id: i64) -> Value {
-    let Some(c) = open_ro(box_id) else { return json!([]) };
-    let mut out = vec![];
-    if let Ok(mut st) = c.prepare(
-        "SELECT id FROM process WHERE brush_pipeline_id=?1 ORDER BY id") {
-        if let Ok(it) = st.query_map([brushprov_id], |r| r.get::<_, i64>(0)) {
-            out = it.flatten().map(Value::from).collect();
-        }
+pub fn pipeline_procs_typed(box_id: i64, pipeline_id: u64) -> Result<Vec<u64>, String> {
+    let Some(conn) = open_ro(box_id) else { return Ok(vec![]) };
+    if !has_table(&conn, "process") || !has_col(&conn, "process", "brush_pipeline_id") {
+        return Ok(vec![]);
     }
-    Value::Array(out)
+    let pipeline_id = i64::try_from(pipeline_id)
+        .map_err(|_| "pipeline row id exceeds sqlite range")?;
+    let mut statement = conn.prepare(
+        "SELECT id FROM process WHERE brush_pipeline_id=?1 ORDER BY id")
+        .map_err(|error| format!("prepare pipeline process query: {error}"))?;
+    let rows = statement.query_map([pipeline_id], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("read pipeline process rows: {error}"))?;
+    let mut result = vec![];
+    for row in rows {
+        let id = row.map_err(|error| format!("read pipeline process row: {error}"))?;
+        result.push(id.try_into().map_err(|_| "negative process row id")?);
+    }
+    Ok(result)
 }
 
 pub fn open_ro_for(box_id: i64) -> Option<rusqlite::Connection> { open_ro(box_id) }
@@ -1048,6 +1186,7 @@ pub fn proc_info_typed(
     row_id: u64,
 ) -> Result<Option<crate::generated_wire::ProcessInfo>, String> {
     let Some(conn) = open_ro(box_id) else { return Ok(None) };
+    if !has_table(&conn, "process") { return Ok(None); }
     let row_id = i64::try_from(row_id).map_err(|_| "process row id exceeds sqlite range")?;
     let row = conn.query_row(
         "SELECT tgid,ppid,parent_id,exe,argv FROM process WHERE id=?1",
@@ -1077,49 +1216,45 @@ pub fn proc_info_typed(
     }))
 }
 
-pub fn proc_info(box_id: i64, row_id: i64) -> Value {
-    let Ok(row_id) = u64::try_from(row_id) else { return Value::Null };
-    match proc_info_typed(box_id, row_id).ok().flatten() {
-        Some(row) => json!([
-            row.tgid,
-            row.ppid,
-            row.parent,
-            String::from_utf8_lossy(row.executable.as_slice()),
-            row.argv.as_slice().iter().map(|word|
-                String::from_utf8_lossy(word.as_slice()).into_owned()).collect::<Vec<_>>(),
-        ]),
-        None => Value::Null,
-    }
-}
-
 /// Provenance dict {exe,cwd,argv} of one process row — the procs-pane filter.
-pub fn proc_prov(box_id: i64, row_id: i64) -> Value {
-    let Some(c) = open_ro(box_id) else { return Value::Null };
-    c.query_row("SELECT exe,cwd,argv FROM process WHERE id=?1", [row_id], |r| {
-        let argv: Option<String> = r.get(2)?;
-        Ok(json!({"exe": r.get::<_,Option<String>>(0)?.unwrap_or_default(),
-                  "cwd": r.get::<_,Option<String>>(1)?.unwrap_or_default(),
-                  "argv": argv.and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                      .unwrap_or_else(|| json!([]))}))
-    }).unwrap_or(Value::Null)
+pub fn proc_prov_typed(
+    box_id: i64,
+    row_id: u64,
+) -> Result<Option<crate::generated_wire::ProcessSubject>, String> {
+    let Some(conn) = open_ro(box_id) else { return Ok(None) };
+    if !has_table(&conn, "process") { return Ok(None); }
+    let row_id = i64::try_from(row_id).map_err(|_| "process row id exceeds sqlite range")?;
+    let row = conn.query_row(
+        "SELECT exe,cwd,argv FROM process WHERE id=?1", [row_id], |row| Ok((
+            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(2)?,
+        )));
+    match row {
+        Ok((executable, cwd, argv)) => Ok(Some(crate::generated_wire::ProcessSubject {
+            executable: relation_path(&executable)?,
+            cwd: relation_path(&cwd)?,
+            argv: relation_argv(argv)?,
+        })),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(format!("read process provenance: {error}")),
+    }
 }
 
 /// Hierarchy-root row ids (process.root=1) — the proc-tree walk boundary.
 pub fn proc_roots_typed(box_id: i64) -> Result<Vec<u64>, String> {
     let Some(conn) = open_ro(box_id) else { return Ok(vec![]) };
+    if !has_table(&conn, "process") { return Ok(vec![]); }
+    let mut statement = conn.prepare("SELECT id FROM process WHERE root=1 ORDER BY id")
+        .map_err(|error| format!("prepare process root query: {error}"))?;
+    let rows = statement.query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("read process root rows: {error}"))?;
     let mut roots = vec![];
-    if let Ok(mut statement) = conn.prepare("SELECT id FROM process WHERE root=1") {
-        if let Ok(rows) = statement.query_map([], |row| row.get::<_, i64>(0)) {
-            for id in rows.flatten() {
-                roots.push(id.try_into().map_err(|_| "negative process root row id")?);
-            }
-        }
+    for row in rows {
+        let id = row.map_err(|error| format!("read process root row: {error}"))?;
+        roots.push(id.try_into().map_err(|_| "negative process root row id")?);
     }
     Ok(roots)
-}
-
-pub fn proc_roots(box_id: i64) -> Value {
-    json!(proc_roots_typed(box_id).unwrap_or_default())
 }
 
 fn writer_col(box_id: i64, rel: &str, col: &str) -> Value {
@@ -1148,28 +1283,113 @@ pub fn first_writer_prov(box_id: i64, rel: &str) -> Value {
     }).unwrap_or(Value::Null)
 }
 
-/// One captured output row WITH its content (bytes → {"__b": base64} so the
-/// Python wire_decode hands the UI real bytes).
-pub fn output_detail(box_id: i64, oid: i64) -> Value {
-    use base64::Engine as _;
-    let Some(c) = open_ro(box_id) else { return Value::Null };
-    c.query_row("SELECT id,ts,process_id,stream,content FROM outputs WHERE id=?1",
-                [oid], |r| {
-        let content: Option<Vec<u8>> = r.get(4)?;
-        let b64 = base64::engine::general_purpose::STANDARD
-            .encode(content.unwrap_or_default());
-        Ok(json!({"id": r.get::<_,i64>(0)?, "ts": r.get::<_,f64>(1)?,
-                  "process_id": r.get::<_,Option<i64>>(2)?,
-                  "stream": r.get::<_,i64>(3)?, "content": {"__b": b64}}))
-    }).unwrap_or(Value::Null)
+/// One captured output row with its original content bytes. Human/JSON
+/// projection is deliberately outside this database decoder.
+pub fn output_detail_typed(
+    box_id: i64,
+    output_id: u64,
+) -> Result<Option<crate::generated_wire::OutputDetail>, String> {
+    use crate::generated_wire::{OutputDetail, OutputRow};
+    let Some(conn) = open_ro(box_id) else { return Ok(None) };
+    if !has_table(&conn, "outputs") { return Ok(None); }
+    let output_id = i64::try_from(output_id)
+        .map_err(|_| "output row id exceeds sqlite range")?;
+    let row = conn.query_row(
+        "SELECT id,ts,process_id,stream,content FROM outputs WHERE id=?1",
+        [output_id], |row| Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, f64>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+        )));
+    let (id, time, process, stream, content) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(format!("read output detail: {error}")),
+    };
+    let stream = relation_output_stream(stream)?;
+    Ok(Some(OutputDetail {
+        summary: OutputRow {
+            id: id.try_into().map_err(|_| "negative output row id")?,
+            time,
+            process: process.map(|value| value.try_into()
+                .map_err(|_| "negative output process id")).transpose()?,
+            stream,
+            length: content.len().try_into().map_err(|_| "output length exceeds u64")?,
+        },
+        content: crate::wire::BoundedBytes::new(content)
+            .map_err(|error| format!("output content exceeds relation bound: {error:?}"))?,
+    }))
 }
 
 /// The deduped environment of one process row (env table via env_id), or {}.
-pub fn process_env(box_id: i64, proc_id: i64) -> Value {
-    let Some(c) = open_ro(box_id) else { return json!({}) };
-    c.query_row("SELECT env.env FROM process JOIN env ON process.env_id=env.id \
-                 WHERE process.id=?1", [proc_id], |r| r.get::<_, Option<String>>(0))
-        .ok().flatten()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or_else(|| json!({}))
+pub fn process_env_typed(
+    box_id: i64,
+    process_id: u64,
+) -> Result<crate::generated_wire::Environment, String> {
+    let Some(conn) = open_ro(box_id) else {
+        return relation_environment(None);
+    };
+    if !has_table(&conn, "process") || !has_table(&conn, "env") {
+        return relation_environment(None);
+    }
+    let process_id = i64::try_from(process_id)
+        .map_err(|_| "process row id exceeds sqlite range")?;
+    let stored = conn.query_row(
+        "SELECT env.env FROM process JOIN env ON process.env_id=env.id WHERE process.id=?1",
+        [process_id], |row| row.get::<_, Option<String>>(0));
+    let stored = match stored {
+        Ok(stored) => stored,
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(format!("read process environment: {error}")),
+    };
+    relation_environment(stored.as_deref())
+}
+
+pub fn pipeline_summary_json(row: &crate::generated_wire::PipelineSummary) -> Value {
+    json!({
+        "id": row.id, "ts": row.time, "cmd": row.command.as_str(),
+        "record": row.record.as_ref().map(pipeline_provenance_json),
+        "pipeline": row.pipeline,
+    })
+}
+
+pub fn process_info_json(row: &crate::generated_wire::ProcessInfo) -> Value {
+    json!([
+        row.tgid, row.ppid, row.parent,
+        String::from_utf8_lossy(row.executable.as_slice()),
+        row.argv.as_slice().iter().map(|word|
+            String::from_utf8_lossy(word.as_slice()).into_owned()).collect::<Vec<_>>(),
+    ])
+}
+
+pub fn process_subject_json(row: &crate::generated_wire::ProcessSubject) -> Value {
+    json!({
+        "exe": String::from_utf8_lossy(row.executable.as_slice()),
+        "cwd": String::from_utf8_lossy(row.cwd.as_slice()),
+        "argv": row.argv.as_slice().iter().map(|word|
+            String::from_utf8_lossy(word.as_slice()).into_owned()).collect::<Vec<_>>(),
+    })
+}
+
+pub fn output_detail_json(row: &crate::generated_wire::OutputDetail) -> Value {
+    use base64::Engine as _;
+    use crate::generated_wire::EchoStream;
+    json!({
+        "id": row.summary.id, "ts": row.summary.time,
+        "process_id": row.summary.process,
+        "stream": match row.summary.stream {
+            EchoStream::Stdout => 0, EchoStream::Stderr => 1,
+        },
+        "content": {"__b": base64::engine::general_purpose::STANDARD
+            .encode(row.content.as_slice())},
+    })
+}
+
+pub fn environment_json(environment: &crate::generated_wire::Environment) -> Value {
+    Value::Object(environment.as_map().iter().map(|(key, value)| (
+        String::from_utf8_lossy(key.as_slice()).into_owned(),
+        Value::String(String::from_utf8_lossy(value.as_slice()).into_owned()),
+    )).collect())
 }

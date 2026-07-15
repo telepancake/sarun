@@ -1336,6 +1336,12 @@ fn dispatch(state: &State, msg: &Value) -> Value {
 /// Execute top-level actions from their generated closed request type. Current
 /// JSON branches immediately enter this typed path; the mandatory binary
 /// listener cutover removes those outer projections and calls it directly.
+fn existing_box_id(sid: u64) -> Result<i64, String> {
+    let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+    discover::discover().contains_key(&id).then_some(id)
+        .ok_or_else(|| "no slopbox".into())
+}
+
 fn dispatch_action(
     state: &State,
     request: crate::generated_wire::ActionRequest,
@@ -1343,10 +1349,7 @@ fn dispatch_action(
     use crate::generated_wire::{ActionRequest, ActionSuccess};
     match request {
         ActionRequest::Sudtrace { sid } => {
-            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
-            if !discover::discover().contains_key(&id) {
-                return Err("no slopbox".into());
-            }
+            let id = existing_box_id(sid)?;
             let live = lock(state)
                 .overlay
                 .clone()
@@ -1355,10 +1358,7 @@ fn dispatch_action(
         }
         request @ (ActionRequest::Apply { sid } | ActionRequest::Discard { sid }) => {
             let applying = matches!(request, ActionRequest::Apply { .. });
-            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
-            if !discover::discover().contains_key(&id) {
-                return Err("no slopbox".into());
-            }
+            let id = existing_box_id(sid)?;
             if box_is_running(state, id) {
                 return Err("box is running; stop it first".into());
             }
@@ -1422,10 +1422,7 @@ fn dispatch_action(
             })
         }
         ActionRequest::Processes { sid } => {
-            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
-            if !discover::discover().contains_key(&id) {
-                return Err("no slopbox".into());
-            }
+            let id = existing_box_id(sid)?;
             let rows = crate::wire::BoundedVec::new(discover::processes_typed(id)?)
                 .map_err(|error| format!("process rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::Processes { value: rows })
@@ -1444,31 +1441,67 @@ fn dispatch_action(
             Ok(ActionSuccess::ProcessesLive { value })
         }
         ActionRequest::Outputs { sid } => {
-            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
-            if !discover::discover().contains_key(&id) {
-                return Err("no slopbox".into());
-            }
+            let id = existing_box_id(sid)?;
             let rows = crate::wire::BoundedVec::new(discover::outputs_typed(id)?)
                 .map_err(|error| format!("output rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::Outputs { value: rows })
         }
         ActionRequest::Brushprov { sid } => {
-            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
-            if !discover::discover().contains_key(&id) {
-                return Err("no slopbox".into());
-            }
+            let id = existing_box_id(sid)?;
             let rows = crate::wire::BoundedVec::new(discover::brushprov_typed(id)?)
                 .map_err(|error| format!("pipeline rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::Brushprov { value: rows })
         }
         ActionRequest::BuildEdges { sid } => {
-            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
-            if !discover::discover().contains_key(&id) {
-                return Err("no slopbox".into());
-            }
+            let id = existing_box_id(sid)?;
             let rows = crate::wire::BoundedVec::new(discover::build_edges_typed(id)?)
                 .map_err(|error| format!("build edge rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::BuildEdges { value: rows })
+        }
+        ActionRequest::ProcPipeline { sid, row } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::ProcPipeline {
+                value: discover::proc_pipeline_typed(id, row)?,
+            })
+        }
+        ActionRequest::OutputPipeline { sid, output } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::OutputPipeline {
+                value: discover::output_pipeline_typed(id, output)?,
+            })
+        }
+        ActionRequest::PipelineProcs { sid, pipeline } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::wire::BoundedVec::new(
+                discover::pipeline_procs_typed(id, pipeline)?)
+                .map_err(|error| format!(
+                    "pipeline process rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::PipelineProcs { value })
+        }
+        ActionRequest::OutputDetail { sid, output } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::OutputDetail {
+                value: discover::output_detail_typed(id, output)?,
+            })
+        }
+        ActionRequest::ProcInfo { sid, row } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::ProcInfo { value: discover::proc_info_typed(id, row)? })
+        }
+        ActionRequest::ProcProv { sid, row } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::ProcProv { value: discover::proc_prov_typed(id, row)? })
+        }
+        ActionRequest::ProcRoots { sid } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::wire::BoundedVec::new(discover::proc_roots_typed(id)?)
+                .map_err(|error| format!(
+                    "process root rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::ProcRoots { value })
+        }
+        ActionRequest::ProcessEnv { sid, row } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::ProcessEnv { value: discover::process_env_typed(id, row)? })
         }
         ActionRequest::ViewOpen {
             kind,
@@ -1476,10 +1509,7 @@ fn dispatch_action(
             filter,
             running_only,
         } => {
-            let id = i64::try_from(r#box).map_err(|_| "box id exceeds engine range")?;
-            if !discover::discover().contains_key(&id) {
-                return Err("no slopbox".into());
-            }
+            let id = existing_box_id(r#box)?;
             let mut shared = lock(state);
             let live = shared.box_runpids.contains_key(&id);
             let Shared {
@@ -1785,6 +1815,18 @@ fn legacy_ui_action_reply(
         Ok(ActionSuccess::BuildEdges { value }) => {
             discover::build_edge_rows_json(value.as_slice())
         }
+        Ok(ActionSuccess::ProcPipeline { value })
+        | Ok(ActionSuccess::OutputPipeline { value }) => value.as_ref()
+            .map(discover::pipeline_summary_json).unwrap_or(Value::Null),
+        Ok(ActionSuccess::PipelineProcs { value })
+        | Ok(ActionSuccess::ProcRoots { value }) => json!(value.as_slice()),
+        Ok(ActionSuccess::OutputDetail { value }) => value.as_ref()
+            .map(discover::output_detail_json).unwrap_or(Value::Null),
+        Ok(ActionSuccess::ProcInfo { value }) => value.as_ref()
+            .map(discover::process_info_json).unwrap_or(Value::Null),
+        Ok(ActionSuccess::ProcProv { value }) => value.as_ref()
+            .map(discover::process_subject_json).unwrap_or(Value::Null),
+        Ok(ActionSuccess::ProcessEnv { value }) => discover::environment_json(&value),
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -1892,6 +1934,11 @@ fn arg_sid(args: &[Value]) -> Option<i64> {
     let v = args.first()?;
     v.as_i64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+fn legacy_u64(args: &[Value], index: usize) -> Option<u64> {
+    let value = args.get(index)?;
+    value.as_u64().or_else(|| value.as_str()?.parse().ok())
 }
 
 fn flow_args<'a>(state: &State, args: &'a [Value]) -> Option<(i64, &'a Value)> {
@@ -3044,25 +3091,33 @@ macro_rules! ui_verbs {
             ));
         }
         // D9 brush↔process linkage joins (both directions).
-        "proc_pipeline" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
-            (Some(id), Some(rid)) => discover::proc_pipeline(id, rid),
-            _ => Value::Null,
+        "proc_pipeline" => {
+            let (Some(sid), Some(row)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid process row"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ProcPipeline { sid, row }));
         }
+        "output_pipeline" => {
+            let (Some(sid), Some(output)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid output row"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::OutputPipeline { sid, output }));
         }
-        "output_pipeline" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
-            (Some(id), Some(oid)) => discover::output_pipeline(id, oid),
-            _ => Value::Null,
+        "pipeline_procs" => {
+            let (Some(sid), Some(pipeline)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid pipeline row"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::PipelineProcs { sid, pipeline }));
         }
-        }
-        "pipeline_procs" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
-            (Some(id), Some(pid)) => discover::pipeline_procs(id, pid),
-            _ => json!([]),
-        }
-        }
-        "output_detail" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
-            (Some(id), Some(oid)) => discover::output_detail(id, oid),
-            _ => Value::Null,
-        }
+        "output_detail" => {
+            let (Some(sid), Some(output)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid output row"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::OutputDetail { sid, output }));
         }
         "processes_live" => {
             // For a box whose runner is still registered the engine returns
@@ -3079,24 +3134,33 @@ macro_rules! ui_verbs {
                 state, crate::generated_wire::ActionRequest::ProcessesLive { sid: id },
             ));
         }
-        "proc_info" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
-            (Some(id), Some(rid)) => discover::proc_info(id, rid),
-            _ => Value::Null,
+        "proc_info" => {
+            let (Some(sid), Some(row)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid process row"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ProcInfo { sid, row }));
         }
+        "proc_prov" => {
+            let (Some(sid), Some(row)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid process row"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ProcProv { sid, row }));
         }
-        "proc_prov" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
-            (Some(id), Some(rid)) => discover::proc_prov(id, rid),
-            _ => Value::Null,
+        "proc_roots" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ProcRoots { sid }));
         }
-        }
-        "proc_roots" => { match arg_sid(args) {
-            Some(id) => discover::proc_roots(id), None => json!([]),
-        }
-        }
-        "process_env" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
-            (Some(id), Some(rid)) => discover::process_env(id, rid),
-            _ => json!({}),
-        }
+        "process_env" => {
+            let (Some(sid), Some(row)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid process row"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ProcessEnv { sid, row }));
         }
         "writer_id" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => discover::writer_id(id, rel), _ => Value::Null,
