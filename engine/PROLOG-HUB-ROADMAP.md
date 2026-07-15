@@ -870,6 +870,13 @@ belong to the relation.
   only constructs the closed values at its boundary. The full native
   aarch64-musl suite passes 308 tests with one existing browser e2e test
   ignored.
+- Made registration's root-process recording consume the generated
+  `ProcessProvenance` record. Executable/cwd/argv/environment bytes and process
+  identities are now bounded and validated before insertion; the capture layer
+  no longer extracts an open JSON object with default-empty and unchecked-cast
+  behavior. The temporary listener constructs that record once at its boundary
+  until the full `Register` request cutover. The full native aarch64-musl suite
+  passes 308 tests with one existing browser e2e test ignored.
 
 ## Stop conditions
 

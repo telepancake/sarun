@@ -1230,38 +1230,45 @@ impl BoxState {
     /// THIS row (matching the Python Supervisor, which records the root with the host
     /// pid's real start_time, not 0). On RERUN a second launch adds ANOTHER root row
     /// and its subtree, keeping the forest connected across runs.
-    pub fn root_process(&self, prov: &serde_json::Value, host_pid: i64) {
-        let g = |k: &str| prov.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    pub fn root_process(
+        &self,
+        provenance: &crate::generated_wire::ProcessProvenance,
+        host_pid: i64,
+    ) -> Result<(), String> {
+        let text = |value: &[u8], field: &str| std::str::from_utf8(value)
+            .map(str::to_owned).map_err(|_| format!("root process {field} is not UTF-8"));
         // tgid: the real host pid when known (so /proc + the bubble chain agree),
         // else the runner's self-reported tgid/pid from prov.
-        let tgid = if host_pid > 0 { host_pid as u32 }
-                   else {
-                       prov.get("tgid").and_then(|v| v.as_i64())
-                           .or_else(|| prov.get("pid").and_then(|v| v.as_i64()))
-                           .unwrap_or(0) as u32
-                   };
-        let ppid = prov.get("ppid").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+        let tgid = if host_pid > 0 {
+            u32::try_from(host_pid).map_err(|_| "root host pid exceeds u32")?
+        } else {
+            provenance.tgid
+        };
+        let ppid = u32::try_from(provenance.ppid).map_err(|_| "negative root parent pid")?;
         // start_time identifies the incarnation; read the host pid's real start so the
         // (tgid,start) identity matches what writers see when they bubble up to it.
         let start = if tgid > 0 { Self::start_time_of(tgid) } else { 0 };
-        let argv: Vec<String> = prov.get("argv").and_then(|v| v.as_array())
-            .map(|a| a.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect())
-            .unwrap_or_default();
+        let argv = provenance.argv.as_slice().iter().map(|value|
+            text(value.as_slice(), "argument")).collect::<Result<Vec<_>, _>>()?;
         // -e env capture: the root's env. Prefer the env the runner sent in prov
         // (its full HOST env — correct even for a nested runner whose tgid is a
         // parent-namespace pid the engine can't /proc-read); else read the host
         // tgid's /proc/<tgid>/environ.
         let env_json = if self.env_capture() {
-            prov.get("env").and_then(|e| e.as_object()).map(|m| {
-                let bt: std::collections::BTreeMap<String, String> = m.iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                    .collect();
-                serde_json::to_string(&bt).unwrap_or_default()
-            }).or_else(|| if tgid > 0 { Self::read_environ_json(tgid) }
-                          else { None })
+            provenance.environment.as_ref().map(|environment| {
+                let values = environment.as_map().iter().map(|(key, value)| Ok((
+                    text(key.as_slice(), "environment key")?,
+                    text(value.as_slice(), "environment value")?,
+                ))).collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+                serde_json::to_string(&values).map_err(|error| error.to_string())
+            }).transpose()?.or_else(|| if tgid > 0 { Self::read_environ_json(tgid) }
+                                     else { None })
         } else { None };
-        self.record_proc(tgid, start, ppid, &g("exe"), &g("cwd"), &argv,
+        self.record_proc(tgid, start, ppid,
+                         &text(provenance.executable.as_slice(), "executable")?,
+                         &text(provenance.cwd.as_slice(), "cwd")?, &argv,
                          env_json, true);
+        Ok(())
     }
 
 

@@ -3787,6 +3787,49 @@ fn valid_name(s: &str) -> bool {
         && !s.ends_with('-')
 }
 
+fn legacy_process_provenance(value: &Value)
+    -> Result<crate::generated_wire::ProcessProvenance, String>
+{
+    let bytes = |name: &str| {
+        let value = value.get(name).and_then(Value::as_str)
+            .ok_or_else(|| format!("process provenance has no {name}"))?;
+        crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+            .map_err(|error| format!("process {name} exceeds relation bound: {error:?}"))
+    };
+    let argv = value.get("argv").and_then(Value::as_array)
+        .ok_or("process provenance has no argv")?.iter().map(|value| {
+            let value = value.as_str().ok_or("process argument is not text")?;
+            crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                .map_err(|error| format!("process argument exceeds relation bound: {error:?}"))
+        }).collect::<Result<Vec<_>, String>>()?;
+    let environment = value.get("env").map(|environment| {
+        let entries = environment.as_object().ok_or("process environment is not an object")?
+            .iter().map(|(key, value)| {
+                let value = value.as_str().ok_or("process environment value is not text")?;
+                Ok((
+                    crate::wire::BoundedBytes::new(key.as_bytes().to_vec())
+                        .map_err(|_| "process environment key exceeds relation bound")?,
+                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                        .map_err(|_| "process environment value exceeds relation bound")?,
+                ))
+            }).collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+        crate::wire::BoundedMap::new(entries)
+            .map_err(|error| format!("process environment exceeds relation bound: {error:?}"))
+    }).transpose()?;
+    Ok(crate::generated_wire::ProcessProvenance {
+        tgid: value.get("tgid").or_else(|| value.get("pid"))
+            .and_then(Value::as_u64).ok_or("process provenance has no tgid")?
+            .try_into().map_err(|_| "process tgid exceeds u32")?,
+        ppid: value.get("ppid").and_then(Value::as_i64).unwrap_or(0)
+            .try_into().map_err(|_| "process ppid exceeds i32")?,
+        executable: bytes("exe")?,
+        cwd: bytes("cwd")?,
+        argv: crate::wire::BoundedVec::new(argv)
+            .map_err(|error| format!("process argv exceeds relation bound: {error:?}"))?,
+        environment,
+    })
+}
+
 /// The runner register handshake. Mints a box_id, creates the backing sentinel
 /// (live/<id>/up) and the box's sqlar (root process row from the message's
 /// prov), registers the box on the overlay, and acks with the <mnt>/<id> bind
@@ -4194,8 +4237,15 @@ fn register(
     // no host filesystem underneath. Surfaced to the runner so it can pick the
     // right default cwd ("/" when there's no host directory to inherit).
     let no_host = b.no_host_fallback() || chain_has_no_host(&boxes, parent);
-    if let Some(prov) = msg.get("prov") {
-        b.root_process(prov, host_pid as i64);
+    match msg.get("prov").ok_or_else(|| "register has no process provenance".to_owned())
+        .and_then(legacy_process_provenance)
+        .and_then(|provenance| b.root_process(&provenance, i64::from(host_pid)))
+    {
+        Ok(()) => (),
+        Err(error) => {
+            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            return json!({"ok": false, "error": error});
+        }
     }
     {
         let mut s = lock(state);
