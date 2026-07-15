@@ -759,6 +759,14 @@ belong to the relation.
   parser, leaving old object spelling only in the temporary listener
   projection. The full native aarch64-musl suite passes 308 tests with one
   existing browser e2e test ignored.
+- Moved `flows.list`, `flows.detail`, and `flows.packets` onto generated
+  request/success variants. Packet capture still stays in canonical pcapng and
+  keylog files; on-demand tshark view decoding now returns bounded generated
+  `FlowRow` and `PacketRow` values directly. Deleted their `to_json` methods and
+  the parallel flow-argument helper; JSON spelling remains only at the
+  temporary listener projection. A focused tshark-row materialization test and
+  the full native aarch64-musl suite pass: 308 tests passed and one existing
+  browser e2e test remained ignored.
 
 ## Stop conditions
 

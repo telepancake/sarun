@@ -1800,6 +1800,34 @@ fn dispatch_action(
             }
             Ok(ActionSuccess::PromptsUiActive { value: () })
         }
+        ActionRequest::FlowsList { sid } => {
+            let id = action_flow_box(state, sid)?;
+            let directory = flows_dir_for(id).ok_or("no flows dir for box")?;
+            let value = crate::wire::BoundedVec::new(
+                crate::net::flows::tshark_list(&directory)?)
+                .map_err(|error| format!("flow rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::FlowsList { value })
+        }
+        ActionRequest::FlowsDetail { sid, frame } => {
+            if frame == 0 {
+                return Err("flow frame must be positive".into());
+            }
+            let id = action_flow_box(state, sid)?;
+            let directory = flows_dir_for(id).ok_or("no flows dir for box")?;
+            let value = crate::wire::BoundedText::new(
+                crate::net::flows::tshark_detail(&directory, frame)?)
+                .map_err(|error| format!("flow detail exceeds relation bound: {error:?}"))?;
+            Ok(ActionSuccess::FlowsDetail { value })
+        }
+        ActionRequest::FlowsPackets { sid, stream } => {
+            let id = action_flow_box(state, sid)?;
+            let stream = i64::try_from(stream).map_err(|_| "flow stream exceeds i64")?;
+            let directory = flows_dir_for(id).ok_or("no flows dir for box")?;
+            let value = crate::wire::BoundedVec::new(
+                crate::net::flows::tshark_packets(&directory, stream)?)
+                .map_err(|error| format!("packet rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::FlowsPackets { value })
+        }
         ActionRequest::ViewOpen {
             kind,
             r#box,
@@ -2270,6 +2298,37 @@ fn legacy_ui_action_reply(
         }),
         Ok(ActionSuccess::PromptsAnswer { value }) => json!({"ok": value}),
         Ok(ActionSuccess::PromptsUiActive { .. }) => json!({"ok": true}),
+        Ok(ActionSuccess::FlowsList { value }) => json!({
+            "ok": true,
+            "flows": value.into_inner().into_iter().map(|row| json!({
+                "frame": row.frame,
+                "t": row.time,
+                "src": row.source.into_inner(),
+                "dst": row.destination.into_inner(),
+                "sni": row.sni.into_inner(),
+                "host": row.host.into_inner(),
+                "method": row.method.into_inner(),
+                "uri": row.uri.into_inner(),
+                "status": row.status.into_inner(),
+                "stream": row.stream.map(|stream| stream as i64).unwrap_or(-1),
+            })).collect::<Vec<_>>(),
+        }),
+        Ok(ActionSuccess::FlowsDetail { value }) => json!({
+            "ok": true,
+            "text": value.into_inner(),
+        }),
+        Ok(ActionSuccess::FlowsPackets { value }) => json!({
+            "ok": true,
+            "packets": value.into_inner().into_iter().map(|row| json!({
+                "frame": row.frame,
+                "t": row.time,
+                "src": row.source.into_inner(),
+                "dst": row.destination.into_inner(),
+                "proto": row.protocol.into_inner(),
+                "len": row.length,
+                "info": row.summary.into_inner(),
+            })).collect::<Vec<_>>(),
+        }),
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -2356,11 +2415,14 @@ fn find_named_child(
         .map(|b| b.box_id)
 }
 
-fn selected_sid(state: &State) -> Option<i64> {
-    lock(state)
-        .selected
-        .as_ref()
-        .and_then(|s| s.parse::<i64>().ok())
+fn action_flow_box(state: &State, requested: Option<u64>) -> Result<i64, String> {
+    let sid = match requested {
+        Some(sid) => sid,
+        None => lock(state).selected.as_ref()
+            .and_then(|sid| sid.parse::<u64>().ok())
+            .ok_or("no box selected")?,
+    };
+    i64::try_from(sid).map_err(|_| "box id exceeds engine range".into())
 }
 
 fn flows_dir_for(box_id: i64) -> Option<std::path::PathBuf> {
@@ -2386,14 +2448,6 @@ fn legacy_u64(args: &[Value], index: usize) -> Option<u64> {
 
 fn legacy_path_arg(args: &[Value], index: usize) -> Option<crate::generated_wire::Path> {
     crate::wire::BoundedBytes::new(args.get(index)?.as_str()?.as_bytes().to_vec()).ok()
-}
-
-fn flow_args<'a>(state: &State, args: &'a [Value]) -> Option<(i64, &'a Value)> {
-    match args {
-        [value] => Some((selected_sid(state)?, value)),
-        [sid, value] => Some((sid.as_str()?.parse().ok()?, value)),
-        _ => None,
-    }
 }
 
 /// Unconditionally remove a box: drop it from the overlay, delete its sqlar +
@@ -4599,36 +4653,35 @@ macro_rules! ui_verbs {
                 _ => json!({"lines": [["err", "bad args"]], "job": Value::Null}),
             }
         }
-        // ── flows pane: tshark-decoded HTTP/TLS rows for one box's pcapng ──
-        // flows.list  [SID]              → {ok, flows: [row, ...]}
-        // flows.detail [SID, FRAME]      → {ok, text: "..."}
-        // SID may be omitted to mean the currently-selected box.
         "flows.list" => {
-            match arg_sid(args).or_else(|| selected_sid(state)) {
-                Some(id) => match flows_dir_for(id) {
-                    Some(dir) => match crate::net::flows::tshark_list(&dir) {
-                        Ok(rows) => json!({"ok": true,
-                            "flows": rows.iter().map(|r| r.to_json())
-                                .collect::<Vec<_>>()}),
-                        Err(e) => json!({"ok": false, "error": e}),
-                    },
-                    None => json!({"ok": false, "error": "no flows dir for box"}),
+            let sid = match args.first() {
+                None => None,
+                Some(_) => match legacy_u64(args, 0) {
+                    Some(sid) => Some(sid),
+                    None => return json!({"ok": false, "error": "invalid box id"}),
                 },
-                None => json!({"ok": false, "error": "no box selected"}),
-            }
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::FlowsList { sid },
+            ));
         }
         "flows.detail" => {
-            match flow_args(state, args)
-                    .and_then(|(id, frame)| frame.as_u64().map(|frame| (id, frame))) {
-                Some((id, frame)) if frame > 0 => match flows_dir_for(id) {
-                    Some(dir) => match crate::net::flows::tshark_detail(&dir, frame) {
-                        Ok(text) => json!({"ok": true, "text": text}),
-                        Err(e) => json!({"ok": false, "error": e}),
-                    },
-                    None => json!({"ok": false, "error": "no flows dir for box"}),
-                },
-                _ => json!({"ok": false, "error": "bad args"}),
-            }
+            let (sid, frame) = match args {
+                [frame] => (None, frame.as_u64()),
+                [sid, frame] => {
+                    let Some(sid) = sid.as_str().and_then(|sid| sid.parse().ok()) else {
+                        return json!({"ok": false, "error": "invalid box id"});
+                    };
+                    (Some(sid), frame.as_u64())
+                }
+                _ => (None, None),
+            };
+            let Some(frame) = frame else {
+                return json!({"ok": false, "error": "bad args"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::FlowsDetail { sid, frame },
+            ));
         }
         "prompts.peek" => {
             return legacy_ui_action_reply(dispatch_action(
@@ -4660,23 +4713,23 @@ macro_rules! ui_verbs {
                 crate::generated_wire::ActionRequest::PromptsUiActive { bool: active },
             ));
         }
-        // flows.packets [SID, STREAM] → every frame in `tcp.stream == STREAM`
-        // (i.e. the connection the user just drilled into from the flows
-        // list pane). Powers the packet-list view inside Pane::Packets.
         "flows.packets" => {
-            match flow_args(state, args)
-                    .and_then(|(id, stream)| stream.as_i64().map(|stream| (id, stream))) {
-                Some((id, stream)) if stream >= 0 => match flows_dir_for(id) {
-                    Some(dir) => match crate::net::flows::tshark_packets(&dir, stream) {
-                        Ok(rows) => json!({"ok": true,
-                            "packets": rows.iter().map(|r| r.to_json())
-                                .collect::<Vec<_>>()}),
-                        Err(e) => json!({"ok": false, "error": e}),
-                    },
-                    None => json!({"ok": false, "error": "no flows dir for box"}),
-                },
-                _ => json!({"ok": false, "error": "bad args"}),
-            }
+            let (sid, stream) = match args {
+                [stream] => (None, stream.as_u64()),
+                [sid, stream] => {
+                    let Some(sid) = sid.as_str().and_then(|sid| sid.parse().ok()) else {
+                        return json!({"ok": false, "error": "invalid box id"});
+                    };
+                    (Some(sid), stream.as_u64())
+                }
+                _ => (None, None),
+            };
+            let Some(stream) = stream else {
+                return json!({"ok": false, "error": "bad args"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::FlowsPackets { sid, stream },
+            ));
         }
         "struct_finish" => { match args.first().and_then(Value::as_i64) {
             Some(job) => crate::review::struct_finish(job),
@@ -6830,29 +6883,6 @@ mod verb_tests {
     }
 
     #[test]
-    fn flow_args_accept_optional_string_sid_and_numeric_value() {
-        let state: State = Default::default();
-        lock(&state).selected = Some("42".into());
-
-        let selected_args = [json!(34)];
-        let explicit_args = [json!("12"), json!(34)];
-        assert_eq!(flow_args(&state, &selected_args), Some((42, &json!(34))));
-        assert_eq!(flow_args(&state, &explicit_args), Some((12, &json!(34))));
-
-        for args in [
-            vec![],
-            vec![json!(12), json!(34)],
-            vec![json!("bad"), json!(34)],
-            vec![json!("12"), json!(34), json!(56)],
-        ] {
-            assert_eq!(flow_args(&state, &args), None, "accepted {args:?}");
-        }
-
-        let no_selection: State = Default::default();
-        assert_eq!(flow_args(&no_selection, &selected_args), None);
-    }
-
-    #[test]
     fn flow_handlers_accept_explicit_or_selected_sid() {
         let state: State = Default::default();
         lock(&state).selected = Some("42".into());
@@ -6861,7 +6891,7 @@ mod verb_tests {
         for (verb, value) in [("flows.detail", 1), ("flows.packets", 0)] {
             for args in [vec![json!(value)], vec![json!("42"), json!(value)]] {
                 let r = dispatch_ui_verb(&state, verb, &args, &boxes);
-                assert_eq!(r["r"]["error"], "no flows dir for box", "{verb} {args:?}");
+                assert_eq!(r["error"], "no flows dir for box", "{verb} {args:?}");
             }
             for args in [
                 vec![json!("42")],
@@ -6869,16 +6899,16 @@ mod verb_tests {
                 vec![json!("42"), json!("not numeric")],
             ] {
                 let r = dispatch_ui_verb(&state, verb, &args, &boxes);
-                assert_eq!(r["r"]["error"], "bad args", "{verb} {args:?}");
+                assert!(r.get("error").is_some(), "{verb} accepted {args:?}: {r}");
             }
         }
 
         assert_eq!(
-            dispatch_ui_verb(&state, "flows.detail", &[json!(0)], &boxes)["r"]["error"],
-            "bad args"
+            dispatch_ui_verb(&state, "flows.detail", &[json!(0)], &boxes)["error"],
+            "flow frame must be positive"
         );
         assert_eq!(
-            dispatch_ui_verb(&state, "flows.packets", &[json!(-1)], &boxes)["r"]["error"],
+            dispatch_ui_verb(&state, "flows.packets", &[json!(-1)], &boxes)["error"],
             "bad args"
         );
     }

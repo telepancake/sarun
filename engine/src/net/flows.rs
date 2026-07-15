@@ -75,7 +75,7 @@ impl FlowsLog {
 // ── tshark queries (sandboxed) ─────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
-pub struct FlowRow {
+struct FlowRow {
     pub frame: u64,
     pub t: f64,            // seconds since capture start
     pub src: String,
@@ -91,13 +91,28 @@ pub struct FlowRow {
 }
 
 impl FlowRow {
-    pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "frame": self.frame, "t": self.t,
-            "src": self.src, "dst": self.dst,
-            "sni": self.sni, "host": self.host,
-            "method": self.method, "uri": self.uri, "status": self.status,
-            "stream": self.stream,
+    fn into_typed(self) -> Result<crate::generated_wire::FlowRow, String> {
+        let short = |value: String| -> Result<
+            crate::wire::BoundedText<{ crate::generated_wire::LIMIT_SHORT_BYTES }>, String> {
+            crate::wire::BoundedText::new(value)
+                .map_err(|error| format!("flow short text exceeds relation bound: {error:?}"))
+        };
+        let text = |value: String| -> Result<
+            crate::wire::BoundedText<{ crate::generated_wire::LIMIT_TEXT_BYTES }>, String> {
+            crate::wire::BoundedText::new(value)
+                .map_err(|error| format!("flow text exceeds relation bound: {error:?}"))
+        };
+        Ok(crate::generated_wire::FlowRow {
+            frame: self.frame,
+            time: self.t,
+            source: short(self.src)?,
+            destination: short(self.dst)?,
+            sni: text(self.sni)?,
+            host: text(self.host)?,
+            method: short(self.method)?,
+            uri: text(self.uri)?,
+            status: short(self.status)?,
+            stream: (self.stream >= 0).then_some(self.stream as u64),
         })
     }
 }
@@ -105,7 +120,7 @@ impl FlowRow {
 /// One row per ethernet frame in a tcp.stream. Used by the
 /// packet-list drill-down in the flows pane.
 #[derive(Clone, Debug)]
-pub struct PacketRow {
+struct PacketRow {
     pub frame: u64,
     pub t: f64,
     pub src: String,
@@ -116,12 +131,22 @@ pub struct PacketRow {
 }
 
 impl PacketRow {
-    pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "frame": self.frame, "t": self.t,
-            "src": self.src, "dst": self.dst,
-            "proto": self.proto, "len": self.len,
-            "info": self.info,
+    fn into_typed(self) -> Result<crate::generated_wire::PacketRow, String> {
+        let short = |value: String| -> Result<
+            crate::wire::BoundedText<{ crate::generated_wire::LIMIT_SHORT_BYTES }>, String> {
+            crate::wire::BoundedText::new(value)
+                .map_err(|error| format!("packet short text exceeds relation bound: {error:?}"))
+        };
+        Ok(crate::generated_wire::PacketRow {
+            frame: self.frame,
+            time: self.t,
+            source: short(self.src)?,
+            destination: short(self.dst)?,
+            protocol: short(self.proto)?,
+            length: self.len,
+            summary: crate::wire::BoundedText::new(self.info)
+                .map_err(|error| format!(
+                    "packet summary exceeds relation bound: {error:?}"))?,
         })
     }
 }
@@ -268,7 +293,9 @@ fn parse_packet_rows(out: &str) -> Vec<PacketRow> {
 /// List interesting flows in the box's pcapng. "Interesting" = HTTP
 /// request/response rows + TLS ClientHello (so the user sees SNIs for
 /// connections that didn't decrypt for whatever reason).
-pub fn tshark_list(box_state_root: &Path) -> Result<Vec<FlowRow>, String> {
+pub fn tshark_list(
+    box_state_root: &Path,
+) -> Result<Vec<crate::generated_wire::FlowRow>, String> {
     let mut argv: Vec<&str> = vec![
         "tshark", "-r", "{pcap}",
         "-o", "tls.keylog_file:{keys}",
@@ -277,14 +304,14 @@ pub fn tshark_list(box_state_root: &Path) -> Result<Vec<FlowRow>, String> {
     ];
     for f in FLOW_FIELDS { argv.push("-e"); argv.push(f); }
     let out = run_tshark_in_box_sandbox(box_state_root, &argv)?;
-    Ok(parse_flow_rows(&out))
+    parse_flow_rows(&out).into_iter().map(FlowRow::into_typed).collect()
 }
 
 /// Every frame in `tcp.stream == STREAM` — i.e. the whole TCP connection
 /// the user clicked into. Powers the packet-list drill-down on the flows
 /// pane. Returns rows in time order (tshark already emits them ordered).
 pub fn tshark_packets(box_state_root: &Path, stream: i64)
-                      -> Result<Vec<PacketRow>, String> {
+                      -> Result<Vec<crate::generated_wire::PacketRow>, String> {
     let filter = format!("tcp.stream == {stream}");
     let mut argv: Vec<&str> = vec![
         "tshark", "-r", "{pcap}",
@@ -294,7 +321,7 @@ pub fn tshark_packets(box_state_root: &Path, stream: i64)
     ];
     for f in PACKET_FIELDS { argv.push("-e"); argv.push(f); }
     let out = run_tshark_in_box_sandbox(box_state_root, &argv)?;
-    Ok(parse_packet_rows(&out))
+    parse_packet_rows(&out).into_iter().map(PacketRow::into_typed).collect()
 }
 
 /// Verbose dissection of one frame: `tshark -V` filtered to that frame.
@@ -306,4 +333,27 @@ pub fn tshark_detail(box_state_root: &Path, frame: u64) -> Result<String, String
                 "-Y", &filter,
                 "-V"];
     run_tshark_in_box_sandbox(box_state_root, &argv)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tshark_rows_materialize_generated_bounded_view_types() {
+        let mut flows = parse_flow_rows(
+            "7\t1.5\t10.0.0.1\t10.0.0.2\texample.test\texample.test\tGET\t/a\t200\t3\n",
+        );
+        let flow = flows.remove(0).into_typed().unwrap();
+        assert_eq!((flow.frame, flow.time, flow.stream), (7, 1.5, Some(3)));
+        assert_eq!(flow.host.as_str(), "example.test");
+
+        let mut packets = parse_packet_rows(
+            "8\t1.75\t10.0.0.1\t10.0.0.2\tHTTP\t42\tGET /a\n",
+        );
+        let packet = packets.remove(0).into_typed().unwrap();
+        assert_eq!((packet.frame, packet.time, packet.length), (8, 1.75, 42));
+        assert_eq!(packet.protocol.as_str(), "HTTP");
+        assert_eq!(packet.summary.as_str(), "GET /a");
+    }
 }
