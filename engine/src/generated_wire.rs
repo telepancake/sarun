@@ -3,10 +3,11 @@
 // source-sha256 engine/pl/action_catalog.pl 5bbba46afdc1aedfe1be7217dd893baa3339bb0222ce459eab9644dec0273c57
 // source-sha256 engine/pl/action_grammar.pl 1f9f4f3bf2423a25b6476059c628328c8512fed3484de3f0cc844f22a2eb6635
 // source-sha256 engine/pl/grammar_engine.pl 89ba618a6a4714faea3a58eb8149b4c6f9fc490053fc574eca314b784c48f1e6
+// source-sha256 engine/pl/grammar_ir.pl aec41cb852a14f60e1caddbf6e8ef24b0dc91877d4062268bb115f857b337063
 // source-sha256 engine/pl/context_relation.pl cbf9d8788d006f18250dd45d07ce8664ec28e1fc997630b7a0ca717c2f8f3a0c
 // source-sha256 engine/pl/transport_catalog.pl 54563becea268fb763b7ffc091c055b5968563921953ec9001c41f36b712718f
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
-// source-sha256 scripts/wire_codegen.py 5bf570743e2169c25765a15ab5cfde7bdd98f7408a5ce803ee5fb8669df34d74
+// source-sha256 scripts/wire_codegen.py e91beec4b176d7067113151832cdb064ca30f72ea78853f56179646356d83af2
 
 use crate::prolog::RelationValue;
 use crate::wire::{

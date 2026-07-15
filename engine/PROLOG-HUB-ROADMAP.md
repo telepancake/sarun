@@ -167,6 +167,13 @@ not change the engine or Rust API. Representative translated fixtures—one
 precedence/conflict/external-token language fragment and one
 length/dispatch/checksum protocol fragment—are required architecture tests.
 
+Current IR checkpoint: `grammar_ir.pl` defines and closes the first grammar
+value vocabulary, and independent Tree-sitter-shaped and Wireshark-shaped
+fixtures validate as pure data. Undeclared rule references and undeclared
+primitive callbacks fail closed. This is schema validation, not yet execution:
+the next engine slice must interpret these values uniformly, after which the
+fixtures must be upgraded from validation tests to parse/render/tear tests.
+
 Immediate extraction order:
 
 - [x] Move relational sequence execution, tears, evidence, repetition, and

@@ -94,6 +94,8 @@ test-action-grammar: swipl ## Run the core-only action grammar tests with pinned
 	@shopt -s nullglob; \
 	  bins=( "$${XDG_CACHE_HOME:-$$HOME/.cache}"/sarun/swipl/9.2.9/pipeline-*/$$(uname -m)/native-swipl-build/src/swipl ); \
 	  (( $${#bins[@]} )) || { echo "pinned host swipl not found after make swipl"; exit 1; }; \
+	  "$${bins[-1]}" -q -f none -s engine/pl/test_grammar_ir.pl \
+	    -g test_grammar_ir:run_grammar_ir_tests -t halt; \
 	  "$${bins[-1]}" -q -f none -s engine/pl/test_grammar_engine.pl \
 	    -g test_grammar_engine:run_grammar_engine_tests -t halt; \
 	  "$${bins[-1]}" -q -f none -s engine/pl/test_action_grammar.pl \
