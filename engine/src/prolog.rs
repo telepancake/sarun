@@ -16,6 +16,8 @@ const LOAD_INFERENCES: i64 = 5_000_000;
 const MAX_INPUT_BYTES: usize = 16 * 1024;
 const MAX_ITEMS: usize = 256;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_RELATION_NODES: usize = 65_536;
+const MAX_RELATION_DEPTH: usize = 128;
 
 const PL_Q_NODEBUG: c_int = 0x0004;
 const PL_Q_CATCH_EXCEPTION: c_int = 0x0008;
@@ -26,6 +28,12 @@ const BUF_MALLOC: u32 = 0x0002_0000;
 const REP_UTF8: u32 = 0x0010_0000;
 const PL_CLEANUP_NO_CANCEL: c_int = 0x0002_0000;
 const PL_CLEANUP_SUCCESS: c_int = 1;
+const PL_ATOM_TYPE: c_int = 2;
+const PL_INTEGER_TYPE: c_int = 3;
+const PL_STRING_TYPE: c_int = 6;
+const PL_COMPOUND_TYPE: c_int = 7;
+const PL_NIL_TYPE: c_int = 8;
+const PL_LIST_PAIR_TYPE: c_int = 10;
 
 type Term = usize;
 type Query = usize;
@@ -40,6 +48,14 @@ unsafe extern "C" {
     fn PL_reset_term_refs(term: Term);
     fn PL_put_variable(term: Term) -> c_int;
     fn PL_put_int64(term: Term, value: i64) -> c_int;
+    fn PL_put_chars(term: Term, flags: c_int, len: usize, text: *const c_char) -> c_int;
+    fn PL_put_term(target: Term, source: Term) -> c_int;
+    fn PL_put_nil(term: Term) -> c_int;
+    fn PL_cons_list(list: Term, head: Term, tail: Term) -> c_int;
+    fn PL_new_atom_nchars(len: usize, text: *const c_char) -> usize;
+    fn PL_unregister_atom(atom: usize);
+    fn PL_new_functor_sz(atom: usize, arity: usize) -> usize;
+    fn PL_cons_functor_v(term: Term, functor: usize, arguments: Term) -> c_int;
     fn PL_put_term_from_chars(term: Term, flags: c_int, len: usize, text: *const c_char) -> c_int;
     fn PL_predicate(name: *const c_char, arity: c_int, module: *const c_char) -> Predicate;
     fn PL_open_query(module: Module, flags: c_int, predicate: Predicate, terms: Term) -> Query;
@@ -49,6 +65,12 @@ unsafe extern "C" {
     fn PL_exception(query: Query) -> Term;
     fn PL_clear_exception();
     fn PL_get_arg_sz(index: usize, term: Term, argument: Term) -> c_int;
+    fn PL_term_type(term: Term) -> c_int;
+    fn PL_get_int64(term: Term, value: *mut i64) -> c_int;
+    fn PL_get_name_arity_sz(term: Term, name: *mut usize, arity: *mut usize) -> c_int;
+    fn PL_atom_nchars(atom: usize, len: *mut usize) -> *const c_char;
+    fn PL_get_list(list: Term, head: Term, tail: Term) -> c_int;
+    fn PL_get_nil(list: Term) -> c_int;
     fn PL_get_nchars(term: Term, len: *mut usize, text: *mut *mut c_char, flags: u32) -> c_int;
     fn PL_free(memory: *mut c_void);
 }
@@ -143,6 +165,52 @@ pub enum RelationValue {
     Integer(i64),
     Compound(String, Vec<RelationValue>),
     List(Vec<RelationValue>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationBinding {
+    pub name: String,
+    pub value: RelationValue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelationLimits {
+    pub max_solutions: usize,
+    pub max_evidence: usize,
+    pub max_output_bytes: usize,
+}
+
+impl Default for RelationLimits {
+    fn default() -> Self {
+        Self {
+            max_solutions: 64,
+            max_evidence: 4096,
+            max_output_bytes: MAX_OUTPUT_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationRequest {
+    pub grammar: RelationValue,
+    pub given: Vec<RelationBinding>,
+    pub wanted: Vec<String>,
+    pub observations: Vec<RelationValue>,
+    pub limits: RelationLimits,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationSolution {
+    pub bindings: Vec<RelationBinding>,
+    pub preference: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationReply {
+    pub solutions: Vec<RelationSolution>,
+    pub context_queries: Vec<RelationValue>,
+    pub dependency_keys: Vec<RelationValue>,
+    pub diagnostics: Vec<RelationValue>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -345,6 +413,7 @@ impl Operation {
 
 enum Command {
     Application(Operation, String, Sender<Result<String, String>>),
+    Transform(RelationValue, Sender<Result<RelationValue, String>>),
     Shutdown(Sender<Result<(), String>>),
     #[cfg(test)]
     ExhaustInferenceLimit(Sender<Result<(), String>>),
@@ -432,6 +501,18 @@ impl Prolog {
         }
         let response = self.application(Operation::Parse, format!("request({items},{mode})"))?;
         decode_parse_response(&response)
+    }
+
+    pub fn transform(&self, request: &RelationRequest) -> Result<RelationReply, String> {
+        let request = encode_relation_request(request)?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.commands
+            .send(Command::Transform(request, reply_tx))
+            .map_err(|_| "Prolog worker has stopped".to_string())?;
+        let value = reply_rx
+            .recv()
+            .map_err(|_| "Prolog worker stopped before replying".to_string())??;
+        decode_relation_reply(value)
     }
 
     pub fn complete(
@@ -715,6 +796,9 @@ fn worker_main(
             Command::Application(operation, request, reply) => {
                 let _ = reply.send(runtime.application(operation, &request));
             }
+            Command::Transform(request, reply) => {
+                let _ = reply.send(runtime.transform(&request));
+            }
             Command::Shutdown(reply) => {
                 let result = runtime.cleanup();
                 let _ = reply.send(result.clone());
@@ -778,6 +862,7 @@ impl Runtime {
         let goal = format!(
             concat!(
                 "call_with_inference_limit((asserta(user:file_search_path(library,'res://library')),",
+                "load_files('res://app/relation_api.pl',[silent(true)]),",
                 "load_files('res://app/action_grammar.pl',[silent(true)]),",
                 "action_grammar:valid_transport_catalog,",
                 "action_grammar:valid_action_catalog),",
@@ -905,6 +990,63 @@ impl Runtime {
         }
     }
 
+    fn transform(&mut self, request: &RelationValue) -> Result<RelationValue, String> {
+        // SAFETY: the predicate and module are fixed. The generic request is
+        // recursively constructed as an FLI term; no Prolog source is parsed.
+        unsafe {
+            let terms = PL_new_term_refs(2);
+            if terms == 0 {
+                return Err("FLI term allocation failed for relation transform".into());
+            }
+            let mut put_budget = RelationTermBudget::default();
+            if put_relation_value(terms, request, 0, &mut put_budget) == 0
+                || PL_put_variable(terms + 1) == 0
+            {
+                PL_clear_exception();
+                PL_reset_term_refs(terms);
+                return Err("failed to construct relation transform terms".into());
+            }
+            let predicate = PL_predicate(c"transform".as_ptr(), 2, c"relation_api".as_ptr());
+            if predicate.is_null() {
+                PL_reset_term_refs(terms);
+                return Err("FLI relation predicate allocation failed".into());
+            }
+            let query = PL_open_query(
+                ptr::null_mut(),
+                PL_Q_NODEBUG | PL_Q_CATCH_EXCEPTION,
+                predicate,
+                terms,
+            );
+            if query == 0 {
+                PL_reset_term_refs(terms);
+                return Err("FLI relation query allocation failed".into());
+            }
+            let succeeded = PL_next_solution(query) != 0;
+            let exception = !succeeded && PL_exception(query) != 0;
+            let result = if succeeded {
+                let mut get_budget = RelationTermBudget::default();
+                get_relation_value(terms + 1, 0, &mut get_budget)
+            } else if exception {
+                Err("relation transform raised a Prolog exception".into())
+            } else {
+                Err("relation transform failed".into())
+            };
+            let closed = if succeeded {
+                PL_cut_query(query)
+            } else {
+                PL_close_query(query)
+            };
+            if exception || closed != 1 {
+                PL_clear_exception();
+            }
+            PL_reset_term_refs(terms);
+            if closed != 1 {
+                return Err("FLI relation query cleanup failed".into());
+            }
+            result
+        }
+    }
+
     unsafe fn extract_application_result(&mut self, terms: Term) -> Result<String, String> {
         let limit_result = unsafe { get_utf8(terms + 2, CVT_ATOM) }?;
         if limit_result == "inference_limit_exceeded" {
@@ -1010,6 +1152,215 @@ impl Drop for Runtime {
         if self.initialized && !self.cleanup_attempted && self.cleanup().is_err() {
             ACTIVE.store(POISONED, Ordering::Release);
         }
+    }
+}
+
+#[derive(Default)]
+struct RelationTermBudget {
+    nodes: usize,
+    bytes: usize,
+}
+
+impl RelationTermBudget {
+    fn enter(&mut self, depth: usize, bytes: usize) -> bool {
+        self.nodes = match self.nodes.checked_add(1) {
+            Some(nodes) => nodes,
+            None => return false,
+        };
+        self.bytes = match self.bytes.checked_add(bytes) {
+            Some(total) => total,
+            None => return false,
+        };
+        depth <= MAX_RELATION_DEPTH
+            && self.nodes <= MAX_RELATION_NODES
+            && self.bytes <= MAX_OUTPUT_BYTES
+    }
+}
+
+unsafe fn put_relation_value(
+    term: Term,
+    value: &RelationValue,
+    depth: usize,
+    budget: &mut RelationTermBudget,
+) -> c_int {
+    let own_bytes = match value {
+        RelationValue::Atom(value)
+        | RelationValue::String(value)
+        | RelationValue::Compound(value, _) => value.len(),
+        RelationValue::Integer(_) | RelationValue::List(_) => 0,
+    };
+    if !budget.enter(depth, own_bytes) {
+        return 0;
+    }
+    match value {
+        RelationValue::Atom(value) => unsafe {
+            PL_put_chars(
+                term,
+                PL_ATOM_TYPE | REP_UTF8 as c_int,
+                value.len(),
+                value.as_ptr().cast(),
+            )
+        },
+        RelationValue::String(value) => unsafe {
+            PL_put_chars(
+                term,
+                PL_STRING_TYPE | REP_UTF8 as c_int,
+                value.len(),
+                value.as_ptr().cast(),
+            )
+        },
+        RelationValue::Integer(value) => unsafe { PL_put_int64(term, *value) },
+        RelationValue::Compound(name, arguments) => unsafe {
+            if checked_atom(name).is_none() || arguments.is_empty() || arguments.len() > MAX_ITEMS {
+                return 0;
+            }
+            let argument_terms = PL_new_term_refs(arguments.len());
+            if argument_terms == 0 {
+                return 0;
+            }
+            for (index, argument) in arguments.iter().enumerate() {
+                if put_relation_value(argument_terms + index, argument, depth + 1, budget) == 0 {
+                    PL_reset_term_refs(argument_terms);
+                    return 0;
+                }
+            }
+            let atom = PL_new_atom_nchars(name.len(), name.as_ptr().cast());
+            if atom == 0 {
+                PL_reset_term_refs(argument_terms);
+                return 0;
+            }
+            let functor = PL_new_functor_sz(atom, arguments.len());
+            PL_unregister_atom(atom);
+            let result = if functor == 0 {
+                0
+            } else {
+                PL_cons_functor_v(term, functor, argument_terms)
+            };
+            PL_reset_term_refs(argument_terms);
+            result
+        },
+        RelationValue::List(values) => unsafe {
+            if values.len() > MAX_RELATION_NODES || PL_put_nil(term) == 0 {
+                return 0;
+            }
+            let temporary = PL_new_term_refs(2);
+            if temporary == 0 {
+                return 0;
+            }
+            for value in values.iter().rev() {
+                if put_relation_value(temporary, value, depth + 1, budget) == 0
+                    || PL_put_term(temporary + 1, term) == 0
+                    || PL_cons_list(term, temporary, temporary + 1) == 0
+                {
+                    PL_reset_term_refs(temporary);
+                    return 0;
+                }
+            }
+            PL_reset_term_refs(temporary);
+            1
+        },
+    }
+}
+
+unsafe fn get_relation_value(
+    term: Term,
+    depth: usize,
+    budget: &mut RelationTermBudget,
+) -> Result<RelationValue, String> {
+    let kind = unsafe { PL_term_type(term) };
+    match kind {
+        PL_ATOM_TYPE => {
+            let value = unsafe { get_utf8(term, CVT_ATOM) }?;
+            if !budget.enter(depth, value.len()) {
+                return Err("relation reply exceeds structural bounds".into());
+            }
+            Ok(RelationValue::Atom(value))
+        }
+        PL_STRING_TYPE => {
+            let value = unsafe { get_utf8(term, CVT_STRING) }?;
+            if !budget.enter(depth, value.len()) {
+                return Err("relation reply exceeds structural bounds".into());
+            }
+            Ok(RelationValue::String(value))
+        }
+        PL_INTEGER_TYPE => {
+            if !budget.enter(depth, 0) {
+                return Err("relation reply exceeds structural bounds".into());
+            }
+            let mut value = 0i64;
+            if unsafe { PL_get_int64(term, &mut value) } == 0 {
+                return Err("invalid integer in relation reply".into());
+            }
+            Ok(RelationValue::Integer(value))
+        }
+        PL_NIL_TYPE => {
+            if !budget.enter(depth, 0) || unsafe { PL_get_nil(term) } == 0 {
+                return Err("invalid empty list in relation reply".into());
+            }
+            Ok(RelationValue::List(Vec::new()))
+        }
+        PL_LIST_PAIR_TYPE => unsafe {
+            if !budget.enter(depth, 0) {
+                return Err("relation reply exceeds structural bounds".into());
+            }
+            let temporary = PL_new_term_refs(2);
+            if temporary == 0 || PL_put_term(temporary + 1, term) == 0 {
+                return Err("FLI list traversal allocation failed".into());
+            }
+            let mut values = Vec::new();
+            while PL_term_type(temporary + 1) == PL_LIST_PAIR_TYPE {
+                if values.len() >= MAX_RELATION_NODES
+                    || PL_get_list(temporary + 1, temporary, temporary + 1) == 0
+                {
+                    PL_reset_term_refs(temporary);
+                    return Err("invalid or oversized list in relation reply".into());
+                }
+                values.push(get_relation_value(temporary, depth + 1, budget)?);
+            }
+            if PL_get_nil(temporary + 1) == 0 {
+                PL_reset_term_refs(temporary);
+                return Err("improper list in relation reply".into());
+            }
+            PL_reset_term_refs(temporary);
+            Ok(RelationValue::List(values))
+        },
+        PL_COMPOUND_TYPE => unsafe {
+            let mut atom = 0usize;
+            let mut arity = 0usize;
+            if PL_get_name_arity_sz(term, &mut atom, &mut arity) == 0
+                || arity == 0
+                || arity > MAX_ITEMS
+            {
+                return Err("invalid compound in relation reply".into());
+            }
+            let mut name_len = 0usize;
+            let name_pointer = PL_atom_nchars(atom, &mut name_len);
+            if name_pointer.is_null() {
+                return Err("invalid functor name in relation reply".into());
+            }
+            let name_bytes = std::slice::from_raw_parts(name_pointer.cast::<u8>(), name_len);
+            let name = std::str::from_utf8(name_bytes)
+                .map_err(|_| "non-UTF-8 functor in relation reply")?
+                .to_string();
+            if checked_atom(&name).is_none() || !budget.enter(depth, name.len()) {
+                return Err("relation reply functor exceeds bounds".into());
+            }
+            let argument = PL_new_term_refs(1);
+            if argument == 0 {
+                return Err("FLI compound traversal allocation failed".into());
+            }
+            let mut arguments = Vec::with_capacity(arity);
+            for index in 1..=arity {
+                if PL_get_arg_sz(index, term, argument) == 0 {
+                    PL_reset_term_refs(argument);
+                    return Err("invalid compound argument in relation reply".into());
+                }
+                arguments.push(get_relation_value(argument, depth + 1, budget)?);
+            }
+            PL_reset_term_refs(argument);
+            Ok(RelationValue::Compound(name, arguments))
+        },
+        _ => Err("unsupported value type in relation reply".into()),
     }
 }
 
@@ -1226,6 +1577,142 @@ fn encode_relation_value(value: &RelationValue) -> Result<String, String> {
                 .collect::<Result<Vec<_>, _>>()?
                 .join(",")
         ),
+    })
+}
+
+fn relation_compound(name: &str, arguments: Vec<RelationValue>) -> RelationValue {
+    RelationValue::Compound(name.to_string(), arguments)
+}
+
+fn relation_list(values: impl IntoIterator<Item = RelationValue>) -> RelationValue {
+    RelationValue::List(values.into_iter().collect())
+}
+
+fn encode_relation_binding(binding: &RelationBinding) -> Result<RelationValue, String> {
+    let name = checked_atom(&binding.name).ok_or("invalid relation binding name")?;
+    Ok(relation_compound(
+        "binding",
+        vec![RelationValue::Atom(name.to_string()), binding.value.clone()],
+    ))
+}
+
+fn bounded_relation_integer(value: usize, field: &str) -> Result<RelationValue, String> {
+    i64::try_from(value)
+        .map(RelationValue::Integer)
+        .map_err(|_| format!("relation {field} exceeds signed 64-bit range"))
+}
+
+fn encode_relation_request(request: &RelationRequest) -> Result<RelationValue, String> {
+    if request.given.len() > MAX_ITEMS
+        || request.wanted.len() > MAX_ITEMS
+        || request.observations.len() > MAX_ITEMS
+    {
+        return Err(format!(
+            "relation request exceeds {MAX_ITEMS} envelope items"
+        ));
+    }
+    let given = request
+        .given
+        .iter()
+        .map(encode_relation_binding)
+        .collect::<Result<Vec<_>, _>>()?;
+    let wanted = request
+        .wanted
+        .iter()
+        .map(|name| {
+            checked_atom(name)
+                .map(|name| RelationValue::Atom(name.to_string()))
+                .ok_or_else(|| "invalid wanted relation binding name".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(relation_compound(
+        "request",
+        vec![
+            request.grammar.clone(),
+            relation_compound("given", vec![relation_list(given)]),
+            relation_compound("want", vec![relation_list(wanted)]),
+            relation_compound(
+                "observations",
+                vec![relation_list(request.observations.clone())],
+            ),
+            relation_compound(
+                "limits",
+                vec![
+                    bounded_relation_integer(request.limits.max_solutions, "solution limit")?,
+                    bounded_relation_integer(request.limits.max_evidence, "evidence limit")?,
+                    bounded_relation_integer(request.limits.max_output_bytes, "output limit")?,
+                ],
+            ),
+        ],
+    ))
+}
+
+fn take_relation_compound(
+    value: RelationValue,
+    expected: &str,
+    arity: usize,
+) -> Result<Vec<RelationValue>, String> {
+    match value {
+        RelationValue::Compound(name, arguments)
+            if name == expected && arguments.len() == arity =>
+        {
+            Ok(arguments)
+        }
+        _ => Err(format!("invalid {expected}/{arity} in relation reply")),
+    }
+}
+
+fn take_relation_list(
+    value: RelationValue,
+    description: &str,
+) -> Result<Vec<RelationValue>, String> {
+    match value {
+        RelationValue::List(values) => Ok(values),
+        _ => Err(format!("expected {description} list in relation reply")),
+    }
+}
+
+fn decode_relation_binding_value(value: RelationValue) -> Result<RelationBinding, String> {
+    let mut arguments = take_relation_compound(value, "binding", 2)?;
+    let value = arguments.pop().unwrap();
+    let name = match arguments.pop().unwrap() {
+        RelationValue::Atom(name) if checked_atom(&name).is_some() => name,
+        _ => return Err("invalid binding name in relation reply".into()),
+    };
+    Ok(RelationBinding { name, value })
+}
+
+fn decode_relation_solution(value: RelationValue) -> Result<RelationSolution, String> {
+    let mut arguments = take_relation_compound(value, "solution", 2)?;
+    let preference = match arguments.pop().unwrap() {
+        RelationValue::Integer(value) => value,
+        _ => return Err("invalid solution preference in relation reply".into()),
+    };
+    let bindings = take_relation_list(arguments.pop().unwrap(), "binding")?
+        .into_iter()
+        .map(decode_relation_binding_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RelationSolution {
+        bindings,
+        preference,
+    })
+}
+
+fn decode_relation_reply(value: RelationValue) -> Result<RelationReply, String> {
+    let arguments = take_relation_compound(value, "reply", 4)?;
+    let mut fields = arguments.into_iter();
+    let solutions = take_relation_list(fields.next().unwrap(), "solution")?
+        .into_iter()
+        .map(decode_relation_solution)
+        .collect::<Result<Vec<_>, _>>()?;
+    let context_queries = take_relation_list(fields.next().unwrap(), "context query")?;
+    let dependency_keys = take_relation_list(fields.next().unwrap(), "dependency key")?;
+    let diagnostics = take_relation_list(fields.next().unwrap(), "diagnostic")?;
+    Ok(RelationReply {
+        solutions,
+        context_queries,
+        dependency_keys,
+        diagnostics,
     })
 }
 
@@ -2199,6 +2686,134 @@ mod tests {
         }
     }
 
+    fn rv_atom(value: &str) -> RelationValue {
+        RelationValue::Atom(value.into())
+    }
+
+    fn rv_string(value: &str) -> RelationValue {
+        RelationValue::String(value.into())
+    }
+
+    fn rv_integer(value: i64) -> RelationValue {
+        RelationValue::Integer(value)
+    }
+
+    fn rv_compound(name: &str, arguments: Vec<RelationValue>) -> RelationValue {
+        RelationValue::Compound(name.into(), arguments)
+    }
+
+    fn rv_list(values: Vec<RelationValue>) -> RelationValue {
+        RelationValue::List(values)
+    }
+
+    #[test]
+    fn generic_transform_crosses_structured_fli_in_both_directions() {
+        let literal = rv_compound(
+            "literal",
+            vec![
+                rv_atom("greeting"),
+                rv_string("hello"),
+                rv_atom("keyword"),
+                rv_atom("greeting"),
+                rv_integer(20),
+            ],
+        );
+        let argument = rv_compound(
+            "argument",
+            vec![rv_compound(
+                "arg",
+                vec![
+                    rv_atom("name"),
+                    rv_atom("word"),
+                    rv_atom("required"),
+                    rv_atom("scalar"),
+                ],
+            )],
+        );
+        let terminal = rv_compound(
+            "terminal",
+            vec![
+                rv_atom("word"),
+                rv_atom("identifier"),
+                rv_list(vec![rv_compound(
+                    "surface",
+                    vec![
+                        rv_compound("word", vec![rv_string("world")]),
+                        rv_string("world"),
+                    ],
+                )]),
+            ],
+        );
+        let grammar = rv_compound(
+            "sequence_grammar",
+            vec![
+                rv_list(vec![literal, argument]),
+                rv_compound("terminals", vec![rv_list(vec![terminal])]),
+                rv_compound("separator", vec![rv_string(" ")]),
+            ],
+        );
+        let span = |start, end| rv_compound("span", vec![rv_integer(start), rv_integer(end)]);
+        let unit = |surface: &str, start, end| {
+            rv_compound(
+                "unit",
+                vec![
+                    rv_atom("ignored"),
+                    span(start, end),
+                    rv_list(vec![span(start, end)]),
+                    rv_string(surface),
+                    rv_atom("source"),
+                    rv_atom("foreign_source"),
+                    rv_integer(3),
+                    rv_atom("foreign_test"),
+                ],
+            )
+        };
+        let source = rv_compound(
+            "source",
+            vec![
+                rv_list(vec![
+                    unit("hello", 0, 5),
+                    unit("world", 6, 11),
+                    rv_compound("end", vec![rv_integer(11)]),
+                ]),
+                rv_atom("exact"),
+            ],
+        );
+        let prolog = global().unwrap();
+        let parsed = prolog
+            .transform(&RelationRequest {
+                grammar: grammar.clone(),
+                given: vec![RelationBinding {
+                    name: "source".into(),
+                    value: source,
+                }],
+                wanted: vec!["arguments".into(), "status".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.solutions.len(), 1);
+        assert_eq!(parsed.solutions[0].bindings[1].value, rv_atom("complete"));
+        let arguments = parsed.solutions[0].bindings[0].value.clone();
+        let rendered = prolog
+            .transform(&RelationRequest {
+                grammar,
+                given: vec![RelationBinding {
+                    name: "arguments".into(),
+                    value: arguments,
+                }],
+                wanted: vec!["source".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert_eq!(
+            rendered.solutions[0].bindings[0].value,
+            rv_string("hello world")
+        );
+    }
+
     #[test]
     fn typed_application_is_embedded_bounded_and_closed() {
         let prolog = global().unwrap();
@@ -2208,24 +2823,15 @@ mod tests {
         };
         assert!(duplicate.contains("already active"));
         assert_eq!(
-            prolog
-                .render(&command("mirror_jobs", None))
-                .unwrap()
-                .text,
+            prolog.render(&command("mirror_jobs", None)).unwrap().text,
             "mirror jobs",
         );
         assert_eq!(
-            prolog
-                .render(&command("mirror_run", Some(7)))
-                .unwrap()
-                .text,
+            prolog.render(&command("mirror_run", Some(7))).unwrap().text,
             "mirror run 7",
         );
         assert_eq!(
-            prolog
-                .render(&command("kill", Some(5)))
-                .unwrap()
-                .text,
+            prolog.render(&command("kill", Some(5))).unwrap().text,
             "kill 5",
         );
         assert_eq!(
@@ -2298,10 +2904,7 @@ mod tests {
         ));
         prolog.exhaust_inference_limit().unwrap();
         assert_eq!(
-            prolog
-                .render(&command("mirror_rm", Some(11)))
-                .unwrap()
-                .text,
+            prolog.render(&command("mirror_rm", Some(11))).unwrap().text,
             "mirror rm 11",
         );
     }
@@ -2597,8 +3200,7 @@ mod tests {
         let filtered = global().unwrap().ui_action_help_matching("mirror").unwrap();
         assert!(filtered.len() >= 5);
         assert!(filtered.iter().all(|row| {
-            row.verb.as_str().contains("mirror")
-                || row.description.as_str().contains("mirror")
+            row.verb.as_str().contains("mirror") || row.description.as_str().contains("mirror")
         }));
     }
 }

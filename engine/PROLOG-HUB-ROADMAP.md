@@ -219,6 +219,15 @@ notation work resumes:
 - dependency tests enforce engine -> no grammar/client imports, grammar -> no
   engine traversal callbacks, and client -> no grammar-AST inspection.
 
+Concrete boundary checkpoint: `relation_api:transform/2` now executes a
+foreign immutable sequence grammar in both directions with the same envelope.
+Rust has generic `RelationRequest`/`RelationReply` values and recursively
+constructs/decodes SWI terms through the FLI on this path, so no textual Prolog
+request or operation atom crosses it. The old action-specific `Operation` and
+`application/3` path still exists for sarun and must be migrated and deleted;
+request limits other than the fixed inference guard are validated but not all
+are enforced during enumeration yet.
+
 Two portability tests constrain the grammar IR before it is considered
 generic:
 

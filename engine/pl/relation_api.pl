@@ -4,7 +4,15 @@
 
 /** <module> Single bounded grammar-engine boundary */
 
-transform(
+transform(Request, Reply) :-
+    call_with_inference_limit(transform_request(Request, Candidate), 100000,
+                              LimitResult),
+    ( LimitResult == inference_limit_exceeded
+    -> Reply = reply([], [], [], [diagnostic(inference_limit_exceeded)])
+    ;  Reply = Candidate
+    ).
+
+transform_request(
     request(Grammar, given(Given), want(Wanted), observations(Observations),
             Limits),
     Reply) :-
@@ -14,7 +22,7 @@ transform(
     -> true
     ;  Reply = reply([], [], [], [diagnostic(no_solution)])
     ).
-transform(_, reply([], [], [], [diagnostic(invalid_request)])).
+transform_request(_, reply([], [], [], [diagnostic(invalid_request)])).
 
 valid_envelope(Given, Wanted, Observations,
                limits(MaxSolutions, MaxEvidence, MaxOutputBytes)) :-
