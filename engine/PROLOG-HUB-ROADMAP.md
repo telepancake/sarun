@@ -85,6 +85,33 @@ must not classify action literals or argument semantics. Prolog turns neutral
 source evidence into semantic evidence. This preserves exact UTF-8 spans while
 keeping syntax knowledge in the hub.
 
+## External semantic context
+
+Object-bearing grammars need query-scoped context: box identities and aliases,
+paths visible in a particular box, mirror names, process rows, rule names, and
+similar live domains. The current command grammar has no such context access;
+it validates argument shape and primitive type only. `KnownUnit` has provider
+fields, but the command relation deliberately ignores their incoming semantic
+classification, and completion currently proposes literals only.
+
+Add context without putting I/O or a second semantic parser in Rust:
+
+1. The relation derives bounded provider requests from the partial parse, such
+   as `boxes(Prefix)` or `box_paths(BoxIdentity, Prefix)`. Requests may depend
+   on preceding relationally parsed arguments.
+2. Rust implements only the provider transport against engine state, sockets,
+   or filesystem snapshots and returns revision-tagged, typed facts. It does
+   not decide which argument accepts which domain or how names normalize.
+3. The same Prolog relation joins source surfaces with those facts for exact
+   resolution, ambiguity reporting, syntax evidence, descriptions, and prefix
+   completion.
+4. Parse/completion responses carry provider and revision provenance so stale
+   choices can be rejected or refreshed before execution.
+
+Prefer this explicit request/fact envelope over foreign-predicate callbacks:
+it keeps the Prolog worker bounded and deterministic, avoids reentrant Rust/I/O
+calls from SWI, and makes contextual parsing independently testable.
+
 ## Complete UI action inventory
 
 The migration must cover all 97 names emitted by `control::ui_verbs!`, not just
@@ -147,6 +174,8 @@ belong to the relation.
       worker thread, inference limits, exception handling, and cleanup tests.
 - [ ] Add catalog/representation query decoding for help, bindings, menus, and
       conversions.
+- [ ] Add generic bounded context-request and typed context-fact envelopes,
+      including provider identity and snapshot revision.
 
 ### 3. Complete Prolog action relation
 
@@ -164,6 +193,8 @@ belong to the relation.
       menu, help/description, and syntax.
 - [ ] Add invariants proving unique public identities, valid handlers/targets,
       schema/form agreement, and complete handler coverage.
+- [ ] Add contextual argument domains, dependent provider requests, exact/alias
+      resolution, ambiguity results, and contextual completions.
 
 ### 4. Mandatory Rust integration
 
@@ -211,6 +242,8 @@ belong to the relation.
 - [ ] Numeric-looking strings, paths, base64, and specs remain strings.
 - [ ] Optional and repeated arguments preserve exact wire array shape.
 - [ ] Completion supports partial tokens and mid-token UTF-8 byte spans.
+- [ ] Box/object/path completion is derived from revision-tagged context facts;
+      dependent domains such as box paths use earlier parsed identities.
 - [ ] Highlighting is derived only from successful grammar evidence.
 - [ ] Help/menu/key projections exactly cover intended visible actions.
 - [ ] Every relation handler resolves to a real Rust execution handler, and
