@@ -15,7 +15,6 @@ use std::path::PathBuf;
 
 use crate::hostfs;
 
-use base64::Engine;
 use rusqlite::Connection;
 use rusqlite::OpenFlags;
 use rusqlite::params;
@@ -96,78 +95,104 @@ fn lower_bytes(rel: &str) -> Vec<u8> {
     }
 }
 
-fn b64(b: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(b)
-}
-
 pub fn current_mode(id: i64, rel: &str) -> Option<u32> {
     let conn = open_ro(id)?;
     crate::depot::archive_mode(&conn, rel)
 }
 
-pub fn hunks(id: i64, rel: &str) -> Value {
+fn diff_line(style: &str, text: impl Into<String>)
+    -> Result<crate::generated_wire::DiffLine, String>
+{
+    Ok(crate::generated_wire::DiffLine {
+        style: crate::wire::BoundedText::new(style.to_owned())
+            .map_err(|error| format!("diff style exceeds relation bound: {error:?}"))?,
+        text: crate::wire::BoundedText::new(text.into())
+            .map_err(|error| format!("diff line exceeds relation bound: {error:?}"))?,
+    })
+}
+
+pub fn hunks_typed(id: i64, rel: &str)
+    -> Result<crate::generated_wire::FileDiff, String>
+{
+    use crate::generated_wire::{ChangeKind, DiffHunk, FileDiff};
     let rel = rel.trim_start_matches('/');
     let Some(mode) = current_mode(id, rel) else {
-        return json!({"is_text": false, "hunks": [],
-                      "diff": {"kind": "error", "error": "gone"}});
+        return Ok(FileDiff::Unavailable {
+            message: crate::wire::BoundedText::new("gone".to_owned())
+                .map_err(|error| format!("diff error exceeds relation bound: {error:?}"))?,
+        });
     };
     if mode & S_IFMT == S_IFCHR {
-        return json!({"is_text": false, "hunks": [], "diff": {"kind": "deleted"}});
+        return Ok(FileDiff::Deleted);
     }
     let host = Path::new("/").join(rel);
     if mode & S_IFMT == S_IFLNK {
-        let tgt = current_bytes(id, rel).unwrap_or_default();
-        let kind = if host.symlink_metadata().map(|m| m.file_type().is_symlink())
-            .unwrap_or(false) { "modified" } else { "created" };
-        return json!({"is_text": false, "hunks": [],
-            "diff": {"kind": kind,
-                     "diff": format!("symlink → {}", String::from_utf8_lossy(&tgt))}});
+        let target = crate::wire::BoundedBytes::new(current_bytes(id, rel).unwrap_or_default())
+            .map_err(|error| format!("symlink target exceeds relation bound: {error:?}"))?;
+        let kind = if host.symlink_metadata().is_ok() {
+            ChangeKind::Modified
+        } else {
+            ChangeKind::Created
+        };
+        return Ok(FileDiff::Symlink { kind, target });
     }
     let cur = current_bytes(id, rel).unwrap_or_default();
     let low = lower_bytes(rel);
-    let text = !cur.contains(&0) && !low.contains(&0);
+    let text = !cur.contains(&0) && !low.contains(&0)
+        && std::str::from_utf8(&cur).is_ok() && std::str::from_utf8(&low).is_ok();
     if !text {
-        let kind = if host.exists() { "modified" } else { "created" };
-        let mut d = json!({"kind": kind, "content": b64(&cur)});
-        if kind == "modified" && !low.is_empty() {
-            d["content_before"] = json!(b64(&low));
-        }
-        return json!({"is_text": false, "hunks": [], "diff": d});
+        let modified = host.exists();
+        let kind = if modified { ChangeKind::Modified } else { ChangeKind::Created };
+        let content = crate::wire::BoundedBytes::new(cur)
+            .map_err(|error| format!("binary diff content exceeds relation bound: {error:?}"))?;
+        let content_before = if modified && !low.is_empty() {
+            Some(crate::wire::BoundedBytes::new(low).map_err(|error| format!(
+                "binary base content exceeds relation bound: {error:?}"))?)
+        } else {
+            None
+        };
+        return Ok(FileDiff::Binary { kind, content, content_before });
     }
     // text: grouped unified diff, lines tagged like _build_hunks_display.
-    let lo = String::from_utf8_lossy(&low).into_owned();
-    let cu = String::from_utf8_lossy(&cur).into_owned();
+    let lo = String::from_utf8(low).map_err(|_| "invalid UTF-8 base diff")?;
+    let cu = String::from_utf8(cur).map_err(|_| "invalid UTF-8 current diff")?;
     let diff = TextDiff::from_lines(&lo, &cu);
     let ll: Vec<&str> = diff.iter_old_slices().map(|s| s.trim_end_matches(['\r', '\n'])).collect();
     let ul: Vec<&str> = diff.iter_new_slices().map(|s| s.trim_end_matches(['\r', '\n'])).collect();
-    let mut hunks = vec![];
+    let mut hunks = Vec::new();
     for (gi, group) in diff.grouped_ops(3).iter().enumerate() {
         if group.is_empty() { continue; }
         let (_, a0, _) = group[0].as_tag_tuple();
         let (_, alast, blast) = group[group.len() - 1].as_tag_tuple();
         let (_, _, b0) = group[0].as_tag_tuple();
-        let mut lines = vec![json!(["hdr",
+        let mut lines = vec![diff_line("hdr",
             format!("@@ -{},{} +{},{} @@", a0.start + 1, alast.end - a0.start,
-                    b0.start + 1, blast.end - b0.start)])];
+                    b0.start + 1, blast.end - b0.start))?];
         for op in group {
             let (tag, orange, nrange) = op.as_tag_tuple();
             match tag {
-                DiffTag::Equal => for k in orange { lines.push(json!([" ", ll[k]])); },
+                DiffTag::Equal => for k in orange { lines.push(diff_line(" ", ll[k])?); },
                 _ => {
-                    for k in orange { lines.push(json!(["-", ll[k]])); }
-                    for k in nrange { lines.push(json!(["+", ul[k]])); }
+                    for k in orange { lines.push(diff_line("-", ll[k])?); }
+                    for k in nrange { lines.push(diff_line("+", ul[k])?); }
                 }
             }
         }
-        hunks.push(json!({"index": gi, "lines": lines}));
+        hunks.push(DiffHunk {
+            index: u32::try_from(gi).map_err(|_| "diff hunk index exceeds u32")?,
+            lines: crate::wire::BoundedVec::new(lines)
+                .map_err(|error| format!("diff lines exceed relation bound: {error:?}"))?,
+        });
     }
-    json!({"is_text": true, "hunks": hunks})
+    Ok(FileDiff::Text {
+        hunks: crate::wire::BoundedVec::new(hunks)
+            .map_err(|error| format!("diff hunks exceed relation bound: {error:?}"))?,
+    })
 }
 
 /// Current content of one box path as the box sees it: the captured write
 /// when `rel` is in the change set, else the host file underneath. Feeds
-/// the UI's document reader ('V' on Changes); base64 because the socket
-/// protocol is JSON. Fails loudly ({ok:false, error}) for tombstones,
+/// the UI's document reader ('V' on Changes). Fails loudly for tombstones,
 /// symlinks, and paths that exist nowhere.
 pub fn file_bytes_typed(id: i64, rel: &str) -> Result<Vec<u8>, String> {
     let rel = rel.trim_start_matches('/');
@@ -297,8 +322,10 @@ pub fn current_mtime(id: i64, rel: &str) -> Option<i64> {
 /// Decorate a batch of paths in one go (one RPC, one server-side host stat
 /// loop). Used by the UI to decorate a window of changes-pane rows without
 /// paying a round-trip per row.
-pub fn decorate_many(id: i64, rels: &[&str]) -> Value {
-    Value::Array(rels.iter().map(|r| decorate(id, r)).collect())
+pub fn decorate_many_typed(id: i64, rels: &[&str])
+    -> Result<Vec<crate::generated_wire::ChangeDecoration>, String>
+{
+    rels.iter().map(|rel| decorate_typed(id, rel)).collect()
 }
 
 /// Newest-first slice of the box's change set — the source feed for a live
@@ -683,14 +710,21 @@ fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
         [name], |_| Ok(())).is_ok()
 }
 
-pub fn decorate(id: i64, rel: &str) -> Value {
+pub fn decorate_typed(id: i64, rel: &str)
+    -> Result<crate::generated_wire::ChangeDecoration, String>
+{
+    use crate::generated_wire::{ChangeDecoration, ChangeKind};
     let rel = rel.trim_start_matches('/');
     let Some(mode) = current_mode(id, rel) else {
-        return json!({"is_text": false, "stale": false, "kind": "changed"});
+        return Ok(ChangeDecoration {
+            is_text: false, stale: false, kind: ChangeKind::Changed,
+        });
     };
     let host = Path::new("/").join(rel);
     if mode & S_IFMT == S_IFCHR {
-        return json!({"is_text": false, "stale": false, "kind": "deleted"});
+        return Ok(ChangeDecoration {
+            is_text: false, stale: false, kind: ChangeKind::Deleted,
+        });
     }
     // is_text: both base and current NUL-free, and not a symlink/tombstone.
     let is_text = if mode & S_IFMT == S_IFLNK {
@@ -703,7 +737,7 @@ pub fn decorate(id: i64, rel: &str) -> Value {
     };
     let hstat = host.symlink_metadata();
     let exists = hstat.is_ok();
-    let kind = if exists { "modified" } else { "created" };
+    let kind = if exists { ChangeKind::Modified } else { ChangeKind::Created };
     let mut stale = false;
     if let Ok(md) = &hstat {
         if let Some(cm) = current_mtime(id, rel) {
@@ -712,7 +746,7 @@ pub fn decorate(id: i64, rel: &str) -> Value {
             stale = host_ns > cm;
         }
     }
-    json!({"is_text": is_text, "stale": stale, "kind": kind})
+    Ok(ChangeDecoration { is_text, stale, kind })
 }
 
 // ── host-mutating review actions (top-level boxes; nested promotion deferred) ──
@@ -1773,24 +1807,39 @@ pub fn patch_text(id: i64) -> Vec<u8> {
     let changes = session_changes_typed(id).unwrap_or_default();
     for change in changes {
         let rel = std::str::from_utf8(change.path.as_slice()).unwrap_or("");
-        let h = hunks(id, rel);
-        if h.get("is_text").and_then(Value::as_bool) == Some(true) {
-            out.push_str(&format!("--- a/{rel}\n+++ b/{rel}\n"));
-            for hk in h.get("hunks").and_then(Value::as_array).unwrap_or(&vec![]) {
-                for line in hk.get("lines").and_then(Value::as_array)
-                    .unwrap_or(&vec![]) {
-                    if let Some(pair) = line.as_array() {
-                        let tag = pair[0].as_str().unwrap_or(" ");
-                        let txt = pair[1].as_str().unwrap_or("");
-                        let pre = if tag == "hdr" { "" } else { tag };
-                        out.push_str(&format!("{pre}{txt}\n"));
+        out.push_str(&format!("--- a/{rel}\n+++ b/{rel}\n"));
+        let diff = match hunks_typed(id, rel) {
+            Ok(diff) => diff,
+            Err(error) => {
+                out.push_str(&format!("# error: {error}\n"));
+                continue;
+            }
+        };
+        match diff {
+            crate::generated_wire::FileDiff::Text { hunks } => {
+                for hunk in hunks.into_inner() {
+                    for line in hunk.lines.into_inner() {
+                        let style = line.style.as_str();
+                        let prefix = if style == "hdr" { "" } else { style };
+                        out.push_str(&format!("{prefix}{}\n", line.text.as_str()));
                     }
                 }
             }
-        } else {
-            let kind = h.get("diff").and_then(|d| d.get("kind"))
-                .and_then(Value::as_str).unwrap_or("changed");
-            out.push_str(&format!("--- a/{rel}\n+++ b/{rel}\n# {kind} (non-text)\n"));
+            crate::generated_wire::FileDiff::Deleted => {
+                out.push_str("# deleted (non-text)\n");
+            }
+            crate::generated_wire::FileDiff::Symlink { kind, .. }
+            | crate::generated_wire::FileDiff::Binary { kind, .. } => {
+                let kind = match kind {
+                    crate::generated_wire::ChangeKind::Modified => "modified",
+                    crate::generated_wire::ChangeKind::Created => "created",
+                    _ => "changed",
+                };
+                out.push_str(&format!("# {kind} (non-text)\n"));
+            }
+            crate::generated_wire::FileDiff::Unavailable { message } => {
+                out.push_str(&format!("# error: {}\n", message.as_str()));
+            }
         }
     }
     out.into_bytes()

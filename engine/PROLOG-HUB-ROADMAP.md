@@ -815,6 +815,14 @@ belong to the relation.
   SQLite errors; internal change-path consumers now reuse the typed rows. The
   full native aarch64-musl suite passes 308 tests with one existing browser e2e
   test ignored.
+- Moved `review.hunks`, `review.decorate`, and `review.decorate_many` onto
+  generated request/success variants. Text hunks now materialize as bounded
+  `DiffHunk`/`DiffLine` records and non-text cases as the closed `FileDiff`
+  sum, retaining binary and symlink data as bytes. Invalid UTF-8 is classified
+  as binary instead of lossily reinterpreted as text. Whole-patch rendering
+  walks the same typed diff, and the old JSON hunk/decorating algorithms and
+  review-side base64 helper are gone. The full native aarch64-musl suite passes
+  308 tests with one existing browser e2e test ignored.
 
 ## Stop conditions
 

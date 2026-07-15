@@ -1781,6 +1781,25 @@ fn dispatch_action(
                 .map_err(|error| format!("file groups exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::ReviewFileGroups { value })
         }
+        ActionRequest::ReviewHunks { sid, rel } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::review::hunks_typed(id, action_relative_path(&rel)?)?;
+            Ok(ActionSuccess::ReviewHunks { value })
+        }
+        ActionRequest::ReviewDecorate { sid, rel } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::review::decorate_typed(id, action_relative_path(&rel)?)?;
+            Ok(ActionSuccess::ReviewDecorate { value })
+        }
+        ActionRequest::ReviewDecorateMany { sid, rels } => {
+            let id = existing_box_id(sid)?;
+            let paths = rels.as_slice().iter().map(action_relative_path)
+                .collect::<Result<Vec<_>, String>>()?;
+            let value = crate::wire::BoundedVec::new(
+                crate::review::decorate_many_typed(id, &paths)?)
+                .map_err(|error| format!("decorations exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::ReviewDecorateMany { value })
+        }
         request @ (ActionRequest::Delete { sid } | ActionRequest::Dissolve { sid }) => {
             let deleting = matches!(request, ActionRequest::Delete { .. });
             let id = existing_box_id(sid)?;
@@ -2405,6 +2424,58 @@ fn legacy_change_kind(kind: crate::generated_wire::ChangeKind) -> &'static str {
     }
 }
 
+fn legacy_change_decoration(value: crate::generated_wire::ChangeDecoration) -> Value {
+    json!({
+        "is_text": value.is_text,
+        "stale": value.stale,
+        "kind": legacy_change_kind(value.kind),
+    })
+}
+
+fn legacy_file_diff(value: crate::generated_wire::FileDiff) -> Value {
+    use crate::generated_wire::FileDiff;
+    match value {
+        FileDiff::Text { hunks } => json!({
+            "is_text": true,
+            "hunks": hunks.into_inner().into_iter().map(|hunk| json!({
+                "index": hunk.index,
+                "lines": hunk.lines.into_inner().into_iter().map(|line| json!([
+                    line.style.into_inner(), line.text.into_inner(),
+                ])).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }),
+        FileDiff::Deleted => json!({
+            "is_text": false,
+            "hunks": [],
+            "diff": {"kind": "deleted"},
+        }),
+        FileDiff::Symlink { kind, target } => json!({
+            "is_text": false,
+            "hunks": [],
+            "diff": {
+                "kind": legacy_change_kind(kind),
+                "diff": format!("symlink → {}", legacy_bytes(target)),
+            },
+        }),
+        FileDiff::Binary { kind, content, content_before } => {
+            let mut diff = json!({
+                "kind": legacy_change_kind(kind),
+                "content": base64::engine::general_purpose::STANDARD.encode(content.as_slice()),
+            });
+            if let Some(before) = content_before {
+                diff["content_before"] = json!(
+                    base64::engine::general_purpose::STANDARD.encode(before.as_slice()));
+            }
+            json!({"is_text": false, "hunks": [], "diff": diff})
+        }
+        FileDiff::Unavailable { message } => json!({
+            "is_text": false,
+            "hunks": [],
+            "diff": {"kind": "error", "error": message.into_inner()},
+        }),
+    }
+}
+
 fn legacy_view_window(value: crate::generated_wire::ViewWindow) -> Value {
     use crate::generated_wire::{EchoStream, ViewWindow};
     match value {
@@ -2706,6 +2777,10 @@ fn legacy_ui_action_reply(
                     .map(legacy_bytes).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         }),
+        Ok(ActionSuccess::ReviewHunks { value }) => legacy_file_diff(value),
+        Ok(ActionSuccess::ReviewDecorate { value }) => legacy_change_decoration(value),
+        Ok(ActionSuccess::ReviewDecorateMany { value }) => Value::Array(value.into_inner()
+            .into_iter().map(legacy_change_decoration).collect()),
         Ok(ActionSuccess::Delete { value }) | Ok(ActionSuccess::Dissolve { value }) => json!({
             "ok": true,
             "reparented": value.reparented.into_inner(),
@@ -4768,11 +4843,13 @@ macro_rules! ui_verbs {
             ));
         }
         "review.hunks" => {
-            match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
-                (Some(id), Some(rel)) => crate::review::hunks(id, rel),
-                _ => json!({"is_text": false, "hunks": [],
-                            "diff": {"kind": "error", "error": "bad args"}}),
-            }
+            let (Some(sid), Some(rel)) = (legacy_u64(args, 0), legacy_path_arg(args, 1)) else {
+                return json!({"ok": true, "r": {"is_text": false, "hunks": [],
+                    "diff": {"kind": "error", "error": "bad args"}}});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewHunks { sid, rel },
+            ));
         }
         "review.file_bytes" => {
             let (Some(sid), Some(rel)) = (legacy_u64(args, 0), legacy_path_arg(args, 1)) else {
@@ -4854,10 +4931,14 @@ macro_rules! ui_verbs {
                 state, crate::generated_wire::ActionRequest::ReviewChangeMode { sid, rel },
             ));
         }
-        "review.decorate" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
-            (Some(id), Some(rel)) => crate::review::decorate(id, rel),
-            _ => json!({"is_text": false, "stale": false, "kind": "changed"}),
-        }
+        "review.decorate" => {
+            let (Some(sid), Some(rel)) = (legacy_u64(args, 0), legacy_path_arg(args, 1)) else {
+                return json!({"ok": true, "r": {
+                    "is_text": false, "stale": false, "kind": "changed"}});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewDecorate { sid, rel },
+            ));
         }
         // Newest-first slice of the box's change set, for the boxes view's
         // "recently changed" panel on a live box. limit defaults to 200.
@@ -4945,14 +5026,29 @@ macro_rules! ui_verbs {
         // changes list with +/~/- glyphs and the `!` stale marker without a
         // round-trip per row.
         "review.decorate_many" => {
-            let id = arg_sid(args);
-            let rels: Vec<&str> = args.get(1).and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
-            match id {
-                Some(id) => crate::review::decorate_many(id, &rels),
-                None => Value::Array(vec![]),
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": true, "r": []});
+            };
+            let Some(values) = args.get(1).and_then(Value::as_array) else {
+                return json!({"ok": false, "error": "bad decoration paths"});
+            };
+            let mut rels = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(path) = value.as_str() else {
+                    return json!({"ok": false, "error": "bad decoration path"});
+                };
+                let Ok(path) = crate::wire::BoundedBytes::new(path.as_bytes().to_vec()) else {
+                    return json!({"ok": false,
+                        "error": "decoration path exceeds relation bound"});
+                };
+                rels.push(path);
             }
+            let Ok(rels) = crate::wire::BoundedVec::new(rels) else {
+                return json!({"ok": false, "error": "too many decoration paths"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewDecorateMany { sid, rels },
+            ));
         }
         "review.apply_hunk" => { match (arg_sid(args), args.get(1).and_then(Value::as_str),
                                       args.get(2).and_then(Value::as_i64)) {
