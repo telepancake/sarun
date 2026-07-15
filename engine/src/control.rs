@@ -1070,6 +1070,33 @@ fn dispatch_reply_transport(
                 .map_err(|_| "sud ingest error count exceeds relation bound")?;
             Ok(TransportResponse::SudIngested { count, errors })
         }
+        TransportRequest::ServiceDeclare { name, argv, net_mode } => {
+            if let Some(fd) = peer_pidfd {
+                unsafe { libc::close(fd); }
+            }
+            if !svc_name_ok(name.as_str()) {
+                return Err("service name is invalid".into());
+            }
+            let argv = argv.into_inner().into_iter().map(|value|
+                String::from_utf8(value.into_inner())
+                    .map_err(|_| "service argv is not UTF-8".to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let id = hint_box_id.ok_or("service declaration has no enclosing box")?;
+            let overlay = lock(state).overlay.clone().ok_or("overlay is unavailable")?;
+            let r#box = overlay.box_of(id).ok_or("service box is not live")?;
+            let argv = serde_json::to_string(&argv)
+                .map_err(|error| format!("encode service argv: {error}"))?;
+            let net_mode = match net_mode {
+                None => "",
+                Some(crate::generated_wire::NetMode::Off) => "off",
+                Some(crate::generated_wire::NetMode::Host) => "host",
+                Some(crate::generated_wire::NetMode::Tap) => "tap",
+            };
+            r#box.set_meta("svc_provide", name.as_str());
+            r#box.set_meta("svc_argv", &argv);
+            r#box.set_meta("svc_net", net_mode);
+            Ok(TransportResponse::Empty)
+        }
         other => {
             if let Some(fd) = peer_pidfd {
                 unsafe { libc::close(fd); }
@@ -6538,14 +6565,24 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     libc::close(fd);
                 }
             }
-            let Some(name) = msg.get("name").and_then(Value::as_str) else {
-                let _ = writer.write_all(b"{\"ok\":false,\"error\":\"svc.serve: missing name\"}\n");
-                return;
+            let request = msg.get("name").and_then(Value::as_str)
+                .ok_or_else(|| "svc.serve: missing name".to_string())
+                .and_then(|name| crate::wire::BoundedText::new(name.to_owned())
+                    .map_err(|_| "svc.serve: name exceeds relation bound".to_string()))
+                .map(|name| crate::generated_wire::TransportRequest::ServiceAccept { name });
+            let name = match request {
+                Ok(crate::generated_wire::TransportRequest::ServiceAccept { name })
+                    if svc_name_ok(name.as_str()) => name,
+                Ok(_) => {
+                    let _ = writer.write_all(b"{\"ok\":false,\"error\":\"svc.serve: bad name\"}\n");
+                    return;
+                }
+                Err(error) => {
+                    let reply = json!({"ok": false, "error": error});
+                    let _ = writer.write_all(format!("{reply}\n").as_bytes());
+                    return;
+                }
             };
-            if !svc_name_ok(name) {
-                let _ = writer.write_all(b"{\"ok\":false,\"error\":\"svc.serve: bad name\"}\n");
-                return;
-            }
             drop(reader);
             if writer
                 .write_all(b"{\"ok\":true,\"r\":\"parked\"}\n")
@@ -6556,7 +6593,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             SVC_PARKED
                 .lock()
                 .unwrap()
-                .entry(name.to_string())
+                .entry(name.into_inner())
                 .or_default()
                 .push_back(writer);
             return;
@@ -6575,25 +6612,35 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     libc::close(fd);
                 }
             }
-            let name = msg.get("name").and_then(Value::as_str).unwrap_or("");
-            let argv = msg.get("argv").cloned().unwrap_or(Value::Null);
-            let net = msg.get("net").and_then(Value::as_str).unwrap_or("");
-            let ok = svc_name_ok(name) && argv.is_array();
-            if ok {
-                if let (Some(bid), Some(ov)) = (hint_box_id, lock(&state).overlay.clone()) {
-                    if let Some(b) = ov.box_of(bid) {
-                        b.set_meta("svc_provide", name);
-                        b.set_meta("svc_argv", &argv.to_string());
-                        b.set_meta("svc_net", net);
-                    }
-                }
-            }
-            let reply = if ok {
-                "{\"ok\":true}\n"
-            } else {
-                "{\"ok\":false,\"error\":\"svc.declare: bad name/argv\"}\n"
-            };
-            let _ = writer.write_all(reply.as_bytes());
+            let request: Result<crate::generated_wire::TransportRequest, String> = (|| {
+                let name = msg.get("name").and_then(Value::as_str)
+                    .ok_or("svc.declare: missing name")?;
+                let name = crate::wire::BoundedText::new(name.to_owned())
+                    .map_err(|_| "svc.declare: name exceeds relation bound")?;
+                let values = msg.get("argv").and_then(Value::as_array)
+                    .ok_or("svc.declare: missing argv")?;
+                let argv = values.iter().map(|value| {
+                    let value = value.as_str().ok_or("svc.declare: argv item is not text")?;
+                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                        .map_err(|_| "svc.declare: argv item exceeds relation bound")
+                }).collect::<Result<Vec<_>, _>>()?;
+                let argv = crate::wire::BoundedVec::new(argv)
+                    .map_err(|error| format!("svc.declare: argv exceeds relation bound: {error:?}"))?;
+                let net_mode = match msg.get("net").and_then(Value::as_str).unwrap_or("") {
+                    "" => None,
+                    "off" => Some(crate::generated_wire::NetMode::Off),
+                    "host" => Some(crate::generated_wire::NetMode::Host),
+                    "tap" => Some(crate::generated_wire::NetMode::Tap),
+                    _ => return Err("svc.declare: invalid network mode".into()),
+                };
+                Ok(crate::generated_wire::TransportRequest::ServiceDeclare {
+                    name, argv, net_mode,
+                })
+            })();
+            let response = request.and_then(|request|
+                dispatch_reply_transport(&state, request, hint_box_id, None));
+            let reply = legacy_transport_response(response);
+            let _ = writer.write_all(format!("{reply}\n").as_bytes());
             return;
         }
         // svc.dial: the host-side half — THIS connection becomes a raw
@@ -6606,19 +6653,33 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     libc::close(fd);
                 }
             }
-            let Some(name) = msg.get("name").and_then(Value::as_str) else {
-                let _ = writer.write_all(b"{\"ok\":false,\"error\":\"svc.dial: missing name\"}\n");
-                return;
+            let request = msg.get("name").and_then(Value::as_str)
+                .ok_or_else(|| "svc.dial: missing name".to_string())
+                .and_then(|name| crate::wire::BoundedText::new(name.to_owned())
+                    .map_err(|_| "svc.dial: name exceeds relation bound".to_string()))
+                .map(|name| crate::generated_wire::TransportRequest::ServiceDial { name });
+            let name = match request {
+                Ok(crate::generated_wire::TransportRequest::ServiceDial { name })
+                    if svc_name_ok(name.as_str()) => name,
+                Ok(_) => {
+                    let _ = writer.write_all(b"{\"ok\":false,\"error\":\"svc.dial: bad name\"}\n");
+                    return;
+                }
+                Err(error) => {
+                    let reply = json!({"ok": false, "error": error});
+                    let _ = writer.write_all(format!("{reply}\n").as_bytes());
+                    return;
+                }
             };
             // Bytes the dialer pipelined right behind its dial line must
             // reach the service too.
             let prebuffered = reader.buffer().to_vec();
             drop(reader);
-            let Some(mut slot) = svc_pair(name) else {
+            let Some(mut slot) = svc_pair(name.as_str()) else {
                 let _ = writer.write_all(
                     format!(
                         "{{\"ok\":false,\"error\":\"svc.dial: no live \
-                     '{name}' service (is its box running?)\"}}\n"
+                     '{}' service (is its box running?)\"}}\n", name.as_str()
                     )
                     .as_bytes(),
                 );

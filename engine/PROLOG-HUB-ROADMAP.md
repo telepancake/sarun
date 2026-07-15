@@ -925,6 +925,13 @@ belong to the relation.
   invalid values; it consumes the closed request before acknowledging and
   entering the raw PTY frame mux. The temporary listener performs the sole
   legacy conversion until `ConnectionMode::Pty` is written directly.
+- Moved all service control onto generated transport variants. Declarations
+  enter the common reply dispatcher as bounded `ServiceDeclare` values and
+  fail when they lack a live declaring box; argv and network mode are validated
+  before metadata mutation. Park and dial handoffs consume `ServiceAccept` and
+  `ServiceDial`, including the shared service-name validation, before the
+  socket becomes a parked accept slot or a raw spliced stream. Their remaining
+  JSON acknowledgements are solely the temporary listener's mode projection.
 
 ## Stop conditions
 
