@@ -222,19 +222,43 @@ pub fn parse(input: &str, context: &dyn ContextProvider) -> ParseResult {
         Ok(prolog) => prolog,
         Err(error) => return ParseResult::BackendError(error),
     };
-    let mut plans = match prolog.context_plans(&grammar_input, None) {
-        Ok(plans) => plans,
+    let resolved = match resolve_best_plan(prolog, &grammar_input, context) {
+        Ok(resolved) => resolved,
         Err(error) => return ParseResult::BackendError(error),
     };
+    let Some(resolved) = resolved else {
+        return ParseResult::Unknown(input.to_string());
+    };
+    match invocation_from_prolog(resolved.command, resolved.observations) {
+        Ok(invocation) => ParseResult::Invocation(invocation),
+        Err(error) => ParseResult::BackendError(error),
+    }
+}
+
+struct ResolvedPlan {
+    command: crate::prolog::CommandAst,
+    evidence: Vec<crate::prolog::Evidence>,
+    preference: i64,
+    observations: Vec<crate::prolog::ContextObservation>,
+}
+
+fn resolve_best_plan(
+    prolog: &crate::prolog::Prolog,
+    input: &crate::prolog::GrammarInput,
+    context: &dyn ContextProvider,
+) -> Result<Option<ResolvedPlan>, String> {
+    let mut plans = prolog.context_plans(input, None)?;
     plans.sort_by_key(|plan| std::cmp::Reverse(plan.preference));
     let mut provider_error = None;
     for plan in plans {
         match execute_context_plan(prolog, &plan, context) {
             Ok(Some((command, observations))) => {
-                return match invocation_from_prolog(command, observations) {
-                    Ok(invocation) => ParseResult::Invocation(invocation),
-                    Err(error) => ParseResult::BackendError(error),
-                };
+                return Ok(Some(ResolvedPlan {
+                    command,
+                    evidence: plan.evidence,
+                    preference: plan.preference,
+                    observations,
+                }));
             }
             Ok(None) => {}
             Err(error) => {
@@ -242,10 +266,10 @@ pub fn parse(input: &str, context: &dyn ContextProvider) -> ParseResult {
             }
         };
     }
-    provider_error.map_or_else(
-        || ParseResult::Unknown(input.to_string()),
-        ParseResult::BackendError,
-    )
+    match provider_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 fn execute_context_plan(
@@ -522,14 +546,19 @@ pub fn apply_completion(input: &str, completion: &CompletionEntry) -> String {
     )
 }
 
-pub fn highlights(input: &str, _context: &dyn ContextProvider) -> Result<Vec<Highlight>, String> {
+pub fn highlights(input: &str, context: &dyn ContextProvider) -> Result<Vec<Highlight>, String> {
     let Some(grammar_input) = grammar_input(input, None) else {
         return Err("command input exceeds parser limits".into());
     };
     let prolog = crate::prolog::global()?;
-    let results = prolog.parse(&grammar_input, None)?;
-    let Some(candidate) = results.into_iter().max_by_key(|result| result.preference) else {
+    let Some(resolved) = resolve_best_plan(prolog, &grammar_input, context)? else {
         return Ok(Vec::new());
+    };
+    let candidate = crate::prolog::ParseCandidate {
+        command: resolved.command,
+        status: crate::prolog::ParseStatus::Complete,
+        evidence: resolved.evidence,
+        preference: resolved.preference,
     };
     let highlights = prolog.highlights(&candidate)?;
     Ok(
@@ -698,5 +727,15 @@ mod tests {
                 && entry.provider == "fixture"
                 && entry.annotation.contains("context(writer_id,path")
         }));
+    }
+
+    #[test]
+    fn highlighting_requires_successful_context_observations() {
+        assert!(!highlights("rename work new-name", &FixtureContext)
+            .unwrap()
+            .is_empty());
+        assert!(highlights("rename missing new-name", &FixtureContext)
+            .unwrap()
+            .is_empty());
     }
 }

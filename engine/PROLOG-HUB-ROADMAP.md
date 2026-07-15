@@ -381,7 +381,8 @@ belong to the relation.
       Cycles, dangling refs, duplicate IDs, refs to non-`one` queries, duplicate
       entry identities, and noncanonical result ordering are covered now;
       explicit cross-domain ref typing and provider-specific bounds remain.
-- [ ] Highlighting is derived only from successful grammar evidence.
+- [x] Highlighting is derived only from successful grammar evidence, including
+      successful external context observations for contextual arguments.
 - [ ] Help/menu/key projections exactly cover intended visible actions.
 - [ ] Every relation handler resolves to a real Rust execution handler, and
       every public handler has one relation definition.
@@ -437,6 +438,9 @@ belong to the relation.
 - Generalized completion plans to query graphs with an explicit target node;
   dependent path completion resolves its preceding box `one` query before the
   `all` path query, and the UI path source returns typed containment facts.
+- Unified invocation parsing and highlighting on the same resolved contextual
+  plan; zero/ambiguous `one` results now leave contextual command text
+  unhighlighted instead of presenting a merely structural parse as valid.
 - Recorded the direct binary `ui.sock` transport boundary: Prolog owns
   representation relationships and conversion, while already-typed
   request/reply delivery is a Rust-only hot path.
