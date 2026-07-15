@@ -134,7 +134,47 @@ pub fn jobs_list() -> Result<Vec<Job>, String> {
             })
         })
         .map_err(|e| e.to_string())?;
-    Ok(rows.flatten().map(derive).collect())
+    rows.map(|row| row.map(derive).map_err(|error| error.to_string()))
+        .collect()
+}
+
+pub fn jobs_list_typed() -> Result<Vec<crate::generated_wire::MirrorJob>, String> {
+    use crate::generated_wire::{MirrorJob, MirrorState};
+    jobs_list()?.into_iter().map(|job| {
+        let state = match job.state.as_str() {
+            "running" => MirrorState::Running,
+            "paused" => MirrorState::Paused,
+            "pending" => MirrorState::Pending,
+            "stopped" => MirrorState::Stopped,
+            "error" => MirrorState::Error,
+            "completed" => MirrorState::Completed,
+            "scheduled" => MirrorState::Scheduled,
+            state => return Err(format!("unknown derived mirror state {state:?}")),
+        };
+        Ok(MirrorJob {
+            id: u64::try_from(job.id).map_err(|_| "negative mirror job id")?,
+            kind: crate::wire::BoundedText::new(job.kind)
+                .map_err(|error| format!("mirror kind exceeds relation bound: {error:?}"))?,
+            source: crate::wire::BoundedText::new(job.src)
+                .map_err(|error| format!("mirror source exceeds relation bound: {error:?}"))?,
+            destination: crate::wire::BoundedBytes::new(job.dest.into_bytes())
+                .map_err(|error| format!(
+                    "mirror destination exceeds relation bound: {error:?}"))?,
+            interval_seconds: u64::try_from(job.interval_secs)
+                .map_err(|_| "negative mirror interval")?,
+            paused: job.paused,
+            last_start: job.last_start,
+            last_end: job.last_end,
+            last_exit: job.last_exit
+                .map(|exit| i32::try_from(exit).map_err(|_| "mirror exit code exceeds i32"))
+                .transpose()?,
+            last_detail: crate::wire::BoundedText::new(job.last_detail)
+                .map_err(|error| format!(
+                    "mirror detail exceeds relation bound: {error:?}"))?,
+            state,
+            next_due: job.next_due,
+        })
+    }).collect()
 }
 
 pub fn job_add(kind: &str, src: &str, dest: &str, interval_secs: i64) -> Result<i64, String> {

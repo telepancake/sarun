@@ -1828,6 +1828,46 @@ fn dispatch_action(
                 .map_err(|error| format!("packet rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::FlowsPackets { value })
         }
+        ActionRequest::MirrorJobs => {
+            let value = crate::wire::BoundedVec::new(crate::mirrors::jobs_list_typed()?)
+                .map_err(|error| format!("mirror jobs exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::MirrorJobs { value })
+        }
+        ActionRequest::MirrorAdd { kind, src, dest, interval_secs } => {
+            let destination = std::str::from_utf8(dest.as_slice())
+                .map_err(|_| "the mirror scheduler cannot address a non-UTF-8 destination")?;
+            let interval = i64::try_from(interval_secs.unwrap_or(24 * 3600))
+                .map_err(|_| "mirror interval exceeds i64")?;
+            let id = crate::mirrors::job_add(kind.as_str(), src.as_str(), destination, interval)?;
+            Ok(ActionSuccess::MirrorAdd {
+                value: u64::try_from(id).map_err(|_| "negative allocated mirror job id")?,
+            })
+        }
+        ActionRequest::MirrorRun { id } => {
+            crate::mirrors::job_run(
+                i64::try_from(id).map_err(|_| "mirror job id exceeds i64")?)?;
+            Ok(ActionSuccess::MirrorRun { value: () })
+        }
+        ActionRequest::MirrorRunPending => {
+            let ids = crate::mirrors::run_pending()?.into_iter()
+                .map(|id| u64::try_from(id).map_err(|_| "negative mirror job id"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let value = crate::wire::BoundedVec::new(ids)
+                .map_err(|error| format!("started mirror jobs exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::MirrorRunPending { value })
+        }
+        ActionRequest::MirrorPause { id, paused } => {
+            crate::mirrors::job_set_paused(
+                i64::try_from(id).map_err(|_| "mirror job id exceeds i64")?, paused)?;
+            Ok(ActionSuccess::MirrorPause { value: () })
+        }
+        ActionRequest::MirrorRm { id } => {
+            let note = crate::mirrors::job_remove(
+                i64::try_from(id).map_err(|_| "mirror job id exceeds i64")?)?;
+            let value = crate::wire::BoundedText::new(note)
+                .map_err(|error| format!("mirror removal note exceeds relation bound: {error:?}"))?;
+            Ok(ActionSuccess::MirrorRm { value })
+        }
         ActionRequest::ViewOpen {
             kind,
             r#box,
@@ -2163,6 +2203,19 @@ fn legacy_path_kind(value: crate::generated_wire::PathKind) -> &'static str {
     }
 }
 
+fn legacy_mirror_state(value: crate::generated_wire::MirrorState) -> &'static str {
+    use crate::generated_wire::MirrorState;
+    match value {
+        MirrorState::Running => "running",
+        MirrorState::Paused => "paused",
+        MirrorState::Pending => "pending",
+        MirrorState::Stopped => "stopped",
+        MirrorState::Error => "error",
+        MirrorState::Completed => "completed",
+        MirrorState::Scheduled => "scheduled",
+    }
+}
+
 fn legacy_ui_action_reply(
     result: Result<crate::generated_wire::ActionSuccess, String>,
 ) -> Value {
@@ -2328,6 +2381,33 @@ fn legacy_ui_action_reply(
                 "len": row.length,
                 "info": row.summary.into_inner(),
             })).collect::<Vec<_>>(),
+        }),
+        Ok(ActionSuccess::MirrorJobs { value }) => Value::Array(value.into_inner()
+            .into_iter().map(|job| json!({
+                "id": job.id,
+                "kind": job.kind.into_inner(),
+                "src": job.source.into_inner(),
+                "dest": legacy_bytes(job.destination),
+                "interval_secs": job.interval_seconds,
+                "paused": job.paused,
+                "last_start": job.last_start,
+                "last_end": job.last_end,
+                "last_exit": job.last_exit,
+                "last_detail": job.last_detail.into_inner(),
+                "state": legacy_mirror_state(job.state),
+                "next_due": job.next_due,
+            })).collect()),
+        Ok(ActionSuccess::MirrorAdd { value }) => json!({"ok": true, "id": value}),
+        Ok(ActionSuccess::MirrorRun { .. }) | Ok(ActionSuccess::MirrorPause { .. }) => {
+            json!({"ok": true})
+        }
+        Ok(ActionSuccess::MirrorRunPending { value }) => json!({
+            "ok": true,
+            "started": value.into_inner(),
+        }),
+        Ok(ActionSuccess::MirrorRm { value }) => json!({
+            "ok": true,
+            "note": value.into_inner(),
         }),
         Ok(other) => {
             return json!({
@@ -4265,10 +4345,10 @@ macro_rules! ui_verbs {
             json!({"ok": true, "name": name, "rev": head_rev})
         }
         // Mirror-update jobs (mirrors.rs): the schedule surface.
-        "mirror_jobs" => { match crate::mirrors::jobs_list() {
-            Ok(jobs) => serde_json::to_value(jobs).unwrap_or(Value::Null),
-            Err(e) => return json!({"ok": false, "error": e}),
-        }
+        "mirror_jobs" => {
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::MirrorJobs,
+            ));
         }
         // args: [kind, src, dest, interval_secs]
         "mirror_add" => {
@@ -4279,48 +4359,65 @@ macro_rules! ui_verbs {
             ) else {
                 return json!({"ok": false, "error": "need kind, src, dest"});
             };
-            let interval = args.get(3).and_then(Value::as_i64).unwrap_or(24 * 3600);
-            match crate::mirrors::job_add(kind, src, dest, interval) {
-                Ok(id) => json!({"ok": true, "id": id}),
-                Err(e) => json!({"ok": false, "error": e}),
-            }
+            let Ok(kind) = crate::wire::BoundedText::new(kind.to_owned()) else {
+                return json!({"ok": false, "error": "mirror kind exceeds relation bound"});
+            };
+            let Ok(src) = crate::wire::BoundedText::new(src.to_owned()) else {
+                return json!({"ok": false, "error": "mirror source exceeds relation bound"});
+            };
+            let Ok(dest) = crate::wire::BoundedBytes::new(dest.as_bytes().to_vec()) else {
+                return json!({"ok": false, "error": "mirror destination exceeds relation bound"});
+            };
+            let interval_secs = match args.get(3) {
+                None | Some(Value::Null) => None,
+                Some(value) => match value.as_u64() {
+                    Some(value) => Some(value),
+                    None => return json!({"ok": false, "error": "invalid mirror interval"}),
+                },
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::MirrorAdd {
+                    kind, src, dest, interval_secs,
+                },
+            ));
         }
         // args: [id] — force-run one job now (paused included).
-        "mirror_run" => { match args.first().and_then(Value::as_i64) {
-            Some(id) => match crate::mirrors::job_run(id) {
-                Ok(()) => json!({"ok": true}),
-                Err(e) => json!({"ok": false, "error": e}),
-            },
-            None => return json!({"ok": false, "error": "need job id"}),
-        }
+        "mirror_run" => {
+            let Some(id) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "need job id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::MirrorRun { id },
+            ));
         }
         // Start every due/stopped unpaused job.
-        "mirror_run_pending" => { match crate::mirrors::run_pending() {
-            Ok(ids) => json!({"ok": true, "started": ids}),
-            Err(e) => json!({"ok": false, "error": e}),
-        }
+        "mirror_run_pending" => {
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::MirrorRunPending,
+            ));
         }
         // args: [id, paused(bool)]
         "mirror_pause" => {
             let (Some(id), Some(p)) = (
-                args.first().and_then(Value::as_i64),
+                legacy_u64(args, 0),
                 args.get(1).and_then(Value::as_bool),
             ) else {
                 return json!({"ok": false, "error": "need id + bool"});
             };
-            match crate::mirrors::job_set_paused(id, p) {
-                Ok(()) => json!({"ok": true}),
-                Err(e) => json!({"ok": false, "error": e}),
-            }
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::MirrorPause {
+                    id, paused: p,
+                },
+            ));
         }
         // args: [id]
-        "mirror_rm" => { match args.first().and_then(Value::as_i64) {
-            Some(id) => match crate::mirrors::job_remove(id) {
-                Ok(note) => json!({"ok": true, "note": note}),
-                Err(e) => json!({"ok": false, "error": e}),
-            },
-            None => return json!({"ok": false, "error": "need job id"}),
-        }
+        "mirror_rm" => {
+            let Some(id) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "need job id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::MirrorRm { id },
+            ));
         }
         "rotate" => {
             let Some(sid) = legacy_u64(args, 0) else {

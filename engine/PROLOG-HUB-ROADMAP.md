@@ -767,6 +767,14 @@ belong to the relation.
   temporary listener projection. A focused tshark-row materialization test and
   the full native aarch64-musl suite pass: 308 tests passed and one existing
   browser e2e test remained ignored.
+- Moved `mirror_jobs`, `mirror_add`, `mirror_run`, `mirror_run_pending`,
+  `mirror_pause`, and `mirror_rm` onto generated request/success variants.
+  Stored scheduler rows now materialize as bounded `MirrorJob` values with a
+  closed `MirrorState`; invalid numeric ranges, unknown derived states,
+  non-UTF-8 scheduler destinations, and malformed database rows fail closed.
+  The temporary listener projects the old object spelling only after typed
+  execution. The full native aarch64-musl suite passes 308 tests with one
+  existing browser e2e test ignored.
 
 ## Stop conditions
 
