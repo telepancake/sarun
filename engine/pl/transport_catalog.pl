@@ -9,6 +9,7 @@
             wire_mode/3,
             wire_event/3,
             wire_frame/7,
+            valid_wire_type/1,
             valid_transport_catalog/0
           ]).
 
@@ -20,7 +21,7 @@
 
 This is the semantic definition of sarun's non-action binary transport.  It is
 not a serializer implementation and it is not a second command catalog.
-Action requests use `action_catalog:wire_handler/2`; the facts below cover only
+Action requests use `action_catalog:wire_handler/3`; the facts below cover only
 connection/lifecycle messages, replies, events, stream modes, mux frames, and
 SCM_RIGHTS roles.
 
@@ -208,6 +209,567 @@ wire_type(activity_item, record([
     field(age_seconds, u64)
 ])).
 
+% Action result vocabulary.  These are semantic wire records, not a binary
+% spelling of serde_json::Value.  Action handlers are related to them in the
+% action catalog, so result shape is known before Rust code is generated.
+wire_type(unit,       record([])).
+wire_type(job_id,     alias(u64)).
+wire_type(view_id,    alias(u64)).
+wire_type(process_id, alias(u32)).
+wire_type(file_mode,  alias(u32)).
+wire_type(nanoseconds, alias(u64)).
+
+wire_type(change_kind, enum).
+wire_enum(change_kind, changed,    1).
+wire_enum(change_kind, deleted,    2).
+wire_enum(change_kind, symlink,    3).
+wire_enum(change_kind, created,    4).
+wire_enum(change_kind, modified,   5).
+wire_enum(change_kind, xattr,      6).
+wire_enum(change_kind, directory,  7).
+wire_enum(change_kind, xattr_only, 8).
+
+wire_type(path_kind, enum).
+wire_enum(path_kind, missing,   1).
+wire_enum(path_kind, file,      2).
+wire_enum(path_kind, directory, 3).
+wire_enum(path_kind, symlink,   4).
+wire_enum(path_kind, special,   5).
+
+wire_type(session_status, enum).
+wire_enum(session_status, running,  1).
+wire_enum(session_status, finished, 2).
+wire_enum(session_status, failed,   3).
+wire_enum(session_status, killed,   4).
+
+wire_type(mirror_state, enum).
+wire_enum(mirror_state, running,   1).
+wire_enum(mirror_state, paused,    2).
+wire_enum(mirror_state, pending,   3).
+wire_enum(mirror_state, stopped,   4).
+wire_enum(mirror_state, error,     5).
+wire_enum(mirror_state, completed, 6).
+wire_enum(mirror_state, scheduled, 7).
+
+wire_type(oaita_status_kind, enum).
+wire_enum(oaita_status_kind, none,     1).
+wire_enum(oaita_status_kind, external, 2).
+wire_enum(oaita_status_kind, local,    3).
+
+wire_type(failure_kind, enum).
+wire_enum(failure_kind, edge,     1).
+wire_enum(failure_kind, pipeline, 2).
+
+wire_type(flow_row, record([
+    field(frame, u64),
+    field(time, timestamp),
+    field(source, text(short_bytes)),
+    field(destination, text(short_bytes)),
+    field(sni, text(text_bytes)),
+    field(host, text(text_bytes)),
+    field(method, text(short_bytes)),
+    field(uri, text(text_bytes)),
+    field(status, text(short_bytes)),
+    field(stream, option(u64))
+])).
+
+wire_type(packet_row, record([
+    field(frame, u64),
+    field(time, timestamp),
+    field(source, text(short_bytes)),
+    field(destination, text(short_bytes)),
+    field(protocol, text(short_bytes)),
+    field(length, u32),
+    field(summary, text(text_bytes))
+])).
+
+wire_type(model_entry, record([
+    field(name, text(text_bytes)),
+    field(url, text(text_bytes)),
+    field(note, text(text_bytes))
+])).
+wire_type(model_catalog, record([
+    field(source, text(text_bytes)),
+    field(models, list(model_entry, collection_items))
+])).
+wire_type(oaita_status, record([
+    field(kind, oaita_status_kind),
+    field(model, text(text_bytes)),
+    field(endpoint, text(text_bytes)),
+    field(serving, bool)
+])).
+
+wire_type(oci_build_result, record([
+    field(code, exit_code),
+    field(log, text(blob_bytes)),
+    field(top, option(box_id))
+])).
+wire_type(oci_image, record([
+    field(top, box_id),
+    field(name, text(short_bytes)),
+    field(reference, text(text_bytes)),
+    field(digest, text(short_bytes))
+])).
+wire_type(oci_load_result, record([
+    field(base, box_id),
+    field(base_name, text(short_bytes)),
+    field(top, box_id),
+    field(top_name, text(short_bytes)),
+    field(layer_count, u32),
+    field(verified, bool)
+])).
+wire_type(oci_resolve_result, record([
+    field(top, box_id),
+    field(note, text(text_bytes))
+])).
+
+wire_type(network_prompt, record([
+    field(id, u64),
+    field(box, text(short_bytes)),
+    field(host, text(text_bytes)),
+    field(port, u16),
+    field(scheme, text(short_bytes))
+])).
+
+wire_type(path_error, record([
+    field(path, option(path)),
+    field(message, text(text_bytes))
+])).
+wire_type(apply_result, record([
+    field(applied, list(path, collection_items)),
+    field(errors, list(path_error, error_items))
+])).
+wire_type(discard_result, record([
+    field(discarded, list(path, collection_items)),
+    field(errors, list(path_error, error_items))
+])).
+wire_type(action_mutation_result, record([
+    field(box, box_id),
+    field(count, u64),
+    field(errors, list(path_error, error_items))
+])).
+
+wire_type(change_row, record([
+    field(path, path),
+    field(kind, change_kind),
+    field(size, u64)
+])).
+wire_type(change_decoration, record([
+    field(kind, change_kind),
+    field(is_text, bool),
+    field(stale, bool)
+])).
+wire_type(file_group, record([
+    field(name, text(short_bytes)),
+    field(count, u64),
+    field(paths, list(path, collection_items))
+])).
+wire_type(diff_line, record([
+    field(style, text(short_bytes)),
+    field(text, text(text_bytes))
+])).
+wire_type(diff_hunk, record([
+    field(index, u32),
+    field(lines, list(diff_line, collection_items))
+])).
+wire_type(file_diff, choice).
+wire_variant(file_diff, text, 1, [
+    field(hunks, list(diff_hunk, collection_items))
+]).
+wire_variant(file_diff, deleted, 2, []).
+wire_variant(file_diff, symlink, 3, [
+    field(kind, change_kind),
+    field(target, bytes(path_bytes))
+]).
+wire_variant(file_diff, binary, 4, [
+    field(kind, change_kind),
+    field(content, bytes(blob_bytes)),
+    field(content_before, option(bytes(blob_bytes)))
+]).
+wire_variant(file_diff, unavailable, 5, [
+    field(message, text(text_bytes))
+]).
+
+wire_type(make_variable_row, record([
+    field(id, row_id),
+    field(name, os_string),
+    field(location, os_string),
+    field(value, os_string),
+    field(make_directory, path),
+    field(rhs, os_string),
+    field(references, os_string),
+    field(flags, text(short_bytes)),
+    field(edge_output, option(path)),
+    field(pipeline_uid, option(pipeline_id)),
+    field(edge, option(row_id)),
+    field(pipeline, option(row_id))
+])).
+
+wire_type(pipeline_context_item, record([
+    field(id, row_id),
+    field(command, text(text_bytes)),
+    field(exit_code, option(exit_code))
+])).
+wire_type(pipeline_context, record([
+    field(parent, option(pipeline_context_item)),
+    field(children, list(pipeline_context_item, collection_items)),
+    field(edge_output, option(path))
+])).
+
+wire_type(output_preview, record([
+    field(id, row_id),
+    field(time, timestamp),
+    field(stream, echo_stream),
+    field(length, u64),
+    field(preview, text(text_bytes))
+])).
+wire_type(change_preview, record([
+    field(path, path),
+    field(kind, change_kind),
+    field(size, u64),
+    field(modified_at, s64),
+    field(xattr_key, option(os_string)),
+    field(xattr_length, option(u64))
+])).
+wire_type(process_preview, record([
+    field(id, row_id),
+    field(tgid, option(process_id)),
+    field(executable, path),
+    field(argv0, os_string)
+])).
+wire_type(pipeline_preview, record([
+    field(id, row_id),
+    field(command, text(text_bytes)),
+    field(nested, bool)
+])).
+wire_type(edge_preview, record([
+    field(id, row_id),
+    field(output, option(path)),
+    field(output_count, u32),
+    field(command, option(text(text_bytes)))
+])).
+wire_type(failure_preview, record([
+    field(kind, failure_kind),
+    field(label, text(text_bytes)),
+    field(code, exit_code),
+    field(excerpt, text(text_bytes))
+])).
+wire_type(box_summary, record([
+    field(outputs, list(output_preview, collection_items)),
+    field(changes, list(change_preview, collection_items)),
+    field(processes, list(process_preview, collection_items)),
+    field(pipelines, list(pipeline_preview, collection_items)),
+    field(edges, list(edge_preview, collection_items)),
+    field(failures, list(failure_preview, collection_items)),
+    field(has_make_variables, bool),
+    field(has_sud_trace, bool),
+    field(activity, list(activity_item, collection_items))
+])).
+
+wire_type(view_open_result, record([
+    field(view, view_id),
+    field(total, u64)
+])).
+wire_type(view_filter_result, record([field(total, u64)])).
+wire_type(view_find_result, alias(option(u64))).
+
+wire_type(api_log_row, record([
+    field(id, row_id),
+    field(time, timestamp),
+    field(method, text(short_bytes)),
+    field(path, text(text_bytes)),
+    field(model, text(text_bytes)),
+    field(status, u16),
+    field(streaming, bool),
+    field(request_length, u64),
+    field(response_length, u64)
+])).
+wire_type(api_log_detail, record([
+    field(summary, api_log_row),
+    field(request, bytes(blob_bytes)),
+    field(response, bytes(blob_bytes))
+])).
+
+wire_type(apply_copy_result, record([
+    field(box, box_id),
+    field(name, text(short_bytes)),
+    field(applied, u64)
+])).
+wire_type(directory_entry, record([
+    field(name, os_string),
+    field(kind, path_kind)
+])).
+wire_type(box_created, record([
+    field(box, box_id),
+    field(root, path)
+])).
+
+wire_type(pipeline_row, record([
+    field(id, row_id),
+    field(time, timestamp),
+    field(command, text(text_bytes)),
+    field(record, option(pipeline_provenance)),
+    field(pipeline, option(pipeline_id)),
+    field(spawned_at, option(timestamp)),
+    field(done_at, option(timestamp)),
+    field(nested, bool),
+    field(uid, option(pipeline_id)),
+    field(parent_uid, option(pipeline_id)),
+    field(exit_code, option(exit_code)),
+    field(processes, list(row_id, collection_items))
+])).
+wire_type(pipeline_summary, record([
+    field(id, row_id),
+    field(time, timestamp),
+    field(command, text(text_bytes)),
+    field(record, option(pipeline_provenance)),
+    field(pipeline, option(pipeline_id))
+])).
+wire_type(build_edge_row, record([
+    field(id, row_id),
+    field(time, timestamp),
+    field(outputs, list(path, 1, collection_items)),
+    field(inputs, list(path, collection_items)),
+    field(command, option(text(text_bytes))),
+    field(started_at, option(timestamp)),
+    field(ended_at, option(timestamp)),
+    field(exit_code, option(exit_code)),
+    field(output_excerpt, option(text(text_bytes)))
+])).
+wire_type(free_result, record([
+    field(reparented, list(box_id, collection_items))
+])).
+
+wire_type(process_row, record([
+    field(id, row_id),
+    field(tgid, option(process_id)),
+    field(ppid, option(process_id)),
+    field(parent, option(row_id)),
+    field(executable, path),
+    field(argv, list(os_string, command_items)),
+    field(pipeline, option(row_id))
+])).
+wire_type(process_info, record([
+    field(tgid, option(process_id)),
+    field(ppid, option(process_id)),
+    field(parent, option(row_id)),
+    field(executable, path),
+    field(argv, list(os_string, command_items))
+])).
+wire_type(process_subject, record([
+    field(executable, path),
+    field(cwd, path),
+    field(argv, list(os_string, command_items))
+])).
+wire_type(writer_provenance, record([
+    field(pid, option(process_id)),
+    field(ppid, option(process_id)),
+    field(executable, path),
+    field(cwd, path),
+    field(argv, list(os_string, command_items))
+])).
+wire_type(output_row, record([
+    field(id, row_id),
+    field(time, timestamp),
+    field(process, option(row_id)),
+    field(stream, echo_stream),
+    field(length, u64)
+])).
+wire_type(output_detail, record([
+    field(summary, output_row),
+    field(content, bytes(blob_bytes))
+])).
+
+wire_type(checkout_result, record([
+    field(revision, text(short_bytes)),
+    field(files, u64),
+    field(bytes, u64)
+])).
+wire_type(ietf_attachment_result, record([
+    field(name, text(text_bytes)),
+    field(revision, text(short_bytes))
+])).
+wire_type(wiki_attachment_result, record([
+    field(name, text(text_bytes)),
+    field(page, u64),
+    field(title, text(text_bytes)),
+    field(revision, u64)
+])).
+wire_type(mirror_job, record([
+    field(id, job_id),
+    field(kind, text(short_bytes)),
+    field(source, text(text_bytes)),
+    field(destination, path),
+    field(interval_seconds, u64),
+    field(paused, bool),
+    field(last_start, option(s64)),
+    field(last_end, option(s64)),
+    field(last_exit, option(exit_code)),
+    field(last_detail, text(text_bytes)),
+    field(state, mirror_state),
+    field(next_due, option(s64))
+])).
+wire_type(rotate_result, record([
+    field(parent, box_id),
+    field(child, box_id)
+])).
+
+wire_type(external_attachment, record([
+    field(name, text(text_bytes)),
+    field(kind, text(short_bytes)),
+    field(revision, text(short_bytes)),
+    field(error, option(text(text_bytes)))
+])).
+wire_type(box_session, record([
+    field(box, box_id),
+    field(name, text(short_bytes)),
+    field(command, list(os_string, command_items)),
+    field(shared_memory, path),
+    field(live, bool),
+    field(has_archive, bool),
+    field(exit_code, option(exit_code)),
+    field(run_pid, option(process_id)),
+    field(parent, option(box_id)),
+    field(parents, list(box_id, collection_items)),
+    field(attachments, list(external_attachment, collection_items)),
+    field(started_at, timestamp),
+    field(status, session_status),
+    field(upper, path),
+    field(display_path, text(text_bytes))
+])).
+
+wire_type(structural_line, record([
+    field(style, text(short_bytes)),
+    field(text, text(text_bytes))
+])).
+wire_type(structural_diff, record([
+    field(lines, list(structural_line, collection_items))
+])).
+wire_type(structural_quick, record([
+    field(lines, list(structural_line, collection_items)),
+    field(job, option(job_id))
+])).
+
+wire_type(stuck_thread, record([
+    field(pid, process_id),
+    field(tid, process_id),
+    field(command, text(short_bytes)),
+    field(state, text(short_bytes)),
+    field(wait_channel, text(text_bytes)),
+    field(syscall, text(short_bytes)),
+    field(detail, text(text_bytes)),
+    field(backtrace, list(text(text_bytes), collection_items))
+])).
+wire_type(stuck_report, record([
+    field(runner, process_id),
+    field(threads, list(stuck_thread, collection_items))
+])).
+
+wire_type(action_help_row, record([
+    field(verb, text(short_bytes)),
+    field(arguments, text(text_bytes)),
+    field(description, text(text_bytes))
+])).
+
+wire_type(web_capture_row, record([
+    field(id, row_id),
+    field(time, timestamp),
+    field(method, text(short_bytes)),
+    field(url, text(text_bytes)),
+    field(host, text(text_bytes)),
+    field(status, u16),
+    field(mime, text(text_bytes)),
+    field(truncated, bool),
+    field(request_length, u64),
+    field(response_length, u64)
+])).
+wire_type(web_capture_detail, record([
+    field(summary, web_capture_row),
+    field(request_headers, bytes(blob_bytes)),
+    field(response_headers, bytes(blob_bytes)),
+    field(request_body, bytes(blob_bytes)),
+    field(response_body, bytes(blob_bytes))
+])).
+wire_type(web_capture_body, record([
+    field(mime, text(text_bytes)),
+    field(body, bytes(blob_bytes))
+])).
+
+wire_type(sud_event_kind, enum).
+wire_enum(sud_event_kind, exec,   1).
+wire_enum(sud_event_kind, argv,   2).
+wire_enum(sud_event_kind, env,    3).
+wire_enum(sud_event_kind, open,   4).
+wire_enum(sud_event_kind, cwd,    5).
+wire_enum(sud_event_kind, stdout, 6).
+wire_enum(sud_event_kind, stderr, 7).
+wire_enum(sud_event_kind, exit,   8).
+wire_enum(sud_event_kind, prof,   9).
+wire_type(sud_event, record([
+    field(time_ns, nanoseconds),
+    field(kind, sud_event_kind),
+    field(pid, process_id),
+    field(tgid, process_id),
+    field(ppid, process_id),
+    field(extras, list(s64, collection_items)),
+    field(text, text(text_bytes))
+])).
+wire_type(sud_trace_view, record([
+    field(events, list(sud_event, collection_items)),
+    field(truncated, bool)
+])).
+
+wire_type(rename_result, record([
+    field(old_display_path, text(text_bytes)),
+    field(name, text(short_bytes))
+])).
+
+wire_type(view_change_row, record([
+    field(path, path),
+    field(name, os_string),
+    field(kind, change_kind),
+    field(size, u64),
+    field(depth, u32),
+    field(connector, bool),
+    field(xattr_for, option(path)),
+    field(xattr_key, option(os_string))
+])).
+wire_type(view_process_row, record([
+    field(id, row_id),
+    field(tgid, option(process_id)),
+    field(ppid, option(process_id)),
+    field(executable, path),
+    field(argv, list(os_string, command_items)),
+    field(depth, u32),
+    field(connector, bool)
+])).
+wire_type(view_output_row, record([
+    field(output, output_row),
+    field(executable, path),
+    field(tgid, option(process_id))
+])).
+wire_type(view_window, choice).
+wire_variant(view_window, changes, 1, [
+    field(start, u64), field(total, u64),
+    field(rows, list(view_change_row, collection_items))
+]).
+wire_variant(view_window, processes, 2, [
+    field(start, u64), field(total, u64),
+    field(rows, list(view_process_row, collection_items))
+]).
+wire_variant(view_window, outputs, 3, [
+    field(start, u64), field(total, u64),
+    field(rows, list(view_output_row, collection_items))
+]).
+wire_variant(view_window, pipelines, 4, [
+    field(start, u64), field(total, u64),
+    field(rows, list(pipeline_row, collection_items))
+]).
+wire_variant(view_window, build_edges, 5, [
+    field(start, u64), field(total, u64),
+    field(rows, list(build_edge_row, collection_items))
+]).
+
 % Start and done have different required fields; this prevents a decoder from
 % accepting `done` without an exit code or silently ignoring a code on `start`.
 wire_type(build_edge_transition, choice).
@@ -224,7 +786,7 @@ wire_variant(build_edge_transition, done, 2, [
     field(excerpt, option(text(text_bytes)))
 ]).
 
-% Request identities 1..131 belong to action_catalog:wire_handler/2. The
+% Request identities 1..131 belong to action_catalog:wire_handler/3. The
 % transport-only namespace starts at 256 so the first request atom dispatches
 % directly without another family tag.
 % wire_request(Name, Code, Success, PositionalFields, FdSchema, Authority).
@@ -406,6 +968,9 @@ valid_transport_catalog :-
     all_modes_valid,
     all_events_valid,
     all_frames_valid.
+
+valid_wire_type(Type) :-
+    valid_type(Type, []).
 
 all_limits_valid :-
     findall(Name-Value, wire_limit(Name, Value), Rows),

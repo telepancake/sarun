@@ -75,8 +75,13 @@ does not need a string family tag. The catalog currently defines:
 - every record, enum, tagged choice, collection bound, transition, direction,
   and conditional SCM_RIGHTS role used by those messages.
 
+Each action opcode is likewise inseparable from its bounded success type in
+`wire_handler(Handler, Code, ResultType)`. Parser/source schemas remain a
+different representation: concrete binary request-field schemas are required
+before codec generation, and generic `spec` arguments cannot cross that gate.
+
 `select`, `apply`, `discard`, `rename`, `review.patch_text`, `sudtrace`, and
-quit are actions. They use `action_catalog:wire_handler/2`; there is no second
+quit are actions. They use `action_catalog:wire_handler/3`; there is no second
 transport request definition for them. Subscription events carry only the box,
 row, count, path, or state needed to invalidate a view. They do not copy full
 provenance or trace records into the event stream.

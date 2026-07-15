@@ -51,7 +51,7 @@ run_test(catalog_is_closed_bounded_and_valid) :-
 
 run_test(namespaces_are_explicit_unique_and_disjoint) :-
     expect(wire_protocol_version(1)),
-    findall(Code, wire_handler(_, Code), ActionCodes),
+    findall(Code, wire_handler(_, Code, _), ActionCodes),
     findall(Code, wire_request(_, Code, _, _, _, _), RequestCodes),
     expect(all_less_than(ActionCodes, 256)),
     expect(all_at_least(RequestCodes, 256)),
@@ -85,8 +85,10 @@ run_test(actions_are_not_duplicated_as_transport_requests) :-
     expect(\+ wire_request(shutdown, _, _, _, _, _)),
     once(representation(sudtrace, wire,
                         wire(98, sudtrace, control,
-                             [arg(sid, string, required, scalar)]))),
-    once(representation(quit, wire, wire(131, quit, control, []))).
+                             [arg(sid, string, required, scalar)],
+                             sud_trace_view))),
+    once(representation(quit, wire,
+                        wire(131, quit, control, [], unit))).
 
 run_test(register_schema_captures_conditional_fd_roles) :-
     once(wire_request(register, 257, mode(box), Fields, Fds,

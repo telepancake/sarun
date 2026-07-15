@@ -373,6 +373,12 @@ belong to the relation.
 - [x] Give every wire action a stable binary identity in the relation. Alias
       actions normalize to their handler's identity and schema; local actions
       have no invented wire form.
+- [ ] Give every wire action a concrete binary request-field schema in the
+      relation. Source/parser categories such as `integer`, `path`, `base64`,
+      and especially `spec` are representations to convert from, not binary
+      field types. Structured requests such as OCI build, API probe, view
+      filters, and read-only attachments must be closed records/choices; no
+      generic JSON-shaped request payload may survive.
 - [ ] Give every wire action handler a concrete typed result schema in the
       relation. Do not preserve the JSON object model as a generic recursive
       binary value or let Rust result construction remain the schema authority.
@@ -556,6 +562,13 @@ belong to the relation.
   only reproduce JSON's schema-less object tree with smaller tags. Concrete
   per-handler result schemas remain an explicit prerequisite for generated
   action reply codecs.
+- Made result type inseparable from action opcode by replacing the two-column
+  wire-handler fact with `wire_handler(Handler, Code, ResultType)`. All 95 live
+  handlers now name a bounded concrete success type, including typed view
+  variants and raw byte bodies rather than base64 wrappers. This declaration
+  checkpoint does not complete the migration gate: generated Rust result
+  values must still replace the current JSON construction and be checked
+  against these schemas.
 - Deleted seven Python-era wire actions whose implementations were explicit
   compatibility no-ops and which had no Rust UI caller: `rescan`, `open_files`,
   `review_state`, `review_live`, `consolidate_start`, and the two consolidation

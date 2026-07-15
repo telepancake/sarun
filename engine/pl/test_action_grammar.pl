@@ -67,6 +67,7 @@ parse_words(Words, Command) :-
     once(parse(Items, parse_result(Command, complete, _, _))).
 
 run_test(catalog_is_complete_and_valid) :-
+    expect(valid_action_catalog),
     findall(Action, action(Action, _, _, _, _, _, _), Actions),
     sort(Actions, Unique),
     length(Actions, 108),
@@ -74,21 +75,24 @@ run_test(catalog_is_complete_and_valid) :-
     expect(all_valid(Actions)).
 
 run_test(wire_identities_are_explicit_unique_and_normalized) :-
-    findall(Code-Handler, wire_handler(Handler, Code), Rows),
+    findall(Code-Handler-Result,
+            wire_handler(Handler, Code, Result), Rows),
     length(Rows, 95),
-    findall(Code, wire_handler(_, Code), Codes),
+    findall(Code, wire_handler(_, Code, _), Codes),
     sort(Codes, UniqueCodes),
     length(UniqueCodes, 95),
-    findall(Handler, wire_handler(Handler, _), Handlers),
+    findall(Handler, wire_handler(Handler, _, _), Handlers),
     sort(Handlers, UniqueHandlers),
     length(UniqueHandlers, 95),
     expect(all_wire_handlers_are_actions(Handlers)),
+    expect(all_wire_results_are_concrete(Rows)),
     once(representation(mirror_resume, wire, Wire)),
     expect_equal(
         Wire,
         wire(62, mirror_pause, ui,
              [arg(id, integer, required, scalar),
-              arg(paused, boolean, required, scalar)])),
+              arg(paused, boolean, required, scalar)],
+             unit)),
     expect(\+ representation(mirror_browse, wire, _)).
 
 run_test(representations_project_the_executable_forms) :-
@@ -102,7 +106,8 @@ run_test(representations_project_the_executable_forms) :-
     once(convert(action, mirror_resume, wire,
                  wire(62, mirror_pause, ui,
                       [arg(id, integer, required, scalar),
-                       arg(paused, boolean, required, scalar)]))),
+                       arg(paused, boolean, required, scalar)],
+                      unit))),
     once(convert(verb, verb("mirror_resume", resume_false), help,
                  help("ID", "resume a mirror job"))),
     findall(Action, action(Action, _, _, _, _, _, _), Actions),
@@ -120,6 +125,12 @@ all_wire_handlers_are_actions([Handler|Handlers]) :-
     action(Handler, Handler, Target, _, _, _, _),
     ( Target = ui ; Target = control ),
     all_wire_handlers_are_actions(Handlers).
+
+all_wire_results_are_concrete([]).
+all_wire_results_are_concrete([_-_-Result|Rows]) :-
+    valid_wire_type(Result),
+    Result \= response,
+    all_wire_results_are_concrete(Rows).
 
 all_valid([]).
 all_valid([Action|Actions]) :-

@@ -1,6 +1,6 @@
 :- module(action_grammar,
           [ action/7,
-            wire_handler/2,
+            wire_handler/3,
             wire_protocol_version/1,
             wire_limit/2,
             wire_type/2,
@@ -11,7 +11,9 @@
             wire_mode/3,
             wire_event/3,
             wire_frame/7,
+            valid_wire_type/1,
             valid_transport_catalog/0,
+            valid_action_catalog/0,
             representation/3,
             convert/4,
             valid_action/1,
@@ -66,16 +68,57 @@ valid_action(Action) :-
     valid_action_wire(Target, Handler),
     once(action_form(Action, verb, _, _)).
 
-valid_action_wire(local, Handler) :- \+ wire_handler(Handler, _).
+valid_action_wire(local, Handler) :- \+ wire_handler(Handler, _, _).
 valid_action_wire(ui, Handler) :- valid_wire_handler(Handler).
 valid_action_wire(control, Handler) :- valid_wire_handler(Handler).
 
 valid_wire_handler(Handler) :-
-    wire_handler(Handler, Code),
+    wire_handler(Handler, Code, _),
     integer(Code),
     Code > 0,
     argument_schema(Handler, Schema),
     valid_schema(Schema).
+
+% Deep schema closure and cross-row uniqueness are startup/catalog work, not
+% work for each parse candidate.  Keeping this out of valid_action/1 prevents
+% ordinary parsing from walking the entire action-result type graph.
+valid_action_catalog :-
+    findall(Action, action(Action, _, _, _, _, _, _), Actions),
+    Actions \= [],
+    all_unique_terms(Actions),
+    all_actions_valid(Actions),
+    findall(Handler-Code, wire_handler(Handler, Code, _), HandlerCodes),
+    HandlerCodes \= [],
+    handler_codes_unique(HandlerCodes),
+    all_wire_rows_valid.
+
+all_actions_valid([]).
+all_actions_valid([Action|Actions]) :-
+    once(valid_action(Action)),
+    all_actions_valid(Actions).
+
+all_wire_rows_valid :-
+    \+ (wire_handler(Handler, Code, ResultType),
+        ( \+ atom(Handler)
+        ; \+ (integer(Code), Code > 0)
+        ; \+ valid_wire_type(ResultType)
+        ; \+ (action(Handler, Handler, Target, _, _, _, _),
+               (Target = ui ; Target = control))
+        )).
+
+handler_codes_unique(Rows) :-
+    handler_code_columns(Rows, Handlers, Codes),
+    all_unique_terms(Handlers),
+    all_unique_terms(Codes).
+
+handler_code_columns([], [], []).
+handler_code_columns([Handler-Code|Rows], [Handler|Handlers], [Code|Codes]) :-
+    handler_code_columns(Rows, Handlers, Codes).
+
+all_unique_terms(Terms) :-
+    sort(Terms, Unique),
+    length(Terms, Count),
+    length(Unique, Count).
 
 valid_target(ui).
 valid_target(control).
@@ -168,9 +211,10 @@ representation(Action, cli, cli(Words, Normalizer)) :-
     form_literal_prefix(Specs, Words).
 representation(Action, syntax(Style), syntax(Specs)) :-
     action_form(Action, Style, Specs, _).
-representation(Action, wire, wire(Code, Handler, Target, Schema)) :-
+representation(Action, wire,
+               wire(Code, Handler, Target, Schema, ResultType)) :-
     action(Action, Handler, Target, _, _, _, _),
-    wire_handler(Handler, Code),
+    wire_handler(Handler, Code, ResultType),
     argument_schema(Handler, Schema).
 representation(Action, help, help(Notation, Description)) :-
     action(Action, _, _, Notation, Description, _, _).

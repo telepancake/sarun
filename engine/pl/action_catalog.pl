@@ -5,7 +5,7 @@
             key_binding/4,
             menu_label/2,
             argument_context/4,
-            wire_handler/2,
+            wire_handler/3,
             visible_action/1
           ]).
 
@@ -35,7 +35,7 @@ action(api_log, api_log, ui, "SID", "--api oaita proxy request log", visible, 50
 action(api_log_detail, api_log_detail, ui, "SID ROW", "full request/response detail of one api_log row", visible, 50).
 action(webcap, webcap, ui, "SID", "web-capture summary rows (tap MITM archive)", visible, 50).
 action(webcap_detail, webcap_detail, ui, "SID ROW", "full detail of one web capture", visible, 50).
-action(webcap_body, webcap_body, ui, "SID ROW", "raw base64 response body of one capture", visible, 50).
+action(webcap_body, webcap_body, ui, "SID ROW", "raw response body of one capture", visible, 50).
 action(brushprov, brushprov, ui, "SID", "brush semantic-provenance rows (pipelines)", visible, 50).
 action(build_edges, build_edges, ui, "SID", "parsed ninja/make build-graph edges", visible, 50).
 action(proc_pipeline, proc_pipeline, ui, "SID ROW", "the pipeline a process belongs to", visible, 50).
@@ -71,12 +71,12 @@ action(reload_rules, reload_rules, ui, "", "reload the file-rules from disk", vi
 action(delete, delete, ui, "SID", "remove a box, promoting its changes down (alias of dissolve)", visible, 50).
 action('review.session_changes', 'review.session_changes', ui, "SID", "changed files of a box", visible, 50).
 action('review.hunks', 'review.hunks', ui, "SID REL", "unified-diff hunks for one changed file", visible, 50).
-action('review.file_bytes', 'review.file_bytes', ui, "SID REL", "current bytes of one box path (captured write, else host), base64", visible, 50).
+action('review.file_bytes', 'review.file_bytes', ui, "SID REL", "current bytes of one box path (captured write, else host)", visible, 50).
 action('review.write_file', 'review.write_file', ui, "SID REL B64", "overwrite one box path's bytes (editor save) — captured like the box's own write, host untouched", visible, 50).
 action('review.apply', 'review.apply', ui, "SID [PATHS...]", "apply a box's changes to the host", visible, 50).
 action('review.discard', 'review.discard', ui, "SID [PATHS...]", "discard a box's changes", visible, 50).
 action('review.file_groups', 'review.file_groups', ui, "SID", "named file-groups + how many of the box's changes each selects", visible, 50).
-action('review.patch_text', 'review.patch_text', ui, "SID", "whole-box patch as base64", visible, 50).
+action('review.patch_text', 'review.patch_text', ui, "SID", "whole-box patch bytes", visible, 50).
 action('review.change_mode', 'review.change_mode', ui, "SID REL", "current mode of one changed path", visible, 50).
 action('review.decorate', 'review.decorate', ui, "SID REL", "kind/stale/is_text label for one change", visible, 50).
 action('review.recent_changes', 'review.recent_changes', ui, "SID [LIMIT]", "newest-first slice of the change set", visible, 50).
@@ -104,7 +104,7 @@ action('flows.packets', 'flows.packets', ui, "[SID] STREAM", "every frame of one
 action(struct_finish, struct_finish, ui, "JOB", "collect a finished structural-diff job", internal, 10).
 action(struct_cancel, struct_cancel, ui, "JOB", "cancel a structural-diff job", internal, 10).
 action(box_drop, box_drop, ui, "SID", "unregister a box from the overlay (no reap)", visible, 50).
-action(box_file_read, box_file_read, ui, "BOX PATH", "read a file from a box's merged view (base64)", visible, 50).
+action(box_file_read, box_file_read, ui, "BOX PATH", "read a file from a box's merged view", visible, 50).
 action(box_file_write, box_file_write, ui, "BOX PATH B64", "write a file into a box's layer (oaita agent tool: same refusal gate as the editor save, but MAY create new files)", visible, 50).
 action(box_dir_list, box_dir_list, ui, "BOX PATH", "list a directory in a box's merged view", visible, 50).
 action(box_path_kind, box_path_kind, ui, "BOX PATH", "file/dir/missing kind of a box path", internal, 10).
@@ -135,105 +135,110 @@ action(filter, filter, local, "", "filter the active pane", visible, 50).
 action(action_menu, action_menu, local, "", "show the actions popup for the selected row", visible, 50).
 action(toggle_mark, toggle_mark, local, "", "select/unselect row for batch operations", visible, 50).
 
-% Stable direct-Rust wire identities. These are explicit protocol facts: never
-% derive them from declaration order. Public aliases relate through their
-% normalized Handler identity, so mirror_resume uses mirror_pause's opcode and
-% two-field wire schema. Local UI actions deliberately have no wire identity.
-wire_handler('flows.detail', 1).
-wire_handler('flows.list', 2).
-wire_handler('flows.packets', 3).
-wire_handler('oaita.models', 4).
-wire_handler('oaita.probe', 5).
-wire_handler('oaita.status', 6).
-wire_handler('oci.build', 7).
-wire_handler('oci.images', 8).
-wire_handler('oci.load', 9).
-wire_handler('oci.resolve', 10).
-wire_handler('prompts.answer', 11).
-wire_handler('prompts.peek', 12).
-wire_handler('prompts.ui_active', 13).
-wire_handler('review.apply', 14).
-wire_handler('review.apply_hunk', 15).
-wire_handler('review.box_summary', 16).
-wire_handler('review.change_mode', 17).
-wire_handler('review.decorate', 18).
-wire_handler('review.decorate_many', 19).
-wire_handler('review.discard', 20).
-wire_handler('review.discard_hunk', 21).
-wire_handler('review.file_bytes', 22).
-wire_handler('review.file_groups', 23).
-wire_handler('review.hunks', 24).
-wire_handler('review.makevars', 27).
-wire_handler('review.map_ids', 28).
-wire_handler('review.patch_text', 29).
-wire_handler('review.pipeline_context', 30).
-wire_handler('review.recent_changes', 31).
-wire_handler('review.session_changes', 32).
-wire_handler('review.write_file', 33).
-wire_handler('svc.up', 34).
-wire_handler('view.close', 35).
-wire_handler('view.filter', 36).
-wire_handler('view.find', 37).
-wire_handler('view.open', 38).
-wire_handler('view.window', 39).
-wire_handler(api_log, 40).
-wire_handler(api_log_detail, 41).
-wire_handler(apply_to_copy, 42).
-wire_handler(box_dir_list, 43).
-wire_handler(box_drop, 44).
-wire_handler(box_file_read, 45).
-wire_handler(box_file_write, 46).
-wire_handler(box_new, 47).
-wire_handler(box_path_kind, 48).
-wire_handler(brushprov, 49).
-wire_handler(build_edges, 50).
-wire_handler(delete, 52).
-wire_handler(display_path, 53).
-wire_handler(dissolve, 54).
-wire_handler(first_writer_id, 55).
-wire_handler(first_writer_prov, 56).
-wire_handler(git_checkout, 57).
-wire_handler(ietf_attach, 58).
-wire_handler(kill, 59).
-wire_handler(mirror_add, 60).
-wire_handler(mirror_jobs, 61).
-wire_handler(mirror_pause, 62).
-wire_handler(mirror_rm, 63).
-wire_handler(mirror_run, 64).
-wire_handler(mirror_run_pending, 65).
-wire_handler(output_detail, 67).
-wire_handler(output_pipeline, 68).
-wire_handler(outputs, 69).
-wire_handler(ping, 70).
-wire_handler(pipeline_procs, 71).
-wire_handler(proc_info, 72).
-wire_handler(proc_pipeline, 73).
-wire_handler(proc_prov, 74).
-wire_handler(proc_roots, 75).
-wire_handler(process_env, 76).
-wire_handler(processes, 77).
-wire_handler(processes_live, 78).
-wire_handler(reload_rules, 79).
-wire_handler(resolve_box, 81).
-wire_handler(ro_attach, 84).
-wire_handler(rotate, 85).
-wire_handler(select, 86).
-wire_handler(session_dicts, 87).
-wire_handler(struct_cancel, 88).
-wire_handler(struct_finish, 89).
-wire_handler(struct_quick, 90).
-wire_handler(stuck, 91).
-wire_handler(verbs, 92).
-wire_handler(webcap, 93).
-wire_handler(webcap_body, 94).
-wire_handler(webcap_detail, 95).
-wire_handler(wiki_attach, 96).
-wire_handler(writer_id, 97).
-wire_handler(sudtrace, 98).
-wire_handler(apply, 128).
-wire_handler(discard, 129).
-wire_handler(rename, 130).
-wire_handler(quit, 131).
+% Stable direct-Rust wire identities and concrete success types. These are one
+% indivisible protocol fact: an opcode cannot exist without its result schema.
+% Public aliases relate through their normalized Handler identity, so
+% mirror_resume uses mirror_pause's opcode, request schema, and unit result.
+% Failures use the shared typed error envelope; `{ok:false}` is never a success
+% shape. Local UI actions deliberately have no wire identity.
+wire_handler('flows.detail', 1, text(text_bytes)).
+wire_handler('flows.list', 2, list(flow_row, collection_items)).
+wire_handler('flows.packets', 3, list(packet_row, collection_items)).
+wire_handler('oaita.models', 4, model_catalog).
+wire_handler('oaita.probe', 5, text(text_bytes)).
+wire_handler('oaita.status', 6, oaita_status).
+wire_handler('oci.build', 7, oci_build_result).
+wire_handler('oci.images', 8, list(oci_image, collection_items)).
+wire_handler('oci.load', 9, oci_load_result).
+wire_handler('oci.resolve', 10, oci_resolve_result).
+wire_handler('prompts.answer', 11, bool).
+wire_handler('prompts.peek', 12, option(network_prompt)).
+wire_handler('prompts.ui_active', 13, unit).
+wire_handler('review.apply', 14, apply_result).
+wire_handler('review.apply_hunk', 15, unit).
+wire_handler('review.box_summary', 16, box_summary).
+wire_handler('review.change_mode', 17, option(file_mode)).
+wire_handler('review.decorate', 18, change_decoration).
+wire_handler('review.decorate_many', 19,
+             list(change_decoration, collection_items)).
+wire_handler('review.discard', 20, discard_result).
+wire_handler('review.discard_hunk', 21, unit).
+wire_handler('review.file_bytes', 22, bytes(blob_bytes)).
+wire_handler('review.file_groups', 23, list(file_group, collection_items)).
+wire_handler('review.hunks', 24, file_diff).
+wire_handler('review.makevars', 27,
+             list(make_variable_row, collection_items)).
+wire_handler('review.map_ids', 28, list(row_id, collection_items)).
+wire_handler('review.patch_text', 29, bytes(blob_bytes)).
+wire_handler('review.pipeline_context', 30, pipeline_context).
+wire_handler('review.recent_changes', 31, list(change_row, collection_items)).
+wire_handler('review.session_changes', 32, list(change_row, collection_items)).
+wire_handler('review.write_file', 33, u64).
+wire_handler('svc.up', 34, bool).
+wire_handler('view.close', 35, unit).
+wire_handler('view.filter', 36, view_filter_result).
+wire_handler('view.find', 37, view_find_result).
+wire_handler('view.open', 38, view_open_result).
+wire_handler('view.window', 39, view_window).
+wire_handler(api_log, 40, list(api_log_row, collection_items)).
+wire_handler(api_log_detail, 41, option(api_log_detail)).
+wire_handler(apply_to_copy, 42, apply_copy_result).
+wire_handler(box_dir_list, 43, list(directory_entry, collection_items)).
+wire_handler(box_drop, 44, unit).
+wire_handler(box_file_read, 45, bytes(blob_bytes)).
+wire_handler(box_file_write, 46, u64).
+wire_handler(box_new, 47, box_created).
+wire_handler(box_path_kind, 48, path_kind).
+wire_handler(brushprov, 49, list(pipeline_row, collection_items)).
+wire_handler(build_edges, 50, list(build_edge_row, collection_items)).
+wire_handler(delete, 52, free_result).
+wire_handler(display_path, 53, option(text(text_bytes))).
+wire_handler(dissolve, 54, free_result).
+wire_handler(first_writer_id, 55, option(row_id)).
+wire_handler(first_writer_prov, 56, option(writer_provenance)).
+wire_handler(git_checkout, 57, checkout_result).
+wire_handler(ietf_attach, 58, ietf_attachment_result).
+wire_handler(kill, 59, unit).
+wire_handler(mirror_add, 60, job_id).
+wire_handler(mirror_jobs, 61, list(mirror_job, collection_items)).
+wire_handler(mirror_pause, 62, unit).
+wire_handler(mirror_rm, 63, text(text_bytes)).
+wire_handler(mirror_run, 64, unit).
+wire_handler(mirror_run_pending, 65, list(job_id, collection_items)).
+wire_handler(output_detail, 67, option(output_detail)).
+wire_handler(output_pipeline, 68, option(pipeline_summary)).
+wire_handler(outputs, 69, list(output_row, collection_items)).
+wire_handler(ping, 70, unit).
+wire_handler(pipeline_procs, 71, list(row_id, collection_items)).
+wire_handler(proc_info, 72, option(process_info)).
+wire_handler(proc_pipeline, 73, option(pipeline_summary)).
+wire_handler(proc_prov, 74, option(process_subject)).
+wire_handler(proc_roots, 75, list(row_id, collection_items)).
+wire_handler(process_env, 76, environment).
+wire_handler(processes, 77, list(process_row, collection_items)).
+wire_handler(processes_live, 78,
+             option(list(process_row, collection_items))).
+wire_handler(reload_rules, 79, unit).
+wire_handler(resolve_box, 81, option(box_id)).
+wire_handler(ro_attach, 84, unit).
+wire_handler(rotate, 85, rotate_result).
+wire_handler(select, 86, unit).
+wire_handler(session_dicts, 87, list(box_session, collection_items)).
+wire_handler(struct_cancel, 88, unit).
+wire_handler(struct_finish, 89, structural_diff).
+wire_handler(struct_quick, 90, structural_quick).
+wire_handler(stuck, 91, stuck_report).
+wire_handler(verbs, 92, list(action_help_row, collection_items)).
+wire_handler(webcap, 93, list(web_capture_row, collection_items)).
+wire_handler(webcap_body, 94, option(web_capture_body)).
+wire_handler(webcap_detail, 95, option(web_capture_detail)).
+wire_handler(wiki_attach, 96, wiki_attachment_result).
+wire_handler(writer_id, 97, option(row_id)).
+wire_handler(sudtrace, 98, sud_trace_view).
+wire_handler(apply, 128, action_mutation_result).
+wire_handler(discard, 129, action_mutation_result).
+wire_handler(rename, 130, rename_result).
+wire_handler(quit, 131, unit).
 
 % Explicit shell forms. `Normalizer` relates parsed source arguments to the
 % handler's wire arguments. Shared paths are intentional and resolved by the
