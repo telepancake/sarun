@@ -129,21 +129,17 @@ fn rename_rpc(sock: &str, sid: &str, name: &str) -> Result<Value, String> {
 }
 
 fn control_message(invocation: &crate::parser::Invocation) -> Result<Value, String> {
-    match (invocation.dispatch_name(), invocation.args.as_slice()) {
-        (kind @ ("apply" | "discard"), [sid]) => {
-            let sid = sid.as_string().ok_or("control SID must be a string")?;
-            Ok(json!({"type": kind, "sid": sid}))
-        }
-        ("rename", [sid, name]) => {
-            let sid = sid.as_string().ok_or("control SID must be a string")?;
-            let name = name.as_string().ok_or("control name must be a string")?;
-            Ok(json!({"type": "rename", "sid": sid, "name": name}))
-        }
-        (kind @ ("apply" | "discard"), _) => {
-            Err(format!("{kind} requires exactly SID in the command prompt"))
-        }
-        ("rename", _) => Err("rename requires exactly SID NEW".into()),
-        (other, _) => Err(format!("unsupported control action: {other}")),
+    use crate::generated_wire::ActionRequest;
+    match invocation.wire_request()? {
+        ActionRequest::Apply { sid } => Ok(json!({"type": "apply", "sid": sid.to_string()})),
+        ActionRequest::Discard { sid } => Ok(json!({"type": "discard", "sid": sid.to_string()})),
+        ActionRequest::Rename { sid, new } => Ok(json!({
+            "type": "rename",
+            "sid": sid.to_string(),
+            "name": new.as_str(),
+        })),
+        ActionRequest::Quit => Ok(json!({"type": "quit"})),
+        other => Err(format!("unsupported control action: {}", other.handler())),
     }
 }
 
@@ -1356,10 +1352,7 @@ fn path_context_snapshot(
                 ],
             ),
             names: vec![path.into()],
-            value: RelationValue::Compound(
-                "path".into(),
-                vec![RelationValue::String(path.into())],
-            ),
+            value: RelationValue::Compound("path".into(), vec![RelationValue::String(path.into())]),
             attributes,
         });
     }

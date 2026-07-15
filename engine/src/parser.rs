@@ -147,22 +147,23 @@ impl ArgValue {
             }
         }
     }
-
-    pub fn as_string(&self) -> Option<&str> {
-        match self {
-            Self::String(value) => Some(value),
-            Self::Path(value) | Self::Base64(value) | Self::Spec(value) => Some(value),
-            _ => None,
-        }
-    }
 }
 
 /// A fully resolved action with protocol-ready arguments.
+#[derive(Debug, PartialEq)]
+pub enum InvocationPayload {
+    Wire(crate::generated_wire::ActionRequest),
+    Local,
+}
+
 #[derive(Debug)]
 pub struct Invocation {
     pub action: String,
-    pub handler: String,
     pub target: ActionTarget,
+    pub payload: InvocationPayload,
+    // Transitional source projection used only by the JSON socket transport.
+    // The binary cutover deletes this field and json_args() together; request
+    // materialization above is mandatory and never falls back to these values.
     pub args: Vec<ArgValue>,
     /// Exact external observations used to resolve this invocation.
     pub context: Vec<crate::prolog::ContextObservation>,
@@ -170,7 +171,19 @@ pub struct Invocation {
 
 impl Invocation {
     pub fn dispatch_name(&self) -> &str {
-        &self.handler
+        match &self.payload {
+            InvocationPayload::Wire(request) => request.handler(),
+            InvocationPayload::Local => &self.action,
+        }
+    }
+
+    pub fn wire_request(&self) -> Result<&crate::generated_wire::ActionRequest, String> {
+        match &self.payload {
+            InvocationPayload::Wire(request) => Ok(request),
+            InvocationPayload::Local => {
+                Err(format!("local action {} has no wire request", self.action))
+            }
+        }
     }
 
     pub fn json_args(&self) -> serde_json::Value {
@@ -266,7 +279,7 @@ pub fn parse(input: &str, context: &dyn ContextProvider) -> ParseResult {
     let Some(resolved) = resolved else {
         return ParseResult::Unknown(input.to_string());
     };
-    match invocation_from_prolog(resolved.command, resolved.observations) {
+    match invocation_from_prolog(prolog, resolved.command, resolved.observations) {
         Ok(invocation) => ParseResult::Invocation(invocation),
         Err(error) => ParseResult::BackendError(error),
     }
@@ -363,6 +376,7 @@ fn execute_context_graph(
 }
 
 fn invocation_from_prolog(
+    prolog: &crate::prolog::Prolog,
     command: crate::prolog::CommandAst,
     context: Vec<crate::prolog::ContextObservation>,
 ) -> Result<Invocation, String> {
@@ -414,6 +428,36 @@ fn invocation_from_prolog(
         "local" => ActionTarget::LocalUi,
         other => return Err(format!("grammar returned invalid action target {other}")),
     };
+    let payload = match target {
+        ActionTarget::UiVerb | ActionTarget::ControlMessage => {
+            let request = prolog
+                .action_request(&command)
+                .map_err(|error| match error {
+                    crate::prolog::QueryError::NoSolution => format!(
+                        "relation produced no concrete request for wire action {}",
+                        command.action
+                    ),
+                    crate::prolog::QueryError::Backend(error) => error,
+                })?;
+            if request.handler() != command.handler {
+                return Err(format!(
+                    "relation request handler {} disagrees with parsed handler {}",
+                    request.handler(),
+                    command.handler
+                ));
+            }
+            InvocationPayload::Wire(request)
+        }
+        ActionTarget::LocalUi => {
+            if !command.args.is_empty() {
+                return Err(format!(
+                    "local action {} unexpectedly has source arguments",
+                    command.action
+                ));
+            }
+            InvocationPayload::Local
+        }
+    };
     let args = command
         .args
         .into_iter()
@@ -421,8 +465,8 @@ fn invocation_from_prolog(
         .collect::<Result<_, _>>()?;
     Ok(Invocation {
         action: command.action,
-        handler: command.handler,
         target,
+        payload,
         args,
         context,
     })
@@ -695,7 +739,7 @@ fn prolog_command(invocation: &Invocation) -> crate::prolog::CommandAst {
     }
     crate::prolog::CommandAst {
         action: invocation.action.clone(),
-        handler: invocation.handler.clone(),
+        handler: invocation.dispatch_name().to_string(),
         target: match invocation.target {
             ActionTarget::UiVerb => "ui",
             ActionTarget::ControlMessage => "control",
@@ -793,15 +837,29 @@ mod tests {
     #[test]
     fn alias_normalization_returns_wire_ready_handler_and_arguments() {
         let pause = invocation("mirror pause 5");
-        assert_eq!(pause.handler, "mirror_pause");
+        assert_eq!(pause.dispatch_name(), "mirror_pause");
         assert_eq!(pause.args, vec![ArgValue::Number(5), ArgValue::Bool(true)]);
+        assert_eq!(
+            pause.payload,
+            InvocationPayload::Wire(crate::generated_wire::ActionRequest::MirrorPause {
+                id: 5,
+                paused: true,
+            })
+        );
 
         let resume = invocation("mirror resume 5");
         assert_eq!(resume.action, "mirror_resume");
-        assert_eq!(resume.handler, "mirror_pause");
+        assert_eq!(resume.dispatch_name(), "mirror_pause");
         assert_eq!(
             resume.args,
             vec![ArgValue::Number(5), ArgValue::Bool(false)]
+        );
+        assert_eq!(
+            resume.payload,
+            InvocationPayload::Wire(crate::generated_wire::ActionRequest::MirrorPause {
+                id: 5,
+                paused: false,
+            })
         );
     }
 
@@ -816,6 +874,9 @@ mod tests {
             let parsed = invocation(input);
             assert_eq!(render(&parsed).unwrap(), input);
         }
+        let local = invocation("refresh");
+        assert_eq!(local.payload, InvocationPayload::Local);
+        assert!(local.wire_request().is_err());
     }
 
     #[test]

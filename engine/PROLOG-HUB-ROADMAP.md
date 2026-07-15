@@ -625,6 +625,14 @@ belong to the relation.
   representation and never survives as the binary request value. Embedded
   aarch64 SWI tests parse, cross the typed FFI, decode base64 into bounded
   bytes, and materialize the generated request.
+- Made concrete request materialization mandatory in the live parser:
+  every resolved UI/control invocation contains the generated
+  `ActionRequest`, aliases must agree on the generated handler identity, and a
+  missing request is a hard parse error rather than a fallback to source
+  arguments. Local UI actions are the explicit non-wire sum case. The existing
+  JSON argument array remains only as the active transport projection to be
+  deleted by the binary socket cutover; control-message dispatch already reads
+  the generated request instead of reinterpreting parser values.
 
 ## Stop conditions
 
