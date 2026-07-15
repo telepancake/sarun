@@ -312,7 +312,7 @@ belong to the relation.
 - [x] Implement aliases, injected arguments, shared CLI paths, exact
       end-of-input resolution, visibility, targets, and handler identities.
 - [x] Generalize parse/render/completion/highlight predicates over all actions.
-- [ ] Add n-way representation queries for canonical verb, CLI, wire, key,
+- [x] Add n-way representation queries for canonical verb, CLI, wire, key,
       menu, help/description, and syntax.
 - [ ] Add the generic bounded blob/slice layout relation and native pure byte
       primitives; cover decode, encode, and validation modes with malformed,
@@ -407,11 +407,11 @@ belong to the relation.
 - [x] Prolog core-only focused tests validate all 114 action rows plus neutral
       parsing, shared forms, normalization, strings, arrays, rendering,
       completion/highlighting, and the closed application surface.
-- [ ] Expand them to exhaustive per-representation and per-action round trips.
-- [ ] Parse/render round trips preserve typed wire arguments for every action.
-- [ ] Canonical verb and all CLI forms parse with exact arity and full input.
+- [x] Expand them to exhaustive per-representation and per-action round trips.
+- [x] Parse/render round trips preserve typed wire arguments for every action.
+- [x] Canonical verb and all CLI forms parse with exact arity and full input.
 - [ ] Numeric-looking strings, paths, base64, and specs remain strings.
-- [ ] Optional and repeated arguments preserve exact wire array shape.
+- [x] Optional and repeated arguments preserve exact wire array shape.
 - [ ] Completion supports partial tokens and mid-token UTF-8 byte spans.
 - [x] Completion candidates are exactly the tear bindings used by successful
       whole-input parses, including suffix viability, ranking evidence, and
@@ -514,6 +514,17 @@ belong to the relation.
   Deleted `split_literal`, `match_known_prefix`, `match_known_item`,
   `viable_suffix`, `split_context_argument`, and the separate context-prefix
   grammar traversal.
+- Replaced the independent `render_specs`/minimum-arity/splitting algorithm
+  with the same `form_relation` and `relate_specs` sequence relation used by
+  parsing. Parse units, edit tears, and rendered surfaces now differ only in
+  terminal mode clauses; required, optional, repeated-array, repeated-spread,
+  normalization, and end-of-form behavior execute once. Removed the old render
+  traversal and its argument-counting helpers.
+- Moved `representation/3` and `convert/4` into the hub beside the executable
+  form relation. Canonical verb, CLI, syntax, wire, help, key, and menu values
+  now project from the normalized facts and executable specs. Exhaustive tests
+  render and reparse minimal and fully populated canonical forms for all 114
+  actions and every explicit CLI form, covering optional/repeated shapes.
 
 ## Stop conditions
 

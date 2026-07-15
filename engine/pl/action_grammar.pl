@@ -2,6 +2,7 @@
           [ action/7,
             wire_handler/2,
             representation/3,
+            convert/4,
             valid_action/1,
             parse/2,
             parse/3,
@@ -139,6 +140,42 @@ cli_literal_specs([Text|Words], Action, Position,
 cli_literal_metadata(first, command_namespace, 10).
 cli_literal_metadata(rest, action_word, 20).
 
+%! representation(?Action, ?Kind, ?Value) is nondet.
+%
+% Every public projection is rooted in the normalized action facts and the
+% same form relation used by parsing and rendering.  `syntax(Style)` exposes
+% the exact executable spec rather than reconstructing usage text elsewhere.
+
+representation(Action, action, Action) :-
+    action(Action, _, _, _, _, _, _).
+representation(Action, verb, verb(Text, Normalizer)) :-
+    action_form(Action, verb,
+                [literal(_, Text, _, _, _)|_], Normalizer).
+representation(Action, cli, cli(Words, Normalizer)) :-
+    action_form(Action, cli, Specs, Normalizer),
+    form_literal_prefix(Specs, Words).
+representation(Action, syntax(Style), syntax(Specs)) :-
+    action_form(Action, Style, Specs, _).
+representation(Action, wire, wire(Code, Handler, Target, Schema)) :-
+    action(Action, Handler, Target, _, _, _, _),
+    wire_handler(Handler, Code),
+    argument_schema(Handler, Schema).
+representation(Action, help, help(Notation, Description)) :-
+    action(Action, _, _, Notation, Description, _, _).
+representation(Action, key, key(Key, Context, Preference)) :-
+    key_binding(Action, Key, Context, Preference).
+representation(Action, menu, menu(Label)) :-
+    menu_label(Action, Label).
+
+form_literal_prefix([], []).
+form_literal_prefix([argument(_)|_], []).
+form_literal_prefix([literal(_, Text, _, _, _)|Specs], [Text|Words]) :-
+    form_literal_prefix(Specs, Words).
+
+convert(FromKind, From, ToKind, To) :-
+    representation(Action, FromKind, From),
+    representation(Action, ToKind, To).
+
 %! parse(+Items, -Result) is nondet.
 
 parse(Items, Result) :-
@@ -154,8 +191,8 @@ parse(Items, Mode,
     valid_mode(Mode),
     action(Action, Handler, Target, _, _, _, ActionPreference),
     valid_action(Action),
-    action_form(Action, _Style, Specs, Normalizer),
-    match_specs(Specs, Body, Mode, SourceArgs, Evidence, EditCount),
+    form_relation(Action, _Style, Body, Mode, Normalizer, SourceArgs,
+                  Evidence, EditCount),
     normalize_args(Normalizer, SourceArgs, WireArgs),
     parse_status(Mode, EditCount, Status),
     evidence_preference(Evidence, ActionPreference, Preference).
@@ -247,53 +284,63 @@ append([Head|Items], Tail, [Head|Result]) :-
 source_unit(unit(_, Span, PaintSpans, Surface, _, _, Preference, Origin),
             Span, PaintSpans, Surface, Preference, Origin).
 
-match_specs([], [], _Mode, [], [], 0).
+% Singular execution relation for an action form.  Concrete source units,
+% edit tears, and rendered surfaces differ only at the terminal relation;
+% sequence, cardinality, normalization inputs, and end-of-form behavior are
+% shared by parsing and rendering.
+form_relation(Action, Style, Items, Mode, Normalizer, SourceArgs, Evidence,
+              EditCount) :-
+    action_form(Action, Style, Specs, Normalizer),
+    relate_specs(Specs, Items, Mode, SourceArgs, Evidence, EditCount).
+
+relate_specs([], [], _Mode, [], [], 0).
 % Once an edit tear has been consumed by an enclosing call, the ordinary
 % parser may end with an expected continuation.  The missing typed arguments
 % remain explicit holes in the incomplete command; concrete input to the
 % right of a tear is never skipped and must still parse normally.
-match_specs(Specs, [], assist(_), Args, [], 0) :-
+relate_specs(Specs, [], assist(_), Args, [], 0) :-
     specs_require_input(Specs),
     missing_source_args(Specs, Args).
-match_specs([literal(Semantic, Text, Syntax, Description, LitPreference)|Specs],
+relate_specs([literal(Semantic, Text, Syntax, Description, LitPreference)|Specs],
             [Item|Items], Mode, Args,
             [EvidenceItem|Evidence], EditCount) :-
     match_literal_item(
         literal(Semantic, Text, Syntax, Description, LitPreference),
         Item, Mode, EvidenceItem, ItemEditCount),
-    match_specs(Specs, Items, Mode, Args, Evidence, RestCount),
+    relate_specs(Specs, Items, Mode, Args, Evidence, RestCount),
     EditCount is RestCount + ItemEditCount.
-match_specs([argument(arg(Name, Kind, required, scalar))|Specs],
+relate_specs([argument(arg(Name, Kind, required, scalar))|Specs],
             [Item|Items], Mode, [Value|Args], [EvidenceItem|Evidence],
             EditCount) :-
     match_argument_item(Name, Kind, Item, Mode, Value, EvidenceItem,
                         ItemEditCount),
-    match_specs(Specs, Items, Mode, Args, Evidence, RestCount),
+    relate_specs(Specs, Items, Mode, Args, Evidence, RestCount),
     EditCount is RestCount + ItemEditCount.
-match_specs([argument(arg(Name, Kind, optional, scalar))|Specs],
+relate_specs([argument(arg(Name, Kind, optional, scalar))|Specs],
             [Item|Items], Mode, [Value|Args], [EvidenceItem|Evidence],
             EditCount) :-
     match_argument_item(Name, Kind, Item, Mode, Value, EvidenceItem,
                         ItemEditCount),
-    match_specs(Specs, Items, Mode, Args, Evidence, RestCount),
+    relate_specs(Specs, Items, Mode, Args, Evidence, RestCount),
     EditCount is RestCount + ItemEditCount.
-match_specs([argument(arg(_, _, optional, scalar))|Specs], Items, Mode,
+relate_specs([argument(arg(_, _, optional, scalar))|Specs], Items, Mode,
             Args, Evidence, EditCount) :-
-    match_specs(Specs, Items, Mode, Args, Evidence, EditCount).
-match_specs([argument(arg(Name, Kind, repeated, Shape))|Specs], Items0, Mode,
+    relate_specs(Specs, Items, Mode, Args, Evidence, EditCount).
+relate_specs([argument(arg(Name, Kind, repeated, Shape))|Specs], Items0, Mode,
             Args, Evidence, EditCount) :-
-    take_repeated(Name, Kind, Items0, Mode, Values, RepeatedEvidence,
-                  RepeatedEditCount, Items),
     repeated_arguments(Shape, Values, Specs, RepeatedArgs),
-    match_specs(Specs, Items, Mode, RestArgs, RestEvidence, RestEditCount),
     append(RepeatedArgs, RestArgs, Args),
+    relate_repeated_items(Name, Kind, Values, Items0, Mode, RepeatedEvidence,
+                          RepeatedEditCount, Items),
+    relate_specs(Specs, Items, Mode, RestArgs, RestEvidence, RestEditCount),
     append(RepeatedEvidence, RestEvidence, Evidence),
     EditCount is RepeatedEditCount + RestEditCount.
 
 match_literal_item(
-    literal(Semantic, Text, Syntax, Description, LitPreference), Item, _Mode,
+    literal(Semantic, Text, Syntax, Description, LitPreference), Item, Mode,
     evidence(Semantic, Span, PaintSpans, Surface, Syntax, Description,
              Preference, Origin), 0) :-
+    source_mode(Mode),
     source_unit(Item, Span, PaintSpans, Surface, SourcePreference, Origin),
     text_string(Surface, SurfaceString),
     SurfaceString = Text,
@@ -304,12 +351,15 @@ match_literal_item(
     evidence(Semantic, Span, [], Surface, Syntax, Description, LitPreference,
              tear(EditId, literal(Text))), 1) :-
     surface_prefix(Surface, Text).
+match_literal_item(literal(_, Text, _, _, _), rendered(Text), render,
+                   rendered, 0).
 
-match_argument_item(Name, Kind, Item, _Mode, Value,
+match_argument_item(Name, Kind, Item, Mode, Value,
                     evidence(Value, Span, PaintSpans, Surface, Syntax,
                              Name, Preference, Origin), 0) :-
+    source_mode(Mode),
     source_unit(Item, Span, PaintSpans, Surface, SourcePreference, Origin),
-    parse_argument(Kind, Surface, Value),
+    argument_surface(Kind, Value, Surface),
     kind_syntax(Kind, Syntax),
     Preference is SourcePreference + 10.
 match_argument_item(Name, Kind, edit_tear(EditId, Span, Surface),
@@ -318,14 +368,20 @@ match_argument_item(Name, Kind, edit_tear(EditId, Span, Surface),
                              Name, 10,
                              tear(EditId, argument(Name, Kind))), 1) :-
     kind_syntax(Kind, Syntax).
+match_argument_item(_Name, Kind, rendered(Surface), render, Value, rendered,
+                    0) :-
+    argument_surface(Kind, Value, Surface).
 
-take_repeated(_, _, Items, _Mode, [], [], 0, Items).
-take_repeated(Name, Kind, [Item|Items0], Mode, [Value|Values],
-              [Evidence|EvidenceItems], EditCount, Items) :-
+source_mode(exact).
+source_mode(assist(_)).
+
+relate_repeated_items(_, _, [], Items, _Mode, [], 0, Items).
+relate_repeated_items(Name, Kind, [Value|Values], [Item|Items0], Mode,
+                      [Evidence|EvidenceItems], EditCount, Items) :-
     match_argument_item(Name, Kind, Item, Mode, Value, Evidence,
                         ItemEditCount),
-    take_repeated(Name, Kind, Items0, Mode, Values, EvidenceItems,
-                  RestEditCount, Items),
+    relate_repeated_items(Name, Kind, Values, Items0, Mode, EvidenceItems,
+                          RestEditCount, Items),
     EditCount is ItemEditCount + RestEditCount.
 
 specs_require_input([literal(_, _, _, _, _)|_]).
@@ -346,30 +402,49 @@ missing_source_args([argument(arg(_, _, repeated, Shape))|Specs], Args) :-
     missing_source_args(Specs, RestArgs),
     append(RepeatedArgs, RestArgs, Args).
 
-repeated_arguments(array, Values, Specs, Args) :-
-    ( Values = [_|_]
-    -> Args = [array(Values)]
-    ; specs_have_argument(Specs)
-    -> Args = [array([])]
-    ;  Args = []
-    ).
+repeated_arguments(array, Values, _Specs, [array(Values)]) :-
+    Values = [_|_].
+repeated_arguments(array, [], Specs, [array([])]) :-
+    specs_have_argument(Specs).
+repeated_arguments(array, [], Specs, []) :-
+    \+ specs_have_argument(Specs).
 repeated_arguments(spread, Values, _Specs, Values).
 
 specs_have_argument([argument(_)|_]) :- !.
 specs_have_argument([_|Specs]) :-
     specs_have_argument(Specs).
 
-parse_argument(boolean, Surface, boolean(Value)) :-
-    text_string(Surface, Text),
-    ( Text = "true" -> Value = true ; Text = "false" -> Value = false ).
-parse_argument(integer, Surface, integer(Value)) :-
-    text_string(Surface, Text),
-    number_string(Value, Text),
-    integer(Value).
-parse_argument(string, Surface, string(Text)) :- text_string(Surface, Text).
-parse_argument(path, Surface, string(Text)) :- text_string(Surface, Text).
-parse_argument(base64, Surface, string(Text)) :- text_string(Surface, Text).
-parse_argument(spec, Surface, string(Text)) :- text_string(Surface, Text).
+argument_surface(boolean, boolean(true), Surface) :-
+    canonical_text_surface("true", Surface).
+argument_surface(boolean, boolean(false), Surface) :-
+    canonical_text_surface("false", Surface).
+argument_surface(integer, integer(Value), Text) :-
+    ( integer(Value)
+    -> number_string(Value, Text)
+    ;  text_string(Text, String),
+       number_string(Value, String),
+       integer(Value)
+    ).
+argument_surface(string, string(Text), Surface) :-
+    string_value_surface(Text, Surface).
+argument_surface(path, string(Text), Surface) :-
+    string_value_surface(Text, Surface).
+argument_surface(base64, string(Text), Surface) :-
+    string_value_surface(Text, Surface).
+argument_surface(spec, string(Text), Surface) :-
+    string_value_surface(Text, Surface).
+
+string_value_surface(Text, Surface) :-
+    ( text(Text)
+    -> text_string(Text, Surface)
+    ;  text_string(Surface, Text)
+    ).
+
+canonical_text_surface(Text, Surface) :-
+    ( ground(Surface)
+    -> text_string(Surface, Text)
+    ;  Surface = Text
+    ).
 
 kind_syntax(boolean, boolean).
 kind_syntax(integer, integer).
@@ -710,67 +785,15 @@ paint_highlights([PaintSpan|PaintSpans], Syntax, Semantic, Origin,
 
 render(command(Action, Handler, Target, WireArgs), Style, Text) :-
     action(Action, Handler, Target, _, _, _, _),
-    action_form(Action, Style, Specs, Normalizer),
     denormalize_args(Normalizer, WireArgs, SourceArgs),
-    render_specs(Specs, SourceArgs, Parts),
+    form_relation(Action, Style, RenderedItems, render, Normalizer, SourceArgs,
+                  _Evidence, 0),
+    rendered_parts(RenderedItems, Parts),
     join_parts(Parts, Text).
 
-render_specs([], [], []).
-render_specs([literal(_, Text, _, _, _)|Specs], Args, [Text|Parts]) :-
-    render_specs(Specs, Args, Parts).
-render_specs([argument(arg(_, _, required, scalar))|Specs],
-             [Value|Args], [Text|Parts]) :-
-    render_value(Value, Text),
-    render_specs(Specs, Args, Parts).
-render_specs([argument(arg(_, _, optional, scalar))|Specs], Args0, Parts) :-
-    minimum_arguments(Specs, RequiredAfter),
-    list_length(Args0, Available),
-    ( Available > RequiredAfter
-    -> Args0 = [Value|Args], render_value(Value, Text), Parts = [Text|Rest]
-    ;  Args = Args0, Parts = Rest
-    ),
-    render_specs(Specs, Args, Rest).
-render_specs([argument(arg(_, _, repeated, array))|Specs], Args0, Parts) :-
-    ( Args0 = [array(Values)|Args]
-    -> render_values(Values, ValueParts), append(ValueParts, Rest, Parts)
-    ;  Args = Args0, Parts = Rest
-    ),
-    render_specs(Specs, Args, Rest).
-render_specs([argument(arg(_, _, repeated, spread))|Specs], Args0, Parts) :-
-    minimum_arguments(Specs, RequiredAfter),
-    list_length(Args0, Available),
-    Take is Available - RequiredAfter,
-    Take >= 0,
-    split_count(Take, Args0, Values, Args),
-    render_values(Values, ValueParts),
-    append(ValueParts, Rest, Parts),
-    render_specs(Specs, Args, Rest).
-
-minimum_arguments([], 0).
-minimum_arguments([literal(_, _, _, _, _)|Specs], Count) :-
-    minimum_arguments(Specs, Count).
-minimum_arguments([argument(arg(_, _, required, scalar))|Specs], Count) :-
-    minimum_arguments(Specs, Rest), Count is Rest + 1.
-minimum_arguments([argument(arg(_, _, optional, scalar))|Specs], Count) :-
-    minimum_arguments(Specs, Count).
-minimum_arguments([argument(arg(_, _, repeated, _))|Specs], Count) :-
-    minimum_arguments(Specs, Count).
-
-list_length([], 0).
-list_length([_|Items], Length) :-
-    list_length(Items, Rest), Length is Rest + 1.
-
-split_count(0, Items, [], Items) :- !.
-split_count(Count, [Item|Items], [Item|Taken], Rest) :-
-    Count > 0, Next is Count - 1, split_count(Next, Items, Taken, Rest).
-
-render_values([], []).
-render_values([Value|Values], [Text|Texts]) :-
-    render_value(Value, Text), render_values(Values, Texts).
-
-render_value(string(Text), Text).
-render_value(integer(Value), Text) :- number_string(Value, Text).
-render_value(boolean(Value), Text) :- atom_string(Value, Text).
+rendered_parts([], []).
+rendered_parts([rendered(Text)|Items], [Text|Parts]) :-
+    rendered_parts(Items, Parts).
 
 join_parts([], "").
 join_parts([Part], Part).

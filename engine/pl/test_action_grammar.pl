@@ -6,12 +6,14 @@
 % Core-only test runner: this same file runs in the package-free embedded image.
 test_name(catalog_is_complete_and_valid).
 test_name(wire_identities_are_explicit_unique_and_normalized).
+test_name(representations_project_the_executable_forms).
 test_name(neutral_source_parses_canonical_form).
 test_name(shared_cli_form_uses_complete_schema).
 test_name(alias_normalization_is_wire_ready).
 test_name(string_kinds_do_not_become_numbers).
 test_name(array_wire_shape_is_preserved).
 test_name(parse_render_roundtrip).
+test_name(all_forms_roundtrip_through_shared_sequence_relation).
 test_name(completion_is_projected_from_tear_parse_evidence).
 test_name(tear_parse_checks_every_concrete_suffix_item).
 test_name(application_surface_is_closed).
@@ -89,6 +91,30 @@ run_test(wire_identities_are_explicit_unique_and_normalized) :-
               arg(paused, boolean, required, scalar)])),
     expect(\+ representation(quit, wire, _)).
 
+run_test(representations_project_the_executable_forms) :-
+    once(representation(mirror_resume, verb,
+                        verb("mirror_resume", resume_false))),
+    once(representation(
+        mirror_resume, syntax(verb),
+        syntax([literal(mirror_resume, "mirror_resume", action_identifier,
+                        mirror_resume, 30),
+                argument(arg(id, integer, required, scalar))]))),
+    once(convert(action, mirror_resume, wire,
+                 wire(62, mirror_pause, ui,
+                      [arg(id, integer, required, scalar),
+                       arg(paused, boolean, required, scalar)]))),
+    once(convert(verb, verb("mirror_resume", resume_false), help,
+                 help("ID", "resume a mirror job"))),
+    findall(Action, action(Action, _, _, _, _, _, _), Actions),
+    expect(all_actions_have_singular_core_representations(Actions)).
+
+all_actions_have_singular_core_representations([]).
+all_actions_have_singular_core_representations([Action|Actions]) :-
+    findall(Verb, representation(Action, verb, Verb), [_]),
+    findall(Help, representation(Action, help, Help), [_]),
+    findall(Syntax, representation(Action, syntax(verb), Syntax), [_]),
+    all_actions_have_singular_core_representations(Actions).
+
 all_wire_handlers_are_actions([]).
 all_wire_handlers_are_actions([Handler|Handlers]) :-
     action(Handler, Handler, Target, _, _, _, _),
@@ -136,6 +162,71 @@ run_test(parse_render_roundtrip) :-
     parse_words(["mirror", "resume", "5"], Command),
     render(Command, cli, "mirror resume 5"),
     render(Command, verb, "mirror_resume 5").
+
+run_test(all_forms_roundtrip_through_shared_sequence_relation) :-
+    findall(Action, action(Action, _, _, _, _, _, _), Actions),
+    expect(all_action_forms_roundtrip(Actions)),
+    findall(Action, representation(Action, cli, _), CliActions),
+    expect(all_cli_forms_roundtrip(CliActions)).
+
+all_action_forms_roundtrip([]).
+all_action_forms_roundtrip([Action|Actions]) :-
+    form_roundtrips(Action, verb, minimal),
+    form_roundtrips(Action, verb, full),
+    all_action_forms_roundtrip(Actions).
+
+all_cli_forms_roundtrip([]).
+all_cli_forms_roundtrip([Action|Actions]) :-
+    form_roundtrips(Action, cli, minimal),
+    form_roundtrips(Action, cli, full),
+    all_cli_forms_roundtrip(Actions).
+
+form_roundtrips(Action, Style, Population) :-
+    once(action_grammar:action_form(Action, Style, Specs, _)),
+    spec_surfaces(Specs, Population, Surfaces),
+    items(Surfaces, SourceItems),
+    once(( parse(SourceItems, parse_result(Command, complete, _, _)),
+           Command = command(Action, _, _, _)
+         )),
+    once(render(Command, Style, Rendered)),
+    split_string(Rendered, " ", "", RenderedSurfaces),
+    items(RenderedSurfaces, RenderedItems),
+    once(parse(RenderedItems,
+               parse_result(Command, complete, _, _))).
+
+spec_surfaces([], _, []).
+spec_surfaces([literal(_, Text, _, _, _)|Specs], Population,
+              [Text|Surfaces]) :-
+    spec_surfaces(Specs, Population, Surfaces).
+spec_surfaces([argument(arg(_, Kind, required, scalar))|Specs], Population,
+              [Surface|Surfaces]) :-
+    sample_surface(Kind, Surface),
+    spec_surfaces(Specs, Population, Surfaces).
+spec_surfaces([argument(arg(_, _, optional, scalar))|Specs], minimal,
+              Surfaces) :-
+    spec_surfaces(Specs, minimal, Surfaces).
+spec_surfaces([argument(arg(_, Kind, optional, scalar))|Specs], full,
+              [Surface|Surfaces]) :-
+    sample_surface(Kind, Surface),
+    spec_surfaces(Specs, full, Surfaces).
+spec_surfaces([argument(arg(_, _, repeated, _))|Specs], minimal, Surfaces) :-
+    spec_surfaces(Specs, minimal, Surfaces).
+spec_surfaces([argument(arg(_, Kind, repeated, _))|Specs], full,
+              [First, Second|Surfaces]) :-
+    sample_surfaces(Kind, First, Second),
+    spec_surfaces(Specs, full, Surfaces).
+
+sample_surface(boolean, "true").
+sample_surface(integer, "7").
+sample_surface(string, "text").
+sample_surface(path, "path/to/file").
+sample_surface(base64, "eA==").
+sample_surface(spec, "kind=value").
+
+sample_surfaces(integer, "7", "8") :- !.
+sample_surfaces(Kind, First, Second) :-
+    sample_surface(Kind, First),
+    sample_surface(Kind, Second).
 
 run_test(completion_is_projected_from_tear_parse_evidence) :-
     Items = [edit_tear(edit, span(0, 8), "mirror_r"), end(8)],

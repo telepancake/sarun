@@ -74,10 +74,8 @@
 //! encoding, etc. Not strictly bijective — that's acceptable. True lenses
 //! (lossless round-trip) only where it matters (patches, protocol bytes).
 //!
-//! Parsing, completion, and highlighting now project the same parse witness.
-//! Rendering still traverses `action_form` separately and is therefore an
-//! explicitly unfinished part of the mandatory n-way-relation migration, not
-//! an alternate implementation that may remain.
+//! Parsing and rendering execute the same bidirectional form/sequence relation;
+//! completion and highlighting project the evidence produced by that relation.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -6,8 +6,6 @@
             menu_label/2,
             argument_context/4,
             wire_handler/2,
-            representation/3,
-            convert/4,
             visible_action/1
           ]).
 
@@ -394,22 +392,3 @@ argument_kind(Name, path) :-
 argument_kind("B64", base64) :- !.
 argument_kind("SPEC", spec) :- !.
 argument_kind(_, string).
-
-representation(Action, action, Action) :-
-    action(Action, _, _, _, _, _, _).
-representation(Action, wire, wire(Code, Handler, Target, Schema)) :-
-    action(Action, Handler, Target, _, _, _, _),
-    wire_handler(Handler, Code),
-    argument_schema(Handler, Schema).
-representation(Action, help, help(Notation, Description)) :-
-    action(Action, _, _, Notation, Description, _, _).
-representation(Action, cli, cli(Words, Normalizer)) :-
-    cli_form(Action, Words, Normalizer).
-representation(Action, key, key(Key, Context, Preference)) :-
-    key_binding(Action, Key, Context, Preference).
-representation(Action, menu, menu(Label)) :-
-    menu_label(Action, Label).
-
-convert(FromKind, From, ToKind, To) :-
-    representation(Action, FromKind, From),
-    representation(Action, ToKind, To).
