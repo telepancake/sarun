@@ -270,6 +270,16 @@ false wire argument, without the terminal callback or action operation table.
 The value is not yet installed behind an opaque handle and production Rust is
 not yet consuming it; context observation must resolve lexical arguments in
 the generic engine before that cut-over.
+Generic context staging now resolves successful `one` observations into the
+corresponding neutral argument binding before semantic projection. Dependent
+selectors are declared with argument references, become validated query-graph
+edges, and are resolved only after the referenced observation exists. Choice
+composition namespaces both node identities and nested `ref/1` terms, so the
+graph remains valid outside a branch and routes back inside without client
+inspection. Completion preferences from every successful choice branch are
+merged and reranked globally. Action-level tests cover the reported `kill C1`
+flow, its typed wire-ready result, a two-stage box/path dependency, and context
+completion returned from the ordinary torn parse.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:

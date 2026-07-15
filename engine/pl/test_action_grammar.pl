@@ -34,6 +34,9 @@ test_name(context_completion_rejects_ambiguous_exact_binding).
 test_name(dependent_context_completion_graph).
 test_name(complete_action_language_is_an_immutable_grammar_value).
 test_name(generic_action_relation_parses_and_renders_projection).
+test_name(generic_action_relation_resolves_context_before_projection).
+test_name(generic_action_relation_declares_dependent_context_graph).
+test_name(generic_action_completion_survives_context_roundtrip).
 
 run_action_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -106,6 +109,104 @@ run_test(generic_action_relation_parses_and_renders_projection) :-
                 want([source]), observations([]), Limits),
         reply([solution([binding(source, "mirror resume 7")], 79)],
               [], [], [])).
+
+run_test(generic_action_relation_resolves_context_before_projection) :-
+    once(action_relation_grammar(Grammar)),
+    items(["kill", "C1"], Items),
+    relation_limits(Limits),
+    Query = ask(one, box, name("C1")),
+    Request0 = request(
+        Grammar, given([binding(source, source(Items, exact))]),
+        want([command]), observations([]), Limits),
+    transform(Request0,
+              reply([solution([binding(command,
+                                       command(kill, kill, ui,
+                                               [string("C1")]))], _)],
+                    [query(branch(kill, q(1)), Query)], [], [])),
+    Entry = entry(box, 1, ["C1"], integer(1), []),
+    Observation = observed(branch(kill, q(1)), Query, source(boxes, 9),
+                           some(one(Entry))),
+    Request1 = request(
+        Grammar, given([binding(source, source(Items, exact))]),
+        want([command]), observations([Observation]), Limits),
+    transform(Request1,
+              reply([solution([binding(command,
+                                       command(kill, kill, ui,
+                                               [integer(1)]))], _)],
+                    [query(branch(kill, q(1)), Query)],
+                    [dependency(branch(kill, q(1)), Query,
+                                some(one(Entry)))], [])),
+    once(action_request(command(kill, kill, ui, [integer(1)]),
+                        action_request(kill, 59, [1]))).
+
+run_test(generic_action_relation_declares_dependent_context_graph) :-
+    once(action_relation_grammar(Grammar)),
+    items(["writer", "id", "C1", "src/main.c"], Items),
+    relation_limits(Limits),
+    BoxQuery = ask(one, box, name("C1")),
+    PathQuery = ask(one, path,
+                    within(box(ref(branch(writer_id, q(1)))),
+                           name("src/main.c"))),
+    Graph = [query(branch(writer_id, q(1)), BoxQuery),
+             query(branch(writer_id, q(2)), PathQuery)],
+    transform(
+        request(Grammar, given([binding(source, source(Items, exact))]),
+                want([command]), observations([]), Limits),
+        reply(_, Graph, [], [])),
+    BoxEntry = entry(box, 1, ["C1"], integer(1), []),
+    BoxObservation = observed(branch(writer_id, q(1)), BoxQuery,
+                              source(boxes, 9), some(one(BoxEntry))),
+    transform(
+        request(context_grammar, given([binding(graph, Graph)]), want([ready]),
+                observations([BoxObservation]), Limits),
+        reply([solution([binding(ready,
+                                 [query(branch(writer_id, q(2)),
+                                        ask(one, path,
+                                            within(box(integer(1)),
+                                                   name("src/main.c"))))])],
+                        0)], [], _, [])),
+    PathEntry = entry(path, 8, ["src/main.c"], path("src/main.c"),
+                      [within(box(integer(1)))]),
+    PathObservation = observed(branch(writer_id, q(2)), PathQuery,
+                               source(paths, 3), some(one(PathEntry))),
+    transform(
+        request(Grammar, given([binding(source, source(Items, exact))]),
+                want([command]),
+                observations([BoxObservation, PathObservation]), Limits),
+        reply([solution([binding(command,
+                                 command(writer_id, writer_id, ui,
+                                         [integer(1),
+                                          path("src/main.c")]))], _)],
+              Graph, _, [])).
+
+run_test(generic_action_completion_survives_context_roundtrip) :-
+    once(action_relation_grammar(Grammar)),
+    neutral("kill", 0, Kill),
+    Items = [Kill, edit_tear(edit, span(5, 6), "C"), end(6)],
+    relation_limits(Limits),
+    Query = ask(all, box, prefix("C")),
+    Request0 = request(
+        Grammar, given([binding(source, source(Items, assist(edit)))]),
+        want([command, completions]), observations([]), Limits),
+    transform(Request0,
+              reply(_, [query(branch(kill, q(1)), Query)], [], [])),
+    Entries = [entry(box, 1, ["C1"], integer(1), [])],
+    Observation = observed(branch(kill, q(1)), Query, source(boxes, 9),
+                           some(all(Entries))),
+    Request1 = request(
+        Grammar, given([binding(source, source(Items, assist(edit)))]),
+        want([command, completions]), observations([Observation]), Limits),
+    transform(Request1, Reply),
+    Reply = reply(
+        [solution([binding(command,
+                           command(kill, kill, ui,
+                                   [hole(sid, string)])),
+                   binding(completions, Completions)], 90)],
+        [query(branch(kill, q(1)), Query)], _, []),
+    Completions = [completion(span(5, 6), "C1",
+                              [alternative(context(box, 1), context_argument,
+                                           boxes, 90)],
+                              90, 1)].
 
 all_help_rows_match(_, []).
 all_help_rows_match(Filter, [record(CommandText, _, Description)|Rows]) :-

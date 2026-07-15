@@ -70,7 +70,8 @@ transform_relation(choice_grammar(Alternatives), Given, Wanted, Observations,
     Replies = [_|_],
     choice_replies(Replies, Solutions0, Queries0, DependencyKeys0,
                    Diagnostics0),
-    limit_solutions(Solutions0, MaxSolutions, Solutions, LimitDiagnostics),
+    choice_completion_projection(Solutions0, Solutions1),
+    limit_solutions(Solutions1, MaxSolutions, Solutions, LimitDiagnostics),
     sort(Queries0, Queries),
     sort(DependencyKeys0, DependencyKeys),
     append(Diagnostics0, LimitDiagnostics, Diagnostics).
@@ -114,9 +115,11 @@ transform_relation(
     Candidates0 = [_|_],
     limit_solutions(Candidates0, MaxSolutions, Candidates, Diagnostics),
     candidate_context_queries(Contexts, Mode, Candidates, Queries),
+    valid_query_graph(Queries),
     candidate_completions(Mode, Contexts, Candidates, Queries, Observations,
                           Completions),
-    candidate_solutions(Candidates, Wanted, Completions, Solutions),
+    candidate_solutions(Candidates, Specs, Contexts, Queries, Observations,
+                        Wanted, Completions, Solutions),
     observation_dependency_keys(Observations, DependencyKeys).
 transform_relation(
     sequence_grammar(Specs, terminals(Terminals), separator(Separator),
@@ -152,8 +155,9 @@ choice_alternative_reply([_|Alternatives], Given, Wanted, Observations,
 scoped_observations(_, [], []).
 scoped_observations(Key,
                     [observed(branch(Key, Id), Query, Source, Outcome)|Rest],
-                    [observed(Id, Query, Source, Outcome)|Inner]) :-
+                    [observed(Id, InnerQuery, Source, Outcome)|Inner]) :-
     !,
+    unscope_term_refs(Query, Key, InnerQuery),
     scoped_observations(Key, Rest, Inner).
 scoped_observations(Key, [_|Rest], Inner) :-
     scoped_observations(Key, Rest, Inner).
@@ -166,20 +170,74 @@ scope_reply(Key, AlternativePreference,
     scope_dependencies(Key, Dependencies0, Dependencies).
 
 scope_solutions([], _, []).
-scope_solutions([solution(Bindings, Preference0)|Rest], AlternativePreference,
+scope_solutions([solution(Bindings0, Preference0)|Rest], AlternativePreference,
                 [solution(Bindings, Preference)|Solutions]) :-
     Preference is Preference0 + AlternativePreference,
+    scope_binding_preferences(Bindings0, AlternativePreference, Bindings),
     scope_solutions(Rest, AlternativePreference, Solutions).
+
+scope_binding_preferences([], _, []).
+scope_binding_preferences([binding(completions, Completions0)|Bindings], Added,
+                          [binding(completions, Completions)|Scoped]) :-
+    !,
+    scope_completions(Completions0, Added, Completions),
+    scope_binding_preferences(Bindings, Added, Scoped).
+scope_binding_preferences([Binding|Bindings], Added, [Binding|Scoped]) :-
+    scope_binding_preferences(Bindings, Added, Scoped).
+
+scope_completions([], _, []).
+scope_completions(
+    [completion(Span, Text, Alternatives0, Preference0, Rank)|Completions],
+    Added,
+    [completion(Span, Text, Alternatives, Preference, Rank)|Scoped]) :-
+    Preference is Preference0 + Added,
+    scope_completion_alternatives(Alternatives0, Added, Alternatives),
+    scope_completions(Completions, Added, Scoped).
+
+scope_completion_alternatives([], _, []).
+scope_completion_alternatives(
+    [alternative(Semantic, Syntax, Description, Preference0)|Alternatives],
+    Added,
+    [alternative(Semantic, Syntax, Description, Preference)|Scoped]) :-
+    Preference is Preference0 + Added,
+    scope_completion_alternatives(Alternatives, Added, Scoped).
 
 scope_queries(_, [], []).
 scope_queries(Key, [query(Id, Query)|Rest],
-              [query(branch(Key, Id), Query)|Queries]) :-
+              [query(branch(Key, Id), ScopedQuery)|Queries]) :-
+    scope_term_refs(Query, Key, ScopedQuery),
     scope_queries(Key, Rest, Queries).
 
 scope_dependencies(_, [], []).
 scope_dependencies(Key, [dependency(Id, Query, Outcome)|Rest],
-                   [dependency(branch(Key, Id), Query, Outcome)|Dependencies]) :-
+                   [dependency(branch(Key, Id), ScopedQuery, Outcome)|Dependencies]) :-
+    scope_term_refs(Query, Key, ScopedQuery),
     scope_dependencies(Key, Rest, Dependencies).
+
+scope_term_refs(ref(Id), Key, ref(branch(Key, Id))) :- !.
+scope_term_refs(Term, _, Term) :- atomic(Term), !.
+scope_term_refs(Term, Key, Scoped) :-
+    Term =.. [Functor|Arguments],
+    scope_term_ref_list(Arguments, Key, ScopedArguments),
+    Scoped =.. [Functor|ScopedArguments].
+
+scope_term_ref_list([], _, []).
+scope_term_ref_list([Argument|Arguments], Key, [Scoped|ScopedArguments]) :-
+    scope_term_refs(Argument, Key, Scoped),
+    scope_term_ref_list(Arguments, Key, ScopedArguments).
+
+unscope_term_refs(ref(branch(Key, Id)), Key, ref(Id)) :- !.
+unscope_term_refs(Term, _, Term) :- atomic(Term), !.
+unscope_term_refs(Term, Key, Unscoped) :-
+    Term =.. [Functor|Arguments],
+    unscope_term_ref_list(Arguments, Key, UnscopedArguments),
+    Unscoped =.. [Functor|UnscopedArguments].
+
+unscope_term_ref_list([], _, []).
+unscope_term_ref_list([Argument|Arguments], Key,
+                      [Unscoped|UnscopedArguments]) :-
+    unscope_term_refs(Argument, Key, Unscoped),
+    unscope_term_ref_list(Arguments, Key, UnscopedArguments).
 
 choice_replies([], [], [], [], []).
 choice_replies([reply(Solutions0, Queries0, Dependencies0, Diagnostics0)|Rest],
@@ -189,6 +247,43 @@ choice_replies([reply(Solutions0, Queries0, Dependencies0, Diagnostics0)|Rest],
     append(Queries0, Queries1, Queries),
     append(Dependencies0, Dependencies1, Dependencies),
     append(Diagnostics0, Diagnostics1, Diagnostics).
+
+choice_completion_projection(Solutions0, Solutions) :-
+    findall(Pair, solution_completion_pair(Solutions0, Pair), Pairs),
+    ( Pairs = []
+    -> Solutions = Solutions0
+    ;  project_completions(Pairs, Completions),
+       replace_solution_completions(Solutions0, Completions, Solutions)
+    ).
+
+solution_completion_pair(Solutions, Pair) :-
+    candidate_member(solution(Bindings, _), Solutions),
+    given_value(completions, Bindings, Completions),
+    candidate_member(
+        completion(Span, Text, Alternatives, _Preference, _Rank),
+        Completions),
+    candidate_member(
+        alternative(Semantic, Syntax, Description, AlternativePreference),
+        Alternatives),
+    Pair = completion_key(Span, Text)-
+               (alternative(Semantic, Syntax, Description)-
+                AlternativePreference).
+
+replace_solution_completions([], _, []).
+replace_solution_completions([solution(Bindings0, Preference)|Solutions0],
+                             Completions,
+                             [solution(Bindings, Preference)|Solutions]) :-
+    replace_completion_binding(Bindings0, Completions, Bindings),
+    replace_solution_completions(Solutions0, Completions, Solutions).
+
+replace_completion_binding([], _, []).
+replace_completion_binding([binding(completions, _)|Bindings], Completions,
+                           [binding(completions, Completions)|Replaced]) :-
+    !,
+    replace_completion_binding(Bindings, Completions, Replaced).
+replace_completion_binding([Binding|Bindings], Completions,
+                           [Binding|Replaced]) :-
+    replace_completion_binding(Bindings, Completions, Replaced).
 
 % A projection template is a small pure relation over generic bindings:
 %
@@ -385,33 +480,66 @@ candidate_context_queries(Contexts, assist(EditId), Candidates, Queries) :-
 % Exact and assist queries share stable q(N) identifiers determined solely by
 % contextual evidence order. Non-contextual literals do not perturb them.
 evidence_context_query(Contexts, Evidence, Mode, Index, Query) :-
-    evidence_context_query_(Contexts, Evidence, Mode, Index, _Next, Query).
+    evidence_context_query_(Contexts, Evidence, Mode, Index, _Next, [],
+                            _Known, Query).
 
-evidence_context_query_(Contexts, [Item|_], Mode, Index, Next, Query) :-
-    contextual_evidence(Contexts, Item, Mode, Index, Query),
+evidence_context_query_(Contexts, [Item|_], Mode, Index, Next, Known,
+                        NextKnown, Query) :-
+    contextual_evidence(Contexts, Item, Mode, Index, Known, Query, Name),
+    NextKnown = [Name-q(Index)|Known],
     Next is Index + 1.
-evidence_context_query_(Contexts, [Item|Items], Mode, Index, Next, Query) :-
-    ( contextual_evidence(Contexts, Item, Mode, Index, _)
-    -> Following is Index + 1
-    ;  Following = Index
+evidence_context_query_(Contexts, [Item|Items], Mode, Index, Next, Known,
+                        NextKnown, Query) :-
+    ( contextual_evidence(Contexts, Item, Mode, Index, Known, _, Name)
+    -> Following is Index + 1,
+       FollowingKnown = [Name-q(Index)|Known]
+    ;  Following = Index,
+       FollowingKnown = Known
     ),
-    evidence_context_query_(Contexts, Items, Mode, Following, Next, Query).
+    evidence_context_query_(Contexts, Items, Mode, Following, Next,
+                            FollowingKnown, NextKnown, Query).
 
 contextual_evidence(Contexts,
                     evidence(_, _, _, Surface, _, Name, _, Origin),
-                    Mode, Index, query(q(Index), Ask)) :-
-    context_descriptor(Name, Cardinality, Domain, root, Contexts),
-    context_ask(Mode, Origin, Cardinality, Domain, Surface, Ask).
+                    Mode, Index, Known, query(q(Index), Ask), Name) :-
+    context_descriptor(Name, Cardinality, Domain, Scope, Contexts),
+    context_ask(Mode, Origin, Cardinality, Domain, Scope, Known, Surface, Ask).
 
-context_ask(exact, _, Cardinality, Domain, Surface,
-            ask(Cardinality, Domain, name(Surface))) :-
+context_ask(exact, _, Cardinality, Domain, Scope, Known, Surface,
+            ask(Cardinality, Domain, Selector)) :-
+    context_selector(Scope, Known, name(Surface), Selector),
     context_cardinality(Cardinality).
-context_ask(assist(EditId), tear(EditId, argument(_, _)), one, Domain, Surface,
-            ask(all, Domain, prefix(Surface))).
-context_ask(assist(EditId), tear(EditId, argument(_, _)), all, Domain, Surface,
-            ask(all, Domain, prefix(Surface))).
-context_ask(assist(EditId), tear(EditId, argument(_, _)), empty, Domain, Surface,
-            ask(empty, Domain, prefix(Surface))).
+context_ask(assist(EditId), tear(EditId, argument(_, _)), one, Domain, Scope,
+            Known, Surface, ask(all, Domain, Selector)) :-
+    context_selector(Scope, Known, prefix(Surface), Selector).
+context_ask(assist(EditId), tear(EditId, argument(_, _)), all, Domain, Scope,
+            Known, Surface, ask(all, Domain, Selector)) :-
+    context_selector(Scope, Known, prefix(Surface), Selector).
+context_ask(assist(EditId), tear(EditId, argument(_, _)), empty, Domain, Scope,
+            Known, Surface, ask(empty, Domain, Selector)) :-
+    context_selector(Scope, Known, prefix(Surface), Selector).
+
+context_selector(root, _, Selector, Selector).
+context_selector(within(Template), Known, Selector,
+                 within(Resolved, Selector)) :-
+    resolve_context_template(Template, Known, Resolved).
+
+resolve_context_template(argument(Name), Known, ref(Id)) :-
+    known_context(Name, Known, Id), !.
+resolve_context_template(Term, _, Term) :- atomic(Term), !.
+resolve_context_template(Term, Known, Resolved) :-
+    Term =.. [Functor|Arguments],
+    resolve_context_templates(Arguments, Known, ResolvedArguments),
+    Resolved =.. [Functor|ResolvedArguments].
+
+resolve_context_templates([], _, []).
+resolve_context_templates([Argument|Arguments], Known,
+                          [Resolved|ResolvedArguments]) :-
+    resolve_context_template(Argument, Known, Resolved),
+    resolve_context_templates(Arguments, Known, ResolvedArguments).
+
+known_context(Name, [Name-Id|_], Id).
+known_context(Name, [_|Known], Id) :- known_context(Name, Known, Id).
 
 context_cardinality(empty).
 context_cardinality(one).
@@ -429,15 +557,26 @@ context_completion_pair(
     candidate_member(
         evidence(_, Span, _, Surface, _, Name, _,
                  tear(EditId, argument(Name, _))), Evidence),
-    context_descriptor(Name, one, Domain, root, Contexts),
+    context_descriptor(Name, one, Domain, _Scope, Contexts),
     candidate_member(query(Id, Query), Queries),
-    Query = ask(all, Domain, prefix(Surface)),
+    Query = ask(all, Domain, Selector),
+    selector_has_prefix(Selector, Surface),
     candidate_member(
         observed(Id, Query, Source, some(all(Entries))), Observations),
     Source = source(Provider, _Revision),
-    context_tear_match(Query, snapshot(Source, Entries), Surface, Text,
+    resolve_query_refs(Query, Observations, ResolvedQuery),
+    context_tear_match(ResolvedQuery, snapshot(Source, Entries), Surface, Text,
                        _ExactQuery,
                        entry(Domain, Identity, _Names, _Value, _Attributes)).
+
+selector_has_prefix(prefix(Surface), Surface).
+selector_has_prefix(within(_, Selector), Surface) :-
+    selector_has_prefix(Selector, Surface).
+selector_has_prefix(and(Left, _), Surface) :- selector_has_prefix(Left, Surface).
+selector_has_prefix(and(_, Right), Surface) :-
+    selector_has_prefix(Right, Surface).
+selector_has_prefix(or(Left, _), Surface) :- selector_has_prefix(Left, Surface).
+selector_has_prefix(or(_, Right), Surface) :- selector_has_prefix(Right, Surface).
 
 observation_dependency_keys(Observations, Keys) :-
     findall(Key,
@@ -446,17 +585,70 @@ observation_dependency_keys(Observations, Keys) :-
             ),
             Keys).
 
-candidate_solutions([], _, _, []).
+candidate_solutions([], _, _, _, _, _, _, []).
 candidate_solutions(
     [candidate(Arguments, Evidence, Status, Preference, Highlights)|Candidates],
-    Wanted, Completions, [solution(Bindings, Preference)|Solutions]) :-
-    Available = [binding(arguments, Arguments),
+    Specs, Contexts, Queries, Observations, Wanted, Completions,
+    [solution(Bindings, Preference)|Solutions]) :-
+    resolve_context_arguments(Specs, Contexts, Evidence, Queries, Observations,
+                              Arguments, ResolvedArguments),
+    Available = [binding(arguments, ResolvedArguments),
                  binding(evidence, Evidence),
                  binding(status, Status),
                  binding(highlights, Highlights),
                  binding(completions, Completions)],
     requested_bindings(Wanted, Available, Bindings),
-    candidate_solutions(Candidates, Wanted, Completions, Solutions).
+    candidate_solutions(Candidates, Specs, Contexts, Queries, Observations,
+                        Wanted, Completions, Solutions).
+
+resolve_context_arguments(Specs, Contexts, Evidence, Queries, Observations,
+                          Arguments, Resolved) :-
+    context_replacements(Evidence, Specs, Contexts, Queries, Observations,
+                         1, 1, Replacements),
+    replace_arguments(Replacements, Arguments, Resolved).
+
+context_replacements([], _, _, _, _, _, _, []).
+context_replacements(
+    [evidence(_, _, _, _, _, Name, _, Origin)|Evidence], Specs, Contexts,
+    Queries, Observations, QueryIndex, ArgumentIndex, Replacements) :-
+    ( spec_argument_name(Name, Specs)
+    -> NextArgument is ArgumentIndex + 1,
+       ( context_descriptor(Name, _, _, _, Contexts)
+       -> Id = q(QueryIndex),
+          NextQuery is QueryIndex + 1,
+          ( Origin \= tear(_, _),
+            candidate_member(query(Id, Query), Queries),
+            candidate_member(
+                observed(Id, Query, _,
+                         some(one(entry(_, _, _, Value, _)))),
+                Observations)
+          -> Replacements = [replace(ArgumentIndex, Value)|Rest]
+          ;  Replacements = Rest
+          )
+       ;  NextQuery = QueryIndex,
+          Replacements = Rest
+       )
+    ;  NextArgument = ArgumentIndex,
+       NextQuery = QueryIndex,
+       Replacements = Rest
+    ),
+    context_replacements(Evidence, Specs, Contexts, Queries, Observations,
+                         NextQuery, NextArgument, Rest).
+
+spec_argument_name(Name, [argument(arg(Name, _, _, _))|_]).
+spec_argument_name(Name, [_|Specs]) :- spec_argument_name(Name, Specs).
+
+replace_arguments([], Arguments, Arguments).
+replace_arguments([replace(Index, Value)|Replacements], Arguments0,
+                  Arguments) :-
+    replace_argument(Index, Arguments0, Value, Arguments1),
+    replace_arguments(Replacements, Arguments1, Arguments).
+
+replace_argument(1, [_|Values], Value, [Value|Values]) :- !.
+replace_argument(Index, [Head|Values], Value, [Head|Result]) :-
+    Index > 1,
+    Next is Index - 1,
+    replace_argument(Next, Values, Value, Result).
 
 candidate_member(Candidate, [Candidate|_]).
 candidate_member(Candidate, [_|Candidates]) :-
