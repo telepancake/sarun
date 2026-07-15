@@ -2414,23 +2414,12 @@ pub fn write_api_box_net_shadows(net: &crate::net::Net) -> std::io::Result<()> {
     Ok(())
 }
 
-/// One row of the UI-verb surface. VERB_DOCS and the dispatch match both
-/// expand from the single `ui_verbs!` token list, so the docs cannot drift
-/// from the arms (same principle as the UI's PANE_KEYS-derived help).
-pub struct VerbDoc {
-    pub name: &'static str,
-    pub args: &'static str,
-    pub help: &'static str,
-}
-
-/// ONE edit site per verb: `"name", "ARGS", "help" => { body }`. Args
-/// notation: UPPER = required, [X] = optional, X... = variadic. The context
-/// idents (state/verb/args/boxes) ride in the list so the emitted fn's
-/// binders share the bodies' hygiene context (a plain `fn` in the emitter
-/// could not see `state` used by body tokens born in THIS macro).
+/// Implementation dispatch only. Names, schemas, descriptions, syntax, keys,
+/// and menus belong to the Prolog relation. The context idents ride in the
+/// list so the emitted function's binders share the bodies' hygiene context.
 macro_rules! ui_verbs {
     ($emit:ident) => { $emit! { (state, verb, args, boxes)
-        "session_dicts", "", "list every box with status metadata (live overridden for running boxes)" => {
+        "session_dicts" => {
             // discover::session_dict reads on-disk metadata only, so every box
             // looks "finished" to it. Override `live` / `status` / `pid` for
             // boxes whose runner is still registered with this engine — that's
@@ -2476,96 +2465,96 @@ macro_rules! ui_verbs {
                 sd
             }).collect())
         }
-        "display_path", "SID", "human display path for a box" => { match arg_sid(args) {
+        "display_path" => { match arg_sid(args) {
             Some(id) => Value::String(discover::display_path(&boxes, id)),
             None => Value::Null,
         }
         }
-        "resolve_box", "NAME_OR_ID", "resolve a box name/id to its numeric id" => { match args.first().and_then(Value::as_str)
+        "resolve_box" => { match args.first().and_then(Value::as_str)
             .and_then(|s| resolve(&boxes, s)) {
             Some(id) => Value::String(id.to_string()),
             None => Value::Null,
         }
         }
-        "select", "SID", "set the engine-side selected box" => {
+        "select" => {
             if let Some(id) = arg_sid(args) {
                 lock(state).selected = Some(id.to_string());
             }
             json!({"ok": true})
         }
-        "processes", "SID", "captured process rows for a box" => { match arg_sid(args) {
+        "processes" => { match arg_sid(args) {
             Some(id) => discover::processes(id),
             None => json!([]),
         }
         }
-        "outputs", "SID", "decoded stdout/stderr transcript rows" => { match arg_sid(args) {
+        "outputs" => { match arg_sid(args) {
             Some(id) => discover::outputs(id),
             None => json!([]),
         }
         }
-        "api_log", "SID", "--api oaita proxy request log" => { match arg_sid(args) {
+        "api_log" => { match arg_sid(args) {
             Some(id) => discover::api_log(id),
             None => json!([]),
         }
         }
-        "api_log_detail", "SID ROW", "full request/response detail of one api_log row" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "api_log_detail" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::api_log_detail(id, rid),
             _ => Value::Null,
         }
         }
         // Web capture (DESIGN-web.md W4): summary rows + full detail, mirroring
         // api_log. Feeds the UI's Captures pane and the oaita web tools.
-        "webcap", "SID", "web-capture summary rows (tap MITM archive)" => { match arg_sid(args) {
+        "webcap" => { match arg_sid(args) {
             Some(id) => discover::webcap(id),
             None => json!([]),
         }
         }
-        "webcap_detail", "SID ROW", "full detail of one web capture" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "webcap_detail" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::webcap_detail(id, rid),
             _ => Value::Null,
         }
         }
         // Raw (base64) response body of one capture — for the image viewer,
         // which needs lossless binary the lossy-UTF8 detail can't carry.
-        "webcap_body", "SID ROW", "raw base64 response body of one capture" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "webcap_body" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::webcap_body(id, rid),
             _ => Value::Null,
         }
         }
-        "brushprov", "SID", "brush semantic-provenance rows (pipelines)" => { match arg_sid(args) {
+        "brushprov" => { match arg_sid(args) {
             Some(id) => discover::brushprov(id),
             None => json!([]),
         }
         }
         // Phase 1 embedded-ninja: the parsed build-graph edges (outs/ins/cmd),
         // including up-to-date targets that never executed.
-        "build_edges", "SID", "parsed ninja/make build-graph edges" => { match arg_sid(args) {
+        "build_edges" => { match arg_sid(args) {
             Some(id) => discover::build_edges(id),
             None => json!([]),
         }
         }
         // D9 brush↔process linkage joins (both directions).
-        "proc_pipeline", "SID ROW", "the pipeline a process belongs to" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "proc_pipeline" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::proc_pipeline(id, rid),
             _ => Value::Null,
         }
         }
-        "output_pipeline", "SID OUTPUT", "the pipeline an output row belongs to" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "output_pipeline" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(oid)) => discover::output_pipeline(id, oid),
             _ => Value::Null,
         }
         }
-        "pipeline_procs", "SID PIPELINE", "processes belonging to a pipeline" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "pipeline_procs" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(pid)) => discover::pipeline_procs(id, pid),
             _ => json!([]),
         }
         }
-        "output_detail", "SID OUTPUT", "one output row in full" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "output_detail" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(oid)) => discover::output_detail(id, oid),
             _ => Value::Null,
         }
         }
-        "processes_live", "SID", "process snapshot when the box is live, else null" => {
+        "processes_live" => {
             // For a box whose runner is still registered the engine returns
             // the captured process set as the "live" snapshot; the UI uses
             // null vs non-null to choose live-style vs finished-style
@@ -2580,38 +2569,38 @@ macro_rules! ui_verbs {
                 _ => Value::Null,
             }
         }
-        "proc_info", "SID ROW", "one process row in full" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "proc_info" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::proc_info(id, rid),
             _ => Value::Null,
         }
         }
-        "proc_prov", "SID ROW", "brush provenance for one process" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "proc_prov" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::proc_prov(id, rid),
             _ => Value::Null,
         }
         }
-        "proc_roots", "SID", "root processes of the captured tree" => { match arg_sid(args) {
+        "proc_roots" => { match arg_sid(args) {
             Some(id) => discover::proc_roots(id), None => json!([]),
         }
         }
-        "process_env", "SID ROW", "recorded environment of one process" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
+        "process_env" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::process_env(id, rid),
             _ => json!({}),
         }
         }
-        "writer_id", "SID REL", "process that last wrote a path" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+        "writer_id" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => discover::writer_id(id, rel), _ => Value::Null,
         }
         }
-        "first_writer_id", "SID REL", "process that first wrote a path" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+        "first_writer_id" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => discover::first_writer_id(id, rel), _ => Value::Null,
         }
         }
-        "first_writer_prov", "SID REL", "provenance of the first writer of a path" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+        "first_writer_prov" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => discover::first_writer_prov(id, rel), _ => Value::Null,
         }
         }
-        "stuck", "SID", "live THREADS of a running box with wchan/syscall (wedge diagnosis)" => { match arg_sid(args) {
+        "stuck" => { match arg_sid(args) {
             // A wedged box is invisible from the outside — this answers
             // WHERE it is stuck without strace. Descend to THREADS, not
             // just processes: the engine's own workers (a wedged in-box
@@ -2813,7 +2802,7 @@ macro_rules! ui_verbs {
             None => json!({"ok": false, "error": "no slopbox"}),
         }
         }
-        "kill", "SID", "SIGTERM the box's runner" => { match arg_sid(args) {
+        "kill" => { match arg_sid(args) {
             Some(id) => {
                 let fd = lock(state).box_pids.get(&id).copied();
                 match fd {
@@ -2824,12 +2813,12 @@ macro_rules! ui_verbs {
             None => json!({"ok": false, "error": "no slopbox"}),
         }
         }
-        "dissolve", "SID", "remove a box, promoting its changes down into children" => { match arg_sid(args) {
+        "dissolve" => { match arg_sid(args) {
             Some(id) => dissolve(state, id),
             None => json!({"ok": false, "error": "no slopbox"}),
         }
         }
-        "apply_to_copy", "SID", "apply a box's changes onto a COPY of its parent (parent untouched)" => {
+        "apply_to_copy" => {
             match arg_sid(args) {
                 Some(id) => apply_to_copy(state, boxes, id),
                 None => json!({"ok": false, "error": "no slopbox"}),
@@ -2845,7 +2834,7 @@ macro_rules! ui_verbs {
         // list = detach all). A box row is hydrated from its at-rest
         // sqlar if not already live; an ext row opens lazily at first
         // use.
-        "ro_attach", "SID [RO_ID|{kind,store,ref,rev,prefix,name}...]", "replace the box's read-only attachment list (ints = box ids, objects = external refs)" => {
+        "ro_attach" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -2908,7 +2897,7 @@ macro_rules! ui_verbs {
         // + pool blob, exactly as if the box had written it. args:
         // [sid, store_path, refname, dest?, subpath?] — dest prefixes the
         // written paths (checkout into a subdirectory of the box).
-        "git_checkout", "SID STORE REF [DEST] [SUBPATH]", "check a commit out of a mirror store into the box's changes" => {
+        "git_checkout" => {
             use crate::depot::BoxDepot as _;
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
@@ -3024,7 +3013,7 @@ macro_rules! ui_verbs {
         // rev read here is the PIN: the readout serves exactly that
         // revision as <title>.txt under prefix at first read
         // (attach.rs), even after later imports move the head.
-        "wiki_attach", "SID ROOT PAGE [PREFIX]", "attach a wikipedia mirror page as a read-only external reference pinned at its current head revision" => {
+        "wiki_attach" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -3118,7 +3107,7 @@ macro_rules! ui_verbs {
         // exactly that revision as <draft>-<rev>.txt under prefix at
         // first read (attach.rs), even after later updates move the
         // head.
-        "ietf_attach", "SID ROOT DRAFT [PREFIX]", "attach an IETF draft as a read-only external reference pinned at its current head revision" => {
+        "ietf_attach" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -3162,13 +3151,13 @@ macro_rules! ui_verbs {
             json!({"ok": true, "name": name, "rev": head_rev})
         }
         // Mirror-update jobs (mirrors.rs): the schedule surface.
-        "mirror_jobs", "", "list scheduled mirror-update jobs" => { match crate::mirrors::jobs_list() {
+        "mirror_jobs" => { match crate::mirrors::jobs_list() {
             Ok(jobs) => serde_json::to_value(jobs).unwrap_or(Value::Null),
             Err(e) => return json!({"ok": false, "error": e}),
         }
         }
         // args: [kind, src, dest, interval_secs]
-        "mirror_add", "KIND SRC DEST [INTERVAL_SECS]", "add a scheduled mirror-update job" => {
+        "mirror_add" => {
             let (Some(kind), Some(src), Some(dest)) = (
                 args.first().and_then(Value::as_str),
                 args.get(1).and_then(Value::as_str),
@@ -3183,7 +3172,7 @@ macro_rules! ui_verbs {
             }
         }
         // args: [id] — force-run one job now (paused included).
-        "mirror_run", "ID", "force-run one mirror job now" => { match args.first().and_then(Value::as_i64) {
+        "mirror_run" => { match args.first().and_then(Value::as_i64) {
             Some(id) => match crate::mirrors::job_run(id) {
                 Ok(()) => json!({"ok": true}),
                 Err(e) => json!({"ok": false, "error": e}),
@@ -3192,13 +3181,13 @@ macro_rules! ui_verbs {
         }
         }
         // Start every due/stopped unpaused job.
-        "mirror_run_pending", "", "start every due unpaused mirror job" => { match crate::mirrors::run_pending() {
+        "mirror_run_pending" => { match crate::mirrors::run_pending() {
             Ok(ids) => json!({"ok": true, "started": ids}),
             Err(e) => json!({"ok": false, "error": e}),
         }
         }
         // args: [id, paused(bool)]
-        "mirror_pause", "ID PAUSED", "pause or resume a mirror job" => {
+        "mirror_pause" => {
             let (Some(id), Some(p)) = (
                 args.first().and_then(Value::as_i64),
                 args.get(1).and_then(Value::as_bool),
@@ -3211,7 +3200,7 @@ macro_rules! ui_verbs {
             }
         }
         // args: [id]
-        "mirror_rm", "ID", "remove a mirror job (git: drops the repo.git fetch buffer, keeps <dest>/store)" => { match args.first().and_then(Value::as_i64) {
+        "mirror_rm" => { match args.first().and_then(Value::as_i64) {
             Some(id) => match crate::mirrors::job_remove(id) {
                 Ok(note) => json!({"ok": true, "note": note}),
                 Err(e) => json!({"ok": false, "error": e}),
@@ -3226,7 +3215,7 @@ macro_rules! ui_verbs {
         // the old parent box holds the inverse (replicas + holes) and
         // becomes the child. Purely syntactic — no view, no host I/O;
         // ancestors are consulted only as recorded data.
-        "rotate", "SID", "promote a child box over its parent (both at rest)" => {
+        "rotate" => {
             let ov = lock(state).overlay.clone();
             let (Some(ov), Some(child_id)) = (ov, arg_sid(args)) else {
                 return json!({"ok": false, "error": "no overlay / bad sid"});
@@ -3328,13 +3317,13 @@ macro_rules! ui_verbs {
             parent.load_mirror();
             json!({"ok": true, "parent": child_id, "child": parent_id})
         }
-        "reload_rules", "", "reload the file-rules from disk" => {
+        "reload_rules" => {
             if let Some(ov) = lock(state).overlay.clone() {
                 ov.reload_rules();
             }
             json!(null)
         }
-        "delete", "SID", "remove a box, promoting its changes down (alias of dissolve)" => { match arg_sid(args) {
+        "delete" => { match arg_sid(args) {
             // Free the box, KEEPING any boxes stacked on it: children have this
             // box's view copied down into them and are re-parented onto the
             // grandparent, so their merged view is unchanged. Same operation as
@@ -3345,25 +3334,25 @@ macro_rules! ui_verbs {
             None => json!({"ok": false}),
         }
         }
-        "review.session_changes", "SID", "changed files of a box" => { match arg_sid(args) {
+        "review.session_changes" => { match arg_sid(args) {
             Some(id) => crate::review::session_changes(id),
             None => json!([]),
         }
         }
-        "review.hunks", "SID REL", "unified-diff hunks for one changed file" => {
+        "review.hunks" => {
             match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
                 (Some(id), Some(rel)) => crate::review::hunks(id, rel),
                 _ => json!({"is_text": false, "hunks": [],
                             "diff": {"kind": "error", "error": "bad args"}}),
             }
         }
-        "review.file_bytes", "SID REL", "current bytes of one box path (captured write, else host), base64" => {
+        "review.file_bytes" => {
             match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
                 (Some(id), Some(rel)) => crate::review::file_bytes(id, rel),
                 _ => json!({"ok": false, "error": "bad args"}),
             }
         }
-        "review.write_file", "SID REL B64", "overwrite one box path's bytes (editor save) — captured like the box's own write, host untouched" => {
+        "review.write_file" => {
             let ov = lock(state).overlay.clone();
             match (ov, arg_sid(args), args.get(1).and_then(Value::as_str),
                    args.get(2).and_then(Value::as_str)) {
@@ -3378,7 +3367,7 @@ macro_rules! ui_verbs {
                 _ => json!({"ok": false, "error": "bad args"}),
             }
         }
-        "review.apply", "SID [PATHS...]", "apply a box's changes to the host" => { match arg_sid(args) {
+        "review.apply" => { match arg_sid(args) {
             // Audit H3: refuse a still-running box — its captured blobs may be
             // mid-write, so applying could stamp a torn blob onto the host.
             Some(id) if box_is_running(state, id) => json!({"applied": [],
@@ -3392,7 +3381,7 @@ macro_rules! ui_verbs {
             None => json!({"applied": [], "errors": []}),
         }
         }
-        "review.discard", "SID [PATHS...]", "discard a box's changes" => { match arg_sid(args) {
+        "review.discard" => { match arg_sid(args) {
             // Audit H3: same running-box guard as apply (discard reads the same
             // blobs to copy them DOWN into children before dropping the row).
             Some(id) if box_is_running(state, id) => json!({"discarded": [],
@@ -3406,7 +3395,7 @@ macro_rules! ui_verbs {
             None => json!({"discarded": [], "errors": []}),
         }
         }
-        "review.file_groups", "SID", "named file-groups + how many of the box's changes each selects" => {
+        "review.file_groups" => {
             match arg_sid(args) {
                 Some(id) => {
                     let paths = crate::review::changed_paths(id);
@@ -3420,7 +3409,7 @@ macro_rules! ui_verbs {
                 None => json!({"ok": false, "error": "no slopbox"}),
             }
         }
-        "review.patch_text", "SID", "whole-box patch as base64" => { match arg_sid(args) {
+        "review.patch_text" => { match arg_sid(args) {
             Some(id) => {
                 let data = crate::review::patch_text(id);
                 json!({"__b": base64::engine::general_purpose::STANDARD.encode(&data)})
@@ -3428,21 +3417,21 @@ macro_rules! ui_verbs {
             None => json!({"__b": ""}),
         }
         }
-        "review.change_mode", "SID REL", "current mode of one changed path" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+        "review.change_mode" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => match crate::review::current_mode(id, rel) {
                 Some(m) => json!(m), None => Value::Null,
             },
             _ => Value::Null,
         }
         }
-        "review.decorate", "SID REL", "kind/stale/is_text label for one change" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
+        "review.decorate" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => crate::review::decorate(id, rel),
             _ => json!({"is_text": false, "stale": false, "kind": "changed"}),
         }
         }
         // Newest-first slice of the box's change set, for the boxes view's
         // "recently changed" panel on a live box. limit defaults to 200.
-        "review.recent_changes", "SID [LIMIT]", "newest-first slice of the change set" => {
+        "review.recent_changes" => {
             let id = arg_sid(args);
             let limit = args.get(1).and_then(Value::as_i64).unwrap_or(200);
             match id {
@@ -3454,7 +3443,7 @@ macro_rules! ui_verbs {
         // outputs / changes / processes / pipelines / build-edges in one
         // round-trip, capped at `limit` per kind (default 20). Changes
         // includes xattr modifications inline as kind="xattr" rows.
-        "review.box_summary", "SID [LIMIT]", "outputs/changes/procs/pipelines/edges bundle" => {
+        "review.box_summary" => {
             let id = arg_sid(args);
             let limit = args.get(1).and_then(Value::as_i64).unwrap_or(20);
             match id {
@@ -3481,7 +3470,7 @@ macro_rules! ui_verbs {
         }
         // The causal neighborhood of one pipeline: parent, children, owning
         // edge. args: [sid, brushprov_row_id].
-        "review.pipeline_context", "SID PROV_ID", "causal neighborhood of one pipeline" => {
+        "review.pipeline_context" => {
             let id = arg_sid(args);
             let prov_id = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
             match id {
@@ -3492,7 +3481,7 @@ macro_rules! ui_verbs {
         // Search the box's recorded makefile variable assignments. args:
         // [sid, name_pattern, value_pattern, limit]. Patterns are cmd_match
         // text globs (bare word = substring); empty = match all.
-        "review.makevars", "SID [NAME_PAT] [VALUE_PAT] [LIMIT] [ANY]", "search recorded makefile variable assignments" => {
+        "review.makevars" => {
             let id = arg_sid(args);
             let name_pat = args.get(1).and_then(Value::as_str).unwrap_or("");
             let value_pat = args.get(2).and_then(Value::as_str).unwrap_or("");
@@ -3509,7 +3498,7 @@ macro_rules! ui_verbs {
         // Map provenance row ids between the process / pipeline / edge
         // domains — the cross-pane generated filter's id translation.
         // args: [sid, from_kind, [ids...], to_kind] → [ids...].
-        "review.map_ids", "SID FROM [IDS...] TO", "translate provenance row ids across domains" => {
+        "review.map_ids" => {
             let id = arg_sid(args);
             let from = args.get(1).and_then(Value::as_str).unwrap_or("");
             let ids: Vec<i64> = args.get(2).and_then(Value::as_array)
@@ -3525,7 +3514,7 @@ macro_rules! ui_verbs {
         // (kind / stale / is_text per row) — the UI uses this to label the
         // changes list with +/~/- glyphs and the `!` stale marker without a
         // round-trip per row.
-        "review.decorate_many", "SID [RELS...]", "bulk decorate a window of changes" => {
+        "review.decorate_many" => {
             let id = arg_sid(args);
             let rels: Vec<&str> = args.get(1).and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).collect())
@@ -3535,7 +3524,7 @@ macro_rules! ui_verbs {
                 None => Value::Array(vec![]),
             }
         }
-        "review.apply_hunk", "SID REL HUNK_IX", "apply one hunk to the host" => { match (arg_sid(args), args.get(1).and_then(Value::as_str),
+        "review.apply_hunk" => { match (arg_sid(args), args.get(1).and_then(Value::as_str),
                                       args.get(2).and_then(Value::as_i64)) {
             (Some(id), Some(rel), Some(ix)) => {
                 let r = crate::review::apply_hunk(id, rel, ix);
@@ -3544,7 +3533,7 @@ macro_rules! ui_verbs {
             _ => json!({"ok": false, "error": "bad args"}),
         }
         }
-        "review.discard_hunk", "SID REL HUNK_IX", "discard one hunk (revert it in the box)" => { match (arg_sid(args), args.get(1).and_then(Value::as_str),
+        "review.discard_hunk" => { match (arg_sid(args), args.get(1).and_then(Value::as_str),
                                         args.get(2).and_then(Value::as_i64)) {
             (Some(id), Some(rel), Some(ix)) => {
                 let r = crate::review::discard_hunk(id, rel, ix);
@@ -3558,7 +3547,7 @@ macro_rules! ui_verbs {
         // set client-side made keystrokes multi-second. These verbs let the
         // client open a materialized view (filtered + sorted) and read it as
         // small windows — see views.rs.
-        "view.open", "KIND SID [FILTER] [RUNNING_ONLY]", "open a server-side windowed view" => {
+        "view.open" => {
             let kind = args.first().and_then(Value::as_str).unwrap_or("");
             // Accept either an int or a string-of-int for the sid (the Python
             // and Rust UIs both send strings, matching the existing verbs;
@@ -3575,35 +3564,35 @@ macro_rules! ui_verbs {
             let Shared { views, next_view_id, .. } = &mut *s;
             crate::views::open(views, next_view_id, kind, sid, &filter, running_only && live)
         }
-        "view.window", "VIEW START SIZE", "read one window of an open view" => {
+        "view.window" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let start = args.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
             let size = args.get(2).and_then(Value::as_u64).unwrap_or(0) as usize;
             let s = lock(state);
             crate::views::window(&s.views, vid, start, size)
         }
-        "view.filter", "VIEW FILTER", "re-filter an open view" => {
+        "view.filter" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let filter = args.get(1).cloned().unwrap_or(Value::Null);
             let mut s = lock(state);
             crate::views::set_filter(&mut s.views, vid, &filter)
         }
-        "view.find", "VIEW ROW_ID", "locate a row id inside a view" => {
+        "view.find" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let target_id = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
             let s = lock(state);
             crate::views::find(&s.views, vid, target_id)
         }
-        "view.close", "VIEW", "close a view" => {
+        "view.close" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
             let mut s = lock(state);
             crate::views::close(&mut s.views, vid)
         }
-        "ping", "", "liveness check; broadcasts a pong event" => {
+        "ping" => {
             broadcast(state, &json!({"type": "pong"}));
             json!("pong")
         }
-        "box_new", "[PARENT_SID]", "create an empty box and expose its mount" => {
+        "box_new" => {
             // m3a: create a box and expose <mnt>/<id> — the overlay-core path
             // (the full runner register handshake is m3b).
             let ov = lock(state).overlay.clone();
@@ -3638,7 +3627,7 @@ macro_rules! ui_verbs {
                                         "error": format!("box_new: {e}")}),
             }
         }
-        "struct_quick", "SID REL", "quick structural diff of a binary change" => {
+        "struct_quick" => {
             match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
                 (Some(id), Some(rel)) => crate::review::struct_quick(id, rel),
                 _ => json!({"lines": [["err", "bad args"]], "job": Value::Null}),
@@ -3648,7 +3637,7 @@ macro_rules! ui_verbs {
         // flows.list  [SID]              → {ok, flows: [row, ...]}
         // flows.detail [SID, FRAME]      → {ok, text: "..."}
         // SID may be omitted to mean the currently-selected box.
-        "flows.list", "[SID]", "tshark-decoded HTTP/TLS flow rows for a box" => {
+        "flows.list" => {
             match arg_sid(args).or_else(|| selected_sid(state)) {
                 Some(id) => match flows_dir_for(id) {
                     Some(dir) => match crate::net::flows::tshark_list(&dir) {
@@ -3662,7 +3651,7 @@ macro_rules! ui_verbs {
                 None => json!({"ok": false, "error": "no box selected"}),
             }
         }
-        "flows.detail", "[SID] FRAME", "full tshark decode of one frame" => {
+        "flows.detail" => {
             match flow_args(state, args)
                     .and_then(|(id, frame)| frame.as_u64().map(|frame| (id, frame))) {
                 Some((id, frame)) if frame > 0 => match flows_dir_for(id) {
@@ -3683,7 +3672,7 @@ macro_rules! ui_verbs {
         //   The TUI calls ui_active(true) on startup and ui_active(false)
         //   on shutdown; while inactive, dispatcher Ask short-circuits to
         //   deny so no connection wedges on an absent UI.
-        "prompts.peek", "", "next pending network-permission prompt" => {
+        "prompts.peek" => {
             match lock(state).net.clone() {
                 Some(net) => match net.prompts.peek() {
                     Some(ask) => json!({"ok": true, "ask": {
@@ -3696,7 +3685,7 @@ macro_rules! ui_verbs {
                 None => json!({"ok": true, "ask": Value::Null}),
             }
         }
-        "prompts.answer", "ID VERDICT", "answer a prompt (yes_once|no_once|allow_save|deny_save)" => {
+        "prompts.answer" => {
             let id = args.first().and_then(Value::as_u64).unwrap_or(0);
             let v = args.get(1).and_then(Value::as_str).unwrap_or("");
             let Some(verdict) = crate::net::prompt::Verdict::parse(v) else {
@@ -3717,7 +3706,7 @@ macro_rules! ui_verbs {
                 None => json!({"ok": false, "error": "no net registry"}),
             }
         }
-        "prompts.ui_active", "BOOL", "mark the TUI prompt consumer active/inactive" => {
+        "prompts.ui_active" => {
             let on = args.first().and_then(Value::as_bool).unwrap_or(false);
             if let Some(net) = lock(state).net.clone() {
                 net.prompts.mark_ui_active(on);
@@ -3727,7 +3716,7 @@ macro_rules! ui_verbs {
         // flows.packets [SID, STREAM] → every frame in `tcp.stream == STREAM`
         // (i.e. the connection the user just drilled into from the flows
         // list pane). Powers the packet-list view inside Pane::Packets.
-        "flows.packets", "[SID] STREAM", "every frame of one TCP stream" => {
+        "flows.packets" => {
             match flow_args(state, args)
                     .and_then(|(id, stream)| stream.as_i64().map(|stream| (id, stream))) {
                 Some((id, stream)) if stream >= 0 => match flows_dir_for(id) {
@@ -3742,18 +3731,18 @@ macro_rules! ui_verbs {
                 _ => json!({"ok": false, "error": "bad args"}),
             }
         }
-        "struct_finish", "JOB", "collect a finished structural-diff job" => { match args.first().and_then(Value::as_i64) {
+        "struct_finish" => { match args.first().and_then(Value::as_i64) {
             Some(job) => crate::review::struct_finish(job),
             None => json!({"lines": [["err", "bad job"]]}),
         }
         }
-        "struct_cancel", "JOB", "cancel a structural-diff job" => {
+        "struct_cancel" => {
             if let Some(job) = args.first().and_then(Value::as_i64) {
                 crate::review::struct_cancel(job);
             }
             return json!({"ok": true, "r": Value::Null});
         }
-        "box_drop", "SID", "unregister a box from the overlay (no reap)" => {
+        "box_drop" => {
             let ov = lock(state).overlay.clone();
             if let (Some(ov), Some(id)) = (ov, arg_sid(args)) {
                 ov.remove_box(id);
@@ -3765,7 +3754,7 @@ macro_rules! ui_verbs {
         //    use the same overlay API nested boxes use. No FUSE mount needed,
         //    no subprocess. args: [name_or_id, path_rel_to_root, (write only)
         //    base64-bytes]. path must NOT start with '/'.
-        "box_file_read", "BOX PATH", "read a file from a box's merged view (base64)" => {
+        "box_file_read" => {
             let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
@@ -3785,7 +3774,7 @@ macro_rules! ui_verbs {
                 Err(e) => return json!({"ok": false, "error": e.to_string()}),
             }
         }
-        "box_file_write", "BOX PATH B64", "write a file into a box's layer (oaita agent tool: same refusal gate as the editor save, but MAY create new files)" => {
+        "box_file_write" => {
             let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
@@ -3811,7 +3800,7 @@ macro_rules! ui_verbs {
             // allow_create = true: the agent authors new files.
             return crate::review::write_file_checked(id, rel, &bytes, &ov, true);
         }
-        "box_dir_list", "BOX PATH", "list a directory in a box's merged view" => {
+        "box_dir_list" => {
             let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
@@ -3830,7 +3819,7 @@ macro_rules! ui_verbs {
                 Err(e) => return json!({"ok": false, "error": e.to_string()}),
             }
         }
-        "box_path_kind", "BOX PATH", "file/dir/missing kind of a box path" => {
+        "box_path_kind" => {
             let ov = lock(state).overlay.clone();
             let Some(ov) = ov else {
                 return json!({"ok": false, "error": "overlay not available"});
@@ -3849,7 +3838,7 @@ macro_rules! ui_verbs {
         // pull doesn't go through the box's netns/FUSE. Box EXECUTION stays in
         // the caller (runner::run) for foreground stdio. The pull blocks this
         // connection's own handler thread, not the main loop.
-        "oci.load", "REFERENCE [NAME]", "pull + unpack an OCI image into at-rest boxes" => {
+        "oci.load" => {
             let Some(reference) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "oci.load: missing reference"});
             };
@@ -3866,7 +3855,7 @@ macro_rules! ui_verbs {
         // Loaded images, for the UI's base-image picker: the TOP box of each
         // installed layer chain (the one carrying the image config), with the
         // reference it was pulled as. Cheap metadata scan, no registry I/O.
-        "oci.images", "", "loaded OCI images (top box of each chain)" => {
+        "oci.images" => {
             let boxes = crate::discover::discover();
             Value::Array(boxes.iter()
                 .filter(|(_, b)| b.meta.contains_key("oci_config"))
@@ -3884,11 +3873,11 @@ macro_rules! ui_verbs {
         }
         // Is a named svc.serve service live (≥1 parked accept slot)? Used by
         // `oaita local` to poll readiness / idempotency without racing.
-        "svc.up", "NAME", "whether a svc.serve service is live" => {
+        "svc.up" => {
             let name = args.first().and_then(Value::as_str).unwrap_or("");
             json!({"up": svc_has(name)})
         }
-        "oci.resolve", "REFERENCE", "resolve an image reference to its local top box" => {
+        "oci.resolve" => {
             let Some(reference) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "oci.resolve: missing reference"});
             };
@@ -3900,7 +3889,7 @@ macro_rules! ui_verbs {
         // In-box `oci build`: the CLI ships its context + Dockerfile here so the
         // build runs host-side (its layer boxes land in engine state, not the
         // box's FUSE). Returns the worker's output + exit code + top box id.
-        "oci.build", "SPEC", "run an in-box-shipped Dockerfile build host-side" => {
+        "oci.build" => {
             let Some(spec) = args.first() else {
                 return json!({"ok": false, "error": "oci.build: missing spec"});
             };
@@ -3913,7 +3902,7 @@ macro_rules! ui_verbs {
         // models resolved from a live HuggingFace query (config-file override
         // + offline fallback). Each entry is a ready-to-download Q4 URL. The
         // UI opens this when neither an external API nor a local model is set.
-        "oaita.models", "", "GGUF local-model catalog for the picker" => {
+        "oaita.models" => {
             let (entries, source) = crate::oaita::models::catalog();
             json!({
                 "source": source,
@@ -3925,7 +3914,7 @@ macro_rules! ui_verbs {
         // What the "Api" pane is wired to: external (host oaita.toml has a
         // model), local (an OAITA-LOCAL svc is declared), or none (offer the
         // picker). Lets the UI reflect real state instead of guessing.
-        "oaita.status", "", "what the Api pane is wired to (external/local/none)" => {
+        "oaita.status" => {
             let host_cfg = crate::oaita::config::Config::load();
             let external = host_cfg.model.as_deref()
                 .map(|m| !m.trim().is_empty()).unwrap_or(false);
@@ -3948,7 +3937,7 @@ macro_rules! ui_verbs {
         // 1-token chat completion against the given endpoint and reports
         // reachability / auth / model validity as a single line. Runs on the
         // engine (which has the network), so the UI stays a thin client.
-        "oaita.probe", "SPEC", "1-token connection test of an external API config" => {
+        "oaita.probe" => {
             let spec = args.first().cloned().unwrap_or(Value::Null);
             let base_url = spec.get("base_url").and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
@@ -3977,32 +3966,32 @@ macro_rules! ui_verbs {
                     "error": format!("{base_url}: {e}")}),
             }
         }
-        // The self-listing verb: the docs table as JSON, optionally filtered by
-        // a substring over name/help. `sarun verbs` and the F1 help render this
-        // same table (the CLI over the socket, the UI in-process).
-        "verbs", "[FILTER]", "list every UI verb with its args and help" => {
+        // The self-listing verb is a projection of the embedded relation,
+        // optionally filtered over name/description. Dispatch owns behavior
+        // only; it does not carry a second help/schema catalog.
+        "verbs" => {
             let filt = args.first().and_then(Value::as_str).unwrap_or("");
-            Value::Array(VERB_DOCS.iter()
-                .filter(|d| filt.is_empty() || d.name.contains(filt)
-                        || d.help.contains(filt))
-                .map(|d| json!({"verb": d.name, "args": d.args, "help": d.help}))
+            let rows = match crate::prolog::global().and_then(|hub| hub.ui_action_help()) {
+                Ok(rows) => rows,
+                Err(error) => return json!({"ok": false, "error": error}),
+            };
+            Value::Array(rows.into_iter()
+                .filter(|row| filt.is_empty()
+                    || row.verb.as_str().contains(filt)
+                    || row.description.as_str().contains(filt))
+                .map(|row| json!({
+                    "verb": row.verb.as_str(),
+                    "args": row.arguments.as_str(),
+                    "help": row.description.as_str(),
+                }))
                 .collect())
         }
     } };
 }
 
-macro_rules! emit_verb_docs {
-    ( ($state:ident, $verb:ident, $args:ident, $boxes:ident)
-      $($($name:literal)|+, $a:literal, $h:literal => $body:block)* ) => {
-        pub static VERB_DOCS: &[VerbDoc] = &[
-            $($(VerbDoc { name: $name, args: $a, help: $h },)+)*
-        ];
-    };
-}
-
 macro_rules! emit_verb_dispatch {
     ( ($state:ident, $verb:ident, $args:ident, $boxes:ident)
-      $($($name:literal)|+, $a:literal, $h:literal => $body:block)* ) => {
+      $($($name:literal)|+ => $body:block)* ) => {
         /// The `{"type":"ui"}` verb dispatch. An arm's `return` sends its
         /// value raw (errors); falling out wraps as {"ok":true,"r":...}.
         pub(crate) fn dispatch_ui_verb($state: &State, $verb: &str,
@@ -4021,7 +4010,6 @@ macro_rules! emit_verb_dispatch {
     };
 }
 
-ui_verbs!(emit_verb_docs);
 ui_verbs!(emit_verb_dispatch);
 
 fn dispatch_ui(state: &State, msg: &Value) -> Value {
@@ -5015,10 +5003,7 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
     } else {
         words.extend(argv.iter().map(String::as_str));
     }
-    let invocation = match crate::parser::parse_words(
-        &words,
-        &crate::parser::EmptyContext,
-    ) {
+    let invocation = match crate::parser::parse_words(&words, &crate::parser::EmptyContext) {
         crate::parser::ParseResult::Invocation(invocation) => invocation,
         _ => {
             eprintln!(
@@ -5130,9 +5115,8 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
     }
 }
 
-/// `sarun verbs [FILTER]` — print the engine's UI-verb surface from the
-/// engine's own VERB_DOCS (via the "verbs" verb, so what prints is what the
-/// RUNNING engine dispatches, not this binary's table). Works from inside a
+/// `sarun verbs [FILTER]` — print the running engine's projection of the
+/// central action relation through the `verbs` action. Works from inside a
 /// box too: the FD broker (SARUN_BROKER, same channel cli_box_op uses)
 /// splices the connection to the engine's control socket.
 pub fn cli_verbs(argv: &[String]) -> i32 {
@@ -5691,25 +5675,24 @@ fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>, frame: &[u8],
 mod verb_tests {
     use super::*;
 
-    // The match arms and VERB_DOCS expand from the same ui_verbs! token
-    // list, so name-coverage parity is guaranteed by construction; calling
-    // every documented verb with empty args is NOT safe in a unit test
+    // Calling every related verb with empty args is not safe in a unit test
     // (mirror_run_pending starts jobs, oaita.models does network I/O), so
     // we spot-check side-effect-free verbs instead.
     #[test]
-    fn verb_docs_nonempty_and_unique() {
-        assert!(
-            VERB_DOCS.len() >= 80,
-            "table lost entries: {}",
-            VERB_DOCS.len()
-        );
-        let mut names: Vec<&str> = VERB_DOCS.iter().map(|d| d.name).collect();
+    fn relation_help_is_complete_nonempty_and_unique() {
+        let docs = crate::prolog::global().unwrap().ui_action_help().unwrap();
+        assert_eq!(docs.len(), 91);
+        let mut names: Vec<&str> = docs.iter().map(|d| d.verb.as_str()).collect();
         names.sort_unstable();
         let n = names.len();
         names.dedup();
-        assert_eq!(n, names.len(), "duplicate verb names in VERB_DOCS");
-        for d in VERB_DOCS {
-            assert!(!d.help.is_empty(), "verb {} has no help", d.name);
+        assert_eq!(n, names.len(), "duplicate UI actions in relation");
+        for doc in docs {
+            assert!(
+                !doc.description.as_str().is_empty(),
+                "action {} has no help",
+                doc.verb.as_str()
+            );
         }
     }
 
@@ -5746,7 +5729,7 @@ mod verb_tests {
         );
         assert!(rows.len() >= 5);
         let all = dispatch_ui_verb(&state, "verbs", &[], &boxes);
-        assert_eq!(all["r"].as_array().unwrap().len(), VERB_DOCS.len());
+        assert_eq!(all["r"].as_array().unwrap().len(), 91);
     }
 
     #[test]
@@ -5793,7 +5776,13 @@ mod verb_tests {
             }
         }
 
-        assert_eq!(dispatch_ui_verb(&state, "flows.detail", &[json!(0)], &boxes)["r"]["error"], "bad args");
-        assert_eq!(dispatch_ui_verb(&state, "flows.packets", &[json!(-1)], &boxes)["r"]["error"], "bad args");
+        assert_eq!(
+            dispatch_ui_verb(&state, "flows.detail", &[json!(0)], &boxes)["r"]["error"],
+            "bad args"
+        );
+        assert_eq!(
+            dispatch_ui_verb(&state, "flows.packets", &[json!(-1)], &boxes)["r"]["error"],
+            "bad args"
+        );
     }
 }

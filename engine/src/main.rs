@@ -57,7 +57,6 @@ mod paths;
 mod prolog;
 mod pty;
 mod reader;
-mod registry;
 mod review;
 mod rules;
 mod runner;
@@ -794,9 +793,8 @@ fn main() {
             ));
         }
         Some("verbs") => {
-            // sarun verbs [FILTER] — the engine's UI-verb surface, from the
-            // running engine's own table (control::VERB_DOCS via the "verbs"
-            // verb). Works in-box too (SARUN_BROKER channel).
+            // sarun verbs [FILTER] — the running engine's UI-action projection
+            // from the central relation. Works in-box too (SARUN_BROKER).
             std::process::exit(control::cli_verbs(&argv[1..]));
         }
         Some("mirror") => {

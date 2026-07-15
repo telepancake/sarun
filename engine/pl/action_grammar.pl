@@ -1380,6 +1380,22 @@ catalog(Visibility, Rows) :-
             ),
             Rows).
 
+%! action_help(+Target, -Rows) is det.
+%
+% Closed help projection used by runtime consumers. Keeping this operation
+% narrow avoids shipping executable syntax terms merely to display the three
+% related fields.
+
+action_help(Target, Rows) :-
+    findall(record(Action, Notation, Description),
+            ( action(Action, _, RowTarget, Notation, Description, _, _),
+              help_target_matches(Target, RowTarget)
+            ),
+            Rows).
+
+help_target_matches(all, _).
+help_target_matches(Target, Target) :- Target \== all.
+
 visibility_matches(all, _).
 visibility_matches(visible, visible).
 visibility_matches(internal, internal).
@@ -1418,6 +1434,11 @@ dispatch_application(render, request(Command, Style), Response) :-
        ).
 dispatch_application(catalog, request(Visibility), ok(Rows)) :-
     !, catalog(Visibility, Rows).
+dispatch_application(action_help, request(Target), Response) :-
+    !, ( ( Target == all ; Target == ui ; Target == control ; Target == local )
+       -> action_help(Target, Rows), Response = ok(Rows)
+       ;  Response = error(invalid_request)
+       ).
 dispatch_application(convert, request(FromKind, From, ToKind), ok(Results)) :-
     !, findall(To, convert(FromKind, From, ToKind, To), Results).
 dispatch_application(context_query, request(Query, Snapshot), ok(Outcome)) :-
@@ -1460,6 +1481,7 @@ dispatch_application(complete, _, error(invalid_request)) :- !.
 dispatch_application(highlights, _, error(invalid_request)) :- !.
 dispatch_application(render, _, error(invalid_request)) :- !.
 dispatch_application(catalog, _, error(invalid_request)) :- !.
+dispatch_application(action_help, _, error(invalid_request)) :- !.
 dispatch_application(convert, _, error(invalid_request)) :- !.
 dispatch_application(context_query, _, error(invalid_request)) :- !.
 dispatch_application(context_observe, _, error(invalid_request)) :- !.

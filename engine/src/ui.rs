@@ -8892,54 +8892,29 @@ fn help_lines() -> Vec<Line<'static>> {
         t("  evaluated TOP → BOTTOM and the FIRST match wins; saving any edit"),
         t("  rewrites the filerules file and reloads it in the engine."),
     ]);
-    // The engine's control-socket verb surface — the SAME table the dispatch
-    // match is generated from (control::VERB_DOCS), read in-process: no
-    // socket call, no second text. `sarun verbs [FILTER]` prints it too.
+    // The complete action surface comes directly from the embedded relation.
+    // `sarun verbs [FILTER]` selects its UI-target subset over the socket.
     v.push(t(""));
-    v.push(h("Verbs (control-socket surface · `sarun verbs [FILTER]`)"));
-    let w = crate::control::VERB_DOCS
+    v.push(h("Actions (central relation · `sarun verbs [FILTER]`)"));
+    let relation_help = match crate::prolog::global().and_then(|hub| hub.action_help()) {
+        Ok(rows) => rows,
+        Err(error) => {
+            v.push(t(&format!("  relation error: {error}")));
+            Vec::new()
+        }
+    };
+    let w = relation_help
         .iter()
-        .map(|d2| d2.name.len() + 1 + d2.args.len())
+        .map(|row| row.verb.as_str().len() + 1 + row.arguments.as_str().len())
         .max()
         .unwrap_or(0);
-    for vd in crate::control::VERB_DOCS {
-        let sig = if vd.args.is_empty() {
-            vd.name.to_string()
+    for row in relation_help {
+        let sig = if row.arguments.as_str().is_empty() {
+            row.verb.as_str().to_string()
         } else {
-            format!("{} {}", vd.name, vd.args)
+            format!("{} {}", row.verb.as_str(), row.arguments.as_str())
         };
-        v.push(t(&format!("  {sig:<w$}  {}", vd.help)));
-    }
-
-    // Registry actions — key bindings, CLI commands, and menu entries
-    // generated from the unified action registry (engine/src/registry.rs).
-    v.push(t(""));
-    v.push(h("Actions (registry · `:` command prompt)"));
-    v.push(d(
-        "  Type ':' to open a command prompt with tab-completion.",
-    ));
-    v.push(d(
-        "  Key + CLI + menu labels are all derived from the verb name.",
-    ));
-    for a in crate::registry::ACTIONS {
-        if a.key.is_some() || a.cli.is_some() {
-            let mut parts = Vec::new();
-            if let Some(k) = a.key {
-                parts.push(format!("'{k}'"));
-            }
-            if let Some(c) = a.ctx {
-                parts.push(format!("on:{c}"));
-            }
-            if let Some(c) = a.cli {
-                parts.push(format!("sarun {}", c.join(" ")));
-            }
-            v.push(t(&format!(
-                "  {:25} {:25}  {}",
-                format!("{}({})", a.verb, a.args),
-                parts.join(", "),
-                a.help
-            )));
-        }
+        v.push(t(&format!("  {sig:<w$}  {}", row.description.as_str())));
     }
     v
 }
@@ -16503,34 +16478,6 @@ fn render_to_string(app: &App, w: u16, h: u16) -> Result<String, String> {
 /// current pane has nothing meaningful you'd do to a row (Help, Pty
 /// — both manage themselves). Caller wraps the returned list in
 /// Modal::ActionMenu and presents it.
-/// Generate menu items from the registry for a given pane context.
-/// Returns ActionItems with the registry's menu label and key hint.
-/// The verb name is stored as the item's label when no explicit menu
-/// label exists — the caller can override.
-#[allow(dead_code)]
-fn registry_menu_items(ctx: &str) -> Vec<ActionItem> {
-    crate::registry::menu_entries()
-        .into_iter()
-        .filter(|(_, _, verb)| {
-            crate::registry::find(verb)
-                .and_then(|a| a.ctx)
-                .map(|c| c == ctx)
-                .unwrap_or(false)
-        })
-        .map(|(label, key, _verb)| {
-            let hint = match key {
-                Some(k) => Box::leak(format!("{k}").into_boxed_str()),
-                None => "",
-            };
-            ActionItem {
-                label: label.to_string(),
-                hint,
-                action: Action::OpenSelection,
-            }
-        })
-        .collect()
-}
-
 fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
     let mk = |label: &str, hint: &'static str, action: Action| ActionItem {
         label: label.into(),
@@ -18558,11 +18505,10 @@ mod tests {
         assert_eq!(char_safe_slice("abcdef", 2, 4), "cd");
     }
 
-    /// F1/'?' help is headless-renderable text: it must carry the "Verbs"
-    /// section derived in-process from control::VERB_DOCS, with at least
-    /// one real verb line.
+    /// F1/'?' help is headless-renderable text and carries the action catalog
+    /// projected in-process from the central relation.
     #[test]
-    fn help_has_verbs_section() {
+    fn help_has_relation_action_section() {
         let text: Vec<String> = super::help_lines()
             .iter()
             .map(|l| {
@@ -18573,8 +18519,8 @@ mod tests {
             })
             .collect();
         assert!(
-            text.iter().any(|l| l.starts_with("Verbs")),
-            "no Verbs header in help"
+            text.iter().any(|l| l.starts_with("Actions")),
+            "no Actions header in help"
         );
         assert!(
             text.iter()
@@ -20513,6 +20459,7 @@ mod tests {
     #[test]
     fn pty_menu_offers_named_destinations() {
         let mut app = headless_app();
+        app.tap_ok = true;
         open_pty_menu(&mut app);
         let Some(Modal::Launcher { items, .. }) = &app.modal else {
             panic!("Pty+ must open the launcher");
@@ -20539,6 +20486,7 @@ mod tests {
     fn launcher_toggles_cycle_in_place_and_reach_the_argv() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = headless_app();
+        app.tap_ok = true;
         open_pty_menu(&mut app);
         // n: tap → host; e: env on. The modal must stay open throughout.
         handle_modal_key(&mut app, KeyCode::Char('n'), KeyModifiers::empty());

@@ -7,6 +7,7 @@
 test_name(catalog_is_complete_and_valid).
 test_name(wire_identities_are_explicit_unique_and_normalized).
 test_name(representations_project_the_executable_forms).
+test_name(help_projection_is_complete_and_targeted).
 test_name(neutral_source_parses_canonical_form).
 test_name(shared_cli_form_uses_complete_schema).
 test_name(alias_normalization_is_wire_ready).
@@ -53,6 +54,18 @@ expect(Goal) :-
 
 expect_equal(Actual, Expected) :-
     ( Actual == Expected -> true ; throw(expected(Expected, got(Actual))) ).
+
+run_test(help_projection_is_complete_and_targeted) :-
+    action_grammar:action_help(all, All),
+    action_grammar:action_help(ui, Ui),
+    length(All, 108),
+    length(Ui, 91),
+    expect(list_has(record(verbs, "[FILTER]",
+                          "list every UI verb with its args and help"), Ui)),
+    expect(\+ list_has(record(quit, _, _), Ui)).
+
+list_has(Value, [Head|_]) :- Value = Head.
+list_has(Value, [_|Tail]) :- list_has(Value, Tail).
 
 neutral(Surface, Start,
         unit(ignored, span(Start, Stop), [span(Start, Stop)], Surface,

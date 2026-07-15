@@ -252,13 +252,13 @@ and makes contextual parsing and invalidation independently testable.
 
 ## Complete UI action inventory
 
-The migration must cover all 97 names emitted by `control::ui_verbs!`, not just
-the five mirror actions. It must also cover local and top-level control actions
-currently declared only in `registry::ACTIONS`:
+The relation now covers all 108 actions: 91 UI actions sharing 90
+implementation arms, five control actions, and twelve local actions. Entries
+which had historically existed only in `registry::ACTIONS` included:
 
-- control messages: `apply`, `discard`, `rename`;
+- control messages: `sudtrace`, `apply`, `discard`, `rename`, `quit`;
 - local actions: `mirror_browse`, `mirror_read`, `change_read`, `change_edit`,
-  `rule_new`, `rule_delete`, `rule_edit`, `quit`, `detach`, `refresh`, `filter`,
+  `rule_new`, `rule_delete`, `rule_edit`, `detach`, `refresh`, `filter`,
   `action_menu`, `toggle_mark`;
 - alias/normalization action: `mirror_resume` -> handler `mirror_pause` with a
   wire boolean of `false`.
@@ -420,13 +420,13 @@ belong to the relation.
 
 - [x] Delete Rust parse/completion/highlight/render implementations and
       compatibility wrappers.
-- [ ] Delete `registry::ACTIONS`, supplemental action synthesis, schema/type
+- [x] Delete `registry::ACTIONS`, supplemental action synthesis, schema/type
       inference, CLI maps, target/alias switches, and dead projections.
-- [ ] Delete `registry.rs` once no semantic responsibility remains.
-- [ ] Strip name/schema/help metadata out of `ui_verbs!`; retain only handler
+- [x] Delete `registry.rs` once no semantic responsibility remains.
+- [x] Strip name/schema/help metadata out of `ui_verbs!`; retain only handler
       implementation dispatch or replace it with handler functions.
-- [ ] Delete `VERB_DOCS`; implement the `verbs` response from relation data.
-- [ ] Delete duplicate help sections, dead `registry_menu_items`, and registry
+- [x] Delete `VERB_DOCS`; implement the `verbs` response from relation data.
+- [x] Delete duplicate help sections, dead `registry_menu_items`, and registry
       synchronization tests.
 - [x] Remove stale parser design text that calls implemented work future or
       describes the Rust registry as phase one.
@@ -641,6 +641,12 @@ belong to the relation.
   malformed-length, and wrong-version tests pass on aarch64; the listener and
   clients still require the single coordinated cutover, so that gate remains
   unchecked.
+- Deleted the 1,500-line Rust action registry, its supplemental action/schema
+  synthesis, dead menu projection, synchronization tests, and duplicate help
+  section. `ui_verbs!` now retains implementation dispatch only. The `verbs`
+  action and F1 help both query a bounded typed help projection from the
+  embedded relation; 108 total actions and the exact 91-action UI subset are
+  checked in core-only and aarch64 embedded tests.
 
 ## Stop conditions
 

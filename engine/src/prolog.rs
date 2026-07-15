@@ -326,6 +326,7 @@ enum Operation {
     Complete,
     Highlights,
     Render,
+    ActionHelp,
     ContextQuery,
     ContextObserve,
     ContextReady,
@@ -344,6 +345,7 @@ impl Operation {
             Self::Complete => "complete",
             Self::Highlights => "highlights",
             Self::Render => "render",
+            Self::ActionHelp => "action_help",
             Self::ContextQuery => "context_query",
             Self::ContextObserve => "context_observe",
             Self::ContextReady => "context_ready",
@@ -493,6 +495,19 @@ impl Prolog {
             )
             .map_err(QueryError::Backend)?;
         decode_action_request_response(&response)
+    }
+
+    /// Project the complete action help surface from the normalized relation.
+    /// This is the only runtime source for verb names, argument notation, and
+    /// descriptions; implementation dispatch contributes no metadata.
+    pub fn action_help(&self) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
+        let response = self.application(Operation::ActionHelp, "request(all)".into())?;
+        decode_action_help_response(&response)
+    }
+
+    pub fn ui_action_help(&self) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
+        let response = self.application(Operation::ActionHelp, "request(ui)".into())?;
+        decode_action_help_response(&response)
     }
 
     pub fn context_query(
@@ -2069,6 +2084,40 @@ fn decode_render_response(response: &str) -> Result<String, QueryError> {
     ))
 }
 
+fn decode_action_help_response(
+    response: &str,
+) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
+    use crate::generated_wire::{ActionHelpRow, LIMIT_SHORT_BYTES, LIMIT_TEXT_BYTES};
+    use crate::wire::BoundedText;
+
+    let value = response_value(response)?;
+    let mut result = Vec::new();
+    for row in list(&value)? {
+        let fields = compound(row, "record", 3)?;
+        let bounded = |value: &ParsedTerm, maximum: usize| -> Result<String, String> {
+            let value = text(value)?.to_owned();
+            if value.len() > maximum {
+                return Err(format!(
+                    "relation catalog text exceeds its declared {maximum}-byte bound"
+                ));
+            }
+            Ok(value)
+        };
+        result.push(ActionHelpRow {
+            verb: BoundedText::<LIMIT_SHORT_BYTES>::new(bounded(&fields[0], LIMIT_SHORT_BYTES)?)
+                .map_err(|error| format!("invalid relation verb: {error:?}"))?,
+            arguments: BoundedText::<LIMIT_TEXT_BYTES>::new(bounded(&fields[1], LIMIT_TEXT_BYTES)?)
+                .map_err(|error| format!("invalid relation argument notation: {error:?}"))?,
+            description: BoundedText::<LIMIT_TEXT_BYTES>::new(bounded(
+                &fields[2],
+                LIMIT_TEXT_BYTES,
+            )?)
+            .map_err(|error| format!("invalid relation description: {error:?}"))?,
+        });
+    }
+    Ok(result)
+}
+
 fn decode_action_request_response(
     response: &str,
 ) -> Result<crate::generated_wire::ActionRequest, QueryError> {
@@ -2119,6 +2168,8 @@ pub(crate) fn ensure_linked() {
     std::hint::black_box(Prolog::highlights as fn(&Prolog, &ParseCandidate) -> _);
     std::hint::black_box(Prolog::render as fn(&Prolog, &CommandAst, RenderForm) -> _);
     std::hint::black_box(Prolog::action_request as fn(&Prolog, &CommandAst) -> _);
+    std::hint::black_box(Prolog::action_help as fn(&Prolog) -> _);
+    std::hint::black_box(Prolog::ui_action_help as fn(&Prolog) -> _);
     std::hint::black_box(
         Prolog::context_query as fn(&Prolog, &ContextQuery, &ContextSnapshot) -> _,
     );
@@ -2524,5 +2575,24 @@ mod tests {
                 .iter()
                 .any(|evidence| evidence.origin.contains("tear(edit,literal"))
         );
+    }
+
+    #[test]
+    fn ui_help_is_projected_from_the_embedded_relation() {
+        let rows = global().unwrap().ui_action_help().unwrap();
+        assert_eq!(rows.len(), 91);
+        let verbs = rows
+            .iter()
+            .map(|row| row.verb.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(verbs.len(), rows.len());
+        assert!(verbs.contains("verbs"));
+        assert!(verbs.contains("view.open"));
+        assert!(!verbs.contains("quit"));
+        let display_path = rows
+            .iter()
+            .find(|row| row.verb.as_str() == "display_path")
+            .expect("UI action missing from relation help surface");
+        assert_eq!(display_path.arguments.as_str(), "SID");
     }
 }
