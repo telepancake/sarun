@@ -62,10 +62,11 @@ fixtures rather than introducing a generic serialization library. Apply tv's
 per-stream delta-state pattern where append-only logs have repeated headers;
 keep the request/reply frame grammar small and explicit.
 
-The relation and FFI must remain generic enough to host future grammars for
+The relation and FFI must be generic enough to host grammars for
 packets/protocol stacks, patches and editing, nested highlighting, build
-graphs, and brush syntax. UI actions are the first complete practical client,
-not a command-specific architecture baked into the FFI.
+graphs, and brush syntax. UI actions are the first practical client used to
+prove the architecture; they must not bake command-specific assumptions into
+the FFI.
 
 SWI remains the singular relation engine after an explicit comparison with
 egglog and egglog-experimental. Egglog's monotone bottom-up saturation and
@@ -107,21 +108,22 @@ future improvements in code, documentation, or status reports. Completion
 means proving the singular relation is the authority and deleting the
 superseded path; it does not mean leaving both paths present behind a choice.
 
-## Current bad state being replaced
+## Starting state (historical, not the current implementation)
 
-There are three competing authorities:
+The migration started with three competing authorities:
 
 - `control::ui_verbs!` / `VERB_DOCS`: 97 wire handler names plus schemas/help;
 - `registry::ACTIONS`: 69 explicit action records plus synthesized copies of
   missing `VERB_DOCS` rows;
 - `pl/action_grammar.pl`: five duplicated mirror actions.
 
-The normal pre-migration build excludes Prolog. The optional path converts a
-successful Prolog result back through `registry::find`, and Rust fallbacks own
-parse, completion, highlighting, and rendering for unsupported input. The
-mirror CLI calls `parse_words` directly and bypasses Prolog. Generated registry
-help/key/menu projections are mostly test-only or dead while the UI retains
-handwritten key and menu tables.
+The normal pre-migration build excluded Prolog. Its optional path converted a
+successful Prolog result back through `registry::find`, and Rust fallbacks
+owned parse, completion, highlighting, and rendering for unsupported input.
+The mirror CLI called `parse_words` directly and bypassed Prolog. Generated
+registry help/key/menu projections were mostly test-only or dead while the UI
+retained handwritten key and menu tables. The checklist and completion log
+below, rather than this historical inventory, state the live migration status.
 
 Do not merely revert the last two commits: the Rust registry detour began in
 `480f80a`, mixed with unrelated useful IETF work. Repair forward and delete the
@@ -152,7 +154,7 @@ Typed values initially required by the UI surface:
 - booleans;
 - arrays for the protocol variadics that are arrays on the wire;
 - flattened repetitions only where the actual wire contract requires them;
-- future-extensible compound/map/byte values for non-command grammars.
+- bounded compound/map/byte values shared with non-command grammars.
 
 Rust may split command input into neutral UTF-8 byte-spanned source tokens, but
 must not classify action literals or argument semantics. Prolog turns neutral
@@ -163,10 +165,11 @@ keeping syntax knowledge in the hub.
 
 Object-bearing grammars need query-scoped context: box identities and aliases,
 paths visible in a particular box, mirror names, process rows, rule names, and
-similar live domains. The current command grammar has no such context access;
-it validates argument shape and primitive type only. `KnownUnit` has provider
-fields, but the command relation deliberately ignores their incoming semantic
-classification, and completion currently proposes literals only.
+similar live domains. The initial command grammar validated only argument shape
+and primitive type. The present relation emits explicit query graphs, resolves
+ordinary contextual arguments through `one`, and derives contextual completion
+from `all` observations matched against the same typed tear. Remaining provider
+and domain coverage is tracked in the checklist below.
 
 Context queries are themselves values in the relation. The compact core
 algebra is:
@@ -425,7 +428,7 @@ belong to the relation.
 - [ ] Delete `VERB_DOCS`; implement the `verbs` response from relation data.
 - [ ] Delete duplicate help sections, dead `registry_menu_items`, and registry
       synchronization tests.
-- [ ] Remove stale parser design text that calls implemented work future or
+- [x] Remove stale parser design text that calls implemented work future or
       describes the Rust registry as phase one.
 - [ ] Verify with `rg` that no alternate command authority or fallback remains.
 
@@ -608,5 +611,5 @@ The feature is not complete merely because a subset works. Do not stop with:
 - an x86-only normal build.
 
 Completion means the UI action surface has one Prolog definition and every
-listed runtime consumer uses it. Future packet/patch/brush grammars then extend
-the same generic relation/FFI rather than creating another parser subsystem.
+listed runtime consumer uses it. Packet, patch, and brush grammars extend the
+same generic relation/FFI rather than creating another parser subsystem.

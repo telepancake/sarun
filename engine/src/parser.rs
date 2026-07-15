@@ -2,11 +2,11 @@
 //!
 //! ## Vision
 //!
-//! A Prolog DCG-backed parser that can handle the mixed, nested,
+//! A Prolog relation-backed parser that can handle the mixed, nested,
 //! context-sensitive syntaxes sarun encounters:
 //!
 //!   - CLI commands: `sarun mirror run 5`
-//!   - Protocol messages: `{"type":"ui","verb":"mirror_run","args":[5]}`
+//!   - Typed binary protocol messages: `action(mirror_run, [integer(5)])`
 //!   - Network packets: HTTP-in-TLS-in-PCAP
 //!   - Patches: unified diff hunks
 //!   - Build graphs: ninja/make edges
@@ -18,8 +18,10 @@
 //! supplies byte-spanned neutral source units and receives typed values; it
 //! does not maintain a second action catalog or parser.
 //!
-//! The current complete UI-action grammar is the first client of the generic
-//! relation. Later clients compose nested grammars such as HTTP in a packet:
+//! The UI-action grammar is the first client used to drive the generic
+//! relation and FFI to completion. The live migration status and remaining
+//! runtime cutovers are recorded in `PROLOG-HUB-ROADMAP.md`. Nested grammars
+//! such as HTTP in a packet compose through the same relation:
 //!
 //! DCG grammars for nested content. Example — HTTP in a pcap:
 //!
@@ -62,7 +64,7 @@
 //! representation(cli, "mirror run").
 //! representation(key, r).
 //! representation(menu, "Force-run this job").
-//! representation(rpc, {type:ui, verb:mirror_run, args:[5]}).
+//! representation(wire, action(mirror_run, [integer(5)])).
 //!
 //! % Convert any representation to any other:
 //! transform(From, To) :-
