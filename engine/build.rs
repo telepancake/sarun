@@ -61,6 +61,54 @@ fn require_value(info: &BTreeMap<String, String>, key: &str, expected: &str) {
     );
 }
 
+fn require_generated_wire(manifest: &Path) {
+    const PREFIX: &str = "// source-sha256 ";
+    const SOURCES: &[&str] = &[
+        "engine/pl/action_catalog.pl",
+        "engine/pl/action_grammar.pl",
+        "engine/pl/context_relation.pl",
+        "engine/pl/transport_catalog.pl",
+        "engine/pl/wire_codegen.pl",
+        "scripts/wire_codegen.py",
+    ];
+
+    let generated = manifest.join("src/generated_wire.rs");
+    require_file(&generated);
+    let contents = fs::read_to_string(&generated)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", generated.display()));
+    let recorded: BTreeMap<_, _> = contents
+        .lines()
+        .filter_map(|line| line.strip_prefix(PREFIX))
+        .map(|line| {
+            line.split_once(' ')
+                .unwrap_or_else(|| panic!("malformed generated wire source hash: {line}"))
+        })
+        .collect();
+    let expected_sources: std::collections::BTreeSet<_> = SOURCES.iter().copied().collect();
+    let recorded_sources: std::collections::BTreeSet<_> =
+        recorded.keys().copied().collect();
+    assert_eq!(
+        recorded_sources, expected_sources,
+        "generated wire source set changed; run `make wire-codegen`"
+    );
+
+    let repository = manifest
+        .parent()
+        .expect("engine manifest must have a repository parent");
+    for relative in SOURCES {
+        let source = repository.join(relative);
+        require_file(&source);
+        let actual = sha256(&source);
+        assert_eq!(
+            recorded.get(relative).copied(),
+            Some(actual.as_str()),
+            "stale generated wire projection for {relative}; run `make wire-codegen`"
+        );
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
+    println!("cargo:rerun-if-changed={}", generated.display());
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=SARUN_SWIPL_DIR");
     let target = env::var("TARGET").expect("Cargo did not set TARGET");
@@ -73,6 +121,7 @@ fn main() {
     };
 
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    require_generated_wire(&manifest);
     let artifacts = env::var_os("SARUN_SWIPL_DIR").map_or_else(
         || {
             manifest

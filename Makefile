@@ -51,7 +51,7 @@ SWIPL_TARGET := $(subst -unknown,,$(ENGINE_TARGET))
 ENGINE_RELEASE := engine/target/$(ENGINE_TARGET)/release
 
 .PHONY: engine
-engine: vendor swipl ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
+engine: vendor wire-codegen ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
 	@command -v uv >/dev/null || { echo "engine needs uv (https://docs.astral.sh/uv/)"; exit 1; }
 	uv tool install --with ziglang cargo-zigbuild
 	rustup target add $(ENGINE_TARGET)
@@ -80,6 +80,14 @@ swipl: ## Build pinned static SWI-Prolog + zlib artifacts (cached outside the re
 	uv tool install --with ziglang cargo-zigbuild
 	PATH="$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
 	  uv run --with cmake --with ninja python3 scripts/swipl.py --target $(SWIPL_TARGET)
+
+.PHONY: wire-codegen
+wire-codegen: swipl ## Project concrete Rust transport codecs from the Prolog relation
+	python3 scripts/wire_codegen.py
+
+.PHONY: check-wire-codegen
+check-wire-codegen: swipl ## Fail if the checked-in Rust transport projection is stale
+	python3 scripts/wire_codegen.py --check
 
 .PHONY: test-action-grammar
 test-action-grammar: swipl ## Run the core-only action grammar tests with pinned host SWI-Prolog

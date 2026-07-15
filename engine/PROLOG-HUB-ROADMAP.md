@@ -390,7 +390,7 @@ belong to the relation.
       variant, and SCM_RIGHTS role a stable binary identity and bounded schema
       in the relation. Ordinary actions do not receive duplicate transport
       request identities.
-- [ ] Project/generate the Rust opcode and codec definitions from the complete
+- [x] Project/generate the Rust opcode and codec definitions from the complete
       transport relation and prove every generated request has exactly one
       handler.
 - [ ] Replace JSON `ui.sock` request/reply transport with direct Rust binary
@@ -596,6 +596,21 @@ belong to the relation.
   static SWI resource, and added closure/uniqueness/bounds/projection tests.
   Subscription events now describe compact invalidations; durable provenance
   and trace bodies are fetched and decoded only at a view boundary.
+- Added a build-time projection which validates the central relation and emits
+  concrete bounded Rust structs, enums, identities, and tv-compatible codecs;
+  it does not emit a generic schema interpreter or recursive value tree. All
+  95 action request variants map directly to one generated handler identity,
+  and their typed success variants share the same stable opcode. Non-action
+  requests, responses, connection modes, events, and stream frames are emitted
+  from their respective relation sums.
+- Made the projection fail closed when stale: the generated file records exact
+  hashes for every contributing Prolog and generator source, `build.rs` checks
+  those hashes on direct Cargo builds, `make engine` regenerates after the
+  pinned host SWI artifact, and `--check` verifies byte-for-byte freshness.
+  Generated aarch64-musl tests instantiate and round-trip every action request,
+  every action success, every named type/case, and every transport/frame
+  variant; 12 exhaustive suites pass, including identity uniqueness and
+  malformed unknown-code/trailing-field rejection.
 
 ## Stop conditions
 

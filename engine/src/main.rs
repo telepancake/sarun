@@ -40,6 +40,8 @@ mod browser;
 mod dockerfile;
 mod editor;
 mod frames;
+#[allow(dead_code)]
+mod generated_wire;
 mod hostfs;
 mod jobserver;
 mod katirun;
