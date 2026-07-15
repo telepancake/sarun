@@ -3,7 +3,7 @@
 // source-sha256 engine/pl/action_catalog.pl 3943f522f7b5a2b94abac859f11f5293765201a054a3221610e8077eb7a0c8f0
 // source-sha256 engine/pl/action_grammar.pl 7a62398c823bd390fb3da998ae51b0ec7e31e3a8f09e0c7aa429c82121149a62
 // source-sha256 engine/pl/context_relation.pl cbf9d8788d006f18250dd45d07ce8664ec28e1fc997630b7a0ca717c2f8f3a0c
-// source-sha256 engine/pl/transport_catalog.pl f7c333fb521f17229ca341f101d2aec8f91e331df0ccedbf65ca54aec62e3c83
+// source-sha256 engine/pl/transport_catalog.pl 54563becea268fb763b7ffc091c055b5968563921953ec9001c41f36b712718f
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
 // source-sha256 scripts/wire_codegen.py 3a281991190c9c76898e4dad47065ffb16590080fef3f9588e20d4c6fcc4e561
 
@@ -186,7 +186,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "2aa8de042eb538773b831efc49a725c59e81de857669c47763df6598bafc17aa";
+    "064ef6e34f843597c93df3049bef81bfec95538f62b706c259de104c2dd66073";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -1613,8 +1613,8 @@ pub enum FilterKind {
     Cwd,
     Arg,
     Ids,
-    Error,
-    Command,
+    Err,
+    Cmd,
     Target,
 }
 
@@ -1627,8 +1627,8 @@ impl WireValue for FilterKind {
             Self::Cwd => 4,
             Self::Arg => 5,
             Self::Ids => 6,
-            Self::Error => 7,
-            Self::Command => 8,
+            Self::Err => 7,
+            Self::Cmd => 8,
             Self::Target => 9,
         };
         put_u64(output, code);
@@ -1643,8 +1643,8 @@ impl WireValue for FilterKind {
             4 => Ok(Self::Cwd),
             5 => Ok(Self::Arg),
             6 => Ok(Self::Ids),
-            7 => Ok(Self::Error),
-            8 => Ok(Self::Command),
+            7 => Ok(Self::Err),
+            8 => Ok(Self::Cmd),
             9 => Ok(Self::Target),
             _ => Err(DecodeError::InvalidValue),
         }
@@ -1660,8 +1660,8 @@ impl RelationWireValue for FilterKind {
             "cwd" => Ok(Self::Cwd),
             "arg" => Ok(Self::Arg),
             "ids" => Ok(Self::Ids),
-            "error" => Ok(Self::Error),
-            "command" => Ok(Self::Command),
+            "err" => Ok(Self::Err),
+            "cmd" => Ok(Self::Cmd),
             "target" => Ok(Self::Target),
             case => Err(format!("unknown FilterKind relation case {case}")),
         }
@@ -12772,8 +12772,8 @@ mod generated_tests {
         roundtrip(FilterKind::Cwd);
         roundtrip(FilterKind::Arg);
         roundtrip(FilterKind::Ids);
-        roundtrip(FilterKind::Error);
-        roundtrip(FilterKind::Command);
+        roundtrip(FilterKind::Err);
+        roundtrip(FilterKind::Cmd);
         roundtrip(FilterKind::Target);
         roundtrip::<FilterClause>(FilterClause {
             kind: FilterKind::Path,

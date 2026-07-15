@@ -41,14 +41,13 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "changes" => Some(Kind::Changes),
-            "procs" => Some(Kind::Procs),
-            "outputs" => Some(Kind::Outputs),
-            "pipelines" => Some(Kind::Pipelines),
-            "build_edges" => Some(Kind::BuildEdges),
-            _ => None,
+    fn from_wire(kind: crate::generated_wire::ViewKind) -> Self {
+        match kind {
+            crate::generated_wire::ViewKind::Changes => Kind::Changes,
+            crate::generated_wire::ViewKind::Processes => Kind::Procs,
+            crate::generated_wire::ViewKind::Outputs => Kind::Outputs,
+            crate::generated_wire::ViewKind::Pipelines => Kind::Pipelines,
+            crate::generated_wire::ViewKind::BuildEdges => Kind::BuildEdges,
         }
     }
 }
@@ -470,20 +469,37 @@ fn source_build_edges(sid: i64) -> Vec<Value> {
 
 // ── filter parsing + application ────────────────────────────────────────────
 
-fn parse_filter(v: &Value) -> Option<Vec<Clause>> {
-    let arr = v.as_array()?;
-    if arr.is_empty() { return None; }
-    let mut out = Vec::with_capacity(arr.len());
-    for c in arr {
-        let kind = c.get("kind").and_then(Value::as_str)?.to_string();
-        let pattern = c.get("pattern").and_then(Value::as_str)?.to_string();
-        let join = match c.get("join").and_then(Value::as_str) {
-            Some("or") => Join::Or, _ => Join::And,
+fn relation_filter(
+    filter: Option<&crate::generated_wire::FilterSpec>,
+) -> Option<Vec<Clause>> {
+    let clauses = filter?.as_slice();
+    if clauses.is_empty() { return None; }
+    let out = clauses.iter().map(|clause| {
+        let kind = match clause.kind {
+            crate::generated_wire::FilterKind::Path => "path",
+            crate::generated_wire::FilterKind::Box => "box",
+            crate::generated_wire::FilterKind::Exe => "exe",
+            crate::generated_wire::FilterKind::Cwd => "cwd",
+            crate::generated_wire::FilterKind::Arg => "arg",
+            crate::generated_wire::FilterKind::Ids => "ids",
+            crate::generated_wire::FilterKind::Err => "err",
+            crate::generated_wire::FilterKind::Cmd => "cmd",
+            crate::generated_wire::FilterKind::Target => "target",
         };
-        let negate = c.get("negate").and_then(Value::as_bool).unwrap_or(false);
-        let enabled = c.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-        out.push(Clause { m: Match { kind, pattern }, join, negate, enabled });
-    }
+        let join = match clause.join {
+            crate::generated_wire::FilterJoin::And => Join::And,
+            crate::generated_wire::FilterJoin::Or => Join::Or,
+        };
+        Clause {
+            m: Match {
+                kind: kind.into(),
+                pattern: clause.pattern.as_str().into(),
+            },
+            join,
+            negate: clause.negated,
+            enabled: clause.enabled,
+        }
+    }).collect::<Vec<_>>();
     if out.iter().all(|c| !c.enabled) { return None; }
     Some(out)
 }
@@ -559,11 +575,15 @@ fn rebuild_idx(view: &mut View) {
 
 pub type Registry = HashMap<u64, View>;
 
-pub fn open(reg: &mut Registry, next_id: &mut u64,
-            kind_s: &str, sid: i64, filter_v: &Value, procs_running_only: bool) -> Value {
-    let Some(kind) = Kind::parse(kind_s) else {
-        return json!({"ok": false, "error": format!("unknown view kind {kind_s:?}")});
-    };
+pub fn open(
+    reg: &mut Registry,
+    next_id: &mut u64,
+    wire_kind: crate::generated_wire::ViewKind,
+    sid: i64,
+    filter: Option<crate::generated_wire::FilterSpec>,
+    procs_running_only: bool,
+) -> Result<crate::generated_wire::ViewOpenResult, String> {
+    let kind = Kind::from_wire(wire_kind);
     let (source, aux) = match kind {
         Kind::Changes => {
             let (s, a) = source_changes(sid);
@@ -586,14 +606,17 @@ pub fn open(reg: &mut Registry, next_id: &mut u64,
             (s, ViewAux::BuildEdges)
         }
     };
-    let filter = parse_filter(filter_v);
+    let filter = relation_filter(filter.as_ref());
     let mut view = View { kind, sid, source, idx: vec![], filter, aux };
     rebuild_idx(&mut view);
-    *next_id += 1;
+    *next_id = next_id.checked_add(1).ok_or("view identity exhausted")?;
     let id = *next_id;
     let total = view.idx.len();
     reg.insert(id, view);
-    json!({"view_id": id, "total": total})
+    Ok(crate::generated_wire::ViewOpenResult {
+        view: id,
+        total: u64::try_from(total).map_err(|_| "view row count exceeds u64")?,
+    })
 }
 
 pub fn window(reg: &Registry, view_id: u64, start: usize, size: usize) -> Value {
@@ -609,30 +632,36 @@ pub fn window(reg: &Registry, view_id: u64, start: usize, size: usize) -> Value 
     json!({"start": start, "rows": rows, "total": view.idx.len()})
 }
 
-pub fn set_filter(reg: &mut Registry, view_id: u64, filter_v: &Value) -> Value {
+pub fn set_filter(
+    reg: &mut Registry,
+    view_id: u64,
+    filter: Option<crate::generated_wire::FilterSpec>,
+) -> Result<crate::generated_wire::ViewFilterResult, String> {
     let Some(view) = reg.get_mut(&view_id) else {
-        return json!({"ok": false, "error": "unknown view_id"});
+        return Err("unknown view_id".into());
     };
-    view.filter = parse_filter(filter_v);
+    view.filter = relation_filter(filter.as_ref());
     rebuild_idx(view);
-    json!({"total": view.idx.len()})
+    Ok(crate::generated_wire::ViewFilterResult {
+        total: u64::try_from(view.idx.len()).map_err(|_| "view row count exceeds u64")?,
+    })
 }
 
-pub fn find(reg: &Registry, view_id: u64, target_id: i64) -> Value {
+pub fn find(reg: &Registry, view_id: u64, target_id: u64) -> Result<Option<u64>, String> {
     let Some(view) = reg.get(&view_id) else {
-        return json!({"ok": false, "error": "unknown view_id"});
+        return Err("unknown view_id".into());
     };
     for (pos, &i) in view.idx.iter().enumerate() {
-        if let Some(id) = view.source[i].get("id").and_then(Value::as_i64) {
+        if let Some(id) = view.source[i].get("id").and_then(Value::as_u64) {
             if id == target_id {
-                return json!({"ok": true, "pos": pos});
+                return u64::try_from(pos).map(Some).map_err(|_| "view position exceeds u64".into());
             }
         }
     }
-    json!({"ok": false, "error": "not found"})
+    Ok(None)
 }
 
-pub fn close(reg: &mut Registry, view_id: u64) -> Value {
+pub fn close(reg: &mut Registry, view_id: u64) -> Result<(), String> {
     reg.remove(&view_id);
-    json!({"ok": true})
+    Ok(())
 }

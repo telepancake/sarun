@@ -1249,7 +1249,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                     let Ok(sid) = u64::try_from(id) else {
                         return json!({"ok": false, "error": "negative box id"});
                     };
-                    match dispatch_control_action(
+                    match dispatch_action(
                         state,
                         crate::generated_wire::ActionRequest::Sudtrace { sid },
                     ) {
@@ -1276,7 +1276,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                     } else {
                         crate::generated_wire::ActionRequest::Discard { sid }
                     };
-                    match dispatch_control_action(state, request) {
+                    match dispatch_action(state, request) {
                         Ok(success) => legacy_control_reply(success),
                         Err(error) => json!({"ok": false, "error": error}),
                     }
@@ -1305,7 +1305,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                             });
                         }
                     };
-                    match dispatch_control_action(
+                    match dispatch_action(
                         state,
                         crate::generated_wire::ActionRequest::Rename { sid, new },
                     ) {
@@ -1323,7 +1323,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             // died. Same signal the `kill` verb sends; the runner forwards
             // it to the wrapper's process group and tears down normally
             // (sweep included, while the engine is still here to serve it).
-            match dispatch_control_action(state, crate::generated_wire::ActionRequest::Quit) {
+            match dispatch_action(state, crate::generated_wire::ActionRequest::Quit) {
                 Ok(success) => legacy_control_reply(success),
                 Err(error) => json!({"ok": false, "error": error}),
             }
@@ -1336,7 +1336,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
 /// Execute top-level actions from their generated closed request type. Current
 /// JSON branches immediately enter this typed path; the mandatory binary
 /// listener cutover removes those outer projections and calls it directly.
-fn dispatch_control_action(
+fn dispatch_action(
     state: &State,
     request: crate::generated_wire::ActionRequest,
 ) -> Result<crate::generated_wire::ActionSuccess, String> {
@@ -1421,6 +1421,45 @@ fn dispatch_control_action(
                 },
             })
         }
+        ActionRequest::ViewOpen {
+            kind,
+            r#box,
+            filter,
+            running_only,
+        } => {
+            let id = i64::try_from(r#box).map_err(|_| "box id exceeds engine range")?;
+            if !discover::discover().contains_key(&id) {
+                return Err("no slopbox".into());
+            }
+            let mut shared = lock(state);
+            let live = shared.box_runpids.contains_key(&id);
+            let Shared {
+                views,
+                next_view_id,
+                ..
+            } = &mut *shared;
+            crate::views::open(
+                views,
+                next_view_id,
+                kind,
+                id,
+                filter,
+                running_only && live,
+            )
+            .map(|value| ActionSuccess::ViewOpen { value })
+        }
+        ActionRequest::ViewFilter { view, filter } => {
+            crate::views::set_filter(&mut lock(state).views, view, filter)
+                .map(|value| ActionSuccess::ViewFilter { value })
+        }
+        ActionRequest::ViewFind { view, row_id } => {
+            crate::views::find(&lock(state).views, view, row_id)
+                .map(|value| ActionSuccess::ViewFind { value })
+        }
+        ActionRequest::ViewClose { view } => {
+            crate::views::close(&mut lock(state).views, view)?;
+            Ok(ActionSuccess::ViewClose { value: () })
+        }
         ActionRequest::Quit => {
             let fds: Vec<i32> = lock(state).box_pids.values().copied().collect();
             for fd in fds {
@@ -1481,6 +1520,100 @@ fn legacy_control_reply(success: crate::generated_wire::ActionSuccess) -> Value 
             "error": format!("wrong typed control result opcode: {}", other.code()),
         }),
     }
+}
+
+fn legacy_view_kind(value: Option<&str>) -> Result<crate::generated_wire::ViewKind, String> {
+    match value {
+        Some("changes") => Ok(crate::generated_wire::ViewKind::Changes),
+        Some("procs") => Ok(crate::generated_wire::ViewKind::Processes),
+        Some("outputs") => Ok(crate::generated_wire::ViewKind::Outputs),
+        Some("pipelines") => Ok(crate::generated_wire::ViewKind::Pipelines),
+        Some("build_edges") => Ok(crate::generated_wire::ViewKind::BuildEdges),
+        Some(kind) => Err(format!("unknown view kind {kind:?}")),
+        None => Err("missing view kind".into()),
+    }
+}
+
+fn legacy_filter_spec(value: &Value) -> Result<Option<crate::generated_wire::FilterSpec>, String> {
+    use crate::generated_wire::{FilterClause, FilterJoin, FilterKind};
+    if value.is_null() {
+        return Ok(None);
+    }
+    let clauses = value
+        .as_array()
+        .ok_or("view filter must be null or an array")?
+        .iter()
+        .map(|clause| {
+            let kind = match clause.get("kind").and_then(Value::as_str) {
+                Some("path") => FilterKind::Path,
+                Some("box") => FilterKind::Box,
+                Some("exe") => FilterKind::Exe,
+                Some("cwd") => FilterKind::Cwd,
+                Some("arg") => FilterKind::Arg,
+                Some("ids") => FilterKind::Ids,
+                Some("err") => FilterKind::Err,
+                Some("cmd") => FilterKind::Cmd,
+                Some("target") => FilterKind::Target,
+                Some(kind) => return Err(format!("unknown filter kind {kind:?}")),
+                None => return Err("filter clause has no kind".into()),
+            };
+            let pattern = clause
+                .get("pattern")
+                .and_then(Value::as_str)
+                .ok_or("filter clause has no pattern")?;
+            let join = match clause.get("join").and_then(Value::as_str) {
+                Some("and") => FilterJoin::And,
+                Some("or") => FilterJoin::Or,
+                Some(join) => return Err(format!("unknown filter join {join:?}")),
+                None => return Err("filter clause has no join".into()),
+            };
+            Ok(FilterClause {
+                kind,
+                pattern: crate::wire::BoundedText::new(pattern.into())
+                    .map_err(|error| format!("filter pattern exceeds relation bound: {error:?}"))?,
+                join,
+                negated: clause
+                    .get("negate")
+                    .and_then(Value::as_bool)
+                    .ok_or("filter clause has no negate flag")?,
+                enabled: clause
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or("filter clause has no enabled flag")?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    crate::wire::BoundedVec::new(clauses)
+        .map(Some)
+        .map_err(|error| format!("filter clause count exceeds relation bound: {error:?}"))
+}
+
+fn legacy_ui_action_reply(
+    result: Result<crate::generated_wire::ActionSuccess, String>,
+) -> Value {
+    use crate::generated_wire::ActionSuccess;
+    let payload = match result {
+        Ok(ActionSuccess::ViewOpen { value }) => json!({
+            "view_id": value.view,
+            "total": value.total,
+        }),
+        Ok(ActionSuccess::ViewFilter { value }) => json!({"total": value.total}),
+        Ok(ActionSuccess::ViewFind { value: Some(position) }) => {
+            json!({"ok": true, "pos": position})
+        }
+        Ok(ActionSuccess::ViewFind { value: None }) => {
+            json!({"ok": false, "error": "not found"})
+        }
+        Ok(ActionSuccess::ViewClose { .. }) => json!({"ok": true}),
+        Ok(other) => {
+            return json!({
+                "ok": false,
+                "error": format!("wrong typed UI result opcode: {}", other.code()),
+            });
+        }
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+    json!({"ok": true, "r": payload})
 }
 
 /// Temporary projection for the still-active newline JSON listener. It is not
@@ -3733,21 +3866,29 @@ macro_rules! ui_verbs {
         // client open a materialized view (filtered + sorted) and read it as
         // small windows — see views.rs.
         "view.open" => {
-            let kind = args.first().and_then(Value::as_str).unwrap_or("");
-            // Accept either an int or a string-of-int for the sid (the Python
-            // and Rust UIs both send strings, matching the existing verbs;
-            // tests sometimes pass ints).
-            let sid = args.get(1).and_then(|v| v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0);
-            let filter = args.get(2).cloned().unwrap_or(Value::Null);
-            // arg 3: running-only (procs). Default true — the most informative for
-            // a LIVE box. Only filters when the box is actually live (a finished
-            // box shows its full history). Liveness reuses box_runpids.
+            let kind = match legacy_view_kind(args.first().and_then(Value::as_str)) {
+                Ok(kind) => kind,
+                Err(error) => return json!({"ok": false, "error": error}),
+            };
+            let Some(sid) = args.get(1).and_then(|value| value.as_u64().or_else(|| {
+                value.as_str().and_then(|text| text.parse().ok())
+            })) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            let filter = match legacy_filter_spec(args.get(2).unwrap_or(&Value::Null)) {
+                Ok(filter) => filter,
+                Err(error) => return json!({"ok": false, "error": error}),
+            };
             let running_only = args.get(3).and_then(Value::as_bool).unwrap_or(true);
-            let mut s = lock(state);
-            let live = s.box_runpids.contains_key(&sid);
-            let Shared { views, next_view_id, .. } = &mut *s;
-            crate::views::open(views, next_view_id, kind, sid, &filter, running_only && live)
+            return legacy_ui_action_reply(dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::ViewOpen {
+                    kind,
+                    r#box: sid,
+                    filter,
+                    running_only,
+                },
+            ));
         }
         "view.window" => {
             let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
@@ -3757,21 +3898,38 @@ macro_rules! ui_verbs {
             crate::views::window(&s.views, vid, start, size)
         }
         "view.filter" => {
-            let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
-            let filter = args.get(1).cloned().unwrap_or(Value::Null);
-            let mut s = lock(state);
-            crate::views::set_filter(&mut s.views, vid, &filter)
+            let Some(view) = args.first().and_then(Value::as_u64) else {
+                return json!({"ok": false, "error": "missing or invalid view id"});
+            };
+            let filter = match legacy_filter_spec(args.get(1).unwrap_or(&Value::Null)) {
+                Ok(filter) => filter,
+                Err(error) => return json!({"ok": false, "error": error}),
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::ViewFilter { view, filter },
+            ));
         }
         "view.find" => {
-            let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
-            let target_id = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
-            let s = lock(state);
-            crate::views::find(&s.views, vid, target_id)
+            let Some(view) = args.first().and_then(Value::as_u64) else {
+                return json!({"ok": false, "error": "missing or invalid view id"});
+            };
+            let Some(row_id) = args.get(1).and_then(Value::as_u64) else {
+                return json!({"ok": false, "error": "missing or invalid row id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::ViewFind { view, row_id },
+            ));
         }
         "view.close" => {
-            let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
-            let mut s = lock(state);
-            crate::views::close(&mut s.views, vid)
+            let Some(view) = args.first().and_then(Value::as_u64) else {
+                return json!({"ok": false, "error": "missing or invalid view id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::ViewClose { view },
+            ));
         }
         "ping" => {
             broadcast(state, &json!({"type": "pong"}));
@@ -5931,6 +6089,67 @@ mod verb_tests {
         let reply = legacy_control_reply(ActionSuccess::Sudtrace { value: trace });
         assert_eq!(reply["events"][0]["kind"], "42");
         assert_eq!(reply["events"][0]["text"], "future");
+    }
+
+    #[test]
+    fn typed_view_requests_drive_the_stateful_view_registry() {
+        use crate::generated_wire::{
+            ActionRequest, ActionSuccess, FilterClause, FilterJoin, FilterKind,
+        };
+        let state: State = Default::default();
+        lock(&state).views.insert(
+            9,
+            crate::views::View {
+                kind: crate::views::Kind::Pipelines,
+                sid: 1,
+                source: vec![
+                    json!({"id": 11, "cmd": "drop", "exit_code": 0}),
+                    json!({"id": 12, "cmd": "keep this", "exit_code": 0}),
+                ],
+                idx: vec![0, 1],
+                filter: None,
+                aux: crate::views::ViewAux::Pipelines,
+            },
+        );
+
+        let found = dispatch_action(
+            &state,
+            ActionRequest::ViewFind {
+                view: 9,
+                row_id: 12,
+            },
+        )
+        .unwrap();
+        assert_eq!(found, ActionSuccess::ViewFind { value: Some(1) });
+
+        let filter = crate::wire::BoundedVec::new(vec![FilterClause {
+            kind: FilterKind::Cmd,
+            pattern: crate::wire::BoundedText::new("keep".into()).unwrap(),
+            join: FilterJoin::And,
+            negated: false,
+            enabled: true,
+        }])
+        .unwrap();
+        let filtered = dispatch_action(
+            &state,
+            ActionRequest::ViewFilter {
+                view: 9,
+                filter: Some(filter),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            filtered,
+            ActionSuccess::ViewFilter {
+                value: crate::generated_wire::ViewFilterResult { total: 1 },
+            }
+        );
+
+        assert_eq!(
+            dispatch_action(&state, ActionRequest::ViewClose { view: 9 }).unwrap(),
+            ActionSuccess::ViewClose { value: () }
+        );
+        assert!(!lock(&state).views.contains_key(&9));
     }
 
     #[test]

@@ -657,6 +657,15 @@ belong to the relation.
   outer boundary; it has not yet been replaced, so the binary socket and
   all-handler result gates remain unchecked. The cleaned aarch64-musl suite
   passes 298 tests with one ignored, and all 42 pure relation tests pass.
+- Moved `view.open`, `view.filter`, `view.find`, and `view.close` state changes
+  onto generated request/result values and removed their JSON result
+  constructors. The active JSON listener has a strict boundary projection for
+  those four operations; `view.window` remains on the old value path until all
+  five row variants are validated and materialized. Handler-driven tests also
+  found and fixed a schema error: filter kinds are the rule engine's actual
+  `cmd` and `err` vocabulary, not the previously guessed `command` and
+  `error`. The aarch64-musl suite now passes 299 tests with one ignored; all
+  pure relation and generated-code consistency checks pass.
 
 ## Stop conditions
 

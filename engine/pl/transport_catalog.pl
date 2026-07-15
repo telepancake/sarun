@@ -287,8 +287,8 @@ wire_enum(filter_kind, exe,    3).
 wire_enum(filter_kind, cwd,    4).
 wire_enum(filter_kind, arg,    5).
 wire_enum(filter_kind, ids,    6).
-wire_enum(filter_kind, error,  7).
-wire_enum(filter_kind, command, 8).
+wire_enum(filter_kind, err,    7).
+wire_enum(filter_kind, cmd,    8).
 wire_enum(filter_kind, target,  9).
 
 wire_type(filter_clause, record([
