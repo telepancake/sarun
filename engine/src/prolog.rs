@@ -2750,6 +2750,7 @@ mod tests {
                 rv_list(vec![literal, argument]),
                 rv_compound("terminals", vec![rv_list(vec![terminal])]),
                 rv_compound("separator", vec![rv_string(" ")]),
+                rv_compound("contexts", vec![rv_list(vec![])]),
             ],
         );
         let span = |start, end| rv_compound("span", vec![rv_integer(start), rv_integer(end)]);

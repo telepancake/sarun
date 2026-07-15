@@ -10,6 +10,8 @@
             transform_relation/6
           ]).
 
+:- use_module(context_relation).
+
 /** <module> Grammar-independent relational sequence execution
 
 This module owns the operational meaning of the current sequence grammar:
@@ -34,10 +36,11 @@ composable grammar-value/codec relation as the generic IR lands.
 % while context staging and bounded solution enumeration move into this layer.
 
 transform_relation(
-    sequence_grammar(Specs, terminals(Terminals), separator(Separator)),
-    Given, Wanted, _Observations,
+    sequence_grammar(Specs, terminals(Terminals), separator(Separator),
+                     contexts(Contexts)),
+    Given, Wanted, Observations,
     limits(MaxSolutions, MaxEvidence, _MaxOutputBytes),
-    reply(Solutions, [], [], Diagnostics)) :-
+    reply(Solutions, Queries, DependencyKeys, Diagnostics)) :-
     given_value(source, Given, source(Items, Mode)),
     neutral_input(Items, Body),
     valid_relation_mode(Mode),
@@ -49,10 +52,14 @@ transform_relation(
               Candidates0),
     Candidates0 = [_|_],
     limit_solutions(Candidates0, MaxSolutions, Candidates, Diagnostics),
-    candidate_completions(Mode, Candidates, Completions),
-    candidate_solutions(Candidates, Wanted, Completions, Solutions).
+    candidate_context_queries(Contexts, Mode, Candidates, Queries),
+    candidate_completions(Mode, Contexts, Candidates, Queries, Observations,
+                          Completions),
+    candidate_solutions(Candidates, Wanted, Completions, Solutions),
+    observation_dependency_keys(Observations, DependencyKeys).
 transform_relation(
-    sequence_grammar(Specs, terminals(Terminals), separator(Separator)),
+    sequence_grammar(Specs, terminals(Terminals), separator(Separator),
+                     contexts(_Contexts)),
     Given, Wanted, _Observations, _Limits,
     reply([solution(Bindings, 0)], [], [], [])) :-
     given_value(arguments, Given, Arguments),
@@ -91,8 +98,9 @@ take_prefix(Count, [Value|Values], [Value|Prefix], Rest) :-
     Next is Count - 1,
     take_prefix(Next, Values, Prefix, Rest).
 
-candidate_completions(exact, _, []).
-candidate_completions(assist(EditId), Candidates, Completions) :-
+candidate_completions(exact, _, _, _, _, []).
+candidate_completions(assist(EditId), Contexts, Candidates, Queries,
+                      Observations, Completions) :-
     findall(completion_key(Span, Text)-
                 (alternative(Semantic, Syntax, Description)-Preference),
             ( candidate_member(
@@ -100,8 +108,96 @@ candidate_completions(assist(EditId), Candidates, Completions) :-
               literal_completion_evidence(
                   EditId, Evidence, Span, Text, Semantic, Syntax, Description)
             ),
-            Pairs),
+            LiteralPairs),
+    findall(completion_key(Span, Text)-
+                (alternative(context(Domain, Identity), context_argument,
+                             Provider)-Preference),
+            context_completion_pair(
+                EditId, Contexts, Candidates, Queries, Observations,
+                Span, Text, Domain, Identity, Provider, Preference),
+            ContextPairs),
+    append(LiteralPairs, ContextPairs, Pairs),
     project_completions(Pairs, Completions).
+
+candidate_context_queries(Contexts, exact, Candidates, Queries) :-
+    findall(Query,
+            ( candidate_member(candidate(_, Evidence, _, _, _), Candidates),
+              evidence_context_query(Contexts, Evidence, exact, 1, Query)
+            ),
+            Queries0),
+    sort(Queries0, Queries).
+candidate_context_queries(Contexts, assist(EditId), Candidates, Queries) :-
+    findall(Query,
+            ( candidate_member(candidate(_, Evidence, _, _, _), Candidates),
+              evidence_context_query(
+                  Contexts, Evidence, assist(EditId), 1, Query)
+            ),
+            Queries0),
+    sort(Queries0, Queries).
+
+% Exact and assist queries share stable q(N) identifiers determined solely by
+% contextual evidence order. Non-contextual literals do not perturb them.
+evidence_context_query(Contexts, Evidence, Mode, Index, Query) :-
+    evidence_context_query_(Contexts, Evidence, Mode, Index, _Next, Query).
+
+evidence_context_query_(Contexts, [Item|_], Mode, Index, Next, Query) :-
+    contextual_evidence(Contexts, Item, Mode, Index, Query),
+    Next is Index + 1.
+evidence_context_query_(Contexts, [Item|Items], Mode, Index, Next, Query) :-
+    ( contextual_evidence(Contexts, Item, Mode, Index, _)
+    -> Following is Index + 1
+    ;  Following = Index
+    ),
+    evidence_context_query_(Contexts, Items, Mode, Following, Next, Query).
+
+contextual_evidence(Contexts,
+                    evidence(_, _, _, Surface, _, Name, _, Origin),
+                    Mode, Index, query(q(Index), Ask)) :-
+    context_descriptor(Name, Cardinality, Domain, root, Contexts),
+    context_ask(Mode, Origin, Cardinality, Domain, Surface, Ask).
+
+context_ask(exact, _, Cardinality, Domain, Surface,
+            ask(Cardinality, Domain, name(Surface))) :-
+    context_cardinality(Cardinality).
+context_ask(assist(EditId), tear(EditId, argument(_, _)), one, Domain, Surface,
+            ask(all, Domain, prefix(Surface))).
+context_ask(assist(EditId), tear(EditId, argument(_, _)), all, Domain, Surface,
+            ask(all, Domain, prefix(Surface))).
+context_ask(assist(EditId), tear(EditId, argument(_, _)), empty, Domain, Surface,
+            ask(empty, Domain, prefix(Surface))).
+
+context_cardinality(empty).
+context_cardinality(one).
+context_cardinality(all).
+
+context_descriptor(Name, Cardinality, Domain, Scope,
+                   [context(Name, Cardinality, Domain, Scope)|_]).
+context_descriptor(Name, Cardinality, Domain, Scope, [_|Contexts]) :-
+    context_descriptor(Name, Cardinality, Domain, Scope, Contexts).
+
+context_completion_pair(
+    EditId, Contexts, Candidates, Queries, Observations,
+    Span, Text, Domain, Identity, Provider, Preference) :-
+    candidate_member(candidate(_, Evidence, _, Preference, _), Candidates),
+    candidate_member(
+        evidence(_, Span, _, Surface, _, Name, _,
+                 tear(EditId, argument(Name, _))), Evidence),
+    context_descriptor(Name, one, Domain, root, Contexts),
+    candidate_member(query(Id, Query), Queries),
+    Query = ask(all, Domain, prefix(Surface)),
+    candidate_member(
+        observed(Id, Query, Source, some(all(Entries))), Observations),
+    Source = source(Provider, _Revision),
+    context_tear_match(Query, snapshot(Source, Entries), Surface, Text,
+                       _ExactQuery,
+                       entry(Domain, Identity, _Names, _Value, _Attributes)).
+
+observation_dependency_keys(Observations, Keys) :-
+    findall(Key,
+            ( candidate_member(Observation, Observations),
+              dependency_key(Observation, Key)
+            ),
+            Keys).
 
 candidate_solutions([], _, _, []).
 candidate_solutions(

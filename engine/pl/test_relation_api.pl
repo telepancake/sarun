@@ -4,6 +4,7 @@
 
 test_name(same_request_shape_parses_and_renders_foreign_grammar).
 test_name(tear_completion_is_aggregated_from_parse_evidence).
+test_name(context_queries_completions_and_dependencies_are_one_relation).
 test_name(solution_limit_is_enforced_and_reported).
 test_name(envelope_fails_closed).
 
@@ -33,7 +34,8 @@ foreign_grammar(
                      [surface(word("world"), "world"),
                       surface(word("friend"), "friend")])
         ]),
-        separator(" "))).
+        separator(" "),
+        contexts([]))).
 
 source(Surface, Start,
        unit(ignored, span(Start, Stop), [span(Start, Stop)], Surface,
@@ -94,7 +96,7 @@ run_test(solution_limit_is_enforced_and_reported) :-
         terminals([
             terminal(word, identifier,
                      [surface(first, "same"), surface(second, "same")])
-        ]), separator(" ")),
+        ]), separator(" "), contexts([])),
     source("same", 0, Same),
     Request = request(
         Ambiguous,
@@ -103,6 +105,52 @@ run_test(solution_limit_is_enforced_and_reported) :-
     transform(Request, Reply),
     Reply = reply([solution([binding(arguments, [_])], _)], [], [],
                   [diagnostic(solution_limit(1))]).
+
+run_test(context_queries_completions_and_dependencies_are_one_relation) :-
+    Grammar = sequence_grammar(
+        [literal(open, "open", keyword, open, 20),
+         argument(arg(name, word, required, scalar))],
+        terminals([
+            terminal(word, identifier,
+                     [surface(word("wo"), "wo")])
+        ]), separator(" "), contexts([context(name, one, object, root)])),
+    source("open", 0, Open),
+    source("wo", 5, Word),
+    Tear = edit_tear(edit, span(5, 7), "wo"),
+    Limits = limits(16, 256, 65536),
+    ExactRequest = request(
+        Grammar,
+        given([binding(source, source([Open, Word, end(7)], exact))]),
+        want([arguments]), observations([]), Limits),
+    transform(ExactRequest, ExactReply),
+    ExactReply = reply(_, [query(q(1), ask(one, object, name("wo")))],
+                       [], []),
+    Request0 = request(
+        Grammar,
+        given([binding(source,
+                       source([Open, Tear, end(7)], assist(edit)))]),
+        want([arguments, completions]), observations([]), Limits),
+    transform(Request0, Reply0),
+    Reply0 = reply(_, [query(q(1), Query)], [], []),
+    Query = ask(all, object, prefix("wo")),
+    Entries = [entry(object, 7, ["work"], object_id(7), [])],
+    Observation = observed(q(1), Query, source(objects, 12),
+                           some(all(Entries))),
+    Request1 = request(
+        Grammar,
+        given([binding(source,
+                       source([Open, Tear, end(7)], assist(edit)))]),
+        want([completions]), observations([Observation]), Limits),
+    transform(Request1, Reply1),
+    Reply1 = reply(
+        [solution([binding(completions,
+                           [completion(span(5, 7), "work",
+                                       [alternative(context(object, 7),
+                                                    context_argument,
+                                                    objects, 33)],
+                                       33, 1)])], 33)],
+        [query(q(1), Query)],
+        [dependency(q(1), Query, some(all(Entries)))], []).
 
 run_test(envelope_fails_closed) :-
     foreign_grammar(Grammar),

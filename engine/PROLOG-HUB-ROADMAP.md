@@ -230,6 +230,11 @@ request. The output-byte limit is validated at the Prolog envelope and bounded
 by the Rust decoder's fixed ceiling, but the request-specific byte ceiling is
 not yet applied by the decoder. The old action-specific `Operation` and
 `application/3` path still exists for sarun and must be migrated and deleted.
+The foreign grammar now also declares contextual fields with an explicit
+`empty`/`one`/`all` exact cardinality. Exact and torn source transformations
+return stable query nodes; resubmitted observations produce completion matches
+and dependency keys through the same reply, without a context-specific entry
+point or client-side grammar inspection.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:
