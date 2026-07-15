@@ -440,7 +440,8 @@ belong to the relation.
 - [x] Expand them to exhaustive per-representation and per-action round trips.
 - [x] Parse/render round trips preserve typed wire arguments for every action.
 - [x] Canonical verb and all CLI forms parse with exact arity and full input.
-- [ ] Numeric-looking strings, paths, base64, and specs remain strings.
+- [ ] Numeric-looking textual values remain text; byte paths and decoded
+      base64 bodies remain bytes without numeric coercion or lossy conversion.
 - [x] Optional and repeated arguments preserve exact wire array shape.
 - [ ] Completion supports partial tokens and mid-token UTF-8 byte spans.
 - [x] Completion candidates are exactly the tear bindings used by successful
@@ -721,6 +722,16 @@ belong to the relation.
   merges live process/error state before the temporary listener projection.
   A focused closed-row test was added; the full native aarch64-musl suite passes
   307 tests with one existing browser e2e test ignored.
+- Moved `box_new`, `box_drop`, `box_file_read`, `box_file_write`,
+  `box_dir_list`, and `box_path_kind` onto generated request/success variants.
+  File bodies remain bounded bytes through execution and base64 is confined to
+  the temporary JSON projection. Box creation now considers both discovered and
+  live IDs and validates an optional parent. Relative-path validation rejects
+  absolute paths, traversal, NULs, and the current overlay index's unsupported
+  non-UTF-8 keys explicitly. The latter is a recorded remaining defect: the
+  wire retains arbitrary bytes, but the overlay's `String` key model must still
+  be replaced before byte-path support is complete. The full native
+  aarch64-musl suite passes 308 tests with one existing browser e2e test ignored.
 
 ## Stop conditions
 

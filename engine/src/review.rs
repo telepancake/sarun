@@ -203,14 +203,24 @@ pub fn write_file_checked(id: i64, rel: &str, bytes: &[u8],
                           ov: &crate::overlay::Overlay, allow_create: bool)
     -> Value
 {
+    match write_file_checked_typed(id, rel, bytes, ov, allow_create) {
+        Ok(length) => json!({"ok": true, "len": length}),
+        Err(error) => json!({"ok": false, "error": error}),
+    }
+}
+
+pub fn write_file_checked_typed(
+    id: i64,
+    rel: &str,
+    bytes: &[u8],
+    ov: &crate::overlay::Overlay,
+    allow_create: bool,
+) -> Result<u64, String> {
     let rel = rel.trim_start_matches('/');
-    if let Err(e) = write_file_guard(id, rel, bytes, allow_create) {
-        return json!({"ok": false, "error": e});
-    }
-    match ov.box_write_file(id, rel, bytes) {
-        Ok(()) => json!({"ok": true, "len": bytes.len()}),
-        Err(e) => json!({"ok": false, "error": format!("write {rel}: {e}")}),
-    }
+    write_file_guard(id, rel, bytes, allow_create)?;
+    ov.box_write_file(id, rel, bytes)
+        .map_err(|error| format!("write {rel}: {error}"))?;
+    u64::try_from(bytes.len()).map_err(|_| "written content length exceeds u64".into())
 }
 
 /// The refusal gate shared by both write verbs, separated so it is

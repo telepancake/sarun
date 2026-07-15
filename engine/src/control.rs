@@ -12,6 +12,7 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -1342,6 +1343,35 @@ fn existing_box_id(sid: u64) -> Result<i64, String> {
         .ok_or_else(|| "no slopbox".into())
 }
 
+fn action_relative_path(path: &crate::generated_wire::Path) -> Result<&str, String> {
+    let bytes = path.as_slice();
+    if bytes.contains(&0) {
+        return Err("box path contains NUL".into());
+    }
+    let path = std::str::from_utf8(bytes)
+        .map_err(|_| "the current overlay index cannot address a non-UTF-8 box path")?;
+    if path.starts_with('/') || std::path::Path::new(path).components().any(|component| {
+        matches!(component, std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_))
+    }) {
+        return Err("box path must be relative and cannot contain '..'".into());
+    }
+    Ok(path)
+}
+
+fn relation_path_kind(kind: char) -> Result<crate::generated_wire::PathKind, String> {
+    use crate::generated_wire::PathKind;
+    match kind {
+        '?' => Ok(PathKind::Missing),
+        'f' => Ok(PathKind::File),
+        'd' => Ok(PathKind::Directory),
+        'l' => Ok(PathKind::Symlink),
+        's' => Ok(PathKind::Special),
+        other => Err(format!("unknown overlay path kind {other:?}")),
+    }
+}
+
 fn dispatch_action(
     state: &State,
     request: crate::generated_wire::ActionRequest,
@@ -1612,6 +1642,89 @@ fn dispatch_action(
             let value = crate::wire::BoundedVec::new(rows)
                 .map_err(|error| format!("session rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::SessionDicts { value })
+        }
+        ActionRequest::BoxNew { parent_sid } => {
+            let overlay = lock(state).overlay.clone()
+                .ok_or("overlay not mounted")?;
+            let parent = parent_sid.map(existing_box_id).transpose()?;
+            let boxes = discover::discover();
+            let id = boxes.keys().max().copied().unwrap_or(0)
+                .max(overlay.box_ids().into_iter().max().unwrap_or(0)) + 1;
+            let capture = crate::capture::BoxState::create(id)
+                .map_err(|error| format!("box_new: {error}"))?;
+            capture.set_parent(parent);
+            if let Some(parent) = parent {
+                capture.set_meta("parent_box_id", &parent.to_string());
+            }
+            overlay.add_box(std::sync::Arc::new(capture));
+            broadcast(state, &json!({
+                "type": "session_added",
+                "sid": id.to_string(),
+                "parent": parent,
+            }));
+            let root = crate::paths::mnt_point().join(id.to_string());
+            let root = crate::wire::BoundedBytes::new(root.as_os_str().as_bytes().to_vec())
+                .map_err(|error| format!("box root path exceeds relation bound: {error:?}"))?;
+            Ok(ActionSuccess::BoxNew {
+                value: crate::generated_wire::BoxCreated {
+                    r#box: u64::try_from(id).map_err(|_| "negative allocated box id")?,
+                    root,
+                },
+            })
+        }
+        ActionRequest::BoxDrop { sid } => {
+            let id = existing_box_id(sid)?;
+            let overlay = lock(state).overlay.clone()
+                .ok_or("overlay not mounted")?;
+            overlay.remove_box(id);
+            Ok(ActionSuccess::BoxDrop { value: () })
+        }
+        ActionRequest::BoxFileRead { r#box, path } => {
+            let id = existing_box_id(r#box)?;
+            let overlay = lock(state).overlay.clone()
+                .ok_or("overlay not available")?;
+            let bytes = overlay.box_read_file(id, action_relative_path(&path)?)
+                .map_err(|error| error.to_string())?;
+            let value = crate::wire::BoundedBytes::new(bytes)
+                .map_err(|error| format!("box file exceeds relation bound: {error:?}"))?;
+            Ok(ActionSuccess::BoxFileRead { value })
+        }
+        ActionRequest::BoxFileWrite { r#box, path, b64 } => {
+            let id = existing_box_id(r#box)?;
+            let overlay = lock(state).overlay.clone()
+                .ok_or("overlay not available")?;
+            let value = crate::review::write_file_checked_typed(
+                id,
+                action_relative_path(&path)?,
+                b64.as_slice(),
+                &overlay,
+                true,
+            )?;
+            Ok(ActionSuccess::BoxFileWrite { value })
+        }
+        ActionRequest::BoxDirList { r#box, path } => {
+            let id = existing_box_id(r#box)?;
+            let overlay = lock(state).overlay.clone()
+                .ok_or("overlay not available")?;
+            let rows = overlay.box_list_dir(id, action_relative_path(&path)?)
+                .map_err(|error| error.to_string())?.into_iter()
+                .map(|(name, kind)| Ok(crate::generated_wire::DirectoryEntry {
+                    name: crate::wire::BoundedBytes::new(name.into_bytes())
+                        .map_err(|error| format!("directory name exceeds relation bound: {error:?}"))?,
+                    kind: relation_path_kind(kind)?,
+                }))
+                .collect::<Result<Vec<_>, String>>()?;
+            let value = crate::wire::BoundedVec::new(rows)
+                .map_err(|error| format!("directory listing exceeds relation bound: {error:?}"))?;
+            Ok(ActionSuccess::BoxDirList { value })
+        }
+        ActionRequest::BoxPathKind { r#box, path } => {
+            let id = existing_box_id(r#box)?;
+            let overlay = lock(state).overlay.clone()
+                .ok_or("overlay not available")?;
+            let value = relation_path_kind(
+                overlay.box_path_kind(id, action_relative_path(&path)?))?;
+            Ok(ActionSuccess::BoxPathKind { value })
         }
         ActionRequest::ViewOpen {
             kind,
@@ -1937,6 +2050,17 @@ fn legacy_box_session(value: crate::generated_wire::BoxSession) -> Value {
     })
 }
 
+fn legacy_path_kind(value: crate::generated_wire::PathKind) -> &'static str {
+    use crate::generated_wire::PathKind;
+    match value {
+        PathKind::Missing => "?",
+        PathKind::File => "f",
+        PathKind::Directory => "d",
+        PathKind::Symlink => "l",
+        PathKind::Special => "s",
+    }
+}
+
 fn legacy_ui_action_reply(
     result: Result<crate::generated_wire::ActionSuccess, String>,
 ) -> Value {
@@ -2011,6 +2135,24 @@ fn legacy_ui_action_reply(
             .collect()),
         Ok(ActionSuccess::SessionDicts { value }) => Value::Array(value.into_inner()
             .into_iter().map(legacy_box_session).collect()),
+        Ok(ActionSuccess::BoxNew { value }) => json!({
+            "sid": value.r#box.to_string(),
+            "root": legacy_bytes(value.root),
+        }),
+        Ok(ActionSuccess::BoxDrop { .. }) => json!({"ok": true}),
+        Ok(ActionSuccess::BoxFileRead { value }) => {
+            use base64::{Engine, prelude::BASE64_STANDARD};
+            json!({"bytes": BASE64_STANDARD.encode(value.as_slice())})
+        }
+        Ok(ActionSuccess::BoxFileWrite { value }) => json!({"len": value}),
+        Ok(ActionSuccess::BoxDirList { value }) => Value::Array(value.into_inner()
+            .into_iter().map(|row| json!({
+                "name": legacy_bytes(row.name),
+                "kind": legacy_path_kind(row.kind),
+            })).collect()),
+        Ok(ActionSuccess::BoxPathKind { value }) => {
+            json!({"kind": legacy_path_kind(value)})
+        }
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -4376,39 +4518,16 @@ macro_rules! ui_verbs {
             ));
         }
         "box_new" => {
-            // m3a: create a box and expose <mnt>/<id> — the overlay-core path
-            // (the full runner register handshake is m3b).
-            let ov = lock(state).overlay.clone();
-            let Some(ov) = ov else {
-                return json!({"ok": false, "error": "overlay not mounted"});
+            let parent_sid = match args.first() {
+                None | Some(Value::Null) => None,
+                Some(_) => match legacy_u64(args, 0) {
+                    Some(parent) => Some(parent),
+                    None => return json!({"ok": false, "error": "invalid parent box id"}),
+                },
             };
-            let id = boxes.keys().max().copied().unwrap_or(0) + 1;
-            // optional parent arg (args[0]) — nests the new box for KIDS_DIR.
-            let parent = args.first().and_then(Value::as_str)
-                .and_then(|s| s.parse::<i64>().ok());
-            match crate::capture::BoxState::create(id) {
-                Ok(b) => {
-                    b.set_parent(parent);
-                    if let Some(p) = parent {
-                        b.set_meta("parent_box_id", &p.to_string());
-                    }
-                    ov.add_box(std::sync::Arc::new(b));
-                    // Same announce as register(): attached UIs need
-                    // to know a new box exists. Without this the
-                    // session list only updates on the next event of
-                    // any kind (or a manual refresh).
-                    broadcast(state, &json!({
-                        "type": "session_added",
-                        "sid": id.to_string(),
-                        "parent": parent,
-                    }));
-                    json!({"sid": id.to_string(),
-                           "root": crate::paths::mnt_point().join(id.to_string())
-                                   .to_string_lossy()})
-                }
-                Err(e) => return json!({"ok": false,
-                                        "error": format!("box_new: {e}")}),
-            }
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::BoxNew { parent_sid },
+            ));
         }
         "struct_quick" => {
             match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
@@ -4526,11 +4645,12 @@ macro_rules! ui_verbs {
             return json!({"ok": true, "r": Value::Null});
         }
         "box_drop" => {
-            let ov = lock(state).overlay.clone();
-            if let (Some(ov), Some(id)) = (ov, arg_sid(args)) {
-                ov.remove_box(id);
-            }
-            json!({"ok": true})
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::BoxDrop { sid },
+            ));
         }
         // ── box-rooted file ops — the engine-side half of oaita's read/write/
         //    inspect tools. Resolve name→id, hydrate the parent chain, then
@@ -4538,37 +4658,33 @@ macro_rules! ui_verbs {
         //    no subprocess. args: [name_or_id, path_rel_to_root, (write only)
         //    base64-bytes]. path must NOT start with '/'.
         "box_file_read" => {
-            let ov = lock(state).overlay.clone();
-            let Some(ov) = ov else {
-                return json!({"ok": false, "error": "overlay not available"});
-            };
             let Some(ident) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "box_file_read: missing name/id"});
             };
             let Some(id) = resolve(&boxes, ident) else {
                 return json!({"ok": false, "error": format!("no such box: {ident}")});
             };
-            let rel = args.get(1).and_then(Value::as_str).unwrap_or("");
-            match ov.box_read_file(id, rel) {
-                Ok(bytes) => {
-                    use base64::{Engine, prelude::BASE64_STANDARD};
-                    json!({"bytes": BASE64_STANDARD.encode(bytes)})
-                }
-                Err(e) => return json!({"ok": false, "error": e.to_string()}),
-            }
+            let Some(path) = legacy_path_arg(args, 1) else {
+                return json!({"ok": false, "error": "box_file_read: missing path"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::BoxFileRead {
+                    r#box: id as u64,
+                    path,
+                },
+            ));
         }
         "box_file_write" => {
-            let ov = lock(state).overlay.clone();
-            let Some(ov) = ov else {
-                return json!({"ok": false, "error": "overlay not available"});
-            };
             let Some(ident) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "box_file_write: missing name/id"});
             };
             let Some(id) = resolve(&boxes, ident) else {
                 return json!({"ok": false, "error": format!("no such box: {ident}")});
             };
-            let rel = args.get(1).and_then(Value::as_str).unwrap_or("");
+            let Some(path) = legacy_path_arg(args, 1) else {
+                return json!({"ok": false, "error": "box_file_write: missing path"});
+            };
             let b64 = args.get(2).and_then(Value::as_str).unwrap_or("");
             use base64::{Engine, prelude::BASE64_STANDARD};
             let bytes = match BASE64_STANDARD.decode(b64) {
@@ -4576,45 +4692,60 @@ macro_rules! ui_verbs {
                 Err(e) => return json!({"ok": false,
                     "error": format!("bad base64: {e}")}),
             };
-            // Shared guard+write core with review.write_file — the agent path
-            // gains the tombstone/symlink/dir/binary refusals it lacked.
-            // `return` (not fall-through) so a refusal reaches the executor
-            // as an envelope error, not a silently-wrapped {ok:false}.
-            // allow_create = true: the agent authors new files.
-            return crate::review::write_file_checked(id, rel, &bytes, &ov, true);
+            let Ok(b64) = crate::wire::BoundedBytes::new(bytes) else {
+                return json!({"ok": false, "error": "box file content exceeds relation bound"});
+            };
+            return match dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::BoxFileWrite {
+                    r#box: id as u64,
+                    path,
+                    b64,
+                },
+            ) {
+                Ok(crate::generated_wire::ActionSuccess::BoxFileWrite { value }) => {
+                    json!({"ok": true, "len": value})
+                }
+                Ok(other) => json!({"ok": false, "error": format!(
+                    "wrong typed box_file_write result opcode: {}", other.code())}),
+                Err(error) => json!({"ok": false, "error": error}),
+            };
         }
         "box_dir_list" => {
-            let ov = lock(state).overlay.clone();
-            let Some(ov) = ov else {
-                return json!({"ok": false, "error": "overlay not available"});
-            };
             let Some(ident) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "box_dir_list: missing name/id"});
             };
             let Some(id) = resolve(&boxes, ident) else {
                 return json!({"ok": false, "error": format!("no such box: {ident}")});
             };
-            let rel = args.get(1).and_then(Value::as_str).unwrap_or("");
-            match ov.box_list_dir(id, rel) {
-                Ok(entries) => Value::Array(entries.into_iter()
-                    .map(|(n, k)| json!({"name": n, "kind": k.to_string()}))
-                    .collect()),
-                Err(e) => return json!({"ok": false, "error": e.to_string()}),
-            }
+            let Some(path) = legacy_path_arg(args, 1) else {
+                return json!({"ok": false, "error": "box_dir_list: missing path"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::BoxDirList {
+                    r#box: id as u64,
+                    path,
+                },
+            ));
         }
         "box_path_kind" => {
-            let ov = lock(state).overlay.clone();
-            let Some(ov) = ov else {
-                return json!({"ok": false, "error": "overlay not available"});
-            };
             let Some(ident) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "box_path_kind: missing name/id"});
             };
             let Some(id) = resolve(&boxes, ident) else {
                 return json!({"ok": false, "error": format!("no such box: {ident}")});
             };
-            let rel = args.get(1).and_then(Value::as_str).unwrap_or("");
-            json!({"kind": ov.box_path_kind(id, rel).to_string()})
+            let Some(path) = legacy_path_arg(args, 1) else {
+                return json!({"ok": false, "error": "box_path_kind: missing path"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::BoxPathKind {
+                    r#box: id as u64,
+                    path,
+                },
+            ));
         }
         // OCI registry I/O runs HOST-SIDE in the engine: the CLI (host or
         // in-box) RPCs these so credentials never enter a box and an in-box
@@ -6452,6 +6583,18 @@ fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>, frame: &[u8],
 #[cfg(test)]
 mod verb_tests {
     use super::*;
+
+    #[test]
+    fn typed_box_paths_reject_unsafe_or_unaddressable_overlay_keys() {
+        let path = |bytes| crate::wire::BoundedBytes::new(bytes).unwrap();
+        assert_eq!(action_relative_path(&path(b"src/main.rs".to_vec())).unwrap(),
+                   "src/main.rs");
+        assert_eq!(action_relative_path(&path(Vec::new())).unwrap(), "");
+        assert!(action_relative_path(&path(b"../host".to_vec())).is_err());
+        assert!(action_relative_path(&path(b"/etc/passwd".to_vec())).is_err());
+        assert!(action_relative_path(&path(vec![b'a', 0, b'b'])).is_err());
+        assert!(action_relative_path(&path(vec![0xff])).is_err());
+    }
 
     // Calling every related verb with empty args is not safe in a unit test
     // (mirror_run_pending starts jobs, oaita.models does network I/O), so
