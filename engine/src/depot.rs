@@ -84,16 +84,6 @@ pub fn archive_mtime(conn: &Connection, rel: &str) -> Option<i64> {
                    |r| r.get(0)).ok()
 }
 
-/// All nodes (name, mode, sz), name-ordered — the session-changes listing.
-pub fn archive_nodes_by_name(conn: &Connection) -> Vec<(String, u32, i64)> {
-    let Ok(mut st) = conn.prepare(
-        "SELECT name,mode,sz FROM sqlar ORDER BY name") else { return vec![] };
-    let Ok(it) = st.query_map([], |r| Ok((
-        r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32,
-        r.get::<_, i64>(2)?))) else { return vec![] };
-    it.flatten().collect()
-}
-
 /// All nodes with content + opaque, name-ordered — the layer-export walk
 /// (OCI build_layer_tar).
 #[allow(clippy::type_complexity)]

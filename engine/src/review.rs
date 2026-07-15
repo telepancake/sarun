@@ -39,16 +39,38 @@ const S_IFMT: u32 = 0o170000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFLNK: u32 = 0o120000;
 
-pub fn session_changes(id: i64) -> Value {
-    let Some(conn) = open_ro(id) else { return json!([]) };
-    let mut out = vec![];
-    for (name, mode, sz) in crate::depot::archive_nodes_by_name(&conn) {
-        let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
-                   else if mode & S_IFMT == S_IFLNK { "symlink" }
-                   else { "changed" };
-        out.push(json!({"path": name, "kind": kind, "size": sz}));
-    }
-    Value::Array(out)
+pub fn session_changes_typed(id: i64)
+    -> Result<Vec<crate::generated_wire::ChangeRow>, String>
+{
+    use crate::generated_wire::{ChangeKind, ChangeRow};
+    let conn = Connection::open_with_flags(
+        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let mut statement = conn.prepare(
+        "SELECT name,mode,sz FROM sqlar ORDER BY name")
+        .map_err(|error| error.to_string())?;
+    let rows = statement.query_map([], |row| Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, i64>(1)?,
+        row.get::<_, i64>(2)?,
+    ))).map_err(|error| error.to_string())?;
+    rows.map(|row| {
+        let (name, mode, size) = row.map_err(|error| error.to_string())?;
+        let mode = u32::try_from(mode).map_err(|_| "stored file mode exceeds u32")?;
+        let kind = if mode & S_IFMT == S_IFCHR {
+            ChangeKind::Deleted
+        } else if mode & S_IFMT == S_IFLNK {
+            ChangeKind::Symlink
+        } else {
+            ChangeKind::Changed
+        };
+        Ok(ChangeRow {
+            path: crate::wire::BoundedBytes::new(name.into_bytes())
+                .map_err(|error| format!("change path exceeds relation bound: {error:?}"))?,
+            kind,
+            size: u64::try_from(size).map_err(|_| "negative stored change size")?,
+        })
+    }).collect()
 }
 
 /// The box's current bytes for `rel`: symlink target (raw in the row) or the
@@ -147,25 +169,25 @@ pub fn hunks(id: i64, rel: &str) -> Value {
 /// the UI's document reader ('V' on Changes); base64 because the socket
 /// protocol is JSON. Fails loudly ({ok:false, error}) for tombstones,
 /// symlinks, and paths that exist nowhere.
-pub fn file_bytes(id: i64, rel: &str) -> Value {
+pub fn file_bytes_typed(id: i64, rel: &str) -> Result<Vec<u8>, String> {
     let rel = rel.trim_start_matches('/');
     match current_mode(id, rel) {
         Some(mode) if mode & S_IFMT == S_IFCHR => {
-            json!({"ok": false, "error": "deleted in box"})
+            Err("deleted in box".into())
         }
         Some(mode) if mode & S_IFMT == S_IFLNK => {
-            json!({"ok": false, "error": "symlink, not a document"})
+            Err("symlink, not a document".into())
         }
         Some(_) => match current_bytes(id, rel) {
-            Some(cur) => json!({"ok": true, "b64": b64(&cur)}),
-            None => json!({"ok": false, "error": "content unavailable"}),
+            Some(current) => Ok(current),
+            None => Err("content unavailable".into()),
         },
         None => {
             let low = lower_bytes(rel);
             if low.is_empty() && !Path::new("/").join(rel).is_file() {
-                json!({"ok": false, "error": "no such file"})
+                Err("no such file".into())
             } else {
-                json!({"ok": true, "b64": b64(&low)})
+                Ok(low)
             }
         }
     }
@@ -180,13 +202,6 @@ pub fn file_bytes(id: i64, rel: &str) -> Value {
 /// an at-rest box is hydrated on demand). The host is never touched.
 /// Fails loudly ({ok:false, error}) for tombstones, symlinks, directories,
 /// binary content (either side), and paths that exist nowhere.
-pub fn write_file(id: i64, rel: &str, bytes: &[u8],
-                  ov: &crate::overlay::Overlay) -> Value {
-    // The editor only opens files that already exist, so a path that exists
-    // nowhere is a caller bug — refuse (allow_create = false).
-    write_file_checked(id, rel, bytes, ov, false)
-}
-
 /// Shared guard-and-write core for the two box-file write verbs:
 /// `review.write_file` (the editor save, `allow_create = false`) and
 /// `box_file_write` (the oaita agent's file-write tool, `allow_create =
@@ -199,16 +214,6 @@ pub fn write_file(id: i64, rel: &str, bytes: &[u8],
 /// refused (the editor can't save a file it never opened). A discard-hunk
 /// inline row needs no special handling here anymore — copy_up
 /// re-materializes it for every writer (`BoxDepot::outline_inline_row`).
-pub fn write_file_checked(id: i64, rel: &str, bytes: &[u8],
-                          ov: &crate::overlay::Overlay, allow_create: bool)
-    -> Value
-{
-    match write_file_checked_typed(id, rel, bytes, ov, allow_create) {
-        Ok(length) => json!({"ok": true, "len": length}),
-        Err(error) => json!({"ok": false, "error": error}),
-    }
-}
-
 pub fn write_file_checked_typed(
     id: i64,
     rel: &str,
@@ -987,9 +992,7 @@ fn paths_arg(id: i64, paths: &Value) -> Vec<String> {
     if let Some(arr) = paths.as_array() {
         return arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
     }
-    session_changes(id).as_array().map(|a| a.iter()
-        .filter_map(|e| e.get("path").and_then(Value::as_str).map(String::from))
-        .collect()).unwrap_or_default()
+    changed_paths(id)
 }
 
 /// Audit M1: has the real host file at `rel` changed since this box captured it?
@@ -1757,9 +1760,9 @@ pub fn set_no_host_meta(child: i64) -> Result<(), String> {
 /// All changed paths a box captured (apply- and discard-bound alike) — the set
 /// a child may have inherited a view of through this box.
 pub fn changed_paths(id: i64) -> Vec<String> {
-    session_changes(id).as_array().map(|a| a.iter()
-        .filter_map(|e| e.get("path").and_then(Value::as_str).map(String::from))
-        .collect()).unwrap_or_default()
+    session_changes_typed(id).unwrap_or_default().into_iter()
+        .filter_map(|change| String::from_utf8(change.path.as_slice().to_vec()).ok())
+        .collect()
 }
 
 /// Unified diff for the whole box (the `patch` CLI verb). Per changed path: a
@@ -1767,9 +1770,9 @@ pub fn changed_paths(id: i64) -> Vec<String> {
 /// binary/symlink/deleted. Best-effort, human-facing.
 pub fn patch_text(id: i64) -> Vec<u8> {
     let mut out = String::new();
-    let changes = session_changes(id);
-    for e in changes.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-        let rel = e.get("path").and_then(Value::as_str).unwrap_or("");
+    let changes = session_changes_typed(id).unwrap_or_default();
+    for change in changes {
+        let rel = std::str::from_utf8(change.path.as_slice()).unwrap_or("");
         let h = hunks(id, rel);
         if h.get("is_text").and_then(Value::as_bool) == Some(true) {
             out.push_str(&format!("--- a/{rel}\n+++ b/{rel}\n"));

@@ -1726,6 +1726,61 @@ fn dispatch_action(
                 overlay.box_path_kind(id, action_relative_path(&path)?))?;
             Ok(ActionSuccess::BoxPathKind { value })
         }
+        ActionRequest::ReviewFileBytes { sid, rel } => {
+            let id = existing_box_id(sid)?;
+            let bytes = crate::review::file_bytes_typed(id, action_relative_path(&rel)?)?;
+            let value = crate::wire::BoundedBytes::new(bytes)
+                .map_err(|error| format!("review file exceeds relation bound: {error:?}"))?;
+            Ok(ActionSuccess::ReviewFileBytes { value })
+        }
+        ActionRequest::ReviewWriteFile { sid, rel, b64 } => {
+            let id = existing_box_id(sid)?;
+            let overlay = lock(state).overlay.clone().ok_or("overlay not available")?;
+            let value = crate::review::write_file_checked_typed(
+                id, action_relative_path(&rel)?, b64.as_slice(), &overlay, false)?;
+            Ok(ActionSuccess::ReviewWriteFile { value })
+        }
+        ActionRequest::ReviewPatchText { sid } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::wire::BoundedBytes::new(crate::review::patch_text(id))
+                .map_err(|error| format!("review patch exceeds relation bound: {error:?}"))?;
+            Ok(ActionSuccess::ReviewPatchText { value })
+        }
+        ActionRequest::ReviewChangeMode { sid, rel } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::review::current_mode(id, action_relative_path(&rel)?);
+            Ok(ActionSuccess::ReviewChangeMode { value })
+        }
+        ActionRequest::ReviewSessionChanges { sid } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::wire::BoundedVec::new(
+                crate::review::session_changes_typed(id)?)
+                .map_err(|error| format!("change list exceeds relation bound: {error:?}"))?;
+            Ok(ActionSuccess::ReviewSessionChanges { value })
+        }
+        ActionRequest::ReviewFileGroups { sid } => {
+            let id = existing_box_id(sid)?;
+            let changes = crate::review::session_changes_typed(id)?;
+            let groups = crate::overlay::file_groups().into_iter().map(|group| {
+                let paths = changes.iter().filter(|change| {
+                    std::str::from_utf8(change.path.as_slice()).ok()
+                        .is_some_and(|path| group.matches(path))
+                }).map(|change| change.path.clone()).collect::<Vec<_>>();
+                Ok(crate::generated_wire::FileGroup {
+                    name: crate::wire::BoundedText::new(group.name)
+                        .map_err(|error| format!(
+                            "file group name exceeds relation bound: {error:?}"))?,
+                    count: u64::try_from(paths.len())
+                        .map_err(|_| "file group count exceeds u64")?,
+                    paths: crate::wire::BoundedVec::new(paths)
+                        .map_err(|error| format!(
+                            "file group paths exceed relation bound: {error:?}"))?,
+                })
+            }).collect::<Result<Vec<_>, String>>()?;
+            let value = crate::wire::BoundedVec::new(groups)
+                .map_err(|error| format!("file groups exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::ReviewFileGroups { value })
+        }
         request @ (ActionRequest::Delete { sid } | ActionRequest::Dissolve { sid }) => {
             let deleting = matches!(request, ActionRequest::Delete { .. });
             let id = existing_box_id(sid)?;
@@ -2336,27 +2391,31 @@ fn legacy_pipeline_provenance(record: crate::generated_wire::PipelineProvenance)
     crate::discover::pipeline_provenance_json(&record)
 }
 
+fn legacy_change_kind(kind: crate::generated_wire::ChangeKind) -> &'static str {
+    use crate::generated_wire::ChangeKind;
+    match kind {
+        ChangeKind::Changed => "changed",
+        ChangeKind::Deleted => "deleted",
+        ChangeKind::Symlink => "symlink",
+        ChangeKind::Created => "created",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Xattr => "xattr",
+        ChangeKind::Directory => "dir",
+        ChangeKind::XattrOnly => "xattr-only",
+    }
+}
+
 fn legacy_view_window(value: crate::generated_wire::ViewWindow) -> Value {
-    use crate::generated_wire::{ChangeKind, EchoStream, ViewWindow};
+    use crate::generated_wire::{EchoStream, ViewWindow};
     match value {
         ViewWindow::Changes { start, total, rows } => json!({
             "start": start,
             "total": total,
             "rows": rows.into_inner().into_iter().map(|row| {
-                let kind = match row.kind {
-                    ChangeKind::Changed => "changed",
-                    ChangeKind::Deleted => "deleted",
-                    ChangeKind::Symlink => "symlink",
-                    ChangeKind::Created => "created",
-                    ChangeKind::Modified => "modified",
-                    ChangeKind::Xattr => "xattr",
-                    ChangeKind::Directory => "dir",
-                    ChangeKind::XattrOnly => "xattr-only",
-                };
                 let mut value = json!({
                     "path": legacy_bytes(row.path),
                     "name": legacy_bytes(row.name),
-                    "kind": kind,
+                    "kind": legacy_change_kind(row.kind),
                     "size": row.size,
                     "depth": row.depth,
                     "connector": row.connector,
@@ -2622,6 +2681,31 @@ fn legacy_ui_action_reply(
         Ok(ActionSuccess::BoxPathKind { value }) => {
             json!({"kind": legacy_path_kind(value)})
         }
+        Ok(ActionSuccess::ReviewFileBytes { value }) => json!({
+            "ok": true,
+            "b64": base64::engine::general_purpose::STANDARD.encode(value.as_slice()),
+        }),
+        Ok(ActionSuccess::ReviewWriteFile { value }) => json!({"ok": true, "len": value}),
+        Ok(ActionSuccess::ReviewPatchText { value }) => json!({
+            "__b": base64::engine::general_purpose::STANDARD.encode(value.as_slice()),
+        }),
+        Ok(ActionSuccess::ReviewChangeMode { value }) => value
+            .map(|mode| json!(mode)).unwrap_or(Value::Null),
+        Ok(ActionSuccess::ReviewSessionChanges { value }) => Value::Array(value.into_inner()
+            .into_iter().map(|change| json!({
+                "path": legacy_bytes(change.path),
+                "kind": legacy_change_kind(change.kind),
+                "size": change.size,
+            })).collect()),
+        Ok(ActionSuccess::ReviewFileGroups { value }) => json!({
+            "ok": true,
+            "groups": value.into_inner().into_iter().map(|group| json!({
+                "name": group.name.into_inner(),
+                "count": group.count,
+                "paths": group.paths.into_inner().into_iter()
+                    .map(legacy_bytes).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }),
         Ok(ActionSuccess::Delete { value }) | Ok(ActionSuccess::Dissolve { value }) => json!({
             "ok": true,
             "reparented": value.reparented.into_inner(),
@@ -3373,11 +3457,8 @@ fn drop_if_empty(state: &State, id: i64) {
     if has_children(id) {
         return;
     }
-    if crate::review::session_changes(id)
-        .as_array()
-        .map(|a| a.is_empty())
-        .unwrap_or(false)
-    {
+    if crate::review::session_changes_typed(id)
+        .is_ok_and(|changes| changes.is_empty()) {
         reap(state, id);
     }
 }
@@ -4678,10 +4759,13 @@ macro_rules! ui_verbs {
                 state, crate::generated_wire::ActionRequest::Delete { sid },
             ));
         }
-        "review.session_changes" => { match arg_sid(args) {
-            Some(id) => crate::review::session_changes(id),
-            None => json!([]),
-        }
+        "review.session_changes" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": true, "r": []});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewSessionChanges { sid },
+            ));
         }
         "review.hunks" => {
             match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
@@ -4691,25 +4775,32 @@ macro_rules! ui_verbs {
             }
         }
         "review.file_bytes" => {
-            match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
-                (Some(id), Some(rel)) => crate::review::file_bytes(id, rel),
-                _ => json!({"ok": false, "error": "bad args"}),
-            }
+            let (Some(sid), Some(rel)) = (legacy_u64(args, 0), legacy_path_arg(args, 1)) else {
+                return json!({"ok": false, "error": "bad args"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewFileBytes { sid, rel },
+            ));
         }
         "review.write_file" => {
-            let ov = lock(state).overlay.clone();
-            match (ov, arg_sid(args), args.get(1).and_then(Value::as_str),
-                   args.get(2).and_then(Value::as_str)) {
-                (Some(ov), Some(id), Some(rel), Some(b64)) => {
-                    match base64::engine::general_purpose::STANDARD.decode(b64) {
-                        Ok(bytes) => crate::review::write_file(id, rel, &bytes, &ov),
-                        Err(e) => json!({"ok": false,
-                                         "error": format!("bad base64: {e}")}),
-                    }
-                }
-                (None, ..) => json!({"ok": false, "error": "overlay not available"}),
-                _ => json!({"ok": false, "error": "bad args"}),
-            }
+            let (Some(sid), Some(rel), Some(encoded)) = (
+                legacy_u64(args, 0),
+                legacy_path_arg(args, 1),
+                args.get(2).and_then(Value::as_str),
+            ) else {
+                return json!({"ok": false, "error": "bad args"});
+            };
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                Ok(bytes) => bytes,
+                Err(error) => return json!({"ok": false,
+                    "error": format!("bad base64: {error}")}),
+            };
+            let Ok(b64) = crate::wire::BoundedBytes::new(bytes) else {
+                return json!({"ok": false, "error": "review file exceeds relation bound"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewWriteFile { sid, rel, b64 },
+            ));
         }
         "review.apply" => { match arg_sid(args) {
             // Audit H3: refuse a still-running box — its captured blobs may be
@@ -4740,33 +4831,28 @@ macro_rules! ui_verbs {
         }
         }
         "review.file_groups" => {
-            match arg_sid(args) {
-                Some(id) => {
-                    let paths = crate::review::changed_paths(id);
-                    let groups: Vec<Value> = crate::overlay::file_groups().iter().map(|g| {
-                        let matched: Vec<&String> =
-                            paths.iter().filter(|p| g.matches(p)).collect();
-                        json!({"name": g.name, "count": matched.len(), "paths": matched})
-                    }).collect();
-                    json!({"ok": true, "groups": groups})
-                }
-                None => json!({"ok": false, "error": "no slopbox"}),
-            }
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "no slopbox"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewFileGroups { sid },
+            ));
         }
-        "review.patch_text" => { match arg_sid(args) {
-            Some(id) => {
-                let data = crate::review::patch_text(id);
-                json!({"__b": base64::engine::general_purpose::STANDARD.encode(&data)})
-            }
-            None => json!({"__b": ""}),
+        "review.patch_text" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": true, "r": {"__b": ""}});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewPatchText { sid },
+            ));
         }
-        }
-        "review.change_mode" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
-            (Some(id), Some(rel)) => match crate::review::current_mode(id, rel) {
-                Some(m) => json!(m), None => Value::Null,
-            },
-            _ => Value::Null,
-        }
+        "review.change_mode" => {
+            let (Some(sid), Some(rel)) = (legacy_u64(args, 0), legacy_path_arg(args, 1)) else {
+                return json!({"ok": true, "r": Value::Null});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewChangeMode { sid, rel },
+            ));
         }
         "review.decorate" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
             (Some(id), Some(rel)) => crate::review::decorate(id, rel),

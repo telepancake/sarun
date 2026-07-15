@@ -806,6 +806,15 @@ belong to the relation.
   and no longer performs lossy conversion or constructs JSON. The temporary
   listener alone translates its legacy rows. The full native aarch64-musl
   suite passes 308 tests with one existing browser e2e test ignored.
+- Moved `review.file_bytes`, `review.write_file`, `review.patch_text`,
+  `review.change_mode`, `review.session_changes`, and `review.file_groups`
+  onto generated request/success variants. File and patch content stay bounded
+  bytes until the temporary listener; session rows and file-group membership
+  materialize as closed generated records. Removed the JSON session-row
+  constructor, JSON write wrappers, and the depot reader that silently erased
+  SQLite errors; internal change-path consumers now reuse the typed rows. The
+  full native aarch64-musl suite passes 308 tests with one existing browser e2e
+  test ignored.
 
 ## Stop conditions
 
