@@ -48,6 +48,20 @@ highlight, or complete only when a consumer asks to view or transform them.
 This late-decoding rule keeps transport and recording fast while allowing rich
 relational presentation to take the time it needs.
 
+Use `tv/wire/wire.h` and `tv/trace/trace.h` as the concrete binary-format
+precedent. The useful properties are: one shared atom codec is the only layer
+that knows raw bytes; common scalar bytes encode in one byte; payloads through
+55 bytes carry a one-byte inline length; longer payloads carry a bounded
+little-endian length; nested atoms frame compound values without field names,
+terminators, seeking, or back-patching; blobs remain arbitrary bytes and can be
+viewed without copying; a leading version rejects incompatible streams; and
+the streaming decoder accepts arbitrary read fragmentation while committing
+state only after a complete valid frame. Stable numeric wire identities come
+from the Prolog relation. Reuse this encoding and cross-language boundary
+fixtures rather than introducing a generic serialization library. Apply tv's
+per-stream delta-state pattern where append-only logs have repeated headers;
+keep the request/reply frame grammar small and explicit.
+
 The relation and FFI must remain generic enough to host future grammars for
 packets/protocol stacks, patches and editing, nested highlighting, build
 graphs, and brush syntax. UI actions are the first complete practical client,
@@ -410,6 +424,10 @@ belong to the relation.
   order through an explicit provider, retain the exact observations, and feed
   them back into the relation for wire-ready resolution. The UI box provider
   supplies revision-tagged identities, names, display paths, and typed values.
+- Made contextual completion execute the relation's explicit `all` query and
+  feed the observation back into Prolog, which selects matching entry names
+  and produces the ordinary ranked completion representation. Live UI box
+  names now complete without Rust interpreting selectors or argument kinds.
 - Recorded the direct binary `ui.sock` transport boundary: Prolog owns
   representation relationships and conversion, while already-typed
   request/reply delivery is a Rust-only hot path.

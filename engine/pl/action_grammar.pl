@@ -10,6 +10,7 @@
             context_plan/3,
             resolve_context_plan/3,
             context_completion_plan/3,
+            resolve_context_completion/3,
             application/3
           ]).
 
@@ -434,6 +435,38 @@ context_completion_plan(Items, EditId,
     match_known_prefix(BeforeSpecs, Before),
     viable_suffix(AfterSpecs, After).
 
+resolve_context_completion(
+    completion_context(Action, Span, Surface, query(Id, Query)),
+    Observations, Completions) :-
+    action(Action, _, _, _, _, _, ActionPreference),
+    context_all_observation(Id, Query, Observations, Provider, Entries),
+    findall(completion_key(Span, Name)-
+                (alternative(context(Action, Domain, Identity),
+                             context_argument, Provider)-ActionPreference),
+            ( context_entry(Entries, Domain, Identity, Names),
+              context_name(Names, Name),
+              surface_prefix(Surface, Name)
+            ),
+            Pairs),
+    merge_completion_pairs(Pairs, Candidates),
+    sort_candidates(Candidates, Sorted),
+    rank_completions(Sorted, 1, Completions).
+
+context_all_observation(
+    Id, Query,
+    [observed(Id, Query, source(Provider, _), some(all(Entries)))|_],
+    Provider, Entries).
+context_all_observation(Id, Query, [_|Observations], Provider, Entries) :-
+    context_all_observation(Id, Query, Observations, Provider, Entries).
+
+context_entry([entry(Domain, Identity, Names, _, _)|_],
+              Domain, Identity, Names).
+context_entry([_|Entries], Domain, Identity, Names) :-
+    context_entry(Entries, Domain, Identity, Names).
+
+context_name([Name|_], Name).
+context_name([_|Names], Name) :- context_name(Names, Name).
+
 split_context_argument([argument(arg(Name, _, _, _))|Specs], [], Name, Specs).
 split_context_argument([Spec|Specs], [Spec|Before], Name, After) :-
     split_context_argument(Specs, Before, Name, After).
@@ -756,6 +789,12 @@ dispatch_application(context_resolve, request(Plan, Observations), Response) :-
        ).
 dispatch_application(context_completion, request(Items, EditId), ok(Plans)) :-
     !, findall(Plan, context_completion_plan(Items, EditId, Plan), Plans).
+dispatch_application(context_completion_resolve,
+                     request(Plan, Observations), ok(Completions)) :-
+    !, ( resolve_context_completion(Plan, Observations, Completions)
+       -> true
+       ;  Completions = []
+       ).
 dispatch_application(parse, _, error(invalid_request)) :- !.
 dispatch_application(complete, _, error(invalid_request)) :- !.
 dispatch_application(highlights, _, error(invalid_request)) :- !.
@@ -768,4 +807,5 @@ dispatch_application(context_ready, _, error(invalid_request)) :- !.
 dispatch_application(context_plan, _, error(invalid_request)) :- !.
 dispatch_application(context_resolve, _, error(invalid_request)) :- !.
 dispatch_application(context_completion, _, error(invalid_request)) :- !.
+dispatch_application(context_completion_resolve, _, error(invalid_request)) :- !.
 dispatch_application(_, _, error(invalid_operation)).

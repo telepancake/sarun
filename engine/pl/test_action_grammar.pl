@@ -17,6 +17,7 @@ test_name(context_plan_captures_box_dependency).
 test_name(context_resolution_rewrites_wire_argument).
 test_name(dependent_path_plan_references_box_query).
 test_name(context_completion_uses_all_prefix_query).
+test_name(context_completion_resolution_uses_entry_names).
 
 run_action_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -167,3 +168,20 @@ run_test(context_completion_uses_all_prefix_query) :-
     expect_equal(Plan,
                  completion_context(rename, span(7, 9), "wo",
                                     query(q1, ask(all, box, prefix("wo"))))).
+
+run_test(context_completion_resolution_uses_entry_names) :-
+    Plan = completion_context(rename, span(7, 9), "wo",
+                              query(q1, Query)),
+    Query = ask(all, box, prefix("wo")),
+    Observations =
+        [observed(q1, Query, source(boxes, 7),
+                  some(all([entry(box, 5, ["5", "work"], string("5"), []),
+                            entry(box, 9, ["9", "world"], string("9"), [])])))],
+    resolve_context_completion(Plan, Observations, Completions),
+    expect_equal(Completions,
+                 [completion(span(7, 9), "work",
+                             [alternative(context(rename, box, 5),
+                                          context_argument, boxes, 50)], 50, 1),
+                  completion(span(7, 9), "world",
+                             [alternative(context(rename, box, 9),
+                                          context_argument, boxes, 50)], 50, 2)]).

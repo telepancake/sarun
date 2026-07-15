@@ -301,6 +301,7 @@ enum Operation {
     ContextPlan,
     ContextResolve,
     ContextCompletion,
+    ContextCompletionResolve,
 }
 
 impl Operation {
@@ -316,6 +317,7 @@ impl Operation {
             Self::ContextPlan => "context_plan",
             Self::ContextResolve => "context_resolve",
             Self::ContextCompletion => "context_completion",
+            Self::ContextCompletionResolve => "context_completion_resolve",
         }
     }
 }
@@ -544,6 +546,25 @@ impl Prolog {
             format!("request({items},{id})"),
         )?;
         decode_context_completion_plans_response(&response)
+    }
+
+    pub fn resolve_context_completion(
+        &self,
+        plan: &ContextCompletionPlan,
+        observations: &[ContextObservation],
+    ) -> Result<Vec<Completion>, String> {
+        let observations = observations
+            .iter()
+            .map(encode_context_observation)
+            .collect::<Result<Vec<_>, _>>()?
+            .join(",");
+        let request = format!(
+            "request({},[{}])",
+            encode_context_completion_plan(plan)?,
+            observations,
+        );
+        let response = self.application(Operation::ContextCompletionResolve, request)?;
+        decode_completion_response(&response)
     }
 
     fn application(&self, operation: Operation, request: String) -> Result<String, String> {
@@ -1183,15 +1204,17 @@ fn encode_context_graph(graph: &[ContextQueryNode]) -> Result<String, String> {
         "[{}]",
         graph
             .iter()
-            .map(|node| {
-                Ok(format!(
-                    "query({},{})",
-                    quote_atom(&node.id),
-                    encode_context_query(&node.query)?,
-                ))
-            })
+            .map(encode_context_node)
             .collect::<Result<Vec<_>, String>>()?
             .join(",")
+    ))
+}
+
+fn encode_context_node(node: &ContextQueryNode) -> Result<String, String> {
+    Ok(format!(
+        "query({},{})",
+        quote_atom(&node.id),
+        encode_context_query(&node.query)?,
     ))
 }
 
@@ -1241,6 +1264,16 @@ fn encode_context_plan(plan: &ContextPlan) -> Result<String, String> {
         bindings,
         encode_evidence_items(&plan.evidence),
         plan.preference,
+    ))
+}
+
+fn encode_context_completion_plan(plan: &ContextCompletionPlan) -> Result<String, String> {
+    Ok(format!(
+        "completion_context({},{},{},{})",
+        quote_atom(&plan.action),
+        encode_span(plan.replace),
+        quote_string(&plan.surface),
+        encode_context_node(&plan.query)?,
     ))
 }
 
@@ -1805,7 +1838,7 @@ fn decode_completion_response(response: &str) -> Result<Vec<Completion>, String>
                     Ok(CompletionAlternative {
                         semantic: term_text(&args[0]),
                         syntax: atom(&args[1])?.to_string(),
-                        provider: atom(&args[2])?.to_string(),
+                        provider: term_text(&args[2]),
                         preference: integer(&args[3])?,
                     })
                 })
@@ -2130,8 +2163,8 @@ mod tests {
         });
         input.end = 9;
 
-        let plans = global()
-            .unwrap()
+        let prolog = global().unwrap();
+        let plans = prolog
             .context_completion_plans(&input, "edit")
             .unwrap();
         assert_eq!(plans.len(), 1);
@@ -2146,5 +2179,29 @@ mod tests {
                 vec![RelationValue::String("wo".into())],
             ),
         );
+
+        let entry = ContextEntry {
+            domain: RelationValue::Atom("box".into()),
+            identity: RelationValue::Integer(5),
+            names: vec!["5".into(), "work".into()],
+            value: RelationValue::Compound(
+                "string".into(),
+                vec![RelationValue::String("5".into())],
+            ),
+            attributes: Vec::new(),
+        };
+        let observation = ContextObservation {
+            id: plans[0].query.id.clone(),
+            query: plans[0].query.query.clone(),
+            provider: RelationValue::Atom("boxes".into()),
+            revision: RelationValue::Integer(7),
+            outcome: Some(ContextResult::All(vec![entry])),
+        };
+        let completions = prolog
+            .resolve_context_completion(&plans[0], &[observation])
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].insert, "work");
+        assert_eq!(completions[0].alternatives[0].provider, "boxes");
     }
 }

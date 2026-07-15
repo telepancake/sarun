@@ -411,44 +411,58 @@ fn word_spans(input: &str) -> Vec<(usize, usize)> {
 pub fn complete_at(
     input: &str,
     cursor: usize,
-    _context: &dyn ContextProvider,
+    context: &dyn ContextProvider,
 ) -> Result<Vec<CompletionEntry>, String> {
     let cursor = floor_char_boundary(input, cursor.min(input.len()));
     let Some(grammar_input) = grammar_input(input, Some(cursor)) else {
         return Err("command input exceeds parser limits".into());
     };
     let prolog = crate::prolog::global()?;
-    let completions = prolog.complete(&grammar_input, "edit")?;
-    Ok(merge_completion_entries(
-        completions
-            .into_iter()
-            .map(|completion| {
-                let provider = completion
-                    .alternatives
-                    .iter()
-                    .map(|alternative| alternative.provider.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let annotation = completion
-                    .alternatives
-                    .iter()
-                    .map(|alternative| alternative.semantic.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                CompletionEntry {
-                    replace: TextSpan {
-                        start: completion.replace.start,
-                        end: completion.replace.end,
-                    },
-                    insert: completion.insert,
-                    display: completion.display,
-                    annotation,
-                    provider,
-                    preference: completion.preference,
-                }
-            })
-            .collect(),
-    ))
+    let mut completions = prolog.complete(&grammar_input, "edit")?;
+    for plan in prolog.context_completion_plans(&grammar_input, "edit")? {
+        let snapshot = context.snapshot(&plan.query)?;
+        let outcome = prolog.context_query(&plan.query.query, &snapshot)?;
+        let observation = crate::prolog::ContextObservation {
+            id: plan.query.id.clone(),
+            query: plan.query.query.clone(),
+            provider: snapshot.provider,
+            revision: snapshot.revision,
+            outcome,
+        };
+        completions.extend(prolog.resolve_context_completion(&plan, &[observation])?);
+    }
+    Ok(merge_completion_entries(completion_entries(completions)))
+}
+
+fn completion_entries(completions: Vec<crate::prolog::Completion>) -> Vec<CompletionEntry> {
+    completions
+        .into_iter()
+        .map(|completion| {
+            let provider = completion
+                .alternatives
+                .iter()
+                .map(|alternative| alternative.provider.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let annotation = completion
+                .alternatives
+                .iter()
+                .map(|alternative| alternative.semantic.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            CompletionEntry {
+                replace: TextSpan {
+                    start: completion.replace.start,
+                    end: completion.replace.end,
+                },
+                insert: completion.insert,
+                display: completion.display,
+                annotation,
+                provider,
+                preference: completion.preference,
+            }
+        })
+        .collect()
 }
 
 fn merge_completion_entries(entries: Vec<CompletionEntry>) -> Vec<CompletionEntry> {

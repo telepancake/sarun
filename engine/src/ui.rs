@@ -18445,6 +18445,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn command_completion_uses_live_box_names() {
+        let mut app = App::bare(String::new());
+        app.sessions = vec![serde_json::json!({
+            "session_id": "5",
+            "name": "work",
+            "path": "work",
+            "status": "finished",
+        })];
+        let completions = crate::parser::complete_at("rename wo", 9, &app).unwrap();
+        assert!(completions.iter().any(|entry| {
+            entry.insert == "work"
+                && entry.provider == "ui_sessions"
+                && entry.annotation.contains("context(rename,box,5)")
+        }));
+    }
+
     /// The "scrolling Outputs of a browser box crashes sarun" regression:
     /// slicing a byte-window out of multi-byte UTF-8 output must snap to char
     /// boundaries instead of panicking. Every offset into a string full of
