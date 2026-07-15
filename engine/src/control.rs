@@ -1360,6 +1360,13 @@ fn action_relative_path(path: &crate::generated_wire::Path) -> Result<&str, Stri
     Ok(path)
 }
 
+fn bounded_review_limit(limit: Option<u64>, default: u64) -> Result<u64, String> {
+    let limit = limit.unwrap_or(default);
+    (limit <= crate::generated_wire::LIMIT_COLLECTION_ITEMS as u64)
+        .then_some(limit)
+        .ok_or_else(|| "review limit exceeds relation collection bound".into())
+}
+
 fn relation_path_kind(kind: char) -> Result<crate::generated_wire::PathKind, String> {
     use crate::generated_wire::PathKind;
     match kind {
@@ -1799,6 +1806,58 @@ fn dispatch_action(
                 crate::review::decorate_many_typed(id, &paths)?)
                 .map_err(|error| format!("decorations exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::ReviewDecorateMany { value })
+        }
+        ActionRequest::ReviewRecentChanges { sid, limit } => {
+            let id = existing_box_id(sid)?;
+            let limit = bounded_review_limit(limit, 200)?;
+            let value = crate::wire::BoundedVec::new(
+                crate::review::recent_changes_typed(id, limit)?)
+                .map_err(|error| format!("recent changes exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::ReviewRecentChanges { value })
+        }
+        ActionRequest::ReviewBoxSummary { sid, limit } => {
+            let id = existing_box_id(sid)?;
+            let limit = bounded_review_limit(limit, 20)?;
+            let mut value = crate::review::box_summary_typed(id, limit)?;
+            let overlay = lock(state).overlay.clone();
+            if let Some(r#box) = overlay.as_ref().and_then(|overlay| overlay.live_box(id)) {
+                let activity = r#box.activity.lock()
+                    .map_err(|_| "box activity lock poisoned")?.iter().map(
+                        |(description, age_seconds)| Ok(crate::generated_wire::ActivityItem {
+                            description: crate::wire::BoundedText::new(description.clone())
+                                .map_err(|error| format!(
+                                    "activity description exceeds relation bound: {error:?}"))?,
+                            age_seconds: *age_seconds,
+                        }),
+                    ).collect::<Result<Vec<_>, String>>()?;
+                value.activity = crate::wire::BoundedVec::new(activity)
+                    .map_err(|error| format!("activity exceeds relation bound: {error:?}"))?;
+            }
+            Ok(ActionSuccess::ReviewBoxSummary { value })
+        }
+        ActionRequest::ReviewPipelineContext { sid, prov_id } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::review::pipeline_context_typed(id, prov_id)?;
+            Ok(ActionSuccess::ReviewPipelineContext { value })
+        }
+        ActionRequest::ReviewMakevars {
+            sid, name_pat, value_pat, limit, any,
+        } => {
+            let id = existing_box_id(sid)?;
+            let name_pat = name_pat.as_ref().map(|value| value.as_str()).unwrap_or("");
+            let value_pat = value_pat.as_ref().map(|value| value.as_str()).unwrap_or("");
+            let limit = bounded_review_limit(limit, 500)?;
+            let value = crate::wire::BoundedVec::new(crate::review::makevars_typed(
+                id, name_pat, value_pat, limit, any.unwrap_or(false))?)
+                .map_err(|error| format!("make variables exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::ReviewMakevars { value })
+        }
+        ActionRequest::ReviewMapIds { sid, from, ids, to } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::wire::BoundedVec::new(crate::review::map_ids_typed(
+                id, from, ids.as_slice(), to)?)
+                .map_err(|error| format!("mapped ids exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::ReviewMapIds { value })
         }
         request @ (ActionRequest::ReviewApply { sid, .. }
             | ActionRequest::ReviewDiscard { sid, .. }) => {
@@ -2343,10 +2402,6 @@ fn dispatch_action(
             }
             Ok(ActionSuccess::Quit { value: () })
         }
-        other => Err(format!(
-            "typed control action {} is not implemented",
-            other.handler()
-        )),
     }
 }
 
@@ -2861,6 +2916,100 @@ fn legacy_ui_action_reply(
         Ok(ActionSuccess::ReviewDecorate { value }) => legacy_change_decoration(value),
         Ok(ActionSuccess::ReviewDecorateMany { value }) => Value::Array(value.into_inner()
             .into_iter().map(legacy_change_decoration).collect()),
+        Ok(ActionSuccess::ReviewRecentChanges { value }) => Value::Array(value.into_inner()
+            .into_iter().map(|change| json!({
+                "path": legacy_bytes(change.path),
+                "kind": legacy_change_kind(change.kind),
+                "size": change.size,
+            })).collect()),
+        Ok(ActionSuccess::ReviewBoxSummary { value }) => json!({
+            "outputs": value.outputs.into_inner().into_iter().map(|row| json!({
+                "id": row.id,
+                "ts": row.time,
+                "stream": match row.stream {
+                    crate::generated_wire::EchoStream::Stdout => 0,
+                    crate::generated_wire::EchoStream::Stderr => 1,
+                },
+                "len": row.length,
+                "preview": row.preview.into_inner(),
+            })).collect::<Vec<_>>(),
+            "changes": value.changes.into_inner().into_iter().map(|row| {
+                let mut result = json!({
+                    "path": legacy_bytes(row.path),
+                    "kind": legacy_change_kind(row.kind),
+                    "size": row.size,
+                    "mtime": row.modified_at,
+                });
+                if let Some(key) = row.xattr_key {
+                    result["xattr_key"] = json!(legacy_bytes(key));
+                }
+                if let Some(length) = row.xattr_length {
+                    result["xattr_len"] = json!(length);
+                }
+                result
+            }).collect::<Vec<_>>(),
+            "processes": value.processes.into_inner().into_iter().map(|row| json!({
+                "id": row.id,
+                "tgid": row.tgid,
+                "exe": legacy_bytes(row.executable),
+                "argv0": legacy_bytes(row.argv0),
+            })).collect::<Vec<_>>(),
+            "pipelines": value.pipelines.into_inner().into_iter().map(|row| json!({
+                "id": row.id,
+                "cmd": row.command.into_inner(),
+                "nested": row.nested,
+            })).collect::<Vec<_>>(),
+            "edges": value.edges.into_inner().into_iter().map(|row| json!({
+                "id": row.id,
+                "out": row.output.map(legacy_bytes).unwrap_or_default(),
+                "n_outs": row.output_count,
+                "cmd": row.command.map(|value| value.into_inner()).unwrap_or_default(),
+            })).collect::<Vec<_>>(),
+            "failures": value.failures.into_inner().into_iter().map(|row| json!({
+                "kind": match row.kind {
+                    crate::generated_wire::FailureKind::Edge => "edge",
+                    crate::generated_wire::FailureKind::Pipeline => "pipeline",
+                },
+                "label": row.label.into_inner(),
+                "code": row.code,
+                "excerpt": row.excerpt.into_inner(),
+            })).collect::<Vec<_>>(),
+            "makevar": if value.has_make_variables { vec![1] } else { vec![] },
+            "sudtrace": if value.has_sud_trace { vec![1] } else { vec![] },
+            "activity": value.activity.into_inner().into_iter().map(|row| json!({
+                "desc": row.description.into_inner(),
+                "age": row.age_seconds,
+            })).collect::<Vec<_>>(),
+        }),
+        Ok(ActionSuccess::ReviewPipelineContext { value }) => {
+            let item = |item: crate::generated_wire::PipelineContextItem| json!({
+                "id": item.id,
+                "cmd": item.command.into_inner(),
+                "exit_code": item.exit_code,
+            });
+            json!({
+                "parent": value.parent.map(&item),
+                "children": value.children.into_inner().into_iter().map(item)
+                    .collect::<Vec<_>>(),
+                "edge_out": value.edge_output.map(legacy_bytes).unwrap_or_default(),
+            })
+        }
+        Ok(ActionSuccess::ReviewMakevars { value }) => Value::Array(value.into_inner()
+            .into_iter().map(|row| json!({
+                "id": row.id,
+                "name": legacy_bytes(row.name),
+                "loc": legacy_bytes(row.location),
+                "value": legacy_bytes(row.value),
+                "make": legacy_bytes(row.make_directory),
+                "rhs": legacy_bytes(row.rhs),
+                "refs": legacy_bytes(row.references),
+                "flags": row.flags.into_inner(),
+                "edge_out": row.edge_output.map(legacy_bytes),
+                "uid": row.pipeline_uid,
+                "edge_id": row.edge,
+                "pipeline_id": row.pipeline,
+            })).collect()),
+        Ok(ActionSuccess::ReviewMapIds { value }) => json!(value.into_inner()),
         Ok(ActionSuccess::ReviewApply { value }) => json!({
             "applied": value.applied.into_inner().into_iter()
                 .map(legacy_bytes).collect::<Vec<_>>(),
@@ -3159,6 +3308,16 @@ fn arg_sid(args: &[Value]) -> Option<i64> {
 fn legacy_u64(args: &[Value], index: usize) -> Option<u64> {
     let value = args.get(index)?;
     value.as_u64().or_else(|| value.as_str()?.parse().ok())
+}
+
+fn legacy_provenance_domain(value: &str) -> Option<crate::generated_wire::ProvenanceDomain> {
+    use crate::generated_wire::ProvenanceDomain;
+    match value {
+        "process" => Some(ProvenanceDomain::Process),
+        "pipeline" => Some(ProvenanceDomain::Pipeline),
+        "edge" => Some(ProvenanceDomain::Edge),
+        _ => None,
+    }
 }
 
 fn legacy_path_arg(args: &[Value], index: usize) -> Option<crate::generated_wire::Path> {
@@ -5050,83 +5209,89 @@ macro_rules! ui_verbs {
         // Newest-first slice of the box's change set, for the boxes view's
         // "recently changed" panel on a live box. limit defaults to 200.
         "review.recent_changes" => {
-            let id = arg_sid(args);
-            let limit = args.get(1).and_then(Value::as_i64).unwrap_or(200);
-            match id {
-                Some(id) => crate::review::recent_changes(id, limit),
-                None => Value::Array(vec![]),
-            }
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": true, "r": []});
+            };
+            let limit = args.get(1).and_then(Value::as_u64);
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewRecentChanges { sid, limit },
+            ));
         }
         // Five-list bundle for the Sessions-view right pane: newest-first
         // outputs / changes / processes / pipelines / build-edges in one
         // round-trip, capped at `limit` per kind (default 20). Changes
         // includes xattr modifications inline as kind="xattr" rows.
         "review.box_summary" => {
-            let id = arg_sid(args);
-            let limit = args.get(1).and_then(Value::as_i64).unwrap_or(20);
-            match id {
-                Some(id) => {
-                    let mut v = crate::review::box_summary(id, limit);
-                    // Live in-flight builtin activity (recipes / $(shell) /
-                    // parse) from the box's watchdog feed — engine memory,
-                    // not the DB; a hung box shows WHAT it's chewing on.
-                    let ov = lock(state).overlay.clone();
-                    if let Some(b) = ov.as_ref().and_then(|ov| ov.live_box(id)) {
-                        let items: Vec<Value> = b.activity.lock().unwrap()
-                            .iter()
-                            .map(|(d, age)| json!({"desc": d, "age": age}))
-                            .collect();
-                        if !items.is_empty() {
-                            v["activity"] = json!(items);
-                        }
-                    }
-                    v
-                }
-                None => json!({"outputs":[], "changes":[], "processes":[],
-                               "pipelines":[], "edges":[]}),
-            }
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": true, "r": {"outputs":[], "changes":[],
+                    "processes":[], "pipelines":[], "edges":[]}});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewBoxSummary {
+                    sid, limit: args.get(1).and_then(Value::as_u64),
+                },
+            ));
         }
         // The causal neighborhood of one pipeline: parent, children, owning
         // edge. args: [sid, brushprov_row_id].
         "review.pipeline_context" => {
-            let id = arg_sid(args);
-            let prov_id = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
-            match id {
-                Some(id) => crate::review::pipeline_context(id, prov_id),
-                None => json!({}),
-            }
+            let (Some(sid), Some(prov_id)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": true, "r": {}});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewPipelineContext {
+                    sid, prov_id,
+                },
+            ));
         }
         // Search the box's recorded makefile variable assignments. args:
         // [sid, name_pattern, value_pattern, limit]. Patterns are cmd_match
         // text globs (bare word = substring); empty = match all.
         "review.makevars" => {
-            let id = arg_sid(args);
-            let name_pat = args.get(1).and_then(Value::as_str).unwrap_or("");
-            let value_pat = args.get(2).and_then(Value::as_str).unwrap_or("");
-            let limit = args.get(3).and_then(Value::as_i64).unwrap_or(500);
-            // 5th arg true = OR the two patterns (single-term "match name
-            // OR value" queries from the UI).
-            let any = args.get(4).and_then(Value::as_bool).unwrap_or(false);
-            match id {
-                Some(id) => crate::review::makevars(id, name_pat, value_pat,
-                                                    limit, any),
-                None => json!([]),
-            }
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": true, "r": []});
+            };
+            let text = |index| args.get(index).and_then(Value::as_str)
+                .map(|value| crate::wire::BoundedText::new(value.to_owned())
+                    .map_err(|error| format!("make variable pattern exceeds relation bound: {error:?}")))
+                .transpose();
+            let (name_pat, value_pat) = match (text(1), text(2)) {
+                (Ok(name), Ok(value)) => (name, value),
+                (Err(error), _) | (_, Err(error)) => return json!({"ok": false, "error": error}),
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewMakevars {
+                    sid, name_pat, value_pat,
+                    limit: args.get(3).and_then(Value::as_u64),
+                    any: args.get(4).and_then(Value::as_bool),
+                },
+            ));
         }
         // Map provenance row ids between the process / pipeline / edge
         // domains — the cross-pane generated filter's id translation.
         // args: [sid, from_kind, [ids...], to_kind] → [ids...].
         "review.map_ids" => {
-            let id = arg_sid(args);
-            let from = args.get(1).and_then(Value::as_str).unwrap_or("");
-            let ids: Vec<i64> = args.get(2).and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_i64).collect())
-                .unwrap_or_default();
-            let to = args.get(3).and_then(Value::as_str).unwrap_or("");
-            match id {
-                Some(id) => crate::review::map_ids(id, from, &ids, to),
-                None => json!([]),
-            }
+            let (Some(sid), Some(from), Some(values), Some(to)) = (
+                legacy_u64(args, 0), args.get(1).and_then(Value::as_str)
+                    .and_then(legacy_provenance_domain),
+                args.get(2).and_then(Value::as_array),
+                args.get(3).and_then(Value::as_str).and_then(legacy_provenance_domain),
+            ) else {
+                return json!({"ok": false, "error": "bad provenance mapping arguments"});
+            };
+            let Some(ids) = values.iter().map(Value::as_u64).collect::<Option<Vec<_>>>() else {
+                return json!({"ok": false, "error": "provenance ids must be unsigned integers"});
+            };
+            let ids = match crate::wire::BoundedVec::new(ids) {
+                Ok(ids) => ids,
+                Err(error) => return json!({"ok": false,
+                    "error": format!("provenance ids exceed relation bound: {error:?}")}),
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ReviewMapIds {
+                    sid, from, ids, to,
+                },
+            ));
         }
         // Bulk decorate: one RPC for a whole window of changes-pane rows
         // (kind / stale / is_text per row) — the UI uses this to label the
@@ -5685,20 +5850,17 @@ macro_rules! ui_verbs {
 macro_rules! emit_verb_dispatch {
     ( ($state:ident, $verb:ident, $args:ident, $boxes:ident)
       $($($name:literal)|+ => $body:block)* ) => {
-        /// The `{"type":"ui"}` verb dispatch. An arm's `return` sends its
-        /// value raw (errors); falling out wraps as {"ok":true,"r":...}.
+        /// Temporary newline-JSON projection into the generated action path.
+        /// Every catalogued arm returns after constructing an `ActionRequest`.
         pub(crate) fn dispatch_ui_verb($state: &State, $verb: &str,
                                        $args: &[Value],
                                        $boxes: &std::collections::BTreeMap<i64, discover::Box_>)
                                        -> Value {
-            let r: Value = match $verb {
+            match $verb {
                 $( $($name)|+ => $body )*
-                other => {
-                    return json!({"ok": false, "error":
-                        format!("unknown verb '{other}'; see 'verbs'")});
-                }
-            };
-            json!({"ok": true, "r": r})
+                other => json!({"ok": false, "error":
+                    format!("unknown verb '{other}'; see 'verbs'")}),
+            }
         }
     };
 }

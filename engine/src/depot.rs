@@ -113,15 +113,14 @@ pub fn archive_names_modes(conn: &Connection) -> Vec<(String, u32)> {
 
 /// Most-recently-touched nodes: (name, mode, sz, mtime), mtime-descending.
 pub fn archive_recent(conn: &Connection, limit: i64)
-    -> Vec<(String, u32, i64, i64)>
+    -> rusqlite::Result<Vec<(String, i64, i64, i64)>>
 {
-    let Ok(mut st) = conn.prepare(
-        "SELECT name, mode, sz, mtime FROM sqlar ORDER BY mtime DESC LIMIT ?1")
-    else { return vec![] };
-    let Ok(it) = st.query_map([limit], |r| Ok((
-        r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32,
-        r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))) else { return vec![] };
-    it.flatten().collect()
+    let mut st = conn.prepare(
+        "SELECT name, mode, sz, mtime FROM sqlar ORDER BY mtime DESC LIMIT ?1")?;
+    let it = st.query_map([limit], |r| Ok((
+        r.get::<_, String>(0)?, r.get::<_, i64>(1)?,
+        r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)))?;
+    it.collect()
 }
 
 /// Remove a node row (the caller handles its blob file).

@@ -1,10 +1,6 @@
-// Review-view verbs in Rust: session_changes (list a box's changes) and hunks
-// (unified text diff of lower vs captured). Read-only against the box's
-// on-disk sqlar (a fresh RO connection coexists with a live box's writer), so
-// these serve both live and finished boxes. Output shapes match the Python
-// ChangeReview exactly (the UI and the conformance readers depend on it).
-// apply/discard (host-mutating, need live-connection ownership routing) and
-// the structural-diff job path are deferred to a later milestone.
+// Review queries and mutations over a box's on-disk sqlar. Public action
+// implementations construct the generated closed relation types; the
+// temporary listener owns the remaining legacy JSON projection.
 
 use crate::depot::BoxDepot;
 use std::ffi::CStr;
@@ -17,9 +13,8 @@ use crate::hostfs;
 
 use rusqlite::Connection;
 use rusqlite::OpenFlags;
+use rusqlite::OptionalExtension;
 use rusqlite::params;
-use serde_json::Value;
-use serde_json::json;
 use similar::DiffTag;
 use similar::TextDiff;
 
@@ -37,6 +32,32 @@ fn open_ro(id: i64) -> Option<Connection> {
 const S_IFMT: u32 = 0o170000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFLNK: u32 = 0o120000;
+
+fn relation_bytes<const MAXIMUM: usize>(
+    value: String,
+    field: &str,
+) -> Result<crate::wire::BoundedBytes<MAXIMUM>, String> {
+    crate::wire::BoundedBytes::new(value.into_bytes())
+        .map_err(|error| format!("{field} exceeds relation bound: {error:?}"))
+}
+
+fn relation_text<const MAXIMUM: usize>(
+    value: String,
+    field: &str,
+) -> Result<crate::wire::BoundedText<MAXIMUM>, String> {
+    crate::wire::BoundedText::new(value)
+        .map_err(|error| format!("{field} exceeds relation bound: {error:?}"))
+}
+
+fn relation_list<T>(
+    values: Vec<T>,
+    field: &str,
+) -> Result<crate::wire::BoundedVec<
+    T, 0, { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+>, String> {
+    crate::wire::BoundedVec::new(values)
+        .map_err(|error| format!("{field} exceeds relation bound: {error:?}"))
+}
 
 pub fn session_changes_typed(id: i64)
     -> Result<Vec<crate::generated_wire::ChangeRow>, String>
@@ -332,16 +353,34 @@ pub fn decorate_many_typed(id: i64, rels: &[&str])
 /// box's "recently changed" panel in the boxes view. Sorted by sqlar.mtime
 /// desc, capped at `limit`. Returns the same row shape as session_changes
 /// so the UI can reuse the same render path.
-pub fn recent_changes(id: i64, limit: i64) -> Value {
-    let Some(conn) = open_ro(id) else { return json!([]) };
-    let mut out = vec![];
-    for (name, mode, sz, _mtime) in crate::depot::archive_recent(&conn, limit) {
-        let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
-                   else if mode & S_IFMT == S_IFLNK { "symlink" }
-                   else { "changed" };
-        out.push(json!({"path": name, "kind": kind, "size": sz}));
-    }
-    Value::Array(out)
+pub fn recent_changes_typed(
+    id: i64,
+    limit: u64,
+) -> Result<Vec<crate::generated_wire::ChangeRow>, String> {
+    use crate::generated_wire::{ChangeKind, ChangeRow};
+    let conn = Connection::open_with_flags(
+        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let limit = i64::try_from(limit).map_err(|_| "change limit exceeds SQLite range")?;
+    crate::depot::archive_recent(&conn, limit).map_err(|error| error.to_string())?
+        .into_iter().map(
+        |(name, mode, size, _)| {
+            let mode = u32::try_from(mode).map_err(|_| "stored file mode exceeds u32")?;
+            let kind = if mode & S_IFMT == S_IFCHR {
+                ChangeKind::Deleted
+            } else if mode & S_IFMT == S_IFLNK {
+                ChangeKind::Symlink
+            } else {
+                ChangeKind::Changed
+            };
+            Ok(ChangeRow {
+                path: crate::wire::BoundedBytes::new(name.into_bytes())
+                    .map_err(|error| format!("change path exceeds relation bound: {error:?}"))?,
+                kind,
+                size: u64::try_from(size).map_err(|_| "negative stored change size")?,
+            })
+        },
+    ).collect()
 }
 
 /// Five-list bundle for the Sessions-view right pane: newest-first
@@ -350,192 +389,211 @@ pub fn recent_changes(id: i64, limit: i64) -> Value {
 /// changes list as their own rows (kind="xattr"), tagged with the file
 /// they hang off + the xattr key — they were invisible before, now
 /// they aren't.
-pub fn box_summary(id: i64, limit: i64) -> Value {
-    let Some(conn) = open_ro(id) else {
-        return json!({"outputs":[], "changes":[], "processes":[],
-                      "pipelines":[], "edges":[]});
+pub fn box_summary_typed(
+    id: i64,
+    limit: u64,
+) -> Result<crate::generated_wire::BoxSummary, String> {
+    use crate::generated_wire::{
+        BoxSummary, ChangeKind, ChangePreview, EchoStream, EdgePreview, FailureKind,
+        FailurePreview, OutputPreview, PipelinePreview, ProcessPreview,
     };
-    // Files: newest-first by mtime. Same kind classification as
-    // recent_changes (sqlar S_IFCHR row = whiteout = deleted).
-    let mut file_rows: Vec<(i64, Value)> = vec![];
-    {
-        {
-            for (name, mode, sz, mtime) in crate::depot::archive_recent(&conn, limit) {
-                let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
-                           else if mode & S_IFMT == S_IFLNK { "symlink" }
-                           else { "changed" };
-                file_rows.push((mtime, json!({
-                    "path": name, "kind": kind, "size": sz, "mtime": mtime,
-                })));
-            }
-        }
-    }
-    // xattrs: the side table has no mtime, so we ride the OWNING file's
-    // mtime to mix them into one timeline. Each xattr (name,key) pair is
-    // one row with kind="xattr". Key + value-byte-count surface; the raw
-    // bytes don't (they could be huge / binary).
-    let mut xattr_rows: Vec<(i64, Value)> = vec![];
-    if has_table(&conn, "xattr") {
-        if let Ok(mut st) = conn.prepare(
-            "SELECT x.name, x.key, length(x.value), \
-                    COALESCE(s.mtime, 0) \
-             FROM xattr x LEFT JOIN sqlar s ON s.name=x.name \
-             ORDER BY COALESCE(s.mtime, 0) DESC LIMIT ?1") {
-            if let Ok(it) = st.query_map([limit], |r| Ok((
-                r.get::<_, String>(0)?, r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?, r.get::<_, i64>(3)?,
-            ))) {
-                for (path, key, vlen, mtime) in it.flatten() {
-                    xattr_rows.push((mtime, json!({
-                        "path": path, "kind": "xattr",
-                        "xattr_key": key, "xattr_len": vlen, "mtime": mtime,
-                    })));
-                }
-            }
-        }
-    }
-    // Merge file + xattr rows by mtime desc, cap at `limit`.
-    let mut changes_merged: Vec<(i64, Value)> = file_rows;
-    changes_merged.extend(xattr_rows);
-    changes_merged.sort_by(|a, b| b.0.cmp(&a.0));
-    let changes: Vec<Value> = changes_merged.into_iter()
-        .take(limit as usize).map(|(_, v)| v).collect();
+    let conn = Connection::open_with_flags(
+        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let sql_limit = i64::try_from(limit).map_err(|_| "summary limit exceeds SQLite range")?;
 
-    let mut outputs = vec![];
-    if let Ok(mut st) = conn.prepare(
-        "SELECT id, ts, stream, length(content), \
-                CAST(substr(content,1,80) AS TEXT) \
-         FROM outputs ORDER BY id DESC LIMIT ?1") {
-        if let Ok(it) = st.query_map([limit], |r| Ok(json!({
-            "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
-            "stream": r.get::<_, i64>(2)?, "len": r.get::<_, i64>(3)?,
-            "preview": r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-        }))) {
-            for row in it.flatten() { outputs.push(row); }
-        }
-    }
-    // Reverse so the topmost row in the UI is the OLDEST of the tail —
-    // matches how a transcript reads. Actually no: keep newest-first so
-    // the user sees the latest first. The UI renders top-down.
-
-    let mut processes = vec![];
-    if let Ok(mut st) = conn.prepare(
-        "SELECT id, tgid, exe, argv FROM process ORDER BY id DESC LIMIT ?1") {
-        if let Ok(it) = st.query_map([limit], |r| {
-            let argv: String = r.get(3)?;
-            let av: Vec<String> = serde_json::from_str(&argv).unwrap_or_default();
-            let head = av.first().cloned().unwrap_or_default();
-            Ok(json!({
-                "id": r.get::<_, i64>(0)?, "tgid": r.get::<_, i64>(1)?,
-                "exe": r.get::<_, String>(2)?, "argv0": head,
-            }))
-        }) {
-            for row in it.flatten() { processes.push(row); }
-        }
-    }
-
-    let mut pipelines = vec![];
-    if has_table(&conn, "brushprov") {
-        if let Ok(mut st) = conn.prepare(
-            "SELECT id, cmd, COALESCE(nested,0) FROM brushprov \
-             ORDER BY id DESC LIMIT ?1") {
-            if let Ok(it) = st.query_map([limit], |r| Ok(json!({
-                "id": r.get::<_, i64>(0)?,
-                "cmd": r.get::<_, String>(1)?,
-                "nested": r.get::<_, i64>(2)? != 0,
-            }))) {
-                for row in it.flatten() { pipelines.push(row); }
-            }
-        }
-    }
-
-    let mut edges = vec![];
-    if has_table(&conn, "build_edges") {
-        if let Ok(mut st) = conn.prepare(
-            "SELECT id, outs, cmd FROM build_edges ORDER BY id DESC LIMIT ?1") {
-            if let Ok(it) = st.query_map([limit], |r| {
-                let outs: String = r.get(1)?;
-                let arr: Vec<String> = serde_json::from_str(&outs).unwrap_or_default();
-                let head = arr.first().cloned().unwrap_or_default();
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?, "out": head,
-                    "n_outs": arr.len(),
-                    "cmd": r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+    let mut changes = crate::depot::archive_recent(&conn, sql_limit)
+        .map_err(|error| error.to_string())?.into_iter().map(
+            |(path, mode, size, modified_at)| {
+                let mode = u32::try_from(mode)
+                    .map_err(|_| "stored file mode exceeds u32")?;
+                Ok((modified_at, ChangePreview {
+                    path: relation_bytes(path, "summary change path")?,
+                    kind: if mode & S_IFMT == S_IFCHR { ChangeKind::Deleted }
+                        else if mode & S_IFMT == S_IFLNK { ChangeKind::Symlink }
+                        else { ChangeKind::Changed },
+                    size: u64::try_from(size)
+                        .map_err(|_| "negative summary change size")?,
+                    modified_at,
+                    xattr_key: None,
+                    xattr_length: None,
                 }))
-            }) {
-                for row in it.flatten() { edges.push(row); }
-            }
+            },
+        ).collect::<Result<Vec<_>, String>>()?;
+    if has_table_typed(&conn, "xattr")? {
+        let mut statement = conn.prepare(
+            "SELECT x.name, x.key, length(x.value), COALESCE(s.mtime, 0) \
+             FROM xattr x LEFT JOIN sqlar s ON s.name=x.name \
+             ORDER BY COALESCE(s.mtime, 0) DESC LIMIT ?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement.query_map([sql_limit], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?, row.get::<_, i64>(3)?,
+        ))).map_err(|error| error.to_string())?;
+        for row in rows {
+            let (path, key, length, modified_at) = row.map_err(|error| error.to_string())?;
+            changes.push((modified_at, ChangePreview {
+                path: relation_bytes(path, "summary xattr path")?,
+                kind: ChangeKind::Xattr,
+                size: 0,
+                modified_at,
+                xattr_key: Some(relation_bytes(key, "summary xattr key")?),
+                xattr_length: Some(u64::try_from(length)
+                    .map_err(|_| "negative summary xattr length")?),
+            }));
+        }
+    }
+    changes.sort_by(|left, right| right.0.cmp(&left.0));
+    let changes = changes.into_iter().take(limit as usize)
+        .map(|(_, row)| row).collect();
+
+    let mut statement = conn.prepare(
+        "SELECT id, ts, stream, length(content), CAST(substr(content,1,80) AS TEXT) \
+         FROM outputs ORDER BY id DESC LIMIT ?1")
+        .map_err(|error| error.to_string())?;
+    let rows = statement.query_map([sql_limit], |row| Ok((
+        row.get::<_, i64>(0)?, row.get::<_, f64>(1)?, row.get::<_, i64>(2)?,
+        row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?,
+    ))).map_err(|error| error.to_string())?;
+    let mut outputs = Vec::new();
+    for row in rows {
+        let (id, time, stream, length, preview) = row.map_err(|error| error.to_string())?;
+        outputs.push(OutputPreview {
+            id: u64::try_from(id).map_err(|_| "negative output row id")?,
+            time,
+            stream: match stream {
+                0 => EchoStream::Stdout,
+                1 => EchoStream::Stderr,
+                _ => return Err(format!("unknown stored output stream {stream}")),
+            },
+            length: u64::try_from(length).map_err(|_| "negative output length")?,
+            preview: relation_text(preview.unwrap_or_default(), "output preview")?,
+        });
+    }
+    drop(statement);
+
+    let mut statement = conn.prepare(
+        "SELECT id, tgid, exe, argv FROM process ORDER BY id DESC LIMIT ?1")
+        .map_err(|error| error.to_string())?;
+    let rows = statement.query_map([sql_limit], |row| Ok((
+        row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?,
+        row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+    ))).map_err(|error| error.to_string())?;
+    let mut processes = Vec::new();
+    for row in rows {
+        let (id, tgid, executable, argv) = row.map_err(|error| error.to_string())?;
+        let argv: Vec<String> = serde_json::from_str(&argv)
+            .map_err(|error| format!("invalid stored process argv: {error}"))?;
+        processes.push(ProcessPreview {
+            id: u64::try_from(id).map_err(|_| "negative process row id")?,
+            tgid: tgid.map(|value| u32::try_from(value)
+                .map_err(|_| "process tgid exceeds u32")).transpose()?,
+            executable: relation_bytes(executable, "process executable")?,
+            argv0: relation_bytes(argv.into_iter().next().unwrap_or_default(), "process argv0")?,
+        });
+    }
+    drop(statement);
+
+    let mut pipelines = Vec::new();
+    if has_table_typed(&conn, "brushprov")? {
+        let mut statement = conn.prepare(
+            "SELECT id, cmd, COALESCE(nested,0) FROM brushprov ORDER BY id DESC LIMIT ?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement.query_map([sql_limit], |row| Ok((
+            row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
+        ))).map_err(|error| error.to_string())?;
+        for row in rows {
+            let (id, command, nested) = row.map_err(|error| error.to_string())?;
+            pipelines.push(PipelinePreview {
+                id: u64::try_from(id).map_err(|_| "negative pipeline row id")?,
+                command: relation_text(command, "pipeline command")?,
+                nested: nested != 0,
+            });
         }
     }
 
-    // Failures front and center: build edges that ran and exited non-zero
-    // (with their captured output excerpt) and failed pipelines. This is the
-    // box overview's "what broke" section — a failed `make` box otherwise
-    // buries the one interesting recipe under thousands of healthy rows.
-    let mut failures = vec![];
-    if has_table(&conn, "build_edges") {
-        if let Ok(mut st) = conn.prepare(
-            "SELECT json_extract(outs,'$[0]'), exit_code, \
-                    COALESCE(output_excerpt,'') \
-             FROM build_edges \
-             WHERE exit_code IS NOT NULL AND exit_code != 0 \
-             ORDER BY id DESC LIMIT ?1") {
-            if let Ok(it) = st.query_map([limit], |r| Ok(json!({
-                "kind": "edge",
-                "label": r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                "code": r.get::<_, i64>(1)?,
-                "excerpt": r.get::<_, String>(2)?,
-            }))) {
-                for row in it.flatten() { failures.push(row); }
-            }
-        }
-    }
-    if has_table(&conn, "brushprov") {
-        if let Ok(mut st) = conn.prepare(
-            "SELECT cmd, exit_code FROM brushprov \
-             WHERE exit_code > 0 ORDER BY id DESC LIMIT ?1") {
-            if let Ok(it) = st.query_map([limit], |r| Ok(json!({
-                "kind": "pipeline",
-                "label": r.get::<_, String>(0)?,
-                "code": r.get::<_, i64>(1)?,
-                "excerpt": "",
-            }))) {
-                for row in it.flatten() { failures.push(row); }
-            }
+    let mut edges = Vec::new();
+    if has_table_typed(&conn, "build_edges")? {
+        let mut statement = conn.prepare(
+            "SELECT id, outs, cmd FROM build_edges ORDER BY id DESC LIMIT ?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement.query_map([sql_limit], |row| Ok((
+            row.get::<_, i64>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))).map_err(|error| error.to_string())?;
+        for row in rows {
+            let (id, outputs, command) = row.map_err(|error| error.to_string())?;
+            let outputs: Vec<String> = serde_json::from_str(&outputs)
+                .map_err(|error| format!("invalid stored build outputs: {error}"))?;
+            edges.push(EdgePreview {
+                id: u64::try_from(id).map_err(|_| "negative build edge row id")?,
+                output: outputs.first().cloned()
+                    .map(|value| relation_bytes(value, "build edge output")).transpose()?,
+                output_count: u32::try_from(outputs.len())
+                    .map_err(|_| "build edge output count exceeds u32")?,
+                command: command.map(|value| relation_text(value, "build edge command"))
+                    .transpose()?,
+            });
         }
     }
 
-    // Presence marker for the Vars chip (the UI shows data-gated chips only
-    // when their table has rows).
-    let makevar: Vec<Value> = if has_table(&conn, "makevar")
-        && conn.query_row("SELECT 1 FROM makevar LIMIT 1", [], |_| Ok(())).is_ok()
-    {
-        vec![json!(1)]
-    } else {
-        vec![]
+    let mut failures = Vec::new();
+    if has_table_typed(&conn, "build_edges")? {
+        let mut statement = conn.prepare(
+            "SELECT json_extract(outs,'$[0]'), exit_code, COALESCE(output_excerpt,'') \
+             FROM build_edges WHERE exit_code IS NOT NULL AND exit_code != 0 \
+             ORDER BY id DESC LIMIT ?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement.query_map([sql_limit], |row| Ok((
+            row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))).map_err(|error| error.to_string())?;
+        for row in rows {
+            let (label, code, excerpt) = row.map_err(|error| error.to_string())?;
+            failures.push(FailurePreview {
+                kind: FailureKind::Edge,
+                label: relation_text(label.unwrap_or_default(), "edge failure label")?,
+                code: i32::try_from(code).map_err(|_| "edge exit code exceeds i32")?,
+                excerpt: relation_text(excerpt, "edge failure excerpt")?,
+            });
+        }
+    }
+    if has_table_typed(&conn, "brushprov")? {
+        let mut statement = conn.prepare(
+            "SELECT cmd, exit_code FROM brushprov WHERE exit_code > 0 \
+             ORDER BY id DESC LIMIT ?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement.query_map([sql_limit], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, i64>(1)?,
+        ))).map_err(|error| error.to_string())?;
+        for row in rows {
+            let (label, code) = row.map_err(|error| error.to_string())?;
+            failures.push(FailurePreview {
+                kind: FailureKind::Pipeline,
+                label: relation_text(label, "pipeline failure label")?,
+                code: i32::try_from(code).map_err(|_| "pipeline exit code exceeds i32")?,
+                excerpt: relation_text(String::new(), "pipeline failure excerpt")?,
+            });
+        }
+    }
+    failures.truncate(limit as usize);
+
+    let has_rows = |table: &str, predicate: &str| -> Result<bool, String> {
+        if !has_table_typed(&conn, table)? { return Ok(false); }
+        let sql = format!("SELECT 1 FROM {table} WHERE {predicate} LIMIT 1");
+        conn.query_row(&sql, [], |_| Ok(())).optional()
+            .map(|row| row.is_some()).map_err(|error| error.to_string())
     };
-
-    // Presence marker for the Trace chip: a non-empty sudtrace blob (only sud
-    // boxes populate it). Same shape as `makevar` — the UI shows the chip only
-    // when this array is non-empty.
-    let sudtrace: Vec<Value> = if has_table(&conn, "sudtrace")
-        && conn.query_row("SELECT 1 FROM sudtrace WHERE length(content)>0 LIMIT 1",
-                          [], |_| Ok(())).is_ok()
-    {
-        vec![json!(1)]
-    } else {
-        vec![]
-    };
-
-    json!({
-        "outputs":   outputs,
-        "changes":   changes,
-        "processes": processes,
-        "pipelines": pipelines,
-        "edges":     edges,
-        "failures":  failures,
-        "makevar":   makevar,
-        "sudtrace":  sudtrace,
+    Ok(BoxSummary {
+        outputs: relation_list(outputs, "summary outputs")?,
+        changes: relation_list(changes, "summary changes")?,
+        processes: relation_list(processes, "summary processes")?,
+        pipelines: relation_list(pipelines, "summary pipelines")?,
+        edges: relation_list(edges, "summary edges")?,
+        failures: relation_list(failures, "summary failures")?,
+        has_make_variables: has_rows("makevar", "1")?,
+        has_sud_trace: has_rows("sudtrace", "length(content)>0")?,
+        activity: relation_list(Vec::new(), "summary activity")?,
     })
 }
 
@@ -543,51 +601,68 @@ pub fn box_summary(id: i64, limit: i64) -> Value {
 /// table). `name_pat` / `value_pat` are cmd_match text globs — a bare word
 /// matches as a substring, empty matches everything. Rows come back in
 /// assignment order so a value's history reads top-to-bottom.
-pub fn makevars(
-    id: i64, name_pat: &str, value_pat: &str, limit: i64, any: bool,
-) -> Value {
-    let Some(conn) = open_ro(id) else { return json!([]) };
-    if !has_table(&conn, "makevar") { return json!([]); }
+pub fn makevars_typed(
+    id: i64, name_pat: &str, value_pat: &str, limit: u64, any: bool,
+) -> Result<Vec<crate::generated_wire::MakeVariableRow>, String> {
+    use crate::generated_wire::MakeVariableRow;
+    let conn = Connection::open_with_flags(
+        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    if !has_table_typed(&conn, "makevar")? { return Ok(Vec::new()); }
+    if limit == 0 { return Ok(Vec::new()); }
     let mut out = vec![];
     // edge_id / pipeline_id resolve the capture-time anchors (recipe edge's
     // primary output / pipeline uid) to the row ids the cross-pane "ids"
     // filters key on, so the UI can navigate without another round-trip.
-    let Ok(mut st) = conn.prepare(
+    let mut st = conn.prepare(
         "SELECT m.id, m.name, m.loc, m.value, m.make_dir, m.rhs, m.refs,
                 m.edge_out, m.uid, m.flags,
                 (SELECT e.id FROM build_edges e
                   WHERE json_extract(e.outs,'$[0]') = m.edge_out LIMIT 1),
                 (SELECT p.id FROM brushprov p WHERE p.uid = m.uid LIMIT 1)
-         FROM makevar m ORDER BY m.id") else {
-        return json!([]);
-    };
-    let Ok(it) = st.query_map([], |r| Ok((
+         FROM makevar m ORDER BY m.id")
+        .map_err(|error| error.to_string())?;
+    let it = st.query_map([], |r| Ok((
         r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
         r.get::<_, String>(3)?, r.get::<_, String>(4)?,
         r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?,
         r.get::<_, Option<String>>(7)?, r.get::<_, Option<i64>>(8)?,
         r.get::<_, Option<String>>(9)?,
         r.get::<_, Option<i64>>(10)?, r.get::<_, Option<i64>>(11)?,
-    ))) else { return json!([]) };
-    for (rid, name, loc, value, make_dir, rhs, refs, edge_out, uid, flags,
-         edge_id, pipeline_id) in it.flatten()
+    ))).map_err(|error| error.to_string())?;
+    for row in it
     {
+        let (rid, name, loc, value, make_dir, rhs, refs, edge_out, uid, flags,
+             edge_id, pipeline_id) = row.map_err(|error| error.to_string())?;
         let name_ok = name_pat.is_empty()
             || crate::rules::cmd_match(name_pat, &name);
         let value_ok = value_pat.is_empty()
             || crate::rules::cmd_match(value_pat, &value);
         if any { if !(name_ok || value_ok) { continue; } }
         else if !(name_ok && value_ok) { continue; }
-        out.push(json!({"id": rid, "name": name, "loc": loc,
-                        "value": value, "make": make_dir,
-                        "rhs": rhs.unwrap_or_default(),
-                        "refs": refs.unwrap_or_default(),
-                        "flags": flags.unwrap_or_default(),
-                        "edge_out": edge_out, "uid": uid,
-                        "edge_id": edge_id, "pipeline_id": pipeline_id}));
-        if out.len() as i64 >= limit { break; }
+        let bytes = |value: String, field: &str| crate::wire::BoundedBytes::new(value.into_bytes())
+            .map_err(|error| format!("make variable {field} exceeds relation bound: {error:?}"));
+        out.push(MakeVariableRow {
+            id: u64::try_from(rid).map_err(|_| "negative make variable row id")?,
+            name: bytes(name, "name")?,
+            location: bytes(loc, "location")?,
+            value: bytes(value, "value")?,
+            make_directory: bytes(make_dir, "directory")?,
+            rhs: bytes(rhs.unwrap_or_default(), "rhs")?,
+            references: bytes(refs.unwrap_or_default(), "references")?,
+            flags: crate::wire::BoundedText::new(flags.unwrap_or_default())
+                .map_err(|error| format!("make variable flags exceed relation bound: {error:?}"))?,
+            edge_output: edge_out.map(|value| bytes(value, "edge output")).transpose()?,
+            pipeline_uid: uid.map(|value| u64::try_from(value)
+                .map_err(|_| "negative make variable pipeline uid")).transpose()?,
+            edge: edge_id.map(|value| u64::try_from(value)
+                .map_err(|_| "negative make variable edge id")).transpose()?,
+            pipeline: pipeline_id.map(|value| u64::try_from(value)
+                .map_err(|_| "negative make variable pipeline id")).transpose()?,
+        });
+        if out.len() as u64 >= limit { break; }
     }
-    json!(out)
+    Ok(out)
 }
 
 /// Map provenance row ids between the three linked domains — "process"
@@ -602,36 +677,51 @@ pub fn makevars(
 /// WINDOW: brushprov rows whose spawn_ts falls inside [started_ts, ended_ts]
 /// (open-ended while the recipe is still running; an edge that never ran has
 /// no members). process↔edge composes the two hops via pipelines.
-pub fn map_ids(id: i64, from: &str, ids: &[i64], to: &str) -> Value {
-    fn ids_json(v: Vec<i64>) -> Value { json!(v) }
-    if ids.is_empty() { return json!([]); }
-    if from == to { return json!(ids); }
-    let Some(conn) = open_ro(id) else { return json!([]) };
-    ids_json(map_ids_conn(&conn, from, ids, to))
+pub fn map_ids_typed(
+    id: i64,
+    from: crate::generated_wire::ProvenanceDomain,
+    ids: &[u64],
+    to: crate::generated_wire::ProvenanceDomain,
+) -> Result<Vec<u64>, String> {
+    if ids.is_empty() || from == to { return Ok(ids.to_vec()); }
+    let conn = Connection::open_with_flags(
+        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let ids = ids.iter().map(|id| i64::try_from(*id)
+        .map_err(|_| "provenance row id exceeds SQLite range"))
+        .collect::<Result<Vec<_>, _>>()?;
+    map_ids_conn(&conn, from, &ids, to)?.into_iter().map(|id|
+        u64::try_from(id).map_err(|_| "negative mapped provenance row id".into())).collect()
 }
 
-fn map_ids_conn(conn: &Connection, from: &str, ids: &[i64], to: &str) -> Vec<i64> {
+fn map_ids_conn(
+    conn: &Connection,
+    from: crate::generated_wire::ProvenanceDomain,
+    ids: &[i64],
+    to: crate::generated_wire::ProvenanceDomain,
+) -> Result<Vec<i64>, String> {
+    use crate::generated_wire::ProvenanceDomain::{Edge, Pipeline, Process};
     if ids.is_empty() || from == to {
-        return ids.to_vec();
+        return Ok(ids.to_vec());
     }
     let inlist = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-    let query = |sql: String| -> Vec<i64> {
-        conn.prepare(&sql).ok().and_then(|mut st| {
-            st.query_map([], |r| r.get::<_, i64>(0)).ok()
-                .map(|it| it.flatten().collect())
-        }).unwrap_or_default()
+    let query = |sql: String| -> Result<Vec<i64>, String> {
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string())).collect()
     };
     // Small slack on the window ends: the edge started/done stamps and the
     // pipeline's spawn_ts are written by different threads around the same
     // instant.
     match (from, to) {
-        ("process", "pipeline") => query(format!(
+        (Process, Pipeline) => query(format!(
             "SELECT DISTINCT brush_pipeline_id FROM process \
              WHERE id IN ({inlist}) AND brush_pipeline_id > 0")),
-        ("pipeline", "process") => query(format!(
+        (Pipeline, Process) => query(format!(
             "SELECT id FROM process WHERE brush_pipeline_id IN ({inlist})")),
-        ("pipeline", "edge") => {
-            if !has_table(conn, "build_edges") { return vec![]; }
+        (Pipeline, Edge) => {
+            if !has_table_typed(conn, "build_edges")? { return Ok(vec![]); }
             // Exact link: pipelines are stamped with the edge whose recipe
             // spawned them (record JSON `edge_out` == the edge's outs[0]).
             query(format!(
@@ -641,8 +731,8 @@ fn map_ids_conn(conn: &Connection, from: &str, ids: &[i64], to: &str) -> Vec<i64
                    AND json_extract(b.record,'$.edge_out') = \
                        json_extract(e.outs,'$[0]')"))
         }
-        ("edge", "pipeline") => {
-            if !has_table(conn, "build_edges") { return vec![]; }
+        (Edge, Pipeline) => {
+            if !has_table_typed(conn, "build_edges")? { return Ok(vec![]); }
             query(format!(
                 "SELECT DISTINCT b.id FROM brushprov b, build_edges e \
                  WHERE e.id IN ({inlist}) \
@@ -650,15 +740,15 @@ fn map_ids_conn(conn: &Connection, from: &str, ids: &[i64], to: &str) -> Vec<i64
                    AND json_extract(b.record,'$.edge_out') = \
                        json_extract(e.outs,'$[0]')"))
         }
-        ("process", "edge") => {
-            let pipes = map_ids_conn(conn, "process", ids, "pipeline");
-            map_ids_conn(conn, "pipeline", &pipes, "edge")
+        (Process, Edge) => {
+            let pipes = map_ids_conn(conn, Process, ids, Pipeline)?;
+            map_ids_conn(conn, Pipeline, &pipes, Edge)
         }
-        ("edge", "process") => {
-            let pipes = map_ids_conn(conn, "edge", ids, "pipeline");
-            map_ids_conn(conn, "pipeline", &pipes, "process")
+        (Edge, Process) => {
+            let pipes = map_ids_conn(conn, Edge, ids, Pipeline)?;
+            map_ids_conn(conn, Pipeline, &pipes, Process)
         }
-        _ => vec![],
+        _ => Ok(vec![]),
     }
 }
 
@@ -667,47 +757,63 @@ fn map_ids_conn(conn: &Connection, from: &str, ids: &[i64], to: &str) -> Vec<i64
 /// and the build edge whose recipe it belongs to (record.edge_out). This is
 /// the "this started that" context the Pipelines detail pane shows so a
 /// failure can be walked up to its root cause without guessing.
-pub fn pipeline_context(id: i64, prov_id: i64) -> Value {
-    let Some(conn) = open_ro(id) else { return json!({}) };
-    let Ok((uid, parent_uid, edge_out)) = conn.query_row(
+pub fn pipeline_context_typed(
+    id: i64,
+    prov_id: u64,
+) -> Result<crate::generated_wire::PipelineContext, String> {
+    use crate::generated_wire::{PipelineContext, PipelineContextItem};
+    let conn = Connection::open_with_flags(
+        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let prov_id = i64::try_from(prov_id).map_err(|_| "pipeline id exceeds SQLite range")?;
+    let (uid, parent_uid, edge_out) = conn.query_row(
         "SELECT uid, parent_uid,                 COALESCE(json_extract(record,'$.edge_out'),'')          FROM brushprov WHERE id=?1",
         [prov_id],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?)))
-    else { return json!({}) };
-    let one = |sql: &str, key: i64| -> Value {
-        conn.query_row(sql, [key], |r| Ok(json!({
-            "id": r.get::<_, i64>(0)?,
-            "cmd": r.get::<_, String>(1)?,
-            "exit_code": r.get::<_, i64>(2)?,
-        }))).unwrap_or(Value::Null)
+        .map_err(|error| error.to_string())?;
+    let item = |row: (i64, String, Option<i64>)| -> Result<PipelineContextItem, String> {
+        Ok(PipelineContextItem {
+            id: u64::try_from(row.0).map_err(|_| "negative pipeline row id")?,
+            command: crate::wire::BoundedText::new(row.1)
+                .map_err(|error| format!("pipeline command exceeds relation bound: {error:?}"))?,
+            exit_code: row.2.map(|code| i32::try_from(code)
+                .map_err(|_| "pipeline exit code exceeds i32")).transpose()?,
+        })
     };
     let parent = if parent_uid > 0 {
-        one("SELECT id, cmd, exit_code FROM brushprov WHERE uid=?1", parent_uid)
-    } else { Value::Null };
+        conn.query_row("SELECT id, cmd, exit_code FROM brushprov WHERE uid=?1", [parent_uid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .optional().map_err(|error| error.to_string())?.map(item).transpose()?
+    } else { None };
     let mut children = vec![];
     if uid > 0 {
-        if let Ok(mut st) = conn.prepare(
-            "SELECT id, cmd, exit_code FROM brushprov              WHERE parent_uid=?1 ORDER BY id LIMIT 40") {
-            if let Ok(it) = st.query_map([uid], |r| Ok(json!({
-                "id": r.get::<_, i64>(0)?,
-                "cmd": r.get::<_, String>(1)?,
-                "exit_code": r.get::<_, i64>(2)?,
-            }))) {
-                for row in it.flatten() { children.push(row); }
-            }
+        let mut statement = conn.prepare(
+            "SELECT id, cmd, exit_code FROM brushprov WHERE parent_uid=?1 ORDER BY id LIMIT 40")
+            .map_err(|error| error.to_string())?;
+        let rows = statement.query_map([uid], |row| Ok((
+            row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            children.push(item(row.map_err(|error| error.to_string())?)?);
         }
     }
-    json!({"parent": parent, "children": children, "edge_out": edge_out})
+    Ok(PipelineContext {
+        parent,
+        children: crate::wire::BoundedVec::new(children)
+            .map_err(|error| format!("pipeline children exceed relation bound: {error:?}"))?,
+        edge_output: (!edge_out.is_empty()).then(|| crate::wire::BoundedBytes::new(
+            edge_out.into_bytes()).map_err(|error|
+                format!("pipeline edge output exceeds relation bound: {error:?}")))
+            .transpose()?,
+    })
 }
 
-/// Cheap "does this sqlar have a given table" probe — Python-engine
-/// archives won't have brushprov / build_edges / xattr; old sarun
-/// archives won't have one or the other. Saves a noisy SQLITE_ERROR.
-fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
+fn has_table_typed(conn: &Connection, name: &str) -> Result<bool, String> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-        [name], |_| Ok(())).is_ok()
+        [name], |_| Ok(()),
+    ).optional().map(|row| row.is_some()).map_err(|error| error.to_string())
 }
 
 pub fn decorate_typed(id: i64, rel: &str)

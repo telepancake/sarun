@@ -383,7 +383,7 @@ belong to the relation.
       types. Structured requests such as OCI build, API probe, view filters,
       and read-only attachments must be closed records/choices; no generic
       JSON-shaped request payload may survive.
-- [ ] Give every wire action handler a concrete typed result schema in the
+- [x] Give every wire action handler a concrete typed result schema in the
       relation. Do not preserve the JSON object model as a generic recursive
       binary value or let Rust result construction remain the schema authority.
 - [x] Give every non-action request, reply, event, stream mode, mux frame, sum
@@ -833,6 +833,18 @@ belong to the relation.
   implementation wrappers; only the temporary listener projects their legacy
   reply spellings. The full native aarch64-musl suite passes 308 tests with one
   existing browser e2e test ignored.
+- Moved `review.recent_changes`, `review.box_summary`,
+  `review.pipeline_context`, `review.makevars`, and `review.map_ids` onto
+  generated request/success variants. Summary previews, provenance context,
+  variable rows, and mapped identities now materialize directly as their
+  bounded closed records; live activity is added to the same `BoxSummary`
+  before projection. Removed the final JSON-producing review implementation,
+  made archive and database iteration errors propagate, and made
+  `dispatch_action` exhaustive over every generated `ActionRequest`, so a new
+  generated action cannot compile without a handler. Every wire action now has
+  a concrete generated request and success path. The full native
+  aarch64-musl suite passes 308 tests with one existing browser e2e test
+  ignored.
 
 ## Stop conditions
 
