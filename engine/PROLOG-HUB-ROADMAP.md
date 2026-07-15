@@ -147,15 +147,18 @@ dependency; those are outputs of the relation.
 Every attempted query produces a stable observation for dependency tracking:
 
 ```prolog
-observed(QueryId, CanonicalQuery, Provider, Revision, some(Result)).
-observed(QueryId, CanonicalQuery, Provider, Revision, none).
+observed(QueryId, CanonicalQuery, source(Provider, SnapshotRevision),
+         some(Result)).
+observed(QueryId, CanonicalQuery, source(Provider, SnapshotRevision), none).
 ```
 
 `none` records relational failure, including a `one` query with zero or
-multiple identities. Comparing canonical observations before and after a
-context change is sufficient to decide whether the dependent parse must be
-recomputed. Unrelated provider changes do not invalidate text whose observed
-query results are unchanged.
+multiple identities. Provider/revision is provenance and cache freshness, not
+semantic equality. The dependency key is the canonical `(QueryId, Query,
+Outcome)` projection. After a relevant provider change, rerun the affected
+queries and compare dependency keys; the parse needs recomputation only when a
+key changes. Unrelated changes, and relevant snapshots producing the same
+outcome, therefore do not invalidate the text.
 
 The parser protocol is staged but remains one relation:
 
