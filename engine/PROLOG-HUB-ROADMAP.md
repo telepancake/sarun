@@ -877,6 +877,12 @@ belong to the relation.
   behavior. The temporary listener constructs that record once at its boundary
   until the full `Register` request cutover. The full native aarch64-musl suite
   passes 308 tests with one existing browser e2e test ignored.
+- Detached registration's network setup from the JSON envelope: it now
+  consumes the generated `NetMode` plus explicit capture/filter/replay fields,
+  and the obsolete untyped replay-as-of side field no longer enters the hot
+  path. Replay identities are range-checked before setup. The full native
+  aarch64-musl suite passes 308 tests with one existing browser e2e test
+  ignored.
 
 ## Stop conditions
 

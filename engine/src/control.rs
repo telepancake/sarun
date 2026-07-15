@@ -4315,7 +4315,27 @@ fn register(
     // around that fd and return dns_ip + the CA bundle CONTENT so the runner can
     // wire bwrap up (it materializes the CA in its own namespace). The engine
     // creates no netns/device, so there is no netns_path.
-    let (dns_ip, ca_pem) = prepare_net(state, id, msg, tap_fd).unwrap_or_default();
+    let net_mode = match msg.get("net_mode").and_then(Value::as_str).unwrap_or("off") {
+        "off" => crate::generated_wire::NetMode::Off,
+        "host" => crate::generated_wire::NetMode::Host,
+        "tap" => crate::generated_wire::NetMode::Tap,
+        _ => return json!({"ok": false, "error": "invalid network mode"}),
+    };
+    let replay_from = match msg.get("replay_from").and_then(Value::as_u64) {
+        Some(value) if i64::try_from(value).is_err() => {
+            return json!({"ok": false, "error": "replay box id exceeds engine range"});
+        }
+        value => value,
+    };
+    let (dns_ip, ca_pem) = prepare_net(
+        state,
+        id,
+        net_mode,
+        msg.get("want_webcap").and_then(Value::as_bool).unwrap_or(false),
+        msg.get("want_webfilter").and_then(Value::as_bool).unwrap_or(false),
+        replay_from,
+        tap_fd,
+    ).unwrap_or_default();
 
     // D-oci: if any ancestor in the parent chain has an oci_config meta key
     // (stamped by `sarun oci load` on the top layer of an image), surface
@@ -4448,11 +4468,13 @@ fn parse_oci_runtime(cfg_json: &str) -> Option<Value> {
 fn prepare_net(
     state: &State,
     id: i64,
-    msg: &Value,
+    net_mode: crate::generated_wire::NetMode,
+    web_capture: bool,
+    web_filter: bool,
+    replay_from: Option<u64>,
     tap_fd: Option<std::os::fd::OwnedFd>,
 ) -> Option<(String, String)> {
-    let net_mode = msg.get("net_mode").and_then(Value::as_str).unwrap_or("off");
-    if net_mode != "tap" {
+    if net_mode != crate::generated_wire::NetMode::Tap {
         drop(tap_fd); // off / host carry no TAP; close any fd the runner sent
         return Some((String::new(), String::new()));
     }
@@ -4512,15 +4534,7 @@ fn prepare_net(
     // The capture sink resolves live_box(id) at record time off the overlay,
     // exactly like the oaita proxy's api_log sink; the filter loads the
     // webfilter ruleset. All-None → the MITM proxy runs its pure pass-through.
-    let want_webcap = msg
-        .get("want_webcap")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let want_webfilter = msg
-        .get("want_webfilter")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let capture = if want_webcap {
+    let capture = if web_capture {
         lock(state)
             .overlay
             .clone()
@@ -4528,20 +4542,17 @@ fn prepare_net(
     } else {
         None
     };
-    let filter = if want_webfilter {
+    let filter = if web_filter {
         Some(std::sync::Arc::new(crate::net::filter::Filter::load()))
     } else {
         None
     };
     // Replay (DESIGN-web.md W4.2): `replay_from` names the source box whose
     // captures answer this box's requests, with an optional `replay_asof`.
-    let replay = msg
-        .get("replay_from")
-        .and_then(Value::as_i64)
-        .map(|source_box| crate::net::ReplaySource {
-            source_box,
-            asof: msg.get("replay_asof").and_then(Value::as_f64),
-        });
+    let replay = replay_from.map(|source_box| crate::net::ReplaySource {
+        source_box: i64::try_from(source_box).expect("validated replay box id"),
+        asof: None,
+    });
     let hooks = if capture.is_some() || filter.is_some() || replay.is_some() {
         Some(std::sync::Arc::new(crate::net::ProxyHooks {
             capture,
