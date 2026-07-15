@@ -246,6 +246,28 @@ fn relation_text(
         .map_err(|error| format!("text exceeds relation bound: {error:?}"))
 }
 
+fn relation_short_text(
+    value: &str,
+) -> Result<crate::wire::BoundedText<{ crate::generated_wire::LIMIT_SHORT_BYTES }>, String> {
+    crate::wire::BoundedText::new(value.into())
+        .map_err(|error| format!("short text exceeds relation bound: {error:?}"))
+}
+
+fn relation_blob(
+    value: Vec<u8>,
+) -> Result<crate::wire::BoundedBytes<{ crate::generated_wire::LIMIT_BLOB_BYTES }>, String> {
+    crate::wire::BoundedBytes::new(value)
+        .map_err(|error| format!("blob exceeds relation bound: {error:?}"))
+}
+
+fn relation_sql_bool(kind: &str, value: i64) -> Result<bool, String> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(format!("invalid stored {kind} boolean {value}")),
+    }
+}
+
 fn relation_pipeline_stage(value: &Value) -> Result<crate::generated_wire::PipelineStage, String> {
     use crate::generated_wire::{LIMIT_STAGE_ITEMS, PipelineStage};
     let redirects = || -> Result<u32, String> {
@@ -396,59 +418,118 @@ pub fn process_rows_json(rows: &[crate::generated_wire::ProcessRow]) -> Value {
 /// oaita-proxy API log rows for a box: one row per request the engine
 /// forwarded on this box's behalf. The body bytes are summary-sized (lengths
 /// only) here; `api_log_detail` fetches the full request/response on demand.
-pub fn api_log(box_id: i64) -> Value {
+pub fn api_log_typed(
+    box_id: i64,
+) -> Result<Vec<crate::generated_wire::ApiLogRow>, String> {
+    use crate::generated_wire::ApiLogRow;
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return json!([]);
+        return Ok(vec![]);
     };
-    let mut rows = vec![];
-    if let Ok(mut st) = conn.prepare(
+    if !has_table(&conn, "api_log") { return Ok(vec![]); }
+    let mut statement = conn.prepare(
         "SELECT id,ts,method,path,model,status,stream,length(req),length(resp) \
-         FROM api_log ORDER BY id") {
-        let it = st.query_map([], |r| Ok(json!({
-            "id": r.get::<_, i64>(0)?,
-            "ts": r.get::<_, f64>(1)?,
-            "method": r.get::<_, String>(2)?,
-            "path": r.get::<_, String>(3)?,
-            "model": r.get::<_, String>(4)?,
-            "status": r.get::<_, i64>(5)?,
-            "stream": r.get::<_, i64>(6)?,
-            "req_len": r.get::<_, i64>(7)?,
-            "resp_len": r.get::<_, i64>(8)?,
-        })));
-        if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }
+         FROM api_log ORDER BY id")
+        .map_err(|error| format!("prepare API log query: {error}"))?;
+    let queried = statement.query_map([], |row| Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, f64>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, i64>(5)?,
+        row.get::<_, i64>(6)?,
+        row.get::<_, i64>(7)?,
+        row.get::<_, i64>(8)?,
+    ))).map_err(|error| format!("read API log rows: {error}"))?;
+    let mut rows = vec![];
+    for row in queried {
+        let (id, time, method, path, model, status, streaming,
+             request_length, response_length) =
+            row.map_err(|error| format!("read API log row: {error}"))?;
+        rows.push(ApiLogRow {
+            id: id.try_into().map_err(|_| "negative API log row id")?,
+            time,
+            method: relation_short_text(&method)?,
+            path: relation_text(&path)?,
+            model: relation_text(&model)?,
+            status: status.try_into().map_err(|_| "API status exceeds u16")?,
+            streaming: relation_sql_bool("API streaming", streaming)?,
+            request_length: request_length.try_into()
+                .map_err(|_| "negative API request length")?,
+            response_length: response_length.try_into()
+                .map_err(|_| "negative API response length")?,
+        });
     }
-    Value::Array(rows)
+    Ok(rows)
 }
 
 /// Full request/response payloads for one api_log row.
-pub fn api_log_detail(box_id: i64, row_id: i64) -> Value {
+pub fn api_log_detail_typed(
+    box_id: i64,
+    row_id: u64,
+) -> Result<Option<crate::generated_wire::ApiLogDetail>, String> {
+    use crate::generated_wire::{ApiLogDetail, ApiLogRow};
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return Value::Null;
+        return Ok(None);
     };
+    if !has_table(&conn, "api_log") { return Ok(None); }
+    let row_id = i64::try_from(row_id).map_err(|_| "API log row id exceeds sqlite range")?;
     let row = conn.query_row(
         "SELECT id,ts,method,path,model,status,stream,req,resp \
          FROM api_log WHERE id=?1",
-        [row_id],
-        |r| {
-            let req: Vec<u8> = r.get(7)?;
-            let resp: Vec<u8> = r.get(8)?;
-            Ok(json!({
-                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
-                "method": r.get::<_, String>(2)?,
-                "path": r.get::<_, String>(3)?,
-                "model": r.get::<_, String>(4)?,
-                "status": r.get::<_, i64>(5)?,
-                "stream": r.get::<_, i64>(6)?,
-                "req": String::from_utf8_lossy(&req),
-                "resp": String::from_utf8_lossy(&resp),
-            }))
-        }
-    );
-    row.unwrap_or(Value::Null)
+        [row_id], |row| Ok((
+            row.get::<_, i64>(0)?, row.get::<_, f64>(1)?,
+            row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?, row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?, row.get::<_, Vec<u8>>(7)?,
+            row.get::<_, Vec<u8>>(8)?,
+        )));
+    let (id, time, method, path, model, status, streaming, request, response) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(format!("read API log detail: {error}")),
+    };
+    let summary = ApiLogRow {
+        id: id.try_into().map_err(|_| "negative API log row id")?,
+        time,
+        method: relation_short_text(&method)?,
+        path: relation_text(&path)?,
+        model: relation_text(&model)?,
+        status: status.try_into().map_err(|_| "API status exceeds u16")?,
+        streaming: relation_sql_bool("API streaming", streaming)?,
+        request_length: request.len().try_into().map_err(|_| "API request length exceeds u64")?,
+        response_length: response.len().try_into()
+            .map_err(|_| "API response length exceeds u64")?,
+    };
+    Ok(Some(ApiLogDetail {
+        summary,
+        request: relation_blob(request)?,
+        response: relation_blob(response)?,
+    }))
+}
+
+pub fn api_log_rows_json(rows: &[crate::generated_wire::ApiLogRow]) -> Value {
+    Value::Array(rows.iter().map(|row| json!({
+        "id": row.id, "ts": row.time, "method": row.method.as_str(),
+        "path": row.path.as_str(), "model": row.model.as_str(), "status": row.status,
+        "stream": if row.streaming { 1 } else { 0 },
+        "req_len": row.request_length, "resp_len": row.response_length,
+    })).collect())
+}
+
+pub fn api_log_detail_json(row: &crate::generated_wire::ApiLogDetail) -> Value {
+    json!({
+        "id": row.summary.id, "ts": row.summary.time,
+        "method": row.summary.method.as_str(), "path": row.summary.path.as_str(),
+        "model": row.summary.model.as_str(), "status": row.summary.status,
+        "stream": if row.summary.streaming { 1 } else { 0 },
+        "req": String::from_utf8_lossy(row.request.as_slice()),
+        "resp": String::from_utf8_lossy(row.response.as_slice()),
+    })
 }
 
 /// Web capture rows for a box (DESIGN-web.md W1/W4): one row per HTTP(S)
@@ -457,94 +538,170 @@ pub fn api_log_detail(box_id: i64, row_id: i64) -> Value {
 /// first (DESC) — the browser/crawler produce these in time order and the
 /// most recent captures are what the Captures pane wants at the top. A sqlar
 /// written before the webcap table existed simply yields no rows.
-pub fn webcap(box_id: i64) -> Value {
+pub fn webcap_typed(
+    box_id: i64,
+) -> Result<Vec<crate::generated_wire::WebCaptureRow>, String> {
+    use crate::generated_wire::WebCaptureRow;
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return json!([]);
+        return Ok(vec![]);
     };
-    let mut rows = vec![];
-    if let Ok(mut st) = conn.prepare(
+    if !has_table(&conn, "webcap") { return Ok(vec![]); }
+    let mut statement = conn.prepare(
         "SELECT id,ts,method,url,host,status,mime,truncated,\
-         length(req_body),length(resp_body) FROM webcap ORDER BY id DESC") {
-        let it = st.query_map([], |r| Ok(json!({
-            "id": r.get::<_, i64>(0)?,
-            "ts": r.get::<_, f64>(1)?,
-            "method": r.get::<_, String>(2)?,
-            "url": r.get::<_, String>(3)?,
-            "host": r.get::<_, String>(4)?,
-            "status": r.get::<_, i64>(5)?,
-            "mime": r.get::<_, String>(6)?,
-            "truncated": r.get::<_, i64>(7)?,
-            "req_len": r.get::<_, i64>(8)?,
-            "resp_len": r.get::<_, i64>(9)?,
-        })));
-        if let Ok(it) = it { for row in it.flatten() { rows.push(row); } }
+         length(req_body),length(resp_body) FROM webcap ORDER BY id DESC")
+        .map_err(|error| format!("prepare web capture query: {error}"))?;
+    let queried = statement.query_map([], |row| Ok((
+        row.get::<_, i64>(0)?, row.get::<_, f64>(1)?,
+        row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?, row.get::<_, i64>(5)?,
+        row.get::<_, String>(6)?, row.get::<_, i64>(7)?,
+        row.get::<_, i64>(8)?, row.get::<_, i64>(9)?,
+    ))).map_err(|error| format!("read web capture rows: {error}"))?;
+    let mut rows = vec![];
+    for row in queried {
+        let (id, time, method, url, host, status, mime, truncated,
+             request_length, response_length) =
+            row.map_err(|error| format!("read web capture row: {error}"))?;
+        rows.push(WebCaptureRow {
+            id: id.try_into().map_err(|_| "negative web capture row id")?,
+            time,
+            method: relation_short_text(&method)?,
+            url: relation_text(&url)?,
+            host: relation_text(&host)?,
+            status: status.try_into().map_err(|_| "web status exceeds u16")?,
+            mime: relation_text(&mime)?,
+            truncated: relation_sql_bool("web truncation", truncated)?,
+            request_length: request_length.try_into()
+                .map_err(|_| "negative web request length")?,
+            response_length: response_length.try_into()
+                .map_err(|_| "negative web response length")?,
+        });
     }
-    Value::Array(rows)
+    Ok(rows)
 }
 
-/// Full headers + bodies for one webcap row. The response body is returned
-/// BOTH raw-lossy (for binary inspection) and, when it decodes to text,
-/// identity-decoded via the recorded Content-Encoding (DESIGN-web.md W2).
-pub fn webcap_detail(box_id: i64, row_id: i64) -> Value {
+/// Full headers + bodies for one webcap row. Stored response bytes are decoded
+/// to identity on this detail read via the recorded Content-Encoding; capture
+/// and summary listing never pay that cost (DESIGN-web.md W2).
+pub fn webcap_detail_typed(
+    box_id: i64,
+    row_id: u64,
+) -> Result<Option<crate::generated_wire::WebCaptureDetail>, String> {
+    use crate::generated_wire::{WebCaptureDetail, WebCaptureRow};
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return Value::Null;
+        return Ok(None);
     };
+    if !has_table(&conn, "webcap") { return Ok(None); }
+    let row_id = i64::try_from(row_id)
+        .map_err(|_| "web capture row id exceeds sqlite range")?;
     let row = conn.query_row(
         "SELECT id,ts,method,url,host,status,mime,req_headers,resp_headers,\
          req_body,resp_body,truncated FROM webcap WHERE id=?1",
-        [row_id],
-        |r| {
-            let resp_headers: String = r.get(8)?;
-            let req_body: Vec<u8> = r.get(9)?;
-            let resp_body: Vec<u8> = r.get(10)?;
-            let decoded = crate::net::webcap::decode_body(&resp_headers, &resp_body);
-            Ok(json!({
-                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, f64>(1)?,
-                "method": r.get::<_, String>(2)?,
-                "url": r.get::<_, String>(3)?,
-                "host": r.get::<_, String>(4)?,
-                "status": r.get::<_, i64>(5)?,
-                "mime": r.get::<_, String>(6)?,
-                "req_headers": r.get::<_, String>(7)?,
-                "resp_headers": resp_headers,
-                "req_body": String::from_utf8_lossy(&req_body),
-                "resp_body": String::from_utf8_lossy(&decoded),
-                "truncated": r.get::<_, i64>(11)?,
-            }))
-        }
-    );
-    row.unwrap_or(Value::Null)
+        [row_id], |row| Ok((
+            row.get::<_, i64>(0)?, row.get::<_, f64>(1)?,
+            row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?, row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?, row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?, row.get::<_, Vec<u8>>(9)?,
+            row.get::<_, Vec<u8>>(10)?, row.get::<_, i64>(11)?,
+        )));
+    let (id, time, method, url, host, status, mime, request_headers,
+         response_headers, request_body, response_body, truncated) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(format!("read web capture detail: {error}")),
+    };
+    let response_length = response_body.len().try_into()
+        .map_err(|_| "web response length exceeds u64")?;
+    let response_body = crate::net::webcap::decode_body(&response_headers, &response_body);
+    Ok(Some(WebCaptureDetail {
+        summary: WebCaptureRow {
+            id: id.try_into().map_err(|_| "negative web capture row id")?,
+            time,
+            method: relation_short_text(&method)?,
+            url: relation_text(&url)?,
+            host: relation_text(&host)?,
+            status: status.try_into().map_err(|_| "web status exceeds u16")?,
+            mime: relation_text(&mime)?,
+            truncated: relation_sql_bool("web truncation", truncated)?,
+            request_length: request_body.len().try_into()
+                .map_err(|_| "web request length exceeds u64")?,
+            response_length,
+        },
+        request_headers: relation_blob(request_headers.into_bytes())?,
+        response_headers: relation_blob(response_headers.into_bytes())?,
+        request_body: relation_blob(request_body)?,
+        response_body: relation_blob(response_body)?,
+    }))
 }
 
-/// The RAW, identity-decoded response body bytes for one webcap row, base64
-/// so JSON can carry binary (images) losslessly — the lossy-UTF8 `resp_body`
-/// in `webcap_detail` corrupts non-text. Feeds the standalone image viewer
-/// (DESIGN-web.md W8). Returns `{ "mime": ..., "b64": ... }`, or Null.
-pub fn webcap_body(box_id: i64, row_id: i64) -> Value {
-    use base64::Engine;
+/// Identity-decoded response bytes for the standalone image viewer. The typed
+/// result remains bytes; only the temporary JSON listener projection applies
+/// base64 (DESIGN-web.md W8).
+pub fn webcap_body_typed(
+    box_id: i64,
+    row_id: u64,
+) -> Result<Option<crate::generated_wire::WebCaptureBody>, String> {
+    use crate::generated_wire::WebCaptureBody;
     let db = sqlar_path(box_id);
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return Value::Null;
+        return Ok(None);
     };
-    conn.query_row(
+    if !has_table(&conn, "webcap") { return Ok(None); }
+    let row_id = i64::try_from(row_id)
+        .map_err(|_| "web capture row id exceeds sqlite range")?;
+    let row = conn.query_row(
         "SELECT mime,resp_headers,resp_body FROM webcap WHERE id=?1",
-        [row_id],
-        |r| {
-            let mime: String = r.get(0)?;
-            let resp_headers: String = r.get(1)?;
-            let resp_body: Vec<u8> = r.get(2)?;
-            let decoded = crate::net::webcap::decode_body(&resp_headers, &resp_body);
-            Ok(json!({
-                "mime": mime,
-                "b64": base64::engine::general_purpose::STANDARD.encode(&decoded),
-            }))
-        }
-    ).unwrap_or(Value::Null)
+        [row_id], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        )));
+    let (mime, response_headers, response_body) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(format!("read web capture body: {error}")),
+    };
+    let body = crate::net::webcap::decode_body(&response_headers, &response_body);
+    Ok(Some(WebCaptureBody {
+        mime: relation_text(&mime)?,
+        body: relation_blob(body)?,
+    }))
+}
+
+pub fn webcap_rows_json(rows: &[crate::generated_wire::WebCaptureRow]) -> Value {
+    Value::Array(rows.iter().map(|row| json!({
+        "id": row.id, "ts": row.time, "method": row.method.as_str(),
+        "url": row.url.as_str(), "host": row.host.as_str(), "status": row.status,
+        "mime": row.mime.as_str(), "truncated": if row.truncated { 1 } else { 0 },
+        "req_len": row.request_length, "resp_len": row.response_length,
+    })).collect())
+}
+
+pub fn webcap_detail_json(row: &crate::generated_wire::WebCaptureDetail) -> Value {
+    json!({
+        "id": row.summary.id, "ts": row.summary.time,
+        "method": row.summary.method.as_str(), "url": row.summary.url.as_str(),
+        "host": row.summary.host.as_str(), "status": row.summary.status,
+        "mime": row.summary.mime.as_str(),
+        "req_headers": String::from_utf8_lossy(row.request_headers.as_slice()),
+        "resp_headers": String::from_utf8_lossy(row.response_headers.as_slice()),
+        "req_body": String::from_utf8_lossy(row.request_body.as_slice()),
+        "resp_body": String::from_utf8_lossy(row.response_body.as_slice()),
+        "truncated": if row.summary.truncated { 1 } else { 0 },
+    })
+}
+
+pub fn webcap_body_json(row: &crate::generated_wire::WebCaptureBody) -> Value {
+    use base64::Engine as _;
+    json!({
+        "mime": row.mime.as_str(),
+        "b64": base64::engine::general_purpose::STANDARD.encode(row.body.as_slice()),
+    })
 }
 
 /// One replayed response: the RAW stored bytes + verbatim headers of the
@@ -908,6 +1065,54 @@ mod relation_row_tests {
         assert_eq!(environment_json(&environment), json!({"A": "1", "PATH": "/bin"}));
         assert!(relation_environment(Some(r#"{"A":1}"#)).is_err());
         assert_eq!(environment_json(&relation_environment(None).unwrap()), json!({}));
+    }
+
+    #[test]
+    fn api_and_web_bytes_project_only_at_the_listener_boundary() {
+        use base64::Engine as _;
+        use crate::generated_wire::{ApiLogDetail, ApiLogRow, WebCaptureBody,
+            WebCaptureDetail, WebCaptureRow};
+
+        let api = ApiLogRow {
+            id: 3, time: 1.0, method: relation_short_text("POST").unwrap(),
+            path: relation_text("/v1/chat").unwrap(), model: relation_text("m").unwrap(),
+            status: 200, streaming: true, request_length: 2, response_length: 3,
+        };
+        assert_eq!(api_log_rows_json(&[api.clone()]), json!([{
+            "id": 3, "ts": 1.0, "method": "POST", "path": "/v1/chat", "model": "m",
+            "status": 200, "stream": 1, "req_len": 2, "resp_len": 3,
+        }]));
+        let api_detail = ApiLogDetail {
+            summary: api, request: relation_blob(b"{}".to_vec()).unwrap(),
+            response: relation_blob(b"yes".to_vec()).unwrap(),
+        };
+        assert_eq!(api_log_detail_json(&api_detail)["resp"], "yes");
+
+        let web = WebCaptureRow {
+            id: 4, time: 2.0, method: relation_short_text("GET").unwrap(),
+            url: relation_text("https://x/").unwrap(), host: relation_text("x").unwrap(),
+            status: 200, mime: relation_text("image/png").unwrap(), truncated: false,
+            request_length: 0, response_length: 3,
+        };
+        let web_detail = WebCaptureDetail {
+            summary: web.clone(), request_headers: relation_blob(vec![]).unwrap(),
+            response_headers: relation_blob(b"x: y".to_vec()).unwrap(),
+            request_body: relation_blob(vec![]).unwrap(),
+            response_body: relation_blob(vec![0, 1, 255]).unwrap(),
+        };
+        assert_eq!(webcap_rows_json(&[web]), json!([{
+            "id": 4, "ts": 2.0, "method": "GET", "url": "https://x/", "host": "x",
+            "status": 200, "mime": "image/png", "truncated": 0,
+            "req_len": 0, "resp_len": 3,
+        }]));
+        assert_eq!(webcap_detail_json(&web_detail)["resp_headers"], "x: y");
+        let body = WebCaptureBody {
+            mime: relation_text("image/png").unwrap(),
+            body: relation_blob(vec![0, 1, 255]).unwrap(),
+        };
+        assert_eq!(webcap_body_json(&body)["b64"],
+            base64::engine::general_purpose::STANDARD.encode([0, 1, 255]));
+        assert!(relation_sql_bool("test", 2).is_err());
     }
 }
 

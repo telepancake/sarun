@@ -1458,6 +1458,36 @@ fn dispatch_action(
                 .map_err(|error| format!("build edge rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::BuildEdges { value: rows })
         }
+        ActionRequest::ApiLog { sid } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::wire::BoundedVec::new(discover::api_log_typed(id)?)
+                .map_err(|error| format!("API log rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::ApiLog { value })
+        }
+        ActionRequest::ApiLogDetail { sid, row } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::ApiLogDetail {
+                value: discover::api_log_detail_typed(id, row)?,
+            })
+        }
+        ActionRequest::Webcap { sid } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::wire::BoundedVec::new(discover::webcap_typed(id)?)
+                .map_err(|error| format!("web capture rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::Webcap { value })
+        }
+        ActionRequest::WebcapDetail { sid, row } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::WebcapDetail {
+                value: discover::webcap_detail_typed(id, row)?,
+            })
+        }
+        ActionRequest::WebcapBody { sid, row } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::WebcapBody {
+                value: discover::webcap_body_typed(id, row)?,
+            })
+        }
         ActionRequest::ProcPipeline { sid, row } => {
             let id = existing_box_id(sid)?;
             Ok(ActionSuccess::ProcPipeline {
@@ -1815,6 +1845,14 @@ fn legacy_ui_action_reply(
         Ok(ActionSuccess::BuildEdges { value }) => {
             discover::build_edge_rows_json(value.as_slice())
         }
+        Ok(ActionSuccess::ApiLog { value }) => discover::api_log_rows_json(value.as_slice()),
+        Ok(ActionSuccess::ApiLogDetail { value }) => value.as_ref()
+            .map(discover::api_log_detail_json).unwrap_or(Value::Null),
+        Ok(ActionSuccess::Webcap { value }) => discover::webcap_rows_json(value.as_slice()),
+        Ok(ActionSuccess::WebcapDetail { value }) => value.as_ref()
+            .map(discover::webcap_detail_json).unwrap_or(Value::Null),
+        Ok(ActionSuccess::WebcapBody { value }) => value.as_ref()
+            .map(discover::webcap_body_json).unwrap_or(Value::Null),
         Ok(ActionSuccess::ProcPipeline { value })
         | Ok(ActionSuccess::OutputPipeline { value }) => value.as_ref()
             .map(discover::pipeline_summary_json).unwrap_or(Value::Null),
@@ -3043,34 +3081,44 @@ macro_rules! ui_verbs {
                 state, crate::generated_wire::ActionRequest::Outputs { sid: id },
             ));
         }
-        "api_log" => { match arg_sid(args) {
-            Some(id) => discover::api_log(id),
-            None => json!([]),
+        "api_log" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ApiLog { sid }));
         }
-        }
-        "api_log_detail" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
-            (Some(id), Some(rid)) => discover::api_log_detail(id, rid),
-            _ => Value::Null,
-        }
+        "api_log_detail" => {
+            let (Some(sid), Some(row)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid API log row"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ApiLogDetail { sid, row }));
         }
         // Web capture (DESIGN-web.md W4): summary rows + full detail, mirroring
         // api_log. Feeds the UI's Captures pane and the oaita web tools.
-        "webcap" => { match arg_sid(args) {
-            Some(id) => discover::webcap(id),
-            None => json!([]),
+        "webcap" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Webcap { sid }));
         }
-        }
-        "webcap_detail" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
-            (Some(id), Some(rid)) => discover::webcap_detail(id, rid),
-            _ => Value::Null,
-        }
+        "webcap_detail" => {
+            let (Some(sid), Some(row)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid web capture row"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::WebcapDetail { sid, row }));
         }
         // Raw (base64) response body of one capture — for the image viewer,
         // which needs lossless binary the lossy-UTF8 detail can't carry.
-        "webcap_body" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
-            (Some(id), Some(rid)) => discover::webcap_body(id, rid),
-            _ => Value::Null,
-        }
+        "webcap_body" => {
+            let (Some(sid), Some(row)) = (legacy_u64(args, 0), legacy_u64(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid web capture row"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::WebcapBody { sid, row }));
         }
         "brushprov" => {
             let Some(id) = arg_sid(args).and_then(|id| u64::try_from(id).ok()) else {

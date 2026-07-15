@@ -689,6 +689,15 @@ belong to the relation.
   outer listener projection. Focused conversion/projection tests and the full
   native aarch64-musl suite pass: 304 tests passed and one existing browser
   e2e test remained ignored.
+- Moved `api_log`, `api_log_detail`, `webcap`, `webcap_detail`, and
+  `webcap_body` onto generated request/success variants and deleted their
+  JSON-producing database handlers. Summary reads construct bounded typed
+  rows without touching bodies; detail reads retain bounded bytes, and web
+  Content-Encoding is decoded only when detail/body is requested. Base64 and
+  lossy text conversion are now confined to the temporary outer JSON listener
+  projection. Stored booleans, numeric ranges, body bounds, and database errors
+  fail closed. Focused projection tests and the full native aarch64-musl suite
+  pass: 305 tests passed and one existing browser e2e test remained ignored.
 
 ## Stop conditions
 
