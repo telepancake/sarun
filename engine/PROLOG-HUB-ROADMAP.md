@@ -891,6 +891,16 @@ belong to the relation.
   one strict conversion at its boundary rather than JSON reads throughout
   registration. The full native aarch64-musl suite passes 308 tests with one
   existing browser e2e test ignored.
+- Moved registration output onto the generated `RegisterReply`, `OciRuntime`,
+  and `SudRuntime` records. Paths and process-facing strings remain bytes,
+  DNS and owner identity have fixed binary widths, collections retain their
+  distinct schema bounds, malformed stored OCI metadata now fails explicitly,
+  and the implementation no longer assembles or mutates a JSON reply. The
+  temporary newline listener projects the old spelling only at its boundary;
+  that projection has direct coverage until the runner and listener switch to
+  `ConnectionMode::Box`. The native aarch64-musl build and registration tests
+  pass; the checkpoint's full suite has 310 passing tests with one existing
+  browser e2e test ignored.
 
 ## Stop conditions
 

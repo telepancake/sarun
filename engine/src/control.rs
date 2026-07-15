@@ -1130,7 +1130,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
     match t {
         "subscribe" => json!({"ok": true, "_subscribe": true}),
         "register" => match legacy_register_request(msg) {
-            Ok(request) => register(state, &request, None, None, None),
+            Ok(request) => legacy_register_reply(register(state, &request, None, None, None)),
             Err(error) => json!({"ok": false, "error": error}),
         },
         "select" => {
@@ -3888,6 +3888,57 @@ fn legacy_register_request(msg: &Value)
     })
 }
 
+fn legacy_register_reply(
+    result: Result<crate::generated_wire::RegisterReply, String>,
+) -> Value {
+    use crate::generated_wire::RegisterReply;
+    let RegisterReply {
+        mount, shared_memory, dns, ca_bundle, owner, r#box, name,
+        capture, api, no_host, oci, sud,
+    } = match result {
+        Ok(reply) => reply,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+    let bytes = |value: crate::generated_wire::OsString| legacy_bytes(value);
+    let oci = oci.map(|runtime| json!({
+        "env": runtime.environment.map(|values|
+            values.into_inner().into_iter().map(&bytes).collect::<Vec<_>>()),
+        "cwd": runtime.cwd.map(legacy_bytes),
+        "cmd": runtime.command.map(|values|
+            values.into_inner().into_iter().map(&bytes).collect::<Vec<_>>()),
+        "entrypoint": runtime.entrypoint.map(|values|
+            values.into_inner().into_iter().map(&bytes).collect::<Vec<_>>()),
+        "user": runtime.user.map(legacy_bytes),
+    }));
+    let mut reply = json!({
+        "ok": true,
+        "mount": legacy_bytes(mount),
+        "shm_dir": legacy_bytes(shared_memory),
+        "dns_ip": dns.map(|address|
+            std::net::Ipv4Addr::from(address.0).to_string()).unwrap_or_default(),
+        "ca_pem": ca_bundle.map(legacy_bytes).unwrap_or_default(),
+        "owner_token": owner.0.iter().map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        "box_id": r#box,
+        "session_id": r#box.to_string(),
+        "name": name.into_inner(),
+        "capture": capture,
+        "api": api,
+        "no_host": no_host,
+        "_box_sid": r#box,
+    });
+    if let Some(oci) = oci {
+        reply["oci"] = oci;
+    }
+    if let Some(runtime) = sud {
+        reply["sud_upper"] = json!(legacy_bytes(runtime.upper));
+        reply["sud_lowers"] = json!(runtime.lowers.into_inner().into_iter()
+            .map(legacy_bytes).collect::<Vec<_>>());
+        reply["sud_ir_key"] = json!(runtime.inramfs_key.into_inner());
+    }
+    reply
+}
+
 /// The runner register handshake. Mints a box_id, creates the backing sentinel
 /// (live/<id>/up) and the box's sqlar (root process row from the message's
 /// prov), registers the box on the overlay, and acks with the <mnt>/<id> bind
@@ -3908,14 +3959,14 @@ fn register(
     peer_pidfd: Option<i32>,
     fd2_raw: Option<i32>,
     fd3_raw: Option<i32>,
-) -> Value {
+) -> Result<crate::generated_wire::RegisterReply, String> {
     use crate::generated_wire::{NetMode, RegistrationName, RunBackend, TransportRequest};
     let TransportRequest::Register {
         command: _, provenance, name: registration_name, backend, net_mode,
         capture, direct, capture_environment, brush, api, web_capture,
         web_filter, replay_from, no_parent, readonly_parent,
     } = request else {
-        return json!({"ok": false, "error": "expected register request"});
+        return Err("expected register request".into());
     };
     // Assign the post-pidfd SCM_RIGHTS fds to roles from the message. The
     // runner sends them in a fixed order: [tap (if net_mode==tap)] then
@@ -3952,7 +4003,7 @@ fn register(
                 libc::close(fd);
             }
         }
-        return json!({"ok": false, "error": "overlay mount is not available"});
+        return Err("overlay mount is not available".into());
     };
     // Runner host pid: from the pidfd if sent (correct for nested runners whose
     // own getpid() is a parent-namespace pid); else the claimed tgid (top-level).
@@ -3979,8 +4030,7 @@ fn register(
                     libc::close(fd);
                 }
             }
-            return json!({"ok": false,
-                "error": "invalid relname: must be a single NAME segment"});
+            return Err("invalid relname: must be a single NAME segment".into());
         }
         match derive_parent_box(state, host_pid) {
             Some(p) => parent = Some(p),
@@ -3990,8 +4040,7 @@ fn register(
                         libc::close(fd);
                     }
                 }
-                return json!({"ok": false,
-                    "error": "relname supplied but no enclosing box found"});
+                return Err("relname supplied but no enclosing box found".into());
             }
         }
         if !rel.is_empty() {
@@ -4012,8 +4061,7 @@ fn register(
                             libc::close(fd);
                         }
                     }
-                    return json!({"ok": false,
-                        "error": format!("parent box '{prefix}' does not exist")});
+                    return Err(format!("parent box '{prefix}' does not exist"));
                 }
             }
         } else {
@@ -4040,7 +4088,7 @@ fn register(
                 libc::close(fd);
             }
         }
-        return json!({"ok": false, "error": "slopbox is already running"});
+        return Err("slopbox is already running".into());
     }
     let live_max = ov.box_ids().into_iter().max().unwrap_or(0);
     let id =
@@ -4063,7 +4111,7 @@ fn register(
                 libc::close(fd);
             }
         }
-        return json!({"ok": false, "error": format!("backing: {e}")});
+        return Err(format!("backing: {e}"));
     }
     let b = match crate::capture::BoxState::create(id) {
         Ok(b) => b,
@@ -4073,7 +4121,7 @@ fn register(
                     libc::close(fd);
                 }
             }
-            return json!({"ok": false, "error": format!("sqlar: {e}")});
+            return Err(format!("sqlar: {e}"));
         }
     };
     // RERUN: reopen the existing box's recorded state so prior writes show
@@ -4108,7 +4156,7 @@ fn register(
                     libc::close(fd);
                 }
             }
-            return json!({"ok": false, "error": format!("sud upper: {e}")});
+            return Err(format!("sud upper: {e}"));
         }
         b.set_meta("sud", "1");
     }
@@ -4146,9 +4194,9 @@ fn register(
                         libc::close(fd);
                     }
                 }
-                return json!({"ok": false, "error": format!(
+                return Err(format!(
                     "sud nesting is same-in-same: enclosing box {enc} is \
-                     not a sud box (see engine/DESIGN-sud.md)")});
+                     not a sud box (see engine/DESIGN-sud.md)"));
             }
         }
     }
@@ -4177,8 +4225,7 @@ fn register(
                             libc::close(fd);
                         }
                     }
-                    return json!({"ok": false,
-                        "error": format!("sud lower export: {e}")});
+                    return Err(format!("sud lower export: {e}"));
                 }
             }
         }
@@ -4200,9 +4247,9 @@ fn register(
                         libc::close(fd);
                     }
                 }
-                return json!({"ok": false, "error": format!(
+                return Err(format!(
                     "sud nesting is same-in-same: ancestor box {aid} is \
-                     not a sud box (see engine/DESIGN-sud.md)")});
+                     not a sud box (see engine/DESIGN-sud.md)"));
             }
             if lock(state).box_pids.contains_key(&aid) {
                 match crate::sud::layers(aid) {
@@ -4216,9 +4263,9 @@ fn register(
                                 libc::close(fd);
                             }
                         }
-                        return json!({"ok": false, "error": format!(
+                        return Err(format!(
                             "running sud box {aid} has no recorded layer \
-                             list (engine restarted under it?)")});
+                             list (engine restarted under it?)"));
                     }
                 }
             }
@@ -4231,8 +4278,7 @@ fn register(
                             libc::close(fd);
                         }
                     }
-                    return json!({"ok": false,
-                        "error": format!("sud lower export: {e}")});
+                    return Err(format!("sud lower export: {e}"));
                 }
             }
             cur = bx.parent;
@@ -4248,7 +4294,7 @@ fn register(
                     libc::close(fd);
                 }
             }
-            return json!({"ok": false, "error": format!("sud upper: {e}")});
+            return Err(format!("sud upper: {e}"));
         }
         // Record this box's full layer list (upper-first) so a nested
         // launch while WE are running can flatten against it.
@@ -4271,7 +4317,7 @@ fn register(
         Ok(()) => (),
         Err(error) => {
             if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
-            return json!({"ok": false, "error": error});
+            return Err(error);
         }
     }
     {
@@ -4341,7 +4387,7 @@ fn register(
     // creates no netns/device, so there is no netns_path.
     let replay_from = match *replay_from {
         Some(value) if i64::try_from(value).is_err() => {
-            return json!({"ok": false, "error": "replay box id exceeds engine range"});
+            return Err("replay box id exceeds engine range".into());
         }
         value => value,
     };
@@ -4362,39 +4408,67 @@ fn register(
     // image's User — without which `sarun img -- /bin/sh` would inherit
     // the HOST's PATH (pointing at host bins that don't exist in a closed
     // box) and the HOST's cwd (likely a path outside the image).
-    let oci = oci_runtime_from_chain(&boxes, parent);
-    let mut reply = json!({
-        "ok": true, "mount": root.to_string_lossy(),
-        "shm_dir": backing.to_string_lossy(),
-        "dns_ip": dns_ip,
-        "ca_pem": ca_pem,
-        "owner_token": format!("{:032x}", std::process::id() as u128
-                               ^ (id as u128) << 64
-                               ^ std::time::SystemTime::now()
-                                 .duration_since(std::time::UNIX_EPOCH)
-                                 .map(|d| d.as_nanos()).unwrap_or(0)),
-        "box_id": id, "session_id": id.to_string(), "name": name,
-        "capture": want_capture,      // sinks + live echo mux active (off for -t/-d)
-        "api": want_api,              // proxy admits this box; inner serves the in-box UDS
-        "no_host": no_host,           // chain is closed — no host fs underneath
-        "_box_sid": id,               // caller marker: this conn is now the box channel
-    });
-    if let Some(o) = oci {
-        reply["oci"] = o;
-    }
-    if want_sud {
-        reply["sud_upper"] = json!(backing.join("sud-up").to_string_lossy());
-        reply["sud_lowers"] = json!(sud_lowers);
-        reply["sud_ir_key"] = json!(
-            lock(state)
-                .overlay
-                .clone()
-                .and_then(|o| o.live_box(id))
-                .and_then(|bx| bx.get_meta("sud_ir_key"))
-                .unwrap_or_default()
-        );
-    }
-    reply
+    let oci = oci_runtime_from_chain(&boxes, parent)?;
+    let bounded_path = |value: &std::path::Path, field: &str| {
+        crate::wire::BoundedBytes::new(value.as_os_str().as_bytes().to_vec())
+            .map_err(|error| format!("{field} exceeds relation bound: {error:?}"))
+    };
+    let dns = if dns_ip.is_empty() {
+        None
+    } else {
+        let address = dns_ip.parse::<std::net::Ipv4Addr>()
+            .map_err(|error| format!("invalid generated DNS address {dns_ip:?}: {error}"))?;
+        Some(crate::wire::FixedBytes(address.octets()))
+    };
+    let ca_bundle = if ca_pem.is_empty() {
+        None
+    } else {
+        Some(crate::wire::BoundedBytes::new(ca_pem.into_bytes())
+            .map_err(|error| format!("CA bundle exceeds relation bound: {error:?}"))?)
+    };
+    let owner = std::process::id() as u128
+        ^ (id as u128) << 64
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+    let sud = if want_sud {
+        let lowers = sud_lowers.into_iter().map(|value| {
+            crate::wire::BoundedBytes::new(
+                std::ffi::OsStr::new(&value).as_bytes().to_vec())
+                .map_err(|error| format!("sud lower exceeds relation bound: {error:?}"))
+        }).collect::<Result<Vec<_>, String>>()?;
+        Some(crate::generated_wire::SudRuntime {
+            upper: bounded_path(&backing.join("sud-up"), "sud upper")?,
+            lowers: crate::wire::BoundedVec::new(lowers)
+                .map_err(|error| format!("sud lower count exceeds relation bound: {error:?}"))?,
+            inramfs_key: crate::wire::BoundedText::new(
+                lock(state)
+                    .overlay
+                    .clone()
+                    .and_then(|overlay| overlay.live_box(id))
+                    .and_then(|r#box| r#box.get_meta("sud_ir_key"))
+                    .unwrap_or_default())
+                .map_err(|error| format!("sud inramfs key exceeds relation bound: {error:?}"))?,
+        })
+    } else {
+        None
+    };
+    Ok(crate::generated_wire::RegisterReply {
+        mount: bounded_path(&root, "mount path")?,
+        shared_memory: bounded_path(&backing, "shared-memory path")?,
+        dns,
+        ca_bundle,
+        owner: crate::wire::FixedBytes(owner.to_be_bytes()),
+        r#box: u64::try_from(id).map_err(|_| "negative box id".to_string())?,
+        name: crate::wire::BoundedText::new(name)
+            .map_err(|error| format!("box name exceeds relation bound: {error:?}"))?,
+        capture: want_capture,
+        api: want_api,
+        no_host,
+        oci,
+        sud,
+    })
 }
 
 /// Walk the parent chain looking for an `oci_config` meta entry (stamped by
@@ -4405,20 +4479,20 @@ fn register(
 fn oci_runtime_from_chain(
     boxes: &std::collections::BTreeMap<i64, discover::Box_>,
     parent: Option<i64>,
-) -> Option<Value> {
+) -> Result<Option<crate::generated_wire::OciRuntime>, String> {
     let mut cur = parent;
     let mut seen = std::collections::HashSet::new();
     while let Some(id) = cur {
         if !seen.insert(id) {
-            return None;
+            return Ok(None);
         }
-        let b = boxes.get(&id)?;
+        let Some(b) = boxes.get(&id) else { return Ok(None) };
         if let Some(cfg_json) = b.meta.get("oci_config") {
             return parse_oci_runtime(cfg_json);
         }
         cur = b.parent;
     }
-    None
+    Ok(None)
 }
 
 /// True if any ancestor in the parent chain (starting at `parent`) is marked
@@ -4451,30 +4525,53 @@ fn chain_has_no_host(
 /// JSON. We don't link `oci_spec` here on purpose — those fields are stable
 /// across the OCI spec versions and a hand-rolled extractor avoids dragging
 /// the dep into control.rs just to read five fields.
-fn parse_oci_runtime(cfg_json: &str) -> Option<Value> {
-    let v: Value = serde_json::from_str(cfg_json).ok()?;
-    let inner = v.get("config")?;
-    let mut out = serde_json::Map::new();
-    if let Some(env) = inner.get("Env") {
-        out.insert("env".into(), env.clone());
-    }
-    if let Some(cwd) = inner.get("WorkingDir") {
-        out.insert("cwd".into(), cwd.clone());
-    }
-    if let Some(cmd) = inner.get("Cmd") {
-        out.insert("cmd".into(), cmd.clone());
-    }
-    if let Some(ep) = inner.get("Entrypoint") {
-        out.insert("entrypoint".into(), ep.clone());
-    }
-    if let Some(u) = inner.get("User") {
-        out.insert("user".into(), u.clone());
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(Value::Object(out))
-    }
+fn parse_oci_runtime(cfg_json: &str)
+    -> Result<Option<crate::generated_wire::OciRuntime>, String>
+{
+    use crate::generated_wire::OciRuntime;
+    let value: Value = serde_json::from_str(cfg_json)
+        .map_err(|error| format!("invalid stored OCI config: {error}"))?;
+    let Some(config) = value.get("config") else { return Ok(None) };
+    let strings = |name: &str| -> Result<Option<Vec<crate::generated_wire::OsString>>, String> {
+        config.get(name).map(|value| {
+            let values = value.as_array().ok_or_else(|| format!("OCI {name} is not an array"))?
+                .iter().map(|value| {
+                    let value = value.as_str().ok_or_else(|| format!("OCI {name} item is not text"))?;
+                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                        .map_err(|error| format!("OCI {name} item exceeds relation bound: {error:?}"))
+                }).collect::<Result<Vec<_>, String>>()?;
+            Ok(values)
+        }).transpose()
+    };
+    let bytes = |name: &str| -> Result<Option<_>, String> {
+        config.get(name).map(|value| {
+            let value = value.as_str().ok_or_else(|| format!("OCI {name} is not text"))?;
+            crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                .map_err(|error| format!("OCI {name} exceeds relation bound: {error:?}"))
+        }).transpose()
+    };
+    let runtime = OciRuntime {
+        environment: strings("Env")?.map(|values|
+            crate::wire::BoundedVec::<_, 0,
+                { crate::generated_wire::LIMIT_ENVIRONMENT_ENTRIES }>::new(values)
+                .map_err(|error| format!("OCI Env exceeds relation bound: {error:?}")))
+            .transpose()?,
+        cwd: bytes("WorkingDir")?,
+        command: strings("Cmd")?.map(|values|
+            crate::wire::BoundedVec::<_, 0,
+                { crate::generated_wire::LIMIT_COMMAND_ITEMS }>::new(values)
+                .map_err(|error| format!("OCI Cmd exceeds relation bound: {error:?}")))
+            .transpose()?,
+        entrypoint: strings("Entrypoint")?.map(|values|
+            crate::wire::BoundedVec::<_, 0,
+                { crate::generated_wire::LIMIT_COMMAND_ITEMS }>::new(values)
+                .map_err(|error| format!("OCI Entrypoint exceeds relation bound: {error:?}")))
+            .transpose()?,
+        user: bytes("User")?,
+    };
+    let empty = runtime.environment.is_none() && runtime.cwd.is_none()
+        && runtime.command.is_none() && runtime.entrypoint.is_none() && runtime.user.is_none();
+    Ok((!empty).then_some(runtime))
 }
 
 /// Equip a `-n` box's netns and start its smoltcp stack.
@@ -6414,7 +6511,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         // below and frames::FRAME_API_{OPEN,DATA,CLOSE}.
         let mut reply = if msg.get("type").and_then(Value::as_str) == Some("register") {
             match legacy_register_request(&msg) {
-                Ok(request) => register(
+                Ok(request) => legacy_register_reply(register(
                     &state,
                     &request,
                     peer_pidfd.take(),
@@ -6422,7 +6519,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                         <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
                     peer_thirdfd.take().map(|fd|
                         <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
-                ),
+                )),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_nested") {
@@ -7918,6 +8015,53 @@ mod verb_tests {
         let reply = legacy_control_reply(ActionSuccess::Sudtrace { value: trace });
         assert_eq!(reply["events"][0]["kind"], "42");
         assert_eq!(reply["events"][0]["text"], "future");
+    }
+
+    #[test]
+    fn typed_registration_reply_projects_only_at_the_legacy_boundary() {
+        use crate::generated_wire::{OciRuntime, RegisterReply, SudRuntime};
+        let raw = |value: &[u8]| crate::wire::BoundedBytes::new(value.to_vec()).unwrap();
+        let reply = legacy_register_reply(Ok(RegisterReply {
+            mount: raw(b"/mnt/7"),
+            shared_memory: raw(b"/run/sarun/7"),
+            dns: Some(crate::wire::FixedBytes([240, 0, 0, 1])),
+            ca_bundle: Some(crate::wire::BoundedBytes::new(b"certificate".to_vec()).unwrap()),
+            owner: crate::wire::FixedBytes([0xab; 16]),
+            r#box: 7,
+            name: crate::wire::BoundedText::new("build".into()).unwrap(),
+            capture: true,
+            api: false,
+            no_host: true,
+            oci: Some(OciRuntime {
+                environment: Some(crate::wire::BoundedVec::new(vec![raw(b"PATH=/bin")]).unwrap()),
+                cwd: Some(raw(b"/work")),
+                command: Some(crate::wire::BoundedVec::new(vec![raw(b"make")]).unwrap()),
+                entrypoint: None,
+                user: Some(raw(b"1000:1000")),
+            }),
+            sud: Some(SudRuntime {
+                upper: raw(b"/upper"),
+                lowers: crate::wire::BoundedVec::new(vec![raw(b"/lower")]).unwrap(),
+                inramfs_key: crate::wire::BoundedText::new("key".into()).unwrap(),
+            }),
+        }));
+        assert_eq!(reply["mount"], "/mnt/7");
+        assert_eq!(reply["dns_ip"], "240.0.0.1");
+        assert_eq!(reply["owner_token"], "ab".repeat(16));
+        assert_eq!(reply["oci"]["env"][0], "PATH=/bin");
+        assert_eq!(reply["sud_lowers"][0], "/lower");
+        assert_eq!(reply["_box_sid"], 7);
+    }
+
+    #[test]
+    fn stored_oci_runtime_is_materialized_as_a_closed_type() {
+        let runtime = parse_oci_runtime(
+            r#"{"config":{"Env":["A=B"],"WorkingDir":"/work","Cmd":["make"]}}"#,
+        ).unwrap().unwrap();
+        assert_eq!(legacy_bytes(runtime.cwd.unwrap()), "/work");
+        assert_eq!(legacy_bytes(runtime.command.unwrap().into_inner().remove(0)), "make");
+        assert!(parse_oci_runtime(r#"{"config":{"Cmd":"make"}}"#).is_err());
+        assert!(parse_oci_runtime("not json").is_err());
     }
 
     #[test]
