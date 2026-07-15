@@ -86,10 +86,11 @@ transport request definition for them. Subscription events carry only the box,
 row, count, path, or state needed to invalidate a view. They do not copy full
 provenance or trace records into the event stream.
 
-Action replies will use concrete per-handler result schemas from the action
-relation. There is deliberately no generic recursive binary `Value`: encoding
-the old JSON object model with numeric tags would leave result meaning in Rust
-and create a schema-less alternate authority.
+Action declarations now carry concrete per-handler request and result schemas.
+There is deliberately no generic recursive binary `Value`: encoding the old
+JSON object model with numeric tags would leave meaning in Rust and create a
+schema-less alternate authority. The remaining cutover replaces the current
+JSON handler values with generated types and codecs from those declarations.
 
 Registration's descriptor tail is relationally exact: pidfd is required; TAP
 is required exactly when `net_mode=tap`; and the sud trace pipe is required

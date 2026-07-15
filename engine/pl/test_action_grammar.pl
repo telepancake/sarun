@@ -86,12 +86,12 @@ run_test(wire_identities_are_explicit_unique_and_normalized) :-
     length(UniqueHandlers, 95),
     expect(all_wire_handlers_are_actions(Handlers)),
     expect(all_wire_results_are_concrete(Rows)),
+    expect(all_wire_requests_are_concrete(Handlers)),
     once(representation(mirror_resume, wire, Wire)),
     expect_equal(
         Wire,
         wire(62, mirror_pause, ui,
-             [arg(id, integer, required, scalar),
-              arg(paused, boolean, required, scalar)],
+             [field(id, job_id), field(paused, bool)],
              unit)),
     expect(\+ representation(mirror_browse, wire, _)).
 
@@ -105,9 +105,11 @@ run_test(representations_project_the_executable_forms) :-
                 argument(arg(id, integer, required, scalar))]))),
     once(convert(action, mirror_resume, wire,
                  wire(62, mirror_pause, ui,
-                      [arg(id, integer, required, scalar),
-                       arg(paused, boolean, required, scalar)],
+                      [field(id, job_id), field(paused, bool)],
                       unit))),
+    once(representation(
+        mirror_resume, source_schema,
+        schema([arg(id, integer, required, scalar)]))),
     once(convert(verb, verb("mirror_resume", resume_false), help,
                  help("ID", "resume a mirror job"))),
     findall(Action, action(Action, _, _, _, _, _, _), Actions),
@@ -131,6 +133,12 @@ all_wire_results_are_concrete([_-_-Result|Rows]) :-
     valid_wire_type(Result),
     Result \= response,
     all_wire_results_are_concrete(Rows).
+
+all_wire_requests_are_concrete([]).
+all_wire_requests_are_concrete([Handler|Handlers]) :-
+    findall(Fields, wire_request_fields(Handler, Fields), [Fields]),
+    valid_wire_fields(Fields),
+    all_wire_requests_are_concrete(Handlers).
 
 all_valid([]).
 all_valid([Action|Actions]) :-

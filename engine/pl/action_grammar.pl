@@ -1,6 +1,7 @@
 :- module(action_grammar,
           [ action/7,
             wire_handler/3,
+            wire_request_fields/2,
             wire_protocol_version/1,
             wire_limit/2,
             wire_type/2,
@@ -12,6 +13,7 @@
             wire_event/3,
             wire_frame/7,
             valid_wire_type/1,
+            valid_wire_fields/1,
             valid_transport_catalog/0,
             valid_action_catalog/0,
             representation/3,
@@ -102,6 +104,8 @@ all_wire_rows_valid :-
         ( \+ atom(Handler)
         ; \+ (integer(Code), Code > 0)
         ; \+ valid_wire_type(ResultType)
+        ; \+ (wire_request_fields(Handler, RequestFields),
+               valid_wire_fields(RequestFields))
         ; \+ (action(Handler, Handler, Target, _, _, _, _),
                (Target = ui ; Target = control))
         )).
@@ -211,11 +215,14 @@ representation(Action, cli, cli(Words, Normalizer)) :-
     form_literal_prefix(Specs, Words).
 representation(Action, syntax(Style), syntax(Specs)) :-
     action_form(Action, Style, Specs, _).
+representation(Action, source_schema, schema(Schema)) :-
+    action(Action, _, _, _, _, _, _),
+    argument_schema(Action, Schema).
 representation(Action, wire,
-               wire(Code, Handler, Target, Schema, ResultType)) :-
+               wire(Code, Handler, Target, RequestFields, ResultType)) :-
     action(Action, Handler, Target, _, _, _, _),
     wire_handler(Handler, Code, ResultType),
-    argument_schema(Handler, Schema).
+    wire_request_fields(Handler, RequestFields).
 representation(Action, help, help(Notation, Description)) :-
     action(Action, _, _, Notation, Description, _, _).
 representation(Action, key, key(Key, Context, Preference)) :-

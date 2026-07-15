@@ -6,6 +6,7 @@
             menu_label/2,
             argument_context/4,
             wire_handler/3,
+            wire_request_fields/2,
             visible_action/1
           ]).
 
@@ -239,6 +240,94 @@ wire_handler(apply, 128, action_mutation_result).
 wire_handler(discard, 129, action_mutation_result).
 wire_handler(rename, 130, rename_result).
 wire_handler(quit, 131, unit).
+
+% Concrete direct-binary request fields.  The ordinary argument schema above
+% describes source syntax; this projection names the semantic values after
+% parsing and context resolution.  Closed structured arguments have explicit
+% overrides.  In particular there is intentionally no default mapping for
+% `spec`: adding another structured action without a real type makes catalog
+% validation fail.
+wire_request_fields(Handler, Fields) :-
+    wire_handler(Handler, _, _),
+    ( wire_request_override(Handler, Fields)
+    -> true
+    ; argument_schema(Handler, Schema),
+      wire_argument_fields(Handler, Schema, Fields)
+    ).
+
+wire_request_override(ro_attach, [
+    field(box, box_id),
+    field(attachments, list(readonly_attachment, collection_items))
+]).
+wire_request_override('view.open', [
+    field(kind, view_kind),
+    field(box, box_id),
+    field(filter, option(filter_spec)),
+    field(running_only, bool)
+]).
+wire_request_override('view.filter', [
+    field(view, view_id),
+    field(filter, option(filter_spec))
+]).
+wire_request_override('oci.build', [field(spec, oci_build_spec)]).
+wire_request_override('oaita.probe', [field(spec, api_probe_spec)]).
+
+wire_argument_fields(_, [], []).
+wire_argument_fields(Handler, [Argument|Arguments],
+                     [field(Name, Type)|Fields]) :-
+    Argument = arg(Name, _, _, _),
+    wire_argument_type(Handler, Argument, Type),
+    wire_argument_fields(Handler, Arguments, Fields).
+
+wire_argument_type(Handler, arg(Name, Kind, required, _), Type) :-
+    wire_base_type(Handler, Name, Kind, Type).
+wire_argument_type(Handler, arg(Name, Kind, optional, _), option(Type)) :-
+    wire_base_type(Handler, Name, Kind, Type).
+wire_argument_type(Handler, arg(Name, Kind, repeated, _),
+                   list(Type, collection_items)) :-
+    wire_base_type(Handler, Name, Kind, Type).
+
+wire_base_type(_, sid, _, box_id) :- !.
+wire_base_type(_, parent_sid, _, box_id) :- !.
+wire_base_type(_, box, _, box_id) :- !.
+wire_base_type(_, name_or_id, _, box_selector) :- !.
+wire_base_type(_, rel, _, path) :- !.
+wire_base_type(_, path, _, path) :- !.
+wire_base_type(_, paths, _, path) :- !.
+wire_base_type(_, rels, _, path) :- !.
+wire_base_type(_, root, _, path) :- !.
+wire_base_type(_, store, _, path) :- !.
+wire_base_type(_, dest, _, path) :- !.
+wire_base_type(_, subpath, _, path) :- !.
+wire_base_type(_, prefix, _, path) :- !.
+wire_base_type(_, row, _, row_id) :- !.
+wire_base_type(_, output, _, row_id) :- !.
+wire_base_type(_, prov_id, _, row_id) :- !.
+wire_base_type(_, pipeline, _, row_id) :- !.
+wire_base_type(_, ids, _, row_id) :- !.
+wire_base_type(_, view, _, view_id) :- !.
+wire_base_type(_, job, _, job_id) :- !.
+wire_base_type(_, hunk_ix, _, u32) :- !.
+wire_base_type(_, frame, _, u64) :- !.
+wire_base_type(_, stream, _, u64) :- !.
+wire_base_type(_, start, _, u64) :- !.
+wire_base_type(_, size, _, u64) :- !.
+wire_base_type(_, limit, _, u64) :- !.
+wire_base_type(_, interval_secs, _, u64) :- !.
+wire_base_type(mirror_run, id, _, job_id) :- !.
+wire_base_type(mirror_pause, id, _, job_id) :- !.
+wire_base_type(mirror_rm, id, _, job_id) :- !.
+wire_base_type(_, from, _, provenance_domain) :- !.
+wire_base_type(_, to, _, provenance_domain) :- !.
+wire_base_type(_, verdict, _, prompt_verdict) :- !.
+wire_base_type('svc.up', name, _, service_name) :- !.
+wire_base_type(_, new, _, text(short_bytes)) :- !.
+wire_base_type(_, b64, _, bytes(blob_bytes)) :- !.
+wire_base_type(_, _, boolean, bool) :- !.
+wire_base_type(_, _, integer, u64) :- !.
+wire_base_type(_, _, path, path) :- !.
+wire_base_type(_, _, base64, bytes(blob_bytes)) :- !.
+wire_base_type(_, _, string, text(text_bytes)).
 
 % Explicit shell forms. `Normalizer` relates parsed source arguments to the
 % handler's wire arguments. Shared paths are intentional and resolved by the

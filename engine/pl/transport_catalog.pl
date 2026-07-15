@@ -10,6 +10,7 @@
             wire_event/3,
             wire_frame/7,
             valid_wire_type/1,
+            valid_wire_fields/1,
             valid_transport_catalog/0
           ]).
 
@@ -255,6 +256,76 @@ wire_type(oaita_status_kind, enum).
 wire_enum(oaita_status_kind, none,     1).
 wire_enum(oaita_status_kind, external, 2).
 wire_enum(oaita_status_kind, local,    3).
+
+wire_type(prompt_verdict, enum).
+wire_enum(prompt_verdict, yes_once,   1).
+wire_enum(prompt_verdict, no_once,    2).
+wire_enum(prompt_verdict, allow_save, 3).
+wire_enum(prompt_verdict, deny_save,  4).
+
+wire_type(provenance_domain, enum).
+wire_enum(provenance_domain, process,  1).
+wire_enum(provenance_domain, pipeline, 2).
+wire_enum(provenance_domain, edge,     3).
+
+wire_type(view_kind, enum).
+wire_enum(view_kind, changes,    1).
+wire_enum(view_kind, processes,  2).
+wire_enum(view_kind, outputs,    3).
+wire_enum(view_kind, pipelines,  4).
+wire_enum(view_kind, build_edges, 5).
+
+wire_type(filter_join, enum).
+wire_enum(filter_join, and, 1).
+wire_enum(filter_join, or,  2).
+
+wire_type(filter_kind, enum).
+wire_enum(filter_kind, path,   1).
+wire_enum(filter_kind, box,    2).
+wire_enum(filter_kind, exe,    3).
+wire_enum(filter_kind, cwd,    4).
+wire_enum(filter_kind, arg,    5).
+wire_enum(filter_kind, ids,    6).
+wire_enum(filter_kind, error,  7).
+wire_enum(filter_kind, command, 8).
+wire_enum(filter_kind, target,  9).
+
+wire_type(filter_clause, record([
+    field(kind, filter_kind),
+    field(pattern, text(text_bytes)),
+    field(join, filter_join),
+    field(negated, bool),
+    field(enabled, bool)
+])).
+wire_type(filter_spec, alias(list(filter_clause, collection_items))).
+
+wire_type(external_reference, record([
+    field(kind, text(short_bytes)),
+    field(store, path),
+    field(reference, text(text_bytes)),
+    field(revision, text(short_bytes)),
+    field(prefix, path),
+    field(name, text(text_bytes))
+])).
+wire_type(readonly_attachment, choice).
+wire_variant(readonly_attachment, box, 1, [field(box, box_id)]).
+wire_variant(readonly_attachment, external, 2,
+             [field(reference, external_reference)]).
+
+wire_type(oci_build_spec, record([
+    field(context_tar_gz, bytes(blob_bytes)),
+    field(dockerfile, bytes(blob_bytes)),
+    field(tag, option(text(text_bytes))),
+    field(net_mode, net_mode),
+    field(build_arguments,
+          map(text(text_bytes), text(text_bytes), environment_entries))
+])).
+
+wire_type(api_probe_spec, record([
+    field(base_url, text(text_bytes)),
+    field(model, text(text_bytes)),
+    field(api_key, text(text_bytes))
+])).
 
 wire_type(failure_kind, enum).
 wire_enum(failure_kind, edge,     1).
@@ -971,6 +1042,9 @@ valid_transport_catalog :-
 
 valid_wire_type(Type) :-
     valid_type(Type, []).
+
+valid_wire_fields(Fields) :-
+    valid_fields(Fields, []).
 
 all_limits_valid :-
     findall(Name-Value, wire_limit(Name, Value), Rows),

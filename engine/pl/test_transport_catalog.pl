@@ -85,7 +85,7 @@ run_test(actions_are_not_duplicated_as_transport_requests) :-
     expect(\+ wire_request(shutdown, _, _, _, _, _)),
     once(representation(sudtrace, wire,
                         wire(98, sudtrace, control,
-                             [arg(sid, string, required, scalar)],
+                             [field(sid, box_id)],
                              sud_trace_view))),
     once(representation(quit, wire,
                         wire(131, quit, control, [], unit))).
