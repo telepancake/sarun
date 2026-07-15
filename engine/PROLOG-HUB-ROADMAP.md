@@ -732,6 +732,13 @@ belong to the relation.
   wire retains arbitrary bytes, but the overlay's `String` key model must still
   be replaced before byte-path support is complete. The full native
   aarch64-musl suite passes 308 tests with one existing browser e2e test ignored.
+- Moved `delete`, `dissolve`, `apply_to_copy`, and `kill` onto generated
+  request/success variants. The duplicate JSON-returning lifecycle helpers are
+  gone: delete/dissolve share one typed `FreeResult`, parent-copy returns a
+  bounded `ApplyCopyResult`, and kill returns unit. Copy allocation now also
+  considers live overlay IDs. Existing parent-copy, copy-down, and dissolve UI
+  integration tests pass in the full native aarch64-musl suite: 308 passed and
+  one existing browser e2e test ignored.
 
 ## Stop conditions
 

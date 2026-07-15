@@ -1726,6 +1726,29 @@ fn dispatch_action(
                 overlay.box_path_kind(id, action_relative_path(&path)?))?;
             Ok(ActionSuccess::BoxPathKind { value })
         }
+        request @ (ActionRequest::Delete { sid } | ActionRequest::Dissolve { sid }) => {
+            let deleting = matches!(request, ActionRequest::Delete { .. });
+            let id = existing_box_id(sid)?;
+            let value = free_box_typed(state, id)?;
+            Ok(if deleting {
+                ActionSuccess::Delete { value }
+            } else {
+                ActionSuccess::Dissolve { value }
+            })
+        }
+        ActionRequest::ApplyToCopy { sid } => {
+            let id = existing_box_id(sid)?;
+            let boxes = discover::discover();
+            let value = apply_to_copy_typed(state, &boxes, id)?;
+            Ok(ActionSuccess::ApplyToCopy { value })
+        }
+        ActionRequest::Kill { sid } => {
+            let id = existing_box_id(sid)?;
+            let pidfd = lock(state).box_pids.get(&id).copied()
+                .ok_or("box not running")?;
+            pidfd_signal(pidfd, libc::SIGTERM);
+            Ok(ActionSuccess::Kill { value: () })
+        }
         ActionRequest::ViewOpen {
             kind,
             r#box,
@@ -2153,6 +2176,17 @@ fn legacy_ui_action_reply(
         Ok(ActionSuccess::BoxPathKind { value }) => {
             json!({"kind": legacy_path_kind(value)})
         }
+        Ok(ActionSuccess::Delete { value }) | Ok(ActionSuccess::Dissolve { value }) => json!({
+            "ok": true,
+            "reparented": value.reparented.into_inner(),
+        }),
+        Ok(ActionSuccess::ApplyToCopy { value }) => json!({
+            "ok": true,
+            "new_sid": value.r#box.to_string(),
+            "name": value.name.into_inner(),
+            "applied": value.applied,
+        }),
+        Ok(ActionSuccess::Kill { .. }) => json!({"ok": true}),
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -2319,10 +2353,6 @@ fn reap(state: &State, id: i64) {
 /// BoxState (connection + RAM mirror) when the child is running, so a mounted
 /// FUSE view keeps serving the right bytes — no rival on-disk handle racing
 /// the serve thread.
-fn dissolve(state: &State, id: i64) -> Value {
-    free_box(state, id)
-}
-
 /// Free box `id`, KEEPING any boxes stacked on it — the shared core of
 /// `dissolve` and `delete` (two names for the same operation). Whatever the
 /// box contributed to its children's merged view is copied DOWN into each
@@ -2335,11 +2365,12 @@ fn dissolve(state: &State, id: i64) -> Value {
 /// A running box is refused when work needs its blobs stable (a copy-down to
 /// children). A leaf delete (no children) is a plain reap and may proceed
 /// even while running.
-fn free_box(state: &State, id: i64) -> Value {
+fn free_box_typed(
+    state: &State,
+    id: i64,
+) -> Result<crate::generated_wire::FreeResult, String> {
     let boxes = discover::discover();
-    let Some(me) = boxes.get(&id) else {
-        return json!({"ok": false, "error": "no slopbox"});
-    };
+    let me = boxes.get(&id).ok_or("no slopbox")?;
     let grandparent = me.parent;
     let children: Vec<i64> = boxes
         .values()
@@ -2347,7 +2378,7 @@ fn free_box(state: &State, id: i64) -> Value {
         .map(|b| b.box_id)
         .collect();
     if lock(state).box_pids.contains_key(&id) && !children.is_empty() {
-        return json!({"ok": false, "error": "box is running; stop it first"});
+        return Err("box is running; stop it first".into());
     }
     let ov = lock(state).overlay.clone();
     // Copy-down: snapshot this box's contributed view into each child that has
@@ -2360,9 +2391,7 @@ fn free_box(state: &State, id: i64) -> Value {
             let live = ov.as_ref().and_then(|o| o.live_box(child));
             for rel in &paths {
                 if let Err(e) = crate::review::copy_down_entry(id, child, rel, live.as_deref()) {
-                    return json!({"ok": false,
-                        "error": format!("copy-down to box {child} failed: {e}"),
-                        "path": rel});
+                    return Err(format!("copy-down to box {child} failed at {rel}: {e}"));
                 }
             }
         }
@@ -2403,7 +2432,13 @@ fn free_box(state: &State, id: i64) -> Value {
         }
     }
     reap(state, id);
-    json!({"ok": true, "reparented": children})
+    let children = children.into_iter()
+        .map(|child| u64::try_from(child).map_err(|_| "negative child box id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(crate::generated_wire::FreeResult {
+        reparented: crate::wire::BoundedVec::new(children)
+            .map_err(|error| format!("reparented boxes exceed relation bound: {error:?}"))?,
+    })
 }
 
 /// Apply box `id`'s changes onto a fresh COPY of its parent, leaving the real
@@ -2412,26 +2447,21 @@ fn free_box(state: &State, id: i64) -> Value {
 /// parent's own changes into it (so it starts as a snapshot of the parent),
 /// then promote `id`'s changes on top. The result is a new sibling box holding
 /// "parent + id's changes"; nothing else in the tree moves.
-fn apply_to_copy(
+fn apply_to_copy_typed(
     state: &State,
     boxes: &std::collections::BTreeMap<i64, discover::Box_>,
     id: i64,
-) -> Value {
-    let Some(me) = boxes.get(&id) else {
-        return json!({"ok": false, "error": "no slopbox"});
-    };
-    let Some(parent) = me.parent else {
-        return json!({"ok": false,
-            "error": "box has no parent box to copy (a top-level box applies to the host)"});
-    };
+) -> Result<crate::generated_wire::ApplyCopyResult, String> {
+    let me = boxes.get(&id).ok_or("no slopbox")?;
+    let parent = me.parent.ok_or(
+        "box has no parent box to copy (a top-level box applies to the host)")?;
     if box_is_running(state, id) || box_is_running(state, parent) {
-        return json!({"ok": false, "error": "box or its parent is running; stop it first"});
+        return Err("box or its parent is running; stop it first".into());
     }
     let grandparent = boxes.get(&parent).and_then(|b| b.parent);
-    let Some(ov) = lock(state).overlay.clone() else {
-        return json!({"ok": false, "error": "overlay not mounted"});
-    };
-    let new_id = boxes.keys().max().copied().unwrap_or(0) + 1;
+    let ov = lock(state).overlay.clone().ok_or("overlay not mounted")?;
+    let new_id = boxes.keys().max().copied().unwrap_or(0)
+        .max(ov.box_ids().into_iter().max().unwrap_or(0)) + 1;
     let parent_name = boxes
         .get(&parent)
         .map(|b| b.name.clone())
@@ -2443,29 +2473,24 @@ fn apply_to_copy(
     };
     // 1. Create the copy box as a child of the grandparent (a sibling of the
     //    real parent).
-    match crate::capture::BoxState::create(new_id) {
-        Ok(b) => {
-            b.set_parent(grandparent);
-            if let Some(gp) = grandparent {
-                b.set_meta("parent_box_id", &gp.to_string());
-            }
-            b.set_meta("name", &new_name);
-            ov.add_box(std::sync::Arc::new(b));
-        }
-        Err(e) => return json!({"ok": false, "error": format!("create copy box: {e}")}),
+    let created = crate::capture::BoxState::create(new_id)
+        .map_err(|error| format!("create copy box: {error}"))?;
+    created.set_parent(grandparent);
+    if let Some(gp) = grandparent {
+        created.set_meta("parent_box_id", &gp.to_string());
     }
+    created.set_meta("name", &new_name);
+    ov.add_box(std::sync::Arc::new(created));
     // 2. Copy the parent's OWN changes into the copy (snapshot of the parent).
     for rel in crate::review::changed_paths(parent) {
-        if let Err(e) = crate::review::copy_down_entry(parent, new_id, &rel, None) {
-            return json!({"ok": false, "error": format!("copy parent '{rel}': {e}")});
-        }
+        crate::review::copy_down_entry(parent, new_id, &rel, None)
+            .map_err(|error| format!("copy parent '{rel}': {error}"))?;
     }
     // 3. Promote this box's changes onto the copy.
     let mut applied = 0usize;
     for rel in crate::review::changed_paths(id) {
-        if let Err(e) = crate::review::promote_into_parent(id, new_id, None, &rel) {
-            return json!({"ok": false, "error": format!("apply '{rel}' onto copy: {e}")});
-        }
+        crate::review::promote_into_parent(id, new_id, None, &rel)
+            .map_err(|error| format!("apply '{rel}' onto copy: {error}"))?;
         applied += 1;
     }
     broadcast(
@@ -2473,7 +2498,12 @@ fn apply_to_copy(
         &json!({"type": "session_new",
         "session_id": new_id.to_string(), "name": new_name}),
     );
-    json!({"ok": true, "new_sid": new_id.to_string(), "name": new_name, "applied": applied})
+    Ok(crate::generated_wire::ApplyCopyResult {
+        r#box: u64::try_from(new_id).map_err(|_| "negative allocated box id")?,
+        name: crate::wire::BoundedText::new(new_name)
+            .map_err(|error| format!("copy name exceeds relation bound: {error:?}"))?,
+        applied: u64::try_from(applied).map_err(|_| "applied path count exceeds u64")?,
+    })
 }
 
 /// Audit H3: apply/discard read the box's pool blobs (`blob_path(id, rowid)`) —
@@ -3694,27 +3724,29 @@ macro_rules! ui_verbs {
             None => json!({"ok": false, "error": "no slopbox"}),
         }
         }
-        "kill" => { match arg_sid(args) {
-            Some(id) => {
-                let fd = lock(state).box_pids.get(&id).copied();
-                match fd {
-                    Some(fd) => { pidfd_signal(fd, libc::SIGTERM); json!({"ok": true}) }
-                    None => json!({"ok": false, "error": "box not running"}),
-                }
-            }
-            None => json!({"ok": false, "error": "no slopbox"}),
+        "kill" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Kill { sid },
+            ));
         }
-        }
-        "dissolve" => { match arg_sid(args) {
-            Some(id) => dissolve(state, id),
-            None => json!({"ok": false, "error": "no slopbox"}),
-        }
+        "dissolve" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Dissolve { sid },
+            ));
         }
         "apply_to_copy" => {
-            match arg_sid(args) {
-                Some(id) => apply_to_copy(state, boxes, id),
-                None => json!({"ok": false, "error": "no slopbox"}),
-            }
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ApplyToCopy { sid },
+            ));
         }
         // RO attachments (DEPOT-DESIGN.md §8): reference another box's
         // layer read-only, between this box and its parent in the lookup
@@ -4214,16 +4246,13 @@ macro_rules! ui_verbs {
                 state, crate::generated_wire::ActionRequest::ReloadRules,
             ));
         }
-        "delete" => { match arg_sid(args) {
-            // Free the box, KEEPING any boxes stacked on it: children have this
-            // box's view copied down into them and are re-parented onto the
-            // grandparent, so their merged view is unchanged. Same operation as
-            // dissolve — the box's OWN writes never reach the parent or host.
-            // A raw reap here would orphan the children — so delete never does
-            // one when children exist, and never destroys a box not named.
-            Some(id) => free_box(state, id),
-            None => json!({"ok": false}),
-        }
+        "delete" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Delete { sid },
+            ));
         }
         "review.session_changes" => { match arg_sid(args) {
             Some(id) => crate::review::session_changes(id),
