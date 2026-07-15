@@ -1801,10 +1801,8 @@ pub fn patch_text(id: i64) -> Vec<u8> {
 // diff of the two textual dumps. The quick verb returns the type line(s) + the
 // header immediately plus a job id; the finish verb runs the (heavy, sandboxed)
 // dump synchronously in its handler thread and returns the full line list.
-// Wire shapes match what the Python RemoteReview expects:
-//   struct_quick  -> {"lines": [[style,text],...], "job": <id|null>}
-//   struct_finish -> {"lines": [[style,text],...]}
-// where each tuple is a 2-element JSON array [style, text].
+// Results materialize in the generated closed relation types. The temporary
+// JSON listener projects those values for the current UI at its outer edge.
 
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
@@ -1819,11 +1817,11 @@ struct StructJob {
     argv: Vec<String>,
     base: Vec<u8>,
     cur: Vec<u8>,
-    head: Vec<Value>,
+    head: Vec<crate::generated_wire::StructuralLine>,
 }
 
-fn job_registry() -> &'static StdMutex<HashMap<i64, StructJob>> {
-    static REG: OnceLock<StdMutex<HashMap<i64, StructJob>>> = OnceLock::new();
+fn job_registry() -> &'static StdMutex<HashMap<u64, StructJob>> {
+    static REG: OnceLock<StdMutex<HashMap<u64, StructJob>>> = OnceLock::new();
     REG.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -1832,8 +1830,26 @@ fn next_id() -> u64 {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
-fn pair(style: &str, text: &str) -> Value {
-    json!([style, text])
+fn pair(style: &str, text: impl Into<String>)
+    -> Result<crate::generated_wire::StructuralLine, String>
+{
+    Ok(crate::generated_wire::StructuralLine {
+        style: crate::wire::BoundedText::new(style.to_owned())
+            .map_err(|error| format!("structural style exceeds relation bound: {error:?}"))?,
+        text: crate::wire::BoundedText::new(text.into())
+            .map_err(|error| format!("structural line exceeds relation bound: {error:?}"))?,
+    })
+}
+
+fn bounded_lines(lines: Vec<crate::generated_wire::StructuralLine>)
+    -> Result<crate::wire::BoundedVec<
+        crate::generated_wire::StructuralLine,
+        0,
+        { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+    >, String>
+{
+    crate::wire::BoundedVec::new(lines)
+        .map_err(|error| format!("structural lines exceed relation bound: {error:?}"))
 }
 
 /// Best-effort type sniff. Read the common magic numbers directly (no libmagic
@@ -1898,42 +1914,50 @@ fn differ_for(mtype: &str, data: &[u8]) -> Option<(Vec<String>, String)> {
     None
 }
 
-/// FAST half: type line(s) + differ selection. Returns the wire dict
-/// {"lines": [...], "job": <id|null>}. When `job` is null the lines are the
-/// complete result (unrecognized type or over the size cap). Never panics.
-pub fn struct_quick(id: i64, rel: &str) -> Value {
+/// FAST half: type line(s) + differ selection. When `job` is absent the lines
+/// are the complete result (unrecognized type or over the size cap).
+pub fn struct_quick(id: i64, rel: &str)
+    -> Result<crate::generated_wire::StructuralQuick, String>
+{
+    use crate::generated_wire::StructuralQuick;
     let rel = rel.trim_start_matches('/');
     let base = lower_bytes(rel);
     let cur = current_bytes(id, rel).unwrap_or_default();
-    let mut lines: Vec<Value> = vec![];
+    let mut lines = Vec::new();
     if !base.is_empty() && !cur.is_empty() {
-        lines.push(pair("type", &format!("type (base): {}", struct_type(&base))));
-        lines.push(pair("type", &format!("type (current): {}", struct_type(&cur))));
+        lines.push(pair("type", format!("type (base): {}", struct_type(&base)))?);
+        lines.push(pair("type", format!("type (current): {}", struct_type(&cur)))?);
     } else {
         let sniff = if cur.is_empty() { &base } else { &cur };
-        lines.push(pair("type", &format!("type: {}", struct_type(sniff))));
+        lines.push(pair("type", format!("type: {}", struct_type(sniff)))?);
     }
     let sniff = if cur.is_empty() { base.clone() } else { cur.clone() };
     let Some((argv, label)) = differ_for(&struct_type(&sniff), &sniff) else {
-        return json!({"lines": lines, "job": Value::Null});
+        return Ok(StructuralQuick { lines: bounded_lines(lines)?, job: None });
     };
-    lines.push(pair("hdr", &format!("\u{2500}\u{2500} structural diff \u{b7} {label} \u{2500}\u{2500}")));
+    lines.push(pair("hdr", format!(
+        "\u{2500}\u{2500} structural diff \u{b7} {label} \u{2500}\u{2500}"))?);
     if base.len() > STRUCT_MAX || cur.len() > STRUCT_MAX {
-        lines.push(pair("dim", &format!("(skipped: file exceeds {STRUCT_MAX} bytes)")));
-        return json!({"lines": lines, "job": Value::Null});
+        lines.push(pair("dim", format!("(skipped: file exceeds {STRUCT_MAX} bytes)"))?);
+        return Ok(StructuralQuick { lines: bounded_lines(lines)?, job: None });
     }
-    let jid = next_id() as i64;
+    let jid = next_id();
     job_registry().lock().unwrap().insert(jid, StructJob {
         argv, base, cur, head: lines.clone(),
     });
-    json!({"lines": lines, "job": jid})
+    Ok(StructuralQuick { lines: bounded_lines(lines)?, job: Some(jid) })
 }
 
 /// SLOW half: run the sandboxed dump(s) for `job` and build the unified
-/// structural diff. Returns {"lines": [...]}. Never panics.
-pub fn struct_finish(job_id: i64) -> Value {
+/// structural diff.
+pub fn struct_finish(job_id: u64)
+    -> Result<crate::generated_wire::StructuralDiff, String>
+{
+    use crate::generated_wire::StructuralDiff;
     let Some(job) = job_registry().lock().unwrap().remove(&job_id) else {
-        return json!({"lines": [["err", "unknown struct job"]]});
+        return Ok(StructuralDiff {
+            lines: bounded_lines(vec![pair("err", "unknown struct job")?])?,
+        });
     };
     let mut lines = job.head.clone();
     let dump = |data: &[u8]| -> String {
@@ -1959,35 +1983,35 @@ pub fn struct_finish(job_id: i64) -> Value {
             let (_, a0, _) = group[0].as_tag_tuple();
             let (_, alast, blast) = group[group.len() - 1].as_tag_tuple();
             let (_, _, b0) = group[0].as_tag_tuple();
-            lines.push(pair("@", &format!("@@ -{},{} +{},{} @@",
-                a0.start + 1, alast.end - a0.start, b0.start + 1, blast.end - b0.start)));
+            lines.push(pair("@", format!("@@ -{},{} +{},{} @@",
+                a0.start + 1, alast.end - a0.start, b0.start + 1, blast.end - b0.start))?);
             any = true;
             for op in &group {
                 let (tag, orange, nrange) = op.as_tag_tuple();
                 match tag {
-                    DiffTag::Equal => for k in orange { lines.push(pair(" ", bl[k])); },
+                    DiffTag::Equal => for k in orange { lines.push(pair(" ", bl[k])?); },
                     _ => {
-                        for k in orange { lines.push(pair("-", bl[k])); }
-                        for k in nrange { lines.push(pair("+", cl[k])); }
+                        for k in orange { lines.push(pair("-", bl[k])?); }
+                        for k in nrange { lines.push(pair("+", cl[k])?); }
                     }
                 }
             }
         }
         if !any {
-            lines.push(pair("dim", "(structural dumps identical)"));
+            lines.push(pair("dim", "(structural dumps identical)")?);
         }
     } else {
         let which_side = if job.cur.is_empty() { "base" } else { "current" };
-        lines.push(pair("dim", &format!("({which_side} only)")));
+        lines.push(pair("dim", format!("({which_side} only)"))?);
         let data = if job.cur.is_empty() { &job.base } else { &job.cur };
         for ln in dump(data).split('\n') {
-            lines.push(pair(" ", ln.trim_end_matches('\r')));
+            lines.push(pair(" ", ln.trim_end_matches('\r'))?);
         }
     }
-    json!({"lines": lines})
+    Ok(StructuralDiff { lines: bounded_lines(lines)? })
 }
 
-pub fn struct_cancel(job_id: i64) {
+pub fn struct_cancel(job_id: u64) {
     job_registry().lock().unwrap().remove(&job_id);
 }
 

@@ -1868,6 +1868,19 @@ fn dispatch_action(
                 .map_err(|error| format!("mirror removal note exceeds relation bound: {error:?}"))?;
             Ok(ActionSuccess::MirrorRm { value })
         }
+        ActionRequest::StructQuick { sid, rel } => {
+            let id = existing_box_id(sid)?;
+            let value = crate::review::struct_quick(id, action_relative_path(&rel)?)?;
+            Ok(ActionSuccess::StructQuick { value })
+        }
+        ActionRequest::StructFinish { job } => {
+            let value = crate::review::struct_finish(job)?;
+            Ok(ActionSuccess::StructFinish { value })
+        }
+        ActionRequest::StructCancel { job } => {
+            crate::review::struct_cancel(job);
+            Ok(ActionSuccess::StructCancel { value: () })
+        }
         ActionRequest::ViewOpen {
             kind,
             r#box,
@@ -2216,6 +2229,19 @@ fn legacy_mirror_state(value: crate::generated_wire::MirrorState) -> &'static st
     }
 }
 
+fn legacy_structural_lines(
+    lines: crate::wire::BoundedVec<
+        crate::generated_wire::StructuralLine,
+        0,
+        { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+    >,
+) -> Vec<Value> {
+    lines.into_inner().into_iter().map(|line| json!([
+        line.style.into_inner(),
+        line.text.into_inner(),
+    ])).collect()
+}
+
 fn legacy_ui_action_reply(
     result: Result<crate::generated_wire::ActionSuccess, String>,
 ) -> Value {
@@ -2409,6 +2435,14 @@ fn legacy_ui_action_reply(
             "ok": true,
             "note": value.into_inner(),
         }),
+        Ok(ActionSuccess::StructQuick { value }) => json!({
+            "lines": legacy_structural_lines(value.lines),
+            "job": value.job,
+        }),
+        Ok(ActionSuccess::StructFinish { value }) => json!({
+            "lines": legacy_structural_lines(value.lines),
+        }),
+        Ok(ActionSuccess::StructCancel { .. }) => json!({"ok": true, "r": Value::Null}),
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -4745,10 +4779,12 @@ macro_rules! ui_verbs {
             ));
         }
         "struct_quick" => {
-            match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
-                (Some(id), Some(rel)) => crate::review::struct_quick(id, rel),
-                _ => json!({"lines": [["err", "bad args"]], "job": Value::Null}),
-            }
+            let (Some(sid), Some(rel)) = (legacy_u64(args, 0), legacy_path_arg(args, 1)) else {
+                return json!({"lines": [["err", "bad args"]], "job": Value::Null});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::StructQuick { sid, rel },
+            ));
         }
         "flows.list" => {
             let sid = match args.first() {
@@ -4828,16 +4864,21 @@ macro_rules! ui_verbs {
                 state, crate::generated_wire::ActionRequest::FlowsPackets { sid, stream },
             ));
         }
-        "struct_finish" => { match args.first().and_then(Value::as_i64) {
-            Some(job) => crate::review::struct_finish(job),
-            None => json!({"lines": [["err", "bad job"]]}),
-        }
+        "struct_finish" => {
+            let Some(job) = legacy_u64(args, 0) else {
+                return json!({"lines": [["err", "bad job"]]});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::StructFinish { job },
+            ));
         }
         "struct_cancel" => {
-            if let Some(job) = args.first().and_then(Value::as_i64) {
-                crate::review::struct_cancel(job);
-            }
-            return json!({"ok": true, "r": Value::Null});
+            let Some(job) = legacy_u64(args, 0) else {
+                return json!({"ok": true, "r": Value::Null});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::StructCancel { job },
+            ));
         }
         "box_drop" => {
             let Some(sid) = legacy_u64(args, 0) else {

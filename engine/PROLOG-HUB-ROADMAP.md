@@ -775,6 +775,14 @@ belong to the relation.
   The temporary listener projects the old object spelling only after typed
   execution. The full native aarch64-musl suite passes 308 tests with one
   existing browser e2e test ignored.
+- Moved `struct_quick`, `struct_finish`, and `struct_cancel` onto generated
+  request/success variants. The structural-diff job registry now retains
+  bounded `StructuralLine` values rather than schema-less JSON, and both quick
+  and sandboxed finish paths return the closed generated result records.
+  Relative path validation and job identity validation happen before the
+  implementation; the temporary listener alone projects line pairs. The full
+  native aarch64-musl suite passes 308 tests with one existing browser e2e test
+  ignored.
 
 ## Stop conditions
 
