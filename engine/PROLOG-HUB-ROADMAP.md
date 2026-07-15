@@ -94,23 +94,81 @@ it validates argument shape and primitive type only. `KnownUnit` has provider
 fields, but the command relation deliberately ignores their incoming semantic
 classification, and completion currently proposes literals only.
 
-Add context without putting I/O or a second semantic parser in Rust:
+Context queries are themselves values in the relation. The compact core
+algebra is:
 
-1. The relation derives bounded provider requests from the partial parse, such
-   as `boxes(Prefix)` or `box_paths(BoxIdentity, Prefix)`. Requests may depend
-   on preceding relationally parsed arguments.
-2. Rust implements only the provider transport against engine state, sockets,
-   or filesystem snapshots and returns revision-tagged, typed facts. It does
-   not decide which argument accepts which domain or how names normalize.
-3. The same Prolog relation joins source surfaces with those facts for exact
-   resolution, ambiguity reporting, syntax evidence, descriptions, and prefix
-   completion.
-4. Parse/completion responses carry provider and revision provenance so stale
-   choices can be rejected or refreshed before execution.
+```prolog
+ask(empty, Domain, Selector)   % is the matching set empty?
+ask(one,   Domain, Selector)   % relate to exactly one entry; fail otherwise
+ask(all,   Domain, Selector)   % relate to the canonical matching entry list
+```
 
-Prefer this explicit request/fact envelope over foreign-predicate callbacks:
-it keeps the Prolog worker bounded and deterministic, avoids reentrant Rust/I/O
-calls from SWI, and makes contextual parsing independently testable.
+`Domain` carries the semantic type. `Selector` is structured relational data,
+not an untyped callback name. Examples:
+
+```prolog
+ask(one, box, name("work"))
+ask(empty, box, prefix("wo"))
+ask(all, box, prefix("wo"))
+ask(all, path, within(box(ref(box_query)), prefix("src/")))
+ask(one, c(variable), within(scope(17), name(y)))
+```
+
+The cardinality is part of meaning, not merely a provider optimization. Exact
+name resolution normally uses `one`; completion enumeration uses `all`; cheap
+viability and negative constraints use `empty`. `one` has no relational
+solution for zero or multiple distinct identities.
+
+Queries form a pure dependency graph:
+
+```prolog
+query(box_query, ask(one, box, name("work"))).
+query(path_query,
+      ask(all, path, within(box(ref(box_query)), prefix("src/")))).
+```
+
+`ref(Id)` is a typed dependency on the successful value of an earlier query.
+The graph must be acyclic and stable under canonical term serialization. This
+supports dependent grammars without prematurely performing I/O or hiding
+dependencies in provider code.
+
+Lexical/local context remains ordinary relational state and emits no external
+query. Thus a prior C declaration resolves `x` internally, while an unresolved
+`y` emits `ask(one, c(variable), within(Scope, name(y)))`. Composition carries
+local environments and external query graphs separately, so nesting grammars
+does not turn all names into global lookups.
+
+Rust executes only ready query nodes against engine state, sockets, or
+filesystem snapshots. It returns typed entries with stable semantic identity,
+display names/aliases, metadata, provider identity, and revision. It must not
+decide which textual position uses which domain, selector, cardinality, or
+dependency; those are outputs of the relation.
+
+Every attempted query produces a stable observation for dependency tracking:
+
+```prolog
+observed(QueryId, CanonicalQuery, Provider, Revision, some(Result)).
+observed(QueryId, CanonicalQuery, Provider, Revision, none).
+```
+
+`none` records relational failure, including a `one` query with zero or
+multiple identities. Comparing canonical observations before and after a
+context change is sufficient to decide whether the dependent parse must be
+recomputed. Unrelated provider changes do not invalidate text whose observed
+query results are unchanged.
+
+The parser protocol is staged but remains one relation:
+
+1. Relating source plus local environment yields a query graph and suspended
+   semantic alternatives.
+2. Rust resolves ready nodes and returns observations in bounded batches.
+3. Relating the same source, graph, and observations yields parse, completion,
+   highlight, or render results together with the exact observations used.
+
+Prefer this explicit graph/observation envelope over foreign-predicate
+callbacks. It keeps the Prolog worker bounded and deterministic, avoids
+reentrant Rust/I/O calls from SWI, exposes type and dependency information,
+and makes contextual parsing and invalidation independently testable.
 
 ## Complete UI action inventory
 
@@ -175,7 +233,8 @@ belong to the relation.
 - [ ] Add catalog/representation query decoding for help, bindings, menus, and
       conversions.
 - [ ] Add generic bounded context-request and typed context-fact envelopes,
-      including provider identity and snapshot revision.
+      using the `ask(empty|one|all, Domain, Selector)` algebra, query IDs,
+      typed `ref/1` dependencies, provider identity, and snapshot revision.
 
 ### 3. Complete Prolog action relation
 
@@ -194,7 +253,9 @@ belong to the relation.
 - [ ] Add invariants proving unique public identities, valid handlers/targets,
       schema/form agreement, and complete handler coverage.
 - [ ] Add contextual argument domains, dependent provider requests, exact/alias
-      resolution, ambiguity results, and contextual completions.
+      resolution, relational `one` failure, and contextual completions.
+- [ ] Add local lexical environments that resolve internal bindings without
+      external queries and compose independently from external query graphs.
 
 ### 4. Mandatory Rust integration
 
@@ -244,6 +305,10 @@ belong to the relation.
 - [ ] Completion supports partial tokens and mid-token UTF-8 byte spans.
 - [ ] Box/object/path completion is derived from revision-tagged context facts;
       dependent domains such as box paths use earlier parsed identities.
+- [ ] Canonical observations compare equal exactly when a context change cannot
+      affect the dependent parse; test successful and failed `one` queries.
+- [ ] Query graphs reject cycles, dangling refs, type-mismatched refs, duplicate
+      query IDs, noncanonical entries, and provider responses beyond bounds.
 - [ ] Highlighting is derived only from successful grammar evidence.
 - [ ] Help/menu/key projections exactly cover intended visible actions.
 - [ ] Every relation handler resolves to a real Rust execution handler, and
