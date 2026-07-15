@@ -810,6 +810,12 @@ dispatch_application(context_observe, request(Id, Query, Snapshot), ok(Observati
     !, observe_query(Id, Query, Snapshot, Observation).
 dispatch_application(context_ready, request(Graph, Observations), ok(Ready)) :-
     !, ready_queries(Graph, Observations, Ready).
+dispatch_application(context_dependencies, request(Observations), ok(Keys)) :-
+    !, findall(Key,
+               ( context_observation(Observations, Observation),
+                 dependency_key(Observation, Key)
+               ),
+               Keys).
 dispatch_application(context_plan, request(Items, Mode), ok(Plans)) :-
     !, findall(Plan, context_plan(Items, Mode, Plan), Plans).
 dispatch_application(context_resolve, request(Plan, Observations), Response) :-
@@ -834,8 +840,13 @@ dispatch_application(convert, _, error(invalid_request)) :- !.
 dispatch_application(context_query, _, error(invalid_request)) :- !.
 dispatch_application(context_observe, _, error(invalid_request)) :- !.
 dispatch_application(context_ready, _, error(invalid_request)) :- !.
+dispatch_application(context_dependencies, _, error(invalid_request)) :- !.
 dispatch_application(context_plan, _, error(invalid_request)) :- !.
 dispatch_application(context_resolve, _, error(invalid_request)) :- !.
 dispatch_application(context_completion, _, error(invalid_request)) :- !.
 dispatch_application(context_completion_resolve, _, error(invalid_request)) :- !.
 dispatch_application(_, _, error(invalid_operation)).
+
+context_observation([Observation|_], Observation).
+context_observation([_|Observations], Observation) :-
+    context_observation(Observations, Observation).

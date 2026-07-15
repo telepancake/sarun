@@ -185,6 +185,14 @@ pub struct ContextObservation {
     pub outcome: Option<ContextResult>,
 }
 
+/// Provenance-free semantic projection used for parse invalidation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextDependencyKey {
+    pub id: String,
+    pub query: ContextQuery,
+    pub outcome: Option<ContextResult>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextQueryNode {
     pub id: String,
@@ -299,6 +307,7 @@ enum Operation {
     ContextQuery,
     ContextObserve,
     ContextReady,
+    ContextDependencies,
     ContextPlan,
     ContextResolve,
     ContextCompletion,
@@ -315,6 +324,7 @@ impl Operation {
             Self::ContextQuery => "context_query",
             Self::ContextObserve => "context_observe",
             Self::ContextReady => "context_ready",
+            Self::ContextDependencies => "context_dependencies",
             Self::ContextPlan => "context_plan",
             Self::ContextResolve => "context_resolve",
             Self::ContextCompletion => "context_completion",
@@ -494,6 +504,22 @@ impl Prolog {
             format!("request({graph},[{observations}])"),
         )?;
         decode_context_ready_response(&response)
+    }
+
+    pub fn context_dependency_keys(
+        &self,
+        observations: &[ContextObservation],
+    ) -> Result<Vec<ContextDependencyKey>, String> {
+        let observations = observations
+            .iter()
+            .map(encode_context_observation)
+            .collect::<Result<Vec<_>, _>>()?
+            .join(",");
+        let response = self.application(
+            Operation::ContextDependencies,
+            format!("request([{observations}])"),
+        )?;
+        decode_context_dependency_keys_response(&response)
     }
 
     pub fn context_plans(
@@ -1640,6 +1666,15 @@ fn decode_context_node(term: &ParsedTerm) -> Result<ContextQueryNode, String> {
     })
 }
 
+fn decode_context_dependency_key(term: &ParsedTerm) -> Result<ContextDependencyKey, String> {
+    let args = compound(term, "dependency", 3)?;
+    Ok(ContextDependencyKey {
+        id: atom(&args[0])?.to_owned(),
+        query: decode_context_query(&args[1])?,
+        outcome: decode_context_outcome(&args[2])?,
+    })
+}
+
 fn decode_context_binding(term: &ParsedTerm) -> Result<ContextBinding, String> {
     let args = compound(term, "bind", 3)?;
     let argument = compound(&args[1], "arg", 1)?;
@@ -1703,6 +1738,16 @@ fn decode_context_ready_response(response: &str) -> Result<Vec<ContextQueryNode>
     list(&value)?
         .iter()
         .map(decode_context_node)
+        .collect()
+}
+
+fn decode_context_dependency_keys_response(
+    response: &str,
+) -> Result<Vec<ContextDependencyKey>, String> {
+    let value = response_value(response)?;
+    list(&value)?
+        .iter()
+        .map(decode_context_dependency_key)
         .collect()
 }
 
@@ -2066,6 +2111,20 @@ mod tests {
             .observe_context("box_query", &box_query, &snapshot)
             .unwrap();
         assert_eq!(observation.outcome, Some(ContextResult::One(entry)));
+        let dependency = prolog
+            .context_dependency_keys(&[observation.clone()])
+            .unwrap();
+        let mut refreshed = observation.clone();
+        refreshed.revision = RelationValue::Integer(8);
+        assert_eq!(
+            dependency,
+            prolog.context_dependency_keys(&[refreshed.clone()]).unwrap(),
+        );
+        refreshed.outcome = None;
+        assert_ne!(
+            dependency,
+            prolog.context_dependency_keys(&[refreshed]).unwrap(),
+        );
 
         let path_query = ContextQuery {
             cardinality: ContextCardinality::All,

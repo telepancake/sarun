@@ -374,8 +374,10 @@ belong to the relation.
 - [ ] Completion supports partial tokens and mid-token UTF-8 byte spans.
 - [ ] Box/object/path completion is derived from revision-tagged context facts;
       dependent domains such as box paths use earlier parsed identities.
-- [ ] Canonical observations compare equal exactly when a context change cannot
-      affect the dependent parse; test successful and failed `one` queries.
+- [x] Canonical observations compare equal exactly when a context change cannot
+      affect the dependent parse; provenance/revision is excluded while query
+      identity and successful/failed outcomes are included. Pure and embedded
+      aarch64 tests cover the projection and revision-only refresh.
 - [ ] Query graphs reject cycles, dangling refs, type-mismatched refs, duplicate
       query IDs, noncanonical entries, and provider responses beyond bounds.
       Cycles, dangling refs, duplicate IDs, refs to non-`one` queries, duplicate
@@ -441,6 +443,9 @@ belong to the relation.
 - Unified invocation parsing and highlighting on the same resolved contextual
   plan; zero/ambiguous `one` results now leave contextual command text
   unhighlighted instead of presenting a merely structural parse as valid.
+- Exposed provenance-free dependency-key projection through the embedded
+  relation; a provider revision change with the same query outcome compares
+  equal, while a changed outcome invalidates the dependent parse.
 - Recorded the direct binary `ui.sock` transport boundary: Prolog owns
   representation relationships and conversion, while already-typed
   request/reply delivery is a Rust-only hot path.
