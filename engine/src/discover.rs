@@ -320,7 +320,7 @@ fn relation_pipeline_stage(value: &Value) -> Result<crate::generated_wire::Pipel
     }
 }
 
-fn relation_pipeline_provenance(
+pub(crate) fn relation_pipeline_provenance(
     value: &Value,
 ) -> Result<crate::generated_wire::PipelineProvenance, String> {
     use crate::generated_wire::{LIMIT_COLLECTION_ITEMS, LIMIT_STAGE_ITEMS, PipelineProvenance};

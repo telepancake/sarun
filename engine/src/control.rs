@@ -724,52 +724,36 @@ fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>, id: i6
 /// event per row. Best-effort: an unresolvable box or malformed message is
 /// dropped quietly (the recipe runs regardless; provenance is optional). This is
 /// a one-shot control reply — it does NOT create a box channel.
-fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    // Resolve the shim's HOST pid from its pidfd (the wrap-immune identity path),
-    // then derive the enclosing box from its /proc ancestry.
-    let host_pid = peer_pidfd
-        .map(host_pid_from_pidfd)
-        .filter(|p| *p > 0)
-        .unwrap_or(0);
-    if let Some(fd) = peer_pidfd {
-        unsafe {
-            libc::close(fd);
-        }
-    }
-    let Some(id) = derive_parent_box(state, host_pid) else {
-        return json!({"ok": false, "error": "no enclosing box"});
-    };
+fn brush_prov_nested(
+    state: &State,
+    records: &[crate::generated_wire::PipelineProvenance],
+    peer_pidfd: Option<i32>,
+) -> Result<u64, String> {
+    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
+    let records = records.iter().map(|record| {
+        if !record.nested { return Err("nested provenance record is not marked nested".into()); }
+        let sequence = i64::try_from(record.sequence)
+            .map_err(|_| "pipeline sequence exceeds SQLite range")?;
+        let uid = i64::try_from(record.uid)
+            .map_err(|_| "pipeline uid exceeds SQLite range")?;
+        let parent_uid = i64::try_from(record.parent_uid)
+            .map_err(|_| "parent pipeline uid exceeds SQLite range")?;
+        let targets = record.output_targets.as_slice().iter().map(|target|
+            std::str::from_utf8(target.as_slice()).map(str::to_owned)
+                .map_err(|_| "pipeline output target is not UTF-8".to_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((record.command.as_str().to_owned(),
+            crate::discover::pipeline_provenance_json(record).to_string(),
+            sequence, record.spawned_at, uid, parent_uid, targets))
+    }).collect::<Result<Vec<_>, String>>()?;
     let ov = lock(state).overlay.clone();
-    let records = msg.get("records").and_then(Value::as_array);
-    let Some(records) = records else {
-        return json!({"ok": false, "error": "no records"});
-    };
-    let mut n = 0i64;
-    for rec in records {
-        let cmd = rec
-            .get("cmd")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let seq = rec.get("seq").and_then(Value::as_i64).unwrap_or(0);
-        let spawn_ts = rec.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0);
-        let uid = rec.get("uid").and_then(Value::as_i64).unwrap_or(0);
-        let parent_uid = rec.get("parent_uid").and_then(Value::as_i64).unwrap_or(0);
-        let record_json = rec.to_string();
+    let mut count = 0u64;
+    for (command, record_json, sequence, spawned_at, uid, parent_uid, targets) in records {
         let mut prov_id = 0i64;
         if let Some(ov) = ov.as_ref() {
             if let Some(b) = ov.live_box(id) {
                 prov_id =
-                    b.add_brushprov_nested(&cmd, &record_json, seq, spawn_ts, uid, parent_uid);
-                let targets: Vec<String> = rec
-                    .get("out_targets")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                    b.add_brushprov_nested(&command, &record_json, sequence, spawned_at, uid, parent_uid);
                 b.on_brush_prov(prov_id, targets);
                 // Set cur_brush_pipeline to the FIRST pipeline in this
                 // complete-command — that is the one that executes first and
@@ -778,7 +762,7 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
                 // track per-pipeline transitions within one complete-command,
                 // but attributing to the first is correct for the common
                 // single-pipeline case and for the first leg of a chain.
-                if n == 0 {
+                if count == 0 {
                     b.set_cur_brush_pipeline(prov_id);
                 }
             }
@@ -787,9 +771,9 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
             broadcast(state,
                 &crate::generated_wire::SubscriptionEvent::BrushProvenanceAdded { r#box, row });
         }
-        n += 1;
+        count += 1;
     }
-    json!({"ok": true, "recorded": n})
+    Ok(count)
 }
 
 /// D9 pipeline completion. After a pipeline's complete-command finishes, the box
@@ -868,32 +852,30 @@ fn recipe_fixup(
 /// ITS OWN pidfd as SCM_RIGHTS. We resolve the enclosing box from /proc ancestry
 /// (the same path register/brush_prov_nested use) and store each edge in the
 /// box's `build_edges` table. One-shot control reply; not a box channel.
-fn build_edges(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd
-        .map(host_pid_from_pidfd)
-        .filter(|p| *p > 0)
-        .unwrap_or(0);
-    if let Some(fd) = peer_pidfd {
-        unsafe {
-            libc::close(fd);
-        }
-    }
-    let Some(id) = derive_parent_box(state, host_pid) else {
-        return json!({"ok": false, "error": "no enclosing box"});
-    };
+fn build_edges(
+    state: &State,
+    edges: &[crate::generated_wire::BuildEdge],
+    peer_pidfd: Option<i32>,
+) -> Result<u64, String> {
+    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
+    let path = |value: &crate::generated_wire::Path| std::str::from_utf8(value.as_slice())
+        .map(str::to_owned).map_err(|_| "build graph path is not UTF-8".to_owned());
+    let edges = edges.iter().map(|edge| {
+        let outputs = edge.outputs.as_slice().iter().map(&path)
+            .collect::<Result<Vec<_>, _>>()?;
+        let inputs = edge.inputs.as_slice().iter().map(&path)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((serde_json::to_string(&outputs).map_err(|error| error.to_string())?,
+            serde_json::to_string(&inputs).map_err(|error| error.to_string())?,
+            edge.command.as_ref().map(|value| value.as_str().to_owned())))
+    }).collect::<Result<Vec<_>, String>>()?;
     let ov = lock(state).overlay.clone();
-    let Some(edges) = msg.get("edges").and_then(Value::as_array) else {
-        return json!({"ok": false, "error": "no edges"});
-    };
-    let mut n = 0i64;
+    let mut count = 0u64;
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
-            for e in edges {
-                let outs = e.get("outs").cloned().unwrap_or_else(|| json!([]));
-                let ins = e.get("ins").cloned().unwrap_or_else(|| json!([]));
-                let cmd = e.get("cmd").and_then(Value::as_str);
-                b.add_build_edge(&outs.to_string(), &ins.to_string(), cmd);
-                n += 1;
+            for (outputs, inputs, command) in &edges {
+                b.add_build_edge(outputs, inputs, command.as_deref());
+                count += 1;
             }
         }
     }
@@ -902,7 +884,7 @@ fn build_edges(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
             r#box, phase: crate::generated_wire::EdgePhase::Rebuilt,
         });
     }
-    json!({"ok": true, "recorded": n})
+    Ok(count)
 }
 
 /// A single build edge's run-state transition (started / finished), sent by the
@@ -931,111 +913,53 @@ pub struct MakeVarRow {
 
 /// `make_vars` frame: a batch of makefile variable assignments from a box's
 /// embedded make(s), recorded into the box's makevar table.
-fn make_vars(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd
-        .map(host_pid_from_pidfd)
-        .filter(|p| *p > 0)
-        .unwrap_or(0);
-    if let Some(fd) = peer_pidfd {
-        unsafe {
-            libc::close(fd);
-        }
-    }
-    let Some(id) = derive_parent_box(state, host_pid) else {
-        return json!({"ok": false, "error": "no enclosing box"});
-    };
-    let rows: Vec<MakeVarRow> = msg
-        .get("rows")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|r| {
-                    Some(MakeVarRow {
-                        name: r.get("name")?.as_str()?.to_string(),
-                        loc: r
-                            .get("loc")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        value: r
-                            .get("value")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        make_dir: r
-                            .get("make")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        edge_out: r.get("edge").and_then(Value::as_str).map(str::to_string),
-                        uid: r.get("uid").and_then(Value::as_i64).unwrap_or(0),
-                        rhs: r
-                            .get("rhs")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        refs: r
-                            .get("refs")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        flags: r
-                            .get("flags")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+fn make_vars(
+    state: &State,
+    rows: &[crate::generated_wire::MakeVariable],
+    peer_pidfd: Option<i32>,
+) -> Result<(), String> {
+    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
+    let string = |value: &[u8], field: &str| std::str::from_utf8(value)
+        .map(str::to_owned).map_err(|_| format!("make variable {field} is not UTF-8"));
+    let rows = rows.iter().map(|row| Ok(MakeVarRow {
+        name: string(row.name.as_slice(), "name")?,
+        loc: string(row.location.as_slice(), "location")?,
+        value: string(row.value.as_slice(), "value")?,
+        make_dir: string(row.make_directory.as_slice(), "directory")?,
+        edge_out: row.edge_output.as_ref().map(|value|
+            string(value.as_slice(), "edge output")).transpose()?,
+        uid: i64::try_from(row.pipeline).map_err(|_| "make variable pipeline exceeds i64")?,
+        rhs: string(row.rhs.as_slice(), "rhs")?,
+        refs: string(row.references.as_slice(), "references")?,
+        flags: row.flags.as_str().to_owned(),
+    })).collect::<Result<Vec<_>, String>>()?;
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
             b.add_makevars(&rows);
         }
     }
-    json!({"ok": true})
+    Ok(())
 }
 
 /// `box_activity` frame: the box's live in-flight builtin work (kati
 /// recipes / $(shell) / parse phases with ages) — stored ephemerally on the
 /// BoxState for the UI's "what is it doing" feed.
-fn box_activity(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd
-        .map(host_pid_from_pidfd)
-        .filter(|p| *p > 0)
-        .unwrap_or(0);
-    if let Some(fd) = peer_pidfd {
-        unsafe {
-            libc::close(fd);
-        }
-    }
-    let Some(id) = derive_parent_box(state, host_pid) else {
-        return json!({"ok": false, "error": "no enclosing box"});
-    };
-    let items: Vec<(String, u64)> = msg
-        .get("items")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|it| {
-                    let arr = it.as_array()?;
-                    Some((
-                        arr.first()?.as_str()?.to_string(),
-                        arr.get(1).and_then(Value::as_u64).unwrap_or(0),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+fn box_activity(
+    state: &State,
+    items: &[crate::generated_wire::ActivityItem],
+    peer_pidfd: Option<i32>,
+) -> Result<(), String> {
+    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
+    let items = items.iter().map(|item|
+        (item.description.as_str().to_owned(), item.age_seconds)).collect();
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
-            *b.activity.lock().unwrap() = items;
+            *b.activity.lock().map_err(|_| "box activity lock poisoned")? = items;
         }
     }
-    json!({"ok": true})
+    Ok(())
 }
 
 fn build_edge_state(
@@ -3369,6 +3293,24 @@ fn legacy_path_list(value: Option<&Value>) -> Result<crate::wire::BoundedVec<
     }).collect::<Result<Vec<_>, String>>()?;
     crate::wire::BoundedVec::new(paths)
         .map_err(|error| format!("path list exceeds relation bound: {error:?}"))
+}
+
+fn legacy_transport_paths<const MINIMUM: usize>(
+    value: Option<&Value>,
+) -> Result<crate::wire::BoundedVec<
+    crate::generated_wire::Path,
+    MINIMUM,
+    { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+>, String> {
+    let values = value.and_then(Value::as_array)
+        .ok_or("build edge paths must be an array")?;
+    let paths = values.iter().map(|value| {
+        let path = value.as_str().ok_or("build edge path must be text")?;
+        crate::wire::BoundedBytes::new(path.as_bytes().to_vec())
+            .map_err(|_| "build edge path exceeds relation bound")
+    }).collect::<Result<Vec<_>, _>>()?;
+    crate::wire::BoundedVec::new(paths)
+        .map_err(|error| format!("build edge paths exceed relation bound: {error:?}"))
 }
 
 /// Unconditionally remove a box: drop it from the overlay, delete its sqlar +
@@ -6408,7 +6350,20 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // brush-sh shim, carrying its OWN pidfd (like register) so we resolve
             // the enclosing box from /proc ancestry. NOT a box channel — record
             // and reply once, then the connection closes. The pidfd is consumed.
-            brush_prov_nested(&state, &msg, peer_pidfd.take())
+            let result = (|| {
+                let values = msg.get("records").and_then(Value::as_array)
+                    .ok_or("brush_prov_nested: missing records")?;
+                let records = values.iter().map(crate::discover::relation_pipeline_provenance)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let records = crate::wire::BoundedVec::<_, 1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(records)
+                    .map_err(|error| format!("pipeline records exceed relation bound: {error:?}"))?;
+                brush_prov_nested(&state, records.as_slice(), peer_pidfd.take())
+            })();
+            match result {
+                Ok(count) => json!({"ok": true, "recorded": count}),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
         } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_done") {
             // D9 pipeline completion: a one-shot control message emitted after a
             // pipeline's complete-command finishes, carrying its OWN pidfd (like
@@ -6449,11 +6404,89 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // Phase 1 embedded-ninja: a one-shot control message from the
             // shadowed `ninja` (vendored n2) carrying its OWN pidfd, resolved to
             // the enclosing box by /proc ancestry exactly like brush_prov_nested.
-            build_edges(&state, &msg, peer_pidfd.take())
+            let result = (|| {
+                let values = msg.get("edges").and_then(Value::as_array)
+                    .ok_or("build_edges: missing edges")?;
+                let edges = values.iter().map(|value| Ok(crate::generated_wire::BuildEdge {
+                    outputs: legacy_transport_paths::<1>(value.get("outs"))?,
+                    inputs: legacy_transport_paths::<0>(value.get("ins"))?,
+                    command: value.get("cmd").and_then(Value::as_str).map(|command|
+                        crate::wire::BoundedText::new(command.to_owned())
+                            .map_err(|_| "build edge command exceeds relation bound"))
+                        .transpose()?,
+                })).collect::<Result<Vec<_>, String>>()?;
+                let edges = crate::wire::BoundedVec::<_, 1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(edges)
+                    .map_err(|error| format!("build graph exceeds relation bound: {error:?}"))?;
+                build_edges(&state, edges.as_slice(), peer_pidfd.take())
+            })();
+            match result {
+                Ok(count) => json!({"ok": true, "recorded": count}),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
         } else if msg.get("type").and_then(Value::as_str) == Some("make_vars") {
-            make_vars(&state, &msg, peer_pidfd.take())
+            let result = (|| {
+                let values = msg.get("rows").and_then(Value::as_array)
+                    .ok_or("make_vars: missing rows")?;
+                let rows = values.iter().map(|row| {
+                    let bytes = |name: &str, default: bool| {
+                        let value = row.get(name).and_then(Value::as_str);
+                        let value = if default { value.unwrap_or("") }
+                            else { value.ok_or("make variable name is required")? };
+                        crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                            .map_err(|_| "make variable field exceeds relation bound")
+                    };
+                    Ok(crate::generated_wire::MakeVariable {
+                        name: bytes("name", false)?,
+                        location: bytes("loc", true)?,
+                        value: bytes("value", true)?,
+                        make_directory: bytes("make", true)?,
+                        rhs: bytes("rhs", true)?,
+                        references: bytes("refs", true)?,
+                        edge_output: row.get("edge").and_then(Value::as_str).map(|value|
+                            crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                                .map_err(|_| "make variable edge exceeds relation bound"))
+                            .transpose()?,
+                        pipeline: row.get("uid").and_then(Value::as_u64).unwrap_or(0),
+                        flags: crate::wire::BoundedText::new(row.get("flags")
+                            .and_then(Value::as_str).unwrap_or("").to_owned())
+                            .map_err(|_| "make variable flags exceed relation bound")?,
+                    })
+                }).collect::<Result<Vec<_>, String>>()?;
+                let rows = crate::wire::BoundedVec::<_, 1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(rows)
+                    .map_err(|error| format!("make variables exceed relation bound: {error:?}"))?;
+                make_vars(&state, rows.as_slice(), peer_pidfd.take())
+            })();
+            match result {
+                Ok(()) => json!({"ok": true}),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
         } else if msg.get("type").and_then(Value::as_str) == Some("box_activity") {
-            box_activity(&state, &msg, peer_pidfd.take())
+            let result = (|| {
+                let values = msg.get("items").and_then(Value::as_array)
+                    .ok_or("box_activity: missing items")?;
+                let items = values.iter().map(|value| {
+                    let fields = value.as_array().ok_or("box activity item must be an array")?;
+                    let description = fields.first().and_then(Value::as_str)
+                        .ok_or("box activity description must be text")?;
+                    let age_seconds = fields.get(1).and_then(Value::as_u64)
+                        .ok_or("box activity age must be unsigned")?;
+                    Ok(crate::generated_wire::ActivityItem {
+                        description: crate::wire::BoundedText::new(description.to_owned())
+                            .map_err(|_| "box activity description exceeds relation bound")?,
+                        age_seconds,
+                    })
+                }).collect::<Result<Vec<_>, String>>()?;
+                let items = crate::wire::BoundedVec::<_, 1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(items)
+                    .map_err(|error| format!("box activity exceeds relation bound: {error:?}"))?;
+                box_activity(&state, items.as_slice(), peer_pidfd.take())
+            })();
+            match result {
+                Ok(()) => json!({"ok": true}),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edge_state") {
             // A single edge's run-state transition (started / finished), sent by
             // the in-process make/ninja executor around each recipe — stamps the

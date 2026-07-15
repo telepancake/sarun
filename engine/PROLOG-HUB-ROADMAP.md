@@ -861,6 +861,15 @@ belong to the relation.
   temporary newline listener only constructs these values at its boundary.
   The full native aarch64-musl suite passes 308 tests with one existing browser
   e2e test ignored.
+- Moved nested provenance, complete build graphs, make-variable batches, and
+  live activity ingestion onto generated `PipelineProvenance`, `BuildEdge`,
+  `MakeVariable`, and `ActivityItem` values. Every batch is validated before
+  mutation, byte strings fail explicitly where the SQLite schema requires
+  text, numeric identities are range-checked, and the old listener's lossy
+  `filter_map`/default-empty behavior is gone. The temporary newline listener
+  only constructs the closed values at its boundary. The full native
+  aarch64-musl suite passes 308 tests with one existing browser e2e test
+  ignored.
 
 ## Stop conditions
 
