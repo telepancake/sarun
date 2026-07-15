@@ -235,6 +235,12 @@ The foreign grammar now also declares contextual fields with an explicit
 return stable query nodes; resubmitted observations produce completion matches
 and dependency keys through the same reply, without a context-specific entry
 point or client-side grammar inspection.
+Rust's typed context-query, observation, readiness, and dependency methods now
+adapt to `RelationRequest` and cross the structured FLI path. Their four
+`Operation` variants and the matching `action_grammar:dispatch_application/3`
+cases have been deleted. Existing graph/ref/cardinality behavior passes through
+`context_grammar` by varying given and wanted bindings, providing the first
+production consumer migrated off the old operation protocol.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:

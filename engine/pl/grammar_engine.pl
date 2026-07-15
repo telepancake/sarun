@@ -35,6 +35,42 @@ composable grammar-value/codec relation as the generic IR lands.
 % selected. Observations and limits already occupy their stable envelope slots
 % while context staging and bounded solution enumeration move into this layer.
 
+transform_relation(context_grammar, Given, Wanted, _EnvelopeObservations,
+                   _Limits,
+                   reply([solution(Bindings, 0)], [], DependencyKeys, [])) :-
+    given_value(id, Given, Id),
+    given_value(query, Given, Query),
+    given_value(snapshot, Given, Snapshot),
+    observe_query(Id, Query, Snapshot, Observation),
+    dependency_key(Observation, DependencyKey),
+    Available = [binding(observation, Observation)],
+    requested_bindings(Wanted, Available, Bindings),
+    DependencyKeys = [DependencyKey].
+transform_relation(context_grammar, Given, Wanted, _EnvelopeObservations,
+                   _Limits,
+                   reply([solution(Bindings, 0)], [], [], [])) :-
+    given_value(query, Given, Query),
+    given_value(snapshot, Given, Snapshot),
+    ( context_query(Query, Snapshot, Result)
+    -> Outcome = some(Result)
+    ;  Outcome = none
+    ),
+    Available = [binding(outcome, Outcome)],
+    requested_bindings(Wanted, Available, Bindings).
+transform_relation(context_grammar, Given, Wanted, Observations, _Limits,
+                   reply([solution(Bindings, 0)], [], DependencyKeys, [])) :-
+    given_value(graph, Given, Graph),
+    ready_queries(Graph, Observations, Ready),
+    observation_dependency_keys(Observations, DependencyKeys),
+    Available = [binding(ready, Ready)],
+    requested_bindings(Wanted, Available, Bindings).
+transform_relation(context_grammar, _Given, Wanted, Observations, _Limits,
+                   reply([solution(Bindings, 0)], [], DependencyKeys, [])) :-
+    Observations = [_|_],
+    observation_dependency_keys(Observations, DependencyKeys),
+    Available = [binding(dependency_keys, DependencyKeys)],
+    requested_bindings(Wanted, Available, Bindings).
+
 transform_relation(
     sequence_grammar(Specs, terminals(Terminals), separator(Separator),
                      contexts(Contexts)),

@@ -5,6 +5,7 @@
 test_name(same_request_shape_parses_and_renders_foreign_grammar).
 test_name(tear_completion_is_aggregated_from_parse_evidence).
 test_name(context_queries_completions_and_dependencies_are_one_relation).
+test_name(context_support_uses_the_same_given_wanted_envelope).
 test_name(solution_limit_is_enforced_and_reported).
 test_name(envelope_fails_closed).
 
@@ -151,6 +152,32 @@ run_test(context_queries_completions_and_dependencies_are_one_relation) :-
                                        33, 1)])], 33)],
         [query(q(1), Query)],
         [dependency(q(1), Query, some(all(Entries)))], []).
+
+run_test(context_support_uses_the_same_given_wanted_envelope) :-
+    Query = ask(one, object, name("work")),
+    Entry = entry(object, 7, ["work"], object_id(7), []),
+    Snapshot = snapshot(source(objects, 12), [Entry]),
+    Limits = limits(16, 256, 65536),
+    transform(
+        request(context_grammar,
+                given([binding(query, Query), binding(snapshot, Snapshot)]),
+                want([outcome]), observations([]), Limits),
+        reply([solution([binding(outcome, some(one(Entry)))], 0)], [], [], [])),
+    transform(
+        request(context_grammar,
+                given([binding(id, object_query), binding(query, Query),
+                       binding(snapshot, Snapshot)]),
+                want([observation]), observations([]), Limits),
+        reply([solution([binding(observation, Observation)], 0)], [],
+              [Dependency], [])),
+    Observation = observed(object_query, Query, source(objects, 12),
+                           some(one(Entry))),
+    Dependency = dependency(object_query, Query, some(one(Entry))),
+    transform(
+        request(context_grammar, given([]), want([dependency_keys]),
+                observations([Observation]), Limits),
+        reply([solution([binding(dependency_keys, [Dependency])], 0)], [],
+              [Dependency], [])).
 
 run_test(envelope_fails_closed) :-
     foreign_grammar(Grammar),

@@ -1198,21 +1198,6 @@ dispatch_application(action_help, request(Target, Filter), Response) :-
        ).
 dispatch_application(convert, request(FromKind, From, ToKind), ok(Results)) :-
     !, findall(To, convert(FromKind, From, ToKind, To), Results).
-dispatch_application(context_query, request(Query, Snapshot), ok(Outcome)) :-
-    !, ( context_query(Query, Snapshot, Result)
-       -> Outcome = some(Result)
-       ;  Outcome = none
-       ).
-dispatch_application(context_observe, request(Id, Query, Snapshot), ok(Observation)) :-
-    !, observe_query(Id, Query, Snapshot, Observation).
-dispatch_application(context_ready, request(Graph, Observations), ok(Ready)) :-
-    !, ready_queries(Graph, Observations, Ready).
-dispatch_application(context_dependencies, request(Observations), ok(Keys)) :-
-    !, findall(Key,
-               ( context_observation(Observations, Observation),
-                 dependency_key(Observation, Key)
-               ),
-               Keys).
 dispatch_application(context_plan, request(Items, Mode), ok(Plans)) :-
     !, findall(Plan, context_plan(Items, Mode, Plan), Plans).
 dispatch_application(context_resolve, request(Plan, Observations), Response) :-
@@ -1240,17 +1225,9 @@ dispatch_application(render, _, error(invalid_request)) :- !.
 dispatch_application(catalog, _, error(invalid_request)) :- !.
 dispatch_application(action_help, _, error(invalid_request)) :- !.
 dispatch_application(convert, _, error(invalid_request)) :- !.
-dispatch_application(context_query, _, error(invalid_request)) :- !.
-dispatch_application(context_observe, _, error(invalid_request)) :- !.
-dispatch_application(context_ready, _, error(invalid_request)) :- !.
-dispatch_application(context_dependencies, _, error(invalid_request)) :- !.
 dispatch_application(context_plan, _, error(invalid_request)) :- !.
 dispatch_application(context_resolve, _, error(invalid_request)) :- !.
 dispatch_application(context_completion, _, error(invalid_request)) :- !.
 dispatch_application(context_completion_resolve, _, error(invalid_request)) :- !.
 dispatch_application(action_request, _, error(invalid_request)) :- !.
 dispatch_application(_, _, error(invalid_operation)).
-
-context_observation([Observation|_], Observation).
-context_observation([_|Observations], Observation) :-
-    context_observation(Observations, Observation).
