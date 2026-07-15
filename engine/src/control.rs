@@ -798,7 +798,7 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
 /// brush_prov_nested). We stamp done_ts + exit_code on those brushprov rows so a
 /// reader can show per-pipeline wall time and tell running (done_ts==0) from
 /// finished. Best-effort; one-shot reply.
-fn brush_prov_done(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
+fn enclosing_box_from_pidfd(state: &State, peer_pidfd: Option<i32>) -> Result<i64, String> {
     let host_pid = peer_pidfd
         .map(host_pid_from_pidfd)
         .filter(|p| *p > 0)
@@ -808,23 +808,27 @@ fn brush_prov_done(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value
             libc::close(fd);
         }
     }
-    let Some(id) = derive_parent_box(state, host_pid) else {
-        return json!({"ok": false, "error": "no enclosing box"});
-    };
-    let uids: Vec<i64> = msg
-        .get("uids")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_i64).collect())
-        .unwrap_or_default();
-    let code = msg.get("code").and_then(Value::as_i64).unwrap_or(0);
-    let done_ts = msg.get("done_ts").and_then(Value::as_f64).unwrap_or(0.0);
+    derive_parent_box(state, host_pid).ok_or_else(|| "no enclosing box".into())
+}
+
+fn brush_prov_done(
+    state: &State,
+    pipelines: &[u64],
+    code: i32,
+    done_at: f64,
+    peer_pidfd: Option<i32>,
+) -> Result<(), String> {
+    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
+    let pipelines = pipelines.iter().map(|value| i64::try_from(*value)
+        .map_err(|_| "pipeline id exceeds SQLite range"))
+        .collect::<Result<Vec<_>, _>>()?;
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
-            b.mark_brushprov_done(&uids, code, done_ts);
+            b.mark_brushprov_done(&pipelines, i64::from(code), done_at);
         }
     }
-    json!({"ok": true})
+    Ok(())
 }
 
 /// Recipe fixup: after a $(shell) recipe finishes, the box sends the pipeline
@@ -832,39 +836,30 @@ fn brush_prov_done(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value
 /// brush_pipeline_id on stderr output rows that the FUSE handler captured
 /// during the recipe with a wrong (racy) attribution. The stderr flowed
 /// through fd 2 normally for live backread — this just fixes the DB linkage.
-fn recipe_fixup(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd
-        .map(host_pid_from_pidfd)
-        .filter(|p| *p > 0)
-        .unwrap_or(0);
-    if let Some(fd) = peer_pidfd {
-        unsafe {
-            libc::close(fd);
-        }
-    }
-    let Some(id) = derive_parent_box(state, host_pid) else {
-        return json!({"ok": false, "error": "no enclosing box"});
-    };
-    let uids: Vec<i64> = msg
-        .get("uids")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_i64).collect())
-        .unwrap_or_default();
-    let start_ts = msg.get("start_ts").and_then(Value::as_f64).unwrap_or(0.0);
+fn recipe_fixup(
+    state: &State,
+    pipelines: &[u64],
+    started_at: f64,
+    peer_pidfd: Option<i32>,
+) -> Result<(), String> {
+    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
+    let pipelines = pipelines.iter().map(|value| i64::try_from(*value)
+        .map_err(|_| "pipeline id exceeds SQLite range"))
+        .collect::<Result<Vec<_>, _>>()?;
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
-            let pipeline_id = uids
+            let pipeline_id = pipelines
                 .iter()
                 .map(|u| b.brushprov_id_for_uid(*u))
                 .find(|id| *id > 0)
                 .unwrap_or(0);
             if pipeline_id > 0 {
-                b.fixup_output_attribution(start_ts, pipeline_id);
+                b.fixup_output_attribution(started_at, pipeline_id);
             }
         }
     }
-    json!({"ok": true})
+    Ok(())
 }
 
 /// Phase 1 embedded-ninja `build_edges` verb. The shadowed `ninja` (vendored n2,
@@ -1043,47 +1038,40 @@ fn box_activity(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
     json!({"ok": true})
 }
 
-fn build_edge_state(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
-    let host_pid = peer_pidfd
-        .map(host_pid_from_pidfd)
-        .filter(|p| *p > 0)
-        .unwrap_or(0);
-    if let Some(fd) = peer_pidfd {
-        unsafe {
-            libc::close(fd);
-        }
+fn build_edge_state(
+    state: &State,
+    transition: &crate::generated_wire::BuildEdgeTransition,
+    peer_pidfd: Option<i32>,
+) -> Result<(), String> {
+    use crate::generated_wire::{BuildEdgeTransition, EdgePhase, SubscriptionEvent};
+    fn text_path(value: &crate::generated_wire::Path) -> Result<&str, String> {
+        std::str::from_utf8(value.as_slice())
+            .map_err(|_| "build edge output is not UTF-8".into())
     }
-    let Some(id) = derive_parent_box(state, host_pid) else {
-        return json!({"ok": false, "error": "no enclosing box"});
-    };
-    let phase = msg.get("state").and_then(Value::as_str).unwrap_or("");
-    let out = msg.get("out").and_then(Value::as_str);
-    let cmd = msg.get("cmd").and_then(Value::as_str);
-    let ts = msg.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
-    let code = msg.get("code").and_then(Value::as_i64).unwrap_or(0);
-    let excerpt = msg.get("excerpt").and_then(Value::as_str);
+    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
-            match phase {
-                "start" => b.mark_build_edge_started(out, cmd, ts),
-                "done" => b.mark_build_edge_done(out, cmd, code, ts, excerpt),
-                _ => {}
+            match transition {
+                BuildEdgeTransition::Start { at, output, command } => {
+                    let output = output.as_ref().map(text_path).transpose()?;
+                    b.mark_build_edge_started(output, command.as_ref().map(|value| value.as_str()), *at);
+                }
+                BuildEdgeTransition::Done { at, output, command, code, excerpt } => {
+                    let output = output.as_ref().map(text_path).transpose()?;
+                    b.mark_build_edge_done(output, command.as_ref().map(|value| value.as_str()),
+                        i64::from(*code), *at, excerpt.as_ref().map(|value| value.as_str()));
+                }
             }
         }
     }
-    if let Ok(r#box) = u64::try_from(id) {
-        let phase = match phase {
-            "start" => Some(crate::generated_wire::EdgePhase::Started),
-            "done" => Some(crate::generated_wire::EdgePhase::Done),
-            _ => None,
-        };
-        if let Some(phase) = phase {
-            broadcast(state,
-                &crate::generated_wire::SubscriptionEvent::BuildGraphChanged { r#box, phase });
-        }
-    }
-    json!({"ok": true})
+    let r#box = u64::try_from(id).map_err(|_| "negative enclosing box id")?;
+    let phase = match transition {
+        BuildEdgeTransition::Start { .. } => EdgePhase::Started,
+        BuildEdgeTransition::Done { .. } => EdgePhase::Done,
+    };
+    broadcast(state, &SubscriptionEvent::BuildGraphChanged { r#box, phase });
+    Ok(())
 }
 
 pub fn broadcast(state: &State, event: &crate::generated_wire::SubscriptionEvent) {
@@ -6426,9 +6414,37 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // pipeline's complete-command finishes, carrying its OWN pidfd (like
             // brush_prov_nested) so we resolve the box, then stamp done_ts +
             // exit_code on the matching brushprov rows (by uid).
-            brush_prov_done(&state, &msg, peer_pidfd.take())
+            let result = (|| {
+                let values = msg.get("uids").and_then(Value::as_array)
+                    .ok_or("brush_prov_done: missing uids")?;
+                let pipelines = values.iter().map(|value| value.as_u64()
+                    .ok_or("brush_prov_done: pipeline id must be unsigned"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let code = i32::try_from(msg.get("code").and_then(Value::as_i64).unwrap_or(0))
+                    .map_err(|_| "brush_prov_done: code exceeds i32")?;
+                let done_at = msg.get("done_ts").and_then(Value::as_f64)
+                    .ok_or("brush_prov_done: missing done_ts")?;
+                brush_prov_done(&state, &pipelines, code, done_at, peer_pidfd.take())
+            })();
+            match result {
+                Ok(()) => json!({"ok": true}),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
         } else if msg.get("type").and_then(Value::as_str) == Some("recipe_fixup") {
-            recipe_fixup(&state, &msg, peer_pidfd.take())
+            let result = (|| {
+                let values = msg.get("uids").and_then(Value::as_array)
+                    .ok_or("recipe_fixup: missing uids")?;
+                let pipelines = values.iter().map(|value| value.as_u64()
+                    .ok_or("recipe_fixup: pipeline id must be unsigned"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let started_at = msg.get("start_ts").and_then(Value::as_f64)
+                    .ok_or("recipe_fixup: missing start_ts")?;
+                recipe_fixup(&state, &pipelines, started_at, peer_pidfd.take())
+            })();
+            match result {
+                Ok(()) => json!({"ok": true}),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edges") {
             // Phase 1 embedded-ninja: a one-shot control message from the
             // shadowed `ninja` (vendored n2) carrying its OWN pidfd, resolved to
@@ -6442,7 +6458,35 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // A single edge's run-state transition (started / finished), sent by
             // the in-process make/ninja executor around each recipe — stamps the
             // box's build_edges row so the targets pane shows live build progress.
-            build_edge_state(&state, &msg, peer_pidfd.take())
+            let result = (|| {
+                let path = |name: &str| msg.get(name).and_then(Value::as_str)
+                    .map(|value| crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                        .map_err(|_| "build edge path exceeds relation bound"))
+                    .transpose();
+                let text = |name: &str| msg.get(name).and_then(Value::as_str)
+                    .map(|value| crate::wire::BoundedText::new(value.to_owned())
+                        .map_err(|_| "build edge text exceeds relation bound"))
+                    .transpose();
+                let at = msg.get("ts").and_then(Value::as_f64)
+                    .ok_or("build_edge_state: missing timestamp")?;
+                let transition = match msg.get("state").and_then(Value::as_str) {
+                    Some("start") => crate::generated_wire::BuildEdgeTransition::Start {
+                        at, output: path("out")?, command: text("cmd")?,
+                    },
+                    Some("done") => crate::generated_wire::BuildEdgeTransition::Done {
+                        at, output: path("out")?, command: text("cmd")?,
+                        code: i32::try_from(msg.get("code").and_then(Value::as_i64)
+                            .unwrap_or(0)).map_err(|_| "build edge code exceeds i32")?,
+                        excerpt: text("excerpt")?,
+                    },
+                    _ => return Err("build_edge_state: invalid state".into()),
+                };
+                build_edge_state(&state, &transition, peer_pidfd.take())
+            })();
+            match result {
+                Ok(()) => json!({"ok": true}),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
         } else {
             dispatch(&state, &msg)
         };

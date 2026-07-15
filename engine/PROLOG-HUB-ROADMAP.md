@@ -853,6 +853,14 @@ belong to the relation.
   the coordinated binary listener/client cutover. The full native
   aarch64-musl suite passes 308 tests with one existing browser e2e test
   ignored.
+- Began the transport-ingestion side of the atomic cutover by making pipeline
+  completion, recipe attribution fixup, and build-edge transitions consume the
+  generated `PipelineId`/`ExitCode`/`BuildEdgeTransition` values directly.
+  Pidfd-to-box resolution is shared, range and UTF-8 constraints fail before
+  storage mutation, and edge-state broadcasts reuse the typed transition. The
+  temporary newline listener only constructs these values at its boundary.
+  The full native aarch64-musl suite passes 308 tests with one existing browser
+  e2e test ignored.
 
 ## Stop conditions
 
