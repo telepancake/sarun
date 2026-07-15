@@ -174,42 +174,51 @@ scoped_observations(Key, [_|Rest], Inner) :-
 scope_reply(Key, AlternativePreference,
             reply(Solutions0, Queries0, Dependencies0, Diagnostics),
             reply(Solutions, Queries, Dependencies, Diagnostics)) :-
-    scope_solutions(Solutions0, AlternativePreference, Solutions),
+    scope_solutions(Key, Solutions0, AlternativePreference, Solutions),
     scope_queries(Key, Queries0, Queries),
     scope_dependencies(Key, Dependencies0, Dependencies).
 
-scope_solutions([], _, []).
-scope_solutions([solution(Bindings0, Preference0)|Rest], AlternativePreference,
+scope_solutions(_, [], _, []).
+scope_solutions(Key, [solution(Bindings0, Preference0)|Rest], AlternativePreference,
                 [solution(Bindings, Preference)|Solutions]) :-
     Preference is Preference0 + AlternativePreference,
-    scope_binding_preferences(Bindings0, AlternativePreference, Bindings),
-    scope_solutions(Rest, AlternativePreference, Solutions).
+    scope_binding_preferences(Key, Bindings0, AlternativePreference, Bindings),
+    scope_solutions(Key, Rest, AlternativePreference, Solutions).
 
-scope_binding_preferences([], _, []).
-scope_binding_preferences([binding(completions, Completions0)|Bindings], Added,
+scope_binding_preferences(_, [], _, []).
+scope_binding_preferences(Key,
+                          [binding(completions, Completions0)|Bindings], Added,
                           [binding(completions, Completions)|Scoped]) :-
     !,
-    scope_completions(Completions0, Added, Completions),
-    scope_binding_preferences(Bindings, Added, Scoped).
-scope_binding_preferences([Binding|Bindings], Added, [Binding|Scoped]) :-
-    scope_binding_preferences(Bindings, Added, Scoped).
+    scope_completions(Key, Completions0, Added, Completions),
+    scope_binding_preferences(Key, Bindings, Added, Scoped).
+scope_binding_preferences(Key, [Binding|Bindings], Added, [Binding|Scoped]) :-
+    scope_binding_preferences(Key, Bindings, Added, Scoped).
 
-scope_completions([], _, []).
-scope_completions(
+scope_completions(_, [], _, []).
+scope_completions(Key,
     [completion(Span, Text, Alternatives0, Preference0, Rank)|Completions],
     Added,
     [completion(Span, Text, Alternatives, Preference, Rank)|Scoped]) :-
     Preference is Preference0 + Added,
-    scope_completion_alternatives(Alternatives0, Added, Alternatives),
-    scope_completions(Completions, Added, Scoped).
+    scope_completion_alternatives(Key, Alternatives0, Added, Alternatives),
+    scope_completions(Key, Completions, Added, Scoped).
 
-scope_completion_alternatives([], _, []).
-scope_completion_alternatives(
+scope_completion_alternatives(_, [], _, []).
+scope_completion_alternatives(Key,
+    [alternative(context(Domain, Identity), Syntax, Description,
+                 Preference0)|Alternatives], Added,
+    [alternative(context(Key, Domain, Identity), Syntax, Description,
+                 Preference)|Scoped]) :-
+    !,
+    Preference is Preference0 + Added,
+    scope_completion_alternatives(Key, Alternatives, Added, Scoped).
+scope_completion_alternatives(Key,
     [alternative(Semantic, Syntax, Description, Preference0)|Alternatives],
     Added,
     [alternative(Semantic, Syntax, Description, Preference)|Scoped]) :-
     Preference is Preference0 + Added,
-    scope_completion_alternatives(Alternatives, Added, Scoped).
+    scope_completion_alternatives(Key, Alternatives, Added, Scoped).
 
 scope_queries(_, [], []).
 scope_queries(Key, [query(Id, Query)|Rest],
@@ -518,6 +527,11 @@ context_ask(exact, _, Cardinality, Domain, Scope, Known, Surface,
             ask(Cardinality, Domain, Selector)) :-
     context_selector(Scope, Known, name(Surface), Selector),
     context_cardinality(Cardinality).
+context_ask(assist(_), Origin, Cardinality, Domain, Scope, Known, Surface,
+            ask(Cardinality, Domain, Selector)) :-
+    Origin \= tear(_, _),
+    context_selector(Scope, Known, name(Surface), Selector),
+    context_cardinality(Cardinality).
 context_ask(assist(EditId), tear(EditId, argument(_, _)), one, Domain, Scope,
             Known, Surface, ask(all, Domain, Selector)) :-
     context_selector(Scope, Known, prefix(Surface), Selector).
@@ -625,15 +639,9 @@ context_replacements(
        ( context_descriptor(Name, _, _, _, Contexts)
        -> Id = q(QueryIndex),
           NextQuery is QueryIndex + 1,
-          ( Origin \= tear(_, _),
-            candidate_member(query(Id, Query), Queries),
-            candidate_member(
-                observed(Id, Query, _,
-                         some(one(entry(_, _, _, Value, _)))),
-                Observations)
-          -> Replacements = [replace(ArgumentIndex, Value)|Rest]
-          ;  Replacements = Rest
-          )
+          resolve_context_replacement(
+              Origin, Id, Queries, Observations, ArgumentIndex,
+              Replacements, Rest)
        ;  NextQuery = QueryIndex,
           Replacements = Rest
        )
@@ -643,6 +651,20 @@ context_replacements(
     ),
     context_replacements(Evidence, Specs, Contexts, Queries, Observations,
                          NextQuery, NextArgument, Rest).
+
+% A contextual value in exact source is valid only when its declared `one`
+% query succeeds. An edit tear deliberately remains a hole while completion
+% observes its `all` query. Keeping this rule in ordinary solution production
+% makes parsing, highlighting, and completion share the same validity test.
+resolve_context_replacement(tear(_, _), _, _, _, _, Rest, Rest) :- !.
+resolve_context_replacement(_, Id, Queries, Observations, ArgumentIndex,
+                            Replacements, Rest) :-
+    candidate_member(query(Id, Query), Queries),
+    ( candidate_member(observed(Id, Query, _, Outcome), Observations)
+    -> Outcome = some(one(entry(_, _, _, Value, _))),
+       Replacements = [replace(ArgumentIndex, Value)|Rest]
+    ;  Replacements = Rest
+    ).
 
 spec_argument_name(Name, [argument(arg(Name, _, _, _))|_]).
 spec_argument_name(Name, [_|Specs]) :- spec_argument_name(Name, Specs).

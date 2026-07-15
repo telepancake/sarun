@@ -228,8 +228,10 @@ constrain foreign-grammar enumeration, and a
 tear completion is aggregated from ordinary parse evidence through the same
 request. The output-byte limit is validated at the Prolog envelope and bounded
 by the Rust decoder using the request-specific ceiling; oversized or zero
-limits fail before entering Prolog. The old action-specific `Operation` and
-`application/3` path still exists for sarun and must be migrated and deleted.
+limits fail before entering Prolog. Only action-help projection and
+action-request materialization still use the old action-specific
+`Operation`/`application/3` path; all parsing machinery has moved to the
+generic envelope and those final adapters must follow.
 The foreign grammar now also declares contextual fields with an explicit
 `empty`/`one`/`all` exact cardinality. Exact and torn source transformations
 return stable query nodes; resubmitted observations produce completion matches
@@ -249,17 +251,18 @@ client inspection. Templates cover constants, binding references, compound
 terms, lists, and relational list concatenation; the latter proves that
 sarun's resume/pause projection can append and remove its fixed boolean through
 the same declaration. Foreign tests parse and render through nested
-choice/projection/sequence values. The action catalog has not yet been
-materialized as this immutable value, so the old action callback and operation
-surface remain the next deletion target.
+choice/projection/sequence values. The action catalog is now materialized as
+this immutable value; the duplicate legacy action predicates and their
+remaining help/request operation surface are the next deletion target.
 Terminals can now contain engine-interpreted codec data rather than a terminal
 predicate. `grammar_codec.pl` implements finite enumerations, typed integer and
 text wrappers, codec choice, and a closed relational JSON shape vocabulary
 (objects, arrays, tuples, nullable fields, and strings). A foreign grammar
 test parses reordered JSON fields into a typed compound and renders canonical
-compact JSON from the same declaration. This is sufficient to express the
-current OCI and API action arguments as grammar data; those declarations and
-the removal of their duplicate callback implementation are next.
+compact JSON from the same declaration. The current OCI and API action
+arguments are expressed with these codecs in the installed action grammar.
+Their older duplicate parsing predicates remain to be deleted after help and
+action-request projections cross the boundary.
 `action_grammar:action_relation_grammar/1` now materializes all 108 actions as
 one immutable `choice_grammar` value. Every branch contains its mechanically
 derived command words, source schema, declarative terminal codecs, context
@@ -267,9 +270,8 @@ descriptors, action preference, and a bidirectional template for the normalized
 `command(Action, Handler, Target, WireArguments)` representation. Generic
 transformation tests parse and render `mirror_resume`, including its fixed
 false wire argument, without the terminal callback or action operation table.
-The value is not yet installed behind an opaque handle and production Rust is
-not yet consuming it; context observation must resolve lexical arguments in
-the generic engine before that cut-over.
+The complete value is installed once behind the opaque `sarun_actions` handle
+and production Rust consumes it without transporting or inspecting its tree.
 Generic context staging now resolves successful `one` observations into the
 corresponding neutral argument binding before semantic projection. Dependent
 selectors are declared with argument references, become validated query-graph
@@ -286,8 +288,8 @@ installs it as `grammar_handle(sarun_actions)`; `relation_api` resolves handles
 generically and has no action-name branch. Reinstalling the identical value is
 idempotent, changing a handle fails, and missing handles fail closed. A native
 aarch64 structured-FLI test renders an action through the installed handle, so
-Rust neither transports nor inspects the grammar tree. Production action
-adapters still call the old operation path and are the next cut-over.
+Rust neither transports nor inspects the grammar tree. Only help and closed
+action-request adapters still call the old operation path.
 Production Rust parsing, rendering, literal completion, and highlighting now
 use `grammar_handle(sarun_actions)` through `RelationRequest` and the recursive
 structured FLI. Input units, typed commands, and retained parse evidence are
@@ -296,9 +298,17 @@ is requested as a projection of the successful parse evidence through the
 same grammar, not recomputed by Rust. The four corresponding Rust `Operation`
 variants and Prolog `dispatch_application/3` cases have been deleted. All 319
 native aarch64 Rust tests (318 pass, one ignored browser integration test) and
-the command-modal regressions pass after the cut-over. Context plan adapters,
-help, and action-request materialization still remain on the old operation
-surface.
+the command-modal regressions pass after the cut-over. Context planning and
+completion now also use the generic request and explicit branch-scoped
+relation values for query identities. Concrete contextual fields remain part
+of an assist parse, so dependent completion first resolves earlier `one`
+queries and only then executes the torn field's `all` query. Failed context
+observations suppress semantic solutions and therefore highlights; the client
+does not filter evidence independently. Choice composition carries branch
+provenance into contextual completion semantics. The old context-plan
+predicates, four dispatch cases, Rust operations, textual encoders/decoders,
+and binding adapter have been deleted. Help and action-request materialization
+are the two remaining old operations.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:
@@ -348,7 +358,7 @@ Immediate extraction order:
 - [ ] Replace `action_grammar:application/3` and its dispatch table with the
       single generic transformation entry point; make context queries and
       evidence ordinary reply data.
-- [ ] Drive a foreign grammar and then sarun actions through that same boundary,
+- [x] Drive a foreign grammar and then sarun actions through that same boundary,
       preserving user-facing parse/render/completion/highlight/context tests.
 - [ ] Replace the flat action-only spec vocabulary and terminal callback with
       immutable composable grammar values interpreted only by the engine.

@@ -25,13 +25,6 @@ test_name(all_actions_roundtrip_through_shared_sequence_relation).
 test_name(completion_is_projected_from_tear_parse_evidence).
 test_name(tear_parse_checks_every_concrete_suffix_item).
 test_name(application_surface_is_closed).
-test_name(context_plan_captures_box_dependency).
-test_name(context_resolution_rewrites_wire_argument).
-test_name(dependent_path_plan_references_box_query).
-test_name(context_completion_uses_all_prefix_query).
-test_name(context_completion_resolution_uses_entry_names).
-test_name(context_completion_rejects_ambiguous_exact_binding).
-test_name(dependent_context_completion_graph).
 test_name(complete_action_language_is_an_immutable_grammar_value).
 test_name(generic_action_relation_parses_and_renders_projection).
 test_name(generic_action_relation_resolves_context_before_projection).
@@ -204,7 +197,7 @@ run_test(generic_action_completion_survives_context_roundtrip) :-
                    binding(completions, Completions)], 90)],
         [query(branch(kill, q(1)), Query)], _, []),
     Completions = [completion(span(5, 6), "C1",
-                              [alternative(context(box, 1), context_argument,
+                              [alternative(context(kill, box, 1), context_argument,
                                            boxes, 90)],
                               90, 1)].
 
@@ -650,101 +643,3 @@ run_test(application_surface_is_closed) :-
     expect_equal(ParseOutput, "error(invalid_operation)"),
     application(shell, "request(halt)", ShellOutput),
     expect_equal(ShellOutput, "error(invalid_operation)").
-
-run_test(context_plan_captures_box_dependency) :-
-    items(["rename", "work", "new-name"], Items),
-    once(context_plan(Items, exact,
-                      plan(command(rename, rename, control,
-                                   [string("work"), string("new-name")]),
-                           Queries, Bindings, _, _))),
-    expect_equal(Queries,
-                 [query(q1, ask(one, box, name("work")))]),
-    expect_equal(Bindings, [bind(q1, arg(1), entry_value)]).
-
-run_test(context_resolution_rewrites_wire_argument) :-
-    items(["rename", "work", "new-name"], Items),
-    once(context_plan(Items, exact, Plan)),
-    Plan = plan(_, [query(q1, Query)], _, _, _),
-    Observations =
-        [observed(q1, Query, source(boxes, 7),
-                  some(one(entry(box, 5, ["work"], integer(5), []))))],
-    resolve_context_plan(Plan, Observations, Command),
-    expect_equal(Command,
-                 command(rename, rename, control,
-                         [integer(5), string("new-name")])).
-
-run_test(dependent_path_plan_references_box_query) :-
-    items(["writer", "id", "work", "src/main.rs"], Items),
-    once(context_plan(Items, exact,
-                      plan(_, Queries, Bindings, _, _))),
-    expect_equal(Queries,
-                 [query(q1, ask(one, box, name("work"))),
-                  query(q2, ask(one, path,
-                                within(box(ref(q1)), name("src/main.rs"))))]),
-    expect_equal(Bindings,
-                 [bind(q1, arg(1), entry_value),
-                  bind(q2, arg(2), entry_value)]).
-
-run_test(context_completion_uses_all_prefix_query) :-
-    neutral("rename", 0, Rename),
-    Items = [Rename, edit_tear(edit, span(7, 9), "wo"), end(9)],
-    once(parse(Items, assist(edit),
-               parse_result(command(rename, rename, control,
-                                    [hole(sid, string),
-                                     hole(new, string)]),
-                            incomplete(edit(edit)), Evidence, _))),
-    expect(tear_argument(Evidence, edit, sid, string)),
-    once(context_completion_plan(Items, edit, Plan)),
-    expect_equal(Plan,
-                 completion_context(rename, span(7, 9), "wo",
-                                    [query(q1, ask(all, box, prefix("wo")))],
-                                    q1, 90)).
-
-tear_argument([evidence(_, _, _, _, _, _, _,
-                        tear(EditId, argument(Name, Kind)))|_],
-              EditId, Name, Kind).
-tear_argument([_|Evidence], EditId, Name, Kind) :-
-    tear_argument(Evidence, EditId, Name, Kind).
-
-run_test(context_completion_resolution_uses_entry_names) :-
-    Plan = completion_context(rename, span(7, 9), "wo",
-                              [query(q1, Query)], q1, 90),
-    Query = ask(all, box, prefix("wo")),
-    Observations =
-        [observed(q1, Query, source(boxes, 7),
-                  some(all([entry(box, 5, ["5", "work"], integer(5), []),
-                            entry(box, 9, ["9", "world"], integer(9), [])])))],
-    resolve_context_completion(Plan, Observations, Completions),
-    expect_equal(Completions,
-                 [completion(span(7, 9), "work",
-                             [alternative(context(rename, box, 5),
-                                          context_argument, boxes, 90)], 90, 1),
-                  completion(span(7, 9), "world",
-                             [alternative(context(rename, box, 9),
-                                          context_argument, boxes, 90)], 90, 2)]).
-
-run_test(context_completion_rejects_ambiguous_exact_binding) :-
-    Plan = completion_context(rename, span(7, 9), "wo",
-                              [query(q1, Query)], q1, 90),
-    Query = ask(all, box, prefix("wo")),
-    Observations =
-        [observed(q1, Query, source(boxes, 7),
-                  some(all([entry(box, 5, ["work"], integer(5), []),
-                            entry(box, 9, ["work"], integer(9), [])])))],
-    resolve_context_completion(Plan, Observations, Completions),
-    expect_equal(Completions, []).
-
-run_test(dependent_context_completion_graph) :-
-    neutral("writer", 0, Writer),
-    neutral("id", 7, Id),
-    neutral("work", 10, Box),
-    Items = [Writer, Id, Box, edit_tear(edit, span(15, 18), "src"), end(18)],
-    once(context_completion_plan(Items, edit, Plan)),
-    expect_equal(
-        Plan,
-        completion_context(
-            writer_id, span(15, 18), "src",
-            [query(q1, ask(one, box, name("work"))),
-             query(q2, ask(all, path,
-                           within(box(ref(q1)), prefix("src"))))],
-            q2, 100)).

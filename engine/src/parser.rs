@@ -357,7 +357,7 @@ fn execute_context_graph(
         for resolved in ready {
             let Some(original) = graph.iter().find(|node| node.id == resolved.id) else {
                 return Err(format!(
-                    "context relation returned unknown ready query {}",
+                    "context relation returned unknown ready query {:?}",
                     resolved.id
                 ));
             };
@@ -902,7 +902,9 @@ mod tests {
     fn contextual_completion_result_reparses_and_renders() {
         let input = "kill wo";
         let completion = complete_at(input, input.len(), &FixtureContext)
-            .unwrap().into_iter().find(|entry| entry.insert == "work")
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.insert == "work")
             .expect("live box completion");
         let completed = apply_completion(input, &completion);
         assert_eq!(completed, "kill work");

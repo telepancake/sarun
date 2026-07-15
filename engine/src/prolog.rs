@@ -252,7 +252,7 @@ pub enum ContextResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextObservation {
-    pub id: String,
+    pub id: RelationValue,
     pub query: ContextQuery,
     pub provider: RelationValue,
     pub revision: RelationValue,
@@ -262,39 +262,36 @@ pub struct ContextObservation {
 /// Provenance-free semantic projection used for parse invalidation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextDependencyKey {
-    pub id: String,
+    pub id: RelationValue,
     pub query: ContextQuery,
     pub outcome: Option<ContextResult>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextQueryNode {
-    pub id: String,
+    pub id: RelationValue,
     pub query: ContextQuery,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContextBinding {
-    pub query_id: String,
-    pub argument_index: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextPlan {
+    pub source: GrammarInput,
+    pub assist_edit: Option<String>,
     pub command: CommandAst,
     pub queries: Vec<ContextQueryNode>,
-    pub bindings: Vec<ContextBinding>,
     pub evidence: Vec<Evidence>,
     pub preference: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextCompletionPlan {
+    pub source: GrammarInput,
+    pub edit_id: String,
     pub action: String,
     pub replace: Span,
     pub surface: String,
     pub queries: Vec<ContextQueryNode>,
-    pub target_query_id: String,
+    pub target_query_id: RelationValue,
     pub preference: i64,
 }
 
@@ -375,10 +372,6 @@ pub struct RenderedCommand {
 #[derive(Clone, Copy)]
 enum Operation {
     ActionHelp,
-    ContextPlan,
-    ContextResolve,
-    ContextCompletion,
-    ContextCompletionResolve,
     ActionRequest,
 }
 
@@ -386,10 +379,6 @@ impl Operation {
     fn atom(self) -> &'static str {
         match self {
             Self::ActionHelp => "action_help",
-            Self::ContextPlan => "context_plan",
-            Self::ContextResolve => "context_resolve",
-            Self::ContextCompletion => "context_completion",
-            Self::ContextCompletionResolve => "context_completion_resolve",
             Self::ActionRequest => "action_request",
         }
     }
@@ -647,17 +636,16 @@ impl Prolog {
 
     pub fn observe_context(
         &self,
-        id: &str,
+        id: &RelationValue,
         query: &ContextQuery,
         snapshot: &ContextSnapshot,
     ) -> Result<ContextObservation, String> {
-        let id = checked_atom(id).ok_or("invalid context query id")?;
         let reply = self.transform(&RelationRequest {
             grammar: RelationValue::Atom("context_grammar".into()),
             given: vec![
                 RelationBinding {
                     name: "id".into(),
-                    value: RelationValue::Atom(id.into()),
+                    value: id.clone(),
                 },
                 RelationBinding {
                     name: "query".into(),
@@ -731,18 +719,39 @@ impl Prolog {
         input: &GrammarInput,
         assist_edit: Option<&'static str>,
     ) -> Result<Vec<ContextPlan>, String> {
-        let items = encode_input(input)?;
-        let mode = assist_edit.map_or_else(
-            || Ok("exact".to_string()),
-            |id| {
-                checked_atom(id)
-                    .map(|id| format!("assist({id})"))
-                    .ok_or("invalid edit tear id")
-            },
-        )?;
-        let response =
-            self.application(Operation::ContextPlan, format!("request({items},{mode})"))?;
-        decode_context_plans_response(&response)
+        let reply = self.transform(&RelationRequest {
+            grammar: action_grammar_handle(),
+            given: vec![RelationBinding {
+                name: "source".into(),
+                value: relation_compound(
+                    "source",
+                    vec![grammar_input_value(input)?, relation_mode(assist_edit)?],
+                ),
+            }],
+            wanted: vec!["command".into(), "status".into(), "evidence".into()],
+            observations: vec![],
+            limits: RelationLimits::default(),
+        })?;
+        if reply.solutions.is_empty() && only_no_solution(&reply) {
+            return Ok(Vec::new());
+        }
+        reject_relation_diagnostics(&reply)?;
+        let queries = decode_context_graph_values(&reply.context_queries)?;
+        reply
+            .solutions
+            .iter()
+            .map(|solution| {
+                let candidate = decode_relation_parse_solution(solution)?;
+                Ok(ContextPlan {
+                    source: input.clone(),
+                    assist_edit: assist_edit.map(str::to_owned),
+                    command: candidate.command,
+                    queries: queries.clone(),
+                    evidence: candidate.evidence,
+                    preference: candidate.preference,
+                })
+            })
+            .collect()
     }
 
     pub fn resolve_context_plan(
@@ -750,21 +759,43 @@ impl Prolog {
         plan: &ContextPlan,
         observations: &[ContextObservation],
     ) -> Result<CommandAst, QueryError> {
-        let observations = observations
-            .iter()
-            .map(encode_context_observation)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(QueryError::Backend)?
-            .join(",");
-        let request = format!(
-            "request({},[{}])",
-            encode_context_plan(plan).map_err(QueryError::Backend)?,
-            observations,
-        );
-        let response = self
-            .application(Operation::ContextResolve, request)
+        let reply = self
+            .transform(&RelationRequest {
+                grammar: action_grammar_handle(),
+                given: vec![RelationBinding {
+                    name: "source".into(),
+                    value: relation_compound(
+                        "source",
+                        vec![
+                            grammar_input_value(&plan.source).map_err(QueryError::Backend)?,
+                            relation_mode(plan.assist_edit.as_deref())
+                                .map_err(QueryError::Backend)?,
+                        ],
+                    ),
+                }],
+                wanted: vec!["command".into()],
+                observations: observations
+                    .iter()
+                    .map(context_observation_value)
+                    .collect::<Result<_, _>>()
+                    .map_err(QueryError::Backend)?,
+                limits: RelationLimits::default(),
+            })
             .map_err(QueryError::Backend)?;
-        decode_context_command_response(&response)
+        if reply.solutions.is_empty() && only_no_solution(&reply) {
+            return Err(QueryError::NoSolution);
+        }
+        reject_relation_diagnostics(&reply).map_err(QueryError::Backend)?;
+        for solution in &reply.solutions {
+            let command = decode_command(&parsed_relation_value(
+                solution_binding(solution, "command").map_err(QueryError::Backend)?,
+            ))
+            .map_err(QueryError::Backend)?;
+            if command.action == plan.command.action {
+                return Ok(command);
+            }
+        }
+        Err(QueryError::NoSolution)
     }
 
     pub fn context_completion_plans(
@@ -772,13 +803,60 @@ impl Prolog {
         input: &GrammarInput,
         edit_id: &'static str,
     ) -> Result<Vec<ContextCompletionPlan>, String> {
-        let items = encode_input(input)?;
-        let id = checked_atom(edit_id).ok_or("invalid edit tear id")?;
-        let response = self.application(
-            Operation::ContextCompletion,
-            format!("request({items},{id})"),
-        )?;
-        decode_context_completion_plans_response(&response)
+        let reply = self.transform(&RelationRequest {
+            grammar: action_grammar_handle(),
+            given: vec![RelationBinding {
+                name: "source".into(),
+                value: relation_compound(
+                    "source",
+                    vec![grammar_input_value(input)?, relation_mode(Some(edit_id))?],
+                ),
+            }],
+            wanted: vec!["command".into(), "completions".into()],
+            observations: vec![],
+            limits: RelationLimits {
+                max_solutions: 256,
+                ..RelationLimits::default()
+            },
+        })?;
+        if reply.context_queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        reject_relation_diagnostics(&reply)?;
+        let queries = decode_context_graph_values(&reply.context_queries)?;
+        let target_query_id = queries
+            .iter()
+            .rev()
+            .find(|node| node.query.cardinality == ContextCardinality::All)
+            .map(|node| node.id.clone())
+            .ok_or("context completion relation omitted its all query")?;
+        let solution = reply
+            .solutions
+            .first()
+            .ok_or("context completion relation returned no parse witness")?;
+        let command = decode_command(&parsed_relation_value(solution_binding(
+            solution, "command",
+        )?))?;
+        let (replace, surface) = input
+            .items
+            .iter()
+            .find_map(|item| match item {
+                InputItem::EditTear { id, span, surface } if *id == edit_id => {
+                    Some((*span, surface.clone()))
+                }
+                _ => None,
+            })
+            .ok_or("context completion input omitted its edit tear")?;
+        Ok(vec![ContextCompletionPlan {
+            source: input.clone(),
+            edit_id: edit_id.into(),
+            action: command.action,
+            replace,
+            surface,
+            queries,
+            target_query_id,
+            preference: solution.preference,
+        }])
     }
 
     pub fn resolve_context_completion(
@@ -786,18 +864,40 @@ impl Prolog {
         plan: &ContextCompletionPlan,
         observations: &[ContextObservation],
     ) -> Result<Vec<Completion>, String> {
-        let observations = observations
+        let reply = self.transform(&RelationRequest {
+            grammar: action_grammar_handle(),
+            given: vec![RelationBinding {
+                name: "source".into(),
+                value: relation_compound(
+                    "source",
+                    vec![
+                        grammar_input_value(&plan.source)?,
+                        relation_mode(Some(&plan.edit_id))?,
+                    ],
+                ),
+            }],
+            wanted: vec!["command".into(), "completions".into()],
+            observations: observations
+                .iter()
+                .map(context_observation_value)
+                .collect::<Result<_, _>>()?,
+            limits: RelationLimits {
+                max_solutions: 256,
+                ..RelationLimits::default()
+            },
+        })?;
+        reject_relation_diagnostics(&reply)?;
+        let solution = reply
+            .solutions
             .iter()
-            .map(encode_context_observation)
-            .collect::<Result<Vec<_>, _>>()?
-            .join(",");
-        let request = format!(
-            "request({},[{}])",
-            encode_context_completion_plan(plan)?,
-            observations,
-        );
-        let response = self.application(Operation::ContextCompletionResolve, request)?;
-        decode_completion_response(&response)
+            .find(|solution| {
+                solution_binding(solution, "command")
+                    .ok()
+                    .and_then(|value| decode_command(&parsed_relation_value(value)).ok())
+                    .is_some_and(|command| command.action == plan.action)
+            })
+            .ok_or("context completion relation lost its parse witness")?;
+        decode_completions_value(solution_binding(solution, "completions")?)
     }
 
     fn application(&self, operation: Operation, request: String) -> Result<String, String> {
@@ -1505,81 +1605,6 @@ fn quote_atom(text: &str) -> String {
     format!("'{escaped}'")
 }
 
-fn encode_span(span: Span) -> String {
-    format!("span({},{})", span.start, span.end)
-}
-
-fn encode_input(input: &GrammarInput) -> Result<String, String> {
-    if input.items.len() > MAX_ITEMS {
-        return Err(format!("action grammar input exceeds {MAX_ITEMS} items"));
-    }
-    let mut previous_end = 0;
-    let mut encoded = Vec::with_capacity(input.items.len() + 1);
-    for item in &input.items {
-        let (span, surface) = match item {
-            InputItem::Unit(unit) => (unit.span, unit.surface.as_str()),
-            InputItem::EditTear { span, surface, .. }
-            | InputItem::SourceTear { span, surface, .. } => (*span, surface.as_str()),
-        };
-        if span.start < previous_end || span.start > span.end || span.end > input.end {
-            return Err("action grammar input has invalid or overlapping spans".into());
-        }
-        previous_end = span.end;
-        if surface.len() > MAX_INPUT_BYTES {
-            return Err("action grammar item surface is too large".into());
-        }
-        encoded.push(match item {
-            InputItem::Unit(unit) => {
-                if unit.paint_spans.iter().any(|paint| {
-                    paint.start < unit.span.start
-                        || paint.start > paint.end
-                        || paint.end > unit.span.end
-                }) {
-                    return Err("action grammar unit has an invalid paint span".into());
-                }
-                let semantic = match &unit.semantic {
-                    Semantic::Atom(atom) => quote_atom(atom),
-                    Semantic::Integer(value) => format!("integer({value})"),
-                    Semantic::Text(value) => format!("text({})", quote_string(value)),
-                };
-                let syntax = quote_atom(&unit.syntax);
-                let provider = quote_atom(&unit.provider);
-                let paints = unit
-                    .paint_spans
-                    .iter()
-                    .map(|span| encode_span(*span))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!(
-                    "unit({semantic},{},[{paints}],{},{syntax},{provider},{},lexer)",
-                    encode_span(unit.span),
-                    quote_string(&unit.surface),
-                    unit.preference,
-                )
-            }
-            InputItem::EditTear { id, span, surface } => format!(
-                "edit_tear({},{},{})",
-                checked_atom(id).ok_or("invalid edit tear id")?,
-                encode_span(*span),
-                quote_string(surface),
-            ),
-            InputItem::SourceTear { id, span, surface } => format!(
-                "source_tear(source{id},{},{})",
-                encode_span(*span),
-                quote_string(surface),
-            ),
-        });
-    }
-    encoded.push(format!("end({})", input.end));
-    let result = format!("[{}]", encoded.join(","));
-    if result.len() > MAX_INPUT_BYTES {
-        return Err(format!(
-            "action grammar request exceeds {MAX_INPUT_BYTES} bytes"
-        ));
-    }
-    Ok(result)
-}
-
 fn encode_command_value(value: &CommandValue) -> String {
     match value {
         CommandValue::Integer(value) => format!("integer({value})"),
@@ -1651,31 +1676,6 @@ fn encode_command(command: &CommandAst) -> String {
         quote_atom(&command.target),
         args
     )
-}
-
-fn encode_relation_value(value: &RelationValue) -> Result<String, String> {
-    Ok(match value {
-        RelationValue::Atom(value) => quote_atom(value),
-        RelationValue::String(value) => quote_string(value),
-        RelationValue::Integer(value) => value.to_string(),
-        RelationValue::Compound(functor, arguments) => {
-            let functor = checked_atom(functor).ok_or("invalid relation value functor")?;
-            let arguments = arguments
-                .iter()
-                .map(encode_relation_value)
-                .collect::<Result<Vec<_>, _>>()?
-                .join(",");
-            format!("{functor}({arguments})")
-        }
-        RelationValue::List(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(encode_relation_value)
-                .collect::<Result<Vec<_>, _>>()?
-                .join(",")
-        ),
-    })
 }
 
 fn relation_compound(name: &str, arguments: Vec<RelationValue>) -> RelationValue {
@@ -2179,7 +2179,6 @@ fn context_result_value(result: &ContextResult) -> RelationValue {
 }
 
 fn context_observation_value(observation: &ContextObservation) -> Result<RelationValue, String> {
-    let id = checked_atom(&observation.id).ok_or("invalid context observation id")?;
     let outcome = observation.outcome.as_ref().map_or_else(
         || RelationValue::Atom("none".into()),
         |result| relation_compound("some", vec![context_result_value(result)]),
@@ -2187,7 +2186,7 @@ fn context_observation_value(observation: &ContextObservation) -> Result<Relatio
     Ok(relation_compound(
         "observed",
         vec![
-            RelationValue::Atom(id.into()),
+            observation.id.clone(),
             context_query_value(&observation.query),
             relation_compound(
                 "source",
@@ -2202,17 +2201,20 @@ fn context_graph_value(graph: &[ContextQueryNode]) -> Result<RelationValue, Stri
     graph
         .iter()
         .map(|node| {
-            let id = checked_atom(&node.id).ok_or("invalid context graph query id")?;
             Ok(relation_compound(
                 "query",
-                vec![
-                    RelationValue::Atom(id.into()),
-                    context_query_value(&node.query),
-                ],
+                vec![node.id.clone(), context_query_value(&node.query)],
             ))
         })
         .collect::<Result<Vec<_>, String>>()
         .map(relation_list)
+}
+
+fn decode_context_graph_values(values: &[RelationValue]) -> Result<Vec<ContextQueryNode>, String> {
+    values
+        .iter()
+        .map(|value| decode_context_node(&parsed_relation_value(value)))
+        .collect()
 }
 
 fn parsed_relation_value(value: &RelationValue) -> ParsedTerm {
@@ -2228,152 +2230,6 @@ fn parsed_relation_value(value: &RelationValue) -> ParsedTerm {
             ParsedTerm::List(values.iter().map(parsed_relation_value).collect())
         }
     }
-}
-
-fn encode_context_query(query: &ContextQuery) -> Result<String, String> {
-    let cardinality = match query.cardinality {
-        ContextCardinality::Empty => "empty",
-        ContextCardinality::One => "one",
-        ContextCardinality::All => "all",
-    };
-    Ok(format!(
-        "ask({cardinality},{},{})",
-        encode_relation_value(&query.domain)?,
-        encode_relation_value(&query.selector)?,
-    ))
-}
-
-fn encode_context_entry(entry: &ContextEntry) -> Result<String, String> {
-    let names = entry
-        .names
-        .iter()
-        .map(|name| quote_string(name))
-        .collect::<Vec<_>>()
-        .join(",");
-    let attributes = entry
-        .attributes
-        .iter()
-        .map(encode_relation_value)
-        .collect::<Result<Vec<_>, _>>()?
-        .join(",");
-    Ok(format!(
-        "entry({},{},[{}],{},[{}])",
-        encode_relation_value(&entry.domain)?,
-        encode_relation_value(&entry.identity)?,
-        names,
-        encode_relation_value(&entry.value)?,
-        attributes,
-    ))
-}
-
-fn encode_context_result(result: &ContextResult) -> Result<String, String> {
-    Ok(match result {
-        ContextResult::Empty(value) => format!("empty({value})"),
-        ContextResult::One(entry) => format!("one({})", encode_context_entry(entry)?),
-        ContextResult::All(entries) => format!(
-            "all([{}])",
-            entries
-                .iter()
-                .map(encode_context_entry)
-                .collect::<Result<Vec<_>, _>>()?
-                .join(",")
-        ),
-    })
-}
-
-fn encode_context_observation(observation: &ContextObservation) -> Result<String, String> {
-    let outcome = match &observation.outcome {
-        Some(result) => format!("some({})", encode_context_result(result)?),
-        None => "none".into(),
-    };
-    Ok(format!(
-        "observed({},{},source({},{}),{})",
-        quote_atom(&observation.id),
-        encode_context_query(&observation.query)?,
-        encode_relation_value(&observation.provider)?,
-        encode_relation_value(&observation.revision)?,
-        outcome,
-    ))
-}
-
-fn encode_context_graph(graph: &[ContextQueryNode]) -> Result<String, String> {
-    Ok(format!(
-        "[{}]",
-        graph
-            .iter()
-            .map(encode_context_node)
-            .collect::<Result<Vec<_>, String>>()?
-            .join(",")
-    ))
-}
-
-fn encode_context_node(node: &ContextQueryNode) -> Result<String, String> {
-    Ok(format!(
-        "query({},{})",
-        quote_atom(&node.id),
-        encode_context_query(&node.query)?,
-    ))
-}
-
-fn encode_evidence_items(evidence: &[Evidence]) -> String {
-    evidence
-        .iter()
-        .map(|item| {
-            let paints = item
-                .paint_spans
-                .iter()
-                .map(|span| encode_span(*span))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "evidence({},{},[{}],{},{},{},{},{})",
-                quote_atom(&item.semantic),
-                encode_span(item.span),
-                paints,
-                quote_string(&item.surface),
-                quote_atom(&item.syntax),
-                quote_atom(&item.provider),
-                item.preference,
-                quote_atom(&item.origin),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn encode_context_plan(plan: &ContextPlan) -> Result<String, String> {
-    let bindings = plan
-        .bindings
-        .iter()
-        .map(|binding| {
-            format!(
-                "bind({},arg({}),entry_value)",
-                quote_atom(&binding.query_id),
-                binding.argument_index,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    Ok(format!(
-        "plan({}, {}, [{}], [{}], {})",
-        encode_command(&plan.command),
-        encode_context_graph(&plan.queries)?,
-        bindings,
-        encode_evidence_items(&plan.evidence),
-        plan.preference,
-    ))
-}
-
-fn encode_context_completion_plan(plan: &ContextCompletionPlan) -> Result<String, String> {
-    Ok(format!(
-        "completion_context({},{},{},{},{},{})",
-        quote_atom(&plan.action),
-        encode_span(plan.replace),
-        quote_string(&plan.surface),
-        encode_context_graph(&plan.queries)?,
-        quote_atom(&plan.target_query_id),
-        plan.preference,
-    ))
 }
 
 #[derive(Clone, Debug)]
@@ -2706,7 +2562,7 @@ fn decode_context_observation(term: &ParsedTerm) -> Result<ContextObservation, S
     let args = compound(term, "observed", 4)?;
     let source = compound(&args[2], "source", 2)?;
     Ok(ContextObservation {
-        id: atom(&args[0])?.to_owned(),
+        id: decode_relation_value(&args[0])?,
         query: decode_context_query(&args[1])?,
         provider: decode_relation_value(&source[0])?,
         revision: decode_relation_value(&source[1])?,
@@ -2717,7 +2573,7 @@ fn decode_context_observation(term: &ParsedTerm) -> Result<ContextObservation, S
 fn decode_context_node(term: &ParsedTerm) -> Result<ContextQueryNode, String> {
     let args = compound(term, "query", 2)?;
     Ok(ContextQueryNode {
-        id: atom(&args[0])?.to_owned(),
+        id: decode_relation_value(&args[0])?,
         query: decode_context_query(&args[1])?,
     })
 }
@@ -2725,95 +2581,10 @@ fn decode_context_node(term: &ParsedTerm) -> Result<ContextQueryNode, String> {
 fn decode_context_dependency_key(term: &ParsedTerm) -> Result<ContextDependencyKey, String> {
     let args = compound(term, "dependency", 3)?;
     Ok(ContextDependencyKey {
-        id: atom(&args[0])?.to_owned(),
+        id: decode_relation_value(&args[0])?,
         query: decode_context_query(&args[1])?,
         outcome: decode_context_outcome(&args[2])?,
     })
-}
-
-fn decode_context_binding(term: &ParsedTerm) -> Result<ContextBinding, String> {
-    let args = compound(term, "bind", 3)?;
-    let argument = compound(&args[1], "arg", 1)?;
-    if atom(&args[2])? != "entry_value" {
-        return Err("invalid context binding projection".into());
-    }
-    let argument_index = nonnegative(&argument[0])?;
-    if argument_index == 0 {
-        return Err("context binding uses zero argument index".into());
-    }
-    Ok(ContextBinding {
-        query_id: atom(&args[0])?.to_owned(),
-        argument_index,
-    })
-}
-
-fn decode_context_plan(term: &ParsedTerm) -> Result<ContextPlan, String> {
-    let args = compound(term, "plan", 5)?;
-    Ok(ContextPlan {
-        command: decode_command(&args[0])?,
-        queries: list(&args[1])?
-            .iter()
-            .map(decode_context_node)
-            .collect::<Result<_, _>>()?,
-        bindings: list(&args[2])?
-            .iter()
-            .map(decode_context_binding)
-            .collect::<Result<_, _>>()?,
-        evidence: list(&args[3])?
-            .iter()
-            .map(decode_evidence)
-            .collect::<Result<_, _>>()?,
-        preference: integer(&args[4])?,
-    })
-}
-
-fn decode_context_completion_plan(term: &ParsedTerm) -> Result<ContextCompletionPlan, String> {
-    let args = compound(term, "completion_context", 6)?;
-    Ok(ContextCompletionPlan {
-        action: atom(&args[0])?.to_owned(),
-        replace: decode_span(&args[1])?,
-        surface: text(&args[2])?.to_owned(),
-        queries: list(&args[3])?
-            .iter()
-            .map(decode_context_node)
-            .collect::<Result<_, _>>()?,
-        target_query_id: atom(&args[4])?.to_owned(),
-        preference: integer(&args[5])?,
-    })
-}
-
-fn decode_context_plans_response(response: &str) -> Result<Vec<ContextPlan>, String> {
-    let value = response_value(response)?;
-    list(&value)?.iter().map(decode_context_plan).collect()
-}
-
-fn decode_context_completion_plans_response(
-    response: &str,
-) -> Result<Vec<ContextCompletionPlan>, String> {
-    let value = response_value(response)?;
-    list(&value)?
-        .iter()
-        .map(decode_context_completion_plan)
-        .collect()
-}
-
-fn decode_context_command_response(response: &str) -> Result<CommandAst, QueryError> {
-    let term = TermParser::parse(response).map_err(QueryError::Backend)?;
-    if let Ok(args) = compound(&term, "ok", 1) {
-        return decode_command(&args[0]).map_err(QueryError::Backend);
-    }
-    if let Ok(args) = compound(&term, "error", 1) {
-        if atom(&args[0]).ok() == Some("no_solution") {
-            return Err(QueryError::NoSolution);
-        }
-        return Err(QueryError::Backend(format!(
-            "action grammar rejected request: {}",
-            term_text(&args[0])
-        )));
-    }
-    Err(QueryError::Backend(
-        "invalid context resolution response".into(),
-    ))
 }
 
 fn decode_span(term: &ParsedTerm) -> Result<Span, String> {
@@ -2922,11 +2693,6 @@ fn decode_evidence(term: &ParsedTerm) -> Result<Evidence, String> {
         preference: integer(&args[6])?,
         origin: term_text(&args[7]),
     })
-}
-
-fn decode_completion_response(response: &str) -> Result<Vec<Completion>, String> {
-    let value = response_value(response)?;
-    decode_completions_term(&value)
 }
 
 fn decode_completions_value(value: &RelationValue) -> Result<Vec<Completion>, String> {
@@ -3458,7 +3224,7 @@ mod tests {
             Some(ContextResult::One(entry.clone())),
         );
         let observation = prolog
-            .observe_context("box_query", &box_query, &snapshot)
+            .observe_context(&atom("box_query"), &box_query, &snapshot)
             .unwrap();
         assert_eq!(observation.outcome, Some(ContextResult::One(entry)));
         let dependency = prolog
@@ -3493,11 +3259,11 @@ mod tests {
             .ready_context_queries(
                 &[
                     ContextQueryNode {
-                        id: "box_query".into(),
+                        id: atom("box_query"),
                         query: box_query,
                     },
                     ContextQueryNode {
-                        id: "path_query".into(),
+                        id: atom("path_query"),
                         query: path_query,
                     },
                 ],
@@ -3505,7 +3271,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].id, "path_query");
+        assert_eq!(ready[0].id, atom("path_query"));
         assert_eq!(
             ready[0].query.selector,
             compound(
@@ -3536,14 +3302,6 @@ mod tests {
             plan.queries[0].query.domain,
             RelationValue::Atom("box".into())
         );
-        assert_eq!(
-            plan.bindings,
-            vec![ContextBinding {
-                query_id: "q1".into(),
-                argument_index: 1,
-            }],
-        );
-
         let entry = ContextEntry {
             domain: RelationValue::Atom("box".into()),
             identity: RelationValue::Integer(5),
@@ -3552,7 +3310,7 @@ mod tests {
             attributes: Vec::new(),
         };
         let observation = ContextObservation {
-            id: "q1".into(),
+            id: plan.queries[0].id.clone(),
             query: plan.queries[0].query.clone(),
             provider: RelationValue::Atom("boxes".into()),
             revision: RelationValue::Integer(7),
@@ -3587,7 +3345,7 @@ mod tests {
         assert_eq!(plans[0].replace, Span { start: 7, end: 9 });
         assert_eq!(plans[0].surface, "wo");
         assert_eq!(plans[0].queries.len(), 1);
-        assert_eq!(plans[0].target_query_id, "q1");
+        assert_eq!(plans[0].target_query_id, plans[0].queries[0].id);
         assert_eq!(plans[0].preference, 90);
         assert_eq!(
             plans[0].queries[0].query.cardinality,
