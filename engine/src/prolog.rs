@@ -118,10 +118,28 @@ pub enum CommandValue {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Path(String),
+    Base64(String),
+    Spec(String),
+    OciSpec {
+        context_tar_gz: String,
+        dockerfile: String,
+        tag: Option<String>,
+        net_mode: String,
+        build_arguments: Vec<(String, String)>,
+    },
+    ApiSpec {
+        base_url: String,
+        model: String,
+        api_key: String,
+    },
     Array(Vec<CommandValue>),
     /// A typed argument expected after an edit tear in an incomplete parse.
     /// Complete commands crossing the execution boundary never contain this.
-    Hole { name: String, kind: String },
+    Hole {
+        name: String,
+        kind: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -316,6 +334,7 @@ enum Operation {
     ContextResolve,
     ContextCompletion,
     ContextCompletionResolve,
+    ActionRequest,
 }
 
 impl Operation {
@@ -333,6 +352,7 @@ impl Operation {
             Self::ContextResolve => "context_resolve",
             Self::ContextCompletion => "context_completion",
             Self::ContextCompletionResolve => "context_completion_resolve",
+            Self::ActionRequest => "action_request",
         }
     }
 }
@@ -462,6 +482,19 @@ impl Prolog {
         Ok(RenderedCommand { form, text })
     }
 
+    pub fn action_request(
+        &self,
+        command: &CommandAst,
+    ) -> Result<crate::generated_wire::ActionRequest, QueryError> {
+        let response = self
+            .application(
+                Operation::ActionRequest,
+                format!("request({})", encode_command(command)),
+            )
+            .map_err(QueryError::Backend)?;
+        decode_action_request_response(&response)
+    }
+
     pub fn context_query(
         &self,
         query: &ContextQuery,
@@ -534,12 +567,14 @@ impl Prolog {
         let items = encode_input(input)?;
         let mode = assist_edit.map_or_else(
             || Ok("exact".to_string()),
-            |id| checked_atom(id).map(|id| format!("assist({id})")).ok_or("invalid edit tear id"),
+            |id| {
+                checked_atom(id)
+                    .map(|id| format!("assist({id})"))
+                    .ok_or("invalid edit tear id")
+            },
         )?;
-        let response = self.application(
-            Operation::ContextPlan,
-            format!("request({items},{mode})"),
-        )?;
+        let response =
+            self.application(Operation::ContextPlan, format!("request({items},{mode})"))?;
         decode_context_plans_response(&response)
     }
 
@@ -1099,6 +1134,44 @@ fn encode_command_value(value: &CommandValue) -> String {
         CommandValue::Integer(value) => format!("integer({value})"),
         CommandValue::Boolean(value) => format!("boolean({value})"),
         CommandValue::String(value) => format!("string({})", quote_string(value)),
+        CommandValue::Path(value) => format!("path({})", quote_string(value)),
+        CommandValue::Base64(value) => format!("base64({})", quote_string(value)),
+        CommandValue::Spec(value) => format!("spec({})", quote_string(value)),
+        CommandValue::OciSpec {
+            context_tar_gz,
+            dockerfile,
+            tag,
+            net_mode,
+            build_arguments,
+        } => {
+            let tag = tag.as_ref().map_or_else(
+                || "none".to_string(),
+                |value| format!("some({})", quote_string(value)),
+            );
+            let build_arguments = build_arguments
+                .iter()
+                .map(|(key, value)| format!("pair({},{})", quote_string(key), quote_string(value)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "oci_spec({},{},{},{},[{}])",
+                quote_string(context_tar_gz),
+                quote_string(dockerfile),
+                tag,
+                quote_string(net_mode),
+                build_arguments,
+            )
+        }
+        CommandValue::ApiSpec {
+            base_url,
+            model,
+            api_key,
+        } => format!(
+            "api_spec({},{},{})",
+            quote_string(base_url),
+            quote_string(model),
+            quote_string(api_key),
+        ),
         CommandValue::Array(values) => format!(
             "array([{}])",
             values
@@ -1746,10 +1819,7 @@ fn decode_context_observation_response(response: &str) -> Result<ContextObservat
 
 fn decode_context_ready_response(response: &str) -> Result<Vec<ContextQueryNode>, String> {
     let value = response_value(response)?;
-    list(&value)?
-        .iter()
-        .map(decode_context_node)
-        .collect()
+    list(&value)?.iter().map(decode_context_node).collect()
 }
 
 fn decode_context_dependency_keys_response(
@@ -1817,6 +1887,44 @@ fn decode_command_value(term: &ParsedTerm) -> Result<CommandValue, String> {
     }
     if let Ok(args) = compound(term, "string", 1) {
         return Ok(CommandValue::String(text(&args[0])?.to_string()));
+    }
+    if let Ok(args) = compound(term, "path", 1) {
+        return Ok(CommandValue::Path(text(&args[0])?.to_string()));
+    }
+    if let Ok(args) = compound(term, "base64", 1) {
+        return Ok(CommandValue::Base64(text(&args[0])?.to_string()));
+    }
+    if let Ok(args) = compound(term, "spec", 1) {
+        return Ok(CommandValue::Spec(text(&args[0])?.to_string()));
+    }
+    if let Ok(args) = compound(term, "oci_spec", 5) {
+        let tag = if atom(&args[2]).ok() == Some("none") {
+            None
+        } else {
+            let value = compound(&args[2], "some", 1)?;
+            Some(text(&value[0])?.to_string())
+        };
+        let build_arguments = list(&args[4])?
+            .iter()
+            .map(|pair| {
+                let fields = compound(pair, "pair", 2)?;
+                Ok((text(&fields[0])?.to_string(), text(&fields[1])?.to_string()))
+            })
+            .collect::<Result<_, String>>()?;
+        return Ok(CommandValue::OciSpec {
+            context_tar_gz: text(&args[0])?.to_string(),
+            dockerfile: text(&args[1])?.to_string(),
+            tag,
+            net_mode: text(&args[3])?.to_string(),
+            build_arguments,
+        });
+    }
+    if let Ok(args) = compound(term, "api_spec", 3) {
+        return Ok(CommandValue::ApiSpec {
+            base_url: text(&args[0])?.to_string(),
+            model: text(&args[1])?.to_string(),
+            api_key: text(&args[2])?.to_string(),
+        });
     }
     if let Ok(args) = compound(term, "array", 1) {
         return Ok(CommandValue::Array(
@@ -1961,6 +2069,40 @@ fn decode_render_response(response: &str) -> Result<String, QueryError> {
     ))
 }
 
+fn decode_action_request_response(
+    response: &str,
+) -> Result<crate::generated_wire::ActionRequest, QueryError> {
+    let term = TermParser::parse(response).map_err(QueryError::Backend)?;
+    if let Ok(ok) = compound(&term, "ok", 1) {
+        let request = compound(&ok[0], "action_request", 3).map_err(QueryError::Backend)?;
+        let handler = atom(&request[0]).map_err(QueryError::Backend)?;
+        let code: u64 = integer(&request[1])
+            .map_err(QueryError::Backend)?
+            .try_into()
+            .map_err(|_| QueryError::Backend("negative relation action opcode".into()))?;
+        let values = list(&request[2])
+            .map_err(QueryError::Backend)?
+            .iter()
+            .map(decode_relation_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(QueryError::Backend)?;
+        return crate::generated_wire::ActionRequest::from_relation(handler, code, &values)
+            .map_err(QueryError::Backend);
+    }
+    if let Ok(error) = compound(&term, "error", 1) {
+        if atom(&error[0]).ok() == Some("no_solution") {
+            return Err(QueryError::NoSolution);
+        }
+        return Err(QueryError::Backend(format!(
+            "action grammar rejected request conversion: {}",
+            term_text(&error[0])
+        )));
+    }
+    Err(QueryError::Backend(
+        "invalid action request relation response".into(),
+    ))
+}
+
 pub fn global() -> Result<&'static Prolog, String> {
     static PROLOG: OnceLock<Result<Prolog, String>> = OnceLock::new();
     PROLOG
@@ -1976,9 +2118,9 @@ pub(crate) fn ensure_linked() {
     std::hint::black_box(Prolog::complete as fn(&Prolog, &GrammarInput, &'static str) -> _);
     std::hint::black_box(Prolog::highlights as fn(&Prolog, &ParseCandidate) -> _);
     std::hint::black_box(Prolog::render as fn(&Prolog, &CommandAst, RenderForm) -> _);
+    std::hint::black_box(Prolog::action_request as fn(&Prolog, &CommandAst) -> _);
     std::hint::black_box(
-        Prolog::context_query
-            as fn(&Prolog, &ContextQuery, &ContextSnapshot) -> _,
+        Prolog::context_query as fn(&Prolog, &ContextQuery, &ContextSnapshot) -> _,
     );
 }
 
@@ -2055,6 +2197,66 @@ mod tests {
                 .text,
             "mirror run",
         );
+        assert_eq!(
+            prolog
+                .action_request(&CommandAst {
+                    action: "mirror_resume".into(),
+                    handler: "mirror_pause".into(),
+                    target: "ui".into(),
+                    args: vec![CommandValue::Integer(7), CommandValue::Boolean(false)],
+                })
+                .unwrap(),
+            crate::generated_wire::ActionRequest::MirrorPause {
+                id: 7,
+                paused: false,
+            },
+        );
+        let oci = prolog
+            .action_request(&CommandAst {
+                action: "oci.build".into(),
+                handler: "oci.build".into(),
+                target: "ui".into(),
+                args: vec![CommandValue::OciSpec {
+                    context_tar_gz: "eA==".into(),
+                    dockerfile: "FROM scratch\n".into(),
+                    tag: Some("example:test".into()),
+                    net_mode: "tap".into(),
+                    build_arguments: vec![("A".into(), "one".into())],
+                }],
+            })
+            .unwrap();
+        let crate::generated_wire::ActionRequest::OciBuild { spec } = oci else {
+            panic!("structured relation returned the wrong request variant")
+        };
+        assert_eq!(spec.context_tar_gz.as_slice(), b"x");
+        assert_eq!(spec.dockerfile.as_slice(), b"FROM scratch\n");
+        assert_eq!(spec.tag.as_ref().unwrap().as_str(), "example:test");
+        assert_eq!(spec.net_mode, crate::generated_wire::NetMode::Tap);
+        assert_eq!(spec.build_arguments.as_map().len(), 1);
+        let parsed_oci = prolog
+            .parse(
+                &grammar_words(&[
+                    "oci.build",
+                    r#"{"context_tar_gz":"eA==","dockerfile":"FROM","tag":null,"net":"tap","build_args":[]}"#,
+                ]),
+                None,
+            )
+            .unwrap();
+        assert_eq!(parsed_oci.len(), 1);
+        assert_eq!(
+            parsed_oci[0].command.args,
+            vec![CommandValue::OciSpec {
+                context_tar_gz: "eA==".into(),
+                dockerfile: "FROM".into(),
+                tag: None,
+                net_mode: "tap".into(),
+                build_arguments: Vec::new(),
+            }],
+        );
+        assert!(matches!(
+            prolog.action_request(&parsed_oci[0].command).unwrap(),
+            crate::generated_wire::ActionRequest::OciBuild { .. }
+        ));
         prolog.exhaust_inference_limit().unwrap();
         assert_eq!(
             prolog
@@ -2135,7 +2337,9 @@ mod tests {
         refreshed.revision = RelationValue::Integer(8);
         assert_eq!(
             dependency,
-            prolog.context_dependency_keys(&[refreshed.clone()]).unwrap(),
+            prolog
+                .context_dependency_keys(&[refreshed.clone()])
+                .unwrap(),
         );
         refreshed.outcome = None;
         assert_ne!(
@@ -2149,10 +2353,7 @@ mod tests {
             selector: compound(
                 "within",
                 vec![
-                    compound(
-                        "box",
-                        vec![compound("ref", vec![atom("box_query")])],
-                    ),
+                    compound("box", vec![compound("ref", vec![atom("box_query")])]),
                     compound("prefix", vec![RelationValue::String("src/".into())]),
                 ],
             ),
@@ -2200,7 +2401,10 @@ mod tests {
         assert_eq!(plan.command.args[0], CommandValue::String("work".into()));
         assert_eq!(plan.queries.len(), 1);
         assert_eq!(plan.queries[0].query.cardinality, ContextCardinality::One);
-        assert_eq!(plan.queries[0].query.domain, RelationValue::Atom("box".into()));
+        assert_eq!(
+            plan.queries[0].query.domain,
+            RelationValue::Atom("box".into())
+        );
         assert_eq!(
             plan.bindings,
             vec![ContextBinding {
@@ -2213,10 +2417,7 @@ mod tests {
             domain: RelationValue::Atom("box".into()),
             identity: RelationValue::Integer(5),
             names: vec!["work".into()],
-            value: RelationValue::Compound(
-                "string".into(),
-                vec![RelationValue::String("5".into())],
-            ),
+            value: RelationValue::Compound("integer".into(), vec![RelationValue::Integer(5)]),
             attributes: Vec::new(),
         };
         let observation = ContextObservation {
@@ -2227,9 +2428,12 @@ mod tests {
             outcome: Some(ContextResult::One(entry)),
         };
         assert_eq!(
-            prolog.resolve_context_plan(plan, &[observation]).unwrap().args,
+            prolog
+                .resolve_context_plan(plan, &[observation])
+                .unwrap()
+                .args,
             vec![
-                CommandValue::String("5".into()),
+                CommandValue::Integer(5),
                 CommandValue::String("new-name".into()),
             ],
         );
@@ -2246,9 +2450,7 @@ mod tests {
         input.end = 9;
 
         let prolog = global().unwrap();
-        let plans = prolog
-            .context_completion_plans(&input, "edit")
-            .unwrap();
+        let plans = prolog.context_completion_plans(&input, "edit").unwrap();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].action, "rename");
         assert_eq!(plans[0].replace, Span { start: 7, end: 9 });
@@ -2256,23 +2458,20 @@ mod tests {
         assert_eq!(plans[0].queries.len(), 1);
         assert_eq!(plans[0].target_query_id, "q1");
         assert_eq!(plans[0].preference, 90);
-        assert_eq!(plans[0].queries[0].query.cardinality, ContextCardinality::All);
+        assert_eq!(
+            plans[0].queries[0].query.cardinality,
+            ContextCardinality::All
+        );
         assert_eq!(
             plans[0].queries[0].query.selector,
-            RelationValue::Compound(
-                "prefix".into(),
-                vec![RelationValue::String("wo".into())],
-            ),
+            RelationValue::Compound("prefix".into(), vec![RelationValue::String("wo".into())],),
         );
 
         let entry = ContextEntry {
             domain: RelationValue::Atom("box".into()),
             identity: RelationValue::Integer(5),
             names: vec!["5".into(), "work".into()],
-            value: RelationValue::Compound(
-                "string".into(),
-                vec![RelationValue::String("5".into())],
-            ),
+            value: RelationValue::Compound("integer".into(), vec![RelationValue::Integer(5)]),
             attributes: Vec::new(),
         };
         let observation = ContextObservation {
@@ -2319,9 +2518,11 @@ mod tests {
                 kind: "integer".into(),
             }]
         );
-        assert!(candidate
-            .evidence
-            .iter()
-            .any(|evidence| evidence.origin.contains("tear(edit,literal")));
+        assert!(
+            candidate
+                .evidence
+                .iter()
+                .any(|evidence| evidence.origin.contains("tear(edit,literal"))
+        );
     }
 }

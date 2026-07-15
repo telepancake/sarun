@@ -93,6 +93,21 @@ pub enum ArgValue {
     Number(i64),
     Bool(bool),
     String(String),
+    Path(String),
+    Base64(String),
+    Spec(String),
+    OciSpec {
+        context_tar_gz: String,
+        dockerfile: String,
+        tag: Option<String>,
+        net_mode: String,
+        build_arguments: Vec<(String, String)>,
+    },
+    ApiSpec {
+        base_url: String,
+        model: String,
+        api_key: String,
+    },
     Array(Vec<ArgValue>),
 }
 
@@ -102,6 +117,31 @@ impl ArgValue {
             Self::Number(value) => serde_json::Value::Number((*value).into()),
             Self::Bool(value) => serde_json::Value::Bool(*value),
             Self::String(value) => serde_json::Value::String(value.clone()),
+            Self::Path(value) | Self::Base64(value) | Self::Spec(value) => {
+                serde_json::Value::String(value.clone())
+            }
+            Self::OciSpec {
+                context_tar_gz,
+                dockerfile,
+                tag,
+                net_mode,
+                build_arguments,
+            } => serde_json::json!({
+                "context_tar_gz": context_tar_gz,
+                "dockerfile": dockerfile,
+                "tag": tag,
+                "net": net_mode,
+                "build_args": build_arguments,
+            }),
+            Self::ApiSpec {
+                base_url,
+                model,
+                api_key,
+            } => serde_json::json!({
+                "base_url": base_url,
+                "model": model,
+                "api_key": api_key,
+            }),
             Self::Array(values) => {
                 serde_json::Value::Array(values.iter().map(Self::json).collect())
             }
@@ -111,6 +151,7 @@ impl ArgValue {
     pub fn as_string(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value),
+            Self::Path(value) | Self::Base64(value) | Self::Spec(value) => Some(value),
             _ => None,
         }
     }
@@ -133,12 +174,7 @@ impl Invocation {
     }
 
     pub fn json_args(&self) -> serde_json::Value {
-        serde_json::Value::Array(
-            self.args
-                .iter()
-                .map(ArgValue::json)
-                .collect(),
-        )
+        serde_json::Value::Array(self.args.iter().map(ArgValue::json).collect())
     }
 }
 
@@ -277,7 +313,13 @@ fn execute_context_plan(
     prolog: &crate::prolog::Prolog,
     plan: &crate::prolog::ContextPlan,
     context: &dyn ContextProvider,
-) -> Result<Option<(crate::prolog::CommandAst, Vec<crate::prolog::ContextObservation>)>, String> {
+) -> Result<
+    Option<(
+        crate::prolog::CommandAst,
+        Vec<crate::prolog::ContextObservation>,
+    )>,
+    String,
+> {
     let Some(observations) = execute_context_graph(prolog, &plan.queries, context)? else {
         return Ok(None);
     };
@@ -330,6 +372,31 @@ fn invocation_from_prolog(
             CommandValue::Integer(value) => Ok(ArgValue::Number(value)),
             CommandValue::Boolean(value) => Ok(ArgValue::Bool(value)),
             CommandValue::String(value) => Ok(ArgValue::String(value)),
+            CommandValue::Path(value) => Ok(ArgValue::Path(value)),
+            CommandValue::Base64(value) => Ok(ArgValue::Base64(value)),
+            CommandValue::Spec(value) => Ok(ArgValue::Spec(value)),
+            CommandValue::OciSpec {
+                context_tar_gz,
+                dockerfile,
+                tag,
+                net_mode,
+                build_arguments,
+            } => Ok(ArgValue::OciSpec {
+                context_tar_gz,
+                dockerfile,
+                tag,
+                net_mode,
+                build_arguments,
+            }),
+            CommandValue::ApiSpec {
+                base_url,
+                model,
+                api_key,
+            } => Ok(ArgValue::ApiSpec {
+                base_url,
+                model,
+                api_key,
+            }),
             CommandValue::Array(values) => Ok(ArgValue::Array(
                 values
                     .into_iter()
@@ -568,20 +635,18 @@ pub fn highlights(input: &str, context: &dyn ContextProvider) -> Result<Vec<High
         preference: resolved.preference,
     };
     let highlights = prolog.highlights(&candidate)?;
-    Ok(
-        highlights
-            .into_iter()
-            .map(|highlight| Highlight {
-                span: TextSpan {
-                    start: highlight.span.start,
-                    end: highlight.span.end,
-                },
-                syntax: highlight.syntax,
-                semantic: highlight.semantic,
-                origin: highlight.origin,
-            })
-            .collect(),
-    )
+    Ok(highlights
+        .into_iter()
+        .map(|highlight| Highlight {
+            span: TextSpan {
+                start: highlight.span.start,
+                end: highlight.span.end,
+            },
+            syntax: highlight.syntax,
+            semantic: highlight.semantic,
+            origin: highlight.origin,
+        })
+        .collect())
 }
 pub fn render(invocation: &Invocation) -> Result<String, String> {
     let command = prolog_command(invocation);
@@ -598,6 +663,31 @@ fn prolog_command(invocation: &Invocation) -> crate::prolog::CommandAst {
             ArgValue::Number(value) => crate::prolog::CommandValue::Integer(*value),
             ArgValue::Bool(value) => crate::prolog::CommandValue::Boolean(*value),
             ArgValue::String(value) => crate::prolog::CommandValue::String(value.clone()),
+            ArgValue::Path(value) => crate::prolog::CommandValue::Path(value.clone()),
+            ArgValue::Base64(value) => crate::prolog::CommandValue::Base64(value.clone()),
+            ArgValue::Spec(value) => crate::prolog::CommandValue::Spec(value.clone()),
+            ArgValue::OciSpec {
+                context_tar_gz,
+                dockerfile,
+                tag,
+                net_mode,
+                build_arguments,
+            } => crate::prolog::CommandValue::OciSpec {
+                context_tar_gz: context_tar_gz.clone(),
+                dockerfile: dockerfile.clone(),
+                tag: tag.clone(),
+                net_mode: net_mode.clone(),
+                build_arguments: build_arguments.clone(),
+            },
+            ArgValue::ApiSpec {
+                base_url,
+                model,
+                api_key,
+            } => crate::prolog::CommandValue::ApiSpec {
+                base_url: base_url.clone(),
+                model: model.clone(),
+                api_key: api_key.clone(),
+            },
             ArgValue::Array(values) => {
                 crate::prolog::CommandValue::Array(values.iter().map(convert_value).collect())
             }
@@ -635,18 +725,15 @@ mod tests {
             request: &crate::prolog::ContextQueryNode,
         ) -> Result<crate::prolog::ContextSnapshot, String> {
             use crate::prolog::{ContextEntry, ContextSnapshot, RelationValue};
-            let string = |value: &str| {
-                RelationValue::Compound(
-                    "string".into(),
-                    vec![RelationValue::String(value.into())],
-                )
-            };
             let entry = match &request.query.domain {
                 RelationValue::Atom(domain) if domain == "box" => ContextEntry {
                     domain: RelationValue::Atom("box".into()),
                     identity: RelationValue::Integer(5),
                     names: vec!["5".into(), "work".into()],
-                    value: string("5"),
+                    value: RelationValue::Compound(
+                        "integer".into(),
+                        vec![RelationValue::Integer(5)],
+                    ),
                     attributes: Vec::new(),
                 },
                 RelationValue::Atom(domain) if domain == "path" => ContextEntry {
@@ -654,15 +741,21 @@ mod tests {
                     identity: RelationValue::Compound(
                         "path".into(),
                         vec![
-                            RelationValue::String("5".into()),
+                            RelationValue::Integer(5),
                             RelationValue::String("src/main.rs".into()),
                         ],
                     ),
                     names: vec!["src/main.rs".into()],
-                    value: string("src/main.rs"),
+                    value: RelationValue::Compound(
+                        "path".into(),
+                        vec![RelationValue::String("src/main.rs".into())],
+                    ),
                     attributes: vec![RelationValue::Compound(
                         "box".into(),
-                        vec![string("5")],
+                        vec![RelationValue::Compound(
+                            "integer".into(),
+                            vec![RelationValue::Integer(5)],
+                        )],
                     )],
                 },
                 _ => return Err("unexpected fixture context domain".into()),
@@ -706,12 +799,20 @@ mod tests {
         let resume = invocation("mirror resume 5");
         assert_eq!(resume.action, "mirror_resume");
         assert_eq!(resume.handler, "mirror_pause");
-        assert_eq!(resume.args, vec![ArgValue::Number(5), ArgValue::Bool(false)]);
+        assert_eq!(
+            resume.args,
+            vec![ArgValue::Number(5), ArgValue::Bool(false)]
+        );
     }
 
     #[test]
     fn parse_and_render_use_the_same_relation() {
-        for input in ["mirror ls", "mirror run 5", "mirror pause 5", "mirror resume 5"] {
+        for input in [
+            "mirror ls",
+            "mirror run 5",
+            "mirror pause 5",
+            "mirror resume 5",
+        ] {
             let parsed = invocation(input);
             assert_eq!(render(&parsed).unwrap(), input);
         }
@@ -738,11 +839,15 @@ mod tests {
 
     #[test]
     fn highlighting_requires_successful_context_observations() {
-        assert!(!highlights("rename work new-name", &FixtureContext)
-            .unwrap()
-            .is_empty());
-        assert!(highlights("rename missing new-name", &FixtureContext)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !highlights("rename work new-name", &FixtureContext)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            highlights("rename missing new-name", &FixtureContext)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

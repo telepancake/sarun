@@ -274,6 +274,149 @@ class Generator:
             "    FixedBytes, WireValue, get_atom, get_u64, put_compound_payload,",
             "    put_u64, require_empty,",
             "};",
+            "use crate::prolog::RelationValue;",
+            "use base64::Engine as _;",
+            "use std::collections::BTreeMap;",
+            "",
+            "pub trait RelationWireValue: Sized {",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String>;",
+            "}",
+            "",
+            "fn relation_atom(value: &RelationValue) -> Result<&str, String> {",
+            "    match value {",
+            "        RelationValue::Atom(value) => Ok(value),",
+            "        _ => Err(\"expected relation atom\".into()),",
+            "    }",
+            "}",
+            "",
+            "fn relation_integer(value: &RelationValue) -> Result<i64, String> {",
+            "    match value {",
+            "        RelationValue::Integer(value) => Ok(*value),",
+            "        _ => Err(\"expected relation integer\".into()),",
+            "    }",
+            "}",
+            "",
+            "fn relation_compound<'a>(value: &'a RelationValue, name: &str) -> Result<&'a [RelationValue], String> {",
+            "    match value {",
+            "        RelationValue::Compound(actual, fields) if actual == name => Ok(fields),",
+            "        _ => Err(format!(\"expected relation {name} compound\")),",
+            "    }",
+            "}",
+            "",
+            "fn relation_list(value: &RelationValue) -> Result<&[RelationValue], String> {",
+            "    match value {",
+            "        RelationValue::List(values) => Ok(values),",
+            "        _ => Err(\"expected relation list\".into()),",
+            "    }",
+            "}",
+            "",
+            "fn require_relation_arity(values: &[RelationValue], expected: usize) -> Result<(), String> {",
+            "    if values.len() == expected { Ok(()) } else {",
+            "        Err(format!(\"expected {expected} relation fields, got {}\", values.len()))",
+            "    }",
+            "}",
+            "",
+            "macro_rules! relation_integer_value {",
+            "    ($type:ty) => {",
+            "        impl RelationWireValue for $type {",
+            "            fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "                relation_integer(value)?.try_into().map_err(|_| format!(\"relation integer is out of range for {}\", stringify!($type)))",
+            "            }",
+            "        }",
+            "    };",
+            "}",
+            "relation_integer_value!(u16);",
+            "relation_integer_value!(u32);",
+            "relation_integer_value!(u64);",
+            "relation_integer_value!(i32);",
+            "relation_integer_value!(i64);",
+            "",
+            "impl RelationWireValue for f64 {",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        Ok(relation_integer(value)? as f64)",
+            "    }",
+            "}",
+            "",
+            "impl RelationWireValue for bool {",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        match relation_atom(value)? {",
+            "            \"true\" => Ok(true),",
+            "            \"false\" => Ok(false),",
+            "            _ => Err(\"expected true or false relation atom\".into()),",
+            "        }",
+            "    }",
+            "}",
+            "",
+            "impl RelationWireValue for () {",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        let fields = relation_compound(value, \"record\")?;",
+            "        require_relation_arity(fields, 0)",
+            "    }",
+            "}",
+            "",
+            "impl<const MAXIMUM: usize> RelationWireValue for BoundedText<MAXIMUM> {",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        let RelationValue::String(value) = value else { return Err(\"expected relation string\".into()) };",
+            "        Self::new(value.clone()).map_err(|error| format!(\"bounded relation text: {error:?}\"))",
+            "    }",
+            "}",
+            "",
+            "impl<const MAXIMUM: usize> RelationWireValue for BoundedBytes<MAXIMUM> {",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        let bytes = match value {",
+            "            RelationValue::String(value) => value.as_bytes().to_vec(),",
+            "            RelationValue::Compound(kind, fields) if kind == \"base64\" => {",
+            "                require_relation_arity(fields, 1)?;",
+            "                let RelationValue::String(value) = &fields[0] else { return Err(\"expected base64 relation string\".into()) };",
+            "                base64::engine::general_purpose::STANDARD.decode(value).map_err(|error| format!(\"invalid relation base64: {error}\"))?",
+            "            }",
+            "            _ => return Err(\"expected relation byte value\".into()),",
+            "        };",
+            "        Self::new(bytes).map_err(|error| format!(\"bounded relation bytes: {error:?}\"))",
+            "    }",
+            "}",
+            "",
+            "impl<const LENGTH: usize> RelationWireValue for FixedBytes<LENGTH> {",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        let values = relation_list(value)?;",
+            "        require_relation_arity(values, LENGTH)?;",
+            "        let mut bytes = [0u8; LENGTH];",
+            "        for (output, value) in bytes.iter_mut().zip(values) {",
+            "            *output = relation_integer(value)?.try_into().map_err(|_| \"relation byte is out of range\")?;",
+            "        }",
+            "        Ok(Self(bytes))",
+            "    }",
+            "}",
+            "",
+            "impl<T: RelationWireValue, const MINIMUM: usize, const MAXIMUM: usize> RelationWireValue for BoundedVec<T, MINIMUM, MAXIMUM> {",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        let values = relation_list(value)?.iter().map(T::from_relation).collect::<Result<Vec<_>, _>>()?;",
+            "        Self::new(values).map_err(|error| format!(\"bounded relation list: {error:?}\"))",
+            "    }",
+            "}",
+            "",
+            "impl<K: Ord + RelationWireValue, V: RelationWireValue, const MAXIMUM: usize> RelationWireValue for BoundedMap<K, V, MAXIMUM> {",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        let mut output = BTreeMap::new();",
+            "        for pair in relation_list(value)? {",
+            "            let fields = relation_compound(pair, \"pair\")?;",
+            "            require_relation_arity(fields, 2)?;",
+            "            let key = K::from_relation(&fields[0])?;",
+            "            let value = V::from_relation(&fields[1])?;",
+            "            if output.insert(key, value).is_some() { return Err(\"duplicate relation map key\".into()); }",
+            "        }",
+            "        Self::new(output).map_err(|error| format!(\"bounded relation map: {error:?}\"))",
+            "    }",
+            "}",
+            "",
+            "impl<T: RelationWireValue> RelationWireValue for Option<T> {",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        if relation_atom(value).ok() == Some(\"none\") { return Ok(None); }",
+            "        let fields = relation_compound(value, \"some\")?;",
+            "        require_relation_arity(fields, 1)?;",
+            "        Ok(Some(T::from_relation(&fields[0])?))",
+            "    }",
+            "}",
             "",
             "pub const WIRE_PROTOCOL_VERSION: u64 = 1;",
             f'pub const WIRE_SCHEMA_SHA256: &str = "{manifest_hash}";',
@@ -328,7 +471,18 @@ class Generator:
             "    }",
             "}",
             "",
+            f"impl RelationWireValue for {name} {{",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        let fields = relation_compound(value, \"record\")?;",
+            f"        require_relation_arity(fields, {len(fields)})?;",
+            "        let mut fields = fields.iter();",
+            "        Ok(Self {",
         ]
+        for field in fields:
+            fname, kind = self.field_parts(field)
+            lines.append(
+                f"            {field_name(fname)}: <{self.rust_type(kind)} as RelationWireValue>::from_relation(fields.next().unwrap())?,")
+        lines += ["        })", "    }", "}", ""]
         return "\n".join(lines)
 
     def enum(self, name: str, cases: list[tuple[str, int]]) -> str:
@@ -354,6 +508,18 @@ class Generator:
             lines.append(f"            {code} => Ok(Self::{pascal(case)}),")
         lines += [
             "            _ => Err(DecodeError::InvalidValue),",
+            "        }",
+            "    }",
+            "}",
+            "",
+            f"impl RelationWireValue for {name} {{",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        match relation_atom(value)? {",
+        ]
+        for case, _ in cases:
+            lines.append(f'            "{case}" => Ok(Self::{pascal(case)}),')
+        lines += [
+            f"            case => Err(format!(\"unknown {name} relation case {{case}}\")),",
             "        }",
             "    }",
             "}",
@@ -446,6 +612,36 @@ class Generator:
             "    }",
             "}",
             "",
+            f"impl RelationWireValue for {name} {{",
+            "    fn from_relation(value: &RelationValue) -> Result<Self, String> {",
+            "        let (case, fields): (&str, &[RelationValue]) = match value {",
+            "            RelationValue::Atom(case) => (case, &[]),",
+            "            RelationValue::Compound(case, fields) => (case, fields),",
+            f"            _ => return Err(\"expected {name} relation choice\".into()),",
+            "        };",
+            "        match case {",
+        ]
+        for case, _, fields in variants:
+            variant = pascal(case)
+            lines.append(f'            "{case}" => {{')
+            lines.append(f"                require_relation_arity(fields, {len(fields)})?;")
+            if fields:
+                lines.append("                let mut fields = fields.iter();")
+                lines.append(f"                Ok(Self::{variant} {{")
+                for field in fields:
+                    fname, kind = self.field_parts(field)
+                    lines.append(
+                        f"                    {field_name(fname)}: <{self.rust_type(kind)} as RelationWireValue>::from_relation(fields.next().unwrap())?,")
+                lines.append("                })")
+            else:
+                lines.append(f"                Ok(Self::{variant})")
+            lines.append("            }")
+        lines += [
+            f"            _ => Err(format!(\"unknown {name} relation choice {{case}}\")),",
+            "        }",
+            "    }",
+            "}",
+            "",
         ]
         return "\n".join(lines)
 
@@ -529,6 +725,40 @@ class Generator:
         lines += ["];", ""]
         return "\n".join(lines)
 
+    def action_relation_decoder(
+            self, rows: list[tuple[str, int, list[Term]]]) -> str:
+        lines = [
+            "impl ActionRequest {",
+            "    pub fn from_relation(handler: &str, code: u64, values: &[RelationValue]) -> Result<Self, String> {",
+            "        match handler {",
+        ]
+        for case, code, fields in rows:
+            variant = pascal(case)
+            lines += [
+                f'            "{case}" => {{',
+                f"                if code != {code} {{ return Err(format!(\"relation opcode {{code}} does not match {case}\")); }}",
+                f"                require_relation_arity(values, {len(fields)})?;",
+            ]
+            if fields:
+                lines += ["                let mut values = values.iter();",
+                          f"                Ok(Self::{variant} {{"]
+                for field in fields:
+                    fname, kind = self.field_parts(field)
+                    lines.append(
+                        f"                    {field_name(fname)}: <{self.rust_type(kind)} as RelationWireValue>::from_relation(values.next().unwrap())?,")
+                lines.append("                })")
+            else:
+                lines.append(f"                Ok(Self::{variant})")
+            lines.append("            }")
+        lines += [
+            "            _ => Err(format!(\"unknown relation action handler {handler}\")),",
+            "        }",
+            "    }",
+            "}",
+            "",
+        ]
+        return "\n".join(lines)
+
     def tests(self, sums: list[tuple[str, str,
                                      list[tuple[str, int, list[Term]]]]]) -> str:
         action_rows = next(rows for name, _, rows in sums
@@ -610,6 +840,63 @@ class Generator:
             "        put_compound_payload(&mut trailing, &trailing_fields).unwrap();",
             "        assert_eq!(ActionRequest::decode_atom(&mut trailing.as_slice()), Err(DecodeError::TrailingFields));",
             "    }",
+            "",
+            "    #[test]",
+            "    fn typed_action_requests_materialize_from_relational_values() {",
+            "        let request = ActionRequest::from_relation(",
+            "            \"mirror_pause\", 62,",
+            "            &[RelationValue::Integer(5), RelationValue::Atom(\"false\".into())],",
+            "        ).unwrap();",
+            "        assert_eq!(request, ActionRequest::MirrorPause { id: 5, paused: false });",
+            "",
+            "        let request = ActionRequest::from_relation(",
+            "            \"mirror_add\", 60,",
+            "            &[",
+            "                RelationValue::String(\"git\".into()),",
+            "                RelationValue::String(\"source\".into()),",
+            "                RelationValue::String(\"destination\".into()),",
+            "                RelationValue::Compound(\"some\".into(), vec![RelationValue::Integer(30)]),",
+            "            ],",
+            "        ).unwrap();",
+            "        assert_eq!(request.code(), 60);",
+            "        assert_eq!(request.handler(), \"mirror_add\");",
+            "",
+            "        let clause = RelationValue::Compound(",
+            "            \"record\".into(),",
+            "            vec![",
+            "                RelationValue::Atom(\"path\".into()),",
+            "                RelationValue::String(\"src/main.rs\".into()),",
+            "                RelationValue::Atom(\"and\".into()),",
+            "                RelationValue::Atom(\"false\".into()),",
+            "                RelationValue::Atom(\"true\".into()),",
+            "            ],",
+            "        );",
+            "        let request = ActionRequest::from_relation(",
+            "            \"view.open\", 38,",
+            "            &[",
+            "                RelationValue::Atom(\"changes\".into()),",
+            "                RelationValue::Integer(7),",
+            "                RelationValue::Compound(\"some\".into(), vec![RelationValue::List(vec![clause])]),",
+            "                RelationValue::Atom(\"false\".into()),",
+            "            ],",
+            "        ).unwrap();",
+            "        assert_eq!(request.code(), 38);",
+            "",
+            "        let request = ActionRequest::from_relation(",
+            "            \"review.write_file\", 33,",
+            "            &[",
+            "                RelationValue::Integer(7),",
+            "                RelationValue::String(\"file\".into()),",
+            "                RelationValue::Compound(\"base64\".into(), vec![RelationValue::String(\"eA==\".into())]),",
+            "            ],",
+            "        ).unwrap();",
+            "        let ActionRequest::ReviewWriteFile { b64, .. } = request else { panic!(\"wrong generated request\") };",
+            "        assert_eq!(b64.as_slice(), b\"x\");",
+            "",
+            "        assert!(ActionRequest::from_relation(\"mirror_add\", 999, &[]).is_err());",
+            "        assert!(ActionRequest::from_relation(\"missing\", 1, &[]).is_err());",
+            "        assert!(ActionRequest::from_relation(\"mirror_pause\", 62, &[]).is_err());",
+            "    }",
             "}",
             "",
         ]
@@ -632,6 +919,7 @@ class Generator:
                 actions.append((atom(values[0]), int(values[1]), self.fields(values[2])))
         chunks.append(self.identity_constant("ACTION_REQUEST_IDENTITIES", actions))
         chunks.append(self.relation_sum("ActionRequest", actions, "handler"))
+        chunks.append(self.action_relation_decoder(actions))
 
         successes = []
         for category, values in self.rows:

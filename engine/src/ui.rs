@@ -1274,10 +1274,12 @@ impl crate::parser::ContextProvider for App {
                 domain: RelationValue::Atom("box".into()),
                 identity: RelationValue::Integer(identity),
                 names,
-                // This is the typed command value projected by bind/3.
+                // This is the typed command value projected by bind/3. A box
+                // query resolves to its canonical numeric identity, never to
+                // another spelling which downstream code must parse again.
                 value: RelationValue::Compound(
-                    "string".into(),
-                    vec![RelationValue::String(id_text.into())],
+                    "integer".into(),
+                    vec![RelationValue::Integer(identity)],
                 ),
                 attributes,
             });
@@ -1316,16 +1318,15 @@ fn path_context_snapshot(
     if box_scope != "box" {
         return Err("path context query has no box scope".into());
     }
-    let RelationValue::Compound(string_kind, value_parts) = box_value else {
+    let RelationValue::Compound(integer_kind, value_parts) = box_value else {
         return Err("path context query has untyped box value".into());
     };
-    let [RelationValue::String(box_id)] = value_parts.as_slice() else {
+    let [RelationValue::Integer(box_id)] = value_parts.as_slice() else {
         return Err("path context query has invalid box value".into());
     };
-    if string_kind != "string" {
-        return Err("path context query box value is not a string".into());
+    if integer_kind != "integer" || *box_id < 0 {
+        return Err("path context query box value is not a box identity".into());
     }
-
     let rows = match rpc(&app.sock, "review.session_changes", json!([box_id]))? {
         Value::Array(rows) => rows,
         _ => return Err("path context provider returned invalid changes".into()),
@@ -1350,13 +1351,13 @@ fn path_context_snapshot(
             identity: RelationValue::Compound(
                 "path".into(),
                 vec![
-                    RelationValue::String(box_id.clone()),
+                    RelationValue::Integer(*box_id),
                     RelationValue::String(path.into()),
                 ],
             ),
             names: vec![path.into()],
             value: RelationValue::Compound(
-                "string".into(),
+                "path".into(),
                 vec![RelationValue::String(path.into())],
             ),
             attributes,

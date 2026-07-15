@@ -113,10 +113,10 @@ action('oci.load', 'oci.load', ui, "REFERENCE [NAME]", "pull + unpack an OCI ima
 action('oci.images', 'oci.images', ui, "", "loaded OCI images (top box of each chain)", visible, 50).
 action('svc.up', 'svc.up', ui, "NAME", "whether a svc.serve service is live", visible, 50).
 action('oci.resolve', 'oci.resolve', ui, "REFERENCE", "resolve an image reference to its local top box", visible, 50).
-action('oci.build', 'oci.build', ui, "SPEC", "run an in-box-shipped Dockerfile build host-side", visible, 50).
+action('oci.build', 'oci.build', ui, "OCI_SPEC", "run an in-box-shipped Dockerfile build host-side", visible, 50).
 action('oaita.models', 'oaita.models', ui, "", "GGUF local-model catalog for the picker", visible, 50).
 action('oaita.status', 'oaita.status', ui, "", "what the Api pane is wired to (external/local/none)", visible, 50).
-action('oaita.probe', 'oaita.probe', ui, "SPEC", "1-token connection test of an external API config", visible, 50).
+action('oaita.probe', 'oaita.probe', ui, "API_SPEC", "1-token connection test of an external API config", visible, 50).
 action(verbs, verbs, ui, "[FILTER]", "list every UI verb with its args and help", visible, 50).
 
 action(mirror_browse, mirror_browse, local, "", "browse wiki mirror in the browser", visible, 50).
@@ -469,9 +469,12 @@ argument_kind(Name, integer) :-
     !.
 argument_kind(Name, path) :-
     ( Name = "PATH" ; Name = "PATHS" ; Name = "REL" ; Name = "RELS"
-    ; Name = "DEST" ; Name = "ROOT" ; Name = "SUBPATH"
+    ; Name = "DEST" ; Name = "ROOT" ; Name = "SUBPATH" ; Name = "STORE"
+    ; Name = "PREFIX"
     ),
     !.
 argument_kind("B64", base64) :- !.
+argument_kind("OCI_SPEC", oci_spec) :- !.
+argument_kind("API_SPEC", api_spec) :- !.
 argument_kind("SPEC", spec) :- !.
 argument_kind(_, string).

@@ -376,7 +376,7 @@ belong to the relation.
 - [x] Give every wire action a stable binary identity in the relation. Alias
       actions normalize to their handler's identity and schema; local actions
       have no invented wire form.
-- [ ] Give every wire action a concrete binary request-field schema in the
+- [x] Give every wire action a concrete binary request-field schema in the
       relation and relate parsed/context-resolved values to that schema.
       Source/parser categories such as `integer`, `path`, `base64`, and
       especially `spec` are representations to convert from, not binary field
@@ -611,6 +611,20 @@ belong to the relation.
   every action success, every named type/case, and every transport/frame
   variant; 12 exhaustive suites pass, including identity uniqueness and
   malformed unknown-code/trailing-field rejection.
+- Related every fully parsed and context-resolved wire command to its concrete
+  generated `ActionRequest`. The relation enforces source cardinality, numeric
+  and UTF-8 byte bounds, enum membership, decoded base64 size, and closed
+  record/choice structure before Rust materializes the generated variant.
+  Exhaustive pure tests construct a request for all 95 handlers, including
+  aliases and contextual identities.
+- Replaced the two unconstrained `SPEC` terminals with action-specific JSON
+  source relations for OCI builds and API probes. Parsing and canonical
+  rendering are pure and core-only; object order is irrelevant, while unknown
+  or duplicate fields fail. The parsed terms relate to bounded
+  `oci_build_spec` and `api_probe_spec` records, so JSON is only a textual
+  representation and never survives as the binary request value. Embedded
+  aarch64 SWI tests parse, cross the typed FFI, decode base64 into bounded
+  bytes, and materialize the generated request.
 
 ## Stop conditions
 

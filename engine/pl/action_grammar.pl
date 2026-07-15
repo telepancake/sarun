@@ -29,6 +29,7 @@
             resolve_context_plan/3,
             context_completion_plan/3,
             resolve_context_completion/3,
+            action_request/2,
             application/3
           ]).
 
@@ -144,6 +145,8 @@ valid_kind(integer).
 valid_kind(string).
 valid_kind(path).
 valid_kind(base64).
+valid_kind(oci_spec).
+valid_kind(api_spec).
 valid_kind(spec).
 
 valid_cardinality(required).
@@ -260,6 +263,242 @@ form_literal_prefix([literal(_, Text, _, _, _)|Specs], [Text|Words]) :-
 convert(FromKind, From, ToKind, To) :-
     representation(Action, FromKind, From),
     representation(Action, ToKind, To).
+
+%! action_request(+Command, -Request) is semidet.
+%
+% Relate a fully parsed and context-resolved command to its concrete binary
+% request representation. The result is positional because field names are
+% schema metadata and are not bytes on the wire. Rust only materializes this
+% already-typed value as the generated enum variant; it does not reinterpret
+% parser kinds or cardinalities.
+
+action_request(command(_Action, Handler, Target, Arguments),
+               action_request(Handler, Code, Values)) :-
+    wire_target(Target),
+    wire_handler(Handler, Code, _ResultType),
+    \+ action_catalog:wire_request_override(Handler, _),
+    argument_schema(Handler, Schema),
+    wire_request_fields(Handler, Fields),
+    request_field_values(Schema, Fields, Arguments, Values).
+action_request(command(_Action, ro_attach, Target,
+                       [BoxSource|AttachmentSources]),
+               action_request(ro_attach, Code, [Box, Attachments])) :-
+    wire_target(Target),
+    wire_handler(ro_attach, Code, _),
+    wire_source_value(box_id, BoxSource, Box),
+    readonly_attachment_sources(AttachmentSources, Attachments).
+action_request(command(_Action, 'view.open', Target, Arguments),
+               action_request('view.open', Code,
+                              [Kind, Box, Filter, RunningOnly])) :-
+    wire_target(Target),
+    wire_handler('view.open', Code, _),
+    view_open_sources(Arguments, Kind, Box, Filter, RunningOnly).
+action_request(command(_Action, 'view.filter', Target,
+                       [ViewSource, FilterSource]),
+               action_request('view.filter', Code, [View, Filter])) :-
+    wire_target(Target),
+    wire_handler('view.filter', Code, _),
+    wire_source_value(view_id, ViewSource, View),
+    filter_source_value(FilterSource, Filter).
+action_request(command(_Action, 'oci.build', Target,
+                       [oci_spec(Context, Dockerfile, TagSource, NetSource,
+                                 BuildArgumentSources)]),
+               action_request('oci.build', Code,
+                              [record(ContextBytes, Dockerfile, Tag, Net,
+                                      BuildArguments)])) :-
+    wire_target(Target),
+    wire_handler('oci.build', Code, _),
+    wire_source_value(bytes(blob_bytes), base64(Context), ContextBytes),
+    bounded_source_text(blob_bytes, Dockerfile),
+    optional_source_text(TagSource, Tag),
+    wire_source_value(net_mode, string(NetSource), Net),
+    build_argument_values(BuildArgumentSources, BuildArguments).
+action_request(command(_Action, 'oaita.probe', Target,
+                       [api_spec(BaseUrl, Model, ApiKey)]),
+               action_request('oaita.probe', Code,
+                              [record(BaseUrl, Model, ApiKey)])) :-
+    wire_target(Target),
+    wire_handler('oaita.probe', Code, _),
+    bounded_source_text(text_bytes, BaseUrl),
+    bounded_source_text(text_bytes, Model),
+    bounded_source_text(text_bytes, ApiKey).
+
+wire_target(ui).
+wire_target(control).
+
+readonly_attachment_sources([], []).
+readonly_attachment_sources([Source|Sources], [box(Box)|Attachments]) :-
+    wire_source_value(box_id, Source, Box),
+    readonly_attachment_sources(Sources, Attachments).
+
+optional_source_text(none, none).
+optional_source_text(some(Value), some(Value)) :-
+    bounded_source_text(text_bytes, Value).
+
+build_argument_values(Sources, Values) :-
+    wire_limit(environment_entries, Maximum),
+    length(Sources, Count),
+    Count =< Maximum,
+    build_argument_values(Sources, [], Values).
+
+build_argument_values([], _, []).
+build_argument_values([pair(Key, Value)|Sources], Seen,
+                      [pair(Key, Value)|Values]) :-
+    bounded_source_text(text_bytes, Key),
+    bounded_source_text(text_bytes, Value),
+    text_key_absent(Key, Seen),
+    build_argument_values(Sources, [Key|Seen], Values).
+
+text_key_absent(_, []).
+text_key_absent(Key, [Seen|Keys]) :-
+    Key \= Seen,
+    text_key_absent(Key, Keys).
+
+view_open_sources([KindSource, BoxSource], Kind, Box, none, true) :-
+    wire_source_value(view_kind, KindSource, Kind),
+    wire_source_value(box_id, BoxSource, Box).
+view_open_sources([KindSource, BoxSource, Third], Kind, Box, Filter,
+                  RunningOnly) :-
+    wire_source_value(view_kind, KindSource, Kind),
+    wire_source_value(box_id, BoxSource, Box),
+    ( filter_source_value(Third, Filter), RunningOnly = true
+    ; wire_source_value(bool, Third, RunningOnly), Filter = none
+    ).
+view_open_sources([KindSource, BoxSource, FilterSource, RunningSource],
+                  Kind, Box, Filter, RunningOnly) :-
+    wire_source_value(view_kind, KindSource, Kind),
+    wire_source_value(box_id, BoxSource, Box),
+    filter_source_value(FilterSource, Filter),
+    wire_source_value(bool, RunningSource, RunningOnly).
+
+% The command-text filter representation is deliberately small and typed:
+% `none` disables filtering; `KIND:PATTERN` is one enabled conjunctive clause.
+% UI code constructs the same closed filter_spec record directly and does not
+% send this textual spelling over the Rust-to-Rust socket.
+filter_source_value(string("none"), none) :- !.
+filter_source_value(string(""), none) :- !.
+filter_source_value(string(Text), some([record(Kind, Pattern, and,
+                                             false, true)])) :-
+    sub_string(Text, Before, 1, After, ":"),
+    sub_string(Text, 0, Before, _, KindText),
+    PatternStart is Before + 1,
+    sub_string(Text, PatternStart, After, 0, Pattern),
+    wire_source_value(filter_kind, string(KindText), Kind),
+    bounded_source_text(text_bytes, Pattern).
+
+request_field_values([], [], [], []).
+request_field_values(
+    [arg(Name, _Kind, required, scalar)|Schema],
+    [field(Name, Type)|Fields], [Argument|Arguments], [Value|Values]) :-
+    wire_source_value(Type, Argument, Value),
+    request_field_values(Schema, Fields, Arguments, Values).
+request_field_values(
+    [arg(Name, _Kind, optional, scalar)|Schema],
+    [field(Name, option(Type))|Fields], [Argument|Arguments],
+    [some(Value)|Values]) :-
+    wire_source_value(Type, Argument, Value),
+    request_field_values(Schema, Fields, Arguments, Values).
+request_field_values(
+    [arg(Name, _Kind, optional, scalar)|Schema],
+    [field(Name, option(_Type))|Fields], Arguments, [none|Values]) :-
+    request_field_values(Schema, Fields, Arguments, Values).
+request_field_values(
+    [arg(Name, _Kind, repeated, array)|Schema],
+    [field(Name, list(Type, Limit))|Fields],
+    [array(Arguments0)|Arguments], [List|Values]) :-
+    wire_source_list(Type, Limit, Arguments0, List),
+    request_field_values(Schema, Fields, Arguments, Values).
+request_field_values(
+    [arg(Name, _Kind, repeated, array)|Schema],
+    [field(Name, list(_Type, _Limit))|Fields], Arguments, [[]|Values]) :-
+    request_field_values(Schema, Fields, Arguments, Values).
+request_field_values(
+    [arg(Name, _Kind, repeated, spread)],
+    [field(Name, list(Type, Limit))], Arguments, [List]) :-
+    wire_source_list(Type, Limit, Arguments, List).
+
+wire_source_list(Type, Limit, Arguments, Values) :-
+    wire_limit(Limit, Maximum),
+    length(Arguments, Count),
+    Count =< Maximum,
+    wire_source_values(Type, Arguments, Values).
+
+wire_source_values(_, [], []).
+wire_source_values(Type, [Argument|Arguments], [Value|Values]) :-
+    wire_source_value(Type, Argument, Value),
+    wire_source_values(Type, Arguments, Values).
+
+wire_source_value(Type, Source, Value) :-
+    wire_type(Type, alias(Alias)),
+    !,
+    wire_source_value(Alias, Source, Value).
+wire_source_value(u16, integer(Value), Value) :-
+    integer(Value), Value >= 0, Value =< 65535.
+wire_source_value(u32, integer(Value), Value) :-
+    integer(Value), Value >= 0, Value =< 4294967295.
+wire_source_value(u64, integer(Value), Value) :-
+    integer(Value), Value >= 0.
+wire_source_value(s32, integer(Value), Value) :-
+    integer(Value), Value >= -2147483648, Value =< 2147483647.
+wire_source_value(s64, integer(Value), Value) :- integer(Value).
+wire_source_value(bool, boolean(Value), Value) :-
+    ( Value = true ; Value = false ).
+wire_source_value(text(Limit), string(Value), Value) :-
+    bounded_source_text(Limit, Value).
+wire_source_value(bytes(Limit), path(Value), Value) :-
+    bounded_source_text(Limit, Value).
+wire_source_value(bytes(Limit), base64(Value), base64(Value)) :-
+    base64_decoded_bytes(Value, Bytes),
+    wire_limit(Limit, Maximum),
+    Bytes =< Maximum.
+wire_source_value(Type, string(Text), Case) :-
+    wire_type(Type, enum),
+    atom_string(Case, Text),
+    wire_enum(Type, Case, _).
+
+bounded_source_text(Limit, Value) :-
+    string(Value),
+    wire_limit(Limit, Maximum),
+    string_bytes(Value, Bytes),
+    Bytes =< Maximum.
+
+base64_decoded_bytes(Value, Bytes) :-
+    string(Value),
+    string_codes(Value, Codes),
+    base64_codes_bytes(Codes, Bytes).
+
+base64_codes_bytes([], 0).
+base64_codes_bytes([A, B, 61, 61], 1) :-
+    base64_code(A), base64_code(B), !.
+base64_codes_bytes([A, B, C, 61], 2) :-
+    base64_code(A), base64_code(B), base64_code(C), !.
+base64_codes_bytes([A, B, C, D|Codes], Bytes) :-
+    base64_code(A), base64_code(B), base64_code(C), base64_code(D),
+    base64_codes_bytes(Codes, Rest),
+    Bytes is Rest + 3.
+
+base64_code(Code) :- Code >= 0'A, Code =< 0'Z, !.
+base64_code(Code) :- Code >= 0'a, Code =< 0'z, !.
+base64_code(Code) :- Code >= 0'0, Code =< 0'9, !.
+base64_code(0'+).
+base64_code(0'/).
+
+% SWI's string_length/2 counts Unicode code points. Wire text and byte bounds
+% are byte bounds, so measure the canonical UTF-8 representation explicitly.
+string_bytes(Value, Bytes) :-
+    string_codes(Value, Codes),
+    utf8_codes_bytes(Codes, 0, Bytes).
+
+utf8_codes_bytes([], Bytes, Bytes).
+utf8_codes_bytes([Code|Codes], Bytes0, Bytes) :-
+    utf8_code_bytes(Code, Width),
+    Bytes1 is Bytes0 + Width,
+    utf8_codes_bytes(Codes, Bytes1, Bytes).
+
+utf8_code_bytes(Code, 1) :- Code >= 0, Code =< 127, !.
+utf8_code_bytes(Code, 2) :- Code =< 2047, !.
+utf8_code_bytes(Code, 3) :- Code =< 65535, !.
+utf8_code_bytes(Code, 4) :- Code =< 1114111.
 
 %! parse(+Items, -Result) is nondet.
 
@@ -512,12 +751,247 @@ argument_surface(integer, integer(Value), Text) :-
     ).
 argument_surface(string, string(Text), Surface) :-
     string_value_surface(Text, Surface).
-argument_surface(path, string(Text), Surface) :-
+argument_surface(string, integer(Value), Surface) :-
+    argument_surface(integer, integer(Value), Surface).
+argument_surface(path, path(Text), Surface) :-
     string_value_surface(Text, Surface).
-argument_surface(base64, string(Text), Surface) :-
+argument_surface(base64, base64(Text), Surface) :-
     string_value_surface(Text, Surface).
-argument_surface(spec, string(Text), Surface) :-
+argument_surface(oci_spec, Spec, Surface) :-
+    structured_json_surface(oci_spec_json, Spec, Surface).
+argument_surface(api_spec, Spec, Surface) :-
+    structured_json_surface(api_spec_json, Spec, Surface).
+argument_surface(spec, spec(Text), Surface) :-
     string_value_surface(Text, Surface).
+
+% Structured source arguments use JSON only as a textual representation.  The
+% ordinary terminal relation parses it here into a closed action-specific term;
+% generic JSON never crosses the request boundary.  Rendering emits compact
+% ASCII-only JSON so the neutral whitespace framer keeps it as one source item.
+structured_json_surface(Relation, Value, Surface) :-
+    ground(Surface),
+    !,
+    text_string(Surface, SurfaceString),
+    string_codes(SurfaceString, Codes),
+    phrase(json_document(Json), Codes),
+    call(Relation, Value, Json).
+structured_json_surface(Relation, Value, Surface) :-
+    ground(Value),
+    call(Relation, Value, Json),
+    json_render_value(Json, Codes),
+    string_codes(Surface, Codes).
+
+oci_spec_json(
+    oci_spec(Context, Dockerfile, Tag, Net, BuildArguments),
+    json_object(Pairs)) :-
+    ground(Pairs),
+    !,
+    json_take("context_tar_gz", Pairs, json_string(Context), Pairs1),
+    json_take("dockerfile", Pairs1, json_string(Dockerfile), Pairs2),
+    json_take("tag", Pairs2, TagJson, Pairs3),
+    json_optional_string(TagJson, Tag),
+    json_take("net", Pairs3, json_string(Net), Pairs4),
+    json_take("build_args", Pairs4, json_array(BuildJson), []),
+    json_build_arguments(BuildJson, BuildArguments).
+oci_spec_json(
+    oci_spec(Context, Dockerfile, Tag, Net, BuildArguments),
+    json_object([
+        "context_tar_gz"-json_string(Context),
+        "dockerfile"-json_string(Dockerfile),
+        "tag"-TagJson,
+        "net"-json_string(Net),
+        "build_args"-json_array(BuildJson)
+    ])) :-
+    json_optional_string(TagJson, Tag),
+    json_build_arguments(BuildJson, BuildArguments).
+
+api_spec_json(api_spec(BaseUrl, Model, ApiKey), json_object(Pairs)) :-
+    ground(Pairs),
+    !,
+    json_take("base_url", Pairs, json_string(BaseUrl), Pairs1),
+    json_take("model", Pairs1, json_string(Model), Pairs2),
+    json_take("api_key", Pairs2, json_string(ApiKey), []).
+api_spec_json(api_spec(BaseUrl, Model, ApiKey),
+              json_object([
+                  "base_url"-json_string(BaseUrl),
+                  "model"-json_string(Model),
+                  "api_key"-json_string(ApiKey)
+              ])).
+
+json_take(Name, [Name-Value|Pairs], Value, Pairs) :- !.
+json_take(Name, [Pair|Pairs], Value, [Pair|Rest]) :-
+    json_take(Name, Pairs, Value, Rest).
+
+json_optional_string(json_null, none).
+json_optional_string(json_string(Value), some(Value)).
+
+json_build_arguments([], []).
+json_build_arguments(
+    [json_array([json_string(Key), json_string(Value)])|Json],
+    [pair(Key, Value)|Arguments]) :-
+    json_build_arguments(Json, Arguments).
+
+json_document(Value) --> json_space, json_value(Value), json_space.
+
+json_value(json_string(Value)) --> json_string(Value).
+json_value(json_object(Pairs)) --> [123], json_space,
+                                  json_object_members(Pairs), json_space, [125].
+json_value(json_array(Values)) --> [91], json_space,
+                                  json_array_members(Values), json_space, [93].
+json_value(json_null) --> [110, 117, 108, 108].
+json_value(json_true) --> [116, 114, 117, 101].
+json_value(json_false) --> [102, 97, 108, 115, 101].
+
+json_object_members([]) --> [].
+json_object_members([Key-Value|Pairs]) -->
+    json_string(Key), json_space, [58], json_space, json_value(Value),
+    json_object_members_tail(Pairs).
+
+json_object_members_tail([]) --> [].
+json_object_members_tail([Key-Value|Pairs]) -->
+    json_space, [44], json_space, json_string(Key), json_space, [58],
+    json_space, json_value(Value), json_object_members_tail(Pairs).
+
+json_array_members([]) --> [].
+json_array_members([Value|Values]) -->
+    json_value(Value), json_array_members_tail(Values).
+
+json_array_members_tail([]) --> [].
+json_array_members_tail([Value|Values]) -->
+    json_space, [44], json_space, json_value(Value),
+    json_array_members_tail(Values).
+
+json_string(Value) --> [34], json_string_codes(Codes), [34],
+                       { string_codes(Value, Codes) }.
+
+json_string_codes([]) --> [].
+json_string_codes([Code|Codes]) -->
+    json_string_code(Code),
+    json_string_codes(Codes).
+
+json_string_code(Code) --> [92], json_escape(Code), !.
+json_string_code(Code) --> [Code],
+    { Code >= 32, Code =\= 34, Code =\= 92 }.
+
+json_escape(34) --> [34].
+json_escape(92) --> [92].
+json_escape(47) --> [47].
+json_escape(8) --> [98].
+json_escape(12) --> [102].
+json_escape(10) --> [110].
+json_escape(13) --> [114].
+json_escape(9) --> [116].
+json_escape(Code) --> [117], json_hex_quad(High),
+                      json_unicode_tail(High, Code).
+
+json_unicode_tail(High, Code) -->
+    { High >= 55296, High =< 56319 },
+    !,
+    [92, 117], json_hex_quad(Low),
+    { Low >= 56320, Low =< 57343,
+      Code is 65536 + ((High - 55296) * 1024) + Low - 56320
+    }.
+json_unicode_tail(Code, Code) -->
+    { ( Code < 55296 ; Code > 57343 ) }.
+
+json_hex_quad(Value) -->
+    json_hex_digit(A), json_hex_digit(B),
+    json_hex_digit(C), json_hex_digit(D),
+    { Value is A * 4096 + B * 256 + C * 16 + D }.
+
+json_hex_digit(Value) --> [Code], { json_hex_code(Code, Value) }.
+
+json_hex_code(Code, Value) :-
+    Code >= 48, Code =< 57, !, Value is Code - 48.
+json_hex_code(Code, Value) :-
+    Code >= 65, Code =< 70, !, Value is Code - 55.
+json_hex_code(Code, Value) :-
+    Code >= 97, Code =< 102, Value is Code - 87.
+
+json_space --> [Code], { json_space_code(Code) }, !, json_space.
+json_space --> [].
+
+json_space_code(32).
+json_space_code(9).
+json_space_code(10).
+json_space_code(13).
+
+json_render_value(json_string(Value), [34|Codes]) :-
+    string_codes(Value, StringCodes),
+    json_render_string_codes(StringCodes, Escaped),
+    append(Escaped, [34], Codes).
+json_render_value(json_object(Pairs), Codes) :-
+    json_render_object_members(Pairs, Members),
+    append([123|Members], [125], Codes).
+json_render_value(json_array(Values), Codes) :-
+    json_render_array_members(Values, Members),
+    append([91|Members], [93], Codes).
+json_render_value(json_null, [110, 117, 108, 108]).
+json_render_value(json_true, [116, 114, 117, 101]).
+json_render_value(json_false, [102, 97, 108, 115, 101]).
+
+json_render_object_members([], []).
+json_render_object_members([Key-Value|Pairs], Codes) :-
+    json_render_value(json_string(Key), KeyCodes),
+    json_render_value(Value, ValueCodes),
+    append(KeyCodes, [58|ValueCodes], Field),
+    json_render_object_tail(Pairs, Tail),
+    append(Field, Tail, Codes).
+
+json_render_object_tail([], []).
+json_render_object_tail(Pairs, [44|Codes]) :-
+    json_render_object_members(Pairs, Codes).
+
+json_render_array_members([], []).
+json_render_array_members([Value|Values], Codes) :-
+    json_render_value(Value, ValueCodes),
+    json_render_array_tail(Values, Tail),
+    append(ValueCodes, Tail, Codes).
+
+json_render_array_tail([], []).
+json_render_array_tail(Values, [44|Codes]) :-
+    json_render_array_members(Values, Codes).
+
+json_render_string_codes([], []).
+json_render_string_codes([Code|Codes], Escaped) :-
+    json_render_string_code(Code, Head),
+    json_render_string_codes(Codes, Tail),
+    append(Head, Tail, Escaped).
+
+json_render_string_code(34, [92, 34]) :- !.
+json_render_string_code(92, [92, 92]) :- !.
+json_render_string_code(8, [92, 98]) :- !.
+json_render_string_code(9, [92, 116]) :- !.
+json_render_string_code(10, [92, 110]) :- !.
+json_render_string_code(12, [92, 102]) :- !.
+json_render_string_code(13, [92, 114]) :- !.
+json_render_string_code(Code, [Code]) :-
+    Code >= 33, Code =< 126, !.
+json_render_string_code(Code, Escaped) :-
+    Code >= 0, Code =< 65535, !,
+    json_render_unicode_escape(Code, Escaped).
+json_render_string_code(Code, Escaped) :-
+    Code =< 1114111,
+    Plane is Code - 65536,
+    High is 55296 + Plane // 1024,
+    Low is 56320 + Plane mod 1024,
+    json_render_unicode_escape(High, HighCodes),
+    json_render_unicode_escape(Low, LowCodes),
+    append(HighCodes, LowCodes, Escaped).
+
+json_render_unicode_escape(Code, [92, 117, A, B, C, D]) :-
+    AValue is (Code // 4096) mod 16,
+    BValue is (Code // 256) mod 16,
+    CValue is (Code // 16) mod 16,
+    DValue is Code mod 16,
+    json_render_hex_code(AValue, A),
+    json_render_hex_code(BValue, B),
+    json_render_hex_code(CValue, C),
+    json_render_hex_code(DValue, D).
+
+json_render_hex_code(Value, Code) :-
+    Value < 10, !, Code is Value + 48.
+json_render_hex_code(Value, Code) :- Code is Value + 87.
 
 string_value_surface(Text, Surface) :-
     ( text(Text)
@@ -536,6 +1010,8 @@ kind_syntax(integer, integer).
 kind_syntax(string, string).
 kind_syntax(path, path).
 kind_syntax(base64, base64).
+kind_syntax(oci_spec, structured_spec).
+kind_syntax(api_spec, structured_spec).
 kind_syntax(spec, spec).
 
 evidence_preference([], Preference, Preference).
@@ -974,6 +1450,11 @@ dispatch_application(context_completion_resolve,
        -> true
        ;  Completions = []
        ).
+dispatch_application(action_request, request(Command), Response) :-
+    !, ( action_request(Command, Request)
+       -> Response = ok(Request)
+       ;  Response = error(no_solution)
+       ).
 dispatch_application(parse, _, error(invalid_request)) :- !.
 dispatch_application(complete, _, error(invalid_request)) :- !.
 dispatch_application(highlights, _, error(invalid_request)) :- !.
@@ -988,6 +1469,7 @@ dispatch_application(context_plan, _, error(invalid_request)) :- !.
 dispatch_application(context_resolve, _, error(invalid_request)) :- !.
 dispatch_application(context_completion, _, error(invalid_request)) :- !.
 dispatch_application(context_completion_resolve, _, error(invalid_request)) :- !.
+dispatch_application(action_request, _, error(invalid_request)) :- !.
 dispatch_application(_, _, error(invalid_operation)).
 
 context_observation([Observation|_], Observation).
