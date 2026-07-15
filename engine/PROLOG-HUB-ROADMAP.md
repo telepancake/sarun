@@ -94,6 +94,13 @@ checks suffix viability and makes the completion carry the exact context
 query graph and observations used by the successful parse. Recording means
 returning pure evidence, never asserting state during backtracking.
 
+This is a present acceptance criterion, not a future improvement. If any
+consumer derives completions, highlighting, hints, syntax, normalization, or
+rendering by independently reinterpreting the grammar, stop the migration and
+replace that path with a projection of the ordinary relation before doing
+further feature work. Do not describe an adjacent implementation as though it
+already satisfies this contract.
+
 ## Current bad state being replaced
 
 There are three competing authorities:
