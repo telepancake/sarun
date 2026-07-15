@@ -409,16 +409,16 @@ wire_type(path_error, record([
 ])).
 wire_type(apply_result, record([
     field(applied, list(path, collection_items)),
-    field(errors, list(path_error, error_items))
+    field(errors, list(path_error, collection_items))
 ])).
 wire_type(discard_result, record([
     field(discarded, list(path, collection_items)),
-    field(errors, list(path_error, error_items))
+    field(errors, list(path_error, collection_items))
 ])).
 wire_type(action_mutation_result, record([
     field(box, box_id),
     field(count, u64),
-    field(errors, list(path_error, error_items))
+    field(errors, list(path_error, collection_items))
 ])).
 
 wire_type(change_row, record([
@@ -767,16 +767,20 @@ wire_type(web_capture_body, record([
     field(body, bytes(blob_bytes))
 ])).
 
-wire_type(sud_event_kind, enum).
-wire_enum(sud_event_kind, exec,   1).
-wire_enum(sud_event_kind, argv,   2).
-wire_enum(sud_event_kind, env,    3).
-wire_enum(sud_event_kind, open,   4).
-wire_enum(sud_event_kind, cwd,    5).
-wire_enum(sud_event_kind, stdout, 6).
-wire_enum(sud_event_kind, stderr, 7).
-wire_enum(sud_event_kind, exit,   8).
-wire_enum(sud_event_kind, prof,   9).
+% TRACE is independently versioned and may acquire event kinds before this
+% viewer does. Preserve an unknown numeric kind explicitly instead of making
+% the typed display relation unable to represent bytes the recorder retained.
+wire_type(sud_event_kind, choice).
+wire_variant(sud_event_kind, exec,    1, []).
+wire_variant(sud_event_kind, argv,    2, []).
+wire_variant(sud_event_kind, env,     3, []).
+wire_variant(sud_event_kind, open,    4, []).
+wire_variant(sud_event_kind, cwd,     5, []).
+wire_variant(sud_event_kind, stdout,  6, []).
+wire_variant(sud_event_kind, stderr,  7, []).
+wire_variant(sud_event_kind, exit,    8, []).
+wire_variant(sud_event_kind, prof,    9, []).
+wire_variant(sud_event_kind, unknown, 10, [field(code, s64)]).
 wire_type(sud_event, record([
     field(time_ns, nanoseconds),
     field(kind, sud_event_kind),

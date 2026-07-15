@@ -3,7 +3,7 @@
 // source-sha256 engine/pl/action_catalog.pl 3943f522f7b5a2b94abac859f11f5293765201a054a3221610e8077eb7a0c8f0
 // source-sha256 engine/pl/action_grammar.pl 7a62398c823bd390fb3da998ae51b0ec7e31e3a8f09e0c7aa429c82121149a62
 // source-sha256 engine/pl/context_relation.pl cbf9d8788d006f18250dd45d07ce8664ec28e1fc997630b7a0ca717c2f8f3a0c
-// source-sha256 engine/pl/transport_catalog.pl a34ee54e12804150abca2415971e5eba39ee44577f3bb958daf6afa1c9b05f16
+// source-sha256 engine/pl/transport_catalog.pl f7c333fb521f17229ca341f101d2aec8f91e331df0ccedbf65ca54aec62e3c83
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
 // source-sha256 scripts/wire_codegen.py 3a281991190c9c76898e4dad47065ffb16590080fef3f9588e20d4c6fcc4e561
 
@@ -186,7 +186,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "690c2116eec0e55210dcc46a1ccea1fe39f1e6a61053a6a24a7b5e7a209d2950";
+    "2aa8de042eb538773b831efc49a725c59e81de857669c47763df6598bafc17aa";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -2580,7 +2580,7 @@ impl RelationWireValue for PathError {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ApplyResult {
     pub applied: BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS>,
-    pub errors: BoundedVec<PathError, 0, LIMIT_ERROR_ITEMS>,
+    pub errors: BoundedVec<PathError, 0, LIMIT_COLLECTION_ITEMS>,
 }
 
 impl WireValue for ApplyResult {
@@ -2597,7 +2597,7 @@ impl WireValue for ApplyResult {
             applied: <BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS> as WireValue>::decode_atom(
                 &mut fields,
             )?,
-            errors: <BoundedVec<PathError, 0, LIMIT_ERROR_ITEMS> as WireValue>::decode_atom(
+            errors: <BoundedVec<PathError, 0, LIMIT_COLLECTION_ITEMS> as WireValue>::decode_atom(
                 &mut fields,
             )?,
         };
@@ -2612,14 +2612,8 @@ impl RelationWireValue for ApplyResult {
         require_relation_arity(fields, 2)?;
         let mut fields = fields.iter();
         Ok(Self {
-            applied:
-                <BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS> as RelationWireValue>::from_relation(
-                    fields.next().unwrap(),
-                )?,
-            errors:
-                <BoundedVec<PathError, 0, LIMIT_ERROR_ITEMS> as RelationWireValue>::from_relation(
-                    fields.next().unwrap(),
-                )?,
+            applied: <BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            errors: <BoundedVec<PathError, 0, LIMIT_COLLECTION_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
         })
     }
 }
@@ -2627,7 +2621,7 @@ impl RelationWireValue for ApplyResult {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DiscardResult {
     pub discarded: BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS>,
-    pub errors: BoundedVec<PathError, 0, LIMIT_ERROR_ITEMS>,
+    pub errors: BoundedVec<PathError, 0, LIMIT_COLLECTION_ITEMS>,
 }
 
 impl WireValue for DiscardResult {
@@ -2644,7 +2638,7 @@ impl WireValue for DiscardResult {
             discarded: <BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS> as WireValue>::decode_atom(
                 &mut fields,
             )?,
-            errors: <BoundedVec<PathError, 0, LIMIT_ERROR_ITEMS> as WireValue>::decode_atom(
+            errors: <BoundedVec<PathError, 0, LIMIT_COLLECTION_ITEMS> as WireValue>::decode_atom(
                 &mut fields,
             )?,
         };
@@ -2659,14 +2653,8 @@ impl RelationWireValue for DiscardResult {
         require_relation_arity(fields, 2)?;
         let mut fields = fields.iter();
         Ok(Self {
-            discarded:
-                <BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS> as RelationWireValue>::from_relation(
-                    fields.next().unwrap(),
-                )?,
-            errors:
-                <BoundedVec<PathError, 0, LIMIT_ERROR_ITEMS> as RelationWireValue>::from_relation(
-                    fields.next().unwrap(),
-                )?,
+            discarded: <BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            errors: <BoundedVec<PathError, 0, LIMIT_COLLECTION_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
         })
     }
 }
@@ -2675,7 +2663,7 @@ impl RelationWireValue for DiscardResult {
 pub struct ActionMutationResult {
     pub r#box: BoxId,
     pub count: u64,
-    pub errors: BoundedVec<PathError, 0, LIMIT_ERROR_ITEMS>,
+    pub errors: BoundedVec<PathError, 0, LIMIT_COLLECTION_ITEMS>,
 }
 
 impl WireValue for ActionMutationResult {
@@ -2692,7 +2680,7 @@ impl WireValue for ActionMutationResult {
         let value = Self {
             r#box: <BoxId as WireValue>::decode_atom(&mut fields)?,
             count: <u64 as WireValue>::decode_atom(&mut fields)?,
-            errors: <BoundedVec<PathError, 0, LIMIT_ERROR_ITEMS> as WireValue>::decode_atom(
+            errors: <BoundedVec<PathError, 0, LIMIT_COLLECTION_ITEMS> as WireValue>::decode_atom(
                 &mut fields,
             )?,
         };
@@ -2709,10 +2697,7 @@ impl RelationWireValue for ActionMutationResult {
         Ok(Self {
             r#box: <BoxId as RelationWireValue>::from_relation(fields.next().unwrap())?,
             count: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
-            errors:
-                <BoundedVec<PathError, 0, LIMIT_ERROR_ITEMS> as RelationWireValue>::from_relation(
-                    fields.next().unwrap(),
-                )?,
+            errors: <BoundedVec<PathError, 0, LIMIT_COLLECTION_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
         })
     }
 }
@@ -5347,7 +5332,7 @@ impl RelationWireValue for WebCaptureBody {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SudEventKind {
     Exec,
     Argv,
@@ -5358,11 +5343,12 @@ pub enum SudEventKind {
     Stderr,
     Exit,
     Prof,
+    Unknown { code: i64 },
 }
 
-impl WireValue for SudEventKind {
-    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
-        let code = match self {
+impl SudEventKind {
+    pub const fn code(&self) -> u64 {
+        match self {
             Self::Exec => 1,
             Self::Argv => 2,
             Self::Env => 3,
@@ -5372,40 +5358,106 @@ impl WireValue for SudEventKind {
             Self::Stderr => 7,
             Self::Exit => 8,
             Self::Prof => 9,
-        };
-        put_u64(output, code);
-        Ok(())
+            Self::Unknown { .. } => 10,
+        }
+    }
+}
+
+impl WireValue for SudEventKind {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        put_u64(&mut fields, self.code());
+        match self {
+            Self::Exec => {}
+            Self::Argv => {}
+            Self::Env => {}
+            Self::Open => {}
+            Self::Cwd => {}
+            Self::Stdout => {}
+            Self::Stderr => {}
+            Self::Exit => {}
+            Self::Prof => {}
+            Self::Unknown { code } => {
+                code.encode_atom(&mut fields)?;
+            }
+        }
+        put_compound_payload(output, &fields)
     }
 
     fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
-        match get_u64(input)? {
-            1 => Ok(Self::Exec),
-            2 => Ok(Self::Argv),
-            3 => Ok(Self::Env),
-            4 => Ok(Self::Open),
-            5 => Ok(Self::Cwd),
-            6 => Ok(Self::Stdout),
-            7 => Ok(Self::Stderr),
-            8 => Ok(Self::Exit),
-            9 => Ok(Self::Prof),
-            _ => Err(DecodeError::InvalidValue),
-        }
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = match get_u64(&mut fields)? {
+            1 => Self::Exec,
+            2 => Self::Argv,
+            3 => Self::Env,
+            4 => Self::Open,
+            5 => Self::Cwd,
+            6 => Self::Stdout,
+            7 => Self::Stderr,
+            8 => Self::Exit,
+            9 => Self::Prof,
+            10 => Self::Unknown {
+                code: <i64 as WireValue>::decode_atom(&mut fields)?,
+            },
+            _ => return Err(DecodeError::InvalidValue),
+        };
+        require_empty(fields)?;
+        Ok(value)
     }
 }
 
 impl RelationWireValue for SudEventKind {
     fn from_relation(value: &RelationValue) -> Result<Self, String> {
-        match relation_atom(value)? {
-            "exec" => Ok(Self::Exec),
-            "argv" => Ok(Self::Argv),
-            "env" => Ok(Self::Env),
-            "open" => Ok(Self::Open),
-            "cwd" => Ok(Self::Cwd),
-            "stdout" => Ok(Self::Stdout),
-            "stderr" => Ok(Self::Stderr),
-            "exit" => Ok(Self::Exit),
-            "prof" => Ok(Self::Prof),
-            case => Err(format!("unknown SudEventKind relation case {case}")),
+        let (case, fields): (&str, &[RelationValue]) = match value {
+            RelationValue::Atom(case) => (case, &[]),
+            RelationValue::Compound(case, fields) => (case, fields),
+            _ => return Err("expected SudEventKind relation choice".into()),
+        };
+        match case {
+            "exec" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::Exec)
+            }
+            "argv" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::Argv)
+            }
+            "env" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::Env)
+            }
+            "open" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::Open)
+            }
+            "cwd" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::Cwd)
+            }
+            "stdout" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::Stdout)
+            }
+            "stderr" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::Stderr)
+            }
+            "exit" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::Exit)
+            }
+            "prof" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::Prof)
+            }
+            "unknown" => {
+                require_relation_arity(fields, 1)?;
+                let mut fields = fields.iter();
+                Ok(Self::Unknown {
+                    code: <i64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                })
+            }
+            _ => Err(format!("unknown SudEventKind relation choice {case}")),
         }
     }
 }
@@ -13213,6 +13265,7 @@ mod generated_tests {
         roundtrip(SudEventKind::Stderr);
         roundtrip(SudEventKind::Exit);
         roundtrip(SudEventKind::Prof);
+        roundtrip(SudEventKind::Unknown { code: 0i64 });
         roundtrip::<SudEvent>(SudEvent {
             time_ns: 0u64,
             kind: SudEventKind::Exec,

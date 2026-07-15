@@ -59,16 +59,19 @@ fn streams() -> &'static Mutex<HashMap<i64, Arc<Stream>>> {
     STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Decode a raw sud TRACE stream (the `sudtrace` blob) into JSON event rows
-/// for the `sudtrace` control verb / the UI's Trace pane. Each row is
-/// `{ts_ns, kind, pid, tgid, ppid, extras, text}` where `kind` names the
-/// event type (numeric string for anything unknown) and `text` is the blob
+/// Decode a raw sud TRACE stream (the `sudtrace` blob) into the closed result
+/// type generated from the relation. Each row retains time, process identity,
+/// extras, and text; unknown numeric event kinds remain an explicit sum case.
+/// `text` is the blob
 /// rendered lossy-UTF8 — argv/env/cwd/open paths and stdout/stderr bytes —
 /// truncated at 4 KiB with a "… (N bytes)" suffix so one huge write can't
 /// bloat the reply. Capped at the first `CAP` events with a `truncated`
 /// flag so a giant trace can't wedge the UI.
-pub fn decode_trace(bytes: &[u8]) -> serde_json::Value {
-    use serde_json::json;
+pub fn decode_trace(bytes: &[u8]) -> Result<crate::generated_wire::SudTraceView, String> {
+    use crate::generated_wire::{
+        LIMIT_COLLECTION_ITEMS, LIMIT_TEXT_BYTES, SudEvent, SudEventKind, SudTraceView,
+    };
+    use crate::wire::{BoundedText, BoundedVec};
     const CAP: usize = 20_000;
     const TEXT_MAX: usize = 4096;
     let mut dec = sudwire::Decoder::default();
@@ -82,26 +85,37 @@ pub fn decode_trace(bytes: &[u8]) -> serde_json::Value {
             String::from_utf8_lossy(blob).into_owned()
         }
     };
-    let rows: Vec<serde_json::Value> = events.iter().take(CAP).map(|e| {
+    let rows = events.iter().take(CAP).map(|e| {
         let kind = match e.ty {
-            sudwire::EV_EXEC => "EXEC".to_string(),
-            sudwire::EV_ARGV => "ARGV".to_string(),
-            sudwire::EV_ENV => "ENV".to_string(),
-            sudwire::EV_OPEN => "OPEN".to_string(),
-            sudwire::EV_CWD => "CWD".to_string(),
-            sudwire::EV_STDOUT => "STDOUT".to_string(),
-            sudwire::EV_STDERR => "STDERR".to_string(),
-            sudwire::EV_EXIT => "EXIT".to_string(),
-            sudwire::EV_PROF => "PROF".to_string(),
-            other => other.to_string(),
+            sudwire::EV_EXEC => SudEventKind::Exec,
+            sudwire::EV_ARGV => SudEventKind::Argv,
+            sudwire::EV_ENV => SudEventKind::Env,
+            sudwire::EV_OPEN => SudEventKind::Open,
+            sudwire::EV_CWD => SudEventKind::Cwd,
+            sudwire::EV_STDOUT => SudEventKind::Stdout,
+            sudwire::EV_STDERR => SudEventKind::Stderr,
+            sudwire::EV_EXIT => SudEventKind::Exit,
+            sudwire::EV_PROF => SudEventKind::Prof,
+            code => SudEventKind::Unknown { code },
         };
-        json!({
-            "ts_ns": e.ts_ns, "kind": kind,
-            "pid": e.pid, "tgid": e.tgid, "ppid": e.ppid,
-            "extras": e.extras, "text": render_text(&e.blob),
+        Ok(SudEvent {
+            time_ns: u64::try_from(e.ts_ns)
+                .map_err(|_| "TRACE event has a negative timestamp")?,
+            kind,
+            pid: u32::try_from(e.pid).map_err(|_| "TRACE event has an invalid pid")?,
+            tgid: u32::try_from(e.tgid).map_err(|_| "TRACE event has an invalid tgid")?,
+            ppid: u32::try_from(e.ppid).map_err(|_| "TRACE event has an invalid ppid")?,
+            extras: BoundedVec::<i64, 0, LIMIT_COLLECTION_ITEMS>::new(e.extras.clone())
+                .map_err(|error| format!("TRACE event extras exceed bounds: {error:?}"))?,
+            text: BoundedText::<LIMIT_TEXT_BYTES>::new(render_text(&e.blob))
+                .map_err(|error| format!("TRACE event text exceeds bounds: {error:?}"))?,
         })
-    }).collect();
-    json!({"ok": true, "events": rows, "truncated": truncated})
+    }).collect::<Result<Vec<_>, String>>()?;
+    Ok(SudTraceView {
+        events: BoundedVec::new(rows)
+            .map_err(|error| format!("TRACE event count exceeds bounds: {error:?}"))?,
+        truncated,
+    })
 }
 
 /// Take the box's stream state (if the runner streamed a trace), waiting
@@ -258,20 +272,21 @@ pub fn sweep(b: &BoxState, id: i64, runpid: u32) -> SweepReport {
     SweepReport { ingested, errors }
 }
 
-/// Decode a box's durable TRACE blob to JSON event rows for the `sudtrace`
-/// verb / the UI Trace pane. Prefers the live BoxState's own connection when
-/// the box is running (no rival on-disk handle racing serve); else opens the
-/// at-rest sqlar. A box with no trace (every FUSE box) answers a clean error.
-pub fn trace_events_json(live: Option<Arc<BoxState>>, id: i64)
-                         -> serde_json::Value {
+/// Decode a box's durable TRACE blob to the generated typed result for the
+/// `sudtrace` verb / the UI Trace pane. Prefers the live BoxState's own
+/// connection when the box is running (no rival on-disk handle racing serve);
+/// else opens the at-rest sqlar. A box with no trace answers a clean error.
+pub fn trace_events(
+    live: Option<Arc<BoxState>>,
+    id: i64,
+) -> Result<crate::generated_wire::SudTraceView, String> {
     let blob = match live {
         Some(b) => b.get_sudtrace(),
         None => BoxState::create(id).ok().and_then(|b| b.get_sudtrace()),
     };
     match blob {
         Some(bytes) => decode_trace(&bytes),
-        None => serde_json::json!({"ok": false,
-                                   "error": "box has no sud trace"}),
+        None => Err("box has no sud trace".into()),
     }
 }
 
@@ -770,8 +785,8 @@ mod tests {
     use super::*;
     use crate::sudwire::{self, EvState};
 
-    /// decode_trace renders an encoder-built stream into typed JSON rows:
-    /// EXEC/OPEN/STDOUT/EXIT names, per-event text, extras verbatim.
+    /// decode_trace renders an encoder-built stream into typed relation rows:
+    /// EXEC/OPEN/STDOUT/EXIT cases, per-event text, extras verbatim.
     #[test]
     fn decode_trace_names_kinds_and_text() {
         let mut enc = EvState::default();
@@ -785,19 +800,35 @@ mod tests {
                                       9, 9, &[], b"hi\n"));
         stream.extend(enc.build_exit(1, 400, 9, 9, 1, 0));
 
-        let v = decode_trace(&stream);
-        assert_eq!(v["ok"], true);
-        assert_eq!(v["truncated"], false);
-        let rows = v["events"].as_array().unwrap();
+        let v = decode_trace(&stream).unwrap();
+        assert!(!v.truncated);
+        let rows = v.events.as_slice();
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0]["kind"], "EXEC");
-        assert_eq!(rows[0]["text"], "/bin/sh");
-        assert_eq!(rows[1]["kind"], "OPEN");
-        assert_eq!(rows[1]["text"], "out.txt");
-        assert_eq!(rows[1]["extras"][0], 0o101);
-        assert_eq!(rows[2]["kind"], "STDOUT");
-        assert_eq!(rows[2]["text"], "hi\n");
-        assert_eq!(rows[3]["kind"], "EXIT");
+        assert_eq!(rows[0].kind, crate::generated_wire::SudEventKind::Exec);
+        assert_eq!(rows[0].text.as_str(), "/bin/sh");
+        assert_eq!(rows[1].kind, crate::generated_wire::SudEventKind::Open);
+        assert_eq!(rows[1].text.as_str(), "out.txt");
+        assert_eq!(rows[1].extras.as_slice()[0], 0o101);
+        assert_eq!(rows[2].kind, crate::generated_wire::SudEventKind::Stdout);
+        assert_eq!(rows[2].text.as_str(), "hi\n");
+        assert_eq!(rows[3].kind, crate::generated_wire::SudEventKind::Exit);
+    }
+
+    #[test]
+    fn decode_trace_preserves_unknown_kinds_and_rejects_invalid_identity() {
+        let mut enc = EvState::default();
+        let mut stream = sudwire::version_atom();
+        stream.extend(enc.build_event(1, 42, 1, 9, 9, 1, 9, 9, &[], b"future"));
+        let view = decode_trace(&stream).unwrap();
+        assert_eq!(
+            view.events.as_slice()[0].kind,
+            crate::generated_wire::SudEventKind::Unknown { code: 42 }
+        );
+
+        let mut enc = EvState::default();
+        let mut invalid = sudwire::version_atom();
+        invalid.extend(enc.build_event(1, sudwire::EV_EXEC, 1, -1, 9, 1, 9, 9, &[], b""));
+        assert!(decode_trace(&invalid).unwrap_err().contains("invalid pid"));
     }
 
     /// A blob past TEXT_MAX (4 KiB) is truncated with a "… (N bytes)" suffix
@@ -809,8 +840,8 @@ mod tests {
         let big = vec![b'a'; 5000];
         stream.extend(enc.build_event(1, sudwire::EV_STDOUT, 1, 9, 9, 1,
                                       9, 9, &[], &big));
-        let v = decode_trace(&stream);
-        let text = v["events"][0]["text"].as_str().unwrap();
+        let v = decode_trace(&stream).unwrap();
+        let text = v.events.as_slice()[0].text.as_str();
         assert!(text.ends_with("… (5000 bytes)"), "got: {}", &text[..40]);
         assert!(text.starts_with(&"a".repeat(4096)));
     }
@@ -824,9 +855,9 @@ mod tests {
             stream.extend(enc.build_event(1, sudwire::EV_EXEC, 1, 9, 9, 1,
                                           9, 9, &[], b""));
         }
-        let v = decode_trace(&stream);
-        assert_eq!(v["truncated"], true);
-        assert_eq!(v["events"].as_array().unwrap().len(), 20_000);
+        let v = decode_trace(&stream).unwrap();
+        assert!(v.truncated);
+        assert_eq!(v.events.as_slice().len(), 20_000);
     }
 
     /// A clean sweep of a sud box's upper dir mirrors its files into the sqlar

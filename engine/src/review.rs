@@ -1029,9 +1029,36 @@ fn host_changed_since_capture(id: i64, rel: &str) -> bool {
 /// (stage all paths, then commit-or-rollback as one unit) is a large redesign
 /// deliberately deferred; the per-path staleness guard below at least refuses
 /// to silently clobber a host file that changed since capture.
-pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
+fn relation_path(path: String) -> Result<crate::generated_wire::Path, String> {
+    crate::wire::BoundedBytes::new(path.into_bytes())
+        .map_err(|error| format!("path exceeds relation bound: {error:?}"))
+}
+
+fn relation_path_error(
+    path: Option<String>,
+    message: String,
+) -> Result<crate::generated_wire::PathError, String> {
+    Ok(crate::generated_wire::PathError {
+        path: path.map(relation_path).transpose()?,
+        message: crate::wire::BoundedText::new(message)
+            .map_err(|error| format!("error message exceeds relation bound: {error:?}"))?,
+    })
+}
+
+pub fn apply_typed(
+    id: i64,
+    paths: &Value,
+    ctx: &NestCtx,
+) -> Result<crate::generated_wire::ApplyResult, String> {
     let Some(conn) = open_rw(id) else {
-        return json!({"applied": [], "errors": [{"path": "", "error": "no archive"}]});
+        return Ok(crate::generated_wire::ApplyResult {
+            applied: crate::wire::BoundedVec::new(Vec::new()).unwrap(),
+            errors: crate::wire::BoundedVec::new(vec![relation_path_error(
+                None,
+                "no archive".into(),
+            )?])
+            .unwrap(),
+        });
     };
     let parent = ctx.parent_of(id);
     // D-parent: a child marked `readonly_parent` REFUSES to promote into its
@@ -1041,8 +1068,8 @@ pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
     // touch the host). The error string is the same shape Python returns so
     // the UI's error pane works uniformly.
     let ro_parent = ctx.readonly_parent_of(id);
-    let mut applied = vec![];
-    let mut errors = vec![];
+    let mut applied = Vec::new();
+    let mut errors = Vec::new();
     for rel in paths_arg(id, paths) {
         let rel = rel.trim_start_matches('/').to_string();
         // Sibling preservation FIRST (fail-closed): the promote below mutates
@@ -1081,12 +1108,33 @@ pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
                 if let Some((rowid, _, _)) = row_of(&conn, &rel) {
                     consume(&conn, id, &rel, rowid);
                 }
-                applied.push(Value::String(rel));
+                applied.push(relation_path(rel)?);
             }
-            Err(e) => errors.push(json!({"path": rel, "error": e})),
+            Err(error) => errors.push(relation_path_error(Some(rel), error)?),
         }
     }
-    json!({"applied": applied, "errors": errors})
+    Ok(crate::generated_wire::ApplyResult {
+        applied: crate::wire::BoundedVec::new(applied)
+            .map_err(|error| format!("apply result exceeds relation bound: {error:?}"))?,
+        errors: crate::wire::BoundedVec::new(errors)
+            .map_err(|error| format!("apply errors exceed relation bound: {error:?}"))?,
+    })
+}
+
+pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
+    match apply_typed(id, paths, ctx) {
+        Ok(result) => json!({
+            "applied": result.applied.into_inner().into_iter()
+                .map(|path| String::from_utf8_lossy(path.as_slice()).into_owned())
+                .collect::<Vec<_>>(),
+            "errors": result.errors.into_inner().into_iter().map(|error| json!({
+                "path": error.path.map(|path|
+                    String::from_utf8_lossy(path.as_slice()).into_owned()).unwrap_or_default(),
+                "error": error.message.into_inner(),
+            })).collect::<Vec<_>>(),
+        }),
+        Err(error) => json!({"applied": [], "errors": [{"path": "", "error": error}]}),
+    }
 }
 
 /// discard == drop each change from the box WITHOUT writing the host — but first
@@ -1094,25 +1142,50 @@ pub fn apply(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
 /// view is unchanged. Mirror of Python ChangeReview.discard. A copy-down failure
 /// for a path leaves that path in place (errored) — the child must not lose its
 /// inherited view.
-pub fn discard(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
-    let mut discarded = vec![];
-    let mut errors = vec![];
+pub fn discard_typed(
+    id: i64,
+    paths: &Value,
+    ctx: &NestCtx,
+) -> Result<crate::generated_wire::DiscardResult, String> {
+    let mut discarded = Vec::new();
+    let mut errors = Vec::new();
     let children = |b: i64| ctx.children_of(b);
     let resolve = |b: i64| ctx.live(b);
     if let Some(conn) = open_rw(id) {
         for rel in paths_arg(id, paths) {
             let rel = rel.trim_start_matches('/').to_string();
             if let Err(e) = copydown_to_children(id, &rel, &children, &resolve) {
-                errors.push(json!({"path": rel, "error": e}));
+                errors.push(relation_path_error(Some(rel), e)?);
                 continue;
             }
             if let Some((rowid, _, _)) = row_of(&conn, &rel) {
                 consume(&conn, id, &rel, rowid);
-                discarded.push(Value::String(rel));
+                discarded.push(relation_path(rel)?);
             }
         }
     }
-    json!({"discarded": discarded, "errors": errors})
+    Ok(crate::generated_wire::DiscardResult {
+        discarded: crate::wire::BoundedVec::new(discarded)
+            .map_err(|error| format!("discard result exceeds relation bound: {error:?}"))?,
+        errors: crate::wire::BoundedVec::new(errors)
+            .map_err(|error| format!("discard errors exceed relation bound: {error:?}"))?,
+    })
+}
+
+pub fn discard(id: i64, paths: &Value, ctx: &NestCtx) -> Value {
+    match discard_typed(id, paths, ctx) {
+        Ok(result) => json!({
+            "discarded": result.discarded.into_inner().into_iter()
+                .map(|path| String::from_utf8_lossy(path.as_slice()).into_owned())
+                .collect::<Vec<_>>(),
+            "errors": result.errors.into_inner().into_iter().map(|error| json!({
+                "path": error.path.map(|path|
+                    String::from_utf8_lossy(path.as_slice()).into_owned()).unwrap_or_default(),
+                "error": error.message.into_inner(),
+            })).collect::<Vec<_>>(),
+        }),
+        Err(error) => json!({"discarded": [], "errors": [{"path": "", "error": error}]}),
+    }
 }
 
 /// Split bytes into lines on '\n', keeping the terminator on each line (the last

@@ -1233,10 +1233,11 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                 None => json!({"ok": false, "error": "no slopbox"}),
             }
         }
-        // The box's durable sud TRACE stream, decoded server-side into JSON
-        // event rows (engine/DESIGN-sud.md step 2). Reads the sqlar blob via
-        // get_sudtrace — works for an at-rest box, no live requirement. A box
-        // with no trace (every FUSE box) answers with a clean error.
+        // The box's durable sud TRACE stream, decoded on demand into the
+        // generated typed result (engine/DESIGN-sud.md step 2). The current
+        // JSON listener projects that value only at its outer boundary. Reads
+        // the sqlar blob via get_sudtrace — works for an at-rest box, no live
+        // requirement. A box with no trace answers with a clean error.
         "sudtrace" => {
             let boxes = discover::discover();
             match msg
@@ -1245,8 +1246,16 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                 .and_then(|s| resolve(&boxes, s))
             {
                 Some(id) => {
-                    let live = lock(state).overlay.clone().and_then(|o| o.live_box(id));
-                    crate::sud::trace_events_json(live, id)
+                    let Ok(sid) = u64::try_from(id) else {
+                        return json!({"ok": false, "error": "negative box id"});
+                    };
+                    match dispatch_control_action(
+                        state,
+                        crate::generated_wire::ActionRequest::Sudtrace { sid },
+                    ) {
+                        Ok(success) => legacy_control_reply(success),
+                        Err(error) => json!({"ok": false, "error": error}),
+                    }
                 }
                 None => json!({"ok": false, "error": "no slopbox"}),
             }
@@ -1258,32 +1267,19 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                 .and_then(Value::as_str)
                 .and_then(|s| resolve(&boxes, s))
             {
-                Some(id) if box_is_running(state, id) => json!({"ok": false,
-                    "error": "box is running; stop it first"}),
                 Some(id) => {
-                    let all = Value::Null; // CLI applies/discards the whole box
-                    let ctx = crate::review::NestCtx::new(lock(state).overlay.clone());
-                    let (r, n) = if t == "apply" {
-                        let r = crate::review::apply(id, &all, &ctx);
-                        let n = r
-                            .get("applied")
-                            .and_then(Value::as_array)
-                            .map(|a| a.len())
-                            .unwrap_or(0);
-                        (r, n)
-                    } else {
-                        let r = crate::review::discard(id, &all, &ctx);
-                        let n = r
-                            .get("discarded")
-                            .and_then(Value::as_array)
-                            .map(|a| a.len())
-                            .unwrap_or(0);
-                        (r, n)
+                    let Ok(sid) = u64::try_from(id) else {
+                        return json!({"ok": false, "error": "negative box id"});
                     };
-                    drop_if_empty(state, id);
-                    json!({"ok": true, "count": n, "sid": id.to_string(),
-                           "errors": r.get("errors").cloned()
-                               .unwrap_or(json!([]))})
+                    let request = if t == "apply" {
+                        crate::generated_wire::ActionRequest::Apply { sid }
+                    } else {
+                        crate::generated_wire::ActionRequest::Discard { sid }
+                    };
+                    match dispatch_control_action(state, request) {
+                        Ok(success) => legacy_control_reply(success),
+                        Err(error) => json!({"ok": false, "error": error}),
+                    }
                 }
                 None => json!({"ok": false, "error": "no slopbox"}),
             }
@@ -1297,54 +1293,243 @@ fn dispatch(state: &State, msg: &Value) -> Value {
                 .and_then(|s| resolve(&boxes, s))
             {
                 Some(id) => {
-                    let old = discover::display_path(&boxes, id);
-                    // Route the meta write through the LIVE BoxState when the box
-                    // is running (one connection — never a rival on-disk handle
-                    // racing the serve thread); otherwise write the at-rest sqlar.
-                    let live = lock(state).overlay.clone().and_then(|o| o.live_box(id));
-                    match live {
-                        Some(cb) => cb.set_meta("name", newname),
-                        // At-rest: still go through BoxState::set_meta so every
-                        // box meta WRITE uses one upserting path, live or not.
-                        None => {
-                            if let Ok(b) = crate::capture::BoxState::create(id) {
-                                b.set_meta("name", newname);
-                            }
+                    let Ok(sid) = u64::try_from(id) else {
+                        return json!({"ok": false, "error": "negative box id"});
+                    };
+                    let new = match crate::wire::BoundedText::new(newname.to_owned()) {
+                        Ok(new) => new,
+                        Err(error) => {
+                            return json!({
+                                "ok": false,
+                                "error": format!("name exceeds relation bound: {error:?}"),
+                            });
                         }
-                    }
-                    broadcast(
+                    };
+                    match dispatch_control_action(
                         state,
-                        &json!({"type": "session_renamed",
-                        "session_id": id.to_string(), "name": newname}),
-                    );
-                    json!({"ok": true, "old": old, "name": newname})
+                        crate::generated_wire::ActionRequest::Rename { sid, new },
+                    ) {
+                        Ok(success) => legacy_control_reply(success),
+                        Err(error) => json!({"ok": false, "error": error}),
+                    }
                 }
                 None => json!({"ok": false, "error": "no slopbox"}),
             }
         }
-        "shutdown" => {
+        "shutdown" | "quit" => {
             // Stop every LIVE box first: quitting the engine (F10 / `q`)
             // must not leave runs going — a sud box's traced tree is
             // ordinary host processes and kept building after the engine
             // died. Same signal the `kill` verb sends; the runner forwards
             // it to the wrapper's process group and tears down normally
             // (sweep included, while the engine is still here to serve it).
-            let fds: Vec<i32> = lock(state).box_pids.values().copied().collect();
-            for fd in fds {
-                pidfd_signal(fd, libc::SIGTERM);
+            match dispatch_control_action(state, crate::generated_wire::ActionRequest::Quit) {
+                Ok(success) => legacy_control_reply(success),
+                Err(error) => json!({"ok": false, "error": error}),
             }
-            // Stop the engine. SIGTERM self → the existing signal handler
-            // tears down the overlay + control socket; everything that
-            // follows in this dispatch is racing the exit, so reply ok now
-            // and let the kernel deliver the signal a few syscalls later.
-            unsafe {
-                libc::kill(libc::getpid(), libc::SIGTERM);
-            }
-            json!({"ok": true})
         }
         other => json!({"ok": false,
                         "error": format!("unknown control type '{other}'")}),
     }
+}
+
+/// Execute top-level actions from their generated closed request type. Current
+/// JSON branches immediately enter this typed path; the mandatory binary
+/// listener cutover removes those outer projections and calls it directly.
+fn dispatch_control_action(
+    state: &State,
+    request: crate::generated_wire::ActionRequest,
+) -> Result<crate::generated_wire::ActionSuccess, String> {
+    use crate::generated_wire::{ActionRequest, ActionSuccess};
+    match request {
+        ActionRequest::Sudtrace { sid } => {
+            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            if !discover::discover().contains_key(&id) {
+                return Err("no slopbox".into());
+            }
+            let live = lock(state)
+                .overlay
+                .clone()
+                .and_then(|overlay| overlay.live_box(id));
+            crate::sud::trace_events(live, id).map(|value| ActionSuccess::Sudtrace { value })
+        }
+        request @ (ActionRequest::Apply { sid } | ActionRequest::Discard { sid }) => {
+            let applying = matches!(request, ActionRequest::Apply { .. });
+            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            if !discover::discover().contains_key(&id) {
+                return Err("no slopbox".into());
+            }
+            if box_is_running(state, id) {
+                return Err("box is running; stop it first".into());
+            }
+            let context = crate::review::NestCtx::new(lock(state).overlay.clone());
+            let value = if applying {
+                let result = crate::review::apply_typed(id, &Value::Null, &context)?;
+                crate::generated_wire::ActionMutationResult {
+                    r#box: sid,
+                    count: result.applied.as_slice().len() as u64,
+                    errors: result.errors,
+                }
+            } else {
+                let result = crate::review::discard_typed(id, &Value::Null, &context)?;
+                crate::generated_wire::ActionMutationResult {
+                    r#box: sid,
+                    count: result.discarded.as_slice().len() as u64,
+                    errors: result.errors,
+                }
+            };
+            drop_if_empty(state, id);
+            Ok(if applying {
+                ActionSuccess::Apply { value }
+            } else {
+                ActionSuccess::Discard { value }
+            })
+        }
+        ActionRequest::Rename { sid, new } => {
+            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            let boxes = discover::discover();
+            if !boxes.contains_key(&id) {
+                return Err("no slopbox".into());
+            }
+            let old = discover::display_path(&boxes, id);
+            let live = lock(state)
+                .overlay
+                .clone()
+                .and_then(|overlay| overlay.live_box(id));
+            match live {
+                Some(capture) => capture.set_meta("name", new.as_str()),
+                None => {
+                    let capture = crate::capture::BoxState::create(id)
+                        .map_err(|error| format!("open box for rename: {error}"))?;
+                    capture.set_meta("name", new.as_str());
+                }
+            }
+            broadcast(
+                state,
+                &json!({
+                    "type": "session_renamed",
+                    "session_id": id.to_string(),
+                    "name": new.as_str(),
+                }),
+            );
+            Ok(ActionSuccess::Rename {
+                value: crate::generated_wire::RenameResult {
+                    old_display_path: crate::wire::BoundedText::new(old).map_err(|error| {
+                        format!("old display path exceeds relation bound: {error:?}")
+                    })?,
+                    name: new,
+                },
+            })
+        }
+        ActionRequest::Quit => {
+            let fds: Vec<i32> = lock(state).box_pids.values().copied().collect();
+            for fd in fds {
+                pidfd_signal(fd, libc::SIGTERM);
+            }
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGTERM);
+            }
+            Ok(ActionSuccess::Quit { value: () })
+        }
+        other => Err(format!(
+            "typed control action {} is not implemented",
+            other.handler()
+        )),
+    }
+}
+
+fn legacy_path_errors(
+    errors: crate::wire::BoundedVec<
+        crate::generated_wire::PathError,
+        0,
+        { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+    >,
+) -> Value {
+    Value::Array(
+        errors
+            .into_inner()
+            .into_iter()
+            .map(|error| {
+                json!({
+                    "path": error.path.map(|path|
+                        String::from_utf8_lossy(path.as_slice()).into_owned()).unwrap_or_default(),
+                    "error": error.message.into_inner(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn legacy_control_reply(success: crate::generated_wire::ActionSuccess) -> Value {
+    use crate::generated_wire::ActionSuccess;
+    match success {
+        ActionSuccess::Sudtrace { value } => legacy_sudtrace_reply(value),
+        ActionSuccess::Apply { value } | ActionSuccess::Discard { value } => json!({
+            "ok": true,
+            "count": value.count,
+            "sid": value.r#box.to_string(),
+            "errors": legacy_path_errors(value.errors),
+        }),
+        ActionSuccess::Rename { value } => json!({
+            "ok": true,
+            "old": value.old_display_path.into_inner(),
+            "name": value.name.into_inner(),
+        }),
+        ActionSuccess::Quit { .. } => json!({"ok": true}),
+        other => json!({
+            "ok": false,
+            "error": format!("wrong typed control result opcode: {}", other.code()),
+        }),
+    }
+}
+
+/// Temporary projection for the still-active newline JSON listener. It is not
+/// a wire schema or alternate dispatcher: the authoritative result is already
+/// `SudTraceView`, and this function disappears with the coordinated socket
+/// cutover.
+fn legacy_sudtrace_reply(value: crate::generated_wire::SudTraceView) -> Value {
+    use crate::generated_wire::SudEventKind;
+    Value::Object(
+        [
+            ("ok".into(), Value::Bool(true)),
+            (
+                "events".into(),
+                Value::Array(
+                    value
+                        .events
+                        .into_inner()
+                        .into_iter()
+                        .map(|event| {
+                            let kind = match event.kind {
+                                SudEventKind::Exec => "EXEC".into(),
+                                SudEventKind::Argv => "ARGV".into(),
+                                SudEventKind::Env => "ENV".into(),
+                                SudEventKind::Open => "OPEN".into(),
+                                SudEventKind::Cwd => "CWD".into(),
+                                SudEventKind::Stdout => "STDOUT".into(),
+                                SudEventKind::Stderr => "STDERR".into(),
+                                SudEventKind::Exit => "EXIT".into(),
+                                SudEventKind::Prof => "PROF".into(),
+                                SudEventKind::Unknown { code } => code.to_string(),
+                            };
+                            json!({
+                                "ts_ns": event.time_ns,
+                                "kind": kind,
+                                "pid": event.pid,
+                                "tgid": event.tgid,
+                                "ppid": event.ppid,
+                                "extras": event.extras.into_inner(),
+                                "text": event.text.into_inner(),
+                            })
+                        })
+                        .collect(),
+                ),
+            ),
+            ("truncated".into(), Value::Bool(value.truncated)),
+        ]
+        .into_iter()
+        .collect(),
+    )
 }
 
 fn resolve(boxes: &std::collections::BTreeMap<i64, discover::Box_>, ident: &str) -> Option<i64> {
@@ -5706,6 +5891,46 @@ mod verb_tests {
             err.contains("unknown verb") && err.contains("see 'verbs'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn typed_control_results_project_only_at_the_legacy_boundary() {
+        use crate::generated_wire::{
+            ActionMutationResult, ActionSuccess, PathError, SudEvent, SudEventKind, SudTraceView,
+        };
+        let path = crate::wire::BoundedBytes::new(b"src/main.rs".to_vec()).unwrap();
+        let errors = crate::wire::BoundedVec::new(vec![PathError {
+            path: Some(path),
+            message: crate::wire::BoundedText::new("stale".into()).unwrap(),
+        }])
+        .unwrap();
+        let reply = legacy_control_reply(ActionSuccess::Apply {
+            value: ActionMutationResult {
+                r#box: 7,
+                count: 2,
+                errors,
+            },
+        });
+        assert_eq!(reply["sid"], "7");
+        assert_eq!(reply["count"], 2);
+        assert_eq!(reply["errors"][0]["path"], "src/main.rs");
+
+        let trace = SudTraceView {
+            events: crate::wire::BoundedVec::new(vec![SudEvent {
+                time_ns: 4,
+                kind: SudEventKind::Unknown { code: 42 },
+                pid: 1,
+                tgid: 1,
+                ppid: 0,
+                extras: crate::wire::BoundedVec::new(Vec::new()).unwrap(),
+                text: crate::wire::BoundedText::new("future".into()).unwrap(),
+            }])
+            .unwrap(),
+            truncated: false,
+        };
+        let reply = legacy_control_reply(ActionSuccess::Sudtrace { value: trace });
+        assert_eq!(reply["events"][0]["kind"], "42");
+        assert_eq!(reply["events"][0]["text"], "future");
     }
 
     #[test]

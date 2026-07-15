@@ -631,8 +631,9 @@ belong to the relation.
   missing request is a hard parse error rather than a fallback to source
   arguments. Local UI actions are the explicit non-wire sum case. The existing
   JSON argument array remains only as the active transport projection to be
-  deleted by the binary socket cutover; control-message dispatch already reads
-  the generated request instead of reinterpreting parser values.
+  deleted by the binary socket cutover; parsed UI commands already carry the
+  generated request instead of requiring transport code to reinterpret parser
+  values.
 - Added the direct socket request envelope over the disjoint generated action
   and transport opcode namespaces, and made the ordinary reply mode carry the
   closed generated `ActionSuccess` sum. Added exact streaming atom I/O which
@@ -647,6 +648,15 @@ belong to the relation.
   action and F1 help both query a bounded typed help projection from the
   embedded relation; 108 total actions and the exact 91-action UI subset are
   checked in core-only and aarch64 embedded tests.
+- Moved `sudtrace`, whole-box `apply`/`discard`, `rename`, and `quit` control
+  execution onto generated `ActionRequest -> ActionSuccess` values. TRACE is
+  retained in its compact native form and decoded on demand into a bounded
+  typed view; independently versioned unknown TRACE event kinds are preserved
+  explicitly. Apply/discard now construct bounded typed path/error results.
+  The active newline-JSON listener projects those typed results only at its
+  outer boundary; it has not yet been replaced, so the binary socket and
+  all-handler result gates remain unchecked. The cleaned aarch64-musl suite
+  passes 298 tests with one ignored, and all 42 pure relation tests pass.
 
 ## Stop conditions
 
