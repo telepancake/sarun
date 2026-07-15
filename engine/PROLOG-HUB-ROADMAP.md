@@ -745,6 +745,13 @@ belong to the relation.
   legacy field spelling occurs only at the temporary listener boundary. The
   full native aarch64-musl suite passes 308 tests with one existing browser
   e2e test ignored.
+- Moved `stuck` onto its generated request/success variant and deleted the
+  schema-less JSON diagnostic construction. `/proc` process/thread discovery,
+  descriptor-peer joins, syscall descriptions, and merged backtraces now
+  construct bounded `StuckThread` rows directly; blocked-first sorting uses
+  their typed state and identities. Only the temporary listener projects the
+  result to the old `procs` object array. The full native aarch64-musl suite
+  passes 308 tests with one existing browser e2e test ignored.
 
 ## Stop conditions
 

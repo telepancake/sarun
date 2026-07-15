@@ -1755,6 +1755,12 @@ fn dispatch_action(
                 value: rotate_typed(state, id)?,
             })
         }
+        ActionRequest::Stuck { sid } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::Stuck {
+                value: stuck_typed(state, id)?,
+            })
+        }
         ActionRequest::ViewOpen {
             kind,
             r#box,
@@ -2198,6 +2204,21 @@ fn legacy_ui_action_reply(
             "parent": value.parent,
             "child": value.child,
         }),
+        Ok(ActionSuccess::Stuck { value }) => json!({
+            "ok": true,
+            "runner": value.runner,
+            "procs": value.threads.into_inner().into_iter().map(|thread| json!({
+                "pid": thread.pid,
+                "tid": thread.tid,
+                "comm": thread.command.into_inner(),
+                "state": thread.state.into_inner(),
+                "wchan": thread.wait_channel.into_inner(),
+                "syscall": thread.syscall.into_inner(),
+                "detail": thread.detail.into_inner(),
+                "bt": thread.backtrace.into_inner().into_iter()
+                    .map(|frame| frame.into_inner()).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }),
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -2600,6 +2621,167 @@ fn rotate_typed(
     Ok(crate::generated_wire::RotateResult {
         parent: u64::try_from(child_id).map_err(|_| "negative child box id")?,
         child: u64::try_from(parent_id).map_err(|_| "negative parent box id")?,
+    })
+}
+
+fn stuck_typed(
+    state: &State,
+    id: i64,
+) -> Result<crate::generated_wire::StuckReport, String> {
+    use crate::generated_wire::{StuckReport, StuckThread};
+    let runner = lock(state).box_runpids.get(&id).copied()
+        .ok_or("box not running")?;
+    let state_of = |path: &str| std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.rfind(')')
+            .and_then(|index| text[index + 1..].trim().chars().next())
+            .map(|state| state.to_string()))
+        .unwrap_or_default();
+
+    let mut box_pids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry.file_name().to_str()
+                .and_then(|text| text.parse::<i32>().ok()) else { continue };
+            let mut current = pid;
+            for _ in 0..64 {
+                if current == runner {
+                    box_pids.push(pid);
+                    break;
+                }
+                let parent = ppid_of(current);
+                if parent <= 1 {
+                    break;
+                }
+                current = parent;
+            }
+        }
+    }
+
+    let mut file_descriptors: std::collections::HashMap<
+        i32, std::collections::HashMap<i32, String>> = Default::default();
+    let mut holders: std::collections::HashMap<String, Vec<i32>> = Default::default();
+    for &pid in &box_pids {
+        let mut table = std::collections::HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            for entry in entries.flatten() {
+                let Some(number) = entry.file_name().to_str()
+                    .and_then(|text| text.parse::<i32>().ok()) else { continue };
+                if let Ok(target) = std::fs::read_link(entry.path()) {
+                    let target = target.to_string_lossy().into_owned();
+                    if target.starts_with("pipe:") || target.starts_with("socket:") {
+                        holders.entry(target.clone()).or_default().push(pid);
+                    }
+                    table.insert(number, target);
+                }
+            }
+        }
+        file_descriptors.insert(pid, table);
+    }
+
+    let mut backtraces = thread_backtraces(&box_pids, 8);
+    for frames in backtraces.values_mut() {
+        frames.retain(|frame| !frame.starts_with("?? "));
+    }
+    backtraces.retain(|_, frames| !frames.is_empty());
+    for (tid, frames) in selfbt_backtraces(runner, &box_pids) {
+        if !frames.is_empty() {
+            backtraces.insert(tid, frames);
+        }
+    }
+    for (tid, frames) in ptrace_backtraces(&box_pids) {
+        if !frames.is_empty() {
+            backtraces.insert(tid, frames);
+        }
+    }
+
+    let short = |value: String| -> Result<
+        crate::wire::BoundedText<{ crate::generated_wire::LIMIT_SHORT_BYTES }>, String> {
+        crate::wire::BoundedText::new(value)
+            .map_err(|error| format!("stuck short text exceeds relation bound: {error:?}"))
+    };
+    let text = |value: String| -> Result<
+        crate::wire::BoundedText<{ crate::generated_wire::LIMIT_TEXT_BYTES }>, String> {
+        crate::wire::BoundedText::new(value)
+            .map_err(|error| format!("stuck text exceeds relation bound: {error:?}"))
+    };
+    let mut threads = Vec::new();
+    for &pid in &box_pids {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { continue };
+        for task in tasks.flatten() {
+            let Some(tid) = task.file_name().to_str()
+                .and_then(|value| value.parse::<i32>().ok()) else { continue };
+            let base = format!("/proc/{pid}/task/{tid}");
+            let read = |name: &str| std::fs::read_to_string(format!("{base}/{name}"))
+                .unwrap_or_default().trim().to_string();
+            let command = read("comm");
+            let wait_channel = read("wchan");
+            let thread_state = state_of(&format!("{base}/stat"));
+            let syscall_raw = read("syscall");
+            let syscall_fields = syscall_raw.split_whitespace().collect::<Vec<_>>();
+            let number = syscall_fields.first().and_then(|field| field.parse::<i64>().ok());
+            let detail = match number {
+                Some(number) if number >= 0 => {
+                    let name = syscall_name(number);
+                    let name = if name.is_empty() {
+                        format!("sys{number}")
+                    } else {
+                        name.to_string()
+                    };
+                    if syscall_arg0_is_fd(number) {
+                        let descriptor = syscall_fields.get(1).and_then(|field|
+                            i64::from_str_radix(field.trim_start_matches("0x"), 16).ok());
+                        match descriptor {
+                            Some(descriptor) => {
+                                let target = file_descriptors.get(&pid)
+                                    .and_then(|table| table.get(&(descriptor as i32)))
+                                    .cloned().unwrap_or_else(|| "?".into());
+                                let mut detail = format!(
+                                    "{name}(fd {descriptor} → {target})");
+                                if let Some(processes) = holders.get(&target) {
+                                    let peers = processes.iter().filter(|peer| **peer != pid)
+                                        .map(ToString::to_string).collect::<Vec<_>>();
+                                    if !peers.is_empty() {
+                                        detail.push_str(&format!(
+                                            "  peer pid {}", peers.join(",")));
+                                    }
+                                }
+                                detail
+                            }
+                            None => format!("{name}()"),
+                        }
+                    } else {
+                        format!("{name}()")
+                    }
+                }
+                _ if wait_channel.is_empty() || wait_channel == "0" => "running".into(),
+                _ => wait_channel.clone(),
+            };
+            let frames = backtraces.get(&tid).into_iter().flatten().take(6)
+                .cloned().map(text).collect::<Result<Vec<_>, _>>()?;
+            threads.push(StuckThread {
+                pid: u32::try_from(pid).map_err(|_| "invalid process id in stuck report")?,
+                tid: u32::try_from(tid).map_err(|_| "invalid thread id in stuck report")?,
+                command: short(command)?,
+                state: short(thread_state)?,
+                wait_channel: text(wait_channel)?,
+                syscall: short(syscall_fields.first().copied().unwrap_or("").to_string())?,
+                detail: text(detail)?,
+                backtrace: crate::wire::BoundedVec::new(frames)
+                    .map_err(|error| format!(
+                        "stuck backtrace exceeds relation bound: {error:?}"))?,
+            });
+        }
+    }
+    threads.sort_by_key(|thread| (
+        thread.state.as_str() == "R",
+        thread.pid,
+        thread.tid,
+    ));
+    Ok(StuckReport {
+        runner: u32::try_from(runner).map_err(|_| "invalid runner process id")?,
+        threads: crate::wire::BoundedVec::new(threads)
+            .map_err(|error| format!("stuck thread list exceeds relation bound: {error:?}"))?,
     })
 }
 
@@ -3619,207 +3801,13 @@ macro_rules! ui_verbs {
             return legacy_ui_action_reply(dispatch_action(
                 state, crate::generated_wire::ActionRequest::FirstWriterProv { sid, rel }));
         }
-        "stuck" => { match arg_sid(args) {
-            // A wedged box is invisible from the outside — this answers
-            // WHERE it is stuck without strace. Descend to THREADS, not
-            // just processes: the engine's own workers (a wedged in-box
-            // build is often a blocked tokio worker or coreutil thread,
-            // e.g. sarun-uu_sort in unix_stream_data_wait) live as tasks
-            // inside one pid, and the tgid leader alone shows "running"
-            // for the idle main thread — useless. For each process whose
-            // ancestry reaches the box's runner we walk /proc/<pid>/task/
-            // and report every thread's comm / state / kernel wchan /
-            // current syscall. Read straight from /proc; no box help.
-            Some(id) => {
-                let rp = lock(state).box_runpids.get(&id).copied();
-                match rp {
-                    None => json!({"ok": false, "error": "box not running"}),
-                    Some(rp) => {
-                        // stat "pid (comm) STATE …" — state char follows the
-                        // LAST ')' (comm may contain parens).
-                        let state_of = |path: &str| std::fs::read_to_string(path)
-                            .ok()
-                            .and_then(|s| s.rfind(')')
-                                .and_then(|i| s[i + 1..].trim().chars().next())
-                                .map(|c| c.to_string()))
-                            .unwrap_or_default();
-                        // The box's process set (ancestry reaches the runner).
-                        let mut box_pids: Vec<i32> = vec![];
-                        if let Ok(rd) = std::fs::read_dir("/proc") {
-                            for ent in rd.flatten() {
-                                let Some(pid) = ent.file_name().to_str()
-                                    .and_then(|s| s.parse::<i32>().ok())
-                                else { continue };
-                                let mut cur = pid;
-                                for _ in 0..64 {
-                                    if cur == rp { box_pids.push(pid); break; }
-                                    let pp = ppid_of(cur);
-                                    if pp <= 1 { break; }
-                                    cur = pp;
-                                }
-                            }
-                        }
-                        // Per-pid fd → target (readlink), plus a box-wide
-                        // pipe/socket-inode → holders map so a thread blocked
-                        // on a pipe/socket names WHO is on the other end —
-                        // turning "unix_stream_data_wait" into an actual
-                        // deadlock topology. Linux threads share the fd
-                        // table, so fds are keyed per pid, not per tid.
-                        let mut fd_tab: std::collections::HashMap<i32,
-                            std::collections::HashMap<i32, String>> =
-                            Default::default();
-                        let mut holders: std::collections::HashMap<String,
-                            Vec<i32>> = Default::default();
-                        for &pid in &box_pids {
-                            let mut t = std::collections::HashMap::new();
-                            if let Ok(fds) = std::fs::read_dir(
-                                format!("/proc/{pid}/fd")) {
-                                for fe in fds.flatten() {
-                                    let Some(n) = fe.file_name().to_str()
-                                        .and_then(|s| s.parse::<i32>().ok())
-                                    else { continue };
-                                    if let Ok(tgt) = std::fs::read_link(fe.path()) {
-                                        let tgt = tgt.to_string_lossy()
-                                            .into_owned();
-                                        if tgt.starts_with("pipe:")
-                                            || tgt.starts_with("socket:") {
-                                            holders.entry(tgt.clone())
-                                                .or_default().push(pid);
-                                        }
-                                        t.insert(n, tgt);
-                                    }
-                                }
-                            }
-                            fd_tab.insert(pid, t);
-                        }
-                        // Symbolized backtraces, two sources merged. Under sud
-                        // external gdb yields `?? ()` for the relocated engine,
-                        // so the on-CPU spins — the ones /proc wchan/syscall
-                        // can't localize — come from in-process self-unwind
-                        // (each R thread dumps its own std::backtrace). gdb
-                        // still covers the non-sud path and blocked threads.
-                        let mut bt_map = thread_backtraces(&box_pids, 8);
-                        // Drop gdb's unsymbolizable `?? ()` frames so the diag
-                        // stops emitting misleading garbage.
-                        for v in bt_map.values_mut() {
-                            v.retain(|f| !f.starts_with("?? "));
-                        }
-                        bt_map.retain(|_, v| !v.is_empty());
-                        // Self-unwind wins for any thread it localized.
-                        for (tid, frames) in selfbt_backtraces(rp, &box_pids) {
-                            if !frames.is_empty() { bt_map.insert(tid, frames); }
-                        }
-                        // Ptrace path wins over both: it works for ANY thread
-                        // state and the sud-wrapper/foreign frames the in-box
-                        // signal handler can't reach (sud masks signals in its
-                        // dispatcher). This is what localizes a syscall-heavy
-                        // spin — the common real wedge.
-                        for (tid, frames) in ptrace_backtraces(&box_pids) {
-                            if !frames.is_empty() { bt_map.insert(tid, frames); }
-                        }
-                        let mut threads = vec![];
-                        for &pid in &box_pids {
-                            let Ok(tasks) = std::fs::read_dir(
-                                format!("/proc/{pid}/task")) else { continue };
-                            for te in tasks.flatten() {
-                                let Some(tid) = te.file_name().to_str()
-                                    .and_then(|s| s.parse::<i32>().ok())
-                                else { continue };
-                                let base = format!("/proc/{pid}/task/{tid}");
-                                let rd1 = |f: &str| std::fs::read_to_string(
-                                    format!("{base}/{f}"))
-                                    .unwrap_or_default().trim().to_string();
-                                let comm = rd1("comm");
-                                let wchan = rd1("wchan");
-                                let state = state_of(&format!("{base}/stat"));
-                                // /proc/.../syscall: "nr arg0 arg1 … sp pc"
-                                // (nr decimal, args hex), or "running"/"-1".
-                                let raw = rd1("syscall");
-                                let toks: Vec<&str> = raw.split_whitespace()
-                                    .collect();
-                                let nr = toks.first().and_then(|t|
-                                    t.parse::<i64>().ok());
-                                // Decode the syscall + resolve its fd arg to
-                                // the pipe/socket/file it names, then name the
-                                // peer holding the other end. This is the join
-                                // that makes wchan actionable.
-                                let detail = match nr {
-                                    Some(nr) if nr >= 0 => {
-                                        let name = syscall_name(nr);
-                                        let name = if name.is_empty() {
-                                            format!("sys{nr}")
-                                        } else { name.to_string() };
-                                        if syscall_arg0_is_fd(nr) {
-                                            let fd = toks.get(1)
-                                                .and_then(|h| i64::from_str_radix(
-                                                    h.trim_start_matches("0x"),
-                                                    16).ok());
-                                            match fd {
-                                                Some(fd) => {
-                                                    let tgt = fd_tab.get(&pid)
-                                                        .and_then(|t| t.get(
-                                                            &(fd as i32)))
-                                                        .cloned()
-                                                        .unwrap_or_else(||
-                                                            "?".into());
-                                                    let mut d = format!(
-                                                        "{name}(fd {fd} → {tgt})");
-                                                    if let Some(h) = holders
-                                                        .get(&tgt) {
-                                                        let peers: Vec<String> =
-                                                            h.iter()
-                                                             .filter(|p| **p != pid)
-                                                             .map(|p| p.to_string())
-                                                             .collect();
-                                                        if !peers.is_empty() {
-                                                            d.push_str(
-                                                                &format!("  peer pid {}",
-                                                                    peers.join(",")));
-                                                        }
-                                                    }
-                                                    d
-                                                }
-                                                None => format!("{name}()"),
-                                            }
-                                        } else { format!("{name}()") }
-                                    }
-                                    // "running"/-1: on-CPU, no syscall — fall
-                                    // back to the kernel wait channel (which is
-                                    // "0"/empty when truly on-CPU).
-                                    _ => if wchan.is_empty() || wchan == "0" {
-                                        "running".into()
-                                    } else { wchan.clone() },
-                                };
-                                let bt = bt_map.get(&tid)
-                                    .map(|v| v.iter().take(6).cloned()
-                                        .collect::<Vec<_>>())
-                                    .unwrap_or_default();
-                                threads.push(json!({
-                                    "pid": pid, "tid": tid, "comm": comm,
-                                    "state": state, "wchan": wchan,
-                                    "syscall": toks.first().copied()
-                                        .unwrap_or("").to_string(),
-                                    "detail": detail, "bt": bt,
-                                }));
-                            }
-                        }
-                        // Blocked threads first (a wedge is a thread NOT
-                        // running), then by pid/tid — so the smoking gun is
-                        // at the top instead of buried under idle workers.
-                        threads.sort_by_key(|t| {
-                            let st = t.get("state").and_then(Value::as_str)
-                                .unwrap_or("");
-                            let running = matches!(st, "R");
-                            (running,
-                             t.get("pid").and_then(Value::as_i64).unwrap_or(0),
-                             t.get("tid").and_then(Value::as_i64).unwrap_or(0))
-                        });
-                        json!({"ok": true, "runner": rp, "procs": threads})
-                    }
-                }
-            }
-            None => json!({"ok": false, "error": "no slopbox"}),
-        }
+        "stuck" => {
+            let Some(sid) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Stuck { sid },
+            ));
         }
         "kill" => {
             let Some(sid) = legacy_u64(args, 0) else {
