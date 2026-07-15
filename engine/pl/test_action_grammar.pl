@@ -647,7 +647,7 @@ member_completion(Text, [_|Completions]) :- member_completion(Text, Completions)
 
 run_test(application_surface_is_closed) :-
     application(parse, "request([end(0)],exact)", ParseOutput),
-    expect_equal(ParseOutput, "ok([])"),
+    expect_equal(ParseOutput, "error(invalid_operation)"),
     application(shell, "request(halt)", ShellOutput),
     expect_equal(ShellOutput, "error(invalid_operation)").
 

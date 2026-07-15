@@ -374,10 +374,6 @@ pub struct RenderedCommand {
 
 #[derive(Clone, Copy)]
 enum Operation {
-    Parse,
-    Complete,
-    Highlights,
-    Render,
     ActionHelp,
     ContextPlan,
     ContextResolve,
@@ -389,10 +385,6 @@ enum Operation {
 impl Operation {
     fn atom(self) -> &'static str {
         match self {
-            Self::Parse => "parse",
-            Self::Complete => "complete",
-            Self::Highlights => "highlights",
-            Self::Render => "render",
             Self::ActionHelp => "action_help",
             Self::ContextPlan => "context_plan",
             Self::ContextResolve => "context_resolve",
@@ -479,20 +471,26 @@ impl Prolog {
         input: &GrammarInput,
         assist_edit: Option<&'static str>,
     ) -> Result<Vec<ParseCandidate>, String> {
-        let items = encode_input(input)?;
-        let mode = assist_edit.map_or_else(
-            || "exact".to_string(),
-            |id| {
-                checked_atom(id)
-                    .map(|id| format!("assist({id})"))
-                    .unwrap_or_else(|| "invalid".to_string())
-            },
-        );
-        if mode == "invalid" {
-            return Err("invalid edit tear id".into());
+        let mode = relation_mode(assist_edit)?;
+        let reply = self.transform(&RelationRequest {
+            grammar: action_grammar_handle(),
+            given: vec![RelationBinding {
+                name: "source".into(),
+                value: relation_compound("source", vec![grammar_input_value(input)?, mode]),
+            }],
+            wanted: vec!["command".into(), "status".into(), "evidence".into()],
+            observations: vec![],
+            limits: RelationLimits::default(),
+        })?;
+        if reply.solutions.is_empty() && only_no_solution(&reply) {
+            return Ok(Vec::new());
         }
-        let response = self.application(Operation::Parse, format!("request({items},{mode})"))?;
-        decode_parse_response(&response)
+        reject_relation_diagnostics(&reply)?;
+        reply
+            .solutions
+            .iter()
+            .map(decode_relation_parse_solution)
+            .collect()
     }
 
     pub fn transform(&self, request: &RelationRequest) -> Result<RelationReply, String> {
@@ -513,24 +511,76 @@ impl Prolog {
         input: &GrammarInput,
         edit_id: &'static str,
     ) -> Result<Vec<Completion>, String> {
-        let id = checked_atom(edit_id).ok_or("invalid edit tear id")?;
-        let items = encode_input(input)?;
-        let response = self.application(Operation::Complete, format!("request({items},{id})"))?;
-        decode_completion_response(&response)
+        let mode = relation_mode(Some(edit_id))?;
+        let reply = self.transform(&RelationRequest {
+            grammar: action_grammar_handle(),
+            given: vec![RelationBinding {
+                name: "source".into(),
+                value: relation_compound("source", vec![grammar_input_value(input)?, mode]),
+            }],
+            wanted: vec!["completions".into()],
+            observations: vec![],
+            limits: RelationLimits {
+                max_solutions: 256,
+                ..RelationLimits::default()
+            },
+        })?;
+        if reply.solutions.is_empty() && only_no_solution(&reply) {
+            return Ok(Vec::new());
+        }
+        reject_relation_diagnostics(&reply)?;
+        let Some(solution) = reply.solutions.first() else {
+            return Ok(Vec::new());
+        };
+        decode_completions_value(solution_binding(solution, "completions")?)
     }
 
     pub fn highlights(&self, result: &ParseCandidate) -> Result<Vec<Highlight>, String> {
-        let request = format!("request({})", encode_parse_candidate(result));
-        let response = self.application(Operation::Highlights, request)?;
-        decode_highlight_response(&response)
+        let reply = self.transform(&RelationRequest {
+            grammar: action_grammar_handle(),
+            given: vec![
+                RelationBinding {
+                    name: "command".into(),
+                    value: command_relation_value(&result.command),
+                },
+                RelationBinding {
+                    name: "evidence".into(),
+                    value: relation_list(result.evidence.iter().map(evidence_relation_value)),
+                },
+            ],
+            wanted: vec!["highlights".into()],
+            observations: vec![],
+            limits: RelationLimits::default(),
+        })?;
+        reject_relation_diagnostics(&reply)?;
+        decode_highlights_value(reply_binding(&reply, "highlights")?)
     }
 
     pub fn render(&self, command: &CommandAst) -> Result<RenderedCommand, QueryError> {
-        let request = format!("request({})", encode_command(command));
-        let response = self
-            .application(Operation::Render, request)
+        let reply = self
+            .transform(&RelationRequest {
+                grammar: action_grammar_handle(),
+                given: vec![RelationBinding {
+                    name: "command".into(),
+                    value: command_relation_value(command),
+                }],
+                wanted: vec!["source".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
             .map_err(QueryError::Backend)?;
-        let text = decode_render_response(&response)?;
+        if reply.solutions.is_empty() && only_no_solution(&reply) {
+            return Err(QueryError::NoSolution);
+        }
+        reject_relation_diagnostics(&reply).map_err(QueryError::Backend)?;
+        let text = match reply_binding(&reply, "source").map_err(QueryError::Backend)? {
+            RelationValue::String(text) => text.clone(),
+            _ => {
+                return Err(QueryError::Backend(
+                    "relation returned non-text source".into(),
+                ));
+            }
+        };
         Ok(RenderedCommand { text })
     }
 
@@ -1636,6 +1686,217 @@ fn relation_list(values: impl IntoIterator<Item = RelationValue>) -> RelationVal
     RelationValue::List(values.into_iter().collect())
 }
 
+fn action_grammar_handle() -> RelationValue {
+    relation_compound(
+        "grammar_handle",
+        vec![RelationValue::Atom("sarun_actions".into())],
+    )
+}
+
+fn relation_mode(assist_edit: Option<&str>) -> Result<RelationValue, String> {
+    match assist_edit {
+        None => Ok(RelationValue::Atom("exact".into())),
+        Some(id) => checked_atom(id)
+            .map(|id| relation_compound("assist", vec![RelationValue::Atom(id.into())]))
+            .ok_or_else(|| "invalid edit tear id".into()),
+    }
+}
+
+fn relation_span(span: Span) -> Result<RelationValue, String> {
+    Ok(relation_compound(
+        "span",
+        vec![
+            bounded_relation_integer(span.start, "span start")?,
+            bounded_relation_integer(span.end, "span end")?,
+        ],
+    ))
+}
+
+fn grammar_input_value(input: &GrammarInput) -> Result<RelationValue, String> {
+    if input.items.len() > MAX_ITEMS {
+        return Err(format!("action grammar input exceeds {MAX_ITEMS} items"));
+    }
+    let mut previous_end = 0;
+    let mut items = Vec::with_capacity(input.items.len() + 1);
+    for item in &input.items {
+        let span = match item {
+            InputItem::Unit(unit) => unit.span,
+            InputItem::EditTear { span, .. } | InputItem::SourceTear { span, .. } => *span,
+        };
+        if span.start < previous_end || span.start > span.end || span.end > input.end {
+            return Err("action grammar input spans are invalid".into());
+        }
+        previous_end = span.end;
+        let value = match item {
+            InputItem::Unit(unit) => {
+                if unit.paint_spans.iter().any(|paint| {
+                    paint.start < unit.span.start
+                        || paint.start > paint.end
+                        || paint.end > unit.span.end
+                }) {
+                    return Err("action grammar unit has an invalid paint span".into());
+                }
+                let semantic = match &unit.semantic {
+                    Semantic::Atom(value) => RelationValue::Atom(value.clone()),
+                    Semantic::Integer(value) => {
+                        relation_compound("integer", vec![RelationValue::Integer(*value)])
+                    }
+                    Semantic::Text(value) => {
+                        relation_compound("text", vec![RelationValue::String(value.clone())])
+                    }
+                };
+                relation_compound(
+                    "unit",
+                    vec![
+                        semantic,
+                        relation_span(unit.span)?,
+                        relation_list(
+                            unit.paint_spans
+                                .iter()
+                                .copied()
+                                .map(relation_span)
+                                .collect::<Result<Vec<_>, _>>()?,
+                        ),
+                        RelationValue::String(unit.surface.clone()),
+                        RelationValue::Atom(unit.syntax.clone()),
+                        RelationValue::Atom(unit.provider.clone()),
+                        RelationValue::Integer(unit.preference),
+                        RelationValue::Atom("lexer".into()),
+                    ],
+                )
+            }
+            InputItem::EditTear { id, span, surface } => {
+                let id = checked_atom(id).ok_or("invalid edit tear id")?;
+                relation_compound(
+                    "edit_tear",
+                    vec![
+                        RelationValue::Atom(id.into()),
+                        relation_span(*span)?,
+                        RelationValue::String(surface.clone()),
+                    ],
+                )
+            }
+            InputItem::SourceTear { id, span, surface } => relation_compound(
+                "source_tear",
+                vec![
+                    RelationValue::Atom(format!("source{id}")),
+                    relation_span(*span)?,
+                    RelationValue::String(surface.clone()),
+                ],
+            ),
+        };
+        items.push(value);
+    }
+    items.push(relation_compound(
+        "end",
+        vec![bounded_relation_integer(input.end, "input end")?],
+    ));
+    Ok(relation_list(items))
+}
+
+fn command_value_relation(value: &CommandValue) -> RelationValue {
+    match value {
+        CommandValue::Integer(value) => {
+            relation_compound("integer", vec![RelationValue::Integer(*value)])
+        }
+        CommandValue::Boolean(value) => {
+            relation_compound("boolean", vec![RelationValue::Atom(value.to_string())])
+        }
+        CommandValue::String(value) => {
+            relation_compound("string", vec![RelationValue::String(value.clone())])
+        }
+        CommandValue::Path(value) => {
+            relation_compound("path", vec![RelationValue::String(value.clone())])
+        }
+        CommandValue::Base64(value) => {
+            relation_compound("base64", vec![RelationValue::String(value.clone())])
+        }
+        CommandValue::Spec(value) => {
+            relation_compound("spec", vec![RelationValue::String(value.clone())])
+        }
+        CommandValue::OciSpec {
+            context_tar_gz,
+            dockerfile,
+            tag,
+            net_mode,
+            build_arguments,
+        } => relation_compound(
+            "oci_spec",
+            vec![
+                RelationValue::String(context_tar_gz.clone()),
+                RelationValue::String(dockerfile.clone()),
+                tag.as_ref().map_or_else(
+                    || RelationValue::Atom("none".into()),
+                    |value| relation_compound("some", vec![RelationValue::String(value.clone())]),
+                ),
+                RelationValue::String(net_mode.clone()),
+                relation_list(build_arguments.iter().map(|(key, value)| {
+                    relation_compound(
+                        "pair",
+                        vec![
+                            RelationValue::String(key.clone()),
+                            RelationValue::String(value.clone()),
+                        ],
+                    )
+                })),
+            ],
+        ),
+        CommandValue::ApiSpec {
+            base_url,
+            model,
+            api_key,
+        } => relation_compound(
+            "api_spec",
+            vec![
+                RelationValue::String(base_url.clone()),
+                RelationValue::String(model.clone()),
+                RelationValue::String(api_key.clone()),
+            ],
+        ),
+        CommandValue::Array(values) => relation_compound(
+            "array",
+            vec![relation_list(values.iter().map(command_value_relation))],
+        ),
+        CommandValue::Hole { name, kind } => relation_compound(
+            "hole",
+            vec![
+                RelationValue::Atom(name.clone()),
+                RelationValue::Atom(kind.clone()),
+            ],
+        ),
+    }
+}
+
+fn command_relation_value(command: &CommandAst) -> RelationValue {
+    relation_compound(
+        "command",
+        vec![
+            RelationValue::Atom(command.action.clone()),
+            RelationValue::Atom(command.handler.clone()),
+            RelationValue::Atom(command.target.clone()),
+            relation_list(command.args.iter().map(command_value_relation)),
+        ],
+    )
+}
+
+fn evidence_relation_value(evidence: &Evidence) -> RelationValue {
+    relation_compound(
+        "evidence",
+        vec![
+            RelationValue::Atom(evidence.semantic.clone()),
+            relation_span(evidence.span).expect("decoded evidence span remains bounded"),
+            relation_list(evidence.paint_spans.iter().copied().map(|span| {
+                relation_span(span).expect("decoded evidence paint span remains bounded")
+            })),
+            RelationValue::String(evidence.surface.clone()),
+            RelationValue::Atom(evidence.syntax.clone()),
+            RelationValue::Atom(evidence.provider.clone()),
+            RelationValue::Integer(evidence.preference),
+            RelationValue::Atom(evidence.origin.clone()),
+        ],
+    )
+}
+
 fn encode_relation_binding(binding: &RelationBinding) -> Result<RelationValue, String> {
     let name = checked_atom(&binding.name).ok_or("invalid relation binding name")?;
     Ok(relation_compound(
@@ -1790,6 +2051,73 @@ fn reply_binding<'a>(reply: &'a RelationReply, name: &str) -> Result<&'a Relatio
         .find(|binding| binding.name == name)
         .map(|binding| &binding.value)
         .ok_or_else(|| format!("relation solution omitted requested {name} binding"))
+}
+
+fn solution_binding<'a>(
+    solution: &'a RelationSolution,
+    name: &str,
+) -> Result<&'a RelationValue, String> {
+    solution
+        .bindings
+        .iter()
+        .find(|binding| binding.name == name)
+        .map(|binding| &binding.value)
+        .ok_or_else(|| format!("relation solution omitted requested {name} binding"))
+}
+
+fn only_no_solution(reply: &RelationReply) -> bool {
+    reply.diagnostics.as_slice()
+        == [relation_compound(
+            "diagnostic",
+            vec![RelationValue::Atom("no_solution".into())],
+        )]
+}
+
+fn reject_relation_diagnostics(reply: &RelationReply) -> Result<(), String> {
+    if reply.diagnostics.is_empty() || only_no_solution(reply) {
+        Ok(())
+    } else {
+        Err(format!(
+            "action relation diagnostics: {:?}",
+            reply.diagnostics
+        ))
+    }
+}
+
+fn decode_relation_parse_solution(solution: &RelationSolution) -> Result<ParseCandidate, String> {
+    let command = decode_command(&parsed_relation_value(solution_binding(
+        solution, "command",
+    )?))?;
+    let status = match solution_binding(solution, "status")? {
+        RelationValue::Atom(value) if value == "complete" => ParseStatus::Complete,
+        RelationValue::Compound(name, values) if name == "incomplete" && values.len() == 1 => {
+            match &values[0] {
+                RelationValue::Compound(edit, id) if edit == "edit" && id.len() == 1 => {
+                    let RelationValue::Atom(id) = &id[0] else {
+                        return Err("relation returned invalid edit status".into());
+                    };
+                    ParseStatus::Incomplete {
+                        edit_id: id.clone(),
+                    }
+                }
+                _ => return Err("relation returned invalid incomplete status".into()),
+            }
+        }
+        _ => return Err("relation returned invalid parse status".into()),
+    };
+    let evidence = match solution_binding(solution, "evidence")? {
+        RelationValue::List(values) => values
+            .iter()
+            .map(|value| decode_evidence(&parsed_relation_value(value)))
+            .collect::<Result<_, _>>()?,
+        _ => return Err("relation returned non-list evidence".into()),
+    };
+    Ok(ParseCandidate {
+        command,
+        status,
+        evidence,
+        preference: solution.preference,
+    })
 }
 
 fn context_query_value(query: &ContextQuery) -> RelationValue {
@@ -2046,21 +2374,6 @@ fn encode_context_completion_plan(plan: &ContextCompletionPlan) -> Result<String
         quote_atom(&plan.target_query_id),
         plan.preference,
     ))
-}
-
-fn encode_parse_candidate(result: &ParseCandidate) -> String {
-    let status = match &result.status {
-        ParseStatus::Complete => "complete".to_string(),
-        ParseStatus::Incomplete { edit_id } => format!("incomplete(edit({}))", quote_atom(edit_id)),
-    };
-    let evidence = encode_evidence_items(&result.evidence);
-    format!(
-        "parse_result({},{},[{}],{})",
-        encode_command(&result.command),
-        status,
-        evidence,
-        result.preference,
-    )
 }
 
 #[derive(Clone, Debug)]
@@ -2611,36 +2924,17 @@ fn decode_evidence(term: &ParsedTerm) -> Result<Evidence, String> {
     })
 }
 
-fn decode_parse_candidate(term: &ParsedTerm) -> Result<ParseCandidate, String> {
-    let args = compound(term, "parse_result", 4)?;
-    let status = if atom(&args[1]).ok() == Some("complete") {
-        ParseStatus::Complete
-    } else {
-        let incomplete = compound(&args[1], "incomplete", 1)?;
-        let edit = compound(&incomplete[0], "edit", 1)?;
-        ParseStatus::Incomplete {
-            edit_id: atom(&edit[0])?.to_string(),
-        }
-    };
-    Ok(ParseCandidate {
-        command: decode_command(&args[0])?,
-        status,
-        evidence: list(&args[2])?
-            .iter()
-            .map(decode_evidence)
-            .collect::<Result<_, _>>()?,
-        preference: integer(&args[3])?,
-    })
-}
-
-fn decode_parse_response(response: &str) -> Result<Vec<ParseCandidate>, String> {
-    let value = response_value(response)?;
-    list(&value)?.iter().map(decode_parse_candidate).collect()
-}
-
 fn decode_completion_response(response: &str) -> Result<Vec<Completion>, String> {
     let value = response_value(response)?;
-    list(&value)?
+    decode_completions_term(&value)
+}
+
+fn decode_completions_value(value: &RelationValue) -> Result<Vec<Completion>, String> {
+    decode_completions_term(&parsed_relation_value(value))
+}
+
+fn decode_completions_term(value: &ParsedTerm) -> Result<Vec<Completion>, String> {
+    list(value)?
         .iter()
         .map(|term| {
             let args = compound(term, "completion", 5)?;
@@ -2669,9 +2963,12 @@ fn decode_completion_response(response: &str) -> Result<Vec<Completion>, String>
         .collect()
 }
 
-fn decode_highlight_response(response: &str) -> Result<Vec<Highlight>, String> {
-    let value = response_value(response)?;
-    list(&value)?
+fn decode_highlights_value(value: &RelationValue) -> Result<Vec<Highlight>, String> {
+    decode_highlights_term(&parsed_relation_value(value))
+}
+
+fn decode_highlights_term(value: &ParsedTerm) -> Result<Vec<Highlight>, String> {
+    list(value)?
         .iter()
         .map(|term| {
             let args = compound(term, "highlight", 4)?;
@@ -2683,27 +2980,6 @@ fn decode_highlight_response(response: &str) -> Result<Vec<Highlight>, String> {
             })
         })
         .collect()
-}
-
-fn decode_render_response(response: &str) -> Result<String, QueryError> {
-    let term = TermParser::parse(response).map_err(QueryError::Backend)?;
-    if let Ok(args) = compound(&term, "ok", 1) {
-        return text(&args[0])
-            .map(str::to_string)
-            .map_err(QueryError::Backend);
-    }
-    if let Ok(args) = compound(&term, "error", 1) {
-        if atom(&args[0]).ok() == Some("no_solution") {
-            return Err(QueryError::NoSolution);
-        }
-        return Err(QueryError::Backend(format!(
-            "action grammar rejected request: {}",
-            term_text(&args[0])
-        )));
-    }
-    Err(QueryError::Backend(
-        "invalid action grammar application response".into(),
-    ))
 }
 
 fn decode_action_help_response(
@@ -3126,14 +3402,12 @@ mod tests {
 
     #[test]
     fn render_no_solution_is_distinct_from_backend_decode_error() {
+        let mut invalid = command("missing_action", None);
+        invalid.handler = "missing_handler".into();
         assert_eq!(
-            decode_render_response("error(no_solution)"),
+            global().unwrap().render(&invalid),
             Err(QueryError::NoSolution)
         );
-        assert!(matches!(
-            decode_render_response("not_a_response"),
-            Err(QueryError::Backend(_))
-        ));
     }
 
     #[test]

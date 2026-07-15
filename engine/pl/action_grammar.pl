@@ -1251,17 +1251,6 @@ decode_request(InputString, Request) :-
     catch(term_string(Request, InputString, [syntax_errors(error)]), _, fail),
     ground(Request).
 
-dispatch_application(parse, request(Items, Mode), ok(Results)) :-
-    !, findall(Result, parse(Items, Mode, Result), Results).
-dispatch_application(complete, request(Items, EditId), ok(Completions)) :-
-    !, completions(Items, EditId, Completions).
-dispatch_application(highlights, request(Result), ok(Highlights)) :-
-    !, ( highlights(Result, Highlights) -> true ; Highlights = [] ).
-dispatch_application(render, request(Command), Response) :-
-    !, ( render(Command, Text)
-       -> Response = ok(Text)
-       ;  Response = error(no_solution)
-       ).
 dispatch_application(catalog, request(Visibility), ok(Rows)) :-
     !, catalog(Visibility, Rows).
 dispatch_application(action_help, request(Target), Response) :-
@@ -1297,10 +1286,6 @@ dispatch_application(action_request, request(Command), Response) :-
        -> Response = ok(Request)
        ;  Response = error(no_solution)
        ).
-dispatch_application(parse, _, error(invalid_request)) :- !.
-dispatch_application(complete, _, error(invalid_request)) :- !.
-dispatch_application(highlights, _, error(invalid_request)) :- !.
-dispatch_application(render, _, error(invalid_request)) :- !.
 dispatch_application(catalog, _, error(invalid_request)) :- !.
 dispatch_application(action_help, _, error(invalid_request)) :- !.
 dispatch_application(convert, _, error(invalid_request)) :- !.

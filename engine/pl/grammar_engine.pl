@@ -135,6 +135,15 @@ transform_relation(
     Available = [binding(source, Text),
                  binding(rendered_items, RenderedItems)],
     requested_bindings(Wanted, Available, Bindings).
+transform_relation(
+    sequence_grammar(_Specs, terminals(_Terminals), separator(_Separator),
+                     contexts(_Contexts)),
+    Given, Wanted, _Observations, _Limits,
+    reply([solution(Bindings, 0)], [], [], [])) :-
+    given_value(evidence, Given, Evidence),
+    project_highlights(Evidence, Highlights),
+    Available = [binding(highlights, Highlights)],
+    requested_bindings(Wanted, Available, Bindings).
 
 % A choice is grammar composition, not an operation switch. Alternative keys
 % are immutable grammar data used to namespace context-query identities; a

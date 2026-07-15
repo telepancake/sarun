@@ -288,6 +288,17 @@ idempotent, changing a handle fails, and missing handles fail closed. A native
 aarch64 structured-FLI test renders an action through the installed handle, so
 Rust neither transports nor inspects the grammar tree. Production action
 adapters still call the old operation path and are the next cut-over.
+Production Rust parsing, rendering, literal completion, and highlighting now
+use `grammar_handle(sarun_actions)` through `RelationRequest` and the recursive
+structured FLI. Input units, typed commands, and retained parse evidence are
+constructed as neutral values rather than Prolog source strings. Highlighting
+is requested as a projection of the successful parse evidence through the
+same grammar, not recomputed by Rust. The four corresponding Rust `Operation`
+variants and Prolog `dispatch_application/3` cases have been deleted. All 319
+native aarch64 Rust tests (318 pass, one ignored browser integration test) and
+the command-modal regressions pass after the cut-over. Context plan adapters,
+help, and action-request materialization still remain on the old operation
+surface.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:
