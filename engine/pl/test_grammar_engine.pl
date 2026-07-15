@@ -13,6 +13,9 @@ test_name(parse_foreign_sequence).
 test_name(render_foreign_sequence).
 test_name(repeat_foreign_field).
 test_name(tear_uses_ordinary_relation_and_leaves_required_hole).
+test_name(neutral_source_validation_is_engine_owned).
+test_name(completion_projection_groups_ranks_and_keeps_ambiguity).
+test_name(highlighting_is_evidence_projection).
 
 run_grammar_engine_tests :-
     findall(Name, test_name(Name), Names),
@@ -93,4 +96,42 @@ run_test(tear_uses_ordinary_relation_and_leaves_required_hole) :-
     expect_equal(EditCount, 1),
     Evidence = [evidence(greeting, span(0, 2), [], "he", foreign_keyword,
                          greeting, 20,
-                         tear(cursor, literal("hello")))].
+                         tear(cursor, literal("hello")))],
+    literal_completion_evidence(cursor, Evidence, span(0, 2), "hello",
+                                greeting, foreign_keyword, greeting).
+
+run_test(neutral_source_validation_is_engine_owned) :-
+    source("hello", 0, Hello),
+    neutral_input([Hello, end(5)], [Hello]),
+    Invalid = unit(ignored, span(0, 2), [span(0, 3)], "hi",
+                   source, foreign_source, 0, foreign_test),
+    \+ neutral_input([Invalid, end(3)], _).
+
+run_test(completion_projection_groups_ranks_and_keeps_ambiguity) :-
+    Hello = completion_key(span(0, 2), "hello"),
+    Help = completion_key(span(0, 2), "help"),
+    Pairs = [
+        Hello-(alternative(greeting, foreign_keyword, first)-10),
+        Hello-(alternative(greeting, foreign_keyword, first)-20),
+        Hello-(alternative(other, foreign_keyword, second)-15),
+        Help-(alternative(help, foreign_keyword, help)-30)
+    ],
+    project_completions(Pairs, Completions),
+    expect_equal(
+        Completions,
+        [completion(span(0, 2), "help",
+                    [alternative(help, foreign_keyword, help, 30)], 30, 1),
+         completion(span(0, 2), "hello",
+                    [alternative(greeting, foreign_keyword, first, 20),
+                     alternative(other, foreign_keyword, second, 15)],
+                    20, 2)]).
+
+run_test(highlighting_is_evidence_projection) :-
+    Evidence = [evidence(word("hello"), span(0, 5),
+                         [span(0, 2), span(3, 5)], "hello", foreign_word,
+                         name, 10, foreign_test)],
+    project_highlights(Evidence, Highlights),
+    expect_equal(
+        Highlights,
+        [highlight(span(0, 2), foreign_word, word("hello"), foreign_test),
+         highlight(span(3, 5), foreign_word, word("hello"), foreign_test)]).

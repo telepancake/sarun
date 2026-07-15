@@ -172,8 +172,10 @@ Immediate extraction order:
 - [x] Move relational sequence execution, tears, evidence, repetition, and
       rendering terminals into an engine module with no sarun imports; prove
       it with an independent foreign grammar test.
-- [ ] Move neutral source validation and all completion/highlight projections
-      into the grammar-independent engine rather than action grammar helpers.
+- [x] Move neutral source validation and completion/highlight evidence
+      projection into the grammar-independent engine rather than action
+      grammar helpers; prove span rejection, ambiguity retention, ranking, and
+      paint projection with the foreign grammar test.
 - [ ] Replace the flat action-only spec vocabulary with composable grammar
       values for sequence, choice, repetition, named fields, constraints, and
       embedded grammars.
