@@ -11,6 +11,7 @@
           ]).
 
 :- use_module(context_relation).
+:- use_module(grammar_codec).
 
 /** <module> Grammar-independent relational sequence execution
 
@@ -465,8 +466,8 @@ requested_bindings([Name|Names], Available, [binding(Name, Value)|Bindings]) :-
 data_terminal(Terminals, syntax(Kind, Syntax)) :-
     terminal_data(Kind, Syntax, _Surfaces, Terminals).
 data_terminal(Terminals, surface(Kind, Value, Surface)) :-
-    terminal_data(Kind, _Syntax, Surfaces, Terminals),
-    surface_data(Value, Surface, Surfaces).
+    terminal_data(Kind, _Syntax, Codec, Terminals),
+    terminal_value(Codec, Value, Surface).
 
 terminal_data(Kind, Syntax, Surfaces,
               [terminal(Kind, Syntax, Surfaces)|_]).
@@ -475,6 +476,12 @@ terminal_data(Kind, Syntax, Surfaces, [_|Terminals]) :-
 
 surface_data(Value, Surface, [surface(Value, Surface)|_]).
 surface_data(Value, Surface, [_|Surfaces]) :-
+    surface_data(Value, Surface, Surfaces).
+
+terminal_value(codec(Codec), Value, Surface) :-
+    codec_value(Codec, Value, Surface).
+terminal_value(Surfaces, Value, Surface) :-
+    proper_list(Surfaces),
     surface_data(Value, Surface, Surfaces).
 
 rendered_surfaces([], []).

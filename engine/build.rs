@@ -67,6 +67,7 @@ fn require_generated_wire(manifest: &Path) {
         "engine/pl/action_catalog.pl",
         "engine/pl/action_grammar.pl",
         "engine/pl/grammar_engine.pl",
+        "engine/pl/grammar_codec.pl",
         "engine/pl/grammar_ir.pl",
         "engine/pl/relation_api.pl",
         "engine/pl/context_relation.pl",
@@ -147,6 +148,7 @@ fn main() {
 
     let grammar = manifest.join("pl/action_grammar.pl");
     let grammar_engine = manifest.join("pl/grammar_engine.pl");
+    let grammar_codec = manifest.join("pl/grammar_codec.pl");
     let grammar_ir = manifest.join("pl/grammar_ir.pl");
     let relation_api = manifest.join("pl/relation_api.pl");
     let catalog = manifest.join("pl/action_catalog.pl");
@@ -156,6 +158,7 @@ fn main() {
     let zlib_license = manifest.join("../LICENSES/zlib.txt");
     require_value(&info, "action_grammar_sha256", &sha256(&grammar));
     require_value(&info, "grammar_engine_sha256", &sha256(&grammar_engine));
+    require_value(&info, "grammar_codec_sha256", &sha256(&grammar_codec));
     require_value(&info, "grammar_ir_sha256", &sha256(&grammar_ir));
     require_value(&info, "relation_api_sha256", &sha256(&relation_api));
     require_value(&info, "action_catalog_sha256", &sha256(&catalog));
@@ -193,6 +196,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", info_path.display());
     println!("cargo:rerun-if-changed={}", grammar.display());
     println!("cargo:rerun-if-changed={}", grammar_engine.display());
+    println!("cargo:rerun-if-changed={}", grammar_codec.display());
     println!("cargo:rerun-if-changed={}", grammar_ir.display());
     println!("cargo:rerun-if-changed={}", relation_api.display());
     println!("cargo:rerun-if-changed={}", catalog.display());

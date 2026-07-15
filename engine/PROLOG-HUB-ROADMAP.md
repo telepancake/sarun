@@ -252,6 +252,14 @@ the same declaration. Foreign tests parse and render through nested
 choice/projection/sequence values. The action catalog has not yet been
 materialized as this immutable value, so the old action callback and operation
 surface remain the next deletion target.
+Terminals can now contain engine-interpreted codec data rather than a terminal
+predicate. `grammar_codec.pl` implements finite enumerations, typed integer and
+text wrappers, codec choice, and a closed relational JSON shape vocabulary
+(objects, arrays, tuples, nullable fields, and strings). A foreign grammar
+test parses reordered JSON fields into a typed compound and renders canonical
+compact JSON from the same declaration. This is sufficient to express the
+current OCI and API action arguments as grammar data; those declarations and
+the removal of their duplicate callback implementation are next.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:

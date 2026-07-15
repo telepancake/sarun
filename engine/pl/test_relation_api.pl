@@ -9,6 +9,7 @@ test_name(context_support_uses_the_same_given_wanted_envelope).
 test_name(grammar_choice_and_projection_are_executable_data).
 test_name(projection_template_is_bidirectional_and_can_append_values).
 test_name(choice_namespaces_context_dependencies).
+test_name(grammar_terminal_codecs_are_declarative_and_bidirectional).
 test_name(solution_limit_is_enforced_and_reported).
 test_name(envelope_fails_closed).
 
@@ -287,6 +288,38 @@ run_test(choice_namespaces_context_dependencies) :-
         reply(_, [query(branch(open_form, q(1)), Query)],
               [dependency(branch(open_form, q(1)), Query, some(one(Entry)))],
               [])).
+
+run_test(grammar_terminal_codecs_are_declarative_and_bidirectional) :-
+    Shape = object(build,
+                   [field("context", string),
+                    field("tag", nullable(string, none, some)),
+                    field("arguments", array(tuple(pair, [string, string])))]),
+    Grammar = sequence_grammar(
+        [literal(build, "build", keyword, build, 20),
+         argument(arg(specification, build_spec, required, scalar))],
+        terminals([
+            terminal(build_spec, structured_spec, codec(json(Shape)))
+        ]), separator(" "), contexts([])),
+    Json = "{\"arguments\":[[\"CC\",\"clang\"]],\"tag\":null,\"context\":\"eA==\"}",
+    source("build", 0, Build),
+    source(Json, 6, Specification),
+    string_length(Json, JsonLength),
+    End is JsonLength + 6,
+    limits(Limits),
+    Semantic = build("eA==", none, [pair("CC", "clang")]),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               source([Build, Specification, end(End)],
+                                      exact))]),
+                want([arguments]), observations([]), Limits),
+        reply([solution([binding(arguments, [Semantic])], _)], [], [], [])),
+    transform(
+        request(Grammar, given([binding(arguments, [Semantic])]),
+                want([source]), observations([]), Limits),
+        reply([solution([binding(source,
+                                 "build {\"context\":\"eA==\",\"tag\":null,\"arguments\":[[\"CC\",\"clang\"]]}")],
+                        0)], [], [], [])).
 
 run_test(envelope_fails_closed) :-
     foreign_grammar(Grammar),
