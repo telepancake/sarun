@@ -25,9 +25,6 @@
 
 use std::collections::HashMap;
 
-use serde_json::Value;
-use serde_json::json;
-
 use crate::discover;
 use crate::rules::{Clause, Join, Match, PathTarget, ProcFilterTarget, PipelineFilterTarget, EdgeFilterTarget, Subject, eval_clauses};
 
@@ -96,11 +93,13 @@ pub enum ViewAux {
 
 // ── building source rows per kind ────────────────────────────────────────────
 
-fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
+fn source_changes(
+    sid: i64,
+) -> Result<(Vec<crate::generated_wire::ViewChangeRow>, Vec<Vec<i64>>), String> {
     // ONE sqlite scan: rows + their writer/last_writer in the same pass, so
     // per-row "ids" filter evaluation later is a Vec lookup not an RPC.
     let Some(conn) = discover::open_ro_for(sid) else {
-        return (vec![], vec![]);
+        return Ok((vec![], vec![]));
     };
     const S_IFMT: u32 = 0o170000;
     const S_IFCHR: u32 = 0o020000;
@@ -181,24 +180,14 @@ fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
         }
         // Emit connector rows for any newly-entered directory levels.
         for d in common..leaf_depth {
-            rows.push(json!({
-                "path": parts[..=d].join("/"),
-                "name": parts[d],
-                "kind": "dir",
-                "size": 0,
-                "depth": d,
-                "connector": true,
-            }));
+            rows.push(view_change_row(
+                &parts[..=d].join("/"), &parts[d], "dir", 0, d, true, None, None,
+            )?);
             ids.push(vec![]);
         }
-        rows.push(json!({
-            "path": name.clone(),
-            "name": parts[leaf_depth],
-            "kind": kind,
-            "size": sz,
-            "depth": leaf_depth,
-            "connector": false,
-        }));
+        rows.push(view_change_row(
+            &name, &parts[leaf_depth], kind, sz, leaf_depth, false, None, None,
+        )?);
         ids.push(wids);
         // Xattr children: one row per (file, key) pair, indented one
         // level under the file leaf. Their "name" is the key
@@ -209,16 +198,10 @@ fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
         // unit instead of being bundled with the file).
         if let Some(xs) = xattr_by_name.get(&name) {
             for (key, vlen) in xs {
-                rows.push(json!({
-                    "path": format!("{name}#xattr={key}"),
-                    "name": key.clone(),
-                    "kind": "xattr",
-                    "size": vlen,
-                    "depth": leaf_depth + 1,
-                    "connector": false,
-                    "xattr_for": name.clone(),
-                    "xattr_key": key.clone(),
-                }));
+                rows.push(view_change_row(
+                    &format!("{name}#xattr={key}"), key, "xattr", *vlen,
+                    leaf_depth + 1, false, Some(&name), Some(key),
+                )?);
                 ids.push(vec![]);
             }
             consumed.insert(name.clone());
@@ -244,49 +227,34 @@ fn source_changes(sid: i64) -> (Vec<Value>, Vec<Vec<i64>>) {
             common += 1;
         }
         for d in common..leaf_depth {
-            rows.push(json!({
-                "path": parts[..=d].join("/"),
-                "name": parts[d],
-                "kind": "dir",
-                "size": 0,
-                "depth": d,
-                "connector": true,
-            }));
+            rows.push(view_change_row(
+                &parts[..=d].join("/"), &parts[d], "dir", 0, d, true, None, None,
+            )?);
             ids.push(vec![]);
         }
         // Synthetic parent file row so the xattrs aren't hanging in
         // the air: kind="xattr-only" carries a hint glyph distinct
         // from a real "changed" file.
-        rows.push(json!({
-            "path": name.clone(),
-            "name": parts[leaf_depth],
-            "kind": "xattr-only",
-            "size": 0,
-            "depth": leaf_depth,
-            "connector": false,
-        }));
+        rows.push(view_change_row(
+            &name, &parts[leaf_depth], "xattr-only", 0, leaf_depth, false, None, None,
+        )?);
         ids.push(vec![]);
         for (key, vlen) in xs {
-            rows.push(json!({
-                "path": format!("{name}#xattr={key}"),
-                "name": key.clone(),
-                "kind": "xattr",
-                "size": vlen,
-                "depth": leaf_depth + 1,
-                "connector": false,
-                "xattr_for": name.clone(),
-                "xattr_key": key,
-            }));
+            rows.push(view_change_row(
+                &format!("{name}#xattr={key}"), &key, "xattr", vlen,
+                leaf_depth + 1, false, Some(&name), Some(&key),
+            )?);
             ids.push(vec![]);
         }
         prev = parts;
     }
-    (rows, ids)
+    Ok((rows, ids))
 }
 
-fn source_outputs(sid: i64) -> (Vec<Value>, Vec<Subject>) {
-    let rows = discover::outputs(sid);
-    let rows: Vec<Value> = rows.as_array().cloned().unwrap_or_default();
+fn source_outputs(
+    sid: i64,
+) -> Result<(Vec<crate::generated_wire::ViewOutputRow>, Vec<Subject>), String> {
+    let rows = discover::outputs_typed(sid)?;
     // The outputs index needs a per-row (exe, tgid) tag for the prototype's
     // "Process" column ("<basename>·<tgid>"). Pull the whole process table
     // ONCE — one sqlite scan, indexed by row id — so we don't run a
@@ -307,106 +275,125 @@ fn source_outputs(sid: i64) -> (Vec<Value>, Vec<Subject>) {
     // to render the index.
     let mut rows_out = Vec::with_capacity(rows.len());
     let mut subjects = Vec::with_capacity(rows.len());
-    for r in rows {
-        let pid = r.get("process_id").and_then(Value::as_i64).unwrap_or(-1);
+    for output in rows {
+        let pid = output.process.and_then(|value| i64::try_from(value).ok()).unwrap_or(-1);
         let (exe, tgid) = pmap.get(&pid).cloned().unwrap_or_default();
         let argv: Vec<String> = vec![]; // outputs filter doesn't use arg
         subjects.push(Subject { box_name: String::new(),
                                 exe: exe.clone(), cwd: String::new(), argv });
-        // Tack exe + tgid onto the row so the renderer can show them
-        // without another round-trip per row.
-        let mut r2 = r;
-        if let Some(obj) = r2.as_object_mut() {
-            obj.insert("exe".into(), Value::String(exe));
-            obj.insert("tgid".into(), Value::Number(tgid.into()));
-        }
-        rows_out.push(r2);
+        rows_out.push(crate::generated_wire::ViewOutputRow {
+            output,
+            executable: wire_path(&exe)?,
+            tgid: u32::try_from(tgid).ok().filter(|value| *value != 0),
+        });
     }
-    (rows_out, subjects)
+    Ok((rows_out, subjects))
 }
 
-fn source_procs(sid: i64, running_only: bool) -> (Vec<Value>, Vec<Subject>) {
+fn source_procs(
+    sid: i64,
+    running_only: bool,
+) -> Result<(Vec<crate::generated_wire::ViewProcessRow>, Vec<Subject>), String> {
     // The flat process list and its DFS-flattened tree with depth/connector,
     // built once here on the engine side. Mirrors the old client-side
     // build_proc_tree but the ancestor `lookup` is a plain function call
     // instead of an RPC round-trip per process.
-    let procs_v = discover::processes(sid);
-    let mut procs: Vec<Value> = procs_v.as_array().cloned().unwrap_or_default();
+    let mut procs = discover::processes_typed(sid)?;
     // running_only (live box, default): keep only rows whose process (tgid, col 1)
     // is still alive — a pidfd probe (control::pid_alive), no stored liveness. The
     // surviving tgids ARE the filter; build_proc_tree still pulls their ancestors
     // as connectors. The caller only sets this for a live box.
     if running_only {
         use std::collections::HashMap;
-        let mut alive: HashMap<i64, bool> = HashMap::new();
-        procs.retain(|p| {
-            let tgid = p.as_array().and_then(|a| a.get(1)).and_then(Value::as_i64).unwrap_or(0);
-            tgid > 0 && *alive.entry(tgid).or_insert_with(|| crate::control::pid_alive(tgid as i32))
+        let mut alive: HashMap<u32, bool> = HashMap::new();
+        procs.retain(|process| {
+            let Some(tgid) = process.tgid.filter(|value| *value != 0) else { return false };
+            *alive.entry(tgid).or_insert_with(|| {
+                i32::try_from(tgid).is_ok_and(crate::control::pid_alive)
+            })
         });
     }
-    let roots: std::collections::HashSet<i64> = discover::proc_roots(sid)
-        .as_array().cloned().unwrap_or_default()
-        .iter().filter_map(Value::as_i64).collect();
-    let rows = build_proc_tree(&procs, &roots, sid);
+    let roots = discover::proc_roots_typed(sid)?.into_iter().collect();
+    let rows = build_proc_tree(&procs, &roots, sid)?;
     // Subject per row for "exe"/"cwd"/"arg" filter kinds. `cwd` lives in the
-    // `process` table but discover::processes() doesn't include it; pull all
+    // `process` table but ProcessRow doesn't include it; pull all
     // (rid → cwd) pairs in ONE sqlite scan so a million-row procs view isn't
     // a million per-row queries (which made view.open take ~30 s at scale).
-    let cwd_by_rid: HashMap<i64, String> = discover::open_ro_for(sid)
+    let cwd_by_rid: HashMap<u64, String> = discover::open_ro_for(sid)
         .and_then(|c| c.prepare("SELECT id, cwd FROM process").ok().map(|mut st| {
             st.query_map([], |r| Ok((r.get::<_, i64>(0)?,
                                      r.get::<_, Option<String>>(1)?.unwrap_or_default())))
-              .ok().map(|it| it.flatten().collect::<HashMap<_, _>>())
+              .ok().map(|it| it.flatten().filter_map(|(id, cwd)|
+                  u64::try_from(id).ok().map(|id| (id, cwd))).collect::<HashMap<_, _>>())
               .unwrap_or_default()
         }))
         .unwrap_or_default();
     let mut subjects = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let rid = r.get("rid").and_then(Value::as_i64).unwrap_or(-1);
-        let exe = r.get("exe").and_then(Value::as_str).unwrap_or("").to_string();
-        let argv = r.get("argv").and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-            .unwrap_or_default();
-        let cwd = cwd_by_rid.get(&rid).cloned().unwrap_or_default();
+    for row in &rows {
+        let exe = String::from_utf8_lossy(row.executable.as_slice()).into_owned();
+        let argv = row.argv.as_slice().iter()
+            .map(|word| String::from_utf8_lossy(word.as_slice()).into_owned()).collect();
+        let cwd = cwd_by_rid.get(&row.id).cloned().unwrap_or_default();
         subjects.push(Subject { box_name: String::new(), exe, cwd, argv });
     }
-    (rows, subjects)
+    Ok((rows, subjects))
 }
 
 // ── proc tree (lifted from ui.rs, with in-process ancestor lookup) ───────────
 
 const PROC_TREE_DEPTH: usize = 64;
 
-type NodeInfo = (i64, i64, Option<i64>, String, Vec<String>);
-
-fn node_info(p: &Value) -> NodeInfo {
-    let a = p.as_array();
-    let g = |i: usize| a.and_then(|x| x.get(i)).and_then(Value::as_i64);
-    let exe = a.and_then(|x| x.get(4)).and_then(Value::as_str).unwrap_or("").to_string();
-    let argv = a.and_then(|x| x.get(5)).and_then(Value::as_array)
-        .map(|v| v.iter().filter_map(Value::as_str).map(String::from).collect())
-        .unwrap_or_default();
-    (g(1).unwrap_or(0), g(2).unwrap_or(0), g(3), exe, argv)
+#[derive(Clone)]
+struct NodeInfo {
+    tgid: Option<u32>,
+    ppid: Option<u32>,
+    parent: Option<u64>,
+    executable: crate::generated_wire::Path,
+    argv: crate::wire::BoundedVec<
+        crate::generated_wire::OsString,
+        0,
+        { crate::generated_wire::LIMIT_COMMAND_ITEMS },
+    >,
 }
 
-fn build_proc_tree(procs: &[Value], roots: &std::collections::HashSet<i64>, sid: i64)
-    -> Vec<Value>
-{
+fn process_node(process: &crate::generated_wire::ProcessRow) -> NodeInfo {
+    NodeInfo {
+        tgid: process.tgid,
+        ppid: process.ppid,
+        parent: process.parent,
+        executable: process.executable.clone(),
+        argv: process.argv.clone(),
+    }
+}
+
+fn process_info_node(process: crate::generated_wire::ProcessInfo) -> NodeInfo {
+    NodeInfo {
+        tgid: process.tgid,
+        ppid: process.ppid,
+        parent: process.parent,
+        executable: process.executable,
+        argv: process.argv,
+    }
+}
+
+fn build_proc_tree(
+    procs: &[crate::generated_wire::ProcessRow],
+    roots: &std::collections::HashSet<u64>,
+    sid: i64,
+) -> Result<Vec<crate::generated_wire::ViewProcessRow>, String> {
     use std::collections::HashMap;
     use std::collections::HashSet;
 
-    let mut members: HashMap<i64, NodeInfo> = HashMap::new();
-    for p in procs {
-        if let Some(rid) = p.as_array().and_then(|x| x.first()).and_then(Value::as_i64) {
-            members.insert(rid, node_info(p));
-        }
+    let mut members: HashMap<u64, NodeInfo> = HashMap::new();
+    for process in procs {
+        members.insert(process.id, process_node(process));
     }
-    let mut nodes: HashMap<i64, NodeInfo> = members.clone();
+    let mut nodes: HashMap<u64, NodeInfo> = members.clone();
 
     // root→self row-id path per member, unioning structural ancestors into
     // `nodes` so their connector rows can carry tgid/ppid/exe in the output.
-    let mut member_paths: HashMap<i64, Vec<i64>> = HashMap::new();
-    let member_ids: Vec<i64> = members.keys().copied().collect();
+    let mut member_paths: HashMap<u64, Vec<u64>> = HashMap::new();
+    let member_ids: Vec<u64> = members.keys().copied().collect();
     for &start in &member_ids {
         let mut path = vec![];
         let mut seen = HashSet::new();
@@ -419,28 +406,15 @@ fn build_proc_tree(procs: &[Value], roots: &std::collections::HashSet<i64>, sid:
             let got = match nodes.get(&cur) {
                 Some(n) => n.clone(),
                 None => {
-                    let v = discover::proc_info(sid, cur);
-                    let a = match v.as_array() { Some(a) => a, None => break };
-                    let g = |i: usize| a.get(i).and_then(Value::as_i64);
-                    let exe = a.get(3).and_then(Value::as_str).unwrap_or("").to_string();
-                    let argv = a.get(4).and_then(Value::as_array)
-                        .map(|x| x.iter().filter_map(Value::as_str).map(String::from).collect())
-                        .unwrap_or_default();
-                    (g(0).unwrap_or(0), g(1).unwrap_or(0), g(2), exe, argv)
+                    let Some(process) = discover::proc_info_typed(sid, cur)? else { break };
+                    process_info_node(process)
                 }
             };
-            let Some(parent_id) = got.2 else { break };
+            let Some(parent_id) = got.parent else { break };
             if parent_id == 0 { break; }
             if !nodes.contains_key(&parent_id) {
-                let v = discover::proc_info(sid, parent_id);
-                if let Some(a) = v.as_array() {
-                    let g = |i: usize| a.get(i).and_then(Value::as_i64);
-                    let exe = a.get(3).and_then(Value::as_str).unwrap_or("").to_string();
-                    let argv = a.get(4).and_then(Value::as_array)
-                        .map(|x| x.iter().filter_map(Value::as_str).map(String::from).collect())
-                        .unwrap_or_default();
-                    nodes.insert(parent_id,
-                                 (g(0).unwrap_or(0), g(1).unwrap_or(0), g(2), exe, argv));
+                if let Some(process) = discover::proc_info_typed(sid, parent_id)? {
+                    nodes.insert(parent_id, process_info_node(process));
                 } else {
                     break;
                 }
@@ -451,39 +425,36 @@ fn build_proc_tree(procs: &[Value], roots: &std::collections::HashSet<i64>, sid:
         member_paths.insert(start, path);
     }
 
-    let mut paths: Vec<Vec<i64>> = member_paths.values().cloned().collect();
+    let mut paths: Vec<Vec<u64>> = member_paths.values().cloned().collect();
     paths.sort();
 
-    let mut emitted: HashSet<i64> = HashSet::new();
+    let mut emitted: HashSet<u64> = HashSet::new();
     let mut out = vec![];
     for path in &paths {
         for (depth, &rid) in path.iter().enumerate() {
             if !emitted.insert(rid) { continue; }
             let connector = !members.contains_key(&rid);
-            let n = nodes.get(&rid).cloned()
-                .unwrap_or((0, 0, None, String::new(), vec![]));
-            out.push(json!({
-                "rid": rid,
-                "tgid": n.0,
-                "ppid": n.1,
-                "exe": n.3,
-                "argv": n.4,
-                "depth": depth,
-                "connector": connector,
-            }));
+            let Some(node) = nodes.get(&rid) else { continue };
+            out.push(crate::generated_wire::ViewProcessRow {
+                id: rid,
+                tgid: node.tgid,
+                ppid: node.ppid,
+                executable: node.executable.clone(),
+                argv: node.argv.clone(),
+                depth: u32::try_from(depth).map_err(|_| "process tree depth exceeds u32")?,
+                connector,
+            });
         }
     }
-    out
+    Ok(out)
 }
 
-fn source_pipelines(sid: i64) -> Vec<Value> {
-    let v = discover::brushprov(sid);
-    v.as_array().cloned().unwrap_or_default()
+fn source_pipelines(sid: i64) -> Result<Vec<crate::generated_wire::PipelineRow>, String> {
+    discover::brushprov_typed(sid)
 }
 
-fn source_build_edges(sid: i64) -> Vec<Value> {
-    let v = discover::build_edges(sid);
-    v.as_array().cloned().unwrap_or_default()
+fn source_build_edges(sid: i64) -> Result<Vec<crate::generated_wire::BuildEdgeRow>, String> {
+    discover::build_edges_typed(sid)
 }
 
 fn wire_path(value: &str) -> Result<crate::generated_wire::Path, String> {
@@ -496,246 +467,38 @@ fn wire_os_string(value: &str) -> Result<crate::generated_wire::OsString, String
         .map_err(|error| format!("OS string exceeds relation bound: {error:?}"))
 }
 
-fn wire_text(value: &str) -> Result<crate::wire::BoundedText<{crate::generated_wire::LIMIT_TEXT_BYTES}>, String> {
-    crate::wire::BoundedText::new(value.into())
-        .map_err(|error| format!("text exceeds relation bound: {error:?}"))
-}
-
-fn required_u64(value: Option<&Value>, field: &str) -> Result<u64, String> {
-    value
-        .and_then(|value| value.as_u64().or_else(|| value.as_i64()?.try_into().ok()))
-        .ok_or_else(|| format!("view row has invalid {field}"))
-}
-
-fn optional_u64(value: Option<&Value>, field: &str) -> Result<Option<u64>, String> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => required_u64(Some(value), field).map(Some),
-    }
-}
-
-fn optional_u32(value: Option<&Value>, field: &str) -> Result<Option<u32>, String> {
-    optional_u64(value, field)?
-        .map(|value| u32::try_from(value).map_err(|_| format!("view row {field} exceeds u32")))
-        .transpose()
-}
-
-fn typed_change_rows(rows: Vec<Value>) -> Result<Vec<crate::generated_wire::ViewChangeRow>, String> {
+fn view_change_row(
+    path: &str,
+    name: &str,
+    kind: &str,
+    size: i64,
+    depth: usize,
+    connector: bool,
+    xattr_for: Option<&str>,
+    xattr_key: Option<&str>,
+) -> Result<crate::generated_wire::ViewChangeRow, String> {
     use crate::generated_wire::{ChangeKind, ViewChangeRow};
-    rows.into_iter().map(|row| {
-        let path = row.get("path").and_then(Value::as_str)
-            .ok_or("change view row has no path")?;
-        let name = row.get("name").and_then(Value::as_str)
-            .ok_or("change view row has no name")?;
-        let kind = match row.get("kind").and_then(Value::as_str) {
-            Some("changed") => ChangeKind::Changed,
-            Some("deleted") => ChangeKind::Deleted,
-            Some("symlink") => ChangeKind::Symlink,
-            Some("created") => ChangeKind::Created,
-            Some("modified") => ChangeKind::Modified,
-            Some("xattr") => ChangeKind::Xattr,
-            Some("dir") => ChangeKind::Directory,
-            Some("xattr-only") => ChangeKind::XattrOnly,
-            Some(kind) => return Err(format!("unknown change view kind {kind:?}")),
-            None => return Err("change view row has no kind".into()),
-        };
-        Ok(ViewChangeRow {
-            path: wire_path(path)?,
-            name: wire_os_string(name)?,
-            kind,
-            size: required_u64(row.get("size"), "change size")?,
-            depth: u32::try_from(required_u64(row.get("depth"), "change depth")?)
-                .map_err(|_| "change view depth exceeds u32")?,
-            connector: row.get("connector").and_then(Value::as_bool)
-                .ok_or("change view row has no connector flag")?,
-            xattr_for: row.get("xattr_for").and_then(Value::as_str)
-                .map(wire_path).transpose()?,
-            xattr_key: row.get("xattr_key").and_then(Value::as_str)
-                .map(wire_os_string).transpose()?,
-        })
-    }).collect()
-}
-
-fn typed_process_rows(rows: Vec<Value>) -> Result<Vec<crate::generated_wire::ViewProcessRow>, String> {
-    use crate::generated_wire::{LIMIT_COMMAND_ITEMS, ViewProcessRow};
-    rows.into_iter().map(|row| {
-        let argv = row.get("argv").and_then(Value::as_array)
-            .ok_or("process view row has no argv")?
-            .iter().map(|word| {
-                word.as_str().ok_or_else(|| "process argv contains non-text".into())
-                    .and_then(wire_os_string)
-            }).collect::<Result<Vec<_>, String>>()?;
-        Ok(ViewProcessRow {
-            id: required_u64(row.get("rid"), "process row id")?,
-            tgid: optional_u32(row.get("tgid"), "process tgid")?.filter(|value| *value != 0),
-            ppid: optional_u32(row.get("ppid"), "process ppid")?.filter(|value| *value != 0),
-            executable: wire_path(row.get("exe").and_then(Value::as_str)
-                .ok_or("process view row has no executable")?)?,
-            argv: crate::wire::BoundedVec::<_, 0, LIMIT_COMMAND_ITEMS>::new(argv)
-                .map_err(|error| format!("process argv exceeds relation bound: {error:?}"))?,
-            depth: u32::try_from(required_u64(row.get("depth"), "process depth")?)
-                .map_err(|_| "process view depth exceeds u32")?,
-            connector: row.get("connector").and_then(Value::as_bool)
-                .ok_or("process view row has no connector flag")?,
-        })
-    }).collect()
-}
-
-fn typed_output_rows(rows: Vec<Value>) -> Result<Vec<crate::generated_wire::ViewOutputRow>, String> {
-    use crate::generated_wire::{EchoStream, OutputRow, ViewOutputRow};
-    rows.into_iter().map(|row| {
-        let stream = match row.get("stream").and_then(Value::as_i64) {
-            Some(0) => EchoStream::Stdout,
-            Some(1) => EchoStream::Stderr,
-            Some(stream) => return Err(format!("unknown captured output stream {stream}")),
-            None => return Err("output view row has no stream".into()),
-        };
-        Ok(ViewOutputRow {
-            output: OutputRow {
-                id: required_u64(row.get("id"), "output row id")?,
-                time: row.get("ts").and_then(Value::as_f64)
-                    .ok_or("output view row has no timestamp")?,
-                process: optional_u64(row.get("process_id"), "output process id")?,
-                stream,
-                length: required_u64(row.get("len"), "output length")?,
-            },
-            executable: wire_path(row.get("exe").and_then(Value::as_str)
-                .ok_or("output view row has no executable")?)?,
-            tgid: optional_u32(row.get("tgid"), "output tgid")?.filter(|value| *value != 0),
-        })
-    }).collect()
-}
-
-fn typed_pipeline_stage(value: &Value) -> Result<crate::generated_wire::PipelineStage, String> {
-    use crate::generated_wire::{LIMIT_STAGE_ITEMS, PipelineStage};
-    match value.get("kind").and_then(Value::as_str) {
-        Some("simple") => {
-            let words = value.get("words").and_then(Value::as_array)
-                .ok_or("simple pipeline stage has no words")?
-                .iter().map(|word| {
-                    word.as_str().ok_or_else(|| "pipeline word is not text".into())
-                        .and_then(wire_os_string)
-                }).collect::<Result<Vec<_>, String>>()?;
-            Ok(PipelineStage::Simple {
-                words: crate::wire::BoundedVec::<_, 0, LIMIT_STAGE_ITEMS>::new(words)
-                    .map_err(|error| format!("pipeline words exceed relation bound: {error:?}"))?,
-                redirects: u32::try_from(required_u64(value.get("redirects"), "redirect count")?)
-                    .map_err(|_| "pipeline redirect count exceeds u32")?,
-            })
-        }
-        Some("compound") => Ok(PipelineStage::Compound {
-            redirects: u32::try_from(required_u64(value.get("redirects"), "redirect count")?)
-                .map_err(|_| "pipeline redirect count exceeds u32")?,
-            text: wire_text(value.get("text").and_then(Value::as_str)
-                .ok_or("compound pipeline stage has no text")?)?,
-        }),
-        Some("function") => Ok(PipelineStage::Function {
-            text: wire_text(value.get("text").and_then(Value::as_str)
-                .ok_or("function pipeline stage has no text")?)?,
-        }),
-        Some("extended_test") => Ok(PipelineStage::ExtendedTest {
-            text: wire_text(value.get("text").and_then(Value::as_str)
-                .ok_or("extended-test pipeline stage has no text")?)?,
-        }),
-        Some(kind) => Err(format!("unknown pipeline stage kind {kind:?}")),
-        None => Err("pipeline stage has no kind".into()),
-    }
-}
-
-fn typed_pipeline_provenance(value: &Value) -> Result<crate::generated_wire::PipelineProvenance, String> {
-    use crate::generated_wire::{LIMIT_COLLECTION_ITEMS, LIMIT_STAGE_ITEMS, PipelineProvenance};
-    let stages = value.get("stage_detail").and_then(Value::as_array)
-        .ok_or("pipeline record has no stage detail")?
-        .iter().map(typed_pipeline_stage).collect::<Result<Vec<_>, _>>()?;
-    let targets = value.get("out_targets").and_then(Value::as_array)
-        .ok_or("pipeline record has no output targets")?
-        .iter().map(|target| {
-            target.as_str().ok_or_else(|| "pipeline target is not text".into())
-                .and_then(wire_path)
-        }).collect::<Result<Vec<_>, String>>()?;
-    Ok(PipelineProvenance {
-        command: wire_text(value.get("cmd").and_then(Value::as_str)
-            .ok_or("pipeline record has no command")?)?,
-        negated: value.get("bang").and_then(Value::as_bool)
-            .ok_or("pipeline record has no negation flag")?,
-        stages: crate::wire::BoundedVec::<_, 1, LIMIT_STAGE_ITEMS>::new(stages)
-            .map_err(|error| format!("pipeline stages exceed relation bound: {error:?}"))?,
-        output_targets: crate::wire::BoundedVec::<_, 0, LIMIT_COLLECTION_ITEMS>::new(targets)
-            .map_err(|error| format!("pipeline targets exceed relation bound: {error:?}"))?,
-        uid: value.get("uid").and_then(Value::as_u64).unwrap_or(0),
-        parent_uid: value.get("parent_uid").and_then(Value::as_u64).unwrap_or(0),
-        sequence: value.get("seq").and_then(Value::as_u64).unwrap_or(0),
-        spawned_at: value.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0),
-        nested: value.get("nested").and_then(Value::as_bool).unwrap_or(false),
-        edge_output: value.get("edge_out").and_then(Value::as_str)
-            .map(wire_path).transpose()?,
+    let kind = match kind {
+        "changed" => ChangeKind::Changed,
+        "deleted" => ChangeKind::Deleted,
+        "symlink" => ChangeKind::Symlink,
+        "created" => ChangeKind::Created,
+        "modified" => ChangeKind::Modified,
+        "xattr" => ChangeKind::Xattr,
+        "dir" => ChangeKind::Directory,
+        "xattr-only" => ChangeKind::XattrOnly,
+        kind => return Err(format!("unknown change view kind {kind:?}")),
+    };
+    Ok(ViewChangeRow {
+        path: wire_path(path)?,
+        name: wire_os_string(name)?,
+        kind,
+        size: u64::try_from(size).map_err(|_| "change size is negative")?,
+        depth: u32::try_from(depth).map_err(|_| "change view depth exceeds u32")?,
+        connector,
+        xattr_for: xattr_for.map(wire_path).transpose()?,
+        xattr_key: xattr_key.map(wire_os_string).transpose()?,
     })
-}
-
-fn typed_pipeline_rows(rows: Vec<Value>) -> Result<Vec<crate::generated_wire::PipelineRow>, String> {
-    use crate::generated_wire::{LIMIT_COLLECTION_ITEMS, PipelineRow};
-    rows.into_iter().map(|row| {
-        let processes = row.get("processes").and_then(Value::as_array)
-            .ok_or("pipeline row has no process list")?
-            .iter().map(|value| required_u64(Some(value), "pipeline process id"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let done_at = row.get("done_ts").and_then(Value::as_f64).filter(|value| *value != 0.0);
-        let exit_code = row.get("exit_code").and_then(Value::as_i64).filter(|value| *value != -1)
-            .map(|value| i32::try_from(value).map_err(|_| "pipeline exit code exceeds i32"))
-            .transpose()?;
-        Ok(PipelineRow {
-            id: required_u64(row.get("id"), "pipeline row id")?,
-            time: row.get("ts").and_then(Value::as_f64)
-                .ok_or("pipeline row has no timestamp")?,
-            command: wire_text(row.get("cmd").and_then(Value::as_str)
-                .ok_or("pipeline row has no command")?)?,
-            record: row.get("record").filter(|value| !value.is_null())
-                .map(typed_pipeline_provenance).transpose()?,
-            pipeline: optional_u64(row.get("pipeline"), "pipeline sequence")?,
-            spawned_at: row.get("spawn_ts").and_then(Value::as_f64),
-            done_at,
-            nested: row.get("nested").and_then(Value::as_bool).unwrap_or(false),
-            uid: optional_u64(row.get("uid"), "pipeline uid")?.filter(|value| *value != 0),
-            parent_uid: optional_u64(row.get("parent_uid"), "pipeline parent uid")?
-                .filter(|value| *value != 0),
-            exit_code,
-            processes: crate::wire::BoundedVec::<_, 0, LIMIT_COLLECTION_ITEMS>::new(processes)
-                .map_err(|error| format!("pipeline process list exceeds relation bound: {error:?}"))?,
-        })
-    }).collect()
-}
-
-fn typed_build_edge_rows(rows: Vec<Value>) -> Result<Vec<crate::generated_wire::BuildEdgeRow>, String> {
-    use crate::generated_wire::{BuildEdgeRow, LIMIT_COLLECTION_ITEMS};
-    rows.into_iter().map(|row| {
-        let paths = |field: &str| -> Result<Vec<crate::generated_wire::Path>, String> {
-            row.get(field).and_then(Value::as_array)
-                .ok_or_else(|| format!("build edge has no {field} list"))?
-                .iter().map(|value| {
-                    value.as_str().ok_or_else(|| format!("build edge {field} is not text"))
-                        .and_then(wire_path)
-                }).collect()
-        };
-        let outputs = paths("outs")?;
-        let inputs = paths("ins")?;
-        Ok(BuildEdgeRow {
-            id: required_u64(row.get("id"), "build edge row id")?,
-            time: row.get("ts").and_then(Value::as_f64)
-                .ok_or("build edge has no timestamp")?,
-            outputs: crate::wire::BoundedVec::<_, 1, LIMIT_COLLECTION_ITEMS>::new(outputs)
-                .map_err(|error| format!("build edge outputs exceed relation bound: {error:?}"))?,
-            inputs: crate::wire::BoundedVec::<_, 0, LIMIT_COLLECTION_ITEMS>::new(inputs)
-                .map_err(|error| format!("build edge inputs exceed relation bound: {error:?}"))?,
-            command: row.get("cmd").and_then(Value::as_str).map(wire_text).transpose()?,
-            started_at: row.get("started_ts").and_then(Value::as_f64),
-            ended_at: row.get("ended_ts").and_then(Value::as_f64),
-            exit_code: row.get("exit_code").and_then(Value::as_i64)
-                .map(|value| i32::try_from(value).map_err(|_| "build edge exit code exceeds i32"))
-                .transpose()?,
-            output_excerpt: row.get("output_excerpt").and_then(Value::as_str)
-                .map(wire_text).transpose()?,
-        })
-    }).collect()
 }
 
 // ── filter parsing + application ────────────────────────────────────────────
@@ -859,24 +622,22 @@ pub fn open(
     let kind = Kind::from_wire(wire_kind);
     let (source, aux) = match kind {
         Kind::Changes => {
-            let (s, a) = source_changes(sid);
-            (ViewRows::Changes(typed_change_rows(s)?), ViewAux::Changes(a))
+            let (rows, ids) = source_changes(sid)?;
+            (ViewRows::Changes(rows), ViewAux::Changes(ids))
         }
         Kind::Procs => {
-            let (s, a) = source_procs(sid, procs_running_only);
-            (ViewRows::Processes(typed_process_rows(s)?), ViewAux::Procs(a))
+            let (rows, subjects) = source_procs(sid, procs_running_only)?;
+            (ViewRows::Processes(rows), ViewAux::Procs(subjects))
         }
         Kind::Outputs => {
-            let (s, a) = source_outputs(sid);
-            (ViewRows::Outputs(typed_output_rows(s)?), ViewAux::Outputs(a))
+            let (rows, subjects) = source_outputs(sid)?;
+            (ViewRows::Outputs(rows), ViewAux::Outputs(subjects))
         }
         Kind::Pipelines => {
-            let s = source_pipelines(sid);
-            (ViewRows::Pipelines(typed_pipeline_rows(s)?), ViewAux::Pipelines)
+            (ViewRows::Pipelines(source_pipelines(sid)?), ViewAux::Pipelines)
         }
         Kind::BuildEdges => {
-            let s = source_build_edges(sid);
-            (ViewRows::BuildEdges(typed_build_edge_rows(s)?), ViewAux::BuildEdges)
+            (ViewRows::BuildEdges(source_build_edges(sid)?), ViewAux::BuildEdges)
         }
     };
     let filter = relation_filter(filter.as_ref());
@@ -973,47 +734,85 @@ mod tests {
 
     #[test]
     fn every_view_row_family_materializes_into_its_closed_window_variant() {
-        let change = typed_change_rows(vec![json!({
-            "path": "src/main.rs", "name": "main.rs", "kind": "changed",
-            "size": 12, "depth": 1, "connector": false,
-        })]).unwrap();
+        let change = vec![view_change_row(
+            "src/main.rs", "main.rs", "changed", 12, 1, false, None, None,
+        ).unwrap()];
         assert_eq!(change[0].kind, ChangeKind::Changed);
 
-        let process = typed_process_rows(vec![json!({
-            "rid": 7, "tgid": 41, "ppid": 1, "exe": "/bin/sh",
-            "argv": ["sh", "-c", "true"], "depth": 0, "connector": false,
-        })]).unwrap();
+        let process = vec![crate::generated_wire::ViewProcessRow {
+            id: 7,
+            tgid: Some(41),
+            ppid: Some(1),
+            executable: wire_path("/bin/sh").unwrap(),
+            argv: crate::wire::BoundedVec::new(vec![
+                wire_os_string("sh").unwrap(),
+                wire_os_string("-c").unwrap(),
+                wire_os_string("true").unwrap(),
+            ]).unwrap(),
+            depth: 0,
+            connector: false,
+        }];
         assert_eq!(process[0].tgid, Some(41));
 
-        let output = typed_output_rows(vec![json!({
-            "id": 8, "ts": 1.25, "process_id": 7, "stream": 1, "len": 4,
-            "exe": "/bin/sh", "tgid": 41,
-        })]).unwrap();
+        let output = vec![crate::generated_wire::ViewOutputRow {
+            output: crate::generated_wire::OutputRow {
+                id: 8,
+                time: 1.25,
+                process: Some(7),
+                stream: EchoStream::Stderr,
+                length: 4,
+            },
+            executable: wire_path("/bin/sh").unwrap(),
+            tgid: Some(41),
+        }];
         assert_eq!(output[0].output.stream, EchoStream::Stderr);
 
-        let pipeline = typed_pipeline_rows(vec![json!({
-            "id": 9, "ts": 1.0, "cmd": "echo hi > out", "pipeline": 3,
-            "spawn_ts": 1.1, "nested": true, "uid": 12, "parent_uid": 4,
-            "done_ts": 1.2, "exit_code": 0, "processes": [7],
-            "record": {
-                "cmd": "echo hi > out", "bang": false, "stages": 1,
-                "stage_detail": [{
-                    "kind": "simple", "words": ["echo", "hi"], "redirects": 1
-                }],
-                "out_targets": ["out"], "uid": 12, "parent_uid": 4,
-                "seq": 3, "spawn_ts": 1.1, "nested": true,
-                "edge_out": "out"
-            }
-        })]).unwrap();
+        let pipeline = vec![crate::generated_wire::PipelineRow {
+            id: 9,
+            time: 1.0,
+            command: crate::wire::BoundedText::new("echo hi > out".into()).unwrap(),
+            record: Some(crate::generated_wire::PipelineProvenance {
+                command: crate::wire::BoundedText::new("echo hi > out".into()).unwrap(),
+                negated: false,
+                stages: crate::wire::BoundedVec::new(vec![PipelineStage::Simple {
+                    words: crate::wire::BoundedVec::new(vec![
+                        wire_os_string("echo").unwrap(), wire_os_string("hi").unwrap(),
+                    ]).unwrap(),
+                    redirects: 1,
+                }]).unwrap(),
+                output_targets: crate::wire::BoundedVec::new(vec![wire_path("out").unwrap()])
+                    .unwrap(),
+                uid: 12,
+                parent_uid: 4,
+                sequence: 3,
+                spawned_at: 1.1,
+                nested: true,
+                edge_output: Some(wire_path("out").unwrap()),
+            }),
+            pipeline: Some(3),
+            spawned_at: Some(1.1),
+            done_at: Some(1.2),
+            nested: true,
+            uid: Some(12),
+            parent_uid: Some(4),
+            exit_code: Some(0),
+            processes: crate::wire::BoundedVec::new(vec![7]).unwrap(),
+        }];
         let record = pipeline[0].record.as_ref().unwrap();
         assert!(matches!(record.stages.as_slice()[0], PipelineStage::Simple { .. }));
         assert_eq!(record.edge_output.as_ref().unwrap().as_slice(), b"out");
 
-        let edge = typed_build_edge_rows(vec![json!({
-            "id": 10, "ts": 2.0, "outs": ["out"], "ins": ["in"],
-            "cmd": "cc in -o out", "started_ts": 2.1, "ended_ts": 2.2,
-            "exit_code": 0, "output_excerpt": "ok",
-        })]).unwrap();
+        let edge = vec![crate::generated_wire::BuildEdgeRow {
+            id: 10,
+            time: 2.0,
+            outputs: crate::wire::BoundedVec::new(vec![wire_path("out").unwrap()]).unwrap(),
+            inputs: crate::wire::BoundedVec::new(vec![wire_path("in").unwrap()]).unwrap(),
+            command: Some(crate::wire::BoundedText::new("cc in -o out".into()).unwrap()),
+            started_at: Some(2.1),
+            ended_at: Some(2.2),
+            exit_code: Some(0),
+            output_excerpt: Some(crate::wire::BoundedText::new("ok".into()).unwrap()),
+        }];
         assert_eq!(edge[0].outputs.as_slice()[0].as_slice(), b"out");
 
         let families = [

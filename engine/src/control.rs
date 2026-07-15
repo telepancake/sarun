@@ -1421,6 +1421,55 @@ fn dispatch_action(
                 },
             })
         }
+        ActionRequest::Processes { sid } => {
+            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            if !discover::discover().contains_key(&id) {
+                return Err("no slopbox".into());
+            }
+            let rows = crate::wire::BoundedVec::new(discover::processes_typed(id)?)
+                .map_err(|error| format!("process rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::Processes { value: rows })
+        }
+        ActionRequest::ProcessesLive { sid } => {
+            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            let live = lock(state).box_runpids.contains_key(&id);
+            let value = if live {
+                Some(crate::wire::BoundedVec::new(discover::processes_typed(id)?)
+                    .map_err(|error| format!(
+                        "live process rows exceed relation bound: {error:?}"
+                    ))?)
+            } else {
+                None
+            };
+            Ok(ActionSuccess::ProcessesLive { value })
+        }
+        ActionRequest::Outputs { sid } => {
+            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            if !discover::discover().contains_key(&id) {
+                return Err("no slopbox".into());
+            }
+            let rows = crate::wire::BoundedVec::new(discover::outputs_typed(id)?)
+                .map_err(|error| format!("output rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::Outputs { value: rows })
+        }
+        ActionRequest::Brushprov { sid } => {
+            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            if !discover::discover().contains_key(&id) {
+                return Err("no slopbox".into());
+            }
+            let rows = crate::wire::BoundedVec::new(discover::brushprov_typed(id)?)
+                .map_err(|error| format!("pipeline rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::Brushprov { value: rows })
+        }
+        ActionRequest::BuildEdges { sid } => {
+            let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            if !discover::discover().contains_key(&id) {
+                return Err("no slopbox".into());
+            }
+            let rows = crate::wire::BoundedVec::new(discover::build_edges_typed(id)?)
+                .map_err(|error| format!("build edge rows exceed relation bound: {error:?}"))?;
+            Ok(ActionSuccess::BuildEdges { value: rows })
+        }
         ActionRequest::ViewOpen {
             kind,
             r#box,
@@ -1596,52 +1645,8 @@ fn legacy_bytes<const MAXIMUM: usize>(value: crate::wire::BoundedBytes<MAXIMUM>)
     String::from_utf8_lossy(value.as_slice()).into_owned()
 }
 
-fn legacy_pipeline_stage(stage: crate::generated_wire::PipelineStage) -> Value {
-    use crate::generated_wire::PipelineStage;
-    match stage {
-        PipelineStage::Simple { words, redirects } => json!({
-            "kind": "simple",
-            "words": words.into_inner().into_iter().map(legacy_bytes).collect::<Vec<_>>(),
-            "redirects": redirects,
-        }),
-        PipelineStage::Compound { redirects, text } => json!({
-            "kind": "compound",
-            "redirects": redirects,
-            "text": text.into_inner(),
-        }),
-        PipelineStage::Function { text } => json!({
-            "kind": "function",
-            "text": text.into_inner(),
-        }),
-        PipelineStage::ExtendedTest { text } => json!({
-            "kind": "extended_test",
-            "text": text.into_inner(),
-        }),
-    }
-}
-
 fn legacy_pipeline_provenance(record: crate::generated_wire::PipelineProvenance) -> Value {
-    let stage_count = record.stages.as_slice().len();
-    let mut value = json!({
-        "cmd": record.command.into_inner(),
-        "bang": record.negated,
-        "stages": stage_count,
-        "stage_detail": record.stages.into_inner().into_iter()
-            .map(legacy_pipeline_stage).collect::<Vec<_>>(),
-        "out_targets": record.output_targets.into_inner().into_iter()
-            .map(legacy_bytes).collect::<Vec<_>>(),
-        "uid": record.uid,
-        "parent_uid": record.parent_uid,
-        "seq": record.sequence,
-        "spawn_ts": record.spawned_at,
-    });
-    if record.nested {
-        value["nested"] = Value::Bool(true);
-    }
-    if let Some(edge) = record.edge_output {
-        value["edge_out"] = Value::String(legacy_bytes(edge));
-    }
-    value
+    crate::discover::pipeline_provenance_json(&record)
 }
 
 fn legacy_view_window(value: crate::generated_wire::ViewWindow) -> Value {
@@ -1764,6 +1769,22 @@ fn legacy_ui_action_reply(
         }
         Ok(ActionSuccess::ViewWindow { value }) => legacy_view_window(value),
         Ok(ActionSuccess::ViewClose { .. }) => json!({"ok": true}),
+        Ok(ActionSuccess::Processes { value }) => {
+            discover::process_rows_json(value.as_slice())
+        }
+        Ok(ActionSuccess::ProcessesLive { value }) => match value {
+            Some(rows) => discover::process_rows_json(rows.as_slice()),
+            None => Value::Null,
+        },
+        Ok(ActionSuccess::Outputs { value }) => {
+            discover::output_rows_json(value.as_slice())
+        }
+        Ok(ActionSuccess::Brushprov { value }) => {
+            discover::pipeline_rows_json(value.as_slice())
+        }
+        Ok(ActionSuccess::BuildEdges { value }) => {
+            discover::build_edge_rows_json(value.as_slice())
+        }
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -2959,15 +2980,21 @@ macro_rules! ui_verbs {
             }
             json!({"ok": true})
         }
-        "processes" => { match arg_sid(args) {
-            Some(id) => discover::processes(id),
-            None => json!([]),
+        "processes" => {
+            let Some(id) = arg_sid(args).and_then(|id| u64::try_from(id).ok()) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Processes { sid: id },
+            ));
         }
-        }
-        "outputs" => { match arg_sid(args) {
-            Some(id) => discover::outputs(id),
-            None => json!([]),
-        }
+        "outputs" => {
+            let Some(id) = arg_sid(args).and_then(|id| u64::try_from(id).ok()) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Outputs { sid: id },
+            ));
         }
         "api_log" => { match arg_sid(args) {
             Some(id) => discover::api_log(id),
@@ -2998,17 +3025,23 @@ macro_rules! ui_verbs {
             _ => Value::Null,
         }
         }
-        "brushprov" => { match arg_sid(args) {
-            Some(id) => discover::brushprov(id),
-            None => json!([]),
-        }
+        "brushprov" => {
+            let Some(id) = arg_sid(args).and_then(|id| u64::try_from(id).ok()) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::Brushprov { sid: id },
+            ));
         }
         // Phase 1 embedded-ninja: the parsed build-graph edges (outs/ins/cmd),
         // including up-to-date targets that never executed.
-        "build_edges" => { match arg_sid(args) {
-            Some(id) => discover::build_edges(id),
-            None => json!([]),
-        }
+        "build_edges" => {
+            let Some(id) = arg_sid(args).and_then(|id| u64::try_from(id).ok()) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::BuildEdges { sid: id },
+            ));
         }
         // D9 brush↔process linkage joins (both directions).
         "proc_pipeline" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
@@ -3039,12 +3072,12 @@ macro_rules! ui_verbs {
             // includes already-exited rows too — but the prototype's
             // strict-active behavior would need engine-level exit
             // detection (a separate ticket).
-            let live_sids: std::collections::HashSet<i64> =
-                lock(state).box_runpids.keys().copied().collect();
-            match arg_sid(args) {
-                Some(id) if live_sids.contains(&id) => discover::processes(id),
-                _ => Value::Null,
-            }
+            let Some(id) = arg_sid(args).and_then(|id| u64::try_from(id).ok()) else {
+                return json!({"ok": false, "error": "missing or invalid box id"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::ProcessesLive { sid: id },
+            ));
         }
         "proc_info" => { match (arg_sid(args), args.get(1).and_then(Value::as_i64)) {
             (Some(id), Some(rid)) => discover::proc_info(id, rid),

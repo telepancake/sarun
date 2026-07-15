@@ -668,6 +668,16 @@ belong to the relation.
   fixed lost xattr keys in xattr-only view rows. The aarch64-musl suite now
   passes 300 tests with one ignored; all pure relation and generated-code
   consistency checks pass.
+- Removed `serde_json::Value` from the materialized view implementation
+  completely. Change/process/output/pipeline/build-edge database readers now
+  decode once into the generated relation types; process ancestry uses typed
+  `ProcessInfo`, and only the explicit still-active JSON listener projection
+  renders those values back to the old UI spelling. Moved `processes`,
+  `processes_live`, `outputs`, `brushprov`, and `build_edges` execution onto
+  generated request/success variants and deleted their former JSON-producing
+  database functions. Nested stored pipeline JSON is normalized at its durable
+  representation boundary and has focused old/current record tests. The
+  aarch64-musl suite passes 302 tests with one ignored.
 
 ## Stop conditions
 
