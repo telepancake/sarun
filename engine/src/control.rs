@@ -1956,6 +1956,149 @@ fn dispatch_action(
                 .map_err(|error| format!("{error:#}"))?;
             Ok(ActionSuccess::OciBuild { value })
         }
+        ActionRequest::RoAttach { r#box, attachments } => {
+            use crate::generated_wire::ReadonlyAttachment;
+            let overlay = lock(state).overlay.clone().ok_or("no overlay")?;
+            let sid = i64::try_from(r#box).map_err(|_| "box id exceeds engine range")?;
+            let owner = hydrate_box(&overlay, sid).ok_or("no such box")?;
+            let mut rows = Vec::with_capacity(attachments.as_slice().len());
+            for attachment in attachments.into_inner() {
+                match attachment {
+                    ReadonlyAttachment::Box { r#box } => {
+                        let attached = i64::try_from(r#box)
+                            .map_err(|_| "attached box id exceeds engine range")?;
+                        if attached == sid {
+                            return Err("cannot attach self".into());
+                        }
+                        if overlay.box_of(attached).is_none() {
+                            let db = crate::paths::state_home().join(format!("{attached}.sqlar"));
+                            if !db.exists() {
+                                return Err(format!("no box {attached}"));
+                            }
+                            let state = crate::capture::BoxState::create(attached)
+                                .map_err(|error| error.to_string())?;
+                            state.load_mirror();
+                            overlay.add_box(std::sync::Arc::new(state));
+                        }
+                        rows.push(crate::capture::RoAttachment::Box(attached));
+                    }
+                    ReadonlyAttachment::External { reference } => {
+                        let store = std::str::from_utf8(reference.store.as_slice())
+                            .map_err(|_| "the attachment store path is not UTF-8")?;
+                        let prefix = action_relative_path(&reference.prefix)?;
+                        rows.push(crate::capture::RoAttachment::Ext(crate::capture::ExtRef {
+                            kind: reference.kind.into_inner(),
+                            store: store.to_owned(),
+                            refname: reference.reference.into_inner(),
+                            rev: reference.revision.into_inner(),
+                            prefix: prefix.to_owned(),
+                            name: reference.name.into_inner(),
+                        }));
+                    }
+                }
+            }
+            owner.set_ro_attachments(rows);
+            overlay.invalidate_ext(sid);
+            Ok(ActionSuccess::RoAttach { value: () })
+        }
+        ActionRequest::WikiAttach { sid, root, page, prefix } => {
+            let overlay = lock(state).overlay.clone().ok_or("no overlay")?;
+            let sid = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            let owner = hydrate_box(&overlay, sid).ok_or("no such box")?;
+            let root = std::str::from_utf8(root.as_slice())
+                .map_err(|_| "the wiki root path is not UTF-8")?;
+            let prefix = prefix.as_ref().map(action_relative_path)
+                .transpose()?.unwrap_or("");
+            let instance = open_wiki_instance(root)?;
+            let (page_id, resolved_title) = match page.as_str().parse::<u64>() {
+                Ok(id) => (id, None),
+                Err(_) => match instance.page_by_title(page.as_str()).map_err(|e| e.to_string())? {
+                    (Some(id), hits) => {
+                        let title = hits.into_iter().find(|(candidate, _)| *candidate == id)
+                            .map(|(_, title)| title);
+                        (id, title)
+                    }
+                    (None, hits) if hits.is_empty() => {
+                        return Err(format!("no page titled {:?}", page.as_str()));
+                    }
+                    (None, hits) => {
+                        let candidates = hits.into_iter().map(|(id, title)| format!(
+                            "{title} ({id})")).collect::<Vec<_>>();
+                        return Err(format!("title {:?} is ambiguous: {}",
+                            page.as_str(), candidates.join(", ")));
+                    }
+                },
+            };
+            let title = match resolved_title {
+                Some(title) => title,
+                None => instance.page_current_title(page_id).map_err(|e| e.to_string())?
+                    .unwrap_or_else(|| format!("page-{page_id}")),
+            };
+            let head = instance.page_head(page_id).map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("no page {page_id}"))?;
+            let wiki = std::path::Path::new(root).file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "wiki".into());
+            let name = format!("wiki:{wiki}/{title}@r{}", head.rev_id);
+            let value = crate::generated_wire::WikiAttachmentResult {
+                name: crate::wire::BoundedText::new(name.clone())
+                    .map_err(|error| format!("wiki attachment name exceeds relation bound: {error:?}"))?,
+                page: page_id,
+                title: crate::wire::BoundedText::new(title.clone())
+                    .map_err(|error| format!("wiki title exceeds relation bound: {error:?}"))?,
+                revision: head.rev_id,
+            };
+            let mut rows = owner.ro_attachment_list();
+            rows.push(crate::capture::RoAttachment::Ext(crate::capture::ExtRef {
+                kind: "wiki".into(),
+                store: root.to_owned(),
+                refname: page_id.to_string(),
+                rev: head.rev_id.to_string(),
+                prefix: prefix.to_owned(),
+                name: name.clone(),
+            }));
+            owner.set_ro_attachments(rows);
+            overlay.invalidate_ext(sid);
+            Ok(ActionSuccess::WikiAttach { value })
+        }
+        ActionRequest::IetfAttach { sid, root, draft, prefix } => {
+            let overlay = lock(state).overlay.clone().ok_or("no overlay")?;
+            let sid = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+            let owner = hydrate_box(&overlay, sid).ok_or("no such box")?;
+            let root = std::str::from_utf8(root.as_slice())
+                .map_err(|_| "the IETF root path is not UTF-8")?;
+            let prefix = prefix.as_ref().map(action_relative_path)
+                .transpose()?.unwrap_or("");
+            let mirror = ietf_mirror::Mirror::open_read(
+                ietf_mirror::MirrorConfig::new(root.into()))
+                .map_err(|error| error.to_string())?;
+            let head_revision = mirror.head(draft.as_str())
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("no draft {}", draft.as_str()))?.rev;
+            let name = format!("ietf:{}@{head_revision}", draft.as_str());
+            let value = crate::generated_wire::IetfAttachmentResult {
+                name: crate::wire::BoundedText::new(name.clone())
+                    .map_err(|error| format!("IETF attachment name exceeds relation bound: {error:?}"))?,
+                revision: crate::wire::BoundedText::new(head_revision.clone())
+                    .map_err(|error| format!("IETF revision exceeds relation bound: {error:?}"))?,
+            };
+            let mut rows = owner.ro_attachment_list();
+            rows.push(crate::capture::RoAttachment::Ext(crate::capture::ExtRef {
+                kind: "ietf".into(),
+                store: root.to_owned(),
+                refname: draft.as_str().to_owned(),
+                rev: head_revision.clone(),
+                prefix: prefix.to_owned(),
+                name: name.clone(),
+            }));
+            owner.set_ro_attachments(rows);
+            overlay.invalidate_ext(sid);
+            Ok(ActionSuccess::IetfAttach { value })
+        }
+        ActionRequest::GitCheckout { sid, store, r#ref, dest, subpath } => {
+            let value = git_checkout_typed(state, sid, store, r#ref, dest, subpath)?;
+            Ok(ActionSuccess::GitCheckout { value })
+        }
         ActionRequest::MirrorJobs => {
             let value = crate::wire::BoundedVec::new(crate::mirrors::jobs_list_typed()?)
                 .map_err(|error| format!("mirror jobs exceed relation bound: {error:?}"))?;
@@ -2179,6 +2322,14 @@ fn legacy_filter_spec(value: &Value) -> Result<Option<crate::generated_wire::Fil
 
 fn legacy_bytes<const MAXIMUM: usize>(value: crate::wire::BoundedBytes<MAXIMUM>) -> String {
     String::from_utf8_lossy(value.as_slice()).into_owned()
+}
+
+fn legacy_bounded_text<const MAXIMUM: usize>(
+    value: String,
+    field: &str,
+) -> Result<crate::wire::BoundedText<MAXIMUM>, String> {
+    crate::wire::BoundedText::new(value)
+        .map_err(|_| format!("{field} exceeds relation bound"))
 }
 
 fn legacy_pipeline_provenance(record: crate::generated_wire::PipelineProvenance) -> Value {
@@ -2587,6 +2738,25 @@ fn legacy_ui_action_reply(
             "code": value.code,
             "log": value.log.into_inner(),
             "top_id": value.top,
+        }),
+        Ok(ActionSuccess::RoAttach { .. }) => json!({"ok": true}),
+        Ok(ActionSuccess::WikiAttach { value }) => json!({
+            "ok": true,
+            "name": value.name.into_inner(),
+            "page": value.page,
+            "title": value.title.into_inner(),
+            "rev": value.revision,
+        }),
+        Ok(ActionSuccess::IetfAttach { value }) => json!({
+            "ok": true,
+            "name": value.name.into_inner(),
+            "rev": value.revision.into_inner(),
+        }),
+        Ok(ActionSuccess::GitCheckout { value }) => json!({
+            "ok": true,
+            "sha": value.revision.into_inner(),
+            "files": value.files,
+            "bytes": value.bytes,
         }),
         Ok(ActionSuccess::MirrorJobs { value }) => Value::Array(value.into_inner()
             .into_iter().map(|job| json!({
@@ -4243,58 +4413,53 @@ macro_rules! ui_verbs {
         // sqlar if not already live; an ext row opens lazily at first
         // use.
         "ro_attach" => {
-            let ov = lock(state).overlay.clone();
-            let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
-                return json!({"ok": false, "error": "no overlay / bad sid"});
+            let Some(r#box) = legacy_u64(args, 0) else {
+                return json!({"ok": false, "error": "bad box id"});
             };
-            // Hydrate an at-rest owner (same as the kind-specific attach
-            // verbs): the list persists in meta, so attaching between
-            // runs must work.
-            let Some(b) = hydrate_box(&ov, sid) else {
-                return json!({"ok": false, "error": "no such box"});
-            };
-            let mut ids = Vec::new();
+            let mut attachments = Vec::new();
             for v in args.iter().skip(1) {
-                let Some(ro) = v.as_i64() else {
+                let Some(attached) = v.as_u64() else {
                     // Object row: an external reference. Parse strictly —
                     // a malformed row must fail the verb, not skip.
-                    match serde_json::from_value::<crate::capture::ExtRef>(
-                        v.clone())
-                    {
-                        Ok(e) => {
-                            ids.push(crate::capture::RoAttachment::Ext(e));
-                            continue;
-                        }
-                        Err(e) => return json!({"ok": false,
-                            "error": format!("bad attachment row: {e}")}),
-                    }
+                    let external = match serde_json::from_value::<crate::capture::ExtRef>(v.clone()) {
+                        Ok(value) => value,
+                        Err(error) => return json!({"ok": false,
+                            "error": format!("bad attachment row: {error}")}),
+                    };
+                    let reference: Result<crate::generated_wire::ExternalReference, String> =
+                        (|| Ok(crate::generated_wire::ExternalReference {
+                        kind: legacy_bounded_text(external.kind, "attachment kind")?,
+                        store: crate::wire::BoundedBytes::new(external.store.into_bytes())
+                            .map_err(|_| "attachment store exceeds relation bound".to_owned())?,
+                        reference: legacy_bounded_text(
+                            external.refname, "attachment reference")?,
+                        revision: legacy_bounded_text(
+                            external.rev, "attachment revision")?,
+                        prefix: crate::wire::BoundedBytes::new(external.prefix.into_bytes())
+                            .map_err(|_| "attachment prefix exceeds relation bound".to_owned())?,
+                        name: legacy_bounded_text(external.name, "attachment name")?,
+                        }))();
+                    let reference = match reference {
+                        Ok(value) => value,
+                        Err(error) => return json!({"ok": false, "error": error}),
+                    };
+                    attachments.push(crate::generated_wire::ReadonlyAttachment::External {
+                        reference,
+                    });
+                    continue;
                 };
-                if ro == sid {
-                    return json!({"ok": false, "error": "cannot attach self"});
-                }
-                if ov.box_of(ro).is_none() {
-                    // Hydrate the at-rest box: open its sqlar, load the
-                    // mirror, register it (never run — reference only).
-                    let db = crate::paths::state_home()
-                        .join(format!("{ro}.sqlar"));
-                    if !db.exists() {
-                        return json!({"ok": false,
-                                      "error": format!("no box {ro}")});
-                    }
-                    match crate::capture::BoxState::create(ro) {
-                        Ok(rb) => {
-                            rb.load_mirror();
-                            ov.add_box(std::sync::Arc::new(rb));
-                        }
-                        Err(e) => return json!({"ok": false,
-                                                "error": e.to_string()}),
-                    }
-                }
-                ids.push(crate::capture::RoAttachment::Box(ro));
+                attachments.push(crate::generated_wire::ReadonlyAttachment::Box {
+                    r#box: attached,
+                });
             }
-            b.set_ro_attachments(ids);
-            ov.invalidate_ext(sid);
-            json!({"ok": true})
+            let Ok(attachments) = crate::wire::BoundedVec::new(attachments) else {
+                return json!({"ok": false, "error": "too many attachments"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::RoAttach {
+                    r#box, attachments,
+                },
+            ));
         }
         // Check a commit out of a gitdepot mirror store INTO the box's
         // changes: resolve ref→sha from meta.sqlite, then STREAM the
@@ -4306,114 +4471,40 @@ macro_rules! ui_verbs {
         // [sid, store_path, refname, dest?, subpath?] — dest prefixes the
         // written paths (checkout into a subdirectory of the box).
         "git_checkout" => {
-            use crate::depot::BoxDepot as _;
-            let ov = lock(state).overlay.clone();
-            let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
-                return json!({"ok": false, "error": "no overlay / bad sid"});
-            };
-            let Some(b) = hydrate_box(&ov, sid) else {
-                return json!({"ok": false, "error": "no such box"});
-            };
-            let (Some(store), Some(refname)) = (
+            let (Some(sid), Some(store), Some(reference)) = (
+                legacy_u64(args, 0),
                 args.get(1).and_then(Value::as_str),
                 args.get(2).and_then(Value::as_str),
             ) else {
                 return json!({"ok": false, "error": "need store path + ref"});
             };
-            let dest = args.get(3).and_then(Value::as_str).unwrap_or("")
-                .trim_matches('/').to_string();
-            let subpath = args.get(4).and_then(Value::as_str).unwrap_or("")
-                .trim_matches('/').to_string();
-            let store_path = std::path::Path::new(store);
-            // REF may be a ref name ("main" matches "refs/heads/main") or a
-            // unique commit-sha prefix — ANY commit in the chain, not just
-            // the tips (gitdepot::resolve_ref owns the semantics).
-            // A commit checks out its own tree (revision resolved by SHA —
-            // tag-tree revisions interleave with commits, so the COMMITS
-            // index is not the revision); a tag-at-tree ref pins the TAG
-            // object's sha and checks out the tagged tree's revision.
-            let resolved = match gitdepot::resolve_ref(store_path, refname) {
-                Ok(Some(r)) => r,
-                Ok(None) => return json!({"ok": false, "error":
-                    format!("no ref or commit {refname} in store")}),
-                Err(gitdepot::Error::Meta(msg)) =>
-                    return json!({"ok": false, "error": msg}),
-                Err(e) => return json!({"ok": false,
-                                        "error": format!("store: {e}")}),
+            let Ok(store) = crate::wire::BoundedBytes::new(store.as_bytes().to_vec()) else {
+                return json!({"ok": false, "error": "git store exceeds relation bound"});
             };
-            let ls = match gitdepot::store::Store::open(store_path)
-                .and_then(|st| st.union())
-            {
-                Ok(ls) => ls,
-                Err(e) => return json!({"ok": false,
-                                        "error": format!("store: {e}")}),
+            let Ok(reference) = crate::wire::BoundedText::new(reference.to_owned()) else {
+                return json!({"ok": false, "error": "git reference exceeds relation bound"});
             };
-            let (sha, rev) = match resolved {
-                gitdepot::Resolved::Commit { sha, .. } => match ls.rev_of(&sha) {
-                    Some(rev) => (sha, rev),
-                    None => return json!({"ok": false, "error":
-                        format!("commit {sha} not in the union store")}),
-                },
-                gitdepot::Resolved::TreeTag { tag_sha, tree_idx } =>
-                    (tag_sha, tree_idx),
-            };
-            let mut files = 0u64;
-            let mut bytes = 0u64;
-            // Ancestor DIRECTORY rows: the mount traverses real dir rows,
-            // so each intermediate directory lands once, like mkdir -p.
-            let mut dirs_done = std::collections::HashSet::new();
-            let ensure_dirs = |b: &crate::capture::BoxState, path: &str,
-                                   dirs_done: &mut std::collections::HashSet<String>| {
-                let mut at = 0usize;
-                while let Some(i) = path[at..].find('/') {
-                    let d = &path[..at + i];
-                    if dirs_done.insert(d.to_string()) {
-                        b.set_dir(d, 0o040755, 0);
-                    }
-                    at += i + 1;
-                }
-            };
-            let res = ls.checkout_entries_at(rev, subpath.as_bytes(), &mut |rel, mode, content| {
-                let rel_s = String::from_utf8_lossy(rel);
-                let path = if dest.is_empty() {
-                    rel_s.into_owned()
-                } else {
-                    format!("{dest}/{rel_s}")
+            let bounded_path = |index: usize, field: &str| -> Result<_, Value> {
+                let Some(path) = args.get(index).and_then(Value::as_str) else {
+                    return Ok(None);
                 };
-                ensure_dirs(&b, &path, &mut dirs_done);
-                use gitdepot::layer::Mode;
-                match mode {
-                    Mode::Symlink => {
-                        let target = String::from_utf8_lossy(content).into_owned();
-                        b.set_symlink(&path, std::path::Path::new(&target), 0);
-                    }
-                    Mode::Gitlink => {} // a submodule pointer has no content here
-                    m => {
-                        let full_mode = match m {
-                            Mode::File => 0o100644,
-                            Mode::Exec => 0o100755,
-                            Mode::Other(x) => x,
-                            _ => 0o100644,
-                        };
-                        let rid = b.ensure_file_row(&path, full_mode, 0);
-                        let bp = crate::depot::blob_path(sid, rid);
-                        if let Some(dir) = bp.parent() {
-                            let _ = std::fs::create_dir_all(dir);
-                        }
-                        std::fs::write(&bp, content).map_err(|e| gitdepot::Error::Chain(
-                            format!("write {}: {e}", bp.display())))?;
-                        b.finalize_file(&path, content.len() as i64, 0, 0);
-                        files += 1;
-                        bytes += content.len() as u64;
-                    }
-                }
-                Ok(())
-            });
-            if let Err(e) = res {
-                return json!({"ok": false, "error": format!("checkout: {e}")});
-            }
-            b.load_mirror();
-            json!({"ok": true, "sha": sha, "files": files, "bytes": bytes})
+                crate::wire::BoundedBytes::new(path.as_bytes().to_vec())
+                    .map(Some).map_err(|_| json!({"ok": false,
+                        "error": format!("git {field} exceeds relation bound")}))
+            };
+            let dest = match bounded_path(3, "destination") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let subpath = match bounded_path(4, "subpath") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::GitCheckout {
+                    sid, store, r#ref: reference, dest, subpath,
+                },
+            ));
         }
         // Attach a wikipedia mirror page (wikimak instance root) as an
         // external RO reference: args [sid, root, page_id, prefix?].
@@ -4422,92 +4513,39 @@ macro_rules! ui_verbs {
         // revision as <title>.txt under prefix at first read
         // (attach.rs), even after later imports move the head.
         "wiki_attach" => {
-            let ov = lock(state).overlay.clone();
-            let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
-                return json!({"ok": false, "error": "no overlay / bad sid"});
-            };
-            let Some(b) = hydrate_box(&ov, sid) else {
-                return json!({"ok": false, "error": "no such box"});
-            };
-            let Some(root) = args.get(1).and_then(Value::as_str) else {
+            let (Some(sid), Some(root)) = (
+                legacy_u64(args, 0),
+                args.get(1).and_then(Value::as_str),
+            ) else {
                 return json!({"ok": false, "error": "need root + page"});
             };
-            let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
-            // Read-side open (shared flock, dropped at scope end): the
-            // pin must be attachable while another attachment is
-            // hydrated — and never block an import running elsewhere.
-            let inst = match open_wiki_instance(root) {
-                Ok(i) => i,
-                Err(e) => return json!({"ok": false, "error": e}),
-            };
-            // PAGE is a numeric id or a title (exact, else unique
-            // case-insensitive substring) — titles are the UI, ids are
-            // the plumbing.
-            let (page, title) = match args.get(2) {
-                Some(Value::Number(n)) if n.as_u64().is_some() => {
-                    (n.as_u64().unwrap(), None)
+            let page = match args.get(2) {
+                Some(Value::Number(value)) if value.as_u64().is_some() => {
+                    value.as_u64().unwrap().to_string()
                 }
-                Some(Value::String(s)) => match s.parse::<u64>() {
-                    Ok(n) => (n, None),
-                    Err(_) => match inst.page_by_title(s) {
-                        Ok((Some(id), hits)) => {
-                            let t = hits.into_iter()
-                                .find(|(i, _)| *i == id).map(|(_, t)| t);
-                            (id, t)
-                        }
-                        Ok((None, hits)) if hits.is_empty() =>
-                            return json!({"ok": false,
-                                "error": format!("no page titled {s:?}")}),
-                        Ok((None, hits)) => {
-                            let cands: Vec<String> = hits.into_iter()
-                                .map(|(i, t)| format!("{t} ({i})")).collect();
-                            return json!({"ok": false, "error": format!(
-                                "title {s:?} is ambiguous: {}",
-                                cands.join(", "))});
-                        }
-                        Err(e) => return json!({"ok": false,
-                                                "error": e.to_string()}),
-                    },
-                },
+                Some(Value::String(value)) => value.clone(),
                 _ => return json!({"ok": false, "error": "need root + page"}),
             };
-            let title = match title {
-                Some(t) => t,
-                // Attached by id: recover the title for the name via
-                // the indexed dictionary hop (open interval →
-                // title_id_to_page) — never a pool-wide listing.
-                None => inst.page_current_title(page).ok().flatten()
-                    .unwrap_or_else(|| format!("page-{page}")),
+            let Ok(root) = crate::wire::BoundedBytes::new(root.as_bytes().to_vec()) else {
+                return json!({"ok": false, "error": "wiki root exceeds relation bound"});
             };
-            // page_head decodes ONE frame for the rev PIN — never a
-            // full history walk; the pinned decode happens readout-side
-            // at first read.
-            let head = match inst.page_head(page) {
-                Ok(Some(h)) => h,
-                Ok(None) => return json!({"ok": false,
-                                          "error": format!("no page {page}")}),
-                Err(e) => return json!({"ok": false, "error": e.to_string()}),
+            let Ok(page) = crate::wire::BoundedText::new(page) else {
+                return json!({"ok": false, "error": "wiki page exceeds relation bound"});
             };
-            // WHICH wiki: the instance root's directory name.
-            let wiki = std::path::Path::new(root).file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "wiki".into());
-            // attach.rs recovers the title from this exact shape
-            // (strip "wiki:", drop the wiki label at the first '/',
-            // rsplit the '@rN' pin) — keep the three in lockstep.
-            let name = format!("wiki:{wiki}/{title}@r{}", head.rev_id);
-            let mut rows = b.ro_attachment_list();
-            rows.push(crate::capture::RoAttachment::Ext(
-                crate::capture::ExtRef {
-                    kind: "wiki".into(), store: root.to_string(),
-                    refname: page.to_string(),
-                    rev: head.rev_id.to_string(),
-                    prefix: prefix.to_string(), name: name.clone(),
-                }));
-            b.set_ro_attachments(rows);
-            ov.invalidate_ext(sid);
-            json!({"ok": true, "name": name, "page": page,
-                   "title": title, "rev": head.rev_id})
+            let prefix = match args.get(3).and_then(Value::as_str) {
+                None => None,
+                Some(prefix) => match crate::wire::BoundedBytes::new(
+                    prefix.as_bytes().to_vec()) {
+                    Ok(prefix) => Some(prefix),
+                    Err(_) => return json!({"ok": false,
+                        "error": "wiki prefix exceeds relation bound"}),
+                },
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::WikiAttach {
+                    sid, root, page, prefix,
+                },
+            ));
         }
         // Attach an IETF draft (ietf-mirror root) as an external RO
         // reference: args [sid, root, draft, prefix?]. Bookkeeping only
@@ -4516,47 +4554,33 @@ macro_rules! ui_verbs {
         // first read (attach.rs), even after later updates move the
         // head.
         "ietf_attach" => {
-            let ov = lock(state).overlay.clone();
-            let (Some(ov), Some(sid)) = (ov, arg_sid(args)) else {
-                return json!({"ok": false, "error": "no overlay / bad sid"});
-            };
-            let Some(b) = hydrate_box(&ov, sid) else {
-                return json!({"ok": false, "error": "no such box"});
-            };
-            let (Some(root), Some(draft)) = (
+            let (Some(sid), Some(root), Some(draft)) = (
+                legacy_u64(args, 0),
                 args.get(1).and_then(Value::as_str),
                 args.get(2).and_then(Value::as_str),
             ) else {
                 return json!({"ok": false, "error": "need root + draft"});
             };
-            let prefix = args.get(3).and_then(Value::as_str).unwrap_or("");
-            // Read-side open (shared flock, dropped at scope end): the
-            // pin must be attachable while an update runs elsewhere.
-            let m = match ietf_mirror::Mirror::open_read(
-                ietf_mirror::MirrorConfig::new(root.into())) {
-                Ok(m) => m,
-                Err(e) => return json!({"ok": false, "error": e.to_string()}),
+            let Ok(root) = crate::wire::BoundedBytes::new(root.as_bytes().to_vec()) else {
+                return json!({"ok": false, "error": "IETF root exceeds relation bound"});
             };
-            // head() decodes ONE layer for the rev pin — never a full
-            // history walk; the pinned decode happens readout-side at
-            // first read.
-            let head_rev = match m.head(draft) {
-                Ok(Some(h)) => h.rev,
-                Ok(None) => return json!({"ok": false,
-                                          "error": format!("no draft {draft}")}),
-                Err(e) => return json!({"ok": false, "error": e.to_string()}),
+            let Ok(draft) = crate::wire::BoundedText::new(draft.to_owned()) else {
+                return json!({"ok": false, "error": "IETF draft exceeds relation bound"});
             };
-            let name = format!("ietf:{draft}@{head_rev}");
-            let mut rows = b.ro_attachment_list();
-            rows.push(crate::capture::RoAttachment::Ext(
-                crate::capture::ExtRef {
-                    kind: "ietf".into(), store: root.to_string(),
-                    refname: draft.to_string(), rev: head_rev.clone(),
-                    prefix: prefix.to_string(), name: name.clone(),
-                }));
-            b.set_ro_attachments(rows);
-            ov.invalidate_ext(sid);
-            json!({"ok": true, "name": name, "rev": head_rev})
+            let prefix = match args.get(3).and_then(Value::as_str) {
+                None => None,
+                Some(prefix) => match crate::wire::BoundedBytes::new(
+                    prefix.as_bytes().to_vec()) {
+                    Ok(prefix) => Some(prefix),
+                    Err(_) => return json!({"ok": false,
+                        "error": "IETF prefix exceeds relation bound"}),
+                },
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::IetfAttach {
+                    sid, root, draft, prefix,
+                },
+            ));
         }
         // Mirror-update jobs (mirrors.rs): the schedule surface.
         "mirror_jobs" => {
@@ -6126,6 +6150,114 @@ fn hydrate_box(
         ov.add_box(std::sync::Arc::new(tb));
     }
     ov.box_of(sid)
+}
+
+fn git_checkout_typed(
+    state: &State,
+    sid: u64,
+    store: crate::generated_wire::Path,
+    reference: crate::wire::BoundedText<{ crate::generated_wire::LIMIT_TEXT_BYTES }>,
+    dest: Option<crate::generated_wire::Path>,
+    subpath: Option<crate::generated_wire::Path>,
+) -> Result<crate::generated_wire::CheckoutResult, String> {
+    use crate::depot::BoxDepot as _;
+    let overlay = lock(state).overlay.clone().ok_or("no overlay")?;
+    let sid = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
+    let owner = hydrate_box(&overlay, sid).ok_or("no such box")?;
+    if store.as_slice().contains(&0) {
+        return Err("git store path contains NUL".into());
+    }
+    let store = std::str::from_utf8(store.as_slice())
+        .map_err(|_| "the git store path is not UTF-8")?;
+    let dest = dest.as_ref().map(action_relative_path).transpose()?.unwrap_or("")
+        .trim_end_matches('/');
+    let subpath = subpath.as_ref().map(action_relative_path).transpose()?.unwrap_or("")
+        .trim_end_matches('/');
+    let store_path = std::path::Path::new(store);
+    let resolved = match gitdepot::resolve_ref(store_path, reference.as_str()) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return Err(format!("no ref or commit {} in store", reference.as_str())),
+        Err(gitdepot::Error::Meta(message)) => return Err(message),
+        Err(error) => return Err(format!("store: {error}")),
+    };
+    let layers = gitdepot::store::Store::open(store_path)
+        .and_then(|store| store.union()).map_err(|error| format!("store: {error}"))?;
+    let (sha, revision) = match resolved {
+        gitdepot::Resolved::Commit { sha, .. } => {
+            let revision = layers.rev_of(&sha)
+                .ok_or_else(|| format!("commit {sha} not in the union store"))?;
+            (sha, revision)
+        }
+        gitdepot::Resolved::TreeTag { tag_sha, tree_idx } => (tag_sha, tree_idx),
+    };
+    let revision_name = crate::wire::BoundedText::new(sha)
+        .map_err(|error| format!("git revision exceeds relation bound: {error:?}"))?;
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut directories = std::collections::HashSet::new();
+    let ensure_directories = |path: &str,
+                              directories: &mut std::collections::HashSet<String>| {
+        let mut at = 0usize;
+        while let Some(index) = path[at..].find('/') {
+            let directory = &path[..at + index];
+            if directories.insert(directory.to_owned()) {
+                owner.set_dir(directory, 0o040755, 0);
+            }
+            at += index + 1;
+        }
+    };
+    layers.checkout_entries_at(revision, subpath.as_bytes(), &mut |rel, mode, content| {
+        let rel = std::str::from_utf8(rel).map_err(|_| gitdepot::Error::Chain(
+            "checkout path cannot be represented by the current UTF-8 overlay index".into()))?;
+        if rel.contains('\0') || rel.starts_with('/') || std::path::Path::new(rel)
+            .components().any(|component| matches!(component,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)))
+        {
+            return Err(gitdepot::Error::Chain(format!("unsafe checkout path {rel:?}")));
+        }
+        let path = if dest.is_empty() { rel.to_owned() } else { format!("{dest}/{rel}") };
+        ensure_directories(&path, &mut directories);
+        use gitdepot::layer::Mode;
+        match mode {
+            Mode::Symlink => {
+                let target = std::str::from_utf8(content).map_err(|_| gitdepot::Error::Chain(
+                    format!("symlink target for {path:?} is not UTF-8")))?;
+                owner.set_symlink(&path, std::path::Path::new(target), 0);
+            }
+            Mode::Gitlink => {}
+            mode => {
+                let full_mode = match mode {
+                    Mode::File => 0o100644,
+                    Mode::Exec => 0o100755,
+                    Mode::Other(value) => value,
+                    _ => 0o100644,
+                };
+                let row = owner.ensure_file_row(&path, full_mode, 0);
+                let blob = crate::depot::blob_path(sid, row);
+                if let Some(directory) = blob.parent() {
+                    std::fs::create_dir_all(directory).map_err(|error| gitdepot::Error::Chain(
+                        format!("create {}: {error}", directory.display())))?;
+                }
+                std::fs::write(&blob, content).map_err(|error| gitdepot::Error::Chain(
+                    format!("write {}: {error}", blob.display())))?;
+                let size = i64::try_from(content.len()).map_err(|_| gitdepot::Error::Chain(
+                    format!("checkout content for {path:?} exceeds i64")))?;
+                owner.finalize_file(&path, size, 0, 0);
+                files = files.checked_add(1).ok_or_else(|| gitdepot::Error::Chain(
+                    "checkout file count overflow".into()))?;
+                bytes = bytes.checked_add(content.len() as u64).ok_or_else(||
+                    gitdepot::Error::Chain("checkout byte count overflow".into()))?;
+            }
+        }
+        Ok(())
+    }).map_err(|error| format!("checkout: {error}"))?;
+    owner.load_mirror();
+    Ok(crate::generated_wire::CheckoutResult {
+        revision: revision_name,
+        files,
+        bytes,
+    })
 }
 
 /// Open a wikimak instance READ-ONLY (shared flock, every write API

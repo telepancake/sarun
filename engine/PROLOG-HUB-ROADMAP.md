@@ -797,6 +797,15 @@ belong to the relation.
   metadata and all numeric ranges fail closed; only the temporary listener
   performs the old base64/object projection. The full native aarch64-musl suite
   passes 308 tests with one existing browser e2e test ignored.
+- Moved `ro_attach`, `wiki_attach`, `ietf_attach`, and `git_checkout` onto
+  generated request/success variants. Generic attachments now consume the
+  closed box/external-reference sum and validate the full bounded list before
+  replacing it. Wiki and IETF pinning validate their result records before
+  mutating state. Git checkout returns `CheckoutResult`, rejects traversal and
+  paths or symlink targets the current UTF-8 overlay index cannot represent,
+  and no longer performs lossy conversion or constructs JSON. The temporary
+  listener alone translates its legacy rows. The full native aarch64-musl
+  suite passes 308 tests with one existing browser e2e test ignored.
 
 ## Stop conditions
 
