@@ -3,6 +3,8 @@
 :- use_module(relation_api).
 
 test_name(same_request_shape_parses_and_renders_foreign_grammar).
+test_name(tear_completion_is_aggregated_from_parse_evidence).
+test_name(solution_limit_is_enforced_and_reported).
 test_name(envelope_fails_closed).
 
 run_relation_api_tests :-
@@ -66,6 +68,41 @@ run_test(same_request_shape_parses_and_renders_foreign_grammar) :-
     transform(RenderRequest, RenderReply),
     RenderReply = reply(
         [solution([binding(source, "hello world")], 0)], [], [], []).
+
+run_test(tear_completion_is_aggregated_from_parse_evidence) :-
+    foreign_grammar(Grammar),
+    limits(Limits),
+    Tear = edit_tear(edit, span(0, 2), "he"),
+    Request = request(
+        Grammar,
+        given([binding(source, source([Tear, end(2)], assist(edit)))]),
+        want([arguments, status, completions]), observations([]), Limits),
+    transform(Request, Reply),
+    Reply = reply(
+        [solution([binding(arguments, [hole(name, word)]),
+                   binding(status, incomplete(edit(edit))),
+                   binding(completions,
+                           [completion(span(0, 2), "hello",
+                                       [alternative(greeting, keyword,
+                                                    greeting, 20)],
+                                       20, 1)])],
+                  20)], [], [], []).
+
+run_test(solution_limit_is_enforced_and_reported) :-
+    Ambiguous = sequence_grammar(
+        [argument(arg(name, word, required, scalar))],
+        terminals([
+            terminal(word, identifier,
+                     [surface(first, "same"), surface(second, "same")])
+        ]), separator(" ")),
+    source("same", 0, Same),
+    Request = request(
+        Ambiguous,
+        given([binding(source, source([Same, end(4)], exact))]),
+        want([arguments]), observations([]), limits(1, 10, 65536)),
+    transform(Request, Reply),
+    Reply = reply([solution([binding(arguments, [_])], _)], [], [],
+                  [diagnostic(solution_limit(1))]).
 
 run_test(envelope_fails_closed) :-
     foreign_grammar(Grammar),

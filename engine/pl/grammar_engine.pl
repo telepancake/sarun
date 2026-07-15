@@ -35,23 +35,22 @@ composable grammar-value/codec relation as the generic IR lands.
 
 transform_relation(
     sequence_grammar(Specs, terminals(Terminals), separator(Separator)),
-    Given, Wanted, _Observations, _Limits,
-    reply([solution(Bindings, Preference)], [], [], [])) :-
+    Given, Wanted, _Observations,
+    limits(MaxSolutions, MaxEvidence, _MaxOutputBytes),
+    reply(Solutions, [], [], Diagnostics)) :-
     given_value(source, Given, source(Items, Mode)),
     neutral_input(Items, Body),
     valid_relation_mode(Mode),
-    relate_sequence(Specs, Body, Mode,
-                    grammar_engine:data_terminal(Terminals),
-                    Arguments, Evidence, EditCount),
-    relation_status(Mode, EditCount, Status),
-    evidence_preference(Evidence, 0, Preference),
-    project_highlights(Evidence, Highlights),
-    Available = [binding(arguments, Arguments),
-                 binding(evidence, Evidence),
-                 binding(status, Status),
-                 binding(highlights, Highlights)],
-    requested_bindings(Wanted, Available, Bindings),
-    text_value(Separator).
+    text_value(Separator),
+    SearchLimit is MaxSolutions + 1,
+    findnsols(SearchLimit, Candidate,
+              sequence_candidate(Specs, Terminals, Body, Mode, MaxEvidence,
+                                 Candidate),
+              Candidates0),
+    Candidates0 = [_|_],
+    limit_solutions(Candidates0, MaxSolutions, Candidates, Diagnostics),
+    candidate_completions(Mode, Candidates, Completions),
+    candidate_solutions(Candidates, Wanted, Completions, Solutions).
 transform_relation(
     sequence_grammar(Specs, terminals(Terminals), separator(Separator)),
     Given, Wanted, _Observations, _Limits,
@@ -65,6 +64,60 @@ transform_relation(
     Available = [binding(source, Text),
                  binding(rendered_items, RenderedItems)],
     requested_bindings(Wanted, Available, Bindings).
+
+sequence_candidate(Specs, Terminals, Body, Mode, MaxEvidence,
+                   candidate(Arguments, Evidence, Status, Preference,
+                             Highlights)) :-
+    relate_sequence(Specs, Body, Mode,
+                    grammar_engine:data_terminal(Terminals),
+                    Arguments, Evidence, EditCount),
+    length(Evidence, EvidenceCount),
+    EvidenceCount =< MaxEvidence,
+    relation_status(Mode, EditCount, Status),
+    evidence_preference(Evidence, 0, Preference),
+    project_highlights(Evidence, Highlights).
+
+limit_solutions(Candidates0, Maximum, Candidates,
+                [diagnostic(solution_limit(Maximum))]) :-
+    take_prefix(Maximum, Candidates0, Candidates, Rest),
+    Rest = [_|_],
+    !.
+limit_solutions(Candidates, _, Candidates, []).
+
+take_prefix(0, Values, [], Values) :- !.
+take_prefix(_, [], [], []).
+take_prefix(Count, [Value|Values], [Value|Prefix], Rest) :-
+    Count > 0,
+    Next is Count - 1,
+    take_prefix(Next, Values, Prefix, Rest).
+
+candidate_completions(exact, _, []).
+candidate_completions(assist(EditId), Candidates, Completions) :-
+    findall(completion_key(Span, Text)-
+                (alternative(Semantic, Syntax, Description)-Preference),
+            ( candidate_member(
+                  candidate(_, Evidence, _, Preference, _), Candidates),
+              literal_completion_evidence(
+                  EditId, Evidence, Span, Text, Semantic, Syntax, Description)
+            ),
+            Pairs),
+    project_completions(Pairs, Completions).
+
+candidate_solutions([], _, _, []).
+candidate_solutions(
+    [candidate(Arguments, Evidence, Status, Preference, Highlights)|Candidates],
+    Wanted, Completions, [solution(Bindings, Preference)|Solutions]) :-
+    Available = [binding(arguments, Arguments),
+                 binding(evidence, Evidence),
+                 binding(status, Status),
+                 binding(highlights, Highlights),
+                 binding(completions, Completions)],
+    requested_bindings(Wanted, Available, Bindings),
+    candidate_solutions(Candidates, Wanted, Completions, Solutions).
+
+candidate_member(Candidate, [Candidate|_]).
+candidate_member(Candidate, [_|Candidates]) :-
+    candidate_member(Candidate, Candidates).
 
 given_value(Name, [binding(Name, Value)|_], Value).
 given_value(Name, [_|Bindings], Value) :- given_value(Name, Bindings, Value).

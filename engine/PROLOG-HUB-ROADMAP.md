@@ -223,10 +223,13 @@ Concrete boundary checkpoint: `relation_api:transform/2` now executes a
 foreign immutable sequence grammar in both directions with the same envelope.
 Rust has generic `RelationRequest`/`RelationReply` values and recursively
 constructs/decodes SWI terms through the FLI on this path, so no textual Prolog
-request or operation atom crosses it. The old action-specific `Operation` and
-`application/3` path still exists for sarun and must be migrated and deleted;
-request limits other than the fixed inference guard are validated but not all
-are enforced during enumeration yet.
+request or operation atom crosses it. Solution and evidence limits now
+constrain foreign-grammar enumeration, and a
+tear completion is aggregated from ordinary parse evidence through the same
+request. The output-byte limit is validated at the Prolog envelope and bounded
+by the Rust decoder's fixed ceiling, but the request-specific byte ceiling is
+not yet applied by the decoder. The old action-specific `Operation` and
+`application/3` path still exists for sarun and must be migrated and deleted.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:
