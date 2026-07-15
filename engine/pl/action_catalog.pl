@@ -4,6 +4,7 @@
             cli_form/3,
             key_binding/4,
             menu_label/2,
+            argument_context/4,
             representation/3,
             convert/4,
             visible_action/1
@@ -203,6 +204,14 @@ menu_label('review.discard_hunk', "Discard this hunk").
 menu_label(rule_new, "New rule").
 menu_label(rule_delete, "Delete rule").
 menu_label(rule_edit, "Edit rule").
+
+% Semantic context is independent from wire encoding. Box references remain
+% protocol strings after resolution, but their source text denotes a live box.
+argument_context(_, sid, box, root).
+argument_context(_, parent_sid, box, root).
+argument_context(_, box, box, root).
+argument_context(_, rel, path, within(box(argument(sid)))).
+argument_context(_, path, path, within(box(argument(box)))).
 
 visible_action(Action) :-
     action(Action, _, _, _, _, visible, _).

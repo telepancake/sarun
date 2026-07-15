@@ -7,6 +7,9 @@
             highlights/2,
             render/3,
             catalog/2,
+            context_plan/3,
+            resolve_context_plan/3,
+            context_completion_plan/3,
             application/3
           ]).
 
@@ -317,6 +320,132 @@ evidence_preference([evidence(_, _, _, _, _, _, ItemPreference, _)|Evidence],
                     Accumulator, Preference) :-
     Next is Accumulator + ItemPreference,
     evidence_preference(Evidence, Next, Preference).
+
+%! context_plan(+Items, +Mode, -Plan) is nondet.
+%
+% Relate a structural parse to its explicit external dependencies. Primitive
+% wire parsing does not perform the lookup; the plan records what must be true.
+
+context_plan(Items, Mode,
+             plan(Command, Queries, Bindings, Evidence, Preference)) :-
+    parse(Items, Mode,
+          parse_result(Command, Status, Evidence, Preference)),
+    Command = command(Action, _, _, _),
+    context_queries(Action, Evidence, 1, 1, [], Queries, Bindings),
+    plan_status_matches(Mode, Status).
+
+plan_status_matches(exact, complete).
+plan_status_matches(assist(Id), incomplete(edit(Id))).
+
+context_queries(_, [], _, _, _, [], []).
+context_queries(Action, [Evidence|EvidenceItems], QueryIndex, ArgIndex,
+                KnownArguments, Queries, Bindings) :-
+    Evidence = evidence(_, _, _, Surface, _, Description, _, _),
+    ( argument_name(Action, Description)
+    -> ( argument_context(Action, Description, Domain, Scope)
+       -> query_id(QueryIndex, Id),
+          context_selector(Scope, KnownArguments, Surface, Selector),
+          Queries = [query(Id, ask(one, Domain, Selector))|RestQueries],
+          Bindings = [bind(Id, arg(ArgIndex), entry_value)|RestBindings],
+          NextQuery is QueryIndex + 1,
+          NextKnown = [Description-Id|KnownArguments]
+       ;  Queries = RestQueries,
+          Bindings = RestBindings,
+          NextQuery = QueryIndex,
+          NextKnown = KnownArguments
+       ),
+       NextArg is ArgIndex + 1
+    ;  Queries = RestQueries,
+       Bindings = RestBindings,
+       NextQuery = QueryIndex,
+       NextArg = ArgIndex,
+       NextKnown = KnownArguments
+    ),
+    context_queries(Action, EvidenceItems, NextQuery, NextArg, NextKnown,
+                    RestQueries, RestBindings).
+
+argument_name(Action, Name) :-
+    argument_schema(Action, Schema),
+    schema_has_name(Schema, Name).
+
+schema_has_name([arg(Name, _, _, _)|_], Name).
+schema_has_name([_|Schema], Name) :- schema_has_name(Schema, Name).
+
+context_selector(root, _, Surface, name(Surface)).
+context_selector(within(Template), Known, Surface,
+                 within(Resolved, name(Surface))) :-
+    resolve_argument_refs(Template, Known, Resolved).
+
+resolve_argument_refs(argument(Name), Known, ref(Id)) :-
+    list_pair(Name, Id, Known), !.
+resolve_argument_refs(Term, _, Term) :- atomic(Term), !.
+resolve_argument_refs(Term, Known, Resolved) :-
+    Term =.. [Functor|Args],
+    resolve_argument_ref_list(Args, Known, ResolvedArgs),
+    Resolved =.. [Functor|ResolvedArgs].
+
+resolve_argument_ref_list([], _, []).
+resolve_argument_ref_list([Arg|Args], Known, [Resolved|ResolvedArgs]) :-
+    resolve_argument_refs(Arg, Known, Resolved),
+    resolve_argument_ref_list(Args, Known, ResolvedArgs).
+
+list_pair(Name, Id, [Name-Id|_]).
+list_pair(Name, Id, [_|Pairs]) :- list_pair(Name, Id, Pairs).
+
+resolve_context_plan(plan(command(Action, Handler, Target, Args0), Queries,
+                          Bindings, _Evidence, _Preference),
+                     Observations,
+                     command(Action, Handler, Target, Args)) :-
+    resolve_bindings(Bindings, Queries, Observations, Args0, Args).
+
+resolve_bindings([], _, _, Args, Args).
+resolve_bindings([bind(Id, arg(Index), entry_value)|Bindings], Queries,
+                 Observations, Args0, Args) :-
+    list_query(Id, Query, Queries),
+    list_observation(Id, Query, Observations, Value),
+    replace_nth(Index, Args0, Value, Args1),
+    resolve_bindings(Bindings, Queries, Observations, Args1, Args).
+
+list_query(Id, Query, [query(Id, Query)|_]).
+list_query(Id, Query, [_|Queries]) :- list_query(Id, Query, Queries).
+
+list_observation(Id, Query,
+                 [observed(Id, Query, _,
+                           some(one(entry(_, _, _, Value, _))))|_], Value).
+list_observation(Id, Query, [_|Observations], Value) :-
+    list_observation(Id, Query, Observations, Value).
+
+replace_nth(1, [_|Values], Value, [Value|Values]) :- !.
+replace_nth(Index, [Head|Values], Value, [Head|Result]) :-
+    Index > 1, Next is Index - 1,
+    replace_nth(Next, Values, Value, Result).
+
+context_completion_plan(Items, EditId,
+                        completion_context(Action, Span, Surface,
+                                           query(q1, ask(all, Domain,
+                                                        prefix(Surface))))) :-
+    input_body(Items, Body, End),
+    valid_body(Body, End),
+    action(Action, _, _, _, _, visible, _),
+    action_form(Action, _Style, Specs, _Normalizer),
+    split_edit(Body, EditId, Before, Span, Surface, After),
+    split_context_argument(Specs, BeforeSpecs, Name, AfterSpecs),
+    argument_context(Action, Name, Domain, root),
+    match_known_prefix(BeforeSpecs, Before),
+    viable_suffix(AfterSpecs, After).
+
+split_context_argument([argument(arg(Name, _, _, _))|Specs], [], Name, Specs).
+split_context_argument([Spec|Specs], [Spec|Before], Name, After) :-
+    split_context_argument(Specs, Before, Name, After).
+
+query_id(1, q1).
+query_id(2, q2).
+query_id(3, q3).
+query_id(4, q4).
+query_id(5, q5).
+query_id(6, q6).
+query_id(7, q7).
+query_id(8, q8).
 
 %! completions(+Items, +EditTearId, -Completions) is det.
 

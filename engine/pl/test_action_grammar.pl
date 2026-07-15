@@ -13,6 +13,10 @@ test_name(array_wire_shape_is_preserved).
 test_name(parse_render_roundtrip).
 test_name(completion_and_highlighting_derive_from_relation).
 test_name(application_surface_is_closed).
+test_name(context_plan_captures_box_dependency).
+test_name(context_resolution_rewrites_wire_argument).
+test_name(dependent_path_plan_references_box_query).
+test_name(context_completion_uses_all_prefix_query).
 
 run_action_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -121,3 +125,45 @@ run_test(application_surface_is_closed) :-
     expect_equal(ParseOutput, "ok([])"),
     application(shell, "request(halt)", ShellOutput),
     expect_equal(ShellOutput, "error(invalid_operation)").
+
+run_test(context_plan_captures_box_dependency) :-
+    items(["rename", "work", "new-name"], Items),
+    once(context_plan(Items, exact,
+                      plan(command(rename, rename, control,
+                                   [string("work"), string("new-name")]),
+                           Queries, Bindings, _, _))),
+    expect_equal(Queries,
+                 [query(q1, ask(one, box, name("work")))]),
+    expect_equal(Bindings, [bind(q1, arg(1), entry_value)]).
+
+run_test(context_resolution_rewrites_wire_argument) :-
+    items(["rename", "work", "new-name"], Items),
+    once(context_plan(Items, exact, Plan)),
+    Plan = plan(_, [query(q1, Query)], _, _, _),
+    Observations =
+        [observed(q1, Query, source(boxes, 7),
+                  some(one(entry(box, 5, ["work"], string("5"), []))))],
+    resolve_context_plan(Plan, Observations, Command),
+    expect_equal(Command,
+                 command(rename, rename, control,
+                         [string("5"), string("new-name")])).
+
+run_test(dependent_path_plan_references_box_query) :-
+    items(["writer_id", "work", "src/main.rs"], Items),
+    once(context_plan(Items, exact,
+                      plan(_, Queries, Bindings, _, _))),
+    expect_equal(Queries,
+                 [query(q1, ask(one, box, name("work"))),
+                  query(q2, ask(one, path,
+                                within(box(ref(q1)), name("src/main.rs"))))]),
+    expect_equal(Bindings,
+                 [bind(q1, arg(1), entry_value),
+                  bind(q2, arg(2), entry_value)]).
+
+run_test(context_completion_uses_all_prefix_query) :-
+    neutral("rename", 0, Rename),
+    Items = [Rename, edit_tear(edit, span(7, 9), "wo"), end(9)],
+    once(context_completion_plan(Items, edit, Plan)),
+    expect_equal(Plan,
+                 completion_context(rename, span(7, 9), "wo",
+                                    query(q1, ask(all, box, prefix("wo"))))).

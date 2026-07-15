@@ -260,6 +260,12 @@ belong to the relation.
       `ref/1` readiness relation.
 - [ ] Add contextual argument domains, dependent provider requests, exact/alias
       resolution, relational `one` failure, and contextual completions.
+- [x] Add initial contextual domains for box identifiers and box-relative paths;
+      structural plans now carry `query/2` nodes plus explicit AST
+      `bind(QueryId,arg(Index),entry_value)` flows.
+- [x] Resolve successful `one` observations into wire-ready command arguments,
+      derive `all`/`prefix` queries for contextual completion, and derive path
+      queries containing `ref/1` dependencies on earlier box arguments.
 - [ ] Add local lexical environments that resolve internal bindings without
       external queries and compose independently from external query graphs.
 
