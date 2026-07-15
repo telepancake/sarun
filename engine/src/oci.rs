@@ -1275,27 +1275,24 @@ fn tar_gz_dir_b64(dir: &Path) -> Result<String> {
 /// layer boxes are created host-side, and return the worker's combined output,
 /// exit code, and top box id. Runs on the connection's own handler thread, so a
 /// long build doesn't block the engine's main loop.
-pub(crate) fn build_in_engine(spec: &Value) -> Result<Value> {
+pub(crate) fn build_in_engine(
+    spec: &crate::generated_wire::OciBuildSpec,
+) -> Result<crate::generated_wire::OciBuildResult> {
     use std::process::{Command, Stdio};
-    let tar_b64 = spec.get("context_tar_gz").and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("oci.build: missing context_tar_gz"))?;
-    let df_text = spec.get("dockerfile").and_then(Value::as_str).unwrap_or("");
-    let tag = spec.get("tag").and_then(Value::as_str);
-    let net = spec.get("net").and_then(Value::as_str).unwrap_or("tap");
-    let build_args: Vec<(String, String)> = spec.get("build_args")
-        .and_then(Value::as_array).map(|a| a.iter().filter_map(|kv| {
-            let kv = kv.as_array()?;
-            Some((kv.first()?.as_str()?.to_string(), kv.get(1)?.as_str()?.to_string()))
-        }).collect()).unwrap_or_default();
+    let net = match spec.net_mode {
+        crate::generated_wire::NetMode::Off => "off",
+        crate::generated_wire::NetMode::Host => "host",
+        crate::generated_wire::NetMode::Tap => "tap",
+    };
 
     let stamp = format!("{}-{}", std::process::id(), now_ns());
     let ctx = paths::runtime_home().join(format!("oci-build-{stamp}"));
     std::fs::create_dir_all(&ctx).context("create build context dir")?;
-    let result_file = paths::runtime_home().join(format!("oci-build-{stamp}.json"));
+    let result_file = paths::runtime_home().join(format!("oci-build-{stamp}.result"));
     let _guard = TmpCleanup { dir: ctx.clone(), file: result_file.clone() };
-    unpack_tar_gz_b64(tar_b64, &ctx)?;
+    unpack_tar_gz(spec.context_tar_gz.as_slice(), &ctx)?;
     let df_path = ctx.join(".sarun-Dockerfile");
-    std::fs::write(&df_path, df_text).context("write shipped Dockerfile")?;
+    std::fs::write(&df_path, spec.dockerfile.as_slice()).context("write shipped Dockerfile")?;
 
     let mut cmd = Command::new("/proc/self/exe");
     cmd.arg("oci").arg("__build-worker")
@@ -1303,17 +1300,23 @@ pub(crate) fn build_in_engine(spec: &Value) -> Result<Value> {
         .arg("-f").arg(&df_path)
         .arg("--net").arg(net)
         .arg("--result-file").arg(&result_file);
-    if let Some(t) = tag { cmd.arg("-t").arg(t); }
-    for (k, v) in &build_args { cmd.arg("--build-arg").arg(format!("{k}={v}")); }
+    if let Some(tag) = &spec.tag { cmd.arg("-t").arg(tag.as_str()); }
+    for (key, value) in spec.build_arguments.as_map() {
+        cmd.arg("--build-arg").arg(format!("{}={}", key.as_str(), value.as_str()));
+    }
     let out = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .output().context("spawn build worker")?;
     let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
     log.push_str(&String::from_utf8_lossy(&out.stderr));
     let code = out.status.code().unwrap_or(1);
     let top_id = std::fs::read_to_string(&result_file).ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("top_id").and_then(Value::as_i64));
-    Ok(serde_json::json!({"code": code, "log": log, "top_id": top_id}))
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    Ok(crate::generated_wire::OciBuildResult {
+        code,
+        log: crate::wire::BoundedText::new(log)
+            .map_err(|error| anyhow!("OCI build log exceeds relation bound: {error:?}"))?,
+        top: top_id,
+    })
 }
 
 /// Best-effort cleanup of the engine-side build temp dir + result file.
@@ -1325,9 +1328,7 @@ impl Drop for TmpCleanup {
     }
 }
 
-fn unpack_tar_gz_b64(b64: &str, dest: &Path) -> Result<()> {
-    use base64::{Engine as _, prelude::BASE64_STANDARD};
-    let bytes = BASE64_STANDARD.decode(b64.trim()).context("decode context")?;
+fn unpack_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
     let gz = flate2::read::GzDecoder::new(&bytes[..]);
     tar::Archive::new(gz).unpack(dest).context("unpack context")?;
     Ok(())
@@ -1335,7 +1336,8 @@ fn unpack_tar_gz_b64(b64: &str, dest: &Path) -> Result<()> {
 
 /// The hidden build worker: a HOST process the engine spawns so the build's
 /// layer boxes land in the engine's state. Runs the Dockerfile against the
-/// already-unpacked context and writes `{"top_id":N}` to --result-file.
+/// already-unpacked context and writes the checked decimal top id to
+/// --result-file.
 fn cli_build_worker(args: &[String]) -> i32 {
     let mut context: Option<String> = None;
     let mut file: Option<String> = None;
@@ -1371,8 +1373,7 @@ fn cli_build_worker(args: &[String]) -> i32 {
             // back to the caller; a dropped write would report a successful
             // build with no result. Surface it and fail.
             if let Some(rf) = result_file {
-                if let Err(e) = std::fs::write(
-                    &rf, serde_json::json!({"top_id": top}).to_string()) {
+                if let Err(e) = std::fs::write(&rf, top.to_string()) {
                     eprintln!("sarun oci build: write --result-file {rf}: {e}");
                     return 1;
                 }

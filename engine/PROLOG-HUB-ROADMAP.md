@@ -789,6 +789,14 @@ belong to the relation.
   the network probe executes directly in Rust and JSON is confined to its
   temporary request/result projection. The full native aarch64-musl suite
   passes 308 tests with one existing browser e2e test ignored.
+- Moved `oci.load`, `oci.images`, `oci.resolve`, and `oci.build` onto generated
+  request/success variants. The engine build implementation now consumes raw
+  bounded compressed-context and Dockerfile bytes instead of a JSON object and
+  base64, and returns `OciBuildResult` directly. Its worker handoff is a checked
+  decimal box identity rather than a private JSON protocol. Image inventory
+  metadata and all numeric ranges fail closed; only the temporary listener
+  performs the old base64/object projection. The full native aarch64-musl suite
+  passes 308 tests with one existing browser e2e test ignored.
 
 ## Stop conditions
 

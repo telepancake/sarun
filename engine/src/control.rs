@@ -1900,6 +1900,62 @@ fn dispatch_action(
         ActionRequest::SvcUp { name } => {
             Ok(ActionSuccess::SvcUp { value: svc_has(name.as_str()) })
         }
+        ActionRequest::OciLoad { reference, name } => {
+            let outcome = crate::oci::load_blocking(
+                reference.as_str(), name.map(|value| value.into_inner()))
+                .map_err(|error| format!("{error:#}"))?;
+            let value = crate::generated_wire::OciLoadResult {
+                base: u64::try_from(outcome.base_id).map_err(|_| "negative OCI base box id")?,
+                base_name: crate::wire::BoundedText::new(outcome.base_name)
+                    .map_err(|error| format!("OCI base name exceeds relation bound: {error:?}"))?,
+                top: u64::try_from(outcome.top_id).map_err(|_| "negative OCI top box id")?,
+                top_name: crate::wire::BoundedText::new(outcome.top_name)
+                    .map_err(|error| format!("OCI top name exceeds relation bound: {error:?}"))?,
+                layer_count: u32::try_from(outcome.n_layers)
+                    .map_err(|_| "OCI layer count exceeds u32")?,
+                verified: outcome.verified,
+            };
+            Ok(ActionSuccess::OciLoad { value })
+        }
+        ActionRequest::OciImages => {
+            let rows = crate::discover::discover().into_iter()
+                .filter(|(_, image)| image.meta.contains_key("oci_config"))
+                .map(|(id, image)| {
+                    let reference = image.meta.get("oci_reference")
+                        .ok_or_else(|| format!("OCI image box {id} has no reference"))?;
+                    Ok(crate::generated_wire::OciImage {
+                        top: u64::try_from(id).map_err(|_| "negative OCI image box id")?,
+                        name: crate::wire::BoundedText::new(image.name)
+                            .map_err(|error| format!(
+                                "OCI image name exceeds relation bound: {error:?}"))?,
+                        reference: crate::wire::BoundedText::new(reference.clone())
+                            .map_err(|error| format!(
+                                "OCI reference exceeds relation bound: {error:?}"))?,
+                        digest: crate::wire::BoundedText::new(image.meta
+                            .get("oci_manifest_digest").cloned().unwrap_or_default())
+                            .map_err(|error| format!(
+                                "OCI digest exceeds relation bound: {error:?}"))?,
+                    })
+                }).collect::<Result<Vec<_>, String>>()?;
+            let value = crate::wire::BoundedVec::new(rows)
+                .map_err(|error| format!("OCI image list exceeds relation bound: {error:?}"))?;
+            Ok(ActionSuccess::OciImages { value })
+        }
+        ActionRequest::OciResolve { reference } => {
+            let (top, note) = crate::oci::resolve_image_top_local(reference.as_str())
+                .map_err(|error| format!("{error:#}"))?;
+            let value = crate::generated_wire::OciResolveResult {
+                top: u64::try_from(top).map_err(|_| "negative OCI top box id")?,
+                note: crate::wire::BoundedText::new(note)
+                    .map_err(|error| format!("OCI resolution note exceeds relation bound: {error:?}"))?,
+            };
+            Ok(ActionSuccess::OciResolve { value })
+        }
+        ActionRequest::OciBuild { spec } => {
+            let value = crate::oci::build_in_engine(&spec)
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(ActionSuccess::OciBuild { value })
+        }
         ActionRequest::MirrorJobs => {
             let value = crate::wire::BoundedVec::new(crate::mirrors::jobs_list_typed()?)
                 .map_err(|error| format!("mirror jobs exceed relation bound: {error:?}"))?;
@@ -2508,6 +2564,30 @@ fn legacy_ui_action_reply(
             "detail": value.into_inner(),
         }),
         Ok(ActionSuccess::SvcUp { value }) => json!({"up": value}),
+        Ok(ActionSuccess::OciLoad { value }) => json!({
+            "base_id": value.base,
+            "base_name": value.base_name.into_inner(),
+            "top_id": value.top,
+            "top_name": value.top_name.into_inner(),
+            "n_layers": value.layer_count,
+            "verified": value.verified,
+        }),
+        Ok(ActionSuccess::OciImages { value }) => Value::Array(value.into_inner()
+            .into_iter().map(|image| json!({
+                "id": image.top,
+                "name": image.name.into_inner(),
+                "reference": image.reference.into_inner(),
+                "digest": image.digest.into_inner(),
+            })).collect()),
+        Ok(ActionSuccess::OciResolve { value }) => json!({
+            "top_id": value.top,
+            "note": value.note.into_inner(),
+        }),
+        Ok(ActionSuccess::OciBuild { value }) => json!({
+            "code": value.code,
+            "log": value.log.into_inner(),
+            "top_id": value.top,
+        }),
         Ok(ActionSuccess::MirrorJobs { value }) => Value::Array(value.into_inner()
             .into_iter().map(|job| json!({
                 "id": job.id,
@@ -5092,34 +5172,28 @@ macro_rules! ui_verbs {
             let Some(reference) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "oci.load: missing reference"});
             };
-            let name = args.get(1).and_then(Value::as_str).map(String::from);
-            match crate::oci::load_blocking(reference, name) {
-                Ok(o) => json!({
-                    "base_id": o.base_id, "base_name": o.base_name,
-                    "top_id": o.top_id, "top_name": o.top_name,
-                    "n_layers": o.n_layers, "verified": o.verified,
-                }),
-                Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
-            }
+            let Ok(reference) = crate::wire::BoundedText::new(reference.to_owned()) else {
+                return json!({"ok": false, "error": "OCI reference exceeds relation bound"});
+            };
+            let name = match args.get(1).and_then(Value::as_str) {
+                None => None,
+                Some(name) => match crate::wire::BoundedText::new(name.to_owned()) {
+                    Ok(name) => Some(name),
+                    Err(_) => return json!({"ok": false,
+                        "error": "OCI image name exceeds relation bound"}),
+                },
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::OciLoad { reference, name },
+            ));
         }
         // Loaded images, for the UI's base-image picker: the TOP box of each
         // installed layer chain (the one carrying the image config), with the
         // reference it was pulled as. Cheap metadata scan, no registry I/O.
         "oci.images" => {
-            let boxes = crate::discover::discover();
-            Value::Array(boxes.iter()
-                .filter(|(_, b)| b.meta.contains_key("oci_config"))
-                .filter_map(|(id, b)| {
-                    let reference = b.meta.get("oci_reference")?;
-                    Some(json!({
-                        "id": id,
-                        "name": b.name,
-                        "reference": reference,
-                        "digest": b.meta.get("oci_manifest_digest")
-                                        .cloned().unwrap_or_default(),
-                    }))
-                })
-                .collect())
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::OciImages,
+            ));
         }
         // Is a named svc.serve service live (≥1 parked accept slot)? Used by
         // `oaita local` to poll readiness / idempotency without racing.
@@ -5136,10 +5210,12 @@ macro_rules! ui_verbs {
             let Some(reference) = args.first().and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "oci.resolve: missing reference"});
             };
-            match crate::oci::resolve_image_top_local(reference) {
-                Ok((top, note)) => json!({"top_id": top, "note": note}),
-                Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
-            }
+            let Ok(reference) = crate::wire::BoundedText::new(reference.to_owned()) else {
+                return json!({"ok": false, "error": "OCI reference exceeds relation bound"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::OciResolve { reference },
+            ));
         }
         // In-box `oci build`: the CLI ships its context + Dockerfile here so the
         // build runs host-side (its layer boxes land in engine state, not the
@@ -5148,10 +5224,72 @@ macro_rules! ui_verbs {
             let Some(spec) = args.first() else {
                 return json!({"ok": false, "error": "oci.build: missing spec"});
             };
-            match crate::oci::build_in_engine(spec) {
-                Ok(v) => v,
-                Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
+            use base64::{Engine as _, prelude::BASE64_STANDARD};
+            let Some(context) = spec.get("context_tar_gz").and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "oci.build: missing context_tar_gz"});
+            };
+            let context = match BASE64_STANDARD.decode(context.trim()) {
+                Ok(value) => value,
+                Err(error) => return json!({"ok": false,
+                    "error": format!("oci.build: invalid context: {error}")}),
+            };
+            let Ok(context_tar_gz) = crate::wire::BoundedBytes::new(context) else {
+                return json!({"ok": false, "error": "OCI build context exceeds relation bound"});
+            };
+            let dockerfile = spec.get("dockerfile").and_then(Value::as_str).unwrap_or("");
+            let Ok(dockerfile) = crate::wire::BoundedBytes::new(dockerfile.as_bytes().to_vec()) else {
+                return json!({"ok": false, "error": "OCI Dockerfile exceeds relation bound"});
+            };
+            let tag = match spec.get("tag").and_then(Value::as_str) {
+                None => None,
+                Some(tag) => match crate::wire::BoundedText::new(tag.to_owned()) {
+                    Ok(tag) => Some(tag),
+                    Err(_) => return json!({"ok": false,
+                        "error": "OCI build tag exceeds relation bound"}),
+                },
+            };
+            let net_mode = match spec.get("net").and_then(Value::as_str).unwrap_or("tap") {
+                "off" => crate::generated_wire::NetMode::Off,
+                "host" => crate::generated_wire::NetMode::Host,
+                "tap" => crate::generated_wire::NetMode::Tap,
+                mode => return json!({"ok": false,
+                    "error": format!("unknown OCI build network mode {mode:?}")}),
+            };
+            let mut build_arguments = std::collections::BTreeMap::new();
+            if let Some(arguments) = spec.get("build_args").and_then(Value::as_array) {
+                for argument in arguments {
+                    let Some(pair) = argument.as_array().filter(|pair| pair.len() == 2) else {
+                        return json!({"ok": false, "error": "invalid OCI build argument"});
+                    };
+                    let (Some(key), Some(value)) = (pair[0].as_str(), pair[1].as_str()) else {
+                        return json!({"ok": false, "error": "invalid OCI build argument"});
+                    };
+                    let (Ok(key), Ok(value)) = (
+                        crate::wire::BoundedText::new(key.to_owned()),
+                        crate::wire::BoundedText::new(value.to_owned()),
+                    ) else {
+                        return json!({"ok": false,
+                            "error": "OCI build argument exceeds relation bound"});
+                    };
+                    if build_arguments.insert(key, value).is_some() {
+                        return json!({"ok": false, "error": "duplicate OCI build argument"});
+                    }
+                }
             }
+            let Ok(build_arguments) = crate::wire::BoundedMap::new(build_arguments) else {
+                return json!({"ok": false, "error": "too many OCI build arguments"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::OciBuild {
+                    spec: crate::generated_wire::OciBuildSpec {
+                        context_tar_gz,
+                        dockerfile,
+                        tag,
+                        net_mode,
+                        build_arguments,
+                    },
+                },
+            ));
         }
         // The local-model picker's catalog: currently-popular GGUF instruct
         // models resolved from a live HuggingFace query (config-file override
