@@ -1114,6 +1114,21 @@ mod relation_row_tests {
             base64::engine::general_purpose::STANDARD.encode([0, 1, 255]));
         assert!(relation_sql_bool("test", 2).is_err());
     }
+
+    #[test]
+    fn writer_provenance_uses_the_closed_process_shape() {
+        let row = crate::generated_wire::WriterProvenance {
+            pid: Some(20), ppid: Some(10), executable: relation_path("/bin/sh").unwrap(),
+            cwd: relation_path("/work").unwrap(),
+            argv: relation_argv(Some(r#"["sh","-c","echo"]"#.into())).unwrap(),
+        };
+        assert_eq!(writer_provenance_json(&row), json!({
+            "pid": 20, "ppid": 10, "exe": "/bin/sh", "cwd": "/work",
+            "argv": ["sh", "-c", "echo"],
+        }));
+        assert_eq!(relation_db_path(b"///src/main.rs").unwrap(), "src/main.rs");
+        assert!(relation_db_path(&[0xff]).is_err());
+    }
 }
 
 pub fn pipeline_rows_json(rows: &[crate::generated_wire::PipelineRow]) -> Value {
@@ -1462,30 +1477,75 @@ pub fn proc_roots_typed(box_id: i64) -> Result<Vec<u64>, String> {
     Ok(roots)
 }
 
-fn writer_col(box_id: i64, rel: &str, col: &str) -> Value {
-    let Some(c) = open_ro(box_id) else { return Value::Null };
-    let rel = rel.trim_start_matches('/');
-    c.query_row(&format!("SELECT {col} FROM sqlar WHERE name=?1"), [rel],
-                |r| r.get::<_, Option<i64>>(0))
-        .ok().flatten().map(Value::from).unwrap_or(Value::Null)
+fn relation_db_path(path: &[u8]) -> Result<&str, String> {
+    std::str::from_utf8(path).map(|path| path.trim_start_matches('/'))
+        .map_err(|_| "stored archive paths require UTF-8".into())
 }
-pub fn writer_id(box_id: i64, rel: &str) -> Value { writer_col(box_id, rel, "last_writer") }
-pub fn first_writer_id(box_id: i64, rel: &str) -> Value { writer_col(box_id, rel, "writer") }
+
+fn writer_id_typed(box_id: i64, path: &[u8], column: &str) -> Result<Option<u64>, String> {
+    let Some(conn) = open_ro(box_id) else { return Ok(None) };
+    if !has_table(&conn, "sqlar") { return Ok(None); }
+    let path = relation_db_path(path)?;
+    let value = conn.query_row(
+        &format!("SELECT {column} FROM sqlar WHERE name=?1"), [path],
+        |row| row.get::<_, Option<i64>>(0));
+    match value {
+        Ok(Some(value)) => value.try_into().map(Some)
+            .map_err(|_| "negative writer process row id".into()),
+        Ok(None) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(format!("read writer process row id: {error}")),
+    }
+}
+
+pub fn last_writer_id_typed(box_id: i64, path: &[u8]) -> Result<Option<u64>, String> {
+    writer_id_typed(box_id, path, "last_writer")
+}
+
+pub fn first_writer_id_typed(box_id: i64, path: &[u8]) -> Result<Option<u64>, String> {
+    writer_id_typed(box_id, path, "writer")
+}
 
 /// Provenance {pid,ppid,exe,cwd,argv} of the FIRST writer of `rel`.
-pub fn first_writer_prov(box_id: i64, rel: &str) -> Value {
-    let Some(c) = open_ro(box_id) else { return Value::Null };
-    let rel = rel.trim_start_matches('/');
-    c.query_row("SELECT process.tgid,process.ppid,process.exe,process.cwd,process.argv \
-                 FROM sqlar JOIN process ON sqlar.writer=process.id WHERE sqlar.name=?1",
-                [rel], |r| {
-        let argv: Option<String> = r.get(4)?;
-        Ok(json!({"pid": r.get::<_,Option<i64>>(0)?, "ppid": r.get::<_,Option<i64>>(1)?,
-                  "exe": r.get::<_,Option<String>>(2)?.unwrap_or_default(),
-                  "cwd": r.get::<_,Option<String>>(3)?.unwrap_or_default(),
-                  "argv": argv.and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                      .unwrap_or_else(|| json!([]))}))
-    }).unwrap_or(Value::Null)
+pub fn first_writer_prov_typed(
+    box_id: i64,
+    path: &[u8],
+) -> Result<Option<crate::generated_wire::WriterProvenance>, String> {
+    let Some(conn) = open_ro(box_id) else { return Ok(None) };
+    if !has_table(&conn, "sqlar") || !has_table(&conn, "process") { return Ok(None); }
+    let path = relation_db_path(path)?;
+    let row = conn.query_row(
+        "SELECT process.tgid,process.ppid,process.exe,process.cwd,process.argv \
+         FROM sqlar JOIN process ON sqlar.writer=process.id WHERE sqlar.name=?1",
+        [path], |row| Ok((
+            row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(4)?,
+        )));
+    let (pid, ppid, executable, cwd, argv) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(format!("read first-writer provenance: {error}")),
+    };
+    Ok(Some(crate::generated_wire::WriterProvenance {
+        pid: pid.map(|value| value.try_into()
+            .map_err(|_| "writer pid exceeds u32")).transpose()?,
+        ppid: ppid.map(|value| value.try_into()
+            .map_err(|_| "writer ppid exceeds u32")).transpose()?,
+        executable: relation_path(&executable)?,
+        cwd: relation_path(&cwd)?,
+        argv: relation_argv(argv)?,
+    }))
+}
+
+pub fn writer_provenance_json(row: &crate::generated_wire::WriterProvenance) -> Value {
+    json!({
+        "pid": row.pid, "ppid": row.ppid,
+        "exe": String::from_utf8_lossy(row.executable.as_slice()),
+        "cwd": String::from_utf8_lossy(row.cwd.as_slice()),
+        "argv": row.argv.as_slice().iter().map(|word|
+            String::from_utf8_lossy(word.as_slice()).into_owned()).collect::<Vec<_>>(),
+    })
 }
 
 /// One captured output row with its original content bytes. Human/JSON

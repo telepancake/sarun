@@ -698,6 +698,14 @@ belong to the relation.
   projection. Stored booleans, numeric ranges, body bounds, and database errors
   fail closed. Focused projection tests and the full native aarch64-musl suite
   pass: 305 tests passed and one existing browser e2e test remained ignored.
+- Moved `writer_id`, `first_writer_id`, and `first_writer_prov` onto generated
+  request/success variants. Archive lookups now consume the bounded byte-path
+  request, construct optional row identities or closed `WriterProvenance`, and
+  surface malformed IDs, argv, and non-UTF-8 archive-path mismatches instead of
+  silently returning null. Deleted the three JSON database handlers; their
+  old spelling exists only at the temporary listener boundary. Focused tests
+  and the full native aarch64-musl suite pass: 306 tests passed and one existing
+  browser e2e test remained ignored.
 
 ## Stop conditions
 

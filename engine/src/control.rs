@@ -1533,6 +1533,24 @@ fn dispatch_action(
             let id = existing_box_id(sid)?;
             Ok(ActionSuccess::ProcessEnv { value: discover::process_env_typed(id, row)? })
         }
+        ActionRequest::WriterId { sid, rel } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::WriterId {
+                value: discover::last_writer_id_typed(id, rel.as_slice())?,
+            })
+        }
+        ActionRequest::FirstWriterId { sid, rel } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::FirstWriterId {
+                value: discover::first_writer_id_typed(id, rel.as_slice())?,
+            })
+        }
+        ActionRequest::FirstWriterProv { sid, rel } => {
+            let id = existing_box_id(sid)?;
+            Ok(ActionSuccess::FirstWriterProv {
+                value: discover::first_writer_prov_typed(id, rel.as_slice())?,
+            })
+        }
         ActionRequest::ViewOpen {
             kind,
             r#box,
@@ -1865,6 +1883,10 @@ fn legacy_ui_action_reply(
         Ok(ActionSuccess::ProcProv { value }) => value.as_ref()
             .map(discover::process_subject_json).unwrap_or(Value::Null),
         Ok(ActionSuccess::ProcessEnv { value }) => discover::environment_json(&value),
+        Ok(ActionSuccess::WriterId { value })
+        | Ok(ActionSuccess::FirstWriterId { value }) => json!(value),
+        Ok(ActionSuccess::FirstWriterProv { value }) => value.as_ref()
+            .map(discover::writer_provenance_json).unwrap_or(Value::Null),
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -1977,6 +1999,10 @@ fn arg_sid(args: &[Value]) -> Option<i64> {
 fn legacy_u64(args: &[Value], index: usize) -> Option<u64> {
     let value = args.get(index)?;
     value.as_u64().or_else(|| value.as_str()?.parse().ok())
+}
+
+fn legacy_path_arg(args: &[Value], index: usize) -> Option<crate::generated_wire::Path> {
+    crate::wire::BoundedBytes::new(args.get(index)?.as_str()?.as_bytes().to_vec()).ok()
 }
 
 fn flow_args<'a>(state: &State, args: &'a [Value]) -> Option<(i64, &'a Value)> {
@@ -3210,17 +3236,26 @@ macro_rules! ui_verbs {
             return legacy_ui_action_reply(dispatch_action(
                 state, crate::generated_wire::ActionRequest::ProcessEnv { sid, row }));
         }
-        "writer_id" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
-            (Some(id), Some(rel)) => discover::writer_id(id, rel), _ => Value::Null,
+        "writer_id" => {
+            let (Some(sid), Some(rel)) = (legacy_u64(args, 0), legacy_path_arg(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid writer path"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::WriterId { sid, rel }));
         }
+        "first_writer_id" => {
+            let (Some(sid), Some(rel)) = (legacy_u64(args, 0), legacy_path_arg(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid writer path"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::FirstWriterId { sid, rel }));
         }
-        "first_writer_id" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
-            (Some(id), Some(rel)) => discover::first_writer_id(id, rel), _ => Value::Null,
-        }
-        }
-        "first_writer_prov" => { match (arg_sid(args), args.get(1).and_then(Value::as_str)) {
-            (Some(id), Some(rel)) => discover::first_writer_prov(id, rel), _ => Value::Null,
-        }
+        "first_writer_prov" => {
+            let (Some(sid), Some(rel)) = (legacy_u64(args, 0), legacy_path_arg(args, 1)) else {
+                return json!({"ok": false, "error": "missing or invalid writer path"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::FirstWriterProv { sid, rel }));
         }
         "stuck" => { match arg_sid(args) {
             // A wedged box is invisible from the outside — this answers
