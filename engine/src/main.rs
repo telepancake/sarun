@@ -339,21 +339,24 @@ fn serve() -> i32 {
                     if !allowed {
                         return true;
                     } // still in cooldown — keep pending
-                    let payload = if kind == "process_added" {
-                        serde_json::json!({
-                            "type": "process_added",
-                            "sid": sid.to_string(),
-                            "n": count,
-                        })
-                    } else {
-                        serde_json::json!({
-                            "type": "overlay",
-                            "sid": sid.to_string(),
-                            "rel": rel,
-                            "n": count,
-                        })
-                    };
-                    control::broadcast(&state, &payload);
+                    let event = u64::try_from(sid).ok().and_then(|r#box| {
+                        let count = u32::try_from(count).ok()?;
+                        if kind == "process_added" {
+                            Some(generated_wire::SubscriptionEvent::ProcessAdded {
+                                r#box, count,
+                            })
+                        } else {
+                            let latest_path = if rel.is_empty() { None } else {
+                                Some(wire::BoundedBytes::new(rel.as_bytes().to_vec()).ok()?)
+                            };
+                            Some(generated_wire::SubscriptionEvent::OverlayChanged {
+                                r#box, count, latest_path,
+                            })
+                        }
+                    });
+                    if let Some(event) = event {
+                        control::broadcast(&state, &event);
+                    }
                     last_sent.insert((sid, kind), now);
                     false // drop from pending — flushed
                 });

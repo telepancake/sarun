@@ -641,13 +641,12 @@ fn lock(state: &State) -> std::sync::MutexGuard<'_, Shared> {
 pub fn broadcast_api_log(box_id: i64) {
     // We need the State to actually broadcast — go through a global handle
     // set up by serve().
-    if let Some(state) = STATE_HANDLE.read().clone() {
+    if let (Some(state), Ok(r#box)) = (STATE_HANDLE.read().clone(), u64::try_from(box_id)) {
         broadcast(
             &state,
-            &json!({
-                "type": "api_log_added",
-                "sid": box_id.to_string(),
-            }),
+            &crate::generated_wire::SubscriptionEvent::ApiLogAdded {
+                r#box,
+            },
         );
     }
 }
@@ -655,13 +654,12 @@ pub fn broadcast_api_log(box_id: i64) {
 /// Broadcast that box `box_id` has new webcap rows so the UI's Captures pane
 /// refreshes. Best-effort, mirroring `broadcast_api_log` (DESIGN-web.md W1).
 pub fn broadcast_webcap(box_id: i64) {
-    if let Some(state) = STATE_HANDLE.read().clone() {
+    if let (Some(state), Ok(r#box)) = (STATE_HANDLE.read().clone(), u64::try_from(box_id)) {
         broadcast(
             &state,
-            &json!({
-                "type": "webcap_added",
-                "sid": box_id.to_string(),
-            }),
+            &crate::generated_wire::SubscriptionEvent::WebCaptureAdded {
+                r#box,
+            },
         );
     }
 }
@@ -712,13 +710,10 @@ fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>, id: i6
             b.on_brush_prov(prov_id, targets);
         }
     }
-    broadcast(
-        state,
-        &json!({"type": "brush_prov",
-                            "session_id": id.to_string(),
-                            "brushprov_id": prov_id, "seq": seq,
-                            "cmd": cmd, "record": rec}),
-    );
+    if let (Ok(r#box), Ok(row)) = (u64::try_from(id), u64::try_from(prov_id)) {
+        broadcast(state,
+            &crate::generated_wire::SubscriptionEvent::BrushProvenanceAdded { r#box, row });
+    }
 }
 
 /// D9 nested-shell provenance verb. The brush-sh shim (a `sh -c RECIPE` the box
@@ -788,13 +783,10 @@ fn brush_prov_nested(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Val
                 }
             }
         }
-        broadcast(
-            state,
-            &json!({"type": "brush_prov",
-                                "session_id": id.to_string(),
-                                "brushprov_id": prov_id, "seq": seq,
-                                "nested": true, "cmd": cmd, "record": rec}),
-        );
+        if let (Ok(r#box), Ok(row)) = (u64::try_from(id), u64::try_from(prov_id)) {
+            broadcast(state,
+                &crate::generated_wire::SubscriptionEvent::BrushProvenanceAdded { r#box, row });
+        }
         n += 1;
     }
     json!({"ok": true, "recorded": n})
@@ -910,11 +902,11 @@ fn build_edges(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Value {
             }
         }
     }
-    broadcast(
-        state,
-        &json!({"type": "build_edges",
-                            "session_id": id.to_string(), "edges": n}),
-    );
+    if let Ok(r#box) = u64::try_from(id) {
+        broadcast(state, &crate::generated_wire::SubscriptionEvent::BuildGraphChanged {
+            r#box, phase: crate::generated_wire::EdgePhase::Rebuilt,
+        });
+    }
     json!({"ok": true, "recorded": n})
 }
 
@@ -1080,16 +1072,65 @@ fn build_edge_state(state: &State, msg: &Value, peer_pidfd: Option<i32>) -> Valu
             }
         }
     }
-    broadcast(
-        state,
-        &json!({"type": "build_edges",
-                            "session_id": id.to_string(), "edge_state": phase}),
-    );
+    if let Ok(r#box) = u64::try_from(id) {
+        let phase = match phase {
+            "start" => Some(crate::generated_wire::EdgePhase::Started),
+            "done" => Some(crate::generated_wire::EdgePhase::Done),
+            _ => None,
+        };
+        if let Some(phase) = phase {
+            broadcast(state,
+                &crate::generated_wire::SubscriptionEvent::BuildGraphChanged { r#box, phase });
+        }
+    }
     json!({"ok": true})
 }
 
-pub fn broadcast(state: &State, ev: &Value) {
-    let data = format!("{ev}\n");
+pub fn broadcast(state: &State, event: &crate::generated_wire::SubscriptionEvent) {
+    use crate::generated_wire::{EdgePhase, SubscriptionEvent};
+    // The newline listener is still the active outer projection until the
+    // coordinated client/server cutover. Event meaning is already closed and
+    // typed here; this projection is deleted with that listener.
+    let value = match event {
+        SubscriptionEvent::BoxAdded { r#box, name, parent } => json!({
+            "type": "session_added", "sid": r#box.to_string(),
+            "name": name.as_ref().map(|value| value.as_str()), "parent": parent,
+        }),
+        SubscriptionEvent::BoxRemoved { r#box } => json!({
+            "type": "session_removed", "session_id": r#box.to_string(),
+        }),
+        SubscriptionEvent::BoxRenamed { r#box, name } => json!({
+            "type": "session_renamed", "session_id": r#box.to_string(),
+            "name": name.as_str(),
+        }),
+        SubscriptionEvent::OverlayChanged { r#box, count, latest_path } => json!({
+            "type": "changes", "session_id": r#box.to_string(), "count": count,
+            "path": latest_path.as_ref().map(|path|
+                String::from_utf8_lossy(path.as_slice()).into_owned()),
+        }),
+        SubscriptionEvent::ProcessAdded { r#box, count } => json!({
+            "type": "process_added", "session_id": r#box.to_string(), "count": count,
+        }),
+        SubscriptionEvent::BrushProvenanceAdded { r#box, row } => json!({
+            "type": "brush_prov", "session_id": r#box.to_string(),
+            "brushprov_id": row,
+        }),
+        SubscriptionEvent::BuildGraphChanged { r#box, phase } => json!({
+            "type": "build_edges", "session_id": r#box.to_string(),
+            "edge_state": match phase {
+                EdgePhase::Rebuilt => "rebuilt", EdgePhase::Started => "start",
+                EdgePhase::Done => "done",
+            },
+        }),
+        SubscriptionEvent::ApiLogAdded { r#box } => json!({
+            "type": "api_log_added", "sid": r#box.to_string(),
+        }),
+        SubscriptionEvent::WebCaptureAdded { r#box } => json!({
+            "type": "webcap_added", "sid": r#box.to_string(),
+        }),
+        SubscriptionEvent::Pong => json!({"type": "pong"}),
+    };
+    let data = format!("{value}\n");
     let mut s = lock(state);
     s.subscribers.retain(|conn| {
         let mut c = conn;
@@ -1443,11 +1484,9 @@ fn dispatch_action(
             }
             broadcast(
                 state,
-                &json!({
-                    "type": "session_renamed",
-                    "session_id": id.to_string(),
-                    "name": new.as_str(),
-                }),
+                &crate::generated_wire::SubscriptionEvent::BoxRenamed {
+                    r#box: sid, name: new.clone(),
+                },
             );
             Ok(ActionSuccess::Rename {
                 value: crate::generated_wire::RenameResult {
@@ -1613,7 +1652,7 @@ fn dispatch_action(
             Ok(ActionSuccess::Select { value: () })
         }
         ActionRequest::Ping => {
-            broadcast(state, &json!({"type": "pong"}));
+            broadcast(state, &crate::generated_wire::SubscriptionEvent::Pong);
             Ok(ActionSuccess::Ping { value: () })
         }
         ActionRequest::ReloadRules => {
@@ -1664,11 +1703,12 @@ fn dispatch_action(
                 capture.set_meta("parent_box_id", &parent.to_string());
             }
             overlay.add_box(std::sync::Arc::new(capture));
-            broadcast(state, &json!({
-                "type": "session_added",
-                "sid": id.to_string(),
-                "parent": parent,
-            }));
+            broadcast(state, &crate::generated_wire::SubscriptionEvent::BoxAdded {
+                r#box: u64::try_from(id).map_err(|_| "negative allocated box id")?,
+                name: None,
+                parent: parent.map(|value| u64::try_from(value)
+                    .map_err(|_| "negative parent box id")).transpose()?,
+            });
             let root = crate::paths::mnt_point().join(id.to_string());
             let root = crate::wire::BoundedBytes::new(root.as_os_str().as_bytes().to_vec())
                 .map_err(|error| format!("box root path exceeds relation bound: {error:?}"))?;
@@ -3359,11 +3399,9 @@ fn reap(state: &State, id: i64) {
     let _ = std::fs::remove_file(crate::paths::state_home().join(format!("{id}.sqlar")));
     let _ = std::fs::remove_dir_all(crate::paths::live_home().join(id.to_string()));
     let _ = std::fs::remove_dir_all(crate::paths::live_home().join("blob").join(id.to_string()));
-    broadcast(
-        state,
-        &json!({"type": "session_removed",
-                             "session_id": id.to_string()}),
-    );
+    if let Ok(r#box) = u64::try_from(id) {
+        broadcast(state, &crate::generated_wire::SubscriptionEvent::BoxRemoved { r#box });
+    }
 }
 
 /// dissolve: remove a box WITHOUT affecting any other box's view. The box's
@@ -3523,11 +3561,14 @@ fn apply_to_copy_typed(
             .map_err(|error| format!("apply '{rel}' onto copy: {error}"))?;
         applied += 1;
     }
-    broadcast(
-        state,
-        &json!({"type": "session_new",
-        "session_id": new_id.to_string(), "name": new_name}),
-    );
+    if let (Ok(r#box), Ok(name)) = (u64::try_from(new_id),
+        crate::wire::BoundedText::new(new_name.clone()))
+    {
+        broadcast(state, &crate::generated_wire::SubscriptionEvent::BoxAdded {
+            r#box, name: Some(name),
+            parent: grandparent.and_then(|value| u64::try_from(value).ok()),
+        });
+    }
     Ok(crate::generated_wire::ApplyCopyResult {
         r#box: u64::try_from(new_id).map_err(|_| "negative allocated box id")?,
         name: crate::wire::BoundedText::new(new_name)
@@ -4277,15 +4318,15 @@ fn register(
     // just never fired here because we forgot to broadcast it.
     // session_removed (in delete / kill paths) and session_renamed
     // (in rename) were getting sent; this is the missing third leg.
-    broadcast(
-        state,
-        &json!({
-            "type": "session_added",
-            "sid": id.to_string(),
-            "name": name,
-            "parent": parent,
-        }),
-    );
+    if let (Ok(r#box), Ok(name)) = (u64::try_from(id),
+        crate::wire::BoundedText::new(name.clone()))
+    {
+        broadcast(state, &crate::generated_wire::SubscriptionEvent::BoxAdded {
+            r#box,
+            name: Some(name),
+            parent: parent.and_then(|value| u64::try_from(value).ok()),
+        });
+    }
     let root = crate::paths::mnt_point().join(id.to_string());
 
     // ── Networking (-n boxes only) ────────────────────────────────────────
@@ -6558,11 +6599,10 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     p.disable_box(id);
                 }
             }
-            broadcast(
-                &state,
-                &json!({"type": "session_removed",
-                                      "session_id": id.to_string()}),
-            );
+            if let Ok(r#box) = u64::try_from(id) {
+                broadcast(&state,
+                    &crate::generated_wire::SubscriptionEvent::BoxRemoved { r#box });
+            }
             return;
         }
         if subscribe {

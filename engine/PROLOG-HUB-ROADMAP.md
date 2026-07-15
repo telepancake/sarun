@@ -845,6 +845,14 @@ belong to the relation.
   a concrete generated request and success path. The full native
   aarch64-musl suite passes 308 tests with one existing browser e2e test
   ignored.
+- Replaced every event producer's open JSON object with the generated bounded
+  `SubscriptionEvent` sum, including coalesced overlay/process invalidations,
+  box lifecycle, build/provenance, API/web capture, and pong. Detailed records
+  are no longer copied into invalidation events. The temporary newline listener
+  is now only an outer projection of these typed events and will be deleted by
+  the coordinated binary listener/client cutover. The full native
+  aarch64-musl suite passes 308 tests with one existing browser e2e test
+  ignored.
 
 ## Stop conditions
 
