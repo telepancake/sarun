@@ -1456,6 +1456,10 @@ fn dispatch_action(
             crate::views::find(&lock(state).views, view, row_id)
                 .map(|value| ActionSuccess::ViewFind { value })
         }
+        ActionRequest::ViewWindow { view, start, size } => {
+            crate::views::window(&lock(state).views, view, start, size)
+                .map(|value| ActionSuccess::ViewWindow { value })
+        }
         ActionRequest::ViewClose { view } => {
             crate::views::close(&mut lock(state).views, view)?;
             Ok(ActionSuccess::ViewClose { value: () })
@@ -1588,6 +1592,160 @@ fn legacy_filter_spec(value: &Value) -> Result<Option<crate::generated_wire::Fil
         .map_err(|error| format!("filter clause count exceeds relation bound: {error:?}"))
 }
 
+fn legacy_bytes<const MAXIMUM: usize>(value: crate::wire::BoundedBytes<MAXIMUM>) -> String {
+    String::from_utf8_lossy(value.as_slice()).into_owned()
+}
+
+fn legacy_pipeline_stage(stage: crate::generated_wire::PipelineStage) -> Value {
+    use crate::generated_wire::PipelineStage;
+    match stage {
+        PipelineStage::Simple { words, redirects } => json!({
+            "kind": "simple",
+            "words": words.into_inner().into_iter().map(legacy_bytes).collect::<Vec<_>>(),
+            "redirects": redirects,
+        }),
+        PipelineStage::Compound { redirects, text } => json!({
+            "kind": "compound",
+            "redirects": redirects,
+            "text": text.into_inner(),
+        }),
+        PipelineStage::Function { text } => json!({
+            "kind": "function",
+            "text": text.into_inner(),
+        }),
+        PipelineStage::ExtendedTest { text } => json!({
+            "kind": "extended_test",
+            "text": text.into_inner(),
+        }),
+    }
+}
+
+fn legacy_pipeline_provenance(record: crate::generated_wire::PipelineProvenance) -> Value {
+    let stage_count = record.stages.as_slice().len();
+    let mut value = json!({
+        "cmd": record.command.into_inner(),
+        "bang": record.negated,
+        "stages": stage_count,
+        "stage_detail": record.stages.into_inner().into_iter()
+            .map(legacy_pipeline_stage).collect::<Vec<_>>(),
+        "out_targets": record.output_targets.into_inner().into_iter()
+            .map(legacy_bytes).collect::<Vec<_>>(),
+        "uid": record.uid,
+        "parent_uid": record.parent_uid,
+        "seq": record.sequence,
+        "spawn_ts": record.spawned_at,
+    });
+    if record.nested {
+        value["nested"] = Value::Bool(true);
+    }
+    if let Some(edge) = record.edge_output {
+        value["edge_out"] = Value::String(legacy_bytes(edge));
+    }
+    value
+}
+
+fn legacy_view_window(value: crate::generated_wire::ViewWindow) -> Value {
+    use crate::generated_wire::{ChangeKind, EchoStream, ViewWindow};
+    match value {
+        ViewWindow::Changes { start, total, rows } => json!({
+            "start": start,
+            "total": total,
+            "rows": rows.into_inner().into_iter().map(|row| {
+                let kind = match row.kind {
+                    ChangeKind::Changed => "changed",
+                    ChangeKind::Deleted => "deleted",
+                    ChangeKind::Symlink => "symlink",
+                    ChangeKind::Created => "created",
+                    ChangeKind::Modified => "modified",
+                    ChangeKind::Xattr => "xattr",
+                    ChangeKind::Directory => "dir",
+                    ChangeKind::XattrOnly => "xattr-only",
+                };
+                let mut value = json!({
+                    "path": legacy_bytes(row.path),
+                    "name": legacy_bytes(row.name),
+                    "kind": kind,
+                    "size": row.size,
+                    "depth": row.depth,
+                    "connector": row.connector,
+                });
+                if let Some(path) = row.xattr_for {
+                    value["xattr_for"] = Value::String(legacy_bytes(path));
+                }
+                if let Some(key) = row.xattr_key {
+                    value["xattr_key"] = Value::String(legacy_bytes(key));
+                }
+                value
+            }).collect::<Vec<_>>(),
+        }),
+        ViewWindow::Processes { start, total, rows } => json!({
+            "start": start,
+            "total": total,
+            "rows": rows.into_inner().into_iter().map(|row| json!({
+                "rid": row.id,
+                "tgid": row.tgid,
+                "ppid": row.ppid,
+                "exe": legacy_bytes(row.executable),
+                "argv": row.argv.into_inner().into_iter()
+                    .map(legacy_bytes).collect::<Vec<_>>(),
+                "depth": row.depth,
+                "connector": row.connector,
+            })).collect::<Vec<_>>(),
+        }),
+        ViewWindow::Outputs { start, total, rows } => json!({
+            "start": start,
+            "total": total,
+            "rows": rows.into_inner().into_iter().map(|row| json!({
+                "id": row.output.id,
+                "ts": row.output.time,
+                "process_id": row.output.process,
+                "stream": match row.output.stream {
+                    EchoStream::Stdout => 0,
+                    EchoStream::Stderr => 1,
+                },
+                "len": row.output.length,
+                "exe": legacy_bytes(row.executable),
+                "tgid": row.tgid,
+            })).collect::<Vec<_>>(),
+        }),
+        ViewWindow::Pipelines { start, total, rows } => json!({
+            "start": start,
+            "total": total,
+            "rows": rows.into_inner().into_iter().map(|row| json!({
+                "id": row.id,
+                "ts": row.time,
+                "cmd": row.command.into_inner(),
+                "record": row.record.map(legacy_pipeline_provenance),
+                "pipeline": row.pipeline,
+                "spawn_ts": row.spawned_at,
+                "nested": row.nested,
+                "uid": row.uid.unwrap_or(0),
+                "parent_uid": row.parent_uid.unwrap_or(0),
+                "done_ts": row.done_at.unwrap_or(0.0),
+                "exit_code": row.exit_code.unwrap_or(-1),
+                "processes": row.processes.into_inner(),
+            })).collect::<Vec<_>>(),
+        }),
+        ViewWindow::BuildEdges { start, total, rows } => json!({
+            "start": start,
+            "total": total,
+            "rows": rows.into_inner().into_iter().map(|row| json!({
+                "id": row.id,
+                "ts": row.time,
+                "outs": row.outputs.into_inner().into_iter()
+                    .map(legacy_bytes).collect::<Vec<_>>(),
+                "ins": row.inputs.into_inner().into_iter()
+                    .map(legacy_bytes).collect::<Vec<_>>(),
+                "cmd": row.command.map(|value| value.into_inner()),
+                "started_ts": row.started_at,
+                "ended_ts": row.ended_at,
+                "exit_code": row.exit_code,
+                "output_excerpt": row.output_excerpt.map(|value| value.into_inner()),
+            })).collect::<Vec<_>>(),
+        }),
+    }
+}
+
 fn legacy_ui_action_reply(
     result: Result<crate::generated_wire::ActionSuccess, String>,
 ) -> Value {
@@ -1604,6 +1762,7 @@ fn legacy_ui_action_reply(
         Ok(ActionSuccess::ViewFind { value: None }) => {
             json!({"ok": false, "error": "not found"})
         }
+        Ok(ActionSuccess::ViewWindow { value }) => legacy_view_window(value),
         Ok(ActionSuccess::ViewClose { .. }) => json!({"ok": true}),
         Ok(other) => {
             return json!({
@@ -3891,11 +4050,19 @@ macro_rules! ui_verbs {
             ));
         }
         "view.window" => {
-            let vid = args.first().and_then(Value::as_u64).unwrap_or(0);
-            let start = args.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
-            let size = args.get(2).and_then(Value::as_u64).unwrap_or(0) as usize;
-            let s = lock(state);
-            crate::views::window(&s.views, vid, start, size)
+            let Some(view) = args.first().and_then(Value::as_u64) else {
+                return json!({"ok": false, "error": "missing or invalid view id"});
+            };
+            let Some(start) = args.get(1).and_then(Value::as_u64) else {
+                return json!({"ok": false, "error": "missing or invalid window start"});
+            };
+            let Some(size) = args.get(2).and_then(Value::as_u64) else {
+                return json!({"ok": false, "error": "missing or invalid window size"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::ViewWindow { view, start, size },
+            ));
         }
         "view.filter" => {
             let Some(view) = args.first().and_then(Value::as_u64) else {
@@ -6094,18 +6261,31 @@ mod verb_tests {
     #[test]
     fn typed_view_requests_drive_the_stateful_view_registry() {
         use crate::generated_wire::{
-            ActionRequest, ActionSuccess, FilterClause, FilterJoin, FilterKind,
+            ActionRequest, ActionSuccess, FilterClause, FilterJoin, FilterKind, PipelineRow,
         };
         let state: State = Default::default();
+        let pipeline = |id, command: &str| PipelineRow {
+            id,
+            time: 0.0,
+            command: crate::wire::BoundedText::new(command.into()).unwrap(),
+            record: None,
+            pipeline: None,
+            spawned_at: None,
+            done_at: None,
+            nested: false,
+            uid: None,
+            parent_uid: None,
+            exit_code: Some(0),
+            processes: crate::wire::BoundedVec::new(Vec::new()).unwrap(),
+        };
         lock(&state).views.insert(
             9,
             crate::views::View {
-                kind: crate::views::Kind::Pipelines,
                 sid: 1,
-                source: vec![
-                    json!({"id": 11, "cmd": "drop", "exit_code": 0}),
-                    json!({"id": 12, "cmd": "keep this", "exit_code": 0}),
-                ],
+                source: crate::views::ViewRows::Pipelines(vec![
+                    pipeline(11, "drop"),
+                    pipeline(12, "keep this"),
+                ]),
                 idx: vec![0, 1],
                 filter: None,
                 aux: crate::views::ViewAux::Pipelines,
@@ -6144,6 +6324,23 @@ mod verb_tests {
                 value: crate::generated_wire::ViewFilterResult { total: 1 },
             }
         );
+
+        let window = dispatch_action(
+            &state,
+            ActionRequest::ViewWindow {
+                view: 9,
+                start: 0,
+                size: 10,
+            },
+        )
+        .unwrap();
+        let ActionSuccess::ViewWindow {
+            value: crate::generated_wire::ViewWindow::Pipelines { start, total, rows },
+        } = window else {
+            panic!("wrong typed view window variant")
+        };
+        assert_eq!((start, total), (0, 1));
+        assert_eq!(rows.as_slice()[0].id, 12);
 
         assert_eq!(
             dispatch_action(&state, ActionRequest::ViewClose { view: 9 }).unwrap(),
