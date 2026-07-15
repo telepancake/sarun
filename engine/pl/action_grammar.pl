@@ -35,6 +35,7 @@
 
 :- use_module(action_catalog).
 :- use_module(context_relation).
+:- use_module(grammar_engine).
 :- use_module(transport_catalog).
 
 /** <module> Relational parser and representation hub
@@ -634,9 +635,6 @@ append([], Tail, Tail).
 append([Head|Items], Tail, [Head|Result]) :-
     append(Items, Tail, Result).
 
-source_unit(unit(_, Span, PaintSpans, Surface, _, _, Preference, Origin),
-            Span, PaintSpans, Surface, Preference, Origin).
-
 % Singular execution relation for an action form.  Concrete source units,
 % edit tears, and rendered surfaces differ only at the terminal relation;
 % sequence, cardinality, normalization inputs, and end-of-form behavior are
@@ -644,128 +642,13 @@ source_unit(unit(_, Span, PaintSpans, Surface, _, _, Preference, Origin),
 form_relation(Action, Items, Mode, Projection, SourceArgs, Evidence,
               EditCount) :-
     action_form(Action, Specs, Projection),
-    relate_specs(Specs, Items, Mode, SourceArgs, Evidence, EditCount).
+    relate_sequence(Specs, Items, Mode, action_grammar:terminal_relation,
+                    SourceArgs, Evidence, EditCount).
 
-relate_specs([], [], _Mode, [], [], 0).
-% Once an edit tear has been consumed by an enclosing call, the ordinary
-% parser may end with an expected continuation.  The missing typed arguments
-% remain explicit holes in the incomplete command; concrete input to the
-% right of a tear is never skipped and must still parse normally.
-relate_specs(Specs, [], assist(_), Args, [], 0) :-
-    specs_require_input(Specs),
-    missing_source_args(Specs, Args).
-relate_specs([literal(Semantic, Text, Syntax, Description, LitPreference)|Specs],
-            [Item|Items], Mode, Args,
-            [EvidenceItem|Evidence], EditCount) :-
-    match_literal_item(
-        literal(Semantic, Text, Syntax, Description, LitPreference),
-        Item, Mode, EvidenceItem, ItemEditCount),
-    relate_specs(Specs, Items, Mode, Args, Evidence, RestCount),
-    EditCount is RestCount + ItemEditCount.
-relate_specs([argument(arg(Name, Kind, required, scalar))|Specs],
-            [Item|Items], Mode, [Value|Args], [EvidenceItem|Evidence],
-            EditCount) :-
-    match_argument_item(Name, Kind, Item, Mode, Value, EvidenceItem,
-                        ItemEditCount),
-    relate_specs(Specs, Items, Mode, Args, Evidence, RestCount),
-    EditCount is RestCount + ItemEditCount.
-relate_specs([argument(arg(Name, Kind, optional, scalar))|Specs],
-            [Item|Items], Mode, [Value|Args], [EvidenceItem|Evidence],
-            EditCount) :-
-    match_argument_item(Name, Kind, Item, Mode, Value, EvidenceItem,
-                        ItemEditCount),
-    relate_specs(Specs, Items, Mode, Args, Evidence, RestCount),
-    EditCount is RestCount + ItemEditCount.
-relate_specs([argument(arg(_, _, optional, scalar))|Specs], Items, Mode,
-            Args, Evidence, EditCount) :-
-    relate_specs(Specs, Items, Mode, Args, Evidence, EditCount).
-relate_specs([argument(arg(Name, Kind, repeated, Shape))|Specs], Items0, Mode,
-            Args, Evidence, EditCount) :-
-    repeated_arguments(Shape, Values, Specs, RepeatedArgs),
-    append(RepeatedArgs, RestArgs, Args),
-    relate_repeated_items(Name, Kind, Values, Items0, Mode, RepeatedEvidence,
-                          RepeatedEditCount, Items),
-    relate_specs(Specs, Items, Mode, RestArgs, RestEvidence, RestEditCount),
-    append(RepeatedEvidence, RestEvidence, Evidence),
-    EditCount is RepeatedEditCount + RestEditCount.
-
-match_literal_item(
-    literal(Semantic, Text, Syntax, Description, LitPreference), Item, Mode,
-    evidence(Semantic, Span, PaintSpans, Surface, Syntax, Description,
-             Preference, Origin), 0) :-
-    source_mode(Mode),
-    source_unit(Item, Span, PaintSpans, Surface, SourcePreference, Origin),
-    text_string(Surface, SurfaceString),
-    SurfaceString = Text,
-    Preference is SourcePreference + LitPreference.
-match_literal_item(
-    literal(Semantic, Text, Syntax, Description, LitPreference),
-    edit_tear(EditId, Span, Surface), assist(EditId),
-    evidence(Semantic, Span, [], Surface, Syntax, Description, LitPreference,
-             tear(EditId, literal(Text))), 1) :-
-    surface_prefix(Surface, Text).
-match_literal_item(literal(_, Text, _, _, _), rendered(Text), render,
-                   rendered, 0).
-
-match_argument_item(Name, Kind, Item, Mode, Value,
-                    evidence(Value, Span, PaintSpans, Surface, Syntax,
-                             Name, Preference, Origin), 0) :-
-    source_mode(Mode),
-    source_unit(Item, Span, PaintSpans, Surface, SourcePreference, Origin),
-    argument_surface(Kind, Value, Surface),
-    kind_syntax(Kind, Syntax),
-    Preference is SourcePreference + 10.
-match_argument_item(Name, Kind, edit_tear(EditId, Span, Surface),
-                    assist(EditId), hole(Name, Kind),
-                    evidence(hole(Name, Kind), Span, [], Surface, Syntax,
-                             Name, 10,
-                             tear(EditId, argument(Name, Kind))), 1) :-
-    kind_syntax(Kind, Syntax).
-match_argument_item(_Name, Kind, rendered(Surface), render, Value, rendered,
-                    0) :-
+terminal_relation(surface(Kind, Value, Surface)) :-
     argument_surface(Kind, Value, Surface).
-
-source_mode(exact).
-source_mode(assist(_)).
-
-relate_repeated_items(_, _, [], Items, _Mode, [], 0, Items).
-relate_repeated_items(Name, Kind, [Value|Values], [Item|Items0], Mode,
-                      [Evidence|EvidenceItems], EditCount, Items) :-
-    match_argument_item(Name, Kind, Item, Mode, Value, Evidence,
-                        ItemEditCount),
-    relate_repeated_items(Name, Kind, Values, Items0, Mode, EvidenceItems,
-                          RestEditCount, Items),
-    EditCount is ItemEditCount + RestEditCount.
-
-specs_require_input([literal(_, _, _, _, _)|_]).
-specs_require_input([argument(arg(_, _, required, scalar))|_]).
-specs_require_input([_|Specs]) :-
-    specs_require_input(Specs).
-
-missing_source_args([], []).
-missing_source_args([literal(_, _, _, _, _)|Specs], Args) :-
-    missing_source_args(Specs, Args).
-missing_source_args([argument(arg(Name, Kind, required, scalar))|Specs],
-                    [hole(Name, Kind)|Args]) :-
-    missing_source_args(Specs, Args).
-missing_source_args([argument(arg(_, _, optional, scalar))|Specs], Args) :-
-    missing_source_args(Specs, Args).
-missing_source_args([argument(arg(_, _, repeated, Shape))|Specs], Args) :-
-    repeated_arguments(Shape, [], Specs, RepeatedArgs),
-    missing_source_args(Specs, RestArgs),
-    append(RepeatedArgs, RestArgs, Args).
-
-repeated_arguments(array, Values, _Specs, [array(Values)]) :-
-    Values = [_|_].
-repeated_arguments(array, [], Specs, [array([])]) :-
-    specs_have_argument(Specs).
-repeated_arguments(array, [], Specs, []) :-
-    \+ specs_have_argument(Specs).
-repeated_arguments(spread, Values, _Specs, Values).
-
-specs_have_argument([argument(_)|_]) :- !.
-specs_have_argument([_|Specs]) :-
-    specs_have_argument(Specs).
+terminal_relation(syntax(Kind, Syntax)) :-
+    kind_syntax(Kind, Syntax).
 
 argument_surface(boolean, boolean(true), Surface) :-
     canonical_text_surface("true", Surface).

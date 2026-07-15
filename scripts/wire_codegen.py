@@ -26,6 +26,7 @@ Term = str | int | list["Term"] | Compound
 SCHEMA_SOURCES = (
     "engine/pl/action_catalog.pl",
     "engine/pl/action_grammar.pl",
+    "engine/pl/grammar_engine.pl",
     "engine/pl/context_relation.pl",
     "engine/pl/transport_catalog.pl",
     "engine/pl/wire_codegen.pl",

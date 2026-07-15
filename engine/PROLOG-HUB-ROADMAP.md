@@ -108,6 +108,89 @@ future improvements in code, documentation, or status reports. Completion
 means proving the singular relation is the authority and deleting the
 superseded path; it does not mean leaving both paths present behind a choice.
 
+## Grammar engine boundary
+
+The hub must be three independently understandable layers, with dependencies
+flowing in one direction:
+
+1. The grammar engine owns neutral sources and sinks, bounded execution modes,
+   variables/tears, evidence, ranking, context query graphs, dependency keys,
+   relational composition, and generic transformation operations. It imports
+   no sarun catalog and contains no grammar-name dispatch (`parse_cpp26`,
+   `parse_old_german`, or an equivalent switch hidden in data).
+2. A grammar declares only relations among representations: sequence, choice,
+   repetition, fields, semantic values, constraints, embeddings, context
+   requirements, and presentation metadata. It does not implement a parsing or
+   printing traversal, completion algorithm, context scheduler, FFI codec, or
+   consumer callback. Adding a grammar must not require editing the engine.
+3. A client such as sarun selects/composes grammar values, supplies neutral
+   input/output representations, and implements context providers through a
+   bounded generic query API. It does not inspect grammar productions or
+   reimplement any derived operation. Adding a grammar must not require adding
+   a grammar-specific Rust method.
+
+The uniform engine operation is relation transformation, not a collection of
+parser entry points. Parse, validate, encode, decode, render, complete,
+highlight, explain, and dependency discovery are mode/projection choices over
+the same grammar value and evidence. Grammars may be values nested in other
+grammars; PHP-like language switching and protocol-stack composition must use
+ordinary composition rather than engine registration.
+
+Necessary operational ugliness belongs inside the engine: termination/mode
+checks, bounds, immutable blob slicing, tear bookkeeping, ambiguity/ranking,
+context staging, caching/invalidation keys, exception containment, and FFI
+marshalling. Grammar declarations and client calls must stay terse even when
+those mechanisms are active.
+
+Two portability tests constrain the grammar IR before it is considered
+generic:
+
+- A Tree-sitter grammar translator should map named rules plus ordinary
+  `seq`/`choice`/`repeat`/`optional`, lexical tokens, fields, precedence,
+  associativity, conflicts, extras, inline/supertypes, and embedded languages
+  into engine grammar values. Source spans, concrete and semantic trees,
+  highlighting, tears, and completions then come from ordinary engine
+  projections. External scanners are explicit bounded primitive relations,
+  not permission to generate a grammar-specific engine entry point.
+- A Wireshark dissector translator should map protocol fields/value tables,
+  bounded cursor and slice operations, endian scalars, dependent lengths,
+  conditional/choice fields, dispatch tables, checksums, nested sub-dissectors,
+  reassembly/context requirements, expert diagnostics, and subtree spans into
+  the same IR. Original packet bytes remain the source representation; decode,
+  validate, tree display, filtering metadata, and re-encoding are projections.
+  Arbitrary side-effecting C cannot be imported as grammar semantics: effects
+  must be isolated as declared context queries or small pure bounded primitives.
+
+These translators need not preserve the source implementation strategy. Their
+output must be declarative grammar data, and adding the translated output must
+not change the engine or Rust API. Representative translated fixtures—one
+precedence/conflict/external-token language fragment and one
+length/dispatch/checksum protocol fragment—are required architecture tests.
+
+Immediate extraction order:
+
+- [x] Move relational sequence execution, tears, evidence, repetition, and
+      rendering terminals into an engine module with no sarun imports; prove
+      it with an independent foreign grammar test.
+- [ ] Move neutral source validation and all completion/highlight projections
+      into the grammar-independent engine rather than action grammar helpers.
+- [ ] Replace the flat action-only spec vocabulary with composable grammar
+      values for sequence, choice, repetition, named fields, constraints, and
+      embedded grammars.
+- [ ] Define precedence/conflict/lexical-extra and bounded byte-cursor/layout
+      constructs sufficient for representative Tree-sitter and Wireshark
+      translations; reject constructs that would require hidden effects.
+- [ ] Move primitive text/value and bounded blob codecs into reusable grammar
+      modules; eliminate action-specific structured JSON handling from the
+      engine layer.
+- [ ] Move context planning/completion/dependency projection behind the same
+      generic grammar-value interface.
+- [ ] Replace operation-specific and action-specific Rust term decoders with a
+      bounded generic transformation envelope plus generated typed projections
+      at application boundaries.
+- [ ] Keep `sarun_actions` and transport/packet/patch/brush grammars as clients
+      of the engine; enforce the dependency direction in tests and build inputs.
+
 ## Starting state (historical, not the current implementation)
 
 The migration started with three competing authorities:
