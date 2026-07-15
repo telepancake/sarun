@@ -899,7 +899,9 @@ impl Runtime {
                 "load_files('res://app/relation_api.pl',[silent(true)]),",
                 "load_files('res://app/action_grammar.pl',[silent(true)]),",
                 "action_grammar:valid_transport_catalog,",
-                "action_grammar:valid_action_catalog),",
+                "action_grammar:valid_action_catalog,",
+                "action_grammar:action_relation_grammar(ActionGrammar),",
+                "grammar_store:install_grammar(sarun_actions,ActionGrammar)),",
                 "{},R),R\\==inference_limit_exceeded"
             ),
             LOAD_INFERENCES
@@ -2991,6 +2993,40 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.contains("output limit"), "{error}");
+    }
+
+    #[test]
+    fn installed_action_grammar_is_reached_by_opaque_handle() {
+        let prolog = global().unwrap();
+        let reply = prolog
+            .transform(&RelationRequest {
+                grammar: rv_compound("grammar_handle", vec![rv_atom("sarun_actions")]),
+                given: vec![RelationBinding {
+                    name: "command".into(),
+                    value: rv_compound(
+                        "command",
+                        vec![
+                            rv_atom("mirror_resume"),
+                            rv_atom("mirror_pause"),
+                            rv_atom("ui"),
+                            rv_list(vec![
+                                rv_compound("integer", vec![rv_integer(7)]),
+                                rv_compound("boolean", vec![rv_atom("false")]),
+                            ]),
+                        ],
+                    ),
+                }],
+                wanted: vec!["source".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert!(reply.diagnostics.is_empty(), "{:?}", reply.diagnostics);
+        assert_eq!(reply.solutions.len(), 1);
+        assert_eq!(
+            reply.solutions[0].bindings[0].value,
+            rv_string("mirror resume 7")
+        );
     }
 
     #[test]

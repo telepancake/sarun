@@ -1,6 +1,7 @@
 :- module(test_relation_api, [run_relation_api_tests/0]).
 
 :- use_module(relation_api).
+:- use_module(grammar_store).
 
 test_name(same_request_shape_parses_and_renders_foreign_grammar).
 test_name(tear_completion_is_aggregated_from_parse_evidence).
@@ -10,6 +11,7 @@ test_name(grammar_choice_and_projection_are_executable_data).
 test_name(projection_template_is_bidirectional_and_can_append_values).
 test_name(choice_namespaces_context_dependencies).
 test_name(grammar_terminal_codecs_are_declarative_and_bidirectional).
+test_name(opaque_handle_resolves_install_once_grammar).
 test_name(solution_limit_is_enforced_and_reported).
 test_name(envelope_fails_closed).
 
@@ -320,6 +322,28 @@ run_test(grammar_terminal_codecs_are_declarative_and_bidirectional) :-
         reply([solution([binding(source,
                                  "build {\"context\":\"eA==\",\"tag\":null,\"arguments\":[[\"CC\",\"clang\"]]}")],
                         0)], [], [], [])).
+
+run_test(opaque_handle_resolves_install_once_grammar) :-
+    foreign_grammar(Grammar),
+    install_grammar(foreign_test, Grammar),
+    install_grammar(foreign_test, Grammar),
+    source("hello", 0, Hello),
+    source("friend", 6, Friend),
+    limits(Limits),
+    transform(
+        request(grammar_handle(foreign_test),
+                given([binding(source,
+                               source([Hello, Friend, end(12)], exact))]),
+                want([arguments]), observations([]), Limits),
+        reply([solution([binding(arguments, [word("friend")])], 36)],
+              [], [], [])),
+    Different = sequence_grammar([], terminals([]), separator(" "),
+                                 contexts([])),
+    \+ install_grammar(foreign_test, Different),
+    transform(
+        request(grammar_handle(missing), given([]), want([source]),
+                observations([]), Limits),
+        reply([], [], [], [diagnostic(invalid_request)])).
 
 run_test(envelope_fails_closed) :-
     foreign_grammar(Grammar),

@@ -4,12 +4,13 @@
 // source-sha256 engine/pl/action_grammar.pl 71bf1f2ec82df4b1358c9ca6d876cf9a002c61e70ca45ad4e20e056e423f66ea
 // source-sha256 engine/pl/grammar_engine.pl 17951156f02ac4d5c0b0cd16fb72e35f56108e345229866c4909553111fb60c5
 // source-sha256 engine/pl/grammar_codec.pl f27871fc35afddbe199d23e51986ae3f9ce6f68d83d241cc8f25f0b692d8fdb6
+// source-sha256 engine/pl/grammar_store.pl a2bffdb3e6fd18a0d45de5269427be6386164530de6c3b9097c4d878ab0093fd
 // source-sha256 engine/pl/grammar_ir.pl aec41cb852a14f60e1caddbf6e8ef24b0dc91877d4062268bb115f857b337063
-// source-sha256 engine/pl/relation_api.pl 0033ff1a97a69bf0eec4816c84742c2531bbfe9b4e778380b0b228ddbb801d81
+// source-sha256 engine/pl/relation_api.pl ad889e938e6fa12b8491da2d8e8dd2d16496a6400223786a43e1e75695f1fb58
 // source-sha256 engine/pl/context_relation.pl cbf9d8788d006f18250dd45d07ce8664ec28e1fc997630b7a0ca717c2f8f3a0c
 // source-sha256 engine/pl/transport_catalog.pl 54563becea268fb763b7ffc091c055b5968563921953ec9001c41f36b712718f
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
-// source-sha256 scripts/wire_codegen.py 6a09fc5a7f7f06e43156750da4b497acded835e2e151adc1b6aa88678cd08f8e
+// source-sha256 scripts/wire_codegen.py ce9aaa574ba6016d53ad199f19d79abe08c5d30e4d841fb1ebff1f388a89e789
 
 use crate::prolog::RelationValue;
 use crate::wire::{

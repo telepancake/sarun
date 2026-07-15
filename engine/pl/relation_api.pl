@@ -1,6 +1,7 @@
 :- module(relation_api, [transform/2]).
 
 :- use_module(grammar_engine).
+:- use_module(grammar_store).
 
 /** <module> Single bounded grammar-engine boundary */
 
@@ -13,10 +14,11 @@ transform(Request, Reply) :-
     ).
 
 transform_request(
-    request(Grammar, given(Given), want(Wanted), observations(Observations),
+    request(GrammarReference, given(Given), want(Wanted), observations(Observations),
             Limits),
     Reply) :-
     valid_envelope(Given, Wanted, Observations, Limits),
+    resolve_grammar(GrammarReference, Grammar),
     !,
     ( transform_relation(Grammar, Given, Wanted, Observations, Limits, Reply)
     -> true

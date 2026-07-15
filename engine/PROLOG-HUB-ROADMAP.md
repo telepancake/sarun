@@ -280,6 +280,14 @@ inspection. Completion preferences from every successful choice branch are
 merged and reranked globally. Action-level tests cover the reported `kill C1`
 flow, its typed wire-ready result, a two-stage box/path dependency, and context
 completion returned from the ordinary torn parse.
+`grammar_store.pl` now provides install-once immutable grammar handles. The
+embedded startup composition materializes the complete action value once and
+installs it as `grammar_handle(sarun_actions)`; `relation_api` resolves handles
+generically and has no action-name branch. Reinstalling the identical value is
+idempotent, changing a handle fails, and missing handles fail closed. A native
+aarch64 structured-FLI test renders an action through the installed handle, so
+Rust neither transports nor inspects the grammar tree. Production action
+adapters still call the old operation path and are the next cut-over.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:
