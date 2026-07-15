@@ -57,6 +57,30 @@ transform_relation(context_grammar, Given, Wanted, _EnvelopeObservations,
     ),
     Available = [binding(outcome, Outcome)],
     requested_bindings(Wanted, Available, Bindings).
+
+transform_relation(choice_grammar(Alternatives), Given, Wanted, Observations,
+                   Limits,
+                   reply(Solutions, Queries, DependencyKeys, Diagnostics)) :-
+    Limits = limits(MaxSolutions, _MaxEvidence, _MaxOutputBytes),
+    findall(Reply,
+            choice_alternative_reply(Alternatives, Given, Wanted,
+                                     Observations, Limits, Reply),
+            Replies),
+    Replies = [_|_],
+    choice_replies(Replies, Solutions0, Queries0, DependencyKeys0,
+                   Diagnostics0),
+    limit_solutions(Solutions0, MaxSolutions, Solutions, LimitDiagnostics),
+    sort(Queries0, Queries),
+    sort(DependencyKeys0, DependencyKeys),
+    append(Diagnostics0, LimitDiagnostics, Diagnostics).
+
+transform_relation(projection_grammar(Grammar, Projections), Given, Wanted,
+                   Observations, Limits, Reply) :-
+    projection_inner_request(Projections, Given, Wanted, InnerGiven,
+                             InnerWanted),
+    transform_relation(Grammar, InnerGiven, InnerWanted, Observations, Limits,
+                       InnerReply),
+    project_reply(Projections, Wanted, InnerReply, Reply).
 transform_relation(context_grammar, Given, Wanted, Observations, _Limits,
                    reply([solution(Bindings, 0)], [], DependencyKeys, [])) :-
     given_value(graph, Given, Graph),
@@ -107,6 +131,185 @@ transform_relation(
     Available = [binding(source, Text),
                  binding(rendered_items, RenderedItems)],
     requested_bindings(Wanted, Available, Bindings).
+
+% A choice is grammar composition, not an operation switch. Alternative keys
+% are immutable grammar data used to namespace context-query identities; a
+% context observation can therefore be routed back through the same nested
+% grammar without a client knowing which branch produced it.
+choice_alternative_reply(
+    [alternative(Key, Preference, Grammar)|_], Given, Wanted, Observations,
+    Limits, Reply) :-
+    scoped_observations(Key, Observations, InnerObservations),
+    transform_relation(Grammar, Given, Wanted, InnerObservations, Limits,
+                       InnerReply),
+    scope_reply(Key, Preference, InnerReply, Reply).
+choice_alternative_reply([_|Alternatives], Given, Wanted, Observations,
+                         Limits, Reply) :-
+    choice_alternative_reply(Alternatives, Given, Wanted, Observations,
+                             Limits, Reply).
+
+scoped_observations(_, [], []).
+scoped_observations(Key,
+                    [observed(branch(Key, Id), Query, Source, Outcome)|Rest],
+                    [observed(Id, Query, Source, Outcome)|Inner]) :-
+    !,
+    scoped_observations(Key, Rest, Inner).
+scoped_observations(Key, [_|Rest], Inner) :-
+    scoped_observations(Key, Rest, Inner).
+
+scope_reply(Key, AlternativePreference,
+            reply(Solutions0, Queries0, Dependencies0, Diagnostics),
+            reply(Solutions, Queries, Dependencies, Diagnostics)) :-
+    scope_solutions(Solutions0, AlternativePreference, Solutions),
+    scope_queries(Key, Queries0, Queries),
+    scope_dependencies(Key, Dependencies0, Dependencies).
+
+scope_solutions([], _, []).
+scope_solutions([solution(Bindings, Preference0)|Rest], AlternativePreference,
+                [solution(Bindings, Preference)|Solutions]) :-
+    Preference is Preference0 + AlternativePreference,
+    scope_solutions(Rest, AlternativePreference, Solutions).
+
+scope_queries(_, [], []).
+scope_queries(Key, [query(Id, Query)|Rest],
+              [query(branch(Key, Id), Query)|Queries]) :-
+    scope_queries(Key, Rest, Queries).
+
+scope_dependencies(_, [], []).
+scope_dependencies(Key, [dependency(Id, Query, Outcome)|Rest],
+                   [dependency(branch(Key, Id), Query, Outcome)|Dependencies]) :-
+    scope_dependencies(Key, Rest, Dependencies).
+
+choice_replies([], [], [], [], []).
+choice_replies([reply(Solutions0, Queries0, Dependencies0, Diagnostics0)|Rest],
+               Solutions, Queries, Dependencies, Diagnostics) :-
+    choice_replies(Rest, Solutions1, Queries1, Dependencies1, Diagnostics1),
+    append(Solutions0, Solutions1, Solutions),
+    append(Queries0, Queries1, Queries),
+    append(Dependencies0, Dependencies1, Dependencies),
+    append(Diagnostics0, Diagnostics1, Diagnostics).
+
+% A projection template is a small pure relation over generic bindings:
+%
+%   constant(Value)                  immutable grammar data
+%   reference(Name)                  another representation binding
+%   structure(Functor, Arguments)    a compound semantic value
+%   sequence(Items)                  a list semantic value
+%   concatenate(Left, Right)         relational list concatenation
+%
+% This is deliberately data rather than a grammar-supplied predicate. The
+% engine evaluates the same template forward after parsing and backward before
+% rendering.
+projection_inner_request(Projections, Given, Wanted, InnerGiven,
+                         InnerWanted) :-
+    inverse_project_given(Projections, Given, InnerGiven0),
+    projection_wanted_references(Projections, Wanted, References),
+    wanted_without_projections(Wanted, Projections, PassthroughWanted),
+    append(PassthroughWanted, References, InnerWanted0),
+    sort(InnerWanted0, InnerWanted),
+    bindings_without_projections(InnerGiven0, Projections, InnerGiven).
+
+inverse_project_given([], Given, Given).
+inverse_project_given([projection(Name, Template)|Projections], Given0,
+                      Given) :-
+    ( given_value(Name, Given0, Value)
+    -> template_value(Template, Value, Given0, Given1)
+    ;  Given1 = Given0
+    ),
+    inverse_project_given(Projections, Given1, Given).
+
+bindings_without_projections([], _, []).
+bindings_without_projections([binding(Name, _)|Bindings], Projections, Rest) :-
+    projection_named(Name, Projections),
+    !,
+    bindings_without_projections(Bindings, Projections, Rest).
+bindings_without_projections([Binding|Bindings], Projections,
+                             [Binding|Rest]) :-
+    bindings_without_projections(Bindings, Projections, Rest).
+
+projection_wanted_references([], _, []).
+projection_wanted_references([projection(Name, Template)|Projections], Wanted,
+                             References) :-
+    projection_wanted_references(Projections, Wanted, Rest),
+    ( member_term(Name, Wanted)
+    -> template_references(Template, Names), append(Names, Rest, References)
+    ;  References = Rest
+    ).
+
+wanted_without_projections([], _, []).
+wanted_without_projections([Name|Names], Projections, Rest) :-
+    projection_named(Name, Projections),
+    !,
+    wanted_without_projections(Names, Projections, Rest).
+wanted_without_projections([Name|Names], Projections, [Name|Rest]) :-
+    wanted_without_projections(Names, Projections, Rest).
+
+projection_named(Name, [projection(Name, _)|_]).
+projection_named(Name, [_|Projections]) :- projection_named(Name, Projections).
+
+project_reply(Projections, Wanted,
+              reply(Solutions0, Queries, Dependencies, Diagnostics),
+              reply(Solutions, Queries, Dependencies, Diagnostics)) :-
+    project_solutions(Solutions0, Projections, Wanted, Solutions).
+
+project_solutions([], _, _, []).
+project_solutions([solution(InnerBindings, Preference)|Rest], Projections,
+                  Wanted, [solution(Bindings, Preference)|Solutions]) :-
+    projected_available(Projections, InnerBindings, Available),
+    requested_bindings(Wanted, Available, Bindings),
+    project_solutions(Rest, Projections, Wanted, Solutions).
+
+projected_available([], Bindings, Bindings).
+projected_available([projection(Name, Template)|Projections], Bindings0,
+                    Available) :-
+    template_value(Template, Value, Bindings0, Bindings1),
+    put_binding(Name, Value, Bindings1, Bindings2),
+    projected_available(Projections, Bindings2, Available).
+
+template_value(constant(Value), Value, Bindings, Bindings).
+template_value(reference(Name), Value, Bindings0, Bindings) :-
+    put_binding(Name, Value, Bindings0, Bindings).
+template_value(structure(Functor, Templates), Value, Bindings0, Bindings) :-
+    atom(Functor),
+    template_values(Templates, Values, Bindings0, Bindings),
+    Value =.. [Functor|Values].
+template_value(sequence(Templates), Values, Bindings0, Bindings) :-
+    template_values(Templates, Values, Bindings0, Bindings).
+template_value(concatenate(Left, Right), Values, Bindings0, Bindings) :-
+    template_value(Left, LeftValues, Bindings0, Bindings1),
+    template_value(Right, RightValues, Bindings1, Bindings),
+    append(LeftValues, RightValues, Values).
+
+template_values([], [], Bindings, Bindings).
+template_values([Template|Templates], [Value|Values], Bindings0, Bindings) :-
+    template_value(Template, Value, Bindings0, Bindings1),
+    template_values(Templates, Values, Bindings1, Bindings).
+
+put_binding(Name, Value, Bindings, Bindings) :-
+    given_value(Name, Bindings, Existing),
+    !,
+    Existing = Value.
+put_binding(Name, Value, Bindings, [binding(Name, Value)|Bindings]).
+
+template_references(constant(_), []).
+template_references(reference(Name), [Name]).
+template_references(structure(_, Templates), Names) :-
+    templates_references(Templates, Names).
+template_references(sequence(Templates), Names) :-
+    templates_references(Templates, Names).
+template_references(concatenate(Left, Right), Names) :-
+    template_references(Left, LeftNames),
+    template_references(Right, RightNames),
+    append(LeftNames, RightNames, Names).
+
+templates_references([], []).
+templates_references([Template|Templates], Names) :-
+    template_references(Template, Names0),
+    templates_references(Templates, Names1),
+    append(Names0, Names1, Names).
+
+member_term(Value, [Head|_]) :- Value == Head, !.
+member_term(Value, [_|Values]) :- member_term(Value, Values).
 
 sequence_candidate(Specs, Terminals, Body, Mode, MaxEvidence,
                    candidate(Arguments, Evidence, Status, Preference,

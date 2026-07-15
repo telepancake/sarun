@@ -6,6 +6,9 @@ test_name(same_request_shape_parses_and_renders_foreign_grammar).
 test_name(tear_completion_is_aggregated_from_parse_evidence).
 test_name(context_queries_completions_and_dependencies_are_one_relation).
 test_name(context_support_uses_the_same_given_wanted_envelope).
+test_name(grammar_choice_and_projection_are_executable_data).
+test_name(projection_template_is_bidirectional_and_can_append_values).
+test_name(choice_namespaces_context_dependencies).
 test_name(solution_limit_is_enforced_and_reported).
 test_name(envelope_fails_closed).
 
@@ -178,6 +181,112 @@ run_test(context_support_uses_the_same_given_wanted_envelope) :-
                 observations([Observation]), Limits),
         reply([solution([binding(dependency_keys, [Dependency])], 0)], [],
               [Dependency], [])).
+
+run_test(grammar_choice_and_projection_are_executable_data) :-
+    Terminals = terminals([
+        terminal(word, identifier, [surface(word("world"), "world")])
+    ]),
+    Greeting = projection_grammar(
+        sequence_grammar(
+            [literal(hello, "hello", keyword, greeting, 20),
+             argument(arg(name, word, required, scalar))],
+            Terminals, separator(" "), contexts([])),
+        [projection(semantic,
+                    structure(message,
+                              [constant(greeting), reference(arguments)]))]),
+    Farewell = projection_grammar(
+        sequence_grammar(
+            [literal(goodbye, "goodbye", keyword, farewell, 20),
+             argument(arg(name, word, required, scalar))],
+            Terminals, separator(" "), contexts([])),
+        [projection(semantic,
+                    structure(message,
+                              [constant(farewell), reference(arguments)]))]),
+    Grammar = choice_grammar([
+        alternative(greeting, 7, Greeting),
+        alternative(farewell, 3, Farewell)
+    ]),
+    source("hello", 0, Hello),
+    source("world", 6, World),
+    limits(Limits),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               source([Hello, World, end(11)], exact))]),
+                want([semantic]), observations([]), Limits),
+        reply([solution([binding(semantic,
+                                 message(greeting, [word("world")]))], 43)],
+              [], [], [])),
+    transform(
+        request(Grammar,
+                given([binding(semantic,
+                               message(farewell, [word("world")]))]),
+                want([source]), observations([]), Limits),
+        reply([solution([binding(source, "goodbye world")], 3)], [], [], [])).
+
+run_test(projection_template_is_bidirectional_and_can_append_values) :-
+    Grammar = projection_grammar(
+        sequence_grammar(
+            [literal(resume, "resume", keyword, resume, 20),
+             argument(arg(id, integer, required, scalar))],
+            terminals([
+                terminal(integer, integer,
+                         [surface(integer(7), "7")])
+            ]), separator(" "), contexts([])),
+        [projection(semantic,
+                    structure(command,
+                              [constant(mirror_pause),
+                               concatenate(reference(arguments),
+                                           sequence([
+                                               constant(boolean(false))
+                                           ]))]))]),
+    source("resume", 0, Resume),
+    source("7", 7, Seven),
+    limits(Limits),
+    Semantic = command(mirror_pause, [integer(7), boolean(false)]),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               source([Resume, Seven, end(8)], exact))]),
+                want([semantic]), observations([]), Limits),
+        reply([solution([binding(semantic, Semantic)], 36)], [], [], [])),
+    transform(
+        request(Grammar, given([binding(semantic, Semantic)]), want([source]),
+                observations([]), Limits),
+        reply([solution([binding(source, "resume 7")], 0)], [], [], [])).
+
+run_test(choice_namespaces_context_dependencies) :-
+    Grammar = choice_grammar([
+        alternative(open_form, 0,
+            sequence_grammar(
+                [literal(open, "open", keyword, open, 20),
+                 argument(arg(name, word, required, scalar))],
+                terminals([
+                    terminal(word, identifier, [surface(word("wo"), "wo")])
+                ]), separator(" "),
+                contexts([context(name, one, object, root)])))
+    ]),
+    source("open", 0, Open),
+    source("wo", 5, Word),
+    limits(Limits),
+    Query = ask(one, object, name("wo")),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               source([Open, Word, end(7)], exact))]),
+                want([arguments]), observations([]), Limits),
+        reply(_, [query(branch(open_form, q(1)), Query)], [], [])),
+    Entry = entry(object, 7, ["work"], object_id(7), []),
+    Observation = observed(branch(open_form, q(1)), Query,
+                           source(objects, 12), some(one(Entry))),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               source([Open, Word, end(7)], exact))]),
+                want([arguments]), observations([Observation]), Limits),
+        reply(_, [query(branch(open_form, q(1)), Query)],
+              [dependency(branch(open_form, q(1)), Query, some(one(Entry)))],
+              [])).
 
 run_test(envelope_fails_closed) :-
     foreign_grammar(Grammar),

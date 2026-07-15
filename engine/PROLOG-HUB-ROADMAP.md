@@ -241,6 +241,17 @@ adapt to `RelationRequest` and cross the structured FLI path. Their four
 cases have been deleted. Existing graph/ref/cardinality behavior passes through
 `context_grammar` by varying given and wanted bindings, providing the first
 production consumer migrated off the old operation protocol.
+The executable grammar value now composes alternatives with
+`choice_grammar/1` and maps neutral representation bindings to semantic terms
+with bidirectional data templates in `projection_grammar/2`. Choice branch keys
+namespace context-query identities and route resubmitted observations without
+client inspection. Templates cover constants, binding references, compound
+terms, lists, and relational list concatenation; the latter proves that
+sarun's resume/pause projection can append and remove its fixed boolean through
+the same declaration. Foreign tests parse and render through nested
+choice/projection/sequence values. The action catalog has not yet been
+materialized as this immutable value, so the old action callback and operation
+surface remain the next deletion target.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:
