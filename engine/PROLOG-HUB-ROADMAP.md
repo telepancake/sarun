@@ -932,6 +932,18 @@ belong to the relation.
   `ServiceDial`, including the shared service-name validation, before the
   socket becomes a parked accept slot or a raw spliced stream. Their remaining
   JSON acknowledgements are solely the temporary listener's mode projection.
+- Fixed the command-modal completion composition failure exposed by
+  `kill <TAB> C1`. Parsing and context resolution had already produced the
+  correct typed `Kill` request, but the preview unconditionally requested the
+  sparse shell-CLI form and reported its ordinary no-solution result as a
+  parser-backend failure. The relation now defines one canonical display choice
+  per action: an explicitly declared CLI form where present, otherwise the
+  canonical verb form. Parser composition coverage now applies a contextual
+  completion, reparses it, checks the typed request, highlights it, and renders
+  it; a UI-level regression reproduces the exact `kill ` to `C1` workflow. The
+  core Prolog suite additionally round-trips canonical minimal and full forms
+  for all 108 actions. Native aarch64 verification passes all 42 Prolog tests
+  and the full Rust suite (313 passed, 1 browser E2E ignored).
 
 ## Stop conditions
 

@@ -696,7 +696,7 @@ pub fn render(invocation: &Invocation) -> Result<String, String> {
     let command = prolog_command(invocation);
     let prolog = crate::prolog::global()?;
     prolog
-        .render(&command, crate::prolog::RenderForm::Cli)
+        .render(&command, crate::prolog::RenderForm::Canonical)
         .map(|rendered| rendered.text)
         .map_err(|error| error.to_string())
 }
@@ -896,6 +896,25 @@ mod tests {
                 && entry.provider == "fixture"
                 && entry.annotation.contains("context(writer_id,path")
         }));
+    }
+
+    #[test]
+    fn contextual_completion_result_reparses_and_renders() {
+        let input = "kill wo";
+        let completion = complete_at(input, input.len(), &FixtureContext)
+            .unwrap().into_iter().find(|entry| entry.insert == "work")
+            .expect("live box completion");
+        let completed = apply_completion(input, &completion);
+        assert_eq!(completed, "kill work");
+        let ParseResult::Invocation(invocation) = parse(&completed, &FixtureContext) else {
+            panic!("completed command did not parse");
+        };
+        assert_eq!(
+            invocation.payload,
+            InvocationPayload::Wire(crate::generated_wire::ActionRequest::Kill { sid: 5 }),
+        );
+        assert_eq!(render(&invocation).unwrap(), "kill 5");
+        assert!(!highlights(&completed, &FixtureContext).unwrap().is_empty());
     }
 
     #[test]

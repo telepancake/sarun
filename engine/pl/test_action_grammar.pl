@@ -409,6 +409,8 @@ all_action_forms_roundtrip([]).
 all_action_forms_roundtrip([Action|Actions]) :-
     form_roundtrips(Action, verb, minimal),
     form_roundtrips(Action, verb, full),
+    canonical_form_roundtrips(Action, minimal),
+    canonical_form_roundtrips(Action, full),
     all_action_forms_roundtrip(Actions).
 
 all_cli_forms_roundtrip([]).
@@ -425,6 +427,19 @@ form_roundtrips(Action, Style, Population) :-
            Command = command(Action, _, _, _)
          )),
     once(render(Command, Style, Rendered)),
+    split_string(Rendered, " ", "", RenderedSurfaces),
+    items(RenderedSurfaces, RenderedItems),
+    once(parse(RenderedItems,
+               parse_result(Command, complete, _, _))).
+
+canonical_form_roundtrips(Action, Population) :-
+    once(action_grammar:action_form(Action, verb, Specs, _)),
+    spec_surfaces(Specs, Population, Surfaces),
+    items(Surfaces, SourceItems),
+    once(( parse(SourceItems, parse_result(Command, complete, _, _)),
+           Command = command(Action, _, _, _)
+         )),
+    once(render(Command, canonical, Rendered)),
     split_string(Rendered, " ", "", RenderedSurfaces),
     items(RenderedSurfaces, RenderedItems),
     once(parse(RenderedItems,

@@ -57,6 +57,7 @@ unsafe extern "C" {
 pub enum RenderForm {
     Verb,
     Cli,
+    Canonical,
 }
 
 impl RenderForm {
@@ -64,6 +65,7 @@ impl RenderForm {
         match self {
             Self::Verb => "verb",
             Self::Cli => "cli",
+            Self::Canonical => "canonical",
         }
     }
 }
@@ -2251,6 +2253,20 @@ mod tests {
                 .unwrap()
                 .text,
             "mirror run 7",
+        );
+        assert_eq!(
+            prolog
+                .render(&command("mirror_run", Some(7)), RenderForm::Canonical)
+                .unwrap()
+                .text,
+            "mirror run 7",
+        );
+        assert_eq!(
+            prolog
+                .render(&command("kill", Some(5)), RenderForm::Canonical)
+                .unwrap()
+                .text,
+            "kill 5",
         );
         assert_eq!(
             prolog

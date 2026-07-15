@@ -18486,6 +18486,35 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn command_modal_kill_completion_reparses_highlights_and_previews() {
+        let mut app = App::bare(String::new());
+        app.sessions = vec![serde_json::json!({
+            "session_id": "1",
+            "name": "C1",
+            "path": "C1",
+            "status": "running",
+        })];
+        let input = "kill ";
+        let completion = super::command_completions(&mut app, input, input.len())
+            .into_iter().find(|entry| entry.insert == "C1")
+            .expect("C1 offered for kill SID");
+        let completed = crate::parser::apply_completion(input, &completion);
+        assert_eq!(completed, "kill C1");
+        assert!(super::command_spans(&completed, &app).is_ok());
+        let crate::parser::ParseResult::Invocation(invocation) =
+            crate::parser::parse(&completed, &app)
+        else {
+            panic!("completed kill command did not parse");
+        };
+        assert_eq!(
+            invocation.payload,
+            crate::parser::InvocationPayload::Wire(
+                crate::generated_wire::ActionRequest::Kill { sid: 1 }),
+        );
+        assert_eq!(crate::parser::render(&invocation).unwrap(), "kill 1");
+    }
+
     /// The "scrolling Outputs of a browser box crashes sarun" regression:
     /// slicing a byte-window out of multi-byte UTF-8 output must snap to char
     /// boundaries instead of panicking. Every offset into a string full of

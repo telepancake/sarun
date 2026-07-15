@@ -176,6 +176,14 @@ action_form(Action, cli, Specs, Normalizer) :-
     cli_literal_specs(Words, Action, Literals),
     schema_specs(Schema, ArgSpecs),
     append(Literals, ArgSpecs, Specs).
+% Canonical display is a relation-level choice: actions with an explicitly
+% declared shell CLI use it; every other action uses its canonical verb form.
+% Consumers do not probe one renderer and fall back to another.
+canonical_style(Action, cli) :-
+    cli_form(Action, _, _).
+canonical_style(Action, verb) :-
+    action(Action, _, _, _, _, _, _),
+    \+ cli_form(Action, _, _).
 
 canonical_normalizer(mirror_resume, resume_false) :- !.
 canonical_normalizer(_, identity).
@@ -1344,6 +1352,11 @@ paint_highlights([PaintSpan|PaintSpans], Syntax, Semantic, Origin,
 
 %! render(+Command, +Style, -Text) is semidet.
 
+render(Command, canonical, Text) :-
+    !,
+    Command = command(Action, _, _, _),
+    canonical_style(Action, Style),
+    render(Command, Style, Text).
 render(command(Action, Handler, Target, WireArgs), Style, Text) :-
     action(Action, Handler, Target, _, _, _, _),
     denormalize_args(Normalizer, WireArgs, SourceArgs),
