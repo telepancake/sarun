@@ -228,10 +228,10 @@ constrain foreign-grammar enumeration, and a
 tear completion is aggregated from ordinary parse evidence through the same
 request. The output-byte limit is validated at the Prolog envelope and bounded
 by the Rust decoder using the request-specific ceiling; oversized or zero
-limits fail before entering Prolog. Only action-help projection and
-action-request materialization still use the old action-specific
-`Operation`/`application/3` path; all parsing machinery has moved to the
-generic envelope and those final adapters must follow.
+limits fail before entering Prolog. Only action-request materialization still
+uses the old action-specific `Operation`/`application/3` path; all parsing and
+metadata projection has moved to the generic envelope and that final adapter
+must follow.
 The foreign grammar now also declares contextual fields with an explicit
 `empty`/`one`/`all` exact cardinality. Exact and torn source transformations
 return stable query nodes; resubmitted observations produce completion matches
@@ -253,7 +253,7 @@ sarun's resume/pause projection can append and remove its fixed boolean through
 the same declaration. Foreign tests parse and render through nested
 choice/projection/sequence values. The action catalog is now materialized as
 this immutable value; the duplicate legacy action predicates and their
-remaining help/request operation surface are the next deletion target.
+remaining request operation surface are the next deletion target.
 Terminals can now contain engine-interpreted codec data rather than a terminal
 predicate. `grammar_codec.pl` implements finite enumerations, typed integer and
 text wrappers, codec choice, and a closed relational JSON shape vocabulary
@@ -261,8 +261,8 @@ text wrappers, codec choice, and a closed relational JSON shape vocabulary
 test parses reordered JSON fields into a typed compound and renders canonical
 compact JSON from the same declaration. The current OCI and API action
 arguments are expressed with these codecs in the installed action grammar.
-Their older duplicate parsing predicates remain to be deleted after help and
-action-request projections cross the boundary.
+Their older duplicate parsing predicates remain to be deleted after the
+action-request projection crosses the boundary.
 `action_grammar:action_relation_grammar/1` now materializes all 108 actions as
 one immutable `choice_grammar` value. Every branch contains its mechanically
 derived command words, source schema, declarative terminal codecs, context
@@ -288,8 +288,8 @@ installs it as `grammar_handle(sarun_actions)`; `relation_api` resolves handles
 generically and has no action-name branch. Reinstalling the identical value is
 idempotent, changing a handle fails, and missing handles fail closed. A native
 aarch64 structured-FLI test renders an action through the installed handle, so
-Rust neither transports nor inspects the grammar tree. Only help and closed
-action-request adapters still call the old operation path.
+Rust neither transports nor inspects the grammar tree. Only the closed
+action-request adapter still calls the old operation path.
 Production Rust parsing, rendering, literal completion, and highlighting now
 use `grammar_handle(sarun_actions)` through `RelationRequest` and the recursive
 structured FLI. Input units, typed commands, and retained parse evidence are
@@ -307,8 +307,12 @@ observations suppress semantic solutions and therefore highlights; the client
 does not filter evidence independently. Choice composition carries branch
 provenance into contextual completion semantics. The old context-plan
 predicates, four dispatch cases, Rust operations, textual encoders/decoders,
-and binding adapter have been deleted. Help and action-request materialization
-are the two remaining old operations.
+and binding adapter have been deleted. Action metadata is now constant
+projection data on the same alternatives: all help and target-filtered help
+vary only their given bindings, and substring filtering is a generic pure
+projection template. The old help predicate, operation cases, and textual
+decoder have been deleted. Action-request materialization is the one remaining
+old operation.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:

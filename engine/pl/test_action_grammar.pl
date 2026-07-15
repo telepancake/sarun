@@ -8,7 +8,6 @@
 test_name(catalog_is_complete_and_valid).
 test_name(wire_identities_are_explicit_unique_and_normalized).
 test_name(representations_project_the_executable_forms).
-test_name(help_projection_is_complete_and_targeted).
 test_name(neutral_source_parses_canonical_form).
 test_name(action_identifier_has_one_mechanical_text_encoding).
 test_name(argument_projection_is_wire_ready).
@@ -30,6 +29,7 @@ test_name(generic_action_relation_parses_and_renders_projection).
 test_name(generic_action_relation_resolves_context_before_projection).
 test_name(generic_action_relation_declares_dependent_context_graph).
 test_name(generic_action_completion_survives_context_roundtrip).
+test_name(generic_action_help_is_constant_branch_projection).
 
 run_action_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -54,20 +54,6 @@ expect(Goal) :-
 expect_equal(Actual, Expected) :-
     ( Actual == Expected -> true ; throw(expected(Expected, got(Actual))) ).
 
-run_test(help_projection_is_complete_and_targeted) :-
-    action_grammar:action_help(all, All),
-    action_grammar:action_help(ui, Ui),
-    action_grammar:action_help(ui, "mirror", Mirror),
-    action_grammar:action_help(ui, "no-such-action", Missing),
-    length(All, 108),
-    length(Ui, 91),
-    expect(list_has(record("verbs", "[FILTER]",
-                          "list every UI verb with its args and help"), Ui)),
-    expect(\+ list_has(record(quit, _, _), Ui)),
-    expect(list_has(record("mirror add", _, _), Mirror)),
-    expect(all_help_rows_match("mirror", Mirror)),
-    expect_equal(Missing, []).
-
 relation_limits(limits(256, 4096, 1048576)).
 
 run_test(complete_action_language_is_an_immutable_grammar_value) :-
@@ -75,12 +61,39 @@ run_test(complete_action_language_is_an_immutable_grammar_value) :-
     length(Alternatives, 108),
     list_has(alternative(kill, 50,
                          projection_grammar(sequence_grammar(_, _, _, _),
-                                            [projection(command, _)])),
+                                            [projection(command, _),
+                                             projection(action_target,
+                                                        constant(ui)),
+                                             projection(help, _),
+                                             projection(help_filter, _)])),
              Alternatives),
     list_has(alternative('oci.build', 50,
                          projection_grammar(sequence_grammar(_, _, _, _),
-                                            [projection(command, _)])),
+                                            [projection(command, _),
+                                             projection(action_target,
+                                                        constant(ui)),
+                                             projection(help, _),
+                                             projection(help_filter, _)])),
              Alternatives).
+
+run_test(generic_action_help_is_constant_branch_projection) :-
+    once(action_relation_grammar(Grammar)),
+    relation_limits(Limits),
+    transform(
+        request(Grammar, given([binding(action_target, control)]),
+                want([help]), observations([]), Limits),
+        reply(Solutions, [], [], [])),
+    length(Solutions, 5),
+    list_has(solution([binding(help,
+                               record("quit", "", "quit the engine"))], _),
+             Solutions),
+    transform(
+        request(Grammar,
+                given([binding(action_target, ui),
+                       binding(help_filter, "mirror")]),
+                want([help]), observations([]), Limits),
+        reply(MirrorSolutions, [], [], [])),
+    length(MirrorSolutions, 9).
 
 run_test(generic_action_relation_parses_and_renders_projection) :-
     once(action_relation_grammar(Grammar)),
@@ -200,13 +213,6 @@ run_test(generic_action_completion_survives_context_roundtrip) :-
                               [alternative(context(kill, box, 1), context_argument,
                                            boxes, 90)],
                               90, 1)].
-
-all_help_rows_match(_, []).
-all_help_rows_match(Filter, [record(CommandText, _, Description)|Rows]) :-
-    ( sub_string(CommandText, _, _, _, Filter)
-    ; sub_string(Description, _, _, _, Filter)
-    ),
-    all_help_rows_match(Filter, Rows).
 
 list_has(Value, [Head|_]) :- Value = Head.
 list_has(Value, [_|Tail]) :- list_has(Value, Tail).

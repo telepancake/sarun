@@ -199,14 +199,25 @@ action_relation_grammar(choice_grammar(Alternatives)) :-
 
 action_relation_alternative(Action, Preference,
                             projection_grammar(Sequence, Projections)) :-
-    action(Action, Handler, Target, _, _, _, Preference),
+    action(Action, Handler, Target, Notation, Description, _, Preference),
     action_form(Action, Specs, Projection),
     action_contexts(Action, Contexts),
     action_terminals(Terminals),
     Sequence = sequence_grammar(Specs, terminals(Terminals), separator(" "),
                                 contexts(Contexts)),
     action_semantic_template(Action, Handler, Target, Projection, Template),
-    Projections = [projection(command, Template)].
+    action_words(Action, Words),
+    join_parts(Words, CommandText),
+    atom_string(Action, ActionText),
+    Projections = [projection(command, Template),
+                   projection(action_target, constant(Target)),
+                   projection(help,
+                              constant(record(CommandText, Notation,
+                                              Description))),
+                   projection(help_filter,
+                              substring_any([constant(ActionText),
+                                             constant(CommandText),
+                                             constant(Description)]))].
 
 action_semantic_template(Action, Handler, Target, Projection,
                          structure(command,
@@ -1002,42 +1013,6 @@ catalog(Visibility, Rows) :-
             ),
             Rows).
 
-%! action_help(+Target, -Rows) is det.
-%
-% Closed help projection used by runtime consumers. Keeping this operation
-% narrow avoids shipping executable syntax terms merely to display the three
-% related fields.
-
-action_help(Target, Rows) :-
-    action_help(Target, "", Rows).
-
-%! action_help(+Target, +Filter, -Rows) is det.
-%
-% Filtering is part of the relation projection, rather than a consumer-side
-% reinterpretation of action metadata. The empty filter projects every row.
-
-action_help(Target, Filter, Rows) :-
-    findall(record(CommandText, Notation, Description),
-            ( action(Action, _, RowTarget, Notation, Description, _, _),
-              help_target_matches(Target, RowTarget),
-              action_words(Action, Words),
-              join_parts(Words, CommandText),
-              help_filter_matches(Filter, Action, CommandText, Description)
-            ),
-            Rows).
-
-help_target_matches(all, _).
-help_target_matches(Target, Target) :- Target \== all.
-
-help_filter_matches("", _, _, _).
-help_filter_matches(Filter, Action, CommandText, Description) :-
-    Filter \== "",
-    atom_string(Action, ActionText),
-    ( sub_string(ActionText, _, _, _, Filter)
-    ; sub_string(CommandText, _, _, _, Filter)
-    ; sub_string(Description, _, _, _, Filter)
-    ), !.
-
 visibility_matches(all, _).
 visibility_matches(visible, visible).
 visibility_matches(internal, internal).
@@ -1065,17 +1040,6 @@ decode_request(InputString, Request) :-
 
 dispatch_application(catalog, request(Visibility), ok(Rows)) :-
     !, catalog(Visibility, Rows).
-dispatch_application(action_help, request(Target), Response) :-
-    !, ( ( Target == all ; Target == ui ; Target == control ; Target == local )
-       -> action_help(Target, Rows), Response = ok(Rows)
-       ;  Response = error(invalid_request)
-       ).
-dispatch_application(action_help, request(Target, Filter), Response) :-
-    !, ( ( Target == all ; Target == ui ; Target == control ; Target == local ),
-         string(Filter)
-       -> action_help(Target, Filter, Rows), Response = ok(Rows)
-       ;  Response = error(invalid_request)
-       ).
 dispatch_application(convert, request(FromKind, From, ToKind), ok(Results)) :-
     !, findall(To, convert(FromKind, From, ToKind, To), Results).
 dispatch_application(action_request, request(Command), Response) :-
@@ -1084,7 +1048,6 @@ dispatch_application(action_request, request(Command), Response) :-
        ;  Response = error(no_solution)
        ).
 dispatch_application(catalog, _, error(invalid_request)) :- !.
-dispatch_application(action_help, _, error(invalid_request)) :- !.
 dispatch_application(convert, _, error(invalid_request)) :- !.
 dispatch_application(action_request, _, error(invalid_request)) :- !.
 dispatch_application(_, _, error(invalid_operation)).

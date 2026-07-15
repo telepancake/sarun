@@ -76,6 +76,10 @@ transform_relation(choice_grammar(Alternatives), Given, Wanted, Observations,
     sort(DependencyKeys0, DependencyKeys),
     append(Diagnostics0, LimitDiagnostics, Diagnostics).
 
+transform_relation(projection_grammar(_Grammar, Projections), Given, Wanted,
+                   _Observations, _Limits, Reply) :-
+    standalone_projection_reply(Projections, Given, Wanted, Reply),
+    !.
 transform_relation(projection_grammar(Grammar, Projections), Given, Wanted,
                    Observations, Limits, Reply) :-
     projection_inner_request(Projections, Given, Wanted, InnerGiven,
@@ -83,6 +87,7 @@ transform_relation(projection_grammar(Grammar, Projections), Given, Wanted,
     transform_relation(Grammar, InnerGiven, InnerWanted, Observations, Limits,
                        InnerReply),
     project_reply(Projections, Wanted, InnerReply, Reply).
+
 transform_relation(context_grammar, Given, Wanted, Observations, _Limits,
                    reply([solution(Bindings, 0)], [], DependencyKeys, [])) :-
     given_value(graph, Given, Graph),
@@ -144,6 +149,20 @@ transform_relation(
     project_highlights(Evidence, Highlights),
     Available = [binding(highlights, Highlights)],
     requested_bindings(Wanted, Available, Bindings).
+
+% Constant metadata is a representation in its own right: asking for it must
+% not manufacture a dummy source merely to enter the inner sequence grammar.
+% A standalone request is allowed only when every wanted projection has no
+% references; groundness alone would let a relational list template invent a
+% shorter value before the inner grammar had supplied its binding.
+standalone_projection_reply(Projections, Given, Wanted,
+                            reply([solution(Bindings, 0)], [], [], [])) :-
+    projection_wanted_references(Projections, Wanted, []),
+    wanted_without_projections(Wanted, Projections, []),
+    inverse_project_given(Projections, Given, Prepared),
+    projected_available(Projections, Wanted, Prepared, Available),
+    requested_bindings(Wanted, Available, Bindings),
+    ground(Bindings).
 
 % A choice is grammar composition, not an operation switch. Alternative keys
 % are immutable grammar data used to namespace context-query identities; a
@@ -310,6 +329,7 @@ replace_completion_binding([Binding|Bindings], Completions,
 %   structure(Functor, Arguments)    a compound semantic value
 %   sequence(Items)                  a list semantic value
 %   concatenate(Left, Right)         relational list concatenation
+%   substring_any(Haystacks)         a given text occurs in one text value
 %
 % This is deliberately data rather than a grammar-supplied predicate. The
 % engine evaluates the same template forward after parsing and backward before
@@ -400,6 +420,17 @@ template_value(concatenate(Left, Right), Values, Bindings0, Bindings) :-
     template_value(Left, LeftValues, Bindings0, Bindings1),
     template_value(Right, RightValues, Bindings1, Bindings),
     append(LeftValues, RightValues, Values).
+template_value(substring_any(Templates), Needle, Bindings0, Bindings) :-
+    string(Needle),
+    template_values(Templates, Haystacks, Bindings0, Bindings),
+    substring_member(Needle, Haystacks).
+
+substring_member(Needle, [Haystack|_]) :-
+    string(Haystack),
+    sub_string(Haystack, _, _, _, Needle),
+    !.
+substring_member(Needle, [_|Haystacks]) :-
+    substring_member(Needle, Haystacks).
 
 template_values([], [], Bindings, Bindings).
 template_values([Template|Templates], [Value|Values], Bindings0, Bindings) :-
@@ -422,6 +453,8 @@ template_references(concatenate(Left, Right), Names) :-
     template_references(Left, LeftNames),
     template_references(Right, RightNames),
     append(LeftNames, RightNames, Names).
+template_references(substring_any(Templates), Names) :-
+    templates_references(Templates, Names).
 
 templates_references([], []).
 templates_references([Template|Templates], Names) :-

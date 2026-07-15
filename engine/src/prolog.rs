@@ -371,14 +371,12 @@ pub struct RenderedCommand {
 
 #[derive(Clone, Copy)]
 enum Operation {
-    ActionHelp,
     ActionRequest,
 }
 
 impl Operation {
     fn atom(self) -> &'static str {
         match self {
-            Self::ActionHelp => "action_help",
             Self::ActionRequest => "action_request",
         }
     }
@@ -590,24 +588,58 @@ impl Prolog {
     /// This is the only runtime source for verb names, argument notation, and
     /// descriptions; implementation dispatch contributes no metadata.
     pub fn action_help(&self) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
-        let response = self.application(Operation::ActionHelp, "request(all)".into())?;
-        decode_action_help_response(&response)
+        self.relation_action_help(None, None)
     }
 
     pub fn ui_action_help(&self) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
-        let response = self.application(Operation::ActionHelp, "request(ui)".into())?;
-        decode_action_help_response(&response)
+        self.relation_action_help(Some("ui"), None)
     }
 
     pub fn ui_action_help_matching(
         &self,
         filter: &str,
     ) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
-        let response = self.application(
-            Operation::ActionHelp,
-            format!("request(ui,{})", quote_string(filter)),
-        )?;
-        decode_action_help_response(&response)
+        self.relation_action_help(Some("ui"), Some(filter))
+    }
+
+    fn relation_action_help(
+        &self,
+        target: Option<&str>,
+        filter: Option<&str>,
+    ) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
+        let mut given = Vec::new();
+        if let Some(target) = target {
+            given.push(RelationBinding {
+                name: "action_target".into(),
+                value: RelationValue::Atom(target.into()),
+            });
+        }
+        if let Some(filter) = filter {
+            given.push(RelationBinding {
+                name: "help_filter".into(),
+                value: RelationValue::String(filter.into()),
+            });
+        }
+        let reply = self.transform(&RelationRequest {
+            grammar: action_grammar_handle(),
+            given,
+            wanted: vec!["help".into()],
+            observations: vec![],
+            limits: RelationLimits {
+                max_solutions: 256,
+                ..RelationLimits::default()
+            },
+        })?;
+        reject_relation_diagnostics(&reply)?;
+        reply
+            .solutions
+            .iter()
+            .map(|solution| {
+                <crate::generated_wire::ActionHelpRow as crate::generated_wire::RelationWireValue>::from_relation(
+                    solution_binding(solution, "help")?,
+                )
+            })
+            .collect()
     }
 
     pub fn context_query(
@@ -2444,21 +2476,6 @@ fn text(term: &ParsedTerm) -> Result<&str, String> {
     }
 }
 
-fn response_value(response: &str) -> Result<ParsedTerm, String> {
-    let term = TermParser::parse(response)?;
-    if let Ok(args) = compound(&term, "ok", 1) {
-        let mut args = args.to_vec();
-        return Ok(args.remove(0));
-    }
-    if let Ok(args) = compound(&term, "error", 1) {
-        return Err(format!(
-            "action grammar rejected request: {}",
-            term_text(&args[0])
-        ));
-    }
-    Err("invalid action grammar application response".into())
-}
-
 fn term_text(term: &ParsedTerm) -> String {
     match term {
         ParsedTerm::Atom(value) | ParsedTerm::String(value) => value.clone(),
@@ -2746,40 +2763,6 @@ fn decode_highlights_term(value: &ParsedTerm) -> Result<Vec<Highlight>, String> 
             })
         })
         .collect()
-}
-
-fn decode_action_help_response(
-    response: &str,
-) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
-    use crate::generated_wire::{ActionHelpRow, LIMIT_SHORT_BYTES, LIMIT_TEXT_BYTES};
-    use crate::wire::BoundedText;
-
-    let value = response_value(response)?;
-    let mut result = Vec::new();
-    for row in list(&value)? {
-        let fields = compound(row, "record", 3)?;
-        let bounded = |value: &ParsedTerm, maximum: usize| -> Result<String, String> {
-            let value = text(value)?.to_owned();
-            if value.len() > maximum {
-                return Err(format!(
-                    "relation catalog text exceeds its declared {maximum}-byte bound"
-                ));
-            }
-            Ok(value)
-        };
-        result.push(ActionHelpRow {
-            verb: BoundedText::<LIMIT_SHORT_BYTES>::new(bounded(&fields[0], LIMIT_SHORT_BYTES)?)
-                .map_err(|error| format!("invalid relation verb: {error:?}"))?,
-            arguments: BoundedText::<LIMIT_TEXT_BYTES>::new(bounded(&fields[1], LIMIT_TEXT_BYTES)?)
-                .map_err(|error| format!("invalid relation argument notation: {error:?}"))?,
-            description: BoundedText::<LIMIT_TEXT_BYTES>::new(bounded(
-                &fields[2],
-                LIMIT_TEXT_BYTES,
-            )?)
-            .map_err(|error| format!("invalid relation description: {error:?}"))?,
-        });
-    }
-    Ok(result)
 }
 
 fn decode_action_request_response(
