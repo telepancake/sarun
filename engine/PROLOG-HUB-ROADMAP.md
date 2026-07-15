@@ -783,6 +783,12 @@ belong to the relation.
   implementation; the temporary listener alone projects line pairs. The full
   native aarch64-musl suite passes 308 tests with one existing browser e2e test
   ignored.
+- Moved `oaita.models`, `oaita.status`, `oaita.probe`, and `svc.up` onto
+  generated request/success variants. Catalog entries, status kind, endpoint,
+  probe specification/result, and service name are now bounded closed values;
+  the network probe executes directly in Rust and JSON is confined to its
+  temporary request/result projection. The full native aarch64-musl suite
+  passes 308 tests with one existing browser e2e test ignored.
 
 ## Stop conditions
 

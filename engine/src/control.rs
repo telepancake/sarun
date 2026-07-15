@@ -1828,6 +1828,78 @@ fn dispatch_action(
                 .map_err(|error| format!("packet rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::FlowsPackets { value })
         }
+        ActionRequest::OaitaModels => {
+            use crate::generated_wire::{ModelCatalog, ModelEntry};
+            let (entries, source) = crate::oaita::models::catalog();
+            let models = entries.into_iter().map(|entry| Ok(ModelEntry {
+                name: crate::wire::BoundedText::new(entry.name)
+                    .map_err(|error| format!("model name exceeds relation bound: {error:?}"))?,
+                url: crate::wire::BoundedText::new(entry.url)
+                    .map_err(|error| format!("model URL exceeds relation bound: {error:?}"))?,
+                note: crate::wire::BoundedText::new(entry.note)
+                    .map_err(|error| format!("model note exceeds relation bound: {error:?}"))?,
+            })).collect::<Result<Vec<_>, String>>()?;
+            let value = ModelCatalog {
+                source: crate::wire::BoundedText::new(source)
+                    .map_err(|error| format!("model source exceeds relation bound: {error:?}"))?,
+                models: crate::wire::BoundedVec::new(models)
+                    .map_err(|error| format!("model catalog exceeds relation bound: {error:?}"))?,
+            };
+            Ok(ActionSuccess::OaitaModels { value })
+        }
+        ActionRequest::OaitaStatus => {
+            use crate::generated_wire::{OaitaStatus, OaitaStatusKind};
+            let host_cfg = crate::oaita::config::Config::load();
+            let external = host_cfg.model.as_deref()
+                .is_some_and(|model| !model.trim().is_empty());
+            let local = service_declared("oaita-local");
+            let (kind, model, endpoint) = if external {
+                (OaitaStatusKind::External,
+                 host_cfg.model.unwrap_or_default(),
+                 host_cfg.base_url.unwrap_or_default())
+            } else if local {
+                (OaitaStatusKind::Local, "local".to_owned(), "svc://oaita-local".to_owned())
+            } else {
+                (OaitaStatusKind::None, String::new(), String::new())
+            };
+            let value = OaitaStatus {
+                kind,
+                model: crate::wire::BoundedText::new(model)
+                    .map_err(|error| format!("OAITA model exceeds relation bound: {error:?}"))?,
+                endpoint: crate::wire::BoundedText::new(endpoint)
+                    .map_err(|error| format!("OAITA endpoint exceeds relation bound: {error:?}"))?,
+                serving: svc_has("oaita-local"),
+            };
+            Ok(ActionSuccess::OaitaStatus { value })
+        }
+        ActionRequest::OaitaProbe { spec } => {
+            let base_url = if spec.base_url.as_str().is_empty() {
+                "https://api.openai.com/v1"
+            } else {
+                spec.base_url.as_str()
+            };
+            if spec.model.as_str().trim().is_empty() {
+                return Err("set a model name first".into());
+            }
+            crate::oaita::client::block_on(async {
+                let client = crate::oaita::client::Client::from_resolved(
+                    base_url, spec.api_key.as_str())?;
+                let body = json!({
+                    "model": spec.model.as_str(),
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "stream": false,
+                });
+                client.post("/chat/completions", body).await
+            }).map_err(|error| format!("{base_url}: {error}"))?;
+            let detail = format!("connected · {} @ {base_url}", spec.model.as_str());
+            let value = crate::wire::BoundedText::new(detail)
+                .map_err(|error| format!("probe result exceeds relation bound: {error:?}"))?;
+            Ok(ActionSuccess::OaitaProbe { value })
+        }
+        ActionRequest::SvcUp { name } => {
+            Ok(ActionSuccess::SvcUp { value: svc_has(name.as_str()) })
+        }
         ActionRequest::MirrorJobs => {
             let value = crate::wire::BoundedVec::new(crate::mirrors::jobs_list_typed()?)
                 .map_err(|error| format!("mirror jobs exceed relation bound: {error:?}"))?;
@@ -2229,6 +2301,15 @@ fn legacy_mirror_state(value: crate::generated_wire::MirrorState) -> &'static st
     }
 }
 
+fn legacy_oaita_status_kind(value: crate::generated_wire::OaitaStatusKind) -> &'static str {
+    use crate::generated_wire::OaitaStatusKind;
+    match value {
+        OaitaStatusKind::None => "none",
+        OaitaStatusKind::External => "external",
+        OaitaStatusKind::Local => "local",
+    }
+}
+
 fn legacy_structural_lines(
     lines: crate::wire::BoundedVec<
         crate::generated_wire::StructuralLine,
@@ -2408,6 +2489,25 @@ fn legacy_ui_action_reply(
                 "info": row.summary.into_inner(),
             })).collect::<Vec<_>>(),
         }),
+        Ok(ActionSuccess::OaitaModels { value }) => json!({
+            "source": value.source.into_inner(),
+            "models": value.models.into_inner().into_iter().map(|model| json!({
+                "name": model.name.into_inner(),
+                "url": model.url.into_inner(),
+                "note": model.note.into_inner(),
+            })).collect::<Vec<_>>(),
+        }),
+        Ok(ActionSuccess::OaitaStatus { value }) => json!({
+            "kind": legacy_oaita_status_kind(value.kind),
+            "model": value.model.into_inner(),
+            "endpoint": value.endpoint.into_inner(),
+            "serving": value.serving,
+        }),
+        Ok(ActionSuccess::OaitaProbe { value }) => json!({
+            "ok": true,
+            "detail": value.into_inner(),
+        }),
+        Ok(ActionSuccess::SvcUp { value }) => json!({"up": value}),
         Ok(ActionSuccess::MirrorJobs { value }) => Value::Array(value.into_inner()
             .into_iter().map(|job| json!({
                 "id": job.id,
@@ -5025,7 +5125,12 @@ macro_rules! ui_verbs {
         // `oaita local` to poll readiness / idempotency without racing.
         "svc.up" => {
             let name = args.first().and_then(Value::as_str).unwrap_or("");
-            json!({"up": svc_has(name)})
+            let Ok(name) = crate::wire::BoundedText::new(name.to_owned()) else {
+                return json!({"ok": false, "error": "service name exceeds relation bound"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::SvcUp { name },
+            ));
         }
         "oci.resolve" => {
             let Some(reference) = args.first().and_then(Value::as_str) else {
@@ -5053,68 +5158,50 @@ macro_rules! ui_verbs {
         // + offline fallback). Each entry is a ready-to-download Q4 URL. The
         // UI opens this when neither an external API nor a local model is set.
         "oaita.models" => {
-            let (entries, source) = crate::oaita::models::catalog();
-            json!({
-                "source": source,
-                "models": entries.iter().map(|e| json!({
-                    "name": e.name, "url": e.url, "note": e.note,
-                })).collect::<Vec<_>>(),
-            })
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::OaitaModels,
+            ));
         }
         // What the "Api" pane is wired to: external (host oaita.toml has a
         // model), local (an OAITA-LOCAL svc is declared), or none (offer the
         // picker). Lets the UI reflect real state instead of guessing.
         "oaita.status" => {
-            let host_cfg = crate::oaita::config::Config::load();
-            let external = host_cfg.model.as_deref()
-                .map(|m| !m.trim().is_empty()).unwrap_or(false);
-            let local = service_declared("oaita-local");
-            let (kind, model, endpoint) = if external {
-                ("external",
-                 host_cfg.model.clone().unwrap_or_default(),
-                 host_cfg.base_url.clone().unwrap_or_default())
-            } else if local {
-                ("local", "local".to_string(), "svc://oaita-local".to_string())
-            } else {
-                ("none", String::new(), String::new())
-            };
-            json!({
-                "kind": kind, "model": model, "endpoint": endpoint,
-                "serving": svc_has("oaita-local"),
-            })
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::OaitaStatus,
+            ));
         }
         // Connection test for the external-API config editor: does a minimal
         // 1-token chat completion against the given endpoint and reports
         // reachability / auth / model validity as a single line. Runs on the
         // engine (which has the network), so the UI stays a thin client.
         "oaita.probe" => {
-            let spec = args.first().cloned().unwrap_or(Value::Null);
-            let base_url = spec.get("base_url").and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("https://api.openai.com/v1").to_string();
-            let model = spec.get("model").and_then(Value::as_str)
-                .unwrap_or("").to_string();
-            let api_key = spec.get("api_key").and_then(Value::as_str)
-                .unwrap_or("").to_string();
-            if model.trim().is_empty() {
-                return json!({"ok": false, "error": "set a model name first"});
-            }
-            let probe = crate::oaita::client::block_on(async {
-                let client = crate::oaita::client::Client::from_resolved(
-                    &base_url, &api_key)?;
-                let body = json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 1, "stream": false,
-                });
-                client.post("/chat/completions", body).await
-            });
-            match probe {
-                Ok(_) => json!({"ok": true, "detail":
-                    format!("connected · {model} @ {base_url}")}),
-                Err(e) => return json!({"ok": false,
-                    "error": format!("{base_url}: {e}")}),
-            }
+            let spec = args.first().unwrap_or(&Value::Null);
+            let text = |field: &str, default: &str| -> Result<_, Value> {
+                let value = spec.get(field).and_then(Value::as_str).unwrap_or(default);
+                crate::wire::BoundedText::new(value.to_owned()).map_err(|_| json!({
+                    "ok": false,
+                    "error": format!("OAITA {field} exceeds relation bound"),
+                }))
+            };
+            let base_url = match text("base_url", "https://api.openai.com/v1") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let model = match text("model", "") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let api_key = match text("api_key", "") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::OaitaProbe {
+                    spec: crate::generated_wire::ApiProbeSpec {
+                        base_url, model, api_key,
+                    },
+                },
+            ));
         }
         "verbs" => {
             let filter = match args.first() {
