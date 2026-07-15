@@ -23,7 +23,7 @@
             parse/3,
             completions/3,
             highlights/2,
-            render/3,
+            render/2,
             catalog/2,
             context_plan/3,
             resolve_context_plan/3,
@@ -69,7 +69,7 @@ valid_action(Action) :-
     argument_schema(Action, Schema),
     valid_schema(Schema),
     valid_action_wire(Target, Handler),
-    once(action_form(Action, verb, _, _)).
+    once(action_form(Action, _, _)).
 
 valid_action_wire(local, Handler) :- \+ wire_handler(Handler, _, _).
 valid_action_wire(ui, Handler) :- valid_wire_handler(Handler).
@@ -89,6 +89,10 @@ valid_action_catalog :-
     findall(Action, action(Action, _, _, _, _, _, _), Actions),
     Actions \= [],
     all_unique_terms(Actions),
+    findall(Words,
+            ( action(Action, _, _, _, _, _, _), action_words(Action, Words) ),
+            CommandNames),
+    all_unique_terms(CommandNames),
     all_actions_valid(Actions),
     findall(Handler-Code, wire_handler(Handler, Code, _), HandlerCodes),
     HandlerCodes \= [],
@@ -158,77 +162,94 @@ valid_shape(optional, scalar).
 valid_shape(repeated, array).
 valid_shape(repeated, spread).
 
-%! action_form(?Action, ?Style, ?Specs, ?Normalizer) is nondet.
+%! action_form(?Action, ?Specs, ?Projection) is nondet.
 %
-% A form is a sequence of `literal/5` and `argument/1` specs. Normalizers
-% relate source-form arguments to the handler's typed wire arguments.
+% A form is a sequence of `literal/5` and `argument/1` specs. Projections
+% relate source-form arguments to the handler's typed wire arguments. There is
+% exactly one textual form per action: its words are mechanically decoded from
+% its sole identifier rather than declared as additional names.
 
-action_form(Action, verb, Specs, Normalizer) :-
+action_form(Action, Specs, Projection) :-
     action(Action, _, _, _, _, _, _),
-    argument_schema(Action, Schema),
-    atom_string(Action, Text),
-    canonical_normalizer(Action, Normalizer),
-    schema_specs(Schema, ArgSpecs),
-    Specs = [literal(Action, Text, action_identifier, Action, 30)|ArgSpecs].
-action_form(Action, cli, Specs, Normalizer) :-
-    cli_form(Action, Words, Normalizer),
-    cli_source_schema(Action, Normalizer, Schema),
-    cli_literal_specs(Words, Action, Literals),
+    action_source_schema(Action, Schema),
+    action_words(Action, Words),
+    action_literal_specs(Words, Action, Literals),
+    argument_projection(Action, Projection),
     schema_specs(Schema, ArgSpecs),
     append(Literals, ArgSpecs, Specs).
-% Canonical display is a relation-level choice: actions with an explicitly
-% declared shell CLI use it; every other action uses its canonical verb form.
-% Consumers do not probe one renderer and fall back to another.
-canonical_style(Action, cli) :-
-    cli_form(Action, _, _).
-canonical_style(Action, verb) :-
-    action(Action, _, _, _, _, _, _),
-    \+ cli_form(Action, _, _).
 
-canonical_normalizer(mirror_resume, resume_false) :- !.
-canonical_normalizer(_, identity).
-
-cli_source_schema(mirror_pause, pause_true,
-                  [arg(id, integer, required, scalar)]) :- !.
-cli_source_schema(Action, _, Schema) :-
+action_source_schema(mirror_pause,
+                     [arg(id, integer, required, scalar)]) :- !.
+action_source_schema(Action, Schema) :-
     argument_schema(Action, Schema).
+
+argument_projection(mirror_pause, pause_true) :- !.
+argument_projection(mirror_resume, resume_false) :- !.
+argument_projection(_, identity).
 
 schema_specs([], []).
 schema_specs([Arg|Schema], [argument(Arg)|Specs]) :-
     schema_specs(Schema, Specs).
 
-cli_literal_specs(Words, Action, Specs) :-
-    cli_literal_specs(Words, Action, first, Specs).
+action_literal_specs([Text], Action,
+                     [literal(Semantic, Text, action_identifier,
+                              Action, 30)]) :-
+    atom_string(Semantic, Text).
+action_literal_specs(Words, Action, Specs) :-
+    Words = [_,_|_],
+    action_literal_specs(Words, Action, first, Specs).
 
-cli_literal_specs([], _, _, []).
-cli_literal_specs([Text|Words], Action, Position,
+action_literal_specs([], _, _, []).
+action_literal_specs([Text|Words], Action, Position,
                   [literal(Semantic, Text, Syntax, Action, Preference)|Specs]) :-
     atom_string(Semantic, Text),
-    cli_literal_metadata(Position, Syntax, Preference),
-    cli_literal_specs(Words, Action, rest, Specs).
+    action_literal_metadata(Position, Syntax, Preference),
+    action_literal_specs(Words, Action, rest, Specs).
 
-cli_literal_metadata(first, command_namespace, 10).
-cli_literal_metadata(rest, action_word, 20).
+action_literal_metadata(first, command_namespace, 10).
+action_literal_metadata(rest, action_word, 20).
+
+action_words(Action, Words) :-
+    atom_codes(Action, Codes),
+    identifier_word_codes(Codes, WordCodes),
+    word_strings(WordCodes, Words).
+
+identifier_word_codes([], []) :- !.
+identifier_word_codes(Codes, [Word|Words]) :-
+    take_identifier_word(Codes, Word, Rest),
+    Word \= [],
+    identifier_word_codes(Rest, Words).
+
+take_identifier_word([], [], []).
+take_identifier_word([Code|Codes], [], Codes) :-
+    identifier_separator(Code), !.
+take_identifier_word([Code|Codes], [Code|Word], Rest) :-
+    take_identifier_word(Codes, Word, Rest).
+
+identifier_separator(0'.).
+identifier_separator(0'_).
+
+word_strings([], []).
+word_strings([Codes|CodeWords], [Word|Words]) :-
+    string_codes(Word, Codes),
+    word_strings(CodeWords, Words).
 
 %! representation(?Action, ?Kind, ?Value) is nondet.
 %
 % Every public projection is rooted in the normalized action facts and the
-% same form relation used by parsing and rendering.  `syntax(Style)` exposes
+% same form relation used by parsing and rendering. `syntax` exposes
 % the exact executable spec rather than reconstructing usage text elsewhere.
 
 representation(Action, action, Action) :-
     action(Action, _, _, _, _, _, _).
-representation(Action, verb, verb(Text, Normalizer)) :-
-    action_form(Action, verb,
-                [literal(_, Text, _, _, _)|_], Normalizer).
-representation(Action, cli, cli(Words, Normalizer)) :-
-    action_form(Action, cli, Specs, Normalizer),
+representation(Action, command, command(Words, Projection)) :-
+    action_form(Action, Specs, Projection),
     form_literal_prefix(Specs, Words).
-representation(Action, syntax(Style), syntax(Specs)) :-
-    action_form(Action, Style, Specs, _).
+representation(Action, syntax, syntax(Specs)) :-
+    action_form(Action, Specs, _).
 representation(Action, source_schema, schema(Schema)) :-
     action(Action, _, _, _, _, _, _),
-    argument_schema(Action, Schema).
+    action_source_schema(Action, Schema).
 representation(Action, wire,
                wire(Code, Handler, Target, RequestFields, ResultType)) :-
     action(Action, Handler, Target, _, _, _, _),
@@ -523,9 +544,9 @@ parse(Items, Mode,
     valid_mode(Mode),
     action(Action, Handler, Target, _, _, _, ActionPreference),
     valid_action(Action),
-    form_relation(Action, _Style, Body, Mode, Normalizer, SourceArgs,
+    form_relation(Action, Body, Mode, Projection, SourceArgs,
                   Evidence, EditCount),
-    normalize_args(Normalizer, SourceArgs, WireArgs),
+    normalize_args(Projection, SourceArgs, WireArgs),
     parse_status(Mode, EditCount, Status),
     evidence_preference(Evidence, ActionPreference, Preference).
 
@@ -620,9 +641,9 @@ source_unit(unit(_, Span, PaintSpans, Surface, _, _, Preference, Origin),
 % edit tears, and rendered surfaces differ only at the terminal relation;
 % sequence, cardinality, normalization inputs, and end-of-form behavior are
 % shared by parsing and rendering.
-form_relation(Action, Style, Items, Mode, Normalizer, SourceArgs, Evidence,
+form_relation(Action, Items, Mode, Projection, SourceArgs, Evidence,
               EditCount) :-
-    action_form(Action, Style, Specs, Normalizer),
+    action_form(Action, Specs, Projection),
     relate_specs(Specs, Items, Mode, SourceArgs, Evidence, EditCount).
 
 relate_specs([], [], _Mode, [], [], 0).
@@ -1350,17 +1371,12 @@ paint_highlights([PaintSpan|PaintSpans], Syntax, Semantic, Origin,
     paint_highlights(PaintSpans, Syntax, Semantic, Origin,
                      Highlights0, Highlights).
 
-%! render(+Command, +Style, -Text) is semidet.
+%! render(+Command, -Text) is semidet.
 
-render(Command, canonical, Text) :-
-    !,
-    Command = command(Action, _, _, _),
-    canonical_style(Action, Style),
-    render(Command, Style, Text).
-render(command(Action, Handler, Target, WireArgs), Style, Text) :-
+render(command(Action, Handler, Target, WireArgs), Text) :-
     action(Action, Handler, Target, _, _, _, _),
-    denormalize_args(Normalizer, WireArgs, SourceArgs),
-    form_relation(Action, Style, RenderedItems, render, Normalizer, SourceArgs,
+    denormalize_args(Projection, WireArgs, SourceArgs),
+    form_relation(Action, RenderedItems, render, Projection, SourceArgs,
                   _Evidence, 0),
     rendered_parts(RenderedItems, Parts),
     join_parts(Parts, Text).
@@ -1408,23 +1424,26 @@ action_help(Target, Rows) :-
 % reinterpretation of action metadata. The empty filter projects every row.
 
 action_help(Target, Filter, Rows) :-
-    findall(record(Action, Notation, Description),
+    findall(record(CommandText, Notation, Description),
             ( action(Action, _, RowTarget, Notation, Description, _, _),
               help_target_matches(Target, RowTarget),
-              help_filter_matches(Filter, Action, Description)
+              action_words(Action, Words),
+              join_parts(Words, CommandText),
+              help_filter_matches(Filter, Action, CommandText, Description)
             ),
             Rows).
 
 help_target_matches(all, _).
 help_target_matches(Target, Target) :- Target \== all.
 
-help_filter_matches("", _, _).
-help_filter_matches(Filter, Action, Description) :-
+help_filter_matches("", _, _, _).
+help_filter_matches(Filter, Action, CommandText, Description) :-
     Filter \== "",
     atom_string(Action, ActionText),
     ( sub_string(ActionText, _, _, _, Filter)
+    ; sub_string(CommandText, _, _, _, Filter)
     ; sub_string(Description, _, _, _, Filter)
-    ).
+    ), !.
 
 visibility_matches(all, _).
 visibility_matches(visible, visible).
@@ -1457,8 +1476,8 @@ dispatch_application(complete, request(Items, EditId), ok(Completions)) :-
     !, completions(Items, EditId, Completions).
 dispatch_application(highlights, request(Result), ok(Highlights)) :-
     !, ( highlights(Result, Highlights) -> true ; Highlights = [] ).
-dispatch_application(render, request(Command, Style), Response) :-
-    !, ( render(Command, Style, Text)
+dispatch_application(render, request(Command), Response) :-
+    !, ( render(Command, Text)
        -> Response = ok(Text)
        ;  Response = error(no_solution)
        ).

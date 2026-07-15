@@ -9,8 +9,8 @@ test_name(wire_identities_are_explicit_unique_and_normalized).
 test_name(representations_project_the_executable_forms).
 test_name(help_projection_is_complete_and_targeted).
 test_name(neutral_source_parses_canonical_form).
-test_name(shared_cli_form_uses_complete_schema).
-test_name(alias_normalization_is_wire_ready).
+test_name(action_identifier_has_one_mechanical_text_encoding).
+test_name(argument_projection_is_wire_ready).
 test_name(parsed_commands_relate_to_closed_action_requests).
 test_name(action_request_cardinality_is_relational).
 test_name(action_request_values_enforce_wire_bounds_and_types).
@@ -20,7 +20,7 @@ test_name(every_wire_handler_materializes_from_closed_source_values).
 test_name(string_kinds_do_not_become_numbers).
 test_name(array_wire_shape_is_preserved).
 test_name(parse_render_roundtrip).
-test_name(all_forms_roundtrip_through_shared_sequence_relation).
+test_name(all_actions_roundtrip_through_shared_sequence_relation).
 test_name(completion_is_projected_from_tear_parse_evidence).
 test_name(tear_parse_checks_every_concrete_suffix_item).
 test_name(application_surface_is_closed).
@@ -62,17 +62,16 @@ run_test(help_projection_is_complete_and_targeted) :-
     action_grammar:action_help(ui, "no-such-action", Missing),
     length(All, 108),
     length(Ui, 91),
-    expect(list_has(record(verbs, "[FILTER]",
+    expect(list_has(record("verbs", "[FILTER]",
                           "list every UI verb with its args and help"), Ui)),
     expect(\+ list_has(record(quit, _, _), Ui)),
-    expect(list_has(record(mirror_add, _, _), Mirror)),
+    expect(list_has(record("mirror add", _, _), Mirror)),
     expect(all_help_rows_match("mirror", Mirror)),
     expect_equal(Missing, []).
 
 all_help_rows_match(_, []).
-all_help_rows_match(Filter, [record(Action, _, Description)|Rows]) :-
-    atom_string(Action, ActionText),
-    ( sub_string(ActionText, _, _, _, Filter)
+all_help_rows_match(Filter, [record(CommandText, _, Description)|Rows]) :-
+    ( sub_string(CommandText, _, _, _, Filter)
     ; sub_string(Description, _, _, _, Filter)
     ),
     all_help_rows_match(Filter, Rows).
@@ -132,12 +131,14 @@ run_test(wire_identities_are_explicit_unique_and_normalized) :-
     expect(\+ representation(mirror_browse, wire, _)).
 
 run_test(representations_project_the_executable_forms) :-
-    once(representation(mirror_resume, verb,
-                        verb("mirror_resume", resume_false))),
+    once(representation(mirror_resume, command,
+                        command(["mirror", "resume"], resume_false))),
     once(representation(
-        mirror_resume, syntax(verb),
-        syntax([literal(mirror_resume, "mirror_resume", action_identifier,
-                        mirror_resume, 30),
+        mirror_resume, syntax,
+        syntax([literal(mirror, "mirror", command_namespace,
+                        mirror_resume, 10),
+                literal(resume, "resume", action_word,
+                        mirror_resume, 20),
                 argument(arg(id, integer, required, scalar))]))),
     once(convert(action, mirror_resume, wire,
                  wire(62, mirror_pause, ui,
@@ -146,16 +147,16 @@ run_test(representations_project_the_executable_forms) :-
     once(representation(
         mirror_resume, source_schema,
         schema([arg(id, integer, required, scalar)]))),
-    once(convert(verb, verb("mirror_resume", resume_false), help,
+    once(convert(command, command(["mirror", "resume"], resume_false), help,
                  help("ID", "resume a mirror job"))),
     findall(Action, action(Action, _, _, _, _, _, _), Actions),
     expect(all_actions_have_singular_core_representations(Actions)).
 
 all_actions_have_singular_core_representations([]).
 all_actions_have_singular_core_representations([Action|Actions]) :-
-    findall(Verb, representation(Action, verb, Verb), [_]),
+    findall(Command, representation(Action, command, Command), [_]),
     findall(Help, representation(Action, help, Help), [_]),
-    findall(Syntax, representation(Action, syntax(verb), Syntax), [_]),
+    findall(Syntax, representation(Action, syntax, Syntax), [_]),
     all_actions_have_singular_core_representations(Actions).
 
 all_wire_handlers_are_actions([]).
@@ -182,20 +183,28 @@ all_valid([Action|Actions]) :-
     all_valid(Actions).
 
 run_test(neutral_source_parses_canonical_form) :-
-    parse_words(["review.map_ids", "12", "process", "3", "4", "edge"],
+    parse_words(["review", "map", "ids", "12", "process", "3", "4", "edge"],
                 command('review.map_ids', 'review.map_ids', ui,
                         [string("12"), string("process"),
                          array([integer(3), integer(4)]), string("edge")])).
 
-run_test(shared_cli_form_uses_complete_schema) :-
-    findall(Command, parse_words(["mirror", "run"], Command), Pending),
-    expect_equal(Pending,
-                 [command(mirror_run_pending, mirror_run_pending, ui, [])]),
-    findall(Command, parse_words(["mirror", "run", "5"], Command), One),
-    expect_equal(One,
-                 [command(mirror_run, mirror_run, ui, [integer(5)])]).
+run_test(action_identifier_has_one_mechanical_text_encoding) :-
+    findall(Words,
+            representation(_, command, command(Words, _)),
+            CommandNames),
+    length(CommandNames, 108),
+    sort(CommandNames, UniqueCommandNames),
+    length(UniqueCommandNames, 108),
+    parse_words(["mirror", "run", "pending"],
+                command(mirror_run_pending, mirror_run_pending, ui, [])),
+    parse_words(["mirror", "run", "5"],
+                command(mirror_run, mirror_run, ui, [integer(5)])),
+    expect(\+ parse_words(["mirror_run", "5"], _)),
+    expect(\+ parse_words(["mirror", "ls"], _)),
+    parse_words(["mirror", "jobs"],
+                command(mirror_jobs, mirror_jobs, ui, [])).
 
-run_test(alias_normalization_is_wire_ready) :-
+run_test(argument_projection_is_wire_ready) :-
     parse_words(["mirror", "pause", "5"],
                 command(mirror_pause, mirror_pause, ui,
                         [integer(5), boolean(true)])),
@@ -282,7 +291,7 @@ run_test(closed_override_requests_use_the_same_relation) :-
 
 run_test(structured_specs_parse_render_and_materialize_relationally) :-
     OciJson = "{\"build_args\":[[\"A\",\"one\"]],\"net\":\"tap\",\"tag\":null,\"dockerfile\":\"FROM\\u0020scratch\\n\",\"context_tar_gz\":\"eA==\"}",
-    parse_words(["oci.build", OciJson], OciCommand),
+    parse_words(["oci", "build", OciJson], OciCommand),
     expect_equal(
         OciCommand,
         command('oci.build', 'oci.build', ui,
@@ -294,16 +303,16 @@ run_test(structured_specs_parse_render_and_materialize_relationally) :-
         action_request('oci.build', 7,
                        [record(base64("eA=="), "FROM scratch\n", none,
                                tap, [pair("A", "one")])])),
-    render(OciCommand, verb, OciRendered),
+    render(OciCommand, OciRendered),
     parse_words_from_text(OciRendered, OciRoundtrip),
     expect_equal(OciRoundtrip, OciCommand),
     ApiJson = "{\"api_key\":\"secret\",\"model\":\"m\",\"base_url\":\"https://example.test/v1\"}",
-    parse_words(["oaita.probe", ApiJson], ApiCommand),
+    parse_words(["oaita", "probe", ApiJson], ApiCommand),
     once(action_request(ApiCommand,
         action_request('oaita.probe', 5,
                        [record("https://example.test/v1", "m", "secret")]))),
     expect(\+ parse_words(
-        ["oaita.probe",
+        ["oaita", "probe",
          "{\"base_url\":\"x\",\"model\":\"m\",\"api_key\":\"k\",\"model\":\"duplicate\"}"],
         _)),
     expect(\+ action_request(
@@ -390,56 +399,32 @@ run_test(string_kinds_do_not_become_numbers) :-
                         [string("7"), string("00042")])).
 
 run_test(array_wire_shape_is_preserved) :-
-    parse_words(["review.apply", "7", "one", "two"],
+    parse_words(["review", "apply", "7", "one", "two"],
                 command('review.apply', 'review.apply', ui,
                         [string("7"), array([path("one"), path("two")])])).
 
 run_test(parse_render_roundtrip) :-
     parse_words(["mirror", "resume", "5"], Command),
-    render(Command, cli, "mirror resume 5"),
-    render(Command, verb, "mirror_resume 5").
+    render(Command, "mirror resume 5").
 
-run_test(all_forms_roundtrip_through_shared_sequence_relation) :-
+run_test(all_actions_roundtrip_through_shared_sequence_relation) :-
     findall(Action, action(Action, _, _, _, _, _, _), Actions),
-    expect(all_action_forms_roundtrip(Actions)),
-    findall(Action, representation(Action, cli, _), CliActions),
-    expect(all_cli_forms_roundtrip(CliActions)).
+    expect(all_action_forms_roundtrip(Actions)).
 
 all_action_forms_roundtrip([]).
 all_action_forms_roundtrip([Action|Actions]) :-
-    form_roundtrips(Action, verb, minimal),
-    form_roundtrips(Action, verb, full),
-    canonical_form_roundtrips(Action, minimal),
-    canonical_form_roundtrips(Action, full),
+    form_roundtrips(Action, minimal),
+    form_roundtrips(Action, full),
     all_action_forms_roundtrip(Actions).
 
-all_cli_forms_roundtrip([]).
-all_cli_forms_roundtrip([Action|Actions]) :-
-    form_roundtrips(Action, cli, minimal),
-    form_roundtrips(Action, cli, full),
-    all_cli_forms_roundtrip(Actions).
-
-form_roundtrips(Action, Style, Population) :-
-    once(action_grammar:action_form(Action, Style, Specs, _)),
+form_roundtrips(Action, Population) :-
+    once(action_grammar:action_form(Action, Specs, _)),
     spec_surfaces(Specs, Population, Surfaces),
     items(Surfaces, SourceItems),
     once(( parse(SourceItems, parse_result(Command, complete, _, _)),
            Command = command(Action, _, _, _)
          )),
-    once(render(Command, Style, Rendered)),
-    split_string(Rendered, " ", "", RenderedSurfaces),
-    items(RenderedSurfaces, RenderedItems),
-    once(parse(RenderedItems,
-               parse_result(Command, complete, _, _))).
-
-canonical_form_roundtrips(Action, Population) :-
-    once(action_grammar:action_form(Action, verb, Specs, _)),
-    spec_surfaces(Specs, Population, Surfaces),
-    items(Surfaces, SourceItems),
-    once(( parse(SourceItems, parse_result(Command, complete, _, _)),
-           Command = command(Action, _, _, _)
-         )),
-    once(render(Command, canonical, Rendered)),
+    once(render(Command, Rendered)),
     split_string(Rendered, " ", "", RenderedSurfaces),
     items(RenderedSurfaces, RenderedItems),
     once(parse(RenderedItems,
@@ -482,34 +467,36 @@ sample_surfaces(Kind, First, Second) :-
     sample_surface(Kind, Second).
 
 run_test(completion_is_projected_from_tear_parse_evidence) :-
-    Items = [edit_tear(edit, span(0, 8), "mirror_r"), end(8)],
+    neutral("mirror", 0, Mirror),
+    Items = [Mirror, edit_tear(edit, span(7, 8), "r"), end(8)],
     once(parse(
         Items, assist(edit),
         parse_result(
             command(mirror_run, mirror_run, ui, [hole(id, integer)]),
             incomplete(edit(edit)), Evidence, _))),
-    expect(tear_literal(Evidence, edit, "mirror_run")),
+    expect(tear_literal(Evidence, edit, "run")),
     completions(Items, edit, Completions),
-    expect(member_completion("mirror_run", Completions)),
+    expect(member_completion("run", Completions)),
     items(["mirror", "run", "5"], ParseItems),
     once(parse(ParseItems, Candidate)),
     highlights(Candidate, Highlights),
     expect(Highlights \= []).
 
 run_test(tear_parse_checks_every_concrete_suffix_item) :-
+    neutral("mirror", 0, Mirror),
     neutral("5", 9, Five),
-    Valid = [edit_tear(edit, span(0, 8), "mirror_r"), Five, end(10)],
+    Valid = [Mirror, edit_tear(edit, span(7, 8), "r"), Five, end(10)],
     completions(Valid, edit, ValidCompletions),
-    expect(member_completion("mirror_run", ValidCompletions)),
+    expect(member_completion("run", ValidCompletions)),
     neutral("not-an-integer", 9, Bad),
-    Invalid = [edit_tear(edit, span(0, 8), "mirror_r"), Bad, end(23)],
+    Invalid = [Mirror, edit_tear(edit, span(7, 8), "r"), Bad, end(23)],
     completions(Invalid, edit, InvalidCompletions),
-    expect(\+ member_completion("mirror_run", InvalidCompletions)),
+    expect(\+ member_completion("run", InvalidCompletions)),
     neutral("extra", 11, Extra),
-    Trailing = [edit_tear(edit, span(0, 8), "mirror_r"), Five, Extra,
+    Trailing = [Mirror, edit_tear(edit, span(7, 8), "r"), Five, Extra,
                 end(16)],
     completions(Trailing, edit, TrailingCompletions),
-    expect(\+ member_completion("mirror_run", TrailingCompletions)).
+    expect(\+ member_completion("run", TrailingCompletions)).
 
 tear_literal([evidence(_, _, _, _, _, _, _,
                        tear(EditId, literal(Text)))|_], EditId, Text).
@@ -548,7 +535,7 @@ run_test(context_resolution_rewrites_wire_argument) :-
                          [integer(5), string("new-name")])).
 
 run_test(dependent_path_plan_references_box_query) :-
-    items(["writer_id", "work", "src/main.rs"], Items),
+    items(["writer", "id", "work", "src/main.rs"], Items),
     once(context_plan(Items, exact,
                       plan(_, Queries, Bindings, _, _))),
     expect_equal(Queries,
@@ -609,9 +596,10 @@ run_test(context_completion_rejects_ambiguous_exact_binding) :-
     expect_equal(Completions, []).
 
 run_test(dependent_context_completion_graph) :-
-    neutral("writer_id", 0, Writer),
+    neutral("writer", 0, Writer),
+    neutral("id", 7, Id),
     neutral("work", 10, Box),
-    Items = [Writer, Box, edit_tear(edit, span(15, 18), "src"), end(18)],
+    Items = [Writer, Id, Box, edit_tear(edit, span(15, 18), "src"), end(18)],
     once(context_completion_plan(Items, edit, Plan)),
     expect_equal(
         Plan,

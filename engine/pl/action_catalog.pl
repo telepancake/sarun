@@ -1,7 +1,6 @@
 :- module(action_catalog,
           [ action/7,
             argument_schema/2,
-            cli_form/3,
             key_binding/4,
             menu_label/2,
             argument_context/4,
@@ -15,7 +14,7 @@
 `action/7` is data, not an execution registry. Rust owns handler bodies; this
 relation owns what each handler means and every public representation of that
 meaning. No Rust table may duplicate these schemas, descriptions, targets,
-aliases, keys, menus, or forms.
+keys, menus, or representations.
 
   action(PublicIdentity, HandlerIdentity, Target, ArgumentNotation,
          Description, Visibility, Preference).
@@ -24,6 +23,10 @@ Argument notation is retained as a help representation and is relationally
 decoded by `argument_schema/2`. A schema element is
 `arg(Name, Kind, Cardinality, WireShape)`, where cardinality is `required`,
 `optional`, or `repeated`, and wire shape is `scalar`, `array`, or `spread`.
+
+An action atom is its only name. Textual command words, display labels, and
+other presentations are mechanical encodings of that atom; this catalog does
+not carry aliases or independently spelled command names.
 */
 
 action(session_dicts, session_dicts, ui, "", "list every box with status metadata (live overridden for running boxes)", visible, 50).
@@ -328,22 +331,6 @@ wire_base_type(_, _, integer, u64) :- !.
 wire_base_type(_, _, path, path) :- !.
 wire_base_type(_, _, base64, bytes(blob_bytes)) :- !.
 wire_base_type(_, _, string, text(text_bytes)).
-
-% Explicit shell forms. `Normalizer` relates parsed source arguments to the
-% handler's wire arguments. Shared paths are intentional and resolved by the
-% complete schema at end-of-input.
-cli_form(mirror_jobs, ["mirror", "ls"], identity).
-cli_form(mirror_add, ["mirror", "add"], identity).
-cli_form(mirror_run, ["mirror", "run"], identity).
-cli_form(mirror_run_pending, ["mirror", "run"], identity).
-cli_form(mirror_pause, ["mirror", "pause"], pause_true).
-cli_form(mirror_resume, ["mirror", "resume"], resume_false).
-cli_form(mirror_rm, ["mirror", "rm"], identity).
-cli_form(wiki_attach, ["attach", "wiki"], identity).
-cli_form(ietf_attach, ["attach", "ietf"], identity).
-cli_form(git_checkout, ["checkout"], identity).
-cli_form('oci.load', ["oci", "load"], identity).
-cli_form('oci.build', ["oci", "build"], identity).
 
 % Key and menu meaning lives here. Context is an atom naming the UI context;
 % `any` is global. More modal/navigation bindings are added as their actual UI

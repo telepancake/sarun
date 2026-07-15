@@ -16,7 +16,7 @@ The Prolog relation is the sole semantic authority for:
 - canonical action identity and implementation/handler identity;
 - typed and shaped argument schemas;
 - control-socket/UI wire verbs and messages;
-- shell command-line and canonical verb forms;
+- mechanical textual encodings of the sole action identifier;
 - keycode bindings and their UI context/gates;
 - menu labels and action availability;
 - description providers, help text, syntax classes, and preferences;
@@ -138,9 +138,11 @@ Exact predicate names can evolve while implementing, but the model must cover:
   description provider/text, and preference;
 - `schema`: ordered named arguments with semantic kind, required/optional or
   repeated cardinality, and scalar/array wire shape;
-- `form`: canonical verb, shell CLI, wire, key, and menu representations;
+- `form`: the sole action identifier mechanically encoded as command words,
+  plus wire, key, and menu representations;
 - `syntax`: literal/argument syntax class and description provider;
-- `normalization`: aliases and injected values such as mirror pause/resume;
+- `projection`: typed argument transformations such as `mirror_resume`
+  supplying `false` to the shared `mirror_pause` wire handler;
 - `context`: pane/gate predicates for key and menu actions.
 
 One normalized command result must carry enough information for Rust to
@@ -260,19 +262,15 @@ which had historically existed only in `registry::ACTIONS` included:
 - local actions: `mirror_browse`, `mirror_read`, `change_read`, `change_edit`,
   `rule_new`, `rule_delete`, `rule_edit`, `detach`, `refresh`, `filter`,
   `action_menu`, `toggle_mark`;
-- alias/normalization action: `mirror_resume` -> handler `mirror_pause` with a
+- argument/wire projection: `mirror_resume` -> handler `mirror_pause` with a
   wire boolean of `false`.
 
-CLI forms currently requiring explicit relation facts include:
-
-- `mirror ls`, `mirror add`, shared `mirror run`, `mirror pause`,
-  `mirror resume`, `mirror rm`;
-- `attach wiki`, `attach ietf`, `checkout`;
-- `oci load`, `oci build`.
-
-All actions also receive their canonical verb form. Shared CLI forms must be
-resolved relationally by complete schemas and end-of-input, not heuristic word
-classification.
+There is exactly one name per action. Command tokens are derived mechanically
+from that atom (`mirror_run_pending` -> `mirror run pending`, `oci.load` ->
+`oci load`); title/display casing and binary identities are other encodings of
+the same identifier. There are no explicit command spellings or implicit
+aliases. Argument and handler projections remain relational but cannot rename
+an action.
 
 Key migration must cover the actual `PANE_ACTION_KEYS`, `PANE_KEYS`, modal key
 tables, and context menus—not the unused registry projections. Selection-derived
@@ -325,10 +323,10 @@ belong to the relation.
 - [x] Implement schema derivation/validation and explicit overrides in Prolog.
 - [x] Implement generic literal and typed argument matching over neutral source
       evidence.
-- [x] Implement aliases, injected arguments, shared CLI paths, exact
-      end-of-input resolution, visibility, targets, and handler identities.
+- [x] Implement mechanical identifier encoding, typed argument projections,
+      exact end-of-input resolution, visibility, targets, and handler identities.
 - [x] Generalize parse/render/completion/highlight predicates over all actions.
-- [x] Add n-way representation queries for canonical verb, CLI, wire, key,
+- [x] Add n-way representation queries for command text, wire, key,
       menu, help/description, and syntax.
 - [ ] Add the generic bounded blob/slice layout relation and native pure byte
       primitives; cover decode, encode, and validation modes with malformed,
@@ -373,8 +371,8 @@ belong to the relation.
 - [x] Inventory every `ui.sock` request, reply, event, and stream frame and
       specify bounded binary framing plus typed scalar/array/value encodings.
       The durable cutover contract is `UI-SOCK-BINARY.md`.
-- [x] Give every wire action a stable binary identity in the relation. Alias
-      actions normalize to their handler's identity and schema; local actions
+- [x] Give every wire action a stable binary identity in the relation. Actions
+      may project to a shared handler identity and schema; local actions
       have no invented wire form.
 - [x] Give every wire action a concrete binary request-field schema in the
       relation and relate parsed/context-resolved values to that schema.
@@ -434,12 +432,12 @@ belong to the relation.
 
 ### 6. Verification gates
 
-- [x] Prolog core-only focused tests validate all 114 action rows plus neutral
-      parsing, shared forms, normalization, strings, arrays, rendering,
+- [x] Prolog core-only focused tests validate all 108 action rows plus neutral
+      parsing, identifier encoding, argument projection, strings, arrays, rendering,
       completion/highlighting, and the closed application surface.
 - [x] Expand them to exhaustive per-representation and per-action round trips.
 - [x] Parse/render round trips preserve typed wire arguments for every action.
-- [x] Canonical verb and all CLI forms parse with exact arity and full input.
+- [x] Every mechanically encoded command parses with exact arity and full input.
 - [ ] Numeric-looking textual values remain text; byte paths and decoded
       base64 bodies remain bytes without numeric coercion or lossy conversion.
 - [x] Optional and repeated arguments preserve exact wire array shape.
@@ -486,9 +484,9 @@ belong to the relation.
   x86_64 musl.
 - Successfully produced and validated the pinned aarch64 static SWI-Prolog and
   zlib artifact set on the current aarch64 host.
-- Added a 114-action Prolog catalog covering the 97 UI wire verbs plus
-  control/local/alias actions, with schemas, targets, visibility, descriptions,
-  canonical forms, explicit CLI forms, and normalization.
+- Added the complete Prolog action catalog with schemas, targets, visibility,
+  descriptions, one mechanically encoded name per action, and typed argument
+  projections.
 - Replaced the five-action grammar with a generic relation over neutral source
   units and typed normalized `command/4` results.
 - Generalized the Rust FFI result types to owned identities and recursive typed
@@ -525,8 +523,8 @@ belong to the relation.
   contract. Consolidated the pre-existing TRACE atom code into one bounded
   tv-compatible Rust primitive and cut the box/PTY mux over to compound atoms.
 - Assigned explicit, order-independent numeric identities to all 95 live wire
-  action handlers in the relation. Wire projection occurs after alias
-  normalization, so (for example) `mirror_resume` projects the actual
+  action handlers in the relation. Wire projection occurs after typed argument
+  projection, so (for example) `mirror_resume` projects the actual
   `mirror_pause` handler and its two-argument schema, while local-only actions
   do not pretend to be transport messages. Relation invariants prove identity
   uniqueness and complete UI/control handler coverage.
@@ -552,10 +550,9 @@ belong to the relation.
   normalization, and end-of-form behavior execute once. Removed the old render
   traversal and its argument-counting helpers.
 - Moved `representation/3` and `convert/4` into the hub beside the executable
-  form relation. Canonical verb, CLI, syntax, wire, help, key, and menu values
-  now project from the normalized facts and executable specs. Exhaustive tests
-  render and reparse minimal and fully populated canonical forms for all 108
-  actions and every explicit CLI form, covering optional/repeated shapes.
+  form relation. Command text, syntax, wire, help, key, and menu values project
+  from the normalized facts and executable specs. Exhaustive tests render and
+  reparse minimal and fully populated forms for all 108 actions.
 - Added the normalized non-action transport relation: 16 requests, 6 response
   payloads, 7 connection modes, 10 compact event invalidations, and 11
   stream-frame identities, plus bounded records/enums/tagged choices and exact
@@ -617,7 +614,7 @@ belong to the relation.
   and UTF-8 byte bounds, enum membership, decoded base64 size, and closed
   record/choice structure before Rust materializes the generated variant.
   Exhaustive pure tests construct a request for all 95 handlers, including
-  aliases and contextual identities.
+  shared-handler projections and contextual identities.
 - Replaced the two unconstrained `SPEC` terminals with action-specific JSON
   source relations for OCI builds and API probes. Parsing and canonical
   rendering are pure and core-only; object order is irrelevant, while unknown
@@ -628,7 +625,7 @@ belong to the relation.
   bytes, and materialize the generated request.
 - Made concrete request materialization mandatory in the live parser:
   every resolved UI/control invocation contains the generated
-  `ActionRequest`, aliases must agree on the generated handler identity, and a
+  `ActionRequest`, projections must agree on the generated handler identity, and a
   missing request is a hard parse error rather than a fallback to source
   arguments. Local UI actions are the explicit non-wire sum case. The existing
   JSON argument array remains only as the active transport projection to be
@@ -935,15 +932,23 @@ belong to the relation.
 - Fixed the command-modal completion composition failure exposed by
   `kill <TAB> C1`. Parsing and context resolution had already produced the
   correct typed `Kill` request, but the preview unconditionally requested the
-  sparse shell-CLI form and reported its ordinary no-solution result as a
-  parser-backend failure. The relation now defines one canonical display choice
-  per action: an explicitly declared CLI form where present, otherwise the
-  canonical verb form. Parser composition coverage now applies a contextual
+  obsolete secondary command form and reported its ordinary no-solution result
+  as a parser-backend failure. The secondary form has now been deleted entirely:
+  each action atom has one mechanically derived textual encoding. Parser
+  composition coverage applies a contextual
   completion, reparses it, checks the typed request, highlights it, and renders
   it; a UI-level regression reproduces the exact `kill ` to `C1` workflow. The
-  core Prolog suite additionally round-trips canonical minimal and full forms
+  core Prolog suite additionally round-trips minimal and full forms
   for all 108 actions. Native aarch64 verification passes all 42 Prolog tests
   and the full Rust suite (313 passed, 1 browser E2E ignored).
+- Enforced the one-action/one-name invariant after the preview bug exposed the
+  leftover dual-form model. Deleted `cli_form/3`, both `verb`/`cli` grammar
+  branches, canonical-form selection, and Rust's `RenderForm` mode. The one
+  action atom now mechanically produces command tokens by splitting identifier
+  separators; catalog validation proves those token sequences are unique.
+  Parsing, completion, highlighting, help, and rendering all consume that same
+  form. `mirror_pause`/`mirror_resume` boolean injection remains solely an
+  argument-to-wire projection and cannot rename either action.
 
 ## Stop conditions
 

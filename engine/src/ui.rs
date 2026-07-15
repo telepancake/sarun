@@ -18553,7 +18553,7 @@ mod tests {
         );
         assert!(
             text.iter()
-                .any(|l| l.contains("mirror_add") && l.contains("add a scheduled")),
+                .any(|l| l.contains("mirror add") && l.contains("add a scheduled")),
             "no verb line in help"
         );
         assert!(text.iter().any(|l| l.starts_with("Keys")), "no Keys header");
@@ -20436,34 +20436,35 @@ mod tests {
     }
 
     #[test]
-    fn command_modal_styles_exact_command_and_previews_canonical_form() {
-        let spans = command_spans("mirror_run 5", &crate::parser::EmptyContext).unwrap();
+    fn command_modal_styles_and_previews_the_single_command_encoding() {
+        let spans = command_spans("mirror run 5", &crate::parser::EmptyContext).unwrap();
         assert_eq!(
             spans
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "mirror_run 5"
+            "mirror run 5"
         );
-        assert_eq!(spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(spans[0].style.fg, Some(Color::LightBlue));
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(spans[2].style.fg, Some(Color::Yellow));
+        assert_eq!(spans[2].style.fg, Some(Color::LightCyan));
+        assert_eq!(spans[4].style.fg, Some(Color::Yellow));
 
         let mut app = headless_app();
         app.modal = Some(Modal::Command {
-            buf: "mirror_run 5".into(),
+            buf: "mirror run 5".into(),
             completions: vec![],
             sel: 0,
         });
         let rendered = render_to_string(&app, 100, 24).unwrap();
-        assert!(rendered.contains(": mirror_run 5_"), "{rendered}");
+        assert!(rendered.contains(": mirror run 5_"), "{rendered}");
         assert!(rendered.contains("→ mirror run 5"), "{rendered}");
     }
 
     #[test]
     fn command_modal_partial_and_unicode_input_are_safe() {
         let mut app = headless_app();
-        for input in ["mirror r", "mirror rün", "mirror_run 五", "λ"] {
+        for input in ["mirror r", "mirror rün", "mirror run 五", "λ"] {
             let spans = command_spans(input, &crate::parser::EmptyContext)
                 .unwrap_or_else(|_| vec![Span::raw(input)]);
             assert_eq!(

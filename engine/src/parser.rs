@@ -5,7 +5,7 @@
 //! A Prolog relation-backed parser that can handle the mixed, nested,
 //! context-sensitive syntaxes sarun encounters:
 //!
-//!   - CLI commands: `sarun mirror run 5`
+//!   - command text: `mirror run 5`
 //!   - Typed binary protocol messages: `action(mirror_run, [integer(5)])`
 //!   - Network packets: HTTP-in-TLS-in-PCAP
 //!   - Patches: unified diff hunks
@@ -60,11 +60,11 @@
 //! N-way transformations between representations:
 //!
 //! ```prolog
-//! representation(verb, mirror_run).
-//! representation(cli, "mirror run").
-//! representation(key, r).
-//! representation(menu, "Force-run this job").
-//! representation(wire, action(mirror_run, [integer(5)])).
+//! representation(mirror_run, action, mirror_run).
+//! representation(mirror_run, command, command(["mirror", "run"], identity)).
+//! representation(mirror_run, key, key(r, 'Mirrors', 80)).
+//! representation(mirror_run, menu, menu("Force-run this job")).
+//! representation(mirror_run, wire, wire(64, mirror_run, ui, _, unit)).
 //!
 //! % Convert any representation to any other:
 //! transform(From, To) :-
@@ -238,7 +238,7 @@ pub trait ContextProvider {
 }
 
 /// A real, empty external context for callers whose grammar has no live
-/// object store (for example, context-free CLI forms and parser unit tests).
+/// object store (for example, context-free command forms and parser unit tests).
 pub struct EmptyContext;
 
 impl ContextProvider for EmptyContext {
@@ -696,7 +696,7 @@ pub fn render(invocation: &Invocation) -> Result<String, String> {
     let command = prolog_command(invocation);
     let prolog = crate::prolog::global()?;
     prolog
-        .render(&command, crate::prolog::RenderForm::Canonical)
+        .render(&command)
         .map(|rendered| rendered.text)
         .map_err(|error| error.to_string())
 }
@@ -820,8 +820,8 @@ mod tests {
     }
 
     #[test]
-    fn shared_cli_form_is_resolved_by_complete_schema() {
-        let pending = invocation("mirror run");
+    fn action_identifier_has_one_mechanical_text_encoding() {
+        let pending = invocation("mirror run pending");
         assert_eq!(pending.action, "mirror_run_pending");
         assert!(pending.args.is_empty());
 
@@ -835,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn alias_normalization_returns_wire_ready_handler_and_arguments() {
+    fn argument_projection_returns_wire_ready_handler_and_arguments() {
         let pause = invocation("mirror pause 5");
         assert_eq!(pause.dispatch_name(), "mirror_pause");
         assert_eq!(pause.args, vec![ArgValue::Number(5), ArgValue::Bool(true)]);
@@ -866,7 +866,7 @@ mod tests {
     #[test]
     fn parse_and_render_use_the_same_relation() {
         for input in [
-            "mirror ls",
+            "mirror jobs",
             "mirror run 5",
             "mirror pause 5",
             "mirror resume 5",
@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn dependent_completion_resolves_box_before_querying_paths() {
-        let input = "writer_id work src";
+        let input = "writer id work src";
         let completions = complete_at(input, input.len(), &FixtureContext).unwrap();
         assert!(completions.iter().any(|entry| {
             entry.insert == "src/main.rs"

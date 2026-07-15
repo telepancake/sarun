@@ -54,23 +54,6 @@ unsafe extern "C" {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RenderForm {
-    Verb,
-    Cli,
-    Canonical,
-}
-
-impl RenderForm {
-    fn prolog_atom(self) -> &'static str {
-        match self {
-            Self::Verb => "verb",
-            Self::Cli => "cli",
-            Self::Canonical => "canonical",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
@@ -318,7 +301,6 @@ pub struct Highlight {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RenderedCommand {
-    pub form: RenderForm,
     pub text: String,
 }
 
@@ -469,21 +451,13 @@ impl Prolog {
         decode_highlight_response(&response)
     }
 
-    pub fn render(
-        &self,
-        command: &CommandAst,
-        form: RenderForm,
-    ) -> Result<RenderedCommand, QueryError> {
-        let request = format!(
-            "request({},{})",
-            encode_command(command),
-            form.prolog_atom(),
-        );
+    pub fn render(&self, command: &CommandAst) -> Result<RenderedCommand, QueryError> {
+        let request = format!("request({})", encode_command(command));
         let response = self
             .application(Operation::Render, request)
             .map_err(QueryError::Backend)?;
         let text = decode_render_response(&response)?;
-        Ok(RenderedCommand { form, text })
+        Ok(RenderedCommand { text })
     }
 
     pub fn action_request(
@@ -2179,7 +2153,7 @@ pub(crate) fn ensure_linked() {
     std::hint::black_box(Prolog::parse as fn(&Prolog, &GrammarInput, Option<&'static str>) -> _);
     std::hint::black_box(Prolog::complete as fn(&Prolog, &GrammarInput, &'static str) -> _);
     std::hint::black_box(Prolog::highlights as fn(&Prolog, &ParseCandidate) -> _);
-    std::hint::black_box(Prolog::render as fn(&Prolog, &CommandAst, RenderForm) -> _);
+    std::hint::black_box(Prolog::render as fn(&Prolog, &CommandAst) -> _);
     std::hint::black_box(Prolog::action_request as fn(&Prolog, &CommandAst) -> _);
     std::hint::black_box(Prolog::action_help as fn(&Prolog) -> _);
     std::hint::black_box(Prolog::ui_action_help as fn(&Prolog) -> _);
@@ -2235,45 +2209,31 @@ mod tests {
         assert!(duplicate.contains("already active"));
         assert_eq!(
             prolog
-                .render(&command("mirror_jobs", None), RenderForm::Verb)
+                .render(&command("mirror_jobs", None))
                 .unwrap()
                 .text,
-            "mirror_jobs",
+            "mirror jobs",
         );
         assert_eq!(
             prolog
-                .render(&command("mirror_jobs", None), RenderForm::Cli)
-                .unwrap()
-                .text,
-            "mirror ls",
-        );
-        assert_eq!(
-            prolog
-                .render(&command("mirror_run", Some(7)), RenderForm::Cli)
+                .render(&command("mirror_run", Some(7)))
                 .unwrap()
                 .text,
             "mirror run 7",
         );
         assert_eq!(
             prolog
-                .render(&command("mirror_run", Some(7)), RenderForm::Canonical)
-                .unwrap()
-                .text,
-            "mirror run 7",
-        );
-        assert_eq!(
-            prolog
-                .render(&command("kill", Some(5)), RenderForm::Canonical)
+                .render(&command("kill", Some(5)))
                 .unwrap()
                 .text,
             "kill 5",
         );
         assert_eq!(
             prolog
-                .render(&command("mirror_run_pending", None), RenderForm::Cli)
+                .render(&command("mirror_run_pending", None))
                 .unwrap()
                 .text,
-            "mirror run",
+            "mirror run pending",
         );
         assert_eq!(
             prolog
@@ -2314,7 +2274,8 @@ mod tests {
         let parsed_oci = prolog
             .parse(
                 &grammar_words(&[
-                    "oci.build",
+                    "oci",
+                    "build",
                     r#"{"context_tar_gz":"eA==","dockerfile":"FROM","tag":null,"net":"tap","build_args":[]}"#,
                 ]),
                 None,
@@ -2338,7 +2299,7 @@ mod tests {
         prolog.exhaust_inference_limit().unwrap();
         assert_eq!(
             prolog
-                .render(&command("mirror_rm", Some(11)), RenderForm::Cli)
+                .render(&command("mirror_rm", Some(11)))
                 .unwrap()
                 .text,
             "mirror rm 11",
@@ -2570,11 +2531,22 @@ mod tests {
     #[test]
     fn incomplete_tear_parse_crosses_embedded_boundary() {
         let input = GrammarInput {
-            items: vec![InputItem::EditTear {
-                id: "edit",
-                span: Span { start: 0, end: 8 },
-                surface: "mirror_r".into(),
-            }],
+            items: vec![
+                InputItem::Unit(KnownUnit {
+                    semantic: Semantic::Text("mirror".into()),
+                    span: Span { start: 0, end: 6 },
+                    paint_spans: vec![Span { start: 0, end: 6 }],
+                    surface: "mirror".into(),
+                    syntax: "command_source".into(),
+                    provider: "rust".into(),
+                    preference: 0,
+                }),
+                InputItem::EditTear {
+                    id: "edit",
+                    span: Span { start: 7, end: 8 },
+                    surface: "r".into(),
+                },
+            ],
             end: 8,
         };
 
@@ -2614,11 +2586,11 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(verbs.len(), rows.len());
         assert!(verbs.contains("verbs"));
-        assert!(verbs.contains("view.open"));
+        assert!(verbs.contains("view open"));
         assert!(!verbs.contains("quit"));
         let display_path = rows
             .iter()
-            .find(|row| row.verb.as_str() == "display_path")
+            .find(|row| row.verb.as_str() == "display path")
             .expect("UI action missing from relation help surface");
         assert_eq!(display_path.arguments.as_str(), "SID");
 
