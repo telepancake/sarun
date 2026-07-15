@@ -317,7 +317,7 @@ belong to the relation.
 - [ ] Add the generic bounded blob/slice layout relation and native pure byte
       primitives; cover decode, encode, and validation modes with malformed,
       truncated, length-dependent, and checksum fixtures.
-- [ ] Make tear matching part of the ordinary terminal/argument matcher and
+- [x] Make tear matching part of the ordinary terminal/argument matcher and
       derive completions by projecting successful full-parse tear evidence;
       remove the separate completion traversal once this path is complete.
 - [ ] Add invariants proving unique public identities, valid handlers/targets,
@@ -413,10 +413,10 @@ belong to the relation.
 - [ ] Numeric-looking strings, paths, base64, and specs remain strings.
 - [ ] Optional and repeated arguments preserve exact wire array shape.
 - [ ] Completion supports partial tokens and mid-token UTF-8 byte spans.
-- [ ] Completion candidates are exactly the tear bindings used by successful
+- [x] Completion candidates are exactly the tear bindings used by successful
       whole-input parses, including suffix viability, ranking evidence, and
       contextual dependency observations.
-- [ ] Box/object/path completion is derived from revision-tagged context facts;
+- [x] Box/object/path completion is derived from revision-tagged context facts;
       dependent domains such as box paths use earlier parsed identities.
 - [x] Canonical observations compare equal exactly when a context change cannot
       affect the dependent parse; provenance/revision is excluded while query
@@ -502,6 +502,18 @@ belong to the relation.
 - Recorded the direct binary `ui.sock` transport boundary: Prolog owns
   representation relationships and conversion, while already-typed
   request/reply delivery is a Rust-only hot path.
+- Replaced the separate literal and contextual completion grammar walkers with
+  ordinary `parse(..., assist(EditId), ...)` witnesses. Literal and argument
+  tears now flow through the same terminal/argument matcher as concrete units;
+  concrete suffix input must parse in full, while absent continuation arguments
+  remain explicit typed holes that cannot cross the execution boundary.
+- Made contextual tear binding a projection of the same staged context
+  relation: `all`/prefix observations are rebound to exact `one`/name witnesses,
+  dependent refs are resolved from the parse's own observations, ambiguous
+  aliases are rejected, and candidates retain the successful parse preference.
+  Deleted `split_literal`, `match_known_prefix`, `match_known_item`,
+  `viable_suffix`, `split_context_argument`, and the separate context-prefix
+  grammar traversal.
 
 ## Stop conditions
 

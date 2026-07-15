@@ -12,13 +12,15 @@ test_name(alias_normalization_is_wire_ready).
 test_name(string_kinds_do_not_become_numbers).
 test_name(array_wire_shape_is_preserved).
 test_name(parse_render_roundtrip).
-test_name(completion_and_highlighting_derive_from_relation).
+test_name(completion_is_projected_from_tear_parse_evidence).
+test_name(tear_parse_checks_every_concrete_suffix_item).
 test_name(application_surface_is_closed).
 test_name(context_plan_captures_box_dependency).
 test_name(context_resolution_rewrites_wire_argument).
 test_name(dependent_path_plan_references_box_query).
 test_name(context_completion_uses_all_prefix_query).
 test_name(context_completion_resolution_uses_entry_names).
+test_name(context_completion_rejects_ambiguous_exact_binding).
 test_name(dependent_context_completion_graph).
 
 run_action_grammar_tests :-
@@ -135,14 +137,40 @@ run_test(parse_render_roundtrip) :-
     render(Command, cli, "mirror resume 5"),
     render(Command, verb, "mirror_resume 5").
 
-run_test(completion_and_highlighting_derive_from_relation) :-
+run_test(completion_is_projected_from_tear_parse_evidence) :-
     Items = [edit_tear(edit, span(0, 8), "mirror_r"), end(8)],
+    once(parse(
+        Items, assist(edit),
+        parse_result(
+            command(mirror_run, mirror_run, ui, [hole(id, integer)]),
+            incomplete(edit(edit)), Evidence, _))),
+    expect(tear_literal(Evidence, edit, "mirror_run")),
     completions(Items, edit, Completions),
     expect(member_completion("mirror_run", Completions)),
     items(["mirror", "run", "5"], ParseItems),
     once(parse(ParseItems, Candidate)),
     highlights(Candidate, Highlights),
     expect(Highlights \= []).
+
+run_test(tear_parse_checks_every_concrete_suffix_item) :-
+    neutral("5", 9, Five),
+    Valid = [edit_tear(edit, span(0, 8), "mirror_r"), Five, end(10)],
+    completions(Valid, edit, ValidCompletions),
+    expect(member_completion("mirror_run", ValidCompletions)),
+    neutral("not-an-integer", 9, Bad),
+    Invalid = [edit_tear(edit, span(0, 8), "mirror_r"), Bad, end(23)],
+    completions(Invalid, edit, InvalidCompletions),
+    expect(\+ member_completion("mirror_run", InvalidCompletions)),
+    neutral("extra", 11, Extra),
+    Trailing = [edit_tear(edit, span(0, 8), "mirror_r"), Five, Extra,
+                end(16)],
+    completions(Trailing, edit, TrailingCompletions),
+    expect(\+ member_completion("mirror_run", TrailingCompletions)).
+
+tear_literal([evidence(_, _, _, _, _, _, _,
+                       tear(EditId, literal(Text)))|_], EditId, Text).
+tear_literal([_|Evidence], EditId, Text) :-
+    tear_literal(Evidence, EditId, Text).
 
 member_completion(Text, [completion(_, Text, _, _, _)|_]).
 member_completion(Text, [_|Completions]) :- member_completion(Text, Completions).
@@ -190,15 +218,27 @@ run_test(dependent_path_plan_references_box_query) :-
 run_test(context_completion_uses_all_prefix_query) :-
     neutral("rename", 0, Rename),
     Items = [Rename, edit_tear(edit, span(7, 9), "wo"), end(9)],
+    once(parse(Items, assist(edit),
+               parse_result(command(rename, rename, control,
+                                    [hole(sid, string),
+                                     hole(new, string)]),
+                            incomplete(edit(edit)), Evidence, _))),
+    expect(tear_argument(Evidence, edit, sid, string)),
     once(context_completion_plan(Items, edit, Plan)),
     expect_equal(Plan,
                  completion_context(rename, span(7, 9), "wo",
                                     [query(q1, ask(all, box, prefix("wo")))],
-                                    q1)).
+                                    q1, 90)).
+
+tear_argument([evidence(_, _, _, _, _, _, _,
+                        tear(EditId, argument(Name, Kind)))|_],
+              EditId, Name, Kind).
+tear_argument([_|Evidence], EditId, Name, Kind) :-
+    tear_argument(Evidence, EditId, Name, Kind).
 
 run_test(context_completion_resolution_uses_entry_names) :-
     Plan = completion_context(rename, span(7, 9), "wo",
-                              [query(q1, Query)], q1),
+                              [query(q1, Query)], q1, 90),
     Query = ask(all, box, prefix("wo")),
     Observations =
         [observed(q1, Query, source(boxes, 7),
@@ -208,10 +248,21 @@ run_test(context_completion_resolution_uses_entry_names) :-
     expect_equal(Completions,
                  [completion(span(7, 9), "work",
                              [alternative(context(rename, box, 5),
-                                          context_argument, boxes, 50)], 50, 1),
+                                          context_argument, boxes, 90)], 90, 1),
                   completion(span(7, 9), "world",
                              [alternative(context(rename, box, 9),
-                                          context_argument, boxes, 50)], 50, 2)]).
+                                          context_argument, boxes, 90)], 90, 2)]).
+
+run_test(context_completion_rejects_ambiguous_exact_binding) :-
+    Plan = completion_context(rename, span(7, 9), "wo",
+                              [query(q1, Query)], q1, 90),
+    Query = ask(all, box, prefix("wo")),
+    Observations =
+        [observed(q1, Query, source(boxes, 7),
+                  some(all([entry(box, 5, ["work"], string("5"), []),
+                            entry(box, 9, ["work"], string("9"), [])])))],
+    resolve_context_completion(Plan, Observations, Completions),
+    expect_equal(Completions, []).
 
 run_test(dependent_context_completion_graph) :-
     neutral("writer_id", 0, Writer),
@@ -225,4 +276,4 @@ run_test(dependent_context_completion_graph) :-
             [query(q1, ask(one, box, name("work"))),
              query(q2, ask(all, path,
                            within(box(ref(q1)), prefix("src"))))],
-            q2)).
+            q2, 100)).

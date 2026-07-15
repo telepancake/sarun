@@ -119,6 +119,9 @@ pub enum CommandValue {
     Boolean(bool),
     String(String),
     Array(Vec<CommandValue>),
+    /// A typed argument expected after an edit tear in an incomplete parse.
+    /// Complete commands crossing the execution boundary never contain this.
+    Hole { name: String, kind: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -221,6 +224,7 @@ pub struct ContextCompletionPlan {
     pub surface: String,
     pub queries: Vec<ContextQueryNode>,
     pub target_query_id: String,
+    pub preference: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1101,6 +1105,9 @@ fn encode_command_value(value: &CommandValue) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         ),
+        CommandValue::Hole { name, kind } => {
+            format!("hole({},{})", quote_atom(name), quote_atom(kind))
+        }
     }
 }
 
@@ -1296,12 +1303,13 @@ fn encode_context_plan(plan: &ContextPlan) -> Result<String, String> {
 
 fn encode_context_completion_plan(plan: &ContextCompletionPlan) -> Result<String, String> {
     Ok(format!(
-        "completion_context({},{},{},{},{})",
+        "completion_context({},{},{},{},{},{})",
         quote_atom(&plan.action),
         encode_span(plan.replace),
         quote_string(&plan.surface),
         encode_context_graph(&plan.queries)?,
         quote_atom(&plan.target_query_id),
+        plan.preference,
     ))
 }
 
@@ -1712,7 +1720,7 @@ fn decode_context_plan(term: &ParsedTerm) -> Result<ContextPlan, String> {
 }
 
 fn decode_context_completion_plan(term: &ParsedTerm) -> Result<ContextCompletionPlan, String> {
-    let args = compound(term, "completion_context", 5)?;
+    let args = compound(term, "completion_context", 6)?;
     Ok(ContextCompletionPlan {
         action: atom(&args[0])?.to_owned(),
         replace: decode_span(&args[1])?,
@@ -1722,6 +1730,7 @@ fn decode_context_completion_plan(term: &ParsedTerm) -> Result<ContextCompletion
             .map(decode_context_node)
             .collect::<Result<_, _>>()?,
         target_query_id: atom(&args[4])?.to_owned(),
+        preference: integer(&args[5])?,
     })
 }
 
@@ -1814,6 +1823,12 @@ fn decode_command_value(term: &ParsedTerm) -> Result<CommandValue, String> {
                 .map(decode_command_value)
                 .collect::<Result<_, _>>()?,
         ));
+    }
+    if let Ok(args) = compound(term, "hole", 2) {
+        return Ok(CommandValue::Hole {
+            name: atom(&args[0])?.to_string(),
+            kind: atom(&args[1])?.to_string(),
+        });
     }
     Err("invalid typed command value returned by grammar".into())
 }
@@ -2238,6 +2253,7 @@ mod tests {
         assert_eq!(plans[0].surface, "wo");
         assert_eq!(plans[0].queries.len(), 1);
         assert_eq!(plans[0].target_query_id, "q1");
+        assert_eq!(plans[0].preference, 90);
         assert_eq!(plans[0].queries[0].query.cardinality, ContextCardinality::All);
         assert_eq!(
             plans[0].queries[0].query.selector,
@@ -2270,5 +2286,40 @@ mod tests {
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].insert, "work");
         assert_eq!(completions[0].alternatives[0].provider, "boxes");
+    }
+
+    #[test]
+    fn incomplete_tear_parse_crosses_embedded_boundary() {
+        let input = GrammarInput {
+            items: vec![InputItem::EditTear {
+                id: "edit",
+                span: Span { start: 0, end: 8 },
+                surface: "mirror_r".into(),
+            }],
+            end: 8,
+        };
+
+        let candidates = global().unwrap().parse(&input, Some("edit")).unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.command.action == "mirror_run")
+            .expect("ordinary parser did not bind the tear to mirror_run");
+        assert_eq!(
+            candidate.status,
+            ParseStatus::Incomplete {
+                edit_id: "edit".into()
+            }
+        );
+        assert_eq!(
+            candidate.command.args,
+            vec![CommandValue::Hole {
+                name: "id".into(),
+                kind: "integer".into(),
+            }]
+        );
+        assert!(candidate
+            .evidence
+            .iter()
+            .any(|evidence| evidence.origin.contains("tear(edit,literal")));
     }
 }

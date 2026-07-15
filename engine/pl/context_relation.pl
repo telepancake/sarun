@@ -1,9 +1,11 @@
 :- module(context_relation,
           [ context_query/3,
+            context_tear_match/6,
             observe_query/4,
             dependency_key/2,
             valid_query_graph/1,
             ready_queries/3,
+            resolve_query_refs/3,
             valid_snapshot/1
           ]).
 
@@ -31,6 +33,60 @@ context_query(ask(one, Domain, Selector), Snapshot, one(Entry)) :-
     matching_entries(Domain, Selector, Snapshot, [Entry]).
 context_query(ask(all, Domain, Selector), Snapshot, all(Entries)) :-
     matching_entries(Domain, Selector, Snapshot, Entries).
+
+%! context_tear_match(+AllQuery, +Snapshot, +Surface, -Name,
+%!                    -ExactQuery, -Entry) is nondet.
+%
+% Bind a contextual tear using the same selector and cardinality relation used
+% by exact parsing.  `Name` is offered only when replacing the prefix selector
+% with that exact name makes `one` succeed.  Ambiguous aliases consequently do
+% not become completions which would fail immediately after insertion.
+
+context_tear_match(ask(all, Domain, Selector), Snapshot, Surface, Name,
+                   ask(one, Domain, ExactSelector), Entry) :-
+    context_query(ask(all, Domain, Selector), Snapshot, all(Entries)),
+    findall(NameString-(Identity-Candidate),
+            ( list_member(Candidate, Entries),
+              Candidate = entry(_, Identity, Names, _, _),
+              list_member(CandidateName, Names),
+              selector_tear_binding(Selector, Surface, CandidateName, _),
+              text_string(CandidateName, NameString)
+            ),
+            NamePairs0),
+    keysort(NamePairs0, NamePairs),
+    group_name_pairs(NamePairs, NameGroups),
+    list_member(Name-IdentityEntries, NameGroups),
+    sort(IdentityEntries, [_Identity-Entry]),
+    selector_tear_binding(Selector, Surface, Name, ExactSelector),
+    Entry = entry(Domain, _, _, _, _).
+
+group_name_pairs([], []).
+group_name_pairs([Name-Value|Pairs], [Name-Values|Groups]) :-
+    take_name_pairs(Pairs, Name, [Value], Values, Rest),
+    group_name_pairs(Rest, Groups).
+
+take_name_pairs([Name-Value|Pairs], Name, Values0, Values, Rest) :-
+    !,
+    take_name_pairs(Pairs, Name, [Value|Values0], Values, Rest).
+take_name_pairs(Pairs, _Name, Values, Values, Pairs).
+
+selector_tear_binding(prefix(Surface), Surface, Name, name(Name)) :-
+    text_prefix(Surface, Name).
+selector_tear_binding(within(Attribute, Selector), Surface, Name,
+                      within(Attribute, ExactSelector)) :-
+    selector_tear_binding(Selector, Surface, Name, ExactSelector).
+selector_tear_binding(and(Left, Right), Surface, Name,
+                      and(ExactLeft, Right)) :-
+    selector_tear_binding(Left, Surface, Name, ExactLeft).
+selector_tear_binding(and(Left, Right), Surface, Name,
+                      and(Left, ExactRight)) :-
+    selector_tear_binding(Right, Surface, Name, ExactRight).
+selector_tear_binding(or(Left, Right), Surface, Name,
+                      or(ExactLeft, Right)) :-
+    selector_tear_binding(Left, Surface, Name, ExactLeft).
+selector_tear_binding(or(Left, Right), Surface, Name,
+                      or(Left, ExactRight)) :-
+    selector_tear_binding(Right, Surface, Name, ExactRight).
 
 observe_query(Id, Query, Snapshot,
               observed(Id, Query, Source, Outcome)) :-
@@ -189,6 +245,11 @@ ready_queries(Graph, Observations, Ready) :-
                Ready)
     ;  Ready = []
     ).
+
+% Project one graph query into the concrete query actually sent to its
+% provider, using successful `one` observations for typed dependencies.
+resolve_query_refs(Query, Observations, Resolved) :-
+    resolve_refs(Query, Observations, Resolved).
 
 valid_observations([], _).
 valid_observations([Observation|Observations], Graph) :-

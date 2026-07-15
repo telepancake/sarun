@@ -248,55 +248,103 @@ source_unit(unit(_, Span, PaintSpans, Surface, _, _, Preference, Origin),
             Span, PaintSpans, Surface, Preference, Origin).
 
 match_specs([], [], _Mode, [], [], 0).
+% Once an edit tear has been consumed by an enclosing call, the ordinary
+% parser may end with an expected continuation.  The missing typed arguments
+% remain explicit holes in the incomplete command; concrete input to the
+% right of a tear is never skipped and must still parse normally.
+match_specs(Specs, [], assist(_), Args, [], 0) :-
+    specs_require_input(Specs),
+    missing_source_args(Specs, Args).
 match_specs([literal(Semantic, Text, Syntax, Description, LitPreference)|Specs],
             [Item|Items], Mode, Args,
-            [evidence(Semantic, Span, PaintSpans, Surface, Syntax,
-                      Description, Preference, Origin)|Evidence], EditCount) :-
-    source_unit(Item, Span, PaintSpans, Surface, SourcePreference, Origin),
-    text_string(Surface, SurfaceString),
-    SurfaceString = Text,
-    Preference is SourcePreference + LitPreference,
-    match_specs(Specs, Items, Mode, Args, Evidence, EditCount).
-match_specs([literal(_Semantic, Text, _Syntax, _Description, _Preference)|Specs],
-            [edit_tear(EditId, _Span, Surface)|Items], assist(EditId), Args,
-            Evidence, EditCount) :-
-    surface_prefix(Surface, Text),
-    match_specs(Specs, Items, assist(EditId), Args, Evidence, RestCount),
-    EditCount is RestCount + 1.
+            [EvidenceItem|Evidence], EditCount) :-
+    match_literal_item(
+        literal(Semantic, Text, Syntax, Description, LitPreference),
+        Item, Mode, EvidenceItem, ItemEditCount),
+    match_specs(Specs, Items, Mode, Args, Evidence, RestCount),
+    EditCount is RestCount + ItemEditCount.
 match_specs([argument(arg(Name, Kind, required, scalar))|Specs],
             [Item|Items], Mode, [Value|Args], [EvidenceItem|Evidence],
             EditCount) :-
-    match_argument_item(Name, Kind, Item, Value, EvidenceItem),
-    match_specs(Specs, Items, Mode, Args, Evidence, EditCount).
+    match_argument_item(Name, Kind, Item, Mode, Value, EvidenceItem,
+                        ItemEditCount),
+    match_specs(Specs, Items, Mode, Args, Evidence, RestCount),
+    EditCount is RestCount + ItemEditCount.
 match_specs([argument(arg(Name, Kind, optional, scalar))|Specs],
             [Item|Items], Mode, [Value|Args], [EvidenceItem|Evidence],
             EditCount) :-
-    match_argument_item(Name, Kind, Item, Value, EvidenceItem),
-    match_specs(Specs, Items, Mode, Args, Evidence, EditCount).
+    match_argument_item(Name, Kind, Item, Mode, Value, EvidenceItem,
+                        ItemEditCount),
+    match_specs(Specs, Items, Mode, Args, Evidence, RestCount),
+    EditCount is RestCount + ItemEditCount.
 match_specs([argument(arg(_, _, optional, scalar))|Specs], Items, Mode,
             Args, Evidence, EditCount) :-
     match_specs(Specs, Items, Mode, Args, Evidence, EditCount).
 match_specs([argument(arg(Name, Kind, repeated, Shape))|Specs], Items0, Mode,
             Args, Evidence, EditCount) :-
-    take_repeated(Name, Kind, Items0, Values, RepeatedEvidence, Items),
+    take_repeated(Name, Kind, Items0, Mode, Values, RepeatedEvidence,
+                  RepeatedEditCount, Items),
     repeated_arguments(Shape, Values, Specs, RepeatedArgs),
-    match_specs(Specs, Items, Mode, RestArgs, RestEvidence, EditCount),
+    match_specs(Specs, Items, Mode, RestArgs, RestEvidence, RestEditCount),
     append(RepeatedArgs, RestArgs, Args),
-    append(RepeatedEvidence, RestEvidence, Evidence).
+    append(RepeatedEvidence, RestEvidence, Evidence),
+    EditCount is RepeatedEditCount + RestEditCount.
 
-match_argument_item(Name, Kind, Item, Value,
+match_literal_item(
+    literal(Semantic, Text, Syntax, Description, LitPreference), Item, _Mode,
+    evidence(Semantic, Span, PaintSpans, Surface, Syntax, Description,
+             Preference, Origin), 0) :-
+    source_unit(Item, Span, PaintSpans, Surface, SourcePreference, Origin),
+    text_string(Surface, SurfaceString),
+    SurfaceString = Text,
+    Preference is SourcePreference + LitPreference.
+match_literal_item(
+    literal(Semantic, Text, Syntax, Description, LitPreference),
+    edit_tear(EditId, Span, Surface), assist(EditId),
+    evidence(Semantic, Span, [], Surface, Syntax, Description, LitPreference,
+             tear(EditId, literal(Text))), 1) :-
+    surface_prefix(Surface, Text).
+
+match_argument_item(Name, Kind, Item, _Mode, Value,
                     evidence(Value, Span, PaintSpans, Surface, Syntax,
-                             Name, Preference, Origin)) :-
+                             Name, Preference, Origin), 0) :-
     source_unit(Item, Span, PaintSpans, Surface, SourcePreference, Origin),
     parse_argument(Kind, Surface, Value),
     kind_syntax(Kind, Syntax),
     Preference is SourcePreference + 10.
+match_argument_item(Name, Kind, edit_tear(EditId, Span, Surface),
+                    assist(EditId), hole(Name, Kind),
+                    evidence(hole(Name, Kind), Span, [], Surface, Syntax,
+                             Name, 10,
+                             tear(EditId, argument(Name, Kind))), 1) :-
+    kind_syntax(Kind, Syntax).
 
-take_repeated(_, _, Items, [], [], Items).
-take_repeated(Name, Kind, [Item|Items0], [Value|Values],
-              [Evidence|EvidenceItems], Items) :-
-    match_argument_item(Name, Kind, Item, Value, Evidence),
-    take_repeated(Name, Kind, Items0, Values, EvidenceItems, Items).
+take_repeated(_, _, Items, _Mode, [], [], 0, Items).
+take_repeated(Name, Kind, [Item|Items0], Mode, [Value|Values],
+              [Evidence|EvidenceItems], EditCount, Items) :-
+    match_argument_item(Name, Kind, Item, Mode, Value, Evidence,
+                        ItemEditCount),
+    take_repeated(Name, Kind, Items0, Mode, Values, EvidenceItems,
+                  RestEditCount, Items),
+    EditCount is ItemEditCount + RestEditCount.
+
+specs_require_input([literal(_, _, _, _, _)|_]).
+specs_require_input([argument(arg(_, _, required, scalar))|_]).
+specs_require_input([_|Specs]) :-
+    specs_require_input(Specs).
+
+missing_source_args([], []).
+missing_source_args([literal(_, _, _, _, _)|Specs], Args) :-
+    missing_source_args(Specs, Args).
+missing_source_args([argument(arg(Name, Kind, required, scalar))|Specs],
+                    [hole(Name, Kind)|Args]) :-
+    missing_source_args(Specs, Args).
+missing_source_args([argument(arg(_, _, optional, scalar))|Specs], Args) :-
+    missing_source_args(Specs, Args).
+missing_source_args([argument(arg(_, _, repeated, Shape))|Specs], Args) :-
+    repeated_arguments(Shape, [], Specs, RepeatedArgs),
+    missing_source_args(Specs, RestArgs),
+    append(RepeatedArgs, RestArgs, Args).
 
 repeated_arguments(array, Values, Specs, Args) :-
     ( Values = [_|_]
@@ -343,41 +391,69 @@ evidence_preference([evidence(_, _, _, _, _, _, ItemPreference, _)|Evidence],
 
 context_plan(Items, Mode,
              plan(Command, Queries, Bindings, Evidence, Preference)) :-
+    relation_plan(Items, Mode,
+                  plan(Command, Queries, Bindings, Evidence, Preference), _).
+
+relation_plan(Items, Mode,
+              plan(Command, Queries, Bindings, Evidence, Preference),
+              CompletionTargets) :-
     parse(Items, Mode,
           parse_result(Command, Status, Evidence, Preference)),
     Command = command(Action, _, _, _),
-    context_queries(Action, Evidence, 1, 1, [], Queries, Bindings),
+    context_queries(Action, Mode, Evidence, 1, 1, [], Queries, Bindings,
+                    CompletionTargets),
+    valid_query_graph(Queries),
     plan_status_matches(Mode, Status).
 
 plan_status_matches(exact, complete).
 plan_status_matches(assist(Id), incomplete(edit(Id))).
 
-context_queries(_, [], _, _, _, [], []).
-context_queries(Action, [Evidence|EvidenceItems], QueryIndex, ArgIndex,
-                KnownArguments, Queries, Bindings) :-
-    Evidence = evidence(_, _, _, Surface, _, Description, _, _),
+context_queries(_, _, [], _, _, _, [], [], []).
+context_queries(Action, Mode, [Evidence|EvidenceItems], QueryIndex, ArgIndex,
+                KnownArguments, Queries, Bindings, CompletionTargets) :-
+    Evidence = evidence(_, Span, _, Surface, _, Description, _, Origin),
     ( argument_name(Action, Description)
     -> ( argument_context(Action, Description, Domain, Scope)
        -> query_id(QueryIndex, Id),
-          context_selector(Scope, KnownArguments, Surface, Selector),
-          Queries = [query(Id, ask(one, Domain, Selector))|RestQueries],
-          Bindings = [bind(Id, arg(ArgIndex), entry_value)|RestBindings],
+          context_argument_dependency(
+              Mode, Origin, Description, Domain, Scope, KnownArguments,
+              Surface, Span, Id, ArgIndex, Query, Binding, Target),
+          Queries = [query(Id, Query)|RestQueries],
+          optional_head(Binding, Bindings, RestBindings),
+          optional_head(Target, CompletionTargets, RestTargets),
           NextQuery is QueryIndex + 1,
           NextKnown = [Description-Id|KnownArguments]
        ;  Queries = RestQueries,
           Bindings = RestBindings,
+          CompletionTargets = RestTargets,
           NextQuery = QueryIndex,
           NextKnown = KnownArguments
        ),
        NextArg is ArgIndex + 1
     ;  Queries = RestQueries,
        Bindings = RestBindings,
+       CompletionTargets = RestTargets,
        NextQuery = QueryIndex,
        NextArg = ArgIndex,
        NextKnown = KnownArguments
     ),
-    context_queries(Action, EvidenceItems, NextQuery, NextArg, NextKnown,
-                    RestQueries, RestBindings).
+    context_queries(Action, Mode, EvidenceItems, NextQuery, NextArg,
+                    NextKnown, RestQueries, RestBindings, RestTargets).
+
+context_argument_dependency(
+    assist(EditId), tear(EditId, argument(Name, Kind)), Name, Domain, Scope,
+    Known, Surface, Span, Id, _ArgIndex, ask(all, Domain, Selector), none,
+    some(completion_target(EditId, Id, Span, Surface, Domain, Kind))) :-
+    !,
+    context_completion_selector(Scope, Known, Surface, Selector).
+context_argument_dependency(
+    _Mode, _Origin, _Name, Domain, Scope, Known, Surface, _Span, Id, ArgIndex,
+    ask(one, Domain, Selector), some(bind(Id, arg(ArgIndex), entry_value)),
+    none) :-
+    context_selector(Scope, Known, Surface, Selector).
+
+optional_head(none, Tail, Tail).
+optional_head(some(Head), [Head|Tail], Tail).
 
 argument_name(Action, Name) :-
     argument_schema(Action, Schema),
@@ -435,43 +511,24 @@ replace_nth(Index, [Head|Values], Value, [Head|Result]) :-
     Index > 1, Next is Index - 1,
     replace_nth(Next, Values, Value, Result).
 
-context_completion_plan(Items, EditId,
-                        completion_context(Action, Span, Surface,
-                                           Queries, TargetId)) :-
-    input_body(Items, Body, End),
-    valid_body(Body, End),
+context_completion_plan(
+    Items, EditId,
+    completion_context(Action, Span, Surface, Queries, TargetId,
+                       Preference)) :-
+    relation_plan(
+        Items, assist(EditId),
+        plan(command(Action, _, _, _), Queries, _Bindings, _Evidence,
+             Preference),
+        Targets),
     action(Action, _, _, _, _, visible, _),
-    action_form(Action, _Style, Specs, _Normalizer),
-    split_edit(Body, EditId, Before, Span, Surface, After),
-    split_context_argument(Specs, BeforeSpecs, Name, AfterSpecs),
-    argument_context(Action, Name, Domain, Scope),
-    context_prefix_queries(Action, BeforeSpecs, Before, 1, [],
-                           PrefixQueries, TargetIndex, KnownArguments),
-    query_id(TargetIndex, TargetId),
-    context_completion_selector(Scope, KnownArguments, Surface, Selector),
-    append(PrefixQueries,
-           [query(TargetId, ask(all, Domain, Selector))], Queries),
-    viable_suffix(AfterSpecs, After).
+    list_completion_target(EditId, Targets, TargetId, Span, Surface).
 
-context_prefix_queries(_, [], [], QueryIndex, Known,
-                       [], QueryIndex, Known).
-context_prefix_queries(Action, [Spec|Specs], [Item|Items], QueryIndex0, Known0,
-                       Queries, QueryIndex, Known) :-
-    match_known_item(Spec, Item),
-    ( Spec = argument(arg(Name, _, _, _)),
-      argument_context(Action, Name, Domain, Scope)
-    -> source_unit(Item, _, _, Surface, _, _),
-       query_id(QueryIndex0, Id),
-       context_selector(Scope, Known0, Surface, Selector),
-       Queries = [query(Id, ask(one, Domain, Selector))|Rest],
-       NextIndex is QueryIndex0 + 1,
-       NextKnown = [Name-Id|Known0]
-    ;  Queries = Rest,
-       NextIndex = QueryIndex0,
-       NextKnown = Known0
-    ),
-    context_prefix_queries(Action, Specs, Items, NextIndex, NextKnown,
-                           Rest, QueryIndex, Known).
+list_completion_target(
+    EditId,
+    [completion_target(EditId, TargetId, Span, Surface, _Domain, _Kind)|_],
+    TargetId, Span, Surface).
+list_completion_target(EditId, [_|Targets], TargetId, Span, Surface) :-
+    list_completion_target(EditId, Targets, TargetId, Span, Surface).
 
 context_completion_selector(root, _, Surface, prefix(Surface)).
 context_completion_selector(within(Template), Known, Surface,
@@ -479,17 +536,19 @@ context_completion_selector(within(Template), Known, Surface,
     resolve_argument_refs(Template, Known, Resolved).
 
 resolve_context_completion(
-    completion_context(Action, Span, Surface, Queries, TargetId),
+    completion_context(Action, Span, Surface, Queries, TargetId, Preference),
     Observations, Completions) :-
-    action(Action, _, _, _, _, _, ActionPreference),
     list_query(TargetId, Query, Queries),
-    context_all_observation(TargetId, Query, Observations, Provider, Entries),
+    context_all_observation(TargetId, Query, Observations, Source, Entries),
+    Source = source(Provider, _),
+    resolve_query_refs(Query, Observations, ResolvedQuery),
     findall(completion_key(Span, Name)-
                 (alternative(context(Action, Domain, Identity),
-                             context_argument, Provider)-ActionPreference),
-            ( context_entry(Entries, Domain, Identity, Names),
-              context_name(Names, Name),
-              surface_prefix(Surface, Name)
+                             context_argument, Provider)-Preference),
+            ( context_tear_match(
+                  ResolvedQuery, snapshot(Source, Entries), Surface, Name,
+                  _ExactQuery,
+                  entry(Domain, Identity, _Names, _Value, _Attributes))
             ),
             Pairs),
     merge_completion_pairs(Pairs, Candidates),
@@ -498,22 +557,9 @@ resolve_context_completion(
 
 context_all_observation(
     Id, Query,
-    [observed(Id, Query, source(Provider, _), some(all(Entries)))|_],
-    Provider, Entries).
-context_all_observation(Id, Query, [_|Observations], Provider, Entries) :-
-    context_all_observation(Id, Query, Observations, Provider, Entries).
-
-context_entry([entry(Domain, Identity, Names, _, _)|_],
-              Domain, Identity, Names).
-context_entry([_|Entries], Domain, Identity, Names) :-
-    context_entry(Entries, Domain, Identity, Names).
-
-context_name([Name|_], Name).
-context_name([_|Names], Name) :- context_name(Names, Name).
-
-split_context_argument([argument(arg(Name, _, _, _))|Specs], [], Name, Specs).
-split_context_argument([Spec|Specs], [Spec|Before], Name, After) :-
-    split_context_argument(Specs, Before, Name, After).
+    [observed(Id, Query, Source, some(all(Entries)))|_], Source, Entries).
+context_all_observation(Id, Query, [_|Observations], Source, Entries) :-
+    context_all_observation(Id, Query, Observations, Source, Entries).
 
 query_id(1, q1).
 query_id(2, q2).
@@ -527,58 +573,33 @@ query_id(8, q8).
 %! completions(+Items, +EditTearId, -Completions) is det.
 
 completions(Items, EditId, Completions) :-
-    ( input_body(Items, Body, End), valid_body(Body, End)
-    -> findall(Visible-(Alternative-Preference),
-               completion_candidate(Body, EditId, Visible,
-                                    Alternative, Preference),
-               Pairs),
-       merge_completion_pairs(Pairs, Candidates),
-       sort_candidates(Candidates, Sorted),
-       rank_completions(Sorted, 1, Completions)
-    ;  Completions = []
-    ).
+    findall(Visible-(Alternative-Preference),
+            completion_witness(Items, EditId, Visible, Alternative,
+                               Preference),
+            Pairs),
+    merge_completion_pairs(Pairs, Candidates),
+    sort_candidates(Candidates, Sorted),
+    rank_completions(Sorted, 1, Completions).
 
-completion_candidate(Body, EditId, completion_key(Span, Text),
-                     alternative(Semantic, Syntax, Description), Preference) :-
-    action(Action, _, _, _, _, visible, ActionPreference),
-    action_form(Action, _Style, Specs, _Normalizer),
-    split_edit(Body, EditId, Before, Span, Surface, After),
-    split_literal(Specs, BeforeSpecs,
-                  literal(Semantic, Text, Syntax, Description,
-                          TerminalPreference),
-                  AfterSpecs),
-    match_known_prefix(BeforeSpecs, Before),
-    surface_prefix(Surface, Text),
-    viable_suffix(AfterSpecs, After),
-    Preference is ActionPreference + TerminalPreference.
+completion_witness(
+    Items, EditId, completion_key(Span, Text),
+    alternative(Semantic, Syntax, Description), Preference) :-
+    parse(Items, assist(EditId),
+          parse_result(command(Action, _, _, _), incomplete(edit(EditId)),
+                       Evidence, Preference)),
+    action(Action, _, _, _, _, visible, _),
+    tear_literal_evidence(EditId, Evidence, Span, Text, Semantic, Syntax,
+                          Description).
 
-split_edit([edit_tear(EditId, Span, Surface)|After], EditId,
-           [], Span, Surface, After).
-split_edit([Item|Items], EditId, [Item|Before], Span, Surface, After) :-
-    split_edit(Items, EditId, Before, Span, Surface, After).
-
-split_literal([Literal|Specs], [], Literal, Specs) :-
-    Literal = literal(_, _, _, _, _).
-split_literal([Spec|Specs], [Spec|Before], Literal, After) :-
-    split_literal(Specs, Before, Literal, After).
-
-match_known_prefix([], []).
-match_known_prefix([Spec|Specs], [Item|Items]) :-
-    match_known_item(Spec, Item),
-    match_known_prefix(Specs, Items).
-
-match_known_item(literal(_, Text, _, _, _), Item) :-
-    source_unit(Item, _, _, Surface, _, _),
-    text_string(Surface, Text).
-match_known_item(argument(arg(_, Kind, _, _)), Item) :-
-    source_unit(Item, _, _, Surface, _, _),
-    parse_argument(Kind, Surface, _).
-
-viable_suffix([], []).
-viable_suffix([_|_], []).
-viable_suffix([Spec|Specs], [Item|Items]) :-
-    match_known_item(Spec, Item),
-    viable_suffix(Specs, Items).
+tear_literal_evidence(
+    EditId,
+    [evidence(Semantic, Span, _, _, Syntax, Description, _,
+              tear(EditId, literal(Text)))|_],
+    Span, Text, Semantic, Syntax, Description).
+tear_literal_evidence(EditId, [_|Evidence], Span, Text, Semantic, Syntax,
+                      Description) :-
+    tear_literal_evidence(EditId, Evidence, Span, Text, Semantic, Syntax,
+                          Description).
 
 surface_prefix(Surface, Text) :-
     text_string(Surface, SurfaceString),

@@ -49,9 +49,8 @@
 //! The grammar provides:
 //!   - `parse(Bytes, AST)` — parse bytes into a structured AST
 //!   - `unparse(AST, Bytes)` — serialize AST back to bytes
-//!   - `complete(AST, PartialAST)` — given a partial AST, enumerate all
-//!     valid completions (from DCG's relational nature: unbound variables
-//!     produce all solutions)
+//!   - `complete(SourceWithTear, Binding)` — run the ordinary parser in assist
+//!     mode and project bindings recorded in successful parse evidence
 //!
 //! N-way lens composition relates each supported representation through one
 //! semantic identity:
@@ -75,8 +74,10 @@
 //! encoding, etc. Not strictly bijective — that's acceptable. True lenses
 //! (lossless round-trip) only where it matters (patches, protocol bytes).
 //!
-//! Parsing, rendering, completion, highlighting, catalog projection, and
-//! conversion are different operations over that same relation.
+//! Parsing, completion, and highlighting now project the same parse witness.
+//! Rendering still traverses `action_form` separately and is therefore an
+//! explicitly unfinished part of the mandatory n-way-relation migration, not
+//! an alternate implementation that may remain.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -324,14 +325,20 @@ fn invocation_from_prolog(
     context: Vec<crate::prolog::ContextObservation>,
 ) -> Result<Invocation, String> {
     use crate::prolog::CommandValue;
-    fn convert_value(value: CommandValue) -> ArgValue {
+    fn convert_value(value: CommandValue) -> Result<ArgValue, String> {
         match value {
-            CommandValue::Integer(value) => ArgValue::Number(value),
-            CommandValue::Boolean(value) => ArgValue::Bool(value),
-            CommandValue::String(value) => ArgValue::String(value),
-            CommandValue::Array(values) => {
-                ArgValue::Array(values.into_iter().map(convert_value).collect())
-            }
+            CommandValue::Integer(value) => Ok(ArgValue::Number(value)),
+            CommandValue::Boolean(value) => Ok(ArgValue::Bool(value)),
+            CommandValue::String(value) => Ok(ArgValue::String(value)),
+            CommandValue::Array(values) => Ok(ArgValue::Array(
+                values
+                    .into_iter()
+                    .map(convert_value)
+                    .collect::<Result<_, _>>()?,
+            )),
+            CommandValue::Hole { name, kind } => Err(format!(
+                "grammar returned incomplete {kind} argument {name} for execution"
+            )),
         }
     }
     let target = match command.target.as_str() {
@@ -344,7 +351,7 @@ fn invocation_from_prolog(
         .args
         .into_iter()
         .map(convert_value)
-        .collect();
+        .collect::<Result<_, _>>()?;
     Ok(Invocation {
         action: command.action,
         handler: command.handler,

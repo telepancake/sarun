@@ -6,6 +6,7 @@
 test_name(cardinalities_are_semantic).
 test_name(unique_fails_for_zero_and_ambiguity).
 test_name(selectors_are_typed_and_composable).
+test_name(tear_matches_are_exact_unique_parse_witnesses).
 test_name(observations_have_stable_dependency_keys).
 test_name(dependent_queries_become_ready_in_order).
 test_name(invalid_graphs_fail_closed).
@@ -56,6 +57,22 @@ run_test(selectors_are_typed_and_composable) :-
                   Snapshot, all(Paths)),
     length(Paths, 2),
     context_query(ask(empty, box, where(kind(file))), Snapshot, empty(true)).
+
+run_test(tear_matches_are_exact_unique_parse_witnesses) :-
+    snapshot(Snapshot),
+    once(context_tear_match(
+        ask(all, path, within(box(box_id(2)), prefix("src/m"))),
+        Snapshot, "src/m", "src/main.rs", ExactQuery,
+        entry(path, p1, _, _, _))),
+    expect_equal(
+        ExactQuery,
+        ask(one, path, within(box(box_id(2)), name("src/main.rs")))),
+    Ambiguous = snapshot(
+        source(boxes, 8),
+        [entry(box, 2, ["same"], box_id(2), []),
+         entry(box, 9, ["same"], box_id(9), [])]),
+    \+ context_tear_match(ask(all, box, prefix("sa")), Ambiguous, "sa",
+                           _, _, _).
 
 run_test(observations_have_stable_dependency_keys) :-
     snapshot(Snapshot),
