@@ -739,6 +739,12 @@ belong to the relation.
   considers live overlay IDs. Existing parent-copy, copy-down, and dissolve UI
   integration tests pass in the full native aarch64-musl suite: 308 passed and
   one existing browser e2e test ignored.
+- Moved `rotate` onto its generated request/success variant. The archive-layer
+  export, two-layer rewrite, parent swap, and mirror refresh now form a typed
+  `Result<RotateResult, String>` implementation with no JSON construction;
+  legacy field spelling occurs only at the temporary listener boundary. The
+  full native aarch64-musl suite passes 308 tests with one existing browser
+  e2e test ignored.
 
 ## Stop conditions
 
