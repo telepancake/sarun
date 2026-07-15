@@ -6,7 +6,8 @@
             evidence_preference/3,
             literal_completion_evidence/7,
             project_completions/2,
-            project_highlights/2
+            project_highlights/2,
+            transform_relation/6
           ]).
 
 /** <module> Grammar-independent relational sequence execution
@@ -23,6 +24,82 @@ grammar name or a grammar-specific terminal kind. This callback-shaped seam is
 an extraction boundary for the current flat spec vocabulary; it will become a
 composable grammar-value/codec relation as the generic IR lands.
 */
+
+%! transform_relation(+Grammar, +Given, +Wanted, +Observations, +Limits,
+%!                    -Reply) is semidet.
+%
+% First executable grammar-value slice. Both directions consume the same
+% immutable grammar value and request envelope; no parse/render operation is
+% selected. Observations and limits already occupy their stable envelope slots
+% while context staging and bounded solution enumeration move into this layer.
+
+transform_relation(
+    sequence_grammar(Specs, terminals(Terminals), separator(Separator)),
+    Given, Wanted, _Observations, _Limits,
+    reply([solution(Bindings, Preference)], [], [], [])) :-
+    given_value(source, Given, source(Items, Mode)),
+    neutral_input(Items, Body),
+    valid_relation_mode(Mode),
+    relate_sequence(Specs, Body, Mode,
+                    grammar_engine:data_terminal(Terminals),
+                    Arguments, Evidence, EditCount),
+    relation_status(Mode, EditCount, Status),
+    evidence_preference(Evidence, 0, Preference),
+    project_highlights(Evidence, Highlights),
+    Available = [binding(arguments, Arguments),
+                 binding(evidence, Evidence),
+                 binding(status, Status),
+                 binding(highlights, Highlights)],
+    requested_bindings(Wanted, Available, Bindings),
+    text_value(Separator).
+transform_relation(
+    sequence_grammar(Specs, terminals(Terminals), separator(Separator)),
+    Given, Wanted, _Observations, _Limits,
+    reply([solution(Bindings, 0)], [], [], [])) :-
+    given_value(arguments, Given, Arguments),
+    relate_sequence(Specs, RenderedItems, render,
+                    grammar_engine:data_terminal(Terminals),
+                    Arguments, _Evidence, 0),
+    rendered_surfaces(RenderedItems, Surfaces),
+    join_surfaces(Surfaces, Separator, Text),
+    Available = [binding(source, Text),
+                 binding(rendered_items, RenderedItems)],
+    requested_bindings(Wanted, Available, Bindings).
+
+given_value(Name, [binding(Name, Value)|_], Value).
+given_value(Name, [_|Bindings], Value) :- given_value(Name, Bindings, Value).
+
+requested_bindings([], _, []).
+requested_bindings([Name|Names], Available, [binding(Name, Value)|Bindings]) :-
+    given_value(Name, Available, Value),
+    requested_bindings(Names, Available, Bindings).
+
+data_terminal(Terminals, syntax(Kind, Syntax)) :-
+    terminal_data(Kind, Syntax, _Surfaces, Terminals).
+data_terminal(Terminals, surface(Kind, Value, Surface)) :-
+    terminal_data(Kind, _Syntax, Surfaces, Terminals),
+    surface_data(Value, Surface, Surfaces).
+
+terminal_data(Kind, Syntax, Surfaces,
+              [terminal(Kind, Syntax, Surfaces)|_]).
+terminal_data(Kind, Syntax, Surfaces, [_|Terminals]) :-
+    terminal_data(Kind, Syntax, Surfaces, Terminals).
+
+surface_data(Value, Surface, [surface(Value, Surface)|_]).
+surface_data(Value, Surface, [_|Surfaces]) :-
+    surface_data(Value, Surface, Surfaces).
+
+rendered_surfaces([], []).
+rendered_surfaces([rendered(Surface)|Items], [Surface|Surfaces]) :-
+    rendered_surfaces(Items, Surfaces).
+
+join_surfaces([], _, "").
+join_surfaces([Surface], _, Surface).
+join_surfaces([Surface|Surfaces], Separator, Text) :-
+    Surfaces = [_|_],
+    join_surfaces(Surfaces, Separator, Rest),
+    string_concat(Surface, Separator, Prefix),
+    string_concat(Prefix, Rest, Text).
 
 %! relate_sequence(+Specs, +Items, +Mode, +TerminalRelation,
 %!                 -Arguments, -Evidence, -EditCount) is nondet.

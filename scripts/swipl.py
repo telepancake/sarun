@@ -65,6 +65,7 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
     grammar = repo / "engine" / "pl" / "action_grammar.pl"
     grammar_engine = repo / "engine" / "pl" / "grammar_engine.pl"
     grammar_ir = repo / "engine" / "pl" / "grammar_ir.pl"
+    relation_api = repo / "engine" / "pl" / "relation_api.pl"
     catalog = repo / "engine" / "pl" / "action_catalog.pl"
     context_relation = repo / "engine" / "pl" / "context_relation.pl"
     transport_catalog = repo / "engine" / "pl" / "transport_catalog.pl"
@@ -74,6 +75,8 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
         raise RuntimeError(f"missing grammar engine: {grammar_engine}")
     if not grammar_ir.is_file():
         raise RuntimeError(f"missing grammar IR: {grammar_ir}")
+    if not relation_api.is_file():
+        raise RuntimeError(f"missing relation API: {relation_api}")
     if not catalog.is_file():
         raise RuntimeError(f"missing action catalog: {catalog}")
     if not context_relation.is_file():
@@ -94,6 +97,7 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
         "action_grammar_sha256": sha256(grammar),
         "grammar_engine_sha256": sha256(grammar_engine),
         "grammar_ir_sha256": sha256(grammar_ir),
+        "relation_api_sha256": sha256(relation_api),
         "action_catalog_sha256": sha256(catalog),
         "context_relation_sha256": sha256(context_relation),
         "transport_catalog_sha256": sha256(transport_catalog),
@@ -114,6 +118,7 @@ def build_identity(metadata: dict[str, str]) -> str:
         "action_grammar_sha256",
         "grammar_engine_sha256",
         "grammar_ir_sha256",
+        "relation_api_sha256",
         "action_catalog_sha256",
         "context_relation_sha256",
         "transport_catalog_sha256",
@@ -308,6 +313,7 @@ def create_app_resource(
         "app/action_grammar.pl": repo / "engine" / "pl" / "action_grammar.pl",
         "app/grammar_engine.pl": repo / "engine" / "pl" / "grammar_engine.pl",
         "app/grammar_ir.pl": repo / "engine" / "pl" / "grammar_ir.pl",
+        "app/relation_api.pl": repo / "engine" / "pl" / "relation_api.pl",
         "app/action_catalog.pl": repo / "engine" / "pl" / "action_catalog.pl",
         "app/context_relation.pl": repo / "engine" / "pl" / "context_relation.pl",
         "app/transport_catalog.pl": repo / "engine" / "pl" / "transport_catalog.pl",
