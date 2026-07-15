@@ -68,6 +68,7 @@ mod sudwire;
 mod ui;
 mod views;
 mod wacz;
+mod wire;
 
 // m2 `serve` mode: the control socket at the instance's namespaced path,
 // speaking the Python ChannelServer's protocol (single-instance guard, ui

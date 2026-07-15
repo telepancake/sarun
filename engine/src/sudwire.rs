@@ -1,5 +1,5 @@
-// Rust encoder for tv's wire/TRACE format (tv/wire/wire.h,
-// tv/trace/trace.h — TRACE_VERSION 3). Step-1.5 of the sud integration
+// Rust TRACE codec layered on crate::wire, the single Rust implementation of
+// tv/wire/wire.h (tv/trace/trace.h — TRACE_VERSION 3). Step-1.5 of the sud integration
 // (engine/DESIGN-sud.md, WIP): the runner now IS the sud launcher, so it
 // writes the stream head (version atom) and the launcher-side EV_EXIT
 // events that tv's sudtrace used to emit. The decoder half lands with
@@ -19,43 +19,15 @@ pub const EV_EXIT_EXITED: i64 = 0;
 pub const EV_EXIT_SIGNALED: i64 = 1;
 
 fn put_blob(out: &mut Vec<u8>, payload: &[u8]) {
-    let n = payload.len() as u64;
-    if n == 1 && payload[0] < 0xC0 {
-        out.push(payload[0]);
-        return;
-    }
-    if n <= 0x37 {
-        out.push(0xC0 + n as u8);
-        out.extend_from_slice(payload);
-        return;
-    }
-    let mut lenbuf = [0u8; 8];
-    let mut lensz = 0usize;
-    let mut tmp = n;
-    while tmp != 0 {
-        lenbuf[lensz] = (tmp & 0xFF) as u8;
-        lensz += 1;
-        tmp >>= 8;
-    }
-    out.push(0xF8 + lensz as u8);
-    out.extend_from_slice(&lenbuf[..lensz]);
-    out.extend_from_slice(payload);
+    crate::wire::put_atom(out, payload).expect("an in-memory trace atom fits");
 }
 
-fn put_u64(out: &mut Vec<u8>, v: u64) {
-    let mut buf = [0u8; 8];
-    let mut n = 0usize;
-    let mut v = v;
-    while v != 0 {
-        buf[n] = (v & 0xFF) as u8;
-        n += 1;
-        v >>= 8;
-    }
-    put_blob(out, &buf[..n]);
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    crate::wire::put_u64(out, value);
 }
 
-fn put_i64(out: &mut Vec<u8>, v: i64) {
-    put_u64(out, ((v as u64) << 1) ^ ((v >> 63) as u64));
+fn put_i64(out: &mut Vec<u8>, value: i64) {
+    crate::wire::put_i64(out, value);
 }
 
 /// The stream head: wire_put_u64(TRACE_VERSION), written once before any
@@ -108,11 +80,9 @@ impl EvState {
         self.nspid = nspid;
         self.nstgid = nstgid;
         // outer { hdr_atom || blob_atom }
-        let mut payload = Vec::with_capacity(hdr.len() + blob.len() + 12);
-        put_blob(&mut payload, &hdr);
-        put_blob(&mut payload, blob);
-        let mut out = Vec::with_capacity(payload.len() + 9);
-        put_blob(&mut out, &payload);
+        let mut out = Vec::with_capacity(hdr.len() + blob.len() + 12);
+        crate::wire::put_many(&mut out, &[&hdr, blob])
+            .expect("an in-memory trace event fits");
         out
     }
 
@@ -194,55 +164,18 @@ process/output capture stops here for this box");
     }
 }
 
-/// Total encoded length of the atom at buf[0..], or None if incomplete.
-/// Err(()) on a malformed prefix (lensz=7 would exceed u64 — wire.h
-/// treats it as format error).
-fn atom_len(buf: &[u8]) -> Result<Option<(usize, usize, usize)>, ()> {
-    // returns (payload_start, payload_len, total)
-    let Some(&b) = buf.first() else { return Ok(None) };
-    if b < 0xC0 {
-        return Ok(Some((0, 1, 1)));
-    }
-    if b < 0xF8 {
-        let len = (b - 0xC0) as usize;
-        if buf.len() < 1 + len { return Ok(None); }
-        return Ok(Some((1, len, 1 + len)));
-    }
-    let lensz = (b - 0xF8) as usize;
-    if lensz == 7 { return Err(()); }
-    if buf.len() < 1 + lensz { return Ok(None); }
-    let mut len = 0usize;
-    for i in 0..lensz {
-        len |= (buf[1 + i] as usize) << (8 * i);
-    }
-    if buf.len() < 1 + lensz + len { return Ok(None); }
-    Ok(Some((1 + lensz, len, 1 + lensz + len)))
-}
+const MAX_TRACE_ATOM: usize = 64 * 1024 * 1024;
 
 fn take_atom<'a>(src: &mut &'a [u8]) -> Option<&'a [u8]> {
-    match atom_len(src) {
-        Ok(Some((start, len, total))) => {
-            let out = &src[start..start + len];
-            *src = &src[total..];
-            Some(out)
-        }
-        _ => None,
-    }
+    crate::wire::get_atom(src, MAX_TRACE_ATOM).ok()
 }
 
 fn take_u64(src: &mut &[u8]) -> Option<u64> {
-    let a = take_atom(src)?;
-    if a.len() > 8 { return None; }
-    let mut v = 0u64;
-    for (i, b) in a.iter().enumerate() {
-        v |= (*b as u64) << (8 * i);
-    }
-    Some(v)
+    crate::wire::get_u64(src).ok()
 }
 
 fn take_i64(src: &mut &[u8]) -> Option<i64> {
-    let u = take_u64(src)?;
-    Some(((u >> 1) as i64) ^ -((u & 1) as i64))
+    crate::wire::get_i64(src).ok()
 }
 
 impl Decoder {
@@ -253,17 +186,16 @@ impl Decoder {
         let mut out = vec![];
         let mut off = 0usize;
         loop {
-            match atom_len(&self.buf[off..]) {
-                Ok(Some((start, len, total))) => {
-                    let payload =
-                        &self.buf[off + start..off + start + len];
+            let source = &self.buf[off..];
+            let mut remaining = source;
+            match crate::wire::get_atom(&mut remaining, MAX_TRACE_ATOM) {
+                Ok(payload) => {
+                    let total = source.len() - remaining.len();
                     if !self.versioned {
                         // first atom = wire_put_u64(TRACE_VERSION); its
                         // payload IS the LE version bytes
-                        let mut v = 0u64;
-                        for (i, b) in payload.iter().enumerate().take(8) {
-                            v |= (*b as u64) << (8 * i);
-                        }
+                        let v = crate::wire::u64_from_payload(payload)
+                            .unwrap_or(u64::MAX);
                         if v != TRACE_VERSION {
                             self.poison(&format!(
                                 "version atom {v} != {TRACE_VERSION} \
@@ -276,15 +208,16 @@ impl Decoder {
                         out.push(ev);
                     } else {
                         self.poison(&format!(
-                            "undecodable event atom ({len} bytes) after {} \
-good event(s) — framing corrupted (interleaved writer?)", out.len()));
+                            "undecodable event atom ({} bytes) after {} \
+good event(s) — framing corrupted (interleaved writer?)",
+                            payload.len(), out.len()));
                         self.buf.clear();
                         return out;
                     }
                     off += total;
                 }
-                Ok(None) => break,
-                Err(()) => {
+                Err(crate::wire::DecodeError::Truncated) => break,
+                Err(_) => {
                     self.poison("malformed atom length prefix — framing lost");
                     self.buf.clear();
                     return out;
@@ -329,40 +262,14 @@ good event(s) — framing corrupted (interleaved writer?)", out.len()));
 mod tests {
     use super::*;
 
-    // Minimal decoder mirroring wire.h, test-only.
     fn get<'a>(src: &mut &'a [u8]) -> &'a [u8] {
-        let b = src[0];
-        if b < 0xC0 {
-            let out = &src[0..1];
-            *src = &src[1..];
-            return out;
-        }
-        if b < 0xF8 {
-            let len = (b - 0xC0) as usize;
-            let out = &src[1..1 + len];
-            *src = &src[1 + len..];
-            return out;
-        }
-        let lensz = (b - 0xF8) as usize;
-        let mut len = 0usize;
-        for i in 0..lensz {
-            len |= (src[1 + i] as usize) << (8 * i);
-        }
-        let out = &src[1 + lensz..1 + lensz + len];
-        *src = &src[1 + lensz + len..];
-        out
+        crate::wire::get_atom(src, MAX_TRACE_ATOM).unwrap()
     }
     fn get_u64(src: &mut &[u8]) -> u64 {
-        let a = get(src);
-        let mut v = 0u64;
-        for (i, b) in a.iter().enumerate() {
-            v |= (*b as u64) << (8 * i);
-        }
-        v
+        crate::wire::get_u64(src).unwrap()
     }
     fn get_i64(src: &mut &[u8]) -> i64 {
-        let u = get_u64(src);
-        ((u >> 1) as i64) ^ -((u & 1) as i64)
+        crate::wire::get_i64(src).unwrap()
     }
 
     #[test]

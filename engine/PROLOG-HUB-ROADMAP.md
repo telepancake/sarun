@@ -321,13 +321,17 @@ belong to the relation.
 - [x] Route the mirror CLI through the same relation (its `parse_words` call is
       now only neutral framing into the mandatory parser).
 - [ ] Route every other command ingress through the same relation.
-- [ ] Inventory every `ui.sock` request, reply, event, and stream frame and
+- [x] Inventory every `ui.sock` request, reply, event, and stream frame and
       specify bounded binary framing plus typed scalar/array/value encodings.
+      The durable cutover contract is `UI-SOCK-BINARY.md`.
 - [ ] Give every wire action/message a stable binary identity in the relation;
       project/generate the Rust opcode and codec definitions from it.
 - [ ] Replace JSON `ui.sock` request/reply transport with direct Rust binary
       encode/decode and handler dispatch, with no Prolog call in message
       delivery and no retained JSON compatibility mode.
+- [x] Consolidate the Rust implementation of `tv/wire/wire.h`; TRACE and the
+      box/PTY/echo/FD-broker mux now share it, and the old four-byte big-endian
+      mux framing has been removed process-wide.
 - [ ] Exercise relation-based conversion only at representation boundaries
       (command line, command prompt, logging, diagnostics, help), producing or
       consuming the same typed binary-wire value used by direct transport.
@@ -446,6 +450,9 @@ belong to the relation.
 - Exposed provenance-free dependency-key projection through the embedded
   relation; a provider revision change with the same query outcome compares
   equal, while a changed outcome invalidates the dependent parse.
+- Inventoried every `ui.sock` connection family and wrote the binary cutover
+  contract. Consolidated the pre-existing TRACE atom code into one bounded
+  tv-compatible Rust primitive and cut the box/PTY mux over to compound atoms.
 - Recorded the direct binary `ui.sock` transport boundary: Prolog owns
   representation relationships and conversion, while already-typed
   request/reply delivery is a Rust-only hot path.
