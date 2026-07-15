@@ -1,4 +1,5 @@
-//! Unified action registry for sarun.
+//! Legacy Rust action registry used while execution consumers are cut over to
+//! projections of the mandatory Prolog action relation.
 //!
 //! `ACTIONS` owns action-specific key, menu, CLI, and target metadata. UI verbs
 //! without such metadata are merged directly from `control::VERB_DOCS`, keeping
@@ -11,9 +12,10 @@
 //!   - `cli_map()` — for CLI command dispatch
 //!   - `help_text()` — for the help pane
 //!
-//! The `:` command prompt in the TUI reads this registry for tab-completion
-//! and dispatch. New control UI verbs are discovered automatically; only actions
-//! needing keys, menus, CLI aliases, or non-UI targets need explicit entries here.
+//! The `:` command prompt does not use this registry for parsing, completion,
+//! or highlighting. Those are projections of the ordinary Prolog parse
+//! relation. Remaining key, menu, CLI, and execution consumers must be migrated
+//! and this registry deleted; it is not an alternate authority or fallback.
 //!
 //! Key model: `key + context + predicate`. The context is a pane name
 //! (or `None` for global). The predicate is a function `fn(&str) -> bool`
@@ -1162,17 +1164,6 @@ pub fn verb_for_cli(path: &[&str]) -> Option<&'static str> {
     (candidates.len() == 1).then(|| candidates[0].verb)
 }
 
-/// Tab-complete a partial verb name in stable lexical order.
-#[allow(dead_code)]
-pub fn complete(prefix: &str) -> Vec<&'static str> {
-    let mut matches: Vec<_> = actions()
-        .filter(|a| a.hidden_reason().is_none() && a.verb.starts_with(prefix))
-        .map(|a| a.verb)
-        .collect();
-    matches.sort_unstable();
-    matches
-}
-
 /// Generate help text for the help pane.
 #[allow(dead_code)]
 pub fn help_text() -> String {
@@ -1447,7 +1438,6 @@ mod tests {
         ] {
             let hidden = find(name).unwrap();
             assert!(!hidden.hidden_reason().unwrap().is_empty(), "{name}");
-            assert!(!complete("").contains(&name), "{name}");
         }
     }
 
@@ -1455,23 +1445,6 @@ mod tests {
     fn find_action() {
         assert!(find("mirror_run").is_some());
         assert!(find("nonexistent").is_none());
-    }
-
-    #[test]
-    fn complete_prefix() {
-        let matches = complete("mirror");
-        assert!(matches.len() >= 6);
-        assert!(matches.contains(&"mirror_run"));
-        assert!(matches.contains(&"mirror_jobs"));
-        assert!(matches.windows(2).all(|pair| pair[0] < pair[1]));
-    }
-
-    #[test]
-    fn complete_empty_returns_all() {
-        assert_eq!(
-            complete("").len(),
-            actions().filter(|a| a.hidden_reason().is_none()).count()
-        );
     }
 
     #[test]
