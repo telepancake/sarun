@@ -87,7 +87,9 @@ test-action-grammar: swipl ## Run the core-only action grammar tests with pinned
 	  bins=( "$${XDG_CACHE_HOME:-$$HOME/.cache}"/sarun/swipl/9.2.9/pipeline-*/$$(uname -m)/native-swipl-build/src/swipl ); \
 	  (( $${#bins[@]} )) || { echo "pinned host swipl not found after make swipl"; exit 1; }; \
 	  "$${bins[-1]}" -q -f none -s engine/pl/test_action_grammar.pl \
-	    -g test_action_grammar:run_action_grammar_tests -t halt
+	    -g test_action_grammar:run_action_grammar_tests -t halt; \
+	  "$${bins[-1]}" -q -f none -s engine/pl/test_context_relation.pl \
+	    -g test_context_relation:run_context_relation_tests -t halt
 
 # ---- Tests ----------------------------------------------------------------
 #

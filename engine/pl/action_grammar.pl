@@ -11,6 +11,7 @@
           ]).
 
 :- use_module(action_catalog).
+:- use_module(context_relation).
 
 /** <module> Relational parser and representation hub
 
@@ -608,10 +609,22 @@ dispatch_application(catalog, request(Visibility), ok(Rows)) :-
     !, catalog(Visibility, Rows).
 dispatch_application(convert, request(FromKind, From, ToKind), ok(Results)) :-
     !, findall(To, convert(FromKind, From, ToKind, To), Results).
+dispatch_application(context_query, request(Query, Snapshot), ok(Outcome)) :-
+    !, ( context_query(Query, Snapshot, Result)
+       -> Outcome = some(Result)
+       ;  Outcome = none
+       ).
+dispatch_application(context_observe, request(Id, Query, Snapshot), ok(Observation)) :-
+    !, observe_query(Id, Query, Snapshot, Observation).
+dispatch_application(context_ready, request(Graph, Observations), ok(Ready)) :-
+    !, ready_queries(Graph, Observations, Ready).
 dispatch_application(parse, _, error(invalid_request)) :- !.
 dispatch_application(complete, _, error(invalid_request)) :- !.
 dispatch_application(highlights, _, error(invalid_request)) :- !.
 dispatch_application(render, _, error(invalid_request)) :- !.
 dispatch_application(catalog, _, error(invalid_request)) :- !.
 dispatch_application(convert, _, error(invalid_request)) :- !.
+dispatch_application(context_query, _, error(invalid_request)) :- !.
+dispatch_application(context_observe, _, error(invalid_request)) :- !.
+dispatch_application(context_ready, _, error(invalid_request)) :- !.
 dispatch_application(_, _, error(invalid_operation)).

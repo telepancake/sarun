@@ -64,10 +64,13 @@ def tool_version(*args: str) -> str:
 def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
     grammar = repo / "engine" / "pl" / "action_grammar.pl"
     catalog = repo / "engine" / "pl" / "action_catalog.pl"
+    context_relation = repo / "engine" / "pl" / "context_relation.pl"
     if not grammar.is_file():
         raise RuntimeError(f"missing application grammar: {grammar}")
     if not catalog.is_file():
         raise RuntimeError(f"missing action catalog: {catalog}")
+    if not context_relation.is_file():
+        raise RuntimeError(f"missing context relation: {context_relation}")
     return {
         "pipeline": PIPELINE_VERSION,
         "target": target,
@@ -81,6 +84,7 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
         "zlib_source_sha256": ZLIB_SHA256,
         "action_grammar_sha256": sha256(grammar),
         "action_catalog_sha256": sha256(catalog),
+        "context_relation_sha256": sha256(context_relation),
         "swipl_license_sha256": sha256(repo / "LICENSES" / "SWI-Prolog.txt"),
         "zlib_license_sha256": sha256(repo / "LICENSES" / "zlib.txt"),
         "cmake": tool_version("cmake", "--version"),
@@ -97,6 +101,7 @@ def build_identity(metadata: dict[str, str]) -> str:
     resource_keys = {
         "action_grammar_sha256",
         "action_catalog_sha256",
+        "context_relation_sha256",
         "swipl_license_sha256",
         "zlib_license_sha256",
     }
@@ -287,6 +292,7 @@ def create_app_resource(
     entries = {
         "app/action_grammar.pl": repo / "engine" / "pl" / "action_grammar.pl",
         "app/action_catalog.pl": repo / "engine" / "pl" / "action_catalog.pl",
+        "app/context_relation.pl": repo / "engine" / "pl" / "context_relation.pl",
         "library/lists.pl": swipl_source / "library" / "lists.pl",
         "library/pairs.pl": swipl_source / "library" / "pairs.pl",
     }

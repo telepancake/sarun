@@ -235,7 +235,7 @@ belong to the relation.
       worker thread, inference limits, exception handling, and cleanup tests.
 - [ ] Add catalog/representation query decoding for help, bindings, menus, and
       conversions.
-- [ ] Add generic bounded context-request and typed context-fact envelopes,
+- [x] Add generic bounded context-request and typed context-fact envelopes,
       using the `ask(empty|one|all, Domain, Selector)` algebra, query IDs,
       typed `ref/1` dependencies, provider identity, and snapshot revision.
 
@@ -255,6 +255,9 @@ belong to the relation.
       menu, help/description, and syntax.
 - [ ] Add invariants proving unique public identities, valid handlers/targets,
       schema/form agreement, and complete handler coverage.
+- [x] Implement the pure `empty|one|all` evaluator, canonical typed matching,
+      observation/dependency-key projection, graph validation, and staged
+      `ref/1` readiness relation.
 - [ ] Add contextual argument domains, dependent provider requests, exact/alias
       resolution, relational `one` failure, and contextual completions.
 - [ ] Add local lexical environments that resolve internal bindings without
@@ -312,6 +315,9 @@ belong to the relation.
       affect the dependent parse; test successful and failed `one` queries.
 - [ ] Query graphs reject cycles, dangling refs, type-mismatched refs, duplicate
       query IDs, noncanonical entries, and provider responses beyond bounds.
+      Cycles, dangling refs, duplicate IDs, refs to non-`one` queries, duplicate
+      entry identities, and noncanonical result ordering are covered now;
+      explicit cross-domain ref typing and provider-specific bounds remain.
 - [ ] Highlighting is derived only from successful grammar evidence.
 - [ ] Help/menu/key projections exactly cover intended visible actions.
 - [ ] Every relation handler resolves to a real Rust execution handler, and
@@ -350,6 +356,11 @@ belong to the relation.
   highlighting fallbacks, Rust render fallback, and obsolete parse wrappers.
 - Built the normal fully static optimized aarch64 release with `make engine`
   and ran it successfully on the current aarch64 host.
+- Added and embedded `context_relation.pl`, a pure query algebra with semantic
+  cardinalities, typed selectors and entries, stable observations, dependency
+  graphs, cycle/dangling-ref validation, and staged reference substitution.
+- Added generic Rust relation values and typed context envelopes; embedded
+  aarch64 tests round-trip a box lookup and make a dependent path query ready.
 
 ## Stop conditions
 

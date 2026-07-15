@@ -129,6 +129,68 @@ pub struct CommandAst {
     pub args: Vec<CommandValue>,
 }
 
+/// A ground, pure value crossing the generic relation boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RelationValue {
+    Atom(String),
+    String(String),
+    Integer(i64),
+    Compound(String, Vec<RelationValue>),
+    List(Vec<RelationValue>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextCardinality {
+    Empty,
+    One,
+    All,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextQuery {
+    pub cardinality: ContextCardinality,
+    pub domain: RelationValue,
+    pub selector: RelationValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextEntry {
+    pub domain: RelationValue,
+    pub identity: RelationValue,
+    pub names: Vec<String>,
+    pub value: RelationValue,
+    pub attributes: Vec<RelationValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextSnapshot {
+    pub provider: RelationValue,
+    pub revision: RelationValue,
+    pub entries: Vec<ContextEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContextResult {
+    Empty(bool),
+    One(ContextEntry),
+    All(Vec<ContextEntry>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextObservation {
+    pub id: String,
+    pub query: ContextQuery,
+    pub provider: RelationValue,
+    pub revision: RelationValue,
+    pub outcome: Option<ContextResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextQueryNode {
+    pub id: String,
+    pub query: ContextQuery,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseStatus {
     Complete,
@@ -210,6 +272,9 @@ enum Operation {
     Complete,
     Highlights,
     Render,
+    ContextQuery,
+    ContextObserve,
+    ContextReady,
 }
 
 impl Operation {
@@ -219,6 +284,9 @@ impl Operation {
             Self::Complete => "complete",
             Self::Highlights => "highlights",
             Self::Render => "render",
+            Self::ContextQuery => "context_query",
+            Self::ContextObserve => "context_observe",
+            Self::ContextReady => "context_ready",
         }
     }
 }
@@ -346,6 +414,54 @@ impl Prolog {
             .map_err(QueryError::Backend)?;
         let text = decode_render_response(&response)?;
         Ok(RenderedCommand { form, text })
+    }
+
+    pub fn context_query(
+        &self,
+        query: &ContextQuery,
+        snapshot: &ContextSnapshot,
+    ) -> Result<Option<ContextResult>, String> {
+        let request = format!(
+            "request({},{})",
+            encode_context_query(query)?,
+            encode_context_snapshot(snapshot)?,
+        );
+        let response = self.application(Operation::ContextQuery, request)?;
+        decode_context_outcome_response(&response)
+    }
+
+    pub fn observe_context(
+        &self,
+        id: &str,
+        query: &ContextQuery,
+        snapshot: &ContextSnapshot,
+    ) -> Result<ContextObservation, String> {
+        let request = format!(
+            "request({},{},{})",
+            quote_atom(id),
+            encode_context_query(query)?,
+            encode_context_snapshot(snapshot)?,
+        );
+        let response = self.application(Operation::ContextObserve, request)?;
+        decode_context_observation_response(&response)
+    }
+
+    pub fn ready_context_queries(
+        &self,
+        graph: &[ContextQueryNode],
+        observations: &[ContextObservation],
+    ) -> Result<Vec<ContextQueryNode>, String> {
+        let graph = encode_context_graph(graph)?;
+        let observations = observations
+            .iter()
+            .map(encode_context_observation)
+            .collect::<Result<Vec<_>, _>>()?
+            .join(",");
+        let response = self.application(
+            Operation::ContextReady,
+            format!("request({graph},[{observations}])"),
+        )?;
+        decode_context_ready_response(&response)
     }
 
     fn application(&self, operation: Operation, request: String) -> Result<String, String> {
@@ -874,6 +990,129 @@ fn encode_command(command: &CommandAst) -> String {
     )
 }
 
+fn encode_relation_value(value: &RelationValue) -> Result<String, String> {
+    Ok(match value {
+        RelationValue::Atom(value) => quote_atom(value),
+        RelationValue::String(value) => quote_string(value),
+        RelationValue::Integer(value) => value.to_string(),
+        RelationValue::Compound(functor, arguments) => {
+            let functor = checked_atom(functor).ok_or("invalid relation value functor")?;
+            let arguments = arguments
+                .iter()
+                .map(encode_relation_value)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(",");
+            format!("{functor}({arguments})")
+        }
+        RelationValue::List(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(encode_relation_value)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(",")
+        ),
+    })
+}
+
+fn encode_context_query(query: &ContextQuery) -> Result<String, String> {
+    let cardinality = match query.cardinality {
+        ContextCardinality::Empty => "empty",
+        ContextCardinality::One => "one",
+        ContextCardinality::All => "all",
+    };
+    Ok(format!(
+        "ask({cardinality},{},{})",
+        encode_relation_value(&query.domain)?,
+        encode_relation_value(&query.selector)?,
+    ))
+}
+
+fn encode_context_entry(entry: &ContextEntry) -> Result<String, String> {
+    let names = entry
+        .names
+        .iter()
+        .map(|name| quote_string(name))
+        .collect::<Vec<_>>()
+        .join(",");
+    let attributes = entry
+        .attributes
+        .iter()
+        .map(encode_relation_value)
+        .collect::<Result<Vec<_>, _>>()?
+        .join(",");
+    Ok(format!(
+        "entry({},{},[{}],{},[{}])",
+        encode_relation_value(&entry.domain)?,
+        encode_relation_value(&entry.identity)?,
+        names,
+        encode_relation_value(&entry.value)?,
+        attributes,
+    ))
+}
+
+fn encode_context_snapshot(snapshot: &ContextSnapshot) -> Result<String, String> {
+    let entries = snapshot
+        .entries
+        .iter()
+        .map(encode_context_entry)
+        .collect::<Result<Vec<_>, _>>()?
+        .join(",");
+    Ok(format!(
+        "snapshot(source({},{}),[{}])",
+        encode_relation_value(&snapshot.provider)?,
+        encode_relation_value(&snapshot.revision)?,
+        entries,
+    ))
+}
+
+fn encode_context_result(result: &ContextResult) -> Result<String, String> {
+    Ok(match result {
+        ContextResult::Empty(value) => format!("empty({value})"),
+        ContextResult::One(entry) => format!("one({})", encode_context_entry(entry)?),
+        ContextResult::All(entries) => format!(
+            "all([{}])",
+            entries
+                .iter()
+                .map(encode_context_entry)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(",")
+        ),
+    })
+}
+
+fn encode_context_observation(observation: &ContextObservation) -> Result<String, String> {
+    let outcome = match &observation.outcome {
+        Some(result) => format!("some({})", encode_context_result(result)?),
+        None => "none".into(),
+    };
+    Ok(format!(
+        "observed({},{},source({},{}),{})",
+        quote_atom(&observation.id),
+        encode_context_query(&observation.query)?,
+        encode_relation_value(&observation.provider)?,
+        encode_relation_value(&observation.revision)?,
+        outcome,
+    ))
+}
+
+fn encode_context_graph(graph: &[ContextQueryNode]) -> Result<String, String> {
+    Ok(format!(
+        "[{}]",
+        graph
+            .iter()
+            .map(|node| {
+                Ok(format!(
+                    "query({},{})",
+                    quote_atom(&node.id),
+                    encode_context_query(&node.query)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .join(",")
+    ))
+}
+
 fn encode_parse_candidate(result: &ParseCandidate) -> String {
     let status = match &result.status {
         ParseStatus::Complete => "complete".to_string(),
@@ -1155,6 +1394,125 @@ fn term_text(term: &ParsedTerm) -> String {
     }
 }
 
+fn decode_relation_value(term: &ParsedTerm) -> Result<RelationValue, String> {
+    Ok(match term {
+        ParsedTerm::Atom(value) => RelationValue::Atom(value.clone()),
+        ParsedTerm::String(value) => RelationValue::String(value.clone()),
+        ParsedTerm::Integer(value) => RelationValue::Integer(*value),
+        ParsedTerm::Compound(functor, arguments) => RelationValue::Compound(
+            functor.clone(),
+            arguments
+                .iter()
+                .map(decode_relation_value)
+                .collect::<Result<_, _>>()?,
+        ),
+        ParsedTerm::List(values) => RelationValue::List(
+            values
+                .iter()
+                .map(decode_relation_value)
+                .collect::<Result<_, _>>()?,
+        ),
+    })
+}
+
+fn decode_context_query(term: &ParsedTerm) -> Result<ContextQuery, String> {
+    let args = compound(term, "ask", 3)?;
+    let cardinality = match atom(&args[0])? {
+        "empty" => ContextCardinality::Empty,
+        "one" => ContextCardinality::One,
+        "all" => ContextCardinality::All,
+        _ => return Err("invalid context query cardinality".into()),
+    };
+    Ok(ContextQuery {
+        cardinality,
+        domain: decode_relation_value(&args[1])?,
+        selector: decode_relation_value(&args[2])?,
+    })
+}
+
+fn decode_context_entry(term: &ParsedTerm) -> Result<ContextEntry, String> {
+    let args = compound(term, "entry", 5)?;
+    Ok(ContextEntry {
+        domain: decode_relation_value(&args[0])?,
+        identity: decode_relation_value(&args[1])?,
+        names: list(&args[2])?
+            .iter()
+            .map(|name| text(name).map(str::to_owned))
+            .collect::<Result<_, _>>()?,
+        value: decode_relation_value(&args[3])?,
+        attributes: list(&args[4])?
+            .iter()
+            .map(decode_relation_value)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn decode_context_result(term: &ParsedTerm) -> Result<ContextResult, String> {
+    if let Ok(args) = compound(term, "empty", 1) {
+        return Ok(ContextResult::Empty(match atom(&args[0])? {
+            "true" => true,
+            "false" => false,
+            _ => return Err("invalid empty context result".into()),
+        }));
+    }
+    if let Ok(args) = compound(term, "one", 1) {
+        return Ok(ContextResult::One(decode_context_entry(&args[0])?));
+    }
+    if let Ok(args) = compound(term, "all", 1) {
+        return Ok(ContextResult::All(
+            list(&args[0])?
+                .iter()
+                .map(decode_context_entry)
+                .collect::<Result<_, _>>()?,
+        ));
+    }
+    Err("invalid context result".into())
+}
+
+fn decode_context_outcome(term: &ParsedTerm) -> Result<Option<ContextResult>, String> {
+    if atom(term).ok() == Some("none") {
+        return Ok(None);
+    }
+    let args = compound(term, "some", 1)?;
+    Ok(Some(decode_context_result(&args[0])?))
+}
+
+fn decode_context_observation(term: &ParsedTerm) -> Result<ContextObservation, String> {
+    let args = compound(term, "observed", 4)?;
+    let source = compound(&args[2], "source", 2)?;
+    Ok(ContextObservation {
+        id: atom(&args[0])?.to_owned(),
+        query: decode_context_query(&args[1])?,
+        provider: decode_relation_value(&source[0])?,
+        revision: decode_relation_value(&source[1])?,
+        outcome: decode_context_outcome(&args[3])?,
+    })
+}
+
+fn decode_context_node(term: &ParsedTerm) -> Result<ContextQueryNode, String> {
+    let args = compound(term, "query", 2)?;
+    Ok(ContextQueryNode {
+        id: atom(&args[0])?.to_owned(),
+        query: decode_context_query(&args[1])?,
+    })
+}
+
+fn decode_context_outcome_response(response: &str) -> Result<Option<ContextResult>, String> {
+    decode_context_outcome(&response_value(response)?)
+}
+
+fn decode_context_observation_response(response: &str) -> Result<ContextObservation, String> {
+    decode_context_observation(&response_value(response)?)
+}
+
+fn decode_context_ready_response(response: &str) -> Result<Vec<ContextQueryNode>, String> {
+    let value = response_value(response)?;
+    list(&value)?
+        .iter()
+        .map(decode_context_node)
+        .collect()
+}
+
 fn decode_span(term: &ParsedTerm) -> Result<Span, String> {
     let args = compound(term, "span", 2)?;
     Ok(Span {
@@ -1329,6 +1687,10 @@ pub(crate) fn ensure_linked() {
     std::hint::black_box(Prolog::complete as fn(&Prolog, &GrammarInput, &'static str) -> _);
     std::hint::black_box(Prolog::highlights as fn(&Prolog, &ParseCandidate) -> _);
     std::hint::black_box(Prolog::render as fn(&Prolog, &CommandAst, RenderForm) -> _);
+    std::hint::black_box(
+        Prolog::context_query
+            as fn(&Prolog, &ContextQuery, &ContextSnapshot) -> _,
+    );
 }
 
 #[cfg(test)]
@@ -1418,5 +1780,87 @@ mod tests {
             end: 0,
         };
         assert!(prolog.parse(&input, None).unwrap_err().contains("items"));
+    }
+
+    #[test]
+    fn contextual_query_graph_roundtrips_through_embedded_relation() {
+        fn atom(value: &str) -> RelationValue {
+            RelationValue::Atom(value.into())
+        }
+        fn compound(name: &str, args: Vec<RelationValue>) -> RelationValue {
+            RelationValue::Compound(name.into(), args)
+        }
+
+        let prolog = global().unwrap();
+        let box_query = ContextQuery {
+            cardinality: ContextCardinality::One,
+            domain: atom("box"),
+            selector: compound("name", vec![RelationValue::String("work".into())]),
+        };
+        let entry = ContextEntry {
+            domain: atom("box"),
+            identity: RelationValue::Integer(2),
+            names: vec!["work".into()],
+            value: compound("box_id", vec![RelationValue::Integer(2)]),
+            attributes: vec![atom("running")],
+        };
+        let snapshot = ContextSnapshot {
+            provider: atom("boxes"),
+            revision: RelationValue::Integer(7),
+            entries: vec![entry.clone()],
+        };
+        assert_eq!(
+            prolog.context_query(&box_query, &snapshot).unwrap(),
+            Some(ContextResult::One(entry.clone())),
+        );
+        let observation = prolog
+            .observe_context("box_query", &box_query, &snapshot)
+            .unwrap();
+        assert_eq!(observation.outcome, Some(ContextResult::One(entry)));
+
+        let path_query = ContextQuery {
+            cardinality: ContextCardinality::All,
+            domain: atom("path"),
+            selector: compound(
+                "within",
+                vec![
+                    compound(
+                        "box",
+                        vec![compound("ref", vec![atom("box_query")])],
+                    ),
+                    compound("prefix", vec![RelationValue::String("src/".into())]),
+                ],
+            ),
+        };
+        let ready = prolog
+            .ready_context_queries(
+                &[
+                    ContextQueryNode {
+                        id: "box_query".into(),
+                        query: box_query,
+                    },
+                    ContextQueryNode {
+                        id: "path_query".into(),
+                        query: path_query,
+                    },
+                ],
+                &[observation],
+            )
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "path_query");
+        assert_eq!(
+            ready[0].query.selector,
+            compound(
+                "within",
+                vec![
+                    compound(
+                        "box",
+                        vec![compound("box_id", vec![RelationValue::Integer(2)])],
+                    ),
+                    compound("prefix", vec![RelationValue::String("src/".into())]),
+                ],
+            ),
+        );
     }
 }
