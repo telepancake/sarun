@@ -413,7 +413,7 @@ impl Operation {
 
 enum Command {
     Application(Operation, String, Sender<Result<String, String>>),
-    Transform(RelationValue, Sender<Result<RelationValue, String>>),
+    Transform(RelationValue, usize, Sender<Result<RelationValue, String>>),
     Shutdown(Sender<Result<(), String>>),
     #[cfg(test)]
     ExhaustInferenceLimit(Sender<Result<(), String>>),
@@ -504,10 +504,11 @@ impl Prolog {
     }
 
     pub fn transform(&self, request: &RelationRequest) -> Result<RelationReply, String> {
+        let output_limit = request.limits.max_output_bytes;
         let request = encode_relation_request(request)?;
         let (reply_tx, reply_rx) = mpsc::channel();
         self.commands
-            .send(Command::Transform(request, reply_tx))
+            .send(Command::Transform(request, output_limit, reply_tx))
             .map_err(|_| "Prolog worker has stopped".to_string())?;
         let value = reply_rx
             .recv()
@@ -796,8 +797,8 @@ fn worker_main(
             Command::Application(operation, request, reply) => {
                 let _ = reply.send(runtime.application(operation, &request));
             }
-            Command::Transform(request, reply) => {
-                let _ = reply.send(runtime.transform(&request));
+            Command::Transform(request, output_limit, reply) => {
+                let _ = reply.send(runtime.transform(&request, output_limit));
             }
             Command::Shutdown(reply) => {
                 let result = runtime.cleanup();
@@ -990,7 +991,11 @@ impl Runtime {
         }
     }
 
-    fn transform(&mut self, request: &RelationValue) -> Result<RelationValue, String> {
+    fn transform(
+        &mut self,
+        request: &RelationValue,
+        output_limit: usize,
+    ) -> Result<RelationValue, String> {
         // SAFETY: the predicate and module are fixed. The generic request is
         // recursively constructed as an FLI term; no Prolog source is parsed.
         unsafe {
@@ -998,7 +1003,7 @@ impl Runtime {
             if terms == 0 {
                 return Err("FLI term allocation failed for relation transform".into());
             }
-            let mut put_budget = RelationTermBudget::default();
+            let mut put_budget = RelationTermBudget::new(MAX_INPUT_BYTES);
             if put_relation_value(terms, request, 0, &mut put_budget) == 0
                 || PL_put_variable(terms + 1) == 0
             {
@@ -1024,7 +1029,7 @@ impl Runtime {
             let succeeded = PL_next_solution(query) != 0;
             let exception = !succeeded && PL_exception(query) != 0;
             let result = if succeeded {
-                let mut get_budget = RelationTermBudget::default();
+                let mut get_budget = RelationTermBudget::new(output_limit);
                 get_relation_value(terms + 1, 0, &mut get_budget)
             } else if exception {
                 Err("relation transform raised a Prolog exception".into())
@@ -1155,13 +1160,21 @@ impl Drop for Runtime {
     }
 }
 
-#[derive(Default)]
 struct RelationTermBudget {
     nodes: usize,
     bytes: usize,
+    max_bytes: usize,
 }
 
 impl RelationTermBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            nodes: 0,
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
     fn enter(&mut self, depth: usize, bytes: usize) -> bool {
         self.nodes = match self.nodes.checked_add(1) {
             Some(nodes) => nodes,
@@ -1173,7 +1186,7 @@ impl RelationTermBudget {
         };
         depth <= MAX_RELATION_DEPTH
             && self.nodes <= MAX_RELATION_NODES
-            && self.bytes <= MAX_OUTPUT_BYTES
+            && self.bytes <= self.max_bytes
     }
 }
 
@@ -1609,6 +1622,19 @@ fn encode_relation_request(request: &RelationRequest) -> Result<RelationValue, S
     {
         return Err(format!(
             "relation request exceeds {MAX_ITEMS} envelope items"
+        ));
+    }
+    if request.limits.max_solutions == 0 || request.limits.max_solutions > 1024 {
+        return Err("relation solution limit must be between 1 and 1024".into());
+    }
+    if request.limits.max_evidence > MAX_RELATION_NODES {
+        return Err(format!(
+            "relation evidence limit exceeds {MAX_RELATION_NODES}"
+        ));
+    }
+    if request.limits.max_output_bytes == 0 || request.limits.max_output_bytes > MAX_OUTPUT_BYTES {
+        return Err(format!(
+            "relation output limit must be between 1 and {MAX_OUTPUT_BYTES} bytes"
         ));
     }
     let given = request
@@ -2813,6 +2839,38 @@ mod tests {
             rendered.solutions[0].bindings[0].value,
             rv_string("hello world")
         );
+    }
+
+    #[test]
+    fn generic_transform_enforces_request_specific_output_bound() {
+        let prolog = global().unwrap();
+        let error = prolog
+            .transform(&RelationRequest {
+                grammar: rv_atom("unknown_grammar"),
+                given: vec![],
+                wanted: vec!["source".into()],
+                observations: vec![],
+                limits: RelationLimits {
+                    max_output_bytes: 1,
+                    ..RelationLimits::default()
+                },
+            })
+            .unwrap_err();
+        assert!(error.contains("bounds"), "{error}");
+
+        let error = prolog
+            .transform(&RelationRequest {
+                grammar: rv_atom("unknown_grammar"),
+                given: vec![],
+                wanted: vec!["source".into()],
+                observations: vec![],
+                limits: RelationLimits {
+                    max_output_bytes: MAX_OUTPUT_BYTES + 1,
+                    ..RelationLimits::default()
+                },
+            })
+            .unwrap_err();
+        assert!(error.contains("output limit"), "{error}");
     }
 
     #[test]

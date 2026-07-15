@@ -227,8 +227,8 @@ request or operation atom crosses it. Solution and evidence limits now
 constrain foreign-grammar enumeration, and a
 tear completion is aggregated from ordinary parse evidence through the same
 request. The output-byte limit is validated at the Prolog envelope and bounded
-by the Rust decoder's fixed ceiling, but the request-specific byte ceiling is
-not yet applied by the decoder. The old action-specific `Operation` and
+by the Rust decoder using the request-specific ceiling; oversized or zero
+limits fail before entering Prolog. The old action-specific `Operation` and
 `application/3` path still exists for sarun and must be migrated and deleted.
 The foreign grammar now also declares contextual fields with an explicit
 `empty`/`one`/`all` exact cardinality. Exact and torn source transformations
