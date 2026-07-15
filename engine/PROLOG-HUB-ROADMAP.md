@@ -260,6 +260,16 @@ test parses reordered JSON fields into a typed compound and renders canonical
 compact JSON from the same declaration. This is sufficient to express the
 current OCI and API action arguments as grammar data; those declarations and
 the removal of their duplicate callback implementation are next.
+`action_grammar:action_relation_grammar/1` now materializes all 108 actions as
+one immutable `choice_grammar` value. Every branch contains its mechanically
+derived command words, source schema, declarative terminal codecs, context
+descriptors, action preference, and a bidirectional template for the normalized
+`command(Action, Handler, Target, WireArguments)` representation. Generic
+transformation tests parse and render `mirror_resume`, including its fixed
+false wire argument, without the terminal callback or action operation table.
+The value is not yet installed behind an opaque handle and production Rust is
+not yet consuming it; context observation must resolve lexical arguments in
+the generic engine before that cut-over.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:

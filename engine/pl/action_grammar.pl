@@ -30,6 +30,7 @@
             context_completion_plan/3,
             resolve_context_completion/3,
             action_request/2,
+            action_relation_grammar/1,
             application/3
           ]).
 
@@ -187,6 +188,84 @@ action_source_schema(Action, Schema) :-
 argument_projection(mirror_pause, pause_true) :- !.
 argument_projection(mirror_resume, resume_false) :- !.
 argument_projection(_, identity).
+
+%! action_relation_grammar(-Grammar) is det.
+%
+% Materialize the complete action language as one immutable executable grammar
+% value. The engine interprets this data without importing this module. This is
+% the cut-over value for the generic transformation API; the older predicates
+% below remain only until their Rust consumers have migrated.
+
+action_relation_grammar(choice_grammar(Alternatives)) :-
+    findall(alternative(Action, Preference, Grammar),
+            action_relation_alternative(Action, Preference, Grammar),
+            Alternatives).
+
+action_relation_alternative(Action, Preference,
+                            projection_grammar(Sequence, Projections)) :-
+    action(Action, Handler, Target, _, _, _, Preference),
+    action_form(Action, Specs, Projection),
+    action_contexts(Action, Contexts),
+    action_terminals(Terminals),
+    Sequence = sequence_grammar(Specs, terminals(Terminals), separator(" "),
+                                contexts(Contexts)),
+    action_semantic_template(Action, Handler, Target, Projection, Template),
+    Projections = [projection(command, Template)].
+
+action_semantic_template(Action, Handler, Target, Projection,
+                         structure(command,
+                                   [constant(Action), constant(Handler),
+                                    constant(Target), Arguments])) :-
+    action_arguments_template(Projection, Arguments).
+
+action_arguments_template(identity, reference(arguments)).
+action_arguments_template(
+    pause_true,
+    concatenate(reference(arguments), sequence([constant(boolean(true))]))).
+action_arguments_template(
+    resume_false,
+    concatenate(reference(arguments), sequence([constant(boolean(false))]))).
+
+action_contexts(Action, Contexts) :-
+    action_source_schema(Action, Schema),
+    schema_contexts(Action, Schema, Contexts).
+
+schema_contexts(_, [], []).
+schema_contexts(Action, [arg(Name, _, _, _)|Schema], Contexts) :-
+    ( argument_context(Action, Name, Domain, Scope)
+    -> Contexts = [context(Name, one, Domain, Scope)|Rest]
+    ;  Contexts = Rest
+    ),
+    schema_contexts(Action, Schema, Rest).
+
+action_terminals([
+    terminal(boolean, boolean,
+             codec(enumeration([surface(boolean(true), "true"),
+                                surface(boolean(false), "false")]))),
+    terminal(integer, integer, codec(integer(integer))),
+    terminal(string, string,
+             codec(choice([text(string), integer(integer)]))),
+    terminal(path, path, codec(text(path))),
+    terminal(base64, base64, codec(text(base64))),
+    terminal(oci_spec, structured_spec, codec(json(OciShape))),
+    terminal(api_spec, structured_spec, codec(json(ApiShape))),
+    terminal(spec, spec, codec(text(spec)))
+]) :-
+    oci_shape(OciShape),
+    api_shape(ApiShape).
+
+oci_shape(object(oci_spec,
+                 [field("context_tar_gz", string),
+                  field("dockerfile", string),
+                  field("tag", nullable(string, none, some)),
+                  field("net", string),
+                  field("build_args",
+                        array(tuple(pair, [string, string])))] )).
+
+api_shape(object(api_spec,
+                 [field("base_url", string),
+                  field("model", string),
+                  field("api_key", string)])).
 
 schema_specs([], []).
 schema_specs([Arg|Schema], [argument(Arg)|Specs]) :-

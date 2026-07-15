@@ -256,24 +256,31 @@ project_reply(Projections, Wanted,
 project_solutions([], _, _, []).
 project_solutions([solution(InnerBindings, Preference)|Rest], Projections,
                   Wanted, [solution(Bindings, Preference)|Solutions]) :-
-    projected_available(Projections, InnerBindings, Available),
+    projected_available(Projections, Wanted, InnerBindings, Available),
     requested_bindings(Wanted, Available, Bindings),
     project_solutions(Rest, Projections, Wanted, Solutions).
 
-projected_available([], Bindings, Bindings).
-projected_available([projection(Name, Template)|Projections], Bindings0,
-                    Available) :-
-    template_value(Template, Value, Bindings0, Bindings1),
-    put_binding(Name, Value, Bindings1, Bindings2),
-    projected_available(Projections, Bindings2, Available).
+projected_available([], _, Bindings, Bindings).
+projected_available([projection(Name, Template)|Projections], Wanted,
+                    Bindings0, Available) :-
+    ( member_term(Name, Wanted)
+    -> template_value(Template, Value, Bindings0, Bindings1),
+       put_binding(Name, Value, Bindings1, Bindings2)
+    ;  Bindings2 = Bindings0
+    ),
+    projected_available(Projections, Wanted, Bindings2, Available).
 
 template_value(constant(Value), Value, Bindings, Bindings).
 template_value(reference(Name), Value, Bindings0, Bindings) :-
     put_binding(Name, Value, Bindings0, Bindings).
 template_value(structure(Functor, Templates), Value, Bindings0, Bindings) :-
     atom(Functor),
-    template_values(Templates, Values, Bindings0, Bindings),
-    Value =.. [Functor|Values].
+    ( ground(Value)
+    -> Value =.. [Functor|Values],
+       template_values(Templates, Values, Bindings0, Bindings)
+    ;  template_values(Templates, Values, Bindings0, Bindings),
+       Value =.. [Functor|Values]
+    ).
 template_value(sequence(Templates), Values, Bindings0, Bindings) :-
     template_values(Templates, Values, Bindings0, Bindings).
 template_value(concatenate(Left, Right), Values, Bindings0, Bindings) :-

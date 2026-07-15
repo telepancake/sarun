@@ -1,6 +1,7 @@
 :- module(test_action_grammar, [run_action_grammar_tests/0]).
 
 :- use_module(action_grammar).
+:- use_module(relation_api).
 :- discontiguous run_test/1.
 
 % Core-only test runner: this same file runs in the package-free embedded image.
@@ -31,6 +32,8 @@ test_name(context_completion_uses_all_prefix_query).
 test_name(context_completion_resolution_uses_entry_names).
 test_name(context_completion_rejects_ambiguous_exact_binding).
 test_name(dependent_context_completion_graph).
+test_name(complete_action_language_is_an_immutable_grammar_value).
+test_name(generic_action_relation_parses_and_renders_projection).
 
 run_action_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -68,6 +71,41 @@ run_test(help_projection_is_complete_and_targeted) :-
     expect(list_has(record("mirror add", _, _), Mirror)),
     expect(all_help_rows_match("mirror", Mirror)),
     expect_equal(Missing, []).
+
+relation_limits(limits(256, 4096, 1048576)).
+
+run_test(complete_action_language_is_an_immutable_grammar_value) :-
+    once(action_relation_grammar(choice_grammar(Alternatives))),
+    length(Alternatives, 108),
+    list_has(alternative(kill, 50,
+                         projection_grammar(sequence_grammar(_, _, _, _),
+                                            [projection(command, _)])),
+             Alternatives),
+    list_has(alternative('oci.build', 50,
+                         projection_grammar(sequence_grammar(_, _, _, _),
+                                            [projection(command, _)])),
+             Alternatives).
+
+run_test(generic_action_relation_parses_and_renders_projection) :-
+    once(action_relation_grammar(Grammar)),
+    items(["mirror", "resume", "7"], Items),
+    relation_limits(Limits),
+    transform(
+        request(Grammar,
+                given([binding(source, source(Items, exact))]),
+                want([command, status]), observations([]), Limits),
+        reply([solution([binding(command,
+                                 command(mirror_resume, mirror_pause, ui,
+                                         [integer(7), boolean(false)])),
+                         binding(status, complete)], _)], [], [], [])),
+    transform(
+        request(Grammar,
+                given([binding(command,
+                               command(mirror_resume, mirror_pause, ui,
+                                       [integer(7), boolean(false)]))]),
+                want([source]), observations([]), Limits),
+        reply([solution([binding(source, "mirror resume 7")], 79)],
+              [], [], [])).
 
 all_help_rows_match(_, []).
 all_help_rows_match(Filter, [record(CommandText, _, Description)|Rows]) :-
