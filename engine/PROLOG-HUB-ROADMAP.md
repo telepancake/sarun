@@ -901,6 +901,15 @@ belong to the relation.
   `ConnectionMode::Box`. The native aarch64-musl build and registration tests
   pass; the checkpoint's full suite has 310 passing tests with one existing
   browser e2e test ignored.
+- Unified nested provenance, pipeline completion, recipe attribution, build
+  graph, make-variable, activity, and build-edge-state requests behind one
+  typed recording dispatcher. Each path now consumes its generated
+  `TransportRequest` variant and returns `TransportResponse::Empty` or
+  `Recorded`; the temporary listener projects that closed response only after
+  execution. This removes the seven independently assembled JSON success
+  replies and makes the eventual binary request path call the same dispatcher.
+  The full native aarch64-musl suite passes 311 tests with one existing browser
+  e2e test ignored.
 
 ## Stop conditions
 

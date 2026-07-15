@@ -998,6 +998,85 @@ fn build_edge_state(
     Ok(())
 }
 
+fn dispatch_recording_transport(
+    state: &State,
+    request: crate::generated_wire::TransportRequest,
+    peer_pidfd: Option<i32>,
+) -> Result<crate::generated_wire::TransportResponse, String> {
+    use crate::generated_wire::{TransportRequest, TransportResponse};
+    match request {
+        TransportRequest::BrushProvenance { records } => {
+            brush_prov_nested(state, records.as_slice(), peer_pidfd)
+                .map(|count| TransportResponse::Recorded { count })
+        }
+        TransportRequest::BrushDone { pipelines, code, done_at } => {
+            brush_prov_done(state, pipelines.as_slice(), code, done_at, peer_pidfd)?;
+            Ok(TransportResponse::Empty)
+        }
+        TransportRequest::RecipeStarted { pipelines, started_at } => {
+            recipe_fixup(state, pipelines.as_slice(), started_at, peer_pidfd)?;
+            Ok(TransportResponse::Empty)
+        }
+        TransportRequest::BuildGraph { edges } => {
+            build_edges(state, edges.as_slice(), peer_pidfd)
+                .map(|count| TransportResponse::Recorded { count })
+        }
+        TransportRequest::MakeVariables { rows } => {
+            make_vars(state, rows.as_slice(), peer_pidfd)?;
+            Ok(TransportResponse::Empty)
+        }
+        TransportRequest::BoxActivity { items } => {
+            box_activity(state, items.as_slice(), peer_pidfd)?;
+            Ok(TransportResponse::Empty)
+        }
+        TransportRequest::BuildEdgeState { transition } => {
+            build_edge_state(state, &transition, peer_pidfd)?;
+            Ok(TransportResponse::Empty)
+        }
+        other => {
+            if let Some(fd) = peer_pidfd {
+                unsafe { libc::close(fd); }
+            }
+            Err(format!("transport opcode {} is not a recording request", other.code()))
+        }
+    }
+}
+
+fn legacy_transport_response(
+    result: Result<crate::generated_wire::TransportResponse, String>,
+) -> Value {
+    use crate::generated_wire::TransportResponse;
+    match result {
+        Ok(TransportResponse::Empty) => json!({"ok": true}),
+        Ok(TransportResponse::Error { category, message }) => json!({
+            "ok": false,
+            "category": match category {
+                crate::generated_wire::ErrorCategory::InvalidRequest => "invalid_request",
+                crate::generated_wire::ErrorCategory::NotFound => "not_found",
+                crate::generated_wire::ErrorCategory::Conflict => "conflict",
+                crate::generated_wire::ErrorCategory::Unavailable => "unavailable",
+                crate::generated_wire::ErrorCategory::Unauthorized => "unauthorized",
+                crate::generated_wire::ErrorCategory::Internal => "internal",
+            },
+            "error": message.into_inner(),
+        }),
+        Ok(TransportResponse::Recorded { count }) => {
+            json!({"ok": true, "recorded": count})
+        }
+        Ok(TransportResponse::SudIngested { count, errors }) => json!({
+            "ok": true,
+            "count": count,
+            "errors": errors.into_inner().into_iter()
+                .map(crate::wire::BoundedText::into_inner).collect::<Vec<_>>(),
+        }),
+        Ok(TransportResponse::Budget { remaining }) => {
+            json!({"ok": true, "remaining": remaining})
+        }
+        Ok(TransportResponse::Action { value }) => legacy_ui_action_reply(Ok(value)),
+        Err(error) => json!({"ok": false, "error": error}),
+    }
+}
+
 pub fn broadcast(state: &State, event: &crate::generated_wire::SubscriptionEvent) {
     use crate::generated_wire::{EdgePhase, SubscriptionEvent};
     // The newline listener is still the active outer projection until the
@@ -6527,7 +6606,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // brush-sh shim, carrying its OWN pidfd (like register) so we resolve
             // the enclosing box from /proc ancestry. NOT a box channel — record
             // and reply once, then the connection closes. The pidfd is consumed.
-            let result = (|| {
+            let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
                 let values = msg.get("records").and_then(Value::as_array)
                     .ok_or("brush_prov_nested: missing records")?;
                 let records = values.iter().map(crate::discover::relation_pipeline_provenance)
@@ -6535,10 +6614,11 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 let records = crate::wire::BoundedVec::<_, 1,
                     { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(records)
                     .map_err(|error| format!("pipeline records exceed relation bound: {error:?}"))?;
-                brush_prov_nested(&state, records.as_slice(), peer_pidfd.take())
+                Ok(crate::generated_wire::TransportRequest::BrushProvenance { records })
             })();
             match result {
-                Ok(count) => json!({"ok": true, "recorded": count}),
+                Ok(request) => legacy_transport_response(dispatch_recording_transport(
+                    &state, request, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_done") {
@@ -6546,7 +6626,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // pipeline's complete-command finishes, carrying its OWN pidfd (like
             // brush_prov_nested) so we resolve the box, then stamp done_ts +
             // exit_code on the matching brushprov rows (by uid).
-            let result = (|| {
+            let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
                 let values = msg.get("uids").and_then(Value::as_array)
                     .ok_or("brush_prov_done: missing uids")?;
                 let pipelines = values.iter().map(|value| value.as_u64()
@@ -6556,14 +6636,20 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     .map_err(|_| "brush_prov_done: code exceeds i32")?;
                 let done_at = msg.get("done_ts").and_then(Value::as_f64)
                     .ok_or("brush_prov_done: missing done_ts")?;
-                brush_prov_done(&state, &pipelines, code, done_at, peer_pidfd.take())
+                let pipelines = crate::wire::BoundedVec::<_, 1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(pipelines)
+                    .map_err(|error| format!("pipeline ids exceed relation bound: {error:?}"))?;
+                Ok(crate::generated_wire::TransportRequest::BrushDone {
+                    pipelines, code, done_at,
+                })
             })();
             match result {
-                Ok(()) => json!({"ok": true}),
+                Ok(request) => legacy_transport_response(dispatch_recording_transport(
+                    &state, request, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("recipe_fixup") {
-            let result = (|| {
+            let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
                 let values = msg.get("uids").and_then(Value::as_array)
                     .ok_or("recipe_fixup: missing uids")?;
                 let pipelines = values.iter().map(|value| value.as_u64()
@@ -6571,17 +6657,23 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     .collect::<Result<Vec<_>, _>>()?;
                 let started_at = msg.get("start_ts").and_then(Value::as_f64)
                     .ok_or("recipe_fixup: missing start_ts")?;
-                recipe_fixup(&state, &pipelines, started_at, peer_pidfd.take())
+                let pipelines = crate::wire::BoundedVec::<_, 1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(pipelines)
+                    .map_err(|error| format!("pipeline ids exceed relation bound: {error:?}"))?;
+                Ok(crate::generated_wire::TransportRequest::RecipeStarted {
+                    pipelines, started_at,
+                })
             })();
             match result {
-                Ok(()) => json!({"ok": true}),
+                Ok(request) => legacy_transport_response(dispatch_recording_transport(
+                    &state, request, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edges") {
             // Phase 1 embedded-ninja: a one-shot control message from the
             // shadowed `ninja` (vendored n2) carrying its OWN pidfd, resolved to
             // the enclosing box by /proc ancestry exactly like brush_prov_nested.
-            let result = (|| {
+            let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
                 let values = msg.get("edges").and_then(Value::as_array)
                     .ok_or("build_edges: missing edges")?;
                 let edges = values.iter().map(|value| Ok(crate::generated_wire::BuildEdge {
@@ -6595,14 +6687,15 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 let edges = crate::wire::BoundedVec::<_, 1,
                     { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(edges)
                     .map_err(|error| format!("build graph exceeds relation bound: {error:?}"))?;
-                build_edges(&state, edges.as_slice(), peer_pidfd.take())
+                Ok(crate::generated_wire::TransportRequest::BuildGraph { edges })
             })();
             match result {
-                Ok(count) => json!({"ok": true, "recorded": count}),
+                Ok(request) => legacy_transport_response(dispatch_recording_transport(
+                    &state, request, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("make_vars") {
-            let result = (|| {
+            let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
                 let values = msg.get("rows").and_then(Value::as_array)
                     .ok_or("make_vars: missing rows")?;
                 let rows = values.iter().map(|row| {
@@ -6633,14 +6726,15 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 let rows = crate::wire::BoundedVec::<_, 1,
                     { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(rows)
                     .map_err(|error| format!("make variables exceed relation bound: {error:?}"))?;
-                make_vars(&state, rows.as_slice(), peer_pidfd.take())
+                Ok(crate::generated_wire::TransportRequest::MakeVariables { rows })
             })();
             match result {
-                Ok(()) => json!({"ok": true}),
+                Ok(request) => legacy_transport_response(dispatch_recording_transport(
+                    &state, request, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("box_activity") {
-            let result = (|| {
+            let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
                 let values = msg.get("items").and_then(Value::as_array)
                     .ok_or("box_activity: missing items")?;
                 let items = values.iter().map(|value| {
@@ -6658,17 +6752,18 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 let items = crate::wire::BoundedVec::<_, 1,
                     { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(items)
                     .map_err(|error| format!("box activity exceeds relation bound: {error:?}"))?;
-                box_activity(&state, items.as_slice(), peer_pidfd.take())
+                Ok(crate::generated_wire::TransportRequest::BoxActivity { items })
             })();
             match result {
-                Ok(()) => json!({"ok": true}),
+                Ok(request) => legacy_transport_response(dispatch_recording_transport(
+                    &state, request, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edge_state") {
             // A single edge's run-state transition (started / finished), sent by
             // the in-process make/ninja executor around each recipe — stamps the
             // box's build_edges row so the targets pane shows live build progress.
-            let result = (|| {
+            let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
                 let path = |name: &str| msg.get(name).and_then(Value::as_str)
                     .map(|value| crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
                         .map_err(|_| "build edge path exceeds relation bound"))
@@ -6691,10 +6786,11 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     },
                     _ => return Err("build_edge_state: invalid state".into()),
                 };
-                build_edge_state(&state, &transition, peer_pidfd.take())
+                Ok(crate::generated_wire::TransportRequest::BuildEdgeState { transition })
             })();
             match result {
-                Ok(()) => json!({"ok": true}),
+                Ok(request) => legacy_transport_response(dispatch_recording_transport(
+                    &state, request, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else {
@@ -8051,6 +8147,19 @@ mod verb_tests {
         assert_eq!(reply["oci"]["env"][0], "PATH=/bin");
         assert_eq!(reply["sud_lowers"][0], "/lower");
         assert_eq!(reply["_box_sid"], 7);
+    }
+
+    #[test]
+    fn typed_transport_responses_project_only_at_the_legacy_boundary() {
+        use crate::generated_wire::{ErrorCategory, TransportResponse};
+        let recorded = legacy_transport_response(Ok(TransportResponse::Recorded { count: 3 }));
+        assert_eq!(recorded, json!({"ok": true, "recorded": 3}));
+        let error = legacy_transport_response(Ok(TransportResponse::Error {
+            category: ErrorCategory::InvalidRequest,
+            message: crate::wire::BoundedText::new("bad frame".into()).unwrap(),
+        }));
+        assert_eq!(error["category"], "invalid_request");
+        assert_eq!(error["error"], "bad frame");
     }
 
     #[test]
