@@ -578,6 +578,11 @@ belong to the relation.
   `spec`, so a newly added structured action fails catalog validation until it
   defines a closed type. The gate remains open until parsed/context-resolved
   values are related into these records and Rust uses the generated codecs.
+- Added the bounded Rust value primitives generated codecs build on: explicit
+  compound wrapping, exact scalar range checks, UTF-8-only text, arbitrary
+  bytes, fixed bytes, min/max lists, bounded maps, and tagged options. Their
+  decoders reject invalid tags, duplicate map keys, count violations, malformed
+  text, and trailing fields; they share the existing tv-compatible atom code.
 - Deleted seven Python-era wire actions whose implementations were explicit
   compatibility no-ops and which had no Rust UI caller: `rescan`, `open_files`,
   `review_state`, `review_live`, `consolidate_start`, and the two consolidation
