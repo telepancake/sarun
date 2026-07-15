@@ -35,13 +35,6 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    pub fn parse(s: &str) -> Option<Verdict> {
-        match s { "yes_once" => Some(Verdict::YesOnce),
-                  "no_once"  => Some(Verdict::NoOnce),
-                  "allow_save" => Some(Verdict::AllowSave),
-                  "deny_save"  => Some(Verdict::DenySave),
-                  _ => None }
-    }
     pub fn is_allow(self) -> bool {
         matches!(self, Verdict::YesOnce | Verdict::AllowSave)
     }

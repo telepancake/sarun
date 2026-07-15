@@ -752,6 +752,13 @@ belong to the relation.
   their typed state and identities. Only the temporary listener projects the
   result to the old `procs` object array. The full native aarch64-musl suite
   passes 308 tests with one existing browser e2e test ignored.
+- Moved `prompts.peek`, `prompts.answer`, and `prompts.ui_active` onto generated
+  request/success variants. Pending prompts now materialize directly as bounded
+  `NetworkPrompt` records; verdict execution consumes the generated
+  `PromptVerdict` enum. Deleted the now-unused handwritten verdict string
+  parser, leaving old object spelling only in the temporary listener
+  projection. The full native aarch64-musl suite passes 308 tests with one
+  existing browser e2e test ignored.
 
 ## Stop conditions
 

@@ -1761,6 +1761,45 @@ fn dispatch_action(
                 value: stuck_typed(state, id)?,
             })
         }
+        ActionRequest::PromptsPeek => {
+            let prompt = lock(state).net.clone()
+                .and_then(|net| net.prompts.peek());
+            let value = prompt.map(|prompt| -> Result<_, String> {
+                Ok(crate::generated_wire::NetworkPrompt {
+                    id: prompt.id,
+                    r#box: crate::wire::BoundedText::new(prompt.box_name)
+                        .map_err(|error| format!(
+                            "prompt box name exceeds relation bound: {error:?}"))?,
+                    host: crate::wire::BoundedText::new(prompt.host)
+                        .map_err(|error| format!(
+                            "prompt host exceeds relation bound: {error:?}"))?,
+                    port: prompt.port,
+                    scheme: crate::wire::BoundedText::new(prompt.scheme)
+                        .map_err(|error| format!(
+                            "prompt scheme exceeds relation bound: {error:?}"))?,
+                })
+            }).transpose()?;
+            Ok(ActionSuccess::PromptsPeek { value })
+        }
+        ActionRequest::PromptsAnswer { id, verdict } => {
+            use crate::generated_wire::PromptVerdict;
+            let verdict = match verdict {
+                PromptVerdict::YesOnce => crate::net::prompt::Verdict::YesOnce,
+                PromptVerdict::NoOnce => crate::net::prompt::Verdict::NoOnce,
+                PromptVerdict::AllowSave => crate::net::prompt::Verdict::AllowSave,
+                PromptVerdict::DenySave => crate::net::prompt::Verdict::DenySave,
+            };
+            let net = lock(state).net.clone().ok_or("no net registry")?;
+            Ok(ActionSuccess::PromptsAnswer {
+                value: net.prompts.answer(id, verdict),
+            })
+        }
+        ActionRequest::PromptsUiActive { bool: active } => {
+            if let Some(net) = lock(state).net.clone() {
+                net.prompts.mark_ui_active(active);
+            }
+            Ok(ActionSuccess::PromptsUiActive { value: () })
+        }
         ActionRequest::ViewOpen {
             kind,
             r#box,
@@ -2219,6 +2258,18 @@ fn legacy_ui_action_reply(
                     .map(|frame| frame.into_inner()).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         }),
+        Ok(ActionSuccess::PromptsPeek { value }) => json!({
+            "ok": true,
+            "ask": value.map(|prompt| json!({
+                "id": prompt.id,
+                "box": prompt.r#box.into_inner(),
+                "host": prompt.host.into_inner(),
+                "port": prompt.port,
+                "scheme": prompt.scheme.into_inner(),
+            })),
+        }),
+        Ok(ActionSuccess::PromptsAnswer { value }) => json!({"ok": value}),
+        Ok(ActionSuccess::PromptsUiActive { .. }) => json!({"ok": true}),
         Ok(other) => {
             return json!({
                 "ok": false,
@@ -4579,54 +4630,35 @@ macro_rules! ui_verbs {
                 _ => json!({"ok": false, "error": "bad args"}),
             }
         }
-        // ── banner-prompt queue verbs (the TUI is the consumer) ────────
-        // prompts.peek                          → {ok, ask: {...}|null}
-        // prompts.answer [ID, "yes_once|no_once|allow_save|deny_save"]
-        //                                       → {ok}
-        // prompts.ui_active [bool]              → {ok}
-        //   The TUI calls ui_active(true) on startup and ui_active(false)
-        //   on shutdown; while inactive, dispatcher Ask short-circuits to
-        //   deny so no connection wedges on an absent UI.
         "prompts.peek" => {
-            match lock(state).net.clone() {
-                Some(net) => match net.prompts.peek() {
-                    Some(ask) => json!({"ok": true, "ask": {
-                        "id": ask.id, "box": ask.box_name,
-                        "host": ask.host, "port": ask.port,
-                        "scheme": ask.scheme,
-                    }}),
-                    None => json!({"ok": true, "ask": Value::Null}),
-                },
-                None => json!({"ok": true, "ask": Value::Null}),
-            }
+            return legacy_ui_action_reply(dispatch_action(
+                state, crate::generated_wire::ActionRequest::PromptsPeek,
+            ));
         }
         "prompts.answer" => {
-            let id = args.first().and_then(Value::as_u64).unwrap_or(0);
-            let v = args.get(1).and_then(Value::as_str).unwrap_or("");
-            let Some(verdict) = crate::net::prompt::Verdict::parse(v) else {
-                return json!({"ok": false, "error": "bad verdict"});
+            let Some(id) = args.first().and_then(Value::as_u64) else {
+                return json!({"ok": false, "error": "missing prompt id"});
             };
-            match lock(state).net.clone() {
-                Some(net) => {
-                    let ok = net.prompts.answer(id, verdict);
-                    // Net rules are reloaded from disk by the dispatcher on
-                    // every connection (Rules::load() is cheap), so the
-                    // newly-appended line takes effect immediately for
-                    // future conns without touching the FUSE-side rule
-                    // cache. (Doing the reload synchronously here was
-                    // hanging on RwLock contention with the FUSE serve
-                    // threads.)
-                    json!({"ok": ok})
-                }
-                None => json!({"ok": false, "error": "no net registry"}),
-            }
+            let verdict = match args.get(1).and_then(Value::as_str) {
+                Some("yes_once") => crate::generated_wire::PromptVerdict::YesOnce,
+                Some("no_once") => crate::generated_wire::PromptVerdict::NoOnce,
+                Some("allow_save") => crate::generated_wire::PromptVerdict::AllowSave,
+                Some("deny_save") => crate::generated_wire::PromptVerdict::DenySave,
+                _ => return json!({"ok": false, "error": "bad verdict"}),
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::PromptsAnswer { id, verdict },
+            ));
         }
         "prompts.ui_active" => {
-            let on = args.first().and_then(Value::as_bool).unwrap_or(false);
-            if let Some(net) = lock(state).net.clone() {
-                net.prompts.mark_ui_active(on);
-            }
-            json!({"ok": true})
+            let Some(active) = args.first().and_then(Value::as_bool) else {
+                return json!({"ok": false, "error": "missing active flag"});
+            };
+            return legacy_ui_action_reply(dispatch_action(
+                state,
+                crate::generated_wire::ActionRequest::PromptsUiActive { bool: active },
+            ));
         }
         // flows.packets [SID, STREAM] → every frame in `tcp.stream == STREAM`
         // (i.e. the connection the user just drilled into from the flows
