@@ -51,6 +51,7 @@ action(writer_id, writer_id, ui, "SID REL", "process that last wrote a path", vi
 action(first_writer_id, first_writer_id, ui, "SID REL", "process that first wrote a path", visible, 50).
 action(first_writer_prov, first_writer_prov, ui, "SID REL", "provenance of the first writer of a path", visible, 50).
 action(stuck, stuck, ui, "SID", "live THREADS of a running box with wchan/syscall (wedge diagnosis)", visible, 50).
+action(sudtrace, sudtrace, control, "SID", "read the durable binary sud trace for a box", internal, 10).
 action(kill, kill, ui, "SID", "SIGTERM the box's runner", visible, 50).
 action(dissolve, dissolve, ui, "SID", "remove a box, promoting its changes down into children", visible, 50).
 action(apply_to_copy, apply_to_copy, ui, "SID", "apply a box's changes onto a COPY of its parent (parent untouched)", visible, 50).
@@ -134,7 +135,7 @@ action(change_edit, change_edit, local, "", "open the selected change in the tex
 action(rule_new, rule_new, local, "", "create a new file rule", visible, 50).
 action(rule_delete, rule_delete, local, "", "delete the selected file rule", visible, 50).
 action(rule_edit, rule_edit, local, "", "edit the selected file rule", visible, 50).
-action(quit, quit, local, "", "quit the engine", visible, 50).
+action(quit, quit, control, "", "quit the engine", visible, 50).
 action(detach, detach, local, "", "detach (leaves the engine running)", visible, 50).
 action(refresh, refresh, local, "", "refresh sessions, changes, and rules", visible, 50).
 action(filter, filter, local, "", "filter the active pane", visible, 50).
@@ -242,9 +243,11 @@ wire_handler(webcap_body, 94).
 wire_handler(webcap_detail, 95).
 wire_handler(wiki_attach, 96).
 wire_handler(writer_id, 97).
+wire_handler(sudtrace, 98).
 wire_handler(apply, 128).
 wire_handler(discard, 129).
 wire_handler(rename, 130).
+wire_handler(quit, 131).
 
 % Explicit shell forms. `Normalizer` relates parsed source arguments to the
 % handler's wire arguments. Shared paths are intentional and resolved by the

@@ -96,6 +96,7 @@ fn main() {
     let grammar = manifest.join("pl/action_grammar.pl");
     let catalog = manifest.join("pl/action_catalog.pl");
     let context_relation = manifest.join("pl/context_relation.pl");
+    let transport_catalog = manifest.join("pl/transport_catalog.pl");
     let swipl_license = manifest.join("../LICENSES/SWI-Prolog.txt");
     let zlib_license = manifest.join("../LICENSES/zlib.txt");
     require_value(&info, "action_grammar_sha256", &sha256(&grammar));
@@ -104,6 +105,11 @@ fn main() {
         &info,
         "context_relation_sha256",
         &sha256(&context_relation),
+    );
+    require_value(
+        &info,
+        "transport_catalog_sha256",
+        &sha256(&transport_catalog),
     );
     require_value(&info, "swipl_license_sha256", &sha256(&swipl_license));
     require_value(&info, "zlib_license_sha256", &sha256(&zlib_license));
@@ -130,6 +136,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", grammar.display());
     println!("cargo:rerun-if-changed={}", catalog.display());
     println!("cargo:rerun-if-changed={}", context_relation.display());
+    println!("cargo:rerun-if-changed={}", transport_catalog.display());
     println!("cargo:rerun-if-changed={}", swipl_license.display());
     println!("cargo:rerun-if-changed={}", zlib_license.display());
 

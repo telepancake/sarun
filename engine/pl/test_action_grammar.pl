@@ -69,19 +69,19 @@ parse_words(Words, Command) :-
 run_test(catalog_is_complete_and_valid) :-
     findall(Action, action(Action, _, _, _, _, _, _), Actions),
     sort(Actions, Unique),
-    length(Actions, 114),
-    length(Unique, 114),
+    length(Actions, 115),
+    length(Unique, 115),
     expect(all_valid(Actions)).
 
 run_test(wire_identities_are_explicit_unique_and_normalized) :-
     findall(Code-Handler, wire_handler(Handler, Code), Rows),
-    length(Rows, 100),
+    length(Rows, 102),
     findall(Code, wire_handler(_, Code), Codes),
     sort(Codes, UniqueCodes),
-    length(UniqueCodes, 100),
+    length(UniqueCodes, 102),
     findall(Handler, wire_handler(Handler, _), Handlers),
     sort(Handlers, UniqueHandlers),
-    length(UniqueHandlers, 100),
+    length(UniqueHandlers, 102),
     expect(all_wire_handlers_are_actions(Handlers)),
     once(representation(mirror_resume, wire, Wire)),
     expect_equal(
@@ -89,7 +89,7 @@ run_test(wire_identities_are_explicit_unique_and_normalized) :-
         wire(62, mirror_pause, ui,
              [arg(id, integer, required, scalar),
               arg(paused, boolean, required, scalar)])),
-    expect(\+ representation(quit, wire, _)).
+    expect(\+ representation(mirror_browse, wire, _)).
 
 run_test(representations_project_the_executable_forms) :-
     once(representation(mirror_resume, verb,

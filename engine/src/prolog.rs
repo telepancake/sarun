@@ -741,7 +741,8 @@ impl Runtime {
         let goal = format!(
             concat!(
                 "call_with_inference_limit((asserta(user:file_search_path(library,'res://library')),",
-                "load_files('res://app/action_grammar.pl',[silent(true)])),",
+                "load_files('res://app/action_grammar.pl',[silent(true)]),",
+                "action_grammar:valid_transport_catalog),",
                 "{},R),R\\==inference_limit_exceeded"
             ),
             LOAD_INFERENCES

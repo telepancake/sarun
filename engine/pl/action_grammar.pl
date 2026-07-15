@@ -1,6 +1,17 @@
 :- module(action_grammar,
           [ action/7,
             wire_handler/2,
+            wire_protocol_version/1,
+            wire_limit/2,
+            wire_type/2,
+            wire_enum/3,
+            wire_variant/4,
+            wire_request/6,
+            wire_response/3,
+            wire_mode/3,
+            wire_event/3,
+            wire_frame/7,
+            valid_transport_catalog/0,
             representation/3,
             convert/4,
             valid_action/1,
@@ -19,6 +30,7 @@
 
 :- use_module(action_catalog).
 :- use_module(context_relation).
+:- use_module(transport_catalog).
 
 /** <module> Relational parser and representation hub
 
@@ -166,6 +178,28 @@ representation(Action, key, key(Key, Context, Preference)) :-
     key_binding(Action, Key, Context, Preference).
 representation(Action, menu, menu(Label)) :-
     menu_label(Action, Label).
+representation(transport(request, Name), wire,
+               request(Code, Success, Fields, Fds, Authority)) :-
+    wire_request(Name, Code, Success, Fields, Fds, Authority).
+representation(transport(response, Name), wire,
+               response(Code, Fields)) :-
+    wire_response(Name, Code, Fields).
+representation(transport(mode, Name), wire,
+               mode(Code, Fields)) :-
+    wire_mode(Name, Code, Fields).
+representation(transport(event, Name), wire,
+               event(Code, Fields)) :-
+    wire_event(Name, Code, Fields).
+representation(transport(frame(Stream), Name), wire,
+               frame(Code, Direction, Fields, Fds, Transition)) :-
+    wire_frame(Stream, Name, Code, Direction, Fields, Fds, Transition).
+representation(transport(type, Name), schema, Definition) :-
+    wire_type(Name, Definition).
+representation(transport(enum(Type), Case), wire, enum(Code)) :-
+    wire_enum(Type, Case, Code).
+representation(transport(variant(Type), Case), wire,
+               variant(Code, Fields)) :-
+    wire_variant(Type, Case, Code, Fields).
 
 form_literal_prefix([], []).
 form_literal_prefix([argument(_)|_], []).

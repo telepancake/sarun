@@ -32,7 +32,9 @@ compound atom selecting the connection mode:
 - `box`: the persistent runner/engine mux, with SCM_RIGHTS where specified;
 - `pty`: bidirectional PTY data/resize/EOF atoms;
 - `raw_http`: the remaining bytes are HTTP for the API proxy;
-- `raw_service`: the remaining bytes are spliced byte-for-byte.
+- `service_accept`: an accept slot waits for a typed `paired` frame and then
+  hands the remaining bytes to the service;
+- `raw_service`: the remaining bytes are spliced byte-for-byte immediately.
 
 Mode selection is a typed handshake result, not protocol sniffing. Bytes after
 a raw handoff are deliberately not atom-decoded.
@@ -44,7 +46,7 @@ The newline-JSON handler currently multiplexes these families:
 | Family | Current messages | Resulting mode |
 | --- | --- | --- |
 | UI actions | `{"type":"ui","verb", "args"}` covering the control verb catalog | one reply |
-| Top-level actions | `apply`, `discard`, `rename`, `select`, `attach`, `checkout`, `patch`, `stuck`, `shutdown`, `sudtrace`, `sud_ingest` | one reply |
+| Actions formerly using top-level JSON | `apply`, `discard`, `rename`, `select`, `patch`, `sudtrace`, and quit/shutdown | ordinary action reply |
 | Runner lifecycle | `register` plus pidfd/TAP/trace SCM_RIGHTS | persistent box mux |
 | Build/provenance | `brush_prov_nested`, `brush_prov_done`, `recipe_fixup`, `build_edges`, `make_vars`, `box_activity`, `build_edge_state` plus pidfd | one reply |
 | Events | `subscribe`; server events include session new/removed/renamed, changes, process/build/provenance activity, and pong | subscribe stream |
@@ -58,6 +60,38 @@ provenance, open-connection/SCM_RIGHTS, and connection handoff frames. After
 `pty_spawn`, it carries PTY data, resize, and EOF. These mux frames have already
 been cut over from the separate four-byte big-endian framing to compound tv
 atoms.
+
+## Relational protocol catalog
+
+`pl/transport_catalog.pl` is the normalized definition site. Action request
+codes occupy 1 through 131 (with deliberate gaps); transport-only requests
+start at 256, so action and lifecycle identities cannot collide and dispatch
+does not need a string family tag. The catalog currently defines:
+
+- 16 lifecycle/stream requests, including registration, provenance ingestion,
+  PTY/API/service handoffs, budget grants, subscriptions, and sud ingestion;
+- 5 typed transport response payloads and 7 first-reply connection modes;
+- 10 compact event invalidations and 11 box/PTY/service stream frames;
+- every record, enum, tagged choice, collection bound, transition, direction,
+  and conditional SCM_RIGHTS role used by those messages.
+
+`select`, `apply`, `discard`, `rename`, `review.patch_text`, `sudtrace`, and
+quit are actions. They use `action_catalog:wire_handler/2`; there is no second
+transport request definition for them. Subscription events carry only the box,
+row, count, path, or state needed to invalidate a view. They do not copy full
+provenance or trace records into the event stream.
+
+Action replies will use concrete per-handler result schemas from the action
+relation. There is deliberately no generic recursive binary `Value`: encoding
+the old JSON object model with numeric tags would leave result meaning in Rust
+and create a schema-less alternate authority.
+
+Registration's descriptor tail is relationally exact: pidfd is required; TAP
+is required exactly when `net_mode=tap`; and the sud trace pipe is required
+exactly when `backend=sud`. Paths, argv, environment keys/values, and other
+Unix-native strings remain bounded byte strings rather than being forced
+through UTF-8. The first reply either selects the declared success mode or
+selects `reply(error)`; errors never partially enter a stream mode.
 
 ## Encoding constraints
 

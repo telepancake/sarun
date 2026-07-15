@@ -367,9 +367,16 @@ belong to the relation.
 - [x] Give every wire action a stable binary identity in the relation. Alias
       actions normalize to their handler's identity and schema; local actions
       have no invented wire form.
-- [ ] Give every non-action request/reply/event a stable binary identity and
-      schema in the relation; project/generate the Rust opcode and codec
-      definitions from the complete relation.
+- [ ] Give every wire action handler a concrete typed result schema in the
+      relation. Do not preserve the JSON object model as a generic recursive
+      binary value or let Rust result construction remain the schema authority.
+- [x] Give every non-action request, reply, event, stream mode, mux frame, sum
+      variant, and SCM_RIGHTS role a stable binary identity and bounded schema
+      in the relation. Ordinary actions do not receive duplicate transport
+      request identities.
+- [ ] Project/generate the Rust opcode and codec definitions from the complete
+      transport relation and prove every generated request has exactly one
+      handler.
 - [ ] Replace JSON `ui.sock` request/reply transport with direct Rust binary
       encode/decode and handler dispatch, with no Prolog call in message
       delivery and no retained JSON compatibility mode.
@@ -500,7 +507,7 @@ belong to the relation.
 - Inventoried every `ui.sock` connection family and wrote the binary cutover
   contract. Consolidated the pre-existing TRACE atom code into one bounded
   tv-compatible Rust primitive and cut the box/PTY mux over to compound atoms.
-- Assigned explicit, order-independent numeric identities to all 100 wire
+- Assigned explicit, order-independent numeric identities to all 102 wire
   action handlers in the relation. Wire projection occurs after alias
   normalization, so (for example) `mirror_resume` projects the actual
   `mirror_pause` handler and its two-argument schema, while local-only actions
@@ -530,8 +537,24 @@ belong to the relation.
 - Moved `representation/3` and `convert/4` into the hub beside the executable
   form relation. Canonical verb, CLI, syntax, wire, help, key, and menu values
   now project from the normalized facts and executable specs. Exhaustive tests
-  render and reparse minimal and fully populated canonical forms for all 114
+  render and reparse minimal and fully populated canonical forms for all 115
   actions and every explicit CLI form, covering optional/repeated shapes.
+- Added the normalized non-action transport relation: 16 requests, 5 response
+  payloads, 7 connection modes, 10 compact event invalidations, and 11
+  stream-frame identities, plus bounded records/enums/tagged choices and exact
+  conditional descriptor roles. Action and transport-only request namespaces
+  are disjoint; select/apply/discard/rename/patch/sudtrace/quit remain actions
+  rather than acquiring duplicate message identities. Unix argv, paths, and
+  environments remain bytes instead of inheriting JSON's UTF-8 restriction.
+- Rejected a generic recursive binary `Value` for action replies: that would
+  only reproduce JSON's schema-less object tree with smaller tags. Concrete
+  per-handler result schemas remain an explicit prerequisite for generated
+  action reply codecs.
+- Routed transport facts, types, enum cases, and tagged variants through the
+  same `representation/3` and `convert/4` hub, embedded the catalog in the
+  static SWI resource, and added closure/uniqueness/bounds/projection tests.
+  Subscription events now describe compact invalidations; durable provenance
+  and trace bodies are fetched and decoded only at a view boundary.
 
 ## Stop conditions
 
