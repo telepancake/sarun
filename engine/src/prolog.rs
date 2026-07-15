@@ -1,5 +1,3 @@
-#![cfg(feature = "prolog")]
-
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::OnceLock;
@@ -56,27 +54,6 @@ unsafe extern "C" {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Action {
-    MirrorJobs,
-    MirrorRun,
-    MirrorRunPending,
-    MirrorPause,
-    MirrorRemove,
-}
-
-impl Action {
-    fn prolog_atom(self) -> &'static str {
-        match self {
-            Self::MirrorJobs => "mirror_jobs",
-            Self::MirrorRun => "mirror_run",
-            Self::MirrorRunPending => "mirror_run_pending",
-            Self::MirrorPause => "mirror_pause",
-            Self::MirrorRemove => "mirror_rm",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderForm {
     Verb,
     Cli,
@@ -99,8 +76,9 @@ pub struct Span {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Semantic {
-    Atom(&'static str),
-    Integer(u64),
+    Atom(String),
+    Integer(i64),
+    Text(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,8 +87,8 @@ pub struct KnownUnit {
     pub span: Span,
     pub paint_spans: Vec<Span>,
     pub surface: String,
-    pub syntax: &'static str,
-    pub provider: &'static str,
+    pub syntax: String,
+    pub provider: String,
     pub preference: i64,
 }
 
@@ -136,14 +114,19 @@ pub struct GrammarInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CommandArg {
-    JobId(u64),
+pub enum CommandValue {
+    Integer(i64),
+    Boolean(bool),
+    String(String),
+    Array(Vec<CommandValue>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandAst {
-    pub action: Action,
-    pub args: Vec<CommandArg>,
+    pub action: String,
+    pub handler: String,
+    pub target: String,
+    pub args: Vec<CommandValue>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -816,14 +799,13 @@ fn encode_input(input: &GrammarInput) -> Result<String, String> {
                 }) {
                     return Err("action grammar unit has an invalid paint span".into());
                 }
-                let semantic = match unit.semantic {
-                    Semantic::Atom(atom) => {
-                        checked_atom(atom).ok_or("invalid semantic atom")?.into()
-                    }
+                let semantic = match &unit.semantic {
+                    Semantic::Atom(atom) => quote_atom(atom),
                     Semantic::Integer(value) => format!("integer({value})"),
+                    Semantic::Text(value) => format!("text({})", quote_string(value)),
                 };
-                let syntax = checked_atom(unit.syntax).ok_or("invalid syntax atom")?;
-                let provider = checked_atom(unit.provider).ok_or("invalid provider atom")?;
+                let syntax = quote_atom(&unit.syntax);
+                let provider = quote_atom(&unit.provider);
                 let paints = unit
                     .paint_spans
                     .iter()
@@ -860,16 +842,36 @@ fn encode_input(input: &GrammarInput) -> Result<String, String> {
     Ok(result)
 }
 
+fn encode_command_value(value: &CommandValue) -> String {
+    match value {
+        CommandValue::Integer(value) => format!("integer({value})"),
+        CommandValue::Boolean(value) => format!("boolean({value})"),
+        CommandValue::String(value) => format!("string({})", quote_string(value)),
+        CommandValue::Array(values) => format!(
+            "array([{}])",
+            values
+                .iter()
+                .map(encode_command_value)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
 fn encode_command(command: &CommandAst) -> String {
     let args = command
         .args
         .iter()
-        .map(|arg| match arg {
-            CommandArg::JobId(value) => format!("job_id({value})"),
-        })
+        .map(encode_command_value)
         .collect::<Vec<_>>()
         .join(",");
-    format!("command({},[{}])", command.action.prolog_atom(), args)
+    format!(
+        "command({},{},{},[{}])",
+        quote_atom(&command.action),
+        quote_atom(&command.handler),
+        quote_atom(&command.target),
+        args
+    )
 }
 
 fn encode_parse_candidate(result: &ParseCandidate) -> String {
@@ -1153,17 +1155,6 @@ fn term_text(term: &ParsedTerm) -> String {
     }
 }
 
-fn decode_action(term: &ParsedTerm) -> Result<Action, String> {
-    match atom(term)? {
-        "mirror_jobs" => Ok(Action::MirrorJobs),
-        "mirror_run" => Ok(Action::MirrorRun),
-        "mirror_run_pending" => Ok(Action::MirrorRunPending),
-        "mirror_pause" => Ok(Action::MirrorPause),
-        "mirror_rm" => Ok(Action::MirrorRemove),
-        other => Err(format!("unsupported action returned by grammar: {other}")),
-    }
-}
-
 fn decode_span(term: &ParsedTerm) -> Result<Span, String> {
     let args = compound(term, "span", 2)?;
     Ok(Span {
@@ -1172,21 +1163,41 @@ fn decode_span(term: &ParsedTerm) -> Result<Span, String> {
     })
 }
 
+fn decode_command_value(term: &ParsedTerm) -> Result<CommandValue, String> {
+    if let Ok(args) = compound(term, "integer", 1) {
+        return Ok(CommandValue::Integer(integer(&args[0])?));
+    }
+    if let Ok(args) = compound(term, "boolean", 1) {
+        return match atom(&args[0])? {
+            "true" => Ok(CommandValue::Boolean(true)),
+            "false" => Ok(CommandValue::Boolean(false)),
+            _ => Err("invalid boolean returned by grammar".into()),
+        };
+    }
+    if let Ok(args) = compound(term, "string", 1) {
+        return Ok(CommandValue::String(text(&args[0])?.to_string()));
+    }
+    if let Ok(args) = compound(term, "array", 1) {
+        return Ok(CommandValue::Array(
+            list(&args[0])?
+                .iter()
+                .map(decode_command_value)
+                .collect::<Result<_, _>>()?,
+        ));
+    }
+    Err("invalid typed command value returned by grammar".into())
+}
+
 fn decode_command(term: &ParsedTerm) -> Result<CommandAst, String> {
-    let args = compound(term, "command", 2)?;
-    let action = decode_action(&args[0])?;
-    let command_args = list(&args[1])?
+    let args = compound(term, "command", 4)?;
+    let command_args = list(&args[3])?
         .iter()
-        .map(|arg| {
-            let value = compound(arg, "job_id", 1)?;
-            Ok(CommandArg::JobId(
-                u64::try_from(integer(&value[0])?)
-                    .map_err(|_| "invalid job id returned by grammar")?,
-            ))
-        })
+        .map(decode_command_value)
         .collect::<Result<Vec<_>, String>>()?;
     Ok(CommandAst {
-        action,
+        action: atom(&args[0])?.to_string(),
+        handler: atom(&args[1])?.to_string(),
+        target: atom(&args[2])?.to_string(),
         args: command_args,
     })
 }
@@ -1324,11 +1335,13 @@ pub(crate) fn ensure_linked() {
 mod tests {
     use super::*;
 
-    fn command(action: Action, id: Option<u64>) -> CommandAst {
+    fn command(action: &str, id: Option<i64>) -> CommandAst {
         CommandAst {
-            action,
+            action: action.into(),
+            handler: action.into(),
+            target: "ui".into(),
             args: id
-                .map(|value| vec![CommandArg::JobId(value)])
+                .map(|value| vec![CommandValue::Integer(value)])
                 .unwrap_or_default(),
         }
     }
@@ -1343,28 +1356,28 @@ mod tests {
         assert!(duplicate.contains("already active"));
         assert_eq!(
             prolog
-                .render(&command(Action::MirrorJobs, None), RenderForm::Verb)
+                .render(&command("mirror_jobs", None), RenderForm::Verb)
                 .unwrap()
                 .text,
             "mirror_jobs",
         );
         assert_eq!(
             prolog
-                .render(&command(Action::MirrorJobs, None), RenderForm::Cli)
+                .render(&command("mirror_jobs", None), RenderForm::Cli)
                 .unwrap()
                 .text,
             "mirror ls",
         );
         assert_eq!(
             prolog
-                .render(&command(Action::MirrorRun, Some(7)), RenderForm::Cli)
+                .render(&command("mirror_run", Some(7)), RenderForm::Cli)
                 .unwrap()
                 .text,
             "mirror run 7",
         );
         assert_eq!(
             prolog
-                .render(&command(Action::MirrorRunPending, None), RenderForm::Cli)
+                .render(&command("mirror_run_pending", None), RenderForm::Cli)
                 .unwrap()
                 .text,
             "mirror run",
@@ -1372,7 +1385,7 @@ mod tests {
         prolog.exhaust_inference_limit().unwrap();
         assert_eq!(
             prolog
-                .render(&command(Action::MirrorRemove, Some(11)), RenderForm::Cli)
+                .render(&command("mirror_rm", Some(11)), RenderForm::Cli)
                 .unwrap()
                 .text,
             "mirror rm 11",

@@ -3981,10 +3981,6 @@ impl App {
                 self.status = format!("command: unknown action {command:?}");
                 return;
             }
-            crate::parser::ParseResult::InvalidArguments(command) => {
-                self.status = format!("command: invalid arguments for {command:?}");
-                return;
-            }
             crate::parser::ParseResult::BackendError(error) => {
                 self.status = format!("command parser: {error}");
                 return;
@@ -3992,7 +3988,7 @@ impl App {
         };
         let name = invocation.dispatch_name();
         match command_target(&invocation) {
-            crate::registry::ActionTarget::UiVerb => {
+            crate::parser::ActionTarget::UiVerb => {
                 let args = invocation.json_args();
                 self.status = match rpc(&self.sock, name, args) {
                     Ok(Value::Array(rows)) => format!("{name}: {} items", rows.len()),
@@ -4001,7 +3997,7 @@ impl App {
                     Err(error) => format!("command: {error}"),
                 };
             }
-            crate::registry::ActionTarget::ControlMessage => {
+            crate::parser::ActionTarget::ControlMessage => {
                 self.status = match control_message_rpc(&self.sock, &invocation) {
                     Ok(_) => format!("{name}: ok"),
                     Err(error) => format!("command: {error}"),
@@ -4009,13 +4005,13 @@ impl App {
                 self.refresh_sessions();
                 self.load_changes();
             }
-            crate::registry::ActionTarget::LocalUi => {
+            crate::parser::ActionTarget::LocalUi => {
                 if !invocation.args.is_empty() {
                     self.status = format!(
                         "command: local action {} takes no arguments",
-                        invocation.action.verb
+                        invocation.action
                     );
-                } else if let Err(reason) = self.dispatch_local_command(invocation.action.verb) {
+                } else if let Err(reason) = self.dispatch_local_command(&invocation.action) {
                     self.status = format!("command: {reason}");
                 }
             }
@@ -8797,9 +8793,8 @@ fn help_lines() -> Vec<Line<'static>> {
     v
 }
 
-fn command_spans(buf: &str) -> crate::parser::BackendResult<Vec<Span<'_>>> {
-    let result = crate::parser::highlights(buf);
-    let mut highlights = result.value;
+fn command_spans(buf: &str) -> Result<Vec<Span<'_>>, String> {
+    let mut highlights = crate::parser::highlights(buf)?;
     highlights.sort_by_key(|highlight| (highlight.span.start, highlight.span.end));
     let mut spans = Vec::new();
     let mut cursor = 0;
@@ -8837,10 +8832,7 @@ fn command_spans(buf: &str) -> crate::parser::BackendResult<Vec<Span<'_>>> {
     if cursor < buf.len() {
         spans.push(Span::raw(&buf[cursor..]));
     }
-    crate::parser::BackendResult {
-        value: spans,
-        status: result.status,
-    }
+    Ok(spans)
 }
 
 /// Render the active modal centered over the body. Returns the area consumed.
@@ -9546,14 +9538,11 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )];
-            let highlighted = command_spans(buf);
-            let mut diagnostics = highlighted
-                .status
-                .diagnostic()
-                .map(str::to_owned)
-                .into_iter()
-                .collect::<Vec<_>>();
-            input.extend(highlighted.value);
+            let (highlighted, mut diagnostics) = match command_spans(buf) {
+                Ok(spans) => (spans, Vec::new()),
+                Err(error) => (vec![Span::raw(buf)], vec![error]),
+            };
+            input.extend(highlighted);
             input.push(Span::raw(if buf.ends_with('_') { "" } else { "_" }));
             let mut body = vec![
                 Line::from(Span::styled(
@@ -9567,14 +9556,13 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             ];
             match crate::parser::parse(buf) {
                 crate::parser::ParseResult::Invocation(invocation) => {
-                    let rendered = crate::parser::render(&invocation);
-                    if let Some(error) = rendered.status.diagnostic() {
-                        diagnostics.push(error.to_string());
+                    match crate::parser::render(&invocation) {
+                        Ok(rendered) => body.push(Line::from(Span::styled(
+                            format!("→ {rendered}"),
+                            Style::default().fg(Color::DarkGray),
+                        ))),
+                        Err(error) => diagnostics.push(error),
                     }
-                    body.push(Line::from(Span::styled(
-                        format!("→ {}", rendered.value),
-                        Style::default().fg(Color::DarkGray),
-                    )));
                 }
                 crate::parser::ParseResult::BackendError(error) => diagnostics.push(error),
                 _ => {}
@@ -10197,7 +10185,7 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
 
 /// Run a `PaneAction` against the app. Bodies are moved verbatim from the
 /// original inline arms — same semantics, one place now.
-fn command_target(invocation: &crate::parser::Invocation) -> crate::registry::ActionTarget {
+fn command_target(invocation: &crate::parser::Invocation) -> crate::parser::ActionTarget {
     invocation.target
 }
 
@@ -10206,11 +10194,13 @@ fn command_completions(
     input: &str,
     cursor: usize,
 ) -> Vec<crate::parser::CompletionEntry> {
-    let result = crate::parser::complete_at(input, cursor);
-    if let Some(error) = result.status.diagnostic() {
-        app.status = format!("command parser: {error}");
+    match crate::parser::complete_at(input, cursor) {
+        Ok(entries) => entries,
+        Err(error) => {
+            app.status = format!("command parser: {error}");
+            Vec::new()
+        }
     }
-    result.value
 }
 
 fn run_pane_action(app: &mut App, action: PaneAction) {
@@ -18357,7 +18347,11 @@ mod tests {
                 serde_json::json!({"type": "rename", "sid": "5", "name": "NEW"}),
             ),
         ] {
-            let invocation = crate::parser::parse_action(input).unwrap();
+            let crate::parser::ParseResult::Invocation(invocation) =
+                crate::parser::parse(input)
+            else {
+                panic!("{input:?} did not parse")
+            };
             assert_eq!(control_message(&invocation).unwrap(), expected, "{input}");
         }
     }
@@ -20285,7 +20279,7 @@ mod tests {
 
     #[test]
     fn command_modal_styles_exact_command_and_previews_canonical_form() {
-        let spans = command_spans("mirror_run 5").value;
+        let spans = command_spans("mirror_run 5").unwrap();
         assert_eq!(
             spans
                 .iter()
@@ -20312,7 +20306,7 @@ mod tests {
     fn command_modal_partial_and_unicode_input_are_safe() {
         let mut app = headless_app();
         for input in ["mirror r", "mirror rün", "mirror_run 五", "λ"] {
-            let spans = command_spans(input).value;
+            let spans = command_spans(input).unwrap_or_else(|_| vec![Span::raw(input)]);
             assert_eq!(
                 spans
                     .iter()

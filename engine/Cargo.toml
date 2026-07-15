@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
-[features]
-default = []
-prolog = []
-
 [[bin]]
 name = "sarun"
 path = "src/main.rs"

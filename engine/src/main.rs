@@ -52,7 +52,6 @@ mod oci_verify;
 mod overlay;
 mod parser;
 mod paths;
-#[cfg(feature = "prolog")]
 mod prolog;
 mod pty;
 mod reader;
@@ -493,7 +492,6 @@ fn driver_invocation() -> Option<i32> {
 }
 
 fn main() {
-    #[cfg(feature = "prolog")]
     prolog::ensure_linked();
 
     // Symlinked-as-`oaita` dispatch — same trick brush_sh / ninja / make use

@@ -10,7 +10,6 @@ const SWIPL_SOURCE_SHA256: &str =
     "281e59fff098094bec8dc0831bd360c35d6360aaf12eebfc7b6be74f31d74d72";
 const ZLIB_COMMIT: &str = "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf";
 const ZLIB_SOURCE_SHA256: &str = "d9e270d46252734aa49770fbc544125391617956266f220bd63216c834f3a522";
-const SWIPL_TARGET: &str = "x86_64-linux-musl";
 
 fn require_file(path: &Path) {
     if !path.is_file() {
@@ -64,15 +63,14 @@ fn require_value(info: &BTreeMap<String, String>, key: &str, expected: &str) {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=SARUN_SWIPL_DIR");
-    if env::var_os("CARGO_FEATURE_PROLOG").is_none() {
-        return;
-    }
-
     let target = env::var("TARGET").expect("Cargo did not set TARGET");
-    assert_eq!(
-        target, "x86_64-unknown-linux-musl",
-        "the prolog feature currently supports only the static x86_64 musl build"
-    );
+    let swipl_target = match target.as_str() {
+        "x86_64-unknown-linux-musl" => "x86_64-linux-musl",
+        "aarch64-unknown-linux-musl" => "aarch64-linux-musl",
+        _ => panic!(
+            "sarun's embedded Prolog runtime supports x86_64 and aarch64 musl, not {target}"
+        ),
+    };
 
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let artifacts = env::var_os("SARUN_SWIPL_DIR").map_or_else(
@@ -80,14 +78,14 @@ fn main() {
             manifest
                 .join("target/swipl")
                 .join(SWIPL_VERSION)
-                .join(SWIPL_TARGET)
+                .join(swipl_target)
         },
         PathBuf::from,
     );
     let info_path = artifacts.join("BUILD-INFO");
     let info = build_info(&info_path);
-    require_value(&info, "pipeline", "4");
-    require_value(&info, "target", SWIPL_TARGET);
+    require_value(&info, "pipeline", "5");
+    require_value(&info, "target", swipl_target);
     require_value(&info, "swipl_version", SWIPL_VERSION);
     require_value(&info, "swipl_commit", SWIPL_COMMIT);
     require_value(&info, "swipl_source_sha256", SWIPL_SOURCE_SHA256);
@@ -96,9 +94,11 @@ fn main() {
     require_value(&info, "use_signals", "OFF");
 
     let grammar = manifest.join("pl/action_grammar.pl");
+    let catalog = manifest.join("pl/action_catalog.pl");
     let swipl_license = manifest.join("../LICENSES/SWI-Prolog.txt");
     let zlib_license = manifest.join("../LICENSES/zlib.txt");
     require_value(&info, "action_grammar_sha256", &sha256(&grammar));
+    require_value(&info, "action_catalog_sha256", &sha256(&catalog));
     require_value(&info, "swipl_license_sha256", &sha256(&swipl_license));
     require_value(&info, "zlib_license_sha256", &sha256(&zlib_license));
 
@@ -122,6 +122,7 @@ fn main() {
     }
     println!("cargo:rerun-if-changed={}", info_path.display());
     println!("cargo:rerun-if-changed={}", grammar.display());
+    println!("cargo:rerun-if-changed={}", catalog.display());
     println!("cargo:rerun-if-changed={}", swipl_license.display());
     println!("cargo:rerun-if-changed={}", zlib_license.display());
 

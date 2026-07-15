@@ -30,9 +30,17 @@ ZLIB_COMMIT = "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf"
 ZLIB_URL = f"https://github.com/madler/zlib/archive/{ZLIB_COMMIT}.tar.gz"
 ZLIB_SHA256 = "d9e270d46252734aa49770fbc544125391617956266f220bd63216c834f3a522"
 
-TARGET = "x86_64-linux-musl"
+SUPPORTED_TARGETS = {
+    "x86_64-linux-musl": "x86_64",
+    "aarch64-linux-musl": "aarch64",
+}
+HOST_TARGETS = {
+    "x86_64": "x86_64-linux-musl",
+    "aarch64": "aarch64-linux-musl",
+    "arm64": "aarch64-linux-musl",
+}
 SOURCE_DATE_EPOCH = "1734688000"  # SWI-Prolog V9.2.9 commit time
-PIPELINE_VERSION = "4"
+PIPELINE_VERSION = "5"
 
 
 def run(*args: str, env: dict[str, str] | None = None) -> None:
@@ -53,13 +61,16 @@ def tool_version(*args: str) -> str:
     return output.splitlines()[0].strip()
 
 
-def metadata(repo: Path, host: str, zig: str) -> dict[str, str]:
+def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
     grammar = repo / "engine" / "pl" / "action_grammar.pl"
+    catalog = repo / "engine" / "pl" / "action_catalog.pl"
     if not grammar.is_file():
         raise RuntimeError(f"missing application grammar: {grammar}")
+    if not catalog.is_file():
+        raise RuntimeError(f"missing action catalog: {catalog}")
     return {
         "pipeline": PIPELINE_VERSION,
-        "target": TARGET,
+        "target": target,
         "host": host,
         "source_date_epoch": SOURCE_DATE_EPOCH,
         "swipl_version": SWIPL_VERSION,
@@ -69,6 +80,7 @@ def metadata(repo: Path, host: str, zig: str) -> dict[str, str]:
         "zlib_commit": ZLIB_COMMIT,
         "zlib_source_sha256": ZLIB_SHA256,
         "action_grammar_sha256": sha256(grammar),
+        "action_catalog_sha256": sha256(catalog),
         "swipl_license_sha256": sha256(repo / "LICENSES" / "SWI-Prolog.txt"),
         "zlib_license_sha256": sha256(repo / "LICENSES" / "zlib.txt"),
         "cmake": tool_version("cmake", "--version"),
@@ -78,6 +90,22 @@ def metadata(repo: Path, host: str, zig: str) -> dict[str, str]:
         "use_signals": "OFF",
         "no_bignum_patch": "guard-ar-alloc-buffer",
     }
+
+
+def build_identity(metadata: dict[str, str]) -> str:
+    """Identify compiled dependencies, excluding repackaged application data."""
+    resource_keys = {
+        "action_grammar_sha256",
+        "action_catalog_sha256",
+        "swipl_license_sha256",
+        "zlib_license_sha256",
+    }
+    payload = "".join(
+        f"{key}={value}\n"
+        for key, value in sorted(metadata.items())
+        if key not in resource_keys
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def read_build_info(path: Path) -> dict[str, str]:
@@ -258,6 +286,7 @@ def create_app_resource(
     shutil.copyfile(boot, output)
     entries = {
         "app/action_grammar.pl": repo / "engine" / "pl" / "action_grammar.pl",
+        "app/action_catalog.pl": repo / "engine" / "pl" / "action_catalog.pl",
         "library/lists.pl": swipl_source / "library" / "lists.pl",
         "library/pairs.pl": swipl_source / "library" / "pairs.pl",
     }
@@ -336,16 +365,25 @@ def main() -> int:
     repo = Path(__file__).resolve().parent.parent
     cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     default_cache = cache_home / "sarun" / "swipl" / SWIPL_VERSION
-    default_output = repo / "engine" / "target" / "swipl" / SWIPL_VERSION / TARGET
+    host = platform.machine().lower()
+    default_target = HOST_TARGETS.get(host)
+    if default_target is None:
+        raise RuntimeError(f"unsupported build host architecture: {host}")
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--target",
+        choices=sorted(SUPPORTED_TARGETS),
+        default=os.environ.get("SARUN_SWIPL_TARGET", default_target),
+    )
     parser.add_argument(
         "--cache",
         type=Path,
         default=Path(os.environ.get("SARUN_SWIPL_CACHE", default_cache)),
     )
-    parser.add_argument("--output", type=Path, default=default_output)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    target = args.target
 
     for tool in ("cmake", "ninja", "cc"):
         if not shutil.which(tool):
@@ -357,8 +395,10 @@ def main() -> int:
     cache = args.cache.resolve()
     downloads = cache / "downloads"
     sources = cache / "sources"
-    output = args.output.resolve()
-    host = platform.machine().lower()
+    output = (
+        args.output
+        or repo / "engine" / "target" / "swipl" / SWIPL_VERSION / target
+    ).resolve()
     swipl_archive = downloads / f"swipl-{SWIPL_VERSION}-{SWIPL_COMMIT}.tar.gz"
     zlib_archive = downloads / f"zlib-{ZLIB_VERSION}-{ZLIB_COMMIT}.tar.gz"
     download(SWIPL_URL, SWIPL_SHA256, swipl_archive)
@@ -367,15 +407,11 @@ def main() -> int:
     zlib_source = extract(zlib_archive, sources, f"zlib-{ZLIB_COMMIT}")
     validate_notices(repo, swipl_source, zlib_source)
 
-    build_metadata = metadata(repo, host, zig)
+    build_metadata = metadata(repo, host, target, zig)
     if valid_output(output, build_metadata):
         print(f"SWI-Prolog output unchanged and validated: {output}")
         return 0
-    identity = hashlib.sha256(
-        "".join(
-            f"{key}={value}\n" for key, value in sorted(build_metadata.items())
-        ).encode()
-    ).hexdigest()[:16]
+    identity = build_identity(build_metadata)
     work = cache / f"pipeline-{PIPELINE_VERSION}-{identity}" / host
     patch_swipl(swipl_source)
 
@@ -410,14 +446,14 @@ def main() -> int:
 
     cross = [
         "-DCMAKE_SYSTEM_NAME=Linux",
-        "-DCMAKE_SYSTEM_PROCESSOR=x86_64",
+        f"-DCMAKE_SYSTEM_PROCESSOR={SUPPORTED_TARGETS[target]}",
         "-DCMAKE_CROSSCOMPILING=ON",
         f"-DCMAKE_C_COMPILER={zig}",
         "-DCMAKE_C_COMPILER_ARG1=cc",
         f"-DCMAKE_CXX_COMPILER={zig}",
         "-DCMAKE_CXX_COMPILER_ARG1=c++",
-        f"-DCMAKE_C_FLAGS=-target {TARGET} -Wno-error=date-time -g0 {prefix_map}",
-        f"-DCMAKE_CXX_FLAGS=-target {TARGET} -Wno-error=date-time -g0 {prefix_map}",
+        f"-DCMAKE_C_FLAGS=-target {target} -Wno-error=date-time -g0 {prefix_map}",
+        f"-DCMAKE_CXX_FLAGS=-target {target} -Wno-error=date-time -g0 {prefix_map}",
         "-DCMAKE_EXE_LINKER_FLAGS=-static",
         "-DRUN_RESULT=0",
         "-DRUN_RESULT__TRYRUN_OUTPUT=0",

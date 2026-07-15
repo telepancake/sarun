@@ -23,16 +23,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// Where an action is implemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActionTarget {
-    /// Dispatch as `{"type":"ui","verb":...}`.
-    UiVerb,
-    /// Dispatch with the action name as the top-level control message type.
-    ControlMessage,
-    /// Handle inside the TUI without using the control socket.
-    LocalUi,
-}
+pub use crate::parser::{ActionTarget, ArgValue};
 
 /// The value accepted by one structured argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,56 +35,6 @@ pub enum ArgKind {
     Path,
     Base64,
     Spec,
-}
-
-/// A protocol-ready argument. Values are typed from `ArgKind` once, at parse
-/// time; dispatchers must not infer types from their textual spelling.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArgValue {
-    Number(i64),
-    Bool(bool),
-    String(String),
-    Array(Vec<ArgValue>),
-}
-
-impl ArgValue {
-    pub fn json(&self) -> serde_json::Value {
-        match self {
-            Self::Number(value) => serde_json::Value::Number((*value).into()),
-            Self::Bool(value) => serde_json::Value::Bool(*value),
-            Self::String(value) => serde_json::Value::String(value.clone()),
-            Self::Array(values) => {
-                serde_json::Value::Array(values.iter().map(Self::json).collect())
-            }
-        }
-    }
-
-    pub fn text(&self) -> String {
-        match self {
-            Self::Number(value) => value.to_string(),
-            Self::Bool(value) => value.to_string(),
-            Self::String(value) => value.clone(),
-            Self::Array(values) => values
-                .iter()
-                .flat_map(Self::source_tokens)
-                .collect::<Vec<_>>()
-                .join(" "),
-        }
-    }
-
-    pub fn source_tokens(&self) -> Vec<String> {
-        match self {
-            Self::Array(values) => values.iter().flat_map(Self::source_tokens).collect(),
-            _ => vec![self.text()],
-        }
-    }
-
-    pub fn as_string(&self) -> Option<&str> {
-        match self {
-            Self::String(value) => Some(value),
-            _ => None,
-        }
-    }
 }
 
 /// Structured argument metadata used where CLI paths are ambiguous.

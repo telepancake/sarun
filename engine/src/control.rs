@@ -514,7 +514,10 @@ fn ptrace_backtraces(box_pids: &[i32]) -> std::collections::HashMap<i32, Vec<Str
                     {
                         break;
                     }
+                    #[cfg(target_arch = "x86_64")]
                     let (rip, mut fp) = (regs.rip, regs.rbp);
+                    #[cfg(target_arch = "aarch64")]
+                    let (rip, mut fp) = (regs.pc, regs.regs[29]);
                     let in_text = text_hi > text_lo && rip >= text_lo && rip < text_hi;
                     // Accept when in brush code, or on the final attempt take
                     // whatever we have rather than nothing.
@@ -5040,7 +5043,7 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
     };
     let rpc_args = invocation.json_args();
     let protocol_verb = invocation.dispatch_name();
-    match invocation.action.verb {
+    match invocation.action.as_str() {
         "mirror_jobs" => match one(protocol_verb, rpc_args) {
             Ok(Value::Array(jobs)) => {
                 for j in jobs {

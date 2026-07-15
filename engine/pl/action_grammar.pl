@@ -1,147 +1,143 @@
 :- module(action_grammar,
-          [ action/6,
+          [ action/7,
             valid_action/1,
             parse/2,
             parse/3,
             completions/3,
             highlights/2,
             render/3,
+            catalog/2,
             application/3
           ]).
 
-/** <module> Core-only grammar for mirror actions over lexer evidence
+:- use_module(action_catalog).
 
-The grammar consumes a list ending in `end(BytePosition)`. Other items are:
+/** <module> Relational parser and representation hub
 
-  * `unit(Semantic, Span, PaintSpans, Surface, Syntax, DescriptionKey,
-    Preference, Origin)` for a semantic unit recognized by the lexer;
-  * `edit_tear(Id, Span, Surface)` for the one source range assist mode may
-    replace; and
-  * `source_tear(Id, Span, Surface)` for unrecognized source that the grammar
-    must not silently repair.
+The grammar consumes neutral lexer evidence. Rust supplies UTF-8 byte spans and
+source surfaces; it does not classify command names or arguments. This module
+relates those surfaces to canonical actions, typed wire values, syntax,
+descriptions, completions, and rendered forms using the sole action definition
+in `action_catalog.pl`.
 
-Spans are ordered, non-overlapping, half-open UTF-8 byte spans represented as
-`span(Start, End)`. Paint spans must be ordered, non-overlapping, and contained
-by their owning unit. A successful parse returns
-`parse_result(command(Action, Args), Status, Evidence, Preference)`. Evidence
-contains only real `unit/8` items, so highlighting is a projection of a grammar
-derivation rather than a second classification pass.
+Input ends in `end(BytePosition)`. Source tokens are represented as `unit/8`;
+their incoming semantic/syntax/provider fields are deliberately ignored by the
+command grammar. `edit_tear/3` marks the one source range completion may
+replace. `source_tear/3` remains an explicit unrecognized hole and is never
+silently repaired.
 
-This module intentionally imports no libraries. It is loadable by sarun's
-core-only embedded SWI-Prolog runtime.
+The normalized result is
+`command(Action, Handler, Target, WireArguments)`. Rust therefore receives a
+dispatch-ready value without consulting another registry.
 */
 
-:- dynamic action/6.
-
-% action(Name, ArgumentSchema, VerbForm, CliForm, DescriptionKey, Preference).
-% Forms are sequences of literal/5 and argument/1 terms. Description values
-% are provider keys; resolving them to prose belongs outside this module.
-
-action(mirror_jobs, [],
-       [literal(mirror_jobs, "mirror_jobs", action_identifier,
-                action_mirror_jobs, 30)],
-       [literal(mirror, "mirror", command_namespace, mirror_namespace, 10),
-        literal(ls, "ls", action_word, action_mirror_jobs, 20)],
-       action_mirror_jobs, 90).
-
-action(mirror_run, [job_id],
-       [literal(mirror_run, "mirror_run", action_identifier,
-                action_mirror_run, 30),
-        argument(job_id)],
-       [literal(mirror, "mirror", command_namespace, mirror_namespace, 10),
-        literal(run, "run", action_word, mirror_run_word, 20),
-        argument(job_id)],
-       action_mirror_run, 100).
-
-action(mirror_run_pending, [],
-       [literal(mirror_run_pending, "mirror_run_pending", action_identifier,
-                action_mirror_run_pending, 30)],
-       [literal(mirror, "mirror", command_namespace, mirror_namespace, 10),
-        literal(run, "run", action_word, action_mirror_run_pending, 20)],
-       action_mirror_run_pending, 85).
-
-action(mirror_pause, [job_id],
-       [literal(mirror_pause, "mirror_pause", action_identifier,
-                action_mirror_pause, 30),
-        argument(job_id)],
-       [literal(mirror, "mirror", command_namespace, mirror_namespace, 10),
-        literal(pause, "pause", action_word, action_mirror_pause, 20),
-        argument(job_id)],
-       action_mirror_pause, 80).
-
-action(mirror_rm, [job_id],
-       [literal(mirror_rm, "mirror_rm", action_identifier,
-                action_mirror_rm, 30),
-        argument(job_id)],
-       [literal(mirror, "mirror", command_namespace, mirror_namespace, 10),
-        literal(rm, "rm", action_word, action_mirror_rm, 20),
-        argument(job_id)],
-       action_mirror_rm, 75).
-
-%! valid_action(+Name) is semidet.
-%
-% Validate the complete action fact, including exact agreement between each
-% form's argument sequence and the declared schema.
-
-valid_action(Name) :-
-    action(Name, Schema, Verb, Cli, Description, Preference),
-    valid_action_fact(Name, Schema, Verb, Cli, Description, Preference).
-
-valid_action_fact(Name, Schema, Verb, Cli, Description, Preference) :-
-    atom(Name),
+valid_action(Action) :-
+    action(Action, Handler, Target, Notation, Description, Visibility,
+           Preference),
+    atom(Action),
+    atom(Handler),
+    valid_target(Target),
+    string(Notation),
+    string(Description),
+    valid_visibility(Visibility),
+    number(Preference),
+    argument_schema(Action, Schema),
     valid_schema(Schema),
-    valid_form(Verb, Schema),
-    valid_form(Cli, Schema),
-    atom(Description),
-    number(Preference).
+    once(action_form(Action, verb, _, _)).
+
+valid_target(ui).
+valid_target(control).
+valid_target(local).
+
+valid_visibility(visible).
+valid_visibility(internal).
 
 valid_schema([]).
-valid_schema([job_id|Schema]) :-
+valid_schema([arg(Name, Kind, Cardinality, Shape)|Schema]) :-
+    atom(Name),
+    valid_kind(Kind),
+    valid_cardinality(Cardinality),
+    valid_shape(Cardinality, Shape),
     valid_schema(Schema).
 
-valid_form([literal(Semantic, Text, Syntax, Description, Preference)|Specs],
-           Schema) :-
-    valid_literal(Semantic, Text, Syntax, Description, Preference),
-    valid_specs(Specs, Schema).
+valid_kind(boolean).
+valid_kind(integer).
+valid_kind(string).
+valid_kind(path).
+valid_kind(base64).
+valid_kind(spec).
 
-valid_specs([], []).
-valid_specs([literal(Semantic, Text, Syntax, Description, Preference)|Specs],
-            Schema) :-
-    valid_literal(Semantic, Text, Syntax, Description, Preference),
-    valid_specs(Specs, Schema).
-valid_specs([argument(job_id)|Specs], [job_id|Schema]) :-
-    valid_specs(Specs, Schema).
+valid_cardinality(required).
+valid_cardinality(optional).
+valid_cardinality(repeated).
 
-valid_literal(Semantic, Text, Syntax, Description, Preference) :-
-    ground(Semantic),
-    string(Text),
-    atom(Syntax),
-    atom(Description),
-    number(Preference).
+valid_shape(required, scalar).
+valid_shape(optional, scalar).
+valid_shape(repeated, array).
+valid_shape(repeated, spread).
+
+%! action_form(?Action, ?Style, ?Specs, ?Normalizer) is nondet.
+%
+% A form is a sequence of `literal/5` and `argument/1` specs. Normalizers
+% relate source-form arguments to the handler's typed wire arguments.
+
+action_form(Action, verb, Specs, Normalizer) :-
+    action(Action, _, _, _, _, _, _),
+    argument_schema(Action, Schema),
+    atom_string(Action, Text),
+    canonical_normalizer(Action, Normalizer),
+    schema_specs(Schema, ArgSpecs),
+    Specs = [literal(Action, Text, action_identifier, Action, 30)|ArgSpecs].
+action_form(Action, cli, Specs, Normalizer) :-
+    cli_form(Action, Words, Normalizer),
+    cli_source_schema(Action, Normalizer, Schema),
+    cli_literal_specs(Words, Action, Literals),
+    schema_specs(Schema, ArgSpecs),
+    append(Literals, ArgSpecs, Specs).
+
+canonical_normalizer(mirror_resume, resume_false) :- !.
+canonical_normalizer(_, identity).
+
+cli_source_schema(mirror_pause, pause_true,
+                  [arg(id, integer, required, scalar)]) :- !.
+cli_source_schema(Action, _, Schema) :-
+    argument_schema(Action, Schema).
+
+schema_specs([], []).
+schema_specs([Arg|Schema], [argument(Arg)|Specs]) :-
+    schema_specs(Schema, Specs).
+
+cli_literal_specs(Words, Action, Specs) :-
+    cli_literal_specs(Words, Action, first, Specs).
+
+cli_literal_specs([], _, _, []).
+cli_literal_specs([Text|Words], Action, Position,
+                  [literal(Semantic, Text, Syntax, Action, Preference)|Specs]) :-
+    atom_string(Semantic, Text),
+    cli_literal_metadata(Position, Syntax, Preference),
+    cli_literal_specs(Words, Action, rest, Specs).
+
+cli_literal_metadata(first, command_namespace, 10).
+cli_literal_metadata(rest, action_word, 20).
 
 %! parse(+Items, -Result) is nondet.
-%
-% Parse without repairing any input.
 
 parse(Items, Result) :-
     parse(Items, exact, Result).
 
 %! parse(+Items, +Mode, -Result) is nondet.
-%
-% Mode is `exact` or `assist(EditTearId)`. An assist parse is a complete
-% derivation after replacing exactly that tear, but its evidence excludes the
-% hypothetical replacement.
 
-parse(Items, Mode, parse_result(command(Action, Args), Status,
-                                Evidence, Preference)) :-
+parse(Items, Mode,
+      parse_result(command(Action, Handler, Target, WireArgs), Status,
+                   Evidence, Preference)) :-
     input_body(Items, Body, End),
     valid_body(Body, End),
     valid_mode(Mode),
-    action(Action, Schema, Verb, Cli, Description, ActionPreference),
-    valid_action_fact(Action, Schema, Verb, Cli, Description, ActionPreference),
-    ( Specs = Verb ; Specs = Cli ),
-    match_complete(Specs, Body, Mode, Args, [], Evidence, [], EditCount),
-    args_match_schema(Args, Schema),
+    action(Action, Handler, Target, _, _, _, ActionPreference),
+    valid_action(Action),
+    action_form(Action, _Style, Specs, Normalizer),
+    match_specs(Specs, Body, Mode, SourceArgs, Evidence, EditCount),
+    normalize_args(Normalizer, SourceArgs, WireArgs),
     parse_status(Mode, EditCount, Status),
     evidence_preference(Evidence, ActionPreference, Preference).
 
@@ -150,6 +146,18 @@ valid_mode(assist(_)).
 
 parse_status(exact, 0, complete).
 parse_status(assist(EditId), 1, incomplete(edit(EditId))).
+
+normalize_args(identity, Args, Args).
+normalize_args(pause_true, Args, WireArgs) :-
+    append(Args, [boolean(true)], WireArgs).
+normalize_args(resume_false, Args, WireArgs) :-
+    append(Args, [boolean(false)], WireArgs).
+
+denormalize_args(identity, Args, Args).
+denormalize_args(pause_true, WireArgs, Args) :-
+    append(Args, [boolean(true)], WireArgs).
+denormalize_args(resume_false, WireArgs, Args) :-
+    append(Args, [boolean(false)], WireArgs).
 
 input_body([end(End)], [], End) :-
     integer(End),
@@ -211,38 +219,97 @@ proper_list([_|Items]) :-
 text(Text) :- string(Text), !.
 text(Text) :- atom(Text).
 
-match_complete([], [], _Mode, Args, Args, Evidence, Evidence, 0).
-match_complete([literal(Semantic, _Text, Syntax, _Description, _Preference)|Specs],
-               [unit(Semantic, Span, PaintSpans, Surface, Syntax,
-                     Description, Preference, Origin)|Items],
-               Mode, Args0, Args, Evidence0, Evidence, EditCount) :-
-    Evidence0 = [evidence(Semantic, Span, PaintSpans, Surface, Syntax,
-                          Description, Preference, Origin)|Evidence1],
-    match_complete(Specs, Items, Mode, Args0, Args,
-                   Evidence1, Evidence, EditCount).
-match_complete([argument(job_id)|Specs],
-               [unit(integer(Id), Span, PaintSpans, Surface, integer,
-                     Description, Preference, Origin)|Items],
-               Mode, [job_id(Id)|Args0], Args, Evidence0, Evidence, EditCount) :-
-    integer(Id),
-    Id >= 0,
-    Evidence0 = [evidence(integer(Id), Span, PaintSpans, Surface, integer,
-                          Description, Preference, Origin)|Evidence1],
-    match_complete(Specs, Items, Mode, Args0, Args,
-                   Evidence1, Evidence, EditCount).
-match_complete([literal(_Semantic, Text, _Syntax, _Description, _Preference)|Specs],
-               [edit_tear(EditId, _Span, Surface)|Items],
-               assist(EditId), Args0, Args, Evidence0, Evidence, EditCount) :-
-    surface_prefix(Surface, Text),
-    match_complete(Specs, Items, assist(EditId), Args0, Args,
-                   Evidence0, Evidence, RestEditCount),
-    EditCount is RestEditCount + 1.
+% Keep the embedded application core-only. SWI's boot image provides append/1
+% but not library(lists)' append/3.
+append([], Tail, Tail).
+append([Head|Items], Tail, [Head|Result]) :-
+    append(Items, Tail, Result).
 
-args_match_schema([], []).
-args_match_schema([job_id(Id)|Args], [job_id|Schema]) :-
-    integer(Id),
-    Id >= 0,
-    args_match_schema(Args, Schema).
+source_unit(unit(_, Span, PaintSpans, Surface, _, _, Preference, Origin),
+            Span, PaintSpans, Surface, Preference, Origin).
+
+match_specs([], [], _Mode, [], [], 0).
+match_specs([literal(Semantic, Text, Syntax, Description, LitPreference)|Specs],
+            [Item|Items], Mode, Args,
+            [evidence(Semantic, Span, PaintSpans, Surface, Syntax,
+                      Description, Preference, Origin)|Evidence], EditCount) :-
+    source_unit(Item, Span, PaintSpans, Surface, SourcePreference, Origin),
+    text_string(Surface, SurfaceString),
+    SurfaceString = Text,
+    Preference is SourcePreference + LitPreference,
+    match_specs(Specs, Items, Mode, Args, Evidence, EditCount).
+match_specs([literal(_Semantic, Text, _Syntax, _Description, _Preference)|Specs],
+            [edit_tear(EditId, _Span, Surface)|Items], assist(EditId), Args,
+            Evidence, EditCount) :-
+    surface_prefix(Surface, Text),
+    match_specs(Specs, Items, assist(EditId), Args, Evidence, RestCount),
+    EditCount is RestCount + 1.
+match_specs([argument(arg(Name, Kind, required, scalar))|Specs],
+            [Item|Items], Mode, [Value|Args], [EvidenceItem|Evidence],
+            EditCount) :-
+    match_argument_item(Name, Kind, Item, Value, EvidenceItem),
+    match_specs(Specs, Items, Mode, Args, Evidence, EditCount).
+match_specs([argument(arg(Name, Kind, optional, scalar))|Specs],
+            [Item|Items], Mode, [Value|Args], [EvidenceItem|Evidence],
+            EditCount) :-
+    match_argument_item(Name, Kind, Item, Value, EvidenceItem),
+    match_specs(Specs, Items, Mode, Args, Evidence, EditCount).
+match_specs([argument(arg(_, _, optional, scalar))|Specs], Items, Mode,
+            Args, Evidence, EditCount) :-
+    match_specs(Specs, Items, Mode, Args, Evidence, EditCount).
+match_specs([argument(arg(Name, Kind, repeated, Shape))|Specs], Items0, Mode,
+            Args, Evidence, EditCount) :-
+    take_repeated(Name, Kind, Items0, Values, RepeatedEvidence, Items),
+    repeated_arguments(Shape, Values, Specs, RepeatedArgs),
+    match_specs(Specs, Items, Mode, RestArgs, RestEvidence, EditCount),
+    append(RepeatedArgs, RestArgs, Args),
+    append(RepeatedEvidence, RestEvidence, Evidence).
+
+match_argument_item(Name, Kind, Item, Value,
+                    evidence(Value, Span, PaintSpans, Surface, Syntax,
+                             Name, Preference, Origin)) :-
+    source_unit(Item, Span, PaintSpans, Surface, SourcePreference, Origin),
+    parse_argument(Kind, Surface, Value),
+    kind_syntax(Kind, Syntax),
+    Preference is SourcePreference + 10.
+
+take_repeated(_, _, Items, [], [], Items).
+take_repeated(Name, Kind, [Item|Items0], [Value|Values],
+              [Evidence|EvidenceItems], Items) :-
+    match_argument_item(Name, Kind, Item, Value, Evidence),
+    take_repeated(Name, Kind, Items0, Values, EvidenceItems, Items).
+
+repeated_arguments(array, Values, Specs, Args) :-
+    ( Values = [_|_]
+    -> Args = [array(Values)]
+    ; specs_have_argument(Specs)
+    -> Args = [array([])]
+    ;  Args = []
+    ).
+repeated_arguments(spread, Values, _Specs, Values).
+
+specs_have_argument([argument(_)|_]) :- !.
+specs_have_argument([_|Specs]) :-
+    specs_have_argument(Specs).
+
+parse_argument(boolean, Surface, boolean(Value)) :-
+    text_string(Surface, Text),
+    ( Text = "true" -> Value = true ; Text = "false" -> Value = false ).
+parse_argument(integer, Surface, integer(Value)) :-
+    text_string(Surface, Text),
+    number_string(Value, Text),
+    integer(Value).
+parse_argument(string, Surface, string(Text)) :- text_string(Surface, Text).
+parse_argument(path, Surface, string(Text)) :- text_string(Surface, Text).
+parse_argument(base64, Surface, string(Text)) :- text_string(Surface, Text).
+parse_argument(spec, Surface, string(Text)) :- text_string(Surface, Text).
+
+kind_syntax(boolean, boolean).
+kind_syntax(integer, integer).
+kind_syntax(string, string).
+kind_syntax(path, path).
+kind_syntax(base64, base64).
+kind_syntax(spec, spec).
 
 evidence_preference([], Preference, Preference).
 evidence_preference([evidence(_, _, _, _, _, _, ItemPreference, _)|Evidence],
@@ -251,32 +318,23 @@ evidence_preference([evidence(_, _, _, _, _, _, ItemPreference, _)|Evidence],
     evidence_preference(Evidence, Next, Preference).
 
 %! completions(+Items, +EditTearId, -Completions) is det.
-%
-% Completions are ranked and deduplicated by their visible identity: edit span
-% plus complete replacement text. Each `completion/5` contains all distinct
-% grammar alternatives as
-% `alternative(Semantic, Syntax, DescriptionKey, Preference)`. Candidates must
-% match all source around the tear and come from a schema-valid action form.
 
 completions(Items, EditId, Completions) :-
-    (   input_body(Items, Body, End),
-        valid_body(Body, End)
-    ->  findall(Visible-(Alternative-Preference),
-                completion_candidate(Body, EditId, Visible,
-                                     Alternative, Preference),
-                Pairs),
-        merge_completion_pairs(Pairs, Candidates),
-        sort_candidates(Candidates, Sorted),
-        rank_completions(Sorted, 1, Completions)
-    ;   Completions = []
+    ( input_body(Items, Body, End), valid_body(Body, End)
+    -> findall(Visible-(Alternative-Preference),
+               completion_candidate(Body, EditId, Visible,
+                                    Alternative, Preference),
+               Pairs),
+       merge_completion_pairs(Pairs, Candidates),
+       sort_candidates(Candidates, Sorted),
+       rank_completions(Sorted, 1, Completions)
+    ;  Completions = []
     ).
 
 completion_candidate(Body, EditId, completion_key(Span, Text),
                      alternative(Semantic, Syntax, Description), Preference) :-
-    action(Action, Schema, Verb, Cli, ActionDescription, ActionPreference),
-    valid_action_fact(Action, Schema, Verb, Cli,
-                      ActionDescription, ActionPreference),
-    ( Specs = Verb ; Specs = Cli ),
+    action(Action, _, _, _, _, visible, ActionPreference),
+    action_form(Action, _Style, Specs, _Normalizer),
     split_edit(Body, EditId, Before, Span, Surface, After),
     split_literal(Specs, BeforeSpecs,
                   literal(Semantic, Text, Syntax, Description,
@@ -302,12 +360,12 @@ match_known_prefix([Spec|Specs], [Item|Items]) :-
     match_known_item(Spec, Item),
     match_known_prefix(Specs, Items).
 
-match_known_item(literal(Semantic, _Text, Syntax, _Description, _Preference),
-                 unit(Semantic, _, _, _, Syntax, _, _, _)).
-match_known_item(argument(job_id),
-                 unit(integer(Id), _, _, _, integer, _, _, _)) :-
-    integer(Id),
-    Id >= 0.
+match_known_item(literal(_, Text, _, _, _), Item) :-
+    source_unit(Item, _, _, Surface, _, _),
+    text_string(Surface, Text).
+match_known_item(argument(arg(_, Kind, _, _)), Item) :-
+    source_unit(Item, _, _, Surface, _, _),
+    parse_argument(Kind, Surface, _).
 
 viable_suffix([], []).
 viable_suffix([_|_], []).
@@ -401,9 +459,6 @@ rank_completions([candidate(completion_key(Span, Text), Alternatives,
     rank_completions(Candidates, NextRank, Rest).
 
 %! highlights(+ParseResult, -Highlights) is det.
-%
-% Project paint spans from evidence in a successful derivation. There is no
-% lexical fallback, and assist replacements never enter Evidence.
 
 highlights(parse_result(_Command, _Status, Evidence, _Preference), Highlights) :-
     evidence_highlights(Evidence, Highlights, []).
@@ -424,32 +479,72 @@ paint_highlights([PaintSpan|PaintSpans], Syntax, Semantic, Origin,
                      Highlights0, Highlights).
 
 %! render(+Command, +Style, -Text) is semidet.
-%
-% Render the normalized command as `verb` or `cli` from the same validated
-% action fact used by the parser.
 
-render(command(Action, Args), Style, Text) :-
-    action(Action, Schema, Verb, Cli, Description, Preference),
-    valid_action_fact(Action, Schema, Verb, Cli, Description, Preference),
-    args_match_schema(Args, Schema),
-    style_specs(Style, Verb, Cli, Specs),
-    render_specs(Specs, Args, Parts, []),
+render(command(Action, Handler, Target, WireArgs), Style, Text) :-
+    action(Action, Handler, Target, _, _, _, _),
+    action_form(Action, Style, Specs, Normalizer),
+    denormalize_args(Normalizer, WireArgs, SourceArgs),
+    render_specs(Specs, SourceArgs, Parts),
     join_parts(Parts, Text).
 
-style_specs(verb, Verb, _Cli, Verb).
-style_specs(cli, _Verb, Cli, Cli).
+render_specs([], [], []).
+render_specs([literal(_, Text, _, _, _)|Specs], Args, [Text|Parts]) :-
+    render_specs(Specs, Args, Parts).
+render_specs([argument(arg(_, _, required, scalar))|Specs],
+             [Value|Args], [Text|Parts]) :-
+    render_value(Value, Text),
+    render_specs(Specs, Args, Parts).
+render_specs([argument(arg(_, _, optional, scalar))|Specs], Args0, Parts) :-
+    minimum_arguments(Specs, RequiredAfter),
+    list_length(Args0, Available),
+    ( Available > RequiredAfter
+    -> Args0 = [Value|Args], render_value(Value, Text), Parts = [Text|Rest]
+    ;  Args = Args0, Parts = Rest
+    ),
+    render_specs(Specs, Args, Rest).
+render_specs([argument(arg(_, _, repeated, array))|Specs], Args0, Parts) :-
+    ( Args0 = [array(Values)|Args]
+    -> render_values(Values, ValueParts), append(ValueParts, Rest, Parts)
+    ;  Args = Args0, Parts = Rest
+    ),
+    render_specs(Specs, Args, Rest).
+render_specs([argument(arg(_, _, repeated, spread))|Specs], Args0, Parts) :-
+    minimum_arguments(Specs, RequiredAfter),
+    list_length(Args0, Available),
+    Take is Available - RequiredAfter,
+    Take >= 0,
+    split_count(Take, Args0, Values, Args),
+    render_values(Values, ValueParts),
+    append(ValueParts, Rest, Parts),
+    render_specs(Specs, Args, Rest).
 
-render_specs([], Args, [], Args).
-render_specs([literal(_Semantic, Text, _Syntax, _Description, _Preference)|Specs],
-             Args, [Text|Parts], RemainingArgs) :-
-    render_specs(Specs, Args, Parts, RemainingArgs).
-render_specs([argument(job_id)|Specs], [job_id(Id)|Args], [Text|Parts],
-             RemainingArgs) :-
-    integer(Id),
-    Id >= 0,
-    number_string(Id, Text),
-    render_specs(Specs, Args, Parts, RemainingArgs).
+minimum_arguments([], 0).
+minimum_arguments([literal(_, _, _, _, _)|Specs], Count) :-
+    minimum_arguments(Specs, Count).
+minimum_arguments([argument(arg(_, _, required, scalar))|Specs], Count) :-
+    minimum_arguments(Specs, Rest), Count is Rest + 1.
+minimum_arguments([argument(arg(_, _, optional, scalar))|Specs], Count) :-
+    minimum_arguments(Specs, Count).
+minimum_arguments([argument(arg(_, _, repeated, _))|Specs], Count) :-
+    minimum_arguments(Specs, Count).
 
+list_length([], 0).
+list_length([_|Items], Length) :-
+    list_length(Items, Rest), Length is Rest + 1.
+
+split_count(0, Items, [], Items) :- !.
+split_count(Count, [Item|Items], [Item|Taken], Rest) :-
+    Count > 0, Next is Count - 1, split_count(Next, Items, Taken, Rest).
+
+render_values([], []).
+render_values([Value|Values], [Text|Texts]) :-
+    render_value(Value, Text), render_values(Values, Texts).
+
+render_value(string(Text), Text).
+render_value(integer(Value), Text) :- number_string(Value, Text).
+render_value(boolean(Value), Text) :- atom_string(Value, Text).
+
+join_parts([], "").
 join_parts([Part], Part).
 join_parts([Part|Parts], Text) :-
     Parts = [_|_],
@@ -457,25 +552,40 @@ join_parts([Part|Parts], Text) :-
     string_concat(Part, " ", Prefix),
     string_concat(Prefix, Rest, Text).
 
+%! catalog(+Visibility, -Rows) is det.
+
+catalog(Visibility, Rows) :-
+    findall(action_info(Action, Handler, Target, Schema, Notation,
+                        Description, RowVisibility, Preference,
+                        Representations),
+            ( action(Action, Handler, Target, Notation, Description,
+                     RowVisibility, Preference),
+              visibility_matches(Visibility, RowVisibility),
+              argument_schema(Action, Schema),
+              findall(representation(Kind, Value),
+                      representation(Action, Kind, Value),
+                      Representations)
+            ),
+            Rows).
+
+visibility_matches(all, _).
+visibility_matches(visible, visible).
+visibility_matches(internal, internal).
+
 %! application(+Operation, +InputString, -OutputString) is det.
-%
-% Closed application entry point for typed FFI callers. Operation is one of
-% `parse`, `complete`, `highlights`, or `render`; InputString is decoded as a
-% ground request term and is never invoked as a goal. OutputString is a
-% canonical serialized `ok(Value)` or `error(Reason)` term.
 
 application(Operation, InputString, OutputString) :-
-    (   atom(Operation)
-    ->  application_atom(Operation, InputString, Response)
-    ;   Response = error(invalid_operation)
+    ( atom(Operation)
+    -> application_atom(Operation, InputString, Response)
+    ;  Response = error(invalid_operation)
     ),
     term_string(Response, OutputString,
                 [quoted(true), ignore_ops(true), numbervars(true)]).
 
 application_atom(Operation, InputString, Response) :-
-    (   decode_request(InputString, Request)
-    ->  dispatch_application(Operation, Request, Response)
-    ;   Response = error(invalid_request)
+    ( decode_request(InputString, Request)
+    -> dispatch_application(Operation, Request, Response)
+    ;  Response = error(invalid_request)
     ).
 
 decode_request(InputString, Request) :-
@@ -484,25 +594,24 @@ decode_request(InputString, Request) :-
     ground(Request).
 
 dispatch_application(parse, request(Items, Mode), ok(Results)) :-
-    !,
-    findall(Result, parse(Items, Mode, Result), Results).
+    !, findall(Result, parse(Items, Mode, Result), Results).
 dispatch_application(complete, request(Items, EditId), ok(Completions)) :-
-    !,
-    completions(Items, EditId, Completions).
+    !, completions(Items, EditId, Completions).
 dispatch_application(highlights, request(Result), ok(Highlights)) :-
-    !,
-    (   highlights(Result, Highlights)
-    ->  true
-    ;   Highlights = []
-    ).
+    !, ( highlights(Result, Highlights) -> true ; Highlights = [] ).
 dispatch_application(render, request(Command, Style), Response) :-
-    !,
-    (   render(Command, Style, Text)
-    ->  Response = ok(Text)
-    ;   Response = error(no_solution)
-    ).
-dispatch_application(parse, _Request, error(invalid_request)) :- !.
-dispatch_application(complete, _Request, error(invalid_request)) :- !.
-dispatch_application(highlights, _Request, error(invalid_request)) :- !.
-dispatch_application(render, _Request, error(invalid_request)) :- !.
-dispatch_application(_Operation, _Request, error(unknown_operation)).
+    !, ( render(Command, Style, Text)
+       -> Response = ok(Text)
+       ;  Response = error(no_solution)
+       ).
+dispatch_application(catalog, request(Visibility), ok(Rows)) :-
+    !, catalog(Visibility, Rows).
+dispatch_application(convert, request(FromKind, From, ToKind), ok(Results)) :-
+    !, findall(To, convert(FromKind, From, ToKind, To), Results).
+dispatch_application(parse, _, error(invalid_request)) :- !.
+dispatch_application(complete, _, error(invalid_request)) :- !.
+dispatch_application(highlights, _, error(invalid_request)) :- !.
+dispatch_application(render, _, error(invalid_request)) :- !.
+dispatch_application(catalog, _, error(invalid_request)) :- !.
+dispatch_application(convert, _, error(invalid_request)) :- !.
+dispatch_application(_, _, error(invalid_operation)).
