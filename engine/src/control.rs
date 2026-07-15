@@ -998,12 +998,13 @@ fn build_edge_state(
     Ok(())
 }
 
-fn dispatch_recording_transport(
+fn dispatch_reply_transport(
     state: &State,
     request: crate::generated_wire::TransportRequest,
+    hint_box_id: Option<i64>,
     peer_pidfd: Option<i32>,
 ) -> Result<crate::generated_wire::TransportResponse, String> {
-    use crate::generated_wire::{TransportRequest, TransportResponse};
+    use crate::generated_wire::{BoxTarget, TransportRequest, TransportResponse};
     match request {
         TransportRequest::BrushProvenance { records } => {
             brush_prov_nested(state, records.as_slice(), peer_pidfd)
@@ -1033,11 +1034,47 @@ fn dispatch_recording_transport(
             build_edge_state(state, &transition, peer_pidfd)?;
             Ok(TransportResponse::Empty)
         }
+        TransportRequest::BudgetGrant { target, amount } => {
+            if let Some(fd) = peer_pidfd {
+                unsafe { libc::close(fd); }
+            }
+            let id = match target {
+                BoxTarget::Broker => hint_box_id,
+                BoxTarget::Selector { r#box } => {
+                    resolve(&discover::discover(), r#box.as_str())
+                }
+            }.ok_or("box not resolvable")?;
+            crate::oaita::budget::grant(state, id, amount);
+            let remaining = crate::oaita::budget::remaining(state, id).unwrap_or(0);
+            Ok(TransportResponse::Budget { remaining })
+        }
+        TransportRequest::SudIngest { r#box } => {
+            if let Some(fd) = peer_pidfd {
+                unsafe { libc::close(fd); }
+            }
+            let id = resolve(&discover::discover(), r#box.as_str())
+                .ok_or("no slopbox")?;
+            let live = lock(state).overlay.clone().and_then(|overlay| overlay.live_box(id))
+                .ok_or("box is not live")?;
+            let runpid = u32::try_from(
+                lock(state).box_runpids.get(&id).copied().unwrap_or(0))
+                .map_err(|_| "negative box runner pid")?;
+            let report = crate::sud::sweep(&live, id, runpid);
+            let count = u64::try_from(report.ingested)
+                .map_err(|_| "sud ingest count exceeds u64")?;
+            let errors = report.errors.into_iter().map(|error|
+                crate::wire::BoundedText::new(error)
+                    .map_err(|_| "sud ingest error exceeds relation bound"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let errors = crate::wire::BoundedVec::new(errors)
+                .map_err(|_| "sud ingest error count exceeds relation bound")?;
+            Ok(TransportResponse::SudIngested { count, errors })
+        }
         other => {
             if let Some(fd) = peer_pidfd {
                 unsafe { libc::close(fd); }
             }
-            Err(format!("transport opcode {} is not a recording request", other.code()))
+            Err(format!("transport opcode {} is not a reply-mode request", other.code()))
         }
     }
 }
@@ -1065,7 +1102,7 @@ fn legacy_transport_response(
         }
         Ok(TransportResponse::SudIngested { count, errors }) => json!({
             "ok": true,
-            "count": count,
+            "ingested": count,
             "errors": errors.into_inner().into_iter()
                 .map(crate::wire::BoundedText::into_inner).collect::<Vec<_>>(),
         }),
@@ -1231,28 +1268,13 @@ fn dispatch(state: &State, msg: &Value) -> Value {
         // BoxState to sud::sweep, which owns the upper/inramfs/trace ingest
         // and residue cleanup; here we only shape the report into a reply.
         "sud_ingest" => {
-            let boxes = discover::discover();
-            match msg
-                .get("sid")
-                .and_then(Value::as_str)
-                .and_then(|s| resolve(&boxes, s))
-            {
-                Some(id) => {
-                    let live = lock(state).overlay.clone().and_then(|o| o.live_box(id));
-                    match live {
-                        Some(b) => {
-                            let runpid =
-                                lock(state).box_runpids.get(&id).copied().unwrap_or(0) as u32;
-                            let r = crate::sud::sweep(&b, id, runpid);
-                            json!({"ok": true, "ingested": r.ingested,
-                                   "errors": r.errors})
-                        }
-                        None => json!({"ok": false,
-                                       "error": "box is not live"}),
-                    }
-                }
-                None => json!({"ok": false, "error": "no slopbox"}),
-            }
+            let result = msg.get("sid").and_then(Value::as_str)
+                .ok_or_else(|| "sud_ingest: missing box selector".to_string())
+                .and_then(|value| crate::wire::BoundedText::new(value.to_owned())
+                    .map_err(|_| "sud_ingest: box selector exceeds relation bound".to_string()))
+                .map(|r#box| crate::generated_wire::TransportRequest::SudIngest { r#box })
+                .and_then(|request| dispatch_reply_transport(state, request, None, None));
+            legacy_transport_response(result)
         }
         "patch" => {
             let boxes = discover::discover();
@@ -6564,24 +6586,24 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     libc::close(fd);
                 }
             }
-            let amount = msg.get("amount").and_then(Value::as_i64).unwrap_or(0);
-            let name = msg.get("box").and_then(Value::as_str);
-            let bid = match name {
-                Some(n) if !n.is_empty() => {
-                    let boxes = discover::discover();
-                    resolve(&boxes, n)
-                }
-                _ => hint_box_id,
-            };
-            let resp = match bid {
-                Some(id) => {
-                    crate::oaita::budget::grant(&state, id, amount);
-                    let rem = crate::oaita::budget::remaining(&state, id).unwrap_or(0);
-                    format!("{{\"ok\":true,\"remaining\":{rem}}}\n")
-                }
-                None => "{\"ok\":false,\"error\":\"box not resolvable\"}\n".to_string(),
-            };
-            let _ = writer.write_all(resp.as_bytes());
+            let request: Result<crate::generated_wire::TransportRequest, String> = (|| {
+                let amount = msg.get("amount").and_then(Value::as_i64)
+                    .ok_or_else(|| "budget.grant: missing integer amount".to_string())?;
+                let target = match msg.get("box").and_then(Value::as_str) {
+                    Some(name) if !name.is_empty() => {
+                        crate::generated_wire::BoxTarget::Selector {
+                            r#box: crate::wire::BoundedText::new(name.to_owned())
+                                .map_err(|_| "budget.grant: box selector exceeds relation bound".to_string())?,
+                        }
+                    }
+                    _ => crate::generated_wire::BoxTarget::Broker,
+                };
+                Ok(crate::generated_wire::TransportRequest::BudgetGrant { target, amount })
+            })();
+            let response = request.and_then(|request|
+                dispatch_reply_transport(&state, request, hint_box_id, None));
+            let reply = legacy_transport_response(response);
+            let _ = writer.write_all(format!("{reply}\n").as_bytes());
             return;
         }
         // The oaita API proxy lives on the existing box-channel as new
@@ -6617,8 +6639,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 Ok(crate::generated_wire::TransportRequest::BrushProvenance { records })
             })();
             match result {
-                Ok(request) => legacy_transport_response(dispatch_recording_transport(
-                    &state, request, peer_pidfd.take())),
+                Ok(request) => legacy_transport_response(dispatch_reply_transport(
+                    &state, request, hint_box_id, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_done") {
@@ -6644,8 +6666,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 })
             })();
             match result {
-                Ok(request) => legacy_transport_response(dispatch_recording_transport(
-                    &state, request, peer_pidfd.take())),
+                Ok(request) => legacy_transport_response(dispatch_reply_transport(
+                    &state, request, hint_box_id, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("recipe_fixup") {
@@ -6665,8 +6687,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 })
             })();
             match result {
-                Ok(request) => legacy_transport_response(dispatch_recording_transport(
-                    &state, request, peer_pidfd.take())),
+                Ok(request) => legacy_transport_response(dispatch_reply_transport(
+                    &state, request, hint_box_id, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edges") {
@@ -6690,8 +6712,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 Ok(crate::generated_wire::TransportRequest::BuildGraph { edges })
             })();
             match result {
-                Ok(request) => legacy_transport_response(dispatch_recording_transport(
-                    &state, request, peer_pidfd.take())),
+                Ok(request) => legacy_transport_response(dispatch_reply_transport(
+                    &state, request, hint_box_id, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("make_vars") {
@@ -6729,8 +6751,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 Ok(crate::generated_wire::TransportRequest::MakeVariables { rows })
             })();
             match result {
-                Ok(request) => legacy_transport_response(dispatch_recording_transport(
-                    &state, request, peer_pidfd.take())),
+                Ok(request) => legacy_transport_response(dispatch_reply_transport(
+                    &state, request, hint_box_id, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("box_activity") {
@@ -6755,8 +6777,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 Ok(crate::generated_wire::TransportRequest::BoxActivity { items })
             })();
             match result {
-                Ok(request) => legacy_transport_response(dispatch_recording_transport(
-                    &state, request, peer_pidfd.take())),
+                Ok(request) => legacy_transport_response(dispatch_reply_transport(
+                    &state, request, hint_box_id, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edge_state") {
@@ -6789,8 +6811,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 Ok(crate::generated_wire::TransportRequest::BuildEdgeState { transition })
             })();
             match result {
-                Ok(request) => legacy_transport_response(dispatch_recording_transport(
-                    &state, request, peer_pidfd.take())),
+                Ok(request) => legacy_transport_response(dispatch_reply_transport(
+                    &state, request, hint_box_id, peer_pidfd.take())),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else {
@@ -8160,6 +8182,14 @@ mod verb_tests {
         }));
         assert_eq!(error["category"], "invalid_request");
         assert_eq!(error["error"], "bad frame");
+        let swept = legacy_transport_response(Ok(TransportResponse::SudIngested {
+            count: 2,
+            errors: crate::wire::BoundedVec::new(vec![
+                crate::wire::BoundedText::new("stale entry".into()).unwrap(),
+            ]).unwrap(),
+        }));
+        assert_eq!(swept["ingested"], 2);
+        assert_eq!(swept["errors"][0], "stale entry");
     }
 
     #[test]

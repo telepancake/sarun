@@ -910,6 +910,14 @@ belong to the relation.
   replies and makes the eventual binary request path call the same dispatcher.
   The full native aarch64-musl suite passes 311 tests with one existing browser
   e2e test ignored.
+- Extended that dispatcher to every non-stream transport reply: budget grants
+  now consume the generated broker-or-selector `BoxTarget`, and SUD sweep
+  consumes `TransportRequest::SudIngest` and materializes bounded
+  `TransportResponse::SudIngested` errors. The old listener only converts its
+  input and projects the response spelling. Reply-mode transport is therefore
+  ready for direct binary framing; register, subscriptions, PTY, API, and
+  service requests remain connection-mode handoffs rather than ordinary
+  replies.
 
 ## Stop conditions
 
