@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Thu, 16 Jul 2026 21:08:49 +0000
+Subject: [PATCH] Expose embedded vhost-user runner
+
+---
+diff --git a/src/vhost_user.rs b/src/vhost_user.rs
+index e1b5e1e..19fae6c 100644
+--- a/src/vhost_user.rs
++++ b/src/vhost_user.rs
+@@ -14,8 +14,9 @@ use log::*;
+ 
+ use vhost::vhost_user::message::*;
+ use vhost::vhost_user::Backend;
++use vhost::vhost_user::Listener;
+ use vhost_user_backend::bitmap::BitmapMmapRegion;
+-use vhost_user_backend::{VhostUserBackend, VringMutex, VringState, VringT};
++use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringMutex, VringState, VringT};
+ use virtio_bindings::bindings::virtio_config::*;
+ use virtio_bindings::bindings::virtio_ring::{
+     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
+@@ -447,6 +448,41 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
+     }
+ }
+ 
++/// Serve a filesystem on a newly-created vhost-user socket until the client
++/// disconnects.  Embedders provide policy through `FileSystem`; this function
++/// owns only the virtio transport lifecycle.
++pub fn run_vhost_user_fs<F>(
++    fs: F,
++    socket: &str,
++    tag: Option<String>,
++    thread_pool_size: usize,
++) -> io::Result<()>
++where
++    F: FileSystem + SerializableFileSystem + Send + Sync + 'static,
++{
++    let mut listener = Listener::new(socket, true)
++        .map_err(|error| io::Error::other(format!("create vhost-user listener: {error}")))?;
++    let backend = Arc::new(
++        VhostUserFsBackendBuilder::default()
++            .set_thread_pool_size(thread_pool_size)
++            .set_tag(tag)
++            .build(fs)
++            .map_err(|error| io::Error::other(format!("create virtio-fs backend: {error}")))?,
++    );
++    let mut daemon = VhostUserDaemon::new(
++        String::from("sarun-virtiofs"),
++        backend,
++        GuestMemoryAtomic::new(GuestMemoryMmap::new()),
++    )
++    .map_err(|error| io::Error::other(format!("create vhost-user daemon: {error}")))?;
++    daemon
++        .start(&mut listener)
++        .map_err(|error| io::Error::other(format!("start vhost-user daemon: {error}")))?;
++    daemon
++        .wait()
++        .map_err(|error| io::Error::other(format!("wait for vhost-user daemon: {error}")))
++}
++
+ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBackend
+     for VhostUserFsBackend<F>
+ {

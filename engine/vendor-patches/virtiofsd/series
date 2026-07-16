@@ -1,1 +1,2 @@
 0010-Make-native-daemon-dependencies-optional.patch
+0020-Expose-embedded-vhost-user-runner.patch
