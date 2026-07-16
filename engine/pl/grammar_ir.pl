@@ -133,6 +133,7 @@ valid_associativity(right).
 
 valid_codec(text(class(Name)), _) :- atom(Name).
 valid_codec(text(regex(Pattern)), _) :- string(Pattern).
+valid_codec(text(codepoint(Set)), _) :- valid_codepoint_set(Set).
 valid_codec(bytes(uint(Bits, Endian)), _) :-
     integer(Bits),
     Bits > 0,
@@ -144,6 +145,18 @@ valid_codec(primitive(Name, Arguments), Primitives) :-
     list_member(Name, Primitives),
     proper_list(Arguments),
     valid_values(Arguments).
+
+valid_codepoint_set(any).
+valid_codepoint_set(chars(Characters)) :- text(Characters).
+valid_codepoint_set(except(Characters)) :- text(Characters).
+valid_codepoint_set(range(Low, High)) :-
+    integer(Low), integer(High), 0 =< Low, Low =< High, High =< 0x10ffff.
+valid_codepoint_set(union(Sets)) :-
+    proper_list(Sets), Sets = [_|_], valid_codepoint_sets(Sets).
+
+valid_codepoint_sets([]).
+valid_codepoint_sets([Set|Sets]) :-
+    valid_codepoint_set(Set), valid_codepoint_sets(Sets).
 
 valid_constraint(equal(Left, Right), _) :-
     valid_value(Left),
@@ -186,7 +199,7 @@ valid_context_query(ask(Cardinality, Domain, Selector)) :-
     ground(Selector).
 
 valid_metadata([]).
-valid_metadata([Name-Value|Metadata]) :-
+valid_metadata([meta(Name, Value)|Metadata]) :-
     atom(Name),
     ground(Value),
     valid_metadata(Metadata).

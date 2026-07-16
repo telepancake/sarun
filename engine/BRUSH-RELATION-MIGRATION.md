@@ -160,6 +160,11 @@ Do not implement these as Brush-specific engine branches:
 
 ### 1. Prove recursive source parsing in the generic engine
 
+- [x] Execute the first foreign raw UTF-8 grammar through the uniform relation:
+      immutable named recursive rules, sequence/choice/optional/repetition,
+      fields, literals, declarative codepoint sets, exact consumption, generic
+      AST nodes, evidence/highlights, and UTF-8 byte spans. Unsupported IR
+      constructs return an explicit mode diagnostic rather than `no_solution`.
 - [ ] Replace the current flat pre-tokenized sequence limitation with raw-source
       grammar values, recursive rule references, trivia, and byte-span evidence.
 - [ ] Implement a small shell-word slice: plain text, escapes, single/double

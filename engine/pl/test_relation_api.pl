@@ -13,6 +13,8 @@ test_name(independent_ast_relations_compose_in_both_directions).
 test_name(composed_context_dependencies_bind_before_ast_bridge).
 test_name(choice_namespaces_context_dependencies).
 test_name(grammar_terminal_codecs_are_declarative_and_bidirectional).
+test_name(recursive_raw_text_grammar_reports_utf8_byte_evidence).
+test_name(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly).
 test_name(opaque_handle_resolves_install_once_grammar).
 test_name(solution_limit_is_enforced_and_reported).
 test_name(envelope_fails_closed).
@@ -406,6 +408,52 @@ run_test(grammar_terminal_codecs_are_declarative_and_bidirectional) :-
                                  "build {\"context\":\"eA==\",\"tag\":null,\"arguments\":[[\"CC\",\"clang\"]]}")],
                         0)], [], [], [])).
 
+run_test(recursive_raw_text_grammar_reports_utf8_byte_evidence) :-
+    Presentation = presentation([meta(syntax, text),
+                                 meta(description, foreign)]),
+    Grammar = grammar(
+        source(text(utf8)), root,
+        [rule(root,
+              seq([literal("say ", say,
+                           presentation([meta(syntax, keyword)])),
+                   field(body, ref(group))])),
+         rule(group,
+              seq([literal("(", open,
+                           presentation([meta(syntax, delimiter)])),
+                   repeat(0, unbounded,
+                          choice([ref(group),
+                                  terminal(text(codepoint(except("()"))),
+                                           Presentation)])),
+                   literal(")", close,
+                           presentation([meta(syntax, delimiter)]))]))],
+        []),
+    limits(Limits),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("say (λ(a))", exact,
+                                           foreign_text))]),
+                want([ast, status, highlights]), observations([]), Limits),
+        reply([solution([binding(ast, node(root, span(0, 11), _)),
+                         binding(status, complete),
+                         binding(highlights, Highlights)], 0)], [], [], [])),
+    has_highlight(span(5, 7), text, codepoint(955), foreign_text, Highlights).
+
+run_test(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly) :-
+    Grammar = grammar(
+        source(text(utf8)), root,
+        [rule(root,
+              terminal(text(regex("[^ ]+")),
+                       presentation([meta(syntax, word)])))],
+        []),
+    limits(Limits),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("word", exact, foreign_text))]),
+                want([ast]), observations([]), Limits),
+        reply([], [], [], [diagnostic(unsupported_text_grammar)])).
+
 run_test(opaque_handle_resolves_install_once_grammar) :-
     foreign_grammar(Grammar),
     install_grammar(foreign_test, Grammar),
@@ -433,3 +481,8 @@ run_test(envelope_fails_closed) :-
     transform(request(Grammar, given([]), want([]), observations([]),
                       limits(0, 0, 0)),
               reply([], [], [], [diagnostic(invalid_request)])).
+
+has_highlight(Span, Syntax, Semantic, Origin,
+              [highlight(Span, Syntax, Semantic, Origin)|_]).
+has_highlight(Span, Syntax, Semantic, Origin, [_|Highlights]) :-
+    has_highlight(Span, Syntax, Semantic, Origin, Highlights).

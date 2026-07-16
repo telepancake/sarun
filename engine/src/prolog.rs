@@ -2584,6 +2584,85 @@ mod tests {
     }
 
     #[test]
+    fn raw_utf8_grammar_crosses_the_embedded_structured_boundary() {
+        let metadata = rv_compound(
+            "presentation",
+            vec![rv_list(vec![rv_compound(
+                "meta",
+                vec![rv_atom("syntax"), rv_atom("text")],
+            )])],
+        );
+        let terminal = rv_compound(
+            "terminal",
+            vec![
+                rv_compound(
+                    "text",
+                    vec![rv_compound("codepoint", vec![rv_atom("any")])],
+                ),
+                metadata,
+            ],
+        );
+        let grammar = rv_compound(
+            "grammar",
+            vec![
+                rv_compound(
+                    "source",
+                    vec![rv_compound("text", vec![rv_atom("utf8")])],
+                ),
+                rv_atom("root"),
+                rv_list(vec![rv_compound(
+                    "rule",
+                    vec![
+                        rv_atom("root"),
+                        rv_compound(
+                            "repeat",
+                            vec![rv_integer(1), rv_atom("unbounded"), terminal],
+                        ),
+                    ],
+                )]),
+                rv_list(vec![]),
+            ],
+        );
+        let source = rv_compound(
+            "text_source",
+            vec![rv_string("λa"), rv_atom("exact"), rv_atom("rust_test")],
+        );
+        let reply = global()
+            .unwrap()
+            .transform(&RelationRequest {
+                grammar,
+                given: vec![RelationBinding {
+                    name: "source".into(),
+                    value: source,
+                }],
+                wanted: vec!["ast".into(), "status".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert!(reply.diagnostics.is_empty());
+        assert_eq!(reply.solutions.len(), 1);
+        assert_eq!(
+            reply.solutions[0].bindings[0].value,
+            rv_compound(
+                "node",
+                vec![
+                    rv_atom("root"),
+                    rv_compound("span", vec![rv_integer(0), rv_integer(3)]),
+                    rv_compound(
+                        "repeated",
+                        vec![rv_list(vec![
+                            rv_compound("codepoint", vec![rv_integer(955)]),
+                            rv_compound("codepoint", vec![rv_integer(97)]),
+                        ])],
+                    ),
+                ],
+            )
+        );
+        assert_eq!(reply.solutions[0].bindings[1].value, rv_atom("complete"));
+    }
+
+    #[test]
     fn generic_transform_enforces_request_specific_output_bound() {
         let prolog = global().unwrap();
         let error = prolog

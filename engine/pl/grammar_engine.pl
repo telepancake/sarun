@@ -12,6 +12,7 @@
 
 :- use_module(context_relation).
 :- use_module(grammar_codec).
+:- use_module(text_grammar_engine).
 
 /** <module> Grammar-independent relational sequence execution
 
@@ -58,6 +59,9 @@ transform_relation(context_grammar, Given, Wanted, _EnvelopeObservations,
     ),
     Available = [binding(outcome, Outcome)],
     requested_bindings(Wanted, Available, Bindings).
+transform_relation(Grammar, Given, Wanted, Observations, Limits, Reply) :-
+    Grammar = grammar(source(text(utf8)), _, _, _),
+    transform_text_grammar(Grammar, Given, Wanted, Observations, Limits, Reply).
 
 transform_relation(choice_grammar(Alternatives), Given, Wanted, Observations,
                    Limits,

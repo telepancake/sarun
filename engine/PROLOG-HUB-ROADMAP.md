@@ -419,13 +419,21 @@ not change the engine or Rust API. Representative translated fixtures—one
 precedence/conflict/external-token language fragment and one
 length/dispatch/checksum protocol fragment—are required architecture tests.
 
-Current IR checkpoint: `grammar_ir.pl` defines and closes an initial capability
-probe, and independent Tree-sitter-shaped and Wireshark-shaped fixtures
-validate as pure data. Undeclared rule references and undeclared primitive
-callbacks fail closed. Its syntax is now deliberately frozen. First replace
-the leaky operation-specific engine/sarun boundary and prove uniform execution;
-only then revise this probe into the actual grammar language and upgrade the
-fixtures from validation tests to transformation tests.
+Current IR checkpoint: `grammar_ir.pl` defines and closes the shared vocabulary,
+and independent Tree-sitter-shaped and Wireshark-shaped fixtures validate as
+pure data. Undeclared rule references and undeclared primitive callbacks fail
+closed. With the uniform engine/client boundary now proven, the first executable
+raw-text subset has landed in the grammar-independent
+`text_grammar_engine.pl`: named recursive rules, sequence, choice, optional,
+repetition, fields, literals, declarative codepoint sets, exact consumption,
+generic AST/evidence/highlight projections, and UTF-8 byte spans all execute
+through `relation_api:transform/2`. A foreign balanced recursive grammar proves
+that `λ` is matched character-safely while exposed as its exact two-byte span.
+Validated IR constructs outside this initial mode matrix return
+`unsupported_text_grammar` explicitly rather than looking like source with no
+parse. Raw tears, trivia, rendering, state, embedding, constraints, precedence,
+and byte grammars remain required before the portability fixtures become full
+transformation tests.
 
 Immediate extraction order:
 
