@@ -21,6 +21,7 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::ffi::OsStrExt;
+use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::path::PathBuf;
@@ -2123,6 +2124,61 @@ impl SarunFs {
         Ok(())
     }
 
+    fn mknod_node(
+        &self,
+        pid: u32,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        rdev: u32,
+    ) -> Result<FileAttr, Errno> {
+        let (box_id, rel) = self.child_path(parent, name)?;
+        let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
+        if self.ro_denied(box_id, &rel) {
+            return Err(Errno::EROFS);
+        }
+        match mode & libc::S_IFMT {
+            libc::S_IFREG => {
+                let rowid = b.ensure_file_row(&rel, mode, b.writer_for(pid));
+                let path = blob_path(box_id, rowid);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(Errno::from)?;
+                }
+                File::create(path).map_err(Errno::from)?;
+            }
+            libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK => {
+                b.set_special(&rel, mode, rdev as u64, b.writer_for(pid));
+            }
+            _ => return Err(Errno::EINVAL),
+        }
+        self.push_event(box_id, rel.clone(), "mknod");
+        let inode = self.ino_for(&(box_id, rel.clone()));
+        let attr = self.attr_of(&b, inode, &rel).ok_or(Errno::EIO)?;
+        self.inner.inodes.acquire(inode, 1);
+        Ok(attr)
+    }
+
+    fn fallocate_node(
+        &self,
+        pid: u32,
+        handle: u64,
+        mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), Errno> {
+        let WriteTarget::File { file, box_id, rel } = self.prepare_write_node(pid, handle)? else {
+            return Err(Errno::EINVAL);
+        };
+        let offset = i64::try_from(offset).map_err(|_| Errno::EFBIG)?;
+        let length = i64::try_from(length).map_err(|_| Errno::EFBIG)?;
+        let result = unsafe { libc::fallocate64(file.as_raw_fd(), mode as i32, offset, length) };
+        if result != 0 {
+            return Err(Errno::from(std::io::Error::last_os_error()));
+        }
+        self.finish_file_write(box_id, rel);
+        Ok(())
+    }
+
     fn read_file_node(&self, handle: u64) -> Result<File, Errno> {
         self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
         let handles = self.inner.fhs.read().unwrap();
@@ -2832,35 +2888,9 @@ impl Filesystem for SarunFs {
 
     fn mknod(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
              _umask: u32, rdev: u32, reply: ReplyEntry) {
-        let Some((bid, prel)) = self.key_of(parent) else {
-            return reply.error(Errno::ENOENT);
-        };
-        if bid == 0 { return reply.error(Errno::EPERM); }
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
-        let rel = if prel.is_empty() { name.to_string() }
-                  else { format!("{prel}/{name}") };
-        if self.ro_denied(bid, &rel) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
-        }
-        match mode & libc::S_IFMT {
-            libc::S_IFREG => {
-                // mknod of a regular file = create an empty file.
-                let writer = b.writer_for(req.pid());
-                let rowid = b.ensure_file_row(&rel, mode, writer);
-                let bp = blob_path(bid, rowid);
-                if let Some(p) = bp.parent() { let _ = std::fs::create_dir_all(p); }
-                let _ = File::create(&bp);
-            }
-            libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK =>
-                b.set_special(&rel, mode, rdev as u64, b.writer_for(req.pid())),
-            _ => return reply.error(Errno::EINVAL),
-        }
-        self.push_event(bid, rel.clone(), "mknod");
-        let ino = self.ino_for(&(bid, rel.clone()));
-        match self.attr_of(&b, ino, &rel) {
-            Some(a) => reply.entry(&TTL, &a, Generation(0)),
-            None => reply.error(Errno::EIO),
+        match self.mknod_node(req.pid(), u64::from(parent), name, mode, rdev) {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -2904,32 +2934,12 @@ impl Filesystem for SarunFs {
         }
     }
 
-    fn fallocate(&self, req: &Request, ino: INodeNo, _fh: FileHandle,
-                 offset: u64, length: u64, _mode: i32, reply: ReplyEmpty) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        let f = match self.layer(&b, &rel) {
-            Layer::UpperFile { rowid, .. } => {
-                // Materialize an inline (discard-reverted) row first. See
-                // ensure_upper_blob.
-                self.ensure_upper_blob(bid, rowid, &rel);
-                OpenOptions::new().write(true).open(blob_path(bid, rowid)).ok()
-            }
-            Layer::Lower => self.copy_up(&b, &rel, req.pid()).ok(),
-            _ => None,
-        };
-        let Some(f) = f else { return reply.error(Errno::EIO) };
-        // grow the file to offset+length if needed (the common posix_fallocate
-        // preallocate path); never shrink.
-        let want = offset + length;
-        if let Ok(md) = f.metadata() {
-            if md.len() < want && f.set_len(want).is_err() {
-                return reply.error(Errno::EIO);
-            }
+    fn fallocate(&self, req: &Request, _ino: INodeNo, fh: FileHandle,
+                 offset: u64, length: u64, mode: i32, reply: ReplyEmpty) {
+        match self.fallocate_node(req.pid(), u64::from(fh), mode as u32, offset, length) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
-        reply.ok();
     }
 
     fn setxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, value: &[u8],
@@ -3246,6 +3256,34 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         })
     }
 
+    fn mknod(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        parent: u64,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        _umask: u32,
+        _extensions: virtiofsd::filesystem::Extensions,
+    ) -> std::io::Result<virtiofsd::filesystem::Entry> {
+        let attr = self
+            .mknod_node(
+                ctx.pid as u32,
+                parent,
+                OsStr::from_bytes(name.to_bytes()),
+                mode,
+                rdev,
+            )
+            .map_err(virtio_error)?;
+        Ok(virtiofsd::filesystem::Entry {
+            inode: u64::from(attr.ino),
+            generation: 0,
+            attr: crate::sarunfs::virtio_attr(attr),
+            attr_timeout: TTL,
+            entry_timeout: TTL,
+        })
+    }
+
     fn symlink(
         &self,
         ctx: virtiofsd::filesystem::Context,
@@ -3380,6 +3418,19 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
                 Ok(written)
             }
         }
+    }
+
+    fn fallocate(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        handle: u64,
+        mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> std::io::Result<()> {
+        self.fallocate_node(ctx.pid as u32, handle, mode, offset, length)
+            .map_err(virtio_error)
     }
 
     fn release(
@@ -3852,6 +3903,46 @@ mod chain_tests {
             created.inode,
             1,
         );
+        let allocated_name = CString::new("allocated").unwrap();
+        let (allocated, allocated_handle, _) =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::create(
+                &fs,
+                ctx,
+                entry.inode,
+                &allocated_name,
+                0o600,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                virtiofsd::filesystem::Extensions::default(),
+            )
+            .unwrap();
+        let allocated_handle = allocated_handle.unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::fallocate(
+            &fs,
+            ctx,
+            allocated.inode,
+            allocated_handle,
+            0,
+            0,
+            4096,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::release(
+            &fs,
+            ctx,
+            allocated.inode,
+            0,
+            allocated_handle,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let Layer::UpperFile { owner, rowid, .. } = fs.resolve(id, "allocated") else {
+            panic!("fallocate target missing");
+        };
+        assert_eq!(blob_path(owner, rowid).metadata().unwrap().len(), 4096);
         let directory_name = CString::new("directory").unwrap();
         let directory = <SarunFs as virtiofsd::filesystem::FileSystem>::mkdir(
             &fs,
@@ -3864,6 +3955,19 @@ mod chain_tests {
         )
         .unwrap();
         assert_eq!(directory.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+        let fifo_name = CString::new("fifo").unwrap();
+        let fifo = <SarunFs as virtiofsd::filesystem::FileSystem>::mknod(
+            &fs,
+            ctx,
+            entry.inode,
+            &fifo_name,
+            libc::S_IFIFO | 0o600,
+            0,
+            0,
+            virtiofsd::filesystem::Extensions::default(),
+        )
+        .unwrap();
+        assert_eq!(fifo.attr.mode & libc::S_IFMT, libc::S_IFIFO);
         let link_name = CString::new("link").unwrap();
         let link_target = CString::new("created").unwrap();
         let link = <SarunFs as virtiofsd::filesystem::FileSystem>::symlink(
@@ -3900,6 +4004,10 @@ mod chain_tests {
         assert_eq!(renamed.inode, created.inode);
         <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
             &fs, ctx, entry.inode, &link_name,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
+            &fs, ctx, entry.inode, &fifo_name,
         )
         .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
