@@ -1202,6 +1202,98 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
     m
 }
 
+/// Project finite argument domains from the builtin parser definitions into
+/// grammar data. This is the sole Brush-builtin/grammar adapter: it is driven
+/// entirely by each registration's declarative Clap definition and contains no
+/// command-name cases. The parser, editor, and interactive UI only see the
+/// resulting typed relation values.
+pub(crate) fn builtin_command_signatures(
+) -> &'static [crate::prolog::DocumentCommandSignature] {
+    static SIGNATURES: std::sync::OnceLock<Vec<crate::prolog::DocumentCommandSignature>> =
+        std::sync::OnceLock::new();
+    SIGNATURES.get_or_init(|| {
+        let mut registrations = box_builtins::<
+            brush_core::extensions::DefaultShellExtensions,
+        >()
+        .into_iter()
+        .collect::<Vec<_>>();
+        registrations.sort_by(|left, right| left.0.cmp(&right.0));
+
+        registrations
+            .into_iter()
+            .filter_map(|(command_name, registration)| {
+                let definition = registration.definition_func?;
+                let command = definition();
+                let following_arguments = command
+                    .get_arguments()
+                    .filter(|argument| {
+                        !argument.is_hide_set() && argument.get_action().takes_values()
+                    })
+                    .flat_map(|argument| {
+                        let values = argument
+                            .get_value_parser()
+                            .possible_values()
+                            .into_iter()
+                            .flatten()
+                            .filter(|value| !value.is_hide_set())
+                            .map(|value| {
+                                let text = value.get_name().to_string();
+                                let description = value
+                                    .get_help()
+                                    .or_else(|| argument.get_help())
+                                    .map_or_else(
+                                        || format!("value for {}", argument.get_id()),
+                                        ToString::to_string,
+                                    );
+                                crate::prolog::CommandArgumentValue {
+                                    semantic: crate::prolog::RelationValue::Compound(
+                                        "builtin_argument".into(),
+                                        vec![
+                                            crate::prolog::RelationValue::String(
+                                                command_name.clone(),
+                                            ),
+                                            crate::prolog::RelationValue::String(
+                                                argument.get_id().to_string(),
+                                            ),
+                                            crate::prolog::RelationValue::String(text.clone()),
+                                        ],
+                                    ),
+                                    text,
+                                    description: crate::prolog::RelationValue::String(description),
+                                    preference: 30,
+                                }
+                            })
+                            .collect::<Vec<_>>();
+
+                        let mut flags = Vec::new();
+                        if let Some(short) = argument.get_short() {
+                            flags.push(format!("-{short}"));
+                        }
+                        if let Some(long) = argument.get_long() {
+                            flags.push(format!("--{long}"));
+                        }
+                        flags.into_iter().filter_map(move |flag| {
+                            (!values.is_empty()).then(|| {
+                                crate::prolog::CommandFollowingArgument {
+                                    flag,
+                                    values: values.clone(),
+                                    syntax: "builtin_argument".into(),
+                                }
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (!following_arguments.is_empty()).then_some(
+                    crate::prolog::DocumentCommandSignature {
+                        command: command_name,
+                        following_arguments,
+                    },
+                )
+            })
+            .collect()
+    })
+}
+
 /// Build a box brush shell. `sh_mode=true` → POSIX; `false` → BASH mode.
 /// `shell_name`/`positional`/`cwd` are $0/$1../$PWD; `None` → brush-core defaults.
 async fn build_box_shell(
@@ -2964,6 +3056,36 @@ mod builtin_boundary_tests {
     fn edit_builtin_is_in_the_single_shared_builtin_catalog() {
         let builtins = super::box_builtins::<brush_core::extensions::DefaultShellExtensions>();
         assert!(builtins.contains_key("edit"));
+    }
+
+    #[test]
+    fn builtin_command_signatures_are_derived_from_canonical_parser_values() {
+        let bind = super::builtin_command_signatures()
+            .iter()
+            .find(|signature| signature.command == "bind")
+            .expect("bind's finite argument definition was not projected");
+        let keymap = bind
+            .following_arguments
+            .iter()
+            .find(|argument| argument.flag == "-m")
+            .expect("bind -m definition was not projected");
+        assert_eq!(
+            keymap
+                .values
+                .iter()
+                .map(|value| value.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "emacs-standard",
+                "emacs-meta",
+                "emacs-ctlx",
+                "vi-command",
+                "vi-insert",
+            ]
+        );
+        assert!(keymap.values.iter().all(|value| {
+            !matches!(value.text.as_str(), "emacs" | "vi" | "vi-move")
+        }));
     }
 
     #[tokio::test]

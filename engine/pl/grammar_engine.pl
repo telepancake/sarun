@@ -87,11 +87,12 @@ transform_relation(symbolic_text_grammar, Given, Wanted, _Observations,
     project_completions(Pairs, Completions),
     Available = [binding(completions, Completions)],
     requested_bindings(Wanted, Available, Bindings).
-transform_relation(symbolic_text_grammar(Signatures), Given, Wanted,
+transform_relation(symbolic_text_grammar(SignatureSource), Given, Wanted,
                    _Observations, _Limits,
                    reply([solution(Bindings, 0)], [], [], [])) :-
     symbolic_constraints(Given, Constraints),
     given_value(final_state, Given, State),
+    symbolic_signatures(SignatureSource, Given, Signatures),
     state_constraint_completion_pairs(Constraints, State, Signatures, Pairs),
     project_completions(Pairs, Completions),
     Available = [binding(completions, Completions)],
@@ -267,6 +268,19 @@ symbolic_constraints(Given, Constraints) :-
 symbolic_constraints(Given, Constraints) :-
     given_value(steps, Given, Steps),
     state_step_constraints(Steps, Constraints).
+
+% A grammar may declare immutable signatures directly, or name a request
+% binding that contributes signatures to its built-in defaults.  This keeps
+% application command catalogs as ordinary relation data: the generic engine
+% neither knows command names nor calls application code.
+symbolic_signatures(given(Name, Defaults), Given, Signatures) :-
+    atom(Name), proper_list(Defaults),
+    ( given_value(Name, Given, Supplied)
+    -> proper_list(Supplied), append(Defaults, Supplied, Signatures)
+    ;  Signatures = Defaults
+    ).
+symbolic_signatures(Signatures, _, Signatures) :-
+    proper_list(Signatures).
 
 initial_local_state(Given, Initial) :-
     given_value(initial_state, Given, Initial), !.

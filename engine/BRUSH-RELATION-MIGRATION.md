@@ -291,11 +291,17 @@ Do not implement these as Brush-specific engine branches:
       branch in Rust or in the generic engine.
 - [ ] Add explicit providers for aliases, functions, builtins, PATH commands,
       filesystem names, environment, and programmable completion specs.
-- [ ] Compose builtin argument grammars after command resolution; start with a
-      small representative set containing options, enums, paths, repetitions,
-      and mutually dependent arguments. The enum-after-flag shape is now
-      executable through `find -type`; options, paths, repetitions, and
-      mutually dependent arguments remain.
+- [x] Compose the first real builtin argument grammar from the same declarative
+      definition that parses execution arguments. Every `Command` registration
+      exposes its Clap command value; one generic sarun adapter projects finite
+      value domains into typed signature data. `bind -m |` therefore offers the
+      five canonical `BindKeyMap` spellings through an ordinary unquoted tear
+      in both document analysis and the editor. No command name is switched on,
+      boolean switches are not mistaken for value-taking arguments, and Clap
+      aliases are not introduced as extra semantic names.
+- [ ] Extend composed builtin grammars beyond enum-after-flag to positional
+      values, paths, repetitions, mutually dependent arguments, and explicit
+      context domains while retaining the same definition and relation path.
 - [ ] Compose sarun's action and object domains in shell argument positions.
 - [ ] Prove dependency-key stability and selective invalidation when cwd,
       PATH, variables, builtins, or sarun snapshots change.

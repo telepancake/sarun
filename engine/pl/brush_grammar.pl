@@ -23,7 +23,7 @@ brush_relation_grammar(Grammar) :-
     StateGrammar = completion_union_grammar(StateGrammar0,
                                             state_completions),
     SemanticGrammar = projection_grammar(
-        symbolic_text_grammar(Signatures),
+        symbolic_text_grammar(given(command_signatures, Signatures)),
         [projection(semantic_completions, reference(completions))]),
     EnrichedGrammar = enrichment_grammar(
         StateGrammar, [steps, final_state], SemanticGrammar,
@@ -55,7 +55,7 @@ brush_state_rules([
     brush_text_projection_rules(TextRules).
 
 brush_text_projection_rules([
-    text_rule(node(unquoted_text), source),
+    text_rule(node(unquoted_text), children_else_source),
     text_rule(node(double_quoted_part), children_else_source),
     text_rule(node(simple_parameter),
               reference(shell_variable, field_text(name)))
@@ -174,7 +174,8 @@ brush_syntax_grammar(
          rule(unquoted_text,
               terminal(text(codepoint(except(" \t\r\n\\'\"$|&;()<>"))),
                        presentation([meta(syntax, word),
-                                     meta(description, shell_word)]))),
+                                     meta(description, shell_word),
+                                     meta(tear, symbolic)]))),
          rule(escape,
               seq([literal("\\", escape,
                            presentation([meta(syntax, escape)])),

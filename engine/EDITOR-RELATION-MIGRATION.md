@@ -106,6 +106,10 @@ replacement spans, cursor tears, and diagnostics.
 - [x] Render relation-derived completions in an edtui popup and apply their
       exact replacement spans. The defining backward `find -type` completion
       now passes through the real editor buffer on static aarch64.
+- [x] Feed finite builtin-argument grammar data from the builtin's actual Clap
+      definition into the same analysis request. `bind -m |` completes and
+      inserts canonical keymap values without editor, engine, or builtin-name
+      branches; the editor remains a consumer of ordinary completion evidence.
 - [x] Relate an identifier tear in a state `use` step to names visible at that
       exact lexical point. Local names unify immediately; the same step emits
       an explicit `all(Domain, prefix(Text))` provider query and can union its

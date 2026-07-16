@@ -16,6 +16,7 @@ test_name(missing_unique_parameter_observation_fails_semantic_solution).
 test_name(assignment_tear_survives_as_later_local_value).
 test_name(later_find_type_use_constrains_assignment_tear).
 test_name(local_variable_name_completion_comes_from_ordinary_use_step).
+test_name(command_signature_binding_composes_builtin_argument_grammar).
 
 run_brush_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -282,6 +283,45 @@ run_test(local_variable_name_completion_comes_from_ordinary_use_step) :-
                           binding(completions, Completions),
                           binding(delta, _)], _), Solutions),
     has_completion("A", local(shell_variable, "A"), Completions).
+
+run_test(command_signature_binding_composes_builtin_argument_grammar) :-
+    brush_relation_grammar(Grammar),
+    BindSignature =
+        signature("bind",
+                  [following(
+                       "-m",
+                       one_of([
+                           value("emacs-standard", "emacs-standard",
+                                 builtin_argument_value, 30),
+                           value("emacs-meta", "emacs-meta",
+                                 builtin_argument_value, 30),
+                           value("emacs-ctlx", "emacs-ctlx",
+                                 builtin_argument_value, 30),
+                           value("vi-command", "vi-command",
+                                 builtin_argument_value, 30),
+                           value("vi-insert", "vi-insert",
+                                 builtin_argument_value, 30)
+                       ]),
+                       presentation(builtin_argument))]),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("bind -m ",
+                                           assist(edit, span(8, 8)),
+                                           brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], [])),
+                       binding(command_signatures, [BindSignature])]),
+                want([status, completions]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply(Solutions, [], [], [])),
+    list_member(solution([binding(status, incomplete(edit(edit))),
+                          binding(completions, Completions)], _), Solutions),
+    has_completion("emacs-standard", "emacs-standard", Completions),
+    has_completion("emacs-meta", "emacs-meta", Completions),
+    has_completion("emacs-ctlx", "emacs-ctlx", Completions),
+    has_completion("vi-command", "vi-command", Completions),
+    has_completion("vi-insert", "vi-insert", Completions).
 
 has_assignment_hole_solution(
     Hole,

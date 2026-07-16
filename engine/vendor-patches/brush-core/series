@@ -17,3 +17,4 @@
 0170-brush-core---dev-fd-N-from-process-substitution-is-a-REAL-fd.patch
 0180-brush-core---dev-fd-N-opens-prefer-the-REAL-fd-over-the-virt.patch
 0190-brush-core--broken-pipe-write-terminates-the-stage--SIGPIPE.patch
+0200-brush-core-expose-builtin-command-definitions.patch

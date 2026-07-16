@@ -1261,6 +1261,28 @@ mod tests {
     }
 
     #[test]
+    fn bash_editor_completes_builtin_argument_from_command_definition() {
+        let mut pane = pane_of("script.sh", "bind -m ");
+        pane.state.mode = EditorMode::Insert;
+        pane.state.cursor = Index2::new(0, 8);
+        assert_eq!(
+            pane.handle_key(KeyCode::Tab, KeyModifiers::empty()),
+            KeyResult::Consumed
+        );
+        let selected = pane
+            .completion_items()
+            .iter()
+            .position(|completion| completion.insert == "vi-insert")
+            .expect("builtin command definition did not reach the Brush relation");
+        pane.completions.as_mut().unwrap().selected = selected;
+        assert_eq!(
+            pane.handle_key(KeyCode::Enter, KeyModifiers::empty()),
+            KeyResult::Consumed
+        );
+        assert_eq!(text_of(&pane.state), "bind -m vi-insert");
+    }
+
+    #[test]
     fn bash_editor_never_falls_back_when_relation_bound_is_exceeded() {
         let source = "x".repeat(crate::prolog::MAX_DOCUMENT_INPUT_BYTES + 1);
         let pane = pane_of("large.sh", &source);

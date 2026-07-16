@@ -460,6 +460,16 @@ context observations: successful unique observations bind external values,
 failed unique observations fail the semantic solution, and consumed outcomes
 become stable dependency keys for selective invalidation.
 
+Application grammars can now name a typed request binding as an immutable
+signature-data contribution. The generic symbolic relation resolves that
+binding without knowing any command identity. Brush uses this seam to project
+finite value-taking arguments from the exact Clap definitions used to execute
+builtins. The first concrete client is `bind -m`: its five canonical keymap
+values pass through ordinary source parsing, scoped constraints, and completion
+evidence in both the production document API and editor. This is grammar data
+composition, not a `bind` parser or completion case; interactive Reedline still
+requires its singular-authority cutover below.
+
 The next externally usable checkpoint is explicitly the complete interactive
 `sarun brush` editing experience: relation-owned highlighting, completion,
 validation, indentation, diagnostics, hints, and context dependencies through

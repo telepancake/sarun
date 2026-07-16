@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Thu, 16 Jul 2026 12:00:00 +0000
+Subject: [PATCH] brush-core: expose builtin command definitions
+
+Let embedders project argument grammar, help, and finite value domains from
+the exact Clap command definition used to parse each builtin. Simple builtins
+without a declarative Command implementation explicitly expose no definition.
+
+---
+diff --git a/src/builtins.rs b/src/builtins.rs
+index 66692b9..e37873a 100644
+--- a/src/builtins.rs
++++ b/src/builtins.rs
+@@ -29,6 +29,10 @@ pub type CommandExecuteFunc<SE: extensions::ShellExtensions> =
+ pub type CommandContentFunc =
+     fn(&str, ContentType, &ContentOptions) -> Result<String, error::Error>;
+ 
++/// Type of a function exposing the same declarative command definition that
++/// is used to parse a builtin's arguments.
++pub type CommandDefinitionFunc = fn() -> clap::Command;
++
+ /// Trait implemented by built-in shell commands.
+ pub trait Command: clap::Parser {
+     /// The error type returned by the command.
+@@ -156,6 +160,10 @@ pub struct Registration<SE: extensions::ShellExtensions> {
+     /// Function to retrieve the builtin's content/help text.
+     pub content_func: CommandContentFunc,
+ 
++    /// Declarative argument definition used by the builtin parser, when the
++    /// builtin is implemented through [`Command`].
++    pub definition_func: Option<CommandDefinitionFunc>,
++
+     /// Has this registration been disabled?
+     pub disabled: bool,
+ 
+@@ -379,6 +387,7 @@ pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExten
+     Registration {
+         execute_func: exec_simple_builtin::<B, SE>,
+         content_func: B::get_content,
++        definition_func: None,
+         disabled: false,
+         special_builtin: false,
+         declaration_builtin: false,
+@@ -391,6 +400,7 @@ pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> R
+     Registration {
+         execute_func: exec_builtin::<B, SE>,
+         content_func: get_builtin_content::<B>,
++        definition_func: Some(command_definition::<B>),
+         disabled: false,
+         special_builtin: false,
+         declaration_builtin: false,
+@@ -405,6 +415,7 @@ pub fn decl_builtin<B: DeclarationCommand + Send + Sync, SE: extensions::ShellEx
+     Registration {
+         execute_func: exec_declaration_builtin::<B, SE>,
+         content_func: get_builtin_content::<B>,
++        definition_func: Some(command_definition::<B>),
+         disabled: false,
+         special_builtin: false,
+         declaration_builtin: true,
+@@ -425,12 +436,17 @@ pub fn raw_arg_builtin<
+     Registration {
+         execute_func: exec_raw_arg_builtin::<B, SE>,
+         content_func: get_builtin_content::<B>,
++        definition_func: Some(command_definition::<B>),
+         disabled: false,
+         special_builtin: false,
+         declaration_builtin: true,
+     }
+ }
+ 
++fn command_definition<T: Command>() -> clap::Command {
++    T::command()
++}
++
+ fn get_builtin_content<T: Command + Send + Sync>(
+     name: &str,
+     content_type: ContentType,
