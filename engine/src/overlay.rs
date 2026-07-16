@@ -1848,6 +1848,110 @@ impl SarunFs {
         })
     }
 
+    fn create_node(
+        &self,
+        pid: u32,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+    ) -> Result<(FileAttr, OpenedNode), Errno> {
+        let (bid, parent_rel) = self.key_of(INodeNo(parent)).ok_or(Errno::ENOENT)?;
+        if bid == 0 {
+            return Err(Errno::EPERM);
+        }
+        let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
+        let name = name.to_str().ok_or(Errno::EINVAL)?;
+        let rel = if parent_rel.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{parent_rel}/{name}")
+        };
+        if self.ro_denied(bid, &rel) {
+            return Err(Errno::EROFS);
+        }
+        let (attr, handle) = if b.direct() || self.is_passthrough(&rel, bid, pid) {
+            let host = self.host(&rel);
+            if let Some(parent) = host.parent() {
+                std::fs::create_dir_all(parent).map_err(Errno::from)?;
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&host)
+                .map_err(Errno::from)?;
+            let inode = self.ino_for(&(bid, rel.clone()));
+            let mut attr = file
+                .metadata()
+                .ok()
+                .map(|metadata| self.attr_from_md(inode, &metadata))
+                .unwrap_or_else(|| self.synth_file_attr(inode));
+            attr.kind = FileType::RegularFile;
+            attr.perm = (mode & 0o7777) as u16;
+            let handle = self.reg_fh(FhInner {
+                box_id: bid,
+                rel,
+                file: Some(file),
+                upper: true,
+                dirty: false,
+                last_pid: pid,
+                last_tgid: 0,
+                sink: None,
+                passthrough: true,
+                _backing: None,
+            });
+            (attr, handle)
+        } else {
+            let writer = b.writer_for(pid);
+            let rowid = b.ensure_file_row(&rel, mode | libc::S_IFREG, writer);
+            let path = blob_path(bid, rowid);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(Errno::from)?;
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .map_err(Errno::from)?;
+            let inode = self.ino_for(&(bid, rel.clone()));
+            let mut attr = file
+                .metadata()
+                .ok()
+                .map(|metadata| self.attr_from_md(inode, &metadata))
+                .unwrap_or_else(|| self.synth_file_attr(inode));
+            attr.kind = FileType::RegularFile;
+            attr.perm = (mode & 0o7777) as u16;
+            self.push_event(bid, rel.clone(), "create");
+            let handle = self.reg_fh(FhInner {
+                box_id: bid,
+                rel,
+                file: Some(file),
+                upper: true,
+                dirty: true,
+                last_pid: pid,
+                last_tgid: 0,
+                sink: None,
+                passthrough: false,
+                _backing: None,
+            });
+            (attr, handle)
+        };
+        self.inner.inodes.acquire(u64::from(attr.ino), 1);
+        Ok((
+            attr,
+            OpenedNode {
+                handle,
+                direct_io: false,
+                nonseekable: false,
+                keep_cache: false,
+                backing_candidate: false,
+            },
+        ))
+    }
+
     fn read_file_node(&self, handle: u64) -> Result<File, Errno> {
         self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
         let handles = self.inner.fhs.read().unwrap();
@@ -2269,69 +2373,16 @@ impl Filesystem for SarunFs {
 
     fn create(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
               _umask: u32, _flags: i32, reply: ReplyCreate) {
-        let Some((bid, prel)) = self.key_of(parent) else {
-            return reply.error(Errno::ENOENT);
-        };
-        if bid == 0 {
-            return reply.error(Errno::EPERM);
+        match self.create_node(req.pid(), u64::from(parent), name, mode) {
+            Ok((attr, opened)) => reply.created(
+                &TTL,
+                &attr,
+                Generation(0),
+                FileHandle(opened.handle),
+                FopenFlags::empty(),
+            ),
+            Err(error) => reply.error(error),
         }
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
-        let rel = if prel.is_empty() { name.to_string() }
-                  else { format!("{prel}/{name}") };
-        if self.ro_denied(bid, &rel) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
-        }
-        if b.direct() || self.is_passthrough(&rel, bid, req.pid()) {
-            // passthrough (file rule, or -d whole-box direct): create the file on
-            // the REAL host, uncaptured.
-            let host = self.host(&rel);
-            if let Some(p) = host.parent() {
-                if let Err(e) = std::fs::create_dir_all(p) {
-                    return reply.error(Errno::from(e));
-                }
-            }
-            match OpenOptions::new().read(true).write(true).create(true)
-                .truncate(true).open(&host) {
-                Ok(f) => {
-                    let ino = self.ino_for(&(bid, rel.clone()));
-                    let md = f.metadata().ok();
-                    let mut attr = md.map(|m| self.attr_from_md(ino, &m))
-                        .unwrap_or_else(|| self.synth_file_attr(ino));
-                    attr.kind = FileType::RegularFile;
-                    attr.perm = (mode & 0o7777) as u16;
-                    let n = self.reg_fh(FhInner {
-                        box_id: bid, rel, file: Some(f), upper: true, dirty: false,
-                        last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: true, _backing: None });
-                    return reply.created(&TTL, &attr, Generation(0),
-                                         FileHandle(n), FopenFlags::empty());
-                }
-                Err(e) => return reply.error(Errno::from(e)),
-            }
-        }
-        let writer = b.writer_for(req.pid());
-        let rowid = b.ensure_file_row(&rel, mode | 0o100000, writer);
-        let bp = blob_path(bid, rowid);
-        if let Some(p) = bp.parent() {
-            let _ = std::fs::create_dir_all(p);
-        }
-        let f = match OpenOptions::new().read(true).write(true).create(true)
-            .truncate(true).open(&bp) {
-            Ok(f) => f,
-            Err(_) => return reply.error(Errno::EIO),
-        };
-        let ino = self.ino_for(&(bid, rel.clone()));
-        let md = f.metadata().ok();
-        let mut attr = md.map(|m| self.attr_from_md(ino, &m))
-            .unwrap_or_else(|| self.synth_dir_attr(ino, mode, 0));
-        attr.kind = FileType::RegularFile;
-        attr.perm = (mode & 0o7777) as u16;
-        self.push_event(bid, rel.clone(), "create");
-        let n = self.reg_fh(FhInner {
-            box_id: bid, rel, file: Some(f), upper: true,
-            dirty: true, last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: false, _backing: None });
-        reply.created(&TTL, &attr, Generation(0), FileHandle(n),
-                      FopenFlags::empty());
     }
 
     fn read(&self, req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
@@ -3048,6 +3099,42 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         Ok((Some(opened.handle), options))
     }
 
+    fn create(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        parent: u64,
+        name: &CStr,
+        mode: u32,
+        _kill_priv: bool,
+        _flags: u32,
+        _umask: u32,
+        _extensions: virtiofsd::filesystem::Extensions,
+    ) -> std::io::Result<(
+        virtiofsd::filesystem::Entry,
+        Option<u64>,
+        virtiofsd::filesystem::OpenOptions,
+    )> {
+        let (attr, opened) = self
+            .create_node(
+                ctx.pid as u32,
+                parent,
+                OsStr::from_bytes(name.to_bytes()),
+                mode,
+            )
+            .map_err(virtio_error)?;
+        Ok((
+            virtiofsd::filesystem::Entry {
+                inode: u64::from(attr.ino),
+                generation: 0,
+                attr: crate::sarunfs::virtio_attr(attr),
+                attr_timeout: TTL,
+                entry_timeout: TTL,
+            },
+            Some(opened.handle),
+            virtiofsd::filesystem::OpenOptions::empty(),
+        ))
+    }
+
     fn read<W: virtiofsd::filesystem::ZeroCopyWriter>(
         &self,
         _ctx: virtiofsd::filesystem::Context,
@@ -3480,6 +3567,59 @@ mod chain_tests {
             panic!("write did not copy up");
         };
         assert_eq!(std::fs::read(blob_path(owner, rowid)).unwrap(), b"changedal bytes");
+
+        let created_name = CString::new("created").unwrap();
+        let (created, created_handle, _) =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::create(
+                &fs,
+                ctx,
+                entry.inode,
+                &created_name,
+                0o640,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                virtiofsd::filesystem::Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(created.attr.mode & 0o7777, 0o640);
+        assert_eq!(fs.inner.inodes.lookup_count(created.inode), 1);
+        let created_handle = created_handle.unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::write(
+            &fs,
+            ctx,
+            created.inode,
+            created_handle,
+            BytesReader(b"new file"),
+            8,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::release(
+            &fs,
+            ctx,
+            created.inode,
+            0,
+            created_handle,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let Layer::UpperFile { owner, rowid, .. } = fs.resolve(id, "created") else {
+            panic!("create did not materialize upper file");
+        };
+        assert_eq!(std::fs::read(blob_path(owner, rowid)).unwrap(), b"new file");
+        <SarunFs as virtiofsd::filesystem::FileSystem>::forget(
+            &fs,
+            ctx,
+            created.inode,
+            1,
+        );
 
         let (attr, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
             &fs,
