@@ -109,8 +109,11 @@ replacement spans, cursor tears, and diagnostics.
 - [ ] Render hints, diagnostics, and incomplete status in the existing editor
       chrome/widget once those generic projections exist; do not reinterpret
       shell grammar in the editor.
-- [ ] Debounce and generation-tag whole-buffer analysis; discard stale results.
-      Use the dedicated Prolog worker rather than blocking every render frame.
+- [x] Debounce and generation-tag whole-buffer highlight analysis; discard
+      stale revision/hash results. Relation work runs off the render thread and
+      reaches the existing dedicated Prolog worker. Explicit Tab completion is
+      still a foreground request; provider observation rounds will need the
+      same asynchronous scheduler.
 - [x] Keep tree-sitter only for non-shell languages until each has a relation
       grammar/import path. Structural-locator uses are independently scoped.
 

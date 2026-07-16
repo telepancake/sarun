@@ -21,7 +21,7 @@
 
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::prolog::{BrushDocumentRequest, Completion, Span, analyze_brush_document};
@@ -233,6 +233,13 @@ fn brush_analysis(
 
 fn brush_file_highlights(code: &str) -> Result<FileHighlights, String> {
     let analysis = brush_analysis(code, None)?;
+    Ok(brush_analysis_highlights(code, &analysis))
+}
+
+fn brush_analysis_highlights(
+    code: &str,
+    analysis: &crate::prolog::BrushDocumentAnalysis,
+) -> FileHighlights {
     let mut highlights = analysis
         .candidates
         .iter()
@@ -255,7 +262,7 @@ fn brush_file_highlights(code: &str) -> Result<FileHighlights, String> {
             ))
     });
     highlights.dedup();
-    Ok(relation_highlights(code, &highlights))
+    relation_highlights(code, &highlights)
 }
 
 /// Push the highlights for a cursor-anchored row window into the editor
@@ -345,6 +352,12 @@ struct CompletionMenu {
     selected: usize,
 }
 
+struct HighlightAnalysisResult {
+    revision: u64,
+    buffer_hash: u64,
+    result: Result<FileHighlights, String>,
+}
+
 /// The editor pane: one open buffer with its edtui state, the precomputed
 /// highlight cache, dirty tracking (buffer hash vs last-saved hash) and the
 /// debounced re-highlight clock. The SAME `render` draws the right-pane and
@@ -356,6 +369,10 @@ pub struct EditorPane {
     provider: AnalysisProvider,
     fh: Option<FileHighlights>,
     completions: Option<CompletionMenu>,
+    analysis_tx: mpsc::Sender<HighlightAnalysisResult>,
+    analysis_rx: mpsc::Receiver<HighlightAnalysisResult>,
+    revision: u64,
+    analysis_pending: Option<u64>,
     /// Hash of the last-saved text; `dirty` == current hash differs.
     saved_hash: u64,
     /// Hash of the buffer after the last handled key — edit detection
@@ -402,6 +419,7 @@ impl EditorPane {
         };
         let state = EditorState::new(Lines::from(text.as_str()));
         let h = hash_of(&text);
+        let (analysis_tx, analysis_rx) = mpsc::channel();
         let status = analysis_error.map_or_else(
             || "vim keys · Ctrl-S save · Ctrl-O open · Ctrl-E lock · z zoom · Esc back".into(),
             |error| format!("brush relation: {error}"),
@@ -413,6 +431,10 @@ impl EditorPane {
             provider,
             fh,
             completions: None,
+            analysis_tx,
+            analysis_rx,
+            revision: 0,
+            analysis_pending: None,
             saved_hash: h,
             buf_hash: h,
             dirty: false,
@@ -461,9 +483,11 @@ impl EditorPane {
         self.status = format!("saved {}", self.target.label());
     }
 
-    /// Recompute highlights if the debounce deadline has passed. Called
-    /// every frame with `Instant::now()`; tests drive the clock explicitly.
+    /// Apply completed analysis and request new highlights once the debounce
+    /// deadline passes. Brush work runs away from the render thread and is
+    /// accepted only when its revision and buffer hash still match.
     pub fn maybe_rehighlight(&mut self, now: Instant) {
+        self.accept_highlight_analysis();
         if let Some(due) = self.rehl_due {
             if now >= due {
                 self.rehl_due = None;
@@ -473,13 +497,47 @@ impl EditorPane {
                     AnalysisProvider::Syntastica(lang) => {
                         self.fh = Some(compute(&text, lang));
                     }
-                    AnalysisProvider::Brush => match brush_file_highlights(&text) {
-                        Ok(highlights) => self.fh = Some(highlights),
-                        Err(error) => {
-                            self.fh = Some(FileHighlights { per_line: vec![] });
-                            self.status = format!("brush relation: {error}");
-                        }
-                    },
+                    AnalysisProvider::Brush => self.request_brush_highlights(text),
+                }
+            }
+        }
+    }
+
+    fn request_brush_highlights(&mut self, text: String) {
+        let revision = self.revision;
+        let buffer_hash = self.buf_hash;
+        let tx = self.analysis_tx.clone();
+        self.analysis_pending = Some(revision);
+        let spawn = std::thread::Builder::new()
+            .name("sarun-editor-analysis".into())
+            .spawn(move || {
+                let result = brush_file_highlights(&text);
+                let _ = tx.send(HighlightAnalysisResult {
+                    revision,
+                    buffer_hash,
+                    result,
+                });
+            });
+        if let Err(error) = spawn {
+            self.analysis_pending = None;
+            self.status = format!("brush relation worker: {error}");
+        }
+    }
+
+    fn accept_highlight_analysis(&mut self) {
+        while let Ok(completed) = self.analysis_rx.try_recv() {
+            if completed.revision != self.revision || completed.buffer_hash != self.buf_hash {
+                continue;
+            }
+            self.analysis_pending = None;
+            match completed.result {
+                Ok(highlights) => {
+                    self.fh = Some(highlights);
+                    self.status = "Brush relation analysis current".into();
+                }
+                Err(error) => {
+                    self.fh = Some(FileHighlights { per_line: vec![] });
+                    self.status = format!("brush relation: {error}");
                 }
             }
         }
@@ -488,7 +546,7 @@ impl EditorPane {
     /// True while an edit is waiting out the debounce quiet period.
     #[allow(dead_code)]
     pub fn rehighlight_pending(&self) -> bool {
-        self.rehl_due.is_some()
+        self.rehl_due.is_some() || self.analysis_pending.is_some()
     }
 
     fn cursor_byte_offset(&self) -> usize {
@@ -524,6 +582,7 @@ impl EditorPane {
                 return;
             }
         };
+        self.fh = Some(brush_analysis_highlights(&text, &analysis));
         let mut items = analysis
             .candidates
             .iter()
@@ -710,6 +769,7 @@ impl EditorPane {
         let h = hash_of(&text_of(&self.state));
         if h != self.buf_hash {
             self.buf_hash = h;
+            self.revision = self.revision.wrapping_add(1);
             self.dirty = h != self.saved_hash;
             if self.provider != AnalysisProvider::Plain {
                 self.rehl_due = Some(Instant::now() + REHL_DEBOUNCE);
@@ -1020,6 +1080,38 @@ mod tests {
         pane.handle_key(KeyCode::Enter, KeyModifiers::empty());
         assert_eq!(text_of(&pane.state), text);
         assert!(pane.status.contains("refused"));
+    }
+
+    #[test]
+    fn editor_discards_stale_background_relation_analysis() {
+        let mut pane = pane_of("revision.sh", "echo old");
+        pane.revision = 2;
+        pane.analysis_pending = Some(2);
+        pane.analysis_tx
+            .send(HighlightAnalysisResult {
+                revision: 1,
+                buffer_hash: pane.buf_hash,
+                result: Ok(FileHighlights {
+                    per_line: vec![vec![]; 99],
+                }),
+            })
+            .unwrap();
+        pane.accept_highlight_analysis();
+        assert_ne!(pane.fh.as_ref().unwrap().per_line.len(), 99);
+        assert_eq!(pane.analysis_pending, Some(2));
+
+        pane.analysis_tx
+            .send(HighlightAnalysisResult {
+                revision: 2,
+                buffer_hash: pane.buf_hash,
+                result: Ok(FileHighlights {
+                    per_line: vec![vec![]; 7],
+                }),
+            })
+            .unwrap();
+        pane.accept_highlight_analysis();
+        assert_eq!(pane.fh.as_ref().unwrap().per_line.len(), 7);
+        assert_eq!(pane.analysis_pending, None);
     }
 
     /// The windowing pin: a large rust buffer computes spans for EVERY
