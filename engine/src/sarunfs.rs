@@ -7,6 +7,7 @@
 pub use crate::overlay::SarunFs;
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::sync::RwLock;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -161,11 +162,55 @@ pub(crate) fn virtio_attr(attr: fuser::FileAttr) -> virtiofsd::fuse::Attr {
 }
 
 #[doc(hidden)]
-pub struct EmptyDirIter;
+pub struct DirIter {
+    entries: Vec<OwnedDirEntry>,
+    next: usize,
+}
 
-impl virtiofsd::filesystem::DirectoryIterator for EmptyDirIter {
+struct OwnedDirEntry {
+    inode: u64,
+    offset: u64,
+    kind: u32,
+    name: CString,
+}
+
+impl DirIter {
+    pub(crate) fn new(entries: Vec<(u64, u64, fuser::FileType, String)>) -> Self {
+        let entries = entries
+            .into_iter()
+            .filter_map(|(inode, offset, kind, name)| {
+                let kind = match kind {
+                    fuser::FileType::NamedPipe => libc::DT_FIFO,
+                    fuser::FileType::CharDevice => libc::DT_CHR,
+                    fuser::FileType::BlockDevice => libc::DT_BLK,
+                    fuser::FileType::Directory => libc::DT_DIR,
+                    fuser::FileType::RegularFile => libc::DT_REG,
+                    fuser::FileType::Symlink => libc::DT_LNK,
+                    fuser::FileType::Socket => libc::DT_SOCK,
+                };
+                Some(OwnedDirEntry {
+                    inode,
+                    offset,
+                    kind: u32::from(kind),
+                    name: CString::new(name).ok()?,
+                })
+            })
+            .collect();
+        Self { entries, next: 0 }
+    }
+}
+
+impl virtiofsd::filesystem::DirectoryIterator for DirIter {
     fn next(&mut self) -> Option<virtiofsd::filesystem::DirEntry<'_>> {
-        None
+        let index = self.next;
+        self.next = self.next.saturating_add(1);
+        let entry = self.entries.get(index)?;
+        Some(virtiofsd::filesystem::DirEntry {
+            ino: entry.inode,
+            offset: entry.offset,
+            type_: entry.kind,
+            name: &entry.name,
+        })
     }
 }
 

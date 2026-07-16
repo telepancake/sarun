@@ -144,6 +144,7 @@ struct Inner {
     boxes: RwLock<BTreeMap<i64, Arc<BoxState>>>,
     inodes: crate::sarunfs::InodeTable,
     fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
+    dir_fhs: RwLock<HashMap<u64, Arc<Vec<DirNode>>>>,
     next_fh: AtomicU64,
     // Live ExtAttachment objects per owning box (RoAttachment::Ext rows,
     // in list order). Constructed lazily and WITHOUT I/O (attach.rs
@@ -233,6 +234,13 @@ struct FhInner {
     // Kernel passthrough backing registration; kept alive as long as the fd
     // (its Drop closes the registration). Only set for readonly-ruled reads.
     _backing: Option<fuser::BackingId>,
+}
+
+#[derive(Clone)]
+struct DirNode {
+    inode: u64,
+    kind: FileType,
+    name: String,
 }
 
 /// Bridges a deferred FUSE read reply into the slip pool. The pool calls exactly
@@ -536,6 +544,7 @@ impl SarunFs {
             boxes: RwLock::new(BTreeMap::new()),
             inodes: crate::sarunfs::InodeTable::new((0, String::new())),
             fhs: RwLock::new(HashMap::new()),
+            dir_fhs: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             ext: RwLock::new(HashMap::new()),
             cache: std::sync::OnceLock::new(),
@@ -1744,6 +1753,79 @@ impl SarunFs {
         }
         out
     }
+
+    fn directory_snapshot(&self, inode: u64) -> Result<Vec<DirNode>, Errno> {
+        if self.getattr_node(inode)?.kind != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        if bid == 0 {
+            return Ok(self
+                .inner
+                .boxes
+                .read()
+                .unwrap()
+                .keys()
+                .map(|id| DirNode {
+                    inode: self.ino_for(&(*id, String::new())),
+                    kind: FileType::Directory,
+                    name: id.to_string(),
+                })
+                .collect());
+        }
+        if rel == KIDS_DIR {
+            return Ok(self
+                .children_of_box(bid)
+                .into_iter()
+                .map(|id| DirNode {
+                    inode: self.ino_for(&(id, String::new())),
+                    kind: FileType::Directory,
+                    name: id.to_string(),
+                })
+                .collect());
+        }
+        let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
+        Ok(self
+            .scan_dir(&b, &rel, false)
+            .into_iter()
+            .filter(|(name, _, _, _)| {
+                let child_rel = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                };
+                (b.is_api()
+                    && (Self::oaita_config_ancestor_or_self(&child_rel)
+                        || Self::oaita_state_ancestor_self_or_within(&child_rel)))
+                    || !Self::is_engine_path(&child_rel)
+            })
+            .map(|(name, kind, inode, _)| DirNode { inode, kind, name })
+            .collect())
+    }
+
+    fn open_directory(&self, inode: u64) -> Result<u64, Errno> {
+        let snapshot = Arc::new(self.directory_snapshot(inode)?);
+        let handle = self.inner.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.inner.dir_fhs.write().unwrap().insert(handle, snapshot);
+        Ok(handle)
+    }
+
+    fn read_directory(&self, handle: u64, offset: u64) -> Result<Vec<DirNode>, Errno> {
+        let snapshots = self.inner.dir_fhs.read().unwrap();
+        let snapshot = snapshots.get(&handle).ok_or(Errno::EBADF)?;
+        let start = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        Ok(snapshot.iter().skip(start).cloned().collect())
+    }
+
+    fn close_directory(&self, handle: u64) -> Result<(), Errno> {
+        self.inner
+            .dir_fhs
+            .write()
+            .unwrap()
+            .remove(&handle)
+            .map(|_| ())
+            .ok_or(Errno::EBADF)
+    }
 }
 
 impl Filesystem for SarunFs {
@@ -2733,109 +2815,52 @@ impl Filesystem for SarunFs {
         reply.ok();
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        match self.open_directory(u64::from(ino)) {
+            Ok(handle) => reply.opened(FileHandle(handle), FopenFlags::empty()),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn readdir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
                mut reply: ReplyDirectory) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
+        let entries = match self.read_directory(u64::from(fh), offset) {
+            Ok(entries) => entries,
+            Err(error) => return reply.error(error),
         };
-        if bid == 0 {
-            for (i, id) in self.inner.boxes.read().unwrap().keys().enumerate() {
-                if (i as u64) < offset { continue; }
-                let cino = self.ino_for(&(*id, String::new()));
-                if reply.add(INodeNo(cino), (i + 1) as u64, FileType::Directory,
-                             id.to_string()) {
-                    break;
-                }
-            }
-            return reply.ok();
-        }
-        if rel == KIDS_DIR {
-            for (i, cid) in self.children_of_box(bid).into_iter().enumerate() {
-                if (i as u64) < offset { continue; }
-                let cino = self.ino_for(&(cid, String::new()));
-                if reply.add(INodeNo(cino), (i + 1) as u64, FileType::Directory,
-                             cid.to_string()) { break; }
-            }
-            return reply.ok();
-        }
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        // Engine self-hide: omit children that resolve to one of sarun's
-        // own host dirs. --api oaita.toml is exempt (the substituted file
-        // stays visible). Matches lookup's gate, so a ls/readdir agrees
-        // with stat: nothing tells the box that hidden dirs ever existed.
-        let entries: Vec<_> = self.scan_dir(&b, &rel, false).into_iter()
-            .filter(|(name, _, _, _)| {
-                let child_rel = if rel.is_empty() { name.clone() }
-                                else { format!("{rel}/{name}") };
-                if b.is_api()
-                    && (Self::oaita_config_ancestor_or_self(&child_rel)
-                        || Self::oaita_state_ancestor_self_or_within(&child_rel))
-                {
-                    return true;
-                }
-                !Self::is_engine_path(&child_rel)
-            })
-            .collect();
-        for (i, (name, kind, cino, _)) in entries.into_iter().enumerate() {
-            if (i as u64) < offset { continue; }
-            if reply.add(INodeNo(cino), (i + 1) as u64, kind, name) {
+        for (index, entry) in entries.into_iter().enumerate() {
+            let next = offset.saturating_add(index as u64).saturating_add(1);
+            if reply.add(INodeNo(entry.inode), next, entry.kind, entry.name) {
                 break;
             }
         }
         reply.ok();
     }
 
-    fn readdirplus(&self, _req: &Request, ino: INodeNo, _fh: FileHandle,
+    fn readdirplus(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
                    offset: u64, mut reply: ReplyDirectoryPlus) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
+        let entries = match self.read_directory(u64::from(fh), offset) {
+            Ok(entries) => entries,
+            Err(error) => return reply.error(error),
         };
-        if bid == 0 {
-            for (i, id) in self.inner.boxes.read().unwrap().keys().enumerate() {
-                if (i as u64) < offset { continue; }
-                let cino = self.ino_for(&(*id, String::new()));
-                let a = self.synth_dir_attr(cino, 0o40755, 0);
-                if reply.add(INodeNo(cino), (i + 1) as u64, id.to_string(),
-                             &TTL, &a, Generation(0)) {
-                    break;
-                }
-            }
-            return reply.ok();
-        }
-        if rel == KIDS_DIR {
-            for (i, cid) in self.children_of_box(bid).into_iter().enumerate() {
-                if (i as u64) < offset { continue; }
-                let cino = self.ino_for(&(cid, String::new()));
-                let a = self.synth_dir_attr(cino, 0o40755, 0);
-                if reply.add(INodeNo(cino), (i + 1) as u64, cid.to_string(),
-                             &TTL, &a, Generation(0)) { break; }
-            }
-            return reply.ok();
-        }
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        // Engine self-hide (mirrors readdir's filter) — see is_engine_path.
-        let entries: Vec<_> = self.scan_dir(&b, &rel, true).into_iter()
-            .filter(|(name, _, _, _)| {
-                let child_rel = if rel.is_empty() { name.clone() }
-                                else { format!("{rel}/{name}") };
-                if b.is_api()
-                    && (Self::oaita_config_ancestor_or_self(&child_rel)
-                        || Self::oaita_state_ancestor_self_or_within(&child_rel))
-                {
-                    return true;
-                }
-                !Self::is_engine_path(&child_rel)
-            })
-            .collect();
-        for (i, (name, _k, cino, attr)) in entries.into_iter().enumerate() {
-            if (i as u64) < offset { continue; }
-            let Some(a) = attr else { continue };
-            if reply.add(INodeNo(cino), (i + 1) as u64, name, &TTL, &a,
+        for (index, entry) in entries.into_iter().enumerate() {
+            let Ok(attr) = self.getattr_node(entry.inode) else { continue };
+            let next = offset.saturating_add(index as u64).saturating_add(1);
+            if reply.add(INodeNo(entry.inode), next, entry.name, &TTL, &attr,
                          Generation(0)) {
                 break;
             }
+            self.inner.inodes.acquire(entry.inode, 1);
         }
         reply.ok();
+    }
+
+    fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
+                  _flags: OpenFlags, reply: ReplyEmpty) {
+        match self.close_directory(u64::from(fh)) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
     }
 }
 
@@ -2849,7 +2874,7 @@ fn virtio_error(error: Errno) -> std::io::Error {
 impl virtiofsd::filesystem::FileSystem for SarunFs {
     type Inode = u64;
     type Handle = u64;
-    type DirIter = crate::sarunfs::EmptyDirIter;
+    type DirIter = crate::sarunfs::DirIter;
 
     fn lookup(
         &self,
@@ -2889,6 +2914,51 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         inode: u64,
     ) -> std::io::Result<Vec<u8>> {
         self.readlink_node(inode).map_err(virtio_error)
+    }
+
+    fn opendir(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+        _flags: u32,
+    ) -> std::io::Result<(Option<u64>, virtiofsd::filesystem::OpenOptions)> {
+        let handle = self.open_directory(inode).map_err(virtio_error)?;
+        Ok((Some(handle), virtiofsd::filesystem::OpenOptions::empty()))
+    }
+
+    fn readdir(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        handle: u64,
+        _size: u32,
+        offset: u64,
+    ) -> std::io::Result<Self::DirIter> {
+        let entries = self
+            .read_directory(handle, offset)
+            .map_err(virtio_error)?
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                (
+                    entry.inode,
+                    offset.saturating_add(index as u64).saturating_add(1),
+                    entry.kind,
+                    entry.name,
+                )
+            })
+            .collect();
+        Ok(crate::sarunfs::DirIter::new(entries))
+    }
+
+    fn releasedir(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        _flags: u32,
+        handle: u64,
+    ) -> std::io::Result<()> {
+        self.close_directory(handle).map_err(virtio_error)
     }
 }
 
@@ -3001,6 +3071,24 @@ mod chain_tests {
             1,
         );
         assert_eq!(fs.inner.inodes.lookup_count(entry.inode), 0);
+
+        let (handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::opendir(
+            &fs, ctx, 1, 0,
+        )
+        .unwrap();
+        let handle = handle.unwrap();
+        fs.add_box(Arc::new(BoxState::create(id + 1).unwrap()));
+        let mut entries = <SarunFs as virtiofsd::filesystem::FileSystem>::readdir(
+            &fs, ctx, 1, handle, 4096, 0,
+        )
+        .unwrap();
+        let first = virtiofsd::filesystem::DirectoryIterator::next(&mut entries).unwrap();
+        assert_eq!(first.name.to_bytes(), id.to_string().as_bytes());
+        assert!(virtiofsd::filesystem::DirectoryIterator::next(&mut entries).is_none());
+        <SarunFs as virtiofsd::filesystem::FileSystem>::releasedir(
+            &fs, ctx, 1, 0, handle,
+        )
+        .unwrap();
 
         let _ = std::fs::remove_dir_all(tmp);
     }
