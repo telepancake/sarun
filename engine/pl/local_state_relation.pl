@@ -1,11 +1,12 @@
 :- module(local_state_relation,
           [ empty_local_state/1,
+           context_state_completion_pairs/3,
            state_constraint_completion_pairs/3,
            state_constraint_completion_pairs/4,
            state_step_constraints/2,
            valid_local_state/1,
            resolve_state_resolutions/3,
-           run_state_steps/6
+           run_state_steps/7
           ]).
 
 /** <module> Pure scoped state transitions for relational grammars
@@ -25,15 +26,50 @@ valid_local_state(local_state(Scopes, Delta)) :-
     proper_list(Delta),
     valid_delta(Delta).
 
-%! run_state_steps(+Steps, +Initial, -Final, -Resolutions, -Queries, -Delta)
-%  is semidet.
+%! run_state_steps(+Steps, +Initial, -Final, -Resolutions, -Queries, -Delta,
+%!                 -CompletionPairs) is semidet.
+%
+%  Name tears in ordinary `use/3` steps are related to the bindings visible at
+%  that exact point in the state transition.  They also emit an explicit `all`
+%  context query so provider-backed names can be unioned with local matches.
 
-run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta) :-
+run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta,
+                CompletionPairs) :-
     proper_list(Steps),
     valid_local_state(Initial),
-    run_steps(Steps, Initial, Final, Resolutions, Queries),
+    run_steps(Steps, Initial, Final, Resolutions, Queries, CompletionPairs),
     Final = local_state(_, Delta),
     valid_local_state(Final).
+
+%! context_state_completion_pairs(+Queries, +Observations, -Pairs) is det.
+%
+%  Resolve provider observations for the explicit name-completion queries
+%  emitted above.  This is the external half of the same relation; consumers
+%  never scan provider entries or reinterpret a language grammar.
+
+context_state_completion_pairs(Queries, Observations, Pairs) :-
+    findall(Pair,
+            context_state_completion_pair(Queries, Observations, Pair),
+            Pairs).
+
+context_state_completion_pair(Queries, Observations,
+    completion_key(Span, Insert)-
+        (alternative(context(Domain, Identity), variable, Provider)-50)) :-
+    value_member(
+        query(CompletionId, Query), Queries),
+    CompletionId = name_completion(_, Prefix, Hole, Suffix),
+    Query = ask(all, Domain, prefix(QueryPrefix)),
+    value_member(
+        observed(CompletionId, Query, source(Provider, _),
+                 some(all(Entries))),
+        Observations),
+    value_member(entry(Domain, Identity, Names, _, _), Entries),
+    value_member(Name, Names),
+    string(Name),
+    Hole = hole(_, Span, Surface, _),
+    string_concat(Prefix, Surface, QueryPrefix),
+    hole_insertion(Name, Prefix, Suffix, Surface, Insert),
+    Insert \= "".
 
 %! state_constraint_completion_pairs(+Constraints, +State, -Pairs)
 %  is semidet.
@@ -223,46 +259,85 @@ hole_insertion(Text, Prefix, Suffix, Surface, Insert) :-
 value_member(Value, [Value|_]).
 value_member(Value, [_|Values]) :- value_member(Value, Values).
 
-run_steps([], State, State, [], []).
-run_steps([Step|Steps], State0, State, Resolutions, Queries) :-
-    state_step(Step, State0, State1, StepResolutions, StepQueries),
-    run_steps(Steps, State1, State, RestResolutions, RestQueries),
+run_steps([], State, State, [], [], []).
+run_steps([Step|Steps], State0, State, Resolutions, Queries,
+          CompletionPairs) :-
+    state_step(Step, State0, State1, StepResolutions, StepQueries,
+               StepCompletionPairs),
+    run_steps(Steps, State1, State, RestResolutions, RestQueries,
+              RestCompletionPairs),
     append(StepResolutions, RestResolutions, Resolutions),
-    append(StepQueries, RestQueries, Queries).
+    append(StepQueries, RestQueries, Queries),
+    append(StepCompletionPairs, RestCompletionPairs, CompletionPairs).
 
 state_step(enter(ScopeId), local_state(Scopes, Delta),
-           local_state([scope(ScopeId, [])|Scopes], Delta), [], []) :-
+           local_state([scope(ScopeId, [])|Scopes], Delta), [], [], []) :-
     ground(ScopeId).
 state_step(leave(ScopeId),
            local_state([scope(ScopeId, Bindings), Parent|Scopes], Delta0),
-           local_state([MergedParent|Scopes], Delta), [], []) :-
+           local_state([MergedParent|Scopes], Delta), [], [], []) :-
     escaping_bindings(Bindings, Escaping),
     merge_bindings(Escaping, Parent, MergedParent),
     merge_delta(Escaping, Delta0, Delta).
 state_step(define(Domain, Name, Value, Lifetime, Policy),
            local_state([scope(ScopeId, Bindings0)|Scopes], Delta0),
-           local_state([scope(ScopeId, Bindings)|Scopes], Delta), [], []) :-
+           local_state([scope(ScopeId, Bindings)|Scopes], Delta), [], [], []) :-
     valid_binding(local_binding(Domain, Name, Value, Lifetime)),
     valid_policy(Policy),
     define_binding(Policy, local_binding(Domain, Name, Value, Lifetime),
                    Bindings0, Bindings),
     definition_delta(Lifetime, Domain, Name, Value, Delta0, Delta).
-state_step(constraint(Constraint), State, State, [], []) :-
+state_step(constraint(Constraint), State, State, [], [], []) :-
     ground(Constraint).
 state_step(use(Id, Domain, Name), State, State,
-           [resolved(Id, local(Binding))], []) :-
+           [resolved(Id, local(Binding))], [], []) :-
     ground(Id), ground(Domain), ground(Name),
+    Name \= text_hole(_, _, _),
     lookup_binding(State, Domain, Name, Binding),
     !.
 state_step(use(Id, Domain, Name), State, State,
            [resolved(Id, external(ref(Id)))],
-           [query(Id, ask(one, Domain, name(Name)))]) :-
-    ground(Id), ground(Domain), ground(Name).
+           [query(Id, ask(one, Domain, name(Name)))], []) :-
+    ground(Id), ground(Domain), ground(Name),
+    Name \= text_hole(_, _, _).
+state_step(use(Id, Domain, TextHole), State, State,
+           [resolved(Id, incomplete(TextHole))],
+           [query(CompletionId, ask(all, Domain, prefix(QueryPrefix)))],
+           CompletionPairs) :-
+    ground(Id), ground(Domain),
+    TextHole = text_hole(Prefix, Hole, Suffix),
+    Hole = hole(_, _, Surface, _),
+    string(Prefix), string(Suffix), string(Surface),
+    string_concat(Prefix, Surface, QueryPrefix),
+    CompletionId = name_completion(Id, Prefix, Hole, Suffix),
+    findall(Pair,
+            local_name_completion_pair(State, Domain, Prefix, Hole, Suffix,
+                                       Pair),
+            CompletionPairs).
 state_step(require(Id, Cardinality, Domain, Selector), State, State, [],
-           [query(Id, ask(Cardinality, Domain, Selector))]) :-
+           [query(Id, ask(Cardinality, Domain, Selector))], []) :-
     ground(Id),
     valid_cardinality(Cardinality),
     ground(Domain), ground(Selector).
+
+local_name_completion_pair(State, Domain, Prefix, Hole, Suffix,
+    completion_key(Span, Insert)-
+        (alternative(local(Domain, Name), variable, local_state)-80)) :-
+    visible_binding(State, Domain, Name, _),
+    string(Name),
+    Hole = hole(_, Span, Surface, _),
+    hole_insertion(Name, Prefix, Suffix, Surface, Insert),
+    Insert \= "".
+
+visible_binding(State, Domain, Name, Binding) :-
+    state_binding(State, Domain, Name, Candidate),
+    lookup_binding(State, Domain, Name, Binding),
+    Candidate == Binding.
+
+state_binding(local_state(Scopes, _), Domain, Name, Binding) :-
+    value_member(scope(_, Bindings), Scopes),
+    value_member(Binding, Bindings),
+    Binding = local_binding(Domain, Name, _, _).
 
 resolve_state_resolutions([], _, []).
 resolve_state_resolutions(

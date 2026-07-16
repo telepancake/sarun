@@ -42,7 +42,7 @@ run_test(fields_emit_ordered_state_steps_from_utf8_source) :-
              use(node_ref(use, span(8, 14)), c_symbol, "λ"),
              use(node_ref(use, span(16, 21)), c_symbol, "z")],
     empty_local_state(Initial),
-    run_state_steps(Steps, Initial, _, Resolutions, Queries, []),
+    run_state_steps(Steps, Initial, _, Resolutions, Queries, [], _),
     Resolutions = [resolved(node_ref(use, span(8, 14)), local(_)),
                    resolved(node_ref(use, span(16, 21)), external(_))],
     Queries = [query(node_ref(use, span(16, 21)),

@@ -47,6 +47,7 @@ valid_capture_selector(node_span).
 valid_capture_selector(field_span(Name)) :- atom(Name).
 valid_capture_selector(field_value(Name)) :- atom(Name).
 valid_capture_selector(field_text(Name)) :- atom(Name).
+valid_capture_selector(field_text_or_hole(Name)) :- atom(Name).
 valid_capture_selector(field_symbolic_text(Name, Rules)) :-
     atom(Name),
     valid_text_projection_rules(Rules).
@@ -128,6 +129,12 @@ capture_value(field_value(Name), _, Value, _, FieldValue) :-
 capture_value(field_text(Name), _, Value, Source, Text) :-
     node_field(Name, Value, Span, _),
     source_span_text(Source, Span, Text).
+capture_value(field_text_or_hole(Name), _, Value, Source, Text) :-
+    node_field(Name, Value, Span, FieldValue),
+    ( tree_edit_hole(FieldValue, Hole)
+    -> field_text_hole(Source, Span, Hole, Text)
+    ;  source_span_text(Source, Span, Text)
+    ).
 capture_value(field_symbolic_text(Name, Rules), _, Value, Source, Text) :-
     node_field(Name, Value, _, FieldValue),
     project_symbolic_text(FieldValue, Source, Rules, Text).
@@ -247,6 +254,33 @@ source_span_text(Source, span(ByteStart, ByteEnd), Text) :-
     byte_character_offset(Whole, ByteEnd, CharacterEnd),
     CharacterLength is CharacterEnd - CharacterStart,
     sub_string(Whole, CharacterStart, CharacterLength, _, Text).
+
+% `text_hole/3` is a grammar-neutral text value.  It preserves the source on
+% both sides of the ordinary parser's edit tear while retaining the exact hole
+% term (including its byte replacement span and codec).  Semantic relations
+% can therefore run a textual field backwards without inspecting AST shapes.
+field_text_hole(Source, span(FieldStart, FieldEnd), Hole,
+                text_hole(Prefix, Hole, Suffix)) :-
+    Hole = hole(_, span(HoleStart, HoleEnd), _, _),
+    FieldStart =< HoleStart,
+    HoleStart =< HoleEnd,
+    HoleEnd =< FieldEnd,
+    source_span_text(Source, span(FieldStart, HoleStart), Prefix),
+    source_span_text(Source, span(HoleEnd, FieldEnd), Suffix).
+
+tree_edit_hole(Value, Hole) :-
+    Value = hole(_, span(_, _), _, _),
+    Hole = Value,
+    !.
+tree_edit_hole(Value, Hole) :-
+    compound(Value),
+    Value =.. [_|Arguments],
+    tree_edit_hole_arguments(Arguments, Hole).
+
+tree_edit_hole_arguments([Value|_], Hole) :-
+    tree_edit_hole(Value, Hole), !.
+tree_edit_hole_arguments([_|Values], Hole) :-
+    tree_edit_hole_arguments(Values, Hole).
 
 source_text(text_source(Text, _, _), Text) :- string(Text).
 source_text(Text, Text) :- string(Text).

@@ -106,6 +106,10 @@ replacement spans, cursor tears, and diagnostics.
 - [x] Render relation-derived completions in an edtui popup and apply their
       exact replacement spans. The defining backward `find -type` completion
       now passes through the real editor buffer on static aarch64.
+- [x] Relate an identifier tear in a state `use` step to names visible at that
+      exact lexical point. Local names unify immediately; the same step emits
+      an explicit `all(Domain, prefix(Text))` provider query and can union its
+      observations without a consumer-side identifier scanner.
 - [ ] Render hints, diagnostics, and incomplete status in the existing editor
       chrome/widget once those generic projections exist; do not reinterpret
       shell grammar in the editor.
@@ -128,6 +132,9 @@ replacement spans, cursor tears, and diagnostics.
       and alternate screen on ordinary errors and unwinding.
 - [x] Use the controlling terminal rather than redirected builtin stdout.
       Refuse non-TTY, background, and pipeline-stage invocation visibly.
+- [x] Give the standalone terminal a frameless presentation and render only on
+      input, resize, or outstanding analysis ticks. Once analysis is quiescent
+      it emits no periodic terminal writes that destroy native text selection.
 
 ### 4. Foreground Brush builtin
 
@@ -182,6 +189,21 @@ alternate screen was restored by returning to the Brush prompt, and exits the
 shell successfully. Unit tests separately pin the byte replacement span,
 absence of external queries, UTF-8 coordinate conversion, stale-result
 rejection, and the full finite completion domain.
+
+The second native acceptance case is the ordinary forward local-name use:
+
+```sh
+#!/bin/bash
+A=""
+find . -type $
+```
+
+With the tear after `$`, the parser's `simple_parameter` node emits the same
+state `use` relation as a complete `$A`. That relation sees the earlier local
+definition and offers `A`; it also records an `all shell_variable prefix("")`
+context query for provider-backed names. The aarch64 PTY test accepts `A`,
+saves the exact three-line `$A` result, verifies that the standalone host did
+not render the UI pane's full-screen frame, and returns to Brush cleanly.
 
 The remaining acceptance work is the broader context/provider and shell
 grammar matrix below, not another editor parsing implementation.

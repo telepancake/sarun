@@ -25,11 +25,17 @@ fn send(master: &mut File, bytes: &[u8]) {
     master.flush().expect("flush PTY input");
 }
 
-#[test]
-fn standalone_brush_edit_builtin_completes_saves_and_restores_terminal() {
+fn run_editor_case(
+    label: &str,
+    initial_text: &[u8],
+    before_tab: &[u8],
+    selection_downs: u8,
+    expected: &[u8],
+) {
     let path = std::env::temp_dir().join(format!(
-        "sarun_editor_builtin_pty_{}.sh",
-        std::process::id()
+        "sarun_editor_builtin_pty_{}_{}.sh",
+        std::process::id(),
+        label
     ));
     let _ = std::fs::remove_file(&path);
 
@@ -132,37 +138,46 @@ fn standalone_brush_edit_builtin_completes_saves_and_restores_terminal() {
             command_sent = true;
         }
         if command_sent && editor_entered.is_none() && contains(&output, b"\x1b[?1049h") {
-            send(&mut master, b"iA=\"\"; find . -type $A");
+            send(&mut master, b"i");
+            send(&mut master, initial_text);
             editor_entered = Some(now);
             phase = 1;
         }
         if let Some(entered) = editor_entered {
             let elapsed = now.duration_since(entered);
             if phase == 1 && elapsed > Duration::from_millis(500) {
-                send(&mut master, b"\x1b");
+                if !before_tab.is_empty() {
+                    send(&mut master, b"\x1b");
+                }
                 phase = 2;
             } else if phase == 2 && elapsed > Duration::from_millis(800) {
-                send(&mut master, b"0llli");
+                if !before_tab.is_empty() {
+                    send(&mut master, before_tab);
+                }
                 phase = 3;
             } else if phase == 3 && elapsed > Duration::from_millis(1000) {
                 send(&mut master, b"\t");
                 phase = 4;
             } else if phase == 4 && contains(&output, b"relation completions") {
-                if downs < 5 && now.duration_since(last_down) > Duration::from_millis(160) {
+                if downs < selection_downs
+                    && now.duration_since(last_down) > Duration::from_millis(160)
+                {
                     send(&mut master, b"\x1b[B");
                     downs += 1;
                     last_down = now;
-                } else if downs == 5 && now.duration_since(last_down) > Duration::from_millis(250) {
+                } else if downs == selection_downs
+                    && now.duration_since(last_down) > Duration::from_millis(250)
+                {
                     send(&mut master, b"\r");
                     phase = 5;
                 }
-            } else if phase == 5 && elapsed > Duration::from_millis(2800) {
+            } else if phase == 5 && elapsed > Duration::from_millis(2200) {
                 send(&mut master, b"\x1b");
                 phase = 6;
-            } else if phase == 6 && elapsed > Duration::from_millis(3100) {
+            } else if phase == 6 && elapsed > Duration::from_millis(2500) {
                 send(&mut master, b"\x13");
                 phase = 7;
-            } else if phase == 7 && elapsed > Duration::from_millis(3400) {
+            } else if phase == 7 && elapsed > Duration::from_millis(2800) {
                 send(&mut master, b"\x1b");
                 phase = 8;
             }
@@ -196,8 +211,33 @@ fn standalone_brush_edit_builtin_completes_saves_and_restores_terminal() {
         output.len()
     );
     assert!(exit_sent, "editor never restored the Brush terminal");
-    assert_eq!(
-        content.expect("editor must save the file"),
-        b"A=\"f\"; find . -type $A"
+    assert_eq!(content.expect("editor must save the file"), expected);
+    for border in ["╔", "╗", "╚", "╝", "║", "═"] {
+        assert!(
+            !contains(&output, border.as_bytes()),
+            "standalone editor rendered UI-pane frame glyph {border}"
+        );
+    }
+}
+
+#[test]
+fn standalone_brush_edit_builtin_propagates_argument_value_and_restores_terminal() {
+    run_editor_case(
+        "argument_value",
+        b"A=\"\"; find . -type $A",
+        b"0llli",
+        5,
+        b"A=\"f\"; find . -type $A",
+    );
+}
+
+#[test]
+fn standalone_brush_edit_builtin_completes_visible_local_after_dollar() {
+    run_editor_case(
+        "local_name",
+        b"#!/bin/bash\rA=\"\"\rfind . -type $",
+        b"",
+        0,
+        b"#!/bin/bash\nA=\"\"\nfind . -type $A",
     );
 }

@@ -566,7 +566,6 @@ impl EditorPane {
     }
 
     /// True while an edit is waiting out the debounce quiet period.
-    #[allow(dead_code)]
     pub fn rehighlight_pending(&self) -> bool {
         self.rehl_due.is_some() || self.analysis_pending.is_some()
     }
@@ -858,6 +857,39 @@ impl EditorPane {
         self.render_completion_menu(f, area);
     }
 
+    /// Standalone presentation deliberately has no surrounding pane frame.
+    /// It leaves the final row for a compact path/status line, giving the text
+    /// editor every other terminal cell and keeping the UI-pane chrome out of
+    /// a user's ordinary terminal copy surface.
+    fn render_standalone(&mut self, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        use ratatui::layout::{Constraint, Layout};
+        use ratatui::widgets::Paragraph;
+
+        self.maybe_rehighlight(Instant::now());
+        if let Some(fh) = &self.fh {
+            inject(&mut self.state, fh, HL_WINDOW);
+        }
+        let [editor_area, status_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        let view = EditorView::new(&mut self.state)
+            .theme(
+                EditorTheme::default()
+                    .base(Style::default().fg(Color::Gray))
+                    .cursor_style(Style::default().add_modifier(Modifier::REVERSED))
+                    .selection_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+                    .line_numbers_style(Style::default().fg(Color::DarkGray)),
+            )
+            .wrap(false)
+            .line_numbers(LineNumbers::Absolute);
+        f.render_widget(view, editor_area);
+        f.render_widget(
+            Paragraph::new(format!("{} · {}", self.title(), self.status))
+                .style(Style::default().fg(Color::DarkGray)),
+            status_area,
+        );
+        self.render_completion_menu(f, editor_area);
+    }
+
     fn render_completion_menu(&self, f: &mut ratatui::Frame, editor_area: ratatui::layout::Rect) {
         use ratatui::widgets::{Block, Borders, Clear, List, ListItem};
 
@@ -982,24 +1014,43 @@ pub fn run_standalone(path: PathBuf) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)
         .map_err(|error| anyhow::anyhow!("editor: initialize terminal: {error}"))?;
     let mut discard_armed = false;
+    let mut redraw = true;
 
     loop {
-        terminal
-            .draw(|frame| pane.render(frame, frame.area(), true))
-            .map_err(|error| anyhow::anyhow!("editor: draw: {error}"))?;
-        if !event::poll(Duration::from_millis(50))
-            .map_err(|error| anyhow::anyhow!("editor: terminal poll: {error}"))?
+        if redraw {
+            terminal
+                .draw(|frame| pane.render_standalone(frame, frame.area()))
+                .map_err(|error| anyhow::anyhow!("editor: draw: {error}"))?;
+            redraw = false;
+        }
+        let analysis_tick = pane.rehighlight_pending();
+        if !event::poll(if analysis_tick {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(60)
+        })
+        .map_err(|error| anyhow::anyhow!("editor: terminal poll: {error}"))?
         {
+            redraw = analysis_tick;
             continue;
         }
-        let Event::Key(key) =
-            event::read().map_err(|error| anyhow::anyhow!("editor: terminal input: {error}"))?
-        else {
-            continue;
+        let event =
+            event::read().map_err(|error| anyhow::anyhow!("editor: terminal input: {error}"))?;
+        let key = match event {
+            Event::Key(key) => key,
+            Event::Resize(_, _) => {
+                terminal
+                    .autoresize()
+                    .map_err(|error| anyhow::anyhow!("editor: resize terminal: {error}"))?;
+                redraw = true;
+                continue;
+            }
+            _ => continue,
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
+        redraw = true;
         let closing_key = key.code == KeyCode::Esc;
         match pane.handle_key(key.code, key.modifiers) {
             KeyResult::Save => match save_standalone_host(&mut pane) {
@@ -1187,6 +1238,29 @@ mod tests {
     }
 
     #[test]
+    fn bash_editor_completes_visible_local_variable_after_dollar() {
+        let source = "#!/bin/bash\nA=\"\"\nfind . -type $";
+        let mut pane = pane_of("script.sh", source);
+        pane.state.mode = EditorMode::Insert;
+        pane.state.cursor = Index2::new(2, 14);
+        assert_eq!(
+            pane.handle_key(KeyCode::Tab, KeyModifiers::empty()),
+            KeyResult::Consumed
+        );
+        let selected = pane
+            .completion_items()
+            .iter()
+            .position(|completion| completion.insert == "A")
+            .expect("ordinary Brush relation omitted the local A binding");
+        pane.completions.as_mut().unwrap().selected = selected;
+        assert_eq!(
+            pane.handle_key(KeyCode::Enter, KeyModifiers::empty()),
+            KeyResult::Consumed
+        );
+        assert_eq!(text_of(&pane.state), "#!/bin/bash\nA=\"\"\nfind . -type $A");
+    }
+
+    #[test]
     fn bash_editor_never_falls_back_when_relation_bound_is_exceeded() {
         let source = "x".repeat(crate::prolog::MAX_DOCUMENT_INPUT_BYTES + 1);
         let pane = pane_of("large.sh", &source);
@@ -1267,6 +1341,29 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo ok\n");
         assert!(!pane.dirty);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn standalone_editor_has_no_full_screen_pane_frame() {
+        let mut pane = pane_of("script.sh", "echo ok");
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| pane.render_standalone(frame, frame.area()))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            ['╔', '╗', '╚', '╝', '║', '═']
+                .iter()
+                .all(|border| !rendered.contains(*border))
+        );
+        assert!(rendered.contains("script.sh"));
     }
 
     /// The windowing pin: a large rust buffer computes spans for EVERY

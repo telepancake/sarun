@@ -17,9 +17,11 @@ brush_relation_grammar(Grammar) :-
     brush_syntax_grammar(Syntax),
     brush_state_rules(StateRules),
     brush_command_signatures(Signatures),
-    StateGrammar = enrichment_grammar(
+    StateGrammar0 = enrichment_grammar(
         Syntax, [ast], ast_state_grammar(StateRules),
-        [steps, final_state, resolutions, delta]),
+        [steps, final_state, resolutions, delta, state_completions]),
+    StateGrammar = completion_union_grammar(StateGrammar0,
+                                            state_completions),
     SemanticGrammar = projection_grammar(
         symbolic_text_grammar(Signatures),
         [projection(semantic_completions, reference(completions))]),
@@ -37,7 +39,7 @@ brush_state_rules([
                after([define(shell_variable, slot(name), slot(value),
                              escaping, replace)])),
     state_rule(node(simple_parameter),
-               [capture(name, field_text(name))],
+               [capture(name, field_text_or_hole(name))],
                before([use(node_identity, shell_variable, slot(name))]),
                after([])),
     state_rule(node(command_words),
@@ -148,14 +150,16 @@ brush_syntax_grammar(
               seq([terminal(
                        text(codepoint(union([range(65, 90), range(97, 122),
                                              chars("_")]))),
-                       presentation([meta(syntax, variable)])),
+                       presentation([meta(syntax, variable),
+                                     meta(tear, symbolic)])),
                    repeat(0, unbounded,
                           terminal(
                               text(codepoint(union([range(65, 90),
                                                     range(97, 122),
                                                     range(48, 57),
                                                     chars("_")]))),
-                              presentation([meta(syntax, variable)])))])),
+                              presentation([meta(syntax, variable),
+                                            meta(tear, symbolic)])))])),
          rule(shell_word,
               lexical(seq([repeat(1, unbounded, ref(word_part)),
                            not(ref(word_part))]))),

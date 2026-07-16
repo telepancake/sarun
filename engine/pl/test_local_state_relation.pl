@@ -5,6 +5,7 @@
 test_name(locals_resolve_without_external_queries).
 test_name(escaping_assignment_is_local_and_returns_delta).
 test_name(shadowing_and_scope_exit_are_lexical).
+test_name(name_tear_unifies_locals_and_emits_rich_provider_query).
 test_name(external_resolution_consumes_unique_observation).
 test_name(failed_unique_observation_fails_resolution).
 test_name(later_constraint_binds_hole_through_local_reference).
@@ -36,7 +37,7 @@ run_test(locals_resolve_without_external_queries) :-
              use(use_y, c_symbol, "y"),
              use(use_z, c_symbol, "z"),
              leave(function_f)],
-    run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta),
+    run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta, _),
     Queries = [query(f_odr,
                      ask(empty, c_external_symbol, name("f"))),
                query(use_z, ask(one, c_symbol, name("z")))],
@@ -63,7 +64,7 @@ run_test(escaping_assignment_is_local_and_returns_delta) :-
         [resolved(read_x,
                   local(local_binding(shell_variable, "x", integer(123),
                                       escaping)))],
-        [], [state_change(shell_variable, "x", integer(123))]).
+        [], [state_change(shell_variable, "x", integer(123))], _).
 
 run_test(shadowing_and_scope_exit_are_lexical) :-
     empty_local_state(Initial),
@@ -79,7 +80,29 @@ run_test(shadowing_and_scope_exit_are_lexical) :-
                   local(local_binding(name, "x", inner, lexical))),
          resolved(outer_x,
                   local(local_binding(name, "x", outer, lexical)))],
-        [], []).
+        [], [], _).
+
+run_test(name_tear_unifies_locals_and_emits_rich_provider_query) :-
+    Hole = hole(edit, span(9, 9), "", text(codepoint(identifier))),
+    CompletionId = name_completion(read_name, "", Hole, ""),
+    Query = ask(all, shell_variable, prefix("")),
+    empty_local_state(Initial),
+    run_state_steps(
+        [define(shell_variable, "A", text(["value"]), escaping, replace),
+         use(read_name, shell_variable, text_hole("", Hole, ""))],
+        Initial, _, [resolved(read_name, incomplete(_))],
+        [query(CompletionId, Query)], _,
+        [completion_key(span(9, 9), "A")-
+             (alternative(local(shell_variable, "A"), variable,
+                          local_state)-80)]),
+    Entry = entry(shell_variable, external_b, ["B"], text(["other"]), []),
+    context_state_completion_pairs(
+        [query(CompletionId, Query)],
+        [observed(CompletionId, Query, source(environment, 4),
+                  some(all([Entry])))],
+        [completion_key(span(9, 9), "B")-
+             (alternative(context(shell_variable, external_b), variable,
+                          environment)-50)]).
 
 run_test(external_resolution_consumes_unique_observation) :-
     Id = use_z,

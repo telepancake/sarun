@@ -24,7 +24,7 @@ literal_completion_evidence(EditId, [_|Evidence], Span, Text, Semantic, Syntax,
 % choosing best scores, deterministic ordering, and rank assignment are shared
 % engine behavior for every source representation.
 
-project_completions([], []).
+project_completions([], []) :- !.
 project_completions(Pairs, Completions) :-
     keysort(Pairs, SortedPairs),
     group_visible_pairs(SortedPairs, Candidates),

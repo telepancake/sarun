@@ -15,6 +15,7 @@ test_name(parameter_observation_resolves_and_records_dependency).
 test_name(missing_unique_parameter_observation_fails_semantic_solution).
 test_name(assignment_tear_survives_as_later_local_value).
 test_name(later_find_type_use_constrains_assignment_tear).
+test_name(local_variable_name_completion_comes_from_ordinary_use_step).
 
 run_brush_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -35,9 +36,12 @@ run_test(grammar_is_valid_executable_data) :-
     brush_relation_grammar(
         completion_union_grammar(
             enrichment_grammar(
-                enrichment_grammar(
-                    Syntax, [ast], ast_state_grammar(StateRules),
-                    [steps, final_state, resolutions, delta]),
+                completion_union_grammar(
+                    enrichment_grammar(
+                        Syntax, [ast], ast_state_grammar(StateRules),
+                        [steps, final_state, resolutions, delta,
+                         state_completions]),
+                    state_completions),
                 [steps, final_state], _, [semantic_completions]),
             semantic_completions)),
     grammar_ir:valid_grammar(Syntax),
@@ -259,6 +263,26 @@ run_test(later_find_type_use_constrains_assignment_tear) :-
     has_completion("s", socket, Completions),
     has_completion("$", literal_dollar, Completions).
 
+run_test(local_variable_name_completion_comes_from_ordinary_use_step) :-
+    brush_relation_grammar(Grammar),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source(
+                                   "#!/bin/bash\nA=\"\"\nfind . -type $",
+                                   assist(edit, span(31, 31)), brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], []))]),
+                want([status, completions, delta]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply(Solutions, Queries, [], [])),
+    list_member(query(_, ask(all, shell_variable, prefix(""))), Queries),
+    \+ list_member(query(_, ask(one, shell_variable, _)), Queries),
+    list_member(solution([binding(status, incomplete(edit(edit))),
+                          binding(completions, Completions),
+                          binding(delta, _)], _), Solutions),
+    has_completion("A", local(shell_variable, "A"), Completions).
+
 has_assignment_hole_solution(
     Hole,
     [solution(
@@ -307,3 +331,6 @@ has_highlight(Span, Syntax, Semantic, Origin,
               [highlight(Span, Syntax, Semantic, Origin)|_]).
 has_highlight(Span, Syntax, Semantic, Origin, [_|Highlights]) :-
     has_highlight(Span, Syntax, Semantic, Origin, Highlights).
+
+list_member(Value, [Value|_]).
+list_member(Value, [_|Values]) :- list_member(Value, Values).

@@ -3340,6 +3340,45 @@ mod tests {
     }
 
     #[test]
+    fn production_brush_document_completes_a_visible_local_after_dollar() {
+        let source = "#!/bin/bash\nA=\"\"\nfind . -type $";
+        let analysis = analyze_brush_document(&BrushDocumentRequest {
+            source: source.into(),
+            assist: Some(Span {
+                start: source.len(),
+                end: source.len(),
+            }),
+            initial_bindings: vec![],
+            observations: vec![],
+        })
+        .unwrap();
+        assert!(analysis.candidates.iter().any(|candidate| {
+            candidate.completions.iter().any(|completion| {
+                completion.replace
+                    == Span {
+                        start: source.len(),
+                        end: source.len(),
+                    }
+                    && completion.insert == "A"
+                    && completion
+                        .alternatives
+                        .iter()
+                        .any(|alternative| alternative.syntax == "variable")
+            })
+        }));
+        assert!(analysis.context_queries.iter().any(|node| {
+            node.query.cardinality == ContextCardinality::All
+                && node.query.domain == rv_atom("shell_variable")
+                && node.query.selector
+                    == rv_compound("prefix", vec![rv_string("")])
+        }));
+        assert!(analysis.context_queries.iter().all(|node| {
+            !(node.query.cardinality == ContextCardinality::One
+                && node.query.domain == rv_atom("shell_variable"))
+        }));
+    }
+
+    #[test]
     fn installed_brush_grammar_consumes_variable_observation() {
         let id = rv_compound(
             "node_ref",
