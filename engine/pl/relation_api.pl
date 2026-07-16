@@ -5,8 +5,17 @@
 
 /** <module> Single bounded grammar-engine boundary */
 
+% Whole-document grammar composition is deliberately bounded, but the bound
+% must cover syntax, state, and projection relations in one request.  The Brush
+% backward-completion acceptance case takes just over 100,000 inferences; keep
+% substantial headroom here while request byte/depth/evidence limits provide
+% the tighter resource bounds.
+relation_inference_limit(5000000).
+
 transform(Request, Reply) :-
-    call_with_inference_limit(transform_request(Request, Candidate), 100000,
+    relation_inference_limit(InferenceLimit),
+    call_with_inference_limit(transform_request(Request, Candidate),
+                              InferenceLimit,
                               LimitResult),
     ( LimitResult == inference_limit_exceeded
     -> Reply = reply([], [], [], [diagnostic(inference_limit_exceeded)])

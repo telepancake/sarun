@@ -3281,6 +3281,65 @@ mod tests {
     }
 
     #[test]
+    fn production_brush_document_propagates_later_find_type_constraint() {
+        let analysis = analyze_brush_document(&BrushDocumentRequest {
+            source: "A=\"\"; find . -type $A".into(),
+            assist: Some(Span { start: 3, end: 3 }),
+            initial_bindings: vec![],
+            observations: vec![],
+        })
+        .unwrap();
+        assert!(analysis.context_queries.is_empty());
+        let candidate = analysis
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate.state_changes.iter().any(|change| {
+                    change.domain == rv_atom("shell_variable")
+                        && change.name == "A"
+                        && contains_relation_value(
+                            &change.value,
+                            &rv_compound(
+                                "hole",
+                                vec![
+                                    rv_atom("document_edit"),
+                                    rv_compound(
+                                        "span",
+                                        vec![rv_integer(3), rv_integer(3)],
+                                    ),
+                                    rv_string(""),
+                                    rv_compound(
+                                        "terminal",
+                                        vec![rv_compound(
+                                            "text",
+                                            vec![rv_compound(
+                                                "codepoint",
+                                                vec![rv_compound(
+                                                    "except",
+                                                    vec![rv_string("\"\\$")],
+                                                )],
+                                            )],
+                                        )],
+                                    ),
+                                ],
+                            ),
+                        )
+                })
+            })
+            .expect("ordinary parse lost the assignment tear");
+        for expected in ["D", "b", "c", "d", "f", "l", "p", "s"] {
+            assert!(candidate
+                .completions
+                .iter()
+                .any(|completion| completion.insert == expected));
+        }
+        assert!(candidate
+            .completions
+            .iter()
+            .all(|completion| completion.replace == Span { start: 3, end: 3 }));
+    }
+
+    #[test]
     fn installed_brush_grammar_consumes_variable_observation() {
         let id = rv_compound(
             "node_ref",

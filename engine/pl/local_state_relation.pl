@@ -1,6 +1,8 @@
 :- module(local_state_relation,
           [ empty_local_state/1,
            state_constraint_completion_pairs/3,
+           state_constraint_completion_pairs/4,
+           state_step_constraints/2,
            valid_local_state/1,
            resolve_state_resolutions/3,
            run_state_steps/6
@@ -41,11 +43,16 @@ run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta) :-
 %  The result uses the engine's ordinary completion-pair representation.
 
 state_constraint_completion_pairs(Constraints, State, Pairs) :-
+    state_constraint_completion_pairs(Constraints, State, [], Pairs).
+
+state_constraint_completion_pairs(Constraints, State, Signatures, Pairs) :-
     proper_list(Constraints),
     valid_text_constraints(Constraints),
+    proper_list(Signatures), valid_signatures(Signatures),
     valid_local_state(State),
     findall(Pair,
-            state_constraint_completion_pair(Constraints, State, Pair),
+            state_constraint_completion_pair(Constraints, State, Signatures,
+                                             Pair),
             Pairs).
 
 valid_text_constraints([]).
@@ -59,6 +66,29 @@ valid_text_constraint(
     proper_list(Values), Values = [_|_],
     valid_constraint_values(Values),
     atom(Syntax).
+valid_text_constraint(invocation_constraint(Command, Arguments)) :-
+    valid_text_expression(Command),
+    proper_list(Arguments), valid_text_expressions(Arguments).
+
+valid_text_expressions([]).
+valid_text_expressions([Expression|Expressions]) :-
+    valid_text_expression(Expression),
+    valid_text_expressions(Expressions).
+
+valid_signatures([]).
+valid_signatures([signature(Command, Rules)|Signatures]) :-
+    string(Command),
+    proper_list(Rules), valid_signature_rules(Rules),
+    valid_signatures(Signatures).
+
+valid_signature_rules([]).
+valid_signature_rules([
+    following(Flag, one_of(Values), presentation(Syntax))|Rules
+]) :-
+    string(Flag),
+    proper_list(Values), Values = [_|_], valid_constraint_values(Values),
+    atom(Syntax),
+    valid_signature_rules(Rules).
 
 valid_text_expression(text(Segments)) :-
     proper_list(Segments),
@@ -83,10 +113,50 @@ valid_constraint_values([value(Text, Semantic, Description, Preference)|Values])
     string(Text), ground(Semantic), ground(Description), number(Preference),
     valid_constraint_values(Values).
 
-state_constraint_completion_pair([Constraint|_], State, Pair) :-
+state_constraint_completion_pair([Constraint|_], State, Signatures, Pair) :-
+    constraint_completion_pair(Constraint, State, Signatures, Pair).
+state_constraint_completion_pair([_|Constraints], State, Signatures, Pair) :-
+    state_constraint_completion_pair(Constraints, State, Signatures, Pair).
+
+constraint_completion_pair(Constraint, State, _, Pair) :-
     text_constraint_completion_pair(Constraint, State, Pair).
-state_constraint_completion_pair([_|Constraints], State, Pair) :-
-    state_constraint_completion_pair(Constraints, State, Pair).
+constraint_completion_pair(
+    invocation_constraint(Command, Arguments), State, Signatures, Pair) :-
+    resolve_text_string(Command, State, CommandText),
+    signature_member(signature(CommandText, Rules), Signatures),
+    signature_constraint(Rules, Arguments, State, Constraint),
+    text_constraint_completion_pair(Constraint, State, Pair).
+
+signature_constraint([
+    following(Flag, Domain, Presentation)|_
+], Arguments, State,
+    text_constraint(Value, Domain, Presentation)) :-
+    following_argument(Arguments, State, Flag, Value).
+signature_constraint([_|Rules], Arguments, State, Constraint) :-
+    signature_constraint(Rules, Arguments, State, Constraint).
+
+following_argument([FlagExpression, Value|_], State, Flag, Value) :-
+    resolve_text_string(FlagExpression, State, Flag).
+following_argument([_|Arguments], State, Flag, Value) :-
+    following_argument(Arguments, State, Flag, Value).
+
+resolve_text_string(Expression, State, Text) :-
+    resolve_text_expression(Expression, State, [], Segments),
+    text_segments_string(Segments, Text).
+
+signature_member(Signature, [Signature|_]).
+signature_member(Signature, [_|Signatures]) :-
+    signature_member(Signature, Signatures).
+
+state_step_constraints(Steps, Constraints) :-
+    proper_list(Steps),
+    step_constraints(Steps, Constraints).
+
+step_constraints([], []).
+step_constraints([constraint(Constraint)|Steps], [Constraint|Constraints]) :- !,
+    step_constraints(Steps, Constraints).
+step_constraints([_|Steps], Constraints) :-
+    step_constraints(Steps, Constraints).
 
 text_constraint_completion_pair(
     text_constraint(Expression, one_of(Values), presentation(Syntax)),
@@ -177,6 +247,8 @@ state_step(define(Domain, Name, Value, Lifetime, Policy),
     define_binding(Policy, local_binding(Domain, Name, Value, Lifetime),
                    Bindings0, Bindings),
     definition_delta(Lifetime, Domain, Name, Value, Delta0, Delta).
+state_step(constraint(Constraint), State, State, [], []) :-
+    ground(Constraint).
 state_step(use(Id, Domain, Name), State, State,
            [resolved(Id, local(Binding))], []) :-
     ground(Id), ground(Domain), ground(Name),

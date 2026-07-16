@@ -81,19 +81,29 @@ transform_relation(local_state_grammar, Given, Wanted, Observations, _Limits,
 transform_relation(symbolic_text_grammar, Given, Wanted, _Observations,
                    _Limits,
                    reply([solution(Bindings, 0)], [], [], [])) :-
-    given_value(constraints, Given, Constraints),
+    symbolic_constraints(Given, Constraints),
     given_value(final_state, Given, State),
     state_constraint_completion_pairs(Constraints, State, Pairs),
     project_completions(Pairs, Completions),
     Available = [binding(completions, Completions)],
     requested_bindings(Wanted, Available, Bindings).
+transform_relation(symbolic_text_grammar(Signatures), Given, Wanted,
+                   _Observations, _Limits,
+                   reply([solution(Bindings, 0)], [], [], [])) :-
+    symbolic_constraints(Given, Constraints),
+    given_value(final_state, Given, State),
+    state_constraint_completion_pairs(Constraints, State, Signatures, Pairs),
+    project_completions(Pairs, Completions),
+    Available = [binding(completions, Completions)],
+    requested_bindings(Wanted, Available, Bindings).
+
 transform_relation(ast_state_grammar(Rules), Given, Wanted, Observations,
                    _Limits,
                    reply(Solutions, ReadyQueries,
                          DependencyKeys, [])) :-
     given_value(ast, Given, Ast),
     given_value(source, Given, Source),
-    given_value(initial_state, Given, Initial),
+    initial_local_state(Given, Initial),
     derive_ast_state_steps(Rules, Ast, Source, Steps),
     run_state_steps(Steps, Initial, Final, Resolutions0, Queries, Delta),
     valid_query_graph(Queries),
@@ -121,6 +131,17 @@ transform_relation(enrichment_grammar(Base, Shared, Extension, Outputs),
                           BaseReply),
        enrich_reply(BaseReply, Extension, ExtensionWanted, Given, Wanted,
                     Observations, Limits, Reply)
+    ).
+transform_relation(completion_union_grammar(Base, AdditionalName), Given,
+                   Wanted, Observations, Limits, Reply) :-
+    atom(AdditionalName),
+    ( member_term(completions, Wanted)
+    -> append(Wanted, [AdditionalName], InnerWanted0),
+       sort(InnerWanted0, InnerWanted),
+       transform_relation(Base, Given, InnerWanted, Observations, Limits,
+                          InnerReply),
+       union_completion_reply(InnerReply, AdditionalName, Wanted, Reply)
+    ;  transform_relation(Base, Given, Wanted, Observations, Limits, Reply)
     ).
 transform_relation(Grammar, Given, Wanted, Observations, Limits, Reply) :-
     Grammar = grammar(source(text(utf8)), _, _, _),
@@ -234,6 +255,42 @@ transform_relation(
     project_highlights(Evidence, Highlights),
     Available = [binding(highlights, Highlights)],
     requested_bindings(Wanted, Available, Bindings).
+
+symbolic_constraints(Given, Constraints) :-
+    given_value(constraints, Given, Constraints), !.
+symbolic_constraints(Given, Constraints) :-
+    given_value(steps, Given, Steps),
+    state_step_constraints(Steps, Constraints).
+
+initial_local_state(Given, Initial) :-
+    given_value(initial_state, Given, Initial), !.
+initial_local_state(_, Initial) :-
+    empty_local_state(Initial).
+
+union_completion_reply(
+    reply(Solutions0, Queries, Dependencies, Diagnostics), AdditionalName,
+    Wanted, reply(Solutions, Queries, Dependencies, Diagnostics)) :-
+    union_completion_solutions(Solutions0, AdditionalName, Wanted, Merged),
+    sort(Merged, Solutions).
+
+union_completion_solutions([], _, _, []).
+union_completion_solutions(
+    [solution(Bindings0, Preference)|Solutions0], AdditionalName, Wanted,
+    [solution(Bindings, Preference)|Solutions]) :-
+    given_value(completions, Bindings0, BaseCompletions),
+    given_value(AdditionalName, Bindings0, AdditionalCompletions),
+    completion_pairs(BaseCompletions, BasePairs),
+    completion_pairs(AdditionalCompletions, AdditionalPairs),
+    append(BasePairs, AdditionalPairs, Pairs),
+    project_completions(Pairs, Completions),
+    replace_named_binding(completions, Completions, Bindings0, Available),
+    requested_bindings(Wanted, Available, Bindings),
+    union_completion_solutions(Solutions0, AdditionalName, Wanted, Solutions).
+
+replace_named_binding(Name, Value, [binding(Name, _)|Bindings],
+                      [binding(Name, Value)|Bindings]) :- !.
+replace_named_binding(Name, Value, [Binding|Bindings], [Binding|Replaced]) :-
+    replace_named_binding(Name, Value, Bindings, Replaced).
 
 proper_atom_names([]).
 proper_atom_names([Name|Names]) :-

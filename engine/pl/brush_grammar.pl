@@ -13,11 +13,21 @@ slice; the installed handle enriches ordinary parse projections with the state
 outputs supported by that slice.
 */
 
-brush_relation_grammar(
-    enrichment_grammar(Syntax, [ast], ast_state_grammar(StateRules),
-                       [steps, final_state, resolutions, delta])) :-
+brush_relation_grammar(Grammar) :-
     brush_syntax_grammar(Syntax),
-    brush_state_rules(StateRules).
+    brush_state_rules(StateRules),
+    brush_command_signatures(Signatures),
+    StateGrammar = enrichment_grammar(
+        Syntax, [ast], ast_state_grammar(StateRules),
+        [steps, final_state, resolutions, delta]),
+    SemanticGrammar = projection_grammar(
+        symbolic_text_grammar(Signatures),
+        [projection(semantic_completions, reference(completions))]),
+    EnrichedGrammar = enrichment_grammar(
+        StateGrammar, [steps, final_state], SemanticGrammar,
+        [semantic_completions]),
+    Grammar = completion_union_grammar(EnrichedGrammar,
+                                       semantic_completions).
 
 brush_state_rules([
     state_rule(node(assignment),
@@ -29,7 +39,16 @@ brush_state_rules([
     state_rule(node(simple_parameter),
                [capture(name, field_text(name))],
                before([use(node_identity, shell_variable, slot(name))]),
-               after([]))
+               after([])),
+    state_rule(node(command_words),
+               [capture(command,
+                        field_symbolic_text(command, TextRules)),
+                capture(arguments,
+                        fields_symbolic_text(argument, TextRules))],
+               before([]),
+               after([constraint(
+                          invocation_constraint(
+                              slot(command), slot(arguments)))]))
 ]) :-
     brush_text_projection_rules(TextRules).
 
@@ -38,6 +57,23 @@ brush_text_projection_rules([
     text_rule(node(double_quoted_part), children_else_source),
     text_rule(node(simple_parameter),
               reference(shell_variable, field_text(name)))
+]).
+
+brush_command_signatures([
+    signature("find",
+              [following(
+                   "-type",
+                   one_of([
+                       value("b", block_device, find_type, 30),
+                       value("c", character_device, find_type, 30),
+                       value("d", directory, find_type, 30),
+                       value("D", door, find_type, 30),
+                       value("f", regular_file, find_type, 30),
+                       value("l", symbolic_link, find_type, 30),
+                       value("p", named_pipe, find_type, 30),
+                       value("s", socket, find_type, 30)
+                   ]),
+                   presentation(find_type_argument))])
 ]).
 
 brush_syntax_grammar(

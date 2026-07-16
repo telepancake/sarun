@@ -14,6 +14,7 @@ test_name(unresolved_parameter_emits_external_query).
 test_name(parameter_observation_resolves_and_records_dependency).
 test_name(missing_unique_parameter_observation_fails_semantic_solution).
 test_name(assignment_tear_survives_as_later_local_value).
+test_name(later_find_type_use_constrains_assignment_tear).
 
 run_brush_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -32,8 +33,13 @@ run_tests([Name|Names], Passed0, Passed) :-
 
 run_test(grammar_is_valid_executable_data) :-
     brush_relation_grammar(
-        enrichment_grammar(Syntax, [ast], ast_state_grammar(StateRules),
-                           [steps, final_state, resolutions, delta])),
+        completion_union_grammar(
+            enrichment_grammar(
+                enrichment_grammar(
+                    Syntax, [ast], ast_state_grammar(StateRules),
+                    [steps, final_state, resolutions, delta]),
+                [steps, final_state], _, [semantic_completions]),
+            semantic_completions)),
     grammar_ir:valid_grammar(Syntax),
     ast_state_relation:valid_ast_state_rules(StateRules).
 
@@ -224,29 +230,78 @@ run_test(assignment_tear_survives_as_later_local_value) :-
                                local_state([scope(root, [])], []))]),
                 want([status, final_state, resolutions, completions]),
                 observations([]), limits(32, 4096, 1048576)),
-        reply([solution(
-                   [binding(status, incomplete(edit(edit))),
-                    binding(final_state,
-                            local_state(
-                                [scope(root,
-                                       [local_binding(shell_variable, "A",
-                                                      text([Hole]),
-                                                      escaping)])],
-                                [state_change(shell_variable, "A",
-                                              text([Hole]))])),
-                    binding(resolutions,
-                            [resolved(
-                                 node_ref(simple_parameter, span(11, 13)),
-                                 local(local_binding(shell_variable, "A",
-                                                     text([Hole]),
-                                                     escaping)))]),
-                    binding(completions,
-                            [completion(
-                                 span(3, 3), "$",
-                                 [alternative(literal_dollar, string,
-                                              grammar, 0)],
-                                 0, 1)])], 0),
-                solution(_, 0)], [], [], [])).
+        reply(Solutions, [], [], [])),
+    has_assignment_hole_solution(Hole, Solutions).
+
+run_test(later_find_type_use_constrains_assignment_tear) :-
+    brush_relation_grammar(Grammar),
+    Hole = hole(edit, span(3, 3), "",
+                terminal(text(codepoint(except("\"\\$"))))),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source(
+                                   "A=\"\"; find . -type $A",
+                                   assist(edit, span(3, 3)), brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], []))]),
+                want([status, completions, delta]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply(Solutions, [], [], [])),
+    has_find_type_solution(Hole, Solutions, Completions),
+    has_completion("D", door, Completions),
+    has_completion("b", block_device, Completions),
+    has_completion("c", character_device, Completions),
+    has_completion("d", directory, Completions),
+    has_completion("f", regular_file, Completions),
+    has_completion("l", symbolic_link, Completions),
+    has_completion("p", named_pipe, Completions),
+    has_completion("s", socket, Completions),
+    has_completion("$", literal_dollar, Completions).
+
+has_assignment_hole_solution(
+    Hole,
+    [solution(
+         [binding(status, incomplete(edit(edit))),
+          binding(final_state,
+                  local_state(
+                      [scope(root,
+                             [local_binding(shell_variable, "A", text([Hole]),
+                                            escaping)])],
+                      [state_change(shell_variable, "A", text([Hole]))])),
+          binding(resolutions,
+                  [resolved(
+                       node_ref(simple_parameter, span(11, 13)),
+                       local(local_binding(shell_variable, "A", text([Hole]),
+                                           escaping)))]),
+          binding(completions,
+                  [completion(span(3, 3), "$",
+                              [alternative(literal_dollar, string, grammar,
+                                           0)],
+                              0, 1)])], 0)|_]).
+has_assignment_hole_solution(Hole, [_|Solutions]) :-
+    has_assignment_hole_solution(Hole, Solutions).
+
+has_find_type_solution(
+    Hole,
+    [solution([binding(status, incomplete(edit(edit))),
+               binding(completions, Completions),
+               binding(delta,
+                       [state_change(shell_variable, "A", text([Hole]))])],
+              0)|_],
+    Completions).
+has_find_type_solution(Hole, [_|Solutions], Completions) :-
+    has_find_type_solution(Hole, Solutions, Completions).
+
+has_completion(Text, Semantic,
+               [completion(_, Text, Alternatives, _, _)|_]) :-
+    has_alternative(Semantic, Alternatives), !.
+has_completion(Text, Semantic, [_|Completions]) :-
+    has_completion(Text, Semantic, Completions).
+
+has_alternative(Semantic, [alternative(Semantic, _, _, _)|_]).
+has_alternative(Semantic, [_|Alternatives]) :-
+    has_alternative(Semantic, Alternatives).
 
 has_highlight(Span, Syntax, Semantic, Origin,
               [highlight(Span, Syntax, Semantic, Origin)|_]).

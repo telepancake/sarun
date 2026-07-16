@@ -281,13 +281,21 @@ Do not implement these as Brush-specific engine branches:
       concatenation, or typed field reference per named node; the generic
       adapter preserves terminal holes and normalizes adjacent text. Brush
       assignments now store `text([...])` values, so a tear inside `A="|"`
-      survives local resolution at a later `$A` use. Invocation/signature data
-      still needs to impose the later argument constraint.
+      survives local resolution at a later `$A` use.
+- [x] Relate command invocations to separately declared signature data through
+      a grammar-independent engine relation. The first Brush signature declares
+      `find -type` as a finite typed domain. The ordinary whole-document parse
+      of `A="|"; find . -type $A` now propagates that later constraint through
+      the locally resolved `$A`, returns all valid type completions at the
+      earlier tear, and emits no external context query. There is no `find`
+      branch in Rust or in the generic engine.
 - [ ] Add explicit providers for aliases, functions, builtins, PATH commands,
       filesystem names, environment, and programmable completion specs.
 - [ ] Compose builtin argument grammars after command resolution; start with a
       small representative set containing options, enums, paths, repetitions,
-      and mutually dependent arguments.
+      and mutually dependent arguments. The enum-after-flag shape is now
+      executable through `find -type`; options, paths, repetitions, and
+      mutually dependent arguments remain.
 - [ ] Compose sarun's action and object domains in shell argument positions.
 - [ ] Prove dependency-key stability and selective invalidation when cwd,
       PATH, variables, builtins, or sarun snapshots change.

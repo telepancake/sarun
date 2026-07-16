@@ -164,6 +164,11 @@ an editor heuristic, a forward-only shell completion pass, or a `find` branch
 in Rust: it is a completion projection from the same relation that parses the
 document and relates the assignment, expansion, command signature, and tear.
 
+The engine-side production analysis API now passes this exact acceptance case,
+including the byte replacement span and absence of external context queries.
+The remaining acceptance work is routing the editor and interactive Brush
+through that API and proving the behavior through their real PTY surfaces.
+
 Native aarch64 PTY tests must start standalone `sarun brush`, invoke `edit` as
 a real foreground builtin, edit and save a UTF-8 shell file, and prove:
 

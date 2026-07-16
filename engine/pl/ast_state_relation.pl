@@ -50,6 +50,9 @@ valid_capture_selector(field_text(Name)) :- atom(Name).
 valid_capture_selector(field_symbolic_text(Name, Rules)) :-
     atom(Name),
     valid_text_projection_rules(Rules).
+valid_capture_selector(fields_symbolic_text(Name, Rules)) :-
+    atom(Name),
+    valid_text_projection_rules(Rules).
 
 valid_text_projection_rules(Rules) :-
     proper_list(Rules),
@@ -128,6 +131,12 @@ capture_value(field_text(Name), _, Value, Source, Text) :-
 capture_value(field_symbolic_text(Name, Rules), _, Value, Source, Text) :-
     node_field(Name, Value, _, FieldValue),
     project_symbolic_text(FieldValue, Source, Rules, Text).
+capture_value(fields_symbolic_text(Name, Rules), _, Value, Source, Texts) :-
+    findall(Text,
+            ( node_field_value(Name, Value, FieldValue),
+              project_symbolic_text(FieldValue, Source, Rules, Text)
+            ),
+            Texts).
 
 project_symbolic_text(Value, Source, Rules, text(Segments)) :-
     project_text_segments(Value, Source, Rules, RawSegments),
@@ -192,6 +201,18 @@ node_field_arguments(Name, [Value|_], Span, FieldValue) :-
     node_field(Name, Value, Span, FieldValue), !.
 node_field_arguments(Name, [_|Values], Span, FieldValue) :-
     node_field_arguments(Name, Values, Span, FieldValue).
+
+node_field_value(Name, field(Name, _, Value), Value) :- !.
+node_field_value(_, node(_, _, _), _) :- !, fail.
+node_field_value(Name, Value, FieldValue) :-
+    compound(Value),
+    Value =.. [_|Arguments],
+    node_field_value_arguments(Name, Arguments, FieldValue).
+
+node_field_value_arguments(Name, [Value|_], FieldValue) :-
+    node_field_value(Name, Value, FieldValue).
+node_field_value_arguments(Name, [_|Values], FieldValue) :-
+    node_field_value_arguments(Name, Values, FieldValue).
 
 instantiate_templates([], _, _, []).
 instantiate_templates([Template|Templates], Captures, NodeIdentity,

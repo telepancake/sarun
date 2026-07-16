@@ -1,5 +1,6 @@
 :- module(evidence_projection,
           [ literal_completion_evidence/7,
+            completion_pairs/2,
             project_completions/2,
             project_highlights/2
           ]).
@@ -29,6 +30,32 @@ project_completions(Pairs, Completions) :-
     group_visible_pairs(SortedPairs, Candidates),
     sort_candidates(Candidates, Sorted),
     rank_completions(Sorted, 1, Completions).
+
+completion_pairs(Completions, Pairs) :-
+    findall(
+        completion_key(Span, Text)-
+            (alternative(Semantic, Syntax, Description)-Preference),
+        completion_pair(Completions, Span, Text, Semantic, Syntax,
+                        Description, Preference),
+        Pairs).
+
+completion_pair(
+    [completion(Span, Text, Alternatives, _, _)|_], Span, Text,
+    Semantic, Syntax, Description, Preference) :-
+    completion_alternative(Alternatives, Semantic, Syntax, Description,
+                           Preference).
+completion_pair([_|Completions], Span, Text, Semantic, Syntax, Description,
+                Preference) :-
+    completion_pair(Completions, Span, Text, Semantic, Syntax, Description,
+                    Preference).
+
+completion_alternative(
+    [alternative(Semantic, Syntax, Description, Preference)|_],
+    Semantic, Syntax, Description, Preference).
+completion_alternative([_|Alternatives], Semantic, Syntax, Description,
+                       Preference) :-
+    completion_alternative(Alternatives, Semantic, Syntax, Description,
+                           Preference).
 
 group_visible_pairs([], []).
 group_visible_pairs([Visible-Value|Pairs],
