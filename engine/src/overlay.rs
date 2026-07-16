@@ -2158,6 +2158,46 @@ impl SarunFs {
         Ok(attr)
     }
 
+    fn link_node(
+        &self,
+        pid: u32,
+        inode: u64,
+        new_parent: u64,
+        new_name: &OsStr,
+    ) -> Result<FileAttr, Errno> {
+        let (source_box, source_rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let (box_id, new_rel) = self.child_path(new_parent, new_name)?;
+        if source_box != box_id {
+            return Err(Errno::EXDEV);
+        }
+        let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
+        if self.ro_denied(box_id, &new_rel) {
+            return Err(Errno::EROFS);
+        }
+        if !matches!(self.resolve(box_id, &new_rel), Layer::Absent) {
+            return Err(Errno::EEXIST);
+        }
+        if self.copy_up(&b, &source_rel, pid).is_err() {
+            return Err(Errno::EIO);
+        }
+        let (source_rowid, source_mode) = match self.layer(&b, &source_rel) {
+            Layer::UpperFile { rowid, mode, .. } => (rowid, mode),
+            _ => return Err(Errno::EPERM),
+        };
+        let new_rowid = b.ensure_file_row(&new_rel, source_mode, b.writer_for(pid));
+        let destination = blob_path(box_id, new_rowid);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(Errno::from)?;
+        }
+        std::fs::hard_link(blob_path(box_id, source_rowid), &destination)
+            .map_err(Errno::from)?;
+        let new_inode = self.ino_for(&(box_id, new_rel.clone()));
+        let attr = self.attr_of(&b, new_inode, &new_rel).ok_or(Errno::EIO)?;
+        self.inner.inodes.acquire(new_inode, 1);
+        self.push_event(box_id, new_rel, "link");
+        Ok(attr)
+    }
+
     fn fallocate_node(
         &self,
         pid: u32,
@@ -2896,41 +2936,9 @@ impl Filesystem for SarunFs {
 
     fn link(&self, req: &Request, ino: INodeNo, newparent: INodeNo,
             newname: &OsStr, reply: ReplyEntry) {
-        // Hardlink as copy-up: a new row backed by a fresh copy of the source
-        // bytes. Not true inode sharing (nlink stays 1), but it stops the EPERM
-        // that breaks git clone --local / ccache — they get a working second
-        // name. Same approximation the Python engine's _link_overlay makes.
-        let (Some((sbid, srel)), Some((nbid, nprel))) =
-            (self.key_of(ino), self.key_of(newparent)) else {
-            return reply.error(Errno::ENOENT);
-        };
-        if sbid != nbid || sbid == 0 { return reply.error(Errno::EXDEV); }
-        let Some(b) = self.box_of(sbid) else { return reply.error(Errno::ENOENT) };
-        let Some(name) = newname.to_str() else { return reply.error(Errno::EINVAL) };
-        let nrel = if nprel.is_empty() { name.to_string() }
-                   else { format!("{nprel}/{name}") };
-        if self.ro_denied(sbid, &nrel) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
-        }
-        // materialise source bytes into the new name's blob.
-        if self.copy_up(&b, &srel, req.pid()).is_err() {
-            return reply.error(Errno::EIO);
-        }
-        let src_rowid = match self.layer(&b, &srel) {
-            Layer::UpperFile { rowid, .. } => rowid,
-            _ => return reply.error(Errno::EPERM), // only files link here
-        };
-        let writer = b.writer_for(req.pid());
-        let nrow = b.ensure_file_row(&nrel, 0o100644, writer);
-        let dst = blob_path(sbid, nrow);
-        if let Some(p) = dst.parent() { let _ = std::fs::create_dir_all(p); }
-        if std::fs::copy(blob_path(sbid, src_rowid), &dst).is_err() {
-            return reply.error(Errno::EIO);
-        }
-        let ino2 = self.ino_for(&(sbid, nrel.clone()));
-        match self.attr_of(&b, ino2, &nrel) {
-            Some(a) => reply.entry(&TTL, &a, Generation(0)),
-            None => reply.error(Errno::EIO),
+        match self.link_node(req.pid(), u64::from(ino), u64::from(newparent), newname) {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -3355,6 +3363,30 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             flags,
         )
         .map_err(virtio_error)
+    }
+
+    fn link(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+        newparent: u64,
+        newname: &CStr,
+    ) -> std::io::Result<virtiofsd::filesystem::Entry> {
+        let attr = self
+            .link_node(
+                ctx.pid as u32,
+                inode,
+                newparent,
+                OsStr::from_bytes(newname.to_bytes()),
+            )
+            .map_err(virtio_error)?;
+        Ok(virtiofsd::filesystem::Entry {
+            inode: u64::from(attr.ino),
+            generation: 0,
+            attr: crate::sarunfs::virtio_attr(attr),
+            attr_timeout: TTL,
+            entry_timeout: TTL,
+        })
     }
 
     fn read<W: virtiofsd::filesystem::ZeroCopyWriter>(
@@ -3986,6 +4018,26 @@ mod chain_tests {
             .unwrap(),
             b"created",
         );
+        let hardlink_name = CString::new("hardlink").unwrap();
+        let hardlink = <SarunFs as virtiofsd::filesystem::FileSystem>::link(
+            &fs,
+            ctx,
+            created.inode,
+            entry.inode,
+            &hardlink_name,
+        )
+        .unwrap();
+        assert_eq!(hardlink.attr.nlink, 2);
+        let Layer::UpperFile { rowid: source_rowid, .. } = fs.resolve(id, "created") else {
+            panic!("hardlink source missing");
+        };
+        let Layer::UpperFile { rowid: linked_rowid, .. } = fs.resolve(id, "hardlink") else {
+            panic!("hardlink destination missing");
+        };
+        assert_eq!(
+            blob_path(id, source_rowid).metadata().unwrap().ino(),
+            blob_path(id, linked_rowid).metadata().unwrap().ino(),
+        );
         let renamed_name = CString::new("renamed").unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::rename(
             &fs,
@@ -4004,6 +4056,10 @@ mod chain_tests {
         assert_eq!(renamed.inode, created.inode);
         <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
             &fs, ctx, entry.inode, &link_name,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
+            &fs, ctx, entry.inode, &hardlink_name,
         )
         .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
