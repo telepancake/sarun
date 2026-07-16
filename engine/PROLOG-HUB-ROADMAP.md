@@ -203,6 +203,25 @@ parsing predicates, printers, completion walkers, or context planners. The
 engine interprets the value without importing the grammar module or switching
 on its identity. Grammar composition resolves values/handles as data.
 
+Representation grammars remain independent even when sarun commonly uses
+them together. A text grammar may relate source to `TextAst`, while a binary
+grammar relates bytes to a distinct `WireAst`. Neither grammar imports or
+names the other. The client supplies an immutable glue relation
+`TextAst <-> WireAst` and installs a composed handle. Structural identity is
+ordinary unification; renamed, defaulted, gathered, or semantically different
+fields are explicit bridge data. The engine owns only generic composition and
+must not acquire action-, packet-, or language-specific AST adaptation.
+
+Context dependencies follow the representation that introduces them. A text
+name can emit and resolve a context query into a semantic identity before the
+bridge relates that identity to `WireAst`; the binary grammar does not learn
+about the original spelling. Composition namespaces query identities, carries
+evidence and dependency keys across bridges, and permits a bridge to relate
+context-bearing values without executing or hiding a lookup. Rust may execute
+generated direct codecs for an already closed wire AST on the hot path, but
+ad-hoc Rust AST conversion is not a substitute for installed glue relation
+data.
+
 Boundary acceptance tests must prove all of the following before grammar
 notation work resumes:
 
@@ -313,6 +332,17 @@ vary only their given bindings, and substring filtering is a generic pure
 projection template. The old help predicate, operation cases, and textual
 decoder have been deleted. Action-request materialization is the one remaining
 old operation.
+
+Generic relation composition now separates representation grammars at the
+engine boundary. `compose_grammar(Left, SharedBindings, Right)` joins two
+immutable relations through explicitly named AST bindings in either direction;
+`binding_grammar/1` is the neutral leaf used by glue relations. Component
+context queries and dependency keys are namespaced as `left`/`right`, while a
+successful observation binds the originating AST before the bridge runs.
+Foreign tests prove both `source <-> TextAst <-> WireAst` and contextual-name
+resolution before `TextAst <-> WireAst`, without sarun grammar imports. The
+next checkpoint must express sarun's command-to-request adaptation as its own
+immutable bridge and compose it with an independent wire-AST relation.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:

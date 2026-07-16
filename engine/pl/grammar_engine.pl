@@ -76,6 +76,23 @@ transform_relation(choice_grammar(Alternatives), Given, Wanted, Observations,
     sort(DependencyKeys0, DependencyKeys),
     append(Diagnostics0, LimitDiagnostics, Diagnostics).
 
+transform_relation(compose_grammar(Left, Shared, Right), Given, Wanted,
+                   Observations, Limits, Reply) :-
+    proper_atom_names(Shared),
+    ( compose_direction(Left, left, Shared, Right, right, Given, Wanted,
+                        Observations, Limits, Reply)
+    -> true
+    ;  compose_direction(Right, right, Shared, Left, left, Given, Wanted,
+                         Observations, Limits, Reply)
+    ).
+
+transform_relation(binding_grammar(Names), Given, Wanted, _Observations,
+                   _Limits,
+                   reply([solution(Bindings, 0)], [], [], [])) :-
+    proper_atom_names(Names),
+    names_within(Wanted, Names),
+    requested_bindings(Wanted, Given, Bindings).
+
 transform_relation(projection_grammar(_Grammar, Projections), Given, Wanted,
                    _Observations, _Limits, Reply) :-
     standalone_projection_reply(Projections, Given, Wanted, Reply),
@@ -87,6 +104,7 @@ transform_relation(projection_grammar(Grammar, Projections), Given, Wanted,
     transform_relation(Grammar, InnerGiven, InnerWanted, Observations, Limits,
                        InnerReply),
     project_reply(Projections, Wanted, InnerReply, Reply).
+
 
 transform_relation(context_grammar, Given, Wanted, Observations, _Limits,
                    reply([solution(Bindings, 0)], [], DependencyKeys, [])) :-
@@ -149,6 +167,75 @@ transform_relation(
     project_highlights(Evidence, Highlights),
     Available = [binding(highlights, Highlights)],
     requested_bindings(Wanted, Available, Bindings).
+
+proper_atom_names([]).
+proper_atom_names([Name|Names]) :-
+    atom(Name),
+    proper_atom_names(Names).
+
+names_within([], _).
+names_within([Name|Rest], Names) :-
+    member_term(Name, Names),
+    names_within(Rest, Names).
+
+compose_direction(First, FirstKey, Shared, Second, SecondKey, Given, Wanted,
+                  Observations, Limits,
+                  reply(Solutions, Queries, Dependencies, Diagnostics)) :-
+    scoped_observations(FirstKey, Observations, FirstObservations),
+    transform_relation(First, Given, Shared, FirstObservations, Limits,
+                       FirstReply),
+    FirstReply = reply(FirstSolutions, FirstQueries0, FirstDependencies0,
+                       FirstDiagnostics),
+    FirstSolutions = [_|_],
+    scoped_observations(SecondKey, Observations, SecondObservations),
+    findall(joined(FirstPreference, SecondReply),
+            ( candidate_member(solution(SharedBindings, FirstPreference),
+                               FirstSolutions),
+              merge_bindings(Given, SharedBindings, SecondGiven),
+              transform_relation(Second, SecondGiven, Wanted,
+                                 SecondObservations, Limits, SecondReply)
+            ),
+            Joined),
+    Joined = [_|_],
+    compose_joined(Joined, SecondKey, Solutions0, SecondQueries,
+                   SecondDependencies, SecondDiagnostics),
+    Limits = limits(MaxSolutions, _, _),
+    limit_solutions(Solutions0, MaxSolutions, Solutions, LimitDiagnostics),
+    scope_queries(FirstKey, FirstQueries0, FirstQueries),
+    scope_dependencies(FirstKey, FirstDependencies0, FirstDependencies),
+    append(FirstQueries, SecondQueries, Queries0),
+    sort(Queries0, Queries),
+    append(FirstDependencies, SecondDependencies, Dependencies0),
+    sort(Dependencies0, Dependencies),
+    append(FirstDiagnostics, SecondDiagnostics, Diagnostics0),
+    append(Diagnostics0, LimitDiagnostics, Diagnostics).
+
+merge_bindings(Bindings, [], Bindings).
+merge_bindings(Bindings0, [binding(Name, Value)|Bindings], Merged) :-
+    put_binding(Name, Value, Bindings0, Bindings1),
+    merge_bindings(Bindings1, Bindings, Merged).
+
+compose_joined([], _, [], [], [], []).
+compose_joined([joined(FirstPreference,
+                       reply(SecondSolutions0, Queries0, Dependencies0,
+                             Diagnostics0))|Joined],
+               SecondKey, Solutions, Queries, Dependencies, Diagnostics) :-
+    add_solution_preference(SecondSolutions0, FirstPreference,
+                            SecondSolutions),
+    scope_queries(SecondKey, Queries0, ScopedQueries),
+    scope_dependencies(SecondKey, Dependencies0, ScopedDependencies),
+    compose_joined(Joined, SecondKey, RestSolutions, RestQueries,
+                   RestDependencies, RestDiagnostics),
+    append(SecondSolutions, RestSolutions, Solutions),
+    append(ScopedQueries, RestQueries, Queries),
+    append(ScopedDependencies, RestDependencies, Dependencies),
+    append(Diagnostics0, RestDiagnostics, Diagnostics).
+
+add_solution_preference([], _, []).
+add_solution_preference([solution(Bindings, Preference0)|Solutions], Added,
+                        [solution(Bindings, Preference)|Adjusted]) :-
+    Preference is Preference0 + Added,
+    add_solution_preference(Solutions, Added, Adjusted).
 
 % Constant metadata is a representation in its own right: asking for it must
 % not manufacture a dummy source merely to enter the inner sequence grammar.

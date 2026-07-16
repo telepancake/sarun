@@ -9,6 +9,8 @@ test_name(context_queries_completions_and_dependencies_are_one_relation).
 test_name(context_support_uses_the_same_given_wanted_envelope).
 test_name(grammar_choice_and_projection_are_executable_data).
 test_name(projection_template_is_bidirectional_and_can_append_values).
+test_name(independent_ast_relations_compose_in_both_directions).
+test_name(composed_context_dependencies_bind_before_ast_bridge).
 test_name(choice_namespaces_context_dependencies).
 test_name(grammar_terminal_codecs_are_declarative_and_bidirectional).
 test_name(opaque_handle_resolves_install_once_grammar).
@@ -257,6 +259,87 @@ run_test(projection_template_is_bidirectional_and_can_append_values) :-
         request(Grammar, given([binding(semantic, Semantic)]), want([source]),
                 observations([]), Limits),
         reply([solution([binding(source, "resume 7")], 0)], [], [], [])).
+
+run_test(independent_ast_relations_compose_in_both_directions) :-
+    TextGrammar = projection_grammar(
+        sequence_grammar(
+            [literal(open, "open", keyword, open, 20),
+             argument(arg(name, word, required, scalar))],
+            terminals([
+                terminal(word, identifier,
+                         [surface(word("work"), "work")])
+            ]), separator(" "), contexts([])),
+        [projection(text_ast,
+                    structure(text_command,
+                              [constant(open), reference(arguments)]))]),
+    AstBridge = projection_grammar(
+        binding_grammar([fields]),
+        [projection(text_ast,
+                    structure(text_command,
+                              [constant(open), reference(fields)])),
+         projection(wire_ast,
+                    structure(wire_call,
+                              [constant(7), reference(fields)]))]),
+    Grammar = compose_grammar(TextGrammar, [text_ast], AstBridge),
+    source("open", 0, Open),
+    source("work", 5, Work),
+    limits(Limits),
+    WireAst = wire_call(7, [word("work")]),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               source([Open, Work, end(9)], exact))]),
+                want([wire_ast]), observations([]), Limits),
+        reply([solution([binding(wire_ast, WireAst)], 36)], [], [], [])),
+    transform(
+        request(Grammar, given([binding(wire_ast, WireAst)]), want([source]),
+                observations([]), Limits),
+        reply([solution([binding(source, "open work")], 0)], [], [], [])).
+
+run_test(composed_context_dependencies_bind_before_ast_bridge) :-
+    TextGrammar = projection_grammar(
+        sequence_grammar(
+            [literal(open, "open", keyword, open, 20),
+             argument(arg(name, word, required, scalar))],
+            terminals([
+                terminal(word, identifier,
+                         [surface(word("work"), "work")])
+            ]), separator(" "),
+            contexts([context(name, one, object, root)])),
+        [projection(text_ast,
+                    structure(text_command,
+                              [constant(open), reference(arguments)]))]),
+    AstBridge = projection_grammar(
+        binding_grammar([fields]),
+        [projection(text_ast,
+                    structure(text_command,
+                              [constant(open), reference(fields)])),
+         projection(wire_ast,
+                    structure(wire_call,
+                              [constant(7), reference(fields)]))]),
+    Grammar = compose_grammar(TextGrammar, [text_ast], AstBridge),
+    source("open", 0, Open),
+    source("work", 5, Work),
+    Source = source([Open, Work, end(9)], exact),
+    limits(Limits),
+    Query = ask(one, object, name("work")),
+    QueryId = branch(left, q(1)),
+    transform(
+        request(Grammar, given([binding(source, Source)]), want([wire_ast]),
+                observations([]), Limits),
+        reply([solution([binding(wire_ast,
+                                 wire_call(7, [word("work")]))], 36)],
+              [query(QueryId, Query)], [], [])),
+    Entry = entry(object, 5, ["work"], object_id(5), []),
+    Observation = observed(QueryId, Query, source(objects, 8),
+                           some(one(Entry))),
+    transform(
+        request(Grammar, given([binding(source, Source)]), want([wire_ast]),
+                observations([Observation]), Limits),
+        reply([solution([binding(wire_ast,
+                                 wire_call(7, [object_id(5)]))], 36)],
+              [query(QueryId, Query)],
+              [dependency(QueryId, Query, some(one(Entry)))], [])).
 
 run_test(choice_namespaces_context_dependencies) :-
     Grammar = choice_grammar([
