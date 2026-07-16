@@ -147,6 +147,10 @@ pub type Overlay = SarunFs;
 struct Inner {
     lower: PathBuf,
     boxes: RwLock<BTreeMap<i64, Arc<BoxState>>>,
+    // Engine-owned read-only files projected into a live box without becoming
+    // captured upper state. This is the generic seam for boot/runtime support
+    // objects: review/apply must never mistake `/init` for a user write.
+    projections: RwLock<HashMap<Key, PathBuf>>,
     inodes: crate::sarunfs::InodeTable,
     detached_attrs: RwLock<HashMap<u64, FileAttr>>,
     fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
@@ -570,6 +574,7 @@ impl SarunFs {
         let ov = SarunFs { inner: Arc::new(Inner {
             lower,
             boxes: RwLock::new(BTreeMap::new()),
+            projections: RwLock::new(HashMap::new()),
             inodes: crate::sarunfs::InodeTable::new((0, String::new())),
             detached_attrs: RwLock::new(HashMap::new()),
             fhs: RwLock::new(HashMap::new()),
@@ -994,6 +999,35 @@ impl SarunFs {
 
     pub fn remove_box(&self, id: i64) {
         self.inner.boxes.write().unwrap().remove(&id);
+        self.inner.projections.write().unwrap().retain(|(bid, _), _| *bid != id);
+    }
+
+    /// Project a host file read-only at `rel` in one live box. Projections are
+    /// filesystem presentation state, not overlay mutations, and disappear
+    /// with the box.
+    pub fn project_file(&self, id: i64, rel: &str, source: PathBuf)
+        -> std::io::Result<()>
+    {
+        if !source.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("projected file {} does not exist", source.display()),
+            ));
+        }
+        if !self.inner.boxes.read().unwrap().contains_key(&id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("box {id} not registered"),
+            ));
+        }
+        self.inner.projections.write().unwrap()
+            .insert((id, rel.to_string()), source);
+        Ok(())
+    }
+
+    fn projected_file(&self, id: i64, rel: &str) -> Option<PathBuf> {
+        self.inner.projections.read().unwrap()
+            .get(&(id, rel.to_string())).cloned()
     }
 
     pub fn box_ids(&self) -> Vec<i64> {
@@ -1013,6 +1047,9 @@ impl SarunFs {
     /// Hydrates the box + its parent chain on demand.
     pub fn box_read_file(&self, bid: i64, rel: &str) -> std::io::Result<Vec<u8>> {
         self.hydrate_chain(Some(bid));
+        if let Some(path) = self.projected_file(bid, rel) {
+            return std::fs::read(path);
+        }
         match self.resolve(bid, rel) {
             Layer::UpperFile { owner, rowid, .. } => {
                 // Restore an inline (discard-reverted) row to its blob so this
@@ -1047,6 +1084,10 @@ impl SarunFs {
     pub fn box_file_mode(&self, bid: i64, rel: &str) -> Option<u32> {
         use std::os::unix::fs::PermissionsExt;
         self.hydrate_chain(Some(bid));
+        if let Some(path) = self.projected_file(bid, rel) {
+            return std::fs::metadata(path).ok()
+                .map(|metadata| metadata.permissions().mode() & 0o7777);
+        }
         match self.resolve(bid, rel) {
             Layer::UpperFile { mode, .. } | Layer::ExtFile { mode, .. } =>
                 Some(mode & 0o7777),
@@ -1065,6 +1106,9 @@ impl SarunFs {
     {
         use std::io::{Seek, SeekFrom, Write};
         self.hydrate_chain(Some(bid));
+        if self.ro_denied(bid, rel) {
+            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+        }
         let Some(b) = self.box_of(bid) else {
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
                                            format!("box {bid} not registered")));
@@ -1081,19 +1125,6 @@ impl SarunFs {
         let mtime_ns = SystemTime::now().duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64).unwrap_or(0);
         b.finalize_file(rel, sz, mtime_ns, writer);
-        Ok(())
-    }
-
-    /// Install engine-owned bytes with an explicit mode through the same upper
-    /// representation.  QEMU uses this for `/init`; it is still an ordinary
-    /// captured file as far as every transport and later review are concerned.
-    pub fn box_install_file(&self, bid: i64, rel: &str, bytes: &[u8], mode: u32)
-        -> std::io::Result<()>
-    {
-        self.box_write_file(bid, rel, bytes)?;
-        let r#box = self.box_of(bid).ok_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::NotFound, format!("box {bid} not registered")))?;
-        r#box.set_mode(rel, libc::S_IFREG | (mode & 0o7777));
         Ok(())
     }
 
@@ -1271,6 +1302,9 @@ impl SarunFs {
     /// checked BEFORE any capture side effect) — the invariant that
     /// keeps the captured layer independent of what was attached.
     pub(crate) fn ro_denied(&self, bid: i64, rel: &str) -> bool {
+        if self.projected_file(bid, rel).is_some() {
+            return true;
+        }
         let mut cur = Some(bid);
         let mut seen = 0;
         while let Some(id) = cur {
@@ -1484,6 +1518,11 @@ impl SarunFs {
     /// Attributes for (box, rel) through the FULL merge (own → parent chain →
     /// host), or None when absent.
     fn attr_of(&self, b: &BoxState, ino: u64, rel: &str) -> Option<FileAttr> {
+        if let Some(path) = self.projected_file(b.id, rel) {
+            let mut attr = self.attr_from_md(ino, &std::fs::metadata(path).ok()?);
+            attr.kind = FileType::RegularFile;
+            return Some(attr);
+        }
         let layer = self.resolve(b.id, rel);
         // --api substitute: same FUSE-shadow trick as brush, but the target
         // is the safe-for-box oaita.toml the engine pre-wrote at startup.
@@ -1733,6 +1772,29 @@ impl SarunFs {
         let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
         let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
         let want_write = flags & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32;
+        if let Some(path) = self.projected_file(bid, &rel) {
+            if want_write { return Err(Errno::EROFS); }
+            let file = File::open(path).map_err(Errno::from)?;
+            let handle = self.reg_fh(FhInner {
+                box_id: bid,
+                rel,
+                file: Some(file),
+                upper: false,
+                dirty: false,
+                last_pid: pid,
+                last_tgid: 0,
+                sink: None,
+                passthrough: false,
+                _backing: None,
+            });
+            return Ok(OpenedNode {
+                handle,
+                direct_io: false,
+                nonseekable: false,
+                keep_cache: true,
+                backing_candidate: allow_backing,
+            });
+        }
         if want_write && self.ro_denied(bid, &rel) {
             return Err(Errno::EROFS);
         }
@@ -2556,6 +2618,9 @@ impl SarunFs {
     }
 
     fn copy_up(&self, b: &BoxState, rel: &str, pid: u32) -> std::io::Result<File> {
+        if self.ro_denied(b.id, rel) {
+            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+        }
         let writer = b.writer_for(pid);
         // Source the lower bytes + mode from the parent-chain resolution.
         let (src, mode): (Option<PathBuf>, u32) = match self.resolve(b.id, rel) {
@@ -2677,6 +2742,13 @@ impl SarunFs {
                 }
                 for p in present { names.insert(p, ()); }
             }
+        }
+        for ((bid, projected), _) in self.inner.projections.read().unwrap().iter() {
+            if *bid != b.id { continue; }
+            let (parent, name) = projected.rsplit_once('/')
+                .map(|(parent, name)| (parent, name))
+                .unwrap_or(("", projected.as_str()));
+            if parent == rel { names.insert(name.to_string(), ()); }
         }
         let mut out = vec![];
         for name in names.keys() {
@@ -4217,6 +4289,42 @@ mod chain_tests {
         )
         .unwrap();
 
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn projected_file_is_visible_executable_read_only_and_not_captured() {
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "sarun-projection-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("appliance-init");
+        std::fs::write(&source, b"target init").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: TEST_STATE_HOME_LOCK serializes state-home tests.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let fs = SarunFs::new(tmp.clone());
+        let id = 9301;
+        let state = Arc::new(BoxState::create(id).unwrap());
+        fs.add_box(state.clone());
+        fs.project_file(id, "init", source).unwrap();
+
+        assert_eq!(fs.box_read_file(id, "init").unwrap(), b"target init");
+        assert_eq!(fs.box_file_mode(id, "init"), Some(0o755));
+        assert!(fs.box_list_dir(id, "").unwrap().iter()
+            .any(|(name, kind)| name == "init" && *kind == 'f'));
+        let error = fs.box_write_file(id, "init", b"overwrite").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EROFS));
+        assert!(!state.kinds.read().unwrap().contains_key("init"));
+
+        fs.remove_box(id);
+        assert!(fs.inner.projections.read().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

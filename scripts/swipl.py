@@ -12,6 +12,7 @@ import hashlib
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -287,6 +288,15 @@ def configure(
     )
 
 
+def remove_zig_linker_depfile(build: Path) -> None:
+    """Work around CMake 4.2 probing a Zig 0.16 linker flag that crashes."""
+    ninja = build / "build.ninja"
+    text = ninja.read_text()
+    rewritten = re.sub(r" +-Xlinker --dependency-file=[^\s]+", "", text)
+    if rewritten != text:
+        ninja.write_text(rewritten)
+
+
 def build_zlib(
     source: Path,
     build: Path,
@@ -549,6 +559,10 @@ def main() -> int:
         ],
         env,
     )
+    # CMake detects the Clang-shaped driver and adds an executable-link
+    # depfile option. Zig 0.16.0 currently segfaults on that option for this
+    # static musl link. Compile depfiles remain intact; only link rules lose it.
+    remove_zig_linker_depfile(target_swipl_build)
     run(
         "cmake",
         "--build",

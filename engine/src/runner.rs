@@ -142,14 +142,19 @@ fn send_register_fds(conn: &UnixStream, line: &[u8], pidfd: i32,
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg.as_mut_ptr().cast();
     msg.msg_controllen = unsafe { libc::CMSG_SPACE(nbytes) } as _;
-    unsafe {
+    let sent = unsafe {
         let c = libc::CMSG_FIRSTHDR(&msg);
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
         (*c).cmsg_len = libc::CMSG_LEN(nbytes) as _;
         std::ptr::copy_nonoverlapping(
             fds.as_ptr().cast(), libc::CMSG_DATA(c), nbytes as usize);
-        libc::sendmsg(conn.as_raw_fd(), &msg, 0) >= 0
+        libc::sendmsg(conn.as_raw_fd(), &msg, 0)
+    };
+    if sent < 0 {
+        false
+    } else {
+        conn_write_all(conn, &line[sent as usize..])
     }
 }
 

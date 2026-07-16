@@ -60,6 +60,7 @@ fn qemu_args(
     kernel: &Path,
     virtiofs_socket: &Path,
     control_socket: &Path,
+    data_dir: &Path,
     kvm: bool,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
@@ -72,6 +73,10 @@ fn qemu_args(
         "stdio",
         "-m",
         "256M",
+        "-object",
+        "memory-backend-memfd,id=mem,size=256M,share=on",
+        "-numa",
+        "node,memdev=mem",
         "-smp",
         "1",
         "-kernel",
@@ -80,21 +85,38 @@ fn qemu_args(
     .map(OsString::from)
     .collect();
     args.push(kernel.as_os_str().to_owned());
-    let (machine, console, fs_device, serial_device) = match architecture {
-        QemuArchitecture::Aarch64 => ("virt", "ttyAMA0", "vhost-user-fs-pci", "virtio-serial-pci"),
+    let (machine, console, fs_device, serial_device, shutdown) = match architecture {
+        QemuArchitecture::Aarch64 => (
+            "virt",
+            "ttyAMA0",
+            "vhost-user-fs-pci",
+            "virtio-serial-pci",
+            "",
+        ),
         QemuArchitecture::X8664 => (
-            "microvm",
+            // With ACPI enabled, microvm does not add its virtio-mmio
+            // transports to the kernel command line.  The appliance kernel
+            // deliberately has no ACPI device-discovery path, so make the
+            // transport description explicit and leave unused PC/RTC
+            // hardware out of the paired machine.
+            "microvm,acpi=off,pcie=off,rtc=off",
             "ttyS0",
             "vhost-user-fs-device",
             "virtio-serial-device",
+            " reboot=t",
         ),
     };
     args.extend(["-machine".into(), machine.into()]);
+    if architecture == QemuArchitecture::X8664 {
+        args.extend(["-L".into(), data_dir.as_os_str().to_owned()]);
+    }
     args.extend(["-accel".into(), if kvm { "kvm" } else { "tcg" }.into()]);
     args.extend(["-cpu".into(), if kvm { "host" } else { "max" }.into()]);
     args.extend([
         "-append".into(),
-        format!("console={console} root={ROOT_TAG} rootfstype=virtiofs rw init=/init panic=-1")
+        format!(
+            "console={console} root={ROOT_TAG} rootfstype=virtiofs rw init=/init panic=-1{shutdown}"
+        )
             .into(),
         "-chardev".into(),
         format!("socket,id=fs,path={}", virtiofs_socket.display()).into(),
@@ -135,6 +157,18 @@ fn wait_for_control(listener: &UnixListener, child: &mut Child) -> io::Result<Un
     }
 }
 
+fn reap_appliance(child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Boot one command and return its guest exit status.
 pub fn run(
     architecture: QemuArchitecture,
@@ -143,6 +177,10 @@ pub fn run(
     command: &ApplianceCommand,
 ) -> io::Result<i32> {
     let qemu = qemu_binary(architecture);
+    let data_dir = qemu
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("share/qemu");
     let kernel = target_kernel(architecture);
     for (kind, path) in [("QEMU", &qemu), ("kernel", &kernel)] {
         if !path.is_file() {
@@ -163,9 +201,20 @@ pub fn run(
     }
     let _ = std::fs::remove_file(&control_socket);
     let listener = UnixListener::bind(&control_socket)?;
-    let kvm =
-        Path::new("/dev/kvm").exists() && architecture_name(architecture) == std::env::consts::ARCH;
-    let args = qemu_args(architecture, &kernel, virtiofs_socket, &control_socket, kvm);
+    let kvm = architecture_name(architecture) == std::env::consts::ARCH
+        && std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok();
+    let args = qemu_args(
+        architecture,
+        &kernel,
+        virtiofs_socket,
+        &control_socket,
+        &data_dir,
+        kvm,
+    );
     let mut child = Command::new(&qemu)
         .args(&args)
         .stdin(Stdio::inherit())
@@ -181,7 +230,7 @@ pub fn run(
     if result.is_err() {
         let _ = child.kill();
     }
-    let _ = child.wait();
+    reap_appliance(&mut child);
     let _ = std::fs::remove_file(control_socket);
     result
 }
@@ -360,6 +409,9 @@ pub fn init_main() -> i32 {
             .open(&port)?;
         let command: ApplianceCommand = crate::socket_wire::read_versioned(&mut stream)?;
         let code = execute_guest(&command)?;
+        // The result is the host's safe-to-stop boundary: publish it only
+        // after dirty guest pages have reached the shared filesystem.
+        unsafe { libc::sync() };
         crate::socket_wire::write_versioned(&mut stream, &ApplianceResult { code })?;
         Ok(code)
     })();
@@ -370,10 +422,7 @@ pub fn init_main() -> i32 {
             127
         }
     };
-    unsafe {
-        libc::sync();
-        libc::reboot(libc::RB_POWER_OFF);
-    }
+    unsafe { libc::reboot(libc::RB_POWER_OFF) };
     code
 }
 
@@ -388,6 +437,7 @@ mod tests {
             Path::new("K"),
             Path::new("F"),
             Path::new("C"),
+            Path::new("D"),
             false,
         );
         let a = a
@@ -403,6 +453,7 @@ mod tests {
             Path::new("K"),
             Path::new("F"),
             Path::new("C"),
+            Path::new("D"),
             false,
         );
         let x = x
@@ -410,9 +461,10 @@ mod tests {
             .map(|v| v.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(x.contains("-machine microvm"));
+        assert!(x.contains("-machine microvm,acpi=off,pcie=off,rtc=off"));
         assert!(x.contains("vhost-user-fs-device"));
         assert!(x.contains("console=ttyS0"));
+        assert!(x.contains("-L D"));
     }
 
     #[test]

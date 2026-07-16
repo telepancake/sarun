@@ -68,6 +68,11 @@ build_qemu() {
     mkdir -p "$out/host-$host_arch"
     install -m755 "$qbuild/qemu-system-aarch64" "$out/host-$host_arch/"
     install -m755 "$qbuild/qemu-system-x86_64" "$out/host-$host_arch/"
+    mkdir -p "$out/host-$host_arch/share/qemu"
+    install -m644 "$trees/qemu-$qemu_version/pc-bios/bios-microvm.bin" \
+        "$trees/qemu-$qemu_version/pc-bios/qboot.rom" \
+        "$trees/qemu-$qemu_version/pc-bios/linuxboot_dma.bin" \
+        "$out/host-$host_arch/share/qemu/"
 }
 
 build_kernel() {
@@ -98,7 +103,8 @@ build_inner() {
     for arch in aarch64 x86_64; do
         local target
         target=$arch-unknown-linux-musl
-        python3 "$repo/scripts/swipl.py" --target "$arch-linux-musl"
+        PATH="$(uv tool dir)/cargo-zigbuild/bin:$PATH" \
+            python3 "$repo/scripts/swipl.py" --target "$arch-linux-musl"
         rustup target add "$target"
         (cd "$repo/engine" && PATH="$(uv tool dir)/cargo-zigbuild/bin:$PATH" \
             cargo zigbuild --release --target "$target")

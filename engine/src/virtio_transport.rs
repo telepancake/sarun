@@ -87,7 +87,17 @@ impl BoxExport {
         let result = thread.join()
             .map_err(|_| io::Error::other("virtio-fs transport thread panicked"))?;
         let _ = std::fs::remove_file(&self.socket);
-        if forced { Ok(()) } else { result }
+        if forced {
+            Ok(())
+        } else {
+            match result {
+                // QEMU closes the vhost-user socket after the guest powers
+                // down. virtiofsd reports that ordinary lifecycle EOF through
+                // its generic request-error wrapper instead of `Ok(())`.
+                Err(error) if error.to_string().contains("peer disconnected") => Ok(()),
+                other => other,
+            }
+        }
     }
 
     fn wait_ready(&self, timeout: Duration) -> io::Result<()> {

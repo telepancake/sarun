@@ -126,6 +126,7 @@ fn top_level_help() -> Result<String, String> {
        sarun --once --sock PATH           render one UI frame and exit (headless)\n\
      \n\
      run FLAGS:\n  \
+       --fuse | --sud | --qemu aarch64|x86_64   execution backend (default: fuse)\n  \
        -n / -N / --net off|tap|host   per-box networking (default: tap, a proxied per-box netns)\n  \
        -t passthrough   -d direct (no overlay)   -e record-env   -b brush-shell   -p pty\n  \
        -C DIR   --no-parent   --readonly-parent   --api (oaita proxy)   --vars (variable provenance)\n"
@@ -835,6 +836,7 @@ fn main() {
                 eprintln!(
                     "usage: sarun run [FLAGS] [NAME] -- CMD...   (needs a running engine/UI)\n\
                     \x20 flags: -n/-N/--net off|tap|host  -t passthrough  -d direct  -e record-env\n\
+                    \x20        --fuse | --sud | --qemu aarch64|x86_64\n\
                     \x20        -b brush-shell  -p pty  -C DIR  --no-parent  --readonly-parent  --api\n\
                     \x20        --vars record variable assignments (Vars view)"
                 );

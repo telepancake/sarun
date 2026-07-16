@@ -101,7 +101,7 @@ as executable mappings and mmap that genuinely need a host fd.
 - [x] Add verified, cached QEMU/Linux source builders and per-architecture
       manifests/configs.
 - [x] Build minimal paired QEMU/kernel artifacts with virtio-fs, console,
-      virtio-serial control, networking, KVM, and TCG support required by sarun.
+      virtio-serial control, KVM, and TCG support required by sarun.
 - [x] Add the host launcher/vhost-user backend and target `/init` control plane.
   - [x] Embedded vhost-user lifecycle serves a scoped `SarunFs` box root on a
         private per-box socket and exits when its frontend disconnects.
@@ -110,6 +110,10 @@ as executable mappings and mmap that genuinely need a host fd.
   - [x] Launch the paired QEMU appliance and implement the guest `/init`
         control endpoint.
 - [ ] Connect off/host/tap networking to the existing engine policy.
+- [x] Boot aarch64 under TCG on the current host; verify a successful command,
+      non-zero exit propagation, captured filesystem writes, and no host write.
+- [x] Boot x86_64 under TCG on the aarch64 host and execute the projected
+      x86_64 `/init` through the same binary control and SarunFs transport.
 - [ ] Pass the full appliance suite on aarch64 TCG here, then aarch64 KVM where
       available, then x86_64 TCG/KVM.
 
