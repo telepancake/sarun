@@ -1226,6 +1226,82 @@ pub(crate) fn builtin_command_grammar() -> &'static crate::prolog::RelationValue
             ],
         )
     }
+    fn presentation(syntax: &str, description: String) -> V {
+        compound(
+            "presentation",
+            vec![list(vec![
+                compound(
+                    "meta",
+                    vec![V::Atom("syntax".into()), V::Atom(syntax.into())],
+                ),
+                compound(
+                    "meta",
+                    vec![V::Atom("description".into()), V::String(description)],
+                ),
+            ])],
+        )
+    }
+    fn path_domain(hint: clap::ValueHint) -> Option<&'static str> {
+        match hint {
+            clap::ValueHint::AnyPath => Some("filesystem_path"),
+            clap::ValueHint::FilePath => Some("filesystem_file"),
+            clap::ValueHint::DirPath => Some("filesystem_directory"),
+            clap::ValueHint::ExecutablePath => Some("filesystem_executable"),
+            _ => None,
+        }
+    }
+    fn contextual_path(name: String, domain: &str, description: String) -> V {
+        let path_codepoint = compound(
+            "terminal",
+            vec![
+                compound(
+                    "text",
+                    vec![compound(
+                        "codepoint",
+                        vec![compound(
+                            "except",
+                            vec![V::String(" \t\r\n\\'\"$|&;()<>".into())],
+                        )],
+                    )],
+                ),
+                compound(
+                    "presentation",
+                    vec![list(vec![
+                        compound(
+                            "meta",
+                            vec![V::Atom("syntax".into()), V::Atom("path".into())],
+                        ),
+                        compound(
+                            "meta",
+                            vec![V::Atom("tear".into()), V::Atom("symbolic".into())],
+                        ),
+                    ])],
+                ),
+            ],
+        );
+        compound(
+            "context",
+            vec![
+                V::Atom(name),
+                compound(
+                    "repeat",
+                    vec![V::Integer(1), V::Atom("unbounded".into()), path_codepoint],
+                ),
+                compound(
+                    "ask",
+                    vec![
+                        V::Atom("one".into()),
+                        V::Atom(domain.into()),
+                        compound(
+                            "name",
+                            vec![compound("value", vec![V::Atom("surface".into())])],
+                        ),
+                    ],
+                ),
+                presentation("path", description),
+            ],
+        )
+    }
 
     static GRAMMAR: std::sync::OnceLock<V> = std::sync::OnceLock::new();
     GRAMMAR.get_or_init(|| {
@@ -1241,6 +1317,7 @@ pub(crate) fn builtin_command_grammar() -> &'static crate::prolog::RelationValue
                 let mut command = definition();
                 command.build();
                 let mut argument_expressions = Vec::new();
+                let mut positional_expressions = Vec::new();
                 for argument in command.get_arguments().filter(|argument| {
                     !argument.is_hide_set() && argument.get_action().takes_values()
                 }) {
@@ -1275,9 +1352,6 @@ pub(crate) fn builtin_command_grammar() -> &'static crate::prolog::RelationValue
                         })
                         .collect::<Vec<_>>();
 
-                    if values.is_empty() {
-                        continue;
-                    }
                     let mut flags = Vec::new();
                     if let Some(short) = argument.get_short() {
                         flags.push(format!("-{short}"));
@@ -1285,7 +1359,7 @@ pub(crate) fn builtin_command_grammar() -> &'static crate::prolog::RelationValue
                     if let Some(long) = argument.get_long() {
                         flags.push(format!("--{long}"));
                     }
-                    for flag in flags {
+                    for flag in flags.into_iter().filter(|_| !values.is_empty()) {
                         let flag_literal = literal(
                             flag.clone(),
                             compound(
@@ -1316,28 +1390,83 @@ pub(crate) fn builtin_command_grammar() -> &'static crate::prolog::RelationValue
                             ])],
                         ));
                     }
+
+                    if argument.is_positional() {
+                        if let Some(domain) = path_domain(argument.get_value_hint()) {
+                            let description = argument
+                                .get_help()
+                                .map_or_else(|| format!("value for {}", argument.get_id()),
+                                             ToString::to_string);
+                            let value = contextual_path(
+                                format!("builtin_{command_name}_{}", argument.get_id()),
+                                domain,
+                                description,
+                            );
+                            let tail = compound(
+                                "seq",
+                                vec![list(vec![
+                                    compound("ref", vec![V::Atom("required_space".into())]),
+                                    value,
+                                ])],
+                            );
+                            let range = argument.get_num_args().unwrap_or_default();
+                            let minimum = if argument.is_required_set() {
+                                range.min_values()
+                            } else {
+                                0
+                            };
+                            let maximum = range.max_values();
+                            let expression = if minimum == 1 && maximum == 1 {
+                                tail
+                            } else if minimum == 0 && maximum == 1 {
+                                compound("optional", vec![tail])
+                            } else {
+                                compound(
+                                    "repeat",
+                                    vec![
+                                        V::Integer(minimum as i64),
+                                        if maximum == usize::MAX {
+                                            V::Atom("unbounded".into())
+                                        } else {
+                                            V::Integer(maximum as i64)
+                                        },
+                                        tail,
+                                    ],
+                                )
+                            };
+                            positional_expressions.push((
+                                argument.get_index().unwrap_or(usize::MAX),
+                                expression,
+                            ));
+                        }
+                    }
                 }
-                (!argument_expressions.is_empty()).then(|| {
-                    compound(
-                        "seq",
-                        vec![list(vec![
-                            literal(
-                                command_name.clone(),
-                                compound("builtin_command", vec![V::String(command_name.clone())]),
-                                "command",
-                                format!("{command_name} builtin"),
-                            ),
-                            compound(
-                                "repeat",
-                                vec![
-                                    V::Integer(0),
-                                    V::Atom("unbounded".into()),
-                                    choice(argument_expressions),
-                                ],
-                            ),
-                        ])],
-                    )
-                })
+                positional_expressions.sort_by_key(|(index, _)| *index);
+                if argument_expressions.is_empty() && positional_expressions.is_empty() {
+                    return None;
+                }
+                let mut invocation = vec![literal(
+                    command_name.clone(),
+                    compound("builtin_command", vec![V::String(command_name.clone())]),
+                    "command",
+                    format!("{command_name} builtin"),
+                )];
+                if !argument_expressions.is_empty() {
+                    invocation.push(compound(
+                        "repeat",
+                        vec![
+                            V::Integer(0),
+                            V::Atom("unbounded".into()),
+                            choice(argument_expressions),
+                        ],
+                    ));
+                }
+                invocation.extend(
+                    positional_expressions
+                        .into_iter()
+                        .map(|(_, expression)| expression),
+                );
+                Some(compound("seq", vec![list(invocation)]))
             })
             .collect::<Vec<_>>();
         assert!(command_expressions.len() >= 2);
@@ -3251,6 +3380,9 @@ mod builtin_boundary_tests {
         assert!(grammar.contains("grammar"));
         assert!(grammar.contains("builtin_invocation"));
         assert!(grammar.contains("emacs-standard"));
+        assert!(grammar.contains("filesystem_path"));
+        assert!(grammar.contains("builtin_edit_path"));
+        assert!(grammar.contains("context"));
         assert!(!grammar.contains("following"));
         assert!(!grammar.contains("positional"));
     }
@@ -3294,6 +3426,22 @@ mod builtin_boundary_tests {
                     && completion.replace_end == cursor
             }));
         }
+    }
+
+    #[test]
+    fn contextual_path_completion_comes_from_the_parsed_builtin_grammar() {
+        let dir = scratch_dir();
+        std::fs::write(dir.join("test1.sh"), "#!/bin/sh\n").expect("write path fixture");
+        let completions = super::BrushRelationCompletionProvider::complete_with_context(
+            "edit ./t",
+            8,
+            &crate::parser::FilesystemContext::new(&dir),
+        );
+        assert!(completions.iter().any(|completion| {
+            completion.insert == "./test1.sh"
+                && completion.replace_start == 5
+                && completion.replace_end == 8
+        }));
     }
 
     #[tokio::test]

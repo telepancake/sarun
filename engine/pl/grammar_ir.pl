@@ -120,6 +120,12 @@ valid_expression(dispatch(Key, Cases, Default), Names, Primitives) :-
 valid_expression(context(Name, Ask), _, _) :-
     atom(Name),
     valid_context_query(Ask).
+valid_expression(context(Name, Expression, Ask,
+                         presentation(Presentation)), Names, Primitives) :-
+    atom(Name),
+    valid_expression(Expression, Names, Primitives),
+    valid_context_query(Ask),
+    valid_metadata(Presentation).
 
 valid_expressions([], _, _).
 valid_expressions([Expression|Expressions], Names, Primitives) :-

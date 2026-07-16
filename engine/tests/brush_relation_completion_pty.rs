@@ -167,3 +167,16 @@ fn standalone_brush_completes_builtin_flag_through_relation() {
         &[b"-m", b"emacs-standard", b"vi-insert"],
     );
 }
+
+#[test]
+fn standalone_brush_completes_contextual_path_through_relation() {
+    let dir = std::env::temp_dir().join(format!(
+        "sarun-brush-relation-path-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create path fixture directory");
+    std::fs::write(dir.join("test1.sh"), "#!/bin/sh\n").expect("write path fixture");
+    run_brush_completion(&dir, b"edit ./t\t", &[b"./test1.sh"]);
+    std::fs::remove_dir_all(&dir).expect("remove path fixture directory");
+}

@@ -302,10 +302,11 @@ Do not implement these as Brush-specific engine branches:
       switched on and no argument-layout vocabulary exists in the engine.
 - [ ] Extend composed builtin grammars beyond enum-after-flag to positional
       values, repetitions, and mutually dependent arguments while retaining
-      the same definition and relation path. `edit`'s execution parser already
-      declares `PATH` once; completion remains unfinished until the adapter can
-      express that value as an ordinary context-backed grammar terminal and the
-      tear relation consumes a typed cwd snapshot.
+      the same definition and relation path. The first contextual positional is
+      complete: `edit` declares `PATH` once, the generic adapter emits an
+      ordinary nested context expression, and the tear relation consumes a
+      typed logical-cwd snapshot. Non-path values and cross-argument
+      dependencies remain.
 - [ ] Compose sarun's action and object domains in shell argument positions.
 - [ ] Prove dependency-key stability and selective invalidation when cwd,
       PATH, variables, builtins, or sarun snapshots change.
@@ -330,9 +331,10 @@ Do not implement these as Brush-specific engine branches:
       requires a neutral semantic provider and has no optional provider or
       fallback. A native aarch64 PTY proves `bind -m |` shows the canonical
       builtin-definition values in an actual standalone `sarun brush` session;
-      another proves `bind|` exposes valid ` -m VALUE` continuations. Contextual
-      paths plus live variables, functions, builtins, and PATH observations
-      remain below.
+      another proves `bind|` exposes valid ` -m VALUE` continuations, and a
+      third proves `edit ./t|` consumes a logical-cwd context observation and
+      offers `./test1.sh`. Live variables, functions, builtins, and PATH-command
+      observations remain below.
 - [ ] Cut validation/indentation/diagnostics after complete/incomplete/invalid
       parity is proven.
 - [ ] Cut provenance AST consumption, standalone Brush, box Brush, sourced

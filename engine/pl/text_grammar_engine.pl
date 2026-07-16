@@ -2,6 +2,7 @@
 
 :- use_module(grammar_ir).
 :- use_module(evidence_projection).
+:- use_module(context_relation).
 
 /** <module> Grammar-independent recursive UTF-8 text relation
 
@@ -20,9 +21,9 @@ transform_text_grammar(Grammar, Given, Wanted, Observations, Limits, Reply) :-
     ).
 
 transform_executable_text_grammar(
-    grammar(source(text(utf8)), Root, Rules, []), Given, Wanted, _Observations,
+    grammar(source(text(utf8)), Root, Rules, []), Given, Wanted, Observations,
     limits(MaxSolutions, MaxEvidence, _MaxOutputBytes),
-    reply(Solutions, [], [], Diagnostics)) :-
+    reply(Solutions, ReadyQueries, DependencyKeys, Diagnostics)) :-
     given_value(source, Given, Source),
     text_source_context(Source, Text, CharacterCount, Context, Status),
     SearchLimit is MaxSolutions + 1,
@@ -31,8 +32,13 @@ transform_executable_text_grammar(
                                       Context, Status, MaxEvidence, Candidate),
               Candidates0),
     Candidates0 = [_|_],
-    text_candidate_completions(Candidates0, Completions),
-    text_candidate_solutions(Candidates0, Wanted, Completions, Solutions0),
+    text_candidate_context_queries(Candidates0, Queries),
+    valid_query_graph(Queries),
+    stage_context(Queries, Observations, ReadyQueries, DependencyKeys),
+    text_candidate_completions(Candidates0, Queries, Observations,
+                               Completions),
+    text_candidate_solutions(Candidates0, Wanted, Completions, Queries,
+                             Observations, Solutions0),
     limit_solutions(Solutions0, MaxSolutions, Solutions, Diagnostics).
 
 executable_text_grammar(grammar(source(text(utf8)), _, Rules, [])) :-
@@ -65,6 +71,9 @@ executable_text_expression(field(_, Expression)) :-
 executable_text_expression(literal(_, _, presentation(_))).
 executable_text_expression(
     terminal(text(codepoint(_)), presentation(_))).
+executable_text_expression(
+    context(_, Expression, ask(_, _, _), presentation(_))) :-
+    executable_text_expression(Expression).
 
 executable_text_expressions([]).
 executable_text_expressions([Expression|Expressions]) :-
@@ -159,16 +168,113 @@ complete_text_candidate(Root, Rules, Text, CharacterCount, Context, Status,
                  binding(highlights, Highlights),
                  binding(status, Status)].
 
-text_candidate_solutions([], _, _, []).
+text_candidate_solutions([], _, _, _, _, []).
 text_candidate_solutions([candidate(Available0, _)|Candidates], Wanted,
-                         Completions, [solution(Bindings, 0)|Solutions]) :-
+                         Completions, Queries, Observations,
+                         [solution(Bindings, 0)|Solutions]) :-
+    candidate_context_valid(Available0, Queries, Observations),
     Available = [binding(completions, Completions)|Available0],
     requested_bindings(Wanted, Available, Bindings),
-    text_candidate_solutions(Candidates, Wanted, Completions, Solutions).
+    text_candidate_solutions(Candidates, Wanted, Completions, Queries,
+                             Observations, Solutions).
+text_candidate_solutions([candidate(Available0, _)|Candidates], Wanted,
+                         Completions, Queries, Observations, Solutions) :-
+    \+ candidate_context_valid(Available0, Queries, Observations),
+    text_candidate_solutions(Candidates, Wanted, Completions, Queries,
+                             Observations, Solutions).
 
-text_candidate_completions(Candidates, Completions) :-
-    findall(Pair, text_completion_pair(Candidates, Pair), Pairs),
+text_candidate_completions(Candidates, Queries, Observations, Completions) :-
+    findall(Pair, text_completion_pair(Candidates, Pair), LiteralPairs),
+    findall(Pair,
+            text_context_completion_pair(Candidates, Queries, Observations,
+                                         Pair),
+            ContextPairs),
+    append(LiteralPairs, ContextPairs, Pairs),
     project_completions(Pairs, Completions).
+
+text_candidate_context_queries(Candidates, Queries) :-
+    findall(Query,
+            ( candidate_member(candidate(_, Evidence), Candidates),
+              candidate_member(Item, Evidence),
+              text_context_evidence_query(Item, Query)
+            ),
+            Queries0),
+    sort(Queries0, Queries).
+
+text_context_evidence_query(
+    evidence(context(Name), Span, _, Surface, _, _, _,
+             context_source(Mode, AskTemplate)),
+    query(text_context(Name, Span, AskTemplate), Ask)) :-
+    context_surface_query(Mode, AskTemplate, Surface, Ask).
+
+context_surface_query(exact, AskTemplate, Surface, Ask) :-
+    substitute_surface(AskTemplate, Surface, Ask).
+context_surface_query(tear(_), ask(Cardinality, Domain, SelectorTemplate),
+                      Surface, ask(TearCardinality, Domain, Selector)) :-
+    tear_cardinality(Cardinality, TearCardinality),
+    substitute_tear_surface(SelectorTemplate, Surface, Selector).
+
+tear_cardinality(one, all).
+tear_cardinality(all, all).
+tear_cardinality(empty, empty).
+
+substitute_surface(value(surface), Surface, Surface) :- !.
+substitute_surface(Term, _, Term) :- atomic(Term), !.
+substitute_surface(Term, Surface, Substituted) :-
+    Term =.. [Functor|Arguments],
+    substitute_surfaces(Arguments, Surface, SubstitutedArguments),
+    Substituted =.. [Functor|SubstitutedArguments].
+
+substitute_surfaces([], _, []).
+substitute_surfaces([Argument|Arguments], Surface,
+                    [Substituted|SubstitutedArguments]) :-
+    substitute_surface(Argument, Surface, Substituted),
+    substitute_surfaces(Arguments, Surface, SubstitutedArguments).
+
+substitute_tear_surface(name(value(surface)), Surface, prefix(Surface)) :- !.
+substitute_tear_surface(Term, Surface, Substituted) :-
+    substitute_surface(Term, Surface, Substituted).
+
+candidate_context_valid(Available, Queries, Observations) :-
+    given_value(evidence, Available, Evidence),
+    \+ ( candidate_member(Item, Evidence),
+         text_context_evidence_query(Item, query(Id, Query)),
+         candidate_member(query(Id, Query), Queries),
+         text_context_observation_failed(Id, Query, Observations)
+       ).
+
+text_context_observation_failed(Id, Query, Observations) :-
+    candidate_member(observed(Id, Query, _, Outcome), Observations),
+    \+ context_outcome_satisfies(Query, Outcome).
+
+context_outcome_satisfies(ask(one, _, _), some(one(_))).
+context_outcome_satisfies(ask(all, _, _), some(all(_))).
+context_outcome_satisfies(ask(empty, _, _), some(empty(_))).
+
+text_context_completion_pair(
+    Candidates, Queries, Observations,
+    completion_key(Span, Text)-
+        (alternative(context(Domain, Identity), Syntax, Provider)-Preference)) :-
+    candidate_member(candidate(_, Evidence), Candidates),
+    candidate_member(
+        evidence(context(Name), Span, _, Surface, Syntax, _, Preference,
+                 context_source(tear(EditId), AskTemplate)),
+        Evidence),
+    candidate_member(query(text_context(Name, Span, AskTemplate), Query),
+                     Queries),
+    Query = ask(all, Domain, _),
+    candidate_member(
+        observed(text_context(Name, Span, AskTemplate), Query, Source,
+                 some(all(Entries))),
+        Observations),
+    Source = source(Provider, _),
+    context_tear_match(Query, snapshot(Source, Entries), Surface, Text,
+                       _ExactQuery,
+                       entry(Domain, Identity, _, _, _)),
+    atom(EditId).
+
+candidate_member(Value, [Value|_]).
+candidate_member(Value, [_|Values]) :- candidate_member(Value, Values).
 
 text_completion_pair([candidate(_, Evidence)|_],
                      completion_key(Span, Text)-
@@ -258,6 +364,17 @@ match_expression(field(Name, Expression), Rules, Text, Origin, Maximum, Start,
     match_expression(Expression, Rules, Text, Origin, Maximum, Start, End,
                      Value, Evidence, Depth0, Depth),
     cursor_span(Start, End, Span).
+match_expression(
+    context(Name, Expression, Ask, presentation(Metadata)), Rules, Text,
+    ParseContext, Maximum, Start, End,
+    contextual(Name, Span, Value), [ContextEvidence|Evidence], Depth0, Depth) :-
+    match_expression(Expression, Rules, Text, ParseContext, Maximum, Start,
+                     End, Value, Evidence, Depth0, Depth),
+    context_match_source(ParseContext, Text, Start, End, Span, Surface, Mode),
+    presentation(Metadata, Syntax, Description, Preference),
+    ContextEvidence = evidence(context(Name), Span, [], Surface, Syntax,
+                               Description, Preference,
+                               context_source(Mode, Ask)).
 
 match_expression(literal(Surface0, Semantic, presentation(Metadata)), _, _Text,
                  Context, _, Start, End, literal(Semantic), [Item], Depth,
@@ -377,6 +494,22 @@ render_completion_repetition(Count, Expression, Rules, Maximum, Depth0,
     render_completion_repetition(Next, Expression, Rules, Maximum, Depth1,
                                  Rest, Depth),
     string_concat(First, Rest, Text).
+
+context_match_source(
+    parse_context(
+        source_context(_, tear(EditId, _, cursor(TearCharacterEnd,
+                                                  TearByteEnd), _)), _),
+    Text, cursor(CharacterStart, ByteStart, unused),
+    cursor(_, _, used), span(ByteStart, TearByteEnd), Surface, tear(EditId)) :-
+    CharacterLength is TearCharacterEnd - CharacterStart,
+    CharacterLength >= 0,
+    sub_string(Text, CharacterStart, CharacterLength, _, Surface),
+    !.
+context_match_source(_, Text, cursor(CharacterStart, ByteStart, _),
+                     cursor(CharacterEnd, ByteEnd, _), span(ByteStart, ByteEnd),
+                     Surface, exact) :-
+    CharacterLength is CharacterEnd - CharacterStart,
+    sub_string(Text, CharacterStart, CharacterLength, _, Surface).
 
 match_expressions([], _, _, _, _, Cursor, Cursor, [], [], Depth, Depth).
 match_expressions([Expression], Rules, Text, Context, Maximum, Start, End,

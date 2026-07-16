@@ -481,12 +481,23 @@ or reinterprets grammar data.
 Enrichment grammars now namespace base and extension query identities so an
 observation returns only to the relation that emitted it, and extensions
 receive exactly their declared shared representations rather than every base
-projection. Contextual positional values are the next unfinished slice. The
-generic filesystem snapshot provider exists, but `edit PATH` must not claim
-relation completion until an ordinary context-backed terminal is in the text
-grammar and native aarch64 editor/REPL tests pass. After that, add live Brush
-variables/functions/builtins/PATH providers and make one cached relation
-analysis own every Reedline and editor presentation projection.
+projection. Context is also an ordinary nested text-grammar expression. It
+wraps the grammar that recognizes the surface and carries an explicit pure
+`ask(Cardinality, Domain, Selector)` template. Exact text substitutes
+`value(surface)` and issues the declared query; a tear mechanically changes a
+unique-name request into `ask(all, Domain, prefix(Surface))`. The same parse
+evidence, observation, and dependency key then produce contextual completions.
+
+The generic Clap adapter maps path value hints to filesystem context domains;
+it does not map command names. `edit PATH` therefore parses through the
+ordinary builtin grammar, asks the logical-cwd filesystem provider, and
+replaces `./t` with `./test1.sh`. Generic relation tests cover query,
+observation, completion, failed exact uniqueness, and dependency recording.
+Rust and native aarch64 PTY tests cover the real standalone Brush behavior.
+Remaining immediate work is to add live Brush variables/functions/builtins/PATH
+providers, embed supplied command grammars at every Brush command position,
+and make one cached relation analysis own every Reedline and editor
+presentation projection.
 
 The next externally usable checkpoint is explicitly the complete interactive
 `sarun brush` editing experience: relation-owned highlighting, completion,
