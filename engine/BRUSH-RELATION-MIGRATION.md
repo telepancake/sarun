@@ -7,6 +7,10 @@ existing Brush execution parser intact while building and measuring the new
 relation. Do not delete the reference parser and then hope to recreate its
 behavior.
 
+The in-process editor work has its own durable implementation checklist in
+`EDITOR-RELATION-MIGRATION.md`. Its shell analysis and Brush-interactive
+analysis are the same required `sarun_brush` client, not parallel parsers.
+
 ## Current authority map
 
 Brush currently has one strong execution parser and several adjacent partial
