@@ -1953,6 +1953,62 @@ impl SarunFs {
         ))
     }
 
+    fn child_path(&self, parent: u64, name: &OsStr) -> Result<(i64, String), Errno> {
+        let (box_id, parent_rel) = self.key_of(INodeNo(parent)).ok_or(Errno::ENOENT)?;
+        if box_id == 0 {
+            return Err(Errno::EPERM);
+        }
+        let name = name.to_str().ok_or(Errno::EINVAL)?;
+        let rel = if parent_rel.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{parent_rel}/{name}")
+        };
+        Ok((box_id, rel))
+    }
+
+    fn mkdir_node(&self, pid: u32, parent: u64, name: &OsStr, mode: u32)
+        -> Result<FileAttr, Errno>
+    {
+        let (box_id, rel) = self.child_path(parent, name)?;
+        let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
+        if self.ro_denied(box_id, &rel) {
+            return Err(Errno::EROFS);
+        }
+        if !matches!(self.resolve(box_id, &rel), Layer::Absent) {
+            return Err(Errno::EEXIST);
+        }
+        b.set_dir(&rel, mode, b.writer_for(pid));
+        let inode = self.ino_for(&(box_id, rel.clone()));
+        self.push_event(box_id, rel, "mkdir");
+        let attr = self.synth_dir_attr(inode, mode | libc::S_IFDIR, 0);
+        self.inner.inodes.acquire(inode, 1);
+        Ok(attr)
+    }
+
+    fn symlink_node(
+        &self,
+        pid: u32,
+        parent: u64,
+        name: &OsStr,
+        target: &Path,
+    ) -> Result<FileAttr, Errno> {
+        let (box_id, rel) = self.child_path(parent, name)?;
+        let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
+        if self.ro_denied(box_id, &rel) {
+            return Err(Errno::EROFS);
+        }
+        b.set_symlink(&rel, target, b.writer_for(pid));
+        let inode = self.ino_for(&(box_id, rel.clone()));
+        self.push_event(box_id, rel, "symlink");
+        let attr = self.synth_link_attr(
+            inode,
+            target.as_os_str().as_encoded_bytes().len() as u64,
+        );
+        self.inner.inodes.acquire(inode, 1);
+        Ok(attr)
+    }
+
     fn read_file_node(&self, handle: u64) -> Result<File, Errno> {
         self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
         let handles = self.inner.fhs.read().unwrap();
@@ -2646,57 +2702,18 @@ impl Filesystem for SarunFs {
 
     fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
              _umask: u32, reply: ReplyEntry) {
-        let Some((bid, prel)) = self.key_of(parent) else {
-            return reply.error(Errno::ENOENT);
-        };
-        if bid == 0 {
-            return reply.error(Errno::EPERM);
+        match self.mkdir_node(req.pid(), u64::from(parent), name, mode) {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(error) => reply.error(error),
         }
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
-        let rel = if prel.is_empty() { name.to_string() }
-                  else { format!("{prel}/{name}") };
-        if self.ro_denied(bid, &rel) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
-        }
-        // Existence must use the MERGED view (resolve), the same one lookup
-        // serves — layer() consults only this box's upper + the raw host, so
-        // a path hidden by a parent-box whiteout / opaque dir / OCI
-        // no_host_fallback showed EEXIST here while lookup said ENOENT, and
-        // create_dir_all's mkdir→stat never reconciled.
-        if !matches!(self.resolve(bid, &rel), Layer::Absent) {
-            return reply.error(Errno::EEXIST);
-        }
-        b.set_dir(&rel, mode, b.writer_for(req.pid()));
-        let ino = self.ino_for(&(bid, rel.clone()));
-        self.push_event(bid, rel, "mkdir");
-        reply.entry(&TTL, &self.synth_dir_attr(ino, mode | 0o40000, 0),
-                    Generation(0));
     }
 
     fn symlink(&self, req: &Request, parent: INodeNo, link_name: &OsStr,
                target: &Path, reply: ReplyEntry) {
-        let Some((bid, prel)) = self.key_of(parent) else {
-            return reply.error(Errno::ENOENT);
-        };
-        if bid == 0 {
-            return reply.error(Errno::EPERM);
+        match self.symlink_node(req.pid(), u64::from(parent), link_name, target) {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(error) => reply.error(error),
         }
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        let Some(name) = link_name.to_str() else {
-            return reply.error(Errno::EINVAL);
-        };
-        let rel = if prel.is_empty() { name.to_string() }
-                  else { format!("{prel}/{name}") };
-        if self.ro_denied(bid, &rel) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
-        }
-        b.set_symlink(&rel, target, b.writer_for(req.pid()));
-        let ino = self.ino_for(&(bid, rel.clone()));
-        self.push_event(bid, rel, "symlink");
-        reply.entry(&TTL, &self.synth_link_attr(
-            ino, target.as_os_str().as_encoded_bytes().len() as u64),
-            Generation(0));
     }
 
     fn mknod(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
@@ -3163,6 +3180,57 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             Some(opened.handle),
             virtiofsd::filesystem::OpenOptions::empty(),
         ))
+    }
+
+    fn mkdir(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        parent: u64,
+        name: &CStr,
+        mode: u32,
+        _umask: u32,
+        _extensions: virtiofsd::filesystem::Extensions,
+    ) -> std::io::Result<virtiofsd::filesystem::Entry> {
+        let attr = self
+            .mkdir_node(
+                ctx.pid as u32,
+                parent,
+                OsStr::from_bytes(name.to_bytes()),
+                mode,
+            )
+            .map_err(virtio_error)?;
+        Ok(virtiofsd::filesystem::Entry {
+            inode: u64::from(attr.ino),
+            generation: 0,
+            attr: crate::sarunfs::virtio_attr(attr),
+            attr_timeout: TTL,
+            entry_timeout: TTL,
+        })
+    }
+
+    fn symlink(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        linkname: &CStr,
+        parent: u64,
+        name: &CStr,
+        _extensions: virtiofsd::filesystem::Extensions,
+    ) -> std::io::Result<virtiofsd::filesystem::Entry> {
+        let attr = self
+            .symlink_node(
+                ctx.pid as u32,
+                parent,
+                OsStr::from_bytes(name.to_bytes()),
+                Path::new(OsStr::from_bytes(linkname.to_bytes())),
+            )
+            .map_err(virtio_error)?;
+        Ok(virtiofsd::filesystem::Entry {
+            inode: u64::from(attr.ino),
+            generation: 0,
+            attr: crate::sarunfs::virtio_attr(attr),
+            attr_timeout: TTL,
+            entry_timeout: TTL,
+        })
     }
 
     fn read<W: virtiofsd::filesystem::ZeroCopyWriter>(
@@ -3696,6 +3764,36 @@ mod chain_tests {
             ctx,
             created.inode,
             1,
+        );
+        let directory_name = CString::new("directory").unwrap();
+        let directory = <SarunFs as virtiofsd::filesystem::FileSystem>::mkdir(
+            &fs,
+            ctx,
+            entry.inode,
+            &directory_name,
+            0o750,
+            0,
+            virtiofsd::filesystem::Extensions::default(),
+        )
+        .unwrap();
+        assert_eq!(directory.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+        let link_name = CString::new("link").unwrap();
+        let link_target = CString::new("created").unwrap();
+        let link = <SarunFs as virtiofsd::filesystem::FileSystem>::symlink(
+            &fs,
+            ctx,
+            &link_target,
+            entry.inode,
+            &link_name,
+            virtiofsd::filesystem::Extensions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::readlink(
+                &fs, ctx, link.inode,
+            )
+            .unwrap(),
+            b"created",
         );
 
         let (attr, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
