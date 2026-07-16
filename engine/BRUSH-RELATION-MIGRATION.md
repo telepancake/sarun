@@ -222,6 +222,11 @@ Do not implement these as Brush-specific engine branches:
       word parses. A zero-width tear records `$(` only when the ordinary parser
       can consume the concrete `echo hi)` suffix; tear state is linear, so it is
       consumed exactly once even inside repetition.
+- [x] Represent grammar-declared symbolic terminal tears as ordinary ground AST
+      and evidence values without consuming source bytes. This lets later
+      semantic relations constrain a hole inside free text while the ordinary
+      parser still proves the concrete prefix and suffix; terminals without
+      symbolic tear metadata retain their finite parsing behavior.
 - [ ] Differentially test UTF-8 byte offsets and render/parse round trips.
 
 ### 2. Shell program structure and dynamic regions

@@ -272,6 +272,18 @@ match_expression(literal(Surface0, Semantic, presentation(Metadata)), _, Text,
                     [span(ByteStart, ByteEnd)], Surface, Syntax, Description,
                     Preference, Origin).
 match_expression(
+    terminal(text(codepoint(Set)), presentation(Metadata)), _, _Text, Context,
+    _, Start, End,
+    hole(EditId, Span, TearSurface, terminal(text(codepoint(Set)))), [Item],
+    Depth, Depth) :-
+    source_tear_at(Context, Start, EditId, End, TearSurface),
+    metadata_value(tear, Metadata, none, symbolic),
+    cursor_span(Start, End, Span),
+    presentation(Metadata, Syntax, Description, Preference),
+    Item = evidence(hole(EditId, terminal(text(codepoint(Set)))), Span, [],
+                    TearSurface, Syntax, Description, Preference,
+                    tear(EditId, terminal(text(codepoint(Set))))).
+match_expression(
     terminal(text(codepoint(Set)), presentation(Metadata)), _, Text, Origin, _,
     cursor(CharacterStart, ByteStart, TearState),
     cursor(CharacterEnd, ByteEnd, TearState),

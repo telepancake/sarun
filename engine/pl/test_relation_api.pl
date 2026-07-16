@@ -16,6 +16,7 @@ test_name(composed_context_dependencies_bind_before_ast_bridge).
 test_name(choice_namespaces_context_dependencies).
 test_name(grammar_terminal_codecs_are_declarative_and_bidirectional).
 test_name(recursive_raw_text_grammar_reports_utf8_byte_evidence).
+test_name(raw_terminal_tear_is_an_ordinary_symbolic_parse_value).
 test_name(raw_text_extras_are_grammar_owned_trivia).
 test_name(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly).
 test_name(opaque_handle_resolves_install_once_grammar).
@@ -511,6 +512,42 @@ run_test(recursive_raw_text_grammar_reports_utf8_byte_evidence) :-
                          binding(status, complete),
                          binding(highlights, Highlights)], 0)], [], [], [])),
     has_highlight(span(5, 7), text, codepoint(955), foreign_text, Highlights).
+
+run_test(raw_terminal_tear_is_an_ordinary_symbolic_parse_value) :-
+    Codec = text(codepoint(except("\""))),
+    Grammar = grammar(
+        source(text(utf8)), root,
+        [rule(root,
+              seq([literal("\"", open,
+                           presentation([meta(syntax, delimiter)])),
+                   repeat(0, unbounded,
+                          terminal(Codec,
+                                   presentation([meta(syntax, string),
+                                                 meta(tear, symbolic)]))),
+                   literal("\"", close,
+                           presentation([meta(syntax, delimiter)])),
+                   literal("x", suffix,
+                           presentation([meta(syntax, word)]))]))],
+        []),
+    limits(Limits),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("\"\"x",
+                                           assist(edit, span(1, 1)),
+                                           foreign_text))]),
+                want([ast, status, completions]), observations([]), Limits),
+        reply([solution(
+                   [binding(ast,
+                            node(root, span(0, 3),
+                                 sequence([
+                                     literal(open),
+                                     repeated([
+                                         hole(edit, span(1, 1), "",
+                                              terminal(Codec))]),
+                                     literal(close), literal(suffix)]))),
+                    binding(status, incomplete(edit(edit))),
+                    binding(completions, [])], 0)], [], [], [])).
 
 run_test(raw_text_extras_are_grammar_owned_trivia) :-
     Space = terminal(text(codepoint(chars(" \t\n"))),

@@ -2669,6 +2669,16 @@ pub(crate) fn ensure_linked() {
 mod tests {
     use super::*;
 
+    fn contains_relation_value(value: &RelationValue, wanted: &RelationValue) -> bool {
+        value == wanted
+            || match value {
+                RelationValue::Compound(_, values) | RelationValue::List(values) => values
+                    .iter()
+                    .any(|value| contains_relation_value(value, wanted)),
+                _ => false,
+            }
+    }
+
     fn grammar_words(words: &[&str]) -> GrammarInput {
         let mut start = 0;
         let mut items = Vec::with_capacity(words.len());
@@ -2908,6 +2918,117 @@ mod tests {
             )
         );
         assert_eq!(reply.solutions[0].bindings[1].value, rv_atom("complete"));
+    }
+
+    #[test]
+    fn raw_terminal_tear_crosses_the_embedded_structured_boundary() {
+        let codec = rv_compound(
+            "text",
+            vec![rv_compound(
+                "codepoint",
+                vec![rv_compound("except", vec![rv_string("\"")])],
+            )],
+        );
+        let presentation = rv_compound(
+            "presentation",
+            vec![rv_list(vec![
+                rv_compound("meta", vec![rv_atom("syntax"), rv_atom("string")]),
+                rv_compound("meta", vec![rv_atom("tear"), rv_atom("symbolic")]),
+            ])],
+        );
+        let grammar = rv_compound(
+            "grammar",
+            vec![
+                rv_compound(
+                    "source",
+                    vec![rv_compound("text", vec![rv_atom("utf8")])],
+                ),
+                rv_atom("root"),
+                rv_list(vec![rv_compound(
+                    "rule",
+                    vec![
+                        rv_atom("root"),
+                        rv_compound(
+                            "seq",
+                            vec![rv_list(vec![
+                                rv_compound(
+                                    "literal",
+                                    vec![
+                                        rv_string("\""),
+                                        rv_atom("open"),
+                                        rv_compound("presentation", vec![rv_list(vec![])]),
+                                    ],
+                                ),
+                                rv_compound(
+                                    "repeat",
+                                    vec![rv_integer(0), rv_atom("unbounded"),
+                                         rv_compound(
+                                             "terminal",
+                                             vec![codec.clone(), presentation],
+                                         )],
+                                ),
+                                rv_compound(
+                                    "literal",
+                                    vec![
+                                        rv_string("\""),
+                                        rv_atom("close"),
+                                        rv_compound("presentation", vec![rv_list(vec![])]),
+                                    ],
+                                ),
+                            ])],
+                        ),
+                    ],
+                )]),
+                rv_list(vec![]),
+            ],
+        );
+        let reply = global()
+            .unwrap()
+            .transform(&RelationRequest {
+                grammar,
+                given: vec![RelationBinding {
+                    name: "source".into(),
+                    value: rv_compound(
+                        "text_source",
+                        vec![
+                            rv_string("\"\""),
+                            rv_compound(
+                                "assist",
+                                vec![
+                                    rv_atom("edit"),
+                                    rv_compound(
+                                        "span",
+                                        vec![rv_integer(1), rv_integer(1)],
+                                    ),
+                                ],
+                            ),
+                            rv_atom("rust_test"),
+                        ],
+                    ),
+                }],
+                wanted: vec!["ast".into(), "status".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert!(reply.diagnostics.is_empty());
+        assert_eq!(reply.solutions.len(), 1);
+        assert_eq!(
+            reply.solutions[0].bindings[1].value,
+            rv_compound("incomplete", vec![rv_compound("edit", vec![rv_atom("edit")])])
+        );
+        assert!(contains_relation_value(
+            &reply.solutions[0].bindings[0].value,
+            &rv_compound(
+                "hole",
+                vec![
+                    rv_atom("edit"),
+                    rv_compound("span", vec![rv_integer(1), rv_integer(1)]),
+                    rv_string(""),
+                    rv_compound("terminal", vec![codec]),
+                ],
+            ),
+        ));
     }
 
     #[test]
