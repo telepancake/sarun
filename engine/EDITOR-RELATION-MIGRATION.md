@@ -119,25 +119,27 @@ replacement spans, cursor tears, and diagnostics.
 
 ### 3. Reusable standalone editor host
 
-- [ ] Extract a small Ratatui event loop around the same `EditorPane` used by
+- [x] Extract a small Ratatui event loop around the same `EditorPane` used by
       `ui.rs`; do not duplicate editor behavior.
 - [ ] Introduce persistence interfaces for UI host files, UI box RPC, and direct
-      logical-filesystem builtin access.
-- [ ] Add an RAII terminal guard which restores raw mode, cursor, mouse state,
+      logical-filesystem builtin access. The first standalone host-file
+      load/create/save path is executable; the interface extraction remains.
+- [x] Add an RAII terminal guard which restores raw mode, cursor, mouse state,
       and alternate screen on ordinary errors and unwinding.
-- [ ] Use the controlling terminal rather than redirected builtin stdout.
+- [x] Use the controlling terminal rather than redirected builtin stdout.
       Refuse non-TTY, background, and pipeline-stage invocation visibly.
 
 ### 4. Foreground Brush builtin
 
-- [ ] Register one canonical `edit` builtin in `box_builtins()` so standalone
+- [x] Register one canonical `edit` builtin in `box_builtins()` so standalone
       Brush, box Brush, nested shells, and recipe shells share the same path.
-- [ ] Resolve relative operands from `context.shell.working_dir()`, never the
+- [x] Resolve relative operands from `context.shell.working_dir()`, never the
       engine process cwd.
 - [ ] Snapshot Brush semantic context directly from the borrowed shell before
       analysis. The shell is paused while its foreground editor runs.
-- [ ] Save through the builtin's logical filesystem and return a meaningful
-      shell status. Redirection must not steal the TUI terminal.
+- [x] Save through the builtin's direct logical filesystem and return a
+      meaningful shell status. Redirection does not steal the TUI terminal;
+      non-interactive, background, and pipeline uses fail before terminal setup.
 
 ### 5. Provider composition
 
@@ -150,7 +152,7 @@ replacement spans, cursor tears, and diagnostics.
 
 ### 6. Consumer convergence
 
-- [ ] Cut the main UI's Bash editor path to the same analysis client and remove
+- [x] Cut the main UI's Bash editor path to the same analysis client and remove
       syntastica Bash selection.
 - [ ] Cut Brush-interactive highlighting, completion, validation, hints, and
       indentation to the same provider, then delete the adjacent algorithms.
@@ -172,10 +174,17 @@ an editor heuristic, a forward-only shell completion pass, or a `find` branch
 in Rust: it is a completion projection from the same relation that parses the
 document and relates the assignment, expansion, command signature, and tear.
 
-The engine-side production analysis API now passes this exact acceptance case,
-including the byte replacement span and absence of external context queries.
-The remaining acceptance work is routing the editor and interactive Brush
-through that API and proving the behavior through their real PTY surfaces.
+The engine-side production API, shared `EditorPane`, and foreground Brush
+`edit` builtin now pass this exact case. The checked-in native aarch64 PTY test
+starts `sarun brush`, launches `edit`, opens the relation completion popup,
+selects `f`, saves exactly `A="f"; find . -type $A`, exits the editor, proves the
+alternate screen was restored by returning to the Brush prompt, and exits the
+shell successfully. Unit tests separately pin the byte replacement span,
+absence of external queries, UTF-8 coordinate conversion, stale-result
+rejection, and the full finite completion domain.
+
+The remaining acceptance work is the broader context/provider and shell
+grammar matrix below, not another editor parsing implementation.
 
 Native aarch64 PTY tests must start standalone `sarun brush`, invoke `edit` as
 a real foreground builtin, edit and save a UTF-8 shell file, and prove:

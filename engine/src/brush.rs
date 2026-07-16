@@ -1026,6 +1026,89 @@ impl brush_core::builtins::SimpleCommand for NinjaBuiltin {
     }
 }
 
+/// `edit PATH` — foreground, in-process Ratatui editor. The editor owns the
+/// controlling terminal directly, so command redirections do not become its
+/// display transport. Pipeline and non-interactive execution are rejected
+/// before terminal state changes.
+struct EditBuiltin;
+
+impl brush_core::builtins::SimpleCommand for EditBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!(
+            "{name} PATH: open PATH in sarun's in-process relation-aware editor\n"
+        ))
+    }
+
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        use brush_core::openfiles::OpenFile;
+        use std::io::Write;
+
+        let mut argv = args
+            .map(|argument| argument.as_ref().to_string())
+            .collect::<Vec<_>>();
+        if argv.first() == Some(&context.command_name) {
+            argv.remove(0);
+        }
+        if argv.first().map(String::as_str) == Some("--") {
+            argv.remove(0);
+        }
+        let fail = |context: &brush_core::commands::ExecutionContext<'_, SE>, message: &str, code| {
+            let mut stderr = context.stderr();
+            let _ = writeln!(stderr, "edit: {message}");
+            brush_core::results::ExecutionResult::new(code)
+        };
+        if argv.len() != 1 {
+            return Ok(fail(&context, "usage: edit PATH", 2));
+        }
+        if !context.shell.options().interactive {
+            return Ok(fail(
+                &context,
+                "requires a foreground interactive Brush session",
+                1,
+            ));
+        }
+        let pipeline_io = |file: Option<OpenFile>| {
+            matches!(file, Some(OpenFile::PipeReader(_) | OpenFile::PipeWriter(_)))
+        };
+        if context.spawned_pipeline_stage
+            || pipeline_io(context.try_fd(0))
+            || pipeline_io(context.try_fd(1))
+        {
+            return Ok(fail(&context, "cannot run in a pipeline", 1));
+        }
+
+        let operand = std::path::PathBuf::from(&argv[0]);
+        let path = if operand.is_absolute() {
+            operand
+        } else {
+            context.shell.working_dir().join(operand)
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::editor::run_standalone(path)
+        }));
+        match result {
+            Ok(Ok(())) => Ok(brush_core::results::ExecutionResult::new(0)),
+            Ok(Err(error)) => Ok(fail(&context, &error.to_string(), 1)),
+            Err(_) => Ok(fail(
+                &context,
+                "editor panicked; terminal state was restored",
+                1,
+            )),
+        }
+    }
+}
+
 /// All box brush builtins — the single builtin-policy point for every box brush
 /// shell (top-level box, nested `sh -c`, make/n2 recipes). The stream/filter
 /// coreutils are registered UNCONDITIONALLY: each runs on its own fresh thread
@@ -1080,6 +1163,7 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
     m.insert("ninja".to_string(), simple_builtin::<NinjaBuiltin, SE>());
     // BashMode shell builtins overwrite any overlapping coreutil names (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
+    m.insert("edit".to_string(), simple_builtin::<EditBuiltin, SE>());
     // In-box engine entry points via /proc/self/exe (no PATH shadow needed).
     m.insert("sarun".to_string(), simple_builtin::<EngineSelfCommand, SE>());
     m.insert("oaita".to_string(), simple_builtin::<EngineSelfCommand, SE>());
@@ -2848,14 +2932,24 @@ mod builtin_boundary_tests {
     /// Build a box shell with logical cwd = `cwd`, run `script` with fd 1 wired to
     /// a capture file, and return everything the shell wrote to stdout.
     async fn run_capture(script: &str, cwd: &Path) -> String {
+        run_capture_mode(script, cwd, false).await
+    }
+
+    async fn run_capture_mode(script: &str, cwd: &Path, interactive: bool) -> String {
         let mut shell = super::build_box_shell(true, None, None, Some(cwd.to_path_buf()))
             .await
             .expect("build box shell");
+        shell.options_mut().interactive = interactive;
         let out_path = cwd.join(".capture_stdout");
+        let err_path = cwd.join(".capture_stderr");
         let file = std::fs::File::create(&out_path).expect("create capture file");
+        let err = std::fs::File::create(&err_path).expect("create stderr capture file");
         shell
             .open_files_mut()
             .set_fd(1, brush_core::openfiles::OpenFile::from(file));
+        shell
+            .open_files_mut()
+            .set_fd(2, brush_core::openfiles::OpenFile::from(err));
         let src = brush_core::SourceInfo { source: "<boundary-test>".into(), start: None };
         let params = shell.default_exec_params();
         shell
@@ -2864,6 +2958,27 @@ mod builtin_boundary_tests {
             .expect("run script");
         drop(shell); // close the capture fd before reading it back
         std::fs::read_to_string(&out_path).expect("read capture file")
+    }
+
+    #[test]
+    fn edit_builtin_is_in_the_single_shared_builtin_catalog() {
+        let builtins = super::box_builtins::<brush_core::extensions::DefaultShellExtensions>();
+        assert!(builtins.contains_key("edit"));
+    }
+
+    #[tokio::test]
+    async fn edit_builtin_refuses_noninteractive_and_pipeline_execution() {
+        let dir = scratch_dir();
+        let noninteractive = run_capture("edit file.sh; printf '%s' \"$?\"", &dir).await;
+        assert_eq!(noninteractive, "1");
+
+        let pipeline = run_capture_mode(
+            "printf x | edit file.sh; printf '%s' \"$?\"",
+            &dir,
+            true,
+        )
+        .await;
+        assert_eq!(pipeline, "1");
     }
 
     /// STREAM shape (`cat`): a relative operand resolves against the shell's

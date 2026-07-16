@@ -461,6 +461,28 @@ impl EditorPane {
         Self::from_bytes(Target::Host(path), bytes, ro)
     }
 
+    /// Standalone editor open: unlike the UI's explicit existing-file prompt,
+    /// a shell `edit new.sh` may create a new regular file on first save.
+    pub fn open_host_or_new(path: PathBuf) -> anyhow::Result<Self> {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("editor: {} is a symlink — open the target", path.display());
+                }
+                if !metadata.is_file() {
+                    anyhow::bail!("editor: {} is not a regular file", path.display());
+                }
+                let bytes = std::fs::read(&path)
+                    .map_err(|error| anyhow::anyhow!("editor: {}: {error}", path.display()))?;
+                Self::from_bytes(Target::Host(path), bytes, metadata.permissions().readonly())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Self::from_bytes(Target::Host(path), vec![], false)
+            }
+            Err(error) => Err(anyhow::anyhow!("editor: {}: {error}", path.display())),
+        }
+    }
+
     /// Open a BOX file's current bytes (fetched by the UI over
     /// `review.file_bytes`). Saves go back over `review.write_file`.
     pub fn open_box(sid: String, rel: String, bytes: Vec<u8>) -> anyhow::Result<Self> {
@@ -894,6 +916,120 @@ impl EditorPane {
     }
 }
 
+struct TerminalRestore;
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        use crossterm::{cursor, execute, terminal};
+        if let Ok(mut tty) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        {
+            let _ = execute!(tty, cursor::Show, terminal::LeaveAlternateScreen);
+        }
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn save_standalone_host(pane: &mut EditorPane) -> anyhow::Result<()> {
+    let Target::Host(path) = &pane.target else {
+        anyhow::bail!("standalone editor received a non-host persistence target");
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("editor: {} became a symlink — save refused", path.display());
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            anyhow::bail!("editor: {} is no longer a regular file", path.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(anyhow::anyhow!("editor: {}: {error}", path.display())),
+    }
+    std::fs::write(path, pane.save_bytes())
+        .map_err(|error| anyhow::anyhow!("editor: save {}: {error}", path.display()))?;
+    pane.mark_saved();
+    Ok(())
+}
+
+/// Run the same editor pane as a foreground terminal application. Crossterm's
+/// Unix event source and raw-mode implementation use `/dev/tty`; the Ratatui
+/// backend is explicitly attached there as well, so shell redirections remain
+/// ordinary command I/O and cannot capture or corrupt the TUI.
+pub fn run_standalone(path: PathBuf) -> anyhow::Result<()> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use crossterm::{cursor, execute, terminal};
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+    use std::io::IsTerminal;
+
+    let mut pane = EditorPane::open_host_or_new(path)?;
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|error| anyhow::anyhow!("editor: controlling terminal: {error}"))?;
+    if !tty.is_terminal() {
+        anyhow::bail!("editor: controlling terminal is not a TTY");
+    }
+    terminal::enable_raw_mode()
+        .map_err(|error| anyhow::anyhow!("editor: enable raw mode: {error}"))?;
+    let _restore = TerminalRestore;
+    execute!(tty, terminal::EnterAlternateScreen, cursor::Hide)
+        .map_err(|error| anyhow::anyhow!("editor: enter terminal screen: {error}"))?;
+    let backend = CrosstermBackend::new(tty);
+    let mut terminal = Terminal::new(backend)
+        .map_err(|error| anyhow::anyhow!("editor: initialize terminal: {error}"))?;
+    let mut discard_armed = false;
+
+    loop {
+        terminal
+            .draw(|frame| pane.render(frame, frame.area(), true))
+            .map_err(|error| anyhow::anyhow!("editor: draw: {error}"))?;
+        if !event::poll(Duration::from_millis(50))
+            .map_err(|error| anyhow::anyhow!("editor: terminal poll: {error}"))?
+        {
+            continue;
+        }
+        let Event::Key(key) =
+            event::read().map_err(|error| anyhow::anyhow!("editor: terminal input: {error}"))?
+        else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        let closing_key = key.code == KeyCode::Esc;
+        match pane.handle_key(key.code, key.modifiers) {
+            KeyResult::Save => match save_standalone_host(&mut pane) {
+                Ok(()) => discard_armed = false,
+                Err(error) => pane.status = error.to_string(),
+            },
+            KeyResult::Close => {
+                if pane.dirty && !discard_armed {
+                    pane.status = "unsaved changes · Esc again to discard · Ctrl-S saves".into();
+                    discard_armed = true;
+                } else {
+                    break;
+                }
+            }
+            KeyResult::OpenPrompt => {
+                pane.status = "standalone editor opens one path per invocation".into();
+            }
+            KeyResult::ToggleFull => {
+                pane.status = "standalone editor is already fullscreen".into();
+            }
+            KeyResult::Consumed | KeyResult::NotHandled => {
+                if !closing_key {
+                    discard_armed = false;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The read-only whitelist: cursor motion, paging, and search keys pass;
 /// anything else is a (refused) mutation. Only Normal-mode keys qualify —
 /// read-only can never be in Insert/Visual (mode-entering keys are refused).
@@ -1112,6 +1248,25 @@ mod tests {
         pane.accept_highlight_analysis();
         assert_eq!(pane.fh.as_ref().unwrap().per_line.len(), 7);
         assert_eq!(pane.analysis_pending, None);
+    }
+
+    #[test]
+    fn standalone_editor_creates_and_saves_host_file() {
+        let path = std::env::temp_dir().join(format!(
+            "sarun_editor_builtin_{}_{}.sh",
+            std::process::id(),
+            hash_of(module_path!())
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut pane = EditorPane::open_host_or_new(path.clone()).unwrap();
+        pane.handle_key(KeyCode::Char('i'), KeyModifiers::empty());
+        for ch in "echo ok\n".chars() {
+            pane.handle_key(KeyCode::Char(ch), KeyModifiers::empty());
+        }
+        save_standalone_host(&mut pane).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo ok\n");
+        assert!(!pane.dirty);
+        std::fs::remove_file(path).unwrap();
     }
 
     /// The windowing pin: a large rust buffer computes spans for EVERY
