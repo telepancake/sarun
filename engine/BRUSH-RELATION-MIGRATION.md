@@ -37,6 +37,34 @@ successful relation. It does not make them fallbacks. Until a consumer reaches
 its cutover gate, the old consumer remains authoritative; after cutover, its
 old algorithm is deleted.
 
+## Intermediate acceptance target: interactive Brush
+
+The next externally usable milestone is a standalone interactive `sarun brush`
+whose entire editing experience is relation-owned. Before moving the execution
+parser, its Reedline session must use one analysis of the current source and
+cursor for:
+
+- syntax highlighting, including nested substitutions and heredoc bodies;
+- literal, variable, command, filesystem, builtin-argument, and sarun-domain
+  completions with exact replacement spans;
+- complete/incomplete/invalid validation, continuation behavior, diagnostics,
+  and indentation;
+- syntax/help hints and semantic descriptions;
+- explicit context queries and dependency keys against the persistent Brush
+  shell and sarun state.
+
+This is a real authority cutover, not a demo or opt-in mode. At the cutover,
+the old Brush-interactive tokenizer highlighter, `COMP_WORDBREAKS` completion
+path, and parser-based validator are removed from the sarun interactive path;
+there is no runtime fallback. Brush's existing AST parser may still execute the
+accepted command text until the later execution-AST parity gate. Thus the
+intermediate product has one parsing authority for the interactive editing
+experience while retaining a separately scoped, measured execution adapter.
+
+Acceptance requires PTY-level tests that type, edit, highlight, complete, and
+submit commands in the actual `sarun brush -i` session on aarch64. Unit tests
+of grammar terms or Reedline adapters alone do not satisfy this milestone.
+
 ### Consumer inventory (2026-07-16)
 
 - sarun execution/provenance: `brush.rs` parses top-level box scripts,
@@ -140,7 +168,7 @@ Do not implement these as Brush-specific engine branches:
 
 ## Work sequence
 
-### 0. Preserve and measure the reference — NEXT
+### 0. Preserve and measure the reference
 
 - [x] Inventory every `Shell::parse_string`, `run_string`, `run_program`,
       highlighter, completer, and validator consumer in sarun and vendored
@@ -227,6 +255,22 @@ Do not implement these as Brush-specific engine branches:
 - [ ] Remove the old parser dependency only after every execution and
       presentation consumer has crossed its gate and the full differential,
       integration, fuzz, static aarch64, and x86_64 suites pass.
+
+### 6. Interactive Brush acceptance gate — INTERMEDIATE TARGET
+
+- [ ] Expose one required, relation-neutral analysis-provider interface at the
+      sarun/Brush-interactive boundary. Sarun supplies it; Reedline does not
+      import Prolog types or reinterpret shell syntax.
+- [ ] Make one cached analysis result feed highlighting, completion,
+      validation, indentation, diagnostics, and hints for a buffer revision.
+- [ ] Supply pure snapshots/observations from the persistent Brush shell and
+      sarun state, and invalidate by returned dependency keys.
+- [ ] Delete the old highlighter/completer/validator authority from sarun's
+      Reedline construction in the same commit that installs the relation
+      provider. No optional constructor, feature toggle, or fallback remains.
+- [ ] Pass checked-in PTY fixtures for nested syntax, UTF-8 edits, variables,
+      command/PATH and filesystem completion, builtin grammar, heredocs,
+      incomplete input, invalid input, and a submitted command that executes.
 
 ## First acceptance fixtures
 

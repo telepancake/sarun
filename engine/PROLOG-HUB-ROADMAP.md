@@ -437,6 +437,13 @@ Raw text sources now also carry zero- or nonzero-width edit tears through the
 ordinary parser. Shared evidence projection records literal completions only
 from whole-source witnesses, including concrete suffixes, and linear cursor
 state guarantees that a tear is consumed exactly once.
+
+The next externally usable checkpoint is explicitly the complete interactive
+`sarun brush` editing experience: relation-owned highlighting, completion,
+validation, indentation, diagnostics, hints, and context dependencies through
+one cached analysis. Brush's current AST parser may remain only as the later
+execution adapter. The interactive cutover is singular and mandatory—there is
+no opt-in provider or fallback to the adjacent Brush algorithms.
 Validated IR constructs outside this initial mode matrix return
 `unsupported_text_grammar` explicitly rather than looking like source with no
 parse. Raw tears, trivia, rendering, state, embedding, constraints, precedence,
