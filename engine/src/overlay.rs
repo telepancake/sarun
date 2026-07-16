@@ -137,6 +137,7 @@ fn has_opaque_ancestor(b: &BoxState, rel: &str) -> bool {
 #[derive(Clone)]
 pub struct SarunFs {
     inner: Arc<Inner>,
+    root: Key,
 }
 
 /// Transitional source-compatible name for control-plane callers.  Filesystem
@@ -585,7 +586,7 @@ impl SarunFs {
             daemon_reads: AtomicU64::new(0),
             events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             shadows: RwLock::new(Shadows::load()),
-        }) };
+        }), root: (0, String::new()) };
         // Reclaim unreferenced cache pool files once per engine start —
         // cheap (one readdir sweep), and NEVER on the FUSE path: eviction
         // under a live open() race would yank a pool file an mmap still
@@ -607,6 +608,17 @@ impl SarunFs {
             });
         }
         ov
+    }
+
+    /// A transport view whose protocol inode 1 is one live box's merged root.
+    /// The view shares all filesystem policy, handles, capture state, and inode
+    /// allocation with the host FUSE view; only the protocol root is scoped.
+    pub fn export_box(&self, box_id: i64) -> Result<Self, Errno> {
+        self.box_of(box_id).ok_or(Errno::ENOENT)?;
+        Ok(Self {
+            inner: self.inner.clone(),
+            root: (box_id, String::new()),
+        })
     }
 
 
@@ -1147,11 +1159,19 @@ impl SarunFs {
     }
 
     fn key_of(&self, ino: INodeNo) -> Option<Key> {
-        self.inner.inodes.key(u64::from(ino))
+        if u64::from(ino) == 1 {
+            Some(self.root.clone())
+        } else {
+            self.inner.inodes.key(u64::from(ino))
+        }
     }
 
     fn ino_for(&self, key: &Key) -> u64 {
-        self.inner.inodes.intern(key)
+        if key == &self.root {
+            1
+        } else {
+            self.inner.inodes.intern(key)
+        }
     }
 
     fn host(&self, rel: &str) -> PathBuf {
@@ -3785,6 +3805,22 @@ mod chain_tests {
             gid: 0.into(),
             pid: 1,
         };
+        let export = fs.export_box(id).unwrap();
+        let (export_root, _) =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
+                &export, ctx, 1, None,
+            )
+            .unwrap();
+        assert_eq!(export_root.ino, 1);
+        let export_filename = CString::new("hello").unwrap();
+        let export_file = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &export,
+            ctx,
+            1,
+            &export_filename,
+        )
+        .unwrap();
+        assert_ne!(export_file.inode, 1);
         let name = CString::new(id.to_string()).unwrap();
         let entry = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
             &fs,
