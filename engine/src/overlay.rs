@@ -82,7 +82,7 @@ fn kind_of_mode(mode: u32) -> FileType {
 }
 
 /// (box_id, rel) — "" rel is the box root; box_id 0 is the synthetic mount root.
-type Key = (i64, String);
+type Key = crate::sarunfs::NodeKey;
 
 /// True if any ANCESTOR directory of `rel` is marked OPAQUE in box `b`. Walks
 /// rel's path components upward (rel="a/b/c/d" → checks "a/b/c", "a/b", "a",
@@ -136,9 +136,7 @@ pub struct Overlay {
 struct Inner {
     lower: PathBuf,
     boxes: RwLock<BTreeMap<i64, Arc<BoxState>>>,
-    ino_to_key: RwLock<HashMap<u64, Key>>,
-    key_to_ino: RwLock<HashMap<Key, u64>>,
-    next_ino: AtomicU64,
+    inodes: crate::sarunfs::InodeTable,
     fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
     next_fh: AtomicU64,
     // Live ExtAttachment objects per owning box (RoAttachment::Ext rows,
@@ -527,16 +525,10 @@ impl Overlay {
     }
 
     pub fn new(lower: PathBuf) -> Self {
-        let mut i2k = HashMap::new();
-        i2k.insert(1u64, (0i64, String::new()));
-        let mut k2i = HashMap::new();
-        k2i.insert((0i64, String::new()), 1u64);
         let ov = Overlay { inner: Arc::new(Inner {
             lower,
             boxes: RwLock::new(BTreeMap::new()),
-            ino_to_key: RwLock::new(i2k),
-            key_to_ino: RwLock::new(k2i),
-            next_ino: AtomicU64::new(2),
+            inodes: crate::sarunfs::InodeTable::new((0, String::new())),
             fhs: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             ext: RwLock::new(HashMap::new()),
@@ -1104,27 +1096,7 @@ impl Overlay {
     /// ino->key map must follow, for `rel_o` and the whole subtree under it,
     /// or a getattr on the cached inode resolves the stale (now-absent) path.
     fn remap_inode_subtree(&self, bid: i64, rel_o: &str, rel_n: &str) {
-        let oldp = format!("{rel_o}/");
-        let mut k2i = self.inner.key_to_ino.write().unwrap();
-        let mut i2k = self.inner.ino_to_key.write().unwrap();
-        let moves: Vec<(String, String)> = k2i.keys()
-            .filter(|(b, _)| *b == bid)
-            .filter_map(|(_, rel)| {
-                if rel == rel_o {
-                    Some((rel.clone(), rel_n.to_string()))
-                } else if let Some(tail) = rel.strip_prefix(&oldp) {
-                    Some((rel.clone(), format!("{rel_n}/{tail}")))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for (old, new) in moves {
-            if let Some(ino) = k2i.remove(&(bid, old)) {
-                k2i.insert((bid, new.clone()), ino);
-                i2k.insert(ino, (bid, new));
-            }
-        }
+        self.inner.inodes.remap_subtree(bid, rel_o, rel_n);
     }
 
     pub(crate) fn box_of(&self, id: i64) -> Option<Arc<BoxState>> {
@@ -1132,21 +1104,11 @@ impl Overlay {
     }
 
     fn key_of(&self, ino: INodeNo) -> Option<Key> {
-        self.inner.ino_to_key.read().unwrap().get(&u64::from(ino)).cloned()
+        self.inner.inodes.key(u64::from(ino))
     }
 
     fn ino_for(&self, key: &Key) -> u64 {
-        if let Some(i) = self.inner.key_to_ino.read().unwrap().get(key) {
-            return *i;
-        }
-        let mut k2i = self.inner.key_to_ino.write().unwrap();
-        if let Some(i) = k2i.get(key) {
-            return *i;
-        }
-        let i = self.inner.next_ino.fetch_add(1, Ordering::Relaxed);
-        k2i.insert(key.clone(), i);
-        self.inner.ino_to_key.write().unwrap().insert(i, key.clone());
-        i
+        self.inner.inodes.intern(key)
     }
 
     fn host(&self, rel: &str) -> PathBuf {
@@ -1728,6 +1690,7 @@ impl Filesystem for Overlay {
                 return reply.error(Errno::ENOENT);
             }
             let ino = self.ino_for(&(id, String::new()));
+            self.inner.inodes.acquire(ino, 1);
             return reply.entry(&TTL, &self.synth_dir_attr(ino, 0o40755, 0),
                                Generation(0));
         }
@@ -1736,6 +1699,7 @@ impl Filesystem for Overlay {
         // a live child's REAL overlay-root inode (nested-launch bind target).
         if prel.is_empty() && name == KIDS_DIR {
             let ino = self.ino_for(&(bid, KIDS_DIR.to_string()));
+            self.inner.inodes.acquire(ino, 1);
             return reply.entry(&TTL, &self.synth_dir_attr(ino, 0o40755, 0),
                                Generation(0));
         }
@@ -1743,6 +1707,7 @@ impl Filesystem for Overlay {
             if let Ok(cid) = name.parse::<i64>() {
                 if self.box_of(cid).and_then(|c| c.parent()) == Some(bid) {
                     let cino = self.ino_for(&(cid, String::new()));
+                    self.inner.inodes.acquire(cino, 1);
                     return reply.entry(&TTL,
                         &self.synth_dir_attr(cino, 0o40755, 0), Generation(0));
                 }
@@ -1753,6 +1718,7 @@ impl Filesystem for Overlay {
                   else { format!("{prel}/{name}") };
         let ino = self.ino_for(&(bid, rel.clone()));
         if prel.is_empty() && (sink_stream(&rel).is_some() || rel == JOBSERVER) {
+            self.inner.inodes.acquire(ino, 1);
             return reply.entry(&TTL, &self.synth_file_attr(ino), Generation(0));
         }
         // Engine self-hide: sarun's own host dirs are invisible to boxes.
@@ -1767,9 +1733,16 @@ impl Filesystem for Overlay {
             return reply.error(Errno::ENOENT);
         }
         match self.attr_of(&b, ino, &rel) {
-            Some(a) => reply.entry(&TTL, &a, Generation(0)),
+            Some(a) => {
+                self.inner.inodes.acquire(ino, 1);
+                reply.entry(&TTL, &a, Generation(0));
+            }
             None => reply.error(Errno::ENOENT),
         }
+    }
+
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.inner.inodes.forget(u64::from(ino), nlookup);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>,

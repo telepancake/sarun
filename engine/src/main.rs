@@ -63,6 +63,7 @@ mod reader;
 mod review;
 mod rules;
 mod runner;
+mod sarunfs;
 mod selfbt;
 mod sixel;
 mod slippool;

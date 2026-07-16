@@ -1,0 +1,148 @@
+//! Transport-neutral state for sarun's single filesystem implementation.
+//!
+//! Protocol frontends do not own inode identity.  FUSE lookup/forget and the
+//! virtio-fs guest protocol have identical lifetime rules, so the mapping and
+//! reference counts live here and are shared by every frontend.
+
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+pub(crate) type NodeKey = (i64, String);
+
+#[derive(Debug)]
+struct Inodes {
+    by_inode: HashMap<u64, NodeKey>,
+    by_key: HashMap<NodeKey, u64>,
+    lookups: HashMap<u64, u64>,
+    next: u64,
+}
+
+/// Stable virtual inode identities plus kernel lookup reference counts.
+///
+/// Zero-count entries deliberately remain interned.  An open-but-unlinked
+/// file may still receive requests, and retaining the identity is both safe
+/// and cheap.  Reclamation can later use handle counts without changing the
+/// protocol contract.
+#[derive(Debug)]
+pub(crate) struct InodeTable {
+    state: RwLock<Inodes>,
+}
+
+impl InodeTable {
+    pub(crate) fn new(root: NodeKey) -> Self {
+        let mut by_inode = HashMap::new();
+        by_inode.insert(1, root.clone());
+        let mut by_key = HashMap::new();
+        by_key.insert(root, 1);
+        Self {
+            state: RwLock::new(Inodes {
+                by_inode,
+                by_key,
+                lookups: HashMap::new(),
+                next: 2,
+            }),
+        }
+    }
+
+    pub(crate) fn key(&self, inode: u64) -> Option<NodeKey> {
+        self.state.read().unwrap().by_inode.get(&inode).cloned()
+    }
+
+    pub(crate) fn intern(&self, key: &NodeKey) -> u64 {
+        if let Some(inode) = self.state.read().unwrap().by_key.get(key) {
+            return *inode;
+        }
+        let mut state = self.state.write().unwrap();
+        if let Some(inode) = state.by_key.get(key) {
+            return *inode;
+        }
+        let inode = state.next;
+        state.next = state.next.checked_add(1).expect("virtual inode exhausted");
+        state.by_key.insert(key.clone(), inode);
+        state.by_inode.insert(inode, key.clone());
+        inode
+    }
+
+    pub(crate) fn acquire(&self, inode: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut state = self.state.write().unwrap();
+        if state.by_inode.contains_key(&inode) {
+            let current = state.lookups.entry(inode).or_default();
+            *current = current.saturating_add(count);
+        }
+    }
+
+    pub(crate) fn forget(&self, inode: u64, count: u64) {
+        let mut state = self.state.write().unwrap();
+        let current = state.lookups.entry(inode).or_default();
+        *current = current.saturating_sub(count);
+    }
+
+    pub(crate) fn remap_subtree(&self, box_id: i64, old: &str, new: &str) {
+        let prefix = format!("{old}/");
+        let mut state = self.state.write().unwrap();
+        let moves: Vec<(NodeKey, NodeKey, u64)> = state
+            .by_key
+            .iter()
+            .filter(|((owner, _), _)| *owner == box_id)
+            .filter_map(|((owner, path), inode)| {
+                let replacement = if path == old {
+                    Some(new.to_owned())
+                } else {
+                    path.strip_prefix(&prefix)
+                        .map(|tail| format!("{new}/{tail}"))
+                }?;
+                Some(((*owner, path.clone()), (*owner, replacement), *inode))
+            })
+            .collect();
+        for (old_key, new_key, inode) in moves {
+            state.by_key.remove(&old_key);
+            state.by_key.insert(new_key.clone(), inode);
+            state.by_inode.insert(inode, new_key);
+        }
+    }
+
+    #[cfg(test)]
+    fn lookup_count(&self, inode: u64) -> u64 {
+        self.state
+            .read()
+            .unwrap()
+            .lookups
+            .get(&inode)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_is_stable_and_forget_saturates() {
+        let table = InodeTable::new((0, String::new()));
+        let key = (7, "a/b".to_owned());
+        let inode = table.intern(&key);
+        assert_eq!(inode, table.intern(&key));
+        assert_eq!(table.key(inode), Some(key));
+        table.acquire(inode, 3);
+        table.forget(inode, 2);
+        assert_eq!(table.lookup_count(inode), 1);
+        table.forget(inode, 20);
+        assert_eq!(table.lookup_count(inode), 0);
+    }
+
+    #[test]
+    fn rename_preserves_inode_identity_for_whole_subtree() {
+        let table = InodeTable::new((0, String::new()));
+        let parent = table.intern(&(4, "old".to_owned()));
+        let child = table.intern(&(4, "old/dir/file".to_owned()));
+        let other = table.intern(&(5, "old/dir/file".to_owned()));
+        table.remap_subtree(4, "old", "new");
+        assert_eq!(table.key(parent), Some((4, "new".to_owned())));
+        assert_eq!(table.key(child), Some((4, "new/dir/file".to_owned())));
+        assert_eq!(table.key(other), Some((5, "old/dir/file".to_owned())));
+    }
+}
