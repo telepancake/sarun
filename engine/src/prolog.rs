@@ -2818,6 +2818,108 @@ mod tests {
     }
 
     #[test]
+    fn installed_brush_grammar_consumes_variable_observation() {
+        let id = rv_compound(
+            "node_ref",
+            vec![
+                rv_atom("simple_parameter"),
+                rv_compound("span", vec![rv_integer(5), rv_integer(7)]),
+            ],
+        );
+        let query = rv_compound(
+            "ask",
+            vec![
+                rv_atom("one"),
+                rv_atom("shell_variable"),
+                rv_compound("name", vec![rv_string("z")]),
+            ],
+        );
+        let entry = rv_compound(
+            "entry",
+            vec![
+                rv_atom("shell_variable"),
+                rv_atom("variable_z"),
+                rv_list(vec![rv_string("z")]),
+                rv_compound("shell_text", vec![rv_string("value")]),
+                rv_list(vec![]),
+            ],
+        );
+        let outcome = rv_compound(
+            "some",
+            vec![rv_compound("one", vec![entry.clone()])],
+        );
+        let observation = rv_compound(
+            "observed",
+            vec![
+                id.clone(),
+                query.clone(),
+                rv_compound(
+                    "source",
+                    vec![rv_atom("brush_variables"), rv_integer(7)],
+                ),
+                outcome.clone(),
+            ],
+        );
+        let reply = global()
+            .unwrap()
+            .transform(&RelationRequest {
+                grammar: brush_grammar_handle(),
+                given: vec![
+                    RelationBinding {
+                        name: "source".into(),
+                        value: rv_compound(
+                            "text_source",
+                            vec![
+                                rv_string("echo $z"),
+                                rv_atom("exact"),
+                                rv_atom("rust_test"),
+                            ],
+                        ),
+                    },
+                    RelationBinding {
+                        name: "initial_state".into(),
+                        value: rv_compound(
+                            "local_state",
+                            vec![
+                                rv_list(vec![rv_compound(
+                                    "scope",
+                                    vec![rv_atom("root"), rv_list(vec![])],
+                                )]),
+                                rv_list(vec![]),
+                            ],
+                        ),
+                    },
+                ],
+                wanted: vec!["resolutions".into()],
+                observations: vec![observation],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert!(reply.diagnostics.is_empty());
+        assert!(reply.context_queries.is_empty());
+        assert_eq!(
+            reply.dependency_keys,
+            vec![rv_compound(
+                "dependency",
+                vec![id.clone(), query, outcome],
+            )]
+        );
+        assert_eq!(
+            reply.solutions[0].bindings[0].value,
+            rv_list(vec![rv_compound(
+                "resolved",
+                vec![
+                    id,
+                    rv_compound(
+                        "external",
+                        vec![rv_compound("one", vec![entry])],
+                    ),
+                ],
+            )])
+        );
+    }
+
+    #[test]
     fn local_state_crosses_the_embedded_relation_without_local_queries() {
         let define_x = rv_compound(
             "define",

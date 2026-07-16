@@ -256,6 +256,10 @@ Do not implement these as Brush-specific engine branches:
       locally, and only unresolved parameters emit `one` queries. Prefix
       assignments, functions, compound scopes, braced operators, and special
       parameters remain.
+      Returned observations are now consumed by the same state projection:
+      successful `one` observations bind the external value, missing or
+      ambiguous `one` observations remove the semantic solution, and every
+      consumed observation yields a provenance-free dependency key.
 - [ ] Add explicit providers for aliases, functions, builtins, PATH commands,
       filesystem names, environment, and programmable completion specs.
 - [ ] Compose builtin argument grammars after command resolution; start with a

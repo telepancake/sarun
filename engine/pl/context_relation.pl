@@ -4,6 +4,7 @@
             observe_query/4,
             dependency_key/2,
             valid_query_graph/1,
+            stage_context/4,
             ready_queries/3,
             resolve_query_refs/3,
             valid_snapshot/1
@@ -236,15 +237,32 @@ query_node([_|Nodes], Id, Ask) :- query_node(Nodes, Id, Ask).
 %! ready_queries(+Graph, +Observations, -Ready) is det.
 
 ready_queries(Graph, Observations, Ready) :-
-    ( valid_query_graph(Graph), valid_observations(Observations, Graph)
-    -> findall(query(Id, Resolved),
-               ( query_node(Graph, Id, Ask),
-                 \+ observation_for(Observations, Id, _),
-                 resolve_refs(Ask, Observations, Resolved)
-               ),
-               Ready)
+    ( stage_context(Graph, Observations, Ready, _)
+    -> true
     ;  Ready = []
     ).
+
+%! stage_context(+Graph, +Observations, -Ready, -DependencyKeys) is semidet.
+%
+% Validate a staged query/observation exchange, return queries whose typed
+% dependencies are now ready, and project provenance-free invalidation keys.
+
+stage_context(Graph, Observations, Ready, DependencyKeys) :-
+    valid_query_graph(Graph),
+    valid_observations(Observations, Graph),
+    findall(query(Id, Resolved),
+            ( query_node(Graph, Id, Ask),
+              \+ observation_for(Observations, Id, _),
+              resolve_refs(Ask, Observations, Resolved)
+            ),
+            Ready),
+    observation_dependencies(Observations, DependencyKeys).
+
+observation_dependencies([], []).
+observation_dependencies([Observation|Observations],
+                         [Dependency|Dependencies]) :-
+    dependency_key(Observation, Dependency),
+    observation_dependencies(Observations, Dependencies).
 
 % Project one graph query into the concrete query actually sent to its
 % provider, using successful `one` observations for typed dependencies.

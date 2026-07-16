@@ -1,7 +1,8 @@
 :- module(local_state_relation,
           [ empty_local_state/1,
-            valid_local_state/1,
-            run_state_steps/6
+           valid_local_state/1,
+           resolve_state_resolutions/3,
+           run_state_steps/6
           ]).
 
 /** <module> Pure scoped state transitions for relational grammars
@@ -69,6 +70,28 @@ state_step(require(Id, Cardinality, Domain, Selector), State, State, [],
     ground(Id),
     valid_cardinality(Cardinality),
     ground(Domain), ground(Selector).
+
+resolve_state_resolutions([], _, []).
+resolve_state_resolutions(
+    [resolved(Id, external(ref(Id)))|Resolutions], Observations,
+    [resolved(Id, External)|Resolved]) :- !,
+    ( resolution_observation(Id, Observations, Outcome)
+    -> observed_external(Outcome, External)
+    ;  External = external(ref(Id))
+    ),
+    resolve_state_resolutions(Resolutions, Observations, Resolved).
+resolve_state_resolutions([Resolution|Resolutions], Observations,
+                          [Resolution|Resolved]) :-
+    resolve_state_resolutions(Resolutions, Observations, Resolved).
+
+resolution_observation(Id, [observed(Id, _, _, Outcome)|_], Outcome) :- !.
+resolution_observation(Id, [_|Observations], Outcome) :-
+    resolution_observation(Id, Observations, Outcome).
+
+observed_external(some(Result), external(Result)).
+% A failed `one` observation makes the semantic relation fail. `empty` and
+% `all` queries always have a value, including false and an empty list.
+observed_external(none, _) :- fail.
 
 valid_policy(replace).
 valid_policy(unique).

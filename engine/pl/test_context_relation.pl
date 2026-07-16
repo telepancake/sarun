@@ -93,10 +93,13 @@ run_test(dependent_queries_become_ready_in_order) :-
     BoxObservation =
         observed(box_query, ask(one, box, name("work")), source(boxes, 7),
                  some(one(entry(box, 2, ["work"], box_id(2), [])))),
-    ready_queries(Graph, [BoxObservation],
-                  [query(path_query,
-                         ask(all, path,
-                             within(box(box_id(2)), prefix("src/"))))]).
+    stage_context(
+        Graph, [BoxObservation],
+        [query(path_query,
+               ask(all, path,
+                   within(box(box_id(2)), prefix("src/"))))],
+        [dependency(box_query, ask(one, box, name("work")),
+                    some(one(entry(box, 2, ["work"], box_id(2), []))))]).
 
 run_test(invalid_graphs_fail_closed) :-
     \+ valid_query_graph([query(a, ask(one, box, name("x"))),

@@ -455,7 +455,10 @@ generic enrichment combinator to expose syntax and state projections together:
 assignment-only commands emit their variable definition after RHS traversal,
 later simple parameters resolve locally, and unresolved parameters become
 explicit external queries. This is the first shell-state slice, not yet full
-Brush assignment or scope semantics.
+Brush assignment or scope semantics. The same state projection now stages
+context observations: successful unique observations bind external values,
+failed unique observations fail the semantic solution, and consumed outcomes
+become stable dependency keys for selective invalidation.
 
 The next externally usable checkpoint is explicitly the complete interactive
 `sarun brush` editing experience: relation-owned highlighting, completion,

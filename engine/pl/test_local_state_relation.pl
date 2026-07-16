@@ -5,6 +5,8 @@
 test_name(locals_resolve_without_external_queries).
 test_name(escaping_assignment_is_local_and_returns_delta).
 test_name(shadowing_and_scope_exit_are_lexical).
+test_name(external_resolution_consumes_unique_observation).
+test_name(failed_unique_observation_fails_resolution).
 
 run_local_state_relation_tests :-
     findall(Name, test_name(Name), Names),
@@ -75,3 +77,20 @@ run_test(shadowing_and_scope_exit_are_lexical) :-
          resolved(outer_x,
                   local(local_binding(name, "x", outer, lexical)))],
         [], []).
+
+run_test(external_resolution_consumes_unique_observation) :-
+    Id = use_z,
+    Query = ask(one, symbol, name("z")),
+    Entry = entry(symbol, z_id, ["z"], integer(9), []),
+    Resolutions = [resolved(Id, external(ref(Id)))],
+    resolve_state_resolutions(
+        Resolutions,
+        [observed(Id, Query, source(symbols, 3), some(one(Entry)))],
+        [resolved(Id, external(one(Entry)))]).
+
+run_test(failed_unique_observation_fails_resolution) :-
+    Id = use_z,
+    \+ resolve_state_resolutions(
+           [resolved(Id, external(ref(Id)))],
+           [observed(Id, ask(one, symbol, name("z")),
+                     source(symbols, 4), none)], _).

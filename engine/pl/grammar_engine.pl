@@ -62,30 +62,42 @@ transform_relation(context_grammar, Given, Wanted, _EnvelopeObservations,
     ),
     Available = [binding(outcome, Outcome)],
     requested_bindings(Wanted, Available, Bindings).
-transform_relation(local_state_grammar, Given, Wanted, _Observations, _Limits,
-                   reply([solution(Bindings, 0)], Queries, [], [])) :-
+transform_relation(local_state_grammar, Given, Wanted, Observations, _Limits,
+                   reply(Solutions, ReadyQueries,
+                         DependencyKeys, [])) :-
     given_value(steps, Given, Steps),
     given_value(initial_state, Given, Initial),
-    run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta),
+    run_state_steps(Steps, Initial, Final, Resolutions0, Queries, Delta),
     valid_query_graph(Queries),
-    Available = [binding(final_state, Final),
-                 binding(resolutions, Resolutions),
-                 binding(delta, Delta)],
-    requested_bindings(Wanted, Available, Bindings).
-transform_relation(ast_state_grammar(Rules), Given, Wanted, _Observations,
+    stage_context(Queries, Observations, ReadyQueries, DependencyKeys),
+    ( resolve_state_resolutions(Resolutions0, Observations, Resolutions)
+    -> Available = [binding(final_state, Final),
+                    binding(resolutions, Resolutions),
+                    binding(delta, Delta)],
+       requested_bindings(Wanted, Available, Bindings),
+       Solutions = [solution(Bindings, 0)]
+    ;  Solutions = []
+    ).
+transform_relation(ast_state_grammar(Rules), Given, Wanted, Observations,
                    _Limits,
-                   reply([solution(Bindings, 0)], Queries, [], [])) :-
+                   reply(Solutions, ReadyQueries,
+                         DependencyKeys, [])) :-
     given_value(ast, Given, Ast),
     given_value(source, Given, Source),
     given_value(initial_state, Given, Initial),
     derive_ast_state_steps(Rules, Ast, Source, Steps),
-    run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta),
+    run_state_steps(Steps, Initial, Final, Resolutions0, Queries, Delta),
     valid_query_graph(Queries),
-    Available = [binding(steps, Steps),
-                 binding(final_state, Final),
-                 binding(resolutions, Resolutions),
-                 binding(delta, Delta)],
-    requested_bindings(Wanted, Available, Bindings).
+    stage_context(Queries, Observations, ReadyQueries, DependencyKeys),
+    ( resolve_state_resolutions(Resolutions0, Observations, Resolutions)
+    -> Available = [binding(steps, Steps),
+                    binding(final_state, Final),
+                    binding(resolutions, Resolutions),
+                    binding(delta, Delta)],
+       requested_bindings(Wanted, Available, Bindings),
+       Solutions = [solution(Bindings, 0)]
+    ;  Solutions = []
+    ).
 transform_relation(enrichment_grammar(Base, Shared, Extension, Outputs),
                    Given, Wanted, Observations, Limits, Reply) :-
     proper_atom_names(Shared),

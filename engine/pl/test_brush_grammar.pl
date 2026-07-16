@@ -11,6 +11,8 @@ test_name(unterminated_word_has_no_complete_parse).
 test_name(assignment_resolves_later_parameter_inside_relation).
 test_name(assignment_rhs_resolves_before_definition).
 test_name(unresolved_parameter_emits_external_query).
+test_name(parameter_observation_resolves_and_records_dependency).
+test_name(missing_unique_parameter_observation_fails_semantic_solution).
 
 run_brush_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -170,6 +172,41 @@ run_test(unresolved_parameter_emits_external_query) :-
                                                    span(5, 7)))))])], 0)],
               [query(node_ref(simple_parameter, span(5, 7)),
                      ask(one, shell_variable, name("z")))], [], [])).
+
+run_test(parameter_observation_resolves_and_records_dependency) :-
+    brush_relation_grammar(Grammar),
+    Id = node_ref(simple_parameter, span(5, 7)),
+    Query = ask(one, shell_variable, name("z")),
+    Entry = entry(shell_variable, variable_z, ["z"], shell_text("value"),
+                  [exported]),
+    Observation = observed(Id, Query, source(brush_variables, 7),
+                           some(one(Entry))),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("echo $z", exact, brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], []))]),
+                want([resolutions]), observations([Observation]),
+                limits(32, 4096, 1048576)),
+        reply([solution([binding(resolutions,
+                                 [resolved(Id, external(one(Entry)))])], 0)],
+              [], [dependency(Id, Query, some(one(Entry)))], [])).
+
+run_test(missing_unique_parameter_observation_fails_semantic_solution) :-
+    brush_relation_grammar(Grammar),
+    Id = node_ref(simple_parameter, span(5, 7)),
+    Query = ask(one, shell_variable, name("z")),
+    Observation = observed(Id, Query, source(brush_variables, 8), none),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("echo $z", exact, brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], []))]),
+                want([resolutions]), observations([Observation]),
+                limits(32, 4096, 1048576)),
+        reply([], [], [dependency(Id, Query, none)], [])).
 
 has_highlight(Span, Syntax, Semantic, Origin,
               [highlight(Span, Syntax, Semantic, Origin)|_]).
