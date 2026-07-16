@@ -5,6 +5,7 @@
 
 test_name(fields_emit_ordered_state_steps_from_utf8_source).
 test_name(before_and_after_emissions_wrap_child_nodes).
+test_name(symbolic_text_projection_is_declarative_ast_glue).
 
 run_ast_state_relation_tests :-
     findall(Name, test_name(Name), Names),
@@ -61,3 +62,33 @@ run_test(before_and_after_emissions_wrap_child_nodes) :-
                            [enter(function_scope),
                             use(node_ref(use, span(0, 1)), symbol, "x"),
                             leave(function_scope)]).
+
+run_test(symbolic_text_projection_is_declarative_ast_glue) :-
+    Hole = hole(edit, span(5, 5), "", terminal(text(codepoint(any)))),
+    Ast = node(assignment, span(0, 6),
+               sequence([
+                   field(name, span(0, 1), ignored),
+                   field(value, span(2, 6),
+                         sequence([
+                             node(raw_text, span(2, 3), codepoint(120)),
+                             node(parameter, span(3, 5),
+                                  field(name, span(4, 5), ignored)),
+                             Hole,
+                             node(raw_text, span(5, 6), codepoint(121))]))
+               ])),
+    TextRules = [text_rule(node(raw_text), source),
+                 text_rule(node(parameter),
+                           reference(variable, field_text(name)))],
+    Rules = [state_rule(
+                 node(assignment),
+                 [capture(name, field_text(name)),
+                  capture(value,
+                          field_symbolic_text(value, TextRules))],
+                 before([]),
+                 after([define(variable, slot(name), slot(value),
+                               escaping, replace)]))],
+    derive_ast_state_steps(
+        Rules, Ast, text_source("A=x$By", assist(edit, span(5, 5)), fixture),
+        [define(variable, "A",
+                text(["x", reference(variable, "B"), Hole, "y"]),
+                escaping, replace)]).

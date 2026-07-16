@@ -3165,7 +3165,7 @@ mod tests {
                 vec![
                     rv_atom("shell_variable"),
                     rv_string("x"),
-                    rv_compound("shell_text", vec![rv_string("123")]),
+                    rv_compound("text", vec![rv_list(vec![rv_string("123")])]),
                 ],
             )])
         );
@@ -3195,7 +3195,7 @@ mod tests {
             vec![DocumentStateChange {
                 domain: rv_atom("shell_variable"),
                 name: "x".into(),
-                value: rv_compound("shell_text", vec![rv_string("123")]),
+                value: rv_compound("text", vec![rv_list(vec![rv_string("123")])]),
             }]
         );
 
@@ -3229,6 +3229,55 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.contains("UTF-8 boundaries"));
+    }
+
+    #[test]
+    fn production_brush_document_keeps_assignment_tear_in_local_value() {
+        let analysis = analyze_brush_document(&BrushDocumentRequest {
+            source: "A=\"\"; echo $A".into(),
+            assist: Some(Span { start: 3, end: 3 }),
+            initial_bindings: vec![],
+            observations: vec![],
+        })
+        .unwrap();
+        assert!(analysis.context_queries.is_empty());
+        assert!(analysis.candidates.iter().all(|candidate| {
+            candidate.status
+                == ParseStatus::Incomplete {
+                    edit_id: "document_edit".into(),
+                }
+        }));
+        let hole = rv_compound(
+            "hole",
+            vec![
+                rv_atom("document_edit"),
+                rv_compound("span", vec![rv_integer(3), rv_integer(3)]),
+                rv_string(""),
+                rv_compound(
+                    "terminal",
+                    vec![rv_compound(
+                        "text",
+                        vec![rv_compound(
+                            "codepoint",
+                            vec![rv_compound("except", vec![rv_string("\"\\$")])],
+                        )],
+                    )],
+                ),
+            ],
+        );
+        assert!(analysis.candidates.iter().any(|candidate| {
+            candidate.state_changes.iter().any(|change| {
+                change.domain == rv_atom("shell_variable")
+                    && change.name == "A"
+                    && contains_relation_value(&change.value, &hole)
+            })
+        }));
+        assert!(analysis.candidates.iter().any(|candidate| {
+            candidate
+                .completions
+                .iter()
+                .any(|completion| completion.insert == "$")
+        }));
     }
 
     #[test]

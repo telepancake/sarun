@@ -22,14 +22,22 @@ brush_relation_grammar(
 brush_state_rules([
     state_rule(node(assignment),
                [capture(name, field_text(name)),
-                capture(value, field_text(value))],
+                capture(value, field_symbolic_text(value, TextRules))],
                before([]),
-               after([define(shell_variable, slot(name),
-                             shell_text(slot(value)), escaping, replace)])),
+               after([define(shell_variable, slot(name), slot(value),
+                             escaping, replace)])),
     state_rule(node(simple_parameter),
                [capture(name, field_text(name))],
                before([use(node_identity, shell_variable, slot(name))]),
                after([]))
+]) :-
+    brush_text_projection_rules(TextRules).
+
+brush_text_projection_rules([
+    text_rule(node(unquoted_text), source),
+    text_rule(node(double_quoted_part), children_else_source),
+    text_rule(node(simple_parameter),
+              reference(shell_variable, field_text(name)))
 ]).
 
 brush_syntax_grammar(
@@ -90,10 +98,10 @@ brush_syntax_grammar(
                           seq([ref(required_horizontal_space),
                                ref(assignment)]))])),
          rule(command_words,
-              seq([not(ref(assignment)), ref(shell_word),
+              seq([not(ref(assignment)), field(command, ref(shell_word)),
                    repeat(0, unbounded,
                           seq([ref(required_horizontal_space),
-                               ref(shell_word)]))])),
+                               field(argument, ref(shell_word))]))])),
          rule(assignment,
               seq([field(name, ref(variable_name)),
                    literal("=", assignment,
@@ -153,7 +161,8 @@ brush_syntax_grammar(
                       ref(parameter_expansion),
                       ref(escape),
                       terminal(text(codepoint(except("\"\\$"))),
-                               presentation([meta(syntax, string)])),
+                               presentation([meta(syntax, string),
+                                             meta(tear, symbolic)])),
                       ref(double_literal_dollar)])),
          rule(parameter_expansion,
               choice([ref(braced_parameter), ref(simple_parameter),

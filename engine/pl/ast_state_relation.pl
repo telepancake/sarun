@@ -47,6 +47,26 @@ valid_capture_selector(node_span).
 valid_capture_selector(field_span(Name)) :- atom(Name).
 valid_capture_selector(field_value(Name)) :- atom(Name).
 valid_capture_selector(field_text(Name)) :- atom(Name).
+valid_capture_selector(field_symbolic_text(Name, Rules)) :-
+    atom(Name),
+    valid_text_projection_rules(Rules).
+
+valid_text_projection_rules(Rules) :-
+    proper_list(Rules),
+    valid_text_projection_rules(Rules, []).
+
+valid_text_projection_rules([], _).
+valid_text_projection_rules([text_rule(node(Name), Strategy)|Rules], Seen) :-
+    atom(Name),
+    \+ member_eq(Name, Seen),
+    valid_text_projection_strategy(Strategy),
+    valid_text_projection_rules(Rules, [Name|Seen]).
+
+valid_text_projection_strategy(source).
+valid_text_projection_strategy(children).
+valid_text_projection_strategy(children_else_source).
+valid_text_projection_strategy(reference(Domain, field_text(Name))) :-
+    ground(Domain), atom(Name).
 
 derive_ast_state_steps(Rules, Ast, Source, Steps) :-
     valid_ast_state_rules(Rules),
@@ -105,6 +125,59 @@ capture_value(field_value(Name), _, Value, _, FieldValue) :-
 capture_value(field_text(Name), _, Value, Source, Text) :-
     node_field(Name, Value, Span, _),
     source_span_text(Source, Span, Text).
+capture_value(field_symbolic_text(Name, Rules), _, Value, Source, Text) :-
+    node_field(Name, Value, _, FieldValue),
+    project_symbolic_text(FieldValue, Source, Rules, Text).
+
+project_symbolic_text(Value, Source, Rules, text(Segments)) :-
+    project_text_segments(Value, Source, Rules, RawSegments),
+    normalize_text_segments(RawSegments, Segments).
+
+project_text_segments(hole(EditId, Span, Surface, Codec), _, _,
+                      [hole(EditId, Span, Surface, Codec)]) :- !.
+project_text_segments(node(Name, Span, Value), Source, Rules, Segments) :- !,
+    text_projection_strategy(Name, Rules, Strategy),
+    project_node_text(Strategy, Span, Value, Source, Rules, Segments).
+project_text_segments(Value, Source, Rules, Segments) :-
+    compound(Value), !,
+    Value =.. [_|Arguments],
+    project_text_arguments(Arguments, Source, Rules, Segments).
+project_text_segments(_, _, _, []).
+
+text_projection_strategy(Name, [text_rule(node(Name), Strategy)|_],
+                         Strategy) :- !.
+text_projection_strategy(Name, [_|Rules], Strategy) :-
+    text_projection_strategy(Name, Rules, Strategy).
+text_projection_strategy(_, [], children).
+
+project_node_text(source, Span, _, Source, _, [Text]) :-
+    source_span_text(Source, Span, Text).
+project_node_text(children, _, Value, Source, Rules, Segments) :-
+    project_text_segments(Value, Source, Rules, Segments).
+project_node_text(children_else_source, Span, Value, Source, Rules, Segments) :-
+    project_text_segments(Value, Source, Rules, Children),
+    ( Children = []
+    -> source_span_text(Source, Span, Text), Segments = [Text]
+    ;  Segments = Children
+    ).
+project_node_text(reference(Domain, field_text(Name)), _, Value, Source, _,
+                  [reference(Domain, Text)]) :-
+    node_field(Name, Value, Span, _),
+    source_span_text(Source, Span, Text).
+
+project_text_arguments([], _, _, []).
+project_text_arguments([Value|Values], Source, Rules, Segments) :-
+    project_text_segments(Value, Source, Rules, First),
+    project_text_arguments(Values, Source, Rules, Rest),
+    append(First, Rest, Segments).
+
+normalize_text_segments([], []).
+normalize_text_segments([Text, Next|Segments], Normalized) :-
+    string(Text), string(Next), !,
+    string_concat(Text, Next, Combined),
+    normalize_text_segments([Combined|Segments], Normalized).
+normalize_text_segments([Segment|Segments], [Segment|Normalized]) :-
+    normalize_text_segments(Segments, Normalized).
 
 % Fields are searched within the current named node, but never through a child
 % named node.  A field wrapping a child node is still visible at its owner.

@@ -276,6 +276,13 @@ Do not implement these as Brush-specific engine branches:
       suffix text constrain the replacement; cyclic, missing, and malformed
       bindings fail closed. Brush AST/value glue and command signatures still
       need to produce these generic constraints.
+- [x] Add declarative AST-to-symbolic-text projection rules to the existing
+      client glue boundary. Grammar data chooses source-text, child
+      concatenation, or typed field reference per named node; the generic
+      adapter preserves terminal holes and normalizes adjacent text. Brush
+      assignments now store `text([...])` values, so a tear inside `A="|"`
+      survives local resolution at a later `$A` use. Invocation/signature data
+      still needs to impose the later argument constraint.
 - [ ] Add explicit providers for aliases, functions, builtins, PATH commands,
       filesystem names, environment, and programmable completion specs.
 - [ ] Compose builtin argument grammars after command resolution; start with a

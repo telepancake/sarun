@@ -13,6 +13,7 @@ test_name(assignment_rhs_resolves_before_definition).
 test_name(unresolved_parameter_emits_external_query).
 test_name(parameter_observation_resolves_and_records_dependency).
 test_name(missing_unique_parameter_observation_fails_semantic_solution).
+test_name(assignment_tear_survives_as_later_local_value).
 
 run_brush_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -123,11 +124,11 @@ run_test(assignment_resolves_later_parameter_inside_relation) :-
                             [resolved(
                                  node_ref(simple_parameter, span(12, 14)),
                                  local(local_binding(
-                                     shell_variable, "x", shell_text("123"),
+                                     shell_variable, "x", text(["123"]),
                                      escaping)))]),
                     binding(delta,
                             [state_change(shell_variable, "x",
-                                          shell_text("123"))])], 0)],
+                                          text(["123"]))])], 0)],
               [], [], [])),
     has_highlight(span(1, 2), operator, assignment, brush_test, Highlights),
     has_highlight(span(12, 13), variable, parameter_sigil, brush_test,
@@ -151,7 +152,8 @@ run_test(assignment_rhs_resolves_before_definition) :-
                                                        span(2, 4))))) ]),
                     binding(delta,
                             [state_change(shell_variable, "x",
-                                          shell_text("$x"))])], 0)],
+                                          text([reference(shell_variable,
+                                                          "x")]))])], 0)],
               [query(node_ref(simple_parameter, span(2, 4)),
                      ask(one, shell_variable, name("x")))], [], [])).
 
@@ -207,6 +209,44 @@ run_test(missing_unique_parameter_observation_fails_semantic_solution) :-
                 want([resolutions]), observations([Observation]),
                 limits(32, 4096, 1048576)),
         reply([], [], [dependency(Id, Query, none)], [])).
+
+run_test(assignment_tear_survives_as_later_local_value) :-
+    brush_relation_grammar(Grammar),
+    Codec = text(codepoint(except("\"\\$"))),
+    Hole = hole(edit, span(3, 3), "", terminal(Codec)),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("A=\"\"; echo $A",
+                                           assist(edit, span(3, 3)),
+                                           brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], []))]),
+                want([status, final_state, resolutions, completions]),
+                observations([]), limits(32, 4096, 1048576)),
+        reply([solution(
+                   [binding(status, incomplete(edit(edit))),
+                    binding(final_state,
+                            local_state(
+                                [scope(root,
+                                       [local_binding(shell_variable, "A",
+                                                      text([Hole]),
+                                                      escaping)])],
+                                [state_change(shell_variable, "A",
+                                              text([Hole]))])),
+                    binding(resolutions,
+                            [resolved(
+                                 node_ref(simple_parameter, span(11, 13)),
+                                 local(local_binding(shell_variable, "A",
+                                                     text([Hole]),
+                                                     escaping)))]),
+                    binding(completions,
+                            [completion(
+                                 span(3, 3), "$",
+                                 [alternative(literal_dollar, string,
+                                              grammar, 0)],
+                                 0, 1)])], 0),
+                solution(_, 0)], [], [], [])).
 
 has_highlight(Span, Syntax, Semantic, Origin,
               [highlight(Span, Syntax, Semantic, Origin)|_]).
