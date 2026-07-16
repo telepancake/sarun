@@ -1597,6 +1597,69 @@ impl SarunFs {
         }
     }
 
+    fn set_xattr_node(
+        &self,
+        inode: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), Errno> {
+        self.getattr_node(inode)?;
+        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
+        if self.ro_denied(bid, &rel) {
+            return Err(Errno::EROFS);
+        }
+        let name = name.to_str().ok_or(Errno::EINVAL)?;
+        let exists = b.get_xattr(&rel, name).is_some();
+        let create = libc::XATTR_CREATE as u32;
+        let replace = libc::XATTR_REPLACE as u32;
+        if flags & !(create | replace) != 0
+            || flags & create != 0 && flags & replace != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+        if flags & create != 0 && exists {
+            return Err(Errno::EEXIST);
+        }
+        if flags & replace != 0 && !exists {
+            return Err(Errno::ENODATA);
+        }
+        b.set_xattr(&rel, name, value);
+        Ok(())
+    }
+
+    fn get_xattr_node(&self, inode: u64, name: &OsStr) -> Result<Vec<u8>, Errno> {
+        self.getattr_node(inode)?;
+        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
+        let name = name.to_str().ok_or(Errno::EINVAL)?;
+        b.get_xattr(&rel, name).ok_or(Errno::ENODATA)
+    }
+
+    fn list_xattr_node(&self, inode: u64) -> Result<Vec<u8>, Errno> {
+        self.getattr_node(inode)?;
+        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
+        let mut buffer = Vec::new();
+        for name in b.list_xattr(&rel) {
+            buffer.extend_from_slice(name.as_bytes());
+            buffer.push(0);
+        }
+        Ok(buffer)
+    }
+
+    fn remove_xattr_node(&self, inode: u64, name: &OsStr) -> Result<(), Errno> {
+        self.getattr_node(inode)?;
+        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
+        if self.ro_denied(bid, &rel) {
+            return Err(Errno::EROFS);
+        }
+        let name = name.to_str().ok_or(Errno::EINVAL)?;
+        b.remove_xattr(&rel, name).then_some(()).ok_or(Errno::ENODATA)
+    }
+
     /// D3: the first actual write to `rel` copies the RESOLVED lower bytes
     /// (the parent box's version if nested, else the host file, else empty)
     /// into a fresh pool blob in THIS box (creating the row + provenance) and
@@ -2601,63 +2664,40 @@ impl Filesystem for SarunFs {
     }
 
     fn setxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, value: &[u8],
-                _flags: i32, _position: u32, reply: ReplyEmpty) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if self.ro_denied(bid, &rel) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+                flags: i32, _position: u32, reply: ReplyEmpty) {
+        match self.set_xattr_node(u64::from(ino), name, value, flags as u32) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
-        if let Some(k) = name.to_str() { b.set_xattr(&rel, k, value); }
-        reply.ok();
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32,
                 reply: fuser::ReplyXattr) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        let v = name.to_str().and_then(|k| b.get_xattr(&rel, k));
-        match v {
-            Some(val) => {
+        match self.get_xattr_node(u64::from(ino), name) {
+            Ok(val) => {
                 if size == 0 { reply.size(val.len() as u32); }
                 else if (size as usize) < val.len() { reply.error(Errno::ERANGE); }
                 else { reply.data(&val); }
             }
-            None => reply.error(Errno::ENODATA),
+            Err(error) => reply.error(error),
         }
     }
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32,
                  reply: fuser::ReplyXattr) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        let mut buf = Vec::new();
-        for k in b.list_xattr(&rel) {
-            buf.extend_from_slice(k.as_bytes());
-            buf.push(0);
+        match self.list_xattr_node(u64::from(ino)) {
+            Ok(buffer) if size == 0 => reply.size(buffer.len() as u32),
+            Ok(buffer) if (size as usize) < buffer.len() => reply.error(Errno::ERANGE),
+            Ok(buffer) => reply.data(&buffer),
+            Err(error) => reply.error(error),
         }
-        if size == 0 { reply.size(buf.len() as u32); }
-        else if (size as usize) < buf.len() { reply.error(Errno::ERANGE); }
-        else { reply.data(&buf); }
     }
 
     fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr,
                    reply: ReplyEmpty) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if self.ro_denied(bid, &rel) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
-        }
-        match name.to_str() {
-            Some(k) if b.remove_xattr(&rel, k) => reply.ok(),
-            _ => reply.error(Errno::ENODATA),
+        match self.remove_xattr_node(u64::from(ino), name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -2916,6 +2956,69 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         self.readlink_node(inode).map_err(virtio_error)
     }
 
+    fn setxattr(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+        _extra_flags: virtiofsd::filesystem::SetxattrFlags,
+    ) -> std::io::Result<()> {
+        self.set_xattr_node(
+            inode,
+            OsStr::from_bytes(name.to_bytes()),
+            value,
+            flags,
+        )
+        .map_err(virtio_error)
+    }
+
+    fn getxattr(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+        name: &CStr,
+        size: u32,
+    ) -> std::io::Result<virtiofsd::filesystem::GetxattrReply> {
+        let value = self
+            .get_xattr_node(inode, OsStr::from_bytes(name.to_bytes()))
+            .map_err(virtio_error)?;
+        if size == 0 {
+            Ok(virtiofsd::filesystem::GetxattrReply::Count(value.len() as u32))
+        } else if (size as usize) < value.len() {
+            Err(std::io::Error::from_raw_os_error(libc::ERANGE))
+        } else {
+            Ok(virtiofsd::filesystem::GetxattrReply::Value(value))
+        }
+    }
+
+    fn listxattr(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+        size: u32,
+    ) -> std::io::Result<virtiofsd::filesystem::ListxattrReply> {
+        let names = self.list_xattr_node(inode).map_err(virtio_error)?;
+        if size == 0 {
+            Ok(virtiofsd::filesystem::ListxattrReply::Count(names.len() as u32))
+        } else if (size as usize) < names.len() {
+            Err(std::io::Error::from_raw_os_error(libc::ERANGE))
+        } else {
+            Ok(virtiofsd::filesystem::ListxattrReply::Names(names))
+        }
+    }
+
+    fn removexattr(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+        name: &CStr,
+    ) -> std::io::Result<()> {
+        self.remove_xattr_node(inode, OsStr::from_bytes(name.to_bytes()))
+            .map_err(virtio_error)
+    }
+
     fn opendir(
         &self,
         _ctx: virtiofsd::filesystem::Context,
@@ -3055,6 +3158,42 @@ mod chain_tests {
         .unwrap();
         assert_eq!(entry.attr.mode & libc::S_IFMT, libc::S_IFDIR);
         assert_eq!(fs.inner.inodes.lookup_count(entry.inode), 1);
+
+        let xattr = CString::new("user.sarun-test").unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::setxattr(
+            &fs,
+            ctx,
+            entry.inode,
+            &xattr,
+            b"value",
+            libc::XATTR_CREATE as u32,
+            virtiofsd::filesystem::SetxattrFlags::empty(),
+        )
+        .unwrap();
+        let duplicate = <SarunFs as virtiofsd::filesystem::FileSystem>::setxattr(
+            &fs,
+            ctx,
+            entry.inode,
+            &xattr,
+            b"other",
+            libc::XATTR_CREATE as u32,
+            virtiofsd::filesystem::SetxattrFlags::empty(),
+        )
+        .unwrap_err();
+        assert_eq!(duplicate.raw_os_error(), Some(libc::EEXIST));
+        match <SarunFs as virtiofsd::filesystem::FileSystem>::getxattr(
+            &fs,
+            ctx,
+            entry.inode,
+            &xattr,
+            32,
+        )
+        .unwrap()
+        {
+            virtiofsd::filesystem::GetxattrReply::Value(value) =>
+                assert_eq!(value, b"value"),
+            virtiofsd::filesystem::GetxattrReply::Count(_) => panic!("expected value"),
+        }
 
         let (attr, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
             &fs,
