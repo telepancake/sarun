@@ -132,6 +132,23 @@ fn top_level_help() -> Result<String, String> {
     Ok(help)
 }
 
+fn dispatch_cli_action(argv: &[String]) -> Result<Option<i32>, String> {
+    match parser::parse_argv(argv, &parser::EmptyContext) {
+        parser::ParseResult::Invocation(invocation)
+            if invocation.target == parser::ActionTarget::CliLocal =>
+        {
+            let handler = invocation.handler.clone();
+            let status = match handler.as_str() {
+                "brush" => brush::execute_cli(invocation),
+                _ => return Err(format!("CLI-local action {handler:?} has no Rust handler")),
+            };
+            Ok(Some(status))
+        }
+        parser::ParseResult::BackendError(error) => Err(error),
+        _ => Ok(None),
+    }
+}
+
 fn serve() -> i32 {
     // rustls 0.23 requires an explicit process-level CryptoProvider when more
     // than one is in the dependency graph — ours has both `ring` (our direct
@@ -564,6 +581,14 @@ fn main() {
         };
         std::process::exit(brush::brush_sh(&shell_argv));
     }
+    match dispatch_cli_action(&argv) {
+        Ok(Some(status)) => std::process::exit(status),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("sarun: action relation: {error}");
+            std::process::exit(1);
+        }
+    }
     match argv.first().map(String::as_str) {
         // `sarun oaita …` — the second entry into the oaita duty (symlinked
         // `oaita` binary is the first, handled above). Equivalent code path.
@@ -814,9 +839,6 @@ fn main() {
             // Help is a local representation projection. It does not involve
             // the engine or ui.sock.
             std::process::exit(action_help::cli(&argv[1..]));
-        }
-        Some("brush") => {
-            std::process::exit(brush::cli(&argv[1..]));
         }
         Some("mirror") => {
             // sarun mirror ls|add|run|pause|resume|rm — mirror-update jobs.

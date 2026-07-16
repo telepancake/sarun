@@ -160,6 +160,7 @@ pub enum InvocationPayload {
 #[derive(Debug)]
 pub struct Invocation {
     pub action: String,
+    pub handler: String,
     pub target: ActionTarget,
     pub payload: InvocationPayload,
     // Transitional source projection used only by the JSON socket transport.
@@ -174,7 +175,7 @@ impl Invocation {
     pub fn dispatch_name(&self) -> &str {
         match &self.payload {
             InvocationPayload::Wire(request) => request.handler(),
-            InvocationPayload::Local => &self.action,
+            InvocationPayload::Local => &self.handler,
         }
     }
 
@@ -504,6 +505,7 @@ fn invocation_from_command(
         .collect::<Result<_, _>>()?;
     Ok(Invocation {
         action: command.action,
+        handler: command.handler,
         target,
         payload,
         args,
@@ -890,6 +892,7 @@ mod tests {
             other => panic!("relation did not parse standalone Brush argv: {other:?}"),
         };
         assert_eq!(invocation.action, "brush");
+        assert_eq!(invocation.handler, "brush");
         assert_eq!(invocation.target, ActionTarget::CliLocal);
         assert_eq!(
             invocation.args,

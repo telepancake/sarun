@@ -1472,6 +1472,7 @@ pub fn is_brush_sh_invocation() -> bool {
 /// invoking process on the host and needs neither an engine nor a box. Argv is
 /// first related to the central action grammar without joining its elements;
 /// the resulting strings are then ordinary shell argv after `sarun brush`.
+#[cfg(test)]
 pub fn cli(arguments: &[String]) -> i32 {
     let mut source = Vec::with_capacity(arguments.len() + 1);
     source.push("brush".to_string());
@@ -1491,6 +1492,10 @@ pub fn cli(arguments: &[String]) -> i32 {
             return 2;
         }
     };
+    execute_cli(invocation)
+}
+
+pub fn execute_cli(invocation: crate::parser::Invocation) -> i32 {
     let mut shell_argv = vec!["bash".to_string()];
     for value in invocation.args {
         match value {

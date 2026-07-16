@@ -383,6 +383,11 @@ bounded input before assembling output lists; a foreign-grammar regression
 proves exhaustive spread enumeration terminates. The real static aarch64
 binary executes a quoted standalone Brush command without an engine, and the
 full suite passes 324 tests with one ignored browser integration test.
+Top-level action ingress no longer contains a `brush` parser branch: argv is
+related generically, only a result declared `cli` enters the CLI-local handler
+dispatcher, and the parsed handler identity is retained explicitly even for
+non-wire actions. The remaining Rust match maps that identity to an executable
+function and contains no name, schema, syntax, or argument parsing knowledge.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:
