@@ -2009,6 +2009,43 @@ impl SarunFs {
         Ok(attr)
     }
 
+    fn unlink_node(&self, pid: u32, parent: u64, name: &OsStr) -> Result<(), Errno> {
+        let (box_id, rel) = self.child_path(parent, name)?;
+        let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
+        if self.ro_denied(box_id, &rel) {
+            return Err(Errno::EROFS);
+        }
+        let inode = self.ino_for(&(box_id, rel.clone()));
+        let attr = self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)?;
+        if attr.kind == FileType::Directory {
+            return Err(Errno::EISDIR);
+        }
+        b.drop_row(&rel);
+        b.set_whiteout(&rel, b.writer_for(pid));
+        self.push_event(box_id, rel, "unlink");
+        Ok(())
+    }
+
+    fn rmdir_node(&self, pid: u32, parent: u64, name: &OsStr) -> Result<(), Errno> {
+        let (box_id, rel) = self.child_path(parent, name)?;
+        let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
+        if self.ro_denied(box_id, &rel) {
+            return Err(Errno::EROFS);
+        }
+        let inode = self.ino_for(&(box_id, rel.clone()));
+        let attr = self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)?;
+        if attr.kind != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if !self.scan_dir(&b, &rel, false).is_empty() {
+            return Err(Errno::ENOTEMPTY);
+        }
+        b.drop_row(&rel);
+        b.set_whiteout(&rel, b.writer_for(pid));
+        self.push_event(box_id, rel, "rmdir");
+        Ok(())
+    }
+
     fn read_file_node(&self, handle: u64) -> Result<File, Errno> {
         self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
         let handles = self.inner.fhs.read().unwrap();
@@ -2858,58 +2895,18 @@ impl Filesystem for SarunFs {
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr,
               reply: ReplyEmpty) {
-        let Some((bid, prel)) = self.key_of(parent) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
-        let rel = if prel.is_empty() { name.to_string() }
-                  else { format!("{prel}/{name}") };
-        if self.ro_denied(bid, &rel) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        match self.unlink_node(req.pid(), u64::from(parent), name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
-        let writer = b.writer_for(req.pid());
-        let lower_exists = self.host(&rel).symlink_metadata().is_ok();
-        match b.entry(&rel) {
-            Some(Entry::Whiteout) | None if !lower_exists =>
-                return reply.error(Errno::ENOENT),
-            Some(Entry::File { .. }) | Some(Entry::Symlink { .. })
-            | Some(Entry::Special { .. }) => {
-                b.drop_row(&rel);
-                if lower_exists {
-                    b.set_whiteout(&rel, writer);
-                }
-            }
-            _ => b.set_whiteout(&rel, writer),
-        }
-        self.push_event(bid, rel, "unlink");
-        reply.ok();
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr,
              reply: ReplyEmpty) {
-        let Some((bid, prel)) = self.key_of(parent) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
-        let rel = if prel.is_empty() { name.to_string() }
-                  else { format!("{prel}/{name}") };
-        if self.ro_denied(bid, &rel) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
+        match self.rmdir_node(req.pid(), u64::from(parent), name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
-        if !self.scan_dir(&b, &rel, false).is_empty() {
-            return reply.error(Errno::ENOTEMPTY);
-        }
-        let writer = b.writer_for(req.pid());
-        if matches!(b.entry(&rel), Some(Entry::Dir { .. })) {
-            b.drop_row(&rel);
-        }
-        if self.host(&rel).is_dir() {
-            b.set_whiteout(&rel, writer);
-        }
-        self.push_event(bid, rel, "rmdir");
-        reply.ok();
     }
 
     // Safe no-op/durability ops real programs call — ENOSYS here (the fuser
@@ -3231,6 +3228,34 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             attr_timeout: TTL,
             entry_timeout: TTL,
         })
+    }
+
+    fn unlink(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        parent: u64,
+        name: &CStr,
+    ) -> std::io::Result<()> {
+        self.unlink_node(
+            ctx.pid as u32,
+            parent,
+            OsStr::from_bytes(name.to_bytes()),
+        )
+        .map_err(virtio_error)
+    }
+
+    fn rmdir(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        parent: u64,
+        name: &CStr,
+    ) -> std::io::Result<()> {
+        self.rmdir_node(
+            ctx.pid as u32,
+            parent,
+            OsStr::from_bytes(name.to_bytes()),
+        )
+        .map_err(virtio_error)
     }
 
     fn read<W: virtiofsd::filesystem::ZeroCopyWriter>(
@@ -3611,7 +3636,8 @@ mod chain_tests {
             libc::XATTR_CREATE as u32,
             virtiofsd::filesystem::SetxattrFlags::empty(),
         )
-        .unwrap_err();
+        .err()
+        .unwrap();
         assert_eq!(duplicate.raw_os_error(), Some(libc::EEXIST));
         match <SarunFs as virtiofsd::filesystem::FileSystem>::getxattr(
             &fs,
@@ -3795,6 +3821,24 @@ mod chain_tests {
             .unwrap(),
             b"created",
         );
+        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
+            &fs, ctx, entry.inode, &link_name,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
+            &fs, ctx, entry.inode, &created_name,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::rmdir(
+            &fs, ctx, entry.inode, &directory_name,
+        )
+        .unwrap();
+        let missing = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &fs, ctx, entry.inode, &created_name,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
 
         let (attr, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
             &fs,
