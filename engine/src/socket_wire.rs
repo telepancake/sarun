@@ -85,14 +85,22 @@ pub fn write_atom<W: Write, T: WireValue>(writer: &mut W, value: &T) -> io::Resu
 }
 
 pub fn write_request<W: Write>(writer: &mut W, request: &RequestEnvelope) -> io::Result<()> {
+    write_versioned(writer, request)
+}
+
+pub fn write_versioned<W: Write, T: WireValue>(writer: &mut W, value: &T) -> io::Result<()> {
     let mut version = Vec::new();
     put_u64(&mut version, WIRE_PROTOCOL_VERSION);
     writer.write_all(&version)?;
-    write_atom(writer, request)?;
+    write_atom(writer, value)?;
     writer.flush()
 }
 
 pub fn read_request<R: Read>(reader: &mut R) -> io::Result<RequestEnvelope> {
+    read_versioned(reader)
+}
+
+pub fn read_versioned<R: Read, T: WireValue>(reader: &mut R) -> io::Result<T> {
     let version: u64 = read_atom(reader)?;
     if version != WIRE_PROTOCOL_VERSION {
         return Err(invalid_data(format!(

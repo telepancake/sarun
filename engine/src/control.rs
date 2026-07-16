@@ -4617,6 +4617,33 @@ fn register(
         write_api_box_oaita_toml();
     }
     ov.add_box(std::sync::Arc::new(b));
+    // The same target-architecture sarun binary is PID 1.  Install it through
+    // the filesystem core before exposing the root to QEMU: this is ordinary
+    // upper-layer state, not a second rootfs or a host-side bind special case.
+    if let Some(architecture) = qemu_architecture {
+        let init_path = crate::appliance::target_init(architecture);
+        let init = std::fs::read(&init_path).map_err(|error| {
+            ov.remove_box(id);
+            let mut shared = lock(state);
+            if let Some(fd) = shared.box_pids.remove(&id) {
+                unsafe { libc::close(fd); }
+            }
+            shared.box_runpids.remove(&id);
+            format!(
+                "QEMU init artifact {}: {error}; run scripts/build-appliances.sh inner",
+                init_path.display()
+            )
+        })?;
+        if let Err(error) = ov.box_install_file(id, "init", &init, 0o755) {
+            ov.remove_box(id);
+            let mut shared = lock(state);
+            if let Some(fd) = shared.box_pids.remove(&id) {
+                unsafe { libc::close(fd); }
+            }
+            shared.box_runpids.remove(&id);
+            return Err(format!("install QEMU /init: {error}"));
+        }
+    }
     let virtiofs_socket = if qemu_architecture.is_some() {
         match crate::virtio_transport::BoxExport::start(&ov, id) {
             Ok(export) => {

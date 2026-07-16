@@ -165,6 +165,18 @@ wire_type(register_reply, record([
     field(virtiofs_socket, option(path))
 ])).
 
+% Host runner <-> target /init over the named virtio-serial port.  This is a
+% compact point-to-point lifecycle relation, not another command-line or JSON
+% representation.
+wire_type(appliance_command, record([
+    field(command, list(os_string, 1, command_items)),
+    field(cwd, option(path)),
+    field(environment, environment)
+])).
+wire_type(appliance_result, record([
+    field(code, exit_code)
+])).
+
 wire_type(pipeline_stage, choice).
 wire_variant(pipeline_stage, simple, 1, [
     field(words, list(os_string, stage_items)),

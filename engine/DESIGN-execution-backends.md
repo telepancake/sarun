@@ -98,16 +98,16 @@ as executable mappings and mmap that genuinely need a host fd.
 
 - [x] Extend the transport relation with backend `qemu` and required
       architecture; reject architecture on non-QEMU registrations.
-- [ ] Add verified, cached QEMU/Linux source builders and per-architecture
+- [x] Add verified, cached QEMU/Linux source builders and per-architecture
       manifests/configs.
-- [ ] Build minimal paired QEMU/kernel artifacts with virtio-fs, console,
+- [x] Build minimal paired QEMU/kernel artifacts with virtio-fs, console,
       virtio-serial control, networking, KVM, and TCG support required by sarun.
-- [ ] Add the host launcher/vhost-user backend and target `/init` control plane.
+- [x] Add the host launcher/vhost-user backend and target `/init` control plane.
   - [x] Embedded vhost-user lifecycle serves a scoped `SarunFs` box root on a
         private per-box socket and exits when its frontend disconnects.
   - [x] QEMU registration uses the generated binary request/reply directly;
         its architecture and virtio-fs socket never acquire a JSON form.
-  - [ ] Launch the paired QEMU appliance and implement the guest `/init`
+  - [x] Launch the paired QEMU appliance and implement the guest `/init`
         control endpoint.
 - [ ] Connect off/host/tap networking to the existing engine policy.
 - [ ] Pass the full appliance suite on aarch64 TCG here, then aarch64 KVM where

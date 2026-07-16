@@ -711,6 +711,147 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     }
 }
 
+/// Architecture appliance runner. Registration and the PID-1 control channel
+/// are both generated binary values; Prolog participates only when another
+/// representation is requested, never in this hot transport path.
+pub fn run_qemu(
+    architecture: crate::generated_wire::QemuArchitecture,
+    name: Option<String>,
+    env: bool,
+    no_parent: bool,
+    readonly_parent: bool,
+    chdir: Option<String>,
+    net_mode: crate::net::NetMode,
+    cmd: Vec<String>,
+) -> i32 {
+    use crate::generated_wire::{
+        ConnectionMode, NetMode as WireNetMode, ProcessProvenance, RegistrationName,
+        RequestEnvelope, RunBackend, TransportRequest, TransportResponse,
+    };
+    use std::os::unix::ffi::OsStrExt;
+
+    if cmd.is_empty() {
+        eprintln!("sarun-engine run --qemu: needs a command");
+        return 2;
+    }
+    if std::env::var("SARUN_BROKER").is_ok_and(|value| !value.is_empty()) {
+        eprintln!("sarun-engine run --qemu: nested appliance boxes are not supported yet");
+        return 2;
+    }
+    if net_mode != crate::net::NetMode::Off {
+        eprintln!(
+            "sarun-engine run --qemu: the first appliance milestone requires --net off; \
+             virtio-net/TAP forwarding is not wired yet"
+        );
+        return 2;
+    }
+    let appliance_command = match crate::appliance::wire_command(&cmd, chdir.as_deref()) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("sarun-engine run --qemu: {error}");
+            return 2;
+        }
+    };
+    let bounded_path = |value: &Path| {
+        crate::wire::BoundedBytes::new(value.as_os_str().as_bytes().to_vec())
+            .map_err(|error| format!("path exceeds relation bound: {error:?}"))
+    };
+    let executable = std::fs::read_link("/proc/self/exe").unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let provenance = match (bounded_path(&executable), bounded_path(&cwd)) {
+        (Ok(executable), Ok(cwd)) => ProcessProvenance {
+            tgid: std::process::id(),
+            ppid: unsafe { libc::getppid() },
+            executable,
+            cwd,
+            argv: appliance_command.command.clone(),
+            environment: env.then(|| appliance_command.environment.clone()),
+        },
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("sarun-engine run --qemu: {error}");
+            return 2;
+        }
+    };
+    let name = match name {
+        Some(value) if !value.is_empty() => match crate::wire::BoundedText::new(value) {
+            Ok(selector) => RegistrationName::Host { selector },
+            Err(error) => {
+                eprintln!("sarun-engine run --qemu: box name exceeds relation bound: {error:?}");
+                return 2;
+            }
+        },
+        _ => RegistrationName::Automatic,
+    };
+    let request = RequestEnvelope::Transport(TransportRequest::Register {
+        command: appliance_command.command.clone(),
+        provenance,
+        name,
+        backend: RunBackend::Qemu,
+        architecture: Some(architecture),
+        net_mode: WireNetMode::Off,
+        capture: true,
+        direct: false,
+        capture_environment: env,
+        brush: false,
+        api: false,
+        web_capture: false,
+        web_filter: false,
+        replay_from: None,
+        no_parent,
+        readonly_parent,
+    });
+    let mut bytes = Vec::new();
+    if let Err(error) = crate::socket_wire::write_request(&mut bytes, &request) {
+        eprintln!("sarun-engine run --qemu: encode registration: {error}");
+        return 1;
+    }
+    let conn = match UnixStream::connect(paths::sock_path()) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("sarun-engine: no engine running: {error}");
+            return 3;
+        }
+    };
+    let pidfd = pidfd_open(std::process::id() as i32);
+    if !send_register_fds(&conn, &bytes, pidfd, None, None) {
+        eprintln!("sarun-engine run --qemu: register write failed");
+        return 1;
+    }
+    if pidfd >= 0 {
+        unsafe { libc::close(pidfd) };
+    }
+    let mut reader = &conn;
+    let registration = match crate::socket_wire::read_mode(&mut reader) {
+        Ok(ConnectionMode::Box { registration }) => registration,
+        Ok(ConnectionMode::Reply {
+            response: TransportResponse::Error { message, .. },
+        }) => {
+            eprintln!("sarun-engine run --qemu: {}", message.as_str());
+            return 1;
+        }
+        Ok(other) => {
+            eprintln!("sarun-engine run --qemu: unexpected engine mode {other:?}");
+            return 1;
+        }
+        Err(error) => {
+            eprintln!("sarun-engine run --qemu: register read: {error}");
+            return 1;
+        }
+    };
+    let Some(socket) = registration.virtiofs_socket.as_ref() else {
+        eprintln!("sarun-engine run --qemu: engine omitted the virtio-fs socket");
+        return 1;
+    };
+    let socket = Path::new(std::ffi::OsStr::from_bytes(socket.as_slice()));
+    match crate::appliance::run(architecture, registration.r#box, socket, &appliance_command) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("sarun-engine run --qemu: {error}");
+            1
+        }
+    }
+}
+
 // ── sud launcher (absorbed from tv/sud/sudtrace.c) ──────────────────────────
 // The runner IS the sud launcher now: it owns the trace fd (1023) and the
 // shared wire-state page (1022), writes the TRACE version atom + launcher

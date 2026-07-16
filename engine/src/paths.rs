@@ -142,6 +142,10 @@ pub fn virtiofs_socket(box_id: i64) -> PathBuf {
     live_home().join(box_id.to_string()).join("virtiofs.sock")
 }
 
+pub fn appliance_control_socket(box_id: i64) -> PathBuf {
+    live_home().join(box_id.to_string()).join("appliance-control.sock")
+}
+
 pub fn ensure_dirs() -> std::io::Result<()> {
     for d in [data_home(), config_home(), runtime_home(), state_home(),
               live_home(), mnt_point(), oaita_state_home()] {

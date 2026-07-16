@@ -1084,6 +1084,19 @@ impl SarunFs {
         Ok(())
     }
 
+    /// Install engine-owned bytes with an explicit mode through the same upper
+    /// representation.  QEMU uses this for `/init`; it is still an ordinary
+    /// captured file as far as every transport and later review are concerned.
+    pub fn box_install_file(&self, bid: i64, rel: &str, bytes: &[u8], mode: u32)
+        -> std::io::Result<()>
+    {
+        self.box_write_file(bid, rel, bytes)?;
+        let r#box = self.box_of(bid).ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::NotFound, format!("box {bid} not registered")))?;
+        r#box.set_mode(rel, libc::S_IFREG | (mode & 0o7777));
+        Ok(())
+    }
+
     /// Merged listing of `rel` in box `bid`. Returns (name, kind_char)
     /// where kind_char ∈ 'f' (file), 'd' (dir), 'l' (symlink), 's' (special),
     /// '?' (unknown).

@@ -37,6 +37,7 @@ mod xargs_builtin;
 // ahead of its consumer (the build driver), so allow the not-yet-used items.
 mod action_bridge;
 mod action_help;
+mod appliance;
 mod attach;
 mod browser;
 #[allow(dead_code)]
@@ -525,6 +526,11 @@ fn driver_invocation() -> Option<i32> {
 }
 
 fn main() {
+    // The target-architecture build is also the appliance's /init.  PID 1 is
+    // an unambiguous role selector and must not initialize the Prolog runtime.
+    if unsafe { libc::getpid() } == 1 {
+        std::process::exit(appliance::init_main());
+    }
     prolog::ensure_linked();
 
     // Symlinked-as-`oaita` dispatch — same trick brush_sh / ninja / make use
@@ -676,6 +682,7 @@ fn main() {
             let mut readonly_parent = false;
             let mut api = false;
             let mut sud = false;
+            let mut qemu: Option<generated_wire::QemuArchitecture> = None;
             let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
             // Box networking defaults to Tap (proxied): the box gets a per-box
@@ -750,7 +757,25 @@ fn main() {
                     //        post-exit sweep captures the upper dir into
                     //        the box's sqlar. Host netns, no capture mux,
                     //        incompatible with -t/-d/-p/-b/--api.
-                    "--sud" => sud = true,
+                    "--sud" => {
+                        sud = true;
+                        qemu = None;
+                    }
+                    "--qemu" => {
+                        sud = false;
+                        qemu = match it.next().map(String::as_str) {
+                            Some("aarch64") => Some(generated_wire::QemuArchitecture::Aarch64),
+                            Some("x86_64") => Some(generated_wire::QemuArchitecture::X8664),
+                            Some(value) => {
+                                eprintln!("sarun: --qemu wants aarch64|x86_64, got '{value}'");
+                                std::process::exit(2);
+                            }
+                            None => {
+                                eprintln!("sarun: --qemu needs an architecture (aarch64|x86_64)");
+                                std::process::exit(2);
+                            }
+                        };
+                    }
                     // --webcap  OPT-IN web capture (DESIGN-web.md W2): tee
                     //           every HTTP(S) request/response this tap box
                     //           makes into its `webcap` table. An env toggle
@@ -783,7 +808,10 @@ fn main() {
                     //         (bwrap + FUSE overlay) — the counterpart of
                     //         --sud. Accepted so scripts can pin the backend;
                     //         selects nothing new.
-                    "--fuse" => sud = false,
+                    "--fuse" => {
+                        sud = false;
+                        qemu = None;
+                    }
                     // A bare word is the box NAME. A dash-word is a TYPO or
                     // an unknown flag — refuse it loudly: silently taking it
                     // as the NAME named every `sarun run --fuse …` box
@@ -822,6 +850,24 @@ fn main() {
                     std::process::exit(2);
                 }
                 std::process::exit(runner::run_sud(name, env, chdir, net_mode, brush, cmd));
+            }
+            if let Some(architecture) = qemu {
+                if passthrough || direct || pty || brush || api {
+                    eprintln!(
+                        "sarun: --qemu is currently incompatible with -t/-d/-p/-b/--api"
+                    );
+                    std::process::exit(2);
+                }
+                std::process::exit(runner::run_qemu(
+                    architecture,
+                    name,
+                    env,
+                    no_parent,
+                    readonly_parent,
+                    chdir,
+                    net_mode,
+                    cmd,
+                ));
             }
             std::process::exit(runner::run(
                 name,

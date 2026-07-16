@@ -1,0 +1,20 @@
+# Locked inputs for Sarun's paired QEMU/kernel appliances.  Artifacts and
+# source trees live under $XDG_CACHE_HOME/sarun; this file is the durable input.
+
+[qemu]
+version = "11.0.2"
+url = "https://download.qemu.org/qemu-11.0.2.tar.xz"
+sha256 = "3745f6ea88e2e87fe0dc838b2b1d4e0a770bf48e01a1d5a186842a1fff76ccf5"
+targets = ["aarch64-softmmu", "x86_64-softmmu"]
+
+[linux]
+series = "6.18"
+version = "6.18.38"
+url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.38.tar.xz"
+sha256 = "ac26e508abd56e9f8b89872b6e10c49fc823bcc70d8068a5d8504c1a7c4ff045"
+
+[appliance]
+protocol = 1
+virtiofs_tag = "sarun-root"
+control_port = "sarun-control"
+architectures = ["aarch64", "x86_64"]

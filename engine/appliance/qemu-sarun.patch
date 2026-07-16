@@ -1,0 +1,55 @@
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 19db91233d..ec814b5f03 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -34,7 +34,6 @@ config ARM_VIRT
+     select ACPI_PCIHP
+     select ACPI_PCI_BRIDGE
+     select VIRTIO_MEM_SUPPORTED
+-    select ACPI_CXL
+     select ACPI_HMAT
+ 
+ config CUBIEBOARD
+diff --git a/hw/arm/virt-acpi-build.c b/hw/arm/virt-acpi-build.c
+index 92df5f652a..e4227898ea 100644
+--- a/hw/arm/virt-acpi-build.c
++++ b/hw/arm/virt-acpi-build.c
+@@ -124,6 +124,8 @@ static void acpi_dsdt_add_flash(Aml *scope, const MemMapEntry *flash_memmap)
+     aml_append(scope, dev);
+ }
+ 
++/* Sarun's appliance has no CXL devices; keep the selectable helper honest. */
++#ifdef CONFIG_ACPI_CXL
+ static void build_acpi0017(Aml *table)
+ {
+     Aml *dev, *scope, *method;
+@@ -140,6 +142,7 @@ static void build_acpi0017(Aml *table)
+     aml_append(scope, dev);
+     aml_append(table, scope);
+ }
++#endif
+ 
+ static void acpi_dsdt_add_pci(Aml *scope, const MemMapEntry *memmap,
+                               uint32_t irq, VirtMachineState *vms)
+@@ -183,7 +186,9 @@ static void acpi_dsdt_add_pci(Aml *scope, const MemMapEntry *memmap,
+             cxl_present = true;
+         }
+     }
++#ifdef CONFIG_ACPI_CXL
+     if (cxl_present) {
+         build_acpi0017(scope);
+     }
++#endif
+ }
+@@ -1343,10 +1348,12 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
+         }
+     }
+ 
++#ifdef CONFIG_ACPI_CXL
+     if (vms->cxl_devices_state.is_enabled) {
+         cxl_build_cedt(table_offsets, tables_blob, tables->linker,
+                        vms->oem_id, vms->oem_table_id, &vms->cxl_devices_state);
+     }
++#endif
+ 
+     if (ms->nvdimms_state->is_enabled) {
