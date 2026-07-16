@@ -2760,6 +2760,87 @@ mod tests {
     }
 
     #[test]
+    fn local_state_crosses_the_embedded_relation_without_local_queries() {
+        let define_x = rv_compound(
+            "define",
+            vec![
+                rv_atom("shell_variable"),
+                rv_string("x"),
+                rv_compound("integer", vec![rv_integer(123)]),
+                rv_atom("escaping"),
+                rv_atom("replace"),
+            ],
+        );
+        let use_x = rv_compound(
+            "use",
+            vec![rv_atom("local_x"), rv_atom("shell_variable"), rv_string("x")],
+        );
+        let use_z = rv_compound(
+            "use",
+            vec![rv_atom("free_z"), rv_atom("shell_variable"), rv_string("z")],
+        );
+        let initial = rv_compound(
+            "local_state",
+            vec![
+                rv_list(vec![rv_compound(
+                    "scope",
+                    vec![rv_atom("root"), rv_list(vec![])],
+                )]),
+                rv_list(vec![]),
+            ],
+        );
+        let reply = global()
+            .unwrap()
+            .transform(&RelationRequest {
+                grammar: rv_atom("local_state_grammar"),
+                given: vec![
+                    RelationBinding {
+                        name: "steps".into(),
+                        value: rv_list(vec![define_x, use_x, use_z]),
+                    },
+                    RelationBinding {
+                        name: "initial_state".into(),
+                        value: initial,
+                    },
+                ],
+                wanted: vec!["delta".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert!(reply.diagnostics.is_empty());
+        assert_eq!(reply.solutions.len(), 1);
+        assert_eq!(
+            reply.context_queries,
+            vec![rv_compound(
+                "query",
+                vec![
+                    rv_atom("free_z"),
+                    rv_compound(
+                        "ask",
+                        vec![
+                            rv_atom("one"),
+                            rv_atom("shell_variable"),
+                            rv_compound("name", vec![rv_string("z")]),
+                        ],
+                    ),
+                ],
+            )]
+        );
+        assert_eq!(
+            reply.solutions[0].bindings[0].value,
+            rv_list(vec![rv_compound(
+                "state_change",
+                vec![
+                    rv_atom("shell_variable"),
+                    rv_string("x"),
+                    rv_compound("integer", vec![rv_integer(123)]),
+                ],
+            )])
+        );
+    }
+
+    #[test]
     fn generic_transform_enforces_request_specific_output_bound() {
         let prolog = global().unwrap();
         let error = prolog

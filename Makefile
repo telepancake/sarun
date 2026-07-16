@@ -106,6 +106,8 @@ test-action-grammar: swipl ## Run the core-only action grammar tests with pinned
 	    -g test_action_grammar:run_action_grammar_tests -t halt; \
 	  "$${bins[-1]}" -q -f none -s engine/pl/test_context_relation.pl \
 	    -g test_context_relation:run_context_relation_tests -t halt; \
+	  "$${bins[-1]}" -q -f none -s engine/pl/test_local_state_relation.pl \
+	    -g test_local_state_relation:run_local_state_relation_tests -t halt; \
 	  "$${bins[-1]}" -q -f none -s engine/pl/test_transport_catalog.pl \
 	    -g test_transport_catalog:run_transport_catalog_tests -t halt
 

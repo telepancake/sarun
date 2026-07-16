@@ -442,6 +442,11 @@ trivia is consumed deterministically at the nearest syntactic boundary. The
 Brush client has consequently grown from an isolated word to its first program
 slice: multiword commands, pipelines, boolean lists, sequencing, newlines, and
 backgrounding all produce AST and highlight evidence through the same handle.
+The engine also now has an executable pure scoped-state relation: lexical and
+escaping definitions resolve nearest-scope uses internally, escaping effects
+become explicit deltas, and only unresolved uses or declared surrounding
+constraints become external context queries. This algebra is tested through
+the uniform transform envelope but is not yet connected to Brush AST fields.
 
 The next externally usable checkpoint is explicitly the complete interactive
 `sarun brush` editing experience: relation-owned highlighting, completion,

@@ -7,6 +7,7 @@ test_name(same_request_shape_parses_and_renders_foreign_grammar).
 test_name(tear_completion_is_aggregated_from_parse_evidence).
 test_name(context_queries_completions_and_dependencies_are_one_relation).
 test_name(context_support_uses_the_same_given_wanted_envelope).
+test_name(local_state_suppresses_resolved_external_queries).
 test_name(grammar_choice_and_projection_are_executable_data).
 test_name(projection_template_is_bidirectional_and_can_append_values).
 test_name(independent_ast_relations_compose_in_both_directions).
@@ -189,6 +190,31 @@ run_test(context_support_uses_the_same_given_wanted_envelope) :-
                 observations([Observation]), Limits),
         reply([solution([binding(dependency_keys, [Dependency])], 0)], [],
               [Dependency], [])).
+
+run_test(local_state_suppresses_resolved_external_queries) :-
+    Steps = [define(shell_variable, "x", integer(123), escaping, replace),
+             use(local_x, shell_variable, "x"),
+             use(free_z, shell_variable, "z")],
+    limits(Limits),
+    transform(
+        request(local_state_grammar,
+                given([binding(steps, Steps),
+                       binding(initial_state,
+                               local_state([scope(root, [])], []))]),
+                want([resolutions, delta]), observations([]), Limits),
+        reply([solution(
+                   [binding(resolutions,
+                            [resolved(local_x,
+                                      local(local_binding(
+                                          shell_variable, "x", integer(123),
+                                          escaping))),
+                             resolved(free_z, external(ref(free_z)))]),
+                    binding(delta,
+                            [state_change(shell_variable, "x",
+                                          integer(123))])],
+                   0)],
+              [query(free_z,
+                     ask(one, shell_variable, name("z")))], [], [])).
 
 run_test(grammar_choice_and_projection_are_executable_data) :-
     Terminals = terminals([

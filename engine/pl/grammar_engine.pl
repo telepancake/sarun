@@ -13,6 +13,7 @@
 :- use_module(context_relation).
 :- use_module(evidence_projection).
 :- use_module(grammar_codec).
+:- use_module(local_state_relation).
 :- use_module(text_grammar_engine).
 
 /** <module> Grammar-independent relational sequence execution
@@ -59,6 +60,16 @@ transform_relation(context_grammar, Given, Wanted, _EnvelopeObservations,
     ;  Outcome = none
     ),
     Available = [binding(outcome, Outcome)],
+    requested_bindings(Wanted, Available, Bindings).
+transform_relation(local_state_grammar, Given, Wanted, _Observations, _Limits,
+                   reply([solution(Bindings, 0)], Queries, [], [])) :-
+    given_value(steps, Given, Steps),
+    given_value(initial_state, Given, Initial),
+    run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta),
+    valid_query_graph(Queries),
+    Available = [binding(final_state, Final),
+                 binding(resolutions, Resolutions),
+                 binding(delta, Delta)],
     requested_bindings(Wanted, Available, Bindings).
 transform_relation(Grammar, Given, Wanted, Observations, Limits, Reply) :-
     Grammar = grammar(source(text(utf8)), _, _, _),

@@ -236,6 +236,12 @@ Do not implement these as Brush-specific engine branches:
 
 ### 3. Context and composed command grammars
 
+- [x] Establish the generic pure scoped-state algebra independently of shell
+      syntax: enter/leave, lexical versus escaping definitions, replace versus
+      unique policy, nearest-scope lookup, explicit escaping deltas, and
+      external queries only for unresolved uses or explicit requirements. The
+      C-shaped `f/x/y/z` fixture and shell `x=123; use(x)` fixture pin that local
+      resolution produces no context query.
 - [ ] Encode shell-local variables/scopes as pure relation inputs and outputs.
 - [ ] Add explicit providers for aliases, functions, builtins, PATH commands,
       filesystem names, environment, and programmable completion specs.
