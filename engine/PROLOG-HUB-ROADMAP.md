@@ -433,6 +433,10 @@ The first real client grammar, `brush_grammar.pl`, now declares a recursive
 shell-word slice as immutable data and is installed behind the `sarun_brush`
 handle. It added generic negative lookahead to the IR for unambiguous lexical
 boundaries; neither the engine nor Rust contains a Brush parsing case.
+Raw text sources now also carry zero- or nonzero-width edit tears through the
+ordinary parser. Shared evidence projection records literal completions only
+from whole-source witnesses, including concrete suffixes, and linear cursor
+state guarantees that a tear is consumed exactly once.
 Validated IR constructs outside this initial mode matrix return
 `unsupported_text_grammar` explicitly rather than looking like source with no
 parse. Raw tears, trivia, rendering, state, embedding, constraints, precedence,

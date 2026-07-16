@@ -69,6 +69,7 @@ fn require_generated_wire(manifest: &Path) {
         "engine/pl/grammar_engine.pl",
         "engine/pl/text_grammar_engine.pl",
         "engine/pl/brush_grammar.pl",
+        "engine/pl/evidence_projection.pl",
         "engine/pl/grammar_codec.pl",
         "engine/pl/grammar_store.pl",
         "engine/pl/grammar_ir.pl",
@@ -153,6 +154,7 @@ fn main() {
     let grammar_engine = manifest.join("pl/grammar_engine.pl");
     let text_grammar_engine = manifest.join("pl/text_grammar_engine.pl");
     let brush_grammar = manifest.join("pl/brush_grammar.pl");
+    let evidence_projection = manifest.join("pl/evidence_projection.pl");
     let grammar_codec = manifest.join("pl/grammar_codec.pl");
     let grammar_store = manifest.join("pl/grammar_store.pl");
     let grammar_ir = manifest.join("pl/grammar_ir.pl");
@@ -170,6 +172,11 @@ fn main() {
         &sha256(&text_grammar_engine),
     );
     require_value(&info, "brush_grammar_sha256", &sha256(&brush_grammar));
+    require_value(
+        &info,
+        "evidence_projection_sha256",
+        &sha256(&evidence_projection),
+    );
     require_value(&info, "grammar_codec_sha256", &sha256(&grammar_codec));
     require_value(&info, "grammar_store_sha256", &sha256(&grammar_store));
     require_value(&info, "grammar_ir_sha256", &sha256(&grammar_ir));
@@ -211,6 +218,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", grammar_engine.display());
     println!("cargo:rerun-if-changed={}", text_grammar_engine.display());
     println!("cargo:rerun-if-changed={}", brush_grammar.display());
+    println!("cargo:rerun-if-changed={}", evidence_projection.display());
     println!("cargo:rerun-if-changed={}", grammar_codec.display());
     println!("cargo:rerun-if-changed={}", grammar_store.display());
     println!("cargo:rerun-if-changed={}", grammar_ir.display());

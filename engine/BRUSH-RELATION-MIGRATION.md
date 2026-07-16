@@ -173,8 +173,10 @@ Do not implement these as Brush-specific engine branches:
       command substitution, and grouped arithmetic. Declarative negative
       lookahead expresses lexical boundaries without shell-specific engine
       behavior. This is a relation client and remains shadow-only.
-- [ ] Derive highlighting and a tear completion from successful parses of that
-      slice, including concrete text to the right of the cursor.
+- [x] Derive highlighting and literal tear completion from the same successful
+      word parses. A zero-width tear records `$(` only when the ordinary parser
+      can consume the concrete `echo hi)` suffix; tear state is linear, so it is
+      consumed exactly once even inside repetition.
 - [ ] Differentially test UTF-8 byte offsets and render/parse round trips.
 
 ### 2. Shell program structure and dynamic regions

@@ -5,6 +5,7 @@
 
 test_name(grammar_is_valid_executable_data).
 test_name(word_slice_parses_quotes_expansions_and_utf8).
+test_name(tear_completion_is_an_ordinary_parse_with_concrete_suffix).
 test_name(unterminated_word_has_no_complete_parse).
 
 run_brush_grammar_tests :-
@@ -42,6 +43,27 @@ run_test(word_slice_parses_quotes_expansions_and_utf8) :-
     has_highlight(span(2, 4), word, codepoint(233), brush_test, Highlights),
     has_highlight(_, variable, _, brush_test, Highlights),
     has_highlight(_, arithmetic, _, brush_test, Highlights).
+
+run_test(tear_completion_is_an_ordinary_parse_with_concrete_suffix) :-
+    brush_relation_grammar(Grammar),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("echo hi)",
+                                           assist(edit, span(0, 0)),
+                                           brush_test))]),
+                want([status, completions, highlights]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply([solution([binding(status, incomplete(edit(edit))),
+                         binding(completions,
+                                 [completion(
+                                      span(0, 0), "$(",
+                                      [alternative(command_substitution_open,
+                                                   delimiter, grammar, 0)],
+                                      0, 1)]),
+                         binding(highlights, Highlights)], 0)], [], [], [])),
+    has_highlight(span(0, 1), command, codepoint(101), brush_test,
+                  Highlights).
 
 run_test(unterminated_word_has_no_complete_parse) :-
     brush_relation_grammar(Grammar),

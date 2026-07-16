@@ -2716,6 +2716,47 @@ mod tests {
                 RelationValue::Compound(name, values)
                     if name == "highlight" && values[1] == rv_atom("variable"))
         }));
+
+        let assist = global()
+            .unwrap()
+            .transform(&RelationRequest {
+                grammar: brush_grammar_handle(),
+                given: vec![RelationBinding {
+                    name: "source".into(),
+                    value: rv_compound(
+                        "text_source",
+                        vec![
+                            rv_string("echo hi)"),
+                            rv_compound(
+                                "assist",
+                                vec![
+                                    rv_atom("edit"),
+                                    rv_compound(
+                                        "span",
+                                        vec![rv_integer(0), rv_integer(0)],
+                                    ),
+                                ],
+                            ),
+                            rv_atom("rust_test"),
+                        ],
+                    ),
+                }],
+                wanted: vec!["completions".into(), "status".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert!(assist.diagnostics.is_empty());
+        assert_eq!(assist.solutions.len(), 1);
+        let completions =
+            decode_completions_value(&assist.solutions[0].bindings[0].value).unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].replace, Span { start: 0, end: 0 });
+        assert_eq!(completions[0].insert, "$(");
+        assert_eq!(
+            assist.solutions[0].bindings[1].value,
+            rv_compound("incomplete", vec![rv_compound("edit", vec![rv_atom("edit")])])
+        );
     }
 
     #[test]

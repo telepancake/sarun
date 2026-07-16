@@ -1,6 +1,7 @@
 :- module(text_grammar_engine, [transform_text_grammar/6]).
 
 :- use_module(grammar_ir).
+:- use_module(evidence_projection).
 
 /** <module> Grammar-independent recursive UTF-8 text relation
 
@@ -22,16 +23,17 @@ transform_executable_text_grammar(
     grammar(source(text(utf8)), Root, Rules, []), Given, Wanted, _Observations,
     limits(MaxSolutions, MaxEvidence, _MaxOutputBytes),
     reply(Solutions, [], [], Diagnostics)) :-
-    given_value(source, Given, text_source(Text, exact, Origin)),
-    string(Text),
-    string_length(Text, CharacterCount),
+    given_value(source, Given, Source),
+    text_source_context(Source, Text, CharacterCount, Context, Status),
     SearchLimit is MaxSolutions + 1,
-    findnsols(SearchLimit, Solution,
-              complete_text_solution(Root, Rules, Text, CharacterCount,
-                                     Origin, MaxEvidence, Wanted, Solution),
-              Candidates),
-    Candidates = [_|_],
-    limit_solutions(Candidates, MaxSolutions, Solutions, Diagnostics).
+    findnsols(SearchLimit, Candidate,
+              complete_text_candidate(Root, Rules, Text, CharacterCount,
+                                      Context, Status, MaxEvidence, Candidate),
+              Candidates0),
+    Candidates0 = [_|_],
+    text_candidate_completions(Candidates0, Completions),
+    text_candidate_solutions(Candidates0, Wanted, Completions, Solutions0),
+    limit_solutions(Solutions0, MaxSolutions, Solutions, Diagnostics).
 
 executable_text_grammar(grammar(source(text(utf8)), _, Rules, [])) :-
     executable_text_rules(Rules).
@@ -64,12 +66,68 @@ executable_text_expressions([Expression|Expressions]) :-
     executable_text_expression(Expression),
     executable_text_expressions(Expressions).
 
-complete_text_solution(Root, Rules, Text, CharacterCount, Origin, Maximum,
-                       Wanted, solution(Bindings, 0)) :-
+text_source_context(text_source(Text, exact, Origin), Text, CharacterCount,
+                    source_context(Origin, no_tear), complete) :-
+    string(Text),
+    ground(Origin),
+    string_length(Text, CharacterCount).
+text_source_context(
+    text_source(Text, assist(EditId, span(ByteStart, ByteEnd)), Origin), Text,
+    CharacterCount,
+    source_context(Origin,
+                   tear(EditId, cursor(CharacterStart, ByteStart),
+                        cursor(CharacterEnd, ByteEnd), Surface)),
+    incomplete(edit(EditId))) :-
+    string(Text),
+    atom(EditId),
+    ground(Origin),
+    integer(ByteStart), integer(ByteEnd), 0 =< ByteStart, ByteStart =< ByteEnd,
+    byte_character_cursor(Text, ByteStart, CharacterStart),
+    byte_character_cursor(Text, ByteEnd, CharacterEnd),
+    CharacterLength is CharacterEnd - CharacterStart,
+    sub_string(Text, CharacterStart, CharacterLength, _, Surface),
+    string_length(Text, CharacterCount).
+
+byte_character_cursor(Text, TargetByte, Character) :-
+    byte_character_cursor(Text, TargetByte, 1, 0, 0, Character).
+
+byte_character_cursor(_, TargetByte, _, Character, TargetByte, Character) :- !.
+byte_character_cursor(Text, TargetByte, Index, Character0, Byte0, Character) :-
+    Byte0 < TargetByte,
+    string_code(Index, Text, Code),
+    utf8_codepoint_bytes(Code, Width),
+    Byte1 is Byte0 + Width,
+    Byte1 =< TargetByte,
+    Index1 is Index + 1,
+    Character1 is Character0 + 1,
+    byte_character_cursor(Text, TargetByte, Index1, Character1, Byte1,
+                          Character).
+
+source_origin(source_context(Origin, _), Origin).
+
+initial_text_cursor(source_context(_, no_tear), cursor(0, 0, absent)).
+initial_text_cursor(source_context(_, tear(_, _, _, _)), cursor(0, 0, unused)).
+
+complete_text_cursor(source_context(_, no_tear), CharacterCount, ByteEnd,
+                     cursor(CharacterCount, ByteEnd, absent)).
+complete_text_cursor(source_context(_, tear(_, _, _, _)), CharacterCount,
+                     ByteEnd, cursor(CharacterCount, ByteEnd, used)).
+
+source_tear_at(
+    source_context(_,
+                   tear(EditId, cursor(CharacterStart, ByteStart),
+                        cursor(CharacterEnd, ByteEnd), Surface)),
+    cursor(CharacterStart, ByteStart, unused), EditId,
+    cursor(CharacterEnd, ByteEnd, used), Surface).
+
+complete_text_candidate(Root, Rules, Text, CharacterCount, Context, Status,
+                        Maximum, candidate(Available, Evidence)) :-
     rule_expression(Root, Rules, Expression),
-    match_expression(Expression, Rules, Text, Origin, Maximum,
-                     cursor(0, 0), cursor(CharacterCount, ByteEnd),
+    initial_text_cursor(Context, Start),
+    match_expression(Expression, Rules, Text, Context, Maximum,
+                     Start, End,
                      Value, Evidence, 0, _Depth),
+    complete_text_cursor(Context, CharacterCount, ByteEnd, End),
     length(Evidence, EvidenceCount),
     EvidenceCount =< Maximum,
     Ast = node(Root, span(0, ByteEnd), Value),
@@ -77,8 +135,35 @@ complete_text_solution(Root, Rules, Text, CharacterCount, Origin, Maximum,
     Available = [binding(ast, Ast),
                  binding(evidence, Evidence),
                  binding(highlights, Highlights),
-                 binding(status, complete)],
-    requested_bindings(Wanted, Available, Bindings).
+                 binding(status, Status)].
+
+text_candidate_solutions([], _, _, []).
+text_candidate_solutions([candidate(Available0, _)|Candidates], Wanted,
+                         Completions, [solution(Bindings, 0)|Solutions]) :-
+    Available = [binding(completions, Completions)|Available0],
+    requested_bindings(Wanted, Available, Bindings),
+    text_candidate_solutions(Candidates, Wanted, Completions, Solutions).
+
+text_candidate_completions(Candidates, Completions) :-
+    findall(Pair, text_completion_pair(Candidates, Pair), Pairs),
+    project_completions(Pairs, Completions).
+
+text_completion_pair([candidate(_, Evidence)|_],
+                     completion_key(Span, Text)-
+                     (alternative(Semantic, Syntax, Description)-Preference)) :-
+    tear_literal_evidence(Evidence, Span, Text, Semantic, Syntax, Description,
+                          Preference).
+text_completion_pair([_|Candidates], Pair) :-
+    text_completion_pair(Candidates, Pair).
+
+tear_literal_evidence(
+    [evidence(Semantic, Span, _, _, Syntax, Description, Preference,
+              tear(_, literal(Text)))|_],
+    Span, Text, Semantic, Syntax, Description, Preference).
+tear_literal_evidence([_|Evidence], Span, Text, Semantic, Syntax, Description,
+                      Preference) :-
+    tear_literal_evidence(Evidence, Span, Text, Semantic, Syntax, Description,
+                          Preference).
 
 match_expression(empty, _, _, _, _, Cursor, Cursor, empty, [], Depth, Depth).
 match_expression(ref(Name), Rules, Text, Origin, Maximum, Start, End,
@@ -118,9 +203,20 @@ match_expression(field(Name, Expression), Rules, Text, Origin, Maximum, Start,
                  End, field(Name, Value), Evidence, Depth0, Depth) :-
     match_expression(Expression, Rules, Text, Origin, Maximum, Start, End,
                      Value, Evidence, Depth0, Depth).
+match_expression(literal(Surface0, Semantic, presentation(Metadata)), _, _Text,
+                 Context, _, Start, End, literal(Semantic), [Item], Depth,
+                 Depth) :-
+    source_tear_at(Context, Start, EditId, End, TearSurface),
+    text_string(Surface0, Surface),
+    string_length(TearSurface, TearLength),
+    sub_string(Surface, 0, TearLength, _, TearSurface),
+    cursor_span(Start, End, Span),
+    presentation(Metadata, Syntax, Description, Preference),
+    Item = evidence(Semantic, Span, [], TearSurface, Syntax, Description,
+                    Preference, tear(EditId, literal(Surface))).
 match_expression(literal(Surface0, Semantic, presentation(Metadata)), _, Text,
-                 Origin, _, cursor(CharacterStart, ByteStart),
-                 cursor(CharacterEnd, ByteEnd), literal(Semantic), [Item],
+                 Context, _, cursor(CharacterStart, ByteStart, TearState),
+                 cursor(CharacterEnd, ByteEnd, TearState), literal(Semantic), [Item],
                  Depth, Depth) :-
     text_string(Surface0, Surface),
     string_length(Surface, CharacterLength),
@@ -128,13 +224,15 @@ match_expression(literal(Surface0, Semantic, presentation(Metadata)), _, Text,
     CharacterEnd is CharacterStart + CharacterLength,
     string_utf8_bytes(Surface, ByteLength),
     ByteEnd is ByteStart + ByteLength,
+    source_origin(Context, Origin),
     presentation(Metadata, Syntax, Description, Preference),
     Item = evidence(Semantic, span(ByteStart, ByteEnd),
                     [span(ByteStart, ByteEnd)], Surface, Syntax, Description,
                     Preference, Origin).
 match_expression(
     terminal(text(codepoint(Set)), presentation(Metadata)), _, Text, Origin, _,
-    cursor(CharacterStart, ByteStart), cursor(CharacterEnd, ByteEnd),
+    cursor(CharacterStart, ByteStart, TearState),
+    cursor(CharacterEnd, ByteEnd, TearState),
     codepoint(Code), [Item], Depth, Depth) :-
     StringIndex is CharacterStart + 1,
     string_code(StringIndex, Text, Code),
@@ -143,10 +241,11 @@ match_expression(
     utf8_codepoint_bytes(Code, ByteLength),
     ByteEnd is ByteStart + ByteLength,
     string_codes(Surface, [Code]),
+    source_origin(Origin, EvidenceOrigin),
     presentation(Metadata, Syntax, Description, Preference),
     Item = evidence(codepoint(Code), span(ByteStart, ByteEnd),
                     [span(ByteStart, ByteEnd)], Surface, Syntax, Description,
-                    Preference, Origin).
+                    Preference, EvidenceOrigin).
 
 match_expressions([], _, _, _, _, Cursor, Cursor, [], [], Depth, Depth).
 match_expressions([Expression|Expressions], Rules, Text, Origin, Maximum, Start,
@@ -210,7 +309,8 @@ metadata_value(Name, [_|Metadata], Default, Value) :-
     metadata_value(Name, Metadata, Default, Value).
 metadata_value(_, [], Default, Default).
 
-cursor_span(cursor(_, ByteStart), cursor(_, ByteEnd), span(ByteStart, ByteEnd)).
+cursor_span(cursor(_, ByteStart, _), cursor(_, ByteEnd, _),
+            span(ByteStart, ByteEnd)).
 
 string_utf8_bytes(String, Bytes) :-
     string_length(String, Characters),
@@ -228,19 +328,6 @@ utf8_codepoint_bytes(Code, 1) :- Code =< 0x7f, !.
 utf8_codepoint_bytes(Code, 2) :- Code =< 0x7ff, !.
 utf8_codepoint_bytes(Code, 3) :- Code =< 0xffff, !.
 utf8_codepoint_bytes(Code, 4) :- Code =< 0x10ffff.
-
-project_highlights([], []).
-project_highlights(
-    [evidence(Semantic, _Span, PaintSpans, _Surface, Syntax, Description,
-              _Preference, Origin)|Evidence], Highlights) :-
-    paint_highlights(PaintSpans, Syntax, Semantic, Description, Origin, First),
-    project_highlights(Evidence, Rest),
-    append(First, Rest, Highlights).
-
-paint_highlights([], _, _, _, _, []).
-paint_highlights([Span|Spans], Syntax, Semantic, Description, Origin,
-                 [highlight(Span, Syntax, Semantic, Origin)|Highlights]) :-
-    paint_highlights(Spans, Syntax, Semantic, Description, Origin, Highlights).
 
 requested_bindings([], _, []).
 requested_bindings([Name|Names], Available, [binding(Name, Value)|Bindings]) :-
