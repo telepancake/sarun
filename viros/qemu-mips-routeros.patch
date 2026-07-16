@@ -1,0 +1,90 @@
+diff --git a/hw/mips/malta.c b/hw/mips/malta.c
+--- a/hw/mips/malta.c
++++ b/hw/mips/malta.c
+@@ -675,7 +675,7 @@ static void write_bootloader_nanomips(uint8_t *base, int64_t run_addr,
+                         * If semihosting is used, arguments have already
+                         * been passed, so we preserve $a0.
+                         */
+-                       !semihosting_get_argc(), 2,
++                       !semihosting_get_argc(), ENVP_NB_ENTRIES,
+                        true, ENVP_VADDR,
+                        true, ENVP_VADDR + 8,
+                        true, loaderparams.ram_low_size,
+@@ -866,7 +866,6 @@ static uint64_t load_kernel(void)
+     uint32_t *prom_buf;
+     long prom_size;
+     int prom_index = 0;
+-    size_t rng_seed_prom_offset;
+
+     kernel_size = load_elf(loaderparams.kernel_filename, NULL,
+                            cpu_mips_kseg0_to_phys, NULL,
+@@ -926,35 +925,24 @@ static uint64_t load_kernel(void)
+     prom_set(prom_buf, prom_index++, "%s", loaderparams.kernel_filename);
+     if (initrd_size > 0) {
+         prom_set(prom_buf, prom_index++,
+-                 "rd_start=0x%" PRIx64 " rd_size=%" PRId64 " %s",
+-                 cpu_mips_phys_to_kseg0(NULL, initrd_offset),
+-                 initrd_size, loaderparams.kernel_cmdline);
+-    } else {
+-        prom_set(prom_buf, prom_index++, "%s", loaderparams.kernel_cmdline);
++                 "rd_start=0x%" PRIx64 " rd_size=%" PRId64,
++                 cpu_mips_phys_to_kseg0(NULL, initrd_offset), initrd_size);
+     }
+
+-    prom_set(prom_buf, prom_index++, "memsize");
+-    prom_set(prom_buf, prom_index++, "%u", loaderparams.ram_low_size);
+-
+-    prom_set(prom_buf, prom_index++, "ememsize");
+-    prom_set(prom_buf, prom_index++, "%u", loaderparams.ram_size);
+-
+-    prom_set(prom_buf, prom_index++, "modetty0");
+-    prom_set(prom_buf, prom_index++, "38400n8r");
++    if (loaderparams.kernel_cmdline) {
++        g_auto(GStrv) args = g_strsplit(loaderparams.kernel_cmdline, " ", -1);
++        char **arg;
+
+-    prom_set(prom_buf, prom_index++, "rngseed");
+-    rng_seed_prom_offset = prom_index * ENVP_ENTRY_SIZE +
+-                           sizeof(uint32_t) * ENVP_NB_ENTRIES;
+-    {
+-        g_autoptr(GString) hex = rng_seed_hex_new();
+-        prom_set(prom_buf, prom_index++, "%s", hex->str);
++        for (arg = args; *arg && prom_index < ENVP_NB_ENTRIES - 1; arg++) {
++            if (**arg) {
++                prom_set(prom_buf, prom_index++, "%s", *arg);
++            }
++        }
+     }
+
+     prom_set(prom_buf, prom_index++, NULL);
+
+     rom_add_blob_fixed("prom", prom_buf, prom_size, ENVP_PADDR);
+-    qemu_register_reset_nosnapshotload(reinitialize_rng_seed,
+-            rom_ptr(ENVP_PADDR, prom_size) + rng_seed_prom_offset);
+
+     g_free(prom_buf);
+     return kernel_entry;
+@@ -1085,6 +1073,7 @@ void mips_malta_init(MachineState *machine)
+     MemoryRegion *system_memory = get_system_memory();
+     MemoryRegion *ram_low_preio = g_new(MemoryRegion, 1);
+     MemoryRegion *ram_low_postio;
++    MemoryRegion *rb_uart = g_new(MemoryRegion, 1);
+     MemoryRegion *bios, *bios_copy = g_new(MemoryRegion, 1);
+     const size_t smbus_eeprom_size = 8 * 256;
+     uint8_t *smbus_eeprom_buf = g_malloc0(smbus_eeprom_size);
+@@ -1120,6 +1109,15 @@ void mips_malta_init(MachineState *machine)
+                              machine->ram, 0, MIN(ram_size, 256 * MiB));
+     memory_region_add_subregion(system_memory, 0, ram_low_preio);
+
++    /* RouterOS smips board=vm still emits panic text through the AR9330
++     * polling UART.  A RAM-backed status/data word is enough for the kernel:
++     * bit 9 means ready and character writes preserve it. */
++    memory_region_init_ram(rb_uart, NULL, "mikrotik.rb-uart", 0x1000,
++                           &error_fatal);
++    memory_region_add_subregion_overlap(system_memory, 0x18020000,
++                                        rb_uart, 10);
++    stl_be_p(memory_region_get_ram_ptr(rb_uart), 0x200);
++
+     /* alias for post IO hole access, if there is enough RAM */
+     if (ram_size > 512 * MiB) {
+         ram_low_postio = g_new(MemoryRegion, 1);
