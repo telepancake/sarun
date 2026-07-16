@@ -167,8 +167,12 @@ Do not implement these as Brush-specific engine branches:
       constructs return an explicit mode diagnostic rather than `no_solution`.
 - [ ] Replace the current flat pre-tokenized sequence limitation with raw-source
       grammar values, recursive rule references, trivia, and byte-span evidence.
-- [ ] Implement a small shell-word slice: plain text, escapes, single/double
-      quotes, parameter expansion, command substitution, and arithmetic.
+- [x] Install the first Brush-owned immutable grammar behind an opaque handle
+      and execute its shell-word slice through the generic engine: plain text,
+      escapes, single/double quotes, named/braced/special parameters, nested
+      command substitution, and grouped arithmetic. Declarative negative
+      lookahead expresses lexical boundaries without shell-specific engine
+      behavior. This is a relation client and remains shadow-only.
 - [ ] Derive highlighting and a tear completion from successful parses of that
       slice, including concrete text to the right of the cursor.
 - [ ] Differentially test UTF-8 byte offsets and render/parse round trips.

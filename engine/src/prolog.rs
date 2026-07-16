@@ -1041,10 +1041,14 @@ impl Runtime {
                 "call_with_inference_limit((asserta(user:file_search_path(library,'res://library')),",
                 "load_files('res://app/relation_api.pl',[silent(true)]),",
                 "load_files('res://app/action_grammar.pl',[silent(true)]),",
+                "load_files('res://app/brush_grammar.pl',[silent(true)]),",
                 "action_grammar:valid_transport_catalog,",
                 "action_grammar:valid_action_catalog,",
                 "action_grammar:action_relation_grammar(ActionGrammar),",
-                "grammar_store:install_grammar(sarun_actions,ActionGrammar)),",
+                "grammar_store:install_grammar(sarun_actions,ActionGrammar),",
+                "brush_grammar:brush_relation_grammar(BrushGrammar),",
+                "grammar_ir:valid_grammar(BrushGrammar),",
+                "grammar_store:install_grammar(sarun_brush,BrushGrammar)),",
                 "{},R),R\\==inference_limit_exceeded"
             ),
             LOAD_INFERENCES
@@ -1511,6 +1515,14 @@ fn action_grammar_handle() -> RelationValue {
     relation_compound(
         "grammar_handle",
         vec![RelationValue::Atom("sarun_actions".into())],
+    )
+}
+
+#[cfg(test)]
+fn brush_grammar_handle() -> RelationValue {
+    relation_compound(
+        "grammar_handle",
+        vec![RelationValue::Atom("sarun_brush".into())],
     )
 }
 
@@ -2660,6 +2672,50 @@ mod tests {
             )
         );
         assert_eq!(reply.solutions[0].bindings[1].value, rv_atom("complete"));
+    }
+
+    #[test]
+    fn installed_brush_word_grammar_is_a_generic_relation_client() {
+        let reply = global()
+            .unwrap()
+            .transform(&RelationRequest {
+                grammar: brush_grammar_handle(),
+                given: vec![RelationBinding {
+                    name: "source".into(),
+                    value: rv_compound(
+                        "text_source",
+                        vec![
+                            rv_string("pré\"$name$(echo hi)\""),
+                            rv_atom("exact"),
+                            rv_atom("rust_test"),
+                        ],
+                    ),
+                }],
+                wanted: vec!["ast".into(), "status".into(), "highlights".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert!(reply.diagnostics.is_empty());
+        assert_eq!(reply.solutions.len(), 1);
+        assert_eq!(reply.solutions[0].bindings[1].value, rv_atom("complete"));
+        let RelationValue::Compound(root, fields) = &reply.solutions[0].bindings[0].value else {
+            panic!("Brush grammar did not return an AST node");
+        };
+        assert_eq!(root, "node");
+        assert_eq!(fields[0], rv_atom("shell_word"));
+        assert_eq!(
+            fields[1],
+            rv_compound("span", vec![rv_integer(0), rv_integer(21)])
+        );
+        let RelationValue::List(highlights) = &reply.solutions[0].bindings[2].value else {
+            panic!("Brush grammar did not return highlight evidence");
+        };
+        assert!(highlights.iter().any(|highlight| {
+            matches!(highlight,
+                RelationValue::Compound(name, values)
+                    if name == "highlight" && values[1] == rv_atom("variable"))
+        }));
     }
 
     #[test]

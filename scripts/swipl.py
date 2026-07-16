@@ -65,6 +65,7 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
     grammar = repo / "engine" / "pl" / "action_grammar.pl"
     grammar_engine = repo / "engine" / "pl" / "grammar_engine.pl"
     text_grammar_engine = repo / "engine" / "pl" / "text_grammar_engine.pl"
+    brush_grammar = repo / "engine" / "pl" / "brush_grammar.pl"
     grammar_codec = repo / "engine" / "pl" / "grammar_codec.pl"
     grammar_store = repo / "engine" / "pl" / "grammar_store.pl"
     grammar_ir = repo / "engine" / "pl" / "grammar_ir.pl"
@@ -78,6 +79,8 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
         raise RuntimeError(f"missing grammar engine: {grammar_engine}")
     if not text_grammar_engine.is_file():
         raise RuntimeError(f"missing text grammar engine: {text_grammar_engine}")
+    if not brush_grammar.is_file():
+        raise RuntimeError(f"missing Brush grammar: {brush_grammar}")
     if not grammar_codec.is_file():
         raise RuntimeError(f"missing grammar codec: {grammar_codec}")
     if not grammar_store.is_file():
@@ -106,6 +109,7 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
         "action_grammar_sha256": sha256(grammar),
         "grammar_engine_sha256": sha256(grammar_engine),
         "text_grammar_engine_sha256": sha256(text_grammar_engine),
+        "brush_grammar_sha256": sha256(brush_grammar),
         "grammar_codec_sha256": sha256(grammar_codec),
         "grammar_store_sha256": sha256(grammar_store),
         "grammar_ir_sha256": sha256(grammar_ir),
@@ -130,6 +134,7 @@ def build_identity(metadata: dict[str, str]) -> str:
         "action_grammar_sha256",
         "grammar_engine_sha256",
         "text_grammar_engine_sha256",
+        "brush_grammar_sha256",
         "grammar_codec_sha256",
         "grammar_store_sha256",
         "grammar_ir_sha256",
@@ -328,6 +333,7 @@ def create_app_resource(
         "app/action_grammar.pl": repo / "engine" / "pl" / "action_grammar.pl",
         "app/grammar_engine.pl": repo / "engine" / "pl" / "grammar_engine.pl",
         "app/text_grammar_engine.pl": repo / "engine" / "pl" / "text_grammar_engine.pl",
+        "app/brush_grammar.pl": repo / "engine" / "pl" / "brush_grammar.pl",
         "app/grammar_codec.pl": repo / "engine" / "pl" / "grammar_codec.pl",
         "app/grammar_store.pl": repo / "engine" / "pl" / "grammar_store.pl",
         "app/grammar_ir.pl": repo / "engine" / "pl" / "grammar_ir.pl",

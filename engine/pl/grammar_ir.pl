@@ -73,6 +73,8 @@ valid_expression(choice(Expressions), Names, Primitives) :-
     valid_expressions(Expressions, Names, Primitives).
 valid_expression(optional(Expression), Names, Primitives) :-
     valid_expression(Expression, Names, Primitives).
+valid_expression(not(Expression), Names, Primitives) :-
+    valid_expression(Expression, Names, Primitives).
 valid_expression(repeat(Minimum, Maximum, Expression), Names, Primitives) :-
     integer(Minimum),
     Minimum >= 0,

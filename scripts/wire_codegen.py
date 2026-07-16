@@ -28,6 +28,7 @@ SCHEMA_SOURCES = (
     "engine/pl/action_grammar.pl",
     "engine/pl/grammar_engine.pl",
     "engine/pl/text_grammar_engine.pl",
+    "engine/pl/brush_grammar.pl",
     "engine/pl/grammar_codec.pl",
     "engine/pl/grammar_store.pl",
     "engine/pl/grammar_ir.pl",

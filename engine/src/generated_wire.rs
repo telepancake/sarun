@@ -3,15 +3,16 @@
 // source-sha256 engine/pl/action_catalog.pl 34b7c8fd250be87ce538a32749a9854040c2512cb1d8242d4454ad579b5951f2
 // source-sha256 engine/pl/action_grammar.pl 5e93bfb255f8c2742750ca2f8c5530cca80276f6b4fa11d8d5bc50b443e428d6
 // source-sha256 engine/pl/grammar_engine.pl ad342586af02fcda74393bdef0e1d7f4bed1f6216da528b0b2195688c309c762
-// source-sha256 engine/pl/text_grammar_engine.pl 6098b9fdade7aa1b495b9dbbf9fcd8882f844677caf6f401e0e372f11b6fb23f
+// source-sha256 engine/pl/text_grammar_engine.pl 544075c6a8964f0708a71ecd714ea8469e4af77eb9a27fe37928ef506c656fcc
+// source-sha256 engine/pl/brush_grammar.pl e3fccd9dc79a019ed59b7e57855783e831d0c4e537fc6967d1e4b62583ecd783
 // source-sha256 engine/pl/grammar_codec.pl f27871fc35afddbe199d23e51986ae3f9ce6f68d83d241cc8f25f0b692d8fdb6
 // source-sha256 engine/pl/grammar_store.pl a2bffdb3e6fd18a0d45de5269427be6386164530de6c3b9097c4d878ab0093fd
-// source-sha256 engine/pl/grammar_ir.pl d9ced0ef6006621072850ce836027f640417c38c2a681aafe18fc3712e980fa3
+// source-sha256 engine/pl/grammar_ir.pl d2412ac275d92a1c629b5334f5deb4e2eb044e603ffda1b86ad9d81fa07082fb
 // source-sha256 engine/pl/relation_api.pl ad889e938e6fa12b8491da2d8e8dd2d16496a6400223786a43e1e75695f1fb58
 // source-sha256 engine/pl/context_relation.pl cbf9d8788d006f18250dd45d07ce8664ec28e1fc997630b7a0ca717c2f8f3a0c
 // source-sha256 engine/pl/transport_catalog.pl 54563becea268fb763b7ffc091c055b5968563921953ec9001c41f36b712718f
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
-// source-sha256 scripts/wire_codegen.py 67a777f84763439835c958029a1fb150dedae97cac47ec923a20fb563f6684fb
+// source-sha256 scripts/wire_codegen.py 5552a9e3bb7854013954adf3af4b7510c0a3470488ac69ce8a4235f2941f953f
 
 use crate::prolog::RelationValue;
 use crate::wire::{

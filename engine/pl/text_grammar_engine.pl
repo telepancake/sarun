@@ -49,6 +49,8 @@ executable_text_expression(choice(Expressions)) :-
     executable_text_expressions(Expressions).
 executable_text_expression(optional(Expression)) :-
     executable_text_expression(Expression).
+executable_text_expression(not(Expression)) :-
+    executable_text_expression(Expression).
 executable_text_expression(repeat(_, _, Expression)) :-
     executable_text_expression(Expression).
 executable_text_expression(field(_, Expression)) :-
@@ -102,6 +104,10 @@ match_expression(optional(Expression), Rules, Text, Origin, Maximum, Start,
                      Value, Evidence, Depth0, Depth).
 match_expression(optional(_), _, _, _, _, Cursor, Cursor, none, [], Depth,
                  Depth).
+match_expression(not(Expression), Rules, Text, Origin, Maximum, Cursor, Cursor,
+                 absent, [], Depth, Depth) :-
+    \+ match_expression(Expression, Rules, Text, Origin, Maximum, Cursor, _,
+                        _, _, Depth, _).
 match_expression(repeat(Minimum, MaximumCount, Expression), Rules, Text,
                  Origin, Maximum, Start, End, repeated(Values), Evidence,
                  Depth0, Depth) :-

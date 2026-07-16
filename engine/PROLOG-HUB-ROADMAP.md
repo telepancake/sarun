@@ -429,6 +429,10 @@ repetition, fields, literals, declarative codepoint sets, exact consumption,
 generic AST/evidence/highlight projections, and UTF-8 byte spans all execute
 through `relation_api:transform/2`. A foreign balanced recursive grammar proves
 that `λ` is matched character-safely while exposed as its exact two-byte span.
+The first real client grammar, `brush_grammar.pl`, now declares a recursive
+shell-word slice as immutable data and is installed behind the `sarun_brush`
+handle. It added generic negative lookahead to the IR for unambiguous lexical
+boundaries; neither the engine nor Rust contains a Brush parsing case.
 Validated IR constructs outside this initial mode matrix return
 `unsupported_text_grammar` explicitly rather than looking like source with no
 parse. Raw tears, trivia, rendering, state, embedding, constraints, precedence,
