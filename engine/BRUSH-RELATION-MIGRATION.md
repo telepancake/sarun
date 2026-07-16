@@ -117,6 +117,17 @@ Shell-local bindings are relation state, not external queries:
 - aliases and shell options that affect tokenization or parsing;
 - command position, redirection state, and heredoc delimiter queues.
 
+State transitions are pure and lexically scoped. A declaration/assignment
+installs a typed local binding; subsequent references search the scope chain
+and emit no context query when that binding resolves them. Closing a scope
+drops non-escaping bindings. Escaping shell effects are returned as an explicit
+state delta and may seed the next relation request, but their later use within
+the request that created them is still local. An external query is emitted only
+for information not derivable from the request's initial state and local
+transitions, or for an explicit surrounding-context constraint such as an
+ODR/conflict check. Thus the analogue of C parameters/locals never pollutes the
+dependency trace, while an unresolved free name does.
+
 Live or potentially expensive namespaces are explicit context queries:
 
 - builtins and their typed argument grammars;
@@ -193,8 +204,10 @@ Do not implement these as Brush-specific engine branches:
       fields, literals, declarative codepoint sets, exact consumption, generic
       AST nodes, evidence/highlights, and UTF-8 byte spans. Unsupported IR
       constructs return an explicit mode diagnostic rather than `no_solution`.
-- [ ] Replace the current flat pre-tokenized sequence limitation with raw-source
-      grammar values, recursive rule references, trivia, and byte-span evidence.
+- [x] Replace the flat pre-tokenized limitation with raw-source grammar values,
+      recursive rule references, grammar-owned trivia, lexical regions, and
+      byte-span evidence. Trivia consumption is deterministic at the nearest
+      syntactic boundary rather than an exponential AST ambiguity.
 - [x] Install the first Brush-owned immutable grammar behind an opaque handle
       and execute its shell-word slice through the generic engine: plain text,
       escapes, single/double quotes, named/braced/special parameters, nested
@@ -209,6 +222,10 @@ Do not implement these as Brush-specific engine branches:
 
 ### 2. Shell program structure and dynamic regions
 
+- [x] Establish the first program slice over the same Brush grammar value:
+      whitespace-separated simple commands, pipelines, `&&`/`||`, `;`, newline,
+      backgrounding, and operator/trivia highlighting. Lexical maximality keeps
+      adjacent codepoints in one word while trivia separates command words.
 - [ ] Add lists, pipelines, `&&`/`||`, backgrounding, compound commands,
       functions, assignments, redirections, and parser-option gates.
 - [ ] Add heredoc delimiter queues, `<<-`, quoted delimiter semantics, multiple

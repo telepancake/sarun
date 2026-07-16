@@ -53,6 +53,11 @@ executable_text_expression(optional(Expression)) :-
     executable_text_expression(Expression).
 executable_text_expression(not(Expression)) :-
     executable_text_expression(Expression).
+executable_text_expression(extras(ExtraExpressions, Expression)) :-
+    executable_text_expressions(ExtraExpressions),
+    executable_text_expression(Expression).
+executable_text_expression(lexical(Expression)) :-
+    executable_text_expression(Expression).
 executable_text_expression(repeat(_, _, Expression)) :-
     executable_text_expression(Expression).
 executable_text_expression(field(_, Expression)) :-
@@ -67,16 +72,19 @@ executable_text_expressions([Expression|Expressions]) :-
     executable_text_expressions(Expressions).
 
 text_source_context(text_source(Text, exact, Origin), Text, CharacterCount,
-                    source_context(Origin, no_tear), complete) :-
+                    parse_context(source_context(Origin, no_tear), []),
+                    complete) :-
     string(Text),
     ground(Origin),
     string_length(Text, CharacterCount).
 text_source_context(
     text_source(Text, assist(EditId, span(ByteStart, ByteEnd)), Origin), Text,
     CharacterCount,
-    source_context(Origin,
-                   tear(EditId, cursor(CharacterStart, ByteStart),
-                        cursor(CharacterEnd, ByteEnd), Surface)),
+    parse_context(
+        source_context(Origin,
+                       tear(EditId, cursor(CharacterStart, ByteStart),
+                            cursor(CharacterEnd, ByteEnd), Surface)),
+        []),
     incomplete(edit(EditId))) :-
     string(Text),
     atom(EditId),
@@ -103,22 +111,36 @@ byte_character_cursor(Text, TargetByte, Index, Character0, Byte0, Character) :-
     byte_character_cursor(Text, TargetByte, Index1, Character1, Byte1,
                           Character).
 
-source_origin(source_context(Origin, _), Origin).
+source_origin(parse_context(source_context(Origin, _), _), Origin).
 
-initial_text_cursor(source_context(_, no_tear), cursor(0, 0, absent)).
-initial_text_cursor(source_context(_, tear(_, _, _, _)), cursor(0, 0, unused)).
+initial_text_cursor(parse_context(source_context(_, no_tear), _),
+                    cursor(0, 0, absent)).
+initial_text_cursor(parse_context(source_context(_, tear(_, _, _, _)), _),
+                    cursor(0, 0, unused)).
 
-complete_text_cursor(source_context(_, no_tear), CharacterCount, ByteEnd,
+complete_text_cursor(parse_context(source_context(_, no_tear), _),
+                     CharacterCount, ByteEnd,
                      cursor(CharacterCount, ByteEnd, absent)).
-complete_text_cursor(source_context(_, tear(_, _, _, _)), CharacterCount,
+complete_text_cursor(parse_context(source_context(_, tear(_, _, _, _)), _),
+                     CharacterCount,
                      ByteEnd, cursor(CharacterCount, ByteEnd, used)).
 
 source_tear_at(
-    source_context(_,
-                   tear(EditId, cursor(CharacterStart, ByteStart),
-                        cursor(CharacterEnd, ByteEnd), Surface)),
+    parse_context(
+        source_context(_,
+                       tear(EditId, cursor(CharacterStart, ByteStart),
+                            cursor(CharacterEnd, ByteEnd), Surface)),
+        _),
     cursor(CharacterStart, ByteStart, unused), EditId,
     cursor(CharacterEnd, ByteEnd, used), Surface).
+
+context_with_extras(parse_context(Source, Existing), Added,
+                    parse_context(Source, Combined)) :-
+    append(Added, Existing, Combined).
+
+context_without_extras(parse_context(Source, _), parse_context(Source, [])).
+
+context_extras(parse_context(_, Extras), Extras).
 
 complete_text_candidate(Root, Rules, Text, CharacterCount, Context, Status,
                         Maximum, candidate(Available, Evidence)) :-
@@ -193,6 +215,25 @@ match_expression(not(Expression), Rules, Text, Origin, Maximum, Cursor, Cursor,
                  absent, [], Depth, Depth) :-
     \+ match_expression(Expression, Rules, Text, Origin, Maximum, Cursor, _,
                         _, _, Depth, _).
+match_expression(extras(ExtraExpressions, Expression), Rules, Text, Context,
+                 Maximum, Start, End,
+                 with_extras(Leading, Value, Trailing), Evidence, Depth0,
+                 Depth) :-
+    context_with_extras(Context, ExtraExpressions, InnerContext),
+    context_without_extras(InnerContext, TriviaContext),
+    match_trivia(ExtraExpressions, Rules, Text, TriviaContext, Maximum, Start,
+                 BodyStart, Leading, LeadingEvidence, Depth0, Depth1),
+    match_expression(Expression, Rules, Text, InnerContext, Maximum, BodyStart,
+                     BodyEnd, Value, BodyEvidence, Depth1, Depth2),
+    match_trivia(ExtraExpressions, Rules, Text, TriviaContext, Maximum, BodyEnd,
+                 End, Trailing, TrailingEvidence, Depth2, Depth),
+    append(LeadingEvidence, BodyEvidence, FirstEvidence),
+    append(FirstEvidence, TrailingEvidence, Evidence).
+match_expression(lexical(Expression), Rules, Text, Context, Maximum, Start, End,
+                 lexical(Value), Evidence, Depth0, Depth) :-
+    context_without_extras(Context, LexicalContext),
+    match_expression(Expression, Rules, Text, LexicalContext, Maximum, Start,
+                     End, Value, Evidence, Depth0, Depth).
 match_expression(repeat(Minimum, MaximumCount, Expression), Rules, Text,
                  Origin, Maximum, Start, End, repeated(Values), Evidence,
                  Depth0, Depth) :-
@@ -248,29 +289,77 @@ match_expression(
                     Preference, EvidenceOrigin).
 
 match_expressions([], _, _, _, _, Cursor, Cursor, [], [], Depth, Depth).
-match_expressions([Expression|Expressions], Rules, Text, Origin, Maximum, Start,
-                  End, [Value|Values], Evidence, Depth0, Depth) :-
-    match_expression(Expression, Rules, Text, Origin, Maximum, Start, Middle,
+match_expressions([Expression], Rules, Text, Context, Maximum, Start, End,
+                  [Value], Evidence, Depth0, Depth) :-
+    match_expression(Expression, Rules, Text, Context, Maximum, Start, End,
+                     Value, Evidence, Depth0, Depth).
+match_expressions([Expression, Next|Expressions], Rules, Text, Context, Maximum,
+                  Start, End, [ValueWithTrivia|Values], Evidence, Depth0,
+                  Depth) :-
+    match_expression(Expression, Rules, Text, Context, Maximum, Start, Middle0,
                      Value, FirstEvidence, Depth0, Depth1),
-    match_expressions(Expressions, Rules, Text, Origin, Maximum, Middle, End,
-                      Values, RestEvidence, Depth1, Depth),
+    match_active_trivia(Context, Rules, Text, Maximum, Middle0, Middle, Trivia,
+                        TriviaEvidence, Depth1, Depth2),
+    attach_trivia(Value, Trivia, ValueWithTrivia),
+    match_expressions([Next|Expressions], Rules, Text, Context, Maximum, Middle,
+                      End, Values, RestEvidence, Depth2, Depth),
+    append(FirstEvidence, TriviaEvidence, BeforeRest),
+    append(BeforeRest, RestEvidence, Evidence).
+
+match_active_trivia(Context, Rules, Text, Maximum, Start, End, Values, Evidence,
+                    Depth0, Depth) :-
+    context_extras(Context, Extras),
+    context_without_extras(Context, TriviaContext),
+    match_trivia(Extras, Rules, Text, TriviaContext, Maximum, Start, End, Values,
+                 Evidence, Depth0, Depth).
+
+match_trivia(Expressions, Rules, Text, Context, Maximum, Start, End,
+             [Value|Values], Evidence, Depth0, Depth) :-
+    expression_choice(Expressions, 1, _, Expression),
+    match_expression(Expression, Rules, Text, Context, Maximum, Start, Middle,
+                     Value, FirstEvidence, Depth0, Depth1),
+    Middle \= Start,
+    !,
+    match_trivia(Expressions, Rules, Text, Context, Maximum, Middle, End,
+                 Values, RestEvidence, Depth1, Depth),
     append(FirstEvidence, RestEvidence, Evidence).
+match_trivia(_, _, _, _, _, Cursor, Cursor, [], [], Depth, Depth).
+
+attach_trivia(Value, [], Value).
+attach_trivia(Value, Trivia, with_trailing_trivia(Value, Trivia)) :-
+    Trivia = [_|_].
 
 match_repetition(_, _, _, _, _, Minimum, _, Count, Cursor, Cursor, [], [],
                  Depth, Depth) :-
     Count >= Minimum.
 match_repetition(Expression, Rules, Text, Origin, Maximum, Minimum,
-                 MaximumCount, Count, Start, End, [Value|Values], Evidence,
+                 MaximumCount, Count, Start, End,
+                 [ValueWithTrivia|Values], Evidence,
                  Depth0, Depth) :-
     repetition_room(MaximumCount, Count),
-    match_expression(Expression, Rules, Text, Origin, Maximum, Start, Middle,
+    match_expression(Expression, Rules, Text, Origin, Maximum, Start, Middle0,
                      Value, FirstEvidence, Depth0, Depth1),
-    Middle \= Start,
+    Middle0 \= Start,
+    repetition_gap(Origin, Rules, Text, Maximum, Middle0, Middle, Trivia,
+                   TriviaEvidence, Depth1, Depth2),
     NextCount is Count + 1,
     match_repetition(Expression, Rules, Text, Origin, Maximum, Minimum,
                      MaximumCount, NextCount, Middle, End, Values,
-                     RestEvidence, Depth1, Depth),
-    append(FirstEvidence, RestEvidence, Evidence).
+                     RestEvidence, Depth2, Depth),
+    gap_has_following_value(Trivia, Values),
+    attach_trivia(Value, Trivia, ValueWithTrivia),
+    append(FirstEvidence, TriviaEvidence, BeforeRest),
+    append(BeforeRest, RestEvidence, Evidence).
+
+repetition_gap(_, _, _, _, Cursor, Cursor, [], [], Depth, Depth).
+repetition_gap(Context, Rules, Text, Maximum, Start, End, Trivia, Evidence,
+               Depth0, Depth) :-
+    match_active_trivia(Context, Rules, Text, Maximum, Start, End, Trivia,
+                        Evidence, Depth0, Depth),
+    Trivia = [_|_].
+
+gap_has_following_value([], _).
+gap_has_following_value([_|_], [_|_]).
 
 repetition_room(unbounded, _).
 repetition_room(Maximum, Count) :- integer(Maximum), Count < Maximum.

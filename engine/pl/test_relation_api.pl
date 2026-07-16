@@ -14,6 +14,7 @@ test_name(composed_context_dependencies_bind_before_ast_bridge).
 test_name(choice_namespaces_context_dependencies).
 test_name(grammar_terminal_codecs_are_declarative_and_bidirectional).
 test_name(recursive_raw_text_grammar_reports_utf8_byte_evidence).
+test_name(raw_text_extras_are_grammar_owned_trivia).
 test_name(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly).
 test_name(opaque_handle_resolves_install_once_grammar).
 test_name(solution_limit_is_enforced_and_reported).
@@ -438,6 +439,32 @@ run_test(recursive_raw_text_grammar_reports_utf8_byte_evidence) :-
                          binding(status, complete),
                          binding(highlights, Highlights)], 0)], [], [], [])),
     has_highlight(span(5, 7), text, codepoint(955), foreign_text, Highlights).
+
+run_test(raw_text_extras_are_grammar_owned_trivia) :-
+    Space = terminal(text(codepoint(chars(" \t\n"))),
+                     presentation([meta(syntax, trivia)])),
+    Grammar = grammar(
+        source(text(utf8)), root,
+        [rule(root,
+              extras([Space],
+                     seq([literal("let", let,
+                                  presentation([meta(syntax, keyword)])),
+                          literal("x", name,
+                                  presentation([meta(syntax, identifier)]))])))],
+        []),
+    limits(Limits),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source(" \tlet   x\n", exact,
+                                           foreign_text))]),
+                want([ast, highlights]), observations([]), Limits),
+        reply([solution([binding(ast, node(root, span(0, 10),
+                                           with_extras(_, _, _))),
+                         binding(highlights, Highlights)], 0)], [], [], [])),
+    has_highlight(span(0, 1), trivia, codepoint(32), foreign_text, Highlights),
+    has_highlight(span(5, 6), trivia, codepoint(32), foreign_text, Highlights),
+    has_highlight(span(9, 10), trivia, codepoint(10), foreign_text, Highlights).
 
 run_test(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly) :-
     Grammar = grammar(

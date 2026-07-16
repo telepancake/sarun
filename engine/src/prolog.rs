@@ -2703,7 +2703,7 @@ mod tests {
             panic!("Brush grammar did not return an AST node");
         };
         assert_eq!(root, "node");
-        assert_eq!(fields[0], rv_atom("shell_word"));
+        assert_eq!(fields[0], rv_atom("shell_program"));
         assert_eq!(
             fields[1],
             rv_compound("span", vec![rv_integer(0), rv_integer(21)])

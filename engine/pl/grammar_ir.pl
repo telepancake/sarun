@@ -104,6 +104,8 @@ valid_expression(extras(ExtraExpressions, Expression), Names, Primitives) :-
     proper_list(ExtraExpressions),
     valid_expressions(ExtraExpressions, Names, Primitives),
     valid_expression(Expression, Names, Primitives).
+valid_expression(lexical(Expression), Names, Primitives) :-
+    valid_expression(Expression, Names, Primitives).
 valid_expression(embed(Grammar, Boundary), _, _) :-
     valid_embedded_grammar(Grammar),
     ground(Boundary).

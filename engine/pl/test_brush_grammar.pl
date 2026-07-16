@@ -5,6 +5,7 @@
 
 test_name(grammar_is_valid_executable_data).
 test_name(word_slice_parses_quotes_expansions_and_utf8).
+test_name(program_slice_parses_commands_pipelines_and_lists).
 test_name(tear_completion_is_an_ordinary_parse_with_concrete_suffix).
 test_name(unterminated_word_has_no_complete_parse).
 
@@ -36,13 +37,34 @@ run_test(word_slice_parses_quotes_expansions_and_utf8) :-
                                            exact, brush_test))]),
                 want([ast, status, highlights]), observations([]),
                 limits(32, 4096, 1048576)),
-        reply([solution([binding(ast, node(shell_word, span(0, 54), _)),
+        reply([solution([binding(ast, node(shell_program, span(0, 54), _)),
                          binding(status, complete),
                          binding(highlights, Highlights)], 0)], [], [], [])),
     has_highlight(span(0, 1), word, codepoint(112), brush_test, Highlights),
     has_highlight(span(2, 4), word, codepoint(233), brush_test, Highlights),
     has_highlight(_, variable, _, brush_test, Highlights),
     has_highlight(_, arithmetic, _, brush_test, Highlights).
+
+run_test(program_slice_parses_commands_pipelines_and_lists) :-
+    brush_relation_grammar(Grammar),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source(
+                                   "echo \"hi $name\" | grep hi && printf done\nnext &",
+                                   exact, brush_test))]),
+                want([ast, status, highlights]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply([solution([binding(ast,
+                                 node(shell_program, span(0, 47), _)),
+                         binding(status, complete),
+                         binding(highlights, Highlights)], 0)], [], [], [])),
+    has_highlight(_, variable, parameter_sigil, brush_test, Highlights),
+    has_highlight(_, operator, pipe, brush_test, Highlights),
+    has_highlight(_, operator, and_if, brush_test, Highlights),
+    has_highlight(_, operator, newline, brush_test, Highlights),
+    has_highlight(_, operator, background, brush_test, Highlights),
+    has_highlight(_, trivia, codepoint(32), brush_test, Highlights).
 
 run_test(tear_completion_is_an_ordinary_parse_with_concrete_suffix) :-
     brush_relation_grammar(Grammar),

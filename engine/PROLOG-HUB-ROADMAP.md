@@ -437,6 +437,11 @@ Raw text sources now also carry zero- or nonzero-width edit tears through the
 ordinary parser. Shared evidence projection records literal completions only
 from whole-source witnesses, including concrete suffixes, and linear cursor
 state guarantees that a tear is consumed exactly once.
+The generic text engine now executes grammar-owned extras and lexical regions;
+trivia is consumed deterministically at the nearest syntactic boundary. The
+Brush client has consequently grown from an isolated word to its first program
+slice: multiword commands, pipelines, boolean lists, sequencing, newlines, and
+backgrounding all produce AST and highlight evidence through the same handle.
 
 The next externally usable checkpoint is explicitly the complete interactive
 `sarun brush` editing experience: relation-owned highlighting, completion,
