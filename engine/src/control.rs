@@ -1280,6 +1280,122 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>, Option<i32>) {
     (first, second, third)
 }
 
+fn first_data_byte(conn: &UnixStream) -> Option<u8> {
+    let mut byte = 0u8;
+    let read = unsafe {
+        libc::recv(
+            conn.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK,
+        )
+    };
+    (read == 1).then_some(byte)
+}
+
+fn binary_error(message: String) -> crate::generated_wire::ConnectionMode {
+    use crate::generated_wire::{ConnectionMode, ErrorCategory, TransportResponse};
+    let message = crate::wire::BoundedText::new(message).unwrap_or_else(|_| {
+        crate::wire::BoundedText::new("binary request failed".to_owned()).unwrap()
+    });
+    ConnectionMode::Reply {
+        response: TransportResponse::Error {
+            category: ErrorCategory::InvalidRequest,
+            message,
+        },
+    }
+}
+
+/// Direct typed registration used by the QEMU launcher.  The request and
+/// reply are generated binary values; after the reply, the connection is the
+/// runner's lifetime channel exactly like the established FUSE/SUD channel.
+fn handle_binary_registration(
+    state: State,
+    mut conn: UnixStream,
+    peer_pidfd: Option<std::os::fd::OwnedFd>,
+    fd2: Option<std::os::fd::OwnedFd>,
+    fd3: Option<std::os::fd::OwnedFd>,
+) {
+    use crate::generated_wire::{ConnectionMode, RequestEnvelope, RunBackend, TransportRequest};
+    let request = match crate::socket_wire::read_request(&mut conn) {
+        Ok(RequestEnvelope::Transport(request @ TransportRequest::Register {
+            backend: RunBackend::Qemu,
+            ..
+        })) => request,
+        Ok(_) => {
+            let _ = crate::socket_wire::write_mode(
+                &mut conn,
+                &binary_error("this binary lifecycle endpoint requires qemu register".into()),
+            );
+            return;
+        }
+        Err(error) => {
+            let _ = crate::socket_wire::write_mode(
+                &mut conn,
+                &binary_error(format!("decode binary registration: {error}")),
+            );
+            return;
+        }
+    };
+    let result = register(
+        &state,
+        &request,
+        peer_pidfd.map(std::os::fd::IntoRawFd::into_raw_fd),
+        fd2.map(std::os::fd::IntoRawFd::into_raw_fd),
+        fd3.map(std::os::fd::IntoRawFd::into_raw_fd),
+    );
+    let registration = match result {
+        Ok(registration) => registration,
+        Err(error) => {
+            let _ = crate::socket_wire::write_mode(&mut conn, &binary_error(error));
+            return;
+        }
+    };
+    let id = match i64::try_from(registration.r#box) {
+        Ok(id) => id,
+        Err(_) => {
+            let _ = crate::socket_wire::write_mode(
+                &mut conn,
+                &binary_error("allocated box id exceeds engine range".into()),
+            );
+            return;
+        }
+    };
+    if crate::socket_wire::write_mode(
+        &mut conn,
+        &ConnectionMode::Box { registration },
+    ).is_err() {
+        stop_virtio_export(&state, id);
+    } else {
+        let mut bytes = [0u8; 256];
+        loop {
+            match std::io::Read::read(&mut conn, &mut bytes) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    let overlay = lock(&state).overlay.clone();
+    stop_virtio_export(&state, id);
+    if let Some(overlay) = overlay {
+        overlay.remove_box(id);
+    }
+    {
+        let mut shared = lock(&state);
+        if let Some(fd) = shared.box_pids.remove(&id) {
+            unsafe { libc::close(fd); }
+        }
+        shared.box_runpids.remove(&id);
+        if let Some(proxy) = shared.api_proxy.clone() {
+            proxy.disable_box(id);
+        }
+    }
+    if let Ok(r#box) = u64::try_from(id) {
+        broadcast(&state, &crate::generated_wire::SubscriptionEvent::BoxRemoved { r#box });
+    }
+}
+
 fn dispatch(state: &State, msg: &Value) -> Value {
     let t = msg.get("type").and_then(Value::as_str).unwrap_or("");
     match t {
@@ -6384,6 +6500,21 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
     let mut peer_thirdfd: Option<std::os::fd::OwnedFd> = peer_thirdfd_raw
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    // Canonical tv atoms start with the small integer protocol version; JSON
+    // requests start with `{`.  Branch before BufReader so a binary atom is
+    // never line-buffered or interpreted as UTF-8.
+    if first_data_byte(&conn).is_some_and(|byte| byte != b'{') {
+        handle_binary_registration(
+            state,
+            conn,
+            peer_pidfd.take().map(|fd| unsafe {
+                <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+            }),
+            peer_tapfd.take(),
+            peer_thirdfd.take(),
+        );
+        return;
+    }
     let mut reader = BufReader::new(match conn.try_clone() {
         Ok(c) => c,
         Err(_) => {
@@ -8149,6 +8280,29 @@ mod verb_tests {
         assert!(qemu_architecture(RunBackend::Fuse, Some(QemuArchitecture::Aarch64)).is_err());
         assert!(qemu_architecture(RunBackend::Sud, Some(QemuArchitecture::X8664)).is_err());
         assert_eq!(qemu_architecture(RunBackend::Fuse, None).unwrap(), None);
+    }
+
+    #[test]
+    fn binary_lifecycle_endpoint_rejects_non_qemu_requests_in_binary() {
+        use crate::generated_wire::{ActionRequest, ConnectionMode, RequestEnvelope,
+            TransportResponse};
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let state: State = Default::default();
+        let thread = std::thread::spawn(move || {
+            handle_binary_registration(state, server, None, None, None)
+        });
+        crate::socket_wire::write_request(
+            &mut client,
+            &RequestEnvelope::Action(ActionRequest::Ping),
+        ).unwrap();
+        match crate::socket_wire::read_mode(&mut client).unwrap() {
+            ConnectionMode::Reply { response: TransportResponse::Error { message, .. } } => {
+                assert!(message.as_str().contains("requires qemu register"));
+            }
+            other => panic!("unexpected binary lifecycle response: {other:?}"),
+        }
+        drop(client);
+        thread.join().unwrap();
     }
 
     #[test]

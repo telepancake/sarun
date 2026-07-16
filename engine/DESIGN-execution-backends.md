@@ -105,6 +105,8 @@ as executable mappings and mmap that genuinely need a host fd.
 - [ ] Add the host launcher/vhost-user backend and target `/init` control plane.
   - [x] Embedded vhost-user lifecycle serves a scoped `SarunFs` box root on a
         private per-box socket and exits when its frontend disconnects.
+  - [x] QEMU registration uses the generated binary request/reply directly;
+        its architecture and virtio-fs socket never acquire a JSON form.
   - [ ] Launch the paired QEMU appliance and implement the guest `/init`
         control endpoint.
 - [ ] Connect off/host/tap networking to the existing engine policy.
