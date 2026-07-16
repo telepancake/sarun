@@ -85,6 +85,13 @@ impl InodeTable {
         *current = current.saturating_sub(count);
     }
 
+    /// Remove a name from the intern table without invalidating the inode.
+    /// Open or looked-up references may continue using the old inode, while a
+    /// later recreation of the same path receives a fresh identity.
+    pub(crate) fn detach(&self, key: &NodeKey) -> Option<u64> {
+        self.state.write().unwrap().by_key.remove(key)
+    }
+
     pub(crate) fn remap_subtree(&self, box_id: i64, old: &str, new: &str) {
         let prefix = format!("{old}/");
         let mut state = self.state.write().unwrap();
@@ -242,5 +249,18 @@ mod tests {
         assert_eq!(table.key(parent), Some((4, "new".to_owned())));
         assert_eq!(table.key(child), Some((4, "new/dir/file".to_owned())));
         assert_eq!(table.key(other), Some((5, "old/dir/file".to_owned())));
+    }
+
+    #[test]
+    fn detached_name_gets_fresh_identity_when_recreated() {
+        let table = InodeTable::new((0, String::new()));
+        let key = (3, "file".to_owned());
+        let old = table.intern(&key);
+        table.acquire(old, 1);
+        assert_eq!(table.detach(&key), Some(old));
+        assert_eq!(table.key(old), Some(key.clone()));
+        let new = table.intern(&key);
+        assert_ne!(new, old);
+        assert_eq!(table.key(new), Some(key));
     }
 }

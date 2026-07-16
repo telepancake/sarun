@@ -145,6 +145,7 @@ struct Inner {
     lower: PathBuf,
     boxes: RwLock<BTreeMap<i64, Arc<BoxState>>>,
     inodes: crate::sarunfs::InodeTable,
+    detached_attrs: RwLock<HashMap<u64, FileAttr>>,
     fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
     dir_fhs: RwLock<HashMap<u64, Arc<Vec<DirNode>>>>,
     next_fh: AtomicU64,
@@ -559,6 +560,7 @@ impl SarunFs {
             lower,
             boxes: RwLock::new(BTreeMap::new()),
             inodes: crate::sarunfs::InodeTable::new((0, String::new())),
+            detached_attrs: RwLock::new(HashMap::new()),
             fhs: RwLock::new(HashMap::new()),
             dir_fhs: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
@@ -1597,7 +1599,9 @@ impl SarunFs {
             return Ok(self.synth_file_attr(inode));
         }
         let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
-        self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)
+        self.attr_of(&b, inode, &rel)
+            .or_else(|| self.inner.detached_attrs.read().unwrap().get(&inode).copied())
+            .ok_or(Errno::ENOENT)
     }
 
     fn readlink_node(&self, inode: u64) -> Result<Vec<u8>, Errno> {
@@ -2020,6 +2024,8 @@ impl SarunFs {
         if attr.kind == FileType::Directory {
             return Err(Errno::EISDIR);
         }
+        self.inner.inodes.detach(&(box_id, rel.clone()));
+        self.inner.detached_attrs.write().unwrap().insert(inode, attr);
         b.drop_row(&rel);
         b.set_whiteout(&rel, b.writer_for(pid));
         self.push_event(box_id, rel, "unlink");
@@ -2040,6 +2046,8 @@ impl SarunFs {
         if !self.scan_dir(&b, &rel, false).is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
+        self.inner.inodes.detach(&(box_id, rel.clone()));
+        self.inner.detached_attrs.write().unwrap().insert(inode, attr);
         b.drop_row(&rel);
         b.set_whiteout(&rel, b.writer_for(pid));
         self.push_event(box_id, rel, "rmdir");
