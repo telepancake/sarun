@@ -363,6 +363,51 @@ pub struct Highlight {
     pub origin: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DocumentBindingLifetime {
+    Lexical,
+    Escaping,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentBinding {
+    pub domain: RelationValue,
+    pub name: String,
+    pub value: RelationValue,
+    pub lifetime: DocumentBindingLifetime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentStateChange {
+    pub domain: RelationValue,
+    pub name: String,
+    pub value: RelationValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrushDocumentRequest {
+    pub source: String,
+    pub assist: Option<Span>,
+    pub initial_bindings: Vec<DocumentBinding>,
+    pub observations: Vec<ContextObservation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrushDocumentCandidate {
+    pub status: ParseStatus,
+    pub highlights: Vec<Highlight>,
+    pub completions: Vec<Completion>,
+    pub state_changes: Vec<DocumentStateChange>,
+    pub preference: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrushDocumentAnalysis {
+    pub candidates: Vec<BrushDocumentCandidate>,
+    pub context_queries: Vec<ContextQueryNode>,
+    pub dependency_keys: Vec<ContextDependencyKey>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RenderedCommand {
     pub text: String,
@@ -476,6 +521,113 @@ impl Prolog {
             .recv()
             .map_err(|_| "Prolog worker stopped before replying".to_string())??;
         decode_relation_reply(value)
+    }
+
+    /// Analyze shell document text through the installed `sarun_brush`
+    /// relation. Consumers never construct the grammar handle, source term,
+    /// scoped state, observation terms, or wanted projection list.
+    pub fn analyze_brush_document(
+        &self,
+        request: &BrushDocumentRequest,
+    ) -> Result<BrushDocumentAnalysis, String> {
+        if request.source.len() > MAX_INPUT_BYTES {
+            return Err(format!(
+                "Brush document exceeds {MAX_INPUT_BYTES} UTF-8 bytes"
+            ));
+        }
+        if let Some(span) = request.assist {
+            if span.start > span.end
+                || span.end > request.source.len()
+                || !request.source.is_char_boundary(span.start)
+                || !request.source.is_char_boundary(span.end)
+            {
+                return Err("Brush document edit tear is not on UTF-8 boundaries".into());
+            }
+        }
+        let mode = request.assist.map_or_else(
+            || RelationValue::Atom("exact".into()),
+            |span| {
+                relation_compound(
+                    "assist",
+                    vec![
+                        RelationValue::Atom("document_edit".into()),
+                        relation_compound(
+                            "span",
+                            vec![
+                                RelationValue::Integer(span.start as i64),
+                                RelationValue::Integer(span.end as i64),
+                            ],
+                        ),
+                    ],
+                )
+            },
+        );
+        let bindings = request
+            .initial_bindings
+            .iter()
+            .map(document_binding_value)
+            .collect::<Vec<_>>();
+        let initial_state = relation_compound(
+            "local_state",
+            vec![
+                relation_list(vec![relation_compound(
+                    "scope",
+                    vec![
+                        RelationValue::Atom("document_root".into()),
+                        relation_list(bindings),
+                    ],
+                )]),
+                relation_list(vec![]),
+            ],
+        );
+        let observations = request
+            .observations
+            .iter()
+            .map(context_observation_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        let reply = self.transform(&RelationRequest {
+            grammar: brush_grammar_handle(),
+            given: vec![
+                RelationBinding {
+                    name: "source".into(),
+                    value: relation_compound(
+                        "text_source",
+                        vec![
+                            RelationValue::String(request.source.clone()),
+                            mode,
+                            RelationValue::Atom("document".into()),
+                        ],
+                    ),
+                },
+                RelationBinding {
+                    name: "initial_state".into(),
+                    value: initial_state,
+                },
+            ],
+            wanted: vec![
+                "status".into(),
+                "highlights".into(),
+                "completions".into(),
+                "delta".into(),
+            ],
+            observations,
+            limits: RelationLimits::default(),
+        })?;
+        reject_relation_diagnostics(&reply)?;
+        let candidates = reply
+            .solutions
+            .iter()
+            .map(decode_brush_document_candidate)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(BrushDocumentAnalysis {
+            candidates,
+            context_queries: decode_context_graph_values(&reply.context_queries)?,
+            dependency_keys: reply
+                .dependency_keys
+                .iter()
+                .map(|value| decode_context_dependency_key(&parsed_relation_value(value)))
+                .collect::<Result<_, _>>()?,
+        })
     }
 
     pub fn complete(
@@ -1521,7 +1673,6 @@ fn action_grammar_handle() -> RelationValue {
     )
 }
 
-#[cfg(test)]
 fn brush_grammar_handle() -> RelationValue {
     relation_compound(
         "grammar_handle",
@@ -1956,6 +2107,66 @@ fn decode_relation_parse_solution(solution: &RelationSolution) -> Result<ParseCa
     })
 }
 
+fn decode_parse_status(value: &RelationValue) -> Result<ParseStatus, String> {
+    match value {
+        RelationValue::Atom(value) if value == "complete" => Ok(ParseStatus::Complete),
+        RelationValue::Compound(name, values) if name == "incomplete" && values.len() == 1 => {
+            match &values[0] {
+                RelationValue::Compound(edit, id) if edit == "edit" && id.len() == 1 => {
+                    let RelationValue::Atom(id) = &id[0] else {
+                        return Err("relation returned invalid edit status".into());
+                    };
+                    Ok(ParseStatus::Incomplete {
+                        edit_id: id.clone(),
+                    })
+                }
+                _ => Err("relation returned invalid incomplete status".into()),
+            }
+        }
+        _ => Err("relation returned invalid parse status".into()),
+    }
+}
+
+fn decode_brush_document_candidate(
+    solution: &RelationSolution,
+) -> Result<BrushDocumentCandidate, String> {
+    Ok(BrushDocumentCandidate {
+        status: decode_parse_status(solution_binding(solution, "status")?)?,
+        highlights: decode_highlights_value(solution_binding(solution, "highlights")?)?,
+        completions: decode_completions_value(solution_binding(solution, "completions")?)?,
+        state_changes: decode_document_state_changes(solution_binding(solution, "delta")?)?,
+        preference: solution.preference,
+    })
+}
+
+fn decode_document_state_changes(
+    value: &RelationValue,
+) -> Result<Vec<DocumentStateChange>, String> {
+    let RelationValue::List(changes) = value else {
+        return Err("relation returned non-list document state changes".into());
+    };
+    changes
+        .iter()
+        .map(|change| {
+            let RelationValue::Compound(name, fields) = change else {
+                return Err("relation returned invalid document state change".into());
+            };
+            if name != "state_change" || fields.len() != 3 {
+                return Err("relation returned invalid document state change".into());
+            }
+            let name = match &fields[1] {
+                RelationValue::String(name) | RelationValue::Atom(name) => name.clone(),
+                _ => return Err("relation returned invalid document state change name".into()),
+            };
+            Ok(DocumentStateChange {
+                domain: fields[0].clone(),
+                name,
+                value: fields[2].clone(),
+            })
+        })
+        .collect()
+}
+
 fn context_query_value(query: &ContextQuery) -> RelationValue {
     let cardinality = match query.cardinality {
         ContextCardinality::Empty => "empty",
@@ -2031,6 +2242,22 @@ fn context_observation_value(observation: &ContextObservation) -> Result<Relatio
             outcome,
         ],
     ))
+}
+
+fn document_binding_value(binding: &DocumentBinding) -> RelationValue {
+    let lifetime = match binding.lifetime {
+        DocumentBindingLifetime::Lexical => "lexical",
+        DocumentBindingLifetime::Escaping => "escaping",
+    };
+    relation_compound(
+        "local_binding",
+        vec![
+            binding.domain.clone(),
+            RelationValue::String(binding.name.clone()),
+            binding.value.clone(),
+            RelationValue::Atom(lifetime.into()),
+        ],
+    )
 }
 
 fn context_graph_value(graph: &[ContextQueryNode]) -> Result<RelationValue, String> {
@@ -2416,6 +2643,12 @@ pub fn global() -> Result<&'static Prolog, String> {
         .get_or_init(Prolog::new)
         .as_ref()
         .map_err(Clone::clone)
+}
+
+pub fn analyze_brush_document(
+    request: &BrushDocumentRequest,
+) -> Result<BrushDocumentAnalysis, String> {
+    global()?.analyze_brush_document(request)
 }
 
 pub(crate) fn ensure_linked() {
@@ -2815,6 +3048,66 @@ mod tests {
                 ],
             )])
         );
+    }
+
+    #[test]
+    fn production_brush_document_api_returns_combined_analysis() {
+        let analysis = analyze_brush_document(&BrushDocumentRequest {
+            source: "x=123; echo $x".into(),
+            assist: None,
+            initial_bindings: vec![],
+            observations: vec![],
+        })
+        .unwrap();
+        assert!(analysis.context_queries.is_empty());
+        assert!(analysis.dependency_keys.is_empty());
+        assert_eq!(analysis.candidates.len(), 1);
+        let candidate = &analysis.candidates[0];
+        assert_eq!(candidate.status, ParseStatus::Complete);
+        assert!(candidate.completions.is_empty());
+        assert!(candidate.highlights.iter().any(|highlight| {
+            highlight.span == Span { start: 12, end: 13 }
+                && highlight.syntax == "variable"
+        }));
+        assert_eq!(
+            candidate.state_changes,
+            vec![DocumentStateChange {
+                domain: rv_atom("shell_variable"),
+                name: "x".into(),
+                value: rv_compound("shell_text", vec![rv_string("123")]),
+            }]
+        );
+
+        let assist = analyze_brush_document(&BrushDocumentRequest {
+            source: "echo hi)".into(),
+            assist: Some(Span { start: 0, end: 0 }),
+            initial_bindings: vec![],
+            observations: vec![],
+        })
+        .unwrap();
+        assert_eq!(assist.candidates.len(), 1);
+        assert_eq!(
+            assist.candidates[0].status,
+            ParseStatus::Incomplete {
+                edit_id: "document_edit".into(),
+            }
+        );
+        assert!(assist.candidates[0]
+            .completions
+            .iter()
+            .any(|completion| completion.insert == "$("));
+    }
+
+    #[test]
+    fn production_brush_document_api_rejects_split_utf8_tear() {
+        let error = analyze_brush_document(&BrushDocumentRequest {
+            source: "λ".into(),
+            assist: Some(Span { start: 1, end: 1 }),
+            initial_bindings: vec![],
+            observations: vec![],
+        })
+        .unwrap_err();
+        assert!(error.contains("UTF-8 boundaries"));
     }
 
     #[test]

@@ -79,12 +79,16 @@ replacement spans, cursor tears, and diagnostics.
 
 ### 1. Production document-analysis API
 
-- [ ] Promote the `sarun_brush` grammar handle from a test helper to a
+- [x] Promote the `sarun_brush` grammar handle from a test helper to a
       production document-analysis client.
-- [ ] Add closed Rust request/result types for exact and assist analysis; keep
-      generic relation values behind this adapter.
-- [ ] Decode highlights, completions, status, queries, dependencies, state, and
-      delta from one transformation reply.
+- [x] Add owned Rust request/result types for exact and assist analysis; hide
+      the grammar handle, source terms, scoped-state terms, observation terms,
+      and wanted projections behind this adapter.
+- [x] Decode highlights, completions, status, queries, dependencies, and delta
+      from one transformation reply while preserving ambiguous candidates.
+- [ ] Extend that same result with the syntax AST and final state; keep domain
+      and semantic values typed without exposing Prolog term construction to
+      consumers.
 - [ ] Add generic hint, indentation, and precise invalid/incomplete diagnostic
       projections to the grammar engine; do not synthesize them in the editor.
 - [ ] Add exact/assist, UTF-8, local-state, successful observation, failed
@@ -146,6 +150,19 @@ replacement spans, cursor tears, and diagnostics.
       regions through grammar composition rather than language-name branches.
 
 ## Acceptance gate
+
+The defining bidirectional completion case is:
+
+```sh
+A=""; find . -type $A
+```
+
+With the cursor tear inside `A="|"`, ordinary whole-document parsing must use
+the later `find -type $A` occurrence to constrain the earlier assignment and
+offer the valid `find -type` values (for example `f`, `d`, and `l`). This is not
+an editor heuristic, a forward-only shell completion pass, or a `find` branch
+in Rust: it is a completion projection from the same relation that parses the
+document and relates the assignment, expansion, command signature, and tear.
 
 Native aarch64 PTY tests must start standalone `sarun brush`, invoke `edit` as
 a real foreground builtin, edit and save a UTF-8 shell file, and prove:
