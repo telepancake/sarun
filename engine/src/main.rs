@@ -34,6 +34,7 @@ mod find_builtin;
 mod xargs_builtin;
 // Dockerfile/Containerfile parser for `sarun oci build` / `oci run`. Lands
 // ahead of its consumer (the build driver), so allow the not-yet-used items.
+mod action_bridge;
 mod attach;
 mod browser;
 #[allow(dead_code)]

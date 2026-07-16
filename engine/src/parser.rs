@@ -279,7 +279,7 @@ pub fn parse(input: &str, context: &dyn ContextProvider) -> ParseResult {
     let Some(resolved) = resolved else {
         return ParseResult::Unknown(input.to_string());
     };
-    match invocation_from_prolog(prolog, resolved.command, resolved.observations) {
+    match invocation_from_command(resolved.command, resolved.observations) {
         Ok(invocation) => ParseResult::Invocation(invocation),
         Err(error) => ParseResult::BackendError(error),
     }
@@ -375,8 +375,7 @@ fn execute_context_graph(
     Ok(Some(observations))
 }
 
-fn invocation_from_prolog(
-    prolog: &crate::prolog::Prolog,
+fn invocation_from_command(
     command: crate::prolog::CommandAst,
     context: Vec<crate::prolog::ContextObservation>,
 ) -> Result<Invocation, String> {
@@ -430,18 +429,10 @@ fn invocation_from_prolog(
     };
     let payload = match target {
         ActionTarget::UiVerb | ActionTarget::ControlMessage => {
-            let request = prolog
-                .action_request(&command)
-                .map_err(|error| match error {
-                    crate::prolog::QueryError::NoSolution => format!(
-                        "relation produced no concrete request for wire action {}",
-                        command.action
-                    ),
-                    crate::prolog::QueryError::Backend(error) => error,
-                })?;
+            let request = crate::action_bridge::materialize(&command)?;
             if request.handler() != command.handler {
                 return Err(format!(
-                    "relation request handler {} disagrees with parsed handler {}",
+                    "wire request handler {} disagrees with parsed handler {}",
                     request.handler(),
                     command.handler
                 ));

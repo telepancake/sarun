@@ -209,8 +209,13 @@ grammar relates bytes to a distinct `WireAst`. Neither grammar imports or
 names the other. The client supplies an immutable glue relation
 `TextAst <-> WireAst` and installs a composed handle. Structural identity is
 ordinary unification; renamed, defaulted, gathered, or semantically different
-fields are explicit bridge data. The engine owns only generic composition and
-must not acquire action-, packet-, or language-specific AST adaptation.
+fields are explicit client bridge data. A client may first attempt a bounded
+typed structural conversion in Rust when the ASTs line up, or install an
+immutable glue relation when the mapping is relational or semantic. In both
+cases the conversion belongs to the client: the engine must not acquire
+action-, packet-, or language-specific AST adaptation, and the destination
+grammar/generated type remains the authority that accepts or rejects the
+resulting shape.
 
 Context dependencies follow the representation that introduces them. A text
 name can emit and resolve a context query into a semantic identity before the
@@ -247,10 +252,8 @@ constrain foreign-grammar enumeration, and a
 tear completion is aggregated from ordinary parse evidence through the same
 request. The output-byte limit is validated at the Prolog envelope and bounded
 by the Rust decoder using the request-specific ceiling; oversized or zero
-limits fail before entering Prolog. Only action-request materialization still
-uses the old action-specific `Operation`/`application/3` path; all parsing and
-metadata projection has moved to the generic envelope and that final adapter
-must follow.
+limits fail before entering Prolog. The former action-request operation has
+now also been removed; all calls into SWI use the generic structured envelope.
 The foreign grammar now also declares contextual fields with an explicit
 `empty`/`one`/`all` exact cardinality. Exact and torn source transformations
 return stable query nodes; resubmitted observations produce completion matches
@@ -271,8 +274,8 @@ terms, lists, and relational list concatenation; the latter proves that
 sarun's resume/pause projection can append and remove its fixed boolean through
 the same declaration. Foreign tests parse and render through nested
 choice/projection/sequence values. The action catalog is now materialized as
-this immutable value; the duplicate legacy action predicates and their
-remaining request operation surface are the next deletion target.
+this immutable value; duplicate legacy parsing predicates remain a deletion
+target, while the request operation surface is gone.
 Terminals can now contain engine-interpreted codec data rather than a terminal
 predicate. `grammar_codec.pl` implements finite enumerations, typed integer and
 text wrappers, codec choice, and a closed relational JSON shape vocabulary
@@ -280,15 +283,14 @@ text wrappers, codec choice, and a closed relational JSON shape vocabulary
 test parses reordered JSON fields into a typed compound and renders canonical
 compact JSON from the same declaration. The current OCI and API action
 arguments are expressed with these codecs in the installed action grammar.
-Their older duplicate parsing predicates remain to be deleted after the
-action-request projection crosses the boundary.
+Their older duplicate parsing predicates remain to be deleted.
 `action_grammar:action_relation_grammar/1` now materializes all 108 actions as
 one immutable `choice_grammar` value. Every branch contains its mechanically
 derived command words, source schema, declarative terminal codecs, context
 descriptors, action preference, and a bidirectional template for the normalized
-`command(Action, Handler, Target, WireArguments)` representation. Generic
+`command(Action, Handler, Target, CommandArguments)` text-AST representation. Generic
 transformation tests parse and render `mirror_resume`, including its fixed
-false wire argument, without the terminal callback or action operation table.
+false normalized argument, without the terminal callback or action operation table.
 The complete value is installed once behind the opaque `sarun_actions` handle
 and production Rust consumes it without transporting or inspecting its tree.
 Generic context staging now resolves successful `one` observations into the
@@ -299,7 +301,7 @@ composition namespaces both node identities and nested `ref/1` terms, so the
 graph remains valid outside a branch and routes back inside without client
 inspection. Completion preferences from every successful choice branch are
 merged and reranked globally. Action-level tests cover the reported `kill C1`
-flow, its typed wire-ready result, a two-stage box/path dependency, and context
+flow, its typed command-AST result, a two-stage box/path dependency, and context
 completion returned from the ordinary torn parse.
 `grammar_store.pl` now provides install-once immutable grammar handles. The
 embedded startup composition materializes the complete action value once and
@@ -307,8 +309,7 @@ installs it as `grammar_handle(sarun_actions)`; `relation_api` resolves handles
 generically and has no action-name branch. Reinstalling the identical value is
 idempotent, changing a handle fails, and missing handles fail closed. A native
 aarch64 structured-FLI test renders an action through the installed handle, so
-Rust neither transports nor inspects the grammar tree. Only the closed
-action-request adapter still calls the old operation path.
+Rust neither transports nor inspects the grammar tree.
 Production Rust parsing, rendering, literal completion, and highlighting now
 use `grammar_handle(sarun_actions)` through `RelationRequest` and the recursive
 structured FLI. Input units, typed commands, and retained parse evidence are
@@ -330,8 +331,7 @@ and binding adapter have been deleted. Action metadata is now constant
 projection data on the same alternatives: all help and target-filtered help
 vary only their given bindings, and substring filtering is a generic pure
 projection template. The old help predicate, operation cases, and textual
-decoder have been deleted. Action-request materialization is the one remaining
-old operation.
+decoder have been deleted.
 
 Generic relation composition now separates representation grammars at the
 engine boundary. `compose_grammar(Left, SharedBindings, Right)` joins two
@@ -340,9 +340,23 @@ immutable relations through explicitly named AST bindings in either direction;
 context queries and dependency keys are namespaced as `left`/`right`, while a
 successful observation binds the originating AST before the bridge runs.
 Foreign tests prove both `source <-> TextAst <-> WireAst` and contextual-name
-resolution before `TextAst <-> WireAst`, without sarun grammar imports. The
-next checkpoint must express sarun's command-to-request adaptation as its own
-immutable bridge and compose it with an independent wire-AST relation.
+resolution before `TextAst <-> WireAst`, without sarun grammar imports.
+
+Sarun now owns command-to-request adaptation in `action_bridge.rs`, outside
+the text grammar, grammar engine, and generated binary codec. It attempts only
+bounded structural option/list/record adaptation plus explicit client-owned
+reshapes for the few intentionally different ASTs; the generated closed
+`ActionRequest::from_relation` implementation is the accepting authority and
+requires exactly one result. The old Prolog `action_request/2`, generic
+`application/3` dispatch table, Rust operation variant, textual command
+encoder, textual response parser, misleading `Prolog::action_request` facade,
+and their obsolete tests have been deleted. The parser invokes the client
+bridge directly after the text relation returns its AST.
+Bridge tests cover optional and repeated fields, `ro_attach`, `view.open`, and
+type-confusion rejection. The full static aarch64 suite passes (321 passed,
+one ignored browser integration test). A bridge that needs genuinely
+relational or context-bearing adaptation must be installed as glue grammar
+data and composed through `compose_grammar/3`, not added to the engine.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:
@@ -386,10 +400,10 @@ Immediate extraction order:
       projection into the grammar-independent engine rather than action
       grammar helpers; prove span rejection, ambiguity retention, ranking, and
       paint projection with the foreign grammar test.
-- [ ] Replace operation-specific and action-specific Rust term decoders with a
+- [x] Replace operation-specific and action-specific Rust term decoders with a
       bounded generic transformation envelope plus generated typed projections
       at application boundaries.
-- [ ] Replace `action_grammar:application/3` and its dispatch table with the
+- [x] Replace `action_grammar:application/3` and its dispatch table with the
       single generic transformation entry point; make context queries and
       evidence ordinary reply data.
 - [x] Drive a foreign grammar and then sarun actions through that same boundary,
@@ -442,9 +456,11 @@ Exact predicate names can evolve while implementing, but the model must cover:
   supplying `false` to the shared `mirror_pause` wire handler;
 - `context`: pane/gate predicates for key and menu actions.
 
-One normalized command result must carry enough information for Rust to
-dispatch without looking up semantic metadata elsewhere: action identity,
-handler identity, target, and typed wire-ready arguments.
+One normalized text-AST result must carry enough information for client glue
+to select the destination representation without another semantic registry:
+action identity, handler identity, target, and typed command arguments. It is
+not itself a binary-layout AST; the sarun bridge and generated closed wire type
+own that boundary explicitly.
 
 Typed values initially required by the UI surface:
 
@@ -601,8 +617,8 @@ belong to the relation.
 - [x] Replace `CommandArg::JobId` with generic typed values including arrays.
 - [x] Add neutral source-token semantics; remove Rust `grammar_unit` command
       classification.
-- [ ] Make the application operation vocabulary extensible by grammar/domain,
-      rather than hard-coding a mirror-command-only Rust API.
+- [x] Replace the application operation vocabulary with one generic bounded
+      relation transformation envelope.
 - [x] Preserve the closed callable surface, request/output bounds, dedicated
       worker thread, inference limits, exception handling, and cleanup tests.
 - [ ] Add catalog/representation query decoding for help, bindings, menus, and
@@ -641,7 +657,7 @@ belong to the relation.
 - [x] Add initial contextual domains for box identifiers and box-relative paths;
       structural plans now carry `query/2` nodes plus explicit AST
       `bind(QueryId,arg(Index),entry_value)` flows.
-- [x] Resolve successful `one` observations into wire-ready command arguments,
+- [x] Resolve successful `one` observations into typed command-AST arguments,
       derive `all`/`prefix` queries for contextual completion, and derive path
       queries containing `ref/1` dependencies on earlier box arguments.
 - [x] Execute dependent completion graphs in readiness order and return all
@@ -801,7 +817,7 @@ belong to the relation.
   the bounded embedded FFI, including aarch64-native boundary tests.
 - Made command parsing execute the relation-emitted query graph in dependency
   order through an explicit provider, retain the exact observations, and feed
-  them back into the relation for wire-ready resolution. The UI box provider
+  them back into the relation for typed command-AST resolution. The UI box provider
   supplies revision-tagged identities, names, display paths, and typed values.
 - Made contextual completion execute the relation's explicit `all` query and
   feed the observation back into Prolog, which selects matching entry names

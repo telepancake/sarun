@@ -25,9 +25,7 @@
             highlights/2,
             render/2,
             catalog/2,
-            action_request/2,
-            action_relation_grammar/1,
-            application/3
+            action_relation_grammar/1
           ]).
 
 :- use_module(action_catalog).
@@ -39,7 +37,7 @@
 
 The grammar consumes neutral lexer evidence. Rust supplies UTF-8 byte spans and
 source surfaces; it does not classify command names or arguments. This module
-relates those surfaces to canonical actions, typed wire values, syntax,
+relates those surfaces to canonical actions, typed command values, syntax,
 descriptions, completions, and rendered forms using the sole action definition
 in `action_catalog.pl`.
 
@@ -49,9 +47,10 @@ command grammar. `edit_tear/3` marks the one source range completion may
 replace. `source_tear/3` remains an explicit unrecognized hole and is never
 silently repaired.
 
-The normalized result is
-`command(Action, Handler, Target, WireArguments)`. Rust therefore receives a
-dispatch-ready value without consulting another registry.
+The normalized text AST is
+`command(Action, Handler, Target, CommandArguments)`. It contains no binary
+layout knowledge. Sarun-owned glue may structurally adapt it to the independent
+generated wire AST, whose closed decoder validates the destination shape.
 */
 
 valid_action(Action) :-
@@ -163,7 +162,7 @@ valid_shape(repeated, spread).
 %! action_form(?Action, ?Specs, ?Projection) is nondet.
 %
 % A form is a sequence of `literal/5` and `argument/1` specs. Projections
-% relate source-form arguments to the handler's typed wire arguments. There is
+% relate source-form arguments to normalized command-AST arguments. There is
 % exactly one textual form per action: its words are mechanically decoded from
 % its sole identifier rather than declared as additional names.
 
@@ -380,242 +379,6 @@ convert(FromKind, From, ToKind, To) :-
     representation(Action, FromKind, From),
     representation(Action, ToKind, To).
 
-%! action_request(+Command, -Request) is semidet.
-%
-% Relate a fully parsed and context-resolved command to its concrete binary
-% request representation. The result is positional because field names are
-% schema metadata and are not bytes on the wire. Rust only materializes this
-% already-typed value as the generated enum variant; it does not reinterpret
-% parser kinds or cardinalities.
-
-action_request(command(_Action, Handler, Target, Arguments),
-               action_request(Handler, Code, Values)) :-
-    wire_target(Target),
-    wire_handler(Handler, Code, _ResultType),
-    \+ action_catalog:wire_request_override(Handler, _),
-    argument_schema(Handler, Schema),
-    wire_request_fields(Handler, Fields),
-    request_field_values(Schema, Fields, Arguments, Values).
-action_request(command(_Action, ro_attach, Target,
-                       [BoxSource|AttachmentSources]),
-               action_request(ro_attach, Code, [Box, Attachments])) :-
-    wire_target(Target),
-    wire_handler(ro_attach, Code, _),
-    wire_source_value(box_id, BoxSource, Box),
-    readonly_attachment_sources(AttachmentSources, Attachments).
-action_request(command(_Action, 'view.open', Target, Arguments),
-               action_request('view.open', Code,
-                              [Kind, Box, Filter, RunningOnly])) :-
-    wire_target(Target),
-    wire_handler('view.open', Code, _),
-    view_open_sources(Arguments, Kind, Box, Filter, RunningOnly).
-action_request(command(_Action, 'view.filter', Target,
-                       [ViewSource, FilterSource]),
-               action_request('view.filter', Code, [View, Filter])) :-
-    wire_target(Target),
-    wire_handler('view.filter', Code, _),
-    wire_source_value(view_id, ViewSource, View),
-    filter_source_value(FilterSource, Filter).
-action_request(command(_Action, 'oci.build', Target,
-                       [oci_spec(Context, Dockerfile, TagSource, NetSource,
-                                 BuildArgumentSources)]),
-               action_request('oci.build', Code,
-                              [record(ContextBytes, Dockerfile, Tag, Net,
-                                      BuildArguments)])) :-
-    wire_target(Target),
-    wire_handler('oci.build', Code, _),
-    wire_source_value(bytes(blob_bytes), base64(Context), ContextBytes),
-    bounded_source_text(blob_bytes, Dockerfile),
-    optional_source_text(TagSource, Tag),
-    wire_source_value(net_mode, string(NetSource), Net),
-    build_argument_values(BuildArgumentSources, BuildArguments).
-action_request(command(_Action, 'oaita.probe', Target,
-                       [api_spec(BaseUrl, Model, ApiKey)]),
-               action_request('oaita.probe', Code,
-                              [record(BaseUrl, Model, ApiKey)])) :-
-    wire_target(Target),
-    wire_handler('oaita.probe', Code, _),
-    bounded_source_text(text_bytes, BaseUrl),
-    bounded_source_text(text_bytes, Model),
-    bounded_source_text(text_bytes, ApiKey).
-
-wire_target(ui).
-wire_target(control).
-
-readonly_attachment_sources([], []).
-readonly_attachment_sources([Source|Sources], [box(Box)|Attachments]) :-
-    wire_source_value(box_id, Source, Box),
-    readonly_attachment_sources(Sources, Attachments).
-
-optional_source_text(none, none).
-optional_source_text(some(Value), some(Value)) :-
-    bounded_source_text(text_bytes, Value).
-
-build_argument_values(Sources, Values) :-
-    wire_limit(environment_entries, Maximum),
-    length(Sources, Count),
-    Count =< Maximum,
-    build_argument_values(Sources, [], Values).
-
-build_argument_values([], _, []).
-build_argument_values([pair(Key, Value)|Sources], Seen,
-                      [pair(Key, Value)|Values]) :-
-    bounded_source_text(text_bytes, Key),
-    bounded_source_text(text_bytes, Value),
-    text_key_absent(Key, Seen),
-    build_argument_values(Sources, [Key|Seen], Values).
-
-text_key_absent(_, []).
-text_key_absent(Key, [Seen|Keys]) :-
-    Key \= Seen,
-    text_key_absent(Key, Keys).
-
-view_open_sources([KindSource, BoxSource], Kind, Box, none, true) :-
-    wire_source_value(view_kind, KindSource, Kind),
-    wire_source_value(box_id, BoxSource, Box).
-view_open_sources([KindSource, BoxSource, Third], Kind, Box, Filter,
-                  RunningOnly) :-
-    wire_source_value(view_kind, KindSource, Kind),
-    wire_source_value(box_id, BoxSource, Box),
-    ( filter_source_value(Third, Filter), RunningOnly = true
-    ; wire_source_value(bool, Third, RunningOnly), Filter = none
-    ).
-view_open_sources([KindSource, BoxSource, FilterSource, RunningSource],
-                  Kind, Box, Filter, RunningOnly) :-
-    wire_source_value(view_kind, KindSource, Kind),
-    wire_source_value(box_id, BoxSource, Box),
-    filter_source_value(FilterSource, Filter),
-    wire_source_value(bool, RunningSource, RunningOnly).
-
-% The command-text filter representation is deliberately small and typed:
-% `none` disables filtering; `KIND:PATTERN` is one enabled conjunctive clause.
-% UI code constructs the same closed filter_spec record directly and does not
-% send this textual spelling over the Rust-to-Rust socket.
-filter_source_value(string("none"), none) :- !.
-filter_source_value(string(""), none) :- !.
-filter_source_value(string(Text), some([record(Kind, Pattern, and,
-                                             false, true)])) :-
-    sub_string(Text, Before, 1, After, ":"),
-    sub_string(Text, 0, Before, _, KindText),
-    PatternStart is Before + 1,
-    sub_string(Text, PatternStart, After, 0, Pattern),
-    wire_source_value(filter_kind, string(KindText), Kind),
-    bounded_source_text(text_bytes, Pattern).
-
-request_field_values([], [], [], []).
-request_field_values(
-    [arg(Name, _Kind, required, scalar)|Schema],
-    [field(Name, Type)|Fields], [Argument|Arguments], [Value|Values]) :-
-    wire_source_value(Type, Argument, Value),
-    request_field_values(Schema, Fields, Arguments, Values).
-request_field_values(
-    [arg(Name, _Kind, optional, scalar)|Schema],
-    [field(Name, option(Type))|Fields], [Argument|Arguments],
-    [some(Value)|Values]) :-
-    wire_source_value(Type, Argument, Value),
-    request_field_values(Schema, Fields, Arguments, Values).
-request_field_values(
-    [arg(Name, _Kind, optional, scalar)|Schema],
-    [field(Name, option(_Type))|Fields], Arguments, [none|Values]) :-
-    request_field_values(Schema, Fields, Arguments, Values).
-request_field_values(
-    [arg(Name, _Kind, repeated, array)|Schema],
-    [field(Name, list(Type, Limit))|Fields],
-    [array(Arguments0)|Arguments], [List|Values]) :-
-    wire_source_list(Type, Limit, Arguments0, List),
-    request_field_values(Schema, Fields, Arguments, Values).
-request_field_values(
-    [arg(Name, _Kind, repeated, array)|Schema],
-    [field(Name, list(_Type, _Limit))|Fields], Arguments, [[]|Values]) :-
-    request_field_values(Schema, Fields, Arguments, Values).
-request_field_values(
-    [arg(Name, _Kind, repeated, spread)],
-    [field(Name, list(Type, Limit))], Arguments, [List]) :-
-    wire_source_list(Type, Limit, Arguments, List).
-
-wire_source_list(Type, Limit, Arguments, Values) :-
-    wire_limit(Limit, Maximum),
-    length(Arguments, Count),
-    Count =< Maximum,
-    wire_source_values(Type, Arguments, Values).
-
-wire_source_values(_, [], []).
-wire_source_values(Type, [Argument|Arguments], [Value|Values]) :-
-    wire_source_value(Type, Argument, Value),
-    wire_source_values(Type, Arguments, Values).
-
-wire_source_value(Type, Source, Value) :-
-    wire_type(Type, alias(Alias)),
-    !,
-    wire_source_value(Alias, Source, Value).
-wire_source_value(u16, integer(Value), Value) :-
-    integer(Value), Value >= 0, Value =< 65535.
-wire_source_value(u32, integer(Value), Value) :-
-    integer(Value), Value >= 0, Value =< 4294967295.
-wire_source_value(u64, integer(Value), Value) :-
-    integer(Value), Value >= 0.
-wire_source_value(s32, integer(Value), Value) :-
-    integer(Value), Value >= -2147483648, Value =< 2147483647.
-wire_source_value(s64, integer(Value), Value) :- integer(Value).
-wire_source_value(bool, boolean(Value), Value) :-
-    ( Value = true ; Value = false ).
-wire_source_value(text(Limit), string(Value), Value) :-
-    bounded_source_text(Limit, Value).
-wire_source_value(bytes(Limit), path(Value), Value) :-
-    bounded_source_text(Limit, Value).
-wire_source_value(bytes(Limit), base64(Value), base64(Value)) :-
-    base64_decoded_bytes(Value, Bytes),
-    wire_limit(Limit, Maximum),
-    Bytes =< Maximum.
-wire_source_value(Type, string(Text), Case) :-
-    wire_type(Type, enum),
-    atom_string(Case, Text),
-    wire_enum(Type, Case, _).
-
-bounded_source_text(Limit, Value) :-
-    string(Value),
-    wire_limit(Limit, Maximum),
-    string_bytes(Value, Bytes),
-    Bytes =< Maximum.
-
-base64_decoded_bytes(Value, Bytes) :-
-    string(Value),
-    string_codes(Value, Codes),
-    base64_codes_bytes(Codes, Bytes).
-
-base64_codes_bytes([], 0).
-base64_codes_bytes([A, B, 61, 61], 1) :-
-    base64_code(A), base64_code(B), !.
-base64_codes_bytes([A, B, C, 61], 2) :-
-    base64_code(A), base64_code(B), base64_code(C), !.
-base64_codes_bytes([A, B, C, D|Codes], Bytes) :-
-    base64_code(A), base64_code(B), base64_code(C), base64_code(D),
-    base64_codes_bytes(Codes, Rest),
-    Bytes is Rest + 3.
-
-base64_code(Code) :- Code >= 0'A, Code =< 0'Z, !.
-base64_code(Code) :- Code >= 0'a, Code =< 0'z, !.
-base64_code(Code) :- Code >= 0'0, Code =< 0'9, !.
-base64_code(0'+).
-base64_code(0'/).
-
-% SWI's string_length/2 counts Unicode code points. Wire text and byte bounds
-% are byte bounds, so measure the canonical UTF-8 representation explicitly.
-string_bytes(Value, Bytes) :-
-    string_codes(Value, Codes),
-    utf8_codes_bytes(Codes, 0, Bytes).
-
-utf8_codes_bytes([], Bytes, Bytes).
-utf8_codes_bytes([Code|Codes], Bytes0, Bytes) :-
-    utf8_code_bytes(Code, Width),
-    Bytes1 is Bytes0 + Width,
-    utf8_codes_bytes(Codes, Bytes1, Bytes).
-
-utf8_code_bytes(Code, 1) :- Code >= 0, Code =< 127, !.
-utf8_code_bytes(Code, 2) :- Code =< 2047, !.
-utf8_code_bytes(Code, 3) :- Code =< 65535, !.
-utf8_code_bytes(Code, 4) :- Code =< 1114111.
-
 %! parse(+Items, -Result) is nondet.
 
 parse(Items, Result) :-
@@ -651,7 +414,7 @@ denormalize_args(resume_false, WireArgs, Args) :-
 text(Text) :- string(Text), !.
 text(Text) :- atom(Text).
 
-% Keep the embedded application core-only. SWI's boot image provides append/1
+% Keep the embedded grammar core-only. SWI's boot image provides append/1
 % but not library(lists)' append/3.
 append([], Tail, Tail).
 append([Head|Items], Tail, [Head|Result]) :-
@@ -1016,38 +779,3 @@ catalog(Visibility, Rows) :-
 visibility_matches(all, _).
 visibility_matches(visible, visible).
 visibility_matches(internal, internal).
-
-%! application(+Operation, +InputString, -OutputString) is det.
-
-application(Operation, InputString, OutputString) :-
-    ( atom(Operation)
-    -> application_atom(Operation, InputString, Response)
-    ;  Response = error(invalid_operation)
-    ),
-    term_string(Response, OutputString,
-                [quoted(true), ignore_ops(true), numbervars(true)]).
-
-application_atom(Operation, InputString, Response) :-
-    ( decode_request(InputString, Request)
-    -> dispatch_application(Operation, Request, Response)
-    ;  Response = error(invalid_request)
-    ).
-
-decode_request(InputString, Request) :-
-    string(InputString),
-    catch(term_string(Request, InputString, [syntax_errors(error)]), _, fail),
-    ground(Request).
-
-dispatch_application(catalog, request(Visibility), ok(Rows)) :-
-    !, catalog(Visibility, Rows).
-dispatch_application(convert, request(FromKind, From, ToKind), ok(Results)) :-
-    !, findall(To, convert(FromKind, From, ToKind, To), Results).
-dispatch_application(action_request, request(Command), Response) :-
-    !, ( action_request(Command, Request)
-       -> Response = ok(Request)
-       ;  Response = error(no_solution)
-       ).
-dispatch_application(catalog, _, error(invalid_request)) :- !.
-dispatch_application(convert, _, error(invalid_request)) :- !.
-dispatch_application(action_request, _, error(invalid_request)) :- !.
-dispatch_application(_, _, error(invalid_operation)).

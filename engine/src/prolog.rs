@@ -11,7 +11,6 @@ static ACTIVE: AtomicU8 = AtomicU8::new(INACTIVE);
 const INACTIVE: u8 = 0;
 const RUNNING: u8 = 1;
 const POISONED: u8 = 2;
-const QUERY_INFERENCES: i64 = 100_000;
 const LOAD_INFERENCES: i64 = 5_000_000;
 const MAX_INPUT_BYTES: usize = 16 * 1024;
 const MAX_ITEMS: usize = 256;
@@ -369,21 +368,7 @@ pub struct RenderedCommand {
     pub text: String,
 }
 
-#[derive(Clone, Copy)]
-enum Operation {
-    ActionRequest,
-}
-
-impl Operation {
-    fn atom(self) -> &'static str {
-        match self {
-            Self::ActionRequest => "action_request",
-        }
-    }
-}
-
 enum Command {
-    Application(Operation, String, Sender<Result<String, String>>),
     Transform(RelationValue, usize, Sender<Result<RelationValue, String>>),
     Shutdown(Sender<Result<(), String>>),
     #[cfg(test)]
@@ -392,9 +377,9 @@ enum Command {
 
 /// A process-global SWI-Prolog runtime whose FFI calls stay on one thread.
 ///
-/// The public query surface is limited to typed operations over the embedded
-/// action grammar. Each operation has an inference bound. This recovers from
-/// nonterminating pure Prolog code without SWI signal handlers. An inference
+/// The public query surface is limited to typed relation transformations over
+/// the embedded action grammar. Each transformation has an inference bound.
+/// This recovers from nonterminating pure Prolog code without SWI signal handlers. An inference
 /// bound is not a wall-clock timeout and cannot interrupt a blocking foreign
 /// predicate; the embedded grammar is pure and the API cannot invoke foreign,
 /// filesystem, process, `halt/0`, or user-selected predicates.
@@ -569,19 +554,6 @@ impl Prolog {
             }
         };
         Ok(RenderedCommand { text })
-    }
-
-    pub fn action_request(
-        &self,
-        command: &CommandAst,
-    ) -> Result<crate::generated_wire::ActionRequest, QueryError> {
-        let response = self
-            .application(
-                Operation::ActionRequest,
-                format!("request({})", encode_command(command)),
-            )
-            .map_err(QueryError::Backend)?;
-        decode_action_request_response(&response)
     }
 
     /// Project the complete action help surface from the normalized relation.
@@ -932,21 +904,6 @@ impl Prolog {
         decode_completions_value(solution_binding(solution, "completions")?)
     }
 
-    fn application(&self, operation: Operation, request: String) -> Result<String, String> {
-        if request.len() > MAX_INPUT_BYTES {
-            return Err(format!(
-                "action grammar request exceeds {MAX_INPUT_BYTES} bytes"
-            ));
-        }
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.commands
-            .send(Command::Application(operation, request, reply_tx))
-            .map_err(|_| "Prolog worker has stopped".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "Prolog worker stopped before replying".to_string())?
-    }
-
     pub fn shutdown(mut self) -> Result<(), String> {
         self.stop()
     }
@@ -1009,9 +966,6 @@ fn worker_main(
 
     while let Ok(command) = receiver.recv() {
         match command {
-            Command::Application(operation, request, reply) => {
-                let _ = reply.send(runtime.application(operation, &request));
-            }
             Command::Transform(request, output_limit, reply) => {
                 let _ = reply.send(runtime.transform(&request, output_limit));
             }
@@ -1070,11 +1024,11 @@ impl Runtime {
             initialized: true,
             cleanup_attempted: false,
         };
-        runtime.load_application()?;
+        runtime.load_grammar()?;
         Ok(runtime)
     }
 
-    fn load_application(&mut self) -> Result<(), String> {
+    fn load_grammar(&mut self) -> Result<(), String> {
         let goal = format!(
             concat!(
                 "call_with_inference_limit((asserta(user:file_search_path(library,'res://library')),",
@@ -1143,71 +1097,6 @@ impl Runtime {
         }
     }
 
-    fn application(&mut self, operation: Operation, request: &str) -> Result<String, String> {
-        let request_string = serde_json::to_string(request)
-            .map_err(|error| format!("failed to encode grammar request: {error}"))?;
-        let goal = format!(
-            "action_grammar:application({},{request_string},Output)",
-            operation.atom(),
-        );
-        // SAFETY: the only callable predicate and operation atoms are fixed.
-        // Request text is a quoted string datum decoded by application/3,
-        // never a goal. All calls stay on the dedicated worker.
-        unsafe {
-            let terms = PL_new_term_refs(3);
-            if terms == 0 {
-                return Err("FLI term allocation failed".into());
-            }
-            if put_utf8_term(terms, &goal) == 0
-                || PL_put_int64(terms + 1, QUERY_INFERENCES) == 0
-                || PL_put_variable(terms + 2) == 0
-            {
-                PL_clear_exception();
-                PL_reset_term_refs(terms);
-                return Err("failed to construct bounded Prolog application query".into());
-            }
-            let predicate =
-                PL_predicate(c"call_with_inference_limit".as_ptr(), 3, c"system".as_ptr());
-            if predicate.is_null() {
-                PL_reset_term_refs(terms);
-                return Err("FLI predicate allocation failed".into());
-            }
-            let query = PL_open_query(
-                ptr::null_mut(),
-                PL_Q_NODEBUG | PL_Q_CATCH_EXCEPTION,
-                predicate,
-                terms,
-            );
-            if query == 0 {
-                PL_reset_term_refs(terms);
-                return Err("FLI query allocation failed".into());
-            }
-
-            let succeeded = PL_next_solution(query) != 0;
-            let exception = !succeeded && PL_exception(query) != 0;
-            let result = if succeeded {
-                self.extract_application_result(terms)
-            } else if exception {
-                Err("action grammar raised a Prolog exception".into())
-            } else {
-                Err("action grammar application failed".into())
-            };
-            let closed = if succeeded {
-                PL_cut_query(query)
-            } else {
-                PL_close_query(query)
-            };
-            if exception || closed != 1 {
-                PL_clear_exception();
-            }
-            PL_reset_term_refs(terms);
-            if closed != 1 {
-                return Err("FLI query cleanup failed".into());
-            }
-            result
-        }
-    }
-
     fn transform(
         &mut self,
         request: &RelationValue,
@@ -1267,31 +1156,6 @@ impl Runtime {
             }
             result
         }
-    }
-
-    unsafe fn extract_application_result(&mut self, terms: Term) -> Result<String, String> {
-        let limit_result = unsafe { get_utf8(terms + 2, CVT_ATOM) }?;
-        if limit_result == "inference_limit_exceeded" {
-            return Err(format!(
-                "action grammar exceeded its {QUERY_INFERENCES}-inference limit"
-            ));
-        }
-        let extracted = unsafe { PL_new_term_refs(2) };
-        if extracted == 0 {
-            return Err("FLI result term allocation failed".into());
-        }
-        if unsafe { PL_get_arg_sz(2, terms, extracted) } == 0
-            || unsafe { PL_get_arg_sz(3, extracted, extracted + 1) } == 0
-        {
-            return Err("embedded grammar returned an invalid application term".into());
-        }
-        let output = unsafe { get_utf8(extracted + 1, CVT_STRING) }?;
-        if output.len() > MAX_OUTPUT_BYTES {
-            return Err(format!(
-                "action grammar response exceeds {MAX_OUTPUT_BYTES} bytes"
-            ));
-        }
-        Ok(output)
     }
 
     #[cfg(test)]
@@ -1626,88 +1490,6 @@ fn checked_atom(atom: &str) -> Option<&str> {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         && atom.as_bytes()[0].is_ascii_lowercase())
     .then_some(atom)
-}
-
-fn quote_string(text: &str) -> String {
-    serde_json::to_string(text).expect("serializing a Rust string cannot fail")
-}
-
-fn quote_atom(text: &str) -> String {
-    let escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
-    format!("'{escaped}'")
-}
-
-fn encode_command_value(value: &CommandValue) -> String {
-    match value {
-        CommandValue::Integer(value) => format!("integer({value})"),
-        CommandValue::Boolean(value) => format!("boolean({value})"),
-        CommandValue::String(value) => format!("string({})", quote_string(value)),
-        CommandValue::Path(value) => format!("path({})", quote_string(value)),
-        CommandValue::Base64(value) => format!("base64({})", quote_string(value)),
-        CommandValue::Spec(value) => format!("spec({})", quote_string(value)),
-        CommandValue::OciSpec {
-            context_tar_gz,
-            dockerfile,
-            tag,
-            net_mode,
-            build_arguments,
-        } => {
-            let tag = tag.as_ref().map_or_else(
-                || "none".to_string(),
-                |value| format!("some({})", quote_string(value)),
-            );
-            let build_arguments = build_arguments
-                .iter()
-                .map(|(key, value)| format!("pair({},{})", quote_string(key), quote_string(value)))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "oci_spec({},{},{},{},[{}])",
-                quote_string(context_tar_gz),
-                quote_string(dockerfile),
-                tag,
-                quote_string(net_mode),
-                build_arguments,
-            )
-        }
-        CommandValue::ApiSpec {
-            base_url,
-            model,
-            api_key,
-        } => format!(
-            "api_spec({},{},{})",
-            quote_string(base_url),
-            quote_string(model),
-            quote_string(api_key),
-        ),
-        CommandValue::Array(values) => format!(
-            "array([{}])",
-            values
-                .iter()
-                .map(encode_command_value)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        CommandValue::Hole { name, kind } => {
-            format!("hole({},{})", quote_atom(name), quote_atom(kind))
-        }
-    }
-}
-
-fn encode_command(command: &CommandAst) -> String {
-    let args = command
-        .args
-        .iter()
-        .map(encode_command_value)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "command({},{},{},[{}])",
-        quote_atom(&command.action),
-        quote_atom(&command.handler),
-        quote_atom(&command.target),
-        args
-    )
 }
 
 fn relation_compound(name: &str, arguments: Vec<RelationValue>) -> RelationValue {
@@ -2273,165 +2055,6 @@ enum ParsedTerm {
     List(Vec<ParsedTerm>),
 }
 
-struct TermParser<'a> {
-    input: &'a [u8],
-    position: usize,
-}
-
-impl<'a> TermParser<'a> {
-    fn parse(input: &'a str) -> Result<ParsedTerm, String> {
-        let mut parser = Self {
-            input: input.as_bytes(),
-            position: 0,
-        };
-        let term = parser.term()?;
-        parser.space();
-        if parser.position != parser.input.len() {
-            return Err("trailing data in action grammar response".into());
-        }
-        Ok(term)
-    }
-
-    fn term(&mut self) -> Result<ParsedTerm, String> {
-        self.space();
-        match self.peek() {
-            Some(b'[') => self.list(),
-            Some(b'\"') => self.string(),
-            Some(b'\'') => self.quoted_atom(),
-            Some(b'-' | b'0'..=b'9') => self.integer(),
-            Some(_) => self.atom_or_compound(),
-            None => Err("unexpected end of action grammar response".into()),
-        }
-    }
-
-    fn list(&mut self) -> Result<ParsedTerm, String> {
-        self.position += 1;
-        let mut values = Vec::new();
-        self.space();
-        if self.take(b']') {
-            return Ok(ParsedTerm::List(values));
-        }
-        loop {
-            values.push(self.term()?);
-            self.space();
-            if self.take(b']') {
-                return Ok(ParsedTerm::List(values));
-            }
-            if !self.take(b',') {
-                return Err("invalid list in action grammar response".into());
-            }
-        }
-    }
-
-    fn string(&mut self) -> Result<ParsedTerm, String> {
-        let start = self.position;
-        self.position += 1;
-        let mut escaped = false;
-        while let Some(byte) = self.peek() {
-            self.position += 1;
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if byte == b'\\' {
-                escaped = true;
-                continue;
-            }
-            if byte == b'\"' {
-                let source = std::str::from_utf8(&self.input[start..self.position])
-                    .map_err(|_| "non-UTF-8 action grammar string")?;
-                let value = serde_json::from_str(source)
-                    .map_err(|error| format!("invalid action grammar string: {error}"))?;
-                return Ok(ParsedTerm::String(value));
-            }
-        }
-        Err("unterminated string in action grammar response".into())
-    }
-
-    fn quoted_atom(&mut self) -> Result<ParsedTerm, String> {
-        self.position += 1;
-        let mut value = String::new();
-        while let Some(byte) = self.peek() {
-            self.position += 1;
-            match byte {
-                b'\'' => return Ok(ParsedTerm::Atom(value)),
-                b'\\' => {
-                    let escaped = self.peek().ok_or("unterminated atom escape")?;
-                    self.position += 1;
-                    value.push(escaped as char);
-                }
-                _ if byte.is_ascii() => value.push(byte as char),
-                _ => return Err("non-ASCII quoted atom in action grammar response".into()),
-            }
-        }
-        Err("unterminated atom in action grammar response".into())
-    }
-
-    fn integer(&mut self) -> Result<ParsedTerm, String> {
-        let start = self.position;
-        if self.peek() == Some(b'-') {
-            self.position += 1;
-        }
-        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
-            self.position += 1;
-        }
-        let source = std::str::from_utf8(&self.input[start..self.position]).unwrap();
-        source
-            .parse()
-            .map(ParsedTerm::Integer)
-            .map_err(|_| "invalid integer in action grammar response".into())
-    }
-
-    fn atom_or_compound(&mut self) -> Result<ParsedTerm, String> {
-        let start = self.position;
-        while self
-            .peek()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
-        {
-            self.position += 1;
-        }
-        if start == self.position {
-            return Err("invalid atom in action grammar response".into());
-        }
-        let name = std::str::from_utf8(&self.input[start..self.position])
-            .unwrap()
-            .to_string();
-        self.space();
-        if !self.take(b'(') {
-            return Ok(ParsedTerm::Atom(name));
-        }
-        let mut args = Vec::new();
-        loop {
-            args.push(self.term()?);
-            self.space();
-            if self.take(b')') {
-                return Ok(ParsedTerm::Compound(name, args));
-            }
-            if !self.take(b',') {
-                return Err("invalid compound in action grammar response".into());
-            }
-        }
-    }
-
-    fn space(&mut self) {
-        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
-            self.position += 1;
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.input.get(self.position).copied()
-    }
-    fn take(&mut self, expected: u8) -> bool {
-        if self.peek() == Some(expected) {
-            self.position += 1;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 fn compound<'a>(
     term: &'a ParsedTerm,
     name: &str,
@@ -2765,40 +2388,6 @@ fn decode_highlights_term(value: &ParsedTerm) -> Result<Vec<Highlight>, String> 
         .collect()
 }
 
-fn decode_action_request_response(
-    response: &str,
-) -> Result<crate::generated_wire::ActionRequest, QueryError> {
-    let term = TermParser::parse(response).map_err(QueryError::Backend)?;
-    if let Ok(ok) = compound(&term, "ok", 1) {
-        let request = compound(&ok[0], "action_request", 3).map_err(QueryError::Backend)?;
-        let handler = atom(&request[0]).map_err(QueryError::Backend)?;
-        let code: u64 = integer(&request[1])
-            .map_err(QueryError::Backend)?
-            .try_into()
-            .map_err(|_| QueryError::Backend("negative relation action opcode".into()))?;
-        let values = list(&request[2])
-            .map_err(QueryError::Backend)?
-            .iter()
-            .map(decode_relation_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(QueryError::Backend)?;
-        return crate::generated_wire::ActionRequest::from_relation(handler, code, &values)
-            .map_err(QueryError::Backend);
-    }
-    if let Ok(error) = compound(&term, "error", 1) {
-        if atom(&error[0]).ok() == Some("no_solution") {
-            return Err(QueryError::NoSolution);
-        }
-        return Err(QueryError::Backend(format!(
-            "action grammar rejected request conversion: {}",
-            term_text(&error[0])
-        )));
-    }
-    Err(QueryError::Backend(
-        "invalid action request relation response".into(),
-    ))
-}
-
 pub fn global() -> Result<&'static Prolog, String> {
     static PROLOG: OnceLock<Result<Prolog, String>> = OnceLock::new();
     PROLOG
@@ -2814,7 +2403,6 @@ pub(crate) fn ensure_linked() {
     std::hint::black_box(Prolog::complete as fn(&Prolog, &GrammarInput, &'static str) -> _);
     std::hint::black_box(Prolog::highlights as fn(&Prolog, &ParseCandidate) -> _);
     std::hint::black_box(Prolog::render as fn(&Prolog, &CommandAst) -> _);
-    std::hint::black_box(Prolog::action_request as fn(&Prolog, &CommandAst) -> _);
     std::hint::black_box(Prolog::action_help as fn(&Prolog) -> _);
     std::hint::black_box(Prolog::ui_action_help as fn(&Prolog) -> _);
     std::hint::black_box(
@@ -3055,7 +2643,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_application_is_embedded_bounded_and_closed() {
+    fn typed_relation_runtime_is_embedded_bounded_and_closed() {
         let prolog = global().unwrap();
         let duplicate = match Prolog::new() {
             Ok(_) => panic!("created duplicate runtime"),
@@ -3081,42 +2669,6 @@ mod tests {
                 .text,
             "mirror run pending",
         );
-        assert_eq!(
-            prolog
-                .action_request(&CommandAst {
-                    action: "mirror_resume".into(),
-                    handler: "mirror_pause".into(),
-                    target: "ui".into(),
-                    args: vec![CommandValue::Integer(7), CommandValue::Boolean(false)],
-                })
-                .unwrap(),
-            crate::generated_wire::ActionRequest::MirrorPause {
-                id: 7,
-                paused: false,
-            },
-        );
-        let oci = prolog
-            .action_request(&CommandAst {
-                action: "oci.build".into(),
-                handler: "oci.build".into(),
-                target: "ui".into(),
-                args: vec![CommandValue::OciSpec {
-                    context_tar_gz: "eA==".into(),
-                    dockerfile: "FROM scratch\n".into(),
-                    tag: Some("example:test".into()),
-                    net_mode: "tap".into(),
-                    build_arguments: vec![("A".into(), "one".into())],
-                }],
-            })
-            .unwrap();
-        let crate::generated_wire::ActionRequest::OciBuild { spec } = oci else {
-            panic!("structured relation returned the wrong request variant")
-        };
-        assert_eq!(spec.context_tar_gz.as_slice(), b"x");
-        assert_eq!(spec.dockerfile.as_slice(), b"FROM scratch\n");
-        assert_eq!(spec.tag.as_ref().unwrap().as_str(), "example:test");
-        assert_eq!(spec.net_mode, crate::generated_wire::NetMode::Tap);
-        assert_eq!(spec.build_arguments.as_map().len(), 1);
         let parsed_oci = prolog
             .parse(
                 &grammar_words(&[
@@ -3138,10 +2690,6 @@ mod tests {
                 build_arguments: Vec::new(),
             }],
         );
-        assert!(matches!(
-            prolog.action_request(&parsed_oci[0].command).unwrap(),
-            crate::generated_wire::ActionRequest::OciBuild { .. }
-        ));
         prolog.exhaust_inference_limit().unwrap();
         assert_eq!(
             prolog.render(&command("mirror_rm", Some(11))).unwrap().text,
