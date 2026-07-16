@@ -35,6 +35,7 @@ mod xargs_builtin;
 // Dockerfile/Containerfile parser for `sarun oci build` / `oci run`. Lands
 // ahead of its consumer (the build driver), so allow the not-yet-used items.
 mod action_bridge;
+mod action_help;
 mod attach;
 mod browser;
 #[allow(dead_code)]
@@ -98,8 +99,8 @@ extern "C" fn on_term(_sig: i32) {
     unsafe { libc::_exit(0) };
 }
 
-fn top_level_help() -> &'static str {
-    "sarun — run a command over a copy-on-write overlay of your filesystem,\n\
+fn top_level_help() -> Result<String, String> {
+    let mut help = "sarun — run a command over a copy-on-write overlay of your filesystem,\n\
      capturing its writes, processes, and output for review before they touch the host.\n\
      \n\
      usage:\n  \
@@ -112,7 +113,7 @@ fn top_level_help() -> &'static str {
        sarun <NAME> attach wiki|ietf SRC REF [AT]      attach a mirror object as a read-only reference\n  \
        sarun mirror <ls|add|run|pause|resume|rm> ...   scheduled mirror updates\n  \
        sarun gitdepot|wikimak|ietfmak ...              embedded mirror-driver CLIs\n  \
-       sarun verbs [FILTER]               list the engine's UI verbs (args + help)\n  \
+       sarun verbs [FILTER]               list relation-generated interactive actions locally\n  \
        sarun oci <load|run|build|save|dockerfile|author> ...   OCI images (`sarun oci -h`)\n  \
        sarun oaita <gen|run|call|tail|add|where> NAME          LLM chat/agent runner (`oaita -h`)\n  \
        sarun web <export-wacz|import-wacz> ...                 WACZ web-archive interop\n  \
@@ -124,6 +125,11 @@ fn top_level_help() -> &'static str {
        -n / -N / --net off|tap|host   per-box networking (default: tap, a proxied per-box netns)\n  \
        -t passthrough   -d direct (no overlay)   -e record-env   -b brush-shell   -p pty\n  \
        -C DIR   --no-parent   --readonly-parent   --api (oaita proxy)   --vars (variable provenance)\n"
+        .to_string();
+    let rows = action_help::ui_rows("")?;
+    help.push_str("\ninteractive action language (generated from the central relation):\n");
+    help.push_str(&action_help::render_rows(&rows, "  "));
+    Ok(help)
 }
 
 fn serve() -> i32 {
@@ -572,8 +578,16 @@ fn main() {
         Some("attach") => std::process::exit(ui_launch(&argv[1..])),
         Some("--once") | Some("--sock") => std::process::exit(ui_launch(&argv)),
         Some("-h") | Some("--help") => {
-            print!("{}", top_level_help());
-            std::process::exit(0);
+            match top_level_help() {
+                Ok(help) => {
+                    print!("{help}");
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    eprintln!("sarun: action relation: {error}");
+                    std::process::exit(1);
+                }
+            }
         }
         // `engine` is the headless-serve alias Python uses; `serve` still works.
         Some("engine") | Some("serve") => std::process::exit(serve()),
@@ -797,9 +811,9 @@ fn main() {
             ));
         }
         Some("verbs") => {
-            // sarun verbs [FILTER] — the running engine's UI-action projection
-            // from the central relation. Works in-box too (SARUN_BROKER).
-            std::process::exit(control::cli_verbs(&argv[1..]));
+            // Help is a local representation projection. It does not involve
+            // the engine or ui.sock.
+            std::process::exit(action_help::cli(&argv[1..]));
         }
         Some("mirror") => {
             // sarun mirror ls|add|run|pause|resume|rm — mirror-update jobs.

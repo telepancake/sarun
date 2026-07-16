@@ -120,7 +120,6 @@ action('oci.build', 'oci.build', ui, "OCI_SPEC", "run an in-box-shipped Dockerfi
 action('oaita.models', 'oaita.models', ui, "", "GGUF local-model catalog for the picker", visible, 50).
 action('oaita.status', 'oaita.status', ui, "", "what the Api pane is wired to (external/local/none)", visible, 50).
 action('oaita.probe', 'oaita.probe', ui, "API_SPEC", "1-token connection test of an external API config", visible, 50).
-action(verbs, verbs, ui, "[FILTER]", "list every UI verb with its args and help", visible, 50).
 
 action(mirror_browse, mirror_browse, local, "", "browse wiki mirror in the browser", visible, 50).
 action(mirror_read, mirror_read, local, "", "read a mirror in the document reader", visible, 50).
@@ -232,7 +231,6 @@ wire_handler(struct_cancel, 88, unit).
 wire_handler(struct_finish, 89, structural_diff).
 wire_handler(struct_quick, 90, structural_quick).
 wire_handler(stuck, 91, stuck_report).
-wire_handler(verbs, 92, list(action_help_row, collection_items)).
 wire_handler(webcap, 93, list(web_capture_row, collection_items)).
 wire_handler(webcap_body, 94, option(web_capture_body)).
 wire_handler(webcap_detail, 95, option(web_capture_detail)).

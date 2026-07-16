@@ -284,7 +284,7 @@ test parses reordered JSON fields into a typed compound and renders canonical
 compact JSON from the same declaration. The current OCI and API action
 arguments are expressed with these codecs in the installed action grammar.
 Their older duplicate parsing predicates remain to be deleted.
-`action_grammar:action_relation_grammar/1` now materializes all 108 actions as
+`action_grammar:action_relation_grammar/1` now materializes all 107 executable actions as
 one immutable `choice_grammar` value. Every branch contains its mechanically
 derived command words, source schema, declarative terminal codecs, context
 descriptors, action preference, and a bidirectional template for the normalized
@@ -357,6 +357,17 @@ type-confusion rejection. The full static aarch64 suite passes (321 passed,
 one ignored browser integration test). A bridge that needs genuinely
 relational or context-bearing adaptation must be installed as glue grammar
 data and composed through `compose_grammar/3`, not added to the engine.
+
+Help presentation now follows the same client/engine boundary. `sarun verbs`
+and `sarun --help` query the embedded relation in the invoking process and
+format the same typed `ActionHelpRow` projection; neither needs a running
+engine or touches ui.sock. The former `verbs` pseudo-action, opcode, generated
+request/success variants, engine dispatcher, newline-JSON request, and legacy
+JSON result projection have been deleted. Top-level help labels the generated
+rows as the interactive action language so it does not pretend every action is
+already a top-level argv form. Native CLI tests execute both help surfaces with
+no engine, and the static aarch64 suite passes 322 tests with one ignored
+browser integration test.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:
@@ -567,8 +578,9 @@ and makes contextual parsing and invalidation independently testable.
 
 ## Complete UI action inventory
 
-The relation now covers all 108 actions: 91 UI actions sharing 90
-implementation arms, five control actions, and twelve local actions. Entries
+The relation now covers all 107 executable actions: 90 UI actions sharing 89
+implementation arms, five control actions, and twelve local actions. Help is
+a projection of those actions, not an additional executable action. Entries
 which had historically existed only in `registry::ACTIONS` included:
 
 - control messages: `sudtrace`, `apply`, `discard`, `rename`, `quit`;
@@ -736,7 +748,8 @@ belong to the relation.
 - [x] Delete `registry.rs` once no semantic responsibility remains.
 - [x] Strip name/schema/help metadata out of `ui_verbs!`; retain only handler
       implementation dispatch or replace it with handler functions.
-- [x] Delete `VERB_DOCS`; implement the `verbs` response from relation data.
+- [x] Delete `VERB_DOCS`; implement local `verbs` presentation from relation
+      data without an engine request.
 - [x] Delete duplicate help sections, dead `registry_menu_items`, and registry
       synchronization tests.
 - [x] Remove stale parser design text that calls implemented work future or
@@ -745,9 +758,9 @@ belong to the relation.
 
 ### 6. Verification gates
 
-- [x] Prolog core-only focused tests validate all 108 action rows plus neutral
+- [x] Prolog core-only focused tests validate all 107 action rows plus neutral
       parsing, identifier encoding, argument projection, strings, arrays, rendering,
-      completion/highlighting, and the closed application surface.
+      completion/highlighting, and the generic transformation surface.
 - [x] Expand them to exhaustive per-representation and per-action round trips.
 - [x] Parse/render round trips preserve typed wire arguments for every action.
 - [x] Every mechanically encoded command parses with exact arity and full input.

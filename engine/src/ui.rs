@@ -8905,7 +8905,7 @@ fn help_lines() -> Vec<Line<'static>> {
         t("  rewrites the filerules file and reloads it in the engine."),
     ]);
     // The complete action surface comes directly from the embedded relation.
-    // `sarun verbs [FILTER]` selects its UI-target subset over the socket.
+    // `sarun verbs [FILTER]` selects the same UI-target subset locally.
     v.push(t(""));
     v.push(h("Actions (central relation · `sarun verbs [FILTER]`)"));
     let relation_help = match crate::prolog::global().and_then(|hub| hub.action_help()) {

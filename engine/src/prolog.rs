@@ -2960,13 +2960,13 @@ mod tests {
     #[test]
     fn ui_help_is_projected_from_the_embedded_relation() {
         let rows = global().unwrap().ui_action_help().unwrap();
-        assert_eq!(rows.len(), 91);
+        assert_eq!(rows.len(), 90);
         let verbs = rows
             .iter()
             .map(|row| row.verb.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(verbs.len(), rows.len());
-        assert!(verbs.contains("verbs"));
+        assert!(!verbs.contains("verbs"));
         assert!(verbs.contains("view open"));
         assert!(!verbs.contains("quit"));
         let display_path = rows

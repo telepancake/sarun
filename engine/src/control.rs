@@ -1704,13 +1704,6 @@ fn dispatch_action(
             }
             Ok(ActionSuccess::ReloadRules { value: () })
         }
-        ActionRequest::Verbs { filter } => {
-            let filter = filter.as_ref().map_or("", |value| value.as_str());
-            let rows = crate::prolog::global()?.ui_action_help_matching(filter)?;
-            let value = crate::wire::BoundedVec::new(rows)
-                .map_err(|error| format!("help rows exceed relation bound: {error:?}"))?;
-            Ok(ActionSuccess::Verbs { value })
-        }
         ActionRequest::SessionDicts => {
             let boxes = discover::discover();
             let (run_pids, overlay) = {
@@ -2943,13 +2936,6 @@ fn legacy_ui_action_reply(
         Ok(ActionSuccess::Select { .. }) => json!({"ok": true}),
         Ok(ActionSuccess::Ping { .. }) => json!("pong"),
         Ok(ActionSuccess::ReloadRules { .. }) => Value::Null,
-        Ok(ActionSuccess::Verbs { value }) => Value::Array(value.into_inner().into_iter()
-            .map(|row| json!({
-                "verb": row.verb.into_inner(),
-                "args": row.arguments.into_inner(),
-                "help": row.description.into_inner(),
-            }))
-            .collect()),
         Ok(ActionSuccess::SessionDicts { value }) => Value::Array(value.into_inner()
             .into_iter().map(legacy_box_session).collect()),
         Ok(ActionSuccess::BoxNew { value }) => json!({
@@ -6104,21 +6090,6 @@ macro_rules! ui_verbs {
                 },
             ));
         }
-        "verbs" => {
-            let filter = match args.first() {
-                None => None,
-                Some(Value::String(value)) => {
-                    let Ok(value) = crate::wire::BoundedText::new(value.clone()) else {
-                        return json!({"ok": false, "error": "help filter exceeds relation bound"});
-                    };
-                    Some(value)
-                }
-                Some(_) => return json!({"ok": false, "error": "help filter must be text"}),
-            };
-            return legacy_ui_action_reply(dispatch_action(
-                state, crate::generated_wire::ActionRequest::Verbs { filter },
-            ));
-        }
     } };
 }
 
@@ -7610,70 +7581,6 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
     }
 }
 
-/// `sarun verbs [FILTER]` — print the running engine's projection of the
-/// central action relation through the `verbs` action. Works from inside a
-/// box too: the FD broker (SARUN_BROKER, same channel cli_box_op uses)
-/// splices the connection to the engine's control socket.
-pub fn cli_verbs(argv: &[String]) -> i32 {
-    let filter = argv.first().cloned().unwrap_or_default();
-    let sock = crate::paths::sock_path();
-    let broker_name = std::env::var("SARUN_BROKER").ok().filter(|s| !s.is_empty());
-    let dial = || -> std::io::Result<UnixStream> {
-        match broker_name.as_ref() {
-            Some(n) => crate::runner::broker_dial(n),
-            None => UnixStream::connect(&sock),
-        }
-    };
-    let mut c = match dial() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("sarun-engine: no engine running");
-            return 1;
-        }
-    };
-    let msg = json!({"type": "ui", "verb": "verbs", "args": [filter]});
-    if let Err(e) = c.write_all(format!("{msg}\n").as_bytes()) {
-        eprintln!("sarun-engine: {e}");
-        return 1;
-    }
-    let mut line = String::new();
-    if BufReader::new(&c).read_line(&mut line).is_err() {
-        eprintln!("sarun-engine: read failed");
-        return 1;
-    }
-    let v: Value = match serde_json::from_str(&line) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("sarun-engine: {e}");
-            return 1;
-        }
-    };
-    let Some(rows) = v.get("r").and_then(Value::as_array) else {
-        eprintln!(
-            "sarun-engine: {}",
-            v.get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("bad reply")
-        );
-        return 1;
-    };
-    let g = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let namew = rows.iter().map(|r| g(r, "verb").len()).max().unwrap_or(0);
-    let argw = rows.iter().map(|r| g(r, "args").len()).max().unwrap_or(0);
-    for r in rows {
-        println!(
-            "{:<namew$}  {:<argw$}  {}",
-            g(r, "verb"),
-            g(r, "args"),
-            g(r, "help")
-        );
-    }
-    if rows.is_empty() {
-        eprintln!("no verbs match '{filter}'");
-    }
-    0
-}
-
 pub fn cli_box_op(argv: &[String]) -> i32 {
     let name = argv[0].as_str();
     let op = argv.get(1).map(String::as_str);
@@ -8188,7 +8095,7 @@ mod verb_tests {
     #[test]
     fn relation_help_is_complete_nonempty_and_unique() {
         let docs = crate::prolog::global().unwrap().ui_action_help().unwrap();
-        assert_eq!(docs.len(), 91);
+        assert_eq!(docs.len(), 90);
         let mut names: Vec<&str> = docs.iter().map(|d| d.verb.as_str()).collect();
         names.sort_unstable();
         let n = names.len();
@@ -8418,24 +8325,12 @@ mod verb_tests {
     fn documented_verbs_spot_check_dispatch() {
         let state: State = Default::default();
         let boxes = std::collections::BTreeMap::new();
-        // Two safe representatives: the self-list and an args-validating
-        // mutator that errors before any side effect.
-        for v in ["verbs", "mirror_pause"] {
+        // Safe args-validating handlers that error before any side effect.
+        for v in ["mirror_pause", "flows.detail"] {
             let r = dispatch_ui_verb(&state, v, &[], &boxes);
             let err = r.get("error").and_then(Value::as_str).unwrap_or("");
             assert!(!err.contains("unknown verb"), "{v} fell through: {err}");
         }
-        // And the self-list actually lists itself + honors the filter arg.
-        let r = dispatch_ui_verb(&state, "verbs", &[json!("mirror")], &boxes);
-        let rows = r["r"].as_array().unwrap();
-        assert!(
-            rows.iter()
-                .all(|x| x["verb"].as_str().unwrap().contains("mirror")
-                    || x["help"].as_str().unwrap().contains("mirror"))
-        );
-        assert!(rows.len() >= 5);
-        let all = dispatch_ui_verb(&state, "verbs", &[], &boxes);
-        assert_eq!(all["r"].as_array().unwrap().len(), 91);
     }
 
     #[test]
