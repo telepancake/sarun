@@ -12,7 +12,7 @@ const INACTIVE: u8 = 0;
 const RUNNING: u8 = 1;
 const POISONED: u8 = 2;
 const LOAD_INFERENCES: i64 = 5_000_000;
-const MAX_INPUT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_DOCUMENT_INPUT_BYTES: usize = 16 * 1024;
 const MAX_ITEMS: usize = 256;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_RELATION_NODES: usize = 65_536;
@@ -530,9 +530,9 @@ impl Prolog {
         &self,
         request: &BrushDocumentRequest,
     ) -> Result<BrushDocumentAnalysis, String> {
-        if request.source.len() > MAX_INPUT_BYTES {
+        if request.source.len() > MAX_DOCUMENT_INPUT_BYTES {
             return Err(format!(
-                "Brush document exceeds {MAX_INPUT_BYTES} UTF-8 bytes"
+                "Brush document exceeds {MAX_DOCUMENT_INPUT_BYTES} UTF-8 bytes"
             ));
         }
         if let Some(span) = request.assist {
@@ -1275,7 +1275,7 @@ impl Runtime {
             if terms == 0 {
                 return Err("FLI term allocation failed for relation transform".into());
             }
-            let mut put_budget = RelationTermBudget::new(MAX_INPUT_BYTES);
+            let mut put_budget = RelationTermBudget::new(MAX_DOCUMENT_INPUT_BYTES);
             if put_relation_value(terms, request, 0, &mut put_budget) == 0
                 || PL_put_variable(terms + 1) == 0
             {

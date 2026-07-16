@@ -96,17 +96,22 @@ replacement spans, cursor tears, and diagnostics.
 
 ### 2. Relation-owned shell editing analysis
 
-- [ ] Add a required analysis source to `EditorPane`; buffer revisions and
-      cursor tears identify cached work.
-- [ ] Replace syntastica for `.sh`/`.bash` with `sarun_brush` results in one
+- [x] Add a required analysis provider to `EditorPane`; cursor positions are
+      converted into relation edit tears. Revision-tagged asynchronous caching
+      remains below.
+- [x] Replace syntastica for `.sh`/`.bash` with `sarun_brush` results in one
       cut. Never run both and pick a winner.
-- [ ] Convert byte spans to `edtui` coordinates and completion edits back to
+- [x] Convert byte spans to `edtui` coordinates and completion edits back to
       bytes without splitting UTF-8.
-- [ ] Render completions, hints, diagnostics, and incomplete status in the
-      existing editor chrome/widget without reinterpreting shell grammar.
+- [x] Render relation-derived completions in an edtui popup and apply their
+      exact replacement spans. The defining backward `find -type` completion
+      now passes through the real editor buffer on static aarch64.
+- [ ] Render hints, diagnostics, and incomplete status in the existing editor
+      chrome/widget once those generic projections exist; do not reinterpret
+      shell grammar in the editor.
 - [ ] Debounce and generation-tag whole-buffer analysis; discard stale results.
       Use the dedicated Prolog worker rather than blocking every render frame.
-- [ ] Keep tree-sitter only for non-shell languages until each has a relation
+- [x] Keep tree-sitter only for non-shell languages until each has a relation
       grammar/import path. Structural-locator uses are independently scoped.
 
 ### 3. Reusable standalone editor host

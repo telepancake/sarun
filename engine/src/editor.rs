@@ -1,5 +1,7 @@
-// Syntax-highlighted text editor pane (the Edit pane's engine): edtui's
-// vim-modal editor widget + a syntastica (tree-sitter) highlight bridge.
+// Syntax-aware text editor pane (the Edit pane's engine): edtui's vim-modal
+// editor widget plus one analysis provider per document grammar. Shell text is
+// analyzed only by the installed `sarun_brush` relation; syntastica remains a
+// provider for the other, not-yet-translated languages.
 //
 // Port of the editor-eval prototype's hl.rs. The shape that makes it fast:
 // tree-sitter runs over the WHOLE buffer only on load and on a debounced
@@ -22,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::prolog::{BrushDocumentRequest, Completion, Span, analyze_brush_document};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::{
     EditorEventHandler, EditorMode, EditorState, EditorTheme, EditorView, Highlight, Index2,
@@ -46,7 +49,7 @@ const REHL_DEBOUNCE: Duration = Duration::from_millis(250);
 /// jagged char buffer + the span cache, each proportional to the file).
 const MAX_EDIT_BYTES: usize = 8 << 20;
 
-// ── the syntastica → edtui bridge (hl.rs port) ──────────────────────────────
+// ── document analysis → edtui bridge ────────────────────────────────────────
 
 /// Per-line styled spans, precomputed for the whole buffer.
 /// (start_col, end_col_inclusive, style) — cols are CHAR indices, matching
@@ -55,38 +58,46 @@ pub struct FileHighlights {
     pub per_line: Vec<Vec<(usize, usize, Style)>>,
 }
 
-/// Language by file extension. None = plain text (no highlighting, and the
-/// buffer still opens — unknown extensions must never refuse or panic).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnalysisProvider {
+    Plain,
+    Brush,
+    Syntastica(Lang),
+}
+
+/// One provider by file extension. Unknown extensions are plain text. Bash is
+/// intentionally absent from the syntastica branch: once selected, the Brush
+/// relation is the only authority for parsing and presentation evidence.
 /// NOTE: no toml — syntastica-parsers' crates.io pack lacks the grammars
 /// that aren't published on crates.io (toml, dockerfile, kotlin, …).
-pub fn lang_for_path(path: &str) -> Option<Lang> {
+fn provider_for_path(path: &str) -> AnalysisProvider {
     let ext = std::path::Path::new(path)
         .extension()
-        .and_then(|e| e.to_str())?;
-    Some(match ext {
-        "rs" => Lang::Rust,
-        "py" => Lang::Python,
-        "c" | "h" => Lang::C,
-        "js" | "mjs" => Lang::Javascript,
-        "sh" | "bash" => Lang::Bash,
-        "md" => Lang::Markdown,
-        "json" => Lang::Json,
-        "yml" | "yaml" => Lang::Yaml,
-        _ => return None,
-    })
+        .and_then(|e| e.to_str());
+    match ext {
+        Some("sh" | "bash") => AnalysisProvider::Brush,
+        Some("rs") => AnalysisProvider::Syntastica(Lang::Rust),
+        Some("py") => AnalysisProvider::Syntastica(Lang::Python),
+        Some("c" | "h") => AnalysisProvider::Syntastica(Lang::C),
+        Some("js" | "mjs") => AnalysisProvider::Syntastica(Lang::Javascript),
+        Some("md") => AnalysisProvider::Syntastica(Lang::Markdown),
+        Some("json") => AnalysisProvider::Syntastica(Lang::Json),
+        Some("yml" | "yaml") => AnalysisProvider::Syntastica(Lang::Yaml),
+        _ => AnalysisProvider::Plain,
+    }
 }
 
 /// Human tag for the pane title.
-fn lang_label(lang: Option<Lang>) -> &'static str {
-    match lang {
-        Some(Lang::Rust) => "rust",
-        Some(Lang::Python) => "python",
-        Some(Lang::C) => "c",
-        Some(Lang::Javascript) => "javascript",
-        Some(Lang::Bash) => "bash",
-        Some(Lang::Markdown) => "markdown",
-        Some(Lang::Json) => "json",
-        Some(Lang::Yaml) => "yaml",
+fn provider_label(provider: AnalysisProvider) -> &'static str {
+    match provider {
+        AnalysisProvider::Brush => "brush",
+        AnalysisProvider::Syntastica(Lang::Rust) => "rust",
+        AnalysisProvider::Syntastica(Lang::Python) => "python",
+        AnalysisProvider::Syntastica(Lang::C) => "c",
+        AnalysisProvider::Syntastica(Lang::Javascript) => "javascript",
+        AnalysisProvider::Syntastica(Lang::Markdown) => "markdown",
+        AnalysisProvider::Syntastica(Lang::Json) => "json",
+        AnalysisProvider::Syntastica(Lang::Yaml) => "yaml",
         _ => "plain",
     }
 }
@@ -149,6 +160,104 @@ pub fn compute(code: &str, lang: Lang) -> FileHighlights {
     FileHighlights { per_line }
 }
 
+fn brush_style(syntax: &str) -> Style {
+    match syntax {
+        "keyword" => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+        "operator" => Style::default().fg(Color::Cyan),
+        "variable" => Style::default().fg(Color::LightCyan),
+        "string" => Style::default().fg(Color::Green),
+        "delimiter" => Style::default().fg(Color::Yellow),
+        "escape" | "escaped" => Style::default().fg(Color::LightYellow),
+        "command" => Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD),
+        "arithmetic" => Style::default().fg(Color::LightMagenta),
+        "trivia" => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
+/// Convert relation-owned UTF-8 byte spans to edtui's per-line character
+/// coordinates. Newline bytes are not paintable cells, so a multi-line span
+/// is split into one segment per non-empty line intersection.
+fn relation_highlights(code: &str, highlights: &[crate::prolog::Highlight]) -> FileHighlights {
+    let mut line_starts = vec![0usize];
+    for (offset, byte) in code.bytes().enumerate() {
+        if byte == b'\n' {
+            line_starts.push(offset + 1);
+        }
+    }
+    let mut per_line = vec![Vec::new(); line_starts.len()];
+    for highlight in highlights {
+        if highlight.span.start >= highlight.span.end
+            || highlight.span.end > code.len()
+            || !code.is_char_boundary(highlight.span.start)
+            || !code.is_char_boundary(highlight.span.end)
+        {
+            continue;
+        }
+        let first_row = line_starts
+            .partition_point(|&start| start <= highlight.span.start)
+            .saturating_sub(1);
+        let end_row = line_starts.partition_point(|&start| start < highlight.span.end);
+        for row in first_row..end_row {
+            let line_start = line_starts[row];
+            let line_end = line_starts
+                .get(row + 1)
+                .map_or(code.len(), |next| next.saturating_sub(1));
+            let start = highlight.span.start.max(line_start);
+            let end = highlight.span.end.min(line_end);
+            if start < end {
+                let c0 = code[line_start..start].chars().count();
+                let c1 = c0 + code[start..end].chars().count() - 1;
+                per_line[row].push((c0, c1, brush_style(&highlight.syntax)));
+            }
+        }
+    }
+    FileHighlights { per_line }
+}
+
+fn brush_analysis(
+    code: &str,
+    assist: Option<Span>,
+) -> Result<crate::prolog::BrushDocumentAnalysis, String> {
+    analyze_brush_document(&BrushDocumentRequest {
+        source: code.to_string(),
+        assist,
+        initial_bindings: vec![],
+        observations: vec![],
+    })
+}
+
+fn brush_file_highlights(code: &str) -> Result<FileHighlights, String> {
+    let analysis = brush_analysis(code, None)?;
+    let mut highlights = analysis
+        .candidates
+        .iter()
+        .flat_map(|candidate| candidate.highlights.iter().cloned())
+        .collect::<Vec<_>>();
+    highlights.sort_by(|left, right| {
+        (
+            left.span.start,
+            left.span.end,
+            &left.syntax,
+            &left.semantic,
+            &left.origin,
+        )
+            .cmp(&(
+                right.span.start,
+                right.span.end,
+                &right.syntax,
+                &right.semantic,
+                &right.origin,
+            ))
+    });
+    highlights.dedup();
+    Ok(relation_highlights(code, &highlights))
+}
+
 /// Push the highlights for a cursor-anchored row window into the editor
 /// state. edtui scans `state.highlights` linearly per rendered char, so we
 /// only inject rows near the cursor (the viewport follows the cursor).
@@ -199,7 +308,10 @@ fn hash_of(text: &str) -> u64 {
 pub enum Target {
     Host(PathBuf),
     /// `sid` as the control socket carries it (the UI's cur_sid string).
-    Box { sid: String, rel: String },
+    Box {
+        sid: String,
+        rel: String,
+    },
 }
 
 impl Target {
@@ -227,6 +339,12 @@ pub enum KeyResult {
     Save,
 }
 
+#[derive(Clone, Debug)]
+struct CompletionMenu {
+    items: Vec<Completion>,
+    selected: usize,
+}
+
 /// The editor pane: one open buffer with its edtui state, the precomputed
 /// highlight cache, dirty tracking (buffer hash vs last-saved hash) and the
 /// debounced re-highlight clock. The SAME `render` draws the right-pane and
@@ -235,8 +353,9 @@ pub struct EditorPane {
     pub target: Target,
     pub state: EditorState,
     handler: EditorEventHandler,
-    lang: Option<Lang>,
+    provider: AnalysisProvider,
     fh: Option<FileHighlights>,
+    completions: Option<CompletionMenu>,
     /// Hash of the last-saved text; `dirty` == current hash differs.
     saved_hash: u64,
     /// Hash of the buffer after the last handled key — edit detection
@@ -272,23 +391,34 @@ impl EditorPane {
     pub fn from_bytes(target: Target, bytes: Vec<u8>, read_only: bool) -> anyhow::Result<Self> {
         let label = target.label();
         let text = text_for_edit(&label, bytes)?;
-        let lang = lang_for_path(&label);
-        let fh = lang.map(|l| compute(&text, l));
+        let provider = provider_for_path(&label);
+        let (fh, analysis_error) = match provider {
+            AnalysisProvider::Plain => (None, None),
+            AnalysisProvider::Syntastica(lang) => (Some(compute(&text, lang)), None),
+            AnalysisProvider::Brush => match brush_file_highlights(&text) {
+                Ok(highlights) => (Some(highlights), None),
+                Err(error) => (Some(FileHighlights { per_line: vec![] }), Some(error)),
+            },
+        };
         let state = EditorState::new(Lines::from(text.as_str()));
         let h = hash_of(&text);
+        let status = analysis_error.map_or_else(
+            || "vim keys · Ctrl-S save · Ctrl-O open · Ctrl-E lock · z zoom · Esc back".into(),
+            |error| format!("brush relation: {error}"),
+        );
         Ok(EditorPane {
             target,
             state,
             handler: EditorEventHandler::default(),
-            lang,
+            provider,
             fh,
+            completions: None,
             saved_hash: h,
             buf_hash: h,
             dirty: false,
             read_only,
             rehl_due: None,
-            status: "vim keys · Ctrl-S save · Ctrl-O open · Ctrl-E lock · z zoom · Esc back"
-                .into(),
+            status,
         })
     }
 
@@ -303,8 +433,8 @@ impl EditorPane {
         if !md.is_file() {
             anyhow::bail!("editor: {} is not a regular file", path.display());
         }
-        let bytes = std::fs::read(&path)
-            .map_err(|e| anyhow::anyhow!("editor: {}: {e}", path.display()))?;
+        let bytes =
+            std::fs::read(&path).map_err(|e| anyhow::anyhow!("editor: {}: {e}", path.display()))?;
         let ro = md.permissions().readonly();
         Self::from_bytes(Target::Host(path), bytes, ro)
     }
@@ -316,7 +446,7 @@ impl EditorPane {
     }
 
     pub fn lang_label(&self) -> &'static str {
-        lang_label(self.lang)
+        provider_label(self.provider)
     }
 
     /// The bytes a save writes — exactly the buffer, byte-for-byte.
@@ -337,8 +467,19 @@ impl EditorPane {
         if let Some(due) = self.rehl_due {
             if now >= due {
                 self.rehl_due = None;
-                if let Some(l) = self.lang {
-                    self.fh = Some(compute(&text_of(&self.state), l));
+                let text = text_of(&self.state);
+                match self.provider {
+                    AnalysisProvider::Plain => self.fh = None,
+                    AnalysisProvider::Syntastica(lang) => {
+                        self.fh = Some(compute(&text, lang));
+                    }
+                    AnalysisProvider::Brush => match brush_file_highlights(&text) {
+                        Ok(highlights) => self.fh = Some(highlights),
+                        Err(error) => {
+                            self.fh = Some(FileHighlights { per_line: vec![] });
+                            self.status = format!("brush relation: {error}");
+                        }
+                    },
                 }
             }
         }
@@ -350,11 +491,175 @@ impl EditorPane {
         self.rehl_due.is_some()
     }
 
+    fn cursor_byte_offset(&self) -> usize {
+        let mut offset = 0usize;
+        for (row, line) in self.state.lines.iter_row().enumerate() {
+            if row == self.state.cursor.row {
+                offset += line
+                    .iter()
+                    .take(self.state.cursor.col)
+                    .map(|ch| ch.len_utf8())
+                    .sum::<usize>();
+                return offset;
+            }
+            offset += line.iter().map(|ch| ch.len_utf8()).sum::<usize>() + 1;
+        }
+        offset
+    }
+
+    fn open_completions(&mut self) {
+        let text = text_of(&self.state);
+        let cursor = self.cursor_byte_offset();
+        let analysis = match brush_analysis(
+            &text,
+            Some(Span {
+                start: cursor,
+                end: cursor,
+            }),
+        ) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                self.completions = None;
+                self.status = format!("brush relation: {error}");
+                return;
+            }
+        };
+        let mut items = analysis
+            .candidates
+            .iter()
+            .flat_map(|candidate| candidate.completions.iter().cloned())
+            .filter(|completion| {
+                completion.replace.start <= completion.replace.end
+                    && completion.replace.end == cursor
+                    && completion.replace.end <= text.len()
+                    && text.is_char_boundary(completion.replace.start)
+                    && text.is_char_boundary(completion.replace.end)
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            (left.rank, std::cmp::Reverse(left.preference), &left.insert).cmp(&(
+                right.rank,
+                std::cmp::Reverse(right.preference),
+                &right.insert,
+            ))
+        });
+        items.dedup_by(|left, right| left.replace == right.replace && left.insert == right.insert);
+        if items.is_empty() {
+            self.completions = None;
+            self.status = "brush relation: no completion at cursor".into();
+        } else {
+            self.status = format!(
+                "{} relation completion(s) · Tab/↓ next · Enter accept · Esc close",
+                items.len()
+            );
+            self.completions = Some(CompletionMenu { items, selected: 0 });
+        }
+    }
+
+    fn handle_completion_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        let Some(menu) = self.completions.as_mut() else {
+            return false;
+        };
+        if !mods.is_empty() && code != KeyCode::BackTab {
+            self.completions = None;
+            return false;
+        }
+        match code {
+            KeyCode::Tab | KeyCode::Down => {
+                menu.selected = (menu.selected + 1) % menu.items.len();
+                true
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                menu.selected = menu.selected.checked_sub(1).unwrap_or(menu.items.len() - 1);
+                true
+            }
+            KeyCode::Enter => {
+                self.apply_selected_completion();
+                true
+            }
+            KeyCode::Esc => {
+                self.completions = None;
+                self.status = "completion closed".into();
+                true
+            }
+            _ => {
+                self.completions = None;
+                false
+            }
+        }
+    }
+
+    fn apply_selected_completion(&mut self) {
+        if self.read_only {
+            self.completions = None;
+            self.status = "read-only — relation completion insertion refused".into();
+            return;
+        }
+        let Some(completion) = self
+            .completions
+            .as_ref()
+            .and_then(|menu| menu.items.get(menu.selected))
+            .cloned()
+        else {
+            return;
+        };
+        let text = text_of(&self.state);
+        let cursor = self.cursor_byte_offset();
+        if completion.replace.end != cursor
+            || completion.replace.start > completion.replace.end
+            || completion.replace.end > text.len()
+            || !text.is_char_boundary(completion.replace.start)
+            || !text.is_char_boundary(completion.replace.end)
+            || completion.insert.contains('\n')
+        {
+            self.completions = None;
+            self.status = "brush relation returned an inapplicable completion span".into();
+            return;
+        }
+        let delete_chars = text[completion.replace.start..completion.replace.end]
+            .chars()
+            .count();
+        for _ in 0..delete_chars {
+            self.handler.on_key_event(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+                &mut self.state,
+            );
+        }
+        for ch in completion.insert.chars() {
+            self.handler.on_key_event(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+                &mut self.state,
+            );
+        }
+        self.completions = None;
+        self.after_key();
+        self.status = format!("inserted relation completion {}", completion.display);
+    }
+
+    #[cfg(test)]
+    fn completion_items(&self) -> &[Completion] {
+        self.completions
+            .as_ref()
+            .map_or(&[], |menu| menu.items.as_slice())
+    }
+
     /// Handle one key. The caller (ui.rs) already consumed the F-keys; an
     /// OPEN editor consumes everything else — normal-mode letters are vim
     /// motions/operators, so pane accelerators intentionally do NOT fire
     /// from inside a buffer (leave with Esc, the chips, or F9).
     pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> KeyResult {
+        if self.handle_completion_key(code, mods) {
+            return KeyResult::Consumed;
+        }
+        if self.provider == AnalysisProvider::Brush
+            && self.state.mode == EditorMode::Insert
+            && mods.is_empty()
+            && code == KeyCode::Tab
+        {
+            self.open_completions();
+            return KeyResult::Consumed;
+        }
+        self.completions = None;
         // Pane controls first, from any mode: save / open / lock-toggle.
         if mods.contains(KeyModifiers::CONTROL) {
             match code {
@@ -406,7 +711,7 @@ impl EditorPane {
         if h != self.buf_hash {
             self.buf_hash = h;
             self.dirty = h != self.saved_hash;
-            if self.lang.is_some() {
+            if self.provider != AnalysisProvider::Plain {
                 self.rehl_due = Some(Instant::now() + REHL_DEBOUNCE);
             }
         }
@@ -437,7 +742,9 @@ impl EditorPane {
         // the bottom title.
         let (bstyle, btype) = if focused {
             (
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
                 BorderType::Double,
             )
         } else {
@@ -466,6 +773,64 @@ impl EditorPane {
             .wrap(false)
             .line_numbers(LineNumbers::Absolute);
         f.render_widget(view, inner);
+        self.render_completion_menu(f, area);
+    }
+
+    fn render_completion_menu(&self, f: &mut ratatui::Frame, editor_area: ratatui::layout::Rect) {
+        use ratatui::widgets::{Block, Borders, Clear, List, ListItem};
+
+        let Some(menu) = &self.completions else {
+            return;
+        };
+        let Some(cursor) = self.state.cursor_screen_position() else {
+            return;
+        };
+        let visible = menu.items.len().min(8);
+        let desired_width = menu
+            .items
+            .iter()
+            .take(visible)
+            .map(|completion| completion.display.chars().count())
+            .max()
+            .unwrap_or(1)
+            .saturating_add(4)
+            .max(24);
+        let width = desired_width.min(editor_area.width.saturating_sub(2) as usize) as u16;
+        let height = visible as u16 + 2;
+        if width < 3 || height > editor_area.height {
+            return;
+        }
+        let x = cursor.x.min(editor_area.right().saturating_sub(width));
+        let below = cursor.y.saturating_add(1);
+        let y = if below.saturating_add(height) <= editor_area.bottom() {
+            below
+        } else {
+            cursor.y.saturating_sub(height)
+        };
+        let area = ratatui::layout::Rect::new(x, y, width, height);
+        let start = menu.selected.saturating_sub(visible - 1);
+        let items = menu.items[start..(start + visible).min(menu.items.len())]
+            .iter()
+            .enumerate()
+            .map(|(offset, completion)| {
+                let selected = start + offset == menu.selected;
+                let style = if selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                ListItem::new(completion.display.clone()).style(style)
+            })
+            .collect::<Vec<_>>();
+        f.render_widget(Clear, area);
+        f.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" relation completions "),
+            ),
+            area,
+        );
     }
 }
 
@@ -525,11 +890,136 @@ mod tests {
 
     fn pane_of(name: &str, text: &str) -> EditorPane {
         EditorPane::from_bytes(
-            Target::Box { sid: "1".into(), rel: name.into() },
+            Target::Box {
+                sid: "1".into(),
+                rel: name.into(),
+            },
             text.as_bytes().to_vec(),
             false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn relation_byte_spans_map_to_utf8_editor_cells() {
+        let source = "éx\n$A\n";
+        let highlights = relation_highlights(
+            source,
+            &[
+                crate::prolog::Highlight {
+                    span: Span { start: 0, end: 3 },
+                    syntax: "string".into(),
+                    semantic: "text".into(),
+                    origin: "grammar".into(),
+                },
+                crate::prolog::Highlight {
+                    span: Span { start: 4, end: 6 },
+                    syntax: "variable".into(),
+                    semantic: "parameter".into(),
+                    origin: "grammar".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            highlights.per_line[0]
+                .iter()
+                .map(|(start, end, _)| (*start, *end))
+                .collect::<Vec<_>>(),
+            vec![(0, 1)]
+        );
+        assert_eq!(
+            highlights.per_line[1]
+                .iter()
+                .map(|(start, end, _)| (*start, *end))
+                .collect::<Vec<_>>(),
+            vec![(0, 1)]
+        );
+    }
+
+    #[test]
+    fn bash_editor_uses_relation_for_backward_completion_and_insertion() {
+        let mut pane = pane_of("script.sh", "A=\"\"; find . -type $A");
+        assert_eq!(pane.provider, AnalysisProvider::Brush);
+        assert_eq!(pane.lang_label(), "brush");
+        assert!(
+            pane.fh
+                .as_ref()
+                .is_some_and(|highlights| highlights.per_line.iter().any(|line| !line.is_empty())),
+            "the Brush relation must provide the initial highlights"
+        );
+
+        pane.state.mode = EditorMode::Insert;
+        pane.state.cursor = Index2::new(0, 3);
+        assert_eq!(
+            pane.handle_key(KeyCode::Tab, KeyModifiers::empty()),
+            KeyResult::Consumed
+        );
+        for expected in ["D", "b", "c", "d", "f", "l", "p", "s"] {
+            assert!(
+                pane.completion_items()
+                    .iter()
+                    .any(|completion| completion.insert == expected),
+                "missing relation completion {expected:?}"
+            );
+        }
+        let backend = TestBackend::new(90, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| pane.render(frame, frame.area(), true))
+            .unwrap();
+        let mut rendered = String::new();
+        for cell in term.backend().buffer().content() {
+            rendered.push_str(cell.symbol());
+        }
+        assert!(
+            rendered.contains("relation completions"),
+            "Tab must render the completion popup, not merely cache candidates"
+        );
+        let selected = pane
+            .completion_items()
+            .iter()
+            .position(|completion| completion.insert == "f")
+            .unwrap();
+        pane.completions.as_mut().unwrap().selected = selected;
+        assert_eq!(
+            pane.handle_key(KeyCode::Enter, KeyModifiers::empty()),
+            KeyResult::Consumed
+        );
+        assert_eq!(text_of(&pane.state), "A=\"f\"; find . -type $A");
+        assert_eq!(pane.state.cursor, Index2::new(0, 4));
+        assert!(pane.dirty);
+        assert!(pane.completions.is_none());
+    }
+
+    #[test]
+    fn bash_editor_never_falls_back_when_relation_bound_is_exceeded() {
+        let source = "x".repeat(crate::prolog::MAX_DOCUMENT_INPUT_BYTES + 1);
+        let pane = pane_of("large.sh", &source);
+        assert_eq!(pane.provider, AnalysisProvider::Brush);
+        assert!(
+            pane.status.contains("exceeds"),
+            "status was: {}",
+            pane.status
+        );
+        assert!(
+            pane.fh
+                .as_ref()
+                .is_some_and(|highlights| highlights.per_line.is_empty()),
+            "an explicit relation error must not invoke the Bash tree-sitter provider"
+        );
+    }
+
+    #[test]
+    fn read_only_editor_refuses_relation_completion_insertion() {
+        let text = "A=\"\"; find . -type $A";
+        let mut pane = pane_of("readonly.sh", text);
+        pane.read_only = true;
+        pane.state.mode = EditorMode::Insert;
+        pane.state.cursor = Index2::new(0, 3);
+        pane.handle_key(KeyCode::Tab, KeyModifiers::empty());
+        assert!(!pane.completion_items().is_empty());
+        pane.handle_key(KeyCode::Enter, KeyModifiers::empty());
+        assert_eq!(text_of(&pane.state), text);
+        assert!(pane.status.contains("refused"));
     }
 
     /// The windowing pin: a large rust buffer computes spans for EVERY
@@ -548,7 +1038,13 @@ mod tests {
         );
         pane.state.cursor = Index2::new(0, 0);
         inject(&mut pane.state, fh, HL_WINDOW);
-        let max_row = pane.state.highlights.iter().map(|h| h.start.row).max().unwrap();
+        let max_row = pane
+            .state
+            .highlights
+            .iter()
+            .map(|h| h.start.row)
+            .max()
+            .unwrap();
         assert!(
             max_row <= HL_WINDOW,
             "injected rows stay inside the window (max {max_row})"
@@ -563,7 +1059,13 @@ mod tests {
         pane.state.cursor = Index2::new(2500, 0);
         let fh = pane.fh.take().unwrap();
         inject(&mut pane.state, &fh, HL_WINDOW);
-        let min_row = pane.state.highlights.iter().map(|h| h.start.row).min().unwrap();
+        let min_row = pane
+            .state
+            .highlights
+            .iter()
+            .map(|h| h.start.row)
+            .min()
+            .unwrap();
         assert!(min_row >= 2500 - HL_WINDOW, "window follows the cursor");
     }
 
@@ -632,10 +1134,18 @@ mod tests {
         );
         assert_eq!(pane.state.cursor.row, 1, "navigation works read-only");
         pane.handle_key(KeyCode::Char('i'), KeyModifiers::empty());
-        assert_eq!(pane.state.mode, EditorMode::Normal, "'i' must not enter insert");
+        assert_eq!(
+            pane.state.mode,
+            EditorMode::Normal,
+            "'i' must not enter insert"
+        );
         pane.handle_key(KeyCode::Char('x'), KeyModifiers::empty());
         assert_eq!(pane.save_bytes(), before, "buffer unchanged");
-        assert!(pane.status.contains("read-only"), "loud refusal: {}", pane.status);
+        assert!(
+            pane.status.contains("read-only"),
+            "loud refusal: {}",
+            pane.status
+        );
         assert!(!pane.dirty);
         assert_eq!(
             pane.handle_key(KeyCode::Char('s'), KeyModifiers::CONTROL),
@@ -683,13 +1193,23 @@ mod tests {
             b"a\0b".to_vec(),
             false,
         );
-        assert!(bin.err().expect("must refuse").to_string().contains("binary"));
+        assert!(
+            bin.err()
+                .expect("must refuse")
+                .to_string()
+                .contains("binary")
+        );
         let bad = EditorPane::from_bytes(
             Target::Host(PathBuf::from("/x.txt")),
             vec![0xff, 0xfe, b'a'],
             false,
         );
-        assert!(bad.err().expect("must refuse").to_string().contains("UTF-8"));
+        assert!(
+            bad.err()
+                .expect("must refuse")
+                .to_string()
+                .contains("UTF-8")
+        );
         let big = EditorPane::from_bytes(
             Target::Host(PathBuf::from("/big.txt")),
             vec![b'a'; MAX_EDIT_BYTES + 1],
