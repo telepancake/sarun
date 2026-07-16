@@ -247,8 +247,15 @@ Do not implement these as Brush-specific engine branches:
       before or after child traversal; the engine has no grammar-name cases.
       Exact UTF-8 field text comes from parser-owned byte spans. A composed
       foreign `let λ; use λ; use z` fixture proves that only `z` escapes to an
-      external query. Brush has not yet supplied its adapter rules.
+      external query. The same boundary now carries the initial Brush rules
+      described below.
 - [ ] Encode shell-local variables/scopes as pure relation inputs and outputs.
+      First executable slice: the installed Brush handle is a generic
+      enrichment of its syntax grammar; assignment-only commands emit escaping
+      variable deltas after RHS traversal, later simple parameters resolve
+      locally, and only unresolved parameters emit `one` queries. Prefix
+      assignments, functions, compound scopes, braced operators, and special
+      parameters remain.
 - [ ] Add explicit providers for aliases, functions, builtins, PATH commands,
       filesystem names, environment, and programmable completion specs.
 - [ ] Compose builtin argument grammars after command resolution; start with a

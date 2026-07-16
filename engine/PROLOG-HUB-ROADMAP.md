@@ -450,7 +450,12 @@ the uniform transform envelope. A separately composable declarative AST-state
 adapter now selects parser-owned named nodes and exact UTF-8 field spans and
 emits ordered state steps around child traversal. A foreign composed grammar
 proves local `λ` resolution and an external `z` query without either syntax or
-state engine knowing the other AST. Brush has not yet supplied adapter rules.
+state engine knowing the other AST. The installed Brush handle now uses a
+generic enrichment combinator to expose syntax and state projections together:
+assignment-only commands emit their variable definition after RHS traversal,
+later simple parameters resolve locally, and unresolved parameters become
+explicit external queries. This is the first shell-state slice, not yet full
+Brush assignment or scope semantics.
 
 The next externally usable checkpoint is explicitly the complete interactive
 `sarun brush` editing experience: relation-owned highlighting, completion,

@@ -8,6 +8,9 @@ test_name(word_slice_parses_quotes_expansions_and_utf8).
 test_name(program_slice_parses_commands_pipelines_and_lists).
 test_name(tear_completion_is_an_ordinary_parse_with_concrete_suffix).
 test_name(unterminated_word_has_no_complete_parse).
+test_name(assignment_resolves_later_parameter_inside_relation).
+test_name(assignment_rhs_resolves_before_definition).
+test_name(unresolved_parameter_emits_external_query).
 
 run_brush_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -25,8 +28,11 @@ run_tests([Name|Names], Passed0, Passed) :-
     run_tests(Names, Passed1, Passed).
 
 run_test(grammar_is_valid_executable_data) :-
-    brush_relation_grammar(Grammar),
-    grammar_ir:valid_grammar(Grammar).
+    brush_relation_grammar(
+        enrichment_grammar(Syntax, [ast], ast_state_grammar(StateRules),
+                           [steps, final_state, resolutions, delta])),
+    grammar_ir:valid_grammar(Syntax),
+    ast_state_relation:valid_ast_state_rules(StateRules).
 
 run_test(word_slice_parses_quotes_expansions_and_utf8) :-
     brush_relation_grammar(Grammar),
@@ -96,6 +102,74 @@ run_test(unterminated_word_has_no_complete_parse) :-
                                            brush_test))]),
                 want([ast]), observations([]), limits(32, 4096, 1048576)),
         reply([], [], [], [diagnostic(no_solution)])).
+
+run_test(assignment_resolves_later_parameter_inside_relation) :-
+    brush_relation_grammar(Grammar),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("x=123; echo $x", exact,
+                                           brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], []))]),
+                want([ast, highlights, resolutions, delta]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply([solution(
+                   [binding(ast, node(shell_program, span(0, 14), _)),
+                    binding(highlights, Highlights),
+                    binding(resolutions,
+                            [resolved(
+                                 node_ref(simple_parameter, span(12, 14)),
+                                 local(local_binding(
+                                     shell_variable, "x", shell_text("123"),
+                                     escaping)))]),
+                    binding(delta,
+                            [state_change(shell_variable, "x",
+                                          shell_text("123"))])], 0)],
+              [], [], [])),
+    has_highlight(span(1, 2), operator, assignment, brush_test, Highlights),
+    has_highlight(span(12, 13), variable, parameter_sigil, brush_test,
+                  Highlights).
+
+run_test(assignment_rhs_resolves_before_definition) :-
+    brush_relation_grammar(Grammar),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("x=$x", exact, brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], []))]),
+                want([resolutions, delta]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply([solution(
+                   [binding(resolutions,
+                            [resolved(
+                                 node_ref(simple_parameter, span(2, 4)),
+                                 external(ref(node_ref(simple_parameter,
+                                                       span(2, 4))))) ]),
+                    binding(delta,
+                            [state_change(shell_variable, "x",
+                                          shell_text("$x"))])], 0)],
+              [query(node_ref(simple_parameter, span(2, 4)),
+                     ask(one, shell_variable, name("x")))], [], [])).
+
+run_test(unresolved_parameter_emits_external_query) :-
+    brush_relation_grammar(Grammar),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("echo $z", exact, brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], []))]),
+                want([resolutions]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply([solution([binding(
+                   resolutions,
+                   [resolved(node_ref(simple_parameter, span(5, 7)),
+                             external(ref(node_ref(simple_parameter,
+                                                   span(5, 7)))))])], 0)],
+              [query(node_ref(simple_parameter, span(5, 7)),
+                     ask(one, shell_variable, name("z")))], [], [])).
 
 has_highlight(Span, Syntax, Semantic, Origin,
               [highlight(Span, Syntax, Semantic, Origin)|_]).

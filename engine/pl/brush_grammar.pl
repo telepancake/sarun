@@ -1,15 +1,38 @@
-:- module(brush_grammar, [brush_relation_grammar/1]).
+:- module(brush_grammar,
+          [ brush_relation_grammar/1,
+            brush_state_rules/1,
+            brush_syntax_grammar/1
+          ]).
 
 /** <module> Brush shell language grammar
 
 This module is a client of the generic grammar engine.  It contains shell
-language knowledge as one immutable grammar value, but no parsing predicates.
-The initial grammar deliberately covers only shell words; later checkpoints
-will grow the same value into complete shell programs before any Brush consumer
-uses it as an authority.
+language knowledge as immutable syntax and AST-state relation values, but no
+parsing or traversal predicates.  The syntax is still an incomplete Brush
+slice; the installed handle enriches ordinary parse projections with the state
+outputs supported by that slice.
 */
 
 brush_relation_grammar(
+    enrichment_grammar(Syntax, [ast], ast_state_grammar(StateRules),
+                       [steps, final_state, resolutions, delta])) :-
+    brush_syntax_grammar(Syntax),
+    brush_state_rules(StateRules).
+
+brush_state_rules([
+    state_rule(node(assignment),
+               [capture(name, field_text(name)),
+                capture(value, field_text(value))],
+               before([]),
+               after([define(shell_variable, slot(name),
+                             shell_text(slot(value)), escaping, replace)])),
+    state_rule(node(simple_parameter),
+               [capture(name, field_text(name))],
+               before([use(node_identity, shell_variable, slot(name))]),
+               after([]))
+]).
+
+brush_syntax_grammar(
     grammar(
         source(text(utf8)), shell_program,
         [rule(shell_program,
@@ -60,10 +83,35 @@ brush_relation_grammar(
                                ref(simple_command)]))])),
          rule(simple_command,
               lexical(
-                  seq([ref(shell_word),
-                       repeat(0, unbounded,
-                              seq([ref(required_horizontal_space),
-                                   ref(shell_word)]))]))),
+                  choice([ref(assignment_command), ref(command_words)]))),
+         rule(assignment_command,
+              seq([ref(assignment),
+                   repeat(0, unbounded,
+                          seq([ref(required_horizontal_space),
+                               ref(assignment)]))])),
+         rule(command_words,
+              seq([not(ref(assignment)), ref(shell_word),
+                   repeat(0, unbounded,
+                          seq([ref(required_horizontal_space),
+                               ref(shell_word)]))])),
+         rule(assignment,
+              seq([field(name, ref(variable_name)),
+                   literal("=", assignment,
+                           presentation([meta(syntax, operator)])),
+                   field(value, repeat(0, unbounded, ref(word_part))),
+                   not(ref(word_part))])),
+         rule(variable_name,
+              seq([terminal(
+                       text(codepoint(union([range(65, 90), range(97, 122),
+                                             chars("_")]))),
+                       presentation([meta(syntax, variable)])),
+                   repeat(0, unbounded,
+                          terminal(
+                              text(codepoint(union([range(65, 90),
+                                                    range(97, 122),
+                                                    range(48, 57),
+                                                    chars("_")]))),
+                              presentation([meta(syntax, variable)])))])),
          rule(shell_word,
               lexical(seq([repeat(1, unbounded, ref(word_part)),
                            not(ref(word_part))]))),
@@ -113,16 +161,7 @@ brush_relation_grammar(
          rule(simple_parameter,
               seq([literal("$", parameter_sigil,
                            presentation([meta(syntax, variable)])),
-                   terminal(text(codepoint(union([range(65, 90),
-                                                  range(97, 122),
-                                                  chars("_")]))),
-                            presentation([meta(syntax, variable)])),
-                   repeat(0, unbounded,
-                          terminal(text(codepoint(union([range(65, 90),
-                                                         range(97, 122),
-                                                         range(48, 57),
-                                                         chars("_")]))),
-                                   presentation([meta(syntax, variable)]))),
+                   field(name, ref(variable_name)),
                    not(terminal(text(codepoint(union([range(65, 90),
                                                        range(97, 122),
                                                        range(48, 57),

@@ -86,6 +86,21 @@ transform_relation(ast_state_grammar(Rules), Given, Wanted, _Observations,
                  binding(resolutions, Resolutions),
                  binding(delta, Delta)],
     requested_bindings(Wanted, Available, Bindings).
+transform_relation(enrichment_grammar(Base, Shared, Extension, Outputs),
+                   Given, Wanted, Observations, Limits, Reply) :-
+    proper_atom_names(Shared),
+    proper_atom_names(Outputs),
+    all_unique_terms(Outputs),
+    partition_names(Wanted, Outputs, ExtensionWanted, BaseWanted),
+    ( ExtensionWanted = []
+    -> transform_relation(Base, Given, Wanted, Observations, Limits, Reply)
+    ;  append(BaseWanted, Shared, RequiredBase0),
+       sort(RequiredBase0, RequiredBase),
+       transform_relation(Base, Given, RequiredBase, Observations, Limits,
+                          BaseReply),
+       enrich_reply(BaseReply, Extension, ExtensionWanted, Given, Wanted,
+                    Observations, Limits, Reply)
+    ).
 transform_relation(Grammar, Given, Wanted, Observations, Limits, Reply) :-
     Grammar = grammar(source(text(utf8)), _, _, _),
     transform_text_grammar(Grammar, Given, Wanted, Observations, Limits, Reply).
@@ -203,6 +218,68 @@ proper_atom_names([]).
 proper_atom_names([Name|Names]) :-
     atom(Name),
     proper_atom_names(Names).
+
+all_unique_terms(Values) :-
+    sort(Values, Unique),
+    length(Values, Count),
+    length(Unique, Count).
+
+partition_names([], _, [], []).
+partition_names([Name|Names], Selected, [Name|Chosen], Rest) :-
+    member_term(Name, Selected), !,
+    partition_names(Names, Selected, Chosen, Rest).
+partition_names([Name|Names], Selected, Chosen, [Name|Rest]) :-
+    partition_names(Names, Selected, Chosen, Rest).
+
+enrich_reply(reply(BaseSolutions, BaseQueries, BaseDependencies,
+                   BaseDiagnostics),
+             Extension, ExtensionWanted, Given, Wanted, Observations, Limits,
+             reply(Solutions, Queries, Dependencies, Diagnostics)) :-
+    BaseSolutions = [_|_],
+    findall(enriched(BaseSolution, ExtensionReply),
+            ( candidate_member(BaseSolution, BaseSolutions),
+              BaseSolution = solution(BaseBindings, _),
+              merge_bindings(Given, BaseBindings, ExtensionGiven),
+              transform_relation(Extension, ExtensionGiven, ExtensionWanted,
+                                 Observations, Limits, ExtensionReply)
+            ),
+            Enriched),
+    Enriched = [_|_],
+    flatten_enriched(Enriched, Wanted, Solutions0, ExtensionQueries,
+                     ExtensionDependencies, ExtensionDiagnostics),
+    Limits = limits(MaxSolutions, _, _),
+    limit_solutions(Solutions0, MaxSolutions, Solutions, LimitDiagnostics),
+    append(BaseQueries, ExtensionQueries, Queries0),
+    append(BaseDependencies, ExtensionDependencies, Dependencies0),
+    append(BaseDiagnostics, ExtensionDiagnostics, Diagnostics0),
+    append(Diagnostics0, LimitDiagnostics, Diagnostics),
+    sort(Queries0, Queries),
+    sort(Dependencies0, Dependencies).
+
+flatten_enriched([], _, [], [], [], []).
+flatten_enriched([
+    enriched(solution(BaseBindings, BasePreference),
+             reply(ExtensionSolutions, Queries0, Dependencies0, Diagnostics0))
+    |Enriched], Wanted, Solutions, Queries, Dependencies, Diagnostics) :-
+    join_extension_solutions(ExtensionSolutions, BaseBindings, BasePreference,
+                             Wanted, Joined),
+    flatten_enriched(Enriched, Wanted, RestSolutions, RestQueries,
+                     RestDependencies, RestDiagnostics),
+    append(Joined, RestSolutions, Solutions),
+    append(Queries0, RestQueries, Queries),
+    append(Dependencies0, RestDependencies, Dependencies),
+    append(Diagnostics0, RestDiagnostics, Diagnostics).
+
+join_extension_solutions([], _, _, _, []).
+join_extension_solutions(
+    [solution(ExtensionBindings, ExtensionPreference)|ExtensionSolutions],
+    BaseBindings, BasePreference, Wanted,
+    [solution(Bindings, Preference)|Solutions]) :-
+    merge_bindings(BaseBindings, ExtensionBindings, Available),
+    requested_bindings(Wanted, Available, Bindings),
+    Preference is BasePreference + ExtensionPreference,
+    join_extension_solutions(ExtensionSolutions, BaseBindings, BasePreference,
+                             Wanted, Solutions).
 
 names_within([], _).
 names_within([Name|Rest], Names) :-

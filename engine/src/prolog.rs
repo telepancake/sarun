@@ -1046,8 +1046,11 @@ impl Runtime {
                 "action_grammar:valid_action_catalog,",
                 "action_grammar:action_relation_grammar(ActionGrammar),",
                 "grammar_store:install_grammar(sarun_actions,ActionGrammar),",
+                "brush_grammar:brush_syntax_grammar(BrushSyntax),",
+                "grammar_ir:valid_grammar(BrushSyntax),",
+                "brush_grammar:brush_state_rules(BrushStateRules),",
+                "ast_state_relation:valid_ast_state_rules(BrushStateRules),",
                 "brush_grammar:brush_relation_grammar(BrushGrammar),",
-                "grammar_ir:valid_grammar(BrushGrammar),",
                 "grammar_store:install_grammar(sarun_brush,BrushGrammar)),",
                 "{},R),R\\==inference_limit_exceeded"
             ),
@@ -2756,6 +2759,61 @@ mod tests {
         assert_eq!(
             assist.solutions[0].bindings[1].value,
             rv_compound("incomplete", vec![rv_compound("edit", vec![rv_atom("edit")])])
+        );
+    }
+
+    #[test]
+    fn installed_brush_grammar_enriches_parse_with_local_state() {
+        let source = rv_compound(
+            "text_source",
+            vec![
+                rv_string("x=123; echo $x"),
+                rv_atom("exact"),
+                rv_atom("rust_test"),
+            ],
+        );
+        let initial = rv_compound(
+            "local_state",
+            vec![
+                rv_list(vec![rv_compound(
+                    "scope",
+                    vec![rv_atom("root"), rv_list(vec![])],
+                )]),
+                rv_list(vec![]),
+            ],
+        );
+        let reply = global()
+            .unwrap()
+            .transform(&RelationRequest {
+                grammar: brush_grammar_handle(),
+                given: vec![
+                    RelationBinding {
+                        name: "source".into(),
+                        value: source,
+                    },
+                    RelationBinding {
+                        name: "initial_state".into(),
+                        value: initial,
+                    },
+                ],
+                wanted: vec!["resolutions".into(), "delta".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert!(reply.diagnostics.is_empty());
+        assert!(reply.context_queries.is_empty());
+        assert_eq!(reply.solutions.len(), 1);
+        assert_eq!(
+            reply.solutions[0].bindings[1].value,
+            rv_list(vec![rv_compound(
+                "state_change",
+                vec![
+                    rv_atom("shell_variable"),
+                    rv_string("x"),
+                    rv_compound("shell_text", vec![rv_string("123")]),
+                ],
+            )])
         );
     }
 
