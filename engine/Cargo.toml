@@ -134,6 +134,10 @@ rustls-pemfile = "2"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 fuser = "0.17.0"
+# Transport-neutral FUSE/virtio-fs protocol, passthrough filesystem, and
+# vhost-user backend.  Sarun embeds the library only; its standalone daemon
+# dependencies are disabled by our pinned vendor patch.
+virtiofsd = { path = "vendor/virtiofsd", default-features = false }
 glob = "0.3.3"
 libc = "0.2.186"
 parking_lot = "0.12"

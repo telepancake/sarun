@@ -1,0 +1,351 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Thu, 16 Jul 2026 20:14:53 +0000
+Subject: [PATCH] Make native daemon dependencies optional
+
+Keep the transport, server, passthrough filesystem, and vhost-user library usable from a fully static musl embedder without libcap-ng. The library's two effective-capability operations use Linux capget/capset directly; the standalone daemon retains its existing libcap-ng feature.
+
+---
+diff --git a/Cargo.toml b/Cargo.toml
+index bc29928..c6e71d5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,7 +28,13 @@ license = "Apache-2.0 AND BSD-3-Clause"
+ repository = "https://gitlab.com/virtio-fs/virtiofsd"
+ 
+ [features]
+-default = ["seccomp"]
++default = ["daemon", "seccomp"]
++daemon = [
++    "dep:capng",
++    "dep:clap",
++    "dep:env_logger",
++    "dep:syslog",
++]
+ seccomp = ["dep:libseccomp-sys"]
+ xen = [
+     "vhost-user-backend/xen",
+@@ -43,7 +49,7 @@ path = "src/lib.rs"
+ [[bin]]
+ name = "virtiofsd"
+ path = "src/main.rs"
+-required-features = ["seccomp"]
++required-features = ["daemon", "seccomp"]
+ 
+ [dependencies.bitflags]
+ version = "1.2"
+@@ -53,13 +59,16 @@ version = "0.7"
+ 
+ [dependencies.capng]
+ version = "0.2.2"
++optional = true
+ 
+ [dependencies.clap]
+ version = "4"
+ features = ["derive"]
++optional = true
+ 
+ [dependencies.env_logger]
+ version = "0.8.4"
++optional = true
+ 
+ [dependencies.futures]
+ version = "0.3"
+@@ -85,6 +94,7 @@ features = ["derive"]
+ 
+ [dependencies.syslog]
+ version = "6.1"
++optional = true
+ 
+ [dependencies.vhost]
+ version = "0.16"
+diff --git a/Cargo.toml.orig b/Cargo.toml.orig
+index a35c9e3..b981253 100644
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -12,7 +12,8 @@ readme = "README.md"
+ exclude = [".gitlab-ci.yml"]
+ 
+ [features]
+-default = ["seccomp"]
++default = ["daemon", "seccomp"]
++daemon = ["dep:capng", "dep:clap", "dep:env_logger", "dep:syslog"]
+ # Expose seccomp bindings from the library.
+ seccomp = ["dep:libseccomp-sys"]
+ # Enabling Xen support will _disable_ QEMU/KVM support!
+@@ -20,18 +21,18 @@ xen = ["vhost-user-backend/xen", "vhost/xen", "vm-memory/xen"]
+ 
+ [[bin]]
+ name = "virtiofsd"
+-required-features = ["seccomp"]
++required-features = ["daemon", "seccomp"]
+ 
+ [dependencies]
+ bitflags = "1.2"
+ btree-range-map = "0.7"
+-capng = "0.2.2"
+-env_logger = "0.8.4"
++capng = { version = "0.2.2", optional = true }
++env_logger = { version = "0.8.4", optional = true }
+ futures = { version = "0.3", features = ["thread-pool"] }
+ libc = "0.2.177"
+ log = "0.4"
+ libseccomp-sys = { version = "0.2", optional = true }
+-clap = { version = "4", features = ["derive"] }
++clap = { version = "4", features = ["derive"], optional = true }
+ postcard = { version = "1.0", features = ["use-std"] }
+ serde = { version = "1.0", features = ["derive"] }
+ vhost-user-backend = "0.22"
+@@ -40,7 +41,7 @@ virtio-bindings = "0.2.7"
+ vm-memory = { version = "=0.17.1", features = ["backend-mmap", "backend-atomic"] }
+ virtio-queue = "0.17.0"
+ vmm-sys-util = "0.15.0"
+-syslog = "6.1"
++syslog = { version = "6.1", optional = true }
+ 
+ [profile.release]
+ lto = true
+diff --git a/src/capabilities.rs b/src/capabilities.rs
+new file mode 100644
+index 0000000..1a91928
+--- /dev/null
++++ b/src/capabilities.rs
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: BSD-3-Clause
++
++//! Minimal Linux capability operations needed by the filesystem library.
++//!
++//! The standalone daemon retains libcap-ng for its broader policy handling.
++//! Library users only need to toggle effective bits while impersonating a
++//! request, so they should not be forced to link a native daemon dependency.
++
++use std::io;
++
++const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
++const CAP_DAC_OVERRIDE: u32 = 1;
++const CAP_FSETID: u32 = 4;
++
++#[repr(C)]
++struct Header {
++    version: u32,
++    pid: i32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default)]
++struct Data {
++    effective: u32,
++    permitted: u32,
++    inheritable: u32,
++}
++
++fn number(name: &str) -> io::Result<u32> {
++    match name {
++        "DAC_OVERRIDE" => Ok(CAP_DAC_OVERRIDE),
++        "FSETID" => Ok(CAP_FSETID),
++        _ => Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            format!("unknown Linux capability {name}"),
++        )),
++    }
++}
++
++fn read() -> io::Result<[Data; 2]> {
++    let mut header = Header {
++        version: LINUX_CAPABILITY_VERSION_3,
++        pid: 0,
++    };
++    let mut data = [Data::default(); 2];
++    let result = unsafe {
++        libc::syscall(
++            libc::SYS_capget,
++            &mut header as *mut Header,
++            data.as_mut_ptr(),
++        )
++    };
++    if result < 0 {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(data)
++    }
++}
++
++fn write(data: &[Data; 2]) -> io::Result<()> {
++    let mut header = Header {
++        version: LINUX_CAPABILITY_VERSION_3,
++        pid: 0,
++    };
++    let result = unsafe {
++        libc::syscall(
++            libc::SYS_capset,
++            &mut header as *mut Header,
++            data.as_ptr(),
++        )
++    };
++    if result < 0 {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(())
++    }
++}
++
++fn location(capability: u32) -> (usize, u32) {
++    ((capability / 32) as usize, 1u32 << (capability % 32))
++}
++
++pub fn effective(name: &str) -> io::Result<bool> {
++    let (word, mask) = location(number(name)?);
++    Ok(read()?[word].effective & mask != 0)
++}
++
++pub fn set_effective(name: &str, enabled: bool) -> io::Result<()> {
++    let (word, mask) = location(number(name)?);
++    let mut data = read()?;
++    if enabled {
++        data[word].effective |= mask;
++    } else {
++        data[word].effective &= !mask;
++    }
++    write(&data)
++}
++
++pub fn clear_all() -> io::Result<()> {
++    write(&[Data::default(); 2])
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn known_capabilities_have_stable_linux_numbers() {
++        assert_eq!(number("DAC_OVERRIDE").unwrap(), 1);
++        assert_eq!(number("FSETID").unwrap(), 4);
++        assert!(number("NOT_A_CAPABILITY").is_err());
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index e895224..8263f1b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,6 +5,7 @@
+ #[macro_use]
+ extern crate log;
+ 
++pub mod capabilities;
+ pub mod descriptor_utils;
+ pub mod file_traits;
+ pub mod filesystem;
+diff --git a/src/passthrough/credentials.rs b/src/passthrough/credentials.rs
+index 11eb6cb..7403ebf 100644
+--- a/src/passthrough/credentials.rs
++++ b/src/passthrough/credentials.rs
+@@ -114,34 +114,19 @@ impl Drop for UnixCredentialsGuard {
+ }
+ 
+ pub struct ScopedCaps {
+-    cap: capng::Capability,
++    name: String,
+ }
+ 
+ impl ScopedCaps {
+     fn new(cap_name: &str) -> io::Result<Option<Self>> {
+-        use capng::{Action, CUpdate, Set, Type};
+-
+-        let cap = capng::name_to_capability(cap_name).map_err(|_| {
+-            let err = io::Error::last_os_error();
+-            error!("couldn't get the capability id for name {cap_name}: {err:?}");
+-            err
+-        })?;
+-
+-        if capng::have_capability(Type::EFFECTIVE, cap) {
+-            let req = vec![CUpdate {
+-                action: Action::DROP,
+-                cap_type: Type::EFFECTIVE,
+-                capability: cap,
+-            }];
+-            capng::update(req).map_err(|e| {
+-                error!("couldn't drop {cap} capability: {e:?}");
++        if crate::capabilities::effective(cap_name)? {
++            crate::capabilities::set_effective(cap_name, false).map_err(|e| {
++                error!("couldn't drop {cap_name} capability: {e:?}");
+                 einval()
+             })?;
+-            capng::apply(Set::CAPS).map_err(|e| {
+-                error!("couldn't apply capabilities after dropping {cap}: {e:?}");
+-                einval()
+-            })?;
+-            Ok(Some(Self { cap }))
++            Ok(Some(Self {
++                name: cap_name.to_owned(),
++            }))
+         } else {
+             Ok(None)
+         }
+@@ -150,21 +135,10 @@ impl ScopedCaps {
+ 
+ impl Drop for ScopedCaps {
+     fn drop(&mut self) {
+-        use capng::{Action, CUpdate, Set, Type};
+-
+-        let req = vec![CUpdate {
+-            action: Action::ADD,
+-            cap_type: Type::EFFECTIVE,
+-            capability: self.cap,
+-        }];
+-
+-        if let Err(e) = capng::update(req) {
+-            panic!("couldn't restore {} capability: {:?}", self.cap, e);
+-        }
+-        if let Err(e) = capng::apply(Set::CAPS) {
++        if let Err(e) = crate::capabilities::set_effective(&self.name, true) {
+             panic!(
+                 "couldn't apply capabilities after restoring {}: {:?}",
+-                self.cap, e
++                self.name, e
+             );
+         }
+     }
+diff --git a/src/util.rs b/src/util.rs
+index 61b758b..4c7288a 100644
+--- a/src/util.rs
++++ b/src/util.rs
+@@ -107,8 +107,7 @@ pub fn sfork() -> io::Result<i32> {
+ pub fn wait_for_child(pid: i32) -> ! {
+     // Drop all capabilities, since the parent doesn't require any
+     // capabilities, as it'd be just waiting for the child to exit.
+-    capng::clear(capng::Set::BOTH);
+-    if let Err(e) = capng::apply(capng::Set::BOTH) {
++    if let Err(e) = crate::capabilities::clear_all() {
+         // Don't exit the process here since we already have a child.
+         error!("warning: can't apply the parent capabilities: {e}");
+     }
+@@ -139,25 +138,9 @@ pub fn wait_for_child(pid: i32) -> ! {
+ /// An error variant will be returned:
+ /// - if the input string does not match the name, without the 'CAP_' prefix, of any of the
+ ///   capabilities defined in `linux/capabiliy.h`.
+-/// - if `capng::get_caps_process()` cannot get the capabilities and bounding set of the process.
+-/// - if `capng::update()` fails to update the internal posix capabilities settings.
+-/// - if `capng::apply()` fails to transfer the specified internal posix capabilities settings to
+-///   the kernel.
+-pub fn add_cap_to_eff(cap_name: &str) -> capng::Result<()> {
+-    use capng::{Action, CUpdate, Set, Type};
+-    let cap = capng::name_to_capability(cap_name)?;
+-    capng::get_caps_process()?;
+-
+-    let req = vec![CUpdate {
+-        action: Action::ADD,
+-        cap_type: Type::EFFECTIVE,
+-        capability: cap,
+-    }];
+-
+-    capng::update(req)?;
+-    capng::apply(Set::CAPS)?;
+-
+-    Ok(())
++/// - if the current capability set cannot be read or changed.
++pub fn add_cap_to_eff(cap_name: &str) -> io::Result<()> {
++    crate::capabilities::set_effective(cap_name, true)
+ }
+ 
+ /// Same as `io::Error::other()`, but the respective io_error_other feature has only been

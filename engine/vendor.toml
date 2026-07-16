@@ -211,3 +211,8 @@ sha256 = "87bf65bdd9e21258dd484aeb7567f5f833c486ed84ba5aa4fe3b1a93a20e7cee"
 source = "crates.io"
 version = "0.8.0"
 sha256 = "07d779636d827cde4100f0e65ff3fd23b0b1f1195055475c6e6813d425f30c8e"
+
+[crates.virtiofsd]
+source = "crates.io"
+version = "1.14.0"
+sha256 = "7051accc9cf2816e25945c8216e6d4be2b4e75fc5e77559cd7eed5e400245cc1"

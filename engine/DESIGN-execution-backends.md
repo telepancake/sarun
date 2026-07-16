@@ -32,9 +32,10 @@ as executable mappings and mmap that genuinely need a host fd.
 
 ## Fixed decisions
 
-- Upstream filesystem basis: pinned `virtiofsd` 1.14.0.  Vendor only the small
-  patch needed to make daemon-only cap-ng/seccomp/sandbox dependencies optional
-  for sarun's static-musl library build.
+- Upstream filesystem basis: pinned `virtiofsd` 1.14.0.  The vendor patch makes
+  daemon-only dependencies optional and replaces the passthrough library's two
+  libcap-ng operations (`DAC_OVERRIDE` and `FSETID`) with direct Linux
+  `capget`/`capset`, keeping sarun's static-musl library build C-library-free.
 - QEMU: pinned 11.0.2.  Linux: pinned 6.18 LTS.  Sources and built artifacts
   live in the external cache; hashes, configs, patches, and reproducible build
   recipes live here.
@@ -57,8 +58,8 @@ as executable mappings and mmap that genuinely need a host fd.
 
 ### 1. Upstream seam and shared core
 
-- [ ] Pin/vendor the library and gate daemon-only native dependencies.
-- [ ] Prove fully static aarch64 and x86_64 musl builds.
+- [x] Pin/vendor the library and gate daemon-only native dependencies.
+- [x] Prove fully static aarch64 and x86_64 musl builds.
 - [ ] Introduce `SarunFs` implementing `FileSystem` and explicitly unsupported
       `SerializableFileSystem` migration hooks.
 - [ ] Separate virtual inode/handle lifetime, overlay policy, underlying layer
