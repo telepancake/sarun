@@ -146,6 +146,13 @@ pub fn appliance_control_socket(box_id: i64) -> PathBuf {
     live_home().join(box_id.to_string()).join("appliance-control.sock")
 }
 
+/// Resolver projected into QEMU appliances using QEMU's direct host network.
+/// Like the target `/init`, this is engine presentation state rather than a
+/// captured write in the box.
+pub fn appliance_host_resolv_conf_path() -> PathBuf {
+    runtime_home().join("appliance-host-resolv.conf")
+}
+
 pub fn ensure_dirs() -> std::io::Result<()> {
     for d in [data_home(), config_home(), runtime_home(), state_home(),
               live_home(), mnt_point(), oaita_state_home()] {

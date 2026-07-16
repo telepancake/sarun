@@ -77,6 +77,7 @@ enum Cmd {
     Write { handle: SocketHandle, data: Vec<u8> },
     Close { handle: SocketHandle },
     RegisterRx { handle: SocketHandle, tx: std::sync::mpsc::Sender<Vec<u8>> },
+    Stop,
 }
 
 impl StackRuntime {
@@ -129,6 +130,12 @@ impl StackRuntime {
         // Best-effort: if the poll thread is already gone the socket is gone
         // too, so a failed close is genuinely nothing to act on. Ignore.
         let _ = self.cmd_tx.send(Cmd::Close { handle });
+    }
+
+    /// End the per-box poll loop and release its packet fd. The dispatcher
+    /// exits when the poll loop drops its accepted-connection sender.
+    pub fn stop(&self) {
+        let _ = self.cmd_tx.send(Cmd::Stop);
     }
 }
 
@@ -298,7 +305,7 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
     // pending buffer drains.
     let mut close_pending: HashSet<SocketHandle> = HashSet::new();
 
-    loop {
+    'poll: loop {
         // 1. Drain control commands.
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
@@ -314,6 +321,7 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
                     }
                 }
                 Cmd::RegisterRx { handle, tx } => { rx_map.insert(handle, tx); }
+                Cmd::Stop => break 'poll,
             }
         }
 

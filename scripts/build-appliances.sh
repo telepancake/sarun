@@ -13,8 +13,10 @@ out=$cache/appliances/v1
 mode=${1:-all}
 qemu_version=11.0.2
 linux_version=6.18.38
+slirp_revision=26be815b86e8d49add8c9a8b320239b9594ff03d
 qemu_sha=3745f6ea88e2e87fe0dc838b2b1d4e0a770bf48e01a1d5a186842a1fff76ccf5
 linux_sha=ac26e508abd56e9f8b89872b6e10c49fc823bcc70d8068a5d8504c1a7c4ff045
+slirp_sha=abd190c8213f259ab9fc1a411b8dd87c54b7aeba329d3f87f4f4aa82d921bbc9
 
 mkdir -p "$sources" "$trees" "$build" "$out"
 
@@ -35,7 +37,17 @@ extract() {
 build_qemu() {
     fetch "https://download.qemu.org/qemu-$qemu_version.tar.xz" \
         "$sources/qemu-$qemu_version.tar.xz" "$qemu_sha"
+    # QEMU's wrap is a Git clone from GitLab.  Fetch the same pinned revision
+    # as a checked archive so the build has an explicit, mirrorable input and
+    # does not perform an unverified network operation from Meson.
+    fetch "https://codeload.github.com/qemu/libslirp/tar.gz/$slirp_revision" \
+        "$sources/libslirp-$slirp_revision.tar.gz" "$slirp_sha"
     extract "$sources/qemu-$qemu_version.tar.xz" "$trees/qemu-$qemu_version"
+    if [[ ! -d $trees/qemu-$qemu_version/subprojects/slirp ]]; then
+        mkdir -p "$trees/qemu-$qemu_version/subprojects/slirp"
+        tar -C "$trees/qemu-$qemu_version/subprojects/slirp" \
+            --strip-components=1 -xf "$sources/libslirp-$slirp_revision.tar.gz"
+    fi
     if ! grep -q "Sarun's appliance has no CXL" \
         "$trees/qemu-$qemu_version/hw/arm/virt-acpi-build.c"; then
         patch -d "$trees/qemu-$qemu_version" -p1 \
@@ -61,7 +73,7 @@ build_qemu() {
         --python="$python" \
         --target-list=aarch64-softmmu,x86_64-softmmu \
         --without-default-features --enable-system --enable-tcg \
-        --enable-kvm --enable-vhost-user --enable-pie \
+        --enable-kvm --enable-vhost-user --enable-slirp --enable-pie \
         --without-default-devices \
         --with-devices-aarch64=sarun --with-devices-x86_64=sarun)
     ninja -C "$qbuild" qemu-system-aarch64 qemu-system-x86_64

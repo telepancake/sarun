@@ -4,7 +4,7 @@ use base64::Engine as _;
 // calls, {"type":"subscribe"} converting the connection into a one-way event
 // feed, explicit errors for unknown types/verbs. The first datagram on a
 // connection may carry SCM_RIGHTS fds — the register handshake sends the
-// runner's pidfd (and, for a `-n` box, its TAP fd). `register` (below) fully
+// runner's pidfd (and, for a tap-backed box, its packet fd). `register` (below) fully
 // runs the box: it builds the overlay + capture state, equips the netns, and
 // turns the SAME connection into the box channel.
 
@@ -36,9 +36,8 @@ pub struct Shared {
     /// filter, so view.window is a cheap slice.
     pub views: crate::views::Registry,
     pub next_view_id: u64,
-    /// Per-box networking (`-n` mode only): the engine's CA + prompt queue. The
-    /// per-box smoltcp stack is owned by its poll thread (driven by the box's
-    /// TAP fd) and its dispatcher task; the engine keeps no handle to reap.
+    /// Per-box networking (`-n` mode only): the engine's CA + prompt queue.
+    /// Poll stacks themselves live in `network_stacks` until box teardown.
     pub net: Option<std::sync::Arc<crate::net::Net>>,
     /// Long-lived tokio runtime handle used by the dispatcher tasks (one
     /// per-conn task per box). One runtime is plenty: the network is rarely
@@ -53,6 +52,9 @@ pub struct Shared {
     /// Active QEMU-facing sockets.  These own transport lifetime only; every
     /// entry serves a scoped clone of `overlay`, never a second filesystem.
     pub virtio_exports: std::collections::HashMap<i64, crate::virtio_transport::BoxExport>,
+    /// Per-box packet stacks, retained solely so box teardown can stop their
+    /// poll/dispatcher threads and close TAP or QEMU packet fds deterministically.
+    pub network_stacks: std::collections::HashMap<i64, std::sync::Arc<crate::net::stack::StackRuntime>>,
 }
 
 /// Open a pidfd for `pid` (>=0 on success). A live `pid` yields a valid fd; a
@@ -635,12 +637,36 @@ fn lock(state: &State) -> std::sync::MutexGuard<'_, Shared> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn stop_virtio_export(state: &State, box_id: i64) {
-    let export = lock(state).virtio_exports.remove(&box_id);
+fn stop_live_transports(state: &State, box_id: i64) {
+    let (export, network) = {
+        let mut shared = lock(state);
+        (shared.virtio_exports.remove(&box_id),
+         shared.network_stacks.remove(&box_id))
+    };
+    if let Some(network) = network {
+        network.stop();
+    }
     if let Some(export) = export {
         if let Err(error) = export.stop() {
             eprintln!("sarun-engine: virtio-fs box {box_id} teardown: {error}");
         }
+    }
+}
+
+/// Undo the live resources installed by a registration that failed before its
+/// reply was published. Persistent captured state is deliberately left alone,
+/// matching normal box teardown; only handles that could keep a half-created
+/// live box or QEMU export reachable are removed here.
+fn abort_registration(state: &State, overlay: &crate::overlay::Overlay, box_id: i64) {
+    stop_live_transports(state, box_id);
+    overlay.remove_box(box_id);
+    let mut shared = lock(state);
+    if let Some(fd) = shared.box_pids.remove(&box_id) {
+        unsafe { libc::close(fd); }
+    }
+    shared.box_runpids.remove(&box_id);
+    if let Some(proxy) = shared.api_proxy.clone() {
+        proxy.disable_box(box_id);
     }
 }
 
@@ -1365,7 +1391,7 @@ fn handle_binary_registration(
         &mut conn,
         &ConnectionMode::Box { registration },
     ).is_err() {
-        stop_virtio_export(&state, id);
+        stop_live_transports(&state, id);
     } else {
         let mut bytes = [0u8; 256];
         loop {
@@ -1377,7 +1403,7 @@ fn handle_binary_registration(
     }
 
     let overlay = lock(&state).overlay.clone();
-    stop_virtio_export(&state, id);
+    stop_live_transports(&state, id);
     if let Some(overlay) = overlay {
         overlay.remove_box(id);
     }
@@ -1887,7 +1913,7 @@ fn dispatch_action(
             let id = existing_box_id(sid)?;
             let overlay = lock(state).overlay.clone()
                 .ok_or("overlay not mounted")?;
-            stop_virtio_export(state, id);
+            stop_live_transports(state, id);
             overlay.remove_box(id);
             Ok(ActionSuccess::BoxDrop { value: () })
         }
@@ -4227,30 +4253,31 @@ fn register(
     };
     let qemu_architecture = qemu_architecture(*backend, *architecture)?;
     // Assign the post-pidfd SCM_RIGHTS fds to roles from the message. The
-    // runner sends them in a fixed order: [tap (if net_mode==tap)] then
+    // runner sends them in a fixed order: [network (if required)] then
     // [sud trace pipe (if want_sud)]. So:
     //   fuse+tap : fd2=tap
     //   sud+tap  : fd2=tap,   fd3=trace
     //   sud+!tap : fd2=trace
+    //   qemu+tap: fd2=packet socket (qemu host uses its user-net backend)
     // Own each as an OwnedFd so every early-return path closes it; the tap
     // fd moves into prepare_net and the trace fd into stream_events only on
     // the success path.
     let want_sud_fd = *backend == RunBackend::Sud;
-    let is_tap_fd = *net_mode == NetMode::Tap;
-    let (tap_raw, trace_raw) = match (want_sud_fd, is_tap_fd) {
+    let has_network_fd = *net_mode == NetMode::Tap;
+    let (network_raw, trace_raw) = match (want_sud_fd, has_network_fd) {
         (true, true) => (fd2_raw, fd3_raw),
         (true, false) => (None, fd2_raw),
         (false, _) => (fd2_raw, None),
     };
     // Close any fd that didn't get a role (shouldn't happen in normal flow).
-    if want_sud_fd && !is_tap_fd {
+    if want_sud_fd && !has_network_fd {
         if let Some(fd) = fd3_raw {
             unsafe {
                 libc::close(fd);
             }
         }
     }
-    let tap_fd: Option<std::os::fd::OwnedFd> = tap_raw
+    let network_fd: Option<std::os::fd::OwnedFd> = network_raw
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
     let sud_trace_owned: Option<std::os::fd::OwnedFd> = trace_raw
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
@@ -4635,6 +4662,27 @@ fn register(
                 init_path.display()
             ));
         }
+        if *net_mode == NetMode::Host {
+            let resolver = crate::paths::appliance_host_resolv_conf_path();
+            let nameserver = format!(
+                "nameserver {}\n",
+                ipv4_str(crate::net::tap::qemu_host_dns())
+            );
+            let result = std::fs::write(&resolver, nameserver)
+                .and_then(|_| ov.project_file(id, "etc/resolv.conf", resolver.clone()));
+            if let Err(error) = result {
+                ov.remove_box(id);
+                let mut shared = lock(state);
+                if let Some(fd) = shared.box_pids.remove(&id) {
+                    unsafe { libc::close(fd); }
+                }
+                shared.box_runpids.remove(&id);
+                return Err(format!(
+                    "QEMU host-network resolver {}: {error}",
+                    resolver.display()
+                ));
+            }
+        }
     }
     let virtiofs_socket = if qemu_architecture.is_some() {
         match crate::virtio_transport::BoxExport::start(&ov, id) {
@@ -4668,21 +4716,6 @@ fn register(
             crate::sud::stream_events(id, fd.into_raw_fd(), bx, backing.join("sud.trace"));
         }
     }
-    // Announce the new box on the subscribe stream so attached UIs
-    // rebuild their session list WITHOUT a manual refresh. on_event
-    // already handles session_added/removed/renamed identically — it
-    // just never fired here because we forgot to broadcast it.
-    // session_removed (in delete / kill paths) and session_renamed
-    // (in rename) were getting sent; this is the missing third leg.
-    if let (Ok(r#box), Ok(name)) = (u64::try_from(id),
-        crate::wire::BoundedText::new(name.clone()))
-    {
-        broadcast(state, &crate::generated_wire::SubscriptionEvent::BoxAdded {
-            r#box,
-            name: Some(name),
-            parent: parent.and_then(|value| u64::try_from(value).ok()),
-        });
-    }
     let root = crate::paths::mnt_point().join(id.to_string());
 
     // ── Networking (-n boxes only) ────────────────────────────────────────
@@ -4697,15 +4730,33 @@ fn register(
         }
         value => value,
     };
-    let (dns_ip, ca_pem) = prepare_net(
+    let (dns_ip, ca_pem) = match prepare_net(
         state,
         id,
         *net_mode,
         *web_capture,
         *web_filter,
         replay_from,
-        tap_fd,
-    ).unwrap_or_default();
+        network_fd,
+    ) {
+        Ok(network) => network,
+        Err(error) => {
+            abort_registration(state, &ov, id);
+            return Err(error);
+        }
+    };
+
+    // Announce only after every registration resource is live. In particular,
+    // a failed network setup must never flash a dead box into subscribers.
+    if let (Ok(r#box), Ok(name)) = (u64::try_from(id),
+        crate::wire::BoundedText::new(name.clone()))
+    {
+        broadcast(state, &crate::generated_wire::SubscriptionEvent::BoxAdded {
+            r#box,
+            name: Some(name),
+            parent: parent.and_then(|value| u64::try_from(value).ok()),
+        });
+    }
 
     // D-oci: if any ancestor in the parent chain has an oci_config meta key
     // (stamped by `sarun oci load` on the top layer of an image), surface
@@ -4887,8 +4938,8 @@ fn parse_oci_runtime(cfg_json: &str)
 /// Stand up the in-engine smoltcp stack for a `tap` box on the TAP fd the
 /// RUNNER created and handed us (SCM_RIGHTS on the register conn). The engine
 /// creates no netns or device — it only polls the fd. Returns (dns_ip,
-/// augmented_ca_bundle_path); empty strings for off/host. `None` on a real
-/// failure (caller surfaces it — never a silent dead network).
+/// augmented_ca_bundle_path); empty strings for ordinary off/host. Every
+/// setup failure crosses the registration boundary as an error.
 fn prepare_net(
     state: &State,
     id: i64,
@@ -4896,26 +4947,23 @@ fn prepare_net(
     web_capture: bool,
     web_filter: bool,
     replay_from: Option<u64>,
-    tap_fd: Option<std::os::fd::OwnedFd>,
-) -> Option<(String, String)> {
+    network_fd: Option<std::os::fd::OwnedFd>,
+) -> Result<(String, String), String> {
     if net_mode != crate::generated_wire::NetMode::Tap {
-        drop(tap_fd); // off / host carry no TAP; close any fd the runner sent
-        return Some((String::new(), String::new()));
+        drop(network_fd); // ordinary off / host carry no packet fd
+        return Ok((String::new(), String::new()));
     }
-    // Tap REQUIRES the runner's TAP fd. Missing it is a protocol bug, not a
+    // Tap REQUIRES the runner's packet fd. Missing it is a protocol bug, not a
     // reason to silently hand the box a dead network — fail loud.
-    let Some(tap_owned) = tap_fd else {
-        eprintln!("sarun-engine: box {id} registered net=tap but sent no TAP fd");
-        return None;
+    let Some(network_owned) = network_fd else {
+        return Err(format!(
+            "box {id} registered networked but sent no packet fd"
+        ));
     };
-    let net = match lock(state).net.clone() {
-        Some(n) => n,
-        None => {
-            // tap_owned drops here → fd closed
-            eprintln!("sarun-engine: net stack unavailable; -n refused for box {id}");
-            return None;
-        }
-    };
+    let net = lock(state).net.clone()
+        .ok_or_else(|| format!("net stack unavailable; networking refused for box {id}"))?;
+    let rt = lock(state).net_rt.clone()
+        .ok_or_else(|| format!("network runtime unavailable; networking refused for box {id}"))?;
     // Fixed addressing — every box's TAP is identical; we key by box id.
     let box_id_u16 = id as u16;
     let subnet = crate::net::tap::box_subnet();
@@ -4926,10 +4974,9 @@ fn prepare_net(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let flows = match crate::net::flows::FlowsLog::create(&box_dir, ts, box_id_u16) {
-        Ok(f) => f,
+        Ok(flows) => flows,
         Err(e) => {
-            eprintln!("sarun-engine: flows log: {e}");
-            return None;
+            return Err(format!("flows log for box {id}: {e}"));
         }
     };
     let stack = crate::net::stack::StackRuntime::start(
@@ -4937,9 +4984,13 @@ fn prepare_net(
         subnet,
         gw_mac,
         crate::net::tap::BOX_MAC,
-        tap_owned,
+        network_owned,
         flows.clone(),
     );
+    let previous = { lock(state).network_stacks.insert(id, stack.clone()) };
+    if let Some(previous) = previous {
+        previous.stop();
+    }
 
     // The augmented CA bundle (host bundle + engine CA) — sent as CONTENT; the
     // runner materializes + binds it in its own namespace (works for nested).
@@ -4952,7 +5003,8 @@ fn prepare_net(
     // tls.keylog_file:<flows>.keys` decrypts every TLS connection in the
     // pcapng. The upstream rustls config is shared (the real internet's
     // trust roots don't vary by box).
-    let keylog = crate::net::mitm::KeyLogFile::new(&flows.keylog_path).ok();
+    let keylog = crate::net::mitm::KeyLogFile::new(&flows.keylog_path)
+        .map_err(|error| format!("TLS key log for box {id}: {error}"))?;
     let upstream_tls = crate::net::mitm::build_upstream_client_config();
     // Proxy hooks (DESIGN-web.md W2/W7): capture + filter, per-box opt-in.
     // The capture sink resolves live_box(id) at record time off the overlay,
@@ -4986,21 +5038,19 @@ fn prepare_net(
     } else {
         None
     };
-    if let (Some(rt), Some(keylog)) = (lock(state).net_rt.clone(), keylog) {
-        crate::net::dispatch::Dispatcher::start(
-            stack.clone(),
-            stack.dns.clone(),
-            format!("box{id}"),
-            net.ca.clone(),
-            keylog,
-            upstream_tls,
-            net.prompts.clone(),
-            hooks,
-            rt,
-        );
-    }
+    crate::net::dispatch::Dispatcher::start(
+        stack.clone(),
+        stack.dns.clone(),
+        format!("box{id}"),
+        net.ca.clone(),
+        keylog,
+        upstream_tls,
+        net.prompts.clone(),
+        hooks,
+        rt,
+    );
 
-    Some((ipv4_str(subnet.gateway_ip()), ca_pem))
+    Ok((ipv4_str(subnet.gateway_ip()), ca_pem))
 }
 
 fn ipv4_str(o: [u8; 4]) -> String {
@@ -7258,7 +7308,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     b.finalize_brush_links();
                 }
                 ov.clear_echo(id);
-                stop_virtio_export(&state, id);
+                stop_live_transports(&state, id);
                 ov.remove_box(id);
             }
             {

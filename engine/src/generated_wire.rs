@@ -13,7 +13,7 @@
 // source-sha256 engine/pl/grammar_ir.pl 1a2a9a63076618402864e0ac630fca29b91210d54a03687f5be198d94a370d77
 // source-sha256 engine/pl/relation_api.pl e87d850a3cfd6a511e49b00bc7497e0c2790a45cf91aa4aa7b833b4b75364f6c
 // source-sha256 engine/pl/context_relation.pl 6819379ba751c4850e40f3a9d53cab888b9c2b1151283f1eaf479ae84f735473
-// source-sha256 engine/pl/transport_catalog.pl d83de70781151d1db546f9c79c69cee1ff6a9560d34fbe5ea51eb813f80a9ef6
+// source-sha256 engine/pl/transport_catalog.pl 866a19a74206c9b53d5809d17fe6518a86d043b72cf5d23a89b48c294ae354b9
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
 // source-sha256 scripts/wire_codegen.py cebd448fb51f20128aa3ea1f9041cf9c18e7908645e82543efbc5b80af8145fd
 
@@ -196,7 +196,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "9c1bf14f6b4fef0d21ddf5710f91c17bac29568e4d7b07a2dddff6247fbe80b6";
+    "a2d186fe0d332ce463ef8a7cfcc72c1bab6b5ade8580e5925594ac238a6c2d29";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -882,6 +882,7 @@ pub struct ApplianceCommand {
     pub command: BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS>,
     pub cwd: Option<Path>,
     pub environment: Environment,
+    pub net_mode: NetMode,
 }
 
 impl WireValue for ApplianceCommand {
@@ -890,6 +891,7 @@ impl WireValue for ApplianceCommand {
         self.command.encode_atom(&mut fields)?;
         self.cwd.encode_atom(&mut fields)?;
         self.environment.encode_atom(&mut fields)?;
+        self.net_mode.encode_atom(&mut fields)?;
         put_compound_payload(output, &fields)
     }
 
@@ -901,6 +903,7 @@ impl WireValue for ApplianceCommand {
             )?,
             cwd: <Option<Path> as WireValue>::decode_atom(&mut fields)?,
             environment: <Environment as WireValue>::decode_atom(&mut fields)?,
+            net_mode: <NetMode as WireValue>::decode_atom(&mut fields)?,
         };
         require_empty(fields)?;
         Ok(value)
@@ -910,7 +913,7 @@ impl WireValue for ApplianceCommand {
 impl RelationWireValue for ApplianceCommand {
     fn from_relation(value: &RelationValue) -> Result<Self, String> {
         let fields = relation_compound(value, "record")?;
-        require_relation_arity(fields, 3)?;
+        require_relation_arity(fields, 4)?;
         let mut fields = fields.iter();
         Ok(Self {
             command:
@@ -919,6 +922,7 @@ impl RelationWireValue for ApplianceCommand {
                 )?,
             cwd: <Option<Path> as RelationWireValue>::from_relation(fields.next().unwrap())?,
             environment: <Environment as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            net_mode: <NetMode as RelationWireValue>::from_relation(fields.next().unwrap())?,
         })
     }
 }
@@ -12763,6 +12767,7 @@ mod generated_tests {
             command: BoundedVec::new(vec![BoundedBytes::new(Vec::new()).unwrap()]).unwrap(),
             cwd: None,
             environment: BoundedMap::new(BTreeMap::new()).unwrap(),
+            net_mode: NetMode::Off,
         });
         roundtrip::<ApplianceResult>(ApplianceResult { code: 0i32 });
         roundtrip(PipelineStage::Simple {

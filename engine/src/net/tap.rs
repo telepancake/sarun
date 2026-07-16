@@ -146,6 +146,64 @@ pub fn create_netns_tap() -> Result<OwnedFd> {
     Ok(tap)
 }
 
+/// Configure the single virtio-net interface inside a QEMU appliance.  The
+/// host transport still owns policy: tap mode uses the same fixed L2/L3
+/// contract as a namespace-backed box. Host mode uses QEMU's mature user
+/// network backend instead; PID 1 only configures the static guest interface
+/// setup that bwrap's surrounding namespace normally provides.
+pub fn configure_appliance_network(mode: crate::generated_wire::NetMode) -> Result<()> {
+    bring_link_up("lo")?;
+    if mode == crate::generated_wire::NetMode::Off {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let interface = loop {
+        if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+            if let Some(name) = entries.flatten()
+                .filter(|entry| {
+                    std::fs::read_to_string(entry.path().join("type"))
+                        .is_ok_and(|kind| kind.trim() == "1")
+                })
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .find(|name| name != "lo")
+            {
+                break name;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("virtio-net interface did not appear within 5 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let (address, prefix, gateway, neighbor) = match mode {
+        crate::generated_wire::NetMode::Off => unreachable!(),
+        crate::generated_wire::NetMode::Tap => {
+            let subnet = box_subnet();
+            (subnet.box_ip(), subnet.box_prefix_len(), subnet.gateway_ip(),
+             Some(gateway_mac()))
+        }
+        // QEMU's user network is the host-mode transport. Its stable built-in
+        // subnet provides unrestricted outbound TCP/UDP without routing the
+        // traffic through Sarun's tap policy or capture stack.
+        crate::generated_wire::NetMode::Host => {
+            ([10, 0, 2, 15], 24, [10, 0, 2, 2], None)
+        }
+    };
+    set_link_up(&interface)?;
+    assign_ip(&interface, address, prefix)?;
+    add_default_route(gateway)?;
+    if let Some(mac) = neighbor {
+        // Optional latency optimization; ordinary ARP discovery remains the
+        // canonical fallback on kernels that reject legacy SIOCSARP here.
+        if let Err(error) = add_neigh(gateway, mac, &interface) {
+            eprintln!("sarun init: gateway ARP seed failed: {error}");
+        }
+    }
+    Ok(())
+}
+
+pub const fn qemu_host_dns() -> [u8; 4] { [10, 0, 2, 3] }
+
 /// Move THIS process into a fresh, configurable network namespace.
 ///
 /// A bare `unshare(CLONE_NEWNET)` needs CAP_NET_ADMIN — satisfied when we run

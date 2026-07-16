@@ -109,7 +109,19 @@ as executable mappings and mmap that genuinely need a host fd.
         its architecture and virtio-fs socket never acquire a JSON form.
   - [x] Launch the paired QEMU appliance and implement the guest `/init`
         control endpoint.
-- [ ] Connect off/host/tap networking to the existing engine policy.
+- [x] Connect off/host/tap networking with the intended policy boundaries.
+  - [x] For `tap`, carry one Ethernet frame per datagram between virtio-net and
+        the existing per-box smoltcp stack; keep QEMU out of Prolog and out of
+        the network-policy implementation.
+  - [x] Prove `off` has no usable network, `host` uses QEMU user networking for
+        unrestricted TCP/UDP without policy/capture, and `tap` resolves and
+        forwards TCP through the ordinary rules/MITM/capture dispatcher.
+  - [x] Stop packet stacks and dispatcher threads deterministically when the
+        box channel closes; surface setup failure as registration failure
+        instead of returning a box with dead networking.
+  - [x] Include the small Linux userspace ABI needed by real tools (futex,
+        eventfd, epoll, timers, locks, rseq, memfd, inotify) while explicitly
+        excluding default-y device families absent from the paired machines.
 - [x] Boot aarch64 under TCG on the current host; verify a successful command,
       non-zero exit propagation, captured filesystem writes, and no host write.
 - [x] Boot x86_64 under TCG on the aarch64 host and execute the projected

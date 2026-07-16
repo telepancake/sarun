@@ -171,7 +171,8 @@ wire_type(register_reply, record([
 wire_type(appliance_command, record([
     field(command, list(os_string, 1, command_items)),
     field(cwd, option(path)),
-    field(environment, environment)
+    field(environment, environment),
+    field(net_mode, net_mode)
 ])).
 wire_type(appliance_result, record([
     field(code, exit_code)

@@ -743,14 +743,7 @@ pub fn run_qemu(
         eprintln!("sarun-engine run --qemu: nested appliance boxes are not supported yet");
         return 2;
     }
-    if net_mode != crate::net::NetMode::Off {
-        eprintln!(
-            "sarun-engine run --qemu: the first appliance milestone requires --net off; \
-             virtio-net/TAP forwarding is not wired yet"
-        );
-        return 2;
-    }
-    let appliance_command = match crate::appliance::wire_command(&cmd, chdir.as_deref()) {
+    let appliance_command = match crate::appliance::wire_command(&cmd, chdir.as_deref(), net_mode) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("sarun-engine run --qemu: {error}");
@@ -787,13 +780,29 @@ pub fn run_qemu(
         },
         _ => RegistrationName::Automatic,
     };
+    let wire_net_mode = match net_mode {
+        crate::net::NetMode::Off => WireNetMode::Off,
+        crate::net::NetMode::Host => WireNetMode::Host,
+        crate::net::NetMode::Tap => WireNetMode::Tap,
+    };
+    let (engine_network, qemu_network) = if net_mode == crate::net::NetMode::Tap {
+        match crate::appliance::packet_socket_pair() {
+            Ok((engine, qemu)) => (Some(engine), Some(qemu)),
+            Err(error) => {
+                eprintln!("sarun-engine run --qemu: packet socket: {error}");
+                return 1;
+            }
+        }
+    } else {
+        (None, None)
+    };
     let request = RequestEnvelope::Transport(TransportRequest::Register {
         command: appliance_command.command.clone(),
         provenance,
         name,
         backend: RunBackend::Qemu,
         architecture: Some(architecture),
-        net_mode: WireNetMode::Off,
+        net_mode: wire_net_mode,
         capture: true,
         direct: false,
         capture_environment: env,
@@ -818,13 +827,20 @@ pub fn run_qemu(
         }
     };
     let pidfd = pidfd_open(std::process::id() as i32);
-    if !send_register_fds(&conn, &bytes, pidfd, None, None) {
+    if !send_register_fds(
+        &conn,
+        &bytes,
+        pidfd,
+        engine_network.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
+        None,
+    ) {
         eprintln!("sarun-engine run --qemu: register write failed");
         return 1;
     }
     if pidfd >= 0 {
         unsafe { libc::close(pidfd) };
     }
+    drop(engine_network);
     let mut reader = &conn;
     let registration = match crate::socket_wire::read_mode(&mut reader) {
         Ok(ConnectionMode::Box { registration }) => registration,
@@ -848,7 +864,13 @@ pub fn run_qemu(
         return 1;
     };
     let socket = Path::new(std::ffi::OsStr::from_bytes(socket.as_slice()));
-    match crate::appliance::run(architecture, registration.r#box, socket, &appliance_command) {
+    match crate::appliance::run(
+        architecture,
+        registration.r#box,
+        socket,
+        &appliance_command,
+        qemu_network,
+    ) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("sarun-engine run --qemu: {error}");

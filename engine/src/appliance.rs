@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -15,7 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::generated_wire::{
-    ApplianceCommand, ApplianceResult, OsString as WireOsString, QemuArchitecture,
+    ApplianceCommand, ApplianceResult, NetMode, OsString as WireOsString, QemuArchitecture,
 };
 
 const ROOT_TAG: &str = "sarun-root";
@@ -62,6 +63,8 @@ fn qemu_args(
     control_socket: &Path,
     data_dir: &Path,
     kvm: bool,
+    net_mode: NetMode,
+    network_fd: Option<RawFd>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "-nodefaults",
@@ -129,7 +132,49 @@ fn qemu_args(
         "-device".into(),
         format!("virtserialport,chardev=control,name={CONTROL_PORT}").into(),
     ]);
+    if net_mode != NetMode::Off {
+        let backend = match net_mode {
+            NetMode::Off => unreachable!(),
+            NetMode::Tap => format!(
+                "dgram,id=network,local.type=fd,local.str={}",
+                network_fd.expect("networked appliance requires its packet socket")
+            ),
+            NetMode::Host => "user,id=network".to_string(),
+        };
+        let device = match architecture {
+            // The appliance boots a built-in kernel driver and carries no PXE
+            // firmware; suppress the otherwise requested efi-virtio.rom.
+            QemuArchitecture::Aarch64 => "virtio-net-pci,rombar=0,romfile=",
+            QemuArchitecture::X8664 => "virtio-net-device",
+        };
+        args.extend([
+            "-netdev".into(),
+            backend.into(),
+            "-device".into(),
+            format!("{device},netdev=network,mac=02:73:72:6e:00:02").into(),
+        ]);
+    }
     args
+}
+
+/// Raw Ethernet packet lane between QEMU and the engine's existing smoltcp
+/// stack. SOCK_DGRAM preserves exactly one Ethernet frame per operation, just
+/// like the TAP fd consumed by `StackRuntime`, without creating another
+/// filesystem or network-policy implementation.
+pub fn packet_socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1; 2];
+    let result = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 fn wait_for_control(listener: &UnixListener, child: &mut Child) -> io::Result<UnixStream> {
@@ -175,6 +220,7 @@ pub fn run(
     box_id: u64,
     virtiofs_socket: &Path,
     command: &ApplianceCommand,
+    network: Option<OwnedFd>,
 ) -> io::Result<i32> {
     let qemu = qemu_binary(architecture);
     let data_dir = qemu
@@ -214,6 +260,8 @@ pub fn run(
         &control_socket,
         &data_dir,
         kvm,
+        command.net_mode,
+        network.as_ref().map(AsRawFd::as_raw_fd),
     );
     let mut child = Command::new(&qemu)
         .args(&args)
@@ -235,7 +283,11 @@ pub fn run(
     result
 }
 
-pub fn wire_command(command: &[String], cwd: Option<&str>) -> Result<ApplianceCommand, String> {
+pub fn wire_command(
+    command: &[String],
+    cwd: Option<&str>,
+    net_mode: crate::net::NetMode,
+) -> Result<ApplianceCommand, String> {
     let command = command
         .iter()
         .map(|value| {
@@ -266,6 +318,11 @@ pub fn wire_command(command: &[String], cwd: Option<&str>) -> Result<ApplianceCo
         command,
         cwd,
         environment,
+        net_mode: match net_mode {
+            crate::net::NetMode::Off => NetMode::Off,
+            crate::net::NetMode::Host => NetMode::Host,
+            crate::net::NetMode::Tap => NetMode::Tap,
+        },
     })
 }
 
@@ -408,6 +465,8 @@ pub fn init_main() -> i32 {
             .write(true)
             .open(&port)?;
         let command: ApplianceCommand = crate::socket_wire::read_versioned(&mut stream)?;
+        crate::net::tap::configure_appliance_network(command.net_mode)
+            .map_err(|error| io::Error::other(format!("configure network: {error}")))?;
         let code = execute_guest(&command)?;
         // The result is the host's safe-to-stop boundary: publish it only
         // after dirty guest pages have reached the shared filesystem.
@@ -439,6 +498,8 @@ mod tests {
             Path::new("C"),
             Path::new("D"),
             false,
+            NetMode::Off,
+            None,
         );
         let a = a
             .iter()
@@ -455,6 +516,8 @@ mod tests {
             Path::new("C"),
             Path::new("D"),
             false,
+            NetMode::Tap,
+            Some(17),
         );
         let x = x
             .iter()
@@ -465,6 +528,25 @@ mod tests {
         assert!(x.contains("vhost-user-fs-device"));
         assert!(x.contains("console=ttyS0"));
         assert!(x.contains("-L D"));
+        assert!(x.contains("-netdev dgram,id=network,local.type=fd,local.str=17"));
+        assert!(x.contains("virtio-net-device"));
+
+        let host = qemu_args(
+            QemuArchitecture::Aarch64,
+            Path::new("K"),
+            Path::new("V"),
+            Path::new("C"),
+            Path::new("D"),
+            false,
+            NetMode::Host,
+            None,
+        );
+        let host = host.iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(host.contains("-netdev user,id=network"));
+        assert!(!host.contains("local.type=fd"));
     }
 
     #[test]
@@ -476,11 +558,28 @@ mod tests {
             .unwrap(),
             cwd: None,
             environment: crate::wire::BoundedMap::new(BTreeMap::new()).unwrap(),
+            net_mode: NetMode::Off,
         };
         let mut bytes = Vec::new();
         crate::socket_wire::write_versioned(&mut bytes, &value).unwrap();
         let decoded: ApplianceCommand =
             crate::socket_wire::read_versioned(&mut bytes.as_slice()).unwrap();
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn packet_socket_lane_preserves_frame_boundaries() {
+        let (engine, qemu) = packet_socket_pair().unwrap();
+        let frame = b"ethernet frame";
+        assert_eq!(unsafe {
+            libc::write(qemu.as_raw_fd(), frame.as_ptr().cast(), frame.len())
+        }, frame.len() as isize);
+        let mut bytes = [0; 64];
+        let read = unsafe {
+            libc::read(engine.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len())
+        };
+        assert!(read >= 0);
+        let read = read as usize;
+        assert_eq!(&bytes[..read], b"ethernet frame");
     }
 }

@@ -12,8 +12,8 @@
 //   — the RUNNER creates the netns + TAP and hands the engine the TAP fd
 //   (SCM_RIGHTS on the register conn); `control::prepare_net` then stands up a
 //   `stack::StackRuntime` + a `dispatch::Dispatcher` around that fd. There is
-//   no `Net`-level per-box handle: each box's stack is owned by its own poll
-//   thread and torn down when that thread's TAP fd closes.
+//   `control::Shared` retains a stop handle for each box so teardown ends its
+//   poll/dispatcher threads and closes the TAP or QEMU packet fd.
 //
 // Per-box layout (Class E /16 per box, 12 bits of box id):
 //   box subnet : (240 | (box_id >> 8)).(box_id & 0xff).0.0/16
@@ -106,8 +106,7 @@ pub struct ReplaySource {
 use std::sync::Arc;
 
 /// Global per-engine networking state — held by the engine main loop. The
-/// per-box smoltcp stack is owned by its own poll thread (driven by the box's
-/// TAP fd) and dispatcher task; the engine keeps no per-box handle.
+/// per-box smoltcp stacks are retained by the control plane until box teardown.
 pub struct Net {
     pub ca: Arc<ca::Ca>,
     /// One global banner-prompt queue. Boxes share it: the user sees one
