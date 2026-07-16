@@ -13,11 +13,13 @@
 use crate::depot::BoxDepot;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -129,9 +131,13 @@ fn has_opaque_ancestor(b: &BoxState, rel: &str) -> bool {
 /// control plane holds another to add/remove boxes. All state is behind the
 /// shared Inner.
 #[derive(Clone)]
-pub struct Overlay {
+pub struct SarunFs {
     inner: Arc<Inner>,
 }
+
+/// Transitional source-compatible name for control-plane callers.  Filesystem
+/// policy lives in `SarunFs`; transports must not grow another implementation.
+pub type Overlay = SarunFs;
 
 struct Inner {
     lower: PathBuf,
@@ -501,7 +507,7 @@ fn is_synthetic_landing(rel: &str) -> bool {
     matches!(rel, "proc" | "dev" | "sys" | "tmp")
 }
 
-impl Overlay {
+impl SarunFs {
     /// Drain queued (box_id, rel, op) events out of the overlay — the
     /// control loop calls this on a tick and broadcasts each one as a
     /// type=overlay event to subscribers. Returns at most OVERLAY_EVT_CAP
@@ -525,7 +531,7 @@ impl Overlay {
     }
 
     pub fn new(lower: PathBuf) -> Self {
-        let ov = Overlay { inner: Arc::new(Inner {
+        let ov = SarunFs { inner: Arc::new(Inner {
             lower,
             boxes: RwLock::new(BTreeMap::new()),
             inodes: crate::sarunfs::InodeTable::new((0, String::new())),
@@ -1507,6 +1513,81 @@ impl Overlay {
         }
     }
 
+    /// Transport-neutral lookup.  Both the host `/dev/fuse` adapter and the
+    /// virtio-fs server enter policy here, including synthetic nodes and inode
+    /// lookup lifetime accounting.
+    fn lookup_node(&self, parent: u64, name: &OsStr) -> Result<FileAttr, Errno> {
+        let (bid, prel) = self.key_of(INodeNo(parent)).ok_or(Errno::ENOENT)?;
+        let name = name.to_str().ok_or(Errno::ENOENT)?;
+        let attr = if bid == 0 {
+            let id = name.parse::<i64>().map_err(|_| Errno::ENOENT)?;
+            if self.box_of(id).is_none() {
+                return Err(Errno::ENOENT);
+            }
+            let ino = self.ino_for(&(id, String::new()));
+            self.synth_dir_attr(ino, 0o40755, 0)
+        } else {
+            let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
+            if prel.is_empty() && name == KIDS_DIR {
+                let ino = self.ino_for(&(bid, KIDS_DIR.to_string()));
+                self.synth_dir_attr(ino, 0o40755, 0)
+            } else if prel == KIDS_DIR {
+                let cid = name.parse::<i64>().map_err(|_| Errno::ENOENT)?;
+                if self.box_of(cid).and_then(|child| child.parent()) != Some(bid) {
+                    return Err(Errno::ENOENT);
+                }
+                let ino = self.ino_for(&(cid, String::new()));
+                self.synth_dir_attr(ino, 0o40755, 0)
+            } else {
+                let rel = if prel.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prel}/{name}")
+                };
+                let ino = self.ino_for(&(bid, rel.clone()));
+                if prel.is_empty() && (sink_stream(&rel).is_some() || rel == JOBSERVER) {
+                    self.synth_file_attr(ino)
+                } else {
+                    if !(b.is_api()
+                        && (Self::oaita_config_ancestor_or_self(&rel)
+                            || Self::oaita_state_ancestor_self_or_within(&rel)))
+                        && Self::is_engine_path(&rel)
+                    {
+                        return Err(Errno::ENOENT);
+                    }
+                    self.attr_of(&b, ino, &rel).ok_or(Errno::ENOENT)?
+                }
+            }
+        };
+        self.inner.inodes.acquire(u64::from(attr.ino), 1);
+        Ok(attr)
+    }
+
+    fn getattr_node(&self, inode: u64) -> Result<FileAttr, Errno> {
+        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        if bid == 0 || rel.is_empty() || rel == KIDS_DIR {
+            return Ok(self.synth_dir_attr(inode, 0o40755, 0));
+        }
+        if sink_stream(&rel).is_some() || rel == JOBSERVER {
+            return Ok(self.synth_file_attr(inode));
+        }
+        let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
+        self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)
+    }
+
+    fn readlink_node(&self, inode: u64) -> Result<Vec<u8>, Errno> {
+        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        self.box_of(bid).ok_or(Errno::ENOENT)?;
+        match self.resolve(bid, &rel) {
+            Layer::UpperSymlink { target } =>
+                Ok(target.as_os_str().as_encoded_bytes().to_vec()),
+            Layer::Lower => std::fs::read_link(self.host(&rel))
+                .map(|target| target.as_os_str().as_encoded_bytes().to_vec())
+                .map_err(|_| Errno::EINVAL),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
     /// D3: the first actual write to `rel` copies the RESOLVED lower bytes
     /// (the parent box's version if nested, else the host file, else empty)
     /// into a fresh pool blob in THIS box (creating the row + provenance) and
@@ -1665,7 +1746,7 @@ impl Overlay {
     }
 }
 
-impl Filesystem for Overlay {
+impl Filesystem for SarunFs {
     fn init(&mut self, _req: &Request,
             config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         // Negotiate kernel FUSE_PASSTHROUGH (kernel 6.9+). WHICH opens use it is
@@ -1679,65 +1760,9 @@ impl Filesystem for Overlay {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let Some((bid, prel)) = self.key_of(parent) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let Some(name) = name.to_str() else { return reply.error(Errno::ENOENT) };
-        if bid == 0 {
-            // synthetic root: entries are box ids
-            let Ok(id) = name.parse::<i64>() else { return reply.error(Errno::ENOENT) };
-            if self.box_of(id).is_none() {
-                return reply.error(Errno::ENOENT);
-            }
-            let ino = self.ino_for(&(id, String::new()));
-            self.inner.inodes.acquire(ino, 1);
-            return reply.entry(&TTL, &self.synth_dir_attr(ino, 0o40755, 0),
-                               Generation(0));
-        }
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        // The hidden synthetic KIDS_DIR at a box root, and routing through it to
-        // a live child's REAL overlay-root inode (nested-launch bind target).
-        if prel.is_empty() && name == KIDS_DIR {
-            let ino = self.ino_for(&(bid, KIDS_DIR.to_string()));
-            self.inner.inodes.acquire(ino, 1);
-            return reply.entry(&TTL, &self.synth_dir_attr(ino, 0o40755, 0),
-                               Generation(0));
-        }
-        if prel == KIDS_DIR {
-            if let Ok(cid) = name.parse::<i64>() {
-                if self.box_of(cid).and_then(|c| c.parent()) == Some(bid) {
-                    let cino = self.ino_for(&(cid, String::new()));
-                    self.inner.inodes.acquire(cino, 1);
-                    return reply.entry(&TTL,
-                        &self.synth_dir_attr(cino, 0o40755, 0), Generation(0));
-                }
-            }
-            return reply.error(Errno::ENOENT);
-        }
-        let rel = if prel.is_empty() { name.to_string() }
-                  else { format!("{prel}/{name}") };
-        let ino = self.ino_for(&(bid, rel.clone()));
-        if prel.is_empty() && (sink_stream(&rel).is_some() || rel == JOBSERVER) {
-            self.inner.inodes.acquire(ino, 1);
-            return reply.entry(&TTL, &self.synth_file_attr(ino), Generation(0));
-        }
-        // Engine self-hide: sarun's own host dirs are invisible to boxes.
-        // --api substitution path is checked inside attr_of BEFORE this,
-        // so the substituted oaita.toml stays visible for api boxes.
-        if b.is_api()
-            && (Self::oaita_config_ancestor_or_self(&rel)
-                || Self::oaita_state_ancestor_self_or_within(&rel))
-        {
-            // exempt — fall through to normal lookup
-        } else if Self::is_engine_path(&rel) {
-            return reply.error(Errno::ENOENT);
-        }
-        match self.attr_of(&b, ino, &rel) {
-            Some(a) => {
-                self.inner.inodes.acquire(ino, 1);
-                reply.entry(&TTL, &a, Generation(0));
-            }
-            None => reply.error(Errno::ENOENT),
+        match self.lookup_node(u64::from(parent), name) {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -1747,35 +1772,16 @@ impl Filesystem for Overlay {
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>,
                reply: ReplyAttr) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
-        };
-        if bid == 0 || rel.is_empty() || rel == KIDS_DIR {
-            return reply.attr(&TTL, &self.synth_dir_attr(u64::from(ino), 0o40755, 0));
-        }
-        if sink_stream(&rel).is_some() || rel == JOBSERVER {
-            return reply.attr(&TTL, &self.synth_file_attr(u64::from(ino)));
-        }
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        match self.attr_of(&b, u64::from(ino), &rel) {
-            Some(a) => reply.attr(&TTL, &a),
-            None => reply.error(Errno::ENOENT),
+        match self.getattr_node(u64::from(ino)) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(error) => reply.error(error),
         }
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let Some(_) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        match self.resolve(bid, &rel) {
-            Layer::UpperSymlink { target } =>
-                reply.data(target.as_os_str().as_encoded_bytes()),
-            Layer::Lower => match std::fs::read_link(self.host(&rel)) {
-                Ok(t) => reply.data(t.as_os_str().as_encoded_bytes()),
-                Err(_) => reply.error(Errno::EINVAL),
-            },
-            _ => reply.error(Errno::EINVAL),
+        match self.readlink_node(u64::from(ino)) {
+            Ok(data) => reply.data(&data),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -2833,10 +2839,68 @@ impl Filesystem for Overlay {
     }
 }
 
+fn virtio_error(error: Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(i32::from(error))
+}
+
+/// Canonical filesystem protocol implementation.  vhost-user-fs and the
+/// forthcoming SUD ring call this trait directly; the legacy fuser callbacks
+/// above are now an adapter over the same policy operations.
+impl virtiofsd::filesystem::FileSystem for SarunFs {
+    type Inode = u64;
+    type Handle = u64;
+    type DirIter = crate::sarunfs::EmptyDirIter;
+
+    fn lookup(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        parent: u64,
+        name: &CStr,
+    ) -> std::io::Result<virtiofsd::filesystem::Entry> {
+        let attr = self
+            .lookup_node(parent, OsStr::from_bytes(name.to_bytes()))
+            .map_err(virtio_error)?;
+        Ok(virtiofsd::filesystem::Entry {
+            inode: u64::from(attr.ino),
+            generation: 0,
+            attr: crate::sarunfs::virtio_attr(attr),
+            attr_timeout: TTL,
+            entry_timeout: TTL,
+        })
+    }
+
+    fn forget(&self, _ctx: virtiofsd::filesystem::Context, inode: u64, count: u64) {
+        self.inner.inodes.forget(inode, count);
+    }
+
+    fn getattr(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+        _handle: Option<u64>,
+    ) -> std::io::Result<(virtiofsd::fuse::Attr, Duration)> {
+        let attr = self.getattr_node(inode).map_err(virtio_error)?;
+        Ok((crate::sarunfs::virtio_attr(attr), TTL))
+    }
+
+    fn readlink(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+    ) -> std::io::Result<Vec<u8>> {
+        self.readlink_node(inode).map_err(virtio_error)
+    }
+}
+
+/// Live migration is intentionally unsupported in the first appliance
+/// generation.  The upstream trait's default methods return `Unsupported`.
+impl virtiofsd::filesystem::SerializableFileSystem for SarunFs {}
+
 #[cfg(test)]
 mod chain_tests {
     use super::*;
     use crate::capture::{BoxState, ExtRef, RoAttachment};
+    use std::ffi::CString;
 
     fn ext_ref(prefix: &str) -> ExtRef {
         ExtRef { kind: "git".into(), store: "/nonexistent".into(),
@@ -2888,5 +2952,56 @@ mod chain_tests {
         assert_eq!(ov.box_path_kind(owner, "deep"), 'd');
         // Off-prefix rels miss the attachment and stay writable.
         assert!(!ov.ro_denied(owner, "elsewhere"));
+    }
+
+    #[test]
+    fn canonical_virtio_lookup_uses_the_shared_policy_and_lifetime() {
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "sarun-canonical-fs-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: TEST_STATE_HOME_LOCK serializes state-home tests.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let fs = SarunFs::new(tmp.clone());
+        let id = 9201;
+        fs.add_box(Arc::new(BoxState::create(id).unwrap()));
+        let ctx = virtiofsd::filesystem::Context {
+            uid: 0.into(),
+            gid: 0.into(),
+            pid: 1,
+        };
+        let name = CString::new(id.to_string()).unwrap();
+        let entry = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &fs,
+            ctx,
+            1,
+            &name,
+        )
+        .unwrap();
+        assert_eq!(entry.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(fs.inner.inodes.lookup_count(entry.inode), 1);
+
+        let (attr, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
+            &fs,
+            ctx,
+            entry.inode,
+            None,
+        )
+        .unwrap();
+        assert_eq!(attr.ino, entry.inode);
+        <SarunFs as virtiofsd::filesystem::FileSystem>::forget(
+            &fs,
+            ctx,
+            entry.inode,
+            1,
+        );
+        assert_eq!(fs.inner.inodes.lookup_count(entry.inode), 0);
+
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }

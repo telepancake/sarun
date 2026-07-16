@@ -60,7 +60,7 @@ as executable mappings and mmap that genuinely need a host fd.
 
 - [x] Pin/vendor the library and gate daemon-only native dependencies.
 - [x] Prove fully static aarch64 and x86_64 musl builds.
-- [ ] Introduce `SarunFs` implementing `FileSystem` and explicitly unsupported
+- [x] Introduce `SarunFs` implementing `FileSystem` and explicitly unsupported
       `SerializableFileSystem` migration hooks.
 - [ ] Separate virtual inode/handle lifetime, overlay policy, underlying layer
       access, capture/provenance, and synthetic nodes.

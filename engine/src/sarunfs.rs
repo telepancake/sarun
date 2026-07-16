@@ -4,8 +4,12 @@
 //! virtio-fs guest protocol have identical lifetime rules, so the mapping and
 //! reference counts live here and are shared by every frontend.
 
+pub use crate::overlay::SarunFs;
+
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 pub(crate) type NodeKey = (i64, String);
 
@@ -105,7 +109,7 @@ impl InodeTable {
     }
 
     #[cfg(test)]
-    fn lookup_count(&self, inode: u64) -> u64 {
+    pub(crate) fn lookup_count(&self, inode: u64) -> u64 {
         self.state
             .read()
             .unwrap()
@@ -113,6 +117,55 @@ impl InodeTable {
             .get(&inode)
             .copied()
             .unwrap_or(0)
+    }
+}
+
+fn timestamp(value: SystemTime) -> (u64, u32) {
+    value
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+        .unwrap_or((0, 0))
+}
+
+pub(crate) fn virtio_attr(attr: fuser::FileAttr) -> virtiofsd::fuse::Attr {
+    let (atime, atimensec) = timestamp(attr.atime);
+    let (mtime, mtimensec) = timestamp(attr.mtime);
+    let (ctime, ctimensec) = timestamp(attr.ctime);
+    let kind = match attr.kind {
+        fuser::FileType::NamedPipe => libc::S_IFIFO,
+        fuser::FileType::CharDevice => libc::S_IFCHR,
+        fuser::FileType::BlockDevice => libc::S_IFBLK,
+        fuser::FileType::Directory => libc::S_IFDIR,
+        fuser::FileType::RegularFile => libc::S_IFREG,
+        fuser::FileType::Symlink => libc::S_IFLNK,
+        fuser::FileType::Socket => libc::S_IFSOCK,
+    };
+    virtiofsd::fuse::Attr {
+        ino: u64::from(attr.ino),
+        size: attr.size,
+        blocks: attr.blocks,
+        atime,
+        mtime,
+        ctime,
+        atimensec,
+        mtimensec,
+        ctimensec,
+        mode: kind | u32::from(attr.perm),
+        nlink: attr.nlink,
+        uid: attr.uid.into(),
+        gid: attr.gid.into(),
+        rdev: attr.rdev,
+        blksize: attr.blksize,
+        flags: attr.flags,
+    }
+}
+
+#[doc(hidden)]
+pub struct EmptyDirIter;
+
+impl virtiofsd::filesystem::DirectoryIterator for EmptyDirIter {
+    fn next(&mut self) -> Option<virtiofsd::filesystem::DirEntry<'_>> {
+        None
     }
 }
 

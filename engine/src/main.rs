@@ -230,7 +230,7 @@ fn serve() -> i32 {
     }
     // Mount the multi-box overlay at the instance mountpoint (threads = cores).
     let mnt = paths::mnt_point();
-    let ov = overlay::Overlay::new(PathBuf::from("/"));
+    let ov = sarunfs::SarunFs::new(PathBuf::from("/"));
     let mut cfg = Config::default();
     cfg.mount_options = vec![MountOption::FSName("sarun-rs".into())];
     let n = std::thread::available_parallelism()
