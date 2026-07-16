@@ -1,5 +1,6 @@
 :- module(local_state_relation,
           [ empty_local_state/1,
+           state_constraint_completion_pairs/3,
            valid_local_state/1,
            resolve_state_resolutions/3,
            run_state_steps/6
@@ -31,6 +32,126 @@ run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta) :-
     run_steps(Steps, Initial, Final, Resolutions, Queries),
     Final = local_state(_, Delta),
     valid_local_state(Final).
+
+%! state_constraint_completion_pairs(+Constraints, +State, -Pairs)
+%  is semidet.
+%
+%  Resolve symbolic text references through the same scoped state used during
+%  parsing, then relate a single source hole to a finite typed value domain.
+%  The result uses the engine's ordinary completion-pair representation.
+
+state_constraint_completion_pairs(Constraints, State, Pairs) :-
+    proper_list(Constraints),
+    valid_text_constraints(Constraints),
+    valid_local_state(State),
+    findall(Pair,
+            state_constraint_completion_pair(Constraints, State, Pair),
+            Pairs).
+
+valid_text_constraints([]).
+valid_text_constraints([Constraint|Constraints]) :-
+    valid_text_constraint(Constraint),
+    valid_text_constraints(Constraints).
+
+valid_text_constraint(
+    text_constraint(Expression, one_of(Values), presentation(Syntax))) :-
+    valid_text_expression(Expression),
+    proper_list(Values), Values = [_|_],
+    valid_constraint_values(Values),
+    atom(Syntax).
+
+valid_text_expression(text(Segments)) :-
+    proper_list(Segments),
+    valid_text_segments(Segments).
+
+valid_text_segments([]).
+valid_text_segments([Segment|Segments]) :-
+    valid_text_segment(Segment),
+    valid_text_segments(Segments).
+
+valid_text_segment(Text) :- string(Text), !.
+valid_text_segment(hole(EditId, span(Start, End), Surface, Codec)) :-
+    ground(EditId), integer(Start), integer(End), 0 =< Start, Start =< End,
+    string(Surface), ground(Codec), !.
+valid_text_segment(reference(Domain, Name)) :-
+    ground(Domain), ground(Name), !.
+valid_text_segment(text(Segments)) :-
+    valid_text_expression(text(Segments)).
+
+valid_constraint_values([]).
+valid_constraint_values([value(Text, Semantic, Description, Preference)|Values]) :-
+    string(Text), ground(Semantic), ground(Description), number(Preference),
+    valid_constraint_values(Values).
+
+state_constraint_completion_pair([Constraint|_], State, Pair) :-
+    text_constraint_completion_pair(Constraint, State, Pair).
+state_constraint_completion_pair([_|Constraints], State, Pair) :-
+    state_constraint_completion_pair(Constraints, State, Pair).
+
+text_constraint_completion_pair(
+    text_constraint(Expression, one_of(Values), presentation(Syntax)),
+    State,
+    completion_key(Span, Insert)-
+        (alternative(Semantic, Syntax, Description)-Preference)) :-
+    atom(Syntax),
+    proper_list(Values),
+    resolve_text_expression(Expression, State, [], Segments),
+    single_text_hole(Segments, Hole, Prefix, Suffix),
+    Hole = hole(_EditId, Span, Surface, _Codec),
+    value_member(value(Text, Semantic, Description, Preference), Values),
+    string(Text), ground(Semantic), ground(Description), number(Preference),
+    hole_insertion(Text, Prefix, Suffix, Surface, Insert).
+
+resolve_text_expression(text(Segments), State, Seen, Resolved) :-
+    proper_list(Segments),
+    resolve_text_segments(Segments, State, Seen, Resolved).
+
+resolve_text_segments([], _, _, []).
+resolve_text_segments([Segment|Segments], State, Seen, Resolved) :-
+    resolve_text_segment(Segment, State, Seen, First),
+    resolve_text_segments(Segments, State, Seen, Rest),
+    append(First, Rest, Resolved).
+
+resolve_text_segment(Text, _, _, [Text]) :- string(Text), !.
+resolve_text_segment(hole(EditId, Span, Surface, Codec), _, _,
+                     [hole(EditId, Span, Surface, Codec)]) :-
+    ground(hole(EditId, Span, Surface, Codec)),
+    string(Surface), !.
+resolve_text_segment(reference(Domain, Name), State, Seen, Resolved) :-
+    ground(Domain), ground(Name),
+    \+ binding_key_member(Domain, Name, Seen),
+    lookup_binding(State, Domain, Name,
+                   local_binding(Domain, Name, Value, _)),
+    resolve_text_expression(Value, State, [Domain-Name|Seen], Resolved).
+resolve_text_segment(text(Segments), State, Seen, Resolved) :-
+    resolve_text_expression(text(Segments), State, Seen, Resolved).
+
+single_text_hole(Segments, Hole, Prefix, Suffix) :-
+    append(PrefixSegments, [Hole|SuffixSegments], Segments),
+    Hole = hole(_, _, _, _),
+    text_segments_string(PrefixSegments, Prefix),
+    text_segments_string(SuffixSegments, Suffix).
+
+text_segments_string([], "").
+text_segments_string([Text|Texts], Combined) :-
+    string(Text),
+    text_segments_string(Texts, Rest),
+    string_concat(Text, Rest, Combined).
+
+hole_insertion(Text, Prefix, Suffix, Surface, Insert) :-
+    string_length(Text, TextLength),
+    string_length(Prefix, PrefixLength),
+    string_length(Suffix, SuffixLength),
+    InsertLength is TextLength - PrefixLength - SuffixLength,
+    InsertLength >= 0,
+    sub_string(Text, 0, PrefixLength, _, Prefix),
+    sub_string(Text, PrefixLength, InsertLength, SuffixLength, Insert),
+    sub_string(Text, _, SuffixLength, 0, Suffix),
+    string_length(Surface, SurfaceLength),
+    sub_string(Insert, 0, SurfaceLength, _, Surface).
+
+value_member(Value, [Value|_]).
+value_member(Value, [_|Values]) :- value_member(Value, Values).
 
 run_steps([], State, State, [], []).
 run_steps([Step|Steps], State0, State, Resolutions, Queries) :-

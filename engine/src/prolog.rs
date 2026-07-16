@@ -3536,6 +3536,108 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_text_constraint_crosses_the_embedded_relation() {
+        let hole = rv_compound(
+            "hole",
+            vec![
+                rv_atom("edit"),
+                rv_compound("span", vec![rv_integer(3), rv_integer(3)]),
+                rv_string(""),
+                rv_compound(
+                    "text",
+                    vec![rv_compound("codepoint", vec![rv_atom("any")])],
+                ),
+            ],
+        );
+        let state = rv_compound(
+            "local_state",
+            vec![
+                rv_list(vec![rv_compound(
+                    "scope",
+                    vec![
+                        rv_atom("root"),
+                        rv_list(vec![rv_compound(
+                            "local_binding",
+                            vec![
+                                rv_atom("shell_variable"),
+                                rv_string("A"),
+                                rv_compound("text", vec![rv_list(vec![hole])]),
+                                rv_atom("escaping"),
+                            ],
+                        )]),
+                    ],
+                )]),
+                rv_list(vec![]),
+            ],
+        );
+        let values = [
+            ("f", "file"),
+            ("d", "directory"),
+            ("l", "symlink"),
+        ]
+        .into_iter()
+        .map(|(text, semantic)| {
+            rv_compound(
+                "value",
+                vec![
+                    rv_string(text),
+                    rv_atom(semantic),
+                    rv_atom("find_type"),
+                    rv_integer(30),
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+        let constraints = rv_list(vec![rv_compound(
+            "text_constraint",
+            vec![
+                rv_compound(
+                    "text",
+                    vec![rv_list(vec![rv_compound(
+                        "reference",
+                        vec![rv_atom("shell_variable"), rv_string("A")],
+                    )])],
+                ),
+                rv_compound("one_of", vec![rv_list(values)]),
+                rv_compound("presentation", vec![rv_atom("find_type_argument")]),
+            ],
+        )]);
+        let reply = global()
+            .unwrap()
+            .transform(&RelationRequest {
+                grammar: rv_atom("symbolic_text_grammar"),
+                given: vec![
+                    RelationBinding {
+                        name: "constraints".into(),
+                        value: constraints,
+                    },
+                    RelationBinding {
+                        name: "final_state".into(),
+                        value: state,
+                    },
+                ],
+                wanted: vec!["completions".into()],
+                observations: vec![],
+                limits: RelationLimits::default(),
+            })
+            .unwrap();
+        assert!(reply.diagnostics.is_empty());
+        assert_eq!(reply.solutions.len(), 1);
+        let completions = decode_completions_value(&reply.solutions[0].bindings[0].value)
+            .unwrap();
+        assert_eq!(
+            completions
+                .iter()
+                .map(|completion| completion.insert.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d", "f", "l"],
+        );
+        assert!(completions
+            .iter()
+            .all(|completion| completion.replace == Span { start: 3, end: 3 }));
+    }
+
+    #[test]
     fn render_no_solution_is_distinct_from_backend_decode_error() {
         let mut invalid = command("missing_action", None);
         invalid.handler = "missing_handler".into();

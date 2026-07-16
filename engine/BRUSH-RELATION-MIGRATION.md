@@ -269,6 +269,13 @@ Do not implement these as Brush-specific engine branches:
       successful `one` observations bind the external value, missing or
       ambiguous `one` observations remove the semantic solution, and every
       consumed observation yields a provenance-free dependency key.
+- [x] Add a grammar-independent symbolic text constraint relation over scoped
+      state. A later `reference(Domain, Name)` resolves through the local scope
+      chain to an earlier source hole, and a finite typed value relation emits
+      ordinary ranked completion evidence for every matching value. Prefix and
+      suffix text constrain the replacement; cyclic, missing, and malformed
+      bindings fail closed. Brush AST/value glue and command signatures still
+      need to produce these generic constraints.
 - [ ] Add explicit providers for aliases, functions, builtins, PATH commands,
       filesystem names, environment, and programmable completion specs.
 - [ ] Compose builtin argument grammars after command resolution; start with a

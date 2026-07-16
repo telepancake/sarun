@@ -78,6 +78,15 @@ transform_relation(local_state_grammar, Given, Wanted, Observations, _Limits,
        Solutions = [solution(Bindings, 0)]
     ;  Solutions = []
     ).
+transform_relation(symbolic_text_grammar, Given, Wanted, _Observations,
+                   _Limits,
+                   reply([solution(Bindings, 0)], [], [], [])) :-
+    given_value(constraints, Given, Constraints),
+    given_value(final_state, Given, State),
+    state_constraint_completion_pairs(Constraints, State, Pairs),
+    project_completions(Pairs, Completions),
+    Available = [binding(completions, Completions)],
+    requested_bindings(Wanted, Available, Bindings).
 transform_relation(ast_state_grammar(Rules), Given, Wanted, Observations,
                    _Limits,
                    reply(Solutions, ReadyQueries,

@@ -7,6 +7,8 @@ test_name(escaping_assignment_is_local_and_returns_delta).
 test_name(shadowing_and_scope_exit_are_lexical).
 test_name(external_resolution_consumes_unique_observation).
 test_name(failed_unique_observation_fails_resolution).
+test_name(later_constraint_binds_hole_through_local_reference).
+test_name(symbolic_constraints_fail_closed).
 
 run_local_state_relation_tests :-
     findall(Name, test_name(Name), Names),
@@ -94,3 +96,30 @@ run_test(failed_unique_observation_fails_resolution) :-
            [resolved(Id, external(ref(Id)))],
            [observed(Id, ask(one, symbol, name("z")),
                      source(symbols, 4), none)], _).
+
+run_test(later_constraint_binds_hole_through_local_reference) :-
+    Hole = hole(edit, span(3, 3), "", text(codepoint(any))),
+    State = local_state(
+        [scope(root,
+               [local_binding(shell_variable, "A", text([Hole]), escaping)])],
+        []),
+    Values = [value("f", file, find_type, 30),
+              value("d", directory, find_type, 30),
+              value("l", symlink, find_type, 30)],
+    Constraints = [text_constraint(
+                       text([reference(shell_variable, "A")]),
+                       one_of(Values), presentation(find_type_argument))],
+    state_constraint_completion_pairs(Constraints, State, Pairs),
+    Pairs = [completion_key(span(3, 3), "f")-
+                 (alternative(file, find_type_argument, find_type)-30),
+             completion_key(span(3, 3), "d")-
+                 (alternative(directory, find_type_argument, find_type)-30),
+             completion_key(span(3, 3), "l")-
+                 (alternative(symlink, find_type_argument, find_type)-30)].
+
+run_test(symbolic_constraints_fail_closed) :-
+    empty_local_state(State),
+    \+ state_constraint_completion_pairs(
+           [text_constraint(text([hole(edit, span(2, 1), "", any)]),
+                            one_of([]), presentation(invalid))],
+           State, _).

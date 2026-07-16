@@ -8,6 +8,7 @@ test_name(tear_completion_is_aggregated_from_parse_evidence).
 test_name(context_queries_completions_and_dependencies_are_one_relation).
 test_name(context_support_uses_the_same_given_wanted_envelope).
 test_name(local_state_suppresses_resolved_external_queries).
+test_name(symbolic_text_constraint_projects_local_backward_completions).
 test_name(parsed_ast_composes_with_declarative_state_adapter).
 test_name(grammar_choice_and_projection_are_executable_data).
 test_name(projection_template_is_bidirectional_and_can_append_values).
@@ -217,6 +218,37 @@ run_test(local_state_suppresses_resolved_external_queries) :-
                    0)],
               [query(free_z,
                      ask(one, shell_variable, name("z")))], [], [])).
+
+run_test(symbolic_text_constraint_projects_local_backward_completions) :-
+    Hole = hole(edit, span(3, 3), "", text(codepoint(any))),
+    State = local_state(
+        [scope(root,
+               [local_binding(shell_variable, "A", text([Hole]), escaping)])],
+        []),
+    Constraints = [text_constraint(
+                       text([reference(shell_variable, "A")]),
+                       one_of([value("f", file, find_type, 30),
+                               value("d", directory, find_type, 30),
+                               value("l", symlink, find_type, 30)]),
+                       presentation(find_type_argument))],
+    limits(Limits),
+    transform(
+        request(symbolic_text_grammar,
+                given([binding(constraints, Constraints),
+                       binding(final_state, State)]),
+                want([completions]), observations([]), Limits),
+        reply([solution([binding(
+                   completions,
+                   [completion(span(3, 3), "d",
+                               [alternative(directory, find_type_argument,
+                                            find_type, 30)], 30, 1),
+                    completion(span(3, 3), "f",
+                               [alternative(file, find_type_argument,
+                                            find_type, 30)], 30, 2),
+                    completion(span(3, 3), "l",
+                               [alternative(symlink, find_type_argument,
+                                            find_type, 30)], 30, 3)])], 0)],
+              [], [], [])).
 
 run_test(parsed_ast_composes_with_declarative_state_adapter) :-
     NameCodepoint = terminal(
