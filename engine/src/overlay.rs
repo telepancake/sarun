@@ -104,7 +104,7 @@ pub struct SarunFs {
 pub type Overlay = SarunFs;
 
 struct Inner {
-    lower: PathBuf,
+    backing: crate::sarunfs::backing::BackingStore,
     boxes: RwLock<BTreeMap<i64, Arc<BoxState>>>,
     // Engine-owned read-only files projected into a live box without becoming
     // captured upper state. This is the generic seam for boot/runtime support
@@ -175,6 +175,12 @@ struct Fh {
     inner: FhInner,
 }
 
+enum FileData {
+    Native(File),
+    Lower(crate::sarunfs::backing::BackingFile),
+    Sink(i32),
+}
+
 enum Handle {
     File(Mutex<Fh>),
     Directory(Arc<Vec<DirNode>>),
@@ -184,7 +190,7 @@ enum Handle {
 struct FhInner {
     box_id: i64,
     rel: String,
-    file: Option<File>,
+    data: FileData,
     upper: bool,
     dirty: bool,
     last_pid: u32,
@@ -198,7 +204,6 @@ struct FhInner {
     // brush↔pipeline linkage (finalize_brush_links) both rely on. 0 until the
     // first data write; release() only consults it when `dirty`, so 0 is safe.
     last_tgid: u32,
-    sink: Option<i32>, // Some(stream) → writes go to the outputs table, not a blob
     passthrough: bool, // writes go straight to the real host file (uncaptured)
     // Kernel passthrough backing registration; kept alive as long as the fd
     // (its Drop closes the registration). Only set for readonly-ruled reads.
@@ -493,8 +498,12 @@ impl SarunFs {
     }
 
     pub fn new(lower: PathBuf) -> Self {
+        let backing = crate::sarunfs::backing::BackingStore::new(lower.clone())
+            .unwrap_or_else(|error| {
+                panic!("cannot initialize upstream backing {}: {error}", lower.display())
+            });
         let ov = SarunFs { inner: Arc::new(Inner {
-            lower,
+            backing,
             boxes: RwLock::new(BTreeMap::new()),
             projections: RwLock::new(HashMap::new()),
             inodes: crate::sarunfs::InodeTable::new((0, String::new())),
@@ -977,7 +986,7 @@ impl SarunFs {
                 self.ensure_upper_blob(owner, rowid, rel);
                 std::fs::read(crate::depot::blob_path(owner, rowid))
             }
-            Layer::Lower => std::fs::read(self.host(rel)),
+            Layer::Lower => self.inner.backing.read_all(rel),
             Layer::ExtFile { att, rel, .. } => match att.blob(&rel) {
                 Some(depot_model::variant::Blob::Bytes(b)) => Ok(b),
                 Some(depot_model::variant::Blob::File(p)) => std::fs::read(p),
@@ -1010,8 +1019,8 @@ impl SarunFs {
         match self.resolve(bid, rel) {
             Layer::UpperFile { mode, .. } | Layer::ExtFile { mode, .. } =>
                 Some(mode & 0o7777),
-            Layer::Lower => std::fs::symlink_metadata(self.host(rel)).ok()
-                .map(|m| m.permissions().mode() & 0o7777),
+            Layer::Lower => self.inner.backing.attr(rel).ok()
+                .map(|attr| attr.mode & 0o7777),
             _ => None,
         }
     }
@@ -1078,10 +1087,10 @@ impl SarunFs {
             Layer::UpperDir { .. } => 'd',
             Layer::UpperSymlink { .. } => 'l',
             Layer::UpperSpecial { .. } => 's',
-            Layer::Lower => match self.host(rel).symlink_metadata() {
-                Ok(m) if m.file_type().is_symlink() => 'l',
-                Ok(m) if m.is_dir() => 'd',
-                Ok(m) if m.is_file() => 'f',
+            Layer::Lower => match self.inner.backing.attr(rel).map(|attr| attr.kind) {
+                Ok(NodeKind::Symlink) => 'l',
+                Ok(NodeKind::Directory) => 'd',
+                Ok(NodeKind::RegularFile) => 'f',
                 Ok(_) => 's',
                 Err(_) => '?',
             },
@@ -1138,7 +1147,7 @@ impl SarunFs {
     }
 
     fn host(&self, rel: &str) -> PathBuf {
-        if rel.is_empty() { self.inner.lower.clone() } else { self.inner.lower.join(rel) }
+        self.inner.backing.direct_path(rel)
     }
 
     /// A box's OWN layer for `rel` (single level, no parent walk) — used by the
@@ -1148,7 +1157,7 @@ impl SarunFs {
         crate::sarunfs::layers::own_layer(
             b,
             rel,
-            self.host(rel).symlink_metadata().is_ok(),
+            self.inner.backing.exists(rel),
         )
     }
 
@@ -1254,13 +1263,12 @@ impl SarunFs {
             rel,
             self.box_of(bid).is_some_and(|origin| origin.is_api()),
             &chain,
-            self.host(rel).symlink_metadata().is_ok(),
+            self.inner.backing.exists(rel),
         )
     }
 
     fn lower_attr(&self, ino: u64, rel: &str) -> Option<NodeAttr> {
-        let md = self.host(rel).symlink_metadata().ok()?;
-        Some(self.attr_from_md(ino, &md))
+        self.inner.backing.attr(rel).ok().map(|attr| attr.node_attr(ino))
     }
 
     fn attr_from_md(&self, ino: u64, md: &std::fs::Metadata) -> NodeAttr {
@@ -1488,8 +1496,8 @@ impl SarunFs {
         match self.resolve(bid, &rel) {
             Layer::UpperSymlink { target } =>
                 Ok(target.as_os_str().as_encoded_bytes().to_vec()),
-            Layer::Lower => std::fs::read_link(self.host(&rel))
-                .map(|target| target.as_os_str().as_encoded_bytes().to_vec())
+            Layer::Lower => self.inner.backing.node(&rel)
+                .and_then(|node| node.readlink())
                 .map_err(|_| Errno::EINVAL),
             _ => Err(Errno::EINVAL),
         }
@@ -1574,12 +1582,11 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
-                file: Some(file),
+                data: FileData::Native(file),
                 upper: false,
                 dirty: false,
                 last_pid: pid,
                 last_tgid: 0,
-                sink: None,
                 passthrough: false,
                 _backing: None,
             });
@@ -1613,12 +1620,11 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
-                file: None,
+                data: FileData::Sink(stream),
                 upper: false,
                 dirty: false,
                 last_pid: pid,
                 last_tgid: 0,
-                sink: Some(stream),
                 passthrough: false,
                 _backing: None,
             });
@@ -1644,12 +1650,11 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
-                file: Some(file),
+                data: FileData::Native(file),
                 upper: true,
                 dirty: false,
                 last_pid: pid,
                 last_tgid: 0,
-                sink: None,
                 passthrough: true,
                 _backing: None,
             });
@@ -1677,12 +1682,11 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
-                file: Some(file),
+                data: FileData::Native(file),
                 upper: false,
                 dirty: false,
                 last_pid: pid,
                 last_tgid: 0,
-                sink: None,
                 passthrough: false,
                 _backing: None,
             });
@@ -1694,7 +1698,13 @@ impl SarunFs {
                 backing_candidate: false,
             });
         }
-        let (file, upper) = match self.resolve(bid, &rel) {
+        const FMODE_EXEC: u32 = 0x20;
+        let backing_candidate = allow_backing
+            && !want_write
+            && flags & FMODE_EXEC == 0
+            && (b.direct() || self.is_passthrough_read(&rel))
+            && self.inner.passthrough_ok.load(Ordering::Relaxed);
+        let (data, upper) = match self.resolve(bid, &rel) {
             Layer::UpperFile { owner, rowid, .. } => {
                 self.ensure_upper_blob(owner, rowid, &rel);
                 let own = owner == bid;
@@ -1703,17 +1713,34 @@ impl SarunFs {
                     .write(want_write && own)
                     .open(blob_path(owner, rowid))
                     .map_err(|_| Errno::EIO)?;
-                (file, own)
+                (FileData::Native(file), own)
             }
             Layer::Lower => {
-                let host = if b.is_api() && Self::matches_host_oaita_config(&rel) {
-                    crate::paths::api_box_oaita_toml_path()
+                let projected = if b.is_api() && Self::matches_host_oaita_config(&rel) {
+                    Some(crate::paths::api_box_oaita_toml_path())
                 } else if b.is_brush() && self.shadow_matches(&rel) {
-                    self.shadow_target_path().unwrap_or_else(|| self.host(&rel))
+                    self.shadow_target_path()
                 } else {
-                    self.host(&rel)
+                    None
                 };
-                (File::open(host).map_err(|_| Errno::EACCES)?, false)
+                if let Some(path) = projected {
+                    (FileData::Native(File::open(path).map_err(|_| Errno::EACCES)?), false)
+                } else if backing_candidate {
+                    (
+                        FileData::Native(
+                            File::open(self.host(&rel)).map_err(|_| Errno::EACCES)?
+                        ),
+                        false,
+                    )
+                } else {
+                    let lower = self
+                        .inner
+                        .backing
+                        .node(&rel)
+                        .and_then(|node| node.open())
+                        .map_err(|_| Errno::EACCES)?;
+                    (FileData::Lower(lower), false)
+                }
             }
             Layer::ExtFile { att, rel: erel, .. } => {
                 let file = match att.blob(&erel) {
@@ -1725,25 +1752,18 @@ impl SarunFs {
                     None => None,
                 }
                 .ok_or(Errno::EIO)?;
-                (file, false)
+                (FileData::Native(file), false)
             }
             _ => return Err(Errno::ENOENT),
         };
-        const FMODE_EXEC: u32 = 0x20;
-        let backing_candidate = allow_backing
-            && !want_write
-            && flags & FMODE_EXEC == 0
-            && (b.direct() || self.is_passthrough_read(&rel))
-            && self.inner.passthrough_ok.load(Ordering::Relaxed);
         let handle = self.reg_fh(FhInner {
             box_id: bid,
             rel,
-            file: Some(file),
+            data,
             upper,
             dirty: false,
             last_pid: pid,
             last_tgid: 0,
-            sink: None,
             passthrough: false,
             _backing: None,
         });
@@ -1800,12 +1820,11 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
-                file: Some(file),
+                data: FileData::Native(file),
                 upper: true,
                 dirty: false,
                 last_pid: pid,
                 last_tgid: 0,
-                sink: None,
                 passthrough: true,
                 _backing: None,
             });
@@ -1836,12 +1855,11 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
-                file: Some(file),
+                data: FileData::Native(file),
                 upper: true,
                 dirty: true,
                 last_pid: pid,
                 last_tgid: 0,
-                sink: None,
                 passthrough: false,
                 _backing: None,
             });
@@ -1996,12 +2014,13 @@ impl SarunFs {
             return Err(Errno::EEXIST);
         }
         let writer = b.writer_for(pid);
-        let lower_old = self.host(&old_rel).symlink_metadata().is_ok();
+        let lower_attr = self.inner.backing.attr(&old_rel).ok();
+        let lower_old = lower_attr.is_some();
         match self.layer(&b, &old_rel) {
             Layer::Absent => return Err(Errno::ENOENT),
             Layer::UpperDir { .. } => {
                 b.reparent(&old_rel, &new_rel);
-                if self.host(&old_rel).is_dir() {
+                if lower_attr.is_some_and(|attr| attr.kind == NodeKind::Directory) {
                     b.set_whiteout(&old_rel, writer);
                 }
             }
@@ -2201,7 +2220,9 @@ impl SarunFs {
                 Layer::UpperFile { .. } => b.set_mode(&rel, libc::S_IFREG | permissions),
                 Layer::UpperDir { .. } => b.set_mode(&rel, libc::S_IFDIR | permissions),
                 Layer::UpperSymlink { .. } => {}
-                Layer::Lower if self.host(&rel).is_dir() => b.set_dir(&rel, permissions, writer),
+                Layer::Lower if self.inner.backing.attr(&rel).is_ok_and(|attr| {
+                    attr.kind == NodeKind::Directory
+                }) => b.set_dir(&rel, permissions, writer),
                 Layer::Lower => {
                     self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
                     b.set_mode(&rel, libc::S_IFREG | permissions);
@@ -2215,7 +2236,11 @@ impl SarunFs {
             let current = b.owner_of(&rel).unwrap_or((0, 0));
             let uid = request.uid.unwrap_or(current.0);
             let gid = request.gid.unwrap_or(current.1);
-            if matches!(self.layer(&b, &rel), Layer::Lower) && !self.host(&rel).is_dir() {
+            if matches!(self.layer(&b, &rel), Layer::Lower)
+                && !self.inner.backing.attr(&rel).is_ok_and(|attr| {
+                    attr.kind == NodeKind::Directory
+                })
+            {
                 self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
             }
             if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
@@ -2231,7 +2256,11 @@ impl SarunFs {
             b.set_owner(&rel, uid, gid);
         }
         if let Some(mtime) = request.mtime {
-            if matches!(self.layer(&b, &rel), Layer::Lower) && !self.host(&rel).is_dir() {
+            if matches!(self.layer(&b, &rel), Layer::Lower)
+                && !self.inner.backing.attr(&rel).is_ok_and(|attr| {
+                    attr.kind == NodeKind::Directory
+                })
+            {
                 self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
             }
             let nanos = mtime
@@ -2252,20 +2281,49 @@ impl SarunFs {
         self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)
     }
 
-    fn read_file_node(&self, handle: u64) -> Result<File, Errno> {
+    fn read_file_node(
+        &self,
+        handle: u64,
+        buffer: &mut [u8],
+        offset: u64,
+    ) -> Result<usize, Errno> {
         self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
         let handle = self.inner.handles.get(handle).ok_or(Errno::EBADF)?;
         let Handle::File(handle) = &*handle else {
             return Err(Errno::EBADF);
         };
         let handle = handle.lock().unwrap();
-        handle
+        match &handle.inner.data {
+            FileData::Native(file) => file.read_at(buffer, offset).map_err(Errno::from),
+            FileData::Lower(lower) => lower.read_at(buffer, offset).map_err(Errno::from),
+            FileData::Sink(_) => Err(Errno::EBADF),
+        }
+    }
+
+    fn read_file_to<W: virtiofsd::filesystem::ZeroCopyWriter>(
+        &self,
+        handle: u64,
+        mut writer: W,
+        size: u32,
+        offset: u64,
+    ) -> std::io::Result<usize> {
+        self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
+        let handle = self
             .inner
-            .file
-            .as_ref()
-            .ok_or(Errno::EBADF)?
-            .try_clone()
-            .map_err(Errno::from)
+            .handles
+            .get(handle)
+            .ok_or_else(|| virtio_error(Errno::EBADF))?;
+        let Handle::File(handle) = &*handle else {
+            return Err(virtio_error(Errno::EBADF));
+        };
+        let handle = handle.lock().unwrap();
+        match &handle.inner.data {
+            FileData::Native(file) => {
+                writer.read_from_file_at(file, size as usize, offset, None)
+            }
+            FileData::Lower(lower) => lower.read_to(writer, size, offset),
+            FileData::Sink(_) => Err(virtio_error(Errno::EBADF)),
+        }
     }
 
     fn prepare_write_node(&self, pid: u32, handle: u64) -> Result<WriteTarget, Errno> {
@@ -2277,15 +2335,15 @@ impl SarunFs {
             return Err(Errno::EBADF);
         };
         let mut handle = handle.lock().unwrap();
-        if let Some(stream) = handle.inner.sink {
+        if let FileData::Sink(stream) = &handle.inner.data {
             return Ok(WriteTarget::Sink {
                 box_id: handle.inner.box_id,
-                stream,
+                stream: *stream,
             });
         }
         if !handle.inner.upper {
             let b = self.box_of(handle.inner.box_id).ok_or(Errno::EIO)?;
-            handle.inner.file = Some(
+            handle.inner.data = FileData::Native(
                 self.copy_up(&b, &handle.inner.rel.clone(), pid)
                     .map_err(|_| Errno::EIO)?,
             );
@@ -2299,13 +2357,10 @@ impl SarunFs {
             }
         }
         handle.inner.last_pid = pid;
-        let file = handle
-            .inner
-            .file
-            .as_ref()
-            .ok_or(Errno::EBADF)?
-            .try_clone()
-            .map_err(Errno::from)?;
+        let FileData::Native(file) = &handle.inner.data else {
+            return Err(Errno::EBADF);
+        };
+        let file = file.try_clone().map_err(Errno::from)?;
         Ok(WriteTarget::File {
             file,
             box_id: handle.inner.box_id,
@@ -2348,7 +2403,7 @@ impl SarunFs {
             return Err(Errno::EBADF);
         };
         let handle = handle.lock().unwrap();
-        if handle.inner.sink.is_some() {
+        if matches!(&handle.inner.data, FileData::Sink(_)) {
             self.note_sink_release(handle.inner.box_id);
         } else if handle.inner.dirty && !handle.inner.passthrough {
             if let Some(b) = self.box_of(handle.inner.box_id) {
@@ -2358,13 +2413,16 @@ impl SarunFs {
                     handle.inner.last_pid
                 };
                 let writer = b.writer_for(writer_id);
-                if let Some(metadata) = handle.inner.file.as_ref().and_then(|file| file.metadata().ok()) {
-                    b.finalize_file(
-                        &handle.inner.rel,
-                        metadata.size() as i64,
-                        metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
-                        writer,
-                    );
+                if let FileData::Native(file) = &handle.inner.data {
+                    let metadata = file.metadata().ok();
+                    if let Some(metadata) = metadata {
+                        b.finalize_file(
+                            &handle.inner.rel,
+                            metadata.size() as i64,
+                            metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+                            writer,
+                        );
+                    }
                 }
             }
         }
@@ -2380,25 +2438,15 @@ impl SarunFs {
             return Err(Errno::EBADF);
         };
         let handle = handle.lock().unwrap();
-        let Some(file) = handle.inner.file.as_ref() else {
-            return Ok(());
-        };
-        if data_only {
-            file.sync_data().map_err(Errno::from)
-        } else {
-            file.sync_all().map_err(Errno::from)
+        match &handle.inner.data {
+            FileData::Native(file) if data_only => file.sync_data().map_err(Errno::from),
+            FileData::Native(file) => file.sync_all().map_err(Errno::from),
+            FileData::Lower(_) | FileData::Sink(_) => Ok(()),
         }
     }
 
     fn statfs_node(&self) -> Result<libc::statvfs64, Errno> {
-        let path = CString::new(self.inner.lower.as_os_str().as_encoded_bytes())
-            .map_err(|_| Errno::EINVAL)?;
-        let mut stat: libc::statvfs64 = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs64(path.as_ptr(), &mut stat) } == 0 {
-            Ok(stat)
-        } else {
-            Err(Errno::from(std::io::Error::last_os_error()))
-        }
+        self.inner.backing.statfs().map_err(Errno::from)
     }
 
     /// D3: the first actual write to `rel` copies the RESOLVED lower bytes
@@ -2428,24 +2476,26 @@ impl SarunFs {
         }
         let writer = b.writer_for(pid);
         // Source the lower bytes + mode from the parent-chain resolution.
-        let (src, mode): (Option<PathBuf>, u32) = match self.resolve(b.id, rel) {
+        let (src, mode, lower_source): (Option<PathBuf>, u32, bool) =
+            match self.resolve(b.id, rel) {
             Layer::UpperFile { owner, rowid, mode } => {
                 // Re-materialize an inline (discard-reverted) row to its blob
                 // so the copy below — and the box's own re-run write — has a
                 // source. See ensure_upper_blob.
                 self.ensure_upper_blob(owner, rowid, rel);
-                (Some(blob_path(owner, rowid)), mode)
+                (Some(blob_path(owner, rowid)), mode, false)
             }
             Layer::Lower => {
-                let m = self.host(rel).symlink_metadata().map(|m| m.mode())
+                let mode = self.inner.backing.attr(rel)
+                    .map(|attr| attr.mode)
                     .unwrap_or(0o100644);
-                (Some(self.host(rel)), m)
+                (None, mode, true)
             }
             // Unreachable: every mutation path EROFS'd at ro_denied
             // before copy_up could see an attachment-resolved key.
             Layer::ExtFile { .. } =>
                 return Err(std::io::Error::from_raw_os_error(libc::EROFS)),
-            _ => (None, 0o100644),
+            _ => (None, 0o100644, false),
         };
         let rowid = b.ensure_file_row(rel, mode, writer);
         let bp = blob_path(b.id, rowid);
@@ -2453,9 +2503,14 @@ impl SarunFs {
             std::fs::create_dir_all(parent)?;
         }
         if !bp.exists() {
-            match src {
-                Some(s) => { std::fs::copy(&s, &bp)?; }
-                None => { File::create(&bp)?; }
+            if lower_source {
+                let destination = File::create(&bp)?;
+                self.inner.backing.copy_to(rel, &destination)?;
+            } else {
+                match src {
+                    Some(s) => { std::fs::copy(&s, &bp)?; }
+                    None => { File::create(&bp)?; }
+                }
             }
         }
         OpenOptions::new().read(true).write(true).open(&bp)
@@ -2483,12 +2538,10 @@ impl SarunFs {
         let no_host = chain.iter().any(|l| matches!(l,
             ChainLink::Box(bx) if bx.no_host_fallback()));
         if !no_host {
-            if let Ok(rd) = std::fs::read_dir(self.host(rel)) {
-                for ent in rd.flatten() {
-                    if let Some(n) = ent.file_name().to_str() {
-                        names.insert(n.to_string(), ());
-                    }
-                }
+            if let Ok(backing_names) = self.inner.backing.node(rel)
+                .and_then(|node| node.read_dir())
+            {
+                for name in backing_names { names.insert(name, ()); }
             }
         }
         for link in chain {
@@ -2524,12 +2577,10 @@ impl SarunFs {
                 {
                     names.clear();
                     if !no_host {
-                        if let Ok(rd) = std::fs::read_dir(self.host(rel)) {
-                            for ent in rd.flatten() {
-                                if let Some(n) = ent.file_name().to_str() {
-                                    names.insert(n.to_string(), ());
-                                }
-                            }
+                        if let Ok(backing_names) = self.inner.backing.node(rel)
+                            .and_then(|node| node.read_dir())
+                        {
+                            for name in backing_names { names.insert(name, ()); }
                         }
                     }
                 }
@@ -2542,7 +2593,7 @@ impl SarunFs {
                     if !no_host {
                         let hp = if rel.is_empty() { h.clone() }
                                  else { format!("{rel}/{h}") };
-                        if self.host(&hp).symlink_metadata().is_ok() {
+                        if self.inner.backing.exists(&hp) {
                             names.insert(h.clone(), ());
                         }
                     }
@@ -2701,7 +2752,7 @@ impl Filesystem for SarunFs {
                     return reply.error(Errno::EBADF);
                 };
                 let mut handle = handle.lock().unwrap();
-                if let Some(file) = handle.inner.file.as_ref() {
+                if let FileData::Native(file) = &handle.inner.data {
                     if let Ok(backing) = reply.open_backing(file) {
                         reply.opened_passthrough(
                             FileHandle(opened.handle),
@@ -2755,14 +2806,10 @@ impl Filesystem for SarunFs {
             }
             return;
         }
-        let f = match self.read_file_node(u64::from(fh)) {
-            Ok(file) => file,
-            Err(error) => return reply.error(error),
-        };
         let mut buf = vec![0u8; size as usize];
-        match f.read_at(&mut buf, offset) {
+        match self.read_file_node(u64::from(fh), &mut buf, offset) {
             Ok(n) => reply.data(&buf[..n]),
-            Err(_) => reply.error(Errno::EIO),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -3350,14 +3397,13 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         _ctx: virtiofsd::filesystem::Context,
         _inode: u64,
         handle: u64,
-        mut writer: W,
+        writer: W,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> std::io::Result<usize> {
-        let file = self.read_file_node(handle).map_err(virtio_error)?;
-        writer.read_from_file_at(&file, size as usize, offset, None)
+        self.read_file_to(handle, writer, size, offset)
     }
 
     fn write<R: virtiofsd::filesystem::ZeroCopyReader>(

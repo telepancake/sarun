@@ -5,6 +5,7 @@
 //! reference counts live here and are shared by every frontend.
 
 pub use crate::overlay::SarunFs;
+pub(crate) mod backing;
 pub(crate) mod layers;
 
 use std::collections::HashMap;

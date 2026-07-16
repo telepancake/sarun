@@ -67,15 +67,17 @@ as executable mappings and mmap that genuinely need a host fd.
   - [x] Make inode identity, lookup counts, handle allocation/lifetime, node
         kinds, and node attributes transport-independent; fuser and virtio-fs
         only encode canonical values at their reply boundaries.
-  - [ ] Isolate merged-layer resolution and ordinary backing-file access.
+  - [x] Isolate merged-layer resolution and ordinary backing-file access.
     - [x] Move precedence, whiteout, hole, opacity, rebase, attachment, and
           synthetic-landing decisions into a pure transport-independent layer
           resolver with direct behavior tests.
-    - [ ] Delegate ordinary host-backed operations to the upstream passthrough
-          machinery instead of open-coding them in protocol callbacks.
+    - [x] Delegate host-backed lookup, attributes, open/read/release, readlink,
+          directory cookies, copy-up reads, and statfs to upstream passthrough.
+          Native paths remain only at explicit direct-write and negotiated
+          kernel-passthrough acceleration boundaries.
   - [ ] Isolate capture/provenance mutation from protocol callbacks.
   - [ ] Isolate synthetic projections, sinks, jobserver, and nested-box nodes.
-- [ ] Use virtiofsd passthrough machinery for ordinary host-backed operations;
+- [x] Use virtiofsd passthrough machinery for ordinary host-backed operations;
       retain only sarun-specific composition and capture policy.
 - [ ] Add canonical-message tests for lookup counts, forgotten/open inodes,
       rename/unlink lifetime, hardlinks, symlinks, xattrs, ownership, locks,
@@ -163,7 +165,7 @@ holding hours of work only in the worktree.
 
 ## Known baseline failures
 
-- The 2026-07-17 full static aarch64 unit run passed 364 tests, ignored one,
+- The 2026-07-17 full static aarch64 unit run passed 370 tests, ignored one,
   and exposed two pre-existing Brush/editor semantic-completion assertions:
   `production_brush_document_propagates_later_find_type_constraint` and
   `bash_editor_uses_relation_for_backward_completion_and_insertion`.  The
