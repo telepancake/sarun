@@ -165,8 +165,10 @@ replacement spans, cursor tears, and diagnostics.
 
 - [x] Cut the main UI's Bash editor path to the same analysis client and remove
       syntastica Bash selection.
-- [ ] Cut Brush-interactive highlighting, completion, validation, hints, and
-      indentation to the same provider, then delete the adjacent algorithms.
+- [ ] Cut Brush-interactive highlighting, validation, hints, and indentation to
+      the same provider, then delete the adjacent algorithms. Completion has
+      crossed this boundary already: Reedline requires and directly presents
+      `sarun_brush` completion edits, with no old-completer fallback.
 - [ ] Reuse the editor analysis for Kati recipes, heredocs, and embedded shell
       regions through grammar composition rather than language-name branches.
 

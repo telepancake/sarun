@@ -241,3 +241,14 @@ fn standalone_brush_edit_builtin_completes_visible_local_after_dollar() {
         b"#!/bin/bash\nA=\"\"\nfind . -type $A",
     );
 }
+
+#[test]
+fn standalone_brush_edit_builtin_completes_builtin_argument_definition() {
+    run_editor_case(
+        "builtin_argument",
+        b"bind -m ",
+        b"",
+        0,
+        b"bind -m emacs-ctlx",
+    );
+}

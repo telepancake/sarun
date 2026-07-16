@@ -467,8 +467,11 @@ finite value-taking arguments from the exact Clap definitions used to execute
 builtins. The first concrete client is `bind -m`: its five canonical keymap
 values pass through ordinary source parsing, scoped constraints, and completion
 evidence in both the production document API and editor. This is grammar data
-composition, not a `bind` parser or completion case; interactive Reedline still
-requires its singular-authority cutover below.
+composition, not a `bind` parser or completion case. Interactive Reedline now
+uses the same completion projection through a required neutral provider; the
+old token-based completer is absent from sarun's path. Its highlighting,
+validation, hints, indentation, and context-observation slices still require
+the broader singular-authority cutover below.
 
 The next externally usable checkpoint is explicitly the complete interactive
 `sarun brush` editing experience: relation-owned highlighting, completion,

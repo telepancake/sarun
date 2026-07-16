@@ -2427,6 +2427,45 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
 /// Interactive REPL for `sh -i`/`bash -i` inside a `-b` box: reedline backend
 /// with history, completion, and highlighting. Same brush-core shell as `-c`.
 /// Set-flags are applied before the loop starts.
+struct BrushRelationCompletionProvider;
+
+impl brush_interactive::SemanticCompletionProvider for BrushRelationCompletionProvider {
+    fn complete(
+        &self,
+        source: &str,
+        cursor: usize,
+    ) -> Vec<brush_interactive::SemanticCompletion> {
+        let Ok(analysis) = crate::prolog::analyze_brush_document(
+            &crate::prolog::BrushDocumentRequest {
+                source: source.to_string(),
+                assist: Some(crate::prolog::Span {
+                    start: cursor,
+                    end: cursor,
+                }),
+                initial_bindings: vec![],
+                observations: vec![],
+            },
+        ) else {
+            return Vec::new();
+        };
+        analysis
+            .candidates
+            .into_iter()
+            .flat_map(|candidate| candidate.completions)
+            .map(|completion| brush_interactive::SemanticCompletion {
+                description: completion
+                    .alternatives
+                    .first()
+                    .map(|alternative| alternative.provider.clone()),
+                insert: completion.insert,
+                display: completion.display,
+                replace_start: completion.replace.start,
+                replace_end: completion.replace.end,
+            })
+            .collect()
+    }
+}
+
 async fn run_brush_interactive(shell_name: String,
                                set_flags: Vec<String>, set_o: Vec<String>,
                                unset_o: Vec<String>, bash_mode: bool) -> i32 {
@@ -2465,7 +2504,7 @@ async fn run_brush_interactive(shell_name: String,
         tokio::sync::Mutex::new(shell));
     let ui_opts = brush_interactive::UIOptions::builder().build();
     let mut backend = match brush_interactive::ReedlineInputBackend::new(
-        &ui_opts, &shell_ref) {
+        &ui_opts, &shell_ref, std::sync::Arc::new(BrushRelationCompletionProvider)) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("sarun-engine brush-sh: reedline init failed: {e}");
@@ -3085,6 +3124,29 @@ mod builtin_boundary_tests {
         );
         assert!(keymap.values.iter().all(|value| {
             !matches!(value.text.as_str(), "emacs" | "vi" | "vi-move")
+        }));
+    }
+
+    #[test]
+    fn interactive_completion_provider_projects_the_same_relation_edits() {
+        use brush_interactive::SemanticCompletionProvider as _;
+
+        let completions = super::BrushRelationCompletionProvider.complete("bind -m ", 8);
+        for expected in [
+            "emacs-standard",
+            "emacs-meta",
+            "emacs-ctlx",
+            "vi-command",
+            "vi-insert",
+        ] {
+            assert!(completions.iter().any(|completion| {
+                completion.insert == expected
+                    && completion.replace_start == 8
+                    && completion.replace_end == 8
+            }));
+        }
+        assert!(completions.iter().all(|completion| {
+            !matches!(completion.insert.as_str(), "emacs" | "vi" | "vi-move")
         }));
     }
 

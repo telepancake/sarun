@@ -25,9 +25,11 @@ interpreters:
   word separately and heuristically classifies command position. It does not
   require the complete surrounding program to parse and does not reset all
   grammar state through an ordinary AST traversal.
-- completion separately splits input with `COMP_WORDBREAKS`, treats the first
-  resulting token as the command, and runs programmable/basic lookup logic.
-  This is not evidence projected from an ordinary parse.
+- sarun's Reedline completion path now requires a host semantic provider and
+  presents exact edits from `sarun_brush`; its former `COMP_WORDBREAKS` lookup
+  call has been deleted. Brush-core still contains the old completion machinery
+  for not-yet-migrated upstream/basic-backend consumers, but it is no longer an
+  authority in standalone `sarun brush`.
 - heredocs are recognized by the execution tokenizer and PEG grammar, including
   dynamic delimiters, `<<-`, quoted-delimiter expansion rules, and heredocs
   nested inside command substitutions. `IoHereDocument::location()` currently
@@ -321,8 +323,12 @@ Do not implement these as Brush-specific engine branches:
 
 - [ ] Cut Reedline highlighting to relation evidence, then delete the old
       tokenizer/word-piece highlighter.
-- [ ] Cut Reedline completion to tear evidence plus explicit context queries,
-      then delete `COMP_WORDBREAKS` completion tokenization and lookup routing.
+- [x] Cut sarun's Reedline completion to ordinary tear evidence and delete its
+      call into `COMP_WORDBREAKS` tokenization/lookup. The backend constructor
+      requires a neutral semantic provider and has no optional provider or
+      fallback. A native aarch64 PTY proves `bind -m |` shows the canonical
+      builtin-definition values in an actual standalone `sarun brush` session.
+      Live shell and filesystem observations remain provider work below.
 - [ ] Cut validation/indentation/diagnostics after complete/incomplete/invalid
       parity is proven.
 - [ ] Cut provenance AST consumption, standalone Brush, box Brush, sourced
@@ -337,7 +343,9 @@ Do not implement these as Brush-specific engine branches:
 
 - [ ] Expose one required, relation-neutral analysis-provider interface at the
       sarun/Brush-interactive boundary. Sarun supplies it; Reedline does not
-      import Prolog types or reinterpret shell syntax.
+      import Prolog types or reinterpret shell syntax. The completion slice is
+      now required and neutral; broaden this same boundary to the other
+      projections rather than adding parallel provider interfaces.
 - [ ] Make one cached analysis result feed highlighting, completion,
       validation, indentation, diagnostics, and hints for a buffer revision.
 - [ ] Supply pure snapshots/observations from the persistent Brush shell and
