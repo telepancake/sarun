@@ -126,8 +126,8 @@ fn top_level_help() -> Result<String, String> {
        -t passthrough   -d direct (no overlay)   -e record-env   -b brush-shell   -p pty\n  \
        -C DIR   --no-parent   --readonly-parent   --api (oaita proxy)   --vars (variable provenance)\n"
         .to_string();
-    let rows = action_help::ui_rows("")?;
-    help.push_str("\ninteractive action language (generated from the central relation):\n");
+    let rows = action_help::rows("")?;
+    help.push_str("\naction language (generated from the central relation):\n");
     help.push_str(&action_help::render_rows(&rows, "  "));
     Ok(help)
 }
@@ -814,6 +814,9 @@ fn main() {
             // Help is a local representation projection. It does not involve
             // the engine or ui.sock.
             std::process::exit(action_help::cli(&argv[1..]));
+        }
+        Some("brush") => {
+            std::process::exit(brush::cli(&argv[1..]));
         }
         Some("mirror") => {
             // sarun mirror ls|add|run|pause|resume|rm — mirror-update jobs.

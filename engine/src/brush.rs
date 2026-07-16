@@ -1468,6 +1468,45 @@ pub fn is_brush_sh_invocation() -> bool {
     matches!(base, "sh" | "bash" | "dash")
 }
 
+/// Public, standalone Brush CLI. Unlike `sarun run -b`, this executes in the
+/// invoking process on the host and needs neither an engine nor a box. Argv is
+/// first related to the central action grammar without joining its elements;
+/// the resulting strings are then ordinary shell argv after `sarun brush`.
+pub fn cli(arguments: &[String]) -> i32 {
+    let mut source = Vec::with_capacity(arguments.len() + 1);
+    source.push("brush".to_string());
+    source.extend_from_slice(arguments);
+    let invocation = match crate::parser::parse_argv(&source, &crate::parser::EmptyContext) {
+        crate::parser::ParseResult::Invocation(invocation)
+            if invocation.action == "brush"
+                && invocation.target == crate::parser::ActionTarget::CliLocal => invocation,
+        crate::parser::ParseResult::BackendError(error) => {
+            eprintln!("sarun brush: parser: {error}");
+            return 2;
+        }
+        _ => {
+            eprintln!(
+                "usage: sarun brush [SHELL_ARGS...]\n       sarun brush -c SCRIPT [NAME [ARG...]]\n       sarun brush SCRIPT [ARG...]"
+            );
+            return 2;
+        }
+    };
+    let mut shell_argv = vec!["bash".to_string()];
+    for value in invocation.args {
+        match value {
+            crate::parser::ArgValue::String(value) => shell_argv.push(value),
+            _ => {
+                eprintln!("sarun brush: grammar returned a non-string shell argument");
+                return 2;
+            }
+        }
+    }
+    if shell_argv.len() == 1 {
+        shell_argv.push("-i".into());
+    }
+    brush_sh(&shell_argv)
+}
+
 /// Nested-shell shim. `argv` is the full process argv (argv[0] = shell name).
 /// Parses `-c SCRIPT` or a script-file form, emits nested provenance, then runs
 /// through brush-core. No real-shell fallback: errors are visible + non-zero.
@@ -2775,6 +2814,19 @@ mod builtin_boundary_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn standalone_cli_runs_relation_parsed_argv_without_an_engine() {
+        let arguments = [
+            "-c",
+            "[ \"$#\" -eq 2 ] && [ \"$1\" = 'argument with spaces' ] && [ -z \"$2\" ]",
+            "brush",
+            "argument with spaces",
+            "",
+        ]
+        .map(str::to_string);
+        assert_eq!(super::cli(&arguments), 0);
+    }
 
     /// A fresh empty scratch dir under the system tempdir (never the process cwd).
     fn scratch_dir() -> PathBuf {

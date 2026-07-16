@@ -563,6 +563,13 @@ impl Prolog {
         self.relation_action_help(None, None)
     }
 
+    pub fn action_help_matching(
+        &self,
+        filter: &str,
+    ) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
+        self.relation_action_help(None, Some(filter))
+    }
+
     pub fn ui_action_help(&self) -> Result<Vec<crate::generated_wire::ActionHelpRow>, String> {
         self.relation_action_help(Some("ui"), None)
     }

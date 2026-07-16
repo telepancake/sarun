@@ -9,6 +9,10 @@ pub fn ui_rows(filter: &str) -> Result<Vec<ActionHelpRow>, String> {
     crate::prolog::global()?.ui_action_help_matching(filter)
 }
 
+pub fn rows(filter: &str) -> Result<Vec<ActionHelpRow>, String> {
+    crate::prolog::global()?.action_help_matching(filter)
+}
+
 pub fn render_rows(rows: &[ActionHelpRow], prefix: &str) -> String {
     let width = rows
         .iter()
@@ -32,7 +36,7 @@ pub fn cli(arguments: &[String]) -> i32 {
         return 2;
     }
     let filter = arguments.first().map(String::as_str).unwrap_or("");
-    match ui_rows(filter) {
+    match rows(filter) {
         Ok(rows) if rows.is_empty() => {
             eprintln!("no actions match {filter:?}");
             1

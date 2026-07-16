@@ -258,6 +258,7 @@ standalone_projection_reply(Projections, Given, Wanted,
 choice_alternative_reply(
     [alternative(Key, Preference, Grammar)|_], Given, Wanted, Observations,
     Limits, Reply) :-
+    choice_alternative_applicable(Grammar, Given),
     scoped_observations(Key, Observations, InnerObservations),
     transform_relation(Grammar, Given, Wanted, InnerObservations, Limits,
                        InnerReply),
@@ -266,6 +267,33 @@ choice_alternative_reply([_|Alternatives], Given, Wanted, Observations,
                          Limits, Reply) :-
     choice_alternative_reply(Alternatives, Given, Wanted, Observations,
                              Limits, Reply).
+
+% Reject a choice cheaply when both the source and the branch expose a
+% discriminating first literal.  This is an engine optimization over generic
+% grammar data, not an action-language index: unknown grammar shapes, empty
+% sources, and non-literal prefixes conservatively retain the branch.  The
+% comparison deliberately has the same exact/prefix behavior as match_literal
+% so pruning cannot change parse or completion results.
+choice_alternative_applicable(Grammar, Given) :-
+    ( given_value(source, Given, source([Item|_], Mode)),
+      grammar_initial_literal(Grammar, Text)
+    -> initial_literal_may_match(Item, Mode, Text)
+    ;  true
+    ).
+
+grammar_initial_literal(
+    sequence_grammar([literal(_, Text, _, _, _)|_], _, _, _), Text).
+grammar_initial_literal(projection_grammar(Grammar, _), Text) :-
+    grammar_initial_literal(Grammar, Text).
+
+initial_literal_may_match(
+    unit(_, _, _, Surface, _, _, _, _), Mode, Text) :-
+    source_mode(Mode),
+    text_string(Surface, SurfaceString),
+    SurfaceString = Text.
+initial_literal_may_match(edit_tear(EditId, _, Surface), assist(EditId), Text) :-
+    surface_prefix(Surface, Text).
+initial_literal_may_match(source_tear(_, _, _), _, _).
 
 scoped_observations(_, [], []).
 scoped_observations(Key,
@@ -903,11 +931,22 @@ relate_sequence([argument(arg(_, _, optional, scalar))|Specs], Items, Mode,
                     Evidence, EditCount).
 relate_sequence([argument(arg(Name, Kind, repeated, Shape))|Specs], Items0,
                 Mode, TerminalRelation, Arguments, Evidence, EditCount) :-
-    repeated_arguments(Shape, Values, Specs, RepeatedArguments),
-    append(RepeatedArguments, RestArguments, Arguments),
+    source_mode(Mode),
     relate_repeated(TerminalRelation, Name, Kind, Values, Items0, Mode,
                     RepeatedEvidence, RepeatedEditCount, Items),
     relate_sequence(Specs, Items, Mode, TerminalRelation, RestArguments,
+                    RestEvidence, RestEditCount),
+    repeated_arguments(Shape, Values, Specs, RepeatedArguments),
+    append(RepeatedArguments, RestArguments, Arguments),
+    append(RepeatedEvidence, RestEvidence, Evidence),
+    EditCount is RepeatedEditCount + RestEditCount.
+relate_sequence([argument(arg(Name, Kind, repeated, Shape))|Specs], Items0,
+                render, TerminalRelation, Arguments, Evidence, EditCount) :-
+    repeated_arguments(Shape, Values, Specs, RepeatedArguments),
+    append(RepeatedArguments, RestArguments, Arguments),
+    relate_repeated(TerminalRelation, Name, Kind, Values, Items0, render,
+                    RepeatedEvidence, RepeatedEditCount, Items),
+    relate_sequence(Specs, Items, render, TerminalRelation, RestArguments,
                     RestEvidence, RestEditCount),
     append(RepeatedEvidence, RestEvidence, Evidence),
     EditCount is RepeatedEditCount + RestEditCount.

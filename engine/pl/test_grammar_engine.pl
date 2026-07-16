@@ -12,6 +12,7 @@ kinds.
 test_name(parse_foreign_sequence).
 test_name(render_foreign_sequence).
 test_name(repeat_foreign_field).
+test_name(spread_repetition_has_a_finite_complete_solution_set).
 test_name(tear_uses_ordinary_relation_and_leaves_required_hole).
 test_name(neutral_source_validation_is_engine_owned).
 test_name(completion_projection_groups_ranks_and_keeps_ambiguity).
@@ -85,6 +86,19 @@ run_test(repeat_foreign_field) :-
                          13, foreign_test),
                 evidence(word("two"), _, _, "two", foreign_word, words,
                          13, foreign_test)].
+
+run_test(spread_repetition_has_a_finite_complete_solution_set) :-
+    Specs = [literal(run, "run", foreign_keyword, run, 20),
+             argument(arg(words, word, repeated, spread))],
+    source("run", 0, Run),
+    source("one", 4, One),
+    source("two", 8, Two),
+    findall(Arguments,
+            relate_sequence(Specs, [Run, One, Two], exact,
+                            test_grammar_engine:foreign_terminal,
+                            Arguments, _Evidence, 0),
+            Solutions),
+    expect_equal(Solutions, [[word("one"), word("two")]]).
 
 run_test(tear_uses_ordinary_relation_and_leaves_required_hole) :-
     foreign_specs(Specs),

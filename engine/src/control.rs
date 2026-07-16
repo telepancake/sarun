@@ -7463,13 +7463,13 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
         eprintln!("sarun-engine: {e}");
         1
     };
-    let mut words = vec!["mirror"];
+    let mut words = vec!["mirror".to_string()];
     if argv.is_empty() {
-        words.push("ls");
+        words.push("ls".into());
     } else {
-        words.extend(argv.iter().map(String::as_str));
+        words.extend_from_slice(argv);
     }
-    let invocation = match crate::parser::parse_words(&words, &crate::parser::EmptyContext) {
+    let invocation = match crate::parser::parse_argv(&words, &crate::parser::EmptyContext) {
         crate::parser::ParseResult::Invocation(invocation) => invocation,
         _ => {
             eprintln!(

@@ -52,7 +52,7 @@ relation_limits(limits(256, 4096, 1048576)).
 
 run_test(complete_action_language_is_an_immutable_grammar_value) :-
     once(action_relation_grammar(choice_grammar(Alternatives))),
-    length(Alternatives, 107),
+    length(Alternatives, 108),
     list_has(alternative(kill, 50,
                          projection_grammar(sequence_grammar(_, _, _, _),
                                             [projection(command, _),
@@ -235,8 +235,8 @@ run_test(catalog_is_complete_and_valid) :-
     expect(valid_action_catalog),
     findall(Action, action(Action, _, _, _, _, _, _), Actions),
     sort(Actions, Unique),
-    length(Actions, 107),
-    length(Unique, 107),
+    length(Actions, 108),
+    length(Unique, 108),
     expect(all_valid(Actions)).
 
 run_test(wire_identities_are_explicit_unique_and_normalized) :-
@@ -322,9 +322,9 @@ run_test(action_identifier_has_one_mechanical_text_encoding) :-
     findall(Words,
             representation(_, command, command(Words, _)),
             CommandNames),
-    length(CommandNames, 107),
+    length(CommandNames, 108),
     sort(CommandNames, UniqueCommandNames),
-    length(UniqueCommandNames, 107),
+    length(UniqueCommandNames, 108),
     parse_words(["mirror", "run", "pending"],
                 command(mirror_run_pending, mirror_run_pending, ui, [])),
     parse_words(["mirror", "run", "5"],

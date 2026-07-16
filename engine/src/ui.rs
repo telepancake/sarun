@@ -4168,7 +4168,7 @@ impl App {
                     }
                 }
             }
-            crate::parser::ActionTarget::LocalUi => {
+            crate::parser::ActionTarget::UiLocal => {
                 if !invocation.args.is_empty() {
                     self.status = format!(
                         "command: local action {} takes no arguments",
@@ -4177,6 +4177,9 @@ impl App {
                 } else if let Err(reason) = self.dispatch_local_command(&invocation.action) {
                     self.status = format!("command: {reason}");
                 }
+            }
+            crate::parser::ActionTarget::CliLocal => {
+                self.status = format!("command: {} is a CLI-only action", invocation.action);
             }
         }
     }

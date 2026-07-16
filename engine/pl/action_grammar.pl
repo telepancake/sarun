@@ -69,6 +69,7 @@ valid_action(Action) :-
     once(action_form(Action, _, _)).
 
 valid_action_wire(local, Handler) :- \+ wire_handler(Handler, _, _).
+valid_action_wire(cli, Handler) :- \+ wire_handler(Handler, _, _).
 valid_action_wire(ui, Handler) :- valid_wire_handler(Handler).
 valid_action_wire(control, Handler) :- valid_wire_handler(Handler).
 
@@ -129,6 +130,7 @@ all_unique_terms(Terms) :-
 valid_target(ui).
 valid_target(control).
 valid_target(local).
+valid_target(cli).
 
 valid_visibility(visible).
 valid_visibility(internal).

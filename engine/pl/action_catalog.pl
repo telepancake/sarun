@@ -137,6 +137,7 @@ action(refresh, refresh, local, "", "refresh sessions, changes, and rules", visi
 action(filter, filter, local, "", "filter the active pane", visible, 50).
 action(action_menu, action_menu, local, "", "show the actions popup for the selected row", visible, 50).
 action(toggle_mark, toggle_mark, local, "", "select/unselect row for batch operations", visible, 50).
+action(brush, brush, cli, "[ARGS...]", "run the standalone embedded Brush shell (Bash mode; no engine or sandbox)", visible, 50).
 
 % Stable direct-Rust wire identities and concrete success types. These are one
 % indivisible protocol fact: an opcode cannot exist without its result schema.

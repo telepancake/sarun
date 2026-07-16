@@ -85,7 +85,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum ActionTarget {
     UiVerb,
     ControlMessage,
-    LocalUi,
+    UiLocal,
+    CliLocal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -254,9 +255,10 @@ impl ContextProvider for EmptyContext {
     }
 }
 
-/// Parse neutral source words through the same mandatory relation as text input.
-pub fn parse_words(parts: &[&str], context: &dyn ContextProvider) -> ParseResult {
-    parse(&parts.join(" "), context)
+/// Parse process argv through the same relation while preserving each argument
+/// as one source unit, including embedded whitespace and empty strings.
+pub fn parse_argv(parts: &[String], context: &dyn ContextProvider) -> ParseResult {
+    parse_surfaces(parts.iter().map(String::as_str), context)
 }
 
 /// Parse a command into a typed, wire-ready invocation through the mandatory
@@ -268,6 +270,59 @@ pub fn parse(input: &str, context: &dyn ContextProvider) -> ParseResult {
     let Some(grammar_input) = grammar_input(input, None) else {
         return ParseResult::BackendError("command input exceeds parser limits".into());
     };
+    parse_input(grammar_input, input.to_string(), context)
+}
+
+fn parse_surfaces<'a>(
+    surfaces: impl IntoIterator<Item = &'a str>,
+    context: &dyn ContextProvider,
+) -> ParseResult {
+    use crate::prolog::{GrammarInput, InputItem, KnownUnit, Semantic, Span};
+    const MAX_BUFFER_BYTES: usize = 16 * 1024;
+    const MAX_ARGUMENTS: usize = 256;
+    let surfaces: Vec<&str> = surfaces.into_iter().collect();
+    let unknown = surfaces.join(" ");
+    let mut items = Vec::new();
+    let mut offset = 0usize;
+    for surface in surfaces {
+        if items.len() >= MAX_ARGUMENTS
+            || offset
+                .checked_add(surface.len())
+                .is_none_or(|end| end > MAX_BUFFER_BYTES)
+        {
+            return ParseResult::BackendError("command argv exceeds parser limits".into());
+        }
+        let end = offset + surface.len();
+        let span = Span { start: offset, end };
+        items.push(InputItem::Unit(KnownUnit {
+            semantic: Semantic::Text(surface.into()),
+            span,
+            paint_spans: vec![span],
+            surface: surface.into(),
+            syntax: "source".into(),
+            provider: "argv".into(),
+            preference: 0,
+        }));
+        offset = end.saturating_add(1);
+    }
+    if items.is_empty() {
+        return ParseResult::Empty;
+    }
+    parse_input(
+        GrammarInput {
+            items,
+            end: offset.saturating_sub(1),
+        },
+        unknown,
+        context,
+    )
+}
+
+fn parse_input(
+    grammar_input: crate::prolog::GrammarInput,
+    unknown: String,
+    context: &dyn ContextProvider,
+) -> ParseResult {
     let prolog = match crate::prolog::global() {
         Ok(prolog) => prolog,
         Err(error) => return ParseResult::BackendError(error),
@@ -277,7 +332,7 @@ pub fn parse(input: &str, context: &dyn ContextProvider) -> ParseResult {
         Err(error) => return ParseResult::BackendError(error),
     };
     let Some(resolved) = resolved else {
-        return ParseResult::Unknown(input.to_string());
+        return ParseResult::Unknown(unknown);
     };
     match invocation_from_command(resolved.command, resolved.observations) {
         Ok(invocation) => ParseResult::Invocation(invocation),
@@ -424,7 +479,8 @@ fn invocation_from_command(
     let target = match command.target.as_str() {
         "ui" => ActionTarget::UiVerb,
         "control" => ActionTarget::ControlMessage,
-        "local" => ActionTarget::LocalUi,
+        "local" => ActionTarget::UiLocal,
+        "cli" => ActionTarget::CliLocal,
         other => return Err(format!("grammar returned invalid action target {other}")),
     };
     let payload = match target {
@@ -439,15 +495,7 @@ fn invocation_from_command(
             }
             InvocationPayload::Wire(request)
         }
-        ActionTarget::LocalUi => {
-            if !command.args.is_empty() {
-                return Err(format!(
-                    "local action {} unexpectedly has source arguments",
-                    command.action
-                ));
-            }
-            InvocationPayload::Local
-        }
+        ActionTarget::UiLocal | ActionTarget::CliLocal => InvocationPayload::Local,
     };
     let args = command
         .args
@@ -734,7 +782,8 @@ fn prolog_command(invocation: &Invocation) -> crate::prolog::CommandAst {
         target: match invocation.target {
             ActionTarget::UiVerb => "ui",
             ActionTarget::ControlMessage => "control",
-            ActionTarget::LocalUi => "local",
+            ActionTarget::UiLocal => "local",
+            ActionTarget::CliLocal => "cli",
         }
         .into(),
         args: invocation.args.iter().map(convert_value).collect(),
@@ -823,6 +872,33 @@ mod tests {
             parse("mirror run 5 extra", &EmptyContext),
             ParseResult::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn argv_is_a_distinct_source_representation_with_stable_boundaries() {
+        let argv = [
+            "brush",
+            "-c",
+            "printf '%s\\n' \"$1\"",
+            "brush",
+            "argument with spaces",
+            "",
+        ]
+        .map(str::to_string);
+        let invocation = match parse_argv(&argv, &EmptyContext) {
+            ParseResult::Invocation(invocation) => invocation,
+            other => panic!("relation did not parse standalone Brush argv: {other:?}"),
+        };
+        assert_eq!(invocation.action, "brush");
+        assert_eq!(invocation.target, ActionTarget::CliLocal);
+        assert_eq!(
+            invocation.args,
+            argv[1..]
+                .iter()
+                .cloned()
+                .map(ArgValue::String)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

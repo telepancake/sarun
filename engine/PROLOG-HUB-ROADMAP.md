@@ -284,7 +284,7 @@ test parses reordered JSON fields into a typed compound and renders canonical
 compact JSON from the same declaration. The current OCI and API action
 arguments are expressed with these codecs in the installed action grammar.
 Their older duplicate parsing predicates remain to be deleted.
-`action_grammar:action_relation_grammar/1` now materializes all 107 executable actions as
+`action_grammar:action_relation_grammar/1` now materializes all 108 executable actions as
 one immutable `choice_grammar` value. Every branch contains its mechanically
 derived command words, source schema, declarative terminal codecs, context
 descriptors, action preference, and a bidirectional template for the normalized
@@ -368,6 +368,21 @@ rows as the interactive action language so it does not pretend every action is
 already a top-level argv form. Native CLI tests execute both help surfaces with
 no engine, and the static aarch64 suite passes 322 tests with one ignored
 browser integration test.
+
+Unix argv is now a distinct neutral source representation rather than text
+joined and tokenized a second time. Each OS argument becomes exactly one
+bounded source unit, including embedded spaces and empty strings. The installed
+action grammar declares the standalone `brush` action with a CLI-local target;
+`sarun brush`, `sarun brush -c SCRIPT ...`, and `sarun brush SCRIPT ...` pass
+through the ordinary action relation and then invoke the existing embedded
+Brush shell without starting or connecting to the server. `mirror` ingress now
+uses the same argv adapter. Generated help and `sarun verbs brush` see this
+single declaration. Generic choice execution conservatively indexes branches
+by their exposed first literal, and source-mode spread repetition consumes the
+bounded input before assembling output lists; a foreign-grammar regression
+proves exhaustive spread enumeration terminates. The real static aarch64
+binary executes a quoted standalone Brush command without an engine, and the
+full suite passes 324 tests with one ignored browser integration test.
 
 Two portability tests constrain the grammar IR before it is considered
 generic:
@@ -578,8 +593,9 @@ and makes contextual parsing and invalidation independently testable.
 
 ## Complete UI action inventory
 
-The relation now covers all 107 executable actions: 90 UI actions sharing 89
-implementation arms, five control actions, and twelve local actions. Help is
+The relation now covers all 108 executable actions: 90 UI actions sharing 89
+implementation arms, five control actions, twelve UI-local actions, and the
+standalone CLI-local `brush` action. Help is
 a projection of those actions, not an additional executable action. Entries
 which had historically existed only in `registry::ACTIONS` included:
 
@@ -690,8 +706,11 @@ belong to the relation.
       failure a visible hard error; never invoke a second parser.
 - [x] Route command prompt parse/render/highlight/completion only through the
       relation.
-- [x] Route the mirror CLI through the same relation (its `parse_words` call is
-      now only neutral framing into the mandatory parser).
+- [x] Route the mirror CLI through the same relation using the argv source
+      adapter, preserving OS argument boundaries without joining/re-tokenizing.
+- [x] Route standalone Brush through the same relation as a CLI-local action;
+      prove `-c`, script arguments containing spaces, and empty argv entries do
+      not require a running server.
 - [ ] Route every other command ingress through the same relation.
 - [x] Inventory every `ui.sock` request, reply, event, and stream frame and
       specify bounded binary framing plus typed scalar/array/value encodings.
@@ -758,7 +777,7 @@ belong to the relation.
 
 ### 6. Verification gates
 
-- [x] Prolog core-only focused tests validate all 107 action rows plus neutral
+- [x] Prolog core-only focused tests validate all 108 action rows plus neutral
       parsing, identifier encoding, argument projection, strings, arrays, rendering,
       completion/highlighting, and the generic transformation surface.
 - [x] Expand them to exhaustive per-representation and per-action round trips.
