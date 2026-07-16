@@ -12,6 +12,7 @@
 
 :- use_module(context_relation).
 :- use_module(evidence_projection).
+:- use_module(ast_state_relation).
 :- use_module(grammar_codec).
 :- use_module(local_state_relation).
 :- use_module(text_grammar_engine).
@@ -68,6 +69,20 @@ transform_relation(local_state_grammar, Given, Wanted, _Observations, _Limits,
     run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta),
     valid_query_graph(Queries),
     Available = [binding(final_state, Final),
+                 binding(resolutions, Resolutions),
+                 binding(delta, Delta)],
+    requested_bindings(Wanted, Available, Bindings).
+transform_relation(ast_state_grammar(Rules), Given, Wanted, _Observations,
+                   _Limits,
+                   reply([solution(Bindings, 0)], Queries, [], [])) :-
+    given_value(ast, Given, Ast),
+    given_value(source, Given, Source),
+    given_value(initial_state, Given, Initial),
+    derive_ast_state_steps(Rules, Ast, Source, Steps),
+    run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta),
+    valid_query_graph(Queries),
+    Available = [binding(steps, Steps),
+                 binding(final_state, Final),
                  binding(resolutions, Resolutions),
                  binding(delta, Delta)],
     requested_bindings(Wanted, Available, Bindings).

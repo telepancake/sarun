@@ -446,7 +446,11 @@ The engine also now has an executable pure scoped-state relation: lexical and
 escaping definitions resolve nearest-scope uses internally, escaping effects
 become explicit deltas, and only unresolved uses or declared surrounding
 constraints become external context queries. This algebra is tested through
-the uniform transform envelope but is not yet connected to Brush AST fields.
+the uniform transform envelope. A separately composable declarative AST-state
+adapter now selects parser-owned named nodes and exact UTF-8 field spans and
+emits ordered state steps around child traversal. A foreign composed grammar
+proves local `λ` resolution and an external `z` query without either syntax or
+state engine knowing the other AST. Brush has not yet supplied adapter rules.
 
 The next externally usable checkpoint is explicitly the complete interactive
 `sarun brush` editing experience: relation-owned highlighting, completion,

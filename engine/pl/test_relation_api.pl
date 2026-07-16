@@ -8,6 +8,7 @@ test_name(tear_completion_is_aggregated_from_parse_evidence).
 test_name(context_queries_completions_and_dependencies_are_one_relation).
 test_name(context_support_uses_the_same_given_wanted_envelope).
 test_name(local_state_suppresses_resolved_external_queries).
+test_name(parsed_ast_composes_with_declarative_state_adapter).
 test_name(grammar_choice_and_projection_are_executable_data).
 test_name(projection_template_is_bidirectional_and_can_append_values).
 test_name(independent_ast_relations_compose_in_both_directions).
@@ -215,6 +216,51 @@ run_test(local_state_suppresses_resolved_external_queries) :-
                    0)],
               [query(free_z,
                      ask(one, shell_variable, name("z")))], [], [])).
+
+run_test(parsed_ast_composes_with_declarative_state_adapter) :-
+    NameCodepoint = terminal(
+        text(codepoint(union([range(97, 122), range(955, 955)]))),
+        presentation([meta(syntax, identifier)])),
+    TextGrammar = grammar(
+        source(text(utf8)), program,
+        [rule(program,
+              seq([ref(declaration), literal("; ", separator,
+                                             presentation([])),
+                   ref(use), literal("; ", separator, presentation([])),
+                   ref(use)])),
+         rule(declaration,
+              seq([literal("let ", declaration, presentation([])),
+                   field(name, ref(identifier))])),
+         rule(use,
+              seq([literal("use ", use, presentation([])),
+                   field(name, ref(identifier))])),
+         rule(identifier, repeat(1, unbounded, NameCodepoint))],
+        []),
+    StateRules = [
+        state_rule(node(declaration), [capture(name, field_text(name))],
+                   before([define(c_symbol, slot(name), int, lexical, unique)]),
+                   after([])),
+        state_rule(node(use), [capture(name, field_text(name))],
+                   before([use(node_identity, c_symbol, slot(name))]),
+                   after([]))
+    ],
+    Grammar = compose_grammar(TextGrammar, [ast],
+                              ast_state_grammar(StateRules)),
+    limits(Limits),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("let λ; use λ; use z", exact,
+                                           fixture)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], []))]),
+                want([resolutions]), observations([]), Limits),
+        reply([solution([binding(
+                   resolutions,
+                   [resolved(node_ref(use, span(8, 14)), local(_)),
+                    resolved(node_ref(use, span(16, 21)), external(_))])], 0)],
+              [query(branch(right, node_ref(use, span(16, 21))),
+                     ask(one, c_symbol, name("z")))], [], [])).
 
 run_test(grammar_choice_and_projection_are_executable_data) :-
     Terminals = terminals([

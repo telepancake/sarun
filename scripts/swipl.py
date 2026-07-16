@@ -67,6 +67,7 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
     text_grammar_engine = repo / "engine" / "pl" / "text_grammar_engine.pl"
     brush_grammar = repo / "engine" / "pl" / "brush_grammar.pl"
     evidence_projection = repo / "engine" / "pl" / "evidence_projection.pl"
+    ast_state_relation = repo / "engine" / "pl" / "ast_state_relation.pl"
     local_state_relation = repo / "engine" / "pl" / "local_state_relation.pl"
     grammar_codec = repo / "engine" / "pl" / "grammar_codec.pl"
     grammar_store = repo / "engine" / "pl" / "grammar_store.pl"
@@ -85,6 +86,8 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
         raise RuntimeError(f"missing Brush grammar: {brush_grammar}")
     if not evidence_projection.is_file():
         raise RuntimeError(f"missing evidence projection: {evidence_projection}")
+    if not ast_state_relation.is_file():
+        raise RuntimeError(f"missing AST state relation: {ast_state_relation}")
     if not local_state_relation.is_file():
         raise RuntimeError(f"missing local state relation: {local_state_relation}")
     if not grammar_codec.is_file():
@@ -117,6 +120,7 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
         "text_grammar_engine_sha256": sha256(text_grammar_engine),
         "brush_grammar_sha256": sha256(brush_grammar),
         "evidence_projection_sha256": sha256(evidence_projection),
+        "ast_state_relation_sha256": sha256(ast_state_relation),
         "local_state_relation_sha256": sha256(local_state_relation),
         "grammar_codec_sha256": sha256(grammar_codec),
         "grammar_store_sha256": sha256(grammar_store),
@@ -144,6 +148,7 @@ def build_identity(metadata: dict[str, str]) -> str:
         "text_grammar_engine_sha256",
         "brush_grammar_sha256",
         "evidence_projection_sha256",
+        "ast_state_relation_sha256",
         "local_state_relation_sha256",
         "grammar_codec_sha256",
         "grammar_store_sha256",
@@ -345,6 +350,7 @@ def create_app_resource(
         "app/text_grammar_engine.pl": repo / "engine" / "pl" / "text_grammar_engine.pl",
         "app/brush_grammar.pl": repo / "engine" / "pl" / "brush_grammar.pl",
         "app/evidence_projection.pl": repo / "engine" / "pl" / "evidence_projection.pl",
+        "app/ast_state_relation.pl": repo / "engine" / "pl" / "ast_state_relation.pl",
         "app/local_state_relation.pl": repo / "engine" / "pl" / "local_state_relation.pl",
         "app/grammar_codec.pl": repo / "engine" / "pl" / "grammar_codec.pl",
         "app/grammar_store.pl": repo / "engine" / "pl" / "grammar_store.pl",

@@ -242,6 +242,12 @@ Do not implement these as Brush-specific engine branches:
       external queries only for unresolved uses or explicit requirements. The
       C-shaped `f/x/y/z` fixture and shell `x=123; use(x)` fixture pin that local
       resolution produces no context query.
+- [x] Add a separately composable, declarative AST-to-state adapter relation.
+      Client data selects named nodes and fields and emits generic state steps
+      before or after child traversal; the engine has no grammar-name cases.
+      Exact UTF-8 field text comes from parser-owned byte spans. A composed
+      foreign `let λ; use λ; use z` fixture proves that only `z` escapes to an
+      external query. Brush has not yet supplied its adapter rules.
 - [ ] Encode shell-local variables/scopes as pure relation inputs and outputs.
 - [ ] Add explicit providers for aliases, functions, builtins, PATH commands,
       filesystem names, environment, and programmable completion specs.

@@ -30,6 +30,7 @@ SCHEMA_SOURCES = (
     "engine/pl/text_grammar_engine.pl",
     "engine/pl/brush_grammar.pl",
     "engine/pl/evidence_projection.pl",
+    "engine/pl/ast_state_relation.pl",
     "engine/pl/local_state_relation.pl",
     "engine/pl/grammar_codec.pl",
     "engine/pl/grammar_store.pl",

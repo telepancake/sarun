@@ -241,9 +241,10 @@ match_expression(repeat(Minimum, MaximumCount, Expression), Rules, Text,
                      MaximumCount, 0, Start, End, Values, Evidence, Depth0,
                      Depth).
 match_expression(field(Name, Expression), Rules, Text, Origin, Maximum, Start,
-                 End, field(Name, Value), Evidence, Depth0, Depth) :-
+                 End, field(Name, Span, Value), Evidence, Depth0, Depth) :-
     match_expression(Expression, Rules, Text, Origin, Maximum, Start, End,
-                     Value, Evidence, Depth0, Depth).
+                     Value, Evidence, Depth0, Depth),
+    cursor_span(Start, End, Span).
 match_expression(literal(Surface0, Semantic, presentation(Metadata)), _, _Text,
                  Context, _, Start, End, literal(Semantic), [Item], Depth,
                  Depth) :-
