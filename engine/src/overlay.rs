@@ -14,6 +14,7 @@ use crate::depot::BoxDepot;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::ffi::CString;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -2066,6 +2067,34 @@ impl SarunFs {
         Ok(())
     }
 
+    fn sync_file_node(&self, handle: u64, data_only: bool) -> Result<(), Errno> {
+        if self.inner.jobserver_fhs.read().unwrap().contains_key(&handle) {
+            return Ok(());
+        }
+        let handles = self.inner.fhs.read().unwrap();
+        let handle = handles.get(&handle).ok_or(Errno::EBADF)?;
+        let handle = handle.lock().unwrap();
+        let Some(file) = handle.inner.file.as_ref() else {
+            return Ok(());
+        };
+        if data_only {
+            file.sync_data().map_err(Errno::from)
+        } else {
+            file.sync_all().map_err(Errno::from)
+        }
+    }
+
+    fn statfs_node(&self) -> Result<libc::statvfs64, Errno> {
+        let path = CString::new(self.inner.lower.as_os_str().as_encoded_bytes())
+            .map_err(|_| Errno::EINVAL)?;
+        let mut stat: libc::statvfs64 = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs64(path.as_ptr(), &mut stat) } == 0 {
+            Ok(stat)
+        } else {
+            Err(Errno::from(std::io::Error::last_os_error()))
+        }
+    }
+
     /// D3: the first actual write to `rel` copies the RESOLVED lower bytes
     /// (the parent box's version if nested, else the host file, else empty)
     /// into a fresh pool blob in THIS box (creating the row + provenance) and
@@ -2871,22 +2900,18 @@ impl Filesystem for SarunFs {
     // files, so an fsync on them is genuine; flush/access just succeed.
     fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
              _lock_owner: LockOwner, reply: ReplyEmpty) {
-        if let Some(h) = self.inner.fhs.read().unwrap().get(&u64::from(fh)) {
-            if let Some(f) = h.lock().unwrap().inner.file.as_ref() {
-                let _ = f.sync_all();
-            }
+        match self.sync_file_node(u64::from(fh), false) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
-        reply.ok();
     }
 
     fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool,
              reply: ReplyEmpty) {
-        if let Some(h) = self.inner.fhs.read().unwrap().get(&u64::from(fh)) {
-            if let Some(f) = h.lock().unwrap().inner.file.as_ref() {
-                let _ = f.sync_all();
-            }
+        match self.sync_file_node(u64::from(fh), _datasync) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
-        reply.ok();
     }
 
     fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle,
@@ -2895,20 +2920,25 @@ impl Filesystem for SarunFs {
     }
 
     fn access(&self, _req: &Request, _ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
-        reply.ok(); // permission is enforced by the box's bwrap uid, not here
+        match self.getattr_node(u64::from(_ino)) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
-        // Report the lower filesystem's real numbers (df, build free-space checks).
-        let Ok(c) = std::ffi::CString::new(self.inner.lower.as_os_str()
-            .as_encoded_bytes()) else { reply.error(Errno::EINVAL); return; };
-        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0 {
-            reply.statfs(s.f_blocks as u64, s.f_bfree as u64, s.f_bavail as u64,
-                         s.f_files as u64, s.f_ffree as u64, s.f_bsize as u32,
-                         255, s.f_frsize as u32);
-        } else {
-            reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+        match self.statfs_node() {
+            Ok(stat) => reply.statfs(
+                stat.f_blocks,
+                stat.f_bfree,
+                stat.f_bavail,
+                stat.f_files,
+                stat.f_ffree,
+                stat.f_bsize as u32,
+                stat.f_namemax as u32,
+                stat.f_frsize as u32,
+            ),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -3211,6 +3241,43 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         self.release_node(handle).map_err(virtio_error)
     }
 
+    fn flush(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        handle: u64,
+        _lock_owner: u64,
+    ) -> std::io::Result<()> {
+        self.sync_file_node(handle, false).map_err(virtio_error)
+    }
+
+    fn fsync(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        datasync: bool,
+        handle: u64,
+    ) -> std::io::Result<()> {
+        self.sync_file_node(handle, datasync).map_err(virtio_error)
+    }
+
+    fn statfs(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+    ) -> std::io::Result<libc::statvfs64> {
+        self.statfs_node().map_err(virtio_error)
+    }
+
+    fn access(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+        _mask: u32,
+    ) -> std::io::Result<()> {
+        self.getattr_node(inode).map(|_| ()).map_err(virtio_error)
+    }
+
     fn setxattr(
         &self,
         _ctx: virtiofsd::filesystem::Context,
@@ -3317,6 +3384,16 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         handle: u64,
     ) -> std::io::Result<()> {
         self.close_directory(handle).map_err(virtio_error)
+    }
+
+    fn fsyncdir(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        _datasync: bool,
+        _handle: u64,
+    ) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
