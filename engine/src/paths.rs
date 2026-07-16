@@ -135,6 +135,13 @@ pub fn mnt_point() -> PathBuf {
     runtime_home().join("mnt")
 }
 
+/// Per-run vhost-user socket used by the QEMU transport.  It lives beside the
+/// box's other ephemeral state, never in the persistent sqlar/depot.  A named
+/// helper also keeps QEMU launch code from inventing a second path convention.
+pub fn virtiofs_socket(box_id: i64) -> PathBuf {
+    live_home().join(box_id.to_string()).join("virtiofs.sock")
+}
+
 pub fn ensure_dirs() -> std::io::Result<()> {
     for d in [data_home(), config_home(), runtime_home(), state_home(),
               live_home(), mnt_point(), oaita_state_home()] {

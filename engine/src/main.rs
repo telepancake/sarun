@@ -73,6 +73,7 @@ mod sudir;
 mod sudwire;
 mod ui;
 mod views;
+mod virtio_transport;
 mod wacz;
 mod wire;
 
