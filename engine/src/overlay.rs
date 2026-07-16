@@ -20,6 +20,7 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::ffi::OsStrExt;
+use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -249,6 +250,12 @@ struct OpenedNode {
     nonseekable: bool,
     keep_cache: bool,
     backing_candidate: bool,
+}
+
+enum WriteTarget {
+    Jobserver,
+    Sink { box_id: i64, stream: i32 },
+    File { file: File, box_id: i64, rel: String },
 }
 
 /// Bridges a deferred FUSE read reply into the slip pool. The pool calls exactly
@@ -1855,6 +1862,71 @@ impl SarunFs {
             .map_err(Errno::from)
     }
 
+    fn prepare_write_node(&self, pid: u32, handle: u64) -> Result<WriteTarget, Errno> {
+        if self.inner.jobserver_fhs.read().unwrap().contains_key(&handle) {
+            return Ok(WriteTarget::Jobserver);
+        }
+        let handles = self.inner.fhs.read().unwrap();
+        let handle = handles.get(&handle).ok_or(Errno::EBADF)?;
+        let mut handle = handle.lock().unwrap();
+        if let Some(stream) = handle.inner.sink {
+            return Ok(WriteTarget::Sink {
+                box_id: handle.inner.box_id,
+                stream,
+            });
+        }
+        if !handle.inner.upper {
+            let b = self.box_of(handle.inner.box_id).ok_or(Errno::EIO)?;
+            handle.inner.file = Some(
+                self.copy_up(&b, &handle.inner.rel.clone(), pid)
+                    .map_err(|_| Errno::EIO)?,
+            );
+            handle.inner.upper = true;
+        }
+        handle.inner.dirty = true;
+        if pid != handle.inner.last_pid || handle.inner.last_tgid == 0 {
+            handle.inner.last_tgid = tgid_of(pid);
+            if let Some(b) = self.box_of(handle.inner.box_id) {
+                b.writer_for(handle.inner.last_tgid);
+            }
+        }
+        handle.inner.last_pid = pid;
+        let file = handle
+            .inner
+            .file
+            .as_ref()
+            .ok_or(Errno::EBADF)?
+            .try_clone()
+            .map_err(Errno::from)?;
+        Ok(WriteTarget::File {
+            file,
+            box_id: handle.inner.box_id,
+            rel: handle.inner.rel.clone(),
+        })
+    }
+
+    fn finish_file_write(&self, box_id: i64, rel: String) {
+        self.push_event(box_id, rel, "write");
+    }
+
+    fn write_sink_node(&self, pid: u32, box_id: i64, stream: i32, data: &[u8]) {
+        let record = match self.muted_owner(pid) {
+            None => true,
+            Some(owner) => owner == box_id,
+        };
+        if record {
+            if let Some(b) = self.box_of(box_id) {
+                b.add_output(stream, pid, data);
+            }
+        }
+        self.echo_send(box_id, stream, data);
+    }
+
+    fn release_jobserver_slip(&self, pid: u32) {
+        let pid = tgid_of(pid) as i32;
+        let _ = crate::slippool::global().lock().unwrap().release(pid);
+    }
+
     fn release_node(&self, handle: u64) -> Result<(), Errno> {
         if self.inner.jobserver_fhs.write().unwrap().remove(&handle).is_some() {
             return Ok(());
@@ -2297,91 +2369,25 @@ impl Filesystem for SarunFs {
     fn write(&self, req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
              data: &[u8], _wf: fuser::WriteFlags, _flags: OpenFlags,
              _lo: Option<LockOwner>, reply: ReplyWrite) {
-        // Slip-pool release: a write on the JOBSERVER file returns one slip the
-        // caller pid holds. The freed slip is handed to the next blocked acquirer
-        // (its deferred read reply is fulfilled inside release) or back to the
-        // pool. We accept the full byte count regardless of payload.
-        if self.inner.jobserver_fhs.read().unwrap().contains_key(&u64::from(fh)) {
-            let pid = tgid_of(req.pid()) as i32;
-            let _ = crate::slippool::global().lock().unwrap().release(pid);
-            return reply.written(data.len() as u32);
-        }
-        let fhs = self.inner.fhs.read().unwrap();
-        let Some(h) = fhs.get(&u64::from(fh)) else {
-            return reply.error(Errno::EBADF);
-        };
-        let mut h = h.lock().unwrap();
-        if let Some(stream) = h.inner.sink {
-            // stdout/stderr sink. MUTE: a muted writer's write to an ANCESTOR
-            // box's sink (owner box != this sink's box) is a nested box's echo
-            // readback travelling UP — echo it onward so it keeps propagating,
-            // but do NOT record it (already captured once at the origin box). A
-            // muted writer's write to ITS OWN box's sink, however, is first-party
-            // output (e.g. a brush in-process builtin writing fd 1 from the muted
-            // --inner pid) and IS recorded. A non-muted writer is always
-            // recorded. Either way, echo it live.
-            let bid = h.inner.box_id;
-            let pid = req.pid();
-            drop(h);
-            drop(fhs);
-            let record = match self.muted_owner(pid) {
-                None => true,             // not muted: record
-                Some(owner) => owner == bid,  // muted: record only its own sink
-            };
-            if record {
-                if let Some(b) = self.box_of(bid) {
-                    b.add_output(stream, pid, data);
+        match self.prepare_write_node(req.pid(), u64::from(fh)) {
+            Ok(WriteTarget::Jobserver) => {
+                self.release_jobserver_slip(req.pid());
+                reply.written(data.len() as u32);
+            }
+            Ok(WriteTarget::Sink { box_id, stream }) => {
+                self.write_sink_node(req.pid(), box_id, stream, data);
+                reply.written(data.len() as u32);
+            }
+            Ok(WriteTarget::File { file, box_id, rel }) => {
+                match file.write_at(data, offset) {
+                    Ok(written) => {
+                        self.finish_file_write(box_id, rel);
+                        reply.written(written as u32);
+                    }
+                    Err(error) => reply.error(Errno::from(error)),
                 }
             }
-            self.echo_send(bid, stream, data);
-            return reply.written(data.len() as u32);
-        }
-        if !h.inner.upper {
-            // D3: the FIRST write triggers copy-up + row + provenance.
-            let Some(b) = self.box_of(h.inner.box_id) else {
-                return reply.error(Errno::EIO);
-            };
-            match self.copy_up(&b, &h.inner.rel.clone(), req.pid()) {
-                Ok(f) => {
-                    h.inner.file = Some(f);
-                    h.inner.upper = true;
-                }
-                Err(_) => return reply.error(Errno::EIO),
-            }
-        }
-        h.inner.dirty = true;
-        let wpid = req.pid();
-        // Resolve TID→TGID NOW, while the writer is alive (see `last_tgid`).
-        // Only when the raw writer pid changes — consecutive writes from the
-        // same fd share a pid, so this is a single /proc read per distinct
-        // writer, not per write op.
-        if wpid != h.inner.last_pid || h.inner.last_tgid == 0 {
-            h.inner.last_tgid = tgid_of(wpid);
-            // Characterize the writer NOW, while it is alive (blocked in this
-            // write()). release() runs at fd-close, which for a short-lived
-            // EXTERNAL writer (gcc/sed/conf — its own tgid, not the long-lived
-            // brush --inner) is its exit; reading /proc there would find nothing.
-            // Recording it here populates proc_current, so the release-time
-            // writer_for(last_tgid) reuses this live row instead of a blank one.
-            if let Some(b) = self.box_of(h.inner.box_id) {
-                b.writer_for(h.inner.last_tgid);
-            }
-        }
-        h.inner.last_pid = wpid;
-        let Some(f) = h.inner.file.as_ref() else {
-            return reply.error(Errno::EBADF);
-        };
-        let box_id = h.inner.box_id;
-        let rel = h.inner.rel.clone();
-        match f.write_at(data, offset) {
-            Ok(n) => {
-                // Per-write notification so a subscribed UI can refresh a
-                // live box's panes without waiting for its periodic tick.
-                drop(h); drop(fhs);
-                self.push_event(box_id, rel, "write");
-                reply.written(n as u32)
-            }
-            Err(_) => reply.error(Errno::EIO),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -2960,6 +2966,17 @@ fn virtio_error(error: Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(i32::from(error))
 }
 
+fn staging_file() -> std::io::Result<File> {
+    let name = CStr::from_bytes_with_nul(b"sarun-virtio-write\0").unwrap();
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: memfd_create returned a new owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
 /// Canonical filesystem protocol implementation.  vhost-user-fs and the
 /// forthcoming SUD ring call this trait directly; the legacy fuser callbacks
 /// above are now an adapter over the same policy operations.
@@ -3044,6 +3061,54 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
     ) -> std::io::Result<usize> {
         let file = self.read_file_node(handle).map_err(virtio_error)?;
         writer.read_from_file_at(&file, size as usize, offset, None)
+    }
+
+    fn write<R: virtiofsd::filesystem::ZeroCopyReader>(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        handle: u64,
+        mut reader: R,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        _kill_priv: bool,
+        _flags: u32,
+    ) -> std::io::Result<usize> {
+        match self
+            .prepare_write_node(ctx.pid as u32, handle)
+            .map_err(virtio_error)?
+        {
+            WriteTarget::Jobserver => {
+                self.release_jobserver_slip(ctx.pid as u32);
+                Ok(size as usize)
+            }
+            WriteTarget::Sink { box_id, stream } => {
+                let staging = staging_file()?;
+                let written = reader.write_to_file_at(
+                    &staging,
+                    size as usize,
+                    0,
+                    None,
+                )?;
+                let mut data = vec![0; written];
+                let read = staging.read_at(&mut data, 0)?;
+                data.truncate(read);
+                self.write_sink_node(ctx.pid as u32, box_id, stream, &data);
+                Ok(read)
+            }
+            WriteTarget::File { file, box_id, rel } => {
+                let written = reader.write_to_file_at(
+                    &file,
+                    size as usize,
+                    offset,
+                    None,
+                )?;
+                self.finish_file_write(box_id, rel);
+                Ok(written)
+            }
+        }
     }
 
     fn release(
@@ -3180,6 +3245,8 @@ mod chain_tests {
 
     struct CollectWriter(Arc<Mutex<Vec<u8>>>);
 
+    struct BytesReader(&'static [u8]);
+
     impl virtiofsd::filesystem::ZeroCopyWriter for CollectWriter {
         fn read_from_file_at(
             &mut self,
@@ -3192,6 +3259,18 @@ mod chain_tests {
             let read = file.read_at(&mut bytes, offset)?;
             self.0.lock().unwrap().extend_from_slice(&bytes[..read]);
             Ok(read)
+        }
+    }
+
+    impl virtiofsd::filesystem::ZeroCopyReader for BytesReader {
+        fn write_to_file_at(
+            &mut self,
+            file: &File,
+            count: usize,
+            offset: u64,
+            _flags: Option<virtiofsd::oslib::WritevFlags>,
+        ) -> std::io::Result<usize> {
+            file.write_at(&self.0[..count.min(self.0.len())], offset)
         }
     }
 
@@ -3359,6 +3438,48 @@ mod chain_tests {
             None,
         )
         .unwrap();
+
+        let (write_handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::open(
+            &fs,
+            ctx,
+            file_entry.inode,
+            false,
+            libc::O_RDWR as u32,
+        )
+        .unwrap();
+        let write_handle = write_handle.unwrap();
+        let written = <SarunFs as virtiofsd::filesystem::FileSystem>::write(
+            &fs,
+            ctx,
+            file_entry.inode,
+            write_handle,
+            BytesReader(b"changed"),
+            7,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(written, 7);
+        <SarunFs as virtiofsd::filesystem::FileSystem>::release(
+            &fs,
+            ctx,
+            file_entry.inode,
+            0,
+            write_handle,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(tmp.join("hello")).unwrap(), b"canonical bytes");
+        let layer = fs.resolve(id, "hello");
+        let Layer::UpperFile { owner, rowid, .. } = layer else {
+            panic!("write did not copy up");
+        };
+        assert_eq!(std::fs::read(blob_path(owner, rowid)).unwrap(), b"changedal bytes");
 
         let (attr, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
             &fs,
