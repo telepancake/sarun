@@ -196,6 +196,19 @@ match_expression(ref(Name), Rules, Text, Origin, Maximum, Start, End,
     match_expression(Expression, Rules, Text, Origin, Maximum, Start, End,
                      Value, Evidence, NextDepth, Depth),
     cursor_span(Start, End, Span).
+match_expression(seq(Expressions), Rules, _Text, Context, Maximum, Start, End,
+                 generated(sequence, Rendered), [Item], Depth0, Depth) :-
+    Depth0 < Maximum,
+    source_tear_at(Context, Start, EditId, End, TearSurface),
+    render_completion_expressions(Expressions, Rules, Maximum, Depth0,
+                                  Rendered, Depth),
+    Rendered \= "",
+    string_length(TearSurface, TearLength),
+    sub_string(Rendered, 0, TearLength, _, TearSurface),
+    cursor_span(Start, End, Span),
+    Item = evidence(generated(sequence), Span, [], TearSurface,
+                    grammar, continuation, 0,
+                    tear(EditId, literal(Rendered))).
 match_expression(seq(Expressions), Rules, Text, Origin, Maximum, Start, End,
                  sequence(Values), Evidence, Depth0, Depth) :-
     match_expressions(Expressions, Rules, Text, Origin, Maximum, Start, End,
@@ -245,6 +258,7 @@ match_expression(field(Name, Expression), Rules, Text, Origin, Maximum, Start,
     match_expression(Expression, Rules, Text, Origin, Maximum, Start, End,
                      Value, Evidence, Depth0, Depth),
     cursor_span(Start, End, Span).
+
 match_expression(literal(Surface0, Semantic, presentation(Metadata)), _, _Text,
                  Context, _, Start, End, literal(Semantic), [Item], Depth,
                  Depth) :-
@@ -300,6 +314,69 @@ match_expression(
     Item = evidence(codepoint(Code), span(ByteStart, ByteEnd),
                     [span(ByteStart, ByteEnd)], Surface, Syntax, Description,
                     Preference, EvidenceOrigin).
+
+render_completion_expressions([], _, _, Depth, "", Depth).
+render_completion_expressions([Expression|Expressions], Rules, Maximum,
+                              Depth0, Text, Depth) :-
+    render_completion_expression(Expression, Rules, Maximum, Depth0,
+                                 First, Depth1),
+    render_completion_expressions(Expressions, Rules, Maximum, Depth1,
+                                  Rest, Depth),
+    string_concat(First, Rest, Text).
+
+render_completion_expression(ref(Name), Rules, Maximum, Depth0, Text, Depth) :-
+    Depth0 < Maximum,
+    NextDepth is Depth0 + 1,
+    rule_expression(Name, Rules, Expression),
+    render_completion_expression(Expression, Rules, Maximum, NextDepth,
+                                 Text, Depth).
+render_completion_expression(seq(Expressions), Rules, Maximum, Depth0,
+                             Text, Depth) :-
+    render_completion_expressions(Expressions, Rules, Maximum, Depth0,
+                                  Text, Depth).
+render_completion_expression(choice(Expressions), Rules, Maximum, Depth0,
+                             Text, Depth) :-
+    expression_choice(Expressions, 1, _, Expression),
+    render_completion_expression(Expression, Rules, Maximum, Depth0,
+                                 Text, Depth).
+render_completion_expression(optional(_), _, _, Depth, "", Depth).
+render_completion_expression(repeat(Minimum, _, Expression), Rules, Maximum,
+                             Depth0, Text, Depth) :-
+    render_completion_repetition(Minimum, Expression, Rules, Maximum, Depth0,
+                                 Text, Depth).
+render_completion_expression(field(_, Expression), Rules, Maximum, Depth0,
+                             Text, Depth) :-
+    render_completion_expression(Expression, Rules, Maximum, Depth0,
+                                 Text, Depth).
+render_completion_expression(extras(_, Expression), Rules, Maximum, Depth0,
+                             Text, Depth) :-
+    render_completion_expression(Expression, Rules, Maximum, Depth0,
+                                 Text, Depth).
+render_completion_expression(lexical(Expression), Rules, Maximum, Depth0,
+                             Text, Depth) :-
+    render_completion_expression(Expression, Rules, Maximum, Depth0,
+                                 Text, Depth).
+render_completion_expression(literal(Surface0, _, presentation(_)), _, _,
+                             Depth, Surface, Depth) :-
+    text_string(Surface0, Surface).
+render_completion_expression(
+    terminal(text(codepoint(chars(Characters0))), presentation(_)), _, _,
+    Depth, Surface, Depth) :-
+    text_string(Characters0, Characters),
+    string_code(1, Characters, Code),
+    string_codes(Surface, [Code]).
+render_completion_expression(empty, _, _, Depth, "", Depth).
+
+render_completion_repetition(0, _, _, _, Depth, "", Depth) :- !.
+render_completion_repetition(Count, Expression, Rules, Maximum, Depth0,
+                             Text, Depth) :-
+    Count > 0,
+    render_completion_expression(Expression, Rules, Maximum, Depth0,
+                                 First, Depth1),
+    Next is Count - 1,
+    render_completion_repetition(Next, Expression, Rules, Maximum, Depth1,
+                                 Rest, Depth),
+    string_concat(First, Rest, Text).
 
 match_expressions([], _, _, _, _, Cursor, Cursor, [], [], Depth, Depth).
 match_expressions([Expression], Rules, Text, Context, Maximum, Start, End,

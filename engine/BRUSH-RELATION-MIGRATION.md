@@ -276,34 +276,36 @@ Do not implement these as Brush-specific engine branches:
       chain to an earlier source hole, and a finite typed value relation emits
       ordinary ranked completion evidence for every matching value. Prefix and
       suffix text constrain the replacement; cyclic, missing, and malformed
-      bindings fail closed. Brush AST/value glue and command signatures still
-      need to produce these generic constraints.
+      bindings fail closed. Ordinary embedded command grammars still need to
+      produce these generic constraints through their AST/value glue.
 - [x] Add declarative AST-to-symbolic-text projection rules to the existing
       client glue boundary. Grammar data chooses source-text, child
       concatenation, or typed field reference per named node; the generic
       adapter preserves terminal holes and normalizes adjacent text. Brush
       assignments now store `text([...])` values, so a tear inside `A="|"`
       survives local resolution at a later `$A` use.
-- [x] Relate command invocations to separately declared signature data through
-      a grammar-independent engine relation. The first Brush signature declares
-      `find -type` as a finite typed domain. The ordinary whole-document parse
-      of `A="|"; find . -type $A` now propagates that later constraint through
-      the locally resolved `$A`, returns all valid type completions at the
-      earlier tear, and emits no external context query. There is no `find`
-      branch in Rust or in the generic engine.
+- [ ] Compose an ordinary supplied command grammar at each parsed Brush command
+      position, including propagation through locally resolved shell values.
+      The removed `signature`/`following`/`positional` mini-language is not an
+      acceptable implementation. The target fixture remains
+      `A="|"; find . -type $A`: the later ordinary `find` grammar must constrain
+      the earlier tear through unification, with no `find` branch in Rust or in
+      the generic engine.
 - [ ] Add explicit providers for aliases, functions, builtins, PATH commands,
       filesystem names, environment, and programmable completion specs.
 - [x] Compose the first real builtin argument grammar from the same declarative
       definition that parses execution arguments. Every `Command` registration
-      exposes its Clap command value; one generic sarun adapter projects finite
-      value domains into typed signature data. `bind -m |` therefore offers the
-      five canonical `BindKeyMap` spellings through an ordinary unquoted tear
-      in both document analysis and the editor. No command name is switched on,
-      boolean switches are not mistaken for value-taking arguments, and Clap
-      aliases are not introduced as extra semantic names.
+      exposes its Clap command value; one generic sarun adapter emits only
+      ordinary text grammar IR. `bind|`, `bind |`, and `bind -m |` therefore
+      offer valid continuations through ordinary parse evidence in document
+      analysis and native aarch64 interactive PTY tests. No command name is
+      switched on and no argument-layout vocabulary exists in the engine.
 - [ ] Extend composed builtin grammars beyond enum-after-flag to positional
-      values, paths, repetitions, mutually dependent arguments, and explicit
-      context domains while retaining the same definition and relation path.
+      values, repetitions, and mutually dependent arguments while retaining
+      the same definition and relation path. `edit`'s execution parser already
+      declares `PATH` once; completion remains unfinished until the adapter can
+      express that value as an ordinary context-backed grammar terminal and the
+      tear relation consumes a typed cwd snapshot.
 - [ ] Compose sarun's action and object domains in shell argument positions.
 - [ ] Prove dependency-key stability and selective invalidation when cwd,
       PATH, variables, builtins, or sarun snapshots change.
@@ -327,8 +329,10 @@ Do not implement these as Brush-specific engine branches:
       call into `COMP_WORDBREAKS` tokenization/lookup. The backend constructor
       requires a neutral semantic provider and has no optional provider or
       fallback. A native aarch64 PTY proves `bind -m |` shows the canonical
-      builtin-definition values in an actual standalone `sarun brush` session.
-      Live shell and filesystem observations remain provider work below.
+      builtin-definition values in an actual standalone `sarun brush` session;
+      another proves `bind|` exposes valid ` -m VALUE` continuations. Contextual
+      paths plus live variables, functions, builtins, and PATH observations
+      remain below.
 - [ ] Cut validation/indentation/diagnostics after complete/incomplete/invalid
       parity is proven.
 - [ ] Cut provenance AST consumption, standalone Brush, box Brush, sourced

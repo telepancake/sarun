@@ -384,31 +384,6 @@ pub struct DocumentStateChange {
     pub value: RelationValue,
 }
 
-/// A finite value accepted by an argument in an application's declarative
-/// command definition. The relation payloads preserve semantic identity and
-/// descriptive metadata without requiring the grammar engine to understand
-/// either one.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandArgumentValue {
-    pub text: String,
-    pub semantic: RelationValue,
-    pub description: RelationValue,
-    pub preference: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandFollowingArgument {
-    pub flag: String,
-    pub values: Vec<CommandArgumentValue>,
-    pub syntax: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DocumentCommandSignature {
-    pub command: String,
-    pub following_arguments: Vec<CommandFollowingArgument>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrushDocumentRequest {
     pub source: String,
@@ -610,10 +585,6 @@ impl Prolog {
             .iter()
             .map(context_observation_value)
             .collect::<Result<Vec<_>, _>>()?;
-        let command_signatures = crate::brush::builtin_command_signatures()
-            .iter()
-            .map(document_command_signature_value)
-            .collect::<Vec<_>>();
         let reply = self.transform(&RelationRequest {
             grammar: brush_grammar_handle(),
             given: vec![
@@ -633,8 +604,8 @@ impl Prolog {
                     value: initial_state,
                 },
                 RelationBinding {
-                    name: "command_signatures".into(),
-                    value: relation_list(command_signatures),
+                    name: "builtin_grammar".into(),
+                    value: crate::brush::builtin_command_grammar().clone(),
                 },
             ],
             wanted: vec![
@@ -2293,41 +2264,6 @@ fn document_binding_value(binding: &DocumentBinding) -> RelationValue {
     )
 }
 
-fn document_command_signature_value(signature: &DocumentCommandSignature) -> RelationValue {
-    relation_compound(
-        "signature",
-        vec![
-            RelationValue::String(signature.command.clone()),
-            relation_list(signature.following_arguments.iter().map(|argument| {
-                relation_compound(
-                    "following",
-                    vec![
-                        RelationValue::String(argument.flag.clone()),
-                        relation_compound(
-                            "one_of",
-                            vec![relation_list(argument.values.iter().map(|value| {
-                                relation_compound(
-                                    "value",
-                                    vec![
-                                        RelationValue::String(value.text.clone()),
-                                        value.semantic.clone(),
-                                        value.description.clone(),
-                                        RelationValue::Integer(value.preference),
-                                    ],
-                                )
-                            }))],
-                        ),
-                        relation_compound(
-                            "presentation",
-                            vec![RelationValue::Atom(argument.syntax.clone())],
-                        ),
-                    ],
-                )
-            })),
-        ],
-    )
-}
-
 fn context_graph_value(graph: &[ContextQueryNode]) -> Result<RelationValue, String> {
     graph
         .iter()
@@ -3495,12 +3431,16 @@ mod tests {
 
     #[test]
     fn installed_brush_grammar_consumes_variable_observation() {
-        let id = rv_compound(
+        let inner_id = rv_compound(
             "node_ref",
             vec![
                 rv_atom("simple_parameter"),
                 rv_compound("span", vec![rv_integer(5), rv_integer(7)]),
             ],
+        );
+        let id = rv_compound(
+            "branch",
+            vec![rv_atom("enrichment_extension"), inner_id.clone()],
         );
         let query = rv_compound(
             "ask",
@@ -3585,7 +3525,7 @@ mod tests {
             rv_list(vec![rv_compound(
                 "resolved",
                 vec![
-                    id,
+                    inner_id,
                     rv_compound(
                         "external",
                         vec![rv_compound("one", vec![entry])],

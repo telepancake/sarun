@@ -1030,47 +1030,29 @@ impl brush_core::builtins::SimpleCommand for NinjaBuiltin {
 /// controlling terminal directly, so command redirections do not become its
 /// display transport. Pipeline and non-interactive execution are rejected
 /// before terminal state changes.
-struct EditBuiltin;
+#[derive(clap::Parser)]
+struct EditBuiltin {
+    /// File to open in sarun's in-process relation-aware editor.
+    #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
+    path: std::path::PathBuf,
+}
 
-impl brush_core::builtins::SimpleCommand for EditBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!(
-            "{name} PATH: open PATH in sarun's in-process relation-aware editor\n"
-        ))
-    }
+impl brush_core::builtins::Command for EditBuiltin {
+    type Error = brush_core::error::Error;
 
-    fn execute<
-        SE: brush_core::extensions::ShellExtensions,
-        I: Iterator<Item = S>,
-        S: AsRef<str>,
-    >(
+    async fn execute<SE: brush_core::extensions::ShellExtensions>(
+        &self,
         context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+    ) -> Result<brush_core::results::ExecutionResult, Self::Error> {
         use brush_core::openfiles::OpenFile;
         use std::io::Write;
 
-        let mut argv = args
-            .map(|argument| argument.as_ref().to_string())
-            .collect::<Vec<_>>();
-        if argv.first() == Some(&context.command_name) {
-            argv.remove(0);
-        }
-        if argv.first().map(String::as_str) == Some("--") {
-            argv.remove(0);
-        }
-        let fail = |context: &brush_core::commands::ExecutionContext<'_, SE>, message: &str, code| {
-            let mut stderr = context.stderr();
-            let _ = writeln!(stderr, "edit: {message}");
-            brush_core::results::ExecutionResult::new(code)
-        };
-        if argv.len() != 1 {
-            return Ok(fail(&context, "usage: edit PATH", 2));
-        }
+        let fail =
+            |context: &brush_core::commands::ExecutionContext<'_, SE>, message: &str, code| {
+                let mut stderr = context.stderr();
+                let _ = writeln!(stderr, "edit: {message}");
+                brush_core::results::ExecutionResult::new(code)
+            };
         if !context.shell.options().interactive {
             return Ok(fail(
                 &context,
@@ -1088,7 +1070,7 @@ impl brush_core::builtins::SimpleCommand for EditBuiltin {
             return Ok(fail(&context, "cannot run in a pipeline", 1));
         }
 
-        let operand = std::path::PathBuf::from(&argv[0]);
+        let operand = self.path.clone();
         let path = if operand.is_absolute() {
             operand
         } else {
@@ -1163,7 +1145,7 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
     m.insert("ninja".to_string(), simple_builtin::<NinjaBuiltin, SE>());
     // BashMode shell builtins overwrite any overlapping coreutil names (highest priority).
     m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
-    m.insert("edit".to_string(), simple_builtin::<EditBuiltin, SE>());
+    m.insert("edit".to_string(), builtin::<EditBuiltin, SE>());
     // In-box engine entry points via /proc/self/exe (no PATH shadow needed).
     m.insert("sarun".to_string(), simple_builtin::<EngineSelfCommand, SE>());
     m.insert("oaita".to_string(), simple_builtin::<EngineSelfCommand, SE>());
@@ -1202,95 +1184,221 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
     m
 }
 
-/// Project finite argument domains from the builtin parser definitions into
-/// grammar data. This is the sole Brush-builtin/grammar adapter: it is driven
-/// entirely by each registration's declarative Clap definition and contains no
-/// command-name cases. The parser, editor, and interactive UI only see the
-/// resulting typed relation values.
-pub(crate) fn builtin_command_signatures(
-) -> &'static [crate::prolog::DocumentCommandSignature] {
-    static SIGNATURES: std::sync::OnceLock<Vec<crate::prolog::DocumentCommandSignature>> =
-        std::sync::OnceLock::new();
-    SIGNATURES.get_or_init(|| {
-        let mut registrations = box_builtins::<
-            brush_core::extensions::DefaultShellExtensions,
-        >()
-        .into_iter()
-        .collect::<Vec<_>>();
+/// Translate declarative builtin parsers into an ordinary immutable text
+/// grammar. The result contains only the generic grammar IR vocabulary; the
+/// engine has no command, flag, positional-argument, or Clap cases.
+pub(crate) fn builtin_command_grammar() -> &'static crate::prolog::RelationValue {
+    use crate::prolog::RelationValue as V;
+
+    fn compound(name: &str, arguments: Vec<V>) -> V {
+        V::Compound(name.into(), arguments)
+    }
+    fn list(values: Vec<V>) -> V {
+        V::List(values)
+    }
+    fn choice(mut expressions: Vec<V>) -> V {
+        if expressions.len() == 1 {
+            expressions.pop().unwrap()
+        } else {
+            compound("choice", vec![list(expressions)])
+        }
+    }
+    fn literal(surface: String, semantic: V, syntax: &str, description: String) -> V {
+        compound(
+            "literal",
+            vec![
+                V::String(surface),
+                semantic,
+                compound(
+                    "presentation",
+                    vec![list(vec![
+                        compound(
+                            "meta",
+                            vec![V::Atom("syntax".into()), V::Atom(syntax.into())],
+                        ),
+                        compound(
+                            "meta",
+                            vec![V::Atom("description".into()), V::String(description)],
+                        ),
+                        compound("meta", vec![V::Atom("preference".into()), V::Integer(30)]),
+                    ])],
+                ),
+            ],
+        )
+    }
+
+    static GRAMMAR: std::sync::OnceLock<V> = std::sync::OnceLock::new();
+    GRAMMAR.get_or_init(|| {
+        let mut registrations = box_builtins::<brush_core::extensions::DefaultShellExtensions>()
+            .into_iter()
+            .collect::<Vec<_>>();
         registrations.sort_by(|left, right| left.0.cmp(&right.0));
 
-        registrations
+        let command_expressions = registrations
             .into_iter()
             .filter_map(|(command_name, registration)| {
                 let definition = registration.definition_func?;
-                let command = definition();
-                let following_arguments = command
-                    .get_arguments()
-                    .filter(|argument| {
-                        !argument.is_hide_set() && argument.get_action().takes_values()
-                    })
-                    .flat_map(|argument| {
-                        let values = argument
-                            .get_value_parser()
-                            .possible_values()
-                            .into_iter()
-                            .flatten()
-                            .filter(|value| !value.is_hide_set())
-                            .map(|value| {
-                                let text = value.get_name().to_string();
-                                let description = value
-                                    .get_help()
-                                    .or_else(|| argument.get_help())
-                                    .map_or_else(
-                                        || format!("value for {}", argument.get_id()),
-                                        ToString::to_string,
-                                    );
-                                crate::prolog::CommandArgumentValue {
-                                    semantic: crate::prolog::RelationValue::Compound(
-                                        "builtin_argument".into(),
+                let mut command = definition();
+                command.build();
+                let mut argument_expressions = Vec::new();
+                for argument in command.get_arguments().filter(|argument| {
+                    !argument.is_hide_set() && argument.get_action().takes_values()
+                }) {
+                    let values = argument
+                        .get_value_parser()
+                        .possible_values()
+                        .into_iter()
+                        .flatten()
+                        .filter(|value| !value.is_hide_set())
+                        .map(|value| {
+                            let text = value.get_name().to_string();
+                            let description = value
+                                .get_help()
+                                .or_else(|| argument.get_help())
+                                .map_or_else(
+                                    || format!("value for {}", argument.get_id()),
+                                    ToString::to_string,
+                                );
+                            literal(
+                                text.clone(),
+                                V::Compound(
+                                    "builtin_argument".into(),
+                                    vec![
+                                        V::String(command_name.clone()),
+                                        V::String(argument.get_id().to_string()),
+                                        V::String(text),
+                                    ],
+                                ),
+                                "builtin_argument",
+                                description,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+
+                    if values.is_empty() {
+                        continue;
+                    }
+                    let mut flags = Vec::new();
+                    if let Some(short) = argument.get_short() {
+                        flags.push(format!("-{short}"));
+                    }
+                    if let Some(long) = argument.get_long() {
+                        flags.push(format!("--{long}"));
+                    }
+                    for flag in flags {
+                        let flag_literal = literal(
+                            flag.clone(),
+                            compound(
+                                "builtin_flag",
+                                vec![
+                                    V::String(command_name.clone()),
+                                    V::String(argument.get_id().to_string()),
+                                    V::String(flag),
+                                ],
+                            ),
+                            "builtin_flag",
+                            argument
+                                .get_help()
+                                .map_or_else(|| "builtin option".into(), ToString::to_string),
+                        );
+                        argument_expressions.push(compound(
+                            "seq",
+                            vec![list(vec![
+                                compound("ref", vec![V::Atom("required_space".into())]),
+                                compound(
+                                    "seq",
+                                    vec![list(vec![
+                                        flag_literal,
+                                        compound("ref", vec![V::Atom("required_space".into())]),
+                                        choice(values.clone()),
+                                    ])],
+                                ),
+                            ])],
+                        ));
+                    }
+                }
+                (!argument_expressions.is_empty()).then(|| {
+                    compound(
+                        "seq",
+                        vec![list(vec![
+                            literal(
+                                command_name.clone(),
+                                compound("builtin_command", vec![V::String(command_name.clone())]),
+                                "command",
+                                format!("{command_name} builtin"),
+                            ),
+                            compound(
+                                "repeat",
+                                vec![
+                                    V::Integer(0),
+                                    V::Atom("unbounded".into()),
+                                    choice(argument_expressions),
+                                ],
+                            ),
+                        ])],
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(command_expressions.len() >= 2);
+        compound(
+            "grammar",
+            vec![
+                compound(
+                    "source",
+                    vec![compound("text", vec![V::Atom("utf8".into())])],
+                ),
+                V::Atom("builtin_invocation".into()),
+                list(vec![
+                    compound(
+                        "rule",
+                        vec![
+                            V::Atom("builtin_invocation".into()),
+                            choice(command_expressions),
+                        ],
+                    ),
+                    compound(
+                        "rule",
+                        vec![
+                            V::Atom("required_space".into()),
+                            compound(
+                                "repeat",
+                                vec![
+                                    V::Integer(1),
+                                    V::Atom("unbounded".into()),
+                                    compound(
+                                        "terminal",
                                         vec![
-                                            crate::prolog::RelationValue::String(
-                                                command_name.clone(),
+                                            compound(
+                                                "text",
+                                                vec![compound(
+                                                    "codepoint",
+                                                    vec![compound(
+                                                        "chars",
+                                                        vec![V::String(" \t\r".into())],
+                                                    )],
+                                                )],
                                             ),
-                                            crate::prolog::RelationValue::String(
-                                                argument.get_id().to_string(),
+                                            compound(
+                                                "presentation",
+                                                vec![list(vec![compound(
+                                                    "meta",
+                                                    vec![
+                                                        V::Atom("syntax".into()),
+                                                        V::Atom("trivia".into()),
+                                                    ],
+                                                )])],
                                             ),
-                                            crate::prolog::RelationValue::String(text.clone()),
                                         ],
                                     ),
-                                    text,
-                                    description: crate::prolog::RelationValue::String(description),
-                                    preference: 30,
-                                }
-                            })
-                            .collect::<Vec<_>>();
-
-                        let mut flags = Vec::new();
-                        if let Some(short) = argument.get_short() {
-                            flags.push(format!("-{short}"));
-                        }
-                        if let Some(long) = argument.get_long() {
-                            flags.push(format!("--{long}"));
-                        }
-                        flags.into_iter().filter_map(move |flag| {
-                            (!values.is_empty()).then(|| {
-                                crate::prolog::CommandFollowingArgument {
-                                    flag,
-                                    values: values.clone(),
-                                    syntax: "builtin_argument".into(),
-                                }
-                            })
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                (!following_arguments.is_empty()).then_some(
-                    crate::prolog::DocumentCommandSignature {
-                        command: command_name,
-                        following_arguments,
-                    },
-                )
-            })
-            .collect()
+                                ],
+                            ),
+                        ],
+                    ),
+                ]),
+                list(vec![]),
+            ],
+        )
     })
 }
 
@@ -2427,27 +2535,50 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
 /// Interactive REPL for `sh -i`/`bash -i` inside a `-b` box: reedline backend
 /// with history, completion, and highlighting. Same brush-core shell as `-c`.
 /// Set-flags are applied before the loop starts.
-struct BrushRelationCompletionProvider;
+struct BrushRelationCompletionProvider {
+    shell: brush_interactive::ShellRef,
+}
 
-impl brush_interactive::SemanticCompletionProvider for BrushRelationCompletionProvider {
-    fn complete(
-        &self,
+impl BrushRelationCompletionProvider {
+    fn complete_with_context(
         source: &str,
         cursor: usize,
+        context: &dyn crate::parser::ContextProvider,
     ) -> Vec<brush_interactive::SemanticCompletion> {
-        let Ok(analysis) = crate::prolog::analyze_brush_document(
-            &crate::prolog::BrushDocumentRequest {
-                source: source.to_string(),
-                assist: Some(crate::prolog::Span {
-                    start: cursor,
-                    end: cursor,
-                }),
-                initial_bindings: vec![],
-                observations: vec![],
-            },
-        ) else {
+        let mut request = crate::prolog::BrushDocumentRequest {
+            source: source.to_string(),
+            assist: Some(crate::prolog::Span {
+                start: cursor,
+                end: cursor,
+            }),
+            initial_bindings: vec![],
+            observations: vec![],
+        };
+        let Ok(mut analysis) = crate::prolog::analyze_brush_document(&request) else {
             return Vec::new();
         };
+        for _ in 0..4 {
+            if analysis.context_queries.is_empty() {
+                break;
+            }
+            let Ok(prolog) = crate::prolog::global() else {
+                return Vec::new();
+            };
+            let Ok(Some(observations)) =
+                crate::parser::execute_context_graph(prolog, &analysis.context_queries, context)
+            else {
+                return Vec::new();
+            };
+            request.observations = observations;
+            let Ok(next) = crate::prolog::analyze_brush_document(&request) else {
+                return Vec::new();
+            };
+            let stable = next.context_queries == analysis.context_queries;
+            analysis = next;
+            if stable {
+                break;
+            }
+        }
         analysis
             .candidates
             .into_iter()
@@ -2463,6 +2594,18 @@ impl brush_interactive::SemanticCompletionProvider for BrushRelationCompletionPr
                 replace_end: completion.replace.end,
             })
             .collect()
+    }
+}
+
+impl brush_interactive::SemanticCompletionProvider for BrushRelationCompletionProvider {
+    fn complete(&self, source: &str, cursor: usize) -> Vec<brush_interactive::SemanticCompletion> {
+        let cwd = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.shell.lock())
+                .working_dir()
+                .to_path_buf()
+        });
+        Self::complete_with_context(source, cursor, &crate::parser::FilesystemContext::new(cwd))
     }
 }
 
@@ -2504,7 +2647,12 @@ async fn run_brush_interactive(shell_name: String,
         tokio::sync::Mutex::new(shell));
     let ui_opts = brush_interactive::UIOptions::builder().build();
     let mut backend = match brush_interactive::ReedlineInputBackend::new(
-        &ui_opts, &shell_ref, std::sync::Arc::new(BrushRelationCompletionProvider)) {
+        &ui_opts,
+        &shell_ref,
+        std::sync::Arc::new(BrushRelationCompletionProvider {
+            shell: shell_ref.clone(),
+        }),
+    ) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("sarun-engine brush-sh: reedline init failed: {e}");
@@ -3098,40 +3246,22 @@ mod builtin_boundary_tests {
     }
 
     #[test]
-    fn builtin_command_signatures_are_derived_from_canonical_parser_values() {
-        let bind = super::builtin_command_signatures()
-            .iter()
-            .find(|signature| signature.command == "bind")
-            .expect("bind's finite argument definition was not projected");
-        let keymap = bind
-            .following_arguments
-            .iter()
-            .find(|argument| argument.flag == "-m")
-            .expect("bind -m definition was not projected");
-        assert_eq!(
-            keymap
-                .values
-                .iter()
-                .map(|value| value.text.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "emacs-standard",
-                "emacs-meta",
-                "emacs-ctlx",
-                "vi-command",
-                "vi-insert",
-            ]
-        );
-        assert!(keymap.values.iter().all(|value| {
-            !matches!(value.text.as_str(), "emacs" | "vi" | "vi-move")
-        }));
+    fn builtin_parser_projects_only_ordinary_grammar_values() {
+        let grammar = format!("{:#?}", super::builtin_command_grammar());
+        assert!(grammar.contains("grammar"));
+        assert!(grammar.contains("builtin_invocation"));
+        assert!(grammar.contains("emacs-standard"));
+        assert!(!grammar.contains("following"));
+        assert!(!grammar.contains("positional"));
     }
 
     #[test]
     fn interactive_completion_provider_projects_the_same_relation_edits() {
-        use brush_interactive::SemanticCompletionProvider as _;
-
-        let completions = super::BrushRelationCompletionProvider.complete("bind -m ", 8);
+        let completions = super::BrushRelationCompletionProvider::complete_with_context(
+            "bind -m ",
+            8,
+            &crate::parser::EmptyContext,
+        );
         for expected in [
             "emacs-standard",
             "emacs-meta",
@@ -3148,6 +3278,22 @@ mod builtin_boundary_tests {
         assert!(completions.iter().all(|completion| {
             !matches!(completion.insert.as_str(), "emacs" | "vi" | "vi-move")
         }));
+    }
+
+    #[test]
+    fn parsed_builtin_exposes_valid_flag_continuations_at_each_tear() {
+        for (source, cursor, expected_prefix) in [("bind", 4, " -m "), ("bind ", 5, "-m ")] {
+            let completions = super::BrushRelationCompletionProvider::complete_with_context(
+                source,
+                cursor,
+                &crate::parser::EmptyContext,
+            );
+            assert!(completions.iter().any(|completion| {
+                completion.insert.starts_with(expected_prefix)
+                    && completion.replace_start == cursor
+                    && completion.replace_end == cursor
+            }));
+        }
     }
 
     #[tokio::test]

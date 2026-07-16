@@ -18,6 +18,7 @@ test_name(choice_namespaces_context_dependencies).
 test_name(grammar_terminal_codecs_are_declarative_and_bidirectional).
 test_name(recursive_raw_text_grammar_reports_utf8_byte_evidence).
 test_name(raw_terminal_tear_is_an_ordinary_symbolic_parse_value).
+test_name(every_tested_parse_prefix_exposes_an_ordinary_completion).
 test_name(raw_text_extras_are_grammar_owned_trivia).
 test_name(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly).
 test_name(opaque_handle_resolves_install_once_grammar).
@@ -581,6 +582,39 @@ run_test(raw_terminal_tear_is_an_ordinary_symbolic_parse_value) :-
                     binding(status, incomplete(edit(edit))),
                     binding(completions, [])], 0)], [], [], [])).
 
+run_test(every_tested_parse_prefix_exposes_an_ordinary_completion) :-
+    Grammar = grammar(
+        source(text(utf8)), invocation,
+        [rule(invocation,
+              seq([literal("bind", bind, presentation([])),
+                   repeat(0, unbounded,
+                          seq([literal(" ", separator, presentation([])),
+                               seq([literal("-m", mode_flag,
+                                            presentation([])),
+                                    literal(" ", separator,
+                                            presentation([])),
+                                    choice([
+                                        literal("emacs-standard", emacs,
+                                                presentation([])),
+                                        literal("vi-command", vi,
+                                                presentation([]))
+                                    ])])]))]))],
+        []),
+    limits(Limits),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("bind -m emacs-standard", exact,
+                                           foreign_text))]),
+                want([ast]), observations([]), Limits),
+        reply([solution([binding(ast, _)], 0)], [], [], [])),
+    parse_prefix_completion(Grammar, Limits, "bind", 4,
+                            " -m emacs-standard"),
+    parse_prefix_completion(Grammar, Limits, "bind ", 5,
+                            "-m emacs-standard"),
+    parse_prefix_completion(Grammar, Limits, "bind -m ", 8,
+                            "emacs-standard").
+
 run_test(raw_text_extras_are_grammar_owned_trivia) :-
     Space = terminal(text(codepoint(chars(" \t\n"))),
                      presentation([meta(syntax, trivia)])),
@@ -649,6 +683,27 @@ run_test(envelope_fails_closed) :-
     transform(request(Grammar, given([]), want([]), observations([]),
                       limits(0, 0, 0)),
               reply([], [], [], [diagnostic(invalid_request)])).
+
+parse_prefix_completion(Grammar, Limits, Prefix, Cursor, Expected) :-
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source(Prefix,
+                                           assist(edit, span(Cursor, Cursor)),
+                                           foreign_text))]),
+                want([status, completions]), observations([]), Limits),
+        reply(Solutions, [], [], [])),
+    solution_has_completion(Solutions, Expected).
+
+solution_has_completion([solution(Bindings, _)|_], Expected) :-
+    list_contains(binding(completions, Completions), Bindings),
+    list_contains(completion(_, Expected, _, _, _), Completions),
+    !.
+solution_has_completion([_|Solutions], Expected) :-
+    solution_has_completion(Solutions, Expected).
+
+list_contains(Value, [Value|_]).
+list_contains(Value, [_|Values]) :- list_contains(Value, Values).
 
 has_highlight(Span, Syntax, Semantic, Origin,
               [highlight(Span, Syntax, Semantic, Origin)|_]).

@@ -25,8 +25,7 @@ fn send(master: &mut File, bytes: &[u8]) {
     master.flush().expect("flush PTY input");
 }
 
-#[test]
-fn standalone_brush_completes_builtin_argument_through_relation() {
+fn run_brush_completion(cwd: &std::path::Path, input: &[u8], expected: &[&[u8]]) -> Vec<u8> {
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let size = libc::winsize {
@@ -60,6 +59,7 @@ fn standalone_brush_completes_builtin_argument_through_relation() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sarun"));
     command
         .arg("brush")
+        .current_dir(cwd)
         .env("TERM", "xterm-256color")
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -115,13 +115,12 @@ fn standalone_brush_completes_builtin_argument_through_relation() {
 
         let now = Instant::now();
         if !completion_sent && now.duration_since(started) > Duration::from_secs(1) {
-            send(&mut master, b"bind -m \t");
+            send(&mut master, input);
             completion_sent = true;
         }
         if completion_sent
             && interrupted_at.is_none()
-            && contains(&output, b"emacs-standard")
-            && contains(&output, b"vi-insert")
+            && expected.iter().all(|needle| contains(&output, needle))
         {
             send(&mut master, b"\x03");
             interrupted_at = Some(now);
@@ -144,8 +143,27 @@ fn standalone_brush_completes_builtin_argument_through_relation() {
     };
     assert!(
         exit_sent,
-        "relation completion menu did not show canonical bind values; captured {} bytes",
+        "relation completion did not produce {expected:?}; captured {} bytes",
         output.len()
     );
     assert!(status.success(), "Brush exited {status}");
+    output
+}
+
+#[test]
+fn standalone_brush_completes_builtin_argument_through_relation() {
+    run_brush_completion(
+        &std::env::current_dir().unwrap(),
+        b"bind -m \t",
+        &[b"emacs-standard", b"vi-insert"],
+    );
+}
+
+#[test]
+fn standalone_brush_completes_builtin_flag_through_relation() {
+    run_brush_completion(
+        &std::env::current_dir().unwrap(),
+        b"bind\t",
+        &[b"-m", b"emacs-standard", b"vi-insert"],
+    );
 }

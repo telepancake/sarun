@@ -14,9 +14,7 @@ test_name(unresolved_parameter_emits_external_query).
 test_name(parameter_observation_resolves_and_records_dependency).
 test_name(missing_unique_parameter_observation_fails_semantic_solution).
 test_name(assignment_tear_survives_as_later_local_value).
-test_name(later_find_type_use_constrains_assignment_tear).
 test_name(local_variable_name_completion_comes_from_ordinary_use_step).
-test_name(command_signature_binding_composes_builtin_argument_grammar).
 
 run_brush_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -165,7 +163,8 @@ run_test(assignment_rhs_resolves_before_definition) :-
                             [state_change(shell_variable, "x",
                                           text([reference(shell_variable,
                                                           "x")]))])], 0)],
-              [query(node_ref(simple_parameter, span(2, 4)),
+              [query(branch(enrichment_extension,
+                            node_ref(simple_parameter, span(2, 4))),
                      ask(one, shell_variable, name("x")))], [], [])).
 
 run_test(unresolved_parameter_emits_external_query) :-
@@ -183,12 +182,14 @@ run_test(unresolved_parameter_emits_external_query) :-
                    [resolved(node_ref(simple_parameter, span(5, 7)),
                              external(ref(node_ref(simple_parameter,
                                                    span(5, 7)))))])], 0)],
-              [query(node_ref(simple_parameter, span(5, 7)),
+              [query(branch(enrichment_extension,
+                            node_ref(simple_parameter, span(5, 7))),
                      ask(one, shell_variable, name("z")))], [], [])).
 
 run_test(parameter_observation_resolves_and_records_dependency) :-
     brush_relation_grammar(Grammar),
-    Id = node_ref(simple_parameter, span(5, 7)),
+    InnerId = node_ref(simple_parameter, span(5, 7)),
+    Id = branch(enrichment_extension, InnerId),
     Query = ask(one, shell_variable, name("z")),
     Entry = entry(shell_variable, variable_z, ["z"], shell_text("value"),
                   [exported]),
@@ -203,12 +204,14 @@ run_test(parameter_observation_resolves_and_records_dependency) :-
                 want([resolutions]), observations([Observation]),
                 limits(32, 4096, 1048576)),
         reply([solution([binding(resolutions,
-                                 [resolved(Id, external(one(Entry)))])], 0)],
+                                 [resolved(InnerId,
+                                           external(one(Entry)))])], 0)],
               [], [dependency(Id, Query, some(one(Entry)))], [])).
 
 run_test(missing_unique_parameter_observation_fails_semantic_solution) :-
     brush_relation_grammar(Grammar),
-    Id = node_ref(simple_parameter, span(5, 7)),
+    Id = branch(enrichment_extension,
+                node_ref(simple_parameter, span(5, 7))),
     Query = ask(one, shell_variable, name("z")),
     Observation = observed(Id, Query, source(brush_variables, 8), none),
     transform(
@@ -238,32 +241,6 @@ run_test(assignment_tear_survives_as_later_local_value) :-
         reply(Solutions, [], [], [])),
     has_assignment_hole_solution(Hole, Solutions).
 
-run_test(later_find_type_use_constrains_assignment_tear) :-
-    brush_relation_grammar(Grammar),
-    Hole = hole(edit, span(3, 3), "",
-                terminal(text(codepoint(except("\"\\$"))))),
-    transform(
-        request(Grammar,
-                given([binding(source,
-                               text_source(
-                                   "A=\"\"; find . -type $A",
-                                   assist(edit, span(3, 3)), brush_test)),
-                       binding(initial_state,
-                               local_state([scope(root, [])], []))]),
-                want([status, completions, delta]), observations([]),
-                limits(32, 4096, 1048576)),
-        reply(Solutions, [], [], [])),
-    has_find_type_solution(Hole, Solutions, Completions),
-    has_completion("D", door, Completions),
-    has_completion("b", block_device, Completions),
-    has_completion("c", character_device, Completions),
-    has_completion("d", directory, Completions),
-    has_completion("f", regular_file, Completions),
-    has_completion("l", symbolic_link, Completions),
-    has_completion("p", named_pipe, Completions),
-    has_completion("s", socket, Completions),
-    has_completion("$", literal_dollar, Completions).
-
 run_test(local_variable_name_completion_comes_from_ordinary_use_step) :-
     brush_relation_grammar(Grammar),
     transform(
@@ -284,45 +261,6 @@ run_test(local_variable_name_completion_comes_from_ordinary_use_step) :-
                           binding(delta, _)], _), Solutions),
     has_completion("A", local(shell_variable, "A"), Completions).
 
-run_test(command_signature_binding_composes_builtin_argument_grammar) :-
-    brush_relation_grammar(Grammar),
-    BindSignature =
-        signature("bind",
-                  [following(
-                       "-m",
-                       one_of([
-                           value("emacs-standard", "emacs-standard",
-                                 builtin_argument_value, 30),
-                           value("emacs-meta", "emacs-meta",
-                                 builtin_argument_value, 30),
-                           value("emacs-ctlx", "emacs-ctlx",
-                                 builtin_argument_value, 30),
-                           value("vi-command", "vi-command",
-                                 builtin_argument_value, 30),
-                           value("vi-insert", "vi-insert",
-                                 builtin_argument_value, 30)
-                       ]),
-                       presentation(builtin_argument))]),
-    transform(
-        request(Grammar,
-                given([binding(source,
-                               text_source("bind -m ",
-                                           assist(edit, span(8, 8)),
-                                           brush_test)),
-                       binding(initial_state,
-                               local_state([scope(root, [])], [])),
-                       binding(command_signatures, [BindSignature])]),
-                want([status, completions]), observations([]),
-                limits(32, 4096, 1048576)),
-        reply(Solutions, [], [], [])),
-    list_member(solution([binding(status, incomplete(edit(edit))),
-                          binding(completions, Completions)], _), Solutions),
-    has_completion("emacs-standard", "emacs-standard", Completions),
-    has_completion("emacs-meta", "emacs-meta", Completions),
-    has_completion("emacs-ctlx", "emacs-ctlx", Completions),
-    has_completion("vi-command", "vi-command", Completions),
-    has_completion("vi-insert", "vi-insert", Completions).
-
 has_assignment_hole_solution(
     Hole,
     [solution(
@@ -338,24 +276,10 @@ has_assignment_hole_solution(
                        node_ref(simple_parameter, span(11, 13)),
                        local(local_binding(shell_variable, "A", text([Hole]),
                                            escaping)))]),
-          binding(completions,
-                  [completion(span(3, 3), "$",
-                              [alternative(literal_dollar, string, grammar,
-                                           0)],
-                              0, 1)])], 0)|_]).
+          binding(completions, Completions)], 0)|_]) :-
+    has_completion("$", literal_dollar, Completions).
 has_assignment_hole_solution(Hole, [_|Solutions]) :-
     has_assignment_hole_solution(Hole, Solutions).
-
-has_find_type_solution(
-    Hole,
-    [solution([binding(status, incomplete(edit(edit))),
-               binding(completions, Completions),
-               binding(delta,
-                       [state_change(shell_variable, "A", text([Hole]))])],
-              0)|_],
-    Completions).
-has_find_type_solution(Hole, [_|Solutions], Completions) :-
-    has_find_type_solution(Hole, Solutions, Completions).
 
 has_completion(Text, Semantic,
                [completion(_, Text, Alternatives, _, _)|_]) :-

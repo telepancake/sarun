@@ -399,7 +399,7 @@ fn execute_context_plan(
     }
 }
 
-fn execute_context_graph(
+pub(crate) fn execute_context_graph(
     prolog: &crate::prolog::Prolog,
     graph: &[crate::prolog::ContextQueryNode],
     context: &dyn ContextProvider,
@@ -429,6 +429,175 @@ fn execute_context_graph(
         }
     }
     Ok(Some(observations))
+}
+
+/// Query-scoped filesystem snapshots rooted in a caller's logical working
+/// directory. Path interpretation and matching remain in the Prolog context
+/// relation; this provider only enumerates the smallest directory snapshot
+/// needed by a typed filesystem prefix query.
+pub struct FilesystemContext {
+    logical_cwd: std::path::PathBuf,
+}
+
+impl FilesystemContext {
+    pub fn new(logical_cwd: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            logical_cwd: logical_cwd.into(),
+        }
+    }
+
+    fn prefix<'a>(selector: &'a crate::prolog::RelationValue) -> Option<&'a str> {
+        use crate::prolog::RelationValue;
+        match selector {
+            RelationValue::Compound(name, arguments)
+                if name == "prefix" && arguments.len() == 1 =>
+            {
+                match &arguments[0] {
+                    RelationValue::String(prefix) | RelationValue::Atom(prefix) => Some(prefix),
+                    _ => None,
+                }
+            }
+            RelationValue::Compound(name, arguments)
+                if matches!(name.as_str(), "within" | "and" | "or") =>
+            {
+                arguments.iter().find_map(Self::prefix)
+            }
+            _ => None,
+        }
+    }
+
+    fn filesystem_domain(domain: &crate::prolog::RelationValue) -> Option<&str> {
+        match domain {
+            crate::prolog::RelationValue::Atom(domain)
+                if matches!(
+                    domain.as_str(),
+                    "filesystem_path"
+                        | "filesystem_file"
+                        | "filesystem_directory"
+                        | "filesystem_executable"
+                ) =>
+            {
+                Some(domain)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl ContextProvider for FilesystemContext {
+    fn snapshot(
+        &self,
+        request: &crate::prolog::ContextQueryNode,
+    ) -> Result<crate::prolog::ContextSnapshot, String> {
+        use crate::prolog::{ContextEntry, ContextSnapshot, RelationValue};
+        use std::time::UNIX_EPOCH;
+
+        let Some(domain) = Self::filesystem_domain(&request.query.domain) else {
+            return Ok(ContextSnapshot {
+                provider: RelationValue::Atom("filesystem_context".into()),
+                revision: RelationValue::Integer(0),
+                entries: Vec::new(),
+            });
+        };
+        let prefix = Self::prefix(&request.query.selector).unwrap_or("");
+        let (display_parent, leaf_prefix) = prefix
+            .rfind('/')
+            .map_or(("", prefix), |slash| prefix.split_at(slash + 1));
+        let operand_parent = if display_parent.is_empty() {
+            std::path::Path::new(".")
+        } else {
+            std::path::Path::new(display_parent)
+        };
+        let directory = if operand_parent.is_absolute() {
+            operand_parent.to_path_buf()
+        } else {
+            self.logical_cwd.join(operand_parent)
+        };
+        let metadata = std::fs::metadata(&directory).ok();
+        let modified = metadata
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok());
+        let revision = RelationValue::Compound(
+            "filesystem_revision".into(),
+            vec![
+                RelationValue::String(directory.to_string_lossy().into_owned()),
+                RelationValue::Integer(
+                    modified.map_or(0, |duration| duration.as_secs().min(i64::MAX as u64) as i64),
+                ),
+                RelationValue::Integer(
+                    modified.map_or(0, |duration| duration.subsec_nanos() as i64),
+                ),
+            ],
+        );
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(&directory) {
+            for entry in read_dir.flatten() {
+                let Some(leaf) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if !leaf.starts_with(leaf_prefix)
+                    || (!leaf_prefix.starts_with('.') && leaf.starts_with('.'))
+                {
+                    continue;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let is_directory = file_type.is_dir();
+                let is_file = file_type.is_file();
+                #[cfg(unix)]
+                let is_executable = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    entry
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                };
+                #[cfg(not(unix))]
+                let is_executable = is_file;
+                if (domain == "filesystem_file" && !is_file)
+                    || (domain == "filesystem_directory" && !is_directory)
+                    || (domain == "filesystem_executable" && !is_executable)
+                {
+                    continue;
+                }
+                let mut display_name = format!("{display_parent}{leaf}");
+                if is_directory {
+                    display_name.push('/');
+                }
+                let identity_path = entry.path();
+                let kind = if is_directory {
+                    "directory"
+                } else if file_type.is_symlink() {
+                    "symlink"
+                } else {
+                    "file"
+                };
+                entries.push(ContextEntry {
+                    domain: request.query.domain.clone(),
+                    identity: RelationValue::String(identity_path.to_string_lossy().into_owned()),
+                    names: vec![display_name],
+                    value: RelationValue::Compound(
+                        "filesystem_path".into(),
+                        vec![RelationValue::String(
+                            identity_path.to_string_lossy().into_owned(),
+                        )],
+                    ),
+                    attributes: vec![RelationValue::Atom(kind.into())],
+                });
+            }
+        }
+        entries.sort_by(|left, right| left.names.cmp(&right.names));
+        Ok(ContextSnapshot {
+            provider: RelationValue::Compound(
+                "filesystem".into(),
+                vec![RelationValue::String(
+                    self.logical_cwd.to_string_lossy().into_owned(),
+                )],
+            ),
+            revision,
+            entries,
+        })
+    }
 }
 
 fn invocation_from_command(

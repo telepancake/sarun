@@ -460,18 +460,33 @@ context observations: successful unique observations bind external values,
 failed unique observations fail the semantic solution, and consumed outcomes
 become stable dependency keys for selective invalidation.
 
-Application grammars can now name a typed request binding as an immutable
-signature-data contribution. The generic symbolic relation resolves that
-binding without knowing any command identity. Brush uses this seam to project
-finite value-taking arguments from the exact Clap definitions used to execute
-builtins. The first concrete client is `bind -m`: its five canonical keymap
-values pass through ordinary source parsing, scoped constraints, and completion
-evidence in both the production document API and editor. This is grammar data
-composition, not a `bind` parser or completion case. Interactive Reedline now
-uses the same completion projection through a required neutral provider; the
-old token-based completer is absent from sarun's path. Its highlighting,
-validation, hints, indentation, and context-observation slices still require
-the broader singular-authority cutover below.
+The discarded command-signature mini-language (`signature`, `following`, and
+`positional`) has been removed from the engine, Rust boundary, grammar, and
+tests. Declarative builtin parsers now translate into the ordinary generic text
+grammar IR (`grammar`, `rule`, `seq`, `repeat`, `choice`, `literal`, and
+`terminal`). The engine has no command, flag, argument-layout, or Clap cases.
+The first concrete client is `bind -m`: its canonical keymap values are literal
+branches in an immutable grammar supplied through the normal request envelope.
+Interactive Reedline consumes the same completion projection.
+
+A tear at the start of a remaining sequence is now an ordinary parse witness:
+the relation renders a bounded valid continuation through the same grammar and
+records it as ordinary evidence. The invariant is explicit and tested: if a
+full construct parses, a tested prefix with valid continuations must expose a
+completion from that parse relation. Generic tests cover `bind|`, `bind |`, and
+`bind -m |`; Rust and native aarch64 PTY tests cover both the flag and value
+menus. Completion is not permitted to become a side algorithm that traverses
+or reinterprets grammar data.
+
+Enrichment grammars now namespace base and extension query identities so an
+observation returns only to the relation that emitted it, and extensions
+receive exactly their declared shared representations rather than every base
+projection. Contextual positional values are the next unfinished slice. The
+generic filesystem snapshot provider exists, but `edit PATH` must not claim
+relation completion until an ordinary context-backed terminal is in the text
+grammar and native aarch64 editor/REPL tests pass. After that, add live Brush
+variables/functions/builtins/PATH providers and make one cached relation
+analysis own every Reedline and editor presentation projection.
 
 The next externally usable checkpoint is explicitly the complete interactive
 `sarun brush` editing experience: relation-owned highlighting, completion,

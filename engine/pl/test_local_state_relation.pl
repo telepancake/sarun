@@ -10,7 +10,6 @@ test_name(external_resolution_consumes_unique_observation).
 test_name(failed_unique_observation_fails_resolution).
 test_name(later_constraint_binds_hole_through_local_reference).
 test_name(symbolic_constraints_fail_closed).
-test_name(invocation_signatures_are_separate_generic_data).
 
 run_local_state_relation_tests :-
     findall(Name, test_name(Name), Names),
@@ -147,25 +146,3 @@ run_test(symbolic_constraints_fail_closed) :-
            [text_constraint(text([hole(edit, span(2, 1), "", any)]),
                             one_of([]), presentation(invalid))],
            State, _).
-
-run_test(invocation_signatures_are_separate_generic_data) :-
-    Hole = hole(edit, span(3, 3), "", text(codepoint(any))),
-    State = local_state(
-        [scope(root,
-               [local_binding(variable, "A", text([Hole]), escaping)])], []),
-    Constraints = [invocation_constraint(
-                       text(["inspect"]),
-                       [text(["--kind"]),
-                        text([reference(variable, "A")])])],
-    Signatures = [signature(
-                      "inspect",
-                      [following(
-                           "--kind",
-                           one_of([value("x", kind_x, kinds, 7),
-                                   value("y", kind_y, kinds, 7)]),
-                           presentation(kind_argument))])],
-    state_constraint_completion_pairs(Constraints, State, Signatures, Pairs),
-    Pairs = [completion_key(span(3, 3), "x")-
-                 (alternative(kind_x, kind_argument, kinds)-7),
-             completion_key(span(3, 3), "y")-
-                 (alternative(kind_y, kind_argument, kinds)-7)].

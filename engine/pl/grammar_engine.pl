@@ -87,16 +87,11 @@ transform_relation(symbolic_text_grammar, Given, Wanted, _Observations,
     project_completions(Pairs, Completions),
     Available = [binding(completions, Completions)],
     requested_bindings(Wanted, Available, Bindings).
-transform_relation(symbolic_text_grammar(SignatureSource), Given, Wanted,
-                   _Observations, _Limits,
-                   reply([solution(Bindings, 0)], [], [], [])) :-
-    symbolic_constraints(Given, Constraints),
-    given_value(final_state, Given, State),
-    symbolic_signatures(SignatureSource, Given, Signatures),
-    state_constraint_completion_pairs(Constraints, State, Signatures, Pairs),
-    project_completions(Pairs, Completions),
-    Available = [binding(completions, Completions)],
-    requested_bindings(Wanted, Available, Bindings).
+transform_relation(given_grammar(Name), Given, Wanted, Observations, Limits,
+                   Reply) :-
+    atom(Name),
+    given_value(Name, Given, Grammar),
+    transform_relation(Grammar, Given, Wanted, Observations, Limits, Reply).
 
 transform_relation(ast_state_grammar(Rules), Given, Wanted, Observations,
                    _Limits,
@@ -134,10 +129,14 @@ transform_relation(enrichment_grammar(Base, Shared, Extension, Outputs),
     -> transform_relation(Base, Given, Wanted, Observations, Limits, Reply)
     ;  append(BaseWanted, Shared, RequiredBase0),
        sort(RequiredBase0, RequiredBase),
-       transform_relation(Base, Given, RequiredBase, Observations, Limits,
-                          BaseReply),
-       enrich_reply(BaseReply, Extension, ExtensionWanted, Given, Wanted,
-                    Observations, Limits, Reply)
+       scoped_observations(enrichment_base, Observations, BaseObservations),
+       transform_relation(Base, Given, RequiredBase, BaseObservations, Limits,
+                          BaseReply0),
+       scope_reply(enrichment_base, 0, BaseReply0, BaseReply),
+       scoped_observations(enrichment_extension, Observations,
+                           ExtensionObservations),
+       enrich_reply(BaseReply, Shared, Extension, ExtensionWanted, Given,
+                    Wanted, ExtensionObservations, Limits, Reply)
     ).
 transform_relation(completion_union_grammar(Base, AdditionalName), Given,
                    Wanted, Observations, Limits, Reply) :-
@@ -269,19 +268,6 @@ symbolic_constraints(Given, Constraints) :-
     given_value(steps, Given, Steps),
     state_step_constraints(Steps, Constraints).
 
-% A grammar may declare immutable signatures directly, or name a request
-% binding that contributes signatures to its built-in defaults.  This keeps
-% application command catalogs as ordinary relation data: the generic engine
-% neither knows command names nor calls application code.
-symbolic_signatures(given(Name, Defaults), Given, Signatures) :-
-    atom(Name), proper_list(Defaults),
-    ( given_value(Name, Given, Supplied)
-    -> proper_list(Supplied), append(Defaults, Supplied, Signatures)
-    ;  Signatures = Defaults
-    ).
-symbolic_signatures(Signatures, _, Signatures) :-
-    proper_list(Signatures).
-
 initial_local_state(Given, Initial) :-
     given_value(initial_state, Given, Initial), !.
 initial_local_state(_, Initial) :-
@@ -331,15 +317,18 @@ partition_names([Name|Names], Selected, Chosen, [Name|Rest]) :-
 
 enrich_reply(reply(BaseSolutions, BaseQueries, BaseDependencies,
                    BaseDiagnostics),
-             Extension, ExtensionWanted, Given, Wanted, Observations, Limits,
-             reply(Solutions, Queries, Dependencies, Diagnostics)) :-
+             Shared, Extension, ExtensionWanted, Given, Wanted, Observations,
+             Limits, reply(Solutions, Queries, Dependencies, Diagnostics)) :-
     BaseSolutions = [_|_],
     findall(enriched(BaseSolution, ExtensionReply),
             ( candidate_member(BaseSolution, BaseSolutions),
               BaseSolution = solution(BaseBindings, _),
-              merge_bindings(Given, BaseBindings, ExtensionGiven),
+              select_named_bindings(Shared, BaseBindings, SharedBindings),
+              merge_bindings(Given, SharedBindings, ExtensionGiven),
               transform_relation(Extension, ExtensionGiven, ExtensionWanted,
-                                 Observations, Limits, ExtensionReply)
+                                 Observations, Limits, ExtensionReply0),
+              scope_reply(enrichment_extension, 0, ExtensionReply0,
+                          ExtensionReply)
             ),
             Enriched),
     Enriched = [_|_],
@@ -353,6 +342,12 @@ enrich_reply(reply(BaseSolutions, BaseQueries, BaseDependencies,
     append(Diagnostics0, LimitDiagnostics, Diagnostics),
     sort(Queries0, Queries),
     sort(Dependencies0, Dependencies).
+
+select_named_bindings([], _, []).
+select_named_bindings([Name|Names], Bindings,
+                      [binding(Name, Value)|Selected]) :-
+    given_value(Name, Bindings, Value),
+    select_named_bindings(Names, Bindings, Selected).
 
 flatten_enriched([], _, [], [], [], []).
 flatten_enriched([
@@ -611,7 +606,8 @@ choice_completion_projection(Solutions0, Solutions) :-
     ( Pairs = []
     -> Solutions = Solutions0
     ;  project_completions(Pairs, Completions),
-       replace_solution_completions(Solutions0, Completions, Solutions)
+       replace_solution_completions(Solutions0, Completions, Projected),
+       sort(Projected, Solutions)
     ).
 
 solution_completion_pair(Solutions, Pair) :-
