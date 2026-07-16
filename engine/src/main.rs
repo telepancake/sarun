@@ -23,6 +23,7 @@ use fuser::MountOption;
 pub use net::NetMode;
 
 mod brush;
+mod brush_relation;
 mod builtin_exec;
 mod capture;
 mod containers_conf;

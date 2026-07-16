@@ -145,6 +145,10 @@ Do not implement these as Brush-specific engine branches:
 - [x] Inventory every `Shell::parse_string`, `run_string`, `run_program`,
       highlighter, completer, and validator consumer in sarun and vendored
       Brush; classify execution, validation, presentation, or provenance use.
+- [x] Check in an initial aarch64-tested reference-status corpus for Bash/POSIX
+      nested substitutions, variables, UTF-8, compounds, functions,
+      arithmetic, pipelines, quoted/unquoted/multiple heredocs, and representative
+      incomplete and invalid sources.
 - [ ] Build a checked-in differential corpus covering POSIX and Bash modes,
       valid/invalid/incomplete input, UTF-8, comments/trivia, assignments,
       functions, compound commands, pipelines, redirections, expansions,

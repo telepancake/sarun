@@ -1,0 +1,86 @@
+[
+  {
+    "name": "assignment_and_parameter_default",
+    "mode": "bash",
+    "status": "complete",
+    "source": "name=world; printf '%s\\n' \"hello ${name:-nobody}\""
+  },
+  {
+    "name": "nested_substitution_and_pipeline",
+    "mode": "bash",
+    "status": "complete",
+    "source": "printf '%s\\n' \"$(printf '%s' \"$name\")\" | sed 's/world/WORLD/'"
+  },
+  {
+    "name": "posix_for_compound",
+    "mode": "posix",
+    "status": "complete",
+    "source": "for x in one two; do printf '<%s>\\n' \"$x\"; done"
+  },
+  {
+    "name": "function_and_arithmetic",
+    "mode": "bash",
+    "status": "complete",
+    "source": "step() { printf '%s\\n' \"$1\"; }; value=$((base + 2 * step)); step \"$value\""
+  },
+  {
+    "name": "expandable_heredoc",
+    "mode": "bash",
+    "status": "complete",
+    "source": "cat <<EOF\nexpanded $name and $(printf nested)\nEOF\n"
+  },
+  {
+    "name": "literal_heredoc",
+    "mode": "posix",
+    "status": "complete",
+    "source": "cat <<'EOF'\nliteral $name and $(printf not-executed)\nEOF\n"
+  },
+  {
+    "name": "multiple_heredocs_in_substitution",
+    "mode": "bash",
+    "status": "complete",
+    "source": "value=$(cat <<A; cat <<'B'\n$name\nA\n$literal\nB\n)\nprintf '%s\\n' \"$value\""
+  },
+  {
+    "name": "utf8_words_and_expansion",
+    "mode": "bash",
+    "status": "complete",
+    "source": "sveiciens=pasaule; printf 'λ %s\\n' \"$sveiciens\""
+  },
+  {
+    "name": "incomplete_double_quote",
+    "mode": "bash",
+    "status": "incomplete",
+    "source": "printf '%s' \"unterminated"
+  },
+  {
+    "name": "incomplete_compound",
+    "mode": "posix",
+    "status": "incomplete",
+    "source": "if true; then\n  printf yes\n"
+  },
+  {
+    "name": "incomplete_heredoc",
+    "mode": "bash",
+    "status": "incomplete",
+    "source": "cat <<EOF\n$name\n"
+  },
+  {
+    "name": "incomplete_command_substitution",
+    "mode": "bash",
+    "status": "incomplete",
+    "source": "printf '%s' \"$(printf nested"
+  },
+  {
+    "name": "invalid_unexpected_close_paren",
+    "mode": "bash",
+    "status": "invalid",
+    "source": "printf ok ) printf no"
+  },
+  {
+    "name": "invalid_then_without_condition",
+    "mode": "posix",
+    "status": "invalid",
+    "source": "if ; then printf no; fi"
+  }
+]
