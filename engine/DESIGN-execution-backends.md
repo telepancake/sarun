@@ -76,6 +76,10 @@ as executable mappings and mmap that genuinely need a host fd.
           Native paths remain only at explicit direct-write and negotiated
           kernel-passthrough acceleration boundaries.
   - [ ] Isolate capture/provenance mutation from protocol callbacks.
+    - [x] Give filesystem mutations and process-provenance insertions one
+          bounded journal owned outside the overlay/protocol adapters.
+    - [ ] Move depot mutations, copy-up attribution, and finalization behind a
+          capture service rather than calling `BoxState` throughout policy.
   - [ ] Isolate synthetic projections, sinks, jobserver, and nested-box nodes.
     - [x] Define every reserved per-box name, kind, attribute, and sink stream
           once in a typed transport-independent synthetic-node catalog.

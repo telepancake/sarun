@@ -154,23 +154,8 @@ struct Inner {
     // the daemon served (test observability: stays ~0 for passthrough'd reads).
     passthrough_ok: std::sync::atomic::AtomicBool,
     daemon_reads: AtomicU64,
-    /// Engine-to-UI event queue, drained by the broadcaster thread in
-    /// main.rs::serve. Two producers, ONE queue:
-    ///   * overlay's mutating FS ops (write / create / mkdir / ...)
-    ///     push (sid, rel, op) → broadcast as type=overlay.
-    ///   * each registered BoxState (record_proc) pushes
-    ///     (sid, "", "process_added") → broadcast as type=process_added.
-    /// add_box() hands every BoxState a clone of this Arc so a direct
-    /// push from the producer beats any race with box teardown.
-    /// Bounded by OVERLAY_EVT_CAP (oldest half-shed on overflow).
-    events: crate::capture::EventQ,
+    mutations: crate::sarunfs::mutation::MutationJournal,
 }
-
-/// Soft cap on the per-overlay event queue. The control loop drains every
-/// few hundred ms; anything still queued past this bound is the oldest
-/// half-shed, which is fine for "what just changed" notifications (the UI
-/// re-reads the underlying view on the broadcast).
-pub const OVERLAY_EVT_CAP: usize = 4096;
 
 struct Fh {
     inner: FhInner,
@@ -453,24 +438,10 @@ mod file_group_tests {
 impl SarunFs {
     /// Drain queued (box_id, rel, op) events out of the overlay — the
     /// control loop calls this on a tick and broadcasts each one as a
-    /// type=overlay event to subscribers. Returns at most OVERLAY_EVT_CAP
-    /// items; anything beyond is dropped before the call returns to keep
-    /// the queue from growing unbounded under a write storm.
+    /// type=overlay event to subscribers. The mutation journal bounds itself
+    /// under a write storm before this consumer drains it.
     pub fn drain_events(&self) -> Vec<(i64, String, &'static str)> {
-        let mut q = self.inner.events.lock().unwrap();
-        let drained: Vec<_> = q.drain(..).collect();
-        drained
-    }
-
-    /// Append one change notification; called from the mutating FS ops.
-    /// Bounded — drops the oldest half if we'd exceed OVERLAY_EVT_CAP.
-    fn push_event(&self, box_id: i64, rel: String, op: &'static str) {
-        let mut q = self.inner.events.lock().unwrap();
-        if q.len() >= OVERLAY_EVT_CAP {
-            let drop_n = OVERLAY_EVT_CAP / 2;
-            q.drain(..drop_n);
-        }
-        q.push_back((box_id, rel, op));
+        self.inner.mutations.drain()
     }
 
     pub fn new(lower: PathBuf) -> Self {
@@ -493,7 +464,7 @@ impl SarunFs {
             muted: RwLock::new(std::collections::HashMap::new()),
             passthrough_ok: std::sync::atomic::AtomicBool::new(false),
             daemon_reads: AtomicU64::new(0),
-            events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            mutations: crate::sarunfs::mutation::MutationJournal::new(),
             shadows: RwLock::new(Shadows::load()),
         }), root: (0, String::new()) };
         // Reclaim unreferenced cache pool files once per engine start —
@@ -790,7 +761,7 @@ impl SarunFs {
     }
 
     pub fn add_box(&self, b: Arc<BoxState>) {
-        b.set_event_sink(self.inner.events.clone());
+        self.inner.mutations.attach_box(&b);
         let parent = b.parent();
         let bid_of_added = b.id;
         self.inner.boxes.write().unwrap().insert(b.id, b);
@@ -1829,7 +1800,7 @@ impl SarunFs {
                 .unwrap_or_else(|| self.synth_file_attr(inode));
             attr.kind = NodeKind::RegularFile;
             attr.perm = (mode & 0o7777) as u16;
-            self.push_event(bid, rel.clone(), "create");
+self.inner.mutations.record(bid, rel.clone(), "create");
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
@@ -1883,7 +1854,7 @@ impl SarunFs {
         }
         b.set_dir(&rel, mode, b.writer_for(pid));
         let inode = self.ino_for(&(box_id, rel.clone()));
-        self.push_event(box_id, rel, "mkdir");
+self.inner.mutations.record(box_id, rel, "mkdir");
         let attr = self.synth_dir_attr(inode, mode | libc::S_IFDIR, 0);
         self.inner.inodes.acquire(inode, 1);
         Ok(attr)
@@ -1903,7 +1874,7 @@ impl SarunFs {
         }
         b.set_symlink(&rel, target, b.writer_for(pid));
         let inode = self.ino_for(&(box_id, rel.clone()));
-        self.push_event(box_id, rel, "symlink");
+self.inner.mutations.record(box_id, rel, "symlink");
         let attr = self.synth_link_attr(
             inode,
             target.as_os_str().as_encoded_bytes().len() as u64,
@@ -1927,7 +1898,7 @@ impl SarunFs {
         self.inner.detached_attrs.write().unwrap().insert(inode, attr);
         b.drop_row(&rel);
         b.set_whiteout(&rel, b.writer_for(pid));
-        self.push_event(box_id, rel, "unlink");
+self.inner.mutations.record(box_id, rel, "unlink");
         Ok(())
     }
 
@@ -1949,7 +1920,7 @@ impl SarunFs {
         self.inner.detached_attrs.write().unwrap().insert(inode, attr);
         b.drop_row(&rel);
         b.set_whiteout(&rel, b.writer_for(pid));
-        self.push_event(box_id, rel, "rmdir");
+self.inner.mutations.record(box_id, rel, "rmdir");
         Ok(())
     }
 
@@ -2018,8 +1989,8 @@ impl SarunFs {
             Layer::ExtFile { .. } => return Err(Errno::EROFS),
         }
         self.remap_inode_subtree(box_id, &old_rel, &new_rel);
-        self.push_event(box_id, old_rel, "rename_src");
-        self.push_event(box_id, new_rel, "rename_dst");
+self.inner.mutations.record(box_id, old_rel, "rename_src");
+self.inner.mutations.record(box_id, new_rel, "rename_dst");
         Ok(())
     }
 
@@ -2050,7 +2021,7 @@ impl SarunFs {
             }
             _ => return Err(Errno::EINVAL),
         }
-        self.push_event(box_id, rel.clone(), "mknod");
+self.inner.mutations.record(box_id, rel.clone(), "mknod");
         let inode = self.ino_for(&(box_id, rel.clone()));
         let attr = self.attr_of(&b, inode, &rel).ok_or(Errno::EIO)?;
         self.inner.inodes.acquire(inode, 1);
@@ -2093,7 +2064,7 @@ impl SarunFs {
         let new_inode = self.ino_for(&(box_id, new_rel.clone()));
         let attr = self.attr_of(&b, new_inode, &new_rel).ok_or(Errno::EIO)?;
         self.inner.inodes.acquire(new_inode, 1);
-        self.push_event(box_id, new_rel, "link");
+self.inner.mutations.record(box_id, new_rel, "link");
         Ok(attr)
     }
 
@@ -2347,7 +2318,7 @@ impl SarunFs {
     }
 
     fn finish_file_write(&self, box_id: i64, rel: String) {
-        self.push_event(box_id, rel, "write");
+self.inner.mutations.record(box_id, rel, "write");
     }
 
     fn write_sink_node(&self, pid: u32, box_id: i64, stream: i32, data: &[u8]) {
