@@ -2046,6 +2046,75 @@ impl SarunFs {
         Ok(())
     }
 
+    fn rename_node(
+        &self,
+        pid: u32,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        let (box_id, old_parent) = self.key_of(INodeNo(parent)).ok_or(Errno::EACCES)?;
+        let (new_box_id, new_parent) = self
+            .key_of(INodeNo(new_parent))
+            .ok_or(Errno::EACCES)?;
+        if box_id == 0 || new_box_id == 0 || box_id != new_box_id {
+            return Err(Errno::EXDEV);
+        }
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            return Err(Errno::ENOSYS);
+        }
+        if flags & !(libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let name = name.to_str().ok_or(Errno::EINVAL)?;
+        let new_name = new_name.to_str().ok_or(Errno::EINVAL)?;
+        let join = |parent: &str, name: &str| {
+            if parent.is_empty() { name.to_owned() } else { format!("{parent}/{name}") }
+        };
+        let old_rel = join(&old_parent, name);
+        let new_rel = join(&new_parent, new_name);
+        let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
+        if self.ro_denied(box_id, &old_rel) || self.ro_denied(box_id, &new_rel) {
+            return Err(Errno::EROFS);
+        }
+        if flags & libc::RENAME_NOREPLACE != 0
+            && !matches!(self.resolve(box_id, &new_rel), Layer::Absent)
+        {
+            return Err(Errno::EEXIST);
+        }
+        let writer = b.writer_for(pid);
+        let lower_old = self.host(&old_rel).symlink_metadata().is_ok();
+        match self.layer(&b, &old_rel) {
+            Layer::Absent => return Err(Errno::ENOENT),
+            Layer::UpperDir { .. } => {
+                b.reparent(&old_rel, &new_rel);
+                if self.host(&old_rel).is_dir() {
+                    b.set_whiteout(&old_rel, writer);
+                }
+            }
+            Layer::Lower => {
+                self.copy_up(&b, &old_rel, pid).map_err(|_| Errno::EIO)?;
+                b.rename_row(&old_rel, &new_rel);
+                b.set_whiteout(&old_rel, writer);
+            }
+            Layer::UpperFile { .. }
+            | Layer::UpperSymlink { .. }
+            | Layer::UpperSpecial { .. } => {
+                b.rename_row(&old_rel, &new_rel);
+                if lower_old {
+                    b.set_whiteout(&old_rel, writer);
+                }
+            }
+            Layer::ExtFile { .. } => return Err(Errno::EROFS),
+        }
+        self.remap_inode_subtree(box_id, &old_rel, &new_rel);
+        self.push_event(box_id, old_rel, "rename_src");
+        self.push_event(box_id, new_rel, "rename_dst");
+        Ok(())
+    }
+
     fn read_file_node(&self, handle: u64) -> Result<File, Errno> {
         self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
         let handles = self.inner.fhs.read().unwrap();
@@ -2957,55 +3026,19 @@ impl Filesystem for SarunFs {
     }
 
     fn rename(&self, req: &Request, parent: INodeNo, name: &OsStr,
-              newparent: INodeNo, newname: &OsStr, _flags: fuser::RenameFlags,
+              newparent: INodeNo, newname: &OsStr, flags: fuser::RenameFlags,
               reply: ReplyEmpty) {
-        let (Some((bo, po)), Some((bn, pn))) =
-            (self.key_of(parent), self.key_of(newparent)) else {
-            return reply.error(Errno::EACCES);
-        };
-        if bo == 0 || bn == 0 || bo != bn {
-            return reply.error(Errno::EXDEV); // no cross-box / root rename
+        match self.rename_node(
+            req.pid(),
+            u64::from(parent),
+            name,
+            u64::from(newparent),
+            newname,
+            flags.bits(),
+        ) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
-        let Some(b) = self.box_of(bo) else { return reply.error(Errno::ENOENT) };
-        let (Some(no), Some(nn)) = (name.to_str(), newname.to_str()) else {
-            return reply.error(Errno::EINVAL);
-        };
-        let join = |p: &str, n: &str| if p.is_empty() { n.to_string() }
-                                      else { format!("{p}/{n}") };
-        let rel_o = join(&po, no);
-        let rel_n = join(&pn, nn);
-        if self.ro_denied(bo, &rel_o) || self.ro_denied(bo, &rel_n) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
-        }
-        let writer = b.writer_for(req.pid());
-        let lower_o = self.host(&rel_o).symlink_metadata().is_ok();
-        match self.layer(&b, &rel_o) {
-            Layer::Absent => return reply.error(Errno::ENOENT),
-            Layer::UpperDir { .. } => {
-                b.reparent(&rel_o, &rel_n);
-                if self.host(&rel_o).is_dir() { b.set_whiteout(&rel_o, writer); }
-            }
-            Layer::Lower => {
-                // copy-up the source to a real upper row, then move it.
-                match self.copy_up(&b, &rel_o, req.pid()) {
-                    Ok(_) => {}
-                    Err(_) => return reply.error(Errno::EIO),
-                }
-                b.rename_row(&rel_o, &rel_n);
-                b.set_whiteout(&rel_o, writer); // lower still shows through old name
-            }
-            Layer::UpperFile { .. } | Layer::UpperSymlink { .. }
-            | Layer::UpperSpecial { .. } => {
-                b.rename_row(&rel_o, &rel_n);
-                if lower_o { b.set_whiteout(&rel_o, writer); }
-            }
-            // layer() never yields it; ro_denied EROFS'd above anyway.
-            Layer::ExtFile { .. } => return reply.error(Errno::EROFS),
-        }
-        self.remap_inode_subtree(bo, &rel_o, &rel_n);
-        self.push_event(bo, rel_o, "rename_src");
-        self.push_event(bo, rel_n, "rename_dst");
-        reply.ok();
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
@@ -3254,6 +3287,26 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             ctx.pid as u32,
             parent,
             OsStr::from_bytes(name.to_bytes()),
+        )
+        .map_err(virtio_error)
+    }
+
+    fn rename(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        olddir: u64,
+        oldname: &CStr,
+        newdir: u64,
+        newname: &CStr,
+        flags: u32,
+    ) -> std::io::Result<()> {
+        self.rename_node(
+            ctx.pid as u32,
+            olddir,
+            OsStr::from_bytes(oldname.to_bytes()),
+            newdir,
+            OsStr::from_bytes(newname.to_bytes()),
+            flags,
         )
         .map_err(virtio_error)
     }
@@ -3821,12 +3874,28 @@ mod chain_tests {
             .unwrap(),
             b"created",
         );
+        let renamed_name = CString::new("renamed").unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::rename(
+            &fs,
+            ctx,
+            entry.inode,
+            &created_name,
+            entry.inode,
+            &renamed_name,
+            0,
+        )
+        .unwrap();
+        let renamed = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &fs, ctx, entry.inode, &renamed_name,
+        )
+        .unwrap();
+        assert_eq!(renamed.inode, created.inode);
         <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
             &fs, ctx, entry.inode, &link_name,
         )
         .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
-            &fs, ctx, entry.inode, &created_name,
+            &fs, ctx, entry.inode, &renamed_name,
         )
         .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::rmdir(
@@ -3834,7 +3903,7 @@ mod chain_tests {
         )
         .unwrap();
         let missing = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-            &fs, ctx, entry.inode, &created_name,
+            &fs, ctx, entry.inode, &renamed_name,
         )
         .err()
         .unwrap();
