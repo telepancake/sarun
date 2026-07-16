@@ -68,6 +68,11 @@ as executable mappings and mmap that genuinely need a host fd.
         kinds, and node attributes transport-independent; fuser and virtio-fs
         only encode canonical values at their reply boundaries.
   - [ ] Isolate merged-layer resolution and ordinary backing-file access.
+    - [x] Move precedence, whiteout, hole, opacity, rebase, attachment, and
+          synthetic-landing decisions into a pure transport-independent layer
+          resolver with direct behavior tests.
+    - [ ] Delegate ordinary host-backed operations to the upstream passthrough
+          machinery instead of open-coding them in protocol callbacks.
   - [ ] Isolate capture/provenance mutation from protocol callbacks.
   - [ ] Isolate synthetic projections, sinks, jobserver, and nested-box nodes.
 - [ ] Use virtiofsd passthrough machinery for ordinary host-backed operations;

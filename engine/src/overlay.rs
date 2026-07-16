@@ -58,6 +58,7 @@ use fuser::TimeOrNow;
 use crate::capture::BoxState;
 use crate::capture::Entry;
 use crate::depot::blob_path;
+use crate::sarunfs::layers::{ChainLink, Layer};
 use crate::sarunfs::{HandleTable, NodeAttr, NodeKind};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -88,47 +89,6 @@ fn kind_of_mode(mode: u32) -> NodeKind {
 
 /// (box_id, rel) — "" rel is the box root; box_id 0 is the synthetic mount root.
 type Key = crate::sarunfs::NodeKey;
-
-/// True if any ANCESTOR directory of `rel` is marked OPAQUE in box `b`. Walks
-/// rel's path components upward (rel="a/b/c/d" → checks "a/b/c", "a/b", "a",
-/// then the box root ""). The box root itself IS a valid opaque target — a
-/// layer can carry a `.wh..wh..opq` directly at its top to opacify EVERYTHING
-/// from below. Root rel ("") has no ancestors → false.
-/// Any ancestor dir of `rel` (or the box root) marked REBASED in this
-/// box (backdrop-anchored, DEPOT-DESIGN.md §2): everything recorded
-/// BELOW this box is erased for that subtree, while the backdrop (host)
-/// shows through — so the chain walk must stop here and fall to host.
-fn has_rebased_ancestor(b: &BoxState, rel: &str) -> bool {
-    if rel.is_empty() { return false; }
-    let mut p = Path::new(rel).parent();
-    while let Some(ancestor) = p {
-        let s = ancestor.to_string_lossy();
-        let s = s.as_ref();
-        if matches!(b.entry(s), Some(Entry::Dir { rebased: true, .. })) {
-            return true;
-        }
-        if s.is_empty() { break; }
-        p = ancestor.parent();
-    }
-    false
-}
-
-fn has_opaque_ancestor(b: &BoxState, rel: &str) -> bool {
-    if rel.is_empty() { return false; }
-    let mut p = Path::new(rel).parent();
-    while let Some(ancestor) = p {
-        let s = ancestor.to_string_lossy();
-        let s = s.as_ref();
-        // Note: s.is_empty() == true is the BOX ROOT — a valid opacity
-        // target. is_opaque("") asks "is the box root marked opaque?".
-        if b.is_opaque(s) {
-            return true;
-        }
-        if s.is_empty() { break; }   // walked past the root; stop
-        p = ancestor.parent();
-    }
-    false
-}
 
 /// Clone-able handle: fuser owns one clone as the mounted filesystem, the
 /// control plane holds another to add/remove boxes. All state is behind the
@@ -507,43 +467,6 @@ mod file_group_tests {
         assert!(groups.iter().any(|g| g.name == "browser session"),
                 "built-in 'browser session' group must always be available");
     }
-}
-
-enum Layer {
-    Absent,
-    UpperFile { owner: i64, rowid: i64, mode: u32 },
-    UpperDir { mode: u32, mtime_ns: i64 },
-    UpperSymlink { target: PathBuf },
-    UpperSpecial { mode: u32, rdev: u64 },
-    /// A regular file served by an external RO attachment. size/mode are
-    /// carried from the readout's entry so getattr NEVER decodes blob
-    /// bytes; only open()/box_read_file call att.blob(rel).
-    ExtFile { att: Arc<crate::attach::ExtAttachment>, rel: String,
-              size: u64, mode: u32 },
-    Lower,
-}
-
-/// One hop of a box's lookup chain: a box's own overlay, or an external
-/// RO attachment served through a mirror-store readout. Scoped to the
-/// overlay — chain_of is the single funnel; BoxState is NOT trait-
-/// objected (its ~40 box_of consumers stay concrete).
-enum ChainLink {
-    Box(Arc<BoxState>),
-    Ext(Arc<crate::attach::ExtAttachment>),
-}
-
-/// Top-level directory names the overlay always presents as an empty, virtual
-/// landing pad — resolve-time only, never written to any box's upper, never
-/// captured. They give the runner's bwrap a mount target on images that ship
-/// no such dir (busybox, distroless, scratch); bwrap then mounts the real fs
-/// (procfs, devtmpfs, the host /sys bind, a /tmp tmpfs) straight over it,
-/// exactly as it would over a dir the image did ship. This is precisely the set
-/// the runner mounts (see runner.rs bwrap setup): proc, dev, sys, tmp. A
-/// landing pad only ever surfaces when nothing real provides the path — a host
-/// box's host dirs and an image's own /proc etc. are untouched — and for --api
-/// boxes /tmp is intercepted earlier in resolve(), so it never reaches here.
-fn is_synthetic_landing(rel: &str) -> bool {
-    matches!(rel, "proc" | "dev" | "sys" | "tmp")
 }
 
 impl SarunFs {
@@ -1222,22 +1145,11 @@ impl SarunFs {
     /// WRITE paths, which operate on the box's own overlay. UpperFile.owner is
     /// the box itself.
     fn layer(&self, b: &BoxState, rel: &str) -> Layer {
-        match b.entry(rel) {
-            Some(Entry::Whiteout) => Layer::Absent,
-            Some(Entry::File { rowid, mode }) =>
-                Layer::UpperFile { owner: b.id, rowid, mode },
-            Some(Entry::Dir { mode, mtime_ns, .. }) => Layer::UpperDir { mode, mtime_ns },
-            Some(Entry::Symlink { target }) => Layer::UpperSymlink { target },
-            Some(Entry::Special { mode, rdev }) => Layer::UpperSpecial { mode, rdev },
-            // A hole in the box's own upper: the backdrop (host) shows.
-            Some(Entry::Hole) | None => {
-                if self.host(rel).symlink_metadata().is_ok() {
-                    Layer::Lower
-                } else {
-                    Layer::Absent
-                }
-            }
-        }
+        crate::sarunfs::layers::own_layer(
+            b,
+            rel,
+            self.host(rel).symlink_metadata().is_ok(),
+        )
     }
 
     /// `b`'s RO attachments as chain links, in LIST order — Box and Ext
@@ -1336,126 +1248,14 @@ impl SarunFs {
     /// (the merged listing clears accumulated names at the opaque-marker box
     /// before applying its own present/whiteout contributions).
     fn resolve(&self, bid: i64, rel: &str) -> Layer {
-        // --api substitute: /tmp is presented as a symlink to a per-box dir
-        // under oaita's state home. Lifts the model's strongest write-target
-        // prior into ordinary overlay-captured space so apply/inspect/discard
-        // work — without this /tmp is a bwrap-private tmpfs and writes there
-        // are a black hole. Decided per ORIGINATING box (no chain walk),
-        // since `bid` is the box whose view is being computed; a parent box
-        // having or not having --api is irrelevant to this box's /tmp.
-        if rel == "tmp" {
-            if let Some(orig) = self.box_of(bid) {
-                if orig.is_api() {
-                    let target = crate::paths::oaita_state_home()
-                        .join(".tmp").join(bid.to_string());
-                    return Layer::UpperSymlink { target };
-                }
-            }
-        }
-        // D-parent: any box in the lookup chain having `no_host_fallback` set
-        // closes the bottom of the stack — when the parent walk runs out, the
-        // path is Absent rather than served from the real host /. Set on the
-        // bottom of an OCI image stack so `ls /etc` inside the box sees only
-        // the image's /etc, never the host's. The chain is each box, its RO
-        // attachments, then its parent (chain_of).
-        let mut no_host = false;
-        for link in self.chain_of(bid) {
-            let b = match link {
-                ChainLink::Box(b) => b,
-                // Attachments are resolved VIEWS: no whiteouts, holes or
-                // opacity — a miss just falls through to the next link.
-                ChainLink::Ext(att) => {
-                    match att.entry(rel) {
-                        Some(e) if e.dir =>
-                            return Layer::UpperDir { mode: e.mode,
-                                                     mtime_ns: 0 },
-                        Some(e) =>
-                            return Layer::ExtFile {
-                                att, rel: rel.to_string(),
-                                size: e.size, mode: e.mode },
-                        None => {}
-                    }
-                    continue;
-                }
-            };
-            let id = b.id;
-            if b.no_host_fallback() { no_host = true; }
-            match b.entry(rel) {
-                Some(Entry::Whiteout) => return Layer::Absent,
-                Some(Entry::File { rowid, mode }) =>
-                    return Layer::UpperFile { owner: id, rowid, mode },
-                Some(Entry::Dir { mode, mtime_ns, .. }) =>
-                    return Layer::UpperDir { mode, mtime_ns },
-                Some(Entry::Symlink { target }) =>
-                    return Layer::UpperSymlink { target },
-                Some(Entry::Special { mode, rdev }) =>
-                    return Layer::UpperSpecial { mode, rdev },
-                // A hole: "this key is not occluded" — every recorded
-                // layer below is skipped; the backdrop (host, or nothing
-                // under no_host) shows through LIVE.
-                Some(Entry::Hole) => break,
-                None => {
-                    // D-opaque (OCI): an upper box can mark a directory as
-                    // opaque (`.wh..wh..opq` convention) — when we don't have
-                    // our own entry for `rel`, but an ANCESTOR dir of `rel` is
-                    // opaque in this box, the lower-layer chain past this box
-                    // can't contribute (the opaque marker wipes everything
-                    // below for that dir's subtree). Return Absent immediately.
-                    if has_opaque_ancestor(&b, rel) {
-                        return Layer::Absent;
-                    }
-                    // A REBASED ancestor erases everything recorded
-                    // below this box for the subtree; the backdrop shows.
-                    if has_rebased_ancestor(&b, rel) {
-                        break;
-                    }
-                    // not in this box → next link in the chain
-                }
-            }
-        }
-        // Synthetic landing pad (see is_synthetic_landing): reaching here means
-        // NO box in the chain has any entry for `rel` — every real Dir / File /
-        // Symlink / Special / Whiteout already returned above, so a directory an
-        // image actually ships is never touched. As a last resort, for the
-        // mount-target names (proc/dev/sys/tmp), present an empty virtual dir so
-        // bwrap has something to mount over on minimal images. NON-DESTRUCTIVE:
-        // chain_dir_has_children backs the pad off the instant any box holds a
-        // child under `rel`, so it can never stand in for — let alone hide — a
-        // directory that has content. Resolve-only: never a sqlar row, never in
-        // apply/discard/the change summary.
-        if no_host {
-            if is_synthetic_landing(rel) && !self.chain_dir_has_children(bid, rel) {
-                return Layer::UpperDir { mode: 0o0555, mtime_ns: 0 };
-            }
-            return Layer::Absent;
-        }
-        if self.host(rel).symlink_metadata().is_ok() {
-            Layer::Lower
-        } else if is_synthetic_landing(rel) && !self.chain_dir_has_children(bid, rel) {
-            Layer::UpperDir { mode: 0o0555, mtime_ns: 0 }
-        } else {
-            Layer::Absent
-        }
-    }
-
-    /// True if any box in the chain rooted at `bid` carries a direct child under
-    /// `rel` — i.e. that directory actually holds something in the merged view.
-    /// The synthetic landing pad consults this to stay non-destructive: a pad is
-    /// only ever offered for a path that is empty in EVERY box of the chain, so
-    /// it can never hide a real directory's contents.
-    fn chain_dir_has_children(&self, bid: i64, rel: &str) -> bool {
-        for link in self.chain_of(bid) {
-            match link {
-                ChainLink::Box(b) => {
-                    let (_white, present, _holes) = b.children_of(rel);
-                    if !present.is_empty() { return true; }
-                }
-                ChainLink::Ext(att) => {
-                    if !att.children(rel).is_empty() { return true; }
-                }
-            }
-        }
-        false
+        let chain = self.chain_of(bid);
+        crate::sarunfs::layers::resolve(
+            bid,
+            rel,
+            self.box_of(bid).is_some_and(|origin| origin.is_api()),
+            &chain,
+            self.host(rel).symlink_metadata().is_ok(),
+        )
     }
 
     fn lower_attr(&self, ino: u64, rel: &str) -> Option<NodeAttr> {
@@ -2710,7 +2510,9 @@ impl SarunFs {
                 // an opaque `etc` must also drop earlier-layer `replace/*`
                 // entries. Without the ancestor check, `etc/replace/old`
                 // would survive a layer that opacified `etc`.
-                if bx.is_opaque(rel) || has_opaque_ancestor(&bx, rel) {
+                if bx.is_opaque(rel)
+                    || crate::sarunfs::layers::has_opaque_ancestor(&bx, rel)
+                {
                     names.clear();
                 }
                 // REBASED here (this dir, or an ancestor): everything the
@@ -2718,7 +2520,7 @@ impl SarunFs {
                 // backdrop (host) still shows through — re-seed it.
                 if matches!(bx.entry(rel),
                             Some(Entry::Dir { rebased: true, .. }))
-                    || has_rebased_ancestor(&bx, rel)
+                    || crate::sarunfs::layers::has_rebased_ancestor(&bx, rel)
                 {
                     names.clear();
                     if !no_host {
@@ -3839,7 +3641,7 @@ mod chain_tests {
     // Box and Ext rows at their list positions, never grouped by kind
     // (resolve precedence is the list order the attach verbs recorded).
     // The Ext link's synthesized prefix chain must then show through
-    // resolve/ro_denied/chain_dir_has_children WITHOUT the store (here
+    // resolve/ro_denied/chain_has_children WITHOUT the store (here
     // nonexistent) ever opening.
     #[test]
     fn chain_interleaves_box_and_ext_rows_in_list_order() {
@@ -3875,7 +3677,10 @@ mod chain_tests {
 
         assert!(matches!(ov.resolve(owner, "deep"), Layer::UpperDir { .. }));
         assert!(ov.ro_denied(owner, "deep"));
-        assert!(ov.chain_dir_has_children(owner, ""));
+        assert!(crate::sarunfs::layers::chain_has_children(
+            &ov.chain_of(owner),
+            "",
+        ));
         assert_eq!(ov.box_path_kind(owner, "deep"), 'd');
         // Off-prefix rels miss the attachment and stay writable.
         assert!(!ov.ro_denied(owner, "elsewhere"));
