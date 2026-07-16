@@ -74,6 +74,22 @@ impl BoxExport {
         result
     }
 
+    /// Stop a listener whose frontend never connected, or join one whose
+    /// frontend has already disconnected.  Connecting and immediately closing
+    /// is the vhost-user equivalent of cancelling accept; negotiation failure
+    /// is expected on that forced path and is therefore not surfaced.
+    pub fn stop(mut self) -> io::Result<()> {
+        let thread = self.thread.take().expect("export thread present");
+        let forced = !thread.is_finished();
+        if forced {
+            let _ = std::os::unix::net::UnixStream::connect(&self.socket);
+        }
+        let result = thread.join()
+            .map_err(|_| io::Error::other("virtio-fs transport thread panicked"))?;
+        let _ = std::fs::remove_file(&self.socket);
+        if forced { Ok(()) } else { result }
+    }
+
     fn wait_ready(&self, timeout: Duration) -> io::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -141,6 +157,18 @@ mod tests {
         let socket = temp.path().join("missing.sock");
         let error = BoxExport::start_at(&fs, 404, socket.clone()).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn stop_cancels_a_listener_before_qemu_connects() {
+        let temp = tempfile::tempdir().unwrap();
+        let fs = crate::sarunfs::SarunFs::new(temp.path().to_owned());
+        let box_id = 9_000_000_072_i64;
+        fs.add_box(Arc::new(BoxState::create(box_id).unwrap()));
+        let socket = temp.path().join("cancel.sock");
+        let export = BoxExport::start_at(&fs, box_id, socket.clone()).unwrap();
+        export.stop().unwrap();
         assert!(!socket.exists());
     }
 }

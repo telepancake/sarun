@@ -96,6 +96,7 @@ run_test(register_schema_captures_conditional_fd_roles) :-
                       pidfd_identity)),
     expect(member_eq(field(name, registration_name), Fields)),
     expect(member_eq(field(backend, run_backend), Fields)),
+    expect(member_eq(field(architecture, option(qemu_architecture)), Fields)),
     expect(member_eq(field(net_mode, net_mode), Fields)),
     expect(\+ member_field(want_rerun, Fields)),
     expect_equal(Fds,

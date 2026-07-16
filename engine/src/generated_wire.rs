@@ -13,7 +13,7 @@
 // source-sha256 engine/pl/grammar_ir.pl 1a2a9a63076618402864e0ac630fca29b91210d54a03687f5be198d94a370d77
 // source-sha256 engine/pl/relation_api.pl e87d850a3cfd6a511e49b00bc7497e0c2790a45cf91aa4aa7b833b4b75364f6c
 // source-sha256 engine/pl/context_relation.pl 6819379ba751c4850e40f3a9d53cab888b9c2b1151283f1eaf479ae84f735473
-// source-sha256 engine/pl/transport_catalog.pl 54563becea268fb763b7ffc091c055b5968563921953ec9001c41f36b712718f
+// source-sha256 engine/pl/transport_catalog.pl 11d687f9eb901cef26de6de19da1d5696e1d9823c1a1142370cc98e04b7c1eb4
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
 // source-sha256 scripts/wire_codegen.py cebd448fb51f20128aa3ea1f9041cf9c18e7908645e82543efbc5b80af8145fd
 
@@ -196,7 +196,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "a0bbbb5194b8b2be99b4ba93c6fe3476edadd8747da43577fdb0b002e3d7f40d";
+    "8e7e35da3859fb1ec5d961739a4ca795787ee7f8398e4a57e739efbeea83b7fc";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -278,6 +278,7 @@ impl RelationWireValue for NetMode {
 pub enum RunBackend {
     Fuse,
     Sud,
+    Qemu,
 }
 
 impl WireValue for RunBackend {
@@ -285,6 +286,7 @@ impl WireValue for RunBackend {
         let code = match self {
             Self::Fuse => 1,
             Self::Sud => 2,
+            Self::Qemu => 3,
         };
         put_u64(output, code);
         Ok(())
@@ -294,6 +296,7 @@ impl WireValue for RunBackend {
         match get_u64(input)? {
             1 => Ok(Self::Fuse),
             2 => Ok(Self::Sud),
+            3 => Ok(Self::Qemu),
             _ => Err(DecodeError::InvalidValue),
         }
     }
@@ -304,7 +307,43 @@ impl RelationWireValue for RunBackend {
         match relation_atom(value)? {
             "fuse" => Ok(Self::Fuse),
             "sud" => Ok(Self::Sud),
+            "qemu" => Ok(Self::Qemu),
             case => Err(format!("unknown RunBackend relation case {case}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum QemuArchitecture {
+    Aarch64,
+    X8664,
+}
+
+impl WireValue for QemuArchitecture {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let code = match self {
+            Self::Aarch64 => 1,
+            Self::X8664 => 2,
+        };
+        put_u64(output, code);
+        Ok(())
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        match get_u64(input)? {
+            1 => Ok(Self::Aarch64),
+            2 => Ok(Self::X8664),
+            _ => Err(DecodeError::InvalidValue),
+        }
+    }
+}
+
+impl RelationWireValue for QemuArchitecture {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        match relation_atom(value)? {
+            "aarch64" => Ok(Self::Aarch64),
+            "x86_64" => Ok(Self::X8664),
+            case => Err(format!("unknown QemuArchitecture relation case {case}")),
         }
     }
 }
@@ -762,6 +801,7 @@ pub struct RegisterReply {
     pub no_host: bool,
     pub oci: Option<OciRuntime>,
     pub sud: Option<SudRuntime>,
+    pub virtiofs_socket: Option<Path>,
 }
 
 impl WireValue for RegisterReply {
@@ -779,6 +819,7 @@ impl WireValue for RegisterReply {
         self.no_host.encode_atom(&mut fields)?;
         self.oci.encode_atom(&mut fields)?;
         self.sud.encode_atom(&mut fields)?;
+        self.virtiofs_socket.encode_atom(&mut fields)?;
         put_compound_payload(output, &fields)
     }
 
@@ -799,6 +840,7 @@ impl WireValue for RegisterReply {
             no_host: <bool as WireValue>::decode_atom(&mut fields)?,
             oci: <Option<OciRuntime> as WireValue>::decode_atom(&mut fields)?,
             sud: <Option<SudRuntime> as WireValue>::decode_atom(&mut fields)?,
+            virtiofs_socket: <Option<Path> as WireValue>::decode_atom(&mut fields)?,
         };
         require_empty(fields)?;
         Ok(value)
@@ -808,7 +850,7 @@ impl WireValue for RegisterReply {
 impl RelationWireValue for RegisterReply {
     fn from_relation(value: &RelationValue) -> Result<Self, String> {
         let fields = relation_compound(value, "record")?;
-        require_relation_arity(fields, 12)?;
+        require_relation_arity(fields, 13)?;
         let mut fields = fields.iter();
         Ok(Self {
             mount: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
@@ -828,6 +870,9 @@ impl RelationWireValue for RegisterReply {
             no_host: <bool as RelationWireValue>::from_relation(fields.next().unwrap())?,
             oci: <Option<OciRuntime> as RelationWireValue>::from_relation(fields.next().unwrap())?,
             sud: <Option<SudRuntime> as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            virtiofs_socket: <Option<Path> as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
         })
     }
 }
@@ -11236,6 +11281,7 @@ pub enum TransportRequest {
         provenance: ProcessProvenance,
         name: RegistrationName,
         backend: RunBackend,
+        architecture: Option<QemuArchitecture>,
         net_mode: NetMode,
         capture: bool,
         direct: bool,
@@ -11334,6 +11380,7 @@ impl WireValue for TransportRequest {
                 provenance,
                 name,
                 backend,
+                architecture,
                 net_mode,
                 capture,
                 direct,
@@ -11350,6 +11397,7 @@ impl WireValue for TransportRequest {
                 provenance.encode_atom(&mut fields)?;
                 name.encode_atom(&mut fields)?;
                 backend.encode_atom(&mut fields)?;
+                architecture.encode_atom(&mut fields)?;
                 net_mode.encode_atom(&mut fields)?;
                 capture.encode_atom(&mut fields)?;
                 direct.encode_atom(&mut fields)?;
@@ -11442,6 +11490,7 @@ impl WireValue for TransportRequest {
                 provenance: <ProcessProvenance as WireValue>::decode_atom(&mut fields)?,
                 name: <RegistrationName as WireValue>::decode_atom(&mut fields)?,
                 backend: <RunBackend as WireValue>::decode_atom(&mut fields)?,
+                architecture: <Option<QemuArchitecture> as WireValue>::decode_atom(&mut fields)?,
                 net_mode: <NetMode as WireValue>::decode_atom(&mut fields)?,
                 capture: <bool as WireValue>::decode_atom(&mut fields)?,
                 direct: <bool as WireValue>::decode_atom(&mut fields)?,
@@ -11524,13 +11573,14 @@ impl RelationWireValue for TransportRequest {
                 Ok(Self::Subscribe)
             }
             "register" => {
-                require_relation_arity(fields, 15)?;
+                require_relation_arity(fields, 16)?;
                 let mut fields = fields.iter();
                 Ok(Self::Register {
                     command: <BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     provenance: <ProcessProvenance as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     name: <RegistrationName as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     backend: <RunBackend as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    architecture: <Option<QemuArchitecture> as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     net_mode: <NetMode as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     capture: <bool as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     direct: <bool as RelationWireValue>::from_relation(fields.next().unwrap())?,
@@ -12570,6 +12620,9 @@ mod generated_tests {
         roundtrip(NetMode::Tap);
         roundtrip(RunBackend::Fuse);
         roundtrip(RunBackend::Sud);
+        roundtrip(RunBackend::Qemu);
+        roundtrip(QemuArchitecture::Aarch64);
+        roundtrip(QemuArchitecture::X8664);
         roundtrip(ErrorCategory::InvalidRequest);
         roundtrip(ErrorCategory::NotFound);
         roundtrip(ErrorCategory::Conflict);
@@ -12625,6 +12678,7 @@ mod generated_tests {
             no_host: false,
             oci: None,
             sud: None,
+            virtiofs_socket: None,
         });
         roundtrip(PipelineStage::Simple {
             words: BoundedVec::new(vec![]).unwrap(),
@@ -13940,6 +13994,7 @@ mod generated_tests {
                 },
                 name: RegistrationName::Automatic,
                 backend: RunBackend::Fuse,
+                architecture: None,
                 net_mode: NetMode::Off,
                 capture: false,
                 direct: false,
@@ -14096,6 +14151,7 @@ mod generated_tests {
                     no_host: false,
                     oci: None,
                     sud: None,
+                    virtiofs_socket: None,
                 },
             },
             ConnectionMode::Pty,

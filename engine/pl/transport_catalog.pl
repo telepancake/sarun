@@ -85,6 +85,11 @@ wire_enum(net_mode, tap,  3).
 wire_type(run_backend, enum).
 wire_enum(run_backend, fuse, 1).
 wire_enum(run_backend, sud,  2).
+wire_enum(run_backend, qemu, 3).
+
+wire_type(qemu_architecture, enum).
+wire_enum(qemu_architecture, aarch64, 1).
+wire_enum(qemu_architecture, x86_64, 2).
 
 wire_type(error_category, enum).
 wire_enum(error_category, invalid_request, 1).
@@ -156,7 +161,8 @@ wire_type(register_reply, record([
     field(api, bool),
     field(no_host, bool),
     field(oci, option(oci_runtime)),
-    field(sud, option(sud_runtime))
+    field(sud, option(sud_runtime)),
+    field(virtiofs_socket, option(path))
 ])).
 
 wire_type(pipeline_stage, choice).
@@ -872,6 +878,7 @@ wire_request(register,              257, mode(box), [
     field(provenance, process_provenance),
     field(name, registration_name),
     field(backend, run_backend),
+    field(architecture, option(qemu_architecture)),
     field(net_mode, net_mode),
     field(capture, bool),
     field(direct, bool),

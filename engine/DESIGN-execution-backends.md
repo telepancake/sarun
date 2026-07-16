@@ -96,7 +96,7 @@ as executable mappings and mmap that genuinely need a host fd.
 
 ### 4. QEMU appliances
 
-- [ ] Extend the transport relation with backend `qemu` and required
+- [x] Extend the transport relation with backend `qemu` and required
       architecture; reject architecture on non-QEMU registrations.
 - [ ] Add verified, cached QEMU/Linux source builders and per-architecture
       manifests/configs.

@@ -50,6 +50,9 @@ pub struct Shared {
     /// in the box-channel frame loop) can fetch the same registry; the
     /// proxy itself has no listener — see oaita::proxy_mux.
     pub api_proxy: Option<std::sync::Arc<crate::oaita::proxy::Proxy>>,
+    /// Active QEMU-facing sockets.  These own transport lifetime only; every
+    /// entry serves a scoped clone of `overlay`, never a second filesystem.
+    pub virtio_exports: std::collections::HashMap<i64, crate::virtio_transport::BoxExport>,
 }
 
 /// Open a pidfd for `pid` (>=0 on success). A live `pid` yields a valid fd; a
@@ -630,6 +633,15 @@ fn lock(state: &State) -> std::sync::MutexGuard<'_, Shared> {
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn stop_virtio_export(state: &State, box_id: i64) {
+    let export = lock(state).virtio_exports.remove(&box_id);
+    if let Some(export) = export {
+        if let Err(error) = export.stop() {
+            eprintln!("sarun-engine: virtio-fs box {box_id} teardown: {error}");
+        }
+    }
 }
 
 // The old api-proxy attribution shim (peer-pid → box-id lookup) was removed
@@ -1759,6 +1771,7 @@ fn dispatch_action(
             let id = existing_box_id(sid)?;
             let overlay = lock(state).overlay.clone()
                 .ok_or("overlay not mounted")?;
+            stop_virtio_export(state, id);
             overlay.remove_box(id);
             Ok(ActionSuccess::BoxDrop { value: () })
         }
@@ -3987,6 +4000,7 @@ fn legacy_register_request(msg: &Value)
         backend: if msg.get("want_sud").and_then(Value::as_bool).unwrap_or(false) {
             RunBackend::Sud
         } else { RunBackend::Fuse },
+        architecture: None,
         net_mode,
         capture: msg.get("want_capture").and_then(Value::as_bool).unwrap_or(true),
         direct: msg.get("want_direct").and_then(Value::as_bool).unwrap_or(false),
@@ -4008,7 +4022,7 @@ fn legacy_register_reply(
     use crate::generated_wire::RegisterReply;
     let RegisterReply {
         mount, shared_memory, dns, ca_bundle, owner, r#box, name,
-        capture, api, no_host, oci, sud,
+        capture, api, no_host, oci, sud, virtiofs_socket: _,
     } = match result {
         Ok(reply) => reply,
         Err(error) => return json!({"ok": false, "error": error}),
@@ -4067,6 +4081,19 @@ fn legacy_register_reply(
 /// derivable enclosing box is an error (the box's pidfd closes on the early
 /// return when the caller's loop tears down). Capture mode stays downgraded in
 /// the ack (no echo/sinks yet — runner behaves as -t passthrough).
+fn qemu_architecture(
+    backend: crate::generated_wire::RunBackend,
+    architecture: Option<crate::generated_wire::QemuArchitecture>,
+) -> Result<Option<crate::generated_wire::QemuArchitecture>, String> {
+    use crate::generated_wire::RunBackend;
+    match (backend, architecture) {
+        (RunBackend::Qemu, Some(architecture)) => Ok(Some(architecture)),
+        (RunBackend::Qemu, None) => Err("qemu registration requires an architecture".into()),
+        (_, Some(_)) => Err("architecture is only valid for the qemu backend".into()),
+        (_, None) => Ok(None),
+    }
+}
+
 fn register(
     state: &State,
     request: &crate::generated_wire::TransportRequest,
@@ -4076,12 +4103,13 @@ fn register(
 ) -> Result<crate::generated_wire::RegisterReply, String> {
     use crate::generated_wire::{NetMode, RegistrationName, RunBackend, TransportRequest};
     let TransportRequest::Register {
-        command: _, provenance, name: registration_name, backend, net_mode,
+        command: _, provenance, name: registration_name, backend, architecture, net_mode,
         capture, direct, capture_environment, brush, api, web_capture,
         web_filter, replay_from, no_parent, readonly_parent,
     } = request else {
         return Err("expected register request".into());
     };
+    let qemu_architecture = qemu_architecture(*backend, *architecture)?;
     // Assign the post-pidfd SCM_RIGHTS fds to roles from the message. The
     // runner sends them in a fixed order: [tap (if net_mode==tap)] then
     // [sud trace pipe (if want_sud)]. So:
@@ -4253,6 +4281,12 @@ fn register(
     // on this flag (see overlay.rs).
     b.set_is_tap(*net_mode == NetMode::Tap);
     b.set_meta("name", &name);
+    if let Some(architecture) = qemu_architecture {
+        b.set_meta("qemu_architecture", match architecture {
+            crate::generated_wire::QemuArchitecture::Aarch64 => "aarch64",
+            crate::generated_wire::QemuArchitecture::X8664 => "x86_64",
+        });
+    }
     // --sud (WIP, see engine/DESIGN-sud.md): the box runs under the sud64
     // wrapper with a directory upper instead of on the FUSE mount. Create
     // the upper here so the ack can hand its path to the runner; the
@@ -4467,6 +4501,29 @@ fn register(
         write_api_box_oaita_toml();
     }
     ov.add_box(std::sync::Arc::new(b));
+    let virtiofs_socket = if qemu_architecture.is_some() {
+        match crate::virtio_transport::BoxExport::start(&ov, id) {
+            Ok(export) => {
+                let socket = export.socket().to_owned();
+                lock(state).virtio_exports.insert(id, export);
+                Some(socket)
+            }
+            Err(error) => {
+                ov.remove_box(id);
+                let mut shared = lock(state);
+                if let Some(fd) = shared.box_pids.remove(&id) {
+                    unsafe { libc::close(fd); }
+                }
+                shared.box_runpids.remove(&id);
+                if let Some(proxy) = shared.api_proxy.clone() {
+                    proxy.disable_box(id);
+                }
+                return Err(format!("virtio-fs export: {error}"));
+            }
+        }
+    } else {
+        None
+    };
     // sud: start consuming the live trace stream now that the BoxState is
     // registered (events snapshot process rows / build the write-
     // attribution map / record outputs; raw bytes tee to sud.trace).
@@ -4582,6 +4639,9 @@ fn register(
         no_host,
         oci,
         sud,
+        virtiofs_socket: virtiofs_socket.as_deref()
+            .map(|path| bounded_path(path, "virtio-fs socket"))
+            .transpose()?,
     })
 }
 
@@ -7048,6 +7108,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     b.finalize_brush_links();
                 }
                 ov.clear_echo(id);
+                stop_virtio_export(&state, id);
                 ov.remove_box(id);
             }
             {
@@ -8078,6 +8139,19 @@ mod verb_tests {
     use super::*;
 
     #[test]
+    fn qemu_architecture_is_required_and_backend_scoped() {
+        use crate::generated_wire::{QemuArchitecture, RunBackend};
+        assert_eq!(
+            qemu_architecture(RunBackend::Qemu, Some(QemuArchitecture::Aarch64)).unwrap(),
+            Some(QemuArchitecture::Aarch64),
+        );
+        assert!(qemu_architecture(RunBackend::Qemu, None).is_err());
+        assert!(qemu_architecture(RunBackend::Fuse, Some(QemuArchitecture::Aarch64)).is_err());
+        assert!(qemu_architecture(RunBackend::Sud, Some(QemuArchitecture::X8664)).is_err());
+        assert_eq!(qemu_architecture(RunBackend::Fuse, None).unwrap(), None);
+    }
+
+    #[test]
     fn typed_box_paths_reject_unsafe_or_unaddressable_overlay_keys() {
         let path = |bytes| crate::wire::BoundedBytes::new(bytes).unwrap();
         assert_eq!(action_relative_path(&path(b"src/main.rs".to_vec())).unwrap(),
@@ -8189,6 +8263,7 @@ mod verb_tests {
                 lowers: crate::wire::BoundedVec::new(vec![raw(b"/lower")]).unwrap(),
                 inramfs_key: crate::wire::BoundedText::new("key".into()).unwrap(),
             }),
+            virtiofs_socket: None,
         }));
         assert_eq!(reply["mount"], "/mnt/7");
         assert_eq!(reply["dns_ip"], "240.0.0.1");
