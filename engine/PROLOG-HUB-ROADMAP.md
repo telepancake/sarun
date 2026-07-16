@@ -68,6 +68,11 @@ graphs, and brush syntax. UI actions are the first practical client used to
 prove the architecture; they must not bake command-specific assumptions into
 the FFI.
 
+The staged Brush proving-ground and its no-delete-before-parity cutover gates
+are specified in `BRUSH-RELATION-MIGRATION.md`. That document is part of this
+roadmap: unchecked items there are required work under the same singular-hub,
+ordinary-tear, explicit-context, and no-fallback rules.
+
 SWI remains the singular relation engine after an explicit comparison with
 egglog and egglog-experimental. Egglog's monotone bottom-up saturation and
 cost-based extraction are attractive for persistent equivalence classes, but
