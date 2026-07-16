@@ -59,6 +59,7 @@ use crate::capture::BoxState;
 use crate::capture::Entry;
 use crate::depot::blob_path;
 use crate::sarunfs::layers::{ChainLink, Layer};
+use crate::sarunfs::synthetic::SyntheticNode;
 use crate::sarunfs::{HandleTable, NodeAttr, NodeKind};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -255,31 +256,6 @@ impl crate::slippool::SlipReply for SlipReplyData {
         if let Some(r) = self.0.take() {
             r.error(Errno::EAGAIN);
         }
-    }
-}
-
-// Reserved box-root paths: the box's stdout/stderr write THROUGH these, and the
-// overlay routes the bytes to the outputs table (per-write pid attribution).
-// They resolve by exact lookup but are never listed in readdir.
-const SINK_STDOUT: &str = ".slopbox-stdout";
-const SINK_STDERR: &str = ".slopbox-stderr";
-// Hidden synthetic dir at each box root listing the box's live children, each
-// routing to that child's real overlay-root inode (the nested-launch bind
-// target). Reachable by explicit lookup; never listed in the box-root readdir.
-const KIDS_DIR: &str = ".slopbox-kids";
-
-// Synthetic jobserver token file at each box root. read() acquires one slip from
-// the engine-global pool (blocking until one frees, unless the fd is O_NONBLOCK),
-// write() releases one. Reached by explicit lookup; never listed in readdir.
-// Because every op is a FUSE request, the engine sees the caller pid and can keep
-// a per-pid ledger + reap leaked slips on exit (slippool.rs).
-const JOBSERVER: &str = ".slopbox-jobserver";
-
-fn sink_stream(rel: &str) -> Option<i32> {
-    match rel {
-        SINK_STDOUT => Some(0),
-        SINK_STDERR => Some(1),
-        _ => None,
     }
 }
 
@@ -1441,10 +1417,10 @@ impl SarunFs {
             self.synth_dir_attr(ino, 0o40755, 0)
         } else {
             let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
-            if prel.is_empty() && name == KIDS_DIR {
-                let ino = self.ino_for(&(bid, KIDS_DIR.to_string()));
-                self.synth_dir_attr(ino, 0o40755, 0)
-            } else if prel == KIDS_DIR {
+            if prel.is_empty() && name == SyntheticNode::Children.name() {
+                let ino = self.ino_for(&(bid, SyntheticNode::Children.name().to_string()));
+                SyntheticNode::Children.attr(ino)
+            } else if prel == SyntheticNode::Children.name() {
                 let cid = name.parse::<i64>().map_err(|_| Errno::ENOENT)?;
                 if self.box_of(cid).and_then(|child| child.parent()) != Some(bid) {
                     return Err(Errno::ENOENT);
@@ -1458,8 +1434,10 @@ impl SarunFs {
                     format!("{prel}/{name}")
                 };
                 let ino = self.ino_for(&(bid, rel.clone()));
-                if prel.is_empty() && (sink_stream(&rel).is_some() || rel == JOBSERVER) {
-                    self.synth_file_attr(ino)
+                if prel.is_empty()
+                    && SyntheticNode::at(&rel).is_some_and(SyntheticNode::is_file)
+                {
+                    SyntheticNode::at(&rel).unwrap().attr(ino)
                 } else {
                     if !(b.is_api()
                         && (Self::oaita_config_ancestor_or_self(&rel)
@@ -1478,11 +1456,11 @@ impl SarunFs {
 
     fn getattr_node(&self, inode: u64) -> Result<NodeAttr, Errno> {
         let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
-        if bid == 0 || rel.is_empty() || rel == KIDS_DIR {
+        if bid == 0 || rel.is_empty() {
             return Ok(self.synth_dir_attr(inode, 0o40755, 0));
         }
-        if sink_stream(&rel).is_some() || rel == JOBSERVER {
-            return Ok(self.synth_file_attr(inode));
+        if let Some(node) = SyntheticNode::at(&rel) {
+            return Ok(node.attr(inode));
         }
         let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
         self.attr_of(&b, inode, &rel)
@@ -1601,7 +1579,7 @@ impl SarunFs {
         if want_write && self.ro_denied(bid, &rel) {
             return Err(Errno::EROFS);
         }
-        if rel == JOBSERVER {
+        if SyntheticNode::at(&rel) == Some(SyntheticNode::Jobserver) {
             let nonblock = flags & libc::O_NONBLOCK as u32 != 0;
             let handle = self
                 .inner
@@ -1615,7 +1593,7 @@ impl SarunFs {
                 backing_candidate: false,
             });
         }
-        if let Some(stream) = sink_stream(&rel) {
+        if let Some(stream) = SyntheticNode::at(&rel).and_then(SyntheticNode::stream) {
             self.note_sink_open(bid);
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
@@ -2640,7 +2618,7 @@ impl SarunFs {
                 })
                 .collect());
         }
-        if rel == KIDS_DIR {
+        if rel == SyntheticNode::Children.name() {
             return Ok(self
                 .children_of_box(bid)
                 .into_iter()

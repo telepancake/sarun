@@ -7,6 +7,7 @@
 pub use crate::overlay::SarunFs;
 pub(crate) mod backing;
 pub(crate) mod layers;
+pub(crate) mod synthetic;
 
 use std::collections::HashMap;
 use std::ffi::CString;

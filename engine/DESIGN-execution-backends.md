@@ -77,6 +77,10 @@ as executable mappings and mmap that genuinely need a host fd.
           kernel-passthrough acceleration boundaries.
   - [ ] Isolate capture/provenance mutation from protocol callbacks.
   - [ ] Isolate synthetic projections, sinks, jobserver, and nested-box nodes.
+    - [x] Define every reserved per-box name, kind, attribute, and sink stream
+          once in a typed transport-independent synthetic-node catalog.
+    - [ ] Move synthetic runtime behavior and projected-file ownership out of
+          the merged overlay implementation.
 - [x] Use virtiofsd passthrough machinery for ordinary host-backed operations;
       retain only sarun-specific composition and capture policy.
 - [ ] Add canonical-message tests for lookup counts, forgotten/open inodes,
