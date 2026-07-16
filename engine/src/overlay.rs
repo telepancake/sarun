@@ -243,6 +243,14 @@ struct DirNode {
     name: String,
 }
 
+struct OpenedNode {
+    handle: u64,
+    direct_io: bool,
+    nonseekable: bool,
+    keep_cache: bool,
+    backing_candidate: bool,
+}
+
 /// Bridges a deferred FUSE read reply into the slip pool. The pool calls exactly
 /// one of grant/deny_again, fulfilling the read that was blocked acquiring a slip
 /// (grant → one byte; deny_again → EAGAIN for an O_NONBLOCK caller, or when the
@@ -1660,6 +1668,228 @@ impl SarunFs {
         b.remove_xattr(&rel, name).then_some(()).ok_or(Errno::ENODATA)
     }
 
+    fn open_node(
+        &self,
+        pid: u32,
+        inode: u64,
+        flags: u32,
+        allow_backing: bool,
+    ) -> Result<OpenedNode, Errno> {
+        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
+        let want_write = flags & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32;
+        if want_write && self.ro_denied(bid, &rel) {
+            return Err(Errno::EROFS);
+        }
+        if rel == JOBSERVER {
+            let nonblock = flags & libc::O_NONBLOCK as u32 != 0;
+            let handle = self.inner.next_fh.fetch_add(1, Ordering::Relaxed);
+            self.inner.jobserver_fhs.write().unwrap().insert(handle, nonblock);
+            return Ok(OpenedNode {
+                handle,
+                direct_io: true,
+                nonseekable: true,
+                keep_cache: false,
+                backing_candidate: false,
+            });
+        }
+        if let Some(stream) = sink_stream(&rel) {
+            self.note_sink_open(bid);
+            let handle = self.reg_fh(FhInner {
+                box_id: bid,
+                rel,
+                file: None,
+                upper: false,
+                dirty: false,
+                last_pid: pid,
+                last_tgid: 0,
+                sink: Some(stream),
+                passthrough: false,
+                _backing: None,
+            });
+            return Ok(OpenedNode {
+                handle,
+                direct_io: false,
+                nonseekable: false,
+                keep_cache: false,
+                backing_candidate: false,
+            });
+        }
+        if want_write && (b.direct() || self.is_passthrough(&rel, bid, pid)) {
+            let host = self.host(&rel);
+            if let Some(parent) = host.parent() {
+                std::fs::create_dir_all(parent).map_err(Errno::from)?;
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&host)
+                .map_err(Errno::from)?;
+            let handle = self.reg_fh(FhInner {
+                box_id: bid,
+                rel,
+                file: Some(file),
+                upper: true,
+                dirty: false,
+                last_pid: pid,
+                last_tgid: 0,
+                sink: None,
+                passthrough: true,
+                _backing: None,
+            });
+            return Ok(OpenedNode {
+                handle,
+                direct_io: false,
+                nonseekable: false,
+                keep_cache: false,
+                backing_candidate: false,
+            });
+        }
+        let tap_shadow = if b.is_tap() && b.entry(&rel).is_none() {
+            if Self::matches_api_box_ca_target(&rel) {
+                Some(crate::paths::api_box_ca_pem_path())
+            } else if rel == "etc/resolv.conf" {
+                Some(crate::paths::api_box_resolv_conf_path())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(safe) = tap_shadow {
+            let file = File::open(safe).map_err(|_| Errno::EACCES)?;
+            let handle = self.reg_fh(FhInner {
+                box_id: bid,
+                rel,
+                file: Some(file),
+                upper: false,
+                dirty: false,
+                last_pid: pid,
+                last_tgid: 0,
+                sink: None,
+                passthrough: false,
+                _backing: None,
+            });
+            return Ok(OpenedNode {
+                handle,
+                direct_io: false,
+                nonseekable: false,
+                keep_cache: false,
+                backing_candidate: false,
+            });
+        }
+        let (file, upper) = match self.resolve(bid, &rel) {
+            Layer::UpperFile { owner, rowid, .. } => {
+                self.ensure_upper_blob(owner, rowid, &rel);
+                let own = owner == bid;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(want_write && own)
+                    .open(blob_path(owner, rowid))
+                    .map_err(|_| Errno::EIO)?;
+                (file, own)
+            }
+            Layer::Lower => {
+                let host = if b.is_api() && Self::matches_host_oaita_config(&rel) {
+                    crate::paths::api_box_oaita_toml_path()
+                } else if b.is_brush() && self.shadow_matches(&rel) {
+                    self.shadow_target_path().unwrap_or_else(|| self.host(&rel))
+                } else {
+                    self.host(&rel)
+                };
+                (File::open(host).map_err(|_| Errno::EACCES)?, false)
+            }
+            Layer::ExtFile { att, rel: erel, .. } => {
+                let file = match att.blob(&erel) {
+                    Some(depot_model::variant::Blob::File(path)) => File::open(path).ok(),
+                    Some(depot_model::variant::Blob::Bytes(bytes)) => self
+                        .cache()
+                        .and_then(|cache| cache.file_for(&bytes).ok())
+                        .and_then(|path| File::open(path).ok()),
+                    None => None,
+                }
+                .ok_or(Errno::EIO)?;
+                (file, false)
+            }
+            _ => return Err(Errno::ENOENT),
+        };
+        const FMODE_EXEC: u32 = 0x20;
+        let backing_candidate = allow_backing
+            && !want_write
+            && flags & FMODE_EXEC == 0
+            && (b.direct() || self.is_passthrough_read(&rel))
+            && self.inner.passthrough_ok.load(Ordering::Relaxed);
+        let handle = self.reg_fh(FhInner {
+            box_id: bid,
+            rel,
+            file: Some(file),
+            upper,
+            dirty: false,
+            last_pid: pid,
+            last_tgid: 0,
+            sink: None,
+            passthrough: false,
+            _backing: None,
+        });
+        Ok(OpenedNode {
+            handle,
+            direct_io: false,
+            nonseekable: false,
+            keep_cache: !backing_candidate,
+            backing_candidate,
+        })
+    }
+
+    fn read_file_node(&self, handle: u64) -> Result<File, Errno> {
+        self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
+        let handles = self.inner.fhs.read().unwrap();
+        let handle = handles.get(&handle).ok_or(Errno::EBADF)?;
+        let handle = handle.lock().unwrap();
+        handle
+            .inner
+            .file
+            .as_ref()
+            .ok_or(Errno::EBADF)?
+            .try_clone()
+            .map_err(Errno::from)
+    }
+
+    fn release_node(&self, handle: u64) -> Result<(), Errno> {
+        if self.inner.jobserver_fhs.write().unwrap().remove(&handle).is_some() {
+            return Ok(());
+        }
+        let handle = self
+            .inner
+            .fhs
+            .write()
+            .unwrap()
+            .remove(&handle)
+            .ok_or(Errno::EBADF)?;
+        let handle = handle.into_inner().unwrap();
+        if handle.inner.sink.is_some() {
+            self.note_sink_release(handle.inner.box_id);
+        } else if handle.inner.dirty && !handle.inner.passthrough {
+            if let Some(b) = self.box_of(handle.inner.box_id) {
+                let writer_id = if handle.inner.last_tgid != 0 {
+                    handle.inner.last_tgid
+                } else {
+                    handle.inner.last_pid
+                };
+                let writer = b.writer_for(writer_id);
+                if let Some(metadata) = handle.inner.file.as_ref().and_then(|file| file.metadata().ok()) {
+                    b.finalize_file(
+                        &handle.inner.rel,
+                        metadata.size() as i64,
+                        metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+                        writer,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// D3: the first actual write to `rel` copies the RESOLVED lower bytes
     /// (the parent box's version if nested, else the host file, else empty)
     /// into a fresh pool blob in THIS box (creating the row + provenance) and
@@ -1931,182 +2161,38 @@ impl Filesystem for SarunFs {
     }
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
+        let opened = match self.open_node(req.pid(), u64::from(ino), flags.0 as u32, true) {
+            Ok(opened) => opened,
+            Err(error) => return reply.error(error),
         };
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        // RO attachment (§8): reject write-intent opens up front — fail
-        // fast like a kernel ro-mount, before any capture side effect.
-        if flags.0 & (libc::O_WRONLY | libc::O_RDWR) != 0
-            && self.ro_denied(bid, &rel)
-        {
-            return reply.error(Errno::EROFS);
+        let mut response_flags = FopenFlags::empty();
+        if opened.direct_io {
+            response_flags |= FopenFlags::FOPEN_DIRECT_IO;
         }
-        if rel == JOBSERVER {
-            // A handle on the slip pool. read() acquires, write() releases. Record
-            // whether this handle is O_NONBLOCK so read() knows to defer (block)
-            // or fail with EAGAIN when the pool is empty.
-            let nonblock = flags.0 & libc::O_NONBLOCK != 0;
-            let n = self.inner.next_fh.fetch_add(1, Ordering::Relaxed);
-            self.inner.jobserver_fhs.write().unwrap().insert(n, nonblock);
-            // DIRECT_IO so the kernel always dispatches read/write to us (the
-            // synthetic file reports size 0; without this the kernel would serve
-            // a read as immediate EOF). NONSEEKABLE: it is a token stream, not a
-            // seekable file — clients must not offset into it.
-            return reply.opened(
-                FileHandle(n),
-                FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_NONSEEKABLE,
-            );
+        if opened.nonseekable {
+            response_flags |= FopenFlags::FOPEN_NONSEEKABLE;
         }
-        if let Some(stream) = sink_stream(&rel) {
-            // stdout/stderr sink: a write-only channel into the outputs table
-            // (+ the live echo readback). Count it so the last release flushes
-            // ECHO_DONE.
-            self.note_sink_open(bid);
-            let n = self.reg_fh(FhInner {
-                box_id: bid, rel, file: None, upper: false, dirty: false,
-                last_pid: req.pid(), last_tgid: 0, sink: Some(stream), passthrough: false, _backing: None });
-            return reply.opened(FileHandle(n), FopenFlags::empty());
+        if opened.keep_cache {
+            response_flags |= FopenFlags::FOPEN_KEEP_CACHE;
         }
-        let want_write = !matches!(flags.acc_mode(),
-                                   fuser::OpenAccMode::O_RDONLY);
-        // -d direct: the whole box is passthrough (no overlay) — writes land on
-        // the real host, uncaptured. Else a per-path passthrough file rule.
-        if want_write && (b.direct() || self.is_passthrough(&rel, bid, req.pid())) {
-            // passthrough rule: writes go straight to the REAL host file, never
-            // captured. Open (creating) the host path directly.
-            let host = self.host(&rel);
-            if let Some(p) = host.parent() {
-                if let Err(e) = std::fs::create_dir_all(p) {
-                    return reply.error(Errno::from(e));
-                }
-            }
-            match OpenOptions::new().read(true).write(true).create(true).open(&host) {
-                Ok(f) => {
-                    let n = self.reg_fh(FhInner {
-                        box_id: bid, rel, file: Some(f), upper: true, dirty: false,
-                        last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: true, _backing: None });
-                    return reply.opened(FileHandle(n), FopenFlags::empty());
-                }
-                Err(e) => return reply.error(Errno::from(e)),
-            }
-        }
-        // resolve() so a child opening a file that lives in its PARENT box (or
-        // the host) finds it. `upper` (this box owns the blob) is true ONLY when
-        // the resolved owner IS this box; a parent's file or the host file is
-        // served read-only until the first write triggers copy-up-from-parent.
-        // Tap shadows (MITM CA bundle, per-box resolv.conf) apply no matter
-        // where the merge would resolve from — host OR an OCI image layer
-        // (a baked-in `nameserver 1.1.1.1` must not bypass the box DNS) —
-        // and even when the path is Absent (an image shipping no
-        // resolv.conf still gets one). Only the box's own entry overrides.
-        let tap_shadow = if b.is_tap() && b.entry(&rel).is_none() {
-            if Self::matches_api_box_ca_target(&rel) {
-                Some(crate::paths::api_box_ca_pem_path())
-            } else if rel == "etc/resolv.conf" {
-                Some(crate::paths::api_box_resolv_conf_path())
-            } else { None }
-        } else { None };
-        if let Some(safe) = tap_shadow {
-            match File::open(safe) {
-                Ok(f) => {
-                    let n = self.reg_fh(FhInner {
-                        box_id: bid, rel, file: Some(f), upper: false, dirty: false,
-                        last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: false, _backing: None });
-                    return reply.opened(FileHandle(n), FopenFlags::empty());
-                }
-                Err(_) => return reply.error(Errno::EACCES),
-            }
-        }
-        let (file, upper) = match self.resolve(bid, &rel) {
-            Layer::UpperFile { owner, rowid, .. } => {
-                // An inline (discard-reverted) row has no pool blob; restore
-                // it before the open so even a read of a reverted file (or a
-                // write onto it) doesn't EIO. See ensure_upper_blob.
-                self.ensure_upper_blob(owner, rowid, &rel);
-                let bp = blob_path(owner, rowid);
-                let own = owner == bid;
-                match OpenOptions::new().read(true).write(want_write && own).open(&bp) {
-                    Ok(f) => (Some(f), own),
-                    Err(_) => return reply.error(Errno::EIO),
-                }
-            }
-            Layer::Lower => {
-                // Brush-mode shadow: open the engine binary instead
-                // of the host file when this rel matches a shadow
-                // pattern. Read-only — the box never writes back
-                // through the shadow (anyone trying to copy-on-write
-                // /bin/sh would land here too, but write opens are
-                // gated above and this branch is read-only-passthrough).
-                // --api substitute: open the safe-for-box oaita.toml
-                // instead of the host config when the box is --api and
-                // the rel is the host oaita.toml path.
-                let host = if b.is_api() && Self::matches_host_oaita_config(&rel) {
-                    crate::paths::api_box_oaita_toml_path()
-                } else if b.is_brush() && self.shadow_matches(&rel) {
-                    self.shadow_target_path().unwrap_or_else(|| self.host(&rel))
-                } else { self.host(&rel) };
-                match File::open(host) {
-                    Ok(f) => (Some(f), false),
-                    Err(_) => return reply.error(Errno::EACCES),
-                }
-            },
-            Layer::ExtFile { att, rel: erel, .. } => {
-                // Write intent already EROFS'd above (ro_denied matches
-                // every attachment-resolved key); this is read-only.
-                let opened = match att.blob(&erel) {
-                    // Store loose file: serve it directly, no copy.
-                    Some(depot_model::variant::Blob::File(p)) =>
-                        File::open(&p).ok(),
-                    // Decoded bytes: land them in the §7 cache pool so
-                    // the Fh has a real fd (read_at/mmap/exec unchanged);
-                    // repeat opens dedupe onto the same pool path.
-                    Some(depot_model::variant::Blob::Bytes(bytes)) =>
-                        self.cache()
-                            .and_then(|c| c.file_for(&bytes).ok())
-                            .and_then(|p| File::open(p).ok()),
-                    None => None,
-                };
-                match opened {
-                    Some(f) => (Some(f), false),
-                    None => return reply.error(Errno::EIO),
-                }
-            }
-            _ => return reply.error(Errno::ENOENT),
-        };
-        // D5 (rule-gated): a READ-ONLY open of a HOST-DIRECT path (the existing
-        // `passthrough` file rule, or a -d direct box) gets a kernel backing fd,
-        // so the kernel serves reads with the daemon out of the loop (the build-
-        // read-storm win). The user declares these paths host-direct via the
-        // rule — never an automatic guess. Exec opens stay daemon-served (mmap of
-        // a passthrough-backed file EIOs). The kernel limit (a write-open of a
-        // file with a live passthrough read fd EIOs) is therefore SCOPED to
-        // user-declared host-direct paths, and — because passthrough rules are
-        // PATH-ONLY — those paths are host-direct in every box, so the EIO is
-        // uniform, never a captured-vs-passthrough divergence (see DESIGN.md D5).
-        const FMODE_EXEC: i32 = 0x20;
-        let is_exec = flags.0 & FMODE_EXEC != 0;
-        if !want_write && !is_exec && (b.direct() || self.is_passthrough_read(&rel))
-            && self.inner.passthrough_ok.load(Ordering::Relaxed) {
-            if let Some(f) = file.as_ref() {
-                if let Ok(backing) = reply.open_backing(f) {
-                    let n = self.reg_fh(FhInner {
-                        box_id: bid, rel, file, upper, dirty: false,
-                        last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: false,
-                        _backing: None });
-                    reply.opened_passthrough(FileHandle(n), FopenFlags::empty(),
-                                             &backing);
-                    if let Some(h) = self.inner.fhs.read().unwrap().get(&n) {
-                        h.lock().unwrap().inner._backing = Some(backing);
+        if opened.backing_candidate {
+            let fhs = self.inner.fhs.read().unwrap();
+            if let Some(handle) = fhs.get(&opened.handle) {
+                let mut handle = handle.lock().unwrap();
+                if let Some(file) = handle.inner.file.as_ref() {
+                    if let Ok(backing) = reply.open_backing(file) {
+                        reply.opened_passthrough(
+                            FileHandle(opened.handle),
+                            response_flags,
+                            &backing,
+                        );
+                        handle.inner._backing = Some(backing);
+                        return;
                     }
-                    return;
                 }
-                // open_backing failed: fall through to daemon-served.
             }
         }
-        let n = self.reg_fh(FhInner {
-            box_id: bid, rel, file, upper, dirty: false, last_pid: req.pid(), last_tgid: 0, sink: None, passthrough: false, _backing: None });
-        reply.opened(FileHandle(n), FopenFlags::FOPEN_KEEP_CACHE);
+        reply.opened(FileHandle(opened.handle), response_flags);
     }
 
     fn create(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
@@ -2178,9 +2264,6 @@ impl Filesystem for SarunFs {
 
     fn read(&self, req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
             size: u32, _flags: OpenFlags, _lo: Option<LockOwner>, reply: ReplyData) {
-        // The daemon served this read (a passthrough'd read never reaches here —
-        // the kernel serves it directly). Counter is test observability.
-        self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
         // Slip-pool acquire: a read on the JOBSERVER file claims one slip for the
         // caller pid. If the pool is empty we DEFER the reply (block the read)
         // until a release frees one — unless the handle is O_NONBLOCK, in which
@@ -2200,13 +2283,9 @@ impl Filesystem for SarunFs {
             }
             return;
         }
-        let fhs = self.inner.fhs.read().unwrap();
-        let Some(h) = fhs.get(&u64::from(fh)) else {
-            return reply.error(Errno::EBADF);
-        };
-        let h = h.lock().unwrap();
-        let Some(f) = h.inner.file.as_ref() else {
-            return reply.error(Errno::EBADF);
+        let f = match self.read_file_node(u64::from(fh)) {
+            Ok(file) => file,
+            Err(error) => return reply.error(error),
         };
         let mut buf = vec![0u8; size as usize];
         match f.read_at(&mut buf, offset) {
@@ -2309,37 +2388,10 @@ impl Filesystem for SarunFs {
     fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
                _flags: OpenFlags, _lo: Option<LockOwner>, _flush: bool,
                reply: ReplyEmpty) {
-        // Closing a JOBSERVER handle: just drop it. Any slips the pid still holds
-        // are reclaimed by pid-exit / box-teardown reaping, not fd close (a
-        // process may legitimately close and reopen the handle mid-build).
-        if self.inner.jobserver_fhs.write().unwrap().remove(&u64::from(fh)).is_some() {
-            return reply.ok();
+        match self.release_node(u64::from(fh)) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
-        let h = self.inner.fhs.write().unwrap().remove(&u64::from(fh));
-        if let Some(h) = h {
-            let h = h.into_inner().unwrap();
-            if h.inner.sink.is_some() {
-                // A capture sink closed (child exited / redirected fd done): when
-                // the box's last sink releases, flush ECHO_DONE so --inner stops
-                // reading without truncating still-in-flight echo bytes.
-                self.note_sink_release(h.inner.box_id);
-            } else if h.inner.dirty && !h.inner.passthrough {
-                if let Some(b) = self.box_of(h.inner.box_id) {
-                    // last_tgid was resolved at write time (alive); fall back to
-                    // last_pid only for the degenerate no-distinct-writer case.
-                    let wid = if h.inner.last_tgid != 0 { h.inner.last_tgid }
-                              else { h.inner.last_pid };
-                    let writer = b.writer_for(wid);
-                    if let Some(md) = h.inner.file.as_ref()
-                        .and_then(|f| f.metadata().ok()) {
-                        b.finalize_file(&h.inner.rel, md.size() as i64,
-                                        md.mtime() * 1_000_000_000
-                                        + md.mtime_nsec(), writer);
-                    }
-                }
-            }
-        }
-        reply.ok();
     }
 
     fn setattr(&self, req: &Request, ino: INodeNo, mode: Option<u32>,
@@ -2956,6 +3008,57 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         self.readlink_node(inode).map_err(virtio_error)
     }
 
+    fn open(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+        _kill_priv: bool,
+        flags: u32,
+    ) -> std::io::Result<(Option<u64>, virtiofsd::filesystem::OpenOptions)> {
+        let opened = self
+            .open_node(ctx.pid as u32, inode, flags, false)
+            .map_err(virtio_error)?;
+        let mut options = virtiofsd::filesystem::OpenOptions::empty();
+        if opened.direct_io {
+            options |= virtiofsd::filesystem::OpenOptions::DIRECT_IO;
+        }
+        if opened.nonseekable {
+            options |= virtiofsd::filesystem::OpenOptions::NONSEEKABLE;
+        }
+        if opened.keep_cache {
+            options |= virtiofsd::filesystem::OpenOptions::KEEP_CACHE;
+        }
+        Ok((Some(opened.handle), options))
+    }
+
+    fn read<W: virtiofsd::filesystem::ZeroCopyWriter>(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        handle: u64,
+        mut writer: W,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _flags: u32,
+    ) -> std::io::Result<usize> {
+        let file = self.read_file_node(handle).map_err(virtio_error)?;
+        writer.read_from_file_at(&file, size as usize, offset, None)
+    }
+
+    fn release(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        _flags: u32,
+        handle: u64,
+        _flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
+    ) -> std::io::Result<()> {
+        self.release_node(handle).map_err(virtio_error)
+    }
+
     fn setxattr(
         &self,
         _ctx: virtiofsd::filesystem::Context,
@@ -3075,6 +3178,23 @@ mod chain_tests {
     use crate::capture::{BoxState, ExtRef, RoAttachment};
     use std::ffi::CString;
 
+    struct CollectWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl virtiofsd::filesystem::ZeroCopyWriter for CollectWriter {
+        fn read_from_file_at(
+            &mut self,
+            file: &File,
+            count: usize,
+            offset: u64,
+            _flags: Option<virtiofsd::oslib::ReadvFlags>,
+        ) -> std::io::Result<usize> {
+            let mut bytes = vec![0; count];
+            let read = file.read_at(&mut bytes, offset)?;
+            self.0.lock().unwrap().extend_from_slice(&bytes[..read]);
+            Ok(read)
+        }
+    }
+
     fn ext_ref(prefix: &str) -> ExtRef {
         ExtRef { kind: "git".into(), store: "/nonexistent".into(),
                  refname: "main".into(), rev: "abc".into(),
@@ -3136,6 +3256,7 @@ mod chain_tests {
             std::time::SystemTime::now()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("hello"), b"canonical bytes").unwrap();
         // SAFETY: TEST_STATE_HOME_LOCK serializes state-home tests.
         unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
@@ -3194,6 +3315,50 @@ mod chain_tests {
                 assert_eq!(value, b"value"),
             virtiofsd::filesystem::GetxattrReply::Count(_) => panic!("expected value"),
         }
+
+        let filename = CString::new("hello").unwrap();
+        let file_entry = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &fs,
+            ctx,
+            entry.inode,
+            &filename,
+        )
+        .unwrap();
+        let (file_handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::open(
+            &fs,
+            ctx,
+            file_entry.inode,
+            false,
+            libc::O_RDONLY as u32,
+        )
+        .unwrap();
+        let file_handle = file_handle.unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let read = <SarunFs as virtiofsd::filesystem::FileSystem>::read(
+            &fs,
+            ctx,
+            file_entry.inode,
+            file_handle,
+            CollectWriter(captured.clone()),
+            64,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(read, b"canonical bytes".len());
+        assert_eq!(&*captured.lock().unwrap(), b"canonical bytes");
+        <SarunFs as virtiofsd::filesystem::FileSystem>::release(
+            &fs,
+            ctx,
+            file_entry.inode,
+            0,
+            file_handle,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
 
         let (attr, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
             &fs,
