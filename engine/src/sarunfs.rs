@@ -8,11 +8,47 @@ pub use crate::overlay::SarunFs;
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 pub(crate) type NodeKey = (i64, String);
+
+/// Transport-independent file kind. Protocol adapters translate this only
+/// when they construct their reply; overlay policy never handles a fuser or
+/// virtio-fs enum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NodeKind {
+    NamedPipe,
+    CharDevice,
+    BlockDevice,
+    Directory,
+    RegularFile,
+    Symlink,
+    Socket,
+}
+
+/// Canonical attributes produced by the shared filesystem core.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NodeAttr {
+    pub inode: u64,
+    pub size: u64,
+    pub blocks: u64,
+    pub atime: SystemTime,
+    pub mtime: SystemTime,
+    pub ctime: SystemTime,
+    pub crtime: SystemTime,
+    pub kind: NodeKind,
+    pub perm: u16,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u32,
+    pub blksize: u32,
+    pub flags: u32,
+}
 
 #[derive(Debug)]
 struct Inodes {
@@ -31,6 +67,42 @@ struct Inodes {
 #[derive(Debug)]
 pub(crate) struct InodeTable {
     state: RwLock<Inodes>,
+}
+
+/// One allocator and ownership table for every protocol-visible handle. The
+/// stored value describes policy state; this type owns only identity and
+/// lifetime, so file, directory and synthetic handles cannot collide or be
+/// released through different transport-specific maps.
+pub(crate) struct HandleTable<T> {
+    next: AtomicU64,
+    entries: RwLock<HashMap<u64, Arc<T>>>,
+}
+
+impl<T> HandleTable<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            next: AtomicU64::new(1),
+            entries: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn insert(&self, value: T) -> u64 {
+        let handle = self.next.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(handle, 0, "virtual handle exhausted");
+        self.entries
+            .write()
+            .unwrap()
+            .insert(handle, Arc::new(value));
+        handle
+    }
+
+    pub(crate) fn get(&self, handle: u64) -> Option<Arc<T>> {
+        self.entries.read().unwrap().get(&handle).cloned()
+    }
+
+    pub(crate) fn remove(&self, handle: u64) -> Option<Arc<T>> {
+        self.entries.write().unwrap().remove(&handle)
+    }
 }
 
 impl InodeTable {
@@ -135,21 +207,53 @@ fn timestamp(value: SystemTime) -> (u64, u32) {
         .unwrap_or((0, 0))
 }
 
-pub(crate) fn virtio_attr(attr: fuser::FileAttr) -> virtiofsd::fuse::Attr {
+pub(crate) fn fuse_kind(kind: NodeKind) -> fuser::FileType {
+    match kind {
+        NodeKind::NamedPipe => fuser::FileType::NamedPipe,
+        NodeKind::CharDevice => fuser::FileType::CharDevice,
+        NodeKind::BlockDevice => fuser::FileType::BlockDevice,
+        NodeKind::Directory => fuser::FileType::Directory,
+        NodeKind::RegularFile => fuser::FileType::RegularFile,
+        NodeKind::Symlink => fuser::FileType::Symlink,
+        NodeKind::Socket => fuser::FileType::Socket,
+    }
+}
+
+pub(crate) fn fuse_attr(attr: NodeAttr) -> fuser::FileAttr {
+    fuser::FileAttr {
+        ino: fuser::INodeNo(attr.inode),
+        size: attr.size,
+        blocks: attr.blocks,
+        atime: attr.atime,
+        mtime: attr.mtime,
+        ctime: attr.ctime,
+        crtime: attr.crtime,
+        kind: fuse_kind(attr.kind),
+        perm: attr.perm,
+        nlink: attr.nlink,
+        uid: attr.uid,
+        gid: attr.gid,
+        rdev: attr.rdev,
+        blksize: attr.blksize,
+        flags: attr.flags,
+    }
+}
+
+pub(crate) fn virtio_attr(attr: NodeAttr) -> virtiofsd::fuse::Attr {
     let (atime, atimensec) = timestamp(attr.atime);
     let (mtime, mtimensec) = timestamp(attr.mtime);
     let (ctime, ctimensec) = timestamp(attr.ctime);
     let kind = match attr.kind {
-        fuser::FileType::NamedPipe => libc::S_IFIFO,
-        fuser::FileType::CharDevice => libc::S_IFCHR,
-        fuser::FileType::BlockDevice => libc::S_IFBLK,
-        fuser::FileType::Directory => libc::S_IFDIR,
-        fuser::FileType::RegularFile => libc::S_IFREG,
-        fuser::FileType::Symlink => libc::S_IFLNK,
-        fuser::FileType::Socket => libc::S_IFSOCK,
+        NodeKind::NamedPipe => libc::S_IFIFO,
+        NodeKind::CharDevice => libc::S_IFCHR,
+        NodeKind::BlockDevice => libc::S_IFBLK,
+        NodeKind::Directory => libc::S_IFDIR,
+        NodeKind::RegularFile => libc::S_IFREG,
+        NodeKind::Symlink => libc::S_IFLNK,
+        NodeKind::Socket => libc::S_IFSOCK,
     };
     virtiofsd::fuse::Attr {
-        ino: u64::from(attr.ino),
+        ino: attr.inode,
         size: attr.size,
         blocks: attr.blocks,
         atime,
@@ -182,18 +286,18 @@ struct OwnedDirEntry {
 }
 
 impl DirIter {
-    pub(crate) fn new(entries: Vec<(u64, u64, fuser::FileType, String)>) -> Self {
+    pub(crate) fn new(entries: Vec<(u64, u64, NodeKind, String)>) -> Self {
         let entries = entries
             .into_iter()
             .filter_map(|(inode, offset, kind, name)| {
                 let kind = match kind {
-                    fuser::FileType::NamedPipe => libc::DT_FIFO,
-                    fuser::FileType::CharDevice => libc::DT_CHR,
-                    fuser::FileType::BlockDevice => libc::DT_BLK,
-                    fuser::FileType::Directory => libc::DT_DIR,
-                    fuser::FileType::RegularFile => libc::DT_REG,
-                    fuser::FileType::Symlink => libc::DT_LNK,
-                    fuser::FileType::Socket => libc::DT_SOCK,
+                    NodeKind::NamedPipe => libc::DT_FIFO,
+                    NodeKind::CharDevice => libc::DT_CHR,
+                    NodeKind::BlockDevice => libc::DT_BLK,
+                    NodeKind::Directory => libc::DT_DIR,
+                    NodeKind::RegularFile => libc::DT_REG,
+                    NodeKind::Symlink => libc::DT_LNK,
+                    NodeKind::Socket => libc::DT_SOCK,
                 };
                 Some(OwnedDirEntry {
                     inode,
@@ -224,6 +328,71 @@ impl virtiofsd::filesystem::DirectoryIterator for DirIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use virtiofsd::soft_idmap::Id as _;
+
+    fn attr(kind: NodeKind) -> NodeAttr {
+        NodeAttr {
+            inode: 42,
+            size: 123,
+            blocks: 2,
+            atime: UNIX_EPOCH + std::time::Duration::new(1, 2),
+            mtime: UNIX_EPOCH + std::time::Duration::new(3, 4),
+            ctime: UNIX_EPOCH + std::time::Duration::new(5, 6),
+            crtime: UNIX_EPOCH,
+            kind,
+            perm: 0o654,
+            nlink: 3,
+            uid: 1000,
+            gid: 1001,
+            rdev: 7,
+            blksize: 4096,
+            flags: 9,
+        }
+    }
+
+    #[test]
+    fn protocol_attributes_are_projections_of_one_canonical_value() {
+        let canonical = attr(NodeKind::RegularFile);
+        let fuse = fuse_attr(canonical);
+        let virtio = virtio_attr(canonical);
+        assert_eq!(u64::from(fuse.ino), canonical.inode);
+        assert_eq!(virtio.ino, canonical.inode);
+        assert_eq!(fuse.size, virtio.size);
+        assert_eq!(fuse.blocks, virtio.blocks);
+        assert_eq!(fuse.perm, (virtio.mode & 0o7777) as u16);
+        assert_eq!(fuse.uid, virtio.uid.into_inner());
+        assert_eq!(fuse.gid, virtio.gid.into_inner());
+        assert_eq!(virtio.mode & libc::S_IFMT, libc::S_IFREG);
+    }
+
+    #[test]
+    fn handles_share_one_identity_and_lifetime_table() {
+        let table = HandleTable::new();
+        let file = table.insert("file");
+        let directory = table.insert("directory");
+        assert_ne!(file, directory);
+        assert_eq!(table.get(file).as_deref(), Some(&"file"));
+        assert_eq!(table.remove(file).as_deref(), Some(&"file"));
+        assert!(table.get(file).is_none());
+        assert_eq!(table.get(directory).as_deref(), Some(&"directory"));
+    }
+
+    #[test]
+    fn every_canonical_kind_has_both_protocol_encodings() {
+        let cases = [
+            (NodeKind::NamedPipe, libc::S_IFIFO),
+            (NodeKind::CharDevice, libc::S_IFCHR),
+            (NodeKind::BlockDevice, libc::S_IFBLK),
+            (NodeKind::Directory, libc::S_IFDIR),
+            (NodeKind::RegularFile, libc::S_IFREG),
+            (NodeKind::Symlink, libc::S_IFLNK),
+            (NodeKind::Socket, libc::S_IFSOCK),
+        ];
+        for (kind, mode) in cases {
+            assert_eq!(virtio_attr(attr(kind)).mode & libc::S_IFMT, mode);
+            assert_eq!(fuse_attr(attr(kind)).kind, fuse_kind(kind));
+        }
+    }
 
     #[test]
     fn identity_is_stable_and_forget_saturates() {

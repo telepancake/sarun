@@ -36,9 +36,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use fuser::Errno;
-use fuser::FileAttr;
 use fuser::FileHandle;
-use fuser::FileType;
 use fuser::Filesystem;
 use fuser::FopenFlags;
 use fuser::Generation;
@@ -60,6 +58,7 @@ use fuser::TimeOrNow;
 use crate::capture::BoxState;
 use crate::capture::Entry;
 use crate::depot::blob_path;
+use crate::sarunfs::{HandleTable, NodeAttr, NodeKind};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -75,15 +74,15 @@ fn ns_ts(ns: i64) -> SystemTime {
     ts(ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000))
 }
 
-fn kind_of_mode(mode: u32) -> FileType {
+fn kind_of_mode(mode: u32) -> NodeKind {
     match mode & libc::S_IFMT {
-        libc::S_IFDIR => FileType::Directory,
-        libc::S_IFLNK => FileType::Symlink,
-        libc::S_IFCHR => FileType::CharDevice,
-        libc::S_IFBLK => FileType::BlockDevice,
-        libc::S_IFIFO => FileType::NamedPipe,
-        libc::S_IFSOCK => FileType::Socket,
-        _ => FileType::RegularFile,
+        libc::S_IFDIR => NodeKind::Directory,
+        libc::S_IFLNK => NodeKind::Symlink,
+        libc::S_IFCHR => NodeKind::CharDevice,
+        libc::S_IFBLK => NodeKind::BlockDevice,
+        libc::S_IFIFO => NodeKind::NamedPipe,
+        libc::S_IFSOCK => NodeKind::Socket,
+        _ => NodeKind::RegularFile,
     }
 }
 
@@ -152,10 +151,8 @@ struct Inner {
     // objects: review/apply must never mistake `/init` for a user write.
     projections: RwLock<HashMap<Key, PathBuf>>,
     inodes: crate::sarunfs::InodeTable,
-    detached_attrs: RwLock<HashMap<u64, FileAttr>>,
-    fhs: RwLock<HashMap<u64, Mutex<Fh>>>,
-    dir_fhs: RwLock<HashMap<u64, Arc<Vec<DirNode>>>>,
-    next_fh: AtomicU64,
+    detached_attrs: RwLock<HashMap<u64, NodeAttr>>,
+    handles: HandleTable<Handle>,
     // Live ExtAttachment objects per owning box (RoAttachment::Ext rows,
     // in list order). Constructed lazily and WITHOUT I/O (attach.rs
     // opens the store on first entry/blob use), so hydration cost stays
@@ -167,10 +164,6 @@ struct Inner {
     // state_home()/cache — is_engine_path already hides the whole
     // state_home subtree from boxes. None = open failed (served EIO).
     cache: std::sync::OnceLock<Option<depot_cache::Cache>>,
-    // Open handles to the synthetic JOBSERVER file: fh -> is-O_NONBLOCK. Kept
-    // apart from `fhs` (no blob/file behind them) so read/write dispatch to the
-    // slip pool instead of a backing file.
-    jobserver_fhs: RwLock<HashMap<u64, bool>>,
     rules: RwLock<crate::rules::Rules>,  // passthrough decisions (reload verb)
     /// Lazy shadowing for -b boxes: at lookup/open time, if the
     /// box-relative path matches one of the compiled glob patterns,
@@ -222,6 +215,12 @@ struct Fh {
     inner: FhInner,
 }
 
+enum Handle {
+    File(Mutex<Fh>),
+    Directory(Arc<Vec<DirNode>>),
+    Jobserver { nonblock: bool },
+}
+
 struct FhInner {
     box_id: i64,
     rel: String,
@@ -249,7 +248,7 @@ struct FhInner {
 #[derive(Clone)]
 struct DirNode {
     inode: u64,
-    kind: FileType,
+    kind: NodeKind,
     name: String,
 }
 
@@ -577,12 +576,9 @@ impl SarunFs {
             projections: RwLock::new(HashMap::new()),
             inodes: crate::sarunfs::InodeTable::new((0, String::new())),
             detached_attrs: RwLock::new(HashMap::new()),
-            fhs: RwLock::new(HashMap::new()),
-            dir_fhs: RwLock::new(HashMap::new()),
-            next_fh: AtomicU64::new(1),
+            handles: HandleTable::new(),
             ext: RwLock::new(HashMap::new()),
             cache: std::sync::OnceLock::new(),
-            jobserver_fhs: RwLock::new(HashMap::new()),
             rules: RwLock::new(crate::rules::Rules::load()),
             echo: RwLock::new(HashMap::new()),
             sink_open: Mutex::new(HashMap::new()),
@@ -1142,9 +1138,9 @@ impl SarunFs {
         let entries = self.scan_dir(&b, rel, /*plus=*/false);
         Ok(entries.into_iter().map(|(name, kind, _, _)| {
             let c = match kind {
-                FileType::RegularFile => 'f',
-                FileType::Directory => 'd',
-                FileType::Symlink => 'l',
+                NodeKind::RegularFile => 'f',
+                NodeKind::Directory => 'd',
+                NodeKind::Symlink => 'l',
                 _ => 's',
             };
             (name, c)
@@ -1202,11 +1198,11 @@ impl SarunFs {
         self.inner.boxes.read().unwrap().get(&id).cloned()
     }
 
-    fn key_of(&self, ino: INodeNo) -> Option<Key> {
-        if u64::from(ino) == 1 {
+    fn key_of(&self, inode: u64) -> Option<Key> {
+        if inode == 1 {
             Some(self.root.clone())
         } else {
-            self.inner.inodes.key(u64::from(ino))
+            self.inner.inodes.key(inode)
         }
     }
 
@@ -1462,14 +1458,14 @@ impl SarunFs {
         false
     }
 
-    fn lower_attr(&self, ino: u64, rel: &str) -> Option<FileAttr> {
+    fn lower_attr(&self, ino: u64, rel: &str) -> Option<NodeAttr> {
         let md = self.host(rel).symlink_metadata().ok()?;
         Some(self.attr_from_md(ino, &md))
     }
 
-    fn attr_from_md(&self, ino: u64, md: &std::fs::Metadata) -> FileAttr {
-        FileAttr {
-            ino: INodeNo(ino),
+    fn attr_from_md(&self, ino: u64, md: &std::fs::Metadata) -> NodeAttr {
+        NodeAttr {
+            inode: ino,
             size: md.size(),
             blocks: md.blocks(),
             atime: ts(md.atime(), md.atime_nsec()),
@@ -1487,40 +1483,40 @@ impl SarunFs {
         }
     }
 
-    fn synth_dir_attr(&self, ino: u64, mode: u32, mtime_ns: i64) -> FileAttr {
-        FileAttr {
-            ino: INodeNo(ino), size: 0, blocks: 0,
+    fn synth_dir_attr(&self, ino: u64, mode: u32, mtime_ns: i64) -> NodeAttr {
+        NodeAttr {
+            inode: ino, size: 0, blocks: 0,
             atime: ns_ts(mtime_ns), mtime: ns_ts(mtime_ns), ctime: ns_ts(mtime_ns),
-            crtime: UNIX_EPOCH, kind: FileType::Directory,
+            crtime: UNIX_EPOCH, kind: NodeKind::Directory,
             perm: (mode & 0o7777) as u16, nlink: 2, uid: 0, gid: 0, rdev: 0,
             blksize: 512, flags: 0,
         }
     }
 
-    fn synth_file_attr(&self, ino: u64) -> FileAttr {
-        FileAttr {
-            ino: INodeNo(ino), size: 0, blocks: 0,
+    fn synth_file_attr(&self, ino: u64) -> NodeAttr {
+        NodeAttr {
+            inode: ino, size: 0, blocks: 0,
             atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH, kind: FileType::RegularFile,
+            crtime: UNIX_EPOCH, kind: NodeKind::RegularFile,
             perm: 0o666, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 512, flags: 0,
         }
     }
 
-    fn synth_link_attr(&self, ino: u64, len: u64) -> FileAttr {
-        FileAttr {
-            ino: INodeNo(ino), size: len, blocks: 0,
+    fn synth_link_attr(&self, ino: u64, len: u64) -> NodeAttr {
+        NodeAttr {
+            inode: ino, size: len, blocks: 0,
             atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH, kind: FileType::Symlink,
+            crtime: UNIX_EPOCH, kind: NodeKind::Symlink,
             perm: 0o777, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 512, flags: 0,
         }
     }
 
     /// Attributes for (box, rel) through the FULL merge (own → parent chain →
     /// host), or None when absent.
-    fn attr_of(&self, b: &BoxState, ino: u64, rel: &str) -> Option<FileAttr> {
+    fn attr_of(&self, b: &BoxState, ino: u64, rel: &str) -> Option<NodeAttr> {
         if let Some(path) = self.projected_file(b.id, rel) {
             let mut attr = self.attr_from_md(ino, &std::fs::metadata(path).ok()?);
-            attr.kind = FileType::RegularFile;
+            attr.kind = NodeKind::RegularFile;
             return Some(attr);
         }
         let layer = self.resolve(b.id, rel);
@@ -1534,7 +1530,7 @@ impl SarunFs {
             let safe = crate::paths::api_box_oaita_toml_path();
             if let Ok(md) = std::fs::metadata(&safe) {
                 let mut a = self.attr_from_md(ino, &md);
-                a.kind = FileType::RegularFile;
+                a.kind = NodeKind::RegularFile;
                 return Some(a);
             }
         }
@@ -1555,7 +1551,7 @@ impl SarunFs {
             let safe = crate::paths::api_box_ca_pem_path();
             if let Ok(md) = std::fs::metadata(&safe) {
                 let mut a = self.attr_from_md(ino, &md);
-                a.kind = FileType::RegularFile;
+                a.kind = NodeKind::RegularFile;
                 return Some(a);
             }
         }
@@ -1566,7 +1562,7 @@ impl SarunFs {
             let safe = crate::paths::api_box_resolv_conf_path();
             if let Ok(md) = std::fs::metadata(&safe) {
                 let mut a = self.attr_from_md(ino, &md);
-                a.kind = FileType::RegularFile;
+                a.kind = NodeKind::RegularFile;
                 return Some(a);
             }
         }
@@ -1580,7 +1576,7 @@ impl SarunFs {
             if let Some(exe) = self.shadow_target_path() {
                 if let Ok(md) = std::fs::metadata(&exe) {
                     let mut a = self.attr_from_md(ino, &md);
-                    a.kind = FileType::RegularFile;
+                    a.kind = NodeKind::RegularFile;
                     // Keep exec bits — most shadow targets are
                     // /bin/sh-shaped things the box wants to exec.
                     return Some(a);
@@ -1595,7 +1591,7 @@ impl SarunFs {
                 let md = bp.metadata().ok()?;
                 let mut a = self.attr_from_md(ino, &md);
                 a.perm = (mode & 0o7777) as u16;
-                a.kind = FileType::RegularFile;
+                a.kind = NodeKind::RegularFile;
                 Some(a)
             }
             // Carried size/mode only — getattr must NEVER call blob()
@@ -1625,8 +1621,8 @@ impl SarunFs {
     /// Transport-neutral lookup.  Both the host `/dev/fuse` adapter and the
     /// virtio-fs server enter policy here, including synthetic nodes and inode
     /// lookup lifetime accounting.
-    fn lookup_node(&self, parent: u64, name: &OsStr) -> Result<FileAttr, Errno> {
-        let (bid, prel) = self.key_of(INodeNo(parent)).ok_or(Errno::ENOENT)?;
+    fn lookup_node(&self, parent: u64, name: &OsStr) -> Result<NodeAttr, Errno> {
+        let (bid, prel) = self.key_of(parent).ok_or(Errno::ENOENT)?;
         let name = name.to_str().ok_or(Errno::ENOENT)?;
         let attr = if bid == 0 {
             let id = name.parse::<i64>().map_err(|_| Errno::ENOENT)?;
@@ -1668,12 +1664,12 @@ impl SarunFs {
                 }
             }
         };
-        self.inner.inodes.acquire(u64::from(attr.ino), 1);
+        self.inner.inodes.acquire(attr.inode, 1);
         Ok(attr)
     }
 
-    fn getattr_node(&self, inode: u64) -> Result<FileAttr, Errno> {
-        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+    fn getattr_node(&self, inode: u64) -> Result<NodeAttr, Errno> {
+        let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         if bid == 0 || rel.is_empty() || rel == KIDS_DIR {
             return Ok(self.synth_dir_attr(inode, 0o40755, 0));
         }
@@ -1687,7 +1683,7 @@ impl SarunFs {
     }
 
     fn readlink_node(&self, inode: u64) -> Result<Vec<u8>, Errno> {
-        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         self.box_of(bid).ok_or(Errno::ENOENT)?;
         match self.resolve(bid, &rel) {
             Layer::UpperSymlink { target } =>
@@ -1707,7 +1703,7 @@ impl SarunFs {
         flags: u32,
     ) -> Result<(), Errno> {
         self.getattr_node(inode)?;
-        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
         if self.ro_denied(bid, &rel) {
             return Err(Errno::EROFS);
@@ -1733,7 +1729,7 @@ impl SarunFs {
 
     fn get_xattr_node(&self, inode: u64, name: &OsStr) -> Result<Vec<u8>, Errno> {
         self.getattr_node(inode)?;
-        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
         let name = name.to_str().ok_or(Errno::EINVAL)?;
         b.get_xattr(&rel, name).ok_or(Errno::ENODATA)
@@ -1741,7 +1737,7 @@ impl SarunFs {
 
     fn list_xattr_node(&self, inode: u64) -> Result<Vec<u8>, Errno> {
         self.getattr_node(inode)?;
-        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
         let mut buffer = Vec::new();
         for name in b.list_xattr(&rel) {
@@ -1753,7 +1749,7 @@ impl SarunFs {
 
     fn remove_xattr_node(&self, inode: u64, name: &OsStr) -> Result<(), Errno> {
         self.getattr_node(inode)?;
-        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
         if self.ro_denied(bid, &rel) {
             return Err(Errno::EROFS);
@@ -1769,7 +1765,7 @@ impl SarunFs {
         flags: u32,
         allow_backing: bool,
     ) -> Result<OpenedNode, Errno> {
-        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
         let want_write = flags & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32;
         if let Some(path) = self.projected_file(bid, &rel) {
@@ -1800,8 +1796,10 @@ impl SarunFs {
         }
         if rel == JOBSERVER {
             let nonblock = flags & libc::O_NONBLOCK as u32 != 0;
-            let handle = self.inner.next_fh.fetch_add(1, Ordering::Relaxed);
-            self.inner.jobserver_fhs.write().unwrap().insert(handle, nonblock);
+            let handle = self
+                .inner
+                .handles
+                .insert(Handle::Jobserver { nonblock });
             return Ok(OpenedNode {
                 handle,
                 direct_io: true,
@@ -1964,8 +1962,8 @@ impl SarunFs {
         parent: u64,
         name: &OsStr,
         mode: u32,
-    ) -> Result<(FileAttr, OpenedNode), Errno> {
-        let (bid, parent_rel) = self.key_of(INodeNo(parent)).ok_or(Errno::ENOENT)?;
+    ) -> Result<(NodeAttr, OpenedNode), Errno> {
+        let (bid, parent_rel) = self.key_of(parent).ok_or(Errno::ENOENT)?;
         if bid == 0 {
             return Err(Errno::EPERM);
         }
@@ -1997,7 +1995,7 @@ impl SarunFs {
                 .ok()
                 .map(|metadata| self.attr_from_md(inode, &metadata))
                 .unwrap_or_else(|| self.synth_file_attr(inode));
-            attr.kind = FileType::RegularFile;
+            attr.kind = NodeKind::RegularFile;
             attr.perm = (mode & 0o7777) as u16;
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
@@ -2032,7 +2030,7 @@ impl SarunFs {
                 .ok()
                 .map(|metadata| self.attr_from_md(inode, &metadata))
                 .unwrap_or_else(|| self.synth_file_attr(inode));
-            attr.kind = FileType::RegularFile;
+            attr.kind = NodeKind::RegularFile;
             attr.perm = (mode & 0o7777) as u16;
             self.push_event(bid, rel.clone(), "create");
             let handle = self.reg_fh(FhInner {
@@ -2049,7 +2047,7 @@ impl SarunFs {
             });
             (attr, handle)
         };
-        self.inner.inodes.acquire(u64::from(attr.ino), 1);
+        self.inner.inodes.acquire(attr.inode, 1);
         Ok((
             attr,
             OpenedNode {
@@ -2063,7 +2061,7 @@ impl SarunFs {
     }
 
     fn child_path(&self, parent: u64, name: &OsStr) -> Result<(i64, String), Errno> {
-        let (box_id, parent_rel) = self.key_of(INodeNo(parent)).ok_or(Errno::ENOENT)?;
+        let (box_id, parent_rel) = self.key_of(parent).ok_or(Errno::ENOENT)?;
         if box_id == 0 {
             return Err(Errno::EPERM);
         }
@@ -2077,7 +2075,7 @@ impl SarunFs {
     }
 
     fn mkdir_node(&self, pid: u32, parent: u64, name: &OsStr, mode: u32)
-        -> Result<FileAttr, Errno>
+        -> Result<NodeAttr, Errno>
     {
         let (box_id, rel) = self.child_path(parent, name)?;
         let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
@@ -2101,7 +2099,7 @@ impl SarunFs {
         parent: u64,
         name: &OsStr,
         target: &Path,
-    ) -> Result<FileAttr, Errno> {
+    ) -> Result<NodeAttr, Errno> {
         let (box_id, rel) = self.child_path(parent, name)?;
         let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
         if self.ro_denied(box_id, &rel) {
@@ -2126,7 +2124,7 @@ impl SarunFs {
         }
         let inode = self.ino_for(&(box_id, rel.clone()));
         let attr = self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)?;
-        if attr.kind == FileType::Directory {
+        if attr.kind == NodeKind::Directory {
             return Err(Errno::EISDIR);
         }
         self.inner.inodes.detach(&(box_id, rel.clone()));
@@ -2145,7 +2143,7 @@ impl SarunFs {
         }
         let inode = self.ino_for(&(box_id, rel.clone()));
         let attr = self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)?;
-        if attr.kind != FileType::Directory {
+        if attr.kind != NodeKind::Directory {
             return Err(Errno::ENOTDIR);
         }
         if !self.scan_dir(&b, &rel, false).is_empty() {
@@ -2168,9 +2166,9 @@ impl SarunFs {
         new_name: &OsStr,
         flags: u32,
     ) -> Result<(), Errno> {
-        let (box_id, old_parent) = self.key_of(INodeNo(parent)).ok_or(Errno::EACCES)?;
+        let (box_id, old_parent) = self.key_of(parent).ok_or(Errno::EACCES)?;
         let (new_box_id, new_parent) = self
-            .key_of(INodeNo(new_parent))
+            .key_of(new_parent)
             .ok_or(Errno::EACCES)?;
         if box_id == 0 || new_box_id == 0 || box_id != new_box_id {
             return Err(Errno::EXDEV);
@@ -2235,7 +2233,7 @@ impl SarunFs {
         name: &OsStr,
         mode: u32,
         rdev: u32,
-    ) -> Result<FileAttr, Errno> {
+    ) -> Result<NodeAttr, Errno> {
         let (box_id, rel) = self.child_path(parent, name)?;
         let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
         if self.ro_denied(box_id, &rel) {
@@ -2268,8 +2266,8 @@ impl SarunFs {
         inode: u64,
         new_parent: u64,
         new_name: &OsStr,
-    ) -> Result<FileAttr, Errno> {
-        let (source_box, source_rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+    ) -> Result<NodeAttr, Errno> {
+        let (source_box, source_rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         let (box_id, new_rel) = self.child_path(new_parent, new_name)?;
         if source_box != box_id {
             return Err(Errno::EXDEV);
@@ -2328,8 +2326,8 @@ impl SarunFs {
         pid: u32,
         inode: u64,
         request: NodeSetattr,
-    ) -> Result<FileAttr, Errno> {
-        let (box_id, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+    ) -> Result<NodeAttr, Errno> {
+        let (box_id, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
         if self.ro_denied(box_id, &rel) {
             return Err(Errno::EROFS);
@@ -2456,8 +2454,10 @@ impl SarunFs {
 
     fn read_file_node(&self, handle: u64) -> Result<File, Errno> {
         self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
-        let handles = self.inner.fhs.read().unwrap();
-        let handle = handles.get(&handle).ok_or(Errno::EBADF)?;
+        let handle = self.inner.handles.get(handle).ok_or(Errno::EBADF)?;
+        let Handle::File(handle) = &*handle else {
+            return Err(Errno::EBADF);
+        };
         let handle = handle.lock().unwrap();
         handle
             .inner
@@ -2469,11 +2469,13 @@ impl SarunFs {
     }
 
     fn prepare_write_node(&self, pid: u32, handle: u64) -> Result<WriteTarget, Errno> {
-        if self.inner.jobserver_fhs.read().unwrap().contains_key(&handle) {
+        let handle = self.inner.handles.get(handle).ok_or(Errno::EBADF)?;
+        if matches!(&*handle, Handle::Jobserver { .. }) {
             return Ok(WriteTarget::Jobserver);
         }
-        let handles = self.inner.fhs.read().unwrap();
-        let handle = handles.get(&handle).ok_or(Errno::EBADF)?;
+        let Handle::File(handle) = &*handle else {
+            return Err(Errno::EBADF);
+        };
         let mut handle = handle.lock().unwrap();
         if let Some(stream) = handle.inner.sink {
             return Ok(WriteTarget::Sink {
@@ -2534,17 +2536,18 @@ impl SarunFs {
     }
 
     fn release_node(&self, handle: u64) -> Result<(), Errno> {
-        if self.inner.jobserver_fhs.write().unwrap().remove(&handle).is_some() {
-            return Ok(());
-        }
         let handle = self
             .inner
-            .fhs
-            .write()
-            .unwrap()
-            .remove(&handle)
+            .handles
+            .remove(handle)
             .ok_or(Errno::EBADF)?;
-        let handle = handle.into_inner().unwrap();
+        if matches!(&*handle, Handle::Jobserver { .. }) {
+            return Ok(());
+        }
+        let Handle::File(handle) = &*handle else {
+            return Err(Errno::EBADF);
+        };
+        let handle = handle.lock().unwrap();
         if handle.inner.sink.is_some() {
             self.note_sink_release(handle.inner.box_id);
         } else if handle.inner.dirty && !handle.inner.passthrough {
@@ -2569,11 +2572,13 @@ impl SarunFs {
     }
 
     fn sync_file_node(&self, handle: u64, data_only: bool) -> Result<(), Errno> {
-        if self.inner.jobserver_fhs.read().unwrap().contains_key(&handle) {
+        let handle = self.inner.handles.get(handle).ok_or(Errno::EBADF)?;
+        if matches!(&*handle, Handle::Jobserver { .. }) {
             return Ok(());
         }
-        let handles = self.inner.fhs.read().unwrap();
-        let handle = handles.get(&handle).ok_or(Errno::EBADF)?;
+        let Handle::File(handle) = &*handle else {
+            return Err(Errno::EBADF);
+        };
         let handle = handle.lock().unwrap();
         let Some(file) = handle.inner.file.as_ref() else {
             return Ok(());
@@ -2657,9 +2662,9 @@ impl SarunFs {
     }
 
     fn reg_fh(&self, fh: FhInner) -> u64 {
-        let n = self.inner.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.inner.fhs.write().unwrap().insert(n, Mutex::new(Fh { inner: fh }));
-        n
+        self.inner
+            .handles
+            .insert(Handle::File(Mutex::new(Fh { inner: fh })))
     }
 
     /// Merged listing of (box, rel) through the FULL chain: host entries, then
@@ -2667,7 +2672,7 @@ impl SarunFs {
     /// whiteouts hide and its entries override shallower layers). (name, kind,
     /// child-ino, Option<attr>).
     fn scan_dir(&self, b: &BoxState, rel: &str, plus: bool)
-                -> Vec<(String, FileType, u64, Option<FileAttr>)> {
+                -> Vec<(String, NodeKind, u64, Option<NodeAttr>)> {
         let mut names: BTreeMap<String, ()> = BTreeMap::new();
         // chain of links, root-first (incl. RO attachments).
         let mut chain = self.chain_of(b.id);
@@ -2764,10 +2769,10 @@ impl SarunFs {
     }
 
     fn directory_snapshot(&self, inode: u64) -> Result<Vec<DirNode>, Errno> {
-        if self.getattr_node(inode)?.kind != FileType::Directory {
+        if self.getattr_node(inode)?.kind != NodeKind::Directory {
             return Err(Errno::ENOTDIR);
         }
-        let (bid, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         if bid == 0 {
             return Ok(self
                 .inner
@@ -2777,7 +2782,7 @@ impl SarunFs {
                 .keys()
                 .map(|id| DirNode {
                     inode: self.ino_for(&(*id, String::new())),
-                    kind: FileType::Directory,
+                    kind: NodeKind::Directory,
                     name: id.to_string(),
                 })
                 .collect());
@@ -2788,7 +2793,7 @@ impl SarunFs {
                 .into_iter()
                 .map(|id| DirNode {
                     inode: self.ino_for(&(id, String::new())),
-                    kind: FileType::Directory,
+                    kind: NodeKind::Directory,
                     name: id.to_string(),
                 })
                 .collect());
@@ -2814,26 +2819,23 @@ impl SarunFs {
 
     fn open_directory(&self, inode: u64) -> Result<u64, Errno> {
         let snapshot = Arc::new(self.directory_snapshot(inode)?);
-        let handle = self.inner.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.inner.dir_fhs.write().unwrap().insert(handle, snapshot);
-        Ok(handle)
+        Ok(self.inner.handles.insert(Handle::Directory(snapshot)))
     }
 
     fn read_directory(&self, handle: u64, offset: u64) -> Result<Vec<DirNode>, Errno> {
-        let snapshots = self.inner.dir_fhs.read().unwrap();
-        let snapshot = snapshots.get(&handle).ok_or(Errno::EBADF)?;
+        let handle = self.inner.handles.get(handle).ok_or(Errno::EBADF)?;
+        let Handle::Directory(snapshot) = &*handle else {
+            return Err(Errno::EBADF);
+        };
         let start = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
         Ok(snapshot.iter().skip(start).cloned().collect())
     }
 
     fn close_directory(&self, handle: u64) -> Result<(), Errno> {
-        self.inner
-            .dir_fhs
-            .write()
-            .unwrap()
-            .remove(&handle)
-            .map(|_| ())
-            .ok_or(Errno::EBADF)
+        match self.inner.handles.remove(handle).as_deref() {
+            Some(Handle::Directory(_)) => Ok(()),
+            _ => Err(Errno::EBADF),
+        }
     }
 }
 
@@ -2852,7 +2854,7 @@ impl Filesystem for SarunFs {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.lookup_node(u64::from(parent), name) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => reply.entry(&TTL, &crate::sarunfs::fuse_attr(attr), Generation(0)),
             Err(error) => reply.error(error),
         }
     }
@@ -2864,7 +2866,7 @@ impl Filesystem for SarunFs {
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>,
                reply: ReplyAttr) {
         match self.getattr_node(u64::from(ino)) {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&TTL, &crate::sarunfs::fuse_attr(attr)),
             Err(error) => reply.error(error),
         }
     }
@@ -2892,8 +2894,10 @@ impl Filesystem for SarunFs {
             response_flags |= FopenFlags::FOPEN_KEEP_CACHE;
         }
         if opened.backing_candidate {
-            let fhs = self.inner.fhs.read().unwrap();
-            if let Some(handle) = fhs.get(&opened.handle) {
+            if let Some(handle) = self.inner.handles.get(opened.handle) {
+                let Handle::File(handle) = &*handle else {
+                    return reply.error(Errno::EBADF);
+                };
                 let mut handle = handle.lock().unwrap();
                 if let Some(file) = handle.inner.file.as_ref() {
                     if let Ok(backing) = reply.open_backing(file) {
@@ -2916,7 +2920,7 @@ impl Filesystem for SarunFs {
         match self.create_node(req.pid(), u64::from(parent), name, mode) {
             Ok((attr, opened)) => reply.created(
                 &TTL,
-                &attr,
+                &crate::sarunfs::fuse_attr(attr),
                 Generation(0),
                 FileHandle(opened.handle),
                 FopenFlags::empty(),
@@ -2931,8 +2935,11 @@ impl Filesystem for SarunFs {
         // caller pid. If the pool is empty we DEFER the reply (block the read)
         // until a release frees one — unless the handle is O_NONBLOCK, in which
         // case the pool denies it with EAGAIN at once.
-        let jsfh = self.inner.jobserver_fhs.read().unwrap().get(&u64::from(fh)).copied();
-        if let Some(nonblock) = jsfh {
+        let synthetic = self.inner.handles.get(u64::from(fh));
+        if let Some(nonblock) = synthetic.as_deref().and_then(|handle| match handle {
+            Handle::Jobserver { nonblock } => Some(*nonblock),
+            _ => None,
+        }) {
             // Key by the process (TGID), so acquire and release agree and the
             // pidfd reaper can watch a real process. A thread's read maps to its
             // owning process.
@@ -3007,7 +3014,7 @@ impl Filesystem for SarunFs {
             u64::from(ino),
             NodeSetattr { mode, uid, gid, size, mtime },
         ) {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&TTL, &crate::sarunfs::fuse_attr(attr)),
             Err(error) => reply.error(error),
         }
     }
@@ -3015,7 +3022,7 @@ impl Filesystem for SarunFs {
     fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
              _umask: u32, reply: ReplyEntry) {
         match self.mkdir_node(req.pid(), u64::from(parent), name, mode) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => reply.entry(&TTL, &crate::sarunfs::fuse_attr(attr), Generation(0)),
             Err(error) => reply.error(error),
         }
     }
@@ -3023,7 +3030,7 @@ impl Filesystem for SarunFs {
     fn symlink(&self, req: &Request, parent: INodeNo, link_name: &OsStr,
                target: &Path, reply: ReplyEntry) {
         match self.symlink_node(req.pid(), u64::from(parent), link_name, target) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => reply.entry(&TTL, &crate::sarunfs::fuse_attr(attr), Generation(0)),
             Err(error) => reply.error(error),
         }
     }
@@ -3031,7 +3038,7 @@ impl Filesystem for SarunFs {
     fn mknod(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
              _umask: u32, rdev: u32, reply: ReplyEntry) {
         match self.mknod_node(req.pid(), u64::from(parent), name, mode, rdev) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => reply.entry(&TTL, &crate::sarunfs::fuse_attr(attr), Generation(0)),
             Err(error) => reply.error(error),
         }
     }
@@ -3039,7 +3046,7 @@ impl Filesystem for SarunFs {
     fn link(&self, req: &Request, ino: INodeNo, newparent: INodeNo,
             newname: &OsStr, reply: ReplyEntry) {
         match self.link_node(req.pid(), u64::from(ino), u64::from(newparent), newname) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => reply.entry(&TTL, &crate::sarunfs::fuse_attr(attr), Generation(0)),
             Err(error) => reply.error(error),
         }
     }
@@ -3184,7 +3191,12 @@ impl Filesystem for SarunFs {
         };
         for (index, entry) in entries.into_iter().enumerate() {
             let next = offset.saturating_add(index as u64).saturating_add(1);
-            if reply.add(INodeNo(entry.inode), next, entry.kind, entry.name) {
+            if reply.add(
+                INodeNo(entry.inode),
+                next,
+                crate::sarunfs::fuse_kind(entry.kind),
+                entry.name,
+            ) {
                 break;
             }
         }
@@ -3199,6 +3211,7 @@ impl Filesystem for SarunFs {
         };
         for (index, entry) in entries.into_iter().enumerate() {
             let Ok(attr) = self.getattr_node(entry.inode) else { continue };
+            let attr = crate::sarunfs::fuse_attr(attr);
             let next = offset.saturating_add(index as u64).saturating_add(1);
             if reply.add(INodeNo(entry.inode), next, entry.name, &TTL, &attr,
                          Generation(0)) {
@@ -3251,7 +3264,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             .lookup_node(parent, OsStr::from_bytes(name.to_bytes()))
             .map_err(virtio_error)?;
         Ok(virtiofsd::filesystem::Entry {
-            inode: u64::from(attr.ino),
+            inode: attr.inode,
             generation: 0,
             attr: crate::sarunfs::virtio_attr(attr),
             attr_timeout: TTL,
@@ -3368,7 +3381,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             .map_err(virtio_error)?;
         Ok((
             virtiofsd::filesystem::Entry {
-                inode: u64::from(attr.ino),
+                inode: attr.inode,
                 generation: 0,
                 attr: crate::sarunfs::virtio_attr(attr),
                 attr_timeout: TTL,
@@ -3397,7 +3410,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             )
             .map_err(virtio_error)?;
         Ok(virtiofsd::filesystem::Entry {
-            inode: u64::from(attr.ino),
+            inode: attr.inode,
             generation: 0,
             attr: crate::sarunfs::virtio_attr(attr),
             attr_timeout: TTL,
@@ -3425,7 +3438,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             )
             .map_err(virtio_error)?;
         Ok(virtiofsd::filesystem::Entry {
-            inode: u64::from(attr.ino),
+            inode: attr.inode,
             generation: 0,
             attr: crate::sarunfs::virtio_attr(attr),
             attr_timeout: TTL,
@@ -3450,7 +3463,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             )
             .map_err(virtio_error)?;
         Ok(virtiofsd::filesystem::Entry {
-            inode: u64::from(attr.ino),
+            inode: attr.inode,
             generation: 0,
             attr: crate::sarunfs::virtio_attr(attr),
             attr_timeout: TTL,
@@ -3522,7 +3535,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             )
             .map_err(virtio_error)?;
         Ok(virtiofsd::filesystem::Entry {
-            inode: u64::from(attr.ino),
+            inode: attr.inode,
             generation: 0,
             attr: crate::sarunfs::virtio_attr(attr),
             attr_timeout: TTL,

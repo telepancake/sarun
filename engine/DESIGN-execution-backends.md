@@ -64,6 +64,12 @@ as executable mappings and mmap that genuinely need a host fd.
       `SerializableFileSystem` migration hooks.
 - [ ] Separate virtual inode/handle lifetime, overlay policy, underlying layer
       access, capture/provenance, and synthetic nodes.
+  - [x] Make inode identity, lookup counts, handle allocation/lifetime, node
+        kinds, and node attributes transport-independent; fuser and virtio-fs
+        only encode canonical values at their reply boundaries.
+  - [ ] Isolate merged-layer resolution and ordinary backing-file access.
+  - [ ] Isolate capture/provenance mutation from protocol callbacks.
+  - [ ] Isolate synthetic projections, sinks, jobserver, and nested-box nodes.
 - [ ] Use virtiofsd passthrough machinery for ordinary host-backed operations;
       retain only sarun-specific composition and capture policy.
 - [ ] Add canonical-message tests for lookup counts, forgotten/open inodes,
@@ -149,3 +155,13 @@ tests; FUSE parity/cutover; SUD ring; SUD parity/deletion; reproducible applianc
 builders; aarch64 appliance; x86_64 appliance; final equivalence and cleanup.
 During any long gate, commit and push a compiling WIP checkpoint rather than
 holding hours of work only in the worktree.
+
+## Known baseline failures
+
+- The 2026-07-17 full static aarch64 unit run passed 364 tests, ignored one,
+  and exposed two pre-existing Brush/editor semantic-completion assertions:
+  `production_brush_document_propagates_later_find_type_constraint` and
+  `bash_editor_uses_relation_for_backward_completion_and_insertion`.  The
+  QEMU appliance, generated-wire, and backend lifecycle subsets are green.
+  These failures require finishing the declarative `find` argument grammar;
+  they are not hidden by filesystem-backend test runs.
