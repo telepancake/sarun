@@ -11,6 +11,7 @@
 // truncate/mkdir/unlink/rmdir/symlink/rename.
 
 use crate::depot::BoxDepot;
+use virtiofsd::soft_idmap::Id as _;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -259,6 +260,14 @@ enum WriteTarget {
     Jobserver,
     Sink { box_id: i64, stream: i32 },
     File { file: File, box_id: i64, rel: String },
+}
+
+struct NodeSetattr {
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    size: Option<u64>,
+    mtime: Option<SystemTime>,
 }
 
 /// Bridges a deferred FUSE read reply into the slip pool. The pool calls exactly
@@ -2219,6 +2228,137 @@ impl SarunFs {
         Ok(())
     }
 
+    fn setattr_node(
+        &self,
+        pid: u32,
+        inode: u64,
+        request: NodeSetattr,
+    ) -> Result<FileAttr, Errno> {
+        let (box_id, rel) = self.key_of(INodeNo(inode)).ok_or(Errno::ENOENT)?;
+        let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
+        if self.ro_denied(box_id, &rel) {
+            return Err(Errno::EROFS);
+        }
+        if b.direct() || self.is_passthrough(&rel, box_id, pid) {
+            let host = self.host(&rel);
+            let path = CString::new(host.as_os_str().as_encoded_bytes())
+                .map_err(|_| Errno::EINVAL)?;
+            if let Some(size) = request.size {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&host)
+                    .map_err(Errno::from)?
+                    .set_len(size)
+                    .map_err(Errno::from)?;
+            }
+            if let Some(mode) = request.mode {
+                if unsafe { libc::chmod(path.as_ptr(), mode & 0o7777) } != 0 {
+                    return Err(Errno::from(std::io::Error::last_os_error()));
+                }
+            }
+            if request.uid.is_some() || request.gid.is_some() {
+                if unsafe {
+                    libc::lchown(
+                        path.as_ptr(),
+                        request.uid.unwrap_or(u32::MAX),
+                        request.gid.unwrap_or(u32::MAX),
+                    )
+                } != 0
+                {
+                    return Err(Errno::from(std::io::Error::last_os_error()));
+                }
+            }
+            if let Some(mtime) = request.mtime {
+                let duration = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
+                let timestamp = libc::timespec {
+                    tv_sec: duration.as_secs() as _,
+                    tv_nsec: duration.subsec_nanos() as _,
+                };
+                let times = [timestamp, timestamp];
+                if unsafe {
+                    libc::utimensat(
+                        libc::AT_FDCWD,
+                        path.as_ptr(),
+                        times.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                {
+                    return Err(Errno::from(std::io::Error::last_os_error()));
+                }
+            }
+            return self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT);
+        }
+        if let Some(size) = request.size {
+            let file = match self.layer(&b, &rel) {
+                Layer::UpperFile { rowid, .. } => {
+                    self.ensure_upper_blob(box_id, rowid, &rel);
+                    OpenOptions::new().write(true).open(blob_path(box_id, rowid)).ok()
+                }
+                Layer::Lower => self.copy_up(&b, &rel, pid).ok(),
+                _ => None,
+            }
+            .ok_or(Errno::EIO)?;
+            file.set_len(size).map_err(Errno::from)?;
+        }
+        if let Some(mode) = request.mode {
+            let permissions = mode & 0o7777;
+            let writer = b.writer_for(pid);
+            match self.layer(&b, &rel) {
+                Layer::UpperFile { .. } => b.set_mode(&rel, libc::S_IFREG | permissions),
+                Layer::UpperDir { .. } => b.set_mode(&rel, libc::S_IFDIR | permissions),
+                Layer::UpperSymlink { .. } => {}
+                Layer::Lower if self.host(&rel).is_dir() => b.set_dir(&rel, permissions, writer),
+                Layer::Lower => {
+                    self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
+                    b.set_mode(&rel, libc::S_IFREG | permissions);
+                }
+                Layer::Absent => return Err(Errno::ENOENT),
+                Layer::UpperSpecial { mode, .. } => b.set_mode(&rel, (mode & libc::S_IFMT) | permissions),
+                Layer::ExtFile { .. } => return Err(Errno::EROFS),
+            }
+        }
+        if request.uid.is_some() || request.gid.is_some() {
+            let current = b.owner_of(&rel).unwrap_or((0, 0));
+            let uid = request.uid.unwrap_or(current.0);
+            let gid = request.gid.unwrap_or(current.1);
+            if matches!(self.layer(&b, &rel), Layer::Lower) && !self.host(&rel).is_dir() {
+                self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
+            }
+            if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
+                self.ensure_upper_blob(box_id, rowid, &rel);
+                let path = CString::new(blob_path(box_id, rowid).as_os_str().as_encoded_bytes())
+                    .map_err(|_| Errno::EINVAL)?;
+                if unsafe { libc::lchown(path.as_ptr(), uid, gid) } != 0 {
+                    return Err(Errno::from(std::io::Error::last_os_error()));
+                }
+            } else if matches!(self.layer(&b, &rel), Layer::Absent) {
+                return Err(Errno::ENOENT);
+            }
+            b.set_owner(&rel, uid, gid);
+        }
+        if let Some(mtime) = request.mtime {
+            if matches!(self.layer(&b, &rel), Layer::Lower) && !self.host(&rel).is_dir() {
+                self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
+            }
+            let nanos = mtime
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as i64)
+                .unwrap_or(0);
+            b.set_mtime(&rel, nanos);
+            if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
+                self.ensure_upper_blob(box_id, rowid, &rel);
+                OpenOptions::new()
+                    .write(true)
+                    .open(blob_path(box_id, rowid))
+                    .map_err(Errno::from)?
+                    .set_modified(mtime)
+                    .map_err(Errno::from)?;
+            }
+        }
+        self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)
+    }
+
     fn read_file_node(&self, handle: u64) -> Result<File, Errno> {
         self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
         let handles = self.inner.fhs.read().unwrap();
@@ -2753,160 +2893,17 @@ impl Filesystem for SarunFs {
                _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>,
                _bkuptime: Option<SystemTime>, _flags: Option<fuser::BsdFileFlags>,
                reply: ReplyAttr) {
-        let Some((bid, rel)) = self.key_of(ino) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let Some(b) = self.box_of(bid) else { return reply.error(Errno::ENOENT) };
-        if self.ro_denied(bid, &rel) {
-            return reply.error(Errno::EROFS); // RO attachment matches (§8)
-        }
-        // HOST-DIRECT (passthrough file rule, or -d direct): metadata ops hit the
-        // REAL host file, never copy-up/capture — mirroring the host-direct
-        // read/write path. This is the fix for the O_TRUNC bug: the kernel
-        // delivers `> file`'s truncate as setattr(size=0); routing it through
-        // copy_up captured a spurious row AND left the host file's tail intact
-        // (the write went host-direct, the truncate went to a blob). Truncate
-        // propagates the real errno; chmod/chown/utimes are best-effort.
-        if b.direct() || self.is_passthrough(&rel, bid, req.pid()) {
-            let host = self.host(&rel);
-            let cpath = std::ffi::CString::new(host.as_os_str().as_encoded_bytes());
-            if let Some(sz) = size {
-                match OpenOptions::new().write(true).open(&host) {
-                    Ok(f) => if let Err(e) = f.set_len(sz) {
-                        return reply.error(Errno::from(e));
-                    },
-                    Err(e) => return reply.error(Errno::from(e)),
-                }
-            }
-            if let (Some(m), Ok(c)) = (mode, &cpath) {
-                unsafe { libc::chmod(c.as_ptr(), (m & 0o7777) as libc::mode_t); }
-            }
-            if (uid.is_some() || gid.is_some()) && cpath.is_ok() {
-                let c = cpath.as_ref().unwrap();
-                // uid_t (-1) == no change.
-                unsafe { libc::lchown(c.as_ptr(), uid.unwrap_or(u32::MAX),
-                                      gid.unwrap_or(u32::MAX)); }
-            }
-            if let (Some(t), Ok(c)) = (mtime, &cpath) {
-                let st = match t {
-                    TimeOrNow::SpecificTime(s) => s,
-                    TimeOrNow::Now => SystemTime::now(),
-                };
-                let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
-                let ts = libc::timespec { tv_sec: d.as_secs() as _,
-                                          tv_nsec: d.subsec_nanos() as i64 };
-                let times = [ts, ts];
-                unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(),
-                                         times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW); }
-            }
-            return match self.attr_of(&b, u64::from(ino), &rel) {
-                Some(a) => reply.attr(&TTL, &a),
-                None => reply.error(Errno::ENOENT),
-            };
-        }
-        if let Some(sz) = size {
-            // truncate: a write — copy-up if still lower, then set_len.
-            let f = match self.layer(&b, &rel) {
-                Layer::UpperFile { rowid, .. } => {
-                    // Materialize an inline (discard-reverted) row first, so
-                    // `> file` (delivered as setattr size=0) onto such a row
-                    // doesn't EIO. See ensure_upper_blob.
-                    self.ensure_upper_blob(bid, rowid, &rel);
-                    OpenOptions::new().write(true).open(blob_path(bid, rowid)).ok()
-                }
-                Layer::Lower => self.copy_up(&b, &rel, req.pid()).ok(),
-                _ => None,
-            };
-            let Some(f) = f else { return reply.error(Errno::EIO) };
-            // Propagate the REAL kernel errno (EFBIG/EINVAL on an over-large
-            // truncate, etc.) — not a blanket EIO that hides it.
-            if let Err(e) = f.set_len(sz) {
-                return reply.error(Errno::from(e));
-            }
-        }
-        if let Some(m) = mode {
-            // chmod: the row's mode is the truth (blob perms are an artifact).
-            // Files and dirs both; a still-lower target is copied up / captured
-            // first so the mode change has a row to live on.
-            let perm = m & 0o7777;
-            let writer = b.writer_for(req.pid());
-            match self.layer(&b, &rel) {
-                Layer::UpperFile { .. } => b.set_mode(&rel, 0o100000 | perm),
-                Layer::UpperDir { .. } => b.set_mode(&rel, 0o040000 | perm),
-                Layer::UpperSymlink { .. } => {}   // symlink mode is ignored
-                Layer::Lower => {
-                    if self.host(&rel).is_dir() {
-                        b.set_dir(&rel, perm, writer);
-                    } else if self.copy_up(&b, &rel, req.pid()).is_ok() {
-                        b.set_mode(&rel, 0o100000 | perm);
-                    }
-                }
-                Layer::Absent => {}
-                Layer::UpperSpecial { .. } => {}
-                Layer::ExtFile { .. } => {}  // layer() never yields it
-            }
-        }
-        // chown: a regular file does a REAL chown on its backing blob and
-        // propagates the errno — the non-root engine rejecting chown-to-others
-        // with EPERM is the box's actual single-uid reality (matches the Python
-        // engine's os.chown-on-backing, and the pjdfstest permission matrices).
-        // A dir/symlink chown is an accepted no-op (no backing file to own).
-        // The side table still records the request for apply-time restoration.
-        if uid.is_some() || gid.is_some() {
-            let cur = b.owner_of(&rel).unwrap_or((u32::MAX, u32::MAX));
-            let nu = uid.unwrap_or(if cur.0 == u32::MAX { 0 } else { cur.0 });
-            let ng = gid.unwrap_or(if cur.1 == u32::MAX { 0 } else { cur.1 });
-            match self.layer(&b, &rel) {
-                Layer::Absent => return reply.error(Errno::ENOENT),
-                Layer::UpperDir { .. } | Layer::UpperSymlink { .. }
-                | Layer::UpperSpecial { .. } => b.set_owner(&rel, nu, ng),
-                Layer::Lower if self.host(&rel).is_dir() => b.set_owner(&rel, nu, ng),
-                _ => {
-                    // regular file: copy up, then real lchown on the blob.
-                    if matches!(self.layer(&b, &rel), Layer::Lower)
-                        && self.copy_up(&b, &rel, req.pid()).is_err() {
-                        return reply.error(Errno::EIO);
-                    }
-                    if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
-                        // Materialize an inline (discard-reverted) row so the
-                        // blob exists for lchown. See ensure_upper_blob.
-                        self.ensure_upper_blob(bid, rowid, &rel);
-                        let c = std::ffi::CString::new(
-                            blob_path(bid, rowid).as_os_str().as_encoded_bytes()).unwrap();
-                        let r = unsafe { libc::lchown(c.as_ptr(), nu, ng) };
-                        if r != 0 {
-                            return reply.error(Errno::from(
-                                std::io::Error::last_os_error()));
-                        }
-                    }
-                    b.set_owner(&rel, nu, ng);
-                }
-            }
-        }
-        // utimes: record mtime. A file's getattr reads its BLOB's metadata, so
-        // set the blob's mtime too; dirs/symlinks read the row, so set_mtime.
-        if let Some(t) = mtime {
-            let st = match t {
-                TimeOrNow::SpecificTime(s) => s,
-                TimeOrNow::Now => SystemTime::now(),
-            };
-            let ns = st.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-            if matches!(self.layer(&b, &rel), Layer::Lower)
-                && !self.host(&rel).is_dir() {
-                let _ = self.copy_up(&b, &rel, req.pid());
-            }
-            b.set_mtime(&rel, ns);
-            if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
-                if let Ok(f) = OpenOptions::new().write(true)
-                    .open(blob_path(bid, rowid)) {
-                    let _ = f.set_modified(st);
-                }
-            }
-        }
-        match self.attr_of(&b, u64::from(ino), &rel) {
-            Some(a) => reply.attr(&TTL, &a),
-            None => reply.error(Errno::ENOENT),
+        let mtime = mtime.map(|time| match time {
+            TimeOrNow::SpecificTime(time) => time,
+            TimeOrNow::Now => SystemTime::now(),
+        });
+        match self.setattr_node(
+            req.pid(),
+            u64::from(ino),
+            NodeSetattr { mode, uid, gid, size, mtime },
+        ) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -3169,6 +3166,45 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
     ) -> std::io::Result<(virtiofsd::fuse::Attr, Duration)> {
         let attr = self.getattr_node(inode).map_err(virtio_error)?;
         Ok((crate::sarunfs::virtio_attr(attr), TTL))
+    }
+
+    fn setattr(
+        &self,
+        ctx: virtiofsd::filesystem::Context,
+        inode: u64,
+        attr: virtiofsd::fuse::SetattrIn,
+        _handle: Option<u64>,
+        valid: virtiofsd::filesystem::SetattrValid,
+    ) -> std::io::Result<(virtiofsd::fuse::Attr, Duration)> {
+        let mtime = if valid.contains(virtiofsd::filesystem::SetattrValid::MTIME_NOW) {
+            Some(SystemTime::now())
+        } else if valid.contains(virtiofsd::filesystem::SetattrValid::MTIME) {
+            Some(UNIX_EPOCH + Duration::new(attr.mtime, attr.mtimensec))
+        } else {
+            None
+        };
+        let result = self
+            .setattr_node(
+                ctx.pid as u32,
+                inode,
+                NodeSetattr {
+                    mode: valid
+                        .contains(virtiofsd::filesystem::SetattrValid::MODE)
+                        .then_some(attr.mode),
+                    uid: valid
+                        .contains(virtiofsd::filesystem::SetattrValid::UID)
+                        .then_some(attr.uid.into_inner()),
+                    gid: valid
+                        .contains(virtiofsd::filesystem::SetattrValid::GID)
+                        .then_some(attr.gid.into_inner()),
+                    size: valid
+                        .contains(virtiofsd::filesystem::SetattrValid::SIZE)
+                        .then_some(attr.size),
+                    mtime,
+                },
+            )
+            .map_err(virtio_error)?;
+        Ok((crate::sarunfs::virtio_attr(result), TTL))
     }
 
     fn readlink(
@@ -3975,6 +4011,23 @@ mod chain_tests {
             panic!("fallocate target missing");
         };
         assert_eq!(blob_path(owner, rowid).metadata().unwrap().len(), 4096);
+        let mut setattr = virtiofsd::fuse::SetattrIn::default();
+        setattr.size = 128;
+        setattr.mode = 0o640;
+        let (allocated_attr, _) =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::setattr(
+                &fs,
+                ctx,
+                allocated.inode,
+                setattr,
+                None,
+                virtiofsd::filesystem::SetattrValid::SIZE
+                    | virtiofsd::filesystem::SetattrValid::MODE,
+            )
+            .unwrap();
+        assert_eq!(allocated_attr.size, 128);
+        assert_eq!(allocated_attr.mode & 0o7777, 0o640);
+        assert_eq!(blob_path(owner, rowid).metadata().unwrap().len(), 128);
         let directory_name = CString::new("directory").unwrap();
         let directory = <SarunFs as virtiofsd::filesystem::FileSystem>::mkdir(
             &fs,
