@@ -244,6 +244,7 @@ build_qemu() {
         --disable-download \
         -Dfdt=internal \
         --disable-docs --disable-gtk --disable-sdl --disable-vnc \
+        --disable-linux-aio --disable-linux-io-uring \
         --disable-curl --disable-libssh --disable-rbd --disable-glusterfs)
     say "Building QEMU"
     make -C "$out" -j "$JOBS"
@@ -622,6 +623,7 @@ build_tile_linux_user() {
         "$src/configure" --python="$python" --meson=internal \
         --prefix="$TOOLS/tile-legacy" \
         --target-list=tilegx-linux-user --disable-system --disable-docs \
+        --disable-tools --disable-linux-aio --disable-linux-io-uring \
         --disable-gtk --disable-sdl --disable-vnc)
     make -C "$out" -j "$JOBS"
     make -C "$out" install

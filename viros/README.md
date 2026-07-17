@@ -41,6 +41,8 @@ prerequisites are likewise built from checksum-pinned source archives below
 the work directory, so their development headers need not be installed on the
 runner. The legacy QEMU 5.2 TILE translator is also forced to use this managed
 interpreter with its bundled Meson rather than discovering a host `python3`.
+Both QEMU builds disable the optional Linux AIO and io_uring backends, which
+are unnecessary for this lab and otherwise vary with runner-installed headers.
 
 Target cross compilers do not come from the runner OS either. `download`
 fetches checksum-pinned Bootlin toolchains for x86-64, ARM, AArch64, both MIPS
