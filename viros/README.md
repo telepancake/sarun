@@ -65,6 +65,13 @@ ROUTEROS_VERSION=7.23.2 ./viros.sh extract all
 ROUTEROS_VERSION=7.23.2 ./viros.sh debug ppc-e500-smp
 ```
 
+To use a system NPK already on disk, pass its path explicitly. This bypasses
+the downloaded package lookup without copying or renaming the input:
+
+```sh
+ROUTEROS_NPK=/path/to/routeros-mmips.npk ./viros.sh debug mmips
+```
+
 Useful individual stages and run modes are:
 
 ```sh
@@ -91,6 +98,12 @@ inspect PID 1 and then stop at the extracted `/init` entry. PPC remains stopped
 at the init-exit panic with `-no-shutdown`. Before presenting the prompt GDB runs
 `lx-version`, `lx-ps`, and examines PID 1 with `$lx_task_by_pid(1)`. MikroTik's
 printk changes are not compatible with the stock 5.6.3 `lx-dmesg` helper.
+The workflow prints QEMU's PID, GDB socket, and log paths before starting GDB.
+For MMIPS, the emulated MT7621 UART is routed to
+`artifacts/mmips/debug-console.log`, but MikroTik's published `mmips.config`
+does not enable the Ralink platform console. The file therefore normally
+remains empty during the matching debug-kernel run; MMIPS is controlled and
+inspected through GDB rather than an interactive VM console.
 
 ## Strict status matrix
 

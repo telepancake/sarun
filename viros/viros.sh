@@ -21,6 +21,7 @@ MPFR_SHA256=${MPFR_SHA256:-b67ba0383ef7e8a8563734e2e889ef5ec3c3b898a01d00fa0a686
 TILE_QEMU_VERSION=${TILE_QEMU_VERSION:-5.2.0}
 LINUX_VERSION=${LINUX_VERSION:-5.6.3}
 ROUTEROS_VERSION=${ROUTEROS_VERSION:-latest}
+ROUTEROS_NPK=${ROUTEROS_NPK:-}
 MIKROTIK_GPL_COMMIT=${MIKROTIK_GPL_COMMIT:-c3e110db1d35886c96ee14e16fc5a06bcac59692}
 PPC_TOOLCHAIN_NAME=${PPC_TOOLCHAIN_NAME:-powerpc-e500mc--glibc--bleeding-edge-2020.08-1}
 PPC_TOOLCHAIN_SHA256=${PPC_TOOLCHAIN_SHA256:-8cab4fbb645be782a6eaeb7b6afd75fda4c0dc8ca9a4095b0be9b6eeb29a9759}
@@ -109,8 +110,9 @@ Information:
   list                  Print accepted run targets and their current status
   doctor                Check host prerequisites
 
-Configuration is via QEMU_VERSION, GDB_VERSION, ROUTEROS_VERSION, JOBS,
-DISK_SIZE, and VIROS_WORKDIR.  All output remains inside VIROS_WORKDIR.
+Configuration is via QEMU_VERSION, GDB_VERSION, ROUTEROS_VERSION,
+ROUTEROS_NPK, JOBS, DISK_SIZE, and VIROS_WORKDIR.  All output remains inside
+VIROS_WORKDIR.
 EOF
 }
 
@@ -221,11 +223,19 @@ build_qemu() {
         sed -i -E 's/^(#define KERNEL_LOAD_ADDR)[[:space:]]+0x00010000$/\1 0x00048000/' "$src/hw/arm/boot.c"
         : > "$src/.routeros-arm-load"
     fi
-    if [[ ! -f "$src/.routeros-mips-vm" ]]; then
+    if [[ ! -f "$src/.routeros-mips-vm" ]] ||
+       ! grep -q 'MT7621 exposes its coherence manager' "$src/hw/mips/malta.c"; then
         say "Applying the RouterOS MetaROUTER/MMIPS Malta boot patch"
         patch --batch --forward -d "$src" -p1 < "$SCRIPT_DIR/qemu-mips-routeros.patch" ||
             die "RouterOS MIPS QEMU patch failed"
         : > "$src/.routeros-mips-vm"
+    fi
+    if [[ ! -f "$src/.routeros-mips-debug" ]] ||
+       ! grep -q 'mmu_idx != MMU_KERNEL_IDX' "$src/target/mips/system/physaddr.c"; then
+        say "Adding the RouterOS MIPS debug-memory and console support"
+        patch --batch --forward -d "$src" -p1 < "$SCRIPT_DIR/qemu-mips-debug.patch" ||
+            die "RouterOS MIPS debug QEMU patch failed"
+        : > "$src/.routeros-mips-debug"
     fi
     if [[ ! -f "$src/.routeros-ppc-hypercall" ]]; then
         say "Applying the RouterOS e500 yield compatibility patch"
@@ -690,6 +700,11 @@ routeros_version() {
 
 npk_for_arch() {
     local arch=$1 version suffix candidate
+    if [[ -n "$ROUTEROS_NPK" ]]; then
+        [[ -s "$ROUTEROS_NPK" ]] || die "ROUTEROS_NPK is not a readable non-empty file: $ROUTEROS_NPK"
+        printf '%s\n' "$ROUTEROS_NPK"
+        return
+    fi
     version=$(routeros_version)
     [[ "$arch" == x86 ]] && suffix="" || suffix="-${arch}"
     for candidate in "$DOWNLOADS/routeros-${version}${suffix}.npk" "$WORKDIR/routeros-${version}${suffix}.npk"; do
@@ -905,8 +920,9 @@ run_stage() {
             [[ -x "$qemu" ]] || die "MMIPS requires viros's MT7621-compatible patched QEMU; run download and build"
             exec "$qemu" -M malta -cpu 34Kf -smp 1 -m 256M \
                 -display none -monitor none -serial none -parallel none \
+                -chardev stdio,id=mikrotik-mmips-uart,signal=off \
                 -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd" \
-                -append 'board=750g-mt mem=256M HZ=100000000 init=/init panic=-1' \
+                -append 'board=750g-mt mem=256M HZ=100000000 console=ttyS0,115200 init=/init panic=-1' \
                 -nic none "$@"
             ;;
         ppc-e500-smp)
@@ -1113,8 +1129,9 @@ debug_stage() {
             [[ "$init_entry" =~ ^0x[0-9a-fA-F]+$ ]] || die "invalid MMIPS init entry: $init_entry"
             qemu_args=( -M malta -cpu 34Kf -smp 1 -m 256M
                 -display none -monitor none -serial none -parallel none -nic none
+                -chardev "file,id=mikrotik-mmips-uart,path=$console_log"
                 -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel" -initrd "$initrd"
-                -append 'board=750g-mt mem=256M HZ=100000000 init=/init panic=-1' )
+                -append 'board=750g-mt mem=256M HZ=100000000 console=ttyS0,115200 init=/init panic=-1' )
             ;;
         smips)
             qemu="$TOOLS/qemu/bin/qemu-system-mips"
@@ -1177,23 +1194,23 @@ debug_stage() {
     esac
 
     gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
-        -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
+        -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10'
         -ex "target remote $DEBUG_GDB_SOCKET" )
     if [[ "$target" == mmips ]]; then
         # CPS-backed MIPS starts with a topology refresh that briefly leaves
         # GDB without a selected CLI thread.  Suppress only those connection
         # notifications; breakpoints, registers, and Python helpers are live.
         gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
-            -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10'
             -ex 'set suppress-cli-notifications on' -ex 'set architecture mips'
             -ex "target remote $DEBUG_GDB_SOCKET" -ex 'hbreak start_thread' -ex continue )
     elif [[ "$target" == mipsbe || "$target" == smips ]]; then
         gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
-            -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10' -ex 'set architecture mips'
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10' -ex 'set architecture mips'
             -ex "target remote $DEBUG_GDB_SOCKET" -ex 'hbreak start_thread' -ex continue )
     elif [[ "$target" == x86 ]]; then
         gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
-            -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10' -ex 'set architecture i386:x86-64'
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10' -ex 'set architecture i386:x86-64'
             -ex "target remote $DEBUG_GDB_SOCKET" -ex 'break compat_start_thread' -ex continue )
     fi
     if [[ "$target" == arm || "$target" == arm64 ]]; then
@@ -1211,6 +1228,17 @@ debug_stage() {
         else
             gdb_args+=( -ex "hbreak *$init_entry" -ex continue )
         fi
+    fi
+    say "QEMU PID: $DEBUG_QEMU_PID"
+    say "GDB socket: $DEBUG_GDB_SOCKET"
+    say "VM console log: $console_log"
+    say "QEMU diagnostic log: $qemu_log"
+    if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips ]]; then
+        say "Breakpoint 1: kernel start_thread (prove and inspect PID 1)"
+        say "Breakpoint 2: RouterOS /init ELF entry $init_entry (final prompt)"
+    fi
+    if [[ "$target" == mmips ]]; then
+        say "MMIPS note: the published debug config has no usable serial console; the console log may remain empty"
     fi
     say "Starting exact-symbol GDB for $target; PID 1 must be printed before the prompt"
     set +e

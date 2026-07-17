@@ -1,0 +1,67 @@
+diff --git a/hw/mips/malta.c b/hw/mips/malta.c
+--- a/hw/mips/malta.c
++++ b/hw/mips/malta.c
+@@ -1087,6 +1087,7 @@ void mips_malta_init(MachineState *machine)
+     MemoryRegion *ram_low_postio;
+     MemoryRegion *rb_uart = g_new(MemoryRegion, 1);
+     MemoryRegion *mmips_uart = g_new(MemoryRegion, 1);
++    Chardev *mmips_chr;
+     MemoryRegion *bios, *bios_copy = g_new(MemoryRegion, 1);
+     const size_t smbus_eeprom_size = 8 * 256;
+     uint8_t *smbus_eeprom_buf = g_malloc0(smbus_eeprom_size);
+@@ -1129,13 +1130,18 @@ void mips_malta_init(MachineState *machine)
+     stl_be_p(memory_region_get_ram_ptr(rb_uart), 0x200);
+-
++
+     /* MMIPS uses the MT7621 UART at 0x1e000c00.  It overlaps Malta's
+-     * pflash window, so place a small polling-compatible register page
+-     * above it.  LSR bits 5 and 6 keep early printk from stalling. */
+-    memory_region_init_ram(mmips_uart, NULL, "mikrotik.mmips-uart", 0x1000,
+-                           &error_fatal);
++     * pflash window.  Put a 16550-compatible UART in a higher-priority
++     * container: its register stride gives the expected LSR at 0x14 and
++     * lets the debug harness capture both early printk and tty output. */
++    mmips_chr = qemu_chr_find("mikrotik-mmips-uart");
++    if (!mmips_chr) {
++        mmips_chr = qemu_chr_new("mikrotik-mmips-uart", "null", NULL);
++    }
++    memory_region_init(mmips_uart, NULL, "mikrotik.mmips-uart", 0x1000);
++    serial_mm_init(mmips_uart, 0, 2, cbus_irq, 115200, mmips_chr,
++                   DEVICE_LITTLE_ENDIAN);
+     memory_region_add_subregion_overlap(system_memory, 0x1e000c00,
+                                         mmips_uart, 10);
+-    *((uint8_t *)memory_region_get_ram_ptr(mmips_uart) + 0x14) = 0x60;
+-
++
+     /* alias for post IO hole access, if there is enough RAM */
+     if (ram_size > 512 * MiB) {
+diff --git a/target/mips/system/physaddr.c b/target/mips/system/physaddr.c
+--- a/target/mips/system/physaddr.c
++++ b/target/mips/system/physaddr.c
+@@ -231,11 +231,22 @@ hwaddr mips_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
+ {
+     CPUMIPSState *env = cpu_env(cs);
+     hwaddr phys_addr;
+     int prot;
++    int mmu_idx = mips_env_mmu_index(env);
+-
++
++    /* First preserve normal access to the current process. */
+     if (get_physical_address(env, &phys_addr, &prot, addr, MMU_DATA_LOAD,
+-                             mips_env_mmu_index(env)) != 0) {
+-        return -1;
++                             mmu_idx) == 0) {
++        return phys_addr;
+     }
+-    return phys_addr;
++
++    /* A debugger must also retain access to kernel symbols after Linux enters
++     * a user task.  Keep the active TLB/ASID and retry with kernel privilege
++     * so helpers such as lx-ps can read kseg0. */
++    if (mmu_idx != MMU_KERNEL_IDX &&
++        get_physical_address(env, &phys_addr, &prot, addr, MMU_DATA_LOAD,
++                             MMU_KERNEL_IDX) == 0) {
++        return phys_addr;
++    }
++    return -1;
+ }
