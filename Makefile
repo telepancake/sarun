@@ -163,6 +163,11 @@ bench-backends: ## Compare live backend filesystem workloads (set SARUN_BENCH_RO
 	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python benchmark_backends.py
 
+.PHONY: test-backend-workloads
+test-backend-workloads: ## Strict real-tool matrix across every locally runnable backend
+	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	  python test_backend_workloads.py
+
 # ---- Housekeeping ---------------------------------------------------------
 
 .PHONY: clean

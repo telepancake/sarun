@@ -251,6 +251,19 @@ as executable mappings and mmap that genuinely need a host fd.
         embedded Kati and n2, capture identical results, and leave the lower
         host project untouched; native SUD joins the same test automatically
         on an x86 Syscall User Dispatch host.
+  - [x] Add strict `make test-backend-workloads`: missing tools and failed
+        operations are errors, never green skips. Separate attributable boxes
+        run Git commits/object storage, SQLite WAL transactions, Cargo/rustc,
+        parallel GNU Make/GCC, parallel Ninja/GCC, Autoconf/configure,
+        CMake/Ninja, tar extraction/symlinks, and newly built executables.
+        FUSE and aarch64 QEMU/TCG produce identical captured results and modes
+        while a recursive lower-tree digest proves no host write. The gate
+        automatically includes native SUD on x86; that final leg remains open.
+  - [x] Preserve request uid/gid when captured files, directories, symlinks,
+        and special nodes are created, and project the stored ownership on
+        subsequent lookup/getattr. The real Git workload exposed synthetic
+        directories appearing as `nobody:nogroup` under unprivileged FUSE;
+        canonical tests now use nontrivial uid/gid for all four node families.
 - [ ] Stress concurrency and forced termination; prove no write escapes to the
       host and no ring waiter remains stuck.
   - [x] Run five consecutive live FUSE/QEMU equivalence rounds with eight
@@ -313,6 +326,9 @@ as executable mappings and mmap that genuinely need a host fd.
   host whose kernel rejects unprivileged user namespaces), with additional
   stale API/baseline cases. Those are recorded work, not treated as backend
   failures or silently converted to green skips.
+- `make test-backend-workloads` passes every strict real-tool stage on both
+  FUSE and aarch64 QEMU/TCG, compares equal backend observations, and proves
+  the caller-writable lower trees remain byte-for-byte and metadata unchanged.
 
 ## Commit gates
 
