@@ -7,6 +7,7 @@
             wire_request/6,
             wire_response/3,
             wire_mode/3,
+            wire_stream/1,
             wire_event/3,
             wire_frame/7,
             valid_wire_type/1,
@@ -169,6 +170,24 @@ wire_type(appliance_command, record([
 ])).
 wire_type(appliance_result, record([
     field(code, exit_code)
+])).
+
+% A nested `run --qemu` does not start QEMU in the guest.  The guest sends this
+% semantic request to its still-live host runner, which launches a second flat
+% appliance through an engine connection authenticated by the outer box
+% channel.  Environment is explicit because the nested caller's guest process
+% context, not the host runner's environment, is inherited by the child.
+wire_type(appliance_run_request, record([
+    field(architecture, qemu_architecture),
+    field(name, option(text(short_bytes))),
+    field(capture_environment, bool),
+    field(no_parent, bool),
+    field(readonly_parent, bool),
+    field(cwd, option(path)),
+    field(net_mode, net_mode),
+    field(brush, bool),
+    field(command, list(os_string, 1, command_items)),
+    field(environment, environment)
 ])).
 
 wire_type(pipeline_stage, choice).
@@ -970,6 +989,14 @@ wire_mode(raw_http,       5, []).
 wire_mode(service_accept, 6, []).
 wire_mode(raw_service,    7, []).
 
+% Frame streams are independent of first-compound connection modes.  Most
+% engine streams share a name with their mode; `appliance` is the generated
+% host-runner <-> guest-PID1 operation stream and is not an engine mode.
+wire_stream(box).
+wire_stream(pty).
+wire_stream(service_accept).
+wire_stream(appliance).
+
 % Subscription events are compact invalidations. Durable provenance, packet,
 % output, and trace records are not copied into the event stream; viewers fetch
 % and relationally decode the visible rows after receiving an identity/count.
@@ -1023,6 +1050,36 @@ wire_frame(box, open_connection, 13, runner_to_engine, [], [], stay).
 wire_frame(box, connection,      14, engine_to_runner, [], [
     fd(connected_socket, required, always)
 ], stay).
+
+% Flat nested-QEMU operation channel.  `stream` identifies one guest caller;
+% it never names an engine socket or a host descriptor.  The host runner owns
+% the real child connection, QEMU process, virtio-fs endpoint, and pidfds.
+wire_frame(appliance, nested_open, 1, guest_to_host, [
+    field(stream, u64),
+    field(request, appliance_run_request)
+], [], stay).
+wire_frame(appliance, nested_input, 2, guest_to_host, [
+    field(stream, u64),
+    field(data, bytes(stream_chunk_bytes))
+], [], stay).
+wire_frame(appliance, nested_input_eof, 3, guest_to_host, [
+    field(stream, u64)
+], [], stay).
+wire_frame(appliance, nested_signal, 4, guest_to_host, [
+    field(stream, u64),
+    field(signal, s32)
+], [], stay).
+wire_frame(appliance, nested_output, 5, host_to_guest, [
+    field(stream, u64),
+    field(data, bytes(stream_chunk_bytes))
+], [], stay).
+wire_frame(appliance, nested_result, 6, host_to_guest, [
+    field(stream, u64),
+    field(code, exit_code)
+], [], stay).
+wire_frame(appliance, result, 7, guest_to_host, [
+    field(code, exit_code)
+], [], close).
 
 wire_frame(pty, data,             7, bidirectional, [
     field(data, bytes(stream_chunk_bytes))
@@ -1219,7 +1276,7 @@ all_events_valid :-
 
 all_frames_valid :-
     \+ (wire_frame(Stream, Name, Code, Direction, Fields, Fds, Transition),
-        ( \+ wire_mode(Stream, _, _)
+        ( \+ wire_stream(Stream)
         ; \+ atom(Name)
         ; \+ (integer(Code), Code > 0)
         ; \+ valid_direction(Direction)
@@ -1234,6 +1291,8 @@ valid_direction(bidirectional).
 valid_direction(client_to_engine).
 valid_direction(engine_to_client).
 valid_direction(engine_to_service).
+valid_direction(guest_to_host).
+valid_direction(host_to_guest).
 
 valid_transition(stay).
 valid_transition(close).

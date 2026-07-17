@@ -199,10 +199,13 @@ as executable mappings and mmap that genuinely need a host fd.
       virtio-serial control, KVM, and TCG support required by sarun.
 - [ ] Replace generic guest/host emulation at remaining Sarun control
       boundaries with the smallest paired QEMU+kernel ABI.  In particular, do
-      not reproduce Unix descriptor passing through a byte-stream mux: define
-      the operations the appliance actually needs and implement them directly
-      in the paired device/kernel boundary, including authenticated nesting
-      and lifecycle ownership.
+      not reproduce Unix descriptor passing through a byte-stream mux.  A
+      `sarun run --qemu` issued inside a QEMU box is a typed request to its
+      still-live host runner.  That runner launches another flat host-side QEMU
+      appliance through a broker-authenticated child engine connection and
+      relays the nested caller's input, output, signals, and result.  It never
+      starts QEMU inside QEMU, and no guest pidfd or host virtio-fs descriptor
+      crosses the appliance boundary.
 - [x] Add the host launcher/vhost-user backend and target `/init` control plane.
   - [x] Embedded vhost-user lifecycle serves a scoped `SarunFs` box root on a
         private per-box engine socket and exits when its frontend disconnects.

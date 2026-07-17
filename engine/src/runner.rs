@@ -55,6 +55,29 @@ fn pidfd_open(pid: i32) -> i32 {
 /// independently interpret `SARUN_BROKER`, because the choice also carries
 /// the engine's parent-attribution boundary.
 pub fn engine_connection() -> std::io::Result<UnixStream> {
+    if let Some(value) = std::env::var_os("SARUN_ENGINE_FD") {
+        // Host-only handoff for a flat nested-QEMU launcher. The outer runner
+        // obtained this already-authenticated connection over its box channel
+        // and inherited it into a short-lived host child. Consume the variable
+        // before constructing the guest environment: neither the integer nor
+        // the descriptor has meaning across the VM boundary.
+        unsafe { std::env::remove_var("SARUN_ENGINE_FD") };
+        let fd = value
+            .to_string_lossy()
+            .parse::<i32>()
+            .map_err(|_| std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid inherited Sarun engine descriptor",
+            ))?;
+        if fd < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "negative inherited Sarun engine descriptor",
+            ));
+        }
+        use std::os::fd::FromRawFd;
+        return Ok(unsafe { UnixStream::from_raw_fd(fd) });
+    }
     match std::env::var("SARUN_BROKER").ok().filter(|value| !value.is_empty()) {
         Some(name) => broker_dial(&name),
         None => UnixStream::connect(paths::sock_path()),
@@ -1824,6 +1847,48 @@ fn recv_box_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32>) -> isize
         }
     }
     n
+}
+
+/// Ask the engine for a fresh connection attributed to the box owning
+/// `channel`. Both the request and returned descriptor remain in the host
+/// outer runner; QEMU guests only see the higher-level nested-run operation.
+pub(crate) fn request_box_connection(channel: &UnixStream) -> std::io::Result<UnixStream> {
+    use std::os::fd::FromRawFd;
+    send_frame(
+        channel.as_raw_fd(),
+        &crate::frames::encode(crate::frames::FRAME_OPEN_CONN, &[]),
+        None,
+    );
+    let mut buffered = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let mut received_fd = None;
+        let count = recv_box_frame_bytes(channel.as_raw_fd(), &mut chunk, &mut received_fd);
+        if count <= 0 {
+            if let Some(fd) = received_fd {
+                unsafe { libc::close(fd) };
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "box channel closed while opening nested engine connection",
+            ));
+        }
+        buffered.extend_from_slice(&chunk[..count as usize]);
+        let (frames, used) = crate::frames::decode(&buffered);
+        for (kind, _) in frames {
+            if kind == crate::frames::FRAME_CONN {
+                let fd = received_fd.take().ok_or_else(|| std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "engine connection frame carried no descriptor",
+                ))?;
+                return Ok(unsafe { UnixStream::from_raw_fd(fd) });
+            }
+        }
+        if let Some(fd) = received_fd {
+            unsafe { libc::close(fd) };
+        }
+        buffered.drain(..used);
+    }
 }
 
 /// Dial the broker via abstract UDS named by SARUN_BROKER; recvmsg the

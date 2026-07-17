@@ -13,7 +13,7 @@
 // source-sha256 engine/pl/grammar_ir.pl 1a2a9a63076618402864e0ac630fca29b91210d54a03687f5be198d94a370d77
 // source-sha256 engine/pl/relation_api.pl e87d850a3cfd6a511e49b00bc7497e0c2790a45cf91aa4aa7b833b4b75364f6c
 // source-sha256 engine/pl/context_relation.pl 6819379ba751c4850e40f3a9d53cab888b9c2b1151283f1eaf479ae84f735473
-// source-sha256 engine/pl/transport_catalog.pl 30094bb08efd98e528c9b723fdc8e4ca85b227eecaed0b988d60c802620bee01
+// source-sha256 engine/pl/transport_catalog.pl 27f794c7686311f557b2b2e696320dff2ae2746ba4f62f4780885896c28cd054
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
 // source-sha256 scripts/wire_codegen.py cebd448fb51f20128aa3ea1f9041cf9c18e7908645e82543efbc5b80af8145fd
 
@@ -196,7 +196,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "673c8977444bf489c40d6f6ab6e2121a94bb8a4df17c3be5964ccdb2d06dada4";
+    "8d76c8675ac6823e40ed77574ad2167e76db53d4696e7294d860b235b2daf8e1";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -904,6 +904,86 @@ impl RelationWireValue for ApplianceResult {
         let mut fields = fields.iter();
         Ok(Self {
             code: <ExitCode as RelationWireValue>::from_relation(fields.next().unwrap())?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApplianceRunRequest {
+    pub architecture: QemuArchitecture,
+    pub name: Option<BoundedText<LIMIT_SHORT_BYTES>>,
+    pub capture_environment: bool,
+    pub no_parent: bool,
+    pub readonly_parent: bool,
+    pub cwd: Option<Path>,
+    pub net_mode: NetMode,
+    pub brush: bool,
+    pub command: BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS>,
+    pub environment: Environment,
+}
+
+impl WireValue for ApplianceRunRequest {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        self.architecture.encode_atom(&mut fields)?;
+        self.name.encode_atom(&mut fields)?;
+        self.capture_environment.encode_atom(&mut fields)?;
+        self.no_parent.encode_atom(&mut fields)?;
+        self.readonly_parent.encode_atom(&mut fields)?;
+        self.cwd.encode_atom(&mut fields)?;
+        self.net_mode.encode_atom(&mut fields)?;
+        self.brush.encode_atom(&mut fields)?;
+        self.command.encode_atom(&mut fields)?;
+        self.environment.encode_atom(&mut fields)?;
+        put_compound_payload(output, &fields)
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = Self {
+            architecture: <QemuArchitecture as WireValue>::decode_atom(&mut fields)?,
+            name: <Option<BoundedText<LIMIT_SHORT_BYTES>> as WireValue>::decode_atom(&mut fields)?,
+            capture_environment: <bool as WireValue>::decode_atom(&mut fields)?,
+            no_parent: <bool as WireValue>::decode_atom(&mut fields)?,
+            readonly_parent: <bool as WireValue>::decode_atom(&mut fields)?,
+            cwd: <Option<Path> as WireValue>::decode_atom(&mut fields)?,
+            net_mode: <NetMode as WireValue>::decode_atom(&mut fields)?,
+            brush: <bool as WireValue>::decode_atom(&mut fields)?,
+            command: <BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS> as WireValue>::decode_atom(
+                &mut fields,
+            )?,
+            environment: <Environment as WireValue>::decode_atom(&mut fields)?,
+        };
+        require_empty(fields)?;
+        Ok(value)
+    }
+}
+
+impl RelationWireValue for ApplianceRunRequest {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        let fields = relation_compound(value, "record")?;
+        require_relation_arity(fields, 10)?;
+        let mut fields = fields.iter();
+        Ok(Self {
+            architecture: <QemuArchitecture as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+            name: <Option<BoundedText<LIMIT_SHORT_BYTES>> as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+            capture_environment: <bool as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+            no_parent: <bool as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            readonly_parent: <bool as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            cwd: <Option<Path> as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            net_mode: <NetMode as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            brush: <bool as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            command:
+                <BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS> as RelationWireValue>::from_relation(
+                    fields.next().unwrap(),
+                )?,
+            environment: <Environment as RelationWireValue>::from_relation(fields.next().unwrap())?,
         })
     }
 }
@@ -12430,6 +12510,204 @@ impl RelationWireValue for BoxFrame {
     }
 }
 
+pub const APPLIANCE_FRAME_IDENTITIES: &[(&str, u64)] = &[
+    ("nested_open", 1),
+    ("nested_input", 2),
+    ("nested_input_eof", 3),
+    ("nested_signal", 4),
+    ("nested_output", 5),
+    ("nested_result", 6),
+    ("result", 7),
+];
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ApplianceFrame {
+    NestedOpen {
+        stream: u64,
+        request: ApplianceRunRequest,
+    },
+    NestedInput {
+        stream: u64,
+        data: BoundedBytes<LIMIT_STREAM_CHUNK_BYTES>,
+    },
+    NestedInputEof {
+        stream: u64,
+    },
+    NestedSignal {
+        stream: u64,
+        signal: i32,
+    },
+    NestedOutput {
+        stream: u64,
+        data: BoundedBytes<LIMIT_STREAM_CHUNK_BYTES>,
+    },
+    NestedResult {
+        stream: u64,
+        code: ExitCode,
+    },
+    Result {
+        code: ExitCode,
+    },
+}
+
+impl ApplianceFrame {
+    pub const fn code(&self) -> u64 {
+        match self {
+            Self::NestedOpen { .. } => 1,
+            Self::NestedInput { .. } => 2,
+            Self::NestedInputEof { .. } => 3,
+            Self::NestedSignal { .. } => 4,
+            Self::NestedOutput { .. } => 5,
+            Self::NestedResult { .. } => 6,
+            Self::Result { .. } => 7,
+        }
+    }
+}
+
+impl WireValue for ApplianceFrame {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        put_u64(&mut fields, self.code());
+        match self {
+            Self::NestedOpen { stream, request } => {
+                stream.encode_atom(&mut fields)?;
+                request.encode_atom(&mut fields)?;
+            }
+            Self::NestedInput { stream, data } => {
+                stream.encode_atom(&mut fields)?;
+                data.encode_atom(&mut fields)?;
+            }
+            Self::NestedInputEof { stream } => {
+                stream.encode_atom(&mut fields)?;
+            }
+            Self::NestedSignal { stream, signal } => {
+                stream.encode_atom(&mut fields)?;
+                signal.encode_atom(&mut fields)?;
+            }
+            Self::NestedOutput { stream, data } => {
+                stream.encode_atom(&mut fields)?;
+                data.encode_atom(&mut fields)?;
+            }
+            Self::NestedResult { stream, code } => {
+                stream.encode_atom(&mut fields)?;
+                code.encode_atom(&mut fields)?;
+            }
+            Self::Result { code } => {
+                code.encode_atom(&mut fields)?;
+            }
+        }
+        put_compound_payload(output, &fields)
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = match get_u64(&mut fields)? {
+            1 => Self::NestedOpen {
+                stream: <u64 as WireValue>::decode_atom(&mut fields)?,
+                request: <ApplianceRunRequest as WireValue>::decode_atom(&mut fields)?,
+            },
+            2 => Self::NestedInput {
+                stream: <u64 as WireValue>::decode_atom(&mut fields)?,
+                data: <BoundedBytes<LIMIT_STREAM_CHUNK_BYTES> as WireValue>::decode_atom(
+                    &mut fields,
+                )?,
+            },
+            3 => Self::NestedInputEof {
+                stream: <u64 as WireValue>::decode_atom(&mut fields)?,
+            },
+            4 => Self::NestedSignal {
+                stream: <u64 as WireValue>::decode_atom(&mut fields)?,
+                signal: <i32 as WireValue>::decode_atom(&mut fields)?,
+            },
+            5 => Self::NestedOutput {
+                stream: <u64 as WireValue>::decode_atom(&mut fields)?,
+                data: <BoundedBytes<LIMIT_STREAM_CHUNK_BYTES> as WireValue>::decode_atom(
+                    &mut fields,
+                )?,
+            },
+            6 => Self::NestedResult {
+                stream: <u64 as WireValue>::decode_atom(&mut fields)?,
+                code: <ExitCode as WireValue>::decode_atom(&mut fields)?,
+            },
+            7 => Self::Result {
+                code: <ExitCode as WireValue>::decode_atom(&mut fields)?,
+            },
+            _ => return Err(DecodeError::InvalidValue),
+        };
+        require_empty(fields)?;
+        Ok(value)
+    }
+}
+
+impl RelationWireValue for ApplianceFrame {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        let (case, fields): (&str, &[RelationValue]) = match value {
+            RelationValue::Atom(case) => (case, &[]),
+            RelationValue::Compound(case, fields) => (case, fields),
+            _ => return Err("expected ApplianceFrame relation choice".into()),
+        };
+        match case {
+            "nested_open" => {
+                require_relation_arity(fields, 2)?;
+                let mut fields = fields.iter();
+                Ok(Self::NestedOpen {
+                    stream: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    request: <ApplianceRunRequest as RelationWireValue>::from_relation(
+                        fields.next().unwrap(),
+                    )?,
+                })
+            }
+            "nested_input" => {
+                require_relation_arity(fields, 2)?;
+                let mut fields = fields.iter();
+                Ok(Self::NestedInput {
+                    stream: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    data: <BoundedBytes<LIMIT_STREAM_CHUNK_BYTES> as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                })
+            }
+            "nested_input_eof" => {
+                require_relation_arity(fields, 1)?;
+                let mut fields = fields.iter();
+                Ok(Self::NestedInputEof {
+                    stream: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                })
+            }
+            "nested_signal" => {
+                require_relation_arity(fields, 2)?;
+                let mut fields = fields.iter();
+                Ok(Self::NestedSignal {
+                    stream: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    signal: <i32 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                })
+            }
+            "nested_output" => {
+                require_relation_arity(fields, 2)?;
+                let mut fields = fields.iter();
+                Ok(Self::NestedOutput {
+                    stream: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    data: <BoundedBytes<LIMIT_STREAM_CHUNK_BYTES> as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                })
+            }
+            "nested_result" => {
+                require_relation_arity(fields, 2)?;
+                let mut fields = fields.iter();
+                Ok(Self::NestedResult {
+                    stream: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    code: <ExitCode as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                })
+            }
+            "result" => {
+                require_relation_arity(fields, 1)?;
+                let mut fields = fields.iter();
+                Ok(Self::Result {
+                    code: <ExitCode as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                })
+            }
+            _ => Err(format!("unknown ApplianceFrame relation choice {case}")),
+        }
+    }
+}
+
 pub const PTY_FRAME_IDENTITIES: &[(&str, u64)] = &[("data", 7), ("resize", 8), ("eof", 9)];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -12670,6 +12948,18 @@ mod generated_tests {
             net_mode: NetMode::Off,
         });
         roundtrip::<ApplianceResult>(ApplianceResult { code: 0i32 });
+        roundtrip::<ApplianceRunRequest>(ApplianceRunRequest {
+            architecture: QemuArchitecture::Aarch64,
+            name: None,
+            capture_environment: false,
+            no_parent: false,
+            readonly_parent: false,
+            cwd: None,
+            net_mode: NetMode::Off,
+            brush: false,
+            command: BoundedVec::new(vec![BoundedBytes::new(Vec::new()).unwrap()]).unwrap(),
+            environment: BoundedMap::new(BTreeMap::new()).unwrap(),
+        });
         roundtrip(PipelineStage::Simple {
             words: BoundedVec::new(vec![]).unwrap(),
             redirects: 0u32,
@@ -14228,6 +14518,50 @@ mod generated_tests {
     }
 
     #[test]
+    fn every_appliance_frame_variant_roundtrips_with_its_relational_identity() {
+        let values = vec![
+            ApplianceFrame::NestedOpen {
+                stream: 0u64,
+                request: ApplianceRunRequest {
+                    architecture: QemuArchitecture::Aarch64,
+                    name: None,
+                    capture_environment: false,
+                    no_parent: false,
+                    readonly_parent: false,
+                    cwd: None,
+                    net_mode: NetMode::Off,
+                    brush: false,
+                    command: BoundedVec::new(vec![BoundedBytes::new(Vec::new()).unwrap()]).unwrap(),
+                    environment: BoundedMap::new(BTreeMap::new()).unwrap(),
+                },
+            },
+            ApplianceFrame::NestedInput {
+                stream: 0u64,
+                data: BoundedBytes::new(Vec::new()).unwrap(),
+            },
+            ApplianceFrame::NestedInputEof { stream: 0u64 },
+            ApplianceFrame::NestedSignal {
+                stream: 0u64,
+                signal: 0i32,
+            },
+            ApplianceFrame::NestedOutput {
+                stream: 0u64,
+                data: BoundedBytes::new(Vec::new()).unwrap(),
+            },
+            ApplianceFrame::NestedResult {
+                stream: 0u64,
+                code: 0i32,
+            },
+            ApplianceFrame::Result { code: 0i32 },
+        ];
+        assert_eq!(values.len(), APPLIANCE_FRAME_IDENTITIES.len());
+        for (value, (name, code)) in values.into_iter().zip(APPLIANCE_FRAME_IDENTITIES) {
+            assert_eq!(value.code(), *code, "{name}");
+            roundtrip(value);
+        }
+    }
+
+    #[test]
     fn every_pty_frame_variant_roundtrips_with_its_relational_identity() {
         let values = vec![
             PtyFrame::Data {
@@ -14380,6 +14714,22 @@ mod generated_tests {
                 .collect::<BTreeSet<_>>()
                 .len(),
             BOX_FRAME_IDENTITIES.len()
+        );
+        assert_eq!(
+            APPLIANCE_FRAME_IDENTITIES
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            APPLIANCE_FRAME_IDENTITIES.len()
+        );
+        assert_eq!(
+            APPLIANCE_FRAME_IDENTITIES
+                .iter()
+                .map(|(_, code)| *code)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            APPLIANCE_FRAME_IDENTITIES.len()
         );
         assert_eq!(
             PTY_FRAME_IDENTITIES

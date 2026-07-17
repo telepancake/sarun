@@ -1416,12 +1416,37 @@ fn handle_binary_registration(
     if !channel_ready {
         stop_live_transports(&state, id);
     } else {
-        let mut bytes = [0u8; 256];
+        let mut bytes = [0u8; 4096];
+        let mut frames = Vec::new();
         loop {
             match std::io::Read::read(&mut conn, &mut bytes) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {}
+                Ok(count) => frames.extend_from_slice(&bytes[..count]),
             }
+            let (decoded, used) = crate::frames::decode(&frames);
+            for (kind, _) in decoded {
+                if kind != crate::frames::FRAME_OPEN_CONN {
+                    continue;
+                }
+                // The QEMU runner stays on the host for the entire appliance
+                // lifetime. A guest nested-run operation asks this runner for
+                // another authenticated engine connection; the descriptor is
+                // delivered only to that host runner and never crosses into
+                // the guest.
+                let Ok((server_side, runner_side)) = UnixStream::pair() else {
+                    continue;
+                };
+                let handler_state = state.clone();
+                std::thread::spawn(move || {
+                    handle_guarded(handler_state, server_side, Some(id))
+                });
+                let _ = send_stream_with_fd(
+                    &conn,
+                    &crate::frames::encode(crate::frames::FRAME_CONN, &[]),
+                    runner_side.as_raw_fd(),
+                );
+            }
+            frames.drain(..used);
         }
     }
 
