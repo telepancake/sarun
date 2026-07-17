@@ -75,6 +75,10 @@ pub fn engine_connection() -> std::io::Result<UnixStream> {
                 "negative inherited Sarun engine descriptor",
             ));
         }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
         use std::os::fd::FromRawFd;
         return Ok(unsafe { UnixStream::from_raw_fd(fd) });
     }
@@ -780,7 +784,49 @@ pub fn run_qemu(
         eprintln!("sarun-engine run --qemu: needs a command");
         return 2;
     }
-    let in_box = std::env::var("SARUN_BROKER").is_ok_and(|value| !value.is_empty());
+    if let Some(broker) = std::env::var("SARUN_APPLIANCE_BROKER")
+        .ok().filter(|value| !value.is_empty())
+    {
+        let request = match crate::appliance::wire_nested_request(
+            architecture,
+            name,
+            env,
+            no_parent,
+            readonly_parent,
+            chdir,
+            net_mode,
+            brush,
+            cmd,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("sarun-engine run --qemu: {error}");
+                return 2;
+            }
+        };
+        return match crate::appliance::nested_run(request, &broker) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("sarun-engine run --qemu: appliance relay: {error}");
+                1
+            }
+        };
+    }
+    let inherited_parent = std::env::var_os("SARUN_ENGINE_PARENT").is_some();
+    if inherited_parent {
+        unsafe { std::env::remove_var("SARUN_ENGINE_PARENT") };
+    }
+    let in_box = inherited_parent
+        || std::env::var("SARUN_BROKER").is_ok_and(|value| !value.is_empty());
+    // Consume a host-inherited nested connection before `wire_command`
+    // snapshots the environment for the guest.
+    let conn = match engine_connection() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("sarun-engine: no engine running: {error}");
+            return 3;
+        }
+    };
     let guest_cmd = if brush {
         brush_cmd("/init", &cmd)
     } else {
@@ -872,13 +918,6 @@ pub fn run_qemu(
         eprintln!("sarun-engine run --qemu: encode registration: {error}");
         return 1;
     }
-    let conn = match engine_connection() {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("sarun-engine: no engine running: {error}");
-            return 3;
-        }
-    };
     let pidfd = pidfd_open(std::process::id() as i32);
     if !send_register_fds(
         &conn,
@@ -946,6 +985,13 @@ pub fn run_qemu(
         virtiofs,
         &appliance_command,
         qemu_network,
+        match conn.try_clone() {
+            Ok(channel) => channel,
+            Err(error) => {
+                eprintln!("sarun-engine run --qemu: clone box channel: {error}");
+                return 1;
+            }
+        },
     ) {
         Ok(code) => code,
         Err(error) => {

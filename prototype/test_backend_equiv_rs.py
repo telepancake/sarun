@@ -480,6 +480,77 @@ def run_nested_qemu():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def run_qemu_inside_qemu():
+    """A guest request launches a flat sibling QEMU through its host runner."""
+    root = Path(tempfile.mkdtemp(prefix="sarun-equiv-qemu-flat-nested-", dir="/var/tmp"))
+    work = root / "lower"
+    work.mkdir()
+    env = dict(os.environ)
+    for key, name in (
+        ("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
+        ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+    ):
+        directory = root / name
+        directory.mkdir()
+        env[key] = str(directory)
+    env["SLOPBOX_NS"] = "EQUIVQEMUFLATNESTED"
+    old = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
+    module = SourceFileLoader(
+        "slopbox_qemu_flat_nested", str(LIBTESTSARUN)
+    ).load_module()
+    module.ensure_dirs()
+    engine = subprocess.Popen(
+        [str(ENGINE_BIN), "serve"], env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        if not wait_socket(module.sock_path()):
+            raise RuntimeError("engine socket never appeared")
+        nested = (
+            '"$SARUN_EXE" run --net off --qemu '
+            f'{HOST_ARCH} INNER -C "$PWD" -- sh -c '
+            "'printf FLAT-NESTED > flat-nested-result; printf flat-nested-ok'"
+        )
+        result = subprocess.run(
+            [str(ENGINE_BIN), "run", "--net", "off", "--qemu", HOST_ARCH,
+             "OUTER", "-C", str(work), "--", "sh", "-c", nested],
+            env=env, capture_output=True, timeout=480,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"rc={result.returncode}; stdout={result.stdout[-600:]!r}; "
+                f"stderr={result.stderr[-800:]!r}"
+            )
+        store = Path(env["XDG_STATE_HOME"]) / f"slopbox.{env['SLOPBOX_NS']}"
+        archives = sorted(store.glob("*.sqlar"), key=lambda path: int(path.stem))
+        if len(archives) != 2:
+            raise RuntimeError(f"expected outer and inner archives, got {archives}")
+        outer, inner = archives
+        return {
+            "exit_output": b"flat-nested-ok" in result.stdout,
+            "outer_name": module.sqlar_meta_get(outer, "name"),
+            "inner_name": module.sqlar_meta_get(inner, "name"),
+            "inner_parent": module.sqlar_meta_get(inner, "parent_box_id"),
+            "outer_id": outer.stem,
+            "inner_result": module.sqlar_content(
+                inner, str(work / "flat-nested-result").lstrip("/")
+            ),
+            "host_unchanged": not (work / "flat-nested-result").exists(),
+        }
+    finally:
+        engine.terminate()
+        try:
+            engine.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            engine.kill()
+            engine.wait(timeout=5)
+        os.environ.clear()
+        os.environ.update(old)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def run_qemu_lifecycle():
     root = Path(tempfile.mkdtemp(prefix="sarun-equiv-qemu-life-", dir="/var/tmp"))
     work = root / "lower"
@@ -686,6 +757,22 @@ def main():
                   "nested qemu: child write captured in child archive")
             check(nested["host_unchanged"],
                   "nested qemu: child write did not escape to host")
+        try:
+            flat_nested = run_qemu_inside_qemu()
+        except Exception as error:
+            check(False, f"qemu inside qemu: flat sibling launch completed ({error})")
+        else:
+            check(flat_nested["exit_output"],
+                  "qemu inside qemu: child output returned to guest caller")
+            check(flat_nested["outer_name"] == "OUTER"
+                  and flat_nested["inner_name"] == "INNER",
+                  "qemu inside qemu: relative names retained")
+            check(flat_nested["inner_parent"] == flat_nested["outer_id"],
+                  "qemu inside qemu: authenticated logical parent recorded")
+            check(flat_nested["inner_result"] == b"FLAT-NESTED",
+                  "qemu inside qemu: sibling appliance captured its own write")
+            check(flat_nested["host_unchanged"],
+                  "qemu inside qemu: sibling write did not escape to host")
         try:
             lifecycle = run_qemu_lifecycle()
         except Exception as error:

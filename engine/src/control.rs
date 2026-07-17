@@ -1337,6 +1337,7 @@ fn handle_binary_registration(
     fd3: Option<std::os::fd::OwnedFd>,
     fd4: Option<std::os::fd::OwnedFd>,
     fd5: Option<std::os::fd::OwnedFd>,
+    authenticated_parent: Option<i64>,
 ) {
     use crate::generated_wire::{ConnectionMode, RequestEnvelope, RunBackend, TransportRequest};
     let request = match crate::socket_wire::read_request(&mut conn) {
@@ -1367,6 +1368,7 @@ fn handle_binary_registration(
         fd3.map(std::os::fd::IntoRawFd::into_raw_fd),
         fd4.map(std::os::fd::IntoRawFd::into_raw_fd),
         fd5.map(std::os::fd::IntoRawFd::into_raw_fd),
+        authenticated_parent,
     );
     let registration = match result {
         Ok(registration) => registration,
@@ -1476,7 +1478,7 @@ fn dispatch(state: &State, msg: &Value) -> Value {
         "subscribe" => json!({"ok": true, "_subscribe": true}),
         "register" => match legacy_register_request(msg) {
             Ok(request) => legacy_register_reply(register(
-                state, &request, None, None, None, None, None)),
+                state, &request, None, None, None, None, None, None)),
             Err(error) => json!({"ok": false, "error": error}),
         },
         "select" => {
@@ -4274,6 +4276,7 @@ fn register(
     fd3_raw: Option<i32>,
     fd4_raw: Option<i32>,
     fd5_raw: Option<i32>,
+    authenticated_parent: Option<i64>,
 ) -> Result<crate::generated_wire::RegisterReply, String> {
     use crate::generated_wire::{NetMode, RegistrationName, RunBackend, TransportRequest};
     let TransportRequest::Register {
@@ -4363,7 +4366,7 @@ fn register(
             }
             return Err("invalid relname: must be a single NAME segment".into());
         }
-        match derive_parent_box(state, host_pid) {
+        match authenticated_parent.or_else(|| derive_parent_box(state, host_pid)) {
             Some(p) => parent = Some(p),
             None => {
                 if let Some(fd) = peer_pidfd {
@@ -6521,6 +6524,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             peer_thirdfd.take(),
             peer_fourthfd.take(),
             peer_fifthfd.take(),
+            hint_box_id,
         );
         return;
     }
@@ -6915,6 +6919,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                         <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
                     peer_fifthfd.take().map(|fd|
                         <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
+                    None,
                 )),
                 Err(error) => json!({"ok": false, "error": error}),
             }
@@ -8365,7 +8370,7 @@ mod verb_tests {
         let (server, mut client) = UnixStream::pair().unwrap();
         let state: State = Default::default();
         let thread = std::thread::spawn(move || {
-            handle_binary_registration(state, server, None, None, None, None, None)
+            handle_binary_registration(state, server, None, None, None, None, None, None)
         });
         crate::socket_wire::write_request(
             &mut client,

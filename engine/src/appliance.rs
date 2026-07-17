@@ -4,23 +4,26 @@
 //! a kernel boundary around the command.  Host and PID-1 exchange the command
 //! and exit status over one generated binary relation value.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::generated_wire::{
-    ApplianceCommand, ApplianceResult, NetMode, OsString as WireOsString, QemuArchitecture,
+    ApplianceCommand, ApplianceFrame, ApplianceRunRequest, NetMode,
+    OsString as WireOsString, QemuArchitecture, ShortOsString,
 };
 
 const ROOT_TAG: &str = "sarun-root";
 const CONTROL_PORT: &str = "sarun-control";
+pub const NESTED_BROKER: &str = "sarun-appliance-run";
 
 pub fn architecture_name(architecture: QemuArchitecture) -> &'static str {
     match architecture {
@@ -30,6 +33,9 @@ pub fn architecture_name(architecture: QemuArchitecture) -> &'static str {
 }
 
 fn cache_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("SARUN_APPLIANCE_ROOT") {
+        return PathBuf::from(root);
+    }
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -195,6 +201,7 @@ pub fn run(
     virtiofs: OwnedFd,
     command: &ApplianceCommand,
     network: Option<OwnedFd>,
+    box_channel: UnixStream,
 ) -> io::Result<i32> {
     let qemu = qemu_binary(architecture);
     let data_dir = qemu
@@ -250,16 +257,226 @@ pub fn run(
     drop(qemu_virtiofs);
     drop(qemu_control);
     drop(qemu_network);
+    let control_writer = Arc::new(Mutex::new(control.try_clone()?));
+    let box_channel = Arc::new(Mutex::new(box_channel));
+    let nested = Arc::new(Mutex::new(HashMap::<u64, NestedChild>::new()));
     let result = (|| {
         crate::socket_wire::write_versioned(&mut control, command)?;
-        let result: ApplianceResult = crate::socket_wire::read_versioned(&mut control)?;
-        Ok(result.code)
+        loop {
+            match crate::socket_wire::read_atom::<_, ApplianceFrame>(&mut control)? {
+                ApplianceFrame::NestedOpen { stream, request } => {
+                    spawn_nested_appliance(
+                        stream,
+                        request,
+                        box_channel.clone(),
+                        control_writer.clone(),
+                        nested.clone(),
+                    );
+                }
+                ApplianceFrame::NestedInput { stream, data } => {
+                    if let Some(input) = nested.lock().unwrap().get_mut(&stream)
+                        .and_then(|child| child.input.as_mut())
+                    {
+                        let _ = input.write_all(data.as_slice());
+                        let _ = input.flush();
+                    }
+                }
+                ApplianceFrame::NestedInputEof { stream } => {
+                    if let Some(child) = nested.lock().unwrap().get_mut(&stream) {
+                        child.input.take();
+                    }
+                }
+                ApplianceFrame::NestedSignal { stream, signal } => {
+                    if let Some(child) = nested.lock().unwrap().get(&stream) {
+                        unsafe { libc::kill(-child.pid, signal) };
+                    }
+                }
+                ApplianceFrame::Result { code } => break Ok(code),
+                _ => break Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guest sent a host-to-guest appliance frame",
+                )),
+            }
+        }
     })();
+    for child in nested.lock().unwrap().values() {
+        unsafe { libc::kill(-child.pid, libc::SIGTERM) };
+    }
     if result.is_err() {
         let _ = child.kill();
     }
     reap_appliance(&mut child);
     result
+}
+
+struct NestedChild {
+    pid: i32,
+    input: Option<ChildStdin>,
+}
+
+fn write_appliance_frame(writer: &Arc<Mutex<UnixStream>>, frame: &ApplianceFrame) {
+    let mut writer = writer.lock().unwrap();
+    let _ = crate::socket_wire::write_atom(&mut *writer, frame);
+    let _ = writer.flush();
+}
+
+fn nested_output(writer: &Arc<Mutex<UnixStream>>, stream: u64, bytes: &[u8]) {
+    for chunk in bytes.chunks(crate::generated_wire::LIMIT_STREAM_CHUNK_BYTES) {
+        let Ok(data) = crate::wire::BoundedBytes::new(chunk.to_vec()) else {
+            continue;
+        };
+        write_appliance_frame(writer, &ApplianceFrame::NestedOutput { stream, data });
+    }
+}
+
+fn nested_host_args(request: &ApplianceRunRequest) -> Vec<OsString> {
+    let mut arguments = vec![
+        OsString::from("run"),
+        OsString::from("--net"),
+        OsString::from(match request.net_mode {
+            NetMode::Off => "off",
+            NetMode::Host => "host",
+            NetMode::Tap => "tap",
+        }),
+        OsString::from("--qemu"),
+        OsString::from(architecture_name(request.architecture)),
+    ];
+    if request.capture_environment {
+        arguments.push(OsString::from("-e"));
+    }
+    if request.no_parent {
+        arguments.push(OsString::from("--no-parent"));
+    }
+    if request.readonly_parent {
+        arguments.push(OsString::from("--readonly-parent"));
+    }
+    if request.brush {
+        arguments.push(OsString::from("-b"));
+    }
+    if let Some(name) = &request.name {
+        arguments.push(OsString::from(name.as_str()));
+    }
+    if let Some(cwd) = &request.cwd {
+        arguments.push(OsString::from("-C"));
+        arguments.push(OsString::from_vec(cwd.as_slice().to_vec()));
+    }
+    arguments.push(OsString::from("--"));
+    arguments.extend(request.command.as_slice().iter()
+        .map(|word| OsString::from_vec(word.as_slice().to_vec())));
+    arguments
+}
+
+fn spawn_nested_appliance(
+    stream: u64,
+    request: ApplianceRunRequest,
+    box_channel: Arc<Mutex<UnixStream>>,
+    control: Arc<Mutex<UnixStream>>,
+    children: Arc<Mutex<HashMap<u64, NestedChild>>>,
+) {
+    if children.lock().unwrap().contains_key(&stream) {
+        nested_output(&control, stream, b"sarun: duplicate nested stream\n");
+        write_appliance_frame(&control, &ApplianceFrame::NestedResult { stream, code: 1 });
+        return;
+    }
+    let engine = {
+        let channel = box_channel.lock().unwrap();
+        crate::runner::request_box_connection(&channel)
+    };
+    let engine = match engine {
+        Ok(engine) => engine,
+        Err(error) => {
+            nested_output(&control, stream,
+                format!("sarun: nested engine connection: {error}\n").as_bytes());
+            write_appliance_frame(&control,
+                &ApplianceFrame::NestedResult { stream, code: 1 });
+            return;
+        }
+    };
+    let engine_fd = engine.as_raw_fd();
+    let flags = unsafe { libc::fcntl(engine_fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(engine_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        nested_output(&control, stream, b"sarun: cannot inherit nested engine connection\n");
+        write_appliance_frame(&control, &ApplianceFrame::NestedResult { stream, code: 1 });
+        return;
+    }
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            nested_output(&control, stream,
+                format!("sarun: nested executable: {error}\n").as_bytes());
+            write_appliance_frame(&control,
+                &ApplianceFrame::NestedResult { stream, code: 1 });
+            return;
+        }
+    };
+    let arguments = nested_host_args(&request);
+    let mut child_command = Command::new(executable);
+    child_command.args(arguments).env_clear();
+    for (key, value) in request.environment.as_map() {
+        child_command.env(
+            OsStr::from_bytes(key.as_slice()),
+            OsStr::from_bytes(value.as_slice()),
+        );
+    }
+    child_command
+        .env_remove("SARUN_APPLIANCE_BROKER")
+        .env("SARUN_ENGINE_FD", engine_fd.to_string())
+        .env("SARUN_ENGINE_PARENT", "1")
+        .env("SARUN_APPLIANCE_ROOT", cache_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = match child_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            nested_output(&control, stream,
+                format!("sarun: launch nested appliance: {error}\n").as_bytes());
+            write_appliance_frame(&control,
+                &ApplianceFrame::NestedResult { stream, code: 1 });
+            return;
+        }
+    };
+    drop(engine);
+    let pid = child.id() as i32;
+    let input = child.stdin.take();
+    for mut output in [child.stdout.take().map(OutputPipe::Stdout),
+                       child.stderr.take().map(OutputPipe::Stderr)]
+        .into_iter().flatten()
+    {
+        let writer = control.clone();
+        std::thread::spawn(move || {
+            let mut bytes = [0u8; 65536];
+            loop {
+                let count = match &mut output {
+                    OutputPipe::Stdout(pipe) => pipe.read(&mut bytes),
+                    OutputPipe::Stderr(pipe) => pipe.read(&mut bytes),
+                };
+                match count {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => nested_output(&writer, stream, &bytes[..count]),
+                }
+            }
+        });
+    }
+    children.lock().unwrap().insert(stream, NestedChild { pid, input });
+    std::thread::spawn(move || {
+        let code = match child.wait() {
+            Ok(status) => status.code().unwrap_or_else(|| {
+                use std::os::unix::process::ExitStatusExt;
+                128 + status.signal().unwrap_or(1)
+            }),
+            Err(_) => 1,
+        };
+        children.lock().unwrap().remove(&stream);
+        write_appliance_frame(&control,
+            &ApplianceFrame::NestedResult { stream, code });
+    });
+}
+
+enum OutputPipe {
+    Stdout(std::process::ChildStdout),
+    Stderr(std::process::ChildStderr),
 }
 
 pub fn wire_command(
@@ -283,15 +500,7 @@ pub fn wire_command(
                 .map_err(|error| format!("cwd exceeds relation bound: {error:?}"))
         })
         .transpose()?;
-    let mut environment = std::env::vars_os()
-        .map(|(key, value)| {
-            let key = crate::wire::BoundedBytes::new(key.as_bytes().to_vec())
-                .map_err(|error| format!("environment name exceeds relation bound: {error:?}"))?;
-            let value = crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                .map_err(|error| format!("environment value exceeds relation bound: {error:?}"))?;
-            Ok((key, value))
-        })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let mut environment = wire_environment()?;
     if brush {
         environment.insert(
             crate::wire::BoundedBytes::new(b"SARUN_BRUSH_SH".to_vec())
@@ -318,6 +527,144 @@ pub fn wire_command(
             crate::net::NetMode::Tap => NetMode::Tap,
         },
     })
+}
+
+fn wire_environment() -> Result<BTreeMap<ShortOsString, WireOsString>, String> {
+    std::env::vars_os()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_bytes(),
+                b"SARUN_ENGINE_FD" | b"SARUN_ENGINE_PARENT" | b"SARUN_APPLIANCE_ROOT"
+            )
+        })
+        .map(|(key, value)| {
+            let key = crate::wire::BoundedBytes::new(key.as_bytes().to_vec())
+                .map_err(|error| format!("environment name exceeds relation bound: {error:?}"))?;
+            let value = crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                .map_err(|error| format!("environment value exceeds relation bound: {error:?}"))?;
+            Ok((key, value))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()
+}
+
+pub fn wire_nested_request(
+    architecture: QemuArchitecture,
+    name: Option<String>,
+    capture_environment: bool,
+    no_parent: bool,
+    readonly_parent: bool,
+    cwd: Option<String>,
+    net_mode: crate::net::NetMode,
+    brush: bool,
+    command: Vec<String>,
+) -> Result<ApplianceRunRequest, String> {
+    let command = command.into_iter().map(|value| {
+        crate::wire::BoundedBytes::new(value.into_bytes())
+            .map_err(|error| format!("command argument exceeds relation bound: {error:?}"))
+    }).collect::<Result<Vec<_>, _>>()?;
+    let command = crate::wire::BoundedVec::new(command)
+        .map_err(|error| format!("command size violates relation bound: {error:?}"))?;
+    let name = name.map(crate::wire::BoundedText::new).transpose()
+        .map_err(|error| format!("box name exceeds relation bound: {error:?}"))?;
+    let cwd = cwd.map(|value| crate::wire::BoundedBytes::new(value.into_bytes()))
+        .transpose().map_err(|error| format!("cwd exceeds relation bound: {error:?}"))?;
+    let environment = crate::wire::BoundedMap::new(wire_environment()?)
+        .map_err(|error| format!("environment size violates relation bound: {error:?}"))?;
+    Ok(ApplianceRunRequest {
+        architecture,
+        name,
+        capture_environment,
+        no_parent,
+        readonly_parent,
+        cwd,
+        net_mode: match net_mode {
+            crate::net::NetMode::Off => NetMode::Off,
+            crate::net::NetMode::Host => NetMode::Host,
+            crate::net::NetMode::Tap => NetMode::Tap,
+        },
+        brush,
+        command,
+        environment,
+    })
+}
+
+static NESTED_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn record_nested_signal(signal: i32) {
+    NESTED_SIGNAL.store(signal, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Guest-side endpoint for `run --qemu` inside an appliance. It asks PID 1 to
+/// relay one semantic launch operation to the host outer runner; the caller
+/// sees an ordinary full-duplex process channel, never an engine socket.
+pub fn nested_run(request: ApplianceRunRequest, broker: &str) -> io::Result<i32> {
+    use std::os::linux::net::SocketAddrExt;
+    let address = std::os::unix::net::SocketAddr::from_abstract_name(broker.as_bytes())?;
+    let mut stream = UnixStream::connect_addr(&address)?;
+    crate::socket_wire::write_atom(
+        &mut stream,
+        &ApplianceFrame::NestedOpen { stream: 0, request },
+    )?;
+    stream.flush()?;
+
+    let mut input_stream = stream.try_clone()?;
+    std::thread::spawn(move || {
+        let mut input = io::stdin().lock();
+        let mut bytes = vec![0u8; crate::generated_wire::LIMIT_STREAM_CHUNK_BYTES.min(65536)];
+        loop {
+            match input.read(&mut bytes) {
+                Ok(0) | Err(_) => {
+                    let _ = crate::socket_wire::write_atom(
+                        &mut input_stream,
+                        &ApplianceFrame::NestedInputEof { stream: 0 },
+                    );
+                    let _ = input_stream.flush();
+                    break;
+                }
+                Ok(count) => {
+                    let Ok(data) = crate::wire::BoundedBytes::new(bytes[..count].to_vec()) else {
+                        break;
+                    };
+                    if crate::socket_wire::write_atom(
+                        &mut input_stream,
+                        &ApplianceFrame::NestedInput { stream: 0, data },
+                    ).and_then(|()| input_stream.flush()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+        unsafe { libc::signal(signal, record_nested_signal as *const () as libc::sighandler_t) };
+    }
+    let mut signal_stream = stream.try_clone()?;
+    std::thread::spawn(move || loop {
+        let signal = NESTED_SIGNAL.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if signal != 0 {
+            if crate::socket_wire::write_atom(
+                &mut signal_stream,
+                &ApplianceFrame::NestedSignal { stream: 0, signal },
+            ).and_then(|()| signal_stream.flush()).is_err() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    });
+
+    loop {
+        match crate::socket_wire::read_atom::<_, ApplianceFrame>(&mut stream)? {
+            ApplianceFrame::NestedOutput { stream: 0, data } => {
+                io::stdout().write_all(data.as_slice())?;
+                io::stdout().flush()?;
+            }
+            ApplianceFrame::NestedResult { stream: 0, code } => return Ok(code),
+            _ => return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guest nested-run broker returned an invalid frame",
+            )),
+        }
+    }
 }
 
 static GUEST_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -372,6 +719,11 @@ fn execute_guest(command: &ApplianceCommand) -> io::Result<i32> {
             OsStr::from_bytes(value.as_slice()),
         );
     }
+    // Every appliance command can launch another flat QEMU box. The broker is
+    // local to this guest and carries only typed run/I/O operations to PID 1;
+    // PID 1 forwards them to the still-live host outer runner.
+    process.env("SARUN_APPLIANCE_BROKER", NESTED_BROKER);
+    process.env("SARUN_EXE", "/init");
     if let Some(cwd) = &command.cwd {
         process.current_dir(OsStr::from_bytes(cwd.as_slice()));
     }
@@ -442,8 +794,116 @@ fn write_guest_outcome<W: io::Write>(stream: &mut W, outcome: io::Result<i32>) -
             127
         }
     };
-    crate::socket_wire::write_versioned(stream, &ApplianceResult { code })?;
+    crate::socket_wire::write_atom(stream, &ApplianceFrame::Result { code })?;
+    stream.flush()?;
     Ok(code)
+}
+
+fn translate_guest_stream(frame: ApplianceFrame, stream: u64) -> io::Result<ApplianceFrame> {
+    match frame {
+        ApplianceFrame::NestedOpen { stream: 0, request } => {
+            Ok(ApplianceFrame::NestedOpen { stream, request })
+        }
+        ApplianceFrame::NestedInput { stream: 0, data } => {
+            Ok(ApplianceFrame::NestedInput { stream, data })
+        }
+        ApplianceFrame::NestedInputEof { stream: 0 } => {
+            Ok(ApplianceFrame::NestedInputEof { stream })
+        }
+        ApplianceFrame::NestedSignal { stream: 0, signal } => {
+            Ok(ApplianceFrame::NestedSignal { stream, signal })
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local appliance caller sent an invalid frame",
+        )),
+    }
+}
+
+fn write_appliance_file_frame(
+    writer: &Arc<Mutex<std::fs::File>>,
+    frame: &ApplianceFrame,
+) {
+    let mut writer = writer.lock().unwrap();
+    let _ = crate::socket_wire::write_atom(&mut *writer, frame);
+    let _ = writer.flush();
+}
+
+fn start_guest_nested_broker(
+    control: &std::fs::File,
+) -> io::Result<Arc<Mutex<std::fs::File>>> {
+    use std::os::linux::net::SocketAddrExt;
+    let address = std::os::unix::net::SocketAddr::from_abstract_name(NESTED_BROKER.as_bytes())?;
+    let listener = std::os::unix::net::UnixListener::bind_addr(&address)?;
+    let writer = Arc::new(Mutex::new(control.try_clone()?));
+    let clients = Arc::new(Mutex::new(HashMap::<u64, Arc<Mutex<UnixStream>>>::new()));
+    let mut reader = control.try_clone()?;
+    let reader_clients = clients.clone();
+    std::thread::spawn(move || loop {
+        let frame = match crate::socket_wire::read_atom::<_, ApplianceFrame>(&mut reader) {
+            Ok(frame) => frame,
+            Err(_) => break,
+        };
+        let (stream, local, finished) = match frame {
+            ApplianceFrame::NestedOutput { stream, data } => (
+                stream,
+                ApplianceFrame::NestedOutput { stream: 0, data },
+                false,
+            ),
+            ApplianceFrame::NestedResult { stream, code } => (
+                stream,
+                ApplianceFrame::NestedResult { stream: 0, code },
+                true,
+            ),
+            _ => continue,
+        };
+        let client = reader_clients.lock().unwrap().get(&stream).cloned();
+        if let Some(client) = client {
+            let mut client = client.lock().unwrap();
+            let _ = crate::socket_wire::write_atom(&mut *client, &local);
+            let _ = client.flush();
+        }
+        if finished {
+            reader_clients.lock().unwrap().remove(&stream);
+        }
+    });
+
+    let accept_writer = writer.clone();
+    std::thread::spawn(move || {
+        let next = std::sync::atomic::AtomicU64::new(1);
+        for client in listener.incoming().flatten() {
+            let stream = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut client_reader = match client.try_clone() {
+                Ok(reader) => reader,
+                Err(_) => continue,
+            };
+            let client = Arc::new(Mutex::new(client));
+            clients.lock().unwrap().insert(stream, client.clone());
+            let writer = accept_writer.clone();
+            let clients = clients.clone();
+            std::thread::spawn(move || loop {
+                let frame = crate::socket_wire::read_atom::<_, ApplianceFrame>(
+                    &mut client_reader,
+                );
+                let frame = match frame.and_then(|frame| translate_guest_stream(frame, stream)) {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        write_appliance_file_frame(
+                            &writer,
+                            &ApplianceFrame::NestedSignal {
+                                stream,
+                                signal: libc::SIGTERM,
+                            },
+                        );
+                        clients.lock().unwrap().remove(&stream);
+                        break;
+                    }
+                };
+                write_appliance_file_frame(&writer, &frame);
+            });
+        }
+    });
+    Ok(writer)
 }
 
 /// PID-1 entry. Called before Prolog or ordinary CLI initialization.
@@ -471,6 +931,7 @@ pub fn init_main() -> i32 {
             .write(true)
             .open(&port)?;
         let command: ApplianceCommand = crate::socket_wire::read_versioned(&mut stream)?;
+        let control = start_guest_nested_broker(&stream)?;
         let guest_outcome = crate::net::tap::configure_appliance_network(command.net_mode)
             .map_err(|error| io::Error::other(format!("configure network: {error}")))
             .and_then(|()| execute_guest(&command));
@@ -479,7 +940,8 @@ pub fn init_main() -> i32 {
         // and network failures are results too: the host must never wait for
         // a control reply that PID 1 has already decided it cannot produce.
         unsafe { libc::sync() };
-        write_guest_outcome(&mut stream, guest_outcome)
+        let mut control = control.lock().unwrap();
+        write_guest_outcome(&mut *control, guest_outcome)
     })();
     let code = match outcome {
         Ok(code) => code,
@@ -505,7 +967,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn guest_exec_failure_is_a_versioned_result_not_a_missing_reply() {
+    fn guest_exec_failure_is_a_framed_result_not_a_missing_reply() {
         let mut encoded = Vec::new();
         let code = write_guest_outcome(
             &mut encoded,
@@ -514,8 +976,8 @@ mod tests {
         .unwrap();
         assert_eq!(code, 127);
         let mut cursor = io::Cursor::new(encoded);
-        let result: ApplianceResult = crate::socket_wire::read_versioned(&mut cursor).unwrap();
-        assert_eq!(result.code, 127);
+        let result: ApplianceFrame = crate::socket_wire::read_atom(&mut cursor).unwrap();
+        assert_eq!(result, ApplianceFrame::Result { code: 127 });
     }
 
     #[test]

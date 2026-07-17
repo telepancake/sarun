@@ -197,7 +197,7 @@ as executable mappings and mmap that genuinely need a host fd.
       manifests/configs.
 - [x] Build minimal paired QEMU/kernel artifacts with virtio-fs, console,
       virtio-serial control, KVM, and TCG support required by sarun.
-- [ ] Replace generic guest/host emulation at remaining Sarun control
+- [x] Replace generic guest/host emulation at remaining Sarun control
       boundaries with the smallest paired QEMU+kernel ABI.  In particular, do
       not reproduce Unix descriptor passing through a byte-stream mux.  A
       `sarun run --qemu` issued inside a QEMU box is a typed request to its
@@ -206,6 +206,16 @@ as executable mappings and mmap that genuinely need a host fd.
       relays the nested caller's input, output, signals, and result.  It never
       starts QEMU inside QEMU, and no guest pidfd or host virtio-fs descriptor
       crosses the appliance boundary.
+  - [x] Define the nested launch and its input, EOF, signal, output, and result
+        as generated appliance-operation frames. Guest PID 1 multiplexes those
+        operations on the existing paired control port; the host outer runner
+        mints an engine connection over its authenticated box channel and
+        inherits that host FD into the flat child launcher. The live aarch64
+        gate proves two host-side appliances, logical `OUTER -> INNER`
+        parenting, returned child output, child-local capture, and no host
+        write. A new QEMU device/kernel driver would add more machinery than it
+        removes here, so the paired kernel remains free to gain one when a
+        later operation actually benefits from it.
 - [x] Add the host launcher/vhost-user backend and target `/init` control plane.
   - [x] Embedded vhost-user lifecycle serves a scoped `SarunFs` box root on a
         private per-box engine socket and exits when its frontend disconnects.
@@ -377,6 +387,11 @@ as executable mappings and mmap that genuinely need a host fd.
 - `make test-backends` also launches QEMU from inside a FUSE box through the
   authenticated broker and descriptor-only appliance boundary. It checks the
   persisted parent edge and child archive, not merely a successful boot.
+- A QEMU guest can itself issue `run --qemu`; the request returns to its live
+  host outer runner and launches a flat sibling QEMU process. The focused
+  aarch64 TCG gate records the outer box as parent, relays the child's output
+  and exact result, captures the child's write only in the child archive, and
+  leaves the lower host tree unchanged. It does not execute QEMU in the guest.
 - The same gate runs the aarch64 QEMU lifecycle matrix, including an immediate
   same-name rerun that must observe prior captured state. This regression found
   and now prevents both stale running-box registration and retained frontend-fd

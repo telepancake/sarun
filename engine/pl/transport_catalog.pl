@@ -168,10 +168,6 @@ wire_type(appliance_command, record([
     field(environment, environment),
     field(net_mode, net_mode)
 ])).
-wire_type(appliance_result, record([
-    field(code, exit_code)
-])).
-
 % A nested `run --qemu` does not start QEMU in the guest.  The guest sends this
 % semantic request to its still-live host runner, which launches a second flat
 % appliance through an engine connection authenticated by the outer box

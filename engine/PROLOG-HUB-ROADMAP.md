@@ -750,6 +750,12 @@ belong to the relation.
       exit 37 and exec-failure 127 propagate through target `/init`, and an
       immediate named parser-brush rerun sees both generations in one captured
       archive with no host write.
+- [x] Make QEMU-in-QEMU syntax a flat host-side launch rather than nested
+      virtualization. The guest emits generated nested-run/I/O frames to PID 1,
+      its live host runner obtains a broker-authenticated engine connection and
+      launches the sibling appliance, and no host descriptor crosses into the
+      guest. A live aarch64 gate proves output, parent identity, child capture,
+      and host non-escape.
 - [ ] Copy third-party license notices beside every normal release artifact.
 
 ### 2. Generic typed FFI — NEXT
