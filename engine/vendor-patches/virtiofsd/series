@@ -2,3 +2,4 @@
 0020-Expose-embedded-vhost-user-runner.patch
 0030-Share-decoder-with-raw-FUSE-transport.patch
 0040-Negotiate-kernel-FUSE-transport-defaults.patch
+0050-Preserve-kernel-FUSE-backing-acceleration.patch

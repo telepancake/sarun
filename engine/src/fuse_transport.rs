@@ -14,24 +14,109 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use virtiofsd::filesystem::FileSystem;
 use virtiofsd::fuse::{InHeader, OutHeader};
-use virtiofsd::server::Server;
+use virtiofsd::server::{FuseBacking, Server};
 
 const MAX_REQUEST_SIZE: usize = (1 << 20) + 0x1000;
 const FUSERMOUNT_COMM_FD: &str = "_FUSE_COMMFD";
 
 nix::ioctl_read!(fuse_dev_ioc_clone, 229, 0, u32);
 
+#[repr(C)]
+struct FuseBackingMap {
+    fd: u32,
+    flags: u32,
+    padding: u64,
+}
+
+nix::ioctl_write_ptr!(fuse_dev_ioc_backing_open, 229, 1, FuseBackingMap);
+nix::ioctl_write_ptr!(fuse_dev_ioc_backing_close, 229, 2, u32);
+
+struct BackingRegistry {
+    device: Arc<File>,
+    by_handle: Mutex<std::collections::HashMap<u64, Vec<u32>>>,
+    unavailable: AtomicBool,
+    successes: AtomicU64,
+    failures: AtomicU64,
+}
+
+impl BackingRegistry {
+    fn close_ids(&self, ids: impl IntoIterator<Item = u32>) {
+        for id in ids {
+            // SAFETY: each id was returned by BACKING_OPEN on this connection.
+            if let Err(error) = unsafe { fuse_dev_ioc_backing_close(self.device.as_raw_fd(), &id) }
+            {
+                eprintln!("sarun-engine: cannot close FUSE backing id {id}: {error}");
+            }
+        }
+    }
+}
+
+impl FuseBacking for BackingRegistry {
+    fn register(&self, handle: u64, file: &File) -> io::Result<u32> {
+        if self.unavailable.load(Ordering::Relaxed) {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+        let map = FuseBackingMap {
+            fd: file.as_raw_fd() as u32,
+            flags: 0,
+            padding: 0,
+        };
+        // SAFETY: both descriptors are live and map has the kernel ABI layout.
+        let id = match unsafe { fuse_dev_ioc_backing_open(self.device.as_raw_fd(), &map) } {
+            Ok(id) => id as u32,
+            Err(error) => {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+                if error == nix::errno::Errno::EPERM {
+                    self.unavailable.store(true, Ordering::Relaxed);
+                } else {
+                    eprintln!("sarun-engine: cannot register FUSE backing file: {error}");
+                }
+                return Err(error.into());
+            }
+        };
+        self.successes.fetch_add(1, Ordering::Relaxed);
+        self.by_handle
+            .lock()
+            .unwrap()
+            .entry(handle)
+            .or_default()
+            .push(id);
+        Ok(id)
+    }
+
+    fn release(&self, handle: u64) {
+        if let Some(ids) = self.by_handle.lock().unwrap().remove(&handle) {
+            self.close_ids(ids);
+        }
+    }
+}
+
+impl Drop for BackingRegistry {
+    fn drop(&mut self) {
+        let ids = self
+            .by_handle
+            .get_mut()
+            .unwrap()
+            .drain()
+            .flat_map(|(_, ids)| ids)
+            .collect::<Vec<_>>();
+        self.close_ids(ids);
+    }
+}
+
 /// A mounted raw-FUSE server. Dropping it detaches the mount and joins every
 /// request worker.
 pub struct FuseSession {
     mountpoint: PathBuf,
     device: Option<Arc<File>>,
+    backing: Option<Arc<BackingRegistry>>,
     workers: Vec<JoinHandle<io::Result<()>>>,
 }
 
@@ -48,10 +133,18 @@ impl FuseSession {
         }
         let mountpoint = mountpoint.canonicalize()?;
         let device = Arc::new(mount_with_helper(&mountpoint)?);
+        let backing = Arc::new(BackingRegistry {
+            device: device.clone(),
+            by_handle: Mutex::new(std::collections::HashMap::new()),
+            unavailable: AtomicBool::new(false),
+            successes: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+        });
         let server = Arc::new(Server::new(filesystem));
         let mut session = Self {
             mountpoint,
             device: Some(device.clone()),
+            backing: Some(backing.clone()),
             workers: Vec::with_capacity(workers),
         };
 
@@ -62,10 +155,11 @@ impl FuseSession {
                 Arc::new(clone_device(&device)?)
             };
             let server = server.clone();
+            let backing = backing.clone();
             match thread::Builder::new()
                 .name(format!("sarun-fuse-{index}"))
                 .spawn(move || {
-                    let result = serve_device(worker_device, server);
+                    let result = serve_device(worker_device, server, backing);
                     if let Err(error) = &result {
                         eprintln!("sarun-engine: raw FUSE worker failed: {error}");
                     }
@@ -76,6 +170,15 @@ impl FuseSession {
             }
         }
         Ok(session)
+    }
+
+    #[cfg(test)]
+    fn backing_results(&self) -> (u64, u64) {
+        let backing = self.backing.as_ref().unwrap();
+        (
+            backing.successes.load(Ordering::Relaxed),
+            backing.failures.load(Ordering::Relaxed),
+        )
     }
 
     fn detach(&mut self) {
@@ -100,7 +203,9 @@ impl FuseSession {
 
     pub fn unmount(mut self) -> io::Result<()> {
         self.detach();
-        join_workers(&mut self.workers)
+        let result = join_workers(&mut self.workers);
+        self.backing.take();
+        result
     }
 }
 
@@ -108,6 +213,7 @@ impl Drop for FuseSession {
     fn drop(&mut self) {
         self.detach();
         let _ = join_workers(&mut self.workers);
+        self.backing.take();
     }
 }
 
@@ -240,7 +346,11 @@ fn clone_device(source: &File) -> io::Result<File> {
     Ok(clone)
 }
 
-fn serve_device<F>(device: Arc<File>, server: Arc<Server<F>>) -> io::Result<()>
+fn serve_device<F>(
+    device: Arc<File>,
+    server: Arc<Server<F>>,
+    backing: Arc<BackingRegistry>,
+) -> io::Result<()>
 where
     F: FileSystem + Send + Sync + 'static,
 {
@@ -262,7 +372,11 @@ where
         if count == 0 {
             return Ok(());
         }
-        let reply_count = match server.handle_fuse_message(&request[..count], &mut response) {
+        let reply_count = match server.handle_fuse_message_with_backing(
+            &request[..count],
+            &mut response,
+            &*backing,
+        ) {
             Ok(reply_count) => reply_count,
             Err(error) => malformed_reply(&request[..count], &mut response)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?,
@@ -314,6 +428,7 @@ mod tests {
     use super::*;
     use std::ffi::CStr;
     use std::io::Write;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use virtiofsd::filesystem::{
         Context, DirEntry, DirectoryIterator, Entry, OpenOptions, ROOT_ID, ZeroCopyWriter,
@@ -328,12 +443,22 @@ mod tests {
         }
     }
 
-    struct StaticFile;
+    struct StaticFile {
+        backing: File,
+        daemon_reads: Arc<AtomicUsize>,
+    }
 
     impl FileSystem for StaticFile {
         type Inode = u64;
         type Handle = u64;
         type DirIter = EmptyDirectory;
+
+        fn init(
+            &self,
+            capable: virtiofsd::filesystem::FsOptions,
+        ) -> io::Result<virtiofsd::filesystem::FsOptions> {
+            Ok(capable & virtiofsd::filesystem::FsOptions::PASSTHROUGH)
+        }
 
         fn lookup(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<Entry> {
             if parent != ROOT_ID || name.to_bytes() != b"hello" {
@@ -379,9 +504,17 @@ mod tests {
             _flags: u32,
         ) -> io::Result<(Option<u64>, OpenOptions)> {
             if inode == 2 {
-                Ok((Some(7), OpenOptions::empty()))
+                Ok((Some(7), OpenOptions::PASSTHROUGH))
             } else {
                 Err(io::Error::from_raw_os_error(libc::ENOENT))
+            }
+        }
+
+        fn backing_file(&self, handle: u64) -> io::Result<Option<File>> {
+            if handle == 7 {
+                self.backing.try_clone().map(Some)
+            } else {
+                Ok(None)
             }
         }
 
@@ -399,14 +532,13 @@ mod tests {
             if inode != 2 || handle != 7 {
                 return Err(io::Error::from_raw_os_error(libc::EBADF));
             }
+            self.daemon_reads.fetch_add(1, Ordering::Relaxed);
             let contents = b"shared decoder\n";
             let start = usize::try_from(offset)
                 .unwrap_or(usize::MAX)
                 .min(contents.len());
             let end = start.saturating_add(size as usize).min(contents.len());
-            let mut source = tempfile::tempfile()?;
-            source.write_all(contents)?;
-            writer.read_from_file_at(&source, end - start, start as u64, None)
+            writer.read_from_file_at(&self.backing, end - start, start as u64, None)
         }
     }
 
@@ -428,10 +560,26 @@ mod tests {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
-        let session = FuseSession::mount(StaticFile, directory.path(), 2).unwrap();
+        let daemon_reads = Arc::new(AtomicUsize::new(0));
+        let mut backing = tempfile::tempfile().unwrap();
+        backing.write_all(b"shared decoder\n").unwrap();
+        let session = FuseSession::mount(
+            StaticFile {
+                backing,
+                daemon_reads: daemon_reads.clone(),
+            },
+            directory.path(),
+            2,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(directory.path().join("hello")).unwrap(),
             b"shared decoder\n"
+        );
+        let (backing_successes, backing_failures) = session.backing_results();
+        assert!(
+            (backing_successes == 1 && daemon_reads.load(Ordering::Relaxed) == 0)
+                || (backing_failures == 1 && daemon_reads.load(Ordering::Relaxed) == 1)
         );
         session.unmount().unwrap();
     }

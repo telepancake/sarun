@@ -1,0 +1,378 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 00:53:22 +0000
+Subject: [PATCH] Preserve kernel FUSE backing acceleration
+
+Expose backing-file eligibility through the shared filesystem contract while keeping backing registration, IDs, and release ioctls inside the raw /dev/fuse transport. Mask the host-only capability from virtio-fs connections.
+
+---
+diff --git a/src/filesystem.rs b/src/filesystem.rs
+index 066cf4d..3d797dc 100644
+--- a/src/filesystem.rs
++++ b/src/filesystem.rs
+@@ -535,6 +535,14 @@ pub trait FileSystem {
+         Ok((None, OpenOptions::empty()))
+     }
+ 
++    /// Duplicate the host file for an open handle that returned
++    /// [`OpenOptions::PASSTHROUGH`]. The ordinary `/dev/fuse` transport uses
++    /// this file only to create a kernel backing registration. Other
++    /// transports never call this method.
++    fn backing_file(&self, handle: Self::Handle) -> io::Result<Option<File>> {
++        Ok(None)
++    }
++
+     /// Create and open a file.
+     ///
+     /// If the file does not already exist, the file system should create it with the specified
+diff --git a/src/fuse.rs b/src/fuse.rs
+index 63281fb..4463921 100644
+--- a/src/fuse.rs
++++ b/src/fuse.rs
+@@ -14,7 +14,7 @@ use vm_memory::ByteValued;
+ pub const KERNEL_VERSION: u32 = 7;
+ 
+ /// Minor version number of this interface.
+-pub const KERNEL_MINOR_VERSION: u32 = 38;
++pub const KERNEL_MINOR_VERSION: u32 = 40;
+ 
+ /// Minimum Minor version number supported. If client sends a minor
+ /// number lesser than this, we don't support it.
+@@ -76,6 +76,10 @@ const FOPEN_NOFLUSH: u32 = 1 << 5;
+ /// Allow concurrent direct writes on the same inode
+ const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
+ 
++/// The kernel accesses a backing file registered by the `/dev/fuse`
++/// transport instead of forwarding reads to userspace.
++const FOPEN_PASSTHROUGH: u32 = 1 << 7;
++
+ bitflags! {
+     /// Options controlling the behavior of files opened by the server in response
+     /// to an open or create request.
+@@ -87,6 +91,7 @@ bitflags! {
+         const STREAM = FOPEN_CACHE_DIR;
+         const NOFLUSH = FOPEN_NOFLUSH;
+         const PARALLEL_DIRECT_WRITES = FOPEN_PARALLEL_DIRECT_WRITES;
++        const PASSTHROUGH = FOPEN_PASSTHROUGH;
+     }
+ }
+ 
+@@ -204,6 +209,9 @@ const CREATE_SUPP_GROUP: u64 = 1 << 34;
+ /// Relax restrictions in FOPEN_DIRECT_IO mode to allow shared mmap.
+ const DIRECT_IO_ALLOW_MMAP: u64 = 1 << 36;
+ 
++/// Kernel FUSE supports backing-file passthrough registrations.
++const PASSTHROUGH: u64 = 1 << 37;
++
+ /// We need this for idmapped mounts support
+ const ALLOW_IDMAP: u64 = 1 << 40;
+ 
+@@ -461,6 +469,10 @@ bitflags! {
+         /// Allow shared mmap'ing of files in DIRECT_IO.
+         const DIRECT_IO_ALLOW_MMAP = DIRECT_IO_ALLOW_MMAP;
+ 
++        /// The `/dev/fuse` transport may register backing files for eligible
++        /// read-only opens. This is never enabled for virtio-fs transport.
++        const PASSTHROUGH = PASSTHROUGH;
++
+         /// Indicates if idmapped mounts are allowed for virtiofs.
+         const ALLOW_IDMAP = ALLOW_IDMAP;
+     }
+@@ -1074,7 +1086,8 @@ pub struct InitOut {
+     pub max_pages: u16,
+     pub map_alignment: u16,
+     pub flags2: u32,
+-    pub unused: [u32; 7],
++    pub max_stack_depth: u32,
++    pub unused: [u32; 6],
+ }
+ unsafe impl ByteValued for InitOut {}
+ 
+diff --git a/src/server.rs b/src/server.rs
+index 08dfe73..fe538ac 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -253,6 +253,14 @@ pub struct Server<F: FileSystem + Sync> {
+     options: AtomicU64,
+ }
+ 
++/// Host-kernel acceleration owned by an ordinary `/dev/fuse` transport.
++/// Filesystem policy chooses eligible handles; this interface only registers
++/// and retires their backing file descriptors on the mounted connection.
++pub trait FuseBacking: Send + Sync {
++    fn register(&self, handle: u64, file: &File) -> io::Result<u32>;
++    fn release(&self, handle: u64);
++}
++
+ impl<F: FileSystem + Sync> Server<F> {
+     pub fn new(fs: F) -> Server<F> {
+         Server {
+@@ -263,7 +271,12 @@ impl<F: FileSystem + Sync> Server<F> {
+ 
+     #[allow(clippy::cognitive_complexity)]
+     pub fn handle_message<T>(&self, r: Reader, w: Writer, vu_req: Option<&mut T>) -> Result<usize> {
+-        self.handle_message_inner(MessageReader::Virtio(r), MessageWriter::Virtio(w), vu_req)
++        self.handle_message_inner(
++            MessageReader::Virtio(r),
++            MessageWriter::Virtio(w),
++            vu_req,
++            None,
++        )
+     }
+ 
+     /// Decode one ordinary kernel FUSE request through the same opcode path as
+@@ -277,6 +290,24 @@ impl<F: FileSystem + Sync> Server<F> {
+                 written: 0,
+             }),
+             None,
++            None,
++        )
++    }
++
++    pub fn handle_fuse_message_with_backing(
++        &self,
++        request: &[u8],
++        response: &mut [u8],
++        backing: &dyn FuseBacking,
++    ) -> Result<usize> {
++        self.handle_message_inner::<()>(
++            MessageReader::Fuse(std::io::Cursor::new(request)),
++            MessageWriter::Fuse(FuseWriter {
++                buffer: response,
++                written: 0,
++            }),
++            None,
++            Some(backing),
+         )
+     }
+ 
+@@ -286,6 +317,7 @@ impl<F: FileSystem + Sync> Server<F> {
+         mut r: MessageReader,
+         w: MessageWriter,
+         vu_req: Option<&mut T>,
++        fuse_backing: Option<&dyn FuseBacking>,
+     ) -> Result<usize> {
+         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
+         let raw_fuse = r.is_fuse();
+@@ -316,11 +348,11 @@ impl<F: FileSystem + Sync> Server<F> {
+                 Opcode::Rmdir => self.rmdir(in_header, r, w),
+                 Opcode::Rename => self.rename(in_header, r, w),
+                 Opcode::Link => self.link(in_header, r, w),
+-                Opcode::Open => self.open(in_header, r, w),
++                Opcode::Open => self.open(in_header, r, w, fuse_backing),
+                 Opcode::Read => self.read(in_header, r, w),
+                 Opcode::Write => self.write(in_header, r, w),
+                 Opcode::Statfs => self.statfs(in_header, w),
+-                Opcode::Release => self.release(in_header, r, w),
++                Opcode::Release => self.release(in_header, r, w, fuse_backing),
+                 Opcode::Fsync => self.fsync(in_header, r, w),
+                 Opcode::Setxattr => self.setxattr(in_header, r, w),
+                 Opcode::Getxattr => self.getxattr(in_header, r, w),
+@@ -741,7 +773,13 @@ impl<F: FileSystem + Sync> Server<F> {
+         }
+     }
+ 
+-    fn open(&self, in_header: InHeader, mut r: MessageReader, w: MessageWriter) -> Result<usize> {
++    fn open(
++        &self,
++        in_header: InHeader,
++        mut r: MessageReader,
++        w: MessageWriter,
++        fuse_backing: Option<&dyn FuseBacking>,
++    ) -> Result<usize> {
+         let OpenIn {
+             flags, open_flags, ..
+         } = r.read_obj().map_err(Error::DecodeMessage)?;
+@@ -754,11 +792,31 @@ impl<F: FileSystem + Sync> Server<F> {
+             kill_priv,
+             flags,
+         ) {
+-            Ok((handle, opts)) => {
++            Ok((handle, mut opts)) => {
++                let handle = handle.map(Into::into);
++                let mut backing_id = 0;
++                if opts.contains(OpenOptions::PASSTHROUGH) {
++                    let registration = handle
++                        .and_then(|handle| {
++                            self.fs
++                                .backing_file(handle.into())
++                                .ok()
++                                .flatten()
++                                .map(|file| (handle, file))
++                        })
++                        .and_then(|(handle, file)| {
++                            fuse_backing.and_then(|backing| backing.register(handle, &file).ok())
++                        });
++                    if let Some(id) = registration {
++                        backing_id = id;
++                    } else {
++                        opts.remove(OpenOptions::PASSTHROUGH);
++                    }
++                }
+                 let out = OpenOut {
+-                    fh: handle.map(Into::into).unwrap_or(0),
++                    fh: handle.unwrap_or(0),
+                     open_flags: opts.bits(),
+-                    ..Default::default()
++                    padding: backing_id,
+                 };
+ 
+                 reply_ok(Some(out), None, in_header.unique, w)
+@@ -880,6 +938,7 @@ impl<F: FileSystem + Sync> Server<F> {
+         in_header: InHeader,
+         mut r: MessageReader,
+         w: MessageWriter,
++        fuse_backing: Option<&dyn FuseBacking>,
+     ) -> Result<usize> {
+         let ReleaseIn {
+             fh,
+@@ -896,7 +955,7 @@ impl<F: FileSystem + Sync> Server<F> {
+             None
+         };
+ 
+-        match self.fs.release(
++        let result = self.fs.release(
+             Context::from(in_header),
+             in_header.nodeid.into(),
+             flags,
+@@ -904,7 +963,11 @@ impl<F: FileSystem + Sync> Server<F> {
+             flush,
+             flock_release,
+             lock_owner,
+-        ) {
++        );
++        if let Some(backing) = fuse_backing {
++            backing.release(fh);
++        }
++        match result {
+             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
+             Err(e) => reply_error(e, in_header.unique, w),
+         }
+@@ -1184,11 +1247,16 @@ impl<F: FileSystem + Sync> Server<F> {
+ 
+         let flags_64 = ((flags2 as u64) << 32) | (flags as u64);
+         let capable = FsOptions::from_bits_truncate(flags_64);
++        let fs_capable = if raw_fuse {
++            capable
++        } else {
++            capable & !FsOptions::PASSTHROUGH
++        };
+ 
+         let page_size: u32 = unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() };
+         let max_pages = ((MAX_BUFFER_SIZE - 1) / page_size) + 1;
+ 
+-        match self.fs.init(capable) {
++        match self.fs.init(fs_capable) {
+             Ok(want) => {
+                 let enabled = (capable & (want | supported)).bits();
+                 self.options.store(enabled, Ordering::Relaxed);
+@@ -1205,6 +1273,11 @@ impl<F: FileSystem + Sync> Server<F> {
+                     max_pages: max_pages.try_into().unwrap(),
+                     map_alignment: 0,
+                     flags2: (enabled >> 32) as u32,
++                    max_stack_depth: if enabled & FsOptions::PASSTHROUGH.bits() != 0 {
++                        2
++                    } else {
++                        0
++                    },
+                     ..Default::default()
+                 };
+ 
+@@ -2116,6 +2189,39 @@ mod tests {
+                 entry_timeout: Duration::from_secs(3),
+             })
+         }
++
++        fn open(
++            &self,
++            _ctx: Context,
++            inode: u64,
++            _kill_priv: bool,
++            _flags: u32,
++        ) -> io::Result<(Option<u64>, OpenOptions)> {
++            assert_eq!(inode, 9);
++            Ok((Some(7), OpenOptions::PASSTHROUGH))
++        }
++
++        fn backing_file(&self, handle: u64) -> io::Result<Option<File>> {
++            assert_eq!(handle, 7);
++            File::open("/dev/null").map(Some)
++        }
++    }
++
++    #[derive(Default)]
++    struct RawBacking {
++        registered: AtomicU64,
++        released: AtomicU64,
++    }
++
++    impl FuseBacking for RawBacking {
++        fn register(&self, handle: u64, _file: &File) -> io::Result<u32> {
++            self.registered.store(handle, Ordering::Relaxed);
++            Ok(41)
++        }
++
++        fn release(&self, handle: u64) {
++            self.released.store(handle, Ordering::Relaxed);
++        }
+     }
+ 
+     #[test]
+@@ -2153,6 +2259,57 @@ mod tests {
+         assert_eq!((entry.entry_valid, entry.attr_valid), (3, 2));
+     }
+ 
++    #[test]
++    fn raw_fuse_backing_registration_is_transport_owned() {
++        let backing = RawBacking::default();
++        let server = Server::new(RawTestFs);
++        let open_header = InHeader {
++            len: (size_of::<InHeader>() + size_of::<OpenIn>()) as u32,
++            opcode: Opcode::Open as u32,
++            unique: 88,
++            nodeid: 9,
++            ..Default::default()
++        };
++        let mut request = open_header.as_slice().to_vec();
++        request.extend_from_slice(OpenIn::default().as_slice());
++        let mut response = [0; 128];
++        let count = server
++            .handle_fuse_message_with_backing(&request, &mut response, &backing)
++            .unwrap();
++        assert_eq!(count, size_of::<OutHeader>() + size_of::<OpenOut>());
++        let opened = unsafe {
++            std::ptr::read_unaligned(
++                response
++                    .as_ptr()
++                    .add(size_of::<OutHeader>())
++                    .cast::<OpenOut>(),
++            )
++        };
++        assert_eq!((opened.fh, opened.padding), (7, 41));
++        assert_eq!(opened.open_flags, OpenOptions::PASSTHROUGH.bits());
++        assert_eq!(backing.registered.load(Ordering::Relaxed), 7);
++
++        let release_header = InHeader {
++            len: (size_of::<InHeader>() + size_of::<ReleaseIn>()) as u32,
++            opcode: Opcode::Release as u32,
++            unique: 89,
++            nodeid: 9,
++            ..Default::default()
++        };
++        let mut release = release_header.as_slice().to_vec();
++        release.extend_from_slice(
++            ReleaseIn {
++                fh: 7,
++                ..Default::default()
++            }
++            .as_slice(),
++        );
++        server
++            .handle_fuse_message_with_backing(&release, &mut response, &backing)
++            .unwrap();
++        assert_eq!(backing.released.load(Ordering::Relaxed), 7);
++    }
++
+     const SUP_GROUPS_EXT_TYPE: u32 = 32;
+ 
+     fn build_sup_groups_request(extension_size: u32) -> (usize, Vec<u8>) {

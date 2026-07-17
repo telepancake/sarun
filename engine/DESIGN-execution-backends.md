@@ -102,6 +102,10 @@ as executable mappings and mmap that genuinely need a host fd.
         through that decoder.
 - [ ] Preserve the synthetic box-id root, sinks, jobserver, shadows, rules,
       attachments, nested boxes, live events, and passthrough behavior.
+  - [x] Keep backing-file eligibility in `SarunFs` while the raw transport owns
+        backing-open/close ioctls and reply IDs; fall back once on kernels or
+        unprivileged daemons that reject registration (Linux currently requires
+        `CAP_SYS_ADMIN`), matching the old adapter's behavior.
 - [ ] Differential-test old and new implementations on identical workloads.
 - [ ] Cut over, delete the old `fuser::Filesystem` implementation, and remove
       `fuser`.

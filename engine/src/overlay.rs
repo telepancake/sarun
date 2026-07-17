@@ -98,6 +98,7 @@ type Key = crate::sarunfs::NodeKey;
 pub struct SarunFs {
     inner: Arc<Inner>,
     root: Key,
+    kernel_passthrough: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Transitional source-compatible name for control-plane callers.  Filesystem
@@ -172,6 +173,7 @@ struct FhInner {
     // first data write; release() only consults it when `dirty`, so 0 is safe.
     last_tgid: u32,
     passthrough: bool, // writes go straight to the real host file (uncaptured)
+    backing_candidate: bool,
     // Kernel passthrough backing registration; kept alive as long as the fd
     // (its Drop closes the registration). Only set for readonly-ruled reads.
     _backing: Option<fuser::BackingId>,
@@ -430,21 +432,25 @@ impl SarunFs {
             .unwrap_or_else(|error| {
                 panic!("cannot initialize upstream backing {}: {error}", lower.display())
             });
-        let ov = SarunFs { inner: Arc::new(Inner {
-            backing,
-            boxes: RwLock::new(BTreeMap::new()),
-            synthetic: SyntheticRuntime::new(),
-            inodes: crate::sarunfs::InodeTable::new((0, String::new())),
-            detached_attrs: RwLock::new(HashMap::new()),
-            handles: HandleTable::new(),
-            ext: RwLock::new(HashMap::new()),
-            cache: std::sync::OnceLock::new(),
-            rules: RwLock::new(crate::rules::Rules::load()),
-            passthrough_ok: std::sync::atomic::AtomicBool::new(false),
-            daemon_reads: AtomicU64::new(0),
-            mutations: crate::sarunfs::mutation::MutationJournal::new(),
-            shadows: RwLock::new(Shadows::load()),
-        }), root: (0, String::new()) };
+        let ov = SarunFs {
+            inner: Arc::new(Inner {
+                backing,
+                boxes: RwLock::new(BTreeMap::new()),
+                synthetic: SyntheticRuntime::new(),
+                inodes: crate::sarunfs::InodeTable::new((0, String::new())),
+                detached_attrs: RwLock::new(HashMap::new()),
+                handles: HandleTable::new(),
+                ext: RwLock::new(HashMap::new()),
+                cache: std::sync::OnceLock::new(),
+                rules: RwLock::new(crate::rules::Rules::load()),
+                passthrough_ok: std::sync::atomic::AtomicBool::new(false),
+                daemon_reads: AtomicU64::new(0),
+                mutations: crate::sarunfs::mutation::MutationJournal::new(),
+                shadows: RwLock::new(Shadows::load()),
+            }),
+            root: (0, String::new()),
+            kernel_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         // Reclaim unreferenced cache pool files once per engine start —
         // cheap (one readdir sweep), and NEVER on the FUSE path: eviction
         // under a live open() race would yank a pool file an mmap still
@@ -476,6 +482,7 @@ impl SarunFs {
         Ok(Self {
             inner: self.inner.clone(),
             root: (box_id, String::new()),
+            kernel_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -1473,6 +1480,7 @@ impl SarunFs {
                 last_pid: pid,
                 last_tgid: 0,
                 passthrough: false,
+                backing_candidate: allow_backing,
                 _backing: None,
             });
             return Ok(OpenedNode {
@@ -1511,6 +1519,7 @@ impl SarunFs {
                 last_pid: pid,
                 last_tgid: 0,
                 passthrough: false,
+                backing_candidate: false,
                 _backing: None,
             });
             return Ok(OpenedNode {
@@ -1541,6 +1550,7 @@ impl SarunFs {
                 last_pid: pid,
                 last_tgid: 0,
                 passthrough: true,
+                backing_candidate: false,
                 _backing: None,
             });
             return Ok(OpenedNode {
@@ -1573,6 +1583,7 @@ impl SarunFs {
                 last_pid: pid,
                 last_tgid: 0,
                 passthrough: false,
+                backing_candidate: false,
                 _backing: None,
             });
             return Ok(OpenedNode {
@@ -1587,8 +1598,7 @@ impl SarunFs {
         let backing_candidate = allow_backing
             && !want_write
             && flags & FMODE_EXEC == 0
-            && (b.direct() || self.is_passthrough_read(&rel))
-            && self.inner.passthrough_ok.load(Ordering::Relaxed);
+            && (b.direct() || self.is_passthrough_read(&rel));
         let (data, upper) = match self.resolve(bid, &rel) {
             Layer::UpperFile { owner, rowid, .. } => {
                 self.ensure_upper_blob(owner, rowid, &rel);
@@ -1650,6 +1660,7 @@ impl SarunFs {
             last_pid: pid,
             last_tgid: 0,
             passthrough: false,
+            backing_candidate,
             _backing: None,
         });
         Ok(OpenedNode {
@@ -1711,6 +1722,7 @@ impl SarunFs {
                 last_pid: pid,
                 last_tgid: 0,
                 passthrough: true,
+                backing_candidate: false,
                 _backing: None,
             });
             (attr, handle)
@@ -1749,6 +1761,7 @@ impl SarunFs {
                 last_pid: pid,
                 last_tgid: 0,
                 passthrough: false,
+                backing_candidate: false,
                 _backing: None,
             });
             (attr, handle)
@@ -2648,7 +2661,12 @@ impl Filesystem for SarunFs {
     }
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let opened = match self.open_node(req.pid(), u64::from(ino), flags.0 as u32, true) {
+        let opened = match self.open_node(
+            req.pid(),
+            u64::from(ino),
+            flags.0 as u32,
+            self.inner.passthrough_ok.load(Ordering::Relaxed),
+        ) {
             Ok(opened) => opened,
             Err(error) => return reply.error(error),
         };
@@ -3012,6 +3030,22 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
     type Handle = u64;
     type DirIter = crate::sarunfs::DirIter;
 
+    fn init(
+        &self,
+        capable: virtiofsd::filesystem::FsOptions,
+    ) -> std::io::Result<virtiofsd::filesystem::FsOptions> {
+        let passthrough = capable.contains(virtiofsd::filesystem::FsOptions::PASSTHROUGH);
+        self.kernel_passthrough.store(passthrough, Ordering::Relaxed);
+        if self.root.0 == 0 {
+            self.inner.passthrough_ok.store(passthrough, Ordering::Relaxed);
+        }
+        Ok(if passthrough {
+            virtiofsd::filesystem::FsOptions::PASSTHROUGH
+        } else {
+            virtiofsd::filesystem::FsOptions::empty()
+        })
+    }
+
     fn lookup(
         &self,
         _ctx: virtiofsd::filesystem::Context,
@@ -3099,7 +3133,12 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         flags: u32,
     ) -> std::io::Result<(Option<u64>, virtiofsd::filesystem::OpenOptions)> {
         let opened = self
-            .open_node(ctx.pid as u32, inode, flags, false)
+            .open_node(
+                ctx.pid as u32,
+                inode,
+                flags,
+                self.kernel_passthrough.load(Ordering::Relaxed),
+            )
             .map_err(virtio_error)?;
         let mut options = virtiofsd::filesystem::OpenOptions::empty();
         if opened.direct_io {
@@ -3111,7 +3150,29 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         if opened.keep_cache {
             options |= virtiofsd::filesystem::OpenOptions::KEEP_CACHE;
         }
+        if opened.backing_candidate {
+            options |= virtiofsd::filesystem::OpenOptions::PASSTHROUGH;
+        }
         Ok((Some(opened.handle), options))
+    }
+
+    fn backing_file(&self, handle: u64) -> std::io::Result<Option<File>> {
+        let handle = self
+            .inner
+            .handles
+            .get(handle)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))?;
+        let Handle::File(handle) = &*handle else {
+            return Ok(None);
+        };
+        let handle = handle.lock().unwrap();
+        if !handle.inner.backing_candidate {
+            return Ok(None);
+        }
+        match &handle.inner.data {
+            FileData::Native(file) => file.try_clone().map(Some),
+            _ => Ok(None),
+        }
     }
 
     fn create(
