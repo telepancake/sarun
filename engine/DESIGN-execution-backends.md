@@ -248,8 +248,10 @@ as executable mappings and mmap that genuinely need a host fd.
         concurrent publishers producing 64 rename-published files per backend;
         every barrier, readback, capture comparison, and host non-escape check
         passed. Ring unit tests separately cover concurrent producers,
-        dead-owner reclamation, and shutdown releasing clients/servers. Live
-        forced-termination and native-SUD soak remain open.
+        dead-owner reclamation, and shutdown releasing clients/servers. Forced
+        FUSE and QEMU box process groups are reaped within the bound and a
+        subsequent box succeeds through the same engine. Native-SUD soak
+        remains open.
 - [ ] Record comparable filesystem benchmarks.  Do not delete a displaced
       backend until its replacement meets or beats its benchmark geometric
       mean.

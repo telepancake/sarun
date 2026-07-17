@@ -9,6 +9,7 @@ wrapper cannot run on an aarch64 kernel.
 """
 
 import os
+import signal
 import shutil
 import socket
 import sqlite3
@@ -134,6 +135,16 @@ def sqlar_observation(sqlar, module, work):
     }
 
 
+def backend_selector(backend):
+    if backend == "fuse":
+        return ["--fuse"]
+    if backend == "sud":
+        return ["--sud"]
+    if backend == "qemu":
+        return ["--qemu", HOST_ARCH]
+    raise ValueError(backend)
+
+
 def run_backend(backend):
     root = Path(tempfile.mkdtemp(prefix=f"sarun-equiv-{backend}-", dir="/var/tmp"))
     xdg = root / "xdg"
@@ -170,15 +181,7 @@ def run_backend(backend):
     try:
         if not wait_socket(module.sock_path()):
             raise RuntimeError(f"{backend}: engine socket never appeared")
-        command = [str(ENGINE_BIN), "run", "--net", "off"]
-        if backend == "fuse":
-            command.append("--fuse")
-        elif backend == "sud":
-            command.append("--sud")
-        elif backend == "qemu":
-            command.extend(["--qemu", HOST_ARCH])
-        else:
-            raise ValueError(backend)
+        command = [str(ENGINE_BIN), "run", "--net", "off", *backend_selector(backend)]
         command.extend([
             f"EQUIV-{backend}", "-C", str(work), "--", "sh", "-c", WORKLOAD,
         ])
@@ -197,6 +200,55 @@ def run_backend(backend):
             and (work / "lower-open.txt").read_bytes() == b"LOWER-OPEN"
             and (work / "victim.txt").read_bytes() == b"VICTIM"
             and not (work / "executed.txt").exists()
+        )
+        abort_command = [
+            str(ENGINE_BIN), "run", "--net", "off", *backend_selector(backend),
+            f"EQUIV-{backend}-abort", "-C", str(work), "--", "sh", "-c",
+            "printf READY > forced-ready; sleep 60",
+        ]
+        abort = subprocess.Popen(
+            abort_command,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        time.sleep(1)
+        was_running = abort.poll() is None
+        try:
+            os.killpg(abort.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            abort.wait(timeout=15)
+            time.sleep(0.2)
+            try:
+                os.killpg(abort.pid, 0)
+                group_gone = False
+            except ProcessLookupError:
+                group_gone = True
+        except subprocess.TimeoutExpired:
+            group_gone = False
+        observation["forced_shutdown"] = was_running and group_gone
+        if not group_gone:
+            try:
+                os.killpg(abort.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                abort.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        probe = subprocess.run(
+            [str(ENGINE_BIN), "run", "--net", "off", *backend_selector(backend),
+             f"EQUIV-{backend}-after-abort", "--", "sh", "-c", "exit 0"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+        observation["forced_shutdown"] = (
+            observation["forced_shutdown"] and probe.returncode == 0
         )
         return observation
     finally:
@@ -248,6 +300,8 @@ def main():
         check(value["sparse_size"] == 1048577, f"{backend}: sparse length captured")
         check(value["source_absent"], f"{backend}: rename source absent")
         check(value["host_unchanged"], f"{backend}: no write escaped to host")
+        check(value["forced_shutdown"],
+              f"{backend}: forced box termination is reaped and transport reusable")
 
     if len(observations) > 1:
         reference = observations[backends[0]]
