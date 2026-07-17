@@ -8,6 +8,20 @@
 
 static unsigned int g_fs_umask;
 
+static int process_fd_path(const char *path)
+{
+    static const char prefix[] = "/proc/self/fd/";
+    if (!path || strncmp(path, prefix, sizeof(prefix) - 1) != 0) return -1;
+    const char *p = path + sizeof(prefix) - 1;
+    if (*p < '0' || *p > '9') return -1;
+    unsigned long value = 0;
+    while (*p >= '0' && *p <= '9') {
+        value = value * 10 + (unsigned int)(*p++ - '0');
+        if (value > INT32_MAX) return -1;
+    }
+    return *p == '\0' ? (int)value : -1;
+}
+
 static int handled(struct sud_syscall_ctx *ctx, long result)
 {
     ctx->ret = result;
@@ -304,15 +318,21 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
     }
 #endif
 #ifdef SYS_open
-    if (nr == SYS_open)
+    if (nr == SYS_open) {
+        int process_fd = process_fd_path((const char *)ctx->args[0]);
+        if (process_fd >= 0 && !sud_vfs_owns_fd(process_fd)) return 0;
         return handled(ctx, sud_vfs_openat(AT_FDCWD,
                          (const char *)ctx->args[0], (int)ctx->args[1],
                          (unsigned int)ctx->args[2], g_fs_umask));
+    }
 #endif
-    if (nr == SYS_openat)
+    if (nr == SYS_openat) {
+        int process_fd = process_fd_path((const char *)ctx->args[1]);
+        if (process_fd >= 0 && !sud_vfs_owns_fd(process_fd)) return 0;
         return handled(ctx, sud_vfs_openat((int)ctx->args[0],
                          (const char *)ctx->args[1], (int)ctx->args[2],
                          (unsigned int)ctx->args[3], g_fs_umask));
+    }
 #ifdef SYS_creat
     if (nr == SYS_creat)
         return handled(ctx, sud_vfs_openat(AT_FDCWD,

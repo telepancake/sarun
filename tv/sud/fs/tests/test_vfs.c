@@ -184,6 +184,16 @@ static int child_calls(struct sud_fs_ring *ring, int lane)
     if (sud_vfs_absolutize(AT_FDCWD, "relative", absolute,
                            sizeof(absolute)) != 0
         || strcmp(absolute, "/relative") != 0) return 10;
+    int process_fd = (int)raw_syscall6(SYS_memfd_create,
+                                       (long)"vfs-process-fd",
+                                       MFD_CLOEXEC, 0, 0, 0, 0);
+    if (process_fd < 0) return 10;
+    char process_fd_path[64];
+    snprintf(process_fd_path, sizeof(process_fd_path),
+             "/proc/self/fd/%d", process_fd);
+    if (fs_call(SYS_openat, AT_FDCWD, (long)process_fd_path,
+                O_RDONLY, 0, 0, 0) != -ENOSYS) return 10;
+    raw_close(process_fd);
     int fd = (int)fs_call(SYS_openat, AT_FDCWD, (long)"/hello",
                           O_RDWR, 0, 0, 0);
     if (fd < 0 || !sud_vfs_owns_fd(fd)) return 11;

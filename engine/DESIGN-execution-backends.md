@@ -136,8 +136,11 @@ as executable mappings and mmap that genuinely need a host fd.
   - [x] Route ordinary file-backed mmap and pathname-based ELF inspection/
         loading through exported canonical handles, including writable shared
         copy-up and logical-cwd/dirfd resolution.
-  - [ ] Add xattr, statfs, locking, sparse/time operations and the remaining
-        exceptional exec forms (notably `execveat(AT_EMPTY_PATH)`).
+  - [x] Add xattr, statfs, locking, sparse/time operations and the remaining
+        exceptional exec forms. `execveat(AT_EMPTY_PATH)` exports the already
+        open canonical handle and carries that descriptor through the ordinary
+        wrapper exec/ELF path; its process-local `/proc/self/fd/N` spelling is
+        the only pathname bypass involved.
   - [ ] Replace the path-remap and inramfs addins in the production wrapper in
         one cutover; do not retain an old/new runtime mode.
 - [x] Add the exceptional SCM_RIGHTS fd lane for exec/mmap backing objects.

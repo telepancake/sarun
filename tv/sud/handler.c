@@ -10,6 +10,9 @@
 #include "sud/raw.h"
 #include "sud/addin.h"
 #include "sud/elf.h"
+#ifdef SUD_ADDIN_FS
+#include "sud/fs/vfs.h"
+#endif
 
 /* ================================================================
  * SUD selector globals — defined here, declared extern in handler.h
@@ -600,23 +603,51 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
         const char *fn = (const char *)a1;
         char **orig_argv = (char **)a2;
         long flags = a4;
+        int exported_exec_fd = -1;
+        char resolved_fn[PATH_MAX];
 
 #ifdef AT_EMPTY_PATH
         if ((flags & AT_EMPTY_PATH) && fn && fn[0] == '\0') {
+#ifdef SUD_ADDIN_FS
+            if (!sud_vfs_owns_fd((int)a0)) {
+                ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
+                UC_SET_RET(uc, ret);
+                return;
+            }
+            if (flags != AT_EMPTY_PATH) {
+                UC_SET_RET(uc, -EINVAL);
+                return;
+            }
+            exported_exec_fd = sud_vfs_export_fd((int)a0, 0);
+            if (exported_exec_fd < 0) {
+                UC_SET_RET(uc, exported_exec_fd);
+                return;
+            }
+#ifdef SYS_fcntl
+            (void)raw_syscall6(SYS_fcntl, exported_exec_fd, F_SETFD,
+                               0, 0, 0, 0);
+#else
+            (void)raw_syscall6(SYS_fcntl64, exported_exec_fd, F_SETFD,
+                               0, 0, 0, 0);
+#endif
+            snprintf(resolved_fn, sizeof(resolved_fn),
+                     "/proc/self/fd/%d", exported_exec_fd);
+#else
             ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
             UC_SET_RET(uc, ret);
             return;
+#endif
         }
 #endif
-        if (flags != 0) {
+        if (exported_exec_fd < 0 && flags != 0) {
             ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
             UC_SET_RET(uc, ret);
             return;
         }
 
-        char resolved_fn[PATH_MAX];
-        if (!resolve_execveat_path((int)a0, fn, flags,
-                                       resolved_fn, sizeof(resolved_fn))) {
+        if (exported_exec_fd < 0
+            && !resolve_execveat_path((int)a0, fn, flags,
+                                      resolved_fn, sizeof(resolved_fn))) {
             ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
             UC_SET_RET(uc, ret);
             return;
@@ -631,6 +662,7 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
                                    PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if ((unsigned long)arena_buf >= (unsigned long)-4095) {
+            if (exported_exec_fd >= 0) raw_close(exported_exec_fd);
             UC_SET_RET(uc, -ENOMEM);
             return;
         }
@@ -659,6 +691,7 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
             ret = -ENOMEM;
         }
         raw_syscall6(SYS_munmap, (long)arena_buf, arena_size, 0, 0, 0, 0);
+        if (exported_exec_fd >= 0) raw_close(exported_exec_fd);
 
         UC_SET_RET(uc, ret);
         return;
