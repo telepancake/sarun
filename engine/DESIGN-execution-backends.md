@@ -512,12 +512,15 @@ as executable mappings and mmap that genuinely need a host fd.
           FUSE/Brush gate. The source is pinned at tag/commit
           `v25.12.5`/`f0a60eee2fe051741c643ea6118718aae1ef17fb`, with all 87
           required archives cached. Prerequisite checking has progressed into
-          package metadata scanning; the current conformance boundary is
-          preserving exported `TOPDIR` through the scan make's recursive
-          `make --no-print-dir -C package/...` invocation. Kati now handles the
-          unambiguous GNU long-option abbreviation generically; the remaining
-          export propagation failure is not bypassed with an OpenWrt-specific
-          flag or variable injection.
+          package metadata scanning. Kati now handles the unambiguous GNU
+          long-option abbreviation generically and recognizes an `env bash`
+          `SHELL` as the POSIX shell it actually invokes, so the make export
+          prefix (including `TOPDIR`) reaches recursive package scans. The
+          exact two-level `env bash` / compound subshell / literal `make -C`
+          regression brings the Make/Brush suite to 39 cases. A real clean
+          prereq run now enters `package/base-files` successfully; the next
+          conformance boundary is completing the package metadata scan rather
+          than failing its first package include.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

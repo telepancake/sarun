@@ -1334,6 +1334,38 @@ def main():
         check(good == b"good" and bad is None,
               f"case38: implicit search is skipped for .PHONY; "
               f"good={good!r} fallback={bad!r}")
+        # ── CASE 39: literal recursive make keeps exports across -C ──────
+        # OpenWrt's metadata scanner invokes literal `make` (not $(MAKE)) from
+        # a compound subshell, clears MAKEFLAGS in that subshell, abbreviates
+        # the directory flag, and relies on an exported TOPDIR while changing
+        # into each package. Its intermediate make selects Bash through
+        # `/usr/bin/env bash`; treating that wrapper as a non-POSIX custom
+        # interpreter used to discard the generated export environment.
+        rcdir = work / "recursive-c-export"
+        shutil.rmtree(rcdir, ignore_errors=True)
+        (rcdir / "child").mkdir(parents=True, exist_ok=True)
+        (rcdir / "rules.mk").write_text("FROM_RULES := reached\n")
+        (rcdir / "child/Makefile").write_text(
+            "include $(TOPDIR)/rules.mk\n"
+            "all:\n\t@printf '%s' '$(FROM_RULES)' > result.txt\n")
+        (rcdir / "scan.mk").write_text(
+            "SHELL := /usr/bin/env bash\n"
+            "all:\n\t@( export MAKEFLAGS= ;make --no-print-dir -r -C child )\n")
+        (rcdir / "Makefile").write_text(
+            "TOPDIR := $(CURDIR)\n"
+            "export TOPDIR\n"
+            "all:\n\t@$(MAKE) -r -f scan.mk\n")
+        r = run_make("MAKE39", rcdir, "-j10", "all")
+        check(r.returncode == 0,
+              f"case39: inherited TOPDIR reaches a literal second-level "
+              f"recursive make through -C "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp39 = latest_sqlar(m)
+        reached = m.sqlar_content(
+            sp39, str((rcdir / "child/result.txt").resolve()).lstrip("/"))
+        check(reached == b"reached",
+              f"case39: child parsed the parent-rooted include after -C; "
+              f"got {reached!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

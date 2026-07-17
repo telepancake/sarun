@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 22:30:00 +0000
+Subject: [PATCH] recognize env-wrapped POSIX make shells
+
+---
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -29,5 +29,42 @@ use bytes::{BufMut, Bytes, BytesMut};
+ use memchr::memchr2;
+-
++
++/// True when GNU make's `SHELL` value names a POSIX shell that the embedded
++/// Brush runner can execute.  `SHELL` is commonly a direct path, but build
++/// systems also use `env bash` so environment lookup chooses Bash.  Treating
++/// that wrapper as an opaque custom interpreter dropped make's exported
++/// environment before every recipe.
++///
++/// This deliberately recognizes only the unambiguous forms we can execute as
++/// a shell.  An arbitrary command string remains on kati's custom-SHELL path.
++pub fn is_posix_shell_command(shell: &[u8]) -> bool {
++    fn is_posix_name(word: &[u8]) -> bool {
++        let base = word.rsplit(|byte| *byte == b'/').next().unwrap_or(word);
++        matches!(base, b"sh" | b"bash" | b"dash" | b"ash" | b"ksh" | b"zsh")
++    }
++
++    let mut words = shell.split(|byte| byte.is_ascii_whitespace())
++        .filter(|word| !word.is_empty());
++    let Some(command) = words.next() else { return false };
++    if is_posix_name(command) {
++        return true;
++    }
++
++    let base = command.rsplit(|byte| *byte == b'/').next().unwrap_or(command);
++    if base != b"env" {
++        return false;
++    }
++    // The common wrapper is `env bash`; also accept leading NAME=VALUE words
++    // and flag-only env options.  Options that take a separate argument are
++    // intentionally not guessed here: they remain on the custom-SHELL path.
++    for word in words {
++        if word == b"--" || word.starts_with(b"-") || word.contains(&b'=') {
++            continue;
++        }
++        return is_posix_name(word);
++    }
++    false
++}
++
+ // sarun: hook for embedders (the sarun engine) to substitute their own
+ // recipe runner — runs the shell command IN-PROCESS via embedded brush
+ // instead of fork+exec'ing /bin/sh. Returns the recipe's exit code; the
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -33,8 +33,9 @@ use crate::{
+     dep::{DepNode, NamedDepNode},
+     error,
+     eval::{Evaluator, FrameType},
+     expr::Evaluable,
+-    fileutil::{RedirectStderr, get_timestamp, run_command, run_with_installed_runner},
++    fileutil::{RedirectStderr, get_timestamp, is_posix_shell_command, run_command,
++               run_with_installed_runner},
+     flags::FLAGS,
+     symtab::Symbol,
+     warn,
+@@ -308,12 +309,8 @@ fn run_node_commands(
+     // that text would be pasted into the command handed to the custom program
+     // (visibly corrupting it); GNU make passes exports to such recipes through
+     // the child ENVIRONMENT, which the fork path inherits from the process
+     // anyway.
+-    let shell_base = std::path::Path::new(OsStr::from_bytes(shell))
+-        .file_name()
+-        .and_then(|s| s.to_str())
+-        .unwrap_or("");
+-    let posix_shell = matches!(shell_base, "sh" | "bash" | "dash" | "ash" | "ksh" | "zsh");
++    let posix_shell = is_posix_shell_command(shell);
+     let mut prefix = if posix_shell { req.box_prefix.to_vec() } else { Vec::new() };
+     if posix_shell {
+         prefix.extend_from_slice(&exports_prefix(&req.exports));

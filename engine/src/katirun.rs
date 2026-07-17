@@ -11,7 +11,8 @@
 //      that handoff is gone — kati executes directly now.)
 //   2. routes every recipe through embedded brush in THIS process via the
 //      `install_recipe_runner` hook — no /bin/sh fork, no engine re-exec —
-//      unless SHELL is non-POSIX, in which case the runner declines
+//      unless SHELL does not resolve directly or through `env` to a POSIX
+//      shell, in which case the runner declines
 //      (Passthrough) and kati's exec.rs uses the classic fork+exec path.
 //   3. emits a `build_edges` provenance frame for the dep graph (the same
 //      frame/table/verb Phase 1's ninja path used), capturing EVERY edge
@@ -953,11 +954,7 @@ fn install_make_recipe_runner() {
     start_activity_reporting();
     kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, prefix, cmd, cwd, redirect_stderr, output_cb| {
         use kati::fileutil::RecipeRunnerDecision;
-        let shell_base = std::path::Path::new(std::ffi::OsStr::from_bytes(shell))
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let posix_shell = matches!(shell_base, "sh" | "bash" | "dash" | "ash" | "ksh" | "zsh");
+        let posix_shell = kati::fileutil::is_posix_shell_command(shell);
         if !posix_shell {
             return RecipeRunnerDecision::Passthrough;
         }
