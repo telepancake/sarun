@@ -1209,6 +1209,29 @@ def main():
         check(remade == b"fresh\n",
               f"case33: main recipe sees reparsed generated include; "
               f"got {remade!r}")
+        # ── CASE 34: shared and repeated prerequisites run each target once ─
+        # A parallel dependency-count scheduler may encounter the same target
+        # through several release paths. Once selected, that target is active:
+        # a later zero-count observation must not prepare or launch it again.
+        dq = work / "duplicate-ready"
+        shutil.rmtree(dq, ignore_errors=True)
+        dq.mkdir(parents=True, exist_ok=True)
+        (dq / "Makefile").write_text(
+            ".PHONY: all left right shared\n"
+            "all: left right shared shared\n"
+            "left: shared shared\n\t@printf '%s\\n' left >> result.txt\n"
+            "right: shared\n\t@printf '%s\\n' right >> result.txt\n"
+            "shared:\n\t@printf '%s\\n' shared >> result.txt\n")
+        r = run_make("MAKE34", dq, "-j10", "all")
+        check(r.returncode == 0,
+              f"case34: duplicate/shared dependency graph completes under "
+              f"-j10 (got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp34 = latest_sqlar(m)
+        lines = m.sqlar_content(
+            sp34, str((dq / "result.txt").resolve()).lstrip("/"))
+        got = sorted((lines or b"").splitlines())
+        check(got == [b"left", b"right", b"shared"],
+              f"case34: every recipe runs exactly once; got {got!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

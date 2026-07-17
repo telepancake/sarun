@@ -59,3 +59,4 @@
 0590-kati--expose-make-exports-to-parse-time-shell-expansions.patch
 0600-kati--let-recursive-argv-override-inherited-MAKEFLAGS-variab.patch
 0610-kati--remake-stale-included-makefiles-before-goals.patch
+0620-Prevent-duplicate-scheduling-of-active-make-targets.patch

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 20:27:36 +0000
+Subject: [PATCH] Prevent duplicate scheduling of active make targets
+
+---
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index d17e971..4ce3338 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -176,6 +176,10 @@ struct Executor<'a> {
+ #[derive(PartialEq, Eq)]
+ enum PState {
+     Pending,
++    /// Selected from the ready heap.  This covers both command preparation and
++    /// an asynchronously running recipe: either way the node must not be
++    /// selected a second time if another release path observes unfinished=0.
++    Active,
+     Done,
+ }
+ 
+@@ -670,7 +674,7 @@ list of the rule for '{output}' at {loc}"));
+                 if dp.unfinished > 0 {
+                     dp.unfinished -= 1;
+                 }
+-                dp.unfinished == 0 && dp.state != PState::Done
++                dp.unfinished == 0 && dp.state == PState::Pending
+             };
+             if now_ready {
+                 let r = graph[&dep].rank;
+@@ -749,6 +753,13 @@ list of the rule for '{output}' at {loc}"));
+             // 1. Evaluate ready nodes on the make thread (serial) → done or queued.
+             while failed.is_none() || keep_going {
+                 let Some(Ready { sym, .. }) = ready.pop() else { break };
++                // A target can be reachable through several dependency paths.
++                // Its first release owns it; stale/duplicate heap entries must
++                // never evaluate or launch the recipe again.
++                if graph[&sym].state != PState::Pending {
++                    continue;
++                }
++                graph.get_mut(&sym).unwrap().state = PState::Active;
+                 let (ts, runreq) = self.prepare_node(&graph, sym, &mut missing)?;
+                 match runreq {
+                     None => self.finish_node(&mut graph, sym, ts, &mut ready, &mut done_count),

@@ -463,6 +463,12 @@ as executable mappings and mmap that genuinely need a host fd.
           requested goals. A focused regression reproduces Kbuild's stale
           `include/config/auto.conf` after `.config` changes; all 33 embedded
           Make/Brush cases pass.
+    - [x] Give the parallel dependency scheduler an explicit active state.
+          Once a target has been selected for preparation or execution, another
+          release path cannot enqueue it again merely because its unfinished
+          count is already zero. A shared/duplicate-prerequisite `-j10`
+          regression verifies each recipe runs exactly once; all 34 embedded
+          Make/Brush cases pass on native aarch64.
     - [ ] Re-run the complete FUSE Brush build, then the complete QEMU Brush
           build, compare retained artifacts, and record timings/counts here.
 - [x] Remove backend-specific semantic branches and obsolete compatibility
