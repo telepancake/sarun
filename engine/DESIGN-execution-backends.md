@@ -221,6 +221,34 @@ as executable mappings and mmap that genuinely need a host fd.
 - [ ] Remove backend-specific semantic branches and obsolete compatibility
       code; update generated help and user documentation.
 
+## Validation ledger (2026-07-17, aarch64 host)
+
+- The final static `aarch64-unknown-linux-musl` test harness has 383 passing
+  tests and one ignored browser test. Its only two failures are the pre-existing
+  relation-completion cases
+  `bash_editor_uses_relation_for_backward_completion_and_insertion` and
+  `production_brush_document_propagates_later_find_type_constraint`; no
+  filesystem, SUD ring, FUSE transport, or QEMU transport test fails.
+- The fixed SUD wrapper builds as freestanding static i386 and x86_64 ELF on
+  this aarch64 host. All eight 32/64 client, descriptor-lane, canonical-FUSE,
+  and VFS fixtures pass, including logical-cwd propagation through local
+  pseudo-filesystem transitions.
+- A live native-aarch64 FUSE box exits zero and captures the exact requested
+  blob without a host write. The final paired aarch64 TCG appliance does the
+  same through target `/init brush` and powers down in two seconds.
+- The final paired x86_64 TCG appliance runs target `/init brush` on this
+  aarch64 host, captures the exact requested blob, and exits through its
+  triple-fault reboot in five seconds. An intentionally mismatched aarch64
+  `/bin/sh` reports versioned exit 127 and shuts down in three seconds.
+- Native live SUD remains untestable on this machine: its x86 wrappers require
+  an x86 kernel with `PR_SET_SYSCALL_USER_DISPATCH`, while qemu-user/binfmt
+  rejects that prctl with `EINVAL`. The 32/64 freestanding behavioral fixtures
+  are the strongest valid substitute here; final live parity requires native
+  x86 Linux hardware.
+- `/dev/kvm` is absent, so the TCG legs are proven here and both KVM legs remain
+  open. The broad real-project/benchmark matrix in section 5 also remains open;
+  it must not be represented as complete from smoke tests.
+
 ## Commit gates
 
 Commit and push after: this roadmap; static upstream seam; shared-core protocol
