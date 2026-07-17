@@ -456,6 +456,13 @@ as executable mappings and mmap that genuinely need a host fd.
           before the child's argv and replaced by variable name; otherwise
           Kbuild's parent `obj=fs` overrides `obj=fs/notify`, recursively runs
           the wrong directory forever, and never creates the nested archive.
+    - [x] Implement GNU's two-phase remake behavior for existing stale included
+          makefiles, not only missing ones. Dependency-graph construction is
+          now non-destructive: Kati first updates parsed include targets,
+          reparses only if a recipe actually ran, and otherwise proceeds to the
+          requested goals. A focused regression reproduces Kbuild's stale
+          `include/config/auto.conf` after `.config` changes; all 33 embedded
+          Make/Brush cases pass.
     - [ ] Re-run the complete FUSE Brush build, then the complete QEMU Brush
           build, compare retained artifacts, and record timings/counts here.
 - [x] Remove backend-specific semantic branches and obsolete compatibility

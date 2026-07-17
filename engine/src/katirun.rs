@@ -493,12 +493,11 @@ fn run_kati(
         }
     }
 
-    // sarun: GNU make's remake-the-makefile loop. After parse, if a
-    // required `include` named a file that didn't exist at parse time
-    // AND a rule for it is in ev.rules, build THOSE targets first;
-    // make_main will then re-exec the engine so the second parse sees
-    // the freshly-generated content. If no rule applies, raise the
-    // canonical error and exit.
+    // sarun: GNU make's remake-the-makefile loop. Every included makefile is
+    // itself a build target, including one that already existed while parsing.
+    // Build those targets first; only request a reparse when the executor
+    // actually ran something. This distinction is what lets a stale generated
+    // config refresh while an up-to-date include proceeds to the real goals.
     let mut remake_targets: Vec<(Symbol, bool)> = Vec::new();
     {
         let pending = std::mem::take(&mut ev.pending_remake_includes);
@@ -516,11 +515,15 @@ fn run_kati(
                         .matches(&name.as_bytes())
                     })
             });
-            if producible
-                && (*required || !noremake.contains(name.as_bytes()))
-            {
+            let path = std::path::Path::new(name);
+            let exists = if path.is_absolute() {
+                path.exists()
+            } else {
+                working_dir.join(path).exists()
+            };
+            if producible && (*required || !noremake.contains(name.as_bytes())) {
                 remake_targets.push((sym, *required));
-            } else if *required {
+            } else if *required && !exists {
                 let pat_str = String::from_utf8_lossy(name.as_bytes());
                 eprintln!("{loc}: {pat_str}: No such file or directory");
                 std::process::exit(2);
@@ -529,80 +532,44 @@ fn run_kati(
             // unmakeable): GNU tolerates it.
         }
     }
-    let remake_active = !remake_targets.is_empty();
-
-    let nodes: Vec<NamedDepNode>;
-    {
-        let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*dependency analysis*"), Loc::default());
-        // When remaking, only build the include targets in this
-        // invocation; the user's real targets get built in the
-        // re-exec'd process.
-        let dep_targets = if remake_active {
-            remake_targets.iter().map(|(s, _)| *s).collect()
-        } else {
-            targets.to_owned()
-        };
-        nodes = make_dep(&mut ev, dep_targets)?;
-    }
-
     // Materialize the final recipe environment after parsing. The same helper
     // is called immediately before every parse-time $(shell ...) expansion.
     ev.refresh_box_export_prefix()?;
 
-    // sarun: emit the build_edges provenance frame BEFORE exec so the
-    // UI's build target pane is populated immediately, even for
-    // up-to-date targets that exec.rs will skip. Walk the kati dep
-    // graph reachable from `nodes` and ship one edge per node — same
-    // shape Phase 1 ninja's emit_build_edges produced. Without this
-    // the build target pane is empty in -b boxes (regression from
-    // ripping out the n2 path).
-    emit_build_edges_kati(&nodes);
-
-    {
-        // sarun: drive kati's OWN executor (src-rs/exec.rs) on the dep
-        // graph directly — NO ninja generation, NO n2. Recipes run
-        // sequentially, in declaration order, with mtime-based
-        // staleness — i.e. exactly the standalone rkati semantics, so
-        // box-mode now passes the same corpus tests rkati does. The
-        // shell call inside exec.rs is intercepted by the
-        // install_recipe_runner hook we set in make_main and routed
-        // through embedded brush in-process — no fork+exec to a
-        // shadowed /bin/sh.
+    let mut remake_active = false;
+    if !remake_targets.is_empty() {
+        let remake_nodes = {
+            let _frame = ev.enter(
+                FrameType::Phase,
+                bytes::Bytes::from_static(b"*remake dependency analysis*"),
+                Loc::default(),
+            );
+            make_dep(
+                &mut ev,
+                remake_targets.iter().map(|(symbol, _)| *symbol).collect(),
+            )?
+        };
+        emit_build_edges_kati(&remake_nodes);
         let _frame = ev.enter(
             FrameType::Phase,
-            bytes::Bytes::from_static(b"*execute*"),
+            bytes::Bytes::from_static(b"*remake*"),
             Loc::default(),
         );
-        if remake_active {
-            // GNU tolerates a failed remake of an OPTIONAL (-include)
-            // makefile: build required and optional include targets in
-            // separate passes so an optional one that can't be built (no
-            // pickable rule, failing recipe) never aborts the make — the
-            // re-parse simply proceeds without it.
-            let required: std::collections::HashSet<Symbol> = remake_targets
-                .iter().filter(|(_, req)| *req).map(|(s, _)| *s).collect();
-            let (req_nodes, opt_nodes): (Vec<_>, Vec<_>) = nodes
-                .into_iter()
-                .partition(|(s, _)| required.contains(s));
-            if !req_nodes.is_empty() {
-                kati::exec::exec(req_nodes, &mut ev)?;
-            }
-            for node in opt_nodes {
-                // optional include not remakable — GNU carries on, silently
-                let _ = kati::exec::exec_opts(vec![node], &mut ev, true);
-            }
-        } else {
-            // GNU -n/-B/-q apply to the MAIN goals only; the remake_active
-            // passes above rebuild included makefiles for real.
-            ev.dry_run = dry_run;
-            ev.always_make = always_make;
-            ev.question = question;
-            kati::exec::exec(nodes, &mut ev)?;
-            ev.dry_run = false;
-            ev.always_make = false;
-            ev.question = false;
+        let required: std::collections::HashSet<Symbol> = remake_targets
+            .iter().filter(|(_, req)| *req).map(|(s, _)| *s).collect();
+        let (req_nodes, opt_nodes): (Vec<_>, Vec<_>) = remake_nodes
+            .into_iter()
+            .partition(|(s, _)| required.contains(s));
+        if !req_nodes.is_empty() {
+            kati::exec::exec(req_nodes, &mut ev)?;
+            remake_active |= ev.question_would_run;
         }
-        ev.finish()?;
+        for node in opt_nodes {
+            // GNU tolerates a failed remake of an optional included makefile.
+            if kati::exec::exec_opts(vec![node], &mut ev, true).is_ok() {
+                remake_active |= ev.question_would_run;
+            }
+        }
     }
     // Optional remake targets that did not materialize are reported back so
     // the re-run skips them (otherwise a permanently-unmakeable -include
@@ -621,8 +588,49 @@ fn run_kati(
         })
         .map(|(sym, _)| sym.as_bytes().to_vec())
         .collect();
-    Ok(RunKatiResult { remake_active, failed_optional,
-                       would_run: ev.question_would_run })
+    if remake_active {
+        ev.finish()?;
+        return Ok(RunKatiResult {
+            remake_active: true,
+            failed_optional,
+            would_run: false,
+        });
+    }
+
+    let nodes = {
+        let _frame = ev.enter(
+            FrameType::Phase,
+            bytes::Bytes::from_static(b"*dependency analysis*"),
+            Loc::default(),
+        );
+        make_dep(&mut ev, targets.to_owned())?
+    };
+    // Emit provenance before execution so even skipped/up-to-date goals are
+    // visible in the build-target pane.
+    emit_build_edges_kati(&nodes);
+    {
+        let _frame = ev.enter(
+            FrameType::Phase,
+            bytes::Bytes::from_static(b"*execute*"),
+            Loc::default(),
+        );
+        // GNU -n/-B/-q apply to the main goals only; makefile remakes above
+        // were always real and unforced.
+        ev.dry_run = dry_run;
+        ev.always_make = always_make;
+        ev.question = question;
+        kati::exec::exec(nodes, &mut ev)?;
+        ev.dry_run = false;
+        ev.always_make = false;
+        ev.question = false;
+    }
+    let would_run = ev.question_would_run;
+    ev.finish()?;
+    Ok(RunKatiResult {
+        remake_active: false,
+        failed_optional,
+        would_run,
+    })
 }
 
 /// Walk the kati dep graph reachable from `roots` and ship one

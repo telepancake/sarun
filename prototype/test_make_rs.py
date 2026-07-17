@@ -1180,6 +1180,35 @@ def main():
         check(conditional == b"onetwo",
               f"case32: included nonempty CONFIG enables the second recipe "
               f"line; got {conditional!r}")
+        # ── CASE 33: an EXISTING stale include is remade and reparsed ────
+        # Kbuild leaves include/config/auto.conf present after a config merge,
+        # but makes .config newer. GNU make treats every parsed makefile as a
+        # target, refreshes the stale include, and restarts before evaluating
+        # CONFIG-dependent architecture recipes.
+        sr = work / "stale-remade-include"
+        shutil.rmtree(sr, ignore_errors=True)
+        sr.mkdir(parents=True, exist_ok=True)
+        (sr / "source.conf").write_text("VALUE := fresh\n")
+        (sr / "generated.conf").write_text("VALUE := stale\n")
+        now = time.time()
+        os.utime(sr / "generated.conf", (now - 10, now - 10))
+        os.utime(sr / "source.conf", (now, now))
+        (sr / "Makefile").write_text(
+            "include generated.conf\n"
+            "all:\n"
+            "\t@printf '%s\\n' '$(VALUE)' > result.txt\n"
+            "generated.conf: source.conf\n"
+            "\t@cp $< $@\n")
+        r = run_make("MAKE33", sr)
+        check(r.returncode == 0,
+              f"case33: stale existing include is remade before main goals "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp33 = latest_sqlar(m)
+        remade = m.sqlar_content(
+            sp33, str((sr / "result.txt").resolve()).lstrip("/"))
+        check(remade == b"fresh\n",
+              f"case33: main recipe sees reparsed generated include; "
+              f"got {remade!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

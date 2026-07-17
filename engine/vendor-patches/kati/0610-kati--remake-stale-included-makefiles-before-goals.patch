@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 20:15:59 +0000
+Subject: [PATCH] kati: remake stale included makefiles before goals
+
+Treat every parsed include as a makefile target, not only missing includes. Build the include graph first, reparse only when a recipe ran, and keep dependency analysis non-destructive so up-to-date includes can proceed to the requested goals.
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 8469590..f9b04cc 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -474,7 +474,10 @@ struct PickedRuleInfo {
+ 
+ impl<'a> DepBuilder<'a> {
+     fn new(ev: &'a mut Evaluator) -> Result<Self> {
+-        let rule_vars = std::mem::take(&mut ev.rule_vars);
++        // Dependency analysis may run once for included makefile targets and
++        // again for the user's goals. Building a graph must therefore be a
++        // read of the parsed grammar, not a destructive drain of it.
++        let rule_vars = ev.rule_vars.clone();
+         // The final value of $(VPATH), evaluated once here — GNU make also
+         // uses the value in effect after reading all makefiles.
+         let vpath_dirs: Vec<Bytes> = {
+@@ -853,8 +856,7 @@ impl<'a> DepBuilder<'a> {
+     }
+ 
+     fn populate_rules(&mut self) -> Result<()> {
+-        // TODO: Is this take necessary, or can we refactor how we pass around ev?
+-        for rule in std::mem::take(&mut self.ev.rules) {
++        for rule in self.ev.rules.clone() {
+             let rule = Arc::new(rule);
+             if rule.outputs.is_empty() {
+                 self.populate_implicit_rule(rule)?;
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 6df5292..e972d6d 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -325,14 +325,12 @@ pub struct Evaluator {
+     /// target. When a recipe exits with a non-zero status, kati
+     /// removes the target's output file (mirrors GNU make).
+     pub delete_on_error: bool,
+-    /// sarun: required `include` directives whose file didn't exist at
+-    /// parse time, paired with the source location of the directive.
+-    /// The remake-the-makefile loop in main.rs checks for rules
+-    /// producing these names and builds + re-parses if any apply.
+-    /// (loc, filename, required) — missing `include` files queued for the
+-    /// remake-the-makefile loop. `-include` files queue with required=false:
+-    /// GNU remakes them too when a rule exists, but a missing one without a
+-    /// rule is silently tolerated.
++    /// sarun: every file named by an `include` directive, paired with the
++    /// source location and whether the include was required. GNU make treats
++    /// parsed makefiles as build targets too: an EXISTING but stale include
++    /// must be remade and the whole makefile reparsed just like a missing one.
++    /// `-include` entries carry required=false so an absent, unproducible file
++    /// remains silently tolerated.
+     pub pending_remake_includes: Vec<(Loc, OsString, bool)>,
+     /// sarun: in the in-process box, exported make variables can't be staged
+     /// into the process environment (`std::env::set_var`) — many makes share one
+@@ -1345,6 +1343,14 @@ impl Evaluator {
+                 }
+ 
+                 {
++                    // Existing included makefiles are remake candidates too.
++                    // This is essential for generated configuration fragments:
++                    // their producer can make them stale without deleting them.
++                    self.pending_remake_includes.push((
++                        stmt.loc(),
++                        OsString::from_vec(fname.to_vec()),
++                        stmt.should_exist,
++                    ));
+                     let _frame = self.enter(FrameType::Parse, fname.clone(), stmt.loc());
+                     self.do_include(fname)
+                         .with_context(|| format!("In file included from {}:", stmt.loc()))?;
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index a99d73d..da91e57 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -244,15 +244,10 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+         ev.dump_include_json(filename)?;
+     }
+ 
+-    // sarun: GNU make's "remake the makefile" loop, step 1 of 2.
+-    // Before we do dep analysis on the user's targets, check whether
+-    // any required `include` was deferred during parse and is producible
+-    // by a rule we have. If so, fold those names into the targets list
+-    // for the single make_dep call below, exec the resulting nodes
+-    // (which build the missing includes), and then re-exec ourselves
+-    // with the same args — the second invocation parses with the
+-    // freshly-generated content visible. Guard against infinite
+-    // re-exec via SARUN_KATI_REMAKE_DEPTH (capped at 5).
++    // sarun: GNU make's "remake the makefile" loop. Every included
++    // makefile is a build target, including an existing but stale one.
++    // Execute those targets before the user's goals and re-exec only when a
++    // recipe actually ran, so up-to-date includes do not create a loop.
+     let mut remake_targets: Vec<(Symbol, bool)> = Vec::new();
+     {
+         let pending = std::mem::take(&mut ev.pending_remake_includes);
+@@ -271,9 +266,15 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+                 && std::env::var("SARUN_KATI_NOREMAKE")
+                     .map(|v| v.split(':').any(|f| f.as_bytes() == name.as_bytes()))
+                     .unwrap_or(false);
++            let path = std::path::Path::new(&name);
++            let exists = if path.is_absolute() {
++                path.exists()
++            } else {
++                ev.working_dir.join(path).exists()
++            };
+             if producible && !noremake_skip {
+                 remake_targets.push((sym, *required));
+-            } else if *required {
++            } else if *required && !exists {
+                 // Missing required include with no matching rule. Emit a
+                 // single line matching upstream kati's `error_loc!` shape;
+                 // the corpus normalizer rolls real make's follow-up
+@@ -285,47 +286,25 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+             // A missing OPTIONAL include with no rule: GNU tolerates it.
+         }
+     }
+-    let remake_active = !remake_targets.is_empty();
+-
+-    let nodes: Vec<NamedDepNode>;
+-    {
+-        let _frame = ev.enter(
+-            FrameType::Phase,
+-            Bytes::from_static(b"*dependency analysis*"),
+-            Loc::default(),
+-        );
+-        let _tr = ScopedTimeReporter::new("make dep time");
+-        // When remaking, we only want to build the remake targets in
+-        // this invocation; the user's real targets get built in the
+-        // re-exec'd process.
+-        let dep_targets = if remake_active {
+-            remake_targets.iter().map(|(s, _)| *s).collect()
+-        } else {
+-            targets.to_owned()
+-        };
+-        nodes = make_dep(&mut ev, dep_targets)?;
+-    }
+-
+-    if FLAGS.is_syntax_check_only {
+-        return Ok(0);
+-    }
+-
+-    if remake_active {
+-        let depth: u32 = std::env::var("SARUN_KATI_REMAKE_DEPTH")
+-            .ok()
+-            .and_then(|s| s.parse().ok())
+-            .unwrap_or(0);
+-        if depth >= 5 {
+-            eprintln!(
+-                "*** kati: remake-the-makefile loop exceeded 5 iterations (still missing: {:?})",
+-                remake_targets
++    let mut remake_active = false;
++    if !remake_targets.is_empty() {
++        let remake_nodes = {
++            let _frame = ev.enter(
++                FrameType::Phase,
++                Bytes::from_static(b"*remake dependency analysis*"),
++                Loc::default(),
+             );
+-            std::process::exit(2);
++            let _tr = ScopedTimeReporter::new("makefile remake dep time");
++            make_dep(
++                &mut ev,
++                remake_targets.iter().map(|(symbol, _)| *symbol).collect(),
++            )?
++        };
++        if FLAGS.is_syntax_check_only {
++            return Ok(0);
+         }
+-        // Build the remake targets. GNU tolerates a failed remake of an
+-        // OPTIONAL (-include) makefile: build required and optional include
+-        // targets in separate passes so an optional one that can't be built
+-        // never aborts the make — the re-parse proceeds without it.
++        // Build required and optional includes separately so a failed
++        // optional producer remains non-fatal.
+         {
+             let _frame = ev.enter(
+                 FrameType::Phase,
+@@ -334,17 +313,33 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+             );
+             let required: std::collections::HashSet<Symbol> = remake_targets
+                 .iter().filter(|(_, req)| *req).map(|(s, _)| *s).collect();
+-            let (req_nodes, opt_nodes): (Vec<_>, Vec<_>) = nodes
++            let (req_nodes, opt_nodes): (Vec<_>, Vec<_>) = remake_nodes
+                 .into_iter()
+                 .partition(|(s, _)| required.contains(s));
+             if !req_nodes.is_empty() {
+                 kati::exec::exec(req_nodes, &mut ev)?;
++                remake_active |= ev.question_would_run;
+             }
+             for node in opt_nodes {
+-                // optional include not remakable — GNU carries on, silently
+-                let _ = kati::exec::exec_opts(vec![node], &mut ev, true);
++                if kati::exec::exec_opts(vec![node], &mut ev, true).is_ok() {
++                    remake_active |= ev.question_would_run;
++                }
+             }
+         }
++    }
++
++    if remake_active {
++        let depth: u32 = std::env::var("SARUN_KATI_REMAKE_DEPTH")
++            .ok()
++            .and_then(|s| s.parse().ok())
++            .unwrap_or(0);
++        if depth >= 5 {
++            eprintln!(
++                "*** kati: remake-the-makefile loop exceeded 5 iterations (still missing: {:?})",
++                remake_targets
++            );
++            std::process::exit(2);
++        }
+         // Optional remake targets that did NOT materialize are carried in
+         // SARUN_KATI_NOREMAKE so the re-exec'd pass skips them instead of
+         // re-queueing forever (GNU proceeds without an unmakeable optional
+@@ -392,6 +387,21 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+         std::process::exit(2);
+     }
+ 
++    let nodes: Vec<NamedDepNode>;
++    {
++        let _frame = ev.enter(
++            FrameType::Phase,
++            Bytes::from_static(b"*dependency analysis*"),
++            Loc::default(),
++        );
++        let _tr = ScopedTimeReporter::new("make dep time");
++        nodes = make_dep(&mut ev, targets.to_owned())?;
++    }
++
++    if FLAGS.is_syntax_check_only {
++        return Ok(0);
++    }
++
+     if FLAGS.generate_ninja {
+         let _frame = ev.enter(
+             FrameType::Phase,
