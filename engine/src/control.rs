@@ -1095,28 +1095,6 @@ fn dispatch_reply_transport(
             let remaining = crate::oaita::budget::remaining(state, id).unwrap_or(0);
             Ok(TransportResponse::Budget { remaining })
         }
-        TransportRequest::SudIngest { r#box } => {
-            if let Some(fd) = peer_pidfd {
-                unsafe { libc::close(fd); }
-            }
-            let id = resolve(&discover::discover(), r#box.as_str())
-                .ok_or("no slopbox")?;
-            let live = lock(state).overlay.clone().and_then(|overlay| overlay.live_box(id))
-                .ok_or("box is not live")?;
-            let runpid = u32::try_from(
-                lock(state).box_runpids.get(&id).copied().unwrap_or(0))
-                .map_err(|_| "negative box runner pid")?;
-            let report = crate::sud::sweep(&live, id, runpid);
-            let count = u64::try_from(report.ingested)
-                .map_err(|_| "sud ingest count exceeds u64")?;
-            let errors = report.errors.into_iter().map(|error|
-                crate::wire::BoundedText::new(error)
-                    .map_err(|_| "sud ingest error exceeds relation bound"))
-                .collect::<Result<Vec<_>, _>>()?;
-            let errors = crate::wire::BoundedVec::new(errors)
-                .map_err(|_| "sud ingest error count exceeds relation bound")?;
-            Ok(TransportResponse::SudIngested { count, errors })
-        }
         TransportRequest::ServiceDeclare { name, argv, net_mode } => {
             if let Some(fd) = peer_pidfd {
                 unsafe { libc::close(fd); }
@@ -1174,12 +1152,6 @@ fn legacy_transport_response(
         Ok(TransportResponse::Recorded { count }) => {
             json!({"ok": true, "recorded": count})
         }
-        Ok(TransportResponse::SudIngested { count, errors }) => json!({
-            "ok": true,
-            "ingested": count,
-            "errors": errors.into_inner().into_iter()
-                .map(crate::wire::BoundedText::into_inner).collect::<Vec<_>>(),
-        }),
         Ok(TransportResponse::Budget { remaining }) => {
             json!({"ok": true, "remaining": remaining})
         }
@@ -1471,19 +1443,6 @@ fn dispatch(state: &State, msg: &Value) -> Value {
             }
         }
         "ui" => dispatch_ui(state, msg),
-        // --sud sweep (engine/DESIGN-sud.md): the runner calls this after
-        // its wrapper child exits. We resolve the box, then hand the live
-        // BoxState to sud::sweep, which owns the upper/inramfs/trace ingest
-        // and residue cleanup; here we only shape the report into a reply.
-        "sud_ingest" => {
-            let result = msg.get("sid").and_then(Value::as_str)
-                .ok_or_else(|| "sud_ingest: missing box selector".to_string())
-                .and_then(|value| crate::wire::BoundedText::new(value.to_owned())
-                    .map_err(|_| "sud_ingest: box selector exceeds relation bound".to_string()))
-                .map(|r#box| crate::generated_wire::TransportRequest::SudIngest { r#box })
-                .and_then(|request| dispatch_reply_transport(state, request, None, None));
-            legacy_transport_response(result)
-        }
         "patch" => {
             let boxes = discover::discover();
             match msg
@@ -4191,7 +4150,7 @@ fn legacy_register_reply(
     use crate::generated_wire::RegisterReply;
     let RegisterReply {
         mount, shared_memory, dns, ca_bundle, owner, r#box, name,
-        capture, api, no_host, oci, sud, virtiofs_socket: _,
+        capture, api, no_host, oci, virtiofs_socket: _,
     } = match result {
         Ok(reply) => reply,
         Err(error) => return json!({"ok": false, "error": error}),
@@ -4226,12 +4185,6 @@ fn legacy_register_reply(
     });
     if let Some(oci) = oci {
         reply["oci"] = oci;
-    }
-    if let Some(runtime) = sud {
-        reply["sud_upper"] = json!(legacy_bytes(runtime.upper));
-        reply["sud_lowers"] = json!(runtime.lowers.into_inner().into_iter()
-            .map(legacy_bytes).collect::<Vec<_>>());
-        reply["sud_ir_key"] = json!(runtime.inramfs_key.into_inner());
     }
     reply
 }
@@ -4473,25 +4426,12 @@ fn register(
             crate::generated_wire::QemuArchitecture::X8664 => "x86_64",
         });
     }
-    // --sud (WIP, see engine/DESIGN-sud.md): the box runs under the sud64
-    // wrapper with a directory upper instead of on the FUSE mount. Create
-    // the upper here so the ack can hand its path to the runner; the
-    // post-exit `sud_ingest` verb sweeps it into this BoxState. The trace
-    // pipe (fd-1023 read end) came in as its own SCM_RIGHTS fd
-    // (sud_trace_owned), separate from the tap fd — so a sud box can be a
-    // TAP box too (tap fd → prepare_net, trace fd → stream_events).
+    // SUD uses the same live BoxState/SarunFs capture as FUSE and QEMU. Its
+    // trace pipe remains independent of the filesystem transport, so a SUD
+    // box can also carry a TAP fd (tap → prepare_net, trace → stream_events).
     let want_sud = *backend == RunBackend::Sud;
     let mut sud_trace_fd: Option<std::os::fd::OwnedFd> = sud_trace_owned;
     if want_sud {
-        let up = backing.join("sud-up");
-        if let Err(e) = std::fs::create_dir_all(&up) {
-            if let Some(fd) = peer_pidfd {
-                unsafe {
-                    libc::close(fd);
-                }
-            }
-            return Err(format!("sud upper: {e}"));
-        }
         b.set_meta("sud", "1");
     }
     // D-parent: `want_no_parent` strips any kernel-derived parent AND closes
@@ -4537,110 +4477,6 @@ fn register(
     if let Some(p) = parent {
         b.set_parent(Some(p));
         b.set_meta("parent_box_id", &p.to_string());
-    }
-    // sud nesting is same-in-same and FLATTENED (DESIGN-sud.md): one
-    // wrapper invocation whose overlay stacks child upper → materialized
-    // ancestor states → host. Wrapper-in-wrapper can't work (fixed text
-    // address), so the chain must be all-sud and at rest; a RERUN's own
-    // prior state is exported as the nearest lower so earlier writes show
-    // through (the FUSE analog is load_mirror). Lowers are materialized
-    // from the sqlar — the authoritative state — never from the stale
-    // sud-up directory.
-    let mut sud_lowers: Vec<String> = Vec::new();
-    if want_sud {
-        // A rerun's own prior state is the nearest lower.
-        if rerun {
-            let dest = backing.join(format!("sud-lower-{id}"));
-            match crate::sud::export_box(id, &dest) {
-                Ok(_) => sud_lowers.push(dest.to_string_lossy().into_owned()),
-                Err(e) => {
-                    if let Some(fd) = peer_pidfd {
-                        unsafe {
-                            libc::close(fd);
-                        }
-                    }
-                    return Err(format!("sud lower export: {e}"));
-                }
-            }
-        }
-        // Ancestor chain. An AT-REST ancestor's truth is its sqlar —
-        // export and keep walking. A RUNNING ancestor's truth is its
-        // LIVE upper directory stacked on its own register-time layer
-        // list (which already covers everything above it) — take those
-        // and stop.
-        let mut cur = parent;
-        let mut seen = std::collections::HashSet::new();
-        while let Some(aid) = cur {
-            if !seen.insert(aid) {
-                break;
-            }
-            let Some(bx) = boxes.get(&aid) else { break };
-            if bx.meta.get("sud").map(String::as_str) != Some("1") {
-                if let Some(fd) = peer_pidfd {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                }
-                return Err(format!(
-                    "sud nesting is same-in-same: ancestor box {aid} is \
-                     not a sud box (see engine/DESIGN-sud.md)"));
-            }
-            if lock(state).box_pids.contains_key(&aid) {
-                match crate::sud::layers(aid) {
-                    Some(mut ls) => {
-                        sud_lowers.append(&mut ls);
-                        break;
-                    }
-                    None => {
-                        if let Some(fd) = peer_pidfd {
-                            unsafe {
-                                libc::close(fd);
-                            }
-                        }
-                        return Err(format!(
-                            "running sud box {aid} has no recorded layer \
-                             list (engine restarted under it?)"));
-                    }
-                }
-            }
-            let dest = backing.join(format!("sud-lower-{aid}"));
-            match crate::sud::export_box(aid, &dest) {
-                Ok(_) => sud_lowers.push(dest.to_string_lossy().into_owned()),
-                Err(e) => {
-                    if let Some(fd) = peer_pidfd {
-                        unsafe {
-                            libc::close(fd);
-                        }
-                    }
-                    return Err(format!("sud lower export: {e}"));
-                }
-            }
-            cur = bx.parent;
-        }
-        // A fresh run starts from an empty upper (a rerun's prior state
-        // just became the nearest lower; stale upper contents would
-        // re-ingest as phantom writes).
-        let up = backing.join("sud-up");
-        let _ = std::fs::remove_dir_all(&up);
-        if let Err(e) = std::fs::create_dir_all(&up) {
-            if let Some(fd) = peer_pidfd {
-                unsafe {
-                    libc::close(fd);
-                }
-            }
-            return Err(format!("sud upper: {e}"));
-        }
-        // Record this box's full layer list (upper-first) so a nested
-        // launch while WE are running can flatten against it.
-        let mut layers = vec![up.to_string_lossy().into_owned()];
-        layers.extend(sud_lowers.iter().cloned());
-        crate::sud::set_layers(id, layers);
-        // /tmp is an inramfs mount (shared-memory store keyed per run;
-        // the engine parses the region at sweep and drops the shms).
-        // pid+id keying keeps concurrent engines and reruns collision-
-        // free; the previous run's shms were unlinked at its sweep.
-        let ir_key = format!("sarun{}b{id}", std::process::id());
-        b.set_meta("sud_ir_key", &ir_key);
     }
     // Host visibility: a box whose chain is closed — its own --no-parent, or any
     // ancestor marked no_host_fallback (e.g. an OCI image's rootfs base) — sees
@@ -4858,28 +4694,6 @@ fn register(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-    let sud = if want_sud {
-        let lowers = sud_lowers.into_iter().map(|value| {
-            crate::wire::BoundedBytes::new(
-                std::ffi::OsStr::new(&value).as_bytes().to_vec())
-                .map_err(|error| format!("sud lower exceeds relation bound: {error:?}"))
-        }).collect::<Result<Vec<_>, String>>()?;
-        Some(crate::generated_wire::SudRuntime {
-            upper: bounded_path(&backing.join("sud-up"), "sud upper")?,
-            lowers: crate::wire::BoundedVec::new(lowers)
-                .map_err(|error| format!("sud lower count exceeds relation bound: {error:?}"))?,
-            inramfs_key: crate::wire::BoundedText::new(
-                lock(state)
-                    .overlay
-                    .clone()
-                    .and_then(|overlay| overlay.live_box(id))
-                    .and_then(|r#box| r#box.get_meta("sud_ir_key"))
-                    .unwrap_or_default())
-                .map_err(|error| format!("sud inramfs key exceeds relation bound: {error:?}"))?,
-        })
-    } else {
-        None
-    };
     Ok(crate::generated_wire::RegisterReply {
         mount: bounded_path(&root, "mount path")?,
         shared_memory: bounded_path(&backing, "shared-memory path")?,
@@ -4893,7 +4707,6 @@ fn register(
         api: want_api,
         no_host,
         oci,
-        sud,
         virtiofs_socket: virtiofs_socket.as_deref()
             .map(|path| bounded_path(path, "virtio-fs socket"))
             .transpose()?,
@@ -7387,6 +7200,9 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 // race-free pass (no-op for non-brush boxes).
                 if let Some(b) = ov.live_box(id) {
                     b.finalize_brush_links();
+                    if b.get_meta("sud").as_deref() == Some("1") {
+                        crate::sud::finish_stream(&b, id);
+                    }
                 }
                 ov.clear_echo(id);
                 stop_live_transports(&state, id);
@@ -8564,7 +8380,7 @@ mod verb_tests {
 
     #[test]
     fn typed_registration_reply_projects_only_at_the_legacy_boundary() {
-        use crate::generated_wire::{OciRuntime, RegisterReply, SudRuntime};
+        use crate::generated_wire::{OciRuntime, RegisterReply};
         let raw = |value: &[u8]| crate::wire::BoundedBytes::new(value.to_vec()).unwrap();
         let reply = legacy_register_reply(Ok(RegisterReply {
             mount: raw(b"/mnt/7"),
@@ -8584,18 +8400,12 @@ mod verb_tests {
                 entrypoint: None,
                 user: Some(raw(b"1000:1000")),
             }),
-            sud: Some(SudRuntime {
-                upper: raw(b"/upper"),
-                lowers: crate::wire::BoundedVec::new(vec![raw(b"/lower")]).unwrap(),
-                inramfs_key: crate::wire::BoundedText::new("key".into()).unwrap(),
-            }),
             virtiofs_socket: None,
         }));
         assert_eq!(reply["mount"], "/mnt/7");
         assert_eq!(reply["dns_ip"], "240.0.0.1");
         assert_eq!(reply["owner_token"], "ab".repeat(16));
         assert_eq!(reply["oci"]["env"][0], "PATH=/bin");
-        assert_eq!(reply["sud_lowers"][0], "/lower");
         assert_eq!(reply["_box_sid"], 7);
     }
 
@@ -8610,14 +8420,6 @@ mod verb_tests {
         }));
         assert_eq!(error["category"], "invalid_request");
         assert_eq!(error["error"], "bad frame");
-        let swept = legacy_transport_response(Ok(TransportResponse::SudIngested {
-            count: 2,
-            errors: crate::wire::BoundedVec::new(vec![
-                crate::wire::BoundedText::new("stale entry".into()).unwrap(),
-            ]).unwrap(),
-        }));
-        assert_eq!(swept["ingested"], 2);
-        assert_eq!(swept["errors"][0], "stale entry");
     }
 
     #[test]

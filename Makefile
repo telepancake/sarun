@@ -44,7 +44,7 @@ vendor: ## Assemble engine/vendor/ from pinned upstreams + vendor-patches/ serie
 	python3 scripts/vendor.py
 
 # The addin set the sarun runner requires of the sud wrappers.
-SUD_ADDINS := sud/trace sud/path_remap sud/cmd-rewrite sud/fake-exec sud/inramfs
+SUD_ADDINS := sud/trace sud/fs
 HOST_ARCH := $(shell uname -m)
 ENGINE_TARGET ?= $(HOST_ARCH)-unknown-linux-musl
 SWIPL_TARGET := $(subst -unknown,,$(ENGINE_TARGET))

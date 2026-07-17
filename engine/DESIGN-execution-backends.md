@@ -128,7 +128,7 @@ as executable mappings and mmap that genuinely need a host fd.
         decoder and scoped `SarunFs` used by FUSE and QEMU.
   - [x] Add the freestanding SUD client and split large reads/writes so no
         request exceeds the negotiated slot payload.
-- [ ] Translate intercepted syscalls and fd operations to canonical FUSE
+- [x] Translate intercepted syscalls and fd operations to canonical FUSE
       requests without resolving paths or applying overlay policy in SUD.
   - [x] Implement LOOKUP/GETATTR/OPEN/CREATE/READ/WRITE/FLUSH/RELEASE and a
         virtual-fd table, directory descriptors, symlink-aware traversal,
@@ -141,7 +141,7 @@ as executable mappings and mmap that genuinely need a host fd.
         open canonical handle and carries that descriptor through the ordinary
         wrapper exec/ELF path; its process-local `/proc/self/fd/N` spelling is
         the only pathname bypass involved.
-  - [ ] Replace the path-remap and inramfs addins in the production wrapper in
+  - [x] Replace the path-remap and inramfs addins in the production wrapper in
         one cutover; do not retain an old/new runtime mode.
 - [x] Add the exceptional SCM_RIGHTS fd lane for exec/mmap backing objects.
       It exports only an already-open canonical handle, is serialized across
@@ -149,12 +149,15 @@ as executable mappings and mmap that genuinely need a host fd.
       shutdown, preserves writable copy-up/capture, and has behavioral tests
       for the Rust endpoint plus both freestanding x86 ABIs on this aarch64
       host. Path and policy operations remain exclusively in `SarunFs`.
-- [ ] Retain trace/provenance independently of the filesystem transport.
+- [x] Retain trace/provenance independently of the filesystem transport. The
+      compact trace stream is applied live and finalized automatically when the
+      box channel closes; no post-exit filesystem sweep remains.
 - [ ] Reach FUSE/SUD equivalence for visible trees, metadata, sqlar, output,
       provenance, networking, nesting, OCI, brush, and termination.
-- [ ] Delete inramfs, SUD overlay/path-remap semantics, `sudir.rs`, upper-dir
-      sweep logic, and their wire/runtime compatibility fields.  Do not delete
-      the SUD dispatcher/frontend itself.
+- [ ] Delete inramfs and SUD overlay/path-remap sources after the production
+      wrapper cutover. `sudir.rs`, upper-dir/lower materialization and sweep
+      logic, and their generated wire/runtime compatibility fields are gone.
+      Do not delete the SUD dispatcher/frontend itself.
 
 ### 4. QEMU appliances
 

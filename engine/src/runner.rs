@@ -970,22 +970,12 @@ fn sud_proc_field(pid: i32, field: &str, fallback: i32) -> i32 {
         .unwrap_or(fallback)
 }
 
-/// `run --sud` (WIP, see engine/DESIGN-sud.md): run CMD under the sud64
-/// wrapper instead of bwrap+FUSE. Registers with `want_sud`, gets the
-/// engine-owned upper directory back in the ack, sets up the sud launcher
-/// contract itself (fds 1022/1023, version atom, EXIT events), execs
-///   sud64 --remap-rule … resolved CMD
-/// and, after the child exits, asks the engine (fresh conn, `sud_ingest`)
-/// to sweep the upper into the box's sqlar. The register conn stays open
-/// for the duration — its EOF after the sweep is the normal box teardown.
-/// `run --sud` (see engine/DESIGN-sud.md): run CMD under the sud64 wrapper
-/// instead of bwrap+FUSE. Registers with `want_sud`, gets the engine-owned
-/// upper directory back in the ack, sets up the sud launcher contract itself
-/// (fds 1022/1023, version atom, EXIT events), execs
-///   sud64 --remap-rule … resolved CMD
-/// and, after the child exits, asks the engine (fresh conn, `sud_ingest`) to
-/// sweep the upper into the box's sqlar. The register conn stays open for the
-/// duration — its EOF after the sweep is the normal box teardown.
+/// `run --sud`: run CMD under the SUD wrapper while every filesystem operation
+/// is served by the same scoped `SarunFs` as FUSE and QEMU. The launcher owns
+/// only transport/lifecycle state: trace fd 1023, wire-state fd 1022, request
+/// ring fd 1021, and descriptor lane fd 1020. The register connection stays
+/// open for the command's lifetime; EOF finalizes trace state and tears down
+/// the filesystem session.
 ///
 /// The body is orchestration only; each labelled step is a named helper below.
 pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
@@ -1060,35 +1050,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     };
     let sid = ack.get("session_id").and_then(Value::as_str)
         .unwrap_or("?").to_string();
-    let upper = ack.get("sud_upper").and_then(Value::as_str)
-        .unwrap_or("").to_string();
-    // Nested (same-in-same) sud box: the engine materialized each ancestor's
-    // captured state and hands the lower list back; the overlay stacks
-    // upper → lowers → host in that priority order.
-    let lowers: Vec<String> = ack.get("sud_lowers")
-        .and_then(Value::as_array)
-        .map(|a| a.iter()
-             .filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    if upper.is_empty() {
-        eprintln!("sarun-engine: engine did not allocate a sud upper \
-                   (engine older than this runner?)");
-        unsafe { libc::close(trace_w); libc::close(lane_client); }
-        return 1;
-    }
-    eprintln!("sarun-engine: box {sid}  (sud upper: {upper})");
-    // Continuing a box lineage is easy to do by accident (rerunning a NAMED
-    // box) and silently changes build behavior: everything earlier runs
-    // captured — including a broken run's stale or zero-length artifacts —
-    // is visible to this run as up-to-date files, so make-style tools skip
-    // the steps that would regenerate them. Say so, loudly, with the way out.
-    if !lowers.is_empty() {
-        eprintln!("sarun-engine: box {sid} continues atop {} prior captured \
-                   layer(s): earlier runs' outputs look like existing \
-                   up-to-date files to this build. For a from-scratch run: \
-                   `sarun <NAME> discard` or use a fresh box name.",
-                  lowers.len());
-    }
+    eprintln!("sarun-engine: box {sid}");
     // -b brush: the box's shell IS the embedded brush, run as the TRACED
     // target — the engine binary under the wrapper via `brush-sh`, so brush +
     // coreutils/find/xargs + make(kati)/ninja(n2) all execute in one traced
@@ -1114,29 +1076,10 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     let probe = shebang.as_ref().map(|(i, _)| i.as_str())
         .unwrap_or(resolved.as_str());
     let wrapper = if sud_elf_class(probe) == 1 { &sud32 } else { &sud64 };
-    // Wrapper argv: the remap-rule flag block, then the target. Rule order is
-    // first-prefix-match-wins, so the narrow carve-outs precede the wide `/`
-    // overlay (each helper appends in that priority order).
+    // The wrapper receives only the target command. Filesystem composition,
+    // network shadows, brush shadows, layering, and capture are all properties
+    // of the engine-owned scoped SarunFs; no policy is serialized into argv.
     let mut sc = Command::new(wrapper);
-    let ir_key = ack.get("sud_ir_key").and_then(Value::as_str).unwrap_or("");
-    sud_base_rules(&mut sc, ir_key);
-    let backing = ack.get("shm_dir").and_then(Value::as_str)
-        .map(std::path::PathBuf::from);
-    let ca_pem = ack.get("ca_pem").and_then(Value::as_str).unwrap_or("");
-    let dns_ip = ack.get("dns_ip").and_then(Value::as_str).unwrap_or("");
-    sud_net_rules(&mut sc, net_mode, ca_pem, dns_ip, backing.as_deref());
-    if brush {
-        let exe = self_exe.as_deref().unwrap_or_default();
-        if let Err(e) = sud_shadow_rules(&mut sc, &upper, exe) {
-            eprintln!("sarun-engine run --sud: {e}");
-            unsafe { libc::close(trace_w); libc::close(lane_client); }
-            return 1;
-        }
-    }
-    if let Err(code) = sud_overlay_rule(&mut sc, &upper, &lowers) {
-        unsafe { libc::close(trace_w); libc::close(lane_client); }
-        return code;
-    }
     match &shebang {
         Some((interp, arg)) => {
             // Script: run the interpreter with the kernel's shebang argv shape
@@ -1164,7 +1107,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // processes — nothing else stops it):
     //   * SIGTERM/SIGINT on this runner (the engine's `kill` verb, engine
     //     shutdown, ^C at the terminal) → SIGTERM to the group; the wait
-    //     loop then finishes normally, sweep included. A SECOND signal
+    //     loop then finishes normally. A SECOND signal
     //     escalates to SIGKILL.
     //   * the box channel `conn` reaching EOF (the engine died or tore the
     //     box down) → same forwarding, from a watchdog thread.
@@ -1202,10 +1145,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     }
     // Launch under the wrapper contract and wait for the traced tree.
     let code = sud_launcher_exec(sc, wrapper, trace_w, fs_ring, lane_client);
-    // Sweep the upper into the box's sqlar on a FRESH conn (the register conn
-    // is the box channel; a verb on it would desync teardown).
-    sud_request_sweep(&sock, &sid);
-    drop(conn); // box channel EOF → teardown
+    drop(conn); // box channel EOF → trace finalization and teardown
     code
 }
 
@@ -1311,187 +1251,6 @@ fn sud_brush_cmd(exe: &str, cmd: &[String]) -> Vec<String> {
     let shell = crate::brush::shell_name_from_argv(cmd);
     vec![exe.to_string(), "brush-sh".into(), "--".into(),
          shell.into(), "-c".into(), script]
-}
-
-/// The base remap-rule carve-outs, in first-prefix-match priority order: the
-/// pseudo filesystems and sarun's own state + FUSE mount trees stay
-/// host-served (a nested NON-sud box binds <mnt>/<id> and its writes belong to
-/// that box's own capture, not this box's upper), then /tmp is served from the
-/// inramfs shared-memory store (`ir_key`, empty = no inramfs) — listed AFTER
-/// the narrower carve-outs so an engine state/mnt dir living under /tmp (test
-/// rigs do this) still routes to the host.
-fn sud_base_rules(sc: &mut Command, ir_key: &str) {
-    for p in ["/proc", "/dev", "/sys"] {
-        sc.args(["--remap-rule", &format!("passthrough:{p}")]);
-    }
-    sc.arg("--remap-rule")
-        .arg(format!("passthrough:{}", crate::paths::state_home().display()));
-    sc.arg("--remap-rule")
-        .arg(format!("passthrough:{}", crate::paths::mnt_point().display()));
-    if !ir_key.is_empty() {
-        sc.args(["--remap-rule", "inramfs:/tmp"]);
-        sc.args(["--inramfs-key", ir_key]);
-    }
-}
-
-/// Tap networking: the box reaches the net through the engine's MITM proxy, so
-/// it must trust the engine's CA and resolve via the gateway. A FUSE box gets
-/// these as overlay shadows; a sud box gets them as `remap` rules pointing the
-/// CA-bundle + resolv.conf paths at host files materialized under `backing`
-/// (ack `shm_dir`). No-op unless tap mode with a CA. Listed BEFORE the wide
-/// overlay:/ rule (first-prefix-match wins).
-fn sud_net_rules(sc: &mut Command, net_mode: crate::net::NetMode,
-                 ca_pem: &str, dns_ip: &str, backing: Option<&Path>) {
-    if net_mode != crate::net::NetMode::Tap || ca_pem.is_empty() { return; }
-    let Some(bk) = backing else { return; };
-    let ca_path = bk.join("sud-ca.pem");
-    if std::fs::write(&ca_path, ca_pem).is_ok() {
-        for tgt in CA_BUNDLE_TARGETS {
-            sc.args(["--remap-rule",
-                     &format!("remap:{tgt}={}", ca_path.display())]);
-        }
-        let canonical = "/etc/ssl/certs/ca-certificates.crt";
-        for k in ["SSL_CERT_FILE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
-                  "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO"] {
-            sc.env(k, canonical);
-        }
-    }
-    if !dns_ip.is_empty() {
-        let rc_path = bk.join("sud-resolv.conf");
-        if std::fs::write(&rc_path, format!("nameserver {dns_ip}\n")).is_ok() {
-            sc.args(["--remap-rule",
-                     &format!("remap:/etc/resolv.conf={}", rc_path.display())]);
-        }
-    }
-}
-
-/// -b shadow rules: the sud analogue of the FUSE overlay's lazy /bin/sh + make
-/// + ninja shadowing. A nested tool's execve of a shadowed path is remapped to
-/// a per-box symlink NAMED AFTER THE TOOL (live/<id>/shadow-bin/<tool> →
-/// engine); argv[0] keeps the shadowed name and SARUN_BRUSH_SH=1 gates dispatch
-/// (is_brush_sh_invocation / is_make_invocation / is_ninja_invocation), so
-/// recipes run through embedded brush and make/ninja in-process (kati/n2). The
-/// symlink — not a direct remap to the engine path — preserves the invocation
-/// basename the wrapper's exec rewrite substitutes as argv[0]; the
-/// engine-state passthrough rule keeps the link itself host-served.
-fn sud_shadow_rules(sc: &mut Command, upper: &str, exe: &str)
-                    -> Result<(), String> {
-    sc.env("SARUN_BRUSH_SH", "1");
-    let shadow_dir = Path::new(upper)
-        .parent().map(|p| p.join("shadow-bin"))
-        .unwrap_or_else(|| std::path::PathBuf::from("shadow-bin"));
-    let _ = std::fs::create_dir_all(&shadow_dir);
-    // The SAME shadow configuration FUSE honors ({config_home}/
-    // shadow_{sh,make,ninja}.glob, or the historical defaults): a make
-    // matched by shadow_make.glob was shadowed under FUSE but ran REAL
-    // under the old hardcoded sud set — the box then recorded processes
-    // but no recipe pipelines and no build edges. A literal (glob-free)
-    // pattern is remapped verbatim, present on the host or not (parity
-    // with the old behavior: `make` in a box works even when the host
-    // has no /usr/bin/make); a glob pattern is expanded against the
-    // host filesystem at launch. Only basenames the engine dispatches
-    // (sh/bash/dash → brush, make/gmake → kati, ninja → n2) get rules —
-    // remapping anything else to the engine binary would exec it as a
-    // confused CLI. The wrapper's rule table is bounded, so shadow
-    // rules are capped and truncation is LOUD.
-    const SHADOW_RULE_CAP: usize = 40;
-    let (sh, mk, nj) = crate::overlay::shadow_glob_strings();
-    // Split shadow patterns into literals and globs. A LITERAL path becomes a
-    // concrete `remap:` rule (verbatim — present on the host or not). A GLOB is
-    // handed to the wrapper as a `redirect:pathglob:` cmd-rewrite rule that
-    // tests the pattern against the ONE path being exec'd, at execve time,
-    // exactly as FUSE does. The old code instead ran `glob::glob(pat)` — an
-    // unbounded, symlink-following FILESYSTEM WALK to enumerate matches, which
-    // wedged box STARTUP (before the child ran) whenever a pattern's `**`
-    // reached a symlink loop or a huge tree. There is no reason to read a
-    // single directory to shadow a command: either the exec path matches the
-    // glob or it does not.
-    let mut literals: Vec<String> = vec![];
-    let mut globs: Vec<String> = vec![];
-    for pat in sh.iter().chain(mk.iter()).chain(nj.iter()) {
-        if !pat.starts_with('/') {
-            continue; // the FUSE loader already warned about these
-        }
-        if pat.contains(['*', '?', '[']) { globs.push(pat.clone()); }
-        else { literals.push(pat.clone()); }
-    }
-    // The six dispatched shim links, created once. The wrapper's redirect rule
-    // rewrites a matched exec to <shadow_dir>/<basename> only when that link
-    // exists, so a glob that happens to match a non-dispatched binary is left
-    // alone — same effect as the old basename filter, without the walk.
-    let ensure_link = |base: &str| -> Result<(), String> {
-        let link = shadow_dir.join(base);
-        if !link.exists() {
-            std::os::unix::fs::symlink(exe, &link)
-                .map_err(|e| format!("-b shadow link {}: {e}",
-                                     link.display()))?;
-        }
-        Ok(())
-    };
-    literals.sort();
-    literals.dedup();
-    let mut n = 0usize;
-    for t in &literals {
-        let Some(base) = Path::new(t).file_name().and_then(|s| s.to_str())
-        else { continue };
-        if !matches!(base, "sh" | "bash" | "dash" | "make" | "gmake"
-                           | "ninja") {
-            eprintln!("sarun-engine run --sud: shadow literal {t:?} \
-                       skipped (basename {base:?} is not a dispatched \
-                       shell/make/ninja name)");
-            continue;
-        }
-        if n == SHADOW_RULE_CAP {
-            eprintln!("sarun-engine run --sud: shadow rules capped at \
-                       {SHADOW_RULE_CAP}");
-            break;
-        }
-        ensure_link(base)?;
-        let link = shadow_dir.join(base);
-        sc.args(["--remap-rule", &format!("remap:{t}={}", link.display())]);
-        n += 1;
-    }
-    if !globs.is_empty() {
-        // Any dispatched name could be the basename a glob matches, so the
-        // shim dir needs all six links present before the rules take effect.
-        for base in ["sh", "bash", "dash", "make", "gmake", "ninja"] {
-            ensure_link(base)?;
-        }
-        let sdir = shadow_dir.to_string_lossy().into_owned();
-        for pat in &globs {
-            sc.args(["--cmd-rule",
-                     &format!("redirect:pathglob:{pat}:{sdir}")]);
-        }
-    }
-    Ok(())
-}
-
-/// The wide `overlay:/` rule, stacking upper → lowers → host. Fails loud (the
-/// rule syntax swallows both faults silently) when the chain exceeds rules.h's
-/// 9-layer cap or any layer path contains the '+' layer separator (which would
-/// split into garbage layers and land box writes on the real host under a
-/// truncated prefix). `Err(code)` carries the process exit code.
-fn sud_overlay_rule(sc: &mut Command, upper: &str, lowers: &[String])
-                    -> Result<(), i32> {
-    if 2 + lowers.len() > 9 {
-        eprintln!("sarun-engine run --sud: box chain too deep for one \
-                   overlay rule ({} layers > 9)", 2 + lowers.len());
-        return Err(2);
-    }
-    if upper.contains('+') || lowers.iter().any(|l| l.contains('+')) {
-        eprintln!("sarun-engine run --sud: state path contains '+' \
-                   (the overlay rule separator): {upper}\n\
-                   move the engine state dir (XDG_STATE_HOME) to a \
-                   path without '+'");
-        return Err(2);
-    }
-    let mut layers = upper.to_string();
-    for l in lowers {
-        layers.push('+');
-        layers.push_str(l);
-    }
-    sc.arg("--remap-rule").arg(format!("overlay:/={layers}+/"));
-    Ok(())
 }
 
 /// The wire-state page + launcher wait loop, absorbed from tv/sud/sudtrace.c.
@@ -1656,8 +1415,7 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
         Err(e) => {
             eprintln!("sarun-engine: exec {wrapper}: {e}\n\
                        hint: build it with `make -C tv sud64 sud32 \
-                       SUD_ADDINS=\"sud/trace sud/path_remap sud/cmd-rewrite \
-                       sud/fake-exec sud/inramfs\"` and put them on PATH or \
+                       SUD_ADDINS=\"sud/trace sud/fs\"` and put them on PATH or \
                        point SARUN_SUD64/SARUN_SUD32 at them.");
             unsafe {
                 libc::munmap(state_page.cast(), 4096);
@@ -1719,35 +1477,6 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
     }
     drop(child); // already reaped by our waitpid; Child::drop doesn't wait
     code
-}
-
-/// Ask the engine (fresh conn to `sock`) to sweep the finished box's upper
-/// into its sqlar. Reporting is best-effort — the command already ran, so a
-/// sweep RPC failure is printed but never changes the box's exit code.
-fn sud_request_sweep(sock: &Path, sid: &str) {
-    let c = match UnixStream::connect(sock) {
-        Ok(c) => c,
-        Err(e) => { eprintln!("sarun-engine: sud sweep: dial engine: {e}");
-                    return; }
-    };
-    let req = json!({"type": "sud_ingest", "sid": sid});
-    if !conn_write_all(&c, format!("{req}\n").as_bytes()) { return; }
-    let mut resp = String::new();
-    let _ = BufReader::new(&c).read_line(&mut resp);
-    match serde_json::from_str::<Value>(&resp) {
-        Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
-            let n = v.get("ingested").and_then(Value::as_i64).unwrap_or(0);
-            eprintln!("sarun-engine: sud sweep: {n} entries \
-                       captured into box {sid}");
-            if let Some(errs) = v.get("errors").and_then(Value::as_array)
-                .filter(|a| !a.is_empty()) {
-                for e in errs {
-                    eprintln!("sarun-engine: sud sweep: {e}");
-                }
-            }
-        }
-        _ => eprintln!("sarun-engine: sud sweep failed: {}", resp.trim()),
-    }
 }
 
 /// Send one frame (optionally with our pidfd as SCM_RIGHTS) over the box channel.

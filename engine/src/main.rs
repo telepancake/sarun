@@ -69,7 +69,6 @@ mod slippool;
 mod socket_wire;
 mod sud;
 mod sud_ring;
-mod sudir;
 mod sudwire;
 mod ui;
 mod views;

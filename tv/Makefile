@@ -118,7 +118,7 @@ SIGSYS_DIAG ?= 0
 ifeq ($(SIGSYS_DIAG),1)
 SUD_CFLAGS  += -DSUDTRACE_SIGSYS_DIAG
 endif
-SUD_ADDINS ?= sud/trace
+SUD_ADDINS ?= sud/trace sud/fs
 SUD_SRCS    := sud/wrapper.c sud/state.c sud/addin.c sud/raw.c sud/elf.c sud/handler.c sud/loader.c sud/runtime_config.c
 SUD_SRCS    += libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
 SUD_HDRS    := $(shell find sud libc-fs -name '*.h' 2>/dev/null)

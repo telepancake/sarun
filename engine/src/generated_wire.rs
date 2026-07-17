@@ -13,7 +13,7 @@
 // source-sha256 engine/pl/grammar_ir.pl 1a2a9a63076618402864e0ac630fca29b91210d54a03687f5be198d94a370d77
 // source-sha256 engine/pl/relation_api.pl e87d850a3cfd6a511e49b00bc7497e0c2790a45cf91aa4aa7b833b4b75364f6c
 // source-sha256 engine/pl/context_relation.pl 6819379ba751c4850e40f3a9d53cab888b9c2b1151283f1eaf479ae84f735473
-// source-sha256 engine/pl/transport_catalog.pl 866a19a74206c9b53d5809d17fe6518a86d043b72cf5d23a89b48c294ae354b9
+// source-sha256 engine/pl/transport_catalog.pl 30094bb08efd98e528c9b723fdc8e4ca85b227eecaed0b988d60c802620bee01
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
 // source-sha256 scripts/wire_codegen.py cebd448fb51f20128aa3ea1f9041cf9c18e7908645e82543efbc5b80af8145fd
 
@@ -196,7 +196,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "a2d186fe0d332ce463ef8a7cfcc72c1bab6b5ade8580e5925594ac238a6c2d29";
+    "673c8977444bf489c40d6f6ab6e2121a94bb8a4df17c3be5964ccdb2d06dada4";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -740,54 +740,6 @@ impl RelationWireValue for OciRuntime {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SudRuntime {
-    pub upper: Path,
-    pub lowers: BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS>,
-    pub inramfs_key: BoundedText<LIMIT_SHORT_BYTES>,
-}
-
-impl WireValue for SudRuntime {
-    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
-        let mut fields = Vec::new();
-        self.upper.encode_atom(&mut fields)?;
-        self.lowers.encode_atom(&mut fields)?;
-        self.inramfs_key.encode_atom(&mut fields)?;
-        put_compound_payload(output, &fields)
-    }
-
-    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
-        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
-        let value = Self {
-            upper: <Path as WireValue>::decode_atom(&mut fields)?,
-            lowers: <BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS> as WireValue>::decode_atom(
-                &mut fields,
-            )?,
-            inramfs_key: <BoundedText<LIMIT_SHORT_BYTES> as WireValue>::decode_atom(&mut fields)?,
-        };
-        require_empty(fields)?;
-        Ok(value)
-    }
-}
-
-impl RelationWireValue for SudRuntime {
-    fn from_relation(value: &RelationValue) -> Result<Self, String> {
-        let fields = relation_compound(value, "record")?;
-        require_relation_arity(fields, 3)?;
-        let mut fields = fields.iter();
-        Ok(Self {
-            upper: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
-            lowers:
-                <BoundedVec<Path, 0, LIMIT_COLLECTION_ITEMS> as RelationWireValue>::from_relation(
-                    fields.next().unwrap(),
-                )?,
-            inramfs_key: <BoundedText<LIMIT_SHORT_BYTES> as RelationWireValue>::from_relation(
-                fields.next().unwrap(),
-            )?,
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct RegisterReply {
     pub mount: Path,
     pub shared_memory: Path,
@@ -800,7 +752,6 @@ pub struct RegisterReply {
     pub api: bool,
     pub no_host: bool,
     pub oci: Option<OciRuntime>,
-    pub sud: Option<SudRuntime>,
     pub virtiofs_socket: Option<Path>,
 }
 
@@ -818,7 +769,6 @@ impl WireValue for RegisterReply {
         self.api.encode_atom(&mut fields)?;
         self.no_host.encode_atom(&mut fields)?;
         self.oci.encode_atom(&mut fields)?;
-        self.sud.encode_atom(&mut fields)?;
         self.virtiofs_socket.encode_atom(&mut fields)?;
         put_compound_payload(output, &fields)
     }
@@ -839,7 +789,6 @@ impl WireValue for RegisterReply {
             api: <bool as WireValue>::decode_atom(&mut fields)?,
             no_host: <bool as WireValue>::decode_atom(&mut fields)?,
             oci: <Option<OciRuntime> as WireValue>::decode_atom(&mut fields)?,
-            sud: <Option<SudRuntime> as WireValue>::decode_atom(&mut fields)?,
             virtiofs_socket: <Option<Path> as WireValue>::decode_atom(&mut fields)?,
         };
         require_empty(fields)?;
@@ -850,7 +799,7 @@ impl WireValue for RegisterReply {
 impl RelationWireValue for RegisterReply {
     fn from_relation(value: &RelationValue) -> Result<Self, String> {
         let fields = relation_compound(value, "record")?;
-        require_relation_arity(fields, 13)?;
+        require_relation_arity(fields, 12)?;
         let mut fields = fields.iter();
         Ok(Self {
             mount: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
@@ -869,7 +818,6 @@ impl RelationWireValue for RegisterReply {
             api: <bool as RelationWireValue>::from_relation(fields.next().unwrap())?,
             no_host: <bool as RelationWireValue>::from_relation(fields.next().unwrap())?,
             oci: <Option<OciRuntime> as RelationWireValue>::from_relation(fields.next().unwrap())?,
-            sud: <Option<SudRuntime> as RelationWireValue>::from_relation(fields.next().unwrap())?,
             virtiofs_socket: <Option<Path> as RelationWireValue>::from_relation(
                 fields.next().unwrap(),
             )?,
@@ -11353,7 +11301,6 @@ pub const TRANSPORT_REQUEST_IDENTITIES: &[(&str, u64)] = &[
     ("service_accept", 268),
     ("service_dial", 269),
     ("budget_grant", 270),
-    ("sud_ingest", 271),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -11424,9 +11371,6 @@ pub enum TransportRequest {
         target: BoxTarget,
         amount: i64,
     },
-    SudIngest {
-        r#box: BoxSelector,
-    },
 }
 
 impl TransportRequest {
@@ -11447,7 +11391,6 @@ impl TransportRequest {
             Self::ServiceAccept { .. } => 268,
             Self::ServiceDial { .. } => 269,
             Self::BudgetGrant { .. } => 270,
-            Self::SudIngest { .. } => 271,
         }
     }
 }
@@ -11557,9 +11500,6 @@ impl WireValue for TransportRequest {
                 target.encode_atom(&mut fields)?;
                 amount.encode_atom(&mut fields)?;
             }
-            Self::SudIngest { r#box } => {
-                r#box.encode_atom(&mut fields)?;
-            }
         }
         put_compound_payload(output, &fields)
     }
@@ -11632,9 +11572,6 @@ impl WireValue for TransportRequest {
             270 => Self::BudgetGrant {
                 target: <BoxTarget as WireValue>::decode_atom(&mut fields)?,
                 amount: <i64 as WireValue>::decode_atom(&mut fields)?,
-            },
-            271 => Self::SudIngest {
-                r#box: <BoxSelector as WireValue>::decode_atom(&mut fields)?,
             },
             _ => return Err(DecodeError::InvalidValue),
         };
@@ -11783,15 +11720,6 @@ impl RelationWireValue for TransportRequest {
                     amount: <i64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
                 })
             }
-            "sud_ingest" => {
-                require_relation_arity(fields, 1)?;
-                let mut fields = fields.iter();
-                Ok(Self::SudIngest {
-                    r#box: <BoxSelector as RelationWireValue>::from_relation(
-                        fields.next().unwrap(),
-                    )?,
-                })
-            }
             _ => Err(format!("unknown TransportRequest relation choice {case}")),
         }
     }
@@ -11801,7 +11729,6 @@ pub const TRANSPORT_RESPONSE_IDENTITIES: &[(&str, u64)] = &[
     ("empty", 1),
     ("error", 2),
     ("recorded", 3),
-    ("sud_ingested", 4),
     ("budget", 5),
     ("action", 6),
 ];
@@ -11815,10 +11742,6 @@ pub enum TransportResponse {
     },
     Recorded {
         count: u64,
-    },
-    SudIngested {
-        count: u64,
-        errors: BoundedVec<BoundedText<LIMIT_TEXT_BYTES>, 0, LIMIT_ERROR_ITEMS>,
     },
     Budget {
         remaining: i64,
@@ -11834,7 +11757,6 @@ impl TransportResponse {
             Self::Empty => 1,
             Self::Error { .. } => 2,
             Self::Recorded { .. } => 3,
-            Self::SudIngested { .. } => 4,
             Self::Budget { .. } => 5,
             Self::Action { .. } => 6,
         }
@@ -11853,10 +11775,6 @@ impl WireValue for TransportResponse {
             }
             Self::Recorded { count } => {
                 count.encode_atom(&mut fields)?;
-            }
-            Self::SudIngested { count, errors } => {
-                count.encode_atom(&mut fields)?;
-                errors.encode_atom(&mut fields)?;
             }
             Self::Budget { remaining } => {
                 remaining.encode_atom(&mut fields)?;
@@ -11878,10 +11796,6 @@ impl WireValue for TransportResponse {
             },
             3 => Self::Recorded {
                 count: <u64 as WireValue>::decode_atom(&mut fields)?,
-            },
-            4 => Self::SudIngested {
-                count: <u64 as WireValue>::decode_atom(&mut fields)?,
-                errors: <BoundedVec<BoundedText<LIMIT_TEXT_BYTES>, 0, LIMIT_ERROR_ITEMS> as WireValue>::decode_atom(&mut fields)?,
             },
             5 => Self::Budget {
                 remaining: <i64 as WireValue>::decode_atom(&mut fields)?,
@@ -11925,14 +11839,6 @@ impl RelationWireValue for TransportResponse {
                 let mut fields = fields.iter();
                 Ok(Self::Recorded {
                     count: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
-                })
-            }
-            "sud_ingested" => {
-                require_relation_arity(fields, 2)?;
-                let mut fields = fields.iter();
-                Ok(Self::SudIngested {
-                    count: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
-                    errors: <BoundedVec<BoundedText<LIMIT_TEXT_BYTES>, 0, LIMIT_ERROR_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
                 })
             }
             "budget" => {
@@ -12743,11 +12649,6 @@ mod generated_tests {
             entrypoint: None,
             user: None,
         });
-        roundtrip::<SudRuntime>(SudRuntime {
-            upper: BoundedBytes::new(Vec::new()).unwrap(),
-            lowers: BoundedVec::new(vec![]).unwrap(),
-            inramfs_key: BoundedText::new(String::new()).unwrap(),
-        });
         roundtrip::<RegisterReply>(RegisterReply {
             mount: BoundedBytes::new(Vec::new()).unwrap(),
             shared_memory: BoundedBytes::new(Vec::new()).unwrap(),
@@ -12760,7 +12661,6 @@ mod generated_tests {
             api: false,
             no_host: false,
             oci: None,
-            sud: None,
             virtiofs_socket: None,
         });
         roundtrip::<ApplianceCommand>(ApplianceCommand {
@@ -14184,9 +14084,6 @@ mod generated_tests {
                 target: BoxTarget::Broker,
                 amount: 0i64,
             },
-            TransportRequest::SudIngest {
-                r#box: BoundedText::new(String::new()).unwrap(),
-            },
         ];
         assert_eq!(values.len(), TRANSPORT_REQUEST_IDENTITIES.len());
         for (value, (name, code)) in values.into_iter().zip(TRANSPORT_REQUEST_IDENTITIES) {
@@ -14204,10 +14101,6 @@ mod generated_tests {
                 message: BoundedText::new(String::new()).unwrap(),
             },
             TransportResponse::Recorded { count: 0u64 },
-            TransportResponse::SudIngested {
-                count: 0u64,
-                errors: BoundedVec::new(vec![]).unwrap(),
-            },
             TransportResponse::Budget { remaining: 0i64 },
             TransportResponse::Action {
                 value: ActionSuccess::Ping { value: () },
@@ -14240,7 +14133,6 @@ mod generated_tests {
                     api: false,
                     no_host: false,
                     oci: None,
-                    sud: None,
                     virtiofs_socket: None,
                 },
             },

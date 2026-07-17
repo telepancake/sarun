@@ -143,12 +143,6 @@ wire_type(oci_runtime, record([
     field(user, option(os_string))
 ])).
 
-wire_type(sud_runtime, record([
-    field(upper, path),
-    field(lowers, list(path, collection_items)),
-    field(inramfs_key, text(short_bytes))
-])).
-
 wire_type(register_reply, record([
     field(mount, path),
     field(shared_memory, path),
@@ -161,7 +155,6 @@ wire_type(register_reply, record([
     field(api, bool),
     field(no_host, bool),
     field(oci, option(oci_runtime)),
-    field(sud, option(sud_runtime)),
     field(virtiofs_socket, option(path))
 ])).
 
@@ -955,10 +948,6 @@ wire_request(budget_grant,          270, reply(budget), [
     field(target, box_target),
     field(amount, s64)
 ], [], target_box(target)).
-wire_request(sud_ingest,            271, reply(sud_ingested), [
-    field(box, box_selector)
-], [], public).
-
 % Reply-mode payload identities. An error always selects reply mode; a request
 % never falls through to another success mode after an error.
 wire_response(empty,        1, []).
@@ -967,10 +956,6 @@ wire_response(error,        2, [
     field(message, text(text_bytes))
 ]).
 wire_response(recorded,     3, [field(count, u64)]).
-wire_response(sud_ingested, 4, [
-    field(count, u64),
-    field(errors, list(text(text_bytes), error_items))
-]).
 wire_response(budget,       5, [field(remaining, s64)]).
 wire_response(action,       6, [field(value, action_success)]).
 
