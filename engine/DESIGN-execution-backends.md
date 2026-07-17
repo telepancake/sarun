@@ -251,6 +251,10 @@ as executable mappings and mmap that genuinely need a host fd.
         architecture instead of the host process. The automated live gate now
         runs parser-driven brush, target-x86_64 Kati, and target-x86_64 n2;
         projecting the aarch64 host engine into that guest is impossible.
+  - [x] Run exact exit 37 and exec-failure 127 cases in the x86_64 guest, then
+        immediately rerun one named x86_64 brush box and prove both generations
+        of captured state share one archive without a host write. This exercises
+        the descriptor teardown barrier under cross-architecture TCG as well.
 - [ ] Pass the full appliance suite on aarch64 TCG here, then aarch64 KVM where
       available, then x86_64 TCG/KVM.
 
@@ -338,7 +342,8 @@ as executable mappings and mmap that genuinely need a host fd.
   `/bin/sh` reports versioned exit 127 and shuts down in three seconds.
 - The cross-architecture brush leg is part of `make test-backends`, not a
   manual-only smoke test. Both cached target init binaries are static, and the
-  x86_64 guest's make/ninja shadows resolve to the x86_64 init artifact.
+  x86_64 guest's make/ninja shadows resolve to the x86_64 init artifact. Exact
+  nonzero/exec-failure status and immediate stateful rerun are gated there too.
 - Native live SUD remains untestable on this machine: its x86 wrappers require
   an x86 kernel with `PR_SET_SYSCALL_USER_DISPATCH`, while qemu-user/binfmt
   rejects that prctl with `EINVAL`. The 32/64 freestanding behavioral fixtures

@@ -746,6 +746,10 @@ belong to the relation.
       stateful rerun on aarch64 TCG. The runner now returns only after engine
       transport teardown, rather than racing a subsequent invocation against
       stale live-box state.
+- [x] Re-run the lifecycle barrier under x86_64 TCG on the aarch64 host: exact
+      exit 37 and exec-failure 127 propagate through target `/init`, and an
+      immediate named parser-brush rerun sees both generations in one captured
+      archive with no host write.
 - [ ] Copy third-party license notices beside every normal release artifact.
 
 ### 2. Generic typed FFI — NEXT

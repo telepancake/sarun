@@ -346,11 +346,55 @@ def run_cross_arch_brush(architecture):
         store = Path(env["XDG_STATE_HOME"]) / f"slopbox.{env['SLOPBOX_NS']}"
         sqlar = max(store.glob("*.sqlar"), key=lambda path: int(path.stem))
         prefix = str(work).lstrip("/") + "/brush-build/"
+        brush_result = module.sqlar_content(sqlar, prefix + "brush-result")
+        kati_result = module.sqlar_content(sqlar, prefix + "kati-out")
+        ninja_result = module.sqlar_content(sqlar, prefix + "ninja-out")
+        nonzero = subprocess.run(
+            [str(ENGINE_BIN), "run", "--net", "off", "--qemu", architecture,
+             "-b", f"LIFE-{architecture}-NONZERO", "-C", str(work), "--",
+             "sh", "-c", "exit 37"],
+            env=env, capture_output=True, timeout=240,
+        )
+        missing = subprocess.run(
+            [str(ENGINE_BIN), "run", "--net", "off", "--qemu", architecture,
+             f"LIFE-{architecture}-MISSING", "-C", str(work), "--",
+             "/definitely/missing-sarun-command"],
+            env=env, capture_output=True, timeout=240,
+        )
+        rerun_name = f"LIFE-{architecture}-RERUN"
+        rerun_first = subprocess.run(
+            [str(ENGINE_BIN), "run", "--net", "off", "--qemu", architecture,
+             "-b", rerun_name, "-C", str(work), "--", "sh", "-c",
+             "printf first > cross-rerun-first"],
+            env=env, capture_output=True, timeout=240,
+        )
+        rerun_second = subprocess.run(
+            [str(ENGINE_BIN), "run", "--net", "off", "--qemu", architecture,
+             "-b", rerun_name, "-C", str(work), "--", "sh", "-c",
+             "test \"$(cat cross-rerun-first)\" = first; printf second > cross-rerun-second"],
+            env=env, capture_output=True, timeout=240,
+        )
+        rerun_archives = [
+            archive for archive in store.glob("*.sqlar")
+            if module.sqlar_meta_get(archive, "name") == rerun_name
+        ]
+        rerun_archive = rerun_archives[0] if len(rerun_archives) == 1 else None
+        work_prefix = str(work).lstrip("/") + "/"
         return {
-            "brush": module.sqlar_content(sqlar, prefix + "brush-result"),
-            "kati": module.sqlar_content(sqlar, prefix + "kati-out"),
-            "ninja": module.sqlar_content(sqlar, prefix + "ninja-out"),
-            "host_unchanged": not (work / "brush-build").exists(),
+            "brush": brush_result,
+            "kati": kati_result,
+            "ninja": ninja_result,
+            "nonzero": nonzero.returncode,
+            "missing": missing.returncode,
+            "rerun_exits": (rerun_first.returncode, rerun_second.returncode),
+            "rerun_unique": len(rerun_archives) == 1,
+            "rerun_first": None if rerun_archive is None else module.sqlar_content(
+                rerun_archive, work_prefix + "cross-rerun-first"
+            ),
+            "rerun_second": None if rerun_archive is None else module.sqlar_content(
+                rerun_archive, work_prefix + "cross-rerun-second"
+            ),
+            "host_unchanged": not any(work.iterdir()),
         }
     finally:
         engine.terminate()
@@ -686,6 +730,13 @@ def main():
                   f"qemu {other_architecture}: target-architecture Kati ran")
             check(cross["ninja"] == b"NINJA",
                   f"qemu {other_architecture}: target-architecture n2 ran")
+            check(cross["nonzero"] == 37 and cross["missing"] == 127,
+                  f"qemu {other_architecture}: lifecycle exit statuses are exact")
+            check(cross["rerun_exits"] == (0, 0)
+                  and cross["rerun_unique"]
+                  and cross["rerun_first"] == b"first"
+                  and cross["rerun_second"] == b"second",
+                  f"qemu {other_architecture}: immediate stateful rerun works")
             check(cross["host_unchanged"],
                   f"qemu {other_architecture}: no cross-architecture host escape")
     else:
