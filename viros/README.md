@@ -100,10 +100,23 @@ at the init-exit panic with `-no-shutdown`. Before presenting the prompt GDB run
 printk changes are not compatible with the stock 5.6.3 `lx-dmesg` helper.
 The workflow prints QEMU's PID, GDB socket, and log paths before starting GDB.
 At the GDB prompt, `viros-console` resumes the VM and attaches the current
-terminal to its serial console. Press `Ctrl-]` to stop the VM and return to
-GDB; the harness breakpoints are temporary, so they do not immediately catch
-again when the console resumes. Console output is also retained in the target's
-`debug-console.log`.
+terminal to its serial console. On first use it replays the retained boot output
+before showing new live output. Press `Ctrl-]` to stop the VM and return to GDB;
+the harness breakpoints are temporary, so they do not immediately catch again
+when the console resumes. Console output is also retained in the target's
+`debug-console.log`. ARM's QEMU `virt` machine uses the PL011 console
+`ttyAMA0`; the other kernel command lines select their target's corresponding
+serial device.
+You can inspect the retained output without resuming the VM as well:
+
+```sh
+less artifacts/arm/debug-console.log
+tail -f artifacts/arm/debug-console.log
+```
+
+Ordinary `run` sessions route the supported machine's serial device to the
+calling terminal. TILE has no TCG system emulation, and `ppc-83xx` still has no
+matching QEMU machine, so neither can provide a usable emulated console.
 For MMIPS, the emulated MT7621 UART is routed to
 `artifacts/mmips/debug-console.log`. It can remain quiet while GDB holds the VM
 at `/init`, then shows kernel diagnostics once `viros-console` resumes it;

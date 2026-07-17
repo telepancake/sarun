@@ -851,7 +851,7 @@ mipsbe_kernel_cmdline() {
     # RAM at 0xc0000000, so supply the same physical offset in that mapping.
     physical=$(( ((ram_bytes - size - overhead + alignment - 1) / alignment) * alignment ))
     mapped=$((0xc0000000 + physical))
-    printf 'board=vm mem=256M HZ=100000000 init=/init panic=-1 rd_start=0x%x rd_size=%d\n' \
+    printf 'board=vm mem=256M HZ=100000000 console=ttyS0,115200 loglevel=8 ignore_loglevel init=/init panic=-1 rd_start=0x%x rd_size=%d\n' \
         "$mapped" "$size"
 }
 
@@ -886,10 +886,10 @@ run_stage() {
         arm)
             qemu=$(qemu_binary qemu-system-arm); kernel="$ARTIFACTS/arm/kernel.raw"; initrd="$ARTIFACTS/arm/initramfs.cpio"
             exec "$qemu" -M virt -cpu cortex-a15 -smp 1 -m 512M \
-                -display none -monitor none -serial none -no-reboot \
+                -display none -monitor none -serial stdio -no-reboot \
                 -d in_asm -D "$ARTIFACTS/arm/qemu-in_asm.log" \
                 -kernel "$kernel" -initrd "$initrd" \
-                -append 'console=ttyS0,115200 loglevel=8 ignore_loglevel init=/init panic=-1' \
+                -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel init=/init panic=-1' \
                 -nic none "$@"
             ;;
         arm64)
@@ -903,16 +903,16 @@ run_stage() {
             qemu="$TOOLS/qemu/bin/qemu-system-mips"; kernel="$ARTIFACTS/mipsbe/kernel.qemu.elf"; initrd="$ARTIFACTS/mipsbe/initramfs.cpio"
             [[ -x "$qemu" ]] || die "MIPSBE requires viros's MetaROUTER-patched QEMU; run download and build"
             mips_cmdline=$(mipsbe_kernel_cmdline "$initrd")
-            exec "$qemu" -M malta -cpu 24Kc -m 256M -display none -monitor none -serial null -parallel none \
+            exec "$qemu" -M malta -cpu 24Kc -m 256M -display none -monitor none -serial stdio -parallel none \
                 -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd" -append "$mips_cmdline" \
                 -nic none "$@"
             ;;
         smips)
             qemu="$TOOLS/qemu/bin/qemu-system-mips"; kernel="$ARTIFACTS/smips/kernel.qemu.elf"; initrd="$ARTIFACTS/smips/initramfs.cpio"
             [[ -x "$qemu" ]] || die "SMIPS requires viros's MetaROUTER-patched QEMU; run download and build"
-            exec "$qemu" -M malta -cpu 24Kc -m 256M -display none -monitor none -serial none \
+            exec "$qemu" -M malta -cpu 24Kc -m 256M -display none -monitor none -serial stdio \
                 -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd" \
-                -append 'board=vm mem=256M HZ=100000000 init=/init panic=-1' \
+                -append 'board=vm mem=256M HZ=100000000 console=ttyS0,115200 loglevel=8 ignore_loglevel init=/init panic=-1' \
                 -nic none "$@"
             ;;
         mmips)
@@ -922,7 +922,7 @@ run_stage() {
                 -display none -monitor none -serial none -parallel none \
                 -chardev stdio,id=mikrotik-mmips-uart,signal=off \
                 -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd" \
-                -append 'board=750g-mt mem=256M HZ=100000000 console=ttyS0,115200 init=/init panic=-1' \
+                -append 'board=750g-mt mem=256M HZ=100000000 console=ttyS0,115200 loglevel=8 ignore_loglevel init=/init panic=-1' \
                 -nic none "$@"
             ;;
         ppc-e500-smp)
@@ -932,7 +932,7 @@ run_stage() {
             # stalls on current QEMU.  One vCPU reaches /init reliably.
             exec "$qemu" -M ppce500 -cpu e500v2 -smp 1 -m 256M -nographic -no-reboot \
                 -nodefaults -serial stdio -monitor none \
-                -kernel "$kernel" -initrd "$initrd" -append 'console=ttyS0 root=/dev/ram0' \
+                -kernel "$kernel" -initrd "$initrd" -append 'console=ttyS0,115200 loglevel=8 ignore_loglevel root=/dev/ram0' \
                 -nic none "$@"
             ;;
         ppc-e500)
@@ -941,7 +941,7 @@ run_stage() {
             initrd="$ARTIFACTS/$target/initramfs.cpio"
             [[ -x "$TOOLS/qemu/bin/qemu-system-ppc" ]] ||
                 die "PPC e500 requires viros's RouterOS-patched QEMU; run download and build"
-            ppc_cmdline='console=ttyS0 root=/dev/ram0 init=/init panic=-1'
+            ppc_cmdline='console=ttyS0,115200 loglevel=8 ignore_loglevel root=/dev/ram0 init=/init panic=-1'
             dtb=$(prepare_ppc_e500_dtb "$qemu" "$kernel" "$initrd" "$ppc_cmdline" "$target")
             exec "$qemu" -M ppce500 -cpu e500v2 -smp 1 -m 256M -nographic -no-reboot \
                 -nodefaults -serial stdio -monitor none -dtb "$dtb" \
@@ -954,7 +954,7 @@ run_stage() {
             bios=$(prepare_ppc440_dtb)
             exec "$qemu" -L "$bios" -M sam460ex -cpu 460exb -m 256M -nographic -no-reboot \
                 -nodefaults -serial stdio -monitor none \
-                -kernel "$kernel" -initrd "$initrd" -append 'console=ttyS0 root=/dev/ram0' \
+                -kernel "$kernel" -initrd "$initrd" -append 'console=ttyS0,115200 loglevel=8 ignore_loglevel root=/dev/ram0' \
                 -nic none "$@"
             ;;
     esac
@@ -1096,7 +1096,7 @@ debug_stage() {
             qemu_args=( -M virt,gic-version=2 -cpu cortex-a15 -m 512M -smp 1
                 -display none -monitor none -nic none -no-reboot -no-shutdown -S
                 -kernel "$kernel" -initrd "$initrd"
-                -append 'console=ttyS0,115200 loglevel=8 ignore_loglevel init=/init panic=-1 nokaslr' )
+                -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel init=/init panic=-1 nokaslr' )
             ;;
         arm64)
             qemu=$(qemu_binary qemu-system-aarch64)
@@ -1135,7 +1135,7 @@ debug_stage() {
             qemu_args=( -M malta -cpu 34Kf -smp 1 -m 256M
                 -display none -monitor none -serial none -parallel none -nic none
                 -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel" -initrd "$initrd"
-                -append 'board=750g-mt mem=256M HZ=100000000 console=ttyS0,115200 init=/init panic=-1' )
+                -append 'board=750g-mt mem=256M HZ=100000000 console=ttyS0,115200 loglevel=8 ignore_loglevel init=/init panic=-1' )
             ;;
         smips)
             qemu="$TOOLS/qemu/bin/qemu-system-mips"
@@ -1149,7 +1149,7 @@ debug_stage() {
             qemu_args=( -M malta -cpu 24Kc -m 256M
                 -display none -monitor none -parallel none -nic none
                 -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel" -initrd "$initrd"
-                -append 'board=vm mem=256M HZ=100000000 init=/init panic=-1' )
+                -append 'board=vm mem=256M HZ=100000000 console=ttyS0,115200 loglevel=8 ignore_loglevel init=/init panic=-1' )
             ;;
         ppc-e500-smp)
             qemu=$(qemu_binary qemu-system-ppc)
@@ -1159,7 +1159,7 @@ debug_stage() {
             qemu_args=( -M ppce500 -cpu e500v2 -smp 1 -m 256M
                 -display none -monitor none -nic none
                 -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd"
-                -append 'console=ttyS0 root=/dev/ram0' )
+                -append 'console=ttyS0,115200 loglevel=8 ignore_loglevel root=/dev/ram0' )
             ;;
         ppc-e500)
             qemu=$(qemu_binary qemu-system-ppc)
@@ -1168,7 +1168,7 @@ debug_stage() {
             kernel="$ARTIFACTS/$target/kernel.debug.qemu.elf"
             initrd="$ARTIFACTS/$target/initramfs.cpio"
             [[ -s "$kernel" ]] || die "debug QEMU ELF is missing; run: ./viros.sh kernel-debug $target"
-            ppc_cmdline='console=ttyS0 root=/dev/ram0 init=/init panic=-1'
+            ppc_cmdline='console=ttyS0,115200 loglevel=8 ignore_loglevel root=/dev/ram0 init=/init panic=-1'
             dtb=$(prepare_ppc_e500_dtb "$qemu" "$kernel" "$initrd" "$ppc_cmdline" "$target")
             qemu_args=( -M ppce500 -cpu e500v2 -smp 1 -m 256M
                 -display none -monitor none -nic none
@@ -1184,7 +1184,7 @@ debug_stage() {
             qemu_args=( -L "$bios" -M sam460ex -cpu 460exb -m 256M
                 -display none -monitor none -nic none
                 -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd"
-                -append 'console=ttyS0 root=/dev/ram0' )
+                -append 'console=ttyS0,115200 loglevel=8 ignore_loglevel root=/dev/ram0' )
             ;;
     esac
     if [[ "$target" == mmips ]]; then
@@ -1253,7 +1253,8 @@ debug_stage() {
     say "At the GDB prompt run 'viros-console'; press Ctrl-] to return to GDB"
     say "Starting exact-symbol GDB for $target; PID 1 must be printed before the prompt"
     set +e
-    VIROS_CONSOLE_SOCKET="$DEBUG_CONSOLE_SOCKET" "$gdb" "${gdb_args[@]}"
+    VIROS_CONSOLE_SOCKET="$DEBUG_CONSOLE_SOCKET" VIROS_CONSOLE_LOG="$console_log" \
+        "$gdb" "${gdb_args[@]}"
     status=$?
     set -e
     cleanup_debug_qemu
