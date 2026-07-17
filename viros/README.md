@@ -99,11 +99,15 @@ at the init-exit panic with `-no-shutdown`. Before presenting the prompt GDB run
 `lx-version`, `lx-ps`, and examines PID 1 with `$lx_task_by_pid(1)`. MikroTik's
 printk changes are not compatible with the stock 5.6.3 `lx-dmesg` helper.
 The workflow prints QEMU's PID, GDB socket, and log paths before starting GDB.
+At the GDB prompt, `viros-console` resumes the VM and attaches the current
+terminal to its serial console. Press `Ctrl-]` to stop the VM and return to
+GDB; the harness breakpoints are temporary, so they do not immediately catch
+again when the console resumes. Console output is also retained in the target's
+`debug-console.log`.
 For MMIPS, the emulated MT7621 UART is routed to
-`artifacts/mmips/debug-console.log`, but MikroTik's published `mmips.config`
-does not enable the Ralink platform console. The file therefore normally
-remains empty during the matching debug-kernel run; MMIPS is controlled and
-inspected through GDB rather than an interactive VM console.
+`artifacts/mmips/debug-console.log`. It can remain quiet while GDB holds the VM
+at `/init`, then shows kernel diagnostics once `viros-console` resumes it;
+RouterOS init does not necessarily provide an interactive shell on that UART.
 
 ## Strict status matrix
 

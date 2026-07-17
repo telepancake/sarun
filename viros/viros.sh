@@ -993,6 +993,7 @@ gdb_stage() {
 
 DEBUG_QEMU_PID=
 DEBUG_GDB_SOCKET=
+DEBUG_CONSOLE_SOCKET=
 cleanup_debug_qemu() {
     local count
     if [[ -n "$DEBUG_QEMU_PID" ]] && kill -0 "$DEBUG_QEMU_PID" 2>/dev/null; then
@@ -1007,8 +1008,10 @@ cleanup_debug_qemu() {
     fi
     [[ -n "$DEBUG_QEMU_PID" ]] && wait "$DEBUG_QEMU_PID" 2>/dev/null || true
     [[ -n "$DEBUG_GDB_SOCKET" ]] && rm -f -- "$DEBUG_GDB_SOCKET"
+    [[ -n "$DEBUG_CONSOLE_SOCKET" ]] && rm -f -- "$DEBUG_CONSOLE_SOCKET"
     DEBUG_QEMU_PID=
     DEBUG_GDB_SOCKET=
+    DEBUG_CONSOLE_SOCKET=
 }
 
 debug_qemu_failed() {
@@ -1041,7 +1044,7 @@ wait_for_console_pattern() {
 }
 
 debug_stage() {
-    local target=${1:-} qemu kernel initrd bios= out vmlinux helper console_log qemu_log gdb status init_entry= mips_cmdline= ppc_cmdline= dtb=
+    local target=${1:-} qemu kernel initrd bios= out vmlinux helper console_log qemu_log gdb status init_entry= mips_cmdline= ppc_cmdline= dtb= console_chardev
     local -a qemu_args gdb_args
     case "$target" in
         x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
@@ -1057,7 +1060,9 @@ debug_stage() {
     [[ -s "$vmlinux" && -s "$helper" ]] || die "matching kernel/debug helpers are missing; run: ./viros.sh kernel-debug $target"
     mkdir -p "$ARTIFACTS/$target" "$BUILD"
     DEBUG_GDB_SOCKET="$BUILD/gdb-$target-$$.sock"
+    DEBUG_CONSOLE_SOCKET="$BUILD/console-$target-$$.sock"
     ((${#DEBUG_GDB_SOCKET} <= 100)) || die "GDB Unix socket path is too long; use a shorter VIROS_WORKDIR"
+    ((${#DEBUG_CONSOLE_SOCKET} <= 100)) || die "console Unix socket path is too long; use a shorter VIROS_WORKDIR"
     console_log="$ARTIFACTS/$target/debug-console.log"
     qemu_log="$ARTIFACTS/$target/debug-qemu.log"
     : > "$console_log"
@@ -1077,7 +1082,7 @@ debug_stage() {
             init_entry=$(head -n 1 "$ARTIFACTS/x86/init.entry")
             [[ "$init_entry" =~ ^0x[0-9a-fA-F]+$ ]] || die "invalid x86 init entry: $init_entry"
             qemu_args=( -machine pc,accel=tcg -cpu qemu64 -smp 1 -m 512M
-                -display none -monitor none -serial "file:$console_log" -nic none
+                -display none -monitor none -nic none
                 -no-reboot -no-shutdown -nodefaults -S
                 -kernel "$kernel" -initrd "$initrd"
                 -append 'console=ttyS0,115200 loglevel=8 ignore_loglevel rdinit=/init init=/init panic=-1 nokaslr'
@@ -1089,7 +1094,7 @@ debug_stage() {
             initrd="$ARTIFACTS/arm/initramfs.cpio"
             [[ -s "$kernel" ]] || die "debug zImage is missing; run: ./viros.sh kernel-debug arm"
             qemu_args=( -M virt,gic-version=2 -cpu cortex-a15 -m 512M -smp 1
-                -display none -monitor none -serial none -nic none -no-reboot -no-shutdown -S
+                -display none -monitor none -nic none -no-reboot -no-shutdown -S
                 -kernel "$kernel" -initrd "$initrd"
                 -append 'console=ttyS0,115200 loglevel=8 ignore_loglevel init=/init panic=-1 nokaslr' )
             ;;
@@ -1099,7 +1104,7 @@ debug_stage() {
             initrd="$ARTIFACTS/arm64/initramfs.cpio"
             [[ -s "$kernel" ]] || die "debug Image is missing; run: ./viros.sh kernel-debug arm64"
             qemu_args=( -M virt -cpu cortex-a57 -m 512M -smp 2
-                -display none -monitor none -serial none -nic none -no-reboot -no-shutdown -S
+                -display none -monitor none -nic none -no-reboot -no-shutdown -S
                 -kernel "$kernel" -initrd "$initrd"
                 -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel init=/init panic=-1 nokaslr' )
             ;;
@@ -1114,7 +1119,7 @@ debug_stage() {
             [[ "$init_entry" =~ ^0x[0-9a-fA-F]+$ ]] || die "invalid MIPSBE init entry: $init_entry"
             mips_cmdline=$(mipsbe_kernel_cmdline "$initrd")
             qemu_args=( -M malta -cpu 24Kc -m 256M
-                -display none -monitor none -serial null -parallel none -nic none
+                -display none -monitor none -parallel none -nic none
                 -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel" -initrd "$initrd"
                 -append "$mips_cmdline" )
             ;;
@@ -1129,7 +1134,6 @@ debug_stage() {
             [[ "$init_entry" =~ ^0x[0-9a-fA-F]+$ ]] || die "invalid MMIPS init entry: $init_entry"
             qemu_args=( -M malta -cpu 34Kf -smp 1 -m 256M
                 -display none -monitor none -serial none -parallel none -nic none
-                -chardev "file,id=mikrotik-mmips-uart,path=$console_log"
                 -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel" -initrd "$initrd"
                 -append 'board=750g-mt mem=256M HZ=100000000 console=ttyS0,115200 init=/init panic=-1' )
             ;;
@@ -1143,7 +1147,7 @@ debug_stage() {
             init_entry=$(head -n 1 "$ARTIFACTS/smips/init.entry")
             [[ "$init_entry" =~ ^0x[0-9a-fA-F]+$ ]] || die "invalid SMIPS init entry: $init_entry"
             qemu_args=( -M malta -cpu 24Kc -m 256M
-                -display none -monitor none -serial null -parallel none -nic none
+                -display none -monitor none -parallel none -nic none
                 -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel" -initrd "$initrd"
                 -append 'board=vm mem=256M HZ=100000000 init=/init panic=-1' )
             ;;
@@ -1153,7 +1157,7 @@ debug_stage() {
             initrd="$ARTIFACTS/$target/initramfs.cpio"
             [[ -s "$kernel" ]] || die "debug QEMU ELF is missing; run: ./viros.sh kernel-debug $target"
             qemu_args=( -M ppce500 -cpu e500v2 -smp 1 -m 256M
-                -display none -monitor none -serial "file:$console_log" -nic none
+                -display none -monitor none -nic none
                 -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd"
                 -append 'console=ttyS0 root=/dev/ram0' )
             ;;
@@ -1167,7 +1171,7 @@ debug_stage() {
             ppc_cmdline='console=ttyS0 root=/dev/ram0 init=/init panic=-1'
             dtb=$(prepare_ppc_e500_dtb "$qemu" "$kernel" "$initrd" "$ppc_cmdline" "$target")
             qemu_args=( -M ppce500 -cpu e500v2 -smp 1 -m 256M
-                -display none -monitor none -serial "file:$console_log" -nic none
+                -display none -monitor none -nic none
                 -no-reboot -no-shutdown -nodefaults -dtb "$dtb"
                 -kernel "$kernel" -initrd "$initrd" -append "$ppc_cmdline" )
             ;;
@@ -1178,11 +1182,18 @@ debug_stage() {
             [[ -s "$kernel" ]] || die "debug QEMU ELF is missing; run: ./viros.sh kernel-debug $target"
             bios=$(prepare_ppc440_dtb)
             qemu_args=( -L "$bios" -M sam460ex -cpu 460exb -m 256M
-                -display none -monitor none -serial "file:$console_log" -nic none
+                -display none -monitor none -nic none
                 -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd"
                 -append 'console=ttyS0 root=/dev/ram0' )
             ;;
     esac
+    if [[ "$target" == mmips ]]; then
+        console_chardev=mikrotik-mmips-uart
+    else
+        console_chardev=viros-console
+    fi
+    qemu_args+=( -chardev "socket,id=$console_chardev,path=$DEBUG_CONSOLE_SOCKET,server=on,wait=off,logfile=$console_log,logappend=on" )
+    [[ "$target" == mmips ]] || qemu_args+=( -serial "chardev:$console_chardev" )
     qemu_args+=( -gdb "unix:path=$DEBUG_GDB_SOCKET,server=on,wait=off" )
     "$qemu" "${qemu_args[@]}" 2> "$qemu_log" &
     DEBUG_QEMU_PID=$!
@@ -1203,18 +1214,18 @@ debug_stage() {
         gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
             -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10'
             -ex 'set suppress-cli-notifications on' -ex 'set architecture mips'
-            -ex "target remote $DEBUG_GDB_SOCKET" -ex 'hbreak start_thread' -ex continue )
+            -ex "target remote $DEBUG_GDB_SOCKET" -ex 'thbreak start_thread' -ex continue )
     elif [[ "$target" == mipsbe || "$target" == smips ]]; then
         gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
             -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10' -ex 'set architecture mips'
-            -ex "target remote $DEBUG_GDB_SOCKET" -ex 'hbreak start_thread' -ex continue )
+            -ex "target remote $DEBUG_GDB_SOCKET" -ex 'thbreak start_thread' -ex continue )
     elif [[ "$target" == x86 ]]; then
         gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
             -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10' -ex 'set architecture i386:x86-64'
-            -ex "target remote $DEBUG_GDB_SOCKET" -ex 'break compat_start_thread' -ex continue )
+            -ex "target remote $DEBUG_GDB_SOCKET" -ex 'tbreak compat_start_thread' -ex continue )
     fi
     if [[ "$target" == arm || "$target" == arm64 ]]; then
-        gdb_args+=( -ex 'hbreak ret_to_user' -ex continue )
+        gdb_args+=( -ex 'thbreak ret_to_user' -ex continue )
     fi
     gdb_args+=( -ex "source $helper" -ex lx-version -ex lx-ps
         -ex 'p $lx_task_by_pid(1)->pid' -ex 'p $lx_task_by_pid(1)->comm' )
@@ -1224,25 +1235,25 @@ debug_stage() {
         if [[ "$target" == x86 ]]; then
             # QEMU x86 TCG does not advertise hardware breakpoints, but a
             # software breakpoint in the mapped IA32 init page is reliable.
-            gdb_args+=( -ex "break *$init_entry" -ex continue )
+            gdb_args+=( -ex "tbreak *$init_entry" -ex continue )
         else
-            gdb_args+=( -ex "hbreak *$init_entry" -ex continue )
+            gdb_args+=( -ex "thbreak *$init_entry" -ex continue )
         fi
     fi
+    gdb_args+=( -ex "source $SCRIPT_DIR/gdb_console.py" )
     say "QEMU PID: $DEBUG_QEMU_PID"
     say "GDB socket: $DEBUG_GDB_SOCKET"
+    say "interactive console socket: $DEBUG_CONSOLE_SOCKET"
     say "VM console log: $console_log"
     say "QEMU diagnostic log: $qemu_log"
     if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips ]]; then
-        say "Breakpoint 1: kernel start_thread (prove and inspect PID 1)"
-        say "Breakpoint 2: RouterOS /init ELF entry $init_entry (final prompt)"
+        say "Temporary breakpoint 1: kernel start_thread (prove and inspect PID 1)"
+        say "Temporary breakpoint 2: RouterOS /init ELF entry $init_entry (final prompt)"
     fi
-    if [[ "$target" == mmips ]]; then
-        say "MMIPS note: the published debug config has no usable serial console; the console log may remain empty"
-    fi
+    say "At the GDB prompt run 'viros-console'; press Ctrl-] to return to GDB"
     say "Starting exact-symbol GDB for $target; PID 1 must be printed before the prompt"
     set +e
-    "$gdb" "${gdb_args[@]}"
+    VIROS_CONSOLE_SOCKET="$DEBUG_CONSOLE_SOCKET" "$gdb" "${gdb_args[@]}"
     status=$?
     set -e
     cleanup_debug_qemu
