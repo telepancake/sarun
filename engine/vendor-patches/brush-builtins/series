@@ -3,3 +3,5 @@
 0030-provenance-record-make-shell-variable-assignments-in-the-box.patch
 0040-provenance-opt-in-vars-record-rhs-dereferences-and-execution.patch
 0050-wait--implement-waiting-on-process-IDs.patch
+0060-discover-optimized-external-commands-through-PATH.patch
+0070-store-umask-in-logical-shell-state.patch

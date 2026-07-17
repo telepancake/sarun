@@ -1,0 +1,17 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 23:33:00 +0000
+Subject: [PATCH] identify find as GNU compatible
+
+---
+diff --git a/src/find/mod.rs b/src/find/mod.rs
+--- a/src/find/mod.rs
++++ b/src/find/mod.rs
+@@ -408,6 +408,6 @@ fn print_version(deps: &dyn Dependencies) -> Result<(), io::Error> {
+     writeln!(
+         &mut deps.get_output().borrow_mut(),
+-        "find (Rust) {}",
++        "find (GNU findutils-compatible Rust) {}",
+         env!("CARGO_PKG_VERSION")
+     )
+ }

@@ -495,6 +495,29 @@ as executable mappings and mmap that genuinely need a host fd.
           keeps a match-anything `%::` fallback from becoming the recipe of
           OpenWrt's `FORCE` target and recursively re-entering `make prereq`.
           The exact rule-less `%::`/`FORCE` fixture brings the suite to 38 cases.
+    - [x] Preserve ordinary external-command identity for optimized in-process
+          commands: `command -v` and `type` now discover their executable PATH,
+          while execution remains optimized. Uutils clap help/version output is
+          routed through the logical pipeline streams, the self-shadowed Bash
+          version probe is truthful and successful, and `find --version`
+          identifies its GNU-compatible contract. These were all exercised by
+          OpenWrt's prerequisite probes in a real FUSE/Brush box.
+    - [x] Make umask logical shell state instead of shared process state. A
+          subshell's `umask 077` is cloned and isolated, external children get
+          it in their pre-exec hook, and in-process utilities receive it through
+          thread-local uucore context. A 100-way nested-umask/mkdir fixture keeps
+          its parent at 0022 while producing 0700 directories and 0600 external
+          files; OpenWrt's parallel proper-umask prerequisite now passes.
+    - [ ] Complete the OpenWrt 25.12.5 `armsr/armv8` clean `make -j10 world`
+          FUSE/Brush gate. The source is pinned at tag/commit
+          `v25.12.5`/`f0a60eee2fe051741c643ea6118718aae1ef17fb`, with all 87
+          required archives cached. Prerequisite checking has progressed into
+          package metadata scanning; the current conformance boundary is
+          preserving exported `TOPDIR` through the scan make's recursive
+          `make --no-print-dir -C package/...` invocation. Kati now handles the
+          unambiguous GNU long-option abbreviation generically; the remaining
+          export propagation failure is not bypassed with an OpenWrt-specific
+          flag or variable injection.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

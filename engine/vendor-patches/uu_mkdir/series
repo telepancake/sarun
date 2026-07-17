@@ -1,1 +1,2 @@
 0010-uu_mkdir-in-process-mkdir-builtin-injected-logical-I-O-logic.patch
+0020-avoid-process-global-umask-races.patch

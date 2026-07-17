@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 23:31:00 +0000
+Subject: [PATCH] discover optimized external commands through PATH
+
+---
+diff --git a/src/command.rs b/src/command.rs
+--- a/src/command.rs
++++ b/src/command.rs
+@@ -107,6 +107,7 @@ impl CommandCommand {
+         } else {
+             if let Some(builtin_cmd) = shell.builtins().get(command_name)
+                 && !builtin_cmd.disabled
++                && !builtin_cmd.external_command
+             {
+                 return Some(FoundCommand::Builtin(command_name.to_owned()));
+             }
+diff --git a/src/type_.rs b/src/type_.rs
+--- a/src/type_.rs
++++ b/src/type_.rs
+@@ -175,7 +175,11 @@ impl TypeCommand {
+             }
+
+             // Check for builtins.
+-            if shell.builtins().get(name).is_some_and(|b| !b.disabled) {
++            if shell
++                .builtins()
++                .get(name)
++                .is_some_and(|b| !b.disabled && !b.external_command)
++            {
+                 types.push(ResolvedType::Builtin);
+                 if !self.all_locations {
+                     return types;

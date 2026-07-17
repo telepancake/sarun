@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 21:40:28 +0000
+Subject: [PATCH] virtualize shell umask across concurrent subshells
+
+---
+diff --git a/src/commands.rs b/src/commands.rs
+index 34386e0..4c4761d 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -287,6 +287,22 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
+     });
+     cmd.inject_fds(other_files)?;
+
++    // `umask` is shell state, not process state. Brush can run cloned shells
++    // concurrently in one process, so mutating the parent's process-global
++    // mask would let one subshell corrupt its siblings. Materialize the
++    // logical value only in the forked child immediately before exec.
++    #[cfg(unix)]
++    {
++        let umask = context.shell.umask();
++        use std::os::unix::process::CommandExt;
++        unsafe {
++            cmd.pre_exec(move || {
++                libc::umask(umask as libc::mode_t);
++                Ok(())
++            });
++        }
++    }
++
+     // sarun fix (NOT upstream brush): close every stray fd > 2 in the
+     // child between fork and exec, except the ones brush explicitly
+     // mapped. Without this hook, pipeline children leak the WRITE end
+diff --git a/src/shell/builder.rs b/src/shell/builder.rs
+index f85308c..3230274 100644
+--- a/src/shell/builder.rs
++++ b/src/shell/builder.rs
+@@ -236,6 +236,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
+             traps: traps::TrapHandlerConfig::default(),
+             open_files: openfiles::OpenFiles::default(),
+             working_dir: PathBuf::default(),
++            umask: 0o022,
+             env: env::ShellEnvironment::default(),
+             funcs: functions::FunctionEnv::default(),
+             options: options::RuntimeOptions::default(),
+diff --git a/src/shell/state.rs b/src/shell/state.rs
+index fb5ee5c..ba03cf1 100644
+--- a/src/shell/state.rs
++++ b/src/shell/state.rs
+@@ -115,6 +115,12 @@ pub trait ShellState {
+     /// Returns the shell's current working directory.
+     fn working_dir(&self) -> &Path;
+
++    /// Returns this logical shell's file-creation mask.
++    fn umask(&self) -> u32;
++
++    /// Updates this logical shell's file-creation mask.
++    fn set_umask(&mut self, umask: u32);
++
+     /// Returns a mutable reference to the shell's current working directory.
+     /// This is only accessible within the crate.
+     fn working_dir_mut(&mut self) -> &mut PathBuf;
+diff --git a/src/shell.rs b/src/shell.rs
+index 0bc731f..b3ccbb2 100644
+--- a/src/shell.rs
++++ b/src/shell.rs
+@@ -70,6 +70,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
+     /// The current working directory.
+     working_dir: PathBuf,
+
++    /// The file-creation mask belonging to this logical shell. A Brush process
++    /// may execute many subshells concurrently, so this cannot live in the
++    /// process-global `umask(2)` slot.
++    umask: u32,
++
+     /// The shell environment, containing shell variables.
+     env: ShellEnvironment,
+
+@@ -167,6 +172,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
+             traps: self.traps.clone(),
+             open_files: self.open_files.clone(),
+             working_dir: self.working_dir.clone(),
++            umask: self.umask,
+             env: self.env.clone(),
+             funcs: self.funcs.clone(),
+             options: self.options.clone(),
+@@ -599,6 +605,16 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
+         &self.working_dir
+     }
+
++    /// Returns this logical shell's file-creation mask.
++    pub fn umask(&self) -> u32 {
++        self.umask
++    }
++
++    /// Updates this logical shell's file-creation mask.
++    pub fn set_umask(&mut self, umask: u32) {
++        self.umask = umask;
++    }
++
+     /// Returns a mutable reference to the shell's current working directory.
+     /// This is only accessible within the crate.
+     pub(crate) fn working_dir_mut(&mut self) -> &mut PathBuf {

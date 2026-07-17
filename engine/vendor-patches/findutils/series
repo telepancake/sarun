@@ -1,4 +1,5 @@
 0010-findutils-reduce-vendored-crate-to-a-find-only-library.patch
+0020-identify-find-as-GNU-compatible.patch
 0020-find-inject-error-diagnostics-through-the-Dependencies-trait.patch
 0030-findutils-drop-accidentally-committed-Cargo.lock.patch
 0040-find-read-files0-from-from-logical-stdin-not-the-process-fd-.patch

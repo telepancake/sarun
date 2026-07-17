@@ -3,3 +3,6 @@
 0030-uu_chown-in-process-chown-builtin-injected-logical-I-O-logic.patch
 0040-logical-env-seam--route-runtime-env-reads-through-the-shell.patch
 0050-silence-rustc-lint-warnings--unused-qualifications---dead-co.patch
+0060-render-clap-results-to-injected-logical-streams.patch
+0070-read-Linux-umask-without-mutating-process-state.patch
+0080-supply-logical-umask-to-in-process-utilities.patch

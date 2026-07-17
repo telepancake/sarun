@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 21:43:41 +0000
+Subject: [PATCH] accept unambiguous GNU long option abbreviations
+
+---
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index 6acec82..3806e86 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -352,7 +352,9 @@ impl Flags {
+
+         while let Some(arg) = iter.next() {
+             let mut should_propagate = true;
+-            match arg.as_bytes() {
++            let arg_bytes = arg.as_bytes();
++            let resolved_long_option = resolve_supported_gnu_long_option(arg_bytes);
++            match resolved_long_option.unwrap_or(arg_bytes) {
+                 b"-f" => {
+                     *flags.makefile.lock() = iter.next();
+                     should_propagate = false;
+@@ -561,6 +563,32 @@ impl Flags {
+     }
+ }
+
++/// GNU getopt accepts an unambiguous prefix of a long option. Keep that
++/// behavior centralized for the GNU-compatible long options Kati implements,
++/// rather than accumulating aliases such as OpenWrt's `--no-print-dir`.
++fn resolve_supported_gnu_long_option(arg: &[u8]) -> Option<&'static [u8]> {
++    if !arg.starts_with(b"--") || arg.contains(&b'=') {
++        return None;
++    }
++    const OPTIONS: &[&[u8]] = &[
++        b"--ignore-errors",
++        b"--just-print",
++        b"--dry-run",
++        b"--recon",
++        b"--trace",
++        b"--always-make",
++        b"--question",
++        b"--load-average",
++        b"--max-load",
++        b"--keep-going",
++        b"--print-directory",
++        b"--no-print-directory",
++    ];
++    let mut matches = OPTIONS.iter().copied().filter(|option| option.starts_with(arg));
++    let first = matches.next()?;
++    matches.next().is_none().then_some(first)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -587,4 +615,20 @@ mod tests {
+             Some(OsString::from("out/%.P"))
+         );
+     }
++
++    #[test]
++    fn test_unambiguous_gnu_long_option_abbreviation() {
++        let flags = Flags::from_args(
++            vec!["make", "--no-print-dir"]
++                .into_iter()
++                .map(Into::into)
++                .collect(),
++        );
++        assert_eq!(flags.subkati_args[1], "--no-print-dir");
++        assert_eq!(
++            resolve_supported_gnu_long_option(b"--no-print-dir"),
++            Some(&b"--no-print-directory"[..])
++        );
++        assert_eq!(resolve_supported_gnu_long_option(b"--"), None);
++    }
+ }

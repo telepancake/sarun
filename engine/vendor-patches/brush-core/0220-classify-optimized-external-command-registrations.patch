@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 23:30:00 +0000
+Subject: [PATCH] classify optimized external command registrations
+
+---
+diff --git a/src/builtins.rs b/src/builtins.rs
+--- a/src/builtins.rs
++++ b/src/builtins.rs
+@@ -169,6 +169,11 @@ pub struct Registration<SE: extensions::ShellExtensions> {
+     /// Is the builtin classified as "special" by specification?
+     pub special_builtin: bool,
+
++    /// Is this an external command implemented in-process as an optimization?
++    /// Discovery reports its executable from PATH, while execution still uses
++    /// this registration.
++    pub external_command: bool,
++
+     /// Is this builtin one that takes specially handled declarations?
+     pub declaration_builtin: bool,
+ }
+@@ -184,4 +189,13 @@ impl<SE: extensions::ShellExtensions> Registration<SE> {
+             ..self
+         }
+     }
++
++    /// Marks an optimized in-process implementation as an external command.
++    #[must_use]
++    pub const fn external(self) -> Self {
++        Self {
++            external_command: true,
++            ..self
++        }
++    }
+ }
+@@ -390,6 +405,7 @@ pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExten
+         definition_func: None,
+         disabled: false,
+         special_builtin: false,
++        external_command: false,
+         declaration_builtin: false,
+     }
+ }
+@@ -403,6 +419,7 @@ pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> R
+         definition_func: Some(command_definition::<B>),
+         disabled: false,
+         special_builtin: false,
++        external_command: false,
+         declaration_builtin: false,
+     }
+ }
+@@ -418,6 +435,7 @@ pub fn decl_builtin<B: DeclarationCommand + Send + Sync, SE: extensions::ShellEx
+         definition_func: Some(command_definition::<B>),
+         disabled: false,
+         special_builtin: false,
++        external_command: false,
+         declaration_builtin: true,
+     }
+ }
+@@ -439,6 +457,7 @@ pub fn raw_arg_builtin<
+         definition_func: Some(command_definition::<B>),
+         disabled: false,
+         special_builtin: false,
++        external_command: false,
+         declaration_builtin: true,
+     }
+ }

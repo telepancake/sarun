@@ -65,3 +65,4 @@
 0650-Prefer-more-specific-implicit-make-patterns.patch
 0660-Compose-overlapping-pattern-specific-make-variables.patch
 0670-Skip-implicit-rules-for-phony-make-targets.patch
+0680-accept-unambiguous-GNU-long-option-abbreviations.patch

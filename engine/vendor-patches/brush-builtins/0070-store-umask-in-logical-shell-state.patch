@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 21:40:27 +0000
+Subject: [PATCH] store umask in logical shell state
+
+---
+diff --git a/src/umask.rs b/src/umask.rs
+index 08a7c36..f4e4339 100644
+--- a/src/umask.rs
++++ b/src/umask.rs
+@@ -1,8 +1,5 @@
+ use brush_core::{ErrorKind, ExecutionResult, builtins};
+-use cfg_if::cfg_if;
+ use clap::Parser;
+-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+-use nix::sys::stat::Mode;
+ use std::io::Write;
+
+ /// Manage the process umask.
+@@ -30,12 +27,12 @@ impl builtins::Command for UmaskCommand {
+         if let Some(mode) = &self.mode {
+             if mode.starts_with(|c: char| c.is_digit(8)) {
+                 let parsed = brush_core::int_utils::parse(mode.as_str(), 8)?;
+-                set_umask(parsed)?;
++                set_umask(context.shell, parsed)?;
+             } else {
+                 return brush_core::error::unimp("umask setting mode from symbolic value");
+             }
+         } else {
+-            let umask = get_umask()?;
++            let umask = context.shell.umask();
+
+             let formatted = if self.symbolic_output {
+                 let u = symbolic_mask_from_bits((!umask & 0o700) >> 6);
+@@ -57,24 +54,11 @@ impl builtins::Command for UmaskCommand {
+     }
+ }
+
+-cfg_if! {
+-    if #[cfg(any(target_os = "linux", target_os = "android"))] {
+-        fn get_umask() -> Result<u32, brush_core::Error> {
+-            let umask = procfs::process::Process::myself().ok().and_then(|me| me.status().ok()).and_then(|status| status.umask);
+-            umask.ok_or_else(|| brush_core::ErrorKind::InvalidUmask.into())
+-        }
+-    } else {
+-        #[expect(clippy::unnecessary_wraps)]
+-        fn get_umask() -> Result<u32, brush_core::Error> {
+-            let u = nix::sys::stat::umask(Mode::empty());
+-            nix::sys::stat::umask(u);
+-            Ok(u32::from(u.bits()))
+-        }
+-    }
+-}
+-
+-fn set_umask(value: nix::sys::stat::mode_t) -> Result<(), brush_core::Error> {
++fn set_umask<SE: brush_core::extensions::ShellExtensions>(
++    shell: &mut brush_core::Shell<SE>,
++    value: nix::sys::stat::mode_t,
++) -> Result<(), brush_core::Error> {
+     // value of mode_t can be platform dependent
+     let mode = nix::sys::stat::Mode::from_bits(value).ok_or_else(|| ErrorKind::InvalidUmask)?;
+-    nix::sys::stat::umask(mode);
++    shell.set_umask(u32::from(mode.bits()));
+     Ok(())
+ }

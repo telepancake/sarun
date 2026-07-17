@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 23:32:00 +0000
+Subject: [PATCH] render clap results to injected logical streams
+
+---
+diff --git a/src/lib/mods/error.rs b/src/lib/mods/error.rs
+--- a/src/lib/mods/error.rs
++++ b/src/lib/mods/error.rs
+@@ -270,4 +270,15 @@ pub trait UError: Error + Send {
+     fn usage(&self) -> bool {
+         false
+     }
++
++    /// Render an error with special output-channel semantics into injected
++    /// logical streams. Clap uses stdout for help/version and stderr for parse
++    /// errors; ordinary utility errors return `None` for normal handling.
++    fn render_logical(
++        &self,
++        _out: &mut dyn Write,
++        _err: &mut dyn Write,
++    ) -> Option<i32> {
++        None
++    }
+ }
+@@ -751,5 +762,18 @@ impl UError for ClapErrorWrapper {
+         } else {
+             self.code
+         }
+     }
++
++    fn render_logical(&self, out: &mut dyn Write, err: &mut dyn Write) -> Option<i32> {
++        let informational = matches!(
++            self.error.kind(),
++            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
++        );
++        let write_failed = if informational {
++            write!(out, "{}", self.error.render()).is_err()
++        } else {
++            write!(err, "{}", self.error.render()).is_err()
++        };
++        Some(if write_failed { 1 } else if informational { 0 } else { self.code })
++    }
+ }

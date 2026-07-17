@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 21:40:28 +0000
+Subject: [PATCH] supply logical umask to in-process utilities
+
+---
+diff --git a/src/lib/features/mode.rs b/src/lib/features/mode.rs
+index d3bfd83..8b45a05 100644
+--- a/src/lib/features/mode.rs
++++ b/src/lib/features/mode.rs
+@@ -171,6 +171,10 @@ pub fn parse(mode_string: &str, considering_dir: bool, umask: u32) -> Result<u32
+ }
+
+ pub fn get_umask() -> u32 {
++    if let Some(umask) = crate::logical_env::logical_umask() {
++        return umask;
++    }
++
+     // Linux exposes the process umask without mutating it. This matters for an
+     // in-process shell running several coreutils concurrently: the traditional
+     // umask(0); umask(old) probe races and can permanently leave the shared
+diff --git a/src/lib/mods/logical_env.rs b/src/lib/mods/logical_env.rs
+index 7872f70..2b9c2e6 100644
+--- a/src/lib/mods/logical_env.rs
++++ b/src/lib/mods/logical_env.rs
+@@ -28,6 +28,8 @@ thread_local! {
+     // hasn't been seeded). `Some(vec)` => the shell's logical exported env.
+     static OVERRIDE: std::cell::RefCell<Option<Vec<(OsString, OsString)>>> =
+         const { std::cell::RefCell::new(None) };
++    static UMASK_OVERRIDE: std::cell::Cell<Option<u32>> =
++        const { std::cell::Cell::new(None) };
+ }
+
+ /// Install the logical environment for the current thread. Replaces any
+@@ -37,10 +39,21 @@ pub fn set_logical_env(env: Vec<(OsString, OsString)>) {
+     OVERRIDE.with(|slot| *slot.borrow_mut() = Some(env));
+ }
+
++/// Install the logical shell umask for the current utility worker thread.
++pub fn set_logical_umask(umask: u32) {
++    UMASK_OVERRIDE.with(|slot| slot.set(Some(umask)));
++}
++
++/// Return the logical shell umask, when running as an in-process utility.
++pub fn logical_umask() -> Option<u32> {
++    UMASK_OVERRIDE.with(std::cell::Cell::get)
++}
++
+ /// Remove any logical-environment override on the current thread, restoring
+ /// the fall-through-to-`std::env` behavior.
+ pub fn clear() {
+     OVERRIDE.with(|slot| *slot.borrow_mut() = None);
++    UMASK_OVERRIDE.with(|slot| slot.set(None));
+ }
+
+ /// Look up `key` in the logical environment for the current thread.

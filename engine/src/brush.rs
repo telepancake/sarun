@@ -104,6 +104,7 @@ fn child_exit_code(status: std::process::ExitStatus) -> i32 {
 /// (1 on spawn/join failure).
 fn run_coreutil_localized(
     util: &'static str,
+    umask: u32,
     env: Vec<(OsString, OsString)>,
     body: impl FnOnce() -> i32 + Send + 'static,
 ) -> i32 {
@@ -121,6 +122,7 @@ fn run_coreutil_localized(
             // per-crate `env` entry params that some utils still take are a
             // harmless belt-and-suspenders, not the source of truth.
             uucore::logical_env::set_logical_env(env);
+            uucore::logical_env::set_logical_umask(umask);
             brush_coreutils_builtins::init_localization(util);
             let code = body();
             uucore::logical_env::clear();
@@ -152,6 +154,27 @@ fn exported_env_snapshot<SE: brush_core::extensions::ShellExtensions>(
         .collect()
 }
 
+/// Finish a vendored uutil result without letting clap's help/version/error
+/// renderer escape to the engine process's fd 1/2. Informational output is
+/// written to the command's logical stdout, parse errors to logical stderr,
+/// and ordinary utility errors keep the usual `name: message` diagnostic.
+fn finish_uutil_error(
+    error: &dyn uucore::error::UError,
+    name: &str,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    if let Some(code) = error.render_logical(out, err) {
+        return code;
+    }
+    let code = error.code();
+    let message = error.to_string();
+    if !message.is_empty() {
+        let _ = writeln!(err, "{name}: {message}");
+    }
+    code
+}
+
 /// `cat` — STREAM template: injected logical stdin/stdout, `splice(2)` fast path intact.
 /// See [`run_coreutil_localized`] for thread-per-call localization isolation.
 struct CatBuiltin;
@@ -179,7 +202,7 @@ impl brush_core::builtins::SimpleCommand for CatBuiltin {
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
         let cwd = context.shell.working_dir().to_path_buf();
-        let code = run_coreutil_localized("uu_cat", exported_env_snapshot(&context), move || {
+        let code = run_coreutil_localized("uu_cat", context.shell.umask(), exported_env_snapshot(&context), move || {
             use std::io::Write;
             use std::os::fd::{AsRawFd, BorrowedFd};
             let mut out = out;
@@ -192,7 +215,7 @@ impl brush_core::builtins::SimpleCommand for CatBuiltin {
             let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
             let r = match uu_cat::cat(argv.into_iter(), &cwd, &mut out, out_fd, &mut inp, in_fd) {
                 Ok(()) => 0,
-                Err(e) => { let _ = writeln!(err, "{name}: {e}"); 1 }
+                Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
             };
             let _ = out.flush();
             let _ = err.flush();
@@ -228,7 +251,7 @@ impl brush_core::builtins::SimpleCommand for HeadBuiltin {
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
         let cwd = context.shell.working_dir().to_path_buf();
-        let code = run_coreutil_localized("uu_head", exported_env_snapshot(&context), move || {
+        let code = run_coreutil_localized("uu_head", context.shell.umask(), exported_env_snapshot(&context), move || {
             use std::io::Write;
             use std::os::fd::{AsRawFd, BorrowedFd};
             let mut out = out;
@@ -241,7 +264,7 @@ impl brush_core::builtins::SimpleCommand for HeadBuiltin {
             let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
             let r = match uu_head::head(argv.into_iter(), &cwd, &mut out, out_fd, &mut inp, in_fd) {
                 Ok(()) => 0,
-                Err(e) => { let _ = writeln!(err, "{name}: {e}"); 1 }
+                Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
             };
             let _ = out.flush();
             let _ = err.flush();
@@ -277,7 +300,7 @@ impl brush_core::builtins::SimpleCommand for TailBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_tail", exported_env_snapshot(&context), move || {
+        let code = run_coreutil_localized("uu_tail", context.shell.umask(), exported_env_snapshot(&context), move || {
             use std::io::Write;
             use std::os::fd::{AsRawFd, BorrowedFd};
             let mut out = out;
@@ -290,11 +313,7 @@ impl brush_core::builtins::SimpleCommand for TailBuiltin {
             let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
             let r = match uu_tail::tail(argv.into_iter(), &cwd, &mut out, out_fd, &mut err, &mut inp, in_fd) {
                 Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
+                Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
             };
             let _ = out.flush();
             let _ = err.flush();
@@ -333,7 +352,7 @@ impl brush_core::builtins::SimpleCommand for WcBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_wc", envv.clone(), move || {
+        let code = run_coreutil_localized("uu_wc", context.shell.umask(), envv.clone(), move || {
             use std::io::Write;
             use std::os::fd::{AsRawFd, BorrowedFd};
             let mut out = out;
@@ -346,7 +365,7 @@ impl brush_core::builtins::SimpleCommand for WcBuiltin {
             let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
             let r = match uu_wc::wc(argv.into_iter(), &cwd, &envv, &mut out, out_fd, &mut err, &mut inp, in_fd) {
                 Ok(()) => 0,
-                Err(e) => e.code(),
+                Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
             };
             let _ = out.flush();
             let _ = err.flush();
@@ -406,17 +425,13 @@ macro_rules! info_builtin {
                 let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-                let code = run_coreutil_localized($thread, exported_env_snapshot(&context), move || {
+                let code = run_coreutil_localized($thread, context.shell.umask(), exported_env_snapshot(&context), move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
                     let r = match $entry(argv.into_iter(), &mut out, &mut err) {
                         Ok(()) => 0,
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                            e.code()
-                        }
+                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
                     };
                     let _ = out.flush();
                     let _ = err.flush();
@@ -457,17 +472,13 @@ macro_rules! info_env_builtin {
                 let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-                let code = run_coreutil_localized($thread, envv.clone(), move || {
+                let code = run_coreutil_localized($thread, context.shell.umask(), envv.clone(), move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
                     let r = match $entry(argv.into_iter(), &envv, &mut out, &mut err) {
                         Ok(()) => 0,
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                            e.code()
-                        }
+                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
                     };
                     let _ = out.flush();
                     let _ = err.flush();
@@ -508,17 +519,13 @@ macro_rules! fs_builtin {
                 let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-                let code = run_coreutil_localized($thread, exported_env_snapshot(&context), move || {
+                let code = run_coreutil_localized($thread, context.shell.umask(), exported_env_snapshot(&context), move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
                     let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err) {
                         Ok(()) => 0,
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                            e.code()
-                        }
+                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
                     };
                     let _ = out.flush();
                     let _ = err.flush();
@@ -560,17 +567,13 @@ macro_rules! fs_env_builtin {
                 let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-                let code = run_coreutil_localized($thread, envv.clone(), move || {
+                let code = run_coreutil_localized($thread, context.shell.umask(), envv.clone(), move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
                     let r = match $entry(argv.into_iter(), &cwd, &envv, &mut out, &mut err) {
                         Ok(()) => 0,
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                            e.code()
-                        }
+                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
                     };
                     let _ = out.flush();
                     let _ = err.flush();
@@ -611,7 +614,7 @@ macro_rules! fs_builtin_stdin {
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
                 let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-                let code = run_coreutil_localized($thread, exported_env_snapshot(&context), move || {
+                let code = run_coreutil_localized($thread, context.shell.umask(), exported_env_snapshot(&context), move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
@@ -619,11 +622,7 @@ macro_rules! fs_builtin_stdin {
                         Box::new(std::io::BufReader::new(inp));
                     let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err, stdin_src) {
                         Ok(()) => 0,
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                            e.code()
-                        }
+                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
                     };
                     let _ = out.flush();
                     let _ = err.flush();
@@ -664,18 +663,14 @@ macro_rules! stream_builtin {
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
                 let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-                let code = run_coreutil_localized($thread, exported_env_snapshot(&context), move || {
+                let code = run_coreutil_localized($thread, context.shell.umask(), exported_env_snapshot(&context), move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
                     let mut inp = inp;
                     let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
                         Ok(()) => 0,
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                            e.code()
-                        }
+                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
                     };
                     let _ = out.flush();
                     let _ = err.flush();
@@ -718,18 +713,14 @@ macro_rules! stream_env_builtin {
                 let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
                 let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-                let code = run_coreutil_localized($thread, envv.clone(), move || {
+                let code = run_coreutil_localized($thread, context.shell.umask(), envv.clone(), move || {
                     use std::io::Write;
                     let mut out = out;
                     let mut err = err;
                     let mut inp = inp;
                     let r = match $entry(argv.into_iter(), &cwd, &envv, &mut out, &mut err, &mut inp) {
                         Ok(()) => 0,
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                            e.code()
-                        }
+                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
                     };
                     let _ = out.flush();
                     let _ = err.flush();
@@ -776,18 +767,14 @@ impl brush_core::builtins::SimpleCommand for TrBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_tr", exported_env_snapshot(&context), move || {
+        let code = run_coreutil_localized("uu_tr", context.shell.umask(), exported_env_snapshot(&context), move || {
             use std::io::Write;
             let mut out = out;
             let mut err = err;
             let mut inp = inp;
             let r = match uu_tr::tr(argv.into_iter(), &mut out, &mut err, &mut inp) {
                 Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
+                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
             };
             let _ = out.flush();
             let _ = err.flush();
@@ -840,21 +827,17 @@ impl brush_core::builtins::SimpleCommand for TouchBuiltin {
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
 
-        let code = run_coreutil_localized("uu_touch", envv.clone(), move || {
+        let code = run_coreutil_localized("uu_touch", context.shell.umask(), envv.clone(), move || {
             use std::io::Write;
             use std::os::fd::AsRawFd;
-            let out = out;
+            let mut out = out;
             let mut err = err;
             // Raw fd for the logical stdout, for the `-` operand only;
             // borrowed for the call's duration (the OpenFile outlives it).
             let out_fd = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
             let r = match uu_touch::touch_main(argv.into_iter(), &cwd, &envv, out_fd, &mut err) {
                 Ok(()) => 0,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.is_empty() { let _ = writeln!(err, "{name}: {msg}"); }
-                    e.code()
-                }
+                Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
             };
             let _ = err.flush();
             r
@@ -1181,6 +1164,23 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
         "nohup".to_string(),
         builtin::<crate::exec_wrappers::NohupCommand, SE>(),
     );
+
+    // These are external commands whose implementations happen to run
+    // in-process. Keep that optimization invisible to shell discovery:
+    // `command -v`/`type` must return the executable from PATH (and therefore
+    // an `-x`-testable path), not a bare shell-builtin name.
+    for name in [
+        "cat", "head", "tail", "wc", "nl", "tac", "basename", "dirname",
+        "seq", "expr", "tr", "cut", "uniq", "sort", "uname", "nproc", "id",
+        "whoami", "cp", "mkdir", "rmdir", "rm", "mv", "ln", "touch", "readlink",
+        "realpath", "mktemp", "tee", "chmod", "chown", "install", "make", "gmake",
+        "ninja", "find", "xargs", "env", "printenv", "nice", "setsid", "nohup",
+        "sarun", "oaita",
+    ] {
+        if let Some(registration) = m.get_mut(name) {
+            registration.external_command = true;
+        }
+    }
     m
 }
 
@@ -1944,6 +1944,18 @@ pub fn brush_sh(argv: &[String]) -> i32 {
     // make/system()), which already point at the top-level inner_brush's FUSE
     // sinks. Re-redirecting would double-record and stamp writes to the wrong
     // process row. inner_brush owns capture; we don't.
+
+    // Self-shadowed /bin/bash must retain the normal discovery contract. This
+    // is deliberately a compatibility banner rather than claiming Brush is
+    // the GNU implementation; build systems commonly grep `bash --version`
+    // for GNU before relying on Bash syntax, which this invocation mode parses.
+    if base == "bash" && argv.get(1).is_some_and(|arg| arg == "--version") {
+        println!(
+            "GNU bash-compatible Brush (sarun) {}",
+            env!("CARGO_PKG_VERSION")
+        );
+        return 0;
+    }
 
     // Parse leading flags. brush-core honors -e/-u/-x/-o NAME (applied via `set`).
     // -l/--login is not supported inside a box — error visibly.
@@ -3380,6 +3392,57 @@ mod builtin_boundary_tests {
     fn edit_builtin_is_in_the_single_shared_builtin_catalog() {
         let builtins = super::box_builtins::<brush_core::extensions::DefaultShellExtensions>();
         assert!(builtins.contains_key("edit"));
+    }
+
+    #[test]
+    fn self_shadowed_bash_version_is_a_successful_compatibility_probe() {
+        assert_eq!(
+            super::brush_sh(&["bash".to_string(), "--version".to_string()]),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn optimized_external_commands_keep_discovery_and_pipeline_semantics() {
+        let dir = scratch_dir();
+        let out = run_capture(
+            "p=$(command -v find); [ -x \"$p\" ] && \
+             find --version | grep GNU >/dev/null && \
+             cp --help | grep 'Copy SOURCE' >/dev/null && \
+             seq --version | grep seq >/dev/null && \
+             install --version | grep uutils >/dev/null && \
+             printf pass",
+            &dir,
+        )
+        .await;
+        assert_eq!(out, "pass");
+    }
+
+    #[tokio::test]
+    async fn parallel_in_process_mkdir_does_not_corrupt_process_umask() {
+        let dir = scratch_dir();
+        let out = run_capture(
+            "before=$(umask); \
+             i=0; while [ $i -lt 40 ]; do mkdir -p d/$i/a & i=$((i+1)); done; \
+             wait; after=$(umask); [ \"$before\" = \"$after\" ] && printf '%s' \"$after\"",
+            &dir,
+        )
+        .await;
+        assert_eq!(out, "0022");
+    }
+
+    #[tokio::test]
+    async fn subshell_umask_is_local_and_reaches_builtins_and_external_children() {
+        let dir = scratch_dir();
+        let out = run_capture(
+            "umask 022; \
+             (umask 077; mkdir private; /usr/bin/touch private/external; \
+              stat -c '%a %a' private private/external); \
+             printf 'parent=%s' \"$(umask)\"",
+            &dir,
+        )
+        .await;
+        assert_eq!(out, "700 600\nparent=0022");
     }
 
     #[test]
