@@ -14,6 +14,10 @@ IMAGES="$WORKDIR/images"
 
 QEMU_VERSION=${QEMU_VERSION:-11.0.2}
 GDB_VERSION=${GDB_VERSION:-17.2}
+GMP_VERSION=${GMP_VERSION:-6.3.0}
+GMP_SHA256=${GMP_SHA256:-a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898}
+MPFR_VERSION=${MPFR_VERSION:-4.2.2}
+MPFR_SHA256=${MPFR_SHA256:-b67ba0383ef7e8a8563734e2e889ef5ec3c3b898a01d00fa0a6869ad81c6ce01}
 TILE_QEMU_VERSION=${TILE_QEMU_VERSION:-5.2.0}
 LINUX_VERSION=${LINUX_VERSION:-5.6.3}
 ROUTEROS_VERSION=${ROUTEROS_VERSION:-latest}
@@ -40,6 +44,10 @@ WHEEL_WHEEL_NAME=${WHEEL_WHEEL_NAME:-wheel-0.46.3-py3-none-any.whl}
 WHEEL_WHEEL_SHA256=${WHEEL_WHEEL_SHA256:-4b399d56c9d9338230118d705d9737a2a468ccca63d5e813e2a4fc7815d8bc4d}
 DTC_COMMIT=${DTC_COMMIT:-b6910bec11614980a21e46fbccc35934b671bd81}
 DTC_SHA256=${DTC_SHA256:-e115f987eec23a1ba25150a46ced1675de3716072d3b4905afb3a9cda0f007c7}
+UV_VERSION=${UV_VERSION:-0.11.21}
+UV_PYTHON_VERSION=${UV_PYTHON_VERSION:-3.12.13}
+UV_AARCH64_SHA256=${UV_AARCH64_SHA256:-88e800834007cc5efd4675f166eb2a51e7e3ad19876d85fa8805a6fb5c922397}
+UV_X86_64_SHA256=${UV_X86_64_SHA256:-8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e162ae093c932d8b264050}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')}
 DISK_SIZE=${DISK_SIZE:-64M}
 DEBUG_BOOT_TIMEOUT=${DEBUG_BOOT_TIMEOUT:-30}
@@ -63,7 +71,24 @@ workdir_is_case_sensitive() {
 }
 
 host_is_supported() {
-    [[ $(uname -s) == Linux && $(getconf LONG_BIT 2>/dev/null || printf 0) == 64 ]]
+    [[ $(uname -s) == Linux && $(getconf LONG_BIT 2>/dev/null || printf 0) == 64 ]] || return 1
+    [[ $(uname -m) == x86_64 || $(uname -m) == aarch64 ]]
+}
+
+uv_host_target() {
+    case "$(uname -m)" in
+        x86_64) printf 'x86_64-unknown-linux-gnu\n' ;;
+        aarch64) printf 'aarch64-unknown-linux-gnu\n' ;;
+        *) die "no pinned uv binary for Linux/$(uname -m)" ;;
+    esac
+}
+
+uv_host_sha256() {
+    case "$(uname -m)" in
+        x86_64) printf '%s\n' "$UV_X86_64_SHA256" ;;
+        aarch64) printf '%s\n' "$UV_AARCH64_SHA256" ;;
+        *) die "no pinned uv checksum for Linux/$(uname -m)" ;;
+    esac
 }
 
 usage() {
@@ -84,8 +109,8 @@ Information:
   list                  Print accepted run targets and their current status
   doctor                Check host prerequisites
 
-Configuration is via QEMU_VERSION, GDB_VERSION, ROUTEROS_VERSION, QEMU_PYTHON,
-JOBS, DISK_SIZE, and VIROS_WORKDIR.  All output remains inside VIROS_WORKDIR.
+Configuration is via QEMU_VERSION, GDB_VERSION, ROUTEROS_VERSION, JOBS,
+DISK_SIZE, and VIROS_WORKDIR.  All output remains inside VIROS_WORKDIR.
 EOF
 }
 
@@ -102,8 +127,9 @@ download_file() {
 }
 
 extract_zip_image() {
-    local archive=$1 destination=$2
-    python3 - "$archive" "$destination" <<'PY'
+    local archive=$1 destination=$2 python
+    python=$(managed_python)
+    "$python" - "$archive" "$destination" <<'PY'
 import shutil
 import sys
 import zipfile
@@ -130,10 +156,17 @@ resolve_routeros_version() {
 }
 
 download_stage() {
+    local uv_target
+    host_is_supported || die "download requires x86-64 or AArch64 Linux"
     need curl
     mkdir -p "$DOWNLOADS"
+    uv_target=$(uv_host_target)
+    download_file "https://releases.astral.sh/github/uv/releases/download/${UV_VERSION}/uv-${uv_target}.tar.gz" \
+        "$DOWNLOADS/uv-${UV_VERSION}-${uv_target}.tar.gz"
     download_file "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" "$DOWNLOADS/qemu-${QEMU_VERSION}.tar.xz"
     download_file "https://ftp.gnu.org/gnu/gdb/gdb-${GDB_VERSION}.tar.xz" "$DOWNLOADS/gdb-${GDB_VERSION}.tar.xz"
+    download_file "https://ftp.gnu.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz" "$DOWNLOADS/gmp-${GMP_VERSION}.tar.xz"
+    download_file "https://ftp.gnu.org/gnu/mpfr/mpfr-${MPFR_VERSION}.tar.xz" "$DOWNLOADS/mpfr-${MPFR_VERSION}.tar.xz"
     download_file "https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${LINUX_VERSION}.tar.xz" "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz"
     download_file "https://files.pythonhosted.org/packages/5d/95/6b5cb3461ea5673ba0995989746db58eb18b91b54dbf331e72f569540946/${PIP_WHEEL_NAME}" "$DOWNLOADS/${PIP_WHEEL_NAME}"
     download_file "https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/${SETUPTOOLS_WHEEL_NAME}" "$DOWNLOADS/${SETUPTOOLS_WHEEL_NAME}"
@@ -150,6 +183,7 @@ download_stage() {
     download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/mips32/tarballs/${MIPSBE_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${MIPSBE_TOOLCHAIN_NAME}.tar.bz2"
     download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/powerpc-e500mc/tarballs/${PPC_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${PPC_TOOLCHAIN_NAME}.tar.bz2"
     download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/mips32el/tarballs/${MMIPS_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${MMIPS_TOOLCHAIN_NAME}.tar.bz2"
+    download_managed_python
     resolve_routeros_version
     local arch suffix name
     for arch in "${ARCHES[@]}"; do
@@ -174,24 +208,12 @@ unpack_source() {
 }
 
 build_qemu() {
-    local src="$SOURCES/qemu-${QEMU_VERSION}" out="$BUILD/qemu-${QEMU_VERSION}" python wheel_file pythonpath=
-    python=${QEMU_PYTHON:-$(command -v python3)}
+    local src="$SOURCES/qemu-${QEMU_VERSION}" out="$BUILD/qemu-${QEMU_VERSION}" python
+    setup_build_python
+    python=$BUILD_PYTHON
     [[ -s "$DOWNLOADS/dtc-${DTC_COMMIT}.tar.gz" ]] || die "QEMU dtc/libfdt source is missing; run download first"
     verify_file "$DTC_SHA256" "$DOWNLOADS/dtc-${DTC_COMMIT}.tar.gz"
     unpack_source "$DOWNLOADS/dtc-${DTC_COMMIT}.tar.gz" "$src/subprojects/dtc"
-    local -a python_wheels=(
-        "$PIP_WHEEL_NAME:$PIP_WHEEL_SHA256"
-        "$SETUPTOOLS_WHEEL_NAME:$SETUPTOOLS_WHEEL_SHA256"
-        "$PACKAGING_WHEEL_NAME:$PACKAGING_WHEEL_SHA256"
-        "$WHEEL_WHEEL_NAME:$WHEEL_WHEEL_SHA256"
-    )
-    for wheel_file in "${python_wheels[@]}"; do
-        local wheel_name=${wheel_file%%:*} wheel_sha=${wheel_file#*:}
-        [[ -s "$DOWNLOADS/$wheel_name" ]] || die "pinned Python bootstrap wheel is missing: $wheel_name; run download first"
-        verify_file "$wheel_sha" "$DOWNLOADS/$wheel_name"
-        pythonpath+="${pythonpath:+:}$DOWNLOADS/$wheel_name"
-    done
-    export PYTHONPATH="$pythonpath${PYTHONPATH:+:$PYTHONPATH}"
     unpack_source "$DOWNLOADS/qemu-${QEMU_VERSION}.tar.xz" "$src"
     if [[ ! -f "$src/.routeros-arm-load" ]]; then
         grep -Eq '^#define KERNEL_LOAD_ADDR[[:space:]]+0x00010000$' "$src/hw/arm/boot.c" ||
@@ -211,9 +233,11 @@ build_qemu() {
             die "RouterOS PowerPC QEMU patch failed"
         : > "$src/.routeros-ppc-hypercall"
     fi
-    mkdir -p "$out" "$TOOLS/qemu"
+    mkdir -p "$out" "$TOOLS/qemu" "$DOWNLOADS/pip-cache"
     say "Configuring QEMU $QEMU_VERSION"
-    (cd "$out" && "$src/configure" \
+    (cd "$out" && env -u PYTHONPATH \
+        PYTHONNOUSERSITE=1 PIP_CACHE_DIR="$DOWNLOADS/pip-cache" \
+        "$src/configure" \
         --python="$python" \
         --prefix="$TOOLS/qemu" \
         --target-list=x86_64-softmmu,x86_64-linux-user,arm-softmmu,aarch64-softmmu,mips-softmmu,mipsel-softmmu,ppc-softmmu,ppc64-softmmu \
@@ -226,15 +250,57 @@ build_qemu() {
     make -C "$out" install
 }
 
+build_gmp() {
+    local archive="$DOWNLOADS/gmp-${GMP_VERSION}.tar.xz"
+    local src="$SOURCES/gmp-${GMP_VERSION}" out="$BUILD/gmp-${GMP_VERSION}"
+    local prefix="$TOOLS/gmp-${GMP_VERSION}"
+    [[ -s "$archive" ]] || die "GMP source is missing; run download first"
+    verify_file "$GMP_SHA256" "$archive"
+    if [[ -s "$prefix/include/gmp.h" && -s "$prefix/lib/libgmp.a" ]]; then
+        return
+    fi
+    unpack_source "$archive" "$src"
+    mkdir -p "$out" "$prefix"
+    say "Building project-local GMP $GMP_VERSION"
+    (cd "$out" && CFLAGS="${CFLAGS:--O2} -std=gnu17" \
+        "$src/configure" --prefix="$prefix" --disable-shared --enable-static)
+    make -C "$out" -j "$JOBS"
+    make -C "$out" install
+}
+
+build_mpfr() {
+    local archive="$DOWNLOADS/mpfr-${MPFR_VERSION}.tar.xz"
+    local src="$SOURCES/mpfr-${MPFR_VERSION}" out="$BUILD/mpfr-${MPFR_VERSION}"
+    local prefix="$TOOLS/mpfr-${MPFR_VERSION}" gmp_prefix="$TOOLS/gmp-${GMP_VERSION}"
+    [[ -s "$archive" ]] || die "MPFR source is missing; run download first"
+    verify_file "$MPFR_SHA256" "$archive"
+    build_gmp
+    if [[ -s "$prefix/include/mpfr.h" && -s "$prefix/lib/libmpfr.a" ]]; then
+        return
+    fi
+    unpack_source "$archive" "$src"
+    mkdir -p "$out" "$prefix"
+    say "Building project-local MPFR $MPFR_VERSION"
+    (cd "$out" && CFLAGS="${CFLAGS:--O2} -std=gnu17" \
+        "$src/configure" --prefix="$prefix" --with-gmp="$gmp_prefix" \
+        --disable-shared --enable-static)
+    make -C "$out" -j "$JOBS"
+    make -C "$out" install
+}
+
 build_gdb() {
-    local src="$SOURCES/gdb-${GDB_VERSION}" out="$BUILD/gdb-${GDB_VERSION}"
+    local src="$SOURCES/gdb-${GDB_VERSION}"
+    local out="$BUILD/gdb-${GDB_VERSION}-python-${UV_PYTHON_VERSION}-localdeps" python python_prefix
+    local gmp_prefix="$TOOLS/gmp-${GMP_VERSION}" mpfr_prefix="$TOOLS/mpfr-${MPFR_VERSION}"
+    build_mpfr
     unpack_source "$DOWNLOADS/gdb-${GDB_VERSION}.tar.xz" "$src"
     mkdir -p "$out" "$TOOLS/gdb"
-    local python
-    python=$(command -v python3)
+    python=$(managed_python)
+    python_prefix=$("$python" -c 'import sys; print(sys.prefix)')
     say "Configuring Python-enabled multi-target GDB $GDB_VERSION"
-    (cd "$out" && "$src/configure" \
+    (cd "$out" && LDFLAGS="-L$python_prefix/lib -Wl,-rpath,$python_prefix/lib${LDFLAGS:+ $LDFLAGS}" "$src/configure" \
         --prefix="$TOOLS/gdb" --enable-targets=all --with-python="$python" \
+        --with-gmp="$gmp_prefix" --with-mpfr="$mpfr_prefix" \
         --disable-binutils --disable-gas --disable-gold --disable-gprof \
         --disable-ld --disable-sim)
     say "Building GDB"
@@ -246,6 +312,66 @@ verify_file() {
     local expected=$1 file=$2 actual
     actual=$(sha256sum "$file" | awk '{print $1}')
     [[ "$actual" == "$expected" ]] || die "checksum mismatch for $file: expected $expected, got $actual"
+}
+
+UV=
+setup_uv() {
+    local target sha archive destination="$TOOLS/uv-$UV_VERSION"
+    target=$(uv_host_target)
+    sha=$(uv_host_sha256)
+    archive="$DOWNLOADS/uv-${UV_VERSION}-${target}.tar.gz"
+    [[ -s "$archive" ]] || die "pinned uv is missing; run download first"
+    verify_file "$sha" "$archive"
+    if [[ ! -f "$destination/.unpacked" ]]; then
+        mkdir -p "$destination"
+        tar -xf "$archive" -C "$destination" --strip-components=1
+        : > "$destination/.unpacked"
+    fi
+    UV="$destination/uv"
+    [[ -x "$UV" ]] || die "uv executable was not found in $archive"
+}
+
+download_managed_python() {
+    setup_uv
+    say "Installing pinned managed CPython $UV_PYTHON_VERSION below VIROS_WORKDIR"
+    UV_CACHE_DIR="$DOWNLOADS/uv-cache" \
+    UV_PYTHON_INSTALL_DIR="$TOOLS/python" \
+    UV_PYTHON_INSTALL_BIN=0 \
+        "$UV" python install --managed-python --no-bin --no-progress "$UV_PYTHON_VERSION"
+}
+
+managed_python() {
+    setup_uv
+    UV_CACHE_DIR="$DOWNLOADS/uv-cache" \
+    UV_PYTHON_INSTALL_DIR="$TOOLS/python" \
+    UV_PYTHON_DOWNLOADS=never \
+        "$UV" python find --managed-python --no-python-downloads "$UV_PYTHON_VERSION"
+}
+
+BUILD_PYTHON=
+setup_build_python() {
+    local python bootstrap="$BUILD/qemu-python-bootstrap" wheel_file
+    local -a python_wheels=(
+        "$PIP_WHEEL_NAME:$PIP_WHEEL_SHA256"
+        "$SETUPTOOLS_WHEEL_NAME:$SETUPTOOLS_WHEEL_SHA256"
+        "$PACKAGING_WHEEL_NAME:$PACKAGING_WHEEL_SHA256"
+        "$WHEEL_WHEEL_NAME:$WHEEL_WHEEL_SHA256"
+    )
+    setup_uv
+    python=$(managed_python)
+    for wheel_file in "${python_wheels[@]}"; do
+        local wheel_name=${wheel_file%%:*} wheel_sha=${wheel_file#*:}
+        [[ -s "$DOWNLOADS/$wheel_name" ]] ||
+            die "pinned Python bootstrap wheel is missing: $wheel_name; run download first"
+        verify_file "$wheel_sha" "$DOWNLOADS/$wheel_name"
+    done
+    UV_CACHE_DIR="$DOWNLOADS/uv-cache" UV_PYTHON_DOWNLOADS=never \
+        "$UV" venv --no-project --no-python-downloads --clear --python "$python" "$bootstrap"
+    UV_CACHE_DIR="$DOWNLOADS/uv-cache" UV_PYTHON_DOWNLOADS=never \
+        "$UV" pip install --python "$bootstrap/bin/python" --no-index \
+        "$DOWNLOADS/$PIP_WHEEL_NAME" "$DOWNLOADS/$SETUPTOOLS_WHEEL_NAME" \
+        "$DOWNLOADS/$PACKAGING_WHEEL_NAME" "$DOWNLOADS/$WHEEL_WHEEL_NAME"
+    BUILD_PYTHON="$bootstrap/bin/python"
 }
 
 unpack_toolchain() {
@@ -361,7 +487,7 @@ find_kernel_config() {
 build_debug_kernel() {
     local target=${1:-} src out config arch prefix= image= obj raw compiler_version
     local -a targets
-    host_is_supported || die "debug-kernel build requires a 64-bit Linux host"
+    host_is_supported || die "debug-kernel build requires x86-64 or AArch64 Linux"
     case "$target" in
         x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
         *) die "no validated matching debug-kernel boot for $target" ;;
@@ -524,8 +650,8 @@ build_mikrotik_tile_kvm() {
 }
 
 build_stage() {
-    host_is_supported || die "build requires a 64-bit Linux host"
-    need make; need tar; need python3; need gcc; need g++; need pkg-config; need sha256sum
+    host_is_supported || die "build requires x86-64 or AArch64 Linux"
+    need make; need tar; need gcc; need g++; need pkg-config; need sha256sum
     [[ -s "$DOWNLOADS/qemu-${QEMU_VERSION}.tar.xz" ]] || die "run download first"
     build_qemu
     build_gdb
@@ -569,14 +695,14 @@ npk_for_arch() {
 }
 
 extract_one() {
-    local arch=$1 npk
+    local arch=$1 npk python
     npk=$(npk_for_arch "$arch")
     say "Extracting $arch from $(basename -- "$npk")"
-    python3 "$SCRIPT_DIR/npk_extract.py" "$npk" "$arch" "$ARTIFACTS"
+    python=$(managed_python)
+    "$python" "$SCRIPT_DIR/npk_extract.py" "$npk" "$arch" "$ARTIFACTS"
 }
 
 extract_stage() {
-    need python3
     local wanted=${1:-all} arch
     if [[ "$wanted" == all ]]; then
         for arch in "${ARCHES[@]}"; do extract_one "$arch"; done
@@ -1102,8 +1228,8 @@ EOF
 }
 
 doctor_stage() {
-    local failed=0 command host_bits name python
-    for command in bash curl python3 tar xz make gcc g++ pkg-config ninja mkfs.ext2 truncate sha256sum flex bison bc perl dtc sed patch; do
+    local failed=0 command host_bits name python uv_target
+    for command in bash curl tar xz make gcc g++ m4 pkg-config ninja mkfs.ext2 truncate sha256sum flex bison bc perl dtc sed patch; do
         if command -v "$command" >/dev/null 2>&1; then
             printf 'ok       %s\n' "$command"
         else
@@ -1111,19 +1237,23 @@ doctor_stage() {
             failed=1
         fi
     done
-    python=${QEMU_PYTHON:-$(command -v python3 2>/dev/null || true)}
-    if [[ -n "$python" ]] && "$python" -c 'import sys, venv; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
-        printf 'ok       %s\n' "Python >= 3.10 with venv module ($python)"
-    else
-        printf 'missing  %s\n' "Python >= 3.10 with venv module (set QEMU_PYTHON or install the host python3-venv package)"
-        failed=1
-    fi
     host_bits=$(getconf LONG_BIT 2>/dev/null || printf 0)
-    if [[ $(uname -s) == Linux && "$host_bits" == 64 ]]; then
+    if host_is_supported; then
         printf 'ok       64-bit Linux/%s build host\n' "$(uname -m)"
     else
-        printf 'missing  supported 64-bit Linux build host (found %s-bit %s/%s)\n' "$host_bits" "$(uname -s)" "$(uname -m)"
+        printf 'missing  x86-64 or AArch64 Linux build host (found %s-bit %s/%s)\n' "$host_bits" "$(uname -s)" "$(uname -m)"
         failed=1
+    fi
+    if host_is_supported; then
+        uv_target=$(uv_host_target)
+        python=$(find "$TOOLS/python" -path "*/bin/python${UV_PYTHON_VERSION%.*}" -print -quit 2>/dev/null || true)
+        if [[ -x "$TOOLS/uv-$UV_VERSION/uv" && -x "$python" ]] &&
+            "$python" -c "import sys; assert sys.version.split()[0] == '$UV_PYTHON_VERSION'" >/dev/null 2>&1; then
+            printf 'ready    uv %s with managed CPython %s\n' "$UV_VERSION" "$UV_PYTHON_VERSION"
+        else
+            printf 'download uv %s and managed CPython %s (supplied by ./viros.sh download for %s)\n' \
+                "$UV_VERSION" "$UV_PYTHON_VERSION" "$uv_target"
+        fi
     fi
     if workdir_is_case_sensitive; then
         printf 'ok       case-sensitive VIROS_WORKDIR\n'

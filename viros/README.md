@@ -31,14 +31,23 @@ stub alone are not success.
 ```
 
 `doctor` checks only native bootstrap programs needed to build QEMU, GDB, and
-Linux (for example `gcc`, `g++`, `make`, Python, flex, bison, and device-tree
-tools). Target cross compilers do not come from the runner OS. `download`
+Linux (for example `gcc`, `g++`, `make`, flex, bison, and device-tree tools).
+The runner's Python installation is not used. Based on the detected host
+architecture, `download` fetches a checksum-pinned standalone `uv` and uses it
+to install an exact managed CPython below the work directory. QEMU's Meson
+bootstrap and the Python-enabled GDB build both use that interpreter and
+project-local environments populated from pinned wheels. GDB's GMP and MPFR
+prerequisites are likewise built from checksum-pinned source archives below
+the work directory, so their development headers need not be installed on the
+runner.
+
+Target cross compilers do not come from the runner OS either. `download`
 fetches checksum-pinned Bootlin toolchains for x86-64, ARM, AArch64, both MIPS
 endian variants, and PowerPC. Their host executables are x86-64: an x86-64
-Linux runner executes them directly, while another supported 64-bit Linux
-runner executes the identical archives through the `qemu-x86_64` user
-emulator built by the QEMU stage. This path has been exercised on x86-64 and
-AArch64 hosts. The work directory must be on a case-sensitive filesystem:
+Linux runner executes them directly, while an AArch64 Linux runner executes
+the identical archives through the `qemu-x86_64` user emulator built by the
+QEMU stage. Both host paths have been exercised. The work directory must be on
+a case-sensitive filesystem:
 Linux has source files whose names differ only by case, so its published patch
 cannot be represented correctly on a case-insensitive macOS-backed mount.
 `doctor` detects this before a kernel build starts; use a checkout or set
