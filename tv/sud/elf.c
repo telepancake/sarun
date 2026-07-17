@@ -67,18 +67,13 @@
 
 #ifdef SUD_ADDIN_FS
 
-static int ir_is_proc_fd(const char *path)
-{
-    static const char prefix[] = "/proc/self/fd/";
-    return path && !strncmp(path, prefix, sizeof(prefix) - 1);
-}
-
 static int ir_open_ro(const char *path)
 {
     /* An execveat(AT_EMPTY_PATH) target is exported as a real descriptor
      * inherited by the replacement wrapper. Its /proc/self/fd spelling is
      * process-local and must bypass SarunFs pathname resolution. */
-    if (ir_is_proc_fd(path)) return raw_open(path, O_RDONLY);
+    if (sud_vfs_is_kernel_path(AT_FDCWD, path))
+        return raw_open(path, O_RDONLY);
     int remote = sud_vfs_openat(AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0, 0);
     if (remote < 0) return remote;
     int backing = sud_vfs_export_fd(remote, 0);
@@ -109,7 +104,8 @@ static int ir_close(int fd)
 
 static int ir_access(const char *path, int mode)
 {
-    if (ir_is_proc_fd(path)) return raw_access(path, mode);
+    if (sud_vfs_is_kernel_path(AT_FDCWD, path))
+        return raw_access(path, mode);
     return sud_vfs_accessat(AT_FDCWD, path, (unsigned int)mode);
 }
 

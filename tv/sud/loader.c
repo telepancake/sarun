@@ -30,8 +30,7 @@
 static int loader_open_elf(const char *path)
 {
 #ifdef SUD_ADDIN_FS
-    static const char proc_fd[] = "/proc/self/fd/";
-    if (path && !strncmp(path, proc_fd, sizeof(proc_fd) - 1))
+    if (sud_vfs_is_kernel_path(AT_FDCWD, path))
         return raw_open(path, O_RDONLY);
     int remote = sud_vfs_openat(AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0, 0);
     if (remote < 0) {

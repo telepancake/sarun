@@ -143,6 +143,11 @@ as executable mappings and mmap that genuinely need a host fd.
         the only pathname bypass involved.
   - [x] Replace the path-remap and inramfs addins in the production wrapper in
         one cutover; do not retain an old/new runtime mode.
+  - [x] Keep process-local `/proc`, `/dev`, and `/sys` at the SUD namespace
+        boundary rather than resolving them in the engine process. Remote
+        `/proc/self/fd/N` descriptors still resolve to their canonical SarunFs
+        handles; local descriptor links and pseudo-filesystem cwd/dirfds stay
+        kernel-local. This is fixed transport plumbing, not a policy mode.
 - [x] Add the exceptional SCM_RIGHTS fd lane for exec/mmap backing objects.
       It exports only an already-open canonical handle, is serialized across
       forked tracees with dead-thread reclamation, owns deterministic session

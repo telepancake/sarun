@@ -184,6 +184,20 @@ static int child_calls(struct sud_fs_ring *ring, int lane)
     if (sud_vfs_absolutize(AT_FDCWD, "relative", absolute,
                            sizeof(absolute)) != 0
         || strcmp(absolute, "/relative") != 0) return 10;
+    if (!sud_vfs_is_kernel_path(AT_FDCWD, "/proc/self/status")
+        || !sud_vfs_is_kernel_path(AT_FDCWD, "/dev/null")
+        || !sud_vfs_is_kernel_path(AT_FDCWD, "/sys/kernel")
+        || sud_vfs_is_kernel_path(AT_FDCWD, "/procurement")) return 10;
+    int root_directory = raw_open("/", O_RDONLY | O_DIRECTORY);
+    int proc_directory = raw_open("/proc/self", O_RDONLY | O_DIRECTORY);
+    if (root_directory < 0 || proc_directory < 0
+        || !sud_vfs_is_kernel_path(proc_directory, "status")
+        || fs_call(SYS_fchdir, proc_directory, 0, 0, 0, 0, 0) != 0
+        || !sud_vfs_is_kernel_path(AT_FDCWD, "status")
+        || fs_call(SYS_fchdir, root_directory, 0, 0, 0, 0, 0) != 0
+        || sud_vfs_is_kernel_path(AT_FDCWD, "status")) return 10;
+    raw_close(root_directory);
+    raw_close(proc_directory);
     int process_fd = (int)raw_syscall6(SYS_memfd_create,
                                        (long)"vfs-process-fd",
                                        MFD_CLOEXEC, 0, 0, 0, 0);
@@ -192,11 +206,20 @@ static int child_calls(struct sud_fs_ring *ring, int lane)
     snprintf(process_fd_path, sizeof(process_fd_path),
              "/proc/self/fd/%d", process_fd);
     if (fs_call(SYS_openat, AT_FDCWD, (long)process_fd_path,
-                O_RDONLY, 0, 0, 0) != -ENOSYS) return 10;
+                O_RDONLY, 0, 0, 0) != -ENOSYS
+        || fs_call(SYS_openat, AT_FDCWD, (long)"/proc/self/status",
+                   O_RDONLY, 0, 0, 0) != -ENOSYS) return 10;
     raw_close(process_fd);
     int fd = (int)fs_call(SYS_openat, AT_FDCWD, (long)"/hello",
                           O_RDWR, 0, 0, 0);
     if (fd < 0 || !sud_vfs_owns_fd(fd)) return 11;
+    snprintf(process_fd_path, sizeof(process_fd_path),
+             "/proc/self/fd/%d", fd);
+    char remote_target[16] = {0};
+    if (sud_vfs_is_kernel_path(AT_FDCWD, process_fd_path)
+        || sud_vfs_readlinkat(AT_FDCWD, process_fd_path,
+                              remote_target, sizeof(remote_target)) != 6
+        || memcmp(remote_target, "/hello", 6) != 0) return 11;
 #if defined(__x86_64__)
     long private_result = fs_call(SYS_mmap, 0, 4096, PROT_READ,
                                   MAP_PRIVATE, fd, 0);

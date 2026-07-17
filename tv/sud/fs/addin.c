@@ -8,20 +8,6 @@
 
 static unsigned int g_fs_umask;
 
-static int process_fd_path(const char *path)
-{
-    static const char prefix[] = "/proc/self/fd/";
-    if (!path || strncmp(path, prefix, sizeof(prefix) - 1) != 0) return -1;
-    const char *p = path + sizeof(prefix) - 1;
-    if (*p < '0' || *p > '9') return -1;
-    unsigned long value = 0;
-    while (*p >= '0' && *p <= '9') {
-        value = value * 10 + (unsigned int)(*p++ - '0');
-        if (value > INT32_MAX) return -1;
-    }
-    return *p == '\0' ? (int)value : -1;
-}
-
 static int handled(struct sud_syscall_ctx *ctx, long result)
 {
     ctx->ret = result;
@@ -282,9 +268,212 @@ static long set_times(int dirfd, const char *path, int follow,
     return sud_vfs_setattrat(dirfd, path, follow, &request);
 }
 
+/* Process-local pseudo filesystems cannot be served from the engine process:
+ * /proc/self and descriptor links would describe the engine, not the tracee.
+ * Return 1 to let the original kernel syscall run, -1 when a two-path
+ * operation crosses the local/SarunFs boundary (ctx already contains EXDEV),
+ * and 0 for an ordinary SarunFs path. This is transport namespace plumbing,
+ * not a path policy or overlay rule table. */
+static int local_pair(struct sud_syscall_ctx *ctx,
+                      int first_dirfd, const char *first,
+                      int second_dirfd, const char *second)
+{
+    int first_local = sud_vfs_is_kernel_path(first_dirfd, first);
+    int second_local = sud_vfs_is_kernel_path(second_dirfd, second);
+    if (first_local && second_local) return 1;
+    if (first_local != second_local) {
+        ctx->ret = -EXDEV;
+        return -1;
+    }
+    return 0;
+}
+
+static int kernel_path_syscall(struct sud_syscall_ctx *ctx)
+{
+    long nr = ctx->nr;
+#define LOCAL_ONE(dirfd, path) \
+    do { if (sud_vfs_is_kernel_path((dirfd), (path))) return 1; } while (0)
+#ifdef SYS_open
+    if (nr == SYS_open) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+    if (nr == SYS_openat)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#ifdef SYS_creat
+    if (nr == SYS_creat) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_stat)
+    if (nr == SYS_stat) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_lstat)
+    if (nr == SYS_lstat) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_stat64)
+    if (nr == SYS_stat64) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_lstat64)
+    if (nr == SYS_lstat64) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_newfstatat)
+    if (nr == SYS_newfstatat)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_fstatat64)
+    if (nr == SYS_fstatat64)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_statx)
+    if (nr == SYS_statx)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_statfs)
+    if (nr == SYS_statfs) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_statfs64)
+    if (nr == SYS_statfs64) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_getxattr)
+    if (nr == SYS_getxattr) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_lgetxattr)
+    if (nr == SYS_lgetxattr) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_listxattr)
+    if (nr == SYS_listxattr) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_llistxattr)
+    if (nr == SYS_llistxattr) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_setxattr)
+    if (nr == SYS_setxattr) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_lsetxattr)
+    if (nr == SYS_lsetxattr) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_removexattr)
+    if (nr == SYS_removexattr) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_lremovexattr)
+    if (nr == SYS_lremovexattr) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+    if (nr == SYS_readlinkat)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#if defined(SYS_readlink)
+    if (nr == SYS_readlink) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_access)
+    if (nr == SYS_access) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_faccessat)
+    if (nr == SYS_faccessat)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_faccessat2)
+    if (nr == SYS_faccessat2)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_chmod)
+    if (nr == SYS_chmod) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_fchmodat)
+    if (nr == SYS_fchmodat)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_chown)
+    if (nr == SYS_chown) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_lchown)
+    if (nr == SYS_lchown) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_fchownat)
+    if (nr == SYS_fchownat)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_truncate)
+    if (nr == SYS_truncate) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_truncate64)
+    if (nr == SYS_truncate64) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_utimensat)
+    if (nr == SYS_utimensat && ctx->args[1])
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_utime)
+    if (nr == SYS_utime) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_utimes)
+    if (nr == SYS_utimes) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_futimesat)
+    if (nr == SYS_futimesat && ctx->args[1])
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_mkdir)
+    if (nr == SYS_mkdir) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_mkdirat)
+    if (nr == SYS_mkdirat)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_mknod)
+    if (nr == SYS_mknod) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_mknodat)
+    if (nr == SYS_mknodat)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_unlink)
+    if (nr == SYS_unlink) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_rmdir)
+    if (nr == SYS_rmdir) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[0]);
+#endif
+#if defined(SYS_unlinkat)
+    if (nr == SYS_unlinkat)
+        LOCAL_ONE((int)ctx->args[0], (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_rename)
+    if (nr == SYS_rename)
+        return local_pair(ctx, AT_FDCWD, (const char *)ctx->args[0],
+                          AT_FDCWD, (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_renameat)
+    if (nr == SYS_renameat)
+        return local_pair(ctx, (int)ctx->args[0], (const char *)ctx->args[1],
+                          (int)ctx->args[2], (const char *)ctx->args[3]);
+#endif
+#if defined(SYS_renameat2)
+    if (nr == SYS_renameat2)
+        return local_pair(ctx, (int)ctx->args[0], (const char *)ctx->args[1],
+                          (int)ctx->args[2], (const char *)ctx->args[3]);
+#endif
+#if defined(SYS_symlink)
+    if (nr == SYS_symlink) LOCAL_ONE(AT_FDCWD, (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_symlinkat)
+    if (nr == SYS_symlinkat)
+        LOCAL_ONE((int)ctx->args[1], (const char *)ctx->args[2]);
+#endif
+#if defined(SYS_link)
+    if (nr == SYS_link)
+        return local_pair(ctx, AT_FDCWD, (const char *)ctx->args[0],
+                          AT_FDCWD, (const char *)ctx->args[1]);
+#endif
+#if defined(SYS_linkat)
+    if (nr == SYS_linkat)
+        return local_pair(ctx, (int)ctx->args[0], (const char *)ctx->args[1],
+                          (int)ctx->args[2], (const char *)ctx->args[3]);
+#endif
+#undef LOCAL_ONE
+    return 0;
+}
+
 static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
 {
     long nr = ctx->nr;
+    int kernel_path = kernel_path_syscall(ctx);
+    if (kernel_path > 0) return 0;
+    if (kernel_path < 0) return 1;
 #if defined(__x86_64__)
     if (nr == SYS_mmap && sud_vfs_owns_fd((int)ctx->args[4])) {
         int flags = (int)ctx->args[3];
@@ -319,16 +508,12 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
 #endif
 #ifdef SYS_open
     if (nr == SYS_open) {
-        int process_fd = process_fd_path((const char *)ctx->args[0]);
-        if (process_fd >= 0 && !sud_vfs_owns_fd(process_fd)) return 0;
         return handled(ctx, sud_vfs_openat(AT_FDCWD,
                          (const char *)ctx->args[0], (int)ctx->args[1],
                          (unsigned int)ctx->args[2], g_fs_umask));
     }
 #endif
     if (nr == SYS_openat) {
-        int process_fd = process_fd_path((const char *)ctx->args[1]);
-        if (process_fd >= 0 && !sud_vfs_owns_fd(process_fd)) return 0;
         return handled(ctx, sud_vfs_openat((int)ctx->args[0],
                          (const char *)ctx->args[1], (int)ctx->args[2],
                          (unsigned int)ctx->args[3], g_fs_umask));
@@ -620,7 +805,7 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
 #endif
     if (nr == SYS_chdir)
         return handled(ctx, sud_vfs_chdir((const char *)ctx->args[0]));
-    if (nr == SYS_fchdir && sud_vfs_owns_fd((int)ctx->args[0]))
+    if (nr == SYS_fchdir)
         return handled(ctx, sud_vfs_fchdir((int)ctx->args[0]));
 #ifdef SYS_getcwd
     if (nr == SYS_getcwd)

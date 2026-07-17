@@ -155,6 +155,24 @@ static struct sud_remote_ofd *description_for(int fd)
     return description;
 }
 
+static struct sud_remote_ofd *remote_proc_fd(const char *path,
+                                              const char **suffix)
+{
+    static const char prefix[] = "/proc/self/fd/";
+    if (!path || strncmp(path, prefix, sizeof(prefix) - 1) != 0) return 0;
+    const char *p = path + sizeof(prefix) - 1;
+    if (*p < '0' || *p > '9') return 0;
+    unsigned long value = 0;
+    while (*p >= '0' && *p <= '9') {
+        value = value * 10 + (unsigned int)(*p++ - '0');
+        if (value > INT32_MAX) return 0;
+    }
+    if (*p != '\0' && *p != '/') return 0;
+    struct sud_remote_ofd *description = description_for((int)value);
+    if (description && suffix) *suffix = p;
+    return description;
+}
+
 static void ofd_lock(struct sud_remote_ofd *description)
 {
     uint32_t me = (uint32_t)raw_gettid();
@@ -186,6 +204,17 @@ static void ofd_unlock(struct sud_remote_ofd *description)
 static int absolute_at(int dirfd, const char *path, char *output, size_t size)
 {
     if (!path || !path[0]) return -ENOENT;
+    const char *suffix = 0;
+    struct sud_remote_ofd *proc_description = remote_proc_fd(path, &suffix);
+    if (proc_description) {
+        size_t suffix_length = strlen(suffix);
+        if (proc_description->path_len + suffix_length >= size)
+            return -ENAMETOOLONG;
+        memcpy(output, proc_description->path, proc_description->path_len);
+        memcpy(output + proc_description->path_len,
+               suffix, suffix_length + 1);
+        return 0;
+    }
     if (path[0] == '/') {
         size_t length = strlen(path);
         if (length >= size) return -ENAMETOOLONG;
@@ -229,6 +258,24 @@ int sud_vfs_absolutize(int dirfd, const char *path,
                        char *output, size_t size)
 {
     return absolute_at(dirfd, path, output, size);
+}
+
+static int kernel_root(const char *path, const char *root)
+{
+    size_t length = strlen(root);
+    return !strncmp(path, root, length)
+        && (path[length] == '\0' || path[length] == '/');
+}
+
+int sud_vfs_is_kernel_path(int dirfd, const char *path)
+{
+    if ((!path || !path[0]) && dirfd != AT_FDCWD)
+        return !sud_vfs_owns_fd(dirfd);
+    char absolute[PATH_MAX];
+    if (absolute_at(dirfd, path, absolute, sizeof(absolute)) != 0) return 0;
+    return kernel_root(absolute, "/proc")
+        || kernel_root(absolute, "/dev")
+        || kernel_root(absolute, "/sys");
 }
 
 struct resolved_node {
@@ -1162,6 +1209,18 @@ int sud_vfs_chdir(const char *path)
     char absolute[PATH_MAX];
     int result = absolute_at(AT_FDCWD, path, absolute, sizeof(absolute));
     if (result != 0) return result;
+    if (sud_vfs_is_kernel_path(AT_FDCWD, path)) {
+        result = (int)raw_syscall6(SYS_chdir, (long)path, 0, 0, 0, 0, 0);
+        if (result != 0) return result;
+        char actual[PATH_MAX];
+        long length = raw_syscall6(SYS_getcwd, (long)actual,
+                                   sizeof(actual), 0, 0, 0, 0);
+        const char *cwd = length > 0 ? actual : absolute;
+        local_lock(&g_cwd_lock);
+        memcpy(g_cwd, cwd, strlen(cwd) + 1);
+        local_unlock(&g_cwd_lock);
+        return 0;
+    }
     struct resolved_node node;
     char canonical[PATH_MAX];
     result = resolve_absolute_full(absolute, &node, 1, canonical);
@@ -1179,7 +1238,18 @@ int sud_vfs_chdir(const char *path)
 int sud_vfs_fchdir(int fd)
 {
     struct sud_remote_ofd *description = description_for(fd);
-    if (!description) return -EBADF;
+    if (!description) {
+        int result = (int)raw_syscall6(SYS_fchdir, fd, 0, 0, 0, 0, 0);
+        if (result != 0) return result;
+        char actual[PATH_MAX];
+        long length = raw_syscall6(SYS_getcwd, (long)actual,
+                                   sizeof(actual), 0, 0, 0, 0);
+        if (length < 0) return (int)length;
+        local_lock(&g_cwd_lock);
+        memcpy(g_cwd, actual, (size_t)length);
+        local_unlock(&g_cwd_lock);
+        return 0;
+    }
     if ((description->mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
     local_lock(&g_cwd_lock);
     memcpy(g_cwd, description->path, description->path_len + 1);
@@ -1253,6 +1323,14 @@ long sud_vfs_getdents64(int fd, void *buffer, size_t size)
 
 long sud_vfs_readlinkat(int dirfd, const char *path, char *buffer, size_t size)
 {
+    const char *suffix = 0;
+    struct sud_remote_ofd *description = remote_proc_fd(path, &suffix);
+    if (description && suffix && !suffix[0]) {
+        size_t length = description->path_len;
+        if (length > size) length = size;
+        if (length) memcpy(buffer, description->path, length);
+        return (long)length;
+    }
     char absolute[PATH_MAX];
     int result = absolute_at(dirfd, path, absolute, sizeof(absolute));
     if (result != 0) return result;
