@@ -475,6 +475,16 @@ as executable mappings and mmap that genuinely need a host fd.
           recipe and preventing a large Kbuild graph from expanding thousands
           of archive recipes while all workers are idle. The focused ordering
           regression brings the native aarch64 Make/Brush suite to 35 cases.
+    - [x] Make non-`-k` parallel failure draining terminal. Successful recipes
+          already in flight may release new dependents after the first failure;
+          those deliberately unstarted nodes no longer make the failed scheduler
+          spin forever. The parallel-failure regression now includes exactly
+          this late-release shape.
+    - [x] Order viable implicit pattern rules by GNU specificity (shortest stem,
+          with later-definition precedence only among ties). This lets ARM64
+          Kbuild's `%.pi.o: %.o` chain beat the generic `%.o: %.S` chain instead
+          of inventing a missing `idreg-override.pi.S`. A focused chained-rule
+          fixture brings the native aarch64 Make/Brush suite to 36 cases.
     - [ ] Re-run the complete FUSE Brush build, then the complete QEMU Brush
           build, compare retained artifacts, and record timings/counts here.
 - [x] Remove backend-specific semantic branches and obsolete compatibility

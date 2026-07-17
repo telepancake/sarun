@@ -1062,8 +1062,10 @@ def main():
         (pf / "fail.mk").write_text("boom:\n\t@false\n")
         siblings = " ".join(f"s{i}" for i in range(9))
         (pf / "Makefile").write_text(
-            f"all: recurse {siblings}\n"
+            f"all: recurse late {siblings}\n"
             "recurse:\n\t@$(MAKE) -f fail.mk boom\n" +
+            "late: slow\n\t@printf late > $@\n"
+            "slow:\n\t@sleep 0.2\n" +
             "".join(
                 f"s{i}:\n\t@sleep 0.1; echo {i} > $@\n" for i in range(9)))
         r = subprocess.run(
@@ -1256,6 +1258,31 @@ def main():
         check(observed == b"observed\n",
               f"case35: later recipe expansion observes earlier output; "
               f"got {observed!r}")
+        # ── CASE 36: specific chained pattern beats generic chain ─────────
+        # ARM64 Kbuild has `%.pi.o: %.o` alongside generic `%.o: %.S` and
+        # `%.o: %.c`. GNU selects the target pattern yielding the shortest stem;
+        # otherwise foo.pi.o is misread as an assembly object needing foo.pi.S.
+        ps = work / "pattern-specificity"
+        shutil.rmtree(ps, ignore_errors=True)
+        ps.mkdir(parents=True, exist_ok=True)
+        (ps / "unit.c").write_text("source\n")
+        (ps / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all: unit.pi.o\n"
+            "%.pi.o: %.o\n\t@cp $< $@\n"
+            "%.o: %.c\n\t@cp $< $@\n"
+            "%.o: %.S\n\t@false\n"
+            "%.S: %_shipped\n\t@cp $< $@\n")
+        r = run_make("MAKE36", ps, "-j10", "all")
+        check(r.returncode == 0,
+              f"case36: specific %.pi.o chain beats generic %.o chain "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp36 = latest_sqlar(m)
+        piobj = m.sqlar_content(
+            sp36, str((ps / "unit.pi.o").resolve()).lstrip("/"))
+        check(piobj == b"source\n",
+              f"case36: chained %.pi.o was built through existing unit.c; "
+              f"got {piobj!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 20:46:50 +0000
+Subject: [PATCH] Prefer more specific implicit make patterns
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index f9b04cc..d93874e 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -1213,11 +1213,31 @@ impl<'a> DepBuilder<'a> {
+             });
+         }
+ 
+-        let irules = self.implicit_rules.get(&output.as_bytes());
++        let mut irules = self.implicit_rules.get(&output.as_bytes());
++        // GNU considers the rule with the shortest stem first (the most
++        // specific matching target pattern), while later definitions win
++        // among equally specific patterns.  RuleTrie lookup order alone does
++        // not provide that ordering: Kbuild's `%.pi.o: %.o` must be considered
++        // before the generic `%.o: %.S`, or `idreg-override.pi.o` is wrongly
++        // interpreted as an assembly object requiring a nonexistent
++        // `idreg-override.pi.S`.
++        irules.reverse();
++        irules.sort_by_key(|rule| {
++            rule.output_patterns
++                .iter()
++                .filter_map(|p| {
++                    let bytes = p.as_bytes();
++                    Pattern::new(bytes.clone()).matches(&output.as_bytes()).then(|| {
++                        output.as_bytes().len().saturating_sub(bytes.len().saturating_sub(1))
++                    })
++                })
++                .min()
++                .unwrap_or(usize::MAX)
++        });
+         // Pass 1: pattern rules whose prerequisites already EXIST (GNU make's
+         // preferred tier — no chaining). This is the original kati behavior and
+         // the path every chain-free corpus case takes.
+-        for rule in irules.iter().rev() {
++        for rule in &irules {
+             let Some(pattern_rule) = self.can_pick_implicit_rule(rule, output, n.clone(), false)
+             else {
+                 continue;
+@@ -1312,7 +1332,7 @@ impl<'a> DepBuilder<'a> {
+         // GNU make's last resort before `.DEFAULT`, and where the Kbuild
+         // `$(obj)/%: $(src)/%_shipped` chain is resolved when the shipped file
+         // doesn't already exist.
+-        for rule in irules.iter().rev() {
++        for rule in &irules {
+             let Some(pattern_rule) = self.can_pick_implicit_rule(rule, output, n.clone(), true)
+             else {
+                 continue;

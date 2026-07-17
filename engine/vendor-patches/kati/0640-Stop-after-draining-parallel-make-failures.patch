@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 20:45:50 +0000
+Subject: [PATCH] Stop after draining parallel make failures
+
+---
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 53ab776..71ff4ac 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -819,7 +819,11 @@ list of the rule for '{output}' at {loc}"));
+             }
+             // 3. Termination.
+             if running == 0 {
+-                if !ready.is_empty() || !run_queue.is_empty() {
++                // Once a non--k build has failed, successful workers that were
++                // already in flight may still release dependents back into
++                // `ready`.  They are deliberately not runnable; do not mistake
++                // that repopulated queue for progress and spin forever.
++                if failed.is_none() && (!ready.is_empty() || !run_queue.is_empty()) {
+                     continue;
+                 }
+                 // A goal target that is STILL rule-less and absent errors
