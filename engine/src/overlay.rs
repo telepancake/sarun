@@ -3870,6 +3870,56 @@ mod chain_tests {
                 assert_eq!(value, b"value"),
             virtiofsd::filesystem::GetxattrReply::Count(_) => panic!("expected value"),
         }
+        assert!(matches!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::getxattr(
+                &fs, ctx, entry.inode, &xattr, 0,
+            )
+            .unwrap(),
+            virtiofsd::filesystem::GetxattrReply::Count(5),
+        ));
+        assert_eq!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::getxattr(
+                &fs, ctx, entry.inode, &xattr, 1,
+            )
+            .err()
+            .unwrap()
+            .raw_os_error(),
+            Some(libc::ERANGE),
+        );
+        let xattr_bytes = xattr.as_bytes_with_nul();
+        assert!(matches!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::listxattr(
+                &fs, ctx, entry.inode, 0,
+            )
+            .unwrap(),
+            virtiofsd::filesystem::ListxattrReply::Count(count)
+                if count as usize == xattr_bytes.len(),
+        ));
+        match <SarunFs as virtiofsd::filesystem::FileSystem>::listxattr(
+            &fs,
+            ctx,
+            entry.inode,
+            xattr_bytes.len() as u32,
+        )
+        .unwrap()
+        {
+            virtiofsd::filesystem::ListxattrReply::Names(names) =>
+                assert_eq!(names, xattr_bytes),
+            virtiofsd::filesystem::ListxattrReply::Count(_) => panic!("expected names"),
+        }
+        <SarunFs as virtiofsd::filesystem::FileSystem>::removexattr(
+            &fs, ctx, entry.inode, &xattr,
+        )
+        .unwrap();
+        assert_eq!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::getxattr(
+                &fs, ctx, entry.inode, &xattr, 32,
+            )
+            .err()
+            .unwrap()
+            .raw_os_error(),
+            Some(libc::ENODATA),
+        );
 
         let filename = CString::new("hello").unwrap();
         let file_entry = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
@@ -4040,6 +4090,94 @@ mod chain_tests {
             4096,
         )
         .unwrap();
+        assert_eq!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::write(
+                &fs,
+                ctx,
+                allocated.inode,
+                allocated_handle,
+                BytesReader(b"x"),
+                1,
+                8192,
+                None,
+                false,
+                false,
+                0,
+            )
+            .unwrap(),
+            1,
+        );
+        let hole = <SarunFs as virtiofsd::filesystem::FileSystem>::lseek(
+            &fs,
+            ctx,
+            allocated.inode,
+            allocated_handle,
+            0,
+            libc::SEEK_HOLE as u32,
+        )
+        .unwrap();
+        assert!(hole <= 8192, "hole must precede the distant data byte: {hole}");
+        assert_eq!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::lseek(
+                &fs,
+                ctx,
+                allocated.inode,
+                allocated_handle,
+                hole,
+                libc::SEEK_DATA as u32,
+            )
+            .unwrap(),
+            8192,
+        );
+        let (lock_handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::open(
+            &fs,
+            ctx,
+            allocated.inode,
+            false,
+            libc::O_RDWR as u32,
+        )
+        .unwrap();
+        let lock_handle = lock_handle.unwrap();
+        let lock = virtiofsd::fuse::FileLock {
+            start: 10,
+            end: 19,
+            type_: libc::F_WRLCK as u32,
+            pid: 123,
+        };
+        <SarunFs as virtiofsd::filesystem::FileSystem>::setlk(
+            &fs, ctx, allocated.inode, allocated_handle, 100, lock, 0,
+        )
+        .unwrap();
+        let conflict = <SarunFs as virtiofsd::filesystem::FileSystem>::getlk(
+            &fs, ctx, allocated.inode, lock_handle, 200, lock, 0,
+        )
+        .unwrap();
+        assert_eq!((conflict.type_, conflict.pid), (libc::F_WRLCK as u32, 123));
+        assert_eq!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::setlk(
+                &fs, ctx, allocated.inode, lock_handle, 200, lock, 0,
+            )
+            .err()
+            .unwrap()
+            .raw_os_error(),
+            Some(libc::EAGAIN),
+        );
+        <SarunFs as virtiofsd::filesystem::FileSystem>::fsync(
+            &fs, ctx, allocated.inode, true, allocated_handle,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::flush(
+            &fs, ctx, allocated.inode, allocated_handle, 100,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::setlk(
+            &fs, ctx, allocated.inode, lock_handle, 200, lock, 0,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::release(
+            &fs, ctx, allocated.inode, 0, lock_handle, false, false, None,
+        )
+        .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::release(
             &fs,
             ctx,
@@ -4054,7 +4192,7 @@ mod chain_tests {
         let Layer::UpperFile { owner, rowid, .. } = fs.resolve(id, "allocated") else {
             panic!("fallocate target missing");
         };
-        assert_eq!(blob_path(owner, rowid).metadata().unwrap().len(), 4096);
+        assert_eq!(blob_path(owner, rowid).metadata().unwrap().len(), 8193);
         let mut setattr = virtiofsd::fuse::SetattrIn::default();
         setattr.size = 128;
         setattr.mode = 0o640;
@@ -4062,6 +4200,8 @@ mod chain_tests {
         setattr.atimensec = 456;
         setattr.mtime = 789;
         setattr.mtimensec = 12;
+        setattr.uid = unsafe { libc::geteuid() }.into();
+        setattr.gid = unsafe { libc::getegid() }.into();
         let (allocated_attr, _) =
             <SarunFs as virtiofsd::filesystem::FileSystem>::setattr(
                 &fs,
@@ -4071,6 +4211,8 @@ mod chain_tests {
                 None,
                 virtiofsd::filesystem::SetattrValid::SIZE
                     | virtiofsd::filesystem::SetattrValid::MODE
+                    | virtiofsd::filesystem::SetattrValid::UID
+                    | virtiofsd::filesystem::SetattrValid::GID
                     | virtiofsd::filesystem::SetattrValid::ATIME
                     | virtiofsd::filesystem::SetattrValid::MTIME,
             )
@@ -4081,6 +4223,8 @@ mod chain_tests {
         assert_eq!(allocated_attr.atimensec, 456);
         assert_eq!(allocated_attr.mtime, 789);
         assert_eq!(allocated_attr.mtimensec, 12);
+        assert_eq!(allocated_attr.uid.into_inner(), unsafe { libc::geteuid() });
+        assert_eq!(allocated_attr.gid.into_inner(), unsafe { libc::getegid() });
         assert_eq!(blob_path(owner, rowid).metadata().unwrap().len(), 128);
         let directory_name = CString::new("directory").unwrap();
         let directory = <SarunFs as virtiofsd::filesystem::FileSystem>::mkdir(
@@ -4169,6 +4313,13 @@ mod chain_tests {
             &fs, ctx, entry.inode, &hardlink_name,
         )
         .unwrap();
+        let renamed_after_unlink =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
+                &fs, ctx, renamed.inode, None,
+            )
+            .unwrap()
+            .0;
+        assert_eq!(renamed_after_unlink.nlink, 1);
         <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
             &fs, ctx, entry.inode, &fifo_name,
         )
@@ -4204,6 +4355,73 @@ mod chain_tests {
         );
         assert_eq!(fs.inner.inodes.lookup_count(entry.inode), 0);
 
+        // Independent canonical requests may be served by different FUSE,
+        // SUD, or virtio-fs workers. Exercise the shared inode, handle,
+        // capture, and SQLite boundaries concurrently rather than only their
+        // private unit-level locks.
+        const PARALLEL_BYTES: [&[u8]; 8] = [
+            b"worker-0", b"worker-1", b"worker-2", b"worker-3",
+            b"worker-4", b"worker-5", b"worker-6", b"worker-7",
+        ];
+        let mut workers = Vec::new();
+        let canonical_root = entry.inode;
+        for index in 0..8 {
+            let fs = fs.clone();
+            workers.push(std::thread::spawn(move || {
+                let name = CString::new(format!("parallel-{index}")).unwrap();
+                let (file, handle, _) =
+                    <SarunFs as virtiofsd::filesystem::FileSystem>::create(
+                        &fs,
+                        ctx,
+                        canonical_root,
+                        &name,
+                        0o600,
+                        false,
+                        libc::O_RDWR as u32,
+                        0,
+                        virtiofsd::filesystem::Extensions::default(),
+                    )
+                    .unwrap();
+                let handle = handle.unwrap();
+                let bytes = PARALLEL_BYTES[index];
+                <SarunFs as virtiofsd::filesystem::FileSystem>::write(
+                    &fs,
+                    ctx,
+                    file.inode,
+                    handle,
+                    BytesReader(bytes),
+                    bytes.len() as u32,
+                    0,
+                    None,
+                    false,
+                    false,
+                    0,
+                )
+                .unwrap();
+                <SarunFs as virtiofsd::filesystem::FileSystem>::release(
+                    &fs, ctx, file.inode, 0, handle, false, false, None,
+                )
+                .unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        for index in 0..8 {
+            assert_eq!(
+                fs.box_read_file(id, &format!("parallel-{index}")).unwrap(),
+                PARALLEL_BYTES[index],
+            );
+        }
+
+        let stat = <SarunFs as virtiofsd::filesystem::FileSystem>::statfs(
+            &fs, ctx, entry.inode,
+        )
+        .unwrap();
+        assert!(stat.f_bsize > 0);
+        assert!(stat.f_blocks >= stat.f_bfree);
+
+        fs.add_box(Arc::new(BoxState::create(id + 2).unwrap()));
         let (handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::opendir(
             &fs, ctx, 1, 0,
         )
@@ -4216,7 +4434,17 @@ mod chain_tests {
         .unwrap();
         let first = virtiofsd::filesystem::DirectoryIterator::next(&mut entries).unwrap();
         assert_eq!(first.name.to_bytes(), id.to_string().as_bytes());
+        let snapshot_second =
+            virtiofsd::filesystem::DirectoryIterator::next(&mut entries).unwrap();
+        assert_eq!(snapshot_second.name.to_bytes(), (id + 2).to_string().as_bytes());
         assert!(virtiofsd::filesystem::DirectoryIterator::next(&mut entries).is_none());
+        let mut resumed = <SarunFs as virtiofsd::filesystem::FileSystem>::readdir(
+            &fs, ctx, 1, handle, 4096, 1,
+        )
+        .unwrap();
+        let second = virtiofsd::filesystem::DirectoryIterator::next(&mut resumed).unwrap();
+        assert_eq!(second.name.to_bytes(), (id + 2).to_string().as_bytes());
+        assert!(virtiofsd::filesystem::DirectoryIterator::next(&mut resumed).is_none());
         <SarunFs as virtiofsd::filesystem::FileSystem>::releasedir(
             &fs, ctx, 1, 0, handle,
         )

@@ -87,7 +87,7 @@ as executable mappings and mmap that genuinely need a host fd.
           the merged overlay implementation.
 - [x] Use virtiofsd passthrough machinery for ordinary host-backed operations;
       retain only sarun-specific composition and capture policy.
-- [ ] Add canonical-message tests for lookup counts, forgotten/open inodes,
+- [x] Add canonical-message tests for lookup counts, forgotten/open inodes,
       rename/unlink lifetime, hardlinks, symlinks, xattrs, ownership, locks,
       mmap, sparse files, truncation, directory cookies, concurrency, and bad
       requests.
@@ -100,6 +100,10 @@ as executable mappings and mmap that genuinely need a host fd.
         Header-bearing decoder failures return `EIO` with the original unique
         ID, and a SUD ring session demonstrably accepts a valid request after a
         malformed one instead of poisoning or cancelling the transport.
+  - [x] Exercise xattr size negotiation/removal, uid/gid projection, record
+        locks and flush-time release, fsync, sparse seek, truncation, hardlink
+        counts, statfs, stable directory cookies, and concurrent canonical
+        requests through the public virtiofsd `FileSystem` trait.
 
 ### 2. FUSE cutover
 
