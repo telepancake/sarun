@@ -81,6 +81,30 @@ printf EXECUTED > executed.txt
 EOF
 chmod +x generated-tool
 ./generated-tool
+
+# Multiple workers publish files by rename while sharing one directory. Every
+# published name must be visible and readable after the barrier.
+mkdir parallel parallel-tmp
+i=0
+while [ "$i" -lt 8 ]; do
+  (
+    j=0
+    while [ "$j" -lt 8 ]; do
+      printf 'worker-%s-%s' "$i" "$j" > "parallel-tmp/$i-$j"
+      mv "parallel-tmp/$i-$j" "parallel/f$i-$j"
+      j=$((j + 1))
+    done
+  ) &
+  i=$((i + 1))
+done
+wait
+count=0
+for file in parallel/f*; do
+  cat "$file" >/dev/null
+  count=$((count + 1))
+done
+[ "$count" -eq 64 ]
+printf '%s' "$count" > parallel-count
 '''
 
 
@@ -102,6 +126,7 @@ def sqlar_observation(sqlar, module, work):
         "moved": module.sqlar_content(sqlar, rel("nested/moved")),
         "destination": module.sqlar_content(sqlar, rel("destination")),
         "executed": module.sqlar_content(sqlar, rel("executed.txt")),
+        "parallel_count": module.sqlar_content(sqlar, rel("parallel-count")),
         "victim_tombstone": stat.S_ISCHR(rows.get(rel("victim.txt"), 0)),
         "sparse_size": sparse[0] if sparse else None,
         "source_absent": rel("source") not in rows,
@@ -216,6 +241,8 @@ def main():
         check(value["moved"] == b"NESTED", f"{backend}: nested rename")
         check(value["destination"] == b"SOURCE", f"{backend}: rename-over fd lifetime")
         check(value["executed"] == b"EXECUTED", f"{backend}: new executable ran")
+        check(value["parallel_count"] == b"64",
+              f"{backend}: concurrent publish/read barrier")
         check(value["victim_tombstone"], f"{backend}: lower deletion is a tombstone")
         check(value["lower_open_tombstone"], f"{backend}: open lower unlink is a tombstone")
         check(value["sparse_size"] == 1048577, f"{backend}: sparse length captured")

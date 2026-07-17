@@ -244,6 +244,12 @@ as executable mappings and mmap that genuinely need a host fd.
         and host non-escape. The gate automatically adds native SUD on x86_64.
 - [ ] Stress concurrency and forced termination; prove no write escapes to the
       host and no ring waiter remains stuck.
+  - [x] Run five consecutive live FUSE/QEMU equivalence rounds with eight
+        concurrent publishers producing 64 rename-published files per backend;
+        every barrier, readback, capture comparison, and host non-escape check
+        passed. Ring unit tests separately cover concurrent producers,
+        dead-owner reclamation, and shutdown releasing clients/servers. Live
+        forced-termination and native-SUD soak remain open.
 - [ ] Record comparable filesystem benchmarks.  Do not delete a displaced
       backend until its replacement meets or beats its benchmark geometric
       mean.
