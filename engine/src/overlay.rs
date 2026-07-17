@@ -1524,6 +1524,10 @@ impl SarunFs {
         if let Some(atime_ns) = b.atime_of(rel) {
             attr.atime = ns_ts(atime_ns);
         }
+        if let Some((uid, gid)) = b.owner_of(rel) {
+            attr.uid = uid;
+            attr.gid = gid;
+        }
         Some(attr)
     }
 
@@ -1913,6 +1917,8 @@ impl SarunFs {
     fn create_node(
         &self,
         pid: u32,
+        uid: u32,
+        gid: u32,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -1965,11 +1971,9 @@ impl SarunFs {
             });
             (attr, handle)
         } else {
-            let rowid = self
-                .inner
-                .mutations
-                .writer(&b, pid)
-                .ensure_file(&rel, mode | libc::S_IFREG);
+            let capture = self.inner.mutations.writer(&b, pid);
+            let rowid = capture.ensure_file(&rel, mode | libc::S_IFREG);
+            capture.set_owner(&rel, uid, gid);
             let path = blob_path(bid, rowid);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(Errno::from)?;
@@ -1989,6 +1993,8 @@ impl SarunFs {
                 .unwrap_or_else(|| self.synth_file_attr(inode));
             attr.kind = NodeKind::RegularFile;
             attr.perm = (mode & 0o7777) as u16;
+            attr.uid = uid;
+            attr.gid = gid;
             self.inner.mutations.record(bid, rel.clone(), "create");
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
@@ -2031,7 +2037,8 @@ impl SarunFs {
         Ok((box_id, rel))
     }
 
-    fn mkdir_node(&self, pid: u32, parent: u64, name: &OsStr, mode: u32)
+    fn mkdir_node(&self, pid: u32, uid: u32, gid: u32,
+                  parent: u64, name: &OsStr, mode: u32)
         -> Result<NodeAttr, Errno>
     {
         let (box_id, rel) = self.child_path(parent, name)?;
@@ -2042,10 +2049,14 @@ impl SarunFs {
         if !matches!(self.resolve(box_id, &rel), Layer::Absent) {
             return Err(Errno::EEXIST);
         }
-        self.inner.mutations.writer(&b, pid).set_dir(&rel, mode);
+        let capture = self.inner.mutations.writer(&b, pid);
+        capture.set_dir(&rel, mode);
+        capture.set_owner(&rel, uid, gid);
         let inode = self.ino_for(&(box_id, rel.clone()));
         self.inner.mutations.record(box_id, rel, "mkdir");
-        let attr = self.synth_dir_attr(inode, mode | libc::S_IFDIR, 0);
+        let mut attr = self.synth_dir_attr(inode, mode | libc::S_IFDIR, 0);
+        attr.uid = uid;
+        attr.gid = gid;
         self.inner.inodes.acquire(inode, 1);
         Ok(attr)
     }
@@ -2053,6 +2064,8 @@ impl SarunFs {
     fn symlink_node(
         &self,
         pid: u32,
+        uid: u32,
+        gid: u32,
         parent: u64,
         name: &OsStr,
         target: &Path,
@@ -2062,16 +2075,17 @@ impl SarunFs {
         if self.ro_denied(box_id, &rel) {
             return Err(Errno::EROFS);
         }
-        self.inner
-            .mutations
-            .writer(&b, pid)
-            .set_symlink(&rel, target);
+        let capture = self.inner.mutations.writer(&b, pid);
+        capture.set_symlink(&rel, target);
+        capture.set_owner(&rel, uid, gid);
         let inode = self.ino_for(&(box_id, rel.clone()));
         self.inner.mutations.record(box_id, rel, "symlink");
-        let attr = self.synth_link_attr(
+        let mut attr = self.synth_link_attr(
             inode,
             target.as_os_str().as_encoded_bytes().len() as u64,
         );
+        attr.uid = uid;
+        attr.gid = gid;
         self.inner.inodes.acquire(inode, 1);
         Ok(attr)
     }
@@ -2257,6 +2271,8 @@ impl SarunFs {
     fn mknod_node(
         &self,
         pid: u32,
+        uid: u32,
+        gid: u32,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -2269,7 +2285,9 @@ impl SarunFs {
         }
         match mode & libc::S_IFMT {
             libc::S_IFREG => {
-                let rowid = self.inner.mutations.writer(&b, pid).ensure_file(&rel, mode);
+                let capture = self.inner.mutations.writer(&b, pid);
+                let rowid = capture.ensure_file(&rel, mode);
+                capture.set_owner(&rel, uid, gid);
                 let path = blob_path(box_id, rowid);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(Errno::from)?;
@@ -2277,10 +2295,9 @@ impl SarunFs {
                 File::create(path).map_err(Errno::from)?;
             }
             libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK => {
-                self.inner
-                    .mutations
-                    .writer(&b, pid)
-                    .set_special(&rel, mode, rdev as u64);
+                let capture = self.inner.mutations.writer(&b, pid);
+                capture.set_special(&rel, mode, rdev as u64);
+                capture.set_owner(&rel, uid, gid);
             }
             _ => return Err(Errno::EINVAL),
         }
@@ -3213,6 +3230,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         let (attr, opened) = self
             .create_node(
                 ctx.pid as u32,
+                ctx.uid.into_inner(),
+                ctx.gid.into_inner(),
                 parent,
                 OsStr::from_bytes(name.to_bytes()),
                 mode,
@@ -3243,6 +3262,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         let attr = self
             .mkdir_node(
                 ctx.pid as u32,
+                ctx.uid.into_inner(),
+                ctx.gid.into_inner(),
                 parent,
                 OsStr::from_bytes(name.to_bytes()),
                 mode,
@@ -3270,6 +3291,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         let attr = self
             .mknod_node(
                 ctx.pid as u32,
+                ctx.uid.into_inner(),
+                ctx.gid.into_inner(),
                 parent,
                 OsStr::from_bytes(name.to_bytes()),
                 mode,
@@ -3296,6 +3319,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         let attr = self
             .symlink_node(
                 ctx.pid as u32,
+                ctx.uid.into_inner(),
+                ctx.gid.into_inner(),
                 parent,
                 OsStr::from_bytes(name.to_bytes()),
                 Path::new(OsStr::from_bytes(linkname.to_bytes())),
@@ -3824,8 +3849,8 @@ mod chain_tests {
         let id = 9201;
         fs.add_box(Arc::new(BoxState::create(id).unwrap()));
         let ctx = virtiofsd::filesystem::Context {
-            uid: 0.into(),
-            gid: 0.into(),
+            uid: 1234.into(),
+            gid: 2345.into(),
             pid: 1,
         };
         let export = fs.export_box(id).unwrap();
@@ -4094,6 +4119,8 @@ mod chain_tests {
             )
             .unwrap();
         assert_eq!(created.attr.mode & 0o7777, 0o640);
+        assert_eq!(created.attr.uid.into_inner(), 1234);
+        assert_eq!(created.attr.gid.into_inner(), 2345);
         assert_eq!(fs.inner.inodes.lookup_count(created.inode), 1);
         let created_handle = created_handle.unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::write(
@@ -4317,6 +4344,8 @@ mod chain_tests {
         )
         .unwrap();
         assert_eq!(directory.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(directory.attr.uid.into_inner(), 1234);
+        assert_eq!(directory.attr.gid.into_inner(), 2345);
         let fifo_name = CString::new("fifo").unwrap();
         let fifo = <SarunFs as virtiofsd::filesystem::FileSystem>::mknod(
             &fs,
@@ -4330,6 +4359,8 @@ mod chain_tests {
         )
         .unwrap();
         assert_eq!(fifo.attr.mode & libc::S_IFMT, libc::S_IFIFO);
+        assert_eq!(fifo.attr.uid.into_inner(), 1234);
+        assert_eq!(fifo.attr.gid.into_inner(), 2345);
         let link_name = CString::new("link").unwrap();
         let link_target = CString::new("created").unwrap();
         let link = <SarunFs as virtiofsd::filesystem::FileSystem>::symlink(
@@ -4341,6 +4372,8 @@ mod chain_tests {
             virtiofsd::filesystem::Extensions::default(),
         )
         .unwrap();
+        assert_eq!(link.attr.uid.into_inner(), 1234);
+        assert_eq!(link.attr.gid.into_inner(), 2345);
         assert_eq!(
             <SarunFs as virtiofsd::filesystem::FileSystem>::readlink(
                 &fs, ctx, link.inode,
