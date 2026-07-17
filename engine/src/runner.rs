@@ -737,6 +737,7 @@ pub fn run_qemu(
     readonly_parent: bool,
     chdir: Option<String>,
     net_mode: crate::net::NetMode,
+    brush: bool,
     cmd: Vec<String>,
 ) -> i32 {
     use crate::generated_wire::{
@@ -753,7 +754,17 @@ pub fn run_qemu(
         eprintln!("sarun-engine run --qemu: nested appliance boxes are not supported yet");
         return 2;
     }
-    let appliance_command = match crate::appliance::wire_command(&cmd, chdir.as_deref(), net_mode) {
+    let guest_cmd = if brush {
+        brush_cmd("/init", &cmd)
+    } else {
+        cmd.clone()
+    };
+    let appliance_command = match crate::appliance::wire_command(
+        &guest_cmd,
+        chdir.as_deref(),
+        net_mode,
+        brush,
+    ) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("sarun-engine run --qemu: {error}");
@@ -816,7 +827,7 @@ pub fn run_qemu(
         capture: true,
         direct: false,
         capture_environment: env,
-        brush: false,
+        brush,
         api: false,
         web_capture: false,
         web_filter: false,
@@ -1066,7 +1077,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
             unsafe { libc::close(trace_w); libc::close(lane_client); }
             return 1;
         };
-        sud_brush_cmd(exe, &cmd)
+        brush_cmd(exe, &cmd)
     } else { cmd };
     // Probe the target the way sudtrace did: PATH-resolve, shebang, ELF class
     // → pick sud32 or sud64 for the initial exec (the wrapper handles
@@ -1243,8 +1254,8 @@ fn sud_register(conn: &UnixStream, cmd: &[String], env: bool,
 }
 
 /// Rewrite CMD so the box's shell IS the embedded brush: `exe` (the engine's
-/// own path) runs under the wrapper via the explicit `brush-sh` subcommand.
-fn sud_brush_cmd(exe: &str, cmd: &[String]) -> Vec<String> {
+/// target-visible path) runs via the explicit `brush-sh` subcommand.
+fn brush_cmd(exe: &str, cmd: &[String]) -> Vec<String> {
     let script = crate::brush::script_from_argv(cmd);
     // Parse mode follows the user's shell: `bash -c …` must be BASH-mode
     // brush (brush_sh dispatches mode on this argv0 basename).

@@ -848,9 +848,9 @@ fn main() {
                 std::process::exit(runner::run_sud(name, env, chdir, net_mode, brush, cmd));
             }
             if let Some(architecture) = qemu {
-                if passthrough || direct || pty || brush || api {
+                if passthrough || direct || pty || api {
                     eprintln!(
-                        "sarun: --qemu is currently incompatible with -t/-d/-p/-b/--api"
+                        "sarun: --qemu is currently incompatible with -t/-d/-p/--api"
                     );
                     std::process::exit(2);
                 }
@@ -862,6 +862,7 @@ fn main() {
                     readonly_parent,
                     chdir,
                     net_mode,
+                    brush,
                     cmd,
                 ));
             }

@@ -287,6 +287,7 @@ pub fn wire_command(
     command: &[String],
     cwd: Option<&str>,
     net_mode: crate::net::NetMode,
+    brush: bool,
 ) -> Result<ApplianceCommand, String> {
     let command = command
         .iter()
@@ -303,7 +304,7 @@ pub fn wire_command(
                 .map_err(|error| format!("cwd exceeds relation bound: {error:?}"))
         })
         .transpose()?;
-    let environment = std::env::vars_os()
+    let mut environment = std::env::vars_os()
         .map(|(key, value)| {
             let key = crate::wire::BoundedBytes::new(key.as_bytes().to_vec())
                 .map_err(|error| format!("environment name exceeds relation bound: {error:?}"))?;
@@ -312,6 +313,20 @@ pub fn wire_command(
             Ok((key, value))
         })
         .collect::<Result<BTreeMap<_, _>, String>>()?;
+    if brush {
+        environment.insert(
+            crate::wire::BoundedBytes::new(b"SARUN_BRUSH_SH".to_vec())
+                .expect("fixed environment name is bounded"),
+            crate::wire::BoundedBytes::new(b"1".to_vec())
+                .expect("fixed environment value is bounded"),
+        );
+        environment.insert(
+            crate::wire::BoundedBytes::new(b"SARUN_EXE".to_vec())
+                .expect("fixed environment name is bounded"),
+            crate::wire::BoundedBytes::new(b"/init".to_vec())
+                .expect("fixed environment value is bounded"),
+        );
+    }
     let environment = crate::wire::BoundedMap::new(environment)
         .map_err(|error| format!("environment size violates relation bound: {error:?}"))?;
     Ok(ApplianceCommand {
@@ -600,6 +615,27 @@ mod tests {
         let decoded: ApplianceCommand =
             crate::socket_wire::read_versioned(&mut bytes.as_slice()).unwrap();
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn brush_appliance_command_carries_fixed_runtime_environment() {
+        let command = wire_command(
+            &["/init".into(), "brush-sh".into()],
+            Some("/work"),
+            crate::net::NetMode::Off,
+            true,
+        )
+        .unwrap();
+        let environment = command.environment.as_map();
+        let value = |name: &[u8]| {
+            environment.iter()
+                .find(|(key, _)| key.as_slice() == name)
+                .map(|(_, value)| value.as_slice())
+        };
+        assert_eq!(value(b"SARUN_BRUSH_SH"), Some(b"1".as_slice()));
+        assert_eq!(value(b"SARUN_EXE"), Some(b"/init".as_slice()));
+        assert_eq!(command.cwd.as_ref().map(|value| value.as_slice()),
+                   Some(b"/work".as_slice()));
     }
 
     #[test]

@@ -217,6 +217,10 @@ as executable mappings and mmap that genuinely need a host fd.
         excluding default-y device families absent from the paired machines.
 - [x] Boot aarch64 under TCG on the current host; verify a successful command,
       non-zero exit propagation, captured filesystem writes, and no host write.
+- [x] Carry the existing registration `brush` value through QEMU instead of
+      hardcoding it false. Target `/init brush-sh` now runs the ordinary parser,
+      and the shared SarunFs shadow projection runs embedded Kati and n2 in a
+      live aarch64 TCG guest with results identical to FUSE and no host escape.
 - [x] Boot x86_64 under TCG on the aarch64 host and execute the projected
       x86_64 `/init` through the same binary control and SarunFs transport.
       Revalidated after the SUD deletion with target `/init brush`, exact
@@ -242,6 +246,11 @@ as executable mappings and mmap that genuinely need a host fd.
         rename-over with an open destination fd, unlink with an open lower fd,
         sparse truncation, execution of a newly created script, tombstones,
         and host non-escape. The gate automatically adds native SUD on x86_64.
+  - [x] Extend that gate through parser-driven brush execution and the shared
+        make/ninja executable projections. FUSE and aarch64 QEMU/TCG both run
+        embedded Kati and n2, capture identical results, and leave the lower
+        host project untouched; native SUD joins the same test automatically
+        on an x86 Syscall User Dispatch host.
 - [ ] Stress concurrency and forced termination; prove no write escapes to the
       host and no ring waiter remains stuck.
   - [x] Run five consecutive live FUSE/QEMU equivalence rounds with eight
@@ -272,7 +281,7 @@ as executable mappings and mmap that genuinely need a host fd.
 
 ## Validation ledger (2026-07-17, aarch64 host)
 
-- The final static `aarch64-unknown-linux-musl` test harness has 384 passing
+- The final static `aarch64-unknown-linux-musl` test harness has 385 passing
   tests and one ignored browser test. Its only two failures are the pre-existing
   relation-completion cases
   `bash_editor_uses_relation_for_backward_completion_and_insertion` and
@@ -315,7 +324,7 @@ holding hours of work only in the worktree.
 
 ## Known baseline failures
 
-- The 2026-07-17 full static aarch64 unit run now passes 383 tests, ignores one,
+- The 2026-07-17 full static aarch64 unit run now passes 385 tests, ignores one,
   and exposed two pre-existing Brush/editor semantic-completion assertions:
   `production_brush_document_propagates_later_find_type_constraint` and
   `bash_editor_uses_relation_for_backward_completion_and_insertion`.  The

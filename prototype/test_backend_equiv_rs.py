@@ -108,6 +108,19 @@ done
 printf '%s' "$count" > parallel-count
 '''
 
+BRUSH_WORKLOAD = r'''
+set -eu
+mkdir brush-build
+cd brush-build
+printf 'all: kati-out\nkati-out:\n\tprintf KATI > kati-out\n' > Makefile
+make -j2
+[ "$(cat kati-out)" = KATI ]
+printf 'rule emit\n  command = printf NINJA > $out\nbuild ninja-out: emit\n' > build.ninja
+ninja
+[ "$(cat ninja-out)" = NINJA ]
+printf BRUSH > brush-result
+'''
+
 
 def sqlar_observation(sqlar, module, work):
     prefix = str(work).lstrip("/") + "/"
@@ -201,6 +214,32 @@ def run_backend(backend):
             and (work / "victim.txt").read_bytes() == b"VICTIM"
             and not (work / "executed.txt").exists()
         )
+        brush_command = [
+            str(ENGINE_BIN), "run", "--net", "off", *backend_selector(backend),
+            "-b", f"EQUIV-{backend}-brush", "-C", str(work), "--",
+            "sh", "-c", BRUSH_WORKLOAD,
+        ]
+        brush_result = subprocess.run(
+            brush_command, env=env, capture_output=True, text=True, timeout=240
+        )
+        if brush_result.returncode != 0:
+            raise RuntimeError(
+                f"{backend} brush: rc={brush_result.returncode}; "
+                f"stdout={brush_result.stdout[-300:]!r}; "
+                f"stderr={brush_result.stderr[-500:]!r}"
+            )
+        brush_sqlar = max(store.glob("*.sqlar"), key=lambda path: int(path.stem))
+        brush_prefix = str(work).lstrip("/") + "/brush-build/"
+        observation["brush_result"] = module.sqlar_content(
+            brush_sqlar, brush_prefix + "brush-result"
+        )
+        observation["kati_result"] = module.sqlar_content(
+            brush_sqlar, brush_prefix + "kati-out"
+        )
+        observation["ninja_result"] = module.sqlar_content(
+            brush_sqlar, brush_prefix + "ninja-out"
+        )
+        observation["brush_host_unchanged"] = not (work / "brush-build").exists()
         abort_command = [
             str(ENGINE_BIN), "run", "--net", "off", *backend_selector(backend),
             f"EQUIV-{backend}-abort", "-C", str(work), "--", "sh", "-c",
@@ -300,6 +339,14 @@ def main():
         check(value["sparse_size"] == 1048577, f"{backend}: sparse length captured")
         check(value["source_absent"], f"{backend}: rename source absent")
         check(value["host_unchanged"], f"{backend}: no write escaped to host")
+        check(value["brush_result"] == b"BRUSH",
+              f"{backend}: parser-driven brush command ran")
+        check(value["kati_result"] == b"KATI",
+              f"{backend}: projected make ran embedded Kati")
+        check(value["ninja_result"] == b"NINJA",
+              f"{backend}: projected ninja ran embedded n2")
+        check(value["brush_host_unchanged"],
+              f"{backend}: brush/build writes did not escape to host")
         check(value["forced_shutdown"],
               f"{backend}: forced box termination is reaped and transport reusable")
 
