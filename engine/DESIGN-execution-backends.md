@@ -133,8 +133,11 @@ as executable mappings and mmap that genuinely need a host fd.
   - [x] Implement LOOKUP/GETATTR/OPEN/CREATE/READ/WRITE/FLUSH/RELEASE and a
         virtual-fd table, directory descriptors, symlink-aware traversal,
         link/rename/mutation operations, metadata, sync, and truncate.
-  - [ ] Add xattr, statfs, locking, sparse/time, mmap, and executable-loading
-        syscall translations on top of the same protocol handles.
+  - [x] Route ordinary file-backed mmap and pathname-based ELF inspection/
+        loading through exported canonical handles, including writable shared
+        copy-up and logical-cwd/dirfd resolution.
+  - [ ] Add xattr, statfs, locking, sparse/time operations and the remaining
+        exceptional exec forms (notably `execveat(AT_EMPTY_PATH)`).
   - [ ] Replace the path-remap and inramfs addins in the production wrapper in
         one cutover; do not retain an old/new runtime mode.
 - [x] Add the exceptional SCM_RIGHTS fd lane for exec/mmap backing objects.

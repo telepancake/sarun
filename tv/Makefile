@@ -338,7 +338,7 @@ build/fs_fuse_client_test32: $(FS_FUSE_CLIENT_TEST_SRCS) sud/fs/fuse_client.h su
 	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) -o $@ $(FS_FUSE_CLIENT_TEST_SRCS)
 
 FS_VFS_TEST_SRCS := sud/fs/tests/test_vfs.c sud/fs/addin.c sud/fs/vfs.c \
-                    sud/fs/fuse_client.c sud/fs/client.c \
+                    sud/fs/fuse_client.c sud/fs/client.c sud/fs/fd_lane.c \
                     sud/runtime_config.c \
                     libc-fs/libc.c libc-fs/deps/printf/printf.c \
                     libc-fs/divdi3.c

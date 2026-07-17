@@ -3,6 +3,7 @@
 #include "sud/raw.h"
 #include "sud/fs/client.h"
 #include "sud/fs/fuse_client.h"
+#include "sud/fs/fd_lane.h"
 #include "sud/fs/vfs.h"
 
 #define SUD_OFD_MAGIC UINT32_C(0x53464f44) /* "SFOD" */
@@ -219,6 +220,12 @@ static int absolute_at(int dirfd, const char *path, char *output, size_t size)
     if (base_len == 0 || output[base_len - 1] != '/') output[base_len++] = '/';
     memcpy(output + base_len, path, path_len + 1);
     return 0;
+}
+
+int sud_vfs_absolutize(int dirfd, const char *path,
+                       char *output, size_t size)
+{
+    return absolute_at(dirfd, path, output, size);
 }
 
 struct resolved_node {
@@ -445,6 +452,17 @@ int sud_vfs_init(const char *initial_cwd)
         }
     }
     return sud_fuse_init();
+}
+
+int sud_vfs_export_fd(int fd, int writable)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    if ((description->mode & S_IFMT) != S_IFREG) return -ENODEV;
+    if (writable && (description->flags & O_ACCMODE) == O_RDONLY)
+        return -EACCES;
+    return sud_fs_export_fd(description->handle,
+                            writable ? SUD_FS_FD_EXPORT_WRITE : 0);
 }
 
 int sud_vfs_openat(int dirfd, const char *path, int flags,

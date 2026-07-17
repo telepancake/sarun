@@ -8,6 +8,8 @@ int sud_vfs_init(const char *initial_cwd);
 int sud_vfs_openat(int dirfd, const char *path, int flags,
                    unsigned int mode, unsigned int umask);
 int sud_vfs_owns_fd(int fd);
+int sud_vfs_export_fd(int fd, int writable);
+int sud_vfs_absolutize(int dirfd, const char *path, char *output, size_t size);
 long sud_vfs_read(int fd, void *buffer, size_t size);
 long sud_vfs_write(int fd, const void *buffer, size_t size);
 long sud_vfs_pread(int fd, void *buffer, size_t size, uint64_t offset);

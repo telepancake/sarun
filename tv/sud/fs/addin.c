@@ -151,6 +151,38 @@ static int setattr_size(struct sud_syscall_ctx *ctx, int dirfd,
 static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
 {
     long nr = ctx->nr;
+#if defined(__x86_64__)
+    if (nr == SYS_mmap && sud_vfs_owns_fd((int)ctx->args[4])) {
+        int flags = (int)ctx->args[3];
+        int writable = ((flags & MAP_SHARED) == MAP_SHARED)
+                    && ((int)ctx->args[2] & PROT_WRITE);
+        int backing = sud_vfs_export_fd((int)ctx->args[4], writable);
+        if (backing < 0) return handled(ctx, backing);
+        void *mapped = raw_mmap((void *)ctx->args[0], (size_t)ctx->args[1],
+                                (int)ctx->args[2], flags, backing,
+                                (off_t)ctx->args[5]);
+        raw_close(backing);
+        return handled(ctx, (long)mapped);
+    }
+#else
+    if (nr == SYS_mmap2 && sud_vfs_owns_fd((int)ctx->args[4])) {
+        int flags = (int)ctx->args[3];
+        int writable = ((flags & MAP_SHARED) == MAP_SHARED)
+                    && ((int)ctx->args[2] & PROT_WRITE);
+        int backing = sud_vfs_export_fd((int)ctx->args[4], writable);
+        if (backing < 0) return handled(ctx, backing);
+        uint64_t page_offset = (uint64_t)(uint32_t)ctx->args[5];
+        if (page_offset > (UINT64_MAX >> 12)) {
+            raw_close(backing);
+            return handled(ctx, -EOVERFLOW);
+        }
+        void *mapped = raw_mmap((void *)ctx->args[0], (size_t)ctx->args[1],
+                                (int)ctx->args[2], flags, backing,
+                                (off_t)(page_offset << 12));
+        raw_close(backing);
+        return handled(ctx, (long)mapped);
+    }
+#endif
 #ifdef SYS_open
     if (nr == SYS_open)
         return handled(ctx, sud_vfs_openat(AT_FDCWD,

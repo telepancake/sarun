@@ -13,6 +13,9 @@
 #include "sud/state.h"
 #include "sud/elf.h"
 #include "sud/runtime_config.h"
+#ifdef SUD_ADDIN_FS
+#include "sud/fs/vfs.h"
+#endif
 #ifdef SUD_ADDIN_INRAMFS
 #include "sud/inramfs/inramfs.h"
 #include "sud/inramfs/path_ops.h"
@@ -62,7 +65,44 @@
  * carry the (fd-is-inramfs?) bit out-of-band so callers don't have
  * to know.  ================================================================ */
 
-#ifdef SUD_ADDIN_INRAMFS
+#ifdef SUD_ADDIN_FS
+
+static int ir_open_ro(const char *path)
+{
+    int remote = sud_vfs_openat(AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0, 0);
+    if (remote < 0) return remote;
+    int backing = sud_vfs_export_fd(remote, 0);
+    int release = sud_vfs_close(remote);
+    raw_close(remote);
+    if (backing < 0) return backing;
+    if (release < 0) {
+        raw_close(backing);
+        return release;
+    }
+    return backing;
+}
+
+static ssize_t ir_pread(int fd, void *buf, size_t n, off_t off)
+{
+    return raw_pread(fd, buf, n, off);
+}
+
+static ssize_t ir_read(int fd, void *buf, size_t n)
+{
+    return raw_read(fd, buf, n);
+}
+
+static int ir_close(int fd)
+{
+    return raw_close(fd);
+}
+
+static int ir_access(const char *path, int mode)
+{
+    return sud_vfs_accessat(AT_FDCWD, path, (unsigned int)mode);
+}
+
+#elif defined(SUD_ADDIN_INRAMFS)
 
 static int ir_path_is_inramfs(const char *path)
 {
@@ -121,7 +161,7 @@ static int ir_access(const char *path, int mode)
     return raw_access(path, mode);
 }
 
-#else  /* !SUD_ADDIN_INRAMFS */
+#else  /* neither shared FS nor inramfs */
 
 static inline int     ir_open_ro(const char *p)
                         { return raw_open(p, O_RDONLY); }
@@ -322,6 +362,13 @@ int resolve_path(const char *cmd, char *out, int out_sz)
      * inramfs points it at an innocuous root — and (b) returns 0,
      * causing build_exec_argv to bail and the kernel to receive an
      * uninstrumented execve("./foo", …) that ends in ENOENT. */
+#ifdef SUD_ADDIN_FS
+    if (cmd[0] == '.' || strchr(cmd, '/')) {
+        char abs[PATH_MAX];
+        if (sud_vfs_absolutize(AT_FDCWD, cmd, abs, sizeof(abs)) == 0)
+            return resolve_path(abs, out, out_sz);
+    }
+#endif
 #ifdef SUD_ADDIN_INRAMFS
     if (cmd[0] == '.' || strchr(cmd, '/')) {
         char abs[PATH_MAX];
@@ -421,6 +468,13 @@ int resolve_execveat_path(int dirfd, const char *path, long flags,
 
     if (dirfd == AT_FDCWD || path[0] == '/')
         return resolve_path(path, out, out_sz);
+
+#ifdef SUD_ADDIN_FS
+    char absolute[PATH_MAX];
+    if (sud_vfs_absolutize(dirfd, path, absolute, sizeof(absolute)) == 0)
+        return resolve_path(absolute, out, out_sz);
+    return 0;
+#endif
 
     char proc_path[64];
     int pos = 0;

@@ -3,12 +3,100 @@
 #include "sud/addin.h"
 #include "sud/fs/client.h"
 #include "sud/fs/fuse_client.h"
+#include "sud/fs/fd_lane.h"
 #include "sud/fs/vfs.h"
 
 void sud_rt_sigreturn_restorer(void) {}
 #if defined(__i386__)
 void sud_sigreturn_restorer(void) {}
 #endif
+
+#define TEST_AF_UNIX 1
+#define TEST_SOCK_SEQPACKET 5
+#define TEST_SOCK_CLOEXEC 02000000
+#define TEST_SOL_SOCKET 1
+#define TEST_SCM_RIGHTS 1
+
+struct lane_iovec { void *base; size_t length; };
+struct lane_msghdr {
+    void *name;
+    unsigned int name_length;
+    struct lane_iovec *iov;
+    size_t iov_length;
+    void *control;
+    size_t control_length;
+    unsigned int flags;
+};
+struct lane_cmsghdr { size_t length; int level; int type; };
+
+#define LANE_ALIGN(n) (((n) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
+#define LANE_DATA(c) ((unsigned char *)(c) + LANE_ALIGN(sizeof(struct lane_cmsghdr)))
+#define LANE_LEN(n) (LANE_ALIGN(sizeof(struct lane_cmsghdr)) + (n))
+#define LANE_SPACE(n) (LANE_ALIGN(sizeof(struct lane_cmsghdr)) + LANE_ALIGN(n))
+
+static int lane_request(int socket, struct sud_fs_fd_request *request)
+{
+    struct lane_iovec iov = { request, sizeof(*request) };
+    struct lane_msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.iov = &iov;
+    message.iov_length = 1;
+    return raw_syscall6(SYS_recvmsg, socket, (long)&message, 0, 0, 0, 0)
+        == sizeof(*request) ? 0 : -1;
+}
+
+static int lane_reply(int socket, uint64_t id, int exported)
+{
+    struct sud_fs_fd_response response = {
+        SUD_FS_FD_MAGIC, SUD_FS_FD_VERSION, SUD_FS_FD_EXPORT, id, 0, 0
+    };
+    struct lane_iovec iov = { &response, sizeof(response) };
+    unsigned char control[LANE_SPACE(sizeof(int))];
+    struct lane_msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.iov = &iov;
+    message.iov_length = 1;
+    message.control = control;
+    message.control_length = sizeof(control);
+    struct lane_cmsghdr *header = (struct lane_cmsghdr *)control;
+    header->length = LANE_LEN(sizeof(int));
+    header->level = TEST_SOL_SOCKET;
+    header->type = TEST_SCM_RIGHTS;
+    memcpy(LANE_DATA(header), &exported, sizeof(exported));
+    return raw_syscall6(SYS_sendmsg, socket, (long)&message, 0, 0, 0, 0)
+        == sizeof(response) ? 0 : -1;
+}
+
+static int serve_lane(int socket)
+{
+    struct sud_fs_fd_request request;
+    int shared = -1;
+    for (int i = 0; i < 2; i++) {
+        if (lane_request(socket, &request) != 0
+            || request.magic != SUD_FS_FD_MAGIC
+            || request.version != SUD_FS_FD_VERSION
+            || request.operation != SUD_FS_FD_EXPORT
+            || request.handle != 9 || request.request_id != (uint64_t)i + 1
+            || request.flags != (i ? SUD_FS_FD_EXPORT_WRITE : 0))
+            return 70 + i;
+        int data = (int)raw_syscall6(SYS_memfd_create,
+                                     (long)"vfs-mmap-test",
+                                     MFD_CLOEXEC, 0, 0, 0, 0);
+        if (data < 0 || raw_write(data, i ? "shared" : "mapped", 6) != 6)
+            return 72 + i;
+        if (lane_reply(socket, request.request_id, data) != 0)
+            return 74 + i;
+        if (i) shared = data;
+        else raw_close(data);
+    }
+    char byte;
+    while (raw_read(socket, &byte, 1) > 0) {}
+    char changed = 0;
+    if (raw_pread(shared, &changed, 1, 0) != 1 || changed != 'S') return 76;
+    raw_close(shared);
+    raw_close(socket);
+    return 0;
+}
 
 static struct sud_fs_slot *take_request(struct sud_fs_ring *ring)
 {
@@ -78,12 +166,42 @@ static long fs_call(long nr, long a0, long a1, long a2,
     return context.ret;
 }
 
-static int child_calls(struct sud_fs_ring *ring)
+static int child_calls(struct sud_fs_ring *ring, int lane)
 {
+    if (raw_syscall6(SYS_dup2, lane, SUD_FS_FD_LANE_FD, 0, 0, 0, 0) < 0)
+        return 9;
+    raw_close(lane);
     if (sud_fs_client_bind(ring) != 0 || sud_vfs_init("/") != 0) return 10;
+    char absolute[PATH_MAX];
+    if (sud_vfs_absolutize(AT_FDCWD, "relative", absolute,
+                           sizeof(absolute)) != 0
+        || strcmp(absolute, "/relative") != 0) return 10;
     int fd = (int)fs_call(SYS_openat, AT_FDCWD, (long)"/hello",
                           O_RDWR, 0, 0, 0);
     if (fd < 0 || !sud_vfs_owns_fd(fd)) return 11;
+#if defined(__x86_64__)
+    long private_result = fs_call(SYS_mmap, 0, 4096, PROT_READ,
+                                  MAP_PRIVATE, fd, 0);
+#else
+    long private_result = fs_call(SYS_mmap2, 0, 4096, PROT_READ,
+                                  MAP_PRIVATE, fd, 0);
+#endif
+    void *private_map = (void *)private_result;
+    if ((unsigned long)private_map >= (unsigned long)-4095
+        || memcmp(private_map, "mapped", 6) != 0) return 11;
+#if defined(__x86_64__)
+    long shared_result = fs_call(SYS_mmap, 0, 4096, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, fd, 0);
+#else
+    long shared_result = fs_call(SYS_mmap2, 0, 4096, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, fd, 0);
+#endif
+    void *shared_map = (void *)shared_result;
+    if ((unsigned long)shared_map >= (unsigned long)-4095
+        || memcmp(shared_map, "shared", 6) != 0) return 11;
+    *(char *)shared_map = 'S';
+    raw_syscall6(SYS_munmap, (long)private_map, 4096, 0, 0, 0, 0);
+    raw_syscall6(SYS_munmap, (long)shared_map, 4096, 0, 0, 0, 0);
     char data[8] = {0};
     if (fs_call(SYS_read, fd, (long)data, 5, 0, 0, 0) != 5
         || memcmp(data, "hello", 5) != 0)
@@ -443,15 +561,30 @@ int main(int argc, char **argv)
     ring->header.total_size = sizeof(*ring);
     ring->header.slot_count = SUD_FS_SLOT_COUNT;
     ring->header.slot_data = SUD_FS_SLOT_DATA;
+    int sockets[2];
+    if (raw_syscall6(SYS_socketpair, TEST_AF_UNIX,
+                     TEST_SOCK_SEQPACKET | TEST_SOCK_CLOEXEC, 0,
+                     (long)sockets, 0, 0) < 0) return 2;
+    long lane_pid = raw_syscall6(SYS_fork, 0, 0, 0, 0, 0, 0);
+    if (lane_pid < 0) return 2;
+    if (lane_pid == 0) {
+        raw_close(sockets[1]);
+        _exit(serve_lane(sockets[0]));
+    }
+    raw_close(sockets[0]);
     long pid = raw_syscall6(SYS_fork, 0, 0, 0, 0, 0, 0);
     if (pid < 0) return 2;
-    if (pid == 0) _exit(child_calls(ring));
+    if (pid == 0) _exit(child_calls(ring, sockets[1]));
+    raw_close(sockets[1]);
     int server = serve_calls(ring);
     if (server != 0) return server;
     int status = 0;
     if (raw_syscall6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0) < 0)
         return 3;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 4;
+    if (raw_syscall6(SYS_wait4, lane_pid, (long)&status, 0, 0, 0, 0) < 0)
+        return 5;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 6;
     const char ok[] = "sud vfs test OK\n";
     (void)write(1, ok, sizeof(ok) - 1);
     return 0;

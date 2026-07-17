@@ -13,6 +13,9 @@
 #include "sud/loader.h"
 #include "sud/addin.h"
 #include "sud/state.h"
+#ifdef SUD_ADDIN_FS
+#include "sud/fs/vfs.h"
+#endif
 #ifdef SUD_ADDIN_INRAMFS
 #include "sud/inramfs/inramfs.h"
 #include "sud/inramfs/path_ops.h"
@@ -26,7 +29,22 @@
  * the host kernel's open(2). */
 static int loader_open_elf(const char *path)
 {
-#ifdef SUD_ADDIN_INRAMFS
+#ifdef SUD_ADDIN_FS
+    int remote = sud_vfs_openat(AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0, 0);
+    if (remote < 0) {
+        errno = -remote;
+        return -1;
+    }
+    int backing = sud_vfs_export_fd(remote, 0);
+    int release = sud_vfs_close(remote);
+    raw_close(remote);
+    if (backing < 0 || release < 0) {
+        if (backing >= 0) raw_close(backing);
+        errno = -(backing < 0 ? backing : release);
+        return -1;
+    }
+    return backing;
+#elif defined(SUD_ADDIN_INRAMFS)
     if (sud_inramfs_active() && path && path[0] == '/'
         && sud_pr_inramfs_path_under_mount(path)) {
         long r = sud_inramfs_op_get_kfd(path);
