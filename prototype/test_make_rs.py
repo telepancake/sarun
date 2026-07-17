@@ -1158,6 +1158,28 @@ def main():
         check(grandchild == b"fs/notify\n",
               f"case31: grandchild default goal includes built-in archive; "
               f"got {grandchild!r}")
+        # ── CASE 32: conditional recipe continuation after an include ────
+        cr = work / "conditional-recipe"
+        shutil.rmtree(cr, ignore_errors=True)
+        cr.mkdir(parents=True, exist_ok=True)
+        (cr / "feature.mk").write_text("CONFIG_COMPAT_VDSO=y\n")
+        (cr / "Makefile").write_text(
+            "include feature.mk\n"
+            "all:\n"
+            "\t@printf one > result.txt\n"
+            "ifdef CONFIG_COMPAT_VDSO\n"
+            "\t@printf two >> result.txt\n"
+            "endif\n")
+        r = run_make("MAKE32", cr)
+        check(r.returncode == 0,
+              f"case32: conditional continuation of the preceding recipe "
+              f"runs (got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp32 = latest_sqlar(m)
+        conditional = m.sqlar_content(
+            sp32, str((cr / "result.txt").resolve()).lstrip("/"))
+        check(conditional == b"onetwo",
+              f"case32: included nonempty CONFIG enables the second recipe "
+              f"line; got {conditional!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
