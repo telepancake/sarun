@@ -4,7 +4,7 @@
 //! a kernel boundary around the command.  Host and PID-1 exchange the command
 //! and exit status over one generated binary relation value.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -306,7 +306,10 @@ pub fn run(
     let mut child = Command::new(&qemu)
         .args(&args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
+        // User stdout returns through the recorded virtio-fs sink. The serial
+        // console is an implementation diagnostic and must not corrupt a
+        // pipeline consuming Sarun's stdout.
+        .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()?;
     let mut qemu_input = child.stdin.take().ok_or_else(|| {
@@ -327,7 +330,7 @@ pub fn run(
     drop(qemu_control);
     drop(qemu_network);
     let control_writer = Arc::new(Mutex::new(control.try_clone()?));
-    let box_channel = Arc::new(Mutex::new(box_channel));
+    let box_channel = ApplianceBoxChannel::new(box_channel)?;
     let nested = Arc::new(Mutex::new(HashMap::<u64, NestedChild>::new()));
     let mut result = (|| {
         crate::socket_wire::write_versioned(&mut control, command)?;
@@ -390,12 +393,128 @@ pub fn run(
         let _ = child.kill();
     }
     reap_appliance(&mut child);
+    box_channel.close_writer();
     result
 }
 
 struct NestedChild {
     pid: i32,
     input: Option<ChildStdin>,
+}
+
+struct BoxChannelState {
+    connections: VecDeque<UnixStream>,
+    closed: bool,
+}
+
+/// Host endpoint of one QEMU box channel. One reader owns all engine-to-runner
+/// frames so live output and SCM_RIGHTS replies cannot race each other. Writers
+/// may concurrently forward guest provenance or request flat nested launches;
+/// the socket write mutex preserves complete generated atoms.
+struct ApplianceBoxChannel {
+    writer: Mutex<UnixStream>,
+    responses: Arc<(Mutex<BoxChannelState>, Condvar)>,
+}
+
+impl ApplianceBoxChannel {
+    fn new(reader: UnixStream) -> io::Result<Arc<Self>> {
+        let writer = reader.try_clone()?;
+        let responses = Arc::new((
+            Mutex::new(BoxChannelState {
+                connections: VecDeque::new(),
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let channel = Arc::new(Self {
+            writer: Mutex::new(writer),
+            responses: responses.clone(),
+        });
+        std::thread::spawn(move || {
+            let mut buffered = Vec::new();
+            let mut chunk = [0u8; 65536];
+            loop {
+                let mut received_fd = None;
+                let count = crate::runner::recv_box_frame_bytes(
+                    reader.as_raw_fd(),
+                    &mut chunk,
+                    &mut received_fd,
+                );
+                if count <= 0 {
+                    if let Some(fd) = received_fd {
+                        unsafe { libc::close(fd) };
+                    }
+                    break;
+                }
+                buffered.extend_from_slice(&chunk[..count as usize]);
+                let (frames, used) = crate::frames::decode(&buffered);
+                for (kind, payload) in frames {
+                    match kind {
+                        crate::frames::FRAME_ECHO if !payload.is_empty() => {
+                            let result = if payload[0] == 1 {
+                                let mut output = io::stderr().lock();
+                                output.write_all(&payload[1..])
+                                    .and_then(|()| output.flush())
+                            } else {
+                                let mut output = io::stdout().lock();
+                                output.write_all(&payload[1..])
+                                    .and_then(|()| output.flush())
+                            };
+                            if result.is_err() {
+                                break;
+                            }
+                        }
+                        crate::frames::FRAME_CONN => {
+                            if let Some(fd) = received_fd.take() {
+                                let connection = unsafe { UnixStream::from_raw_fd(fd) };
+                                let (state, changed) = &*responses;
+                                state.lock().unwrap().connections.push_back(connection);
+                                changed.notify_one();
+                            }
+                        }
+                        crate::frames::FRAME_ECHO_DONE => {}
+                        _ => {}
+                    }
+                }
+                if let Some(fd) = received_fd {
+                    unsafe { libc::close(fd) };
+                }
+                buffered.drain(..used);
+            }
+            let (state, changed) = &*responses;
+            state.lock().unwrap().closed = true;
+            changed.notify_all();
+        });
+        Ok(channel)
+    }
+
+    fn send(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.write_all(bytes)?;
+        writer.flush()
+    }
+
+    fn request_connection(&self) -> io::Result<UnixStream> {
+        self.send(&crate::frames::encode(crate::frames::FRAME_OPEN_CONN, &[]))?;
+        let (state, changed) = &*self.responses;
+        let mut state = state.lock().unwrap();
+        loop {
+            if let Some(connection) = state.connections.pop_front() {
+                return Ok(connection);
+            }
+            if state.closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "box channel closed while opening nested engine connection",
+                ));
+            }
+            state = changed.wait(state).unwrap();
+        }
+    }
+
+    fn close_writer(&self) {
+        let _ = self.writer.lock().unwrap().shutdown(std::net::Shutdown::Write);
+    }
 }
 
 fn signal_nested_children(children: &Arc<Mutex<HashMap<u64, NestedChild>>>, signal: i32) {
@@ -427,7 +546,7 @@ fn write_appliance_frame(writer: &Arc<Mutex<UnixStream>>, frame: &ApplianceFrame
 }
 
 fn forward_guest_process(
-    channel: &Arc<Mutex<UnixStream>>,
+    channel: &ApplianceBoxChannel,
     event: crate::generated_wire::GuestProcessEvent,
 ) -> io::Result<()> {
     use crate::wire::WireValue;
@@ -438,9 +557,7 @@ fn forward_guest_process(
             io::ErrorKind::InvalidData,
             format!("encode guest process event: {error:?}"),
         ))?;
-    let mut channel = channel.lock().unwrap();
-    channel.write_all(&encoded)?;
-    channel.flush()
+    channel.send(&encoded)
 }
 
 fn nested_output(writer: &Arc<Mutex<UnixStream>>, stream: u64, bytes: &[u8]) {
@@ -492,7 +609,7 @@ fn nested_host_args(request: &ApplianceRunRequest) -> Vec<OsString> {
 fn spawn_nested_appliance(
     stream: u64,
     request: ApplianceRunRequest,
-    box_channel: Arc<Mutex<UnixStream>>,
+    box_channel: Arc<ApplianceBoxChannel>,
     control: Arc<Mutex<UnixStream>>,
     children: Arc<Mutex<HashMap<u64, NestedChild>>>,
 ) {
@@ -501,10 +618,7 @@ fn spawn_nested_appliance(
         write_appliance_frame(&control, &ApplianceFrame::NestedResult { stream, code: 1 });
         return;
     }
-    let engine = {
-        let channel = box_channel.lock().unwrap();
-        crate::runner::request_box_connection(&channel)
-    };
+    let engine = box_channel.request_connection();
     let engine = match engine {
         Ok(engine) => engine,
         Err(error) => {
@@ -970,6 +1084,25 @@ fn execute_guest(
     if let Some(cwd) = &command.cwd {
         process.current_dir(OsStr::from_bytes(cwd.as_slice()));
     }
+    // Route ordinary command output through SarunFs itself. Virtio-fs carries
+    // the calling guest TID on every sink write, so the engine records the
+    // actual writer and returns the same bytes as live ECHO frames. PID 1's
+    // control stream remains separate and cannot be confused with user output.
+    let stdout = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/.slopbox-stdout")
+        .map_err(|error| io::Error::new(
+            error.kind(),
+            format!("open guest stdout capture sink: {error}"),
+        ))?;
+    let stderr = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/.slopbox-stderr")
+        .map_err(|error| io::Error::new(
+            error.kind(),
+            format!("open guest stderr capture sink: {error}"),
+        ))?;
+    process.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
     unsafe {
         process.pre_exec(|| {
             if libc::setpgid(0, 0) == 0 {

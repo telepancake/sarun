@@ -1904,7 +1904,7 @@ fn runner_broker_handoff(fd: i32) {
 /// off `raw` (the box-channel) AND extract the first SCM_RIGHTS fd (a
 /// FRAME_CONN attaches one). Returns the byte count (0 = EOF, <0 = error)
 /// and sets `*fd` if one came in.
-fn recv_box_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32>) -> isize {
+pub(crate) fn recv_box_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32>) -> isize {
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
@@ -1933,48 +1933,6 @@ fn recv_box_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32>) -> isize
         }
     }
     n
-}
-
-/// Ask the engine for a fresh connection attributed to the box owning
-/// `channel`. Both the request and returned descriptor remain in the host
-/// outer runner; QEMU guests only see the higher-level nested-run operation.
-pub(crate) fn request_box_connection(channel: &UnixStream) -> std::io::Result<UnixStream> {
-    use std::os::fd::FromRawFd;
-    send_frame(
-        channel.as_raw_fd(),
-        &crate::frames::encode(crate::frames::FRAME_OPEN_CONN, &[]),
-        None,
-    );
-    let mut buffered = Vec::new();
-    let mut chunk = [0u8; 256];
-    loop {
-        let mut received_fd = None;
-        let count = recv_box_frame_bytes(channel.as_raw_fd(), &mut chunk, &mut received_fd);
-        if count <= 0 {
-            if let Some(fd) = received_fd {
-                unsafe { libc::close(fd) };
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "box channel closed while opening nested engine connection",
-            ));
-        }
-        buffered.extend_from_slice(&chunk[..count as usize]);
-        let (frames, used) = crate::frames::decode(&buffered);
-        for (kind, _) in frames {
-            if kind == crate::frames::FRAME_CONN {
-                let fd = received_fd.take().ok_or_else(|| std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "engine connection frame carried no descriptor",
-                ))?;
-                return Ok(unsafe { UnixStream::from_raw_fd(fd) });
-            }
-        }
-        if let Some(fd) = received_fd {
-            unsafe { libc::close(fd) };
-        }
-        buffered.drain(..used);
-    }
 }
 
 /// Dial the broker via abstract UDS named by SARUN_BROKER; recvmsg the

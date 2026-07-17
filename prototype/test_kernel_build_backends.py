@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import shutil
 import socket
 import sqlite3
@@ -74,6 +75,31 @@ def wait_socket(path, timeout=30):
         except OSError:
             time.sleep(0.1)
     return False
+
+
+def run_workload(command, env, timeout):
+    """Run one backend in its own process group and reap QEMU on failure."""
+    process = subprocess.Popen(
+        command,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        raise RuntimeError(
+            f"backend workload timed out after {timeout}s; "
+            f"stderr={stderr[-2000:]!r}"
+        )
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def tree_metadata_digest(root):
@@ -201,9 +227,7 @@ def run_backend(backend, source, jobs, keep):
             shell_workload(source, work, jobs),
         ]
         started = time.monotonic()
-        result = subprocess.run(
-            command, env=env, capture_output=True, timeout=7200
-        )
+        result = run_workload(command, env, timeout=7200)
         elapsed = time.monotonic() - started
 
         store = Path(env["XDG_STATE_HOME"]) / f"slopbox.{env['SLOPBOX_NS']}"

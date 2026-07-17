@@ -418,13 +418,22 @@ as executable mappings and mmap that genuinely need a host fd.
         QEMU shell/child check records both guest rows, links the child to the
         shell, assigns the shell's row to its created file, and records none of
         the unrelated host services whose numeric PIDs previously collided.
+  - [x] Route QEMU command stdout/stderr through the ordinary synthetic
+        SarunFs sinks. The engine records each virtio-fs write with its guest
+        TID and echoes it over a single host-side box-channel reader that also
+        demultiplexes nested-connection descriptors. A live check preserves
+        distinct stdout/stderr bytes, records three output rows against the
+        guest shell, and leaves the command's stdout free of boot-console text.
+  - [x] Exercise a bounded QEMU `make -j10`: thirty one-second recipes finish
+        in three waves (seven seconds including TCG boot), all thirty output
+        files have guest writers, and the archive contains 67 guest process
+        rows. The probe exposed an unset guest wall clock; the paired kernels
+        now enable their PL031/CMOS RTC and initialize CLOCK_REALTIME before
+        PID 1. Guest and lower-file epoch seconds agree after the rebuild.
   - [ ] Finish the QEMU kernel build and byte-for-byte artifact comparison.
-        The first live run also exposed absent QEMU output recording and a
-        parallel-build stall after roughly 200 objects. Complete the binary
-        guest-output lane, isolate the stall with a bounded `make -j10`
-        workload, then rerun the full build. Compiler processes and artifact
-        writers must be guest records, and output/trace rows must be populated,
-        not merely inferred from a successful exit.
+        Rerun after the output, clock, and concurrency fixes. Compiler processes
+        and artifact writers must be guest records, and output/trace rows must
+        be populated, not merely inferred from a successful exit.
 - [x] Remove backend-specific semantic branches and obsolete compatibility
       code; update generated help and user documentation. A repository audit
       finds backend selection only in registration, runner, transport, trace,

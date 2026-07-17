@@ -1501,6 +1501,10 @@ fn handle_binary_registration(
     if !channel_ready {
         stop_live_transports(&state, id);
     } else {
+        let overlay = lock(&state).overlay.clone();
+        if let (Some(overlay), Ok(writer)) = (overlay.as_ref(), conn.try_clone()) {
+            overlay.set_echo(id, Arc::new(Mutex::new(writer)));
+        }
         let mut bytes = [0u8; 4096];
         let mut frames = Vec::new();
         loop {
@@ -1527,11 +1531,16 @@ fn handle_binary_registration(
                 std::thread::spawn(move || {
                     handle_guarded(handler_state, server_side, Some(id))
                 });
-                let _ = send_stream_with_fd(
-                    &conn,
-                    &crate::frames::encode(crate::frames::FRAME_CONN, &[]),
-                    runner_side.as_raw_fd(),
-                );
+                let writer = lock(&state).overlay.as_ref()
+                    .and_then(|overlay| overlay.echo_writer(id));
+                if let Some(writer) = writer {
+                    let writer = writer.lock().unwrap();
+                    let _ = send_stream_with_fd(
+                        &writer,
+                        &crate::frames::encode(crate::frames::FRAME_CONN, &[]),
+                        runner_side.as_raw_fd(),
+                    );
+                }
             }
             frames.drain(..used);
         }
@@ -1540,6 +1549,7 @@ fn handle_binary_registration(
     let overlay = lock(&state).overlay.clone();
     stop_live_transports(&state, id);
     if let Some(overlay) = overlay {
+        overlay.clear_echo(id);
         overlay.remove_box(id);
     }
     {
