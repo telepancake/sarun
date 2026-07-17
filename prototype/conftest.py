@@ -18,6 +18,7 @@ pattern are ignored.
 import os
 import subprocess
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN
 
 import pytest
 
@@ -57,7 +58,7 @@ def _restore_os_environ():
 # real environment, since this runs before any test mutates it), the rest block
 # then find the finished binary and skip. A pre-existing binary is a no-op.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_ENGINE_BIN = _REPO_ROOT / "engine/target/x86_64-unknown-linux-musl/release/sarun"
+_ENGINE_BIN = ENGINE_BIN
 
 
 @pytest.fixture(scope="session", autouse=True)

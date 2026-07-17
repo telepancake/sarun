@@ -11,13 +11,14 @@ mount has that the Python baseline does NOT are real Rust defects.
 """
 import os, re, socket, subprocess, sys, tempfile, shutil, time
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN, LIBTESTSARUN, REPO_ROOT
 from importlib.machinery import SourceFileLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "bench"))
 import extsuite
 from extsuite import parse_failures, GROUPS  # parser + group list
 
-BIN = Path(__file__).resolve().parent.parent / "engine/target/x86_64-unknown-linux-musl/release/sarun"
+BIN = ENGINE_BIN
 PYBASELINE = Path("bench/pjdfstest_baseline.txt")
 RSBASELINE = Path("bench/pjdfstest_baseline_rs.txt")
 _fails = []
@@ -40,7 +41,7 @@ def main():
     if not BIN.exists():
         if shutil.which("make"):
             subprocess.run(["make","engine"],
-                           cwd="/home/user/sarun", capture_output=True)
+                           cwd=REPO_ROOT, capture_output=True)
     if not BIN.exists():
         print("  ok  pjdfstest-rs: engine binary unavailable — SKIP\n\nALL PASS"); return 0
     try:
@@ -55,7 +56,7 @@ def main():
                 ("XDG_CONFIG_HOME","c"),("XDG_DATA_HOME","d")):
         os.environ[k]=str(tmp/s)
     os.environ["SLOPBOX_NS"]="PJD"; (tmp/"run").mkdir(parents=True)
-    m = SourceFileLoader("slopbox","/home/user/sarun/prototype/libtestsarun.py").load_module()
+    m = SourceFileLoader("slopbox", str(LIBTESTSARUN)).load_module()
     m.ensure_dirs()
     eng = subprocess.Popen([str(BIN),"serve"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     try:

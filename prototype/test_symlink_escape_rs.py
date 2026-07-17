@@ -26,11 +26,12 @@ FAILS LOUD (raises) if the engine binary cannot be built — no fake-green skip.
 import os, socket, stat as stat_mod, subprocess, sys
 import tempfile, shutil, time
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN, LIBTESTSARUN
 from importlib.machinery import SourceFileLoader
 
-SARUN = "/home/user/sarun/prototype/libtestsarun.py"
+SARUN = str(LIBTESTSARUN)
 CRATE = Path(__file__).resolve().parent.parent / "engine"
-BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
+BIN = ENGINE_BIN
 
 _fails = []
 def check(cond, msg):

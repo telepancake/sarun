@@ -12,11 +12,12 @@ Skips (passes vacuously) if cargo/the binary are unavailable.
 """
 import os, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN
 from importlib.machinery import SourceFileLoader
 
 SARUN = str(Path(__file__).resolve().parent / "libtestsarun.py")
 CRATE = Path(__file__).resolve().parent.parent / "engine"
-BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
+BIN = ENGINE_BIN
 
 _fails = []
 def check(cond, msg):

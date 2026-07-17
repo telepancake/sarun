@@ -29,12 +29,13 @@ Skips (passes vacuously) if cargo/the binary/FUSE/kernel-passthrough unavailable
 """
 import os, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN
 from importlib.machinery import SourceFileLoader
 
 _HERE = Path(__file__).resolve().parent
 SARUN = str(_HERE / "libtestsarun.py")
 CRATE = _HERE.parent / "engine"
-BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
+BIN = ENGINE_BIN
 
 ORIG = b"PT-INPUT-" + bytes(range(256)) * 32000  # ~8 MB
 PT = Path("/root/ptr_in.bin")       # passthrough-ruled

@@ -19,9 +19,10 @@ import subprocess
 import tempfile
 import threading
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN
 
 _HERE = Path(__file__).resolve().parent
-BIN = _HERE.parent / "engine/target/x86_64-unknown-linux-musl/release/sarun"
+BIN = ENGINE_BIN
 
 _fails = []
 def check(cond, msg):

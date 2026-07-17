@@ -25,11 +25,12 @@ Env:
 """
 import concurrent.futures, os, re, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN
 from importlib.machinery import SourceFileLoader
 
 _HERE = Path(__file__).resolve().parent
 SARUN = str(_HERE / "libtestsarun.py")
-BIN = _HERE.parent / "engine/target/x86_64-unknown-linux-musl/release/sarun"
+BIN = ENGINE_BIN
 TESTCASES = _HERE.parent / "engine/vendor/kati/testcase"
 
 # Box-only expected failures, with reasons. Keep this SHORT — every entry is

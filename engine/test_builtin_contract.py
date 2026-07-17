@@ -19,11 +19,12 @@ fallback). Asserts at the syscall level:
 Standalone:  engine/test_builtin_contract.py        (prints CONTRACT PASS/FAIL)
 pytest:      uv run --with pytest pytest engine/test_builtin_contract.py
 
-Requires `strace` (ptrace) and GNU coreutils on PATH, plus the built engine at
-engine/target/x86_64-unknown-linux-musl/release/sarun (run `make engine` first).
+Requires `strace` (ptrace) and GNU coreutils on PATH, plus the built static
+engine for the current host architecture (run `make engine` first).
 """
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -31,7 +32,11 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.path.join(HERE, "target/x86_64-unknown-linux-musl/release/sarun")
+_arch = {"arm64": "aarch64", "amd64": "x86_64"}.get(
+    platform.machine().lower(), platform.machine().lower()
+)
+_target = os.environ.get("SARUN_ENGINE_TARGET", f"{_arch}-unknown-linux-musl")
+BIN = os.path.join(HERE, "target", _target, "release", "sarun")
 
 # execve: fork+exec of a util; dup2/dup3: fd-table trampling; splice: cat fast path.
 TRACE = "execve,dup2,dup3,splice,clone,vfork,fork"

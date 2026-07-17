@@ -25,11 +25,12 @@ sees through the overlay; writes land in the sqlar as "root/wl_rs/...".
 """
 import os, socket, subprocess, sys, tempfile, shutil, time, stat as st
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN, LIBTESTSARUN, REPO_ROOT
 from importlib.machinery import SourceFileLoader
 
-SARUN = "/home/user/sarun/prototype/libtestsarun.py"
-CRATE = Path("/home/user/sarun/engine")
-BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
+SARUN = str(LIBTESTSARUN)
+CRATE = REPO_ROOT / "engine"
+BIN = ENGINE_BIN
 WROOT = Path("/root/wl_rs")          # host scratch, visible in the box overlay
 QPREFIX = "root/wl_rs/"              # how WROOT paths appear in the sqlar
 

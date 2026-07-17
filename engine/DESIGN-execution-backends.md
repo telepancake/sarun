@@ -226,6 +226,12 @@ as executable mappings and mmap that genuinely need a host fd.
 - [ ] Exercise git, SQLite, Cargo, GNU make/Kati, Ninja, Autoconf, CMake,
       archive extraction, parallel compilers, and execution of new binaries on
       every backend.
+  - [x] Make the real-engine Python suite resolve the current host's static
+        musl target instead of hardcoding x86_64 and `/home/user/sarun`.
+        On this aarch64 host, the rebuilt static engine serves and captures a
+        FUSE box; GNU hello completes archive extraction, Autoconf configure,
+        GNU make and execution, and a CMake/Unix Makefiles project compiles and
+        executes. The SUD/QEMU and remaining tool/backend legs stay open.
 - [ ] Stress concurrency and forced termination; prove no write escapes to the
       host and no ring waiter remains stuck.
 - [ ] Record comparable filesystem benchmarks.  Do not delete a displaced

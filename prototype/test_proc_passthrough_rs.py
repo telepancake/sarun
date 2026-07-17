@@ -20,12 +20,13 @@ Skips (passes vacuously) if cargo/binary/FUSE unavailable.
 """
 import os, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN
 from importlib.machinery import SourceFileLoader
 
 _HERE = Path(__file__).resolve().parent
 SARUN = str(_HERE / "libtestsarun.py")
 CRATE = _HERE.parent / "engine"
-BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
+BIN = ENGINE_BIN
 
 A = Path("/root/pp_match.key")     # written by a MATCHING writer  -> host-direct
 B = Path("/root/pp_other.key")     # written by a NON-matching writer -> captured

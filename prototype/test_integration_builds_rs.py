@@ -22,11 +22,12 @@ Skips (passes vacuously) if the engine binary is unavailable.
 """
 import os, shutil, socket, subprocess, sys, tarfile, tempfile, time, urllib.request
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN
 from importlib.machinery import SourceFileLoader
 
 _HERE = Path(__file__).resolve().parent
 SARUN = str(_HERE / "libtestsarun.py")
-BIN = _HERE.parent / "engine/target/x86_64-unknown-linux-musl/release/sarun"
+BIN = ENGINE_BIN
 
 HELLO_URL = "https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz"
 CACHE = Path.home() / ".cache" / "sarun-integ"
@@ -83,7 +84,8 @@ def run_box(name, cwd, script, timeout):
     """Run `sh -c script` in a fresh -b box rooted at cwd; return the
     CompletedProcess (stdout is the box's logical stdout)."""
     return subprocess.run(
-        [str(BIN), "run", "-b", name, "-C", str(cwd), "--", "sh", "-c", script],
+        [str(BIN), "run", "-b", "--net", "off", name, "-C", str(cwd),
+         "--", "sh", "-c", script],
         capture_output=True, text=True, timeout=timeout)
 
 def main():
@@ -99,10 +101,9 @@ def main():
     m = SourceFileLoader("slopbox", SARUN).load_module()
     m.ensure_dirs()
 
-    # box-visible work root (host /tmp is tmpfs and hidden box-side)
-    work = Path("/root/integ_builds_work")
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
+    # Use a caller-writable host directory that is also part of the ordinary
+    # lower tree. `/root` made the suite silently x86/root-only.
+    work = Path(tempfile.mkdtemp(prefix="sarun-integ-builds-", dir="/var/tmp"))
 
     eng = subprocess.Popen([str(BIN), "serve"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)

@@ -26,9 +26,10 @@ launched headless and SIGTERM'd in a finally; the tree is removed on exit.
 import os, sys, time, signal, socket, subprocess, tempfile, shutil
 import json, hashlib, tarfile, gzip, io, sqlite3
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN, REPO_ROOT
 
-REPO = Path("/home/user/sarun")
-ENGINE = REPO / "engine/target/x86_64-unknown-linux-musl/release/sarun"
+REPO = REPO_ROOT
+ENGINE = ENGINE_BIN
 
 _fails = []
 def check(cond, msg):

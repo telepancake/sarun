@@ -17,15 +17,15 @@ musl binary IS present it asserts, for real:
   * a `sarun engine` instance comes up (its control socket appears), and
   * a real `sarun run -- echo …` box runs against it and exits 0.
 
-Build the musl binary first with:
-  cargo build --release --target x86_64-unknown-linux-musl   (cwd: engine/)
+Build the host-architecture musl binary first with `make engine`.
 """
-import os, socket, subprocess, sys, tempfile, time
+import os, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN
 
 _HERE = Path(__file__).resolve().parent
 CRATE = _HERE.parent / "engine"
-MUSL_BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
+MUSL_BIN = ENGINE_BIN
 
 
 def check(cond, msg):
@@ -56,9 +56,19 @@ def main():
         return 0
 
     # --- static-link proof ---------------------------------------------------
-    f = subprocess.run(["file", str(MUSL_BIN)], capture_output=True, text=True)
-    check("statically linked" in f.stdout or "static-pie" in f.stdout,
-          f"musl-rs: `file` reports static linkage ({f.stdout.split(':',1)[-1].strip()})")
+    if shutil.which("file"):
+        f = subprocess.run(["file", str(MUSL_BIN)], capture_output=True, text=True)
+        check("statically linked" in f.stdout or "static-pie" in f.stdout,
+              f"musl-rs: `file` reports static linkage "
+              f"({f.stdout.split(':',1)[-1].strip()})")
+    else:
+        # Minimal appliance/build hosts commonly have binutils but not the
+        # `file` package. An ELF with no PT_INTERP segment has no runtime
+        # dynamic loader dependency.
+        f = subprocess.run(["readelf", "-l", str(MUSL_BIN)],
+                           capture_output=True, text=True)
+        check(f.returncode == 0 and "INTERP" not in f.stdout,
+              "musl-rs: `readelf` reports no dynamic-loader segment")
 
     l = subprocess.run(["ldd", str(MUSL_BIN)], capture_output=True, text=True)
     out = (l.stdout + l.stderr).lower()
@@ -95,7 +105,8 @@ def main():
         check(True, f"musl-rs: engine serving (socket at {sock})")
 
         marker = "musl-static-box-ok"
-        r = subprocess.run([str(MUSL_BIN), "run", "--", "echo", marker],
+        r = subprocess.run([str(MUSL_BIN), "run", "--net", "off", "--",
+                            "echo", marker],
                            capture_output=True, text=True, env=env, timeout=120)
         check(r.returncode == 0,
               f"musl-rs: box exited 0 (rc={r.returncode}, err={r.stderr.strip()!r})")

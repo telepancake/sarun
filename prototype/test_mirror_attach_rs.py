@@ -31,12 +31,13 @@ absent. Run:
 import http.server, os, shutil, socket, sqlite3, subprocess, sys
 import tempfile, threading, time
 from pathlib import Path
+from sarun_test_paths import ENGINE_BIN
 from importlib.machinery import SourceFileLoader
 
 _HERE = Path(__file__).resolve().parent
 SARUN = str(_HERE / "libtestsarun.py")
 CRATE = _HERE.parent / "engine"
-BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
+BIN = ENGINE_BIN
 GIMIR = _HERE.parent / "gimir"
 TOOLS = {name: GIMIR / f"target/debug/{name}"
          for name in ("gitdepot", "wikimak", "ietfmak")}
