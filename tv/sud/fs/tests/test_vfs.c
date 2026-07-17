@@ -221,6 +221,9 @@ static int child_calls(struct sud_fs_ring *ring, int lane)
     if (fs_call(SYS_ftruncate, fd, 3, 0, 0, 0, 0) != 0) return 18;
     if (fs_call(SYS_fsync, fd, 0, 0, 0, 0, 0) != 0
         || fs_call(SYS_fchmod, fd, 0600, 0, 0, 0, 0) != 0) return 19;
+    struct timespec times[2] = { { 123, 456 }, { 789, 12 } };
+    if (fs_call(SYS_utimensat, AT_FDCWD, (long)"/hello", (long)times,
+                0, 0, 0) != 0) return 19;
     stat_buf_t path_stat;
 #if defined(__x86_64__)
     if (fs_call(SYS_newfstatat, AT_FDCWD, (long)"/hello",
@@ -346,6 +349,29 @@ static int serve_calls(struct sud_fs_ring *ring)
         || setattr->mode != 0600 || setattr->fh != 9) return 29;
     attributes.attr.mode = S_IFREG | 0600;
     reply(slot, &attributes, sizeof(attributes));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_LOOKUP || header->nodeid != FUSE_ROOT_ID
+        || strcmp((char *)(header + 1), "hello") != 0) return 29;
+    memset(&entry, 0, sizeof(entry));
+    entry.nodeid = 2;
+    entry.attr.ino = 2;
+    entry.attr.mode = S_IFREG | 0600;
+    reply(slot, &entry, sizeof(entry));
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    setattr = (struct fuse_setattr_in *)(header + 1);
+    if (header->opcode != FUSE_SETATTR || header->nodeid != 2
+        || !(setattr->valid & FATTR_ATIME) || !(setattr->valid & FATTR_MTIME)
+        || setattr->atime != 123 || setattr->atimensec != 456
+        || setattr->mtime != 789 || setattr->mtimensec != 12) return 29;
+    attributes.attr.atime = 123;
+    attributes.attr.atimensec = 456;
+    attributes.attr.mtime = 789;
+    attributes.attr.mtimensec = 12;
+    reply(slot, &attributes, sizeof(attributes));
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FORGET || header->nodeid != 2) return 29;
+    no_reply(slot);
 
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
     if (header->opcode != FUSE_LOOKUP || header->nodeid != FUSE_ROOT_ID

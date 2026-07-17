@@ -149,6 +149,50 @@ static int setattr_size(struct sud_syscall_ctx *ctx, int dirfd,
     return handled(ctx, sud_vfs_setattrat(dirfd, path, 1, &request));
 }
 
+struct sud_utimbuf { long access; long modification; };
+struct sud_timeval { long seconds; long microseconds; };
+
+static int add_timestamp(struct fuse_setattr_in *request, int atime,
+                         long seconds, long nanoseconds)
+{
+    if (nanoseconds == UTIME_OMIT) return 0;
+    if (nanoseconds == UTIME_NOW) {
+        request->valid |= atime ? FATTR_ATIME_NOW : FATTR_MTIME_NOW;
+        return 0;
+    }
+    if (seconds < 0 || nanoseconds < 0 || nanoseconds >= 1000000000L)
+        return -EINVAL;
+    if (atime) {
+        request->valid |= FATTR_ATIME;
+        request->atime = (uint64_t)seconds;
+        request->atimensec = (uint32_t)nanoseconds;
+    } else {
+        request->valid |= FATTR_MTIME;
+        request->mtime = (uint64_t)seconds;
+        request->mtimensec = (uint32_t)nanoseconds;
+    }
+    return 0;
+}
+
+static long set_times(int dirfd, const char *path, int follow,
+                      const struct timespec *times)
+{
+    struct fuse_setattr_in request;
+    memset(&request, 0, sizeof(request));
+    if (!times) {
+        request.valid = FATTR_ATIME_NOW | FATTR_MTIME_NOW;
+    } else {
+        int result = add_timestamp(&request, 1,
+                                   times[0].tv_sec, times[0].tv_nsec);
+        if (result != 0) return result;
+        result = add_timestamp(&request, 0,
+                               times[1].tv_sec, times[1].tv_nsec);
+        if (result != 0) return result;
+    }
+    if (!path) return sud_vfs_fsetattr(dirfd, &request);
+    return sud_vfs_setattrat(dirfd, path, follow, &request);
+}
+
 static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
 {
     long nr = ctx->nr;
@@ -569,6 +613,75 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
     if (nr == SYS_truncate64)
         return setattr_size(ctx, AT_FDCWD, (const char *)ctx->args[0],
                             split_offset(ctx->args, 1));
+#endif
+#ifdef SYS_utimensat
+    if (nr == SYS_utimensat) {
+        int flags = (int)ctx->args[3];
+        if (flags & ~AT_SYMLINK_NOFOLLOW) return handled(ctx, -EINVAL);
+        const char *path = (const char *)ctx->args[1];
+        if (!path && !sud_vfs_owns_fd((int)ctx->args[0])) return 0;
+        return handled(ctx, set_times((int)ctx->args[0], path,
+                         !(flags & AT_SYMLINK_NOFOLLOW),
+                         (const struct timespec *)ctx->args[2]));
+    }
+#endif
+#ifdef SYS_utime
+    if (nr == SYS_utime) {
+        const struct sud_utimbuf *input =
+            (const struct sud_utimbuf *)ctx->args[1];
+        struct timespec times[2];
+        const struct timespec *pointer = 0;
+        if (input) {
+            times[0].tv_sec = input->access;
+            times[0].tv_nsec = 0;
+            times[1].tv_sec = input->modification;
+            times[1].tv_nsec = 0;
+            pointer = times;
+        }
+        return handled(ctx, set_times(AT_FDCWD, (const char *)ctx->args[0],
+                                      1, pointer));
+    }
+#endif
+#ifdef SYS_utimes
+    if (nr == SYS_utimes) {
+        const struct sud_timeval *input =
+            (const struct sud_timeval *)ctx->args[1];
+        struct timespec times[2];
+        const struct timespec *pointer = 0;
+        if (input) {
+            if (input[0].microseconds < 0 || input[0].microseconds >= 1000000
+                || input[1].microseconds < 0 || input[1].microseconds >= 1000000)
+                return handled(ctx, -EINVAL);
+            times[0].tv_sec = input[0].seconds;
+            times[0].tv_nsec = input[0].microseconds * 1000;
+            times[1].tv_sec = input[1].seconds;
+            times[1].tv_nsec = input[1].microseconds * 1000;
+            pointer = times;
+        }
+        return handled(ctx, set_times(AT_FDCWD, (const char *)ctx->args[0],
+                                      1, pointer));
+    }
+#endif
+#ifdef SYS_futimesat
+    if (nr == SYS_futimesat) {
+        const struct sud_timeval *input =
+            (const struct sud_timeval *)ctx->args[2];
+        struct timespec times[2];
+        const struct timespec *pointer = 0;
+        if (input) {
+            if (input[0].microseconds < 0 || input[0].microseconds >= 1000000
+                || input[1].microseconds < 0 || input[1].microseconds >= 1000000)
+                return handled(ctx, -EINVAL);
+            times[0].tv_sec = input[0].seconds;
+            times[0].tv_nsec = input[0].microseconds * 1000;
+            times[1].tv_sec = input[1].seconds;
+            times[1].tv_nsec = input[1].microseconds * 1000;
+            pointer = times;
+        }
+        const char *path = (const char *)ctx->args[1];
+        if (!path && !sud_vfs_owns_fd((int)ctx->args[0])) return 0;
+        return handled(ctx, set_times((int)ctx->args[0], path, 1, pointer));
+    }
 #endif
 #ifdef SYS_fsync
     if (nr == SYS_fsync && sud_vfs_owns_fd((int)ctx->args[0]))

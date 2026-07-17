@@ -218,6 +218,7 @@ struct NodeSetattr {
     uid: Option<u32>,
     gid: Option<u32>,
     size: Option<u64>,
+    atime: Option<SystemTime>,
     mtime: Option<SystemTime>,
 }
 
@@ -1322,7 +1323,7 @@ impl SarunFs {
                 }
             }
         }
-        match layer {
+        let mut attr = match layer {
             Layer::Absent => None,
             Layer::Lower => self.lower_attr(ino, rel),
             Layer::UpperFile { owner, rowid, mode } => {
@@ -1354,7 +1355,11 @@ impl SarunFs {
                 a.rdev = rdev as u32;
                 Some(a)
             }
+        }?;
+        if let Some(atime_ns) = b.atime_of(rel) {
+            attr.atime = ns_ts(atime_ns);
         }
+        Some(attr)
     }
 
     /// Transport-neutral lookup.  Both the host `/dev/fuse` adapter and the
@@ -2131,13 +2136,19 @@ impl SarunFs {
                     return Err(Errno::from(std::io::Error::last_os_error()));
                 }
             }
-            if let Some(mtime) = request.mtime {
-                let duration = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
-                let timestamp = libc::timespec {
-                    tv_sec: duration.as_secs() as _,
-                    tv_nsec: duration.subsec_nanos() as _,
+            if request.atime.is_some() || request.mtime.is_some() {
+                let to_timespec = |time: SystemTime| {
+                    let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+                    libc::timespec {
+                        tv_sec: duration.as_secs() as _,
+                        tv_nsec: duration.subsec_nanos() as _,
+                    }
                 };
-                let times = [timestamp, timestamp];
+                let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT };
+                let times = [
+                    request.atime.map_or(omit, &to_timespec),
+                    request.mtime.map_or(omit, &to_timespec),
+                ];
                 if unsafe {
                     libc::utimensat(
                         libc::AT_FDCWD,
@@ -2211,30 +2222,55 @@ impl SarunFs {
                 .writer(&b, pid)
                 .set_owner(&rel, uid, gid);
         }
-        if let Some(mtime) = request.mtime {
+        if request.atime.is_some() || request.mtime.is_some() {
             if matches!(self.layer(&b, &rel), Layer::Lower)
-                && !self.inner.backing.attr(&rel).is_ok_and(|attr| {
-                    attr.kind == NodeKind::Directory
-                })
             {
-                self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
+                if self.inner.backing.attr(&rel).is_ok_and(|attr| {
+                    attr.kind == NodeKind::Directory
+                }) {
+                    self.inner
+                        .mutations
+                        .writer(&b, pid)
+                        .set_dir(&rel, self.inner.backing.attr(&rel)
+                            .map(|attr| attr.mode)
+                            .unwrap_or(libc::S_IFDIR | 0o755));
+                } else {
+                    self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
+                }
             }
-            let nanos = mtime
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos() as i64)
-                .unwrap_or(0);
-            self.inner
-                .mutations
-                .writer(&b, pid)
-                .set_mtime(&rel, nanos);
+            let capture = self.inner.mutations.writer(&b, pid);
+            if let Some(atime) = request.atime {
+                let nanos = atime.duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos() as i64)
+                    .unwrap_or(0);
+                capture.set_atime(&rel, nanos);
+            }
+            if let Some(mtime) = request.mtime {
+                let nanos = mtime.duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos() as i64)
+                    .unwrap_or(0);
+                capture.set_mtime(&rel, nanos);
+            }
             if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
                 self.ensure_upper_blob(box_id, rowid, &rel);
-                OpenOptions::new()
-                    .write(true)
-                    .open(blob_path(box_id, rowid))
-                    .map_err(Errno::from)?
-                    .set_modified(mtime)
-                    .map_err(Errno::from)?;
+                let path = CString::new(blob_path(box_id, rowid)
+                    .as_os_str().as_encoded_bytes()).map_err(|_| Errno::EINVAL)?;
+                let to_timespec = |time: SystemTime| {
+                    let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+                    libc::timespec {
+                        tv_sec: duration.as_secs() as _,
+                        tv_nsec: duration.subsec_nanos() as _,
+                    }
+                };
+                let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT };
+                let times = [
+                    request.atime.map_or(omit, &to_timespec),
+                    request.mtime.map_or(omit, &to_timespec),
+                ];
+                if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(),
+                                             times.as_ptr(), 0) } != 0 {
+                    return Err(Errno::from(std::io::Error::last_os_error()));
+                }
             }
         }
         self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)
@@ -2747,6 +2783,13 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         } else {
             None
         };
+        let atime = if valid.contains(virtiofsd::filesystem::SetattrValid::ATIME_NOW) {
+            Some(SystemTime::now())
+        } else if valid.contains(virtiofsd::filesystem::SetattrValid::ATIME) {
+            Some(UNIX_EPOCH + Duration::new(attr.atime, attr.atimensec))
+        } else {
+            None
+        };
         let result = self
             .setattr_node(
                 ctx.pid as u32,
@@ -2764,6 +2807,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
                     size: valid
                         .contains(virtiofsd::filesystem::SetattrValid::SIZE)
                         .then_some(attr.size),
+                    atime,
                     mtime,
                 },
             )
@@ -3668,6 +3712,10 @@ mod chain_tests {
         let mut setattr = virtiofsd::fuse::SetattrIn::default();
         setattr.size = 128;
         setattr.mode = 0o640;
+        setattr.atime = 123;
+        setattr.atimensec = 456;
+        setattr.mtime = 789;
+        setattr.mtimensec = 12;
         let (allocated_attr, _) =
             <SarunFs as virtiofsd::filesystem::FileSystem>::setattr(
                 &fs,
@@ -3676,11 +3724,17 @@ mod chain_tests {
                 setattr,
                 None,
                 virtiofsd::filesystem::SetattrValid::SIZE
-                    | virtiofsd::filesystem::SetattrValid::MODE,
+                    | virtiofsd::filesystem::SetattrValid::MODE
+                    | virtiofsd::filesystem::SetattrValid::ATIME
+                    | virtiofsd::filesystem::SetattrValid::MTIME,
             )
             .unwrap();
         assert_eq!(allocated_attr.size, 128);
         assert_eq!(allocated_attr.mode & 0o7777, 0o640);
+        assert_eq!(allocated_attr.atime, 123);
+        assert_eq!(allocated_attr.atimensec, 456);
+        assert_eq!(allocated_attr.mtime, 789);
+        assert_eq!(allocated_attr.mtimensec, 12);
         assert_eq!(blob_path(owner, rowid).metadata().unwrap().len(), 128);
         let directory_name = CString::new("directory").unwrap();
         let directory = <SarunFs as virtiofsd::filesystem::FileSystem>::mkdir(

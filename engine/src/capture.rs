@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS xattr(name TEXT, key TEXT, value BLOB,
  PRIMARY KEY(name,key));
 CREATE TABLE IF NOT EXISTS ownership(name TEXT PRIMARY KEY, uid INT, gid INT);
 CREATE TABLE IF NOT EXISTS rdev(name TEXT PRIMARY KEY, dev INT);
+CREATE TABLE IF NOT EXISTS atime(name TEXT PRIMARY KEY, ns INT);
 -- D9 brush-shell semantic provenance: one row per pipeline the embedded brush
 -- shell (-b) ran, carrying the exact command string + parsed structure (JSON).
 --   pipeline: a 0-based ordinal of the pipeline within the brush run, so the

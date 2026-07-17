@@ -122,6 +122,10 @@ impl CaptureWriter<'_> {
     pub(crate) fn set_mtime(&self, rel: &str, mtime_ns: i64) {
         self.box_state.set_mtime(rel, mtime_ns);
     }
+
+    pub(crate) fn set_atime(&self, rel: &str, atime_ns: i64) {
+        self.box_state.set_atime(rel, atime_ns);
+    }
 }
 
 #[cfg(test)]

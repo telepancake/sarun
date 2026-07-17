@@ -179,7 +179,7 @@ pub fn archive_clear(conn: &Connection, box_id: i64) -> Result<(), String> {
             let _ = std::fs::remove_file(blob_path(box_id, rowid));
         }
     }
-    for t in ["sqlar", "ownership", "rdev", "xattr"] {
+    for t in ["sqlar", "ownership", "rdev", "xattr", "atime"] {
         conn.execute(&format!("DELETE FROM {t}"), [])
             .map_err(|e| e.to_string())?;
     }
@@ -218,6 +218,8 @@ pub trait BoxDepot {
     // ── node metadata ────────────────────────────────────────────────────
     fn set_mode(&self, rel: &str, full_mode: u32);
     fn set_mtime(&self, rel: &str, mtime_ns: i64);
+    fn set_atime(&self, rel: &str, atime_ns: i64);
+    fn atime_of(&self, rel: &str) -> Option<i64>;
     fn set_owner(&self, rel: &str, uid: u32, gid: u32);
     fn owner_of(&self, rel: &str) -> Option<(u32, u32)>;
     fn set_xattr(&self, rel: &str, key: &str, value: &[u8]);
@@ -242,14 +244,14 @@ pub trait BoxDepot {
 }
 
 fn clear_node_metadata(conn: &Connection, rel: &str) {
-    for table in ["ownership", "rdev", "xattr"] {
+    for table in ["ownership", "rdev", "xattr", "atime"] {
         let _ = conn.execute(&format!("DELETE FROM {table} WHERE name=?1"), [rel]);
     }
 }
 
 fn move_node_metadata(conn: &Connection, old: &str, new: &str) {
     clear_node_metadata(conn, new);
-    for table in ["ownership", "rdev", "xattr"] {
+    for table in ["ownership", "rdev", "xattr", "atime"] {
         let _ = conn.execute(
             &format!("UPDATE {table} SET name=?2 WHERE name=?1"),
             params![old, new],
@@ -352,6 +354,23 @@ impl BoxDepot for BoxState {
             self.kinds.write().unwrap().get_mut(rel) {
             *m = mtime_ns;
         }
+    }
+
+    fn set_atime(&self, rel: &str, atime_ns: i64) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO atime(name,ns) VALUES(?1,?2)
+             ON CONFLICT(name) DO UPDATE SET ns=excluded.ns",
+            rusqlite::params![rel, atime_ns],
+        );
+    }
+
+    fn atime_of(&self, rel: &str) -> Option<i64> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT ns FROM atime WHERE name=?1", [rel], |row| row.get(0))
+            .ok()
     }
 
     /// chown: stored in a side table (the box squashes to one uid in-namespace,
