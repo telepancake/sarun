@@ -157,9 +157,9 @@ pub fn watch_pid(pid: i32) {
 /// protocol); a client writes back whatever it read.
 pub const SLIP: u8 = b'+';
 
-/// A pending acquirer's reply channel, decoupled from `fuser`. The FUSE read
-/// handler implements this over its deferred `ReplyData`; tests use a mock.
-/// Exactly one of `grant`/`deny_again` is called, consuming the reply.
+/// A pending acquirer's reply channel. Blocking filesystem requests bridge it
+/// to their waiting worker; tests can supply a deterministic mock. Exactly one
+/// of `grant`/`deny_again` is called, consuming the reply.
 pub trait SlipReply: Send {
     /// Hand the caller a slip (reply to the blocked/queued read with one byte).
     fn grant(self: Box<Self>);

@@ -65,8 +65,8 @@ as executable mappings and mmap that genuinely need a host fd.
 - [x] Separate virtual inode/handle lifetime, overlay policy, underlying layer
       access, capture/provenance, and synthetic nodes.
   - [x] Make inode identity, lookup counts, handle allocation/lifetime, node
-        kinds, and node attributes transport-independent; fuser and virtio-fs
-        only encode canonical values at their reply boundaries.
+      kinds, and node attributes transport-independent; the shared virtio-fs
+        decoder alone encodes canonical values at the reply boundary.
   - [x] Isolate merged-layer resolution and ordinary backing-file access.
     - [x] Move precedence, whiteout, hole, opacity, rebase, attachment, and
           synthetic-landing decisions into a pure transport-independent layer
@@ -100,7 +100,7 @@ as executable mappings and mmap that genuinely need a host fd.
         movement only at the reader/writer boundary.
   - [x] Own the mount/device worker lifecycle and dispatch `/dev/fuse` buffers
         through that decoder.
-- [ ] Preserve the synthetic box-id root, sinks, jobserver, shadows, rules,
+- [x] Preserve the synthetic box-id root, sinks, jobserver, shadows, rules,
       attachments, nested boxes, live events, and passthrough behavior.
   - [x] Keep backing-file eligibility in `SarunFs` while the raw transport owns
         backing-open/close ioctls and reply IDs; fall back once on kernels or
@@ -109,8 +109,11 @@ as executable mappings and mmap that genuinely need a host fd.
   - [x] Run the live engine on the raw transport and prove captured write/read
         without host escape, stdout sink delivery, blocking host jobserver
         acquire/release, UI materialization, and live overlay events on aarch64.
-- [ ] Differential-test old and new implementations on identical workloads.
-- [ ] Cut over, delete the old `fuser::Filesystem` implementation, and remove
+- [x] Differential-test old and new implementations on identical workloads.
+  The static aarch64 suite has the identical 377-pass/2-known-failure/1-ignore
+  result before and after cutover; live engine capture, sink, jobserver, UI,
+  and event workloads also match on the current host.
+- [x] Cut over, delete the old `fuser::Filesystem` implementation, and remove
       `fuser`.
 
 ### 3. SUD cutover

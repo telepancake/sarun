@@ -133,7 +133,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 rustls-pemfile = "2"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
-fuser = "0.17.0"
 # Transport-neutral FUSE/virtio-fs protocol, passthrough filesystem, and
 # vhost-user backend.  Sarun embeds the library only; its standalone daemon
 # dependencies are disabled by our pinned vendor patch.
@@ -173,7 +172,7 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 http = "1"
 pcap-file = "2"
-nix = { version = "0.30", features = ["sched", "net", "socket", "ioctl", "user", "fs", "process"] }
+nix = { version = "0.30", features = ["sched", "net", "socket", "uio", "ioctl", "user", "fs", "process"] }
 rand = "0.8"
 time = "0.3"
 tui-term = { version = "0.3", features = ["vt100"] }

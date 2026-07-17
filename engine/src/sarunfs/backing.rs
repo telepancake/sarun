@@ -91,7 +91,6 @@ impl BackingAttr {
             atime: self.atime,
             mtime: self.mtime,
             ctime: self.ctime,
-            crtime: std::time::UNIX_EPOCH,
             kind: self.kind,
             perm: (self.mode & 0o7777) as u16,
             nlink: self.nlink,

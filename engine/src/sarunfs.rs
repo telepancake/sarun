@@ -20,9 +20,8 @@ use std::time::UNIX_EPOCH;
 
 pub(crate) type NodeKey = (i64, String);
 
-/// Transport-independent file kind. Protocol adapters translate this only
-/// when they construct their reply; overlay policy never handles a fuser or
-/// virtio-fs enum.
+/// Transport-independent file kind. The shared protocol server translates it
+/// when constructing a reply; overlay policy never handles a wire enum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NodeKind {
     NamedPipe,
@@ -43,7 +42,6 @@ pub(crate) struct NodeAttr {
     pub atime: SystemTime,
     pub mtime: SystemTime,
     pub ctime: SystemTime,
-    pub crtime: SystemTime,
     pub kind: NodeKind,
     pub perm: u16,
     pub nlink: u32,
@@ -211,38 +209,6 @@ fn timestamp(value: SystemTime) -> (u64, u32) {
         .unwrap_or((0, 0))
 }
 
-pub(crate) fn fuse_kind(kind: NodeKind) -> fuser::FileType {
-    match kind {
-        NodeKind::NamedPipe => fuser::FileType::NamedPipe,
-        NodeKind::CharDevice => fuser::FileType::CharDevice,
-        NodeKind::BlockDevice => fuser::FileType::BlockDevice,
-        NodeKind::Directory => fuser::FileType::Directory,
-        NodeKind::RegularFile => fuser::FileType::RegularFile,
-        NodeKind::Symlink => fuser::FileType::Symlink,
-        NodeKind::Socket => fuser::FileType::Socket,
-    }
-}
-
-pub(crate) fn fuse_attr(attr: NodeAttr) -> fuser::FileAttr {
-    fuser::FileAttr {
-        ino: fuser::INodeNo(attr.inode),
-        size: attr.size,
-        blocks: attr.blocks,
-        atime: attr.atime,
-        mtime: attr.mtime,
-        ctime: attr.ctime,
-        crtime: attr.crtime,
-        kind: fuse_kind(attr.kind),
-        perm: attr.perm,
-        nlink: attr.nlink,
-        uid: attr.uid,
-        gid: attr.gid,
-        rdev: attr.rdev,
-        blksize: attr.blksize,
-        flags: attr.flags,
-    }
-}
-
 pub(crate) fn virtio_attr(attr: NodeAttr) -> virtiofsd::fuse::Attr {
     let (atime, atimensec) = timestamp(attr.atime);
     let (mtime, mtimensec) = timestamp(attr.mtime);
@@ -342,7 +308,6 @@ mod tests {
             atime: UNIX_EPOCH + std::time::Duration::new(1, 2),
             mtime: UNIX_EPOCH + std::time::Duration::new(3, 4),
             ctime: UNIX_EPOCH + std::time::Duration::new(5, 6),
-            crtime: UNIX_EPOCH,
             kind,
             perm: 0o654,
             nlink: 3,
@@ -355,17 +320,15 @@ mod tests {
     }
 
     #[test]
-    fn protocol_attributes_are_projections_of_one_canonical_value() {
+    fn protocol_attributes_are_a_projection_of_one_canonical_value() {
         let canonical = attr(NodeKind::RegularFile);
-        let fuse = fuse_attr(canonical);
         let virtio = virtio_attr(canonical);
-        assert_eq!(u64::from(fuse.ino), canonical.inode);
         assert_eq!(virtio.ino, canonical.inode);
-        assert_eq!(fuse.size, virtio.size);
-        assert_eq!(fuse.blocks, virtio.blocks);
-        assert_eq!(fuse.perm, (virtio.mode & 0o7777) as u16);
-        assert_eq!(fuse.uid, virtio.uid.into_inner());
-        assert_eq!(fuse.gid, virtio.gid.into_inner());
+        assert_eq!(canonical.size, virtio.size);
+        assert_eq!(canonical.blocks, virtio.blocks);
+        assert_eq!(canonical.perm, (virtio.mode & 0o7777) as u16);
+        assert_eq!(canonical.uid, virtio.uid.into_inner());
+        assert_eq!(canonical.gid, virtio.gid.into_inner());
         assert_eq!(virtio.mode & libc::S_IFMT, libc::S_IFREG);
     }
 
@@ -382,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn every_canonical_kind_has_both_protocol_encodings() {
+    fn every_canonical_kind_has_a_protocol_encoding() {
         let cases = [
             (NodeKind::NamedPipe, libc::S_IFIFO),
             (NodeKind::CharDevice, libc::S_IFCHR),
@@ -394,7 +357,6 @@ mod tests {
         ];
         for (kind, mode) in cases {
             assert_eq!(virtio_attr(attr(kind)).mode & libc::S_IFMT, mode);
-            assert_eq!(fuse_attr(attr(kind)).kind, fuse_kind(kind));
         }
     }
 

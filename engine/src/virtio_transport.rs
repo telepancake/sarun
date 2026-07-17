@@ -33,8 +33,7 @@ impl BoxExport {
         box_id: i64,
         socket: PathBuf,
     ) -> io::Result<Self> {
-        let scoped = fs.export_box(box_id)
-            .map_err(|error| io::Error::from_raw_os_error(i32::from(error)))?;
+        let scoped = fs.export_box(box_id)?;
         if let Some(parent) = socket.parent() {
             std::fs::create_dir_all(parent)?;
         }

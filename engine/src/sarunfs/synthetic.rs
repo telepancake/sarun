@@ -58,7 +58,6 @@ impl SyntheticNode {
             atime: std::time::UNIX_EPOCH,
             mtime: std::time::UNIX_EPOCH,
             ctime: std::time::UNIX_EPOCH,
-            crtime: std::time::UNIX_EPOCH,
             kind: if directory {
                 NodeKind::Directory
             } else {
@@ -304,15 +303,6 @@ impl SyntheticRuntime {
                 "jobserver reply channel closed",
             )),
         }
-    }
-
-    pub(crate) fn acquire_host_jobserver(
-        &self,
-        host_tgid: i32,
-        reply: Box<dyn crate::slippool::SlipReply>,
-        nonblocking: bool,
-    ) {
-        self.acquire_jobserver(host_tgid, reply, nonblocking, true);
     }
 
     pub(crate) fn acquire_host_jobserver_blocking(

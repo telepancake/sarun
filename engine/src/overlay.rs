@@ -35,25 +35,6 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use fuser::Errno;
-use fuser::FileHandle;
-use fuser::Filesystem;
-use fuser::FopenFlags;
-use fuser::Generation;
-use fuser::INodeNo;
-use fuser::LockOwner;
-use fuser::OpenFlags;
-use fuser::ReplyAttr;
-use fuser::ReplyCreate;
-use fuser::ReplyData;
-use fuser::ReplyDirectory;
-use fuser::ReplyDirectoryPlus;
-use fuser::ReplyEmpty;
-use fuser::ReplyEntry;
-use fuser::ReplyOpen;
-use fuser::ReplyWrite;
-use fuser::Request;
-use fuser::TimeOrNow;
 
 use crate::capture::BoxState;
 use crate::capture::Entry;
@@ -91,9 +72,41 @@ fn kind_of_mode(mode: u32) -> NodeKind {
 /// (box_id, rel) — "" rel is the box root; box_id 0 is the synthetic mount root.
 type Key = crate::sarunfs::NodeKey;
 
-/// Clone-able handle: fuser owns one clone as the mounted filesystem, the
-/// control plane holds another to add/remove boxes. All state is behind the
-/// shared Inner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Errno(i32);
+
+impl Errno {
+    const EACCES: Self = Self(libc::EACCES);
+    const EBADF: Self = Self(libc::EBADF);
+    const EEXIST: Self = Self(libc::EEXIST);
+    const EFBIG: Self = Self(libc::EFBIG);
+    const EINVAL: Self = Self(libc::EINVAL);
+    const EIO: Self = Self(libc::EIO);
+    const EISDIR: Self = Self(libc::EISDIR);
+    const ENODATA: Self = Self(libc::ENODATA);
+    const ENOENT: Self = Self(libc::ENOENT);
+    const ENOSYS: Self = Self(libc::ENOSYS);
+    const ENOTDIR: Self = Self(libc::ENOTDIR);
+    const ENOTEMPTY: Self = Self(libc::ENOTEMPTY);
+    const EPERM: Self = Self(libc::EPERM);
+    const EROFS: Self = Self(libc::EROFS);
+    const EXDEV: Self = Self(libc::EXDEV);
+}
+
+impl From<std::io::Error> for Errno {
+    fn from(error: std::io::Error) -> Self {
+        Self(error.raw_os_error().unwrap_or(libc::EIO))
+    }
+}
+
+impl From<Errno> for i32 {
+    fn from(error: Errno) -> Self {
+        error.0
+    }
+}
+
+/// Clone-able handle: each transport owns one clone as its filesystem, while
+/// the control plane holds another to add/remove boxes. All state is shared.
 #[derive(Clone)]
 pub struct SarunFs {
     inner: Arc<Inner>,
@@ -175,9 +188,6 @@ struct FhInner {
     last_tgid: u32,
     passthrough: bool, // writes go straight to the real host file (uncaptured)
     backing_candidate: bool,
-    // Kernel passthrough backing registration; kept alive as long as the fd
-    // (its Drop closes the registration). Only set for readonly-ruled reads.
-    _backing: Option<fuser::BackingId>,
 }
 
 #[derive(Clone)]
@@ -207,25 +217,6 @@ struct NodeSetattr {
     gid: Option<u32>,
     size: Option<u64>,
     mtime: Option<SystemTime>,
-}
-
-/// Bridges a deferred FUSE read reply into the slip pool. The pool calls exactly
-/// one of grant/deny_again, fulfilling the read that was blocked acquiring a slip
-/// (grant → one byte; deny_again → EAGAIN for an O_NONBLOCK caller, or when the
-/// waiting pid was reaped). `ReplyData` is `Send`, so the pool can hold it across
-/// threads and reply later from a release/reap.
-struct SlipReplyData(Option<fuser::ReplyData>);
-impl crate::slippool::SlipReply for SlipReplyData {
-    fn grant(mut self: Box<Self>) {
-        if let Some(r) = self.0.take() {
-            r.data(&[crate::slippool::SLIP]);
-        }
-    }
-    fn deny_again(mut self: Box<Self>) {
-        if let Some(r) = self.0.take() {
-            r.error(Errno::EAGAIN);
-        }
-    }
 }
 
 /// Thread-group id of `pid` from /proc/<pid>/status (so a thread's write is
@@ -479,8 +470,9 @@ impl SarunFs {
     /// A transport view whose protocol inode 1 is one live box's merged root.
     /// The view shares all filesystem policy, handles, capture state, and inode
     /// allocation with the host FUSE view; only the protocol root is scoped.
-    pub fn export_box(&self, box_id: i64) -> Result<Self, Errno> {
-        self.box_of(box_id).ok_or(Errno::ENOENT)?;
+    pub fn export_box(&self, box_id: i64) -> std::io::Result<Self> {
+        self.box_of(box_id)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
         Ok(Self {
             inner: self.inner.clone(),
             root: (box_id, String::new()),
@@ -1164,7 +1156,6 @@ impl SarunFs {
             atime: ts(md.atime(), md.atime_nsec()),
             mtime: ts(md.mtime(), md.mtime_nsec()),
             ctime: ts(md.ctime(), md.ctime_nsec()),
-            crtime: UNIX_EPOCH,
             kind: kind_of_mode(md.mode()),
             perm: (md.mode() & 0o7777) as u16,
             nlink: md.nlink() as u32,
@@ -1180,7 +1171,7 @@ impl SarunFs {
         NodeAttr {
             inode: ino, size: 0, blocks: 0,
             atime: ns_ts(mtime_ns), mtime: ns_ts(mtime_ns), ctime: ns_ts(mtime_ns),
-            crtime: UNIX_EPOCH, kind: NodeKind::Directory,
+            kind: NodeKind::Directory,
             perm: (mode & 0o7777) as u16, nlink: 2, uid: 0, gid: 0, rdev: 0,
             blksize: 512, flags: 0,
         }
@@ -1190,7 +1181,7 @@ impl SarunFs {
         NodeAttr {
             inode: ino, size: 0, blocks: 0,
             atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH, kind: NodeKind::RegularFile,
+            kind: NodeKind::RegularFile,
             perm: 0o666, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 512, flags: 0,
         }
     }
@@ -1199,7 +1190,7 @@ impl SarunFs {
         NodeAttr {
             inode: ino, size: len, blocks: 0,
             atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH, kind: NodeKind::Symlink,
+            kind: NodeKind::Symlink,
             perm: 0o777, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 512, flags: 0,
         }
     }
@@ -1484,7 +1475,6 @@ impl SarunFs {
                 last_tgid: 0,
                 passthrough: false,
                 backing_candidate: allow_backing,
-                _backing: None,
             });
             return Ok(OpenedNode {
                 handle,
@@ -1523,7 +1513,6 @@ impl SarunFs {
                 last_tgid: 0,
                 passthrough: false,
                 backing_candidate: false,
-                _backing: None,
             });
             return Ok(OpenedNode {
                 handle,
@@ -1554,7 +1543,6 @@ impl SarunFs {
                 last_tgid: 0,
                 passthrough: true,
                 backing_candidate: false,
-                _backing: None,
             });
             return Ok(OpenedNode {
                 handle,
@@ -1587,7 +1575,6 @@ impl SarunFs {
                 last_tgid: 0,
                 passthrough: false,
                 backing_candidate: false,
-                _backing: None,
             });
             return Ok(OpenedNode {
                 handle,
@@ -1664,7 +1651,6 @@ impl SarunFs {
             last_tgid: 0,
             passthrough: false,
             backing_candidate,
-            _backing: None,
         });
         Ok(OpenedNode {
             handle,
@@ -1726,7 +1712,6 @@ impl SarunFs {
                 last_tgid: 0,
                 passthrough: true,
                 backing_candidate: false,
-                _backing: None,
             });
             (attr, handle)
         } else {
@@ -1765,7 +1750,6 @@ impl SarunFs {
                 last_tgid: 0,
                 passthrough: false,
                 backing_candidate: false,
-                _backing: None,
             });
             (attr, handle)
         };
@@ -2201,25 +2185,6 @@ impl SarunFs {
         self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)
     }
 
-    fn read_file_node(
-        &self,
-        handle: u64,
-        buffer: &mut [u8],
-        offset: u64,
-    ) -> Result<usize, Errno> {
-        self.inner.daemon_reads.fetch_add(1, Ordering::Relaxed);
-        let handle = self.inner.handles.get(handle).ok_or(Errno::EBADF)?;
-        let Handle::File(handle) = &*handle else {
-            return Err(Errno::EBADF);
-        };
-        let handle = handle.lock().unwrap();
-        match &handle.inner.data {
-            FileData::Native(file) => file.read_at(buffer, offset).map_err(Errno::from),
-            FileData::Lower(lower) => lower.read_at(buffer, offset).map_err(Errno::from),
-            FileData::Sink(_) => Err(Errno::EBADF),
-        }
-    }
-
     fn jobserver_handle(&self, handle: u64) -> Option<(i64, bool)> {
         self.inner
             .handles
@@ -2315,12 +2280,6 @@ impl SarunFs {
             stream,
             data,
         );
-    }
-
-    fn release_host_jobserver_slip(&self, pid: u32) {
-        self.inner
-            .synthetic
-            .release_host_jobserver(tgid_of(pid) as i32);
     }
 
     fn release_node(&self, handle: u64) -> Result<(), Errno> {
@@ -2624,392 +2583,6 @@ impl SarunFs {
     }
 }
 
-impl Filesystem for SarunFs {
-    fn init(&mut self, _req: &Request,
-            config: &mut fuser::KernelConfig) -> std::io::Result<()> {
-        // Negotiate kernel FUSE_PASSTHROUGH (kernel 6.9+). WHICH opens use it is
-        // decided per-path by the `readonly` file rule — never automatically.
-        // set_max_stack_depth(2) is needed because backing files can live on a
-        // stacked fs (the container's overlayfs root). Never fail init over this.
-        let ok = config.add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH).is_ok()
-            && config.set_max_stack_depth(2).is_ok();
-        self.inner.passthrough_ok.store(ok, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match self.lookup_node(u64::from(parent), name) {
-            Ok(attr) => reply.entry(&TTL, &crate::sarunfs::fuse_attr(attr), Generation(0)),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.inner.inodes.forget(u64::from(ino), nlookup);
-    }
-
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>,
-               reply: ReplyAttr) {
-        match self.getattr_node(u64::from(ino)) {
-            Ok(attr) => reply.attr(&TTL, &crate::sarunfs::fuse_attr(attr)),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        match self.readlink_node(u64::from(ino)) {
-            Ok(data) => reply.data(&data),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let opened = match self.open_node(
-            req.pid(),
-            u64::from(ino),
-            flags.0 as u32,
-            self.inner.passthrough_ok.load(Ordering::Relaxed),
-        ) {
-            Ok(opened) => opened,
-            Err(error) => return reply.error(error),
-        };
-        let mut response_flags = FopenFlags::empty();
-        if opened.direct_io {
-            response_flags |= FopenFlags::FOPEN_DIRECT_IO;
-        }
-        if opened.nonseekable {
-            response_flags |= FopenFlags::FOPEN_NONSEEKABLE;
-        }
-        if opened.keep_cache {
-            response_flags |= FopenFlags::FOPEN_KEEP_CACHE;
-        }
-        if opened.backing_candidate {
-            if let Some(handle) = self.inner.handles.get(opened.handle) {
-                let Handle::File(handle) = &*handle else {
-                    return reply.error(Errno::EBADF);
-                };
-                let mut handle = handle.lock().unwrap();
-                if let FileData::Native(file) = &handle.inner.data {
-                    if let Ok(backing) = reply.open_backing(file) {
-                        reply.opened_passthrough(
-                            FileHandle(opened.handle),
-                            response_flags,
-                            &backing,
-                        );
-                        handle.inner._backing = Some(backing);
-                        return;
-                    }
-                }
-            }
-        }
-        reply.opened(FileHandle(opened.handle), response_flags);
-    }
-
-    fn create(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
-              _umask: u32, _flags: i32, reply: ReplyCreate) {
-        match self.create_node(req.pid(), u64::from(parent), name, mode) {
-            Ok((attr, opened)) => reply.created(
-                &TTL,
-                &crate::sarunfs::fuse_attr(attr),
-                Generation(0),
-                FileHandle(opened.handle),
-                FopenFlags::empty(),
-            ),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn read(&self, req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
-            size: u32, _flags: OpenFlags, _lo: Option<LockOwner>, reply: ReplyData) {
-        // Slip-pool acquire: a read on the JOBSERVER file claims one slip for the
-        // caller pid. If the pool is empty we DEFER the reply (block the read)
-        // until a release frees one — unless the handle is O_NONBLOCK, in which
-        // case the pool denies it with EAGAIN at once.
-        if let Some((_, nonblock)) = self.jobserver_handle(u64::from(fh)) {
-            // Key by the process (TGID), so acquire and release agree and the
-            // pidfd reaper can watch a real process. A thread's read maps to its
-            // owning process.
-            let pid = tgid_of(req.pid()) as i32;
-            let r = Box::new(SlipReplyData(Some(reply)));
-            self.inner
-                .synthetic
-                .acquire_host_jobserver(pid, r, nonblock);
-            return;
-        }
-        let mut buf = vec![0u8; size as usize];
-        match self.read_file_node(u64::from(fh), &mut buf, offset) {
-            Ok(n) => reply.data(&buf[..n]),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn write(&self, req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
-             data: &[u8], _wf: fuser::WriteFlags, _flags: OpenFlags,
-             _lo: Option<LockOwner>, reply: ReplyWrite) {
-        match self.prepare_write_node(req.pid(), u64::from(fh)) {
-            Ok(WriteTarget::Jobserver { .. }) => {
-                self.release_host_jobserver_slip(req.pid());
-                reply.written(data.len() as u32);
-            }
-            Ok(WriteTarget::Sink { box_id, stream }) => {
-                self.write_sink_node(req.pid(), box_id, stream, data);
-                reply.written(data.len() as u32);
-            }
-            Ok(WriteTarget::File { file, box_id, rel }) => {
-                match file.write_at(data, offset) {
-                    Ok(written) => {
-                        self.finish_file_write(box_id, rel);
-                        reply.written(written as u32);
-                    }
-                    Err(error) => reply.error(Errno::from(error)),
-                }
-            }
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
-               _flags: OpenFlags, _lo: Option<LockOwner>, _flush: bool,
-               reply: ReplyEmpty) {
-        match self.release_node(u64::from(fh)) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn setattr(&self, req: &Request, ino: INodeNo, mode: Option<u32>,
-               uid: Option<u32>, gid: Option<u32>, size: Option<u64>,
-               _atime: Option<TimeOrNow>, mtime: Option<TimeOrNow>,
-               _ctime: Option<SystemTime>, _fh: Option<FileHandle>,
-               _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>,
-               _bkuptime: Option<SystemTime>, _flags: Option<fuser::BsdFileFlags>,
-               reply: ReplyAttr) {
-        let mtime = mtime.map(|time| match time {
-            TimeOrNow::SpecificTime(time) => time,
-            TimeOrNow::Now => SystemTime::now(),
-        });
-        match self.setattr_node(
-            req.pid(),
-            u64::from(ino),
-            NodeSetattr { mode, uid, gid, size, mtime },
-        ) {
-            Ok(attr) => reply.attr(&TTL, &crate::sarunfs::fuse_attr(attr)),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
-             _umask: u32, reply: ReplyEntry) {
-        match self.mkdir_node(req.pid(), u64::from(parent), name, mode) {
-            Ok(attr) => reply.entry(&TTL, &crate::sarunfs::fuse_attr(attr), Generation(0)),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn symlink(&self, req: &Request, parent: INodeNo, link_name: &OsStr,
-               target: &Path, reply: ReplyEntry) {
-        match self.symlink_node(req.pid(), u64::from(parent), link_name, target) {
-            Ok(attr) => reply.entry(&TTL, &crate::sarunfs::fuse_attr(attr), Generation(0)),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn mknod(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32,
-             _umask: u32, rdev: u32, reply: ReplyEntry) {
-        match self.mknod_node(req.pid(), u64::from(parent), name, mode, rdev) {
-            Ok(attr) => reply.entry(&TTL, &crate::sarunfs::fuse_attr(attr), Generation(0)),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn link(&self, req: &Request, ino: INodeNo, newparent: INodeNo,
-            newname: &OsStr, reply: ReplyEntry) {
-        match self.link_node(req.pid(), u64::from(ino), u64::from(newparent), newname) {
-            Ok(attr) => reply.entry(&TTL, &crate::sarunfs::fuse_attr(attr), Generation(0)),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn fallocate(&self, req: &Request, _ino: INodeNo, fh: FileHandle,
-                 offset: u64, length: u64, mode: i32, reply: ReplyEmpty) {
-        match self.fallocate_node(req.pid(), u64::from(fh), mode as u32, offset, length) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn setxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, value: &[u8],
-                flags: i32, _position: u32, reply: ReplyEmpty) {
-        match self.set_xattr_node(u64::from(ino), name, value, flags as u32) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32,
-                reply: fuser::ReplyXattr) {
-        match self.get_xattr_node(u64::from(ino), name) {
-            Ok(val) => {
-                if size == 0 { reply.size(val.len() as u32); }
-                else if (size as usize) < val.len() { reply.error(Errno::ERANGE); }
-                else { reply.data(&val); }
-            }
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32,
-                 reply: fuser::ReplyXattr) {
-        match self.list_xattr_node(u64::from(ino)) {
-            Ok(buffer) if size == 0 => reply.size(buffer.len() as u32),
-            Ok(buffer) if (size as usize) < buffer.len() => reply.error(Errno::ERANGE),
-            Ok(buffer) => reply.data(&buffer),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr,
-                   reply: ReplyEmpty) {
-        match self.remove_xattr_node(u64::from(ino), name) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr,
-              reply: ReplyEmpty) {
-        match self.unlink_node(req.pid(), u64::from(parent), name) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr,
-             reply: ReplyEmpty) {
-        match self.rmdir_node(req.pid(), u64::from(parent), name) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    // Safe no-op/durability ops real programs call — ENOSYS here (the fuser
-    // default) makes fsync()/access() fail spuriously. Backing fds are real
-    // files, so an fsync on them is genuine; flush/access just succeed.
-    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
-             _lock_owner: LockOwner, reply: ReplyEmpty) {
-        match self.sync_file_node(u64::from(fh), false) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool,
-             reply: ReplyEmpty) {
-        match self.sync_file_node(u64::from(fh), _datasync) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle,
-                _datasync: bool, reply: ReplyEmpty) {
-        reply.ok();
-    }
-
-    fn access(&self, _req: &Request, _ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
-        match self.getattr_node(u64::from(_ino)) {
-            Ok(_) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
-        match self.statfs_node() {
-            Ok(stat) => reply.statfs(
-                stat.f_blocks,
-                stat.f_bfree,
-                stat.f_bavail,
-                stat.f_files,
-                stat.f_ffree,
-                stat.f_bsize as u32,
-                stat.f_namemax as u32,
-                stat.f_frsize as u32,
-            ),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn rename(&self, req: &Request, parent: INodeNo, name: &OsStr,
-              newparent: INodeNo, newname: &OsStr, flags: fuser::RenameFlags,
-              reply: ReplyEmpty) {
-        match self.rename_node(
-            req.pid(),
-            u64::from(parent),
-            name,
-            u64::from(newparent),
-            newname,
-            flags.bits(),
-        ) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.open_directory(u64::from(ino)) {
-            Ok(handle) => reply.opened(FileHandle(handle), FopenFlags::empty()),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn readdir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64,
-               mut reply: ReplyDirectory) {
-        let entries = match self.read_directory(u64::from(fh), offset) {
-            Ok(entries) => entries,
-            Err(error) => return reply.error(error),
-        };
-        for (index, entry) in entries.into_iter().enumerate() {
-            let next = offset.saturating_add(index as u64).saturating_add(1);
-            if reply.add(
-                INodeNo(entry.inode),
-                next,
-                crate::sarunfs::fuse_kind(entry.kind),
-                entry.name,
-            ) {
-                break;
-            }
-        }
-        reply.ok();
-    }
-
-    fn readdirplus(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
-                   offset: u64, mut reply: ReplyDirectoryPlus) {
-        let entries = match self.read_directory(u64::from(fh), offset) {
-            Ok(entries) => entries,
-            Err(error) => return reply.error(error),
-        };
-        for (index, entry) in entries.into_iter().enumerate() {
-            let Ok(attr) = self.getattr_node(entry.inode) else { continue };
-            let attr = crate::sarunfs::fuse_attr(attr);
-            let next = offset.saturating_add(index as u64).saturating_add(1);
-            if reply.add(INodeNo(entry.inode), next, entry.name, &TTL, &attr,
-                         Generation(0)) {
-                break;
-            }
-            self.inner.inodes.acquire(entry.inode, 1);
-        }
-        reply.ok();
-    }
-
-    fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle,
-                  _flags: OpenFlags, reply: ReplyEmpty) {
-        match self.close_directory(u64::from(fh)) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
-        }
-    }
-}
-
 fn virtio_error(error: Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(i32::from(error))
 }
@@ -3025,9 +2598,8 @@ fn staging_file() -> std::io::Result<File> {
     }
 }
 
-/// Canonical filesystem protocol implementation.  vhost-user-fs and the
-/// forthcoming SUD ring call this trait directly; the legacy fuser callbacks
-/// above are now an adapter over the same policy operations.
+/// Canonical filesystem protocol implementation. Raw kernel FUSE,
+/// vhost-user-fs, and the SUD ring all enter through this one implementation.
 impl virtiofsd::filesystem::FileSystem for SarunFs {
     type Inode = u64;
     type Handle = u64;
