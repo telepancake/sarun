@@ -440,6 +440,18 @@ fn find_control_port() -> io::Result<PathBuf> {
     }
 }
 
+fn write_guest_outcome<W: io::Write>(stream: &mut W, outcome: io::Result<i32>) -> io::Result<i32> {
+    let code = match outcome {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("sarun init: {error}");
+            127
+        }
+    };
+    crate::socket_wire::write_versioned(stream, &ApplianceResult { code })?;
+    Ok(code)
+}
+
 /// PID-1 entry. Called before Prolog or ordinary CLI initialization.
 pub fn init_main() -> i32 {
     if let Err(error) = mount_one("devtmpfs", "/dev", "devtmpfs", 0) {
@@ -465,14 +477,15 @@ pub fn init_main() -> i32 {
             .write(true)
             .open(&port)?;
         let command: ApplianceCommand = crate::socket_wire::read_versioned(&mut stream)?;
-        crate::net::tap::configure_appliance_network(command.net_mode)
-            .map_err(|error| io::Error::other(format!("configure network: {error}")))?;
-        let code = execute_guest(&command)?;
+        let guest_outcome = crate::net::tap::configure_appliance_network(command.net_mode)
+            .map_err(|error| io::Error::other(format!("configure network: {error}")))
+            .and_then(|()| execute_guest(&command));
         // The result is the host's safe-to-stop boundary: publish it only
-        // after dirty guest pages have reached the shared filesystem.
+        // after dirty guest pages have reached the shared filesystem. Exec
+        // and network failures are results too: the host must never wait for
+        // a control reply that PID 1 has already decided it cannot produce.
         unsafe { libc::sync() };
-        crate::socket_wire::write_versioned(&mut stream, &ApplianceResult { code })?;
-        Ok(code)
+        write_guest_outcome(&mut stream, guest_outcome)
     })();
     let code = match outcome {
         Ok(code) => code,
@@ -481,13 +494,35 @@ pub fn init_main() -> i32 {
             127
         }
     };
-    unsafe { libc::reboot(libc::RB_POWER_OFF) };
+    // ACPI-free x86 microvm has no power-off device. Its `reboot=t` command
+    // line turns RB_AUTOBOOT into a triple-fault reset, and QEMU's
+    // `-no-reboot` makes that reset exit. Aarch64 has a real power-off path.
+    let shutdown = if cfg!(target_arch = "x86_64") {
+        libc::RB_AUTOBOOT
+    } else {
+        libc::RB_POWER_OFF
+    };
+    unsafe { libc::reboot(shutdown) };
     code
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_exec_failure_is_a_versioned_result_not_a_missing_reply() {
+        let mut encoded = Vec::new();
+        let code = write_guest_outcome(
+            &mut encoded,
+            Err(io::Error::from_raw_os_error(libc::ENOEXEC)),
+        )
+        .unwrap();
+        assert_eq!(code, 127);
+        let mut cursor = io::Cursor::new(encoded);
+        let result: ApplianceResult = crate::socket_wire::read_versioned(&mut cursor).unwrap();
+        assert_eq!(result.code, 127);
+    }
 
     #[test]
     fn qemu_arguments_keep_architecture_specific_devices_at_the_edge() {

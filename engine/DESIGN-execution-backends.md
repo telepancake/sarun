@@ -181,6 +181,10 @@ as executable mappings and mmap that genuinely need a host fd.
         its architecture and virtio-fs socket never acquire a JSON form.
   - [x] Launch the paired QEMU appliance and implement the guest `/init`
         control endpoint.
+  - [x] Treat guest setup/exec failure as a versioned control result rather
+        than a missing reply. PID 1 reports exit 127 after syncing dirty pages;
+        the ACPI-free x86 appliance uses its configured triple-fault reboot so
+        QEMU exits deterministically under `-no-reboot`.
 - [x] Connect off/host/tap networking with the intended policy boundaries.
   - [x] For `tap`, carry one Ethernet frame per datagram between virtio-net and
         the existing per-box smoltcp stack; keep QEMU out of Prolog and out of
@@ -198,6 +202,9 @@ as executable mappings and mmap that genuinely need a host fd.
       non-zero exit propagation, captured filesystem writes, and no host write.
 - [x] Boot x86_64 under TCG on the aarch64 host and execute the projected
       x86_64 `/init` through the same binary control and SarunFs transport.
+      Revalidated after the SUD deletion with target `/init brush`, exact
+      captured bytes, and an architecture-mismatched exec returning 127 in
+      three seconds instead of hanging until the host timeout.
 - [ ] Pass the full appliance suite on aarch64 TCG here, then aarch64 KVM where
       available, then x86_64 TCG/KVM.
 
