@@ -235,8 +235,9 @@ as executable mappings and mmap that genuinely need a host fd.
       same-name rerun begins. The engine drops its temporary SCM_RIGHTS source
       fd before joining virtiofsd, so frontend EOF cannot be self-retained.
 - [x] Gate exact exit 37, signalled exit 143, versioned exec failure 127,
-      environment/cwd transfer, off/host/tap device topology, same-name stateful
-      rerun, and host non-escape on the current aarch64 TCG appliance.
+      environment/cwd transfer, off isolation, host-mode HTTP to a local
+      fixture, tap-mode synthetic DNS through smoltcp, same-name stateful rerun,
+      and host non-escape on the current aarch64 TCG appliance.
 - [x] Carry the existing registration `brush` value through QEMU instead of
       hardcoding it false. Target `/init brush-sh` now runs the ordinary parser,
       and the shared SarunFs shadow projection runs embedded Kati and n2 in a

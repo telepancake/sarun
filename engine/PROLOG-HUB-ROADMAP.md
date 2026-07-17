@@ -741,9 +741,11 @@ belong to the relation.
       parent edge, child capture, exit/output, and host isolation.
 - [x] Make QEMU completion a lifecycle barrier and cover exact nonzero/signal/
       exec-failure results, binary environment/cwd control, all three network
-      device modes, and immediate same-name stateful rerun on aarch64 TCG. The
-      runner now returns only after engine transport teardown, rather than
-      racing a subsequent invocation against stale live-box state.
+      modes (including local HTTP through QEMU user networking and synthetic
+      DNS packets through the tap/smoltcp path), and immediate same-name
+      stateful rerun on aarch64 TCG. The runner now returns only after engine
+      transport teardown, rather than racing a subsequent invocation against
+      stale live-box state.
 - [ ] Copy third-party license notices beside every normal release artifact.
 
 ### 2. Generic typed FFI — NEXT

@@ -9,6 +9,7 @@ wrapper cannot run on an aarch64 kernel.
 """
 
 import os
+import http.server
 import signal
 import shutil
 import socket
@@ -16,6 +17,7 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -455,6 +457,21 @@ def run_qemu_lifecycle():
         "slopbox_qemu_lifecycle", str(LIBTESTSARUN)
     ).load_module()
     module.ensure_dirs()
+    class LocalHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"QEMU-HOST-NETWORK"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    local_server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), LocalHandler)
+    local_server_thread = threading.Thread(target=local_server.serve_forever, daemon=True)
+    local_server_thread.start()
+    local_port = local_server.server_address[1]
     engine = subprocess.Popen(
         [str(ENGINE_BIN), "serve"], env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -481,10 +498,15 @@ def run_qemu_lifecycle():
             "LIFE-NET-OFF", ["sh", "-c", "test ! -e /sys/class/net/eth0"], "off"
         )
         network_host = run_case(
-            "LIFE-NET-HOST", ["sh", "-c", "test -e /sys/class/net/eth0"], "host"
+            "LIFE-NET-HOST",
+            ["sh", "-c", "test -e /sys/class/net/eth0; "
+             f"curl -fsS --max-time 10 http://10.0.2.2:{local_port}/ > host-http"],
+            "host",
         )
         network_tap = run_case(
-            "LIFE-NET-TAP", ["sh", "-c", "test -e /sys/class/net/eth0"], "tap"
+            "LIFE-NET-TAP",
+            ["sh", "-c", "test -e /sys/class/net/eth0; getent hosts lifecycle.invalid > tap-dns"],
+            "tap",
         )
         rerun_first = run_case(
             "LIFE-RERUN", ["sh", "-c", "printf first > rerun-first"]
@@ -518,6 +540,12 @@ def run_qemu_lifecycle():
                 network_host.returncode,
                 network_tap.returncode,
             ),
+            "tap_dns": module.sqlar_content(
+                named["LIFE-NET-TAP"], prefix + "tap-dns"
+            ),
+            "host_http": module.sqlar_content(
+                named["LIFE-NET-HOST"], prefix + "host-http"
+            ),
             "rerun_exits": (rerun_first.returncode, rerun_second.returncode),
             "rerun_unique": len(rerun_archives) == 1,
             "rerun_first": None if rerun_archive is None else module.sqlar_content(
@@ -529,6 +557,9 @@ def run_qemu_lifecycle():
             "host_unchanged": not any(work.iterdir()),
         }
     finally:
+        local_server.shutdown()
+        local_server.server_close()
+        local_server_thread.join(timeout=5)
         engine.terminate()
         try:
             engine.wait(timeout=10)
@@ -625,8 +656,10 @@ def main():
             check(lifecycle["environment_exit"] == 0
                   and lifecycle["environment"] == lifecycle["expected_environment"],
                   "qemu lifecycle: environment and cwd crossed binary control")
-            check(lifecycle["network"] == (0, 0, 0),
-                  "qemu lifecycle: off/host/tap device topology is exact")
+            check(lifecycle["network"] == (0, 0, 0)
+                  and lifecycle["host_http"] == b"QEMU-HOST-NETWORK"
+                  and b"lifecycle.invalid" in lifecycle["tap_dns"],
+                  "qemu lifecycle: off/host/tap network paths work")
             check(lifecycle["rerun_exits"] == (0, 0)
                   and lifecycle["rerun_unique"]
                   and lifecycle["rerun_first"] == b"first"
