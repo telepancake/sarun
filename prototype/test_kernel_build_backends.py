@@ -19,6 +19,7 @@ Run from the repository root:
 """
 
 import argparse
+from decimal import Decimal
 import hashlib
 import json
 import os
@@ -44,12 +45,12 @@ ARCH_CONFIG = REPO_ROOT / "engine/appliance/kernel-aarch64.config"
 CLANG_PROBE = r'''#!/bin/sh
 set -u
 state=${SARUN_CLANG_PROBE_STATE:?}
-started=$(date +%s%N)
+IFS=' ' read -r started _ < /proc/uptime
 trace="$state/trace.$$.$started"
 printf '%s\n' "$started" > "$trace"
 /usr/bin/clang-21 "$@"
 status=$?
-ended=$(date +%s%N)
+IFS=' ' read -r ended _ < /proc/uptime
 printf '%s\n' "$ended" >> "$trace"
 exit "$status"
 '''
@@ -153,8 +154,10 @@ def compiler_overlap(module, sqlar, prefix):
         if content is None:
             continue
         try:
-            started, ended = (int(value) for value in content.splitlines())
-        except (TypeError, ValueError):
+            started, ended = (
+                Decimal(value.decode("ascii")) for value in content.splitlines()
+            )
+        except (AttributeError, TypeError, ValueError):
             continue
         if ended >= started:
             intervals.append((started, ended))
