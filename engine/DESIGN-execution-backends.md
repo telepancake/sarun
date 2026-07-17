@@ -255,6 +255,14 @@ as executable mappings and mmap that genuinely need a host fd.
 - [ ] Record comparable filesystem benchmarks.  Do not delete a displaced
       backend until its replacement meets or beats its benchmark geometric
       mean.
+  - [x] Add `make bench-backends`, with timing taken inside each box so boot is
+        excluded and with host non-escape checked. Three aarch64-host median
+        rounds (2026-07-17) measured: FUSE 90 ms sequential / 6010 ms metadata
+        / 4290 ms parallel; aarch64 QEMU under TCG 290 / 27870 / 33620 ms,
+        respectively, for a 4.89x geometric ratio to FUSE. This is explicitly
+        a TCG result, not KVM. Native SUD and KVM measurements remain open; the
+        already-deleted historical SUD filesystem cannot be validly benchmarked
+        on this non-x86 Syscall User Dispatch host.
 - [ ] Remove backend-specific semantic branches and obsolete compatibility
       code; update generated help and user documentation.
 

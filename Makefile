@@ -158,6 +158,11 @@ test-backends: ## Portable live SarunFs equivalence (FUSE, host QEMU, and native
 	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_backend_equiv_rs.py
 
+.PHONY: bench-backends
+bench-backends: ## Compare live backend filesystem workloads (set SARUN_BENCH_ROUNDS=N)
+	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	  python benchmark_backends.py
+
 # ---- Housekeeping ---------------------------------------------------------
 
 .PHONY: clean
