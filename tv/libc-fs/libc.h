@@ -186,7 +186,7 @@
 #endif
 
 /* ----------------------------------------------------------------
- * Path-bearing syscalls used by sud/path_remap and sud/handler.
+ * Path-bearing syscalls used by the SUD handler and SarunFs adapter.
  * Every consumer should rely on these aliases instead of defining
  * its own local `#ifndef SYS_xxx` fallback — one source of truth.
  * Each is conditional so we silently skip on architectures that
@@ -369,11 +369,8 @@
 #endif
 
 /* ----------------------------------------------------------------
- * In-RAM filesystem add-in needs futex (cross-process locking),
- * memfd_create (process-local fd cookies for inramfs handles), and
- * ftruncate (resize the shared shm segment on first attach).  These
- * are useful enough on their own to deserve canonical aliases here
- * rather than being redefined in addin code.
+ * Shared-ring and virtual-fd plumbing needs futex, memfd_create, and
+ * ftruncate. Keep their syscall aliases in one place.
  * ---------------------------------------------------------------- */
 #if !defined(SYS_futex) && defined(__NR_futex)
 #define SYS_futex          __NR_futex
@@ -653,7 +650,7 @@ typedef struct ucontext_t {
 #define ERANGE          34
 #endif
 
-/* Futex op codes used by inramfs's cross-process locks. */
+/* Futex op codes used by cross-process shared state. */
 #ifndef FUTEX_WAIT
 #define FUTEX_WAIT          0
 #endif
@@ -663,12 +660,7 @@ typedef struct ucontext_t {
 #ifndef FUTEX_PRIVATE_FLAG
 #define FUTEX_PRIVATE_FLAG  128
 #endif
-/* inramfs uses *non*-private futexes because the futex word lives in
- * a MAP_SHARED region accessed by multiple processes; FUTEX_PRIVATE_FLAG
- * is only valid for single-process use. */
-
-/* memfd_create flags (used by inramfs to allocate process-local fd
- * cookies that the kernel recognises for close/dup/poll). */
+/* memfd_create flags used by the SUD shared ring and virtual descriptors. */
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC         0x0001
 #endif
@@ -712,11 +704,8 @@ extern int g_errno_value;
 #define O_NOFOLLOW      0400000
 #define O_CLOEXEC       02000000
 #define O_TMPFILE       020200000
-/* O_LARGEFILE: on 32-bit the kernel refuses open()/openat() of a file
- * whose size exceeds 2 GiB unless this flag is set (EOVERFLOW). It is a
- * no-op on x86_64 (the kernel treats every open as large). Required so a
- * sud32 process can attach the multi-GiB inramfs small-file shm that a
- * sud64 process created. */
+/* O_LARGEFILE is required by 32-bit open/openat for files over 2 GiB and is
+ * a no-op on x86_64. */
 #if defined(__i386__)
 #define O_LARGEFILE     0100000
 #else
@@ -744,7 +733,7 @@ extern int g_errno_value;
 #define S_IFLNK 0120000
 #define S_IFSOCK 0140000
 
-/* Permission and special-mode bits used by inramfs's mode handling. */
+/* Permission and special-mode bits. */
 #ifndef S_ISUID
 #define S_ISUID  04000
 #endif
@@ -785,7 +774,7 @@ extern int g_errno_value;
 #define DT_SOCK   12
 #endif
 
-/* AT_* additions used by inramfs (utimensat, etc.) */
+/* utimensat timestamp sentinels. */
 #ifndef UTIME_NOW
 #define UTIME_NOW   ((1L << 30) - 1L)
 #endif
@@ -911,10 +900,7 @@ struct linux_dirent64 {
 #define MAP_ANONYMOUS   0x20
 #define MAP_FAILED      ((void *)-1)
 
-/* Newer mmap flags used by the inramfs add-in to claim its high-
- * address region without trampling an existing mapping.  May be
- * absent on very old kernels; if so, addin code falls back to plain
- * MAP_FIXED.  Numeric value matches Linux UAPI. */
+/* Newer mmap flag; numeric value matches Linux UAPI. */
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif

@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """Concurrent filesystem-semantics validation for the sud backend.
 
-Until now NOTHING validated `--sud` overlay/inramfs semantics under PARALLEL
-access — the equivalence test is single-threaded, the C overlay tests are
-single-threaded, and the one "concurrent" test is FUSE-only single-file
-read+write. But the real workload — `make -jN` under `-b` — runs recipe threads
-IN ONE PROCESS, all taking SIGSYS concurrently and hammering the SAME overlay
-state (the per-process synth merged-directory machinery, the fd/dirfd maps, the
-shared inramfs /tmp). This test drives that model with CONTENTION on a shared
-directory and asserts the invariants a filesystem must keep:
+The real workload — `make -jN` under `-b` — runs recipe threads in one process,
+all taking SIGSYS concurrently and hammering the same SarunFs transport state.
+This test drives that model with contention on shared directories and asserts
+the invariants a filesystem must keep:
 
   - a file written then read back has exactly the bytes written (no torn /
     stale / empty reads under a racing copy-up or synth rebuild),
@@ -36,7 +32,7 @@ CRATE = _HERE.parent / "engine"
 BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
 TV = _HERE.parent / "tv"
 SUD64 = TV / "sud64"
-TMPBASE = "/var/tmp"   # box /tmp is inramfs; keep engine state off /tmp
+TMPBASE = "/var/tmp"
 
 _fails = []
 def check(cond, msg):
@@ -57,7 +53,7 @@ def wait_socket(sock, timeout=10.0):
 
 
 # Single-process POSIX fs-semantics matrix (run inside the box, self-checking).
-# These are the dimensions a userland overlay re-implements and can get wrong:
+# These are filesystem dimensions a syscall transport can get wrong:
 # truncate grow/shrink, sparse holes, mtime ordering, mode bits, rename-over
 # atomicity, UNLINKED-FILE-HELD-BY-FD (read+write survive the unlink), O_APPEND,
 # readdir-sees-create, mid-file seek/overwrite. Prints one PASS/FAIL per probe.
@@ -113,12 +109,10 @@ cnt=$(ls x | grep -c '^f'); [ "$cnt" = 300 ] || echo "FINAL-COUNT $cnt" >> error
 if [ -s errors ]; then echo "VIS-ERRORS"; sort errors | uniq -c | head; else echo VIS-ALLOK; fi
 '''
 
-# The box's /tmp is a SEPARATE hand-rolled in-memory fs (inramfs), and the rest
-# is the copy-on-write overlay — different code, different bugs. This exercises
-# inramfs semantics directly AND the overlay<->inramfs boundary (rename/cp both
-# directions), plus inramfs under 6-reader concurrency. Builds live in /tmp
-# (TMPDIR / configure / compilers), so this path is not optional.
-INRAMFS_WORKLOAD = r'''
+# Repeat the semantics and contention probes under /tmp, including rename/copy
+# between /tmp and /root. Builds make heavy use of TMPDIR, so this path must use
+# the same correct shared filesystem semantics as the rest of the tree.
+TMP_WORKLOAD = r'''
 set -u
 P(){ echo "PASS $1"; }
 F(){ echo "FAIL $1 :: $2"; }
@@ -142,7 +136,7 @@ wait
 for i in $(seq 1 300); do [ -r cc/f$i ] || echo "MISSING cc/f$i">>errors; done
 c=$(ls cc|grep -c '^f'); [ "$c" = 300 ]||echo "COUNT $c">>errors
 [ -s errors ] && { echo "IR-CONC-FAIL"; sort errors|uniq -c|head; } || echo IR-CONC-ALLOK
-echo INRAMFS-DONE
+echo TMP-DONE
 '''
 
 # --- workloads (run inside the box, self-checking) ------------------------
@@ -252,20 +246,19 @@ def main():
               f"semantics workload ran to completion "
               f"(out={r.stdout.strip()[-200:]!r})")
 
-        # inramfs (/tmp) semantics + overlay<->inramfs boundary + inramfs
-        # concurrency — a distinct code path from the overlay above.
+        # /tmp semantics, cross-directory operations, and concurrency.
         fresh()
-        r = box.run("IR", INRAMFS_WORKLOAD)
+        r = box.run("TMP", TMP_WORKLOAD)
         for line in r.stdout.splitlines():
             if line.startswith("PASS "):
-                check(True, "inramfs: " + line[5:])
+                check(True, "tmp: " + line[5:])
             elif line.startswith("FAIL "):
-                check(False, "inramfs: " + line[5:])
+                check(False, "tmp: " + line[5:])
         check("IR-CONC-ALLOK" in r.stdout,
-              f"inramfs concurrent visibility (6 readers, 300 files in /tmp) "
+              f"/tmp concurrent visibility (6 readers, 300 files) "
               f"(out={r.stdout.strip()[-160:]!r})")
-        check("INRAMFS-DONE" in r.stdout,
-              f"inramfs workload ran to completion "
+        check("TMP-DONE" in r.stdout,
+              f"/tmp workload ran to completion "
               f"(out={r.stdout.strip()[-160:]!r})")
 
         # Concurrency — a race that fires 1-in-K only shows with repetition.

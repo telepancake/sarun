@@ -173,7 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_webcap_url ON webcap(url);
 -- sud TRACE stream (engine/DESIGN-sud.md step 2): the raw wire-format event
 -- stream a sud box's tracer emitted (EXEC/ARGV/ENV/OPEN/CWD/STDOUT/STDERR/EXIT),
 -- teed live to live/<id>/sud.trace and folded into the box's durable record by
--- the post-exit sweep. Single-row (one blob per box): set_sudtrace deletes then
+-- SUD trace finalization. Single-row (one blob per box): set_sudtrace deletes then
 -- inserts so a rerun overwrites. Decoded on demand by the `sudtrace` control
 -- verb (crate::sudwire::Decoder). Absent for FUSE boxes — only sud boxes ever
 -- populate it, which is what gates the UI's Trace chip.

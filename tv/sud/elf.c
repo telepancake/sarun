@@ -13,17 +13,7 @@
 #include "sud/state.h"
 #include "sud/elf.h"
 #include "sud/runtime_config.h"
-#ifdef SUD_ADDIN_FS
 #include "sud/fs/vfs.h"
-#endif
-#ifdef SUD_ADDIN_INRAMFS
-#include "sud/inramfs/inramfs.h"
-#include "sud/inramfs/path_ops.h"
-#include "sud/path_remap/path.h"
-#endif
-#ifdef SUD_ADDIN_PATH_REMAP
-#include "sud/path_remap/overlay.h"
-#endif
 
 /* ELF ident helpers not provided by our minimal libc.h */
 #ifndef SELFMAG
@@ -37,41 +27,11 @@
 #endif
 
 /* ================================================================
- * inramfs-aware low-level file helpers
- *
- * The traced program may execve() a binary that lives under the
- * inramfs mount.  Under sud, the kernel only ever directly execs
- * sud32/sud64 — handler.c's build_exec_argv() rewrites the argv to
- * prepend the loader.  But to do that rewriting it must first
- * inspect the target binary (resolve_path checks executability,
- * check_shebang reads the first two bytes, check_elf_dynamic reads
- * the ELF header + PT_INTERP).  Those inspections were issued via
- * raw_open / raw_pread / raw_access, which go straight to the
- * kernel.  The kernel doesn't know about inramfs paths, so
- * raw_access returns -ENOENT and resolve_path answers 0; the rest
- * of the pipeline then falls through and the kernel ends up trying
- * to exec an inramfs path it can't see.
- *
- * Fix: route the read-only inspection ops through the inramfs addin
- * for paths under the mount.  The inramfs ops are signal-safe (they
- * use only raw syscalls themselves) and return -errno values in the
- * kernel-syscall convention.  When inramfs is not built in, not
- * active, or the path is not under the mount, we transparently fall
- * back to the raw kernel syscalls — this is exactly the same
- * dispatch policy the addin runs at the syscall layer.
- *
- * The fd handed back by ir_open_ro() is registered in inramfs's own
- * fd table; ir_pread() / ir_close() must be paired with it.  We
- * carry the (fd-is-inramfs?) bit out-of-band so callers don't have
- * to know.  ================================================================ */
-
-#ifdef SUD_ADDIN_FS
+ * SarunFs-backed low-level file helpers
+ * ================================================================ */
 
 static int ir_open_ro(const char *path)
 {
-    /* An execveat(AT_EMPTY_PATH) target is exported as a real descriptor
-     * inherited by the replacement wrapper. Its /proc/self/fd spelling is
-     * process-local and must bypass SarunFs pathname resolution. */
     if (sud_vfs_is_kernel_path(AT_FDCWD, path))
         return raw_open(path, O_RDONLY);
     int remote = sud_vfs_openat(AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0, 0);
@@ -109,81 +69,8 @@ static int ir_access(const char *path, int mode)
     return sud_vfs_accessat(AT_FDCWD, path, (unsigned int)mode);
 }
 
-#elif defined(SUD_ADDIN_INRAMFS)
-
-static int ir_path_is_inramfs(const char *path)
-{
-    return path && path[0] == '/'
-        && sud_inramfs_active()
-        && sud_pr_inramfs_path_under_mount(path);
-}
-
-/* Mark inramfs-owned fds with this bit so we can dispatch close
- * and pread without consulting the inramfs fd table on every call.
- * The kernel will never hand us an fd this large; the inramfs fd
- * table caps at SUD_IR_FD_TABLE_SIZE (1024). */
-#define IR_FD_TAG  0x40000000
-
-static int ir_open_ro(const char *path)
-{
-    if (ir_path_is_inramfs(path)) {
-        long r = sud_inramfs_op_open(path, O_RDONLY, 0);
-        if (r < 0) return -1;
-        return (int)r | IR_FD_TAG;
-    }
-    return raw_open(path, O_RDONLY);
-}
-
-static ssize_t ir_pread(int fd, void *buf, size_t n, off_t off)
-{
-    if (fd & IR_FD_TAG) {
-        long r = sud_inramfs_op_pread(fd & ~IR_FD_TAG, buf, n, off);
-        return (r < 0) ? -1 : (ssize_t)r;
-    }
-    return raw_pread(fd, buf, n, off);
-}
-
-static ssize_t ir_read(int fd, void *buf, size_t n)
-{
-    if (fd & IR_FD_TAG) {
-        long r = sud_inramfs_op_read(fd & ~IR_FD_TAG, buf, n);
-        return (r < 0) ? -1 : (ssize_t)r;
-    }
-    return raw_read(fd, buf, n);
-}
-
-static int ir_close(int fd)
-{
-    if (fd & IR_FD_TAG)
-        return (int)sud_inramfs_op_close(fd & ~IR_FD_TAG);
-    return raw_close(fd);
-}
-
-static int ir_access(const char *path, int mode)
-{
-    if (ir_path_is_inramfs(path)) {
-        long r = sud_inramfs_op_access(path, mode);
-        return (r < 0) ? -1 : 0;
-    }
-    return raw_access(path, mode);
-}
-
-#else  /* neither shared FS nor inramfs */
-
-static inline int     ir_open_ro(const char *p)
-                        { return raw_open(p, O_RDONLY); }
-static inline ssize_t ir_pread(int fd, void *b, size_t n, off_t o)
-                        { return raw_pread(fd, b, n, o); }
-static inline ssize_t ir_read (int fd, void *b, size_t n)
-                        { return raw_read (fd, b, n); }
-static inline int     ir_close(int fd)              { return raw_close(fd); }
-static inline int     ir_access(const char *p, int m)
-                        { return raw_access(p, m); }
-
-#endif
-
 /* ================================================================
- * Shebang / ELF inspection
+* Shebang / ELF inspection
  * ================================================================ */
 
 int check_shebang(const char *path, char *interp, int interp_sz,
@@ -323,108 +210,14 @@ int resolve_path(const char *cmd, char *out, int out_sz)
         if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
         memcpy(out, cmd, clen);
         out[clen] = '\0';
-#ifdef SUD_ADDIN_INRAMFS
-        /* An absolute path UNDER THE INRAMFS MOUNT is served by the inode
-         * store, not the kernel or any overlay upper — do NOT run the
-         * overlay resolver on it (that would rewrite e.g. /tmp/prog into a
-         * nonexistent overlay upper path when an `overlay:/` rule is also
-         * configured, ir_access would fail, build_exec_argv would bail, and
-         * the kernel would get an uninstrumented execve of an inramfs path
-         * it cannot see → ENOENT).  The inramfs exec path (ir_access here +
-         * the loader's memfd re-adoption) handles it directly.  This mirrors
-         * the relative-path inramfs arm below. */
-        if (ir_path_is_inramfs(out))
-            return (ir_access(out, X_OK) == 0);
-#endif
-#ifdef SUD_ADDIN_PATH_REMAP
-        /* Apply --remap / --overlay rules before checking accessibility:
-         * the wrapper has to load the *real* binary off disk (the kernel
-         * will then exec it with /proc/self/exe pointing at the real
-         * path, and the SIGSYS layer rewrites future syscall args back
-         * onto the virtual layout).  Without this, a script whose
-         * shebang names an interpreter under a remapped prefix
-         * (e.g. `#!/usr/bin/python3` with --remap /usr/bin=/host/usr/bin)
-         * fails here with "sud: cannot find …" because the literal
-         * virtual path doesn't exist on disk. */
-        char rewritten[PATH_MAX];
-        int rc = sud_overlay_resolve(out, 0, rewritten, sizeof(rewritten));
-        if (rc == SUD_OVERLAY_RESOLVED) {
-            size_t rlen = strlen(rewritten);
-            if (rlen >= (size_t)out_sz) rlen = (size_t)out_sz - 1;
-            memcpy(out, rewritten, rlen);
-            out[rlen] = '\0';
-        }
-#endif
         return (ir_access(out, X_OK) == 0);
     }
 
-    /* Path containing a slash (./foo, ../foo, foo/bar) — POSIX execvp
-     * treats these as relative-to-cwd, no PATH search.  If the
-     * inramfs addin has a logical cwd inside the mount, absolutise
-     * via that; build_exec_argv then sees an absolute inramfs path
-     * and correctly prepends sud{32,64}.  Without this the relative
-     * path is handed to ir_access verbatim, which (a) requires
-     * absolute paths to enter the inramfs branch, so falls through
-     * to raw_access against the kernel cwd — which is "/" since
-     * inramfs points it at an innocuous root — and (b) returns 0,
-     * causing build_exec_argv to bail and the kernel to receive an
-     * uninstrumented execve("./foo", …) that ends in ENOENT. */
-#ifdef SUD_ADDIN_FS
+    /* POSIX treats a command containing '/' as relative to the logical cwd. */
     if (cmd[0] == '.' || strchr(cmd, '/')) {
         char abs[PATH_MAX];
         if (sud_vfs_absolutize(AT_FDCWD, cmd, abs, sizeof(abs)) == 0)
             return resolve_path(abs, out, out_sz);
-    }
-#endif
-#ifdef SUD_ADDIN_INRAMFS
-    if (cmd[0] == '.' || strchr(cmd, '/')) {
-        char abs[PATH_MAX];
-        int rc = sud_inramfs_active()
-               ? sud_pr_resolve_at_inramfs(AT_FDCWD, cmd, abs, sizeof(abs))
-               : -1;
-        if (rc == 0) {
-            size_t clen = strlen(abs);
-            if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
-            memcpy(out, abs, clen);
-            out[clen] = '\0';
-            return (ir_access(out, X_OK) == 0);
-        }
-    }
-#endif
-
-    if (cmd[0] == '.' || strchr(cmd, '/')) {
-        /* Absolutise and re-enter the absolute arm so overlay/remap
-         * rules apply.  Without this, a relative exec of a binary that
-         * exists only in the overlay UPPER (`./example` just built by
-         * the box) reaches the kernel against the host directory and
-         * ENOENTs.  The LOGICAL cwd shadow must win over the kernel
-         * cwd: after a chdir into an upper-only directory the kernel
-         * cwd is the upper skeleton, and "../configure" absolutised
-         * against it never finds the host file (out-of-tree builds). */
-        char abs[PATH_MAX];
-#ifdef SUD_ADDIN_PATH_REMAP
-        if (sud_pr_absolutise(AT_FDCWD, cmd, abs, sizeof(abs)) == 0
-            && resolve_path(abs, out, out_sz))
-            return 1;
-#endif
-        long n = raw_syscall6(SYS_readlinkat, AT_FDCWD,
-                              (long)"/proc/thread-self/cwd",
-                              (long)abs, sizeof(abs) - 1, 0, 0);
-        if (n > 0) {
-            size_t cl = (size_t)n;
-            size_t pl = strlen(cmd);
-            if (cl + 1 + pl + 1 <= sizeof(abs)) {
-                abs[cl] = '/';
-                memcpy(abs + cl + 1, cmd, pl + 1);
-                if (resolve_path(abs, out, out_sz))
-                    return 1;
-            }
-        }
-        size_t clen = strlen(cmd);
-        if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
-        memcpy(out, cmd, clen);
-        out[clen] = '\0';
-        return (ir_access(out, X_OK) == 0);
     }
 
     const char *path_env = (g_path_env && g_path_env[0]) ? g_path_env : "/usr/bin:/bin";
@@ -440,19 +233,6 @@ int resolve_path(const char *cmd, char *out, int out_sz)
             out[dlen] = '/';
             memcpy(out + dlen + 1, cmd, clen);
             out[dlen + 1 + clen] = '\0';
-#ifdef SUD_ADDIN_PATH_REMAP
-            /* Same rationale as the absolute-path arm: a $PATH dir may
-             * itself be remapped (e.g. --remap /usr/bin=/host/usr/bin).
-             * Translate before testing executability. */
-            char rewritten[PATH_MAX];
-            int rc = sud_overlay_resolve(out, 0, rewritten, sizeof(rewritten));
-            if (rc == SUD_OVERLAY_RESOLVED) {
-                size_t rlen = strlen(rewritten);
-                if (rlen >= (size_t)out_sz) rlen = (size_t)out_sz - 1;
-                memcpy(out, rewritten, rlen);
-                out[rlen] = '\0';
-            }
-#endif
             if (ir_access(out, X_OK) == 0)
                 return 1;
         }
@@ -675,10 +455,8 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
             args[0] = d_self;
             nargs++;
 
-            /* Re-emit the wrapper flag block from the live runtime
-             * config so the child wrapper inherits the same set of
-             * --remap-rule / --inramfs-key / --cwd / --trace-outfile
-             * / --no-env values that this wrapper parsed.  drop_count
+            /* Re-emit the wrapper flag block so the child wrapper inherits
+             * --cwd / --trace-outfile / --no-env. drop_count
              * is dynamic (computed from the depth-loop that prepended
              * ld-linux a few iterations above), so we override it on
              * a local clone of the live config without disturbing
@@ -788,11 +566,7 @@ size_t exec_arena_size_for(const char *fn, char **argv, int argc)
      * a couple of duplicates of the resolved path). */
     need += 16 * (R16(PATH_MAX) + R16(256) + R16(PATH_MAX));
 
-    /* Wrapper flag block re-emitted via sud_runtime_config_emit().
-     * Bounded by SUD_RC_MAX_EMIT_ARGS string slots, each at most the
-     * length of a remap-rule spec (~PATH_MAX in the worst case for
-     * an overlay or remap rule).  Adds another arena allocation for
-     * the temporary args[] grow that absorbs the inserted block. */
+    /* Wrapper flag block re-emitted via sud_runtime_config_emit(). */
     need += R16((size_t)SUD_RC_MAX_EMIT_ARGS * PATH_MAX);
     need += R16((size_t)SUD_RC_MAX_EMIT_ARGS * sizeof(char *));
 

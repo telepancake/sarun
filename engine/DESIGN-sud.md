@@ -1,356 +1,69 @@
-# sud-backed boxes — cooperative shared-memory capture (WORK IN PROGRESS)
+# SUD execution transport
 
-STATUS: exploratory. Nothing in this document is settled; it records the
-current working hypothesis for replacing the FUSE overlay with the
-cooperative, shared-memory-based mechanism imported under `tv/` (the sud
-sandbox-userland stack) — and it is expected to change as practical issues
-surface. Treat every section as "current thinking", not commitment.
+SUD is one execution transport for the shared sarun filesystem. It is not a
+second overlay implementation and has no selectable filesystem modes.
 
-## Why
+## Boundary
 
-The FUSE overlay puts the engine in the synchronous path of every file
-operation a box performs: each lookup/read/write is a kernel round-trip into
-the engine's fuser threads. The sud stack (`tv/sud/`) intercepts syscalls
-*inside the traced process* via Syscall User Dispatch (SIGSYS on every
-out-of-range syscall), applies overlayfs-clone semantics in userland
-(`tv/sud/path_remap/overlay.c`: upper/lower walk, copy-up, char-0:0
-whiteouts), and can serve a whole subtree from a shared-memory inode store
-(`tv/sud/inramfs/`: a /dev/shm region mapped at a fixed address by every sud
-process, futex-locked, lock-free lookups). Provenance comes from the trace
-addin's lock-free event stream (`tv/wire/wire.h`, `tv/sud/trace/`) instead of
-from being in the I/O path.
+The production wrapper contains exactly two fixed adapters:
 
-The trade: SUD is cooperative. It intercepts what the process issues; it is
-not a kernel-enforced boundary the way a mount is. For sarun's use case
-(capture your own builds/agents for review) that is acceptable, but it is a
-real change of threat model and must stay documented.
+1. the compact binary trace/provenance stream; and
+2. the SarunFs syscall adapter.
 
-## Seam inventory (what stays, what moves)
+The syscall adapter translates intercepted Linux syscalls into canonical FUSE
+requests. A sealed shared memfd at fd 1021 contains independently reclaimable
+request/reply slots; futexes wake producers and the engine worker. The worker
+passes each request to the same virtiofsd decoder and scoped `SarunFs` used by
+the FUSE and QEMU transports. Path resolution, overlay precedence, copy-up,
+whiteouts, capture, rules, attachments, and synthetic nodes therefore exist
+only in `SarunFs`.
 
-From the FUSE side, the only FUSE-aware type is `Overlay`
-(`engine/src/overlay.rs`); `capture::BoxState` (sqlar rows + blob pool),
-`review.rs` apply/discard, `hostfs.rs`, and the control plane are all
-mechanism-agnostic. The contract with `runner.rs` today is just "a directory
-path presenting the merged root" for `bwrap --bind`. Under sud there is no
-mount: the runner launches the command under `sudtrace`/`sud64` with
-`--overlay` rules instead.
+The transport may maintain process-local state needed to preserve Linux file
+descriptor and cwd semantics. It must not make filesystem policy decisions.
 
-Kept unchanged for now: the sqlar archive as the at-rest interchange format
-(review, UI, and `prototype/libtestsarun.py` readers stay untouched). A
-lower-overhead store (gimir depot mechanics: mmap flat index + framed
-append-only files; strpool interning) is deliberately LAST — see the branch
-discussion; `gimir/SCOPING.md` is honest that the current depot crate does
-not drop in.
+## Descriptor export
 
-## Staging
+Some Linux operations need a kernel file descriptor rather than a byte reply:
+ELF loading, file-backed mmap, and `execveat(AT_EMPTY_PATH)`. For those cases a
+Unix `SOCK_SEQPACKET` lane at fd 1022 transfers an fd with `SCM_RIGHTS`. The
+request names an already-open canonical SarunFs handle; no path or policy is
+resolved on the fd lane. Writable shared mappings request a writable export so
+copy-up and capture happen before the fd is returned.
 
-1. **(done)** `sarun run --sud`: launch the command under the sud wrapper
-   with a plain *directory* upper (`{state}/live/<id>/sud-up`) overlaid on
-   `/`, then a post-exit sweep (`sud_ingest` verb → `engine/src/sud.rs`)
-   ingests the upper dir into the box's existing sqlar `BoxState` —
-   whiteouts (char 0:0) → whiteout rows, files → pool blobs, symlinks/dirs/
-   specials → their rows. Everything downstream (review/apply/discard/UI)
-   works unchanged. No bwrap, no FUSE mount participation for the box's own
-   I/O; the box registers on the overlay like any other so the control plane
-   and UI see it.
-1.5. **(done)** Absorb the launcher (tv's `sudtrace`) into the Rust runner;
-   `engine/src/sudwire.rs` encodes the launcher side of the TRACE stream.
-2. **(done — trace streaming)** The runner's fd 1023 is a pipe whose read
-   end rides to the engine with register (second SCM_RIGHTS fd, the slot
-   tap boxes use). `sud::stream_events` consumes the TRACE stream live:
-   EXEC events snapshot each process row from /proc *while the process is
-   alive* (`writer_for`), OPEN-for-write events build the rel→writer map
-   the sweep uses for per-file attribution (relative paths resolved
-   against per-tgid EV_CWD state; dirfd-relative opens fall back to the
-   runner row), STDOUT/STDERR events land in the box's outputs table, and
-   the raw bytes tee to `live/<id>/sud.trace` at rest. `sud_ingest` waits
-   for pipe EOF (the runner closes fd 1023 before requesting the sweep)
-   so the attribution map is complete.
-2.5. **(done — inramfs /tmp)** `/tmp` is a per-box inramfs mount rather
-   than a passthrough stopgap: the engine mints a per-run key
-   (`sarun<pid>b<id>`), the wrapper serves `/tmp` from the shared-memory
-   store (`--remap-rule inramfs:/tmp --inramfs-key …`), and at sweep the
-   engine parses the store's `/dev/shm/sud-inramfs.<key>.{meta,smalldata,
-   f.*}` region FROM OUTSIDE (`engine/src/sudir.rs`, offset-addressed —
-   no fixed-address mapping needed) into the sqlar under `tmp/…`, then
-   unlinks the shms. Mixed 32/64 is the hard case and works: a 64-bit
-   process maps the region; a 32-bit process can't fit the 8 GiB data
-   space in its address space, so it pread/pwrites the smalldata shm and
-   promotes large files to per-file shms — all captured. Two upstream
-   fixes were required for cross-class store sharing:
-     - `internal.h`: `struct sud_ir_inode` is 76 B on i386 vs 80 B on
-       x86_64 (a trailing 12-B union after an 8-aligned body), so a
-       64-init region gave a 32-bit attacher a wrong inode stride. Pinned
-       both structs with `aligned(8)` + `_Static_assert` on size.
-     - `super.c` / `libc.h`: a 32-bit `open()` of the 8 GiB smalldata shm
-       needs `O_LARGEFILE` (else EOVERFLOW → attach aborts → `/tmp`
-       silently reverts to host), and the creating truncate needs the
-       i386 split-arg `ftruncate64`.
-   Still pending: live file rows (writes appear at sweep, not as they
-   happen); OPEN attribution under /tmp currently often lands on the
-   runner row.
-3. Only then: the store. Alternate `BoxState` backend on depot/strpool
-   mechanics, sqlar kept as an export for the Python tooling.
+The lane is serialized across forked tracees, reclaims a lock owned by a dead
+thread, and closes with the box. It is exceptional data movement, not another
+filesystem interface.
 
-## Equivalence testing (prototype/test_sud_equiv_rs.py)
+## Namespace boundary
 
-sud is a REPLACEMENT mechanism, so the load-bearing test is not a bespoke
-sud test but running the SAME workload through both backends and asserting
-the captured sqlar agrees. `test_sud_equiv_rs.py` (also `make test-sud`)
-runs one workload under FUSE and under sud and checks field-for-field
-equivalence on: file permission bits, a user.* xattr, char-dev tombstones
-(== whiteouts hiding a host/lower file), content + nested-subdir capture,
-and a program executed from the HOST filesystem. It then checks two
-sud-only exec capabilities with no FUSE analogue: executing an ELF binary
-that lives in the box's inramfs /tmp, and a nested (same-in-same) box
-executing a binary in its PARENT box's captured layer. Temp dirs live under
-/var/tmp on purpose — the box's /tmp is an inramfs mount, so engine state
-(which holds the overlay upper) must not sit under /tmp.
+`/proc`, `/dev`, and `/sys` are process-local pseudo-filesystems. Their paths,
+cwd values, dirfds, and local `/proc/self/fd/N` links stay in the traced process
+namespace. A `/proc/self/fd/N` referring to a virtual SarunFs descriptor is
+recognized by the adapter and resolves to its canonical handle/path instead.
 
-The test also cross-checks OUTPUT capture (stdout+stderr into the outputs
-table, for both 64- and 32-bit boxes) and NETWORK capture (a tap box's DNS
-answered by the engine's synthetic resolver + a per-box flows pcapng) —
-both equivalent FUSE vs sud.
+All other filesystem syscalls use the ring. Virtual open-file descriptions are
+shared across dup/fork, preserving offsets and lock ownership. Logical cwd is
+carried in wrapper argv across exec so relative resolution remains stable
+without environment-variable state.
 
-sud networking now mirrors a FUSE box: `run --sud` honors `--net
-off|tap|host`. Tap creates the netns + TAP device the same way the FUSE
-runner does (`create_netns_tap`, the wrapper inherits the netns) and hands
-the engine the TAP fd as a THIRD register SCM_RIGHTS fd (the trace pipe is
-its own fd now, so a sud box can be a tap box too). The engine's stack,
-DNS, MITM and flow-capture are backend-agnostic; the CA bundle + resolv.conf
-that a FUSE box gets as overlay shadows are served to a sud box as `remap`
-rules pointing at host files the runner materializes from the ack's
-ca_pem/dns_ip. `--net off` unshares an empty netns (no bwrap to do it).
+## Lifecycle
 
-Bugs this test surfaced and that are now fixed:
-- Output stream numbering diverged: FUSE labels stdout=0/stderr=1 in the
-  outputs table (overlay.rs sink map), but sud's trace ingest used the fd
-  numbers 1/2. sud now uses 0/1 to match. (A shell `>&2` redirect is still
-  labeled stdout under sud — the trace addin sees write(fd=1) after the
-  shell's dup — a minor artifact vs FUSE's sink-based model; direct
-  stderr writes match.)
-- The sud sweep did not capture xattrs. `sud::capture_xattrs` now reads
-  each upper file's l*xattr set into the sqlar (skipping trusted.overlay.*).
-- Executing a binary in inramfs /tmp failed whenever an `overlay:/` rule
-  was also configured (i.e. always, in the sarun runner): the execve
-  pre-syscall dispatcher overlay-rewrote the inramfs path to a nonexistent
-  upper path before build_exec_argv saw it. Fixed in tv: the execve/
-  execveat dispatch (path_remap/addin.c) now classifies the target against
-  the inramfs mount and leaves inramfs paths un-rewritten for the loader's
-  memfd exec path, and resolve_path's absolute arm (elf.c) skips the
-  overlay resolver for inramfs paths. A RELATIVE exec of the same binary
-  already worked; only the absolute path was broken.
+The runner creates the trace channel, filesystem ring, and fd lane and passes
+them as ordered registration descriptors. The engine owns the SarunFs worker
+and fd exporter. The compact trace is applied live; EOF finalizes provenance
+and capture. There is no upper-directory sweep or post-exit in-memory
+filesystem import.
 
-## brush + in-process builtins under sud (`run --sud -b`, implemented)
+The standalone SUD launcher, inramfs, path-remap overlay, fake-exec,
+command-rewrite, and selectable add-in matrix were displaced by this boundary
+and have been deleted. New SUD filesystem semantics belong in `SarunFs`, where
+all three transports receive them.
 
-The D9 in-process advantage — brush-core as the box shell, coreutils/
-find/xargs as builtins, kati (`make`) and n2 (`ninja`) embedded, no
-sh-storm — carries over to sud boxes, and compounds: under FUSE a
-builtin's file I/O still crossed the kernel into the engine's fuser
-threads; under sud it is a SIGSYS trap handled in the SAME address
-space by the userland overlay. The pieces:
+## Validation constraint
 
-- **Top level**: the traced target IS the engine binary, execed under
-  the wrapper as `sarun brush-sh -- sh -c <script>` (the explicit shim
-  subcommand; `script_from_argv` reconstructs the box command). The
-  engine is a static musl non-PIE ELF linked at the default low base —
-  no collision with the wrapper's text (sud32 at 0x20000000, sud64 at
-  0x40000000), and SUD (unlike LD_PRELOAD) traces static binaries and
-  brush's multi-threaded tokio runtime (clone3/CLONE_VM re-arming in
-  tv handler.c).
-- **Nested shells/builds**: the FUSE overlay's lazy /bin/sh + make +
-  ninja shadowing becomes `remap:` rules. Subtlety: the wrapper's exec
-  rewrite substitutes the RESOLVED target path as the child's argv[0]
-  (handler.c build_exec_argv), which would lose the invocation name
-  the engine's dispatch gates key on (is_brush_sh/is_make/is_ninja +
-  SARUN_BRUSH_SH=1). So the remap destination is a per-box symlink
-  NAMED AFTER THE TOOL (`live/<id>/shadow-bin/sh → sarun` etc.); the
-  basename survives the rewrite and the engine-state passthrough rule
-  keeps the link host-served. Rules are emitted for {/bin,/usr/bin}/
-  {sh,bash,dash,make,gmake,ninja} (the FUSE Shadows defaults; the
-  shadow_*.glob config files are not consulted — remap rules can't
-  express globs).
-- **32-bit boxes**: nothing special — brush is the 64-bit engine
-  reached through the wrapper's cross-class dir-sibling convention;
-  a sud32-traced tool exec'ing the shadowed `sh` transitions to sud64
-  like any other 64-bit child. There is no (and need be no) 32-bit
-  build of brush/the builtins.
-- **fake-exec** remains orthogonal: it elides trivial helper execs
-  (echo/true/printf) at the SUD layer for ANY sud box, brush or not.
-
-Rejected: compiling brush/builtins INTO the wrapper (it is a tiny
-freestanding fixed-address C binary — no allocator, no std), and
-cmd-rewrite `compiler-wrap` rules (its one-shot per-chain suppression
-would drop the shim for deep make→sh→make chains, and it also loses
-argv[0]).
-
-Verified by the `-b` leg of test_sud_equiv_rs.py: builtin redirect
-write, nested `/bin/sh -c` through the shim, in-process `cat`, and an
-in-process `make` recipe write — all captured, host untouched,
-field-for-field equivalent FUSE vs sud.
-
-Gaps:
-- **Semantic provenance**: no box channel exists in the traced brush
-  process, so FRAME_PROV/brushprov rows are not emitted (send_nested_
-  prov no-ops without SARUN_BROKER); per-pipeline provenance under sud
-  should eventually ride the trace stream as a synthetic event kind.
-  Process attribution still comes from the trace stream as usual.
-- Upstream bug found by this work (fixed in tv): path_remap's addin
-  parsed rules into a 16-entry array (SUD_OVERLAY_MAX_RULES) while the
-  runtime config carries 64 — the shadow rules pushed the runner past
-  16 and the trailing wide `overlay:/` rule was SILENTLY dropped,
-  letting every write land on the real host. The cap now equals
-  SUD_RULES_MAX_RULES.
-
-## Composition: same-in-same nesting (implemented), mixed (sketch)
-
-Same-in-same nesting preserves the full model on both sides, and both
-sides use the SAME shape: **flattening**. FUSE-in-FUSE was never
-mount-in-mount — it is one multi-box mount whose resolve() walks the
-parent chain; sud-in-sud is likewise never wrapper-in-wrapper (both
-wrappers link at one fixed text address, and the outer wrapper's execve
-interception would wrap the inner wrapper binary) — it is ONE wrapper
-invocation whose overlay rule stacks the layers.
-
-**sud-in-sud (implemented)**: `sarun run --sud PARENT.CHILD -- cmd`
-(launched from the host, dotted-name parent resolution — the existing
-register path). Register validates the chain is all-sud and AT REST,
-materializes each ancestor's captured state from its sqlar
-(`sud::export_box` — the inverse of the sweep: blob-pool hardlinks,
-char-0:0 whiteouts, dirs/symlinks/specials) into `live/<id>/sud-lower-
-<aid>`, and acks the lower list; the runner emits
-`overlay:/=<up>+<lower…>+/`. A rerun exports its OWN prior state as the
-nearest lower (the FUSE analog is load_mirror) and starts from a clean
-upper. The sqlar is authoritative — the stale sud-up dir is never used
-as a lower, so apply/discard done between runs are honored. Upstream
-patch: the overlay resolve walk now honors whiteouts found in MIDDLE
-lowers (the dir-listing merge already did); rules.h caps one rule at 9
-layers, so chains deeper than 7 ancestors fail loud.
-
-**In-box nesting (implemented)**: a `run --sud` issued from INSIDE a
-running sud box derives its enclosing box from the runner's /proc
-ancestry (same identity path relname registration uses). A RUNNING
-ancestor's truth is its LIVE upper directory stacked on its register-
-time layer list (recorded in `sud::set_layers`); an at-rest ancestor is
-exported from its sqlar as before. Two mechanics make this safe:
-- The outer wrapper's execve interception passes a sud-wrapper target
-  through UNWRAPPED (elf.c): execve replaces the process image, so the
-  inner wrapper simply takes over with its own composed flag block —
-  no wrapper-in-wrapper, no address collision.
-- The nested runner never replumbs fds 1022/1023 in its own process
-  (it is itself traced by the outer wrapper, whose trace addin writes
-  outer events — with stream ids from the OUTER counter page — to fd
-  1023 there); the inner contract fds are installed in the child
-  between fork and exec, and the launcher writes its version atom +
-  EXIT events through the pipe fd directly.
-
-**Mixed 32/64 (verified)**: one box can cross classes both ways — a
-64-bit shell spawning a 32-bit static binary (wrapped by sud32 via the
-wrapper's dir-sibling convention) and a 32-bit binary exec'ing /bin/sh:
-both capture into the same upper with correct attribution. This is the
-environment inramfs testing needs — on 32-bit the store cannot fit in
-the address space and the transfer paths must be exercised.
-
-Gaps: opaque-dir semantics don't exist in the sud overlay; host-
-launched (dotted-name) nesting still requires at-rest ancestors.
-
-**32-bit (implemented)**: the runner probes the target's ELF class and
-picks sud32/sud64 (`$SARUN_SUD32`, or sud64's dir sibling — the same
-convention the wrapper itself uses for cross-class children). Verified:
-a static i386 binary traced by sud32 captures into the upper with
-attribution and output rows. This unblocks the inramfs upper (the
-in-RAM store must be mappable from both wrapper classes).
-
-Mixed quadrants (sketch only):
-
-- **FUSE box nested in a sud box**: works structurally today — the inner
-  runner dials the engine as a host runner (a sud box sets no
-  SARUN_BROKER), bwrap binds `<mnt>/<id>` as usual. The sud overlay must
-  NOT swallow writes that go through the FUSE mount (they belong to the
-  inner box's capture), so the engine's mountpoint is a passthrough
-  carve-out in the sud rule stack. Gap: parentage — the inner box
-  registers as top-level because parent derivation currently only runs
-  for in-box (`relname`) registrations; deriving the enclosing sud box
-  from the /proc ancestry (box_runpids already has the sud runner's pid)
-  would nest it properly.
-- **sud box nested in a FUSE box**: rejected today. The wrong way is to
-  run sud64 inside the bwrap mount (upper paths under the engine state
-  dir resolve through the parent's FUSE lower — the child's captured
-  writes would themselves become parent-box captured writes). The right
-  way is rule composition against the parent's *host-side* mount:
-  `overlay:/=<child-up>+<mnt>/<parent-id>` — reads traverse the parent's
-  merged view (whiteouts and all), writes land in the child's own upper.
-- **sud in sud**: never wrapper-in-wrapper — both wrappers link at the
-  same fixed text address, and the outer wrapper's execve interception
-  would try to wrap the inner wrapper. Flatten instead: the engine knows
-  the parent chain, so a nested sud box is ONE wrapper invocation with a
-  composed rule stack, `overlay:/=<child-up>+<parent-up>+/` (the overlay
-  rule syntax already takes multiple lowers, and the upper-side whiteout
-  markers are honored during lower walks).
-- **FUSE box whose PARENT is a sud box**: the FUSE resolve() walks parent
-  BoxStates, but a live sud box's writes sit in its upper dir, not in its
-  BoxState until sweep — the child would see a stale parent. Needs either
-  live row ingest (streaming writes into the BoxState as they happen) or
-  a resolve() fallback that consults the parent's sud upper directory.
-
-## Known gaps / practical issues expected (step 1)
-
-- **Attribution**: post-exit sweep = one writer (the runner). Real per-pid
-  attribution needs the trace stream (step 2).
-- **Rename/mtime fidelity**: the sweep sees final state only; intermediate
-  writes, renames, and deletions-then-recreations collapse.
-- **/proc, /dev, /sys, /tmp** are passthrough carve-outs (a write to /tmp is
-  NOT captured — differs from FUSE boxes where /tmp is a bwrap tmpfs, and
-  from --api boxes where /tmp maps into the overlay). Needs a decision.
-- **Whiteout markers** are char 0:0 device nodes created by the intercepted
-  unlink; unprivileged environments may refuse mknod — may need a userland
-  marker convention instead.
-- **Opaque dirs**: not translated yet (sud overlay.c semantics vs OCI
-  `.wh..wh..opq` need mapping).
-- **No isolation**: step 1 runs without bwrap, in the host pid/net
-  namespaces. Whether sud boxes should still get bwrap for pid/net (without
-  the mount) is open.
-- **Nesting**: nested `--sud` boxes are rejected for now (FUSE nesting binds
-  the parent-exposed kids dir; the sud equivalent — nested rule stacks or a
-  shared inramfs key — is undesigned).
-- **Escape hatches**: statically-linked targets work (SUD is not LD_PRELOAD),
-  but `PTRACE_TRACEME` children currently drop interception (sud's
-  documented fallback), and 32-bit targets need `sud32`.
-- **Toolchain**: `sud64` is a freestanding gcc build (`make -C tv sud64
-  SUD_ADDINS=...`) — outside the engine's cargo-zigbuild musl world. The tv
-  import ships without its third-party single-file printf dep; it is now
-  vendored at `tv/libc-fs/deps/printf/` (mpaland/printf, MIT). The C
-  launcher (`sudtrace`) is absorbed into the Rust runner; translating the
-  wrapper itself to `no_std` Rust is deliberately deferred — its interface
-  (argv flag block in, upper dir + trace stream out) is language-neutral,
-  and a rewrite buys toolchain unification at high regression risk.
-
-## Runner/engine protocol (step 1 + launcher absorption, subject to change)
-
-- `run --sud` registers with `want_sud: true`, `want_capture: false`,
-  `net_mode: "host"`. The engine creates `live/<id>/sud-up` and acks with
-  `sud_upper`.
-- The runner IS the sud launcher (tv's `sudtrace` binary is no longer in
-  the loop; only the freestanding `sud64` wrapper remains a foreign
-  artifact, located via `$SARUN_SUD64` or PATH). The runner:
-  - opens `live/<id>/sud.trace` on fd 1023 and the 4 KiB MAP_SHARED
-    wire-state page (memfd, stream-id counter) on fd 1022 — the wrapper
-    contract from tv/sud/sudtrace.c; every traced child inherits both;
-  - writes the TRACE version atom and, from its waitpid loop, the
-    launcher-side EV_EXIT events, via the Rust wire encoder
-    (`engine/src/sudwire.rs` — the seed of the step-2 trace crate; its
-    events decode with tv's own `tools/wiredump` interleaved with
-    wrapper-emitted streams);
-  - probes the target like sudtrace did (PATH resolve, shebang → run the
-    interpreter with the kernel's shebang argv shape, ELF class — a
-    32-bit target fails loud until sud32 is wired);
-  - execs `sud64 --trace-outfile T --remap-rule passthrough:… --remap-rule
-    overlay:/=<sud_upper>+/ CMD…` — the argv flag block from
-    tv/sud/runtime_config.h (rule order matters: first-prefix-match wins,
-    carve-outs before the wide rule).
-- On exit the runner sends `{"type":"sud_ingest","sid":…}` on a fresh
-  engine conn; the engine sweeps the upper into the live `BoxState`, then
-  the runner drops the box channel (normal EOF teardown).
-- The trace file is written but not yet consumed (step 2). Owning fd 1023
-  in the runner is what lets step 2 switch from a post-exit file read to
-  live streaming.
+Both i386 and x86_64 wrappers and their ring/fd-lane fixtures are built and run
+on the current aarch64 host. A live x86 SUD process cannot run through the
+host's qemu-user/binfmt path because that emulator rejects
+`PR_SET_SYSCALL_USER_DISPATCH`; live parity therefore additionally requires a
+native x86 Linux host. This is an emulator limitation, not a retained runtime
+fallback.

@@ -1414,8 +1414,8 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
         Ok(c) => c,
         Err(e) => {
             eprintln!("sarun-engine: exec {wrapper}: {e}\n\
-                       hint: build it with `make -C tv sud64 sud32 \
-                       SUD_ADDINS=\"sud/trace sud/fs\"` and put them on PATH or \
+                       hint: build it with `make -C tv sud64 sud32` and put \
+                       them on PATH or \
                        point SARUN_SUD64/SARUN_SUD32 at them.");
             unsafe {
                 libc::munmap(state_page.cast(), 4096);

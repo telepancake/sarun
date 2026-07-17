@@ -12,7 +12,7 @@
  * Formatted output comes from deps/printf (mpaland/printf).
  *
  * This program does NOT parse "-o", "--help", or fork children.
- * That is the job of the separate sudtrace launcher (sud/sudtrace.c).
+ * The engine runner owns launch lifecycle and the fixed descriptor contract.
  */
 
 #include "libc-fs/libc.h"
@@ -28,7 +28,7 @@
 /* ================================================================
  * Wrapper argument parsing
  *
- * The wrapper is invoked by sudtrace as:
+ * The wrapper is invoked by the engine runner as:
  *   sud64 [--no-env] [--drop-argv N] /path/to/binary [args...]
  *
  * All arguments are positional; no flag parsing ambiguity.
@@ -188,8 +188,8 @@ int main(int argc, char **argv)
      * call rewrite_cmdline(), which overwrites the original argv
      * memory with the visible argv so /proc/self/cmdline reflects
      * the target program.  That clobber would invalidate every
-     * string in g_sud_runtime_config (trace_outfile, inramfs_key,
-     * remap_rules, cwd) — the next build_exec_argv() would then
+     * string in g_sud_runtime_config (trace_outfile, cwd) — the next
+     * build_exec_argv() would then
      * re-emit garbage flag values to child wrappers.  Deep-copy
      * the strings now so the live config owns its own storage. */
     sud_runtime_config_intern(&g_sud_runtime_config);
@@ -206,14 +206,7 @@ int main(int argc, char **argv)
     if (drop_count > argc - argi)
         drop_count = 0;
 
-    /* Initialise add-ins BEFORE resolving the target path: the inramfs
-     * add-in's resolve_path() needs sud_inramfs_active() to be true so
-     * that ir_access() / ir_open_ro() route mount-relative paths through
-     * the inramfs ops instead of falling through to raw_access against
-     * the kernel cwd.  Otherwise an absolute inramfs path handed to the
-     * wrapper (e.g. by a build_exec_argv rewrite of `./sqlite3`) would
-     * be rejected here with "sud: cannot find …" and the binary never
-     * launches. */
+    /* Bind trace and SarunFs transport state before resolving the target. */
     sud_addins_wrapper_init();
 
     /* Resolve target path */

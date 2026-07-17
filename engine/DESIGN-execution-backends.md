@@ -159,10 +159,12 @@ as executable mappings and mmap that genuinely need a host fd.
       box channel closes; no post-exit filesystem sweep remains.
 - [ ] Reach FUSE/SUD equivalence for visible trees, metadata, sqlar, output,
       provenance, networking, nesting, OCI, brush, and termination.
-- [ ] Delete inramfs and SUD overlay/path-remap sources after the production
+- [x] Delete inramfs and SUD overlay/path-remap sources after the production
       wrapper cutover. `sudir.rs`, upper-dir/lower materialization and sweep
-      logic, and their generated wire/runtime compatibility fields are gone.
-      Do not delete the SUD dispatcher/frontend itself.
+      logic, their generated wire/runtime compatibility fields, the obsolete
+      standalone launcher, and the unused fake-exec/cmd-rewrite optional addins
+      are gone. The SUD dispatcher/frontend remains and now has exactly two
+      fixed adapters: trace and SarunFs.
 
 ### 4. QEMU appliances
 

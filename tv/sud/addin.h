@@ -15,7 +15,7 @@ struct sud_syscall_ctx {
      * (e.g. trace) are invoked with args[] reset to this snapshot in
      * sud_addins_post_syscall() so their output reflects the program's
      * view of the syscall — never any mutation applied by a later
-     * mutator addin (e.g. path_remap).  Initialized by the dispatcher,
+     * transport adapter. Initialized by the dispatcher,
      * not by handler.c, so the legacy positional initializer in
      * handler.c keeps working unchanged. */
     long orig_args[6];
@@ -53,10 +53,6 @@ int sud_addins_pre_syscall(struct sud_syscall_ctx *ctx);
 void sud_addins_post_syscall(const struct sud_syscall_ctx *ctx);
 
 extern const struct sud_addin sud_trace_addin;
-extern const struct sud_addin sud_path_remap_addin;
-extern const struct sud_addin sud_cmd_rewrite_addin;
-extern const struct sud_addin sud_fake_exec_addin;
-extern const struct sud_addin sud_inramfs_addin;
 extern const struct sud_addin sud_fs_addin;
 
 #endif /* SUD_ADDIN_H */

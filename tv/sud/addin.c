@@ -1,88 +1,10 @@
 #include "sud/addin.h"
 
-/*
- * Addin invocation order.
- *
- * The `pre_syscall` and `post_syscall` hooks of every registered addin
- * are invoked in the order they appear in this array.  That order
- * matters when more than one addin observes or mutates the same
- * syscall, so the contract is fixed here:
- *
- *   1. sud_trace_addin runs FIRST.  It is a pure observer: it sees
- *      the syscall arguments exactly as the traced program passed
- *      them, with no knowledge of any remapping that may follow.
- *      This is important: if the program calls open("/tmp/x"), the
- *      trace must record "/tmp/x" — the path the program actually
- *      asked for — regardless of whether a remap/overlay/inramfs
- *      rule will later rewrite or short-circuit the call.  Trace
- *      output must therefore be byte-for-byte identical regardless
- *      of which mutator addins are compiled in or active.
- *
- *   2. sud_path_remap_addin runs SECOND.  It is the path layer:
- *      it owns the chdir/getcwd/fchdir interception (CWD shadow +
- *      dirfd table), routes any path under the inramfs mount to
- *      the inramfs data store via sud_pr_inramfs_route_pre_syscall
- *      (sud/path_remap/inramfs_glue.c), and applies the overlay /
- *      remap rule table to anything else.  By the time this addin
- *      returns, every path-bearing syscall has either been short-
- *      circuited (with -errno or a synthetic fd) or had its path
- *      arg rewritten to the resolved kernel path.
- *
- *   3. sud_cmd_rewrite_addin runs THIRD.  It rewrites execve args:
- *      compiler-wrap prepends ccache, exec-strip drops sudo /
- *      fakeroot-ng / env wrappers, exec-as bumps the runtime
- *      config's pretend-uid/gid for the rewritten exec subtree.
- *      Slotted after path_remap so paths are resolved before we
- *      pattern-match on them, and before fake-exec so any further
- *      elision (true/false/echo) can fire on the rewritten argv —
- *      "sudo /usr/bin/true" becomes /usr/bin/true via exec-strip
- *      and then fake-exec elides it.
- *
- *   4. sud_fake_exec_addin runs FOURTH.  It intercepts execve/execveat
- *      and, for a small registry of trivial helper binaries
- *      (true/false/:/echo/printf), replaces the kernel exec with a
- *      per-task SYS_exit emitting the synthesised status (and any
- *      synthetic stdout bytes).  Slotted after cmd-rewrite so the
- *      argv it sees is already canonicalised; slotted before inramfs
- *      so we never need an inramfs-served binary to back a builtin
- *      we are about to elide.  Trace fidelity is preserved because
- *      the trace addin (above) records the EXEC event from the
- *      original args before we run.
- *
- *   5. sud_inramfs_addin runs LAST.  After the Part-1 re-layering
- *      it sees only fd-bearing syscalls (read/write/lseek/dup/
- *      fcntl/mmap/munmap/copy_file_range/...): path_remap already
- *      handled all path-bearing dispatch into the inramfs data
- *      store.  fds returned by inramfs are real (memfd-backed) so
- *      this hook just has to recognise them via sud_inramfs_owns_fd
- *      and serve read/write/seek from the inramfs extents instead
- *      of the empty memfd.
- *
- * Any addin can be omitted at compile time (via the SUD_ADDIN_*
- * macros set by the Makefile from the SUD_ADDINS list); the others
- * keep working unmodified.  When SUD_ADDIN_INRAMFS is omitted,
- * sud_pr_inramfs_route_pre_syscall isn't called and path_remap
- * just runs its overlay/remap dispatch.
- */
+/* Trace observes original syscall arguments first; the singular SarunFs
+ * adapter then translates filesystem operations to canonical FUSE requests. */
 static const struct sud_addin *const g_addins[] = {
-#ifdef SUD_ADDIN_TRACE
     &sud_trace_addin,
-#endif
-#ifdef SUD_ADDIN_FS
     &sud_fs_addin,
-#endif
-#ifdef SUD_ADDIN_PATH_REMAP
-    &sud_path_remap_addin,
-#endif
-#ifdef SUD_ADDIN_CMD_REWRITE
-    &sud_cmd_rewrite_addin,
-#endif
-#ifdef SUD_ADDIN_FAKE_EXEC
-    &sud_fake_exec_addin,
-#endif
-#ifdef SUD_ADDIN_INRAMFS
-    &sud_inramfs_addin,
-#endif
     0
 };
 
@@ -115,10 +37,7 @@ void sud_addins_fork_child(void)
 
 int sud_addins_pre_syscall(struct sud_syscall_ctx *ctx)
 {
-    /* Snapshot the program-supplied args so that observer addins
-     * (trace) can be presented with them in post_syscall, even if a
-     * later mutator addin (path_remap) rewrote ctx->args[] for the
-     * kernel call. */
+    /* Preserve the program-supplied arguments for trace post-processing. */
     for (int i = 0; i < 6; i++)
         ctx->orig_args[i] = ctx->args[i];
 
@@ -131,13 +50,7 @@ int sud_addins_pre_syscall(struct sud_syscall_ctx *ctx)
 
 void sud_addins_post_syscall(const struct sud_syscall_ctx *ctx)
 {
-    /* Hand each addin a view of ctx in which args[] are restored to
-     * the values the traced program originally passed.  This keeps
-     * trace remapping-agnostic: it produces byte-identical output
-     * regardless of whether path_remap is compiled in, enabled, or
-     * configured with rules.  path_remap itself has no post_syscall
-     * hook today, so there is no consumer that would prefer to see
-     * the rewritten args here. */
+    /* Trace always sees the arguments the program originally supplied. */
     struct sud_syscall_ctx local = *ctx;
     for (int i = 0; i < 6; i++)
         local.args[i] = ctx->orig_args[i];

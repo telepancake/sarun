@@ -4,6 +4,7 @@
 #include "sud/fs/client.h"
 #include "sud/fs/fuse_client.h"
 #include "sud/fs/fd_lane.h"
+#include "sud/runtime_config.h"
 #include "sud/fs/vfs.h"
 #include <asm/statfs.h>
 
@@ -501,6 +502,8 @@ int sud_vfs_init(const char *initial_cwd)
             if (length < 0) return (int)length;
         }
     }
+    if (g_sud_runtime_config_present)
+        sud_runtime_config_set_cwd(&g_sud_runtime_config, g_cwd);
     return sud_fuse_init();
 }
 
@@ -1218,6 +1221,8 @@ int sud_vfs_chdir(const char *path)
         const char *cwd = length > 0 ? actual : absolute;
         local_lock(&g_cwd_lock);
         memcpy(g_cwd, cwd, strlen(cwd) + 1);
+        if (g_sud_runtime_config_present)
+            sud_runtime_config_set_cwd(&g_sud_runtime_config, g_cwd);
         local_unlock(&g_cwd_lock);
         return 0;
     }
@@ -1231,6 +1236,8 @@ int sud_vfs_chdir(const char *path)
     local_lock(&g_cwd_lock);
     size_t length = strlen(canonical);
     memcpy(g_cwd, canonical, length + 1);
+    if (g_sud_runtime_config_present)
+        sud_runtime_config_set_cwd(&g_sud_runtime_config, g_cwd);
     local_unlock(&g_cwd_lock);
     return 0;
 }
@@ -1247,12 +1254,16 @@ int sud_vfs_fchdir(int fd)
         if (length < 0) return (int)length;
         local_lock(&g_cwd_lock);
         memcpy(g_cwd, actual, (size_t)length);
+        if (g_sud_runtime_config_present)
+            sud_runtime_config_set_cwd(&g_sud_runtime_config, g_cwd);
         local_unlock(&g_cwd_lock);
         return 0;
     }
     if ((description->mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
     local_lock(&g_cwd_lock);
     memcpy(g_cwd, description->path, description->path_len + 1);
+    if (g_sud_runtime_config_present)
+        sud_runtime_config_set_cwd(&g_sud_runtime_config, g_cwd);
     local_unlock(&g_cwd_lock);
     return 0;
 }

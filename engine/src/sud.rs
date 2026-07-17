@@ -1,10 +1,5 @@
-// sud-backed boxes, step 1 (see engine/DESIGN-sud.md — WORK IN PROGRESS).
-// The box ran under tv's sudtrace with a plain directory upper overlaid on
-// `/`; this module sweeps that upper directory into the box's sqlar
-// BoxState after the command exits, so review/apply/discard/UI work on a
-// sud box exactly as on a FUSE box. Post-exit sweep = final state only:
-// every row is attributed to the runner's process row until the wire trace
-// stream is ingested (step 2).
+// SUD trace/provenance stream handling. Filesystem capture is performed live
+// by the shared SarunFs and is deliberately absent from this module.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,13 +10,13 @@ use std::sync::OnceLock;
 use crate::capture::BoxState;
 use crate::sudwire;
 
-// ── live trace streaming (step 2) ───────────────────────────────────────────
+// ── live trace streaming ────────────────────────────────────────────────────
 // The runner ships the read end of the fd-1023 pipe with register; the
 // engine consumes the TRACE stream as the box runs: EXEC events snapshot
 // each process row from /proc WHILE THE PROCESS IS ALIVE (writer_for),
-// OPEN-for-write events build the rel→writer map the post-exit sweep uses
-// for per-file attribution, STDOUT/STDERR events land in the box's
-// outputs table, and every byte is teed to live/<id>/sud.trace at rest.
+// STDOUT/STDERR events land in the box's outputs table, and every byte is
+// teed to live/<id>/sud.trace at rest. Filesystem attribution arrives through
+// SarunFs's capture journal, not through this stream.
 
 /// Per-box streaming state, registered while a sud box runs.
 pub struct Stream {
@@ -313,8 +308,8 @@ pub fn stream_events(box_id: i64, fd: i32, b: Arc<BoxState>,
                 eprintln!("sarun-engine: sud trace apply PANICKED for box \
                            {box_id}; live process/output capture stops here \
                            (the pipe keeps draining so the box keeps \
-                           running; the post-exit sweep still ingests \
-                           final state)");
+                           running; filesystem capture continues through \
+                           SarunFs)");
             }
         }
         unsafe { libc::close(fd); }
@@ -338,7 +333,7 @@ fn apply_event(b: &BoxState, st: &Stream,
     match ev.ty {
         sudwire::EV_EXEC => {
             // Snapshot the process row while /proc/<tgid> is alive —
-            // this is what post-exit sweeps structurally can't do. An
+            // this must happen before a short-lived process disappears. An
             // in-place execve (vendor `exec real-tool "$@"` wrappers)
             // keeps (tgid,start), so refresh the existing row's image
             // rather than trusting the first snapshot (capture.rs

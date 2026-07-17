@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""EQUIVALENCE + CAPABILITY proof for the sud backend (`sarun run --sud`).
+"""EQUIVALENCE + CAPABILITY proof for the SUD backend (`sarun run --sud`).
 
-sud is a REPLACEMENT for the FUSE overlay (engine/DESIGN-sud.md): the box runs
-under tv's Syscall-User-Dispatch wrapper with a userland overlay + inramfs /tmp
-instead of a FUSE mount, and a post-exit sweep ingests the result into the SAME
-sqlar BoxState. Downstream (review / apply / discard / UI) must therefore see an
-identical box whichever backend produced it.
+SUD is a transport for the same SarunFs used by FUSE and QEMU
+(engine/DESIGN-sud.md). Downstream review/apply/discard/UI results must be
+identical whichever backend carried the canonical filesystem requests.
 
 PART A — EQUIVALENCE: one workload through BOTH backends, asserting the captured
 sqlar agrees on every mechanism-agnostic observation:
@@ -16,9 +14,8 @@ sqlar agrees on every mechanism-agnostic observation:
   - a program executed FROM THE HOST filesystem runs and its output is captured,
   - file content + nested-subdir writes are captured.
 
-PART B — sud-only CAPABILITIES (no FUSE analogue):
-  - executing an ELF binary that lives in the box's inramfs /tmp works
-    seamlessly (the tv loader re-execs it from a memfd), and
+PART B — SUD transport CAPABILITIES:
+  - executing an ELF binary created inside the captured tree works, and
   - a nested (same-in-same) sud box executes a binary located in its PARENT
     box's captured layer.
 
@@ -26,9 +23,8 @@ Run:
     uv run --with "pyfuse3>=3.2" --with "trio>=0.22" --with "wcmatch>=8.4" \
       --with "python-magic>=0.4" python test_sud_equiv_rs.py
 Skips (passes vacuously) if cargo / the engine / bwrap / the sud64 wrapper / a
-C toolchain is unavailable. Temp dirs live under /var/tmp on purpose: the box's
-/tmp is an inramfs mount, so the engine state (which holds the overlay upper)
-must NOT sit under /tmp or the two would overlap.
+C toolchain is unavailable. Host fixtures use /var/tmp so they do not collide
+with paths deliberately created inside the test boxes.
 """
 import os, shutil, socket, sqlite3, stat as stat_mod, subprocess, sys, \
        tempfile, time
@@ -69,9 +65,6 @@ BIN = CRATE / "target/x86_64-unknown-linux-musl/release/sarun"
 TV = _HERE.parent / "tv"
 SUD64 = TV / "sud64"
 SUD32 = TV / "sud32"
-SUD_ADDINS = ("sud/trace sud/path_remap sud/cmd-rewrite "
-              "sud/fake-exec sud/inramfs")
-# The box's /tmp is inramfs; keep engine state (the overlay upper) off /tmp.
 TMPBASE = "/var/tmp"
 
 _fails = []
@@ -81,7 +74,7 @@ def check(cond, msg):
 
 # A tiny STATIC helper the box execs to prove where a binary can run from, and
 # to set an xattr (no setfattr in this image). Static so it needs no in-box
-# dynamic loader path — important for exec-from-inramfs / exec-from-parent-box.
+# dynamic loader path — important for exec-from-capture / exec-from-parent-box.
 SUDTOOL_C = r"""
 #define _GNU_SOURCE
 #include <sys/xattr.h>
@@ -158,7 +151,7 @@ def ensure_binaries():
             return False
     if not SUD64.exists():
         try:
-            subprocess.run(["make", "sud64", f"SUD_ADDINS={SUD_ADDINS}"],
+            subprocess.run(["make", "sud64"],
                            cwd=TV, check=True, timeout=600)
         except Exception:
             return False
@@ -168,7 +161,7 @@ def ensure_binaries():
     # must hold, else a 32-bit box's wrapper exec fails and captures nothing.
     if not SUD32.exists():
         try:
-            subprocess.run(["make", "sud32", f"SUD_ADDINS={SUD_ADDINS}"],
+            subprocess.run(["make", "sud32"],
                            cwd=TV, check=True, timeout=600,
                            stderr=subprocess.DEVNULL)
         except Exception:
@@ -276,9 +269,8 @@ def equivalence_workload(mode, sudtool):
         m = eng.m
         rows = {n: md for n, md, *_ in m.sqlar_list(sp)}
         outs = sqlar_outputs(sp)
-        # sud TRACE stream is now durable (engine/DESIGN-sud.md step 2): the
-        # sweep folds live/<id>/sud.trace into the box's sqlar `sudtrace` row
-        # and, on a clean sweep, removes the redundant file. Verify the blob
+        # SUD trace EOF finalization folds live/<id>/sud.trace into the box's
+        # sqlar `sudtrace` row and removes the redundant file. Verify the blob
         # is present + the `sudtrace` control verb decodes ≥1 EXEC event + the
         # live file is gone. (FUSE boxes never populate it — trace stays None.)
         trace = None
@@ -329,26 +321,28 @@ def equivalence_workload(mode, sudtool):
         eng.close()
 
 
-def sud_inramfs_exec(sudtool):
-    """Copy a binary into the box's inramfs /tmp and exec it there."""
+def sud_captured_exec(sudtool):
+    """Copy a binary into the captured tree and execute it there."""
     eng = Engine("sud")
     try:
         host_bin = Path(TMPBASE) / "sudeq_irbin"
         shutil.copy(sudtool, host_bin); host_bin.chmod(0o755)
-        script = (f"cp {host_bin} /tmp/irtool && chmod +x /tmp/irtool && "
-                  "/tmp/irtool mark FROMINRAMFS")
+        script = (f"cp {host_bin} /tmp/captured-tool && "
+                  "chmod +x /tmp/captured-tool && "
+                  "/tmp/captured-tool mark FROMCAPTURE")
         r = eng.run("IRBOX", script)
         host_bin.unlink(missing_ok=True)
-        return (r.returncode == 0 and "MARK:FROMINRAMFS" in r.stdout, r)
+        return (r.returncode == 0 and "MARK:FROMCAPTURE" in r.stdout, r)
     finally:
         eng.close()
 
 
-def sud_xstore_bridge(sudtool):
-    """Cross-store rename/link between inramfs /tmp and the overlay tree
-    must behave as one device (the FUSE backend presents them so). A raw
-    rename(2) from /tmp into the tree, and an O_TMPFILE+linkat inside the
-    tree, both used to fail EXDEV — silently losing a staged build output.
+def sud_shared_tree_ops(sudtool):
+    """Rename and link operations across directories in the shared tree.
+
+    A raw rename(2) from /tmp into /root and an O_TMPFILE+linkat inside /root
+    both used to expose transport-specific filesystem boundaries and fail
+    EXDEV, silently losing a staged build output.
     Uses the raw-syscall helper so a tool's own EXDEV fallback can't mask
     a regression."""
     eng = Engine("sud")
@@ -357,7 +351,7 @@ def sud_xstore_bridge(sudtool):
         shutil.copy(sudtool, host_bin); host_bin.chmod(0o755)
         script = (
             "cp %s /tmp/xs && chmod +x /tmp/xs && "
-            # raw rename /tmp (inramfs) -> /root (overlay): content survives
+            # raw rename across shared-tree directories: content survives
             "echo HDRDATA > /tmp/staged.h && "
             "/tmp/xs xrename /tmp/staged.h /root/moved.h && "
             "cat /root/moved.h && "
@@ -537,7 +531,7 @@ def main():
           f"sud: sudtrace verb returns ok with ≥1 EXEC event "
           f"(ok={tr and tr['verb_ok']} execs={tr and tr['exec_events']})")
     check(tr is not None and tr["file_gone"],
-          "sud: live/<id>/sud.trace removed after the clean sweep")
+          "sud: live/<id>/sud.trace removed after EOF finalization")
 
     # ── PART A2: 32-bit output capture (both backends). ──
     tool32 = build_sudtool(bits=32)
@@ -610,19 +604,19 @@ def main():
     except Exception as e:
         print(f"  (-b brush workload unavailable: {e})")
 
-    # ── PART B: sud-only exec capabilities. ──
+    # ── PART B: SUD transport exec and descriptor capabilities. ──
     try:
-        ok_ir, r_ir = sud_inramfs_exec(sudtool)
-        check(ok_ir, "sud: ELF binary in inramfs /tmp execs seamlessly"
+        ok_ir, r_ir = sud_captured_exec(sudtool)
+        check(ok_ir, "sud: ELF binary created in the captured tree executes"
                      + ("" if ok_ir else f" (rc={r_ir.returncode} "
                         f"out={r_ir.stdout[-120:]!r} err={r_ir.stderr[-160:]!r})"))
         ok_pb, r_pb = sud_parentbox_exec(sudtool)
         check(ok_pb, "sud: nested box execs a binary from its PARENT box's layer"
                      + ("" if ok_pb else f" (rc={r_pb.returncode} "
                         f"out={r_pb.stdout[-120:]!r} err={r_pb.stderr[-160:]!r})"))
-        ok_xs, r_xs = sud_xstore_bridge(sudtool)
-        check(ok_xs, "sud: cross-store rename /tmp->tree + O_TMPFILE linkat "
-                     "bridge like one device"
+        ok_xs, r_xs = sud_shared_tree_ops(sudtool)
+        check(ok_xs, "sud: rename /tmp->/root + O_TMPFILE linkat use the "
+                     "same shared filesystem"
                      + ("" if ok_xs else f" (rc={r_xs.returncode} "
                         f"out={r_xs.stdout[-160:]!r} err={r_xs.stderr[-160:]!r})"))
     except Exception as e:

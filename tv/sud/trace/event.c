@@ -18,7 +18,7 @@
  * multi-process build to single-thread through one mutex.
  *
  * The new design:
- *   - The launcher (sud/sudtrace.c) sets up SUD_STATE_FD as a single
+ *   - The engine runner sets up SUD_STATE_FD as a single
  *     MAP_SHARED page holding only `struct sud_shared { uint32_t
  *     next_stream_id; }` — an atomic counter, no lock.
  *   - Each process (the launcher itself + every traced child) calls

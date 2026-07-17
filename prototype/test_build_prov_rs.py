@@ -157,12 +157,10 @@ def main():
                   f"(got {prov})")
 
             # ── named fifo in /tmp works (make 4.4 jobserver shape) ──────
-            # GNU make >= 4.4 puts its jobserver in a NAMED FIFO under
-            # /tmp; in a sud box /tmp is inramfs, which had no mknod at
-            # all — every `make -j` died on "cannot open jobserver" or
-            # wedged. Exercise the raw mechanism (mkfifo + cross-process
-            # writer/reader + blocking open) so the fix can't regress
-            # even on hosts whose make is 4.3.
+            # GNU make >= 4.4 puts its jobserver in a named FIFO under /tmp.
+            # Exercise the raw mechanism (mkfifo + cross-process writer/reader
+            # + blocking open) so the SUD transport cannot regress it even on
+            # hosts whose make is 4.3.
             fifo_py = ("import os,sys; p='/tmp/bp.fifo'; os.mkfifo(p);\n"
                        "pid=os.fork()\n"
                        "if pid==0:\n"

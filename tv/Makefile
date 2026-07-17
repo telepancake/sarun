@@ -5,10 +5,10 @@ PWD     := $(shell pwd)
 MOK_KEY ?= $(PWD)/MOK.priv
 MOK_CER ?= $(PWD)/MOK.der
 
-all: tv sudtrace upttrace sud-bins mod-bins
+all: tv upttrace sud-bins mod-bins
 
 .PHONY: sud-bins mod-bins
-sud-bins: fs-ring-test path-remap-test dispatcher-test inramfs-test fake-exec-test cmd-rewrite-test
+sud-bins: fs-ring-test
 	$(MAKE) sud64 sud32
 
 mod-bins:
@@ -40,14 +40,7 @@ unload:
 clean:
 	$(MAKE) -C $(MOD_DIR) clean
 	$(MAKE) -C libc-fs clean
-	rm -f tv sudtrace upttrace sud32 sud64
-	rm -f build/path_remap_test32 build/path_remap_test64
-	rm -f build/dispatcher_test_both32 build/dispatcher_test_both64
-	rm -f build/dispatcher_test_pathremap32 build/dispatcher_test_pathremap64
-	rm -f build/dispatcher_test_trace32 build/dispatcher_test_trace64
-	rm -f build/inramfs_test32 build/inramfs_test64
-	rm -f build/fake_exec_test32 build/fake_exec_test64
-	rm -f build/cmd_rewrite_test64
+	rm -f tv upttrace sud32 sud64
 	rm -f build/fs_ring_abi32.o build/fs_ring_abi64.o
 	rm -f build/fs_ring_client32.o build/fs_ring_client64.o
 	rm -f build/fs_fd_lane32.o build/fs_fd_lane64.o
@@ -118,43 +111,12 @@ SIGSYS_DIAG ?= 0
 ifeq ($(SIGSYS_DIAG),1)
 SUD_CFLAGS  += -DSUDTRACE_SIGSYS_DIAG
 endif
-SUD_ADDINS ?= sud/trace sud/fs
 SUD_SRCS    := sud/wrapper.c sud/state.c sud/addin.c sud/raw.c sud/elf.c sud/handler.c sud/loader.c sud/runtime_config.c
 SUD_SRCS    += libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
 SUD_HDRS    := $(shell find sud libc-fs -name '*.h' 2>/dev/null)
-ifneq ($(filter sud/trace,$(SUD_ADDINS)),)
-SUD_CFLAGS  += -DSUD_ADDIN_TRACE
+SUD_CFLAGS  += -DSUD_ADDIN_TRACE -DSUD_ADDIN_FS
 SUD_SRCS    += sud/trace/event.c sud/trace/addin.c
-endif
-ifneq ($(filter sud/fs,$(SUD_ADDINS)),)
-ifneq ($(filter sud/path_remap sud/inramfs,$(SUD_ADDINS)),)
-$(error sud/fs replaces sud/path_remap and sud/inramfs; they cannot be built together)
-endif
-SUD_CFLAGS  += -DSUD_ADDIN_FS
 SUD_SRCS    += sud/fs/addin.c sud/fs/vfs.c sud/fs/fuse_client.c sud/fs/client.c sud/fs/fd_lane.c
-endif
-ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
-SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
-SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c sud/path_remap/rules.c
-endif
-ifneq ($(filter sud/cmd-rewrite,$(SUD_ADDINS)),)
-SUD_CFLAGS  += -DSUD_ADDIN_CMD_REWRITE
-SUD_SRCS    += sud/cmd-rewrite/addin.c sud/cmd-rewrite/rules.c
-endif
-ifneq ($(filter sud/fake-exec,$(SUD_ADDINS)),)
-SUD_CFLAGS  += -DSUD_ADDIN_FAKE_EXEC
-SUD_SRCS    += sud/fake-exec/addin.c sud/fake-exec/builtins.c sud/fake-exec/detect.c
-endif
-ifneq ($(filter sud/inramfs,$(SUD_ADDINS)),)
-SUD_CFLAGS  += -DSUD_ADDIN_INRAMFS
-SUD_SRCS    += sud/inramfs/addin.c sud/inramfs/super.c sud/inramfs/vfs.c
-# inramfs_glue.c lives under path_remap/ but is the path-bearing
-# dispatch table for inramfs.  It only makes sense when both addins
-# are configured (path_remap drives, inramfs serves).
-ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
-SUD_SRCS    += sud/path_remap/inramfs_glue.c
-endif
-endif
 SUD_NATIVE  := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 
 $(ZSTD_LIB):
@@ -188,7 +150,7 @@ $(DUCKDB_OBJ): $(DUCKDB_CPP)
 
 # Single statically-linked tv binary with subcommands. Folds in what
 # used to be separate wiredump/fv binaries — see main.cpp's subcommand
-# dispatch (dump, fv, ingest, test). Tracers (upttrace, sudtrace,
+# dispatch (dump, fv, ingest, test). Tracers (upttrace,
 # modtrace) are now separate binaries; pick one via `tv --tracer EXE`.
 TV_CXX_SRCS := main.cpp engine.cpp tests.cpp \
                trace/trace_stream.cpp \
@@ -206,15 +168,6 @@ tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
 	$(CXX) $(CXXFLAGS) $(TV_LDFLAGS) -o tv $(TV_CXX_SRCS) $(TV_C_OBJS) \
 	    $(DUCKDB_OBJ) $(TV_LIBS)
 
-# Standalone sudtrace launcher (the tracer binary itself; calls into
-# sud32/sud64 wrappers to drive the traced process). See sud/sudtrace.c
-# for the design notes.  Links the shared --remap/--overlay rule
-# parser (sud/path_remap/rules.c) so the launcher applies the exact
-# same rule set as the wrapper-side path_remap addin when probing
-# script shebangs and interpreter binaries before forking the wrapper.
-sudtrace: sud/sudtrace.c sud/runtime_config.c sud/runtime_config.h sud/path_remap/rules.c sud/path_remap/rules.h wire/wire.h trace/trace.h
-	$(CC) $(CFLAGS) -o $@ sud/sudtrace.c sud/runtime_config.c sud/path_remap/rules.c
-
 # Standalone upttrace (ptrace-based userspace tracer, works anywhere).
 UPTTRACE_HDRS := wire/wire.h trace/trace.h
 upttrace: upt/upttrace.cpp $(UPTTRACE_HDRS) $(ZSTD_LIB)
@@ -230,7 +183,7 @@ upttrace: upt/upttrace.cpp $(UPTTRACE_HDRS) $(ZSTD_LIB)
 release: CXXFLAGS := -std=c++23 -O2 -DNDEBUG -fno-stack-protector -I. -I$(ZSTD_DIR) -I$(DUCKDB_INC)
 release: CFLAGS   := -std=c11   -O2 -DNDEBUG -I. -I$(ZSTD_DIR)
 release: TV_LDFLAGS := -static -s
-release: tv sudtrace upttrace
+release: tv upttrace
 
 clean-tv:
 	rm -f tv $(TV_C_OBJS)
@@ -355,244 +308,9 @@ build/fs_vfs_test32: $(FS_VFS_TEST_SRCS) sud/fs/vfs.h sud/fs/fuse_client.h sud/f
 libc-fs-test:
 	$(MAKE) -C libc-fs test
 
-# path_remap overlay self-tests.  Built freestanding for both 32-bit
-# and 64-bit just like the sud wrapper itself, so any architecture-
-# specific bug in path resolution / stat layout / syscall numbering
-# is caught in CI before the wrapper goes near a traced program.
-PATH_REMAP_TEST_SRCS := sud/path_remap/tests/test_overlay.c \
-                        sud/path_remap/tests/test_fakeroot.c \
-                        sud/path_remap/overlay.c \
-                        sud/path_remap/path.c \
-                        sud/path_remap/fakeroot.c \
-                        sud/path_remap/rules.c \
-                        sud/runtime_config.c \
-                        libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
-PATH_REMAP_TEST_HDRS := sud/path_remap/overlay.h \
-                        sud/path_remap/path.h \
-                        sud/path_remap/fakeroot.h \
-                        sud/path_remap/rules.h \
-                        sud/runtime_config.h \
-                        libc-fs/libc.h libc-fs/fmt.h
-.PHONY: path-remap-test
-path-remap-test: build/path_remap_test64 build/path_remap_test32
-	@echo '--- running 64-bit path_remap overlay tests ---'
-	./build/path_remap_test64
-	@echo '--- running 32-bit path_remap overlay tests ---'
-	./build/path_remap_test32
-
-build/path_remap_test64: $(PATH_REMAP_TEST_SRCS) $(PATH_REMAP_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC64) $(SUD_CFLAGS) $(SUD_LDFLAGS) \
-	    -o $@ $(PATH_REMAP_TEST_SRCS)
-
-build/path_remap_test32: $(PATH_REMAP_TEST_SRCS) $(PATH_REMAP_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) \
-	    -o $@ $(PATH_REMAP_TEST_SRCS)
-
-# path_remap × trace dispatch-order tests.  Built three times in each
-# bitness — both addins, path_remap-only, trace-only — to verify the
-# dispatcher contract: trace runs first and observes the program-
-# supplied args, path_remap runs second and rewrites them for the
-# kernel.  Either addin must work on its own.
-DISPATCH_TEST_BASE_CFLAGS := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-                             -ffreestanding -fno-builtin -fno-stack-protector \
-                             -fno-pie -fomit-frame-pointer -I.
-DISPATCH_TEST_LDFLAGS     := -nostdlib -static -no-pie -Wl,--build-id=none
-DISPATCH_TEST_COMMON_SRCS := sud/path_remap/tests/test_dispatcher.c \
-                             sud/addin.c \
-                             sud/runtime_config.c \
-                             libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
-DISPATCH_TEST_PATHREMAP_SRCS := sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c sud/path_remap/rules.c
-DISPATCH_TEST_HDRS := sud/addin.h sud/path_remap/overlay.h sud/path_remap/path.h \
-                      sud/path_remap/fakeroot.h \
-                      sud/path_remap/rules.h \
-                      sud/runtime_config.h \
-                      libc-fs/libc.h libc-fs/fmt.h
-
-DISPATCH_TEST_BIN64_BOTH := build/dispatcher_test_both64
-DISPATCH_TEST_BIN32_BOTH := build/dispatcher_test_both32
-DISPATCH_TEST_BIN64_PR   := build/dispatcher_test_pathremap64
-DISPATCH_TEST_BIN32_PR   := build/dispatcher_test_pathremap32
-DISPATCH_TEST_BIN64_TR   := build/dispatcher_test_trace64
-DISPATCH_TEST_BIN32_TR   := build/dispatcher_test_trace32
-
-.PHONY: dispatcher-test
-dispatcher-test: $(DISPATCH_TEST_BIN64_BOTH) $(DISPATCH_TEST_BIN32_BOTH) \
-                 $(DISPATCH_TEST_BIN64_PR)   $(DISPATCH_TEST_BIN32_PR) \
-                 $(DISPATCH_TEST_BIN64_TR)   $(DISPATCH_TEST_BIN32_TR)
-	@echo '--- 64-bit dispatcher tests (both addins) ---'
-	./$(DISPATCH_TEST_BIN64_BOTH)
-	@echo '--- 32-bit dispatcher tests (both addins) ---'
-	./$(DISPATCH_TEST_BIN32_BOTH)
-	@echo '--- 64-bit dispatcher tests (path_remap only) ---'
-	./$(DISPATCH_TEST_BIN64_PR)
-	@echo '--- 32-bit dispatcher tests (path_remap only) ---'
-	./$(DISPATCH_TEST_BIN32_PR)
-	@echo '--- 64-bit dispatcher tests (trace only) ---'
-	./$(DISPATCH_TEST_BIN64_TR)
-	@echo '--- 32-bit dispatcher tests (trace only) ---'
-	./$(DISPATCH_TEST_BIN32_TR)
-
-$(DISPATCH_TEST_BIN64_BOTH): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC64) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE -DSUD_ADDIN_PATH_REMAP \
-	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS)
-
-$(DISPATCH_TEST_BIN32_BOTH): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC32) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE -DSUD_ADDIN_PATH_REMAP \
-	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS)
-
-$(DISPATCH_TEST_BIN64_PR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC64) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_PATH_REMAP \
-	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS)
-
-$(DISPATCH_TEST_BIN32_PR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS) $(DISPATCH_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC32) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_PATH_REMAP \
-	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_PATHREMAP_SRCS)
-
-$(DISPATCH_TEST_BIN64_TR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC64) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE \
-	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS)
-
-$(DISPATCH_TEST_BIN32_TR): $(DISPATCH_TEST_COMMON_SRCS) $(DISPATCH_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC32) $(DISPATCH_TEST_BASE_CFLAGS) -DSUD_ADDIN_TRACE \
-	    $(DISPATCH_TEST_LDFLAGS) -o $@ \
-	    $(DISPATCH_TEST_COMMON_SRCS)
-
 .PHONY: wire-test
 wire-test: tv
 	./tv dump --selftest
-
-# inramfs add-in self-tests.  Built freestanding (-nostdlib) for both
-# 32-bit and 64-bit so any architecture-specific bug in layout, alloc,
-# locking, or the dispatch front-end is caught in CI.  The tests use
-# /dev/shm as the backing region; CI must allow writes there.
-INRAMFS_TEST_SRCS := sud/inramfs/tests/test_inramfs.c \
-                     sud/inramfs/super.c sud/inramfs/vfs.c sud/inramfs/addin.c \
-                     sud/path_remap/path.c \
-                     sud/runtime_config.c \
-                     libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
-INRAMFS_TEST_HDRS := sud/inramfs/inramfs.h sud/inramfs/internal.h \
-                     sud/path_remap/path.h \
-                     sud/addin.h sud/runtime_config.h \
-                     libc-fs/libc.h libc-fs/fmt.h
-.PHONY: inramfs-test inramfs-test-e2e inramfs-test-sqlite
-inramfs-test: build/inramfs_test64 build/inramfs_test32
-	@echo '--- running 64-bit inramfs tests ---'
-	./build/inramfs_test64
-	@echo '--- running 32-bit inramfs tests ---'
-	./build/inramfs_test32
-	@echo '--- running inramfs end-to-end harness ---'
-	$(MAKE) inramfs-test-e2e
-	@echo '--- running inramfs sqlite end-to-end ---'
-	$(MAKE) inramfs-test-sqlite
-
-# inramfs end-to-end harness: runs sudtrace + strace over a tiny
-# shell workload and asserts zero kernel file syscalls touch any
-# path under the inramfs mount.  This is the "milestone 1" gate from
-# the inramfs plan — without it nothing else is verifiable.
-#
-# The harness needs both the wrapper (sud64) and the launcher
-# (sudtrace), built with the inramfs add-in compiled in.  We force
-# SUD_ADDINS to include the add-in so a developer running this
-# target directly (not via `make all`) gets a working build.
-inramfs-test-e2e: tests/inramfs_e2e.sh
-	@SUD_ADDINS="sud/trace sud/path_remap sud/inramfs" \
-	    $(MAKE) -s sud64 sudtrace
-	./tests/inramfs_e2e.sh
-
-# Ultimate end-to-end: clone sqlite source, build sqlite3 from
-# the amalgamation, then run two separate sqlite3 invocations
-# against an inramfs-resident db (CREATE+INSERT, then SELECT
-# validation).  Skipped automatically when the network is
-# unreachable (e.g. air-gapped CI).
-inramfs-test-sqlite: tests/inramfs_sqlite_e2e.sh
-	@SUD_ADDINS="sud/trace sud/path_remap sud/inramfs" \
-	    $(MAKE) -s sud64 sudtrace
-	./tests/inramfs_sqlite_e2e.sh
-
-build/inramfs_test64: $(INRAMFS_TEST_SRCS) $(INRAMFS_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC64) $(SUD_CFLAGS) -DSUD_ADDIN_INRAMFS $(SUD_LDFLAGS) \
-	    -o $@ $(INRAMFS_TEST_SRCS)
-
-build/inramfs_test32: $(INRAMFS_TEST_SRCS) $(INRAMFS_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC32) $(SUD_CFLAGS) -DSUD_ADDIN_INRAMFS $(SUD_LDFLAGS) \
-	    -o $@ $(INRAMFS_TEST_SRCS)
-
-# fake-exec addin self-tests.  Pure-function tests over the classifier
-# and the builtin registry; the SYS_exit-emitting addin path is exercised
-# end-to-end by tests/sudtrace_test.sh, not here.
-FAKE_EXEC_TEST_SRCS := sud/fake-exec/tests/test_fake_exec.c \
-                       sud/fake-exec/detect.c \
-                       sud/fake-exec/builtins.c \
-                       sud/runtime_config.c \
-                       libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
-FAKE_EXEC_TEST_HDRS := sud/fake-exec/fake_exec.h sud/fake-exec/builtins.h \
-                       sud/addin.h sud/runtime_config.h \
-                       libc-fs/libc.h libc-fs/fmt.h
-.PHONY: fake-exec-test
-fake-exec-test: build/fake_exec_test64
-	@echo '--- running 64-bit fake-exec tests ---'
-	./build/fake_exec_test64
-
-build/fake_exec_test64: $(FAKE_EXEC_TEST_SRCS) $(FAKE_EXEC_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC64) $(SUD_CFLAGS) -DSUD_ADDIN_FAKE_EXEC $(SUD_LDFLAGS) \
-	    -o $@ $(FAKE_EXEC_TEST_SRCS)
-
-# cmd-rewrite addin self-tests.  Pure-function tests over the rule
-# parser, pattern matchers (basename/glob/path), and apply paths;
-# the SIGSYS interception is exercised end-to-end by sudtrace_test.sh.
-CMD_REWRITE_TEST_SRCS := sud/cmd-rewrite/tests/test_cmd_rewrite.c \
-                         sud/cmd-rewrite/rules.c \
-                         sud/runtime_config.c \
-                         libc-fs/libc.c libc-fs/deps/printf/printf.c libc-fs/divdi3.c
-CMD_REWRITE_TEST_HDRS := sud/cmd-rewrite/cmd_rewrite.h \
-                         sud/cmd-rewrite/rules.h \
-                         sud/addin.h sud/runtime_config.h \
-                         libc-fs/libc.h libc-fs/fmt.h
-.PHONY: cmd-rewrite-test
-cmd-rewrite-test: build/cmd_rewrite_test64 build/cmd_rewrite_test32
-	@echo '--- running 64-bit cmd-rewrite tests ---'
-	./build/cmd_rewrite_test64
-	@echo '--- running 32-bit cmd-rewrite tests ---'
-	./build/cmd_rewrite_test32
-
-build/cmd_rewrite_test64: $(CMD_REWRITE_TEST_SRCS) $(CMD_REWRITE_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC64) $(SUD_CFLAGS) -DSUD_ADDIN_CMD_REWRITE $(SUD_LDFLAGS) \
-	    -o $@ $(CMD_REWRITE_TEST_SRCS)
-
-# The matchers/parsers are pure logic and SHOULD be arch-identical — but this
-# codebase has taught us not to assume 32==64, so run the unit suite on 32-bit
-# too. (Pure C, no syscalls, so it runs directly on x86-64 hosts.)
-build/cmd_rewrite_test32: $(CMD_REWRITE_TEST_SRCS) $(CMD_REWRITE_TEST_HDRS)
-	@mkdir -p build
-	$(SUD_CC32) $(SUD_CFLAGS) -DSUD_ADDIN_CMD_REWRITE $(SUD_LDFLAGS) \
-	    -o $@ $(CMD_REWRITE_TEST_SRCS)
-
-# fake-exec performance regression gate.  Runs sudtrace over a
-# fixture loop with --no-fake-exec vs the default and asserts the
-# on/off wall-clock ratio stays under FAKE_EXEC_PERF_RATIO (default
-# 95%).  Needs sud64 + sudtrace built with the fake-exec addin.
-.PHONY: fake-exec-perf
-fake-exec-perf: tests/fake_exec_perf.sh
-	@SUD_ADDINS="sud/trace sud/path_remap sud/fake-exec" \
-	    $(MAKE) -s sud64 sudtrace
-	./tests/fake_exec_perf.sh
 
 .PHONY: all keygen sign load unload clean clean-bins install test
 test: tv libc-fs-test

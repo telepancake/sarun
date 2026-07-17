@@ -750,12 +750,8 @@ fn main() {
                     //        in-box `oaita gen` routes through the engine
                     //        with no api key in the box and no extra UDS.
                     "--api" => api = true,
-                    // --sud  EXPERIMENTAL (engine/DESIGN-sud.md, WIP): run
-                    //        CMD under tv's sudtrace (Syscall User Dispatch
-                    //        + userland overlay) instead of bwrap+FUSE; a
-                    //        post-exit sweep captures the upper dir into
-                    //        the box's sqlar. Host netns, no capture mux,
-                    //        incompatible with -t/-d/-p/-b/--api.
+                    // --sud  Run CMD through the Syscall User Dispatch
+                    //        transport backed by the shared SarunFs.
                     "--sud" => {
                         sud = true;
                         qemu = None;

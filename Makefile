@@ -44,7 +44,6 @@ vendor: ## Assemble engine/vendor/ from pinned upstreams + vendor-patches/ serie
 	python3 scripts/vendor.py
 
 # The addin set the sarun runner requires of the sud wrappers.
-SUD_ADDINS := sud/trace sud/fs
 HOST_ARCH := $(shell uname -m)
 ENGINE_TARGET ?= $(HOST_ARCH)-unknown-linux-musl
 SWIPL_TARGET := $(subst -unknown,,$(ENGINE_TARGET))
@@ -65,7 +64,7 @@ engine: vendor wire-codegen ## Build the engine (fully-static musl binary; cargo
 	@# tv/Makefile uses zig's bundled musl+UAPI headers, so no host -m32
 	@# toolchain is required; fail visibly instead of leaving stale/missing
 	@# wrapper siblings in the release directory.
-	$(MAKE) -C tv sud64 sud32 SUD_ADDINS="$(SUD_ADDINS)"
+	$(MAKE) -C tv sud64 sud32
 	cp tv/sud64 tv/sud32 $(ENGINE_RELEASE)/
 	@# The mirror drivers are compiled INTO sarun (multi-call dispatch on
 	@# argv[0] / subcommand — mirrors.rs self-execs); the symlinks are a

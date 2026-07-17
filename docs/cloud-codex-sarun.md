@@ -70,11 +70,8 @@ From the repository root:
 
 ```bash
 make engine
-make -C tv sud64 sud32 \
-  SUD_ADDINS='sud/trace sud/path_remap sud/cmd-rewrite sud/fake-exec sud/inramfs' \
-  SUD_CFLAGS='-O2 -Wall -Wextra -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer -I. -DSUD_ADDIN_TRACE -DSUD_ADDIN_PATH_REMAP -DSUD_ADDIN_CMD_REWRITE -DSUD_ADDIN_FAKE_EXEC -DSUD_ADDIN_INRAMFS'
-make -C tv build/inramfs_test64 build/inramfs_test32 \
-  SUD_CFLAGS='-O2 -Wall -Wextra -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer -I. -DSUD_ADDIN_TRACE'
+make -C tv sud64 sud32
+make -C tv fs-ring-test
 ```
 
 ## Runtime checks
@@ -82,11 +79,14 @@ make -C tv build/inramfs_test64 build/inramfs_test32 \
 Use these checks to confirm the environment can execute the binaries it builds:
 
 ```bash
-./tv/build/inramfs_test64
-./tv/build/inramfs_test32
-./tv/sud64 /bin/true >/tmp/sud64.out 2>/tmp/sud64.err
+./tv/build/fs_vfs_test64
+./tv/build/fs_vfs_test32
 tv/tests/sud32_qemu_system_smoke.sh
 ```
+
+The SUD wrapper is an internal transport endpoint and expects the engine's
+trace channel, shared filesystem ring, and descriptor lane. Use `make test-sud`
+for an end-to-end run on a native x86 Linux host.
 
 The `sud32_qemu_system_smoke.sh` check boots a tiny qemu-system guest and runs
 `sud32` against a freestanding i386 program inside the guest. If the Codex host

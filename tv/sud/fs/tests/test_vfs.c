@@ -5,6 +5,7 @@
 #include "sud/fs/fuse_client.h"
 #include "sud/fs/fd_lane.h"
 #include "sud/fs/vfs.h"
+#include "sud/runtime_config.h"
 
 void sud_rt_sigreturn_restorer(void) {}
 #if defined(__i386__)
@@ -179,7 +180,11 @@ static int child_calls(struct sud_fs_ring *ring, int lane)
     if (raw_syscall6(SYS_dup2, lane, SUD_FS_FD_LANE_FD, 0, 0, 0, 0) < 0)
         return 9;
     raw_close(lane);
-    if (sud_fs_client_bind(ring) != 0 || sud_vfs_init("/") != 0) return 10;
+    sud_runtime_config_clear(&g_sud_runtime_config);
+    g_sud_runtime_config_present = 1;
+    if (sud_fs_client_bind(ring) != 0 || sud_vfs_init("/") != 0
+        || !g_sud_runtime_config.cwd
+        || strcmp(g_sud_runtime_config.cwd, "/") != 0) return 10;
     char absolute[PATH_MAX];
     if (sud_vfs_absolutize(AT_FDCWD, "relative", absolute,
                            sizeof(absolute)) != 0
@@ -193,8 +198,12 @@ static int child_calls(struct sud_fs_ring *ring, int lane)
     if (root_directory < 0 || proc_directory < 0
         || !sud_vfs_is_kernel_path(proc_directory, "status")
         || fs_call(SYS_fchdir, proc_directory, 0, 0, 0, 0, 0) != 0
+        || !g_sud_runtime_config.cwd
+        || strncmp(g_sud_runtime_config.cwd, "/proc/", 6) != 0
         || !sud_vfs_is_kernel_path(AT_FDCWD, "status")
         || fs_call(SYS_fchdir, root_directory, 0, 0, 0, 0, 0) != 0
+        || !g_sud_runtime_config.cwd
+        || strcmp(g_sud_runtime_config.cwd, "/") != 0
         || sud_vfs_is_kernel_path(AT_FDCWD, "status")) return 10;
     raw_close(root_directory);
     raw_close(proc_directory);
