@@ -1232,6 +1232,30 @@ def main():
         got = sorted((lines or b"").splitlines())
         check(got == [b"left", b"right", b"shared"],
               f"case34: every recipe runs exactly once; got {got!r}")
+        # ── CASE 35: recipe expansion is bounded by execution capacity ────
+        # GNU expands recipes when they are selected to run. In a -j1 build,
+        # the second recipe therefore sees files created by the first. Draining
+        # and expanding the whole ready graph before dispatch breaks that
+        # semantic and starves workers on large Kbuild archive graphs.
+        rexp = work / "recipe-expansion-order"
+        shutil.rmtree(rexp, ignore_errors=True)
+        rexp.mkdir(parents=True, exist_ok=True)
+        (rexp / "Makefile").write_text(
+            ".PHONY: all one two\n"
+            "all: one two\n"
+            "one:\n\t@printf done > marker\n"
+            "two:\n"
+            "\t@$(if $(wildcard marker),printf '%s\\n' observed > result.txt,false)\n")
+        r = run_make("MAKE35", rexp, "-j1", "all")
+        check(r.returncode == 0,
+              f"case35: -j1 dispatches the first recipe before expanding the "
+              f"second (got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp35 = latest_sqlar(m)
+        observed = m.sqlar_content(
+            sp35, str((rexp / "result.txt").resolve()).lstrip("/"))
+        check(observed == b"observed\n",
+              f"case35: later recipe expansion observes earlier output; "
+              f"got {observed!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

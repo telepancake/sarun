@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 20:37:50 +0000
+Subject: [PATCH] Dispatch make recipes before expanding farther ahead
+
+---
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 4ce3338..53ab776 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -750,8 +750,16 @@ list of the rule for '{output}' at {loc}"));
+         // goal targets in here get the "not remade" notice at the end.
+         let mut failed_set: HashSet<Symbol> = HashSet::new();
+         loop {
+-            // 1. Evaluate ready nodes on the make thread (serial) → done or queued.
+-            while failed.is_none() || keep_going {
++            // 1. Evaluate ready nodes on the make thread (serial) → done or
++            // queued.  Do not prepare farther ahead than the available worker
++            // capacity: GNU expands a recipe when it is about to run, and an
++            // earlier recipe may change the filesystem observed by a later
++            // expansion.  This also prevents large Kbuild graphs from spending
++            // minutes expanding thousands of archive recipes while every
++            // worker is idle.
++            while (failed.is_none() || keep_going)
++                && running + run_queue.len() < cap
++            {
+                 let Some(Ready { sym, .. }) = ready.pop() else { break };
+                 // A target can be reachable through several dependency paths.
+                 // Its first release owns it; stale/duplicate heap entries must

@@ -469,6 +469,12 @@ as executable mappings and mmap that genuinely need a host fd.
           count is already zero. A shared/duplicate-prerequisite `-j10`
           regression verifies each recipe runs exactly once; all 34 embedded
           Make/Brush cases pass on native aarch64.
+    - [x] Bound recipe preparation to the currently available execution slots.
+          Recipe expansion now occurs when work can actually be dispatched,
+          preserving GNU's `-j1` visibility of files created by an earlier
+          recipe and preventing a large Kbuild graph from expanding thousands
+          of archive recipes while all workers are idle. The focused ordering
+          regression brings the native aarch64 Make/Brush suite to 35 cases.
     - [ ] Re-run the complete FUSE Brush build, then the complete QEMU Brush
           build, compare retained artifacts, and record timings/counts here.
 - [x] Remove backend-specific semantic branches and obsolete compatibility

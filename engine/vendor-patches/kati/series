@@ -60,3 +60,4 @@
 0600-kati--let-recursive-argv-override-inherited-MAKEFLAGS-variab.patch
 0610-kati--remake-stale-included-makefiles-before-goals.patch
 0620-Prevent-duplicate-scheduling-of-active-make-targets.patch
+0630-Dispatch-make-recipes-before-expanding-farther-ahead.patch
