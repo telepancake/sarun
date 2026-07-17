@@ -1,0 +1,30 @@
+#ifndef SUD_FS_FUSE_CLIENT_H
+#define SUD_FS_FUSE_CLIENT_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <linux/fuse.h>
+
+int sud_fuse_init(void);
+int sud_fuse_lookup(uint64_t parent, const char *name,
+                    struct fuse_entry_out *entry);
+int sud_fuse_forget(uint64_t inode, uint64_t count);
+int sud_fuse_getattr(uint64_t inode, uint64_t handle,
+                     int has_handle, struct fuse_attr_out *attributes);
+int sud_fuse_open(uint64_t inode, uint32_t flags,
+                  struct fuse_open_out *opened);
+int sud_fuse_create(uint64_t parent, const char *name, uint32_t flags,
+                    uint32_t mode, uint32_t umask,
+                    struct fuse_entry_out *entry,
+                    struct fuse_open_out *opened);
+long sud_fuse_read(uint64_t inode, uint64_t handle, uint64_t offset,
+                   uint32_t flags, void *buffer, size_t size);
+long sud_fuse_write(uint64_t inode, uint64_t handle, uint64_t offset,
+                    uint32_t flags, const void *buffer, size_t size);
+int sud_fuse_flush(uint64_t inode, uint64_t handle, uint32_t flags);
+int sud_fuse_release(uint64_t inode, uint64_t handle, uint32_t flags);
+
+size_t sud_fuse_max_read(void);
+size_t sud_fuse_max_write(void);
+
+#endif /* SUD_FS_FUSE_CLIENT_H */

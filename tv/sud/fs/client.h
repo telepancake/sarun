@@ -6,12 +6,23 @@
 
 #include "sud/fs/ring.h"
 
+#ifndef E2BIG
+#define E2BIG 7
+#endif
+#ifndef EPIPE
+#define EPIPE 32
+#endif
+#ifndef EPROTO
+#define EPROTO 71
+#endif
+
 struct sud_fs_transaction {
     struct sud_fs_slot *slot;
     unsigned char *request;
     const unsigned char *response;
     size_t request_len;
     size_t response_len;
+    uint64_t request_id;
 };
 
 /* Map and validate SUD_FS_RING_FD. Returns 0 or a negative errno. */

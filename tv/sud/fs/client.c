@@ -2,16 +2,6 @@
 #include "sud/raw.h"
 #include "sud/fs/client.h"
 
-#ifndef E2BIG
-#define E2BIG 7
-#endif
-#ifndef EPIPE
-#define EPIPE 32
-#endif
-#ifndef EPROTO
-#define EPROTO 71
-#endif
-
 static struct sud_fs_ring *g_ring;
 static uint32_t g_cursor;
 
@@ -98,6 +88,7 @@ int sud_fs_transaction_begin(struct sud_fs_transaction *tx, size_t request_len)
             tx->slot = slot;
             tx->request = slot->request;
             tx->request_len = request_len;
+            tx->request_id = slot->request_id;
             return 0;
         }
         (void)fs_futex(&g_ring->header.request_wake, FUTEX_WAIT, observed);
